@@ -62,7 +62,7 @@ impl Entry {
 }
 
 /// The agents people pick most, first in menus; the rest follow by name.
-const AGENTS_FIRST: &[&str] = &["claude", "codex", "pi", "opencode", "cursor", "copilot", "amp", "gemini", "grok"];
+const AGENTS_FIRST: &[&str] = &["claude", "codex", "pi", "opencode", "cursor", "copilot", "amp", "gemini", "grok", "kimi", "qwen", "hermes", "glm", "zcode"];
 
 /// Every agent the table can start (entries with `run`), most picked first:
 /// `{ key, name, icon, tint, tile, color, run }`.
@@ -102,15 +102,44 @@ pub fn installed(commands: &[String], on: Option<&str>) -> Result<Vec<String>, S
             };
             result.map(|(code, out, err)| (code, String::from_utf8_lossy(&out).into_owned(), String::from_utf8_lossy(&err).into_owned()))
         }
-        None if cfg!(windows) => {
-            // The core refreshes user/system PATH; the app may have inherited only the system PATH.
-            let mut args = vec!["exec".into(), "--".into(), crate::window::shell()];
-            args.extend(installed_powershell(commands));
-            crate::mods::run_blocking(&crate::core_bin::path().to_string_lossy(), &args, None, std::time::Duration::from_secs(30))
-        }
+        None if cfg!(windows) => return Ok(installed_windows_path(commands)),
         None => return installed_here(&crate::window::shell(), commands),
     };
     installed_result(commands, result)
+}
+
+fn installed_windows_path(commands: &[String]) -> Vec<String> {
+    let path_env = std::env::var_os("PATH").unwrap_or_default();
+    let exts: Vec<String> = std::env::var("PATHEXT")
+        .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+        .split(';')
+        .filter(|e| !e.is_empty())
+        .map(str::to_owned)
+        .collect();
+    let dirs: Vec<std::path::PathBuf> = std::env::split_paths(&path_env).collect();
+    commands
+        .iter()
+        .filter(|cmd| {
+            let p = std::path::Path::new(cmd.as_str());
+            if p.components().count() > 1 || p.is_absolute() {
+                if p.extension().is_some() && p.is_file() {
+                    return true;
+                }
+                return exts
+                    .iter()
+                    .any(|ext| std::path::PathBuf::from(format!("{}{ext}", p.display())).is_file());
+            }
+            dirs.iter().any(|dir| {
+                let candidate = dir.join(cmd.as_str());
+                if candidate.extension().is_some() && candidate.is_file() {
+                    return true;
+                }
+                exts.iter()
+                    .any(|ext| std::path::PathBuf::from(format!("{}{ext}", candidate.display())).is_file())
+            })
+        })
+        .cloned()
+        .collect()
 }
 
 fn installed_here(shell: &str, commands: &[String]) -> Result<Vec<String>, String> {
@@ -125,6 +154,7 @@ fn installed_here(shell: &str, commands: &[String]) -> Result<Vec<String>, Strin
     })
 }
 
+#[allow(dead_code)]
 fn installed_result(commands: &[String], result: Result<(i32, String, String), String>) -> Result<Vec<String>, String> {
     let (code, out, err) = result?;
     if code != 0 || !out.lines().any(|line| line == "herdr-check-complete") {
@@ -134,6 +164,7 @@ fn installed_result(commands: &[String], result: Result<(i32, String, String), S
     Ok(commands.iter().filter(|c| found.contains(c.as_str())).cloned().collect())
 }
 
+#[allow(dead_code)]
 fn installed_powershell(commands: &[String]) -> Vec<String> {
     let list = commands.iter().map(|c| powershell_quote(c)).collect::<Vec<_>>().join(",");
     let script = format!(
@@ -250,6 +281,7 @@ fn base(s: &str) -> &str {
 const PS_QUOTES: [char; 5] = ['\'', '\u{2018}', '\u{2019}', '\u{201A}', '\u{201B}'];
 
 /// `& 'prog' 'arg 1'`: a command for PowerShell's `-Command`, each word quoted.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn powershell_line(cmd: &[String]) -> String {
     format!("& {}", cmd.iter().map(|w| powershell_quote(w)).collect::<Vec<_>>().join(" "))
 }

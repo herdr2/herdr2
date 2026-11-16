@@ -7,8 +7,8 @@ function Install-HerdrAppFiles($Binary, $Icon, $Destination) {
     $installed = $false
     try {
         New-Item -ItemType Directory -Path $stage -Force | Out-Null
-        Copy-Item -LiteralPath $Binary -Destination "$stage\herdr-app.exe"
-        Copy-Item -LiteralPath $Icon -Destination "$stage\herdr-app.svg"
+        Copy-Item -LiteralPath $Binary -Destination "$stage\herdr2.exe"
+        Copy-Item -LiteralPath $Icon -Destination "$stage\herdr2.svg"
         # Renaming the folder leaves an already running app alive.
         if (Test-Path -LiteralPath $Destination) {
             Rename-Item -LiteralPath $Destination -NewName (Split-Path $backup -Leaf)
@@ -33,7 +33,7 @@ function Install-HerdrAppFiles($Binary, $Icon, $Destination) {
         }
         if ($installed -and (Test-Path -LiteralPath $backup)) {
             try { Remove-Item -LiteralPath $backup -Recurse -Force }
-            catch { Write-Warning "Previous build remains at $backup. Remove it after quitting Herdr." }
+            catch { Write-Warning "Previous build remains at $backup. Remove it after quitting Herdr2." }
         }
     }
 }
@@ -46,16 +46,16 @@ if ($env:OS -ne "Windows_NT") { throw "This installer requires Windows." }
 Push-Location "$PSScriptRoot\.."
 try {
     cargo build --release --locked --target-dir target
-    if ($LASTEXITCODE) { throw "Herdr build failed (exit $LASTEXITCODE)." }
-    $dir = Join-Path $env:LOCALAPPDATA "Programs\herdr-app"
-    Install-HerdrAppFiles "target\release\herdr-app.exe" "assets\icons\herdr-ui-icon-clean.svg" $dir
+    if ($LASTEXITCODE) { throw "Herdr2 build failed (exit $LASTEXITCODE)." }
+    $dir = Join-Path $env:LOCALAPPDATA "Programs\herdr2"
+    Install-HerdrAppFiles "target\release\herdr2.exe" "assets\icons\herdr-ui-icon-clean.svg" $dir
 } finally {
     Pop-Location
 }
 
-$menu = Join-Path ([Environment]::GetFolderPath("Programs")) "Herdr.lnk"
+$menu = Join-Path ([Environment]::GetFolderPath("Programs")) "Herdr2.lnk"
 $link = (New-Object -ComObject WScript.Shell).CreateShortcut($menu)
-$link.TargetPath = Join-Path $dir "herdr-app.exe"
+$link.TargetPath = Join-Path $dir "herdr2.exe"
 $link.WorkingDirectory = $env:USERPROFILE
 $link.Description = "Terminals and coding agents that keep running"
 $link.Save()
@@ -75,4 +75,4 @@ try {
     $key.Close()
 }
 if (($env:Path -split ";") -notcontains $dir) { $env:Path += ";$dir" }
-Write-Host "Installed herdr-app. Quit and reopen Herdr to use the new build."
+Write-Host "Installed herdr2. Quit and reopen Herdr2 to use the new build."

@@ -13,14 +13,15 @@ export interface ExecResult {
  *  Rejects when it can't start (not installed, no such folder, the machine is unreachable). */
 export function exec(command: string, args?: string[], options?: { cwd?: string; on?: string | null; timeout?: number }): Promise<ExecResult>;
 
-/** Runs `hc` (herdr-core) with the given arguments. Add "--json" for machine output. */
+/** Runs `hc` / `h2` with the given arguments. Add "--json" for machine output. */
 export function hc(args: string[]): Promise<ExecResult>;
+export function h2(args: string[]): Promise<ExecResult>;
 
 /** The user's home directory. */
 export function home(): string;
-/** The app's folder (`~/.config/herdr-app`, or `$HERDR_APP_HOME`): settings.json, keys.json, layouts/. */
+/** The app's folder (`~/.config/herdr2-app`, or `$HERDR2_APP_HOME`): settings.json, keys.json, layouts/. */
 export function appHome(): string;
-/** True while `herdr-app check` loads this mod: `init()` runs for real there
+/** True while `herdr2 check` loads this mod: `init()` runs for real there
  *  (exec and writeTextFile included), so guard process side effects. */
 export function checking(): boolean;
 
@@ -75,7 +76,8 @@ export function playSound(sound: string): null;
  *   terminal.select_all {terminal?} (whole screen and scrollback, or only the alternate screen; Cmd+A on macOS).
  *   terminal.right_click {to: "program" | "menu", terminal?} (right-clicks to a program that takes the mouse; Shift: the menu).
  *   terminal.scroll {lines | pages | to: "top" | "bottom", terminal?} (Herdr's view of the history: negative goes up; pages may be fractional).
- * Agents: agent.next, agent.prev (the agents list's order), agent.focus {terminal} (sub-agents too).
+ * Agents: agent.next, agent.prev (the agents list's order), agent.focus {terminal} (sub-agents too),
+ *   agent.send {agent?, text, steer?}, agent.interrupt {agent?}, agent.approve {agent?, option?}, agent.deny {agent?}.
  * Layout (the shown layout's nodes by id): layout.toggle|show|hide {id}, layout.resize {id, px | weight},
  *   layout.select {stack, child}, layout.set {layout} (personal trees; shipped layouts: click/look fields only), layout.switch {name?} (no name: the next one).
  *   layout.clone {name, as?} duplicates and switches; mod.clone {name, as?} duplicates a mod.

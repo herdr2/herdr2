@@ -1,22 +1,22 @@
-# herdr-app: drive the person's window
+# herdr2: drive the person's window
 
-Herdr shows spaces, tabs and panes. herdr-core (`hc`) runs their terminals
-and keeps them alive when the window closes. Use `herdr-app` only to change
+Herdr2 shows spaces, tabs and panes. herdr2-core (`h2`) runs their terminals
+and keeps them alive when the window closes. Use `herdr2` only to change
 what the person sees. For starting, reading, messaging, waiting on or cleaning
-up agents and programs, read `hc --skill` and use hc.
-Your terminal address is `$HC_TERMINAL_ID`; it is not a pane ID.
+up agents and programs, read `h2 --skill` and use h2.
+Your terminal address is `$H2_TERMINAL_ID`; it is not a pane ID.
 
 ## Inspect before acting
 
 ```sh
-herdr-app ls          # spaces > tabs > terminals, including pane IDs
-herdr-app status      # current layout, focus, overlays, zoom and file/mod errors
-herdr-app commands    # available commands, arguments and descriptions
+herdr2 ls          # spaces > tabs > terminals, including pane IDs
+herdr2 status      # current layout, focus, overlays, zoom and file/mod errors
+herdr2 commands    # available commands, arguments and descriptions
 ```
 
 `ls` and `status` talk to the running window, not a new app. `commands`
 prints the built-in command list even without an open window. Do not launch bare
-`herdr-app` to inspect it: that opens or raises the window. Do not stop,
+`herdr2` to inspect it: that opens or raises the window. Do not stop,
 signal or restart the person's app or core. A window closing does not kill
 its terminals.
 
@@ -33,7 +33,7 @@ To start one the person will look at later without moving them there, pass
 `--focus false`:
 
 ```sh
-herdr-app do space.new --name eng-123 --folder ~/code/app/eng-123 --argv '["claude"]' --task "Implement ENG-123" --focus false
+herdr2 do space.new --name eng-123 --folder ~/code/app/eng-123 --argv '["claude"]' --task "Implement ENG-123" --focus false
 ```
 
 Pick an explicit, useful name for every new space and tab; don't rely on
@@ -41,16 +41,16 @@ default names. Use IDs from `ls` rather than guessing or acting on the wrong
 focused pane.
 
 ```sh
-herdr-app do space.new --name api --folder /path/to/api
-herdr-app do tab.new --name "fix login" --argv '["claude"]' --task "Look at the login bug"
-herdr-app do pane.split --direction right --pane p12
-herdr-app do agent.focus --terminal t7
+herdr2 do space.new --name api --folder /path/to/api
+herdr2 do tab.new --name "fix login" --argv '["claude"]' --task "Look at the login bug"
+herdr2 do pane.split --direction right --pane p12
+herdr2 do agent.focus --terminal t7
 ```
 
 For a remote space:
 
 ```sh
-herdr-app do space.new --name "remote api" --machine vps --folder /srv/api
+herdr2 do space.new --name "remote api" --machine vps --folder /srv/api
 ```
 
 The folder is on that machine; tabs and splits in the space stay there.
@@ -64,8 +64,8 @@ including when `--argv` supplies a program. Without `--folder`, it follows the
 focused terminal's folder. If an inherited local folder was deleted, new spaces,
 tabs and splits retry in that machine's home. An explicit invalid folder
 still fails.
-`hc machine ls` lists machines. Use `hc run --on vps ...`, `hc exec --on vps ...`
-and `hc file ... --on vps ...` for remote work, not your local file tools.
+`h2 machine ls` lists machines. Use `h2 run --on vps ...`, `h2 exec --on vps ...`
+and `h2 file ... --on vps ...` for remote work, not your local file tools.
 
 `do` accepts `--key value` arguments (JSON for arrays/objects) or one JSON
 object. Unknown argument names fail and list valid names. Target IDs (`id`,
@@ -74,7 +74,7 @@ the current-target default can apply. Null keeps its omitted-argument meaning.
 Use `commands` to confirm the command's exact shape:
 
 ```sh
-herdr-app do pane.split '{"direction":"right","pane":"p12"}'
+herdr2 do pane.split '{"direction":"right","pane":"p12"}'
 ```
 
 `pane.swap {pane?, direction | target}` trades the places of `pane` (default:
@@ -82,7 +82,7 @@ the focused one) and its neighbor in a direction, or `target`, another pane of
 the same tab. Give `direction` or `target`, not both. Focus stays with the same pane:
 
 ```sh
-herdr-app do pane.swap '{"pane":"p12","target":"p14"}'
+herdr2 do pane.swap '{"pane":"p12","target":"p14"}'
 ```
 
 `terminal.select_all {terminal?}` selects a terminal's whole screen and scrollback,
@@ -115,16 +115,16 @@ terminal was created, not that its program started correctly. If it exits
 with a nonzero code within two seconds, the window shows an error toast with
 the exit code and last output lines.
 
-A terminal started with hc opts into the window with `herdr.space=<id>`.
-`herdr.tab=<id>` chooses its tab; without it, Herdr creates a tab in that space.
+A terminal started with h2 opts into the window with `herdr.space=<id>`.
+`herdr.tab=<id>` chooses its tab; without it, Herdr2 creates a tab in that space.
 Unlabeled workers stay hidden. Do not add labels just to run a background
 worker. Use app commands when the
-user wants to see a new tab or split, hc for orchestration that need not change
+user wants to see a new tab or split, h2 for orchestration that need not change
 the screen.
 
 ## Customize layouts, keys, or mods
 
-First read `~/.config/herdr-app/AGENTS.md` (or `$HERDR_APP_HOME/AGENTS.md` if
+First read `~/.config/herdr2-app/AGENTS.md` (or `$HERDR2_APP_HOME/AGENTS.md` if
 set). It is the installed guide to settings, layouts, commands and mods.
 Read the generated `.d.ts` files beside it for full API details; do not edit
 those files or the generated guide. The app rewrites them on start.
@@ -134,7 +134,7 @@ those files or the generated guide. The app rewrites them on start.
   `terminal_scroll_speed` (default 1, 0.1..5) adjusts wheel and trackpad
   scrolling, including mouse reports. Set them in settings.json or the
   layout's look; the layout wins.
-- Home defaults to `~/.config/herdr-app`; `HERDR_APP_HOME` selects another.
+- Home defaults to `~/.config/herdr2-app`; `HERDR2_APP_HOME` selects another.
 - `worktrees.directory` in settings.json sets the shipped New worktree destination,
   e.g. `{"worktrees":{"directory":"~/Developer/worktrees"}}`. Default:
   `~/.herdr/worktrees`; checkouts use `<directory>/<repo>/<branch>` (slashes in
@@ -147,9 +147,9 @@ those files or the generated guide. The app rewrites them on start.
   `"focus"` from `nextCommand()` and focuses its own keyboard handle.
 - A mod's `watchFolder(dir)` promise has `cancel()`; cancel it when the folder
   is no longer shown. It resolves with `[]` and releases only that call.
-- Shipped mods belong to Herdr: duplicate with `mod.clone` before editing.
+- Shipped mods belong to Herdr2: duplicate with `mod.clone` before editing.
   Shipped layouts likewise use `layout.clone` for a personal copy.
-  Discover required arguments with `herdr-app commands`.
+  Discover required arguments with `herdr2 commands`.
 - Save to reload. A broken save keeps the old version running and reports
   an error in `status`; a still-working screen is not proof the edit worked.
 - Make only the requested change. Don't touch unrelated mods or settings.
@@ -164,30 +164,30 @@ those files or the generated guide. The app rewrites them on start.
 After every mod change:
 
 ```sh
-herdr-app check ~/.config/herdr-app/mods/<name>
-herdr-app status
-herdr-app shot /tmp/mod.png   # then look at the picture
+herdr2 check ~/.config/herdr2-app/mods/<name>
+herdr2 status
+herdr2 shot /tmp/mod.png   # then look at the picture
 ```
 
 `check` loads the mod and renders it once. It exits nonzero with the exact
 error. Its shared state starts empty and stays in memory; it leaves shared.json
 untouched. Its `init()` still runs: import `checking` from `"herdr"` and guard
 process side effects with `if (checking()) return;`. It is true throughout a
-check and false in a live window; `exec`, `hc` and `writeTextFile` still run
+check and false in a live window; `exec`, `h2` and `writeTextFile` still run
 and warn during checks. Never call a mod done without a passing check.
 Then confirm it is shown correctly in the running window with `shot`; don't claim a visual
 check you haven't made.
 
-`herdr-app shot [file.png]` saves the window's current frame and prints its
+`herdr2 shot [file.png]` saves the window's current frame and prints its
 absolute path (default: `herdr-shot.png` in your current folder). It is the
 app's own rendering at full pixel size: terminals, images, overlays and
 floats included, even when the window is covered or minimized. No screen
 capture or permissions. It needs a running window that has drawn a frame;
-`HERDR_APP_HOME` selects the window, as for `status`.
+`HERDR2_APP_HOME` selects the window, as for `status`.
 
 ## Problems and safety
 
-If Herdr misbehaves, `herdr-app feedback "<what happened>"` drafts a report.
+If Herdr2 misbehaves, `herdr2 feedback "<what happened>"` drafts a report.
 The person reviews and sends it; it does not silently send feedback.
 
 Never experiment with pointer/key automation on the person's real display.

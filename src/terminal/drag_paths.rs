@@ -109,14 +109,21 @@ mod tests {
     }
 
     #[test]
-    fn path_pastes_quote_special_names_without_enter() {
+    fn path_pastes_quote_special_names_without_enter_in_either_paste_mode() {
         let files = paths(None);
         for local_windows in [false, true] {
             for target in ["t1", "remote/t1"] {
                 let text = quote_paths(files.paths.clone(), target, local_windows).unwrap();
                 let apostrophe = if local_windows && target == "t1" { "''" } else { "'\\''" };
                 assert_eq!(text, format!("'/work/中文 O{apostrophe}Brien/notes.txt' '/work/a folder' "));
-                assert!(!text.contains('\r') && !text.contains('\n'));
+                let mut vt = crate::vt::Vt::new(80, 24);
+                for bracketed in [false, true] {
+                    if bracketed { vt.write(b"\x1b[?2004h"); }
+                    let bytes = vt.paste_bytes(&text);
+                    assert!(!bytes.contains(&b'\r') && !bytes.contains(&b'\n'));
+                    let expected = if bracketed { format!("\x1b[200~{text}\x1b[201~").into_bytes() } else { text.as_bytes().to_vec() };
+                    assert_eq!(bytes, expected);
+                }
             }
         }
     }

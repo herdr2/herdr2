@@ -100,16 +100,16 @@ Mods are trusted code, not sandboxed extensions. Read [security and privacy](doc
 ## For agents
 
 ```sh
-herdr-app --skill
+herdr2 --skill
 ```
 
-This prints the agent guide for driving the window. The herdr-core skill points agents here.
-Use herdr-core for running and coordinating programs; use the app to change what you see.
+This prints the agent guide for driving the window. The herdr2 (`h2`) skill points agents here.
+Use `h2` for running and coordinating ACP agents; use `herdr2` to change what you see.
 
 ```sh
-herdr-app ls
-herdr-app status
-herdr-app commands
+herdr2 ls
+herdr2 status
+herdr2 commands
 ```
 
 The first two inspect the open window. The command list also works without one.

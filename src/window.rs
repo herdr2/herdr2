@@ -881,7 +881,7 @@ impl AppWindow {
         std::thread::spawn(move || {
             if let Ok(s) = core.call("server.status", json!({})) {
                 let text = |k: &str| s.get(k).and_then(Value::as_str).map(str::to_owned);
-                crate::update::set_core(text("version").map(|v| v.trim_start_matches("hc ").to_owned()), text("installed_by"));
+                crate::update::set_core(text("version").map(|v| v.trim_start_matches("h2 ").trim_start_matches("hc ").to_owned()), text("installed_by"));
             }
         });
     }
@@ -1774,7 +1774,7 @@ impl AppWindow {
     fn load(&self, inst: Instance, window: &mut Window, cx: &mut Context<Self>) -> Copy {
         let mut copy = Copy { inst, id: 0, root: None, _watch: None, error: None };
         let (Some(runtime), Some(folder)) = (&self.runtime, self.folders.get(&copy.inst.name)) else {
-            copy.error = Some(format!("no mod folder ~/.config/herdr-app/mods/{}", copy.inst.name));
+            copy.error = Some(format!("no mod folder ~/.config/herdr2-app/mods/{}", copy.inst.name));
             return copy;
         };
         copy.id = mods::prepare_load(&copy.inst);
@@ -2108,8 +2108,8 @@ impl AppWindow {
                 let Some(name) = machine["name"].as_str() else { continue };
                 let state = machine["state"].as_str().unwrap_or("unavailable");
                 let reason = (state != "connected").then(|| machine["why"].as_str().map(str::to_owned).unwrap_or_else(|| match state {
-                    "needs_update" => format!("{name} needs a core update; run hc machine update {name}"),
-                    "needs_login" => format!("{name} needs login; run hc machine login {name}"),
+                    "needs_update" => format!("{name} needs a core update; run h2 machine update {name}"),
+                    "needs_login" => format!("{name} needs login; run h2 machine login {name}"),
                     _ => format!("{name} is {state}"),
                 }));
                 self.documents.entry(name.to_owned()).or_default().connection(state == "connected", machine["since_ms"].as_u64(), reason);
@@ -2498,7 +2498,7 @@ impl AppWindow {
             Some(slot) if slot.available => Ok(()),
             Some(slot) => Err(slot.error.clone().unwrap_or_else(|| "This machine's layout is unavailable. Try again when it reconnects.".into())),
             None => Err(match machine {
-                Some(m) => format!("Herdr has no machine called {m}. See hc machine ls; machines added with --temp stay out of Herdr."),
+                Some(m) => format!("Herdr2 has no machine called {m}. See h2 machine ls; machines added with --temp stay out of Herdr2."),
                 None => "This machine's layout is unavailable. Try again when it reconnects.".into(),
             }),
         }
@@ -2973,7 +2973,7 @@ impl AppWindow {
                 return json!({ "ok": true });
             }
             tracing::warn!("unknown command {name:?}");
-            return json!({ "error": format!("unknown command {name:?}: see `herdr-app commands`; a mod's are <mod>.<command> and need the mod loaded") });
+            return json!({ "error": format!("unknown command {name:?}: see `herdr2 commands`; a mod's are <mod>.<command> and need the mod loaded") });
         };
         if let Err(error) = crate::commands::validate_args(command, &args) {
             return json!({ "error": error });
@@ -3576,7 +3576,7 @@ impl AppWindow {
             "app.check_updates" => crate::update::check_now(),
             "app.update_core" => {
                 if crate::update::core().ready.is_none() && crate::update::core().error.is_none() {
-                    return self.fail("herdr-core is up to date");
+                    return self.fail("herdr2-core is up to date");
                 }
                 crate::update::update_core();
             }
@@ -3620,8 +3620,8 @@ impl AppWindow {
                     Ok(true) => {}
                     Ok(false) => return self.fail("no update is ready yet"),
                     Err(error) => {
-                        let reason = format!("Couldn't replace Herdr's files: {error}.");
-                        return self.fail(if cfg!(windows) { format!("Close Herdr's terminals (or restart Windows) and try again. {reason}") } else { reason });
+                        let reason = format!("Couldn't replace Herdr2's files: {error}.");
+                        return self.fail(if cfg!(windows) { format!("Close Herdr2's terminals (or restart Windows) and try again. {reason}") } else { reason });
                     }
                 }
                 self.drain_documents(window, cx);
@@ -3947,7 +3947,7 @@ impl AppWindow {
             Request::Run { name, args } => self.run(&name, args, window, cx),
             Request::OpenOverlay { id, spec } => self.open_overlay(id, spec, window, cx),
             Request::CloseOverlay { id } => self.close_overlay(&id, window, cx),
-            Request::SetWindowTitle(title) => window.set_window_title(title.as_deref().unwrap_or("Herdr")),
+            Request::SetWindowTitle(title) => window.set_window_title(title.as_deref().unwrap_or("Herdr2")),
             Request::SetBadge(text) => crate::badge::set(text.as_deref()),
             Request::Refresh => self.refresh_mods(cx),
             Request::Control { cmd, reply } => {
@@ -4513,7 +4513,7 @@ impl AppWindow {
                 .text_xs()
                 .text_color(c("blocked"))
                 .overflow_y_scroll()
-                .child(format!("{} did not load:\n\n{}\n\nFix the files; Herdr retries on save.", inst.name, error.as_deref().unwrap_or("?")))
+                .child(format!("{} did not load:\n\n{}\n\nFix the files; Herdr2 retries on save.", inst.name, error.as_deref().unwrap_or("?")))
                 .into_any_element(),
             None => div().into_any_element(),
         }
@@ -4717,7 +4717,7 @@ impl AppWindow {
                 .occlude().flex().items_center().gap(settings::z(8.0))
                 .child(div().id("core-update-error").flex_1().min_w_0().cursor_pointer()
                     .on_click(cx.listener(|this, _, w, cx| this.run("app.settings", json!({ "section": "updates" }), w, cx)))
-                    .child(format!("herdr-core update failed: {error} · Open Updates")))
+                    .child(format!("herdr2-core update failed: {error} · Open Updates")))
                 .child(div().id("core-update-error-dismiss").size(settings::z(24.0)).flex_none()
                     .flex().items_center().justify_center().rounded_full().cursor_pointer()
                     .text_color(c("dim")).hover(|s| s.bg(c("raised")).text_color(c("foreground"))).child("×")
@@ -4738,9 +4738,9 @@ impl AppWindow {
         let core = crate::update::core();
         let core = core.ready.filter(|_| !core.updating && core.managed.is_none());
         match (crate::update::ready(), core) {
-            (Some(a), Some(c)) => Some(format!("Herdr {a} and herdr-core {c} are ready")),
-            (Some(a), None) => Some(format!("Herdr {a} is ready")),
-            (None, Some(c)) => Some(format!("herdr-core {c} is ready")),
+            (Some(a), Some(c)) => Some(format!("Herdr2 {a} and herdr2-core {c} are ready")),
+            (Some(a), None) => Some(format!("Herdr2 {a} is ready")),
+            (None, Some(c)) => Some(format!("herdr2-core {c} is ready")),
             (None, None) => None,
         }
     }
@@ -6078,12 +6078,12 @@ mod tests {
     /// fresh app home: a window takes process-wide things (the app home, the
     /// mods' request channel) that tests beside it would otherwise share.
     fn in_own_process(name: &str) {
-        let home = crate::test_tmp().join(format!("herdr-window-test-{name}-{}", std::process::id()));
+        let home = crate::test_tmp().join(format!("herdr2-window-test-{name}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&home);
         let out = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &format!("window::tests::{name}"), "--nocapture", "--test-threads=1"])
-            .env("HERDR_APP_HOME", &home)
-            .env("HERDR_TEST_WINDOW", name)
+            .env("HERDR2_APP_HOME", &home)
+            .env("HERDR2_TEST_WINDOW", name)
             .output()
             .unwrap();
         let _ = std::fs::remove_dir_all(&home);
@@ -6093,7 +6093,7 @@ mod tests {
 
     /// In the process `in_own_process` started for `name`: whether to go on.
     fn running_alone(name: &str) -> bool {
-        std::env::var("HERDR_TEST_WINDOW").as_deref() == Ok(name)
+        std::env::var("HERDR2_TEST_WINDOW").as_deref() == Ok(name)
     }
 
     /// The window on a core that's never there (`hc::offline`), showing
@@ -7013,7 +7013,7 @@ export default class Probe extends View {
             cx.window_title()
         };
         assert_eq!(title(json!("acorn"), cx).as_deref(), Some("acorn"));
-        assert_eq!(title(json!(null), cx).as_deref(), Some("Herdr"));
+        assert_eq!(title(json!(null), cx).as_deref(), Some("Herdr2"));
     }
 
     include!("window/pane_size_tests.rs");

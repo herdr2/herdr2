@@ -226,7 +226,7 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
     module = module.async_function("pickFolder", |_| Ok(async { Ok(HostValue::Null) }));
     module = module.async_function("nextCommand", |_| Ok(std::future::pending::<gpui_shell::HostResult>()));
     module = module.cancellable_async_function("watchFolder", HostValue::Array(vec![]), |_| Ok(std::future::pending::<gpui_shell::HostResult>()));
-    for name in ["exec", "hc", "readTextFile", "writeTextFile", "sendFeedback"] {
+    for name in ["exec", "hc", "h2", "readTextFile", "writeTextFile", "sendFeedback"] {
         let calls = calls.clone();
         module = module.async_function(name, move |a| {
             let first = a.get(0).map(from_host).unwrap_or(Value::Null);
@@ -238,10 +238,10 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
                     .and_then(|p| p.strip_suffix(".json"))
                     .filter(|n| crate::window::shipped_layouts().contains(n))
                     .map(|_| json!("{}")),
-                "hc" if first == json!(["machine", "ls", "--json"]) => {
+                "hc" | "h2" if first == json!(["machine", "ls", "--json"]) => {
                     Some(json!({"code":0,"stdout":"{\"machines\":[{\"name\":\"remote\",\"state\":\"online\"}]}","stderr":""}))
                 }
-                "hc" if first == json!(["machine", "add", "host", "--json"]) => {
+                "hc" | "h2" if first == json!(["machine", "add", "host", "--json"]) => {
                     Some(json!({"code":1,"stdout":"{\"error\":{\"kind\":\"host_key\",\"message\":\"unknown host key\"}}","stderr":""}))
                 }
                 // The files panel lists a folder with sh: kind and name pairs.
@@ -596,7 +596,7 @@ impl gpui::Render for RootedView {
 
 #[gpui::test]
 fn a_mod_hears_a_pinch_only_over_its_element(cx: &mut TestAppContext) {
-    use gpui::{AppContext as _, Modifiers, PinchEvent, TouchPhase, VisualTestContext, point, px};
+    use gpui::{Modifiers, PinchEvent, TouchPhase, VisualTestContext, point, px};
 
     cx.update(gpui_shell::init);
     let staged = Staged::new();

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub const MAX_IMAGES: usize = 3;
 const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
+#[allow(dead_code)]
 const ENDPOINT: &str = "https://telemetry.herdr.dev/v1/feedback";
 
 fn endpoint() -> Option<String> {

@@ -663,7 +663,7 @@ The main ones:
   started, including its release outside the pane; other panes don't receive it.
   Terminals display Kitty graphics, including Unicode placeholder images used by
   programs such as yazi; partial images and scrolling follow the placeholder cells.
-- Agents: `agent.next`, `agent.prev`, `agent.focus {terminal}`.
+- Agents: `agent.next`, `agent.prev`, `agent.focus {terminal}`, `agent.send {agent?, text, steer?}`, `agent.interrupt {agent?}`, `agent.approve {agent?, option?}`, `agent.deny {agent?}`.
 - Layout: `layout.switch {name?}`, `layout.toggle {id}`, `layout.show {id}`, `layout.hide {id}`,
   `layout.resize {id, px | weight}`, `layout.select {stack, child}`, `layout.set {layout}`
   (personal tree edits; on shipped layouts only click/look fields change),
@@ -717,6 +717,7 @@ What's about the user, never a look:
 { "zoom": 1, "sounds": { "enabled": true } }
 ```
 
+- `default_agent`: preset name (e.g. `"claude"`, `"codex"`, `"gemini"`) or binary used when starting a session without explicit `argv`.
 - `zoom` scales the whole app: terminals, mods, the layout's px sizes
   (0.5 to 3; the zoom keys change it). Write sizes as designed at zoom 1.
 - `sounds`: `{ "enabled": true, "done": "<file>", "blocked": "<file>" }`.

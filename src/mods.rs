@@ -664,6 +664,7 @@ pub fn publish_focused_selection(selection: Value) -> bool {
     })
 }
 
+#[allow(dead_code)]
 pub fn terminal_address(word: &str, source: &str) -> Option<String> {
     SNAPSHOT.with(|s| {
         let s = s.borrow();

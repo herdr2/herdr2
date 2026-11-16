@@ -144,6 +144,7 @@ pub(super) enum HiddenFit {
 }
 
 impl AppWindow {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(super) fn initial_size(&self, root: &Node, pane: &str, window: &Window) -> Option<(u16, u16)> {
         let focused = root.path_to(pane)?.into_iter().collect();
         self.displayed_size(root, root.panes().len(), pane, &focused, window)

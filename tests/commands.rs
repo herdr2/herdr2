@@ -23,13 +23,14 @@ export default class Probe extends View {
     let path = home.join("shared.json");
     for original in [Some("{\"sentinel\":true}"), Some("broken json"), None] {
         if let Some(text) = original { std::fs::write(&path, text).unwrap(); }
-        let output = Command::new(env!("CARGO_BIN_EXE_herdr-app"))
+        let output = Command::new(env!("CARGO_BIN_EXE_herdr2"))
             .arg("check").arg(&module)
-            .env("HERDR_APP_HOME", &home)
-            .env("HC_SESSION", format!("check-shared-{}", std::process::id()))
+            .env("HERDR2_APP_HOME", &home)
+            .env("H2_SESSION", format!("check-shared-{}", std::process::id()))
             .env("XDG_CONFIG_HOME", root.join("config"))
             .env("XDG_STATE_HOME", root.join("state"))
             .env("APPDATA", root.join("appdata"))
+            .env_remove("H2_TERMINAL_ID").env_remove("H2_TERMINAL_SOCKET").env_remove("H2_SCOPE")
             .env_remove("HC_TERMINAL_ID").env_remove("HC_TERMINAL_SOCKET").env_remove("HC_SCOPE")
             .output().unwrap();
         assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
@@ -43,13 +44,13 @@ export default class Probe extends View {
 #[test]
 fn commands_need_no_window_or_app_home() {
     let home = std::env::temp_dir().join(format!(
-        "herdr-app-commands-{}-{}",
+        "herdr2-commands-{}-{}",
         std::process::id(),
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
     ));
-    let output = Command::new(env!("CARGO_BIN_EXE_herdr-app"))
+    let output = Command::new(env!("CARGO_BIN_EXE_herdr2"))
         .arg("commands")
-        .env("HERDR_APP_HOME", &home)
+        .env("HERDR2_APP_HOME", &home)
         .output()
         .unwrap();
     assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));

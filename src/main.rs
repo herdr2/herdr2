@@ -11,6 +11,7 @@ mod hc;
 mod keys;
 mod layout;
 mod layout_sync;
+#[allow(dead_code)]
 mod links;
 mod model;
 mod mirror;
@@ -26,25 +27,29 @@ mod mods;
 mod mod_files;
 mod process_cwd;
 mod programs;
+#[allow(dead_code)]
 mod remote_shell;
 mod settings;
 mod setup;
 mod sound;
 mod spawn;
+#[allow(dead_code)]
 mod sprites;
 mod telemetry;
 mod feedback;
 mod terminal;
 mod update;
 mod update_notes;
+#[allow(dead_code)]
 mod vt;
+#[allow(dead_code)]
 mod win32_keys;
 mod window;
 
 use gpui::*;
 
 const HELP: &str = "\
-herdr2: the Herdr2 desktop app for ACP agents. With no arguments it opens the window.
+herdr2: the Herdr2 desktop app for coding agents and terminals. With no arguments it opens the window.
 
 Usage:
   herdr2                        open the window
@@ -58,9 +63,9 @@ Usage:
   herdr2 --skill                Agent Skill: driving the window, and where h2 fits
   herdr2 --version
 
-The agents run in herdr2 core (`h2`), which keeps them alive when the
-window closes. `h2 --help`: start, read, send prompts to and wait on ACP
-agents. The app shows them and arranges them in spaces and tabs.
+The terminals run in herdr2 core (`h2`), which keeps them alive when the
+window closes. `h2 --help`: start, read, send prompts/input to and wait on
+terminals and ACP agents. The app shows terminals and arranges them in spaces and tabs.
 
 Home: ~/.config/herdr2-app (HERDR2_APP_HOME picks another).
 ";

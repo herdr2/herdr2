@@ -875,6 +875,7 @@ static FONTS_ADDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 
 /// How many times fonts were added while running: text shaped before may now
 /// fall back to other glyphs.
+#[allow(dead_code)]
 pub fn fonts_added() -> u64 {
     FONTS_ADDED.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -903,6 +904,7 @@ pub const BUNDLED_FONTS: &[&[u8]] = &[
 pub const SYMBOLS_FONT_FILE: &[u8] = include_bytes!("../assets/fonts/SymbolsNerdFont-Regular.ttf");
 
 /// Nerd Font icons for terminals, under any font (MIT, nerd-fonts).
+#[allow(dead_code)]
 pub const SYMBOLS_FONT: &str = "Symbols Nerd Font";
 
 /// Terminals' font unless a layout or settings.json picks another.

@@ -1,5 +1,12 @@
 # Herdr changelog
 
+## [0.2.0] - 2026-11-16
+
+### New
+- **Herdr2 runs headless ACP agent sessions natively:** no PTY, shell wrapping, or Ghostty VT dependency.
+- **Native GPUI transcript pane:** renders structured `user`, `thought`, `assistant`, `tool_call`, `plan`, `permission`, `error`, and `stderr` entries with inline permission approvals and a built-in prompt/steer composer.
+- **Side-by-side coexistence with Herdr:** separate `herdr2` (`h2`) core, `~/.config/herdr2-app` home, `herdr2-app.sock`, and `Herdr2` window identity.
+
 ## [0.1.16] - 2026-11-14
 
 ### New

@@ -2,6 +2,7 @@
   "inputs": [
     "Cargo.lock",
     "Cargo.toml",
+    "crates/ghostty-sys/Cargo.toml",
     "defaults/icons/LICENSES.md",
     "vendor/gpui-kit/Cargo.toml",
     "vendor/gpui-kit/LICENSE-APACHE",
@@ -31,9 +32,25 @@
     "scripts/notices.ts",
     "scripts/notices.hbs",
     "licenses/inventory.json",
-    "licenses/README.md"
+    "licenses/README.md",
+    "crates/ghostty-sys/build.rs",
+    "vendor/ghostty/build.zig.zon",
+    "vendor/ghostty/src/build/GhosttyZig.zig",
+    "vendor/ghostty/src/build/GhosttyLibVt.zig",
+    "vendor/ghostty/pkg/highway/build.zig.zon",
+    "vendor/ghostty/pkg/wuffs/build.zig.zon",
+    "vendor/ghostty/pkg/wuffs/build.zig",
+    "vendor/ghostty/pkg/simdutf/vendor/simdutf.h",
+    "vendor/ghostty/pkg/simdutf/vendor/simdutf.cpp"
   ],
   "components": [
+    {
+      "name": "Ghostty (libghostty-vt)",
+      "source": "https://github.com/ghostty-org/ghostty/tree/291fd050b9e9c293c8adb6a140742649b7e42d3a",
+      "files": [
+        "vendor/ghostty/LICENSE"
+      ]
+    },
     {
       "name": "QuickJS / quickjs-ng (embedded by quickjs-jit-sys)",
       "source": "https://github.com/longbridge/quickjs-jit/tree/96593cd7a54440ac060a391b8baea7e9a3cf1393/sys/quickjs",
@@ -54,6 +71,54 @@
       "source": "https://github.com/DioxusLabs/taffy/tree/v0.13.0",
       "files": [
         "vendor/taffy/LICENSE"
+      ]
+    },
+    {
+      "name": "uucode and its Unicode data / UTF-8 decoder",
+      "source": "https://github.com/jacobsandlund/uucode/tree/9d55524551411b493cca41ca06363625d90aff1e",
+      "files": [
+        "licenses/uucode.txt",
+        "licenses/uucode-LICENSE_Bjoern_Hoehrmann.txt",
+        "licenses/uucode-LICENSE_unicode.txt"
+      ]
+    },
+    {
+      "name": "Wuffs (Ghostty Kitty graphics)",
+      "source": "Copyright 2017 The Wuffs Authors. https://deps.files.ghostty.org/wuffs-7411f488fe2e2c205c3d3b3d28638b7356522930.tar.gz",
+      "files": [
+        "licenses/Wuffs-LICENSE.txt",
+        "licenses/Wuffs-LICENSE-MIT.txt",
+        "licenses/Wuffs-LICENSE-APACHE.txt"
+      ]
+    },
+    {
+      "name": "Highway (Ghostty SIMD)",
+      "source": "https://github.com/google/highway/tree/66486a10623fa0d72fe91260f96c892e41aceb06",
+      "files": [
+        "licenses/highway.txt",
+        "licenses/highway-BSD3.txt"
+      ]
+    },
+    {
+      "name": "simdutf 9.0.0 (Ghostty's amalgamated source)",
+      "source": "https://github.com/simdutf/simdutf/tree/v9.0.0",
+      "files": [
+        "licenses/simdutf.txt",
+        "licenses/simdutf-TH.txt"
+      ]
+    },
+    {
+      "name": "Zig 0.16.0 standard library and compiler runtime",
+      "source": "https://github.com/ziglang/zig/tree/0.16.0",
+      "files": [
+        "licenses/Zig.txt"
+      ]
+    },
+    {
+      "name": "musl (where statically included by the toolchain)",
+      "source": "Zig 0.16.0 lib/libc/musl/COPYRIGHT; official Linux app builds use system glibc, not musl.",
+      "files": [
+        "licenses/musl.txt"
       ]
     },
     {
