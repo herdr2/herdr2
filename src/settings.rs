@@ -370,9 +370,12 @@ pub struct Person {
     /// How big the whole app is drawn (1 = as designed). The zoom keys change it.
     pub zoom: f32,
     pub sounds: Sounds,
-    /// The herdr-core to use, when it isn't where Herdr looks (core_bin.rs).
+    /// The herdr2 core (`h2`) to use, when it isn't where Herdr2 looks (core_bin.rs).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub core: Option<String>,
+    /// Default ACP agent preset or command when starting a new pane with empty argv.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_agent: Option<String>,
     /// Fonts for layouts that don't set their own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font: Option<String>,
@@ -392,8 +395,8 @@ pub struct Person {
     /// The panels' font (their sizes follow zoom).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ui_font: Option<String>,
-    /// Anonymous usage data (telemetry.rs). On unless set to false.
-    #[serde(skip_serializing_if = "is_true")]
+    /// Anonymous usage data (telemetry.rs). Off by default.
+    #[serde(skip_serializing_if = "is_false")]
     pub telemetry: bool,
     /// Allow terminal programs (including remote ones) to copy text locally.
     #[serde(skip_serializing_if = "is_true")]
@@ -454,12 +457,17 @@ fn is_true(b: &bool) -> bool {
     *b
 }
 
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 impl Default for Person {
     fn default() -> Self {
         Person {
             zoom: 1.0,
             sounds: Sounds::default(),
             core: None,
+            default_agent: None,
             font: None,
             font_size: None,
             font_weight: None,
@@ -468,7 +476,7 @@ impl Default for Person {
             terminal_cell_width: 1.0,
             terminal_scroll_speed: 1.0,
             ui_font: None,
-            telemetry: true,
+            telemetry: false,
             clipboard_write: true,
             copy_on_select: true,
             pane_scrollbars: true,
@@ -720,7 +728,7 @@ pub fn telemetry_setting(person: &Result<Person, String>) -> bool {
         Ok(p) => p.telemetry,
         Err(_) => {
             let raw = std::fs::read_to_string(path()).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
-            raw.and_then(|v| v.get("telemetry").and_then(serde_json::Value::as_bool)).unwrap_or(true)
+            raw.and_then(|v| v.get("telemetry").and_then(serde_json::Value::as_bool)).unwrap_or(false)
         }
     }
 }
@@ -919,11 +927,11 @@ mod tests {
 
     #[test]
     fn zoom_writes_preserve_mod_preferences_and_clear_unset_app_fields() {
-        let raw = r#"{"zoom":1,"font":"custom","telemetry":false,"worktrees":{"directory":"~/Developer/worktrees","future":true},"another_mod":{"enabled":true}}"#;
+        let raw = r#"{"zoom":1,"font":"custom","telemetry":true,"worktrees":{"directory":"~/Developer/worktrees","future":true},"another_mod":{"enabled":true}}"#;
         let mut person: Person = serde_json::from_str(raw).unwrap();
         person.zoom = 1.5;
         person.font = None;
-        person.telemetry = true;
+        person.telemetry = false;
         let saved: serde_json::Value = serde_json::from_str(&person_text(&person, raw).unwrap()).unwrap();
         assert_eq!(saved["zoom"], 1.5);
         assert_eq!(saved["worktrees"], serde_json::json!({"directory":"~/Developer/worktrees","future":true}));
@@ -1080,7 +1088,7 @@ mod tests {
     /// settings.json key.
     #[test]
     fn the_guide_explains_every_setting() {
-        let all = Person { core: Some(String::new()), font: Some(String::new()), font_size: Some(1.0), font_weight: Some(400), ui_font: Some(String::new()), telemetry: false, clipboard_write: false, copy_on_select: false, appearance: Appearance::Light, theme: Some(crate::layout::ThemeChoice::One(String::new())), colors: [("text".into(), String::new())].into(), ..Person::default() };
+        let all = Person { core: Some(String::new()), default_agent: Some(String::new()), font: Some(String::new()), font_size: Some(1.0), font_weight: Some(400), ui_font: Some(String::new()), telemetry: true, clipboard_write: false, copy_on_select: false, appearance: Appearance::Light, theme: Some(crate::layout::ThemeChoice::One(String::new())), colors: [("text".into(), String::new())].into(), ..Person::default() };
         let keys: Vec<String> = serde_json::to_value(&all).unwrap().as_object().unwrap().keys().cloned().collect();
         let guide = include_str!("../defaults/AGENTS.md");
         let section = guide.split("## The person").nth(1).and_then(|s| s.split("\n## ").next()).unwrap_or_default();

@@ -1,11 +1,18 @@
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
 fn main() {
+    println!("cargo:rustc-check-cfg=cfg(gpui_runtime_d3dcompile)");
     #[cfg(target_os = "windows")]
     {
         // Compile HLSL shaders
         #[cfg(not(debug_assertions))]
         compile_shaders();
+    }
+    #[cfg(not(target_os = "windows"))]
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+        // Cross-compiling from non-Windows lacks fxc.exe at build time;
+        // compile embedded HLSL sources via D3DCompile at runtime instead.
+        println!("cargo:rustc-cfg=gpui_runtime_d3dcompile");
     }
 }
 

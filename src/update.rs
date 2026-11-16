@@ -35,17 +35,17 @@ fn find_root() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
     let dir = exe.parent()?;
     if cfg!(target_os = "macos") {
-        // Herdr.app/Contents/MacOS/Herdr
+        // Herdr2.app/Contents/MacOS/Herdr2
         let bundle = dir.parent()?.parent()?;
         (bundle.extension()? == "app").then(|| bundle.to_path_buf())
     } else {
         // The release folder holds the binary and its icon; cargo's target/ doesn't.
-        dir.join("herdr-app.svg").is_file().then(|| dir.to_path_buf())
+        dir.join("herdr2.svg").is_file().then(|| dir.to_path_buf())
     }
 }
 
 /// The folder or bundle name inside a release tarball.
-const PACKED: &str = if cfg!(target_os = "macos") { "Herdr.app" } else { "herdr-app" };
+const PACKED: &str = if cfg!(target_os = "macos") { "Herdr2.app" } else { "herdr2" };
 
 fn beside(root: &Path, suffix: &str) -> PathBuf {
     let mut name = root.file_name().unwrap_or_default().to_os_string();
@@ -70,7 +70,7 @@ fn target() -> String {
 }
 
 fn releases() -> String {
-    std::env::var("HERDR_RELEASES_URL").unwrap_or_else(|_| "https://releases.herdr.dev".into())
+    std::env::var("HERDR2_RELEASES_URL").unwrap_or_else(|_| "https://releases.herdr.dev".into())
 }
 
 /// The version downloaded and waiting for a restart.
@@ -119,13 +119,18 @@ pub fn set_core(version: Option<String>, managed: Option<String>) {
     }
 }
 
-fn checks_app() -> Option<PathBuf> {
-    root().filter(|_| option_env!("HERDR_APP_RELEASE").is_some() || std::env::var_os("HERDR_RELEASES_URL").is_some())
+fn strip_core_prefix(v: &str) -> &str {
+    let v = v.trim();
+    v.strip_prefix("h2 ").or_else(|| v.strip_prefix("herdr2 ")).or_else(|| v.strip_prefix("hc ")).unwrap_or(v)
 }
 
-/// A release build checks the core; a source build only when pointed at a test release server.
+fn checks_app() -> Option<PathBuf> {
+    root().filter(|_| std::env::var_os("HERDR2_RELEASES_URL").is_some())
+}
+
+/// Only checks updates when pointed at a custom HERDR2_RELEASES_URL (never polls upstream herdr.dev).
 fn checks_core() -> bool {
-    option_env!("HERDR_APP_RELEASE").is_some() || std::env::var_os("HERDR_RELEASES_URL").is_some()
+    std::env::var_os("HERDR2_RELEASES_URL").is_some()
 }
 
 /// For the settings screen: both programs, what's waiting, when we last looked.
@@ -249,7 +254,7 @@ pub fn update_core() {
         c.updating = false;
         match result {
             Ok(now) => {
-                c.version = Some(now.trim_start_matches("hc ").to_owned());
+                c.version = Some(strip_core_prefix(&now).to_owned());
                 c.ready = None;
                 crate::telemetry::count("core_update_ok");
             }
@@ -383,20 +388,20 @@ fn run(cmd: &mut Command) -> Result<(), String> {
 
 fn exe_in(app: &Path) -> PathBuf {
     if cfg!(target_os = "macos") {
-        app.join("Contents/MacOS/Herdr")
+        app.join("Contents/MacOS/Herdr2")
     } else {
-        app.join(format!("herdr-app{}", std::env::consts::EXE_SUFFIX))
+        app.join(format!("herdr2{}", std::env::consts::EXE_SUFFIX))
     }
 }
 
-/// What `herdr-app --version` says in this folder or bundle (`0.2.0`).
+/// What `herdr2 --version` says in this folder or bundle (`0.2.0`).
 fn version_of(app: &Path) -> Option<String> {
     let out = crate::spawn::command(exe_in(app)).arg("--version").stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
     let text = String::from_utf8_lossy(&out.stdout);
     if !out.status.success() {
         return None;
     }
-    text.trim().strip_prefix("herdr-app ").map(str::to_owned)
+    text.trim().strip_prefix("herdr2 ").map(str::to_owned)
 }
 
 /// `a` is a later version than `b` (semver; `0.2.0-rc.1` comes before `0.2.0`).
@@ -459,11 +464,11 @@ pub fn leave_install_folder() {
 /// Recover a staged hotfix even when the previous window never quit cleanly.
 /// The inherited expected version allows only one automatic relaunch.
 pub fn apply_on_startup() -> bool {
-    let expected = std::env::var("HERDR_APP_UPDATE_EXPECTED").ok();
+    let expected = std::env::var("HERDR2_APP_UPDATE_EXPECTED").ok();
     if let Some(expected) = &expected {
         // SAFETY: startup runs before any app threads. Do not leak the guard
         // into the core's environment and every terminal it later starts.
-        unsafe { std::env::remove_var("HERDR_APP_UPDATE_EXPECTED") };
+        unsafe { std::env::remove_var("HERDR2_APP_UPDATE_EXPECTED") };
         if expected != env!("CARGO_PKG_VERSION") {
             tracing::warn!("update: relaunched as {}, expected {expected}; not retrying", env!("CARGO_PKG_VERSION"));
         }
@@ -524,7 +529,7 @@ fn relaunch_expected(expected: Option<&str>) -> bool {
     let script = format!("Wait-Process -Id {} -ErrorAction SilentlyContinue; Start-Process '{exe}'", std::process::id());
     let mut command = crate::spawn::command("powershell");
     if let Some(expected) = expected {
-        command.env("HERDR_APP_UPDATE_EXPECTED", expected);
+        command.env("HERDR2_APP_UPDATE_EXPECTED", expected);
     }
     let spawned = command
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
@@ -547,16 +552,16 @@ fn relaunch_expected(expected: Option<&str>) -> bool {
     let Some(root) = root() else { return false };
     // LaunchServices need not preserve the startup guard or an isolated home.
     let open = if cfg!(target_os = "macos") {
-        if expected.is_some() { "exec \"$1/Contents/MacOS/Herdr\"" } else { "open \"$1\"" }
+        if expected.is_some() { "exec \"$1/Contents/MacOS/Herdr2\"" } else { "open \"$1\"" }
     } else {
-        "exec \"$1/herdr-app\""
+        "exec \"$1/herdr2\""
     };
     let script = format!("while kill -0 \"$0\" 2>/dev/null; do sleep 0.1; done; {open}");
     let spawned = {
         use std::os::unix::process::CommandExt;
         let mut command = Command::new("sh");
         if let Some(expected) = expected {
-            command.env("HERDR_APP_UPDATE_EXPECTED", expected);
+            command.env("HERDR2_APP_UPDATE_EXPECTED", expected);
         }
         command
             .arg("-c")
@@ -599,7 +604,7 @@ pub fn after_update(connected: std::sync::Arc<crate::hc::Core>) {
         let have = crate::core_bin::version(&crate::core_bin::path()).unwrap_or_default();
         CORE.lock().unwrap().updating = true;
         let latest = latest_core().map_err(|e| tracing::warn!("core release check after app update: {e}")).ok();
-        let target = after_update_target(have.trim_start_matches("hc "), latest.as_ref(), crate::hc::GENERATION, crate::hc::core_min());
+        let target = after_update_target(strip_core_prefix(&have), latest.as_ref(), crate::hc::GENERATION, crate::hc::core_min());
         let result = crate::core_bin::update_to(target);
         let mut core = CORE.lock().unwrap();
         core.updating = false;
@@ -608,12 +613,12 @@ pub fn after_update(connected: std::sync::Arc<crate::hc::Core>) {
                 if let Some(root) = root() {
                     let _ = std::fs::remove_dir_all(beside(&root, ".old"));
                 }
-                tracing::info!("herdr-core is {now}");
-                core.version = Some(now.trim_start_matches("hc ").to_owned());
+                tracing::info!("herdr2 core is {now}");
+                core.version = Some(strip_core_prefix(&now).to_owned());
                 core.error = None;
             }
             Err(e) => {
-                tracing::warn!("herdr-core update: {e}");
+                tracing::warn!("herdr2 core update: {e}");
                 core.error = Some(e);
             }
         }
@@ -624,7 +629,7 @@ fn after_update_managed(status: Result<serde_json::Value, String>) -> bool {
     match status {
         Ok(status) => {
             let text = |key: &str| status[key].as_str().map(str::to_owned);
-            set_core(text("version").map(|v| v.trim_start_matches("hc ").to_owned()), text("installed_by"));
+            set_core(text("version").map(|v| strip_core_prefix(&v).to_owned()), text("installed_by"));
             core().managed.is_some()
         }
         Err(e) => {
@@ -649,7 +654,7 @@ mod tests {
             let output = Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", "update::tests::managed_cores_report_new_releases_without_running_updates", "--nocapture"])
                 .env(CHILD, "1")
-                .env("HERDR_RELEASES_URL", format!("file://{}", root.display()))
+                .env("HERDR2_RELEASES_URL", format!("file://{}", root.display()))
                 .output().unwrap();
             std::fs::remove_dir_all(root).unwrap();
             assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
@@ -734,19 +739,19 @@ mod tests {
         let receipt = beside(&root, ".new.json");
         let exe = exe_in(&staged);
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
-        std::fs::write(&exe, "#!/bin/sh\necho herdr-app 0.1.8\n").unwrap();
+        std::fs::write(&exe, "#!/bin/sh\necho herdr2 0.2.1\n").unwrap();
         std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         assert_eq!(staged_version(&root), None);
         assert!(staged.is_dir()); // Legacy stages are left for the checker.
-        std::fs::write(&receipt, r#"{"version":"0.1.8"}"#).unwrap();
-        assert_eq!(staged_version(&root).as_deref(), Some("0.1.8"));
-        std::fs::write(&receipt, r#"{"version":"0.1.9"}"#).unwrap();
+        std::fs::write(&receipt, r#"{"version":"0.2.1"}"#).unwrap();
+        assert_eq!(staged_version(&root).as_deref(), Some("0.2.1"));
+        std::fs::write(&receipt, r#"{"version":"0.2.2"}"#).unwrap();
         assert_eq!(staged_version(&root), None);
         assert!(!staged.exists());
         assert!(!receipt.exists());
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
         std::fs::write(&exe, "corrupt").unwrap();
-        std::fs::write(&receipt, r#"{"version":"0.1.8"}"#).unwrap();
+        std::fs::write(&receipt, r#"{"version":"0.2.1"}"#).unwrap();
         assert_eq!(staged_version(&root), None);
         assert!(!staged.exists());
         std::fs::remove_dir_all(work).unwrap();

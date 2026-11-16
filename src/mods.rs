@@ -57,11 +57,11 @@ pub fn note_fonts(cx: &gpui::App) {
     *FONTS.lock().unwrap() = names;
 }
 
-/// The app's home: `$HERDR_APP_HOME` (tests, experiments), else
-/// `$XDG_CONFIG_HOME/herdr-app`, else `~/.config/herdr-app`, on every OS.
+/// The app's home: `$HERDR2_APP_HOME` (tests, experiments), else
+/// `$XDG_CONFIG_HOME/herdr2-app`, else `~/.config/herdr2-app`, on every OS.
 pub fn app_dir() -> PathBuf {
     let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-    env("HERDR_APP_HOME").unwrap_or_else(|| env("XDG_CONFIG_HOME").unwrap_or_else(|| home().join(".config")).join("herdr-app"))
+    env("HERDR2_APP_HOME").unwrap_or_else(|| env("XDG_CONFIG_HOME").unwrap_or_else(|| home().join(".config")).join("herdr2-app"))
 }
 
 pub fn mods_dir() -> PathBuf {
@@ -846,8 +846,8 @@ fn exec_limit(options: Option<&HostValue>) -> Result<Duration, HostError> {
 
 pub(crate) fn run_blocking(command: &str, args: &[String], cwd: Option<String>, limit: Duration) -> Result<(i32, String, String), String> {
     use std::io::Read;
-    // The core may have no `hc` link beside it (a Windows zip has only herdr-core.exe).
-    let program = if command == "hc" { crate::core_bin::path() } else { PathBuf::from(command) };
+    // Shipped/custom mods may call either `hc(...)` or `h2(...)`; both use the resolved herdr2 core.
+    let program = if command == "hc" || command == "h2" { crate::core_bin::path() } else { PathBuf::from(command) };
     let mut child = crate::spawn::command(program)
         .args(args)
         .current_dir(cwd.map(PathBuf::from).unwrap_or_else(home))
@@ -1011,6 +1011,10 @@ fn module(inst: Instance, copy: u64) -> HostModule {
         .async_function("hc", |a| {
             if checking() { tracing::warn!("check: mod called hc; it runs for real"); }
             Ok(exec_future("hc".into(), strings(a.get(0)), None, None, EXEC_LIMIT))
+        })
+        .async_function("h2", |a| {
+            if checking() { tracing::warn!("check: mod called h2; it runs for real"); }
+            Ok(exec_future("h2".into(), strings(a.get(0)), None, None, EXEC_LIMIT))
         })
         .function("checking", |_| Ok(HostValue::Bool(checking())))
         .function("home", |_| Ok(home().to_string_lossy().into_owned().into()))
@@ -1208,7 +1212,7 @@ fn module(inst: Instance, copy: u64) -> HostModule {
         })
         .async_function("nextCommand", move |_| {
             let rx = commands.clone();
-            Ok(async move { rx.recv().await.map(HostValue::Str).map_err(|_| HostError::new("herdr-app is shutting down")) })
+            Ok(async move { rx.recv().await.map(HostValue::Str).map_err(|_| HostError::new("herdr2 is shutting down")) })
         })
 }
 
@@ -1348,19 +1352,21 @@ mod tests {
         #[cfg(unix)]
         let core = {
             use std::os::unix::fs::PermissionsExt;
-            let core = dir.join("herdr-core");
+            let core = dir.join("h2");
             std::fs::write(&core, "#!/bin/sh\necho \"the chosen core: $*\"\n").unwrap();
             std::fs::set_permissions(&core, std::fs::Permissions::from_mode(0o755)).unwrap();
             core
         };
         #[cfg(windows)]
         let core = {
-            let core = dir.join("herdr-core.cmd");
+            let core = dir.join("h2.cmd");
             std::fs::write(&core, "@echo the chosen core: %*\r\n").unwrap();
             core
         };
         crate::core_bin::use_core(core);
         let (code, stdout, stderr) = run_blocking("hc", &["ls".into()], None, Duration::from_secs(5)).unwrap();
+        assert_eq!((code, stdout.trim()), (0, "the chosen core: ls"), "{stderr}");
+        let (code, stdout, stderr) = run_blocking("h2", &["ls".into()], None, Duration::from_secs(5)).unwrap();
         assert_eq!((code, stdout.trim()), (0, "the chosen core: ls"), "{stderr}");
         std::fs::remove_dir_all(dir).unwrap();
     }

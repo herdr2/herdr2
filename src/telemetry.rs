@@ -90,8 +90,8 @@ fn read_env_off() -> Option<&'static str> {
     if set("DO_NOT_TRACK").is_some_and(truthy) {
         return Some("DO_NOT_TRACK");
     }
-    if set("HERDR_TELEMETRY").is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")) {
-        return Some("HERDR_TELEMETRY");
+    if set("HERDR2_TELEMETRY").or_else(|| set("HERDR_TELEMETRY")).is_some_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")) {
+        return Some("HERDR2_TELEMETRY");
     }
     const CI: &[&str] = &["CI", "GITHUB_ACTIONS", "GITLAB_CI", "CIRCLECI", "BUILDKITE", "JENKINS_URL", "TEAMCITY_VERSION"];
     CI.iter().any(|k| set(k).is_some()).then_some("CI")
@@ -99,10 +99,7 @@ fn read_env_off() -> Option<&'static str> {
 
 /// Where reports go, if this build sends at all.
 fn endpoint() -> Option<String> {
-    match std::env::var("HERDR_TELEMETRY_URL").ok().filter(|u| !u.is_empty()) {
-        Some(url) => Some(url),
-        None => option_env!("HERDR_APP_RELEASE").map(|_| ENDPOINT.to_owned()),
-    }
+    std::env::var("HERDR2_TELEMETRY_URL").ok().filter(|u| !u.is_empty())
 }
 
 pub fn collecting() -> bool {
@@ -303,7 +300,8 @@ fn startup_bucket(ms: u64) -> &'static str {
 
 /// A release version (`0.2.0`, `0.2.0-rc.1`), else `other`: never a free string.
 pub(crate) fn version(v: &str) -> String {
-    let v = v.trim().trim_start_matches("hc ").trim_start_matches('v');
+    let v = v.trim();
+    let v = v.strip_prefix("h2 ").or_else(|| v.strip_prefix("hc ")).unwrap_or(v).trim_start_matches('v');
     let number = |s: &str| !s.is_empty() && s.len() <= 4 && s.bytes().all(|b| b.is_ascii_digit());
     let (core, pre) = v.split_once('-').map_or((v, None), |(c, p)| (c, Some(p)));
     let parts: Vec<&str> = core.split('.').collect();

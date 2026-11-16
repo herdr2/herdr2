@@ -2770,13 +2770,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ghostty-sys"
-version = "0.0.0"
-dependencies = [
- "bindgen",
-]
-
-[[package]]
 name = "gif"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3695,14 +3688,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 
 [[package]]
-name = "herdr-app"
-version = "0.1.16"
+name = "herdr2"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-channel",
  "base64",
  "fancy-regex 0.19.2",
- "ghostty-sys",
  "gpui-base",
  "gpui-pre",
  "gpui-pre-linux",

@@ -9,8 +9,7 @@ const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 const ENDPOINT: &str = "https://telemetry.herdr.dev/v1/feedback";
 
 fn endpoint() -> Option<String> {
-    std::env::var("HERDR_FEEDBACK_URL").ok().filter(|u| !u.is_empty())
-        .or_else(|| option_env!("HERDR_APP_RELEASE").map(|_| ENDPOINT.to_owned()))
+    std::env::var("HERDR2_FEEDBACK_URL").ok().filter(|u| !u.is_empty())
 }
 
 pub fn draft(message: &str, email: &str, images: usize, from: &str, layout: &str) -> Value {

@@ -24,7 +24,7 @@ const APP_INSTALL: &str = "powershell -c \"irm https://releases.herdr.dev/app/in
 const CORE_INSTALL: &str = "curl -fsSL https://releases.herdr.dev/core/install.sh | sh";
 #[cfg(windows)]
 const CORE_INSTALL: &str = "powershell -c \"irm https://releases.herdr.dev/core/install.ps1 | iex\"";
-const CORE_PLACE: &str = if cfg!(windows) { r"%LOCALAPPDATA%\Programs\herdr-core" } else { "~/.local/bin" };
+const CORE_PLACE: &str = if cfg!(windows) { r"%LOCALAPPDATA%\Programs\h2" } else { "~/.local/bin" };
 
 /// What's missing before the main window can open.
 pub enum Need {
@@ -76,13 +76,13 @@ pub struct Setup {
 pub fn open(need: Need, requests: async_channel::Receiver<Request>, cx: &mut App) {
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(620.0), px(460.0)), cx))),
-        titlebar: Some(TitlebarOptions { title: Some("Herdr".into()), ..Default::default() }),
-        app_id: Some("herdr-app".into()),
+        titlebar: Some(TitlebarOptions { title: Some("Herdr2".into()), ..Default::default() }),
+        app_id: Some("herdr2".into()),
         ..Default::default()
     };
     let icon = Arc::new(Image::from_bytes(ImageFormat::Png, ICON.to_vec()));
     cx.open_window(options, |_, cx| cx.new(|_| Setup { need, state: State::Ready, requests: Some(requests), icon }))
-        .expect("cannot open the Herdr window");
+        .expect("cannot open the Herdr2 window");
     cx.activate(true);
 }
 
@@ -134,25 +134,25 @@ impl Setup {
     }
 
     fn install(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.run("Installing herdr-core…", || crate::core_bin::install().map(Some), window, cx);
+        self.run("Installing herdr2 core (h2)…", || crate::core_bin::install().map(Some), window, cx);
     }
 
     fn update(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.run("Updating herdr-core… your terminals keep running.", || crate::core_bin::update().map(|_| None), window, cx);
+        self.run("Updating h2… your agents keep running.", || crate::core_bin::update().map(|_| None), window, cx);
     }
 
     fn choose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let paths = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some("Use this herdr-core".into()) });
+        let paths = cx.prompt_for_paths(PathPromptOptions { files: true, directories: false, multiple: false, prompt: Some("Use this herdr2 core (h2)".into()) });
         cx.spawn_in(window, async move |this, cx| {
             let Ok(Ok(Some(paths))) = paths.await else { return };
             let Some(bin) = paths.into_iter().next() else { return };
             let _ = this.update_in(cx, |this, window, cx| {
                 if crate::core_bin::version(&bin).is_none() {
-                    this.state = State::Failed(format!("{} isn't herdr-core (it should answer `--version` with `hc …`)", bin.display()));
+                    this.state = State::Failed(format!("{} isn't herdr2 core (it should answer `--version` with `h2 …`)", bin.display()));
                     cx.notify();
                     return;
                 }
-                // Remembered: next time Herdr looks there first.
+                // Remembered: next time Herdr2 looks there first.
                 let mut person = settings::load_person().unwrap_or_default();
                 person.core = Some(bin.to_string_lossy().into_owned());
                 let _ = settings::write_person(&person);
@@ -167,29 +167,29 @@ impl Setup {
     fn words(&self) -> (String, String, String) {
         match &self.need {
             Need::Install => (
-                "Herdr needs herdr-core".into(),
-                "herdr-core runs your terminals and agents, and keeps them alive when this window closes. Herdr couldn't find it on this computer.".into(),
-                format!("Install it for me puts it in {CORE_PLACE} (with hc), like its own installer: {CORE_INSTALL}"),
+                "Herdr2 needs h2 (herdr2 core)".into(),
+                "herdr2 (`h2`) runs your ACP agents headlessly and keeps them alive when this window closes. Herdr2 couldn't find `h2` on this computer.".into(),
+                format!("Expected location: {CORE_PLACE}. Install h2 from source (or pick it below). Fallback installer: {CORE_INSTALL}"),
             ),
             Need::Connect(error) => (
-                "Herdr can't connect to herdr-core".into(),
+                "Herdr2 can't connect to h2".into(),
                 error.clone(),
                 "Once you've resolved this, try again.".into(),
             ),
             Need::Fix(Mismatch::TooOld { have, need }) => (
-                "Herdr needs a newer herdr-core".into(),
-                format!("Yours is {have}; this Herdr needs {need} or newer. Updating keeps your terminals running."),
-                "Or update it yourself: hc update".into(),
+                "Herdr2 needs a newer h2".into(),
+                format!("Yours is {have}; this Herdr2 needs {need} or newer. Updating keeps your agents running."),
+                "Or update it yourself: h2 update".into(),
             ),
             Need::Fix(Mismatch::Missing(methods)) => (
-                "Herdr needs a newer herdr-core".into(),
-                format!("Your herdr-core can't do everything this Herdr needs ({}). Updating keeps your terminals running.", methods.join(", ")),
-                "Or update it yourself: hc update".into(),
+                "Herdr2 needs a newer h2".into(),
+                format!("Your h2 core can't do everything this Herdr2 needs ({}). Updating keeps your agents running.", methods.join(", ")),
+                "Or update it yourself: h2 update".into(),
             ),
             Need::Fix(Mismatch::Newer { generation }) => (
-                "This Herdr is older than your herdr-core".into(),
-                format!("Your herdr-core speaks a newer protocol (generation {generation}) than this Herdr understands. Update Herdr; your terminals keep running."),
-                format!("Update Herdr: {APP_INSTALL}"),
+                "This Herdr2 is older than your h2 core".into(),
+                format!("Your h2 speaks a newer protocol (generation {generation}) than this Herdr2 understands. Update Herdr2; your agents keep running."),
+                format!("Update Herdr2: {APP_INSTALL}"),
             ),
         }
     }
@@ -229,7 +229,7 @@ impl Render for Setup {
             Need::Fix(_) => div()
                 .flex()
                 .gap(px(10.0))
-                .child(button("update", "Update herdr-core", true).when(!busy, |d| d.on_click(cx.listener(|this, _, w, cx| this.update(w, cx))))),
+                .child(button("update", "Update h2", true).when(!busy, |d| d.on_click(cx.listener(|this, _, w, cx| this.update(w, cx))))),
         };
         div()
             .size_full()
