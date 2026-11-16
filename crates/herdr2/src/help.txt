@@ -1,0 +1,48 @@
+h2 - headless ACP multi-agent orchestration runtime
+
+Usage: h2 <command> [options]
+       h2               list live agents
+
+Agents
+  run [--agent A] [--prompt P] [argv|template [task]]
+                              start an ACP agent (waits for first turn; --bg: don't wait)
+  ls                          list live agents (--all: finished too)
+  get <a>                     show one agent's full record
+  read <a> [--last|--lines N] print rendered JSONL transcript or final assistant text
+  kill <a>                    terminate an ACP agent process
+  rm <a>                      remove a finished agent
+  label <a> k=v...            set or clear labels (`k=` clears)
+  keep <a> [--off]            resume crashed/restarted agent via `session/load`
+
+Communicate & control
+  send <a> <text>             queue a prompt into agent's inbox (--steer: cancel & deliver next)
+  approve <a> [--option ID]   approve a blocked agent's pending permission request
+  deny <a> [--option ID]      deny a blocked agent's pending permission request
+  interrupt <a>               send ACP `session/cancel` to stop current turn cleanly
+  wait <a>                    wait until agent leaves `working` (--output X, --children any|all)
+  put <a> <file>              stage a file beside agent on its machine, print path
+
+Non-agent & files
+  exec [--on m] <cmd>         run non-agent command directly; exact stdout/stderr & exit code
+  file read|write|edit [--on m] <path>
+                              read, atomic-write from stdin, or exact-edit files
+
+More
+  templates                   list templates (~/.config/herdr2/templates)
+  mcp                         run built-in stdio MCP server (`h2 mcp`)
+  events                      follow ordered lifecycle events as JSON lines
+  server start|stop|status|restart
+                              manage background runtime daemon
+  update [--version X|--from <file>]
+                              update h2 binary and restart core cleanly
+  machine add|ls|login|update|rename|rm
+                              manage remote machines over SSH or `--via`
+  connect                     JSON-RPC API over stdin/stdout
+  schema                      print OpenRPC 1.3.2 JSON Schema
+
+<a> is an agent address (`a1`, `a7`, `machine/a7`) or a unique name.
+Built-in `--agent` presets: claude, codex, gemini, opencode, copilot, cursor, kimi, qwen, pi, hermes, glm, zcode.
+Options: --json (default when piped except read/file read/exec), -V --version, --licenses.
+Per command: h2 <command> --help
+Settings: ~/.config/herdr2/config.toml (default_permissions, inject_mcp, [agents]).
+Agent manual: h2 --skill

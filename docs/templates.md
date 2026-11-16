@@ -1,88 +1,55 @@
 # Agent templates
 
-Save a command and a role once, then start an agent by name with a task.
-Templates do not install agents or configure their status reporting.
+Save an ACP preset, command, model, permission policy, and opening instructions once, then start the role by name.
 
-[Back to the README](../README.md) · [Command reference](commands.md#hc-templates)
+[Back to the README](../README.md) · [Command reference](commands.md#h2-templates)
 
 ## Make a reviewer
 
-Save this as `~/.config/herdr-core/templates/reviewer.md` on Linux or macOS:
+Save this as `~/.config/herdr2/templates/reviewer.md` on Linux or macOS (`%APPDATA%\herdr2\templates\reviewer.md` on Windows, or under `$XDG_CONFIG_HOME/herdr2/templates`):
 
 ```markdown
 ---
 description: Read-only code review. Give it file paths and scope.
-command: pi
+agent: claude
+model: sonnet
+permissions: approve-reads
 ---
 You are a focused review agent. Read the code before giving findings.
 Do not edit files or start other agents.
 Report bugs with file paths, lines, and a short reason.
-If a parent assigned the review, report back with hc send.
+If a parent assigned the review, report back with `h2_send` or `h2 send`.
 ```
 
-Use an installed interactive agent command. Put model choices and other agent options in that command.
-On Windows, templates live under `%APPDATA%\herdr-core\templates` by default.
-Setting `XDG_CONFIG_HOME` changes the config home on either platform.
+Launch and interact with it:
 
 ```sh
-hc templates
-hc run --bg --name review --cwd /path/to/repo reviewer "Review src/x.rs only."
-hc read review --lines 100
-hc send review "Recheck the error path."
+h2 templates
+h2 run --bg --name review --cwd /path/to/repo reviewer "Review src/x.rs only."
+h2 wait review
+h2 read review --last
+h2 send review "Recheck the error path."
 ```
 
-Use background mode for agents so their screen does not stream into your caller's output.
-You can still attach and take over with `hc attach review`.
+Without `--bg`, `h2 run` waits for the first ACP turn to finish and prints the transcript.
 
 ## File format
 
-Each template is one Markdown file ending in `.md`.
-The filename without that suffix is the template's name.
-The optional name field is ignored; the filename wins.
-Files are read fresh on each use.
+Each template is one Markdown file ending in `.md` (the filename without `.md` is the template name; files are read fresh on every use).
 
-Start the file with a line containing three hyphens. End the header the same way.
-The header is a small line-based format, not full YAML:
+Start and close frontmatter with `---` lines using simple `key: value` pairs (no YAML quotes or multiline values):
 
 | Field | Meaning |
 | --- | --- |
-| `command` | Required shell command that starts the agent. |
-| `description` | Short text shown in the template list. |
-| `ready` | Default: wait for an OSC 7501 status report. The value `quiet` waits for output to settle instead. |
-| `submit` | Override the key sequence used to submit text. |
-| `stop` | Override the key sequence used to interrupt a turn. |
-| `paste_gap_ms` | Override the pause before submitting pasted text, in milliseconds. |
+| `agent` | ACP preset (`claude`, `codex`, `gemini`, `opencode`, `copilot`, `cursor`, `kimi`, `qwen`, `pi`) or custom command string (required unless `command` is set). |
+| `command` | Alternative ACP command line if `agent` is omitted. |
+| `description` | Short description shown by `h2 templates`. |
+| `model` | Optional model passed to ACP `session/set_config_option` (`model`). |
+| `mode` | Optional ACP session mode passed to `session/set_mode`. |
+| `permissions` | Override default permission policy (`approve-all`, `approve-reads`, `deny-all`, `ask`). |
+| `inject_mcp` | `true` or `false` (overrides global `inject_mcp` setting unless `--no-mcp` is passed). |
+| `system_prompt` | Text passed via `_meta.systemPrompt` when creating the ACP session. |
 
-Values are literal text after the first colon, trimmed at each end.
-Do not add YAML quotes around them or use multiline YAML values.
-Unknown fields are ignored.
-The body is the agent's opening instructions. Core appends your task after a blank line.
-The command runs through `sh`, which must be on PATH on Windows too.
+The Markdown body is placed before your task prompt (separated by a blank line) and queued into the agent's ACP inbox as soon as `session/new` finishes.
 
-## Readiness and input
-
-By default, core waits for the agent's first status report before sending the opening message.
-If that does not arrive within 30 seconds by default, it leaves the screen alone.
-A trust dialog might be waiting for you. Read the screen before sending again.
-The run result reports whether the first message was sent.
-
-For a program that does not report status, opt into quiet readiness:
-
-```markdown
----
-description: An interactive assistant without status reports.
-command: my-assistant
-ready: quiet
-submit: enter
-stop: ctrl+c
-paste_gap_ms: 100
----
-Stay within the assigned files. Ask when blocked.
-```
-
-Quiet output is not proof that an agent is ready. Use this only when you know its startup flow.
-It does not give the program an agent status; core still never guesses status from the screen.
-See `hc keys --help` for key notation and `hc --skill` for the delegation workflow.
-
-When a terminal is launched on another machine, that machine resolves the template and runs its command.
-Put the template and agent there first.
+When launched with `--on`, the remote machine resolves the template and spawns the ACP session there.

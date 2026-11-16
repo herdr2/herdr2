@@ -3,24 +3,22 @@
 set -eu
 export COPYFILE_DISABLE=1
 if [ "$#" -ne 2 ]; then
-    echo "usage: scripts/package <herdr-core binary> <output.tar.gz>" >&2
+    echo "usage: scripts/package <herdr2 binary> <output.tar.gz>" >&2
     exit 2
 fi
 root=$(CDPATH= cd -- "$(dirname "$0")/.." && pwd)
-work=$(mktemp -d "${TMPDIR:-/var/tmp}/hc-package.XXXXXX")
+work=$(mktemp -d "${TMPDIR:-/var/tmp}/h2-package.XXXXXX")
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 if [ -d "$1/Contents/MacOS" ]; then
-    cp -R "$1" "$work/Herdr Core.app"
-    # Old updaters install only this standalone signature. The bundle executable
-    # is resource-sealed and cannot be copied out without invalidating it.
-    cp "$(dirname "$1")/herdr-core" "$work/herdr-core"
+    cp -R "$1" "$work/Herdr2.app"
+    cp "$(dirname "$1")/herdr2" "$work/herdr2"
 else
-    cp "$1" "$work/herdr-core"
+    cp "$1" "$work/herdr2"
 fi
 cp "$root/LICENSE" "$work/LICENSE"
-cp "$root/crates/herdr-core/THIRD-PARTY-NOTICES" "$work/THIRD-PARTY-NOTICES"
-if [ -d "$work/Herdr Core.app" ]; then
-    tar -czf "$2" -C "$work" herdr-core 'Herdr Core.app' LICENSE THIRD-PARTY-NOTICES
+cp "$root/crates/herdr2/THIRD-PARTY-NOTICES" "$work/THIRD-PARTY-NOTICES"
+if [ -d "$work/Herdr2.app" ]; then
+    tar -czf "$2" -C "$work" herdr2 'Herdr2.app' LICENSE THIRD-PARTY-NOTICES
 else
-    tar -czf "$2" -C "$work" herdr-core LICENSE THIRD-PARTY-NOTICES
+    tar -czf "$2" -C "$work" herdr2 LICENSE THIRD-PARTY-NOTICES
 fi

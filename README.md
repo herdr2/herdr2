@@ -1,186 +1,75 @@
-# herdr-core (`hc`)
+# herdr2 (`h2`)
 
-`hc` runs programs and coding agents in terminals that stay alive after you leave.
-Agents can start other agents, send them work, and hear back; you can attach to any terminal and take over.
+`herdr2` (`h2`) is a **headless multi-agent orchestration runtime** communicating exclusively via **ACP (Agent Client Protocol) JSON-RPC 2.0 over stdio**.
 
-Core draws nothing. Use it from your shell, an agent, or your own app.
+Called agents receive no PTY, no terminal window, and no terminal identity environment variables (`TERM`, `COLORTERM`, `TERM_PROGRAM` are not set). Client capabilities explicitly advertise `fs: { readTextFile: false, writeTextFile: false }` and `terminal: false` so child agents perform file/tool operations internally according to their own sandbox and policy.
 
-## Install
-
-Linux and macOS:
+## Quick start
 
 ```sh
-curl -fsSL https://releases.herdr.dev/core/install.sh | sh
+h2 run --bg --name lead --agent claude --prompt "Inspect README.md and summarize"
+h2 ls
+h2 wait lead
+h2 read lead --last
 ```
 
-Windows (PowerShell):
+Without `--bg`, `h2 run` waits for the first ACP turn to settle (default 180s check-in, exit 124 if still running while leaving the agent live).
 
-```powershell
-powershell -c "irm https://releases.herdr.dev/core/install.ps1 | iex"
-```
+Built-in `--agent` presets: `claude`, `codex`, `gemini`, `opencode`, `copilot`, `cursor`, `kimi`, `qwen`, `pi`, custom `[agents]` tables in `~/.config/herdr2/config.toml`, or explicit command lines (`h2 run --agent "python3 my_acp.py"`).
 
-Builds are available for Linux and macOS on x86_64 and aarch64, and Windows on x86_64.
-Linux builds are static. On Windows, templates and quoted shell commands need `sh` on PATH, such as Git for Windows provides.
-
-Run `hc update` to update. Running terminals keep running.
-Updates and `hc server restart` keep the environment the core started with;
-run `hc server restart --fresh` from a terminal outside Herdr to use that shell's
-environment without ending programs. Stopping and starting also takes a fresh one.
-The update from an older core to 0.1.19 uses the updater's environment once,
-because older cores can't save it for the next core.
-
-If saving fails, the restart still goes ahead with the launcher's environment.
-Saved settings expire after three minutes and cannot carry over to another boot
-on Linux or macOS. On Windows, a restart cut short by a fast reboot can reuse them
-once. A plain SIGTERM keeps terminals and screens, but does not save settings.
-The new launcher still chooses the session's location and, on macOS, whether it
-starts from SSH or launchd.
-
-See [security](docs/security.md) for the trust and signing details.
-
-## Run it and come back
+Non-agent commands run via `exec`:
 
 ```sh
-hc run cargo test                  # stream output and wait for it
-hc run --bg --name web bun dev     # start it and return
-hc ls                             # see live terminals
-hc attach web                     # take over; Ctrl+\ detaches
-hc read web --lines 100            # read without attaching
+h2 exec cargo test
 ```
 
-Closing your viewer does not end the program.
-A waiting run checks in after 180 seconds by default, leaving the program running.
-It prints the terminal's address so you can read it or wait again.
+## Permissions (`approve-reads` default)
 
-For a terminal you want to keep even if its program is lost, use `hc run --keep`.
-Recovery starts a fresh shell, never reruns the task.
-A normal exit or an explicit kill still ends it.
-
-To show a lost kept program's last saved screen above the new shell, set
-`restore_screen = true` in the same config.toml described below. It defaults
-to false. Changes apply at the next recovery. A divider marks where the old
-program ended; on Windows its screen is in history. `hc read` includes that
-old output, so scripts reading it can match text from the lost program. Each saved screen
-is consumed or discarded once, even with the setting off. A power cut that
-saves nothing starts blank.
-
-## Default shell
-
-With no program, `hc run --bg` starts the machine's shell: `$SHELL` (or
-`/bin/sh`) on Unix, PowerShell 7 on Windows if available, else Windows PowerShell.
-Override it in `~/.config/herdr-core/config.toml` (Windows:
-`%APPDATA%\herdr-core\config.toml`, or `$XDG_CONFIG_HOME/herdr-core/config.toml`
-when set):
-
-```toml
-shell = ["nu"]
-# Windows Git Bash (literal strings keep backslashes):
-# shell = ['C:\Program Files\Git\bin\bash.exe', '--login', '-i']
-```
-
-The list is an executable followed by separate arguments, without extra path
-quoting. It must contain a nonempty executable. Changes apply to the next new
-shell or `keep` recovery, including recovery after a restart; no restart is
-needed. Running terminals, explicit programs, and quoted command lines keep
-their behavior. A bad setting reports a config error; a shell that cannot start
-reports `spawn_failed`. Recovery stays pending and retries, with errors in
-`core.log` (config) or `holder.log` (spawn); it never silently falls back to another shell.
-
-## Draft wait
-
-Sends and parent notes wait for you to send or clear an unfinished draft,
-up to 60 seconds after your last key. In the same config.toml:
-
-```toml
-notes_quiet = 3 # seconds of quiet before a parent note
-draft_wait = 60 # seconds a draft holds sends and notes; 0 keeps only the quiet pause
-```
-
-Both settings apply to the next delivery without restarting the core. Values must
-be finite seconds that fit in a duration (a negative value means 0). If the config is invalid,
-delivery uses defaults and logs the config error once in `core.log`.
-Reverse sends allow at least the default 60-second draft hold.
-A parent configured above 60 seconds can still outwait a child configured below
-that parent's limit and cause its reverse send to time out.
-
-## Agents run agents
-
-Give an agent `hc --skill`. It prints the agent docs in one read, including how to delegate, wait, report back, and clean up.
-
-[Templates](docs/templates.md) give an agent a command and a role.
-After saving the reviewer example from that page:
+By default (`default_permissions = "approve-reads"`), read-only ACP tool requests (`read`, `search`, `think`, `fetch`, `list`, `glob`, `grep`) are auto-approved. Mutating or command-execution permission prompts pause the agent in state `blocked`:
 
 ```sh
-hc templates
-hc run --bg --name review reviewer "Review src/x.rs. Read-only."
-hc send review "Focus on the error path."
-hc read review --lines 100
+h2 get lead
+h2 approve lead
+h2 deny lead
 ```
 
-Agents started inside an hc terminal become its children.
-They can report back with `hc send` and wait for their children with `hc wait --children all`.
-The parent gets notes when a child needs attention or ends.
-Children end with their parent unless started with `--outlive-parent`.
-On Unix, ending a terminal hangs up its program and foreground job, rather than
-hunting down detached programs. Programs deliberately detached with `nohup` or
-`setsid` can keep running, including background servers (their ports stay busy).
-An unexpected holder loss still uses inherited cleanup tokens to end abandoned
-programs, including detached ones. Windows keeps its job-object cleanup.
-Terminals kept alive through an update retain their old holder's behavior until
-recreated.
+Other modes (`--permissions` or config `default_permissions`): `approve-all`, `approve-reads`, `deny-all`, `ask`.
 
-## Every machine
+## Inbox & steering
+
+Prompts sent to a working agent enqueue serially into its per-agent inbox:
 
 ```sh
-hc machine add my-ssh-host --name box
-hc run --on box --cwd /srv/app cargo test
-hc attach box/t3
+h2 send lead "Also inspect src/mcp.rs"
+h2 send lead --steer "Abort current work and summarize now"
+h2 interrupt lead
 ```
 
-Use the address returned by your run, not the example's `box/t3`.
-Programs and files stay on that machine. Your local core brings its terminals into the same list.
-[Machines](docs/machines.md) covers SSH, custom connections, remote files, and reconnecting.
+`--steer` sends `session/cancel` to abort the running ACP turn cleanly and promotes the steered message ahead of queued inbox items.
 
-## Status comes from the program
+## Built-in MCP (`h2 mcp`)
 
-An agent can say it is working, done, blocked, or in error through OSC 7501, the Program Status Protocol.
-Core stores what it reports. It does not guess from screen text or recognize agent brands.
-A program that does not report status has none.
+By default (`inject_mcp = true`, disable per-run with `--no-mcp`), `herdr2` injects its built-in stdio MCP server (`h2 mcp`) into ACP `session/new` and `session/load` `mcpServers` with `$H2_AGENT_ID` and `$H2_AGENT_SOCKET` set, exposing `h2_run`, `h2_send`, `h2_wait`, `h2_read`, `h2_ls`, `h2_approve`, and `h2_deny`.
 
-Use `hc get review` for a snapshot or `hc events` to follow changes.
+## Templates, remote machines, and files
 
-## Build your own client
+- [Templates](docs/templates.md): reusable agent specs in `~/.config/herdr2/templates/<name>.md`.
+- [Machines](docs/machines.md): orchestrate agents, `exec`, and `file` across SSH or `--via` targets (`box/a3`).
+- [Security](docs/security.md): isolated Unix socket / named pipe endpoints, sessions (`H2_SESSION`), and state layout.
+- [Commands](docs/commands.md): generated CLI help reference.
+- [API](schema/README.md): JSON-RPC 2.0 / OpenRPC protocol (`h2 schema`), events, documents, and `h2 connect`.
 
-`hc schema` prints the request/response API as OpenRPC with JSON Schema.
-[The API docs](schema/README.md) cover connecting, terminal streams, events, and status.
-Use `hc connect` to carry the protocol over stdin and stdout, including through SSH.
+Give an agent `h2 --skill` to teach it the full orchestration workflow in one read.
 
-## Docs
+## Side-by-side coexistence with `herdr-core` (`hc`)
 
-- [Commands](docs/commands.md): generated from the binary's help.
-- [Machines](docs/machines.md): work across machines.
-- [Templates](docs/templates.md): reusable agent roles.
-- [Security](docs/security.md): access, state, and updates.
-- [API](schema/README.md): build a client.
+`herdr2` (`h2`) uses distinct binary/package names (`herdr2`, `h2`), environment variables (`H2_SESSION`, `H2_SOCKET`, `H2_AGENT_ID`, `H2_AGENT_SOCKET`), config/state directories (`~/.config/herdr2/`, `~/.local/state/herdr2/`), and runtime sockets (`$XDG_RUNTIME_DIR/herdr2/`). It runs alongside an active `herdr-core` (`hc`) daemon without conflict.
 
-For a quick lookup, run `hc --help` or a command's help, such as `hc run --help`.
-For agents, use `hc --skill`.
-
-## Build from source
-
-You need Rust, Zig 0.16, and just. CI pins the Rust version in [.github/workflows/ci.yml](.github/workflows/ci.yml).
+## Build and test from source
 
 ```sh
-git submodule update --init --depth 1
-cargo build --locked -p herdr-core
-just check
+cargo build --locked -p herdr2
+cargo test --locked
 ```
 
-`just install` installs this checkout and restarts your core. Running terminals keep running. A running core keeps its environment; if none is running, the one it starts gets only the login's own variables (PATH, HOME, USER, SHELL, locale, SSH agent and markers, display, session paths; see `scripts/restart-core.sh`), never the rest of the build shell's.
-
-`just docs` refreshes the command reference. `just docs-check` checks it and the examples; CI runs the same tests.
-
-See [CONTRIBUTING.md](CONTRIBUTING.md) for contributor setup and checks.
-
-License: [Apache-2.0](LICENSE). `hc --licenses` prints the included third-party licenses.
-After a dependency change, regenerate them with `just notices`.
+License: [Apache-2.0](LICENSE). Run `h2 --licenses` for bundled third-party license notices.

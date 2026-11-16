@@ -1,0 +1,772 @@
+//! Every method's params and results.
+
+use crate::agents::Public;
+use crate::permissions::PermissionMode;
+use crate::rpc::RpcError;
+use crate::wait::WaitResult;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::time::Duration;
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone)]
+pub struct CoreInfo {
+    /// Permanent random id, reset only when state is wiped.
+    pub id: String,
+    /// Display name, the hostname by default.
+    pub name: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct Empty {}
+
+// Request types below are both the API's params (serde, schema) and the CLI's
+// arguments (clap): one definition, one doc comment for `--help` and schema.
+// `#[arg(skip)]` fields are filled in by h2 itself.
+
+/// A `key=value` label. The CLI takes it repeated (`--label k=v`); JSON takes
+/// an object.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Label(pub String, pub String);
+
+impl std::str::FromStr for Label {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Label, String> {
+        match s.split_once('=') {
+            Some((k, v)) if !k.is_empty() => Ok(Label(k.into(), v.into())),
+            _ => Err(format!("expected key=value, got {s:?}")),
+        }
+    }
+}
+
+/// Labels as a JSON object of strings (the last of a repeated key wins).
+mod label_map {
+    use super::Label;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S: Serializer>(labels: &[Label], s: S) -> Result<S::Ok, S::Error> {
+        super::labels(labels).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Label>, D::Error> {
+        Ok(BTreeMap::<String, String>::deserialize(d)?.into_iter().map(|(k, v)| Label(k, v)).collect())
+    }
+}
+
+pub fn labels(labels: &[Label]) -> BTreeMap<String, String> {
+    labels.iter().map(|Label(k, v)| (k.clone(), v.clone())).collect()
+}
+
+/// The word a person or agent types for a value (`idle`, `any`, ...).
+pub fn word<T: clap::ValueEnum>(v: &T) -> String {
+    v.to_possible_value().map(|p| p.get_name().to_string()).unwrap_or_default()
+}
+
+#[derive(Clone, Copy, PartialEq, Debug, clap::ValueEnum, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum IdleOrWorking {
+    Idle,
+    Working,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug, clap::ValueEnum, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum Children {
+    Any,
+    All,
+}
+
+/// Seconds on the command line: 0 or more, finite (JSON has no NaN, so a
+/// bad value must stop here, not turn into null on the way).
+fn cli_seconds(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if v.is_finite() && v >= 0.0 => Ok(v),
+        _ => Err(format!("expected seconds, 0 or more, got {s:?}")),
+    }
+}
+
+/// Seconds from a request, checked before anything happens.
+pub(super) fn seconds(s: Option<f64>) -> Result<Option<Duration>, RpcError> {
+    s.map(|s| {
+        Duration::try_from_secs_f64(s)
+            .map_err(|_| RpcError::invalid_params(format!("timeout must be 0 or more seconds, not {s}")))
+    })
+    .transpose()
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct HelloParams {
+    /// Protocol generation the caller speaks.
+    pub generation: Option<u32>,
+    /// Switch this connection to framed mode after the reply.
+    #[serde(default)]
+    pub framed: bool,
+    /// Another core dialing in: who it is. Its agents may then be parents
+    /// of agents here, and hear from them.
+    pub core: Option<CoreInfo>,
+    /// What that core calls this one (`rohan`), so news about `a7` reaches it as `rohan/a7`.
+    pub calls_you: Option<String>,
+    /// Features supported by a core dialing in.
+    #[serde(default)]
+    pub features: Vec<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct HelloResult {
+    pub generation: u32,
+    pub version: String,
+    pub core: CoreInfo,
+    pub framed: bool,
+    pub methods: Vec<String>,
+    pub features: Vec<String>,
+    /// OS login inherited by this core. Absent when unavailable or unsupported.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub login_session: Option<crate::platform::LoginSession>,
+    /// True: systemd lingering is enabled; false: programs stop at last logout.
+    /// Null: unsupported, not applicable or unknown.
+    pub keeps_running_after_logout: Option<bool>,
+    /// Account for the administrator's loginctl enable-linger command.
+    pub logout_linger_user: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct StatusResult {
+    pub core: CoreInfo,
+    pub version: String,
+    pub pid: u32,
+    pub uptime_ms: u64,
+    pub live: usize,
+    pub finished: usize,
+    /// The package manager this h2 came from (homebrew, nix, mise, or
+    /// system package manager): it updates h2, `h2 update` won't.
+    /// Null for a replaceable plain install.
+    pub installed_by: Option<String>,
+    /// True: systemd lingering is enabled; false: agents stop at last logout.
+    /// Null: unsupported, not applicable or unknown. Checked on every request.
+    pub keeps_running_after_logout: Option<bool>,
+    /// Account for the administrator's loginctl enable-linger command.
+    pub logout_linger_user: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DocGetParams {
+    /// Document name, using the agent name rules.
+    pub name: String,
+    /// Another machine; omitted for this core.
+    pub on: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DocSetParams {
+    pub name: String,
+    /// Any JSON value, at most 1 MiB when serialized; null deletes it.
+    pub value: serde_json::Value,
+    /// Current version from doc.get; zero for a name never written.
+    pub version: u64,
+    pub on: Option<String>,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct DocGetResult {
+    pub value: serde_json::Value,
+    /// Zero when never written. Deletions retain their version.
+    pub version: u64,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct DocSetResult {
+    pub version: u64,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct RestartParams {
+    /// Replacement environment for the next core; requires PATH. Omit to preserve
+    /// this core's environment. Normal startup filtering applies; session paths
+    /// and service bookkeeping still belong to the next launcher.
+    pub environment: Option<BTreeMap<String, String>>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct StopResult {
+    pub stopped: bool,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct RunParams {
+    /// ACP preset name (`claude`, `codex`, `gemini`, ...) or explicit command line.
+    #[arg(long, value_name = "AGENT")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    /// Initial prompt queued right after ACP session setup.
+    #[arg(long, value_name = "TEXT")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// System prompt appended via `_meta.systemPrompt` on session creation.
+    #[arg(long = "system-prompt", value_name = "TEXT")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    /// Model override passed to `session/set_config_option` (`model`).
+    #[arg(long, value_name = "MODEL")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Session mode override passed to `session/set_mode`.
+    #[arg(long, value_name = "MODE")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// Permission policy (`approve-all`, `approve-reads`, `deny-all`, `ask`).
+    #[arg(long, value_name = "MODE")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<PermissionMode>,
+    /// Disable injecting the built-in `herdr2` MCP server into `mcpServers`.
+    #[arg(long = "no-mcp")]
+    #[serde(default)]
+    pub no_mcp: bool,
+    /// Preset/command and arguments, or a template name and its task.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    #[serde(default)]
+    pub argv: Vec<String>,
+    /// Name, unique among live agents: 1-32 of a-z 0-9 - _ .
+    #[arg(long)]
+    pub name: Option<String>,
+    /// Working directory (default: where h2 runs; through the API, the core's;
+    /// with --on, that machine's home).
+    #[arg(long)]
+    pub cwd: Option<String>,
+    /// Run it on another machine (see `h2 machine ls`); its address is `machine/a7`.
+    #[arg(long, value_name = "MACHINE")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+    /// Extra environment variables merged onto the core's environment.
+    #[arg(skip)]
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Labels, key=value (repeatable).
+    #[arg(long = "label", value_name = "K=V")]
+    #[serde(default, with = "label_map")]
+    #[schemars(with = "BTreeMap<String, String>")]
+    pub labels: Vec<Label>,
+    /// Parent agent (default: the agent it is started from).
+    #[arg(long, conflicts_with = "no_parent")]
+    pub parent: Option<String>,
+    /// No parent, even when started from an agent.
+    #[arg(long)]
+    #[serde(default)]
+    pub no_parent: bool,
+    /// Don't send automated notes about it to its parent.
+    #[arg(long)]
+    #[serde(default)]
+    pub no_notify: bool,
+    /// Keep it running when its parent finishes (by default it ends too).
+    #[arg(long)]
+    #[serde(default)]
+    pub outlive_parent: bool,
+    /// Ignored: children end with their parent unless `outlive_parent`.
+    #[arg(long, hide = true)]
+    #[serde(default)]
+    pub die_with_parent: bool,
+    /// Remove it right after it exits (once a waiting parent has seen it).
+    #[arg(long)]
+    #[serde(default)]
+    pub rm: bool,
+    /// Keep recovering via `session/load` (if supported) after crash or restart.
+    #[arg(long)]
+    #[serde(default)]
+    pub keep: bool,
+    /// Then wait until it is not working, like `agent.wait`, and return its
+    /// transcript (the CLI waits unless --bg).
+    #[arg(skip)]
+    #[serde(default)]
+    pub wait: bool,
+    /// Start it and return immediately.
+    #[arg(long)]
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub bg: bool,
+    /// Seconds before a wait checks in, leaving it running (default: config
+    /// `wait_timeout`, else 180).
+    #[arg(long, value_parser = cli_seconds)]
+    pub timeout: Option<f64>,
+    /// Who is calling (`H2_AGENT_ID` inside an agent).
+    #[arg(skip)]
+    pub caller: Option<String>,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct AgentParams {
+    /// The agent: `a7`, a name, or `machine/a7`.
+    #[arg(default_value = "", hide_default_value = true)]
+    pub agent: String,
+    /// Who is calling; a parent looking at its child has seen its news.
+    #[arg(skip)]
+    pub caller: Option<String>,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct ListParams {
+    /// Include finished agents.
+    #[arg(long)]
+    #[serde(default)]
+    pub all: bool,
+    /// Only agents carrying all of these labels (repeatable).
+    #[arg(long = "label", value_name = "K=V")]
+    #[serde(default, with = "label_map")]
+    #[schemars(with = "BTreeMap<String, String>")]
+    pub labels: Vec<Label>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct ListResult {
+    /// This machine's agents, then each connected machine's (`machine/a7`).
+    #[schemars(with = "Vec<Public>")]
+    pub agents: Vec<serde_json::Value>,
+    /// Finished agents left out (see `all`).
+    pub hidden_finished: usize,
+    /// Machines added here and their lines: one that is not connected is
+    /// listed here, not waited on.
+    pub machines: Vec<crate::remote::MachineView>,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct LabelParams {
+    /// The agent: `a7`, a name, or `machine/a7`.
+    pub agent: String,
+    /// Labels to set, key=value; `key=` removes one.
+    #[arg(required = true, value_name = "K=V")]
+    #[serde(with = "label_map")]
+    #[schemars(with = "BTreeMap<String, String>")]
+    pub labels: Vec<Label>,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct KeepParams {
+    /// The agent: `a7`, a name, or `machine/a7`.
+    pub agent: String,
+    /// Keep this live agent recoverable across crash or planned restart.
+    #[arg(long = "off", action = clap::ArgAction::SetFalse, default_value_t = true)]
+    pub keep: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct RemoveResult {
+    pub removed: String,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct ReadParams {
+    /// The agent: `a7`, a name, or `machine/a7`.
+    #[arg(default_value = "", hide_default_value = true)]
+    pub agent: String,
+    #[arg(skip)]
+    pub caller: Option<String>,
+    /// Trailing rendered transcript lines (default: full transcript).
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lines: Option<usize>,
+    /// Print only the final assistant text from the latest turn.
+    #[arg(long)]
+    #[serde(default)]
+    pub last: bool,
+    /// Wait for the agent to finish its current turn or block before reading.
+    #[arg(long)]
+    #[serde(default)]
+    pub wait: bool,
+    /// With `--wait`: seconds before returning early (default: config, else 180).
+    #[arg(long, value_parser = cli_seconds)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<f64>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct ReadResult {
+    pub text: String,
+    /// False when older lines were truncated or history is incomplete.
+    pub complete: bool,
+    /// "transcript", "last", or "history".
+    pub how: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    /// Structured JSONL transcript entries (included for default full transcript reads).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub entries: Vec<crate::transcript::Entry>,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema, Default)]
+pub struct SubscribeParams {
+    /// Only this agent.
+    #[arg(long)]
+    pub agent: Option<String>,
+    /// Only children of this agent.
+    #[arg(long)]
+    pub children_of: Option<String>,
+    /// Only agents carrying all of these labels (repeatable).
+    #[arg(long = "label", value_name = "K=V")]
+    #[serde(default, with = "label_map")]
+    #[schemars(with = "BTreeMap<String, String>")]
+    pub labels: Vec<Label>,
+    /// Documents by name (repeatable); a name ending in `*` is a prefix. Naming
+    /// narrows, so documents alone hear only them — name an agent for both.
+    #[arg(long = "doc", value_name = "NAME")]
+    #[serde(default)]
+    pub docs: Vec<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct SubscribeResult {
+    /// Events after this sequence follow. After a `missed` snapshot, ignore
+    /// events whose seq is not above the snapshot's.
+    pub seq: u64,
+    /// Matching agents here and on connected machines (`machine/a7`).
+    #[schemars(with = "Vec<Public>")]
+    pub agents: Vec<serde_json::Value>,
+    /// Framed mode: the channel events arrive on (JSON lines, with credit).
+    /// Plain mode: none; this connection now carries only notifications.
+    pub channel: Option<u32>,
+}
+
+/// A plain-mode subscription handed to the connection after the reply.
+pub struct PlainSub {
+    pub rx: tokio::sync::mpsc::Receiver<String>,
+    pub behind: Arc<std::sync::atomic::AtomicBool>,
+    pub filter: crate::events::Filter,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct SendParams {
+    /// The agent: `a7`, a name, or `machine/a7`.
+    pub agent: String,
+    /// Prompt text queued for the agent's ACP inbox.
+    pub text: String,
+    /// Cancel the active ACP turn (`session/cancel`) and deliver this prompt next.
+    #[arg(long)]
+    #[serde(default)]
+    pub steer: bool,
+    /// Only enqueue if the status is exactly this.
+    #[arg(long = "if", value_name = "STATUS")]
+    #[serde(rename = "if")]
+    pub only_if: Option<IdleOrWorking>,
+    /// Wait for the turn this send triggers.
+    #[arg(long)]
+    #[serde(default)]
+    pub wait: bool,
+    /// With wait: seconds before it checks in (default: config, else 180).
+    #[arg(long, value_parser = cli_seconds)]
+    pub timeout: Option<f64>,
+    /// Sender address attributed in `<h2 from="...">` tags (default: caller).
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Who is sending (`H2_AGENT_ID`, else the calling process's parent), so a
+    /// bare wait from the same caller waits for this send's turn.
+    #[arg(skip)]
+    pub caller: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct SendResult {
+    /// The agent's status word when queued.
+    pub status: Option<String>,
+    /// The turn when queued.
+    pub turn: u64,
+    /// Whether the queued prompt started a turn or went into the serial inbox.
+    pub started: Option<bool>,
+    /// Total queued items waiting behind the current turn.
+    pub inbox_len: usize,
+    /// With `wait`: how that turn ended.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait: Option<crate::wait::WaitResult>,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct WaitParams {
+    /// The agent; with `children`, whose children (default: the caller).
+    pub agent: Option<String>,
+    /// Wait on children instead: all = until none is working, any = next news or a message to you.
+    #[arg(long)]
+    pub children: Option<Children>,
+    /// End when streamed transcript output after the wait starts contains this text.
+    /// Blocked, error or exit end it too.
+    #[arg(long)]
+    pub output: Option<String>,
+    /// Seconds before it checks in (default: config `wait_timeout`, else 180).
+    #[arg(long, value_parser = cli_seconds)]
+    pub timeout: Option<f64>,
+    /// See `agent.send`.
+    #[arg(skip)]
+    pub caller: Option<String>,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct InterruptParams {
+    /// The agent: `a7`, a name, or `machine/a7`.
+    #[arg(default_value = "", hide_default_value = true)]
+    pub agent: String,
+    /// Seconds to wait for cancellation effect (default 10).
+    #[arg(long, value_parser = cli_seconds)]
+    pub timeout: Option<f64>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct InterruptResult {
+    /// stopped, exited, still_working, or unknown.
+    pub outcome: String,
+    /// ACP cancellation method (`session/cancel`).
+    pub method: String,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct ApproveParams {
+    /// The agent: `a7`, a name, or `machine/a7`.
+    #[arg(default_value = "", hide_default_value = true)]
+    pub agent: String,
+    /// Explicit ACP permission `optionId` to choose (default: first matching option).
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option: Option<String>,
+    #[arg(skip)]
+    pub caller: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct ApproveResult {
+    pub agent: String,
+    pub request_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub option_id: Option<String>,
+    pub outcome: String,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct PutParams {
+    /// The agent: `a7`, a name, or `machine/a7`.
+    pub agent: String,
+    /// The file's name, kept so `.png` stays `.png` (CLI: the local file to send).
+    #[arg(value_name = "FILE")]
+    pub name: String,
+    /// Its bytes, base64; at most 8 MB raw.
+    #[arg(skip)]
+    pub data: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct PutResult {
+    /// Where it landed, as the agent's machine sees it.
+    pub path: String,
+    pub bytes: usize,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct ExecParams {
+    /// Program and arguments, run as given (no shell).
+    #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub argv: Vec<String>,
+    /// A shell line instead of argv, run by that machine's shell (`sh -c`;
+    /// Windows `%COMSPEC% /d /s /c`). The CLI sends one string with spaces or
+    /// shell signs as a line.
+    #[arg(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<String>,
+    /// Run it on another machine (see `h2 machine ls`).
+    #[arg(long, value_name = "MACHINE")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+    /// Working directory (default: where h2 runs; through the API, the core's;
+    /// with --on, that machine's home).
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Set on top of the core's environment, key=value (repeatable).
+    #[arg(long = "env", value_name = "K=V")]
+    #[serde(default, with = "label_map")]
+    #[schemars(with = "BTreeMap<String, String>")]
+    pub env: Vec<Label>,
+    /// Seconds before it and everything it started are ended (default 60, at most 600).
+    #[arg(long, value_parser = cli_seconds)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<f64>,
+    /// Bytes for its stdin, base64, at most 8 MB raw (without: stdin is closed).
+    #[arg(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<String>,
+    /// Feed what is piped into h2 to its stdin.
+    #[arg(short = 'i', long)]
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub stdin: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct ExecResult {
+    /// Its exit code; null when a signal ended it.
+    pub code: Option<i32>,
+    /// The signal that ended it (Unix).
+    pub signal: Option<i32>,
+    /// What it wrote, base64: the first 8 MB.
+    pub stdout: String,
+    /// What it wrote, base64: the first 1 MB.
+    pub stderr: String,
+    /// It wrote more than was kept (it still ran to its end).
+    pub truncated: bool,
+    /// It ran out of time and was ended: the output is what came so far.
+    pub timed_out: bool,
+    /// How long it ran, in milliseconds.
+    pub ms: u64,
+}
+
+/// A file here or on a machine.
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct FileAt {
+    /// The file: absolute, or from `cwd`.
+    pub path: String,
+    /// On another machine (see `h2 machine ls`).
+    #[arg(long, value_name = "MACHINE")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+    /// Where a relative path starts (default: where h2 runs; through the API,
+    /// the core's; with --on, that machine's home).
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct FileReadParams {
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub at: FileAt,
+    /// The first line to give, from 1.
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offset: Option<usize>,
+    /// At most this many lines (default: all, up to 8 MB).
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct FileReadResult {
+    /// The lines as they are in the file, line ends kept.
+    pub text: String,
+    /// The first and last line given (last < first: none).
+    pub first: usize,
+    pub last: usize,
+    /// Lines in the file.
+    pub lines: usize,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct FileWriteParams {
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub at: FileAt,
+    /// Its new content, base64, at most 8 MB raw (CLI: what is piped in).
+    #[arg(skip)]
+    pub data: String,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct FileEditParams {
+    #[command(flatten)]
+    #[serde(flatten)]
+    pub at: FileAt,
+    /// Replacements, all made or none (CLI: --old/--new pairs).
+    #[arg(skip)]
+    pub edits: Vec<Edit>,
+    /// Exact text found once in the file (repeatable, paired with --new in order).
+    #[arg(long, required = true)]
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub old: Vec<String>,
+    /// What replaces it.
+    #[arg(long, required = true)]
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub new: Vec<String>,
+}
+
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+pub struct Edit {
+    /// Exact text, found exactly once in the file as it was.
+    pub old: String,
+    pub new: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct FileResult {
+    /// The file written, absolute.
+    pub path: String,
+    pub bytes: usize,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct MachineAddParams {
+    /// How ssh reaches it: `vps`, `can@10.0.0.7`, `can@10.0.0.7:2222`, a Host from ~/.ssh/config.
+    #[arg(required_unless_present = "via", conflicts_with = "via")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Reach it with this command instead of ssh: it is given a shell line to
+    /// run there as its last argument, like ssh (`ssh -p 2222 -i key user@ip`,
+    /// `fly ssh console -a app --pty=false -C`).
+    #[arg(long, value_name = "COMMAND")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub via: Option<String>,
+    /// Mark it short-lived (a sandbox for a task), so clients can show it apart
+    /// from machines that stay. h2 treats it like any other; remove it with
+    /// `h2 machine rm`.
+    #[arg(long = "temp")]
+    #[serde(default)]
+    pub temporary: bool,
+    /// Copy this h2 there when it has none or one too old, without asking.
+    #[arg(long)]
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub install: bool,
+    /// What to call it here (default: the target's host).
+    #[arg(long)]
+    pub name: Option<String>,
+    /// The h2 session on that machine (default: its default).
+    #[arg(long)]
+    pub session: Option<String>,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct MachineParams {
+    /// The machine's name.
+    pub machine: String,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct MachineRenameParams {
+    /// The machine's name now.
+    pub machine: String,
+    /// Its new name. Addresses with the old one stop working.
+    pub new_name: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct MachineListResult {
+    pub machines: Vec<crate::remote::MachineView>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct RunResult {
+    #[serde(flatten)]
+    pub agent: Public,
+    /// Whether the initial prompt went into the agent inbox.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_message: Option<crate::templates::FirstMessage>,
+    /// With `wait`: how the wait ended (status, exit, or timeout: still running).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait: Option<WaitResult>,
+    /// With `wait`: transcript output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct TemplatesResult {
+    pub templates: Vec<crate::templates::TemplateInfo>,
+}

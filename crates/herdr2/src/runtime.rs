@@ -1,0 +1,600 @@
+//! The core's live side: active ACP agent sessions, transcripts, persistence,
+//! permission approvals, and lifecycle transitions.
+
+use crate::acp::proto::{permission_cancelled, permission_selected};
+use crate::acp::{PendingPermission, QueuedPrompt, SessionHandle};
+use crate::agents::{Agent, Registry, address};
+use crate::api::CoreInfo;
+use crate::paths::{Paths, read_state};
+use crate::permissions;
+use crate::platform::{self, signal};
+use crate::rpc::RpcError;
+use crate::status::StatusReport;
+use crate::transcript::{Entry, Transcript, append_disk, load as load_transcript, path as transcript_path};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::io;
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant, SystemTime};
+use tokio::sync::Notify;
+
+mod persistence;
+use persistence::RegistryWriter;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Exit {
+    pub code: Option<i32>,
+    pub signal: Option<i32>,
+}
+
+pub struct Core {
+    pub info: CoreInfo,
+    pub login_session: Option<platform::LoginSession>,
+    pub started: Instant,
+    pub stop: Notify,
+    /// Set by `server.restart`: on stop, cleanly end live ACP adapters and let kept agents recover on restart.
+    pub restart: std::sync::atomic::AtomicBool,
+    pub paths: Paths,
+    pub state: Mutex<State>,
+    /// Woken on every lifecycle change; waiters re-check what they need.
+    pub changed: Notify,
+    pub jobs: tokio::sync::mpsc::UnboundedSender<crate::notes::Job>,
+    pub jobs_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<crate::notes::Job>>>,
+    pub(crate) sweeps: Arc<std::sync::atomic::AtomicUsize>,
+    dirty: std::sync::atomic::AtomicBool,
+    save_due: Notify,
+    registry_writer: RegistryWriter,
+}
+
+#[derive(Default)]
+pub struct State {
+    pub reg: Registry,
+    pub docs: std::collections::BTreeMap<String, crate::api::DocGetResult>,
+    pub sessions: HashMap<u32, SessionHandle>,
+    pub inboxes: HashMap<u32, VecDeque<QueuedPrompt>>,
+    pub pending_perms: HashMap<u32, PendingPermission>,
+    pub transcripts: HashMap<u32, Transcript>,
+    pub recovering: HashSet<u32>,
+    pub events: crate::events::Events,
+    /// Waits matching streaming output (`agent.wait --output`).
+    pub output_watch: HashMap<u32, Vec<tokio::sync::mpsc::UnboundedSender<String>>>,
+    /// The turn of each caller's last send to an agent, until a bare wait reports it.
+    pub last_send: HashMap<(String, u32), u64>,
+    /// Waits in progress by (caller, agent): a parent waiting needs no note.
+    pub waiting: HashMap<(String, u32), usize>,
+    /// A message was queued into this agent while it worked and no wait of its returned since.
+    pub messages: HashMap<u32, Option<String>>,
+    /// Parents with a note delivery running.
+    pub note_tasks: HashSet<u32>,
+    pub killing: HashSet<u32>,
+    pub stopping: bool,
+    pub machines: Vec<crate::machines::Machine>,
+    pub lines: HashMap<String, crate::remote::LineState>,
+    pub line_tasks: HashMap<String, tokio::task::AbortHandle>,
+    pub peers: std::collections::BTreeMap<String, crate::remote::Peer>,
+    pub peer_lines: HashMap<String, (usize, Arc<crate::remote::Line>)>,
+    pub afar_notes: HashMap<u32, Vec<String>>,
+    pub afar_runs: HashMap<(u32, String), (usize, bool)>,
+    pub machine_outbox: HashMap<String, Vec<serde_json::Value>>,
+    pub mirrors: HashMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
+}
+
+const SAVE_SOON: Duration = Duration::from_secs(2);
+
+pub fn now_ms() -> u64 {
+    SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
+}
+
+fn finish_reason(killed: bool, stopping: bool, restart: bool, host_shutdown: bool) -> &'static str {
+    if killed {
+        "killed"
+    } else if restart {
+        "stopped_by_restart"
+    } else if stopping {
+        "server_stop"
+    } else if host_shutdown {
+        "host_shutdown"
+    } else {
+        "exited"
+    }
+}
+
+impl Core {
+    pub fn start(paths: Paths, info: CoreInfo) -> io::Result<Arc<Core>> {
+        let reg: Registry = read_state(&paths.state.join("agents.json"))?;
+        let docs_path = paths.state.join("docs.json");
+        let docs = read_state(&docs_path).unwrap_or_else(|e| {
+            eprintln!("core: cannot load documents, starting empty: {e}");
+            if let Err(e) = std::fs::rename(&docs_path, paths.state.join("docs.json.bad")) {
+                eprintln!("core: cannot quarantine documents: {e}");
+            }
+            Default::default()
+        });
+        crate::platform::private_dir(&paths.state.join("transcripts"))?;
+        let machines = read_state(&paths.state.join("machines.json"))?;
+        let peers = read_state(&paths.state.join("peers.json"))?;
+        let (jobs, jobs_rx) = tokio::sync::mpsc::unbounded_channel();
+        let core = Arc::new(Core {
+            info,
+            login_session: platform::login_session(),
+            started: Instant::now(),
+            stop: Notify::new(),
+            restart: Default::default(),
+            registry_writer: RegistryWriter::new(paths.state.join("agents.json"))?,
+            paths,
+            state: Mutex::new(State { reg, docs, machines, peers, ..Default::default() }),
+            changed: Notify::new(),
+            jobs,
+            jobs_rx: Mutex::new(Some(jobs_rx)),
+            sweeps: Default::default(),
+            dirty: Default::default(),
+            save_due: Notify::new(),
+        });
+        crate::exec::sweep_leftovers(&core.paths.state);
+        core.reconcile_startup();
+        Ok(core)
+    }
+
+    /// Reconciles agents left `"live"` by an earlier core process: ACP stdio pipes never
+    /// cross process boundaries, so unkept ones finish and kept ones prepare for `recover_kept`.
+    fn reconcile_startup(&self) {
+        let mut st = self.lock();
+        let stale_ids: Vec<u32> = st.reg.agents.values().filter(|a| a.is_live()).map(Agent::id).collect();
+        let mut scopes = Vec::new();
+        for id in stale_ids {
+            if let Some(a) = st.reg.agents.get(&id)
+                && let Some(scope) = &a.scope
+            {
+                scopes.push(scope.clone());
+            }
+            let keep = st.reg.agents.get(&id).is_some_and(|a| a.keep);
+            if keep {
+                if let Some(a) = st.reg.agents.get_mut(&id) {
+                    a.pid = None;
+                    a.pending_permission = None;
+                    a.inbox_len = 0;
+                    if a.reason.is_none() {
+                        a.reason = Some("stopped_by_restart".into());
+                    }
+                    let _ = crate::status::reset(a);
+                }
+                if let Ok(t) = load_transcript(&self.paths.state, &address(id)) {
+                    st.transcripts.insert(id, t);
+                }
+            } else {
+                self.record_finish(&mut st, id, Exit::default(), "stopped_by_restart");
+            }
+        }
+        self.sweep_in_background(scopes);
+        self.prune(&mut st);
+        self.save(&st);
+    }
+
+    pub fn settings(&self) -> crate::config::Config {
+        crate::config::load(&self.paths.config).unwrap_or_default()
+    }
+
+    pub fn lock(&self) -> MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn save(&self, st: &State) {
+        self.dirty.store(false, std::sync::atomic::Ordering::SeqCst);
+        let bytes = serde_json::to_vec(&st.reg).expect("registry serializes");
+        self.registry_writer.save(bytes);
+    }
+
+    pub async fn flush_saved(&self) -> Result<(), RpcError> {
+        tokio::time::timeout(Duration::from_secs(10), self.registry_writer.flush())
+            .await
+            .map_err(|_| {
+                RpcError::new(
+                    "unavailable",
+                    "registry persistence timed out; the operation may already have completed",
+                    "check the agent and disk before retrying",
+                )
+            })?
+            .map_err(|e| RpcError::internal(format!("cannot save agents: {e}")))
+    }
+
+    pub fn save_soon(&self) {
+        if !self.dirty.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            self.save_due.notify_one();
+        }
+    }
+
+    pub async fn save_when_due(self: Arc<Self>) {
+        loop {
+            self.save_due.notified().await;
+            tokio::time::sleep(SAVE_SOON).await;
+            let st = self.lock();
+            if self.dirty.load(std::sync::atomic::Ordering::SeqCst) {
+                self.save(&st);
+            }
+        }
+    }
+
+    /// Appends one structured entry to the agent's transcript and notifies output watchers.
+    pub fn record_transcript(&self, st: &mut State, id: u32, entry: Entry) {
+        let addr = address(id);
+        let _ = append_disk(&self.paths.state, &addr, &entry);
+        let payload = serde_json::to_value(&entry).unwrap_or_default();
+        let snippet = match &entry {
+            Entry::Assistant { text, .. } => (!text.is_empty()).then(|| text.clone()),
+            Entry::Error { message, .. } => Some(format!("[error] {message}\n")),
+            Entry::ToolCall { title, status, .. } if !title.is_empty() => {
+                Some(format!("[tool: {status}] {title}\n"))
+            }
+            Entry::Permission { title, outcome, .. } => Some(format!("[permission: {outcome}] {title}\n")),
+            _ => None,
+        };
+        st.transcripts.entry(id).or_default().push(entry);
+        self.emit(st, "transcript", id, payload);
+        if let Some(chunk) = snippet
+            && let Some(watchers) = st.output_watch.get_mut(&id)
+        {
+            watchers.retain(|tx| tx.send(chunk.clone()).is_ok());
+            if watchers.is_empty() {
+                st.output_watch.remove(&id);
+            }
+        }
+    }
+
+    pub fn apply_status(&self, st: &mut State, id: u32, report: &StatusReport) {
+        let word = |st: &State| st.reg.agents.get(&id).and_then(|a| a.status.as_ref().map(|s| s.state.clone()));
+        let was = word(st);
+        let Some(a) = st.reg.agents.get_mut(&id).filter(|a| a.is_live()) else {
+            return;
+        };
+        let change = crate::status::apply(a, report);
+        self.status_changed(st, id, change);
+        if word(st) != was {
+            self.save(st);
+        } else {
+            self.save_soon();
+        }
+        self.changed.notify_waiters();
+    }
+
+    pub fn status_changed(&self, st: &mut State, id: u32, change: crate::status::Change) {
+        let a = st.reg.agents.get_mut(&id).expect("reported agent");
+        let first_task_finished = a.first_task_turn.is_some_and(|turn| {
+            a.turn > turn
+                || (change.root_report
+                    && a.status.as_ref().is_some_and(|s| matches!(s.state.as_str(), "done" | "blocked" | "error")))
+        });
+        if first_task_finished {
+            a.first_task_turn = None;
+        }
+        let (status, records, turn, reported, pending_permission, inbox_len) = (
+            a.status.clone(),
+            a.records.clone(),
+            a.turn,
+            a.reported,
+            a.pending_permission.clone(),
+            a.inbox_len,
+        );
+        if change.status {
+            self.emit(
+                st,
+                "status",
+                id,
+                serde_json::json!({
+                    "status": status,
+                    "records": records,
+                    "reported": reported,
+                    "pending_permission": pending_permission,
+                    "inbox_len": inbox_len,
+                }),
+            );
+        }
+        if change.turn_ended {
+            let state = status.map(|s| s.state);
+            self.emit(st, "turn", id, serde_json::json!({"turn": turn, "state": state}));
+        }
+        if (change.turn_ended || change.stuck || first_task_finished) && st.reg.agents[&id].is_live() {
+            self.news(st, id);
+        }
+    }
+
+    /// Resolves a blocked permission prompt for agent `id`.
+    pub fn resolve_permission(
+        &self,
+        id: u32,
+        approve: bool,
+        explicit_option: Option<&str>,
+    ) -> Result<(String, Option<String>), RpcError> {
+        let mut st = self.lock();
+        let a = st
+            .reg
+            .agents
+            .get(&id)
+            .ok_or_else(|| RpcError::new("not_found", format!("no agent {}", address(id)), ""))?;
+        if !a.is_live() {
+            return Err(RpcError::new("finished", format!("{} already exited", a.address), ""));
+        }
+        let Some(pending) = st.pending_perms.remove(&id) else {
+            return Err(RpcError::new(
+                "invalid_state",
+                format!("{} has no pending permission request", address(id)),
+                "wait until status is blocked before approving or denying",
+            ));
+        };
+
+        let chosen = if approve {
+            permissions::pick_approve(&pending.options, explicit_option)
+        } else {
+            permissions::pick_deny(&pending.options, explicit_option)
+        };
+
+        if explicit_option.is_some() && chosen.is_none() {
+            st.pending_perms.insert(id, pending);
+            return Err(RpcError::invalid_params("unknown permission option id"));
+        }
+        if approve && chosen.is_none() {
+            st.pending_perms.insert(id, pending);
+            return Err(RpcError::invalid_params("permission request offers no approval option"));
+        }
+
+        let payload = match &chosen {
+            Some(opt_id) => permission_selected(opt_id),
+            None => permission_cancelled(),
+        };
+        pending.transport.reply_result(pending.rpc_id, payload);
+
+        let outcome = if approve {
+            format!("approved ({})", chosen.as_deref().unwrap_or("ok"))
+        } else if let Some(opt_id) = &chosen {
+            format!("denied ({opt_id})")
+        } else {
+            "denied (cancelled)".into()
+        };
+        if let Some(a) = st.reg.agents.get_mut(&id) {
+            a.pending_permission = None;
+        }
+        self.record_transcript(
+            &mut st,
+            id,
+            Entry::Permission { turn: pending.turn, title: pending.title, outcome, ts_ms: now_ms() },
+        );
+        self.apply_status(&mut st, id, &StatusReport::root("working"));
+        self.save(&st);
+        Ok((pending.request_id, chosen))
+    }
+
+    pub fn read_transcript(&self, id: u32, lines: Option<usize>, last: bool) -> Result<(String, bool, &'static str), RpcError> {
+        let st = self.lock();
+        if let Some(t) = st.transcripts.get(&id) {
+            return Ok(t.render(lines, last));
+        }
+        drop(st);
+        let t = load_transcript(&self.paths.state, &address(id))
+            .map_err(|e| RpcError::internal(format!("cannot read transcript of {}: {e}", address(id))))?;
+        let rendered = t.render(lines, last);
+        let mut st = self.lock();
+        if st.reg.agents.contains_key(&id) {
+            st.transcripts.entry(id).or_insert(t);
+        }
+        Ok(rendered)
+    }
+
+    pub fn read_transcript_entries(&self, id: u32) -> Result<Vec<Entry>, RpcError> {
+        let st = self.lock();
+        if let Some(t) = st.transcripts.get(&id) {
+            return Ok(t.entries().to_vec());
+        }
+        drop(st);
+        let t = load_transcript(&self.paths.state, &address(id))
+            .map_err(|e| RpcError::internal(format!("cannot read transcript of {}: {e}", address(id))))?;
+        let entries = t.entries().to_vec();
+        let mut st = self.lock();
+        if st.reg.agents.contains_key(&id) {
+            st.transcripts.entry(id).or_insert(t);
+        }
+        Ok(entries)
+    }
+
+    pub fn finish(&self, st: &mut State, id: u32, exit: Exit) {
+        let reason = finish_reason(
+            st.killing.contains(&id),
+            st.stopping,
+            self.restart.load(std::sync::atomic::Ordering::SeqCst),
+            platform::host_shutdown_in_progress(),
+        );
+        self.record_finish(st, id, exit, reason);
+        self.save(st);
+        self.changed.notify_waiters();
+    }
+
+    pub(crate) fn record_finish(&self, st: &mut State, id: u32, exit: Exit, reason: &str) {
+        st.sessions.remove(&id);
+        st.inboxes.remove(&id);
+        st.pending_perms.remove(&id);
+        if !st.reg.agents.get(&id).is_some_and(|a| a.is_live()) {
+            return;
+        }
+        let reason = if st.killing.remove(&id) {
+            "killed"
+        } else if reason == "exited" && st.reg.agents[&id].keep && exit.code.is_none() && exit.signal.is_some() {
+            "signaled"
+        } else {
+            reason
+        };
+        if let Some(a) = st.reg.agents.get_mut(&id) {
+            a.first_task_turn = None;
+            a.pending_permission = None;
+            a.inbox_len = 0;
+            let change = crate::status::reset(a);
+            self.status_changed(st, id, change);
+        }
+        st.reg.finish(id, exit.code, exit.signal, reason, now_ms());
+        let finished_ms = st.reg.agents.get(&id).and_then(|a| a.finished_ms);
+        let end =
+            serde_json::json!({"reason": reason, "exit_code": exit.code, "signal": exit.signal, "finished_ms": finished_ms});
+        let pending = st.reg.agents[&id].is_live();
+        self.emit(st, if pending { "lost" } else { "finished" }, id, end);
+        if pending {
+            let a = st.reg.agents.get_mut(&id).expect("lost");
+            a.news += 1;
+            a.told_parent = false;
+        } else {
+            self.news(st, id);
+            let _ = self.jobs.send(crate::notes::Job::Orphaned(id));
+            crate::remote::orphaned_afar(self, st, id);
+        }
+        let rm = st.reg.agents.get(&id).is_some_and(|a| {
+            !a.is_live() && a.rm && !a.parent.as_ref().is_some_and(|p| st.waiting.contains_key(&(p.clone(), id)))
+        });
+        if rm {
+            self.remove(st, id);
+        }
+        self.prune(st);
+    }
+
+    pub fn prune(&self, st: &mut State) {
+        for gone in st.reg.expired(now_ms()) {
+            self.remove(st, gone);
+        }
+    }
+
+    pub fn remove(&self, st: &mut State, id: u32) {
+        let Some(was) = st.reg.agents.remove(&id) else { return };
+        st.transcripts.remove(&id);
+        st.sessions.remove(&id);
+        st.inboxes.remove(&id);
+        st.pending_perms.remove(&id);
+        self.emit_from(st, "removed", id, serde_json::json!({}), Some(&was));
+        let _ = std::fs::remove_file(transcript_path(&self.paths.state, &was.address));
+        let _ = std::fs::remove_dir_all(crate::put::dir(&self.paths.state, id));
+        self.save(st);
+    }
+
+    pub fn signal(&self, st: &State, id: u32, sig: i32) {
+        if let Some(session) = st.sessions.get(&id) {
+            session.transport.signal(sig);
+        }
+    }
+
+    /// Waits until `done` holds or the timeout passes; returns whether it held.
+    pub async fn wait_for(&self, timeout: Duration, done: impl Fn(&State) -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if done(&self.lock()) {
+                return true;
+            }
+            if tokio::time::timeout_at(deadline, notified).await.is_err() {
+                return done(&self.lock());
+            }
+        }
+    }
+
+    /// Terminates live agents cleanly (`HUP` -> `TERM` -> `KILL`) and cleans up records/scopes.
+    pub async fn kill(&self, ids: &[u32]) {
+        let all_done = |st: &State| ids.iter().all(|id| !st.sessions.contains_key(id));
+        {
+            let mut st = self.lock();
+            for &id in ids {
+                if !st.sessions.contains_key(&id) && st.reg.agents.get(&id).is_some_and(|a| a.is_live()) {
+                    let reason = if st.killing.contains(&id) {
+                        "killed"
+                    } else if self.restart.load(std::sync::atomic::Ordering::SeqCst) {
+                        "stopped_by_restart"
+                    } else {
+                        "server_stop"
+                    };
+                    self.record_finish(&mut st, id, Exit::default(), reason);
+                }
+            }
+            self.save(&st);
+        }
+        for (sig, wait) in [(signal::HUP, 500), (signal::TERM, 500), (signal::KILL, 2000)] {
+            {
+                let st = self.lock();
+                for &id in ids {
+                    self.signal(&st, id, sig);
+                }
+            }
+            if self.wait_for(Duration::from_millis(wait), all_done).await {
+                return;
+            }
+        }
+        let scopes: Vec<String> = {
+            let mut st = self.lock();
+            let scopes: Vec<String> =
+                ids.iter().filter_map(|id| st.reg.agents.get(id).and_then(|a| a.scope.clone())).collect();
+            for &id in ids {
+                let reason = if st.killing.contains(&id) { "killed" } else { "server_stop" };
+                self.record_finish(&mut st, id, Exit::default(), reason);
+            }
+            self.save(&st);
+            scopes
+        };
+        self.sweep_in_background(scopes);
+    }
+
+    fn sweep_in_background(&self, scopes: Vec<String>) {
+        if scopes.is_empty() {
+            return;
+        }
+        self.sweeps.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let sweeps = self.sweeps.clone();
+        std::thread::spawn(move || {
+            crate::sweep::sweep(&scopes);
+            sweeps.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
+
+    fn wait_for_sweeps(&self) {
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while self.sweeps.load(std::sync::atomic::Ordering::SeqCst) > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    /// Planned restart: stop active ACP adapters cleanly while leaving kept records live for `recover_kept`.
+    pub async fn handover(&self) -> io::Result<()> {
+        let live: Vec<u32> = {
+            let mut st = self.lock();
+            st.stopping = true;
+            st.reg.agents.values().filter(|a| a.is_live()).map(Agent::id).collect()
+        };
+        self.changed.notify_waiters();
+        self.kill(&live).await;
+        crate::exec::wait_all().await;
+        self.wait_for_sweeps();
+        {
+            let mut st = self.lock();
+            for id in live {
+                self.record_finish(&mut st, id, Exit::default(), "stopped_by_restart");
+            }
+            self.save(&st);
+        }
+        self.registry_writer.flush().await
+    }
+
+    /// Server stop: terminate all live agents and flush registry state.
+    pub async fn shutdown(&self) -> Result<(), RpcError> {
+        let live: Vec<u32> = {
+            let mut st = self.lock();
+            st.stopping = true;
+            st.reg.agents.values().filter(|a| a.is_live()).map(Agent::id).collect()
+        };
+        self.changed.notify_waiters();
+        self.kill(&live).await;
+        crate::exec::wait_all().await;
+        self.wait_for_sweeps();
+        {
+            let mut st = self.lock();
+            for id in live {
+                self.record_finish(&mut st, id, Exit::default(), "server_stop");
+            }
+            self.save(&st);
+        }
+        self.flush_saved().await
+    }
+}
+
+#[cfg(test)]
+mod tests;

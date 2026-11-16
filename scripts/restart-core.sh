@@ -1,8 +1,5 @@
 #!/bin/sh
 # Restarts the core with only the login's own variables instead of the calling shell's.
-# A running core keeps the environment it started with; one this starts gets only
-# these variables, so a build shell's (an agent's, a CI job's) never reach terminals.
-# The SSH markers only tell the core it was started over ssh; programs never see them.
 set -eu
 exe="$1"
 shift
@@ -28,6 +25,6 @@ exec env -i \
   ${XDG_DATA_HOME:+"XDG_DATA_HOME=$XDG_DATA_HOME"} \
   ${XDG_STATE_HOME:+"XDG_STATE_HOME=$XDG_STATE_HOME"} \
   ${XDG_RUNTIME_DIR:+"XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR"} \
-  ${HC_SESSION:+"HC_SESSION=$HC_SESSION"} \
-  ${HC_SOCKET:+"HC_SOCKET=$HC_SOCKET"} \
+  ${H2_SESSION:+"H2_SESSION=$H2_SESSION"} \
+  ${H2_SOCKET:+"H2_SOCKET=$H2_SOCKET"} \
   "$exe" server restart "$@"

@@ -1,26 +1,18 @@
 #!/bin/sh
-# Builds a previous release (a git ref) and checks that updating from it to
-# this tree keeps every terminal and machine running: tests/upgrade.rs.
-# Usage: scripts/upgrade-test.sh <ref>   (CI: the last release tag)
+# Builds a previous release (a git ref) and checks updating from it to this tree.
 set -eu
 ref=${1:?usage: scripts/upgrade-test.sh <git ref of the previous release>}
 root=$(git rev-parse --show-toplevel)
 sha=$(git -C "$root" rev-parse --short "$ref")
-bin=/var/tmp/hc-upgrade/$sha/herdr-core
+bin=/var/tmp/h2-upgrade/$sha/herdr2
 if [ ! -x "$bin" ]; then
-    src=/var/tmp/hc-upgrade/$sha-src
+    src=/var/tmp/h2-upgrade/$sha-src
     rm -rf "$src"
     git -C "$root" worktree add --detach "$src" "$ref"
-    # Ghostty: this checkout's when the ref pins the same commit, else fetched.
-    if [ "$(git -C "$root" ls-tree "$ref" vendor/ghostty)" = "$(git -C "$root" ls-tree HEAD vendor/ghostty)" ]; then
-        rmdir "$src/vendor/ghostty" && ln -s "$root/vendor/ghostty" "$src/vendor/ghostty"
-    else
-        git -C "$src" submodule update --init --depth 1 vendor/ghostty
-    fi
-    (cd "$src" && CARGO_TARGET_DIR=/var/tmp/hc-upgrade/target cargo build -q --bin herdr-core)
+    (cd "$src" && CARGO_TARGET_DIR=/var/tmp/h2-upgrade/target cargo build -q --bin herdr2)
     mkdir -p "$(dirname "$bin")"
-    cp /var/tmp/hc-upgrade/target/debug/herdr-core "$bin"
+    cp /var/tmp/h2-upgrade/target/debug/herdr2 "$bin"
     git -C "$root" worktree remove --force "$src"
 fi
 cd "$root"
-HC_OLD_BIN="$bin" cargo test -q --test upgrade -- --nocapture
+H2_OLD_BIN="$bin" cargo test -q --test acp_lifecycle -- --nocapture

@@ -1,111 +1,72 @@
 # Security and trust
 
-Core runs commands with your account's access. It is not a sandbox or a permission broker for agents.
-Anyone who can connect to its API can run commands, read and change files, and control its terminals with that access.
+Core runs ACP agents and commands with your account's access.
 
-[Back to the README](../README.md) · [API](../schema/README.md) · [Report a vulnerability](../SECURITY.md)
+[Back to the README](../README.md) · [API](../schema/README.md)
 
 ## What runs
 
-The CLI starts a background core when it needs one.
-Holder processes own the terminals so a core restart or update can leave programs running.
-Programs run as the account that runs core, with its filesystem and network access.
-Templates are shell commands and opening instructions, not isolation rules.
+The CLI starts a background core daemon when needed.
+Core spawns ACP adapters directly over stdio pipes (without PTYs, shells, or holder processes) using the running account's filesystem and network access.
+Templates and presets launch the configured agent commands as your account.
 
 Do not run core as root or as an administrator unless you intend to give its clients that access.
-A status of blocked can prevent a normal send, but it is not an access boundary against another client.
+ACP permission policies (`approve-reads` default) gate adapter tool permission requests via `blocked` state, while OS/container isolation remains the agent sandbox boundary.
 
 ## Who can connect
 
 On Unix, core listens on a local Unix socket, not a public TCP port.
-It creates its state and socket directories with mode 0700.
+It creates its state and socket directories with mode `0700`.
 It does not repair permissions on directories that already exist.
 Keep custom socket paths in directories only your account can enter.
 There is no separate API password or per-client permission check.
-Other programs running as your account are part of the trust boundary.
 
-On Windows, core uses named pipes. Their access rules allow the current account and SYSTEM.
-The integrity label prevents a lower-integrity process from controlling an elevated core.
-State files use the filesystem's directory permissions; core does not install a separate Windows state-directory ACL.
+On Windows, core uses named pipes whose ACLs allow the current account and `SYSTEM`.
 
-Do not expose the socket or forward the raw API to people you would not trust with a shell on that machine.
+## Sessions and coexistence
 
-## Sessions
-
-The default session is named default.
-Setting `HC_SESSION` selects a separate core, terminals, and state directory:
+The default session is named `default`.
+Setting `H2_SESSION` selects an isolated core, agent registry, transcripts, and endpoint:
 
 ```sh
-HC_SESSION=scratch hc ls
+H2_SESSION=scratch h2 ls
 ```
 
-Sessions are useful for tests and separate sets of work.
-They are not security boundaries: another process under the same account can select the same session.
-Config and templates are shared across sessions in the same config home.
-Tests should also use scratch XDG directories so they do not touch your real state or config.
+`herdr2` (`h2`) uses separate binary names, environment variables (`H2_*`), runtime sockets, and config/state directories from `herdr-core` (`hc`), allowing both to run simultaneously on the same host without conflict.
+Config and templates are shared across `herdr2` sessions under the same config home.
+Tests should use a dedicated `H2_SESSION` and scratch XDG directories so they do not touch your live state or config.
 
 ## Remote trust
 
 SSH handles login, host keys, and encryption. Core carries its protocol through that connection.
-A custom connection command must provide its own trust and transport guarantees.
-Core does not add another encryption layer or authenticate a remote user itself.
-
-Adding a machine gives local clients access to its hc account's commands, files, and terminals.
-Trust the destination, the SSH target, and any custom connection command.
-Machine installation or update copies executable code there and restarts that session's core.
-Forgetting a machine removes the connection here, not its remote programs or state.
+A custom `--via` command must provide its own trust and transport guarantees.
+Adding a machine gives local clients access to that remote `herdr2` core's agents, commands, and files.
+Forgetting a machine removes the connection here, leaving remote agents running.
 See [machines](machines.md).
 
 ## State and endpoints
 
 | Item | Default |
 | --- | --- |
-| Unix state | `~/.local/state/herdr-core/<session>/` |
-| Unix config | `~/.config/herdr-core/config.toml` |
-| Windows state | `%LOCALAPPDATA%\herdr-core\<session>\` |
-| Windows config | `%APPDATA%\herdr-core\config.toml` |
-| Templates | A templates directory beside the config file |
+| Unix state | `~/.local/state/herdr2/<session>/` |
+| Unix config | `~/.config/herdr2/config.toml` |
+| Windows state | `%LOCALAPPDATA%\herdr2\<session>\` |
+| Windows config | `%APPDATA%\herdr2\config.toml` |
+| Templates | `templates/` beside `config.toml` |
 
 `XDG_STATE_HOME` and `XDG_CONFIG_HOME` override the state and config homes on both platforms.
-On Unix, sockets live under `$XDG_RUNTIME_DIR/herdr-core/` when set.
-Otherwise core uses `/run/user/<uid>/herdr-core/` if that runtime directory exists, then falls back to the session's state directory.
-The client socket is named `<session>.sock`; holder sockets sit beside it.
-On Windows, pipe names include the account name and session.
+On Unix, sockets live under `$XDG_RUNTIME_DIR/herdr2/<session>.sock` when set, falling back to `/run/user/<uid>/herdr2/` and then the session's state directory.
+`H2_SOCKET` overrides the client endpoint (else `socket` in `config.toml`).
 
-`HC_SOCKET` overrides the client endpoint. Otherwise the socket setting in config can override it.
-A custom endpoint does not move the state directory.
-Keep Unix socket paths short; the OS limits their length.
-
-State includes terminal records, saved screens and history, machine connections, peer records, and API documents.
-Core and holder logs also live there. Treat the whole directory as private: terminal output and saved screens may contain secrets.
-State is not encrypted by core. Removing state is destructive, not a way to stop running programs safely.
+State includes `agents.json`, per-agent JSONL transcripts under `transcripts/<address>.jsonl`, `machines.json`, `peers.json`, `docs.json`, and `core.log`. Treat the state directory as private since transcripts may contain secrets.
 
 ## Updates and signing
 
 ```sh
-hc update
-hc update --version 0.1.5
+h2 update
+h2 update --version 0.2.0
 ```
 
-The version form means at least that version, not an exact downgrade.
-Updates restart the core while holders keep the terminals running.
-An update may also restart an older running core when the installed binary is already current.
-
-Release installers and updates download a manifest and check the archive's SHA-256 against it.
-The default release service is HTTPS at releases.herdr.dev.
-This trusts the release service and HTTPS; a checksum is not an independently signed release manifest.
-The manifest is not verified with a separate signing key.
-
-Windows release signing is conditional in the release workflow.
-When the signing profile is configured, the workflow signs and verifies the executable with Azure Artifact Signing.
-If the profile is unset, it publishes unsigned builds. Windows may block those builds.
-Do not assume every downloaded build is signed.
-
-`hc update --from /path/to/herdr-core` installs a local build instead of downloading one.
-Only use a build you trust. The updater's compatibility checks are not a review of its code.
-
-On macOS, a release that ships `Herdr Core.app` installs as that bundle when hc is installed under your home folder and not as root.
-With the default release service, the installer and `hc update` refuse the bundle unless `codesign` finds it signed by Herdr's Apple team (`2W9652Q7QR`) with identifier `dev.herdr.core`.
-Once hc runs from the bundle, an update will not replace it with a bare executable.
-As root or outside your home folder, they install the plain `herdr-core` executable, checked only by its SHA-256.
-With another `HERDR_RELEASES_URL`, or `hc update --from` a bundle, an ad-hoc signature with that identifier is enough, so that service or file is trusted as it is.
+Release installers and updates verify archive SHA-256 digests from the release manifest (`HERDR2_RELEASES_URL` overrides the default URL).
+On macOS per-user home installs, `Herdr2.app` is installed under `~/.local/share/herdr2/active/Herdr2.app` with links in `~/.local/bin` and identifier `dev.herdr2.core`.
+`h2 update --from /path/to/herdr2` installs a trusted local build.
