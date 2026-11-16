@@ -5,6 +5,7 @@ async fn provisional_grants_survive_only_successful_or_ambiguous_launches() {
     let root = crate::test_tmp().join(format!("h2-run-grants-{}", crate::platform::random_hex()));
     let paths = crate::paths::Paths {
         socket: root.join("core.sock"),
+        holder_socket: root.join("holder.sock"),
         state: root.clone(),
         config: root.join("config.toml"),
     };

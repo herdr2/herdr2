@@ -7,6 +7,30 @@ use std::os::unix::process::CommandExt;
 use std::process::Command;
 
 type Disclaim = unsafe extern "C" fn(*mut libc::posix_spawnattr_t, libc::c_int) -> libc::c_int;
+const MARKER: &str = "_H2_RESPONSIBLE_PID";
+
+pub fn holder_startup() {
+    if std::env::args_os().nth(1).as_deref() != Some(OsStr::new("hold")) {
+        return;
+    }
+    let marked = std::env::var(MARKER).ok() == Some(std::process::id().to_string());
+    unsafe { std::env::remove_var(MARKER) };
+    if marked {
+        return;
+    }
+    let result = (|| {
+        // AppKit must discover the signed bundle, even when h2 was invoked through an install symlink.
+        let exe = std::env::current_exe()?;
+        let exe = exe.canonicalize().ok().filter(|p| super::macos_bundle::source_is_bundle(p)).unwrap_or(exe);
+        let mut cmd = Command::new(exe);
+        cmd.args(std::env::args_os().skip(1)).env(MARKER, std::process::id().to_string());
+        exec(cmd)
+    })();
+    if let Err(error) = result {
+        eprintln!("h2: cannot disclaim holder responsibility: {error}");
+        std::process::exit(1);
+    }
+}
 
 /// SETEXEC leaves no short-lived wrapper as the privacy subject. If the SPI is
 /// absent, retain the previous exec behavior rather than preventing startup.

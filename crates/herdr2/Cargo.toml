@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
+ghostty-vt = { path = "../ghostty-vt" }
 schemars = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -35,6 +36,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_IO",
     "Win32_System_JobObjects",
     "Win32_System_Kernel",
+    "Win32_System_LibraryLoader",
     "Win32_System_Pipes",
     "Win32_System_Threading",
     "Win32_System_RemoteDesktop",

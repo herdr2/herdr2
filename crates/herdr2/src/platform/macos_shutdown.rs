@@ -261,6 +261,7 @@ mod tests {
             state: root.join("state"),
             config: root.join("config.toml"),
             socket: root.join("core.sock"),
+            holder_socket: root.join("holder.sock"),
         };
         paths().create_dirs().unwrap();
         let info = || CoreInfo { id: "test".into(), name: "test".into() };

@@ -38,6 +38,11 @@ pub fn dir(state: &Path, id: u32) -> PathBuf {
     state.join("files").join(crate::agents::address(id))
 }
 
+/// Where a PTY terminal's files go; removed with its record.
+pub fn terminal_dir(state: &Path, id: u32) -> PathBuf {
+    state.join("files").join(crate::terminals::address(id))
+}
+
 /// The basename, safe on any machine; `file` if nothing is left.
 fn clean(name: &str) -> String {
     let base = name.rsplit(['/', '\\']).next().unwrap_or_default();
@@ -49,8 +54,16 @@ fn clean(name: &str) -> String {
 
 /// Writes `bytes` as `name` (or `name-2.ext`, ... when taken) beside agent `id`.
 pub fn stage(state: &Path, id: u32, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
-    let dir = dir(state, id);
-    std::fs::create_dir_all(&dir)?;
+    stage_in(&dir(state, id), name, bytes)
+}
+
+/// Writes `bytes` as `name` (or `name-2.ext`, ... when taken) beside terminal `id`.
+pub fn stage_terminal(state: &Path, id: u32, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    stage_in(&terminal_dir(state, id), name, bytes)
+}
+
+fn stage_in(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
     let name = clean(name);
     let (stem, ext) = match name.rsplit_once('.').filter(|(stem, _)| !stem.is_empty()) {
         Some((stem, ext)) => (stem.to_string(), format!(".{ext}")),

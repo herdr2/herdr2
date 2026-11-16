@@ -1,6 +1,7 @@
 //! Forward a call after granting a remote run access to its local parent.
 
 use super::*;
+use crate::runtime::TargetKey;
 
 #[cfg(test)]
 mod tests;
@@ -9,27 +10,40 @@ mod tests;
 /// Cancellation or a lost reply may hide a started child, so retain by default.
 struct RunGrant<'a> {
     core: &'a Core,
-    key: (u32, String),
+    key: (TargetKey, String),
     keep: bool,
 }
 
 impl<'a> RunGrant<'a> {
     fn start(core: &'a Core, m: &Machine, method: &str, params: &Value) -> Option<Self> {
         // An explicit parent is resolved on the destination, not on this core.
-        if method != "agent.run" || params["no_parent"] == true || !params["parent"].is_null() {
+        if !matches!(method, "agent.run" | "terminal.run") || params["no_parent"] == true || !params["parent"].is_null() {
             return None;
         }
         let caller = crate::addr::local(params["caller"].as_str()?, &core.info.id, &core.info.name).ok()?;
-        let parent = crate::agents::parse_id(caller)?;
+        let parent = TargetKey::parse(caller)?;
         let key = (parent, m.id.clone());
         let mut st = core.lock();
-        let a = st.reg.agents.get(&parent)?;
-        if a.afar.contains(&m.id) && !st.afar_runs.contains_key(&key) {
-            return None; // A previous launch already made this grant permanent.
+        match parent {
+            TargetKey::Agent(id) => {
+                let a = st.reg.agents.get(&id)?;
+                if a.afar.contains(&m.id) && !st.afar_runs.contains_key(&key) {
+                    return None;
+                }
+                st.afar_runs.entry(key.clone()).or_default().0 += 1;
+                st.reg.agents.get_mut(&id)?.afar.insert(m.id.clone());
+                core.save(&st);
+            }
+            TargetKey::Terminal(id) => {
+                let t = st.pty_reg.terminals.get(&id)?;
+                if t.afar.contains(&m.id) && !st.afar_runs.contains_key(&key) {
+                    return None;
+                }
+                st.afar_runs.entry(key.clone()).or_default().0 += 1;
+                st.pty_reg.terminals.get_mut(&id)?.afar.insert(m.id.clone());
+                core.save_pty(&st);
+            }
         }
-        st.afar_runs.entry(key.clone()).or_default().0 += 1;
-        st.reg.agents.get_mut(&parent)?.afar.insert(m.id.clone());
-        core.save(&st);
         Some(Self { core, key, keep: true })
     }
 
@@ -51,9 +65,21 @@ impl Drop for RunGrant<'_> {
         }
         let keep = *keep;
         st.afar_runs.remove(&self.key);
-        if !keep && let Some(a) = st.reg.agents.get_mut(&self.key.0) {
-            a.afar.remove(&self.key.1);
-            self.core.save(&st);
+        if !keep {
+            match self.key.0 {
+                TargetKey::Agent(id) => {
+                    if let Some(a) = st.reg.agents.get_mut(&id) {
+                        a.afar.remove(&self.key.1);
+                        self.core.save(&st);
+                    }
+                }
+                TargetKey::Terminal(id) => {
+                    if let Some(t) = st.pty_reg.terminals.get_mut(&id) {
+                        t.afar.remove(&self.key.1);
+                        self.core.save_pty(&st);
+                    }
+                }
+            }
         }
     }
 }
@@ -65,17 +91,23 @@ fn not_started(e: &RpcError) -> bool {
         "invalid_params" | "invalid_template" | "config" | "name_taken" | "not_found" | "machine_unknown"
         | "unknown_method" | "spawn_failed" => true,
         "unavailable" => {
-            e.message == "the core is stopping" || e.message == "this core has used every agent id"
+            e.message == "the core is stopping"
+                || e.message == "this core has used every agent id"
+                || e.message == "this core has used every terminal id"
         }
         _ => false,
     }
 }
 
 pub(super) async fn forward_once(core: &Core, m: &Machine, method: &str, mut params: Value) -> Result<Value, RpcError> {
-    if method == "agent.run" {
+    if matches!(method, "agent.run" | "terminal.run") {
         params["die_with_parent"] = json!(params["outlive_parent"] != true);
     }
-    let deadline = if method == "agent.send" { Duration::MAX } else { deadline_for(core, method, &params) };
+    let deadline = if matches!(method, "agent.send" | "terminal.send") {
+        Duration::MAX
+    } else {
+        deadline_for(core, method, &params)
+    };
     let line = line(core, m).await?;
     let grant = RunGrant::start(core, m, method, &params);
     let result = line.call(&m.name, method, params, deadline).await;

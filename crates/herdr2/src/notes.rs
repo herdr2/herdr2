@@ -1,25 +1,28 @@
 //! Parents and children: news about a child is queued into its parent's ACP
-//! inbox as a marked note, only when the parent can take it and hasn't seen it.
+//! inbox (or typed into a parent PTY terminal) as a marked note, only when the
+//! parent can take it and hasn't seen it.
 
 use crate::acp::{QueuedPrompt, SessionCommand};
-use crate::agents::{Agent, parse_id};
+use crate::agents::Agent;
+use crate::pty_input::{Step, paste};
 use crate::rpc::RpcError;
-use crate::runtime::{Core, State, now_ms};
+use crate::runtime::{Core, State, TargetKey, now_ms};
+use crate::terminals::Terminal;
 use std::sync::Arc;
 use std::time::Duration;
 
 /// Work that can't happen on the thread that noticed it.
 pub enum Job {
-    /// Deliver pending notes into this parent's ACP inbox.
-    Notes(u32),
+    /// Deliver pending notes into this parent's ACP inbox or PTY terminal.
+    Notes(TargetKey),
     /// The parent finished: end children that asked to die with it.
-    Orphaned(u32),
-    /// News for a parent on a core that dialed in (`desktop/a3`).
+    Orphaned(TargetKey),
+    /// News for a parent on a core that dialed in (`desktop/a3` or `desktop/t3`).
     NotesAfar(String),
 }
 
-fn parent_id(a: &Agent) -> Option<u32> {
-    a.parent.as_deref().and_then(parse_id)
+fn parent_key(parent: Option<&str>) -> Option<TargetKey> {
+    parent.and_then(TargetKey::parse)
 }
 
 fn says(a: &Agent, word: &str) -> bool {
@@ -35,7 +38,19 @@ fn stuck(a: &Agent) -> bool {
     blocked(a) || says(a, "error")
 }
 
-/// Trailing lines of a child transcript/error when it exits without reporting.
+fn pty_says(t: &Terminal, word: &str) -> bool {
+    t.is_live() && t.status.as_ref().is_some_and(|s| s.state == word)
+}
+
+fn pty_blocked(t: &Terminal) -> bool {
+    pty_says(t, "blocked")
+}
+
+fn pty_stuck(t: &Terminal) -> bool {
+    pty_blocked(t) || pty_says(t, "error")
+}
+
+/// Trailing lines of a child transcript/screen when it exits without reporting.
 fn last_lines(text: &str) -> Vec<String> {
     const LINES: usize = 20;
     const WIDTH: usize = 300;
@@ -50,10 +65,16 @@ fn last_lines(text: &str) -> Vec<String> {
     lines
 }
 
-/// A parent can take a note when live, initialized, not blocked on an approval,
+/// A parent ACP agent can take a note when live, initialized, not blocked,
 /// and backed by an active ACP session.
 fn can_take_note(a: &Agent) -> bool {
     a.is_live() && a.reported && !blocked(a) && a.check_program().is_ok()
+}
+
+/// A parent PTY terminal can take a note when live, reported as an agent, not
+/// on a permission dialog, and running its program.
+fn pty_can_take_note(t: &Terminal) -> bool {
+    t.is_live() && t.reported && !pty_blocked(t) && t.check_program().is_ok()
 }
 
 /// `a7 reviewer`: address, then name or template.
@@ -64,27 +85,42 @@ pub fn who(a: &Agent) -> String {
     }
 }
 
-/// What a child can't say itself: it is blocked, it hit an error, or it is
-/// gone. Everything else it reports with `h2 send`.
-fn note(a: &Agent, address: &str, last: &[String]) -> String {
-    let status = a.status.as_ref();
-    let (what, look) = if blocked(a) {
+/// `t7 reviewer`: address, then name or template.
+pub fn pty_who(t: &Terminal) -> String {
+    match t.name.as_ref().or(t.template.as_ref()) {
+        Some(name) => format!("{} {name}", t.address),
+        None => t.address.clone(),
+    }
+}
+
+fn format_note(
+    status: Option<&crate::status::Status>,
+    is_blocked: bool,
+    is_stuck: bool,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    reason: Option<&str>,
+    name: Option<&str>,
+    address: &str,
+    last: &[String],
+) -> String {
+    let (what, look) = if is_blocked {
         let kind = status.and_then(|s| s.kind.as_deref()).unwrap_or("waiting");
         (format!("is blocked ({kind})"), "See")
-    } else if stuck(a) {
+    } else if is_stuck {
         match status.and_then(|s| s.msg.lines().next()).map(|m| m.trim_end_matches('.')).filter(|m| !m.is_empty()) {
             Some(msg) => (format!("hit an error: {}", msg.chars().take(200).collect::<String>()), "See"),
             None => ("hit an error".into(), "See"),
         }
     } else {
-        let how = match (a.exit_code, a.signal) {
+        let how = match (exit_code, signal) {
             (Some(code), _) => format!("exit {code}"),
             (_, Some(sig)) => format!("signal {sig}"),
-            _ => a.reason.clone().unwrap_or_else(|| "ended".into()),
+            _ => reason.unwrap_or("ended").to_string(),
         };
         (format!("exited ({how})"), "Read")
     };
-    let name = a.name.as_ref().or(a.template.as_ref()).map(|n| format!(" {n}")).unwrap_or_default();
+    let name = name.map(|n| format!(" {n}")).unwrap_or_default();
     let gap = match last.is_empty() {
         true => ". ".to_string(),
         false => format!(". Last lines:\n{}\n", last.join("\n")),
@@ -92,8 +128,37 @@ fn note(a: &Agent, address: &str, last: &[String]) -> String {
     format!("<h2>{address}{name} {what}{gap}{look}: h2 read {address}</h2>")
 }
 
+/// What a child can't say itself: it is blocked, it hit an error, or it is gone.
+fn note(a: &Agent, address: &str, last: &[String]) -> String {
+    format_note(
+        a.status.as_ref(),
+        blocked(a),
+        stuck(a),
+        a.exit_code,
+        a.signal,
+        a.reason.as_deref(),
+        a.name.as_ref().or(a.template.as_ref()).map(String::as_str),
+        address,
+        last,
+    )
+}
+
+fn pty_note(t: &Terminal, address: &str, last: &[String]) -> String {
+    format_note(
+        t.status.as_ref(),
+        pty_blocked(t),
+        pty_stuck(t),
+        t.exit_code,
+        t.signal,
+        t.reason.as_deref(),
+        t.name.as_ref().or(t.template.as_ref()).map(String::as_str),
+        address,
+        last,
+    )
+}
+
 impl Core {
-    /// The note about child `id`, called `address` by its parent.
+    /// The note about ACP child `id`, called `address` by its parent.
     fn note_for(&self, st: &State, id: u32, address: &str) -> String {
         let a = &st.reg.agents[&id];
         let last = if !a.is_live() && a.exit_code.is_some_and(|c| c != 0) {
@@ -105,21 +170,46 @@ impl Core {
         note(a, address, &last)
     }
 
-    /// Something notable happened to `id` (a turn ended, it got stuck, it exited).
+    /// The note about PTY child `id`, called `address` by its parent.
+    fn pty_note_for(&self, st: &State, id: u32, address: &str) -> String {
+        let t = &st.pty_reg.terminals[&id];
+        let last = if !t.is_live() && !t.reported {
+            last_lines(&self.screen_text(st, id).unwrap_or_default())
+        } else {
+            Vec::new()
+        };
+        pty_note(t, address, &last)
+    }
+
+    /// Something notable happened to ACP child `id`.
     pub fn news(&self, st: &mut State, id: u32) {
         let Some(a) = st.reg.agents.get_mut(&id) else { return };
         a.news += 1;
         if std::mem::take(&mut a.told_parent) && !stuck(a) && a.is_live() {
             a.seen = a.news;
         }
-        match (parent_id(a), &a.parent) {
+        match (parent_key(a.parent.as_deref()), &a.parent) {
             (Some(p), _) if a.notify => drop(self.jobs.send(Job::Notes(p))),
             (None, Some(afar)) if a.notify => drop(self.jobs.send(Job::NotesAfar(afar.clone()))),
             _ => {}
         }
     }
 
-    /// The caller looked at `id`; if it is the parent, that news is seen.
+    /// Something notable happened to PTY child `id`.
+    pub fn pty_news(&self, st: &mut State, id: u32) {
+        let Some(t) = st.pty_reg.terminals.get_mut(&id) else { return };
+        t.news += 1;
+        if std::mem::take(&mut t.told_parent) && !pty_stuck(t) && t.is_live() {
+            t.seen = t.news;
+        }
+        match (parent_key(t.parent.as_deref()), &t.parent) {
+            (Some(p), _) if t.notify => drop(self.jobs.send(Job::Notes(p))),
+            (None, Some(afar)) if t.notify => drop(self.jobs.send(Job::NotesAfar(afar.clone()))),
+            _ => {}
+        }
+    }
+
+    /// The caller looked at ACP child `id`; if it is the parent, that news is seen.
     pub fn saw(&self, caller: Option<&str>, id: u32) {
         let mut st = self.lock();
         if let Some(a) = st.reg.agents.get_mut(&id)
@@ -133,41 +223,96 @@ impl Core {
         }
     }
 
-    /// Text from the agent `from` (a caller address) to the agent `to`, wrapped in
-    /// `<h2>` tags attributing the sender.
+    /// The caller looked at PTY child `id`; if it is the parent, that news is seen.
+    pub fn pty_saw(&self, caller: Option<&str>, id: u32) {
+        let mut st = self.lock();
+        if let Some(t) = st.pty_reg.terminals.get_mut(&id)
+            && caller.is_some()
+            && t.parent.as_deref() == caller
+            && t.seen < t.news
+        {
+            t.seen = t.news;
+            t.seen_ms = Some(now_ms());
+            self.save_pty(&st);
+        }
+    }
+
+    fn sender_label(&self, st: &State, from: Option<&str>, to: TargetKey) -> Option<(String, String)> {
+        let from = from?;
+        if let Some(key) = TargetKey::parse(from).filter(|k| *k != to) {
+            return match key {
+                TargetKey::Agent(f) => st.reg.agents.get(&f).filter(|s| s.reported).map(|s| (who(s), s.address.clone())),
+                TargetKey::Terminal(f) => {
+                    st.pty_reg.terminals.get(&f).filter(|s| s.reported).map(|s| (pty_who(s), s.address.clone()))
+                }
+            };
+        }
+        None
+    }
+
+    /// Text from `from` to ACP agent `to`, wrapped in `<h2>` tags attributing the sender.
     pub fn tagged(&self, from: Option<&str>, to: u32, text: &str, reach: bool) -> String {
         if !self.notes_on() {
             return text.to_string();
         }
         let st = self.lock();
-        let sender = from.and_then(parse_id).filter(|f| *f != to).and_then(|f| st.reg.agents.get(&f));
-        let target = st.reg.agents.get(&to);
-        if let Some(afar) = from.filter(|f| f.rsplit_once('/').is_some_and(|(_, local)| parse_id(local).is_some()))
-            && target.is_some_and(|a| a.reported)
-        {
+        if !st.reg.agents.get(&to).is_some_and(|a| a.reported) {
+            return text.to_string();
+        }
+        if let Some(afar) = from.filter(|f| f.rsplit_once('/').is_some_and(|(_, local)| TargetKey::parse(local).is_some())) {
             return format!("<h2 from=\"{afar}\">{text}</h2>");
         }
-        match sender.filter(|s| s.reported && target.is_some_and(|a| a.reported)) {
-            Some(s) if reach => {
-                format!("<h2 from=\"{}\" reach=\"h2 send {} when done or stuck\">{text}</h2>", who(s), s.address)
+        match self.sender_label(&st, from, TargetKey::Agent(to)) {
+            Some((label, addr)) if reach => {
+                format!("<h2 from=\"{label}\" reach=\"h2 send {addr} when done or stuck\">{text}</h2>")
             }
-            Some(s) => format!("<h2 from=\"{}\">{text}</h2>", who(s)),
+            Some((label, _)) => format!("<h2 from=\"{label}\">{text}</h2>"),
             None => text.to_string(),
         }
     }
 
-    /// Children of `parent` that are stuck or gone with news it hasn't seen,
-    /// been told, or isn't already waiting for.
-    fn unseen(&self, st: &State, address: &str) -> Vec<u32> {
-        let address = address.to_string();
-        st.reg
+    /// Text from `from` to PTY terminal `to`, wrapped in `<h2>` tags if both reported as agents.
+    pub fn pty_tagged(&self, from: Option<&str>, to: u32, text: &str, reach: bool) -> String {
+        if !self.notes_on() {
+            return text.to_string();
+        }
+        let st = self.lock();
+        if !st.pty_reg.terminals.get(&to).is_some_and(|t| t.reported) {
+            return text.to_string();
+        }
+        if let Some(afar) = from.filter(|f| f.rsplit_once('/').is_some_and(|(_, local)| TargetKey::parse(local).is_some())) {
+            return format!("<h2 from=\"{afar}\">{text}</h2>");
+        }
+        match self.sender_label(&st, from, TargetKey::Terminal(to)) {
+            Some((label, addr)) if reach => {
+                format!("<h2 from=\"{label}\" reach=\"h2 send {addr} when done or stuck\">{text}</h2>")
+            }
+            Some((label, _)) => format!("<h2 from=\"{label}\">{text}</h2>"),
+            None => text.to_string(),
+        }
+    }
+
+    /// Children (ACP agents and PTY terminals) of `address` with unseen news.
+    fn unseen(&self, st: &State, address: &str) -> (Vec<u32>, Vec<u32>) {
+        let acp_kids = st
+            .reg
             .agents
             .values()
-            .filter(|a| a.parent.as_deref() == Some(address.as_str()) && a.notify)
+            .filter(|a| a.parent.as_deref() == Some(address) && a.notify)
             .filter(|a| a.news > a.seen.max(a.noted) && (stuck(a) || !a.is_live()))
-            .filter(|a| !st.waiting.contains_key(&(address.clone(), a.id())))
+            .filter(|a| !st.waiting.contains_key(&(address.to_string(), TargetKey::Agent(a.id()))))
             .map(Agent::id)
-            .collect()
+            .collect();
+        let pty_kids = st
+            .pty_reg
+            .terminals
+            .values()
+            .filter(|t| t.parent.as_deref() == Some(address) && t.notify)
+            .filter(|t| t.news > t.seen.max(t.noted) && (pty_stuck(t) || !t.is_live()))
+            .filter(|t| !st.waiting.contains_key(&(address.to_string(), TargetKey::Terminal(t.id()))))
+            .map(Terminal::id)
+            .collect();
+        (acp_kids, pty_kids)
     }
 
     /// Runs jobs for as long as the core runs.
@@ -183,26 +328,40 @@ impl Core {
                 Job::NotesAfar(parent) => {
                     let mut st = self.lock();
                     let Some(called) = crate::remote::called_there(&st, &parent) else { continue };
-                    let kids = self.unseen(&st, &parent);
-                    if kids.is_empty() {
+                    let (acp_kids, pty_kids) = self.unseen(&st, &parent);
+                    if acp_kids.is_empty() && pty_kids.is_empty() {
                         continue;
                     }
-                    let notes: Vec<String> = kids
+                    let mut notes: Vec<String> = acp_kids
                         .iter()
                         .map(|id| self.note_for(&st, *id, &format!("{called}/{}", crate::agents::address(*id))))
                         .collect();
-                    for id in &kids {
+                    notes.extend(
+                        pty_kids
+                            .iter()
+                            .map(|id| self.pty_note_for(&st, *id, &format!("{called}/{}", crate::terminals::address(*id)))),
+                    );
+                    for id in &acp_kids {
                         let a = st.reg.agents.get_mut(id).expect("listed");
                         a.noted = a.noted.max(a.news);
                     }
-                    self.save(&st);
+                    for id in &pty_kids {
+                        let t = st.pty_reg.terminals.get_mut(id).expect("listed");
+                        t.noted = t.noted.max(t.news);
+                    }
+                    if !acp_kids.is_empty() {
+                        self.save(&st);
+                    }
+                    if !pty_kids.is_empty() {
+                        self.save_pty(&st);
+                    }
                     crate::remote::tell_peer(&self, &mut st, &parent, &notes);
                 }
                 Job::Orphaned(parent) => {
-                    let address = crate::agents::address(parent);
-                    let kids: Vec<u32> = {
+                    let address = parent.address();
+                    let (acp_kids, pty_kids): (Vec<u32>, Vec<u32>) = {
                         let mut st = self.lock();
-                        let kids: Vec<u32> = st
+                        let acp_kids: Vec<u32> = st
                             .reg
                             .agents
                             .values()
@@ -211,11 +370,24 @@ impl Core {
                             })
                             .map(Agent::id)
                             .collect();
-                        st.killing.extend(&kids);
-                        kids
+                        let pty_kids: Vec<u32> = st
+                            .pty_reg
+                            .terminals
+                            .values()
+                            .filter(|t| {
+                                t.is_live() && t.die_with_parent && t.parent.as_deref() == Some(address.as_str())
+                            })
+                            .map(Terminal::id)
+                            .collect();
+                        st.killing.extend(&acp_kids);
+                        st.pty_killing.extend(&pty_kids);
+                        (acp_kids, pty_kids)
                     };
                     let core = self.clone();
-                    tokio::spawn(async move { core.kill(&kids).await });
+                    tokio::spawn(async move {
+                        core.kill(&acp_kids).await;
+                        core.pty_kill(&pty_kids).await;
+                    });
                 }
             }
         }
@@ -225,8 +397,16 @@ impl Core {
         crate::config::load(&self.paths.config).map(|c| c.notes.unwrap_or(true)).unwrap_or(true)
     }
 
-    async fn deliver_notes(self: Arc<Self>, parent: u32) {
+    async fn deliver_notes(self: Arc<Self>, parent: TargetKey) {
+        match parent {
+            TargetKey::Agent(id) => self.deliver_acp_notes(id).await,
+            TargetKey::Terminal(id) => self.deliver_pty_notes(id).await,
+        }
+    }
+
+    async fn deliver_acp_notes(self: Arc<Self>, parent: u32) {
         let enabled = self.notes_on();
+        let key = TargetKey::Agent(parent);
         loop {
             let ready = |st: &State| st.reg.agents.get(&parent).is_none_or(|a| !a.is_live() || can_take_note(a));
             while !self.wait_for(Duration::from_secs(60), ready).await {}
@@ -236,13 +416,14 @@ impl Core {
             }
             if !self.queue_note_batch(parent) {
                 let mut st = self.lock();
-                if self.unseen(&st, &crate::agents::address(parent)).is_empty() && !st.afar_notes.contains_key(&parent) {
-                    st.note_tasks.remove(&parent);
+                let (acp_kids, pty_kids) = self.unseen(&st, &crate::agents::address(parent));
+                if acp_kids.is_empty() && pty_kids.is_empty() && !st.afar_notes.contains_key(&key) {
+                    st.note_tasks.remove(&key);
                     return;
                 }
             }
         }
-        self.lock().note_tasks.remove(&parent);
+        self.lock().note_tasks.remove(&key);
     }
 
     fn queue_note_batch(&self, parent: u32) -> bool {
@@ -253,18 +434,29 @@ impl Core {
         if !can_take_note(p) || !st.sessions.contains_key(&parent) {
             return false;
         }
-        let afar = st.afar_notes.remove(&parent).unwrap_or_default();
-        let kids = self.unseen(&st, &crate::agents::address(parent));
-        if kids.is_empty() && afar.is_empty() {
+        let key = TargetKey::Agent(parent);
+        let addr = crate::agents::address(parent);
+        let afar = st.afar_notes.remove(&key).unwrap_or_default();
+        let (acp_kids, pty_kids) = self.unseen(&st, &addr);
+        if acp_kids.is_empty() && pty_kids.is_empty() && afar.is_empty() {
             return false;
         }
         let mut text: Vec<String> =
-            kids.iter().map(|id| self.note_for(&st, *id, &st.reg.agents[id].address)).collect();
+            acp_kids.iter().map(|id| self.note_for(&st, *id, &st.reg.agents[id].address)).collect();
+        text.extend(
+            pty_kids.iter().map(|id| self.pty_note_for(&st, *id, &st.pty_reg.terminals[id].address)),
+        );
         text.extend(afar);
-        let told: Vec<(u32, u64)> = kids.iter().map(|id| (*id, st.reg.agents[id].news)).collect();
-        for (id, news) in &told {
+        let told_acp: Vec<(u32, u64)> = acp_kids.iter().map(|id| (*id, st.reg.agents[id].news)).collect();
+        let told_pty: Vec<(u32, u64)> = pty_kids.iter().map(|id| (*id, st.pty_reg.terminals[id].news)).collect();
+        for (id, news) in &told_acp {
             if let Some(a) = st.reg.agents.get_mut(id) {
                 a.noted = a.noted.max(*news);
+            }
+        }
+        for (id, news) in &told_pty {
+            if let Some(t) = st.pty_reg.terminals.get_mut(id) {
+                t.noted = t.noted.max(*news);
             }
         }
         st.inboxes.entry(parent).or_default().push_back(QueuedPrompt { text: text.join("\n"), from: None });
@@ -276,7 +468,96 @@ impl Core {
             let _ = session.cmd_tx.send(SessionCommand::WakeInbox);
         }
         self.save(&st);
+        if !told_pty.is_empty() {
+            self.save_pty(&st);
+        }
         true
+    }
+
+    async fn deliver_pty_notes(self: Arc<Self>, parent: u32) {
+        let enabled = self.notes_on();
+        let key = TargetKey::Terminal(parent);
+        loop {
+            let ready = |st: &State| st.pty_reg.terminals.get(&parent).is_none_or(|t| !t.is_live() || pty_can_take_note(t));
+            while !self.wait_for(Duration::from_secs(60), ready).await {}
+            let alive = self.lock().pty_reg.terminals.get(&parent).is_some_and(|t| t.is_live());
+            if !alive || !enabled {
+                break;
+            }
+            match self.type_pty_note(parent).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(_) => continue,
+            }
+            let mut st = self.lock();
+            let (acp_kids, pty_kids) = self.unseen(&st, &crate::terminals::address(parent));
+            if acp_kids.is_empty() && pty_kids.is_empty() && !st.afar_notes.contains_key(&key) {
+                st.note_tasks.remove(&key);
+                return;
+            }
+        }
+        self.lock().note_tasks.remove(&key);
+    }
+
+    async fn type_pty_note(&self, parent: u32) -> Result<bool, RpcError> {
+        let quiet = crate::config::delivery(&self.paths.config).notes_quiet.unwrap_or_else(crate::pty_input::quiet);
+        let key = TargetKey::Terminal(parent);
+        let afar = self.lock().afar_notes.remove(&key).unwrap_or_default();
+        let typed = self
+            .type_in(parent, quiet, true, |st, t| {
+                if !pty_can_take_note(t) {
+                    return Err(RpcError::new("busy", "the parent got busy", ""));
+                }
+                let addr = crate::terminals::address(parent);
+                let (acp_kids, pty_kids) = self.unseen(st, &addr);
+                if acp_kids.is_empty() && pty_kids.is_empty() && afar.is_empty() {
+                    return Ok(((Vec::new(), Vec::new()), Vec::new()));
+                }
+                let mut text: Vec<String> =
+                    acp_kids.iter().map(|id| self.note_for(st, *id, &st.reg.agents[id].address)).collect();
+                text.extend(
+                    pty_kids.iter().map(|id| self.pty_note_for(st, *id, &st.pty_reg.terminals[id].address)),
+                );
+                text.extend(afar.iter().cloned());
+                let bracketed = st.screens.get(&parent).is_some_and(|s| s.dec_mode(2004));
+                let told_acp: Vec<(u32, u64)> = acp_kids.iter().map(|id| (*id, st.reg.agents[id].news)).collect();
+                let told_pty: Vec<(u32, u64)> = pty_kids.iter().map(|id| (*id, st.pty_reg.terminals[id].news)).collect();
+                let steps = vec![
+                    Step::Write(paste(bracketed, &text.join("\n"))),
+                    Step::Pause(crate::pty_input::PASTE_GAP),
+                    Step::Write(b"\r".to_vec()),
+                ];
+                Ok(((told_acp, told_pty), steps))
+            })
+            .await;
+        let (told_acp, told_pty) = match typed {
+            Ok(told) => told,
+            Err(e) => {
+                if !afar.is_empty() {
+                    self.lock().afar_notes.entry(key).or_default().splice(0..0, afar);
+                }
+                return Err(e);
+            }
+        };
+        let had_afar = !afar.is_empty();
+        let mut st = self.lock();
+        for (id, news) in &told_acp {
+            if let Some(a) = st.reg.agents.get_mut(id) {
+                a.noted = a.noted.max(*news);
+            }
+        }
+        for (id, news) in &told_pty {
+            if let Some(t) = st.pty_reg.terminals.get_mut(id) {
+                t.noted = t.noted.max(*news);
+            }
+        }
+        if !told_acp.is_empty() {
+            self.save(&st);
+        }
+        if !told_pty.is_empty() {
+            self.save_pty(&st);
+        }
+        Ok(!told_acp.is_empty() || !told_pty.is_empty() || had_afar)
     }
 }
 

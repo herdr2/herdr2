@@ -14,6 +14,18 @@ impl LoginSession {
     }
 }
 
+pub fn holder_current(
+    holder_build: &str,
+    core_build: &str,
+    draining: bool,
+    core: Option<LoginSession>,
+    holder: Option<LoginSession>,
+) -> bool {
+    holder_build == core_build
+        && !draining
+        && core.zip(holder).is_none_or(|(core, holder)| core.id == holder.id && core.user == holder.user)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -32,5 +44,17 @@ mod tests {
         for launcher in [session(20, Some(false)), session(20, None), LoginSession { user: 502, ..gui }] {
             assert!(!launcher.replaces(Some(session(10, Some(true)))));
         }
+    }
+
+    #[test]
+    fn a_holder_needs_the_build_session_and_no_prior_drain() {
+        let core = Some(session(20, Some(true)));
+        assert!(holder_current("same", "same", false, core, core));
+        assert!(!holder_current("old", "same", false, core, core));
+        assert!(!holder_current("same", "same", true, core, core));
+        assert!(!holder_current("same", "same", false, core, Some(session(10, Some(true)))));
+        assert!(!holder_current("same", "same", false, core, Some(session(10, Some(false)))));
+        assert!(holder_current("same", "same", false, core, None));
+        assert!(holder_current("same", "same", false, None, core));
     }
 }

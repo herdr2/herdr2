@@ -145,7 +145,7 @@ fn handle_json_rpc(msg: Value, call: &impl Fn(&str, Value) -> Result<Value, RpcE
 fn dispatch_tool(params: &Value, call: &impl Fn(&str, Value) -> Result<Value, RpcError>) -> Value {
     let name = params.get("name").and_then(Value::as_str).unwrap_or_default();
     let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
-    let me = client::agent_id();
+    let me = client::agent_id().or_else(client::terminal_id);
 
     let rpc = match name {
         "h2_run" => {

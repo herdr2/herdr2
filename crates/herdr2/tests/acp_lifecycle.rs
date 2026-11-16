@@ -124,3 +124,39 @@ fn waited_run_read_modes_interrupt_kill_and_rm_work_cleanly() {
     s.json(&["rm", &a]);
     assert_eq!(s.err(&["--json", "get", &a]).1["error"]["kind"], "not_found");
 }
+
+#[test]
+fn async_start_returns_starting_immediately_and_records_spawn_failure() {
+    let s = Session::new();
+    // Ensure daemon is started, then connect over Unix socket.
+    s.json(&["server", "status"]);
+    let mut conn = s.connect();
+
+    // Valid fake ACP agent with async_start: returns immediately with "starting", then transitions to "idle".
+    let parts: Vec<String> = fake_acp_spec().split_whitespace().map(str::to_owned).collect();
+    let res = conn.call(1, "agent.run", serde_json::json!({
+        "argv": parts,
+        "keep": true,
+        "async_start": true,
+    }));
+    let ok = &res["result"];
+    let addr = ok["address"].as_str().unwrap().to_owned();
+    assert_eq!(ok["status"]["state"], "starting", "{res}");
+    wait_until("async_start becomes idle", || get(&s, &addr)["status"]["state"] == "idle");
+
+    // Nonexistent binary with async_start + keep: returns immediately, then records Error + spawn_failed with keep=false.
+    let bad = conn.call(2, "agent.run", serde_json::json!({
+        "argv": ["herdr2-missing-binary-for-test-999"],
+        "keep": true,
+        "async_start": true,
+    }));
+    let bad_addr = bad["result"]["address"].as_str().unwrap().to_owned();
+    assert_eq!(bad["result"]["status"]["state"], "starting", "{bad}");
+    wait_until("bad async_start transitions to finished spawn_failed", || {
+        let g = get(&s, &bad_addr);
+        g["state"] == "finished" && g["reason"] == "spawn_failed"
+    });
+    let g = get(&s, &bad_addr);
+    assert_eq!(g["keep"], false, "{g}");
+    assert!(text(&s, &bad_addr).contains("not found") || text(&s, &bad_addr).contains("No such file"), "{g}");
+}

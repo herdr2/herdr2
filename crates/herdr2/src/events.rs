@@ -3,6 +3,7 @@
 
 use crate::agents::Agent;
 use crate::runtime::{Core, State};
+use crate::terminals::Terminal;
 use crate::wire::Conn;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -23,12 +24,14 @@ pub struct Events {
 pub struct Filter {
     /// One agent, by its address here (`a7`, `rohan/a7`).
     pub agent: Option<String>,
-    /// Children of this agent (`a3`).
+    /// One terminal, by its address here (`t7`, `rohan/t7`).
+    pub terminal: Option<String>,
+    /// Children of this agent or terminal (`a3`, `t3`).
     pub children_of: Option<String>,
     pub labels: BTreeMap<String, String>,
     /// Documents this subscriber asked for, by name or by a prefix ending in `*`
-    /// (`piher.cmd.a7`, `piher.*`). Empty hears every document event, as it always
-    /// has, but only while no agent is selected: a document concerns no agent.
+    /// (`piher.cmd.t7`, `piher.*`). Empty hears every document event, as it always
+    /// has, but only while no agent or terminal is selected: a document concerns neither.
     pub docs: Vec<String>,
     /// A core that dialed in: only what is here. What it hears from us it
     /// passes on, so two machines that added each other would echo forever.
@@ -37,22 +40,31 @@ pub struct Filter {
 
 impl Filter {
     /// `record`: an agent as clients see it (here or on another machine).
-    fn matches(&self, record: &Value) -> bool {
-        self.agent.as_ref().is_none_or(|a| record["address"] == a.as_str())
+    fn matches_agent(&self, record: &Value) -> bool {
+        self.terminal.is_none()
+            && self.agent.as_ref().is_none_or(|a| record["address"] == a.as_str())
             && self.children_of.as_ref().is_none_or(|p| record["parent"] == p.as_str())
             && self.labels.iter().all(|(k, v)| record["labels"][k] == v.as_str())
     }
 
-    /// No agent selection at all: this subscriber asked for everything.
-    fn all_agents(&self) -> bool {
-        self.agent.is_none() && self.children_of.is_none() && self.labels.is_empty()
+    /// `record`: a terminal as clients see it (here or on another machine).
+    fn matches_terminal(&self, record: &Value) -> bool {
+        self.agent.is_none()
+            && self.terminal.as_ref().is_none_or(|t| record["address"] == t.as_str())
+            && self.children_of.as_ref().is_none_or(|p| record["parent"] == p.as_str())
+            && self.labels.iter().all(|(k, v)| record["labels"][k] == v.as_str())
+    }
+
+    /// No agent or terminal selection at all: this subscriber asked for everything.
+    fn all_targets(&self) -> bool {
+        self.agent.is_none() && self.terminal.is_none() && self.children_of.is_none() && self.labels.is_empty()
     }
 
     /// Whether this subscriber hears the document event for `name`: the names it
-    /// asked for, or every one when it asked for none and selected no agent.
+    /// asked for, or every one when it asked for none and selected no target.
     fn wants_doc(&self, name: &str) -> bool {
         if self.docs.is_empty() {
-            return self.all_agents();
+            return self.all_targets();
         }
         self.docs.iter().any(|pattern| match pattern.strip_suffix('*') {
             Some(prefix) => name.starts_with(prefix),
@@ -63,25 +75,34 @@ impl Filter {
     /// Whether a lost document stream concerns it: a document reader (it named
     /// names) or a subscriber that hears everything.
     fn wants_documents(&self) -> bool {
-        !self.docs.is_empty() || self.all_agents()
+        !self.docs.is_empty() || self.all_targets()
     }
 
     /// Whether it wants agent facts at all. Naming anything narrows, as it does
-    /// in every other dimension of this filter, so naming documents and no agent
-    /// asks for documents alone; naming both asks for both.
+    /// in every other dimension of this filter, so naming documents or a terminal
+    /// alone excludes agents.
     fn wants_agents(&self) -> bool {
-        self.docs.is_empty() || !self.all_agents()
+        (self.docs.is_empty() || !self.all_targets()) && self.terminal.is_none()
+    }
+
+    /// Whether it wants terminal facts at all.
+    fn wants_terminals(&self) -> bool {
+        (self.docs.is_empty() || !self.all_targets()) && self.agent.is_none()
     }
 }
 
 /// What a delivered event is about, which is what a subscriber's filter is read
-/// against: an agent (with the record it had, when it changed) or a document.
+/// against: an agent, a terminal, or a document.
 pub(crate) enum Target<'a> {
     Agent {
         record: &'a Value,
         was: Option<&'a Value>,
     },
-    /// A document fact concerns a name, not an agent: `record` is `Null`.
+    Terminal {
+        record: &'a Value,
+        was: Option<&'a Value>,
+    },
+    /// A document fact concerns a name, not an agent or terminal: `record` is `Null`.
     Doc {
         name: &'a str,
     },
@@ -89,6 +110,10 @@ pub(crate) enum Target<'a> {
 
 fn record(a: &Agent) -> Value {
     json!(crate::agents::Public(a.clone()))
+}
+
+fn pty_record(t: &Terminal) -> Value {
+    json!(crate::terminals::Public(t.clone()))
 }
 
 pub enum Sink {
@@ -118,12 +143,23 @@ impl Core {
     pub fn matching(&self, st: &State, filter: &Filter) -> Vec<Value> {
         let here = st.reg.agents.values().map(record);
         let afar = st.mirrors.values().filter(|_| !filter.here_only).flat_map(|m| m.values().cloned());
-        here.chain(afar).filter(|r| filter.matches(r)).collect()
+        here.chain(afar).filter(|r| filter.matches_agent(r)).collect()
     }
 
-    /// Every agent the filter matches, with the sequence it is current at.
+    /// Terminals the filter matches: here, then those mirrored from machines.
+    pub fn matching_terminals(&self, st: &State, filter: &Filter) -> Vec<Value> {
+        let here = st.pty_reg.terminals.values().map(pty_record);
+        let afar = st.terminal_mirrors.values().filter(|_| !filter.here_only).flat_map(|m| m.values().cloned());
+        here.chain(afar).filter(|r| filter.matches_terminal(r)).collect()
+    }
+
+    /// Every agent and terminal the filter matches, with the sequence it is current at.
     pub fn snapshot(&self, st: &State, filter: &Filter) -> Value {
-        json!({"seq": st.events.seq, "agents": self.matching(st, filter)})
+        json!({
+            "seq": st.events.seq,
+            "agents": self.matching(st, filter),
+            "terminals": self.matching_terminals(st, filter),
+        })
     }
 
     pub fn subscribe(&self, st: &mut State, filter: Filter, sink: Sink) {
@@ -171,8 +207,33 @@ impl Core {
         self.deliver_event(st, params, Target::Agent { record, was });
     }
 
+    /// Records one fact change about terminal `id` (call before removing it).
+    pub fn emit_pty(&self, st: &mut State, kind: &str, id: u32, data: Value) {
+        self.emit_pty_from(st, kind, id, data, None);
+    }
+
+    /// A change that may move a terminal into or out of a filter (labels), or a removal.
+    pub fn emit_pty_from(&self, st: &mut State, kind: &str, id: u32, data: Value, was: Option<&Terminal>) {
+        let Some(t) = st.pty_reg.terminals.get(&id).or(was).map(pty_record) else { return };
+        self.deliver_pty(st, kind, &crate::terminals::address(id), data, &t, was.map(pty_record).as_ref());
+    }
+
+    /// One fact change about the terminal at `address` to every subscriber it concerns.
+    pub fn deliver_pty(
+        &self,
+        st: &mut State,
+        kind: &str,
+        address: &str,
+        data: Value,
+        record: &Value,
+        was: Option<&Value>,
+    ) {
+        let params = json!({"type": kind, "terminal": address, "data": data});
+        self.deliver_event(st, params, Target::Terminal { record, was });
+    }
+
     /// Documents concern the subscribers that named them, every subscriber while
-    /// nobody names any, and never an agent selection on its own.
+    /// nobody names any, and never an agent or terminal selection on its own.
     pub fn doc_event(&self, st: &mut State, name: &str, data: Value, machine: Option<&str>) {
         let mut params = json!({"type": "doc", "data": data});
         if let Some(machine) = machine {
@@ -184,7 +245,9 @@ impl Core {
     fn deliver_event(&self, st: &mut State, mut params: Value, target: Target<'_>) {
         st.events.seq += 1;
         params["seq"] = st.events.seq.into();
-        let afar = params["machine"].is_string() || params["agent"].as_str().is_some_and(|a| a.contains('/'));
+        let afar = params["machine"].is_string()
+            || params["agent"].as_str().is_some_and(|a| a.contains('/'))
+            || params["terminal"].as_str().is_some_and(|a| a.contains('/'));
         let plain = notification("event", params.clone());
         let with_record = |record: &Value| {
             let mut params = params.clone();
@@ -193,13 +256,19 @@ impl Core {
         };
         let mut subs = std::mem::take(&mut st.events.subs);
         subs.retain(|sub| {
-            // `record` is `Some` only for an agent the subscriber newly matches, which
+            // `record` is `Some` only for a record the subscriber newly matches, which
             // is also the only case that carries the record along with the fact.
             let (now, before, added) = match target {
                 Target::Agent { record, was } => (
-                    sub.filter.wants_agents() && sub.filter.matches(record),
-                    sub.filter.wants_agents() && was.is_some_and(|w| sub.filter.matches(w)),
-                    (was.is_some() && sub.filter.wants_agents() && sub.filter.matches(record)).then_some(record),
+                    sub.filter.wants_agents() && sub.filter.matches_agent(record),
+                    sub.filter.wants_agents() && was.is_some_and(|w| sub.filter.matches_agent(w)),
+                    (was.is_some() && sub.filter.wants_agents() && sub.filter.matches_agent(record)).then_some(record),
+                ),
+                Target::Terminal { record, was } => (
+                    sub.filter.wants_terminals() && sub.filter.matches_terminal(record),
+                    sub.filter.wants_terminals() && was.is_some_and(|w| sub.filter.matches_terminal(w)),
+                    (was.is_some() && sub.filter.wants_terminals() && sub.filter.matches_terminal(record))
+                        .then_some(record),
                 ),
                 Target::Doc { name } => (sub.filter.wants_doc(name), false, None),
             };
@@ -313,10 +382,16 @@ mod tests {
     fn naming_documents_alone_asks_for_documents_alone() {
         let docs_only = filter(&["app"], None);
         assert!(!docs_only.wants_agents(), "nothing asked for agents");
+        assert!(!docs_only.wants_terminals(), "nothing asked for terminals");
         assert!(docs_only.wants_doc("app"));
         let both = filter(&["app"], Some("a7"));
         assert!(both.wants_agents(), "an agent was named too");
+        assert!(!both.wants_terminals(), "selecting an agent excludes terminals");
         assert!(both.wants_doc("app"));
+        let term_only = Filter { terminal: Some("t7".into()), ..Filter::default() };
+        assert!(term_only.wants_terminals());
+        assert!(!term_only.wants_agents(), "selecting a terminal excludes agents");
+        assert!(!term_only.wants_doc("app"));
         let agents_only = filter(&[], Some("a7"));
         assert!(agents_only.wants_agents());
         assert!(!agents_only.wants_doc("app"), "it named no document");

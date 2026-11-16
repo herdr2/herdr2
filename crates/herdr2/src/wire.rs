@@ -13,6 +13,14 @@ pub const DATA: u8 = 0;
 pub const CREDIT: u8 = 1;
 /// The channel is over (JSON reason from the core, empty from a client).
 pub const CLOSE: u8 = 2;
+/// u16 LE cols, u16 LE rows: viewer -> core, core -> observer.
+pub const RESIZE: u8 = 3;
+/// Viewer -> core: 1 = gained focus, 0 = lost it.
+pub const FOCUS: u8 = 4;
+/// Viewer -> core: JSON display facts (colors, cell size).
+pub const FACTS: u8 = 5;
+/// Viewer -> core: terminal-generated replies, not human activity.
+pub const AUTOMATIC_INPUT: u8 = 6;
 
 /// Credit a stream starts with before the subscriber acknowledges anything.
 pub const WINDOW: usize = 256 * 1024;
@@ -138,6 +146,8 @@ impl Conn {
 
 struct Stream {
     pending: VecDeque<u8>,
+    /// RESIZE frames placed at byte offsets within `pending`.
+    resizes: VecDeque<(usize, Vec<u8>)>,
     paused: bool,
     credit: usize,
     /// The stream ended: CLOSE (with this reason) once `pending` is out.
@@ -173,7 +183,7 @@ impl Outbox {
     pub fn open(&mut self, channel: u32) {
         self.streams.insert(
             channel,
-            Stream { pending: VecDeque::new(), paused: false, credit: WINDOW, ending: None },
+            Stream { pending: VecDeque::new(), resizes: VecDeque::new(), paused: false, credit: WINDOW, ending: None },
         );
     }
 
@@ -191,6 +201,23 @@ impl Outbox {
 
     pub fn can_send(&self, channel: u32) -> bool {
         self.streams.get(&channel).is_some_and(|s| !s.paused && s.credit > 0)
+    }
+
+    /// Supersede pending output with a new grid and an authoritative repaint.
+    /// A partly delivered escape sequence is cancelled by the repaint's CAN.
+    pub fn resize(&mut self, channel: u32, size: &[u8]) {
+        if let Some(s) = self.streams.get_mut(&channel) {
+            s.pending.clear();
+            s.resizes.clear();
+            s.resizes.push_back((0, size.to_vec()));
+        }
+    }
+
+    /// Relay boundaries keep bytes already charged to the upstream credit window.
+    pub fn ordered_resize(&mut self, channel: u32, size: &[u8]) {
+        if let Some(s) = self.streams.get_mut(&channel) {
+            s.resizes.push_back((s.pending.len(), size.to_vec()));
+        }
     }
 
     /// Ends a stream now: whatever is queued is dropped.
@@ -213,6 +240,11 @@ impl Outbox {
         let Some(s) = self.streams.get_mut(&channel) else { return true };
         if s.pending.len() + bytes.len() > MAX_PENDING {
             s.pending.clear();
+            let latest = s.resizes.pop_back();
+            s.resizes.clear();
+            if let Some((_, size)) = latest {
+                s.resizes.push_back((0, size));
+            }
             return false;
         }
         s.pending.extend(bytes);
@@ -263,7 +295,15 @@ impl Outbox {
         let channel = *ready.iter().find(|ch| **ch > self.turn).or(ready.first())?;
         self.turn = channel;
         let s = self.streams.get_mut(&channel).expect("ready stream");
-        let n = s.pending.len().min(s.credit).min(CHUNK);
+        if s.resizes.front().is_some_and(|(at, _)| *at == 0) {
+            let (_, size) = s.resizes.pop_front().unwrap();
+            return Some(encode(channel, RESIZE, &size));
+        }
+        let boundary = s.resizes.front().map_or(usize::MAX, |(at, _)| *at);
+        let n = s.pending.len().min(s.credit).min(CHUNK).min(boundary);
+        for (at, _) in &mut s.resizes {
+            *at -= n;
+        }
         s.credit -= n;
         let chunk: Vec<u8> = s.pending.drain(..n).collect();
         Some(encode(channel, DATA, &chunk))

@@ -13,12 +13,42 @@ use crate::status::StatusReport;
 use crate::transcript::{Entry, Transcript, append_disk, load as load_transcript, path as transcript_path};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, oneshot};
 
 mod persistence;
+mod pty;
 use persistence::RegistryWriter;
+pub use pty::Link;
+
+/// Identifies either an ACP agent (`a*`) or a PTY terminal (`t*`) in shared
+/// maps (waits, notes, messages, last sends, remote outboxes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TargetKey {
+    Agent(u32),
+    Terminal(u32),
+}
+
+impl TargetKey {
+    pub fn parse(address: &str) -> Option<Self> {
+        if let Some(id) = crate::agents::parse_id(address) {
+            Some(Self::Agent(id))
+        } else if let Some(id) = crate::terminals::parse_id(address) {
+            Some(Self::Terminal(id))
+        } else {
+            None
+        }
+    }
+
+    pub fn address(self) -> String {
+        match self {
+            Self::Agent(id) => crate::agents::address(id),
+            Self::Terminal(id) => crate::terminals::address(id),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Exit {
@@ -31,7 +61,7 @@ pub struct Core {
     pub login_session: Option<platform::LoginSession>,
     pub started: Instant,
     pub stop: Notify,
-    /// Set by `server.restart`: on stop, cleanly end live ACP adapters and let kept agents recover on restart.
+    /// Set by `server.restart`: on stop, cleanly end live ACP adapters and hand over PTY holders so kept entries recover on restart.
     pub restart: std::sync::atomic::AtomicBool,
     pub paths: Paths,
     pub state: Mutex<State>,
@@ -40,14 +70,19 @@ pub struct Core {
     pub jobs: tokio::sync::mpsc::UnboundedSender<crate::notes::Job>,
     pub jobs_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<crate::notes::Job>>>,
     pub(crate) sweeps: Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) holder_start: Mutex<()>,
     dirty: std::sync::atomic::AtomicBool,
+    pty_dirty: std::sync::atomic::AtomicBool,
     save_due: Notify,
+    pub(crate) image_due: Notify,
     registry_writer: RegistryWriter,
+    pty_registry_writer: RegistryWriter,
 }
 
 #[derive(Default)]
 pub struct State {
     pub reg: Registry,
+    pub pty_reg: crate::terminals::Registry,
     pub docs: std::collections::BTreeMap<String, crate::api::DocGetResult>,
     pub sessions: HashMap<u32, SessionHandle>,
     pub inboxes: HashMap<u32, VecDeque<QueuedPrompt>>,
@@ -57,14 +92,34 @@ pub struct State {
     pub events: crate::events::Events,
     /// Waits matching streaming output (`agent.wait --output`).
     pub output_watch: HashMap<u32, Vec<tokio::sync::mpsc::UnboundedSender<String>>>,
-    /// The turn of each caller's last send to an agent, until a bare wait reports it.
-    pub last_send: HashMap<(String, u32), u64>,
-    /// Waits in progress by (caller, agent): a parent waiting needs no note.
-    pub waiting: HashMap<(String, u32), usize>,
-    /// A message was queued into this agent while it worked and no wait of its returned since.
-    pub messages: HashMap<u32, Option<String>>,
+    pub screens: HashMap<u32, ghostty_vt::Terminal>,
+    pub relays: HashMap<u32, crate::relay::Relay>,
+    pub image_deadlines: HashMap<u32, (u64, tokio::time::Instant)>,
+    pub viewers: HashMap<u32, Vec<crate::viewers::Viewer>>,
+    pub gates: HashMap<u32, crate::pty_input::Gate>,
+    pub queues: HashMap<u32, Arc<tokio::sync::Mutex<()>>>,
+    pub sends: HashMap<u32, Arc<tokio::sync::Mutex<()>>>,
+    pub foreground: HashMap<u32, Vec<oneshot::Sender<i32>>>,
+    pub pty_output_watch: HashMap<u32, Vec<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
+    pub last_output: HashMap<u32, Instant>,
+    pub output_seq: HashMap<u32, u64>,
+    pub stitching: HashSet<u32>,
+    pub stitched: HashMap<u32, (u64, crate::stitch::Capture)>,
+    pub holders: Vec<Link>,
+    pub pending: HashMap<u32, oneshot::Sender<Result<crate::terminals::Terminal, String>>>,
+    pub pty_killing: HashSet<u32>,
+    pub relinked: HashMap<String, Instant>,
+    pub disconnected: HashMap<String, PathBuf>,
+    pub relayed: HashMap<(usize, u32), crate::remote::Relayed>,
+    pub terminal_mirrors: HashMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
+    /// The turn of each caller's last send to an agent or terminal, until a bare wait reports it.
+    pub last_send: HashMap<(String, TargetKey), u64>,
+    /// Waits in progress by (caller, target): a parent waiting needs no note.
+    pub waiting: HashMap<(String, TargetKey), usize>,
+    /// A message arrived while this target was working and no wait of its returned since.
+    pub messages: HashMap<TargetKey, Option<String>>,
     /// Parents with a note delivery running.
-    pub note_tasks: HashSet<u32>,
+    pub note_tasks: HashSet<TargetKey>,
     pub killing: HashSet<u32>,
     pub stopping: bool,
     pub machines: Vec<crate::machines::Machine>,
@@ -72,8 +127,8 @@ pub struct State {
     pub line_tasks: HashMap<String, tokio::task::AbortHandle>,
     pub peers: std::collections::BTreeMap<String, crate::remote::Peer>,
     pub peer_lines: HashMap<String, (usize, Arc<crate::remote::Line>)>,
-    pub afar_notes: HashMap<u32, Vec<String>>,
-    pub afar_runs: HashMap<(u32, String), (usize, bool)>,
+    pub afar_notes: HashMap<TargetKey, Vec<String>>,
+    pub afar_runs: HashMap<(TargetKey, String), (usize, bool)>,
     pub machine_outbox: HashMap<String, Vec<serde_json::Value>>,
     pub mirrors: HashMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
 }
@@ -84,7 +139,7 @@ pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
 
-fn finish_reason(killed: bool, stopping: bool, restart: bool, host_shutdown: bool) -> &'static str {
+pub(crate) fn finish_reason(killed: bool, stopping: bool, restart: bool, host_shutdown: bool) -> &'static str {
     if killed {
         "killed"
     } else if restart {
@@ -101,6 +156,7 @@ fn finish_reason(killed: bool, stopping: bool, restart: bool, host_shutdown: boo
 impl Core {
     pub fn start(paths: Paths, info: CoreInfo) -> io::Result<Arc<Core>> {
         let reg: Registry = read_state(&paths.state.join("agents.json"))?;
+        let pty_reg: crate::terminals::Registry = read_state(&paths.state.join("terminals.json"))?;
         let docs_path = paths.state.join("docs.json");
         let docs = read_state(&docs_path).unwrap_or_else(|e| {
             eprintln!("core: cannot load documents, starting empty: {e}");
@@ -110,6 +166,7 @@ impl Core {
             Default::default()
         });
         crate::platform::private_dir(&paths.state.join("transcripts"))?;
+        std::fs::create_dir_all(paths.state.join("screens"))?;
         let machines = read_state(&paths.state.join("machines.json"))?;
         let peers = read_state(&paths.state.join("peers.json"))?;
         let (jobs, jobs_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -120,17 +177,22 @@ impl Core {
             stop: Notify::new(),
             restart: Default::default(),
             registry_writer: RegistryWriter::new(paths.state.join("agents.json"))?,
+            pty_registry_writer: RegistryWriter::new(paths.state.join("terminals.json"))?,
             paths,
-            state: Mutex::new(State { reg, docs, machines, peers, ..Default::default() }),
+            state: Mutex::new(State { reg, pty_reg, docs, machines, peers, ..Default::default() }),
             changed: Notify::new(),
             jobs,
             jobs_rx: Mutex::new(Some(jobs_rx)),
             sweeps: Default::default(),
+            holder_start: Default::default(),
             dirty: Default::default(),
+            pty_dirty: Default::default(),
             save_due: Notify::new(),
+            image_due: Notify::new(),
         });
         crate::exec::sweep_leftovers(&core.paths.state);
         core.reconcile_startup();
+        core.attach_all()?;
         Ok(core)
     }
 
@@ -184,16 +246,21 @@ impl Core {
     }
 
     pub async fn flush_saved(&self) -> Result<(), RpcError> {
+        let timeout_err = |_| {
+            RpcError::new(
+                "unavailable",
+                "registry persistence timed out; the operation may already have completed",
+                "check the agent and disk before retrying",
+            )
+        };
         tokio::time::timeout(Duration::from_secs(10), self.registry_writer.flush())
             .await
-            .map_err(|_| {
-                RpcError::new(
-                    "unavailable",
-                    "registry persistence timed out; the operation may already have completed",
-                    "check the agent and disk before retrying",
-                )
-            })?
-            .map_err(|e| RpcError::internal(format!("cannot save agents: {e}")))
+            .map_err(timeout_err)?
+            .map_err(|e| RpcError::internal(format!("cannot save agents: {e}")))?;
+        tokio::time::timeout(Duration::from_secs(10), self.pty_registry_writer.flush())
+            .await
+            .map_err(timeout_err)?
+            .map_err(|e| RpcError::internal(format!("cannot save terminals: {e}")))
     }
 
     pub fn save_soon(&self) {
@@ -209,6 +276,9 @@ impl Core {
             let st = self.lock();
             if self.dirty.load(std::sync::atomic::Ordering::SeqCst) {
                 self.save(&st);
+            }
+            if self.pty_dirty.load(std::sync::atomic::Ordering::SeqCst) {
+                self.save_pty(&st);
             }
         }
     }
@@ -438,11 +508,12 @@ impl Core {
             a.told_parent = false;
         } else {
             self.news(st, id);
-            let _ = self.jobs.send(crate::notes::Job::Orphaned(id));
-            crate::remote::orphaned_afar(self, st, id);
+            let target = TargetKey::Agent(id);
+            let _ = self.jobs.send(crate::notes::Job::Orphaned(target));
+            crate::remote::orphaned_afar(self, st, target);
         }
         let rm = st.reg.agents.get(&id).is_some_and(|a| {
-            !a.is_live() && a.rm && !a.parent.as_ref().is_some_and(|p| st.waiting.contains_key(&(p.clone(), id)))
+            !a.is_live() && a.rm && !a.parent.as_ref().is_some_and(|p| st.waiting.contains_key(&(p.clone(), TargetKey::Agent(id))))
         });
         if rm {
             self.remove(st, id);
@@ -454,6 +525,7 @@ impl Core {
         for gone in st.reg.expired(now_ms()) {
             self.remove(st, gone);
         }
+        self.prune_pty(st);
     }
 
     pub fn remove(&self, st: &mut State, id: u32) {
@@ -553,7 +625,7 @@ impl Core {
         }
     }
 
-    /// Planned restart: stop active ACP adapters cleanly while leaving kept records live for `recover_kept`.
+    /// Planned restart: stop active ACP adapters cleanly and hand over PTY holders so kept entries recover.
     pub async fn handover(&self) -> io::Result<()> {
         let live: Vec<u32> = {
             let mut st = self.lock();
@@ -564,33 +636,47 @@ impl Core {
         self.kill(&live).await;
         crate::exec::wait_all().await;
         self.wait_for_sweeps();
+        self.goodbye(crate::holder_proto::Goodbye::Handover);
+        self.wait_for_sweeps();
         {
             let mut st = self.lock();
             for id in live {
                 self.record_finish(&mut st, id, Exit::default(), "stopped_by_restart");
             }
             self.save(&st);
+            self.save_pty_handover_state(&mut st);
         }
-        self.registry_writer.flush().await
+        self.registry_writer.flush().await?;
+        self.pty_registry_writer.flush().await
     }
 
-    /// Server stop: terminate all live agents and flush registry state.
+    /// Server stop: terminate all live agents and PTY terminals, then flush registry state.
     pub async fn shutdown(&self) -> Result<(), RpcError> {
-        let live: Vec<u32> = {
+        let (live_agents, live_terminals): (Vec<u32>, Vec<u32>) = {
             let mut st = self.lock();
             st.stopping = true;
-            st.reg.agents.values().filter(|a| a.is_live()).map(Agent::id).collect()
+            (
+                st.reg.agents.values().filter(|a| a.is_live()).map(Agent::id).collect(),
+                st.pty_reg.terminals.values().filter(|t| t.is_live()).map(|t| t.id()).collect(),
+            )
         };
         self.changed.notify_waiters();
-        self.kill(&live).await;
+        self.kill(&live_agents).await;
+        self.pty_kill(&live_terminals).await;
         crate::exec::wait_all().await;
+        self.wait_for_sweeps();
+        self.goodbye(crate::holder_proto::Goodbye::Shutdown);
         self.wait_for_sweeps();
         {
             let mut st = self.lock();
-            for id in live {
+            for id in live_agents {
                 self.record_finish(&mut st, id, Exit::default(), "server_stop");
             }
+            for id in live_terminals {
+                self.pty_record_finish(&mut st, id, Exit::default(), "server_stop");
+            }
             self.save(&st);
+            self.save_pty(&st);
         }
         self.flush_saved().await
     }

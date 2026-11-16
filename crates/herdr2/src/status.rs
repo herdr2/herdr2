@@ -2,8 +2,10 @@
 //! The turn goes up each time the root record leaves `working`, for any reason.
 
 use crate::agents::Agent;
+use crate::terminals::Terminal;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 const MAX_RECORDS: usize = 256;
 
@@ -63,6 +65,51 @@ impl Status {
             msg: r.message.clone(),
         }
     }
+
+    /// The report again as OSC 7501, for a new viewer's first paint.
+    pub fn encode(&self, id: &str) -> String {
+        let mut fields = vec![format!("state={}", self.state)];
+        let mut push = |key: &str, value: &str| {
+            if !value.is_empty() {
+                fields.push(format!("{key}={value}"));
+            }
+        };
+        push("id", id);
+        push("kind", self.kind.as_deref().unwrap_or(""));
+        push("progress", &self.progress.map(|p| p.to_string()).unwrap_or_default());
+        push("app", &self.app);
+        push("title", &crate::put::encode(self.title.as_bytes()));
+        push("msg", &crate::put::encode(self.msg.as_bytes()));
+        format!("\x1b]7501;{}\x1b\\", fields.join(":"))
+    }
+}
+
+/// Shared status-state target for both headless ACP agents and PTY terminals.
+trait StatusTarget {
+    fn status(&self) -> Option<&Status>;
+    fn set_status(&mut self, s: Option<Status>);
+    fn records_mut(&mut self) -> &mut BTreeMap<String, Status>;
+    fn inc_turn(&mut self);
+    fn set_status_ms(&mut self, ms: Option<u64>);
+    fn set_reported(&mut self);
+}
+
+impl StatusTarget for Agent {
+    fn status(&self) -> Option<&Status> { self.status.as_ref() }
+    fn set_status(&mut self, s: Option<Status>) { self.status = s; }
+    fn records_mut(&mut self) -> &mut BTreeMap<String, Status> { &mut self.records }
+    fn inc_turn(&mut self) { self.turn += 1; }
+    fn set_status_ms(&mut self, ms: Option<u64>) { self.status_ms = ms; }
+    fn set_reported(&mut self) { self.reported = true; }
+}
+
+impl StatusTarget for Terminal {
+    fn status(&self) -> Option<&Status> { self.status.as_ref() }
+    fn set_status(&mut self, s: Option<Status>) { self.status = s; }
+    fn records_mut(&mut self) -> &mut BTreeMap<String, Status> { &mut self.records }
+    fn inc_turn(&mut self) { self.turn += 1; }
+    fn set_status_ms(&mut self, ms: Option<u64>) { self.status_ms = ms; }
+    fn set_reported(&mut self) { self.reported = true; }
 }
 
 /// What a report changed, for events and waiters.
@@ -76,53 +123,53 @@ pub struct Change {
     pub stuck: bool,
 }
 
-fn working(a: &Agent) -> bool {
-    a.status.as_ref().is_some_and(|s| s.state == "working")
+fn working<T: StatusTarget>(a: &T) -> bool {
+    a.status().is_some_and(|s| s.state == "working")
 }
 
-fn end_turn(a: &mut Agent, was_working: bool) -> bool {
+fn end_turn<T: StatusTarget>(a: &mut T, was_working: bool) -> bool {
     let ended = was_working && !working(a);
     if ended {
-        a.turn += 1;
+        a.inc_turn();
     }
     ended
 }
 
-fn stuck(a: &Agent) -> Option<&str> {
-    a.status.as_ref().map(|s| s.state.as_str()).filter(|w| *w == "blocked" || *w == "error")
+fn stuck<T: StatusTarget>(a: &T) -> Option<&str> {
+    a.status().map(|s| s.state.as_str()).filter(|w| *w == "blocked" || *w == "error")
 }
 
-fn word(a: &Agent) -> Option<String> {
-    a.status.as_ref().map(|s| s.state.clone())
+fn word<T: StatusTarget>(a: &T) -> Option<String> {
+    a.status().map(|s| s.state.clone())
 }
 
-fn stamp(a: &mut Agent, was: Option<String>) {
+fn stamp<T: StatusTarget>(a: &mut T, was: Option<String>) {
     if word(a) != was {
-        a.status_ms = Some(crate::runtime::now_ms());
+        a.set_status_ms(Some(crate::runtime::now_ms()));
     }
 }
 
-pub fn apply(a: &mut Agent, r: &StatusReport) -> Change {
+fn apply_target<T: StatusTarget>(a: &mut T, r: &StatusReport) -> Change {
     let (was_working, was_word) = (working(a), word(a));
     let was = stuck(a).map(String::from);
-    a.reported = true;
+    a.set_reported();
     if r.state == "clear" {
         if r.id.is_empty() {
-            a.status = None;
-            a.records.clear();
+            a.set_status(None);
+            a.records_mut().clear();
         } else {
             let child = format!("{}/", r.id);
-            a.records.retain(|id, _| *id != r.id && !id.starts_with(&child));
+            a.records_mut().retain(|id, _| *id != r.id && !id.starts_with(&child));
         }
     } else if r.id.is_empty() {
-        a.status = Some(Status::from(r));
+        a.set_status(Some(Status::from(r)));
     } else {
         // Over the limit, the record updated longest ago goes (approximated by first id).
-        if !a.records.contains_key(&r.id) && a.records.len() >= MAX_RECORDS - 1 {
-            let oldest = a.records.keys().next().cloned().expect("non-empty");
-            a.records.remove(&oldest);
+        if !a.records_mut().contains_key(&r.id) && a.records_mut().len() >= MAX_RECORDS - 1 {
+            let oldest = a.records_mut().keys().next().cloned().expect("non-empty");
+            a.records_mut().remove(&oldest);
         }
-        a.records.insert(r.id.clone(), Status::from(r));
+        a.records_mut().insert(r.id.clone(), Status::from(r));
     }
     stamp(a, was_word);
     Change {
@@ -133,14 +180,39 @@ pub fn apply(a: &mut Agent, r: &StatusReport) -> Change {
     }
 }
 
-/// The agent exited: its status facts reset.
-pub fn reset(a: &mut Agent) -> Change {
+fn reset_target<T: StatusTarget>(a: &mut T) -> Change {
     let (was_working, was_word) = (working(a), word(a));
-    let had = a.status.is_some() || !a.records.is_empty();
-    a.status = None;
-    a.records.clear();
+    let had = a.status().is_some() || !a.records_mut().is_empty();
+    a.set_status(None);
+    a.records_mut().clear();
     stamp(a, was_word);
     Change { status: had, turn_ended: end_turn(a, was_working), ..Default::default() }
+}
+
+pub fn apply(a: &mut Agent, r: &StatusReport) -> Change {
+    apply_target(a, r)
+}
+
+/// The agent exited: its status facts reset.
+pub fn reset(a: &mut Agent) -> Change {
+    reset_target(a)
+}
+
+pub fn apply_terminal(t: &mut Terminal, r: &ghostty_vt::StatusReport) -> Change {
+    let report = StatusReport {
+        state: r.state,
+        kind: r.kind,
+        progress: r.progress,
+        id: r.id.clone(),
+        app: r.app.clone(),
+        title: r.title.clone(),
+        message: r.message.clone(),
+    };
+    apply_target(t, &report)
+}
+
+pub fn reset_terminal(t: &mut Terminal) -> Change {
+    reset_target(t)
 }
 
 #[cfg(test)]

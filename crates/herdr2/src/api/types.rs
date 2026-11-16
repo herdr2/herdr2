@@ -284,6 +284,11 @@ pub struct RunParams {
     #[serde(skip)]
     #[schemars(skip)]
     pub bg: bool,
+    /// Return the created `"starting"` agent record immediately and run the ACP handshake in the background.
+    #[arg(skip)]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[schemars(skip)]
+    pub async_start: bool,
     /// Seconds before a wait checks in, leaving it running (default: config
     /// `wait_timeout`, else 180).
     #[arg(long, value_parser = cli_seconds)]
@@ -397,16 +402,20 @@ pub struct SubscribeParams {
     /// Only this agent.
     #[arg(long)]
     pub agent: Option<String>,
-    /// Only children of this agent.
+    /// Only this terminal.
+    #[arg(long)]
+    #[serde(default)]
+    pub terminal: Option<String>,
+    /// Only children of this agent or terminal.
     #[arg(long)]
     pub children_of: Option<String>,
-    /// Only agents carrying all of these labels (repeatable).
+    /// Only records carrying all of these labels (repeatable).
     #[arg(long = "label", value_name = "K=V")]
     #[serde(default, with = "label_map")]
     #[schemars(with = "BTreeMap<String, String>")]
     pub labels: Vec<Label>,
     /// Documents by name (repeatable); a name ending in `*` is a prefix. Naming
-    /// narrows, so documents alone hear only them — name an agent for both.
+    /// narrows, so documents alone hear only them — name an agent or terminal for both.
     #[arg(long = "doc", value_name = "NAME")]
     #[serde(default)]
     pub docs: Vec<String>,
@@ -420,6 +429,10 @@ pub struct SubscribeResult {
     /// Matching agents here and on connected machines (`machine/a7`).
     #[schemars(with = "Vec<Public>")]
     pub agents: Vec<serde_json::Value>,
+    /// Matching terminals here and on connected machines (`machine/t7`).
+    #[serde(default)]
+    #[schemars(with = "Vec<crate::terminals::Public>")]
+    pub terminals: Vec<serde_json::Value>,
     /// Framed mode: the channel events arrive on (JSON lines, with credit).
     /// Plain mode: none; this connection now carries only notifications.
     pub channel: Option<u32>,
@@ -769,4 +782,248 @@ pub struct RunResult {
 #[derive(Serialize, JsonSchema)]
 pub struct TemplatesResult {
     pub templates: Vec<crate::templates::TemplateInfo>,
+}
+
+#[derive(Clone, Copy, Serialize, Deserialize, JsonSchema)]
+pub struct InitialSize {
+    /// Initial terminal width in columns (at least 1).
+    #[schemars(range(min = 1))]
+    pub cols: u16,
+    /// Initial terminal height in rows (at least 1).
+    #[schemars(range(min = 1))]
+    pub rows: u16,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Default)]
+pub struct TerminalRunParams {
+    /// Program and arguments, or a template name and its task. With neither
+    /// argv nor line: that machine's own shell.
+    #[serde(default)]
+    pub argv: Vec<String>,
+    /// A shell line instead of argv, run by that machine's shell.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<String>,
+    /// Initial size before the program starts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<InitialSize>,
+    /// The caller's colors and cell size, answering the program's display queries from its start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<crate::viewers::Display>,
+    /// Name, unique among live agents and terminals: 1-32 of a-z 0-9 - _ .
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Working directory.
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// Run it on another machine; its address is `machine/t7`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+    /// Override the core's environment and terminal identity.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Labels, key=value.
+    #[serde(default, with = "label_map")]
+    #[schemars(with = "BTreeMap<String, String>")]
+    pub labels: Vec<Label>,
+    /// Parent terminal or agent.
+    #[serde(default)]
+    pub parent: Option<String>,
+    #[serde(default)]
+    pub no_parent: bool,
+    #[serde(default)]
+    pub no_notify: bool,
+    #[serde(default)]
+    pub outlive_parent: bool,
+    #[serde(default)]
+    pub die_with_parent: bool,
+    #[serde(default)]
+    pub rm: bool,
+    #[serde(default)]
+    pub keep: bool,
+    #[serde(default)]
+    pub wait: bool,
+    #[serde(default)]
+    pub timeout: Option<f64>,
+    #[serde(default)]
+    pub caller: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct TerminalRunResult {
+    #[serde(flatten)]
+    pub terminal: crate::terminals::Public,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub first_message: Option<crate::templates::FirstMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait: Option<WaitResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct TerminalParams {
+    /// The terminal: `t7`, a name, or `machine/t7`.
+    pub terminal: String,
+    #[serde(default)]
+    pub caller: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct TerminalListResult {
+    /// This machine's terminals, then each connected machine's (`machine/t7`).
+    #[schemars(with = "Vec<crate::terminals::Public>")]
+    pub terminals: Vec<serde_json::Value>,
+    /// Finished terminals left out (see `all`).
+    pub hidden_finished: usize,
+    pub machines: Vec<crate::remote::MachineView>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct TerminalLabelParams {
+    pub terminal: String,
+    #[serde(with = "label_map")]
+    #[schemars(with = "BTreeMap<String, String>")]
+    pub labels: Vec<Label>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct TerminalKeepParams {
+    pub terminal: String,
+    pub keep: bool,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct TerminalReadParams {
+    pub terminal: String,
+    #[serde(default)]
+    pub caller: Option<String>,
+    /// Lines of history above the screen.
+    #[serde(default)]
+    pub lines: usize,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct TerminalReadResult {
+    pub text: String,
+    pub complete: bool,
+    pub how: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct AttachParams {
+    /// The terminal: `t7`, a name, or `machine/t7`.
+    #[arg(default_value = "", hide_default_value = true)]
+    pub terminal: String,
+    /// Watch only: never type or resize.
+    #[arg(long)]
+    #[serde(default)]
+    pub observe: bool,
+    /// Observer understands core-to-viewer RESIZE before replacement paints.
+    #[arg(skip)]
+    #[serde(default)]
+    pub resize_notifications: bool,
+    /// Scrollback lines to show first (main screen only).
+    #[arg(long, default_value_t = 0)]
+    #[serde(default)]
+    pub history: usize,
+    /// The viewer's size in cells.
+    #[arg(skip)]
+    pub cols: u16,
+    #[arg(skip)]
+    pub rows: u16,
+    /// The viewer's own colors and cell size, used to answer display queries.
+    #[arg(skip)]
+    #[serde(default)]
+    pub display: crate::viewers::Display,
+    /// Back after a dropped line: sets the size only once active again.
+    #[arg(skip)]
+    #[serde(default)]
+    pub resumed: bool,
+    /// Who is calling (`H2_TERMINAL_ID` inside a terminal): never itself.
+    #[arg(skip)]
+    #[serde(default)]
+    pub caller: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct AttachResult {
+    pub channel: u32,
+    pub terminal: crate::terminals::Public,
+    pub resize_notifications: bool,
+    pub automatic_input: bool,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct TerminalSendParams {
+    pub terminal: String,
+    pub text: String,
+    #[serde(default)]
+    pub force: bool,
+    #[serde(rename = "if", default)]
+    pub only_if: Option<IdleOrWorking>,
+    #[serde(default)]
+    pub wait: bool,
+    #[serde(default)]
+    pub timeout: Option<f64>,
+    #[serde(default)]
+    pub caller: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct TerminalSendResult {
+    pub status: Option<String>,
+    pub turn: u64,
+    pub started: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait: Option<WaitResult>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct TerminalWaitParams {
+    pub terminal: Option<String>,
+    pub children: Option<Children>,
+    pub output: Option<String>,
+    pub timeout: Option<f64>,
+    #[serde(default)]
+    pub caller: Option<String>,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct KeysParams {
+    /// The terminal: `t7`, a name, or `machine/t7`.
+    pub terminal: String,
+    #[arg(skip)]
+    #[serde(default)]
+    pub caller: Option<String>,
+    /// Key names: enter, esc, tab, up, ctrl+c, alt+x, f5, a, ...
+    #[arg(required = true)]
+    pub keys: Vec<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct KeysResult {
+    pub status: Option<String>,
+    pub turn: u64,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct TerminalInterruptParams {
+    pub terminal: String,
+    #[serde(default)]
+    pub timeout: Option<f64>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct TerminalInterruptResult {
+    pub outcome: String,
+    pub key: String,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct TerminalPutParams {
+    pub terminal: String,
+    pub name: String,
+    pub data: String,
 }

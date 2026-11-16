@@ -1,4 +1,4 @@
-//! Where a core lives (socket, state, config) and how its
+//! Where a core lives (socket, holder socket, state, config) and how its
 //! state files are read and written.
 
 use crate::rpc::RpcError;
@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 /// Where one core keeps its socket and state. `H2_SESSION` names an isolated core.
 pub struct Paths {
     pub socket: PathBuf,
+    pub holder_socket: PathBuf,
     pub state: PathBuf,
     pub config: PathBuf,
 }
@@ -23,33 +24,35 @@ impl Paths {
         let config = xdg("XDG_CONFIG_HOME", config_home).join("herdr2").join("config.toml");
         // Where sockets go (Windows: the named pipe namespace), and their name prefix.
         let (run, prefix) = crate::platform::endpoints(&state);
-        // H2_SOCKET, else `socket` in config, else the runtime dir.
+        // H2_SOCKET, else `socket` in config, else the runtime dir. The holder sits beside it.
         let chosen = std::env::var_os("H2_SOCKET")
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .or_else(|| crate::config::load(&config).ok()?.socket.map(PathBuf::from));
-        let socket = match chosen {
-            Some(socket) => socket,
-            None => run.join(format!("{prefix}{session}.sock")),
+        let (socket, holder_socket) = match chosen {
+            Some(socket) => (socket.clone(), socket.with_extension("holder.sock")),
+            None => (run.join(format!("{prefix}{session}.sock")), run.join(format!("{prefix}{session}.holder.sock"))),
         };
-        let len = socket.as_os_str().len();
+        // Holders listen on `<holder_socket minus .sock>.<id>.sock`: the longest path.
+        let longest = holder_socket.as_os_str().len() + 1 + HOLDER_ID;
         let max = crate::platform::MAX_SOCKET_PATH;
-        if len > max {
+        if socket.as_os_str().len().max(longest) > max {
             return Err(RpcError::new(
                 "usage",
                 format!(
-                    "the socket path for session {session:?} is too long here ({len} bytes; this system allows {max})"
+                    "the socket path for session {session:?} is too long here ({longest} bytes; this system allows {max})"
                 ),
                 "use a shorter H2_SESSION (or socket in the config)",
             ));
         }
-        Ok(Paths { socket, config, state })
+        Ok(Paths { socket, holder_socket, config, state })
     }
 
     pub fn create_dirs(&self) -> std::io::Result<()> {
         use crate::platform::private_dir;
         private_dir(&self.state)?;
-        private_dir(self.socket.parent().expect("socket has a parent"))
+        private_dir(self.socket.parent().expect("socket has a parent"))?;
+        private_dir(self.holder_socket.parent().expect("socket has a parent"))
     }
 }
 
@@ -70,6 +73,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     std::fs::OpenOptions::new().write(true).open(&tmp)?.sync_all()?;
     std::fs::rename(tmp, path)
 }
+
+/// Hex digits in a holder's socket name.
+pub const HOLDER_ID: usize = 8;
 
 /// The session name goes into folder and pipe names. Spaces around it are
 /// dropped (cmd's `set X=a & ...` keeps the one before `&`); characters a

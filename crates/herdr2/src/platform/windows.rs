@@ -1,4 +1,4 @@
-//! Windows: named pipes, job objects, stdio streams.
+//! Windows: named pipes, ConPTY, job objects, the console API.
 
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -13,7 +13,7 @@ use std::sync::Arc;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
 use windows_sys::Win32::Storage::FileSystem::*;
-use windows_sys::Win32::System::Console::{GetStdHandle, STD_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+use windows_sys::Win32::System::Console::*;
 use windows_sys::Win32::System::IO::*;
 use windows_sys::Win32::System::JobObjects::*;
 use windows_sys::Win32::System::Pipes::*;
@@ -91,7 +91,7 @@ impl Pipe {
     }
 }
 
-/// A connection to a core (blocking, safe to read and write from
+/// A connection to a core or a holder (blocking, safe to read and write from
 /// different threads at once).
 #[derive(Clone)]
 pub struct Stream(Arc<Pipe>);
@@ -151,7 +151,7 @@ pub fn connect(path: &Path) -> io::Result<Stream> {
     for _ in 0..50 {
         let h = unsafe {
             // Identification only: whoever serves this name can't act as us
-            // (a fake core can't borrow an elevated h2's rights).
+            // (a fake core can't borrow an elevated hc's rights).
             let flags = FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION;
             CreateFileW(name.as_ptr(), GENERIC_READ | GENERIC_WRITE, 0, null(), OPEN_EXISTING, flags, null_mut())
         };
@@ -170,7 +170,7 @@ pub fn connect(path: &Path) -> io::Result<Stream> {
 /// Who may open our pipes: this account and SYSTEM (the default also lets
 /// everyone read, and names Administrators as owner when elevated). The
 /// integrity label keeps lower processes out: an unelevated program can't
-/// drive an elevated h2.
+/// drive an elevated hc.
 fn pipe_security() -> io::Result<*const SECURITY_ATTRIBUTES> {
     use windows_sys::Win32::Security::Authorization::*;
     use windows_sys::Win32::Security::*;
@@ -230,7 +230,7 @@ fn new_instance(name: &[u16], first: bool) -> io::Result<Pipe> {
     Ok(Pipe { handle: unsafe { OwnedHandle::from_raw_handle(h as RawHandle) } })
 }
 
-/// A pipe name others connect to.
+/// A pipe name others connect to (blocking accepts: the holder).
 pub struct Listener {
     name: Vec<u16>,
     next: std::sync::Mutex<Option<Pipe>>,
@@ -390,7 +390,7 @@ pub fn make_executable(_: &Path) -> io::Result<()> {
 }
 
 /// The files of a release, as they sit beside herdr2.exe.
-const RELEASE: [&str; 1] = ["herdr2.exe"];
+const RELEASE: [&str; 3] = ["herdr2.exe", r"conpty\conpty.dll", r"conpty\x64\OpenConsole.exe"];
 
 /// Puts the release whose herdr2.exe is `from` where `dest`'s folder
 /// is. Windows won't overwrite a running file but will rename one: every
@@ -408,7 +408,12 @@ pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::R
         )
         .open(dir.join(".update.lock"))
     })?;
-    for leftover in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+    for leftover in [dir.to_path_buf(), dir.join("conpty"), dir.join(r"conpty\x64")]
+        .iter()
+        .filter_map(|d| std::fs::read_dir(d).ok())
+        .flatten()
+        .flatten()
+    {
         // Only what an update named: <release file>.<old|new|failed>-<pid>-<32 hex>.
         let name = leftover.file_name().to_string_lossy().to_ascii_lowercase();
         let tagged = |rest: &str| {
@@ -419,7 +424,7 @@ pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::R
                     && hex.bytes().all(|b| b.is_ascii_hexdigit())
             })
         };
-        let ours = ["herdr2.exe", "h2.exe"]
+        let ours = ["herdr2.exe", "conpty.dll", "openconsole.exe", "h2.exe"]
             .iter()
             .flat_map(|f| ["old", "new", "failed"].map(|w| format!("{f}.{w}-")))
             .any(|prefix| name.strip_prefix(&prefix).is_some_and(tagged));
@@ -430,9 +435,9 @@ pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::R
     let tag = format!("{}-{}", std::process::id(), crate::platform::random_hex());
     let aside = |p: &Path, what: &str| PathBuf::from(format!("{}.{what}-{tag}", p.display()));
     let exe = dir.join(RELEASE[0]);
-    let h2 = dir.join("h2.exe");
+    let hc = dir.join("h2.exe");
     let linked = |a: &Path, b: &Path| matches!((std::fs::metadata(a), std::fs::metadata(b)), (Ok(a), Ok(b)) if file_identity(&a) == file_identity(&b));
-    let h2_ours = linked(&h2, &exe);
+    let hc_ours = linked(&hc, &exe);
 
     // (staged, final) pairs, all staged before anything moves.
     let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -441,7 +446,7 @@ pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::R
         for rel in RELEASE {
             let (from, to) = (src.join(rel), dir.join(rel));
             if !from.is_file() {
-                continue;
+                continue; // a bare exe (an app's own build): its ConPTY stays
             }
             std::fs::create_dir_all(to.parent().unwrap())?;
             std::fs::copy(&from, aside(&to, "new"))?;
@@ -454,9 +459,9 @@ pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::R
         if !staged.first().is_some_and(|(s, _)| works(s)) {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
-        if h2_ours {
-            std::fs::hard_link(&staged[0].0, aside(&h2, "new"))?;
-            staged.push((aside(&h2, "new"), h2.clone()));
+        if hc_ours {
+            std::fs::hard_link(&staged[0].0, aside(&hc, "new"))?;
+            staged.push((aside(&hc, "new"), hc.clone()));
         }
         Ok(())
     })();
@@ -526,8 +531,9 @@ pub fn file_identity(m: &std::fs::Metadata) -> String {
 
 // --- Processes -------------------------------------------------------------
 
-/// Starts `cmd` with no console, out of the job of
-/// the shell it was started from (ending that shell won't end it),
+/// Starts `cmd` with no console (no new process group: that would turn off
+/// Ctrl+C for every program the holder starts), out of the job of
+/// the terminal it was started from (ending that terminal won't end it),
 /// stdin/stdout to NUL and stderr to `log`. It inherits only those two
 /// handles: std's spawn hands down every inheritable one, and a pipe of an
 /// ssh session living on in the daemon keeps that session from ending.
@@ -589,7 +595,7 @@ pub fn spawn_detached(cmd: Command, log: File) -> io::Result<()> {
         };
         let mut started = set != 0 && start(flags | CREATE_BREAKAWAY_FROM_JOB);
         // A job that won't let us leave. Under ssh, one that kills on close
-        // ends every agent at logout: refuse. Elsewhere
+        // ends every terminal at logout: refuse. Elsewhere
         // (cargo, some launchers) stay in it and live as long as it does.
         if !started && set != 0 && GetLastError() == ERROR_ACCESS_DENIED {
             if std::env::var_os("SSH_CONNECTION").is_some() && job_kills_on_close() {
@@ -694,6 +700,338 @@ pub fn machine_id() -> Option<String> {
 /// Windows has no SIGTERM handoff; a requested restart is bounded by its expiry.
 pub fn boot_id() -> io::Result<Option<String>> {
     Ok(None)
+}
+
+// --- Terminals: ConPTY ----------------------------------------------------
+
+type CreatePc = unsafe extern "system" fn(COORD, HANDLE, HANDLE, u32, *mut HPCON) -> i32;
+type ResizePc = unsafe extern "system" fn(HPCON, COORD) -> i32;
+type ClosePc = unsafe extern "system" fn(HPCON);
+
+struct ConPty {
+    create: CreatePc,
+    resize: ResizePc,
+    close: ClosePc,
+}
+
+/// The ConPTY shipped beside hc (`conpty\conpty.dll`): Windows' own drops
+/// input escape sequences agents answer with. Windows' own if none is there.
+/// A broken or incompatible one fails each start, never the process.
+fn conpty() -> io::Result<&'static ConPty> {
+    use windows_sys::Win32::System::LibraryLoader::*;
+    static API: std::sync::OnceLock<Result<ConPty, String>> = std::sync::OnceLock::new();
+    let api = API.get_or_init(|| {
+        let bundled = std::env::current_exe()
+            .ok()
+            .and_then(|e| Some(e.parent()?.join(r"conpty\conpty.dll")))
+            .filter(|p| p.is_file());
+        let from = bundled.as_ref().map_or_else(|| "kernel32.dll".into(), |p| p.display().to_string());
+        // SAFETY: the names are NUL-terminated wide strings that outlive the
+        // calls; a loaded module stays loaded for the life of the process.
+        let module = unsafe {
+            match &bundled {
+                Some(dll) => LoadLibraryW(wide(dll.as_os_str()).as_ptr()),
+                None => GetModuleHandleW(wide("kernel32.dll".as_ref()).as_ptr()),
+            }
+        };
+        if module.is_null() {
+            return Err(format!("cannot load ConPTY from {from}: {}", io::Error::last_os_error()));
+        }
+        type Proc = unsafe extern "system" fn() -> isize;
+        // SAFETY: `module` is loaded; each name is a C string literal.
+        let get = |name: &std::ffi::CStr| {
+            unsafe { GetProcAddress(module, name.as_ptr().cast()) }.ok_or_else(|| format!("{from} has no {name:?}"))
+        };
+        // SAFETY: these exports have exactly these signatures (consoleapi.h).
+        unsafe {
+            Ok(ConPty {
+                create: std::mem::transmute::<Proc, CreatePc>(get(c"CreatePseudoConsole")?),
+                resize: std::mem::transmute::<Proc, ResizePc>(get(c"ResizePseudoConsole")?),
+                close: std::mem::transmute::<Proc, ClosePc>(get(c"ClosePseudoConsole")?),
+            })
+        }
+    });
+    api.as_ref().map_err(|e| io::Error::other(e.clone()))
+}
+
+/// Closes once: when its program ended (so the last output arrives and its
+/// reader ends), or when the terminal is let go.
+struct PseudoConsole(std::sync::Mutex<Option<usize>>);
+
+impl PseudoConsole {
+    fn close(&self) {
+        if let Some(hpc) = self.0.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            // A console exists only if ConPTY loaded.
+            if let Ok(api) = conpty() {
+                unsafe { (api.close)(hpc as HPCON) };
+            }
+        }
+    }
+}
+
+impl Drop for PseudoConsole {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
+/// A program on its own pseudo console, everything it starts in one job.
+pub struct Pty {
+    console: Arc<PseudoConsole>,
+    input: File,
+    output: File,
+    job: OwnedHandle,
+    pid: u32,
+}
+
+pub struct Process {
+    pid: u32,
+    handle: OwnedHandle,
+    console: Arc<PseudoConsole>,
+}
+
+impl Process {
+    pub fn id(&self) -> u32 {
+        self.pid
+    }
+}
+
+/// `program` as Windows starts it: found on PATH with PATHEXT, batch files
+/// through cmd (npm installs agents as `.cmd` shims).
+fn command_line(argv: &[String], env: &BTreeMap<String, String>) -> io::Result<Vec<u16>> {
+    let program = argv.first().ok_or_else(|| io::Error::other("empty argv"))?;
+    let path = env.iter().find(|(k, _)| k.eq_ignore_ascii_case("PATH")).map(|(_, v)| v.clone()).unwrap_or_default();
+    let exts = env
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("PATHEXT"))
+        .map_or(".COM;.EXE;.BAT;.CMD".into(), |(_, v)| v.clone());
+    let found = resolve(program, &path, &exts)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{program}: not found on PATH")))?;
+    let ext = found.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    if ext == "cmd" || ext == "bat" {
+        return batch_line(&found, &argv[1..]).map(|l| wide(l.as_ref()));
+    }
+    if super::is_shell_line(argv) {
+        return Ok(wide(format!("{} /d /s /c \"{}\"", quote(&found.display().to_string()), argv[4]).as_ref()));
+    }
+    let line: Vec<String> =
+        std::iter::once(found.display().to_string()).chain(argv[1..].iter().cloned()).map(|a| quote(&a)).collect();
+    Ok(wide(line.join(" ").as_ref()))
+}
+
+/// A .cmd/.bat (how npm installs agents) runs through cmd, which reads
+/// `& | < > ^ %` itself: each argument is quoted, `"` doubled and `%`
+/// defused, so a prompt arrives as one literal argument (the scheme Rust's
+/// std uses since BatBadBut). cmd can't carry a line break in an argument.
+fn batch_line(script: &Path, args: &[String]) -> io::Result<String> {
+    Ok(format!("cmd.exe /e:ON /v:OFF /d /c {}", batch_tail(script, args)?))
+}
+
+fn resolve(program: &str, path: &str, exts: &str) -> Option<PathBuf> {
+    let with_exts = |base: PathBuf| -> Option<PathBuf> {
+        if base.extension().is_some() && base.is_file() {
+            return Some(base);
+        }
+        exts.split(';')
+            .filter(|e| !e.is_empty())
+            .map(|e| PathBuf::from(format!("{}{e}", base.display())))
+            .find(|p| p.is_file())
+    };
+    let p = Path::new(program);
+    if p.components().count() > 1 || p.is_absolute() {
+        return with_exts(p.to_path_buf());
+    }
+    std::env::split_paths(path).find_map(|dir| with_exts(dir.join(program)))
+}
+
+/// One argument as Windows' command line parsing reads it back.
+fn quote(arg: &str) -> String {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+        return arg.into();
+    }
+    let mut out = String::from("\"");
+    let mut slashes = 0;
+    for c in arg.chars() {
+        match c {
+            '\\' => slashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(slashes * 2 + 1));
+                out.push('"');
+                slashes = 0;
+            }
+            c => {
+                out.push_str(&"\\".repeat(slashes));
+                out.push(c);
+                slashes = 0;
+            }
+        }
+    }
+    out.push_str(&"\\".repeat(slashes * 2));
+    out.push('"');
+    out
+}
+
+fn env_block(env: &BTreeMap<String, String>) -> Vec<u16> {
+    let mut block: Vec<u16> = Vec::new();
+    for (k, v) in env {
+        block.extend(format!("{k}={v}").encode_utf16());
+        block.push(0);
+    }
+    block.push(0);
+    block
+}
+
+pub fn spawn_pty(
+    argv: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: &str,
+    cols: u16,
+    rows: u16,
+) -> io::Result<(Pty, Process)> {
+    let mut cmd = command_line(argv, env)?;
+    let mut block = env_block(env);
+    let cwd = wide(cwd.as_ref());
+    unsafe {
+        // Ctrl+C ignored is inherited (an ssh session sets it): the program
+        // inherits ours, so take Ctrl+C again.
+        SetConsoleCtrlHandler(None, 0);
+        let (mut in_r, mut in_w, mut out_r, mut out_w) = (null_mut(), null_mut(), null_mut(), null_mut());
+        check(CreatePipe(&mut in_r, &mut in_w, null(), 0))?;
+        check(CreatePipe(&mut out_r, &mut out_w, null(), 0))?;
+        let (in_r, input, output, out_w) = (
+            OwnedHandle::from_raw_handle(in_r as RawHandle),
+            File::from_raw_handle(in_w as RawHandle),
+            File::from_raw_handle(out_r as RawHandle),
+            OwnedHandle::from_raw_handle(out_w as RawHandle),
+        );
+        let mut hpc: HPCON = 0;
+        let hr = (conpty()?.create)(
+            COORD { X: cols as i16, Y: rows as i16 },
+            in_r.as_raw_handle() as HANDLE,
+            out_w.as_raw_handle() as HANDLE,
+            0,
+            &mut hpc,
+        );
+        if hr != 0 {
+            return Err(io::Error::other(format!("CreatePseudoConsole failed: {hr:#x}")));
+        }
+        let console = Arc::new(PseudoConsole(std::sync::Mutex::new(Some(hpc as usize))));
+
+        // Everything it starts goes with it: killed when the job's last handle
+        // closes (us, or the holder dying). Breakaway lets hc's own core and
+        // holders, started from inside, outlive it.
+        let job = CreateJobObjectW(null(), null());
+        if job.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let job = OwnedHandle::from_raw_handle(job as RawHandle);
+        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = zeroed();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
+        check(SetInformationJobObject(
+            job.as_raw_handle() as HANDLE,
+            JobObjectExtendedLimitInformation,
+            (&raw const limits).cast(),
+            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+        ))?;
+
+        let mut n = 0usize;
+        InitializeProcThreadAttributeList(null_mut(), 1, 0, &mut n);
+        let mut attrs = vec![0u8; n];
+        let list = attrs.as_mut_ptr() as LPPROC_THREAD_ATTRIBUTE_LIST;
+        check(InitializeProcThreadAttributeList(list, 1, 0, &mut n))?;
+        check(UpdateProcThreadAttribute(
+            list,
+            0,
+            PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+            hpc as *const c_void,
+            size_of::<HPCON>(),
+            null_mut(),
+            null(),
+        ))?;
+        let mut si: STARTUPINFOEXW = zeroed();
+        si.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        si.lpAttributeList = list;
+        // Otherwise it inherits the holder's own stdio and writes there, not
+        // into the pseudo console.
+        si.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        si.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+        si.StartupInfo.hStdOutput = INVALID_HANDLE_VALUE;
+        si.StartupInfo.hStdError = INVALID_HANDLE_VALUE;
+        let mut pi: PROCESS_INFORMATION = zeroed();
+        let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_SUSPENDED;
+        let started = CreateProcessW(
+            null(),
+            cmd.as_mut_ptr(),
+            null(),
+            null(),
+            0,
+            flags,
+            block.as_mut_ptr().cast(),
+            cwd.as_ptr(),
+            &si.StartupInfo,
+            &mut pi,
+        );
+        DeleteProcThreadAttributeList(list);
+        check(started)?;
+        let handle = OwnedHandle::from_raw_handle(pi.hProcess as RawHandle);
+        let thread = OwnedHandle::from_raw_handle(pi.hThread as RawHandle);
+        AssignProcessToJobObject(job.as_raw_handle() as HANDLE, handle.as_raw_handle() as HANDLE);
+        ResumeThread(thread.as_raw_handle() as HANDLE);
+        // The console holds its own ends now.
+        drop((in_r, out_w));
+        let process = Process { pid: pi.dwProcessId, handle, console: console.clone() };
+        Ok((Pty { console, input, output, job, pid: pi.dwProcessId }, process))
+    }
+}
+
+impl Pty {
+    pub fn reader(&self) -> io::Result<File> {
+        self.output.try_clone()
+    }
+
+    pub fn writer(&self) -> io::Result<File> {
+        self.input.try_clone()
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) {
+        if let Some(hpc) = *self.console.0.lock().unwrap_or_else(|p| p.into_inner())
+            && let Ok(api) = conpty()
+        {
+            unsafe { (api.resize)(hpc as HPCON, COORD { X: cols as i16, Y: rows as i16 }) };
+        }
+    }
+
+    /// No process groups on a pseudo console: a known shell's newest child,
+    /// else the terminal's first process.
+    pub fn foreground(&self) -> i32 {
+        super::windows_foreground::in_front(self.job.as_raw_handle() as HANDLE, self.pid) as i32
+    }
+
+    /// Ctrl+C through the console for an interrupt; anything harder ends the
+    /// whole job (Windows has no hangup or terminate to ask with).
+    pub fn signal(&self, _pid: u32, signal: i32) {
+        if signal == super::signal::INT {
+            let _ = (&self.input).write_all(b"\x03");
+        } else {
+            unsafe { TerminateJobObject(self.job.as_raw_handle() as HANDLE, 1) };
+        }
+    }
+
+    pub fn hang_up(&self, _pid: u32) {
+        unsafe { TerminateJobObject(self.job.as_raw_handle() as HANDLE, 1) };
+    }
+}
+
+/// Waits for it to end: (exit code, no signal on Windows). Then closes its
+/// console, so its last output arrives and the reader ends.
+pub fn wait(child: &mut Process) -> io::Result<(Option<i32>, Option<i32>)> {
+    unsafe {
+        WaitForSingleObject(child.handle.as_raw_handle() as HANDLE, INFINITE);
+        let mut code = 0u32;
+        check(GetExitCodeProcess(child.handle.as_raw_handle() as HANDLE, &mut code))?;
+        child.console.close();
+        Ok((Some(code as i32), None))
+    }
 }
 
 // --- Agent subprocesses ----------------------------------------------------
@@ -818,67 +1156,72 @@ fn batch_tail(script: &Path, args: &[String]) -> io::Result<String> {
     Ok(line)
 }
 
-fn resolve(program: &str, path: &str, exts: &str) -> Option<PathBuf> {
-    let with_exts = |base: PathBuf| -> Option<PathBuf> {
-        if base.extension().is_some() && base.is_file() {
-            return Some(base);
-        }
-        exts.split(';')
-            .filter(|e| !e.is_empty())
-            .map(|e| PathBuf::from(format!("{}{e}", base.display())))
-            .find(|p| p.is_file())
-    };
-    let p = Path::new(program);
-    if p.components().count() > 1 || p.is_absolute() {
-        return with_exts(p.to_path_buf());
-    }
-    std::env::split_paths(path).find_map(|dir| with_exts(dir.join(program)))
-}
-
-/// One argument as Windows' command line parsing reads it back.
-fn quote(arg: &str) -> String {
-    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
-        return arg.into();
-    }
-    let mut out = String::from("\"");
-    let mut slashes = 0;
-    for c in arg.chars() {
-        match c {
-            '\\' => slashes += 1,
-            '"' => {
-                out.push_str(&"\\".repeat(slashes * 2 + 1));
-                out.push('"');
-                slashes = 0;
-            }
-            c => {
-                out.push_str(&"\\".repeat(slashes));
-                out.push(c);
-                slashes = 0;
-            }
-        }
-    }
-    out.push_str(&"\\".repeat(slashes * 2));
-    out.push('"');
-    out
-}
-
-fn env_block(env: &BTreeMap<String, String>) -> Vec<u16> {
-    let mut block: Vec<u16> = Vec::new();
-    for (k, v) in env {
-        block.extend(format!("{k}={v}").encode_utf16());
-        block.push(0);
-    }
-    block.push(0);
-    block
-}
-
-// --- The console (connect) ---------------------------------------------------
+// --- The console (attach, picker) --------------------------------------------
 
 pub mod console {
     use super::*;
 
+    static TERMINATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    unsafe extern "system" fn on_ctrl(_: u32) -> BOOL {
+        TERMINATED.store(true, std::sync::atomic::Ordering::SeqCst);
+        1
+    }
+
+    /// Ctrl+Break, closing the window, logoff: a flag the input loop sees, so
+    /// the console is given back.
+    pub fn catch_termination() {
+        unsafe { SetConsoleCtrlHandler(Some(on_ctrl), 1) };
+    }
+
+    pub fn terminated() -> bool {
+        TERMINATED.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
     fn std(which: STD_HANDLE) -> HANDLE {
         unsafe { GetStdHandle(which) }
+    }
+
+    /// Keys as VT bytes in, VT sequences out, nothing cooked.
+    pub struct RawMode(Option<(u32, u32, u32, u32)>);
+
+    impl RawMode {
+        pub fn enter() -> RawMode {
+            unsafe {
+                let (mut input, mut output) = (0u32, 0u32);
+                if GetConsoleMode(std(STD_INPUT_HANDLE), &mut input) == 0
+                    || GetConsoleMode(std(STD_OUTPUT_HANDLE), &mut output) == 0
+                {
+                    return RawMode(None);
+                }
+                let (cp_out, cp_in) = (GetConsoleOutputCP(), GetConsoleCP());
+                let raw_in = (input & !(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT))
+                    | ENABLE_VIRTUAL_TERMINAL_INPUT;
+                SetConsoleMode(std(STD_INPUT_HANDLE), raw_in);
+                SetConsoleMode(
+                    std(STD_OUTPUT_HANDLE),
+                    output | ENABLE_VIRTUAL_TERMINAL_PROCESSING | DISABLE_NEWLINE_AUTO_RETURN,
+                );
+                // Both ways: keys are read as bytes in the input code page,
+                // and the program's console takes UTF-8.
+                SetConsoleOutputCP(65001);
+                SetConsoleCP(65001);
+                RawMode(Some((input, output, cp_out, cp_in)))
+            }
+        }
+    }
+
+    impl Drop for RawMode {
+        fn drop(&mut self) {
+            if let Some((input, output, cp_out, cp_in)) = self.0 {
+                unsafe {
+                    SetConsoleMode(std(STD_INPUT_HANDLE), input);
+                    SetConsoleMode(std(STD_OUTPUT_HANDLE), output);
+                    SetConsoleOutputCP(cp_out);
+                    SetConsoleCP(cp_in);
+                }
+            }
+        }
     }
 
     pub fn stdin() -> std::mem::ManuallyDrop<File> {
@@ -887,5 +1230,59 @@ pub mod console {
 
     pub fn stdout() -> std::mem::ManuallyDrop<File> {
         std::mem::ManuallyDrop::new(unsafe { File::from_raw_handle(std(STD_OUTPUT_HANDLE) as RawHandle) })
+    }
+
+    pub fn out(bytes: &[u8]) {
+        let _ = stdout().write_all(bytes);
+    }
+
+    pub fn window_size() -> (u16, u16) {
+        unsafe {
+            let mut info: CONSOLE_SCREEN_BUFFER_INFO = zeroed();
+            if GetConsoleScreenBufferInfo(std(STD_OUTPUT_HANDLE), &mut info) != 0 {
+                let w = info.srWindow;
+                return ((w.Right - w.Left + 1) as u16, (w.Bottom - w.Top + 1) as u16);
+            }
+        }
+        (80, 24)
+    }
+
+    /// Waits up to `ms` for keys; returns what arrived (empty: nothing yet,
+    /// None: input closed). Console events that aren't keys (focus, resize,
+    /// mouse) wake the wait without bytes: those are taken off and skipped.
+    pub fn read_stdin(ms: i32) -> Option<Vec<u8>> {
+        unsafe {
+            let h = std(STD_INPUT_HANDLE);
+            if WaitForSingleObject(h, ms.max(0) as u32) != WAIT_OBJECT_0 {
+                return Some(Vec::new());
+            }
+            let mut mode = 0u32;
+            if GetConsoleMode(h, &mut mode) != 0 {
+                let mut events: [INPUT_RECORD; 32] = zeroed();
+                let mut n = 0u32;
+                if PeekConsoleInputW(h, events.as_mut_ptr(), events.len() as u32, &mut n) == 0 {
+                    return None;
+                }
+                // Shift, Ctrl, Alt, Win or a lock key alone type nothing, and
+                // ReadFile would wait for a key that does. (Arrows count: VT
+                // mode turns them into bytes as they are read.)
+                let modifier = |vk: u16| matches!(vk, 0x10..=0x12 | 0x14 | 0x5B | 0x5C | 0x90 | 0x91 | 0xA0..=0xA5);
+                let key = events[..n as usize].iter().any(|e| {
+                    e.EventType == KEY_EVENT as u16
+                        && e.Event.KeyEvent.bKeyDown != 0
+                        && !modifier(e.Event.KeyEvent.wVirtualKeyCode)
+                });
+                if !key {
+                    ReadConsoleInputW(h, events.as_mut_ptr(), n, &mut n);
+                    return Some(Vec::new());
+                }
+            }
+            let mut buf = [0u8; 8192];
+            let mut got = 0u32;
+            if ReadFile(h, buf.as_mut_ptr(), buf.len() as u32, &mut got, null_mut()) == 0 || got == 0 {
+                return None;
+            }
+            Some(buf[..got as usize].to_vec())
+        }
     }
 }

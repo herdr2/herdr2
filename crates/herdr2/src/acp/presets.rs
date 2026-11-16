@@ -11,6 +11,7 @@ pub const BUILTIN_PRESETS: &[(&str, &[&str])] = &[
     ("opencode", &["opencode", "acp"]),
     ("copilot", &["copilot", "--acp", "--stdio"]),
     ("cursor", &["cursor-agent", "acp"]),
+    ("cursor-agent", &["cursor-agent", "acp"]),
     ("kimi", &["kimi", "acp"]),
     ("qwen", &["qwen", "--acp"]),
     ("pi", &["pi-acp"]),

@@ -1,8 +1,8 @@
 # h2 manual (herdr2)
 
-`h2` (`herdr2`) is a headless multi-agent orchestration runtime speaking the Agent Client Protocol (ACP) over stdio JSON-RPC 2.0. Called agents receive `terminal: false` and `fs: false` capabilities, zero PTYs, and zero terminal environment variables (`TERM`, `COLORTERM`, `TERM_PROGRAM` are omitted).
+`h2` (`herdr2`) combines real Ghostty/PTY workspace terminals (`t1`, `t2`, ...) for human interactive sessions with a headless ACP (Agent Client Protocol) orchestration runtime (`a1`, `a2`, ...) for subordinate agents. Called ACP sub-agents receive `terminal: false` and `fs: false` capabilities, zero PTYs, and zero terminal environment variables (`TERM`, `COLORTERM`, `TERM_PROGRAM` are omitted), and open no terminal panes in `Herdr2`.
 
-- Inside an orchestrated agent, `$H2_AGENT_ID` holds your address (`a1`, `a7`, ...) and `$H2_AGENT_SOCKET` points to the daemon socket.
+- Inside an ACP sub-agent, `$H2_AGENT_ID` holds your address (`a1`, `a7`, ...) and `$H2_AGENT_SOCKET` points to the daemon socket. Inside a workspace PTY terminal, `$H2_TERMINAL_ID` holds `t1`, ... and `$H2_TERMINAL_SOCKET` points to the same socket, so launching `h2 run` or `h2 mcp` from a workspace automatically parents child ACP sub-agents to that terminal.
 - Agents you launch default to becoming your children (they receive `<h2>` tags on inter-agent messages and exit with you unless `--outlive-parent` is passed).
 - Piped output is JSON except `run` (waited), `exec`, `read`, and `file read` (text unless `--json`).
 - Run `h2 --help` for commands or `h2 <command> --help` for exact flags.
@@ -45,7 +45,9 @@ h2 kill worker                          # terminate an ACP agent process
 h2 rm worker                            # remove a finished agent record
 h2 keep worker [--off]                  # resume crashed/restarted agent via session/load
 h2 label worker env=staging             # set or clear labels (`env=` removes)
-h2 put worker ./payload.bin             # stage a file beside the agent, print path
+h2 put worker ./payload.bin             # stage a file beside the agent or terminal
+h2 attach t1                            # inspect a live PTY workspace terminal (Ctrl-\ then d)
+h2 keys t1 enter                        # send named keys (enter, esc, ctrl+c, ...) to a PTY
 h2 events                               # follow ordered lifecycle events as JSON lines
 ```
 

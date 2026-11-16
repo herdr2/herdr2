@@ -1,11 +1,11 @@
-//! Linux and macOS: Unix sockets, process groups, stdio streams.
+//! Linux and macOS: Unix sockets, PTYs, process groups, termios.
 
 use std::fs::File;
-use std::io;
-use std::os::fd::AsRawFd;
+use std::io::{self, Read, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 
 pub fn check_via(_target: &str) -> io::Result<()> {
     Ok(())
@@ -23,7 +23,7 @@ pub fn via_command(target: &str, line: &str) -> io::Result<Command> {
 
 // --- Connections -----------------------------------------------------------
 
-/// A connection to a core (blocking).
+/// A connection to a core or a holder (blocking).
 pub type Stream = std::os::unix::net::UnixStream;
 pub type Listener = std::os::unix::net::UnixListener;
 
@@ -199,9 +199,10 @@ mod nofile_tests {
     }
 }
 
-/// Starts `cmd` in its own session (ending the shell it was started from
+/// Starts `cmd` in its own session (ending the terminal it was started from
 /// won't end it), stdin/stdout to /dev/null, stderr to `log`.
 pub fn spawn_detached(mut cmd: Command, log: std::fs::File) -> io::Result<()> {
+    use std::process::Stdio;
     #[cfg(target_os = "macos")]
     cmd.env_remove("XPC_FLAGS");
     cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(log);
@@ -212,11 +213,12 @@ pub fn spawn_detached(mut cmd: Command, log: std::fs::File) -> io::Result<()> {
         });
     }
     let mut child = cmd.spawn()?;
+    // Reap it if it ever exits while we live (the holder outlives crashed cores).
     std::thread::spawn(move || child.wait());
     Ok(())
 }
 
-/// Puts the h2 binary at `from` where `dest` is: a copy beside it that `works`,
+/// Puts the hc at `from` where `dest` is: a copy beside it that `works`,
 /// then renamed over it (InvalidData: the copy doesn't run).
 pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::Result<()> {
     #[cfg(target_os = "macos")]
@@ -561,7 +563,7 @@ pub fn hostname() -> String {
 /// This system's own id, new on a cloned disk: Linux's machine-id (made per
 /// box at first boot), a Mac's hardware UUID. None when there is none or it
 /// can't be read. One source only: a second one that disagrees, read when
-/// the first fails once, would look like a copy and forget live agents.
+/// the first fails once, would look like a copy and forget live terminals.
 pub fn machine_id() -> Option<String> {
     #[cfg(target_os = "macos")]
     {
@@ -609,6 +611,167 @@ pub fn boot_id() -> io::Result<Option<String>> {
             return Err(io::Error::other("boot identity is empty"));
         }
         Ok(Some(value.into()))
+    }
+}
+
+// --- Terminals -------------------------------------------------------------
+
+/// A program on its own terminal.
+pub struct Pty {
+    master: File,
+    stop: Stream,
+    _stop_sender: Stream,
+}
+
+/// Cancels blocked IO when the holder releases the terminal, even if a
+/// detached program keeps its slave open.
+pub struct PtyIo {
+    master: File,
+    stop: Stream,
+}
+
+impl PtyIo {
+    fn ready(&self, events: i16) -> io::Result<bool> {
+        let mut fds = [
+            libc::pollfd { fd: self.master.as_raw_fd(), events, revents: 0 },
+            libc::pollfd { fd: self.stop.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+        ];
+        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, -1) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(fds[1].revents == 0)
+    }
+}
+
+impl Read for PtyIo {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if !self.ready(libc::POLLIN)? {
+                return Ok(0);
+            }
+            match self.master.read(buf) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                result => return result,
+            }
+        }
+    }
+}
+
+impl Write for PtyIo {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if !self.ready(libc::POLLOUT)? {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            match self.master.write(buf) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.master.flush()
+    }
+}
+
+pub type Process = Child;
+
+/// Starts `argv` on a new terminal of `cols`x`rows`.
+pub fn spawn_pty(
+    argv: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+    cwd: &str,
+    cols: u16,
+    rows: u16,
+) -> io::Result<(Pty, Process)> {
+    let program = argv.first().ok_or_else(|| io::Error::other("empty argv"))?;
+    let (mut master, mut slave) = (0, 0);
+    let mut size = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+    if unsafe { libc::openpty(&mut master, &mut slave, std::ptr::null_mut(), std::ptr::null_mut(), &raw mut size) } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let (master, slave) = unsafe { (File::from_raw_fd(master), File::from_raw_fd(slave)) };
+    for fd in [master.as_raw_fd(), slave.as_raw_fd()] {
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let (stop, stop_sender) = Stream::pair()?;
+    let mut cmd = Command::new(program);
+    cmd.args(&argv[1..])
+        .env_clear()
+        .envs(env)
+        .current_dir(cwd)
+        .stdin(Stdio::from(slave.try_clone()?))
+        .stdout(Stdio::from(slave.try_clone()?))
+        .stderr(Stdio::from(slave));
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = cmd.spawn()?;
+    Ok((Pty { master, stop, _stop_sender: stop_sender }, child))
+}
+
+impl Pty {
+    /// Its output, read until the slave closes or this PTY is released.
+    pub fn reader(&self) -> io::Result<PtyIo> {
+        Ok(PtyIo { master: self.master.try_clone()?, stop: self.stop.try_clone()? })
+    }
+
+    pub fn writer(&self) -> io::Result<PtyIo> {
+        self.reader()
+    }
+
+    pub fn resize(&self, cols: u16, rows: u16) {
+        let size = libc::winsize { ws_row: rows, ws_col: cols, ws_xpixel: 0, ws_ypixel: 0 };
+        unsafe { libc::ioctl(self.master.as_raw_fd(), libc::TIOCSWINSZ as _, &size) };
+    }
+
+    /// The process group in the foreground (a shell's job), or -1.
+    pub fn foreground(&self) -> i32 {
+        unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) }
+    }
+
+    /// The program's group, plus whatever group is in the foreground.
+    pub fn signal(&self, pid: u32, signal: i32) {
+        unsafe {
+            libc::killpg(pid as i32, signal);
+            let fg = libc::tcgetpgrp(self.master.as_raw_fd());
+            if fg > 0 && fg != pid as i32 {
+                libc::killpg(fg, signal);
+            }
+        }
+    }
+
+    /// Its program is gone: hang up what still holds the terminal.
+    pub fn hang_up(&self, pid: u32) {
+        unsafe { libc::killpg(pid as i32, libc::SIGHUP) };
+    }
+}
+
+/// Waits for it to end: (exit code, signal).
+pub fn wait(child: &mut Process) -> io::Result<(Option<i32>, Option<i32>)> {
+    loop {
+        match child.wait() {
+            Ok(status) => return Ok((status.code(), status.signal())),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -684,11 +847,53 @@ pub fn macos_environ(pid: i32) -> Option<Vec<u8>> {
     Some(rest.to_vec())
 }
 
-// --- The console (connect) ---------------------------------------------------
+// --- The console (attach, picker) --------------------------------------------
 
 pub mod console {
     use super::*;
-    use std::os::fd::FromRawFd;
+
+    static TERMINATED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+    extern "C" fn on_signal(_: libc::c_int) {
+        TERMINATED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// A kill (TERM, HUP, INT) only sets a flag: the input loop sees it within one
+    /// poll and leaves through the normal cleanup, so the terminal is given back.
+    pub fn catch_termination() {
+        for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+            unsafe { libc::signal(signal, on_signal as *const () as libc::sighandler_t) };
+        }
+    }
+
+    pub fn terminated() -> bool {
+        TERMINATED.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub struct RawMode(Option<libc::termios>);
+
+    impl RawMode {
+        pub fn enter() -> RawMode {
+            let mut saved: libc::termios = unsafe { std::mem::zeroed() };
+            if unsafe { libc::tcgetattr(0, &mut saved) } != 0 {
+                return RawMode(None);
+            }
+            let mut raw = saved;
+            unsafe {
+                libc::cfmakeraw(&mut raw);
+                libc::tcsetattr(0, libc::TCSANOW, &raw);
+            }
+            RawMode(Some(saved))
+        }
+    }
+
+    impl Drop for RawMode {
+        fn drop(&mut self) {
+            if let Some(saved) = &self.0 {
+                unsafe { libc::tcsetattr(0, libc::TCSANOW, saved) };
+            }
+        }
+    }
 
     /// Unbuffered stdin/stdout: std's stdout holds bytes until a newline.
     pub fn stdin() -> std::mem::ManuallyDrop<File> {
@@ -697,5 +902,30 @@ pub mod console {
 
     pub fn stdout() -> std::mem::ManuallyDrop<File> {
         std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(1) })
+    }
+
+    pub fn out(bytes: &[u8]) {
+        let _ = stdout().write_all(bytes);
+    }
+
+    pub fn window_size() -> (u16, u16) {
+        let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+        if unsafe { libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) } == 0 && ws.ws_col > 0 {
+            (ws.ws_col, ws.ws_row)
+        } else {
+            (80, 24)
+        }
+    }
+
+    /// Waits up to `ms` for stdin; returns what arrived (empty: nothing yet,
+    /// None: stdin is closed).
+    pub fn read_stdin(ms: i32) -> Option<Vec<u8>> {
+        let mut fds = [libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 }];
+        if unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) } <= 0 {
+            return Some(Vec::new());
+        }
+        let mut buf = [0u8; 8192];
+        let n = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
+        (n > 0).then(|| buf[..n as usize].to_vec())
     }
 }

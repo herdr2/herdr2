@@ -290,3 +290,10 @@ pub fn agent_id() -> Option<String> {
         .is_none_or(|s| Paths::from_env().is_ok_and(|p| p.socket.as_os_str() == s));
     std::env::var("H2_AGENT_ID").ok().filter(|_| own_core)
 }
+
+/// The h2 workspace terminal we run in, if it belongs to the core we talk to.
+pub fn terminal_id() -> Option<String> {
+    let own_core = std::env::var_os("H2_TERMINAL_SOCKET")
+        .is_none_or(|s| Paths::from_env().is_ok_and(|p| p.socket.as_os_str() == s));
+    std::env::var("H2_TERMINAL_ID").ok().filter(|_| own_core)
+}

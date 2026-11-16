@@ -78,6 +78,8 @@ pub fn serve() -> io::Result<()> {
                 kept.clone().recover_kept(false).await;
             }
         });
+        tokio::spawn(core.clone().watch_foreground());
+        tokio::spawn(core.clone().expire_image_answers());
         if let Some(jobs) = core.jobs_rx.lock().unwrap_or_else(|p| p.into_inner()).take() {
             tokio::spawn(core.clone().run_jobs(jobs));
         }
@@ -127,7 +129,8 @@ struct Identity {
 /// What a copy of another machine's disk must not bring along: that
 /// machine's agents, transcripts, files, execs and the cores that dialed it.
 /// Kept: the machines it reaches and the clients' docs (settings, not life).
-const CLONE_FORGETS: &[&str] = &["agents.json", "peers.json", "transcripts", "files", "execs"];
+const CLONE_FORGETS: &[&str] =
+    &["agents.json", "terminals.json", "peers.json", "transcripts", "screens", "files", "execs"];
 
 /// Permanent core identity: created on first start, kept until state is
 /// wiped, or until the disk turns up under another machine id (a snapshot,
@@ -194,7 +197,7 @@ async fn connection(core: Arc<Core>, read: platform::AsyncRead, mut write: Write
                 handled = handling => handled,
                 () = closed(&mut read, &mut ahead) => return Ok(()),
             },
-            Some("agent.send") => {
+            Some("agent.send" | "terminal.send") => {
                 let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let handling = SEND_CANCELLED.scope(cancelled.clone(), handling);
                 tokio::pin!(handling);
@@ -227,7 +230,7 @@ async fn connection(core: Arc<Core>, read: platform::AsyncRead, mut write: Write
         }
     }
     let conn = Arc::new(Conn::default());
-    let mut writer = tokio::spawn(write_frames(conn.clone(), write));
+    let mut writer = tokio::spawn(write_frames(core.clone(), conn.clone(), write));
     // Another core dialing in says who it is in its hello.
     let hello: Value = serde_json::from_str(&line).unwrap_or_default();
     crate::remote::peer_joined(&core, &conn, &hello["params"]);
@@ -241,6 +244,8 @@ async fn connection(core: Arc<Core>, read: platform::AsyncRead, mut write: Write
             Ok(())
         }
     };
+    core.detach(&conn, None);
+    crate::remote::conn_gone(&core, &conn);
     crate::remote::peer_left(&core, &conn);
     writer.abort();
     result
@@ -324,9 +329,10 @@ pub fn heartbeat(core: Arc<Core>, conn: Arc<Conn>, channel: u32) {
 }
 
 /// Sends whatever the outbox hands out: control first, then streams by credit.
-async fn write_frames(conn: Arc<Conn>, mut write: Writer) -> io::Result<()> {
+async fn write_frames(core: Arc<Core>, conn: Arc<Conn>, mut write: Writer) -> io::Result<()> {
     loop {
         conn.wake.notified().await;
+        core.prepare_repaints(&conn);
         loop {
             let next = conn.outbox().next_frame();
             match next {
@@ -338,11 +344,15 @@ async fn write_frames(conn: Arc<Conn>, mut write: Writer) -> io::Result<()> {
 }
 
 async fn read_frames(core: &Arc<Core>, conn: &Arc<Conn>, read: &mut Reader) -> io::Result<()> {
+    let u16_at = |p: &[u8], i: usize| u16::from_le_bytes([p[i], p[i + 1]]);
     // Execs running for this connection by request id: they end when it
     // closes, or when it gives up on one (`$/cancelRequest`).
     let mut execs = Execs::default();
     let mut sends = Sends::default();
     while let Some((channel, kind, payload)) = wire::read_frame(read).await? {
+        if channel != 0 && crate::remote::relay_in(core, conn, channel, kind, &payload) {
+            continue;
+        }
         match (channel, kind) {
             // Calls run side by side so a slow one (kill, wait) never holds up messaging.
             (0, wire::DATA) => {
@@ -384,13 +394,23 @@ async fn read_frames(core: &Arc<Core>, conn: &Arc<Conn>, read: &mut Reader) -> i
                 }
             }
             (0, _) => {}
+            (ch, wire::DATA) => core.viewer_input(conn, ch, &payload, false),
+            (ch, wire::AUTOMATIC_INPUT) => core.viewer_input(conn, ch, &payload, true),
             (ch, wire::CREDIT) if payload.len() == 4 => {
                 let n = u32::from_le_bytes(payload[..4].try_into().unwrap()) as usize;
                 conn.with(|out| out.credit(ch, n));
             }
+            (ch, wire::RESIZE) if payload.len() == 4 => {
+                core.viewer_resize(conn, ch, u16_at(&payload, 0), u16_at(&payload, 2))
+            }
+            (ch, wire::FOCUS) => core.viewer_focus(conn, ch, payload.first() == Some(&1)),
+            (ch, wire::FACTS) => {
+                if let Ok(display) = serde_json::from_slice(&payload) {
+                    core.viewer_facts(conn, ch, display);
+                }
+            }
             (ch, wire::CLOSE) => {
-                let mut st = core.lock();
-                core.unsubscribe(&mut st, conn, Some(ch));
+                core.detach(conn, Some(ch));
                 conn.with(|out| out.close(ch, b""));
             }
             _ => {}
@@ -399,14 +419,14 @@ async fn read_frames(core: &Arc<Core>, conn: &Arc<Conn>, read: &mut Reader) -> i
     Ok(())
 }
 
-/// Cancellation tracking for `agent.send`.
+/// Cancellation tracking for `agent.send` and `terminal.send`.
 #[derive(Default)]
 pub(crate) struct Sends(Vec<(String, std::sync::Weak<std::sync::atomic::AtomicBool>)>);
 
 impl Sends {
     pub(crate) fn track(&mut self, request: &Value) -> Arc<std::sync::atomic::AtomicBool> {
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        if request["method"] == "agent.send" {
+        if matches!(request["method"].as_str(), Some("agent.send" | "terminal.send")) {
             self.0.retain(|(_, flag)| flag.strong_count() > 0);
             self.0.push((request["id"].to_string(), Arc::downgrade(&cancelled)));
         }
@@ -474,6 +494,14 @@ async fn handle(
     let params = crate::remote::from_peer(core, conn, request["params"].clone());
     let result = match crate::remote::route(core, method, &params) {
         _ if method == "$/orphaned" => crate::remote::orphaned(core, conn, &params).await,
+        Ok(Some((crate::remote::To::Machine(machine), params))) if method == "terminal.attach" => match conn {
+            Some(conn) => crate::remote::attach(core, conn, &machine, params).await,
+            None => Err(RpcError::new(
+                "needs_framed",
+                "attach needs a framed connection",
+                "send hello with framed: true first, or use `h2 attach`",
+            )),
+        },
         Ok(Some((to, params))) => crate::remote::forward_to(core, &to, method, params).await,
         Ok(None) => api::dispatch(&call, method, params).await,
         Err(e) => Err(e),

@@ -1,9 +1,9 @@
 //! What differs between Unix (Linux, macOS) and Windows, behind one small
-//! surface: connections, agent processes, the console, files.
+//! surface: connections, terminals, agent processes, process trees, the console, files.
 //! Everything above it is shared.
 
 mod session;
-pub use session::LoginSession;
+pub use session::{LoginSession, holder_current};
 
 #[cfg(unix)]
 mod unix;
@@ -15,13 +15,15 @@ mod linux_login;
 #[cfg(target_os = "linux")]
 pub mod systemd;
 
-/// Only a new SSH-started Linux core imports login settings; agent subprocesses inherit from the core.
+/// Only a new SSH-started Linux core imports login settings; holders and agent subprocesses inherit the core.
 #[allow(unused_variables)]
 pub fn core_environment(cmd: &mut std::process::Command, state: &std::path::Path) {
     #[cfg(target_os = "linux")]
     linux_login::apply(cmd, state);
 }
 
+#[cfg(target_os = "macos")]
+mod macos_appkit;
 #[cfg(target_os = "macos")]
 mod macos_bundle;
 #[cfg(target_os = "macos")]
@@ -52,16 +54,30 @@ pub fn start_logout_linger() {
     systemd::start_logout_linger();
 }
 
+/// Whether foreground observations can distinguish a shell from its jobs.
+pub fn foreground_tracks_jobs() -> bool {
+    cfg!(unix)
+}
+
 /// Run before threads or runtime setup: a launchd launcher forks the core here.
 pub fn daemon_startup() -> bool {
     #[cfg(target_os = "macos")]
     {
         macos_bundle::installer_startup();
+        macos_responsibility::holder_startup();
         macos_launchd::startup()
     }
     #[cfg(not(target_os = "macos"))]
     {
         false
+    }
+}
+
+/// Complete the holder's background-app registration before starting threads or terminals.
+pub fn prepare_holder() {
+    #[cfg(target_os = "macos")]
+    if let Err(error) = macos_appkit::check_in() {
+        eprintln!("holder: background app registration unavailable: {error}");
     }
 }
 
@@ -87,6 +103,19 @@ pub fn connect_for_app(paths: &crate::paths::Paths) -> Result<Stream, crate::rpc
     }
     #[cfg(not(target_os = "macos"))]
     crate::client::connect_or_start(paths)
+}
+
+#[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
+pub fn holder_can_start_core(session: Option<LoginSession>) -> bool {
+    #[cfg(target_os = "macos")]
+    if let Some(id) = macos_session::graphic_session()
+        .ok()
+        .flatten()
+        .or_else(|| session.filter(|s| s.gui == Some(true)).map(|s| s.id))
+    {
+        return macos_appkit::gui_session_usable(id);
+    }
+    true
 }
 
 /// Daemons must not keep launchd's 256-fd or systemd's 1024-fd soft limit.
@@ -165,7 +194,11 @@ pub fn bundle_update_hint() -> Option<&'static str> {
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
-pub fn privacy_upgrade_notice(_previous_exe: &std::path::Path) -> &'static str {
+pub fn privacy_upgrade_notice(previous_exe: &std::path::Path) -> &'static str {
+    #[cfg(target_os = "macos")]
+    if !macos_bundle::source_is_bundle(previous_exe) {
+        return "; recreate terminals started before the Herdr2.app upgrade if macOS privacy access is broken (they were not stopped)";
+    }
     ""
 }
 
@@ -187,6 +220,8 @@ mod windows_exec;
 pub use windows_exec::*;
 #[cfg(windows)]
 mod windows_env;
+#[cfg(windows)]
+mod windows_foreground;
 #[cfg(windows)]
 mod windows_session;
 
@@ -285,7 +320,13 @@ pub(crate) fn restored_environment(
         if named(key, "XPC_FLAGS") {
             return true;
         }
-        [crate::sweep::VAR, crate::sweep::RUNTIME, "H2_LAUNCHD_DIRECT", "H2_LAUNCHD_DETACH"]
+        [
+            crate::sweep::VAR,
+            crate::sweep::RUNTIME,
+            "H2_LAUNCHD_DIRECT",
+            "H2_LAUNCHD_DETACH",
+            "_H2_RESPONSIBLE_PID",
+        ]
             .iter()
             .any(|name| named(key, name))
     };

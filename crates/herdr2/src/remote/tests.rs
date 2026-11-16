@@ -7,7 +7,7 @@ use std::sync::atomic::AtomicBool;
 async fn removing_or_replacing_a_machine_drops_its_status_poll() {
     for replacement in [false, true] {
         let root = std::path::PathBuf::from(format!("/var/tmp/h2-poll-{}", crate::platform::random_hex()));
-        let paths = Paths { socket: root.join("core.sock"), state: root.clone(), config: root.join("config.toml") };
+        let paths = Paths { socket: root.join("core.sock"), holder_socket: root.join("holder.sock"), state: root.clone(), config: root.join("config.toml") };
         paths.create_dirs().unwrap();
         let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
         let machine: Machine = serde_json::from_value(json!({
@@ -93,7 +93,7 @@ async fn a_send_on_an_already_closed_line_fails_without_waiting() {
 #[test]
 fn remote_misses_and_renames_keep_subscribers_on_the_current_machine() {
     let root = crate::test_tmp().join(format!("h2-doc-missed-{}-{}", std::process::id(), crate::platform::random_hex()));
-    let paths = Paths { socket: root.join("core.sock"), state: root.clone(), config: root.join("config.toml") };
+    let paths = Paths { socket: root.join("core.sock"), holder_socket: root.join("holder.sock"), state: root.clone(), config: root.join("config.toml") };
     paths.create_dirs().unwrap();
     let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
     let machine = Machine {

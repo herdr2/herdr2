@@ -5,7 +5,7 @@
 
 use crate::machines::Machine;
 use crate::rpc::RpcError;
-use crate::runtime::{Core, State, now_ms};
+use crate::runtime::{Core, State, TargetKey, now_ms};
 use crate::wire::{self, Conn};
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -18,8 +18,19 @@ use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 
+/// A viewer here that a stream there goes to: its connection and channel.
+type Sink = (Arc<Conn>, u32);
+/// A pending reply, its stream sink and whether resize support is required.
+type Waiting = (oneshot::Sender<Value>, Option<(Sink, bool)>);
+
 mod run;
+mod viewers;
 use run::forward_once;
+#[cfg(test)]
+#[allow(unused_imports)]
+use viewers::automatic_input;
+use viewers::{RESIZE_LOST, reattach};
+pub use viewers::{Relayed, attach, conn_gone, relay_in};
 
 #[cfg(test)]
 mod tests;
@@ -28,16 +39,18 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-/// One open line: calls go out on channel 0, replies come back by id.
+/// One open line: calls go out on channel 0, replies come back by id;
+/// attach streams there are relayed to viewers here.
 pub struct Line {
     frames: mpsc::UnboundedSender<Vec<u8>>,
-    pending: Mutex<HashMap<u64, oneshot::Sender<Value>>>,
+    pending: Mutex<HashMap<u64, Waiting>>,
+    /// Stream channel there -> the viewer here.
+    streams: Mutex<HashMap<u32, Sink>>,
     next: AtomicU64,
     /// The events subscription that keeps this machine's mirror: its call id,
     /// then its channel, and a line of events not yet whole.
     mirror: Mutex<(u64, Option<u32>, Vec<u8>)>,
     /// What the core there said it can do (its `hello`).
-    #[allow(dead_code)]
     features: Vec<String>,
     closed: AtomicBool,
 }
@@ -50,6 +63,7 @@ impl Line {
             frames,
             closed: AtomicBool::new(false),
             pending: Mutex::default(),
+            streams: Mutex::default(),
             next: AtomicU64::new(2),
             mirror: Mutex::default(),
         })
@@ -62,8 +76,19 @@ impl Line {
     }
 
     /// A reply to one of our calls: to whoever waits for it.
-    fn take_reply(&self, reply: Value) {
-        let Some(waiter) = reply["id"].as_u64().and_then(|id| lock(&self.pending).remove(&id)) else { return };
+    fn take_reply(&self, mut reply: Value) {
+        let Some((waiter, sink)) = reply["id"].as_u64().and_then(|id| lock(&self.pending).remove(&id)) else { return };
+        if let (Some((sink, require_resize)), Some(there)) = (sink, reply["result"]["channel"].as_u64()) {
+            if require_resize && reply["result"]["resize_notifications"] != true {
+                let _ = self.frames.send(wire::encode(there as u32, wire::CLOSE, b""));
+                reply = crate::rpc::response(
+                    reply["id"].clone(),
+                    Err(RpcError::new("unavailable", RESIZE_LOST, "attach again")),
+                );
+            } else {
+                lock(&self.streams).insert(there as u32, sink);
+            }
+        }
         let _ = waiter.send(reply);
     }
 
@@ -79,9 +104,21 @@ impl Line {
         params: Value,
         deadline: Duration,
     ) -> Result<Value, RpcError> {
+        self.call_into(machine, method, params, None, deadline).await
+    }
+
+    /// A call whose reply may open a stream (`channel`): it goes to `sink`
+    /// from its first byte.
+    async fn call_into(
+        &self,
+        machine: &str,
+        method: &str,
+        params: Value,
+        sink: Option<(Sink, bool)>,
+        deadline: Duration,
+    ) -> Result<Value, RpcError> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
-        // Too big for one frame would end the whole line: refuse just this call.
         if req.len() > wire::MAX_PAYLOAD {
             return Err(RpcError::invalid_params(format!(
                 "too big to send to {machine} ({} MB at most)",
@@ -101,7 +138,7 @@ impl Line {
             if self.closed.load(Ordering::Relaxed) {
                 return Err(lost());
             }
-            pending.insert(id, tx);
+            pending.insert(id, (tx, sink));
         }
         let _asked = Asked { line: self, id };
         self.frames.send(wire::encode(0, wire::DATA, req.as_bytes())).map_err(|_| lost())?;
@@ -110,14 +147,14 @@ impl Line {
                 RpcError::new(
                     "unavailable",
                     format!("{machine} didn't answer within {} s", deadline.as_secs()),
-                    if method == "agent.send" {
-                        "it may still have been queued; check with h2 read before retrying"
+                    if matches!(method, "agent.send" | "terminal.send") {
+                        "it may still have been queued or typed; check with h2 read before retrying"
                     } else {
                         "it may be busy or stuck; h2 machine ls shows its line"
                     },
                 )
             })?,
-            err = crate::server::send_cancelled(), if method == "agent.send" => return Err(err),
+            err = crate::server::send_cancelled(), if matches!(method, "agent.send" | "terminal.send") => return Err(err),
         };
         let reply = reply.map_err(|_| lost())?;
         match reply.get("error") {
@@ -210,6 +247,9 @@ pub fn keep_up(core: &Arc<Core>, id: String) {
 pub fn forget(core: &Core, st: &mut State, id: &str) {
     for (address, record) in st.mirrors.remove(id).unwrap_or_default() {
         core.deliver(st, "removed", &address, json!({}), &record, Some(&record));
+    }
+    for (address, record) in st.terminal_mirrors.remove(id).unwrap_or_default() {
+        core.deliver_pty(st, "removed", &address, json!({}), &record, Some(&record));
     }
     if let Some(LineState::Connected(line)) = st.lines.remove(id) {
         line.close();
@@ -308,6 +348,7 @@ async fn hold(core: &Arc<Core>, m: &Machine, mut d: crate::machines::Dialed) {
         }
     }
     core.changed.notify_waiters();
+    tokio::spawn(reattach(core.clone(), m.clone(), line.clone()));
     let refresh = refresh_status(core, m, &line);
     tokio::pin!(refresh);
     // Everything that happens there, to keep its mirror here and tell subscribers.
@@ -352,8 +393,13 @@ async fn hold(core: &Arc<Core>, m: &Machine, mut d: crate::machines::Dialed) {
                     None if message["id"] == mirror_call => {
                         lock(&line.mirror).1 = message["result"]["channel"].as_u64().map(|c| c as u32);
                         mirror_replace(core, m, message["result"]["agents"].as_array().cloned().unwrap_or_default());
+                        mirror_replace_terminals(
+                            core,
+                            m,
+                            message["result"]["terminals"].as_array().cloned().unwrap_or_default(),
+                        );
                         if message["result"]["channel"].is_u64() {
-                            // Docs are not in agent snapshots: readers must refetch after a gap.
+                            // Docs are not in agent/terminal snapshots: readers must refetch after a gap.
                             core.documents_missed(&mut core.lock());
                         }
                     }
@@ -373,24 +419,48 @@ async fn hold(core: &Arc<Core>, m: &Machine, mut d: crate::machines::Dialed) {
                 mirror_events(core, m, &line, &payload);
                 let _ = line.frames.send(wire::encode(there, wire::CREDIT, &(payload.len() as u32).to_le_bytes()));
             }
+            (there, wire::DATA) => {
+                if let Some((conn, here)) = lock(&line.streams).get(&there) {
+                    conn.with(|out| {
+                        out.data(*here, &payload);
+                    });
+                }
+            }
+            (there, wire::RESIZE) if payload.len() == 4 => {
+                if let Some((conn, here)) = lock(&line.streams).get(&there) {
+                    conn.with(|out| out.ordered_resize(*here, &payload));
+                }
+            }
+            (there, wire::CLOSE) => {
+                if let Some((conn, here)) = lock(&line.streams).remove(&there) {
+                    core.lock().relayed.remove(&(conn_key(&conn), here));
+                    conn.with(|out| out.finish(here, &payload));
+                }
+            }
             _ => {}
         }
     }
     writer.abort();
     drain.abort();
-    // No longer the line to use, before anyone waiting hears it is lost (a
-    // retry must not pick this dead line up again).
     {
         let mut st = core.lock();
         if matches!(st.lines.get(&m.id), Some(LineState::Connected(l)) if Arc::ptr_eq(l, &line)) {
             st.lines.insert(m.id.clone(), LineState::Connecting);
         }
     }
-    // Calls still waiting on it fail now ("lost the line"), not at their deadline.
     line.close();
-    // Killed, not waited for: a Mac core once never heard the old ssh had
-    // died and stayed "connecting" for good. It is reaped in the background.
+    let notice = lost_notice(&m.name);
+    for (_, (conn, here)) in lock(&line.streams).drain() {
+        conn.with(|out| {
+            out.data(here, notice.as_bytes());
+        });
+    }
     let _ = d.child.start_kill();
+}
+
+/// CAN first: the line may have dropped mid-sequence, which would swallow this.
+fn lost_notice(machine: &str) -> String {
+    format!("\x18\r\n[line to {machine} lost; reconnecting...]\r\n")
 }
 
 /// A machine's agents now (after a connect, or after it says we missed
@@ -413,24 +483,57 @@ fn mirror_replace(core: &Core, m: &Machine, agents: Vec<Value>) {
     st.mirrors.insert(m.id.clone(), fresh);
 }
 
+fn mirror_replace_terminals(core: &Core, m: &Machine, terminals: Vec<Value>) {
+    let mut st = core.lock();
+    let Some(name) = st.machines.iter().find(|current| current.id == m.id).map(|m| m.name.clone()) else { return };
+    let fresh: std::collections::BTreeMap<String, Value> = terminals
+        .into_iter()
+        .map(|t| localize_in(core, &st, &name, &[], t))
+        .map(|t| (t["address"].as_str().unwrap_or_default().to_string(), t))
+        .collect();
+    let old = st.terminal_mirrors.remove(&m.id).unwrap_or_default();
+    for (address, record) in old.iter().filter(|(a, _)| !fresh.contains_key(*a)) {
+        core.deliver_pty(&mut st, "removed", address, json!({}), record, Some(record));
+    }
+    for (address, record) in fresh.iter().filter(|(a, r)| old.get(*a) != Some(*r)) {
+        core.deliver_pty(&mut st, "created", address, record.clone(), record, None);
+    }
+    st.terminal_mirrors.insert(m.id.clone(), fresh);
+}
+
 pub fn rename_mirror(core: &Core, st: &mut State, id: &str, old: &str, new: &str) {
-    let Some(records) = st.mirrors.remove(id) else { return };
-    let mut renamed = std::collections::BTreeMap::new();
-    for record in records.values() {
-        let mut record = record.clone();
-        map_addresses(&mut record, &|s| match s.split_once('/') {
-            Some((prefix, rest)) if prefix == old => format!("{new}/{rest}"),
-            _ => s.to_owned(),
-        });
-        let address = record["address"].as_str().unwrap_or_default().to_owned();
-        renamed.insert(address, record);
+    let rename_map = |records: std::collections::BTreeMap<String, Value>| {
+        let mut renamed = std::collections::BTreeMap::new();
+        for record in records.values() {
+            let mut record = record.clone();
+            map_addresses(&mut record, &|s| match s.split_once('/') {
+                Some((prefix, rest)) if prefix == old => format!("{new}/{rest}"),
+                _ => s.to_owned(),
+            });
+            let address = record["address"].as_str().unwrap_or_default().to_owned();
+            renamed.insert(address, record);
+        }
+        renamed
+    };
+    if let Some(records) = st.mirrors.remove(id) {
+        let renamed = rename_map(records.clone());
+        st.mirrors.insert(id.to_owned(), renamed.clone());
+        for (address, record) in records {
+            core.deliver(st, "removed", &address, json!({}), &record, Some(&record));
+        }
+        for (address, record) in renamed {
+            core.deliver(st, "created", &address, record.clone(), &record, None);
+        }
     }
-    st.mirrors.insert(id.to_owned(), renamed.clone());
-    for (address, record) in records {
-        core.deliver(st, "removed", &address, json!({}), &record, Some(&record));
-    }
-    for (address, record) in renamed {
-        core.deliver(st, "created", &address, record.clone(), &record, None);
+    if let Some(records) = st.terminal_mirrors.remove(id) {
+        let renamed = rename_map(records.clone());
+        st.terminal_mirrors.insert(id.to_owned(), renamed.clone());
+        for (address, record) in records {
+            core.deliver_pty(st, "removed", &address, json!({}), &record, Some(&record));
+        }
+        for (address, record) in renamed {
+            core.deliver_pty(st, "created", &address, record.clone(), &record, None);
+        }
     }
 }
 
@@ -449,6 +552,7 @@ fn mirror_events(core: &Core, m: &Machine, line: &Line, payload: &[u8]) {
             Some("event") => mirror_event(core, m, msg["params"].clone()),
             Some("missed") => {
                 mirror_replace(core, m, msg["params"]["agents"].as_array().cloned().unwrap_or_default());
+                mirror_replace_terminals(core, m, msg["params"]["terminals"].as_array().cloned().unwrap_or_default());
                 core.documents_missed(&mut core.lock());
             }
             _ => {}
@@ -460,16 +564,37 @@ fn mirror_event(core: &Core, m: &Machine, p: Value) {
     let mut st = core.lock();
     let Some(name) = st.machines.iter().find(|current| current.id == m.id).map(|m| m.name.clone()) else { return };
     let p = localize_in(core, &st, &name, &[], p);
-    let (kind, address, data) =
-        (p["type"].as_str().unwrap_or_default(), p["agent"].as_str().unwrap_or_default(), p["data"].clone());
+    let kind = p["type"].as_str().unwrap_or_default();
+    let data = p["data"].clone();
     if kind == "doc" {
-        // Only this machine, not docs it in turn watches on a third core.
         if p.get("machine").is_none() {
             let doc = data["name"].as_str().unwrap_or_default().to_string();
             core.doc_event(&mut st, &doc, data, Some(&name));
         }
         return;
     }
+    if let Some(address) = p["terminal"].as_str() {
+        let mirror = st.terminal_mirrors.entry(m.id.clone()).or_default();
+        let (record, was) = match kind {
+            "created" | "restarted" => {
+                mirror.insert(address.into(), data.clone());
+                (data.clone(), None)
+            }
+            "removed" => match mirror.remove(address) {
+                Some(record) => (record.clone(), Some(record)),
+                None => return,
+            },
+            _ => {
+                let Some(record) = mirror.get_mut(address) else { return };
+                let was = record.clone();
+                apply(record, kind, &data);
+                (record.clone(), Some(was))
+            }
+        };
+        core.deliver_pty(&mut st, kind, address, data, &record, was.as_ref());
+        return;
+    }
+    let address = p["agent"].as_str().unwrap_or_default();
     let mirror = st.mirrors.entry(m.id.clone()).or_default();
     let (record, was) = match kind {
         "created" | "restarted" => {
@@ -490,7 +615,7 @@ fn mirror_event(core: &Core, m: &Machine, p: Value) {
     core.deliver(&mut st, kind, address, data, &record, was.as_ref());
 }
 
-/// An event's change, applied to an agent record (see schema/README.md).
+/// An event's change, applied to an agent or terminal mirror record.
 fn apply(record: &mut Value, kind: &str, data: &Value) {
     let set = |record: &mut Value, keys: &[&str]| keys.iter().for_each(|k| record[*k] = data[*k].clone());
     match kind {
@@ -502,6 +627,7 @@ fn apply(record: &mut Value, kind: &str, data: &Value) {
             set(record, &["reason", "exit_code", "signal", "finished_ms"]);
         }
         "status" => set(record, &["status", "records", "reported", "pending_permission", "inbox_len"]),
+        "foreground" => record["foreground"] = data.clone(),
         "turn" => set(record, &["turn"]),
         "title" => set(record, &["title"]),
         "labels" => set(record, &["labels"]),
@@ -510,35 +636,52 @@ fn apply(record: &mut Value, kind: &str, data: &Value) {
     }
 }
 
-/// What a machine may ask of agents here that are parents of its own.
-const CALLS_BACK: &[&str] = &["agent.send", "agent.get", "agent.read", "agent.wait"];
+/// What a machine may ask of agents or terminals here that are parents of its own.
+const CALLS_BACK: &[&str] = &[
+    "agent.send",
+    "agent.get",
+    "agent.read",
+    "agent.wait",
+    "terminal.send",
+    "terminal.get",
+    "terminal.read",
+    "terminal.wait",
+];
 
-/// A call or a note from a machine we dialed. It reaches only agents here
-/// that started work there: adding a machine gives it no say over the rest.
 async fn from_machine(core: Arc<Core>, m: Machine, line: Arc<Line>, message: Value) {
     let method = message["method"].as_str().unwrap_or_default();
     let mut params = message["params"].clone();
-    let key = if method == "notes" { "parent" } else { "agent" };
+    let key = if method == "notes" {
+        "parent"
+    } else if method.starts_with("terminal.") {
+        "terminal"
+    } else {
+        "agent"
+    };
     let parent = params[key].as_str().and_then(|a| {
+        let local = crate::addr::local(a, &core.info.id, &core.info.name).ok()?;
         let st = core.lock();
-        let id = st.reg.resolve(crate::addr::local(a, &core.info.id, &core.info.name).ok()?).ok()?;
-        st.reg.agents.get(&id).filter(|a| a.afar.contains(&m.id)).map(|_| id)
+        if let Some(id) = st.reg.resolve(local).ok() {
+            return st.reg.agents.get(&id).filter(|a| a.afar.contains(&m.id)).map(|_| TargetKey::Agent(id));
+        }
+        let id = st.pty_reg.resolve(local).ok()?;
+        st.pty_reg.terminals.get(&id).filter(|t| t.afar.contains(&m.id)).map(|_| TargetKey::Terminal(id))
     });
     if method == "notes" {
-        if let (Some(id), Some(text)) = (parent, params["text"].as_str()) {
-            core.lock().afar_notes.entry(id).or_default().push(text.into());
-            let _ = core.jobs.send(crate::notes::Job::Notes(id));
+        if let (Some(target), Some(text)) = (parent, params["text"].as_str()) {
+            core.lock().afar_notes.entry(target).or_default().push(text.into());
+            let _ = core.jobs.send(crate::notes::Job::Notes(target));
         }
         return;
     }
     let result = match parent.filter(|_| CALLS_BACK.contains(&method)) {
         None => Err(RpcError::new(
             "denied",
-            format!("{} may only reach the agents here that started its own", m.name),
+            format!("{} may only reach the agents or terminals here that started its own", m.name),
             "",
         )),
-        Some(id) => {
-            params["agent"] = crate::agents::address(id).into();
+        Some(target) => {
+            params[key] = target.address().into();
             if let Some(caller) = params["caller"].as_str() {
                 params["caller"] = format!("{}/{caller}", m.name).into();
             }
@@ -655,9 +798,14 @@ pub fn tell_peer(core: &Core, st: &mut State, parent: &str, notes: &[String]) {
 
 /// A parent here finished: machines it started work on end its children that
 /// asked to die with it (once the line is back, if it is down).
-pub fn orphaned_afar(core: &Core, st: &mut State, parent: u32) {
-    let afar = st.reg.agents.get(&parent).map(|a| a.afar.clone()).unwrap_or_default();
-    let message = json!({"jsonrpc": "2.0", "method": "$/orphaned", "params": {"parent": format!("{}/{}", core.info.id, crate::agents::address(parent))}});
+pub fn orphaned_afar(core: &Core, st: &mut State, parent: TargetKey) {
+    let afar = match parent {
+        TargetKey::Agent(id) => st.reg.agents.get(&id).map(|a| a.afar.clone()),
+        TargetKey::Terminal(id) => st.pty_reg.terminals.get(&id).map(|t| t.afar.clone()),
+    }
+    .unwrap_or_default();
+    let message =
+        json!({"jsonrpc": "2.0", "method": "$/orphaned", "params": {"parent": format!("{}/{}", core.info.id, parent.address())}});
     for id in afar {
         match st.lines.get(&id) {
             Some(LineState::Connected(line)) => line.message(&message),
@@ -666,26 +814,35 @@ pub fn orphaned_afar(core: &Core, st: &mut State, parent: u32) {
     }
 }
 
-/// From a peer: its agent `parent` finished. Children here that asked to
+/// From a peer: its agent or terminal `parent` finished. Children here that asked to
 /// die with it end.
 pub async fn orphaned(core: &Arc<Core>, conn: Option<&Arc<Conn>>, params: &Value) -> Result<Value, RpcError> {
     let from_peer = conn.is_some_and(|c| core.lock().peer_lines.values().any(|(k, _)| *k == conn_key(c)));
     let Some(address) = params["parent"].as_str().filter(|_| from_peer).and_then(|p| peer_address(core, p)) else {
-        return Err(RpcError::new("denied", "only a core that dialed in says its agents finished", ""));
+        return Err(RpcError::new("denied", "only a core that dialed in says its parents finished", ""));
     };
-    let kids: Vec<u32> = {
+    let (acp_kids, pty_kids): (Vec<u32>, Vec<u32>) = {
         let mut st = core.lock();
-        let kids: Vec<u32> = st
+        let acp_kids: Vec<u32> = st
             .reg
             .agents
             .values()
             .filter(|a| a.is_live() && a.die_with_parent && a.parent.as_deref() == Some(address.as_str()))
             .map(|a| a.id())
             .collect();
-        st.killing.extend(&kids);
-        kids
+        let pty_kids: Vec<u32> = st
+            .pty_reg
+            .terminals
+            .values()
+            .filter(|t| t.is_live() && t.die_with_parent && t.parent.as_deref() == Some(address.as_str()))
+            .map(|t| t.id())
+            .collect();
+        st.killing.extend(&acp_kids);
+        st.pty_killing.extend(&pty_kids);
+        (acp_kids, pty_kids)
     };
-    core.kill(&kids).await;
+    core.kill(&acp_kids).await;
+    core.pty_kill(&pty_kids).await;
     Ok(json!({}))
 }
 
@@ -729,11 +886,27 @@ const ON_AN_AGENT: &[&str] = &[
     "agent.put",
 ];
 
+/// Methods whose `terminal` names the terminal they act on.
+const ON_A_TERMINAL: &[&str] = &[
+    "terminal.get",
+    "terminal.kill",
+    "terminal.rm",
+    "terminal.label",
+    "terminal.keep",
+    "terminal.read",
+    "terminal.attach",
+    "terminal.send",
+    "terminal.keys",
+    "terminal.interrupt",
+    "terminal.wait",
+    "terminal.put",
+];
+
 /// Where a call goes when it isn't here.
 pub enum To {
     /// A machine this core added.
     Machine(Machine),
-    /// A core that dialed in: only to the parents of its agents here.
+    /// A core that dialed in: only to the parents of its agents/terminals here.
     Peer { id: String, name: String },
 }
 
@@ -758,7 +931,7 @@ pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Va
     let mut params = params.clone();
     let to = if matches!(
         method,
-        "agent.run" | "machine.exec" | "file.read" | "file.write" | "file.edit" | "doc.get" | "doc.set"
+        "agent.run" | "terminal.run" | "machine.exec" | "file.read" | "file.write" | "file.edit" | "doc.get" | "doc.set"
     ) {
         let Some(on) = params["on"].as_str().map(String::from) else { return Ok(None) };
         params.as_object_mut().map(|p| p.remove("on"));
@@ -766,9 +939,10 @@ pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Va
             Some(To::Peer { name, .. }) => return Err(crate::machines::unknown(&st.machines, &name)),
             to => to,
         }
-    } else if ON_AN_AGENT.contains(&method) && params["children"].is_null() {
+    } else if (ON_AN_AGENT.contains(&method) || ON_A_TERMINAL.contains(&method)) && params["children"].is_null() {
+        let field = if ON_A_TERMINAL.contains(&method) { "terminal" } else { "agent" };
         let Some((prefix, local)) =
-            params["agent"].as_str().and_then(|a| a.split_once('/')).map(|(a, b)| (a.to_string(), b.to_string()))
+            params[field].as_str().and_then(|a| a.split_once('/')).map(|(a, b)| (a.to_string(), b.to_string()))
         else {
             return Ok(None);
         };
@@ -778,7 +952,7 @@ pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Va
         {
             return Err(RpcError::new("denied", format!("{name} only takes send, read, get and wait from here"), ""));
         }
-        params["agent"] = local.into();
+        params[field] = local.into();
         to
     } else {
         None
@@ -847,7 +1021,8 @@ fn deadline_for(core: &Core, method: &str, params: &Value) -> Duration {
         let secs = params["timeout"].as_f64().unwrap_or(crate::exec::DEFAULT_TIMEOUT).clamp(0.0, 600.0);
         return config.machine_timeout() + Duration::from_secs_f64(secs) + Duration::from_secs(5);
     }
-    let waits = method == "agent.wait" || (params["wait"] == true && matches!(method, "agent.run" | "agent.send"));
+    let waits = matches!(method, "agent.wait" | "terminal.wait")
+        || (params["wait"] == true && matches!(method, "agent.run" | "agent.send" | "terminal.run" | "terminal.send"));
     let wait = match params["timeout"].as_f64() {
         Some(secs) => secs,
         None => config.wait_timeout.unwrap_or(180.0),
@@ -857,7 +1032,8 @@ fn deadline_for(core: &Core, method: &str, params: &Value) -> Duration {
 }
 
 fn waits(method: &str, params: &Value) -> bool {
-    method == "agent.wait" || (params["wait"] == true && matches!(method, "agent.run" | "agent.send"))
+    matches!(method, "agent.wait" | "terminal.wait")
+        || (params["wait"] == true && matches!(method, "agent.run" | "agent.send" | "terminal.run" | "terminal.send"))
 }
 
 fn line_lost(e: &RpcError) -> bool {
@@ -869,16 +1045,20 @@ fn line_lost(e: &RpcError) -> bool {
 /// started with; its output is read once it is done.
 async fn forward_waiting(core: &Core, m: &Machine, method: &str, mut params: Value) -> Result<Value, RpcError> {
     let deadline = tokio::time::Instant::now() + deadline_for(core, method, &params);
-    let mark = (method == "agent.run").then(crate::platform::random_hex);
+    let is_pty = method.starts_with("terminal.");
+    let is_run = matches!(method, "agent.run" | "terminal.run");
+    let is_send = matches!(method, "agent.send" | "terminal.send");
+    let mark = is_run.then(crate::platform::random_hex);
     if let Some(mark) = &mark {
         params["labels"]["h2.run"] = mark.clone().into();
     }
     let first = match forward_once(core, m, method, params.clone()).await {
-        Err(e) if line_lost(&e) && method != "agent.send" => e,
+        Err(e) if line_lost(&e) && !is_send => e,
         done => return done,
     };
     let caller = params["caller"].clone();
-    let mut target = (method != "agent.run").then(|| params["agent"].as_str().map(String::from)).flatten();
+    let field = if is_pty { "terminal" } else { "agent" };
+    let mut target = (!is_run).then(|| params[field].as_str().map(String::from)).flatten();
     loop {
         if tokio::time::Instant::now() >= deadline {
             return Err(first);
@@ -891,33 +1071,36 @@ async fn forward_waiting(core: &Core, m: &Machine, method: &str, mut params: Val
         if target.is_none()
             && let Some(mark) = &mark
         {
-            let found = forward_once(core, m, "agent.list", json!({"all": true, "labels": {"h2.run": mark}})).await;
-            target = found.ok().and_then(|r| r["agents"][0]["address"].as_str().map(String::from));
+            let (list_m, list_k) = if is_pty { ("terminal.list", "terminals") } else { ("agent.list", "agents") };
+            let found = forward_once(core, m, list_m, json!({"all": true, "labels": {"h2.run": mark}})).await;
+            target = found.ok().and_then(|r| r[list_k][0]["address"].as_str().map(String::from));
             if target.is_none() {
-                return Err(first); // it never started there
+                return Err(first);
             }
         }
-        let Some(agent) = target.clone() else { return Err(first) };
-        let local = agent.split_once('/').map_or(agent.as_str(), |(_, a)| a).to_string();
+        let Some(tgt) = target.clone() else { return Err(first) };
+        let local = tgt.split_once('/').map_or(tgt.as_str(), |(_, a)| a).to_string();
         let left = deadline.saturating_duration_since(tokio::time::Instant::now()).as_secs_f64();
-        let wait = json!({"agent": local, "timeout": left, "caller": caller});
-        let r = match forward_once(core, m, "agent.wait", wait).await {
+        let wait_m = if is_pty { "terminal.wait" } else { "agent.wait" };
+        let wait = json!({field: local, "timeout": left, "caller": caller});
+        let r = match forward_once(core, m, wait_m, wait).await {
             Err(e) if line_lost(&e) => continue,
             other => other?,
         };
-        return Ok(match method {
-            "agent.run" => {
-                let mut record = forward_once(core, m, "agent.get", json!({"agent": local})).await?;
-                let read = json!({"agent": local, "lines": crate::api::FINISHED_LINES});
-                let text =
-                    forward_once(core, m, "agent.read", read).await.map(|r| r["text"].clone()).unwrap_or_default();
-                let id = crate::agents::parse_id(&local).unwrap_or_default();
-                record["wait"] = r;
-                record["output"] = crate::api::tail(text.as_str().unwrap_or_default().to_string(), id).into();
-                record
-            }
-            "agent.send" => json!({"status": r["status"], "turn": r["turn"], "wait": r}),
-            _ => r,
+        return Ok(if is_run {
+            let get_m = if is_pty { "terminal.get" } else { "agent.get" };
+            let read_m = if is_pty { "terminal.read" } else { "agent.read" };
+            let mut record = forward_once(core, m, get_m, json!({field: local})).await?;
+            let read = json!({field: local, "lines": crate::api::FINISHED_LINES});
+            let text = forward_once(core, m, read_m, read).await.map(|r| r["text"].clone()).unwrap_or_default();
+            let raw_text = text.as_str().unwrap_or_default().to_string();
+            record["wait"] = r;
+            record["output"] = crate::api::tail_address(raw_text, &local).into();
+            record
+        } else if is_send {
+            json!({"status": r["status"], "turn": r["turn"], "wait": r})
+        } else {
+            r
         });
     }
 }
@@ -958,7 +1141,7 @@ fn map_addresses(v: &mut Value, map: &dyn Fn(&str) -> String) {
                 match v {
                     Value::String(s)
                         if ["address", "parent", "from", "removed"].contains(&k.as_str())
-                            || (k == "agent" && !is_agent_record) =>
+                            || ((k == "agent" || k == "terminal") && !is_agent_record) =>
                     {
                         *s = map(s)
                     }

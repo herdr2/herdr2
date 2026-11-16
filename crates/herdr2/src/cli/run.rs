@@ -29,6 +29,7 @@ pub(super) fn flags_after_task(paths: &Paths, p: RunParams) -> Result<(RunParams
         rm: p.rm || q.rm,
         keep: p.keep || q.keep,
         bg: p.bg || q.bg,
+        async_start: p.async_start || q.async_start,
         timeout: q.timeout.or(p.timeout),
         ..p
     };

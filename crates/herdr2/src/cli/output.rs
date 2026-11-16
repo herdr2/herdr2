@@ -23,7 +23,7 @@ pub(super) fn status(a: &Value) -> (String, &'static str) {
     (word.into(), dot)
 }
 
-/// Which agent binary/preset runs here.
+/// Which agent binary/preset runs here (or foreground app / command for terminals).
 pub(super) fn agent_label(a: &Value) -> String {
     if let Some(preset) = a["agent"].as_str().filter(|s| !s.is_empty()) {
         return preset.into();
@@ -31,12 +31,15 @@ pub(super) fn agent_label(a: &Value) -> String {
     if let Some(info) = a["agent_info"].as_str().filter(|s| !s.is_empty()) {
         return info.into();
     }
+    if let Some(app) = a["status"]["app"].as_str().filter(|s| !s.is_empty()) {
+        return app.into();
+    }
     let program = a["argv"][0].as_str().unwrap_or_default();
     program.rsplit('/').next().unwrap_or_default().into()
 }
 
 fn cwd(a: &Value) -> Option<&str> {
-    a["cwd"].as_str()
+    a["foreground"]["cwd"].as_str().or_else(|| a["cwd"].as_str())
 }
 
 /// The last folder of an agent's cwd, `~` for home.
@@ -177,12 +180,13 @@ fn order_tree(agents: &[Value]) -> Vec<(usize, &Value)> {
 }
 
 pub(super) fn table(r: &Value) -> String {
-    let agents = r["agents"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let mut records: Vec<Value> = r["terminals"].as_array().cloned().unwrap_or_default();
+    records.extend(r["agents"].as_array().cloned().unwrap_or_default());
     let mut out = String::new();
-    if agents.is_empty() {
+    if records.is_empty() {
         out.push_str("no live agents\n");
     } else {
-        let rows: Vec<(&'static str, [String; 6])> = order_tree(agents)
+        let rows: Vec<(&'static str, [String; 6])> = order_tree(&records)
             .into_iter()
             .map(|(depth, a)| {
                 let (word, dot) = status(a);

@@ -1,8 +1,8 @@
 //! `h2`: one API call per command. Tables for people, JSON when piped or `--json`.
 
 use crate::api::{
-    AgentParams, ApproveParams, ExecParams, InterruptParams, KeepParams, LabelParams, ListParams, PutParams,
-    ReadParams, RunParams, SendParams, SubscribeParams, WaitParams,
+    AgentParams, ApproveParams, AttachParams, ExecParams, InterruptParams, KeepParams, KeysParams, LabelParams,
+    ListParams, PutParams, ReadParams, RunParams, SendParams, SubscribeParams, WaitParams,
 };
 use crate::client;
 use crate::paths::Paths;
@@ -110,6 +110,15 @@ enum Cmd {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Follow live output of an interactive PTY terminal (Ctrl-\ then d detaches).
+    Attach(AttachParams),
+    /// Send named keys (enter, esc, tab, ctrl+c, ...) to a live PTY terminal.
+    Keys(KeysParams),
+    #[command(hide = true)]
+    Hold {
+        #[arg(long)]
+        socket: std::path::PathBuf,
+    },
     #[command(hide = true)]
     Serve,
 }
@@ -211,15 +220,21 @@ fn call(paths: &Paths, method: &str, params: Value) -> Result<Value, RpcError> {
     client::call(&stream, method, params).map_err(|e| client::explain_closed(paths, e))
 }
 
-/// Requires an explicit target or fails with candidate agent addresses/names.
+/// Requires an explicit target or fails with candidate agent/terminal addresses and names.
 fn target(paths: &Paths, given: Option<String>, finished: bool) -> Result<String, RpcError> {
     if let Some(a) = given {
         return Ok(a);
     }
-    let list = call(paths, "agent.list", json!({"all": finished}))?;
     let state = if finished { "finished" } else { "live" };
-    let candidates: Vec<&Value> =
-        list["agents"].as_array().into_iter().flatten().filter(|a| a["state"] == state).collect();
+    let agents = call(paths, "agent.list", json!({"all": finished}))?;
+    let terminals = call(paths, "terminal.list", json!({"all": finished})).unwrap_or_else(|_| json!({}));
+    let candidates: Vec<&Value> = agents["agents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(terminals["terminals"].as_array().into_iter().flatten())
+        .filter(|a| a["state"] == state)
+        .collect();
     let names: Vec<String> = candidates
         .iter()
         .map(|a| match a["name"].as_str() {
@@ -228,16 +243,21 @@ fn target(paths: &Paths, given: Option<String>, finished: bool) -> Result<String
         })
         .collect();
     let message = if names.is_empty() {
-        format!("no agent given, and none are {state}")
+        format!("no target given, and none are {state}")
     } else {
-        format!("which agent? {}", names.join(", "))
+        format!("which target? {}", names.join(", "))
     };
-    Err(RpcError::new("needs_target", message, "pass an address like a7 or a name"))
+    Err(RpcError::new("needs_target", message, "pass an address like a7 or t1, or a name"))
 }
 
-/// Bare `h2`: print the live agents overview (or JSON when piped/`--json`).
+/// Bare `h2`: print live agents & terminals overview (or JSON when piped/`--json`).
 fn bare(paths: &Paths) -> Result<Option<Out>, RpcError> {
     let mut r = call(paths, "agent.list", json!({}))?;
+    if let Ok(tr) = call(paths, "terminal.list", json!({}))
+        && let Some(arr) = tr["terminals"].as_array().filter(|a| !a.is_empty())
+    {
+        r["terminals"] = Value::Array(arr.clone());
+    }
     let human = table(&r);
     r["commands"] = json!([
         "h2 run --agent <preset> --prompt <task>",
@@ -252,7 +272,7 @@ fn bare(paths: &Paths) -> Result<Option<Out>, RpcError> {
 
 fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcError> {
     let paths = Paths::from_env()?;
-    if !matches!(&cmd, Some(Cmd::Serve | Cmd::Connect { .. } | Cmd::Mcp)) {
+    if !matches!(&cmd, Some(Cmd::Serve | Cmd::Hold { .. } | Cmd::Connect { .. } | Cmd::Mcp)) {
         crate::platform::legacy_bundle_notice(&paths.state);
     }
     let Some(cmd) = cmd else {
@@ -267,6 +287,20 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             crate::platform::prepare_core();
             crate::server::serve().map_err(|e| RpcError::internal(e.to_string()))?;
             return Ok(None);
+        }
+        Cmd::Hold { socket } => {
+            crate::holder::run(socket).map_err(|e| RpcError::internal(e.to_string()))?;
+            return Ok(None);
+        }
+        Cmd::Attach(p) => {
+            let message = crate::attach::run(&paths, &pick(p.terminal)?, p.observe, p.history)?;
+            eprintln!("{message}");
+            return Ok(None);
+        }
+        Cmd::Keys(mut p) => {
+            p.caller = Some(caller());
+            let r = call("terminal.keys", to(&p))?;
+            Out { json: r, human: "keys sent".into() }
         }
         Cmd::Mcp => {
             crate::mcp::serve_stdio()?;
@@ -358,10 +392,22 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             Out { json, human }
         }
         Cmd::Ls(p) => {
-            let r = call("agent.list", to(&p))?;
+            let mut r = call("agent.list", to(&p))?;
+            let tr = call("terminal.list", to(&p)).unwrap_or_else(|_| json!({}));
+            if let Some(arr) = tr["terminals"].as_array().filter(|a| !a.is_empty()) {
+                r["terminals"] = Value::Array(arr.clone());
+                r["hidden_finished"] = json!(
+                    r["hidden_finished"].as_u64().unwrap_or(0)
+                        + tr["hidden_finished"].as_u64().unwrap_or(0)
+                );
+            }
             let human = table(&r);
             let rows: Vec<Value> = r["agents"].as_array().into_iter().flatten().map(short).collect();
             let mut json = json!({"agents": rows, "hidden_finished": r["hidden_finished"]});
+            if let Some(trows) = r["terminals"].as_array() {
+                let trows: Vec<Value> = trows.iter().map(short).collect();
+                json["terminals"] = Value::Array(trows);
+            }
             if let Some(machines) = r["machines"].as_array().filter(|m| !m.is_empty()) {
                 let keep = |m: &Value| -> Value {
                     let fields = ["name", "state", "since_ms", "why"].into_iter();
@@ -375,14 +421,26 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             Out { json, human }
         }
         Cmd::Get(mut p) => {
-            (p.agent, p.caller) = (pick(p.agent)?, Some(caller()));
-            let r = call("agent.get", to(&p))?;
+            let name = pick(p.agent)?;
+            p.agent = name.clone();
+            p.caller = Some(caller());
+            let r = match call("agent.get", to(&p)) {
+                Err(e) if e.kind == "not_found" => call("terminal.get", json!({"terminal": name, "caller": p.caller}))?,
+                other => other?,
+            };
             let human = describe(&r);
             Out { json: r, human }
         }
         Cmd::Kill(mut p) => {
-            (p.agent, p.caller) = (pick(p.agent)?, Some(caller()));
-            let r = call("agent.kill", to(&p))?;
+            let name = pick(p.agent)?;
+            p.agent = name.clone();
+            p.caller = Some(caller());
+            let r = match call("agent.kill", to(&p)) {
+                Err(e) if e.kind == "not_found" => {
+                    call("terminal.kill", json!({"terminal": name, "caller": p.caller}))?
+                }
+                other => other?,
+            };
             let human = describe(&r);
             Out { json: r, human }
         }
@@ -393,12 +451,24 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             Out { json: r, human }
         }
         Cmd::Keep(p) => {
-            let r = call("agent.keep", to(&p))?;
+            let name = p.agent.clone();
+            let keep = p.keep;
+            let r = match call("agent.keep", to(&p)) {
+                Err(e) if e.kind == "not_found" => call("terminal.keep", json!({"terminal": name, "keep": keep}))?,
+                other => other?,
+            };
             let human = describe(&r);
             Out { json: r, human }
         }
         Cmd::Label(p) => {
-            let r = call("agent.label", to(&p))?;
+            let name = p.agent.clone();
+            let labels_val = to(&p)["labels"].clone();
+            let r = match call("agent.label", to(&p)) {
+                Err(e) if e.kind == "not_found" => {
+                    call("terminal.label", json!({"terminal": name, "labels": labels_val}))?
+                }
+                other => other?,
+            };
             let human = describe(&r);
             Out { json: r, human }
         }
@@ -587,9 +657,11 @@ fn from_here(cwd: Option<String>) -> Option<String> {
     }
 }
 
-/// Who is asking: this h2 agent, else the shell or script that ran us.
+/// Who is asking: this h2 agent or terminal, else the shell or script that ran us.
 fn caller() -> String {
-    client::agent_id().unwrap_or_else(|| format!("ppid:{}", crate::platform::parent_pid()))
+    client::agent_id()
+        .or_else(client::terminal_id)
+        .unwrap_or_else(|| format!("ppid:{}", crate::platform::parent_pid()))
 }
 
 /// Prints the snapshot, then every notification until the core goes away.
@@ -600,7 +672,7 @@ fn follow_events(paths: &Paths, params: Value, json: bool) -> Result<(), RpcErro
     if json {
         println!("{snapshot}");
     } else {
-        println!("{}", table(&json!({"agents": snapshot["agents"]})));
+        println!("{}", table(&json!({"agents": snapshot["agents"], "terminals": snapshot["terminals"]})));
     }
     for line in std::io::BufReader::new(&stream).lines() {
         let Ok(line) = line else { break };
@@ -618,12 +690,16 @@ fn follow_events(paths: &Paths, params: Value, json: bool) -> Result<(), RpcErro
             }
             Some("event") => println!(
                 "{:<6} {:<10} {}",
-                p["agent"].as_str().unwrap_or("?"),
+                p["agent"].as_str().or_else(|| p["terminal"].as_str()).unwrap_or("?"),
                 p["type"].as_str().unwrap_or("?"),
                 p["data"]
             ),
             Some("missed") => {
-                println!("[missed some events; {} agents now]", p["agents"].as_array().map_or(0, Vec::len))
+                println!(
+                    "[missed some events; {} agents, {} terminals now]",
+                    p["agents"].as_array().map_or(0, Vec::len),
+                    p["terminals"].as_array().map_or(0, Vec::len)
+                )
             }
             _ => {}
         }
@@ -735,6 +811,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("approve", "agent.approve"),
     ("deny", "agent.deny"),
     ("read", "agent.read"),
+    ("attach", "terminal.attach"),
+    ("keys", "terminal.keys"),
     ("put", "agent.put"),
     ("exec", "machine.exec"),
     ("file read", "file.read"),
@@ -753,8 +831,24 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("machine rename", "machine.rename"),
     ("machine rm", "machine.rm"),
 ];
-/// Client-only methods: handshake and opaque document storage.
-pub const API_ONLY: &[&str] = &["hello", "doc.get", "doc.set"];
+/// Client/app methods not mapped 1:1 from a separate top-level CLI subcommand.
+pub const API_ONLY: &[&str] = &[
+    "hello",
+    "doc.get",
+    "doc.set",
+    "terminal.run",
+    "terminal.list",
+    "terminal.get",
+    "terminal.kill",
+    "terminal.rm",
+    "terminal.keep",
+    "terminal.label",
+    "terminal.read",
+    "terminal.send",
+    "terminal.wait",
+    "terminal.interrupt",
+    "terminal.put",
+];
 
 #[cfg(test)]
 mod tests;

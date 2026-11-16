@@ -4,7 +4,7 @@
 
 use crate::agents::{Agent, NewAgent, Public};
 use crate::rpc::{RpcError, methods};
-use crate::runtime::{Core, Exit, now_ms};
+use crate::runtime::{Core, Exit, TargetKey, now_ms};
 use crate::wait::{WaitResult, WaitSpec};
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -13,18 +13,32 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub const GENERATION: u32 = 1;
-pub const FEATURES: &[&str] = &["framed", "events", "status", "acp", "mcp", "restart_environment"];
+pub const FEATURES: &[&str] = &[
+    "framed",
+    "events",
+    "status",
+    "acp",
+    "mcp",
+    "attach",
+    "shell",
+    "resize_notifications",
+    "automatic_input",
+    "restart_environment",
+];
 pub const FINISHED_LINES: usize = 1000;
-/// Agent identity variables stripped unless explicitly passed by a caller.
-pub const IDENTITY_VARS: &[&str] = &["H2_AGENT_ID", "H2_AGENT_SOCKET"];
+/// Agent and terminal identity variables stripped unless explicitly passed by a caller.
+pub const IDENTITY_VARS: &[&str] = &["H2_AGENT_ID", "H2_AGENT_SOCKET", "H2_TERMINAL_ID", "H2_TERMINAL_SOCKET"];
 
 mod doc;
+mod pty;
 mod run;
 mod types;
 use doc::*;
+use pty::*;
+pub(crate) use pty::{pty_child_env, terminal_env};
 mod waiting;
 use run::*;
-pub(crate) use run::{agent_env, child_env, not_stopping, tail};
+pub(crate) use run::{agent_env, child_env, not_stopping, tail_address};
 pub use types::*;
 use waiting::*;
 
@@ -110,6 +124,48 @@ methods! { Ctx<'_>;
     "agent.put" => agent_put, PutParams => PutResult,
         "Write bytes to a file beside a live agent, on its machine, for it to read. Lands in an isolated directory removed with the agent.",
         errors ["not_found", "machine_unknown", "finished", "invalid_params"];
+    "terminal.run" => terminal_run, TerminalRunParams => TerminalRunResult,
+        "Start a program in a pseudo-terminal (`shell`, command, or template). With `wait`, wait for it to finish and return its screen.",
+        errors ["invalid_params", "name_taken", "spawn_failed", "unavailable", "invalid_template", "not_found", "machine_unknown", "config"];
+    "terminal.list" => terminal_list, ListParams => TerminalListResult,
+        "Live interactive PTY terminals (all with `all`), optionally filtered by labels.",
+        errors [];
+    "terminal.get" => terminal_get, TerminalParams => crate::terminals::Public,
+        "One terminal's facts, live or finished.",
+        errors ["not_found", "machine_unknown"];
+    "terminal.kill" => terminal_kill, TerminalParams => crate::terminals::Public,
+        "End a terminal's program (HUP, then TERM, then KILL). Returns the observed record.",
+        errors ["not_found", "machine_unknown"];
+    "terminal.rm" => terminal_rm, TerminalParams => RemoveResult,
+        "Remove a finished terminal.",
+        errors ["not_found", "machine_unknown", "live"];
+    "terminal.keep" => terminal_keep, TerminalKeepParams => crate::terminals::Public,
+        "Keep a live terminal recoverable after crash or restart by launching a replacement shell.",
+        errors ["not_found", "invalid_params"];
+    "terminal.label" => terminal_label, TerminalLabelParams => crate::terminals::Public,
+        "Set or remove labels (free-form `key=value`, never interpreted).",
+        errors ["not_found", "machine_unknown", "invalid_params"];
+    "terminal.read" => terminal_read, TerminalReadParams => TerminalReadResult,
+        "A terminal's screen, or scrollback history lines.",
+        errors ["not_found", "machine_unknown"];
+    "terminal.attach" => terminal_attach, AttachParams => AttachResult,
+        "Open a live terminal viewer stream on this framed connection.",
+        errors ["not_found", "machine_unknown", "finished", "needs_framed", "refused"];
+    "terminal.send" => terminal_send, TerminalSendParams => TerminalSendResult,
+        "Paste text into a live terminal and submit with Enter.",
+        errors ["not_found", "machine_unknown", "finished", "unavailable", "blocked", "status_mismatch", "invalid_params", "config"];
+    "terminal.wait" => terminal_wait, TerminalWaitParams => crate::wait::WaitResult,
+        "Wait until a terminal leaves `working` (done, idle, blocked, error, exited) or matches `output`.",
+        errors ["not_found", "machine_unknown", "invalid_params", "needs_target", "config"];
+    "terminal.keys" => terminal_keys, KeysParams => KeysResult,
+        "Send named keys (enter, esc, tab, ctrl+c, ...) to a live terminal.",
+        errors ["not_found", "machine_unknown", "finished", "unavailable", "invalid_params", "config"];
+    "terminal.interrupt" => terminal_interrupt, TerminalInterruptParams => TerminalInterruptResult,
+        "Send interrupt key (Esc or Ctrl-C) to a live terminal and watch for an effect.",
+        errors ["not_found", "machine_unknown", "finished", "unavailable", "invalid_params"];
+    "terminal.put" => terminal_put, TerminalPutParams => PutResult,
+        "Write bytes to a file beside a live terminal for its program to read.",
+        errors ["not_found", "machine_unknown", "finished", "invalid_params"];
     "machine.exec" => machine_exec, ExecParams => ExecResult,
         "Run one non-agent command here or on a machine (`on`); returns exit code and stdout/stderr (base64). `argv` runs directly, `line` in that machine's shell.",
         errors ["invalid_params", "spawn_failed", "machine_unknown", "unavailable", "needs_update"];
@@ -160,6 +216,18 @@ fn resolve(core: &Core, address: &str) -> Result<u32, RpcError> {
     core.lock().reg.resolve(local)
 }
 
+pub(crate) fn resolve_any(core: &Core, address: &str) -> Result<TargetKey, RpcError> {
+    let local = crate::addr::local(address, &core.info.id, &core.info.name)?;
+    let st = core.lock();
+    match st.reg.resolve(local) {
+        Ok(id) => Ok(TargetKey::Agent(id)),
+        Err(agent_err) => match st.pty_reg.resolve(local) {
+            Ok(id) => Ok(TargetKey::Terminal(id)),
+            Err(_) => Err(agent_err),
+        },
+    }
+}
+
 fn record(core: &Core, id: u32) -> Result<Agent, RpcError> {
     core.lock().reg.agents.get(&id).cloned().ok_or_else(|| {
         RpcError::new("not_found", format!("{} was removed", crate::agents::address(id)), "see `h2 ls --all`")
@@ -191,14 +259,17 @@ async fn hello(core: Ctx<'_>, p: HelloParams) -> Result<HelloResult, RpcError> {
 async fn server_status(core: Ctx<'_>, _: Empty) -> Result<StatusResult, RpcError> {
     let (keeps_running_after_logout, logout_linger_user) = crate::platform::logout_linger();
     let st = core.lock();
-    let live = st.reg.agents.values().filter(|a| a.is_live()).count();
+    let live_agents = st.reg.agents.values().filter(|a| a.is_live()).count();
+    let live_terminals = st.pty_reg.terminals.values().filter(|t| t.is_live()).count();
+    let total = st.reg.agents.len() + st.pty_reg.terminals.len();
+    let live = live_agents + live_terminals;
     Ok(StatusResult {
         core: core.info.clone(),
         version: version(),
         pid: std::process::id(),
         uptime_ms: core.started.elapsed().as_millis() as u64,
         live,
-        finished: st.reg.agents.len() - live,
+        finished: total - live,
         installed_by: crate::client::installed_by().map(String::from),
         keeps_running_after_logout,
         logout_linger_user,
@@ -289,20 +360,26 @@ async fn agent_kill(core: Ctx<'_>, p: AgentParams) -> Result<Public, RpcError> {
 }
 
 async fn agent_rm(core: Ctx<'_>, p: AgentParams) -> Result<RemoveResult, RpcError> {
-    let id = resolve(core, &p.agent)?;
-    {
-        let mut st = core.lock();
-        if st.reg.agents.get(&id).is_some_and(|a| a.is_live()) {
-            return Err(RpcError::new(
-                "live",
-                format!("{} is still running", crate::agents::address(id)),
-                format!("kill it first: h2 kill {}", crate::agents::address(id)),
-            ));
+    match resolve_any(core, &p.agent)? {
+        TargetKey::Terminal(id) => {
+            terminal_rm(core, TerminalParams { terminal: crate::terminals::address(id), caller: p.caller }).await
         }
-        core.remove(&mut st, id);
+        TargetKey::Agent(id) => {
+            {
+                let mut st = core.lock();
+                if st.reg.agents.get(&id).is_some_and(|a| a.is_live()) {
+                    return Err(RpcError::new(
+                        "live",
+                        format!("{} is still running", crate::agents::address(id)),
+                        format!("kill it first: h2 kill {}", crate::agents::address(id)),
+                    ));
+                }
+                core.remove(&mut st, id);
+            }
+            core.flush_saved().await?;
+            Ok(RemoveResult { removed: crate::agents::address(id) })
+        }
     }
-    core.flush_saved().await?;
-    Ok(RemoveResult { removed: crate::agents::address(id) })
 }
 
 async fn agent_keep(core: Ctx<'_>, p: KeepParams) -> Result<Public, RpcError> {
@@ -343,63 +420,124 @@ async fn agent_label(core: Ctx<'_>, p: LabelParams) -> Result<Public, RpcError> 
 }
 
 async fn agent_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError> {
-    let timeout = if p.wait { Some(wait_timeout(core, p.timeout)?) } else { None };
-    let id = resolve(core, &p.agent)?;
-    if let Some(timeout) = timeout {
-        let spec = WaitSpec { output: None, timeout, after_turn: None };
-        let _ = watched(core, p.caller.clone(), id, spec).await;
-    } else {
-        core.saw(p.caller.as_deref(), id);
+    match resolve_any(core, &p.agent)? {
+        TargetKey::Terminal(id) => {
+            let term_addr = crate::terminals::address(id);
+            if p.wait {
+                let timeout = wait_timeout(core, p.timeout)?;
+                let spec = WaitSpec { output: None, timeout, after_turn: None };
+                let _ = watched(core, p.caller.clone(), TargetKey::Terminal(id), spec).await;
+            }
+            let r = terminal_read(
+                core,
+                TerminalReadParams { terminal: term_addr, caller: p.caller, lines: p.lines.unwrap_or(0) },
+            )
+            .await?;
+            Ok(ReadResult { text: r.text, complete: r.complete, how: r.how, why: r.why, entries: Vec::new() })
+        }
+        TargetKey::Agent(id) => {
+            let timeout = if p.wait { Some(wait_timeout(core, p.timeout)?) } else { None };
+            if let Some(timeout) = timeout {
+                let spec = WaitSpec { output: None, timeout, after_turn: None };
+                let _ = watched(core, p.caller.clone(), TargetKey::Agent(id), spec).await;
+            } else {
+                core.saw(p.caller.as_deref(), id);
+            }
+            let (text, complete, how) = core.read_transcript(id, p.lines, p.last)?;
+            let entries = if !p.last && p.lines.is_none() {
+                core.read_transcript_entries(id)?
+            } else {
+                Vec::new()
+            };
+            core.flush_saved().await?;
+            Ok(ReadResult { text, complete, how: how.into(), why: None, entries })
+        }
     }
-    let (text, complete, how) = core.read_transcript(id, p.lines, p.last)?;
-    let entries = if !p.last && p.lines.is_none() {
-        core.read_transcript_entries(id)?
-    } else {
-        Vec::new()
-    };
-    core.flush_saved().await?;
-    Ok(ReadResult { text, complete, how: how.into(), why: None, entries })
 }
 
 async fn agent_send(core: Ctx<'_>, p: SendParams) -> Result<SendResult, RpcError> {
-    let timeout = wait_timeout(core, p.timeout)?;
-    let id = resolve(core, &p.agent)?;
-    let sender = p.from.as_deref().or(p.caller.as_deref());
-    let text = if p.text.trim_start().starts_with("<h2") { p.text.clone() } else { core.tagged(sender, id, &p.text, false) };
-    let sent = core.send(id, &text, p.steer, p.only_if.map(|w| word(&w)).as_deref(), sender).await?;
-    if let Some(child) = sender.and_then(crate::agents::parse_id) {
-        let mut st = core.lock();
-        if let Some(c) =
-            st.reg.agents.get_mut(&child).filter(|c| c.parent.as_deref() == Some(crate::agents::address(id).as_str()))
-        {
-            c.told_parent = true;
+    match resolve_any(core, &p.agent)? {
+        TargetKey::Terminal(id) => {
+            let r = terminal_send(
+                core,
+                TerminalSendParams {
+                    terminal: crate::terminals::address(id),
+                    text: p.text,
+                    force: p.steer,
+                    only_if: p.only_if,
+                    wait: p.wait,
+                    timeout: p.timeout,
+                    caller: p.from.or(p.caller),
+                },
+            )
+            .await?;
+            Ok(SendResult { status: r.status, turn: r.turn, started: r.started, inbox_len: 0, wait: r.wait })
+        }
+        TargetKey::Agent(id) => {
+            let timeout = wait_timeout(core, p.timeout)?;
+            let sender = p.from.as_deref().or(p.caller.as_deref());
+            let text =
+                if p.text.trim_start().starts_with("<h2") { p.text.clone() } else { core.tagged(sender, id, &p.text, false) };
+            let sent = core.send(id, &text, p.steer, p.only_if.map(|w| word(&w)).as_deref(), sender).await?;
+            let target_addr = crate::agents::address(id);
+            if let Some(caller_key) = sender.and_then(TargetKey::parse) {
+                let mut st = core.lock();
+                match caller_key {
+                    TargetKey::Agent(child) => {
+                        if let Some(c) =
+                            st.reg.agents.get_mut(&child).filter(|c| c.parent.as_deref() == Some(target_addr.as_str()))
+                        {
+                            c.told_parent = true;
+                        }
+                    }
+                    TargetKey::Terminal(child) => {
+                        if let Some(c) = st
+                            .pty_reg
+                            .terminals
+                            .get_mut(&child)
+                            .filter(|c| c.parent.as_deref() == Some(target_addr.as_str()))
+                        {
+                            c.told_parent = true;
+                        }
+                    }
+                }
+            }
+            if sent.status.as_deref() == Some("working") {
+                let mut st = core.lock();
+                let from = sender
+                    .and_then(TargetKey::parse)
+                    .and_then(|k| match k {
+                        TargetKey::Agent(c) => st.reg.agents.get(&c).map(|a| a.address.clone()),
+                        TargetKey::Terminal(c) => st.pty_reg.terminals.get(&c).map(|t| t.address.clone()),
+                    })
+                    .or_else(|| sender.filter(|c| c.contains('/')).map(str::to_string));
+                st.messages.insert(TargetKey::Agent(id), from);
+                drop(st);
+                core.changed.notify_waiters();
+            }
+            core.saw(p.caller.as_deref(), id);
+            if let Some(caller) = &p.caller {
+                core.lock().last_send.insert((caller.clone(), TargetKey::Agent(id)), sent.after_turn);
+            }
+            let target = TargetKey::Agent(id);
+            let wait = if p.wait && sent.started == Some(false) {
+                Some(core.wait_result(target, false, "not_started", None))
+            } else if p.wait {
+                let spec = WaitSpec { output: None, timeout, after_turn: Some(sent.after_turn) };
+                Some(watched(core, p.caller.clone(), target, spec).await)
+            } else {
+                None
+            };
+            core.flush_saved().await?;
+            Ok(SendResult {
+                status: sent.status,
+                turn: sent.turn,
+                started: sent.started,
+                inbox_len: sent.inbox_len,
+                wait,
+            })
         }
     }
-    if sent.status.as_deref() == Some("working") {
-        let mut st = core.lock();
-        let from = sender
-            .and_then(crate::agents::parse_id)
-            .and_then(|c| st.reg.agents.get(&c))
-            .map(|a| a.address.clone())
-            .or_else(|| sender.filter(|c| c.contains('/')).map(str::to_string));
-        st.messages.insert(id, from);
-        drop(st);
-        core.changed.notify_waiters();
-    }
-    core.saw(p.caller.as_deref(), id);
-    if let Some(caller) = &p.caller {
-        core.lock().last_send.insert((caller.clone(), id), sent.after_turn);
-    }
-    let wait = if p.wait && sent.started == Some(false) {
-        Some(core.wait_result(id, false, "not_started", None))
-    } else if p.wait {
-        let spec = WaitSpec { output: None, timeout, after_turn: Some(sent.after_turn) };
-        Some(watched(core, p.caller.clone(), id, spec).await)
-    } else {
-        None
-    };
-    core.flush_saved().await?;
-    Ok(SendResult { status: sent.status, turn: sent.turn, started: sent.started, inbox_len: sent.inbox_len, wait })
 }
 
 async fn agent_approve(core: Ctx<'_>, p: ApproveParams) -> Result<ApproveResult, RpcError> {
@@ -447,51 +585,88 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> Result<T, RpcError> + S
 }
 
 async fn agent_put(core: Ctx<'_>, p: PutParams) -> Result<PutResult, RpcError> {
-    let too_big = || RpcError::invalid_params(format!("at most {} MB per put", crate::put::MAX_BYTES >> 20));
-    if p.data.len() / 4 * 3 > crate::put::MAX_BYTES + 3 {
-        return Err(too_big());
+    match resolve_any(core, &p.agent)? {
+        TargetKey::Terminal(id) => {
+            terminal_put(
+                core,
+                TerminalPutParams { terminal: crate::terminals::address(id), name: p.name, data: p.data },
+            )
+            .await
+        }
+        TargetKey::Agent(id) => {
+            let too_big = || RpcError::invalid_params(format!("at most {} MB per put", crate::put::MAX_BYTES >> 20));
+            if p.data.len() / 4 * 3 > crate::put::MAX_BYTES + 3 {
+                return Err(too_big());
+            }
+            let bytes = crate::put::decode(&p.data).ok_or_else(|| RpcError::invalid_params("data is not base64"))?;
+            if bytes.len() > crate::put::MAX_BYTES {
+                return Err(too_big());
+            }
+            if !record(core, id)?.is_live() {
+                return Err(RpcError::new(
+                    "finished",
+                    format!("{} has finished", crate::agents::address(id)),
+                    "nothing there to read it",
+                ));
+            }
+            let path = crate::put::stage(&core.paths.state, id, &p.name, &bytes)
+                .map_err(|e| RpcError::internal(format!("cannot write the file: {e}")))?;
+            Ok(PutResult { path: path.display().to_string(), bytes: bytes.len() })
+        }
     }
-    let bytes = crate::put::decode(&p.data).ok_or_else(|| RpcError::invalid_params("data is not base64"))?;
-    if bytes.len() > crate::put::MAX_BYTES {
-        return Err(too_big());
-    }
-    let id = resolve(core, &p.agent)?;
-    if !record(core, id)?.is_live() {
-        return Err(RpcError::new(
-            "finished",
-            format!("{} has finished", crate::agents::address(id)),
-            "nothing there to read it",
-        ));
-    }
-    let path = crate::put::stage(&core.paths.state, id, &p.name, &bytes)
-        .map_err(|e| RpcError::internal(format!("cannot write the file: {e}")))?;
-    Ok(PutResult { path: path.display().to_string(), bytes: bytes.len() })
 }
 
 async fn agent_interrupt(core: Ctx<'_>, p: InterruptParams) -> Result<InterruptResult, RpcError> {
-    use crate::input::Interrupted;
-    let timeout = seconds(p.timeout)?.unwrap_or(Duration::from_secs(10));
-    let id = resolve(core, &p.agent)?;
-    let (outcome, method) = core.interrupt(id, timeout).await?;
-    let outcome = match outcome {
-        Interrupted::Stopped => "stopped",
-        Interrupted::Exited => "exited",
-        Interrupted::StillWorking => "still_working",
-        Interrupted::Unknown => "unknown",
-    };
-    core.flush_saved().await?;
-    Ok(InterruptResult { outcome: outcome.into(), method })
+    match resolve_any(core, &p.agent)? {
+        TargetKey::Terminal(id) => {
+            let r = terminal_interrupt(
+                core,
+                TerminalInterruptParams { terminal: crate::terminals::address(id), timeout: p.timeout },
+            )
+            .await?;
+            Ok(InterruptResult { outcome: r.outcome, method: r.key })
+        }
+        TargetKey::Agent(id) => {
+            use crate::input::Interrupted;
+            let timeout = seconds(p.timeout)?.unwrap_or(Duration::from_secs(10));
+            let (outcome, method) = core.interrupt(id, timeout).await?;
+            let outcome = match outcome {
+                Interrupted::Stopped => "stopped",
+                Interrupted::Exited => "exited",
+                Interrupted::StillWorking => "still_working",
+                Interrupted::Unknown => "unknown",
+            };
+            core.flush_saved().await?;
+            Ok(InterruptResult { outcome: outcome.into(), method })
+        }
+    }
 }
 
 async fn events_subscribe(core: Ctx<'_>, p: SubscribeParams) -> Result<SubscribeResult, RpcError> {
     use crate::events::{Filter, Sink};
-    let address = |a: &str| match a.split_once('/').filter(|(m, _)| core.lock().machines.iter().any(|x| x.name == *m)) {
+    let address_agent = |a: &str| match a.split_once('/').filter(|(m, _)| core.lock().machines.iter().any(|x| x.name == *m)) {
         Some(_) => Ok(a.to_string()),
         None => resolve(core, a).map(crate::agents::address),
     };
-    let agent = p.agent.as_deref().map(address).transpose()?;
-    let children_of = p.children_of.as_deref().map(address).transpose()?;
-    let filter = Filter { agent, children_of, labels: labels(&p.labels), docs: p.docs, here_only: from_afar(core) };
+    let address_term = |t: &str| match t.split_once('/').filter(|(m, _)| core.lock().machines.iter().any(|x| x.name == *m)) {
+        Some(_) => Ok(t.to_string()),
+        None => resolve_pty(core, t).map(crate::terminals::address),
+    };
+    let address_any = |x: &str| match x.split_once('/').filter(|(m, _)| core.lock().machines.iter().any(|x| x.name == *m)) {
+        Some(_) => Ok(x.to_string()),
+        None => resolve_any(core, x).map(TargetKey::address),
+    };
+    let agent = p.agent.as_deref().map(address_agent).transpose()?;
+    let terminal = p.terminal.as_deref().map(address_term).transpose()?;
+    let children_of = p.children_of.as_deref().map(address_any).transpose()?;
+    let filter = Filter {
+        agent,
+        terminal,
+        children_of,
+        labels: labels(&p.labels),
+        docs: p.docs,
+        here_only: from_afar(core),
+    };
     let (sink, channel) = match (core.conn, core.plain) {
         (Some(conn), _) => {
             let channel = conn.new_channel();
@@ -507,16 +682,17 @@ async fn events_subscribe(core: Ctx<'_>, p: SubscribeParams) -> Result<Subscribe
         }
         (None, None) => return Err(RpcError::internal("no connection to deliver events on")),
     };
-    let (seq, agents) = {
+    let (seq, agents, terminals) = {
         let mut st = core.lock();
         let agents = core.matching(&st, &filter);
+        let terminals = core.matching_terminals(&st, &filter);
         core.subscribe(&mut st, filter, sink);
-        (st.events.seq, agents)
+        (st.events.seq, agents, terminals)
     };
     if let Some(channel) = channel {
         crate::server::heartbeat(core.core.clone(), core.conn.expect("framed").clone(), channel);
     }
-    Ok(SubscribeResult { seq, agents, channel })
+    Ok(SubscribeResult { seq, agents, terminals, channel })
 }
 
 /// A machine name that is free: valid, not another machine's, not this core's own.

@@ -54,23 +54,46 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
     let caller = p.caller.clone();
     let from_afar = caller.as_deref().is_some_and(|c| c.contains('/'));
     let cwd = crate::exec::folder(p.cwd.as_deref(), from_afar);
+    if p.async_start && !p.wait && !std::path::Path::new(&cwd).is_dir() {
+        return Err(RpcError::new(
+            "spawn_failed",
+            format!("missing working directory {cwd}"),
+            "",
+        ));
+    }
     let base_env = crate::platform::program_env().await;
     let env = child_env(base_env, p.env.clone());
 
     let parent = match (&p.parent, &caller) {
-        (Some(parent), _) => Some(crate::agents::address(resolve(core, parent)?)),
+        (Some(parent), _) => Some(resolve_any(core, parent)?.address()),
         (None, Some(caller)) if !p.no_parent && from_afar => {
-            caller.split_once('/').and_then(|(_, a)| crate::agents::parse_id(a)).map(|_| caller.clone())
+            caller.split_once('/').and_then(|(_, a)| TargetKey::parse(a)).map(|_| caller.clone())
         }
-        (None, Some(caller)) if !p.no_parent => crate::agents::parse_id(caller)
-            .filter(|id| core.lock().reg.agents.contains_key(id))
-            .map(crate::agents::address),
+        (None, Some(caller)) if !p.no_parent => match TargetKey::parse(caller) {
+            Some(TargetKey::Agent(id)) if core.lock().reg.agents.contains_key(&id) => {
+                Some(crate::agents::address(id))
+            }
+            Some(TargetKey::Terminal(id)) if core.lock().pty_reg.terminals.contains_key(&id) => {
+                Some(crate::terminals::address(id))
+            }
+            _ => None,
+        },
         _ => None,
     };
 
-    let (id, address, env) = {
+    let async_mode = p.async_start && !p.wait;
+    let (id, address, env, created_async) = {
         let mut st = core.lock();
         not_stopping(&st)?;
+        if let Some(name) = p.name.as_deref()
+            && st.pty_reg.terminals.values().any(|t| t.is_live() && t.name.as_deref() == Some(name))
+        {
+            return Err(RpcError::new(
+                "name_taken",
+                format!("name {name:?} is already taken by a live terminal"),
+                "pick another with --name",
+            ));
+        }
         let new = NewAgent {
             template: template.clone(),
             die_with_parent: parent.is_some() && !p.outlive_parent,
@@ -90,13 +113,25 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
             permission_mode: permissions,
         };
         let id = st.reg.create(new, now_ms())?;
+        st.recovering.insert(id);
         let (env, scope) = agent_env(core, id, &cwd, env);
         let a = st.reg.agents.get_mut(&id).expect("just created");
         a.scope = Some(scope);
         a.restart_env = p.env.clone();
+        if async_mode {
+            let _ = crate::status::apply(a, &StatusReport::root("starting"));
+        }
+        let created = a.clone();
         let address = a.address.clone();
+        if async_mode {
+            let public = serde_json::to_value(Public(created.clone())).unwrap_or_default();
+            core.emit(&mut st, "created", id, public);
+        }
         core.save(&st);
-        (id, address, env)
+        if async_mode {
+            core.changed.notify_waiters();
+        }
+        (id, address, env, created)
     };
 
     let mcp_exe = std::env::current_exe().map(|exe| exe.display().to_string()).unwrap_or_else(|_| "herdr2".into());
@@ -115,10 +150,86 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         socket: core.paths.socket.display().to_string(),
     };
 
+    if async_mode {
+        let core_bg = core.core.clone();
+        let caller_bg = caller.clone();
+        tokio::spawn(async move {
+            match acp::spawn_session(spec).await {
+                Ok(started) => {
+                    {
+                        let mut st = core_bg.lock();
+                        st.recovering.remove(&id);
+                        if st.stopping || st.killing.contains(&id) || !st.reg.agents.get(&id).is_some_and(Agent::is_live) {
+                            started.transport.kill();
+                            core_bg.remove(&mut st, id);
+                            return;
+                        }
+                        let agent_info = started.agent_info.clone();
+                        let acp_sid = started.session_id.clone();
+                        let can_load = started.can_load_session;
+                        let handle = acp::spawn_actor(core_bg.clone(), id, started);
+                        let pid = handle.transport.pid();
+                        st.sessions.insert(id, handle);
+                        let a = st.reg.agents.get_mut(&id).expect("just created");
+                        a.pid = pid;
+                        a.acp_session_id = Some(acp_sid);
+                        a.can_load_session = can_load;
+                        if agent_info.is_some() {
+                            a.agent_info = agent_info;
+                        }
+                        a.program_started_ms = Some(now_ms());
+                        a.reported = true;
+                        let _ = crate::status::apply(a, &StatusReport::root("idle"));
+                        let public = serde_json::to_value(Public(a.clone())).unwrap_or_default();
+                        core_bg.emit(&mut st, "restarted", id, public);
+                        core_bg.save(&st);
+                        core_bg.changed.notify_waiters();
+                    }
+                    if let Some(text) = initial_prompt {
+                        let tagged = core_bg.tagged(caller_bg.as_deref(), id, &text, true);
+                        if let Ok(sent) = core_bg.send(id, &tagged, false, None, caller_bg.as_deref()).await {
+                            let mut st = core_bg.lock();
+                            if let Some(a) = st.reg.agents.get_mut(&id)
+                                && a.is_live()
+                            {
+                                a.first_task_turn = Some(sent.after_turn);
+                                core_bg.save(&st);
+                            }
+                        }
+                    }
+                }
+                Err(err) => {
+                    let mut st = core_bg.lock();
+                    st.recovering.remove(&id);
+                    if let Some(a) = st.reg.agents.get_mut(&id)
+                        && a.is_live()
+                    {
+                        a.keep = false;
+                        core_bg.record_transcript(
+                            &mut st,
+                            id,
+                            crate::transcript::Entry::Error {
+                                turn: 0,
+                                message: err.message,
+                                ts_ms: now_ms(),
+                            },
+                        );
+                        core_bg.record_finish(&mut st, id, crate::runtime::Exit::default(), "spawn_failed");
+                        core_bg.save(&st);
+                        core_bg.changed.notify_waiters();
+                    }
+                }
+            }
+        });
+        core.flush_saved().await?;
+        return Ok(RunResult { agent: Public(created_async), first_message: None, wait: None, output: None });
+    }
+
     let started = match acp::spawn_session(spec).await {
         Ok(started) => started,
         Err(err) => {
             let mut st = core.lock();
+            st.recovering.remove(&id);
             core.remove(&mut st, id);
             return Err(err);
         }
@@ -126,6 +237,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
 
     let created_agent = {
         let mut st = core.lock();
+        st.recovering.remove(&id);
         if st.stopping || st.killing.contains(&id) || !st.reg.agents.get(&id).is_some_and(Agent::is_live) {
             started.transport.kill();
             core.remove(&mut st, id);
@@ -199,12 +311,13 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
     let (wait, output) = match timeout {
         None => (None, None),
         Some(timeout) => {
-            let r = watch(core, caller.clone(), id, WaitSpec { output: None, timeout, after_turn }).await;
+            let target = crate::runtime::TargetKey::Agent(id);
+            let r = watch(core, caller.clone(), target, WaitSpec { output: None, timeout, after_turn }).await;
             let text = tail(
                 core.read_transcript(id, Some(FINISHED_LINES), false).map(|t| t.0).unwrap_or_default(),
                 id,
             );
-            has_seen(core, caller.as_deref(), id);
+            has_seen(core, caller.as_deref(), target);
             (Some(r), Some(text))
         }
     };
@@ -217,6 +330,10 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
 /// Output a run hands back: at most `RUN_OUTPUT` bytes, whole lines from the
 /// end (errors are at the end), saying where the rest is.
 pub(crate) fn tail(text: String, id: u32) -> String {
+    tail_address(text, &crate::agents::address(id))
+}
+
+pub(crate) fn tail_address(text: String, address: &str) -> String {
     const RUN_OUTPUT: usize = 50_000;
     if text.len() <= RUN_OUTPUT {
         return text;
@@ -227,8 +344,7 @@ pub(crate) fn tail(text: String, id: u32) -> String {
     }
     let from = text[from..].find('\n').map_or(from, |at| from + at + 1);
     format!(
-        "[h2] earlier output cut: h2 read {} --lines {FINISHED_LINES}\n{}",
-        crate::agents::address(id),
+        "[h2] earlier output cut: h2 read {address} --lines {FINISHED_LINES}\n{}",
         &text[from..]
     )
 }

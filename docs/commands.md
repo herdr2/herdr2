@@ -8,29 +8,32 @@ Run `just docs` to refresh it and `just docs-check` to check it.
 ## h2
 
 ```text
-h2 - headless ACP multi-agent orchestration runtime
+h2 - hybrid PTY workspace & headless ACP multi-agent runtime
 
 Usage: h2 <command> [options]
-       h2               list live agents
+       h2               list live agents and terminals
 
-Agents
+Agents & terminals
   run [--agent A] [--prompt P] [argv|template [task]]
-                              start an ACP agent (waits for first turn; --bg: don't wait)
-  ls                          list live agents (--all: finished too)
-  get <a>                     show one agent's full record
-  read <a> [--last|--lines N] print rendered JSONL transcript or final assistant text
-  kill <a>                    terminate an ACP agent process
-  rm <a>                      remove a finished agent
-  label <a> k=v...            set or clear labels (`k=` clears)
-  keep <a> [--off]            resume crashed/restarted agent via `session/load`
+                              start a headless ACP sub-agent (--bg: don't wait)
+  ls                          list live terminals and ACP agents (--all: finished too)
+  get <a|t>                   show one agent's or terminal's full record
+  read <a|t> [--last|--lines N]
+                              print rendered transcript (ACP) or screen/history (PTY)
+  attach <t>                  follow a live PTY terminal in the shell (Ctrl-\ then d)
+  keys <t> <key>...           send named keys (enter, esc, ctrl+c, ...) to a PTY terminal
+  kill <a|t>                  terminate an ACP agent or PTY terminal
+  rm <a|t>                    remove a finished agent or terminal
+  label <a|t> k=v...          set or clear labels (`k=` clears)
+  keep <a|t> [--off]          resume crashed/restarted agent or shell
 
 Communicate & control
-  send <a> <text>             queue a prompt into agent's inbox (--steer: cancel & deliver next)
-  approve <a> [--option ID]   approve a blocked agent's pending permission request
-  deny <a> [--option ID]      deny a blocked agent's pending permission request
-  interrupt <a>               send ACP `session/cancel` to stop current turn cleanly
-  wait <a>                    wait until agent leaves `working` (--output X, --children any|all)
-  put <a> <file>              stage a file beside agent on its machine, print path
+  send <a|t> <text>           queue ACP prompt or paste text into PTY (--steer: cancel & deliver next)
+  approve <a> [--option ID]   approve a blocked ACP agent's pending permission request
+  deny <a> [--option ID]      deny a blocked ACP agent's pending permission request
+  interrupt <a|t>             send ACP `session/cancel` or PTY interrupt (Esc / Ctrl-C)
+  wait <a|t>                  wait until not `working` (--output X, --children any|all)
+  put <a|t> <file>            stage a file beside agent or terminal, print path
 
 Non-agent & files
   exec [--on m] <cmd>         run non-agent command directly; exact stdout/stderr & exit code
@@ -50,8 +53,8 @@ More
   connect                     JSON-RPC API over stdin/stdout
   schema                      print OpenRPC 1.3.2 JSON Schema
 
-<a> is an agent address (`a1`, `a7`, `machine/a7`) or a unique name.
-Built-in `--agent` presets: claude, codex, gemini, opencode, copilot, cursor, kimi, qwen, pi, hermes, glm, zcode.
+<a> / <t> is an agent (`a1`), terminal (`t1`), remote (`machine/a7`), or unique name.
+Built-in `--agent` presets: claude, codex, gemini, opencode, copilot, cursor, cursor-agent, kimi, qwen, pi, hermes, glm, zcode.
 Options: --json (default when piped except read/file read/exec), -V --version, --licenses.
 Per command: h2 <command> --help
 Settings: ~/.config/herdr2/config.toml (default_permissions, inject_mcp, [agents]).
@@ -72,6 +75,23 @@ Options:
       --json             JSON output even in a terminal
       --option <OPTION>  Explicit ACP permission `optionId` to choose (default: first matching option)
   -h, --help             Print help
+```
+
+## h2 attach
+
+```text
+Follow live output of an interactive PTY terminal (Ctrl-\ then d detaches)
+
+Usage: h2 attach [OPTIONS] [TERMINAL]
+
+Arguments:
+  [TERMINAL]  The terminal: `t7`, a name, or `machine/t7`
+
+Options:
+      --json               JSON output even in a terminal
+      --observe            Watch only: never type or resize
+      --history <HISTORY>  Scrollback lines to show first (main screen only) [default: 0]
+  -h, --help               Print help
 ```
 
 ## h2 connect
@@ -113,9 +133,10 @@ Usage: h2 events [OPTIONS]
 Options:
       --agent <AGENT>              Only this agent
       --json                       JSON output even in a terminal
-      --children-of <CHILDREN_OF>  Only children of this agent
-      --label <K=V>                Only agents carrying all of these labels (repeatable)
-      --doc <NAME>                 Documents by name (repeatable); a name ending in `*` is a prefix. Naming narrows, so documents alone hear only them — name an agent for both
+      --terminal <TERMINAL>        Only this terminal
+      --children-of <CHILDREN_OF>  Only children of this agent or terminal
+      --label <K=V>                Only records carrying all of these labels (repeatable)
+      --doc <NAME>                 Documents by name (repeatable); a name ending in `*` is a prefix. Naming narrows, so documents alone hear only them — name an agent or terminal for both
   -h, --help                       Print help
 ```
 
@@ -256,6 +277,22 @@ Arguments:
 Options:
       --json  JSON output even in a terminal
       --off   Keep this live agent recoverable across crash or planned restart
+  -h, --help  Print help
+```
+
+## h2 keys
+
+```text
+Send named keys (enter, esc, tab, ctrl+c, ...) to a live PTY terminal
+
+Usage: h2 keys [OPTIONS] <TERMINAL> <KEYS>...
+
+Arguments:
+  <TERMINAL>  The terminal: `t7`, a name, or `machine/t7`
+  <KEYS>...   Key names: enter, esc, tab, up, ctrl+c, alt+x, f5, a, ...
+
+Options:
+      --json  JSON output even in a terminal
   -h, --help  Print help
 ```
 

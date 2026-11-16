@@ -9,6 +9,7 @@ async fn startup_finishes_unkept_agents_and_prepares_kept_ones_for_recovery() {
     let root = crate::test_tmp().join(format!("h2-rt-start-{}", platform::random_hex()));
     let paths = || Paths {
         socket: root.join("core.sock"),
+        holder_socket: root.join("holder.sock"),
         state: root.join("state"),
         config: root.join("config.toml"),
     };
@@ -50,7 +51,7 @@ async fn startup_finishes_unkept_agents_and_prepares_kept_ones_for_recovery() {
 #[tokio::test]
 async fn status_changed_updates_turn_and_emits_news_to_parent() {
     let root = crate::test_tmp().join(format!("h2-rt-status-{}", platform::random_hex()));
-    let paths = Paths { socket: root.join("core.sock"), state: root.join("state"), config: root.join("config.toml") };
+    let paths = Paths { socket: root.join("core.sock"), holder_socket: root.join("holder.sock"), state: root.join("state"), config: root.join("config.toml") };
     paths.create_dirs().unwrap();
     let core = Core::start(paths, CoreInfo { id: "c1".into(), name: "box".into() }).unwrap();
     let mut st = core.lock();
@@ -73,7 +74,7 @@ async fn status_changed_updates_turn_and_emits_news_to_parent() {
 #[tokio::test]
 async fn approve_and_deny_validate_options_and_remove_cleans_transcript() {
     let root = crate::test_tmp().join(format!("h2-rt-perm-{}", platform::random_hex()));
-    let paths = Paths { socket: root.join("core.sock"), state: root.join("state"), config: root.join("config.toml") };
+    let paths = Paths { socket: root.join("core.sock"), holder_socket: root.join("holder.sock"), state: root.join("state"), config: root.join("config.toml") };
     paths.create_dirs().unwrap();
     let core = Core::start(paths, CoreInfo { id: "c1".into(), name: "box".into() }).unwrap();
     let id = {
