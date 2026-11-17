@@ -1,0 +1,6143 @@
+{
+  "components": {
+    "schemas": {
+      "Agent": {
+        "properties": {
+          "address": {
+            "description": "`a7`: this agent forever on this core.",
+            "type": "string"
+          },
+          "agent": {
+            "description": "Configured agent preset name (e.g. `claude`, `codex`), if launched via preset.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "agent_info": {
+            "description": "Agent identity reported by ACP `initialize` (`agentInfo.name version`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "argv": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "created_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "die_with_parent": {
+            "default": false,
+            "type": "boolean"
+          },
+          "exit_code": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "finished_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "first_message": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FirstMessage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A template first message that was not sent; retained for later inspection."
+          },
+          "inbox_len": {
+            "description": "Number of user messages queued behind the active ACP turn.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "inject_mcp": {
+            "default": true,
+            "description": "Whether built-in `herdr2` MCP server is injected into ACP `mcpServers`.",
+            "type": "boolean"
+          },
+          "keep": {
+            "default": false,
+            "description": "Restart a crashed or stopped kept agent cleanly (`session/load` when supported). Exit with a code and kill remain final.",
+            "type": "boolean"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "mode": {
+            "description": "Requested mode override (`session/set_mode`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "description": "Requested model override (`session/set_config_option`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "notify": {
+            "default": false,
+            "description": "Its parent gets notes about it (see `--no-notify`).",
+            "type": "boolean"
+          },
+          "parent": {
+            "default": null,
+            "description": "The agent that started it (`a3`), set once at start.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pending_permission": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublicPermission"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Current pending approval request when `status.state == \"blocked\"`."
+          },
+          "permission_mode": {
+            "$ref": "#/components/schemas/PermissionMode",
+            "default": "approve-reads",
+            "description": "Permission policy for `session/request_permission`."
+          },
+          "pid": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Why its process ended or is pending: exited, killed, server_stop,\nhost_shutdown, signaled, crashed, stopped_by_restart.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "records": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Status"
+            },
+            "type": "object"
+          },
+          "reported": {
+            "default": false,
+            "type": "boolean"
+          },
+          "rm": {
+            "default": false,
+            "description": "Removed right after it exits (once a waiting parent has the exit code).",
+            "type": "boolean"
+          },
+          "signal": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "\"live\" or \"finished\".",
+            "type": "string"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Status"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Agent execution state: idle, working, done, blocked, or error."
+          },
+          "status_ms": {
+            "default": null,
+            "description": "When that state last changed, ms since the epoch.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "template": {
+            "default": null,
+            "description": "The template that started it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "default": "",
+            "type": "string"
+          },
+          "turn": {
+            "default": 0,
+            "description": "Goes up each time the status leaves `working`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "address",
+          "labels",
+          "argv",
+          "cwd",
+          "state",
+          "created_ms"
+        ],
+        "type": "object"
+      },
+      "ApproveResult": {
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "option_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "outcome": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent",
+          "request_id",
+          "outcome"
+        ],
+        "type": "object"
+      },
+      "AttachResult": {
+        "properties": {
+          "automatic_input": {
+            "type": "boolean"
+          },
+          "channel": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "resize_notifications": {
+            "type": "boolean"
+          },
+          "terminal": {
+            "$ref": "#/components/schemas/Terminal"
+          }
+        },
+        "required": [
+          "channel",
+          "terminal",
+          "resize_notifications",
+          "automatic_input"
+        ],
+        "type": "object"
+      },
+      "Children": {
+        "enum": [
+          "any",
+          "all"
+        ],
+        "type": "string"
+      },
+      "CoreInfo": {
+        "properties": {
+          "id": {
+            "description": "Permanent random id, reset only when state is wiped.",
+            "type": "string"
+          },
+          "name": {
+            "description": "Display name, the hostname by default.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name"
+        ],
+        "type": "object"
+      },
+      "Display": {
+        "description": "What a viewer's own terminal looks like, reported by the client.",
+        "properties": {
+          "bg": {
+            "description": "Default background as `#rrggbb`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cell": {
+            "description": "Cell size in pixels: `[width, height]`.",
+            "items": {
+              "format": "uint32",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "maxItems": 2,
+            "minItems": 2,
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "cursor": {
+            "description": "Cursor color as `#rrggbb`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fg": {
+            "description": "Default foreground as `#rrggbb`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "DocGetResult": {
+        "properties": {
+          "value": true,
+          "version": {
+            "description": "Zero when never written. Deletions retain their version.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "value",
+          "version"
+        ],
+        "type": "object"
+      },
+      "DocSetResult": {
+        "properties": {
+          "version": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version"
+        ],
+        "type": "object"
+      },
+      "Edit": {
+        "properties": {
+          "new": {
+            "type": "string"
+          },
+          "old": {
+            "description": "Exact text, found exactly once in the file as it was.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "old",
+          "new"
+        ],
+        "type": "object"
+      },
+      "Entry": {
+        "oneOf": [
+          {
+            "properties": {
+              "from": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "kind": {
+                "const": "user",
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              },
+              "ts_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "turn": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "turn",
+              "text",
+              "ts_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "thought",
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              },
+              "ts_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "turn": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "turn",
+              "text",
+              "ts_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "assistant",
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              },
+              "ts_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "turn": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "turn",
+              "text",
+              "ts_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "id": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "tool_call",
+                "type": "string"
+              },
+              "status": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "tool_kind": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "ts_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "turn": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "turn",
+              "id",
+              "title",
+              "status",
+              "ts_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "items": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "kind": {
+                "const": "plan",
+                "type": "string"
+              },
+              "ts_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "turn": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "turn",
+              "items",
+              "ts_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "permission",
+                "type": "string"
+              },
+              "outcome": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "ts_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "turn": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "turn",
+              "title",
+              "outcome",
+              "ts_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "error",
+                "type": "string"
+              },
+              "message": {
+                "type": "string"
+              },
+              "ts_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "turn": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "turn",
+              "message",
+              "ts_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "stderr",
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              },
+              "ts_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "text",
+              "ts_ms"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ExecResult": {
+        "properties": {
+          "code": {
+            "description": "Its exit code; null when a signal ended it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "ms": {
+            "description": "How long it ran, in milliseconds.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "signal": {
+            "description": "The signal that ended it (Unix).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "stderr": {
+            "description": "What it wrote, base64: the first 1 MB.",
+            "type": "string"
+          },
+          "stdout": {
+            "description": "What it wrote, base64: the first 8 MB.",
+            "type": "string"
+          },
+          "timed_out": {
+            "description": "It ran out of time and was ended: the output is what came so far.",
+            "type": "boolean"
+          },
+          "truncated": {
+            "description": "It wrote more than was kept (it still ran to its end).",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "stdout",
+          "stderr",
+          "truncated",
+          "timed_out",
+          "ms"
+        ],
+        "type": "object"
+      },
+      "FileReadResult": {
+        "properties": {
+          "first": {
+            "description": "The first and last line given (last < first: none).",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "last": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lines": {
+            "description": "Lines in the file.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "text": {
+            "description": "The lines as they are in the file, line ends kept.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "text",
+          "first",
+          "last",
+          "lines"
+        ],
+        "type": "object"
+      },
+      "FileResult": {
+        "properties": {
+          "bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "description": "The file written, absolute.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "bytes"
+        ],
+        "type": "object"
+      },
+      "FirstMessage": {
+        "properties": {
+          "reason": {
+            "description": "Why it was not sent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sent": {
+            "type": "boolean"
+          },
+          "started": {
+            "description": "Whether the agent started working on it (see agent.send).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "turn": {
+            "description": "The turn when it went in (see agent.send).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "sent"
+        ],
+        "type": "object"
+      },
+      "Foreground": {
+        "properties": {
+          "argv": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "cwd": {
+            "description": "Its working directory now (resolved by the OS).",
+            "type": "string"
+          },
+          "name": {
+            "description": "Its name as the OS has it (`node`, `vim`, `sh`).",
+            "type": "string"
+          },
+          "pid": {
+            "description": "The foreground process group's leader.",
+            "format": "int32",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pid",
+          "name",
+          "argv",
+          "cwd"
+        ],
+        "type": "object"
+      },
+      "HelloResult": {
+        "properties": {
+          "core": {
+            "$ref": "#/components/schemas/CoreInfo"
+          },
+          "features": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "framed": {
+            "type": "boolean"
+          },
+          "generation": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "keeps_running_after_logout": {
+            "description": "True: systemd lingering is enabled; false: programs stop at last logout.\nNull: unsupported, not applicable or unknown.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "login_session": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LoginSession"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "OS login inherited by this core. Absent when unavailable or unsupported."
+          },
+          "logout_linger_user": {
+            "description": "Account for the administrator's loginctl enable-linger command.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "methods": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "generation",
+          "version",
+          "core",
+          "framed",
+          "methods",
+          "features"
+        ],
+        "type": "object"
+      },
+      "IdleOrWorking": {
+        "enum": [
+          "idle",
+          "working"
+        ],
+        "type": "string"
+      },
+      "InitialSize": {
+        "properties": {
+          "cols": {
+            "description": "Initial terminal width in columns (at least 1).",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "rows": {
+            "description": "Initial terminal height in rows (at least 1).",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "cols",
+          "rows"
+        ],
+        "type": "object"
+      },
+      "InterruptResult": {
+        "properties": {
+          "method": {
+            "description": "ACP cancellation method (`session/cancel`).",
+            "type": "string"
+          },
+          "outcome": {
+            "description": "stopped, exited, still_working, or unknown.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "outcome",
+          "method"
+        ],
+        "type": "object"
+      },
+      "KeysResult": {
+        "properties": {
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "turn": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "turn"
+        ],
+        "type": "object"
+      },
+      "ListResult": {
+        "properties": {
+          "agents": {
+            "description": "This machine's agents, then each connected machine's (`machine/a7`).",
+            "items": {
+              "$ref": "#/components/schemas/Agent"
+            },
+            "type": "array"
+          },
+          "hidden_finished": {
+            "description": "Finished agents left out (see `all`).",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "machines": {
+            "description": "Machines added here and their lines: one that is not connected is\nlisted here, not waited on.",
+            "items": {
+              "$ref": "#/components/schemas/MachineView"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "agents",
+          "hidden_finished",
+          "machines"
+        ],
+        "type": "object"
+      },
+      "LoginSession": {
+        "description": "The OS login a process inherited, rather than text restored from its environment.",
+        "properties": {
+          "gui": {
+            "description": "Unknown provenance never triggers automatic replacement.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "user": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "user"
+        ],
+        "type": "object"
+      },
+      "Machine": {
+        "properties": {
+          "host": {
+            "description": "What that core calls itself (its hostname).",
+            "type": "string"
+          },
+          "id": {
+            "description": "The other core's permanent id.",
+            "type": "string"
+          },
+          "keeps_running_after_logout": {
+            "default": null,
+            "description": "Last observed systemd logout protection; null for old or unsupported cores.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "logout_linger_user": {
+            "default": null,
+            "description": "Remote account for loginctl enable-linger, when applicable.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "What this core calls it: `rohan` in `rohan/a7`.",
+            "type": "string"
+          },
+          "session": {
+            "description": "The h2 session there (null: its default).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target": {
+            "description": "How it is reached: an ssh target, or (`via`) a command.",
+            "type": "string"
+          },
+          "temporary": {
+            "default": false,
+            "description": "Short-lived (a sandbox for a task): clients may show it apart from the\nmachines that stay. h2 treats it like any other.",
+            "type": "boolean"
+          },
+          "version": {
+            "description": "Its h2 version when last seen.",
+            "type": "string"
+          },
+          "via": {
+            "default": false,
+            "description": "`target` is a command that runs a shell line there, given as its last\nargument, like ssh (a provider's own CLI, ssh with its options).",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "name",
+          "target",
+          "id",
+          "host",
+          "version"
+        ],
+        "type": "object"
+      },
+      "MachineListResult": {
+        "properties": {
+          "machines": {
+            "items": {
+              "$ref": "#/components/schemas/MachineView"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "machines"
+        ],
+        "type": "object"
+      },
+      "MachineView": {
+        "description": "A machine as `machine ls` and `ls` show it: its profile and its line now.",
+        "properties": {
+          "host": {
+            "description": "What that core calls itself (its hostname).",
+            "type": "string"
+          },
+          "id": {
+            "description": "The other core's permanent id.",
+            "type": "string"
+          },
+          "keeps_running_after_logout": {
+            "default": null,
+            "description": "Last observed systemd logout protection; null for old or unsupported cores.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "logout_linger_user": {
+            "default": null,
+            "description": "Remote account for loginctl enable-linger, when applicable.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "What this core calls it: `rohan` in `rohan/a7`.",
+            "type": "string"
+          },
+          "session": {
+            "description": "The h2 session there (null: its default).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "since_ms": {
+            "description": "Since when it is not connected (ms since the epoch).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "connecting, connected, needs_login or unreachable.",
+            "type": "string"
+          },
+          "target": {
+            "description": "How it is reached: an ssh target, or (`via`) a command.",
+            "type": "string"
+          },
+          "temporary": {
+            "default": false,
+            "description": "Short-lived (a sandbox for a task): clients may show it apart from the\nmachines that stay. h2 treats it like any other.",
+            "type": "boolean"
+          },
+          "version": {
+            "description": "Its h2 version when last seen.",
+            "type": "string"
+          },
+          "via": {
+            "default": false,
+            "description": "`target` is a command that runs a shell line there, given as its last\nargument, like ssh (a provider's own CLI, ssh with its options).",
+            "type": "boolean"
+          },
+          "why": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "target",
+          "id",
+          "host",
+          "version",
+          "state"
+        ],
+        "type": "object"
+      },
+      "PermissionMode": {
+        "enum": [
+          "approve-all",
+          "approve-reads",
+          "deny-all",
+          "ask"
+        ],
+        "type": "string"
+      },
+      "PublicPermission": {
+        "properties": {
+          "kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "options": {
+            "items": {
+              "$ref": "#/components/schemas/PublicPermissionOption"
+            },
+            "type": "array"
+          },
+          "request_id": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "request_id",
+          "session_id",
+          "title",
+          "options"
+        ],
+        "type": "object"
+      },
+      "PublicPermissionOption": {
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "option_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "option_id",
+          "name",
+          "kind"
+        ],
+        "type": "object"
+      },
+      "PutResult": {
+        "properties": {
+          "bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "description": "Where it landed, as the agent's machine sees it.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path",
+          "bytes"
+        ],
+        "type": "object"
+      },
+      "ReadResult": {
+        "properties": {
+          "complete": {
+            "description": "False when older lines were truncated or history is incomplete.",
+            "type": "boolean"
+          },
+          "entries": {
+            "description": "Structured JSONL transcript entries (included for default full transcript reads).",
+            "items": {
+              "$ref": "#/components/schemas/Entry"
+            },
+            "type": "array"
+          },
+          "how": {
+            "description": "\"transcript\", \"last\", or \"history\".",
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "why": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "text",
+          "complete",
+          "how"
+        ],
+        "type": "object"
+      },
+      "RemoveResult": {
+        "properties": {
+          "removed": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "removed"
+        ],
+        "type": "object"
+      },
+      "RunResult": {
+        "properties": {
+          "address": {
+            "description": "`a7`: this agent forever on this core.",
+            "type": "string"
+          },
+          "agent": {
+            "description": "Configured agent preset name (e.g. `claude`, `codex`), if launched via preset.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "agent_info": {
+            "description": "Agent identity reported by ACP `initialize` (`agentInfo.name version`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "argv": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "created_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "die_with_parent": {
+            "default": false,
+            "type": "boolean"
+          },
+          "exit_code": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "finished_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "first_message": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FirstMessage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether the initial prompt went into the agent inbox."
+          },
+          "inbox_len": {
+            "description": "Number of user messages queued behind the active ACP turn.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "inject_mcp": {
+            "default": true,
+            "description": "Whether built-in `herdr2` MCP server is injected into ACP `mcpServers`.",
+            "type": "boolean"
+          },
+          "keep": {
+            "default": false,
+            "description": "Restart a crashed or stopped kept agent cleanly (`session/load` when supported). Exit with a code and kill remain final.",
+            "type": "boolean"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "mode": {
+            "description": "Requested mode override (`session/set_mode`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "description": "Requested model override (`session/set_config_option`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "notify": {
+            "default": false,
+            "description": "Its parent gets notes about it (see `--no-notify`).",
+            "type": "boolean"
+          },
+          "output": {
+            "description": "With `wait`: transcript output.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parent": {
+            "default": null,
+            "description": "The agent that started it (`a3`), set once at start.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pending_permission": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PublicPermission"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Current pending approval request when `status.state == \"blocked\"`."
+          },
+          "permission_mode": {
+            "$ref": "#/components/schemas/PermissionMode",
+            "default": "approve-reads",
+            "description": "Permission policy for `session/request_permission`."
+          },
+          "pid": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Why its process ended or is pending: exited, killed, server_stop,\nhost_shutdown, signaled, crashed, stopped_by_restart.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "records": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Status"
+            },
+            "type": "object"
+          },
+          "reported": {
+            "default": false,
+            "type": "boolean"
+          },
+          "rm": {
+            "default": false,
+            "description": "Removed right after it exits (once a waiting parent has the exit code).",
+            "type": "boolean"
+          },
+          "signal": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "\"live\" or \"finished\".",
+            "type": "string"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Status"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Agent execution state: idle, working, done, blocked, or error."
+          },
+          "status_ms": {
+            "default": null,
+            "description": "When that state last changed, ms since the epoch.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "template": {
+            "default": null,
+            "description": "The template that started it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "default": "",
+            "type": "string"
+          },
+          "turn": {
+            "default": 0,
+            "description": "Goes up each time the status leaves `working`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "wait": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WaitResult"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "With `wait`: how the wait ended (status, exit, or timeout: still running)."
+          }
+        },
+        "required": [
+          "address",
+          "labels",
+          "argv",
+          "cwd",
+          "state",
+          "created_ms"
+        ],
+        "type": "object"
+      },
+      "SendResult": {
+        "properties": {
+          "inbox_len": {
+            "description": "Total queued items waiting behind the current turn.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "started": {
+            "description": "Whether the queued prompt started a turn or went into the serial inbox.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "The agent's status word when queued.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "turn": {
+            "description": "The turn when queued.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "wait": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WaitResult"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "With `wait`: how that turn ended."
+          }
+        },
+        "required": [
+          "turn",
+          "inbox_len"
+        ],
+        "type": "object"
+      },
+      "Status": {
+        "description": "One status record. Words describe ACP execution state cleanly without translation.",
+        "properties": {
+          "app": {
+            "type": "string"
+          },
+          "kind": {
+            "description": "permission, question or auth (blocked only, when relevant).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "msg": {
+            "type": "string"
+          },
+          "progress": {
+            "description": "0..100 (working or blocked, when reported).",
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "idle, working, done, blocked or error.",
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
+      "StatusResult": {
+        "properties": {
+          "core": {
+            "$ref": "#/components/schemas/CoreInfo"
+          },
+          "finished": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "installed_by": {
+            "description": "The package manager this h2 came from (homebrew, nix, mise, or\nsystem package manager): it updates h2, `h2 update` won't.\nNull for a replaceable plain install.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "keeps_running_after_logout": {
+            "description": "True: systemd lingering is enabled; false: agents stop at last logout.\nNull: unsupported, not applicable or unknown. Checked on every request.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "live": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "logout_linger_user": {
+            "description": "Account for the administrator's loginctl enable-linger command.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pid": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "uptime_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "version": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "core",
+          "version",
+          "pid",
+          "uptime_ms",
+          "live",
+          "finished"
+        ],
+        "type": "object"
+      },
+      "StopResult": {
+        "properties": {
+          "stopped": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "stopped"
+        ],
+        "type": "object"
+      },
+      "SubscribeResult": {
+        "properties": {
+          "agents": {
+            "description": "Matching agents here and on connected machines (`machine/a7`).",
+            "items": {
+              "$ref": "#/components/schemas/Agent"
+            },
+            "type": "array"
+          },
+          "channel": {
+            "description": "Framed mode: the channel events arrive on (JSON lines, with credit).\nPlain mode: none; this connection now carries only notifications.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "seq": {
+            "description": "Events after this sequence follow. After a `missed` snapshot, ignore\nevents whose seq is not above the snapshot's.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "terminals": {
+            "default": [],
+            "description": "Matching terminals here and on connected machines (`machine/t7`).",
+            "items": {
+              "$ref": "#/components/schemas/Terminal"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "seq",
+          "agents"
+        ],
+        "type": "object"
+      },
+      "TemplateInfo": {
+        "properties": {
+          "agent": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "command": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "error": {
+            "description": "Set when the file can't be used.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "description",
+          "command"
+        ],
+        "type": "object"
+      },
+      "TemplatesResult": {
+        "properties": {
+          "templates": {
+            "items": {
+              "$ref": "#/components/schemas/TemplateInfo"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "templates"
+        ],
+        "type": "object"
+      },
+      "Terminal": {
+        "properties": {
+          "address": {
+            "description": "`t7`: this terminal forever on this core.",
+            "type": "string"
+          },
+          "argv": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "cols": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "created_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "die_with_parent": {
+            "default": false,
+            "type": "boolean"
+          },
+          "exit_code": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "finished_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "first_message": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FirstMessage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A template first message that was not sent; retained for later inspection."
+          },
+          "foreground": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Foreground"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What runs in it right now and where (null once it has finished)."
+          },
+          "identity": {
+            "default": "",
+            "description": "Which terminal the program believes it runs in (TERM_PROGRAM and\nversion), fixed at start; XTVERSION answers with it.",
+            "type": "string"
+          },
+          "keep": {
+            "default": false,
+            "description": "Replace a lost program with this machine’s shell, in place. Exit with a code and kill remain final.",
+            "type": "boolean"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "notify": {
+            "default": false,
+            "description": "Its parent gets notes about it (see `--no-notify`).",
+            "type": "boolean"
+          },
+          "parent": {
+            "default": null,
+            "description": "The terminal that started it (`t3`), set once at start.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "paste_gap_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pid": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Why its program ended or is pending (`spawn_pending` means its initial\nspawn timed out, but the holder may still be starting it):\nexited, killed, server_stop, host_shutdown (Windows\nis ending the session, including logout), signaled (a kept program\ndied by signal without an exit code), holder_lost (its holder\ndied), stopped_by_restart (nothing ran it any more after a restart).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "records": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Status"
+            },
+            "description": "Other 7501 records by id (programs reporting on several things).",
+            "type": "object"
+          },
+          "reported": {
+            "default": false,
+            "description": "Whether the program ever sent a 7501 report.",
+            "type": "boolean"
+          },
+          "rm": {
+            "default": false,
+            "description": "Removed right after it exits (once a waiting parent has the exit code).",
+            "type": "boolean"
+          },
+          "rows": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "screen": {
+            "description": "\"exact\", or \"inexact\" after a core crash (older history may be missing).",
+            "type": "string"
+          },
+          "signal": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "\"live\" or \"finished\".",
+            "type": "string"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Status"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The program's own word for what it's doing (OSC 7501 root record);\nnull if it never said, or after it exited."
+          },
+          "status_ms": {
+            "default": null,
+            "description": "When that word last changed, ms since the epoch; null if it never said.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "stop": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "submit": {
+            "description": "Template overrides: the key that submits a message, the stop key, the pause\nbetween paste and submit.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "template": {
+            "default": null,
+            "description": "The template that started it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "default": "",
+            "type": "string"
+          },
+          "turn": {
+            "default": 0,
+            "description": "Goes up each time the status leaves `working`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "address",
+          "labels",
+          "argv",
+          "cwd",
+          "state",
+          "created_ms",
+          "screen",
+          "cols",
+          "rows"
+        ],
+        "type": "object"
+      },
+      "TerminalInterruptResult": {
+        "properties": {
+          "key": {
+            "type": "string"
+          },
+          "outcome": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "outcome",
+          "key"
+        ],
+        "type": "object"
+      },
+      "TerminalListResult": {
+        "properties": {
+          "hidden_finished": {
+            "description": "Finished terminals left out (see `all`).",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "machines": {
+            "items": {
+              "$ref": "#/components/schemas/MachineView"
+            },
+            "type": "array"
+          },
+          "terminals": {
+            "description": "This machine's terminals, then each connected machine's (`machine/t7`).",
+            "items": {
+              "$ref": "#/components/schemas/Terminal"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "terminals",
+          "hidden_finished",
+          "machines"
+        ],
+        "type": "object"
+      },
+      "TerminalReadResult": {
+        "properties": {
+          "complete": {
+            "type": "boolean"
+          },
+          "how": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          },
+          "why": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "text",
+          "complete",
+          "how"
+        ],
+        "type": "object"
+      },
+      "TerminalRunResult": {
+        "properties": {
+          "address": {
+            "description": "`t7`: this terminal forever on this core.",
+            "type": "string"
+          },
+          "argv": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "cols": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "created_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "die_with_parent": {
+            "default": false,
+            "type": "boolean"
+          },
+          "exit_code": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "finished_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "first_message": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FirstMessage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "foreground": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Foreground"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What runs in it right now and where (null once it has finished)."
+          },
+          "identity": {
+            "default": "",
+            "description": "Which terminal the program believes it runs in (TERM_PROGRAM and\nversion), fixed at start; XTVERSION answers with it.",
+            "type": "string"
+          },
+          "keep": {
+            "default": false,
+            "description": "Replace a lost program with this machine’s shell, in place. Exit with a code and kill remain final.",
+            "type": "boolean"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "notify": {
+            "default": false,
+            "description": "Its parent gets notes about it (see `--no-notify`).",
+            "type": "boolean"
+          },
+          "output": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parent": {
+            "default": null,
+            "description": "The terminal that started it (`t3`), set once at start.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "paste_gap_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "pid": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "Why its program ended or is pending (`spawn_pending` means its initial\nspawn timed out, but the holder may still be starting it):\nexited, killed, server_stop, host_shutdown (Windows\nis ending the session, including logout), signaled (a kept program\ndied by signal without an exit code), holder_lost (its holder\ndied), stopped_by_restart (nothing ran it any more after a restart).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "records": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/Status"
+            },
+            "description": "Other 7501 records by id (programs reporting on several things).",
+            "type": "object"
+          },
+          "reported": {
+            "default": false,
+            "description": "Whether the program ever sent a 7501 report.",
+            "type": "boolean"
+          },
+          "rm": {
+            "default": false,
+            "description": "Removed right after it exits (once a waiting parent has the exit code).",
+            "type": "boolean"
+          },
+          "rows": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "screen": {
+            "description": "\"exact\", or \"inexact\" after a core crash (older history may be missing).",
+            "type": "string"
+          },
+          "signal": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "\"live\" or \"finished\".",
+            "type": "string"
+          },
+          "status": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Status"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "The program's own word for what it's doing (OSC 7501 root record);\nnull if it never said, or after it exited."
+          },
+          "status_ms": {
+            "default": null,
+            "description": "When that word last changed, ms since the epoch; null if it never said.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "stop": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "submit": {
+            "description": "Template overrides: the key that submits a message, the stop key, the pause\nbetween paste and submit.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "template": {
+            "default": null,
+            "description": "The template that started it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "default": "",
+            "type": "string"
+          },
+          "turn": {
+            "default": 0,
+            "description": "Goes up each time the status leaves `working`.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "wait": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WaitResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "address",
+          "labels",
+          "argv",
+          "cwd",
+          "state",
+          "created_ms",
+          "screen",
+          "cols",
+          "rows"
+        ],
+        "type": "object"
+      },
+      "TerminalSendResult": {
+        "properties": {
+          "started": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "turn": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "wait": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WaitResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "turn"
+        ],
+        "type": "object"
+      },
+      "WaitResult": {
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "children": {
+            "description": "With `children`: one result per child it reports on.",
+            "items": {
+              "$ref": "#/components/schemas/WaitResult"
+            },
+            "type": "array"
+          },
+          "ended": {
+            "description": "False on timeout: a check-in, the agent is still running.",
+            "type": "boolean"
+          },
+          "exit_code": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "from": {
+            "description": "With a message: the sender's address (queued in your inbox);\nnull when a person sent it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reason": {
+            "description": "status, exit (including loss in a kept agent), output, timeout,\nor not_started (after a send: it did not start working; a plain wait\nstill follows that send's turn); with `children`: children;\nmessage (someone messaged the waiter, any wait); for each child in\n`children`: status, exit, or running (still working).",
+            "type": "string"
+          },
+          "signal": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "The current state word (`idle`, `working`, `blocked`, `error`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "turn": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "agent",
+          "ended",
+          "reason",
+          "turn",
+          "children"
+        ],
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Headless ACP multi-agent orchestration runtime. JSON-RPC 2.0, one message per line on the h2 socket (or framed after `hello`). Protocol generation 1. Errors carry a stable `data.kind`.",
+    "license": {
+      "name": "Apache-2.0"
+    },
+    "title": "herdr2",
+    "version": "0.2.0"
+  },
+  "methods": [
+    {
+      "description": "Handshake: protocol generation, core identity, methods and features. `framed: true` switches the connection to framed mode.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unsupported_generation"
+          },
+          "message": "unsupported_generation"
+        }
+      ],
+      "name": "hello",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "What that core calls this one (`rohan`), so news about `a7` reaches it as `rohan/a7`.",
+          "name": "calls_you",
+          "required": false,
+          "schema": {
+            "description": "What that core calls this one (`rohan`), so news about `a7` reaches it as `rohan/a7`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Another core dialing in: who it is. Its agents may then be parents\nof agents here, and hear from them.",
+          "name": "core",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/CoreInfo"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Another core dialing in: who it is. Its agents may then be parents\nof agents here, and hear from them."
+          }
+        },
+        {
+          "description": "Features supported by a core dialing in.",
+          "name": "features",
+          "required": false,
+          "schema": {
+            "default": [],
+            "description": "Features supported by a core dialing in.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        {
+          "description": "Switch this connection to framed mode after the reply.",
+          "name": "framed",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Switch this connection to framed mode after the reply.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Protocol generation the caller speaks.",
+          "name": "generation",
+          "required": false,
+          "schema": {
+            "description": "Protocol generation the caller speaks.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/HelloResult"
+        }
+      }
+    },
+    {
+      "description": "This core's identity, version, pid, uptime and agent counts.",
+      "errors": [],
+      "name": "server.status",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/StatusResult"
+        }
+      }
+    },
+    {
+      "description": "Stop the core and its ACP agents. Kept agents recover when the core next starts.",
+      "errors": [],
+      "name": "server.stop",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/StopResult"
+        }
+      }
+    },
+    {
+      "description": "Planned restart (e.g. after an update): live ACP sessions stop cleanly and kept agents resume on startup.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        }
+      ],
+      "name": "server.restart",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Replacement environment for the next core; requires PATH. Omit to preserve\nthis core's environment. Normal startup filtering applies; session paths\nand service bookkeeping still belong to the next launcher.",
+          "name": "environment",
+          "required": false,
+          "schema": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Replacement environment for the next core; requires PATH. Omit to preserve\nthis core's environment. Normal startup filtering applies; session paths\nand service bookkeeping still belong to the next launcher.",
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/StopResult"
+        }
+      }
+    },
+    {
+      "description": "Start an ACP agent (preset, command, or template) with no PTY or terminal info, optionally queue its initial prompt, and return once the ACP session is ready.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "name_taken"
+          },
+          "message": "name_taken"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "spawn_failed"
+          },
+          "message": "spawn_failed"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "invalid_template"
+          },
+          "message": "invalid_template"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "config"
+          },
+          "message": "config"
+        }
+      ],
+      "name": "agent.run",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "ACP preset name (`claude`, `codex`, `gemini`, ...) or explicit command line.",
+          "name": "agent",
+          "required": false,
+          "schema": {
+            "description": "ACP preset name (`claude`, `codex`, `gemini`, ...) or explicit command line.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Preset/command and arguments, or a template name and its task.",
+          "name": "argv",
+          "required": false,
+          "schema": {
+            "default": [],
+            "description": "Preset/command and arguments, or a template name and its task.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        {
+          "description": "Who is calling (`H2_AGENT_ID` inside an agent).",
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "description": "Who is calling (`H2_AGENT_ID` inside an agent).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Working directory (default: where h2 runs; through the API, the core's;\nwith --on, that machine's home).",
+          "name": "cwd",
+          "required": false,
+          "schema": {
+            "description": "Working directory (default: where h2 runs; through the API, the core's;\nwith --on, that machine's home).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Ignored: children end with their parent unless `outlive_parent`.",
+          "name": "die_with_parent",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Ignored: children end with their parent unless `outlive_parent`.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Extra environment variables merged onto the core's environment.",
+          "name": "env",
+          "required": false,
+          "schema": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "description": "Extra environment variables merged onto the core's environment.",
+            "type": "object"
+          }
+        },
+        {
+          "description": "Keep recovering via `session/load` (if supported) after crash or restart.",
+          "name": "keep",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Keep recovering via `session/load` (if supported) after crash or restart.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Labels, key=value (repeatable).",
+          "name": "labels",
+          "required": false,
+          "schema": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "description": "Labels, key=value (repeatable).",
+            "type": "object"
+          }
+        },
+        {
+          "description": "Session mode override passed to `session/set_mode`.",
+          "name": "mode",
+          "required": false,
+          "schema": {
+            "description": "Session mode override passed to `session/set_mode`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Model override passed to `session/set_config_option` (`model`).",
+          "name": "model",
+          "required": false,
+          "schema": {
+            "description": "Model override passed to `session/set_config_option` (`model`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Name, unique among live agents: 1-32 of a-z 0-9 - _ .",
+          "name": "name",
+          "required": false,
+          "schema": {
+            "description": "Name, unique among live agents: 1-32 of a-z 0-9 - _ .",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Disable injecting the built-in `herdr2` MCP server into `mcpServers`.",
+          "name": "no_mcp",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Disable injecting the built-in `herdr2` MCP server into `mcpServers`.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Don't send automated notes about it to its parent.",
+          "name": "no_notify",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Don't send automated notes about it to its parent.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "No parent, even when started from an agent.",
+          "name": "no_parent",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "No parent, even when started from an agent.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Run it on another machine (see `h2 machine ls`); its address is `machine/a7`.",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "Run it on another machine (see `h2 machine ls`); its address is `machine/a7`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Keep it running when its parent finishes (by default it ends too).",
+          "name": "outlive_parent",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Keep it running when its parent finishes (by default it ends too).",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Parent agent (default: the agent it is started from).",
+          "name": "parent",
+          "required": false,
+          "schema": {
+            "description": "Parent agent (default: the agent it is started from).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Permission policy (`approve-all`, `approve-reads`, `deny-all`, `ask`).",
+          "name": "permissions",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PermissionMode"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Permission policy (`approve-all`, `approve-reads`, `deny-all`, `ask`)."
+          }
+        },
+        {
+          "description": "Initial prompt queued right after ACP session setup.",
+          "name": "prompt",
+          "required": false,
+          "schema": {
+            "description": "Initial prompt queued right after ACP session setup.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Remove it right after it exits (once a waiting parent has seen it).",
+          "name": "rm",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Remove it right after it exits (once a waiting parent has seen it).",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "System prompt appended via `_meta.systemPrompt` on session creation.",
+          "name": "system_prompt",
+          "required": false,
+          "schema": {
+            "description": "System prompt appended via `_meta.systemPrompt` on session creation.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Seconds before a wait checks in, leaving it running (default: config\n`wait_timeout`, else 180).",
+          "name": "timeout",
+          "required": false,
+          "schema": {
+            "description": "Seconds before a wait checks in, leaving it running (default: config\n`wait_timeout`, else 180).",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Then wait until it is not working, like `agent.wait`, and return its\ntranscript (the CLI waits unless --bg).",
+          "name": "wait",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Then wait until it is not working, like `agent.wait`, and return its\ntranscript (the CLI waits unless --bg).",
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/RunResult"
+        }
+      }
+    },
+    {
+      "description": "Templates by name and description, so you can pick a role without knowing its command.",
+      "errors": [],
+      "name": "templates.list",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/TemplatesResult"
+        }
+      }
+    },
+    {
+      "description": "Live agents (all with `all`), optionally filtered by labels.",
+      "errors": [],
+      "name": "agent.list",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Include finished agents.",
+          "name": "all",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Include finished agents.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Only agents carrying all of these labels (repeatable).",
+          "name": "labels",
+          "required": false,
+          "schema": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "description": "Only agents carrying all of these labels (repeatable).",
+            "type": "object"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ListResult"
+        }
+      }
+    },
+    {
+      "description": "One agent's facts, live or finished.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        }
+      ],
+      "name": "agent.get",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The agent: `a7`, a name, or `machine/a7`.",
+          "name": "agent",
+          "required": true,
+          "schema": {
+            "description": "The agent: `a7`, a name, or `machine/a7`.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Who is calling; a parent looking at its child has seen its news.",
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "description": "Who is calling; a parent looking at its child has seen its news.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/Agent"
+        }
+      }
+    },
+    {
+      "description": "Terminate an ACP agent (HUP, then TERM, then KILL). Returns the observed record.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        }
+      ],
+      "name": "agent.kill",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The agent: `a7`, a name, or `machine/a7`.",
+          "name": "agent",
+          "required": true,
+          "schema": {
+            "description": "The agent: `a7`, a name, or `machine/a7`.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Who is calling; a parent looking at its child has seen its news.",
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "description": "Who is calling; a parent looking at its child has seen its news.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/Agent"
+        }
+      }
+    },
+    {
+      "description": "Remove a finished agent.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "live"
+          },
+          "message": "live"
+        }
+      ],
+      "name": "agent.rm",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The agent: `a7`, a name, or `machine/a7`.",
+          "name": "agent",
+          "required": true,
+          "schema": {
+            "description": "The agent: `a7`, a name, or `machine/a7`.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Who is calling; a parent looking at its child has seen its news.",
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "description": "Who is calling; a parent looking at its child has seen its news.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/RemoveResult"
+        }
+      }
+    },
+    {
+      "description": "Set whether a live agent resumes cleanly via `session/load` after crash or planned restart.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        }
+      ],
+      "name": "agent.keep",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The agent: `a7`, a name, or `machine/a7`.",
+          "name": "agent",
+          "required": true,
+          "schema": {
+            "description": "The agent: `a7`, a name, or `machine/a7`.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Keep this live agent recoverable across crash or planned restart.",
+          "name": "keep",
+          "required": true,
+          "schema": {
+            "description": "Keep this live agent recoverable across crash or planned restart.",
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/Agent"
+        }
+      }
+    },
+    {
+      "description": "Set or remove labels (free-form `key=value`, never interpreted).",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        }
+      ],
+      "name": "agent.label",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The agent: `a7`, a name, or `machine/a7`.",
+          "name": "agent",
+          "required": true,
+          "schema": {
+            "description": "The agent: `a7`, a name, or `machine/a7`.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Labels to set, key=value; `key=` removes one.",
+          "name": "labels",
+          "required": true,
+          "schema": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Labels to set, key=value; `key=` removes one.",
+            "type": "object"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/Agent"
+        }
+      }
+    },
+    {
+      "description": "Rendered JSONL transcript (`transcript`), `--last` final assistant message (`last`), or trailing history lines.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "config"
+          },
+          "message": "config"
+        }
+      ],
+      "name": "agent.read",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The agent: `a7`, a name, or `machine/a7`.",
+          "name": "agent",
+          "required": true,
+          "schema": {
+            "description": "The agent: `a7`, a name, or `machine/a7`.",
+            "type": "string"
+          }
+        },
+        {
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Print only the final assistant text from the latest turn.",
+          "name": "last",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Print only the final assistant text from the latest turn.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Trailing rendered transcript lines (default: full transcript).",
+          "name": "lines",
+          "required": false,
+          "schema": {
+            "description": "Trailing rendered transcript lines (default: full transcript).",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "With `--wait`: seconds before returning early (default: config, else 180).",
+          "name": "timeout",
+          "required": false,
+          "schema": {
+            "description": "With `--wait`: seconds before returning early (default: config, else 180).",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Wait for the agent to finish its current turn or block before reading.",
+          "name": "wait",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Wait for the agent to finish its current turn or block before reading.",
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ReadResult"
+        }
+      }
+    },
+    {
+      "description": "Enqueue a prompt into the agent's serial ACP inbox, or cancel the active turn and steer immediately with `steer`.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "finished"
+          },
+          "message": "finished"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "blocked"
+          },
+          "message": "blocked"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "status_mismatch"
+          },
+          "message": "status_mismatch"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "config"
+          },
+          "message": "config"
+        }
+      ],
+      "name": "agent.send",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The agent: `a7`, a name, or `machine/a7`.",
+          "name": "agent",
+          "required": true,
+          "schema": {
+            "description": "The agent: `a7`, a name, or `machine/a7`.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Who is sending (`H2_AGENT_ID`, else the calling process's parent), so a\nbare wait from the same caller waits for this send's turn.",
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "description": "Who is sending (`H2_AGENT_ID`, else the calling process's parent), so a\nbare wait from the same caller waits for this send's turn.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Sender address attributed in `<h2 from=\"...\">` tags (default: caller).",
+          "name": "from",
+          "required": false,
+          "schema": {
+            "description": "Sender address attributed in `<h2 from=\"...\">` tags (default: caller).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Only enqueue if the status is exactly this.",
+          "name": "if",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IdleOrWorking"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Only enqueue if the status is exactly this."
+          }
+        },
+        {
+          "description": "Cancel the active ACP turn (`session/cancel`) and deliver this prompt next.",
+          "name": "steer",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Cancel the active ACP turn (`session/cancel`) and deliver this prompt next.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Prompt text queued for the agent's ACP inbox.",
+          "name": "text",
+          "required": true,
+          "schema": {
+            "description": "Prompt text queued for the agent's ACP inbox.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "With wait: seconds before it checks in (default: config, else 180).",
+          "name": "timeout",
+          "required": false,
+          "schema": {
+            "description": "With wait: seconds before it checks in (default: config, else 180).",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Wait for the turn this send triggers.",
+          "name": "wait",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Wait for the turn this send triggers.",
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SendResult"
+        }
+      }
+    },
+    {
+      "description": "Wait until an agent leaves `working` (idle, blocked, error, or exited). Already not working returns immediately. With `children`, wait on subordinate agents.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "needs_target"
+          },
+          "message": "needs_target"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "config"
+          },
+          "message": "config"
+        }
+      ],
+      "name": "agent.wait",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The agent; with `children`, whose children (default: the caller).",
+          "name": "agent",
+          "required": false,
+          "schema": {
+            "description": "The agent; with `children`, whose children (default: the caller).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "See `agent.send`.",
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "description": "See `agent.send`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Wait on children instead: all = until none is working, any = next news or a message to you.",
+          "name": "children",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Children"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Wait on children instead: all = until none is working, any = next news or a message to you."
+          }
+        },
+        {
+          "description": "End when streamed transcript output after the wait starts contains this text.\nBlocked, error or exit end it too.",
+          "name": "output",
+          "required": false,
+          "schema": {
+            "description": "End when streamed transcript output after the wait starts contains this text.\nBlocked, error or exit end it too.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Seconds before it checks in (default: config `wait_timeout`, else 180).",
+          "name": "timeout",
+          "required": false,
+          "schema": {
+            "description": "Seconds before it checks in (default: config `wait_timeout`, else 180).",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/WaitResult"
+        }
+      }
+    },
+    {
+      "description": "Send ACP `session/cancel` to abort the current turn cleanly without killing the agent process.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "finished"
+          },
+          "message": "finished"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        }
+      ],
+      "name": "agent.interrupt",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The agent: `a7`, a name, or `machine/a7`.",
+          "name": "agent",
+          "required": true,
+          "schema": {
+            "description": "The agent: `a7`, a name, or `machine/a7`.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Seconds to wait for cancellation effect (default 10).",
+          "name": "timeout",
+          "required": false,
+          "schema": {
+            "description": "Seconds to wait for cancellation effect (default 10).",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/InterruptResult"
+        }
+      }
+    },
+    {
+      "description": "Approve a blocked agent's pending ACP `session/request_permission` prompt.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "finished"
+          },
+          "message": "finished"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "invalid_state"
+          },
+          "message": "invalid_state"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        }
+      ],
+      "name": "agent.approve",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The agent: `a7`, a name, or `machine/a7`.",
+          "name": "agent",
+          "required": true,
+          "schema": {
+            "description": "The agent: `a7`, a name, or `machine/a7`.",
+            "type": "string"
+          }
+        },
+        {
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Explicit ACP permission `optionId` to choose (default: first matching option).",
+          "name": "option",
+          "required": false,
+          "schema": {
+            "description": "Explicit ACP permission `optionId` to choose (default: first matching option).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ApproveResult"
+        }
+      }
+    },
+    {
+      "description": "Deny or cancel a blocked agent's pending ACP `session/request_permission` prompt.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "finished"
+          },
+          "message": "finished"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "invalid_state"
+          },
+          "message": "invalid_state"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        }
+      ],
+      "name": "agent.deny",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The agent: `a7`, a name, or `machine/a7`.",
+          "name": "agent",
+          "required": true,
+          "schema": {
+            "description": "The agent: `a7`, a name, or `machine/a7`.",
+            "type": "string"
+          }
+        },
+        {
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Explicit ACP permission `optionId` to choose (default: first matching option).",
+          "name": "option",
+          "required": false,
+          "schema": {
+            "description": "Explicit ACP permission `optionId` to choose (default: first matching option).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ApproveResult"
+        }
+      }
+    },
+    {
+      "description": "Write bytes to a file beside a live agent, on its machine, for it to read. Lands in an isolated directory removed with the agent.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "finished"
+          },
+          "message": "finished"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        }
+      ],
+      "name": "agent.put",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The agent: `a7`, a name, or `machine/a7`.",
+          "name": "agent",
+          "required": true,
+          "schema": {
+            "description": "The agent: `a7`, a name, or `machine/a7`.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Its bytes, base64; at most 8 MB raw.",
+          "name": "data",
+          "required": true,
+          "schema": {
+            "description": "Its bytes, base64; at most 8 MB raw.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "The file's name, kept so `.png` stays `.png` (CLI: the local file to send).",
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "The file's name, kept so `.png` stays `.png` (CLI: the local file to send).",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/PutResult"
+        }
+      }
+    },
+    {
+      "description": "Start a program in a pseudo-terminal (`shell`, command, or template). With `wait`, wait for it to finish and return its screen.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "name_taken"
+          },
+          "message": "name_taken"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "spawn_failed"
+          },
+          "message": "spawn_failed"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "invalid_template"
+          },
+          "message": "invalid_template"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "config"
+          },
+          "message": "config"
+        }
+      ],
+      "name": "terminal.run",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Program and arguments, or a template name and its task. With neither\nargv nor line: that machine's own shell.",
+          "name": "argv",
+          "required": false,
+          "schema": {
+            "default": [],
+            "description": "Program and arguments, or a template name and its task. With neither\nargv nor line: that machine's own shell.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        {
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Working directory.",
+          "name": "cwd",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Working directory.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "die_with_parent",
+          "required": false,
+          "schema": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "The caller's colors and cell size, answering the program's display queries from its start.",
+          "name": "display",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Display"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The caller's colors and cell size, answering the program's display queries from its start."
+          }
+        },
+        {
+          "description": "Override the core's environment and terminal identity.",
+          "name": "env",
+          "required": false,
+          "schema": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "description": "Override the core's environment and terminal identity.",
+            "type": "object"
+          }
+        },
+        {
+          "name": "keep",
+          "required": false,
+          "schema": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Labels, key=value.",
+          "name": "labels",
+          "required": false,
+          "schema": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "description": "Labels, key=value.",
+            "type": "object"
+          }
+        },
+        {
+          "description": "A shell line instead of argv, run by that machine's shell.",
+          "name": "line",
+          "required": false,
+          "schema": {
+            "description": "A shell line instead of argv, run by that machine's shell.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Name, unique among live agents and terminals: 1-32 of a-z 0-9 - _ .",
+          "name": "name",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Name, unique among live agents and terminals: 1-32 of a-z 0-9 - _ .",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "no_notify",
+          "required": false,
+          "schema": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        {
+          "name": "no_parent",
+          "required": false,
+          "schema": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Run it on another machine; its address is `machine/t7`.",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "Run it on another machine; its address is `machine/t7`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "outlive_parent",
+          "required": false,
+          "schema": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Parent terminal or agent.",
+          "name": "parent",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Parent terminal or agent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "rm",
+          "required": false,
+          "schema": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Initial size before the program starts.",
+          "name": "size",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/InitialSize"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Initial size before the program starts."
+          }
+        },
+        {
+          "name": "timeout",
+          "required": false,
+          "schema": {
+            "default": null,
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "wait",
+          "required": false,
+          "schema": {
+            "default": false,
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/TerminalRunResult"
+        }
+      }
+    },
+    {
+      "description": "Live interactive PTY terminals (all with `all`), optionally filtered by labels.",
+      "errors": [],
+      "name": "terminal.list",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Include finished agents.",
+          "name": "all",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Include finished agents.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Only agents carrying all of these labels (repeatable).",
+          "name": "labels",
+          "required": false,
+          "schema": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "description": "Only agents carrying all of these labels (repeatable).",
+            "type": "object"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/TerminalListResult"
+        }
+      }
+    },
+    {
+      "description": "One terminal's facts, live or finished.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        }
+      ],
+      "name": "terminal.get",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "The terminal: `t7`, a name, or `machine/t7`.",
+          "name": "terminal",
+          "required": true,
+          "schema": {
+            "description": "The terminal: `t7`, a name, or `machine/t7`.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/Terminal"
+        }
+      }
+    },
+    {
+      "description": "End a terminal's program (HUP, then TERM, then KILL). Returns the observed record.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        }
+      ],
+      "name": "terminal.kill",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "The terminal: `t7`, a name, or `machine/t7`.",
+          "name": "terminal",
+          "required": true,
+          "schema": {
+            "description": "The terminal: `t7`, a name, or `machine/t7`.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/Terminal"
+        }
+      }
+    },
+    {
+      "description": "Remove a finished terminal.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "live"
+          },
+          "message": "live"
+        }
+      ],
+      "name": "terminal.rm",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "The terminal: `t7`, a name, or `machine/t7`.",
+          "name": "terminal",
+          "required": true,
+          "schema": {
+            "description": "The terminal: `t7`, a name, or `machine/t7`.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/RemoveResult"
+        }
+      }
+    },
+    {
+      "description": "Keep a live terminal recoverable after crash or restart by launching a replacement shell.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        }
+      ],
+      "name": "terminal.keep",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "keep",
+          "required": true,
+          "schema": {
+            "type": "boolean"
+          }
+        },
+        {
+          "name": "terminal",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/Terminal"
+        }
+      }
+    },
+    {
+      "description": "Set or remove labels (free-form `key=value`, never interpreted).",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        }
+      ],
+      "name": "terminal.label",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "labels",
+          "required": true,
+          "schema": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        {
+          "name": "terminal",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/Terminal"
+        }
+      }
+    },
+    {
+      "description": "A terminal's screen, or scrollback history lines.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        }
+      ],
+      "name": "terminal.read",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Lines of history above the screen.",
+          "name": "lines",
+          "required": false,
+          "schema": {
+            "default": 0,
+            "description": "Lines of history above the screen.",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "name": "terminal",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/TerminalReadResult"
+        }
+      }
+    },
+    {
+      "description": "Open a live terminal viewer stream on this framed connection.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "finished"
+          },
+          "message": "finished"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "needs_framed"
+          },
+          "message": "needs_framed"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "refused"
+          },
+          "message": "refused"
+        }
+      ],
+      "name": "terminal.attach",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Who is calling (`H2_TERMINAL_ID` inside a terminal): never itself.",
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Who is calling (`H2_TERMINAL_ID` inside a terminal): never itself.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "The viewer's size in cells.",
+          "name": "cols",
+          "required": true,
+          "schema": {
+            "description": "The viewer's size in cells.",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "description": "The viewer's own colors and cell size, used to answer display queries.",
+          "name": "display",
+          "required": false,
+          "schema": {
+            "$ref": "#/components/schemas/Display",
+            "default": {
+              "bg": null,
+              "cell": null,
+              "cursor": null,
+              "fg": null
+            },
+            "description": "The viewer's own colors and cell size, used to answer display queries."
+          }
+        },
+        {
+          "description": "Scrollback lines to show first (main screen only).",
+          "name": "history",
+          "required": false,
+          "schema": {
+            "default": 0,
+            "description": "Scrollback lines to show first (main screen only).",
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "description": "Watch only: never type or resize.",
+          "name": "observe",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Watch only: never type or resize.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Observer understands core-to-viewer RESIZE before replacement paints.",
+          "name": "resize_notifications",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Observer understands core-to-viewer RESIZE before replacement paints.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Back after a dropped line: sets the size only once active again.",
+          "name": "resumed",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Back after a dropped line: sets the size only once active again.",
+            "type": "boolean"
+          }
+        },
+        {
+          "name": "rows",
+          "required": true,
+          "schema": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "description": "The terminal: `t7`, a name, or `machine/t7`.",
+          "name": "terminal",
+          "required": true,
+          "schema": {
+            "description": "The terminal: `t7`, a name, or `machine/t7`.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/AttachResult"
+        }
+      }
+    },
+    {
+      "description": "Paste text into a live terminal and submit with Enter.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "finished"
+          },
+          "message": "finished"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "blocked"
+          },
+          "message": "blocked"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "status_mismatch"
+          },
+          "message": "status_mismatch"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "config"
+          },
+          "message": "config"
+        }
+      ],
+      "name": "terminal.send",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "force",
+          "required": false,
+          "schema": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        {
+          "name": "if",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IdleOrWorking"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        {
+          "name": "terminal",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "text",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "timeout",
+          "required": false,
+          "schema": {
+            "default": null,
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "wait",
+          "required": false,
+          "schema": {
+            "default": false,
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/TerminalSendResult"
+        }
+      }
+    },
+    {
+      "description": "Wait until a terminal leaves `working` (done, idle, blocked, error, exited) or matches `output`.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "needs_target"
+          },
+          "message": "needs_target"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "config"
+          },
+          "message": "config"
+        }
+      ],
+      "name": "terminal.wait",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "children",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Children"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        {
+          "name": "output",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "terminal",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "timeout",
+          "required": false,
+          "schema": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/WaitResult"
+        }
+      }
+    },
+    {
+      "description": "Send named keys (enter, esc, tab, ctrl+c, ...) to a live terminal.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "finished"
+          },
+          "message": "finished"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "config"
+          },
+          "message": "config"
+        }
+      ],
+      "name": "terminal.keys",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Key names: enter, esc, tab, up, ctrl+c, alt+x, f5, a, ...",
+          "name": "keys",
+          "required": true,
+          "schema": {
+            "description": "Key names: enter, esc, tab, up, ctrl+c, alt+x, f5, a, ...",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        {
+          "description": "The terminal: `t7`, a name, or `machine/t7`.",
+          "name": "terminal",
+          "required": true,
+          "schema": {
+            "description": "The terminal: `t7`, a name, or `machine/t7`.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/KeysResult"
+        }
+      }
+    },
+    {
+      "description": "Send interrupt key (Esc or Ctrl-C) to a live terminal and watch for an effect.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "finished"
+          },
+          "message": "finished"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        }
+      ],
+      "name": "terminal.interrupt",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "terminal",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "timeout",
+          "required": false,
+          "schema": {
+            "default": null,
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/TerminalInterruptResult"
+        }
+      }
+    },
+    {
+      "description": "Write bytes to a file beside a live terminal for its program to read.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "finished"
+          },
+          "message": "finished"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        }
+      ],
+      "name": "terminal.put",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "data",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "terminal",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/PutResult"
+        }
+      }
+    },
+    {
+      "description": "Run one non-agent command here or on a machine (`on`); returns exit code and stdout/stderr (base64). `argv` runs directly, `line` in that machine's shell.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "spawn_failed"
+          },
+          "message": "spawn_failed"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "needs_update"
+          },
+          "message": "needs_update"
+        }
+      ],
+      "name": "machine.exec",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Program and arguments, run as given (no shell).",
+          "name": "argv",
+          "required": false,
+          "schema": {
+            "description": "Program and arguments, run as given (no shell).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        {
+          "description": "Working directory (default: where h2 runs; through the API, the core's;\nwith --on, that machine's home).",
+          "name": "cwd",
+          "required": false,
+          "schema": {
+            "description": "Working directory (default: where h2 runs; through the API, the core's;\nwith --on, that machine's home).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Set on top of the core's environment, key=value (repeatable).",
+          "name": "env",
+          "required": false,
+          "schema": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "description": "Set on top of the core's environment, key=value (repeatable).",
+            "type": "object"
+          }
+        },
+        {
+          "description": "Bytes for its stdin, base64, at most 8 MB raw (without: stdin is closed).",
+          "name": "input",
+          "required": false,
+          "schema": {
+            "description": "Bytes for its stdin, base64, at most 8 MB raw (without: stdin is closed).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "A shell line instead of argv, run by that machine's shell (`sh -c`;\nWindows `%COMSPEC% /d /s /c`). The CLI sends one string with spaces or\nshell signs as a line.",
+          "name": "line",
+          "required": false,
+          "schema": {
+            "description": "A shell line instead of argv, run by that machine's shell (`sh -c`;\nWindows `%COMSPEC% /d /s /c`). The CLI sends one string with spaces or\nshell signs as a line.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Run it on another machine (see `h2 machine ls`).",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "Run it on another machine (see `h2 machine ls`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Seconds before it and everything it started are ended (default 60, at most 600).",
+          "name": "timeout",
+          "required": false,
+          "schema": {
+            "description": "Seconds before it and everything it started are ended (default 60, at most 600).",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ExecResult"
+        }
+      }
+    },
+    {
+      "description": "Read a text file here or on a machine (`on`): lines from `offset`, at most `limit` and 8 MB, and how many it has.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_text"
+          },
+          "message": "not_text"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "io"
+          },
+          "message": "io"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "needs_update"
+          },
+          "message": "needs_update"
+        }
+      ],
+      "name": "file.read",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Where a relative path starts (default: where h2 runs; through the API,\nthe core's; with --on, that machine's home).",
+          "name": "cwd",
+          "required": false,
+          "schema": {
+            "description": "Where a relative path starts (default: where h2 runs; through the API,\nthe core's; with --on, that machine's home).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "At most this many lines (default: all, up to 8 MB).",
+          "name": "limit",
+          "required": false,
+          "schema": {
+            "description": "At most this many lines (default: all, up to 8 MB).",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "The first line to give, from 1.",
+          "name": "offset",
+          "required": false,
+          "schema": {
+            "description": "The first line to give, from 1.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "On another machine (see `h2 machine ls`).",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "On another machine (see `h2 machine ls`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "The file: absolute, or from `cwd`.",
+          "name": "path",
+          "required": true,
+          "schema": {
+            "description": "The file: absolute, or from `cwd`.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/FileReadResult"
+        }
+      }
+    },
+    {
+      "description": "Write a file here or on a machine (`on`), making missing folders. Swapped atomically.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "io"
+          },
+          "message": "io"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "needs_update"
+          },
+          "message": "needs_update"
+        }
+      ],
+      "name": "file.write",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Where a relative path starts (default: where h2 runs; through the API,\nthe core's; with --on, that machine's home).",
+          "name": "cwd",
+          "required": false,
+          "schema": {
+            "description": "Where a relative path starts (default: where h2 runs; through the API,\nthe core's; with --on, that machine's home).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Its new content, base64, at most 8 MB raw (CLI: what is piped in).",
+          "name": "data",
+          "required": true,
+          "schema": {
+            "description": "Its new content, base64, at most 8 MB raw (CLI: what is piped in).",
+            "type": "string"
+          }
+        },
+        {
+          "description": "On another machine (see `h2 machine ls`).",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "On another machine (see `h2 machine ls`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "The file: absolute, or from `cwd`.",
+          "name": "path",
+          "required": true,
+          "schema": {
+            "description": "The file: absolute, or from `cwd`.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/FileResult"
+        }
+      }
+    },
+    {
+      "description": "Edit a text file here or on a machine (`on`): each `old` must match once; all or none.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "edit_failed"
+          },
+          "message": "edit_failed"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_text"
+          },
+          "message": "not_text"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "io"
+          },
+          "message": "io"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "needs_update"
+          },
+          "message": "needs_update"
+        }
+      ],
+      "name": "file.edit",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Where a relative path starts (default: where h2 runs; through the API,\nthe core's; with --on, that machine's home).",
+          "name": "cwd",
+          "required": false,
+          "schema": {
+            "description": "Where a relative path starts (default: where h2 runs; through the API,\nthe core's; with --on, that machine's home).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Replacements, all made or none (CLI: --old/--new pairs).",
+          "name": "edits",
+          "required": true,
+          "schema": {
+            "description": "Replacements, all made or none (CLI: --old/--new pairs).",
+            "items": {
+              "$ref": "#/components/schemas/Edit"
+            },
+            "type": "array"
+          }
+        },
+        {
+          "description": "On another machine (see `h2 machine ls`).",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "On another machine (see `h2 machine ls`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "The file: absolute, or from `cwd`.",
+          "name": "path",
+          "required": true,
+          "schema": {
+            "description": "The file: absolute, or from `cwd`.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/FileResult"
+        }
+      }
+    },
+    {
+      "description": "Read an opaque JSON document and its version (zero when never written). Optional `on` selects another machine.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "needs_update"
+          },
+          "message": "needs_update"
+        }
+      ],
+      "name": "doc.get",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Document name, using the agent name rules.",
+          "name": "name",
+          "required": true,
+          "schema": {
+            "description": "Document name, using the agent name rules.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Another machine; omitted for this core.",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "Another machine; omitted for this core.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/DocGetResult"
+        }
+      }
+    },
+    {
+      "description": "Write an opaque JSON document (at most 1 MiB) if its version still matches. Null deletes the value while retaining version.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "conflict"
+          },
+          "message": "conflict"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "internal"
+          },
+          "message": "internal"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "needs_update"
+          },
+          "message": "needs_update"
+        }
+      ],
+      "name": "doc.set",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "name",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "on",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Any JSON value, at most 1 MiB when serialized; null deletes it.",
+          "name": "value",
+          "required": true,
+          "schema": {
+            "description": "Any JSON value, at most 1 MiB when serialized; null deletes it."
+          }
+        },
+        {
+          "description": "Current version from doc.get; zero for a name never written.",
+          "name": "version",
+          "required": true,
+          "schema": {
+            "description": "Current version from doc.get; zero for a name never written.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/DocSetResult"
+        }
+      }
+    },
+    {
+      "description": "Snapshot of matching agents, then ordered fact changes (created, lost, restarted, keep, finished, removed, status, turn, title, labels, transcript, doc) as `event` notifications, `heartbeat` every 15 s, and `missed` + snapshot when behind.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        }
+      ],
+      "name": "events.subscribe",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Only this agent.",
+          "name": "agent",
+          "required": false,
+          "schema": {
+            "description": "Only this agent.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Only children of this agent or terminal.",
+          "name": "children_of",
+          "required": false,
+          "schema": {
+            "description": "Only children of this agent or terminal.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Documents by name (repeatable); a name ending in `*` is a prefix. Naming\nnarrows, so documents alone hear only them — name an agent or terminal for both.",
+          "name": "docs",
+          "required": false,
+          "schema": {
+            "default": [],
+            "description": "Documents by name (repeatable); a name ending in `*` is a prefix. Naming\nnarrows, so documents alone hear only them — name an agent or terminal for both.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        {
+          "description": "Only records carrying all of these labels (repeatable).",
+          "name": "labels",
+          "required": false,
+          "schema": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "description": "Only records carrying all of these labels (repeatable).",
+            "type": "object"
+          }
+        },
+        {
+          "description": "Only this terminal.",
+          "name": "terminal",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Only this terminal.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/SubscribeResult"
+        }
+      }
+    },
+    {
+      "description": "Add another machine: dial it over ssh, check that h2 answers there, and keep it under a name.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "name_taken"
+          },
+          "message": "name_taken"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "already_added"
+          },
+          "message": "already_added"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unreachable"
+          },
+          "message": "unreachable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "h2_missing"
+          },
+          "message": "h2_missing"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "incompatible"
+          },
+          "message": "incompatible"
+        }
+      ],
+      "name": "machine.add",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "What to call it here (default: the target's host).",
+          "name": "name",
+          "required": false,
+          "schema": {
+            "description": "What to call it here (default: the target's host).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "The h2 session on that machine (default: its default).",
+          "name": "session",
+          "required": false,
+          "schema": {
+            "description": "The h2 session on that machine (default: its default).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "How ssh reaches it: `vps`, `can@10.0.0.7`, `can@10.0.0.7:2222`, a Host from ~/.ssh/config.",
+          "name": "target",
+          "required": false,
+          "schema": {
+            "description": "How ssh reaches it: `vps`, `can@10.0.0.7`, `can@10.0.0.7:2222`, a Host from ~/.ssh/config.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Mark it short-lived (a sandbox for a task), so clients can show it apart\nfrom machines that stay. h2 treats it like any other; remove it with\n`h2 machine rm`.",
+          "name": "temporary",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Mark it short-lived (a sandbox for a task), so clients can show it apart\nfrom machines that stay. h2 treats it like any other; remove it with\n`h2 machine rm`.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Reach it with this command instead of ssh: it is given a shell line to\nrun there as its last argument, like ssh (`ssh -p 2222 -i key user@ip`,\n`fly ssh console -a app --pty=false -C`).",
+          "name": "via",
+          "required": false,
+          "schema": {
+            "description": "Reach it with this command instead of ssh: it is given a shell line to\nrun there as its last argument, like ssh (`ssh -p 2222 -i key user@ip`,\n`fly ssh console -a app --pty=false -C`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/Machine"
+        }
+      }
+    },
+    {
+      "description": "The machines this core has added.",
+      "errors": [],
+      "name": "machine.list",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/MachineListResult"
+        }
+      }
+    },
+    {
+      "description": "Dial a machine now instead of at its next retry (after a login), and report its line.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        }
+      ],
+      "name": "machine.connect",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The machine's name.",
+          "name": "machine",
+          "required": true,
+          "schema": {
+            "description": "The machine's name.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/MachineView"
+        }
+      }
+    },
+    {
+      "description": "Give a machine a new name here. Only this core's name for it changes.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "name_taken"
+          },
+          "message": "name_taken"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        }
+      ],
+      "name": "machine.rename",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The machine's name now.",
+          "name": "machine",
+          "required": true,
+          "schema": {
+            "description": "The machine's name now.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Its new name. Addresses with the old one stop working.",
+          "name": "new_name",
+          "required": true,
+          "schema": {
+            "description": "Its new name. Addresses with the old one stop working.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/Machine"
+        }
+      }
+    },
+    {
+      "description": "Forget a machine. Its agents keep running there.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        }
+      ],
+      "name": "machine.rm",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The machine's name.",
+          "name": "machine",
+          "required": true,
+          "schema": {
+            "description": "The machine's name.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/RemoveResult"
+        }
+      }
+    },
+    {
+      "description": "The whole API as an OpenRPC document: every method with its params, result and errors in JSON Schema.",
+      "errors": [],
+      "name": "rpc.discover",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "https://meta.open-rpc.org/"
+        }
+      }
+    }
+  ],
+  "openrpc": "1.3.2"
+}

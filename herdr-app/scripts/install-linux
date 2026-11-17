@@ -1,0 +1,32 @@
+#!/bin/bash
+# Points ~/.local/bin/herdr2 at this checkout's release build and adds the
+# launcher entry with the Herdr2 icon. Re-run after moving the checkout.
+set -euo pipefail
+
+[[ $(uname -s) == Linux ]] || { echo 'This installer is for Linux.' >&2; exit 1; }
+cd "$(dirname "$0")/.."
+cargo build --release
+
+data=${XDG_DATA_HOME:-$HOME/.local/share}
+mkdir -p "$HOME/.local/bin" "$data/applications" "$data/icons/hicolor/scalable/apps"
+ln -sfn "$PWD/target/release/herdr2" "$HOME/.local/bin/herdr2"
+cp assets/icons/herdr-ui-icon-clean.svg "$data/icons/hicolor/scalable/apps/herdr2.svg"
+cat > "$data/applications/herdr2.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Herdr2
+Comment=Headless ACP coding agents
+Exec=$HOME/.local/bin/herdr2
+Icon=herdr2
+Terminal=false
+Categories=Development;
+StartupWMClass=herdr2
+EOF
+update-desktop-database "$data/applications" 2>/dev/null || true
+# A stale icon cache hides new icons until it's rebuilt.
+[[ -f $data/icons/hicolor/icon-theme.cache ]] && gtk-update-icon-cache -f -t "$data/icons/hicolor" >/dev/null 2>&1 || true
+# Plasma remembers a missing icon until it is told the theme changed,
+# so a fresh install shows an empty page in the taskbar.
+command -v dbus-send >/dev/null 2>&1 &&
+  dbus-send --session --type=signal /KIconLoader org.kde.KIconLoader.iconChanged int32:0 2>/dev/null || true
+echo "Installed herdr-app. Quit and reopen Herdr to use the new build."
