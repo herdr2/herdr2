@@ -6,6 +6,14 @@ use crate::runtime::TargetKey;
 use crate::templates;
 use crate::terminals::{NewTerminal, Public as TerminalPublic, Terminal};
 
+pub(crate) fn is_acp_caller(caller: Option<&str>) -> bool {
+    let Some(caller) = caller.map(str::trim).filter(|s| !s.is_empty()) else {
+        return false;
+    };
+    let local = caller.rsplit_once('/').map_or(caller, |(_, tail)| tail);
+    matches!(TargetKey::parse(local), Some(TargetKey::Agent(_)))
+}
+
 pub(super) fn resolve_pty(core: &Core, address: &str) -> Result<u32, RpcError> {
     let local = crate::addr::local(address, &core.info.id, &core.info.name)?;
     core.lock().pty_reg.resolve(local)
@@ -60,7 +68,13 @@ pub(super) async fn terminal_run(core: Ctx<'_>, mut p: TerminalRunParams) -> Res
         None => (None, None),
         Some(timeout) => {
             let after_turn = first_message.as_ref().and_then(|f| f.turn);
-            let r = watch(core, caller.clone(), TargetKey::Terminal(id), WaitSpec { output: None, timeout, after_turn }).await;
+            let r = watch(
+                core,
+                caller.clone(),
+                TargetKey::Terminal(id),
+                WaitSpec { output: None, timeout: Some(timeout), after_turn },
+            )
+            .await;
             let full_screen = core.lock().screens.get(&id).is_some_and(|s| s.alt_screen());
             let read = TerminalReadParams {
                 terminal: crate::terminals::address(id),
@@ -286,8 +300,16 @@ pub(super) async fn terminal_attach(core: Ctx<'_>, p: AttachParams) -> Result<At
 pub(super) async fn terminal_send(core: Ctx<'_>, p: TerminalSendParams) -> Result<TerminalSendResult, RpcError> {
     let timeout = wait_timeout(core, p.timeout)?;
     let id = resolve_pty(core, &p.terminal)?;
+    if is_acp_caller(p.caller.as_deref()) {
+        return Err(RpcError::invalid_params(format!(
+            "ACP agent cannot send terminal input to {}; terminal agents only receive messages via `h2 wait` / `h2 read`",
+            crate::terminals::address(id)
+        )));
+    }
     let text = core.pty_tagged(p.caller.as_deref(), id, &p.text, false);
     let sent = core.pty_send(id, &text, p.force, p.only_if.map(|w| word(&w)).as_deref()).await?;
+    core.clear_manual_status_key(TargetKey::Terminal(id));
+    core.clear_manual_status_caller(p.caller.as_deref());
     let target_addr = crate::terminals::address(id);
     if let Some(caller_key) = p.caller.as_deref().and_then(TargetKey::parse) {
         let mut st = core.lock();
@@ -327,7 +349,7 @@ pub(super) async fn terminal_send(core: Ctx<'_>, p: TerminalSendParams) -> Resul
     let wait = if p.wait && sent.started == Some(false) {
         Some(core.wait_result(target, false, "not_started", None))
     } else if p.wait {
-        let spec = WaitSpec { output: None, timeout, after_turn: Some(sent.turn) };
+        let spec = WaitSpec { output: None, timeout: Some(timeout), after_turn: Some(sent.turn) };
         Some(watched(core, p.caller.clone(), target, spec).await)
     } else {
         None
@@ -337,7 +359,7 @@ pub(super) async fn terminal_send(core: Ctx<'_>, p: TerminalSendParams) -> Resul
 }
 
 pub(super) async fn terminal_wait(core: Ctx<'_>, p: TerminalWaitParams) -> Result<WaitResult, RpcError> {
-    wait_impl(core, p.terminal, p.children, p.output, p.timeout, p.caller, true).await
+    wait_impl(core, p.terminal, p.children, p.output, p.timeout, false, p.caller, true).await
 }
 
 pub(super) async fn terminal_put(core: Ctx<'_>, p: TerminalPutParams) -> Result<PutResult, RpcError> {
@@ -364,7 +386,15 @@ pub(super) async fn terminal_put(core: Ctx<'_>, p: TerminalPutParams) -> Result<
 
 pub(super) async fn terminal_keys(core: Ctx<'_>, p: KeysParams) -> Result<KeysResult, RpcError> {
     let id = resolve_pty(core, &p.terminal)?;
+    if is_acp_caller(p.caller.as_deref()) {
+        return Err(RpcError::invalid_params(format!(
+            "ACP agent cannot send keys to {}; terminal agents only receive messages via `h2 wait` / `h2 read`",
+            crate::terminals::address(id)
+        )));
+    }
     let (status, turn) = core.keys(id, &p.keys).await?;
+    core.clear_manual_status_key(TargetKey::Terminal(id));
+    core.clear_manual_status_caller(p.caller.as_deref());
     core.pty_saw(p.caller.as_deref(), id);
     core.flush_saved().await?;
     Ok(KeysResult { status, turn })
@@ -375,6 +405,7 @@ pub(super) async fn terminal_interrupt(core: Ctx<'_>, p: TerminalInterruptParams
     let timeout = seconds(p.timeout)?.unwrap_or(Duration::from_secs(10));
     let id = resolve_pty(core, &p.terminal)?;
     let (outcome, key) = core.pty_interrupt(id, timeout).await?;
+    core.clear_manual_status_key(TargetKey::Terminal(id));
     let outcome = match outcome {
         Interrupted::Stopped => "stopped",
         Interrupted::Exited => "exited",

@@ -91,3 +91,63 @@ fn resize_drags_serialize_nothing_without_observers_and_only_latest_when_stalled
     drop(core);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn viewer_input_clears_manual_status_only_on_real_interaction() {
+    assert!(!is_user_interaction_input(b""));
+    assert!(!is_user_interaction_input(b"\x1b[I"));
+    assert!(!is_user_interaction_input(b"\x1b[O"));
+    assert!(!is_user_interaction_input(b"\x1b[<35;12;8M"));
+    assert!(!is_user_interaction_input(b"\x1b[<64;12;8M"));
+    assert!(!is_user_interaction_input(b"\x1b[<0;12;8m"));
+    assert!(is_user_interaction_input(b"\x1b[<0;12;8M"));
+    assert!(is_user_interaction_input(b"y"));
+    assert!(is_user_interaction_input(b"\r"));
+
+    let root = crate::test_tmp().join(format!("hc-manual-{}", crate::platform::random_hex()));
+    let paths = crate::paths::Paths {
+        socket: root.join("core.sock"),
+        holder_socket: root.join("holder.sock"),
+        state: root.clone(),
+        config: root.join("config.toml"),
+    };
+    paths.create_dirs().unwrap();
+    let core = Core::start(paths, crate::api::CoreInfo { id: "test".into(), name: "test".into() }).unwrap();
+    let id = {
+        let mut st = core.lock();
+        let id = st
+            .pty_reg
+            .create(
+                crate::terminals::NewTerminal { argv: vec!["sh".into()], cols: 80, rows: 24, ..Default::default() },
+                0,
+            )
+            .unwrap();
+        st.screens.insert(id, ghostty_vt::Terminal::new(80, 24, 1 << 20));
+        st.pty_reg.terminals.get_mut(&id).unwrap().labels.insert("herdr.status".into(), "blocked@1".into());
+        id
+    };
+    let conn = Arc::new(Conn::default());
+    let channel = core.attach(&conn, id, AttachRequest {
+        observe: false,
+        resize_notifications: false,
+        history: 0,
+        size: (80, 24),
+        display: Display::default(),
+        resumed: false,
+    }).unwrap();
+
+    // Passive focus & wheel events must not clear manual status.
+    core.viewer_input(&conn, channel, b"\x1b[I\x1b[<64;10;10M", false);
+    assert_eq!(core.lock().pty_reg.terminals[&id].labels.get("herdr.status").map(String::as_str), Some("blocked@1"));
+
+    // Automatic query answers must not clear manual status.
+    core.viewer_input(&conn, channel, b"y", true);
+    assert_eq!(core.lock().pty_reg.terminals[&id].labels.get("herdr.status").map(String::as_str), Some("blocked@1"));
+
+    // User keystroke clears herdr.status back to auto.
+    core.viewer_input(&conn, channel, b"y", false);
+    assert!(!core.lock().pty_reg.terminals[&id].labels.contains_key("herdr.status"));
+
+    drop(core);
+    std::fs::remove_dir_all(root).unwrap();
+}

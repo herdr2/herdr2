@@ -1153,6 +1153,7 @@ const CONTEXT_AND_VIEW: &str = r#"  /**
     local_position: Point;
     bounds: import("gpui-shell").ElementBounds;
     modifiers: Modifiers;
+    readonly pressed_button: MouseButton | "back" | "forward" | null;
   }
 
   /**
@@ -2449,6 +2450,19 @@ const BASE: &str = r#"  /** A row. */
   /** A controlled switch. No styling. */
   export const Switch: ComponentType;
   /** Rich HTML or Markdown text. CSS in HTML is not supported. */
+  export interface TextViewThemeOptions {
+    dark?: boolean;
+    foreground?: string;
+    muted?: string;
+    link?: string;
+    selection?: string;
+    code_background?: string;
+    inline_code_foreground?: string;
+    inline_code_background?: string;
+    border?: string;
+    heading?: string;
+    syntax?: Record<string, string>;
+  }
   export interface TextViewElement extends NativeElement {
     /** Overrides TextView's default URL opening and reports the resolved URL. */
     on_link_click(handler: (url: string, cx: Context) => void): this;
@@ -2457,7 +2471,7 @@ const BASE: &str = r#"  /** A row. */
   }
   export const TextView: {
     html(id: string, html: string): TextViewElement;
-    markdown(id: string, markdown: string): TextViewElement;
+    markdown(id: string, markdown: string, options?: TextViewThemeOptions): TextViewElement;
   };
   /**
    * A tab list. It holds no selection of its own — each `Tab` is told whether
@@ -3231,9 +3245,22 @@ const BASE: &str = r#"  /** A row. */
       /** Defaults to false. */
       soft_wrap?: boolean;
       /** Semantic colors: keyword, string, comment, function, type, number,
-       * constant, variable, operator, punctuation, boolean, string.escape.
+       * constant, variable, parameter, property, macro, regexp, tag, attribute,
+       * namespace, operator, punctuation, heading, boolean, string.escape.
        * Values are concrete hex colors; unspecified UI colors follow the theme. */
       syntax?: Record<string, string>;
+      /** Optional editor surface overrides (concrete hex colors). */
+      colors?: {
+        background?: string;
+        foreground?: string;
+        gutter?: string;
+        line_number?: string;
+        active_line?: string;
+        selection?: string;
+        caret?: string;
+        border?: string;
+        invisible?: string;
+      };
     }) => EditorState;
   };
   export const Editor: { new: (state: EditorState) => NativeElement };

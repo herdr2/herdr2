@@ -145,8 +145,25 @@ fn main() {
         Some(bin) => {
             core_bin::use_core(bin);
             match hc::Core::connect() {
-                // One that can't serve this app gets the screen that fixes it.
-                Ok(core) => hc::check(&core.hello).map(|()| core).map_err(setup::Need::Fix),
+                // One that can't serve this app gets the screen that fixes it, after
+                // hot-restarting a stale daemon if the binary on disk already satisfies us.
+                Ok(core) => match hc::check(&core.hello) {
+                    Ok(()) => Ok(core),
+                    Err(hc::Mismatch::TooOld { .. } | hc::Mismatch::Missing(_))
+                        if core_bin::version(&core_bin::path()).is_some_and(|v| hc::meets_core_min(&v)) =>
+                    {
+                        drop(core);
+                        let _ = core_bin::restart();
+                        match hc::Core::connect() {
+                            Ok(restarted) => hc::check(&restarted.hello).map(|()| restarted).map_err(setup::Need::Fix),
+                            Err(e) => {
+                                eprintln!("herdr2: {e:#}");
+                                Err(setup::Need::connection(e))
+                            }
+                        }
+                    }
+                    Err(err) => Err(setup::Need::Fix(err)),
+                },
                 Err(e) => {
                     eprintln!("herdr2: {e:#}");
                     Err(setup::Need::connection(e))

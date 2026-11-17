@@ -215,10 +215,14 @@ pub struct RunParams {
     #[arg(long, value_name = "MODE")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
-    /// Permission policy (`approve-all`, `approve-reads`, `deny-all`, `ask`).
+    /// Permission policy (`approve-all`, `approve-reads`, `deny-all`, `ask`, `dangerously-skip-permissions`).
     #[arg(long, value_name = "MODE")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permissions: Option<PermissionMode>,
+    /// Skip all permission checks (`approve-all` policy plus `bypassPermissions` session mode when supported).
+    #[arg(long = "dangerously-skip-permissions")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dangerously_skip_permissions: bool,
     /// Disable injecting the built-in `herdr2` MCP server into `mcpServers`.
     #[arg(long = "no-mcp")]
     #[serde(default)]
@@ -505,6 +509,10 @@ pub struct WaitParams {
     /// Seconds before it checks in (default: config `wait_timeout`, else 180).
     #[arg(long, value_parser = cli_seconds)]
     pub timeout: Option<f64>,
+    /// Wait indefinitely until status, exit, output, or message (for background runners).
+    #[arg(long)]
+    #[serde(default)]
+    pub no_timeout: bool,
     /// See `agent.send`.
     #[arg(skip)]
     pub caller: Option<String>,
@@ -548,6 +556,23 @@ pub struct ApproveResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub option_id: Option<String>,
     pub outcome: String,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct ConfigParams {
+    /// The agent: `a7`, a name, or `machine/a7`.
+    pub agent: String,
+    /// Option id to set (e.g. `model`, `reasoning_effort`, `fast-mode`, `mode`).
+    #[arg(long = "id", value_name = "ID")]
+    pub config_id: String,
+    /// String option value (for select options such as model, reasoning effort, or mode).
+    #[arg(long, value_name = "VALUE", conflicts_with = "bool_value")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// Boolean option value (`true` or `false`, e.g. for `fast-mode`).
+    #[arg(long = "bool", value_name = "BOOL", conflicts_with = "value", num_args = 1)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bool_value: Option<bool>,
 }
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
@@ -1026,4 +1051,55 @@ pub struct TerminalPutParams {
     pub terminal: String,
     pub name: String,
     pub data: String,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DroveOnParams {
+    /// Another machine; omitted for this core.
+    pub on: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DroveProbeParams {
+    /// Another machine; omitted for this core.
+    pub on: Option<String>,
+    #[serde(default)]
+    pub refresh: bool,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DroveAiTestParams {
+    #[serde(default)]
+    pub on: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DroveMagpieTestParams {
+    #[serde(default)]
+    pub on: Option<String>,
+    #[serde(default)]
+    pub gateway_url: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct DroveWebOpenParams {
+    #[serde(default)]
+    pub on: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default)]
+    pub no_open: bool,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct DroveSubscribeResult {
+    pub channel: u32,
 }

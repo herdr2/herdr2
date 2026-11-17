@@ -2,7 +2,10 @@
 
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout } from "herdr";
+import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout, settings } from "herdr";
+
+const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
+const tr = (en, zh) => (isZh() ? zh : en);
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -53,15 +56,27 @@ const RANK = { blocked: 4, done: 3, working: 2, idle: 1 };
 // A sub-agent without a pane isn't in agents(): its raw word, error counting as
 // blocked. It's never done: it reports to its parent, and the parent's done is the news.
 const kidStatus = (k, listed) => {
+  if (k.manual_status) return k.manual_status;
   const s = listed.get(k.address) ?? k.status;
   return s === "error" ? "blocked" : s === "done" ? "idle" : s;
 };
-const SORTS = [
-  { id: "priority", label: "Priority", icon: "clock" },
-  { id: "grouped", label: "Grouped by space", icon: "layers" },
+const statusLabels = () => ({ idle: tr("Idle", "空闲"), working: tr("Working", "运行中"), blocked: tr("Needs you", "待确认"), done: tr("Done", "已完成") });
+const statusItems = () => [
+  { id: "idle", label: tr("Idle", "空闲") },
+  { id: "working", label: tr("Working", "运行中") },
+  { id: "blocked", label: tr("Needs you", "待确认") },
+  { id: "done", label: tr("Done", "已完成") },
+  { id: "auto", label: tr("Auto detect", "自动识别") },
 ];
-const sortOf = () => SORTS.find((s) => s.id === shared("agents.sort")) ?? SORTS[0];
-const SECTION = { 4: "Needs you", 3: "Done", 2: "Working", 1: "Idle" };
+const sorts = () => [
+  { id: "priority", label: tr("Priority", "按优先级"), icon: "clock" },
+  { id: "grouped", label: tr("Grouped by space", "按工作区分组"), icon: "layers" },
+];
+const sortOf = () => {
+  const list = sorts();
+  return list.find((s) => s.id === shared("agents.sort")) ?? list[0];
+};
+const sectionLabel = (r) => ({ 4: tr("Needs you", "待确认"), 3: tr("Done", "已完成"), 2: tr("Working", "运行中"), 1: tr("Idle", "空闲") }[r]);
 const SECTION_STATUS = { 4: "blocked", 3: "done", 2: "working" };
 
 function duration(ms) {
@@ -78,9 +93,24 @@ function icon(p, size, color) {
   return p.tint ? svg(p.icon).size(size).flex_none().text_color(color) : image(p.icon).w(size).h(size).flex_none();
 }
 
+const trashedList = () => {
+  const v = typeof shared === "function" ? shared("agents.trash") : null;
+  return Array.isArray(v) ? v : [];
+};
+const trashTitle = (it) => {
+  const rawTitle = clean(it.title);
+  const meaningfulTitle = rawTitle && rawTitle !== it.address && rawTitle !== it.program?.name ? rawTitle : null;
+  return it.custom_name || it.name || (it.acp ? meaningfulTitle : null) || it.tab_name || it.program?.name || it.address;
+};
+
 export default class Agents extends View {
   init(_props, cx) {
-    if (props()?.sortMenu) return;
+    if (props()?.sortMenu || props()?.statusMenu || props()?.trashMenu) {
+      this.at = 0;
+      this.handle = cx.focus_handle?.();
+      this.handle?.focus?.();
+      return;
+    }
     this.folded = new Set();
     // Each agent's last state and when it changed (ms), kept across restarts.
     try { this.changed = JSON.parse(localStorage.getItem("changed") ?? "{}"); } catch { this.changed = {}; }
@@ -89,6 +119,9 @@ export default class Agents extends View {
     if (!Array.isArray(this.pendingPins)) this.pendingPins = [];
     if (!this.pendingPins.length) localStorage.removeItem("pins");
     this.migratingPins = new Set();
+    this.hovered = null;
+    this.hoveredSub = null;
+    this.listFocus = cx?.focus_handle?.();
     cx.timer.every(30000, (cx) => cx.notify());
   }
 
@@ -144,8 +177,8 @@ export default class Agents extends View {
       .p(5)
       .bg(t.popover)
       .text_size(12.8)
-      .child(div().px(8).pt(4).pb(6).text_size(11).text_color(t.dim).child("Sort agents"))
-      .children(SORTS.map((s) => h_flex()
+      .child(div().px(8).pt(4).pb(6).text_size(11).text_color(t.dim).child(tr("Sort agents", "排序方式")))
+      .children(sorts().map((s) => h_flex()
         .id(`sort-${s.id}`)
         .h(31)
         .px(8)
@@ -163,13 +196,279 @@ export default class Agents extends View {
         .when(s.id === on, (el) => el.child(svg("mods/workspace-chrome/check.svg").size(14).flex_none().text_color(t.foreground)))));
   }
 
+  statusMenu(t) {
+    const terminal = props()?.terminal;
+    const ag = agents().find((x) => x.address === terminal);
+    const term = terminals().find((x) => x.address === terminal);
+    const manual = ag?.manual_status ?? term?.manual_status ?? null;
+    const active = manual ?? "auto";
+    const items = statusItems();
+    const select = (id) => {
+      if (terminal) run("agent.status", { terminal, status: id });
+      closeOverlay(props()?.overlay);
+    };
+    const glyph = (it) => {
+      if (it.id === "auto") return svg("mods/workspace-chrome/clock.svg").size(14).flex_none().text_color(t.muted);
+      return div().w(14).flex_none().flex().items_center().justify_center().child(this.status(t, { status: it.id }, true));
+    };
+    return v_flex()
+      .id("ag-status-menu")
+      .track_focus(this.handle)
+      .w_full()
+      .p(5)
+      .bg(t.popover)
+      .text_size(12.8)
+      .on_key_down((e, cx) => {
+        if (e.key === "down") this.at = (this.at + 1) % items.length;
+        else if (e.key === "up") this.at = (this.at + items.length - 1) % items.length;
+        else if (e.key === "enter") select(items[this.at]?.id ?? "auto");
+        else if (e.key === "escape") closeOverlay(props()?.overlay);
+        else return;
+        cx.notify();
+      })
+      .child(div().px(8).pt(4).pb(6).text_size(11).text_color(t.dim).child(tr("Agent status", "智能体状态")))
+      .children(items.map((it, i) => {
+        const picked = it.id === active;
+        const hint = it.id === "auto" ? (manual ? "" : tr("Default", "默认")) : picked ? tr("Manual", "手动") : "";
+        return v_flex()
+          .when(it.id === "auto", (el) => el.child(div().mx(7).my(4).h(1).bg(t.border)))
+          .child(
+            h_flex()
+              .id(`st-item-${it.id}`)
+              .h(30)
+              .px(8)
+              .gap(9)
+              .rounded(7)
+              .items_center()
+              .text_color(t.foreground)
+              .cursor_pointer()
+              .when(i === this.at, (el) => el.bg(t.selected ?? t.hover))
+              .hover((el) => el.bg(t.hover))
+              .on_click(() => select(it.id))
+              .child(glyph(it))
+              .child(div().flex_1().child(it.label))
+              .when(Boolean(hint), (el) => el.child(div().text_size(10.5).text_color(t.dim).child(hint)))
+              .when(picked, (el) => el.child(svg("mods/workspace-chrome/check.svg").size(13).flex_none().text_color(t.accent ?? t.foreground))),
+          );
+      }));
+  }
+
+  statusButton(t, addr, a, compact = false) {
+    const label = statusLabels()[a.status] ?? tr("Idle", "空闲");
+    const tip = tr(
+      `Status: ${label}${a.manual_status ? " (manual)" : ""} — click to change`,
+      `状态：${label}${a.manual_status ? "（手动）" : ""} — 点击更改`,
+    );
+    const active = this.hovered === addr || this.hoveredSub === addr || Boolean(a.manual_status);
+    const btn = h_flex()
+      .id(`status-${addr}`)
+      .min_w(24)
+      .h(22)
+      .px(5)
+      .rounded(5)
+      .items_center()
+      .justify_center()
+      .flex_none()
+      .when(active, (el) => el.bg(t.raised).border_1().border_color(a.manual_status ? (t.accent ?? t.border) : t.border))
+      .cursor_pointer()
+      .hover((s) => s.bg(t.raised).border_1().border_color(t.border))
+      .tooltip(tip)
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => {
+        cx.stop_propagation();
+        openOverlay({ mod: "agents", kind: "popup", width: 215, height: 220, props: { statusMenu: true, terminal: addr } });
+      })
+      .child(this.status(t, a, compact));
+    return btn;
+  }
+
   peek(addr) {
     run("terminal.peek", { terminal: addr });
   }
 
+  selectAgent(addr) {
+    if (addr && typeof setShared === "function") setShared("agents.selected", addr);
+  }
+
+  trashMenu(t) {
+    const list = trashedList();
+    const now = Date.now();
+    const overlay = props()?.overlay;
+    const accent = t.accent ?? "#3b82f6";
+    const menuH = list.length === 0 ? 132 : Math.min(340, 52 + list.length * 54);
+    return v_flex()
+      .id("ag-trash-menu")
+      .when(Boolean(this.handle), (el) => el.track_focus(this.handle))
+      .w_full()
+      .h(menuH)
+      .min_h(0)
+      .p(6)
+      .gap(6)
+      .bg(t.popover)
+      .text_size(12.5)
+      .on_key_down((e) => {
+        if (e?.key === "escape" && overlay) closeOverlay(overlay);
+      })
+      .child(
+        h_flex()
+          .px(6)
+          .pt(2)
+          .pb(4)
+          .flex_none()
+          .items_center()
+          .justify_between()
+          .border_b(1)
+          .border_color(t.border)
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .child(svg("mods/workspace-chrome/archive.svg").size(14).flex_none().text_color(t.muted))
+              .child(div().font_semibold().text_color(t.foreground).child(tr(`Recycle Bin (${list.length})`, `智能体回收站 (${list.length})`))),
+          )
+          .when(list.length > 0, (el) =>
+            el.child(
+              div()
+                .id("trash-empty")
+                .px(7)
+                .py(3)
+                .rounded(5)
+                .text_size(11)
+                .text_color(t.dim)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                .on_click((_e, cx) => {
+                  cx.stop_propagation();
+                  run("agent.empty_trash", {});
+                })
+                .child(tr("Empty", "清空")),
+            ),
+          ),
+      )
+      .when(list.length === 0, (el) =>
+        el.child(
+          v_flex()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .px(16)
+            .child(div().text_size(12).text_color(t.dim).child(tr("Recycle bin is empty. Deleted agents can be restored here.", "回收站为空，删除的智能体可在这里恢复。"))),
+        ),
+      )
+      .when(list.length > 0, (el) =>
+        el.child(
+          v_flex()
+            .id("trash-list")
+            .flex_1()
+            .min_h(0)
+            .gap(4)
+            .overflow_y_scrollbar()
+            .children(
+              list.map((it) => {
+                const pic = icon(it.program, 15, t.foreground) ?? svg("mods/workspace-chrome/terminal.svg").size(14).flex_none().text_color(t.muted);
+                const live = Boolean(it.live);
+                const age = it.trashed_at ? duration(Math.max(0, now - it.trashed_at)) : "";
+                const meta = [
+                  it.space_name || it.machine || "",
+                  live ? tr("Live · lossless", "会话存活 · 无损恢复") : tr("Ended · relaunch", "已退出 · 重新启动"),
+                  age,
+                ].filter(Boolean).join(" · ");
+                return h_flex()
+                  .id(`trash-row-${it.address}`)
+                  .h(48)
+                  .px(8)
+                  .gap(8)
+                  .flex_none()
+                  .rounded(7)
+                  .items_center()
+                  .bg(t.raised)
+                  .border_1()
+                  .border_color(t.border)
+                  .child(pic)
+                  .child(
+                    v_flex()
+                      .flex_1()
+                      .min_w(0)
+                      .gap(2)
+                      .child(
+                        h_flex()
+                          .gap(5)
+                          .items_center()
+                          .min_w(0)
+                          .child(div().truncate().text_size(12.5).font_medium().text_color(t.foreground).child(trashTitle(it)))
+                          .child(
+                            div()
+                              .px(4)
+                              .py(1)
+                              .flex_none()
+                              .rounded(4)
+                              .bg(t.hover)
+                              .text_size(9.5)
+                              .text_color(t.dim)
+                              .child(it.acp ? "ACP" : tr("CLI", "终端")),
+                          ),
+                      )
+                      .child(div().truncate().text_size(10.5).text_color(live ? (t.done ?? t.muted) : t.dim).child(meta)),
+                  )
+                  .child(
+                    h_flex()
+                      .gap(4)
+                      .flex_none()
+                      .items_center()
+                      .child(
+                        div()
+                          .id(`trash-restore-${it.address}`)
+                          .px(8)
+                          .h(22)
+                          .flex()
+                          .items_center()
+                          .rounded(5)
+                          .bg(t.selected ?? t.hover)
+                          .border_1()
+                          .border_color(accent)
+                          .text_size(11)
+                          .font_medium()
+                          .text_color(t.foreground)
+                          .cursor_pointer()
+                          .hover((s) => s.bg(t.hover))
+                          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                          .on_click((_e, cx) => {
+                            cx.stop_propagation();
+                            run("agent.restore", { terminal: it.address });
+                            if (overlay) closeOverlay(overlay);
+                          })
+                          .child(tr("Restore", "恢复")),
+                      )
+                      .child(
+                        div()
+                          .id(`trash-purge-${it.address}`)
+                          .size(22)
+                          .flex()
+                          .items_center()
+                          .justify_center()
+                          .rounded(5)
+                          .text_color(t.dim)
+                          .cursor_pointer()
+                          .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                          .tooltip(tr("Delete permanently", "彻底删除"))
+                          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                          .on_click((_e, cx) => {
+                            cx.stop_propagation();
+                            run("agent.purge", { terminal: it.address });
+                          })
+                          .child(svg("mods/pane/close.svg").size(11)),
+                      ),
+                  );
+              }),
+            ),
+        ),
+      );
+  }
+
   // Live sub-agents of `addr`, depth first, each with the tree lines in front of it.
   tree(all, addr, lead = []) {
-    const kids = all.filter((k) => k.parent === addr && k.state === "live");
+    const kids = all.filter((k) => k.parent === addr && k.state === "live" && !k.labels?.["herdr.trashed"]);
     return kids.flatMap((k, i) => {
       const last = i === kids.length - 1;
       return [
@@ -181,6 +480,9 @@ export default class Agents extends View {
 
   subRow(t, s, shown, compact) {
     const k = s.t;
+    const isAcp = Boolean(k.acp);
+    const pane = this.paneByAddr?.get(k.address) ?? null;
+    const canFocusPane = Boolean(pane) || (!isAcp && this.listed.has(k.address));
     const st = kidStatus(k, this.listed);
     const pic = icon(k.program, 14, t.foreground);
     const on = k.address === shown;
@@ -196,13 +498,48 @@ export default class Agents extends View {
       .text_size(12.5)
       .when(on, (el) => el.bg(t.raised))
       .hover((s) => s.bg(t.hover))
-      .on_click(() => (this.listed.has(k.address) ? run("pane.focus", { terminal: k.address }) : this.peek(k.address)))
+      .on_hover((on, cx) => {
+        if (on) this.hoveredSub = k.address;
+        else if (this.hoveredSub === k.address) this.hoveredSub = null;
+        cx.notify();
+      })
+      .on_mouse_down("right", (_e, cx) => {
+        cx.stop_propagation();
+        this.selectAgent(k.address);
+        openOverlay({ mod: "menu", kind: "popup", width: k.acp ? 280 : 220, props: { tab: "agent", target: { terminal: k.address, pane } } });
+      })
+      .on_click(() => {
+        this.selectAgent(k.address);
+        canFocusPane ? run("pane.focus", pane ? { pane } : { terminal: k.address }) : this.peek(k.address);
+      })
       .children(s.lines.map(l => div().self_start().mt(-4).w(9).h(17).mr(4).flex_none()
         .when(Boolean(l), el => el.border_l(1.5).border_color(t.input))
         .when(l === "└" || l === "├", el => el.border_b(1.5).rounded_bl(6))))
       .when(Boolean(pic), el => el.child(div().mr(8).child(pic)))
-      .child(div().flex_1().truncate().text_color(on ? t.foreground : t.muted).child(k.name || k.template || k.program?.name || k.address))
-      .child(this.status(t, { status: st }, compact));
+      .child(div().flex_1().truncate().text_color(on ? t.foreground : t.muted).child(k.labels?.["herdr.name"] || k.labels?.["drove.display"] || k.name || (isAcp && clean(k.title) && clean(k.title) !== k.address && clean(k.title) !== k.program?.name ? clean(k.title) : null) || k.template || k.program?.name || k.address))
+      .when(isAcp, (el) => el.child(div().mr(4).px(4).py(1).rounded(4).bg(t.hover).text_size(9.5).text_color(t.dim).child("ACP")))
+      .when(this.hoveredSub === k.address, (el) =>
+        el.child(
+          div()
+            .id(`rm-sub-${k.address}`)
+            .mr(4)
+            .flex_none()
+            .p(2)
+            .rounded(4)
+            .text_color(t.dim)
+            .cursor_pointer()
+            .hover((s) => s.bg(t.hover).text_color(t.foreground))
+            .tooltip(tr("Move to recycle bin", "移入回收站"))
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              this.hoveredSub = null;
+              run("agent.trash", { terminal: k.address });
+              cx.notify();
+            })
+            .child(svg("mods/pane/close.svg").size(11)),
+        ),
+      )
+      .child(this.statusButton(t, k.address, { status: st, manual_status: k.manual_status }, compact));
   }
 
   // compact: a ! for blocked where a header already says "Needs you".
@@ -210,7 +547,7 @@ export default class Agents extends View {
     const color = t[a.status] ?? t.dim;
     if (a.status === "working") return svg("mods/workspace-chrome/spinner.svg").size(12).mx(1).flex_none().text_color(t.working).spin(900);
     if (a.status === "blocked" && compact) return div().size(14).flex_none().rounded(4).bg(t.blocked + "26").text_size(10.5).font_bold().text_color(t.blocked).flex().items_center().justify_center().child("!");
-    if (a.status === "blocked") return div().flex_none().px(6).h(18).rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).flex().items_center().child("Needs you");
+    if (a.status === "blocked") return div().flex_none().px(6).h(18).rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).flex().items_center().child(tr("Needs you", "待确认"));
     // Idle: a ring; done: a dot.
     if (a.status === "idle") return div().size(7).mx(3).flex_none().rounded(4).border(1.5).border_color(t.idle ?? t.dim);
     return div().size(7).mx(3).flex_none().rounded(4).bg(a.status === "done" ? color : t.dim + "00");
@@ -219,6 +556,9 @@ export default class Agents extends View {
   render(cx) {
     const t = theme();
     if (props()?.sortMenu) return this.sortMenu(t);
+    if (props()?.statusMenu) return this.statusMenu(t);
+    if (props()?.trashMenu) return this.trashMenu(t);
+    const trashed = trashedList();
     const collapsed = narrow();
     const sort = sortOf();
     let list = agents();
@@ -280,9 +620,13 @@ export default class Agents extends View {
     // agent's own title, never an automatic tab number unless two rows would
     // otherwise read the same.
     // Read the pane snapshot once: every host read copies the whole list into JS.
-    const leads = leadPanes(panes());
+    const allPanes = panes();
+    this.paneByAddr = new Map(allPanes.filter((p) => p.terminal && p.pane).map((p) => [p.terminal, p.pane]));
+    const leads = leadPanes(allPanes);
     const tabs = new Map(spaces().flatMap(s => s.tabs).map(tab => [tab.id, tab]));
     const labels = new Map(list.map(a => {
+      const custom = a.custom_name || all.find((x) => x.address === a.address)?.labels?.["herdr.name"];
+      if (custom) return [a.address, custom];
       const tab = tabs.get(a.tab);
       const many = tabCounts.get(a.tab) > 1;
       return [a.address, tab ? title(many ? { ...tab, named: false } : tab, many ? a : leads.get(a.tab)) : (a.title || a.program?.name || "")];
@@ -312,9 +656,17 @@ export default class Agents extends View {
           .gap(4)
           .when(a.focused, (el) => el.bg(t.selected))
           .hover((s) => s.bg(t.hover))
-          .on_click(() => run("pane.focus", { pane: a.pane }))
+          .on_mouse_down("right", (_e, cx) => {
+            cx.stop_propagation();
+            this.selectAgent(a.address);
+            openOverlay({ mod: "menu", kind: "popup", width: a.acp ? 280 : 220, props: { tab: "agent", target: { terminal: a.address, pane: a.pane ?? null } } });
+          })
+          .on_click(() => {
+            this.selectAgent(a.address);
+            a.pane ? run("pane.focus", { pane: a.pane }) : this.peek(a.address);
+          })
           .child(div().flex_1().min_w(0).whitespace_nowrap().text_right().text_color(a.focused ? t.foreground : t.muted).child(String(i + 1)))
-          .child(h_flex().w(14).flex_none().items_center().justify_center().child(this.status(t, a, true)));
+          .child(h_flex().w(18).flex_none().items_center().justify_center().child(this.statusButton(t, a.address, a, true)));
       }
       const when = this.since(a);
       const idle = a.status === "idle" && !a.focused;
@@ -327,7 +679,7 @@ export default class Agents extends View {
         .text_color(t.dim)
         .cursor_pointer()
         .hover((s) => s.bg(t.hover).text_color(t.foreground))
-        .tooltip(isPinned ? "Unpin" : "Pin to the top")
+        .tooltip(isPinned ? tr("Unpin", "取消置顶") : tr("Pin to the top", "置顶"))
         .on_click((_e, cx) => {
           cx.stop_propagation();
           run("terminal.pin", { terminal: a.address, pinned: !isPinned });
@@ -336,6 +688,22 @@ export default class Agents extends View {
           cx.notify();
         })
         .child(svg(`mods/workspace-chrome/${isPinned ? "pin-off" : "pin"}.svg`).size(13));
+      const remove = div()
+        .id(`rm-${a.address}`)
+        .flex_none()
+        .p(2)
+        .rounded(4)
+        .text_color(t.dim)
+        .cursor_pointer()
+        .hover((s) => s.bg(t.hover).text_color(t.foreground))
+        .tooltip(tr("Move to recycle bin", "移入回收站"))
+        .on_click((_e, cx) => {
+          cx.stop_propagation();
+          this.hovered = null;
+          run("agent.trash", { terminal: a.address });
+          cx.notify();
+        })
+        .child(svg("mods/pane/close.svg").size(12));
       // Under a space header the space goes without saying; an automatic tab number says nothing.
       // Without a space header above (priority, pinned) the row names its space.
       const full = byPriority || isPinned;
@@ -356,7 +724,15 @@ export default class Agents extends View {
           else if (this.hovered === a.address) this.hovered = null;
           cx.notify();
         })
-        .on_click(() => run("pane.focus", { pane: a.pane }))
+        .on_mouse_down("right", (_e, cx) => {
+          cx.stop_propagation();
+          this.selectAgent(a.address);
+          openOverlay({ mod: "menu", kind: "popup", width: a.acp ? 280 : 220, props: { tab: "agent", target: { terminal: a.address, pane: a.pane ?? null } } });
+        })
+        .on_click(() => {
+          this.selectAgent(a.address);
+          a.pane ? run("pane.focus", { pane: a.pane }) : this.peek(a.address);
+        })
         .when(Boolean(pic), el => el.child(div().id(`agent-fold-${a.address}`)
           .when(subs.length > 0, el => el.on_click((_e, cx) => {
             cx.stop_propagation();
@@ -366,21 +742,22 @@ export default class Agents extends View {
         .child(h_flex().flex_1().min_w(0).gap(5).items_center()
           .child(div().min_w(0).max_w(full && more ? 120 : 200).truncate().text_color(idle ? t.muted : t.foreground).child(name))
           .when(full && Boolean(more), el => el.child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(`\u00b7 ${more}`))))
+        .when(Boolean(a.acp), el => el.child(div().px(4).py(1).rounded(4).bg(t.hover).text_size(9.5).text_color(t.dim).child("ACP")))
         .when(Boolean(machine), el => el.child(div().text_size(10).text_color(t.dim).child(machine)))
         .when(subs.length > 0, el => el.child(fold(a, subs)))
-        .when(this.hovered === a.address, el => el.child(pin))
+        .when(this.hovered === a.address, el => el.child(pin).child(remove))
         .when(this.hovered !== a.address && Boolean(when), el => el.child(div().flex_none().text_size(11).text_color(t.dim).child(duration(now - when))))
-        .child(this.status(t, a, byPriority && !isPinned));
+        .child(this.statusButton(t, a.address, a, byPriority && !isPinned));
     };
 
     // Groups in list order: spaces (grouped) or priority sections. Agents of a
     // space are next to each other in agents(), so neighbours make a group.
-    const groups = pinned.length ? [{ id: "pinned", label: "Pinned", status: null, members: pinned }] : [];
+    const groups = pinned.length ? [{ id: "pinned", label: tr("Pinned", "已置顶"), status: null, members: pinned }] : [];
     for (const a of rest) {
       const r = rankOf(a) || RANK.idle;
       const id = byPriority ? `sec-${r}` : `sp-${a.space}`;
       if (groups.at(-1)?.id === id) groups.at(-1).members.push(a);
-      else groups.push({ id, label: byPriority ? SECTION[r] : a.space_name || "", status: byPriority ? SECTION_STATUS[r] : null, members: [a] });
+      else groups.push({ id, label: byPriority ? sectionLabel(r) : a.space_name || "", status: byPriority ? SECTION_STATUS[r] : null, members: [a] });
     }
 
     // A group's header; it folds the group. Folded, it says how many and the most urgent state.
@@ -421,6 +798,16 @@ export default class Agents extends View {
       .border_t(1)
       .border_color(t.border)
       .text_size(13)
+      .when(Boolean(this.listFocus), (el) => el.track_focus(this.listFocus))
+      .on_key_down((e, cx) => {
+        if (e?.key === "f2") {
+          const sel = (typeof shared === "function" ? shared("agents.selected") : null) || focused()?.agent;
+          if (sel) {
+            cx?.stop_propagation?.();
+            run("agent.rename", { terminal: sel });
+          }
+        }
+      })
       .when(!collapsed, (el) =>
         el.child(
           h_flex()
@@ -431,37 +818,105 @@ export default class Agents extends View {
             .flex_none()
             .items_center()
             .justify_between()
-            .child(div().text_size(11.5).font_medium().text_color(t.dim).child("Agents"))
+            .child(div().text_size(11.5).font_medium().text_color(t.dim).child(tr("Agents", "智能体")))
             .child(
-              div()
-                .id("ag-sort")
-                .text_size(11)
-                .text_color(t.dim)
-                .hover((s) => s.text_color(t.foreground))
-                .on_click(() => openOverlay({ mod: "agents", kind: "popup", width: 200, height: 140, props: { sortMenu: true } }))
-                .tooltip(`Sort agents: ${sort.label}`)
-                .child(svg(`mods/workspace-chrome/${sort.icon}.svg`).size(14)),
+              h_flex()
+                .gap(6)
+                .items_center()
+                .child(
+                  h_flex()
+                    .id("ag-recycle")
+                    .h(20)
+                    .px(trashed.length > 0 ? 5 : 3)
+                    .gap(4)
+                    .items_center()
+                    .rounded(5)
+                    .text_size(10.5)
+                    .text_color(trashed.length > 0 ? t.muted : t.dim)
+                    .cursor_pointer()
+                    .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                    .on_click(() => openOverlay({ mod: "agents", kind: "popup", width: 360, height: 340, props: { trashMenu: true } }))
+                    .tooltip(trashed.length > 0 ? tr(`Recycle bin (${trashed.length})`, `回收站 (${trashed.length})`) : tr("Recycle bin", "回收站"))
+                    .child(svg("mods/workspace-chrome/archive.svg").size(13))
+                    .when(trashed.length > 0, (el) => el.child(div().font_semibold().text_color(t.foreground).child(String(trashed.length)))),
+                )
+                .child(
+                  div()
+                    .id("ag-sort")
+                    .text_size(11)
+                    .text_color(t.dim)
+                    .hover((s) => s.text_color(t.foreground))
+                    .on_click(() => openOverlay({ mod: "agents", kind: "popup", width: 200, height: 140, props: { sortMenu: true } }))
+                    .tooltip(tr(`Sort agents: ${sort.label}`, `排序：${sort.label}`))
+                    .child(svg(`mods/workspace-chrome/${sort.icon}.svg`).size(14)),
+                ),
             ),
         ),
       )
       .when(list.length === 0 && !collapsed, (el) =>
-        el.child(div().px(12).text_size(12).text_color(t.dim).child("No agent status yet. Agents show up here when they report their status. Older versions and agents inside tmux may not.")),
+        el.child(
+          v_flex()
+            .px(12)
+            .gap(8)
+            .child(div().text_size(12).text_color(t.dim).child(tr("No active agents yet. Headless ACP agents and interactive coding CLIs appear here automatically.", "暂无活跃智能体。后台 ACP 智能体和交互式终端 CLI 会自动显示在这里。")))
+            .when(trashed.length > 0, (el2) =>
+              el2.child(
+                h_flex()
+                  .id("ag-recycle-empty-btn")
+                  .px(8)
+                  .h(26)
+                  .gap(6)
+                  .items_center()
+                  .rounded(6)
+                  .bg(t.raised)
+                  .border_1()
+                  .border_color(t.border)
+                  .text_size(11.5)
+                  .text_color(t.foreground)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.hover))
+                  .on_click(() => openOverlay({ mod: "agents", kind: "popup", width: 360, height: 340, props: { trashMenu: true } }))
+                  .child(svg("mods/workspace-chrome/archive.svg").size(13).text_color(t.muted))
+                  .child(tr(`Recycle bin (${trashed.length} recoverable)`, `打开回收站（${trashed.length} 个可恢复）`)),
+              ),
+            ),
+        ),
       )
       .child(v_flex().id("ag-list").flex_1().min_h(0).px(collapsed ? 0 : 8).overflow_y_scrollbar().mode("always").children(rows))
       .when(collapsed, (el) =>
         el.child(
-          h_flex()
-            .h(28)
+          v_flex()
             .items_center()
-            .justify_center()
+            .gap(4)
+            .pb(4)
+            .when(trashed.length > 0, (el2) =>
+              el2.child(
+                div()
+                  .id("ag-recycle-rail")
+                  .p(4)
+                  .rounded(5)
+                  .text_color(t.muted)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                  .tooltip(tr(`Recycle bin (${trashed.length})`, `回收站 (${trashed.length})`))
+                  .on_click(() => openOverlay({ mod: "agents", kind: "popup", width: 360, height: 340, props: { trashMenu: true } }))
+                  .child(svg("mods/workspace-chrome/archive.svg").size(13)),
+              ),
+            )
             .child(
-              div()
-                .id("collapse")
-                .text_size(13)
-                .text_color(t.dim)
-                .hover((s) => s.text_color(t.foreground))
-                .on_click(toggleSidebar)
-                .child("»"),
+              h_flex()
+                .h(24)
+                .items_center()
+                .justify_center()
+                .child(
+                  div()
+                    .id("collapse")
+                    .text_size(13)
+                    .text_color(t.dim)
+                    .hover((s) => s.text_color(t.foreground))
+                    .on_click(toggleSidebar)
+                    .child("»"),
+                ),
             ),
         ),
       );

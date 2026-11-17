@@ -339,6 +339,50 @@ fn find<'a>(t: &'a Table, name: &str) -> Option<(&'a str, &'a Entry)> {
     }
 }
 
+fn is_agent_entry(key: &str, e: &Entry) -> bool {
+    !e.run.is_empty() || key == "agent"
+}
+
+fn find_agent_segment<'a>(t: &'a Table, seg: &str) -> Option<(&'a str, &'a Entry)> {
+    let seg = [".exe", ".cmd", ".bat", ".ps1", ".js", ".mjs", ".cjs", ".ts", ".py", ".rb"]
+        .iter()
+        .find_map(|ext| seg.strip_suffix(ext))
+        .unwrap_or(seg);
+    let trimmed = seg.strip_suffix("-cli").or_else(|| seg.strip_suffix("-ai"));
+    for candidate in std::iter::once(seg).chain(trimmed) {
+        if let Some((key, e)) = find(t, candidate).filter(|(k, e)| is_agent_entry(k, e)) {
+            return Some((key, e));
+        }
+    }
+    None
+}
+
+fn find_agent_in_path<'a>(t: &'a Table, path: &str) -> Option<(&'a str, &'a Entry)> {
+    let segs: Vec<&str> = path.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+    let last = *segs.last()?;
+    if let Some(hit) = find_agent_segment(t, last) {
+        return Some(hit);
+    }
+    if segs.len() >= 3 && segs[segs.len() - 2].eq_ignore_ascii_case("versions")
+        && let Some(hit) = find_agent_segment(t, segs[segs.len() - 3])
+    {
+        return Some(hit);
+    }
+    let last_stem = [".js", ".mjs", ".cjs", ".ts", ".py", ".rb"].iter().find_map(|ext| last.strip_suffix(ext)).unwrap_or(last);
+    let generic_entry = matches!(last_stem.to_ascii_lowercase().as_str(), "cli" | "index" | "main" | "run" | "bin");
+    for (i, seg) in segs[..segs.len().saturating_sub(1)].iter().enumerate().rev() {
+        if seg.starts_with('@') || matches!(seg.to_ascii_lowercase().as_str(), "bin" | "dist" | "build" | "lib" | "src" | "node_modules") {
+            continue;
+        }
+        let in_node_modules = segs[..i].iter().any(|s| *s == "node_modules" || s.starts_with('@'));
+        let near_generic_entry = generic_entry && segs.len().saturating_sub(i) <= 3;
+        if (in_node_modules || near_generic_entry) && let Some(hit) = find_agent_segment(t, seg) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
 fn resolve(t: &Table, app: Option<&str>, argv: &[String]) -> Value {
     if let Some(app) = app.filter(|a| !a.is_empty()) {
         return match find(t, app) {
@@ -356,12 +400,12 @@ fn resolve(t: &Table, app: Option<&str>, argv: &[String]) -> Value {
     {
         return resolve(t, None, &argv[4..]);
     }
-    // On Windows: `pwsh -NoExit -Command "& 'codex' ..."`.
-    if argv.len() == 4
+    // On Windows: `pwsh [-NoLogo] [-ExecutionPolicy Bypass] -NoExit -Command "& 'codex' ..."`.
+    if argv.len() >= 4
         && t.shells.iter().any(|s| s == base(&argv[0]))
-        && argv[1] == "-NoExit"
-        && argv[2] == "-Command"
-        && let Some(words) = powershell_words(&argv[3])
+        && argv[1..argv.len() - 2].iter().any(|a| a.eq_ignore_ascii_case("-NoExit"))
+        && argv[argv.len() - 2].eq_ignore_ascii_case("-Command")
+        && let Some(words) = powershell_words(&argv[argv.len() - 1])
     {
         return resolve(t, None, &words);
     }
@@ -375,12 +419,23 @@ fn resolve(t: &Table, app: Option<&str>, argv: &[String]) -> Value {
             let name = base(arg);
             let stem = [".js", ".mjs", ".cjs", ".ts", ".py", ".rb"].iter().find_map(|x| name.strip_suffix(x)).unwrap_or(name);
             if let Some((key, e)) = find(t, stem).filter(|(k, _)| !t.interpreters.iter().any(|i| i == k)) {
-                return shown(key, e, None, false, false);
+                return shown(key, e, None, false, is_agent_entry(key, e));
+            }
+            if (arg.contains('/') || arg.contains('\\'))
+                && let Some((key, e)) = find_agent_in_path(t, arg)
+            {
+                return shown(key, e, None, false, true);
             }
         }
     }
     if let Some((key, e)) = find(t, first) {
-        return shown(key, e, None, false, false);
+        return shown(key, e, None, false, is_agent_entry(key, e));
+    }
+    if !t.shells.iter().any(|s| s == first)
+        && (argv[0].contains('/') || argv[0].contains('\\'))
+        && let Some((key, e)) = find_agent_in_path(t, &argv[0])
+    {
+        return shown(key, e, None, false, true);
     }
     if t.shells.iter().any(|s| s == first) {
         return shown("shell", t.programs.get("shell").unwrap_or(&Entry::default()), Some(first), true, false);
@@ -459,7 +514,11 @@ mod tests {
         assert_eq!(key(Some("agent"), &[]), "cursor");
         assert_eq!(key(Some("cursor-agent"), &[]), "cursor");
         assert_eq!(key(Some("newagent"), &[]), "agent");
-        assert!(startable().iter().any(|a| a["key"] == "cursor" && a["run"] == json!(["agent"])));
+        assert!(startable().iter().any(|a| a["key"] == "cursor" && a["run"] == json!(["cursor-agent", "--yolo", "--trust"])));
+        assert!(startable().iter().any(|a| a["key"] == "claude" && a["run"] == json!(["claude", "--dangerously-skip-permissions"])));
+        assert!(startable().iter().any(|a| a["key"] == "codex" && a["run"] == json!(["codex", "--no-daemon", "--dangerously-bypass-approvals-and-sandbox"])));
+        assert!(startable().iter().any(|a| a["key"] == "opencode" && a["run"] == json!(["opencode", "--auto"])));
+        assert!(startable().iter().any(|a| a["key"] == "gemini" && a["run"] == json!(["gemini", "--yolo"])));
         // A person's own key still beats a built-in `match` (python matches python3).
         let mut personal = t();
         personal.programs.insert(
@@ -488,6 +547,30 @@ mod tests {
         assert_eq!(key(None, &[r"C:\Program Files\PowerShell\7\pwsh.exe", "-NoExit", "-Command", &line]), "codex");
         assert_eq!(key(None, &[r"C:\Program Files\PowerShell\7\pwsh.exe"]), "shell");
         assert_eq!(key(None, &[r"C:\Windows\powershell.exe"]), "shell");
+
+        let is_agent = |argv: &[&str]| {
+            let argv: Vec<String> = argv.iter().map(|s| s.to_string()).collect();
+            resolve(&t(), None, &argv)["agent"].as_bool().unwrap()
+        };
+        assert!(is_agent(&["claude"]));
+        assert!(is_agent(&["codex"]));
+        assert!(is_agent(&["opencode"]));
+        assert!(is_agent(&["agent"]));
+        assert!(!is_agent(&["vim"]));
+        assert!(!is_agent(&["/bin/zsh"]));
+        assert_eq!(key(None, &["node", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"]), "claude");
+        assert!(is_agent(&["node", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"]));
+        assert_eq!(key(None, &[r"C:\Program Files\nodejs\node.exe", r"C:\Users\u\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js"]), "codex");
+        assert_eq!(key(None, &["node", "/usr/lib/node_modules/@google/gemini-cli/bundle/gemini.js"]), "gemini");
+        assert_eq!(key(None, &["/home/u/.local/share/claude/versions/2.1.325"]), "claude");
+        assert!(is_agent(&["/home/u/.local/share/claude/versions/2.1.325"]));
+        assert_eq!(key(None, &[r"C:\Users\u\AppData\Roaming\npm\codex.cmd"]), "codex");
+        assert_eq!(key(None, &["node", "/home/pi/server.js"]), "node");
+        assert_eq!(
+            key(None, &["powershell.exe", "-ExecutionPolicy", "Bypass", "-NoExit", "-Command", "& 'claude' '--dangerously-skip-permissions'"]),
+            "claude"
+        );
+        assert!(is_agent(&["powershell.exe", "-ExecutionPolicy", "Bypass", "-NoExit", "-Command", "& 'claude' '--dangerously-skip-permissions'"]));
     }
 
     #[cfg(unix)]

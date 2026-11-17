@@ -1107,11 +1107,85 @@ fn materialize_component(
             )
         }
         Component::TextView(spec) => {
+            let mut tv_style = TextViewStyle::from_theme(&Theme::global(cx));
+            let mut syntax_spec: Option<std::collections::BTreeMap<String, String>> = None;
+
+            if let Some(theme_spec) = spec.theme.as_ref() {
+                let parse_color = |raw: &Option<String>| -> Option<gpui::Hsla> {
+                    raw.as_ref()
+                        .and_then(|s| Bridged::Str(s.clone()).as_color().ok())
+                };
+                if let Some(dark) = theme_spec.dark {
+                    tv_style = tv_style.with_dark(dark);
+                }
+                let custom_fg = parse_color(&theme_spec.foreground);
+                if let Some(fg) = custom_fg {
+                    tv_style = tv_style.with_foreground(fg);
+                }
+                if let Some(muted) = parse_color(&theme_spec.muted) {
+                    tv_style = tv_style.with_muted_foreground(muted);
+                }
+                if let Some(link) = parse_color(&theme_spec.link) {
+                    tv_style = tv_style.with_link(link);
+                }
+                if let Some(selection) = parse_color(&theme_spec.selection) {
+                    tv_style = tv_style.with_selection(selection);
+                }
+                let custom_code_bg = parse_color(&theme_spec.code_background);
+                if let Some(code_bg) = custom_code_bg {
+                    tv_style = tv_style.with_code_background(code_bg);
+                }
+                if let Some(border) = parse_color(&theme_spec.border) {
+                    tv_style = tv_style.with_border(border);
+                }
+                if theme_spec.inline_code_background.is_some()
+                    || theme_spec.inline_code_foreground.is_some()
+                    || custom_code_bg.is_some()
+                {
+                    let mut inline = tv_style.inline_code();
+                    if let Some(bg) = parse_color(&theme_spec.inline_code_background).or(custom_code_bg)
+                    {
+                        inline.background_color = Some(bg);
+                    }
+                    if let Some(fg) = parse_color(&theme_spec.inline_code_foreground) {
+                        inline.color = Some(fg);
+                    }
+                    tv_style = tv_style.with_inline_code(inline);
+                }
+                if let Some(heading_fg) = parse_color(&theme_spec.heading) {
+                    tv_style = tv_style.with_heading(move |_| {
+                        StyleRefinement::default().text_color(heading_fg)
+                    });
+                }
+                if custom_code_bg.is_some() || custom_fg.is_some() {
+                    let mut table_head = StyleRefinement::default();
+                    if let Some(bg) = custom_code_bg {
+                        table_head = table_head.bg(bg);
+                    }
+                    if let Some(fg) = custom_fg {
+                        table_head = table_head.text_color(fg);
+                    }
+                    tv_style = tv_style
+                        .with_table(StyleRefinement::default().bg(gpui::transparent_black()))
+                        .with_table_head(table_head);
+                }
+                if !theme_spec.syntax.is_empty() {
+                    syntax_spec = Some(theme_spec.syntax.clone());
+                }
+            }
+
             let mut view = match spec.format {
                 crate::spec::TextViewFormat::Html => TextView::html(spec.id, spec.text),
                 crate::spec::TextViewFormat::Markdown => TextView::markdown(spec.id, spec.text),
             }
-            .style(TextViewStyle::from_theme(&Theme::global(cx)));
+            .style(tv_style);
+            if matches!(spec.format, crate::spec::TextViewFormat::Markdown)
+                && let Some(syntax_map) = syntax_spec
+            {
+                view = view.shared_code_block_highlighter(cached_code_block_highlighter(
+                    syntax_map,
+                ));
+            }
             if let Some(selectable) = behavior.selectable {
                 view = view.selectable(selectable);
             }
@@ -1639,6 +1713,49 @@ fn materializes_slots(component: &Component, behavior: &Behavior) -> bool {
     // content needs a per-slot predicate and, for the uncontrolled case, an
     // open state this side does not hold — base owns it.
     !matches!(component, Component::Collapsible) || behavior.open.unwrap_or(false)
+}
+
+type SharedCodeBlockHighlighter = std::sync::Arc<
+    dyn Fn(&gpui_base::text::CodeBlock) -> Vec<(std::ops::Range<usize>, gpui::HighlightStyle)>
+        + Send
+        + Sync,
+>;
+
+fn cached_code_block_highlighter(
+    syntax_map: std::collections::BTreeMap<String, String>,
+) -> SharedCodeBlockHighlighter {
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::{Arc, LazyLock, Mutex};
+
+    static CACHE: LazyLock<Mutex<HashMap<BTreeMap<String, String>, SharedCodeBlockHighlighter>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    if let Ok(guard) = CACHE.lock()
+        && let Some(existing) = guard.get(&syntax_map)
+    {
+        return existing.clone();
+    }
+
+    let mut colors = HashMap::new();
+    for (name, hex) in &syntax_map {
+        if let Ok(color) = Bridged::Str(hex.clone()).as_color() {
+            colors.insert(name.clone(), color);
+        }
+    }
+    let styles = Arc::new(crate::syntax::SyntaxStyles(colors));
+    let highlighter: SharedCodeBlockHighlighter = Arc::new(move |block| {
+        let lang = block.lang();
+        let code = block.code();
+        crate::syntax::highlight_code(lang.as_deref(), code.as_ref(), &styles)
+    });
+
+    if let Ok(mut guard) = CACHE.lock() {
+        if guard.len() >= 32 {
+            guard.clear();
+        }
+        guard.insert(syntax_map, highlighter.clone());
+    }
+    highlighter
 }
 
 fn finish<E>(mut element: E, refinement: StyleRefinement, children: Children) -> AnyElement

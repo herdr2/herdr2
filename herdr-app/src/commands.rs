@@ -39,12 +39,15 @@ pub const COMMANDS: &[Command] = &[
     cmd("tab.close", &[opt("id"), opt("confirmed")], "Close a tab and end its terminals."),
     cmd("tab.rename", &[opt("id"), opt("name")], "Rename a tab (asks the person when no name; an empty name: called by its number again)."),
     cmd("tab.move", &[opt("id"), opt("index"), opt("by")], "Move a tab (the active one if no id) to a position in its space (1 = first), or `by` places left (-) or right (+), wrapping."),
+    cmd("tab.merge", &[req("source"), req("target"), opt("direction")], "Merge all panes of the source tab beside the target tab's panes (direction: \"right\", default, \"left\", \"down\" or \"up\"), removing the source tab and selecting the target tab."),
     cmd("pane.split", &[req("direction"), opt("pane"), opt("argv"), opt("mod"), opt("props")], "Split a pane (default: the focused one) \"right\" or \"down\" with a new terminal, or with a mod (`mod`, its `props`) beside it."),
     cmd("pane.close", &[opt("pane")], "Close a pane and end its terminal."),
+    cmd("pane.detach", &[opt("pane")], "Move a pane (default: the focused one) out of a split tab into its own tab beside it and select it."),
     cmd("terminal.open", &[opt("argv"), opt("folder"), opt("place"), opt("name")], "Start a terminal: as a new tab (place \"tab\", default), or \"right\"/\"down\" of the focused pane."),
     cmd("terminal.keep", &[req("terminal"), opt("place")], "Give a running terminal without a pane (a sub-agent) a pane: a new tab, or \"right\"/\"down\"."),
     cmd("terminal.park", &[req("terminal")], "Take a terminal's pane away and disable core keep; it keeps running (a sub-agent shows under its parent again)."),
     cmd("terminal.right_click", &[req("to"), opt("terminal")], "Where right-clicks in a terminal (default: the focused one) go when its program takes the mouse: \"program\" or \"menu\" (Herdr2's, the default). Shift+right-click is always the menu."),
+    cmd("terminal.view", &[req("view"), opt("terminal"), opt("tab")], "Switch how a terminal displays in its tab pane: \"peek\" (structured conversation view, like ACP), \"terminal\" (terminal grid), or \"toggle\". Targets terminal, all non-ACP terminals in tab, or the focused terminal."),
     cmd("terminal.pin", &[req("terminal"), req("pinned")], "Pin an agent to the top of the agent lists (pinned true) or unpin it (false). Pins are kept with the terminal, so every Herdr2 client shows them, and end with it."),
     cmd("terminal.kill", &[req("terminal")], "End a terminal and its sub-agents."),
     // What you see.
@@ -72,6 +75,12 @@ pub const COMMANDS: &[Command] = &[
     cmd("terminal.paste_image", &[], "Ctrl+V: the clipboard's image as a file on the focused terminal's machine, when that's another one; on Windows, paste clipboard text; otherwise Ctrl+V goes to the terminal."),
     cmd("terminal.search", &[], "Search the focused terminal's screen and scrollback; the find bar and query stay with that terminal."),
     cmd("agent.focus", &[req("terminal")], "Show an agent (sub-agents too)."),
+    cmd("agent.rename", &[opt("terminal"), opt("name")], "Rename an agent (asks the person when no name; an empty name returns to its automatic label; default target: the focused or shown agent)."),
+    cmd("agent.trash", &[opt("terminal")], "Move an agent (default: the focused or selected agent) to the recycle bin, closing its pane while preserving its session so it can be restored."),
+    cmd("agent.restore", &[req("terminal")], "Restore a deleted agent from the recycle bin back into its space and tab."),
+    cmd("agent.purge", &[req("terminal")], "Permanently delete an agent from the recycle bin and end its session."),
+    cmd("agent.empty_trash", &[], "Permanently delete all agents in the recycle bin."),
+    cmd("agent.status", &[req("status"), opt("terminal")], "Set an agent's status manually (\"idle\", \"working\", \"blocked\", \"done\"), or \"auto\" to return to automatic detection (default target: the focused terminal or shown agent)."),
     cmd("agent.next", &[], "Show the next agent, in the order the agents list shows them."),
     cmd("agent.prev", &[], "Show the previous agent."),
     cmd("layout.switch", &[opt("name")], "Show a layout (layouts/<name>.json), or the next one."),
@@ -92,11 +101,12 @@ pub const COMMANDS: &[Command] = &[
     cmd("app.whats_new", &[], "Show what this release brought (it opens once by itself after an update)."),
     cmd("app.feedback", &[opt("message"), opt("from")], "Draft feedback for the person to review and send (from: person or agent)."),
     cmd("app.palette", &[], "Toggle the command palette: every command by name, with its key; calling again closes it."),
-    cmd("app.settings", &[opt("section")], "Open the settings (section: look, alerts, updates)."),
+    cmd("app.settings", &[opt("section")], "Open the settings (section: look, machines, drove, alerts, updates, privacy)."),
     cmd("app.check_updates", &[], "Look for a newer Herdr2 and herdr2-core now."),
     cmd("app.update_core", &[], "Update herdr2-core to its latest release of this generation; terminals keep running."),
     cmd("app.reset", &[], "The escape hatch: set the shown layout and keys aside, back to the default screen."),
     cmd("app.theme", &[req("name")], "Use a theme (a preset or themes/<name>.json)."),
+    cmd("app.language", &[req("language")], "Set the interface language (\"en\" or \"zh-CN\")."),
     cmd("app.zoom_in", &[], "Make everything bigger."),
     cmd("app.zoom_out", &[], "Make everything smaller."),
     cmd("app.zoom_reset", &[], "Back to normal size."),
@@ -137,7 +147,7 @@ pub fn validate_args(c: &Command, args: &Value) -> Result<(), String> {
                 return Err(format!("{}: unknown argument(s): {}; valid arguments: {valid}", c.name, unknown.join(", ")));
             }
             for (key, value) in args {
-                if matches!(key.as_str(), "id" | "pane" | "space" | "terminal" | "target") && !value.is_string() && !value.is_null() {
+                if matches!(key.as_str(), "id" | "pane" | "space" | "terminal" | "target" | "source") && !value.is_string() && !value.is_null() {
                     return Err(format!("{}: argument {key} must be a string (or null to omit it)", c.name));
                 }
             }
@@ -202,7 +212,7 @@ mod tests {
 
     #[test]
     fn malformed_targets_cannot_fall_back_to_the_current_work() {
-        for (name, arg) in [("tab.close", "id"), ("pane.close", "pane"), ("space.close", "id"), ("tab.new", "space"), ("terminal.show", "terminal"), ("pane.swap", "pane"), ("pane.swap", "target")] {
+        for (name, arg) in [("tab.close", "id"), ("pane.close", "pane"), ("pane.detach", "pane"), ("space.close", "id"), ("tab.new", "space"), ("terminal.show", "terminal"), ("pane.swap", "pane"), ("pane.swap", "target")] {
             let c = find(name).unwrap();
             for value in [json!(123), json!(false), json!([]), json!({"id": "target"})] {
                 let error = validate_args(c, &json!({arg: value})).unwrap_err();

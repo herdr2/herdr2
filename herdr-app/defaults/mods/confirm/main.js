@@ -4,7 +4,10 @@
 
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { run, props, closeOverlay, theme } from "herdr";
+import { run, props, closeOverlay, theme, settings } from "herdr";
+
+const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
+const tr = (en, zh) => (isZh() ? zh : en);
 
 export default class Confirm extends View {
   init(_props, cx) {
@@ -39,15 +42,15 @@ export default class Confirm extends View {
       .rounded(8)
       .bg(t.popover)
       .text_size(13)
-      .child(h_flex().items_center().child(div().flex_1().text_size(15).font_semibold().text_color(t.foreground).child(p.title ?? "Are you sure?")).child(div().text_size(11).text_color(t.dim).child("Esc")))
+      .child(h_flex().items_center().child(div().flex_1().text_size(15).font_semibold().text_color(t.foreground).child(p.title ?? tr("Are you sure?", "确认执行？"))).child(div().text_size(11).text_color(t.dim).child("Esc")))
       .child(div().flex_1().min_h(0).overflow_y_scrollbar().text_color(t.muted).child(p.detail ?? ""))
       .child(
         h_flex()
           .justify_end()
           .gap(8)
           .text_size(12)
-          .child(button("no", "Cancel", t.raised, t.foreground, () => closeOverlay(props().overlay)))
-          .child(button("yes", "Confirm", t.solid, t.solid_foreground, () => this.yes())),
+          .child(button("no", tr("Cancel", "取消"), t.raised, t.foreground, () => closeOverlay(props().overlay)))
+          .child(button("yes", tr("Confirm", "确认"), t.solid, t.solid_foreground, () => this.yes())),
       );
   }
 }

@@ -2,37 +2,78 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, InputState, Input, Popup } from "gpui-base";
-import { hc, run, theme, themes, fonts, updates, telemetry, settings, layouts, shared, appHome, readTextFile, writeTextFile, playSound, props, closeOverlay, notify, window } from "herdr";
+import { hc, run, theme, themes, fonts, updates, telemetry, settings, layouts, layout, spaces, shared, setShared, appHome, readTextFile, writeTextFile, playSound, props, closeOverlay, notify, window, checking } from "herdr";
 
 const I = (name) => `frame/settings/${name}.svg`;
 
-const SECTIONS = [
-  { id: "look", title: "Look", icon: "palette" },
-  ...(window()?.platform === "macos" ? [{ id: "keyboard", title: "Keyboard", icon: "keyboard" }] : []),
-  { id: "machines", title: "Machines", icon: "server" },
-  { id: "alerts", title: "Alerts", icon: "bell" },
-  { id: "updates", title: "Updates", icon: "refresh" },
-  { id: "privacy", title: "Privacy", icon: "shield" },
+const SECTIONS = () => [
+  { id: "look", title: "Look", zh: "外观", icon: "palette" },
+  ...(window()?.platform === "macos" ? [{ id: "keyboard", title: "Keyboard", zh: "键盘", icon: "keyboard" }] : []),
+  { id: "machines", title: "Machines", zh: "主机", icon: "server" },
+  { id: "drove", title: "Drove", zh: "编队", icon: "layers" },
+  { id: "alerts", title: "Alerts", zh: "提醒", icon: "bell" },
+  { id: "updates", title: "Updates", zh: "更新", icon: "refresh" },
+  { id: "privacy", title: "Privacy", zh: "隐私", icon: "shield" },
 ];
 
-const LOOKS = { main: "Herdr", terminals: "Terminals", win98: "Herdr 98" };
+const DROVE_BUILTIN_ROLES = ["coder", "tester", "writer", "reviewer", "researcher"];
+const DROVE_FALLBACK_AGENTS = ["claude", "codex", "agy", "gemini", "opencode", "qoder", "cursor", "kimi", "dsh"];
+const DROVE_EFFORTS = ["low", "medium", "high", "xhigh"];
+const DROVE_AGENT_ICONS = {
+  agy: { path: "icons/antigravity.svg", tint: false },
+  antigravity: { path: "icons/antigravity.svg", tint: false },
+  claude: { path: "icons/claude.svg", tint: false },
+  codex: { path: "icons/codex.svg", tint: false },
+  gemini: { path: "icons/gemini.svg", tint: true },
+  opencode: { path: "icons/opencode.svg", tint: true },
+  cursor: { path: "icons/cursor.svg", tint: true },
+  "cursor-agent": { path: "icons/cursor.svg", tint: true },
+  kimi: { path: "icons/kimi.svg", tint: false },
+  qoder: { path: "icons/qoder.svg", tint: true },
+  dsh: { path: "icons/dsh-tui.svg", tint: true },
+  copilot: { path: "icons/copilot.svg", tint: true },
+  hermes: { path: "icons/hermes.svg", tint: true },
+  pi: { path: "icons/pi.svg", tint: true },
+  zcode: { path: "icons/agent.svg", tint: true },
+  glm: { path: "icons/agent.svg", tint: true },
+};
+
+const LOOKS = { main: "Herdr2", terminals: "Terminals", win98: "Herdr 98" };
+const PANELS = [
+  ["files", "Files", "文件", "The folder you're in as a tree, with highlighted file preview.", "以树形结构浏览当前目录，支持语法高亮只读预览。"],
+  ["changes", "Changes", "变更", "Every file changed in git, its diff, and a commit box.", "查看 Git 工作区改动、逐行 diff 并直接提交。"],
+];
 const APPEARANCES = [
-  [null, "System"],
-  ["light", "Light"],
-  ["dark", "Dark"],
+  [null, "System", "跟随系统"],
+  ["light", "Light", "浅色"],
+  ["dark", "Dark", "深色"],
+];
+const LANGUAGES = [
+  ["en", "English"],
+  ["zh-CN", "简体中文"],
 ];
 
 // What the app uses when settings.json names no font (settings.rs).
 const DEFAULT_FONT = "JetBrains Mono";
 const DEFAULT_UI_FONT = "Geist";
+const fmtVer = (v) => (v ? `v${String(v).replace(/^v/i, "")}` : "");
 
 export default class Settings extends View {
+  lang() {
+    const raw = (typeof settings === "function" ? settings()?.language : undefined) ?? this.person?.language ?? "en";
+    return String(raw).toLowerCase().startsWith("zh") ? "zh-CN" : "en";
+  }
+
+  tr(en, zh) {
+    return this.lang() === "zh-CN" ? zh : en;
+  }
+
   init(_props, cx) {
     const asked = props()?.section;
-    this.section = SECTIONS.some((s) => s.id === asked) ? asked : "look";
+    this.section = SECTIONS().some((s) => s.id === asked) ? asked : "look";
     this.picking = null; // "font" | "ui_font" while its list is open
     this.filter = "";
-    this.fontInput = InputState.new({ placeholder: "Type to search fonts" });
+    this.fontInput = InputState.new({ placeholder: this.tr("Type to search fonts", "输入字体名称搜索") });
     this.fontInput.on("change", (_e, cx) => { this.filter = this.fontInput.value(); cx.notify(); });
     this.renameInput = InputState.new();
     this.renameInput.on("focus", (_e, cx) => { this.renameFocused = true; cx.notify(); });
@@ -54,11 +95,55 @@ export default class Settings extends View {
     this.machineResults = {};
     this.machineEdit = null;
     this.machineNotice = null;
+    const activeSpaceMachine = typeof spaces === "function" ? (spaces()?.find((s) => s.active)?.machine ?? null) : null;
+    this.droveMachine = activeSpaceMachine || null;
+    this.droveData = null;
+    this.droveLoading = false;
+    this.droveSaving = false;
+    this.droveProbing = false;
+    this.droveAutoProbed = {};
+    this.droveAiTesting = false;
+    this.droveMagpieTesting = false;
+    this.droveError = null;
+    this.droveTestResult = null;
+    this.droveMagpieResult = null;
+    this.droveKeyDirty = false;
+    this.droveShowAddRole = false;
+    this.droveModelFilter = "";
+    this.droveModelSubmit = null;
+    this.droveModelInput = InputState.new({ placeholder: this.tr("Search or enter custom model ID…", "搜索或输入自定义模型 ID…") });
+    this.droveModelInput.on("change", (_e, cx) => {
+      this.droveModelFilter = this.droveModelInput.value();
+      cx.notify();
+    });
+    this.droveModelInput.on("submit", (_e, cx) => {
+      const custom = this.droveModelInput.value().trim();
+      if (custom && this.droveModelSubmit) {
+        const cb = this.droveModelSubmit;
+        this.picking = null;
+        this.droveModelSubmit = null;
+        this.handle.focus();
+        cb(custom, cx);
+      }
+    });
+    this.droveUrlInput = InputState.new({ placeholder: "https://api.example.com/v1" });
+    this.droveKeyInput = InputState.new({ placeholder: this.tr("API key (stored in 0600 ai.key)", "API Key（保存在 0600 ai.key）") });
+    this.droveKeyInput.set_masked?.(true);
+    this.droveKeyInput.on("change", () => { this.droveKeyDirty = true; });
+    this.droveMagpieUrlInput = InputState.new({ placeholder: "http://127.0.0.1:3425" });
+    this.droveNewRoleInput = InputState.new({ placeholder: this.tr("New role id (e.g. architect)", "新角色 ID（如 architect）") });
     this.handle = cx.focus_handle();
     this.handle.focus();
     cx.spawn(async (cx) => {
       await this.load();
-      if (this.section === "machines") await this.loadMachines();
+      if (!(typeof checking === "function" && checking())) {
+        if (this.section === "machines") await this.loadMachines();
+        if (this.section === "drove") {
+          await this.loadMachines();
+          await this.loadDrove();
+          this.maybeAutoProbeDrove(cx);
+        }
+      }
       cx.notify();
     });
     // After "Check now": follow the look (the answer comes from the app), then
@@ -320,6 +405,38 @@ export default class Settings extends View {
       );
   }
 
+  languagePicker(t, cx) {
+    const now = this.lang();
+    return h_flex()
+      .p(2)
+      .gap(2)
+      .rounded(8)
+      .border_1()
+      .border_color(t.border)
+      .bg(t.background)
+      .children(
+        LANGUAGES.map(([value, label]) =>
+          div()
+            .id(`st-lang-${value}`)
+            .px(12)
+            .py(4)
+            .rounded(6)
+            .text_size(13)
+            .cursor_pointer()
+            .when(now === value, (el) => el.bg(t.raised).text_color(t.foreground).border_1().border_color(t.border))
+            .when(now !== value, (el) => el.text_color(t.muted).hover((s) => s.text_color(t.foreground)))
+            .on_click((_e, cx) => {
+              this.person = { ...this.person };
+              if (value === "en") delete this.person.language;
+              else this.person.language = value;
+              run("app.language", { language: value });
+              cx.notify();
+            })
+            .child(label),
+        ),
+      );
+  }
+
   appearancePicker(t, cx) {
     const now = this.person.appearance ?? null;
     return h_flex()
@@ -330,7 +447,7 @@ export default class Settings extends View {
       .border_color(t.border)
       .bg(t.background)
       .children(
-        APPEARANCES.map(([value, label]) =>
+        APPEARANCES.map(([value, label, zh]) =>
           div()
             .id(`st-ap-${label}`)
             .px(12)
@@ -346,7 +463,7 @@ export default class Settings extends View {
                 else p.appearance = value;
               }, cx),
             )
-            .child(label),
+            .child(this.tr(label, zh)),
         ),
       );
   }
@@ -484,9 +601,34 @@ export default class Settings extends View {
           .h(200)
           .p(4)
           .overflow_y_scrollbar()
-          .when(!q, (el) => el.child(item(`st-fd-${which}`, `Default (${def})`, def, (_e, cx) => choose(null, cx))))
+          .when(!q, (el) => el.child(item(`st-fd-${which}`, this.tr(`Default (${def})`, `默认 (${def})`), def, (_e, cx) => choose(null, cx))))
           .children(matches.map((f, i) => item(`st-fi-${which}-${i}`, f, f, (_e, cx) => choose(f, cx)))),
       );
+  }
+
+  panels() {
+    return shared("workspace.panels") ?? PANELS.map(([id]) => id);
+  }
+
+  togglePanel(id, cx) {
+    const cur = this.panels();
+    const on = cur.includes(id);
+    const next = on ? cur.filter((x) => x !== id) : [...cur, id];
+    setShared("workspace.panels", next);
+    const find = (node, target) => {
+      if (!node) return null;
+      if (node.id === target) return node;
+      for (const c of node.children ?? []) {
+        const f = find(c, target);
+        if (f) return f;
+      }
+      return null;
+    };
+    const L = layout();
+    if (on && find(L, "panel") && (find(L, "panel-body")?.active === id || next.length === 0)) {
+      run("layout.hide", { id: "panel" });
+    }
+    cx.notify();
   }
 
   look(t, cx) {
@@ -497,6 +639,7 @@ export default class Settings extends View {
     const own = (key, composed, def) => !same(p[key] ?? def, composed);
     const size = (key, value, d, cx) => this.change((q) => (q[key] = Math.max(8, Math.min(32, (q[key] ?? value) + d))), cx);
     const step = (key, value, d, lo, hi, cx) => this.change((q) => (q[key] = Math.round(Math.max(lo, Math.min(hi, (q[key] ?? value) + d)) * 100) / 100), cx);
+    const ownNote = this.tr("This layout sets its own; yours shows in the others.", "当前布局单独覆盖了该项；其他布局将使用你的设置。");
     const fontRow = (which, sizeKey, title, family, def, sizeNow) =>
       v_flex()
         .w_full()
@@ -504,7 +647,7 @@ export default class Settings extends View {
           this.row(
             t,
             title,
-            own(which, family, def) ? "This layout sets its own; yours shows in the others." : null,
+            own(which, family, def) ? ownNote : null,
             h_flex()
               .gap(8)
               .items_center()
@@ -515,66 +658,81 @@ export default class Settings extends View {
         );
     return v_flex()
       .w_full()
-      .child(this.heading(t, "Layout"))
+      .child(this.heading(t, this.tr("Language", "语言")))
+      .child(this.row(t, this.tr("Interface language", "界面语言"), this.tr("Applies immediately across the app.", "在界面各面板、菜单与设置页即时生效。"), this.languagePicker(t, cx)))
+      .child(div().h(18))
+      .child(this.heading(t, this.tr("Layout", "布局")))
       .child(this.layoutPicker(t, cx))
       .child(div().h(18))
-      .child(this.heading(t, "Theme"))
-      .child(this.row(t, "Appearance", "Light or dark, or as your system is now.", this.appearancePicker(t, cx)))
-      .child(div().pt(12).pb(8).text_size(12.5).text_color(t.dim).child("For the layout you're in: each layout keeps its own light and dark theme."))
-      .child(div().pb(6).text_size(12.5).font_medium().text_color(t.muted).child("Dark"))
+      .child(this.heading(t, this.tr("Panels", "右侧面板")))
+      .children(
+        PANELS.map(([id, title, zhTitle, about, zhAbout]) =>
+          this.row(
+            t,
+            this.tr(title, zhTitle),
+            this.tr(about, zhAbout),
+            this.toggle(t, `st-panel-${id}`, this.panels().includes(id), (_e, cx) => this.togglePanel(id, cx)),
+          ),
+        ),
+      )
+      .child(div().h(18))
+      .child(this.heading(t, this.tr("Theme", "主题")))
+      .child(this.row(t, this.tr("Appearance", "外观模式"), this.tr("Light or dark, or as your system is now.", "浅色、深色或自动跟随系统设置。"), this.appearancePicker(t, cx)))
+      .child(div().pt(12).pb(8).text_size(12.5).text_color(t.dim).child(this.tr("For the layout you're in: each layout keeps its own light and dark theme.", "仅作用于当前布局：每个布局可分别保留深色与浅色主题。")))
+      .child(div().pb(6).text_size(12.5).font_medium().text_color(t.muted).child(this.tr("Dark", "深色")))
       .child(this.themePicker(t, false))
-      .child(div().pt(10).pb(6).text_size(12.5).font_medium().text_color(t.muted).child("Light"))
+      .child(div().pt(10).pb(6).text_size(12.5).font_medium().text_color(t.muted).child(this.tr("Light", "浅色")))
       .child(this.themePicker(t, true))
       .child(div().h(18))
-      .child(this.heading(t, "Size and fonts"))
+      .child(this.heading(t, this.tr("Size and fonts", "缩放与字体")))
       .child(
         this.row(
           t,
-          "Zoom",
-          "Everything: terminals, panels, text.",
+          this.tr("Zoom", "界面缩放"),
+          this.tr("Everything: terminals, panels, text.", "等比缩放终端、侧栏、面板与文字。"),
           h_flex()
             .gap(8)
             .items_center()
             .child(this.stepper(t, "st-zoom", `${Math.round(s.zoom * 100)}%`, () => run("app.zoom_out"), () => run("app.zoom_in")))
-            .child(this.button(t, "st-zoom-reset", "Reset", () => run("app.zoom_reset"))),
+            .child(this.button(t, "st-zoom-reset", this.tr("Reset", "重置"), () => run("app.zoom_reset"))),
         ),
       )
-      .child(fontRow("font", "font_size", "Terminal font", s.font_family, DEFAULT_FONT, s.font_size))
+      .child(fontRow("font", "font_size", this.tr("Terminal font", "终端字体"), s.font_family, DEFAULT_FONT, s.font_size))
       .child(
         this.row(
           t,
-          "Terminal font weight",
-          own("font_weight", s.font_weight, 500) ? "This layout sets its own; yours shows in the others." : "Bold text stays at 700.",
+          this.tr("Terminal font weight", "终端字重"),
+          own("font_weight", s.font_weight, 500) ? ownNote : this.tr("Bold text stays at 700.", "粗体文本保持 700 字重。"),
           this.stepper(t, "st-font_weight", `${s.font_weight}`, (_e, cx) => step("font_weight", s.font_weight, -100, 100, 900, cx), (_e, cx) => step("font_weight", s.font_weight, 100, 100, 900, cx)),
         ),
       )
       .children([
-        ["terminal_line_height", "Terminal line height", 0.8, 2, 0.1],
-        ["terminal_cell_width", "Terminal cell width", 0.8, 2, 0.05],
-        ["terminal_scroll_speed", "Terminal scroll speed", 0.1, 5, 0.1],
+        ["terminal_line_height", this.tr("Terminal line height", "终端行高"), 0.8, 2, 0.1],
+        ["terminal_cell_width", this.tr("Terminal cell width", "终端字符宽度"), 0.8, 2, 0.05],
+        ["terminal_scroll_speed", this.tr("Terminal scroll speed", "终端滚动速度"), 0.1, 5, 0.1],
       ].map(([key, title, min, max, step]) => {
         const by = (d) => (_e, cx) => this.change((q) => (q[key] = Math.max(min, Math.min(max, Math.round(Math.round(((q[key] ?? s[key]) + d) / step) * step * 100) / 100))), cx);
         return this.row(
           t, title,
-          own(key, s[key], 1) ? "This layout sets its own; yours shows in the others." : null,
+          own(key, s[key], 1) ? ownNote : null,
           this.stepper(t, `st-${key}`, `${Math.round(s[key] * 100)}%`, by(-step), by(step)),
         );
       }))
-      .child(fontRow("ui_font", null, "Interface font", s.ui_font_family, DEFAULT_UI_FONT));
+      .child(fontRow("ui_font", null, this.tr("Interface font", "界面字体"), s.ui_font_family, DEFAULT_UI_FONT));
   }
 
   keyboard(t) {
     const choices = [
-      ["auto", "Automatic (Alt on US keyboards)"],
+      ["auto", this.tr("Automatic (Alt on US keyboards)", "自动识别（美式键盘作为 Alt）")],
       ["on", "Alt"],
-      ["off", "Types characters"],
-      ["left", "Left Option is Alt"],
-      ["right", "Right Option is Alt"],
+      ["off", this.tr("Types characters", "输入特殊字符")],
+      ["left", this.tr("Left Option is Alt", "左 Option 作为 Alt")],
+      ["right", this.tr("Right Option is Alt", "右 Option 作为 Alt")],
     ];
     return v_flex()
       .w_full()
-      .child(this.heading(t, "Option key"))
-      .child(div().pb(12).text_size(13).text_color(t.dim).child("Use Option for terminal shortcuts or to type accents and special characters."))
+      .child(this.heading(t, this.tr("Option key", "Option 键行为")))
+      .child(div().pb(12).text_size(13).text_color(t.dim).child(this.tr("Use Option for terminal shortcuts or to type accents and special characters.", "选择将 Option 键用作终端快捷键，还是用于输入重音与特殊字符。")))
       .children(choices.map(([value, label]) => {
         const on = (this.person.option_as_alt ?? "auto") === value;
         return h_flex()
@@ -628,7 +786,7 @@ export default class Settings extends View {
         try { payload = JSON.parse(r.stdout || r.stderr); } catch {}
         if (r.code !== 0) throw new Error(payload?.error?.message || (r.stderr || r.stdout || "It didn't work.").trim());
         const message = action === "update"
-          ? `Updated ${machine}${payload?.version ? ` to hc ${payload.version}` : ""}; its terminals kept running.`
+          ? `Updated ${machine}${payload?.version ? ` to h2 ${fmtVer(payload.version)}` : ""}; its terminals kept running.`
           : action === "rename" ? `Renamed ${machine} to ${name.trim()}.` : `Removed ${machine}; its terminals keep running there.`;
         if (action === "update") this.machineResults[machine] = { message, ok: true };
         else this.machineNotice = message;
@@ -667,11 +825,11 @@ export default class Settings extends View {
     const color = ["connected", "online"].includes(m.state) ? t.ansi2 : ["connecting", "reconnecting"].includes(m.state) ? t.working : t.blocked;
     const result = this.machineResults[m.name];
     const controls = h_flex().gap(6).items_center();
-    if (busy) controls.child(svg("mods/workspace-chrome/spinner.svg").size(12).text_color(t.working).spin(900)).child(div().text_size(12).text_color(t.muted).child(busy === "update" ? "Updating…" : busy === "rename" ? "Renaming…" : "Removing…"));
+    if (busy) controls.child(svg("mods/workspace-chrome/spinner.svg").size(12).text_color(t.working).spin(900)).child(div().text_size(12).text_color(t.muted).child(busy === "update" ? this.tr("Updating…", "更新中…") : busy === "rename" ? this.tr("Renaming…", "重命名中…") : this.tr("Removing…", "移除中…")));
     else {
-      if (this.olderCore(m.version, localVersion)) controls.child(this.button(t, `st-m-update-${m.name}`, "Update", (_e, cx) => this.machineAction(m.name, "update", cx)));
-      for (const [action, label] of [["rename", "Rename"], ["rm", "Remove"]]) {
-        controls.child(this.button(t, `st-m-${action}-${m.name}`, label, (_e, cx) => {
+      if (this.olderCore(m.version, localVersion)) controls.child(this.button(t, `st-m-update-${m.name}`, this.tr("Update", "更新"), (_e, cx) => this.machineAction(m.name, "update", cx)));
+      for (const [action, label, zh] of [["rename", "Rename", "重命名"], ["rm", "Remove", "移除"]]) {
+        controls.child(this.button(t, `st-m-${action}-${m.name}`, this.tr(label, zh), (_e, cx) => {
           this.machineEdit = { machine: m.name, action, name: m.name };
           if (action === "rename") {
             this.renameInput.set_value(m.name);
@@ -688,34 +846,34 @@ export default class Settings extends View {
         .child(div().w(7).h(7).flex_none().rounded(4).bg(color))
         .child(v_flex().flex_1().min_w(0).gap(3)
           .child(div().text_size(14).text_color(t.foreground).child(m.name))
-          .child(div().text_size(12.5).text_color(t.dim).child(`${m.target ?? ""} · ${state} · ${m.version ? `hc ${m.version}` : "hc version unknown"}`)))
+          .child(div().text_size(12.5).text_color(t.dim).child(`${m.target ?? ""} · ${state} · ${m.version ? `h2 ${fmtVer(m.version)}` : this.tr("h2 version unknown", "h2 版本未知")}`)))
         .when(m.keeps_running_after_logout === false, el => el.child(div().id(`st-m-logout-${m.name}`)
-          .text_color(t.blocked).cursor_pointer().tooltip("Agents stop when you disconnect. Click for the fix.")
+          .text_color(t.blocked).cursor_pointer().tooltip(this.tr("Agents stop when you disconnect. Click for the fix.", "断开连接后智能体将停止运行。点击查看修复方案。"))
           .on_click(() => run("mod.open", { name: "machine-add" })).child("⚠")))
         .child(controls.flex_none()));
     if (m.state === "needs_login") {
       const command = `hc machine login ${m.name}`;
       row.child(v_flex().gap(5)
-        .child(div().text_size(12.5).text_color(t.blocked).child("needs a login: run"))
+        .child(div().text_size(12.5).text_color(t.blocked).child(this.tr("needs a login: run", "需要登录，请运行")))
         .child(h_flex().gap(8).items_center()
           .child(div().flex_1().min_w(0).text_size(12.5).text_color(t.foreground).child(command))
-          .child(this.button(t, `st-m-login-copy-${m.name}`, this.copiedLogin === command ? "Copied" : "Copy", (_e, cx) => {
+          .child(this.button(t, `st-m-login-copy-${m.name}`, this.copiedLogin === command ? this.tr("Copied", "已复制") : this.tr("Copy", "复制"), (_e, cx) => {
             cx.write_to_clipboard(command);
             this.copiedLogin = command;
             cx.notify();
           }))));
     }
-    if (busy === "update") row.child(div().text_size(12.5).text_color(t.dim).child("Copying this computer's herdr-core. Its terminals keep running."));
+    if (busy === "update") row.child(div().text_size(12.5).text_color(t.dim).child(this.tr("Copying this computer's herdr-core. Its terminals keep running.", "正在同步本机 herdr-core，远程终端会继续保持运行。")));
     if (edit && !busy) {
-      const cancel = this.button(t, `st-m-cancel-${m.name}`, "Cancel", (_e, cx) => { this.machineEdit = null; this.handle.focus(); cx.notify(); });
+      const cancel = this.button(t, `st-m-cancel-${m.name}`, this.tr("Cancel", "取消"), (_e, cx) => { this.machineEdit = null; this.handle.focus(); cx.notify(); });
       if (edit.action === "rm") row.child(v_flex().gap(8)
-        .child(div().text_size(12.5).text_color(t.muted).child(`Remove ${m.name}? Its terminals keep running there.`))
-        .child(h_flex().gap(6).child(cancel).child(this.button(t, `st-m-confirm-${m.name}`, "Remove machine", (_e, cx) => this.machineAction(m.name, "rm", cx)))));
+        .child(div().text_size(12.5).text_color(t.muted).child(this.tr(`Remove ${m.name}? Its terminals keep running there.`, `确定移除 ${m.name}？远程终端仍会继续运行。`)))
+        .child(h_flex().gap(6).child(cancel).child(this.button(t, `st-m-confirm-${m.name}`, this.tr("Remove machine", "确认移除"), (_e, cx) => this.machineAction(m.name, "rm", cx)))));
       else row.child(v_flex().gap(6)
-        .child(div().text_size(12).text_color(t.dim).child("New name (addresses using the old name stop working)"))
+        .child(div().text_size(12).text_color(t.dim).child(this.tr("New name (addresses using the old name stop working)", "新名称（使用旧名称的地址将失效）")))
         .child(h_flex().gap(6).items_center()
           .child(Input.new(this.renameInput).flex_1().min_w(0).h(32).px(10).rounded(7).border_1().border_color(this.renameFocused ? t.accent : t.input).bg(t.background).text_size(13).text_color(t.foreground))
-          .child(cancel).child(this.button(t, `st-m-save-${m.name}`, "Save", (_e, cx) => this.machineAction(m.name, "rename", cx, edit.name)))));
+          .child(cancel).child(this.button(t, `st-m-save-${m.name}`, this.tr("Save", "保存"), (_e, cx) => this.machineAction(m.name, "rename", cx, edit.name)))));
     }
     if (result) row.child(div().text_size(12.5).text_color(result.ok ? t.ansi2 : t.blocked).child(result.message));
     return row;
@@ -724,15 +882,994 @@ export default class Settings extends View {
   machines(t) {
     const version = updates().core.version;
     return v_flex().w_full()
-      .child(this.heading(t, "Machines"))
-      .child(div().pb(8).text_size(12.5).line_height("18px").text_color(t.dim).child("Your computers, reached over ssh. Their terminals keep running when you disconnect."))
-      .child(this.row(t, "This computer", `Connected · ${version ? `hc ${version}` : "hc version unknown"}`, div().w(7).h(7).rounded(4).bg(t.ansi2)))
+      .child(this.heading(t, this.tr("Machines", "主机")))
+      .child(div().pb(8).text_size(12.5).line_height("18px").text_color(t.dim).child(this.tr("Your computers, reached over ssh. Their terminals keep running when you disconnect.", "通过 SSH 连接的远程主机。断开连接后上面的终端仍保持运行。")))
+      .child(this.row(t, this.tr("This computer", "本机"), `${this.tr("Connected", "已连接")} · ${version ? `h2 ${fmtVer(version)}` : this.tr("h2 version unknown", "h2 版本未知")}`, div().w(7).h(7).rounded(4).bg(t.ansi2)))
       .children((this.machineList ?? []).map((m) => this.machineRow(t, m, version)))
-      .when(this.machineList === null && !this.machineError, (el) => el.child(h_flex().py(14).gap(8).items_center().child(svg("mods/workspace-chrome/spinner.svg").size(12).text_color(t.working).spin(900)).child(div().text_size(12.5).text_color(t.dim).child("Reading machines…"))))
-      .when(this.machineList?.length === 0, (el) => el.child(div().py(14).text_size(12.5).text_color(t.dim).child("No other machines yet.")))
+      .when(this.machineList === null && !this.machineError, (el) => el.child(h_flex().py(14).gap(8).items_center().child(svg("mods/workspace-chrome/spinner.svg").size(12).text_color(t.working).spin(900)).child(div().text_size(12.5).text_color(t.dim).child(this.tr("Reading machines…", "正在读取主机列表…")))))
+      .when(this.machineList?.length === 0, (el) => el.child(div().py(14).text_size(12.5).text_color(t.dim).child(this.tr("No other machines yet.", "暂未配置其他主机。"))))
       .when(Boolean(this.machineError), (el) => el.child(div().py(10).text_size(12.5).text_color(t.blocked).child(this.machineError)))
       .when(Boolean(this.machineNotice), (el) => el.child(div().py(10).text_size(12.5).text_color(t.ansi2).child(this.machineNotice)))
-      .child(h_flex().pt(16).child(this.button(t, "st-m-add", "Add a machine", () => run("mod.open", { name: "machine-add" }))));
+      .child(h_flex().pt(16).child(this.button(t, "st-m-add", this.tr("Add a machine", "添加主机"), () => run("mod.open", { name: "machine-add" }))));
+  }
+
+  // Drove ----------------------------------------------------------------
+
+  droveArgs(base) {
+    return this.droveMachine ? [...base, "--on", this.droveMachine] : base;
+  }
+
+  async droveHcJson(args) {
+    if (typeof checking === "function" && checking()) return null;
+    const r = await hc([...this.droveArgs(args), "--json"]);
+    let parsed = null;
+    try { parsed = JSON.parse(r.stdout || r.stderr); } catch {}
+    if (r.code !== 0) {
+      throw new Error(parsed?.error?.message || parsed?.message || (r.stderr || r.stdout || "Drove command failed.").trim());
+    }
+    return parsed;
+  }
+
+  async droveCallWithJsonFile(args, payload) {
+    if (typeof checking === "function" && checking()) return null;
+    const reqPath = `${appHome()}/.drove-req-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.json`;
+    await writeTextFile(reqPath, JSON.stringify(payload), null);
+    return this.droveHcJson([...args, "--file", reqPath, "--consume"]);
+  }
+
+  syncDroveInputs(data) {
+    const cfg = data?.config ?? {};
+    this.droveUrlInput.set_value(cfg.ai?.baseUrl ?? "");
+    this.droveMagpieUrlInput.set_value(cfg.magpie?.gatewayUrl ?? "");
+    this.droveKeyInput.set_value("");
+    this.droveKeyDirty = false;
+  }
+
+  async loadDrove() {
+    if (this.droveLoading || (typeof checking === "function" && checking())) return;
+    this.droveLoading = true;
+    this.droveError = null;
+    try {
+      const data = await this.droveHcJson(["drove", "settings"]);
+      this.droveData = data;
+      this.syncDroveInputs(data);
+    } catch (e) {
+      this.droveError = String(e?.message ?? e);
+    } finally {
+      this.droveLoading = false;
+    }
+  }
+
+  saveDrovePatch(patch, cx, syncInputs = false) {
+    if (this.droveSaving) return;
+    this.droveSaving = true;
+    this.droveError = null;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const next = await this.droveCallWithJsonFile(["drove", "settings-set"], patch);
+        if (next) {
+          this.droveData = next;
+          if (syncInputs) this.syncDroveInputs(next);
+        }
+      } catch (e) {
+        this.droveError = String(e?.message ?? e);
+        notify({ title: this.tr("Drove settings not saved", "编队设置保存失败"), body: this.droveError, level: "error" });
+      } finally {
+        this.droveSaving = false;
+        cx.notify();
+      }
+    });
+  }
+
+  probeDroveAgents(cx) {
+    if (this.droveProbing) return;
+    this.droveProbing = true;
+    this.droveError = null;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const snap = await this.droveHcJson(["drove", "probe", "--refresh"]);
+        if (snap && this.droveData) this.droveData = { ...this.droveData, agents: snap };
+        else await this.loadDrove();
+      } catch (e) {
+        this.droveError = String(e?.message ?? e);
+      } finally {
+        this.droveProbing = false;
+        cx.notify();
+      }
+    });
+  }
+
+  testDroveAi(cx) {
+    if (this.droveAiTesting) return;
+    this.droveAiTesting = true;
+    this.droveTestResult = null;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const baseUrl = this.droveUrlInput.value().trim();
+        const apiKey = this.droveKeyInput.value().trim();
+        const payload = {};
+        if (baseUrl) payload.baseUrl = baseUrl;
+        if (apiKey) payload.apiKey = apiKey;
+        this.droveTestResult = await this.droveCallWithJsonFile(["drove", "ai-test"], payload);
+      } catch (e) {
+        this.droveTestResult = { ok: false, error: String(e?.message ?? e) };
+      } finally {
+        this.droveAiTesting = false;
+        cx.notify();
+      }
+    });
+  }
+
+  testDroveMagpie(cx) {
+    if (this.droveMagpieTesting) return;
+    this.droveMagpieTesting = true;
+    this.droveMagpieResult = null;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const url = this.droveMagpieUrlInput.value().trim();
+        const args = ["drove", "magpie-test"];
+        if (url) args.push("--url", url);
+        this.droveMagpieResult = await this.droveHcJson(args);
+      } catch (e) {
+        this.droveMagpieResult = { ok: false, error: String(e?.message ?? e) };
+      } finally {
+        this.droveMagpieTesting = false;
+        cx.notify();
+      }
+    });
+  }
+
+  maybeAutoProbeDrove(cx) {
+    const key = this.droveMachine ?? "__local__";
+    if (this.droveAutoProbed?.[key] || this.droveProbing || (typeof checking === "function" && checking())) return;
+    if (!this.droveData?.agents?.agents) return;
+    this.droveAutoProbed = { ...(this.droveAutoProbed ?? {}), [key]: true };
+    if (this.droveData.agents.fullProbe) return;
+    this.probeDroveAgents(cx);
+  }
+
+  probedAgents() {
+    const probed = this.droveData?.agents?.agents ?? [];
+    if (probed.length > 0) return probed;
+    return DROVE_FALLBACK_AGENTS.map((id) => ({ id, name: id, installed: false, models: [], efforts: [] }));
+  }
+
+  probedModelsFor(agentId) {
+    const a = this.probedAgents().find((x) => x.id === agentId);
+    const out = [];
+    const seen = new Set();
+    for (const raw of a?.models ?? []) {
+      const id = (typeof raw === "string" ? raw : raw?.id ?? "").trim();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      const name = typeof raw === "string" ? null : raw?.name;
+      out.push({ id, label: name && name !== id ? `${id} · ${name}` : id });
+    }
+    return out;
+  }
+
+  aiAvailableModels() {
+    const seen = new Set();
+    const out = [];
+    const add = (m) => {
+      const id = String(m ?? "").trim();
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        out.push(id);
+      }
+    };
+    for (const m of this.droveTestResult?.availableModels ?? []) add(m);
+    if (this.droveTestResult?.discoveredModel) add(this.droveTestResult.discoveredModel);
+    for (const m of this.droveData?.aiStatus?.availableModels ?? []) add(m);
+    return out;
+  }
+
+  agentIconMeta(agentId) {
+    const key = String(agentId ?? "").trim().toLowerCase();
+    return DROVE_AGENT_ICONS[key] ?? { path: "icons/agent.svg", tint: true };
+  }
+
+  agentIconEl(t, agentId, size = 14) {
+    const meta = this.agentIconMeta(agentId);
+    return meta.tint
+      ? svg(meta.path).size(size).flex_none().text_color(t.muted)
+      : image(meta.path).w(size).h(size).flex_none();
+  }
+
+  roleDisplayTitle(roleId, role) {
+    switch (roleId) {
+      case "coder": return this.tr("Coder", "程序员");
+      case "tester": return this.tr("Tester", "测试员");
+      case "writer": return this.tr("Tech Writer", "技术作家");
+      case "reviewer": return this.tr("Reviewer", "审查员");
+      case "researcher": return this.tr("Researcher", "调研员");
+      default: return role?.label || roleId;
+    }
+  }
+
+  effortLabel(eff) {
+    switch (eff) {
+      case "low": return this.tr("Low", "低");
+      case "medium": return this.tr("Med", "中");
+      case "high": return this.tr("High", "高");
+      case "xhigh": return this.tr("Max", "极高");
+      default: return eff;
+    }
+  }
+
+  drovePicker(t, id, label, items, onSelect, opts = 156, cx) {
+    const o = typeof opts === "number" ? { width: opts } : (opts ?? {});
+    const width = o.width ?? 156;
+    const popupWidth = o.popupWidth ?? Math.max(width + 110, 320);
+    const anchor = o.anchor ?? "bottom_left";
+    const flex1 = Boolean(o.flex1);
+    const allowCustom = Boolean(o.allowCustom);
+    const key = `drove:${id}`;
+    const open = this.picking === key;
+    const trigger = h_flex()
+      .id(`st-drp-${id}`)
+      .w_full()
+      .h(28)
+      .px(9)
+      .rounded(7)
+      .border_1()
+      .border_color(open ? t.accent : t.border)
+      .bg(t.raised)
+      .cursor_pointer()
+      .items_center()
+      .justify_between()
+      .gap(6)
+      .hover((s) => s.bg(t.hover))
+      .on_click((_e, cx) => {
+        this.picking = open ? null : key;
+        if (this.picking && allowCustom) {
+          this.droveModelFilter = "";
+          this.droveModelInput.set_value("");
+          this.droveModelSubmit = onSelect;
+          this.droveModelInput.focus();
+        } else {
+          this.droveModelSubmit = null;
+          this.handle.focus();
+        }
+        cx.notify();
+      })
+      .child(
+        h_flex()
+          .flex_1()
+          .min_w(0)
+          .gap(6)
+          .items_center()
+          .when(Boolean(o.icon), (el) => el.child(this.agentIconEl(t, o.icon, 13)))
+          .when(o.dot !== undefined, (el) =>
+            el.child(div().w(5).h(5).rounded(3).flex_none().bg(o.dot ? t.ansi2 : t.dim)),
+          )
+          .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).child(label)),
+      )
+      .child(div().flex_none().text_size(10).text_color(t.dim).child("▾"));
+
+    const rawQ = allowCustom ? (this.droveModelFilter ?? "") : "";
+    const qTrim = rawQ.trim();
+    const qLower = qTrim.toLowerCase();
+    const filtered = qLower
+      ? items.filter((it) => String(it.label ?? "").toLowerCase().includes(qLower) || String(it.value ?? "").toLowerCase().includes(qLower))
+      : items;
+    const hasExact = qTrim && items.some((it) => String(it.value ?? "") === qTrim);
+    const listItems = qTrim && !hasExact
+      ? [{ value: qTrim, label: this.tr(`Use "${qTrim}"`, `使用「${qTrim}」`), meta: this.tr("custom", "自定义"), active: false }, ...filtered]
+      : filtered;
+    const rowH = 30;
+    const listH = listItems.length === 0 ? 44 : Math.min(listItems.length * rowH + 8, 280);
+
+    return Popup.new(`st-drpp-${id}`, trigger)
+      .anchor(anchor)
+      .when(flex1, (el) => el.flex_1().min_w(width), (el) => el.w(width).flex_none())
+      .when(open, (el) =>
+        el.content(
+          v_flex()
+            .w(popupWidth)
+            .rounded(8)
+            .border_1()
+            .border_color(t.border)
+            .bg(t.background)
+            .on_mouse_down_out((_e, cx) => {
+              this.picking = null;
+              this.droveModelSubmit = null;
+              this.handle.focus();
+              cx.notify();
+            })
+            .on_scroll_wheel((_e, cx) => cx.stop_propagation())
+            .when(allowCustom, (box) =>
+              box.child(
+                div()
+                  .px(10)
+                  .py(7)
+                  .border_b(1)
+                  .border_color(t.border)
+                  .text_size(12.5)
+                  .child(Input.new(this.droveModelInput).h(24).text_color(t.foreground)),
+              ),
+            )
+            .child(
+              div()
+                .id(`st-drpm-${id}`)
+                .h(listH)
+                .p(4)
+                .overflow_y_scrollbar()
+                .when(listItems.length === 0, (list) =>
+                  list.child(div().px(10).py(8).text_size(12).text_color(t.dim).child(this.tr("No matching options", "没有匹配项"))),
+                )
+                .children(
+                  listItems.map((it, idx) =>
+                    h_flex()
+                      .id(`st-drpi-${id}-${idx}`)
+                      .w_full()
+                      .h(rowH)
+                      .flex_none()
+                      .px(9)
+                      .gap(7)
+                      .rounded(6)
+                      .items_center()
+                      .cursor_pointer()
+                      .bg(it.active ? t.raised : "#00000000")
+                      .hover((s) => s.bg(t.hover))
+                      .on_click((_e, cx) => {
+                        this.picking = null;
+                        this.droveModelSubmit = null;
+                        this.handle.focus();
+                        onSelect(it.value, cx);
+                      })
+                      .when(Boolean(it.icon), (row) => row.child(this.agentIconEl(t, it.icon, 13)))
+                      .when(it.dot !== undefined, (row) =>
+                        row.child(div().w(6).h(6).rounded(3).flex_none().bg(it.dot ? t.ansi2 : t.dim)),
+                      )
+                      .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(it.active ? t.foreground : t.muted).child(it.label))
+                      .when(Boolean(it.meta), (row) => row.child(div().flex_none().text_size(11).text_color(t.dim).child(it.meta))),
+                  ),
+                ),
+            ),
+        ),
+      );
+  }
+
+  roleChain(role) {
+    const raw = [];
+    if (role?.primary?.agent) raw.push(role.primary);
+    for (const fb of role?.fallbacks ?? []) {
+      if (fb?.agent) raw.push(fb);
+    }
+    if (raw.length === 0) {
+      raw.push({ agent: "claude", model: null, effort: "high" });
+    }
+    return raw.map((item) => ({
+      agent: String(item.agent).trim(),
+      model: item.model ? String(item.model) : null,
+      effort: item.effort ?? "high",
+    }));
+  }
+
+  applyRoleChain(role, chain) {
+    const clean = (chain ?? [])
+      .filter((item) => item && String(item.agent ?? "").trim())
+      .map((item) => ({
+        agent: String(item.agent).trim(),
+        model: item.model ? String(item.model) : null,
+        effort: item.effort ?? "high",
+      }));
+    if (clean.length === 0) return;
+    role.primary = clean[0];
+    role.fallbacks = clean.slice(1);
+  }
+
+  nextCandidateAgent(chain) {
+    const probed = this.probedAgents();
+    const used = new Set((chain ?? []).map((c) => c.agent));
+    const unusedInstalled = probed.find((a) => a.installed && !used.has(a.id));
+    if (unusedInstalled) return unusedInstalled.id;
+    const unusedAny = probed.find((a) => !used.has(a.id));
+    if (unusedAny) return unusedAny.id;
+    const last = chain?.[chain.length - 1]?.agent;
+    return probed.find((a) => a.id !== last)?.id ?? "codex";
+  }
+
+  droveUpdateRole(roleId, updater, cx) {
+    const roles = JSON.parse(JSON.stringify(this.droveData?.config?.roles ?? {}));
+    const current = roles[roleId];
+    if (!current) return;
+    updater(current, roles);
+    this.saveDrovePatch({ roles }, cx);
+  }
+
+  droveRoleCard(t, roleId, role, cx) {
+    const builtin = DROVE_BUILTIN_ROLES.includes(roleId);
+    const chain = this.roleChain(role);
+    const probed = this.probedAgents();
+    const access = role.access ?? "writable";
+    const accessLabel = access === "readonly"
+      ? this.tr("Read-only", "只读")
+      : access === "scoped_write"
+        ? this.tr("Scoped", "受限写")
+        : this.tr("Writable", "可写");
+    const accessColor = access === "readonly" ? t.dim : t.ansi2;
+
+    const commitChain = (nextChain, cx) => {
+      this.droveUpdateRole(roleId, (r) => this.applyRoleChain(r, nextChain), cx);
+    };
+
+    const candidateRow = (target, idx) => {
+      const isPrimary = idx === 0;
+      const curAgentInfo = probed.find((a) => a.id === target.agent);
+      const agentItems = probed.map((a) => ({
+        value: a.id,
+        label: a.name && a.name !== a.id ? `${a.id} · ${a.name}` : a.id,
+        icon: a.id,
+        dot: Boolean(a.installed),
+        meta: a.models?.length ? `${a.models.length} ${this.tr("models", "模型")}` : a.installed ? "✓" : this.tr("missing", "未安装"),
+        active: target.agent === a.id,
+      }));
+      const models = this.probedModelsFor(target.agent);
+      const modelItems = [
+        { value: null, label: this.tr("Auto (agent default)", "自动（Agent 默认）"), active: !target.model },
+        ...models.map((m) => ({
+          value: m.id,
+          label: m.label,
+          active: target.model === m.id,
+        })),
+      ];
+      if (target.model && !models.some((m) => m.id === target.model)) {
+        modelItems.splice(1, 0, { value: target.model, label: target.model, meta: this.tr("custom", "自定义"), active: true });
+      }
+      const canUp = idx > 0;
+      const canDown = idx < chain.length - 1;
+      const canRemove = chain.length > 1;
+      const stepBtn = (btnId, glyph, enabled, title, onClick, hoverColor = t.foreground) =>
+        div()
+          .id(btnId)
+          .w(22)
+          .h(26)
+          .flex_none()
+          .flex()
+          .items_center()
+          .justify_center()
+          .rounded(5)
+          .text_size(12)
+          .text_color(enabled ? t.muted : t.dim)
+          .opacity(enabled ? 1.0 : 0.35)
+          .when(enabled, (el) =>
+            el
+              .cursor_pointer()
+              .tooltip(title)
+              .hover((s) => s.bg(t.hover).text_color(hoverColor))
+              .on_click(onClick),
+          )
+          .child(glyph);
+
+      return h_flex()
+        .id(`st-dr-cand-${roleId}-${idx}`)
+        .w_full()
+        .gap(6)
+        .items_center()
+        .child(
+          div()
+            .w(62)
+            .h(28)
+            .flex_none()
+            .px(6)
+            .rounded(5)
+            .bg(isPrimary ? t.raised : t.background)
+            .border_1()
+            .border_color(t.border)
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_size(11)
+            .when(isPrimary, (el) => el.font_semibold())
+            .text_color(isPrimary ? t.accent : t.dim)
+            .child(isPrimary ? this.tr("#1 Main", "#1 主选") : this.tr(`#${idx + 1}`, `#${idx + 1} 备`)),
+        )
+        .child(
+          this.drovePicker(
+            t,
+            `${roleId}-c${idx}-agent`,
+            target.agent,
+            agentItems,
+            (agent, cx) => {
+              const next = chain.map((c, i) => (i === idx ? { ...c, agent, model: null } : c));
+              commitChain(next, cx);
+            },
+            { width: 148, popupWidth: 280, icon: target.agent, dot: curAgentInfo ? Boolean(curAgentInfo.installed) : undefined },
+            cx,
+          ),
+        )
+        .child(
+          this.drovePicker(
+            t,
+            `${roleId}-c${idx}-model`,
+            target.model || this.tr("Auto (default)", "自动（默认）"),
+            modelItems,
+            (model, cx) => {
+              const next = chain.map((c, i) => (i === idx ? { ...c, model } : c));
+              commitChain(next, cx);
+            },
+            { flex1: true, width: 150, popupWidth: 380, allowCustom: true },
+            cx,
+          ),
+        )
+        .child(
+          h_flex()
+            .h(28)
+            .flex_none()
+            .p(2)
+            .gap(1)
+            .items_center()
+            .rounded(7)
+            .border_1()
+            .border_color(t.border)
+            .bg(t.background)
+            .children(
+              DROVE_EFFORTS.map((eff) => {
+                const active = (target.effort ?? "high") === eff;
+                return div()
+                  .id(`st-dr-eff-${roleId}-${idx}-${eff}`)
+                  .min_w(32)
+                  .h(22)
+                  .px(6)
+                  .flex()
+                  .items_center()
+                  .justify_center()
+                  .rounded(5)
+                  .cursor_pointer()
+                  .bg(active ? t.accent : "#00000000")
+                  .text_size(11)
+                  .when(active, (el) => el.font_semibold())
+                  .text_color(active ? t.accent_foreground : t.muted)
+                  .when(!active, (el) => el.hover((s) => s.bg(t.hover).text_color(t.foreground)))
+                  .on_click((_e, cx) => {
+                    const next = chain.map((c, i) => (i === idx ? { ...c, effort: eff } : c));
+                    commitChain(next, cx);
+                  })
+                  .child(this.effortLabel(eff));
+              }),
+            ),
+        )
+        .child(
+          h_flex()
+            .flex_none()
+            .gap(2)
+            .items_center()
+            .child(stepBtn(`st-dr-up-${roleId}-${idx}`, "↑", canUp, this.tr("Move up", "上移"), (_e, cx) => {
+              const next = [...chain];
+              [next[idx - 1], next[idx]] = [next[idx], next[idx - 1]];
+              commitChain(next, cx);
+            }))
+            .child(stepBtn(`st-dr-dn-${roleId}-${idx}`, "↓", canDown, this.tr("Move down", "下移"), (_e, cx) => {
+              const next = [...chain];
+              [next[idx], next[idx + 1]] = [next[idx + 1], next[idx]];
+              commitChain(next, cx);
+            }))
+            .child(stepBtn(`st-dr-rm-${roleId}-${idx}`, "×", canRemove, this.tr("Remove", "移除"), (_e, cx) => {
+              commitChain(chain.filter((_, i) => i !== idx), cx);
+            }, t.blocked)),
+        );
+    };
+
+    return v_flex()
+      .id(`st-dr-role-${roleId}`)
+      .rounded(10)
+      .border_1()
+      .border_color(t.border)
+      .bg(t.surface)
+      .overflow_hidden()
+      .child(
+        h_flex()
+          .px(14)
+          .pt(10)
+          .pb(8)
+          .items_center()
+          .justify_between()
+          .gap(10)
+          .child(
+            h_flex()
+              .gap(8)
+              .items_center()
+              .min_w(0)
+              .child(div().text_size(13.5).font_semibold().text_color(t.foreground).child(this.roleDisplayTitle(roleId, role)))
+              .child(div().px(6).py(1).rounded(4).bg(t.raised).font_family(DEFAULT_FONT).text_size(11).text_color(t.dim).child(roleId))
+              .child(div().px(6).py(1).rounded(4).bg(t.raised).text_size(11).text_color(accessColor).child(accessLabel))
+              .child(div().px(6).py(1).rounded(4).bg(t.raised).text_size(11).text_color(t.muted).child(this.tr(`${chain.length} agent(s)`, `${chain.length} 个候选`))),
+          )
+          .child(
+            h_flex()
+              .flex_1()
+              .min_w(0)
+              .gap(8)
+              .items_center()
+              .when(Boolean(role.summary), (el) =>
+                el.child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.dim).child(role.summary)),
+              )
+              .when(!builtin, (el) =>
+                el.child(
+                  div()
+                    .id(`st-dr-del-${roleId}`)
+                    .flex_none()
+                    .px(7)
+                    .py(2)
+                    .rounded(5)
+                    .cursor_pointer()
+                    .text_size(11.5)
+                    .text_color(t.dim)
+                    .hover((s) => s.bg(t.hover).text_color(t.blocked))
+                    .on_click((_e, cx) => {
+                      this.droveUpdateRole(roleId, (_cur, all) => { delete all[roleId]; }, cx);
+                    })
+                    .child(this.tr("Remove", "删除")),
+                ),
+              ),
+          ),
+      )
+      .child(
+        v_flex()
+          .px(14)
+          .pb(10)
+          .gap(6)
+          .children(chain.map((target, idx) => candidateRow(target, idx))),
+      )
+      .child(
+        h_flex()
+          .px(14)
+          .py(7)
+          .border_t(1)
+          .border_color(t.border)
+          .bg(t.background)
+          .justify_between()
+          .items_center()
+          .gap(8)
+          .child(
+            div()
+              .id(`st-dr-fb-add-${roleId}`)
+              .cursor_pointer()
+              .px(7)
+              .py(2)
+              .rounded(5)
+              .text_size(11.5)
+              .text_color(t.muted)
+              .hover((s) => s.bg(t.hover).text_color(t.foreground))
+              .on_click((_e, cx) =>
+                commitChain(
+                  [...chain, { agent: this.nextCandidateAgent(chain), model: null, effort: chain[0]?.effort ?? "high" }],
+                  cx,
+                ),
+              )
+              .child(this.tr("+ Add candidate agent", "+ 添加候选 Agent")),
+          )
+          .child(
+            div()
+              .text_size(11)
+              .text_color(t.dim)
+              .child(this.tr("Tried in #1 → #2 → #3… order on quota exhaustion or retry", "按 #1 → #2 → #3… 顺延调度（额度耗尽或重试自动切换）")),
+          ),
+      );
+  }
+
+  drove(t, cx) {
+    const machines = (this.machineList ?? []).filter((m) => !m.temporary);
+    const data = this.droveData;
+    const cfg = data?.config ?? {};
+    const aiStatus = data?.aiStatus ?? {};
+    const roles = cfg.roles ?? {};
+    const roleIds = Object.keys(roles).sort((a, b) => {
+      const ia = DROVE_BUILTIN_ROLES.indexOf(a);
+      const ib = DROVE_BUILTIN_ROLES.indexOf(b);
+      if (ia !== -1 || ib !== -1) return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+      return a.localeCompare(b);
+    });
+    const machineChip = (id, label, value) => {
+      const on = this.droveMachine === value;
+      return div()
+        .id(`st-dr-m-${id}`)
+        .px(10)
+        .py(4)
+        .rounded(6)
+        .border_1()
+        .border_color(on ? t.accent : t.border)
+        .bg(on ? t.accent : t.raised)
+        .cursor_pointer()
+        .text_size(12.5)
+        .text_color(on ? t.accent_foreground : t.foreground)
+        .on_click((_e, cx) => {
+          this.droveMachine = value;
+          this.picking = null;
+          this.droveModelSubmit = null;
+          this.droveTestResult = null;
+          this.droveMagpieResult = null;
+          cx.spawn(async (cx) => {
+            await this.loadDrove();
+            this.maybeAutoProbeDrove(cx);
+            cx.notify();
+          });
+        })
+        .child(label);
+    };
+    const magpieOn = Boolean(cfg.magpie?.enabled);
+    const aiOn = cfg.ai?.enabled !== false;
+    const aiModels = this.aiAvailableModels();
+    const currentAiModel = (cfg.ai?.model ?? "").trim();
+    const aiModelItems = [
+      { value: "", label: this.tr("Auto (first available model)", "自动选择（首个可用模型）"), active: !currentAiModel },
+      ...aiModels.map((m) => ({ value: m, label: m, active: currentAiModel === m })),
+    ];
+    if (currentAiModel && !aiModels.includes(currentAiModel)) {
+      aiModelItems.splice(1, 0, { value: currentAiModel, label: currentAiModel, meta: this.tr("custom", "自定义"), active: true });
+    }
+    const magpieQuotas = data?.magpieQuotas ?? [];
+
+    return v_flex()
+      .w_full()
+      .gap(6)
+      .child(
+        h_flex()
+          .items_center()
+          .justify_between()
+          .gap(10)
+          .flex_wrap()
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .flex_wrap()
+              .child(div().text_size(12.5).text_color(t.dim).child(this.tr("Machine:", "目标主机：")))
+              .child(machineChip("local", this.tr("This computer", "本机"), null))
+              .children(machines.map((m) => machineChip(m.name, m.name, m.name))),
+          )
+          .child(
+            h_flex()
+              .gap(8)
+              .items_center()
+              .child(this.button(t, "st-dr-probe", this.droveProbing ? this.tr("Refreshing…", "检测中…") : this.tr("Refresh Agents", "刷新检测"), (_e, cx) => this.probeDroveAgents(cx)))
+              .child(this.button(t, "st-dr-web", this.tr("Open Drove Web", "打开 Drove 网页"), () => {
+                if (!(typeof checking === "function" && checking())) hc(this.droveArgs(["drove", "web"]));
+              })),
+          ),
+      )
+      .when(Boolean(this.droveError), (el) =>
+        el.child(div().py(6).text_size(12.5).text_color(t.blocked).child(this.droveError)),
+      )
+      .when(this.droveLoading && !data, (el) =>
+        el.child(h_flex().py(14).gap(8).items_center().child(svg("mods/workspace-chrome/spinner.svg").size(12).text_color(t.working).spin(900)).child(div().text_size(12.5).text_color(t.dim).child(this.tr("Loading Drove configuration…", "正在读取 Drove 配置…")))),
+      )
+      .child(div().h(8))
+      .child(
+        h_flex()
+          .items_center()
+          .justify_between()
+          .child(this.heading(t, this.tr("Roles", "角色配置")))
+          .child(
+            this.button(t, "st-dr-add-role-btn", this.droveShowAddRole ? this.tr("Cancel", "取消") : this.tr("+ Add role", "+ 添加角色"), (_e, cx) => {
+              this.droveShowAddRole = !this.droveShowAddRole;
+              this.droveNewRoleInput.set_value("");
+              cx.notify();
+            }),
+          ),
+      )
+      .child(div().pb(6).text_size(12.5).text_color(t.dim).child(this.tr("Assign an ACP agent, model, and reasoning effort directly to each role.", "直接为每个角色分配 Agent、模型与思考强度。")))
+      .when(this.droveShowAddRole, (el) =>
+        el.child(
+          h_flex()
+            .gap(8)
+            .pb(6)
+            .items_center()
+            .child(div().flex_1().px(8).py(3).rounded(6).border_1().border_color(t.border).bg(t.background).child(Input.new(this.droveNewRoleInput).h(26).text_size(13).text_color(t.foreground)))
+            .child(this.button(t, "st-dr-add-role-ok", this.tr("Create", "创建"), (_e, cx) => {
+              const id = this.droveNewRoleInput.value().trim().toLowerCase().replace(/[^a-z0-9_-]+/g, "-");
+              if (!id) return;
+              const nextRoles = JSON.parse(JSON.stringify(roles));
+              if (!nextRoles[id]) {
+                nextRoles[id] = { label: id, access: "writable", primary: { agent: "claude", model: null, effort: "high" }, fallbacks: [] };
+                this.droveShowAddRole = false;
+                this.saveDrovePatch({ roles: nextRoles }, cx);
+              }
+            })),
+        ),
+      )
+      .child(
+        v_flex()
+          .gap(8)
+          .children(roleIds.map((id) => this.droveRoleCard(t, id, roles[id], cx))),
+      )
+      .child(div().h(14))
+      .child(this.heading(t, this.tr("AI Assistant", "智能辅助模型")))
+      .child(
+        this.row(
+          t,
+          this.tr("Enable AI assistant", "启用智能辅助"),
+          this.tr("Optional lightweight OpenAI-compatible helper for run titles and digest summaries.", "可选的轻量 OpenAI 兼容接口，用于自动命名与摘要。"),
+          this.toggle(t, "st-dr-ai-on", aiOn, (_e, cx) => this.saveDrovePatch({ ai: { enabled: !aiOn } }, cx)),
+        ),
+      )
+      .child(
+        v_flex()
+          .gap(10)
+          .pt(10)
+          .child(
+            v_flex()
+              .gap(4)
+              .child(div().text_size(12.5).text_color(t.foreground).child(this.tr("Service URL", "远端服务地址")))
+              .child(div().px(8).py(3).rounded(7).border_1().border_color(t.border).bg(t.background).child(Input.new(this.droveUrlInput).h(28).text_size(13).text_color(t.foreground))),
+          )
+          .child(
+            v_flex()
+              .gap(4)
+              .child(
+                h_flex()
+                  .justify_between()
+                  .child(div().text_size(12.5).text_color(t.foreground).child(this.tr("API Key", "API Key")))
+                  .when(Boolean(aiStatus.keyMasked), (el) =>
+                    el.child(div().text_size(11.5).text_color(t.dim).child(this.tr(`Saved: ${aiStatus.keyMasked}`, `已保存：${aiStatus.keyMasked}`))),
+                  ),
+              )
+              .child(div().px(8).py(3).rounded(7).border_1().border_color(t.border).bg(t.background).child(Input.new(this.droveKeyInput).h(28).text_size(13).text_color(t.foreground))),
+          )
+          .child(
+            h_flex()
+              .gap(12)
+              .items_center()
+              .justify_between()
+              .child(
+                v_flex()
+                  .gap(2)
+                  .child(div().text_size(12.5).text_color(t.foreground).child(this.tr("Model", "使用模型")))
+                  .child(
+                    div()
+                      .text_size(11.5)
+                      .text_color(t.dim)
+                      .child(
+                        aiModels.length > 0
+                          ? this.tr(`${aiModels.length} model(s) discovered from endpoint`, `已从服务端拉取 ${aiModels.length} 个可用模型`)
+                          : this.tr("Save or test connection to load models, or type a custom model ID", "保存或测试连通性后将自动拉取模型列表，也可直接输入自定义模型"),
+                      ),
+                  ),
+              )
+              .child(
+                this.drovePicker(
+                  t,
+                  "ai-model",
+                  currentAiModel || this.tr("Auto (first available)", "自动选择（首个可用）"),
+                  aiModelItems,
+                  (model, cx) => this.saveDrovePatch({ ai: { model: model || "" } }, cx),
+                  { width: 250, popupWidth: 390, anchor: "bottom_right", allowCustom: true },
+                  cx,
+                ),
+              ),
+          )
+          .child(
+            h_flex()
+              .gap(8)
+              .items_center()
+              .child(this.button(t, "st-dr-ai-save", this.droveSaving ? this.tr("Saving…", "保存中…") : this.tr("Save", "保存"), (_e, cx) => {
+                const ai = { baseUrl: this.droveUrlInput.value().trim(), enabled: aiOn };
+                const k = this.droveKeyInput.value().trim();
+                if (this.droveKeyDirty && k) ai.apiKey = k;
+                this.saveDrovePatch({ ai }, cx, true);
+              }))
+              .child(this.button(t, "st-dr-ai-test", this.droveAiTesting ? this.tr("Testing…", "测试中…") : this.tr("Test Connection", "测试连通性"), (_e, cx) => this.testDroveAi(cx)))
+              .when(Boolean(aiStatus.keyMasked), (el) =>
+                el.child(this.button(t, "st-dr-ai-clear", this.tr("Clear Key", "清除 Key"), (_e, cx) => {
+                  this.droveKeyInput.set_value("");
+                  this.droveKeyDirty = false;
+                  this.saveDrovePatch({ clearAiKey: true }, cx);
+                })),
+              ),
+          )
+          .when(Boolean(this.droveTestResult), (el) => {
+            const trRes = this.droveTestResult;
+            const n = (trRes.availableModels ?? []).length;
+            return el.child(
+              div()
+                .text_size(12)
+                .text_color(trRes.ok ? t.ansi2 : t.blocked)
+                .child(
+                  trRes.ok
+                    ? `✓ OK (${trRes.latencyMs ?? 0}ms) · ${trRes.discoveredModel ?? ""}${n > 0 ? ` · ${n} ${this.tr("models", "个模型")}` : ""}`
+                    : `✗ ${trRes.error ?? "Failed"}${n > 0 ? ` (${n} ${this.tr("models listed", "个模型可选")})` : ""}`,
+                ),
+            );
+          }),
+      )
+      .child(div().h(14))
+      .child(this.heading(t, this.tr("Magpie Quota (Optional)", "Magpie 额度（可选）")))
+      .child(
+        this.row(
+          t,
+          this.tr("Enable Magpie quota integration", "启用 Magpie 额度联动"),
+          this.tr("Off by default. Shows live quota cards in Settings/Web and skips exhausted primary agents.", "默认关闭。开启后将在设置与网页端展示实时额度，并在主 Agent 额度耗尽时自动回退。"),
+          this.toggle(t, "st-dr-magpie-on", magpieOn, (_e, cx) => this.saveDrovePatch({ magpie: { enabled: !magpieOn } }, cx)),
+        ),
+      )
+      .when(magpieOn, (el) =>
+        el.child(
+          v_flex()
+            .gap(8)
+            .pt(8)
+            .child(div().text_size(12.5).text_color(t.dim).child(this.tr(`Gateway URL (blank = ${data?.magpieGatewayResolved ?? "http://127.0.0.1:3425"})`, `网关地址（留空则自动探测 ${data?.magpieGatewayResolved ?? "http://127.0.0.1:3425"}）`)))
+            .child(div().px(8).py(3).rounded(7).border_1().border_color(t.border).bg(t.background).child(Input.new(this.droveMagpieUrlInput).h(28).text_size(13).text_color(t.foreground)))
+            .child(
+              h_flex()
+                .gap(8)
+                .items_center()
+                .child(this.button(t, "st-dr-mag-save", this.tr("Save URL", "保存地址"), (_e, cx) => {
+                  this.saveDrovePatch({ magpie: { enabled: true, gatewayUrl: this.droveMagpieUrlInput.value().trim() } }, cx);
+                }))
+                .child(this.button(t, "st-dr-mag-test", this.droveMagpieTesting ? this.tr("Testing…", "测试中…") : this.tr("Test", "测试连接"), (_e, cx) => this.testDroveMagpie(cx)))
+                .child(this.button(t, "st-dr-mag-refresh", this.droveLoading ? this.tr("Refreshing…", "刷新中…") : this.tr("Refresh Quotas", "刷新额度"), (_e, cx) => {
+                  cx.spawn(async (cx) => { await this.loadDrove(); cx.notify(); });
+                })),
+            )
+            .when(Boolean(this.droveMagpieResult), (r) => {
+              const mr = this.droveMagpieResult;
+              const prov = (mr.providers ?? []).slice(0, 6).join(", ");
+              return r.child(
+                div()
+                  .text_size(12)
+                  .text_color(mr.ok ? t.ansi2 : t.blocked)
+                  .child(
+                    mr.ok
+                      ? `✓ ${mr.cardsCount ?? 0} ${this.tr("quota card(s)", "张额度卡片")}${prov ? ` (${prov})` : ""}`
+                      : `✗ ${mr.error ?? "Unavailable"}`,
+                  ),
+              );
+            })
+            .when(Boolean(data?.magpieError), (r) =>
+              r.child(div().text_size(12).text_color(t.blocked).child(`✗ ${data.magpieError}`)),
+            )
+            .when(magpieQuotas.length > 0, (r) =>
+              r.child(
+                v_flex()
+                  .gap(6)
+                  .pt(4)
+                  .children(
+                    magpieQuotas.slice(0, 8).map((card, idx) => {
+                      const wins = (card.windows ?? []).filter((w) => !w.text).slice(0, 3);
+                      return h_flex()
+                        .id(`st-dr-mq-${idx}`)
+                        .px(10)
+                        .py(6)
+                        .rounded(7)
+                        .border_1()
+                        .border_color(t.border)
+                        .bg(t.surface)
+                        .items_center()
+                        .justify_between()
+                        .gap(10)
+                        .child(
+                          h_flex()
+                            .gap(6)
+                            .items_center()
+                            .min_w(0)
+                            .child(div().text_size(12.5).font_semibold().text_color(t.foreground).child(card.name || card.provider))
+                            .when(Boolean(card.plan), (el) => el.child(div().px(5).py(1).rounded(4).bg(t.raised).text_size(10.5).text_color(t.dim).child(card.plan)))
+                            .when(Boolean(card.balance), (el) => el.child(div().text_size(11.5).text_color(t.muted).child(card.balance))),
+                        )
+                        .child(
+                          h_flex()
+                            .gap(8)
+                            .items_center()
+                            .children(
+                              wins.map((w) => {
+                                const pct = w.unlimited ? "∞" : `${Math.round(Math.max(0, Math.min(100, w.remaining ?? 0)))}%`;
+                                const color = w.unlimited ? t.ansi2 : (w.remaining ?? 0) <= 0 ? t.blocked : (w.remaining ?? 0) <= 20 ? t.working : t.ansi2;
+                                return div().text_size(11.5).text_color(color).child(`${w.name}: ${pct}`);
+                              }),
+                            ),
+                        );
+                    }),
+                  ),
+              ),
+            ),
+        ),
+      );
   }
 
   // Alerts ---------------------------------------------------------------
@@ -740,21 +1877,21 @@ export default class Settings extends View {
   alerts(t) {
     const sounds = this.person.sounds ?? {};
     const on = sounds.enabled !== false;
-    const file = (f) => (f ? f.split(/[\\/]/).pop() : "Herdr's sound");
+    const file = (f) => (f ? f.split(/[\\/]/).pop() : this.tr("Herdr's sound", "默认提示音"));
     return v_flex()
       .w_full()
-      .child(this.heading(t, "Sounds"))
+      .child(this.heading(t, this.tr("Sounds", "提示音")))
       .child(
         this.row(
           t,
-          "Play sounds",
-          "When an agent needs you, and when one finishes while you're not looking. A note shows in the corner either way.",
+          this.tr("Play sounds", "播放提示音"),
+          this.tr("When an agent needs you, and when one finishes while you're not looking. A note shows in the corner either way.", "当智能体需要你的确认，或在后台完成任务时播放提示音（右下角通知始终显示）。"),
           this.toggle(t, "st-sounds", on, (_e, cx) => this.change((p) => (p.sounds = { ...(p.sounds ?? {}), enabled: !on }), cx)),
         ),
       )
-      .child(this.row(t, "An agent needs you", file(sounds.blocked), this.button(t, "st-play-blocked", "Play", () => playSound("blocked"))))
-      .child(this.row(t, "An agent finished", file(sounds.done), this.button(t, "st-play-done", "Play", () => playSound("done"))))
-      .child(div().pt(12).text_size(12.5).line_height("18px").text_color(t.dim).child("Want your own sounds? Ask your agent to set sounds.done and sounds.blocked in settings.json to an MP3."));
+      .child(this.row(t, this.tr("An agent needs you", "智能体需要确认时"), file(sounds.blocked), this.button(t, "st-play-blocked", this.tr("Play", "试听"), () => playSound("blocked"))))
+      .child(this.row(t, this.tr("An agent finished", "智能体完成任务时"), file(sounds.done), this.button(t, "st-play-done", this.tr("Play", "试听"), () => playSound("done"))))
+      .child(div().pt(12).text_size(12.5).line_height("18px").text_color(t.dim).child(this.tr("Want your own sounds? Ask your agent to set sounds.done and sounds.blocked in settings.json to an MP3.", "如需自定义提示音，可在 settings.json 中配置 sounds.done 和 sounds.blocked 为 MP3 文件路径。")));
   }
 
   // Updates --------------------------------------------------------------
@@ -765,10 +1902,10 @@ export default class Settings extends View {
       const d = new Date(secs * 1000);
       return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
     };
-    const checked = u.checked ? ` Checked at ${at(u.checked)}.` : "";
-    const result = u.checking ? "Checking\u2026" : u.checked
-      ? `Up to date.${checked}`
-      : "No successful check. Check your connection and try again.";
+    const checked = u.checked ? this.tr(` Checked at ${at(u.checked)}.`, ` 上次检查：${at(u.checked)}。`) : "";
+    const result = u.checking ? this.tr("Checking\u2026", "检查中…") : u.checked
+      ? this.tr(`Up to date.${checked}`, `已是最新版本。${checked}`)
+      : this.tr("No successful check. Check your connection and try again.", "检查失败，请检查网络连接后重试。");
     // Pressed: "Checking\u2026" while it looks, then "Up to date" for a moment
     // (a find changes the row instead). One per row: an element shows once.
     const asked = this.asked && Date.now() - this.asked < 3000;
@@ -776,10 +1913,10 @@ export default class Settings extends View {
       !u.checks
         ? null
         : u.checking && this.asked
-          ? div().px(12).py(5).text_size(13).text_color(t.dim).child("Checking\u2026")
+          ? div().px(12).py(5).text_size(13).text_color(t.dim).child(this.tr("Checking\u2026", "检查中…"))
           : asked && u.checked && !u.checking
-            ? div().px(12).py(5).text_size(13).text_color(t.ansi2).child("\u2713 Up to date")
-            : this.button(t, id, "Check now", (_e, cx) => {
+            ? div().px(12).py(5).text_size(13).text_color(t.ansi2).child(this.tr("\u2713 Up to date", "✓ 已是最新"))
+            : this.button(t, id, this.tr("Check now", "立即检查"), (_e, cx) => {
                 this.asked = Date.now();
                 run("app.check_updates");
                 cx.notify();
@@ -787,32 +1924,30 @@ export default class Settings extends View {
     const primary = (id, label, f) =>
       div().id(id).px(12).py(5).rounded(7).cursor_pointer().bg(t.accent).text_color(t.accent_foreground).text_size(13).font_semibold().hover((s) => s.opacity(0.9)).on_click(f).child(label);
     const app = !u.app.updates
-      ? ["A build from source: it updates with git, not here.", null]
+      ? [this.tr("A build from source: it updates with git, not here.", "当前为源码构建版本：请通过 git 拉取更新。"), null]
       : u.app.ready
-        ? [`${u.app.ready} is ready. Restart to switch now; it also switches when you quit.`, primary("st-app-update", "Restart to update", () => run("app.update"))]
+        ? [this.tr(`${u.app.ready} is ready. Restart to switch now; it also switches when you quit.`, `${u.app.ready} 已就绪，重启后立即生效。`), primary("st-app-update", this.tr("Restart to update", "重启更新"), () => run("app.update"))]
         : [result, check("st-check-app")];
     const c = u.core;
     const core = c.managed
-      ? [`Managed by ${c.managed}: update it there.${c.ready ? ` ${c.ready} is available.` : ""}`, u.checks ? check("st-check-core") : null]
+      ? [this.tr(`Managed by ${c.managed}: update it there.${c.ready ? ` ${c.ready} is available.` : ""}`, `由 ${c.managed} 托管：请通过包管理器更新。${c.ready ? ` 已有新版本 ${c.ready}。` : ""}`), u.checks ? check("st-check-core") : null]
       : c.updating
-        ? ["Updating\u2026 your terminals keep running.", null]
+        ? [this.tr("Updating\u2026 your terminals keep running.", "更新中… 终端会话不会中断。"), null]
         : c.error
-          ? [`The update failed: ${c.error}`, primary("st-core-retry", "Try again", () => run("app.update_core"))]
+          ? [this.tr(`The update failed: ${c.error}`, `更新失败：${c.error}`), primary("st-core-retry", this.tr("Try again", "重试"), () => run("app.update_core"))]
           : c.ready
-            ? [`${c.ready} is ready. Your terminals keep running through it.`, primary("st-core-update", "Update herdr-core", () => run("app.update_core"))]
+            ? [this.tr(`${c.ready} is ready. Your terminals keep running through it.`, `${c.ready} 已就绪，更新过程不会中断现有终端。`), primary("st-core-update", this.tr("Update herdr2-core", "更新 herdr2-core"), () => run("app.update_core"))]
             : u.checks
               ? [result, check("st-check-core")]
-              : ["Not checked: a build from source looks for no updates.", null];
+              : [this.tr("Not checked: a build from source looks for no updates.", "源码构建版本不检查自动更新。"), null];
     return v_flex()
       .w_full()
-      .child(this.heading(t, "Herdr"))
-      .child(this.row(t, `Herdr ${u.app.version}`, app[0], h_flex().gap(8).flex_none()
-        .child(this.button(t, "st-whats-new", "What's new", () => { closeOverlay(props()?.overlay); run("app.whats_new"); }))
-        .when(Boolean(app[1]), (el) => el.child(app[1]))))
+      .child(this.heading(t, "Herdr2"))
+      .child(this.row(t, `Herdr2 ${fmtVer(u.app.version)}`.trim(), app[0], app[1] ?? div()))
       .child(div().h(18))
-      .child(this.heading(t, "herdr-core"))
-      .child(this.row(t, `herdr-core ${c.version ?? ""}`, core[0], core[1] ?? div()))
-      .child(div().pt(12).text_size(12.5).line_height("18px").text_color(t.dim).child("Herdr looks for both every hour and tells you in the corner. herdr-core runs your terminals, so they keep running through its updates."));
+      .child(this.heading(t, "herdr2-core"))
+      .child(this.row(t, `herdr2-core ${fmtVer(c.version)}`.trim(), core[0], core[1] ?? div()))
+      .child(div().pt(12).text_size(12.5).line_height("18px").text_color(t.dim).child(this.tr("Herdr2 looks for both every hour and tells you in the corner. herdr2-core runs your terminals, so they keep running through its updates.", "Herdr2 每小时检查一次更新，并由后台 herdr2-core 守护确保终端会话在更新时不受影响。")));
   }
 
 
@@ -845,15 +1980,15 @@ export default class Settings extends View {
     const s = telemetry();
     const on = s ? s.setting : this.person.telemetry !== false;
     const at = (secs) => new Date(secs * 1000).toLocaleString();
-    const why = s?.off_because ? `Off for now: ${s.off_because} is set where Herdr started.` : null;
+    const why = s?.off_because ? this.tr(`Off for now: ${s.off_because} is set where Herdr started.`, `当前已禁用：启动环境中设置了 ${s.off_because}。`) : null;
     const body = v_flex()
       .w_full()
-      .child(this.heading(t, "Usage data"))
+      .child(this.heading(t, this.tr("Usage data", "使用数据")))
       .child(
         this.row(
           t,
-          "Share anonymous usage data",
-          why ?? "Once a day: which agents and features you use, how many spaces and tabs, your system and Herdr's version. Never what's in your terminals, never names of files, folders or projects.",
+          this.tr("Share anonymous usage data", "分享匿名使用数据"),
+          why ?? this.tr("Once a day: which agents and features you use, how many spaces and tabs, your system and Herdr's version. Never what's in your terminals, never names of files, folders or projects.", "每天一次：仅统计使用的智能体与功能、工作区与标签页数量、系统及应用版本。绝不采集终端内容、文件名、目录或项目名称。"),
           this.toggle(t, "st-telemetry", on, (_e, cx) =>
             this.change((p) => {
               if (on) p.telemetry = false;
@@ -865,20 +2000,20 @@ export default class Settings extends View {
       .child(
         this.row(
           t,
-          "What we send",
-          s && !s.sends ? "This build never sends: it's built from source. You can still see what a release would send." : "Exactly what leaves your computer, word for word.",
-          this.button(t, "st-telemetry-show", this.showData ? "Hide" : "Show", (_e, cx) => {
+          this.tr("What we send", "上报内容预览"),
+          s && !s.sends ? this.tr("This build never sends: it's built from source. You can still see what a release would send.", "源码构建版本不会发送数据，但仍可预览正式版会发送的格式。") : this.tr("Exactly what leaves your computer, word for word.", "逐字展示将离开本机的全部数据内容。"),
+          this.button(t, "st-telemetry-show", this.showData ? this.tr("Hide", "隐藏") : this.tr("Show", "查看"), (_e, cx) => {
             this.showData = !this.showData;
             cx.notify();
           }),
         ),
       );
     if (!this.showData) return body;
-    if (!s?.enabled) return body.child(div().pt(14).text_size(13).text_color(t.dim).child("Nothing is collected or sent while it's off."));
+    if (!s?.enabled) return body.child(div().pt(14).text_size(13).text_color(t.dim).child(this.tr("Nothing is collected or sent while it's off.", "关闭期间不会收集或发送任何数据。")));
     return body
-      .children(s.queued.map((r, i) => this.report(t, `st-tq-${i}`, `Waiting to send: ${r.day}`, "Sent as is, soon.", r)))
-      .when(Boolean(s.draft), (el) => el.child(this.report(t, "st-td", "Today so far", "A draft: it changes until the day ends (UTC), then goes out once.", s.draft)))
-      .when(Boolean(s.last_sent), (el) => el.child(this.report(t, "st-tl", `Last sent: ${s.last_sent.report.day}`, `Sent ${at(s.last_sent.at)}.`, s.last_sent.report)));
+      .children(s.queued.map((r, i) => this.report(t, `st-tq-${i}`, this.tr(`Waiting to send: ${r.day}`, `待发送：${r.day}`), this.tr("Sent as is, soon.", "将按此内容尽快发送。"), r)))
+      .when(Boolean(s.draft), (el) => el.child(this.report(t, "st-td", this.tr("Today so far", "今日草稿"), this.tr("A draft: it changes until the day ends (UTC), then goes out once.", "当天结束（UTC）前会持续汇总，之后仅发送一次。"), s.draft)))
+      .when(Boolean(s.last_sent), (el) => el.child(this.report(t, "st-tl", this.tr(`Last sent: ${s.last_sent.report.day}`, `上次发送：${s.last_sent.report.day}`), this.tr(`Sent ${at(s.last_sent.at)}.`, `发送于 ${at(s.last_sent.at)}。`), s.last_sent.report)));
   }
 
   // ----------------------------------------------------------------------
@@ -894,9 +2029,9 @@ export default class Settings extends View {
       .gap(2)
       .border_r(1)
       .border_color(t.border)
-      .child(div().px(10).pt(6).pb(12).text_size(16).font_semibold().text_color(t.foreground).child("Settings"))
+      .child(div().px(10).pt(6).pb(12).text_size(16).font_semibold().text_color(t.foreground).child(this.tr("Settings", "设置")))
       .children(
-        SECTIONS.map((s) => {
+        SECTIONS().map((s) => {
           const on = s.id === this.section;
           return h_flex()
             .id(`st-s-${s.id}`)
@@ -914,10 +2049,16 @@ export default class Settings extends View {
               this.machineEdit = null;
               this.handle.focus();
               if (s.id === "machines") cx.spawn(async (cx) => { await this.loadMachines(); cx.notify(); });
+              if (s.id === "drove") cx.spawn(async (cx) => {
+                if (this.machineList === null) await this.loadMachines();
+                await this.loadDrove();
+                this.maybeAutoProbeDrove(cx);
+                cx.notify();
+              });
               cx.notify();
             })
             .child(svg(I(s.icon)).size(15).text_color(on ? t.accent : t.dim))
-            .child(div().flex_1().text_size(13.5).text_color(on ? t.foreground : t.muted).child(s.title))
+            .child(div().flex_1().text_size(13.5).text_color(on ? t.foreground : t.muted).child(this.tr(s.title, s.zh)))
             .when(s.id === "updates" && waiting, (el) => el.child(div().w(7).h(7).rounded(4).bg(t.accent)));
         }),
       );
@@ -952,7 +2093,7 @@ export default class Settings extends View {
         cx.stop_propagation();
         cx.notify();
       })
-      .child(nav.h_full().child(div().flex_1()).child(this.button(t, "st-feedback", "Send feedback", () => { closeOverlay(props()?.overlay); run("app.feedback"); })))
+      .child(nav.h_full().child(div().flex_1()).child(this.button(t, "st-feedback", this.tr("Send feedback", "发送反馈"), () => { closeOverlay(props()?.overlay); run("app.feedback"); })))
       .child(
         // A bar that always shows: the pages are taller than the dialog and
         // people should see that they scroll.
@@ -979,6 +2120,8 @@ export default class Settings extends View {
                         ? this.keyboard(t)
                       : this.section === "machines"
                         ? this.machines(t)
+                      : this.section === "drove"
+                        ? this.drove(t, cx)
                       : this.section === "alerts"
                         ? this.alerts(t)
                         : this.section === "privacy"

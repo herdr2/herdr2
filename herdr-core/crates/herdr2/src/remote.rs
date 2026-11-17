@@ -20,8 +20,8 @@ use tokio::sync::{mpsc, oneshot};
 
 /// A viewer here that a stream there goes to: its connection and channel.
 type Sink = (Arc<Conn>, u32);
-/// A pending reply, its stream sink and whether resize support is required.
-type Waiting = (oneshot::Sender<Value>, Option<(Sink, bool)>);
+/// A pending reply, its stream sink and whether resize support is required, or Drove SSE channel sender.
+type Waiting = (oneshot::Sender<Value>, Option<(Sink, bool)>, Option<mpsc::UnboundedSender<Vec<u8>>>);
 
 mod run;
 mod viewers;
@@ -46,6 +46,8 @@ pub struct Line {
     pending: Mutex<HashMap<u64, Waiting>>,
     /// Stream channel there -> the viewer here.
     streams: Mutex<HashMap<u32, Sink>>,
+    /// Framed Drove SSE relay channels opened on this line.
+    drove_streams: Mutex<HashMap<u32, mpsc::UnboundedSender<Vec<u8>>>>,
     next: AtomicU64,
     /// The events subscription that keeps this machine's mirror: its call id,
     /// then its channel, and a line of events not yet whole.
@@ -64,6 +66,7 @@ impl Line {
             closed: AtomicBool::new(false),
             pending: Mutex::default(),
             streams: Mutex::default(),
+            drove_streams: Mutex::default(),
             next: AtomicU64::new(2),
             mirror: Mutex::default(),
         })
@@ -73,11 +76,34 @@ impl Line {
         let mut pending = lock(&self.pending);
         self.closed.store(true, Ordering::Relaxed);
         pending.clear();
+        lock(&self.drove_streams).clear();
+    }
+
+    /// Opens a framed Drove SSE relay channel on the remote machine without losing initial frames.
+    pub async fn subscribe_drove(&self, machine: &str) -> Result<(u32, mpsc::UnboundedReceiver<Vec<u8>>), RpcError> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let res = self
+            .call_into_raw(machine, "drove.subscribe", json!({}), None, Some(tx), Duration::from_secs(10))
+            .await?;
+        let ch = res["channel"]
+            .as_u64()
+            .and_then(|c| u32::try_from(c).ok())
+            .ok_or_else(|| RpcError::internal("drove.subscribe did not return channel"))?;
+        Ok((ch, rx))
+    }
+
+    /// Closes a previously opened framed Drove SSE relay channel.
+    pub fn close_drove_stream(&self, ch: u32) {
+        if lock(&self.drove_streams).remove(&ch).is_some() {
+            let _ = self.frames.send(wire::encode(ch, wire::CLOSE, b""));
+        }
     }
 
     /// A reply to one of our calls: to whoever waits for it.
     fn take_reply(&self, mut reply: Value) {
-        let Some((waiter, sink)) = reply["id"].as_u64().and_then(|id| lock(&self.pending).remove(&id)) else { return };
+        let Some((waiter, sink, drove_tx)) = reply["id"].as_u64().and_then(|id| lock(&self.pending).remove(&id)) else {
+            return;
+        };
         if let (Some((sink, require_resize)), Some(there)) = (sink, reply["result"]["channel"].as_u64()) {
             if require_resize && reply["result"]["resize_notifications"] != true {
                 let _ = self.frames.send(wire::encode(there as u32, wire::CLOSE, b""));
@@ -88,6 +114,8 @@ impl Line {
             } else {
                 lock(&self.streams).insert(there as u32, sink);
             }
+        } else if let (Some(tx), Some(there)) = (drove_tx, reply["result"]["channel"].as_u64()) {
+            lock(&self.drove_streams).insert(there as u32, tx);
         }
         let _ = waiter.send(reply);
     }
@@ -117,6 +145,18 @@ impl Line {
         sink: Option<(Sink, bool)>,
         deadline: Duration,
     ) -> Result<Value, RpcError> {
+        self.call_into_raw(machine, method, params, sink, None, deadline).await
+    }
+
+    async fn call_into_raw(
+        &self,
+        machine: &str,
+        method: &str,
+        params: Value,
+        sink: Option<(Sink, bool)>,
+        drove_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+        deadline: Duration,
+    ) -> Result<Value, RpcError> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string();
         if req.len() > wire::MAX_PAYLOAD {
@@ -138,7 +178,7 @@ impl Line {
             if self.closed.load(Ordering::Relaxed) {
                 return Err(lost());
             }
-            pending.insert(id, (tx, sink));
+            pending.insert(id, (tx, sink, drove_tx));
         }
         let _asked = Asked { line: self, id };
         self.frames.send(wire::encode(0, wire::DATA, req.as_bytes())).map_err(|_| lost())?;
@@ -420,7 +460,10 @@ async fn hold(core: &Arc<Core>, m: &Machine, mut d: crate::machines::Dialed) {
                 let _ = line.frames.send(wire::encode(there, wire::CREDIT, &(payload.len() as u32).to_le_bytes()));
             }
             (there, wire::DATA) => {
-                if let Some((conn, here)) = lock(&line.streams).get(&there) {
+                if let Some(tx) = lock(&line.drove_streams).get(&there).cloned() {
+                    let _ = tx.send(payload.clone());
+                    let _ = line.frames.send(wire::encode(there, wire::CREDIT, &(payload.len() as u32).to_le_bytes()));
+                } else if let Some((conn, here)) = lock(&line.streams).get(&there) {
                     conn.with(|out| {
                         out.data(*here, &payload);
                     });
@@ -432,6 +475,7 @@ async fn hold(core: &Arc<Core>, m: &Machine, mut d: crate::machines::Dialed) {
                 }
             }
             (there, wire::CLOSE) => {
+                lock(&line.drove_streams).remove(&there);
                 if let Some((conn, here)) = lock(&line.streams).remove(&there) {
                     core.lock().relayed.remove(&(conn_key(&conn), here));
                     conn.with(|out| out.finish(here, &payload));
@@ -632,6 +676,8 @@ fn apply(record: &mut Value, kind: &str, data: &Value) {
         "title" => set(record, &["title"]),
         "labels" => set(record, &["labels"]),
         "keep" => set(record, &["keep"]),
+        "config" => set(record, &["model", "mode", "permission_mode", "config_options"]),
+        "usage" => record["context_usage"] = data.clone(),
         _ => {}
     }
 }
@@ -650,6 +696,11 @@ const CALLS_BACK: &[&str] = &[
 
 async fn from_machine(core: Arc<Core>, m: Machine, line: Arc<Line>, message: Value) {
     let method = message["method"].as_str().unwrap_or_default();
+    if method == "$/drove_open_web" {
+        let run_id = message["params"]["run_id"].as_str();
+        core.drove.record_peer_open_url(&m.name, run_id);
+        return;
+    }
     let mut params = message["params"].clone();
     let key = if method == "notes" {
         "parent"
@@ -796,6 +847,23 @@ pub fn tell_peer(core: &Core, st: &mut State, parent: &str, notes: &[String]) {
     }
 }
 
+/// Asks connected local peers (desktop UI over SSH) to open Drove Web locally for `run_id`.
+pub fn notify_peers_drove_open(core: &Core, run_id: Option<&str>) -> bool {
+    let st = core.lock();
+    if st.peer_lines.is_empty() {
+        return false;
+    }
+    let msg = json!({
+        "jsonrpc": "2.0",
+        "method": "$/drove_open_web",
+        "params": { "run_id": run_id.unwrap_or("") }
+    });
+    for (_, line) in st.peer_lines.values() {
+        line.message(&msg);
+    }
+    true
+}
+
 /// A parent here finished: machines it started work on end its children that
 /// asked to die with it (once the line is back, if it is down).
 pub fn orphaned_afar(core: &Core, st: &mut State, parent: TargetKey) {
@@ -883,6 +951,7 @@ const ON_AN_AGENT: &[&str] = &[
     "agent.wait",
     "agent.approve",
     "agent.deny",
+    "agent.config",
     "agent.put",
 ];
 
@@ -931,7 +1000,21 @@ pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Va
     let mut params = params.clone();
     let to = if matches!(
         method,
-        "agent.run" | "terminal.run" | "machine.exec" | "file.read" | "file.write" | "file.edit" | "doc.get" | "doc.set"
+        "agent.run"
+            | "terminal.run"
+            | "machine.exec"
+            | "file.read"
+            | "file.write"
+            | "file.edit"
+            | "doc.get"
+            | "doc.set"
+            | "drove.settings.get"
+            | "drove.settings.set"
+            | "drove.probe"
+            | "drove.ai.test"
+            | "drove.magpie.test"
+            | "drove.http_proxy"
+            | "drove.web.open"
     ) {
         let Some(on) = params["on"].as_str().map(String::from) else { return Ok(None) };
         params.as_object_mut().map(|p| p.remove("on"));
@@ -1122,7 +1205,11 @@ pub async fn forward_to(core: &Core, to: &To, method: &str, params: Value) -> Re
             let calls_me = core.lock().peers.get(id).map(|p| p.calls_me.clone()).unwrap_or_default();
             let deadline = deadline_for(core, method, &params);
             let reply = line.call(name, method, params, deadline).await?;
-            Ok(if method.starts_with("doc.") { reply } else { localize(core, name, &[calls_me.as_str()], reply) })
+            Ok(if method.starts_with("doc.") || method.starts_with("drove.") {
+                reply
+            } else {
+                localize(core, name, &[calls_me.as_str()], reply)
+            })
         }
     }
 }

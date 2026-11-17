@@ -93,6 +93,15 @@ fn workspace_terminal_dispatches_headless_acp_subagent_and_cleans_up_on_kill() {
     assert!(read_a.contains("ENV:TERM=<unset>"), "{read_a}");
     assert!(read_a.contains("ENV:H2_AGENT_ID=a1"), "{read_a}");
 
+    // ACP agents must never inject terminal input or automatic notes into PTY `t1`.
+    let blocked_agent_send = c.call(5, "agent.send", json!({"agent": "t1", "caller": "a1", "text": "echo SHOULD_NOT_TYPE"}));
+    assert_eq!(blocked_agent_send["error"]["data"]["kind"], "invalid_params", "{blocked_agent_send}");
+    let blocked_term_send = c.call(6, "terminal.send", json!({"terminal": "t1", "caller": "a1", "text": "echo SHOULD_NOT_TYPE"}));
+    assert_eq!(blocked_term_send["error"]["data"]["kind"], "invalid_params", "{blocked_term_send}");
+    let screen_t1 = s.json(&["read", "t1"])["text"].as_str().unwrap().to_owned();
+    assert!(!screen_t1.contains("<h2"), "terminal must not receive <h2> notes: {screen_t1}");
+    assert!(!screen_t1.contains("SHOULD_NOT_TYPE"), "ACP input leaked to PTY: {screen_t1}");
+
     // 4. `h2 send t1` + `h2 read t1` types into and reads the live PTY workspace screen.
     s.json(&["send", "t1", "echo HYBRID_OK_77"]);
     wait_until("PTY shell echoes HYBRID_OK_77", || {

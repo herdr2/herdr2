@@ -16,6 +16,7 @@ pub(super) fn flags_after_task(paths: &Paths, p: RunParams) -> Result<(RunParams
         model: q.model.or(p.model),
         mode: q.mode.or(p.mode),
         permissions: q.permissions.or(p.permissions),
+        dangerously_skip_permissions: p.dangerously_skip_permissions || q.dangerously_skip_permissions,
         no_mcp: p.no_mcp || q.no_mcp,
         argv: q.argv,
         name: q.name.or(p.name),

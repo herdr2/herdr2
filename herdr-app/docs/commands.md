@@ -101,6 +101,16 @@ Move a tab (the active one if no id) to a position in its space (1 = first), or 
 | `index` | no |
 | `by` | no |
 
+## `tab.merge`
+
+Merge all panes of the source tab beside the target tab's panes (direction: "right", default, "left", "down" or "up"), removing the source tab and selecting the target tab.
+
+| Argument | Required |
+|---|---|
+| `source` | yes |
+| `target` | yes |
+| `direction` | no |
+
 ## `pane.split`
 
 Split a pane (default: the focused one) "right" or "down" with a new terminal, or with a mod (`mod`, its `props`) beside it.
@@ -116,6 +126,14 @@ Split a pane (default: the focused one) "right" or "down" with a new terminal, o
 ## `pane.close`
 
 Close a pane and end its terminal.
+
+| Argument | Required |
+|---|---|
+| `pane` | no |
+
+## `pane.detach`
+
+Move a pane (default: the focused one) out of a split tab into its own tab beside it and select it.
 
 | Argument | Required |
 |---|---|
@@ -157,6 +175,16 @@ Where right-clicks in a terminal (default: the focused one) go when its program 
 |---|---|
 | `to` | yes |
 | `terminal` | no |
+
+## `terminal.view`
+
+Switch how a terminal displays in its tab pane: "peek" (structured conversation view, like ACP), "terminal" (terminal grid), or "toggle". Targets terminal, all non-ACP terminals in tab, or the focused terminal.
+
+| Argument | Required |
+|---|---|
+| `view` | yes |
+| `terminal` | no |
+| `tab` | no |
 
 ## `terminal.pin`
 
@@ -363,6 +391,54 @@ Show an agent (sub-agents too).
 |---|---|
 | `terminal` | yes |
 
+## `agent.rename`
+
+Rename an agent (asks the person when no name; an empty name returns to its automatic label; default target: the focused or shown agent).
+
+| Argument | Required |
+|---|---|
+| `terminal` | no |
+| `name` | no |
+
+## `agent.trash`
+
+Move an agent (default: the focused or selected agent) to the recycle bin, closing its pane while preserving its session so it can be restored.
+
+| Argument | Required |
+|---|---|
+| `terminal` | no |
+
+## `agent.restore`
+
+Restore a deleted agent from the recycle bin back into its space and tab.
+
+| Argument | Required |
+|---|---|
+| `terminal` | yes |
+
+## `agent.purge`
+
+Permanently delete an agent from the recycle bin and end its session.
+
+| Argument | Required |
+|---|---|
+| `terminal` | yes |
+
+## `agent.empty_trash`
+
+Permanently delete all agents in the recycle bin.
+
+No arguments.
+
+## `agent.status`
+
+Set an agent's status manually ("idle", "working", "blocked", "done"), or "auto" to return to automatic detection (default target: the focused terminal or shown agent).
+
+| Argument | Required |
+|---|---|
+| `status` | yes |
+| `terminal` | no |
+
 ## `agent.next`
 
 Show the next agent, in the order the agents list shows them.
@@ -511,7 +587,7 @@ No arguments.
 
 ## `app.settings`
 
-Open the settings (section: look, alerts, updates).
+Open the settings (section: look, machines, drove, alerts, updates, privacy).
 
 | Argument | Required |
 |---|---|
@@ -542,6 +618,14 @@ Use a theme (a preset or themes/<name>.json).
 | Argument | Required |
 |---|---|
 | `name` | yes |
+
+## `app.language`
+
+Set the interface language ("en" or "zh-CN").
+
+| Argument | Required |
+|---|---|
+| `language` | yes |
 
 ## `app.zoom_in`
 

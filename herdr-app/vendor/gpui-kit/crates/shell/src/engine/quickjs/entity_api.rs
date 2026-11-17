@@ -455,8 +455,28 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                         .map_err(|error| Exception::throw_type(&ctx, &error.to_string()))?;
                     colors.insert(name.clone(), color);
                 }
+                let parse_opt_color = |value: &Option<String>| -> JsResult<Option<gpui::Hsla>> {
+                    value
+                        .as_ref()
+                        .map(|hex| {
+                            crate::value::Bridged::Str(hex.clone())
+                                .as_color()
+                                .map_err(|error| Exception::throw_type(&ctx, &error.to_string()))
+                        })
+                        .transpose()
+                };
                 let style = gpui_base::input::InputEditorStyle {
+                    foreground: parse_opt_color(&options.colors.foreground)?.unwrap_or_default(),
+                    muted_foreground: parse_opt_color(&options.colors.line_number)?
+                        .unwrap_or_default(),
+                    background: parse_opt_color(&options.colors.background)?.unwrap_or_default(),
+                    border: parse_opt_color(&options.colors.border)?.unwrap_or_default(),
+                    selection: parse_opt_color(&options.colors.selection)?.unwrap_or_default(),
+                    caret: parse_opt_color(&options.colors.caret)?.unwrap_or_default(),
                     highlight_styles: std::sync::Arc::new(crate::syntax::SyntaxStyles(colors)),
+                    editor_invisible: parse_opt_color(&options.colors.invisible)?,
+                    editor_active_line: parse_opt_color(&options.colors.active_line)?,
+                    editor_gutter_background: parse_opt_color(&options.colors.gutter)?,
                     ..Default::default()
                 };
                 let store = alive(&ctx, &create_editor)?;

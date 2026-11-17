@@ -14,7 +14,7 @@ pub struct WaitSpec {
     /// Ends when output produced after the wait started contains this; then
     /// only blocked, error or exit end it otherwise.
     pub output: Option<String>,
-    pub timeout: Duration,
+    pub timeout: Option<Duration>,
     /// End at once if this turn already ended (a wait right after a send).
     pub after_turn: Option<u64>,
 }
@@ -251,7 +251,7 @@ impl Core {
         if already {
             return result(true, "status", None);
         }
-        let deadline = tokio::time::Instant::now() + spec.timeout;
+        let deadline = spec.timeout.map(|t| tokio::time::Instant::now() + t);
         let mut prev = start.status;
         let mut seen = String::new();
         let mut held = Vec::new();
@@ -311,7 +311,12 @@ impl Core {
                         seen.drain(..cut);
                     }
                 }
-                _ = tokio::time::sleep_until(deadline) => return result(false, "timeout", None),
+                _ = async {
+                    match deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => return result(false, "timeout", None),
             }
         }
     }

@@ -1,5 +1,6 @@
 //! Cumulative release notes and this launch's update range. Reading notes never
 //! changes the last successful version; only expanded spotlights are recorded.
+#![allow(dead_code)]
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

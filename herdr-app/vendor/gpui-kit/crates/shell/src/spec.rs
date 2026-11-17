@@ -198,6 +198,22 @@ pub(crate) enum TextViewFormat {
     Markdown,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct TextViewThemeSpec {
+    pub(crate) dark: Option<bool>,
+    pub(crate) foreground: Option<String>,
+    pub(crate) muted: Option<String>,
+    pub(crate) link: Option<String>,
+    pub(crate) selection: Option<String>,
+    pub(crate) code_background: Option<String>,
+    pub(crate) inline_code_foreground: Option<String>,
+    pub(crate) inline_code_background: Option<String>,
+    pub(crate) border: Option<String>,
+    pub(crate) heading: Option<String>,
+    pub(crate) syntax: std::collections::BTreeMap<String, String>,
+}
+
 /// A document keeps the authority of the script that described it. Image
 /// loads happen in later native rendering phases, after the script scope ends.
 #[derive(Clone)]
@@ -205,6 +221,7 @@ pub(crate) struct TextViewSpec {
     pub(crate) id: SharedString,
     pub(crate) text: SharedString,
     pub(crate) format: TextViewFormat,
+    pub(crate) theme: Option<TextViewThemeSpec>,
     pub(crate) policy: Rc<crate::policy::Policy>,
 }
 
@@ -215,6 +232,7 @@ impl std::fmt::Debug for TextViewSpec {
             .field("id", &self.id)
             .field("text", &self.text)
             .field("format", &self.format)
+            .field("theme", &self.theme)
             .finish_non_exhaustive()
     }
 }
@@ -224,6 +242,7 @@ impl PartialEq for TextViewSpec {
         self.id == other.id
             && self.text == other.text
             && self.format == other.format
+            && self.theme == other.theme
             && Rc::ptr_eq(&self.policy, &other.policy)
     }
 }

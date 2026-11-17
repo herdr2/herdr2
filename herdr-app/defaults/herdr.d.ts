@@ -62,7 +62,7 @@ export function playSound(sound: string): null;
  * New spaces and tabs take focus by default. Boolean focus: false keeps the shown
  * space, selected tab and keyboard focus; background tabs are appended in creation order.
  * With no space shown, a new space is shown even with focus: false.
- * Panes: pane.split {direction: "right" | "down", pane?}, pane.close {pane?}, pane.zoom {pane?},
+ * Panes: pane.split {direction: "right" | "down", pane?}, pane.close {pane?}, pane.detach {pane?}, pane.zoom {pane?},
  *   pane.focus {pane | terminal}, pane.go {direction}, pane.swap {pane?, direction | target}.
  *   Pane menus get target { pane, terminal }.
  * Terminals: terminal.open {argv?, folder?, place?: "tab" | "right" | "down"}, terminal.kill {terminal},
@@ -75,6 +75,7 @@ export function playSound(sound: string): null;
  *   terminal.clear_selection {terminal?}. No default keys or built-in copy mode.
  *   terminal.select_all {terminal?} (whole screen and scrollback, or only the alternate screen; Cmd+A on macOS).
  *   terminal.right_click {to: "program" | "menu", terminal?} (right-clicks to a program that takes the mouse; Shift: the menu).
+ *   terminal.view {view: "peek" | "terminal" | "toggle", terminal?, tab?} (switch a terminal pane between structured conversation view and raw terminal grid).
  *   terminal.scroll {lines | pages | to: "top" | "bottom", terminal?} (Herdr's view of the history: negative goes up; pages may be fractional).
  * Agents: agent.next, agent.prev (the agents list's order), agent.focus {terminal} (sub-agents too),
  *   agent.send {agent?, text, steer?}, agent.interrupt {agent?}, agent.approve {agent?, option?}, agent.deny {agent?}.
@@ -179,6 +180,8 @@ export interface AgentInfo {
   /** "done" means it finished while you weren't looking; it becomes "idle" once you look
    *  (here or on another Herdr client). */
   status: Status;
+  /** Manual status override set via `agent.status` / `herdr.status`, or null when automatic. */
+  manual_status?: "idle" | "working" | "blocked" | "done" | null;
   /** What the agent reported (OSC 7501 `app`), e.g. "claude-code", "pi", "codex". */
   app: string | null;
   program: Program;
@@ -226,6 +229,8 @@ export interface PaneInfo {
   zoomed: boolean;
   /** The app's top-center grip can rearrange this pane. False when zoomed or alone. */
   movable: boolean;
+  /** True when a non-ACP terminal pane is currently displayed in structured ACP-style (`peek`) view. */
+  structured?: boolean;
   /** History scroll for a terminal pane's attached view; null for mod panes / alt-screen. Live. */
   scroll?: PaneScroll | null;
 }
@@ -379,10 +384,10 @@ export function sendFeedback(body: import("gpui-kit").HostValue, images?: string
 
 /** What the app runs with: the shown layout's look (theme name, fonts, sizes, terminal
  *  padding and opacity, terminal_line_height, terminal_cell_width and terminal_scroll_speed) with the
- *  person's zoom and sounds. terminal_line_height and terminal_cell_width: number, default 1, clamped
- *  to 0.8..2; terminal_scroll_speed: number, default 1, clamped to 0.1..5. Layout values override
- *  settings.json. */
-export function settings(): Record<string, unknown>;
+ *  person's zoom, language ("en" | "zh-CN"), and sounds. terminal_line_height and terminal_cell_width:
+ *  number, default 1, clamped to 0.8..2; terminal_scroll_speed: number, default 1, clamped to 0.1..5.
+ *  Layout values override settings.json. */
+export function settings(): Record<string, unknown> & { language?: "en" | "zh-CN" };
 
 /** Every key binding: { section, keys, action }. */
 export function keys(): { section: string; keys: string; action: string }[];

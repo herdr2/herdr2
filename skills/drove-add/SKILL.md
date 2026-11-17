@@ -1,0 +1,34 @@
+---
+name: drove-add
+description: Append new tasks dynamically to an active or existing Drove Run without restarting or losing warm workers. Use when adding follow-up implementation, verification, or review tasks to the current Run.
+disable-model-invocation: true
+---
+
+# `/drove-add`: Append Tasks to the Current Drove Run
+
+Use `h2 drove add` to hot-plug new tasks into the current Run (recorded by `h2 drove use` / latest `h2 drove plan`):
+
+## Single Task (Quick Flags)
+
+```bash
+h2 drove add \
+  --key fix-lint \
+  --title "Fix clippy warnings" \
+  --role coder \
+  --change "Resolve clippy warnings in src/drove/" \
+  --deps impl \
+  --verify "cargo clippy --all-targets"
+```
+
+Pass `--worktree` to isolate the task in a detached Git / AOSP harness worktree merged back automatically on completion.
+
+## Batch Tasks (YAML/JSON)
+
+```bash
+h2 drove add --file /tmp/more-tasks.yaml
+# or `--run <run_id>` and `--on <machine>` for remote SSH targets
+```
+
+After appending tasks:
+- Run `h2 drove wait` (if not already waiting) to block until the newly added tasks settle or ask questions.
+- Run `h2 drove show` to see current task statuses and warm worker states.

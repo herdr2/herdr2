@@ -74,3 +74,83 @@ test("a settings.json that can't be read, or an edit that throws, says why", asy
   expect(disk.writes).toBe(0);
   expect(thrown.toasts).toEqual([{ title: "Cannot read settings.json", body: "no such section", level: "error" }]);
 });
+
+test("drove probedModelsFor normalizes string arrays and object entries without duplicates", () => {
+  const view = new Settings();
+  view.droveData = {
+    agents: {
+      agents: [
+        { id: "claude", installed: true, models: ["claude-sonnet-4-6", "claude-opus-4-6", "claude-sonnet-4-6"] },
+        { id: "codex", installed: true, models: [{ id: "gpt-5.4", name: "GPT-5.4" }, "gpt-5.3-codex"] },
+      ],
+    },
+  };
+  expect(view.probedModelsFor("claude")).toEqual([
+    { id: "claude-sonnet-4-6", label: "claude-sonnet-4-6" },
+    { id: "claude-opus-4-6", label: "claude-opus-4-6" },
+  ]);
+  expect(view.probedModelsFor("codex")).toEqual([
+    { id: "gpt-5.4", label: "gpt-5.4 · GPT-5.4" },
+    { id: "gpt-5.3-codex", label: "gpt-5.3-codex" },
+  ]);
+});
+
+test("aiAvailableModels merges endpoint models from test results and daemon status cleanly", () => {
+  const view = new Settings();
+  view.droveData = {
+    aiStatus: { availableModels: ["deepseek-chat", "deepseek-reasoner"] },
+  };
+  view.droveTestResult = {
+    ok: true,
+    discoveredModel: "gpt-4o-mini",
+    availableModels: ["gpt-4o-mini", "deepseek-chat"],
+  };
+  expect(view.aiAvailableModels()).toEqual(["gpt-4o-mini", "deepseek-chat", "deepseek-reasoner"]);
+});
+
+test("roleChain and applyRoleChain support 4+ agents, reordering, and primary promotion", () => {
+  const view = new Settings();
+  const role: any = {
+    primary: { agent: "claude", model: "claude-opus-4-6", effort: "high" },
+    fallbacks: [
+      { agent: "codex", model: "gpt-5.4", effort: "high" },
+      { agent: "agy", model: null, effort: "medium" },
+      { agent: "gemini", model: "gemini-2.5-pro", effort: "low" },
+    ],
+  };
+
+  const chain = view.roleChain(role);
+  expect(chain.map((c: any) => c.agent)).toEqual(["claude", "codex", "agy", "gemini"]);
+
+  // Promote #3 (agy) to #1
+  const reordered = [chain[2], chain[0], chain[1], chain[3]];
+  view.applyRoleChain(role, reordered);
+  expect(role.primary).toEqual({ agent: "agy", model: null, effort: "medium" });
+  expect(role.fallbacks.map((c: any) => c.agent)).toEqual(["claude", "codex", "gemini"]);
+
+  // Remove #1 -> #2 (claude) becomes new primary, remaining fallbacks preserved
+  view.applyRoleChain(role, reordered.slice(1));
+  expect(role.primary).toEqual({ agent: "claude", model: "claude-opus-4-6", effort: "high" });
+  expect(role.fallbacks.map((c: any) => c.agent)).toEqual(["codex", "gemini"]);
+});
+
+test("maybeAutoProbeDrove reuses saved fullProbe models without re-probing", () => {
+  const view = new Settings();
+  let calls = 0;
+  view.probeDroveAgents = () => {
+    calls++;
+  };
+  view.droveMachine = "local";
+  view.droveData = {
+    agents: { fullProbe: true, agents: [{ id: "claude", installed: true, models: ["claude-opus-4-6"] }] },
+  };
+  view.maybeAutoProbeDrove({ notify() {} });
+  expect(calls).toBe(0);
+
+  view.droveMachine = "wsl";
+  view.droveData = {
+    agents: { fullProbe: false, agents: [{ id: "claude", installed: true, models: [] }] },
+  };
+  view.maybeAutoProbeDrove({ notify() {} });
+  expect(calls).toBe(1);
+});

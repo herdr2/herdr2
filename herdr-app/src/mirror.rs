@@ -72,17 +72,29 @@ pub fn local<'a>(id: &'a str, machine: Option<&str>) -> &'a str {
     machine.and_then(|m| id.strip_prefix(m).and_then(|s| s.strip_prefix('/'))).unwrap_or(id)
 }
 
+fn map_acp_peek_props(name: &str, props: &mut serde_json::Value, map: &impl Fn(&str) -> String) {
+    if name == "peek"
+        && props.get("acp").and_then(serde_json::Value::as_bool) == Some(true)
+        && let Some(t) = props.get("terminal").and_then(serde_json::Value::as_str).map(str::to_owned)
+    {
+        props["terminal"] = serde_json::Value::String(map(&t));
+    }
+}
+
 fn map_node(node: &mut Node, map: &impl Fn(&str) -> String) {
     node.id = map(&node.id);
     match &mut node.kind {
         Kind::Block { content: Content::Terminal { terminal } } => *terminal = map(terminal),
+        Kind::Block { content: Content::Mod { name, props } } => map_acp_peek_props(name, props, map),
         Kind::Stack { active: Some(active), .. } => *active = map(active),
         _ => {}
     }
     for float in &mut node.floating {
         float.id = map(&float.id);
-        if let Content::Terminal { terminal } = &mut float.content {
-            *terminal = map(terminal);
+        match &mut float.content {
+            Content::Terminal { terminal } => *terminal = map(terminal),
+            Content::Mod { name, props } => map_acp_peek_props(name, props, map),
+            _ => {}
         }
     }
     if let Some(children) = node.children_mut() {
@@ -355,5 +367,27 @@ mod tests {
     #[test]
     fn fresh_ids_are_not_a_per_screen_counter() {
         assert_ne!(Model::default().fresh_id("p"), Model::default().fresh_id("p"));
+    }
+
+    #[test]
+    fn acp_peek_tab_address_is_mapped_across_machines() {
+        let mut m = Model::default();
+        let pane = Node::block(
+            "wsl/p1",
+            Content::Mod {
+                name: "peek".into(),
+                props: serde_json::json!({ "acp": true, "tab": true, "terminal": "wsl/a8" }),
+            },
+        );
+        m.add_space("wsl/s1", "work", "/work", Tab::with_pane("wsl/tb1", "acp", pane));
+        m.space_mut("wsl/s1").unwrap().machine = Some("wsl".into());
+        let doc = Document::capture(&m, Some("wsl"));
+        let root_json = serde_json::to_value(&doc.spaces[0].tabs[0].root).unwrap();
+        assert_eq!(root_json["children"][0]["content"]["props"]["terminal"], "a8");
+
+        let mut restored = Model::default();
+        doc.replace(&mut restored, Some("wsl"));
+        assert_eq!(restored.acp_pane_of("wsl/a8").as_deref(), Some("wsl/p1"));
+        assert_eq!(restored.any_address_of("wsl/p1").as_deref(), Some("wsl/a8"));
     }
 }

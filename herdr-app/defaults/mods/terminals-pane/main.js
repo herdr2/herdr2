@@ -35,6 +35,7 @@ export default class TerminalsPane extends View {
     const p = this.me();
     if (!p) return div();
     const pane = p.pane;
+    const tabPaneCount = panes().filter((x) => x.tab === p.tab).length;
     const g = p.program;
     const where = folder(p.cwd);
     // Shells often put the folder in their title already.
@@ -56,7 +57,7 @@ export default class TerminalsPane extends View {
       .child(div().flex_1().truncate().text_color("#8b8f95").child(dir))
       .child(this.button(`th-r-${pane}`, "split-right", "pane.split", { direction: "right", pane }))
       .child(this.button(`th-d-${pane}`, "split-down", "pane.split", { direction: "down", pane }))
-      .child(this.button(`th-z-${pane}`, p.zoomed ? "unzoom" : "zoom", "pane.zoom", { pane }))
+      .when(tabPaneCount > 1, (el) => el.child(this.button(`th-z-${pane}`, "zoom", "pane.detach", { pane })))
       .child(this.button(`th-x-${pane}`, "close", "pane.close", { pane }));
   }
 }

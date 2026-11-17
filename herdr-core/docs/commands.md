@@ -31,6 +31,8 @@ Communicate & control
   send <a|t> <text>           queue ACP prompt or paste text into PTY (--steer: cancel & deliver next)
   approve <a> [--option ID]   approve a blocked ACP agent's pending permission request
   deny <a> [--option ID]      deny a blocked ACP agent's pending permission request
+  config <a> --id K (--value V|--bool B)
+                              set live ACP model, reasoning effort, fast mode, or session mode
   interrupt <a|t>             send ACP `session/cancel` or PTY interrupt (Esc / Ctrl-C)
   wait <a|t>                  wait until not `working` (--output X, --children any|all)
   put <a|t> <file>            stage a file beside agent or terminal, print path
@@ -51,10 +53,11 @@ More
   machine add|ls|login|update|rename|rm
                               manage remote machines over SSH or `--via`
   connect                     JSON-RPC API over stdin/stdout
+  drove status|web|probe|...  manage Drove DAG orchestration and Web UI
   schema                      print OpenRPC 1.3.2 JSON Schema
 
 <a> / <t> is an agent (`a1`), terminal (`t1`), remote (`machine/a7`), or unique name.
-Built-in `--agent` presets: claude, codex, gemini, opencode, copilot, cursor, cursor-agent, kimi, qwen, pi, hermes, glm, zcode.
+Built-in `--agent` presets: agy, claude, codex, cursor, dsh, gemini, opencode, copilot, kimi, qwen, pi, hermes, glm, zcode.
 Options: --json (default when piped except read/file read/exec), -V --version, --licenses.
 Per command: h2 <command> --help
 Settings: ~/.config/herdr2/config.toml (default_permissions, inject_mcp, [agents]).
@@ -94,6 +97,24 @@ Options:
   -h, --help               Print help
 ```
 
+## h2 config
+
+```text
+Configure a live ACP session option (model, reasoning effort, fast mode, session mode)
+
+Usage: h2 config [OPTIONS] --id <ID> <AGENT>
+
+Arguments:
+  <AGENT>  The agent: `a7`, a name, or `machine/a7`
+
+Options:
+      --id <ID>        Option id to set (e.g. `model`, `reasoning_effort`, `fast-mode`, `mode`)
+      --json           JSON output even in a terminal
+      --value <VALUE>  String option value (for select options such as model, reasoning effort, or mode)
+      --bool <BOOL>    Boolean option value (`true` or `false`, e.g. for `fast-mode`) [possible values: true, false]
+  -h, --help           Print help
+```
+
 ## h2 connect
 
 ```text
@@ -120,6 +141,593 @@ Arguments:
 Options:
       --json             JSON output even in a terminal
       --option <OPTION>  Explicit ACP permission `optionId` to choose (default: first matching option)
+  -h, --help             Print help
+```
+
+## h2 drove
+
+```text
+Manage multi-agent Drove orchestration (`drove status`, `drove web`, `drove settings`, ...)
+
+Usage: h2 drove [OPTIONS] [COMMAND]
+
+Commands:
+  status        Show Drove web server, configured roles, AI status, and active runs
+  web           Print or open the Drove Web UI URL in the browser
+  settings      Read Drove configuration, resolved roles, and AI connection status
+  settings-set  Update Drove configuration from a JSON file (removes temp file if requested)
+  probe         Probe installed ACP agents and discover their live model & effort options
+  ai-test       Test the lightweight AI assistant URL and API key
+  magpie-test   Test the optional Magpie quota gateway
+  use           Set the active default Run ID for subsequent CLI commands
+  plan          Create a Drove Run from a YAML/JSON plan file or stdin and launch its DAG
+  add           Append one or more tasks to an existing Run
+  quick         Quickly launch a single-task Run from the command line
+  wait          Wait for pending coordinator messages, task failures, or Run completion
+  inbox         List unread coordinator inbox messages for a Run
+  show          Inspect a Run, Task, or Message snapshot by ID
+  ack           Acknowledge a coordinator inbox message
+  reply         Reply to a worker question or escalation message
+  send          Send guidance to a running task worker (or interrupt current turn)
+  inspect       Inspect structured diagnostics and recent items for a task or attempt
+  retry         Retry a task with optional hint or new role/agent/model
+  route         Override role/agent/model/effort assignment on a pending or ready task
+  cancel        Cancel a specific task (by ID/key) or an entire Run
+  complete      Finalize a Run (runs Run-level verify gate if configured)
+  pause         Pause scheduling new tasks in a Run
+  resume        Resume a paused Run
+  worker        Worker protocol subcommands invoked by spawned worker ACP sessions
+  install       Install Drove agent skills (`drove`, `drove-add`, `drove-setup`)
+  help          Print this message or the help of the given subcommand(s)
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h2 drove ack
+
+```text
+Acknowledge a coordinator inbox message
+
+Usage: h2 drove ack [OPTIONS] <MESSAGE_ID>
+
+Arguments:
+  <MESSAGE_ID>  
+
+Options:
+      --json          JSON output even in a terminal
+      --on <MACHINE>  
+  -h, --help          Print help
+```
+
+## h2 drove add
+
+```text
+Append one or more tasks to an existing Run
+
+Usage: h2 drove add [OPTIONS]
+
+Options:
+      --json             JSON output even in a terminal
+      --run <RUN>        Run ID (defaults to `drove use` or latest active run)
+      --file <FILE>      
+      --stdin            
+      --key <KEY>        
+      --title <TITLE>    
+      --change <CHANGE>  
+      --role <ROLE>      
+      --deps <DEPS>      
+      --verify <VERIFY>  
+      --worktree         
+      --on <MACHINE>     
+  -h, --help             Print help
+```
+
+## h2 drove ai-test
+
+```text
+Test the lightweight AI assistant URL and API key
+
+Usage: h2 drove ai-test [OPTIONS]
+
+Options:
+      --file <FILE>    
+      --json           JSON output even in a terminal
+      --url <URL>      
+      --model <MODEL>  
+      --on <MACHINE>   
+      --consume        Delete `--file` right after reading it
+  -h, --help           Print help
+```
+
+## h2 drove cancel
+
+```text
+Cancel a specific task (by ID/key) or an entire Run
+
+Usage: h2 drove cancel [OPTIONS] [TARGET]
+
+Arguments:
+  [TARGET]  
+
+Options:
+      --json          JSON output even in a terminal
+      --run <RUN>     
+      --on <MACHINE>  
+  -h, --help          Print help
+```
+
+## h2 drove complete
+
+```text
+Finalize a Run (runs Run-level verify gate if configured)
+
+Usage: h2 drove complete [OPTIONS] [RUN]
+
+Arguments:
+  [RUN]  
+
+Options:
+      --json               JSON output even in a terminal
+      --summary <SUMMARY>  
+      --force              
+      --on <MACHINE>       
+  -h, --help               Print help
+```
+
+## h2 drove inbox
+
+```text
+List unread coordinator inbox messages for a Run
+
+Usage: h2 drove inbox [OPTIONS]
+
+Options:
+      --json          JSON output even in a terminal
+      --run <RUN>     
+      --on <MACHINE>  
+  -h, --help          Print help
+```
+
+## h2 drove inspect
+
+```text
+Inspect structured diagnostics and recent items for a task or attempt
+
+Usage: h2 drove inspect [OPTIONS] <TARGET>
+
+Arguments:
+  <TARGET>  
+
+Options:
+      --json          JSON output even in a terminal
+      --run <RUN>     
+      --on <MACHINE>  
+  -h, --help          Print help
+```
+
+## h2 drove install
+
+```text
+Install Drove agent skills (`drove`, `drove-add`, `drove-setup`)
+
+Usage: h2 drove install [OPTIONS]
+
+Options:
+      --json          JSON output even in a terminal
+      --target <DIR>  
+  -h, --help          Print help
+```
+
+## h2 drove magpie-test
+
+```text
+Test the optional Magpie quota gateway
+
+Usage: h2 drove magpie-test [OPTIONS]
+
+Options:
+      --json          JSON output even in a terminal
+      --url <URL>     
+      --on <MACHINE>  
+  -h, --help          Print help
+```
+
+## h2 drove pause
+
+```text
+Pause scheduling new tasks in a Run
+
+Usage: h2 drove pause [OPTIONS] [RUN]
+
+Arguments:
+  [RUN]  
+
+Options:
+      --json          JSON output even in a terminal
+      --on <MACHINE>  
+  -h, --help          Print help
+```
+
+## h2 drove plan
+
+```text
+Create a Drove Run from a YAML/JSON plan file or stdin and launch its DAG
+
+Usage: h2 drove plan [OPTIONS]
+
+Options:
+      --file <FILE>
+          Plan YAML or JSON file (`{ objective?, maxConcurrency?, verify?, tasks: [...] }` or task list)
+      --json
+          JSON output even in a terminal
+      --stdin
+          Read plan YAML/JSON from stdin
+      --objective <OBJECTIVE>
+          Run objective (defaults to plan `objective` or directory name)
+      --cwd <CWD>
+          Workspace root (defaults to current working directory)
+      --max-concurrency <MAX_CONCURRENCY>
+          Maximum parallel workers (1..16)
+      --verify <VERIFY>
+          Run-level verification command executed on `complete`
+      --session <SESSION>
+          Override coordinator session address (defaults to `$H2_AGENT_ID` or `$H2_TERMINAL_ID`)
+      --on <MACHINE>
+          
+  -h, --help
+          Print help
+```
+
+## h2 drove probe
+
+```text
+Probe installed ACP agents and discover their live model & effort options
+
+Usage: h2 drove probe [OPTIONS]
+
+Options:
+      --json          JSON output even in a terminal
+      --on <MACHINE>  
+      --refresh       Run live ACP initialize+session/new probing instead of quick cache/PATH scan
+  -h, --help          Print help
+```
+
+## h2 drove quick
+
+```text
+Quickly launch a single-task Run from the command line
+
+Usage: h2 drove quick [OPTIONS] <PROMPT>
+
+Arguments:
+  <PROMPT>  
+
+Options:
+      --json             JSON output even in a terminal
+      --role <ROLE>      [default: coder]
+      --cwd <CWD>        
+      --verify <VERIFY>  
+      --worktree         
+      --wait             
+      --on <MACHINE>     
+  -h, --help             Print help
+```
+
+## h2 drove reply
+
+```text
+Reply to a worker question or escalation message
+
+Usage: h2 drove reply [OPTIONS] <MESSAGE_ID> <BODY>
+
+Arguments:
+  <MESSAGE_ID>  
+  <BODY>        
+
+Options:
+      --json          JSON output even in a terminal
+      --on <MACHINE>  
+  -h, --help          Print help
+```
+
+## h2 drove resume
+
+```text
+Resume a paused Run
+
+Usage: h2 drove resume [OPTIONS] [RUN]
+
+Arguments:
+  [RUN]  
+
+Options:
+      --json          JSON output even in a terminal
+      --on <MACHINE>  
+  -h, --help          Print help
+```
+
+## h2 drove retry
+
+```text
+Retry a task with optional hint or new role/agent/model
+
+Usage: h2 drove retry [OPTIONS] <TASK>
+
+Arguments:
+  <TASK>  
+
+Options:
+      --hint <HINT>      
+      --json             JSON output even in a terminal
+      --role <ROLE>      
+      --agent <AGENT>    
+      --model <MODEL>    
+      --effort <EFFORT>  
+      --fresh            
+      --run <RUN>        
+      --on <MACHINE>     
+  -h, --help             Print help
+```
+
+## h2 drove route
+
+```text
+Override role/agent/model/effort assignment on a pending or ready task
+
+Usage: h2 drove route [OPTIONS] <TASK>
+
+Arguments:
+  <TASK>  
+
+Options:
+      --json             JSON output even in a terminal
+      --role <ROLE>      
+      --agent <AGENT>    
+      --model <MODEL>    
+      --effort <EFFORT>  
+      --worker <WORKER>  
+      --run <RUN>        
+      --on <MACHINE>     
+  -h, --help             Print help
+```
+
+## h2 drove send
+
+```text
+Send guidance to a running task worker (or interrupt current turn)
+
+Usage: h2 drove send [OPTIONS] <TASK> <TEXT>
+
+Arguments:
+  <TASK>  
+  <TEXT>  
+
+Options:
+      --interrupt     
+      --json          JSON output even in a terminal
+      --run <RUN>     
+      --on <MACHINE>  
+  -h, --help          Print help
+```
+
+## h2 drove settings
+
+```text
+Read Drove configuration, resolved roles, and AI connection status
+
+Usage: h2 drove settings [OPTIONS]
+
+Options:
+      --json          JSON output even in a terminal
+      --on <MACHINE>  
+  -h, --help          Print help
+```
+
+## h2 drove settings-set
+
+```text
+Update Drove configuration from a JSON file (removes temp file if requested)
+
+Usage: h2 drove settings-set [OPTIONS] --file <FILE>
+
+Options:
+      --file <FILE>   
+      --json          JSON output even in a terminal
+      --on <MACHINE>  
+      --consume       Delete the input JSON file right after reading it (safe for API keys)
+  -h, --help          Print help
+```
+
+## h2 drove show
+
+```text
+Inspect a Run, Task, or Message snapshot by ID
+
+Usage: h2 drove show [OPTIONS] [ID]
+
+Arguments:
+  [ID]  
+
+Options:
+      --json          JSON output even in a terminal
+      --on <MACHINE>  
+  -h, --help          Print help
+```
+
+## h2 drove status
+
+```text
+Show Drove web server, configured roles, AI status, and active runs
+
+Usage: h2 drove status [OPTIONS]
+
+Options:
+      --json          JSON output even in a terminal
+      --on <MACHINE>  Target remote machine (`h2 machine ls`)
+  -h, --help          Print help
+```
+
+## h2 drove use
+
+```text
+Set the active default Run ID for subsequent CLI commands
+
+Usage: h2 drove use [OPTIONS] <RUN_ID>
+
+Arguments:
+  <RUN_ID>  
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h2 drove wait
+
+```text
+Wait for pending coordinator messages, task failures, or Run completion
+
+Usage: h2 drove wait [OPTIONS]
+
+Options:
+      --json                   JSON output even in a terminal
+      --run <RUN>              
+      --timeout <TIMEOUT>      [default: 300]
+      --since-seq <SINCE_SEQ>  [default: 0]
+      --on <MACHINE>           
+  -h, --help                   Print help
+```
+
+## h2 drove web
+
+```text
+Print or open the Drove Web UI URL in the browser
+
+Usage: h2 drove web [OPTIONS]
+
+Options:
+      --json          JSON output even in a terminal
+      --run <RUN>     Pre-select a run ID (`run_...` or `machine/run_...`)
+      --on <MACHINE>  Target remote machine
+      --no-open       Print URL only without launching a browser
+  -h, --help          Print help
+```
+
+## h2 drove worker
+
+```text
+Worker protocol subcommands invoked by spawned worker ACP sessions
+
+Usage: h2 drove worker [OPTIONS] <COMMAND>
+
+Commands:
+  context  Print current worker & active attempt context from the daemon
+  inbox    Drain unread notes sent to this worker attempt
+  ask      Ask the coordinator a blocking question and print the reply
+  note     Post a non-blocking progress note to the coordinator
+  read     Read a dependency task result, verify log, or review patch slice
+  done     Submit task attempt completion or explicit failure to the Drove daemon gates
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h2 drove worker ask
+
+```text
+Ask the coordinator a blocking question and print the reply
+
+Usage: h2 drove worker ask [OPTIONS] <QUESTION>
+
+Arguments:
+  <QUESTION>  
+
+Options:
+      --json                   JSON output even in a terminal
+      --options <OPTIONS>      
+      --recommend <RECOMMEND>  
+      --why <WHY>              
+      --timeout <TIMEOUT>      [default: 300]
+  -h, --help                   Print help
+```
+
+## h2 drove worker context
+
+```text
+Print current worker & active attempt context from the daemon
+
+Usage: h2 drove worker context [OPTIONS]
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h2 drove worker done
+
+```text
+Submit task attempt completion or explicit failure to the Drove daemon gates
+
+Usage: h2 drove worker done [OPTIONS]
+
+Options:
+      --json               JSON output even in a terminal
+      --outcome <OUTCOME>  [default: done]
+      --summary <SUMMARY>  
+      --reason <REASON>    
+      --data <DATA>        
+      --files <FILES>      
+      --no-retry           
+  -h, --help               Print help
+```
+
+## h2 drove worker inbox
+
+```text
+Drain unread notes sent to this worker attempt
+
+Usage: h2 drove worker inbox [OPTIONS]
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h2 drove worker note
+
+```text
+Post a non-blocking progress note to the coordinator
+
+Usage: h2 drove worker note [OPTIONS] <TEXT>
+
+Arguments:
+  <TEXT>  
+
+Options:
+      --json               JSON output even in a terminal
+      --subject <SUBJECT>  
+  -h, --help               Print help
+```
+
+## h2 drove worker read
+
+```text
+Read a dependency task result, verify log, or review patch slice
+
+Usage: h2 drove worker read [OPTIONS] <TARGET>
+
+Arguments:
+  <TARGET>  
+
+Options:
+      --json             JSON output even in a terminal
+      --offset <OFFSET>  [default: 0]
+      --limit <LIMIT>    [default: 65536]
+      --grep <GREP>      
   -h, --help             Print help
 ```
 
@@ -528,27 +1136,28 @@ Arguments:
   [ARGV]...  Preset/command and arguments, or a template name and its task
 
 Options:
-      --agent <AGENT>         ACP preset name (`claude`, `codex`, `gemini`, ...) or explicit command line
-      --json                  JSON output even in a terminal
-      --prompt <TEXT>         Initial prompt queued right after ACP session setup
-      --system-prompt <TEXT>  System prompt appended via `_meta.systemPrompt` on session creation
-      --model <MODEL>         Model override passed to `session/set_config_option` (`model`)
-      --mode <MODE>           Session mode override passed to `session/set_mode`
-      --permissions <MODE>    Permission policy (`approve-all`, `approve-reads`, `deny-all`, `ask`) [possible values: approve-all, approve-reads, deny-all, ask]
-      --no-mcp                Disable injecting the built-in `herdr2` MCP server into `mcpServers`
-      --name <NAME>           Name, unique among live agents: 1-32 of a-z 0-9 - _ 
-      --cwd <CWD>             Working directory (default: where h2 runs; through the API, the core's; with --on, that machine's home)
-      --on <MACHINE>          Run it on another machine (see `h2 machine ls`); its address is `machine/a7`
-      --label <K=V>           Labels, key=value (repeatable)
-      --parent <PARENT>       Parent agent (default: the agent it is started from)
-      --no-parent             No parent, even when started from an agent
-      --no-notify             Don't send automated notes about it to its parent
-      --outlive-parent        Keep it running when its parent finishes (by default it ends too)
-      --rm                    Remove it right after it exits (once a waiting parent has seen it)
-      --keep                  Keep recovering via `session/load` (if supported) after crash or restart
-      --bg                    Start it and return immediately
-      --timeout <TIMEOUT>     Seconds before a wait checks in, leaving it running (default: config `wait_timeout`, else 180)
-  -h, --help                  Print help
+      --agent <AGENT>                 ACP preset name (`claude`, `codex`, `gemini`, ...) or explicit command line
+      --json                          JSON output even in a terminal
+      --prompt <TEXT>                 Initial prompt queued right after ACP session setup
+      --system-prompt <TEXT>          System prompt appended via `_meta.systemPrompt` on session creation
+      --model <MODEL>                 Model override passed to `session/set_config_option` (`model`)
+      --mode <MODE>                   Session mode override passed to `session/set_mode`
+      --permissions <MODE>            Permission policy (`approve-all`, `approve-reads`, `deny-all`, `ask`, `dangerously-skip-permissions`) [possible values: approve-all, approve-reads, deny-all, ask]
+      --dangerously-skip-permissions  Skip all permission checks (`approve-all` policy plus `bypassPermissions` session mode when supported)
+      --no-mcp                        Disable injecting the built-in `herdr2` MCP server into `mcpServers`
+      --name <NAME>                   Name, unique among live agents: 1-32 of a-z 0-9 - _ 
+      --cwd <CWD>                     Working directory (default: where h2 runs; through the API, the core's; with --on, that machine's home)
+      --on <MACHINE>                  Run it on another machine (see `h2 machine ls`); its address is `machine/a7`
+      --label <K=V>                   Labels, key=value (repeatable)
+      --parent <PARENT>               Parent agent (default: the agent it is started from)
+      --no-parent                     No parent, even when started from an agent
+      --no-notify                     Don't send automated notes about it to its parent
+      --outlive-parent                Keep it running when its parent finishes (by default it ends too)
+      --rm                            Remove it right after it exits (once a waiting parent has seen it)
+      --keep                          Keep recovering via `session/load` (if supported) after crash or restart
+      --bg                            Start it and return immediately
+      --timeout <TIMEOUT>             Seconds before a wait checks in, leaving it running (default: config `wait_timeout`, else 180)
+  -h, --help                          Print help
 ```
 
 ## h2 schema
@@ -688,5 +1297,6 @@ Options:
       --json                 JSON output even in a terminal
       --output <OUTPUT>      End when streamed transcript output after the wait starts contains this text. Blocked, error or exit end it too
       --timeout <TIMEOUT>    Seconds before it checks in (default: config `wait_timeout`, else 180)
+      --no-timeout           Wait indefinitely until status, exit, output, or message (for background runners)
   -h, --help                 Print help
 ```

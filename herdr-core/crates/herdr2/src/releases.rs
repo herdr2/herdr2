@@ -22,15 +22,22 @@ pub struct Target {
     pub sha256: String,
 }
 
-fn base() -> String {
+fn base() -> Result<String, RpcError> {
     std::env::var("HERDR2_RELEASES_URL")
-        .unwrap_or_else(|_| "https://releases.herdr.dev".into())
-        .trim_end_matches('/')
-        .into()
+        .ok()
+        .map(|u| u.trim().trim_end_matches('/').to_owned())
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| {
+            RpcError::new(
+                "unavailable",
+                "automatic core updates require HERDR2_RELEASES_URL",
+                "build and install h2 from source, or run h2 update --from <path>",
+            )
+        })
 }
 
 fn unavailable(why: String) -> RpcError {
-    RpcError::new("unavailable", why, "check your connection; the releases are at releases.herdr.dev")
+    RpcError::new("unavailable", why, "check your connection or HERDR2_RELEASES_URL")
 }
 
 fn curl(url: &str, to: &Path) -> Result<(), RpcError> {
@@ -49,9 +56,10 @@ fn curl(url: &str, to: &Path) -> Result<(), RpcError> {
 
 /// The latest release's list, or one version's.
 pub fn manifest(version: Option<&str>, scratch: &Path) -> Result<Manifest, RpcError> {
+    let base = base()?;
     let url = match version {
-        Some(v) => format!("{}/core/{v}/manifest.json", base()),
-        None => format!("{}/core/latest.json", base()),
+        Some(v) => format!("{base}/core/{v}/manifest.json"),
+        None => format!("{base}/core/latest.json"),
     };
     let file = scratch.join("manifest.json");
     curl(&url, &file)?;

@@ -468,6 +468,15 @@ impl Core {
                 Ok(((word, t.turn, t.reported), steps))
             })
             .await?;
+        if !text.trim().is_empty() {
+            let mut st = self.lock();
+            let list = st.pty_prompts.entry(id).or_default();
+            list.push((turn, crate::runtime::now_ms(), text.to_string()));
+            if list.len() > 64 {
+                let drop_n = list.len() - 64;
+                list.drain(0..drop_n);
+            }
+        }
         let started = if reported {
             let went =
                 |st: &State| st.pty_reg.terminals.get(&id).is_none_or(|t| t.turn > turn || working(t) || !t.is_live());

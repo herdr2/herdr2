@@ -132,6 +132,7 @@ struct Calls {
     unexpected: Vec<String>,
     effects: Vec<(String, Vec<Value>)>,
     shared: BTreeMap<String, Value>,
+    interrupted: Vec<String>,
 }
 
 fn updates(app: &str, core: &str) -> Value {
@@ -243,6 +244,127 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
                 }
                 "hc" | "h2" if first == json!(["machine", "add", "host", "--json"]) => {
                     Some(json!({"code":1,"stdout":"{\"error\":{\"kind\":\"host_key\",\"message\":\"unknown host key\"}}","stderr":""}))
+                }
+                "hc" | "h2" if first == json!(["read", "--json", "t1"]) => {
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "complete": true,
+                            "how": "transcript",
+                            "entries": [
+                                {"kind":"user","turn":1,"text":"Fix CLI layout","ts_ms":1700000000000i64},
+                                {"kind":"assistant","turn":1,"text":"Updated the layout.","ts_ms":1700000001000i64}
+                            ]
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
+                }
+                "hc" | "h2" if first == json!(["get", "--json", "t1"]) => {
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "address": "t1",
+                            "state": "live",
+                            "cwd": "/fixture/project"
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
+                }
+                "hc" | "h2" if first == json!(["read", "--json", "t_idle"]) => {
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "complete": true,
+                            "how": "screen",
+                            "entries": [],
+                            "text": "────────────────────────────────────\n ▐▛███▛█ Claude Code\n❯ Try \"fix lint errors\""
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
+                }
+                "hc" | "h2" if first == json!(["read", "--json", "t_snap"]) => {
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "complete": true,
+                            "how": "screen",
+                            "entries": [],
+                            "text": "────────────────────────────────────\nbuild succeeded in 2.4s"
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
+                }
+                "hc" | "h2" if first == json!(["read", "--json", "t_rich"]) => {
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "complete": true,
+                            "how": "transcript",
+                            "entries": [
+                                {"kind":"user","turn":1,"text":"编译+安装","ts_ms":1700000000000i64},
+                                {"kind":"thought","turn":1,"text":"Running release build and checking targets.","ts_ms":1700000001000i64},
+                                {"kind":"tool_call","turn":1,"id":"tc1","title":"cargo xwin build --release","tool_kind":"execute","status":"completed","ts_ms":1700000002000i64},
+                                {"kind":"assistant","turn":1,"text":"已完成编译与安装，结果如下：\n\n| 目标 | 状态 | 产物 |\n|---|---|---|\n| Linux Core | 通过 | `herdr2` |\n| Windows App | 通过 | `herdr2.exe` |\n\n1. 验证单测：\n\n   ```sh\n   cargo test -p herdr2\n   ```\n\n```rust\nfn main() {\n    println!(\"ok\");\n}\n```","ts_ms":1700000003000i64},
+                                {"kind":"user","turn":2,"text":"请对比一下：第一行：检查对齐；\n第二行：检查多行用户气泡宽度与边框是否重叠。","ts_ms":1700000010000i64},
+                                {"kind":"assistant","turn":2,"text":"已确认气泡、表格和代码块均对齐且无双重边框。","ts_ms":1700000011000i64}
+                            ]
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
+                }
+                "hc" | "h2" if first == json!(["read", "--json", "a1"]) => {
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "complete": false,
+                            "entries": [
+                                {"kind":"user","turn":1,"from":"t1","text":"<h2 from=\"t1\">Fix bug</h2>","ts_ms":1700000000000i64},
+                                {"kind":"thought","turn":1,"text":"Inspecting parser state.","ts_ms":1700000001000i64},
+                                {"kind":"tool_call","turn":1,"id":"tc1","title":"Read src/main.rs","tool_kind":"read","status":"completed","ts_ms":1700000002000i64},
+                                {"kind":"plan","turn":1,"items":["Check inputs","Add regression test"],"ts_ms":1700000003000i64},
+                                {"kind":"assistant","turn":1,"text":"Found the issue.\n\n```rust\nfn fix() -> bool { true }\n```","ts_ms":1700000004000i64},
+                                {"kind":"stderr","text":"warn: unused helper","ts_ms":1700000005000i64},
+                                {"kind":"error","turn":2,"message":"Sandbox warning","ts_ms":1700000006000i64}
+                            ]
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
+                }
+                "hc" | "h2" if first == json!(["get", "--json", "a1"]) => {
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "address": "a1",
+                            "config_options": [
+                                {"id":"model","name":"Model","category":"model","kind":"select","current_value":"gpt-5.4","options":[{"value":"gpt-5.4","name":"GPT-5.4"},{"value":"gpt-5.3-codex","name":"GPT-5.3 Codex"}]},
+                                {"id":"reasoning_effort","name":"Reasoning Effort","category":"thought_level","kind":"select","current_value":"high","options":[{"value":"low","name":"Low"},{"value":"high","name":"High"}]},
+                                {"id":"fast-mode","name":"Fast Mode","category":"model_config","kind":"boolean","current_value":true},
+                                {"id":"mode","name":"Mode","category":"mode","kind":"select","current_value":"code","options":[{"value":"code","name":"Code"},{"value":"architect","name":"Architect"}]}
+                            ]
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
+                }
+                "hc" | "h2" if first == json!(["config", "--json", "a1", "--id", "fast-mode", "--bool", "true"]) => {
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "address": "a1",
+                            "config_options": [
+                                {"id":"model","name":"Model","category":"model","kind":"select","current_value":"gpt-5.4","options":[{"value":"gpt-5.4","name":"GPT-5.4"},{"value":"gpt-5.3-codex","name":"GPT-5.3 Codex"}]},
+                                {"id":"fast-mode","name":"Fast Mode","category":"model_config","kind":"boolean","current_value":true}
+                            ]
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
+                }
+                "hc" | "h2" if first == json!(["interrupt", "--json", "a1"]) => {
+                    calls.borrow_mut().interrupted.push("a1".into());
+                    Some(json!({"code":0,"stdout":"{\"outcome\":\"stopped\"}","stderr":""}))
+                }
+                "hc" | "h2" if first == json!(["interrupt", "--json", "t1"]) => {
+                    calls.borrow_mut().interrupted.push("t1".into());
+                    Some(json!({"code":0,"stdout":"{\"outcome\":\"stopped\"}","stderr":""}))
                 }
                 // The files panel lists a folder with sh: kind and name pairs.
                 "exec" if first == "sh" && a.get(1).map(from_host).and_then(|v| v.get(2).cloned()) == Some(json!("files")) => {
@@ -1025,7 +1147,7 @@ fn settings_keep_notes_in_the_whats_new_window(cx: &mut TestAppContext) {
     let mut p = props();
     p["section"] = json!("updates");
     let tree = describe(cx, &staged, "frame/settings", true, p, update.clone(), None).unwrap();
-    assert!(tree.contains("st-whats-new") && tree.contains("st-app-update") && tree.contains("st-check-core"));
+    assert!(!tree.contains("st-whats-new") && tree.contains("st-app-update") && tree.contains("st-check-core"));
     assert!(!tree.contains("Newest details") && !tree.contains("Older headline"));
     let mut p = props();
     p["notes"] = notes;
@@ -1259,4 +1381,535 @@ fn status_bar_counts_agents_in_the_singular_and_the_plural(cx: &mut TestAppConte
     let tree = describe_with_values(cx, &staged, "mods/workspace-status", two, None).unwrap();
     assert!(tree.contains("2 agents"), "two agents are plural: {tree}");
     assert!(tree.contains("2 need you") && !tree.contains("2 needs you"), "two blocked agents need you: {tree}");
+}
+
+#[gpui::test]
+fn acp_peek_renders_t3_conversation_and_permission_card(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let program = json!({"key":"pi", "name":"Pi", "icon":null, "tint":true, "tile":"#334455", "color":"#aabbcc", "shell":false, "agent":true});
+    let mut values = fixture(true, json!({"overlay":"o1","terminal":"a1","acp":true}), updates("current", "current"));
+    values.insert("terminals".into(), json!([
+        {"address":"t1","name":"Build","title":"Build","argv":["pi"],"parent":null,"labels":{},"state":"running","status":"working","report":{"app":"pi"},"program":program,"cwd":"/fixture/project"},
+        {"address":"a1","name":"Reviewer","title":"Reviewer","argv":["pi"],"parent":"t1","labels":{},"state":"running","status":"blocked","turn":2,"transcript_seq":4,"inbox_len":2,"pending_permission":{"request_id":"req-1","title":"Run cargo test","options":[{"option_id":"once","name":"Allow once"}]},"report":{"app":"pi"},"program":program,"cwd":"/fixture/project"}
+    ]));
+    values.insert("agents".into(), json!([
+        {"address":"t1","pane":"p1","space":"s1","space_name":"Local","tab":"tab1","tab_index":1,"tab_name":"Build","status":"working","app":"pi","program":program,"title":"Build","seq":1,"focused":true},
+        {"address":"a1","pane":"","space":"s1","space_name":"Local","tab":"","tab_index":0,"tab_name":"","status":"blocked","app":"pi","program":program,"title":"Reviewer","seq":2,"focused":false}
+    ]));
+
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    let policy = Policy::new()
+        .with_storage_path(staged.0.join("store-acp-peek.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(module(values, calls.clone()))
+        .unwrap();
+    let runtime = ShellRuntime::new_isolated().unwrap();
+    let root = staged.0.join("mods/peek");
+    let window = cx.add_window(|_, _| Empty);
+    let mut session = window.update(cx, |_, window, cx| {
+        let mut session = DescriptionSession::load(runtime, root, policy, window, cx).unwrap();
+        let _initial = session.describe(window, cx).unwrap();
+        session
+    }).unwrap();
+
+    // Let async `h2(["read", "--json", "a1"])` resolve and trigger re-render.
+    cx.run_until_parked();
+    let tree = window.update(cx, |_, window, cx| session.describe(window, cx).unwrap()).unwrap();
+    window.update(cx, |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+
+    assert!(calls.borrow().unexpected.is_empty(), "unexpected host calls: {:?}", calls.borrow().unexpected);
+    assert!(!tree.contains("<h2"), "raw <h2 envelope leaked into rendered tree: {tree}");
+    assert!(tree.contains("Fix bug"), "cleaned user prompt missing: {tree}");
+    assert!(tree.contains("from Build"), "parent badge missing: {tree}");
+    assert!(tree.contains("1 tool call · 1 thought · 1 plan"), "activity group summary missing: {tree}");
+    assert!(tree.contains("copy-as-4-code-1"), "code card copy button missing: {tree}");
+    assert!(tree.contains("Diagnostic stderr (1 line)"), "stderr drawer missing: {tree}");
+    assert!(tree.contains("Sandbox warning"), "error card missing: {tree}");
+    assert!(tree.contains("Run cargo test"), "permission card title missing: {tree}");
+    assert!(tree.contains("perm-opt-0"), "permission approve option missing: {tree}");
+    assert!(tree.contains("2 queued"), "queued inbox pill missing: {tree}");
+    assert!(tree.contains("acp-composer-card"), "composer card missing: {tree}");
+    assert!(tree.contains("acp-input-area"), "spacious composer input area missing: {tree}");
+    assert!(tree.contains("acp-send"), "composer send button missing: {tree}");
+    assert!(tree.contains("acp-cfg-bar"), "capability pill bar missing: {tree}");
+    assert!(tree.contains("GPT-5.4"), "model pill missing: {tree}");
+    assert!(tree.contains("High"), "reasoning pill missing: {tree}");
+    assert!(tree.contains("Fast"), "fast-mode pill missing: {tree}");
+    assert!(tree.contains("Code"), "mode pill missing: {tree}");
+    assert!(tree.contains("acp-mount-tab") && tree.contains("Open as Tab"), "Open as Tab button missing in dialog: {tree}");
+    assert!(tree.contains("acp-split-right") && tree.contains("Split right"), "Split right button missing in dialog: {tree}");
+}
+
+#[gpui::test]
+fn acp_peek_tab_mode_renders_background_action_without_dialog_close(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let program = json!({"key":"pi", "name":"Pi", "icon":null, "tint":true, "tile":"#334455", "color":"#aabbcc", "shell":false, "agent":true});
+    let mut values = fixture(true, json!({"terminal":"a1","acp":true,"tab":true,"pane":"p2"}), updates("current", "current"));
+    values.insert("terminals".into(), json!([
+        {"address":"a1","name":"Reviewer","title":"Reviewer","argv":["pi"],"parent":null,"labels":{},"state":"live","status":"idle","turn":1,"transcript_seq":1,"report":{"app":"pi"},"program":program,"cwd":"/fixture/project"}
+    ]));
+    values.insert("agents".into(), json!([
+        {"address":"a1","acp":true,"pane":"p2","space":"s1","space_name":"Local","tab":"tab1","tab_index":1,"tab_name":"Reviewer","status":"idle","app":"pi","program":program,"title":"Reviewer","seq":1,"focused":true}
+    ]));
+
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    let policy = Policy::new()
+        .with_storage_path(staged.0.join("store-acp-tab.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(module(values, calls.clone()))
+        .unwrap();
+    let runtime = ShellRuntime::new_isolated().unwrap();
+    let root = staged.0.join("mods/peek");
+    let window = cx.add_window(|_, _| Empty);
+    let mut session = window.update(cx, |_, window, cx| {
+        let mut session = DescriptionSession::load(runtime, root, policy, window, cx).unwrap();
+        let _initial = session.describe(window, cx).unwrap();
+        session
+    }).unwrap();
+
+    cx.run_until_parked();
+    let tree = window.update(cx, |_, window, cx| session.describe(window, cx).unwrap()).unwrap();
+    window.update(cx, |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+
+    assert!(calls.borrow().unexpected.is_empty(), "unexpected host calls: {:?}", calls.borrow().unexpected);
+    assert!(!tree.contains("acp-header"), "duplicate acp-header should be omitted in tab mode: {tree}");
+    assert!(!tree.contains("acp-close\""), "dialog close button should be omitted in tab mode: {tree}");
+    assert!(tree.contains("GPT-5.4"), "model pill missing in tab mode: {tree}");
+
+    let mut pane_values = fixture(true, json!({"pane":"p2","terminal":"a1"}), updates("current", "current"));
+    pane_values.insert("terminals".into(), json!([
+        {"address":"a1","acp":true,"name":"Reviewer","state":"live","status":"working","program":program,"context_usage":{"used":28000,"size":200000}}
+    ]));
+    pane_values.insert("panes".into(), json!([
+        {"pane":"p2","acp":true,"mod":"peek","terminal":"a1","tab":"tab1","title":"Reviewer","cwd":"/fixture/project","status":"working","program":program,"context_usage":{"used":28000,"size":200000},"focused":true,"zoomed":false,"movable":false}
+    ]));
+    let pane_tree = describe_with_values(cx, &staged, "mods/pane", pane_values.clone(), Some("this.hovered = true;")).unwrap();
+    assert!(!pane_tree.contains("Reviewer"), "sole ACP tab pane omits duplicate agent name below tab pill: {pane_tree}");
+    assert!(pane_tree.contains("Ctx 14%"), "ACP pane header missing context usage ratio: {pane_tree}");
+    assert!(pane_tree.contains("ph-stop-p2"), "ACP pane header missing inline Stop button: {pane_tree}");
+    assert!(pane_tree.contains("ph-r-p2"), "ACP pane header missing split-right button: {pane_tree}");
+    assert!(pane_tree.contains("ph-x-p2"), "ACP pane header missing background button: {pane_tree}");
+
+    // When split alongside another pane in the same tab, the ACP pane header identifies itself by name & ACP badge.
+    pane_values.insert("panes".into(), json!([
+        {"pane":"p1","acp":false,"terminal":"t1","tab":"tab1","title":"zsh","cwd":"/fixture/project","status":null,"program":null,"focused":false,"zoomed":false,"movable":true},
+        {"pane":"p2","acp":true,"mod":"peek","terminal":"a1","tab":"tab1","title":"Reviewer","cwd":"/fixture/project","status":"working","program":program,"context_usage":{"used":28000,"size":200000},"focused":true,"zoomed":false,"movable":true}
+    ]));
+    let split_tree = describe_with_values(cx, &staged, "mods/pane", pane_values, None).unwrap();
+    assert!(split_tree.contains("Reviewer"), "split ACP pane header missing agent name: {split_tree}");
+    assert!(split_tree.contains("ACP"), "split ACP pane header missing ACP badge: {split_tree}");
+}
+
+#[gpui::test]
+fn acp_capability_popup_opens_anchored_above_trigger_without_warnings(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let program = json!({"key":"pi", "name":"Pi", "icon":null, "tint":true, "tile":"#334455", "color":"#aabbcc", "shell":false, "agent":true});
+    let mut values = fixture(true, json!({"terminal":"a1","acp":true,"tab":true,"pane":"p2"}), updates("current", "current"));
+    let config_options = json!([
+        {"id":"model","name":"Model","category":"model","kind":"select","current_value":"gpt-5.4","options":[{"value":"gpt-5.4","name":"GPT-5.4"},{"value":"gpt-5.3-codex","name":"GPT-5.3 Codex"}]},
+        {"id":"fast-mode","name":"Fast Mode","category":"model_config","kind":"boolean","current_value":false}
+    ]);
+    values.insert("terminals".into(), json!([
+        {"address":"a1","name":"Reviewer","title":"Reviewer","argv":["pi"],"parent":null,"labels":{},"state":"live","status":"idle","turn":1,"transcript_seq":1,"config_options":config_options,"report":{"app":"pi"},"program":program,"cwd":"/fixture/project"}
+    ]));
+    values.insert("agents".into(), json!([
+        {"address":"a1","acp":true,"pane":"p2","space":"s1","space_name":"Local","tab":"tab1","tab_index":1,"tab_name":"Reviewer","status":"idle","app":"pi","program":program,"title":"Reviewer","seq":1,"focused":true}
+    ]));
+
+    let tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/peek",
+        values.clone(),
+        Some("this.openConfigPopover(this.configOptionsFor(this.term())[0], cx);"),
+    ).unwrap();
+
+    assert!(tree.contains("Popup \"acp-popup-model\""), "anchored Popup missing: {tree}");
+    assert!(tree.contains("acp-cfg-popover-model"), "animated popover card missing: {tree}");
+    assert!(tree.contains("GPT-5.3 Codex"), "model choices missing inside open popup: {tree}");
+
+    // Toggling Fast Mode while Model popup is open immediately flips Fast to On and animates Model closed.
+    let after_fast = describe_with_values(
+        cx,
+        &staged,
+        "mods/peek",
+        values,
+        Some("const opts = this.configOptionsFor(this.term()); this.openConfigPopover(opts[0], cx); this.setConfigOption(opts[1], true, cx);"),
+    ).unwrap();
+    assert!(!after_fast.contains("chevron-up.svg"), "model trigger should close immediately on fast toggle: {after_fast}");
+    assert!(after_fast.contains("Fast Mode: On"), "fast-mode should toggle optimistically: {after_fast}");
+    assert!(
+        !after_fast.contains("acp-cfg-popover-model") || after_fast.contains(":transition(opacity, 130ms, 0ms, ease-in)"),
+        "model popup must unmount or be in its closing animation: {after_fast}"
+    );
+}
+
+#[gpui::test]
+fn brand_and_panel_buttons_render_by_default(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+
+    let chrome = describe(cx, &staged, "mods/workspace-chrome", false, props(), updates("current", "current"), None).unwrap();
+    assert!(chrome.contains("Herdr2"), "top-left sidebar header must say Herdr2: {chrome}");
+    assert!(!chrome.contains("text \"Herdr\""), "stale Herdr label in workspace-chrome: {chrome}");
+
+    let tabs = describe(cx, &staged, "mods/tabs", false, props(), updates("current", "current"), None).unwrap();
+    assert!(tabs.contains("panel-files"), "Files button missing in top-right tab bar: {tabs}");
+    assert!(tabs.contains("panel-changes"), "Changes button missing in top-right tab bar: {tabs}");
+
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    let policy = Policy::new()
+        .with_host_module(module(fixture(true, props(), updates("current", "current")), calls.clone()))
+        .unwrap();
+    let runtime = ShellRuntime::new_isolated().unwrap();
+    let root = staged.wrapper("frame/welcome", "this.page = 3;");
+    let window = cx.add_window(|_, _| Empty);
+    let welcome = window.update(cx, |_, window, cx| {
+        let mut session = DescriptionSession::load(runtime, root, policy, window, cx).unwrap();
+        let tree = session.describe(window, cx).unwrap();
+        window.remove_window();
+        tree
+    }).unwrap();
+    assert!(welcome.contains("Choose your panels"), "{welcome}");
+    assert!(
+        !calls.borrow().shared.contains_key("workspace.panels"),
+        "welcome page 3 must not reset workspace.panels to []"
+    );
+
+    let settings = describe(cx, &staged, "frame/settings", true, json!({"section":"look"}), updates("current", "current"), None).unwrap();
+    assert!(settings.contains("st-panel-files"), "Files panel toggle missing in Settings Look: {settings}");
+    assert!(settings.contains("st-panel-changes"), "Changes panel toggle missing in Settings Look: {settings}");
+}
+
+#[gpui::test]
+fn claude_acp_peek_exposes_dangerously_skip_permissions_in_mode_and_banner(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let program = json!({"key":"claude", "name":"Claude Code", "icon":null, "tint":false, "tile":"#1c1d21", "color":"#ffffff", "shell":false, "agent":true});
+    let mut values = fixture(true, json!({"terminal":"a1","acp":true,"tab":true,"pane":"p2"}), updates("current", "current"));
+    let config_options = json!([
+        {"id":"model","name":"Model","category":"model","kind":"select","current_value":"sonnet","options":[{"value":"sonnet","name":"Sonnet"}]},
+        {"id":"mode","name":"Mode","category":"mode","kind":"select","current_value":"default","options":[
+            {"value":"default","name":"Manual","description":"Always ask before making changes"},
+            {"value":"acceptEdits","name":"Accept edits","description":"Automatically accept all file edits"},
+            {"value":"plan","name":"Plan","description":"Create a plan before making changes"},
+            {"value":"auto","name":"Auto","description":"Claude handles permission decisions"},
+            {"value":"bypassPermissions","name":"Bypass permissions","description":"Accepts all permissions"}
+        ]}
+    ]);
+    values.insert("terminals".into(), json!([
+        {"address":"a1","acp":true,"agent":"claude","mode":"default","name":"Claude","title":"Claude","argv":["claude-agent-acp"],"parent":null,"labels":{},"state":"live","status":"blocked","turn":1,"transcript_seq":1,"pending_permission":{"request_id":"req-1","title":"Run bash","options":[{"option_id":"allow-once","name":"Yes"}]},"config_options":config_options,"report":{"app":"claude-code"},"program":program,"cwd":"/fixture/project"}
+    ]));
+    values.insert("agents".into(), json!([
+        {"address":"a1","agent":"claude","acp":true,"pane":"p2","space":"s1","space_name":"Local","tab":"tab1","tab_index":1,"tab_name":"Claude","status":"blocked","app":"claude-code","program":program,"title":"Claude","seq":1,"focused":true}
+    ]));
+
+    let tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/peek",
+        values.clone(),
+        Some("const mode = this.configOptionsFor(this.term()).find((o) => o.id === 'mode'); this.openConfigPopover(mode, cx);"),
+    ).unwrap();
+
+    assert!(tree.contains("perm-skip-all"), "dangerously-skip-permissions quick approve button missing in permission banner: {tree}");
+    assert!(tree.contains("acp-cfg-popover-mode"), "mode popover missing: {tree}");
+    assert!(tree.contains("acp-cfg-choice-mode-4"), "5th Claude mode choice missing in mode menu: {tree}");
+    assert!(tree.contains("dangerously-skip-permissions"), "dangerously-skip-permissions choice missing in mode menu: {tree}");
+    let list_line = tree.lines().find(|l| l.contains("acp-cfg-list")).unwrap();
+    assert!(list_line.contains(".max_h[Number(420.0)]"), "mode choice list max_h must expand to avoid clipping 5th choice: {list_line}");
+
+    let mut menu_values = values;
+    menu_values.insert("props".into(), json!({"tab":"agent","target":{"terminal":"a1","pane":"p2"}}));
+    let menu_tree = describe_with_values(cx, &staged, "mods/menu", menu_values.clone(), None).unwrap();
+    assert!(menu_tree.contains("Permissions: dangerously-skip-permissions"), "ACP agent right-click menu missing quick bypass option: {menu_tree}");
+
+    if let Some(list) = menu_values.get_mut("terminals").and_then(Value::as_array_mut) {
+        list[0]["mode"] = json!("bypassPermissions");
+    }
+    let bypass_menu_tree = describe_with_values(cx, &staged, "mods/menu", menu_values, None).unwrap();
+    assert!(bypass_menu_tree.contains("✓ dangerously-skip-permissions (Reset)"), "ACP agent right-click menu missing active bypass reset label: {bypass_menu_tree}");
+}
+
+#[gpui::test]
+fn agents_status_button_and_manual_status_menus_render(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+
+    let agents_tree = describe(cx, &staged, "mods/agents", true, props(), updates("current", "current"), None).unwrap();
+    assert!(agents_tree.contains("status-t1"), "agents panel missing status button for t1: {agents_tree}");
+    assert!(agents_tree.contains("ag-recycle"), "agents panel missing recycle bin button: {agents_tree}");
+
+    let mut trash_props = props();
+    trash_props.as_object_mut().unwrap().insert("trashMenu".into(), json!(true));
+    let trash_tree = describe(cx, &staged, "mods/agents", true, trash_props, updates("current", "current"), None).unwrap();
+    assert!(trash_tree.contains("Recycle Bin (0)"), "trashMenu missing header: {trash_tree}");
+
+    let mut status_props = props();
+    status_props.as_object_mut().unwrap().extend([
+        ("statusMenu".into(), json!(true)),
+        ("terminal".into(), json!("t1")),
+    ]);
+    let status_menu_tree = describe(cx, &staged, "mods/agents", true, status_props, updates("current", "current"), None).unwrap();
+    for label in ["Idle", "Working", "Needs you", "Done", "Auto detect"] {
+        assert!(status_menu_tree.contains(label), "statusMenu missing {label}: {status_menu_tree}");
+    }
+
+    let mut agent_menu_props = props();
+    agent_menu_props.as_object_mut().unwrap().extend([
+        ("tab".into(), json!("agent")),
+        ("target".into(), json!({"terminal": "t1", "pane": "p1"})),
+    ]);
+    let agent_menu_tree = describe(cx, &staged, "mods/menu", true, agent_menu_props.clone(), updates("current", "current"), None).unwrap();
+    assert!(agent_menu_tree.contains("Rename"), "agent context menu missing Rename: {agent_menu_tree}");
+    for removed in ["Status: Idle", "Status: Working", "Status: Needs you", "Status: Done", "Status: Auto detect"] {
+        assert!(!agent_menu_tree.contains(removed), "agent context menu should not include {removed}: {agent_menu_tree}");
+    }
+
+    let mut zh_values = fixture(true, agent_menu_props, updates("current", "current"));
+    zh_values.get_mut("settings").unwrap()["language"] = json!("zh-CN");
+    let zh_menu_tree = describe_with_values(cx, &staged, "mods/menu", zh_values, None).unwrap();
+    assert!(zh_menu_tree.contains("重命名"), "zh-CN agent context menu missing 重命名: {zh_menu_tree}");
+}
+
+#[gpui::test]
+fn simplified_chinese_language_renders_localized_chrome_and_settings(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+
+    let zh_values = |mod_props: Value| {
+        let mut values = fixture(true, mod_props, updates("current", "current"));
+        values.get_mut("settings").unwrap()["language"] = json!("zh-CN");
+        values
+    };
+
+    let settings_tree = describe_with_values(cx, &staged, "frame/settings", zh_values(props()), None).unwrap();
+    for expected in ["界面语言", "简体中文", "外观"] {
+        assert!(settings_tree.contains(expected), "zh-CN settings missing {expected}: {settings_tree}");
+    }
+
+    let tabs_tree = describe_with_values(cx, &staged, "mods/tabs", zh_values(props()), None).unwrap();
+    for expected in ["文件", "变更"] {
+        assert!(tabs_tree.contains(expected), "zh-CN tabs missing {expected}: {tabs_tree}");
+    }
+
+    let agents_tree = describe_with_values(cx, &staged, "mods/agents", zh_values(props()), None).unwrap();
+    assert!(agents_tree.contains("智能体"), "zh-CN agents header missing: {agents_tree}");
+
+    let chrome_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/workspace-chrome",
+        zh_values(json!({"footer": true})),
+        None,
+    ).unwrap();
+    for expected in ["设置", "添加主机"] {
+        assert!(chrome_tree.contains(expected), "zh-CN footer missing {expected}: {chrome_tree}");
+    }
+
+    let menu_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/menu",
+        zh_values(json!({"tab": "global"})),
+        None,
+    ).unwrap();
+    for expected in ["新建工作区", "Language: 简体中文"] {
+        assert!(menu_tree.contains(expected), "zh-CN global menu missing {expected}: {menu_tree}");
+    }
+}
+
+#[gpui::test]
+fn tab_menu_structured_view_toggle_and_pty_peek_render_cleanly(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let program = json!({"key":"claude", "name":"Claude Code", "icon":null, "tint":false, "tile":"#1c1d21", "color":"#ffffff", "shell":false, "agent":true});
+
+    let mut off_values = fixture(true, json!({"tab":"tab","target":{"id":"tab1","space":"s1"}}), updates("current", "current"));
+    off_values.insert("panes".into(), json!([
+        {"pane":"p1","terminal":"t1","tab":"tab1","title":"Claude Code","cwd":"/fixture/project","status":"idle","program":program,"structured":false,"focused":true,"zoomed":false,"movable":false}
+    ]));
+    let off_menu = describe_with_values(cx, &staged, "mods/menu", off_values.clone(), None).unwrap();
+    assert!(off_menu.contains("Structured chat view"), "tab menu missing Structured chat view toggle: {off_menu}");
+    assert!(off_menu.contains("mi-sw-"), "tab menu missing visual toggle switch element: {off_menu}");
+
+    let mut on_values = off_values;
+    on_values.insert("panes".into(), json!([
+        {"pane":"p1","terminal":"t1","tab":"tab1","title":"Claude Code","cwd":"/fixture/project","status":"working","program":program,"structured":true,"focused":true,"zoomed":false,"movable":false}
+    ]));
+    on_values.get_mut("settings").unwrap()["language"] = json!("zh-CN");
+    let on_menu = describe_with_values(cx, &staged, "mods/menu", on_values, None).unwrap();
+    assert!(on_menu.contains("结构化对话视图"), "zh-CN tab menu missing 结构化对话视图: {on_menu}");
+    assert!(on_menu.contains("mi-sw-"), "zh-CN tab menu missing visual toggle switch element: {on_menu}");
+
+    let mut peek_values = fixture(true, json!({"terminal":"t1","acp":true,"pty":true,"tab":true,"pane":"p1"}), updates("current", "current"));
+    peek_values.insert("terminals".into(), json!([
+        {"address":"t1","name":"Claude Code","title":"Claude Code","argv":["claude"],"parent":null,"labels":{"herdr.view":"peek"},"state":"live","status":"blocked","turn":1,"program":program,"cwd":"/fixture/project"}
+    ]));
+    peek_values.insert("agents".into(), json!([
+        {"address":"t1","pane":"p1","space":"s1","space_name":"Local","tab":"tab1","tab_index":1,"tab_name":"Claude Code","status":"blocked","app":"claude-code","program":program,"title":"Claude Code","seq":1,"focused":true}
+    ]));
+    peek_values.insert("panes".into(), json!([
+        {"pane":"p1","terminal":"t1","tab":"tab1","title":"Claude Code","cwd":"/fixture/project","status":"blocked","program":program,"structured":true,"focused":true,"zoomed":false,"movable":false}
+    ]));
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    let policy = Policy::new()
+        .with_storage_path(staged.0.join("store-pty-peek.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(module(peek_values, calls.clone()))
+        .unwrap();
+    let runtime = ShellRuntime::new_isolated().unwrap();
+    let root = staged.0.join("mods/peek");
+    let window = cx.add_window(|_, _| Empty);
+    let mut session = window.update(cx, |_, window, cx| {
+        let mut session = DescriptionSession::load(runtime, root, policy, window, cx).unwrap();
+        let _initial = session.describe(window, cx).unwrap();
+        session
+    }).unwrap();
+    cx.run_until_parked();
+    let peek_tree = window.update(cx, |_, window, cx| session.describe(window, cx).unwrap()).unwrap();
+    window.update(cx, |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+
+    assert!(calls.borrow().unexpected.is_empty(), "unexpected host calls: {:?}", calls.borrow().unexpected);
+
+    assert!(peek_tree.contains("acp-switch-terminal"), "PTY peek missing Terminal view pill: {peek_tree}");
+    assert!(peek_tree.contains("CLI Agent"), "PTY peek missing CLI Agent badge: {peek_tree}");
+    assert!(peek_tree.contains("pty-blocked-banner"), "blocked PTY peek missing interactive confirmation banner: {peek_tree}");
+    assert!(peek_tree.contains("pty-open-terminal"), "blocked PTY peek missing Open terminal button: {peek_tree}");
+    assert!(peek_tree.contains("Fix CLI layout"), "PTY peek missing parsed user entry: {peek_tree}");
+    assert!(peek_tree.contains("Updated the layout."), "PTY peek missing parsed assistant entry: {peek_tree}");
+
+    let mut tabs_values = fixture(true, json!({}), updates("current", "current"));
+    tabs_values.insert("panes".into(), json!([
+        {"pane":"p1","terminal":"t1","tab":"tab1","title":"Claude Code","cwd":"/fixture/project","status":"working","program":program,"structured":true,"focused":true,"zoomed":false,"movable":false}
+    ]));
+    let tabs_tree = describe_with_values(cx, &staged, "mods/tabs", tabs_values.clone(), None).unwrap();
+    assert!(tabs_tree.contains("Terminal Agent (Structured View)"), "structured terminal tab badge tooltip missing: {tabs_tree}");
+
+    tabs_values.insert("props".into(), json!({"pane":"p1","terminal":"t1"}));
+    let pane_tree = describe_with_values(cx, &staged, "mods/pane", tabs_values, None).unwrap();
+    assert!(pane_tree.contains("ph-stop-p1"), "structured PTY pane header missing Stop button: {pane_tree}");
+
+    let mut load_and_describe = |addr: &str, turn: u64, status: &str| {
+        let mut pv = fixture(true, json!({"terminal":addr,"acp":true,"pty":true,"tab":true,"pane":"p1"}), updates("current", "current"));
+        pv.insert("terminals".into(), json!([
+            {"address":addr,"name":"Claude Code","title":"Claude Code","argv":["claude"],"parent":null,"labels":{"herdr.view":"peek"},"state":"live","status":status,"turn":turn,"program":program,"cwd":"/fixture/project"}
+        ]));
+        pv.insert("agents".into(), json!([
+            {"address":addr,"pane":"p1","space":"s1","space_name":"Local","tab":"tab1","tab_index":1,"tab_name":"Claude Code","status":status,"app":"claude-code","program":program,"title":"Claude Code","seq":1,"focused":true}
+        ]));
+        pv.insert("panes".into(), json!([
+            {"pane":"p1","terminal":addr,"tab":"tab1","title":"Claude Code","cwd":"/fixture/project","status":status,"program":program,"structured":true,"focused":true,"zoomed":false,"movable":false}
+        ]));
+        let c = Rc::new(RefCell::new(Calls::default()));
+        let pol = Policy::new()
+            .with_storage_path(staged.0.join(format!("store-pty-{addr}.json")))
+            .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+            .with_host_module(module(pv, c.clone()))
+            .unwrap();
+        let rt = ShellRuntime::new_isolated().unwrap();
+        let w = cx.add_window(|_, _| Empty);
+        let mut s = w.update(cx, |_, window, cx| {
+            let mut s = DescriptionSession::load(rt, staged.0.join("mods/peek"), pol, window, cx).unwrap();
+            let _ = s.describe(window, cx).unwrap();
+            s
+        }).unwrap();
+        cx.run_until_parked();
+        let tree = w.update(cx, |_, window, cx| s.describe(window, cx).unwrap()).unwrap();
+        w.update(cx, |_, window, _| window.remove_window()).unwrap();
+        cx.run_until_parked();
+        assert!(c.borrow().unexpected.is_empty(), "unexpected host calls for {addr}: {:?}", c.borrow().unexpected);
+        tree
+    };
+
+    let idle_tree = load_and_describe("t_idle", 0, "idle");
+    assert!(idle_tree.contains("No messages yet. Send a prompt below to begin."), "turn-0 idle PTY must show empty state: {idle_tree}");
+    assert!(!idle_tree.contains("▐▛███▛█"), "turn-0 idle PTY leaked raw welcome banner: {idle_tree}");
+
+    let snap_tree = load_and_describe("t_snap", 1, "done");
+    assert!(snap_tree.contains("Terminal snapshot"), "screen fallback missing Terminal snapshot header: {snap_tree}");
+    assert!(snap_tree.contains("Copy"), "screen fallback missing Copy pill: {snap_tree}");
+    assert!(snap_tree.contains("pty-snap-open-terminal"), "screen fallback missing Open terminal pill: {snap_tree}");
+}
+
+#[gpui::test]
+fn escape_interrupts_working_acp_and_structured_pty_peek(cx: &mut TestAppContext) {
+    use gpui::VisualTestContext;
+    use std::ops::Deref;
+
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let program = json!({"key":"claude", "name":"Claude Code", "icon":null, "tint":false, "tile":"#1c1d21", "color":"#ffffff", "shell":false, "agent":true});
+
+    let mut acp_values = fixture(true, json!({"terminal":"a1","acp":true,"tab":true,"pane":"p2"}), updates("current", "current"));
+    acp_values.insert("terminals".into(), json!([
+        {"address":"a1","acp":true,"agent":"claude","name":"Claude","title":"Claude","argv":["claude-agent-acp"],"parent":null,"labels":{},"state":"live","status":"working","turn":1,"transcript_seq":1,"program":program,"cwd":"/fixture/project"}
+    ]));
+    acp_values.insert("agents".into(), json!([
+        {"address":"a1","acp":true,"pane":"p2","space":"s1","space_name":"Local","tab":"tab1","tab_index":1,"tab_name":"Claude","status":"working","app":"claude-code","program":program,"title":"Claude","seq":1,"focused":true}
+    ]));
+    acp_values.insert("panes".into(), json!([
+        {"pane":"p2","acp":true,"mod":"peek","terminal":"a1","tab":"tab1","title":"Claude","cwd":"/fixture/project","status":"working","program":program,"focused":true,"zoomed":false,"movable":false}
+    ]));
+
+    let tree = describe_with_values(cx, &staged, "mods/peek", acp_values.clone(), None).unwrap();
+    assert!(tree.contains("acp-stop"), "working tab composer should render Stop · Esc pill: {tree}");
+
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    gpui_shell::policy::set_default(
+        Policy::new()
+            .with_storage_path(staged.0.join("store-esc-acp.json"))
+            .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+            .with_host_module(module(acp_values, calls.clone()))
+            .unwrap(),
+    );
+    let runtime = ShellRuntime::new_isolated().unwrap();
+    let window = cx.add_window(|window, cx| RootedView(runtime.try_load(&staged.0.join("mods/peek"), window, cx).unwrap()));
+    let mut visual = VisualTestContext::from_window(*window.deref(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.run_until_parked();
+    visual.simulate_keystrokes("escape");
+    visual.run_until_parked();
+    assert_eq!(calls.borrow().interrupted, vec!["a1"], "unexpected: {:?}", calls.borrow().unexpected);
+    visual.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+
+    let mut pty_values = fixture(true, json!({"terminal":"t1","acp":true,"pty":true,"tab":true,"pane":"p1"}), updates("current", "current"));
+    pty_values.insert("terminals".into(), json!([
+        {"address":"t1","name":"Claude Code","title":"Claude Code","argv":["claude"],"parent":null,"labels":{"herdr.view":"peek"},"state":"live","status":"working","turn":1,"program":program,"cwd":"/fixture/project"}
+    ]));
+    pty_values.insert("agents".into(), json!([
+        {"address":"t1","pane":"p1","space":"s1","space_name":"Local","tab":"tab1","tab_index":1,"tab_name":"Claude Code","status":"working","app":"claude-code","program":program,"title":"Claude Code","seq":1,"focused":true}
+    ]));
+    pty_values.insert("panes".into(), json!([
+        {"pane":"p1","terminal":"t1","tab":"tab1","title":"Claude Code","cwd":"/fixture/project","status":"working","program":program,"structured":true,"focused":true,"zoomed":false,"movable":false}
+    ]));
+
+    let pty_tree = describe_with_values(cx, &staged, "mods/peek", pty_values.clone(), None).unwrap();
+    assert!(pty_tree.contains("acp-stop"), "working structured PTY composer should render Stop · Esc pill: {pty_tree}");
+
+    gpui_shell::policy::set_default(
+        Policy::new()
+            .with_storage_path(staged.0.join("store-esc-pty.json"))
+            .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+            .with_host_module(module(pty_values, calls.clone()))
+            .unwrap(),
+    );
+    let pty_runtime = ShellRuntime::new_isolated().unwrap();
+    let pty_window = cx.add_window(|window, cx| RootedView(pty_runtime.try_load(&staged.0.join("mods/peek"), window, cx).unwrap()));
+    let mut pty_visual = VisualTestContext::from_window(*pty_window.deref(), cx);
+    pty_visual.update(|window, cx| window.draw(cx).clear(cx));
+    pty_visual.run_until_parked();
+    pty_visual.simulate_keystrokes("escape");
+    pty_visual.run_until_parked();
+    assert_eq!(calls.borrow().interrupted, vec!["a1", "t1"], "unexpected: {:?}", calls.borrow().unexpected);
+    pty_visual.update(|window, _| window.remove_window());
+    gpui_shell::policy::set_default(Policy::new());
+    cx.run_until_parked();
 }

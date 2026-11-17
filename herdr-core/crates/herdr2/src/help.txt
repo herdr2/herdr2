@@ -21,6 +21,8 @@ Communicate & control
   send <a|t> <text>           queue ACP prompt or paste text into PTY (--steer: cancel & deliver next)
   approve <a> [--option ID]   approve a blocked ACP agent's pending permission request
   deny <a> [--option ID]      deny a blocked ACP agent's pending permission request
+  config <a> --id K (--value V|--bool B)
+                              set live ACP model, reasoning effort, fast mode, or session mode
   interrupt <a|t>             send ACP `session/cancel` or PTY interrupt (Esc / Ctrl-C)
   wait <a|t>                  wait until not `working` (--output X, --children any|all)
   put <a|t> <file>            stage a file beside agent or terminal, print path
@@ -41,10 +43,11 @@ More
   machine add|ls|login|update|rename|rm
                               manage remote machines over SSH or `--via`
   connect                     JSON-RPC API over stdin/stdout
+  drove status|web|probe|...  manage Drove DAG orchestration and Web UI
   schema                      print OpenRPC 1.3.2 JSON Schema
 
 <a> / <t> is an agent (`a1`), terminal (`t1`), remote (`machine/a7`), or unique name.
-Built-in `--agent` presets: claude, codex, gemini, opencode, copilot, cursor, cursor-agent, kimi, qwen, pi, hermes, glm, zcode.
+Built-in `--agent` presets: agy, claude, codex, cursor, dsh, gemini, opencode, copilot, kimi, qwen, pi, hermes, glm, zcode.
 Options: --json (default when piped except read/file read/exec), -V --version, --licenses.
 Per command: h2 <command> --help
 Settings: ~/.config/herdr2/config.toml (default_permissions, inject_mcp, [agents]).

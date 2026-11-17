@@ -1,7 +1,7 @@
 //! `h2`: one API call per command. Tables for people, JSON when piped or `--json`.
 
 use crate::api::{
-    AgentParams, ApproveParams, AttachParams, ExecParams, InterruptParams, KeepParams, KeysParams, LabelParams,
+    AgentParams, ApproveParams, AttachParams, ConfigParams, ExecParams, InterruptParams, KeepParams, KeysParams, LabelParams,
     ListParams, PutParams, ReadParams, RunParams, SendParams, SubscribeParams, WaitParams,
 };
 use crate::client;
@@ -60,6 +60,8 @@ enum Cmd {
     Approve(ApproveParams),
     /// Deny a blocked agent's pending ACP permission request.
     Deny(ApproveParams),
+    /// Configure a live ACP session option (model, reasoning effort, fast mode, session mode).
+    Config(ConfigParams),
     /// Print an agent's transcript or final assistant text (`--last`).
     Read(ReadParams),
     /// Stage a local file beside a live agent (on its machine); prints its path.
@@ -87,6 +89,8 @@ enum Cmd {
     Templates,
     /// Run the built-in stdio MCP server (`h2 mcp`).
     Mcp,
+    /// Manage multi-agent Drove orchestration (`drove status`, `drove web`, `drove settings`, ...).
+    Drove(crate::drove::cli::DroveCli),
     /// Swap this h2 for another build and restart core.
     Update {
         /// A herdr2 binary to use (default: download the latest release).
@@ -139,6 +143,13 @@ pub fn command_names() -> Vec<String> {
 pub fn main() -> i32 {
     let daemon = crate::platform::daemon_startup();
     client::remember_exe();
+    if !daemon
+        && let Some(arg0) = std::env::args_os().next()
+        && let Some(stem) = std::path::Path::new(&arg0).file_stem().and_then(|s| s.to_str())
+        && stem.eq_ignore_ascii_case("drove")
+    {
+        return crate::drove::cli::main_standalone();
+    }
     let args: Vec<_> = if daemon { vec!["serve".into()] } else { std::env::args_os().skip(1).collect() };
     match args.iter().map(|a| a.to_str()).collect::<Vec<_>>().as_slice() {
         [Some("--help" | "-h" | "help")] => {
@@ -293,11 +304,21 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             return Ok(None);
         }
         Cmd::Attach(p) => {
+            if crate::client::agent_id().is_some() {
+                return Err(RpcError::invalid_params(
+                    "ACP agent cannot attach to a PTY terminal; terminal agents receive messages only via `h2 wait`",
+                ));
+            }
             let message = crate::attach::run(&paths, &pick(p.terminal)?, p.observe, p.history)?;
             eprintln!("{message}");
             return Ok(None);
         }
         Cmd::Keys(mut p) => {
+            if crate::client::agent_id().is_some() {
+                return Err(RpcError::invalid_params(
+                    "ACP agent cannot send keys to a PTY terminal; terminal agents receive messages only via `h2 wait`",
+                ));
+            }
             p.caller = Some(caller());
             let r = call("terminal.keys", to(&p))?;
             Out { json: r, human: "keys sent".into() }
@@ -305,6 +326,10 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
         Cmd::Mcp => {
             crate::mcp::serve_stdio()?;
             return Ok(None);
+        }
+        Cmd::Drove(p) => {
+            let (json, human) = crate::drove::cli::execute(&paths, p)?;
+            Out { json, human }
         }
         Cmd::Wait(mut p) => {
             if p.children.is_none() {
@@ -360,6 +385,16 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
                 "denied {} (request {})",
                 r["agent"].as_str().unwrap_or("?"),
                 r["request_id"].as_str().unwrap_or("?")
+            );
+            Out { json: r, human }
+        }
+        Cmd::Config(p) => {
+            let r = call("agent.config", to(&p))?;
+            let human = format!(
+                "{}: model={} mode={}",
+                r["address"].as_str().unwrap_or("?"),
+                r["model"].as_str().unwrap_or("-"),
+                r["mode"].as_str().unwrap_or("-"),
             );
             Out { json: r, human }
         }
@@ -810,6 +845,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("interrupt", "agent.interrupt"),
     ("approve", "agent.approve"),
     ("deny", "agent.deny"),
+    ("config", "agent.config"),
     ("read", "agent.read"),
     ("attach", "terminal.attach"),
     ("keys", "terminal.keys"),
@@ -830,6 +866,12 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("machine login", "machine.connect"),
     ("machine rename", "machine.rename"),
     ("machine rm", "machine.rm"),
+    ("drove settings", "drove.settings.get"),
+    ("drove settings-set", "drove.settings.set"),
+    ("drove probe", "drove.probe"),
+    ("drove ai-test", "drove.ai.test"),
+    ("drove magpie-test", "drove.magpie.test"),
+    ("drove web", "drove.web.open"),
 ];
 /// Client/app methods not mapped 1:1 from a separate top-level CLI subcommand.
 pub const API_ONLY: &[&str] = &[
@@ -848,6 +890,8 @@ pub const API_ONLY: &[&str] = &[
     "terminal.wait",
     "terminal.interrupt",
     "terminal.put",
+    "drove.http_proxy",
+    "drove.subscribe",
 ];
 
 #[cfg(test)]

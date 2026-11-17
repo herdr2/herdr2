@@ -415,10 +415,36 @@ pub struct Person {
     /// Light or dark: the system's, or one always.
     #[serde(skip_serializing_if = "Appearance::is_system")]
     pub appearance: Appearance,
+    /// Interface language: `"en"` (default) or `"zh-CN"` (Simplified Chinese).
+    #[serde(skip_serializing_if = "Language::is_default")]
+    pub language: Language,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<crate::layout::ThemeChoice>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub colors: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Language {
+    #[default]
+    #[serde(rename = "en", alias = "en-US", alias = "en_US", alias = "english")]
+    En,
+    #[serde(rename = "zh-CN", alias = "zh", alias = "zh_CN", alias = "zh-Hans", alias = "chinese")]
+    ZhCn,
+}
+
+impl Language {
+    pub fn is_default(&self) -> bool {
+        *self == Self::En
+    }
+
+    pub fn parse_arg(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "en" | "en-us" | "en_us" | "english" => Some(Self::En),
+            "zh" | "zh-cn" | "zh_cn" | "zh-hans" | "chinese" => Some(Self::ZhCn),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -483,6 +509,7 @@ impl Default for Person {
             minimum_contrast: 1.0,
             option_as_alt: OptionAsAlt::Auto,
             appearance: Appearance::System,
+            language: Language::En,
             theme: None,
             colors: BTreeMap::new(),
         }
@@ -528,6 +555,7 @@ pub struct Settings {
     pub copy_on_select: bool,
     pub minimum_contrast: f32,
     pub option_as_alt: OptionAsAlt,
+    pub language: Language,
     pub sounds: Sounds,
 }
 
@@ -575,6 +603,7 @@ impl Default for Settings {
             copy_on_select: true,
             minimum_contrast: 1.0,
             option_as_alt: OptionAsAlt::Auto,
+            language: Language::En,
             sounds: Sounds::default(),
         }
     }
@@ -619,6 +648,7 @@ impl Settings {
             copy_on_select: person.copy_on_select,
             minimum_contrast: person.minimum_contrast,
             option_as_alt: person.option_as_alt,
+            language: person.language,
         }
     }
 }
@@ -1086,11 +1116,33 @@ mod tests {
         assert_eq!(Settings::compose(&person, &win98.look, true).theme, "ink");
     }
 
+    #[test]
+    fn language_parses_and_roundtrips() {
+        let default: Person = serde_json::from_str("{}").unwrap();
+        assert_eq!(default.language, Language::En);
+        assert!(serde_json::to_value(&default).unwrap().get("language").is_none());
+        for (raw, expected, canonical) in [
+            ("en", Language::En, "en"),
+            ("en-US", Language::En, "en"),
+            ("zh-CN", Language::ZhCn, "zh-CN"),
+            ("zh", Language::ZhCn, "zh-CN"),
+            ("zh-Hans", Language::ZhCn, "zh-CN"),
+        ] {
+            let person: Person = serde_json::from_value(serde_json::json!({ "language": raw })).unwrap();
+            assert_eq!(person.language, expected);
+            let settings = Settings::compose(&person, &crate::layout::Look::default(), true);
+            assert_eq!(settings.language, expected);
+            assert_eq!(serde_json::to_value(&settings).unwrap()["language"], canonical);
+            assert_eq!(Language::parse_arg(raw), Some(expected));
+        }
+        assert_eq!(Language::parse_arg("fr"), None);
+    }
+
     /// The guide agents read (written to the home folder) explains every
     /// settings.json key.
     #[test]
     fn the_guide_explains_every_setting() {
-        let all = Person { core: Some(String::new()), default_agent: Some(String::new()), font: Some(String::new()), font_size: Some(1.0), font_weight: Some(400), ui_font: Some(String::new()), telemetry: true, clipboard_write: false, copy_on_select: false, appearance: Appearance::Light, theme: Some(crate::layout::ThemeChoice::One(String::new())), colors: [("text".into(), String::new())].into(), ..Person::default() };
+        let all = Person { core: Some(String::new()), default_agent: Some(String::new()), font: Some(String::new()), font_size: Some(1.0), font_weight: Some(400), ui_font: Some(String::new()), telemetry: true, clipboard_write: false, copy_on_select: false, appearance: Appearance::Light, language: Language::ZhCn, theme: Some(crate::layout::ThemeChoice::One(String::new())), colors: [("text".into(), String::new())].into(), ..Person::default() };
         let keys: Vec<String> = serde_json::to_value(&all).unwrap().as_object().unwrap().keys().cloned().collect();
         let guide = include_str!("../defaults/AGENTS.md");
         let section = guide.split("## The person").nth(1).and_then(|s| s.split("\n## ").next()).unwrap_or_default();

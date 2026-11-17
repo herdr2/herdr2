@@ -2,6 +2,15 @@ import { test, expect } from "bun:test";
 import { readFile, mkdtemp, mkdir, writeFile, rm, symlink } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import {
+  detectFileKind,
+  CODE_THEMES,
+  MD_THEMES,
+  resolveCodeTheme,
+  resolveMdTheme,
+  prepareMarkdown,
+  resolveRelativeFileLink,
+} from "../defaults/mods/files/themes.js";
 
 const source = await readFile(new URL("../defaults/mods/files/main.js", import.meta.url), "utf8");
 const directorySource = source.slice(source.indexOf("async function directory("), source.indexOf("\nexport default class"));
@@ -126,4 +135,84 @@ test("Files follows directory links one level at a time", async () => {
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+test("Files detects Markdown, code languages, and exact filenames", () => {
+  expect(detectFileKind("README.md")).toMatchObject({ language: "md", label: "Markdown", isMarkdown: true });
+  expect(detectFileKind("docs/guide.MDX")).toMatchObject({ language: "md", label: "MDX", isMarkdown: true });
+  expect(detectFileKind("src/main.rs")).toMatchObject({ language: "rs", label: "Rust", isMarkdown: false });
+  expect(detectFileKind("web/App.tsx")).toMatchObject({ language: "tsx", label: "TSX", isMarkdown: false });
+  expect(detectFileKind("Cargo.toml")).toMatchObject({ language: "toml", label: "TOML", isMarkdown: false });
+  expect(detectFileKind("docker/Dockerfile")).toMatchObject({ language: "dockerfile", label: "Dockerfile", isMarkdown: false });
+  expect(detectFileKind("Makefile")).toMatchObject({ language: "makefile", label: "Makefile", isMarkdown: false });
+  expect(detectFileKind(".env.local")).toMatchObject({ language: "ini", label: "Env", isMarkdown: false });
+  expect(detectFileKind("notes")).toMatchObject({ language: "txt", label: "Plain Text", isMarkdown: false });
+});
+
+test("Files code and Markdown themes always resolve valid hex colors and never transparent", () => {
+  const hexRe = /^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$/;
+  const appLight = {
+    background: "#ffffff",
+    surface: "#f8fafc",
+    raised: "#f1f5f9",
+    foreground: "#0f172a",
+    muted: "#475569",
+    dim: "#94a3b8",
+    accent: "#2563eb",
+    border: "#e2e8f0",
+    selection: "#2563eb33",
+    hover: "#e2e8f0",
+    ansi1: "#dc2626",
+    ansi2: "#16a34a",
+    ansi3: "#ca8a04",
+    ansi4: "#2563eb",
+    ansi5: "#9333ea",
+    ansi6: "#0891b2",
+  };
+  for (const preset of CODE_THEMES) {
+    const resolved = resolveCodeTheme(preset.id, appLight);
+    for (const val of [...Object.values(resolved.colors), ...Object.values(resolved.syntax)]) {
+      expect(val).not.toBe("transparent");
+      expect(hexRe.test(val)).toBe(true);
+    }
+  }
+  for (const preset of MD_THEMES) {
+    const resolved = resolveMdTheme(preset.id, appLight);
+    expect(hexRe.test(resolved.background)).toBe(true);
+    expect(typeof resolved.textView.dark).toBe("boolean");
+    expect(resolved.id === "auto" ? resolved.textView.dark : undefined).toBe(preset.id === "auto" ? false : undefined);
+    for (const [k, val] of Object.entries(resolved.textView)) {
+      if (k === "dark") continue;
+      if (k === "syntax") {
+        for (const s of Object.values(val as Record<string, string>)) expect(hexRe.test(s)).toBe(true);
+      } else {
+        expect(val).not.toBe("transparent");
+        expect(hexRe.test(val as string)).toBe(true);
+      }
+    }
+  }
+});
+
+test("Files formats GitHub callout alerts outside fenced code blocks", () => {
+  const input = [
+    "> [!NOTE]",
+    "> Helpful tip.",
+    "",
+    "```markdown",
+    "> [!WARNING]",
+    "> Stay literal inside code fences.",
+    "```",
+  ].join("\n");
+  const out = prepareMarkdown(input);
+  expect(out).toContain("> **ⓘ Note**");
+  expect(out).toContain("```markdown\n> [!WARNING]");
+});
+
+test("Files resolves relative Markdown file links and rejects external or escaping links", () => {
+  expect(resolveRelativeFileLink("docs/guide/intro.md", "./setup.md#install")).toBe("docs/guide/setup.md");
+  expect(resolveRelativeFileLink("docs/guide/intro.md", "../README.md")).toBe("docs/README.md");
+  expect(resolveRelativeFileLink("README.md", "src/main.rs?line=10")).toBe("src/main.rs");
+  expect(resolveRelativeFileLink("README.md", "../escape.txt")).toBeNull();
+  expect(resolveRelativeFileLink("docs/a.md", "https://example.com/x")).toBeNull();
+  expect(resolveRelativeFileLink("docs/a.md", "#section")).toBeNull();
 });

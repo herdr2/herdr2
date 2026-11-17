@@ -82,7 +82,7 @@ impl Core {
             return;
         }
 
-        let candidates: Vec<(u32, String, Vec<String>, String, Option<String>, bool, Option<String>, Option<String>, Option<String>, bool, std::collections::BTreeMap<String, String>)> = {
+        let candidates: Vec<_> = {
             let mut st = self.lock();
             if st.stopping || self.restart.load(Ordering::SeqCst) {
                 return;
@@ -119,6 +119,7 @@ impl Core {
                         a.system_prompt.clone(),
                         a.model.clone(),
                         a.mode.clone(),
+                        a.config_overrides.clone(),
                         a.inject_mcp,
                         a.restart_env.clone(),
                     ))
@@ -128,9 +129,9 @@ impl Core {
 
         if !candidates.is_empty() {
             let base_env = crate::platform::program_env().await;
-            let mcp_exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "herdr2".into());
+            let mcp_exe = crate::client::exe_path().map(|p| p.display().to_string()).unwrap_or_else(|| "herdr2".into());
 
-            for (id, address, argv, orig_cwd, resume_session_id, can_load_session, system_prompt, model, mode, inject_mcp, restart_env) in candidates {
+            for (id, address, argv, orig_cwd, resume_session_id, can_load_session, system_prompt, model, mode, config_overrides, inject_mcp, restart_env) in candidates {
                 if self.lock().stopping || self.restart.load(Ordering::SeqCst) {
                     self.lock().recovering.remove(&id);
                     continue;
@@ -162,6 +163,8 @@ impl Core {
                     system_prompt,
                     model,
                     mode,
+                    dangerously_skip_permissions: false,
+                    config_overrides,
                     inject_mcp,
                     mcp_exe: mcp_exe.clone(),
                     socket: self.paths.socket.display().to_string(),
@@ -178,6 +181,8 @@ impl Core {
                         let agent_info = started.agent_info.clone();
                         let acp_sid = started.session_id.clone();
                         let can_load = started.can_load_session;
+                        let config_options = started.config_options.clone();
+                        let context_usage = started.context_usage;
                         let handle = acp::spawn_actor(self.clone(), id, started);
                         let pid = handle.transport.pid();
                         st.sessions.insert(id, handle);
@@ -185,6 +190,11 @@ impl Core {
                             a.pid = pid;
                             a.acp_session_id = Some(acp_sid);
                             a.can_load_session = can_load;
+                            a.config_options = config_options;
+                            if let Some(usage) = context_usage {
+                                a.context_usage = Some(usage);
+                            }
+                            acp::sync_config_to_agent(a);
                             if agent_info.is_some() {
                                 a.agent_info = agent_info;
                             }

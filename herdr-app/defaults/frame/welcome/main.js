@@ -394,9 +394,7 @@ export default class Welcome extends View {
   }
 
   pageThree(t) {
-    // The first look at this page asks: nothing is picked yet (skipping the
-    // welcome leaves both on).
-    if (shared("workspace.panels") === undefined || shared("workspace.panels") === null) setShared("workspace.panels", []);
+    // Default panels stay enabled (["files", "changes"]) unless toggled off.
     return v_flex()
       .gap(14)
       .child(this.title(t, "Choose your panels", "Herdr comes with a couple of panels. Turn one on and it appears beside your terminals. Drag this window aside to see it. Later, the buttons in the tab bar open and close them."))

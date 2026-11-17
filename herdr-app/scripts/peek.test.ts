@@ -1,0 +1,453 @@
+import { describe, test, expect } from "bun:test";
+import {
+  parseUserEnvelope,
+  splitMarkdownBlocks,
+  cleanTerminalSnapshot,
+  buildConversationItems,
+  summarizeActivityGroup,
+  summarizeToolTitle,
+  normalizeThoughtText,
+  toolIconPath,
+  shortenPath,
+  normalizeConfigOptions,
+  filterConfigChoices,
+} from "../defaults/mods/peek/acp_model.js";
+
+describe("parseUserEnvelope", () => {
+  test("strips <h2 from=...> wrapper and preserves multi-line UTF-8 body", () => {
+    const raw = `<h2 from="t8" reach="h2 send t8 when done or stuck">请联网检索 GLM-5.5\n重点包含：\n1) 发布时间\n2) 模型规格</h2>`;
+    const parsed = parseUserEnvelope(raw, "t8");
+    expect(parsed.from).toBe("t8");
+    expect(parsed.reach).toBe("h2 send t8 when done or stuck");
+    expect(parsed.body).toBe("请联网检索 GLM-5.5\n重点包含：\n1) 发布时间\n2) 模型规格");
+  });
+
+  test("extracts from attribute when entry.from is absent and unwraps nested envelopes", () => {
+    const raw = `<h2 from="t3"><h2 from="t3">Check auth middleware</h2></h2>`;
+    const parsed = parseUserEnvelope(raw, null);
+    expect(parsed.from).toBe("t3");
+    expect(parsed.body).toBe("Check auth middleware");
+  });
+
+  test("returns plain user text untouched", () => {
+    const parsed = parseUserEnvelope("hello agent\nfix the build", null);
+    expect(parsed.from).toBeNull();
+    expect(parsed.body).toBe("hello agent\nfix the build");
+  });
+});
+
+describe("splitMarkdownBlocks", () => {
+  test("splits mixed prose and fenced code blocks while preserving languages", () => {
+    const md = [
+      "# Summary",
+      "",
+      "Here is the patch:",
+      "",
+      "```rust",
+      "fn main() {",
+      "    println!(\"ok\");",
+      "}",
+      "```",
+      "",
+      "Run verification:",
+      "",
+      "```bash",
+      "cargo test",
+      "```",
+    ].join("\n");
+
+    const blocks = splitMarkdownBlocks(md);
+    expect(blocks).toEqual([
+      { type: "prose", text: "# Summary\n\nHere is the patch:" },
+      { type: "code", lang: "rust", code: "fn main() {\n    println!(\"ok\");\n}", closed: true },
+      { type: "prose", text: "Run verification:" },
+      { type: "code", lang: "bash", code: "cargo test", closed: true },
+    ]);
+  });
+
+  test("handles unclosed streaming code fences", () => {
+    const blocks = splitMarkdownBlocks("Streaming:\n```ts\nconst x = 1;");
+    expect(blocks).toEqual([
+      { type: "prose", text: "Streaming:" },
+      { type: "code", lang: "ts", code: "const x = 1;", closed: false },
+    ]);
+  });
+});
+
+describe("buildConversationItems", () => {
+  test("groups real multi-turn ACP entries into T3 Code items", () => {
+    const entries = [
+      {
+        kind: "user",
+        turn: 1,
+        from: "t8",
+        text: '<h2 from="t8" reach="h2 send t8">Inspect server routes</h2>',
+        ts_ms: 1794884405000,
+      },
+      { kind: "thought", turn: 1, text: "Need to read router setup.", ts_ms: 1794884406000 },
+      { kind: "tool_call", turn: 1, id: "tc-1", title: "Read src/router.rs", tool_kind: "read", status: "completed", ts_ms: 1794884407000 },
+      { kind: "tool_call", turn: 1, id: "tc-2", title: "cargo check", tool_kind: "execute", status: "completed", ts_ms: 1794884408000 },
+      { kind: "plan", turn: 1, items: ["Read router", "Check middleware"], ts_ms: 1794884409000 },
+      {
+        kind: "assistant",
+        turn: 1,
+        text: "All routes look good.\n\n```rust\nroute(\"/health\")\n```",
+        ts_ms: 1794884410000,
+      },
+      { kind: "stderr", text: "warning: unused var", ts_ms: 1794884411000 },
+      { kind: "stderr", text: "warning: dead code", ts_ms: 1794884412000 },
+      { kind: "user", turn: 2, text: "Now add tests", ts_ms: 1794884420000 },
+      { kind: "tool_call", turn: 2, id: "tc-3", title: "Edit tests/router.rs", tool_kind: "edit", status: "in_progress", ts_ms: 1794884421000 },
+    ];
+
+    const items = buildConversationItems(entries, "", true);
+    expect(items.map((x) => x.kind)).toEqual([
+      "user",
+      "activity_group",
+      "assistant",
+      "stderr_group",
+      "user",
+      "activity_group",
+    ]);
+
+    const firstUser = items[0] as any;
+    expect(firstUser.from).toBe("t8");
+    expect(firstUser.body).toBe("Inspect server routes");
+
+    const doneGroup = items[1] as any;
+    expect(doneGroup.showSpeakerHeader).toBe(true);
+    expect(doneGroup.defaultExpanded).toBe(false);
+    expect(summarizeActivityGroup(doneGroup)).toBe("2 tool calls · 1 thought · 1 plan");
+
+    const reply = items[2] as any;
+    expect(reply.showSpeakerHeader).toBe(false);
+    expect(reply.blocks).toHaveLength(2);
+    expect(reply.blocks[1]).toMatchObject({ type: "code", lang: "rust" });
+
+    const stderr = items[3] as any;
+    expect(stderr.lineCount).toBe(2);
+
+    const activeGroup = items[5] as any;
+    expect(activeGroup.runningCount).toBe(1);
+    expect(activeGroup.defaultExpanded).toBe(true);
+    expect(summarizeActivityGroup(activeGroup)).toBe("Running: Edit tests/router.rs");
+  });
+
+  test("falls back to plain text when entries array is empty", () => {
+    const items = buildConversationItems([], "Legacy plain output");
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      kind: "assistant",
+      text: "Legacy plain output",
+      showSpeakerHeader: true,
+    });
+  });
+});
+
+describe("helpers", () => {
+  test("maps tool kinds and shortens cwd paths", () => {
+    expect(toolIconPath("execute", "bash")).toBe("mods/workspace-chrome/terminal.svg");
+    expect(toolIconPath("read", "Read file")).toBe("mods/workspace-chrome/file-text.svg");
+    expect(toolIconPath("search", "web search")).toBe("mods/workspace-chrome/search.svg");
+    expect(shortenPath("/home/user/repo", "/home/user")).toBe("~/repo");
+    expect(shortenPath("/tmp/work", "/home/user")).toBe("/tmp/work");
+  });
+});
+
+describe("normalizeConfigOptions & filterConfigChoices", () => {
+  test("orders capability pills cleanly and resolves current labels", () => {
+    const opts = normalizeConfigOptions(
+      [
+        {
+          id: "mode",
+          name: "Mode",
+          category: "mode",
+          kind: "select",
+          current_value: "code",
+          options: [
+            { value: "architect", name: "Architect" },
+            { value: "code", name: "Code" },
+          ],
+        },
+        {
+          id: "fast-mode",
+          name: "Fast Mode",
+          category: "model_config",
+          kind: "boolean",
+          current_value: true,
+        },
+        {
+          id: "reasoning_effort",
+          name: "Reasoning Effort",
+          category: "thought_level",
+          kind: "select",
+          current_value: "high",
+          options: [
+            { value: "low", name: "Low" },
+            { value: "high", name: "High", group: "Deep" },
+          ],
+        },
+        {
+          id: "model",
+          name: "Model",
+          category: "model",
+          kind: "select",
+          current_value: "gpt-5.4",
+          options: [
+            { value: "gpt-5.4", name: "GPT-5.4", description: "Flagship", group: "OpenAI" },
+            { value: "gpt-5.3-codex", name: "GPT-5.3 Codex", group: "OpenAI" },
+          ],
+        },
+      ],
+      {},
+    );
+
+    expect(opts.map((o) => `${o.id}:${o.iconKind}:${o.pillLabel}`)).toEqual([
+      "model:model:GPT-5.4",
+      "reasoning_effort:thinking:High",
+      "fast-mode:fast:Fast",
+      "mode:mode:Code",
+    ]);
+    expect(opts[2].isNonDefault).toBe(true);
+
+    expect(filterConfigChoices(opts[0].choices, "codex").map((c) => c.value)).toEqual(["gpt-5.3-codex"]);
+    expect(filterConfigChoices(opts[0].choices, "flagship").map((c) => c.value)).toEqual(["gpt-5.4"]);
+  });
+
+  test("falls back to synthetic custom model option when adapter omits model options", () => {
+    const opts = normalizeConfigOptions([], { model: "claude-sonnet-4" });
+    expect(opts).toHaveLength(1);
+    expect(opts[0]).toMatchObject({
+      id: "model",
+      shortLabel: "Model",
+      iconKind: "model",
+      pillLabel: "claude-sonnet-4",
+      kind: "custom_text",
+      currentValue: "claude-sonnet-4",
+      currentLabel: "claude-sonnet-4",
+    });
+  });
+
+  test("maps Claude bypassPermissions mode to dangerously-skip-permissions and synthesizes fallback modes", () => {
+    const opts = normalizeConfigOptions(
+      [
+        {
+          id: "mode",
+          name: "Mode",
+          category: "mode",
+          kind: "select",
+          current_value: "bypassPermissions",
+          options: [
+            { value: "default", name: "Manual" },
+            { value: "bypassPermissions", name: "Bypass permissions" },
+          ],
+        },
+      ],
+      { agent: "claude" },
+    );
+    const modeOpt = opts.find((o) => o.id === "mode")!;
+    expect(modeOpt.pillLabel).toBe("dangerously-skip-permissions");
+    expect(filterConfigChoices(modeOpt.choices, "dangerously").map((c) => c.value)).toEqual(["bypassPermissions"]);
+    expect(filterConfigChoices(modeOpt.choices, "skip").map((c) => c.value)).toEqual(["bypassPermissions"]);
+
+    const synthesized = normalizeConfigOptions([], { agent: "claude", model: "sonnet", mode: "default" });
+    const synthMode = synthesized.find((o) => o.id === "mode")!;
+    expect(synthMode.choices.some((c) => c.value === "bypassPermissions" && c.name === "dangerously-skip-permissions")).toBe(true);
+  });
+
+  test("summarizes multi-line Codex tool titles, splits glued thought headings, and drops session/load replays", () => {
+    const info = summarizeToolTitle("python3 - <<'PY'\nprint('hello')\nprint('world')\nPY");
+    expect(info.summary).toBe("python3 - <<'PY'");
+    expect(info.extraLines).toBe(3);
+    expect(info.multiline).toBe(true);
+
+    expect(normalizeThoughtText("**Preparing report****Adding final link**")).toBe(
+      "**Preparing report**\n\n**Adding final link**",
+    );
+
+    const items = buildConversationItems([
+      { kind: "user", turn: 1, from: "t8", text: "First prompt", ts_ms: 1 },
+      { kind: "assistant", turn: 1, text: "First answer", ts_ms: 2 },
+      // Historical replay artifacts emitted at start of resumed turn 2 with from=null
+      { kind: "user", turn: 2, from: null, text: "First prompt", ts_ms: 3 },
+      { kind: "assistant", turn: 2, text: "First answer", ts_ms: 4 },
+      // Authoritative prompt for turn 2
+      { kind: "user", turn: 2, from: "t8", text: "Follow-up prompt", ts_ms: 5 },
+      { kind: "thought", turn: 2, text: "**Checking dates****Summarizing findings**", ts_ms: 6 },
+      { kind: "tool_call", turn: 2, id: "tc-ml", title: "cat > out.txt <<'EOF'\nline 1\nline 2\nEOF", tool_kind: "execute", status: "completed", ts_ms: 7 },
+      { kind: "assistant", turn: 2, text: "Follow-up answer", ts_ms: 8 },
+    ]);
+
+    expect(items.filter((x) => x.kind === "user").map((x: any) => x.body)).toEqual([
+      "First prompt",
+      "Follow-up prompt",
+    ]);
+    const grp = items.find((x) => x.kind === "activity_group") as any;
+    expect(grp.steps[0]).toMatchObject({ kind: "thought", text: "**Checking dates**\n\n**Summarizing findings**" });
+    expect(grp.steps[1]).toMatchObject({
+      kind: "tool_call",
+      summaryTitle: "cat > out.txt <<'EOF'",
+      extraLines: 3,
+      multiline: true,
+    });
+    expect(summarizeActivityGroup(grp)).not.toContain("\n");
+
+    const singleToolGroup = {
+      runningCount: 0,
+      steps: [{ kind: "tool_call", title: "cat <<'EOF'\na\nb\nEOF", summaryTitle: "cat <<'EOF'", extraLines: 3 }],
+    };
+    expect(summarizeActivityGroup(singleToolGroup)).toBe("cat <<'EOF' (+3 lines)");
+
+    // Program metadata alone identifies Claude Code ACP and exposes dangerously-skip-permissions.
+    const claudeByProgram = normalizeConfigOptions([], { program: { name: "Claude Code" } });
+    const claudeMode = claudeByProgram.find((o) => o.id === "mode")!;
+    expect(claudeMode.choices.some((c) => c.value === "bypassPermissions" && c.name === "dangerously-skip-permissions")).toBe(true);
+    expect(claudeMode.currentValue).toBe("bypassPermissions");
+    expect(claudeMode.pillLabel).toBe("dangerously-skip-permissions");
+
+    // Adapters with permission_mode but no native ACP mode expose Herdr2's permissions selector.
+    const codexPerms = normalizeConfigOptions([], { agent: "codex", permission_mode: "approve-reads" });
+    const permOpt = codexPerms.find((o) => o.id === "permissions")!;
+    expect(permOpt.currentLabel).toBe("Approve reads");
+    expect(permOpt.choices.some((c) => c.value === "dangerously-skip-permissions")).toBe(true);
+
+    // Full 5-choice Claude mode list preserves all choices and maps bypassPermissions -> dangerously-skip-permissions.
+    const fullClaude = normalizeConfigOptions(
+      [
+        {
+          id: "mode",
+          name: "Mode",
+          category: "mode",
+          kind: "select",
+          current_value: "default",
+          options: [
+            { value: "default", name: "Manual", description: "Always ask before making changes" },
+            { value: "acceptEdits", name: "Accept edits", description: "Automatically accept all file edits" },
+            { value: "plan", name: "Plan", description: "Create a plan before making changes" },
+            { value: "auto", name: "Auto", description: "Claude handles permission decisions" },
+            { value: "bypassPermissions", name: "Bypass permissions", description: "Accepts all permissions" },
+          ],
+        },
+      ],
+      { agent: "claude" },
+    );
+    const fullMode = fullClaude.find((o) => o.id === "mode")!;
+    expect(fullMode.choices.map((c) => c.value)).toEqual(["default", "acceptEdits", "plan", "auto", "bypassPermissions"]);
+    expect(fullMode.choices[4]).toMatchObject({
+      value: "bypassPermissions",
+      name: "dangerously-skip-permissions",
+      description: "Accepts all permissions",
+    });
+
+    // Alternate mode option ids (`permission_mode`, `approval_policy`) also normalize under `mode`.
+    for (const altId of ["permission_mode", "approval_policy"]) {
+      const altOpts = normalizeConfigOptions(
+        [
+          {
+            id: altId,
+            name: "Permissions",
+            kind: "select",
+            current_value: "default",
+            options: [{ value: "default", name: "Manual" }],
+          },
+        ],
+        { agent: "claude" },
+      );
+      const altMode = altOpts.find((o) => o.id === altId)!;
+      expect(altMode.iconKind).toBe("mode");
+      expect(altMode.choices.some((c) => c.value === "bypassPermissions" && c.name === "dangerously-skip-permissions")).toBe(true);
+    }
+  });
+});
+
+describe("PTY structured formatting & snapshot fallback", () => {
+  test("cleanTerminalSnapshot strips wide dividers, NBSP, and blank runs", () => {
+    const rule = "─".repeat(200);
+    const blanks = "\n".repeat(100);
+    const raw = `\n ▐▛███▛█   Claude Code\n${blanks}${rule}\n❯\u00a0Try "fix lint errors"\n${rule}\n  Model:\u00a0GLM-5.3\n\n\n`;
+    const cleaned = cleanTerminalSnapshot(raw);
+    expect(cleaned).not.toContain(rule);
+    expect(cleaned).not.toContain("\u00a0");
+    expect(cleaned).not.toContain("\n\n\n");
+    expect(cleaned.split("\n")).toEqual([
+      " ▐▛███▛█   Claude Code",
+      "",
+      '❯ Try "fix lint errors"',
+      "  Model: GLM-5.3",
+    ]);
+  });
+
+  test("returns empty state for idle turn-0 PTY agent and snapshot card for non-zero screen fallback", () => {
+    const rawScreen = `${"─".repeat(60)}\n❯\u00a0Welcome to Claude Code\n${"─".repeat(60)}`;
+    expect(
+      buildConversationItems([], rawScreen, false, {
+        isPty: true,
+        how: "screen",
+        turn: 0,
+        isAgent: true,
+      }),
+    ).toEqual([]);
+
+    const snap = buildConversationItems([], rawScreen, false, {
+      isPty: true,
+      how: "screen",
+      turn: 1,
+      isAgent: true,
+    });
+    expect(snap).toHaveLength(1);
+    expect(snap[0]).toMatchObject({
+      kind: "terminal_snapshot",
+      turn: 1,
+      text: "❯ Welcome to Claude Code",
+      lineCount: 1,
+    });
+  });
+
+  test("keeps indented fenced code inside numbered lists while splitting top-level fences", () => {
+    const md = [
+      "1. First step:",
+      "",
+      "   ```sh",
+      "   cargo check",
+      "   ```",
+      "",
+      "2. Second step.",
+      "",
+      "```rust",
+      "fn top_level() {}",
+      "```",
+    ].join("\n");
+
+    const blocks = splitMarkdownBlocks(md);
+    expect(blocks).toEqual([
+      {
+        type: "prose",
+        text: "1. First step:\n\n   ```sh\n   cargo check\n   ```\n\n2. Second step.",
+      },
+      {
+        type: "code",
+        lang: "rust",
+        code: "fn top_level() {}",
+        closed: true,
+      },
+    ]);
+  });
+
+  test("coalesces adjacent assistant entries per turn and marks only final turn reply", () => {
+    const items = buildConversationItems([
+      { kind: "user", turn: 1, text: "Check status", ts_ms: 100 },
+      { kind: "assistant", turn: 1, text: "Working on part A.", ts_ms: 110 },
+      { kind: "assistant", turn: 1, text: "Also checking part B.", ts_ms: 120 },
+      { kind: "tool_call", turn: 1, id: "t1", title: "h2 ls", tool_kind: "execute", status: "completed", ts_ms: 130 },
+      { kind: "assistant", turn: 1, text: "All done.", ts_ms: 140 },
+    ]);
+
+    expect(items.map((x) => x.kind)).toEqual(["user", "assistant", "activity_group", "assistant"]);
+    const firstReply = items[1] as any;
+    expect(firstReply.text).toBe("Working on part A.\n\nAlso checking part B.");
+    expect(firstReply.isFinalTurnReply).toBe(false);
+    const finalReply = items[3] as any;
+    expect(finalReply.text).toBe("All done.");
+    expect(finalReply.isFinalTurnReply).toBe(true);
+  });
+});

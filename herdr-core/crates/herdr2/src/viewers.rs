@@ -303,6 +303,9 @@ impl Core {
             self.touch(&mut st, conn, channel, |_| {})
         };
         if let Some(id) = id {
+            if !automatic && is_user_interaction_input(bytes) {
+                self.clear_manual_status_pty_locked(&mut st, id);
+            }
             let answered = Self::viewer(&mut st, conn, channel).unwrap().1.answers.feed(bytes);
             let mut now = Vec::new();
             let mut from = 0;
@@ -471,6 +474,54 @@ fn ordered_replies(gate: &mut crate::pty_input::Gate, replies: &[u8]) -> Vec<u8>
         }
     }
     now
+}
+
+/// Returns true if `bytes` contains genuine user interaction (keystrokes, clicks, pastes)
+/// rather than passive focus/hover/wheel events.
+pub(crate) fn is_user_interaction_input(bytes: &[u8]) -> bool {
+    !bytes.is_empty() && !is_passive_mouse_or_focus_only(bytes)
+}
+
+fn is_passive_mouse_or_focus_only(mut rest: &[u8]) -> bool {
+    while !rest.is_empty() {
+        if let Some(after) = rest.strip_prefix(b"\x1b[I").or_else(|| rest.strip_prefix(b"\x1b[O")) {
+            rest = after;
+            continue;
+        }
+        if let Some(after) = rest.strip_prefix(b"\x1b[<") {
+            let Some(end_idx) = after.iter().take(32).position(|&b| b == b'M' || b == b'm') else {
+                return false;
+            };
+            let Ok(body) = std::str::from_utf8(&after[..end_idx]) else {
+                return false;
+            };
+            let mut parts = body.split(';');
+            let (Some(btn), Some(x), Some(y), None) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
+            else {
+                return false;
+            };
+            let (Ok(btn), Ok(_), Ok(_)) = (btn.parse::<u32>(), x.parse::<u32>(), y.parse::<u32>()) else {
+                return false;
+            };
+            // Release ('m'), motion (32), and wheel (64) are passive; mouse button press ('M' without 32|64) is a click.
+            if after[end_idx] == b'M' && (btn & (32 | 64)) == 0 {
+                return false;
+            }
+            rest = &after[end_idx + 1..];
+            continue;
+        }
+        if rest.starts_with(b"\x1b[M") && rest.len() >= 6 {
+            let cb = rest[3].wrapping_sub(32);
+            if (cb & (32 | 64)) == 0 && (cb & 3) != 3 {
+                return false;
+            }
+            rest = &rest[6..];
+            continue;
+        }
+        return false;
+    }
+    true
 }
 
 /// Whether a viewer could answer an image: observers' replies never reach the program.

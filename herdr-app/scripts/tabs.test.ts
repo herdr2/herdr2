@@ -12,7 +12,10 @@ class Element {
         if (key === "child") target.nodes.push(args[0] as Element);
         else if (key === "children") target.nodes.push(...(args[0] as Element[]));
         else if (key === "when") { if (args[0]) (args[1] as (el: Element) => void)(proxy); }
-        else target.calls[key] = args;
+        else {
+          target.calls[key] = args;
+          if (typeof args[0] === "string") target.calls[`${key}:${args[0]}`] = args;
+        }
         return proxy;
       },
     });
@@ -139,4 +142,214 @@ test("a shell's title never replaces its tab's name", () => {
   expect(label({ name: "", named: false }, shell)).toBe("zsh");
   expect(label({ name: "notes", named: true }, shell)).toBe("notes");
   expect(label({ name: "", named: false }, undefined)).toBe("Terminal");
+});
+
+test("clicking vs dragging tabs floats active tab with zoom-aware 1:1 tracking, spring settle, and type badges", async () => {
+  const runCalls: unknown[][] = [];
+  let currentZoom = 1.2;
+  let currentLang = "en";
+  let currentTabs = [{ id: "t1", name: "a" }, { id: "t2", name: "b", active: true }, { id: "t3", name: "c" }];
+  const currentPanes = [
+    { tab: "t1", acp: true, program: { name: "Claude Code", key: "claude", agent: true } },
+    { tab: "t2", program: { name: "Claude Code", key: "claude", agent: true } },
+    { tab: "t3", program: { name: "zsh", key: "zsh" } },
+  ];
+  const view = new (new Function(...Object.keys(values), source.replace(/^import .*;\n/gm, "").replace("export default class Tabs", "return class Tabs"))(
+    ...Object.values({
+      ...values,
+      spaces: () => [{ id: "s1", active: true, tabs: currentTabs }],
+      panes: () => currentPanes,
+      settings: () => ({ zoom: currentZoom, language: currentLang }),
+      run: (cmd: string, args: any) => {
+        runCalls.push([cmd, args]);
+        if (cmd === "tab.move" && args?.id === "t1" && args?.index === 2) {
+          currentTabs = [currentTabs[1], currentTabs[0], currentTabs[2]];
+        }
+      },
+    }),
+  ))();
+  view.init();
+  const collectTexts = (node: any): string[] => {
+    if (!node) return [];
+    const out: string[] = [];
+    for (const ch of node.nodes ?? []) {
+      if (typeof ch === "string") out.push(ch);
+      else out.push(...collectTexts(ch));
+    }
+    return out;
+  };
+  const findById = (node: any, id: string): any => {
+    if (!node) return null;
+    if (node.calls?.id?.[0] === id) return node;
+    for (const ch of node.nodes ?? []) {
+      const hit = findById(ch, id);
+      if (hit) return hit;
+    }
+    return null;
+  };
+
+  let releaseSleep: (() => void) | null = null;
+  const tasks: Promise<unknown>[] = [];
+  const asyncCx = {
+    stop_propagation() {},
+    notify() {},
+    spawn(fn: (acx: any) => Promise<unknown>) {
+      const p = fn({
+        sleep: () => new Promise<void>((res) => { releaseSleep = res; }),
+        notify() {},
+      });
+      tasks.push(p);
+      return { cancel() {} };
+    },
+  };
+
+  // Tab pills distinguish ACP vs Terminal Agent (CLI in English, 终端 in Simplified Chinese) vs plain shell.
+  const root1 = view.render();
+  expect(collectTexts(findById(root1, "tab-t1"))).toContain("ACP");
+  expect(collectTexts(findById(root1, "tab-t2"))).toContain("CLI");
+  expect(collectTexts(findById(root1, "tab-t3"))).not.toContain("ACP");
+  expect(collectTexts(findById(root1, "tab-t3"))).not.toContain("CLI");
+  currentLang = "zh-CN";
+  expect(collectTexts(findById(view.render(), "tab-t2"))).toContain("终端");
+  currentLang = "en";
+
+  // Click without drag selects the tab.
+  const tab1 = findById(root1, "tab-t1");
+  tab1.calls["on_mouse_down:left"][1]({ click_count: 1, position: { x: 24 }, bounds: { width: 120 } }, asyncCx);
+  tab1.calls["on_mouse_up:left"][1]({}, asyncCx);
+  expect(runCalls).toEqual([["tab.select", { id: "t1" }]]);
+
+  runCalls.length = 0;
+  // Measure raw zoomed widths (120 raw px / 1.2 zoom = 100 logical px) and drag t1 past t2.
+  findById(root1, "tab-t2").calls.on_size_change[0]({ width: 120 }, asyncCx);
+  findById(root1, "tab-t3").calls.on_size_change[0]({ width: 120 }, asyncCx);
+  tab1.calls["on_mouse_down:left"][1]({ click_count: 1, position: { x: 24 }, bounds: { width: 120 } }, asyncCx);
+  // Move +180 raw px -> 150 logical px (past t2's merge zone into the reorder slot).
+  root1.calls.on_mouse_move[0]({ position: { x: 204 }, pressed_button: "left" }, asyncCx);
+
+  const draggingRoot = view.render();
+  const placeholderTab1 = findById(draggingRoot, "tab-t1");
+  const floatingTab1 = findById(draggingRoot, "tab-float-t1");
+  const shiftedTab2 = findById(draggingRoot, "tab-t2");
+  const shield = findById(draggingRoot, "tab-drag-shield");
+  expect(placeholderTab1.calls.opacity?.[0]).toBe(0);
+  expect(floatingTab1.calls.left[0]).toBe(150);
+  expect(floatingTab1.calls.spring?.[1]?.response).toBe(0);
+  expect(shiftedTab2.calls.left[0]).toBe(-103);
+  expect(shiftedTab2.calls.spring?.[0]).toBe("left");
+  expect(shiftedTab2.calls.spring?.[1]?.response).toBe(165);
+  expect(shield).not.toBeNull();
+
+  // Releasing enters the smooth settle spring (160ms response to destination X 103) before committing tab.move.
+  shield.calls["on_mouse_up:left"][1]({}, asyncCx);
+  expect(runCalls).toEqual([]);
+  const settlingRoot = view.render();
+  const settlingFloat = findById(settlingRoot, "tab-float-t1");
+  expect(settlingFloat.calls.left[0]).toBe(103);
+  expect(settlingFloat.calls.spring?.[1]?.response).toBe(160);
+  expect(findById(settlingRoot, "tab-t2").calls.left[0]).toBe(-103);
+
+  releaseSleep?.();
+  await Promise.all(tasks);
+  expect(runCalls).toEqual([
+    ["tab.move", { id: "t1", index: 2 }],
+    ["tab.select", { id: "t1" }],
+  ]);
+
+  // First render after array reorder snaps neighbors at response: 0 so there is zero double-slide seam.
+  const settledRoot = view.render();
+  expect(findById(settledRoot, "tab-t2").calls.left[0]).toBe(0);
+  expect(findById(settledRoot, "tab-t2").calls.spring?.[1]?.response).toBe(0);
+
+  // Dragging onto another tab's center highlights the target without shifting it and merges on release.
+  runCalls.length = 0;
+  const beforeMergeRoot = view.render();
+  const tab2Now = findById(beforeMergeRoot, "tab-t2");
+  tab2Now.calls["on_mouse_down:left"][1]({ click_count: 1, position: { x: 24 }, bounds: { width: 120 } }, asyncCx);
+  // Drag t2 (+103 logical px -> +124 raw px, center = 153) squarely over t1's center [103..203].
+  beforeMergeRoot.calls.on_mouse_move[0]({ position: { x: 148 }, pressed_button: "left" }, asyncCx);
+  currentLang = "zh-CN";
+  const mergePreviewRoot = view.render();
+  expect(findById(mergePreviewRoot, "tab-t1").calls.left[0]).toBe(0);
+  expect(collectTexts(findById(mergePreviewRoot, "tab-merge-badge"))).toContain("◫ 分栏");
+  currentLang = "en";
+  expect(collectTexts(findById(view.render(), "tab-merge-badge"))).toContain("◫ Split");
+  findById(mergePreviewRoot, "tab-drag-shield").calls["on_mouse_up:left"][1]({}, asyncCx);
+  expect(runCalls).toEqual([["tab.merge", { source: "t2", target: "t1", direction: "right" }]]);
+
+  // Two-tab strip: holding over neighbor merges; pushing past neighbor still reorders.
+  runCalls.length = 0;
+  currentTabs = [{ id: "t1", name: "a", active: true }, { id: "t2", name: "b" }];
+  const twoTabRoot = view.render();
+  findById(twoTabRoot, "tab-t1").calls["on_mouse_down:left"][1]({ click_count: 1, position: { x: 24 }, bounds: { width: 120 } }, asyncCx);
+  // Push +192 raw px -> +160 logical px (clamped at 103+58 = 161, center = 210 > 183).
+  twoTabRoot.calls.on_mouse_move[0]({ position: { x: 216 }, pressed_button: "left" }, asyncCx);
+  const twoReorderRoot = view.render();
+  expect(findById(twoReorderRoot, "tab-merge-badge")).toBeNull();
+  expect(findById(twoReorderRoot, "tab-t2").calls.left[0]).toBe(-103);
+  findById(twoReorderRoot, "tab-drag-shield").calls["on_mouse_up:left"][1]({}, asyncCx);
+  releaseSleep?.();
+  await Promise.all(tasks);
+  expect(runCalls).toEqual([["tab.move", { id: "t1", index: 2 }]]);
+});
+
+test("pane header maximize button breaks out split pane into a standalone tab via pane.detach", async () => {
+  const paneSource = await readFile(new URL("../defaults/mods/pane/main.js", import.meta.url), "utf8");
+  let currentPanes: Array<Record<string, unknown>> = [
+    { pane: "p1", tab: "tb1", terminal: "t1", title: "zsh", status: "idle", zoomed: false, focused: true },
+  ];
+  let currentProps = { pane: "p1", terminal: "t1" };
+  const paneRunCalls: Array<[string, Record<string, unknown>]> = [];
+  const paneValues: Record<string, unknown> = {
+    View: class {},
+    div: element,
+    svg: element,
+    image: element,
+    h_flex: element,
+    panes: () => currentPanes,
+    terminals: () => [{ address: "t1", name: "zsh", labels: {} }, { address: "t2", acp: true, name: "codex-news", labels: {} }],
+    props: () => currentProps,
+    run(command: string, args: Record<string, unknown>) { paneRunCalls.push([command, args]); },
+    h2() {},
+    openOverlay() {},
+    theme: () => ({}),
+    home: () => "/home/me",
+    layout: () => null,
+    settings: () => ({ language: "zh-CN" }),
+  };
+  const Pane = new Function(
+    ...Object.keys(paneValues),
+    paneSource.replace(/^import .*;\n/gm, "").replace("export default class Pane", "return class Pane"),
+  )(...Object.values(paneValues));
+
+  const findNodeById = (node: Element | null | undefined, id: string): Element | null => {
+    if (!node) return null;
+    if (node.calls.id?.[0] === id) return node;
+    for (const child of node.nodes) {
+      if (child && typeof child === "object" && Array.isArray(child.nodes)) {
+        const hit = findNodeById(child, id);
+        if (hit) return hit;
+      }
+    }
+    return null;
+  };
+
+  const view = new Pane();
+  view.init();
+  // Hover a single-pane tab header: no #ph-z button (cannot detach/zoom a lone pane).
+  const singleRoot = view.render({});
+  singleRoot.calls.on_hover[0](true, { notify() {} });
+  expect(findNodeById(view.render({}), "ph-z-p1")).toBeNull();
+
+  // Merged / split tab with two panes: shows #ph-z-p2 and clicking it runs pane.detach.
+  currentPanes = [
+    { pane: "p1", tab: "tb1", terminal: "t1", title: "zsh", status: "idle", zoomed: false, focused: false },
+    { pane: "p2", tab: "tb1", terminal: "a1", acp: true, title: "codex-news", status: "idle", zoomed: false, focused: true },
+  ];
+  currentProps = { pane: "p2", terminal: "a1" };
+  const mergedRoot = view.render({});
+  const zoomBtn = findNodeById(mergedRoot, "ph-z-p2");
+  expect(zoomBtn).not.toBeNull();
+  zoomBtn.calls.on_click[0]({}, { stop_propagation() {} });
+  expect(paneRunCalls).toEqual([["pane.detach", { pane: "p2" }]]);
 });

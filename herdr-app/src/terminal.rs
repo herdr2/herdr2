@@ -149,6 +149,7 @@ struct Grid {
 pub struct TerminalView {
     pub address: String,
     pub title: String,
+    raw_title: String,
     pub ended: Option<String>,
     /// The core connection dropped; waiting to reattach.
     pub lost: bool,
@@ -172,6 +173,14 @@ pub struct TerminalView {
     shown_in: Cell<u64>,
     /// When the person last typed here: output right after is shown at once.
     typed_at: Cell<Option<Instant>>,
+    /// When the person last pressed Enter/newline in this pane.
+    last_enter_at: Cell<Option<Instant>>,
+    /// When the current PTY stream attached (suppresses attach replay from counting as live output).
+    attached_at: Instant,
+    /// Last non-echo PTY output timestamp (fallback activity signal for CLI agents without OSC 7501).
+    last_output_at: Option<Instant>,
+    /// Last live terminal title change timestamp (distinguishes static `✳` idle titles from active spinners).
+    last_title_change_at: Option<Instant>,
     /// Scrolled this gesture, in lines, toward the next whole one.
     scrolled: Point<f32>,
     /// Search UI and query belong to this terminal view, not the window. Each
@@ -302,6 +311,7 @@ impl TerminalView {
         let mut view = TerminalView {
             address: address.clone(),
             title: address.clone(),
+            raw_title: address.clone(),
             ended: None,
             lost: false,
             selecting: false,
@@ -338,6 +348,10 @@ impl TerminalView {
             was_focused: false,
             shown_in: Cell::new(0),
             typed_at: Cell::new(None),
+            last_enter_at: Cell::new(None),
+            attached_at: Instant::now(),
+            last_output_at: None,
+            last_title_change_at: None,
             scrolled: point(0.0, 0.0),
             search_open: false,
             search_keys: false,
@@ -457,6 +471,8 @@ impl TerminalView {
         match attached {
             Ok(attached) => {
                 self.lost = false;
+                self.attached_at = Instant::now();
+                self.last_output_at = None;
                 let mut g = self.grid.borrow_mut();
                 // Replay uses the size requested by attach, not a newer pane layout.
                 if (g.vt.cols, g.vt.rows) != attached_size {
@@ -506,11 +522,48 @@ impl TerminalView {
 
     /// Its title as shown (see `shown_title`); news only when that changed.
     fn set_title(&mut self, title: &str, cx: &mut Context<Self>) {
+        if title != self.raw_title && Instant::now().saturating_duration_since(self.attached_at) >= Duration::from_millis(450) {
+            self.last_title_change_at = Some(Instant::now());
+        }
+        self.raw_title = title.to_owned();
         let shown = shown_title(title);
         if shown != self.title {
             self.title = shown.into_owned();
             cx.emit(TerminalEvent::TitleChanged);
         }
+    }
+
+    pub fn last_typed_at(&self) -> Option<Instant> {
+        self.typed_at.get()
+    }
+
+    pub fn has_active_output(&self, now: Instant) -> bool {
+        self.last_output_at.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(2200))
+    }
+
+    /// Best-effort execution state for an interactive CLI agent that did not emit OSC 7501.
+    pub fn inferred_agent_state(&self, fallback_raw_title: &str, now: Instant) -> &'static str {
+        let raw_title = if !self.raw_title.is_empty() && self.raw_title != self.address {
+            self.raw_title.as_str()
+        } else {
+            fallback_raw_title
+        };
+        let active_output = self.has_active_output(now);
+        let quiet_ready = !active_output && self.last_output_at.is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(1000));
+        let title_spinning = self.last_title_change_at.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(3000));
+        // Claude Code parks its idle OSC title at `✳ <Session Name>`; strip the static glyph when quiet so it returns to idle.
+        let effective_title = if !active_output && !title_spinning && raw_title.trim_start().starts_with('\u{2733}') {
+            shown_title(raw_title)
+        } else {
+            std::borrow::Cow::Borrowed(raw_title)
+        };
+        // Short-circuit before touching the grid when title/output already decide.
+        let prelim = infer_pty_agent_state(effective_title.as_ref(), active_output, false, &[]);
+        if prelim != "idle" || !quiet_ready {
+            return prelim;
+        }
+        let tail = self.grid.borrow().vt.tail_lines(6);
+        infer_pty_agent_state(effective_title.as_ref(), active_output, true, &tail)
     }
 
     #[cfg(test)]
@@ -553,11 +606,22 @@ impl TerminalView {
     /// Feeds relayed bytes in; returns false once the stream is over.
     fn ingest(&mut self, batch: impl IntoIterator<Item = Stream>, cx: &mut Context<Self>) -> bool {
         let mut open = true;
+        let now = Instant::now();
+        let mut saw_output = false;
         let title = {
             let mut g = self.grid.borrow_mut();
             for item in batch {
                 match item {
                     Stream::Data(bytes) => {
+                        if !bytes.is_empty() {
+                            let settled = now.saturating_duration_since(self.attached_at) >= Duration::from_millis(450);
+                            let just_typed = self.typed_at.get().is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(160));
+                            let just_entered = self.last_enter_at.get().is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(250));
+                            let echo_only = just_typed && !just_entered && bytes.len() <= 32;
+                            if settled && !echo_only {
+                                saw_output = true;
+                            }
+                        }
                         g.vt.allow_clipboard_write(crate::settings::get().clipboard_write);
                         g.vt.write(&bytes);
                         let [clipboard, primary] = g.vt.take_clipboard();
@@ -592,6 +656,9 @@ impl TerminalView {
             }
             g.vt.take_title()
         };
+        if saw_output {
+            self.last_output_at = Some(now);
+        }
         if let Some(title) = title {
             let title = if title.is_empty() { self.address.clone() } else { title };
             self.set_title(&title, cx);
@@ -673,7 +740,11 @@ impl TerminalView {
     }
 
     fn send(&self, bytes: &[u8]) {
-        self.typed_at.set(Some(Instant::now()));
+        let now = Instant::now();
+        self.typed_at.set(Some(now));
+        if bytes.contains(&b'\r') || bytes.contains(&b'\n') {
+            self.last_enter_at.set(Some(now));
+        }
         let mut g = self.grid.borrow_mut();
         if let Some(ch) = g.channel
             && !bytes.is_empty()
@@ -1320,6 +1391,47 @@ pub(crate) fn shown_title(title: &str) -> std::borrow::Cow<'_, str> {
         }
         _ => Cow::Borrowed(title),
     }
+}
+
+/// Infer an interactive CLI agent's execution state when it does not emit OSC 7501:
+/// 1) title cues (`[ ! ]` / `Action Required` / `[ . ]` / spinners / `✦`)
+/// 2) active PTY output
+/// 3) quiet screen confirmation prompts on the bottom rows
+/// 4) otherwise `"idle"`.
+pub(crate) fn infer_pty_agent_state(raw_title: &str, active_output: bool, quiet_ready: bool, tail_lines: &[String]) -> &'static str {
+    let lower_title = raw_title.to_ascii_lowercase();
+    if raw_title.contains("[ ! ]")
+        || lower_title.contains("action required")
+        || lower_title.contains("permission required")
+        || lower_title.contains("approval required")
+    {
+        return "blocked";
+    }
+    if raw_title.contains("[ . ]") || raw_title.trim_start().starts_with(['✦', '❖']) || shown_title(raw_title) != raw_title {
+        return "working";
+    }
+    if active_output {
+        return "working";
+    }
+    if quiet_ready
+        && tail_lines.iter().any(|line| {
+            let l = line.to_ascii_lowercase();
+            l.contains("(y/n)")
+                || l.contains("[y/n]")
+                || l.contains("(yes/no)")
+                || l.contains("do you want to proceed")
+                || l.contains("do you want to allow")
+                || l.contains("allow once")
+                || l.contains("allow always")
+                || l.contains("yes, allow")
+                || l.contains("needs your approval")
+                || l.contains("waiting for approval")
+                || l.contains("approve this")
+        })
+    {
+        return "blocked";
+    }
+    "idle"
 }
 
 /// A live macOS screenshot thumbnail, dropped before it saved.
@@ -4940,5 +5052,25 @@ mod tests {
         cx.executor().advance_clock(Duration::from_millis(33));
         cx.run_until_parked();
         assert_eq!(notifies.get(), 1, "subsequent 33ms tick must not emit a duplicate notification");
+    }
+
+    #[test]
+    fn infers_interactive_cli_agent_status_without_osc_7501() {
+        assert_eq!(super::infer_pty_agent_state("\u{2733} Fix the tests", false, true, &[]), "working");
+        assert_eq!(super::infer_pty_agent_state("\u{280b} Working", false, true, &[]), "working");
+        assert_eq!(super::infer_pty_agent_state("\u{03c0} \u{2839} task", false, true, &[]), "working");
+        assert_eq!(super::infer_pty_agent_state("✦ Reviewing changes", false, true, &[]), "working");
+        assert_eq!(super::infer_pty_agent_state("opencode [ . ] task", false, true, &[]), "working");
+        assert_eq!(super::infer_pty_agent_state("opencode [ ! ] tool", false, true, &[]), "blocked");
+        assert_eq!(super::infer_pty_agent_state("Action Required - Claude Code", false, true, &[]), "blocked");
+        assert_eq!(super::infer_pty_agent_state("Claude Code", true, false, &[]), "working");
+        assert_eq!(
+            super::infer_pty_agent_state("Claude Code", false, true, &["Do you want to proceed? (y/n)".into()]),
+            "blocked"
+        );
+        assert_eq!(
+            super::infer_pty_agent_state("Codex", false, true, &["> Ready for your next prompt".into()]),
+            "idle"
+        );
     }
 }

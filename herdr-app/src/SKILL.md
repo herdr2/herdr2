@@ -69,7 +69,7 @@ and `h2 file ... --on vps ...` for remote work, not your local file tools.
 
 `do` accepts `--key value` arguments (JSON for arrays/objects) or one JSON
 object. Unknown argument names fail and list valid names. Target IDs (`id`,
-`pane`, `space`, `target`, `terminal`) must be strings; other non-null types fail before
+`pane`, `source`, `space`, `target`, `terminal`) must be strings; other non-null types fail before
 the current-target default can apply. Null keeps its omitted-argument meaning.
 Use `commands` to confirm the command's exact shape:
 
@@ -84,6 +84,8 @@ the same tab. Give `direction` or `target`, not both. Focus stays with the same 
 ```sh
 herdr2 do pane.swap '{"pane":"p12","target":"p14"}'
 ```
+
+`pane.detach {pane?}` moves a pane out of a split tab into its own tab right after it and selects it.
 
 `terminal.select_all {terminal?}` selects a terminal's whole screen and scrollback,
 ready for `terminal.copy`. Without a target it follows keyboard focus. In vim and

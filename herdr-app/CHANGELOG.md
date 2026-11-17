@@ -1,6 +1,6 @@
-# Herdr changelog
+# Herdr2 changelog
 
-## [0.2.0] - 2026-11-16
+## [0.2.0] - 2026-11-17
 
 ### New
 - **Herdr2 runs headless ACP agent sessions natively:** no PTY, shell wrapping, or Ghostty VT dependency.

@@ -168,9 +168,19 @@ impl Transcript {
                     self.entries.last_mut()
                     && *prev_turn == turn
                 {
+                    let sep = if prev_text.trim_end().ends_with("**")
+                        && text.trim_start().starts_with("**")
+                        && !prev_text.ends_with('\n')
+                        && !text.starts_with('\n')
+                    {
+                        prev_text.push_str("\n\n");
+                        2
+                    } else {
+                        0
+                    };
                     prev_text.push_str(&text);
                     *prev_ts = ts_ms;
-                    self.bytes += added_bytes;
+                    self.bytes += added_bytes + sep;
                     self.evict_old();
                     return;
                 }
@@ -377,5 +387,16 @@ mod tests {
         let loaded = load(&dir, "a1").unwrap();
         assert_eq!(loaded.render(None, true), ("part1 part2".into(), false, "last"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn coalesces_adjacent_bold_thought_headings_with_spacing() {
+        let mut t = Transcript::default();
+        t.push(Entry::Thought { turn: 1, text: "**First heading**".into(), ts_ms: 1 });
+        t.push(Entry::Thought { turn: 1, text: "**Second heading**".into(), ts_ms: 2 });
+        let Some(Entry::Thought { text, .. }) = t.entries.first() else {
+            panic!("expected coalesced thought entry");
+        };
+        assert_eq!(text, "**First heading**\n\n**Second heading**");
     }
 }

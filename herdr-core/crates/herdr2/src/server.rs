@@ -84,6 +84,7 @@ pub fn serve() -> io::Result<()> {
             tokio::spawn(core.clone().run_jobs(jobs));
         }
         crate::remote::start_all(&core);
+        crate::drove::start_background(&core);
         tokio::spawn(core.clone().save_when_due());
         let term = platform::termination();
         tokio::pin!(term);
@@ -108,6 +109,7 @@ pub fn serve() -> io::Result<()> {
 
 /// Finish queued registry work before the runtime cancels its tasks (which still own Core).
 pub(crate) async fn finish(core: &Core) -> io::Result<()> {
+    core.drove.shutdown();
     if core.restart.load(std::sync::atomic::Ordering::SeqCst) {
         core.handover().await?;
     }
@@ -245,6 +247,7 @@ async fn connection(core: Arc<Core>, read: platform::AsyncRead, mut write: Write
         }
     };
     core.detach(&conn, None);
+    core.drove.unsubscribe_conn(&conn, None);
     crate::remote::conn_gone(&core, &conn);
     crate::remote::peer_left(&core, &conn);
     writer.abort();
@@ -411,6 +414,7 @@ async fn read_frames(core: &Arc<Core>, conn: &Arc<Conn>, read: &mut Reader) -> i
             }
             (ch, wire::CLOSE) => {
                 core.detach(conn, Some(ch));
+                core.drove.unsubscribe_conn(conn, Some(ch));
                 conn.with(|out| out.close(ch, b""));
             }
             _ => {}
@@ -492,6 +496,10 @@ async fn handle(
     };
     let call = api::Call { core, conn, plain };
     let params = crate::remote::from_peer(core, conn, request["params"].clone());
+    if matches!(method, "agent.send" | "terminal.send" | "terminal.keys" | "agent.approve" | "agent.deny") {
+        core.clear_manual_status_caller(params["from"].as_str());
+        core.clear_manual_status_caller(params["caller"].as_str());
+    }
     let result = match crate::remote::route(core, method, &params) {
         _ if method == "$/orphaned" => crate::remote::orphaned(core, conn, &params).await,
         Ok(Some((crate::remote::To::Machine(machine), params))) if method == "terminal.attach" => match conn {

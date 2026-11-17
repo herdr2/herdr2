@@ -7,7 +7,76 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { commands, layouts, keys, run, theme, props, closeOverlay, openOverlay, shared, window as win } from "herdr";
+import { commands, layouts, keys, run, theme, props, closeOverlay, openOverlay, shared, settings, window as win } from "herdr";
+
+const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
+const tr = (en, zh) => (isZh() ? zh : en);
+const GROUP_ZH = {
+  Recent: "最近使用",
+  Tab: "标签页",
+  Pane: "窗格",
+  Space: "工作区",
+  Layout: "布局",
+  Terminal: "终端",
+  Agent: "智能体",
+  Window: "窗口",
+  App: "应用",
+};
+const TITLE_ZH = {
+  "New tab": "新建标签页",
+  "Go to space or tab…": "跳转到工作区或标签页…",
+  "Rename tab": "重命名标签页",
+  "Close tab": "关闭标签页",
+  "Next tab": "下一个标签页",
+  "Previous tab": "上一个标签页",
+  "Split right": "向右分栏",
+  "Split down": "向下分栏",
+  "Close pane": "关闭窗格",
+  "Maximize pane to new tab": "最大化为独立标签页",
+  "Zoom pane": "最大化/还原窗格",
+  "Focus pane left": "聚焦左侧窗格",
+  "Focus pane right": "聚焦右侧窗格",
+  "Focus pane up": "聚焦上方窗格",
+  "Focus pane down": "聚焦下方窗格",
+  "Swap pane left": "与左侧窗格交换",
+  "Swap pane right": "与右侧窗格交换",
+  "Swap pane up": "与上方窗格交换",
+  "Swap pane down": "与下方窗格交换",
+  "New space": "新建工作区",
+  "Rename space": "重命名工作区",
+  "Close space": "关闭工作区",
+  "Next space": "下一个工作区",
+  "Previous space": "上一个工作区",
+  "Next layout": "切换下一个布局",
+  "Reset layout": "重置当前布局",
+  "Duplicate layout": "复制当前布局",
+  "Duplicate mod": "复制模组",
+  "New terminal": "新建终端",
+  Copy: "复制",
+  Paste: "粘贴",
+  "Next agent": "下一个智能体",
+  "Previous agent": "上一个智能体",
+  "Rename agent": "重命名智能体",
+  "Move agent to recycle bin": "将智能体移入回收站",
+  "Empty agent recycle bin": "清空智能体回收站",
+  "Set agent status: Idle": "设置智能体状态：空闲",
+  "Set agent status: Working": "设置智能体状态：运行中",
+  "Set agent status: Needs you": "设置智能体状态：待确认",
+  "Set agent status: Done": "设置智能体状态：已完成",
+  "Reset agent status to Auto": "恢复智能体状态自动识别",
+  "Minimize window": "最小化窗口",
+  "Maximize window": "最大化/还原窗口",
+  "Close window": "关闭窗口",
+  Settings: "设置",
+  Keys: "快捷键",
+  Welcome: "欢迎页",
+  "What's new": "更新日志",
+  "Reset to the default screen": "恢复默认布局与快捷键",
+  "Zoom in": "放大界面",
+  "Zoom out": "缩小界面",
+  "Reset zoom": "重置缩放",
+  "Quit Herdr2": "退出 Herdr2",
+};
 
 // The list keeps one height while you move: rows and group titles have fixed
 // heights, and the window shows as many as fit in LIST_H.
@@ -30,6 +99,7 @@ const NAMED = [
   ["pane.split", { direction: "right" }, "Pane", "Split right", "vertical"],
   ["pane.split", { direction: "down" }, "Pane", "Split down", "horizontal"],
   ["pane.close", {}, "Pane", "Close pane", "kill"],
+  ["pane.detach", {}, "Pane", "Maximize pane to new tab", "unmerge extract split tab maximize"],
   ["pane.zoom", {}, "Pane", "Zoom pane", "maximize fullscreen"],
   ...["left", "right", "up", "down"].map((d) => ["pane.go", { direction: d }, "Pane", `Focus pane ${d}`, "move go"]),
   ...["left", "right", "up", "down"].map((d) => ["pane.swap", { direction: d }, "Pane", `Swap pane ${d}`, "move"]),
@@ -47,28 +117,37 @@ const NAMED = [
   ["terminal.paste", {}, "Terminal", "Paste", "clipboard"],
   ["agent.next", {}, "Agent", "Next agent", ""],
   ["agent.prev", {}, "Agent", "Previous agent", ""],
+  ["agent.rename", {}, "Agent", "Rename agent", "rename f2 重命名"],
+  ["agent.trash", {}, "Agent", "Move agent to recycle bin", "delete remove trash recycle 回收站 删除"],
+  ["agent.empty_trash", {}, "Agent", "Empty agent recycle bin", "clear trash recycle 清空回收站"],
+  ["agent.status", { status: "idle" }, "Agent", "Set agent status: Idle", "manual override reset clear"],
+  ["agent.status", { status: "working" }, "Agent", "Set agent status: Working", "manual override busy"],
+  ["agent.status", { status: "blocked" }, "Agent", "Set agent status: Needs you", "manual override blocked"],
+  ["agent.status", { status: "done" }, "Agent", "Set agent status: Done", "manual override finished"],
+  ["agent.status", { status: "auto" }, "Agent", "Reset agent status to Auto", "automatic detect"],
   ["window.minimize", {}, "Window", "Minimize window", ""],
   ["window.maximize", {}, "Window", "Maximize window", "restore"],
   ["window.close", {}, "Window", "Close window", "quit"],
   ["app.settings", {}, "App", "Settings", "preferences options config look font theme sound"],
   ["app.help", {}, "App", "Keys", "keybindings shortcuts help"],
   ["app.welcome", {}, "App", "Welcome", "intro start onboarding"],
-  ["app.whats_new", {}, "App", "What's new", "release changes news update"],
   ["app.reset", {}, "App", "Reset to the default screen", "escape hatch broken restore"],
   ["app.zoom_in", {}, "App", "Zoom in", "bigger font size"],
   ["app.zoom_out", {}, "App", "Zoom out", "smaller font size"],
   ["app.zoom_reset", {}, "App", "Reset zoom", "font size"],
-  ["app.quit", {}, "App", "Quit Herdr", "exit"],
+  ["app.quit", {}, "App", "Quit Herdr2", "exit"],
   ...["graphite", "ink", "moss", "atom-one-dark"].map((n) => ["app.theme", { name: n }, "App", `Theme: ${n.replace(/-/g, " ")}`, "colors look"]),
+  ["app.language", { language: "en" }, "App", "Language: English", "locale i18n english 语言 英文"],
+  ["app.language", { language: "zh-CN" }, "App", "Language: 简体中文", "locale i18n chinese 语言 中文 简体"],
 ];
 
 // Commands that act on something you point at (ids, terminals): not for a list.
 const HIDDEN = new Set([
-  "space.move", "tab.move", "space.select", "tab.select", "pane.focus", "terminal.keep",
-  "terminal.park", "terminal.kill", "terminal.show", "agent.focus", "layout.set", "layout.toggle",
+  "space.move", "tab.move", "tab.merge", "space.select", "tab.select", "pane.focus", "terminal.keep",
+  "terminal.park", "terminal.kill", "terminal.show", "agent.focus", "agent.restore", "agent.purge", "agent.status", "layout.set", "layout.toggle",
   "layout.show", "layout.hide", "layout.resize", "layout.select", "mod.open", "overlay.close",
   "tab.settle", "tab.unsettle",
-  "app.palette", "app.hide", "app.hide_others", "app.show_all", "app.theme", "app.settings",
+  "app.palette", "app.hide", "app.hide_others", "app.show_all", "app.theme", "app.language", "app.settings", "app.whats_new",
 ]);
 
 function titleOf(name) {
@@ -80,18 +159,24 @@ function titleOf(name) {
 function entries() {
   const known = new Set(commands().map((c) => c.name));
   const mac = win()?.platform === "macos";
+  const zh = isZh();
   const list = NAMED.filter(([n]) => known.has(n))
     .filter(([n]) => !(mac && n.startsWith("window.")))
-    .map(([name, args, group, title, words]) => ({ name, args, group, title, words }));
+    .map(([name, args, group, rawTitle, rawWords]) => {
+      const title = zh ? (TITLE_ZH[rawTitle] ?? rawTitle.replace(/^Theme: /, "主题：")) : rawTitle;
+      const words = zh ? `${rawWords} ${rawTitle}` : rawWords;
+      return { name, args, group, groupLabel: zh ? (GROUP_ZH[group] ?? group) : group, title, words };
+    });
   for (const l of layouts()) {
-    const t = { main: "Herdr", terminals: "Terminals", win98: "Herdr 98" }[l] ?? l.charAt(0).toUpperCase() + l.slice(1);
-    list.push({ name: "layout.switch", args: { name: l }, group: "Layout", title: `Layout: ${t}`, words: `look ${l}` });
+    const t = { main: "Herdr2", terminals: "Terminals", win98: "Herdr 98" }[l] ?? l.charAt(0).toUpperCase() + l.slice(1);
+    list.push({ name: "layout.switch", args: { name: l }, group: "Layout", groupLabel: zh ? GROUP_ZH.Layout : "Layout", title: zh ? `布局：${t}` : `Layout: ${t}`, words: `look ${l} layout` });
   }
   // Anything new in the app shows up too, until it gets a better name here.
   const named = new Set(NAMED.map(([n]) => n));
   for (const c of commands()) {
     if (named.has(c.name) || HIDDEN.has(c.name) || c.args.some((a) => a.required && a.name !== "name")) continue;
-    list.push({ name: c.name, args: {}, ...titleOf(c.name), words: c.about });
+    const t = titleOf(c.name);
+    list.push({ name: c.name, args: {}, group: t.group, groupLabel: zh ? (GROUP_ZH[t.group] ?? t.group) : t.group, title: t.title, words: c.about });
   }
   return list.map((e) => ({ ...e, id: `${e.name}:${JSON.stringify(e.args)}` }));
 }
@@ -131,7 +216,7 @@ function fuzzy(q, text) {
 export default class Palette extends View {
   init(_props, cx) {
     this.query = "";
-    this.input = InputState.new({ placeholder: "Type a command…" });
+    this.input = InputState.new({ placeholder: tr("Type a command…", "输入命令或关键词搜索…") });
     this.input.on("change", (_e, cx) => { this.query = this.input.value(); this.at = 0; cx.notify(); });
     this.input.on("submit", () => this.go(this.rows()[this.at]?.e));
     this.input.focus();
@@ -170,7 +255,7 @@ export default class Palette extends View {
       const recent = this.recent.map((id) => all.find((e) => e.id === id)).filter(Boolean).slice(0, 5);
       const rest = GROUPS.slice(1).flatMap((g) => all.filter((e) => e.group === g && !recent.includes(e)));
       const others = all.filter((e) => !GROUPS.includes(e.group) && !recent.includes(e));
-      return [...recent.map((e) => ({ e, head: "Recent" })), ...[...rest, ...others].map((e) => ({ e, head: e.group }))];
+      return [...recent.map((e) => ({ e, head: tr("Recent", GROUP_ZH.Recent) })), ...[...rest, ...others].map((e) => ({ e, head: e.groupLabel ?? e.group }))];
     }
     const rank = (e) => this.recent.indexOf(e.id);
     return all
@@ -259,7 +344,7 @@ export default class Palette extends View {
           .hover((s) => s.bg(t.hover))
           .on_click(() => this.go(r.e))
           .child(div().flex_1().min_w(0).child(this.title(t, r.e.title, r.hits, on)))
-          .when(Boolean(this.query), (el) => el.child(div().text_size(11.5).text_color(t.dim).child(r.e.group)))
+          .when(Boolean(this.query), (el) => el.child(div().text_size(11.5).text_color(t.dim).child(r.e.groupLabel ?? r.e.group)))
           .when(Boolean(k), (el) => el.child(key(k))),
       );
     });
@@ -315,7 +400,7 @@ export default class Palette extends View {
                 cx.notify();
               })
               .children(fixed ? list : [v_flex().children(list)])
-          : div().px(16).py(14).text_size(13).text_color(t.dim).child(`Nothing matches "${this.query}". Places are in the picker.`),
+          : div().px(16).py(14).text_size(13).text_color(t.dim).child(tr(`Nothing matches "${this.query}". Places are in the picker.`, `未找到匹配 "${this.query}" 的命令。工作区和标签页请在快速跳转中查找。`)),
       );
   }
 }

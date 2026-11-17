@@ -9,8 +9,8 @@ use std::str::FromStr;
 #[derive(Serialize, Deserialize, JsonSchema, ValueEnum, Clone, Copy, Debug, PartialEq, Eq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionMode {
-    #[serde(alias = "approve_all")]
-    #[value(name = "approve-all", alias = "approve_all")]
+    #[serde(alias = "approve_all", alias = "dangerously-skip-permissions", alias = "bypassPermissions")]
+    #[value(name = "approve-all", alias = "approve_all", alias = "dangerously-skip-permissions", alias = "bypassPermissions")]
     ApproveAll,
     #[default]
     #[serde(alias = "approve_reads")]
@@ -33,6 +33,19 @@ impl PermissionMode {
     }
 }
 
+/// Returns true if an ACP session mode identifier represents full permission bypass.
+pub fn is_bypass_mode_id(mode: &str) -> bool {
+    matches!(
+        mode.trim().trim_start_matches('-').to_ascii_lowercase().as_str(),
+        "bypasspermissions"
+            | "bypass-permissions"
+            | "bypass_permissions"
+            | "dangerously-skip-permissions"
+            | "dangerously_skip_permissions"
+            | "agent-full-access"
+    )
+}
+
 impl fmt::Display for PermissionMode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
@@ -43,12 +56,20 @@ impl FromStr for PermissionMode {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "approve-all" | "approve_all" => Ok(Self::ApproveAll),
+        match s.trim().trim_start_matches('-').to_ascii_lowercase().as_str() {
+            "approve-all"
+            | "approve_all"
+            | "dangerously-skip-permissions"
+            | "dangerously_skip_permissions"
+            | "bypass-permissions"
+            | "bypass_permissions"
+            | "bypasspermissions" => Ok(Self::ApproveAll),
             "approve-reads" | "approve_reads" => Ok(Self::ApproveReads),
             "deny-all" | "deny_all" => Ok(Self::DenyAll),
             "ask" => Ok(Self::Ask),
-            other => Err(format!("unknown permission mode {other:?}; use approve-all, approve-reads, deny-all, or ask")),
+            other => Err(format!(
+                "unknown permission mode {other:?}; use approve-all, approve-reads, deny-all, ask, or dangerously-skip-permissions"
+            )),
         }
     }
 }
@@ -185,8 +206,13 @@ mod tests {
     fn permission_mode_parses_kebab_and_snake_case() {
         assert_eq!("approve-reads".parse::<PermissionMode>().unwrap(), PermissionMode::ApproveReads);
         assert_eq!("approve_all".parse::<PermissionMode>().unwrap(), PermissionMode::ApproveAll);
+        assert_eq!("dangerously-skip-permissions".parse::<PermissionMode>().unwrap(), PermissionMode::ApproveAll);
+        assert_eq!("bypassPermissions".parse::<PermissionMode>().unwrap(), PermissionMode::ApproveAll);
         assert_eq!("deny-all".parse::<PermissionMode>().unwrap(), PermissionMode::DenyAll);
         assert_eq!("ask".parse::<PermissionMode>().unwrap(), PermissionMode::Ask);
+        assert!(is_bypass_mode_id("bypassPermissions"));
+        assert!(is_bypass_mode_id("dangerously-skip-permissions"));
+        assert!(!is_bypass_mode_id("default"));
         assert!("bogus".parse::<PermissionMode>().is_err());
     }
 }

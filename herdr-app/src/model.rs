@@ -65,6 +65,8 @@ pub enum Alert {
 pub struct Agent {
     /// The program's 7501 word (working, idle, done, blocked, error), if it reports.
     pub word: Option<String>,
+    /// User-assigned status override (idle, working, blocked, done), synced via `herdr.status`.
+    pub manual_status: Option<String>,
     /// The agent's name from its 7501 report (`app`), e.g. "claude-code".
     pub app: Option<String>,
     /// Whether the person has seen it since it last stopped working.
@@ -102,6 +104,33 @@ pub fn priority(status: Option<&str>) -> u8 {
         Some("working") => 2,
         Some("idle") => 1,
         _ => 0,
+    }
+}
+
+/// Flattens nested same-axis containers and clears explicit child sizes so siblings share space equally.
+fn equalize_split_tree(node: &mut Node) {
+    let axis = node.axis();
+    if let Some(children) = node.children_mut() {
+        for child in children.iter_mut() {
+            equalize_split_tree(child);
+        }
+        if let Some(ax) = axis {
+            let mut flat = Vec::with_capacity(children.len());
+            for mut child in std::mem::take(children) {
+                if child.axis() == Some(ax)
+                    && let Some(grand) = child.children_mut()
+                {
+                    flat.append(grand);
+                    continue;
+                }
+                child.size = None;
+                flat.push(child);
+            }
+            for child in &mut flat {
+                child.size = None;
+            }
+            *children = flat;
+        }
     }
 }
 
@@ -342,6 +371,7 @@ impl Model {
         if !c.root.split(target, axis, block, container) {
             return false;
         }
+        equalize_split_tree(&mut c.root);
         c.zoomed = None;
         c.focus(&new_pane);
         true
@@ -399,6 +429,118 @@ impl Model {
         Ok(())
     }
 
+    /// Merges all panes of `source` beside `target`'s panes along `edge` and selects `target`.
+    pub fn merge_tabs(&mut self, source: &str, target: &str, edge: crate::layout::Edge) -> Result<Vec<String>, String> {
+        if source == target {
+            return Err("tab.merge source and target are the same tab".into());
+        }
+        let Some(src_space) = self.spaces.iter().position(|p| p.tab(source).is_some()) else {
+            return Err(format!("no tab {source:?}"));
+        };
+        let Some(dst_space) = self.spaces.iter().position(|p| p.tab(target).is_some()) else {
+            return Err(format!("no tab {target:?}"));
+        };
+        if src_space != dst_space {
+            return Err("tab.merge tabs must be in the same space".into());
+        }
+        let machine = self.spaces[dst_space].machine.clone();
+        let src_index = self.spaces[dst_space].tabs.iter().position(|c| c.id == source).unwrap();
+        let src_tab = self.spaces[dst_space].tabs.remove(src_index);
+        let moved_addrs = any_addresses(&src_tab.root);
+        let focus_pane = src_tab.focused.clone().or_else(|| src_tab.root.panes().first().map(|n| n.id.clone()));
+        let axis = if edge.vertical() { Axis::Row } else { Axis::Column };
+
+        fn take_nodes(mut root: Node, axis: Axis, split_id: Option<String>) -> Vec<Node> {
+            if root.axis() == Some(axis) {
+                if let Some(children) = root.children_mut() {
+                    return std::mem::take(children);
+                }
+            } else if matches!(root.kind, crate::layout::Kind::Row { .. } | crate::layout::Kind::Column { .. })
+                && root.children().len() == 1
+            {
+                return vec![root.children_mut().unwrap().remove(0)];
+            }
+            if let Some(id) = split_id {
+                root.id = id;
+            }
+            vec![root]
+        }
+
+        let needs_split_id = |root: &Node| {
+            root.axis() != Some(axis)
+                && !(matches!(root.kind, crate::layout::Kind::Row { .. } | crate::layout::Kind::Column { .. })
+                    && root.children().len() == 1)
+        };
+        let dst_split_id = {
+            let dst_root = &self.spaces[dst_space].tabs.iter().find(|c| c.id == target).unwrap().root;
+            needs_split_id(dst_root).then(|| self.fresh_id_on("s", machine.as_deref()))
+        };
+        let src_split_id = needs_split_id(&src_tab.root).then(|| self.fresh_id_on("s", machine.as_deref()));
+
+        let dst_tab = self.spaces[dst_space].tabs.iter_mut().find(|c| c.id == target).unwrap();
+        let dst_id = dst_tab.id.clone();
+        let dst_root = std::mem::replace(&mut dst_tab.root, Node::container(&dst_id, axis, vec![]));
+        let mut dst_children = take_nodes(dst_root, axis, dst_split_id);
+        let mut src_children = take_nodes(src_tab.root, axis, src_split_id);
+        let mut children = if matches!(edge, crate::layout::Edge::Left | crate::layout::Edge::Top) {
+            src_children.append(&mut dst_children);
+            src_children
+        } else {
+            dst_children.append(&mut src_children);
+            dst_children
+        };
+        for child in &mut children {
+            if matches!(child.size, Some(crate::layout::Size::Weight { .. })) {
+                child.size = None;
+            }
+        }
+        dst_tab.root = Node::container(dst_id, axis, children);
+        equalize_split_tree(&mut dst_tab.root);
+        dst_tab.zoomed = None;
+        if let Some(fp) = focus_pane {
+            dst_tab.focus(&fp);
+        }
+        self.select_tab(target);
+        Ok(moved_addrs)
+    }
+
+    /// Moves `pane_id` out of a multi-pane tab into a new standalone tab right after it and selects it.
+    /// Returns `(new_tab_id, moved_terminal_or_acp_address)`.
+    pub fn detach_pane(&mut self, pane_id: &str, new_tab_name: &str) -> Result<(String, Option<String>), String> {
+        let Some((space_idx, tab_idx)) = self.spaces.iter().enumerate().find_map(|(si, sp)| {
+            sp.tabs
+                .iter()
+                .position(|c| c.root.find(pane_id).is_some_and(Node::is_pane))
+                .map(|ti| (si, ti))
+        }) else {
+            return Err(format!("no pane {pane_id:?}"));
+        };
+        if self.spaces[space_idx].tabs[tab_idx].root.panes().len() < 2 {
+            return Err("pane is already in its own tab".into());
+        }
+        let machine = self.spaces[space_idx].machine.clone();
+        let new_tab_id = self.fresh_id_on("tb", machine.as_deref());
+        let extracted = {
+            let src_tab = &mut self.spaces[space_idx].tabs[tab_idx];
+            let mut extracted = src_tab.root.remove(pane_id).ok_or_else(|| format!("no pane {pane_id:?}"))?;
+            extracted.size = None;
+            equalize_split_tree(&mut src_tab.root);
+            src_tab.zoomed = None;
+            src_tab.before.retain(|p| p != pane_id);
+            let here: Vec<String> = src_tab.root.panes().iter().map(|n| n.id.clone()).collect();
+            src_tab.before.retain(|p| here.contains(p));
+            if src_tab.focused.as_deref() == Some(pane_id) || !src_tab.focused.as_ref().is_some_and(|f| here.contains(f)) {
+                src_tab.focused = src_tab.before.pop().or_else(|| here.first().cloned());
+            }
+            extracted
+        };
+        let moved_addr = extracted.any_terminal().map(str::to_owned);
+        let new_tab = Tab::with_pane(&new_tab_id, new_tab_name, extracted);
+        self.spaces[space_idx].tabs.insert(tab_idx + 1, new_tab);
+        self.select_tab(&new_tab_id);
+        Ok((new_tab_id, moved_addr))
+    }
+
     /// Removes a pane. Returns what else closed: the tab, and the space if it was its last.
     pub fn remove_pane(&mut self, pane_id: &str) -> (bool, bool) {
         let Some(c) = self.tab_of_mut(pane_id) else { return (false, false) };
@@ -407,6 +549,7 @@ impl Model {
             c.zoomed = None;
         }
         if !c.root.panes().is_empty() {
+            equalize_split_tree(&mut c.root);
             c.before.retain(|p| p != pane_id);
             if c.focused.as_deref() == Some(pane_id) {
                 // Back to the pane focused before it that's still here, else the first.
@@ -436,7 +579,7 @@ impl Model {
             let id = p.id.clone();
             self.remove_space(&id);
         }
-        (addresses(&removed.root), closed)
+        (any_addresses(&removed.root), closed)
     }
 
     /// Removes a space (remembered in `recent`). Returns its terminal addresses.
@@ -450,7 +593,7 @@ impl Model {
         if was_active {
             self.active = self.spaces.get(pi).or(self.spaces.last()).map(|p| p.id.clone());
         }
-        p.tabs.iter().flat_map(|c| addresses(&c.root)).collect()
+        p.tabs.iter().flat_map(|c| any_addresses(&c.root)).collect()
     }
 
     /// The focused pane of the selected space's selected tab.
@@ -521,6 +664,19 @@ impl Model {
         self.tabs().flat_map(|c| c.root.terminals()).find(|n| n.terminal() == Some(address)).map(|n| n.id.clone())
     }
 
+    /// The PTY or mounted ACP address shown in a pane block.
+    pub fn any_address_of(&self, pane_id: &str) -> Option<String> {
+        self.tabs().find_map(|c| c.root.find(pane_id)).and_then(Node::any_terminal).map(str::to_owned)
+    }
+
+    pub fn acp_pane_of(&self, address: &str) -> Option<String> {
+        self.tabs().flat_map(|c| c.root.panes()).find(|n| n.acp_terminal() == Some(address)).map(|n| n.id.clone())
+    }
+
+    pub fn any_pane_of(&self, address: &str) -> Option<String> {
+        self.pane_of(address).or_else(|| self.acp_pane_of(address))
+    }
+
     /// Every terminal in every tab, in space → tab → pane order.
     pub fn all_addresses(&self) -> Vec<String> {
         self.tabs().flat_map(|c| addresses(&c.root)).collect()
@@ -547,6 +703,20 @@ impl Model {
         true
     }
 
+    /// Overrides the inferred status with an explicit manual state (`None` returns to auto detection).
+    pub fn set_manual_status(&mut self, address: &str, manual: Option<String>, app: Option<String>) -> bool {
+        let a = self.agents.entry(address.to_owned()).or_insert_with(|| Agent { seen: true, ..Default::default() });
+        a.app = app.or(a.app.take());
+        if a.manual_status == manual {
+            return false;
+        }
+        a.manual_status = manual;
+        self.seq += 1;
+        a.seq = self.seq;
+        a.since = now_ms();
+        true
+    }
+
     /// Herdr's attention rule for a change of 7501 word: needing you always
     /// alerts; finishing alerts only if the person wasn't looking.
     pub fn alert(prev: Option<&str>, new: Option<&str>, looking: bool) -> Option<Alert> {
@@ -565,7 +735,7 @@ impl Model {
     /// parent; a terminal in none of the spaces (another machine's, another
     /// app's) isn't the person's business here.
     pub fn alert_for(&self, addr: &str, sub_agent: bool, prev: Option<&str>, new: Option<&str>, looking: bool) -> Option<Alert> {
-        if sub_agent || self.pane_of(addr).is_none() {
+        if sub_agent || self.any_pane_of(addr).is_none() || self.agents.get(addr).and_then(|a| a.manual_status.as_ref()).is_some() {
             return None;
         }
         Self::alert(prev, new, looking)
@@ -596,6 +766,15 @@ impl Model {
     /// What the UI shows: working, blocked, done (finished, unseen), idle, or None (not an agent).
     pub fn status(&self, address: &str) -> Option<&'static str> {
         let a = self.agents.get(address)?;
+        if let Some(manual) = a.manual_status.as_deref() {
+            return match manual {
+                "working" => Some("working"),
+                "blocked" | "error" => Some("blocked"),
+                "done" => Some("done"),
+                "idle" => Some("idle"),
+                _ => None,
+            };
+        }
         Some(match a.word.as_deref()? {
             "working" => "working",
             "blocked" | "error" => "blocked",
@@ -606,15 +785,15 @@ impl Model {
 
     /// When something in a tab last changed state, ms (None: nothing since the app started).
     pub fn changed_at(&self, c: &Tab) -> Option<u64> {
-        addresses(&c.root).iter().filter_map(|a| self.agents.get(a)).map(|a| a.since).filter(|t| *t > 0).max()
+        any_addresses(&c.root).iter().filter_map(|a| self.agents.get(a)).map(|a| a.since).filter(|t| *t > 0).max()
     }
 
     /// Since when an agent in a tab has been working, ms (the earliest, if several).
     pub fn working_since(&self, c: &Tab) -> Option<u64> {
-        addresses(&c.root)
+        any_addresses(&c.root)
             .iter()
             .filter_map(|a| self.agents.get(a))
-            .filter(|a| a.word.as_deref() == Some("working") && a.since > 0)
+            .filter(|a| a.manual_status.as_deref().or(a.word.as_deref()) == Some("working") && a.since > 0)
             .map(|a| a.since)
             .min()
     }
@@ -655,6 +834,10 @@ pub fn addresses(node: &Node) -> Vec<String> {
     node.terminals().iter().filter_map(|n| n.terminal().map(str::to_owned)).collect()
 }
 
+pub fn any_addresses(node: &Node) -> Vec<String> {
+    node.panes().into_iter().filter_map(|n| n.any_terminal().map(str::to_owned)).collect()
+}
+
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct FolderInfo {
     /// The checkout's top folder (a worktree's own), else the folder itself.
@@ -677,7 +860,7 @@ pub fn space_json(m: &Model, p: &Space, index: usize, branch: Option<&str>, home
                 "name": Model::tab_name(p, c),
                 "named": !c.name.is_empty(),
                 "active": Some(&c.id) == active.as_ref(),
-                "status": m.rollup(&addresses(&c.root)),
+                "status": m.rollup(&any_addresses(&c.root)),
                 "panes": c.root.panes().len(),
                 "zoomed": c.zoomed.is_some(),
                 "settled": c.settled.is_some(),
@@ -687,7 +870,7 @@ pub fn space_json(m: &Model, p: &Space, index: usize, branch: Option<&str>, home
             })
         })
         .collect();
-    let all: Vec<String> = p.tabs.iter().flat_map(|c| addresses(&c.root)).collect();
+    let all: Vec<String> = p.tabs.iter().flat_map(|c| any_addresses(&c.root)).collect();
     json!({
         "id": p.id,
         "index": index + 1,
@@ -1125,5 +1308,123 @@ mod tests {
         assert_eq!(m.active.as_deref(), Some("p1"));
         assert_eq!(m.focused_pane().as_deref(), Some("x1"));
         assert_eq!(m.active_tab().map(|c| addresses(c.shown())).unwrap_or_default(), ["t1"]);
+    }
+
+    #[test]
+    fn manual_status_overrides_inferred_status_until_cleared() {
+        let mut m = model_with_one();
+        m.set_word("t1", Some("working".into()), Some("claude".into()), true);
+        assert_eq!(m.status("t1"), Some("working"));
+
+        assert!(m.set_manual_status("t1", Some("done".into()), None));
+        assert_eq!(m.status("t1"), Some("done"));
+        // Marking seen does not clear an explicit manual "done" override.
+        m.mark_seen(&["t1".into()]);
+        assert_eq!(m.status("t1"), Some("done"));
+        assert_eq!(m.alert_for("t1", false, Some("working"), Some("idle"), false), None);
+
+        assert!(m.set_manual_status("t1", Some("idle".into()), None));
+        assert_eq!(m.status("t1"), Some("idle"));
+
+        assert!(m.set_manual_status("t1", None, None));
+        assert_eq!(m.status("t1"), Some("working"));
+    }
+
+    #[test]
+    fn merge_tabs_combines_panes_removes_source_and_preserves_acp_panes() {
+        use crate::layout::Edge;
+
+        let mut m = model_with_one();
+        m.add_tab("p1", Tab::new("c2", "two", "x2", "t2"));
+        m.add_tab(
+            "p1",
+            Tab::with_pane(
+                "c3",
+                "acp",
+                Node::block("acp-1", Content::Mod { name: "peek".into(), props: json!({ "acp": true, "terminal": "a1" }) }),
+            ),
+        );
+
+        let moved = m.merge_tabs("c2", "c1", Edge::Right).unwrap();
+        assert_eq!(moved, ["t2"]);
+        assert!(m.tab("c2").is_none());
+        let c1 = m.tab("c1").unwrap();
+        assert_eq!(c1.root.axis(), Some(Axis::Row));
+        let ids: Vec<_> = c1.root.panes().into_iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, ["x1", "x2"]);
+        assert_eq!(m.focused_pane().as_deref(), Some("x2"));
+        assert_eq!(m.active_tab().map(|c| c.id.as_str()), Some("c1"));
+        assert_eq!(m.pane_of("t1").as_deref(), Some("x1"));
+        assert_eq!(m.pane_of("t2").as_deref(), Some("x2"));
+
+        // Merging a third ACP tab flattens into the row and keeps ACP identity intact.
+        let moved_acp = m.merge_tabs("c3", "c1", Edge::Right).unwrap();
+        assert_eq!(moved_acp, ["a1"]);
+        assert!(m.tab("c3").is_none());
+        let ids: Vec<_> = m.tab("c1").unwrap().root.panes().into_iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, ["x1", "x2", "acp-1"]);
+        assert_eq!(m.acp_pane_of("a1").as_deref(), Some("acp-1"));
+        assert_eq!(m.pane_of("t1").as_deref(), Some("x1"));
+
+        // Reject self-merge and cross-space merge.
+        assert!(m.merge_tabs("c1", "c1", Edge::Right).is_err());
+        m.add_space("p2", "other", "/o", Tab::new("c4", "four", "x4", "t4"));
+        assert!(m.merge_tabs("c4", "c1", Edge::Right).is_err());
+    }
+
+    #[test]
+    fn detach_pane_splits_merged_pane_into_standalone_tab_and_clears_zoom() {
+        use crate::layout::Edge;
+
+        let mut m = model_with_one();
+        m.add_tab("p1", Tab::new("c2", "two", "x2", "t2"));
+        m.add_tab(
+            "p1",
+            Tab::with_pane(
+                "c3",
+                "acp",
+                Node::block("acp-1", Content::Mod { name: "peek".into(), props: json!({ "acp": true, "terminal": "a1" }) }),
+            ),
+        );
+        m.merge_tabs("c2", "c1", Edge::Right).unwrap();
+        m.merge_tabs("c3", "c1", Edge::Right).unwrap();
+        // Simulate uneven divider resizing before detaching: remaining panes must rebalance equally.
+        if let Some(x1) = m.tab_mut("c1").unwrap().root.find_mut("x1") {
+            x1.size = Some(crate::layout::Size::Weight { weight: 1.8 });
+        }
+        if let Some(x2) = m.tab_mut("c1").unwrap().root.find_mut("x2") {
+            x2.size = Some(crate::layout::Size::Weight { weight: 0.4 });
+        }
+        m.tab_mut("c1").unwrap().zoomed = Some("acp-1".into());
+        m.tab_mut("c1").unwrap().focus("acp-1");
+
+        // Detach the ACP pane from the merged tab.
+        let (new_acp_tab, moved_addr) = m.detach_pane("acp-1", "Codex").unwrap();
+        assert_eq!(moved_addr.as_deref(), Some("a1"));
+        assert_eq!(m.active_tab().map(|c| c.id.as_str()), Some(new_acp_tab.as_str()));
+        assert_eq!(m.acp_pane_of("a1").as_deref(), Some("acp-1"));
+        assert_eq!(m.tab(&new_acp_tab).unwrap().name, "Codex");
+        let space = m.space("p1").unwrap();
+        let tab_ids: Vec<_> = space.tabs.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(tab_ids, ["c1", new_acp_tab.as_str()]);
+        let src = m.tab("c1").unwrap();
+        assert_eq!(src.zoomed, None);
+        assert_eq!(src.focused.as_deref(), Some("x2"));
+        assert_eq!(
+            src.root.panes().into_iter().map(|n| n.id.as_str()).collect::<Vec<_>>(),
+            ["x1", "x2"]
+        );
+        assert!(src.root.children().iter().all(|ch| ch.size.is_none()), "remaining panes must share width equally: {:?}", src.root.children());
+
+        // Detaching from a single-pane tab fails cleanly.
+        assert!(m.detach_pane("acp-1", "").is_err());
+
+        // Detach x2 out of c1 as well, leaving x1 alone in c1.
+        let (new_x2_tab, moved_t2) = m.detach_pane("x2", "").unwrap();
+        assert_eq!(moved_t2.as_deref(), Some("t2"));
+        assert_eq!(m.pane_of("t2").as_deref(), Some("x2"));
+        let tab_ids: Vec<_> = m.space("p1").unwrap().tabs.iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(tab_ids, ["c1", new_x2_tab.as_str(), new_acp_tab.as_str()]);
+        assert_eq!(m.tab("c1").unwrap().root.panes().len(), 1);
     }
 }

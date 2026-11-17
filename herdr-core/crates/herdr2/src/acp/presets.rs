@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 pub const BUILTIN_PRESETS: &[(&str, &[&str])] = &[
+    ("agy", &["agy", "acp"]),
+    ("antigravity", &["agy", "acp"]),
     ("claude", &["claude-agent-acp"]),
     ("codex", &["codex-acp"]),
     ("gemini", &["gemini", "--acp"]),
@@ -12,6 +14,7 @@ pub const BUILTIN_PRESETS: &[(&str, &[&str])] = &[
     ("copilot", &["copilot", "--acp", "--stdio"]),
     ("cursor", &["cursor-agent", "acp"]),
     ("cursor-agent", &["cursor-agent", "acp"]),
+    ("dsh", &["dsh", "--profile", "acp"]),
     ("kimi", &["kimi", "acp"]),
     ("qwen", &["qwen", "--acp"]),
     ("pi", &["pi-acp"]),
@@ -25,6 +28,16 @@ pub struct ResolvedAgent {
     pub preset: Option<String>,
     pub argv: Vec<String>,
     pub prompt: Option<String>,
+}
+
+pub fn is_claude_agent(preset: Option<&str>, argv: &[String]) -> bool {
+    if preset == Some("claude") {
+        return true;
+    }
+    argv.first()
+        .and_then(|p| Path::new(p).file_stem())
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.to_ascii_lowercase().starts_with("claude"))
 }
 
 pub fn preset_names(config_presets: &BTreeMap<String, Vec<String>>) -> Vec<String> {
@@ -162,6 +175,22 @@ pub fn split_words(raw: &str) -> Result<Vec<String>, RpcError> {
     Ok(words)
 }
 
+fn candidate_files_in_dir(dir: &Path, program: &str, pathext_override: Option<&str>) -> Vec<std::path::PathBuf> {
+    let mut cands = vec![dir.join(program)];
+    if cfg!(windows) && Path::new(program).extension().is_none() {
+        let pathext = pathext_override.map(String::from).or_else(|| std::env::var("PATHEXT").ok());
+        let exts = pathext.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or(".COM;.EXE;.BAT;.CMD");
+        for ext in exts.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+            cands.push(dir.join(format!("{program}{ext}")));
+            let lower = ext.to_ascii_lowercase();
+            if lower != ext {
+                cands.push(dir.join(format!("{program}{lower}")));
+            }
+        }
+    }
+    cands
+}
+
 fn check_not_ide_shim(program: &str) -> Result<(), RpcError> {
     if is_ide_shim_path(program) {
         return Err(shim_error(program));
@@ -170,8 +199,7 @@ fn check_not_ide_shim(program: &str) -> Result<(), RpcError> {
         && let Some(path) = std::env::var_os("PATH")
     {
         for dir in std::env::split_paths(&path) {
-            let cand = dir.join(program);
-            if cand.is_file() {
+            if let Some(cand) = candidate_files_in_dir(&dir, program, None).into_iter().find(|c| c.is_file()) {
                 if is_ide_shim_path(&cand.to_string_lossy()) {
                     return Err(shim_error(&cand.display().to_string()));
                 }
@@ -182,9 +210,43 @@ fn check_not_ide_shim(program: &str) -> Result<(), RpcError> {
     Ok(())
 }
 
-fn is_ide_shim_path(path: &str) -> bool {
+pub(crate) fn is_ide_shim_path(path: &str) -> bool {
     let lower = path.to_ascii_lowercase();
     lower.contains(".windsurf") || lower.contains(".codeium")
+}
+
+/// Resolves an executable in the supplied `PATH`/`PATHEXT` (or process environment) if it exists and is not an IDE shim.
+pub(crate) fn resolve_non_shim_binary_in_path(
+    program: &str,
+    path_override: Option<&str>,
+    pathext_override: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    if is_ide_shim_path(program) {
+        return None;
+    }
+    let p = Path::new(program);
+    if program.contains('/') || program.contains('\\') {
+        let dir = p.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."));
+        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+            return candidate_files_in_dir(dir, name, pathext_override)
+                .into_iter()
+                .find(|c| c.is_file() && !is_ide_shim_path(&c.to_string_lossy()));
+        }
+        return p.is_file().then(|| p.to_path_buf());
+    }
+    let path = path_override.map(std::ffi::OsString::from).or_else(|| std::env::var_os("PATH"))?;
+    for dir in std::env::split_paths(&path) {
+        if let Some(cand) = candidate_files_in_dir(&dir, program, pathext_override).into_iter().find(|c| c.is_file()) {
+            return (!is_ide_shim_path(&cand.to_string_lossy())).then_some(cand);
+        }
+    }
+    None
+}
+
+/// Resolves an executable in `PATH` (or explicit path) if it exists and is not an IDE shim.
+#[allow(dead_code)]
+pub(crate) fn resolve_non_shim_binary(program: &str) -> Option<std::path::PathBuf> {
+    resolve_non_shim_binary_in_path(program, None, None)
 }
 
 fn shim_error(program: &str) -> RpcError {

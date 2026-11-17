@@ -44,6 +44,15 @@ pub struct Agent {
     /// Requested mode override (`session/set_mode`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    /// Live session configuration options (model, reasoning effort, fast mode, session mode) advertised by the ACP agent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_options: Vec<crate::acp::proto::AcpConfigOption>,
+    /// User-applied session configuration overrides preserved across `--keep` reloads.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub config_overrides: BTreeMap<String, serde_json::Value>,
+    /// Latest context window token usage reported by ACP `usage_update`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<crate::acp::proto::AcpContextUsage>,
     /// Whether built-in `herdr2` MCP server is injected into ACP `mcpServers`.
     #[serde(default = "default_true")]
     pub inject_mcp: bool,
@@ -286,6 +295,9 @@ impl Registry {
                 system_prompt: new.system_prompt,
                 model: new.model,
                 mode: new.mode,
+                config_options: Vec::new(),
+                config_overrides: BTreeMap::new(),
+                context_usage: None,
                 inject_mcp: new.inject_mcp,
                 permission_mode: new.permission_mode,
                 pending_permission: None,
@@ -416,6 +428,7 @@ impl Registry {
 const PRIVATE: &[&str] = &[
     "acp_session_id",
     "can_load_session",
+    "config_overrides",
     "system_prompt",
     "first_task_turn",
     "news",

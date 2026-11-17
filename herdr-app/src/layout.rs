@@ -486,6 +486,24 @@ impl Node {
         }
     }
 
+    /// Address of a mounted ACP pane (`mod: "peek"`, `props: { acp: true, terminal }`).
+    pub fn acp_terminal(&self) -> Option<&str> {
+        match self.content() {
+            Some(Content::Mod { name, props })
+                if name == "peek"
+                    && props.get("acp").and_then(Value::as_bool) == Some(true) =>
+            {
+                props.get("terminal").and_then(Value::as_str).filter(|s| !s.is_empty())
+            }
+            _ => None,
+        }
+    }
+
+    /// Address shown in a pane block, whether PTY terminal or mounted ACP mod.
+    pub fn any_terminal(&self) -> Option<&str> {
+        self.terminal().or_else(|| self.acp_terminal())
+    }
+
     /// A pane in a tab: a terminal, or a mod beside them (a viewer, a board).
     pub fn is_pane(&self) -> bool {
         matches!(self.content(), Some(Content::Terminal { .. } | Content::Mod { .. }))

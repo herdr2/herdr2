@@ -75,6 +75,7 @@ pub struct Core {
     pty_dirty: std::sync::atomic::AtomicBool,
     save_due: Notify,
     pub(crate) image_due: Notify,
+    pub drove: Arc<crate::drove::DroveRuntime>,
     registry_writer: RegistryWriter,
     pty_registry_writer: RegistryWriter,
 }
@@ -131,6 +132,7 @@ pub struct State {
     pub afar_runs: HashMap<(TargetKey, String), (usize, bool)>,
     pub machine_outbox: HashMap<String, Vec<serde_json::Value>>,
     pub mirrors: HashMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
+    pub pty_prompts: HashMap<u32, Vec<(u64, u64, String)>>,
 }
 
 const SAVE_SOON: Duration = Duration::from_secs(2);
@@ -169,6 +171,7 @@ impl Core {
         std::fs::create_dir_all(paths.state.join("screens"))?;
         let machines = read_state(&paths.state.join("machines.json"))?;
         let peers = read_state(&paths.state.join("peers.json"))?;
+        let drove = crate::drove::DroveRuntime::open(&paths)?;
         let (jobs, jobs_rx) = tokio::sync::mpsc::unbounded_channel();
         let core = Arc::new(Core {
             info,
@@ -189,7 +192,9 @@ impl Core {
             pty_dirty: Default::default(),
             save_due: Notify::new(),
             image_due: Notify::new(),
+            drove,
         });
+        core.drove.attach_core(&core);
         crate::exec::sweep_leftovers(&core.paths.state);
         core.reconcile_startup();
         core.attach_all()?;
@@ -297,7 +302,13 @@ impl Core {
             Entry::Permission { title, outcome, .. } => Some(format!("[permission: {outcome}] {title}\n")),
             _ => None,
         };
-        st.transcripts.entry(id).or_default().push(entry);
+        st.transcripts.entry(id).or_default().push(entry.clone());
+        if let Some(wid) = st.reg.agents.get(&id).and_then(|a| a.labels.get("drove.worker")) {
+            let _ = self.drove.pool_tx.send(crate::drove::pool::PoolSignal::Transcript {
+                worker_id: wid.clone(),
+                entry,
+            });
+        }
         self.emit(st, "transcript", id, payload);
         if let Some(chunk) = snippet
             && let Some(watchers) = st.output_watch.get_mut(&id)
@@ -511,6 +522,13 @@ impl Core {
             let target = TargetKey::Agent(id);
             let _ = self.jobs.send(crate::notes::Job::Orphaned(target));
             crate::remote::orphaned_afar(self, st, target);
+        }
+        if let Some(wid) = st.reg.agents.get(&id).and_then(|a| a.labels.get("drove.worker")) {
+            let _ = self.drove.pool_tx.send(crate::drove::pool::PoolSignal::AgentExited {
+                worker_id: wid.clone(),
+                agent_id: id,
+                reason: reason.to_string(),
+            });
         }
         let rm = st.reg.agents.get(&id).is_some_and(|a| {
             !a.is_live() && a.rm && !a.parent.as_ref().is_some_and(|p| st.waiting.contains_key(&(p.clone(), TargetKey::Agent(id))))

@@ -1,9 +1,22 @@
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, v_flex } from "gpui-base";
-import { theme, spaces, panes, knownAgents, run, openOverlay, closeOverlay, props, window, keys, shared, setShared } from "herdr";
+import { theme, spaces, panes, knownAgents, run, h2, openOverlay, closeOverlay, props, window, keys, shared, setShared, settings } from "herdr";
+
+const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
+const tr = (en, zh) => (isZh() ? zh : en);
 
 // The last agents each machine reported, shown at once while knownAgents() checks again.
 const KNOWN = "new-menu.agents";
+const MODE_KEY = "new-menu.agent-mode";
+const ACP_SKIP_KEY = "new-menu.acp-skip-perms";
+const isAcpSkipPerms = () => shared(ACP_SKIP_KEY) !== false;
+const ACP_PRESETS = new Set(["claude", "codex", "gemini", "opencode", "copilot", "cursor", "kimi", "qwen", "pi", "hermes", "glm", "zcode"]);
+
+function activeFolder(space) {
+  if (!space) return null;
+  const tabIds = new Set((space.tabs ?? []).map((t) => t.id));
+  return panes().find((p) => tabIds.has(p.tab) && p.cwd)?.cwd || space.folder || null;
+}
 
 function shortcut(name) {
   const k = keys().find(b => b.section === "global" && b.action === name);
@@ -45,29 +58,122 @@ export default class NewMenu extends View {
       .on_click(() => { if (enabled) { closeOverlay(props().overlay); action(); } })
       .child(icon).child(div().flex_1().child(name)).child(div().text_size(11).text_color(t.dim).child(hint));
   }
+  launchAgent(a, space, acpMode) {
+    closeOverlay(props().overlay);
+    if (acpMode && ACP_PRESETS.has(a.key)) {
+      const cwd = activeFolder(space);
+      const args = ["run", "--bg"];
+      if (isAcpSkipPerms()) {
+        args.push("--dangerously-skip-permissions");
+      } else if (a.key === "claude") {
+        args.push("--mode", "default");
+      }
+      args.push("--agent", a.key);
+      if (space?.machine) args.push("--on", space.machine);
+      if (cwd) args.push("--cwd", cwd);
+      Promise.resolve(h2(args)).catch(() => {});
+      return;
+    }
+    const runArgv = a.key === "cursor" && Array.isArray(a.run) && a.run[0] === "agent"
+      ? ["cursor-agent", ...a.run.slice(1)]
+      : a.run;
+    run("tab.new", { name: a.name, space: space?.id, argv: runArgv });
+  }
   render() {
     const t = theme();
     const space = spaces().find(s => s.active);
+    const acpMode = (shared(MODE_KEY) ?? "terminal") === "acp";
+    const skipPerms = isAcpSkipPerms();
     const installed = this.agents.filter(a => a.installed);
     const choices = this.failed ? installed : [...installed, ...this.agents.filter(a => !a.installed).slice(0, 2)];
-    return v_flex().min_h(0).w_full().h(Math.min(491, 167 + Math.max(1, choices.length + (this.failed ? 1 : 0)) * 31)).bg(t.popover).p(5).text_size(12.8)
+    const modeChip = (id, label, active) => div()
+      .id(`nm-mode-${id}`)
+      .px(6)
+      .py(2)
+      .rounded(5)
+      .text_size(10.5)
+      .font_medium()
+      .bg(active ? t.selected : t.popover)
+      .border_1()
+      .border_color(active ? (t.accent ?? t.border) : t.border)
+      .text_color(active ? t.foreground : t.dim)
+      .cursor_pointer()
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => {
+        cx.stop_propagation();
+        setShared(MODE_KEY, id);
+        cx.notify();
+      })
+      .child(label);
+    return v_flex().min_h(0).w_full().h(Math.min(520, 175 + (acpMode ? 28 : 0) + Math.max(1, choices.length + (this.failed ? 1 : 0)) * 31)).bg(t.popover).p(5).text_size(12.8)
       .id("new-menu").track_focus(this.handle)
       .on_key_down((e) => {
         if (e.modifiers.control || e.modifiers.platform || e.modifiers.alt) return;
         const agent = /^[1-9]$/.test(e.key) ? installed[Number(e.key) - 1] : null;
         if (!agent) return;
-        closeOverlay(props().overlay);
-        run("tab.new", { name: agent.name, space: space?.id, argv: agent.run });
+        this.launchAgent(agent, space, acpMode);
       })
-      .child(this.row("terminal", svg("icons/shell.svg").size(14), "Terminal", () => run("tab.new", { space: space?.id }), shortcut("tab.new")))
-      .child(div().px(9).pt(8).pb(4).text_size(11).text_color(t.dim).child("Start an agent"))
+      .child(this.row("terminal", svg("icons/shell.svg").size(14), tr("Terminal", "终端"), () => run("tab.new", { space: space?.id }), shortcut("tab.new")))
+      .child(
+        h_flex()
+          .px(9)
+          .pt(8)
+          .pb(4)
+          .items_center()
+          .justify_between()
+          .child(div().text_size(11).text_color(t.dim).child(tr("Start an agent", "启动智能体")))
+          .child(h_flex().gap(4).items_center().child(modeChip("terminal", tr("CLI", "终端"), !acpMode)).child(modeChip("acp", "ACP", acpMode))),
+      )
+      .when(acpMode, (el) => el.child(
+        h_flex()
+          .id("nm-acp-skip")
+          .h(26)
+          .mx(6)
+          .mb(2)
+          .px(8)
+          .gap(7)
+          .items_center()
+          .justify_between()
+          .rounded(6)
+          .bg(skipPerms ? t.selected : t.raised)
+          .border_1()
+          .border_color(skipPerms ? (t.blocked ?? "#f59e0b") : t.border)
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover))
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+          .on_click((_e, cx) => {
+            cx.stop_propagation();
+            setShared(ACP_SKIP_KEY, !skipPerms);
+            cx.notify();
+          })
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .min_w(0)
+              .child(svg("frame/settings/shield.svg").size(12).flex_none().text_color(skipPerms ? (t.blocked ?? "#f59e0b") : t.dim))
+              .child(div().truncate().text_size(11.5).text_color(skipPerms ? (t.blocked ?? "#f59e0b") : t.muted).child("dangerously-skip-permissions")),
+          )
+          .child(div().text_size(11).font_semibold().text_color(skipPerms ? (t.blocked ?? "#f59e0b") : t.dim).child(skipPerms ? "✓" : "○")),
+      ))
       .child(v_flex().flex_1().min_h(0).overflow_y_scrollbar()
-        .children(choices.map((a, i) => this.row(a.key, a.tint ? svg(a.icon).size(14).text_color(t.foreground) : image(a.icon).size(14), a.name,
-          () => run("tab.new", { name: a.name, space: space?.id, argv: a.run }), a.installed ? (i < 9 ? String(i + 1) : "") : "not installed", a.installed)))
-        .when(this.failed || this.agents.length === 0, el => el.child(div().px(9).py(6).text_color(t.dim).child(this.failed ? "Could not check installed agents" : "Checking installed agents…"))))
+        .children(choices.map((a, i) => {
+          const canAcp = ACP_PRESETS.has(a.key);
+          const enabled = a.installed && (!acpMode || canAcp);
+          const hint = !a.installed ? tr("not installed", "未安装") : (acpMode && !canAcp) ? tr("CLI only", "仅终端") : (i < 9 ? String(i + 1) : "");
+          return this.row(
+            a.key,
+            a.tint ? svg(a.icon).size(14).text_color(t.foreground) : image(a.icon).size(14),
+            a.name,
+            () => this.launchAgent(a, space, acpMode),
+            hint,
+            enabled,
+          );
+        }))
+        .when(this.failed || this.agents.length === 0, el => el.child(div().px(9).py(6).text_color(t.dim).child(this.failed ? tr("Could not check installed agents", "无法检查已安装的智能体") : tr("Checking installed agents…", "正在检查已安装的智能体…")))))
       .child(div().h(1).mx(4).my(5).bg(t.border))
-      .child(this.row("space", div().w(14).child("+"), "New space", () => run("space.new"), shortcut("space.new")))
-      .child(this.row("worktree", svg("mods/workspace-chrome/branch.svg").size(14), "New worktree…", () => openOverlay({ mod: "worktree", kind: "dialog", width: 460, height: 280, props: { space: space?.id, folder: panes().find(p => p.focused)?.cwd, action: "new" } }), "", Boolean(space)))
-      .child(this.row("worktree-open", svg("mods/workspace-chrome/branch.svg").size(14), "Open worktree\u2026", () => openOverlay({ mod: "worktree", kind: "dialog", width: 560, height: 480, props: { space: space?.id, folder: panes().find(p => p.focused)?.cwd, action: "open" } }), "", Boolean(space)));
+      .child(this.row("space", div().w(14).child("+"), tr("New space", "新建工作区"), () => run("space.new"), shortcut("space.new")))
+      .child(this.row("worktree", svg("mods/workspace-chrome/branch.svg").size(14), tr("New worktree…", "新建工作树…"), () => openOverlay({ mod: "worktree", kind: "dialog", width: 460, height: 280, props: { space: space?.id, folder: panes().find(p => p.focused)?.cwd, action: "new" } }), "", Boolean(space)))
+      .child(this.row("worktree-open", svg("mods/workspace-chrome/branch.svg").size(14), tr("Open worktree\u2026", "打开工作树…"), () => openOverlay({ mod: "worktree", kind: "dialog", width: 560, height: 480, props: { space: space?.id, folder: panes().find(p => p.focused)?.cwd, action: "open" } }), "", Boolean(space)));
   }
 }

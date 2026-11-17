@@ -4206,6 +4206,25 @@ impl ShellRuntime {
             event_bounds.set("height", f32::from(bounds.size.height))?;
             payload.set("bounds", event_bounds)?;
             payload.set("modifiers", modifiers_object(&ctx, event.modifiers)?)?;
+            let pressed_button = match event.pressed_button {
+                Some(gpui::MouseButton::Left) => {
+                    rquickjs::String::from_str(ctx.clone(), "left")?.into_value()
+                }
+                Some(gpui::MouseButton::Right) => {
+                    rquickjs::String::from_str(ctx.clone(), "right")?.into_value()
+                }
+                Some(gpui::MouseButton::Middle) => {
+                    rquickjs::String::from_str(ctx.clone(), "middle")?.into_value()
+                }
+                Some(gpui::MouseButton::Navigate(gpui::NavigationDirection::Back)) => {
+                    rquickjs::String::from_str(ctx.clone(), "back")?.into_value()
+                }
+                Some(gpui::MouseButton::Navigate(gpui::NavigationDirection::Forward)) => {
+                    rquickjs::String::from_str(ctx.clone(), "forward")?.into_value()
+                }
+                None => rquickjs::Value::new_null(ctx.clone()),
+            };
+            payload.set("pressed_button", pressed_button)?;
             handler.call::<_, ()>((
                 payload,
                 context_object(ctx, ContextBinding::Call(generation))?,
@@ -7183,8 +7202,8 @@ globalThis.__gpui = (() => {
     },
     Textarea: { new: (state) => element(__textarea_element(state.__handle)) },
     TextView: {
-      html: (id, text) => element(__text_view(String(id), String(text), "html")),
-      markdown: (id, text) => element(__text_view(String(id), String(text), "markdown")),
+      html: (id, text) => element(__text_view(String(id), String(text), "html", null)),
+      markdown: (id, text, options) => element(__text_view(String(id), String(text), "markdown", options === undefined || options === null ? null : JSON.stringify(options))),
     },
     CalendarState: { new: () => calendarState(__calendar_state_new()) },
     SliderState: {
@@ -7419,17 +7438,49 @@ impl ShellRuntime {
             let text_view_runtime = runtime.clone();
             globals.set(
                 "__text_view",
-                Func::from(move |ctx: Ctx<'_>, id: String, text: String, format: String| -> JsResult<SpecId> {
+                Func::from(move |ctx: Ctx<'_>, id: String, text: String, format: String, theme_json: Option<String>| -> JsResult<SpecId> {
                     let format = match format.as_str() {
                         "html" => crate::spec::TextViewFormat::Html,
                         "markdown" => crate::spec::TextViewFormat::Markdown,
                         _ => return Err(Exception::throw_type(&ctx, "TextView format must be html or markdown")),
+                    };
+                    let theme = match theme_json {
+                        Some(json) => {
+                            let parsed: crate::spec::TextViewThemeSpec = serde_json::from_str(&json)
+                                .map_err(|error| Exception::throw_type(&ctx, &error.to_string()))?;
+                            for color in [
+                                &parsed.foreground,
+                                &parsed.muted,
+                                &parsed.link,
+                                &parsed.selection,
+                                &parsed.code_background,
+                                &parsed.inline_code_foreground,
+                                &parsed.inline_code_background,
+                                &parsed.border,
+                                &parsed.heading,
+                            ]
+                            .into_iter()
+                            .flatten()
+                            {
+                                Bridged::Str(color.clone())
+                                    .as_color()
+                                    .map_err(|error| Exception::throw_type(&ctx, &error.to_string()))?;
+                            }
+                            for color in parsed.syntax.values() {
+                                Bridged::Str(color.clone())
+                                    .as_color()
+                                    .map_err(|error| Exception::throw_type(&ctx, &error.to_string()))?;
+                            }
+                            Some(parsed)
+                        }
+                        None => None,
                     };
                     Ok(upgrade(&text_view_runtime, &ctx)?.push_node(Component::TextView(
                         crate::spec::TextViewSpec {
                             id: id.into(),
                             text: text.into(),
                             format,
+                            theme,
                             policy: crate::scope::policy(),
                         },
                     )))

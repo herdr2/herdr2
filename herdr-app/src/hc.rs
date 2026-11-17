@@ -37,6 +37,8 @@ pub struct EventLines {
     seq: u64,
     /// Every terminal the stream describes, in its order (schema/README.md, Events).
     terminals: Vec<Value>,
+    /// Every headless ACP agent the stream describes (`events.subscribe` `"agents"`).
+    agents: Vec<Value>,
     /// Each terminal's highest `herdr.seen` among the label changes since the
     /// last `take_seen`: `terminals` keeps only the last, which may hide a
     /// write of ours under a later, lower one (docs/labels.md).
@@ -54,10 +56,11 @@ pub struct Pushed {
 }
 
 impl EventLines {
-    /// From `events.subscribe`'s reply: its `seq` and `terminals`.
+    /// From `events.subscribe`'s reply: its `seq`, `terminals`, and `agents`.
     pub fn new(snapshot: &Value) -> Self {
         let terminals = snapshot["terminals"].as_array().cloned().unwrap_or_default();
-        EventLines { seq: snapshot["seq"].as_u64().unwrap_or(0), terminals, resynced: true, ..Default::default() }
+        let agents = snapshot["agents"].as_array().cloned().unwrap_or_default();
+        EventLines { seq: snapshot["seq"].as_u64().unwrap_or(0), terminals, agents, resynced: true, ..Default::default() }
     }
 
     /// The `herdr.seen` values that went by, and whether a snapshot replaced everything.
@@ -71,36 +74,22 @@ impl EventLines {
         *high = (*high).max(seen);
     }
 
-    /// The live terminals, as `terminal.list` puts them.
+    /// The live terminals and live ACP agents, in core list order.
     pub fn live(&self) -> Value {
-        let live: Vec<&Value> = self.terminals.iter().filter(|t| t["state"] == "live").collect();
-        json!({ "terminals": live })
+        let terminals: Vec<&Value> = self.terminals.iter().filter(|t| t["state"] == "live").collect();
+        let agents: Vec<&Value> = self.agents.iter().filter(|a| a["state"] == "live").collect();
+        json!({ "terminals": terminals, "agents": agents })
     }
 
     /// Parent references from cores may still use host names. All app
-    /// consumers need the same addresses as the terminal records themselves.
+    /// consumers need the same addresses as the terminal/agent records themselves.
     pub fn live_for(&self, hello: &Value, machines: &Value) -> Value {
         let mut live = self.live();
-        for terminal in live["terminals"].as_array_mut().into_iter().flatten() {
-            let Some(parent) = terminal["parent"].as_str() else { continue };
-            let Some((prefix, id)) = parent.split_once('/') else { continue };
-            let local = [hello["core"]["id"].as_str(), hello["core"]["name"].as_str()].contains(&Some(prefix));
-            if local {
-                terminal["parent"] = id.into();
-                continue;
-            }
-            let known = machines["machines"].as_array().into_iter().flatten();
-            // Preserve normalized names before considering a core's host name.
-            let machine = known.clone().find(|m| m["name"] == prefix || m["id"] == prefix)
-                .or_else(|| {
-                    let mut hosts = known.filter(|m| m["host"] == prefix);
-                    match (hosts.next(), hosts.next()) {
-                        (Some(machine), None) => Some(machine),
-                        _ => None,
-                    }
-                });
-            let Some(name) = machine.and_then(|m| m["name"].as_str()) else { continue };
-            terminal["parent"] = format!("{name}/{id}").into();
+        if let Some(terminals) = live["terminals"].as_array_mut() {
+            normalize_parents(terminals, hello, machines);
+        }
+        if let Some(agents) = live["agents"].as_array_mut() {
+            normalize_parents(agents, hello, machines);
         }
         live
     }
@@ -126,6 +115,7 @@ impl EventLines {
             match line["method"].as_str() {
                 Some("missed") => {
                     self.terminals = p["terminals"].as_array().cloned().unwrap_or_default();
+                    self.agents = p["agents"].as_array().cloned().unwrap_or_default();
                     self.seq = p["seq"].as_u64().unwrap_or(self.seq);
                     self.resynced = true;
                     pushed.docs = true;
@@ -145,13 +135,29 @@ impl EventLines {
         pushed
     }
 
-    /// One event's change to the terminal it names (schema/README.md, Events).
+    /// One event's change to the terminal or ACP agent it names.
     fn apply(&mut self, p: &Value) -> bool {
-        let (kind, address, data) = (p["type"].as_str().unwrap_or_default(), &p["terminal"], &p["data"]);
-        if matches!(kind, "created" | "restarted" | "labels") {
-            self.note_seen(address, &data["labels"]);
+        if !p["terminal"].is_null() {
+            self.apply_record(p, false)
+        } else if !p["agent"].is_null() {
+            self.apply_record(p, true)
+        } else {
+            false
         }
-        let at = self.terminals.iter().position(|t| &t["address"] == address);
+    }
+
+    fn apply_record(&mut self, p: &Value, is_agent: bool) -> bool {
+        let (kind, address, data) = (
+            p["type"].as_str().unwrap_or_default(),
+            if is_agent { &p["agent"] } else { &p["terminal"] },
+            &p["data"],
+        );
+        if matches!(kind, "created" | "restarted" | "labels") {
+            let labels = if !data["labels"].is_null() { &data["labels"] } else { &data["record"]["labels"] };
+            self.note_seen(address, labels);
+        }
+        let list = if is_agent { &mut self.agents } else { &mut self.terminals };
+        let at = list.iter().position(|t| &t["address"] == address);
         let whole = match kind {
             "created" | "restarted" => Some(data),
             "labels" => data.get("record"),
@@ -159,17 +165,17 @@ impl EventLines {
         };
         if let Some(record) = whole {
             match at {
-                Some(i) => self.terminals[i] = record.clone(),
-                None => self.terminals.push(record.clone()),
+                Some(i) => list[i] = record.clone(),
+                None => list.push(record.clone()),
             }
             return true;
         }
         let Some(i) = at else { return false };
         if kind == "removed" {
-            self.terminals.remove(i);
+            list.remove(i);
             return true;
         }
-        let t = &mut self.terminals[i];
+        let t = &mut list[i];
         let mut set = |keys: &[&str]| keys.iter().for_each(|k| t[*k] = data[*k].clone());
         match kind {
             "finished" | "lost" => {
@@ -178,18 +184,59 @@ impl EventLines {
                 if kind == "lost" {
                     t["pid"] = Value::Null;
                 }
+                if is_agent && kind == "finished" {
+                    t["pending_permission"] = Value::Null;
+                    t["inbox_len"] = json!(0);
+                }
                 t.as_object_mut().map(|r| r.remove("foreground"));
             }
-            "status" => set(&["status", "records", "reported"]),
+            "status" => {
+                set(&["status", "records", "reported"]);
+                if is_agent {
+                    t["pending_permission"] = data["pending_permission"].clone();
+                    if !data["inbox_len"].is_null() {
+                        t["inbox_len"] = data["inbox_len"].clone();
+                    }
+                }
+            }
             "turn" => set(&["turn"]),
             "title" => set(&["title"]),
             "labels" => set(&["labels"]),
             "keep" => set(&["keep"]),
             "size" => set(&["cols", "rows"]),
             "foreground" => t["foreground"] = data.clone(),
+            "config" if is_agent => set(&["model", "mode", "permission_mode", "config_options"]),
+            "usage" if is_agent => t["context_usage"] = data.clone(),
+            "transcript" if is_agent => {
+                let next = t["transcript_seq"].as_u64().unwrap_or(0) + 1;
+                t["transcript_seq"] = json!(next);
+            }
             _ => return false,
         }
         true
+    }
+}
+
+fn normalize_parents(records: &mut [Value], hello: &Value, machines: &Value) {
+    for record in records {
+        let Some(parent) = record["parent"].as_str() else { continue };
+        let Some((prefix, id)) = parent.split_once('/') else { continue };
+        let local = [hello["core"]["id"].as_str(), hello["core"]["name"].as_str()].contains(&Some(prefix));
+        if local {
+            record["parent"] = id.into();
+            continue;
+        }
+        let known = machines["machines"].as_array().into_iter().flatten();
+        // Preserve normalized names before considering a core's host name.
+        let machine = known.clone().find(|m| m["name"] == prefix || m["id"] == prefix).or_else(|| {
+            let mut hosts = known.filter(|m| m["host"] == prefix);
+            match (hosts.next(), hosts.next()) {
+                (Some(machine), None) => Some(machine),
+                _ => None,
+            }
+        });
+        let Some(name) = machine.and_then(|m| m["name"].as_str()) else { continue };
+        record["parent"] = format!("{name}/{id}").into();
     }
 }
 
@@ -248,6 +295,16 @@ fn semver(v: &str) -> (u64, u64, u64) {
     (p.next().unwrap_or(0), p.next().unwrap_or(0), p.next().unwrap_or(0))
 }
 
+/// Whether `have` is at least `need` by major.minor.patch.
+pub fn semver_at_least(have: &str, need: &str) -> bool {
+    semver(have) >= semver(need)
+}
+
+/// Whether `v` satisfies this app's `distribution/core-version`.
+pub fn meets_core_min(v: &str) -> bool {
+    semver_at_least(v, core_min())
+}
+
 /// Whether a core's hello says it can serve this app.
 pub fn check(hello: &Value) -> Result<(), Mismatch> {
     let generation = hello.get("generation").and_then(Value::as_u64).unwrap_or(0);
@@ -255,7 +312,7 @@ pub fn check(hello: &Value) -> Result<(), Mismatch> {
         return Err(Mismatch::Newer { generation });
     }
     let have = hello.get("version").and_then(Value::as_str).unwrap_or("0.0.0").to_owned();
-    if generation < GENERATION || semver(&have) < semver(core_min()) {
+    if generation < GENERATION || !semver_at_least(&have, core_min()) {
         return Err(Mismatch::TooOld { have, need: core_min().to_owned() });
     }
     let methods: Vec<&str> = hello.get("methods").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
@@ -321,8 +378,26 @@ fn connect_error(stderr: &str) -> Option<ConnectError> {
 }
 
 impl Core {
-    /// Connects to the user's core (starting it if needed) and switches to framed mode.
+    /// Connects to the user's core (starting it if needed), restarting an older
+    /// local daemon that lacks Drove support, and switches to framed mode.
     pub fn connect() -> Result<Arc<Core>> {
+        let core = Self::connect_once()?;
+        if core.hello["methods"].is_array()
+            && !core.hello["features"].as_array().is_some_and(|f| f.iter().any(|x| x == "drove"))
+        {
+            drop(core);
+            let _ = crate::spawn::command(crate::core_bin::path())
+                .args(["server", "restart"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            return Self::connect_once();
+        }
+        Ok(core)
+    }
+
+    fn connect_once() -> Result<Arc<Core>> {
         let mut child = crate::spawn::command(crate::core_bin::path())
             .arg("connect")
             .stdin(Stdio::piped())
@@ -860,10 +935,65 @@ mod tests {
     #[test]
     fn a_core_serves_the_app_by_generation_version_and_methods() {
         assert_eq!(check(&hello(1, "9.9.9", USES)), Ok(()));
-        assert_eq!(check(&hello(1, "0.0.1", USES)), Err(Mismatch::TooOld { have: "0.0.1".into(), need: core_min().into() }));
+        assert_eq!(check(&hello(1, "0.0.0", USES)), Err(Mismatch::TooOld { have: "0.0.0".into(), need: core_min().into() }));
         assert_eq!(check(&hello(2, "9.9.9", USES)), Err(Mismatch::Newer { generation: 2 }));
         assert_eq!(check(&hello(1, "9.9.9", &["terminal.run"])), Err(Mismatch::Missing(USES[1..].iter().map(|m| m.to_string()).collect())));
         // 0.10 is newer than 0.9 (numbers, not text).
         assert!(semver("0.10.0") > semver("0.9.3"));
+    }
+
+    #[test]
+    fn event_lines_tracks_acp_agents_and_normalizes_parents() {
+        let mut lines = EventLines::new(&json!({
+            "seq": 10,
+            "terminals": [{"address": "t1", "state": "live"}],
+            "agents": [{"address": "wsl/a6", "state": "live", "parent": "win-id/t1", "status": {"state": "idle"}, "turn": 1, "labels": {"herdr.seen": "1"}}],
+        }));
+        let (seen, resynced) = lines.take_seen();
+        assert!(seen.is_empty() && resynced);
+
+        let ev = |seq: u64, kind: &str, agent: &str, data: Value| {
+            format!("{}\n", json!({"jsonrpc": "2.0", "method": "event", "params": {"seq": seq, "type": kind, "agent": agent, "data": data}}))
+        };
+        let mut stream = String::new();
+        stream.push_str(&ev(11, "created", "a1", json!({"address": "a1", "state": "live", "parent": "t1", "status": {"state": "starting"}, "turn": 0, "labels": {}})));
+        stream.push_str(&ev(12, "status", "a1", json!({"status": {"state": "blocked", "kind": "permission"}, "records": {}, "reported": true, "pending_permission": {"request_id": "r1", "title": "Allow bash"}, "inbox_len": 2})));
+        stream.push_str(&ev(13, "transcript", "a1", json!({"kind": "assistant", "text": "hello"})));
+        stream.push_str(&ev(14, "labels", "a1", json!({"labels": {"herdr.seen": "4"}})));
+        stream.push_str(&ev(15, "turn", "a1", json!({"turn": 4, "state": "idle"})));
+        stream.push_str(&ev(16, "finished", "wsl/a6", json!({"reason": "exited", "exit_code": 0, "signal": null, "finished_ms": 999})));
+
+        let pushed = lines.push(stream.as_bytes());
+        assert!(pushed.terminals);
+        let (seen, resynced) = lines.take_seen();
+        assert!(!resynced);
+        assert_eq!(seen.get("a1"), Some(&4));
+
+        let hello = json!({"core": {"id": "win-id", "name": "win"}});
+        let machines = json!({"machines": [{"id": "wsl-id", "name": "wsl", "host": "wsl-host"}]});
+        let live = lines.live_for(&hello, &machines);
+        assert_eq!(live["terminals"].as_array().unwrap().len(), 1);
+        let agents = live["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0]["address"], "a1");
+        assert_eq!(agents[0]["status"]["state"], "blocked");
+        assert_eq!(agents[0]["pending_permission"]["request_id"], "r1");
+        assert_eq!(agents[0]["inbox_len"], 2);
+        assert_eq!(agents[0]["transcript_seq"], 1);
+        assert_eq!(agents[0]["turn"], 4);
+
+        let missed = format!("{}\n", json!({
+            "jsonrpc": "2.0",
+            "method": "missed",
+            "params": {
+                "seq": 20,
+                "terminals": [],
+                "agents": [{"address": "wsl/a9", "state": "live", "parent": "win/t1"}],
+            }
+        }));
+        let pushed = lines.push(missed.as_bytes());
+        assert!(pushed.docs && pushed.terminals);
+        let live2 = lines.live_for(&hello, &machines);
+        assert_eq!(live2["agents"][0]["parent"], "t1");
     }
 }

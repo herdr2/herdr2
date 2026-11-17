@@ -10,11 +10,24 @@ use std::time::{Duration, Instant};
 
 static EXE: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
 
+fn clean_exe_path(path: std::path::PathBuf) -> std::path::PathBuf {
+    let s = path.to_string_lossy();
+    match s.strip_suffix(" (deleted)") {
+        Some(stripped) => std::path::PathBuf::from(stripped),
+        None => path,
+    }
+}
+
+/// Returns our executable path, stripping Linux's `" (deleted)"` suffix after atomic binary replacement.
+pub fn exe_path() -> Option<std::path::PathBuf> {
+    EXE.get().cloned().or_else(|| std::env::current_exe().ok()).map(clean_exe_path)
+}
+
 /// Remembers our binary's path at startup. After an update swaps the file,
 /// asking the OS again would name the deleted old binary.
 pub fn remember_exe() {
     if let Ok(exe) = std::env::current_exe() {
-        let _ = EXE.set(exe);
+        let _ = EXE.set(clean_exe_path(exe));
     }
     build_id();
 }
@@ -22,7 +35,7 @@ pub fn remember_exe() {
 /// The package manager this h2 came from, or "system package manager" as a
 /// compatibility marker when its folder isn't writable. None for a replaceable install.
 pub fn installed_by() -> Option<&'static str> {
-    let exe = EXE.get().cloned().or_else(|| std::env::current_exe().ok())?;
+    let exe = exe_path()?;
     installed_by_path(&exe)
 }
 
@@ -59,10 +72,28 @@ pub fn build_id() -> String {
             if let Some(id) = running_build_id() {
                 return format!("elf:{id}");
             }
-            let exe = EXE.get().cloned().or_else(|| std::env::current_exe().ok());
+            let exe = exe_path();
             exe.and_then(|e| std::fs::metadata(e).ok()).map(|m| platform::file_identity(&m)).unwrap_or_default()
         })
         .clone()
+}
+
+/// Build id of the executable currently stored at `exe_path()` on disk.
+pub fn disk_build_id() -> Option<String> {
+    let exe = exe_path()?;
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Read;
+        let mut head = Vec::new();
+        if let Ok(file) = std::fs::File::open(&exe) {
+            if file.take(64 << 10).read_to_end(&mut head).is_ok() {
+                if let Some(id) = elf_build_id(&head) {
+                    return Some(format!("elf:{id}"));
+                }
+            }
+        }
+    }
+    std::fs::metadata(&exe).ok().map(|m| platform::file_identity(&m))
 }
 
 fn unavailable(message: String) -> RpcError {
@@ -200,7 +231,7 @@ pub fn spawn_core(paths: &Paths) -> Result<(), RpcError> {
 pub fn spawn_detached(paths: &Paths, args: &[&str], log: &str) -> std::io::Result<()> {
     paths.create_dirs()?;
     let log = paths.state.join(log);
-    let exe = EXE.get().cloned().map_or_else(std::env::current_exe, Ok)?;
+    let exe = exe_path().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "cannot resolve herdr2 executable path"))?;
     let exe = if args.first() == Some(&"serve") { platform::core_executable(&exe) } else { exe };
     let mut cmd = Command::new(exe);
     if args.first() == Some(&"serve") {

@@ -16,10 +16,11 @@ Built-in presets for `--agent` (or positional first argument): `claude`, `codex`
 h2 templates
 
 # Launch with preset + initial prompt in background
-h2 run --bg --name reviewer --cwd /path/to/repo --agent claude --prompt "Review src/x.rs only. Report findings via h2_send or h2 send $H2_AGENT_ID."
+h2 run --bg --name reviewer --cwd /path/to/repo --agent claude --prompt "Review src/x.rs only. Report findings via h2 send $H2_AGENT_ID."
 
-# Wait for an agent to finish or block
+# Wait for an agent to finish or block (or pass --no-timeout inside a background command runner)
 h2 wait reviewer
+h2 wait reviewer --no-timeout
 
 # Launch a template (instructions from template body + task argument)
 h2 run --bg --name worker reviewer "Check src/acp/mod.rs for edge cases"
@@ -27,7 +28,20 @@ h2 run --bg --name worker reviewer "Check src/acp/mod.rs for edge cases"
 
 Overrides on `run`: `--model <MODEL>`, `--mode <MODE>`, `--system-prompt <TEXT>`, `--permissions <approve-all|approve-reads|deny-all|ask>`, `--no-mcp`, `--keep`, `--rm`, `--no-notify`, `--outlive-parent`, `--label k=v`, `--on <machine>`.
 
-Never use shell `&` or `sleep` polling for agents: use `h2 run --bg`, `h2 wait <a>`, or `h2 wait --children any|all`.
+Never use shell `&` or `sleep` polling for agents: use `h2 run --bg` with `h2 wait` (or your host's background command runner).
+
+## Non-blocking waiting (for hosts with background command execution)
+
+If your host supports running shell commands in the background, do not block your active turn waiting synchronously:
+
+1. Start child agents with `h2 run --bg --name <name> ...`.
+2. Run `h2 wait <name> --no-timeout` (or `h2 wait --children all --no-timeout`, or `--children any --no-timeout`) in **your host's background command runner**:
+   - **Claude Code / `dsh`**: call `Bash` with `run_in_background: true` (wakes you via task notification on exit).
+   - **Antigravity (`agy`)**: call `run_command` with short `WaitMsBeforeAsync` (e.g. `500`), then end your turn; reactive wakeup resumes you when `h2 wait` exits.
+   - **Codex CLI**: call `exec_command` (yields to a background `session_id` after ~10s) and read completion via `write_stdin`.
+   - **Cursor**: call `run_terminal_cmd` with `is_background: true`.
+3. Once `h2 wait` finishes (`status`, `exit`, `output`, or `message`), inspect with `h2 read <name> --last` or resolve `blocked` permissions with `h2 approve` / `h2 deny`.
+4. If your host does not support background commands, run `h2 wait <name>` synchronously (default 180s check-in; re-run on `timeout`) or omit `wait` and let `notes` / `h2 send` deliver updates.
 
 ## Coordinate, steer, and read transcripts
 
@@ -51,14 +65,14 @@ h2 keys t1 enter                        # send named keys (enter, esc, ctrl+c, .
 h2 events                               # follow ordered lifecycle events as JSON lines
 ```
 
-Messages sent from one agent to another (when `notes != false` in `~/.config/herdr2/config.toml`) are attributed with `<h2 from="...">...</h2>` tags (and `reach="h2 send <addr> when done or stuck"` on first task launches).
+Messages sent from one ACP agent to another (when `notes != false` in `~/.config/herdr2/config.toml`) are attributed with `<h2 from="...">...</h2>` tags (and `reach="h2 send <addr> when done or stuck"` for ACP parents). ACP agents cannot inject terminal input into PTY terminals (`t*`); terminal coordinators receive results exclusively via `h2 wait` and `h2 read`.
 
 Wait reasons:
 - `status`: target is now `idle`, `done`, `blocked`, or `error`.
 - `exit`: target process exited (`exit_code` / `signal`).
 - `output`: `--output TEXT` matched streamed transcript output.
 - `message`: a caller queued a prompt into your inbox while you waited on children (inspect inbox).
-- `timeout`: default 180s check-in; call `h2 wait` again to continue waiting.
+- `timeout`: default 180s check-in (unless `--no-timeout`); call `h2 wait` again to continue waiting.
 
 ## Permission policy (`approve-reads` default)
 
@@ -75,11 +89,9 @@ h2 approve worker              # approve (or --option <option_id>)
 h2 deny worker                 # deny/cancel (or --option <option_id>)
 ```
 
-## Built-in MCP server (`h2 mcp`)
+## CLI-first orchestration (no MCP required)
 
-By default (`inject_mcp = true`, unless `--no-mcp`), `herdr2` injects `{ "type": "stdio", "name": "herdr2", "command": "<h2-exe>", "args": ["mcp"], "env": [{"name": "H2_AGENT_ID", ...}, {"name": "H2_AGENT_SOCKET", ...}] }` into ACP `session/new` and `session/load` `mcpServers` (falling back automatically without `"type": "stdio"` if an adapter returns `-32602`).
-
-Exposed MCP tools: `h2_run`, `h2_send`, `h2_wait`, `h2_read`, `h2_ls`, `h2_approve`, `h2_deny`.
+Use the `h2` CLI directly together with your host's shell / background command runner. Set `inject_mcp = false` in `~/.config/herdr2/config.toml` if you also want ACP child agents to use `h2` CLI + `herdr2` skill without auto-injecting `h2 mcp`.
 
 ## Non-agent commands, files, and machines
 
@@ -93,4 +105,5 @@ Exposed MCP tools: `h2_run`, `h2_send`, `h2_wait`, `h2_read`, `h2_ls`, `h2_appro
 - State lives in `~/.local/state/herdr2/<session>/` (`agents.json`, `transcripts/<addr>.jsonl`), config in `~/.config/herdr2/config.toml`, runtime sockets in `$XDG_RUNTIME_DIR/herdr2/<session>.sock`.
 - Side-by-side coexistence: `herdr2`/`h2` uses completely separate binaries, env vars (`H2_*`), sockets, and state paths from legacy `herdr-core`/`hc`.
 - Never call `h2 server stop` or `h2 server restart` on a shared session unless requested; tests must use a dedicated `H2_SESSION` and scratch XDG paths.
+- `h2 drove status|web|probe` manages native Drove role-based multi-agent orchestration (Workers appear as `a*` sub-agents).
 - Exit codes: `2` usage, `3` not_found, `4` machine_unknown, `5` unavailable, `6` invalid_params, `7` needs_target, `8` config, `9` blocked, `10` status_mismatch, `11` finished, `124` waited run/exec timeout.

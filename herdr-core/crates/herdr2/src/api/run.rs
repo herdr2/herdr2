@@ -15,7 +15,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         None => None,
     };
 
-    let (resolved, initial_prompt, model, mode, permissions, inject_mcp, system_prompt) = match &template {
+    let (resolved, initial_prompt, model, mode, explicit_permissions, inject_mcp, system_prompt) = match &template {
         Some(t) => {
             if p.prompt.is_some() && p.argv.len() > 1 {
                 return Err(RpcError::invalid_params(
@@ -33,22 +33,36 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
             let prompt = (!first.trim().is_empty()).then_some(first);
             let model = p.model.clone().or_else(|| t.model.clone());
             let mode = p.mode.clone().or_else(|| t.mode.clone());
-            let permissions = p.permissions.or(t.permissions).or(settings.default_permissions).unwrap_or_default();
+            let explicit_permissions = p.permissions.or(t.permissions).or(settings.default_permissions);
             let inject_mcp = if p.no_mcp {
                 false
             } else {
                 t.inject_mcp.or(settings.inject_mcp).unwrap_or(true)
             };
             let system_prompt = p.system_prompt.clone().or_else(|| t.system_prompt.clone());
-            (resolved, prompt, model, mode, permissions, inject_mcp, system_prompt)
+            (resolved, prompt, model, mode, explicit_permissions, inject_mcp, system_prompt)
         }
         None => {
             let resolved = presets::resolve(p.agent.as_deref(), &p.argv, p.prompt.take(), &settings.agents)?;
             let prompt = resolved.prompt.clone().filter(|s| !s.trim().is_empty());
-            let permissions = p.permissions.or(settings.default_permissions).unwrap_or_default();
+            let explicit_permissions = p.permissions.or(settings.default_permissions);
             let inject_mcp = !p.no_mcp && settings.inject_mcp.unwrap_or(true);
-            (resolved, prompt, p.model.clone(), p.mode.clone(), permissions, inject_mcp, p.system_prompt.clone())
+            (resolved, prompt, p.model.clone(), p.mode.clone(), explicit_permissions, inject_mcp, p.system_prompt.clone())
         }
+    };
+
+    let is_claude = presets::is_claude_agent(resolved.preset.as_deref(), &resolved.argv);
+    let default_claude_skip = is_claude && mode.is_none() && explicit_permissions.is_none();
+    let mode = mode
+        .map(|m| acp::normalize_mode_value(&m, is_claude, &[]))
+        .or_else(|| default_claude_skip.then(|| "bypassPermissions".to_string()));
+    let skip_perms = p.dangerously_skip_permissions
+        || default_claude_skip
+        || mode.as_deref().is_some_and(crate::permissions::is_bypass_mode_id);
+    let permissions = if skip_perms {
+        crate::permissions::PermissionMode::ApproveAll
+    } else {
+        explicit_permissions.unwrap_or_default()
     };
 
     let caller = p.caller.clone();
@@ -134,7 +148,8 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         (id, address, env, created)
     };
 
-    let mcp_exe = std::env::current_exe().map(|exe| exe.display().to_string()).unwrap_or_else(|_| "herdr2".into());
+    let spec_skip = p.dangerously_skip_permissions && mode.is_none();
+    let mcp_exe = crate::client::exe_path().map(|exe| exe.display().to_string()).unwrap_or_else(|| "herdr2".into());
     let spec = SpawnSpec {
         address,
         argv: resolved.argv,
@@ -145,6 +160,8 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         system_prompt,
         model,
         mode,
+        dangerously_skip_permissions: spec_skip,
+        config_overrides: BTreeMap::new(),
         inject_mcp,
         mcp_exe,
         socket: core.paths.socket.display().to_string(),
@@ -167,6 +184,8 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
                         let agent_info = started.agent_info.clone();
                         let acp_sid = started.session_id.clone();
                         let can_load = started.can_load_session;
+                        let config_options = started.config_options.clone();
+                        let context_usage = started.context_usage;
                         let handle = acp::spawn_actor(core_bg.clone(), id, started);
                         let pid = handle.transport.pid();
                         st.sessions.insert(id, handle);
@@ -174,6 +193,11 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
                         a.pid = pid;
                         a.acp_session_id = Some(acp_sid);
                         a.can_load_session = can_load;
+                        a.config_options = config_options;
+                        if let Some(usage) = context_usage {
+                            a.context_usage = Some(usage);
+                        }
+                        acp::sync_config_to_agent(a);
                         if agent_info.is_some() {
                             a.agent_info = agent_info;
                         }
@@ -246,6 +270,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         let agent_info = started.agent_info.clone();
         let acp_sid = started.session_id.clone();
         let can_load = started.can_load_session;
+        let config_options = started.config_options.clone();
         let handle = acp::spawn_actor(core.core.clone(), id, started);
         let pid = handle.transport.pid();
         st.sessions.insert(id, handle);
@@ -253,6 +278,8 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         a.pid = pid;
         a.acp_session_id = Some(acp_sid);
         a.can_load_session = can_load;
+        a.config_options = config_options;
+        acp::sync_config_to_agent(a);
         if agent_info.is_some() {
             a.agent_info = agent_info;
         }
@@ -312,7 +339,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         None => (None, None),
         Some(timeout) => {
             let target = crate::runtime::TargetKey::Agent(id);
-            let r = watch(core, caller.clone(), target, WaitSpec { output: None, timeout, after_turn }).await;
+            let r = watch(core, caller.clone(), target, WaitSpec { output: None, timeout: Some(timeout), after_turn }).await;
             let text = tail(
                 core.read_transcript(id, Some(FINISHED_LINES), false).map(|t| t.0).unwrap_or_default(),
                 id,
@@ -393,6 +420,225 @@ pub(crate) fn child_env(base: BTreeMap<String, String>, extra: BTreeMap<String, 
         env.insert("LANG".into(), lang);
     }
     env
+}
+
+pub(crate) struct DroveSpawnSpec {
+    pub agent: String,
+    pub cwd: String,
+    pub parent: Option<String>,
+    pub title: String,
+    pub labels: BTreeMap<String, String>,
+    pub env: BTreeMap<String, String>,
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    pub access: crate::drove::types::RoleAccessMode,
+    pub isolate_secrets: bool,
+}
+
+pub(crate) struct DroveSpawnResult {
+    pub agent_id: u32,
+    pub address: String,
+    pub pid: Option<u32>,
+    pub sandbox_mode: &'static str,
+}
+
+/// Spawns a native `herdr2` headless ACP `a*` worker for Drove (without an initial prompt yet)
+/// so the caller can persist Worker/Attempt state before sending the task prompt.
+pub(crate) async fn spawn_drove_agent(
+    core: &Arc<Core>,
+    req: DroveSpawnSpec,
+) -> Result<DroveSpawnResult, RpcError> {
+    not_stopping(&core.lock())?;
+    if !std::path::Path::new(&req.cwd).is_dir() {
+        return Err(RpcError::new("spawn_failed", format!("missing working directory {}", req.cwd), ""));
+    }
+    let settings = crate::config::load(&core.paths.config)?;
+    let resolved = presets::resolve(Some(&req.agent), &[], None, &settings.agents)?;
+
+    let (wrapped_argv, sandbox_mode) = crate::drove::sandbox::wrap_worker_argv(
+        &resolved.argv,
+        &core.drove.paths,
+        &req.cwd,
+        req.access,
+        req.isolate_secrets,
+    );
+
+    let bin_dir = ensure_drove_bin_links(&core.drove.paths.state_dir);
+    let base_env = crate::platform::program_env().await;
+    let mut env = child_env(base_env, req.env);
+    if let Some(bdir) = bin_dir {
+        let old = env.get("PATH").cloned().unwrap_or_default();
+        let combined = if old.is_empty() { bdir } else { format!("{bdir}:{old}") };
+        env.insert("PATH".into(), combined);
+    }
+
+    let mut overrides = BTreeMap::new();
+    if let Some(eff) = &req.effort
+        && !eff.trim().is_empty()
+    {
+        overrides.insert("reasoning_effort".into(), serde_json::Value::String(eff.clone()));
+    }
+
+    let (id, address, env) = {
+        let mut st = core.lock();
+        not_stopping(&st)?;
+        let new = NewAgent {
+            template: None,
+            die_with_parent: false,
+            parent: req.parent.clone(),
+            notify: false,
+            rm: false,
+            keep: false,
+            name: None,
+            labels: req.labels.clone(),
+            argv: wrapped_argv.clone(),
+            cwd: req.cwd.clone(),
+            agent: resolved.preset.clone(),
+            system_prompt: None,
+            model: req.model.clone(),
+            mode: None,
+            inject_mcp: false,
+            permission_mode: crate::permissions::PermissionMode::ApproveAll,
+        };
+        let id = st.reg.create(new, now_ms())?;
+        st.recovering.insert(id);
+        let (env, scope) = agent_env(core, id, &req.cwd, env);
+        let a = st.reg.agents.get_mut(&id).expect("just created");
+        a.scope = Some(scope);
+        a.title = req.title.clone();
+        a.config_overrides = overrides.clone();
+        let addr = a.address.clone();
+        core.save(&st);
+        (id, addr, env)
+    };
+
+    let mcp_exe = crate::client::exe_path().map(|exe| exe.display().to_string()).unwrap_or_else(|| "herdr2".into());
+    let spec = SpawnSpec {
+        address: address.clone(),
+        argv: wrapped_argv,
+        env,
+        cwd: req.cwd,
+        resume_session_id: None,
+        can_load_session: false,
+        system_prompt: None,
+        model: req.model,
+        mode: None,
+        dangerously_skip_permissions: true,
+        config_overrides: overrides,
+        inject_mcp: false,
+        mcp_exe,
+        socket: core.paths.socket.display().to_string(),
+    };
+
+    let started = match acp::spawn_session(spec).await {
+        Ok(started) => started,
+        Err(err) => {
+            let mut st = core.lock();
+            st.recovering.remove(&id);
+            core.remove(&mut st, id);
+            return Err(err);
+        }
+    };
+
+    let pid = {
+        let mut st = core.lock();
+        st.recovering.remove(&id);
+        if st.stopping || st.killing.contains(&id) || !st.reg.agents.get(&id).is_some_and(Agent::is_live) {
+            started.transport.kill();
+            core.remove(&mut st, id);
+            return Err(RpcError::new("unavailable", "the core is stopping", "run it again once restarted"));
+        }
+        let agent_info = started.agent_info.clone();
+        let acp_sid = started.session_id.clone();
+        let can_load = started.can_load_session;
+        let config_options = started.config_options.clone();
+        let handle = acp::spawn_actor(core.clone(), id, started);
+        let pid = handle.transport.pid();
+        st.sessions.insert(id, handle);
+        let a = st.reg.agents.get_mut(&id).expect("just created");
+        a.pid = pid;
+        a.acp_session_id = Some(acp_sid);
+        a.can_load_session = can_load;
+        a.config_options = config_options;
+        acp::sync_config_to_agent(a);
+        if agent_info.is_some() {
+            a.agent_info = agent_info;
+        }
+        a.program_started_ms = Some(now_ms());
+        a.reported = true;
+        let _ = crate::status::apply(a, &StatusReport::root("idle"));
+        let created = a.clone();
+        let public = serde_json::to_value(Public(created)).unwrap_or_default();
+        core.emit(&mut st, "created", id, public);
+        core.save(&st);
+        core.changed.notify_waiters();
+        pid
+    };
+    core.flush_saved().await?;
+    Ok(DroveSpawnResult { agent_id: id, address, pid, sandbox_mode })
+}
+
+/// Updates a live agent's `title` and `labels` and broadcasts `title` + `labels` events to subscribers.
+pub(crate) fn update_agent_display(
+    core: &Core,
+    id: u32,
+    title: String,
+    labels_patch: BTreeMap<String, Option<String>>,
+) {
+    let mut st = core.lock();
+    let was = st.reg.agents.get(&id).cloned();
+    let Some(a) = st.reg.agents.get_mut(&id) else {
+        return;
+    };
+    if !a.is_live() {
+        return;
+    }
+    a.title = title.clone();
+    for (k, v) in labels_patch {
+        match v {
+            Some(val) if !val.is_empty() => {
+                a.labels.insert(k, val);
+            }
+            _ => {
+                a.labels.remove(&k);
+            }
+        }
+    }
+    let labels = serde_json::to_value(&a.labels).unwrap_or_default();
+    core.emit(&mut st, "title", id, serde_json::json!({ "title": title }));
+    core.emit_from(&mut st, "labels", id, serde_json::json!({ "labels": labels }), was.as_ref());
+    core.save(&st);
+    core.changed.notify_waiters();
+}
+
+#[cfg(unix)]
+fn ensure_drove_bin_links(state_dir: &std::path::Path) -> Option<String> {
+    let exe = crate::client::exe_path()?;
+    let bin_dir = state_dir.join("bin");
+    let _ = std::fs::create_dir_all(&bin_dir);
+    for name in ["h2", "drove", "herdr2"] {
+        let link = bin_dir.join(name);
+        if !link.exists() {
+            let _ = std::os::unix::fs::symlink(&exe, &link);
+        }
+    }
+    Some(bin_dir.display().to_string())
+}
+
+#[cfg(not(unix))]
+fn ensure_drove_bin_links(state_dir: &std::path::Path) -> Option<String> {
+    let exe = crate::client::exe_path()?;
+    let bin_dir = state_dir.join("bin");
+    if std::fs::create_dir_all(&bin_dir).is_err() {
+        return exe.parent().map(|d| d.display().to_string());
+    }
+    for name in ["h2.exe", "drove.exe", "herdr2.exe"] {
+        let link = bin_dir.join(name);
+        if !link.exists() && std::fs::hard_link(&exe, &link).is_err() {
+            let _ = std::fs::copy(&exe, &link);
+        }
+    }
+    Some(bin_dir.display().to_string())
 }
 
 #[cfg(test)]

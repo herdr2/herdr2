@@ -14,7 +14,7 @@ pub(super) fn wait_timeout(core: &Core, given: Option<f64>) -> Result<Duration, 
 }
 
 pub(super) async fn agent_wait(core: Ctx<'_>, p: WaitParams) -> Result<WaitResult, RpcError> {
-    wait_impl(core, p.agent, p.children, p.output, p.timeout, p.caller, false).await
+    wait_impl(core, p.agent, p.children, p.output, p.timeout, p.no_timeout, p.caller, false).await
 }
 
 pub(super) async fn wait_impl(
@@ -23,12 +23,23 @@ pub(super) async fn wait_impl(
     children: Option<Children>,
     output: Option<String>,
     timeout: Option<f64>,
+    no_timeout: bool,
     caller: Option<String>,
     pty_only: bool,
 ) -> Result<WaitResult, RpcError> {
-    let timeout = wait_timeout(core, timeout)?;
+    let timeout = if no_timeout { None } else { Some(wait_timeout(core, timeout)?) };
     if let Some(mode) = children {
-        let result = wait_children_everywhere(core, target_name, children, output, Some(timeout.as_secs_f64()), caller, &word(&mode), timeout).await;
+        let result = wait_children_everywhere(
+            core,
+            target_name,
+            children,
+            output,
+            timeout.map(|t| t.as_secs_f64()),
+            caller,
+            &word(&mode),
+            timeout,
+        )
+        .await;
         core.flush_saved().await?;
         return result;
     }
@@ -243,7 +254,7 @@ pub(super) async fn wait_children_everywhere(
     timeout_secs: Option<f64>,
     caller: Option<String>,
     mode: &str,
-    timeout: Duration,
+    timeout: Option<Duration>,
 ) -> Result<WaitResult, RpcError> {
     let (parent, parent_addr) = children_of(core, target_name.as_deref(), caller.as_deref())?;
     let afar: Vec<crate::machines::Machine> = {
@@ -270,12 +281,16 @@ pub(super) async fn wait_children_everywhere(
             TargetKey::Agent(_) => ("agent.wait", "agent"),
             TargetKey::Terminal(_) => ("terminal.wait", "terminal"),
         };
-        let params = json!({
+        let mut params = json!({
             field: format!("{}/{}", core.info.id, parent.address()),
             "children": mode,
-            "timeout": timeout.as_secs_f64(),
             "caller": caller.as_ref().map(|c| format!("{}/{c}", core.info.id)),
         });
+        if let Some(t) = timeout {
+            params["timeout"] = json!(t.as_secs_f64());
+        } else {
+            params["no_timeout"] = json!(true);
+        }
         let c = core.clone();
         sides.spawn(async move {
             let r = crate::remote::forward(&c, &machine, method, params).await?;
@@ -308,7 +323,7 @@ pub(super) async fn wait_children(
     caller: Option<String>,
     output: Option<String>,
     mode: &str,
-    timeout: Duration,
+    timeout: Option<Duration>,
     others: bool,
 ) -> Result<WaitResult, RpcError> {
     if output.is_some() {
@@ -365,7 +380,7 @@ pub(super) async fn wait_children(
         false => k.news() > start.get(&k.key()).copied().unwrap_or(0),
     };
     let seen = |keys: &[TargetKey]| keys.iter().for_each(|&k| has_seen(core, caller.as_deref(), k));
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = timeout.map(|t| tokio::time::Instant::now() + t);
     loop {
         let changed = core.changed.notified();
         tokio::pin!(changed);
@@ -398,10 +413,15 @@ pub(super) async fn wait_children(
             }
             return Ok(r);
         }
-        if tokio::time::Instant::now() >= deadline {
+        if deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
             let children = kids.iter().filter(|k| k.is_live()).map(|k| k.as_is(!k.busy())).collect();
             return Ok(WaitResult { ended: false, reason: "timeout".into(), ..done(children) });
         }
-        let _ = tokio::time::timeout_at(deadline, changed).await;
+        match deadline {
+            Some(d) => {
+                let _ = tokio::time::timeout_at(d, changed).await;
+            }
+            None => changed.await,
+        }
     }
 }

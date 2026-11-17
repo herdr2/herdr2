@@ -848,13 +848,20 @@ fn exec_limit(options: Option<&HostValue>) -> Result<Duration, HostError> {
 pub(crate) fn run_blocking(command: &str, args: &[String], cwd: Option<String>, limit: Duration) -> Result<(i32, String, String), String> {
     use std::io::Read;
     // Shipped/custom mods may call either `hc(...)` or `h2(...)`; both use the resolved herdr2 core.
-    let program = if command == "hc" || command == "h2" { crate::core_bin::path() } else { PathBuf::from(command) };
-    let mut child = crate::spawn::command(program)
-        .args(args)
+    let is_core = command == "hc" || command == "h2";
+    let program = if is_core { crate::core_bin::path() } else { PathBuf::from(command) };
+    let mut cmd = crate::spawn::command(program);
+    cmd.args(args)
         .current_dir(cwd.map(PathBuf::from).unwrap_or_else(home))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if is_core {
+        for var in ["H2_TERMINAL_ID", "H2_TERMINAL_SOCKET", "H2_AGENT_ID", "H2_AGENT_SOCKET"] {
+            cmd.env_remove(var);
+        }
+    }
+    let mut child = cmd
         .spawn()
         .map_err(|e| format!("cannot run {command}: {e}"))?;
     // Bounded: a chatty command can't fill memory; the rest is drained and dropped.

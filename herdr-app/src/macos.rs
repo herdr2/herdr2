@@ -70,7 +70,6 @@ pub(crate) fn menus(layouts: &[String], shown: Option<&str>) -> Vec<Menu> {
         .chain([MenuItem::separator(), command("Next Layout", "layout.switch")]);
     vec![
         Menu::new("Herdr").items([
-            command("What's New", "app.whats_new"),
             command("Check for Updates…", "app.settings:updates"),
             MenuItem::separator(),
             command("Settings…", "app.settings"),

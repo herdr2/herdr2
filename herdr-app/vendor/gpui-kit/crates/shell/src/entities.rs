@@ -182,6 +182,21 @@ pub(crate) struct PlainScrollHandle {
     pub(crate) pending: Rc<Cell<Option<usize>>>,
 }
 
+// HERDR: optional editor UI surface and chrome color overrides.
+#[derive(Default, serde::Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct EditorColors {
+    pub background: Option<String>,
+    pub foreground: Option<String>,
+    pub gutter: Option<String>,
+    pub line_number: Option<String>,
+    pub active_line: Option<String>,
+    pub selection: Option<String>,
+    pub caret: Option<String>,
+    pub border: Option<String>,
+    pub invisible: Option<String>,
+}
+
 // HERDR: script editor construction options, decoded before retaining any state.
 #[derive(serde::Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -193,6 +208,7 @@ pub(crate) struct EditorOptions {
     pub readonly: bool,
     pub soft_wrap: bool,
     pub syntax: HashMap<String, String>,
+    pub colors: EditorColors,
     pub font_family: Option<String>,
     pub font_size: Option<f32>,
 }
@@ -207,6 +223,7 @@ impl Default for EditorOptions {
             readonly: false,
             soft_wrap: false,
             syntax: HashMap::new(),
+            colors: EditorColors::default(),
             font_family: None,
             font_size: None,
         }

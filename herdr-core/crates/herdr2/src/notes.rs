@@ -4,7 +4,9 @@
 
 use crate::acp::{QueuedPrompt, SessionCommand};
 use crate::agents::Agent;
+#[allow(unused_imports)]
 use crate::pty_input::{Step, paste};
+#[allow(unused_imports)]
 use crate::rpc::RpcError;
 use crate::runtime::{Core, State, TargetKey, now_ms};
 use crate::terminals::Terminal;
@@ -73,6 +75,7 @@ fn can_take_note(a: &Agent) -> bool {
 
 /// A parent PTY terminal can take a note when live, reported as an agent, not
 /// on a permission dialog, and running its program.
+#[allow(dead_code)]
 fn pty_can_take_note(t: &Terminal) -> bool {
     t.is_live() && t.reported && !pty_blocked(t) && t.check_program().is_ok()
 }
@@ -189,7 +192,9 @@ impl Core {
             a.seen = a.news;
         }
         match (parent_key(a.parent.as_deref()), &a.parent) {
-            (Some(p), _) if a.notify => drop(self.jobs.send(Job::Notes(p))),
+            // Only ACP parents receive background note injections into their inbox;
+            // PTY terminal agents collect updates exclusively via `h2 wait` / `h2 read`.
+            (Some(p @ TargetKey::Agent(_)), _) if a.notify => drop(self.jobs.send(Job::Notes(p))),
             (None, Some(afar)) if a.notify => drop(self.jobs.send(Job::NotesAfar(afar.clone()))),
             _ => {}
         }
@@ -203,7 +208,7 @@ impl Core {
             t.seen = t.news;
         }
         match (parent_key(t.parent.as_deref()), &t.parent) {
-            (Some(p), _) if t.notify => drop(self.jobs.send(Job::Notes(p))),
+            (Some(p @ TargetKey::Agent(_)), _) if t.notify => drop(self.jobs.send(Job::Notes(p))),
             (None, Some(afar)) if t.notify => drop(self.jobs.send(Job::NotesAfar(afar.clone()))),
             _ => {}
         }
@@ -220,6 +225,7 @@ impl Core {
             a.seen = a.news;
             a.seen_ms = Some(now_ms());
             self.save(&st);
+            self.clear_manual_status_caller_locked(&mut st, caller);
         }
     }
 
@@ -234,6 +240,77 @@ impl Core {
             t.seen = t.news;
             t.seen_ms = Some(now_ms());
             self.save_pty(&st);
+            self.clear_manual_status_caller_locked(&mut st, caller);
+        }
+    }
+
+    /// Clears a manual `herdr.status` override on ACP agent `id`, restoring automatic recognition.
+    pub(crate) fn clear_manual_status_agent_locked(&self, st: &mut State, id: u32) -> bool {
+        if !st.reg.agents.get(&id).is_some_and(|a| a.labels.contains_key("herdr.status")) {
+            return false;
+        }
+        let was = st.reg.agents.get(&id).cloned();
+        st.reg.agents.get_mut(&id).expect("checked").labels.remove("herdr.status");
+        let labels = serde_json::to_value(&st.reg.agents[&id].labels).unwrap_or_default();
+        self.save(st);
+        self.emit_from(st, "labels", id, serde_json::json!({"labels": labels}), was.as_ref());
+        true
+    }
+
+    /// Clears a manual `herdr.status` override on PTY terminal `id`, restoring automatic recognition.
+    pub(crate) fn clear_manual_status_pty_locked(&self, st: &mut State, id: u32) -> bool {
+        if !st.pty_reg.terminals.get(&id).is_some_and(|t| t.labels.contains_key("herdr.status")) {
+            return false;
+        }
+        let was = st.pty_reg.terminals.get(&id).cloned();
+        st.pty_reg.terminals.get_mut(&id).expect("checked").labels.remove("herdr.status");
+        let labels = serde_json::to_value(&st.pty_reg.terminals[&id].labels).unwrap_or_default();
+        self.save_pty(st);
+        self.emit_pty_from(st, "labels", id, serde_json::json!({"labels": labels}), was.as_ref());
+        true
+    }
+
+    /// Clears `herdr.status` on target `key`.
+    pub(crate) fn clear_manual_status_key(&self, key: TargetKey) {
+        let mut st = self.lock();
+        match key {
+            TargetKey::Agent(id) => {
+                self.clear_manual_status_agent_locked(&mut st, id);
+            }
+            TargetKey::Terminal(id) => {
+                self.clear_manual_status_pty_locked(&mut st, id);
+            }
+        }
+    }
+
+    fn local_target_key(&self, raw: Option<&str>) -> Option<TargetKey> {
+        let s = raw.map(str::trim).filter(|s| !s.is_empty())?;
+        if let Some((prefix, tail)) = s.split_once('/') {
+            if prefix == self.info.name || prefix == self.info.id {
+                return TargetKey::parse(tail);
+            }
+            return None;
+        }
+        TargetKey::parse(s)
+    }
+
+    /// Clears `herdr.status` on a local `caller`/`from` address while already holding `State`.
+    pub(crate) fn clear_manual_status_caller_locked(&self, st: &mut State, caller: Option<&str>) {
+        let Some(key) = self.local_target_key(caller) else { return };
+        match key {
+            TargetKey::Agent(id) => {
+                self.clear_manual_status_agent_locked(st, id);
+            }
+            TargetKey::Terminal(id) => {
+                self.clear_manual_status_pty_locked(st, id);
+            }
+        }
+    }
+
+    /// Clears `herdr.status` on a local `caller`/`from` address.
+    pub(crate) fn clear_manual_status_caller(&self, caller: Option<&str>) {
+        if let Some(key) = self.local_target_key(caller) {
+            self.clear_manual_status_key(key);
         }
     }
 
@@ -263,7 +340,7 @@ impl Core {
             return format!("<h2 from=\"{afar}\">{text}</h2>");
         }
         match self.sender_label(&st, from, TargetKey::Agent(to)) {
-            Some((label, addr)) if reach => {
+            Some((label, addr)) if reach && TargetKey::parse(&addr).is_some_and(|k| matches!(k, TargetKey::Agent(_))) => {
                 format!("<h2 from=\"{label}\" reach=\"h2 send {addr} when done or stuck\">{text}</h2>")
             }
             Some((label, _)) => format!("<h2 from=\"{label}\">{text}</h2>"),
@@ -400,7 +477,13 @@ impl Core {
     async fn deliver_notes(self: Arc<Self>, parent: TargetKey) {
         match parent {
             TargetKey::Agent(id) => self.deliver_acp_notes(id).await,
-            TargetKey::Terminal(id) => self.deliver_pty_notes(id).await,
+            TargetKey::Terminal(id) => {
+                // Terminal parents must never receive automatic PTY stdin injections;
+                // they receive messages/updates strictly via `h2 wait` / `h2 read`.
+                let mut st = self.lock();
+                st.afar_notes.remove(&TargetKey::Terminal(id));
+                st.note_tasks.remove(&TargetKey::Terminal(id));
+            }
         }
     }
 
@@ -467,6 +550,7 @@ impl Core {
         if let Some(session) = st.sessions.get(&parent) {
             let _ = session.cmd_tx.send(SessionCommand::WakeInbox);
         }
+        self.clear_manual_status_agent_locked(&mut st, parent);
         self.save(&st);
         if !told_pty.is_empty() {
             self.save_pty(&st);
@@ -474,6 +558,7 @@ impl Core {
         true
     }
 
+    #[allow(dead_code)]
     async fn deliver_pty_notes(self: Arc<Self>, parent: u32) {
         let enabled = self.notes_on();
         let key = TargetKey::Terminal(parent);
@@ -499,6 +584,7 @@ impl Core {
         self.lock().note_tasks.remove(&key);
     }
 
+    #[allow(dead_code)]
     async fn type_pty_note(&self, parent: u32) -> Result<bool, RpcError> {
         let quiet = crate::config::delivery(&self.paths.config).notes_quiet.unwrap_or_else(crate::pty_input::quiet);
         let key = TargetKey::Terminal(parent);

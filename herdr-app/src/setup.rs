@@ -179,12 +179,20 @@ impl Setup {
             Need::Fix(Mismatch::TooOld { have, need }) => (
                 "Herdr2 needs a newer h2".into(),
                 format!("Yours is {have}; this Herdr2 needs {need} or newer. Updating keeps your agents running."),
-                "Or update it yourself: h2 update".into(),
+                if std::env::var_os("HERDR2_RELEASES_URL").is_none() {
+                    "Install a newer h2 binary (or run h2 server restart) and click Update h2 / Retry.".into()
+                } else {
+                    "Or update it yourself: h2 update".into()
+                },
             ),
             Need::Fix(Mismatch::Missing(methods)) => (
                 "Herdr2 needs a newer h2".into(),
                 format!("Your h2 core can't do everything this Herdr2 needs ({}). Updating keeps your agents running.", methods.join(", ")),
-                "Or update it yourself: h2 update".into(),
+                if std::env::var_os("HERDR2_RELEASES_URL").is_none() {
+                    "Install a newer h2 binary (or run h2 server restart) and click Update h2 / Retry.".into()
+                } else {
+                    "Or update it yourself: h2 update".into()
+                },
             ),
             Need::Fix(Mismatch::Newer { generation }) => (
                 "This Herdr2 is older than your h2 core".into(),
@@ -229,7 +237,8 @@ impl Render for Setup {
             Need::Fix(_) => div()
                 .flex()
                 .gap(px(10.0))
-                .child(button("update", "Update h2", true).when(!busy, |d| d.on_click(cx.listener(|this, _, w, cx| this.update(w, cx))))),
+                .child(button("update", "Update h2", true).when(!busy, |d| d.on_click(cx.listener(|this, _, w, cx| this.update(w, cx)))))
+                .child(button("retry", "Retry", false).when(!busy, |d| d.on_click(cx.listener(|this, _, w, cx| this.start(w, cx))))),
         };
         div()
             .size_full()

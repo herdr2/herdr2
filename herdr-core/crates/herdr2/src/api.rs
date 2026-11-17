@@ -24,6 +24,7 @@ pub const FEATURES: &[&str] = &[
     "resize_notifications",
     "automatic_input",
     "restart_environment",
+    "drove",
 ];
 pub const FINISHED_LINES: usize = 1000;
 /// Agent and terminal identity variables stripped unless explicitly passed by a caller.
@@ -31,7 +32,7 @@ pub const IDENTITY_VARS: &[&str] = &["H2_AGENT_ID", "H2_AGENT_SOCKET", "H2_TERMI
 
 mod doc;
 mod pty;
-mod run;
+pub(crate) mod run;
 mod types;
 use doc::*;
 use pty::*;
@@ -121,6 +122,9 @@ methods! { Ctx<'_>;
     "agent.deny" => agent_deny, ApproveParams => ApproveResult,
         "Deny or cancel a blocked agent's pending ACP `session/request_permission` prompt.",
         errors ["not_found", "machine_unknown", "finished", "invalid_state", "invalid_params"];
+    "agent.config" => agent_config, ConfigParams => Public,
+        "Set a live ACP session configuration option (model, reasoning effort, fast mode, session mode) and return the updated agent record.",
+        errors ["not_found", "machine_unknown", "finished", "unavailable", "invalid_params", "spawn_failed"];
     "agent.put" => agent_put, PutParams => PutResult,
         "Write bytes to a file beside a live agent, on its machine, for it to read. Lands in an isolated directory removed with the agent.",
         errors ["not_found", "machine_unknown", "finished", "invalid_params"];
@@ -202,6 +206,30 @@ methods! { Ctx<'_>;
     "machine.rm" => machine_rm, MachineParams => RemoveResult,
         "Forget a machine. Its agents keep running there.",
         errors ["machine_unknown"];
+    "drove.settings.get" => drove_settings_get, DroveOnParams => crate::drove::types::DroveSettingsResult,
+        "Read Drove roles, AI configuration, optional Magpie settings, and known ACP agents.",
+        errors ["machine_unknown", "unavailable"];
+    "drove.settings.set" => drove_settings_set, crate::drove::types::DroveSettingsSetParams => crate::drove::types::DroveSettingsResult,
+        "Update Drove configuration and secrets (0600).",
+        errors ["invalid_params", "machine_unknown", "unavailable"];
+    "drove.probe" => drove_probe, DroveProbeParams => crate::drove::types::ProbeSnapshot,
+        "Probe installed ACP agents and discover their model and effort options.",
+        errors ["machine_unknown", "unavailable"];
+    "drove.ai.test" => drove_ai_test, DroveAiTestParams => crate::drove::probe::AiTestResult,
+        "Test generic OpenAI-compatible AI endpoint URL and API key.",
+        errors ["invalid_params", "machine_unknown", "unavailable"];
+    "drove.magpie.test" => drove_magpie_test, DroveMagpieTestParams => crate::drove::magpie::MagpieTestResult,
+        "Test optional Magpie quota gateway connectivity.",
+        errors ["invalid_params", "machine_unknown", "unavailable"];
+    "drove.web.open" => drove_web_open, DroveWebOpenParams => crate::drove::types::DroveWebOpenResult,
+        "Return or open the Drove Web UI URL (proxying open requests back to desktop peers over SSH).",
+        errors ["invalid_params", "machine_unknown", "unavailable"];
+    "drove.http_proxy" => drove_http_proxy, crate::drove::http::HttpProxyRequest => crate::drove::http::HttpProxyResponse,
+        "Internal HTTP federation proxy for Drove Web across connected SSH machines.",
+        errors ["invalid_params", "machine_unknown", "unavailable"];
+    "drove.subscribe" => drove_subscribe, Empty => DroveSubscribeResult,
+        "Subscribe to Drove change and item events on a framed connection.",
+        errors ["needs_framed"];
     "rpc.discover" => rpc_discover, Empty => serde_json::Value,
         "The whole API as an OpenRPC document: every method with its params, result and errors in JSON Schema.",
         errors [];
@@ -302,6 +330,13 @@ async fn templates_list(core: Ctx<'_>, _: Empty) -> Result<TemplatesResult, RpcE
     Ok(TemplatesResult { templates: crate::templates::list(&core.paths) })
 }
 
+fn compact_list_entry(mut v: serde_json::Value) -> serde_json::Value {
+    if let Some(obj) = v.as_object_mut() {
+        obj.remove("config_options");
+    }
+    v
+}
+
 async fn agent_list(core: Ctx<'_>, p: ListParams) -> Result<ListResult, RpcError> {
     let afar = from_afar(core);
     let (mut agents, mut hidden_finished, machines) = {
@@ -311,7 +346,7 @@ async fn agent_list(core: Ctx<'_>, p: ListParams) -> Result<ListResult, RpcError
             st.reg.agents.values().filter(|a| p.labels.iter().all(|Label(k, v)| a.labels.get(k) == Some(v))).collect();
         let hidden = if p.all { 0 } else { matching.iter().filter(|a| !a.is_live()).count() };
         let agents: Vec<serde_json::Value> =
-            matching.into_iter().filter(|a| p.all || a.is_live()).cloned().map(|a| json!(Public(a))).collect();
+            matching.into_iter().filter(|a| p.all || a.is_live()).cloned().map(|a| compact_list_entry(json!(Public(a)))).collect();
         let machines = if afar { Vec::new() } else { st.machines.clone() };
         (agents, hidden, machines)
     };
@@ -327,7 +362,7 @@ async fn agent_list(core: Ctx<'_>, p: ListParams) -> Result<ListResult, RpcError
         .collect();
     for ask in asks {
         if let Ok(Some(r)) = ask.await {
-            agents.extend(r["agents"].as_array().cloned().unwrap_or_default());
+            agents.extend(r["agents"].as_array().cloned().unwrap_or_default().into_iter().map(compact_list_entry));
             hidden_finished += r["hidden_finished"].as_u64().unwrap_or(0) as usize;
         }
     }
@@ -425,20 +460,40 @@ async fn agent_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError
             let term_addr = crate::terminals::address(id);
             if p.wait {
                 let timeout = wait_timeout(core, p.timeout)?;
-                let spec = WaitSpec { output: None, timeout, after_turn: None };
+                let spec = WaitSpec { output: None, timeout: Some(timeout), after_turn: None };
                 let _ = watched(core, p.caller.clone(), TargetKey::Terminal(id), spec).await;
             }
+            let snap = (!p.last && p.lines.is_none()).then(|| {
+                let st = core.lock();
+                st.pty_reg
+                    .terminals
+                    .get(&id)
+                    .map(|t| crate::pty_transcript::snapshot_from_terminal(t, st.pty_prompts.get(&id)))
+            }).flatten();
+            let entries = if let Some(snap) = snap {
+                blocking(move || Ok(crate::pty_transcript::extract_entries(&snap))).await?
+            } else {
+                Vec::new()
+            };
+            let lines = match p.lines {
+                Some(n) => n,
+                None if !entries.is_empty() => 0,
+                None => {
+                    if core.lock().screens.get(&id).is_some_and(|s| s.alt_screen()) { 0 } else { 160 }
+                }
+            };
             let r = terminal_read(
                 core,
-                TerminalReadParams { terminal: term_addr, caller: p.caller, lines: p.lines.unwrap_or(0) },
+                TerminalReadParams { terminal: term_addr, caller: p.caller, lines },
             )
             .await?;
-            Ok(ReadResult { text: r.text, complete: r.complete, how: r.how, why: r.why, entries: Vec::new() })
+            let how = if !entries.is_empty() { "transcript".into() } else { r.how };
+            Ok(ReadResult { text: r.text, complete: r.complete, how, why: r.why, entries })
         }
         TargetKey::Agent(id) => {
             let timeout = if p.wait { Some(wait_timeout(core, p.timeout)?) } else { None };
             if let Some(timeout) = timeout {
-                let spec = WaitSpec { output: None, timeout, after_turn: None };
+                let spec = WaitSpec { output: None, timeout: Some(timeout), after_turn: None };
                 let _ = watched(core, p.caller.clone(), TargetKey::Agent(id), spec).await;
             } else {
                 core.saw(p.caller.as_deref(), id);
@@ -479,6 +534,9 @@ async fn agent_send(core: Ctx<'_>, p: SendParams) -> Result<SendResult, RpcError
             let text =
                 if p.text.trim_start().starts_with("<h2") { p.text.clone() } else { core.tagged(sender, id, &p.text, false) };
             let sent = core.send(id, &text, p.steer, p.only_if.map(|w| word(&w)).as_deref(), sender).await?;
+            core.clear_manual_status_key(TargetKey::Agent(id));
+            core.clear_manual_status_caller(p.from.as_deref());
+            core.clear_manual_status_caller(p.caller.as_deref());
             let target_addr = crate::agents::address(id);
             if let Some(caller_key) = sender.and_then(TargetKey::parse) {
                 let mut st = core.lock();
@@ -523,7 +581,7 @@ async fn agent_send(core: Ctx<'_>, p: SendParams) -> Result<SendResult, RpcError
             let wait = if p.wait && sent.started == Some(false) {
                 Some(core.wait_result(target, false, "not_started", None))
             } else if p.wait {
-                let spec = WaitSpec { output: None, timeout, after_turn: Some(sent.after_turn) };
+                let spec = WaitSpec { output: None, timeout: Some(timeout), after_turn: Some(sent.after_turn) };
                 Some(watched(core, p.caller.clone(), target, spec).await)
             } else {
                 None
@@ -551,10 +609,187 @@ async fn agent_deny(core: Ctx<'_>, p: ApproveParams) -> Result<ApproveResult, Rp
 async fn resolve_perm(core: Ctx<'_>, p: ApproveParams, approve: bool) -> Result<ApproveResult, RpcError> {
     let id = resolve(core, &p.agent)?;
     let (request_id, option_id) = core.resolve_permission(id, approve, p.option.as_deref())?;
+    core.clear_manual_status_key(TargetKey::Agent(id));
+    core.clear_manual_status_caller(p.caller.as_deref());
     core.saw(p.caller.as_deref(), id);
     core.flush_saved().await?;
     let outcome = if approve { "approved" } else { "denied" }.into();
     Ok(ApproveResult { agent: crate::agents::address(id), request_id, option_id, outcome })
+}
+
+async fn agent_config(core: Ctx<'_>, p: ConfigParams) -> Result<Public, RpcError> {
+    if p.config_id.trim().is_empty() {
+        return Err(RpcError::invalid_params("--id cannot be empty"));
+    }
+    let val = match (&p.value, p.bool_value) {
+        (Some(v), None) => serde_json::Value::String(v.clone()),
+        (None, Some(b)) => serde_json::Value::Bool(b),
+        (Some(_), Some(_)) => return Err(RpcError::invalid_params("pass either value or bool_value, not both")),
+        (None, None) => return Err(RpcError::invalid_params("pass --value <VALUE> or --bool <true|false>")),
+    };
+    let id = resolve(core, &p.agent)?;
+
+    let need_auto_approve = if p.config_id == "permissions" {
+        apply_permissions_config(core, id, &val).await?
+    } else {
+        apply_acp_config(core, id, &p.config_id, val).await?
+    };
+
+    if need_auto_approve {
+        let _ = core.resolve_permission(id, true, None);
+    }
+    let updated = {
+        let mut st = core.lock();
+        core.clear_manual_status_agent_locked(&mut st, id);
+        let (data, snapshot) = {
+            let a = st.reg.agents.get(&id).ok_or_else(|| {
+                RpcError::new("not_found", format!("{} was removed", crate::agents::address(id)), "see `h2 ls --all`")
+            })?;
+            (crate::acp::config_event_data(a), Public(a.clone()))
+        };
+        core.emit(&mut st, "config", id, data);
+        core.save(&st);
+        core.changed.notify_waiters();
+        snapshot
+    };
+    core.flush_saved().await?;
+    Ok(updated)
+}
+
+async fn apply_permissions_config(core: Ctx<'_>, id: u32, val: &serde_json::Value) -> Result<bool, RpcError> {
+    let raw_str = val.as_str().map(str::trim);
+    let next_perm = match val {
+        serde_json::Value::String(s) => s.parse::<crate::permissions::PermissionMode>().map_err(RpcError::invalid_params)?,
+        serde_json::Value::Bool(true) => crate::permissions::PermissionMode::ApproveAll,
+        serde_json::Value::Bool(false) => crate::permissions::PermissionMode::ApproveReads,
+        _ => unreachable!(),
+    };
+    let wants_bypass = next_perm == crate::permissions::PermissionMode::ApproveAll
+        && (val.as_bool() == Some(true) || raw_str.is_some_and(crate::permissions::is_bypass_mode_id));
+    let live_bypass = {
+        let st = core.lock();
+        let a = st.reg.agents.get(&id).ok_or_else(|| {
+            RpcError::new("not_found", format!("{} was removed", crate::agents::address(id)), "see `h2 ls --all`")
+        })?;
+        if !a.is_live() {
+            return Err(RpcError::new("finished", format!("{} has finished", a.address), ""));
+        }
+        a.check_program()?;
+        if wants_bypass
+            && let Some((wire_mode, src)) = crate::acp::bypass_mode_for_options(&a.config_options)
+            && let Some(sid) = a.acp_session_id.clone()
+            && let Some(tr) = st.sessions.get(&id).map(|h| h.transport.clone())
+        {
+            Some((sid, wire_mode, src, tr))
+        } else {
+            None
+        }
+    };
+    let fresh_mode = if let Some((sid, wire_mode, src, tr)) = live_bypass {
+        let v = serde_json::Value::String(wire_mode);
+        let opts = crate::acp::apply_config_option(&tr, &sid, "mode", &v, src.as_deref()).await?;
+        Some((v, opts))
+    } else {
+        None
+    };
+
+    let mut st = core.lock();
+    let a = st.reg.agents.get_mut(&id).ok_or_else(|| {
+        RpcError::new("not_found", format!("{} was removed", crate::agents::address(id)), "see `h2 ls --all`")
+    })?;
+    if !a.is_live() {
+        return Err(RpcError::new("finished", format!("{} has finished", a.address), ""));
+    }
+    a.permission_mode = next_perm;
+    if let Some((v, opts)) = fresh_mode {
+        a.config_overrides.insert("mode".into(), v.clone());
+        if let Some(fresh_opts) = opts {
+            a.config_options = fresh_opts;
+        } else {
+            crate::acp::patch_config_value(&mut a.config_options, "mode", &v);
+        }
+        crate::acp::sync_config_to_agent(a);
+    }
+    Ok(next_perm == crate::permissions::PermissionMode::ApproveAll && st.pending_perms.contains_key(&id))
+}
+
+async fn apply_acp_config(
+    core: Ctx<'_>,
+    id: u32,
+    config_id: &str,
+    val: serde_json::Value,
+) -> Result<bool, RpcError> {
+    let default_permissions = crate::config::load(&core.paths.config)
+        .ok()
+        .and_then(|c| c.default_permissions)
+        .unwrap_or_default();
+    let (session_id, source, transport, is_claude, mode_choices) = {
+        let st = core.lock();
+        let a = st.reg.agents.get(&id).ok_or_else(|| {
+            RpcError::new("not_found", format!("{} was removed", crate::agents::address(id)), "see `h2 ls --all`")
+        })?;
+        if !a.is_live() {
+            return Err(RpcError::new("finished", format!("{} has finished", a.address), ""));
+        }
+        a.check_program()?;
+        let session_id = a.acp_session_id.clone().ok_or_else(|| {
+            RpcError::new("unavailable", format!("{} ACP session is still starting", a.address), "retry shortly")
+        })?;
+        let source = a.config_options.iter().find(|o| o.id == config_id).map(|o| o.source.clone());
+        let is_claude = crate::acp::presets::is_claude_agent(a.agent.as_deref(), &a.argv);
+        let mode_choices = a
+            .config_options
+            .iter()
+            .find(|o| o.id == "mode" || o.category.as_deref() == Some("mode"))
+            .map(|o| o.options.clone())
+            .unwrap_or_default();
+        let transport = st
+            .sessions
+            .get(&id)
+            .map(|h| h.transport.clone())
+            .ok_or_else(|| RpcError::new("unavailable", format!("{} has no active ACP transport", a.address), ""))?;
+        (session_id, source, transport, is_claude, mode_choices)
+    };
+
+    let val = if config_id == "mode"
+        && let Some(raw) = val.as_str()
+    {
+        serde_json::Value::String(crate::acp::normalize_mode_value(raw, is_claude, &mode_choices))
+    } else {
+        val
+    };
+    let wants_bypass = config_id == "mode" && val.as_str().is_some_and(crate::permissions::is_bypass_mode_id);
+
+    let fresh = match crate::acp::apply_config_option(&transport, &session_id, config_id, &val, source.as_deref()).await {
+        Ok(opts) => opts,
+        Err(_) if wants_bypass => None,
+        Err(e) => return Err(e),
+    };
+
+    let mut st = core.lock();
+    let a = st.reg.agents.get_mut(&id).ok_or_else(|| {
+        RpcError::new("not_found", format!("{} was removed", crate::agents::address(id)), "see `h2 ls --all`")
+    })?;
+    if !a.is_live() {
+        return Err(RpcError::new("finished", format!("{} has finished", a.address), ""));
+    }
+    a.config_overrides.insert(config_id.to_owned(), val.clone());
+    if let Some(opts) = fresh {
+        a.config_options = opts;
+    } else {
+        crate::acp::patch_config_value(&mut a.config_options, config_id, &val);
+    }
+    crate::acp::sync_config_to_agent(a);
+    if config_id == "mode"
+        && let Some(m) = val.as_str()
+    {
+        if crate::permissions::is_bypass_mode_id(m) {
+            a.permission_mode = crate::permissions::PermissionMode::ApproveAll;
+        } else if is_claude && a.permission_mode == crate::permissions::PermissionMode::ApproveAll {
+            a.permission_mode = default_permissions;
+        }
+    }
+    Ok(a.permission_mode == crate::permissions::PermissionMode::ApproveAll && st.pending_perms.contains_key(&id))
 }
 
 async fn machine_exec(core: Ctx<'_>, p: ExecParams) -> Result<ExecResult, RpcError> {
@@ -630,6 +865,7 @@ async fn agent_interrupt(core: Ctx<'_>, p: InterruptParams) -> Result<InterruptR
             use crate::input::Interrupted;
             let timeout = seconds(p.timeout)?.unwrap_or(Duration::from_secs(10));
             let (outcome, method) = core.interrupt(id, timeout).await?;
+            core.clear_manual_status_key(TargetKey::Agent(id));
             let outcome = match outcome {
                 Interrupted::Stopped => "stopped",
                 Interrupted::Exited => "exited",
@@ -830,4 +1066,53 @@ async fn machine_rm(core: Ctx<'_>, p: MachineParams) -> Result<RemoveResult, Rpc
 
 async fn rpc_discover(_: Ctx<'_>, _: Empty) -> Result<serde_json::Value, RpcError> {
     Ok(openrpc())
+}
+
+async fn drove_settings_get(
+    core: Ctx<'_>,
+    _: DroveOnParams,
+) -> Result<crate::drove::types::DroveSettingsResult, RpcError> {
+    Ok(core.drove.rpc_settings_get().await)
+}
+
+async fn drove_settings_set(
+    core: Ctx<'_>,
+    p: crate::drove::types::DroveSettingsSetParams,
+) -> Result<crate::drove::types::DroveSettingsResult, RpcError> {
+    core.drove.rpc_settings_set(p).await
+}
+
+async fn drove_probe(core: Ctx<'_>, p: DroveProbeParams) -> Result<crate::drove::types::ProbeSnapshot, RpcError> {
+    core.drove.rpc_probe(p.refresh).await
+}
+
+async fn drove_ai_test(core: Ctx<'_>, p: DroveAiTestParams) -> Result<crate::drove::probe::AiTestResult, RpcError> {
+    core.drove.rpc_ai_test(p.base_url, p.api_key, p.model).await
+}
+
+async fn drove_magpie_test(
+    core: Ctx<'_>,
+    p: DroveMagpieTestParams,
+) -> Result<crate::drove::magpie::MagpieTestResult, RpcError> {
+    core.drove.rpc_magpie_test(p.gateway_url).await
+}
+
+async fn drove_web_open(core: Ctx<'_>, p: DroveWebOpenParams) -> Result<crate::drove::types::DroveWebOpenResult, RpcError> {
+    core.drove.open_web(p.run_id.as_deref(), p.no_open)
+}
+
+async fn drove_http_proxy(
+    core: Ctx<'_>,
+    p: crate::drove::http::HttpProxyRequest,
+) -> Result<crate::drove::http::HttpProxyResponse, RpcError> {
+    core.drove.rpc_http_proxy(p).await
+}
+
+async fn drove_subscribe(core: Ctx<'_>, _: Empty) -> Result<DroveSubscribeResult, RpcError> {
+    let Some(conn) = core.conn else {
+        return Err(RpcError::new("needs_framed", "drove.subscribe needs a framed connection", "send hello with framed: true"));
+    };
+    let val = core.drove.rpc_subscribe(conn)?;
+    let ch = val["channel"].as_u64().unwrap_or(0) as u32;
+    Ok(DroveSubscribeResult { channel: ch })
 }

@@ -1,6 +1,98 @@
 {
   "components": {
     "schemas": {
+      "AcpConfigChoice": {
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "group": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "value",
+          "name"
+        ],
+        "type": "object"
+      },
+      "AcpConfigOption": {
+        "properties": {
+          "category": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "current_value": true,
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "kind": {
+            "description": "`\"select\"` or `\"boolean\"`.",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "options": {
+            "items": {
+              "$ref": "#/components/schemas/AcpConfigChoice"
+            },
+            "type": "array"
+          },
+          "source": {
+            "description": "`\"config\"` (default), `\"legacy_model\"`, or `\"legacy_mode\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "kind",
+          "current_value"
+        ],
+        "type": "object"
+      },
+      "AcpContextUsage": {
+        "properties": {
+          "size": {
+            "description": "Total token capacity of the model's context window.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "used": {
+            "description": "Tokens currently used in the session context window.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "used",
+          "size"
+        ],
+        "type": "object"
+      },
       "Agent": {
         "properties": {
           "address": {
@@ -26,6 +118,24 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "config_options": {
+            "description": "Live session configuration options (model, reasoning effort, fast mode, session mode) advertised by the ACP agent.",
+            "items": {
+              "$ref": "#/components/schemas/AcpConfigOption"
+            },
+            "type": "array"
+          },
+          "context_usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AcpContextUsage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Latest context window token usage reported by ACP `usage_update`."
           },
           "created_ms": {
             "format": "uint64",
@@ -229,6 +339,118 @@
         ],
         "type": "object"
       },
+      "AiSettings": {
+        "properties": {
+          "autoTitle": {
+            "default": true,
+            "type": "boolean"
+          },
+          "baseUrl": {
+            "default": "",
+            "type": "string"
+          },
+          "conflictPolicy": {
+            "default": "warn",
+            "type": "string"
+          },
+          "enabled": {
+            "default": true,
+            "type": "boolean"
+          },
+          "model": {
+            "default": "",
+            "type": "string"
+          },
+          "questionMode": {
+            "default": "draft",
+            "type": "string"
+          },
+          "taskEnrich": {
+            "default": true,
+            "type": "boolean"
+          },
+          "verifyDigest": {
+            "default": true,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "AiSwitches": {
+        "properties": {
+          "autoTitle": {
+            "type": "boolean"
+          },
+          "conflictPolicy": {
+            "type": "string"
+          },
+          "handoverCompact": {
+            "type": "boolean"
+          },
+          "loopDetect": {
+            "type": "string"
+          },
+          "questionMode": {
+            "type": "string"
+          },
+          "taskEnrich": {
+            "type": "boolean"
+          },
+          "verifyDigest": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "verifyDigest",
+          "handoverCompact",
+          "autoTitle",
+          "taskEnrich",
+          "conflictPolicy",
+          "questionMode",
+          "loopDetect"
+        ],
+        "type": "object"
+      },
+      "AiTestResult": {
+        "properties": {
+          "availableModels": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "baseUrl": {
+            "type": "string"
+          },
+          "discoveredModel": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "latencyMs": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "baseUrl",
+          "latencyMs"
+        ],
+        "type": "object"
+      },
       "ApproveResult": {
         "properties": {
           "agent": {
@@ -303,6 +525,76 @@
         ],
         "type": "object"
       },
+      "DaemonAiStatus": {
+        "properties": {
+          "availableModels": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "baseUrl": {
+            "type": "string"
+          },
+          "circuitOpen": {
+            "type": "boolean"
+          },
+          "configured": {
+            "type": "boolean"
+          },
+          "consecutiveFailures": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cooldownUntil": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "keyFilePath": {
+            "type": "string"
+          },
+          "keyMasked": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "keySource": {
+            "type": "string"
+          },
+          "lastError": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "switches": {
+            "$ref": "#/components/schemas/AiSwitches"
+          }
+        },
+        "required": [
+          "enabled",
+          "configured",
+          "keySource",
+          "keyFilePath",
+          "baseUrl",
+          "model",
+          "circuitOpen",
+          "consecutiveFailures",
+          "switches"
+        ],
+        "type": "object"
+      },
       "Display": {
         "description": "What a viewer's own terminal looks like, reported by the client.",
         "properties": {
@@ -373,6 +665,232 @@
         ],
         "type": "object"
       },
+      "DroveAiPatch": {
+        "properties": {
+          "apiKey": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "autoTitle": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "baseUrl": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "clearKey": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "conflictPolicy": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "enabled": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "model": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "questionMode": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "taskEnrich": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "verifyDigest": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "DroveConfig": {
+        "properties": {
+          "ai": {
+            "$ref": "#/components/schemas/AiSettings",
+            "default": {
+              "autoTitle": true,
+              "baseUrl": "",
+              "conflictPolicy": "warn",
+              "enabled": true,
+              "model": "",
+              "questionMode": "draft",
+              "taskEnrich": true,
+              "verifyDigest": true
+            }
+          },
+          "magpie": {
+            "$ref": "#/components/schemas/MagpieSettings",
+            "default": {
+              "enabled": false
+            }
+          },
+          "maxConcurrencyDefault": {
+            "default": 4,
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "roles": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/RoleConfig"
+            },
+            "default": {},
+            "type": "object"
+          },
+          "updatedAt": {
+            "default": "",
+            "type": "string"
+          },
+          "version": {
+            "default": 1,
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "DroveMagpiePatch": {
+        "properties": {
+          "enabled": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "gatewayUrl": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "DroveSettingsResult": {
+        "properties": {
+          "agents": {
+            "$ref": "#/components/schemas/ProbeSnapshot"
+          },
+          "aiStatus": {
+            "$ref": "#/components/schemas/DaemonAiStatus"
+          },
+          "config": {
+            "$ref": "#/components/schemas/DroveConfig"
+          },
+          "configPath": {
+            "type": "string"
+          },
+          "machine": {
+            "type": "string"
+          },
+          "magpieError": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "magpieGatewayResolved": {
+            "type": "string"
+          },
+          "magpieQuotas": {
+            "items": {
+              "$ref": "#/components/schemas/QuotaCard"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "webPort": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "machine",
+          "webPort",
+          "configPath",
+          "config",
+          "aiStatus",
+          "magpieGatewayResolved",
+          "agents"
+        ],
+        "type": "object"
+      },
+      "DroveSubscribeResult": {
+        "properties": {
+          "channel": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "channel"
+        ],
+        "type": "object"
+      },
+      "DroveWebOpenResult": {
+        "properties": {
+          "opened": {
+            "type": "boolean"
+          },
+          "url": {
+            "type": "string"
+          },
+          "viaPeer": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "url",
+          "opened",
+          "viaPeer"
+        ],
+        "type": "object"
+      },
       "Edit": {
         "properties": {
           "new": {
@@ -388,6 +906,16 @@
           "new"
         ],
         "type": "object"
+      },
+      "Effort": {
+        "enum": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "type": "string"
       },
       "Entry": {
         "oneOf": [
@@ -866,6 +1394,22 @@
         ],
         "type": "object"
       },
+      "HttpProxyResponse": {
+        "properties": {
+          "body": true,
+          "status": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status",
+          "body"
+        ],
+        "type": "object"
+      },
       "IdleOrWorking": {
         "enum": [
           "idle",
@@ -1154,6 +1698,56 @@
         ],
         "type": "object"
       },
+      "MagpieSettings": {
+        "properties": {
+          "enabled": {
+            "default": false,
+            "description": "Disabled by default: when false, never probe localhost:3425 and never show quota cards.",
+            "type": "boolean"
+          },
+          "gatewayUrl": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "MagpieTestResult": {
+        "properties": {
+          "cardsCount": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "gatewayUrl": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "providers": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "ok",
+          "gatewayUrl",
+          "cardsCount",
+          "providers"
+        ],
+        "type": "object"
+      },
       "PermissionMode": {
         "enum": [
           "approve-all",
@@ -1162,6 +1756,94 @@
           "ask"
         ],
         "type": "string"
+      },
+      "ProbeSnapshot": {
+        "properties": {
+          "agents": {
+            "items": {
+              "$ref": "#/components/schemas/ProbedAgent"
+            },
+            "type": "array"
+          },
+          "fullProbe": {
+            "default": false,
+            "type": "boolean"
+          },
+          "probedAt": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "probedAt",
+          "agents"
+        ],
+        "type": "object"
+      },
+      "ProbedAgent": {
+        "properties": {
+          "agentInfo": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "command": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "defaultEffort": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "defaultModel": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "efforts": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "installed": {
+            "type": "boolean"
+          },
+          "models": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "command",
+          "installed"
+        ],
+        "type": "object"
       },
       "PublicPermission": {
         "properties": {
@@ -1232,6 +1914,121 @@
         ],
         "type": "object"
       },
+      "QuotaCard": {
+        "properties": {
+          "asOf": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "balance": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "plan": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider": {
+            "type": "string"
+          },
+          "user": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "windows": {
+            "items": {
+              "$ref": "#/components/schemas/QuotaWindow"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "provider"
+        ],
+        "type": "object"
+      },
+      "QuotaWindow": {
+        "properties": {
+          "display": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "pool": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "remaining": {
+            "default": 0.0,
+            "format": "double",
+            "type": "number"
+          },
+          "resetsAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "unlimited": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "used": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
       "ReadResult": {
         "properties": {
           "complete": {
@@ -1277,6 +2074,86 @@
         ],
         "type": "object"
       },
+      "RoleAccessMode": {
+        "enum": [
+          "readonly",
+          "scoped_write",
+          "writable"
+        ],
+        "type": "string"
+      },
+      "RoleConfig": {
+        "properties": {
+          "access": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/RoleAccessMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "allowedPaths": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "fallbacks": {
+            "items": {
+              "$ref": "#/components/schemas/RoleTarget"
+            },
+            "type": "array"
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "primary": {
+            "$ref": "#/components/schemas/RoleTarget"
+          },
+          "prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "primary"
+        ],
+        "type": "object"
+      },
+      "RoleTarget": {
+        "properties": {
+          "agent": {
+            "type": "string"
+          },
+          "effort": {
+            "$ref": "#/components/schemas/Effort",
+            "default": "medium"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "agent"
+        ],
+        "type": "object"
+      },
       "RunResult": {
         "properties": {
           "address": {
@@ -1302,6 +2179,24 @@
               "type": "string"
             },
             "type": "array"
+          },
+          "config_options": {
+            "description": "Live session configuration options (model, reasoning effort, fast mode, session mode) advertised by the ACP agent.",
+            "items": {
+              "$ref": "#/components/schemas/AcpConfigOption"
+            },
+            "type": "array"
+          },
+          "context_usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AcpContextUsage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Latest context window token usage reported by ACP `usage_update`."
           },
           "created_ms": {
             "format": "uint64",
@@ -2688,6 +3583,15 @@
           }
         },
         {
+          "description": "Skip all permission checks (`approve-all` policy plus `bypassPermissions` session mode when supported).",
+          "name": "dangerously_skip_permissions",
+          "required": false,
+          "schema": {
+            "description": "Skip all permission checks (`approve-all` policy plus `bypassPermissions` session mode when supported).",
+            "type": "boolean"
+          }
+        },
+        {
           "description": "Ignored: children end with their parent unless `outlive_parent`.",
           "name": "die_with_parent",
           "required": false,
@@ -2834,7 +3738,7 @@
           }
         },
         {
-          "description": "Permission policy (`approve-all`, `approve-reads`, `deny-all`, `ask`).",
+          "description": "Permission policy (`approve-all`, `approve-reads`, `deny-all`, `ask`, `dangerously-skip-permissions`).",
           "name": "permissions",
           "required": false,
           "schema": {
@@ -2846,7 +3750,7 @@
                 "type": "null"
               }
             ],
-            "description": "Permission policy (`approve-all`, `approve-reads`, `deny-all`, `ask`)."
+            "description": "Permission policy (`approve-all`, `approve-reads`, `deny-all`, `ask`, `dangerously-skip-permissions`)."
           }
         },
         {
@@ -3579,6 +4483,16 @@
           }
         },
         {
+          "description": "Wait indefinitely until status, exit, output, or message (for background runners).",
+          "name": "no_timeout",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Wait indefinitely until status, exit, output, or message (for background runners).",
+            "type": "boolean"
+          }
+        },
+        {
           "description": "End when streamed transcript output after the wait starts contains this text.\nBlocked, error or exit end it too.",
           "name": "output",
           "required": false,
@@ -3842,6 +4756,105 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/ApproveResult"
+        }
+      }
+    },
+    {
+      "description": "Set a live ACP session configuration option (model, reasoning effort, fast mode, session mode) and return the updated agent record.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "finished"
+          },
+          "message": "finished"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "spawn_failed"
+          },
+          "message": "spawn_failed"
+        }
+      ],
+      "name": "agent.config",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The agent: `a7`, a name, or `machine/a7`.",
+          "name": "agent",
+          "required": true,
+          "schema": {
+            "description": "The agent: `a7`, a name, or `machine/a7`.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Boolean option value (`true` or `false`, e.g. for `fast-mode`).",
+          "name": "bool_value",
+          "required": false,
+          "schema": {
+            "description": "Boolean option value (`true` or `false`, e.g. for `fast-mode`).",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Option id to set (e.g. `model`, `reasoning_effort`, `fast-mode`, `mode`).",
+          "name": "config_id",
+          "required": true,
+          "schema": {
+            "description": "Option id to set (e.g. `model`, `reasoning_effort`, `fast-mode`, `mode`).",
+            "type": "string"
+          }
+        },
+        {
+          "description": "String option value (for select options such as model, reasoning effort, or mode).",
+          "name": "value",
+          "required": false,
+          "schema": {
+            "description": "String option value (for select options such as model, reasoning effort, or mode).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/Agent"
         }
       }
     },
@@ -6122,6 +7135,548 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/RemoveResult"
+        }
+      }
+    },
+    {
+      "description": "Read Drove roles, AI configuration, optional Magpie settings, and known ACP agents.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "drove.settings.get",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Another machine; omitted for this core.",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "Another machine; omitted for this core.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/DroveSettingsResult"
+        }
+      }
+    },
+    {
+      "description": "Update Drove configuration and secrets (0600).",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "drove.settings.set",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "ai",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DroveAiPatch"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        {
+          "name": "apiKey",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "clearAiKey",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "config",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DroveConfig"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        {
+          "name": "magpie",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/DroveMagpiePatch"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        {
+          "name": "maxConcurrencyDefault",
+          "required": false,
+          "schema": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "on",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "roles",
+          "required": false,
+          "schema": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/RoleConfig"
+            },
+            "default": null,
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/DroveSettingsResult"
+        }
+      }
+    },
+    {
+      "description": "Probe installed ACP agents and discover their model and effort options.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "drove.probe",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Another machine; omitted for this core.",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "Another machine; omitted for this core.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "refresh",
+          "required": false,
+          "schema": {
+            "default": false,
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ProbeSnapshot"
+        }
+      }
+    },
+    {
+      "description": "Test generic OpenAI-compatible AI endpoint URL and API key.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "drove.ai.test",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "apiKey",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "baseUrl",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "model",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "on",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/AiTestResult"
+        }
+      }
+    },
+    {
+      "description": "Test optional Magpie quota gateway connectivity.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "drove.magpie.test",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "gatewayUrl",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "on",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/MagpieTestResult"
+        }
+      }
+    },
+    {
+      "description": "Return or open the Drove Web UI URL (proxying open requests back to desktop peers over SSH).",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "drove.web.open",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "no_open",
+          "required": false,
+          "schema": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        {
+          "name": "on",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "run_id",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/DroveWebOpenResult"
+        }
+      }
+    },
+    {
+      "description": "Internal HTTP federation proxy for Drove Web across connected SSH machines.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "drove.http_proxy",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "body",
+          "required": false,
+          "schema": {
+            "default": null
+          }
+        },
+        {
+          "name": "headers",
+          "required": false,
+          "schema": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "default": {},
+            "type": "object"
+          }
+        },
+        {
+          "name": "method",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "on",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "path",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "query",
+          "required": false,
+          "schema": {
+            "default": "",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/HttpProxyResponse"
+        }
+      }
+    },
+    {
+      "description": "Subscribe to Drove change and item events on a framed connection.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "needs_framed"
+          },
+          "message": "needs_framed"
+        }
+      ],
+      "name": "drove.subscribe",
+      "paramStructure": "by-name",
+      "params": [],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/DroveSubscribeResult"
         }
       }
     },

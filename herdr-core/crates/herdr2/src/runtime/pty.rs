@@ -191,9 +191,13 @@ impl Core {
         drop(answered);
         let (bye, bye_rx) = mpsc::channel();
         let build = crate::client::build_id();
+        let disk_build = (welcome.build != build && require_current)
+            .then(crate::client::disk_build_id)
+            .flatten();
+        let effective_build = disk_build.as_deref().filter(|d| *d == welcome.build).unwrap_or(build.as_str());
         let current = platform::holder_current(
             &welcome.build,
-            &build,
+            effective_build,
             welcome.draining,
             self.login_session,
             welcome.login_session,
@@ -600,6 +604,7 @@ impl Core {
 
     pub fn pty_remove(&self, st: &mut State, id: u32) {
         let Some(was) = st.pty_reg.terminals.remove(&id) else { return };
+        st.pty_prompts.remove(&id);
         self.emit_pty_from(st, "removed", id, serde_json::json!({}), Some(&was));
         let _ = std::fs::remove_file(self.snapshot_path(id));
         let _ = std::fs::remove_dir_all(crate::put::terminal_dir(&self.paths.state, id));

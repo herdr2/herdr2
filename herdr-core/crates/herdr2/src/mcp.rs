@@ -259,7 +259,14 @@ fn tool_definitions() -> Value {
                     "cwd": { "type": "string", "description": "Working directory" },
                     "model": { "type": "string" },
                     "mode": { "type": "string" },
-                    "permissions": { "type": "string", "enum": ["approve-all", "approve-reads", "deny-all", "ask"] },
+                    "permissions": {
+                        "type": "string",
+                        "enum": ["approve-all", "approve-reads", "deny-all", "ask", "dangerously-skip-permissions", "bypassPermissions"]
+                    },
+                    "dangerously_skip_permissions": {
+                        "type": "boolean",
+                        "description": "Skip all permission checks (sets approve-all policy and bypassPermissions session mode when supported)"
+                    },
                     "system_prompt": { "type": "string" },
                     "no_mcp": { "type": "boolean" },
                     "on": { "type": "string" },
@@ -273,7 +280,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "h2_send",
-            "description": "Queue a prompt for an agent (or cancel active turn and deliver immediately with steer=true).",
+            "description": "Queue a prompt for an ACP agent (cannot target PTY terminals; terminal agents receive ACP results via h2 wait).",
             "inputSchema": {
                 "type": "object",
                 "required": ["agent", "text"],

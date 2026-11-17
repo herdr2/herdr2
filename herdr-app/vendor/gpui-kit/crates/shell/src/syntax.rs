@@ -1,7 +1,7 @@
 // HERDR: built-in pure-Rust syntax highlighting for script editors, adapted from Base's showcase.
 use std::{collections::HashMap, ops::Range, sync::LazyLock};
 
-use gpui::{Context, HighlightStyle, SharedString, Window};
+use gpui::{Context, FontStyle, FontWeight, HighlightStyle, SharedString, Window};
 use gpui_base::input::{
     EditorState, FoldRange, HighlightStyleResolver, InputEdit, InputHighlighter, Rope,
 };
@@ -38,28 +38,107 @@ impl SyntectHighlighter {
             semantic_names: HashMap::new(),
         })
     }
+}
 
-    fn push_highlight(&mut self, range: Range<usize>, scopes: &ScopeStack) {
-        if range.is_empty() {
-            return;
-        }
-
-        let name = scopes.scopes.iter().rev().find_map(|scope| {
-            *self
-                .semantic_names
-                .entry(*scope)
-                .or_insert_with(|| semantic_name(*scope))
-        });
-        if let Some(name) = name {
-            self.highlights.push((range, name));
-        }
+fn syntax_alias(language: &str) -> Option<&'static str> {
+    match language {
+        "ts" | "tsx" | "mts" | "cts" | "jsx" | "mjs" | "cjs" | "typescript" | "javascript"
+        | "graphql" | "gql" => Some("js"),
+        "toml" | "ini" | "cfg" | "conf" | "env" | "dotenv" | "properties" => Some("yaml"),
+        "jsonc" | "jsonl" | "geojson" => Some("json"),
+        "mdx" | "markdown" | "mdown" | "mkd" => Some("md"),
+        "vue" | "svelte" | "astro" | "svg" | "xhtml" => Some("html"),
+        "scss" | "sass" | "less" | "pcss" => Some("css"),
+        "kt" | "kts" | "kotlin" => Some("scala"),
+        "swift" | "zig" | "wgsl" => Some("rs"),
+        "proto" | "protobuf" | "ino" | "cuda" | "cu" => Some("cpp"),
+        "ps1" | "psm1" | "psd1" | "zsh" | "bash" | "fish" | "dockerfile" | "containerfile"
+        | "justfile" => Some("sh"),
+        "cmake" | "mk" | "gnumakefile" => Some("makefile"),
+        _ => None,
     }
 }
 
 fn find_syntax(language: &str) -> Option<&'static SyntaxReference> {
+    let trimmed = language.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
     SYNTAX_SET
-        .find_syntax_by_token(language)
-        .or_else(|| SYNTAX_SET.find_syntax_by_extension(language))
+        .find_syntax_by_token(trimmed)
+        .or_else(|| SYNTAX_SET.find_syntax_by_extension(trimmed))
+        .or_else(|| SYNTAX_SET.find_syntax_by_token(&lower))
+        .or_else(|| SYNTAX_SET.find_syntax_by_extension(&lower))
+        .or_else(|| {
+            syntax_alias(&lower).and_then(|alias| {
+                SYNTAX_SET
+                    .find_syntax_by_token(alias)
+                    .or_else(|| SYNTAX_SET.find_syntax_by_extension(alias))
+            })
+        })
+}
+
+fn collect_highlights(
+    syntax: &SyntaxReference,
+    text: &str,
+    semantic_names: &mut HashMap<Scope, Option<&'static str>>,
+) -> Vec<(Range<usize>, &'static str)> {
+    let mut parser = ParseState::new(syntax);
+    let mut scopes = ScopeStack::new();
+    let mut offset = 0;
+    let mut highlights = Vec::new();
+
+    for line in LinesWithEndings::from(text) {
+        if let Ok(operations) = parser.parse_line(line, &SYNTAX_SET) {
+            let mut cursor = 0;
+            for (index, operation) in operations {
+                if cursor < index {
+                    let name = scopes.scopes.iter().rev().find_map(|scope| {
+                        *semantic_names
+                            .entry(*scope)
+                            .or_insert_with(|| semantic_name(*scope))
+                    });
+                    if let Some(name) = name {
+                        highlights.push((offset + cursor..offset + index, name));
+                    }
+                }
+                let _ = scopes.apply(&operation);
+                cursor = index;
+            }
+            if cursor < line.len() {
+                let name = scopes.scopes.iter().rev().find_map(|scope| {
+                    *semantic_names
+                        .entry(*scope)
+                        .or_insert_with(|| semantic_name(*scope))
+                });
+                if let Some(name) = name {
+                    highlights.push((offset + cursor..offset + line.len(), name));
+                }
+            }
+        }
+        offset += line.len();
+    }
+
+    highlights
+}
+
+pub(crate) fn highlight_code(
+    language: Option<&str>,
+    text: &str,
+    styles: &SyntaxStyles,
+) -> Vec<(Range<usize>, HighlightStyle)> {
+    let Some(lang) = language else {
+        return Vec::new();
+    };
+    let Some(syntax) = find_syntax(lang) else {
+        return Vec::new();
+    };
+    let mut semantic_names = HashMap::new();
+    let raw = collect_highlights(syntax, text, &mut semantic_names);
+    raw.into_iter()
+        .filter_map(|(range, name)| styles.style(name).map(|style| (range, style)))
+        .collect()
 }
 
 impl InputHighlighter for SyntectHighlighter {
@@ -80,23 +159,7 @@ impl InputHighlighter for SyntectHighlighter {
         let text = text.to_string();
         let syntax = find_syntax(self.language.as_ref())
             .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
-        let mut parser = ParseState::new(syntax);
-        let mut scopes = ScopeStack::new();
-        let mut offset = 0;
-        self.highlights.clear();
-
-        for line in LinesWithEndings::from(&text) {
-            if let Ok(operations) = parser.parse_line(line, &SYNTAX_SET) {
-                let mut cursor = 0;
-                for (index, operation) in operations {
-                    self.push_highlight(offset + cursor..offset + index, &scopes);
-                    let _ = scopes.apply(&operation);
-                    cursor = index;
-                }
-                self.push_highlight(offset + cursor..offset + line.len(), &scopes);
-            }
-            offset += line.len();
-        }
+        self.highlights = collect_highlights(syntax, &text, &mut self.semantic_names);
 
         self.fold_ranges = if folding {
             brace_fold_ranges(&text)
@@ -164,27 +227,61 @@ fn semantic_name(scope: Scope) -> Option<&'static str> {
         "comment"
     } else if scope.starts_with("constant.character.escape") {
         "string.escape"
+    } else if scope.starts_with("string.regexp") {
+        "regexp"
+    } else if scope.starts_with("support.type.property-name")
+        || scope.starts_with("meta.object-literal.key")
+        || scope.starts_with("entity.name.tag.yaml")
+        || scope.starts_with("variable.other.member")
+        || scope.starts_with("variable.other.property")
+        || scope.starts_with("variable.other.readwrite.member")
+    {
+        "property"
     } else if scope.starts_with("string") {
         "string"
     } else if scope.starts_with("constant.numeric") {
         "number"
     } else if scope.starts_with("constant.language.boolean") {
         "boolean"
-    } else if scope.starts_with("keyword.operator") {
-        "operator"
-    } else if scope.starts_with("keyword") || scope.starts_with("storage") {
-        "keyword"
+    } else if scope.starts_with("constant") || scope.starts_with("support.constant") {
+        "constant"
+    } else if scope.starts_with("entity.name.tag") {
+        "tag"
+    } else if scope.starts_with("entity.other.attribute-name") {
+        "attribute"
+    } else if scope.starts_with("entity.name.function.macro")
+        || scope.starts_with("support.macro")
+        || scope.starts_with("meta.preprocessor")
+        || scope.starts_with("meta.annotation")
+        || scope.starts_with("storage.type.annotation")
+    {
+        "macro"
     } else if scope.starts_with("entity.name.function") || scope.starts_with("support.function") {
         "function"
     } else if scope.starts_with("entity.name.type")
         || scope.starts_with("entity.name.class")
+        || scope.starts_with("entity.name.struct")
+        || scope.starts_with("entity.name.enum")
+        || scope.starts_with("entity.name.trait")
+        || scope.starts_with("entity.name.interface")
         || scope.starts_with("support.type")
+        || scope.starts_with("support.class")
+        || scope.starts_with("storage.type.primitive")
     {
         "type"
+    } else if scope.starts_with("entity.name.namespace") || scope.starts_with("entity.name.module")
+    {
+        "namespace"
+    } else if scope.starts_with("variable.parameter") {
+        "parameter"
+    } else if scope.starts_with("keyword.operator") || scope.starts_with("punctuation.accessor") {
+        "operator"
+    } else if scope.starts_with("keyword") || scope.starts_with("storage") {
+        "keyword"
     } else if scope.starts_with("variable") {
         "variable"
-    } else if scope.starts_with("constant") {
-        "constant"
+    } else if scope.starts_with("markup.heading") || scope.starts_with("entity.name.section") {
+        "heading"
     } else if scope.starts_with("punctuation") {
         "punctuation"
     } else {
@@ -225,6 +322,20 @@ fn brace_fold_ranges(text: &str) -> Vec<FoldRange> {
     ranges
 }
 
+fn fallback_semantic_key(name: &str) -> &[&'static str] {
+    match name {
+        "regexp" => &["string"],
+        "property" => &["variable", "function"],
+        "tag" => &["keyword"],
+        "attribute" => &["type"],
+        "macro" => &["function"],
+        "namespace" => &["type"],
+        "parameter" => &["variable"],
+        "heading" => &["keyword"],
+        _ => &[],
+    }
+}
+
 /// HERDR: semantic overrides fall back to readable, dark-editor defaults.
 #[derive(Default)]
 pub(crate) struct SyntaxStyles(pub std::collections::HashMap<String, gpui::Hsla>);
@@ -232,28 +343,34 @@ pub(crate) struct SyntaxStyles(pub std::collections::HashMap<String, gpui::Hsla>
 impl HighlightStyleResolver for SyntaxStyles {
     fn style(&self, name: &str) -> Option<HighlightStyle> {
         let root = name.split('.').next()?;
-        let color = self
-            .0
-            .get(name)
-            .or_else(|| self.0.get(root))
-            .copied()
-            .or_else(|| {
-                let rgb = match root {
-                    "comment" => 0x7f848e,
-                    "string" => 0x98c379,
-                    "number" => 0xd19a66,
-                    "keyword" => 0xc678dd,
-                    "boolean" | "constant" => 0xe5c07b,
-                    "function" => 0x61afef,
-                    "type" => 0xe5c07b,
-                    "operator" => 0x56b6c2,
-                    // Unclassified identifiers and punctuation follow the theme foreground.
-                    _ => return None,
-                };
-                Some(gpui::rgb(rgb).into())
-            });
+        let mut color = self.0.get(name).or_else(|| self.0.get(root)).copied();
+        if color.is_none() {
+            for fallback in fallback_semantic_key(root) {
+                if let Some(found) = self.0.get(*fallback).copied() {
+                    color = Some(found);
+                    break;
+                }
+            }
+        }
+        let color = color.or_else(|| {
+            let rgb = match root {
+                "comment" => 0x7f848e,
+                "string" | "regexp" => 0x98c379,
+                "number" => 0xd19a66,
+                "keyword" | "tag" | "heading" => 0xc678dd,
+                "boolean" | "constant" => 0xe5c07b,
+                "function" | "macro" => 0x61afef,
+                "type" | "namespace" | "attribute" => 0xe5c07b,
+                "operator" => 0x56b6c2,
+                // Unclassified identifiers and punctuation follow the theme foreground.
+                _ => return None,
+            };
+            Some(gpui::rgb(rgb).into())
+        });
         color.map(|color| HighlightStyle {
             color: Some(color),
+            font_style: (root == "comment").then_some(FontStyle::Italic),
+            font_weight: (root == "heading").then_some(FontWeight::BOLD),
             ..Default::default()
         })
     }
@@ -277,11 +394,31 @@ mod tests {
     #[test]
     fn semantic_overrides_and_nested_names_resolve() {
         let color = gpui::rgb(0xc678dd).into();
-        let styles = SyntaxStyles(HashMap::from([("string".into(), color)]));
+        let var_color = gpui::rgb(0xe06c75).into();
+        let styles = SyntaxStyles(HashMap::from([
+            ("string".into(), color),
+            ("variable".into(), var_color),
+        ]));
         assert_eq!(styles.style("string.escape").unwrap().color, Some(color));
+        assert_eq!(styles.style("property").unwrap().color, Some(var_color));
+        assert_eq!(styles.style("comment").unwrap().font_style, Some(FontStyle::Italic));
+        assert_eq!(styles.style("heading").unwrap().font_weight, Some(FontWeight::BOLD));
         assert!(styles.style("keyword").is_some());
         assert!(find_syntax("rust").is_some());
         assert!(find_syntax("rs").is_some());
+        assert!(find_syntax("tsx").is_some());
+        assert!(find_syntax("toml").is_some());
+        assert!(find_syntax("dockerfile").is_some());
         assert!(find_syntax("unknown-language").is_none());
+    }
+
+    #[test]
+    fn highlight_code_produces_non_empty_runs_for_supported_languages() {
+        let styles = SyntaxStyles::default();
+        let runs = highlight_code(Some("rs"), "fn main() { let x = \"hi\"; }", &styles);
+        assert!(!runs.is_empty());
+        assert!(highlight_code(Some("tsx"), "const n: number = 1;", &styles).len() > 1);
+        assert!(highlight_code(None, "plain", &styles).is_empty());
+        assert!(highlight_code(Some("unknown-language"), "plain", &styles).is_empty());
     }
 }

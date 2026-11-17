@@ -122,6 +122,6 @@ pub(super) async fn forward_once(core: &Core, m: &Machine, method: &str, mut par
         ),
         _ => e,
     })?;
-    // Document contents are opaque: address-shaped keys belong to the client.
-    Ok(if method.starts_with("doc.") { reply } else { localize(core, &m.name, &[], reply) })
+    // Document and Drove contents are opaque: address-shaped keys belong to the client/subsystem.
+    Ok(if method.starts_with("doc.") || method.starts_with("drove.") { reply } else { localize(core, &m.name, &[], reply) })
 }

@@ -1353,6 +1353,48 @@ impl Vt {
         Some(LinkHit { target, spans })
     }
 
+    /// Up to `limit` bottommost non-empty rows of the active viewport.
+    pub fn tail_lines(&self, limit: usize) -> Vec<String> {
+        if limit == 0 || self.rows == 0 || self.cols == 0 {
+            return Vec::new();
+        }
+        let mut lines = Vec::with_capacity(limit);
+        for y in (0..u32::from(self.rows)).rev() {
+            let Some(mut r) = self.grid_ref(GHOSTTY_POINT_TAG_ACTIVE, 0, y) else { continue };
+            let mut row = String::new();
+            for x in 0..self.cols {
+                r.x = x;
+                let wide = unsafe {
+                    let mut cell: GhosttyCell = Default::default();
+                    ghostty_grid_ref_cell(&r, &mut cell);
+                    let mut wide: GhosttyCellWide = GHOSTTY_CELL_WIDE_NARROW;
+                    ghostty_cell_get(cell, GHOSTTY_CELL_DATA_WIDE, &mut wide as *mut _ as *mut c_void);
+                    wide
+                };
+                if wide == GHOSTTY_CELL_WIDE_SPACER_TAIL || wide == GHOSTTY_CELL_WIDE_SPACER_HEAD {
+                    continue;
+                }
+                let before = row.len();
+                let mut cps = [0u32; 16];
+                let mut len = 0usize;
+                unsafe { ghostty_grid_ref_graphemes(&r, cps.as_mut_ptr(), cps.len(), &mut len) };
+                row.extend(cps[..len.min(cps.len())].iter().filter_map(|c| char::from_u32(*c)));
+                if row.len() == before {
+                    row.push(' ');
+                }
+            }
+            let trimmed = row.trim();
+            if !trimmed.is_empty() {
+                lines.push(trimmed.to_owned());
+                if lines.len() >= limit {
+                    break;
+                }
+            }
+        }
+        lines.reverse();
+        lines
+    }
+
     pub fn clear_selection(&mut self) {
         unsafe { ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_SELECTION, std::ptr::null()) };
     }

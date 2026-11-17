@@ -160,3 +160,97 @@ fn async_start_returns_starting_immediately_and_records_spawn_failure() {
     assert_eq!(g["keep"], false, "{g}");
     assert!(text(&s, &bad_addr).contains("not found") || text(&s, &bad_addr).contains("No such file"), "{g}");
 }
+
+#[test]
+fn session_config_options_and_h2_config_update_work_end_to_end() {
+    let s = Session::new();
+    let a = run_fake(&s, &[]);
+    let initial = get(&s, &a);
+    let opts = initial["config_options"].as_array().unwrap();
+    assert!(opts.iter().any(|o| o["id"] == "model"), "{initial}");
+    assert!(opts.iter().any(|o| o["id"] == "reasoning_effort"), "{initial}");
+    assert!(opts.iter().any(|o| o["id"] == "fast-mode" && o["kind"] == "boolean"), "{initial}");
+
+    let after_model = s.json(&["config", &a, "--id", "model", "--value", "gpt-test-2"]);
+    assert_eq!(after_model["model"], "gpt-test-2", "{after_model}");
+
+    let after_effort = s.json(&["config", &a, "--id", "reasoning_effort", "--value", "xhigh"]);
+    let effort_opt = after_effort["config_options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["id"] == "reasoning_effort")
+        .unwrap();
+    assert_eq!(effort_opt["current_value"], "xhigh", "{after_effort}");
+
+    let after_fast = s.json(&["config", &a, "--id", "fast-mode", "--bool", "true"]);
+    let fast_opt = after_fast["config_options"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["id"] == "fast-mode")
+        .unwrap();
+    assert_eq!(fast_opt["current_value"], true, "{after_fast}");
+
+    let after_bypass = s.json(&["config", &a, "--id", "mode", "--value", "dangerously-skip-permissions"]);
+    assert_eq!(after_bypass["mode"], "bypassPermissions", "{after_bypass}");
+    assert_eq!(after_bypass["permission_mode"], "approve-all", "{after_bypass}");
+
+    let st = state_json(&s, &a);
+    assert_eq!(st["model"], "gpt-test-2", "{st}");
+    assert_eq!(st["reasoning_effort"], "xhigh", "{st}");
+    assert_eq!(st["fast_mode"], true, "{st}");
+    assert_eq!(st["mode"], "bypassPermissions", "{st}");
+
+    let skipped = run_fake(&s, &["--dangerously-skip-permissions"]);
+    let skipped_rec = get(&s, &skipped);
+    assert_eq!(skipped_rec["permission_mode"], "approve-all", "{skipped_rec}");
+    assert_eq!(skipped_rec["mode"], "bypassPermissions", "{skipped_rec}");
+}
+
+#[test]
+fn claude_preset_defaults_to_dangerously_skip_permissions() {
+    let s = Session::new();
+    let parts: Vec<String> = fake_acp_spec().split_whitespace().map(|p| format!("{p:?}")).collect();
+    let conf_dir = s.root.join("config/herdr2");
+    std::fs::create_dir_all(&conf_dir).unwrap();
+    std::fs::write(conf_dir.join("config.toml"), format!("[agents]\nclaude = [{}]\n", parts.join(", "))).unwrap();
+
+    let a = s.json(&["run", "--bg", "--agent", "claude"])["address"].as_str().unwrap().to_owned();
+    let rec = get(&s, &a);
+    assert_eq!(rec["mode"], "bypassPermissions", "{rec}");
+    assert_eq!(rec["permission_mode"], "approve-all", "{rec}");
+    let st = state_json(&s, &a);
+    assert_eq!(st["mode"], "bypassPermissions", "{st}");
+
+    // Explicit non-bypass mode is still respected.
+    let manual = s.json(&["run", "--bg", "--agent", "claude", "--mode", "default"])["address"].as_str().unwrap().to_owned();
+    let manual_rec = get(&s, &manual);
+    assert_eq!(manual_rec["mode"], "default", "{manual_rec}");
+    assert_eq!(manual_rec["permission_mode"], "approve-reads", "{manual_rec}");
+}
+
+#[test]
+fn agent_send_resets_manual_status_on_sender_and_receiver() {
+    let s = Session::new();
+    let a1 = run_fake(&s, &[]);
+    let a2 = run_fake(&s, &[]);
+
+    s.json(&["label", &a1, "herdr.status=done@0"]);
+    s.json(&["label", &a2, "herdr.status=blocked@0"]);
+    assert_eq!(get(&s, &a1)["labels"]["herdr.status"], "done@0");
+    assert_eq!(get(&s, &a2)["labels"]["herdr.status"], "blocked@0");
+
+    let send_out = s
+        .cmd()
+        .env("H2_AGENT_ID", &a1)
+        .args(["send", &a2, "--wait", "PING"])
+        .output()
+        .unwrap();
+    assert!(send_out.status.success(), "{}", String::from_utf8_lossy(&send_out.stderr));
+
+    let after_a1 = get(&s, &a1);
+    let after_a2 = get(&s, &a2);
+    assert!(after_a1["labels"].get("herdr.status").is_none(), "sender manual status was not reset: {after_a1}");
+    assert!(after_a2["labels"].get("herdr.status").is_none(), "receiver manual status was not reset: {after_a2}");
+}

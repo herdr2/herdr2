@@ -1,6 +1,7 @@
 //! ACP (Agent Client Protocol) JSON-RPC 2.0 wire types and resilient parsers.
 
 use crate::permissions::PublicPermissionOption;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -13,18 +14,75 @@ pub struct FsCapabilities {
     pub write_text_file: bool,
 }
 
+#[derive(Serialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct BooleanConfigCapability {}
+
+#[derive(Serialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionConfigOptionsCapability {
+    pub boolean: BooleanConfigCapability,
+}
+
+#[derive(Serialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionClientCapabilities {
+    pub config_options: SessionConfigOptionsCapability,
+}
+
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientCapabilities {
     pub fs: FsCapabilities,
     pub terminal: bool,
+    pub session: SessionClientCapabilities,
 }
 
 impl ClientCapabilities {
     /// Advertises strictly headless orchestration: no client FS or terminal access.
     pub fn headless() -> Self {
-        Self { fs: FsCapabilities { read_text_file: false, write_text_file: false }, terminal: false }
+        Self {
+            fs: FsCapabilities { read_text_file: false, write_text_file: false },
+            terminal: false,
+            session: SessionClientCapabilities::default(),
+        }
     }
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq)]
+pub struct AcpConfigChoice {
+    pub value: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+fn default_config_source() -> String {
+    "config".into()
+}
+
+fn is_default_config_source(s: &str) -> bool {
+    s == "config"
+}
+
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq)]
+pub struct AcpConfigOption {
+    pub id: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// `"select"` or `"boolean"`.
+    pub kind: String,
+    pub current_value: Value,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<AcpConfigChoice>,
+    /// `"config"` (default), `"legacy_model"`, or `"legacy_mode"`.
+    #[serde(default = "default_config_source", skip_serializing_if = "is_default_config_source")]
+    pub source: String,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -167,7 +225,136 @@ pub struct SessionSetModeParams {
 pub struct SessionSetConfigOptionParams {
     pub session_id: String,
     pub config_id: String,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub option_type: Option<String>,
     pub value: Value,
+}
+
+/// Parses ACP v1/v2 `configOptions` plus legacy `models` / `modes` blocks into unified descriptors.
+pub fn parse_session_config(val: &Value) -> Vec<AcpConfigOption> {
+    let mut out = Vec::new();
+    if let Some(arr) = val.get("configOptions").and_then(Value::as_array) {
+        for item in arr {
+            let Some(id) = item
+                .get("configId")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let name = item.get("name").and_then(Value::as_str).unwrap_or(id).to_string();
+            let description = item.get("description").and_then(Value::as_str).map(String::from);
+            let category = item.get("category").and_then(Value::as_str).map(String::from);
+            let kind = item.get("type").and_then(Value::as_str).unwrap_or("select").to_string();
+            let current_value = item.get("currentValue").cloned().unwrap_or(Value::Null);
+            let options = parse_select_choices(item.get("options"));
+            out.push(AcpConfigOption {
+                id: id.to_string(),
+                name,
+                description,
+                category,
+                kind,
+                current_value,
+                options,
+                source: "config".into(),
+            });
+        }
+    }
+
+    let has_model = out.iter().any(|o| o.id == "model" || o.category.as_deref() == Some("model"));
+    if !has_model && let Some(models) = val.get("models") {
+        let mut choices = Vec::new();
+        if let Some(arr) = models.get("availableModels").and_then(Value::as_array) {
+            for m in arr {
+                if let Some(id) = m.get("modelId").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    choices.push(AcpConfigChoice {
+                        value: id.to_string(),
+                        name: m.get("name").and_then(Value::as_str).unwrap_or(id).to_string(),
+                        description: m.get("description").and_then(Value::as_str).map(String::from),
+                        group: None,
+                    });
+                }
+            }
+        }
+        let current = models.get("currentModelId").cloned().unwrap_or(Value::Null);
+        if !choices.is_empty() || !current.is_null() {
+            out.push(AcpConfigOption {
+                id: "model".into(),
+                name: "Model".into(),
+                description: None,
+                category: Some("model".into()),
+                kind: "select".into(),
+                current_value: current,
+                options: choices,
+                source: "legacy_model".into(),
+            });
+        }
+    }
+
+    let has_mode = out.iter().any(|o| o.id == "mode" || o.category.as_deref() == Some("mode"));
+    if !has_mode && let Some(modes) = val.get("modes") {
+        let mut choices = Vec::new();
+        if let Some(arr) = modes.get("availableModes").and_then(Value::as_array) {
+            for m in arr {
+                if let Some(id) = m.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    choices.push(AcpConfigChoice {
+                        value: id.to_string(),
+                        name: m.get("name").and_then(Value::as_str).unwrap_or(id).to_string(),
+                        description: m.get("description").and_then(Value::as_str).map(String::from),
+                        group: None,
+                    });
+                }
+            }
+        }
+        let current = modes.get("currentModeId").cloned().unwrap_or(Value::Null);
+        if !choices.is_empty() || !current.is_null() {
+            out.push(AcpConfigOption {
+                id: "mode".into(),
+                name: "Mode".into(),
+                description: None,
+                category: Some("mode".into()),
+                kind: "select".into(),
+                current_value: current,
+                options: choices,
+                source: "legacy_mode".into(),
+            });
+        }
+    }
+    out
+}
+
+fn parse_select_choices(raw: Option<&Value>) -> Vec<AcpConfigChoice> {
+    let Some(arr) = raw.and_then(Value::as_array) else { return Vec::new() };
+    let mut choices = Vec::new();
+    for entry in arr {
+        if let Some(group_opts) = entry.get("options").and_then(Value::as_array) {
+            let group = entry
+                .get("name")
+                .or_else(|| entry.get("group"))
+                .or_else(|| entry.get("groupId"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            for opt in group_opts {
+                if let Some(val) = opt.get("value").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                    choices.push(AcpConfigChoice {
+                        value: val.to_string(),
+                        name: opt.get("name").and_then(Value::as_str).unwrap_or(val).to_string(),
+                        description: opt.get("description").and_then(Value::as_str).map(String::from),
+                        group: group.clone(),
+                    });
+                }
+            }
+        } else if let Some(val) = entry.get("value").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+            choices.push(AcpConfigChoice {
+                value: val.to_string(),
+                name: entry.get("name").and_then(Value::as_str).unwrap_or(val).to_string(),
+                description: entry.get("description").and_then(Value::as_str).map(String::from),
+                group: None,
+            });
+        }
+    }
+    choices
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -203,13 +390,24 @@ pub struct SessionCancelParams {
     pub session_id: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, schemars::JsonSchema, Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AcpContextUsage {
+    /// Tokens currently used in the session context window.
+    pub used: u64,
+    /// Total token capacity of the model's context window.
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub enum ParsedUpdate {
     AssistantChunk(String),
     ThoughtChunk(String),
     UserChunk(String),
     ToolCall { id: String, title: String, kind: Option<String>, status: String },
     Plan(Vec<String>),
+    ConfigOptions(Vec<AcpConfigOption>),
+    CurrentMode(String),
+    Usage(AcpContextUsage),
     Other,
 }
 
@@ -248,6 +446,26 @@ pub fn parse_session_update(params: &Value) -> Option<(String, ParsedUpdate)> {
                 })
                 .unwrap_or_default();
             ParsedUpdate::Plan(items)
+        }
+        "config_option_update" => ParsedUpdate::ConfigOptions(parse_session_config(update)),
+        "current_mode_update" => update
+            .get("currentModeId")
+            .and_then(Value::as_str)
+            .map_or(ParsedUpdate::Other, |m| ParsedUpdate::CurrentMode(m.to_string())),
+        "usage_update" => {
+            let used = update
+                .get("used")
+                .or_else(|| update.get("usedTokens"))
+                .or_else(|| update.get("totalTokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            let size = update
+                .get("size")
+                .or_else(|| update.get("contextWindow"))
+                .or_else(|| update.get("maxTokens"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            if size > 0 { ParsedUpdate::Usage(AcpContextUsage { used, size }) } else { ParsedUpdate::Other }
         }
         _ => ParsedUpdate::Other,
     };
@@ -331,7 +549,94 @@ mod tests {
         assert_eq!(value["clientCapabilities"]["terminal"], false);
         assert_eq!(value["clientCapabilities"]["fs"]["readTextFile"], false);
         assert_eq!(value["clientCapabilities"]["fs"]["writeTextFile"], false);
+        assert_eq!(value["clientCapabilities"]["session"]["configOptions"]["boolean"], json!({}));
         assert_eq!(value["clientInfo"]["name"], "herdr2");
+    }
+
+    #[test]
+    fn parses_session_config_options_grouped_boolean_and_legacy_fallback() {
+        let modern = json!({
+            "sessionId": "s1",
+            "configOptions": [
+                {
+                    "id": "model",
+                    "name": "Model",
+                    "category": "model",
+                    "type": "select",
+                    "currentValue": "gpt-6.1-sol",
+                    "options": [{
+                        "group": "OpenAI",
+                        "options": [{ "value": "gpt-6.1-sol", "name": "6.1 Sol", "description": "Workhorse" }]
+                    }]
+                },
+                {
+                    "configId": "reasoning_effort",
+                    "name": "Reasoning effort",
+                    "category": "thought_level",
+                    "type": "select",
+                    "currentValue": "high",
+                    "options": [
+                        { "value": "low", "name": "Low" },
+                        { "value": "high", "name": "High" }
+                    ]
+                },
+                {
+                    "id": "fast-mode",
+                    "name": "Fast mode",
+                    "category": "model_config",
+                    "type": "boolean",
+                    "currentValue": false
+                }
+            ]
+        });
+        let parsed = parse_session_config(&modern);
+        assert_eq!(parsed.len(), 3);
+        assert_eq!(parsed[0].options[0].group.as_deref(), Some("OpenAI"));
+        assert_eq!(parsed[1].id, "reasoning_effort");
+        assert_eq!(parsed[2].kind, "boolean");
+        assert_eq!(parsed[2].current_value, json!(false));
+
+        let legacy = json!({
+            "sessionId": "s2",
+            "models": {
+                "currentModelId": "m1",
+                "availableModels": [{ "modelId": "m1", "name": "Model 1" }]
+            },
+            "modes": {
+                "currentModeId": "agent",
+                "availableModes": [{ "id": "agent", "name": "Auto review" }]
+            }
+        });
+        let legacy_parsed = parse_session_config(&legacy);
+        assert_eq!(legacy_parsed.len(), 2);
+        assert_eq!(legacy_parsed[0].source, "legacy_model");
+        assert_eq!(legacy_parsed[0].current_value, json!("m1"));
+        assert_eq!(legacy_parsed[1].source, "legacy_mode");
+        assert_eq!(legacy_parsed[1].current_value, json!("agent"));
+
+        let upd = json!({
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "config_option_update",
+                "configOptions": [{ "id": "fast-mode", "name": "Fast mode", "type": "boolean", "currentValue": true }]
+            }
+        });
+        assert_eq!(
+            parse_session_update(&upd),
+            Some((
+                "s1".into(),
+                ParsedUpdate::ConfigOptions(vec![AcpConfigOption {
+                    id: "fast-mode".into(),
+                    name: "Fast mode".into(),
+                    description: None,
+                    category: None,
+                    kind: "boolean".into(),
+                    current_value: json!(true),
+                    options: vec![],
+                    source: "config".into(),
+                }])
+            ))
+        );
     }
 
     #[test]
@@ -361,6 +666,23 @@ mod tests {
             "update": { "sessionUpdate": "agent_message_chunk", "content": { "type": "text", "text": "hi" } }
         });
         assert_eq!(parse_session_update(&update), Some(("s1".into(), ParsedUpdate::AssistantChunk("hi".into()))));
+    }
+
+    #[test]
+    fn parses_usage_update_context_window() {
+        let update = json!({
+            "sessionId": "s1",
+            "update": { "sessionUpdate": "usage_update", "used": 28400, "size": 200000 }
+        });
+        assert_eq!(
+            parse_session_update(&update),
+            Some(("s1".into(), ParsedUpdate::Usage(AcpContextUsage { used: 28400, size: 200000 })))
+        );
+        let zero = json!({
+            "sessionId": "s1",
+            "update": { "sessionUpdate": "usage_update", "used": 10, "size": 0 }
+        });
+        assert_eq!(parse_session_update(&zero), Some(("s1".into(), ParsedUpdate::Other)));
     }
 
     #[test]

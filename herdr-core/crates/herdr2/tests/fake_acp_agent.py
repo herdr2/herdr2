@@ -24,6 +24,8 @@ mcp_servers: list = []
 system_prompt: str | None = None
 current_model: str | None = None
 current_mode: str | None = None
+reasoning_effort: str = "high"
+fast_mode: bool = False
 last_cwd: str = ""
 reject_load = "--reject-load" in sys.argv
 no_load_cap = "--no-load-cap" in sys.argv
@@ -221,6 +223,8 @@ def handle_prompt(rpc_id, params: dict) -> None:
                         "loaded": was_loaded,
                         "model": current_model,
                         "mode": current_mode,
+                        "reasoning_effort": reasoning_effort,
+                        "fast_mode": fast_mode,
                         "mcp_servers": mcp_servers,
                         "system_prompt": system_prompt,
                         "client_caps": client_caps,
@@ -228,6 +232,14 @@ def handle_prompt(rpc_id, params: dict) -> None:
                     }
                 )
             )
+        elif line.startswith("SH:"):
+            cmd = line.split(":", 1)[1]
+            res = subprocess.run(cmd, shell=True, cwd=last_cwd or None, text=True, capture_output=True)
+            if res.stdout:
+                emit_text(res.stdout)
+            if res.stderr:
+                emit_text(res.stderr)
+            outputs.append(f"sh:{res.returncode}")
         else:
             outputs.append(f"echo: {line}")
 
@@ -240,8 +252,56 @@ def handle_prompt(rpc_id, params: dict) -> None:
     reply_ok(rpc_id, {"stopReason": "end_turn"})
 
 
+def current_config_options() -> list[dict]:
+    return [
+        {
+            "id": "model",
+            "name": "Model",
+            "category": "model",
+            "type": "select",
+            "currentValue": current_model or "gpt-test-1",
+            "options": [
+                {"value": "gpt-test-1", "name": "GPT Test 1"},
+                {"value": "gpt-test-2", "name": "GPT Test 2"},
+            ],
+        },
+        {
+            "id": "reasoning_effort",
+            "name": "Reasoning effort",
+            "category": "thought_level",
+            "type": "select",
+            "currentValue": reasoning_effort,
+            "options": [
+                {"value": "low", "name": "Low"},
+                {"value": "medium", "name": "Medium"},
+                {"value": "high", "name": "High"},
+                {"value": "xhigh", "name": "Extra High"},
+            ],
+        },
+        {
+            "id": "fast-mode",
+            "name": "Fast mode",
+            "category": "model_config",
+            "type": "boolean",
+            "currentValue": fast_mode,
+        },
+        {
+            "id": "mode",
+            "name": "Mode",
+            "category": "mode",
+            "type": "select",
+            "currentValue": current_mode or "agent",
+            "options": [
+                {"value": "agent", "name": "Auto review"},
+                {"value": "plan", "name": "Plan"},
+                {"value": "bypassPermissions", "name": "Bypass permissions"},
+            ],
+        },
+    ]
+
+
 def worker() -> None:
-    global client_caps, session_id, was_loaded, mcp_servers, system_prompt, current_model, current_mode, last_cwd
+    global client_caps, session_id, was_loaded, mcp_servers, system_prompt, current_model, current_mode, reasoning_effort, fast_mode, last_cwd
     while True:
         msg = work_queue.get()
         if msg is None:
@@ -275,7 +335,7 @@ def worker() -> None:
                     system_prompt = sp.get("append")
                 session_id = f"sess-{os.getpid()}-{int(time.time() * 1000)}"
                 was_loaded = False
-                reply_ok(rpc_id, {"sessionId": session_id})
+                reply_ok(rpc_id, {"sessionId": session_id, "configOptions": current_config_options()})
             elif method == "session/load":
                 if reject_load:
                     reply_err(rpc_id, -32000, "load rejected")
@@ -284,7 +344,7 @@ def worker() -> None:
                 mcp_servers = params.get("mcpServers", [])
                 session_id = params.get("sessionId", session_id)
                 was_loaded = True
-                reply_ok(rpc_id, {"sessionId": session_id})
+                reply_ok(rpc_id, {"sessionId": session_id, "configOptions": current_config_options()})
             elif method == "session/set_mode":
                 mode_id = params.get("modeId")
                 if mode_id == "REJECT":
@@ -293,13 +353,20 @@ def worker() -> None:
                     current_mode = mode_id
                     reply_ok(rpc_id, {})
             elif method == "session/set_config_option":
-                if params.get("configId") == "model":
-                    val = params.get("value")
+                cfg_id = params.get("configId")
+                val = params.get("value")
+                if cfg_id == "model":
                     if val == "REJECT":
                         reply_err(rpc_id, -32602, "invalid model")
                         continue
                     current_model = val
-                reply_ok(rpc_id, {})
+                elif cfg_id == "reasoning_effort":
+                    reasoning_effort = str(val)
+                elif cfg_id == "fast-mode":
+                    fast_mode = bool(val)
+                elif cfg_id == "mode":
+                    current_mode = str(val)
+                reply_ok(rpc_id, {"configOptions": current_config_options()})
             elif method == "session/set_model":
                 current_model = params.get("modelId")
                 reply_ok(rpc_id, {})

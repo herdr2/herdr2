@@ -385,8 +385,8 @@ The tab block says how each pane of the shown tab is wrapped:
 - `header`: a mod drawn on each pane, one copy per pane, with
   `props().pane` and `props().terminal`. It reads its live facts from
   `panes()` (title, folder, branch, agent status, focused, zoomed, scroll)
-  and its buttons run pane commands with that pane (`pane.split`, `pane.zoom`,
-  `pane.close`). `scroll` is `{ total, offset, len, from_bottom }` for a
+  and its buttons run pane commands with that pane (`pane.split`, `pane.detach`
+  when a tab has multiple panes, `pane.zoom`, `pane.close`). `scroll` is `{ total, offset, len, from_bottom }` for a
   terminal pane's history viewport (`from_bottom` is 0 at the end; `scroll`
   is null on the alternate screen). Reads get current numbers. Mods refresh
   only on transitions between the end, history, and the alternate screen;
@@ -586,6 +586,7 @@ The main ones:
   in beside it like any tab), `tab.close {id?, confirmed?}` (closing the last tab
   closes its space and asks first unless confirmed),
   `tab.rename {id?, name}` ("": its number again), `tab.move {id?, index | by}` (by: places left (-) or right (+), skipping settled tabs as `tab.next` does, wrapping),
+  `tab.merge {source, target, direction?: "right" | "left" | "down" | "up"}` (merges the source tab's panes into the target tab as a split and removes the source tab),
   `tab.select {index | id}`, `tab.next`, `tab.prev`,
   `tab.settle {id?}`, `tab.unsettle {id?}` (index, next and prev
   skip settled tabs).
@@ -597,7 +598,7 @@ The main ones:
   terminal, or a mod pane; `argv` starts in your interactive shell, for its PATH, and the
   pane ends with it, keeping its exit code; that shell PATH needs sh, bash, zsh, dash, ksh or
   fish: with other shells (nushell) and on Windows `argv` runs directly), `pane.close {pane?}`,
-  `pane.zoom {pane?}`, `pane.focus {pane | terminal}`, `pane.go {direction}`,
+  `pane.detach {pane?}` (moves a pane out of a split tab into its own tab right after it and selects it), `pane.zoom {pane?}`, `pane.focus {pane | terminal}`, `pane.go {direction}`,
   `pane.swap {pane?, direction | target}`.
   `pane.zoom` also makes the pane its tab's focused one (the tab isn't
   selected); on the zoomed pane it unzooms and focus stays.
@@ -621,6 +622,7 @@ The main ones:
   only with sh, bash, zsh, dash, ksh or fish: other shells (nushell) and Windows don't give
   `argv` that shell's PATH, and a split there runs `argv` directly), `terminal.kill {terminal}`,
   `terminal.keep {terminal, place?}`, `terminal.park {terminal}`,
+  `terminal.view {view: "peek" | "terminal" | "toggle", terminal?, tab?}`,
   `terminal.peek {terminal}` (peek over the tab, with keep-as-tab and close),
   `terminal.show {terminal?, pane?}`, `terminal.search` (screen and scrollback;
   find bar state stays with that terminal), `terminal.select_all {terminal?}` (selects the whole
@@ -663,17 +665,17 @@ The main ones:
   started, including its release outside the pane; other panes don't receive it.
   Terminals display Kitty graphics, including Unicode placeholder images used by
   programs such as yazi; partial images and scrolling follow the placeholder cells.
-- Agents: `agent.next`, `agent.prev`, `agent.focus {terminal}`, `agent.send {agent?, text, steer?}`, `agent.interrupt {agent?}`, `agent.approve {agent?, option?}`, `agent.deny {agent?}`.
+- Agents: `agent.next`, `agent.prev`, `agent.focus {terminal}`, `agent.rename {terminal?, name?}`, `agent.trash {terminal?}`, `agent.restore {terminal}`, `agent.purge {terminal}`, `agent.empty_trash`, `agent.status {status, terminal?}`, `agent.send {agent?, text, steer?}`, `agent.interrupt {agent?}`, `agent.approve {agent?, option?}`, `agent.deny {agent?}`.
 - Layout: `layout.switch {name?}`, `layout.toggle {id}`, `layout.show {id}`, `layout.hide {id}`,
   `layout.resize {id, px | weight}`, `layout.select {stack, child}`, `layout.set {layout}`
   (personal tree edits; on shipped layouts only click/look fields change),
   `layout.reset {name?}` (reset a shipped layout and its clicks),
   `layout.clone {name, as?}` (duplicate, then switch; default `<name>-copy`).
 - App: `mod.clone {name, as?}` (duplicate; default `<name>-copy`), `mod.open {name}` (again: closes it), `overlay.close {id?}`, `app.help` (again: closes it), `app.palette` (again: closes it), `app.settings {section?}`
-  (sections: `look`, `machines`, `alerts`, `updates`, `privacy`; Machines lists, updates, renames and removes ssh machines; settings edit the same files you do).
+  (sections: `look`, `machines`, `drove`, `alerts`, `updates`, `privacy`; Machines lists, updates, renames and removes ssh machines; Drove configures roles, AI assistant, and optional Magpie quota; settings edit the same files you do).
   `app.check_updates` (only a successful check reports Up to date; a failed check clears the checked time and can be retried), `app.update_core` (a newer herdr-core of this generation, terminals kept;
   never one a package manager owns), `app.welcome`, `app.whats_new`, `app.feedback {message?, from?}` (from `"person"` or `"agent"`; opens a review window, where the person can paste up to 3 screenshots; never sends until the person clicks Send), `app.reset`,
-  `app.theme {name}`, `app.zoom_in`, `app.zoom_out`, `app.zoom_reset`,
+  `app.theme {name}`, `app.language {language}` (`"en"` or `"zh-CN"`), `app.zoom_in`, `app.zoom_out`, `app.zoom_reset`,
   `app.update` (restart into a downloaded update).
   Add machine lists all named ssh-config hosts in a scrollable list. Machines
   that need a password, a new host key or herdr-core installed show what to run
@@ -753,6 +755,7 @@ What's about the user, never a look:
   precedence as fonts.
 - `appearance`: `"light"` or `"dark"` always; absent, the system's. A layout
   with a light and a dark theme shows the matching one.
+- `language`: `"en"` (default) or `"zh-CN"` (Simplified Chinese) for the app interface.
 - Updates: an installed app downloads them by itself and offers Restart and
   What changed. If the app crashes or is killed with a verified newer update
   waiting, the next launch installs it before opening a window. The first
