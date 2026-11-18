@@ -159,19 +159,178 @@ export function splitMarkdownBlocks(markdown) {
 export function toolIconPath(toolKind, title = "") {
   const kind = String(toolKind ?? "").toLowerCase();
   const label = String(title ?? "").toLowerCase();
-  if (kind === "execute" || kind === "command" || /\b(bash|sh|exec|run)\b/.test(label)) {
+  if (kind === "execute" || kind === "command" || /\b(bash|sh|exec|run|shell|shell_command|exec_command)\b/.test(label)) {
     return "mods/workspace-chrome/terminal.svg";
   }
-  if (kind === "read" || kind === "edit" || kind === "write" || /\b(read|write|edit|file)\b/.test(label)) {
+  if (kind === "read" || /\b(read|read_file|view_file)\b/.test(label)) {
     return "mods/workspace-chrome/file-text.svg";
   }
-  if (kind === "search" || /\b(search|grep|rg|find|webreader|fetch)\b/.test(label)) {
+  if (kind === "edit" || kind === "write" || kind === "patch" || /\b(edit|write|patch|create|apply_patch|multiedit|notebookedit)\b/.test(label)) {
+    return "mods/workspace-chrome/square-pen.svg";
+  }
+  if (kind === "search" || /\b(search|grep|rg|glob|find)\b/.test(label)) {
     return "mods/workspace-chrome/search.svg";
   }
-  if (kind === "think" || kind === "thought") {
-    return "mods/workspace-chrome/clock.svg";
+  if (kind === "web" || kind === "fetch" || /\b(webfetch|webreader|fetch|curl|http|url)\b/.test(label)) {
+    return "mods/peek/globe.svg";
   }
-  return "mods/workspace-chrome/layers.svg";
+  if (kind === "think" || kind === "thought") {
+    return "mods/peek/brain.svg";
+  }
+  if (kind === "plan" || kind === "todo") {
+    return "mods/peek/list-todo.svg";
+  }
+  return "mods/peek/wrench.svg";
+}
+
+/**
+ * Extracts a single-line inline preview from markdown reasoning text (matching T3 Code `liveThoughtLine`).
+ */
+export function thoughtPreview(rawText, maxChars = 110) {
+  const src = String(rawText ?? "").replace(/\r\n/g, "\n").trim();
+  if (!src) return "";
+  const firstNonEmpty = src
+    .split("\n")
+    .map((l) => l.trim())
+    .find(Boolean) ?? "";
+  const clean = firstNonEmpty
+    .replace(/^#{1,6}\s+/, "")
+    .replace(/^[-*+]\s+/, "")
+    .replace(/^\d+\.\s+/, "")
+    .replace(/^>\s+/, "")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\*([^*]+)\*/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/[ \t]+/g, " ")
+    .trim();
+  if (clean.length <= maxChars) return clean;
+  return `${clean.slice(0, Math.max(1, maxChars - 1))}…`;
+}
+
+/**
+ * Parses `[x]` / `[~]` / `[ ]` plan entries into structured checklist items.
+ */
+export function parsePlanItems(items) {
+  const list = Array.isArray(items) ? items : [];
+  return list
+    .map((raw) => {
+      const src = String(raw ?? "").trim();
+      if (!src) return null;
+      if (/^\[x\]/i.test(src)) {
+        const text = src.replace(/^\[x\]\s*/i, "").trim() || src;
+        return { status: "completed", text };
+      }
+      if (/^\[[~*]\]/.test(src)) {
+        const text = src.replace(/^\[[~*]\]\s*/, "").trim() || src;
+        return { status: "in_progress", text };
+      }
+      if (/^\[\s*\]/.test(src)) {
+        const text = src.replace(/^\[\s*\]\s*/, "").trim() || src;
+        return { status: "pending", text };
+      }
+      return { status: "pending", text: src };
+    })
+    .filter(Boolean);
+}
+
+/**
+ * Detects interactive shell prompt+command blocks (`$ cmd`, `user@host:~/dir$ cmd`, `~/dir % cmd`, `PS ...> cmd`)
+ * inside cleaned terminal snapshots so shell output renders in T3 Code `CommandBlock` style.
+ */
+export function parseTerminalShellBlocks(cleanedText) {
+  const src = String(cleanedText ?? "").replace(/\r\n/g, "\n");
+  if (!src.trim()) return [];
+  const promptMatchers = [
+    /^([a-zA-Z0-9._-]+@[a-zA-Z0-9._-]+[^\n]{0,60}[$#%]\s+)(.+)$/,
+    /^((?:\([^)]+\)\s+)?(?:~|\/|\.\.?)(?:\/[^\s$#%]*)*\s+[$%❯›]\s+)(.+)$/,
+    /^(\$\s+)(\S[^\n]*)$/,
+    /^(PS\s+[^\n>]*>\s+)(.+)$/,
+  ];
+  const matchPrompt = (line) => {
+    for (const re of promptMatchers) {
+      const m = line.match(re);
+      if (m && m[2].trim()) {
+        return { prompt: m[1].trim(), command: m[2].trim() };
+      }
+    }
+    return null;
+  };
+
+  const blocks = [];
+  let leadingLines = [];
+  let current = null;
+
+  const flushCurrent = () => {
+    if (!current) return;
+    const output = current.outputLines.join("\n").replace(/^\n+|\n+$/g, "");
+    blocks.push({
+      type: "command",
+      prompt: current.prompt,
+      command: current.command,
+      output,
+    });
+    current = null;
+  };
+
+  for (const line of src.split("\n")) {
+    const hit = matchPrompt(line);
+    if (hit) {
+      if (!current && leadingLines.length > 0) {
+        const lead = leadingLines.join("\n").replace(/^\n+|\n+$/g, "");
+        if (lead.trim()) blocks.push({ type: "output", text: lead });
+        leadingLines = [];
+      }
+      flushCurrent();
+      current = { prompt: hit.prompt, command: hit.command, outputLines: [] };
+    } else if (current) {
+      current.outputLines.push(line);
+    } else {
+      leadingLines.push(line);
+    }
+  }
+  flushCurrent();
+
+  if (!blocks.some((b) => b.type === "command")) return [];
+  return blocks;
+}
+
+/**
+ * Builds read-only Composer footer badges for structured PTY terminals from
+ * `ReadResult.session_meta` (or record fallback).
+ */
+export function buildPtySessionBadges(sessionMeta, record) {
+  const badges = [];
+  const meta = sessionMeta ?? {};
+  const model = meta.model || record?.model || null;
+  if (model) {
+    badges.push({
+      id: "model",
+      iconKind: "model",
+      label: String(model),
+      tooltip: `Model: ${model}`,
+    });
+  }
+  if (meta.reasoning_effort) {
+    const effort = String(meta.reasoning_effort);
+    const nice = effort.charAt(0).toUpperCase() + effort.slice(1);
+    badges.push({
+      id: "reasoning",
+      iconKind: "thinking",
+      label: nice,
+      effortVisual: resolveEffortVisual(effort),
+      tooltip: `Reasoning: ${nice}`,
+    });
+  }
+  if (meta.mode) {
+    const mode = String(meta.mode);
+    badges.push({
+      id: "mode",
+      iconKind: "mode",
+      label: mode,
+      tooltip: `Mode: ${mode}`,
+    });
+  }
+  return badges;
 }
 
 /**
@@ -244,20 +403,37 @@ function isRunningStatus(status) {
 }
 
 /**
- * Cleans raw terminal screen snapshots by normalizing non-breaking spaces,
- * trimming trailing whitespace, removing full-width divider lines, and
- * collapsing large runs of empty lines left by fixed-row PTY screens.
+ * Enhances terminal snapshots by normalizing non-breaking spaces, trimming trailing
+ * whitespace, removing TUI frame divider/border lines, unwrapping Unicode box rows,
+ * and collapsing large runs of empty lines left by fixed-row PTY screens.
  */
 export function cleanTerminalSnapshot(rawText) {
   const src = String(rawText ?? "").replace(/\r\n/g, "\n").replace(/\u00a0/g, " ");
   if (!src.trim()) return "";
+  const rawLines = src.split("\n");
+  const isBoxRule = (t) =>
+    /^[╭╮╰╯┌┐└┘├┤┬┴┼─━═┄┈\-_\s]+$/.test(t) &&
+    (/[╭╮╰╯┌┐└┘├┤┬┴┼─━═┄┈]{8,}/.test(t) || /^[-_]{24,}$/.test(t));
+  const isNeighborBox = (idx) => {
+    const prev = rawLines[idx - 1]?.trim() ?? "";
+    const next = rawLines[idx + 1]?.trim() ?? "";
+    const prevBoxed = Boolean(prev) && !/^[╰└]/.test(prev) && (isBoxRule(prev) || /^[│┃║].*[│┃║]$/.test(prev));
+    const nextBoxed = Boolean(next) && !/^[╭┌]/.test(next) && (isBoxRule(next) || /^[│┃║].*[│┃║]$/.test(next));
+    return prevBoxed || nextBoxed;
+  };
   const cleaned = [];
   let blankRun = 0;
-  for (const rawLine of src.split("\n")) {
-    const line = rawLine.replace(/[ \t]+$/g, "");
-    const trimmed = line.trim();
-    if (/^[─━═┄┈\-_]{24,}$/.test(trimmed)) {
+  for (let i = 0; i < rawLines.length; i++) {
+    let line = rawLines[i].replace(/[ \t]+$/g, "");
+    let trimmed = line.trim();
+    if (isBoxRule(trimmed) || /^[│┃║]\s*[│┃║]$/.test(trimmed)) {
       continue;
+    }
+    const boxed = trimmed.match(/^[│┃]\s*(.+?)\s*[│┃]$/);
+    if (boxed && isNeighborBox(i)) {
+      line = boxed[1];
+      trimmed = line.trim();
+      if (!trimmed) continue;
     }
     if (!trimmed) {
       blankRun += 1;
@@ -273,6 +449,230 @@ export function cleanTerminalSnapshot(rawText) {
     cleaned.pop();
   }
   return cleaned.join("\n");
+}
+
+/**
+ * Extracts a single-line fold summary from a user prompt (used for delegated subagent prompts).
+ */
+export function summarizeUserPrompt(rawText, maxChars = 96) {
+  const src = String(rawText ?? "").replace(/\r\n/g, "\n").trim();
+  if (!src) return "";
+  const firstNonEmpty = src
+    .split("\n")
+    .map((l) => l.trim())
+    .find(Boolean) ?? "";
+  const clean = firstNonEmpty
+    .replace(/^#{1,6}\s+/, "")
+    .replace(/^[-*+]\s+/, "")
+    .replace(/^\d+\.\s+/, "")
+    .replace(/^>\s+/, "")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\*([^*]+)\*/g, "$1")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/[ \t]+/g, " ")
+    .trim();
+  if (clean.length <= maxChars) return clean;
+  return `${clean.slice(0, Math.max(1, maxChars - 1))}…`;
+}
+
+/**
+ * Parses tool call detail into T3 Code display modes: unified/patch `diff`,
+ * shell `command` (+ output), or `plain` monospace output.
+ */
+export function parseToolDetail(step) {
+  const raw = String(step?.detail ?? "").replace(/\r\n/g, "\n");
+  const title = String(step?.title ?? "").trim();
+  const kind = String(step?.tool_kind ?? "").toLowerCase();
+  const isCommand =
+    kind === "execute" ||
+    kind === "command" ||
+    /\b(bash|sh|exec|run|shell|shell_command|exec_command)\b/i.test(title);
+
+  const lines = raw ? raw.split("\n") : [];
+  const hasDiffHeaders =
+    raw.startsWith("--- ") ||
+    raw.startsWith("diff --git") ||
+    raw.startsWith("*** Begin Patch") ||
+    raw.startsWith("*** Update File:") ||
+    raw.startsWith("*** Add File:");
+  const hasHunkOrSigns =
+    /\n@@[^\n]*@@/.test(raw) ||
+    ((/^(?:---|\+\+\+|\*\*\*)/m.test(raw)) && (/^[+-]/m.test(raw)));
+  const isDiff = Boolean(raw) && !isCommand && (hasDiffHeaders || hasHunkOrSigns);
+
+  if (isDiff) {
+    let additions = 0;
+    let deletions = 0;
+    const diffLines = [];
+    const limit = 120;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      let lineKind = "ctx";
+      if (
+        line.startsWith("diff --git") ||
+        line.startsWith("index ") ||
+        line.startsWith("--- ") ||
+        line.startsWith("+++ ") ||
+        line.startsWith("*** ")
+      ) {
+        lineKind = "meta";
+      } else if (line.startsWith("@@")) {
+        lineKind = "hunk";
+      } else if (line.startsWith("+")) {
+        lineKind = "add";
+        additions += 1;
+      } else if (line.startsWith("-")) {
+        lineKind = "del";
+        deletions += 1;
+      }
+      if (i < limit) {
+        diffLines.push({ kind: lineKind, text: line });
+      }
+    }
+    return {
+      mode: "diff",
+      diffLines,
+      additions,
+      deletions,
+      truncatedLines: Math.max(0, lines.length - limit),
+      command: "",
+      output: "",
+      raw,
+    };
+  }
+
+  if (isCommand) {
+    let command = title;
+    let output = raw.trim();
+    if (title && raw) {
+      if (raw === title) {
+        output = "";
+      } else if (raw.startsWith(`${title}\n\n`)) {
+        output = raw.slice(title.length + 2).trim();
+      } else if (raw.startsWith(`${title}\n`)) {
+        output = raw.slice(title.length + 1).trim();
+      }
+    }
+    return {
+      mode: "command",
+      diffLines: [],
+      additions: 0,
+      deletions: 0,
+      truncatedLines: 0,
+      command,
+      output,
+      raw,
+    };
+  }
+
+  return {
+    mode: "plain",
+    diffLines: [],
+    additions: 0,
+    deletions: 0,
+    truncatedLines: 0,
+    command: "",
+    output: raw.trim(),
+    raw,
+  };
+}
+
+function normalizeRelativeFilePath(rawPath, cwd = "") {
+  let p = String(rawPath ?? "").trim().replace(/^['"]|['"]$/g, "");
+  if (!p || p === "/dev/null") return "";
+  if (p.startsWith("a/") || p.startsWith("b/")) p = p.slice(2);
+  if (cwd) {
+    const cleanCwd = String(cwd).replace(/[\\/]+$/, "");
+    if (cleanCwd && (p.startsWith(`${cleanCwd}/`) || p.startsWith(`${cleanCwd}\\`))) {
+      p = p.slice(cleanCwd.length + 1);
+    }
+  }
+  if (p.startsWith("./")) p = p.slice(2);
+  return p;
+}
+
+/**
+ * Aggregates edited/written file paths and +/- line stats across a turn's tool steps
+ * for T3 Code's `ChangedFilesTree` summary card.
+ */
+export function extractTurnChangedFiles(steps, cwd = "") {
+  const list = Array.isArray(steps) ? steps : [];
+  const byPath = new Map();
+
+  const recordFile = (rawPath, additions, deletions) => {
+    const clean = normalizeRelativeFilePath(rawPath, cwd);
+    if (!clean) return;
+    const prev = byPath.get(clean);
+    if (prev) {
+      prev.additions += additions;
+      prev.deletions += deletions;
+    } else {
+      byPath.set(clean, { path: clean, additions, deletions });
+    }
+  };
+
+  for (const step of list) {
+    if (!step || step.kind !== "tool_call" || step.status === "failed") continue;
+    const toolKind = String(step.tool_kind ?? "").toLowerCase();
+    const title = String(step.title ?? "").trim();
+    const raw = String(step.detail ?? "");
+    const titleEdit = title.match(/^(?:Edit|MultiEdit|Write|Create|Patch|edit_file|write_file|replace_file_content|apply_patch)\s+(.+)$/i);
+    const hasDiffDetail =
+      raw.startsWith("--- ") ||
+      raw.startsWith("diff --git") ||
+      /\*\*\*\s+(?:Update|Add|Delete)\s+File:/.test(raw);
+    const isEditTool = toolKind === "edit" || toolKind === "write" || toolKind === "patch" || Boolean(titleEdit) || hasDiffDetail;
+    if (!isEditTool) continue;
+
+    const parsed = parseToolDetail(step);
+    const additions = parsed.mode === "diff" ? parsed.additions : 0;
+    const deletions = parsed.mode === "diff" ? parsed.deletions : 0;
+
+    const patchFiles = [...raw.matchAll(/^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$/gm)].map((m) => m[1]);
+    if (patchFiles.length > 0) {
+      if (patchFiles.length === 1) {
+        recordFile(patchFiles[0], additions, deletions);
+      } else {
+        patchFiles.forEach((pf) => recordFile(pf, 0, 0));
+      }
+      continue;
+    }
+
+    const plusMatch = raw.match(/^\+\+\+\s+([^\n]+)/m);
+    const minusMatch = raw.match(/^---\s+([^\n]+)/m);
+    const diffPath = (plusMatch && plusMatch[1].trim() !== "/dev/null" ? plusMatch[1] : minusMatch?.[1]) ?? null;
+    if (diffPath) {
+      recordFile(diffPath, additions, deletions);
+      continue;
+    }
+
+    if (titleEdit?.[1]) {
+      recordFile(titleEdit[1], additions, deletions);
+    }
+  }
+
+  const files = [...byPath.values()];
+  const totalAdditions = files.reduce((acc, f) => acc + f.additions, 0);
+  const totalDeletions = files.reduce((acc, f) => acc + f.deletions, 0);
+  return { files, totalAdditions, totalDeletions };
+}
+
+/**
+ * Resolves T3 Code's 4-bar rising EffortGlyph levels from reasoning effort settings.
+ */
+export function resolveEffortVisual(rawValue) {
+  const v = String(rawValue ?? "").trim().toLowerCase();
+  if (!v) return null;
+  if (v === "off" || v === "none") return { bars: 4, active: 0 };
+  if (v === "minimal" || v === "low" || v === "min") return { bars: 4, active: 1 };
+  if (v === "medium" || v === "med" || v === "normal" || v === "balanced" || v === "default") {
+    return { bars: 4, active: 2 };
+  }
+  if (v === "high") return { bars: 4, active: 3 };
+  if (v === "xhigh" || v === "extra_high" || v === "extra-high" || v === "max" || v === "ultrathink") {
+    return { bars: 4, active: 4 };
+  }
+  return null;
 }
 
 /**
@@ -295,6 +695,7 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
           id: "term-snap-0",
           turn: turn ?? 0,
           text: cleaned,
+          shellBlocks: parseTerminalShellBlocks(cleaned),
           lineCount: cleaned.split("\n").length,
           ts_ms: 0,
         },
@@ -370,13 +771,16 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
       flushStderr();
       currentSpeakerKey = null;
       const env = parseUserEnvelope(entry.text, entry.from ?? null);
+      const body = env.body || String(entry.text ?? "").trim();
       items.push({
         kind: "user",
         id: `u-${idx}`,
         turn: entry.turn ?? 0,
         from: env.from,
         reach: env.reach,
-        body: env.body || String(entry.text ?? "").trim(),
+        body,
+        isDelegated: Boolean(env.from),
+        foldSummary: summarizeUserPrompt(body),
         ts_ms: entry.ts_ms ?? 0,
       });
       return;
@@ -399,6 +803,7 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
           runningCount: 0,
           failedCount: 0,
           activeTitle: null,
+          latestPlan: null,
           ts_ms: entry.ts_ms ?? 0,
           defaultExpanded: false,
         };
@@ -408,12 +813,20 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
         const text = normalizeThoughtText(entry.text);
         if (text) {
           activeGroup.thoughtCount += 1;
-          activeGroup.steps.push({ kind: "thought", id: `th-${idx}`, text, ts_ms: entry.ts_ms ?? 0 });
+          activeGroup.steps.push({
+            kind: "thought",
+            id: `th-${idx}`,
+            text,
+            preview: thoughtPreview(text),
+            ts_ms: entry.ts_ms ?? 0,
+          });
         }
       } else if (kind === "tool_call") {
         const status = entry.status || "completed";
         const title = entry.title || entry.id || "Tool call";
         const info = summarizeToolTitle(title);
+        const detail = entry.detail ? String(entry.detail) : null;
+        const parsedDetail = detail ? parseToolDetail({ tool_kind: entry.tool_kind, title, detail }) : null;
         activeGroup.toolCount += 1;
         if (isRunningStatus(status)) {
           activeGroup.runningCount += 1;
@@ -429,6 +842,11 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
           summaryTitle: info.summary,
           extraLines: info.extraLines,
           multiline: info.multiline,
+          detail,
+          diffStats: parsedDetail?.mode === "diff"
+            ? { additions: parsedDetail.additions, deletions: parsedDetail.deletions }
+            : null,
+          expandable: Boolean(info.multiline || (title && title.length > 120) || detail),
           tool_kind: entry.tool_kind || "other",
           status,
           ts_ms: entry.ts_ms ?? 0,
@@ -436,8 +854,11 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
       } else if (kind === "plan") {
         const planItems = Array.isArray(entry.items) ? entry.items.filter(Boolean) : [];
         if (planItems.length > 0) {
+          const parsedItems = parsePlanItems(planItems);
+          const planStep = { kind: "plan", id: `pl-${idx}`, items: planItems, parsedItems, ts_ms: entry.ts_ms ?? 0 };
           activeGroup.planCount += 1;
-          activeGroup.steps.push({ kind: "plan", id: `pl-${idx}`, items: planItems, ts_ms: entry.ts_ms ?? 0 });
+          activeGroup.steps.push(planStep);
+          activeGroup.latestPlan = planStep;
         }
       } else if (kind === "permission") {
         activeGroup.permissionCount += 1;
@@ -514,19 +935,49 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
   flushStderr();
 
   // Prune empty activity groups (for instance empty whitespace thoughts).
+  const cwd = options?.cwd || "";
   const compact = items.filter((it) => it.kind !== "activity_group" || it.steps.length > 0);
   const lastIdx = compact.length - 1;
   const finalAssistantIdxByTurn = new Map();
+  const lastGroupIdxByTurn = new Map();
+  const toolStepsByTurn = new Map();
   compact.forEach((it, idx) => {
+    const turn = it.turn ?? 0;
     if (it.kind === "assistant") {
-      finalAssistantIdxByTurn.set(it.turn ?? 0, idx);
+      finalAssistantIdxByTurn.set(turn, idx);
+    } else if (it.kind === "activity_group") {
+      lastGroupIdxByTurn.set(turn, idx);
+      const prev = toolStepsByTurn.get(turn) ?? [];
+      for (const st of it.steps) {
+        if (st.kind === "tool_call") prev.push(st);
+      }
+      toolStepsByTurn.set(turn, prev);
     }
   });
+  const changedByTurn = new Map();
+  for (const [turn, steps] of toolStepsByTurn.entries()) {
+    const summary = extractTurnChangedFiles(steps, cwd);
+    if (summary.files.length > 0) changedByTurn.set(turn, summary);
+  }
   compact.forEach((it, idx) => {
+    const turn = it.turn ?? 0;
+    const changed = changedByTurn.get(turn) ?? null;
     if (it.kind === "activity_group") {
       it.defaultExpanded = it.runningCount > 0 || (agentWorking && idx === lastIdx);
+      if (
+        changed &&
+        !finalAssistantIdxByTurn.has(turn) &&
+        !agentWorking &&
+        lastGroupIdxByTurn.get(turn) === idx
+      ) {
+        it.changedFiles = changed;
+      }
     } else if (it.kind === "assistant") {
-      it.isFinalTurnReply = finalAssistantIdxByTurn.get(it.turn ?? 0) === idx;
+      const isFinal = finalAssistantIdxByTurn.get(turn) === idx;
+      it.isFinalTurnReply = isFinal;
+      if (isFinal && changed) {
+        it.changedFiles = changed;
+      }
     }
   });
   return compact;
@@ -541,30 +992,48 @@ const isModeOption = (o) =>
 
 const CAPABILITY_ORDER = [
   (o) => o.category === "model" || o.id === "model",
-  (o) => o.category === "thought_level" || o.id === "reasoning_effort" || o.id === "thinking",
+  (o) => o.id === "context" || o.id === "context_window",
+  (o) =>
+    o.category === "thought_level" ||
+    o.id === "reasoning_effort" ||
+    o.id === "reasoning" ||
+    o.id === "effort" ||
+    o.id === "thinking",
   (o) => o.id === "fast-mode" || o.id === "fast" || (o.kind === "boolean" && o.category === "model_config"),
   isModeOption,
 ];
 
 function shortLabelFor(opt, rankIdx) {
   if (rankIdx === 0) return "Model";
-  if (rankIdx === 1) return "Reasoning";
-  if (rankIdx === 2) return "Fast";
-  if (rankIdx === 3) return "Mode";
+  if (rankIdx === 1) return "Ctx";
+  if (rankIdx === 2) return "Reasoning";
+  if (rankIdx === 3) return "Fast";
+  if (rankIdx === 4) return "Mode";
   if (opt.id === "collaboration_mode") return "Collab";
   return opt.name || opt.id;
 }
 
 function iconKindFor(rankIdx) {
   if (rankIdx === 0) return "model";
-  if (rankIdx === 1) return "thinking";
-  if (rankIdx === 2) return "fast";
-  if (rankIdx === 3) return "mode";
+  if (rankIdx === 1) return "extra";
+  if (rankIdx === 2) return "thinking";
+  if (rankIdx === 3) return "fast";
+  if (rankIdx === 4) return "mode";
   return "extra";
 }
 
 function pillLabelFor(opt, shortLabel, iconKind, currentValue, currentLabel) {
-  if (iconKind === "fast") return shortLabel;
+  if (iconKind === "fast") {
+    if (opt.kind !== "boolean") {
+      const lower = String(currentValue ?? "").trim().toLowerCase();
+      return lower === "false" || lower === "off" || lower === "" ? "Fast · Off" : shortLabel;
+    }
+    return shortLabel;
+  }
+  if (opt.id === "context" || opt.id === "context_window") {
+    const cleanVal = String(currentLabel ?? currentValue ?? "").trim();
+    return cleanVal ? `Ctx ${cleanVal}` : shortLabel;
+  }
   if (iconKind === "extra") {
     return currentLabel.toLowerCase() === "default" ? shortLabel : currentLabel;
   }
@@ -638,8 +1107,8 @@ export function normalizeConfigOptions(rawOptions, record) {
     const rawChoices = (Array.isArray(raw.options) ? raw.options : [])
       .map((c) => ({
         value: String(c?.value ?? ""),
-        name: String(c?.name ?? c?.value ?? ""),
-        description: c?.description ? String(c.description) : null,
+        name: String(c?.name ?? c?.value ?? "").replace(/\u200b/g, "").trim(),
+        description: c?.description ? String(c.description).replace(/\u200b/g, "").trim() : null,
         group: c?.group ? String(c.group) : null,
       }))
       .filter((c) => c.value.length > 0);
@@ -672,12 +1141,15 @@ export function normalizeConfigOptions(rawOptions, record) {
     const iconKind = iconKindFor(rankIdx);
     const isNonDefault = kind === "boolean"
       ? currentValue === true
-      : (currentValue != null && String(currentValue) !== "" && String(currentValue).toLowerCase() !== "default");
+      : iconKind === "fast"
+        ? currentValue != null && !["", "false", "off", "default"].includes(String(currentValue).trim().toLowerCase())
+        : (currentValue != null && String(currentValue) !== "" && String(currentValue).toLowerCase() !== "default");
     normalized.push({
       ...descriptor,
       shortLabel,
       iconKind,
       pillLabel: pillLabelFor(descriptor, shortLabel, iconKind, currentValue, currentLabel),
+      effortVisual: iconKind === "thinking" ? resolveEffortVisual(currentValue ?? currentLabel) : null,
       isNonDefault,
       _rank: rankIdx >= 0 ? rankIdx : 10 + idx,
     });

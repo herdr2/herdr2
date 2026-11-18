@@ -231,6 +231,7 @@ pub(super) fn service_env(mut env: BTreeMap<String, String>) -> BTreeMap<String,
             && !SERVICE.contains(&k.as_str())
             && !super::SSH_LOGIN.contains(&k.as_str())
     });
+    super::strip_agy_wrapper_env(&mut env, None);
     env
 }
 

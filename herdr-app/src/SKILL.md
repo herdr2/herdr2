@@ -20,12 +20,6 @@ prints the built-in command list even without an open window. Do not launch bare
 signal or restart the person's app or core. A window closing does not kill
 its terminals.
 
-`app.check_updates` checks for newer releases. Settings reports "Up to date"
-only after a successful check; on failure, check the connection and retry.
-Package-managed cores are checked but updated through their package manager.
-Dismiss a core update error with its × or `overlay.close {id:"core-update-error"}`;
-it stays dismissed until the error changes or the update recovers.
-
 ## Show something when asked
 
 New spaces and tabs are shown immediately: only create them when asked.
@@ -188,9 +182,6 @@ capture or permissions. It needs a running window that has drawn a frame;
 `HERDR2_APP_HOME` selects the window, as for `status`.
 
 ## Problems and safety
-
-If Herdr2 misbehaves, `herdr2 feedback "<what happened>"` drafts a report.
-The person reviews and sends it; it does not silently send feedback.
 
 Never experiment with pointer/key automation on the person's real display.
 When developing the app on Linux, its `scripts/sandbox` provides an isolated

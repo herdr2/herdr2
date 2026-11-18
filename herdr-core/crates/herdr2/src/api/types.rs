@@ -387,6 +387,28 @@ pub struct ReadParams {
     pub timeout: Option<f64>,
 }
 
+/// Session configuration & context-usage metadata inferred from a transcript.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReadSessionMeta {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_usage: Option<crate::acp::proto::AcpContextUsage>,
+}
+
+impl ReadSessionMeta {
+    pub fn is_empty(&self) -> bool {
+        self.model.is_none()
+            && self.reasoning_effort.is_none()
+            && self.mode.is_none()
+            && self.context_usage.is_none()
+    }
+}
+
 #[derive(Serialize, JsonSchema)]
 pub struct ReadResult {
     pub text: String,
@@ -399,6 +421,9 @@ pub struct ReadResult {
     /// Structured JSONL transcript entries (included for default full transcript reads).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entries: Vec<crate::transcript::Entry>,
+    /// Model/mode/context usage metadata inferred from CLI agent session logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_meta: Option<ReadSessionMeta>,
 }
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema, Default)]

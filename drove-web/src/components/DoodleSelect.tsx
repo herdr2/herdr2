@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
 import { useT } from "../i18n";
 
@@ -55,6 +55,7 @@ export function DoodleSelect({
   title?: string;
 }) {
   const { t } = useT();
+  const listboxId = useId();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [active, setActive] = useState(0);
@@ -199,6 +200,7 @@ export function DoodleSelect({
         title={title}
         aria-haspopup="listbox"
         aria-expanded={open}
+        aria-controls={open ? listboxId : undefined}
         onClick={() => setOpen((o) => !o)}
         onKeyDown={onTriggerKeyDown}
       >
@@ -215,6 +217,7 @@ export function DoodleSelect({
         createPortal(
           <div
             ref={panelRef}
+            id={listboxId}
             className={`doodle-select__panel${pos.up ? " doodle-select__panel--up" : ""}`}
             style={
               pos.up
@@ -252,6 +255,7 @@ export function DoodleSelect({
                     data-idx={i}
                     role="option"
                     aria-selected={o.value === value}
+                    aria-disabled={o.disabled || undefined}
                     className={
                       "doodle-select__opt" +
                       (i === active ? " doodle-select__opt--active" : "") +

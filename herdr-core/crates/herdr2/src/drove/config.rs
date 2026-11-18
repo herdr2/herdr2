@@ -75,10 +75,10 @@ pub fn default_roles() -> BTreeMap<String, RoleConfig> {
             summary: Some("核心功能实现、模块重构与 Bug 修复".into()),
             access: Some(RoleAccessMode::Writable),
             allowed_paths: Vec::new(),
-            primary: RoleTarget { agent: "agy".into(), model: None, effort: Effort::High },
+            primary: RoleTarget { agent: "agy".into(), model: None, effort: Effort::High, fast: false, context: None },
             fallbacks: vec![
-                RoleTarget { agent: "claude".into(), model: None, effort: Effort::High },
-                RoleTarget { agent: "codex".into(), model: None, effort: Effort::High },
+                RoleTarget { agent: "claude".into(), model: None, effort: Effort::High, fast: false, context: None },
+                RoleTarget { agent: "codex".into(), model: None, effort: Effort::High, fast: false, context: None },
             ],
             prompt: None,
         },
@@ -98,8 +98,8 @@ pub fn default_roles() -> BTreeMap<String, RoleConfig> {
                 "**/fixtures/**".into(),
                 "**/testdata/**".into(),
             ],
-            primary: RoleTarget { agent: "dsh".into(), model: None, effort: Effort::Medium },
-            fallbacks: vec![RoleTarget { agent: "agy".into(), model: None, effort: Effort::Medium }],
+            primary: RoleTarget { agent: "dsh".into(), model: None, effort: Effort::Medium, fast: false, context: None },
+            fallbacks: vec![RoleTarget { agent: "agy".into(), model: None, effort: Effort::Medium, fast: false, context: None }],
             prompt: None,
         },
     );
@@ -120,8 +120,8 @@ pub fn default_roles() -> BTreeMap<String, RoleConfig> {
                 "**/*.mmd".into(),
                 "**/*.puml".into(),
             ],
-            primary: RoleTarget { agent: "agy".into(), model: None, effort: Effort::Medium },
-            fallbacks: vec![RoleTarget { agent: "claude".into(), model: None, effort: Effort::Medium }],
+            primary: RoleTarget { agent: "agy".into(), model: None, effort: Effort::Medium, fast: false, context: None },
+            fallbacks: vec![RoleTarget { agent: "claude".into(), model: None, effort: Effort::Medium, fast: false, context: None }],
             prompt: None,
         },
     );
@@ -132,8 +132,8 @@ pub fn default_roles() -> BTreeMap<String, RoleConfig> {
             summary: Some("只读异构代码审查、并发安全与架构审计".into()),
             access: Some(RoleAccessMode::Readonly),
             allowed_paths: Vec::new(),
-            primary: RoleTarget { agent: "codex".into(), model: None, effort: Effort::High },
-            fallbacks: vec![RoleTarget { agent: "agy".into(), model: None, effort: Effort::High }],
+            primary: RoleTarget { agent: "codex".into(), model: None, effort: Effort::High, fast: false, context: None },
+            fallbacks: vec![RoleTarget { agent: "agy".into(), model: None, effort: Effort::High, fast: false, context: None }],
             prompt: None,
         },
     );
@@ -144,8 +144,8 @@ pub fn default_roles() -> BTreeMap<String, RoleConfig> {
             summary: Some("跨仓源码检索、架构摸底与日志分析".into()),
             access: Some(RoleAccessMode::Readonly),
             allowed_paths: Vec::new(),
-            primary: RoleTarget { agent: "dsh".into(), model: None, effort: Effort::High },
-            fallbacks: vec![RoleTarget { agent: "agy".into(), model: None, effort: Effort::High }],
+            primary: RoleTarget { agent: "dsh".into(), model: None, effort: Effort::High, fast: false, context: None },
+            fallbacks: vec![RoleTarget { agent: "agy".into(), model: None, effort: Effort::High, fast: false, context: None }],
             prompt: None,
         },
     );
@@ -165,6 +165,34 @@ impl Default for DroveConfig {
     }
 }
 
+/// Parses a token window size such as `"8k"`, `"128k"`, `"1m"`, or `"32768"` (1K..=4M).
+pub fn parse_ai_token_size(raw: &str) -> Option<u32> {
+    let s = raw.trim().to_ascii_lowercase();
+    if s.is_empty() || s == "auto" || s == "default" {
+        return None;
+    }
+    let val = if let Some(num) = s.strip_suffix('k') {
+        let n: f64 = num.trim().parse().ok()?;
+        if !n.is_finite() || n <= 0.0 {
+            return None;
+        }
+        (n * 1024.0).round()
+    } else if let Some(num) = s.strip_suffix('m') {
+        let n: f64 = num.trim().parse().ok()?;
+        if !n.is_finite() || n <= 0.0 {
+            return None;
+        }
+        (n * 1_048_576.0).round()
+    } else {
+        let n: u32 = s.parse().ok()?;
+        n as f64
+    };
+    if !(1024.0..=4_194_304.0).contains(&val) {
+        return None;
+    }
+    Some(val as u32)
+}
+
 /// Validates and normalizes a `DroveConfig` before persisting or applying.
 pub fn validate_config(cfg: &mut DroveConfig) -> Result<(), RpcError> {
     if cfg.max_concurrency_default < 1 || cfg.max_concurrency_default > 16 {
@@ -176,6 +204,43 @@ pub fn validate_config(cfg: &mut DroveConfig) -> Result<(), RpcError> {
         cfg.ai.base_url = String::new();
     }
     cfg.ai.model = cfg.ai.model.trim().to_string();
+    cfg.ai.effort = cfg.ai.effort.trim().to_ascii_lowercase();
+    if cfg.ai.effort.is_empty() {
+        cfg.ai.effort = "low".into();
+    }
+    if !matches!(cfg.ai.effort.as_str(), "auto" | "none" | "low" | "medium" | "high") {
+        return Err(RpcError::invalid_params("ai.effort must be auto, none, low, medium, or high"));
+    }
+    if let Some(ctx) = cfg.ai.context_window.take() {
+        let clean = ctx.trim().to_ascii_lowercase();
+        if !clean.is_empty() && clean != "auto" && clean != "default" {
+            if parse_ai_token_size(&clean).is_none() {
+                return Err(RpcError::invalid_params(
+                    "ai.contextWindow must be auto or a token size between 1k and 4m (e.g. 8k, 32k, 128k, 1m)",
+                ));
+            }
+            cfg.ai.context_window = Some(clean);
+        }
+    }
+    if let Some(mt) = cfg.ai.max_tokens {
+        if mt == 0 {
+            cfg.ai.max_tokens = None;
+        } else if !(64..=131_072).contains(&mt) {
+            return Err(RpcError::invalid_params("ai.maxTokens must be between 64 and 131072"));
+        }
+    }
+    cfg.ai.conflict_policy = cfg.ai.conflict_policy.trim().to_string();
+    cfg.ai.question_mode = cfg.ai.question_mode.trim().to_string();
+    cfg.ai.loop_detect = cfg.ai.loop_detect.trim().to_string();
+    if !matches!(cfg.ai.conflict_policy.as_str(), "off" | "warn" | "auto_worktree") {
+        return Err(RpcError::invalid_params("ai.conflictPolicy must be off, warn, or auto_worktree"));
+    }
+    if !matches!(cfg.ai.question_mode.as_str(), "off" | "draft" | "auto" | "auto_when_offline") {
+        return Err(RpcError::invalid_params("ai.questionMode must be off, draft, auto, or auto_when_offline"));
+    }
+    if !matches!(cfg.ai.loop_detect.as_str(), "off" | "warn" | "steer_once") {
+        return Err(RpcError::invalid_params("ai.loopDetect must be off, warn, or steer_once"));
+    }
     if let Some(url) = &cfg.magpie.gateway_url {
         let trimmed = url.trim();
         if trimmed.is_empty() {
@@ -444,6 +509,8 @@ pub struct CachedAgentModels {
     pub default_effort: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_info: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_contexts: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -542,5 +609,45 @@ mod tests {
         clear_ai_key(&paths).unwrap();
         assert_eq!(read_ai_key(&paths).0, None);
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn parses_and_validates_ai_model_parameters() {
+        assert_eq!(parse_ai_token_size(""), None);
+        assert_eq!(parse_ai_token_size("auto"), None);
+        assert_eq!(parse_ai_token_size("default"), None);
+        assert_eq!(parse_ai_token_size("8k"), Some(8192));
+        assert_eq!(parse_ai_token_size("128K"), Some(131_072));
+        assert_eq!(parse_ai_token_size("1m"), Some(1_048_576));
+        assert_eq!(parse_ai_token_size("32768"), Some(32_768));
+        assert_eq!(parse_ai_token_size("512"), None);
+        assert_eq!(parse_ai_token_size("8m"), None);
+        assert_eq!(parse_ai_token_size("abc"), None);
+
+        let mut cfg = DroveConfig::default();
+        cfg.ai.effort = " HIGH ".into();
+        cfg.ai.context_window = Some(" 64K ".into());
+        cfg.ai.max_tokens = Some(2048);
+        validate_config(&mut cfg).unwrap();
+        assert_eq!(cfg.ai.effort, "high");
+        assert_eq!(cfg.ai.context_window.as_deref(), Some("64k"));
+        assert_eq!(cfg.ai.max_tokens, Some(2048));
+
+        cfg.ai.context_window = Some("auto".into());
+        cfg.ai.max_tokens = Some(0);
+        validate_config(&mut cfg).unwrap();
+        assert_eq!(cfg.ai.context_window, None);
+        assert_eq!(cfg.ai.max_tokens, None);
+
+        cfg.ai.effort = "ultra".into();
+        assert!(validate_config(&mut cfg).is_err());
+
+        cfg.ai.effort = "low".into();
+        cfg.ai.context_window = Some("512".into());
+        assert!(validate_config(&mut cfg).is_err());
+
+        cfg.ai.context_window = None;
+        cfg.ai.max_tokens = Some(16);
+        assert!(validate_config(&mut cfg).is_err());
     }
 }

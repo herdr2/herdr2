@@ -10,6 +10,12 @@
 use std::path::Path;
 
 fn walk(dir: &Path, base: &Path, root: &Path, out: &mut Vec<String>) {
+    if let Ok(rel_dir) = dir.strip_prefix(base) {
+        let rel_dir = rel_dir.to_string_lossy().replace('\\', "/");
+        if !rel_dir.is_empty() {
+            println!("cargo:rerun-if-changed={rel_dir}");
+        }
+    }
     let mut entries: Vec<_> = std::fs::read_dir(dir).unwrap().flatten().map(|e| e.path()).collect();
     entries.sort();
     for p in entries {

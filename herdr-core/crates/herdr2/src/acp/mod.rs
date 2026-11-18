@@ -23,7 +23,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use transport::{CallError, ChildWaiter, Inbound, Transport};
 
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
 const TURN_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Debug)]
@@ -83,7 +83,11 @@ pub struct StartedSession {
 }
 
 /// Spawns the ACP child process and runs `initialize` + `session/new` (or `session/load`).
-pub async fn spawn_session(spec: SpawnSpec) -> Result<StartedSession, RpcError> {
+pub async fn spawn_session(mut spec: SpawnSpec) -> Result<StartedSession, RpcError> {
+    if spec.dangerously_skip_permissions {
+        presets::ensure_agy_skip_permissions(&mut spec.argv);
+    }
+    presets::apply_cursor_env_quirks(&spec.argv, &mut spec.env);
     let (transport, waiter, mut inbound_rx) = Transport::spawn(&spec.argv, &spec.env, &spec.cwd)?;
 
     let init_res = match setup_session(&transport, &spec, &mut inbound_rx).await {
@@ -143,6 +147,372 @@ pub fn bypass_mode_for_options(options: &[AcpConfigOption]) -> Option<(String, O
         .into_iter()
         .find(|candidate| opt.options.iter().any(|c| c.value == *candidate))?;
     Some((wire.to_string(), Some(opt.source.clone())))
+}
+
+/// Resolves a requested config option id against the session's advertised `config_options`.
+/// Maps reasoning aliases (`reasoning_effort` / `thought_level` / `effort` / `thinking` / `reasoning`) cleanly across adapters.
+pub fn resolve_config_option_id(requested_id: &str, options: &[AcpConfigOption]) -> String {
+    if options.iter().any(|o| o.id == requested_id) {
+        return requested_id.to_string();
+    }
+    if matches!(requested_id, "reasoning_effort" | "thought_level" | "effort" | "thinking" | "reasoning")
+        && let Some(found) = options.iter().find(|o| {
+            o.category.as_deref() == Some("thought_level")
+                || matches!(o.id.as_str(), "reasoning_effort" | "thought_level" | "effort" | "thinking" | "reasoning")
+        })
+    {
+        return found.id.clone();
+    }
+    if requested_id == "fast-mode"
+        && let Some(found) = options.iter().find(|o| o.id == "fast" || o.id == "fast-mode")
+    {
+        return found.id.clone();
+    }
+    requested_id.to_string()
+}
+
+fn parse_context_tokens(raw: &str) -> Option<u64> {
+    let s = raw.trim().to_ascii_lowercase();
+    if let Some(num) = s.strip_suffix('k') {
+        return num.trim().parse::<u64>().ok().map(|n| n.saturating_mul(1_000));
+    }
+    if let Some(num) = s.strip_suffix('m') {
+        return num.trim().parse::<u64>().ok().map(|n| n.saturating_mul(1_000_000));
+    }
+    s.parse::<u64>().ok()
+}
+
+/// Resolves an ACP `config_overrides` entry `(cfg_id, val)` against a session's advertised
+/// `config_options`, returning `Some((wire_id, wire_value, source))` or `None` when unsupported/no-op.
+pub(crate) fn resolve_config_override(
+    config_options: &[AcpConfigOption],
+    cfg_id: &str,
+    val: &Value,
+) -> Option<(String, Value, Option<String>)> {
+    if cfg_id.eq_ignore_ascii_case("context") {
+        let opt = config_options.iter().find(|o| o.id.eq_ignore_ascii_case("context"))?;
+        let raw = val.as_str()?.trim();
+        if raw.is_empty() || raw.eq_ignore_ascii_case("auto") || raw.eq_ignore_ascii_case("default") {
+            return None;
+        }
+        if opt.options.is_empty() {
+            return Some((opt.id.clone(), Value::String(raw.to_string()), Some(opt.source.clone())));
+        }
+        let chosen = if raw.eq_ignore_ascii_case("max") {
+            opt.options
+                .iter()
+                .max_by_key(|c| parse_context_tokens(&c.value).unwrap_or(0))
+                .map(|c| c.value.clone())?
+        } else if let Some(exact) = opt.options.iter().find(|c| c.value.eq_ignore_ascii_case(raw)) {
+            exact.value.clone()
+        } else if let Some(target_tokens) = parse_context_tokens(raw) {
+            opt.options
+                .iter()
+                .filter_map(|c| parse_context_tokens(&c.value).map(|toks| (toks, c)))
+                .min_by(|(a, _), (b, _)| {
+                    let da = a.abs_diff(target_tokens);
+                    let db = b.abs_diff(target_tokens);
+                    da.cmp(&db).then_with(|| b.cmp(a))
+                })
+                .map(|(_, c)| c.value.clone())
+                .unwrap_or_else(|| raw.to_string())
+        } else {
+            return None;
+        };
+        return Some((opt.id.clone(), Value::String(chosen), Some(opt.source.clone())));
+    }
+
+    let is_effort_req = matches!(cfg_id, "reasoning_effort" | "thought_level" | "effort" | "thinking" | "reasoning");
+    let opt = if is_effort_req {
+        config_options
+            .iter()
+            .find(|o| o.id == cfg_id)
+            .or_else(|| {
+                config_options.iter().find(|o| {
+                    o.category.as_deref() == Some("thought_level")
+                        || matches!(o.id.as_str(), "reasoning_effort" | "thought_level" | "effort" | "thinking" | "reasoning")
+                })
+            })
+    } else if matches!(cfg_id, "fast-mode" | "fast") {
+        config_options
+            .iter()
+            .find(|o| o.id == cfg_id)
+            .or_else(|| config_options.iter().find(|o| matches!(o.id.as_str(), "fast-mode" | "fast")))
+    } else {
+        config_options.iter().find(|o| o.id == cfg_id)
+    };
+
+    if matches!(cfg_id, "fast-mode" | "fast") {
+        if let Some(opt) = opt {
+            let wire_val = if opt.kind == "select" {
+                if let Some(b) = val.as_bool() {
+                    Value::String(if b { "true" } else { "false" }.into())
+                } else {
+                    val.clone()
+                }
+            } else {
+                val.clone()
+            };
+            return Some((opt.id.clone(), wire_val, Some(opt.source.clone())));
+        }
+        return Some((cfg_id.to_string(), val.clone(), None));
+    }
+
+    if is_effort_req && let Some(opt) = opt {
+        if let Some(raw) = val.as_str() {
+            if opt.options.is_empty() {
+                if opt.kind == "boolean" {
+                    let enable = !matches!(raw.trim().to_ascii_lowercase().as_str(), "none" | "off" | "false");
+                    return Some((opt.id.clone(), Value::Bool(enable), Some(opt.source.clone())));
+                }
+                return Some((opt.id.clone(), val.clone(), Some(opt.source.clone())));
+            }
+            if let Some(exact) = opt.options.iter().find(|c| c.value.eq_ignore_ascii_case(raw)) {
+                return Some((opt.id.clone(), Value::String(exact.value.clone()), Some(opt.source.clone())));
+            }
+            if opt.id == "thinking" {
+                let target = if matches!(raw.trim().to_ascii_lowercase().as_str(), "none" | "off" | "false") {
+                    "false"
+                } else {
+                    "true"
+                };
+                if let Some(found) = opt.options.iter().find(|c| c.value.eq_ignore_ascii_case(target)) {
+                    return Some((opt.id.clone(), Value::String(found.value.clone()), Some(opt.source.clone())));
+                }
+            }
+            if raw.eq_ignore_ascii_case("extra-high") {
+                if let Some(xh) = opt.options.iter().find(|c| c.value.eq_ignore_ascii_case("xhigh")) {
+                    return Some((opt.id.clone(), Value::String(xh.value.clone()), Some(opt.source.clone())));
+                }
+                if let Some(high) = opt.options.iter().find(|c| c.value.eq_ignore_ascii_case("high")) {
+                    return Some((opt.id.clone(), Value::String(high.value.clone()), Some(opt.source.clone())));
+                }
+            }
+            if raw.eq_ignore_ascii_case("xhigh") {
+                if let Some(xh) = opt.options.iter().find(|c| c.value.eq_ignore_ascii_case("extra-high")) {
+                    return Some((opt.id.clone(), Value::String(xh.value.clone()), Some(opt.source.clone())));
+                }
+                if let Some(high) = opt.options.iter().find(|c| c.value.eq_ignore_ascii_case("high")) {
+                    return Some((opt.id.clone(), Value::String(high.value.clone()), Some(opt.source.clone())));
+                }
+            }
+            if raw.eq_ignore_ascii_case("med")
+                && let Some(medium) = opt.options.iter().find(|c| c.value.eq_ignore_ascii_case("medium"))
+            {
+                return Some((opt.id.clone(), Value::String(medium.value.clone()), Some(opt.source.clone())));
+            }
+            return None;
+        }
+        return Some((opt.id.clone(), val.clone(), Some(opt.source.clone())));
+    }
+
+    let effective_id = opt.map(|o| o.id.clone()).unwrap_or_else(|| resolve_config_option_id(cfg_id, config_options));
+    let src = opt.map(|o| o.source.clone());
+    Some((effective_id, val.clone(), src))
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SplitModelVariant {
+    pub model: String,
+    pub effort: Option<String>,
+    pub fast: Option<bool>,
+    pub context: Option<String>,
+}
+
+const EFFORT_SUFFIXES: &[(&str, &str)] = &[
+    ("-extra-high", "xhigh"),
+    ("-xhigh", "xhigh"),
+    ("-minimal", "minimal"),
+    ("-medium", "medium"),
+    ("-med", "medium"),
+    ("-high", "high"),
+    ("-low", "low"),
+    ("-none", "none"),
+    ("-max", "max"),
+];
+
+/// Returns `true` when `model` encodes a reasoning/thinking effort directly (e.g. `-high`,
+/// `-high-fast`, `-thinking`, `-thinking-xhigh-fast`, `-extra-high`, or `[effort=medium]`).
+pub fn model_has_embedded_effort(model: &str) -> bool {
+    let lower = model.trim().to_ascii_lowercase();
+    if lower.is_empty() || matches!(lower.as_str(), "auto" | "default" | "default[]") {
+        return false;
+    }
+    let mut slug = lower.as_str();
+    if let Some(bracket_start) = lower.find('[')
+        && lower.ends_with(']')
+    {
+        let inner = &lower[bracket_start + 1..lower.len() - 1];
+        for entry in inner.split(',') {
+            let Some((k, v)) = entry.split_once('=') else { continue };
+            let k = k.trim();
+            let v = v.trim();
+            if matches!(k, "effort" | "reasoning_effort" | "reasoning" | "thought_level" | "thinking")
+                && !v.is_empty()
+                && !matches!(v, "auto" | "default")
+            {
+                return true;
+            }
+        }
+        slug = lower[..bracket_start].trim();
+    }
+    let slug = slug.strip_suffix("-fast").unwrap_or(slug);
+    slug.ends_with("-thinking") || EFFORT_SUFFIXES.iter().any(|(suffix, _)| slug.ends_with(suffix))
+}
+
+fn find_model_choice(candidate: &str, model_opt: &AcpConfigOption) -> Option<String> {
+    if let Some(found) = model_opt.options.iter().find(|c| c.value == candidate) {
+        return Some(found.value.clone());
+    }
+    if let Some(stripped) = candidate.strip_prefix("cursor-")
+        && let Some(found) = model_opt.options.iter().find(|c| c.value == stripped)
+    {
+        return Some(found.value.clone());
+    }
+    None
+}
+
+fn effort_option_accepts(eff_opt: &AcpConfigOption, eff: &str) -> bool {
+    if eff_opt.options.is_empty() {
+        return true;
+    }
+    if eff_opt.options.iter().any(|c| c.value.eq_ignore_ascii_case(eff)) {
+        return true;
+    }
+    if eff_opt.id == "thinking" {
+        let want = if matches!(eff, "none" | "off" | "false") { "false" } else { "true" };
+        return eff_opt.options.iter().any(|c| c.value.eq_ignore_ascii_case(want));
+    }
+    if eff.eq_ignore_ascii_case("xhigh") {
+        return eff_opt.options.iter().any(|c| c.value.eq_ignore_ascii_case("extra-high"));
+    }
+    false
+}
+
+/// Splits a variant model string (such as `"gemini-4-carbon-high"`, `"grok-4.7-high-fast"`,
+/// `"claude-opus-5-thinking-xhigh-fast"`, `"gpt-5.5-extra-high"`, or `"claude-opus-5-5[context=300k,effort=medium,fast=false]"`)
+/// into its parameterized ACP `model` choice and extracted `effort`/`fast`/`context` values.
+pub fn split_model_variant_for_options(model: &str, options: &[AcpConfigOption]) -> SplitModelVariant {
+    let unsplit = || SplitModelVariant { model: model.to_string(), ..Default::default() };
+    let Some(model_opt) = options.iter().find(|o| o.id == "model" || o.category.as_deref() == Some("model")) else {
+        return unsplit();
+    };
+    if model_opt.options.is_empty() || model_opt.options.iter().any(|c| c.value == model) {
+        return unsplit();
+    }
+
+    let trimmed = model.trim();
+    let mut raw_slug = trimmed;
+    let mut bracket_effort: Option<String> = None;
+    let mut bracket_fast: Option<bool> = None;
+    let mut bracket_context: Option<String> = None;
+    let mut has_brackets = false;
+
+    if let Some(bracket_start) = trimmed.find('[')
+        && trimmed.ends_with(']')
+    {
+        has_brackets = true;
+        raw_slug = trimmed[..bracket_start].trim();
+        let inner = &trimmed[bracket_start + 1..trimmed.len() - 1];
+        for entry in inner.split(',') {
+            let Some((k, v)) = entry.split_once('=') else { continue };
+            let k = k.trim().to_ascii_lowercase();
+            let v = v.trim();
+            if v.is_empty() {
+                continue;
+            }
+            match k.as_str() {
+                "context" | "context_window" if !matches!(v.to_ascii_lowercase().as_str(), "auto" | "default") => {
+                    bracket_context = Some(v.to_string());
+                }
+                "fast" | "fast-mode" => match v.to_ascii_lowercase().as_str() {
+                    "true" | "1" | "on" | "yes" => bracket_fast = Some(true),
+                    "false" | "0" | "off" | "no" => bracket_fast = Some(false),
+                    _ => {}
+                },
+                "effort" | "reasoning_effort" | "reasoning" | "thought_level" | "thinking"
+                    if !matches!(v.to_ascii_lowercase().as_str(), "auto" | "default") =>
+                {
+                    let lower_v = v.to_ascii_lowercase();
+                    let normalized = match lower_v.as_str() {
+                        "extra-high" => "xhigh".to_string(),
+                        "med" => "medium".to_string(),
+                        _ => lower_v,
+                    };
+                    bracket_effort = Some(normalized);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut matched_base = if has_brackets { find_model_choice(raw_slug, model_opt) } else { find_model_choice(raw_slug, model_opt) };
+    let mut peeled_fast: Option<bool> = None;
+    let mut peeled_effort: Option<String> = None;
+
+    if matched_base.is_none() {
+        let mut s = raw_slug;
+        if let Some(without_fast) = s.strip_suffix("-fast") {
+            peeled_fast = Some(true);
+            s = without_fast;
+            if let Some(base) = find_model_choice(s, model_opt) {
+                matched_base = Some(base);
+            }
+        }
+        if matched_base.is_none() {
+            for (suffix, mapped) in EFFORT_SUFFIXES {
+                if let Some(without_eff) = s.strip_suffix(suffix) {
+                    let base = find_model_choice(without_eff, model_opt).or_else(|| {
+                        without_eff
+                            .strip_suffix("-thinking")
+                            .and_then(|stem| find_model_choice(stem, model_opt))
+                    });
+                    if let Some(base) = base {
+                        matched_base = Some(base);
+                        peeled_effort = Some((*mapped).to_string());
+                        break;
+                    }
+                }
+            }
+        }
+        if matched_base.is_none()
+            && let Some(without_thinking) = s.strip_suffix("-thinking")
+            && let Some(base) = find_model_choice(without_thinking, model_opt)
+        {
+            matched_base = Some(base);
+            peeled_effort = Some("high".to_string());
+        }
+    }
+
+    let Some(base_model) = matched_base else {
+        return unsplit();
+    };
+
+    let final_effort = bracket_effort.clone().or(peeled_effort);
+    if bracket_effort.is_none()
+        && let Some(ref eff) = final_effort
+    {
+        let eff_id = resolve_config_option_id("reasoning_effort", options);
+        if let Some(eff_opt) = options.iter().find(|o| o.id == eff_id)
+            && !effort_option_accepts(eff_opt, eff)
+        {
+            return unsplit();
+        }
+    }
+
+    SplitModelVariant {
+        model: base_model,
+        effort: final_effort,
+        fast: bracket_fast.or(peeled_fast),
+        context: bracket_context,
+    }
+}
+
+/// Splits an effort-suffixed model slug (such as `"gemini-4-carbon-high"`) into base model + thought level
+/// when the session advertises only base model IDs alongside a thought/reasoning option.
+pub fn split_model_effort_for_options(model: &str, options: &[AcpConfigOption]) -> (String, Option<String>) {
+    let split = split_model_variant_for_options(model, options);
+    (split.model, split.effort)
 }
 
 /// Updates one config option in place (or inserts a minimal entry if missing).
@@ -356,22 +726,60 @@ async fn setup_session(
     if let Some(model) = &spec.model
         && !spec.config_overrides.contains_key("model")
     {
+        let split = split_model_variant_for_options(model, &config_options);
         let src = config_options.iter().find(|o| o.id == "model").map(|o| o.source.clone());
-        let val = json!(model);
+        let val = json!(split.model);
         if let Some(fresh) = apply_config_option(transport, &session_id, "model", &val, src.as_deref()).await? {
             config_options = fresh;
         } else {
             patch_config_value(&mut config_options, "model", &val);
         }
+        let has_explicit_effort = spec.config_overrides.keys().any(|k| {
+            matches!(
+                k.as_str(),
+                "reasoning_effort" | "thought_level" | "effort" | "thinking" | "reasoning"
+            )
+        });
+        let mut derived: Vec<(&str, Value)> = Vec::new();
+        if !has_explicit_effort && let Some(eff) = split.effort {
+            derived.push(("reasoning_effort", json!(eff)));
+        }
+        if !spec.config_overrides.contains_key("fast")
+            && !spec.config_overrides.contains_key("fast-mode")
+            && let Some(fast) = split.fast
+        {
+            derived.push(("fast-mode", json!(fast)));
+        }
+        if !spec.config_overrides.contains_key("context")
+            && let Some(ctx) = split.context
+        {
+            derived.push(("context", json!(ctx)));
+        }
+        for (cfg_id, val) in derived {
+            let Some((effective_id, effective_val, src)) = resolve_config_override(&config_options, cfg_id, &val) else {
+                continue;
+            };
+            if let Ok(maybe_fresh) =
+                apply_config_option(transport, &session_id, &effective_id, &effective_val, src.as_deref()).await
+            {
+                if let Some(fresh) = maybe_fresh {
+                    config_options = fresh;
+                } else {
+                    patch_config_value(&mut config_options, &effective_id, &effective_val);
+                }
+            }
+        }
     }
 
     for (cfg_id, val) in &spec.config_overrides {
-        let src = config_options.iter().find(|o| o.id == *cfg_id).map(|o| o.source.clone());
-        if let Ok(maybe_fresh) = apply_config_option(transport, &session_id, cfg_id, val, src.as_deref()).await {
+        let Some((effective_id, effective_val, src)) = resolve_config_override(&config_options, cfg_id, val) else {
+            continue;
+        };
+        if let Ok(maybe_fresh) = apply_config_option(transport, &session_id, &effective_id, &effective_val, src.as_deref()).await {
             if let Some(fresh) = maybe_fresh {
                 config_options = fresh;
             } else {
-                patch_config_value(&mut config_options, cfg_id, val);
+                patch_config_value(&mut config_options, &effective_id, &effective_val);
             }
         }
     }
@@ -664,8 +1072,8 @@ fn handle_update(core: &Core, id: u32, turn_num: u64, params: &Value) {
         ParsedUpdate::AssistantChunk(text) => Entry::Assistant { turn: turn_num, text, ts_ms },
         ParsedUpdate::ThoughtChunk(text) => Entry::Thought { turn: turn_num, text, ts_ms },
         ParsedUpdate::UserChunk(_) => return,
-        ParsedUpdate::ToolCall { id: tc_id, title, kind, status } => {
-            Entry::ToolCall { turn: turn_num, id: tc_id, title, tool_kind: kind, status, ts_ms }
+        ParsedUpdate::ToolCall { id: tc_id, title, kind, status, detail } => {
+            Entry::ToolCall { turn: turn_num, id: tc_id, title, tool_kind: kind, status, detail, ts_ms }
         }
         ParsedUpdate::Plan(items) => Entry::Plan { turn: turn_num, items, ts_ms },
         ParsedUpdate::ConfigOptions(opts) => {
@@ -816,4 +1224,269 @@ fn cancel_pending_perm(core: &Core, id: u32, turn_num: u64) {
 fn record_entry(core: &Core, id: u32, entry: Entry) {
     let mut st = core.lock();
     core.record_transcript(&mut st, id, entry);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn choice(value: &str) -> AcpConfigChoice {
+        AcpConfigChoice { value: value.into(), name: value.into(), description: None, group: None }
+    }
+
+    fn agy_options() -> Vec<AcpConfigOption> {
+        vec![
+            AcpConfigOption {
+                id: "model".into(),
+                name: "Model".into(),
+                description: None,
+                category: Some("model".into()),
+                kind: "select".into(),
+                current_value: json!("gemini-4-carbon"),
+                options: vec![choice("gemini-4-carbon"), choice("claude-opus-5-5")],
+                source: "config".into(),
+            },
+            AcpConfigOption {
+                id: "thought_level".into(),
+                name: "Thought Level".into(),
+                description: None,
+                category: Some("thought_level".into()),
+                kind: "select".into(),
+                current_value: json!("medium"),
+                options: vec![choice("low"), choice("medium"), choice("high")],
+                source: "config".into(),
+            },
+        ]
+    }
+
+    fn claude_options() -> Vec<AcpConfigOption> {
+        vec![
+            AcpConfigOption {
+                id: "model".into(),
+                name: "Model".into(),
+                description: None,
+                category: Some("model".into()),
+                kind: "select".into(),
+                current_value: json!("claude-sonnet-4-5"),
+                options: vec![choice("claude-sonnet-4-5")],
+                source: "config".into(),
+            },
+            AcpConfigOption {
+                id: "effort".into(),
+                name: "Effort".into(),
+                description: None,
+                category: Some("thought_level".into()),
+                kind: "select".into(),
+                current_value: json!("high"),
+                options: vec![choice("low"), choice("medium"), choice("high"), choice("max")],
+                source: "config".into(),
+            },
+        ]
+    }
+
+    #[test]
+    fn resolves_reasoning_effort_aliases_for_agy_and_claude() {
+        let agy = agy_options();
+        assert_eq!(resolve_config_option_id("reasoning_effort", &agy), "thought_level");
+        assert_eq!(resolve_config_option_id("thought_level", &agy), "thought_level");
+        assert_eq!(resolve_config_option_id("model", &agy), "model");
+
+        let claude = claude_options();
+        assert_eq!(resolve_config_option_id("reasoning_effort", &claude), "effort");
+        assert_eq!(resolve_config_option_id("effort", &claude), "effort");
+    }
+
+    #[test]
+    fn splits_agy_suffixed_model_slug_when_options_use_base_ids() {
+        let agy = agy_options();
+        assert_eq!(
+            split_model_effort_for_options("gemini-4-carbon-high", &agy),
+            ("gemini-4-carbon".into(), Some("high".into()))
+        );
+        assert_eq!(
+            split_model_effort_for_options("claude-opus-5-5-medium", &agy),
+            ("claude-opus-5-5".into(), Some("medium".into()))
+        );
+        // Base model stays unsplit; unknown suffix stays unsplit.
+        assert_eq!(
+            split_model_effort_for_options("gemini-4-carbon", &agy),
+            ("gemini-4-carbon".into(), None)
+        );
+        assert_eq!(
+            split_model_effort_for_options("gemini-4-carbon-xhigh", &agy),
+            ("gemini-4-carbon-xhigh".into(), None)
+        );
+    }
+
+    #[test]
+    fn resolves_cursor_context_and_fast_config_overrides() {
+        let opts = vec![
+            AcpConfigOption {
+                id: "model".into(),
+                name: "Model".into(),
+                description: None,
+                category: Some("model".into()),
+                kind: "select".into(),
+                current_value: json!("grok-4.7"),
+                options: vec![choice("grok-4.7")],
+                source: "config".into(),
+            },
+            AcpConfigOption {
+                id: "context".into(),
+                name: "Context".into(),
+                description: None,
+                category: Some("model_config".into()),
+                kind: "select".into(),
+                current_value: json!("256k"),
+                options: vec![choice("256k"), choice("500k")],
+                source: "config".into(),
+            },
+            AcpConfigOption {
+                id: "fast".into(),
+                name: "Fast".into(),
+                description: None,
+                category: Some("model_config".into()),
+                kind: "select".into(),
+                current_value: json!("false"),
+                options: vec![choice("false"), choice("true")],
+                source: "config".into(),
+            },
+        ];
+
+        assert_eq!(
+            resolve_config_override(&opts, "context", &json!("500k")),
+            Some(("context".into(), json!("500k"), Some("config".into())))
+        );
+        assert_eq!(
+            resolve_config_override(&opts, "context", &json!("max")),
+            Some(("context".into(), json!("500k"), Some("config".into())))
+        );
+        assert_eq!(
+            resolve_config_override(&opts, "context", &json!("1m")),
+            Some(("context".into(), json!("500k"), Some("config".into())))
+        );
+        assert_eq!(
+            resolve_config_override(&opts, "context", &json!("auto")),
+            None
+        );
+        assert_eq!(
+            resolve_config_override(&opts, "fast-mode", &json!(true)),
+            Some(("fast".into(), json!("true"), Some("config".into())))
+        );
+        // No context option advertised on this model -> returns None cleanly.
+        let agy = agy_options();
+        assert_eq!(resolve_config_override(&agy, "context", &json!("500k")), None);
+        assert_eq!(
+            resolve_config_override(&agy, "reasoning_effort", &json!("xhigh")),
+            Some(("thought_level".into(), json!("high"), Some("config".into())))
+        );
+    }
+
+    #[test]
+    fn detects_embedded_effort_and_splits_cursor_model_variants() {
+        for embedded in [
+            "grok-4.7-high",
+            "grok-4.7-high-fast",
+            "claude-opus-5-thinking-xhigh-fast",
+            "gpt-5.5-extra-high",
+            "gpt-5.6-sol-none",
+            "muse-wonder-1.0-minimal",
+            "sonnet-4-thinking",
+            "claude-opus-5-5[context=300k,effort=medium]",
+            "grok-4.7[reasoning=high]",
+        ] {
+            assert!(model_has_embedded_effort(embedded), "{embedded} should report embedded effort");
+        }
+        for base in [
+            "",
+            "auto",
+            "default",
+            "grok-4.7",
+            "claude-opus-5-5",
+            "gpt-5.3-codex-fast",
+            "composer-2.5-fast",
+            "grok-4.7[context=500k,fast=true]",
+        ] {
+            assert!(!model_has_embedded_effort(base), "{base} should not report embedded effort");
+        }
+
+        // Before model selection on Cursor ACP, only "model" options list base ids (without effort/fast/context yet).
+        let cursor_initial = vec![AcpConfigOption {
+            id: "model".into(),
+            name: "Model".into(),
+            description: None,
+            category: Some("model".into()),
+            kind: "select".into(),
+            current_value: json!("default"),
+            options: vec![
+                choice("grok-4.7"),
+                choice("claude-opus-5"),
+                choice("claude-opus-5-5"),
+                choice("gpt-5.5"),
+                choice("gpt-5.3-codex-fast"),
+            ],
+            source: "config".into(),
+        }];
+
+        assert_eq!(
+            split_model_variant_for_options("gpt-5.3-codex-fast", &cursor_initial),
+            SplitModelVariant { model: "gpt-5.3-codex-fast".into(), effort: None, fast: None, context: None }
+        );
+        assert_eq!(
+            split_model_variant_for_options("grok-4.7-high-fast", &cursor_initial),
+            SplitModelVariant {
+                model: "grok-4.7".into(),
+                effort: Some("high".into()),
+                fast: Some(true),
+                context: None,
+            }
+        );
+        assert_eq!(
+            split_model_variant_for_options("claude-opus-5-thinking-xhigh-fast", &cursor_initial),
+            SplitModelVariant {
+                model: "claude-opus-5".into(),
+                effort: Some("xhigh".into()),
+                fast: Some(true),
+                context: None,
+            }
+        );
+        assert_eq!(
+            split_model_variant_for_options("gpt-5.5-extra-high", &cursor_initial),
+            SplitModelVariant {
+                model: "gpt-5.5".into(),
+                effort: Some("xhigh".into()),
+                fast: None,
+                context: None,
+            }
+        );
+        assert_eq!(
+            split_model_variant_for_options("claude-opus-5-5[context=300k,effort=medium,fast=false]", &cursor_initial),
+            SplitModelVariant {
+                model: "claude-opus-5-5".into(),
+                effort: Some("medium".into()),
+                fast: Some(false),
+                context: Some("300k".into()),
+            }
+        );
+
+        let cursor_reasoning_opts = vec![AcpConfigOption {
+            id: "reasoning".into(),
+            name: "Reasoning".into(),
+            description: None,
+            category: Some("thought_level".into()),
+            kind: "select".into(),
+            current_value: json!("medium"),
+            options: vec![choice("none"), choice("low"), choice("medium"), choice("high"), choice("xhigh")],
+            source: "config".into(),
+        }];
+        assert_eq!(resolve_config_option_id("reasoning_effort", &cursor_reasoning_opts), "reasoning");
+        assert_eq!(
+            resolve_config_override(&cursor_reasoning_opts, "reasoning_effort", &json!("high")),
+            Some(("reasoning".into(), json!("high"), Some("config".into())))
+        );
+        assert_eq!(
+            resolve_config_override(&cursor_reasoning_opts, "reasoning_effort", &json!("extra-high")),
+            Some(("reasoning".into(), json!("xhigh"), Some("config".into())))
+        );
+    }
 }

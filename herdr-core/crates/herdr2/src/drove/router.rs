@@ -10,7 +10,9 @@ pub struct RouteDecision {
     pub role_config: RoleConfig,
     pub agent: String,
     pub model: Option<String>,
+    pub context: Option<String>,
     pub effort: Effort,
+    pub fast: bool,
     pub reason: String,
     pub warm_worker: Option<Worker>,
 }
@@ -52,7 +54,7 @@ pub fn route_task_with_quotas(
             summary: None,
             access: Some(RoleAccessMode::Writable),
             allowed_paths: Vec::new(),
-            primary: RoleTarget { agent: "claude".into(), model: None, effort: Effort::High },
+            primary: RoleTarget { agent: "claude".into(), model: None, effort: Effort::High, fast: false, context: None },
             fallbacks: Vec::new(),
             prompt: None,
         });
@@ -69,33 +71,58 @@ pub fn route_task_with_quotas(
         assign.and_then(|a| a.model.clone()).filter(|s| !s.trim().is_empty())
     };
     let explicit_effort = if is_router_assigned { None } else { assign.and_then(|a| a.effort) };
+    let explicit_fast = if is_router_assigned { None } else { assign.and_then(|a| a.fast) };
 
-    let (chosen_agent, chosen_model, chosen_effort, reason) = if let Some(agent) = explicit_agent {
+    let (chosen_agent, chosen_model, chosen_context, chosen_effort, chosen_fast, reason) = if let Some(agent) = explicit_agent {
+        let same_as_primary = agent == role_cfg.primary.agent;
+        let default_fast = if same_as_primary { role_cfg.primary.fast } else { false };
+        let default_context = if same_as_primary {
+            role_cfg.primary.context.clone()
+        } else {
+            role_cfg.fallbacks.iter().find(|f| f.agent == agent).and_then(|f| f.context.clone())
+        };
         (
             agent.to_string(),
             explicit_model.or_else(|| role_cfg.primary.model.clone()),
+            default_context,
             explicit_effort.unwrap_or(role_cfg.primary.effort),
+            explicit_fast.unwrap_or(default_fast),
             format!("user_override role={role_name}"),
         )
     } else {
         pick_candidate(
             &role_name,
             &role_cfg,
+            workers,
             probed,
             quotas,
             explicit_model,
             explicit_effort,
+            explicit_fast,
             task.failures,
         )
     };
 
-    // Prefer an explicit requested worker id if idle and matching cwd/agent.
-    let explicit_worker = assign.and_then(|a| a.worker.as_deref());
+    // Prefer an explicit user-requested worker id if idle and matching cwd/agent;
+    // ignore router-populated `assign.worker` so fallback retries can switch agents cleanly.
+    let explicit_worker = if is_router_assigned {
+        None
+    } else {
+        assign.and_then(|a| a.worker.as_deref())
+    };
     let warm_worker = if let Some(wid) = explicit_worker {
         workers
             .iter()
-            .find(|w| w.id == wid && w.state == WorkerState::Idle && w.cwd == effective_cwd)
+            .find(|w| {
+                w.id == wid
+                    && w.state == WorkerState::Idle
+                    && w.read_only_dir.is_none()
+                    && worker_matches_isolation(w, task, effective_cwd)
+                    && w.agent == chosen_agent
+                    && w.h2_agent.is_some()
+            })
             .cloned()
+            .or_else(|| find_warm_worker(workers, &role_name, &chosen_agent, effective_cwd, task))
     } else {
         find_warm_worker(workers, &role_name, &chosen_agent, effective_cwd, task)
     };
@@ -105,7 +132,9 @@ pub fn route_task_with_quotas(
         role_config: role_cfg,
         agent: chosen_agent,
         model: chosen_model,
+        context: chosen_context,
         effort: chosen_effort,
+        fast: chosen_fast,
         reason,
         warm_worker,
     }
@@ -114,12 +143,14 @@ pub fn route_task_with_quotas(
 fn pick_candidate(
     role_name: &str,
     role_cfg: &RoleConfig,
+    workers: &[Worker],
     probed: &ProbeSnapshot,
     quotas: Option<&[QuotaCard]>,
     explicit_model: Option<String>,
     explicit_effort: Option<Effort>,
+    explicit_fast: Option<bool>,
     failures: u32,
-) -> (String, Option<String>, Effort, String) {
+) -> (String, Option<String>, Option<String>, Effort, bool, String) {
     let mut chain = Vec::with_capacity(1 + role_cfg.fallbacks.len());
     chain.push(&role_cfg.primary);
     for fb in &role_cfg.fallbacks {
@@ -157,7 +188,26 @@ fn pick_candidate(
         }
 
         let all_exhausted = quotas.is_some_and(|c| !c.is_empty()) && available.is_empty();
-        let pool = if !available.is_empty() { &available } else { &eligible };
+        let base_pool = if !available.is_empty() { &available } else { &eligible };
+        let healthy: Vec<(usize, &RoleTarget)> = base_pool
+            .iter()
+            .copied()
+            .filter(|(_, cand)| {
+                let eff_model = explicit_model.as_deref().or(cand.model.as_deref());
+                let has_dead = workers.iter().any(|w| {
+                    w.state == WorkerState::Dead
+                        && w.agent == cand.agent
+                        && w.model.as_deref() == eff_model
+                });
+                let has_healthy = workers.iter().any(|w| {
+                    matches!(w.state, WorkerState::Idle | WorkerState::Busy)
+                        && w.agent == cand.agent
+                        && w.model.as_deref() == eff_model
+                });
+                !has_dead || has_healthy
+            })
+            .collect();
+        let pool = if !healthy.is_empty() { &healthy } else { base_pool };
         let chosen_pos = (failures as usize) % pool.len();
         let (idx, cand) = pool[chosen_pos];
         let kind = if idx == 0 { "primary" } else { "fallback" };
@@ -181,7 +231,9 @@ fn pick_candidate(
         return (
             cand.agent.clone(),
             explicit_model.or_else(|| cand.model.clone()),
+            cand.context.clone(),
             explicit_effort.unwrap_or(cand.effort),
+            explicit_fast.unwrap_or(cand.fast),
             reason,
         );
     }
@@ -189,9 +241,21 @@ fn pick_candidate(
     (
         role_cfg.primary.agent.clone(),
         explicit_model.or_else(|| role_cfg.primary.model.clone()),
+        role_cfg.primary.context.clone(),
         explicit_effort.unwrap_or(role_cfg.primary.effort),
+        explicit_fast.unwrap_or(role_cfg.primary.fast),
         format!("role={role_name} default_primary={}", role_cfg.primary.agent),
     )
+}
+
+fn worker_matches_isolation(w: &Worker, task: &Task, effective_cwd: &str) -> bool {
+    if task.isolation == Isolation::Worktree {
+        w.worktree
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty() && std::path::Path::new(p).is_dir())
+    } else {
+        w.worktree.is_none() && w.cwd == effective_cwd
+    }
 }
 
 fn find_warm_worker(
@@ -205,9 +269,10 @@ fn find_warm_worker(
         .iter()
         .filter(|w| {
             w.state == WorkerState::Idle
+                && w.read_only_dir.is_none()
                 && w.agent == agent
                 && w.role.as_deref().unwrap_or("coder") == role_name
-                && w.cwd == effective_cwd
+                && worker_matches_isolation(w, task, effective_cwd)
                 && w.h2_agent.is_some()
         })
         .collect();
@@ -299,8 +364,8 @@ mod tests {
                 summary: None,
                 access: Some(RoleAccessMode::Writable),
                 allowed_paths: Vec::new(),
-                primary: RoleTarget { agent: "claude".into(), model: None, effort: Effort::High },
-                fallbacks: vec![RoleTarget { agent: "codex".into(), model: None, effort: Effort::High }],
+                primary: RoleTarget { agent: "claude".into(), model: None, effort: Effort::High, fast: false, context: None },
+                fallbacks: vec![RoleTarget { agent: "codex".into(), model: None, effort: Effort::High, fast: false, context: None }],
                 prompt: None,
             },
         );
@@ -369,11 +434,11 @@ mod tests {
                 summary: None,
                 access: Some(RoleAccessMode::Writable),
                 allowed_paths: Vec::new(),
-                primary: RoleTarget { agent: "claude".into(), model: None, effort: Effort::High },
+                primary: RoleTarget { agent: "claude".into(), model: None, effort: Effort::High, fast: false, context: None },
                 fallbacks: vec![
-                    RoleTarget { agent: "codex".into(), model: Some("gpt-5.4".into()), effort: Effort::High },
-                    RoleTarget { agent: "agy".into(), model: None, effort: Effort::Medium },
-                    RoleTarget { agent: "gemini".into(), model: None, effort: Effort::Low },
+                    RoleTarget { agent: "codex".into(), model: Some("gpt-5.4".into()), effort: Effort::High, fast: true, context: None },
+                    RoleTarget { agent: "agy".into(), model: None, effort: Effort::Medium, fast: false, context: None },
+                    RoleTarget { agent: "gemini".into(), model: None, effort: Effort::Low, fast: false, context: None },
                 ],
                 prompt: None,
             },
@@ -388,7 +453,22 @@ mod tests {
             task.failures = fail_count as u32;
             let dec = route_task_with_quotas(&cfg, &task, "/tmp", &[], &ProbeSnapshot::default(), None);
             assert_eq!(&dec.agent, expected_agent, "failures={fail_count}");
+            assert_eq!(dec.fast, *expected_agent == "codex", "fast flag mismatch at failures={fail_count}");
         }
+
+        // Cursor target propagates configured context window size.
+        cfg.roles.get_mut("coder").unwrap().primary = RoleTarget {
+            agent: "cursor".into(),
+            model: Some("grok-4.7".into()),
+            effort: Effort::High,
+            fast: false,
+            context: Some("500k".into()),
+        };
+        let mut cursor_task = sample_task("coder");
+        cursor_task.assign = None;
+        let dec = route_task_with_quotas(&cfg, &cursor_task, "/tmp", &[], &ProbeSnapshot::default(), None);
+        assert_eq!(dec.agent, "cursor");
+        assert_eq!(dec.context.as_deref(), Some("500k"));
 
         // User-pinned override stays pinned even when retries increment.
         task.assign.as_mut().unwrap().source = Some("user".into());
@@ -397,5 +477,76 @@ mod tests {
         let pinned = route_task_with_quotas(&cfg, &task, "/tmp", &[], &ProbeSnapshot::default(), None);
         assert_eq!(pinned.agent, "kimi");
         assert!(pinned.reason.contains("user_override"));
+    }
+
+    #[test]
+    fn fallback_retry_does_not_reuse_router_assigned_primary_worker() {
+        let mut cfg = DroveConfig::default();
+        cfg.roles.insert(
+            "reviewer".into(),
+            RoleConfig {
+                label: Some("Reviewer".into()),
+                summary: None,
+                access: Some(RoleAccessMode::Readonly),
+                allowed_paths: Vec::new(),
+                primary: RoleTarget {
+                    agent: "codex".into(),
+                    model: Some("gpt-6.2-sol".into()),
+                    effort: Effort::High,
+                    fast: false,
+                    context: None,
+                },
+                fallbacks: vec![RoleTarget {
+                    agent: "agy".into(),
+                    model: Some("gemini-4-carbon-high".into()),
+                    effort: Effort::High,
+                    fast: false,
+                    context: None,
+                }],
+                prompt: None,
+            },
+        );
+
+        let workers = vec![Worker {
+            id: "w_primary".into(),
+            run_id: "r1".into(),
+            agent: "codex".into(),
+            model: Some("gpt-6.2-sol".into()),
+            context_window: None,
+            effort: Some(Effort::High),
+            fast: Some(false),
+            session_key: "r1:w_primary".into(),
+            h2_agent: Some("a1".into()),
+            cwd: "/tmp".into(),
+            worktree: None,
+            state: WorkerState::Idle,
+            current_attempt_id: None,
+            pid: None,
+            fingerprint: Fingerprint::default(),
+            context: WorkerContext::default(),
+            totals: WorkerTotals { tokens: 0, cost: 0.0, attempts: 1, estimated: None },
+            created_at: "2026-01-01T00:00:00Z".into(),
+            last_active_at: "2026-01-01T00:00:00Z".into(),
+            role: Some("reviewer".into()),
+            forked_from: None,
+            protocol_gen: Some(1),
+            read_only_dir: None,
+        }];
+
+        let mut task = sample_task("reviewer");
+        task.failures = 1;
+        task.assign = Some(Assign {
+            role: Some("reviewer".into()),
+            source: Some("router".into()),
+            agent: Some("codex".into()),
+            model: Some("gpt-6.2-sol".into()),
+            worker: Some("w_primary".into()),
+            ..Assign::default()
+        });
+
+        let dec = route_task_with_quotas(&cfg, &task, "/tmp", &workers, &ProbeSnapshot::default(), None);
+        assert_eq!(dec.agent, "agy");
+        assert_eq!(dec.model.as_deref(), Some("gemini-4-carbon-high"));
+        assert!(dec.warm_worker.is_none(), "must not reuse primary codex worker for agy fallback");
     }
 }

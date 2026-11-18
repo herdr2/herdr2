@@ -17,6 +17,7 @@ const WATCHDOG_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Event-driven scheduler loop waking on `Store::changed`, `DroveRuntime::scheduler_wake`, or 2s tick.
 pub async fn run_scheduler_loop(core: Arc<Core>) {
+    super::pool::reconcile_startup_workers(&core).await;
     let mut tick = tokio::time::interval(WATCHDOG_INTERVAL);
     tick.tick().await;
     loop {
@@ -39,7 +40,25 @@ pub async fn tick_once(core: &Arc<Core>) {
     let probed = core.drove.cached_probe();
 
     for run in runs {
-        if run.trashed_at.is_some() || run.status != RunStatus::Active {
+        let has_open_workers = core
+            .drove
+            .store
+            .list_workers(Some(&run.id))
+            .iter()
+            .any(|w| !matches!(w.state, WorkerState::Closed | WorkerState::Dead));
+        if run.trashed_at.is_some() {
+            if has_open_workers {
+                super::pool::stop_run_workers(core, &run.id).await;
+            }
+            continue;
+        }
+        if (has_open_workers || run.status == RunStatus::Active)
+            && super::pool::is_coordinator_closed(core, &run)
+        {
+            super::pool::close_run_for_coordinator(core, &run).await;
+            continue;
+        }
+        if run.status != RunStatus::Active {
             continue;
         }
         let mut tasks = core.drove.store.list_tasks(&run.id);
@@ -53,6 +72,16 @@ pub async fn tick_once(core: &Arc<Core>) {
 
         // 3. Check silence / stall / timeout watchdog for Running tasks.
         check_running_timeouts_and_stalls(core, &run, &tasks).await;
+        tasks = core.drove.store.list_tasks(&run.id);
+
+        if !tasks.is_empty()
+            && tasks
+                .iter()
+                .filter(|t| t.template != Some(true))
+                .all(|t| is_terminal_status(t.status))
+        {
+            continue;
+        }
 
         // 4. Recompute concurrency & dispatch Ready tasks (`exec` or `agent`).
         let workers = core.drove.store.list_workers(Some(&run.id));
@@ -77,7 +106,20 @@ pub async fn tick_once(core: &Arc<Core>) {
             None
         };
 
-        for task in ready_tasks {
+        let repo_supports_wt = super::integrate::is_git_repo(&run.cwd)
+            && !super::integrate::is_aosp_harness(&run.cwd);
+        let running_shared_writers = tasks
+            .iter()
+            .filter(|t| {
+                t.status == TaskStatus::Running
+                    && t.isolation == Isolation::None
+                    && task_writes_workspace(&cfg, t)
+            })
+            .count();
+        let mut shared_writers_started_this_tick = 0usize;
+        let mut promoted_shared_writers_in_tick = 0usize;
+
+        for (idx, mut task) in ready_tasks.iter().cloned().enumerate() {
             if slots == 0 {
                 break;
             }
@@ -95,8 +137,74 @@ pub async fn tick_once(core: &Arc<Core>) {
                 continue;
             }
 
+            if task.isolation == Isolation::None && task_writes_workspace(&cfg, &task) {
+                let remaining_ready_writers = ready_tasks[idx + 1..]
+                    .iter()
+                    .filter(|other| other.isolation == Isolation::None && task_writes_workspace(&cfg, other))
+                    .count();
+                let can_overlap_in_tick = slots > 0 && remaining_ready_writers > 0;
+                let conflict_risk = running_shared_writers > 0
+                    || shared_writers_started_this_tick > 0
+                    || promoted_shared_writers_in_tick > 0
+                    || can_overlap_in_tick;
+                if conflict_risk {
+                    match cfg.ai.conflict_policy.as_str() {
+                        "auto_worktree" if repo_supports_wt => {
+                            let _ = core.drove.store.update_task(&task.id, |t| {
+                                t.isolation = Isolation::Worktree;
+                            });
+                            task.isolation = Isolation::Worktree;
+                            promoted_shared_writers_in_tick += 1;
+                            core.drove.store.append_daemon_event(super::store::NewDaemonEvent {
+                                run_id: Some(run.id.clone()),
+                                task_id: Some(task.id.clone()),
+                                attempt_id: None,
+                                worker_id: None,
+                                message_id: None,
+                                category: "schedule".into(),
+                                kind: "auto_worktree".into(),
+                                status: "ok".into(),
+                                title: format!("Auto-isolated `{}` into worktree", task.key),
+                                detail: Some(
+                                    "Concurrent writable/scoped_write tasks detected under conflictPolicy=auto_worktree"
+                                        .into(),
+                                ),
+                                duration_ms: None,
+                                tokens: None,
+                                cost: None,
+                            });
+                        }
+                        "warn" => {
+                            shared_writers_started_this_tick += 1;
+                            core.drove.store.append_daemon_event(super::store::NewDaemonEvent {
+                                run_id: Some(run.id.clone()),
+                                task_id: Some(task.id.clone()),
+                                attempt_id: None,
+                                worker_id: None,
+                                message_id: None,
+                                category: "schedule".into(),
+                                kind: "write_conflict_warn".into(),
+                                status: "warn".into(),
+                                title: format!("Concurrent shared-cwd write on `{}`", task.key),
+                                detail: Some(
+                                    "Parallel writable tasks share run.cwd under conflictPolicy=warn".into(),
+                                ),
+                                duration_ms: None,
+                                tokens: None,
+                                cost: None,
+                            });
+                        }
+                        _ => {
+                            shared_writers_started_this_tick += 1;
+                        }
+                    }
+                } else {
+                    shared_writers_started_this_tick += 1;
+                }
+            }
+
             let current_workers = core.drove.store.list_workers(Some(&run.id));
-            let decision = route_task_with_quotas(
+            let mut decision = route_task_with_quotas(
                 &cfg,
                 &task,
                 &run.cwd,
@@ -104,35 +212,91 @@ pub async fn tick_once(core: &Arc<Core>) {
                 &probed,
                 quotas.as_deref(),
             );
-            let effective_cwd = match worktree_for_task(core, &run, &task).await {
+            if decision.warm_worker.is_none()
+                && task.isolation == Isolation::None
+                && repo_supports_wt
+                && task_writes_workspace(&cfg, &task)
+            {
+                let explicit_worker = (task.assign.as_ref().and_then(|a| a.source.as_deref()) != Some("router"))
+                    .then(|| task.assign.as_ref().and_then(|a| a.worker.as_deref()))
+                    .flatten();
+                let has_warm_wt = current_workers.iter().any(|w| {
+                    w.state == WorkerState::Idle
+                        && w.read_only_dir.is_none()
+                        && w.agent == decision.agent
+                        && w.role.as_deref().unwrap_or("coder") == decision.role
+                        && explicit_worker.is_none_or(|eid| w.id == eid)
+                        && w.worktree
+                            .as_deref()
+                            .is_some_and(|p| !p.trim().is_empty() && std::path::Path::new(p).is_dir())
+                        && super::pool::live_untrashed_agent_id(core, w.h2_agent.as_deref()).is_some()
+                });
+                if has_warm_wt {
+                    let _ = core.drove.store.update_task(&task.id, |t| {
+                        t.isolation = Isolation::Worktree;
+                    });
+                    task.isolation = Isolation::Worktree;
+                    decision = route_task_with_quotas(
+                        &cfg,
+                        &task,
+                        &run.cwd,
+                        &current_workers,
+                        &probed,
+                        quotas.as_deref(),
+                    );
+                }
+            }
+            if let Some(ref warm) = decision.warm_worker {
+                let warm_live = super::pool::live_untrashed_agent_id(core, warm.h2_agent.as_deref()).is_some();
+                if !warm_live {
+                    let _ = core.drove.store.update_worker(&warm.id, |w| {
+                        if !matches!(w.state, WorkerState::Closed | WorkerState::Dead) {
+                            w.state = WorkerState::Dead;
+                        }
+                        w.current_attempt_id = None;
+                        w.worktree = None;
+                    });
+                    if let Some(wt) = warm.worktree.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                        super::integrate::cleanup_worktree_dir(&run.cwd, std::path::Path::new(wt));
+                    }
+                    decision.warm_worker = None;
+                }
+            }
+            let reuse_wt = decision
+                .warm_worker
+                .as_ref()
+                .and_then(|w| w.worktree.clone());
+            let effective_cwd = match worktree_for_task(core, &run, &task, reuse_wt.as_deref()).await {
                 Ok((cwd, wt)) => (cwd, wt),
                 Err(err) => {
                     core.drove.release_task_reservation(&task.id);
-                    let _ = core.drove.store.update_task(&task.id, |t| {
-                        t.status = TaskStatus::Failed;
-                    });
-                    notify_coordinator(
+                    super::fail_or_retry_task(
                         core,
-                        &run,
-                        "worktree_failed",
-                        &format!("Worktree setup failed for `{}`", task.key),
-                        &format!("[drove] Worktree error for `{}`: {err}", task.key),
-                        Some(&task.id),
-                        None,
-                        None,
-                        None,
+                        &run.id,
+                        &task.id,
+                        "",
+                        FailureKind::AgentError,
+                        &format!("Worktree setup failed: {err}"),
+                        0,
                     )
                     .await;
                     continue;
                 }
             };
+            if let Some(ref warm) = decision.warm_worker
+                && warm.worktree.as_deref() != effective_cwd.1.as_deref()
+            {
+                decision.warm_worker = None;
+            }
 
             let retry_of = core
                 .drove
                 .store
                 .list_attempts(None, Some(&task.id), None)
-                .last()
-                .map(|a| a.id.clone());
+                .into_iter()
+                .rev()
+                .find(|a| a.kind.as_deref() != Some("review"))
+                .map(|a| a.id);
             let hint = core.drove.take_task_hint(&task.id);
 
             let res = dispatch_agent_task(
@@ -215,7 +379,7 @@ fn expand_foreach_from(core: &Arc<Core>, run: &Run, tasks: &[Task]) {
                 spec,
                 tags: tpl.tags.clone(),
                 files: tpl.files.clone(),
-                deps: tpl.deps.clone(),
+                deps: vec![tpl.id.clone()],
                 output_schema: tpl.output_schema.clone(),
                 isolation: tpl.isolation,
                 timeout_sec: tpl.timeout_sec,
@@ -268,10 +432,44 @@ fn promote_pending_tasks(core: &Arc<Core>, tasks: &[Task]) {
         let mut unresolved = false;
         for dep_ref in &task.deps {
             if let Some(d) = tasks.iter().find(|t| &t.id == dep_ref || &t.key == dep_ref) {
-                if !is_terminal_status(d.status) {
-                    unresolved = true;
+                if d.template == Some(true) && task.expanded_from.as_deref() != Some(d.id.as_str()) {
+                    if d.expansion_state.as_deref() != Some("done") {
+                        unresolved = true;
+                    }
+                    let mut child_count = 0usize;
+                    for child in tasks
+                        .iter()
+                        .filter(|c| c.expanded_from.as_deref() == Some(d.id.as_str()))
+                    {
+                        child_count += 1;
+                        if !is_terminal_status(child.status) {
+                            unresolved = true;
+                        }
+                        dep_statuses.push(child.status);
+                    }
+                    if child_count == 0 {
+                        if !is_terminal_status(d.status) {
+                            unresolved = true;
+                        }
+                        dep_statuses.push(d.status);
+                    }
+                } else {
+                    if !is_terminal_status(d.status) {
+                        unresolved = true;
+                    }
+                    dep_statuses.push(d.status);
                 }
-                dep_statuses.push(d.status);
+            } else {
+                for child in tasks.iter().filter(|c| {
+                    c.key
+                        .strip_prefix(dep_ref.as_str())
+                        .is_some_and(|r| r.starts_with('#'))
+                }) {
+                    if !is_terminal_status(child.status) {
+                        unresolved = true;
+                    }
+                    dep_statuses.push(child.status);
+                }
             }
         }
         let (should_skip, should_ready) = match rule {
@@ -395,6 +593,7 @@ async fn run_exec_task(core: Arc<Core>, run: Run, task: Task) {
         agent: "exec".into(),
         model: None,
         effort: None,
+        fast: None,
         route_reason: "exec".into(),
         reused: false,
         retry_of: None,
@@ -548,4 +747,21 @@ pub fn is_terminal_status(s: TaskStatus) -> bool {
         s,
         TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Skipped
     )
+}
+
+fn task_writes_workspace(cfg: &DroveConfig, task: &Task) -> bool {
+    if task.kind.as_deref() == Some("exec") || task.template == Some(true) {
+        return false;
+    }
+    let role_name = task
+        .assign
+        .as_ref()
+        .and_then(|a| a.role.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("coder");
+    let mode = super::config::resolve_role_config(cfg, role_name)
+        .and_then(|r| r.access)
+        .unwrap_or(RoleAccessMode::Writable);
+    mode != RoleAccessMode::Readonly
 }

@@ -1,16 +1,15 @@
-//! Explicit, person-reviewed beta feedback. No usage-data consent or install id.
-//! Screenshots are what the person pastes or picks, each shown before sending.
+//! Explicit, person-reviewed beta feedback (sending disabled in Herdr2).
+#![allow(dead_code)]
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
 pub const MAX_IMAGES: usize = 3;
 const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
-#[allow(dead_code)]
 const ENDPOINT: &str = "https://telemetry.herdr.dev/v1/feedback";
 
 fn endpoint() -> Option<String> {
-    std::env::var("HERDR2_FEEDBACK_URL").ok().filter(|u| !u.is_empty())
+    None
 }
 
 pub fn draft(message: &str, email: &str, images: usize, from: &str, layout: &str) -> Value {
@@ -110,20 +109,8 @@ fn validate(body: &Value) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn send(body: Value, shots: Vec<String>) -> Result<(), String> {
-    validate(&body)?;
-    if shots.len() > MAX_IMAGES || body["images"].as_u64() != Some(shots.len() as u64) {
-        return Err("Up to 3 screenshots.".into());
-    }
-    let files = shots.iter().map(|s| shot_file(s)).collect::<Result<Vec<_>, _>>()?;
-    let url = endpoint().ok_or("This build was made from source and doesn't send feedback. Use a release build.")?;
-    let (tx, rx) = async_channel::bounded(1);
-    std::thread::spawn(move || {
-        let result = post(&url, &body.to_string(), &files);
-        if result.is_ok() { clear_shots(); }
-        let _ = tx.send_blocking(result);
-    });
-    rx.recv().await.map_err(|_| "The feedback request was lost.".to_owned())?
+pub async fn send(_body: Value, _shots: Vec<String>) -> Result<(), String> {
+    Err("Feedback sending is disabled in this build.".into())
 }
 
 /// Text alone goes as JSON (what every version sends); with screenshots, as a

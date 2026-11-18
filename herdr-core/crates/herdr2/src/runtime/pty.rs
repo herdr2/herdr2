@@ -323,7 +323,14 @@ impl Core {
                     self.pty_status_changed(st, id, change);
                 }
             } else {
-                let (turn, was, since) = (rec.turn, rec.status.as_ref().map(|s| s.state.clone()), rec.status_ms);
+                let (turn, was, since, working_since, work_ms, total_work_ms) = (
+                    rec.turn,
+                    rec.status.as_ref().map(|s| s.state.clone()),
+                    rec.status_ms,
+                    rec.working_since,
+                    rec.work_ms,
+                    rec.total_work_ms,
+                );
                 let facts = |t: &crate::terminals::Terminal| (t.status.clone(), t.records.clone(), t.reported);
                 let heard = facts(rec);
                 for r in &reports {
@@ -333,6 +340,9 @@ impl Core {
                 rec.turn = turn + (was.as_deref() == Some("working") && now.as_deref() != Some("working")) as u64;
                 if now == was {
                     rec.status_ms = since;
+                    rec.working_since = working_since;
+                    rec.work_ms = work_ms;
+                    rec.total_work_ms = total_work_ms;
                 }
                 let root_report = rec.turn != turn || now != was;
                 let status = facts(rec) != heard;
@@ -562,6 +572,9 @@ impl Core {
             let target = TargetKey::Terminal(id);
             let _ = self.jobs.send(crate::notes::Job::Orphaned(target));
             crate::remote::orphaned_afar(self, st, target);
+            let _ = self.drove.pool_tx.send(crate::drove::pool::PoolSignal::SessionClosed {
+                address: crate::terminals::address(id),
+            });
         }
         if let (Some(relay), Some(screen)) = (st.relays.get_mut(&id), st.screens.get_mut(&id)) {
             relay.flush(screen);

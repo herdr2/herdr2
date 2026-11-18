@@ -10,7 +10,21 @@ import {
   resolveMdTheme,
   prepareMarkdown,
   resolveRelativeFileLink,
+  resolveRelativeAssetPath,
 } from "../defaults/mods/files/themes.js";
+import {
+  parseMarkdownBlocks,
+  serializeMarkdownBlocks,
+  toggleMarkdownTask,
+  extractMarkdownImageUrls,
+  prepareBlockMarkdown,
+  detectHeadingLevel,
+  parseMarkdownTable,
+  serializeMarkdownTable,
+  parseCodeFence,
+  serializeCodeFence,
+  resolveFenceLanguage,
+} from "../defaults/mods/files/markdown_blocks.js";
 
 const source = await readFile(new URL("../defaults/mods/files/main.js", import.meta.url), "utf8");
 const directorySource = source.slice(source.indexOf("async function directory("), source.indexOf("\nexport default class"));
@@ -215,4 +229,189 @@ test("Files resolves relative Markdown file links and rejects external or escapi
   expect(resolveRelativeFileLink("README.md", "../escape.txt")).toBeNull();
   expect(resolveRelativeFileLink("docs/a.md", "https://example.com/x")).toBeNull();
   expect(resolveRelativeFileLink("docs/a.md", "#section")).toBeNull();
+});
+
+test("Files detects binary image extensions separately from SVG and Markdown", () => {
+  for (const ext of ["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tif", "tiff"]) {
+    const kind = detectFileKind(`assets/photo.${ext}`);
+    expect(kind.isImage).toBe(true);
+    expect(kind.isMarkdown).toBe(false);
+    expect(kind.label).toBe(ext.toUpperCase());
+  }
+  const svg = detectFileKind("icons/logo.svg");
+  expect(svg.isImage).toBe(false);
+  expect(svg.label).toBe("SVG");
+  const md = detectFileKind("docs/README.md");
+  expect(md.isImage).toBe(false);
+  expect(md.isMarkdown).toBe(true);
+});
+
+test("Files resolves relative and root-relative asset paths safely", () => {
+  expect(resolveRelativeAssetPath("docs/guide/intro.md", "./img/pic.png")).toBe("docs/guide/img/pic.png");
+  expect(resolveRelativeAssetPath("docs/guide/intro.md", "../shared/my%20pic.png?raw=1#top")).toBe("docs/shared/my pic.png");
+  expect(resolveRelativeAssetPath("docs/guide/intro.md", "<./img/spaced pic.png>")).toBe("docs/guide/img/spaced pic.png");
+  expect(resolveRelativeAssetPath("docs/guide/intro.md", "..\\hero.webp")).toBe("docs/hero.webp");
+  expect(resolveRelativeAssetPath("docs/guide/intro.md", "/assets/banner.jpg")).toBe("assets/banner.jpg");
+  expect(resolveRelativeAssetPath("docs/guide/intro.md", "../../../escape.png")).toBeNull();
+  expect(resolveRelativeAssetPath("docs/guide/intro.md", "https://example.com/a.png")).toBeNull();
+  expect(resolveRelativeAssetPath("docs/guide/intro.md", "data:image/png;base64,AA==")).toBeNull();
+  expect(resolveRelativeAssetPath("docs/guide/intro.md", "file:///tmp/a.png")).toBeNull();
+  expect(resolveRelativeAssetPath("docs/guide/intro.md", "//cdn.example.com/a.png")).toBeNull();
+  expect(resolveRelativeAssetPath("docs/guide/intro.md", "#anchor")).toBeNull();
+});
+
+test("Files Markdown block parser preserves lossless round-trips across edge cases", () => {
+  const samples = [
+    "",
+    "\n  \n\n",
+    "---\ntitle: Spec\n---\r\n\r\n# Heading\r\n\r\n---\r\n\r\nParagraph line 1\r\nParagraph line 2\r\n",
+    "````md\n```js\nconst x = 1;\n```\n````\n\n~~~py\nprint('ok')\n~~~\n",
+    "| Name | Status |\n| --- | --- |\n| Core | OK |\n\n> [!NOTE] Important note\n> Body line\n",
+    "- [ ] First task\n  - nested note\n- [X] Done task\n1. [ ] Ordered task\n",
+    "<details>\n<summary>More</summary>\n\nHidden text\n</details>\n\n![solo](./pic.png)\n\n<img src=\"./tag.png\" height=\"40\">\n\n[ref]: ./ref.png \"title\"\n",
+  ];
+
+  for (const raw of samples) {
+    const doc = parseMarkdownBlocks(raw);
+    expect(serializeMarkdownBlocks(doc)).toBe(raw);
+  }
+
+  const frontDoc = parseMarkdownBlocks(samples[2]);
+  expect(frontDoc.blocks[0].kind).toBe("frontmatter");
+  expect(frontDoc.blocks[1].kind).toBe("heading");
+  expect(frontDoc.blocks[2].kind).toBe("hr");
+
+  const listDoc = parseMarkdownBlocks(samples[5]);
+  expect(listDoc.blocks[0].kind).toBe("list");
+  expect(listDoc.blocks[0].tasks).toEqual([
+    { lineIndex: 0, checked: false, label: "First task" },
+    { lineIndex: 2, checked: true, label: "Done task" },
+    { lineIndex: 3, checked: false, label: "Ordered task" },
+  ]);
+
+  const mediaDoc = parseMarkdownBlocks(samples[6]);
+  expect(mediaDoc.blocks.map((b) => b.kind)).toEqual(["html", "image", "image", "definition"]);
+});
+
+test("Files Markdown task toggling updates only the targeted task line and preserves endings", () => {
+  const block = "- [ ] Alpha\r\n  - [X] Beta\r\n1. [ ] Gamma";
+  const step1 = toggleMarkdownTask(block, 0);
+  expect(step1).toBe("- [x] Alpha\r\n  - [X] Beta\r\n1. [ ] Gamma");
+  const step2 = toggleMarkdownTask(step1, 1);
+  expect(step2).toBe("- [x] Alpha\r\n  - [ ] Beta\r\n1. [ ] Gamma");
+  const step3 = toggleMarkdownTask(step2, 2);
+  expect(step3).toBe("- [x] Alpha\r\n  - [ ] Beta\r\n1. [x] Gamma");
+  expect(toggleMarkdownTask(step3, 99)).toBe(step3);
+});
+
+test("Files extracts and rewrites Markdown and HTML image URLs while skipping code", () => {
+  const docRaw = [
+    "# Demo",
+    "",
+    "Inline ![a](./img/one.png \"One\") and ![a-dup](./img/one.png) and ![b](<./img/two space.jpg>) plus ![ref-pic][picref].",
+    "",
+    "HTML <img src='/assets/logo.webp' width='20'> and `<img src='./ignored-inline.png'>` and `![ignored](./inline.png)`.",
+    "",
+    "```md",
+    "![ignored-fence](./fenced.png)",
+    "<img src=\"./fenced-html.png\">",
+    "```",
+    "",
+    "> [!WARNING] Watch out",
+    "",
+    "[picref]: ../shared/ref.png",
+  ].join("\n");
+
+  expect(extractMarkdownImageUrls(docRaw)).toEqual([
+    "./img/one.png",
+    "./img/two space.jpg",
+    "/assets/logo.webp",
+    "../shared/ref.png",
+  ]);
+
+  const parsed = parseMarkdownBlocks(docRaw);
+  const remoteMap = new Map([
+    ["docs/img/one.png", "data:image/png;base64,ONE"],
+    ["docs/img/two space.jpg", "data:image/jpeg;base64,TWO"],
+    ["assets/logo.webp", "data:image/webp;base64,LOGO"],
+    ["shared/ref.png", "data:image/png;base64,REF"],
+  ]);
+
+  const inlineBlockOut = prepareBlockMarkdown(parsed.blocks[1].raw, parsed.defs, remoteMap, "docs/readme.md");
+  expect(inlineBlockOut).toContain("![a](data:image/png;base64,ONE \"One\")");
+  expect(inlineBlockOut).toContain("![b](data:image/jpeg;base64,TWO)");
+  expect(inlineBlockOut).toContain("[picref]: data:image/png;base64,REF");
+
+  const htmlBlockOut = prepareBlockMarkdown(parsed.blocks[2].raw, parsed.defs, remoteMap, "docs/readme.md");
+  expect(htmlBlockOut).toContain("<img src='data:image/webp;base64,LOGO' width='20'>");
+  expect(htmlBlockOut).toContain("`<img src='./ignored-inline.png'>`");
+  expect(htmlBlockOut).toContain("`![ignored](./inline.png)`");
+
+  const fenceOut = prepareBlockMarkdown(parsed.blocks[3].raw, parsed.defs, remoteMap, "docs/readme.md");
+  expect(fenceOut.split("\n\n")[0]).toBe(parsed.blocks[3].raw);
+  expect(fenceOut).toContain("![ignored-fence](./fenced.png)");
+  expect(fenceOut).toContain('<img src="./fenced-html.png">');
+
+  const alertOut = prepareBlockMarkdown(parsed.blocks[4].raw, parsed.defs, remoteMap, "docs/readme.md");
+  expect(alertOut).toBe("> **⚠ Warning** Watch out");
+});
+
+test("Files detects ATX and Setext heading levels cleanly", () => {
+  expect(detectHeadingLevel("# Main Title")).toBe(1);
+  expect(detectHeadingLevel("  ## Section")).toBe(2);
+  expect(detectHeadingLevel("###### Deepest")).toBe(6);
+  expect(detectHeadingLevel("Setext H1\n===")).toBe(1);
+  expect(detectHeadingLevel("Setext H2\n---")).toBe(2);
+  expect(detectHeadingLevel("Plain paragraph")).toBe(0);
+  const doc = parseMarkdownBlocks("# H1\n\n### H3\n\nBody\n");
+  expect(doc.blocks.map((b) => b.headingLevel)).toEqual([1, 3, 0]);
+});
+
+test("Files parses and serializes GFM pipe tables including alignments and escaped pipes", () => {
+  const raw = [
+    "| Name | Role | Notes |",
+    "| :--- | :---: | ---: |",
+    "| Alice | Dev | a \\| b |",
+    "| Bob | QA | ok |",
+  ].join("\r\n");
+
+  const table = parseMarkdownTable(raw);
+  expect(table).not.toBeNull();
+  expect(table?.headers).toEqual(["Name", "Role", "Notes"]);
+  expect(table?.alignments).toEqual(["left", "center", "right"]);
+  expect(table?.rows).toEqual([
+    ["Alice", "Dev", "a | b"],
+    ["Bob", "QA", "ok"],
+  ]);
+
+  if (!table) throw new Error("expected parsed table");
+  table.rows[0][1] = "Lead | Architect";
+  table.rows.push(["Cara", "PM", "ready"]);
+  const serialized = serializeMarkdownTable(table);
+  expect(serialized).toContain("\r\n");
+  expect(serialized).toContain("Lead \\| Architect");
+  const roundTripped = parseMarkdownTable(serialized);
+  expect(roundTripped?.alignments).toEqual(["left", "center", "right"]);
+  expect(roundTripped?.rows[0][1]).toBe("Lead | Architect");
+  expect(roundTripped?.rows[2]).toEqual(["Cara", "PM", "ready"]);
+  expect(parseMarkdownTable("| not a table |\nplain")).toBeNull();
+});
+
+test("Files parses and serializes fenced code blocks safely", () => {
+  const raw = "```rust\nfn main() {\n    println!(\"hi\");\n}\n```";
+  const fence = parseCodeFence(raw);
+  expect(fence).toMatchObject({ fenceChar: "`", fenceLen: 3, lang: "rust", body: "fn main() {\n    println!(\"hi\");\n}", hasClosing: true });
+
+  expect(resolveFenceLanguage("rust")).toBe("rs");
+  expect(resolveFenceLanguage("TypeScript")).toBe("ts");
+  expect(resolveFenceLanguage("unknown-lang")).toBe("txt");
+
+  if (!fence) throw new Error("expected parsed fence");
+  const withTicks = serializeCodeFence(fence, "````\ninner\n````", "markdown");
+  expect(withTicks.startsWith("`````markdown\n")).toBe(true);
+  expect(withTicks.endsWith("\n`````")).toBe(true);
+  expect(parseCodeFence(withTicks)?.body).toBe("````\ninner\n````");
+
+  const emptyFence = serializeCodeFence(fence, "", "py");
+  expect(emptyFence).toBe("```py\n```");
 });

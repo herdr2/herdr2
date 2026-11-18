@@ -154,3 +154,127 @@ test("maybeAutoProbeDrove reuses saved fullProbe models without re-probing", () 
   view.maybeAutoProbeDrove({ notify() {} });
   expect(calls).toBe(1);
 });
+
+test("drove settings uses English Drove title, hides feedback button, and preserves codex fast flag", () => {
+  expect(source).toContain('{ id: "drove", title: "Drove", zh: "Drove", icon: "layers" }');
+  expect(source).not.toContain("st-feedback");
+  expect(source).not.toContain("Send feedback");
+
+  const view = new Settings();
+  const role: any = {
+    primary: { agent: "codex", model: "gpt-6.1-sol", effort: "high", fast: true },
+    fallbacks: [{ agent: "claude", model: null, effort: "high", fast: false }],
+  };
+  const chain = view.roleChain(role);
+  expect(chain).toEqual([
+    { agent: "codex", model: "gpt-6.1-sol", effort: "high", fast: true },
+    { agent: "claude", model: null, effort: "high" },
+  ]);
+  view.applyRoleChain(role, chain);
+  expect(role.primary).toEqual({ agent: "codex", model: "gpt-6.1-sol", effort: "high", fast: true });
+  expect(role.fallbacks).toEqual([{ agent: "claude", model: null, effort: "high" }]);
+});
+
+test("cursor context sizing preserves context field and falls back by model family", () => {
+  const view = new Settings();
+  view.droveData = {
+    agents: {
+      agents: [
+        {
+          id: "cursor",
+          installed: true,
+          models: ["grok-4.7", "claude-opus-5-5"],
+          modelContexts: {
+            "grok-4.7": ["256k", "500k"],
+          },
+        },
+      ],
+    },
+  };
+  expect(view.cursorContextChoicesFor("grok-4.7")).toEqual(["256k", "500k"]);
+  expect(view.cursorContextChoicesFor("claude-opus-5-5")).toEqual(["300k", "1m"]);
+
+  const role: any = {
+    primary: { agent: "cursor", model: "grok-4.7", effort: "high", context: "500k" },
+    fallbacks: [{ agent: "agy", model: "gemini-4-carbon-high", effort: "high" }],
+  };
+  const chain = view.roleChain(role);
+  expect(chain[0]).toEqual({ agent: "cursor", model: "grok-4.7", effort: "high", context: "500k" });
+  view.applyRoleChain(role, chain);
+  expect(role.primary).toEqual({ agent: "cursor", model: "grok-4.7", effort: "high", context: "500k" });
+});
+
+test("cursor modelHasEmbeddedEffort detects built-in effort slugs and variants while allowing base models", () => {
+  const view = new Settings();
+  view.droveData = {
+    agents: {
+      agents: [
+        {
+          id: "cursor",
+          installed: true,
+          models: ["grok-4.7", "grok-4.7-high-fast", "claude-opus-5-5"],
+          modelContexts: {
+            "grok-4.7": ["256k", "500k"],
+          },
+        },
+      ],
+    },
+  };
+
+  for (const embedded of [
+    "grok-4.7-high",
+    "grok-4.7-high-fast",
+    "claude-opus-5-thinking-xhigh-fast",
+    "gpt-5.5-extra-high",
+    "gpt-5.6-sol-none",
+    "muse-wonder-1.0-minimal",
+    "sonnet-4-thinking",
+    "claude-opus-5-5[context=300k,effort=medium]",
+    "grok-4.7[reasoning=high]",
+  ]) {
+    expect(view.modelHasEmbeddedEffort(embedded)).toBe(true);
+  }
+
+  for (const base of [
+    null,
+    "",
+    "auto",
+    "default",
+    "grok-4.7",
+    "claude-opus-5-5",
+    "gpt-5.3-codex-fast",
+    "composer-2.5-fast",
+    "grok-4.7[context=500k,fast=true]",
+  ]) {
+    expect(view.modelHasEmbeddedEffort(base)).toBe(false);
+  }
+
+  expect(view.cursorContextChoicesFor("grok-4.7-high-fast")).toEqual(["256k", "500k"]);
+  expect(view.cursorContextChoicesFor("claude-opus-5-thinking-xhigh-fast")).toEqual(["300k", "1m"]);
+});
+
+test("ai assistant parameter helpers format effort and parse context/maxTokens inputs", () => {
+  const view = new Settings();
+  expect(view.aiEffortLabel("auto")).toBe("Auto");
+  expect(view.aiEffortLabel("none")).toBe("Off");
+  expect(view.aiEffortLabel("low")).toBe("Low");
+  expect(view.aiEffortLabel("medium")).toBe("Med");
+  expect(view.aiEffortLabel("high")).toBe("High");
+
+  expect(view.normalizeAiContextInput("")).toBe("");
+  expect(view.normalizeAiContextInput("Auto")).toBe("");
+  expect(view.normalizeAiContextInput(" DEFAULT ")).toBe("");
+  expect(view.normalizeAiContextInput(" 128K ")).toBe("128k");
+  expect(view.normalizeAiContextInput("1M")).toBe("1m");
+
+  expect(view.parseAiMaxTokensInput(0)).toBe(0);
+  expect(view.parseAiMaxTokensInput("")).toBe(0);
+  expect(view.parseAiMaxTokensInput("auto")).toBe(0);
+  expect(view.parseAiMaxTokensInput("0")).toBe(0);
+  expect(view.parseAiMaxTokensInput(2048)).toBe(2048);
+  expect(view.parseAiMaxTokensInput("4k")).toBe(4096);
+  expect(view.parseAiMaxTokensInput("16")).toBe(64);
+  expect(view.parseAiMaxTokensInput("200000")).toBe(131072);
+  expect(view.parseAiMaxTokensInput("not-a-number")).toBeNull();
+  expect(view.parseAiMaxTokensInput("-100")).toBeNull();
+});

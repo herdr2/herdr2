@@ -140,7 +140,7 @@ pub fn procargs(pid: i32) -> Option<(Vec<String>, Vec<u8>)> {
     Some((argv, rest.to_vec()))
 }
 
-fn shell_root(root: &Foreground) -> bool {
+pub(crate) fn is_shell_root(root: &Foreground) -> bool {
     // Command and script wrappers can share their foreground group with a live agent.
     if root.argv.iter().skip(1).any(|arg| {
         (!arg.starts_with('-') && !arg.starts_with('+'))
@@ -170,7 +170,7 @@ impl Core {
                     continue;
                 };
                 let at_shell = crate::platform::foreground_tracks_jobs()
-                    && now.as_ref().is_some_and(|n| Some(n.pid as u32) == t.pid && shell_root(n));
+                    && now.as_ref().is_some_and(|n| Some(n.pid as u32) == t.pid && is_shell_root(n));
                 let change = (at_shell && (t.status.is_some() || !t.records.is_empty())).then(|| {
                     t.first_task_turn = None;
                     crate::status::reset_terminal(t)
@@ -202,14 +202,14 @@ mod tests {
     fn command_flags_keep_shell_roots_from_clearing_live_status() {
         for shell in ["sh", "bash", "zsh", "fish", "nu", "dash", "ksh", "tcsh"] {
             let mut root = Foreground { pid: 1, name: shell.into(), argv: vec![shell.into()], cwd: "/".into() };
-            assert!(shell_root(&root), "{shell}");
+            assert!(is_shell_root(&root), "{shell}");
             for arg in ["-i", "-li", "--login", "--no-config"] {
                 root.argv = vec![shell.into(), arg.into()];
-                assert!(shell_root(&root), "{shell} {arg}");
+                assert!(is_shell_root(&root), "{shell} {arg}");
             }
             for arg in ["-c", "-cecho", "-ic echo", "--command", "--command=echo", "--commands", "--commands=echo"] {
                 root.argv = vec![shell.into(), arg.into()];
-                assert!(!shell_root(&root), "{shell} {arg}");
+                assert!(!is_shell_root(&root), "{shell} {arg}");
             }
         }
     }

@@ -1,0 +1,437 @@
+/* ---------- graph nodes ---------- */
+
+.react-flow {
+  --xy-background-color: var(--bg-canvas, var(--bg));
+  --xy-controls-button-background-color: transparent;
+  --xy-controls-button-background-color-hover: var(--surface-2);
+  --xy-controls-button-color: var(--text-2);
+  --xy-controls-button-color-hover: var(--text);
+  --xy-controls-button-border-color: var(--border);
+  --xy-controls-box-shadow: var(--shadow);
+  --xy-edge-stroke: var(--edge-depends);
+}
+/* Shell paints `.dag-board .react-flow` with `--bg`. Restate it here so the
+   canvas sits on warm drafting parchment / Anthropic near-black. */
+.dag-board,
+.dag-board .react-flow {
+  background: var(--bg-canvas, var(--bg));
+}
+.dag-board .react-flow__controls {
+  border-radius: 10px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--surface-elevated, var(--surface)) 92%, transparent);
+  backdrop-filter: blur(8px);
+  box-shadow: var(--shadow);
+}
+.dag-board .react-flow__controls-button {
+  background: transparent;
+  color: var(--text-2);
+  border-bottom-color: var(--border);
+}
+.dag-board .react-flow__controls-button svg {
+  fill: currentColor;
+}
+.dag-board .react-flow__controls-button:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+
+.gnode {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  box-sizing: border-box;
+  padding: 10px 12px 10px 15px;
+  border-radius: 12px;
+  background: var(--surface-elevated, var(--surface));
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  overflow: hidden;
+  cursor: pointer;
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+/* status rail: inset pill so it clears the 12px corner */
+.gnode::before {
+  content: "";
+  position: absolute;
+  top: 8px;
+  bottom: 8px;
+  left: 4px;
+  width: 3.5px;
+  border-radius: 999px;
+  background: var(--st);
+}
+.gnode:hover {
+  border-color: var(--border-strong);
+  box-shadow: var(--shadow-md);
+}
+.gnode--selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2.5px color-mix(in srgb, var(--accent) 26%, transparent), var(--shadow-md);
+}
+
+/* sizes: keep in sync with NODE_SIZE (layout.ts).
+   Outer border-box pixels are fixed so Dagre routing stays exact. */
+.gnode--task {
+  width: 260px;
+  height: 122px;
+}
+.gnode--worker {
+  width: 240px;
+  height: 108px;
+  background: color-mix(in srgb, var(--role-worker-bg) 45%, var(--surface-elevated, var(--surface)));
+}
+.gnode--coord {
+  width: 240px;
+  height: 112px;
+  box-sizing: border-box;
+  background: color-mix(in srgb, var(--role-coord-bg) 55%, var(--surface-elevated, var(--surface)));
+  border-color: color-mix(in srgb, var(--role-coord) 40%, var(--border));
+}
+.gnode--coord:hover {
+  border-color: var(--border-strong);
+}
+.gnode--selected:hover,
+.gnode--coord.gnode--selected,
+.gnode--coord.gnode--selected:hover {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2.5px color-mix(in srgb, var(--accent) 26%, transparent), var(--shadow-md);
+}
+
+.gnode__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.gnode__status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--st);
+  white-space: nowrap;
+}
+/* the worker head holds badge + chip + status + ↗ in a fixed 240px card:
+   the status text gives way (ellipsis) before the card would need to grow */
+.gnode__status--fit {
+  min-width: 0;
+  flex: 0 1 auto;
+}
+.gnode__status-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.gnode__title {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.gnode--coord .gnode__title {
+  font-family: var(--font-serif);
+}
+.gnode__title--sm {
+  font-size: 12px;
+}
+.gnode__meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+}
+.gnode__meta > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.gnode__meta--dim {
+  color: var(--text-3);
+}
+.gnode__dim {
+  color: var(--text-3);
+  font-weight: 400;
+}
+.gnode__warn {
+  color: var(--st-failed);
+}
+.gnode__sep {
+  flex: none;
+  width: 1px;
+  height: 10px;
+  background: var(--border-strong);
+}
+.gnode__flag {
+  flex: none;
+  margin-left: auto;
+  padding: 0 5px;
+  border-radius: 3px;
+  background: var(--st-failed-bg);
+  color: var(--st-failed);
+  font-weight: 600;
+}
+
+.gnode .react-flow__handle {
+  width: 7px;
+  height: 7px;
+  border: 1px solid var(--surface);
+  background: var(--border-strong);
+}
+
+/* role badge: the explicit "what is this node" label */
+.role-badge {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 6px;
+  border: 1px solid color-mix(in srgb, currentColor 24%, transparent);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+.role-badge--coord {
+  background: var(--role-coord-bg);
+  color: var(--role-coord);
+}
+.role-badge--worker {
+  background: var(--role-worker-bg);
+  color: var(--role-worker);
+}
+.role-badge--task {
+  background: var(--role-task-bg);
+  color: var(--role-task);
+}
+.role-badge--reviewer {
+  background: var(--role-reviewer-bg);
+  color: var(--role-reviewer);
+  letter-spacing: 0.04em;
+}
+.role-badge--coder {
+  background: var(--role-coder-bg);
+  color: var(--role-coder);
+}
+.role-badge--tester {
+  background: var(--role-tester-bg);
+  color: var(--role-tester);
+}
+.role-badge--writer {
+  background: var(--role-writer-bg);
+  color: var(--role-writer);
+}
+.role-badge--researcher {
+  background: var(--role-researcher-bg);
+  color: var(--role-researcher);
+}
+.role-badge--custom {
+  background: var(--role-custom-bg);
+  color: var(--role-custom);
+}
+
+.access-pill {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-2);
+  background: var(--surface-2);
+  white-space: nowrap;
+}
+.access-pill--readonly {
+  color: var(--role-reviewer);
+  border-color: var(--role-reviewer-border);
+  background: var(--role-reviewer-bg);
+}
+.access-pill--scoped_write {
+  color: var(--role-tester);
+  border-color: color-mix(in srgb, var(--role-tester) 40%, var(--border));
+  background: var(--role-tester-bg);
+}
+.access-pill--writable {
+  color: var(--role-coder);
+  border-color: color-mix(in srgb, var(--role-coder) 35%, var(--border));
+  background: var(--role-coder-bg);
+}
+
+/* ---------- edges ---------- */
+
+/* dependency edges are the graph's backbone: heaviest stroke. Arrowheads
+   get an explicit color from DagView (markers live in a shared <defs>, out of
+   reach of a CSS variable set on the edge). */
+.edge .react-flow__edge-path {
+  stroke-width: 1.5;
+}
+.edge--depends {
+  --edge-color: var(--edge-depends);
+}
+.edge--depends .react-flow__edge-path {
+  stroke: var(--edge-color);
+  stroke-width: 2;
+}
+.edge--satisfied {
+  --edge-color: var(--edge-satisfied);
+}
+.edge--dispatch {
+  --edge-color: var(--edge-dispatch);
+}
+.edge--dispatch .react-flow__edge-path {
+  stroke: var(--edge-color);
+  stroke-dasharray: 5 4;
+  opacity: 0.7;
+}
+.edge--executes {
+  --edge-color: var(--edge-executes);
+}
+.edge--mark-ok,
+.edge--mark-order {
+  --edge-color: var(--edge-executes);
+}
+/* Always-on success edges use the sage done color. */
+.edge--persist.edge--mark-ok {
+  --edge-color: var(--st-done);
+}
+.edge--mark-fail {
+  --edge-color: var(--st-failed);
+}
+.edge--mark-retry {
+  --edge-color: var(--st-blocked);
+}
+.edge--mark-run {
+  --edge-color: var(--st-running);
+}
+.edge--executes .react-flow__edge-path {
+  stroke: var(--edge-color);
+  stroke-width: 2;
+}
+.edge--retry .react-flow__edge-path {
+  stroke-dasharray: 6 4;
+}
+.react-flow__edgelabel-renderer {
+  z-index: 12;
+}
+.exec-label {
+  position: absolute;
+  z-index: 12;
+  padding: 0 5px;
+  border: 1px solid var(--c, var(--edge-executes));
+  border-radius: 6px;
+  background: var(--surface-elevated, var(--surface));
+  color: var(--c, var(--edge-executes));
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 16px;
+  pointer-events: none;
+  box-shadow: var(--shadow);
+}
+.exec-label--ok,
+.exec-label--order {
+  --c: var(--edge-executes);
+}
+.exec-label--persist.exec-label--ok {
+  --c: var(--st-done);
+}
+.exec-label--fail {
+  --c: var(--st-failed);
+}
+.exec-label--retry {
+  --c: var(--st-blocked);
+}
+.exec-label--run {
+  --c: var(--st-running);
+}
+.edge--active .react-flow__edge-path {
+  opacity: 1;
+  stroke-width: 2;
+}
+.react-flow__edge.selected .react-flow__edge-path {
+  stroke: var(--accent);
+}
+
+.gnode__deps {
+  min-width: 0;
+}
+.gnode__nowrap {
+  flex: none;
+}
+
+.edge-legend {
+  position: absolute;
+  left: 12px;
+  bottom: 12px;
+  z-index: 5;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  max-width: calc(100% - 24px);
+  padding: 7px 12px;
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--surface-elevated, var(--surface)) 88%, transparent);
+  backdrop-filter: blur(10px);
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+  font-size: 12px;
+  color: var(--text-2);
+}
+.edge-legend__item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.edge-legend__arrow line {
+  stroke: var(--c);
+  stroke-width: 2;
+}
+.edge-legend__arrow path {
+  fill: var(--c);
+}
+.edge-legend__arrow--dispatch {
+  --c: var(--edge-dispatch);
+}
+.edge-legend__arrow--dispatch line {
+  stroke-dasharray: 4 3;
+}
+.edge-legend__arrow--executes {
+  --c: var(--edge-executes);
+}
+.edge-legend__arrow--depends {
+  --c: var(--edge-depends);
+}
+/* color key for dependency arrows: plain swatches, not arrows, so they read as
+   "this color means…" rather than as another kind of edge */
+.edge-legend__colors {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-wrap: wrap;
+}
+.legend-swatch {
+  display: inline-block;
+  width: 16px;
+  height: 4px;
+  border-radius: 2px;
+  margin-left: 4px;
+}
+.legend-swatch--pending {
+  background: var(--edge-depends);
+}
+.legend-swatch--satisfied {
+  background: var(--edge-satisfied);
+}
+

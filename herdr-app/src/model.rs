@@ -80,6 +80,34 @@ pub struct Agent {
     pub seq: u64,
     /// When the state last changed, ms since the epoch (0: not since the app started).
     pub since: u64,
+    /// Epoch ms when the current active working run began (adjusted for prior paused blocked segments).
+    pub working_since: Option<u64>,
+    /// Active execution duration (ms) of the current or most recently completed run.
+    pub work_ms: Option<u64>,
+    /// Cumulative active execution duration (ms) across all runs of this agent.
+    pub total_work_ms: u64,
+}
+
+impl Agent {
+    fn transition_timing(&mut self, was_eff: Option<&str>, now_eff: Option<&str>, now: u64) {
+        let was_w = was_eff == Some("working");
+        let is_w = now_eff == Some("working");
+        if was_w && !is_w {
+            if self.working_since.is_some() || self.work_ms.is_some() {
+                let prev = self.work_ms.unwrap_or(0);
+                let run = self.working_since.map_or(prev, |ws| now.saturating_sub(ws).max(prev));
+                let delta = run.saturating_sub(prev);
+                self.work_ms = Some(run);
+                self.total_work_ms = self.total_work_ms.saturating_add(delta);
+            }
+            self.working_since = None;
+        } else if !was_w && is_w {
+            let resuming = matches!(was_eff, Some("blocked" | "error")) && self.work_ms.is_some();
+            let prior = if resuming { self.work_ms.unwrap_or(0) } else { 0 };
+            self.work_ms = Some(prior);
+            self.working_since = Some(now.saturating_sub(prior));
+        }
+    }
 }
 
 #[derive(Default)]
@@ -689,6 +717,7 @@ impl Model {
         if a.word == word {
             return false;
         }
+        let was_eff = a.manual_status.as_deref().or(a.word.as_deref()).map(str::to_owned);
         let was_busy = matches!(a.word.as_deref(), Some("working" | "blocked"));
         match word.as_deref() {
             Some("working" | "blocked") => a.seen = true,
@@ -697,9 +726,12 @@ impl Model {
             _ => {}
         }
         a.word = word;
+        let now_eff = a.manual_status.as_deref().or(a.word.as_deref()).map(str::to_owned);
         self.seq += 1;
         a.seq = self.seq;
-        a.since = now_ms();
+        let now = now_ms();
+        a.since = now;
+        a.transition_timing(was_eff.as_deref(), now_eff.as_deref(), now);
         true
     }
 
@@ -710,11 +742,58 @@ impl Model {
         if a.manual_status == manual {
             return false;
         }
+        let was_eff = a.manual_status.as_deref().or(a.word.as_deref()).map(str::to_owned);
         a.manual_status = manual;
+        let now_eff = a.manual_status.as_deref().or(a.word.as_deref()).map(str::to_owned);
         self.seq += 1;
         a.seq = self.seq;
-        a.since = now_ms();
+        let now = now_ms();
+        a.since = now;
+        a.transition_timing(was_eff.as_deref(), now_eff.as_deref(), now);
         true
+    }
+
+    /// Syncs core-provided execution timing (`working_since`, `work_ms`, `total_work_ms`, `status_ms`).
+    pub fn sync_core_timing(
+        &mut self,
+        address: &str,
+        core_ws: Option<u64>,
+        core_work_ms: Option<u64>,
+        core_total_ms: Option<u64>,
+        core_status_ms: Option<u64>,
+        is_starting_handshake: bool,
+    ) -> bool {
+        let Some(a) = self.agents.get_mut(address) else { return false };
+        if a.manual_status.is_some() {
+            return false;
+        }
+        let prev = (a.working_since, a.work_ms, a.total_work_ms);
+        if is_starting_handshake {
+            if a.total_work_ms == 0 && core_work_ms.is_none() {
+                a.working_since = None;
+                a.work_ms = None;
+            }
+            return (a.working_since, a.work_ms, a.total_work_ms) != prev;
+        }
+        if core_ws.is_some() || core_work_ms.is_some() || core_total_ms.is_some_and(|t| t > 0) {
+            if a.word.as_deref() == Some("working") {
+                if core_ws.is_some() {
+                    a.working_since = core_ws;
+                }
+            } else {
+                a.working_since = None;
+            }
+            if core_work_ms.is_some() {
+                a.work_ms = core_work_ms;
+            }
+            a.total_work_ms = a.total_work_ms.max(core_total_ms.unwrap_or(0));
+        } else if a.word.as_deref() == Some("working")
+            && let Some(status_ms) = core_status_ms.filter(|ms| *ms > 0)
+            && a.work_ms.unwrap_or(0) == 0
+        {
+            a.working_since = Some(status_ms);
+        }
+        (a.working_since, a.work_ms, a.total_work_ms) != prev
     }
 
     /// Herdr's attention rule for a change of 7501 word: needing you always
@@ -793,9 +872,27 @@ impl Model {
         any_addresses(&c.root)
             .iter()
             .filter_map(|a| self.agents.get(a))
-            .filter(|a| a.manual_status.as_deref().or(a.word.as_deref()) == Some("working") && a.since > 0)
-            .map(|a| a.since)
+            .filter(|a| a.manual_status.as_deref().or(a.word.as_deref()) == Some("working"))
+            .filter_map(|a| a.working_since.or((a.since > 0).then_some(a.since)))
             .min()
+    }
+
+    /// Active or most recent completed run duration among agents in a tab, ms.
+    pub fn work_ms(&self, c: &Tab) -> Option<u64> {
+        any_addresses(&c.root)
+            .iter()
+            .filter_map(|a| self.agents.get(a))
+            .filter_map(|a| a.work_ms)
+            .max()
+    }
+
+    /// Cumulative active execution duration across agents in a tab, ms.
+    pub fn total_work_ms(&self, c: &Tab) -> u64 {
+        any_addresses(&c.root)
+            .iter()
+            .filter_map(|a| self.agents.get(a))
+            .map(|a| a.total_work_ms)
+            .sum()
     }
 
     /// The most urgent status among some terminals.
@@ -867,6 +964,8 @@ pub fn space_json(m: &Model, p: &Space, index: usize, branch: Option<&str>, home
                 "settled_at": c.settled,
                 "changed_at": m.changed_at(c),
                 "working_since": m.working_since(c),
+                "work_ms": m.work_ms(c),
+                "total_work_ms": m.total_work_ms(c),
             })
         })
         .collect();
@@ -1426,5 +1525,47 @@ mod tests {
         let tab_ids: Vec<_> = m.space("p1").unwrap().tabs.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(tab_ids, ["c1", new_x2_tab.as_str(), new_acp_tab.as_str()]);
         assert_eq!(m.tab("c1").unwrap().root.panes().len(), 1);
+    }
+
+    #[test]
+    fn agent_timing_tracks_runs_pauses_and_syncs_core_values() {
+        let mut m = model_with_one();
+        assert!(m.set_word("t1", Some("working".into()), Some("claude".into()), true));
+        let a = m.agents.get_mut("t1").unwrap();
+        assert!(a.working_since.is_some());
+        assert_eq!(a.work_ms, Some(0));
+        a.working_since = Some(a.working_since.unwrap().saturating_sub(3_000));
+
+        assert!(m.set_word("t1", Some("blocked".into()), None, true));
+        let paused = m.agents["t1"].work_ms.expect("paused work_ms");
+        assert!(paused >= 3_000);
+        assert_eq!(m.agents["t1"].working_since, None);
+        assert_eq!(m.agents["t1"].total_work_ms, paused);
+
+        assert!(m.set_word("t1", Some("working".into()), None, true));
+        assert!(m.agents["t1"].working_since.is_some());
+        assert_eq!(m.agents["t1"].work_ms, Some(paused));
+
+        assert!(m.set_word("t1", Some("done".into()), None, false));
+        let finished = m.agents["t1"].work_ms.expect("finished work_ms");
+        assert!(finished >= paused);
+        assert_eq!(m.agents["t1"].working_since, None);
+        assert_eq!(m.agents["t1"].total_work_ms, finished);
+
+        let tab = m.tab("c1").unwrap();
+        assert_eq!(m.work_ms(tab), Some(finished));
+        assert_eq!(m.total_work_ms(tab), finished);
+
+        // Cold ACP handshake ("starting" at turn 0) resets fake timing until real work starts.
+        assert!(m.set_word("a1", Some("working".into()), Some("codex".into()), true));
+        assert!(m.sync_core_timing("a1", None, None, None, None, true));
+        assert_eq!(m.agents["a1"].working_since, None);
+        assert_eq!(m.agents["a1"].work_ms, None);
+
+        // Core timing sync overrides when core reports active work_ms / working_since.
+        assert!(m.sync_core_timing("a1", Some(123_000), Some(4_500), Some(9_000), Some(123_000), false));
+        assert_eq!(m.agents["a1"].working_since, Some(123_000));
+        assert_eq!(m.agents["a1"].work_ms, Some(4_500));
+        assert_eq!(m.agents["a1"].total_work_ms, 9_000);
     }
 }

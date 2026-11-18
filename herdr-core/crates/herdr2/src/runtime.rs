@@ -522,6 +522,9 @@ impl Core {
             let target = TargetKey::Agent(id);
             let _ = self.jobs.send(crate::notes::Job::Orphaned(target));
             crate::remote::orphaned_afar(self, st, target);
+            let _ = self.drove.pool_tx.send(crate::drove::pool::PoolSignal::SessionClosed {
+                address: crate::agents::address(id),
+            });
         }
         if let Some(wid) = st.reg.agents.get(&id).and_then(|a| a.labels.get("drove.worker")) {
             let _ = self.drove.pool_tx.send(crate::drove::pool::PoolSignal::AgentExited {

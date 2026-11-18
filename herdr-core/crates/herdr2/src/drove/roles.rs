@@ -144,6 +144,21 @@ fn glob_match_chars(pat: &[char], path: &[char]) -> bool {
     }
 }
 
+/// Returns true for ephemeral bytecode/test cache files and directories that must not
+/// trigger role scope violations or pollute worktree snapshots/patches.
+pub(super) fn is_ephemeral_cache_path(rel: &str) -> bool {
+    let norm = rel.trim_start_matches("./").replace('\\', "/");
+    if norm.ends_with(".pyc") || norm.ends_with(".pyo") {
+        return true;
+    }
+    norm.split('/').any(|seg| {
+        matches!(
+            seg,
+            "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".ruff_cache"
+        )
+    })
+}
+
 fn is_git_repo(cwd: &str) -> bool {
     super::bg_std_command("git")
         .args(["rev-parse", "--is-inside-work-tree"])
@@ -171,7 +186,7 @@ fn git_status_paths(cwd: &str) -> Vec<String> {
         }
         let code = &rec[..2];
         let rel = String::from_utf8_lossy(&rec[3..]).replace('\\', "/");
-        if !rel.is_empty() {
+        if !rel.is_empty() && !(code == b"??" && is_ephemeral_cache_path(&rel)) {
             paths.push(rel);
         }
         if code[0] == b'R' || code[0] == b'C' {
@@ -202,7 +217,10 @@ fn scan_plain_dir_hashes(root: &Path) -> BTreeMap<String, String> {
             let p = entry.path();
             let name = entry.file_name();
             let ns = name.to_string_lossy();
-            if matches!(ns.as_ref(), ".git" | "node_modules" | "target") {
+            if matches!(
+                ns.as_ref(),
+                ".git" | "node_modules" | "target" | "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".ruff_cache"
+            ) {
                 continue;
             }
             if p.is_dir() {
@@ -210,10 +228,11 @@ fn scan_plain_dir_hashes(root: &Path) -> BTreeMap<String, String> {
             } else if p.is_file()
                 && let Ok(rel) = p.strip_prefix(root)
             {
-                out.insert(
-                    rel.to_string_lossy().replace('\\', "/"),
-                    file_digest_or_tombstone(&p),
-                );
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                if is_ephemeral_cache_path(&rel_str) {
+                    continue;
+                }
+                out.insert(rel_str, file_digest_or_tombstone(&p));
                 if out.len() >= 4096 {
                     return out;
                 }
@@ -234,5 +253,15 @@ mod tests {
         assert!(matches_glob("*.test.ts", "foo.test.ts"));
         assert!(!matches_glob("*.test.ts", "src/foo.test.ts"));
         assert!(!matches_glob("docs/**", "src/lib.rs"));
+    }
+
+    #[test]
+    fn ephemeral_cache_paths_are_detected() {
+        assert!(is_ephemeral_cache_path("src/__pycache__/kvstore.cpython-312.pyc"));
+        assert!(is_ephemeral_cache_path("./tests/__pycache__/"));
+        assert!(is_ephemeral_cache_path(".pytest_cache/v/cache/nodeids"));
+        assert!(is_ephemeral_cache_path("foo.pyo"));
+        assert!(!is_ephemeral_cache_path("src/kvstore.py"));
+        assert!(!is_ephemeral_cache_path("tests/test_kvstore.py"));
     }
 }

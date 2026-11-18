@@ -99,6 +99,87 @@ fn mtime(p: &std::path::Path) -> Option<SystemTime> {
     std::fs::metadata(p).ok()?.modified().ok()
 }
 
+const WIN_PS_HOOK: &str = "$global:__h2_prompt = $function:prompt; function global:prompt { $p = & $global:__h2_prompt; $l = $ExecutionContext.SessionState.Path.CurrentLocation; if ($l.Provider.Name -eq 'FileSystem') { try { [Environment]::CurrentDirectory = $l.ProviderPath } catch {} }; $p }";
+
+fn find_exe_in_path(path_os: Option<&std::ffi::OsStr>, exe: &str) -> Option<String> {
+    let path = path_os?;
+    std::env::split_paths(path)
+        .map(|dir| dir.join(exe))
+        .find(|cand| cand.is_file())
+        .map(|cand| cand.to_string_lossy().into_owned())
+}
+
+fn find_git_bash_with(
+    path_os: Option<&std::ffi::OsStr>,
+    program_files: Option<&str>,
+    program_files_x86: Option<&str>,
+    local_app_data: Option<&str>,
+) -> Option<String> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    for base in [program_files, program_files_x86].into_iter().flatten() {
+        candidates.push(std::path::Path::new(base).join("Git").join("bin").join("bash.exe"));
+        candidates.push(std::path::Path::new(base).join("Git").join("usr").join("bin").join("bash.exe"));
+    }
+    if let Some(local) = local_app_data {
+        candidates.push(std::path::Path::new(local).join("Programs").join("Git").join("bin").join("bash.exe"));
+    }
+    if let Some(cand) = candidates.into_iter().find(|p| p.is_file()) {
+        return Some(cand.to_string_lossy().into_owned());
+    }
+    if let Some(path) = path_os {
+        for dir in std::env::split_paths(path) {
+            let cand = dir.join("bash.exe");
+            let lower = dir.to_string_lossy().to_ascii_lowercase();
+            if cand.is_file() && !lower.ends_with("\\system32") && !lower.ends_with("/system32") {
+                return Some(cand.to_string_lossy().into_owned());
+            }
+        }
+    }
+    None
+}
+
+pub(crate) fn resolve_windows_shell_argv_with(
+    choice: &str,
+    path_os: Option<&std::ffi::OsStr>,
+    program_files: Option<&str>,
+    program_files_x86: Option<&str>,
+    local_app_data: Option<&str>,
+    comspec: Option<&str>,
+) -> Option<Vec<String>> {
+    let ps_argv = |exe: String| vec![exe, "-NoExit".into(), "-Command".into(), WIN_PS_HOOK.into()];
+    let c = choice.trim();
+    match c.to_ascii_lowercase().as_str() {
+        "" | "auto" | "wsl" => None,
+        "powershell" | "windows-powershell" => Some(ps_argv("powershell.exe".into())),
+        "pwsh" | "powershell7" => Some(ps_argv(
+            find_exe_in_path(path_os, "pwsh.exe").unwrap_or_else(|| "pwsh.exe".into()),
+        )),
+        "git-bash" | "gitbash" | "bash" => {
+            let exe = find_git_bash_with(path_os, program_files, program_files_x86, local_app_data)
+                .unwrap_or_else(|| "bash.exe".into());
+            Some(vec![exe, "--login".into(), "-i".into()])
+        }
+        "cmd" => Some(vec![comspec.filter(|s| !s.is_empty()).unwrap_or("cmd.exe").into()]),
+        _ => Some(vec![c.to_owned()]),
+    }
+}
+
+fn resolve_windows_shell_argv(choice: &str) -> Option<Vec<String>> {
+    let path_os = std::env::var_os("PATH");
+    let pf = std::env::var("ProgramFiles").ok();
+    let pfx86 = std::env::var("ProgramFiles(x86)").ok();
+    let local = std::env::var("LOCALAPPDATA").ok();
+    let comspec = std::env::var("COMSPEC").ok();
+    resolve_windows_shell_argv_with(
+        choice,
+        path_os.as_deref(),
+        pf.as_deref(),
+        pfx86.as_deref(),
+        local.as_deref(),
+        comspec.as_deref(),
+    )
+}
+
 pub fn shell() -> String {
     if cfg!(windows) {
         let path = std::env::var_os("PATH").unwrap_or_default();
@@ -547,8 +628,10 @@ pub struct AppWindow {
     /// The downloaded update the frame's pill offers, and the one closed for now.
     /// What's waiting, in words (`update_label`).
     update_ready: Option<String>,
+    #[allow(dead_code)]
     update_dismissed: Option<String>,
     core_update_error_dismissed: Option<String>,
+    #[allow(dead_code)]
     update_success: bool,
     update_status: String,
     focus: FocusHandle,
@@ -914,12 +997,9 @@ impl AppWindow {
         });
     }
 
-    /// Temporarily disabled while `CHANGELOG.md` still carries upstream Herdr spotlights.
-    fn open_whats_new(&mut self, asked: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if asked {
-            self.run("app.settings", json!({ "section": "updates" }), window, cx);
-        }
-    }
+    /// Disabled while original Herdr update/whats-new UI is suppressed.
+    #[allow(dead_code)]
+    fn open_whats_new(&mut self, _asked: bool, _window: &mut Window, _cx: &mut Context<Self>) {}
 
     fn open_welcome(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A window over the live app (nothing dims), centered and movable:
@@ -930,8 +1010,10 @@ impl AppWindow {
 
     /// Tells the updater which core this is and who owns it (off the UI thread).
     fn note_core(core: &Arc<Core>) {
+        mods::set_live_core(core);
         let core = core.clone();
         std::thread::spawn(move || {
+            gpui_shell::warm_syntax();
             if let Ok(s) = core.call("server.status", json!({})) {
                 let text = |k: &str| s.get(k).and_then(Value::as_str).map(str::to_owned);
                 crate::update::set_core(text("version").map(|v| v.trim_start_matches("h2 ").trim_start_matches("hc ").to_owned()), text("installed_by"));
@@ -2062,9 +2144,40 @@ impl AppWindow {
             let context_usage = rec.and_then(|r| r.get("context_usage")).cloned().unwrap_or(Value::Null);
             (rec.is_some(), a, title, pinned, custom_name, app, cwd, context_usage)
         };
+        let agent_timing = |addr: &str| -> (Option<u64>, Option<u64>, u64) {
+            let rec = self.live.get(addr).or_else(|| self.ended_acp.get(addr));
+            let a = m.agents.get(addr);
+            let is_ended = !self.live.contains_key(addr) && self.ended_acp.contains_key(addr);
+            let working_since = if is_ended {
+                None
+            } else {
+                a.and_then(|a| a.working_since)
+                    .or_else(|| rec.and_then(|r| r.get("working_since")).and_then(Value::as_u64))
+            };
+            let mut work_ms = a
+                .and_then(|a| a.work_ms)
+                .or_else(|| rec.and_then(|r| r.get("work_ms")).and_then(Value::as_u64));
+            if is_ended
+                && work_ms.is_none()
+                && rec.and_then(|r| r.get("turn")).and_then(Value::as_u64).unwrap_or(0) > 0
+                && let (Some(c), Some(f)) = (
+                    rec.and_then(|r| r.get("created_ms")).and_then(Value::as_u64),
+                    rec.and_then(|r| r.get("finished_ms")).and_then(Value::as_u64),
+                )
+            {
+                work_ms = Some(f.saturating_sub(c));
+            }
+            let total_work_ms = a
+                .map(|a| a.total_work_ms)
+                .unwrap_or(0)
+                .max(rec.and_then(|r| r.get("total_work_ms")).and_then(Value::as_u64).unwrap_or(0))
+                .max(work_ms.unwrap_or(0));
+            (working_since, work_ms, total_work_ms)
+        };
         let push_acp = |agents: &mut Vec<Value>, addr: &str, space_id: &str, space_name: &str| {
             let (has_rec, a, title, pinned, custom_name, app, _, context_usage) = acp_meta(addr);
             if !has_rec { return; }
+            let (working_since, work_ms, total_work_ms) = agent_timing(addr);
             agents.push(json!({
                 "address": addr, "acp": true, "pane": Value::Null, "space": space_id, "space_name": space_name,
                 "tab": Value::Null, "tab_index": 0, "tab_name": "headless",
@@ -2073,6 +2186,9 @@ impl AppWindow {
                 "app": app, "program": self.program(addr), "title": title,
                 "custom_name": custom_name,
                 "context_usage": context_usage,
+                "working_since": working_since,
+                "work_ms": work_ms,
+                "total_work_ms": total_work_ms,
                 "seq": a.map(|a| a.seq).unwrap_or(0),
                 "pinned": pinned,
                 "focused": self.peeked_agent.as_deref() == Some(addr),
@@ -2087,11 +2203,16 @@ impl AppWindow {
                         let (_, a, title, pinned, custom_name, app, cwd, context_usage) = acp_meta(addr);
                         let is_ended = !self.live.contains_key(addr) && self.ended_acp.contains_key(addr);
                         let status = if is_ended { "ended" } else { m.status(addr).unwrap_or("idle") };
+                        let (working_since, work_ms, total_work_ms) = agent_timing(addr);
                         panes.push(json!({
                             "pane": p.id, "acp": true, "mod": "peek", "terminal": addr, "tab": ctx.id, "title": title,
+                            "custom_name": custom_name,
                             "cwd": cwd, "branch": m.folder_info.get(addr).and_then(|f| f.branch.clone()),
                             "status": status, "app": app, "program": self.program(addr),
                             "context_usage": context_usage,
+                            "working_since": working_since,
+                            "work_ms": work_ms,
+                            "total_work_ms": total_work_ms,
                             "focused": focused, "zoomed": zoomed, "movable": self.pane_movable(&p.id),
                         }));
                         if !is_ended && !self.closing_terminals.contains_key(addr) && !self.live.get(addr).is_some_and(is_trashed_record) {
@@ -2103,6 +2224,9 @@ impl AppWindow {
                                 "app": app, "program": self.program(addr), "title": title,
                                 "custom_name": custom_name,
                                 "context_usage": context_usage,
+                                "working_since": working_since,
+                                "work_ms": work_ms,
+                                "total_work_ms": total_work_ms,
                                 "seq": a.map(|a| a.seq).unwrap_or(0),
                                 "pinned": pinned,
                                 "focused": focused || self.peeked_agent.as_deref() == Some(addr),
@@ -2121,18 +2245,23 @@ impl AppWindow {
                         self.live.get(addr).and_then(|r| r.get("title")).and_then(Value::as_str).map(str::to_owned)
                     });
                     let structured = !self.swapped.contains_key(&p.id) && self.is_structured_terminal(addr);
+                    let custom_name = self.live.get(addr).and_then(|r| r.pointer("/labels/herdr.name")).and_then(Value::as_str).filter(|s| !s.is_empty());
+                    let (working_since, work_ms, total_work_ms) = agent_timing(addr);
                     panes.push(json!({
                         "pane": p.id, "terminal": addr, "tab": ctx.id, "title": title.clone().unwrap_or_default(),
+                        "custom_name": custom_name,
                         "cwd": self.cwds.get(addr), "branch": m.folder_info.get(addr).and_then(|f| f.branch.clone()),
                         "status": m.status(addr), "app": a.and_then(|a| a.app.clone()), "program": self.program(addr),
                         "structured": structured,
+                        "working_since": working_since,
+                        "work_ms": work_ms,
+                        "total_work_ms": total_work_ms,
                         "focused": focused, "zoomed": zoomed, "movable": self.pane_movable(&p.id),
                     }));
                     if self.closing_terminals.contains_key(addr) || self.live.get(addr).is_some_and(is_trashed_record) {
                         continue;
                     }
                     let Some(status) = m.status(addr).or_else(|| has_live_child(addr, &self.live, &self.closing_terminals).then_some("idle")) else { continue };
-                    let custom_name = self.live.get(addr).and_then(|r| r.pointer("/labels/herdr.name")).and_then(Value::as_str).filter(|s| !s.is_empty());
                     agents.push(json!({
                         "address": addr, "pane": p.id, "space": pr.id, "space_name": m.space_name(pr, &home),
                         "tab": ctx.id, "tab_index": ci + 1, "tab_name": Model::tab_name(pr, ctx),
@@ -2140,6 +2269,9 @@ impl AppWindow {
                         "manual_status": a.and_then(|a| a.manual_status.clone()),
                         "app": a.and_then(|a| a.app.clone()), "program": self.program(addr), "title": title.unwrap_or_default(),
                         "custom_name": custom_name,
+                        "working_since": working_since,
+                        "work_ms": work_ms,
+                        "total_work_ms": total_work_ms,
                         "seq": a.map(|a| a.seq).unwrap_or(0),
                         "pinned": self.live.get(addr).and_then(|r| r.pointer("/labels/herdr.pinned")).and_then(Value::as_str).is_some_and(|v| !v.is_empty()),
                         "focused": m.active.as_deref() == Some(pr.id.as_str()) && focused_pane.as_deref() == Some(p.id.as_str()),
@@ -2679,8 +2811,8 @@ impl AppWindow {
             let Some(obj) = agent.as_object_mut() else { continue };
             let Some(addr) = obj.get("address").and_then(Value::as_str).map(str::to_owned) else { continue };
             let report = obj.remove("status").unwrap_or(Value::Null);
-            let raw_state = report.get("state").and_then(Value::as_str).or_else(|| report.as_str());
-            let word = match raw_state {
+            let raw_state = report.get("state").and_then(Value::as_str).or_else(|| report.as_str()).map(str::to_owned);
+            let word = match raw_state.as_deref() {
                 Some("starting" | "working") => json!("working"),
                 Some("blocked" | "error") => json!("blocked"),
                 _ => json!("idle"),
@@ -2703,6 +2835,7 @@ impl AppWindow {
             let shown = crate::terminal::shown_title(&raw_title).into_owned();
             obj.insert("acp".into(), json!(true));
             obj.insert("reported".into(), json!(true));
+            obj.insert("raw_state".into(), raw_state.map_or(Value::Null, Value::String));
             obj.insert("status".into(), word);
             obj.insert("report".into(), report);
             obj.insert("program".into(), prog);
@@ -2791,6 +2924,28 @@ impl AppWindow {
             let turn = rec.get("turn").and_then(Value::as_u64).unwrap_or(0);
             let label = rec.pointer("/labels/herdr.seen").and_then(Value::as_str).and_then(|s| s.parse::<u64>().ok());
             changed |= self.model.set_turn(&addr, turn, label.max(self.written_seen.get(&addr).copied()));
+            let core_ws = rec.get("working_since").and_then(Value::as_u64);
+            let core_work_ms = rec.get("work_ms").and_then(Value::as_u64);
+            let core_total_ms = rec.get("total_work_ms").and_then(Value::as_u64);
+            let core_status_ms = rec.get("status_ms").and_then(Value::as_u64);
+            let is_starting = rec.get("raw_state").and_then(Value::as_str) == Some("starting") && turn == 0;
+            changed |= self.model.sync_core_timing(&addr, core_ws, core_work_ms, core_total_ms, core_status_ms, is_starting);
+            if let Some(a) = self.model.agents.get(&addr)
+                && let Some(obj) = self.live.get_mut(&addr).and_then(Value::as_object_mut)
+            {
+                let want_ws = a.working_since.map_or(Value::Null, |v| json!(v));
+                let want_wm = a.work_ms.map_or(Value::Null, |v| json!(v));
+                let want_tm = json!(a.total_work_ms);
+                if obj.get("working_since") != Some(&want_ws)
+                    || obj.get("work_ms") != Some(&want_wm)
+                    || obj.get("total_work_ms") != Some(&want_tm)
+                {
+                    obj.insert("working_since".into(), want_ws);
+                    obj.insert("work_ms".into(), want_wm);
+                    obj.insert("total_work_ms".into(), want_tm);
+                    republished = true;
+                }
+            }
         }
         if republished {
             mods::publish_terminals(self.ordered_live_values());
@@ -2909,12 +3064,10 @@ impl AppWindow {
         let mut unmounted_acp: Vec<String> = self.live.iter()
             .filter(|(a, r)| is_acp_addr(a) || r.get("acp").and_then(Value::as_bool) == Some(true))
             .filter(|(a, r)| {
-                r["state"] == "live"
-                    && self.model.acp_pane_of(a).is_none()
+                self.model.acp_pane_of(a).is_none()
                     && !self.changing_terminals.contains(*a)
                     && !self.closing_terminals.contains_key(*a)
-                    && !is_trashed_record(r)
-                    && r.pointer("/labels/herdr.parked").and_then(Value::as_str) != Some("1")
+                    && should_auto_mount_acp(r)
             })
             .filter(|(a, _)| {
                 let machine = a.split_once('/').map(|(m, _)| m);
@@ -3229,9 +3382,61 @@ impl AppWindow {
         unix_agent_argv(shell(), cmd, cfg!(target_os = "macos"), false)
     }
 
+    /// Resolves local interactive shell argv from an explicit `shell` override or user settings.
+    fn resolve_local_shell_argv(shell_override: Option<&str>, on: Option<&str>) -> Option<Vec<String>> {
+        if on.is_some() {
+            return None;
+        }
+        let s = settings::get();
+        let choice = shell_override
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| s.shell.trim());
+        if choice.is_empty() || choice.eq_ignore_ascii_case("auto") {
+            return None;
+        }
+        if cfg!(windows) {
+            return resolve_windows_shell_argv(choice);
+        }
+        Some(vec![choice.to_owned()])
+    }
+
+    /// Saves a single-pane tab's custom tab name onto its terminal's `herdr.name` label
+    /// before merging multiple panes into one tab.
+    fn preserve_single_pane_tab_name(&mut self, tab_id: &str, cx: &mut Context<Self>) -> bool {
+        let Some((pane_id, tab_name)) = self.model.tab(tab_id).and_then(|c| {
+            let panes = c.root.panes();
+            (panes.len() == 1).then(|| (panes[0].id.clone(), c.name.trim().to_owned()))
+        }) else {
+            return false;
+        };
+        if !tab_name.is_empty()
+            && let Some(addr) = self.model.any_address_of(&pane_id)
+        {
+            let has_custom = self
+                .live
+                .get(&addr)
+                .or_else(|| self.ended_acp.get(&addr))
+                .and_then(|r| r.pointer("/labels/herdr.name"))
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty());
+            if !has_custom {
+                for map in [&mut self.live, &mut self.ended_acp] {
+                    if let Some(obj) = map.get_mut(&addr).and_then(Value::as_object_mut)
+                        && let Some(labels) = obj.entry("labels").or_insert_with(|| json!({})).as_object_mut()
+                    {
+                        labels.insert("herdr.name".into(), json!(tab_name.clone()));
+                    }
+                }
+                Self::write_core_label(self.core.clone(), addr, "herdr.name", tab_name, cx);
+            }
+        }
+        true
+    }
+
     /// A space with its first tab and terminal, shown at once unless focus is false.
     /// `machine`: another machine (`hc machine ls`); its space starts in that machine's home.
-    fn new_space(&mut self, name: &str, folder: Option<String>, ctx_name: Option<&str>, argv: Option<Vec<String>>, task: Option<&str>, machine: Option<String>, focus: bool, window: &Window) -> Result<Value, String> {
+    fn new_space(&mut self, name: &str, folder: Option<String>, ctx_name: Option<&str>, argv: Option<Vec<String>>, task: Option<&str>, machine: Option<String>, shell: Option<String>, focus: bool, window: &Window) -> Result<Value, String> {
         let follow = folder.is_none();
         let on = machine.as_deref();
         // The focused pane's folder only means something on its own machine.
@@ -3241,7 +3446,10 @@ impl AppWindow {
         let folder = folder.or_else(here).unwrap_or_else(|| if on.is_some() { String::new() } else { home() });
         let (space, ctx, pane) = (self.model.fresh_id_on("sp", on), self.model.fresh_id_on("tb", on), self.model.fresh_id_on("p", on));
         let size = self.initial_size(&Tab::new(&ctx, "", &pane, "").root, &pane, window);
-        let (addr, folder) = self.spawn(Self::agent_argv(argv.clone(), task, on).or(argv), true, folder, follow, &space, &ctx, on, size, window)?;
+        let argv = Self::agent_argv(argv.clone(), task, on)
+            .or(argv)
+            .or_else(|| Self::resolve_local_shell_argv(shell.as_deref(), on));
+        let (addr, folder) = self.spawn(argv, true, folder, follow, &space, &ctx, on, size, window)?;
         let ctx_name = ctx_name.map(str::trim).unwrap_or_default();
         let tab = Tab::new(&ctx, ctx_name, &pane, &addr);
         if focus { self.model.add_space(&space, name.trim(), &folder, tab) } else { self.model.add_space_unshown(&space, name.trim(), &folder, tab) }
@@ -3252,7 +3460,7 @@ impl AppWindow {
     }
 
     /// A tab in a space (default: the shown one), shown at once unless focus is false.
-    fn new_tab(&mut self, space: Option<String>, name: &str, folder: Option<String>, argv: Option<Vec<String>>, task: Option<&str>, focus: bool, window: &Window) -> Result<Value, String> {
+    fn new_tab(&mut self, space: Option<String>, name: &str, folder: Option<String>, argv: Option<Vec<String>>, task: Option<&str>, shell: Option<String>, focus: bool, window: &Window) -> Result<Value, String> {
         let space = space.or_else(|| self.model.active_space().map(|p| p.id.clone())).ok_or("no space yet: make one first (space.new)")?;
         if self.model.space(&space).is_none() {
             return Err(format!("no space {space:?}"));
@@ -3262,9 +3470,87 @@ impl AppWindow {
         let on = self.machine_of(&space);
         let (ctx, pane) = (self.model.fresh_id_on("tb", on.as_deref()), self.model.fresh_id_on("p", on.as_deref()));
         let size = self.initial_size(&Tab::new(&ctx, "", &pane, "").root, &pane, window);
-        let (addr, _) = self.spawn(Self::agent_argv(argv.clone(), task, on.as_deref()).or(argv), true, folder, follow, &space, &ctx, on.as_deref(), size, window)?;
+        let argv = Self::agent_argv(argv.clone(), task, on.as_deref())
+            .or(argv)
+            .or_else(|| Self::resolve_local_shell_argv(shell.as_deref(), on.as_deref()));
+        let (addr, _) = self.spawn(argv, true, folder, follow, &space, &ctx, on.as_deref(), size, window)?;
         self.add_new_tab(&space, Tab::new(&ctx, name.trim(), &pane, &addr), focus);
         Ok(json!({ "space": space, "tab": ctx, "terminal": addr }))
+    }
+
+    /// Starts an ACP agent directly inside a dedicated tab and optionally focuses it.
+    fn new_acp_tab(&mut self, space: Option<String>, name: &str, folder: Option<String>, agent: &str, focus: bool, window: &mut Window, cx: &mut Context<Self>) -> Result<Value, String> {
+        let agent_key = agent.trim();
+        if agent_key.is_empty() {
+            return Err("tab.new acp requires agent".into());
+        }
+        let create_space = space.is_none() && self.model.active_space().is_none();
+        let (space_id, space_folder, on) = if create_space {
+            let folder = folder.unwrap_or_else(home);
+            (self.model.fresh_id("sp"), folder, None)
+        } else {
+            let sp = space
+                .or_else(|| self.model.active_space().map(|p| p.id.clone()))
+                .ok_or("no space yet: make one first (space.new)")?;
+            if self.model.space(&sp).is_none() {
+                return Err(format!("no space {sp:?}"));
+            }
+            let on = self.machine_of(&sp);
+            let folder = folder.unwrap_or_else(|| self.folder_for(&sp));
+            (sp, folder, on)
+        };
+        self.require_document(on.as_deref())?;
+        let (ctx, pane) = (
+            self.model.fresh_id_on("tb", on.as_deref()),
+            self.model.fresh_id_on("p", on.as_deref()),
+        );
+        let space_label = crate::mirror::local(&space_id, on.as_deref()).to_owned();
+        let tab_label = crate::mirror::local(&ctx, on.as_deref()).to_owned();
+        let mut params = json!({
+            "agent": agent_key,
+            "dangerously_skip_permissions": true,
+            "keep": true,
+            "async_start": true,
+            "labels": {
+                "herdr.space": space_label,
+                "herdr.tab": tab_label,
+                "herdr.seen": "0",
+                "herdr.parked": ""
+            }
+        });
+        if !space_folder.is_empty() {
+            params["cwd"] = json!(space_folder);
+        }
+        if let Some(ref m) = on {
+            params["on"] = json!(m);
+        }
+        let created = self
+            .core
+            .call("agent.run", params)
+            .map_err(|e| format!("cannot start ACP agent {agent_key}: {e:#}"))?;
+        let addr = created["address"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "agent.run did not return address".to_owned())?
+            .to_owned();
+        self.born.borrow_mut().insert(addr.clone(), Instant::now());
+        if let Some(cwd) = created["cwd"].as_str().filter(|s| !s.is_empty()) {
+            self.cwds.insert(addr.clone(), cwd.to_owned());
+        } else if !space_folder.is_empty() {
+            self.cwds.insert(addr.clone(), space_folder.clone());
+        }
+        self.live.insert(addr.clone(), created);
+        let tab = Tab::with_pane(&ctx, name.trim(), Self::acp_pane_node(&pane, &addr));
+        if create_space {
+            self.model.add_space(&space_id, "", &space_folder, tab);
+            self.model.active = Some(space_id.clone());
+        } else {
+            self.add_new_tab(&space_id, tab, focus);
+        }
+        if focus {
+            self.focus_mounted_acp(&addr, window, cx);
+        }
+        Ok(json!({ "space": space_id, "tab": ctx, "pane": pane, "terminal": addr }))
     }
 
     /// Adds a new tab to its space and shows it, or (focus false) leaves what is shown as it is.
@@ -3293,7 +3579,7 @@ impl AppWindow {
         Ok(json!({ "space": space, "tab": ctx, "pane": pane }))
     }
 
-    fn split(&mut self, pane: Option<String>, axis: Axis, argv: Option<Vec<String>>, folder: Option<String>, window: &Window) -> Result<Value, String> {
+    fn split(&mut self, pane: Option<String>, axis: Axis, argv: Option<Vec<String>>, folder: Option<String>, shell: Option<String>, window: &Window) -> Result<Value, String> {
         let target = pane.or_else(|| self.model.focused_pane()).ok_or("no pane to split")?;
         let (Some(p), Some(c)) = (self.model.space_of(&target), self.model.tab_of(&target)) else { return Err(format!("no pane {target:?}")) };
         let (space, ctx, fallback) = (p.id.clone(), c.id.clone(), p.folder.clone());
@@ -3321,7 +3607,10 @@ impl AppWindow {
         root.split(&target, axis, Node::block(new.clone(), Content::Terminal { terminal: String::new() }), "initial-size".into());
         let size = self.model.active_tab().filter(|tab| tab.id == ctx)
             .and_then(|_| self.initial_size(&root, &new, window));
-        let argv = argv.filter(|a| !a.is_empty()).map(|a| Self::split_argv(a, on.as_deref()));
+        let argv = argv
+            .filter(|a| !a.is_empty())
+            .map(|a| Self::split_argv(a, on.as_deref()))
+            .or_else(|| Self::resolve_local_shell_argv(shell.as_deref(), on.as_deref()));
         let (addr, _) = self.spawn(argv, false, cwd, follow, &space, &ctx, on.as_deref(), size, window)?;
         self.model.split(&target, axis, &new, &addr);
         Ok(json!({ "pane": new, "terminal": addr }))
@@ -4032,7 +4321,7 @@ impl AppWindow {
                 && self.model.tab_of(&pane).is_some_and(|t| t.root.panes().len() == 1)
             {
                 let space_id = sp.id.clone();
-                let _ = self.new_tab(Some(space_id), "", None, None, None, true, window);
+                let _ = self.new_tab(Some(space_id), "", None, None, None, None, true, window);
             }
             self.model.remove_pane(&pane);
         }
@@ -4298,7 +4587,7 @@ impl AppWindow {
             .filter(|a| !a.is_empty());
         let run_argv = preset_argv.or(raw_argv);
         let created = if let Some(sp) = target_space {
-            self.new_tab(Some(sp), &tab_name, cwd, run_argv, None, true, window)?
+            self.new_tab(Some(sp), &tab_name, cwd, run_argv, None, None, true, window)?
         } else {
             let sname = entry.get("space_name").and_then(Value::as_str).unwrap_or("");
             self.new_space(
@@ -4308,6 +4597,7 @@ impl AppWindow {
                 run_argv,
                 None,
                 machine,
+                None,
                 true,
                 window,
             )?
@@ -4580,12 +4870,17 @@ impl AppWindow {
                     .or_else(|| self.peeked_agent.clone())
                     .or_else(|| self.model.focused_pane().and_then(|p| self.model.any_address_of(&p)))
                     .or_else(|| self.shown_agent());
-                let rec = terminal.as_deref().and_then(|t| self.live.get(t));
+                let rec = terminal.as_deref().and_then(|t| self.live.get(t).or_else(|| self.ended_acp.get(t)));
+                let mut is_split_or_shell = false;
                 let tab_name = terminal.as_deref().and_then(|t| {
                     let pane = self.model.any_pane_of(t)?;
                     let tab_id = self.model.tab_of(&pane)?.id.clone();
                     let tab = self.model.tab(&tab_id)?;
-                    (tab.root.panes().len() == 1 && !tab.name.is_empty()).then(|| tab.name.clone())
+                    let pane_count = tab.root.panes().len();
+                    if pane_count > 1 || (!is_acp_addr(t) && !self.is_agent_pty(t)) {
+                        is_split_or_shell = true;
+                    }
+                    (pane_count == 1 && !tab.name.is_empty()).then(|| tab.name.clone())
                 });
                 let current = rec
                     .and_then(|r| r.pointer("/labels/herdr.name").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned))
@@ -4593,7 +4888,13 @@ impl AppWindow {
                     .or_else(|| rec.and_then(|r| r.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned)));
                 args["terminal"] = json!(terminal);
                 (
-                    if zh { "重命名智能体" } else { "rename agent" },
+                    if is_split_or_shell {
+                        if zh { "重命名分栏" } else { "rename pane" }
+                    } else if zh {
+                        "重命名智能体"
+                    } else {
+                        "rename agent"
+                    },
                     if zh { "留空则恢复默认名称" } else { "empty: automatic name" },
                     current,
                 )
@@ -4626,7 +4927,7 @@ impl AppWindow {
             "space.new" => {
                 let Some(focus) = Self::focus(a) else { return self.fail("space.new focus is true or false") };
                 let name = Self::arg(a, "name").unwrap_or_default();
-                let r = self.new_space(name, Self::owned(a, "folder"), Self::arg(a, "tab"), Self::argv(a), Self::arg(a, "task"), Self::owned(a, "machine").filter(|m| !m.is_empty()), focus, window);
+                let r = self.new_space(name, Self::owned(a, "folder"), Self::arg(a, "tab"), Self::argv(a), Self::arg(a, "task"), Self::owned(a, "machine").filter(|m| !m.is_empty()), Self::owned(a, "shell"), focus, window);
                 self.answer(r);
             }
             "space.close" => {
@@ -4690,13 +4991,19 @@ impl AppWindow {
             "tab.new" => {
                 let Some(focus) = Self::focus(a) else { return self.fail("tab.new focus is true or false") };
                 let name = Self::arg(a, "name").unwrap_or_default();
+                let acp = a.get("acp").and_then(Value::as_bool) == Some(true);
+                let shell = Self::owned(a, "shell");
                 let r = match Self::owned(a, "mod") {
                     Some(m) => self.new_mod_tab(Self::owned(a, "space"), name, m, a.get("props").cloned().unwrap_or(Value::Null), focus),
+                    None if acp => {
+                        let Some(agent) = Self::owned(a, "agent") else { return self.fail("tab.new acp needs agent") };
+                        self.new_acp_tab(Self::owned(a, "space"), name, Self::owned(a, "folder"), &agent, focus, window, cx)
+                    }
                     // A person's new tab with no space open starts one, as space.new does.
                     None if person && a.get("space").is_none() && self.model.active_space().is_none() => {
-                        self.new_space("", Self::owned(a, "folder"), Some(name), Self::argv(a), Self::arg(a, "task"), None, focus, window)
+                        self.new_space("", Self::owned(a, "folder"), Some(name), Self::argv(a), Self::arg(a, "task"), None, shell, focus, window)
                     }
-                    None => self.new_tab(Self::owned(a, "space"), name, Self::owned(a, "folder"), Self::argv(a), Self::arg(a, "task"), focus, window),
+                    None => self.new_tab(Self::owned(a, "space"), name, Self::owned(a, "folder"), Self::argv(a), Self::arg(a, "task"), shell, focus, window),
                 };
                 self.answer(r);
             }
@@ -4714,7 +5021,7 @@ impl AppWindow {
                         return self.dispatch("space.close", &args, person, window, cx);
                     }
                     let space_id = p.id.clone();
-                    let _ = self.new_tab(Some(space_id), "", None, None, None, true, window);
+                    let _ = self.new_tab(Some(space_id), "", None, None, None, None, true, window);
                     let agent_snapshots: Vec<(String, Value)> = if person {
                         pty_addrs
                             .iter()
@@ -4803,10 +5110,17 @@ impl AppWindow {
                     _ => return self.fail("direction must be \"right\", \"left\", \"down\" or \"up\""),
                 };
                 let machine = self.model.space_of(&target).and_then(|s| s.machine.clone());
+                self.preserve_single_pane_tab_name(&source, cx);
+                let dst_was_single = self.preserve_single_pane_tab_name(&target, cx);
                 let moved_addrs = match self.model.merge_tabs(&source, &target, edge) {
                     Ok(v) => v,
                     Err(e) => return self.fail(e),
                 };
+                if dst_was_single && self.require_document(machine.as_deref()).is_ok()
+                    && let Some(c) = self.model.tab_mut(&target)
+                {
+                    c.name.clear();
+                }
                 let tab_label = crate::mirror::local(&target, machine.as_deref()).to_owned();
                 for addr in moved_addrs {
                     if let Some(labels) = self.live.get_mut(&addr).and_then(|r| r.get_mut("labels")).and_then(Value::as_object_mut) {
@@ -4854,7 +5168,7 @@ impl AppWindow {
                 };
                 let r = match Self::owned(a, "mod") {
                     Some(name) => self.split_mod(Self::owned(a, "pane"), axis, name, a.get("props").cloned().unwrap_or(Value::Null)),
-                    None => self.split(Self::owned(a, "pane"), axis, Self::argv(a), None, window),
+                    None => self.split(Self::owned(a, "pane"), axis, Self::argv(a), None, Self::owned(a, "shell"), window),
                 };
                 self.answer(r);
             }
@@ -4993,14 +5307,22 @@ impl AppWindow {
             // ---- terminals
             "terminal.open" => {
                 let argv = Self::argv(a);
+                let shell = Self::owned(a, "shell");
                 let r = match Self::arg(a, "place").unwrap_or("tab") {
-                    "right" => self.split(None, Axis::Row, argv, Self::owned(a, "folder"), window),
-                    "down" => self.split(None, Axis::Column, argv, Self::owned(a, "folder"), window),
+                    "right" => self.split(None, Axis::Row, argv, Self::owned(a, "folder"), shell, window),
+                    "down" => self.split(None, Axis::Column, argv, Self::owned(a, "folder"), shell, window),
                     _ => {
                         let name = Self::owned(a, "name")
                             .or_else(|| argv.as_ref().and_then(|v| v.first()).map(|p| p.rsplit('/').next().unwrap_or(p).to_owned()))
+                            .or_else(|| shell.as_deref().filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto")).map(|s| match s.to_ascii_lowercase().as_str() {
+                                "powershell" => "PowerShell".to_owned(),
+                                "pwsh" => "PowerShell 7".to_owned(),
+                                "git-bash" => "Git Bash".to_owned(),
+                                "cmd" => "CMD".to_owned(),
+                                _ => s.to_owned(),
+                            }))
                             .unwrap_or_else(|| "shell".into());
-                        self.new_tab(None, &name, Self::owned(a, "folder"), argv, None, true, window)
+                        self.new_tab(None, &name, Self::owned(a, "folder"), argv, None, shell, true, window)
                     }
                 };
                 self.answer(r);
@@ -5203,10 +5525,26 @@ impl AppWindow {
                 if matches!(self.rename_focus, RenameFocus::Agent(_)) {
                     self.rename_focus = RenameFocus::Agent(Some(t.clone()));
                 }
-                if is_acp_addr(&t) {
+                let is_acp = is_acp_addr(&t)
+                    || self.live.get(&t).and_then(|r| r.get("acp")).and_then(Value::as_bool) == Some(true);
+                if is_acp {
                     self.close_overlay("terminal-peek", window, cx);
                     if !self.focus_mounted_acp(&t, window, cx) {
-                        let _ = self.keep_terminal(&t, "tab", window, cx);
+                        if self.live.get(&t).is_some_and(is_acp_subagent) {
+                            let root = self.root_agent(&t);
+                            if root != t {
+                                let root_acp = is_acp_addr(&root)
+                                    || self.live.get(&root).and_then(|r| r.get("acp")).and_then(Value::as_bool) == Some(true);
+                                if root_acp {
+                                    let _ = self.focus_mounted_acp(&root, window, cx);
+                                } else {
+                                    self.focus_agent(&root);
+                                }
+                            }
+                            self.peek_terminal(&t, window, cx);
+                        } else {
+                            let _ = self.keep_terminal(&t, "tab", window, cx);
+                        }
                     }
                     return;
                 }
@@ -5219,20 +5557,24 @@ impl AppWindow {
                     .or_else(|| self.model.focused_pane().and_then(|p| self.model.any_address_of(&p)))
                     .or_else(|| self.shown_agent())
                     .unwrap_or_default();
-                if !self.live.contains_key(&t) {
+                let in_live = self.live.contains_key(&t);
+                let in_ended = self.ended_acp.contains_key(&t);
+                if !in_live && !in_ended {
                     return self.fail(format!("no running terminal {t:?}"));
                 }
                 let Some(raw) = Self::arg(a, "name") else {
                     return self.fail("agent.rename needs name (empty: automatic)");
                 };
                 let trimmed = raw.trim().to_owned();
-                if let Some(obj) = self.live.get_mut(&t).and_then(Value::as_object_mut)
-                    && let Some(labels) = obj.entry("labels").or_insert_with(|| json!({})).as_object_mut()
-                {
-                    if trimmed.is_empty() {
-                        labels.remove("herdr.name");
-                    } else {
-                        labels.insert("herdr.name".into(), json!(trimmed));
+                for map in [&mut self.live, &mut self.ended_acp] {
+                    if let Some(obj) = map.get_mut(&t).and_then(Value::as_object_mut)
+                        && let Some(labels) = obj.entry("labels").or_insert_with(|| json!({})).as_object_mut()
+                    {
+                        if trimmed.is_empty() {
+                            labels.remove("herdr.name");
+                        } else {
+                            labels.insert("herdr.name".into(), json!(trimmed));
+                        }
                     }
                 }
                 if let Some(pane) = self.model.any_pane_of(&t)
@@ -5311,6 +5653,13 @@ impl AppWindow {
                     let word = self.live.get(&t).and_then(|r| r.get("status")).and_then(Value::as_str).map(str::to_owned);
                     let looking = self.visible_addresses().iter().any(|v| v == &t) && self.window_active;
                     self.model.set_word(&t, word, app, looking);
+                }
+                if let Some(a) = self.model.agents.get(&t)
+                    && let Some(obj) = self.live.get_mut(&t).and_then(Value::as_object_mut)
+                {
+                    obj.insert("working_since".into(), a.working_since.map_or(Value::Null, |v| json!(v)));
+                    obj.insert("work_ms".into(), a.work_ms.map_or(Value::Null, |v| json!(v)));
+                    obj.insert("total_work_ms".into(), json!(a.total_work_ms));
                 }
                 mods::publish_terminals(self.ordered_live_values());
                 self.sync(window, cx);
@@ -5466,10 +5815,6 @@ impl AppWindow {
                 self.open_welcome(window, cx);
                 return;
             }
-            "app.whats_new" => {
-                self.open_whats_new(true, window, cx);
-                return;
-            }
             "app.palette" => {
                 // Once: a second press closes the palette instead of stacking another.
                 if self.overlays.iter().any(|o| o.id == "palette") {
@@ -5481,15 +5826,7 @@ impl AppWindow {
                 return;
             }
             "app.feedback" => {
-                let from = Self::owned(a, "from").unwrap_or_else(|| "person".into());
-                if !matches!(from.as_str(), "person" | "agent") {
-                    return self.fail("from must be person or agent");
-                }
-                // A window, not a dialog: the app stays usable behind it (copy an error, paste it in).
-                let spec = json!({ "mod": "frame-feedback", "kind": "window", "key": "feedback", "width": 680,
-                    "props": { "message": Self::owned(a, "message").unwrap_or_default(), "from": from, "layout": self.layout_name } });
-                self.open_overlay(mods::new_overlay_id(), spec, window, cx);
-                return;
+                return self.fail("feedback is disabled in Herdr2");
             }
             "app.settings" => {
                 // Once: a second press doesn't stack another; asking for a section opens it there.
@@ -5499,17 +5836,10 @@ impl AppWindow {
                     self.close_overlay("settings", window, cx);
                 }
                 if !open || section.is_some() {
-                    let spec = json!({ "mod": "frame-settings", "kind": "dialog", "width": 880, "props": { "section": section } });
+                    let spec = json!({ "mod": "frame-settings", "kind": "dialog", "width": 920, "props": { "section": section } });
                     self.open_overlay("settings".into(), spec, window, cx);
                 }
                 return;
-            }
-            "app.check_updates" => crate::update::check_now(),
-            "app.update_core" => {
-                if crate::update::core().ready.is_none() && crate::update::core().error.is_none() {
-                    return self.fail("herdr2-core is up to date");
-                }
-                crate::update::update_core();
             }
             "app.help" => {
                 if self.overlays.iter().any(|o| o.id == "help") {
@@ -5553,19 +5883,6 @@ impl AppWindow {
                 self.write_person(|p| p.zoom = zoom, window, cx);
             }
             "app.quit" => cx.quit(),
-            "app.update" => {
-                match crate::update::apply() {
-                    Ok(true) => {}
-                    Ok(false) => return self.fail("no update is ready yet"),
-                    Err(error) => {
-                        let reason = format!("Couldn't replace Herdr2's files: {error}.");
-                        return self.fail(if cfg!(windows) { format!("Close Herdr2's terminals (or restart Windows) and try again. {reason}") } else { reason });
-                    }
-                }
-                self.drain_documents(window, cx);
-                crate::update::relaunch();
-                cx.quit();
-            }
             "window.close" | "window.minimize" | "window.maximize" => return self.window_command(name, window, cx),
             // Hiding apps is macOS's (bound natively there).
             "app.hide" | "app.hide_others" | "app.show_all" => return,
@@ -5798,11 +6115,22 @@ impl AppWindow {
 
     fn peek_terminal(&mut self, address: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.close_overlay("terminal-peek", window, cx);
-        if is_acp_addr(address) {
+        let is_acp = is_acp_addr(address)
+            || self.live.get(address).and_then(|r| r.get("acp")).and_then(Value::as_bool) == Some(true);
+        if is_acp {
             if self.focus_mounted_acp(address, window, cx) {
                 return;
             }
-            let _ = self.keep_terminal(address, "tab", window, cx);
+            self.peeked_agent = Some(address.to_owned());
+            self.open_overlay("terminal-peek".into(), json!({
+                "kind": "dialog",
+                "frame": "none",
+                "width": 0.8,
+                "height": 0.85,
+                "mod": "peek",
+                "props": { "terminal": address, "acp": true }
+            }), window, cx);
+            self.publish(cx);
             return;
         }
         self.open_overlay("terminal-peek".into(), json!({
@@ -6691,21 +7019,6 @@ impl AppWindow {
                 }
             }
         }
-        let core = crate::update::core();
-        if let Some(error) = core.error.filter(|error| core.managed.is_none() && self.core_update_error_dismissed.as_ref() != Some(error)) {
-            out.push(div().absolute().right(settings::z(16.0)).bottom(settings::z(toast_y))
-                .max_w(settings::z(540.0)).p(settings::z(12.0)).rounded_lg().bg(c("popover"))
-                .border_1().border_color(c("border")).text_size(settings::z(13.0)).text_color(c("foreground"))
-                .occlude().flex().items_center().gap(settings::z(8.0))
-                .child(div().id("core-update-error").flex_1().min_w_0().cursor_pointer()
-                    .on_click(cx.listener(|this, _, w, cx| this.run("app.settings", json!({ "section": "updates" }), w, cx)))
-                    .child(format!("herdr2-core update failed: {error} · Open Updates")))
-                .child(div().id("core-update-error-dismiss").size(settings::z(24.0)).flex_none()
-                    .flex().items_center().justify_center().rounded_full().cursor_pointer()
-                    .text_color(c("dim")).hover(|s| s.bg(c("raised")).text_color(c("foreground"))).child("×")
-                    .on_click(cx.listener(|this, _, w, cx| this.close_overlay("core-update-error", w, cx))))
-                .into_any_element());
-        }
         out.extend(pill);
         out
     }
@@ -6714,84 +7027,13 @@ impl AppWindow {
 const UPDATE_PILL_HEIGHT: f32 = 34.0;
 
 impl AppWindow {
-    /// "Herdr 0.2.0 is ready · Restart": the frame's, so no layout or mod can hide it.
-    /// What's waiting, in words: the pill shows it until clicked or dismissed.
+    /// Original Herdr update banner and pill are disabled.
     fn update_label() -> Option<String> {
-        let core = crate::update::core();
-        let core = core.ready.filter(|_| !core.updating && core.managed.is_none());
-        match (crate::update::ready(), core) {
-            (Some(a), Some(c)) => Some(format!("Herdr2 {a} and herdr2-core {c} are ready")),
-            (Some(a), None) => Some(format!("Herdr2 {a} is ready")),
-            (None, Some(c)) => Some(format!("herdr2-core {c} is ready")),
-            (None, None) => None,
-        }
+        None
     }
 
-    fn render_update_pill(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let app_version = crate::update::ready();
-        let app_ready = app_version.is_some();
-        let success = self.update_ready.is_none() && self.update_success;
-        let label = self.update_ready.clone().or_else(|| success.then(|| format!("Updated to {}", env!("CARGO_PKG_VERSION"))))?;
-        let dismissal = app_version.map(|v| format!("app:{v}")).unwrap_or_else(|| label.clone());
-        if self.update_dismissed.as_ref() == Some(&dismissal) { return None; }
-        let pill = div()
-            .absolute()
-            .right(settings::z(16.0))
-            .bottom(settings::z(16.0))
-            .h(settings::z(UPDATE_PILL_HEIGHT))
-            .pl(settings::z(14.0))
-            .pr(settings::z(6.0))
-            .flex()
-            .items_center()
-            .gap(settings::z(10.0))
-            .bg(c("popover"))
-            .border_1()
-            .border_color(c("border"))
-            .rounded_full()
-            .shadow_lg()
-            .occlude()
-            .text_size(settings::z(13.0))
-            .child(div().text_color(c("foreground")).child(label.clone()))
-            .when(app_ready, |pill| pill.child(
-                div()
-                    .id("update-restart")
-                    .h(settings::z(24.0))
-                    .px(settings::z(10.0))
-                    .flex()
-                    .items_center()
-                    .rounded_full()
-                    .cursor_pointer()
-                    .bg(c("accent"))
-                    .text_color(c("accent_foreground"))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .hover(|s| s.opacity(0.9))
-                    .child("Restart")
-                    .on_click(cx.listener(|this, _, w, cx| this.run("app.update", json!({}), w, cx))),
-            ))
-            .child(div().id("update-notes").px(settings::z(6.0)).cursor_pointer().text_color(c("accent"))
-                .child(if app_ready || success { "What changed" } else { "Open Updates" })
-                .on_click(cx.listener(move |this, _, w, cx| {
-                    if success { this.update_success = false; }
-                    this.run("app.settings", json!({ "section": "updates" }), w, cx);
-                })))
-            .child(
-                div()
-                    .id("update-dismiss")
-                    .size(settings::z(24.0))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_full()
-                    .cursor_pointer()
-                    .text_color(c("dim"))
-                    .hover(|s| s.bg(c("raised")).text_color(c("foreground")))
-                    .child("×")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.update_dismissed = Some(dismissal.clone());
-                        cx.notify();
-                    })),
-            );
-        Some(pill.into_any_element())
+    fn render_update_pill(&self, _cx: &mut Context<Self>) -> Option<AnyElement> {
+        None
     }
 }
 
@@ -7142,6 +7384,37 @@ fn is_trashed_record(rec: &Value) -> bool {
     rec.pointer("/labels/herdr.trashed")
         .and_then(Value::as_str)
         .is_some_and(|s| !s.is_empty())
+}
+
+/// Returns `true` for sub-agents spawned by a parent session or Drove worker pool.
+fn is_acp_subagent(rec: &Value) -> bool {
+    rec.get("parent")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.trim().is_empty())
+        || rec
+            .pointer("/labels/drove.worker")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+        || rec
+            .pointer("/labels/drove.run")
+            .and_then(Value::as_str)
+            .is_some_and(|s| !s.trim().is_empty())
+}
+
+/// Returns whether `reconcile` should auto-mount an unmounted live ACP agent into its own tab.
+/// Sub-agents stay in the background under their main agent unless explicitly labeled with `herdr.space`.
+fn should_auto_mount_acp(rec: &Value) -> bool {
+    if rec["state"] != "live" || is_trashed_record(rec) {
+        return false;
+    }
+    if rec.pointer("/labels/herdr.parked").and_then(Value::as_str) == Some("1") {
+        return false;
+    }
+    let has_explicit_space = rec
+        .pointer("/labels/herdr.space")
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty());
+    !is_acp_subagent(rec) || has_explicit_space
 }
 
 fn has_live_child(addr: &str, live: &HashMap<String, Value>, closing: &HashMap<String, bool>) -> bool {
@@ -9199,6 +9472,45 @@ export default class Probe extends View {
             this.model.focus_pane("pb");
             this.sync(window, cx);
 
+            // Sub-agents spawned by a main agent (or Drove workers) do not auto-create tabs on reconcile.
+            this.live.insert("a3".into(), json!({
+                "address": "a3",
+                "acp": true,
+                "parent": "term-a",
+                "state": "live",
+                "labels": {}
+            }));
+            this.live.insert("a5".into(), json!({
+                "address": "a5",
+                "acp": true,
+                "state": "live",
+                "labels": { "drove.worker": "wrk_1" }
+            }));
+            this.reconcile(window, cx);
+            assert!(this.model.acp_pane_of("a3").is_none());
+            assert!(this.model.acp_pane_of("a5").is_none());
+
+            // Clicking or focusing an unmounted ACP sub-agent opens ACP Peek instead of creating a tab.
+            let out = this.run_as("terminal.peek", json!({ "terminal": "a3" }), false, window, cx);
+            assert!(out.get("error").is_none(), "{out}");
+            assert!(this.model.acp_pane_of("a3").is_none());
+            assert!(!this.changing_terminals.contains("a3"));
+            assert_eq!(this.peeked_agent.as_deref(), Some("a3"));
+            assert!(this.overlays.iter().any(|o| o.id == "terminal-peek"));
+            this.close_overlay("terminal-peek", window, cx);
+            assert!(this.peeked_agent.is_none());
+
+            let out = this.run_as("agent.focus", json!({ "terminal": "a3" }), false, window, cx);
+            assert!(out.get("error").is_none(), "{out}");
+            assert!(this.model.acp_pane_of("a3").is_none());
+            assert!(!this.changing_terminals.contains("a3"));
+            assert_eq!(this.peeked_agent.as_deref(), Some("a3"));
+            this.close_overlay("terminal-peek", window, cx);
+            this.live.remove("a3");
+            this.live.remove("a5");
+            this.model.select_tab("tb2");
+            this.model.focus_pane("pb");
+
             // Moving already-mounted ACP agent a2 beside focused pane pb splits tb2 horizontally.
             assert!(this.keep_terminal("a2", "right", window, cx).is_ok());
             assert_eq!(this.model.tab_of("acp-p2").map(|t| t.id.as_str()), Some("tb2"));
@@ -9621,6 +9933,83 @@ export default class SystemToast extends View {
         assert!(!super::path_matches_root("/home/u/Work/herdr2", "/home/u", true));
         assert!(super::path_matches_root("/home/u", "/home/u", false));
         assert!(!super::path_matches_root("/home/u/Work/herdr2", "/home/u/Work/herdr2/sub", true));
+    }
+
+    #[test]
+    fn acp_subagents_do_not_auto_mount_tabs_by_default() {
+        use serde_json::json;
+        let root_acp = json!({ "address": "a1", "state": "live", "parent": null, "labels": {} });
+        assert!(!super::is_acp_subagent(&root_acp));
+        assert!(super::should_auto_mount_acp(&root_acp));
+
+        let cli_subagent = json!({ "address": "a2", "state": "live", "parent": "t1", "labels": {} });
+        assert!(super::is_acp_subagent(&cli_subagent));
+        assert!(!super::should_auto_mount_acp(&cli_subagent));
+
+        let remote_subagent = json!({ "address": "wsl/a2", "state": "live", "parent": "wsl/t13", "labels": {} });
+        assert!(super::is_acp_subagent(&remote_subagent));
+        assert!(!super::should_auto_mount_acp(&remote_subagent));
+
+        let acp_subagent = json!({ "address": "a3", "state": "live", "parent": "a1", "labels": {} });
+        assert!(super::is_acp_subagent(&acp_subagent));
+        assert!(!super::should_auto_mount_acp(&acp_subagent));
+
+        let drove_worker = json!({ "address": "a4", "state": "live", "parent": null, "labels": { "drove.worker": "wrk_1" } });
+        assert!(super::is_acp_subagent(&drove_worker));
+        assert!(!super::should_auto_mount_acp(&drove_worker));
+
+        let explicit_mounted = json!({ "address": "a2", "state": "live", "parent": "t1", "labels": { "herdr.space": "sp1", "herdr.parked": "" } });
+        assert!(super::should_auto_mount_acp(&explicit_mounted));
+
+        let parked_subagent = json!({ "address": "a2", "state": "live", "parent": "t1", "labels": { "herdr.space": "", "herdr.parked": "1" } });
+        assert!(!super::should_auto_mount_acp(&parked_subagent));
+    }
+
+    #[test]
+    fn resolve_windows_shell_argv_with_picks_configured_shells() {
+        let dir = std::env::temp_dir().join(format!("herdr-win-shell-test-{}", std::process::id()));
+        let pwsh_dir = dir.join("pwsh-bin");
+        let sys32_dir = dir.join("System32");
+        let git_bin_dir = dir.join("ProgramFiles").join("Git").join("bin");
+        let _ = std::fs::create_dir_all(&pwsh_dir);
+        let _ = std::fs::create_dir_all(&sys32_dir);
+        let _ = std::fs::create_dir_all(&git_bin_dir);
+        std::fs::write(pwsh_dir.join("pwsh.exe"), b"").unwrap();
+        std::fs::write(sys32_dir.join("bash.exe"), b"").unwrap();
+        let git_bash = git_bin_dir.join("bash.exe");
+        std::fs::write(&git_bash, b"").unwrap();
+
+        let path_joined = std::env::join_paths([&sys32_dir, &pwsh_dir]).unwrap();
+        let pf = dir.join("ProgramFiles");
+        let pf_str = pf.to_str().unwrap();
+
+        assert_eq!(
+            super::resolve_windows_shell_argv_with("auto", Some(&path_joined), Some(pf_str), None, None, Some("C:\\Windows\\System32\\cmd.exe")),
+            None,
+        );
+        let ps = super::resolve_windows_shell_argv_with("powershell", Some(&path_joined), Some(pf_str), None, None, None).unwrap();
+        assert_eq!(ps[0], "powershell.exe");
+        assert_eq!(ps[1], "-NoExit");
+        assert_eq!(ps[2], "-Command");
+
+        let pwsh = super::resolve_windows_shell_argv_with("pwsh", Some(&path_joined), Some(pf_str), None, None, None).unwrap();
+        assert_eq!(pwsh[0], pwsh_dir.join("pwsh.exe").to_string_lossy());
+        assert_eq!(pwsh[1], "-NoExit");
+
+        let gb = super::resolve_windows_shell_argv_with("git-bash", Some(&path_joined), Some(pf_str), None, None, None).unwrap();
+        assert_eq!(gb, vec![git_bash.to_string_lossy().into_owned(), "--login".into(), "-i".into()]);
+
+        let gb_path = super::resolve_windows_shell_argv_with("git-bash", Some(&path_joined), None, None, None, None).unwrap();
+        // Should skip System32\bash.exe shim when ProgramFiles has nothing.
+        assert_eq!(gb_path, vec!["bash.exe".to_owned(), "--login".into(), "-i".into()]);
+
+        let cmd = super::resolve_windows_shell_argv_with("cmd", None, None, None, None, Some("C:\\Windows\\System32\\cmd.exe")).unwrap();
+        assert_eq!(cmd, vec!["C:\\Windows\\System32\\cmd.exe".to_owned()]);
+
+        let wsl = super::resolve_windows_shell_argv_with("wsl", None, None, None, None, None);
+        assert_eq!(wsl, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
 

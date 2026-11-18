@@ -89,7 +89,7 @@ Roles (`coder`, `tester`, `writer`, `reviewer`, `researcher`, plus custom roles)
    h2 drove send <task_key_or_id> "Check edge case X" [--interrupt]
    h2 drove retry <task_key_or_id> --hint "Fix test assertion" [--role tester] [--fresh]
    ```
-4. Finalize the Run (runs Run-level `verify` + `goal.autoRepair` if enabled):
+4. Finalize the Run (runs Run-level `verify` + `goal.autoRepair` if enabled; healthy workers stay warm `idle` until the Coordinator closes or the Run is deleted in Drove Web):
    ```bash
    h2 drove complete --summary "Implemented and verified storage refactor"
    ```

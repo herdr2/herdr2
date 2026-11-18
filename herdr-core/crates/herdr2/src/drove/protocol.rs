@@ -56,7 +56,12 @@ pub fn build_task_prompt(
         let mut dep_lines = Vec::new();
         for d in dep_tasks {
             if let Some(res) = &d.result {
-                dep_lines.push(format!("- `{}` ({:?}): {}", d.key, d.status, res.summary));
+                let summary_txt = res
+                    .compact_summary
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or(&res.summary);
+                dep_lines.push(format!("- `{}` ({:?}): {}", d.key, d.status, summary_txt));
                 if let Some(files) = &res.files_modified
                     && !files.is_empty()
                 {
@@ -72,6 +77,15 @@ pub fn build_task_prompt(
         }
     }
 
+    if let Some(schema) = &task.output_schema
+        && !schema.is_null()
+    {
+        let schema_pretty = serde_json::to_string_pretty(schema).unwrap_or_else(|_| schema.to_string());
+        sections.push(format!(
+            "Required outputSchema (`--data` JSON MUST satisfy this schema when calling `drove worker done`):\n{schema_pretty}"
+        ));
+    }
+
     if let Some(ctx) = &task.context
         && !ctx.is_null()
     {
@@ -82,10 +96,15 @@ pub fn build_task_prompt(
         sections.push(format!("Retry / coordinator hint:\n{h}"));
     }
 
+    let data_flag = if task.output_schema.as_ref().is_some_and(|s| !s.is_null()) {
+        "--data '<JSON matching outputSchema>' (REQUIRED)"
+    } else {
+        "[--data '{\"key\": \"val\"}']"
+    };
     let protocol_instr = format!(
         "Completion protocol (REQUIRED):\n\
          When you finish, or if you need coordinator input, use the `h2 drove worker` CLI (or `drove worker`):\n\
-         - Report completion: `h2 drove worker done --outcome done --summary \"...\" [--data '{{\"key\": \"val\"}}']`\n\
+         - Report completion: `h2 drove worker done --outcome done --summary \"...\" {data_flag}`\n\
          - Report failure: `h2 drove worker done --outcome failed --reason \"...\"`\n\
          - Ask coordinator (blocks until reply): `h2 drove worker ask \"Question?\" [--options \"A,B\"]`\n\
          - Send progress note: `h2 drove worker note \"...\"`\n\
@@ -141,4 +160,157 @@ fn extract_when_value<'a>(task: &'a Task, path: Option<&str>) -> Option<&'a Valu
         cur = cur.get(seg)?;
     }
     Some(cur)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn build_task_prompt_renders_output_schema_and_compact_summary() {
+        let run = Run {
+            id: "run_1".into(),
+            objective: "Demo".into(),
+            cwd: "/tmp".into(),
+            coordinator: CoordinatorInfo {
+                host: "herdr2".into(),
+                host_session: "t1".into(),
+                generation: 1,
+                agent: None,
+                model: None,
+                host_pid: None,
+                session_bound: None,
+                notification: None,
+            },
+            max_concurrency: 2,
+            budget: None,
+            status: RunStatus::Active,
+            pause_reason: None,
+            verify: None,
+            goal: None,
+            finalization: None,
+            verified_at: None,
+            name: None,
+            order: None,
+            trashed_at: None,
+            status_before_trash: None,
+            ai_usage: None,
+            machine: None,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+        };
+        let dep = Task {
+            id: "tsk_dep".into(),
+            run_id: "run_1".into(),
+            key: "discover".into(),
+            title: "Discover".into(),
+            phase: None,
+            spec: Spec {
+                target: "SPEC.md".into(),
+                change: "Analyze".into(),
+                constraints: None,
+                ownership: None,
+                acceptance: "Done".into(),
+                verify: None,
+            },
+            tags: Vec::new(),
+            files: Vec::new(),
+            deps: Vec::new(),
+            output_schema: None,
+            isolation: Isolation::None,
+            timeout_sec: None,
+            stall_warn_sec: None,
+            stall_kill_sec: None,
+            when: None,
+            assign: None,
+            status: TaskStatus::Succeeded,
+            result: Some(TaskResult {
+                summary: "Very long raw summary...".into(),
+                compact_summary: Some("Compact handover sentence".into()),
+                data: None,
+                files_modified: None,
+                blockers: None,
+                output_file_hashes: None,
+            }),
+            failures: 0,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            updated_at: "2026-01-01T00:00:00Z".into(),
+            kind: None,
+            exec_phase: None,
+            execution_version: None,
+            trigger_rule: None,
+            context: None,
+            exec: None,
+            foreach_from: None,
+            template: None,
+            expansion_state: None,
+            expanded_from: None,
+            review: None,
+            review_state: None,
+            candidate_result: None,
+            cache: None,
+            cached_from: None,
+        };
+        let mut task = dep.clone();
+        task.id = "tsk_2".into();
+        task.key = "impl".into();
+        task.result = None;
+        task.output_schema = Some(json!({ "type": "object", "required": ["ok"] }));
+        let attempt = Attempt {
+            id: "att_1".into(),
+            task_id: "tsk_2".into(),
+            run_id: "run_1".into(),
+            worker_id: "wrk_1".into(),
+            agent: "codex".into(),
+            model: None,
+            effort: None,
+            fast: None,
+            route_reason: "primary".into(),
+            reused: false,
+            retry_of: None,
+            hint: None,
+            started_at: "2026-01-01T00:00:00Z".into(),
+            ended_at: None,
+            awaiting_late_done: None,
+            tokens: TokenCounts::default(),
+            cost: None,
+            estimated: None,
+            outcome: None,
+            failure: None,
+            result: None,
+            kind: Some("author".into()),
+            review_round: None,
+            verifying: None,
+            verify_rejections: None,
+            stagnant_rejections: None,
+            last_verify_hash: None,
+            last_tree_sha: None,
+            verify_log_artifact_id: None,
+            verify_ai_digest: None,
+            ai_diagnosis: None,
+            spinning_detected_at: None,
+        };
+        let role_cfg = RoleConfig {
+            label: None,
+            summary: None,
+            access: Some(RoleAccessMode::Writable),
+            allowed_paths: Vec::new(),
+            primary: RoleTarget {
+                agent: "codex".into(),
+                model: None,
+                effort: Effort::Medium,
+                fast: false,
+                context: None,
+            },
+            fallbacks: Vec::new(),
+            prompt: None,
+        };
+        let prompt = build_task_prompt(&run, &task, &attempt, "coder", &role_cfg, &[dep], None);
+        assert!(prompt.contains("Compact handover sentence"), "{prompt}");
+        assert!(!prompt.contains("Very long raw summary"), "{prompt}");
+        assert!(prompt.contains("Required outputSchema"), "{prompt}");
+        assert!(prompt.contains("\"ok\""), "{prompt}");
+        assert!(prompt.contains("--data '<JSON matching outputSchema>' (REQUIRED)"), "{prompt}");
+    }
 }

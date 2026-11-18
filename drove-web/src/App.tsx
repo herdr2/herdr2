@@ -689,14 +689,16 @@ export default function App() {
             </svg>
           </button>
           <span className="topbar__mark" aria-hidden="true">
-            <svg viewBox="0 0 24 24" width="22" height="22">
-              <circle cx="5" cy="12" r="2.6" />
-              <circle cx="19" cy="5" r="2.6" />
-              <circle cx="19" cy="19" r="2.6" />
-              <path d="M7.4 11 L16.6 6 M7.4 13 L16.6 18" />
+            <svg viewBox="0 0 24 24" width="21" height="21">
+              <path className="topbar__mark-ray" d="M12 12 L12 4.6 M12 12 L19.4 12 M12 12 L12 19.4 M12 12 L7.3 7.3 M12 12 L7.3 16.7" />
+              <path d="M12 12 L5.2 12 M12 12 L17.5 6.5 M12 12 L17.5 17.5" />
+              <circle cx="12" cy="12" r="2.2" />
+              <circle cx="5.2" cy="12" r="1.65" />
+              <circle cx="17.5" cy="6.5" r="1.65" />
+              <circle cx="17.5" cy="17.5" r="1.65" />
             </svg>
           </span>
-          <div>
+          <div className="topbar__brand-text">
             <div className="topbar__title">{t("app.title")}</div>
             <div className="topbar__subtitle">{t("app.subtitle")}</div>
           </div>
@@ -764,6 +766,7 @@ export default function App() {
       {page === "agents" ? (
         <AgentsView
           profile={profile}
+          run={snap?.run ?? null}
           stats={stats}
           availability={availability}
           magpieEnabled={magpieEnabled}

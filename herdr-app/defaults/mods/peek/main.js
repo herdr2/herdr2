@@ -4,13 +4,15 @@
 
 import { View, div, image, svg } from "gpui-kit";
 import { h_flex, v_flex, Popup, TextareaState, Textarea, InputState, Input, TextView, ScrollHandle } from "gpui-base";
-import { agents, terminals, panes, run, theme, settings, home, props, closeOverlay, openOverlay, checking, h2 } from "herdr";
-import { buildConversationItems, summarizeActivityGroup, toolIconPath, formatTime, shortenPath, normalizeConfigOptions, filterConfigChoices } from "./acp_model.js";
+import { agents, terminals, panes, spaces, run, theme, settings, home, props, closeOverlay, openOverlay, checking, h2 } from "herdr";
+import { buildConversationItems, buildPtySessionBadges, summarizeActivityGroup, toolIconPath, formatTime, shortenPath, normalizeConfigOptions, filterConfigChoices, parseToolDetail, resolveEffortVisual } from "./acp_model.js";
 
+const LANE_MAX_W = 736; // 46rem editorial content column (--chat-content-max-width)
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
 const statusWords = () => ({
+  starting: tr("Starting…", "启动中…"),
   working: tr("Working", "运行中"),
   blocked: tr("Needs approval", "待审批"),
   done: tr("Finished", "已完成"),
@@ -22,12 +24,26 @@ const ICONS = {
   bot: "frame/welcome/bot.svg",
   arrowRight: "frame/welcome/arrow-right.svg",
   arrowUp: "mods/peek/arrow-up.svg",
-  sparkles: "mods/peek/sparkles.svg",
+  brain: "mods/peek/brain.svg",
+  circleAlert: "mods/peek/circle-alert.svg",
+  copy: "mods/peek/copy.svg",
+  cornerUpRight: "mods/peek/corner-up-right.svg",
+  fileDiff: "mods/peek/file-diff.svg",
+  globe: "mods/peek/globe.svg",
   lightbulb: "mods/peek/lightbulb.svg",
+  listPlus: "mods/peek/list-plus.svg",
+  listTodo: "mods/peek/list-todo.svg",
+  messagesSquare: "mods/peek/messages-square.svg",
+  sparkles: "mods/peek/sparkles.svg",
+  wrapText: "mods/peek/wrap-text.svg",
+  wrench: "mods/peek/wrench.svg",
   zap: "mods/peek/zap.svg",
   refresh: "frame/settings/refresh.svg",
   shield: "frame/settings/shield.svg",
+  folder: "mods/workspace-chrome/folder.svg",
+  gitBranch: "mods/workspace-chrome/git-branch.svg",
   search: "mods/workspace-chrome/search.svg",
+  server: "mods/workspace-chrome/server.svg",
   check: "mods/workspace-chrome/check.svg",
   circleCheck: "mods/workspace-chrome/circle-check.svg",
   chevronDown: "mods/workspace-chrome/chevron-down.svg",
@@ -47,11 +63,23 @@ function icon(p, size, color) {
 }
 
 function withAlpha(color, alphaHex) {
-  return typeof color === "string" && /^#[0-9a-fA-F]{6}$/.test(color) ? `${color}${alphaHex}` : color;
+  if (typeof color !== "string") return color;
+  if (/^#[0-9a-fA-F]{6}$/.test(color)) return `${color}${alphaHex}`;
+  if (/^#[0-9a-fA-F]{8}$/.test(color)) return `${color.slice(0, 7)}${alphaHex}`;
+  return color;
 }
 
 function stopMouse(_e, cx) {
   cx.stop_propagation();
+}
+
+function stopScroll(_e, cx) {
+  cx.stop_propagation();
+}
+
+function preserveIndentForWrap(line) {
+  if (!line) return " ";
+  return String(line).replace(/\t/g, "  ").replace(/^( +)/, (m) => "\u00a0".repeat(m.length));
 }
 
 function fenceFor(code) {
@@ -72,6 +100,7 @@ export default class Peek extends View {
     this.entries = [];
     this.fallbackText = "";
     this.readHow = null;
+    this.sessionMeta = null;
     this.loadedOnce = false;
     this.error = null;
     this.busyAction = false;
@@ -80,6 +109,9 @@ export default class Peek extends View {
     this.reloadQueued = false;
     this.expandedGroups = {};
     this.expandedSteps = {};
+    this.wrappedCodes = {};
+    this.hoveredRows = {};
+    this.workingStartedAt = null;
     this.copiedId = null;
     this.autoFollow = true;
     this.revealedSig = "";
@@ -118,7 +150,7 @@ export default class Peek extends View {
     });
     this.input = TextareaState.new({
       value: "",
-      placeholder: tr("Ask anything, or send instructions…", "输入问题或发送指令…"),
+      placeholder: tr("Ask anything…", "输入任何问题…"),
     });
     this.input.set_auto_grow(2, 8);
     this.input.on("focus", (_e, cx) => {
@@ -148,6 +180,9 @@ export default class Peek extends View {
     if (!checking()) this.handle.focus();
     if (!checking()) {
       this.reloadTranscript();
+      cx.timer.every(1000, (tcx) => {
+        if (this.status() === "working") tcx?.notify?.();
+      });
       if (props()?.pty) {
         cx.timer.every(1200, () => {
           if (this.term()?.state === "live") this.reloadTranscript();
@@ -210,6 +245,7 @@ export default class Peek extends View {
         this.entries = Array.isArray(parsed.entries) ? parsed.entries : [];
         this.fallbackText = parsed.text || "";
         this.readHow = parsed.how || null;
+        this.sessionMeta = parsed.session_meta ?? null;
         this.loadedOnce = true;
         this.error = null;
       }
@@ -483,23 +519,24 @@ export default class Peek extends View {
       .child(content);
   }
 
-  copyPill(t, key, text, label = tr("Copy", "复制")) {
+  copyPill(t, key, text, label = tr("Copy", "复制"), iconOnly = false) {
     const copied = this.copiedId === key;
     return h_flex()
       .id(`copy-${key}`)
       .h(22)
-      .px(8)
-      .gap(5)
+      .px(iconOnly ? 5 : 7)
+      .gap(4)
       .items_center()
       .rounded(6)
       .cursor_pointer()
       .text_size(11)
       .text_color(copied ? (t.done ?? t.foreground) : t.dim)
       .hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .when(iconOnly && Boolean(label), (el) => el.tooltip(copied ? tr("Copied", "已复制") : label))
       .on_mouse_down("left", stopMouse)
       .on_click((_e, cx) => this.copyText(key, text, cx))
-      .when(copied, (el) => el.child(svg(ICONS.check).size(11).text_color(t.done ?? t.foreground)))
-      .child(copied ? tr("Copied", "已复制") : label);
+      .child(svg(copied ? ICONS.check : ICONS.copy).size(11).text_color(copied ? (t.done ?? t.foreground) : t.dim))
+      .when(!iconOnly, (el) => el.child(copied ? tr("Copied", "已复制") : label));
   }
 
   avatarTile(t, program, pic, size = 30, glyph = 16) {
@@ -519,7 +556,8 @@ export default class Peek extends View {
   }
 
   statusPill(t, st) {
-    const color = t[st] ?? t.dim;
+    const spinning = st === "working" || st === "starting";
+    const color = t[st] ?? (st === "starting" ? (t.working ?? t.accent) : t.dim);
     const label = statusWords()[st] ?? st ?? tr("Offline", "离线");
     return h_flex()
       .h(24)
@@ -534,26 +572,82 @@ export default class Peek extends View {
       .text_size(11.5)
       .font_medium()
       .text_color(color)
-      .when(st === "working", (el) => el.child(svg(ICONS.spinner).size(11).text_color(color).spin(900)))
-      .when(st !== "working", (el) => el.child(div().size(6).rounded(999).bg(color)))
+      .when(spinning, (el) => el.child(svg(ICONS.spinner).size(11).text_color(color).spin(900)))
+      .when(!spinning, (el) => el.child(div().size(6).rounded(999).bg(color)))
       .child(label);
   }
 
-  speakerRow(t, item, program, agentName, copyKey = null, copyContent = null) {
-    const time = formatTime(item.ts_ms);
+  mdOptions(t, cwd) {
+    const isDark = settings()?.dark ?? true;
+    const opts = {
+      dark: Boolean(isDark),
+      foreground: t.foreground,
+      muted: t.muted,
+      link: t.accent ?? t.foreground,
+      selection: t.selection,
+      code_background: t.code_bg ?? t.popover ?? t.surface,
+      inline_code_foreground: t.foreground,
+      inline_code_background: t.raised,
+      border: t.border,
+      heading: t.foreground,
+    };
+    if (cwd) opts.root_dir = cwd;
+    return opts;
+  }
+
+  renderEffortGlyph(t, visual, activeColor) {
+    if (!visual) return null;
+    const heights = [4, 6.5, 9.5, 12.5];
+    const bars = visual.bars ?? 4;
+    const active = visual.active ?? 0;
+    const offColor = withAlpha(t.dim ?? t.muted, "55");
     return h_flex()
+      .h(13)
+      .gap(1.5)
+      .items_end()
+      .flex_none()
+      .children(
+        heights.slice(0, bars).map((bh, i) =>
+          div()
+            .w(2)
+            .h(bh)
+            .rounded(1)
+            .bg(i < active ? activeColor : offColor),
+        ),
+      );
+  }
+
+  renderSubagentDivider(t, parent) {
+    const label = tr(`from ${parent.name || parent.address}`, `来自 ${parent.name || parent.address}`);
+    return h_flex()
+      .id("acp-subagent-divider")
       .w_full()
+      .max_w(LANE_MAX_W)
+      .gap(10)
       .items_center()
-      .gap(8)
-      .child(this.avatarTile(t, program, null, 20, 12))
-      .child(div().text_size(12.5).font_semibold().text_color(t.foreground).child(agentName))
-      .when(item.turn > 0, (el) => el.child(div().px(6).py(1).rounded(5).bg(t.raised).text_size(10.5).text_color(t.dim).child(`Turn ${item.turn}`)))
-      .when(Boolean(time), (el) => el.child(div().text_size(11).text_color(t.dim).child(time)))
-      .child(div().flex_1())
-      .when(Boolean(copyKey && copyContent), (el) => el.child(this.copyPill(t, copyKey, copyContent, "Copy")));
+      .py(2)
+      .child(div().flex_1().h(1).bg(t.border))
+      .child(
+        h_flex()
+          .gap(5)
+          .px(8)
+          .py(2)
+          .rounded(999)
+          .items_center()
+          .text_size(11)
+          .text_color(t.dim)
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover).text_color(t.foreground))
+          .on_mouse_down("left", stopMouse)
+          .on_click(() => run("agent.focus", { terminal: parent.address }))
+          .child(svg(ICONS.bot).size(12).flex_none().text_color(t.dim))
+          .child(label),
+      )
+      .child(div().flex_1().h(1).bg(t.border));
   }
 
   renderUserItem(t, item, currentTerminal) {
+    const isDark = Boolean(settings()?.dark ?? true);
     const time = formatTime(item.ts_ms);
     let fromLabel = item.from ? `from ${item.from}` : null;
     if (item.from) {
@@ -564,82 +658,160 @@ export default class Peek extends View {
         fromLabel = `from ${sender.name} (${item.from})`;
       }
     }
-    const body = item.body || "";
-    const isRich = body.includes("\n") || body.length > 72 || /[`*_#[\]|>]/.test(body);
+    const fullBody = item.body || "";
+    const isDelegated = Boolean(item.isDelegated ?? item.from);
+    const foldKey = `u-fold-${item.id}`;
+    const foldOpen = !isDelegated || Boolean(this.expandedSteps?.[foldKey]);
+    const lines = fullBody.split("\n");
+    const isLong = lines.length > 14 || fullBody.length > 900;
+    const moreKey = `u-more-${item.id}`;
+    const showAll = !isLong || Boolean(this.expandedSteps?.[moreKey]);
+    const displayBody = showAll
+      ? fullBody
+      : `${(lines.length > 14 ? lines.slice(0, 12).join("\n") : fullBody.slice(0, 720)).trimEnd()}…`;
+    const isRich = displayBody.includes("\n") || displayBody.length > 72 || /[`*_#[\]|>]/.test(displayBody);
+    const rowHoverKey = `row-u-${item.id}`;
+    const hovered = Boolean(this.hoveredRows?.[rowHoverKey]);
+
     return v_flex()
       .id(`acp-row-${item.id}`)
       .w_full()
-      .max_w(820)
+      .max_w(LANE_MAX_W)
       .min_w(0)
       .flex_none()
       .items_end()
-      .gap(5)
-      .child(
-        h_flex()
-          .gap(6)
-          .items_center()
-          .when(Boolean(fromLabel), (el) =>
-            el.child(div().px(6).py(1).rounded(999).bg(t.raised).border_1().border_color(t.border).text_size(10.5).text_color(t.muted).child(fromLabel)),
-          )
-          .when(Boolean(time), (el) => el.child(div().text_size(11).text_color(t.dim).child(time))),
+      .gap(4)
+      .on_hover((on, cx) => {
+        if (Boolean(this.hoveredRows[rowHoverKey]) !== on) {
+          this.hoveredRows[rowHoverKey] = on;
+          cx.notify();
+        }
+      })
+      .when(isDelegated, (el) =>
+        el.child(
+          h_flex()
+            .id(`acp-u-fold-${item.id}`)
+            .max_w(620)
+            .min_h(32)
+            .px(12)
+            .py(5)
+            .gap(7)
+            .items_center()
+            .rounded(12)
+            .bg(t.message ?? t.raised)
+            .border_1()
+            .border_color(foldOpen ? withAlpha(t.accent ?? t.border, "66") : t.border)
+            .cursor_pointer()
+            .hover((s) => s.bg(t.hover))
+            .on_mouse_down("left", stopMouse)
+            .on_click((_e, cx) => {
+              this.expandedSteps[foldKey] = !foldOpen;
+              cx.notify();
+            })
+            .child(svg(ICONS.messagesSquare).size(13).flex_none().text_color(t.dim))
+            .when(Boolean(fromLabel), (b) => b.child(div().flex_none().font_medium().text_size(11.5).text_color(t.muted).child(fromLabel)))
+            .when(Boolean(fromLabel), (b) => b.child(div().flex_none().text_size(11.5).text_color(t.dim).child("·")))
+            .child(div().max_w(440).truncate().text_size(12.5).text_color(t.foreground).child(item.foldSummary || fullBody))
+            .child(svg(foldOpen ? ICONS.chevronDown : ICONS.chevronRight).size(12).flex_none().text_color(t.dim)),
+        ),
       )
-      .child(
-        isRich
-          ? v_flex()
-              .w_full()
-              .max_w(680)
+      .when(foldOpen, (el) =>
+        el
+          .child(
+            v_flex()
+              .when(isRich, (b) => b.w_full().max_w(588))
+              .when(!isRich, (b) => b.max_w(588))
               .min_w(0)
-              .px(16)
-              .py(11)
-              .rounded(14)
-              .bg(t.surface)
-              .border_1()
-              .border_color(t.border)
-              .text_size(13.5)
-              .line_height("21px")
-              .text_color(t.foreground)
-              .child(TextView.markdown(`acp-u-${item.id}`, body).w_full().min_w(0).selectable(true).scrollable(false))
-          : div()
-              .max_w(640)
               .px(15)
-              .py(9)
-              .rounded(14)
-              .bg(t.surface)
-              .border_1()
-              .border_color(t.border)
-              .text_size(13.5)
-              .line_height("21px")
+              .py(10)
+              .rounded(18)
+              .rounded_br(6)
+              .bg(t.message ?? t.raised)
+              .when(!isDark, (b) => b.border_1().border_color(t.border))
+              .text_size(14)
+              .line_height("22px")
               .text_color(t.foreground)
-              .whitespace_normal()
-              .child(body),
+              .gap(6)
+              .child(
+                isRich
+                  ? TextView.markdown(`acp-u-${item.id}`, displayBody, this.mdOptions(t, this.term()?.cwd)).w_full().min_w(0).selectable(true).scrollable(false)
+                  : div().whitespace_normal().child(displayBody),
+              )
+              .when(isLong, (b) =>
+                b.child(
+                  h_flex()
+                    .justify_end()
+                    .child(
+                      div()
+                        .id(`acp-u-toggle-${item.id}`)
+                        .px(6)
+                        .py(2)
+                        .rounded(6)
+                        .text_size(11)
+                        .font_medium()
+                        .text_color(t.accent ?? t.muted)
+                        .cursor_pointer()
+                        .hover((s) => s.bg(t.hover))
+                        .on_mouse_down("left", stopMouse)
+                        .on_click((_e, cx) => {
+                          this.expandedSteps[moreKey] = !showAll;
+                          cx.notify();
+                        })
+                        .child(showAll ? tr("Show less", "收起") : tr("Show more", "展开全部")),
+                    ),
+                ),
+              ),
+          )
+          .when(Boolean(fullBody) || Boolean(time), (b) =>
+            b.child(
+              h_flex()
+                .px(4)
+                .gap(6)
+                .items_center()
+                .opacity(hovered || this.copiedId === `u-${item.id}` ? 1 : 0.45)
+                .when(Boolean(time), (meta) => meta.child(div().text_size(11).text_color(t.dim).child(time)))
+                .when(Boolean(fullBody), (meta) => meta.child(this.copyPill(t, `u-${item.id}`, fullBody, tr("Copy message", "复制消息"), true))),
+            ),
+          ),
       );
   }
 
   renderToolStep(t, step, mono) {
     const running = step.status === "pending" || step.status === "in_progress";
     const failed = step.status === "failed";
-    const iconPath = toolIconPath(step.tool_kind, step.title);
-    const kindBadge = step.tool_kind && step.tool_kind !== "other" ? step.tool_kind : null;
+    const iconPath = running ? ICONS.spinner : failed ? ICONS.circleAlert : toolIconPath(step.tool_kind, step.title);
     const summary = step.summaryTitle || step.title || "Tool call";
-    const expandable = Boolean(step.multiline || (step.title && step.title.length > 120));
+    const hasLongTitle = Boolean(step.multiline || (step.title && step.title.length > 120));
+    const detailBody = step.detail
+      ? (hasLongTitle && !step.detail.includes(step.title) ? `${step.title}\n\n${step.detail}` : step.detail)
+      : (hasLongTitle ? step.title : "");
+    const expandable = Boolean(step.expandable || detailBody);
     const open = Boolean(this.expandedSteps?.[step.id]);
+    const iconColor = failed ? (t.blocked ?? "#ef4444") : running ? t.foreground : t.dim;
+    const textColor = failed ? (t.blocked ?? "#ef4444") : running ? t.foreground : t.muted;
+    const isDark = Boolean(settings()?.dark ?? true);
+    const addColor = isDark ? "#4ade80" : "#16a34a";
+    const delColor = isDark ? "#f87171" : "#dc2626";
+    const addBg = isDark ? "#22c55e1a" : "#16a34a14";
+    const delBg = isDark ? "#ef44441a" : "#dc262614";
+    const parsedDetail = expandable && open && Boolean(detailBody)
+      ? parseToolDetail({ tool_kind: step.tool_kind, title: step.title, detail: detailBody })
+      : null;
+
     return v_flex()
       .id(`acp-step-${step.id}`)
       .w_full()
       .min_w(0)
-      .rounded(8)
-      .bg(t.surface)
-      .border_1()
-      .border_color(failed ? (t.blocked ?? t.border) : t.border)
-      .overflow_hidden()
+      .gap(4)
       .child(
         h_flex()
           .w_full()
-          .min_h(30)
-          .px(10)
-          .py(5)
-          .gap(8)
+          .min_h(24)
+          .px(6)
+          .py(2)
+          .gap(7)
           .items_center()
+          .rounded(6)
           .when(expandable, (el) =>
             el
               .cursor_pointer()
@@ -650,247 +822,746 @@ export default class Peek extends View {
                 cx.notify();
               }),
           )
-          .child(svg(iconPath).size(13).flex_none().text_color(running ? (t.working ?? t.accent) : t.dim))
-          .child(div().flex_1().min_w(0).truncate().font_family(mono).text_size(11.5).text_color(t.foreground).child(summary))
+          .when(!expandable, (el) => el.hover((s) => s.bg(withAlpha(t.foreground, "06"))))
+          .child(
+            div()
+              .size(16)
+              .flex_none()
+              .flex()
+              .items_center()
+              .justify_center()
+              .child(
+                svg(iconPath)
+                  .size(14)
+                  .text_color(iconColor)
+                  .when(running, (s) => s.spin(900)),
+              ),
+          )
+          .child(
+            div()
+              .flex_1()
+              .min_w(0)
+              .truncate()
+              .text_size(13)
+              .when(running, (el) => el.font_medium())
+              .text_color(textColor)
+              .child(summary),
+          )
+          .when(Boolean(step.diffStats) && (step.diffStats.additions > 0 || step.diffStats.deletions > 0), (el) =>
+            el.child(
+              h_flex()
+                .gap(4)
+                .flex_none()
+                .font_family(mono)
+                .text_size(11)
+                .when(step.diffStats.additions > 0, (s) => s.child(div().text_color(addColor).child(`+${step.diffStats.additions}`)))
+                .when(step.diffStats.deletions > 0, (s) => s.child(div().text_color(delColor).child(`-${step.diffStats.deletions}`))),
+            ),
+          )
           .when(step.extraLines > 0, (el) =>
-            el.child(div().px(5).py(1).rounded(4).bg(t.raised).text_size(10.5).text_color(t.dim).flex_none().child(tr(`+${step.extraLines} lines`, `+${step.extraLines} 行`))),
+            el.child(div().text_size(11).text_color(t.dim).flex_none().child(tr(`+${step.extraLines}L`, `+${step.extraLines}行`))),
           )
-          .when(Boolean(kindBadge), (el) =>
-            el.child(div().px(5).py(1).rounded(4).bg(t.raised).text_size(10.5).text_color(t.dim).flex_none().child(kindBadge)),
+          .when(failed, (el) =>
+            el.child(div().text_size(11).font_medium().text_color(t.blocked ?? "#ef4444").flex_none().child(tr("failed", "失败"))),
           )
-          .when(running, (el) => el.child(svg(ICONS.spinner).size(12).flex_none().text_color(t.working ?? t.accent).spin(900)))
-          .when(!running && !failed, (el) => el.child(svg(ICONS.check).size(12).flex_none().text_color(t.done ?? t.dim)))
-          .when(failed, (el) => el.child(div().flex_none().text_size(11).font_medium().text_color(t.blocked ?? "#ef4444").child(tr("failed", "失败"))))
-          .when(expandable, (el) => el.child(svg(open ? ICONS.chevronDown : ICONS.chevronRight).size(12).flex_none().text_color(t.dim))),
+          .when(expandable, (el) =>
+            el.child(svg(open ? ICONS.chevronDown : ICONS.chevronRight).size(12).flex_none().text_color(t.dim)),
+          ),
       )
-      .when(expandable && open, (el) =>
-        el.child(
+      .when(Boolean(parsedDetail), (el) => {
+        if (parsedDetail.mode === "diff") {
+          return el.child(
+            v_flex()
+              .ml(24)
+              .min_w(0)
+              .rounded(8)
+              .bg(t.code_bg ?? t.popover ?? t.surface)
+              .border_1()
+              .border_color(t.border)
+              .overflow_hidden()
+              .child(
+                h_flex()
+                  .h(26)
+                  .pl(10)
+                  .pr(6)
+                  .items_center()
+                  .justify_between()
+                  .border_b(1)
+                  .border_color(t.border)
+                  .child(
+                    h_flex()
+                      .gap(6)
+                      .items_center()
+                      .child(svg(ICONS.fileDiff).size(12).text_color(t.dim))
+                      .child(div().font_family(mono).text_size(11).text_color(t.muted).child(tr("diff", "差异")))
+                      .when(parsedDetail.additions > 0, (s) => s.child(div().font_family(mono).text_size(11).text_color(addColor).child(`+${parsedDetail.additions}`)))
+                      .when(parsedDetail.deletions > 0, (s) => s.child(div().font_family(mono).text_size(11).text_color(delColor).child(`-${parsedDetail.deletions}`))),
+                  )
+                  .child(this.copyPill(t, `tc-${step.id}`, detailBody, tr("Copy", "复制"), true)),
+              )
+              .child(
+                v_flex()
+                  .w_full()
+                  .min_w(0)
+                  .max_h(260)
+                  .overflow_y_scrollbar()
+                  .py(4)
+                  .children(
+                    parsedDetail.diffLines.map((dl) => {
+                      const bg = dl.kind === "add" ? addBg : dl.kind === "del" ? delBg : null;
+                      const fg = dl.kind === "add"
+                        ? addColor
+                        : dl.kind === "del"
+                          ? delColor
+                          : dl.kind === "hunk"
+                            ? (t.accent ?? t.muted)
+                            : dl.kind === "meta"
+                              ? t.dim
+                              : t.muted;
+                      return div()
+                        .w_full()
+                        .min_w(0)
+                        .px(10)
+                        .py(1)
+                        .when(Boolean(bg), (row) => row.bg(bg))
+                        .font_family(mono)
+                        .text_size(11.5)
+                        .line_height("17px")
+                        .text_color(fg)
+                        .whitespace_normal()
+                        .child(preserveIndentForWrap(dl.text));
+                    }),
+                  )
+                  .when(parsedDetail.truncatedLines > 0, (d) =>
+                    d.child(
+                      div()
+                        .px(10)
+                        .py(4)
+                        .text_size(11)
+                        .text_color(t.dim)
+                        .child(tr(`… ${parsedDetail.truncatedLines} more lines`, `… 还有 ${parsedDetail.truncatedLines} 行`)),
+                    ),
+                  ),
+              ),
+          );
+        }
+        if (parsedDetail.mode === "command") {
+          return el.child(
+            v_flex()
+              .ml(24)
+              .min_w(0)
+              .rounded(8)
+              .bg(t.code_bg ?? t.popover ?? t.surface)
+              .border_1()
+              .border_color(t.border)
+              .overflow_hidden()
+              .child(
+                h_flex()
+                  .min_h(28)
+                  .pl(10)
+                  .pr(6)
+                  .py(4)
+                  .gap(6)
+                  .items_center()
+                  .justify_between()
+                  .when(Boolean(parsedDetail.output), (b) => b.border_b(1).border_color(t.border))
+                  .child(
+                    h_flex()
+                      .flex_1()
+                      .min_w(0)
+                      .gap(6)
+                      .items_center()
+                      .child(div().flex_none().font_family(mono).text_size(11.5).text_color(t.dim).child("$"))
+                      .child(div().flex_1().min_w(0).font_family(mono).text_size(11.5).text_color(t.foreground).whitespace_normal().child(parsedDetail.command || step.title)),
+                  )
+                  .child(this.copyPill(t, `tc-${step.id}`, detailBody, tr("Copy", "复制"), true)),
+              )
+              .when(Boolean(parsedDetail.output), (b) =>
+                b.child(
+                  div()
+                    .w_full()
+                    .min_w(0)
+                    .max_h(240)
+                    .overflow_y_scrollbar()
+                    .px(10)
+                    .py(6)
+                    .font_family(mono)
+                    .text_size(11.5)
+                    .line_height("17px")
+                    .text_color(t.muted)
+                    .whitespace_normal()
+                    .child(parsedDetail.output),
+                ),
+              ),
+          );
+        }
+        return el.child(
           v_flex()
-            .w_full()
+            .ml(24)
             .min_w(0)
-            .border_t(1)
+            .rounded(8)
+            .bg(t.code_bg ?? t.popover ?? t.surface)
+            .border_1()
             .border_color(t.border)
-            .bg(t.background)
             .overflow_hidden()
+            .child(
+              h_flex()
+                .h(26)
+                .pl(10)
+                .pr(6)
+                .items_center()
+                .justify_between()
+                .child(div().font_family(mono).text_size(11).text_color(t.dim).child(step.tool_kind || tr("detail", "详情")))
+                .child(this.copyPill(t, `tc-${step.id}`, detailBody, tr("Copy", "复制"), true)),
+            )
             .child(
               div()
                 .min_w(0)
-                .m(-1)
+                .max_h(240)
+                .overflow_y_scrollbar()
+                .px(2)
+                .pb(2)
                 .font_family(mono)
                 .text_size(11.5)
                 .line_height("18px")
                 .text_color(t.muted)
                 .child(
-                  TextView.markdown(`acp-tc-${step.id}`, `${fenceFor(step.title)}\n${step.title}\n${fenceFor(step.title)}`)
+                  TextView.markdown(`acp-tc-${step.id}`, `${fenceFor(detailBody)}\n${detailBody}\n${fenceFor(detailBody)}`)
                     .w_full()
                     .min_w(0)
                     .selectable(true)
                     .scrollable(false),
                 ),
             ),
+        );
+      });
+  }
+
+  renderThoughtStep(t, step, defaultOpen = false) {
+    const open = this.expandedSteps?.[step.id] ?? defaultOpen;
+    const preview = step.preview || tr("Reasoning", "推理过程");
+    return v_flex()
+      .id(`acp-step-${step.id}`)
+      .w_full()
+      .min_w(0)
+      .gap(4)
+      .child(
+        h_flex()
+          .w_full()
+          .min_h(24)
+          .px(6)
+          .py(2)
+          .gap(7)
+          .items_center()
+          .rounded(6)
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover))
+          .on_mouse_down("left", stopMouse)
+          .on_click((_e, cx) => {
+            this.expandedSteps[step.id] = !open;
+            cx.notify();
+          })
+          .child(
+            div()
+              .size(16)
+              .flex_none()
+              .flex()
+              .items_center()
+              .justify_center()
+              .child(svg(ICONS.brain).size(14).text_color(t.dim)),
+          )
+          .child(div().flex_1().min_w(0).truncate().text_size(13).text_color(t.muted).child(open ? tr("Thought", "思考过程") : preview))
+          .child(svg(open ? ICONS.chevronDown : ICONS.chevronRight).size(12).flex_none().text_color(t.dim)),
+      )
+      .when(open, (el) =>
+        el.child(
+          div()
+            .ml(24)
+            .pl(10)
+            .py(2)
+            .min_w(0)
+            .border_l(1)
+            .border_color(t.border)
+            .text_size(12.5)
+            .line_height("19px")
+            .text_color(t.muted)
+            .child(TextView.markdown(`acp-th-${step.id}`, step.text, this.mdOptions(t, this.term()?.cwd)).w_full().min_w(0).selectable(true).scrollable(false)),
         ),
       );
   }
 
-  renderActivityGroup(t, item, program, agentName, mono) {
-    const open = this.expandedGroups[item.id] ?? item.defaultExpanded;
-    const summary = summarizeActivityGroup(item);
-    const statusColor = item.runningCount > 0 ? (t.working ?? t.accent) : item.failedCount > 0 ? (t.blocked ?? "#ef4444") : (t.done ?? t.muted);
-
-    const stepNodes = item.steps.map((step) => {
-      if (step.kind === "tool_call") {
-        return this.renderToolStep(t, step, mono);
-      }
-      if (step.kind === "thought") {
-        return v_flex()
-          .id(`acp-step-${step.id}`)
+  renderProposedPlanCard(t, plan) {
+    if (!plan || !plan.items?.length) return null;
+    const parsed = plan.parsedItems ?? plan.items.map((text) => ({ status: "pending", text }));
+    const rawText = plan.items.join("\n");
+    const canCollapse = parsed.length > 8;
+    const expanded = !canCollapse || Boolean(this.expandedSteps?.[`plan-exp-${plan.id}`]);
+    const visibleItems = expanded ? parsed : parsed.slice(0, 6);
+    return v_flex()
+      .id(`acp-plan-${plan.id}`)
+      .w_full()
+      .max_w(LANE_MAX_W)
+      .min_w(0)
+      .rounded(16)
+      .border_1()
+      .border_color(t.border)
+      .bg(withAlpha(t.popover ?? t.surface, "d8"))
+      .p(14)
+      .gap(10)
+      .child(
+        h_flex()
           .w_full()
-          .min_w(0)
-          .px(12)
-          .py(8)
-          .gap(4)
-          .rounded(8)
-          .bg(t.surface)
-          .border_1()
-          .border_color(t.border)
-          .child(div().text_size(10.5).font_semibold().text_color(t.dim).child(tr("REASONING", "推理过程")))
-          .child(div().w_full().min_w(0).text_size(12).line_height("18px").text_color(t.muted).child(TextView.markdown(`acp-th-${step.id}`, step.text).w_full().min_w(0).selectable(true).scrollable(false)));
-      }
-      if (step.kind === "plan") {
-        return v_flex()
-          .id(`acp-step-${step.id}`)
-          .w_full()
-          .min_w(0)
-          .px(12)
-          .py(9)
-          .gap(6)
-          .rounded(8)
-          .bg(t.surface)
-          .border_1()
-          .border_color(t.border)
+          .items_center()
+          .justify_between()
+          .gap(8)
           .child(
             h_flex()
-              .gap(6)
+              .gap(8)
               .items_center()
-              .child(svg(ICONS.layers).size(12).text_color(t.accent ?? t.muted))
-              .child(div().text_size(11.5).font_semibold().text_color(t.foreground).child(tr("Plan", "执行计划"))),
+              .child(
+                div()
+                  .px(7)
+                  .py(2)
+                  .rounded(6)
+                  .bg(t.raised)
+                  .text_size(11)
+                  .font_medium()
+                  .text_color(t.muted)
+                  .child(tr("Plan", "计划")),
+              )
+              .child(div().text_size(13.5).font_semibold().text_color(t.foreground).child(tr("Proposed plan", "执行计划"))),
           )
+          .child(this.copyPill(t, `plan-${plan.id}`, rawText, tr("Copy plan", "复制计划"), true)),
+      )
+      .child(
+        v_flex()
+          .w_full()
+          .gap(6)
           .children(
-            step.items.map((line, li) =>
-              h_flex()
-                .gap(7)
+            visibleItems.map((entry) => {
+              const done = entry.status === "completed";
+              const active = entry.status === "in_progress";
+              return h_flex()
+                .w_full()
+                .gap(8)
                 .items_center()
-                .child(div().size(5).rounded(999).flex_none().bg(t.accent ?? t.dim))
-                .child(div().flex_1().min_w(0).text_size(12).line_height("18px").text_color(t.muted).child(line)),
+                .when(done, (el) => el.child(svg(ICONS.circleCheck).size(13).flex_none().text_color(t.done ?? "#10b981")))
+                .when(active, (el) => el.child(svg(ICONS.spinner).size(13).flex_none().text_color(t.working ?? t.accent).spin(900)))
+                .when(!done && !active, (el) =>
+                  el.child(div().size(11).ml(1).mr(1).rounded(999).flex_none().border_1().border_color(t.dim)),
+                )
+                .child(
+                  div()
+                    .flex_1()
+                    .min_w(0)
+                    .text_size(12.5)
+                    .line_height("18px")
+                    .text_color(done ? t.muted : t.foreground)
+                    .child(entry.text),
+                );
+            }),
+          ),
+      )
+      .when(canCollapse, (el) =>
+        el.child(
+          h_flex()
+            .pt(2)
+            .child(
+              div()
+                .id(`acp-plan-toggle-${plan.id}`)
+                .px(8)
+                .py(3)
+                .rounded(6)
+                .text_size(11.5)
+                .font_medium()
+                .text_color(t.accent ?? t.muted)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover))
+                .on_mouse_down("left", stopMouse)
+                .on_click((_e, cx) => {
+                  this.expandedSteps[`plan-exp-${plan.id}`] = !expanded;
+                  cx.notify();
+                })
+                .child(
+                  expanded
+                    ? tr("Collapse plan", "收起计划")
+                    : tr(`Expand plan (${parsed.length})`, `展开计划 (${parsed.length})`),
+                ),
             ),
-          );
-      }
+        ),
+      );
+  }
+
+  renderChangedFilesCard(t, item, mono) {
+    const cf = item?.changedFiles;
+    if (!cf || !Array.isArray(cf.files) || cf.files.length === 0) return null;
+    const key = `cf-${item.id}`;
+    const open = Boolean(this.expandedGroups?.[key]);
+    const isDark = Boolean(settings()?.dark ?? true);
+    const addColor = isDark ? "#4ade80" : "#16a34a";
+    const delColor = isDark ? "#f87171" : "#dc2626";
+    const count = cf.files.length;
+    const label = tr(`${count} changed file${count === 1 ? "" : "s"}`, `${count} 个变更文件`);
+    return v_flex()
+      .id(`acp-changed-${item.id}`)
+      .w_full()
+      .max_w(LANE_MAX_W)
+      .min_w(0)
+      .rounded(12)
+      .border_1()
+      .border_color(t.border)
+      .bg(withAlpha(t.popover ?? t.surface, "b8"))
+      .overflow_hidden()
+      .child(
+        h_flex()
+          .h(32)
+          .px(12)
+          .gap(8)
+          .items_center()
+          .justify_between()
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover))
+          .on_mouse_down("left", stopMouse)
+          .on_click((_e, cx) => {
+            this.expandedGroups[key] = !open;
+            cx.notify();
+          })
+          .child(
+            h_flex()
+              .flex_1()
+              .min_w(0)
+              .gap(7)
+              .items_center()
+              .child(svg(ICONS.fileDiff).size(13).flex_none().text_color(t.dim))
+              .child(div().text_size(12).font_medium().text_color(t.foreground).child(label))
+              .when(cf.totalAdditions > 0, (s) => s.child(div().font_family(mono).text_size(11).text_color(addColor).child(`+${cf.totalAdditions}`)))
+              .when(cf.totalDeletions > 0, (s) => s.child(div().font_family(mono).text_size(11).text_color(delColor).child(`-${cf.totalDeletions}`))),
+          )
+          .child(svg(open ? ICONS.chevronDown : ICONS.chevronRight).size(12).flex_none().text_color(t.dim)),
+      )
+      .when(open, (el) =>
+        el.child(
+          v_flex()
+            .w_full()
+            .min_w(0)
+            .border_t(1)
+            .border_color(t.border)
+            .p(6)
+            .gap(2)
+            .children(
+              cf.files.map((f, fi) => {
+                const idx = f.path.lastIndexOf("/");
+                const dir = idx >= 0 ? f.path.slice(0, idx + 1) : "";
+                const name = idx >= 0 ? f.path.slice(idx + 1) : f.path;
+                return h_flex()
+                  .id(`acp-cf-file-${item.id}-${fi}`)
+                  .w_full()
+                  .h(26)
+                  .px(8)
+                  .gap(8)
+                  .items_center()
+                  .justify_between()
+                  .rounded(6)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.hover))
+                  .on_mouse_down("left", stopMouse)
+                  .on_click(() => {
+                    run("layout.select", { stack: "panel-body", child: "changes" });
+                    run("layout.show", { id: "panel" });
+                  })
+                  .child(
+                    h_flex()
+                      .flex_1()
+                      .min_w(0)
+                      .items_center()
+                      .when(Boolean(dir), (s) => s.child(div().truncate().font_family(mono).text_size(11.5).text_color(t.dim).child(dir)))
+                      .child(div().truncate().font_family(mono).text_size(11.5).font_medium().text_color(t.foreground).child(name)),
+                  )
+                  .child(
+                    h_flex()
+                      .gap(5)
+                      .flex_none()
+                      .font_family(mono)
+                      .text_size(11)
+                      .when(f.additions > 0, (s) => s.child(div().text_color(addColor).child(`+${f.additions}`)))
+                      .when(f.deletions > 0, (s) => s.child(div().text_color(delColor).child(`-${f.deletions}`))),
+                  );
+              }),
+            ),
+        ),
+      );
+  }
+
+  renderActivityGroup(t, item, mono) {
+    const open = this.expandedGroups[item.id] ?? item.defaultExpanded;
+    const summary = summarizeActivityGroup(item);
+    const running = item.runningCount > 0;
+    const failed = item.failedCount > 0;
+    const time = formatTime(item.ts_ms);
+    const nonPlanSteps = item.steps.filter((s) => s.kind !== "plan");
+    const onlyPlan = item.steps.length > 0 && nonPlanSteps.length === 0;
+    const groupHoverKey = `row-ag-${item.id}`;
+    const hovered = Boolean(this.hoveredRows?.[groupHoverKey]);
+
+    if (onlyPlan && item.latestPlan) {
+      return v_flex()
+        .id(`acp-row-${item.id}`)
+        .w_full()
+        .max_w(LANE_MAX_W)
+        .min_w(0)
+        .flex_none()
+        .child(this.renderProposedPlanCard(t, item.latestPlan));
+    }
+
+    const renderStep = (step) => {
+      if (step.kind === "tool_call") return this.renderToolStep(t, step, mono);
+      if (step.kind === "thought") return this.renderThoughtStep(t, step, running && item.steps.length === 1);
       if (step.kind === "permission") {
         return h_flex()
           .id(`acp-step-${step.id}`)
           .w_full()
-          .min_h(28)
-          .px(10)
-          .py(5)
-          .gap(8)
+          .min_h(24)
+          .px(6)
+          .py(2)
+          .gap(7)
           .items_center()
-          .rounded(8)
-          .bg(t.surface)
-          .border_1()
-          .border_color(t.border)
-          .child(svg(ICONS.shield).size(12).flex_none().text_color(t.accent ?? t.dim))
-          .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.muted).child(step.title))
-          .when(Boolean(step.outcome), (el) =>
-            el.child(div().px(6).py(1).rounded(4).bg(t.raised).text_size(10.5).text_color(t.dim).child(step.outcome)),
-          );
+          .rounded(6)
+          .child(div().size(16).flex_none().flex().items_center().justify_center().child(svg(ICONS.shield).size(13).text_color(t.dim)))
+          .child(div().flex_1().min_w(0).truncate().text_size(13).text_color(t.muted).child(step.title))
+          .when(Boolean(step.outcome), (el) => el.child(div().text_size(11).text_color(t.dim).child(step.outcome)));
       }
       return null;
-    }).filter(Boolean);
+    };
+
+    const singleNonPlan = item.steps.length === 1 && nonPlanSteps.length === 1;
+    const stepNodes = (item.latestPlan ? nonPlanSteps : item.steps).map(renderStep).filter(Boolean);
+    const primaryStep = nonPlanSteps[0];
+    const groupIconPath = running
+      ? ICONS.spinner
+      : failed
+        ? ICONS.circleAlert
+        : primaryStep?.kind === "thought"
+          ? ICONS.brain
+          : primaryStep?.kind === "tool_call"
+            ? toolIconPath(primaryStep.tool_kind, primaryStep.title)
+            : ICONS.wrench;
 
     return v_flex()
       .id(`acp-row-${item.id}`)
       .w_full()
-      .max_w(820)
+      .max_w(LANE_MAX_W)
       .min_w(0)
       .flex_none()
-      .gap(8)
-      .when(item.showSpeakerHeader, (el) => el.child(this.speakerRow(t, item, program, agentName)))
-      .child(
-        v_flex()
-          .w_full()
-          .min_w(0)
-          .gap(6)
+      .gap(6)
+      .when(singleNonPlan, (el) => el.children(stepNodes))
+      .when(!singleNonPlan, (el) =>
+        el
           .child(
             h_flex()
               .id(`acp-grp-${item.id}`)
               .w_full()
-              .h(34)
-              .px(11)
-              .gap(8)
+              .min_h(24)
+              .px(6)
+              .py(2)
+              .gap(7)
               .items_center()
-              .rounded(9)
-              .bg(t.surface)
-              .border_1()
-              .border_color(t.border)
+              .rounded(6)
               .cursor_pointer()
               .hover((s) => s.bg(t.hover))
+              .on_hover((on, cx) => {
+                if (Boolean(this.hoveredRows[groupHoverKey]) !== on) {
+                  this.hoveredRows[groupHoverKey] = on;
+                  cx.notify();
+                }
+              })
               .on_mouse_down("left", stopMouse)
               .on_click((_e, cx) => {
                 this.expandedGroups[item.id] = !open;
                 cx.notify();
               })
-              .when(item.runningCount > 0, (el) => el.child(svg(ICONS.spinner).size(13).flex_none().text_color(statusColor).spin(900)))
-              .when(item.runningCount === 0, (el) => el.child(svg(ICONS.circleCheck).size(13).flex_none().text_color(statusColor)))
-              .child(div().flex_1().min_w(0).truncate().text_size(12).font_medium().text_color(t.muted).child(summary))
-              .child(div().px(6).py(1).rounded(999).bg(t.raised).text_size(10.5).text_color(t.dim).flex_none().child(String(item.steps.length)))
-              .child(svg(open ? ICONS.chevronDown : ICONS.chevronRight).size(13).flex_none().text_color(t.dim)),
+              .child(
+                div()
+                  .size(16)
+                  .flex_none()
+                  .flex()
+                  .items_center()
+                  .justify_center()
+                  .child(
+                    svg(groupIconPath)
+                      .size(14)
+                      .text_color(failed ? (t.blocked ?? "#ef4444") : running ? t.foreground : t.dim)
+                      .when(running, (s) => s.spin(900)),
+                  ),
+              )
+              .child(
+                div()
+                  .flex_1()
+                  .min_w(0)
+                  .truncate()
+                  .text_size(13)
+                  .when(running, (tEl) => tEl.font_medium())
+                  .text_color(running ? t.foreground : t.muted)
+                  .child(summary),
+              )
+              .when(Boolean(time), (tEl) => tEl.child(div().text_size(11).text_color(t.dim).opacity(hovered ? 1 : 0.45).flex_none().child(time)))
+              .child(svg(open ? ICONS.chevronDown : ICONS.chevronRight).size(12).flex_none().text_color(t.dim)),
           )
-          .when(open && stepNodes.length > 0, (el) =>
-            el.child(
+          .when(open && stepNodes.length > 0, (wrap) =>
+            wrap.child(
               v_flex()
                 .w_full()
                 .min_w(0)
-                .pl(12)
-                .ml(10)
+                .ml(13)
+                .pl(11)
                 .py(2)
-                .gap(6)
-                .border_l(2)
+                .gap(2)
+                .border_l(1)
                 .border_color(t.border)
                 .children(stepNodes),
             ),
           ),
-      );
+      )
+      .when(Boolean(item.latestPlan), (el) => el.child(this.renderProposedPlanCard(t, item.latestPlan)))
+      .when(Boolean(item.changedFiles), (el) => el.child(this.renderChangedFilesCard(t, item, mono)));
   }
 
-  renderAssistantItem(t, item, program, agentName, mono) {
+  renderAssistantItem(t, item, mono) {
     const copyTurnKey = `turn-${item.id}`;
+    const time = formatTime(item.ts_ms);
+    const mdOpts = this.mdOptions(t, this.term()?.cwd);
+    const isDark = Boolean(settings()?.dark ?? true);
+    const rowHoverKey = `row-as-${item.id}`;
+    const hovered = Boolean(this.hoveredRows?.[rowHoverKey]);
     const blocks = (item.blocks ?? []).map((block, bi) => {
       if (block.type === "code") {
         const key = `${item.id}-code-${bi}`;
         const fence = fenceFor(block.code);
         const fenced = `${fence}\n${block.code}\n${fence}`;
+        const wrapped = Boolean(this.wrappedCodes?.[key]);
+        const codeLines = String(block.code ?? "").replace(/\r\n/g, "\n").split("\n");
         return v_flex()
           .id(`acp-codecard-${key}`)
           .w_full()
           .min_w(0)
-          .rounded(10)
+          .rounded(9)
           .border_1()
           .border_color(t.border)
-          .bg(t.background)
+          .bg(t.code_bg ?? t.popover ?? t.surface)
           .overflow_hidden()
           .child(
             h_flex()
-              .h(32)
-              .px(12)
+              .h(28)
+              .pl(12)
+              .pr(6)
+              .pt(2)
               .items_center()
               .justify_between()
-              .bg(t.raised)
-              .border_b(1)
-              .border_color(t.border)
+              .child(div().font_family(mono).text_size(11).text_color(t.dim).child(block.lang || "text"))
               .child(
                 h_flex()
-                  .gap(6)
+                  .gap(4)
                   .items_center()
-                  .child(svg(ICONS.terminal).size(12).text_color(t.dim))
-                  .child(div().font_family(mono).text_size(11.5).font_medium().text_color(t.muted).child(block.lang || "code")),
-              )
-              .child(this.copyPill(t, key, block.code, tr("Copy", "复制"))),
-          )
-          .child(
-            v_flex()
-              .w_full()
-              .min_w(0)
-              .overflow_hidden()
-              .child(
-                div()
-                  .min_w(0)
-                  .m(-1)
-                  .font_family(mono)
-                  .text_size(12.5)
-                  .child(TextView.markdown(`acp-cd-${key}`, fenced).w_full().min_w(0).selectable(true).scrollable(false)),
+                  .child(
+                    h_flex()
+                      .id(`wrap-${key}`)
+                      .h(22)
+                      .px(5)
+                      .items_center()
+                      .justify_center()
+                      .rounded(6)
+                      .cursor_pointer()
+                      .when(wrapped, (el) => el.bg(t.selected ?? t.hover))
+                      .hover((s) => s.bg(t.hover))
+                      .tooltip(wrapped ? tr("Disable line wrap", "关闭自动换行") : tr("Wrap long lines", "自动换行"))
+                      .on_mouse_down("left", stopMouse)
+                      .on_click((_e, cx) => {
+                        this.wrappedCodes[key] = !wrapped;
+                        cx.notify();
+                      })
+                      .child(svg(ICONS.wrapText).size(11).text_color(wrapped ? t.foreground : t.dim)),
+                  )
+                  .child(this.copyPill(t, key, block.code, tr("Copy", "复制"))),
               ),
+          )
+          .when(!wrapped, (el) =>
+            el.child(
+              v_flex()
+                .w_full()
+                .min_w(0)
+                .px(2)
+                .pb(2)
+                .overflow_hidden()
+                .child(
+                  div()
+                    .min_w(0)
+                    .m(-1)
+                    .font_family(mono)
+                    .text_size(12.5)
+                    .child(TextView.markdown(`acp-cd-${key}`, fenced, mdOpts).w_full().min_w(0).selectable(true).scrollable(false)),
+                ),
+            ),
+          )
+          .when(wrapped, (el) =>
+            el.child(
+              v_flex()
+                .w_full()
+                .min_w(0)
+                .px(12)
+                .py(8)
+                .gap(1)
+                .children(
+                  codeLines.map((line) =>
+                    div()
+                      .w_full()
+                      .min_w(0)
+                      .whitespace_normal()
+                      .font_family(mono)
+                      .text_size(12)
+                      .line_height("19px")
+                      .text_color(isDark ? "#e4e4e7" : t.foreground)
+                      .child(preserveIndentForWrap(line)),
+                  ),
+                ),
+            ),
           );
       }
       return div()
         .w_full()
         .min_w(0)
-        .text_size(13.5)
+        .px(4)
+        .text_size(14)
         .line_height("22px")
         .text_color(t.foreground)
-        .child(TextView.markdown(`acp-md-${item.id}-${bi}`, block.text).w_full().min_w(0).selectable(true).scrollable(false));
+        .child(TextView.markdown(`acp-md-${item.id}-${bi}`, block.text, mdOpts).w_full().min_w(0).selectable(true).scrollable(false));
     });
 
     return v_flex()
       .id(`acp-row-${item.id}`)
       .w_full()
-      .max_w(820)
+      .max_w(LANE_MAX_W)
       .min_w(0)
       .flex_none()
       .gap(10)
-      .when(item.showSpeakerHeader, (el) => el.child(this.speakerRow(t, item, program, agentName, copyTurnKey, item.text)))
+      .on_hover((on, cx) => {
+        if (Boolean(this.hoveredRows[rowHoverKey]) !== on) {
+          this.hoveredRows[rowHoverKey] = on;
+          cx.notify();
+        }
+      })
       .children(blocks)
-      .when(!item.showSpeakerHeader && Boolean(item.isFinalTurnReply) && Boolean(item.text), (el) =>
-        el.child(h_flex().w_full().justify_end().child(this.copyPill(t, copyTurnKey, item.text, tr("Copy reply", "复制回复")))),
+      .when(Boolean(item.changedFiles), (el) => el.child(this.renderChangedFilesCard(t, item, mono)))
+      .when(Boolean(item.isFinalTurnReply) && Boolean(item.text), (el) =>
+        el.child(
+          h_flex()
+            .w_full()
+            .px(4)
+            .pt(1)
+            .gap(8)
+            .items_center()
+            .opacity(hovered || this.copiedId === copyTurnKey ? 1 : 0.45)
+            .child(this.copyPill(t, copyTurnKey, item.text, tr("Copy", "复制"), true))
+            .when(Boolean(time), (meta) => meta.child(div().text_size(11).text_color(t.dim).child(time))),
+        ),
       );
   }
 
@@ -899,16 +1570,18 @@ export default class Peek extends View {
     const fence = fenceFor(src);
     const fenced = `${fence}\n${src}\n${fence}`;
     const lineLabel = tr(`${item.lineCount ?? 0} lines`, `${item.lineCount ?? 0} 行`);
+    const shellBlocks = Array.isArray(item.shellBlocks) ? item.shellBlocks : [];
+
     return v_flex()
       .id(`acp-row-${item.id}`)
       .w_full()
-      .max_w(820)
+      .max_w(LANE_MAX_W)
       .min_w(0)
       .flex_none()
-      .rounded(10)
+      .rounded(12)
       .border_1()
       .border_color(t.border)
-      .bg(t.background)
+      .bg(t.popover ?? t.surface)
       .overflow_hidden()
       .child(
         h_flex()
@@ -916,7 +1589,6 @@ export default class Peek extends View {
           .px(12)
           .items_center()
           .justify_between()
-          .bg(t.raised)
           .border_b(1)
           .border_color(t.border)
           .child(
@@ -924,12 +1596,12 @@ export default class Peek extends View {
               .gap(7)
               .items_center()
               .child(svg(ICONS.terminal).size(12).text_color(t.dim))
-              .child(div().text_size(11.5).font_medium().text_color(t.muted).child(tr("Terminal snapshot", "终端画面快照")))
+              .child(div().text_size(12).font_medium().text_color(t.muted).child(tr("Terminal snapshot", "终端画面快照")))
               .child(div().text_size(11).text_color(t.dim).child(lineLabel)),
           )
           .child(
             h_flex()
-              .gap(8)
+              .gap(6)
               .items_center()
               .child(this.copyPill(t, `ts-${item.id}`, src, tr("Copy", "复制")))
               .when(Boolean(terminal), (el) =>
@@ -945,44 +1617,108 @@ export default class Peek extends View {
               ),
           ),
       )
-      .child(
-        v_flex()
-          .w_full()
-          .min_w(0)
-          .overflow_hidden()
-          .child(
-            div()
-              .min_w(0)
-              .m(-1)
-              .font_family(mono)
-              .text_size(12)
-              .child(TextView.markdown(`acp-ts-${item.id}`, fenced).w_full().min_w(0).selectable(true).scrollable(false)),
-          ),
+      .when(shellBlocks.length > 0, (el) =>
+        el.child(
+          v_flex()
+            .w_full()
+            .min_w(0)
+            .p(10)
+            .gap(8)
+            .children(
+              shellBlocks.map((sb, idx) => {
+                if (sb.type === "output") {
+                  const outFence = fenceFor(sb.text);
+                  return div()
+                    .min_w(0)
+                    .font_family(mono)
+                    .text_size(12)
+                    .child(TextView.markdown(`acp-tso-${item.id}-${idx}`, `${outFence}\n${sb.text}\n${outFence}`).w_full().min_w(0).selectable(true).scrollable(false));
+                }
+                return v_flex()
+                  .w_full()
+                  .min_w(0)
+                  .gap(6)
+                  .child(
+                    h_flex()
+                      .w_full()
+                      .min_h(34)
+                      .px(10)
+                      .py(6)
+                      .gap(8)
+                      .items_center()
+                      .justify_between()
+                      .rounded(8)
+                      .border_1()
+                      .border_color(t.border)
+                      .bg(t.raised)
+                      .child(
+                        h_flex()
+                          .flex_1()
+                          .min_w(0)
+                          .gap(6)
+                          .items_center()
+                          .child(div().flex_none().font_family(mono).text_size(12).text_color(t.dim).child("$"))
+                          .child(div().flex_1().min_w(0).truncate().font_family(mono).text_size(12).text_color(t.foreground).child(sb.command)),
+                      )
+                      .child(this.copyPill(t, `cmd-${item.id}-${idx}`, sb.command, tr("Copy command", "复制命令"), true)),
+                  )
+                  .when(Boolean(sb.output), (outEl) => {
+                    const outFence = fenceFor(sb.output);
+                    return outEl.child(
+                      div()
+                        .min_w(0)
+                        .font_family(mono)
+                        .text_size(11.5)
+                        .child(TextView.markdown(`acp-tsc-${item.id}-${idx}`, `${outFence}\n${sb.output}\n${outFence}`).w_full().min_w(0).selectable(true).scrollable(false)),
+                    );
+                  });
+              }),
+            ),
+        ),
+      )
+      .when(shellBlocks.length === 0, (el) =>
+        el.child(
+          v_flex()
+            .w_full()
+            .min_w(0)
+            .px(2)
+            .pb(2)
+            .overflow_hidden()
+            .child(
+              div()
+                .min_w(0)
+                .m(-1)
+                .font_family(mono)
+                .text_size(12)
+                .child(TextView.markdown(`acp-ts-${item.id}`, fenced).w_full().min_w(0).selectable(true).scrollable(false)),
+            ),
+        ),
       );
   }
 
-  renderErrorItem(t, item, program, agentName) {
-    return v_flex()
+  renderErrorItem(t, item) {
+    return h_flex()
       .id(`acp-row-${item.id}`)
       .w_full()
-      .max_w(820)
+      .max_w(LANE_MAX_W)
       .min_w(0)
       .flex_none()
-      .gap(8)
-      .when(item.showSpeakerHeader, (el) => el.child(this.speakerRow(t, item, program, agentName)))
+      .px(14)
+      .py(10)
+      .gap(10)
+      .items_start()
+      .rounded(12)
+      .bg(withAlpha(t.blocked ?? "#ef4444", "12"))
+      .border_1()
+      .border_color(withAlpha(t.blocked ?? "#ef4444", "44"))
+      .child(svg(ICONS.circleAlert).size(15).mt(2).flex_none().text_color(t.blocked ?? "#ef4444"))
       .child(
         v_flex()
-          .w_full()
+          .flex_1()
           .min_w(0)
-          .px(14)
-          .py(10)
-          .gap(4)
-          .rounded(10)
-          .bg(t.surface)
-          .border_1()
-          .border_color(t.blocked ?? "#ef4444")
-          .child(div().text_size(11.5).font_semibold().text_color(t.blocked ?? "#ef4444").child(tr("Agent error", "智能体错误")))
-          .child(div().text_size(12.5).line_height("19px").text_color(t.foreground).child(item.message)),
+          .gap(2)
+          .child(div().text_size(12).font_semibold().text_color(t.blocked ?? "#ef4444").child(tr("Agent error", "智能体错误")))
+          .child(div().text_size(13).line_height("19px").text_color(t.foreground).whitespace_normal().child(item.message)),
       );
   }
 
@@ -991,22 +1727,20 @@ export default class Peek extends View {
     return v_flex()
       .id(`acp-row-${item.id}`)
       .w_full()
-      .max_w(820)
+      .max_w(LANE_MAX_W)
       .min_w(0)
       .flex_none()
-      .gap(6)
+      .gap(4)
       .child(
         h_flex()
           .id(`acp-se-${item.id}`)
           .w_full()
-          .h(30)
-          .px(10)
+          .min_h(26)
+          .px(6)
+          .py(2)
           .gap(8)
           .items_center()
-          .rounded(8)
-          .bg(t.surface)
-          .border_1()
-          .border_color(t.border)
+          .rounded(6)
           .cursor_pointer()
           .hover((s) => s.bg(t.hover))
           .on_mouse_down("left", stopMouse)
@@ -1014,17 +1748,17 @@ export default class Peek extends View {
             this.expandedGroups[item.id] = !open;
             cx.notify();
           })
-          .child(svg(ICONS.terminal).size(12).flex_none().text_color(t.dim))
-          .child(div().flex_1().text_size(11.5).text_color(t.dim).child(tr(`Diagnostic stderr (${item.lineCount} line${item.lineCount === 1 ? "" : "s"})`, `诊断日志 stderr（${item.lineCount} 行）`)))
+          .child(div().size(16).flex_none().flex().items_center().justify_center().child(svg(ICONS.terminal).size(13).text_color(t.dim)))
+          .child(div().flex_1().text_size(12).text_color(t.dim).child(tr(`Diagnostic stderr (${item.lineCount} line${item.lineCount === 1 ? "" : "s"})`, `诊断日志 stderr（${item.lineCount} 行）`)))
           .child(svg(open ? ICONS.chevronDown : ICONS.chevronRight).size(12).flex_none().text_color(t.dim)),
       )
       .when(open, (el) =>
         el.child(
           v_flex()
-            .w_full()
+            .ml(24)
             .min_w(0)
             .rounded(8)
-            .bg(t.background)
+            .bg(t.popover ?? t.surface)
             .border_1()
             .border_color(t.border)
             .overflow_hidden()
@@ -1042,29 +1776,55 @@ export default class Peek extends View {
       );
   }
 
-  renderEmptyState(t, k, program, agentName, shortCwd) {
+  renderEmptyState(t, k, program, agentName, shortCwd, st) {
+    const folderName = (shortCwd || "").split(/[\\/]/).filter(Boolean).pop() || "";
+    const starting = st === "starting" || (!props()?.pty && k?.state === "live" && !k?.acp_session_id && !this.agentDetail?.acp_session_id && st !== "idle" && st !== "done");
     return v_flex()
       .w_full()
-      .max_w(520)
+      .max_w(LANE_MAX_W)
       .min_w(0)
-      .flex_none()
-      .my(24)
-      .p(24)
+      .flex_1()
+      .min_h(220)
+      .py(36)
+      .px(16)
       .gap(12)
       .items_center()
-      .rounded(14)
-      .bg(t.surface)
-      .border_1()
-      .border_color(t.border)
-      .child(this.avatarTile(t, program, null, 44, 22))
-      .child(div().text_size(15).font_semibold().text_color(t.foreground).child(agentName))
-      .when(Boolean(shortCwd), (el) => el.child(div().text_size(12).text_color(t.dim).child(shortCwd)))
+      .justify_center()
+      .child(this.avatarTile(t, program, null, 38, 20))
       .child(
-        div()
-          .text_size(12.5)
-          .line_height("19px")
-          .text_color(t.muted)
-          .child(this.loadedOnce ? tr("No messages yet. Send a prompt below to begin.", "暂无消息，请在下方输入提示词开始对话。") : tr("Loading conversation…", "正在加载对话…")),
+        h_flex()
+          .gap(6)
+          .flex_wrap()
+          .justify_center()
+          .items_baseline()
+          .child(div().text_size(22).text_color(t.muted).child(tr("What should we build", "准备构建什么")))
+          .when(Boolean(folderName), (el) =>
+            el.child(div().text_size(22).font_semibold().text_color(t.foreground).child(tr(`in ${folderName}?`, `（${folderName}）`))),
+          ),
+      )
+      .when(starting, (el) =>
+        el.child(
+          h_flex()
+            .gap(8)
+            .items_center()
+            .child(svg(ICONS.spinner).size(13).flex_none().text_color(t.working ?? t.accent ?? t.dim).spin(900))
+            .child(
+              div()
+                .text_size(12.5)
+                .line_height("19px")
+                .text_color(t.muted)
+                .child(tr(`Starting ${agentName} ACP session… Prompts sent now will be queued.`, `正在启动 ${agentName} ACP 会话… 现在发送的消息将自动排队。`)),
+            ),
+        ),
+      )
+      .when(!starting, (el) =>
+        el.child(
+          div()
+            .text_size(12.5)
+            .line_height("19px")
+            .text_color(t.dim)
+            .child(this.loadedOnce ? tr("No messages yet. Send a prompt below to begin.", "暂无消息，请在下方输入提示词开始对话。") : tr("Loading conversation…", "正在加载对话…")),
+        ),
       );
   }
 
@@ -1075,35 +1835,41 @@ export default class Peek extends View {
       modeOpt.currentValue !== "bypassPermissions" &&
       modeOpt.currentValue !== "dangerously-skip-permissions",
     );
-    const padX = isTab ? 18 : 28;
+    const padX = isTab ? 20 : 28;
+    const isDark = Boolean(settings()?.dark ?? true);
+    const warnColor = t.blocked ?? "#f59e0b";
     return v_flex()
       .w_full()
       .px(padX)
-      .pt(8)
+      .mb(6)
       .flex_none()
       .items_center()
       .child(
         v_flex()
           .w_full()
-          .max_w(820)
-          .px(16)
-          .py(12)
-          .gap(10)
-          .rounded(12)
-          .bg(t.surface)
+          .max_w(LANE_MAX_W)
+          .px(14)
+          .py(11)
+          .gap(9)
+          .rounded(14)
+          .bg(t.glass ?? withAlpha(t.popover ?? t.surface, isDark ? "e4" : "f2"))
           .border_1()
-          .border_color(t.blocked ?? "#f59e0b")
+          .border_color(withAlpha(warnColor, "77"))
+          .shadow_lg()
+          .on_mouse_down("left", stopMouse)
+          .on_scroll_wheel(stopScroll)
           .child(
             h_flex()
               .w_full()
               .gap(8)
               .items_center()
-              .child(svg(ICONS.shield).size(15).flex_none().text_color(t.blocked ?? "#f59e0b"))
-              .child(div().flex_1().min_w(0).text_size(13).font_semibold().text_color(t.foreground).child(perm.title || tr("Permission approval required", "需要权限确认"))),
+              .child(svg(ICONS.shield).size(15).flex_none().text_color(warnColor))
+              .child(div().text_size(12.5).font_semibold().text_color(warnColor).child(tr("Approval requested", "等待审批")))
+              .child(div().flex_1().min_w(0).truncate().text_size(12.5).font_medium().text_color(t.foreground).child(perm.title || tr("Permission approval required", "需要权限确认"))),
           )
           .child(
             h_flex()
-              .gap(8)
+              .gap(6)
               .flex_wrap()
               .children(
                 (perm.options ?? []).map((opt, idx) =>
@@ -1112,12 +1878,12 @@ export default class Peek extends View {
                     `perm-opt-${idx}`,
                     opt.name || opt.option_id,
                     () => this.runH2(["approve", "--json", terminal, "--option", opt.option_id]),
-                    { primary: idx === 0, outlined: idx !== 0, h: 30, px: 12 },
+                    { primary: idx === 0, outlined: idx !== 0, h: 28, px: 11 },
                   ),
                 ),
               )
               .when(!(perm.options?.length), (b) =>
-                b.child(this.pillButton(t, "perm-allow", tr("Approve", "允许"), () => this.runH2(["approve", "--json", terminal]), { primary: true, h: 30, px: 12 })),
+                b.child(this.pillButton(t, "perm-allow", tr("Approve", "允许"), () => this.runH2(["approve", "--json", terminal]), { primary: true, h: 28, px: 11 })),
               )
               .when(canSkipAll, (b) =>
                 b.child(
@@ -1126,18 +1892,18 @@ export default class Peek extends View {
                     "perm-skip-all",
                     "dangerously-skip-permissions",
                     (_e, cx) => this.setConfigOption(modeOpt, "bypassPermissions", cx),
-                    { outlined: true, h: 30, px: 12 },
+                    { outlined: true, h: 28, px: 11 },
                   ),
                 ),
               )
-              .child(this.pillButton(t, "perm-deny", tr("Deny", "拒绝"), () => this.runH2(["deny", "--json", terminal]), { danger: true, outlined: true, h: 30, px: 12 })),
+              .child(this.pillButton(t, "perm-deny", tr("Deny", "拒绝"), () => this.runH2(["deny", "--json", terminal]), { danger: true, outlined: true, h: 28, px: 11 })),
           ),
       );
   }
 
   capabilityIcon(opt) {
     if (opt.iconKind === "model") return ICONS.sparkles;
-    if (opt.iconKind === "thinking") return ICONS.lightbulb;
+    if (opt.iconKind === "thinking") return ICONS.brain;
     if (opt.iconKind === "fast") return ICONS.zap;
     if (opt.iconKind === "mode") return ICONS.shield;
     return ICONS.layers;
@@ -1380,40 +2146,27 @@ export default class Peek extends View {
 
   renderCapabilityBar(t, opts, k) {
     const isPty = Boolean(props()?.pty);
-    const usage = k?.context_usage ?? this.agentDetail?.context_usage ?? null;
-    const hasUsage = Boolean(usage && typeof usage.size === "number" && usage.size > 0);
-    if (!isPty && !opts.length && !hasUsage) return null;
-    const formatTok = (n) => {
-      if (typeof n !== "number" || !Number.isFinite(n) || n < 0) return "0";
-      if (n >= 1000000) return `${(n / 1000000).toFixed(1).replace(/\.0$/, "")}M`;
-      if (n >= 1000) return `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k`;
-      return String(Math.round(n));
-    };
-    const used = usage?.used ?? 0;
-    const size = usage?.size ?? 0;
-    const pct = hasUsage ? Math.min(100, Math.round((used / size) * 100)) : 0;
-    const pctColor = pct >= 85 ? (t.blocked ?? "#ef4444") : pct >= 65 ? (t.done ?? "#f59e0b") : t.muted;
+    const ptyBadges = isPty ? buildPtySessionBadges(this.sessionMeta, k) : [];
+    if (!isPty && !opts.length) return null;
+
     return h_flex()
       .id("acp-cfg-bar")
       .flex_1()
       .min_w(0)
       .flex_wrap()
-      .gap(4)
+      .gap(2)
       .items_center()
       .when(isPty, (el) =>
         el
           .child(
             h_flex()
               .id("acp-switch-terminal")
-              .h(26)
-              .px(9)
+              .h(28)
+              .px(8)
               .gap(5)
               .items_center()
-              .rounded(999)
-              .bg(t.raised)
-              .border_1()
-              .border_color(t.border)
-              .text_size(11.5)
+              .rounded(8)
+              .text_size(12)
               .font_medium()
               .text_color(t.muted)
               .cursor_pointer()
@@ -1421,20 +2174,42 @@ export default class Peek extends View {
               .tooltip(tr("Switch back to raw terminal view", "切回原始终端视图"))
               .on_mouse_down("left", stopMouse)
               .on_click(() => run("terminal.view", { terminal: props()?.terminal, view: "terminal" }))
-              .child(svg(ICONS.terminal).size(12).flex_none().text_color(t.dim))
+              .child(svg(ICONS.terminal).size(13).flex_none().text_color(t.dim))
               .child(tr("Terminal view", "终端视图")),
           )
           .child(
             div()
-              .px(7)
+              .px(6)
               .py(2)
-              .rounded(999)
+              .rounded(6)
               .bg(t.raised)
-              .border_1()
-              .border_color(t.border)
-              .text_size(10.5)
+              .text_size(11)
               .text_color(t.dim)
               .child(tr("CLI Agent", "终端智能体")),
+          )
+          .children(
+            ptyBadges.map((b) => {
+              const effortNode = b.effortVisual
+                ? this.renderEffortGlyph(t, b.effortVisual, t.foreground)
+                : null;
+              const bIcon = b.iconKind === "model"
+                ? (k?.program?.icon && k.program.tint ? k.program.icon : ICONS.sparkles)
+                : b.iconKind === "thinking"
+                  ? ICONS.brain
+                  : ICONS.shield;
+              return h_flex()
+                .id(`pty-badge-${b.id}`)
+                .h(28)
+                .px(8)
+                .gap(5)
+                .items_center()
+                .rounded(8)
+                .text_size(12)
+                .text_color(b.iconKind === "model" ? t.foreground : t.muted)
+                .tooltip(b.tooltip)
+                .child(effortNode ?? svg(bIcon).size(13).flex_none().text_color(t.dim))
+                .child(div().max_w(180).truncate().child(b.label));
+            }),
           ),
       )
       .children(
@@ -1443,25 +2218,25 @@ export default class Peek extends View {
           const isModel = opt.iconKind === "model";
           const isBypassMode = opt.iconKind === "mode"
             && (opt.currentValue === "bypassPermissions" || opt.currentValue === "dangerously-skip-permissions");
-          const pillText = opt.iconKind === "mode" && !isBypassMode
-            ? `${tr("Permissions", "权限")}: ${opt.pillLabel}`
-            : opt.pillLabel;
+          const pillText = opt.pillLabel;
           const open = this.openConfigId === opt.id;
           const isClosing = !open && Boolean(this.closingConfigs[opt.id]);
           const on = isBool && opt.currentValue === true;
           const active = isBool ? on : open;
           const glyph = this.capabilityIcon(opt);
+          const programModelIcon = isModel && k?.program?.icon ? icon(k.program, 13, open ? t.foreground : t.dim) : null;
           const accentText = t.accent ?? t.foreground;
-          const warnColor = t.blocked ?? accentText;
-          const glyphColor = isModel
-            ? (t.accent ?? t.muted)
-            : isBypassMode
-              ? warnColor
-              : (isBool && on) || (opt.iconKind === "extra" && opt.isNonDefault)
-                ? accentText
-                : active
-                  ? t.foreground
-                  : t.dim;
+          const warnColor = t.blocked ?? "#f59e0b";
+          const glyphColor = isBypassMode
+            ? warnColor
+            : (isBool && on) || (opt.iconKind === "extra" && opt.isNonDefault)
+              ? accentText
+              : active
+                ? t.foreground
+                : t.dim;
+          const effortNode = opt.effortVisual
+            ? this.renderEffortGlyph(t, opt.effortVisual, active ? t.foreground : (opt.isNonDefault ? accentText : t.muted))
+            : null;
           const labelColor = isModel
             ? t.foreground
             : isBypassMode
@@ -1475,20 +2250,16 @@ export default class Peek extends View {
           const trigger = h_flex()
             .id(`acp-cfg-${opt.id}`)
             .h(28)
-            .px(isModel ? 10 : 9)
-            .gap(isModel ? 6 : isBool ? 4.5 : 5)
+            .px(8)
+            .gap(5)
             .items_center()
-            .rounded(999)
-            .text_size(isModel ? 12.5 : 12)
+            .rounded(8)
+            .text_size(12.5)
             .transition("opacity", 120)
             .when(isModel || (isBool && on) || isBypassMode, (el) => el.font_medium())
-            .when(isModel, (el) =>
-              el.bg(open ? (t.selected ?? t.hover) : t.raised)
-                .when(open, (b) => b.border_1().border_color(t.accent ?? t.border)),
-            )
-            .when(!isModel && isBool && on, (el) => el.bg(withAlpha(t.accent ?? "#2563eb", "1f")))
-            .when(!isModel && isBypassMode && !open, (el) => el.bg(withAlpha(t.blocked ?? "#f59e0b", "18")))
-            .when(!isModel && !isBool && open, (el) => el.bg(t.selected ?? t.hover))
+            .when(isBool && on, (el) => el.bg(withAlpha(t.accent ?? "#3b82f6", "1a")))
+            .when(isBypassMode && !open, (el) => el.bg(withAlpha(warnColor, "14")))
+            .when(!isBool && open, (el) => el.bg(t.selected ?? t.hover))
             .text_color(labelColor)
             .cursor_pointer()
             .hover((s) => s.bg(t.hover).text_color(t.foreground))
@@ -1503,9 +2274,9 @@ export default class Peek extends View {
               if (open) this.closeConfigPopover(cx);
               else this.openConfigPopover(opt, cx);
             })
-            .child(svg(glyph).size(13).flex_none().text_color(glyphColor))
-            .child(div().max_w(isBypassMode ? 220 : 200).truncate().child(pillText))
-            .when(!isBool, (el) => el.child(svg(open ? ICONS.chevronUp : ICONS.chevronDown).size(10).flex_none().text_color(t.dim)));
+            .child(programModelIcon ?? effortNode ?? svg(glyph).size(13).flex_none().text_color(glyphColor))
+            .child(div().max_w(isBypassMode ? 220 : 190).truncate().child(pillText))
+            .when(!isBool, (el) => el.child(svg(open ? ICONS.chevronUp : ICONS.chevronDown).size(11).flex_none().text_color(t.dim)));
 
           if (isBool) return trigger;
 
@@ -1514,46 +2285,114 @@ export default class Peek extends View {
             .anchor("bottom_left")
             .when(open || isClosing, (el) => el.content(this.renderConfigPopupContent(t, opt, phase)));
         }),
+      );
+  }
+
+  renderContextStrip(t, k, shortCwd) {
+    const addr = props()?.terminal;
+    const pInfo = panes().find((p) => p.terminal === addr) ?? null;
+    const aInfo = agents().find((a) => a.address === addr) ?? null;
+    const sp = (typeof spaces === "function" ? spaces() : []).find((s) => s.id === (aInfo?.space ?? null))
+      ?? (typeof spaces === "function" ? spaces() : []).find((s) => s.active)
+      ?? null;
+    const machineName = sp?.machine || tr("Local", "本地");
+    const branch = pInfo?.branch || sp?.branch || k?.branch || null;
+    const usage = k?.context_usage ?? this.agentDetail?.context_usage ?? this.sessionMeta?.context_usage ?? null;
+    const hasUsage = Boolean(usage && typeof usage.size === "number" && usage.size > 0);
+    const formatTok = (n) => {
+      if (typeof n !== "number" || !Number.isFinite(n) || n < 0) return "0";
+      if (n >= 1000000) return `${(n / 1000000).toFixed(1).replace(/\.0$/, "")}M`;
+      if (n >= 1000) return `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k`;
+      return String(Math.round(n));
+    };
+    const used = usage?.used ?? 0;
+    const size = usage?.size ?? 0;
+    const pct = hasUsage ? Math.min(100, Math.round((used / size) * 100)) : 0;
+    const pctColor = pct >= 85 ? (t.blocked ?? "#ef4444") : pct >= 65 ? (t.done ?? "#f59e0b") : t.dim;
+
+    return h_flex()
+      .id("acp-ctx-strip")
+      .w_full()
+      .max_w(LANE_MAX_W)
+      .px(8)
+      .pt(6)
+      .gap(12)
+      .items_center()
+      .justify_between()
+      .text_size(11.5)
+      .text_color(t.dim)
+      .child(
+        h_flex()
+          .flex_1()
+          .min_w(0)
+          .gap(10)
+          .items_center()
+          .child(
+            h_flex()
+              .gap(4)
+              .items_center()
+              .flex_none()
+              .child(svg(ICONS.server).size(11).text_color(t.dim))
+              .child(machineName),
+          )
+          .when(Boolean(shortCwd), (el) =>
+            el.child(
+              h_flex()
+                .min_w(0)
+                .gap(4)
+                .items_center()
+                .child(svg(ICONS.folder).size(11).flex_none().text_color(t.dim))
+                .child(div().min_w(0).truncate().child(shortCwd)),
+            ),
+          )
+          .when(Boolean(branch), (el) =>
+            el.child(
+              h_flex()
+                .gap(4)
+                .items_center()
+                .flex_none()
+                .child(svg(ICONS.gitBranch).size(11).text_color(t.dim))
+                .child(div().max_w(160).truncate().child(branch)),
+            ),
+          ),
       )
       .when(hasUsage, (el) =>
         el.child(
           h_flex()
             .id("acp-ctx-usage")
-            .h(24)
-            .px(8)
-            .gap(5)
+            .gap(6)
             .flex_none()
             .items_center()
-            .rounded(999)
-            .bg(t.raised)
-            .border_1()
-            .border_color(t.border)
             .tooltip(tr(`Context window: ${formatTok(used)} / ${formatTok(size)} tokens (${pct}%)`, `上下文占用：${formatTok(used)} / ${formatTok(size)} tokens (${pct}%)`))
             .child(
               div()
                 .w(28)
-                .h(4)
+                .h(3.5)
                 .rounded(2)
                 .bg(t.border)
                 .overflow_hidden()
                 .child(div().h_full().w(`${pct}%`).bg(pctColor)),
             )
-            .child(div().text_size(11).font_medium().text_color(pctColor).child(`${pct}% · ${formatTok(used)}/${formatTok(size)}`)),
+            .child(div().text_size(11).text_color(pctColor).child(`${pct}% · ${formatTok(used)}/${formatTok(size)}`)),
         ),
       );
   }
 
-  renderComposer(t, k, st, isTab = false) {
+  renderComposer(t, k, st, shortCwd, isTab = false) {
     const queued = k?.inbox_len ?? 0;
     const ended = st === "ended" || k?.state === "finished";
+    const working = st === "working" && !ended;
     const hasText = Boolean((this.input?.value?.() ?? "").trim());
     const opts = this.configOptionsFor(k);
     const capBar = ended ? null : this.renderCapabilityBar(t, opts, k);
     const canSend = !ended && hasText && !this.busyAction;
-    const padX = isTab ? 18 : 28;
+    const padX = isTab ? 20 : 28;
+    const isDark = Boolean(settings()?.dark ?? true);
+    const accentSolid = t.accent ?? t.solid ?? "#2563eb";
+    const dangerSolid = t.blocked ?? "#ef4444";
     const sendTip = ended
       ? tr("Session ended · transcript preserved", "会话已结束 · 对话记录已保留")
-      : st === "working"
+      : working
         ? tr("Queue message (Enter) · Ctrl+Enter steers · Shift+Enter for newline", "加入队列 (Enter) · Ctrl+Enter 插话 · Shift+Enter 换行")
         : tr("Send message (Enter) · Shift+Enter for newline", "发送消息 (Enter) · Shift+Enter 换行");
 
@@ -1561,30 +2400,33 @@ export default class Peek extends View {
       .id("acp-composer-wrap")
       .w_full()
       .px(padX)
-      .pt(8)
-      .pb(isTab ? 16 : 20)
+      .pt(2)
+      .pb(isTab ? 10 : 14)
       .flex_none()
       .items_center()
-      .bg(t.canvas ?? t.background)
+      .bg(withAlpha(t.canvas ?? t.background, isDark ? "dc" : "e8"))
       .child(
         v_flex()
           .id("acp-composer-card")
           .w_full()
-          .max_w(820)
+          .max_w(LANE_MAX_W)
           .rounded(18)
           .border_1()
-          .border_color(this.inputFocused ? (t.accent ?? t.input) : t.border)
-          .bg(t.surface)
-          .shadow_md()
+          .border_color(this.inputFocused ? withAlpha(accentSolid, "90") : t.border)
+          .bg(t.glass ?? withAlpha(t.popover ?? t.surface, isDark ? "e2" : "f0"))
+          .shadow_xl()
           .overflow_hidden()
+          .on_mouse_down("left", stopMouse)
+          .on_scroll_wheel(stopScroll)
+          .child(div().w_full().h(1).bg(isDark ? "#ffffff0e" : "#ffffffcc"))
           .child(
             v_flex()
               .id("acp-input-area")
               .w_full()
-              .min_h(72)
-              .px(18)
-              .pt(14)
-              .pb(10)
+              .min_h(56)
+              .px(16)
+              .pt(11)
+              .pb(6)
               .cursor_text()
               .on_mouse_down("left", (_e, cx) => {
                 if (this.openConfigId) this.closeConfigPopover(cx);
@@ -1606,20 +2448,21 @@ export default class Peek extends View {
             h_flex()
               .id("acp-composer-footer")
               .w_full()
-              .min_h(44)
-              .px(12)
-              .py(6)
-              .gap(10)
+              .min_h(38)
+              .px(10)
+              .pb(8)
+              .pt(2)
+              .gap(8)
               .items_center()
               .justify_between()
               .child(
                 capBar ?? h_flex().flex_1().min_w(0).when(ended, (el) =>
-                  el.child(div().px(8).py(2).rounded(999).bg(t.raised).border_1().border_color(t.border).text_size(11).text_color(t.muted).child(tr("Session ended · transcript preserved", "会话已结束 · 对话记录已保留"))),
+                  el.child(div().px(8).py(2).rounded(6).bg(t.raised).text_size(11).text_color(t.muted).child(tr("Session ended · transcript preserved", "会话已结束 · 对话记录已保留"))),
                 ),
               )
               .child(
                 h_flex()
-                  .gap(8)
+                  .gap(6)
                   .items_center()
                   .flex_none()
                   .when(queued > 0, (el) =>
@@ -1629,103 +2472,118 @@ export default class Peek extends View {
                         .py(2)
                         .rounded(999)
                         .bg(t.raised)
-                        .border_1()
-                        .border_color(t.border)
                         .text_size(11)
                         .text_color(t.accent ?? t.muted)
                         .flex_none()
                         .child(tr(`${queued} queued`, `队列 ${queued}`)),
                     ),
                   )
-                  .when(st === "working" && !ended, (el) =>
-                    el.child(
-                      this.pillButton(
-                        t,
-                        "acp-stop",
-                        h_flex()
-                          .gap(5)
-                          .items_center()
-                          .child(svg(this.interrupting ? ICONS.spinner : ICONS.square).size(10).when(this.interrupting, (s) => s.spin(900)))
-                          .child(this.interrupting ? tr("Stopping…", "停止中…") : tr("Stop · Esc", "停止 · Esc")),
-                        (_e, cx) => {
-                          if (this.openConfigId) this.closeConfigPopover(cx);
-                          this.interruptAgent(props()?.terminal, cx);
-                        },
-                        { danger: true, outlined: true, h: 30, px: 11, disabled: this.interrupting },
-                      ),
-                    ),
-                  )
-                  .when(st === "working" && hasText && !ended, (el) =>
+                  .when(working && hasText, (el) =>
                     el.child(
                       h_flex()
                         .id("acp-steer")
-                        .h(30)
-                        .px(12)
+                        .h(28)
+                        .px(9)
+                        .gap(4)
                         .items_center()
                         .justify_center()
-                        .rounded(999)
-                        .border_1()
-                        .border_color(t.border)
-                        .bg(t.raised)
+                        .rounded(8)
                         .text_size(12)
                         .font_medium()
-                        .text_color(t.foreground)
-                        .when(!this.busyAction, (b) => b.cursor_pointer().hover((s) => s.bg(t.hover)))
+                        .text_color(t.muted)
+                        .when(!this.busyAction, (b) => b.cursor_pointer().hover((s) => s.bg(t.hover).text_color(t.foreground)))
+                        .tooltip(tr("Steer current turn immediately (Ctrl+Enter)", "立即插话并重引导 (Ctrl+Enter)"))
                         .on_mouse_down("left", stopMouse)
                         .on_click((_e, cx) => {
                           if (this.openConfigId) this.closeConfigPopover(cx);
                           this.sendPrompt(true);
                         })
+                        .child(svg(ICONS.cornerUpRight).size(13))
                         .child(tr("Steer", "插话")),
                     ),
                   )
-                  .child(
-                    h_flex()
-                      .id("acp-send")
-                      .size(32)
-                      .rounded(999)
-                      .flex_none()
-                      .items_center()
-                      .justify_center()
-                      .bg(canSend ? (t.solid ?? t.foreground) : t.raised)
-                      .text_color(canSend ? (t.solid_foreground ?? t.background) : t.dim)
-                      .when(canSend, (el) => el.shadow_sm().cursor_pointer().hover((s) => s.opacity(0.88)))
-                      .tooltip(sendTip)
-                      .when(canSend, (el) =>
-                        el.on_mouse_down("left", stopMouse).on_click((_e, cx) => {
+                  .when(!working || hasText, (el) =>
+                    el.child(
+                      h_flex()
+                        .id("acp-send")
+                        .size(32)
+                        .rounded(999)
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .bg(canSend ? accentSolid : withAlpha(t.foreground, "16"))
+                        .text_color(canSend ? "#ffffff" : t.dim)
+                        .when(canSend, (btn) => btn.shadow_sm().cursor_pointer().hover((s) => s.opacity(0.9)))
+                        .tooltip(sendTip)
+                        .when(canSend, (btn) =>
+                          btn.on_mouse_down("left", stopMouse).on_click((_e, cx) => {
+                            if (this.openConfigId) this.closeConfigPopover(cx);
+                            this.sendPrompt(false);
+                          }),
+                        )
+                        .child(svg(working ? ICONS.listPlus : ICONS.arrowUp).size(15)),
+                    ),
+                  )
+                  .when(working, (el) =>
+                    el.child(
+                      h_flex()
+                        .id("acp-stop")
+                        .size(32)
+                        .rounded(999)
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .bg(dangerSolid)
+                        .text_color("#ffffff")
+                        .shadow_sm()
+                        .when(!this.interrupting, (btn) => btn.cursor_pointer().hover((s) => s.opacity(0.9)))
+                        .tooltip(this.interrupting ? tr("Stopping…", "停止中…") : tr("Stop generation (Esc)", "停止生成 (Esc)"))
+                        .on_mouse_down("left", stopMouse)
+                        .on_click((_e, cx) => {
+                          if (this.interrupting) return;
                           if (this.openConfigId) this.closeConfigPopover(cx);
-                          this.sendPrompt(false);
-                        }),
-                      )
-                      .child(svg(ICONS.arrowUp).size(16)),
+                          this.interruptAgent(props()?.terminal, cx);
+                        })
+                        .child(
+                          this.interrupting
+                            ? svg(ICONS.spinner).size(13).spin(900)
+                            : svg(ICONS.square).size(10),
+                        ),
+                    ),
                   ),
               ),
           ),
-      );
+      )
+      .child(this.renderContextStrip(t, k, shortCwd));
   }
 
   renderPtyBlockedBanner(t, terminal, isTab = false) {
-    const padX = isTab ? 18 : 28;
+    const padX = isTab ? 20 : 28;
+    const isDark = Boolean(settings()?.dark ?? true);
+    const warnColor = t.blocked ?? "#f59e0b";
     return v_flex()
       .id("pty-blocked-banner")
       .w_full()
       .px(padX)
-      .pt(8)
+      .mb(6)
       .flex_none()
       .items_center()
       .child(
         h_flex()
           .w_full()
-          .max_w(820)
-          .px(16)
+          .max_w(LANE_MAX_W)
+          .px(14)
           .py(10)
           .gap(10)
           .items_center()
-          .rounded(12)
-          .bg(t.surface)
+          .rounded(14)
+          .bg(t.glass ?? withAlpha(t.popover ?? t.surface, isDark ? "e4" : "f2"))
           .border_1()
-          .border_color(t.blocked ?? "#f59e0b")
-          .child(svg(ICONS.shield).size(15).flex_none().text_color(t.blocked ?? "#f59e0b"))
+          .border_color(withAlpha(warnColor, "77"))
+          .shadow_lg()
+          .on_mouse_down("left", stopMouse)
+          .on_scroll_wheel(stopScroll)
+          .child(svg(ICONS.shield).size(15).flex_none().text_color(warnColor))
           .child(
             div()
               .flex_1()
@@ -1751,12 +2609,24 @@ export default class Peek extends View {
     const { terminal, overlay, tab, pane } = props() ?? {};
     const isTab = Boolean(tab);
     const isPty = Boolean(props()?.pty);
+    const isDark = Boolean(settings()?.dark ?? true);
     const myPane = pane ?? panes().find((p) => (p.acp || p.structured) && p.terminal === terminal)?.pane ?? null;
     const key = `${terminal}:${st}:${k?.turn ?? 0}:${k?.transcript_seq ?? 0}:${k?.pending_permission?.request_id ?? ""}:${k?.printed ?? 0}:${k?.status_ms ?? 0}`;
     if (!checking() && key !== this.lastKey) {
       this.lastKey = key;
       Promise.resolve().then(() => this.reloadTranscript());
     }
+    if (st === "working") {
+      const fromTerm = typeof k?.working_since === "number" && k.working_since > 0 ? k.working_since : null;
+      if (fromTerm) {
+        this.workingStartedAt = fromTerm;
+      } else if (!this.workingStartedAt) {
+        this.workingStartedAt = Date.now();
+      }
+    } else {
+      this.workingStartedAt = null;
+    }
+
     const perm = k?.pending_permission;
     const mono = settings()?.font_family ?? "JetBrains Mono";
     const program = k?.program;
@@ -1767,39 +2637,69 @@ export default class Peek extends View {
       how: this.readHow,
       turn: k?.turn ?? 0,
       isAgent: Boolean(program?.agent || k?.status || st),
+      cwd: k?.cwd || "",
     });
 
     const threadChildren = [];
+    if (parent) {
+      threadChildren.push(this.renderSubagentDivider(t, parent));
+    }
     if (items.length === 0) {
-      threadChildren.push(this.renderEmptyState(t, k, program, agentName, shortCwd));
+      threadChildren.push(this.renderEmptyState(t, k, program, agentName, shortCwd, st));
     } else {
       for (const item of items) {
         if (item.kind === "user") threadChildren.push(this.renderUserItem(t, item, terminal));
-        else if (item.kind === "activity_group") threadChildren.push(this.renderActivityGroup(t, item, program, agentName, mono));
-        else if (item.kind === "assistant") threadChildren.push(this.renderAssistantItem(t, item, program, agentName, mono));
+        else if (item.kind === "activity_group") threadChildren.push(this.renderActivityGroup(t, item, mono));
+        else if (item.kind === "assistant") threadChildren.push(this.renderAssistantItem(t, item, mono));
         else if (item.kind === "terminal_snapshot") threadChildren.push(this.renderTerminalSnapshot(t, item, terminal, mono));
-        else if (item.kind === "error") threadChildren.push(this.renderErrorItem(t, item, program, agentName));
+        else if (item.kind === "error") threadChildren.push(this.renderErrorItem(t, item));
         else if (item.kind === "stderr_group") threadChildren.push(this.renderStderrItem(t, item, mono));
       }
     }
 
     if (st === "working") {
+      const lastItem = items[items.length - 1];
+      const activeHint = lastItem?.kind === "activity_group" && lastItem.activeTitle
+        ? lastItem.activeTitle
+        : "";
+      const elapsedSec = this.workingStartedAt ? Math.max(0, Math.floor((Date.now() - this.workingStartedAt) / 1000)) : 0;
+      const m = Math.floor(elapsedSec / 60);
+      const s = String(elapsedSec % 60).padStart(2, "0");
+      const workingText = this.interrupting
+        ? tr("Stopping…", "正在中断…")
+        : activeHint
+          ? (elapsedSec >= 1 ? `${activeHint} · ${m}:${s}` : activeHint)
+          : (elapsedSec >= 1 ? tr(`Working for ${m}:${s}`, `已运行 ${m}:${s}`) : tr("Working…", "执行中…"));
       threadChildren.push(
         h_flex()
           .id("acp-working-tail")
           .w_full()
-          .max_w(820)
+          .max_w(LANE_MAX_W)
           .min_w(0)
           .flex_none()
+          .px(6)
+          .pt(6)
+          .pb(6)
           .gap(8)
           .items_center()
-          .py(4)
-          .child(svg(ICONS.spinner).size(13).text_color(t.working ?? t.accent).spin(900))
-          .child(div().text_size(12).text_color(t.muted).child(this.interrupting ? tr("Stopping…", "正在中断…") : tr("Agent is working… · Press Esc to stop", "智能体正在执行… · 按 Esc 中断"))),
+          .border_b(1)
+          .border_color(withAlpha(t.border, "99"))
+          .child(svg(ICONS.spinner).size(13).flex_none().text_color(t.working ?? t.accent).spin(900))
+          .child(
+            div()
+              .flex_1()
+              .min_w(0)
+              .truncate()
+              .text_size(12.5)
+              .text_color(t.muted)
+              .child(workingText),
+          )
+          .child(div().flex_none().text_size(11).text_color(t.dim).child(tr("Esc to stop", "按 Esc 中断"))),
       );
     }
 
-    threadChildren.push(div().id("acp-bottom-anchor").h(4).flex_none());
+    const overlayPadBottom = perm || (isPty && st === "blocked") ? 244 : 172;
+    threadChildren.push(div().id("acp-bottom-anchor").h(overlayPadBottom).flex_none());
 
     const last = items[items.length - 1];
     const tailSig = `${items.length}:${last?.id ?? ""}:${last?.text?.length ?? 0}:${last?.steps?.length ?? 0}:${st ?? ""}:${Boolean(perm)}`;
@@ -1808,39 +2708,38 @@ export default class Peek extends View {
       this.scroll.scroll_to_item(threadChildren.length - 1);
     }
 
-    const padX = isTab ? 18 : 28;
+    const padX = isTab ? 20 : 28;
     const modalHeader = h_flex()
       .id("acp-header")
-      .min_h(54)
-      .px(18)
-      .py(8)
-      .gap(12)
+      .min_h(48)
+      .px(16)
+      .py(6)
+      .gap(10)
       .flex_none()
       .items_center()
-      .bg(t.surface)
+      .bg(t.canvas ?? t.background)
       .border_b(1)
       .border_color(t.border)
-      .child(this.avatarTile(t, program, pic, 32, 17))
+      .child(this.avatarTile(t, program, pic, 28, 15))
       .child(
         v_flex()
           .flex_1()
           .min_w(0)
-          .gap(2)
+          .gap(1)
           .child(
             h_flex()
               .gap(7)
               .items_center()
-              .child(div().truncate().text_size(13.5).font_semibold().text_color(t.foreground).child(agentName))
-              .child(div().px(6).py(1).rounded(5).bg(t.raised).border_1().border_color(t.border).text_size(10.5).font_medium().text_color(t.muted).flex_none().child("ACP"))
+              .child(div().truncate().text_size(13).font_semibold().text_color(t.foreground).child(agentName))
               .when(Boolean(terminal), (el) =>
-                el.child(div().px(6).py(1).rounded(5).bg(t.raised).font_family(mono).text_size(11).text_color(t.dim).flex_none().child(terminal)),
+                el.child(div().font_family(mono).text_size(11).text_color(t.dim).flex_none().child(terminal)),
               ),
           )
           .child(
             h_flex()
               .gap(8)
               .items_center()
-              .text_size(11.5)
+              .text_size(11)
               .text_color(t.dim)
               .when(Boolean(parent), (el) => el.child(div().flex_none().text_color(t.muted).child(tr(`from ${parent.name || parent.address}`, `来自 ${parent.name || parent.address}`))))
               .when(Boolean(shortCwd), (el) => el.child(div().min_w(0).truncate().child(shortCwd))),
@@ -1848,7 +2747,7 @@ export default class Peek extends View {
       )
       .child(
         h_flex()
-          .gap(6)
+          .gap(4)
           .items_center()
           .flex_none()
           .child(this.statusPill(t, st))
@@ -1874,7 +2773,7 @@ export default class Peek extends View {
               "acp-refresh",
               h_flex().gap(5).items_center().child(svg(ICONS.refresh).size(12).when(this.loading, (s) => s.spin(900))).child(tr("Refresh", "刷新")),
               () => this.reloadTranscript(),
-              { outlined: true, h: 26, px: 9 },
+              { h: 26, px: 8 },
             ),
           )
           .child(
@@ -1935,11 +2834,66 @@ export default class Peek extends View {
           ),
       );
 
+    const canvasBase = t.canvas ?? t.background;
+    const fadeStops = ["00", "24", "58", "96", "cc"];
+    const bottomOverlay = v_flex()
+      .absolute()
+      .left(0)
+      .right(0)
+      .bottom(0)
+      .w_full()
+      .items_center()
+      .when(!this.autoFollow, (el) =>
+        el.child(
+          h_flex()
+            .w_full()
+            .px(padX)
+            .mb(8)
+            .justify_center()
+            .child(
+              h_flex()
+                .id("acp-latest-inline")
+                .h(28)
+                .px(12)
+                .gap(5)
+                .items_center()
+                .rounded(999)
+                .border_1()
+                .border_color(t.border)
+                .bg(t.glass ?? withAlpha(t.popover ?? t.surface, isDark ? "e2" : "f0"))
+                .shadow_md()
+                .text_size(12)
+                .font_medium()
+                .text_color(t.muted)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                .on_mouse_down("left", stopMouse)
+                .on_scroll_wheel(stopScroll)
+                .on_click((_e, cx) => {
+                  this.autoFollow = true;
+                  this.revealedSig = "";
+                  this.scroll.scroll_to_item(threadChildren.length - 1);
+                  cx.notify();
+                })
+                .child(svg(ICONS.chevronDown).size(13).text_color(t.dim))
+                .child(tr("Scroll to end", "回到底部")),
+            ),
+        ),
+      )
+      .when(Boolean(perm), (el) => el.child(this.renderApprovalBanner(t, perm, terminal, k, isTab)))
+      .when(isPty && st === "blocked" && !perm, (el) => el.child(this.renderPtyBlockedBanner(t, terminal, isTab)))
+      .child(
+        v_flex()
+          .w_full()
+          .children(fadeStops.map((alpha) => div().w_full().h(4).bg(withAlpha(canvasBase, alpha)))),
+      )
+      .child(this.renderComposer(t, k, st, shortCwd, isTab));
+
     return v_flex()
       .id("acp-peek")
       .size_full()
       .when(!isTab, (el) => el.rounded(14).border_1().border_color(t.border).shadow_2xl())
-      .bg(t.canvas ?? t.background)
+      .bg(canvasBase)
       .text_color(t.foreground)
       .overflow_hidden()
       .track_focus(this.handle)
@@ -1983,9 +2937,9 @@ export default class Peek extends View {
             .flex_none()
             .items_center()
             .justify_between()
-            .bg(t.surface)
+            .bg(withAlpha(t.blocked ?? "#ef4444", "12"))
             .border_b(1)
-            .border_color(t.blocked ?? "#ef4444")
+            .border_color(withAlpha(t.blocked ?? "#ef4444", "55"))
             .child(div().flex_1().min_w(0).text_size(12).text_color(t.blocked ?? "#ef4444").child(this.error))
             .child(
               this.pillButton(t, "acp-error-dismiss", svg(ICONS.x).size(12), (_e, cx) => {
@@ -1996,55 +2950,37 @@ export default class Peek extends View {
         ),
       )
       .child(
-        v_flex()
-          .id("acp-transcript")
+        div()
+          .id("acp-stage")
+          .relative()
           .flex_1()
           .min_h(0)
           .w_full()
-          .overflow_x_hidden()
-          .px(padX)
-          .py(isTab ? 14 : 20)
-          .gap(16)
-          .items_center()
-          .overflow_y_scrollbar()
-          .mode("hover")
-          .track_scroll(this.scroll)
-          .on_scroll_wheel((e, cx) => {
-            if ((e.delta?.y ?? 0) > 6 && this.autoFollow) {
-              this.autoFollow = false;
-              cx.notify();
-            }
-          })
-          .children(threadChildren),
-      )
-      .when(isTab && !this.autoFollow, (el) =>
-        el.child(
-          h_flex()
-            .id("acp-latest-bar")
-            .w_full()
-            .px(padX)
-            .pt(4)
-            .flex_none()
-            .justify_center()
-            .child(
-              this.pillButton(
-                t,
-                "acp-latest-inline",
-                tr("↓ Jump to latest", "↓ 跳到最新"),
-                (_e, cx) => {
-                  this.autoFollow = true;
-                  this.revealedSig = "";
-                  this.scroll.scroll_to_item(threadChildren.length - 1);
+          .overflow_hidden()
+          .child(
+            v_flex()
+              .id("acp-transcript")
+              .size_full()
+              .min_h(0)
+              .overflow_x_hidden()
+              .px(padX)
+              .pt(isTab ? 16 : 20)
+              .pb(8)
+              .gap(12)
+              .items_center()
+              .overflow_y_scrollbar()
+              .mode("hover")
+              .track_scroll(this.scroll)
+              .on_scroll_wheel((e, cx) => {
+                if ((e.delta?.y ?? 0) > 6 && this.autoFollow) {
+                  this.autoFollow = false;
                   cx.notify();
-                },
-                { outlined: true, h: 26, px: 12 },
-              ),
-            ),
-        ),
-      )
-      .when(Boolean(perm), (el) => el.child(this.renderApprovalBanner(t, perm, terminal, k, isTab)))
-      .when(isPty && st === "blocked" && !perm, (el) => el.child(this.renderPtyBlockedBanner(t, terminal, isTab)))
-      .child(this.renderComposer(t, k, st, isTab));
+                }
+              })
+              .children(threadChildren),
+          )
+          .child(bottomOverlay),
+      );
   }
 
   render() {

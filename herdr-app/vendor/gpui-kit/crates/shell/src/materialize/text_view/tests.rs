@@ -393,3 +393,192 @@ fn document_svg_images_cannot_read_local_files(cx: &mut TestAppContext) {
     let decoded = cx.update(|cx| decode_image(svg.as_bytes().to_vec(), cx.svg_renderer()));
     assert!(decoded.is_ok());
 }
+
+fn load_document_image(
+    cx: &mut TestAppContext,
+    capabilities: Capabilities,
+    options: TextViewImageOptions,
+    uri: &str,
+) -> ImageResult {
+    let policy = Rc::new(Policy::new().with_capabilities(capabilities));
+    let owner = cx.new(|_| DocumentImages {
+        policy,
+        options,
+        used: HashSet::new(),
+    });
+    let result = Arc::new(Mutex::new(None));
+    let out = result.clone();
+    let uri = SharedUri::from(uri.to_owned());
+    let fut = cx.update(|cx| DocumentImage::load((owner.downgrade(), uri), cx));
+    cx.background_executor
+        .spawn(async move {
+            *out.lock().unwrap() = Some(fut.await);
+        })
+        .detach();
+    cx.run_until_parked();
+    result.lock().unwrap().take().expect("image load completed")
+}
+
+#[gpui::test]
+fn text_view_local_images_respect_base_dir_root_dir_and_capabilities(cx: &mut TestAppContext) {
+    let base = std::env::temp_dir().join(format!("gpui-shell-local-imgs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let docs = base.join("docs");
+    let sub = docs.join("sub");
+    let spaced = docs.join("my dir");
+    let assets = base.join("assets");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::create_dir_all(&spaced).unwrap();
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(sub.join("pic.png"), PNG).unwrap();
+    std::fs::write(spaced.join("pic.png"), PNG).unwrap();
+    std::fs::write(assets.join("top.png"), PNG).unwrap();
+    std::fs::write(
+        sub.join("diagram.svg"),
+        br#"<svg xmlns="http://www.w3.org/2000/svg" width="4" height="2"><rect width="4" height="2"/></svg>"#,
+    )
+    .unwrap();
+    let outside = std::env::temp_dir().join(format!("gpui-shell-local-outside-{}.png", std::process::id()));
+    std::fs::write(&outside, PNG).unwrap();
+
+    let options = TextViewImageOptions {
+        base_dir: Some(docs.to_string_lossy().into_owned()),
+        root_dir: Some(base.to_string_lossy().into_owned()),
+        allow_data_images: false,
+    };
+
+    let read_granted = Capabilities::new().read_roots([base.clone()]);
+    let file_uri = reqwest::Url::from_file_path(sub.join("pic.png"))
+        .unwrap()
+        .to_string();
+
+    for uri in [
+        "./sub/pic.png",
+        "sub/pic.png",
+        "../assets/top.png",
+        "my%20dir/pic.png",
+        "/assets/top.png",
+        "sub/diagram.svg",
+        file_uri.as_str(),
+    ] {
+        assert!(
+            load_document_image(cx, read_granted.clone(), options.clone(), uri).is_ok(),
+            "expected local image to load with read grant: {uri}"
+        );
+        assert!(
+            load_document_image(cx, Capabilities::new(), options.clone(), uri).is_err(),
+            "expected empty capabilities to refuse local image: {uri}"
+        );
+    }
+
+    // Read-root containment refuses paths outside the granted root even with base_dir/root_dir.
+    let outside_file_uri = reqwest::Url::from_file_path(&outside).unwrap().to_string();
+    assert!(load_document_image(cx, read_granted.clone(), options.clone(), &outside_file_uri).is_err());
+
+    // Unrestricted execution grant (used by trusted host mods) also resolves local files.
+    let unrestricted = Capabilities::new().execute(crate::ExecuteGrant::Unrestricted);
+    assert!(load_document_image(cx, unrestricted, options.clone(), "./sub/pic.png").is_ok());
+
+    // End-to-end JS -> TextView.markdown options deserialization.
+    let options_json = serde_json::json!({
+        "base_dir": docs.to_string_lossy(),
+        "root_dir": base.to_string_lossy(),
+        "allow_data_images": true,
+    });
+    let js = format!(
+        r#"
+import {{ View }} from "gpui-kit";
+import {{ TextView }} from "gpui-base";
+export default class Document extends View {{
+  render() {{ return TextView.markdown("document", "![pic](./sub/pic.png)", {options_json}); }}
+}}
+"#
+    );
+    let mut app = cx.new_app();
+    let mut context = mount_documents(&mut app, &js, vec![read_granted]);
+    draw_documents(&mut context);
+    app.quit();
+
+    let _ = std::fs::remove_file(&outside);
+    let _ = std::fs::remove_dir_all(&base);
+}
+
+#[gpui::test]
+fn text_view_data_images_require_opt_in_option(cx: &mut TestAppContext) {
+    let png_data = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAAEUlEQVR4nGMUMgn7z8DAwAAACQ0BnfdmzRUAAAAASUVORK5CYII=";
+    let svg_data = "data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20width%3D%222%22%20height%3D%221%22%3E%3Crect%20width%3D%222%22%20height%3D%221%22%2F%3E%3C%2Fsvg%3E";
+
+    let disabled = TextViewImageOptions::default();
+    let enabled = TextViewImageOptions {
+        allow_data_images: true,
+        ..Default::default()
+    };
+
+    for uri in [png_data, svg_data] {
+        assert!(
+            load_document_image(cx, Capabilities::new(), disabled.clone(), uri).is_err(),
+            "data image must remain refused without allow_data_images: {uri}"
+        );
+        assert!(
+            load_document_image(cx, Capabilities::new(), enabled.clone(), uri).is_ok(),
+            "data image must decode when allow_data_images is true: {uri}"
+        );
+    }
+}
+
+#[test]
+fn shell_http_client_supports_get_and_redirect_policies() {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let first_line = req.lines().next().unwrap_or("");
+            if first_line.starts_with("GET /redirect ") {
+                stream
+                    .write_all(b"HTTP/1.1 302 Found\r\nLocation: /final.png\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+            } else {
+                let mut reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    PNG.len()
+                )
+                .into_bytes();
+                reply.extend_from_slice(PNG);
+                stream.write_all(&reply).unwrap();
+            }
+        }
+    });
+
+    let client = crate::http_client("herdr2-test");
+    let no_follow = smol::block_on(client.get(
+        &format!("http://{addr}/redirect"),
+        ().into(),
+        false,
+    ))
+    .unwrap();
+    assert_eq!(no_follow.status().as_u16(), 302);
+    assert_eq!(
+        no_follow.headers().get("location").unwrap().to_str().unwrap(),
+        "/final.png"
+    );
+
+    let mut followed = smol::block_on(client.get(
+        &format!("http://{addr}/redirect"),
+        ().into(),
+        true,
+    ))
+    .unwrap();
+    assert_eq!(followed.status().as_u16(), 200);
+    let mut bytes = Vec::new();
+    smol::block_on(followed.body_mut().read_to_end(&mut bytes)).unwrap();
+    assert_eq!(bytes, PNG);
+
+    handle.join().unwrap();
+}

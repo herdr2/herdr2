@@ -1,0 +1,1931 @@
+/* ============================================================
+   Drove — Inspector drawer, gates, messages & transcripts
+   Claude Artifact Drawer / Chat Transcript aesthetic: warm
+   ivory surfaces, hairline borders, editorial serif titles,
+   soft pill chips, terracotta accents. Tokens only.
+   ============================================================ */
+
+/* ---------- side panel (artifact drawer) ---------- */
+
+.side-panel {
+  --sp-accent: var(--accent);
+  --sp-accent-bg: var(--accent-soft);
+  position: relative;
+  flex: none;
+  z-index: 2;
+  display: flex;
+  flex-direction: column;
+  width: var(--panel-w, 400px);
+  max-width: 70%;
+  height: 100%;
+  border-left: 1px solid var(--border);
+  background: var(--surface);
+  overflow: hidden;
+}
+.side-panel[data-role="coord"] {
+  --sp-accent: var(--role-coord);
+  --sp-accent-bg: var(--role-coord-bg);
+}
+.side-panel[data-role="task"] {
+  --sp-accent: var(--role-task);
+  --sp-accent-bg: var(--role-task-bg);
+}
+.side-panel[data-role="worker"] {
+  --sp-accent: var(--role-worker);
+  --sp-accent-bg: var(--role-worker-bg);
+}
+.side-panel[data-role="reviewer"] {
+  --sp-accent: var(--role-reviewer);
+  --sp-accent-bg: var(--role-reviewer-bg);
+}
+/* left-edge grip: a wide invisible hit area with a thin warm line
+   that lights up in terracotta while hovering or dragging */
+.side-panel__resize {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  z-index: 2;
+  width: 8px;
+  cursor: col-resize;
+  touch-action: none;
+}
+.side-panel__resize::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: 3px;
+  border-radius: var(--r-pill);
+  background: color-mix(in srgb, var(--accent) 55%, transparent);
+  opacity: 0;
+  transition: opacity 0.18s var(--ease-out);
+}
+.side-panel__resize:hover::after,
+.side-panel__resize:focus-visible::after,
+.side-panel--resizing .side-panel__resize::after {
+  opacity: 1;
+}
+.side-panel__resize:focus-visible {
+  outline: none;
+}
+/* keep the col-resize cursor and stop text selection for the whole drag */
+.side-panel--resizing {
+  user-select: none;
+}
+.side-panel--resizing,
+.side-panel--resizing * {
+  cursor: col-resize !important;
+}
+.side-panel__header {
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 18px 12px;
+  background: var(--surface);
+  border-bottom: 1px solid var(--border);
+  box-shadow: inset 0 2px 0 var(--sp-accent);
+}
+.side-panel__top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+.side-panel__badges {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+  min-width: 0;
+  flex: 1;
+}
+.side-panel__badges .role-badge,
+.side-panel__badges .sbadge,
+.side-panel__badges .review-requirement,
+.side-panel__badges .access-pill,
+.side-panel__badges .micro-badge {
+  box-sizing: border-box;
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  max-width: none;
+  padding: 0 9px;
+  border-radius: var(--r-pill);
+  border: 1px solid color-mix(in srgb, currentColor 22%, var(--border));
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.01em;
+  text-transform: none;
+  white-space: nowrap;
+}
+.side-panel__badges .sbadge {
+  gap: 5px;
+}
+.side-panel__badges .review-requirement--none,
+.side-panel__badges .micro-badge:not(.micro-badge--exec):not(.micro-badge--template):not(.micro-badge--cached):not(.micro-badge--review):not(.micro-badge--role) {
+  border-color: var(--border);
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+.side-panel__actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: none;
+}
+.side-panel__title {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: 17px;
+  font-weight: 600;
+  letter-spacing: -0.015em;
+  line-height: 1.35;
+  color: var(--text);
+  word-break: break-word;
+}
+.side-panel__sub {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+.side-panel__id {
+  margin: 0;
+  color: var(--text-3);
+  font-size: 11px;
+  word-break: break-all;
+}
+.side-panel__body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 14px 18px 22px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.panel-field {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.panel-field:last-child {
+  border-bottom: none;
+}
+.panel-field__key {
+  display: block;
+  margin-bottom: 5px;
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-3);
+}
+.panel-field__val {
+  min-width: 0;
+  word-break: break-word;
+}
+
+.spec {
+  margin: 0;
+  white-space: pre-wrap;
+  color: var(--text);
+  line-height: 1.55;
+}
+
+.code-block {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 260px;
+  overflow: auto;
+}
+
+.link-list,
+.attempt-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.link-btn {
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--accent);
+  text-align: left;
+  cursor: pointer;
+}
+.link-btn:hover {
+  text-decoration: underline;
+}
+.attempt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 7px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface-elevated, var(--surface));
+  box-shadow: var(--shadow-xs);
+  text-align: left;
+  cursor: pointer;
+  min-width: 0;
+  transition: border-color 0.14s var(--ease-out), background 0.14s var(--ease-out);
+}
+.attempt:hover {
+  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+  background: var(--surface-2);
+}
+/* Move fields to the next line as a whole, but wrap a field if it is wider
+   than the card (for example, a model name or a related task title). */
+.attempt {
+  flex-wrap: wrap;
+  row-gap: 3px;
+}
+.attempt > :not(.attempt__id) {
+  flex: none;
+  min-width: 0;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.attempt > .attempt__detail {
+  flex-basis: 100%;
+  white-space: pre-wrap;
+}
+.attempt__no {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+.fail-banner {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--st, var(--st-failed)) 35%, var(--border));
+  border-left: 3px solid var(--st, var(--st-failed));
+  border-radius: 10px;
+  background: var(--st-bg, var(--st-failed-bg));
+}
+.fail-banner--task {
+  --st: var(--st-failed);
+  --st-bg: var(--st-failed-bg);
+}
+.fail-banner--review {
+  --st: var(--st-review);
+  --st-bg: var(--st-review-bg);
+}
+.fail-banner--other {
+  --st: var(--st-other);
+  --st-bg: var(--st-other-bg);
+}
+.fail-banner__class {
+  color: var(--st, var(--st-failed));
+  font-size: 13px;
+  font-weight: 700;
+}
+.fail-banner__detail {
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.review-standing {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 7px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 700;
+}
+.review-standing--reviewing,
+.review-standing--rework {
+  background: var(--st-running-bg);
+  color: var(--st-running);
+}
+.review-standing--approved {
+  background: var(--st-done-bg);
+  color: var(--st-done);
+}
+.review-standing--rejected,
+.review-standing--broken {
+  background: var(--st-review-bg);
+  color: var(--st-review);
+}
+.review-standing--stopped {
+  background: var(--st-other-bg);
+  color: var(--st-other);
+}
+.review-findings {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.review-findings li {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: baseline;
+}
+.review-finding__sev {
+  flex: none;
+  padding: 0 6px;
+  border-radius: var(--r-pill);
+  background: var(--st-review-bg);
+  color: var(--st-review);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.attempt__id {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+.panel-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 14px;
+  padding-top: 10px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
+/* ---------- gates: a floating parchment banner over the canvas ---------- */
+
+.gates {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  z-index: 15;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  max-width: min(720px, calc(100% - 120px));
+  padding: 8px 10px;
+  transform: translateX(-50%);
+  border: 1px solid color-mix(in srgb, var(--st-blocked) 28%, var(--border));
+  border-radius: var(--r-md);
+  background: var(--surface);
+  box-shadow: var(--shadow-md);
+}
+.gates__label {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--st-blocked);
+  white-space: nowrap;
+}
+.gates__chip {
+  max-width: 260px;
+  overflow: hidden;
+  padding: 3px 10px;
+  border: 1px solid color-mix(in srgb, var(--st-blocked) 35%, var(--border));
+  border-radius: var(--r-pill);
+  background: var(--st-blocked-bg);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color 0.14s var(--ease-out);
+}
+.gates__chip:hover {
+  border-color: var(--st-blocked);
+}
+/* questions borrow the "running" hue (as the ? chip on worker cards does),
+   escalations the "failed" one (as their message rows do) */
+.gates__label--ask {
+  color: var(--st-running);
+}
+.gates__label--esc {
+  color: var(--st-failed);
+}
+.gates__chip--ask {
+  border-color: color-mix(in srgb, var(--st-running) 35%, var(--border));
+  background: var(--st-running-bg);
+}
+.gates__chip--ask:hover {
+  border-color: var(--st-running);
+}
+.gates__chip--esc {
+  border-color: color-mix(in srgb, var(--st-failed) 35%, var(--border));
+  background: var(--st-failed-bg);
+}
+.gates__chip--esc:hover {
+  border-color: var(--st-failed);
+}
+.gate__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+/* a gate's options, read-only: the coordinating agent decides them */
+.gate__options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.gate__option {
+  padding: 3px 10px;
+  border: 1px solid color-mix(in srgb, var(--st-blocked) 35%, var(--border));
+  border-radius: var(--r-pill);
+  background: var(--st-blocked-bg);
+  color: var(--text);
+  font-size: 12px;
+}
+.gate__option--no {
+  border-color: color-mix(in srgb, var(--st-failed) 35%, var(--border));
+  background: var(--st-failed-bg);
+}
+
+/* ---------- empty states: literary, centered ---------- */
+
+.dag-empty,
+.empty-run {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 24px;
+  text-align: center;
+}
+.empty-run {
+  z-index: 4;
+  background: var(--bg);
+}
+.dag-empty__title,
+.empty-run__title {
+  margin: 0;
+  font-family: var(--font-serif);
+  font-size: 20px;
+  font-weight: 500;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+.dag-empty__hint,
+.empty-run__body {
+  margin: 0;
+  max-width: 520px;
+  color: var(--text-2);
+  line-height: 1.55;
+}
+
+/* ---------- narrow screens ---------- */
+
+@media (max-width: 720px) {
+  .topbar,
+  .toolbar {
+    padding-left: 16px;
+    padding-right: 16px;
+  }
+  .topbar__subtitle,
+  .toolbar__meta,
+  .toolbar__divider {
+    display: none;
+  }
+  /* the Run sidebar becomes an off-canvas drawer */
+  .topbar__menu {
+    display: grid;
+  }
+  .sidebar,
+  .sidebar--collapsed {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    z-index: 60;
+    width: min(300px, 86vw);
+    box-shadow: var(--shadow-lg);
+    transform: translateX(-100%);
+    transition: transform 0.18s ease;
+  }
+  .sidebar--open {
+    transform: none;
+  }
+  .sidebar-backdrop {
+    display: block;
+    position: fixed;
+    inset: 0;
+    z-index: 55;
+    background: var(--backdrop);
+  }
+  .canvas {
+    flex-direction: column;
+  }
+  .side-panel {
+    width: 100%;
+    max-width: none;
+    height: min(46vh, 420px);
+    border-left: none;
+    border-top: 1px solid var(--border);
+  }
+  /* stacked under the canvas: nothing to resize sideways */
+  .side-panel__resize {
+    display: none;
+  }
+}
+
+/* ---------- dependency focus (a task is selected) ---------- */
+
+.gnode--rel-dim {
+  opacity: 0.38;
+}
+/* A when-branch the gate did not choose. Quieter than a normal cancelled card. */
+.gnode--branch-miss {
+  opacity: 0.5;
+  filter: grayscale(0.55);
+}
+.gnode--branch-miss.gnode--selected,
+.gnode--branch-miss:hover {
+  opacity: 1;
+  filter: none;
+}
+.gnode--rel-dim.gnode--branch-miss {
+  opacity: 0.28;
+}
+.branch-tag {
+  flex: none;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 0 6px;
+  border-radius: var(--r-xs);
+  border: 1px dashed var(--border-strong);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 16px;
+  white-space: nowrap;
+}
+.branch-tag--hit {
+  border-style: solid;
+  border-color: var(--edge-satisfied);
+  background: var(--st-done-bg);
+  color: var(--st-done);
+}
+.branch-tag--miss,
+.branch-tag--open {
+  color: var(--text-3);
+}
+.gnode--rel-up {
+  border-color: var(--edge-depends);
+}
+.gnode--rel-down {
+  border-color: var(--accent);
+}
+.rel-tag {
+  flex: none;
+  margin-right: auto;
+  padding: 0 6px;
+  border-radius: var(--r-xs);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  white-space: nowrap;
+}
+.rel-tag--up {
+  background: var(--surface-2);
+  color: var(--text-2);
+  border: 1px solid var(--border-strong);
+}
+.rel-tag--down {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+/* a task the selected worker ran: worker role color, like its executes edge */
+.gnode--rel-ran {
+  border-color: var(--edge-executes);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--edge-executes) 22%, transparent), var(--shadow);
+}
+.rel-tag--ran {
+  background: var(--role-worker-bg);
+  color: var(--role-worker);
+}
+.order-badge {
+  flex: none;
+  color: var(--edge-executes);
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1;
+}
+/* Persistent worker number on worker cards (W1, W2, …). */
+.worker-num {
+  flex: none;
+  padding: 0 6px;
+  border-radius: var(--r-pill);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  background: var(--role-worker-bg);
+  color: var(--role-worker);
+  letter-spacing: 0.02em;
+}
+/* Worker-number chips on task cards: latest attempt solid, earlier ones dimmed. */
+.task-wnum {
+  flex: none;
+  padding: 0 5px;
+  border-radius: var(--r-pill);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  background: var(--role-worker-bg);
+  color: var(--role-worker);
+}
+.task-wnum--dim {
+  opacity: 0.45;
+}
+.task-wnum--fail {
+  background: var(--st-failed-bg);
+  color: var(--st-failed);
+}
+.attempt-mark {
+  flex: none;
+  padding: 0 5px;
+  border-radius: var(--r-pill);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+}
+.attempt-mark--ok {
+  background: var(--st-done-bg);
+  color: var(--st-done);
+}
+.attempt-mark--fail {
+  background: var(--st-failed-bg);
+  color: var(--st-failed);
+}
+.attempt-mark--retry {
+  background: var(--st-blocked-bg);
+  color: var(--st-blocked);
+}
+.attempt-mark--run {
+  background: var(--st-running-bg);
+  color: var(--st-running);
+}
+.edge--dim .react-flow__edge-path {
+  opacity: 0.18;
+}
+.edge--focus .react-flow__edge-path {
+  stroke-width: 3;
+}
+
+.legend-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 20px;
+  height: 18px;
+  padding: 0 5px;
+  border: 1px solid var(--border-strong);
+  border-left: 3px solid var(--role-task);
+  border-radius: 4px;
+  background: var(--surface);
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text);
+}
+.edge-legend__hint {
+  color: var(--text-3);
+}
+
+/* worker → task leaves the worker's trailing side and enters the task's
+   leading side above the dependency input */
+.gnode__handle--exec.react-flow__handle {
+  background: var(--edge-executes);
+}
+.dispatch-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.dispatch-item:last-child {
+  border-bottom: 0;
+}
+.dispatch-item__row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 11px;
+}
+
+/* ---------- decision gates on the canvas ---------- */
+
+/* sizes: keep in sync with NODE_SIZE.gate (layout.ts) */
+.gnode--gate {
+  width: 220px;
+  height: 160px;
+  overflow: hidden;
+  border-radius: var(--r-md);
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--st) 45%, var(--border));
+  background: color-mix(in srgb, var(--st-bg) 55%, var(--surface));
+}
+.gnode--gate-pending {
+  border-style: solid;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--st-blocked) 25%, transparent), var(--shadow);
+}
+.role-badge--gate {
+  background: var(--st-blocked-bg);
+  color: var(--st-blocked);
+}
+.gnode__handle--gate.react-flow__handle {
+  background: var(--st-blocked);
+}
+.edge--gate .react-flow__edge-path {
+  stroke: var(--st-blocked);
+  stroke-width: 2;
+  stroke-dasharray: 2 4;
+  stroke-linecap: round;
+}
+.edge--gate.edge--satisfied .react-flow__edge-path {
+  stroke: var(--edge-satisfied);
+}
+.edge--gate-rejected .react-flow__edge-path {
+  stroke: var(--st-failed);
+}
+.edge-legend__arrow--gate {
+  --c: var(--st-blocked);
+}
+.edge-legend__arrow--gate line {
+  stroke-dasharray: 2 3;
+}
+.edge-legend__arrow--branch {
+  --c: var(--text-3);
+}
+.edge-legend__arrow--branch line {
+  stroke-dasharray: 6 4;
+}
+.gnode__handle--branch.react-flow__handle {
+  background: var(--text-3);
+}
+.branch-label {
+  position: absolute;
+  z-index: 5;
+  padding: 0 5px;
+  border: 1px dashed var(--edge-branch);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--edge-branch);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  pointer-events: none;
+}
+.branch-label--hit {
+  border-style: solid;
+  border-color: var(--edge-satisfied);
+  color: var(--st-done);
+}
+.branch-label--miss {
+  opacity: 0.55;
+}
+.edge--branch .react-flow__edge-path {
+  stroke: var(--edge-branch);
+  stroke-width: 2;
+  stroke-dasharray: 3 5;
+  stroke-linecap: round;
+}
+.edge--branch-hit .react-flow__edge-path {
+  stroke: var(--edge-satisfied);
+  stroke-width: 2;
+  stroke-dasharray: none;
+  opacity: 1;
+}
+.edge--branch-miss .react-flow__edge-path {
+  stroke: var(--text-3);
+  stroke-dasharray: 8 6;
+  opacity: 0.38;
+}
+.edge--dim.edge--branch-miss .react-flow__edge-path {
+  opacity: 0.16;
+}
+
+/* ---------- messages: refined correspondence notes ---------- */
+
+.msg-chip {
+  flex: none;
+  margin-right: auto;
+  margin-left: 6px;
+  padding: 0 7px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text-2);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 15px;
+  white-space: nowrap;
+}
+.msg-chip--ask {
+  background: var(--st-running-bg);
+  border-color: var(--st-running);
+  color: var(--st-running);
+}
+.msg-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.msg-filters > * {
+  min-width: 0;
+  max-width: 100%;
+}
+/* in-panel segmented filters: Claude's soft pill tab bar, terracotta active */
+.side-panel .seg {
+  border: 1px solid var(--border-subtle, var(--border));
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  padding: 2px;
+}
+.side-panel .seg button {
+  border-radius: var(--r-pill);
+  color: var(--text-2);
+}
+.side-panel .seg button.active {
+  background: var(--surface-elevated, var(--surface));
+  color: var(--accent);
+  box-shadow: var(--shadow-xs);
+}
+.seg--sm button {
+  height: 24px;
+  padding: 0 9px;
+  font-size: 11px;
+}
+.msg-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.msg {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--role-worker);
+  border-radius: var(--r-md);
+  background: var(--surface-elevated, var(--surface));
+  box-shadow: var(--shadow-xs);
+  transition: border-color 0.14s var(--ease-out);
+}
+.msg--out {
+  border-left-color: var(--role-coord);
+  background: color-mix(in srgb, var(--role-coord-bg) 40%, var(--surface-elevated, var(--surface)));
+}
+.msg--question {
+  border-left-color: var(--st-running);
+}
+.msg--worker_done,
+.msg--done {
+  border-left-color: var(--st-done);
+}
+.msg--escalation,
+.msg--failed {
+  border-left-color: var(--st-failed);
+}
+.msg--gate {
+  border-left-color: var(--st-blocked);
+}
+.msg__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  font-size: 11px;
+}
+/* the type stamp: a soft pill in the message's own hue */
+.msg__type {
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  padding: 1px 8px;
+  border-radius: var(--r-pill);
+  background: var(--surface-2);
+  color: var(--text-2);
+}
+.msg__type--question {
+  color: var(--st-running);
+  background: var(--st-running-bg);
+}
+.msg__type--worker_done,
+.msg__type--done {
+  color: var(--st-done);
+  background: var(--st-done-bg);
+}
+.msg__type--escalation,
+.msg__type--failed {
+  color: var(--st-failed);
+  background: var(--st-failed-bg);
+}
+.msg__type--gate {
+  color: var(--st-blocked);
+  background: var(--st-blocked-bg);
+}
+.msg__type--note {
+  color: var(--role-worker);
+  background: var(--role-worker-bg);
+}
+.msg--out .msg__type--note {
+  color: var(--role-coord);
+  background: var(--role-coord-bg);
+}
+.msg__type--reply,
+.msg__type--dispatch {
+  color: var(--role-coord);
+  background: var(--role-coord-bg);
+}
+.msg__dir {
+  padding: 1px 7px;
+  border-radius: var(--r-pill);
+  font-size: 10px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.msg__dir--out {
+  background: var(--role-coord-bg);
+  color: var(--role-coord);
+}
+.msg__dir--in {
+  background: var(--role-worker-bg);
+  color: var(--role-worker);
+}
+.msg__details {
+  margin-top: 6px;
+  font-size: 11.5px;
+}
+.msg__details > summary {
+  cursor: pointer;
+  color: var(--accent);
+  font-weight: 500;
+  user-select: none;
+}
+.msg__tag {
+  padding: 0 7px;
+  border-radius: var(--r-pill);
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-weight: 600;
+}
+.msg__tag--ok {
+  background: var(--st-done-bg);
+  color: var(--st-done);
+}
+.msg__time {
+  margin-left: auto;
+  color: var(--text-3);
+}
+.msg__subject {
+  margin-top: 4px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.msg__body {
+  margin: 4px 0 0;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: var(--text-2);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.msg__meta {
+  margin-top: 4px;
+  font-size: 11px;
+}
+
+/* Dispatch detail key/value grid */
+.kv {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 10px;
+  margin: 2px 0 0;
+  font-size: 11.5px;
+}
+.kv dt {
+  color: var(--text-3);
+}
+.kv dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.msg--open {
+  border-color: var(--st-running);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--st-running) 18%, transparent);
+}
+.msg__tag--ask {
+  background: var(--st-running-bg);
+  color: var(--st-running);
+}
+.msg--escalation.msg--open {
+  border-color: var(--st-failed);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--st-failed) 18%, transparent);
+}
+.msg__tag--esc {
+  background: var(--st-failed-bg);
+  color: var(--st-failed);
+}
+
+
+/* gate decision change */
+
+.callout {
+  margin-bottom: 12px;
+  padding: 12px 14px;
+  border-radius: var(--r-md);
+  border: 1px solid var(--border);
+  background: var(--surface-elevated, var(--surface));
+  box-shadow: var(--shadow-xs);
+  font-size: 12.5px;
+}
+.callout p {
+  margin: 0 0 8px;
+}
+.callout--warn {
+  border-color: color-mix(in srgb, var(--st-failed) 40%, var(--border));
+  background: var(--st-failed-bg);
+  box-shadow: none;
+}
+
+.btn--sm {
+  height: 26px;
+  margin-top: 6px;
+  padding: 0 8px;
+  font-size: 12px;
+}
+
+/* a failed task's reason: the worker's report subject + body */
+.failure {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.failure__label {
+  font-size: 10.5px;
+  font-weight: 650;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--st-failed);
+}
+.failure__subject {
+  color: var(--text);
+}
+.failure__body {
+  display: block;
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text-2);
+  line-height: 1.55;
+}
+.failure .hint {
+  margin: 2px 0 0;
+}
+.attempt__why {
+  margin: 2px 0 0 6px;
+  font-size: 11.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tag {
+  flex: none;
+  padding: 0 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-pill);
+  font-size: 10.5px;
+  color: var(--text-3);
+}
+
+/* "next Dispatch" config group in the task panel */
+.panel-group {
+  margin: 4px 0 12px;
+  padding: 12px 14px 4px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-elevated, var(--surface));
+  box-shadow: var(--shadow-xs);
+}
+.panel-group__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+.panel-group__head .mono {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11.5px;
+}
+.panel-group__title {
+  font-size: 12px;
+  font-weight: 600;
+}
+.panel-group > .hint {
+  display: block;
+  margin: 2px 0 8px;
+}
+
+.side-panel .panel-group {
+  margin: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-elevated, var(--surface));
+  box-shadow: var(--shadow-xs);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.side-panel .panel-group__head {
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.side-panel .panel-group__title {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  color: var(--text);
+}
+.sp-group-title-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.sp-count {
+  padding: 1px 7px;
+  border-radius: var(--r-pill);
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font: 11px var(--font-mono);
+}
+.sp-group-hint {
+  margin: -2px 0 0;
+  line-height: 1.45;
+}
+.sp-group-body {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  min-width: 0;
+}
+.sp-group-body > .panel-field {
+  padding: 8px 0;
+}
+.sp-group-body > .panel-field:first-child {
+  padding-top: 0;
+}
+.sp-group-body > .panel-field:last-child {
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+.sp-kv-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px 12px;
+}
+.sp-kv {
+  min-width: 0;
+}
+.sp-kv--full {
+  grid-column: 1 / -1;
+}
+.sp-kv__val {
+  min-width: 0;
+  font-size: 12.5px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+.sp-code {
+  padding: 6px 9px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  word-break: break-all;
+}
+
+.sp-file-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin: 2px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.sp-file-chip {
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-xs);
+  background: var(--surface-2);
+  font-size: 11px;
+  line-height: 1.4;
+  word-break: break-all;
+}
+.sp-bullet-list {
+  margin: 2px 0 0;
+  padding-left: 16px;
+  font-size: 12px;
+  line-height: 1.55;
+}
+.sp-rel-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.sp-review-task {
+  gap: 8px;
+}
+.sp-review-task__head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+.sp-review-task__head .attempt {
+  flex: 1;
+  min-width: 0;
+}
+.sp-review-round {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding-top: 6px;
+  border-top: 1px dashed var(--border);
+}
+.sp-inline-link {
+  font-size: 11.5px;
+  flex: none;
+  white-space: nowrap;
+}
+
+.side-panel .panel-group .attempt {
+  padding: 8px 10px;
+  border-radius: var(--r-sm);
+  background: var(--surface-2);
+  box-shadow: none;
+}
+.side-panel .panel-group .attempt:hover {
+  border-color: color-mix(in srgb, var(--sp-accent) 45%, var(--border));
+  background: color-mix(in srgb, var(--sp-accent-bg) 32%, var(--surface-2));
+}
+.side-panel .panel-group .msg:not(.msg--out),
+.side-panel .panel-group .stream__item:not(.stream__item--user) {
+  background: var(--surface-2);
+}
+.side-panel .panel-group .wb-stream__bar,
+.side-panel .panel-group .msg-play-hint {
+  margin: 0;
+}
+
+/* worker panel: what the agent was launched with */
+.launch {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 2px 10px;
+  margin: 0 0 4px;
+  font-size: 12.5px;
+}
+.launch dt {
+  color: var(--text-3);
+}
+.launch dd {
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+/* task card: one line on who runs it, or why it failed */
+.gnode__run {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+}
+.gnode__fail {
+  color: var(--st-failed);
+  font-weight: 500;
+}
+.gnode__fail-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* "open in Orca" — icon button on worker cards, full button in panels */
+.jump-btn {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: var(--r-xs);
+  background: var(--surface);
+  color: var(--text-2);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+}
+.jump-btn:hover:not(:disabled) {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+.jump-btn:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.jump-btn--off {
+  opacity: 0.35;
+  /* the click opens the card's panel instead (see JumpToTerminal) */
+  cursor: help;
+}
+.jump-btn--ok {
+  border-color: var(--st-done);
+  color: var(--st-done);
+}
+.jump-btn--fail {
+  border-color: var(--st-failed);
+  color: var(--st-failed);
+}
+/* ---------- message route: sender → receiver ---------- */
+/* two fixed rows — sender, then receiver — so a wrap never strands the
+   direction mid-line */
+.msg__route {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin-top: 4px;
+  font-size: 11px;
+}
+.party {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.party__label {
+  flex: none;
+  min-width: 3.5em;
+  color: var(--text-3);
+}
+.party__btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+  padding: 1px 5px 1px 1px;
+  border: 1px solid transparent;
+  border-radius: var(--r-xs);
+  background: none;
+  color: var(--text-2);
+  font: inherit;
+  cursor: pointer;
+}
+.party__btn:hover:not(.party__btn--static) {
+  border-color: var(--border);
+  background: var(--surface-2);
+}
+.party__btn--static {
+  cursor: default;
+}
+.party__who {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 220px;
+}
+
+/* ---------- worker transcript (worker-read) ---------- */
+.transcript__bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+/* claude.ai conversation log: one warm paper scroll, hairline turns */
+.transcript {
+  margin: 8px 0;
+  padding: 0;
+  list-style: none;
+  max-height: 320px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--surface-elevated, var(--surface));
+}
+.transcript__row {
+  display: flex;
+  gap: 8px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-subtle);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.transcript__row:last-child {
+  border-bottom: none;
+}
+.transcript__role {
+  flex: none;
+  width: 62px;
+  color: var(--text-3);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  letter-spacing: 0.02em;
+}
+.transcript__text {
+  margin: 0;
+  min-width: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+}
+.transcript__row--tool-call .transcript__text,
+.transcript__row--tool-result .transcript__text,
+.transcript__row--line .transcript__text {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-2);
+  max-height: 7.5em;
+  overflow: hidden;
+}
+.transcript__row--user .transcript__text {
+  max-height: 5em;
+  overflow: hidden;
+}
+
+.old-server {
+  margin: 0;
+  padding: 6px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--st-failed-bg);
+  color: var(--st-failed);
+  font-size: 12px;
+}
+
+.jump {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 4px;
+}
+.jump__fail {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: 12px;
+}
+
+/* ---------- agent recommendations (orca-dag skill) ---------- */
+
+/* ★ marks a harness/model that came from the skill's recommendation rather
+   than a pick the user made; accent-colored so it reads as "suggested" */
+.rec-mark {
+  margin-right: 3px;
+  color: var(--accent);
+  font-size: 10px;
+}
+.gnode__model {
+  min-width: 0;
+}
+.rec-note {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text);
+}
+.rec-toggle {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+}
+
+/* ---------- message replay on the canvas ---------- */
+/* threads in the message list: replies hang under the message they answer */
+.msg-thread {
+  list-style: none;
+}
+.msg-thread__hit {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  border-radius: var(--r-md);
+  outline-offset: 2px;
+}
+.msg-thread__hit[role="button"] {
+  cursor: pointer;
+}
+.msg-thread__hit[role="button"]:hover .msg {
+  border-color: var(--accent);
+}
+.msg-thread__hit:focus-visible {
+  outline: 2px solid var(--accent);
+}
+.msg-thread--playing .msg {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent-soft);
+}
+.msg-thread__playing {
+  display: block;
+  margin-top: 3px;
+  color: var(--accent);
+  font-size: 11px;
+  font-weight: 600;
+}
+/* warm thread reply connectors */
+.msg-replies {
+  margin: 0 0 0 16px;
+  padding: 0 0 0 12px;
+  list-style: none;
+  border-left: 2px solid var(--border-strong);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.msg--reply {
+  background: var(--surface-2);
+}
+.msg__reply-mark {
+  color: var(--text-3);
+}
+.msg-play-hint {
+  margin: 0 0 6px;
+}
+
+/* the caption says what's travelling; the canvas shows where.
+   Claude artifact-drawer header paper: warm elevated card. */
+.talk-caption {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 6;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(640px, calc(100% - 120px));
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface-elevated, var(--surface));
+  box-shadow: var(--shadow-lg);
+  font-size: 12px;
+}
+.talk-caption__close {
+  flex: none;
+  margin-left: 2px;
+  padding: 0 4px;
+  border: none;
+  background: none;
+  color: var(--text-3);
+  font: inherit;
+  cursor: pointer;
+}
+.talk-caption__close:hover {
+  color: var(--text);
+}
+.talk-caption--off {
+  border-color: var(--border);
+  color: var(--text-3);
+  box-shadow: var(--shadow-md);
+}
+.talk-caption__step {
+  font-family: var(--font-mono);
+  color: var(--text-3);
+}
+.talk-caption__subject {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  font-weight: 600;
+}
+
+/* the replayed conversation, drawn over the canvas (TalkOverlay) */
+.talk-overlay {
+  z-index: 20;
+}
+.talk {
+  --talk: var(--accent);
+}
+.talk--question {
+  --talk: var(--st-running);
+}
+.talk--worker_done,
+.talk--done {
+  --talk: var(--st-done);
+}
+.talk--escalation,
+.talk--failed {
+  --talk: var(--st-failed);
+}
+.talk--gate {
+  --talk: var(--st-blocked);
+}
+.talk--note {
+  --talk: var(--role-worker);
+}
+.talk--reply,
+.talk--status,
+.talk--dispatch {
+  --talk: var(--role-coord);
+}
+.talk__path {
+  stroke: var(--talk);
+  stroke-width: 2.5;
+  stroke-linecap: round;
+}
+.talk__arrow {
+  fill: var(--talk);
+}
+.talk--past .talk__path,
+.talk--past .talk__arrow {
+  opacity: 0.4;
+}
+.talk--current .talk__path {
+  stroke-width: 3.5;
+  /* in pathLength units (TalkOverlay sets pathLength=1): one dash, one gap,
+     each exactly the hop's length, so long hops draw in like short ones and
+     stay in step with the dot */
+  stroke-dasharray: 1 1;
+  stroke-dashoffset: 1;
+  animation: talk-draw 1.3s linear forwards;
+}
+.talk--current .talk__arrow {
+  opacity: 0;
+  animation: talk-arrive 0.2s ease-out 1.15s forwards;
+}
+.talk__badge circle {
+  fill: var(--surface);
+  stroke: var(--talk);
+  stroke-width: 1.5;
+}
+.talk__badge text {
+  fill: var(--talk);
+  font-family: var(--font-mono);
+  font-size: 10px;
+  font-weight: 700;
+}
+.talk__dot circle {
+  fill: var(--talk);
+  stroke: var(--surface);
+  stroke-width: 2;
+}
+.talk__dot text {
+  fill: var(--talk);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  paint-order: stroke;
+  stroke: var(--bg);
+  stroke-width: 3px;
+}
+@keyframes talk-draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+@keyframes talk-arrive {
+  to {
+    opacity: 1;
+  }
+}
+
+/* cards: everything the thread touches stays lit, the rest steps back */
+.react-flow__node.talk-dim {
+  opacity: 0.3;
+  transition: opacity 0.2s;
+}
+.react-flow__node.talk-node .gnode {
+  box-shadow: 0 0 0 2px var(--accent-soft), 0 0 0 1px var(--accent);
+}
+.react-flow__node.talk-from .gnode {
+  box-shadow: 0 0 0 4px var(--accent-soft), 0 0 0 2px var(--accent);
+}
+.react-flow__node.talk-to .gnode {
+  animation: talk-receive 1.3s ease-out forwards;
+}
+@keyframes talk-receive {
+  0%,
+  85% {
+    box-shadow: 0 0 0 2px var(--accent-soft), 0 0 0 1px var(--accent);
+  }
+  100% {
+    box-shadow: 0 0 0 6px var(--accent-soft), 0 0 0 2px var(--accent);
+  }
+}
+/* the regular edges fade so their arrows don't read as the message's direction */
+.react-flow__edge.edge--talk-dim {
+  opacity: 0.12;
+}
+@media (prefers-reduced-motion: reduce) {
+  .talk--current .talk__path,
+  .talk--current .talk__arrow,
+  .react-flow__node.talk-to .gnode {
+    animation: none;
+    stroke-dashoffset: 0;
+    opacity: 1;
+  }
+}
+
+/* ---------- co: context bar, interaction stream, agents ---------- */
+
+.ctx {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 1;
+}
+.ctx__bar {
+  display: block;
+  flex: 1;
+  height: 6px;
+  border-radius: var(--r-pill);
+  background: var(--surface-3);
+  overflow: hidden;
+}
+.ctx__fill {
+  display: block;
+  height: 100%;
+  border-radius: var(--r-pill);
+  background: var(--accent);
+}
+.ctx__fill--hot {
+  background: var(--st-running);
+}
+.ctx__fill--full {
+  background: var(--st-failed);
+}
+.ctx__pct {
+  flex: none;
+  font-variant-numeric: tabular-nums;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-3);
+}
+.ctx--lg .ctx__bar {
+  height: 8px;
+}
+
+/* ---------- host transcript: claude.ai conversation turns ---------- */
+
+.stream {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  max-height: 480px;
+  overflow: auto;
+}
+.stream__item {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--surface-elevated, var(--surface));
+}
+/* the user's turn: warm linen bubble */
+.stream__item--user {
+  background: var(--surface-2);
+  border: 1px solid var(--border-subtle, var(--border));
+}
+/* the assistant's turn: clean ivory card, comfortable reading measure */
+.stream__item--assistant {
+  line-height: 1.6;
+}
+/* thinking & tool-use: understated warm stone containers */
+.stream__item--thought,
+.stream__item--tool {
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface-2) 65%, var(--surface));
+  border: 1px solid var(--border-subtle, var(--border));
+}
+/* usage / plan / system: same stone, plus a quiet status rail */
+.stream__item--usage,
+.stream__item--plan,
+.stream__item--system {
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface-2) 65%, var(--surface));
+  border: 1px solid var(--border-subtle, var(--border));
+  border-left: 3px solid var(--border-strong);
+}
+.stream__item--usage {
+  border-left-color: var(--st-running);
+}
+.stream__item--plan {
+  border-left-color: var(--st-ready);
+}
+.stream__item--system {
+  border-left-color: var(--st-blocked);
+}
+.stream__head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-3);
+}
+.stream__kind {
+  font-weight: 650;
+  color: var(--text-2);
+}
+.stream__time {
+  margin-left: auto;
+}
+.stream__text {
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text);
+}
+/* collapsible thinking / tool-use: one quiet stone drawer */
+.stream__item details {
+  margin-top: 6px;
+  padding: 7px 10px;
+  border: 1px solid var(--border-subtle, var(--border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--surface-2) 65%, var(--surface));
+}
+.stream__item summary {
+  cursor: pointer;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-2);
+  user-select: none;
+}
+.stream__item summary:hover {
+  color: var(--text);
+}
+.stream__pre {
+  margin: 6px 0 0;
+  padding: 8px 10px;
+  max-height: 160px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  background: var(--bg);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.stream__locs {
+  margin: 4px 0 0;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-3);
+}

@@ -2462,6 +2462,9 @@ const BASE: &str = r#"  /** A row. */
     border?: string;
     heading?: string;
     syntax?: Record<string, string>;
+    base_dir?: string;
+    root_dir?: string;
+    allow_data_images?: boolean;
   }
   export interface TextViewElement extends NativeElement {
     /** Overrides TextView's default URL opening and reports the resolved URL. */

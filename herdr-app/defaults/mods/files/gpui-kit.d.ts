@@ -20752,6 +20752,9 @@ declare module "gpui-base" {
     border?: string;
     heading?: string;
     syntax?: Record<string, string>;
+    base_dir?: string;
+    root_dir?: string;
+    allow_data_images?: boolean;
   }
   export interface TextViewElement extends NativeElement {
     /** Overrides TextView's default URL opening and reports the resolved URL. */
@@ -22315,9 +22318,13 @@ declare module "herdr" {
   /** Reads UTF-8 text (up to 1 MiB), or null if absent. Runs off the UI thread.
    *  `on`: from that machine (a space's `machine`). */
   export function readTextFile(path: string, options?: { on?: string | null }): Promise<string | null>;
+  /** Reads an image (up to 8 MiB) as a `data:<mime>;base64,...` URL, or null if absent. Runs off the UI thread.
+   *  `on`: from that machine (a space's `machine`). */
+  export function readImageDataUrl(path: string, options?: { on?: string | null }): Promise<string | null>;
   /** Writes UTF-8 text only if it still matches expected (null creates a new file).
-   * Rejects on a stale snapshot; existing files are replaced atomically. */
-  export function writeTextFile(path: string, text: string, expected: string | null): Promise<null>;
+   * Rejects on a stale snapshot; existing files are replaced atomically.
+   * `on`: on that machine (a space's `machine`). */
+  export function writeTextFile(path: string, text: string, expected: string | null, options?: { on?: string | null }): Promise<null>;
 
   /** The agents people can start from a menu (entries with `run` in programs.json), most picked
    *  first, and whether each is installed: asked of the shell agents start in (on another machine,
@@ -22610,9 +22617,10 @@ declare module "herdr" {
   } | null;
 
   /** Every theme color by name: background (the terminals'), surface, canvas (behind cards),
-   *  chrome (sidebars and bars), popover, raised, hover, selected, border, input, foreground,
-   *  muted, dim, accent, accent_foreground, solid and solid_foreground (a primary button: ink on
-   *  paper, paper on ink), selection, working, blocked, done, idle, unknown, ansi0..ansi15.
+   *  chrome (sidebars and bars), popover, raised, message (user bubble surface), code_bg, glass,
+   *  hover, selected, border, input, foreground, muted, dim, accent, accent_foreground,
+   *  solid and solid_foreground (a primary button: ink on paper, paper on ink), selection,
+   *  working, blocked, done, idle, unknown, ansi0..ansi15.
    *  Light and dark themes name the same colors, so a mod that uses them follows both. */
   export function theme(): Record<string, string>;
 

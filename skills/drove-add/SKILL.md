@@ -6,7 +6,7 @@ disable-model-invocation: true
 
 # `/drove-add`: Append Tasks to the Current Drove Run
 
-Use `h2 drove add` to hot-plug new tasks into the current Run (recorded by `h2 drove use` / latest `h2 drove plan`):
+Use `h2 drove add` to hot-plug new tasks into the current Run (recorded by `h2 drove use` / latest `h2 drove plan`). Workers remain warm (`idle`) after tasks finish and after `h2 drove complete` until the Coordinator closes or the Run is deleted in Drove Web, so appending tasks to a settled or `done` Run automatically reactivates it and reuses those warm workers:
 
 ## Single Task (Quick Flags)
 

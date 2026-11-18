@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchAiStatus, fetchDaemonEvents, fetchDaemonHealth, testAiConnection } from "../api";
-import { fmtDeepSeekCny, fmtTokens } from "../format";
+import { fmtCost, fmtTokens } from "../format";
 import { useT } from "../i18n";
 import { clockTime, relTime } from "../time";
 import type {
@@ -227,7 +227,30 @@ export function DaemonView({
               <div className="daemon-kv">
                 <div className="panel-field">
                   <span className="panel-field__key">{t("daemon.model")}</span>
-                  <span className="panel-field__val mono">{aiStatus.model}</span>
+                  <span className="panel-field__val mono">{aiStatus.model || t("daemon.paramAuto")}</span>
+                </div>
+                <div className="panel-field">
+                  <span className="panel-field__key">{t("daemon.effort")}</span>
+                  <span className="panel-field__val mono">
+                    {(() => {
+                      const eff = (aiStatus.effort || "low").toLowerCase();
+                      const key = `daemon.effort.${eff}`;
+                      const label = t(key);
+                      return label !== key ? label : eff;
+                    })()}
+                  </span>
+                </div>
+                <div className="panel-field">
+                  <span className="panel-field__key">{t("daemon.context")}</span>
+                  <span className="panel-field__val mono">
+                    {aiStatus.contextWindow ? aiStatus.contextWindow.toUpperCase() : t("daemon.paramAuto")}
+                  </span>
+                </div>
+                <div className="panel-field">
+                  <span className="panel-field__key">{t("daemon.maxTokens")}</span>
+                  <span className="panel-field__val mono">
+                    {aiStatus.maxTokens ? String(aiStatus.maxTokens) : t("daemon.paramAuto")}
+                  </span>
                 </div>
                 <div className="panel-field">
                   <span className="panel-field__key">{t("daemon.endpoint")}</span>
@@ -346,7 +369,7 @@ export function DaemonView({
               </div>
               <div className="panel-field">
                 <span className="panel-field__key">{t("wb.cost")}</span>
-                <span className="panel-field__val mono">{fmtDeepSeekCny(aiUsage.cost)}</span>
+                <span className="panel-field__val mono">{fmtCost(aiUsage.cost)}</span>
               </div>
               <p className="hint">{t("daemon.runUsageHint")}</p>
             </div>
@@ -433,7 +456,7 @@ export function DaemonView({
                           in={ev.tokens.input}(hit={ev.tokens.cacheHit}) out={ev.tokens.output}
                         </span>
                       )}
-                      {ev.cost != null && ev.cost > 0 && <span className="hint mono">{fmtDeepSeekCny(ev.cost)}</span>}
+                      {ev.cost != null && ev.cost > 0 && <span className="hint mono">{fmtCost(ev.cost)}</span>}
                       {ev.runId && !inCurrentRun && <span className="hint mono">{t("daemon.otherRunHint", { id: ev.runId })}</span>}
                       {ev.taskId && inCurrentRun && knownTasks.has(ev.taskId) && (
                         <button type="button" className="link-btn" onClick={() => onOpenTask(ev.taskId!)}>

@@ -306,6 +306,8 @@ test("pane header maximize button breaks out split pane into a standalone tab vi
     svg: element,
     image: element,
     h_flex: element,
+    InputState: { new: () => ({ on() {}, value: () => "", set_value() {}, set_selected_range() {}, focus() {} }) },
+    Input: { new: () => element() },
     panes: () => currentPanes,
     terminals: () => [{ address: "t1", name: "zsh", labels: {} }, { address: "t2", acp: true, name: "codex-news", labels: {} }],
     props: () => currentProps,
@@ -336,10 +338,16 @@ test("pane header maximize button breaks out split pane into a standalone tab vi
 
   const view = new Pane();
   view.init();
-  // Hover a single-pane tab header: no #ph-z button (cannot detach/zoom a lone pane).
+  // Hover a single-pane tab header: no #ph-z button (cannot detach/zoom a lone pane), but shows #ph-view toggle.
   const singleRoot = view.render({});
   singleRoot.calls.on_hover[0](true, { notify() {} });
-  expect(findNodeById(view.render({}), "ph-z-p1")).toBeNull();
+  const hoveredSingle = view.render({});
+  expect(findNodeById(hoveredSingle, "ph-z-p1")).toBeNull();
+  const viewBtn = findNodeById(hoveredSingle, "ph-view-p1");
+  expect(viewBtn).not.toBeNull();
+  viewBtn.calls.on_click[0]({}, { stop_propagation() {} });
+  expect(paneRunCalls).toEqual([["terminal.view", { terminal: "t1", view: "toggle" }]]);
+  paneRunCalls.length = 0;
 
   // Merged / split tab with two panes: shows #ph-z-p2 and clicking it runs pane.detach.
   currentPanes = [
@@ -352,4 +360,141 @@ test("pane header maximize button breaks out split pane into a standalone tab vi
   expect(zoomBtn).not.toBeNull();
   zoomBtn.calls.on_click[0]({}, { stop_propagation() {} });
   expect(paneRunCalls).toEqual([["pane.detach", { pane: "p2" }]]);
+});
+
+test("tabs and pane headers show agent type (ACP / Terminal) and live/paused execution duration", async () => {
+  const paneSource = await readFile(new URL("../defaults/mods/pane/main.js", import.meta.url), "utf8");
+  const collectTexts = (node: any): string[] => {
+    if (!node) return [];
+    const out: string[] = [];
+    for (const ch of node.nodes ?? []) {
+      if (typeof ch === "string") out.push(ch);
+      else out.push(...collectTexts(ch));
+    }
+    return out;
+  };
+  const findById = (node: any, id: string): any => {
+    if (!node) return null;
+    if (node.calls?.id?.[0] === id) return node;
+    for (const ch of node.nodes ?? []) {
+      const hit = findById(ch, id);
+      if (hit) return hit;
+    }
+    return null;
+  };
+
+  let currentLang = "en";
+  let tNow = 10_000_000;
+  setSystemTime(new Date(tNow));
+
+  let currentTabs = [
+    { id: "tb-acp", name: "Codex", active: true, status: "working", working_since: tNow - 65_000 },
+    { id: "tb-cli", name: "Claude", status: "done", work_ms: 12_000, total_work_ms: 45_000 },
+    { id: "tb-mix", name: "Mix", status: "working", working_since: tNow - 5_000 },
+    { id: "tb-sh", name: "Shell" },
+  ];
+  let currentPanes: Array<Record<string, unknown>> = [
+    { pane: "p-acp", tab: "tb-acp", terminal: "a1", acp: true, title: "Codex", status: "working", working_since: tNow - 65_000, program: { name: "Codex", key: "codex", agent: true } },
+    { pane: "p-cli", tab: "tb-cli", terminal: "t1", title: "Claude", status: "done", work_ms: 12_000, total_work_ms: 45_000, program: { name: "Claude Code", key: "claude", agent: true } },
+    { pane: "p-mix-1", tab: "tb-mix", terminal: "a2", acp: true, title: "A2", status: "idle", work_ms: 3_000, program: { name: "Codex", key: "codex", agent: true } },
+    { pane: "p-mix-2", tab: "tb-mix", terminal: "t2", structured: true, title: "T2", status: "working", working_since: tNow - 5_000, program: { name: "Claude Code", key: "claude", agent: true } },
+    { pane: "p-sh", tab: "tb-sh", terminal: "t3", title: "zsh", status: null, program: { name: "zsh", key: "zsh", shell: true, agent: false } },
+  ];
+
+  const tabsCtor = new Function(...Object.keys(values), source.replace(/^import .*;\n/gm, "").replace("export default class Tabs", "return class Tabs"))(
+    ...Object.values({
+      ...values,
+      spaces: () => [{ id: "s1", active: true, tabs: currentTabs }],
+      panes: () => currentPanes,
+      settings: () => ({ zoom: 1, language: currentLang }),
+    }),
+  );
+  let timerCb: ((cx: any) => void) | null = null;
+  const tabsView = new tabsCtor();
+  tabsView.init({}, { timer: { every: (_ms: number, fn: (cx: any) => void) => { timerCb = fn; } } });
+
+  const tree1 = tabsView.render();
+  expect(collectTexts(findById(tree1, "tab-tb-acp"))).toContain("ACP");
+  expect(collectTexts(findById(tree1, "tab-time-tb-acp"))).toContain("1:05");
+  expect(collectTexts(findById(tree1, "tab-tb-cli"))).toContain("CLI");
+  expect(collectTexts(findById(tree1, "tab-time-tb-cli"))).toContain("0:12");
+  // Merged tab with both ACP and Terminal CLI agents shows both badges and active elapsed time.
+  const mixTexts = collectTexts(findById(tree1, "tab-tb-mix"));
+  expect(mixTexts).toContain("ACP");
+  expect(mixTexts).toContain("CLI");
+  expect(collectTexts(findById(tree1, "tab-time-tb-mix"))).toContain("0:05");
+  // Plain shell tab shows neither agent badge nor execution timer.
+  const shTexts = collectTexts(findById(tree1, "tab-tb-sh"));
+  expect(shTexts).not.toContain("ACP");
+  expect(shTexts).not.toContain("CLI");
+  expect(findById(tree1, "tab-time-tb-sh")).toBeNull();
+
+  // Advance clock by 4 seconds and verify working timer ticks live and zh-CN switches CLI -> 终端.
+  tNow += 4_000;
+  setSystemTime(new Date(tNow));
+  let timerNotified = 0;
+  timerCb?.({ notify: () => { timerNotified++; } });
+  expect(timerNotified).toBe(1);
+  currentLang = "zh-CN";
+  const tree2 = tabsView.render();
+  expect(collectTexts(findById(tree2, "tab-time-tb-acp"))).toContain("1:09");
+  expect(collectTexts(findById(tree2, "tab-tb-cli"))).toContain("终端");
+  expect(collectTexts(findById(tree2, "tab-time-tb-cli"))).toContain("0:12");
+  expect(collectTexts(findById(tree2, "tab-tb-mix"))).toContain("终端");
+  expect(collectTexts(findById(tree2, "tab-time-tb-mix"))).toContain("0:09");
+
+  // Pane header tests across ACP lone tab, Terminal agent pane, and plain shell pane.
+  let activePaneProp = { pane: "p-acp", terminal: "a1" };
+  const paneValues: Record<string, unknown> = {
+    View: class {},
+    div: element,
+    svg: element,
+    image: element,
+    h_flex: element,
+    InputState: { new: () => ({ on() {}, value: () => "", set_value() {}, set_selected_range() {}, focus() {} }) },
+    Input: { new: () => element() },
+    panes: () => currentPanes,
+    terminals: () => [],
+    props: () => activePaneProp,
+    run() {},
+    h2() {},
+    openOverlay() {},
+    theme: () => ({}),
+    home: () => "/home/me",
+    layout: () => null,
+    settings: () => ({ language: currentLang }),
+  };
+  const PaneCtor = new Function(
+    ...Object.keys(paneValues),
+    paneSource.replace(/^import .*;\n/gm, "").replace("export default class Pane", "return class Pane"),
+  )(...Object.values(paneValues));
+  const paneView = new PaneCtor();
+  let paneTimerCb: ((cx: any) => void) | null = null;
+  paneView.init({}, { timer: { every: (_ms: number, fn: (cx: any) => void) => { paneTimerCb = fn; } } });
+
+  // Lone ACP pane shows ACP badge and live timer (zh-CN).
+  const acpPaneTree = paneView.render({});
+  expect(collectTexts(findById(acpPaneTree, "ph-type-p-acp"))).toContain("ACP");
+  expect(collectTexts(findById(acpPaneTree, "ph-time-p-acp"))).toContain("1:09");
+
+  let paneNotified = 0;
+  paneTimerCb?.({ notify: () => { paneNotified++; } });
+  expect(paneNotified).toBe(1);
+
+  // Terminal agent pane shows 终端 (zh-CN) / CLI (en) and preserved duration 0:12.
+  activePaneProp = { pane: "p-cli", terminal: "t1" };
+  const cliPaneZh = paneView.render({});
+  expect(collectTexts(findById(cliPaneZh, "ph-type-p-cli"))).toContain("终端");
+  expect(collectTexts(findById(cliPaneZh, "ph-time-p-cli"))).toContain("0:12");
+
+  currentLang = "en";
+  const cliPaneEn = paneView.render({});
+  expect(collectTexts(findById(cliPaneEn, "ph-type-p-cli"))).toContain("CLI");
+  expect(collectTexts(findById(cliPaneEn, "ph-time-p-cli"))).toContain("0:12");
+
+  // Plain shell pane omits both ph-type and ph-time.
+  activePaneProp = { pane: "p-sh", terminal: "t3" };
+  const shPaneTree = paneView.render({});
+  expect(findById(shPaneTree, "ph-type-p-sh")).toBeNull();
+  expect(findById(shPaneTree, "ph-time-p-sh")).toBeNull();
 });

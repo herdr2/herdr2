@@ -91,6 +91,12 @@ trait StatusTarget {
     fn records_mut(&mut self) -> &mut BTreeMap<String, Status>;
     fn inc_turn(&mut self);
     fn set_status_ms(&mut self, ms: Option<u64>);
+    fn working_since(&self) -> Option<u64>;
+    fn set_working_since(&mut self, ms: Option<u64>);
+    fn work_ms(&self) -> Option<u64>;
+    fn set_work_ms(&mut self, ms: Option<u64>);
+    fn total_work_ms(&self) -> u64;
+    fn set_total_work_ms(&mut self, ms: u64);
     fn set_reported(&mut self);
 }
 
@@ -100,6 +106,12 @@ impl StatusTarget for Agent {
     fn records_mut(&mut self) -> &mut BTreeMap<String, Status> { &mut self.records }
     fn inc_turn(&mut self) { self.turn += 1; }
     fn set_status_ms(&mut self, ms: Option<u64>) { self.status_ms = ms; }
+    fn working_since(&self) -> Option<u64> { self.working_since }
+    fn set_working_since(&mut self, ms: Option<u64>) { self.working_since = ms; }
+    fn work_ms(&self) -> Option<u64> { self.work_ms }
+    fn set_work_ms(&mut self, ms: Option<u64>) { self.work_ms = ms; }
+    fn total_work_ms(&self) -> u64 { self.total_work_ms }
+    fn set_total_work_ms(&mut self, ms: u64) { self.total_work_ms = ms; }
     fn set_reported(&mut self) { self.reported = true; }
 }
 
@@ -109,6 +121,12 @@ impl StatusTarget for Terminal {
     fn records_mut(&mut self) -> &mut BTreeMap<String, Status> { &mut self.records }
     fn inc_turn(&mut self) { self.turn += 1; }
     fn set_status_ms(&mut self, ms: Option<u64>) { self.status_ms = ms; }
+    fn working_since(&self) -> Option<u64> { self.working_since }
+    fn set_working_since(&mut self, ms: Option<u64>) { self.working_since = ms; }
+    fn work_ms(&self) -> Option<u64> { self.work_ms }
+    fn set_work_ms(&mut self, ms: Option<u64>) { self.work_ms = ms; }
+    fn total_work_ms(&self) -> u64 { self.total_work_ms }
+    fn set_total_work_ms(&mut self, ms: u64) { self.total_work_ms = ms; }
     fn set_reported(&mut self) { self.reported = true; }
 }
 
@@ -144,8 +162,25 @@ fn word<T: StatusTarget>(a: &T) -> Option<String> {
 }
 
 fn stamp<T: StatusTarget>(a: &mut T, was: Option<String>) {
-    if word(a) != was {
-        a.set_status_ms(Some(crate::runtime::now_ms()));
+    let now_word = word(a);
+    if now_word != was {
+        let now_ms = crate::runtime::now_ms();
+        a.set_status_ms(Some(now_ms));
+        let was_working = was.as_deref() == Some("working");
+        let is_working = now_word.as_deref() == Some("working");
+        if was_working && !is_working {
+            let prev_run = a.work_ms().unwrap_or(0);
+            let new_run = a.working_since().map_or(prev_run, |ws| now_ms.saturating_sub(ws).max(prev_run));
+            let delta = new_run.saturating_sub(prev_run);
+            a.set_work_ms(Some(new_run));
+            a.set_total_work_ms(a.total_work_ms().saturating_add(delta));
+            a.set_working_since(None);
+        } else if !was_working && is_working {
+            let resuming = matches!(was.as_deref(), Some("blocked" | "error")) && a.work_ms().is_some();
+            let prior = if resuming { a.work_ms().unwrap_or(0) } else { 0 };
+            a.set_work_ms(Some(prior));
+            a.set_working_since(Some(now_ms.saturating_sub(prior)));
+        }
     }
 }
 
@@ -285,5 +320,48 @@ mod tests {
         }
         apply(&mut a, &report("clear", "build"));
         assert_eq!(a.records.keys().collect::<Vec<_>>(), ["buildx", "deploy"]);
+    }
+
+    #[test]
+    fn execution_timing_tracks_working_runs_and_pauses_during_blocked() {
+        let mut a = agent();
+        apply(&mut a, &report("starting", ""));
+        assert_eq!(a.working_since, None);
+        assert_eq!(a.work_ms, None);
+        assert_eq!(a.total_work_ms, 0);
+
+        apply(&mut a, &report("working", ""));
+        assert!(a.working_since.is_some());
+        assert_eq!(a.work_ms, Some(0));
+
+        // Simulate 4s of active work before getting blocked for user approval.
+        a.working_since = Some(a.working_since.unwrap().saturating_sub(4_000));
+        apply(&mut a, &report("blocked", ""));
+        assert_eq!(a.working_since, None);
+        let paused_ms = a.work_ms.expect("work_ms saved on pause");
+        assert!(paused_ms >= 4_000);
+        assert_eq!(a.total_work_ms, paused_ms);
+
+        // Resuming from blocked continues the same run without counting blocked wait time.
+        apply(&mut a, &report("working", ""));
+        let resumed_ws = a.working_since.expect("resumed working_since");
+        assert!(resumed_ws <= crate::runtime::now_ms().saturating_sub(paused_ms));
+        a.working_since = Some(resumed_ws.saturating_sub(2_000));
+        apply(&mut a, &report("done", ""));
+        let first_run = a.work_ms.expect("first run finalized");
+        assert!(first_run >= paused_ms + 2_000);
+        assert_eq!(a.total_work_ms, first_run);
+        assert_eq!(a.working_since, None);
+
+        // A second turn starts a fresh work_ms run while accumulating total_work_ms.
+        apply(&mut a, &report("working", ""));
+        assert_eq!(a.work_ms, Some(0));
+        let second_ws = a.working_since.expect("second turn working_since");
+        a.working_since = Some(second_ws.saturating_sub(1_500));
+        apply(&mut a, &report("idle", ""));
+        let second_run = a.work_ms.expect("second run finalized");
+        assert!(second_run >= 1_500);
+        assert_eq!(a.total_work_ms, first_run + second_run);
+        assert_eq!(a.working_since, None);
     }
 }

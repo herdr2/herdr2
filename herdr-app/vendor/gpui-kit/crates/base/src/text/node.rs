@@ -2551,6 +2551,8 @@ impl Paragraph {
                         .object_fit(ObjectFit::Contain)
                         .max_w(relative(1.))
                         .when_some(image.width, |this, width| this.w(width))
+                        // HERDR: respect explicit height on standalone HTML <img> tags.
+                        .when_some(image.height, |this, height| this.h(height))
                         .when_some(image.link.clone(), |this, link| {
                             let link_click_handler = link_click_handler.clone();
                             let aux_link = link.clone();

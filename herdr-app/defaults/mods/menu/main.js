@@ -65,6 +65,11 @@ function items(p, git) {
       const tabPaneCount = inTab ? panes().filter((pane) => pane.tab === paneInfo.tab).length : 0;
       const isStructured = Boolean(paneInfo?.structured);
       return [
+        ...(tg.terminal
+          ? [
+              [tr("Rename", "重命名"), "agent.rename", { terminal: tg.terminal }],
+            ]
+          : []),
         ...(inTab
           ? [
               [tr("Split right", "向右分栏"), "pane.split", { direction: "right", pane: tg.pane }],

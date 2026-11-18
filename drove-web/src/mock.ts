@@ -1526,6 +1526,14 @@ export function mockTrashRun(id: string): Run {
   run.status = "paused";
   run.trashedAt = new Date().toISOString();
   run.updatedAt = run.trashedAt;
+  for (const worker of db.workers) {
+    if (worker.runId === id && (worker.state === "idle" || worker.state === "starting")) {
+      worker.state = "closed";
+      worker.worktree = undefined;
+      worker.currentAttemptId = undefined;
+      worker.lastActiveAt = run.trashedAt;
+    }
+  }
   return clone(run);
 }
 
@@ -2026,9 +2034,10 @@ export function mockAiStatus(): DaemonAiStatus {
     enabled: true,
     configured: true,
     keySource: "file",
-    keyFilePath: "~/.co/ai.key",
-    baseUrl: "https://api.deepseek.com",
-    model: "deepseek-chat",
+    keyFilePath: "~/.local/state/herdr2/drove/secrets/ai.key",
+    baseUrl: "http://127.0.0.1:11434/v1",
+    model: "qwen3-coder",
+    effort: "low",
     circuitOpen: false,
     consecutiveFailures: 0,
     switches: {
@@ -2044,7 +2053,7 @@ export function mockAiStatus(): DaemonAiStatus {
 }
 
 export function mockTestAiConnection(): DaemonAiProbeResult {
-  return { ok: true, latencyMs: 184, model: "deepseek-chat", reply: "pong" };
+  return { ok: true, latencyMs: 184, model: "qwen3-coder", reply: "pong" };
 }
 
 export function mockSaveAiConfig(patch: import("./types").DaemonAiConfigPatch): DaemonAiStatus {
@@ -2054,6 +2063,9 @@ export function mockSaveAiConfig(patch: import("./types").DaemonAiConfigPatch): 
     enabled: patch.enabled ?? base.enabled,
     baseUrl: patch.baseUrl?.trim().replace(/\/+$/, "") || base.baseUrl,
     model: patch.model?.trim() || base.model,
+    effort: patch.effort?.trim() || base.effort,
+    contextWindow: patch.contextWindow !== undefined ? (patch.contextWindow.trim() || undefined) : base.contextWindow,
+    maxTokens: patch.maxTokens !== undefined ? (patch.maxTokens || undefined) : base.maxTokens,
     configured: patch.clearKey ? false : patch.apiKey?.trim() ? true : base.configured,
     keySource: patch.clearKey ? "none" : patch.apiKey?.trim() ? "file" : base.keySource,
     switches: {

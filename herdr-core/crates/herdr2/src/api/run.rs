@@ -15,7 +15,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         None => None,
     };
 
-    let (resolved, initial_prompt, model, mode, explicit_permissions, inject_mcp, system_prompt) = match &template {
+    let (mut resolved, initial_prompt, model, mode, explicit_permissions, inject_mcp, system_prompt) = match &template {
         Some(t) => {
             if p.prompt.is_some() && p.argv.len() > 1 {
                 return Err(RpcError::invalid_params(
@@ -59,6 +59,9 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
     let skip_perms = p.dangerously_skip_permissions
         || default_claude_skip
         || mode.as_deref().is_some_and(crate::permissions::is_bypass_mode_id);
+    if skip_perms {
+        presets::ensure_agy_skip_permissions(&mut resolved.argv);
+    }
     let permissions = if skip_perms {
         crate::permissions::PermissionMode::ApproveAll
     } else {
@@ -189,8 +192,10 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
                         let handle = acp::spawn_actor(core_bg.clone(), id, started);
                         let pid = handle.transport.pid();
                         st.sessions.insert(id, handle);
+                        let inbox_len = st.inboxes.get(&id).map_or(0, std::collections::VecDeque::len);
                         let a = st.reg.agents.get_mut(&id).expect("just created");
                         a.pid = pid;
+                        a.inbox_len = inbox_len;
                         a.acp_session_id = Some(acp_sid);
                         a.can_load_session = can_load;
                         a.config_options = config_options;
@@ -430,7 +435,9 @@ pub(crate) struct DroveSpawnSpec {
     pub labels: BTreeMap<String, String>,
     pub env: BTreeMap<String, String>,
     pub model: Option<String>,
+    pub context: Option<String>,
     pub effort: Option<String>,
+    pub fast: Option<bool>,
     pub access: crate::drove::types::RoleAccessMode,
     pub isolate_secrets: bool,
 }
@@ -455,13 +462,14 @@ pub(crate) async fn spawn_drove_agent(
     let settings = crate::config::load(&core.paths.config)?;
     let resolved = presets::resolve(Some(&req.agent), &[], None, &settings.agents)?;
 
-    let (wrapped_argv, sandbox_mode) = crate::drove::sandbox::wrap_worker_argv(
+    let (mut wrapped_argv, sandbox_mode) = crate::drove::sandbox::wrap_worker_argv(
         &resolved.argv,
         &core.drove.paths,
         &req.cwd,
         req.access,
         req.isolate_secrets,
     );
+    presets::ensure_agy_skip_permissions(&mut wrapped_argv);
 
     let bin_dir = ensure_drove_bin_links(&core.drove.paths.state_dir);
     let base_env = crate::platform::program_env().await;
@@ -473,10 +481,27 @@ pub(crate) async fn spawn_drove_agent(
     }
 
     let mut overrides = BTreeMap::new();
-    if let Some(eff) = &req.effort
+    let is_agy = matches!(req.agent.as_str(), "agy" | "antigravity");
+    let is_cursor = matches!(req.agent.as_str(), "cursor" | "cursor-agent");
+    let cursor_has_effort = is_cursor && req.model.as_deref().is_some_and(crate::acp::model_has_embedded_effort);
+    if !is_agy
+        && !cursor_has_effort
+        && let Some(eff) = &req.effort
         && !eff.trim().is_empty()
     {
         overrides.insert("reasoning_effort".into(), serde_json::Value::String(eff.clone()));
+    }
+    if is_cursor
+        && let Some(ctx) = req.context.as_deref().map(str::trim)
+        && !ctx.is_empty()
+        && !ctx.eq_ignore_ascii_case("auto")
+    {
+        overrides.insert("context".into(), serde_json::Value::String(ctx.to_string()));
+    }
+    if let Some(fast) = req.fast
+        && (fast || req.agent == "codex")
+    {
+        overrides.insert("fast-mode".into(), serde_json::Value::Bool(fast));
     }
 
     let (id, address, env) = {

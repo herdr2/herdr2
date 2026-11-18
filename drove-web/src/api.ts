@@ -1,5 +1,5 @@
 import { isMock, mockAgents, mockAiStatus, mockAssign, mockCoordinatorTranscript, mockDaemonEvents, mockDaemonHealth, mockDeleteRun, mockInspectTask, mockItems, mockListRuns, mockPauseRun, mockRenameRun, mockReorderRuns, mockRestoreRun, mockResumeRun, mockReviewDiff, mockSaveAiConfig, mockSaveProfile, mockSnapshot, mockStop, mockTestAiConnection, mockTrashRun, mockVerifyLog } from "./mock";
-import type { CoordinatorTranscriptSlice, DaemonAiConfigPatch, DaemonAiProbeResult, DaemonAiStatus, DaemonEvent, DaemonEventCategory, DaemonEventStatus, DaemonHealth, Diagnosis, Effort, Item, ModelAvailability, Profile, QuotaCard, ReviewDiffSlice, Run, RunSnapshot, RunSummary, StatsTable, VerifyLogSlice } from "./types";
+import type { CoordinatorTranscriptSlice, DaemonAiConfigPatch, DaemonAiProbeResult, DaemonAiStatus, DaemonEvent, DaemonEventCategory, DaemonEventStatus, DaemonHealth, Diagnosis, Effort, Item, ModelAvailability, Profile, QuotaCard, ReviewDiffSlice, Run, RunSnapshot, RunSummary, StatsTable, Task, VerifyLogSlice } from "./types";
 
 export interface AgentsResponse {
   profile: Profile | null;
@@ -82,9 +82,89 @@ export async function fetchRuns(trash = false): Promise<RunSummary[]> {
   return [];
 }
 
+function stripMachinePrefix(ref: string): string {
+  const idx = ref.indexOf("/");
+  return idx >= 0 ? ref.slice(idx + 1) : ref;
+}
+
+/**
+ * Normalizes task dependency references into canonical `task.id` values so both local runs
+ * (key-based deps in older daemons) and remote-prefixed runs render edges, counts, and lenses uniformly.
+ */
+export function normalizeSnapshot(snap: RunSnapshot): RunSnapshot {
+  const byId = new Map(snap.tasks.map((t) => [t.id, t]));
+  const byKey = new Map(snap.tasks.map((t) => [t.key, t]));
+  const childrenOf = new Map<string, string[]>();
+  for (const t of snap.tasks) {
+    if (!t.expandedFrom) continue;
+    const list = childrenOf.get(t.expandedFrom) ?? [];
+    list.push(t.id);
+    childrenOf.set(t.expandedFrom, list);
+  }
+
+  let changed = false;
+  const tasks = snap.tasks.map((task) => {
+    const resolved: string[] = [];
+    const pushUnique = (id: string) => {
+      if (!resolved.includes(id)) resolved.push(id);
+    };
+    const parentTpl = task.expandedFrom ? byId.get(task.expandedFrom) : undefined;
+    const expandTarget = (target: Task): string[] => {
+      if (
+        target.template
+        && task.expandedFrom !== target.id
+        && (target.expansionState === "done" || target.expansionState === "expanded")
+      ) {
+        const kids = childrenOf.get(target.id);
+        if (kids && kids.length > 0) return kids;
+      }
+      return [target.id];
+    };
+    const parentDepIds = new Set<string>();
+    if (parentTpl) {
+      for (const pd of parentTpl.deps) {
+        const pDirect = byId.get(pd) ?? byKey.get(byKey.has(pd) ? pd : stripMachinePrefix(pd));
+        if (pDirect) parentDepIds.add(pDirect.id);
+      }
+    }
+
+    for (const dep of task.deps) {
+      const direct = byId.get(dep);
+      if (direct) {
+        if (parentTpl && parentDepIds.has(direct.id)) continue;
+        for (const id of expandTarget(direct)) pushUnique(id);
+        continue;
+      }
+      const raw = byKey.has(dep) ? dep : stripMachinePrefix(dep);
+      const byK = byKey.get(raw);
+      if (byK) {
+        if (parentTpl && parentDepIds.has(byK.id)) continue;
+        for (const id of expandTarget(byK)) pushUnique(id);
+        continue;
+      }
+      const foreachChildren = snap.tasks.filter((t) => t.key.startsWith(`${raw}#`));
+      if (foreachChildren.length > 0) {
+        for (const c of foreachChildren) pushUnique(c.id);
+        continue;
+      }
+      pushUnique(dep);
+    }
+    if (parentTpl) {
+      pushUnique(parentTpl.id);
+    }
+    if (resolved.length === task.deps.length && resolved.every((v, i) => v === task.deps[i])) {
+      return task;
+    }
+    changed = true;
+    return { ...task, deps: resolved };
+  });
+
+  return changed ? { ...snap, tasks } : snap;
+}
+
 export async function fetchSnapshot(runId: string): Promise<RunSnapshot> {
-  if (isMock()) return mockSnapshot(runId);
-  return get<RunSnapshot>(`/api/runs/${encodeURIComponent(runId)}`);
+  if (isMock()) return normalizeSnapshot(mockSnapshot(runId));
+  return normalizeSnapshot(await get<RunSnapshot>(`/api/runs/${encodeURIComponent(runId)}`));
 }
 
 function asItemPage(body: unknown, limit: number): ItemPage {

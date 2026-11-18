@@ -20740,6 +20740,19 @@ declare module "gpui-base" {
   /** A controlled switch. No styling. */
   export const Switch: ComponentType;
   /** Rich HTML or Markdown text. CSS in HTML is not supported. */
+  export interface TextViewThemeOptions {
+    dark?: boolean;
+    foreground?: string;
+    muted?: string;
+    link?: string;
+    selection?: string;
+    code_background?: string;
+    inline_code_foreground?: string;
+    inline_code_background?: string;
+    border?: string;
+    heading?: string;
+    syntax?: Record<string, string>;
+  }
   export interface TextViewElement extends NativeElement {
     /** Overrides TextView's default URL opening and reports the resolved URL. */
     on_link_click(handler: (url: string, cx: Context) => void): this;
@@ -20748,7 +20761,7 @@ declare module "gpui-base" {
   }
   export const TextView: {
     html(id: string, html: string): TextViewElement;
-    markdown(id: string, markdown: string): TextViewElement;
+    markdown(id: string, markdown: string, options?: TextViewThemeOptions): TextViewElement;
   };
   /**
    * A tab list. It holds no selection of its own — each `Tab` is told whether
@@ -21522,9 +21535,22 @@ declare module "gpui-base" {
       /** Defaults to false. */
       soft_wrap?: boolean;
       /** Semantic colors: keyword, string, comment, function, type, number,
-       * constant, variable, operator, punctuation, boolean, string.escape.
+       * constant, variable, parameter, property, macro, regexp, tag, attribute,
+       * namespace, operator, punctuation, heading, boolean, string.escape.
        * Values are concrete hex colors; unspecified UI colors follow the theme. */
       syntax?: Record<string, string>;
+      /** Optional editor surface overrides (concrete hex colors). */
+      colors?: {
+        background?: string;
+        foreground?: string;
+        gutter?: string;
+        line_number?: string;
+        active_line?: string;
+        selection?: string;
+        caret?: string;
+        border?: string;
+        invisible?: string;
+      };
     }) => EditorState;
   };
   export const Editor: { new: (state: EditorState) => NativeElement };
@@ -22323,7 +22349,7 @@ declare module "herdr" {
    * New spaces and tabs take focus by default. Boolean focus: false keeps the shown
    * space, selected tab and keyboard focus; background tabs are appended in creation order.
    * With no space shown, a new space is shown even with focus: false.
-   * Panes: pane.split {direction: "right" | "down", pane?}, pane.close {pane?}, pane.zoom {pane?},
+   * Panes: pane.split {direction: "right" | "down", pane?}, pane.close {pane?}, pane.detach {pane?}, pane.zoom {pane?},
    *   pane.focus {pane | terminal}, pane.go {direction}, pane.swap {pane?, direction | target}.
    *   Pane menus get target { pane, terminal }.
    * Terminals: terminal.open {argv?, folder?, place?: "tab" | "right" | "down"}, terminal.kill {terminal},

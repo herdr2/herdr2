@@ -7,6 +7,22 @@ use std::path::{Path, PathBuf};
 
 const MAX_ENTRIES: usize = 2000;
 const MAX_BYTES: usize = 2 << 20;
+const MAX_TOOL_DETAIL_CHARS: usize = 4000;
+
+/// Trims and caps tool-call detail snippets (commands, diffs, or outputs) at a clean char boundary.
+pub(crate) fn cap_tool_detail(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut chars = trimmed.chars();
+    let capped: String = chars.by_ref().take(MAX_TOOL_DETAIL_CHARS).collect();
+    if chars.next().is_some() {
+        Some(format!("{capped}\n…"))
+    } else {
+        Some(capped)
+    }
+}
 
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -35,6 +51,8 @@ pub enum Entry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tool_kind: Option<String>,
         status: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
         ts_ms: u64,
     },
     Plan {
@@ -77,8 +95,12 @@ impl Entry {
         match self {
             Self::User { text, from, .. } => text.len() + from.as_ref().map_or(0, String::len),
             Self::Thought { text, .. } | Self::Assistant { text, .. } | Self::Stderr { text, .. } => text.len(),
-            Self::ToolCall { id, title, tool_kind, status, .. } => {
-                id.len() + title.len() + tool_kind.as_ref().map_or(0, String::len) + status.len()
+            Self::ToolCall { id, title, tool_kind, status, detail, .. } => {
+                id.len()
+                    + title.len()
+                    + tool_kind.as_ref().map_or(0, String::len)
+                    + status.len()
+                    + detail.as_ref().map_or(0, String::len)
             }
             Self::Plan { items, .. } => items.iter().map(String::len).sum(),
             Self::Permission { title, outcome, .. } => title.len() + outcome.len(),
@@ -186,12 +208,13 @@ impl Transcript {
                 }
                 self.entries.push(Entry::Thought { turn, text, ts_ms });
             }
-            Entry::ToolCall { turn, id, title, tool_kind, status, ts_ms } => {
+            Entry::ToolCall { turn, id, title, tool_kind, status, detail, ts_ms } => {
                 if !id.is_empty()
                     && let Some(Entry::ToolCall {
                         title: old_title,
                         tool_kind: old_kind,
                         status: old_status,
+                        detail: old_detail,
                         ts_ms: old_ts,
                         ..
                     }) = self.entries.iter_mut().rev().find(|e| {
@@ -199,7 +222,10 @@ impl Transcript {
                     })
                 {
                     self.bytes = self.bytes.saturating_sub(
-                        old_title.len() + old_kind.as_ref().map_or(0, String::len) + old_status.len(),
+                        old_title.len()
+                            + old_kind.as_ref().map_or(0, String::len)
+                            + old_status.len()
+                            + old_detail.as_ref().map_or(0, String::len),
                     );
                     if !title.is_empty() {
                         *old_title = title;
@@ -210,12 +236,30 @@ impl Transcript {
                     if !status.is_empty() {
                         *old_status = status;
                     }
+                    if let Some(d) = detail {
+                        let d_trim = d.trim();
+                        if !d_trim.is_empty() {
+                            match old_detail {
+                                Some(prev) if !prev.contains(d_trim) => {
+                                    if prev.len() < 4000 {
+                                        prev.push_str("\n\n");
+                                        prev.push_str(d_trim);
+                                    }
+                                }
+                                None => *old_detail = Some(d_trim.to_string()),
+                                _ => {}
+                            }
+                        }
+                    }
                     *old_ts = ts_ms;
-                    self.bytes += old_title.len() + old_kind.as_ref().map_or(0, String::len) + old_status.len();
+                    self.bytes += old_title.len()
+                        + old_kind.as_ref().map_or(0, String::len)
+                        + old_status.len()
+                        + old_detail.as_ref().map_or(0, String::len);
                     self.evict_old();
                     return;
                 }
-                self.entries.push(Entry::ToolCall { turn, id, title, tool_kind, status, ts_ms });
+                self.entries.push(Entry::ToolCall { turn, id, title, tool_kind, status, detail, ts_ms });
             }
             other => {
                 self.entries.push(other);
@@ -342,6 +386,7 @@ mod tests {
             title: "Read foo".into(),
             tool_kind: Some("read".into()),
             status: "pending".into(),
+            detail: None,
             ts_ms: 2,
         });
         t.push(Entry::ToolCall {
@@ -350,6 +395,7 @@ mod tests {
             title: "".into(),
             tool_kind: None,
             status: "completed".into(),
+            detail: Some("fn foo() {}".into()),
             ts_ms: 3,
         });
         t.push(Entry::Assistant { turn: 1, text: "Hello ".into(), ts_ms: 4 });

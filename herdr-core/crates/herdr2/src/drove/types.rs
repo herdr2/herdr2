@@ -302,6 +302,8 @@ pub struct ReviewSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub different_agent: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub criteria: Option<String>,
@@ -407,6 +409,8 @@ pub struct Assign {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worker: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -425,7 +429,13 @@ pub struct CoordinatorInfo {
     pub host_session: String,
     pub generation: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_bound: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notification: Option<Value>,
 }
@@ -645,6 +655,8 @@ pub struct Attempt {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast: Option<bool>,
     pub route_reason: String,
     pub reused: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -729,7 +741,11 @@ pub struct Worker {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<Effort>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast: Option<bool>,
     pub session_key: String,
     /// Native `herdr2` ACP agent address (`a1`, `a2`, ...) owning this worker session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1033,6 +1049,10 @@ pub struct RoleTarget {
     pub model: Option<String>,
     #[serde(default)]
     pub effort: Effort,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fast: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1062,26 +1082,42 @@ pub struct AiSettings {
     pub base_url: String,
     #[serde(default)]
     pub model: String,
+    #[serde(default = "default_ai_effort")]
+    pub effort: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
     #[serde(default = "default_true")]
     pub auto_title: bool,
     #[serde(default = "default_true")]
     pub verify_digest: bool,
+    #[serde(default = "default_true")]
+    pub handover_compact: bool,
     #[serde(default = "default_true")]
     pub task_enrich: bool,
     #[serde(default = "default_question_mode")]
     pub question_mode: String,
     #[serde(default = "default_conflict_policy")]
     pub conflict_policy: String,
+    #[serde(default = "default_loop_detect")]
+    pub loop_detect: String,
 }
 
 fn default_true() -> bool {
     true
+}
+fn default_ai_effort() -> String {
+    "low".into()
 }
 fn default_question_mode() -> String {
     "draft".into()
 }
 fn default_conflict_policy() -> String {
     "warn".into()
+}
+fn default_loop_detect() -> String {
+    "off".into()
 }
 
 impl Default for AiSettings {
@@ -1090,11 +1126,16 @@ impl Default for AiSettings {
             enabled: true,
             base_url: String::new(),
             model: String::new(),
+            effort: default_ai_effort(),
+            context_window: None,
+            max_tokens: None,
             auto_title: true,
             verify_digest: true,
+            handover_compact: true,
             task_enrich: true,
             question_mode: default_question_mode(),
             conflict_policy: default_conflict_policy(),
+            loop_detect: default_loop_detect(),
         }
     }
 }
@@ -1151,6 +1192,8 @@ pub struct ProbedAgent {
     pub efforts: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_effort: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_contexts: BTreeMap<String, Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -1187,6 +1230,11 @@ pub struct DaemonAiStatus {
     pub key_masked: Option<String>,
     pub base_url: String,
     pub model: String,
+    pub effort: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
     #[serde(default)]
     pub available_models: Vec<String>,
     pub circuit_open: bool,
@@ -1208,15 +1256,25 @@ pub struct DroveAiPatch {
     #[serde(default)]
     pub model: Option<String>,
     #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(default)]
+    pub context_window: Option<String>,
+    #[serde(default)]
+    pub max_tokens: Option<u32>,
+    #[serde(default)]
     pub auto_title: Option<bool>,
     #[serde(default)]
     pub verify_digest: Option<bool>,
+    #[serde(default)]
+    pub handover_compact: Option<bool>,
     #[serde(default)]
     pub task_enrich: Option<bool>,
     #[serde(default)]
     pub question_mode: Option<String>,
     #[serde(default)]
     pub conflict_policy: Option<String>,
+    #[serde(default)]
+    pub loop_detect: Option<String>,
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]

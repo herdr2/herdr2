@@ -8,9 +8,14 @@ const tr = (en, zh) => (isZh() ? zh : en);
 // The last agents each machine reported, shown at once while knownAgents() checks again.
 const KNOWN = "new-menu.agents";
 const MODE_KEY = "new-menu.agent-mode";
-const ACP_SKIP_KEY = "new-menu.acp-skip-perms";
-const isAcpSkipPerms = () => shared(ACP_SKIP_KEY) !== false;
-const ACP_PRESETS = new Set(["claude", "codex", "gemini", "opencode", "copilot", "cursor", "kimi", "qwen", "pi", "hermes", "glm", "zcode"]);
+const ACP_PRESETS = new Set(["claude", "codex", "antigravity", "agy", "gemini", "opencode", "copilot", "cursor", "kimi", "qwen", "pi", "hermes", "glm", "zcode", "dsh-tui", "dsh"]);
+const ACP_AGENT_KEY = { antigravity: "agy", "dsh-tui": "dsh" };
+const WIN_SHELLS = () => [
+  { id: "powershell", label: "PowerShell" },
+  { id: "pwsh", label: "PowerShell 7" },
+  { id: "git-bash", label: "Git Bash" },
+  { id: "cmd", label: "CMD" },
+];
 
 function activeFolder(space) {
   if (!space) return null;
@@ -62,16 +67,10 @@ export default class NewMenu extends View {
     closeOverlay(props().overlay);
     if (acpMode && ACP_PRESETS.has(a.key)) {
       const cwd = activeFolder(space);
-      const args = ["run", "--bg"];
-      if (isAcpSkipPerms()) {
-        args.push("--dangerously-skip-permissions");
-      } else if (a.key === "claude") {
-        args.push("--mode", "default");
-      }
-      args.push("--agent", a.key);
-      if (space?.machine) args.push("--on", space.machine);
-      if (cwd) args.push("--cwd", cwd);
-      Promise.resolve(h2(args)).catch(() => {});
+      const preset = ACP_AGENT_KEY[a.key] ?? a.key;
+      const args = { space: space?.id, acp: true, agent: preset };
+      if (cwd) args.folder = cwd;
+      run("tab.new", args);
       return;
     }
     const runArgv = a.key === "cursor" && Array.isArray(a.run) && a.run[0] === "agent"
@@ -83,7 +82,8 @@ export default class NewMenu extends View {
     const t = theme();
     const space = spaces().find(s => s.active);
     const acpMode = (shared(MODE_KEY) ?? "terminal") === "acp";
-    const skipPerms = isAcpSkipPerms();
+    const showWinShells = window()?.platform === "windows" && !space?.machine;
+    const winShells = showWinShells ? WIN_SHELLS() : [];
     const installed = this.agents.filter(a => a.installed);
     const choices = this.failed ? installed : [...installed, ...this.agents.filter(a => !a.installed).slice(0, 2)];
     const modeChip = (id, label, active) => div()
@@ -105,7 +105,7 @@ export default class NewMenu extends View {
         cx.notify();
       })
       .child(label);
-    return v_flex().min_h(0).w_full().h(Math.min(520, 175 + (acpMode ? 28 : 0) + Math.max(1, choices.length + (this.failed ? 1 : 0)) * 31)).bg(t.popover).p(5).text_size(12.8)
+    return v_flex().min_h(0).w_full().h(Math.min(520, 175 + (showWinShells ? 28 : 0) + Math.max(1, choices.length + (this.failed ? 1 : 0)) * 31)).bg(t.popover).p(5).text_size(12.8)
       .id("new-menu").track_focus(this.handle)
       .on_key_down((e) => {
         if (e.modifiers.control || e.modifiers.platform || e.modifiers.alt) return;
@@ -114,6 +114,37 @@ export default class NewMenu extends View {
         this.launchAgent(agent, space, acpMode);
       })
       .child(this.row("terminal", svg("icons/shell.svg").size(14), tr("Terminal", "终端"), () => run("tab.new", { space: space?.id }), shortcut("tab.new")))
+      .when(showWinShells, (el) => el.child(
+        h_flex()
+          .id("nm-win-shells")
+          .px(9)
+          .pt(2)
+          .pb(4)
+          .gap(4)
+          .flex_wrap()
+          .items_center()
+          .children(winShells.map((sh) =>
+            div()
+              .id(`nm-shell-${sh.id}`)
+              .px(6)
+              .py(2)
+              .rounded(5)
+              .bg(t.raised)
+              .border_1()
+              .border_color(t.border)
+              .text_size(10.5)
+              .text_color(t.muted)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.selected).text_color(t.foreground))
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+              .on_click((_e, cx) => {
+                cx.stop_propagation();
+                closeOverlay(props().overlay);
+                run("tab.new", { space: space?.id, shell: sh.id, name: sh.label });
+              })
+              .child(sh.label),
+          )),
+      ))
       .child(
         h_flex()
           .px(9)
@@ -124,38 +155,6 @@ export default class NewMenu extends View {
           .child(div().text_size(11).text_color(t.dim).child(tr("Start an agent", "启动智能体")))
           .child(h_flex().gap(4).items_center().child(modeChip("terminal", tr("CLI", "终端"), !acpMode)).child(modeChip("acp", "ACP", acpMode))),
       )
-      .when(acpMode, (el) => el.child(
-        h_flex()
-          .id("nm-acp-skip")
-          .h(26)
-          .mx(6)
-          .mb(2)
-          .px(8)
-          .gap(7)
-          .items_center()
-          .justify_between()
-          .rounded(6)
-          .bg(skipPerms ? t.selected : t.raised)
-          .border_1()
-          .border_color(skipPerms ? (t.blocked ?? "#f59e0b") : t.border)
-          .cursor_pointer()
-          .hover((s) => s.bg(t.hover))
-          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-          .on_click((_e, cx) => {
-            cx.stop_propagation();
-            setShared(ACP_SKIP_KEY, !skipPerms);
-            cx.notify();
-          })
-          .child(
-            h_flex()
-              .gap(6)
-              .items_center()
-              .min_w(0)
-              .child(svg("frame/settings/shield.svg").size(12).flex_none().text_color(skipPerms ? (t.blocked ?? "#f59e0b") : t.dim))
-              .child(div().truncate().text_size(11.5).text_color(skipPerms ? (t.blocked ?? "#f59e0b") : t.muted).child("dangerously-skip-permissions")),
-          )
-          .child(div().text_size(11).font_semibold().text_color(skipPerms ? (t.blocked ?? "#f59e0b") : t.dim).child(skipPerms ? "✓" : "○")),
-      ))
       .child(v_flex().flex_1().min_h(0).overflow_y_scrollbar()
         .children(choices.map((a, i) => {
           const canAcp = ACP_PRESETS.has(a.key);

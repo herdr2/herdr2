@@ -28,7 +28,14 @@ pub const FEATURES: &[&str] = &[
 ];
 pub const FINISHED_LINES: usize = 1000;
 /// Agent and terminal identity variables stripped unless explicitly passed by a caller.
-pub const IDENTITY_VARS: &[&str] = &["H2_AGENT_ID", "H2_AGENT_SOCKET", "H2_TERMINAL_ID", "H2_TERMINAL_SOCKET"];
+pub const IDENTITY_VARS: &[&str] = &[
+    "H2_AGENT_ID",
+    "H2_AGENT_SOCKET",
+    "H2_TERMINAL_ID",
+    "H2_TERMINAL_SOCKET",
+    "ANTIGRAVITY_SOURCE_METADATA",
+    "AGY_LLM_GATEWAY_PROXY_URL",
+];
 
 mod doc;
 mod pty;
@@ -441,13 +448,28 @@ async fn agent_keep(core: Ctx<'_>, p: KeepParams) -> Result<Public, RpcError> {
 
 async fn agent_label(core: Ctx<'_>, p: LabelParams) -> Result<Public, RpcError> {
     let id = resolve(core, &p.agent)?;
-    {
+    let (trashed, worker_id) = {
         let mut st = core.lock();
         let was = st.reg.agents.get(&id).cloned();
         st.reg.label(id, &labels(&p.labels))?;
         core.save(&st);
         let labels = serde_json::to_value(&st.reg.agents[&id].labels).unwrap_or_default();
         core.emit_from(&mut st, "labels", id, json!({"labels": labels}), was.as_ref());
+        let a = &st.reg.agents[&id];
+        (
+            a.labels.get("herdr.trashed").is_some_and(|s| !s.is_empty()),
+            a.labels.get("drove.worker").cloned(),
+        )
+    };
+    if trashed {
+        let sig = if let Some(wid) = worker_id {
+            crate::drove::pool::PoolSignal::WorkerTrashed { worker_id: wid }
+        } else {
+            crate::drove::pool::PoolSignal::SessionClosed {
+                address: crate::agents::address(id),
+            }
+        };
+        let _ = core.drove.pool_tx.send(sig);
     }
     let result = record(core, id).map(Public);
     core.flush_saved().await?;
@@ -470,10 +492,10 @@ async fn agent_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError
                     .get(&id)
                     .map(|t| crate::pty_transcript::snapshot_from_terminal(t, st.pty_prompts.get(&id)))
             }).flatten();
-            let entries = if let Some(snap) = snap {
-                blocking(move || Ok(crate::pty_transcript::extract_entries(&snap))).await?
+            let (entries, session_meta) = if let Some(snap) = snap {
+                blocking(move || Ok(crate::pty_transcript::extract_transcript(&snap))).await?
             } else {
-                Vec::new()
+                (Vec::new(), None)
             };
             let lines = match p.lines {
                 Some(n) => n,
@@ -488,7 +510,7 @@ async fn agent_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError
             )
             .await?;
             let how = if !entries.is_empty() { "transcript".into() } else { r.how };
-            Ok(ReadResult { text: r.text, complete: r.complete, how, why: r.why, entries })
+            Ok(ReadResult { text: r.text, complete: r.complete, how, why: r.why, entries, session_meta })
         }
         TargetKey::Agent(id) => {
             let timeout = if p.wait { Some(wait_timeout(core, p.timeout)?) } else { None };
@@ -505,7 +527,7 @@ async fn agent_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError
                 Vec::new()
             };
             core.flush_saved().await?;
-            Ok(ReadResult { text, complete, how: how.into(), why: None, entries })
+            Ok(ReadResult { text, complete, how: how.into(), why: None, entries, session_meta: None })
         }
     }
 }
@@ -723,7 +745,7 @@ async fn apply_acp_config(
         .ok()
         .and_then(|c| c.default_permissions)
         .unwrap_or_default();
-    let (session_id, source, transport, is_claude, mode_choices) = {
+    let (session_id, effective_id, source, transport, is_claude, mode_choices, opts_snapshot) = {
         let st = core.lock();
         let a = st.reg.agents.get(&id).ok_or_else(|| {
             RpcError::new("not_found", format!("{} was removed", crate::agents::address(id)), "see `h2 ls --all`")
@@ -735,7 +757,8 @@ async fn apply_acp_config(
         let session_id = a.acp_session_id.clone().ok_or_else(|| {
             RpcError::new("unavailable", format!("{} ACP session is still starting", a.address), "retry shortly")
         })?;
-        let source = a.config_options.iter().find(|o| o.id == config_id).map(|o| o.source.clone());
+        let effective_id = crate::acp::resolve_config_option_id(config_id, &a.config_options);
+        let source = a.config_options.iter().find(|o| o.id == effective_id).map(|o| o.source.clone());
         let is_claude = crate::acp::presets::is_claude_agent(a.agent.as_deref(), &a.argv);
         let mode_choices = a
             .config_options
@@ -748,23 +771,44 @@ async fn apply_acp_config(
             .get(&id)
             .map(|h| h.transport.clone())
             .ok_or_else(|| RpcError::new("unavailable", format!("{} has no active ACP transport", a.address), ""))?;
-        (session_id, source, transport, is_claude, mode_choices)
+        (session_id, effective_id, source, transport, is_claude, mode_choices, a.config_options.clone())
     };
 
-    let val = if config_id == "mode"
+    let (val, split_effort) = if effective_id == "mode"
         && let Some(raw) = val.as_str()
     {
-        serde_json::Value::String(crate::acp::normalize_mode_value(raw, is_claude, &mode_choices))
+        (serde_json::Value::String(crate::acp::normalize_mode_value(raw, is_claude, &mode_choices)), None)
+    } else if effective_id == "model"
+        && let Some(raw) = val.as_str()
+    {
+        let (wire_model, effort) = crate::acp::split_model_effort_for_options(raw, &opts_snapshot);
+        (serde_json::Value::String(wire_model), effort)
     } else {
-        val
+        (val, None)
     };
-    let wants_bypass = config_id == "mode" && val.as_str().is_some_and(crate::permissions::is_bypass_mode_id);
+    let wants_bypass = effective_id == "mode" && val.as_str().is_some_and(crate::permissions::is_bypass_mode_id);
 
-    let fresh = match crate::acp::apply_config_option(&transport, &session_id, config_id, &val, source.as_deref()).await {
+    let mut fresh = match crate::acp::apply_config_option(&transport, &session_id, &effective_id, &val, source.as_deref()).await {
         Ok(opts) => opts,
         Err(_) if wants_bypass => None,
         Err(e) => return Err(e),
     };
+
+    let mut applied_effort: Option<(String, serde_json::Value)> = None;
+    if let Some(eff) = split_effort {
+        let base_opts = fresh.as_deref().unwrap_or(&opts_snapshot);
+        let eff_id = crate::acp::resolve_config_option_id("reasoning_effort", base_opts);
+        let eff_src = base_opts.iter().find(|o| o.id == eff_id).map(|o| o.source.clone());
+        let eff_val = serde_json::json!(eff);
+        if let Ok(eff_fresh) =
+            crate::acp::apply_config_option(&transport, &session_id, &eff_id, &eff_val, eff_src.as_deref()).await
+        {
+            if let Some(opts) = eff_fresh {
+                fresh = Some(opts);
+            }
+            applied_effort = Some((eff_id, eff_val));
+        }
+    }
 
     let mut st = core.lock();
     let a = st.reg.agents.get_mut(&id).ok_or_else(|| {
@@ -773,14 +817,20 @@ async fn apply_acp_config(
     if !a.is_live() {
         return Err(RpcError::new("finished", format!("{} has finished", a.address), ""));
     }
-    a.config_overrides.insert(config_id.to_owned(), val.clone());
+    a.config_overrides.insert(effective_id.clone(), val.clone());
+    if let Some((ref eff_id, ref eff_val)) = applied_effort {
+        a.config_overrides.insert(eff_id.clone(), eff_val.clone());
+    }
     if let Some(opts) = fresh {
         a.config_options = opts;
     } else {
-        crate::acp::patch_config_value(&mut a.config_options, config_id, &val);
+        crate::acp::patch_config_value(&mut a.config_options, &effective_id, &val);
+        if let Some((ref eff_id, ref eff_val)) = applied_effort {
+            crate::acp::patch_config_value(&mut a.config_options, eff_id, eff_val);
+        }
     }
     crate::acp::sync_config_to_agent(a);
-    if config_id == "mode"
+    if effective_id == "mode"
         && let Some(m) = val.as_str()
     {
         if crate::permissions::is_bypass_mode_id(m) {

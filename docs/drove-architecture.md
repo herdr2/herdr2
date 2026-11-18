@@ -17,7 +17,8 @@ All orchestration runs inside the existing `herdr2` daemon (`DroveRuntime`):
 - **Worker Pool & Bottom-Left Agents Tree (`pool.rs`, `api/run.rs`)**:
   - Every Drove worker spawns directly via `Core` as a headless ACP `a*` sub-agent (`name: None`, `notify: false`, `inject_mcp: false`, `dangerously_skip_permissions: true`, `parent` = coordinator `t*` or `a*`).
   - Live display text uses `a.title` + `labels["drove.display"]` (`"<role> · <task_key>"` while busy, `"<role> · idle"` when warm idle) so the bottom-left **Agents** tree in `herdr-app` displays worker teams natively without running into `Agent.name` uniqueness/charset rules.
-  - `Core` -> `DroveRuntime` lifecycle events flow lock-free over `mpsc::UnboundedSender<PoolSignal>`, preventing lock-order deadlocks and keeping external `h2 kill <a*>` synchronized with Drove worker/attempt recovery.
+  - Completed author, worktree, and reviewer workers stay `idle` (and Git worktrees are merged and reset clean) across task completion and `h2 drove complete` for warm reuse via `h2 drove add`. Workers are closed only when the Coordinator session exits/is trashed, the user deletes/trashes the Run in Drove Web, or explicitly stopped.
+  - `Core` -> `DroveRuntime` lifecycle events flow lock-free over `mpsc::UnboundedSender<PoolSignal>`, preventing lock-order deadlocks and keeping external `h2 kill <a*>` and coordinator close/trash hooks synchronized with Drove worker/attempt lifecycle.
 - **Process Sandboxing (`sandbox.rs`)**:
   - On Linux when `bwrap` user namespaces are available, worker launches bind `<state>/drove` read-only and shadow `<state>/drove/secrets` with `--tmpfs` (plus `--ro-bind <cwd>` for `readonly` roles) so workers cannot read `coordinator.token` or `ai.key`.
 

@@ -191,10 +191,13 @@ export interface DaemonEvent {
 export interface DaemonAiStatus {
   enabled: boolean;
   configured: boolean;
-  keySource: "env:CO_DEEPSEEK_API_KEY" | "env:DEEPSEEK_API_KEY" | "file" | "none";
+  keySource: string;
   keyFilePath: string;
   baseUrl: string;
   model: string;
+  effort?: string;
+  contextWindow?: string;
+  maxTokens?: number;
   circuitOpen: boolean;
   cooldownUntil?: string;
   consecutiveFailures: number;
@@ -226,6 +229,9 @@ export interface DaemonAiConfigPatch {
   enabled?: boolean;
   baseUrl?: string;
   model?: string;
+  effort?: string;
+  contextWindow?: string;
+  maxTokens?: number;
   apiKey?: string;
   clearKey?: boolean;
   verifyDigest?: boolean;
@@ -263,6 +269,8 @@ export interface Run {
     host: string;
     hostSession: string;
     generation: number;
+    agent?: string;
+    model?: string;
     hostPid?: number;
     notification?: { id: string; threadId: string; codexHome?: string; lastSeq: number; error?: string };
   };
@@ -328,7 +336,7 @@ export interface Task {
   foreachFrom?: ForeachFrom;
   /** Virtual barrier node expanded at runtime from `foreachFrom`. */
   template?: boolean;
-  expansionState?: "pending" | "expanded";
+  expansionState?: "pending" | "expanded" | "done";
   expandedFrom?: string;
   review?: ReviewSpec;
   reviewState?: ReviewState;
@@ -601,6 +609,8 @@ export interface HostTranscriptItem {
   index: number;
   kind: "user" | "assistant" | "thought" | "tool";
   text: string;
+  title?: string;
+  detail?: string;
   status?: string;
   ts?: string;
 }
@@ -608,6 +618,7 @@ export interface HostTranscriptItem {
 export interface CoordinatorTranscriptSlice {
   available: boolean;
   host: string;
+  agent?: string;
   hostSession: string;
   match?: "session-id" | "run-id" | "cwd-and-time";
   sourceFile?: string;

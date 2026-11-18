@@ -1,7 +1,7 @@
-import { fmtCost, fmtMs, fmtTokens, statsSuccess } from "../format";
+import { agentModel, fmtCost, fmtMs, fmtTokens, statsSuccess } from "../format";
 import { useT } from "../i18n";
 import { BUILT_IN_ROLE_IDS, resolveRoleMeta, roleDisplayName } from "../roles";
-import type { ModelAvailability, Profile, QuotaCard, QuotaWindow, StatsTable } from "../types";
+import type { ModelAvailability, Profile, QuotaCard, QuotaWindow, Run, StatsTable } from "../types";
 import { Estimate } from "./Estimate";
 
 function formatPercent(remaining: number): string {
@@ -132,9 +132,10 @@ function QuotaOverview({
   );
 }
 
-function RoleRoutingMatrix({ profile }: { profile: Profile | null }) {
+function RoleRoutingMatrix({ profile, run }: { profile: Profile | null; run?: Run | null }) {
   const { t } = useT();
   const roleIds = [...new Set<string>([...BUILT_IN_ROLE_IDS, ...Object.keys(profile?.roles ?? {})])];
+  const coordAgentModel = run ? agentModel(run.coordinator.agent, run.coordinator.model, "") : "";
   return (
     <section className="agents-roles" style={{ marginBottom: 24 }}>
       <h2 style={{ marginBottom: 6 }}>{t("agents.rolesTitle")}</h2>
@@ -157,7 +158,10 @@ function RoleRoutingMatrix({ profile }: { profile: Profile | null }) {
             </td>
             <td><span className="access-pill">Host Singleton</span></td>
             <td className="mono">—</td>
-            <td>{t("agents.architectRow")}</td>
+            <td>
+              {coordAgentModel && <div className="mono" style={{ fontSize: 12 }}>{coordAgentModel}</div>}
+              <div className={coordAgentModel ? "hint" : undefined}>{t("agents.architectRow")}</div>
+            </td>
             <td className="hint">planning · user Q&A · arbitration</td>
           </tr>
           {roleIds.map((id) => {
@@ -189,6 +193,7 @@ function RoleRoutingMatrix({ profile }: { profile: Profile | null }) {
 
 export function AgentsView({
   profile,
+  run,
   stats,
   magpieEnabled = false,
   quotas = [],
@@ -197,6 +202,7 @@ export function AgentsView({
   onRefresh,
 }: {
   profile: Profile | null;
+  run?: Run | null;
   stats: StatsTable;
   availability?: Record<string, ModelAvailability>;
   magpieEnabled?: boolean;
@@ -240,7 +246,7 @@ export function AgentsView({
       </div>
 
       <QuotaOverview quotas={quotas} quotaError={quotaError} magpieEnabled={magpieEnabled} />
-      <RoleRoutingMatrix profile={profile} />
+      <RoleRoutingMatrix profile={profile} run={run} />
 
       <h2>{t("agents.stats")}</h2>
       {rows.length === 0 ? (

@@ -14,9 +14,11 @@
 //! of the same generation is offered (also applied after an app update), unless
 //! a package manager owns it. Within a generation a newer core only adds.
 
+#![allow(dead_code)]
+
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Condvar, Mutex};
 use std::time::Duration;
 
@@ -70,14 +72,14 @@ fn target() -> String {
 }
 
 fn releases() -> String {
-    std::env::var("HERDR2_RELEASES_URL").unwrap_or_else(|_| "https://releases.herdr.dev".into())
+    std::env::var("HERDR2_RELEASES_URL").unwrap_or_default()
 }
 
-/// The version downloaded and waiting for a restart.
+/// Self-updates are disabled: always reports None.
 static READY: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn ready() -> Option<String> {
-    READY.lock().unwrap().clone()
+    None
 }
 
 /// The core the app runs, from its `server.status`, and a newer release waiting.
@@ -125,33 +127,27 @@ fn strip_core_prefix(v: &str) -> &str {
 }
 
 fn checks_app() -> Option<PathBuf> {
-    root().filter(|_| std::env::var_os("HERDR2_RELEASES_URL").is_some())
+    None
 }
 
-/// Only checks updates when pointed at a custom HERDR2_RELEASES_URL (never polls upstream herdr.dev).
+/// Self-updates from upstream Herdr are disabled.
 fn checks_core() -> bool {
-    std::env::var_os("HERDR2_RELEASES_URL").is_some()
+    false
 }
 
-/// For the settings screen: both programs, what's waiting, when we last looked.
+/// For the settings screen / mods: reports current versions without update prompts.
 pub fn status() -> serde_json::Value {
     serde_json::json!({
-        "app": { "version": env!("CARGO_PKG_VERSION"), "ready": ready(), "updates": checks_app().is_some() },
-        "notes": crate::update_notes::notes(ready().as_deref()),
+        "app": { "version": env!("CARGO_PKG_VERSION"), "ready": serde_json::Value::Null, "updates": false },
+        "notes": serde_json::Value::Array(Vec::new()),
         "core": core(),
-        "checked": *CHECKED.lock().unwrap(),
-        "checks": RUNNING.load(Ordering::Relaxed),
-        "checking": CHECKING.load(Ordering::Relaxed),
+        "checked": serde_json::Value::Null,
+        "checks": false,
+        "checking": false,
     })
 }
 
-pub fn check_now() {
-    if RUNNING.load(Ordering::Relaxed) {
-        CHECKING.store(true, Ordering::Relaxed);
-    }
-    *WAKE.0.lock().unwrap() = true;
-    WAKE.1.notify_all();
-}
+pub fn check_now() {}
 
 fn sleep(d: Duration) {
     let woken = WAKE.0.lock().unwrap();
@@ -159,49 +155,8 @@ fn sleep(d: Duration) {
     *woken = false;
 }
 
-/// Starts checking in the background: the app if it's an installed release, the core too.
-pub fn start() {
-    let app = checks_app();
-    let core = checks_core();
-    if app.is_none() && !core {
-        tracing::info!("a build from source: no updates");
-        return;
-    }
-    RUNNING.store(true, Ordering::Relaxed);
-    CHECKING.store(true, Ordering::Relaxed);
-    std::thread::spawn(move || {
-        sleep(Duration::from_secs(10));
-        loop {
-            CHECKING.store(true, Ordering::Relaxed);
-            let mut wait = EVERY;
-            let mut succeeded = true;
-            if let Some(root) = &app {
-                match check(root) {
-                    Ok(found) => {
-                        if found.is_some() {
-                            *READY.lock().unwrap() = found;
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("update check: {e}");
-                        crate::telemetry::count("app_update_failed");
-                        wait = RETRY;
-                        succeeded = false;
-                    }
-                }
-            }
-            if core && let Err(e) = check_core() {
-                tracing::warn!("core update check: {e}");
-                wait = RETRY;
-                succeeded = false;
-            }
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-            *CHECKED.lock().unwrap() = checked_at(succeeded, now);
-            CHECKING.store(false, Ordering::Relaxed);
-            sleep(wait);
-        }
-    });
-}
+/// Self-updates from upstream Herdr are disabled.
+pub fn start() {}
 
 fn checked_at(succeeded: bool, now: u64) -> Option<u64> {
     succeeded.then_some(now)
@@ -238,33 +193,8 @@ fn after_update_target<'a>(have: &str, latest: Option<&'a CoreRelease>, generati
     })
 }
 
-/// `hc update` (terminals keep running; the app reconnects when the core restarts).
-pub fn update_core() {
-    {
-        let mut c = CORE.lock().unwrap();
-        if c.updating || c.managed.is_some() {
-            return;
-        }
-        c.updating = true;
-        c.error = None;
-    }
-    std::thread::spawn(|| {
-        let result = crate::core_bin::update();
-        let mut c = CORE.lock().unwrap();
-        c.updating = false;
-        match result {
-            Ok(now) => {
-                c.version = Some(strip_core_prefix(&now).to_owned());
-                c.ready = None;
-                crate::telemetry::count("core_update_ok");
-            }
-            Err(e) => {
-                c.error = Some(e);
-                crate::telemetry::count("core_update_failed");
-            }
-        }
-    });
-}
+/// Core auto-updates are disabled.
+pub fn update_core() {}
 
 /// Downloads the latest release if it's newer. Ok(Some): a version is ready.
 fn check(root: &Path) -> Result<Option<String>, String> {
@@ -461,39 +391,14 @@ pub fn leave_install_folder() {
     }
 }
 
-/// Recover a staged hotfix even when the previous window never quit cleanly.
-/// The inherited expected version allows only one automatic relaunch.
+/// Self-updates are disabled: startup never swaps binaries.
 pub fn apply_on_startup() -> bool {
-    let expected = std::env::var("HERDR2_APP_UPDATE_EXPECTED").ok();
-    if let Some(expected) = &expected {
-        // SAFETY: startup runs before any app threads. Do not leak the guard
-        // into the core's environment and every terminal it later starts.
-        unsafe { std::env::remove_var("HERDR2_APP_UPDATE_EXPECTED") };
-        if expected != env!("CARGO_PKG_VERSION") {
-            tracing::warn!("update: relaunched as {}, expected {expected}; not retrying", env!("CARGO_PKG_VERSION"));
-        }
-        return false;
-    }
-    let Some(root) = checks_app() else { return false };
-    let staged = staged_version(&root);
-    let Some(version) = startup_target(env!("CARGO_PKG_VERSION"), staged.as_deref(), expected.as_deref()) else { return false };
-    if swap(&root).is_err() {
-        return false;
-    }
-    relaunch_expected(Some(version))
+    false
 }
 
-/// Puts the downloaded version in place of this one. The running app keeps
-/// its files open, so it can go on until it quits. Ok(false) means nothing is ready.
-/// Windows lets a running program's folder be renamed, not deleted: the old
-/// one goes on the next start (`after_update`).
+/// Self-updates are disabled: nothing is applied.
 pub fn apply() -> std::io::Result<bool> {
-    let Some(root) = root() else { return Ok(false) };
-    let staged = staged_version(&root);
-    if ready().as_deref() != staged.as_deref() || !staged.as_deref().is_some_and(|version| newer(version, env!("CARGO_PKG_VERSION"))) {
-        return Ok(false);
-    }
-    swap(&root).map(|()| true)
+    Ok(false)
 }
 
 fn swap(root: &Path) -> std::io::Result<()> {
@@ -588,42 +493,8 @@ fn marker() -> PathBuf {
     crate::mods::app_dir().join(".updated")
 }
 
-/// The first start after an app update brings the core to the latest release
-/// of this app's generation (`hc update --version`, terminals kept). If the
-/// release check fails or offers another generation, keep the minimum pin.
-/// Cores before 0.1.5 lack `--version`: they keep their same-generation update
-/// path. A core a package manager owns is left alone.
-pub fn after_update(connected: std::sync::Arc<crate::hc::Core>) {
-    if std::fs::remove_file(marker()).is_err() {
-        return;
-    }
-    std::thread::spawn(move || {
-        if after_update_managed(connected.call("server.status", serde_json::json!({})).map_err(|e| e.to_string())) {
-            return;
-        }
-        let have = crate::core_bin::version(&crate::core_bin::path()).unwrap_or_default();
-        CORE.lock().unwrap().updating = true;
-        let latest = latest_core().map_err(|e| tracing::warn!("core release check after app update: {e}")).ok();
-        let target = after_update_target(strip_core_prefix(&have), latest.as_ref(), crate::hc::GENERATION, crate::hc::core_min());
-        let result = crate::core_bin::update_to(target);
-        let mut core = CORE.lock().unwrap();
-        core.updating = false;
-        match result {
-            Ok(now) => {
-                if let Some(root) = root() {
-                    let _ = std::fs::remove_dir_all(beside(&root, ".old"));
-                }
-                tracing::info!("herdr2 core is {now}");
-                core.version = Some(strip_core_prefix(&now).to_owned());
-                core.error = None;
-            }
-            Err(e) => {
-                tracing::warn!("herdr2 core update: {e}");
-                core.error = Some(e);
-            }
-        }
-    });
-}
+/// Post-update core auto-upgrade is disabled.
+pub fn after_update(_connected: std::sync::Arc<crate::hc::Core>) {}
 
 fn after_update_managed(status: Result<serde_json::Value, String>) -> bool {
     match status {

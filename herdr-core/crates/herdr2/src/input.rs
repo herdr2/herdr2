@@ -91,18 +91,43 @@ impl Core {
                 ));
             }
 
-            let session = st
-                .sessions
-                .get(&id)
-                .ok_or_else(|| {
-                    RpcError::new("unavailable", format!("{} has no active ACP session", a.address), "")
-                })?
-                .clone_cmd();
             let was_working = working(a);
             let turn = a.turn;
+            let agent_addr = a.address.clone();
             let queued_before = st.inboxes.get(&id).map_or(0, std::collections::VecDeque::len);
             let after_turn = target_after_turn(turn, was_working, queued_before, steer);
             let prompt = QueuedPrompt { text: text.to_string(), from: from.map(String::from) };
+
+            let Some(session) = st.sessions.get(&id).map(SessionSender::clone_cmd) else {
+                if st.recovering.contains(&id) {
+                    let q = st.inboxes.entry(id).or_default();
+                    if steer {
+                        q.push_front(prompt);
+                    } else {
+                        q.push_back(prompt);
+                    }
+                    let len = q.len();
+                    let status_payload = if let Some(agent) = st.reg.agents.get_mut(&id) {
+                        agent.inbox_len = len;
+                        Some(serde_json::json!({
+                            "status": agent.status,
+                            "records": agent.records,
+                            "reported": agent.reported,
+                            "pending_permission": agent.pending_permission,
+                            "inbox_len": len,
+                        }))
+                    } else {
+                        None
+                    };
+                    if let Some(payload) = status_payload {
+                        self.emit(&mut st, "status", id, payload);
+                    }
+                    self.save(&st);
+                    self.changed.notify_waiters();
+                    return Ok(Sent { status: word, turn, started: Some(false), after_turn, inbox_len: len });
+                }
+                return Err(RpcError::new("unavailable", format!("{agent_addr} has no active ACP session"), ""));
+            };
 
             let inbox_len = if steer {
                 let _ = session.send(SessionCommand::Steer(prompt));
@@ -187,5 +212,74 @@ mod tests {
     fn formats_inter_agent_prompts() {
         assert_eq!(format_prompt("hi", None), "hi");
         assert_eq!(format_prompt("hi", Some("a1")), "<h2 from=\"a1\">\nhi\n</h2>");
+    }
+
+    #[tokio::test]
+    async fn queues_prompts_while_acp_session_is_starting() {
+        let dir = std::env::temp_dir().join(format!("h2-input-queue-starting-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let paths = crate::paths::Paths {
+            socket: dir.join("core.sock"),
+            holder_socket: dir.join("core.holder.sock"),
+            state: dir.join("state"),
+            config: dir.join("config.toml"),
+        };
+        paths.create_dirs().unwrap();
+        let core = Core::start(
+            paths,
+            crate::api::CoreInfo {
+                id: "test-id".into(),
+                name: "test".into(),
+            },
+        )
+        .unwrap();
+        let id = {
+            let mut st = core.lock();
+            let id = st
+                .reg
+                .create(
+                    crate::agents::NewAgent {
+                        template: None,
+                        die_with_parent: false,
+                        parent: None,
+                        notify: true,
+                        rm: false,
+                        keep: false,
+                        name: None,
+                        labels: Default::default(),
+                        argv: vec!["agy".into(), "acp".into()],
+                        cwd: dir.display().to_string(),
+                        agent: Some("agy".into()),
+                        system_prompt: None,
+                        model: None,
+                        mode: None,
+                        inject_mcp: false,
+                        permission_mode: crate::permissions::PermissionMode::ApproveAll,
+                    },
+                    crate::runtime::now_ms(),
+                )
+                .unwrap();
+            st.recovering.insert(id);
+            id
+        };
+
+        let sent = core.send(id, "first queued", false, None, None).await.unwrap();
+        assert_eq!(sent.inbox_len, 1);
+        assert_eq!(sent.started, Some(false));
+        assert_eq!(sent.after_turn, 0);
+
+        let sent2 = core.send(id, "second queued", false, None, Some("a9")).await.unwrap();
+        assert_eq!(sent2.inbox_len, 2);
+        assert_eq!(sent2.after_turn, 1);
+
+        {
+            let st = core.lock();
+            let q = st.inboxes.get(&id).unwrap();
+            assert_eq!(q.len(), 2);
+            assert_eq!(q[0].text, "first queued");
+            assert_eq!(q[1].text, "second queued");
+            assert_eq!(st.reg.agents.get(&id).unwrap().inbox_len, 2);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

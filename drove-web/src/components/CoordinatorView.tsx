@@ -1,7 +1,7 @@
 import { useMemo, useState, type CSSProperties } from "react";
 import { fmtCost, fmtTokens, jsonPreview, snapshotEstimated } from "../format";
 import { useT } from "../i18n";
-import { COORD_ID, allMessages, coordinatorHostLabel } from "../relate";
+import { COORD_ID, allMessages, coordinatorAgentModelLine, coordinatorHostLabel } from "../relate";
 import { parseReviewerNodeId } from "../review";
 import { clockTime, relTime } from "../time";
 import type { Run, RunSnapshot } from "../types";
@@ -99,6 +99,7 @@ export function CoordinatorView({
   }
 
   const run = snap.run;
+  const coordModel = coordinatorAgentModelLine(run);
   const est = snapshotEstimated(snap.attempts);
   const tokenRatio = run.budget?.tokens ? snap.stats.tokens / run.budget.tokens : null;
   const costRatio = run.budget?.cost ? snap.stats.cost / run.budget.cost : null;
@@ -122,7 +123,7 @@ export function CoordinatorView({
   }
 
   const sections: { key: CoordSection; label: string; count?: string | number; hint: string }[] = [
-    { key: "host", label: t("wb.coordHost"), hint: `${coordinatorHostLabel(run)} · ${run.coordinator.hostSession}` },
+    { key: "host", label: t("wb.coordHost"), hint: `${coordModel ? `${coordModel} · ` : ""}${coordinatorHostLabel(run)} · ${run.coordinator.hostSession}` },
     { key: "messages", label: t("wb.coordMessages"), count: msgs.length, hint: t("wb.coordMessagesHint") },
     { key: "stalls", label: t("wb.coordStalls"), count: stalls.length + unhandledMsgs.length, hint: t("wb.coordStallsHint") },
     { key: "goal", label: t("wb.coordGoal"), hint: run.finalization ? t(`final.${run.finalization.state}`) : run.status },
@@ -288,6 +289,14 @@ export function CoordinatorView({
             <p className="wb-prose">{run.objective}</p>
             <div className="wb-kv-grid">
               <div className="panel-field">
+                <span className="panel-field__key">{t("panel.agent")}</span>
+                <div className="panel-field__val mono">{run.coordinator.agent || "—"}</div>
+              </div>
+              <div className="panel-field">
+                <span className="panel-field__key">{t("panel.model")}</span>
+                <div className="panel-field__val mono">{run.coordinator.model || "—"}</div>
+              </div>
+              <div className="panel-field">
                 <span className="panel-field__key">{t("panel.host")}</span>
                 <div className="panel-field__val">{coordinatorHostLabel(run)}</div>
               </div>
@@ -392,7 +401,7 @@ export function CoordinatorView({
         <WorkbenchHeader
           badge={<span className="role-badge role-badge--coord">{t("role.coordinator")}</span>}
           title={t("wb.coordTitle")}
-          subtitle={`${coordinatorHostLabel(run)} · gen ${run.coordinator.generation} · ${t("panel.concurrency")} ${run.maxConcurrency}${attentions.length > 0 ? ` · ${t("coord.pending", { n: attentions.length })}` : ""}`}
+          subtitle={`${coordModel ? `${coordModel} · ` : ""}${coordinatorHostLabel(run)} · gen ${run.coordinator.generation} · ${t("panel.concurrency")} ${run.maxConcurrency}${attentions.length > 0 ? ` · ${t("coord.pending", { n: attentions.length })}` : ""}`}
           actions={
             <button type="button" className="btn btn--ghost btn--sm" onClick={() => onJumpToDag(COORD_ID)}>
               {t("review.jumpDag")}

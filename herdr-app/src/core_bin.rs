@@ -206,6 +206,7 @@ fn login_path_answer(out: &str) -> Option<std::ffi::OsString> {
 
 /// Installs the core's latest release with its own installer (into
 /// ~/.local/bin, or H2_INSTALL_DIR), then finds it. Err: what went wrong.
+#[allow(dead_code)]
 pub fn install() -> Result<PathBuf, String> {
     let releases = std::env::var("HERDR2_RELEASES_URL").ok().filter(|u| !u.is_empty())
         .ok_or_else(|| "automatic core install is disabled (build and install h2 from source)".to_owned())?;
@@ -253,11 +254,13 @@ pub fn restart() -> Result<(), String> {
 /// Updates the core to its latest release (`hc update`: same generation only,
 /// terminals kept). Ok: the version it runs now. Err: what it said, e.g.
 /// "belongs to Homebrew: brew upgrade herdr-core".
+#[allow(dead_code)]
 pub fn update() -> Result<String, String> {
     update_to(None)
 }
 
 /// `hc update --version X`: at least X (a newer core stays). Cores before 0.1.5 lack it.
+#[allow(dead_code)]
 pub fn update_to(at_least: Option<&str>) -> Result<String, String> {
     if std::env::var_os("HERDR2_RELEASES_URL").filter(|v| !v.is_empty()).is_none() {
         let need = at_least.unwrap_or(crate::hc::core_min());

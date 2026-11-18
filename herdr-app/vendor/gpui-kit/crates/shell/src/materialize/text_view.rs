@@ -3,7 +3,9 @@
 
 use std::{
     collections::HashSet,
+    hash::{Hash as _, Hasher as _},
     io::Cursor,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{
         Arc,
@@ -29,8 +31,23 @@ const IMAGE_TIMEOUT: Duration = Duration::from_secs(30);
 
 type ImageResult = Result<Arc<RenderImage>, ImageCacheError>;
 
-pub(super) fn with_policy(view: TextView, policy: Rc<Policy>) -> impl IntoElement {
-    PolicyTextView { view, policy }
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub(crate) struct TextViewImageOptions {
+    pub(crate) base_dir: Option<String>,
+    pub(crate) root_dir: Option<String>,
+    pub(crate) allow_data_images: bool,
+}
+
+pub(super) fn with_policy(
+    view: TextView,
+    policy: Rc<Policy>,
+    options: TextViewImageOptions,
+) -> impl IntoElement {
+    PolicyTextView {
+        view,
+        policy,
+        options,
+    }
 }
 
 /// CLI check constructs elements without drawing. Only layout may initialize
@@ -38,6 +55,7 @@ pub(super) fn with_policy(view: TextView, policy: Rc<Policy>) -> impl IntoElemen
 struct PolicyTextView {
     view: TextView,
     policy: Rc<Policy>,
+    options: TextViewImageOptions,
 }
 
 impl IntoElement for PolicyTextView {
@@ -67,7 +85,13 @@ impl Element for PolicyTextView {
         window: &mut Window,
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
-        self.view = image_sources(self.view.clone(), self.policy.clone(), window, cx);
+        self.view = image_sources(
+            self.view.clone(),
+            self.policy.clone(),
+            self.options.clone(),
+            window,
+            cx,
+        );
         self.view.request_layout(id, inspector_id, window, cx)
     }
 
@@ -102,13 +126,17 @@ impl Element for PolicyTextView {
 fn image_sources(
     view: TextView,
     policy: Rc<Policy>,
+    options: TextViewImageOptions,
     window: &mut Window,
     cx: &mut App,
 ) -> TextView {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    options.hash(&mut hasher);
     let key = SharedString::from(format!(
-        "{}/shell-images/{:p}",
+        "{}/shell-images/{:p}/{:016x}",
         view.id().expect("TextView has an element id"),
         Rc::as_ptr(&policy),
+        hasher.finish(),
     ));
     let images = window.use_keyed_state(key, cx, |_, cx| {
         let owner = cx.weak_entity();
@@ -124,6 +152,7 @@ fn image_sources(
         .detach();
         DocumentImages {
             policy,
+            options,
             used: HashSet::new(),
         }
     });
@@ -142,6 +171,7 @@ fn image_sources(
 struct DocumentImages {
     // Retaining the immutable policy also keeps its identity from being reused.
     policy: Rc<Policy>,
+    options: TextViewImageOptions,
     used: HashSet<SharedUri>,
 }
 
@@ -157,30 +187,250 @@ impl Asset for DocumentImage {
         (owner, uri): Self::Source,
         cx: &mut App,
     ) -> impl Future<Output = ImageResult> + Send + 'static {
-        let capabilities = owner
-            .upgrade()
-            .map(|images| images.read(cx).policy.capabilities().clone());
+        let state = owner.upgrade().map(|images| {
+            let images = images.read(cx);
+            (images.policy.capabilities().clone(), images.options.clone())
+        });
         let client = cx.http_client();
         let renderer = cx.svg_renderer();
-        let timeout = cx.background_executor().timer(IMAGE_TIMEOUT);
+        let executor = cx.background_executor().clone();
+        let timeout = executor.timer(IMAGE_TIMEOUT);
         async move {
-            let capabilities = capabilities.ok_or_else(denied_image)?;
-            let url = image_url(&capabilities, uri.as_ref())?;
-            smol::future::race(
-                async move {
-                    let bytes = request_image(client, capabilities, url).await?;
-                    decode_image(bytes, renderer)
-                },
-                async move {
-                    timeout.await;
-                    Err(ImageCacheError::Asset(
-                        "TextView image request timed out".into(),
-                    ))
-                },
-            )
-            .await
+            let (capabilities, options) = state.ok_or_else(denied_image)?;
+            let raw = uri.as_ref();
+            if raw
+                .get(..5)
+                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+            {
+                if !options.allow_data_images {
+                    return Err(denied_image());
+                }
+                let bytes = decode_data_image_url(raw)?;
+                return decode_image(bytes, renderer);
+            }
+            if is_openable_url(raw) {
+                let url = image_url(&capabilities, raw)?;
+                return smol::future::race(
+                    async move {
+                        let bytes = request_image(client, capabilities, url).await?;
+                        decode_image(bytes, renderer)
+                    },
+                    async move {
+                        timeout.await;
+                        Err(ImageCacheError::Asset(
+                            "TextView image request timed out".into(),
+                        ))
+                    },
+                )
+                .await;
+            }
+            if options.base_dir.is_some() || options.root_dir.is_some() {
+                let candidates = local_image_candidates(raw, &options)?;
+                let bytes = executor
+                    .spawn(async move { read_local_image(&capabilities, &candidates) })
+                    .await?;
+                return decode_image(bytes, renderer);
+            }
+            Err(denied_image())
         }
     }
+}
+
+fn decode_data_image_url(raw: &str) -> Result<Vec<u8>, ImageCacheError> {
+    let parsed = data_url::DataUrl::process(raw)
+        .map_err(|_| ImageCacheError::Asset("Invalid TextView data image URL".into()))?;
+    if !parsed.mime_type().type_.eq_ignore_ascii_case("image") {
+        return Err(denied_image());
+    }
+    let (bytes, _) = parsed
+        .decode_to_vec()
+        .map_err(|_| ImageCacheError::Asset("Invalid TextView data image encoding".into()))?;
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return Err(ImageCacheError::Asset(
+            "TextView image exceeds the 8 MiB limit".into(),
+        ));
+    }
+    Ok(bytes)
+}
+
+fn local_image_candidates(
+    value: &str,
+    options: &TextViewImageOptions,
+) -> Result<Vec<PathBuf>, ImageCacheError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.starts_with("//") {
+        return Err(denied_image());
+    }
+    if trimmed
+        .get(..7)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file://"))
+    {
+        let url = reqwest::Url::parse(trimmed).map_err(|_| denied_image())?;
+        let path = url.to_file_path().map_err(|()| denied_image())?;
+        return Ok(vec![path]);
+    }
+    if let Some(colon) = trimmed.find(':') {
+        let before_colon = &trimmed[..colon];
+        let ends_before_sep = !before_colon.contains(['/', '\\', '?', '#']);
+        if ends_before_sep
+            && before_colon.len() > 1
+            && before_colon.bytes().enumerate().all(|(i, b)| {
+                if i == 0 {
+                    b.is_ascii_alphabetic()
+                } else {
+                    b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.')
+                }
+            })
+        {
+            return Err(denied_image());
+        }
+    }
+    let clean = trimmed.split(['?', '#']).next().unwrap_or("").trim();
+    if clean.is_empty() {
+        return Err(denied_image());
+    }
+    let decoded = percent_decode(clean).ok_or_else(denied_image)?;
+    if decoded.contains('\0') {
+        return Err(denied_image());
+    }
+    let normalized = if cfg!(unix) {
+        decoded.replace('\\', "/")
+    } else {
+        decoded
+    };
+    let path = Path::new(&normalized);
+    let mut candidates = Vec::new();
+    if path.is_absolute() || normalized.starts_with('/') {
+        if path.is_absolute() {
+            candidates.push(path.to_path_buf());
+        }
+        if let Some(rel) = normalized.strip_prefix('/') {
+            let rel = rel.trim_start_matches('/');
+            if !rel.is_empty() {
+                if let Some(root) = &options.root_dir {
+                    let candidate = Path::new(root).join(rel);
+                    if !candidates.contains(&candidate) {
+                        candidates.push(candidate);
+                    }
+                }
+                if let Some(base) = &options.base_dir {
+                    let candidate = Path::new(base).join(rel);
+                    if !candidates.contains(&candidate) {
+                        candidates.push(candidate);
+                    }
+                }
+            }
+        }
+    } else {
+        if let Some(base) = &options.base_dir {
+            candidates.push(Path::new(base).join(path));
+        }
+        if let Some(root) = &options.root_dir {
+            let candidate = Path::new(root).join(path);
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Err(denied_image());
+    }
+    Ok(candidates)
+}
+
+fn percent_decode(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn read_local_image(
+    capabilities: &Capabilities,
+    candidates: &[PathBuf],
+) -> Result<Vec<u8>, ImageCacheError> {
+    if matches!(capabilities.execute_grant(), crate::ExecuteGrant::Unrestricted) {
+        for candidate in candidates {
+            match std::fs::File::open(candidate) {
+                Ok(file) => {
+                    if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
+                        continue;
+                    }
+                    return read_bounded(file);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        return Err(ImageCacheError::Asset(
+            "TextView local image not found".into(),
+        ));
+    }
+    if capabilities.has_read_access() {
+        let mut saw_allowed = false;
+        for candidate in candidates {
+            match capabilities.open(candidate, crate::capability::Access::Read) {
+                Ok(grant) => {
+                    saw_allowed = true;
+                    let (dir, relative) = grant.into_parts();
+                    match dir.open(&relative) {
+                        Ok(file) => {
+                            if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
+                                continue;
+                            }
+                            return read_bounded(file);
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        return if saw_allowed {
+            Err(ImageCacheError::Asset(
+                "TextView local image not found".into(),
+            ))
+        } else {
+            Err(denied_image())
+        };
+    }
+    Err(denied_image())
+}
+
+fn read_bounded(reader: impl std::io::Read) -> Result<Vec<u8>, ImageCacheError> {
+    use std::io::Read as _;
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_IMAGE_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_IMAGE_BYTES {
+        return Err(ImageCacheError::Asset(
+            "TextView image exceeds the 8 MiB limit".into(),
+        ));
+    }
+    Ok(bytes)
 }
 
 fn denied_image() -> ImageCacheError {

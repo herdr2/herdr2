@@ -212,6 +212,10 @@ pub(crate) struct TextViewThemeSpec {
     pub(crate) border: Option<String>,
     pub(crate) heading: Option<String>,
     pub(crate) syntax: std::collections::BTreeMap<String, String>,
+    // HERDR: opt-in local image resolution and inline data:image/... support for TextView.
+    pub(crate) base_dir: Option<String>,
+    pub(crate) root_dir: Option<String>,
+    pub(crate) allow_data_images: bool,
 }
 
 /// A document keeps the authority of the script that described it. Image

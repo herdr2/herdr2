@@ -61,6 +61,15 @@ pub struct Terminal {
     /// When that word last changed, ms since the epoch; null if it never said.
     #[serde(default)]
     pub status_ms: Option<u64>,
+    /// Epoch ms when the current active working run began (adjusted for prior paused blocked segments in the same run).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_since: Option<u64>,
+    /// Active execution duration (ms) of the current or most recently completed run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_ms: Option<u64>,
+    /// Cumulative active execution duration (ms) across all runs of this agent.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub total_work_ms: u64,
     /// Other 7501 records by id (programs reporting on several things).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub records: BTreeMap<String, crate::status::Status>,
@@ -285,6 +294,9 @@ impl Registry {
                 identity: new.identity,
                 status: None,
                 status_ms: None,
+                working_since: None,
+                work_ms: None,
+                total_work_ms: 0,
                 records: BTreeMap::new(),
                 turn: 0,
                 first_task_turn: None,

@@ -1109,6 +1109,15 @@ fn materialize_component(
         Component::TextView(spec) => {
             let mut tv_style = TextViewStyle::from_theme(&Theme::global(cx));
             let mut syntax_spec: Option<std::collections::BTreeMap<String, String>> = None;
+            let image_options = spec
+                .theme
+                .as_ref()
+                .map(|theme_spec| text_view::TextViewImageOptions {
+                    base_dir: theme_spec.base_dir.clone(),
+                    root_dir: theme_spec.root_dir.clone(),
+                    allow_data_images: theme_spec.allow_data_images,
+                })
+                .unwrap_or_default();
 
             if let Some(theme_spec) = spec.theme.as_ref() {
                 let parse_color = |raw: &Option<String>| -> Option<gpui::Hsla> {
@@ -1216,7 +1225,7 @@ fn materialize_component(
                 });
             }
             Styled::style(&mut view).refine(&refinement);
-            text_view::with_policy(view, spec.policy).into_any_element()
+            text_view::with_policy(view, spec.policy, image_options).into_any_element()
         }
         Component::Text(value) => {
             // A text run, not a `div` holding one. GPUI implements

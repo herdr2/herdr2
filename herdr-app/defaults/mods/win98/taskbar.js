@@ -212,8 +212,6 @@ export default class Taskbar {
       act: { run: ["layout.switch", { name }] },
     }));
     return [
-      { label: "Herdr Update", icon: "update", act: { run: ["app.settings", { section: "updates" }] } },
-      { sep: true },
       {
         label: "&Programs",
         icon: "programs",

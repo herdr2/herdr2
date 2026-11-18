@@ -133,6 +133,10 @@ struct Calls {
     effects: Vec<(String, Vec<Value>)>,
     shared: BTreeMap<String, Value>,
     interrupted: Vec<String>,
+    files: BTreeMap<String, String>,
+    images: BTreeMap<String, String>,
+    reads: Vec<String>,
+    writes: Vec<(String, String, Value, Value)>,
 }
 
 fn updates(app: &str, core: &str) -> Value {
@@ -227,18 +231,48 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
     module = module.async_function("pickFolder", |_| Ok(async { Ok(HostValue::Null) }));
     module = module.async_function("nextCommand", |_| Ok(std::future::pending::<gpui_shell::HostResult>()));
     module = module.cancellable_async_function("watchFolder", HostValue::Array(vec![]), |_| Ok(std::future::pending::<gpui_shell::HostResult>()));
-    for name in ["exec", "hc", "h2", "readTextFile", "writeTextFile", "sendFeedback"] {
+    for name in ["exec", "hc", "h2", "readTextFile", "readImageDataUrl", "writeTextFile", "sendFeedback"] {
         let calls = calls.clone();
         module = module.async_function(name, move |a| {
             let first = a.get(0).map(from_host).unwrap_or(Value::Null);
             let reply = match name {
+                "readImageDataUrl" => Some(
+                    first
+                        .as_str()
+                        .and_then(|p| calls.borrow().images.get(p).cloned())
+                        .map(Value::String)
+                        .unwrap_or(Value::Null),
+                ),
                 "readTextFile" if first == "/fixture/app/settings.json" || first == "/fixture/.ssh/config" => Some(Value::Null),
+                "readTextFile" if first.as_str().is_some_and(|p| calls.borrow().files.contains_key(p)) => {
+                    first.as_str().and_then(|p| {
+                        calls.borrow_mut().reads.push(p.to_owned());
+                        calls.borrow().files.get(p).cloned()
+                    }).map(Value::String)
+                }
                 "readTextFile" => first
                     .as_str()
                     .and_then(|p| p.strip_prefix("/fixture/app/layouts/"))
                     .and_then(|p| p.strip_suffix(".json"))
                     .filter(|n| crate::window::shipped_layouts().contains(n))
                     .map(|_| json!("{}")),
+                "writeTextFile" => {
+                    let text = a.get(1).map(from_host).unwrap_or(Value::Null);
+                    let expected = a.get(2).map(from_host).unwrap_or(Value::Null);
+                    let on = a
+                        .get(3)
+                        .map(from_host)
+                        .and_then(|v| v.get("on").cloned())
+                        .unwrap_or(Value::Null);
+                    if let (Some(path), Some(text_str)) = (first.as_str(), text.as_str()) {
+                        let mut c = calls.borrow_mut();
+                        c.writes.push((path.to_owned(), text_str.to_owned(), expected, on));
+                        c.files.insert(path.to_owned(), text_str.to_owned());
+                        Some(Value::Null)
+                    } else {
+                        None
+                    }
+                }
                 "hc" | "h2" if first == json!(["machine", "ls", "--json"]) => {
                     Some(json!({"code":0,"stdout":"{\"machines\":[{\"name\":\"remote\",\"state\":\"online\"}]}","stderr":""}))
                 }
@@ -1004,48 +1038,17 @@ fn option_key_settings_are_only_shown_on_macos(cx: &mut TestAppContext) {
 #[gpui::test]
 fn settings_sections_and_updates(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);
-    let start = Instant::now();
     let staged = Staged::new();
-    for section in ["look", "alerts", "privacy", "updates"] {
+    for section in ["look", "machines", "drove", "alerts", "privacy"] {
         let mut p = props();
         p["section"] = json!(section);
-        describe(cx, &staged, "frame/settings", true, p, updates("current", "current"), None).unwrap();
+        let tree = describe(cx, &staged, "frame/settings", true, p, updates("current", "current"), None).unwrap();
+        assert!(!tree.contains("st-s-updates") && !tree.contains("st-check-app") && !tree.contains("st-app-update") && !tree.contains("st-check-core"), "updates UI must stay suppressed in {section}: {tree}");
     }
-    for app in ["source", "current", "ready"] {
-        for core in ["current", "ready", "error", "managed", "updating"] {
-            let mut p = props();
-            p["section"] = json!("updates");
-            let tree = describe(cx, &staged, "frame/settings", true, p, updates(app, core), None)
-                .unwrap_or_else(|e| panic!("updates/{app}/{core}: {e:#}"));
-            if app == "current" && core == "current" {
-                assert!(
-                    tree.contains("check-app") && tree.contains("check-core"),
-                    "both update buttons must exist: {tree}"
-                );
-            }
-        }
-    }
-    for (checking, checked, asked) in [
-        (false, None, false), (false, None, true),
-        (true, None, false), (true, None, true),
-        (true, Some(1700000000u64), false), (true, Some(1700000000), true),
-        (false, Some(1700000000), false), (false, Some(1700000000), true),
-    ] {
-        let mut p = props();
-        p["section"] = json!("updates");
-        let mut u = updates("current", "current");
-        u["checked"] = json!(checked);
-        u["checking"] = json!(checking);
-        let setup = asked.then_some("this.asked = Date.now();");
-        let tree = describe(cx, &staged, "frame/settings", true, p, u, setup).unwrap();
-        let succeeded = !checking && checked.is_some();
-        assert_eq!(tree.contains("Up to date"), succeeded, "success requires a completed, successful check: {tree}");
-        if !checking && checked.is_none() {
-            assert!(tree.contains("check-app") && tree.contains("check-core"), "failed checks must remain retryable: {tree}");
-        }
-        assert!(tree.contains(if checking { "Checking" } else if succeeded { "Up to date" } else { "Check your connection" }), "check status missing: {tree}");
-    }
-    eprintln!("27 settings cases, each twice: {:?}", start.elapsed());
+    let mut p = props();
+    p["section"] = json!("updates");
+    let fallback = describe(cx, &staged, "frame/settings", true, p, updates("ready", "ready"), None).unwrap();
+    assert!(!fallback.contains("st-s-updates") && !fallback.contains("st-check-app") && !fallback.contains("st-app-update") && !fallback.contains("st-check-core"), "updates section must fall back without update UI: {fallback}");
 }
 
 #[gpui::test]
@@ -1145,9 +1148,9 @@ fn settings_keep_notes_in_the_whats_new_window(cx: &mut TestAppContext) {
     let mut update = updates("ready", "current");
     update["notes"] = notes.clone();
     let mut p = props();
-    p["section"] = json!("updates");
+    p["section"] = json!("look");
     let tree = describe(cx, &staged, "frame/settings", true, p, update.clone(), None).unwrap();
-    assert!(!tree.contains("st-whats-new") && tree.contains("st-app-update") && tree.contains("st-check-core"));
+    assert!(!tree.contains("st-whats-new") && !tree.contains("st-app-update") && !tree.contains("st-s-updates"));
     assert!(!tree.contains("Newest details") && !tree.contains("Older headline"));
     let mut p = props();
     p["notes"] = notes;
@@ -1430,9 +1433,12 @@ fn acp_peek_renders_t3_conversation_and_permission_card(cx: &mut TestAppContext)
     assert!(tree.contains("Run cargo test"), "permission card title missing: {tree}");
     assert!(tree.contains("perm-opt-0"), "permission approve option missing: {tree}");
     assert!(tree.contains("2 queued"), "queued inbox pill missing: {tree}");
+    assert!(tree.contains("acp-stage"), "floating transcript stage missing: {tree}");
+    assert!(tree.contains("acp-u-fold-u-0"), "delegated prompt FoldedMessageHeader missing: {tree}");
     assert!(tree.contains("acp-composer-card"), "composer card missing: {tree}");
     assert!(tree.contains("acp-input-area"), "spacious composer input area missing: {tree}");
     assert!(tree.contains("acp-send"), "composer send button missing: {tree}");
+    assert!(tree.contains("wrap-as-4-code-1"), "code card wrap toggle missing: {tree}");
     assert!(tree.contains("acp-cfg-bar"), "capability pill bar missing: {tree}");
     assert!(tree.contains("GPT-5.4"), "model pill missing: {tree}");
     assert!(tree.contains("High"), "reasoning pill missing: {tree}");
@@ -1489,6 +1495,8 @@ fn acp_peek_tab_mode_renders_background_action_without_dialog_close(cx: &mut Tes
     ]));
     let pane_tree = describe_with_values(cx, &staged, "mods/pane", pane_values.clone(), Some("this.hovered = true;")).unwrap();
     assert!(!pane_tree.contains("Reviewer"), "sole ACP tab pane omits duplicate agent name below tab pill: {pane_tree}");
+    assert!(pane_tree.contains("ph-type-p2"), "sole ACP pane header missing type badge: {pane_tree}");
+    assert!(pane_tree.contains("ph-time-p2"), "sole ACP pane header missing execution time badge: {pane_tree}");
     assert!(pane_tree.contains("Ctx 14%"), "ACP pane header missing context usage ratio: {pane_tree}");
     assert!(pane_tree.contains("ph-stop-p2"), "ACP pane header missing inline Stop button: {pane_tree}");
     assert!(pane_tree.contains("ph-r-p2"), "ACP pane header missing split-right button: {pane_tree}");
@@ -1502,6 +1510,7 @@ fn acp_peek_tab_mode_renders_background_action_without_dialog_close(cx: &mut Tes
     let split_tree = describe_with_values(cx, &staged, "mods/pane", pane_values, None).unwrap();
     assert!(split_tree.contains("Reviewer"), "split ACP pane header missing agent name: {split_tree}");
     assert!(split_tree.contains("ACP"), "split ACP pane header missing ACP badge: {split_tree}");
+    assert!(split_tree.contains("ph-time-p2"), "split ACP pane header missing execution time badge: {split_tree}");
 }
 
 #[gpui::test]
@@ -1694,8 +1703,13 @@ fn simplified_chinese_language_renders_localized_chrome_and_settings(cx: &mut Te
     }
 
     let tabs_tree = describe_with_values(cx, &staged, "mods/tabs", zh_values(props()), None).unwrap();
-    for expected in ["文件", "变更"] {
+    for expected in ["文件", "变更", "终端", "tab-time-tab1"] {
         assert!(tabs_tree.contains(expected), "zh-CN tabs missing {expected}: {tabs_tree}");
+    }
+
+    let pane_zh_tree = describe_with_values(cx, &staged, "mods/pane", zh_values(props()), None).unwrap();
+    for expected in ["终端", "ph-type-p1", "ph-time-p1"] {
+        assert!(pane_zh_tree.contains(expected), "zh-CN pane header missing {expected}: {pane_zh_tree}");
     }
 
     let agents_tree = describe_with_values(cx, &staged, "mods/agents", zh_values(props()), None).unwrap();
@@ -1791,10 +1805,14 @@ fn tab_menu_structured_view_toggle_and_pty_peek_render_cleanly(cx: &mut TestAppC
     ]));
     let tabs_tree = describe_with_values(cx, &staged, "mods/tabs", tabs_values.clone(), None).unwrap();
     assert!(tabs_tree.contains("Terminal Agent (Structured View)"), "structured terminal tab badge tooltip missing: {tabs_tree}");
+    assert!(tabs_tree.contains("tab-time-tab1"), "structured terminal tab execution timer missing: {tabs_tree}");
 
     tabs_values.insert("props".into(), json!({"pane":"p1","terminal":"t1"}));
     let pane_tree = describe_with_values(cx, &staged, "mods/pane", tabs_values, None).unwrap();
+    assert!(pane_tree.contains("ph-type-p1"), "structured PTY pane header missing agent type badge: {pane_tree}");
+    assert!(pane_tree.contains("ph-time-p1"), "structured PTY pane header missing execution timer: {pane_tree}");
     assert!(pane_tree.contains("ph-stop-p1"), "structured PTY pane header missing Stop button: {pane_tree}");
+    assert!(pane_tree.contains("ph-view-p1"), "structured PTY pane header missing 1-click Terminal toggle: {pane_tree}");
 
     let mut load_and_describe = |addr: &str, turn: u64, status: &str| {
         let mut pv = fixture(true, json!({"terminal":addr,"acp":true,"pty":true,"tab":true,"pane":"p1"}), updates("current", "current"));
@@ -1910,6 +1928,940 @@ fn escape_interrupts_working_acp_and_structured_pty_peek(cx: &mut TestAppContext
     pty_visual.run_until_parked();
     assert_eq!(calls.borrow().interrupted, vec!["a1", "t1"], "unexpected: {:?}", calls.borrow().unexpected);
     pty_visual.update(|window, _| window.remove_window());
+    gpui_shell::policy::set_default(Policy::new());
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn settings_drove_renders_policies_codex_fast_and_english_drove_label(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+
+    let en_tree = describe(
+        cx,
+        &staged,
+        "frame/settings",
+        true,
+        json!({ "section": "drove" }),
+        updates("current", "current"),
+        Some("this.droveData = { config: { roles: { reviewer: { label: 'Reviewer', access: 'readonly', primary: { agent: 'codex', model: 'gpt-6.1-sol', effort: 'high', fast: true }, fallbacks: [] } }, ai: { enabled: true, verifyDigest: true, handoverCompact: false, autoTitle: true, taskEnrich: true, conflictPolicy: 'warn', questionMode: 'draft', loopDetect: 'steer_once' } }, aiStatus: { switches: { verifyDigest: true, handoverCompact: false, autoTitle: true, taskEnrich: true, conflictPolicy: 'warn', questionMode: 'draft', loopDetect: 'steer_once' } }, agents: { fullProbe: true, agents: [{ id: 'codex', installed: true, models: ['gpt-6.1-sol'] }] } };"),
+    )
+    .unwrap();
+    for expected in [
+        "CONTROL-PLANE AI POLICIES",
+        "Verify Digest",
+        "Handover Compact",
+        "Conflict Policy",
+        "Loop Detect",
+        "⚡ Fast",
+        "Reasoning Effort",
+        "Context Size",
+        "Max Output Tokens",
+        "st-dr-ai-eff-group",
+        "st-drp-ai-context",
+        "st-drp-ai-max-tokens",
+    ] {
+        assert!(en_tree.contains(expected), "EN drove settings missing {expected}: {en_tree}");
+    }
+    assert!(!en_tree.contains("Send feedback"), "Send feedback should be suppressed: {en_tree}");
+
+    let mut zh_values = fixture(true, json!({ "section": "drove" }), updates("current", "current"));
+    zh_values.get_mut("settings").unwrap()["language"] = json!("zh-CN");
+    let zh_tree = describe_with_values(
+        cx,
+        &staged,
+        "frame/settings",
+        zh_values,
+        Some("this.droveData = { config: { roles: { reviewer: { label: 'Reviewer', access: 'readonly', primary: { agent: 'codex', model: null, effort: 'high', fast: false }, fallbacks: [] } }, ai: { enabled: true } }, aiStatus: { switches: { verifyDigest: true, handoverCompact: true, autoTitle: true, taskEnrich: true, conflictPolicy: 'warn', questionMode: 'draft', loopDetect: 'off' } }, agents: { fullProbe: true, agents: [{ id: 'codex', installed: true, models: ['gpt-6.1-sol'] }] } };"),
+    )
+    .unwrap();
+    for expected in ["Drove", "控制面 AI 策略开关", "Verify 失败摘要", "交接上下文压缩", "死循环检测", "思考强度", "上下文大小", "最大输出长度"] {
+        assert!(zh_tree.contains(expected), "zh-CN drove settings missing {expected}: {zh_tree}");
+    }
+    assert!(!zh_tree.contains("编队"), "Settings should show English Drove in zh-CN: {zh_tree}");
+    assert!(!zh_tree.contains("发送反馈"), "Send feedback should be suppressed in zh-CN: {zh_tree}");
+}
+
+#[gpui::test]
+fn split_pane_names_merged_tabs_and_windows_shells(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let claude_prog = json!({"key":"claude","name":"Claude Code","icon":null,"tint":false,"tile":"#1c1d21","color":"#ffffff","shell":false,"agent":true});
+    let shell_prog = json!({"key":"shell","name":"Shell","icon":null,"tint":true,"tile":"#16241a","color":"#4ec95f","shell":true,"agent":false});
+
+    // 1. Split tab panes show each pane's custom_name / name, inline rename button, and inline input when renaming.
+    let mut split_values = fixture(true, json!({"pane":"p1","terminal":"t1"}), updates("current", "current"));
+    split_values.insert("spaces".into(), json!([
+        {"id":"s1","index":1,"name":"Local","folder":"/fixture/project","machine":null,"branch":"main","active":true,"status":"idle","tabs":[{"id":"tab1","index":1,"name":"tab1","named":false,"active":true,"status":"idle","panes":2,"zoomed":false,"settled":false,"settled_at":null}]}
+    ]));
+    split_values.insert("panes".into(), json!([
+        {"pane":"p1","terminal":"t1","tab":"tab1","title":"zsh","custom_name":"Frontend","cwd":"/fixture/project","status":"idle","program":shell_prog,"focused":true,"zoomed":false,"movable":true},
+        {"pane":"p2","acp":true,"mod":"peek","terminal":"a1","tab":"tab1","title":"Reviewer","custom_name":"Reviewer","cwd":"/fixture/project","status":"idle","program":claude_prog,"focused":false,"zoomed":false,"movable":true}
+    ]));
+    split_values.insert("terminals".into(), json!([
+        {"address":"t1","name":"zsh","labels":{"herdr.name":"Frontend"},"state":"live","status":"idle","program":shell_prog,"cwd":"/fixture/project"},
+        {"address":"a1","acp":true,"name":"Reviewer","labels":{"herdr.name":"Reviewer"},"state":"live","status":"idle","program":claude_prog,"cwd":"/fixture/project"}
+    ]));
+    let pane_tree = describe_with_values(cx, &staged, "mods/pane", split_values.clone(), None).unwrap();
+    assert!(pane_tree.contains("Frontend"), "split pane 1 name missing: {pane_tree}");
+    assert!(pane_tree.contains("ph-ren-p1"), "split pane 1 rename trigger missing: {pane_tree}");
+
+    let rename_tree = describe_with_values(cx, &staged, "mods/pane", split_values.clone(), Some("this.startRename('t1', 'Frontend', cx);")).unwrap();
+    assert!(rename_tree.contains("ph-ren-input-p1"), "inline rename Input missing in split pane: {rename_tree}");
+
+    // 2. Pane context menu exposes Rename action.
+    let menu_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/menu",
+        fixture(true, json!({"tab":"pane","target":{"pane":"p1","terminal":"t1"}}), updates("current", "current")),
+        None,
+    ).unwrap();
+    assert!(menu_tree.contains("Rename"), "pane context menu should expose Rename: {menu_tree}");
+
+    // 3. Merged tab shows combined pane names and persistent merged badge.
+    let tabs_tree = describe_with_values(cx, &staged, "mods/tabs", split_values, None).unwrap();
+    assert!(tabs_tree.contains("Frontend + Reviewer"), "merged tab title should combine pane names: {tabs_tree}");
+    assert!(tabs_tree.contains("tab-merged-tab1"), "merged tab badge element missing: {tabs_tree}");
+    assert!(tabs_tree.contains("◫ 2"), "merged tab badge label missing: {tabs_tree}");
+
+    // 4. New Menu omits dangerously-skip-permissions toggle and shows Windows shell choices on Windows.
+    let mut nm_values = fixture(true, json!({}), updates("current", "current"));
+    nm_values.insert("window".into(), json!({"platform":"windows","titlebar":"none","buttons":true,"maximized":false,"fullscreen":false,"active":true}));
+    let nm_calls = Rc::new(RefCell::new(Calls::default()));
+    nm_calls.borrow_mut().shared.insert("new-menu.agent-mode".into(), json!("acp"));
+    let nm_policy = Policy::new()
+        .with_storage_path(staged.0.join("store-nm-win.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(module(nm_values.clone(), nm_calls.clone()))
+        .unwrap();
+    let nm_wrapper = staged.wrapper(
+        "mods/new-menu",
+        "this.launchAgent({ key: 'claude', name: 'Claude Code', icon: 'icons/claude.svg', tint: false, installed: true, run: ['claude'] }, { id: 's1', folder: '/fixture/project' }, true);",
+    );
+    let nm_runtime = ShellRuntime::new_isolated().unwrap();
+    let nm_win = cx.add_window(|_, _| Empty);
+    let nm_tree = nm_win
+        .update(cx, |_, window, cx| {
+            let mut session = DescriptionSession::load(nm_runtime, nm_wrapper, nm_policy, window, cx).unwrap();
+            let _ = session.describe(window, cx).unwrap();
+            session.describe(window, cx).unwrap()
+        })
+        .unwrap();
+    nm_win.update(cx, |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+    assert!(!nm_tree.contains("nm-acp-skip"), "ACP skip toggle should be removed: {nm_tree}");
+    assert!(!nm_tree.contains("dangerously-skip-permissions"), "dangerously-skip-permissions should be hidden: {nm_tree}");
+    assert!(!nm_tree.contains("nm-shell-wsl"), "WSL shell option should be removed on Windows: {nm_tree}");
+    assert!(!nm_tree.contains("WSL"), "WSL label should be removed on Windows: {nm_tree}");
+    for expected in ["nm-win-shells", "nm-shell-powershell", "nm-shell-git-bash", "PowerShell", "Git Bash", "CMD"] {
+        assert!(nm_tree.contains(expected), "Windows shell picker in new-menu missing {expected}: {nm_tree}");
+    }
+    assert!(
+        nm_calls.borrow().effects.iter().any(|(fn_name, args)| {
+            fn_name == "run"
+                && args.first().and_then(Value::as_str) == Some("tab.new")
+                && args.get(1).and_then(|v| v.get("acp")).and_then(Value::as_bool) == Some(true)
+                && args.get(1).and_then(|v| v.get("agent")).and_then(Value::as_str) == Some("claude")
+        }),
+        "ACP launch should dispatch tab.new with acp: true so workspace jumps to the new tab: {:?}",
+        nm_calls.borrow().effects
+    );
+
+    // 4b. Antigravity (`agy`) is enabled in ACP mode and launches `agent: "agy"`.
+    let agy_calls = Rc::new(RefCell::new(Calls::default()));
+    agy_calls.borrow_mut().shared.insert("new-menu.agent-mode".into(), json!("acp"));
+    let agy_policy = Policy::new()
+        .with_storage_path(staged.0.join("store-nm-agy.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(module(nm_values.clone(), agy_calls.clone()))
+        .unwrap();
+    let agy_agent_fixture = "[{ key: 'antigravity', name: 'Antigravity', icon: 'icons/antigravity.svg', tint: false, installed: true, run: ['agy', '--dangerously-skip-permissions'] }]";
+    std::fs::write(
+        staged.0.join("main.js"),
+        format!(
+            "import Real from './mods/new-menu/main.js'; export default class Scenario extends Real {{ \
+             init(p, cx) {{ super.init(p, cx); this.launchAgent({agy_agent_fixture}[0], {{ id: 's1', folder: '/fixture/project' }}, true); }} \
+             render() {{ this.agents = {agy_agent_fixture}; return super.render(); }} }}"
+        ),
+    )
+    .unwrap();
+    let agy_runtime = ShellRuntime::new_isolated().unwrap();
+    let agy_win = cx.add_window(|_, _| Empty);
+    let agy_tree = agy_win
+        .update(cx, |_, window, cx| {
+            let mut session = DescriptionSession::load(agy_runtime, staged.0.clone(), agy_policy, window, cx).unwrap();
+            let _ = session.describe(window, cx).unwrap();
+            session.describe(window, cx).unwrap()
+        })
+        .unwrap();
+    agy_win.update(cx, |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+    assert!(agy_tree.contains("Antigravity"), "Antigravity row missing in new-menu ACP mode: {agy_tree}");
+    assert!(!agy_tree.contains("CLI only"), "Antigravity must be ACP-enabled, not CLI only: {agy_tree}");
+    assert!(!agy_tree.contains("仅终端"), "Antigravity must be ACP-enabled, not 仅终端: {agy_tree}");
+    assert!(
+        agy_calls.borrow().effects.iter().any(|(fn_name, args)| {
+            fn_name == "run"
+                && args.first().and_then(Value::as_str) == Some("tab.new")
+                && args.get(1).and_then(|v| v.get("acp")).and_then(Value::as_bool) == Some(true)
+                && args.get(1).and_then(|v| v.get("agent")).and_then(Value::as_str) == Some("agy")
+                && args.get(1).and_then(|v| v.get("folder")).and_then(Value::as_str) == Some("/fixture/project")
+        }),
+        "Antigravity ACP launch should map antigravity -> agent: \"agy\": {:?}",
+        agy_calls.borrow().effects
+    );
+
+    // 5. Settings exposes Default terminal shell picker on Windows and fixed Fast column slot across all Drove candidate rows.
+    let mut st_look_values = fixture(true, json!({ "section": "look" }), updates("current", "current"));
+    st_look_values.insert("window".into(), json!({"platform":"windows","titlebar":"none","buttons":true,"maximized":false,"fullscreen":false,"active":true}));
+    let look_tree = describe_with_values(cx, &staged, "frame/settings", st_look_values, None).unwrap();
+    assert!(look_tree.contains("Default terminal shell"), "Windows Look settings missing Default terminal shell: {look_tree}");
+    assert!(look_tree.contains("st-drp-term-shell"), "Windows Look settings missing st-drp-term-shell picker: {look_tree}");
+
+    let aligned_tree = describe(
+        cx,
+        &staged,
+        "frame/settings",
+        true,
+        json!({ "section": "drove" }),
+        updates("current", "current"),
+        Some("this.droveData = { config: { roles: { reviewer: { label: 'Reviewer', access: 'readonly', primary: { agent: 'claude', model: 'claude-sonnet-4-5', effort: 'high' }, fallbacks: [{ agent: 'codex', model: 'gpt-5.4', effort: 'high', fast: true }, { agent: 'agy', model: 'gemini-4-carbon-high', effort: 'high' }, { agent: 'cursor', model: 'grok-4.7', effort: 'high', context: '500k' }, { agent: 'cursor', model: 'grok-4.7-high', effort: 'high', context: '256k' }] } }, ai: { enabled: true } }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'claude', installed: true, models: ['claude-sonnet-4-5'] }, { id: 'codex', installed: true, models: ['gpt-5.4'] }, { id: 'agy', installed: true, models: ['gemini-4-carbon-high'] }, { id: 'cursor', installed: true, models: ['grok-4.7', 'grok-4.7-high'], modelContexts: { 'grok-4.7': ['256k', '500k'] } }] } };"),
+    )
+    .unwrap();
+    assert!(aligned_tree.contains("st-dr-fast-reviewer-0"), "Non-Codex candidate row should reserve aligned Fast slot: {aligned_tree}");
+    assert!(aligned_tree.contains("st-dr-fast-reviewer-1"), "Codex candidate row should render Fast toggle: {aligned_tree}");
+    assert!(aligned_tree.contains("st-dr-eff-group-reviewer-2"), "Agy candidate row should render effort container: {aligned_tree}");
+    assert!(aligned_tree.contains("st-drp-reviewer-c3-ctx"), "Cursor candidate row should render context picker: {aligned_tree}");
+    assert!(aligned_tree.contains("Ctx 500K"), "Cursor candidate row should show selected 500K context: {aligned_tree}");
+    let eff_group_3 = aligned_tree.lines().find(|l| l.contains("st-dr-eff-group-reviewer-3")).unwrap();
+    assert!(!eff_group_3.contains("0.35"), "Base Cursor model effort selector should stay enabled: {eff_group_3}");
+    let eff_pill_3 = aligned_tree.lines().find(|l| l.contains("st-dr-eff-reviewer-3-low")).unwrap();
+    assert!(eff_pill_3.contains("on_click"), "Base Cursor model effort pill should remain clickable: {eff_pill_3}");
+    assert!(eff_pill_3.contains("cursor_pointer"), "Base Cursor model effort pill should show pointer cursor: {eff_pill_3}");
+    let eff_group_4 = aligned_tree.lines().find(|l| l.contains("st-dr-eff-group-reviewer-4")).unwrap();
+    assert!(eff_group_4.contains("0.35"), "Embedded-effort Cursor model should gray out effort selector: {eff_group_4}");
+    assert!(
+        eff_group_4.contains("Selected Cursor model already includes reasoning effort"),
+        "Embedded-effort Cursor model should explain disabled effort in tooltip: {eff_group_4}"
+    );
+    let eff_pill_4 = aligned_tree.lines().find(|l| l.contains("st-dr-eff-reviewer-4-high")).unwrap();
+    assert!(!eff_pill_4.contains("on_click"), "Embedded-effort Cursor model effort pill must not be clickable: {eff_pill_4}");
+    assert!(aligned_tree.contains("st-drp-reviewer-c4-ctx"), "Embedded-effort Cursor row should still render context picker: {aligned_tree}");
+    assert!(aligned_tree.contains("Ctx 256K"), "Embedded-effort Cursor row should show selected 256K context: {aligned_tree}");
+}
+
+#[gpui::test]
+fn text_view_markdown_renders_local_data_and_http_images(cx: &mut TestAppContext) {
+    use base64::Engine as _;
+    use gpui::{VisualTestContext, http_client::{AsyncBody, FakeHttpClient, Response}};
+    use gpui_shell::HttpRequestGrant;
+    use std::{
+        io::{Read as _, Write as _},
+        net::TcpListener,
+        ops::Deref as _,
+        sync::Arc,
+        task::{Context, Poll, Wake},
+        thread::Thread,
+        time::Duration,
+    };
+
+    fn block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
+        struct ThreadWaker(Thread);
+        impl Wake for ThreadWaker {
+            fn wake(self: Arc<Self>) { self.0.unpark(); }
+        }
+        let waker = Arc::new(ThreadWaker(std::thread::current())).into();
+        let mut tcx = Context::from_waker(&waker);
+        let mut fut = std::pin::pin!(fut);
+        loop {
+            match fut.as_mut().poll(&mut tcx) {
+                Poll::Ready(val) => return val,
+                Poll::Pending => std::thread::park_timeout(Duration::from_millis(5)),
+            }
+        }
+    }
+
+    let encode_png = |width: u32, rgba: [u8; 4]| -> Vec<u8> {
+        let mut out = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut out, width, 1);
+            encoder.set_color(png::ColorType::Rgba);
+            encoder.set_depth(png::BitDepth::Eight);
+            let mut writer = encoder.write_header().unwrap();
+            let pixels: Vec<u8> = (0..width).flat_map(|_| rgba).collect();
+            writer.write_image_data(&pixels).unwrap();
+        }
+        out
+    };
+
+    let png_2 = encode_png(2, [220, 40, 40, 255]);
+    let png_3 = encode_png(3, [40, 220, 40, 255]);
+    let png_4 = encode_png(4, [40, 40, 220, 255]);
+    let png_5 = encode_png(5, [220, 220, 40, 255]);
+    let png_6 = encode_png(6, [220, 40, 220, 255]);
+    let png_7 = encode_png(7, [40, 220, 220, 255]);
+
+    // 1. Verify production gpui_shell::http_client GET + RedirectPolicy handling.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server_png = png_6.clone();
+    let server = std::thread::spawn(move || {
+        for _ in 0..3 {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 1024];
+            let n = stream.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]);
+            let first_line = req.lines().next().unwrap_or("");
+            if first_line.starts_with("GET /redirect ") {
+                stream
+                    .write_all(b"HTTP/1.1 302 Found\r\nLocation: /final.png\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .unwrap();
+            } else {
+                let mut reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    server_png.len()
+                )
+                .into_bytes();
+                reply.extend_from_slice(&server_png);
+                stream.write_all(&reply).unwrap();
+            }
+        }
+    });
+
+    let real_client = gpui_shell::http_client("herdr2-test");
+    let no_follow = block_on(real_client.get(
+        &format!("http://{addr}/redirect"),
+        ().into(),
+        false,
+    ))
+    .unwrap();
+    assert_eq!(no_follow.status().as_u16(), 302);
+    assert_eq!(no_follow.headers().get("location").unwrap().to_str().unwrap(), "/final.png");
+
+    let followed = block_on(real_client.get(
+        &format!("http://{addr}/redirect"),
+        ().into(),
+        true,
+    ))
+    .unwrap();
+    assert_eq!(followed.status().as_u16(), 200);
+    assert_eq!(
+        followed.headers().get("content-length").unwrap().to_str().unwrap(),
+        png_6.len().to_string(),
+    );
+    server.join().unwrap();
+
+    // 2. Verify end-to-end TextView.markdown image resolution across policy boundaries.
+    cx.update(gpui_shell::init);
+    let remote_png = png_6.clone();
+    let fake_client = FakeHttpClient::create(move |req| {
+        let remote_png = remote_png.clone();
+        async move {
+            if req.uri().to_string() == "https://images.example/remote.png" {
+                Ok(Response::builder()
+                    .status(200)
+                    .header("content-type", "image/png")
+                    .body(AsyncBody::from(remote_png))
+                    .unwrap())
+            } else {
+                Ok(Response::builder()
+                    .status(404)
+                    .body(AsyncBody::from(Vec::new()))
+                    .unwrap())
+            }
+        }
+    });
+    cx.update(|cx| cx.set_http_client(fake_client));
+
+    let staged = Staged::new();
+    let ws = staged.0.join("ws");
+    let docs = ws.join("docs");
+    let sub = docs.join("sub");
+    let assets = ws.join("assets");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::create_dir_all(&assets).unwrap();
+    std::fs::write(sub.join("rel.png"), &png_2).unwrap();
+    std::fs::write(assets.join("root.png"), &png_3).unwrap();
+    std::fs::write(sub.join("file.png"), &png_4).unwrap();
+    let outside = staged.0.join("outside.png");
+    std::fs::write(&outside, &png_7).unwrap();
+
+    let file_uri = format!("file://{}", sub.join("file.png").display());
+    let data_uri = format!(
+        "data:image/png;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(&png_5)
+    );
+    let md_doc = format!(
+        "![rel](./sub/rel.png)\n\n![root](/assets/root.png)\n\n![file]({file_uri})\n\n<img src=\"{data_uri}\" height=\"24\">\n\n![remote](https://images.example/remote.png)\n\n![outside](../../outside.png)"
+    );
+    let md_json = serde_json::to_string(&md_doc).unwrap();
+    let denied_opts = json!({ "allow_data_images": false });
+    let allowed_opts = json!({
+        "base_dir": docs.to_string_lossy(),
+        "root_dir": ws.to_string_lossy(),
+        "allow_data_images": true,
+    });
+
+    let denied_dir = staged.0.join("tv-denied");
+    std::fs::create_dir_all(&denied_dir).unwrap();
+    std::fs::write(
+        denied_dir.join("main.js"),
+        format!(
+            "import {{ View, div }} from 'gpui-kit';\nimport {{ TextView }} from 'gpui-base';\nexport default class Doc extends View {{ render() {{ return div().size_full().child(TextView.markdown('doc-denied', {md_json}, {denied_opts}).scrollable(false)); }} }}\n"
+        ),
+    )
+    .unwrap();
+
+    gpui_shell::policy::set_default(Policy::new().with_capabilities(Capabilities::new()));
+    let runtime_denied = ShellRuntime::new_isolated().unwrap();
+    let win_denied = cx.add_window(|window, cx| RootedView(runtime_denied.try_load(&denied_dir, window, cx).unwrap()));
+    let mut visual_denied = VisualTestContext::from_window(*win_denied.deref(), cx);
+    for _ in 0..4 {
+        visual_denied.update(|window, cx| window.draw(cx).clear(cx));
+        visual_denied.run_until_parked();
+    }
+    let denied_images = visual_denied.update(|window, _| window.displayed_images());
+    assert!(denied_images.is_empty(), "expected no images without grants/opt-in, got {}", denied_images.len());
+    visual_denied.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+
+    let allowed_dir = staged.0.join("tv-allowed");
+    std::fs::create_dir_all(&allowed_dir).unwrap();
+    std::fs::write(
+        allowed_dir.join("main.js"),
+        format!(
+            "import {{ View, div }} from 'gpui-kit';\nimport {{ TextView }} from 'gpui-base';\nexport default class Doc extends View {{ render() {{ return div().size_full().child(TextView.markdown('doc-allowed', {md_json}, {allowed_opts}).scrollable(false)); }} }}\n"
+        ),
+    )
+    .unwrap();
+
+    gpui_shell::policy::set_default(
+        Policy::new().with_capabilities(
+            Capabilities::new()
+                .read_roots([ws.clone()])
+                .http_requests([HttpRequestGrant::new("images.example", ["GET"], ["/remote.png"], [] as [&str; 0])]),
+        ),
+    );
+    let runtime_allowed = ShellRuntime::new_isolated().unwrap();
+    let win_allowed = cx.add_window(|window, cx| RootedView(runtime_allowed.try_load(&allowed_dir, window, cx).unwrap()));
+    let mut visual_allowed = VisualTestContext::from_window(*win_allowed.deref(), cx);
+    for _ in 0..4 {
+        visual_allowed.update(|window, cx| window.draw(cx).clear(cx));
+        visual_allowed.run_until_parked();
+    }
+    let allowed_sizes: Vec<_> = visual_allowed
+        .update(|window, _| window.displayed_images())
+        .into_iter()
+        .map(|img| img.size(0))
+        .collect();
+    for width in [2, 3, 4, 5, 6] {
+        let expected = gpui::size(width.into(), 1.into());
+        assert!(
+            allowed_sizes.contains(&expected),
+            "expected rendered image width {width}x1 in {:?}",
+            allowed_sizes
+        );
+    }
+    assert!(
+        !allowed_sizes.contains(&gpui::size(7.into(), 1.into())),
+        "outside read_root image 7x1 must not render: {:?}",
+        allowed_sizes
+    );
+
+    visual_allowed.update(|window, _| window.remove_window());
+    gpui_shell::policy::set_default(Policy::new());
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn files_mod_shows_collapsible_tree_and_edits_markdown_in_preview(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, VisualTestContext, point, px};
+    use std::ops::Deref as _;
+
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let initial_md = "# Title\n\n- [ ] Ship images\n\nBody paragraph.\n";
+    let data_png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAAEUlEQVR4nGMUMgn7z8DAwAAACQ0BnfdmzRUAAAAASUVORK5CYII=";
+
+    // 1. Right-side tree + Markdown preview without Split, Wrap, or Open-in-Tab.
+    let calls_open = Rc::new(RefCell::new(Calls::default()));
+    calls_open.borrow_mut().files.insert("/fixture/project/README.md".into(), initial_md.into());
+    let policy_open = Policy::new()
+        .with_storage_path(staged.0.join("store-files-open.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(module(fixture(true, json!({ "file": "README.md" }), updates("current", "current")), calls_open.clone()))
+        .unwrap();
+    let runtime_open = ShellRuntime::new_isolated().unwrap();
+    let win_open = cx.add_window(|_, _| Empty);
+    let mut sess_open = win_open
+        .update(cx, |_, window, cx| {
+            let mut session = DescriptionSession::load(runtime_open, staged.0.join("mods/files"), policy_open, window, cx).unwrap();
+            let _ = session.describe(window, cx).unwrap();
+            session
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let tree_open = win_open.update(cx, |_, window, cx| sess_open.describe(window, cx).unwrap()).unwrap();
+    win_open.update(cx, |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+
+    assert!(calls_open.borrow().unexpected.is_empty(), "unexpected host calls: {:?}", calls_open.borrow().unexpected);
+    for expected in [
+        "files-split",
+        "files-tree",
+        "README.md",
+        "src",
+        "files-collapse-tree",
+        "files-toggle-tree",
+        "mods/files/panel-right.svg",
+        "files-md-view",
+        "files-md-preview",
+        "files-md-code",
+        "files-md-block-0",
+        "files-md-block-1",
+        "files-md-block-2",
+        "files-task-1-0",
+    ] {
+        assert!(tree_open.contains(expected), "side-by-side files view missing {expected}: {tree_open}");
+    }
+    let md_pos = tree_open.find("files-md-view").expect("files-md-view missing");
+    let tree_pos = tree_open.find("files-tree").expect("files-tree missing");
+    assert!(md_pos < tree_pos, "file tree must appear to the right of Markdown viewer: {tree_open}");
+    assert!(!tree_open.contains("files-md-split"), "Split mode button must be removed: {tree_open}");
+    assert!(!tree_open.contains("files-wrap"), "Wrap button must be removed: {tree_open}");
+    assert!(!tree_open.contains("files-open-tab"), "Open in Tab button must be removed: {tree_open}");
+
+    // 2. Collapsible file tree hides treeSidebar while keeping Markdown preview & toggle button.
+    let calls_collapsed = Rc::new(RefCell::new(Calls::default()));
+    calls_collapsed.borrow_mut().files.insert("/fixture/project/README.md".into(), initial_md.into());
+    let policy_collapsed = Policy::new()
+        .with_storage_path(staged.0.join("store-files-collapsed.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(module(fixture(true, json!({ "file": "README.md" }), updates("current", "current")), calls_collapsed.clone()))
+        .unwrap();
+    let collapsed_dir = staged.wrapper("mods/files", "this.setTreeOpen(false, cx);");
+    let runtime_collapsed = ShellRuntime::new_isolated().unwrap();
+    let win_collapsed = cx.add_window(|_, _| Empty);
+    let mut sess_collapsed = win_collapsed
+        .update(cx, |_, window, cx| {
+            let mut session = DescriptionSession::load(runtime_collapsed, collapsed_dir, policy_collapsed, window, cx).unwrap();
+            let _ = session.describe(window, cx).unwrap();
+            session
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let tree_collapsed = win_collapsed.update(cx, |_, window, cx| sess_collapsed.describe(window, cx).unwrap()).unwrap();
+    win_collapsed.update(cx, |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+
+    assert!(calls_collapsed.borrow().unexpected.is_empty(), "unexpected host calls: {:?}", calls_collapsed.borrow().unexpected);
+    assert!(!tree_collapsed.contains("files-tree"), "collapsed tree must not build files-tree: {tree_collapsed}");
+    assert!(tree_collapsed.contains("files-md-view"), "collapsed tree must keep files-md-view: {tree_collapsed}");
+    assert!(tree_collapsed.contains("files-toggle-tree"), "collapsed tree must keep expand toggle: {tree_collapsed}");
+    assert_eq!(calls_collapsed.borrow().shared.get("files.treeOpen"), Some(&json!(false)));
+
+    // 3. Real mouse click + real keystroke editing in Markdown Preview, Escape commit, and Ctrl+S save (local workspace).
+    let calls_edit = Rc::new(RefCell::new(Calls::default()));
+    calls_edit.borrow_mut().files.insert("/fixture/project/README.md".into(), initial_md.into());
+    calls_edit.borrow_mut().shared.insert("files.treeOpen".into(), json!(false));
+    gpui_shell::policy::set_default(
+        Policy::new()
+            .with_storage_path(staged.0.join("store-files-edit.json"))
+            .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+            .with_host_module(module(fixture(true, json!({ "file": "README.md" }), updates("current", "current")), calls_edit.clone()))
+            .unwrap(),
+    );
+    let runtime_edit = ShellRuntime::new_isolated().unwrap();
+    let win_edit = cx.add_window(|window, cx| RootedView(runtime_edit.try_load(&staged.0.join("mods/files"), window, cx).unwrap()));
+    let view_edit: gpui::Entity<gpui_shell::ScriptView> = win_edit
+        .read_with(cx, |root, cx| root.0.read(cx).content().clone().downcast().unwrap())
+        .unwrap();
+    let mut visual = VisualTestContext::from_window(*win_edit.deref(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+
+    visual.simulate_click(point(px(80.), px(60.)), Modifiers::default());
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let opened_editor_tree = visual.update(|_, cx| {
+        view_edit.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
+    });
+    assert!(opened_editor_tree.contains("files-md-block-editor"), "clicking #files-md-block-0 must open inline block editor: {opened_editor_tree}");
+    assert!(!opened_editor_tree.contains("files-md-block-done"), "Typora block editor must not show header chrome/Done button: {opened_editor_tree}");
+
+    visual.simulate_keystrokes("!");
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let dirty_tree = visual.update(|_, cx| {
+        view_edit.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
+    });
+    assert!(dirty_tree.contains("files-save"), "Save button must appear after typing in block editor: {dirty_tree}");
+
+    // Down arrow at end of heading block seamlessly commits and moves cursor into next block.
+    visual.simulate_keystrokes("down");
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let after_down_tree = visual.update(|_, cx| {
+        view_edit.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
+    });
+    assert!(after_down_tree.contains("# Title!"), "Down arrow must commit previous block edit: {after_down_tree}");
+    assert!(after_down_tree.contains("files-md-block-editor"), "Down arrow must enter editing on next block: {after_down_tree}");
+
+    visual.simulate_keystrokes("escape");
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let committed_tree = visual.update(|_, cx| {
+        view_edit.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
+    });
+    assert!(!committed_tree.contains("files-md-block-editor"), "Escape must commit and close block editor: {committed_tree}");
+    assert!(committed_tree.contains("# Title!"), "committed block edit missing updated heading: {committed_tree}");
+
+    visual.simulate_click(point(px(300.), px(18.)), Modifiers::default());
+    visual.simulate_keystrokes("ctrl-s");
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    let saved_tree = visual.update(|_, cx| {
+        view_edit.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
+    });
+    assert_eq!(
+        calls_edit.borrow().writes,
+        vec![(
+            "/fixture/project/README.md".to_owned(),
+            "# Title!\n\n- [ ] Ship images\n\nBody paragraph.\n".to_owned(),
+            json!(initial_md),
+            Value::Null,
+        )],
+        "unexpected local writes: {:?}",
+        calls_edit.borrow().writes,
+    );
+    assert!(!saved_tree.contains("files-save"), "Save button should disappear after Ctrl+S save: {saved_tree}");
+    assert!(calls_edit.borrow().unexpected.is_empty(), "unexpected host calls: {:?}", calls_edit.borrow().unexpected);
+
+    visual.update(|window, _| window.remove_window());
+    gpui_shell::policy::set_default(Policy::new());
+    cx.run_until_parked();
+
+    // 4. Remote / WSL workspace editing in Markdown Preview passes { on: "remote" } to writeTextFile.
+    let mut remote_values = fixture(true, json!({ "file": "README.md" }), updates("current", "current"));
+    let program = json!({"key":"pi", "name":"Pi", "icon":null, "tint":true, "tile":"#334455", "color":"#aabbcc", "shell":false, "agent":true});
+    remote_values.insert("spaces".into(), json!([
+        {"id":"s1","index":1,"name":"Local","folder":"/fixture/project","machine":null,"branch":"main","active":false,"status":"working","tabs":[{"id":"tab1","index":1,"name":"Build","active":true,"status":"working","panes":1,"zoomed":false,"settled":false,"settled_at":null}]},
+        {"id":"s2","index":2,"name":"Remote","folder":"/remote/project","machine":"remote","branch":null,"active":true,"status":"done","tabs":[{"id":"tab2","index":1,"name":"Done","active":true,"status":"done","panes":1,"zoomed":false,"settled":false,"settled_at":null}]}
+    ]));
+    remote_values.insert("panes".into(), json!([
+        {"pane":"p2","terminal":"t2","tab":"tab2","title":"Remote task","cwd":"/remote/project","branch":null,"status":"done","app":"pi","program":program,"focused":true,"zoomed":false}
+    ]));
+    remote_values.insert("focused".into(), json!({"space":"s2","tab":"tab2","pane":"p2","terminal":"t2","agent":"t2","shown":null,"cwd":"/remote/project"}));
+
+    let calls_remote = Rc::new(RefCell::new(Calls::default()));
+    calls_remote.borrow_mut().files.insert("/remote/project/README.md".into(), initial_md.into());
+    calls_remote.borrow_mut().shared.insert("files.treeOpen".into(), json!(false));
+    gpui_shell::policy::set_default(
+        Policy::new()
+            .with_storage_path(staged.0.join("store-files-remote.json"))
+            .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+            .with_host_module(module(remote_values, calls_remote.clone()))
+            .unwrap(),
+    );
+    let runtime_remote = ShellRuntime::new_isolated().unwrap();
+    let win_remote = cx.add_window(|window, cx| RootedView(runtime_remote.try_load(&staged.0.join("mods/files"), window, cx).unwrap()));
+    let view_remote: gpui::Entity<gpui_shell::ScriptView> = win_remote
+        .read_with(cx, |root, cx| root.0.read(cx).content().clone().downcast().unwrap())
+        .unwrap();
+    let mut remote_visual = VisualTestContext::from_window(*win_remote.deref(), cx);
+    remote_visual.update(|window, cx| window.draw(cx).clear(cx));
+    remote_visual.run_until_parked();
+    remote_visual.update(|window, cx| window.draw(cx).clear(cx));
+
+    remote_visual.simulate_click(point(px(80.), px(60.)), Modifiers::default());
+    remote_visual.run_until_parked();
+    remote_visual.update(|window, cx| window.draw(cx).clear(cx));
+    let remote_editor_tree = remote_visual.update(|_, cx| {
+        view_remote.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
+    });
+    assert!(remote_editor_tree.contains("files-md-block-editor"), "remote workspace click must open block editor: {remote_editor_tree}");
+
+    remote_visual.simulate_keystrokes("!");
+    remote_visual.simulate_keystrokes("escape");
+    remote_visual.run_until_parked();
+    remote_visual.update(|window, cx| window.draw(cx).clear(cx));
+    remote_visual.simulate_click(point(px(300.), px(18.)), Modifiers::default());
+    remote_visual.simulate_keystrokes("ctrl-s");
+    remote_visual.run_until_parked();
+    remote_visual.update(|window, cx| window.draw(cx).clear(cx));
+    assert_eq!(
+        calls_remote.borrow().writes,
+        vec![(
+            "/remote/project/README.md".to_owned(),
+            "# Title!\n\n- [ ] Ship images\n\nBody paragraph.\n".to_owned(),
+            json!(initial_md),
+            json!("remote"),
+        )],
+        "unexpected remote writes: {:?}",
+        calls_remote.borrow().writes,
+    );
+    assert!(calls_remote.borrow().unexpected.is_empty(), "unexpected host calls: {:?}", calls_remote.borrow().unexpected);
+
+    remote_visual.update(|window, _| window.remove_window());
+    gpui_shell::policy::set_default(Policy::new());
+    cx.run_until_parked();
+
+    // 5. Source code file (.rs) is directly editable and savable, with Wrap/Open-in-Tab removed.
+    let initial_rs = "fn main() {}\n";
+    let calls_code = Rc::new(RefCell::new(Calls::default()));
+    calls_code.borrow_mut().files.insert("/fixture/project/src/main.rs".into(), initial_rs.into());
+    calls_code.borrow_mut().shared.insert("files.treeOpen".into(), json!(false));
+    gpui_shell::policy::set_default(
+        Policy::new()
+            .with_storage_path(staged.0.join("store-files-code.json"))
+            .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+            .with_host_module(module(fixture(true, json!({ "file": "src/main.rs" }), updates("current", "current")), calls_code.clone()))
+            .unwrap(),
+    );
+    let runtime_code = ShellRuntime::new_isolated().unwrap();
+    let win_code = cx.add_window(|window, cx| RootedView(runtime_code.try_load(&staged.0.join("mods/files"), window, cx).unwrap()));
+    let view_code: gpui::Entity<gpui_shell::ScriptView> = win_code
+        .read_with(cx, |root, cx| root.0.read(cx).content().clone().downcast().unwrap())
+        .unwrap();
+    let mut code_visual = VisualTestContext::from_window(*win_code.deref(), cx);
+    code_visual.update(|window, cx| window.draw(cx).clear(cx));
+    code_visual.run_until_parked();
+    code_visual.update(|window, cx| window.draw(cx).clear(cx));
+
+    let code_tree = code_visual.update(|_, cx| {
+        view_code.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
+    });
+    assert!(code_tree.contains("files-code-view"), "source file missing files-code-view: {code_tree}");
+    assert!(!code_tree.contains("files-wrap"), "source file toolbar must not have Wrap button: {code_tree}");
+    assert!(!code_tree.contains("files-open-tab"), "source file toolbar must not have Open in Tab button: {code_tree}");
+
+    code_visual.simulate_click(point(px(120.), px(80.)), Modifiers::default());
+    code_visual.simulate_keystrokes("/");
+    code_visual.run_until_parked();
+    code_visual.update(|window, cx| window.draw(cx).clear(cx));
+    let dirty_code_tree = code_visual.update(|_, cx| {
+        view_code.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
+    });
+    assert!(dirty_code_tree.contains("files-save"), "Save button must appear after typing in source code editor: {dirty_code_tree}");
+
+    code_visual.simulate_keystrokes("ctrl-s");
+    code_visual.run_until_parked();
+    code_visual.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(
+        calls_code.borrow().writes.len() == 1
+            && calls_code.borrow().writes[0].0 == "/fixture/project/src/main.rs"
+            && calls_code.borrow().writes[0].1.contains('/'),
+        "expected modified src/main.rs write with '/', got {:?}",
+        calls_code.borrow().writes,
+    );
+    assert!(calls_code.borrow().unexpected.is_empty(), "unexpected host calls: {:?}", calls_code.borrow().unexpected);
+
+    code_visual.update(|window, _| window.remove_window());
+    gpui_shell::policy::set_default(Policy::new());
+    cx.run_until_parked();
+
+    // 6. Binary image preview renders files-image-view via readImageDataUrl.
+    let calls_img = Rc::new(RefCell::new(Calls::default()));
+    calls_img.borrow_mut().images.insert("/fixture/project/hero.png".into(), data_png.into());
+    let policy_img = Policy::new()
+        .with_storage_path(staged.0.join("store-files-img.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(module(fixture(true, json!({ "file": "hero.png" }), updates("current", "current")), calls_img.clone()))
+        .unwrap();
+    let runtime_img = ShellRuntime::new_isolated().unwrap();
+    let win_img = cx.add_window(|_, _| Empty);
+    let mut sess_img = win_img
+        .update(cx, |_, window, cx| {
+            let mut session = DescriptionSession::load(runtime_img, staged.0.join("mods/files"), policy_img, window, cx).unwrap();
+            let _ = session.describe(window, cx).unwrap();
+            session
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let img_tree = win_img.update(cx, |_, window, cx| sess_img.describe(window, cx).unwrap()).unwrap();
+    win_img.update(cx, |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+
+    assert!(calls_img.borrow().unexpected.is_empty(), "unexpected host calls: {:?}", calls_img.borrow().unexpected);
+    assert!(img_tree.contains("files-image-view"), "binary image preview missing files-image-view: {img_tree}");
+    assert!(img_tree.contains("PNG"), "binary image preview missing PNG badge: {img_tree}");
+
+    // 7. Typora direct visual table cell editing, fenced code block card, and debounced auto-save.
+    let spec_md = "| Name | Role |\n| :--- | ---: |\n| Alice | Dev |\n\n```rust\nfn demo() {}\n```\n";
+    let calls_typora = Rc::new(RefCell::new(Calls::default()));
+    calls_typora.borrow_mut().files.insert("/fixture/project/SPEC.md".into(), spec_md.into());
+    calls_typora.borrow_mut().shared.insert("files.treeOpen".into(), json!(false));
+    gpui_shell::policy::set_default(
+        Policy::new()
+            .with_storage_path(staged.0.join("store-files-typora.json"))
+            .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+            .with_host_module(module(fixture(true, json!({ "file": "SPEC.md" }), updates("current", "current")), calls_typora.clone()))
+            .unwrap(),
+    );
+    let runtime_typora = ShellRuntime::new_isolated().unwrap();
+    let win_typora = cx.add_window(|window, cx| RootedView(runtime_typora.try_load(&staged.0.join("mods/files"), window, cx).unwrap()));
+    let view_typora: gpui::Entity<gpui_shell::ScriptView> = win_typora
+        .read_with(cx, |root, cx| root.0.read(cx).content().clone().downcast().unwrap())
+        .unwrap();
+    let mut typora_visual = VisualTestContext::from_window(*win_typora.deref(), cx);
+    typora_visual.update(|window, cx| window.draw(cx).clear(cx));
+    typora_visual.run_until_parked();
+    typora_visual.update(|window, cx| window.draw(cx).clear(cx));
+
+    let typora_init_tree = typora_visual.update(|_, cx| {
+        view_typora.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
+    });
+    for expected in [
+        "files-md-table-0",
+        "files-md-cell-0-h-0",
+        "files-md-cell-0-0-1",
+        "files-md-code-block-1",
+        "files-md-code-lang-1",
+        "files-md-code-body-1",
+    ] {
+        assert!(typora_init_tree.contains(expected), "Typora preview missing {expected}: {typora_init_tree}");
+    }
+
+    // Click header cell (0, h, 0) ("Name"), type "!", wait for debounced auto-save without pressing Ctrl+S.
+    typora_visual.simulate_click(point(px(80.), px(64.)), Modifiers::default());
+    typora_visual.run_until_parked();
+    typora_visual.update(|window, cx| window.draw(cx).clear(cx));
+    let cell_open_tree = typora_visual.update(|_, cx| {
+        view_typora.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
+    });
+    assert!(cell_open_tree.contains("files-md-table-cell-editor"), "clicking table cell must open inline input: {cell_open_tree}");
+
+    typora_visual.simulate_keystrokes("!");
+    typora_visual.run_until_parked();
+    typora_visual.executor().advance_clock(std::time::Duration::from_millis(1000));
+    typora_visual.run_until_parked();
+    typora_visual.update(|window, cx| window.draw(cx).clear(cx));
+    let autosaved_tree = typora_visual.update(|_, cx| {
+        view_typora.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
+    });
+    assert!(autosaved_tree.contains("files-md-table-cell-editor"), "debounced auto-save must keep active cell editor open: {autosaved_tree}");
+    assert_eq!(calls_typora.borrow().writes.len(), 1, "expected 1 debounced auto-save write: {:?}", calls_typora.borrow().writes);
+    assert!(calls_typora.borrow().writes[0].1.contains("Name!"), "auto-saved table missing 'Name!': {:?}", calls_typora.borrow().writes);
+
+    // Click fenced code block body below the table to open direct code-body editor (without raw ``` markers).
+    typora_visual.simulate_click(point(px(120.), px(175.)), Modifiers::default());
+    typora_visual.run_until_parked();
+    typora_visual.update(|window, cx| window.draw(cx).clear(cx));
+    let code_open_tree = typora_visual.update(|_, cx| {
+        view_typora.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
+    });
+    assert!(code_open_tree.contains("files-md-code-editor"), "clicking code block body must open inline code editor: {code_open_tree}");
+    assert!(calls_typora.borrow().unexpected.is_empty(), "unexpected host calls: {:?}", calls_typora.borrow().unexpected);
+
+    typora_visual.update(|window, _| window.remove_window());
+    gpui_shell::policy::set_default(Policy::new());
+    cx.run_until_parked();
+
+    // 8. Multi-file switching: same-language EditorState reuse and immediate cached Markdown restoration.
+    let calls_switch = Rc::new(RefCell::new(Calls::default()));
+    {
+        let mut f = calls_switch.borrow_mut();
+        f.files.insert("/fixture/project/README.md".into(), initial_md.into());
+        f.files.insert("/fixture/project/src/main.rs".into(), "fn main() {}\n".into());
+        f.files.insert("/fixture/project/src/lib.rs".into(), "pub fn lib_fn() -> usize { 42 }\n".into());
+        f.shared.insert("files.treeOpen".into(), json!(false));
+    }
+    let switch_dir = staged.0.clone();
+    std::fs::write(
+        switch_dir.join("main.js"),
+        r#"import Real from './mods/files/main.js';
+import { div } from 'gpui-kit';
+export default class SwitchTest extends Real {
+  init(props, cx) {
+    super.init(props, cx);
+    this.trackedFile = null;
+    this.trackedCode = null;
+    this.codeReusedCount = 0;
+  }
+  render(cx) {
+    const out = super.render(cx);
+    if (this.file && !this.loadingFile && !this.fileError) {
+      if (this.trackedFile !== this.file) {
+        if (this.trackedFile && this.trackedCode && this.code && this.trackedCode === this.code) {
+          this.codeReusedCount++;
+        }
+        this.trackedFile = this.file;
+        this.trackedCode = this.code;
+      } else if (!this.trackedCode && this.code) {
+        this.trackedCode = this.code;
+      }
+    }
+    return div()
+      .size_full()
+      .id(`switch-reused-${this.codeReusedCount}`)
+      .on_key_down((e, cx) => {
+        if (e.key === "1") this.show("README.md", cx);
+        else if (e.key === "2") this.show("src/main.rs", cx);
+        else if (e.key === "3") this.show("src/lib.rs", cx);
+      })
+      .child(out);
+  }
+}
+"#,
+    )
+    .unwrap();
+    gpui_shell::policy::set_default(
+        Policy::new()
+            .with_storage_path(staged.0.join("store-files-switch.json"))
+            .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+            .with_host_module(module(fixture(true, json!({ "file": "README.md" }), updates("current", "current")), calls_switch.clone()))
+            .unwrap(),
+    );
+    let runtime_switch = ShellRuntime::new_isolated().unwrap();
+    let win_switch = cx.add_window(|window, cx| RootedView(runtime_switch.try_load(&switch_dir, window, cx).unwrap()));
+    let view_switch: gpui::Entity<gpui_shell::ScriptView> = win_switch
+        .read_with(cx, |root, cx| root.0.read(cx).content().clone().downcast().unwrap())
+        .unwrap();
+    let mut switch_visual = VisualTestContext::from_window(*win_switch.deref(), cx);
+    switch_visual.update(|window, cx| window.draw(cx).clear(cx));
+    switch_visual.run_until_parked();
+    switch_visual.update(|window, cx| window.draw(cx).clear(cx));
+
+    // Focus the panel cleanly, then switch to src/main.rs -> src/lib.rs (same Rust language).
+    switch_visual.simulate_click(point(px(20.), px(20.)), Modifiers::default());
+    switch_visual.simulate_keystrokes("2");
+    switch_visual.run_until_parked();
+    switch_visual.update(|window, cx| window.draw(cx).clear(cx));
+    let main_tree = switch_visual.update(|_, cx| {
+        view_switch.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
+    });
+    assert!(main_tree.contains("text \"main.rs\""), "expected main.rs in tree: {main_tree}");
+    assert!(main_tree.contains("files-code-view"), "expected files-code-view for src/main.rs: {main_tree}");
+    assert!(!main_tree.contains("Loading file"), "must not flash loading indicator: {main_tree}");
+
+    switch_visual.simulate_keystrokes("3");
+    switch_visual.run_until_parked();
+    switch_visual.update(|window, cx| window.draw(cx).clear(cx));
+    let lib_tree = switch_visual.update(|_, cx| {
+        view_switch.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
+    });
+    assert!(lib_tree.contains("text \"lib.rs\""), "expected lib.rs in tree: {lib_tree}");
+    assert!(lib_tree.contains("files-code-view"), "expected files-code-view for src/lib.rs: {lib_tree}");
+    assert!(lib_tree.contains("switch-reused-1"), "expected EditorState reuse across Rust files: {lib_tree}");
+
+    // Switching back to cached README.md updates synchronously on the first draw before async tasks run.
+    switch_visual.simulate_keystrokes("1");
+    switch_visual.update(|window, cx| window.draw(cx).clear(cx));
+    let cached_md_tree = switch_visual.update(|_, cx| {
+        view_switch.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
+    });
+    assert!(cached_md_tree.contains("files-md-view"), "cached Markdown must render on first frame: {cached_md_tree}");
+    assert!(cached_md_tree.contains("# Title"), "cached Markdown content missing on first frame: {cached_md_tree}");
+    assert!(!cached_md_tree.contains("Loading file"), "cached Markdown switch must not flash Loading: {cached_md_tree}");
+
+    switch_visual.run_until_parked();
+    assert!(calls_switch.borrow().unexpected.is_empty(), "unexpected host calls: {:?}", calls_switch.borrow().unexpected);
+    assert!(calls_switch.borrow().reads.iter().any(|p| p.ends_with("src/main.rs")), "expected read of src/main.rs");
+    assert!(calls_switch.borrow().reads.iter().any(|p| p.ends_with("src/lib.rs")), "expected read of src/lib.rs");
+
+    switch_visual.update(|window, _| window.remove_window());
     gpui_shell::policy::set_default(Policy::new());
     cx.run_until_parked();
 }

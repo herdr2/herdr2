@@ -123,6 +123,7 @@ impl DroveRuntime {
                             efforts: a.efforts.clone(),
                             default_effort: a.default_effort.clone(),
                             agent_info: a.agent_info.clone(),
+                            model_contexts: a.model_contexts.clone(),
                         },
                     );
                 }
@@ -225,6 +226,7 @@ impl DroveRuntime {
                             efforts: a.efforts.clone(),
                             default_effort: a.default_effort.clone(),
                             agent_info: a.agent_info.clone(),
+                            model_contexts: a.model_contexts.clone(),
                         },
                     );
                 } else if let Some(saved) = map.get(&a.id) {
@@ -241,6 +243,9 @@ impl DroveRuntime {
                     if a.agent_info.is_none() {
                         a.agent_info = saved.agent_info.clone();
                     }
+                    if a.model_contexts.is_empty() && !saved.model_contexts.is_empty() {
+                        a.model_contexts = saved.model_contexts.clone();
+                    }
                 } else if a.installed && !a.models.is_empty() {
                     map.insert(
                         a.id.clone(),
@@ -250,6 +255,7 @@ impl DroveRuntime {
                             efforts: a.efforts.clone(),
                             default_effort: a.default_effort.clone(),
                             agent_info: a.agent_info.clone(),
+                            model_contexts: a.model_contexts.clone(),
                         },
                     );
                 }
@@ -290,6 +296,20 @@ impl DroveRuntime {
         let map = self.worker_tokens.lock().unwrap_or_else(|p| p.into_inner());
         map.get(worker_id)
             .is_some_and(|expected| crypto::secure_eq(expected, token))
+    }
+
+    pub fn has_worker_token(&self, worker_id: &str) -> bool {
+        self.worker_tokens
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(worker_id)
+    }
+
+    pub fn remove_worker_token(&self, worker_id: &str) {
+        self.worker_tokens
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(worker_id);
     }
 
     pub fn try_reserve_task(&self, task_id: &str) -> bool {
@@ -498,6 +518,9 @@ impl DroveRuntime {
             key_masked: key.as_deref().map(mask_key),
             base_url: cfg.ai.base_url.clone(),
             model: cfg.ai.model.clone(),
+            effort: cfg.ai.effort.clone(),
+            context_window: cfg.ai.context_window.clone(),
+            max_tokens: cfg.ai.max_tokens,
             available_models: self.ai_models_cache.lock().unwrap_or_else(|p| p.into_inner()).clone(),
             circuit_open: cir.circuit_open,
             cooldown_until: cir.cooldown_until.clone(),
@@ -505,12 +528,12 @@ impl DroveRuntime {
             last_error: cir.last_error.clone(),
             switches: AiSwitches {
                 verify_digest: cfg.ai.verify_digest,
-                handover_compact: true,
+                handover_compact: cfg.ai.handover_compact,
                 auto_title: cfg.ai.auto_title,
                 task_enrich: cfg.ai.task_enrich,
                 conflict_policy: cfg.ai.conflict_policy.clone(),
                 question_mode: cfg.ai.question_mode.clone(),
-                loop_detect: "off".into(),
+                loop_detect: cfg.ai.loop_detect.clone(),
             },
         }
     }
@@ -587,11 +610,28 @@ impl DroveRuntime {
             if let Some(s) = ai.model {
                 next.ai.model = s;
             }
+            if let Some(s) = ai.effort {
+                next.ai.effort = s;
+            }
+            if let Some(s) = ai.context_window {
+                let clean = s.trim().to_ascii_lowercase();
+                next.ai.context_window = if clean.is_empty() || clean == "auto" || clean == "default" {
+                    None
+                } else {
+                    Some(clean)
+                };
+            }
+            if let Some(n) = ai.max_tokens {
+                next.ai.max_tokens = if n == 0 { None } else { Some(n) };
+            }
             if let Some(b) = ai.auto_title {
                 next.ai.auto_title = b;
             }
             if let Some(b) = ai.verify_digest {
                 next.ai.verify_digest = b;
+            }
+            if let Some(b) = ai.handover_compact {
+                next.ai.handover_compact = b;
             }
             if let Some(b) = ai.task_enrich {
                 next.ai.task_enrich = b;
@@ -601,6 +641,9 @@ impl DroveRuntime {
             }
             if let Some(s) = ai.conflict_policy {
                 next.ai.conflict_policy = s;
+            }
+            if let Some(s) = ai.loop_detect {
+                next.ai.loop_detect = s;
             }
             patch_api_key = ai.api_key;
             patch_clear = ai.clear_key.unwrap_or(false);
@@ -793,8 +836,13 @@ pub fn start_background(core: &Arc<Core>) {
     tokio::spawn(scheduler::run_scheduler_loop(core.clone()));
 }
 
-pub async fn worktree_for_task(core: &Arc<Core>, run: &Run, task: &Task) -> Result<(String, Option<String>), String> {
-    integrate::prepare_task_worktree(core, run, task).await
+pub async fn worktree_for_task(
+    core: &Arc<Core>,
+    run: &Run,
+    task: &Task,
+    reuse_worktree: Option<&str>,
+) -> Result<(String, Option<String>), String> {
+    integrate::prepare_task_worktree(core, run, task, reuse_worktree).await
 }
 
 pub async fn fail_or_retry_task(
@@ -927,6 +975,7 @@ mod tests {
                 default_model: Some("claude-sonnet-4-6".into()),
                 efforts: vec!["low".into(), "medium".into(), "high".into()],
                 default_effort: Some("high".into()),
+                model_contexts: BTreeMap::new(),
                 error: None,
             }],
         };
@@ -955,6 +1004,7 @@ mod tests {
                 default_model: None,
                 efforts: vec![],
                 default_effort: None,
+                model_contexts: BTreeMap::new(),
                 error: Some("ACP probe timed out after 10s".into()),
             }],
         };

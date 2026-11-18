@@ -35,7 +35,6 @@ export function fmtTokens(n: number): string {
 }
 
 export const USD_TO_CNY = 7.2;
-export const DEEPSEEK_USD_TO_CNY = USD_TO_CNY;
 
 /** Format a USD-stored token cost in RMB (¥) using the 7.2 RMB/USD rate. */
 export function fmtCost(usd: number | undefined | null): string {
@@ -47,11 +46,6 @@ export function fmtCost(usd: number | undefined | null): string {
   if (abs < 0.0001) return `${sign}¥${abs.toFixed(6)}`;
   if (abs < 1) return `${sign}¥${abs.toFixed(4)}`;
   return `${sign}¥${abs.toFixed(2)}`;
-}
-
-/** Format USD-stored DeepSeek control-plane cost back into native RMB (¥) using the 7.2 RMB/USD rate in src/ai/deepseek.ts. */
-export function fmtDeepSeekCny(usd: number | undefined | null): string {
-  return fmtCost(usd);
 }
 
 export function fmtDuration(start: string, end?: string, now = Date.now()): string {

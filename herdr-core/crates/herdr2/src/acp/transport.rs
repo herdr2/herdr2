@@ -34,7 +34,18 @@ pub enum CallError {
 impl CallError {
     pub fn into_rpc_error(self, context: &str, stderr: &str) -> RpcError {
         let base = match self {
-            Self::Rpc(e) => format!("{context}: {} (code {})", e.message, e.code),
+            Self::Rpc(e) => {
+                let detail = e
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.as_str().or_else(|| d.get("message").and_then(Value::as_str)))
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case(&e.message));
+                match detail {
+                    Some(d) => format!("{context}: {}: {d} (code {})", e.message, e.code),
+                    None => format!("{context}: {} (code {})", e.message, e.code),
+                }
+            }
             Self::Io(e) => format!("{context}: {e}"),
             Self::Timeout => format!("{context}: timed out waiting for ACP response"),
             Self::Closed => format!("{context}: agent closed stdio before replying"),
@@ -77,6 +88,8 @@ pub struct Transport {
 
 pub struct ChildWaiter {
     child: Child,
+    inner: Arc<Inner>,
+    reaped: bool,
     stderr_task: tokio::task::JoinHandle<()>,
     writer_task: tokio::task::JoinHandle<()>,
     stdout_task: tokio::task::JoinHandle<()>,
@@ -85,10 +98,25 @@ pub struct ChildWaiter {
 impl ChildWaiter {
     pub async fn wait(mut self) -> std::io::Result<ExitStatus> {
         let status = self.child.wait().await;
-        let _ = tokio::time::timeout(Duration::from_millis(250), self.stderr_task).await;
-        let _ = tokio::time::timeout(Duration::from_millis(250), self.stdout_task).await;
+        self.reaped = true;
+        let _ = tokio::time::timeout(Duration::from_millis(250), &mut self.stderr_task).await;
+        let _ = tokio::time::timeout(Duration::from_millis(250), &mut self.stdout_task).await;
         self.writer_task.abort();
         status
+    }
+}
+
+impl Drop for ChildWaiter {
+    fn drop(&mut self) {
+        if !self.reaped {
+            if let Some(pid) = self.inner.pid {
+                platform::signal_agent(pid, platform::signal::KILL);
+            }
+            self.inner.guard.terminate();
+        }
+        self.stderr_task.abort();
+        self.stdout_task.abort();
+        self.writer_task.abort();
     }
 }
 
@@ -204,7 +232,11 @@ impl Transport {
             }
         });
 
-        Ok((Transport { inner }, ChildWaiter { child, stderr_task, writer_task, stdout_task }, inbound_rx))
+        Ok((
+            Transport { inner: inner.clone() },
+            ChildWaiter { child, inner, reaped: false, stderr_task, writer_task, stdout_task },
+            inbound_rx,
+        ))
     }
 
     pub fn pid(&self) -> Option<u32> {

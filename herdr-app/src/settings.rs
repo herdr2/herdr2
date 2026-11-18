@@ -27,17 +27,17 @@ struct Palette {
     status: Option<[u32; 3]>,
 }
 
-const DARK_STATUS: Option<[u32; 3]> = Some([0xe5c07b, 0xf0705f, 0x76a8ff]);
+const DARK_STATUS: Option<[u32; 3]> = Some([0xf59e0b, 0xf87171, 0x60a5fa]);
 
 const GRAPHITE: Palette = Palette {
-    background: 0x17191d,
-    foreground: 0xd2d4d9,
-    selection: 0x394454,
+    background: 0x000000,
+    foreground: 0xf4f4f5,
+    selection: 0x26324d,
     cursor: None,
     status: DARK_STATUS,
     ansi: [
-        0x45484f, 0xdc8c95, 0xa6bd91, 0xd8be87, 0x96b2d7, 0xb5a2ce, 0x8cbdc3, 0xd2d4d9, 0x818793, 0xf0a5ad, 0xbad5a2, 0xead2a1, 0xb0cbef,
-        0xcbb7e6, 0xa4d5db, 0xf0f0f2,
+        0x27272a, 0xf87171, 0x4ade80, 0xfacc15, 0x5c7cfa, 0xc084fc, 0x38bdf8, 0xd4d4d8, 0x71717a, 0xfca5a5, 0x86efac, 0xfde047, 0x748ffc,
+        0xd8b4fe, 0x7dd3fc, 0xfafafa,
     ],
 };
 const INK: Palette = Palette {
@@ -63,17 +63,17 @@ const MOSS: Palette = Palette {
     ],
 };
 
-/// Light: white paper, dark ink. Every ANSI color stays readable on white
+/// Light: crisp Zinc-25 paper, Zinc-900 ink. Every ANSI color stays readable on white
 /// (bright white is ink, not white: programs write it as "strong" text).
 const PAPER: Palette = Palette {
-    background: 0xffffff,
-    foreground: 0x25272c,
-    selection: 0xcfdcf5,
-    cursor: Some(0x25272c),
-    status: Some([0x9a6700, 0xc93c2c, 0x2f6fe4]),
+    background: 0xfcfcfd,
+    foreground: 0x18181b,
+    selection: 0xdbe4ff,
+    cursor: Some(0x18181b),
+    status: Some([0xd97706, 0xdc2626, 0x3b5bdb]),
     ansi: [
-        0x25272c, 0xc62a2a, 0x1a7f37, 0x8f5d00, 0x1f62d0, 0x7a45c8, 0x0f6f74, 0x5f6068, 0x7b7e87, 0xd1242f, 0x1f883d, 0x9a6700, 0x0969da,
-        0x8250df, 0x1b7c83, 0x111214,
+        0x18181b, 0xdc2626, 0x16a34a, 0xb45309, 0x3b5bdb, 0x7c3aed, 0x0e7490, 0x52525b, 0x71717a, 0xef4444, 0x22c55e, 0xd97706, 0x4c6ef5,
+        0x9333ea, 0x0891b2, 0x09090b,
     ],
 };
 
@@ -302,25 +302,66 @@ pub type Theme = BTreeMap<String, String>;
 
 /// The panel colors around a palette. `chrome` (sidebars, bars) and
 /// `canvas` (behind cards) step away from the terminal's background:
-/// darker on a dark theme, toward warm grey on a light one.
+/// darker on a dark theme, toward Zinc neutral grey on a light one.
 fn resolve(p: &Palette, overrides: &BTreeMap<String, String>) -> Theme {
     let bg = p.background;
     let light = is_light(bg);
-    let fg = if light { 0x1b1b1e } else { 0xeeeeef };
-    let [working, blocked, done] = p.status.unwrap_or([p.ansi[3], p.ansi[1], p.ansi[4]]);
-    let (popover, raised, hover, selected, border, input, canvas, chrome) = if light {
-        let warm = 0xe8e8e2;
-        (hex(bg), hex(mix(bg, 0, 0.035)), "#0000000c".into(), "#00000012".into(), "#00000017".into(), "#00000026".into(), mix(bg, warm, 0.2), mix(bg, warm, 0.6))
+    let pure_black = !light && bg == 0;
+    let fg = if light {
+        0x18181b
+    } else if pure_black {
+        0xf4f4f5
     } else {
+        0xeeeeef
+    };
+    let [working, blocked, done] = p.status.unwrap_or([p.ansi[3], p.ansi[1], p.ansi[4]]);
+    let (popover, raised, hover, selected, border, input, canvas, chrome, message, code_bg, glass) = if light {
+        let zinc = 0xf4f4f6;
+        let raised = if bg == 0xfcfcfd { "#ededf0".into() } else { hex(mix(bg, 0, 0.045)) };
+        let border = if bg >= 0xf8f8f8 { "#e4e4e7".into() } else { "#00000016".into() };
         (
-            hex(mix(bg, 0xffffff, 0.06)),
-            hex(mix(bg, 0xffffff, 0.09)),
+            "#ffffff".into(),
+            raised,
+            "#0000000a".into(),
+            "#00000010".into(),
+            border,
+            "#0000001f".into(),
+            mix(bg, zinc, 0.25),
+            mix(bg, zinc, 0.75),
+            "#ededf0".into(),
+            "#f4f4f5".into(),
+            "#ffffffeb".into(),
+        )
+    } else if pure_black {
+        (
+            "#0c0c0f".into(),
+            "#141417".into(),
+            "#ffffff0d".into(),
+            "#ffffff16".into(),
+            "#ffffff14".into(),
+            "#ffffff1f".into(),
+            0x000000,
+            0x000000,
+            "#141417".into(),
+            "#0a0a0d".into(),
+            "#0c0c0fe0".into(),
+        )
+    } else {
+        let pop = hex(mix(bg, 0xffffff, 0.06));
+        let rsd = hex(mix(bg, 0xffffff, 0.09));
+        let glass = format!("{pop}e0");
+        (
+            pop,
+            rsd.clone(),
             "#ffffff0e".into(),
             "#ffffff17".into(),
             "#ffffff18".into(),
             "#ffffff24".into(),
             mix(bg, 0, 0.16),
             mix(bg, 0, 0.32),
+            rsd,
+            hex(mix(bg, 0xffffff, 0.035)),
+            glass,
         )
     };
     let mut t: Theme = [
@@ -332,14 +373,17 @@ fn resolve(p: &Palette, overrides: &BTreeMap<String, String>) -> Theme {
         ("chrome", hex(chrome)),
         ("popover", popover),
         ("raised", raised),
+        ("message", message),
+        ("code_bg", code_bg),
+        ("glass", glass),
         ("hover", hover),
         ("selected", selected),
         ("border", border),
         ("input", input),
-        ("muted", hex(mix(bg, fg, if light { 0.66 } else { 0.6 }))),
-        ("dim", hex(mix(bg, fg, if light { 0.46 } else { 0.38 }))),
+        ("muted", hex(mix(bg, fg, if light { 0.66 } else if pure_black { 0.67 } else { 0.6 }))),
+        ("dim", hex(mix(bg, fg, if light || pure_black { 0.46 } else { 0.38 }))),
         ("accent", hex(p.ansi[4])),
-        ("accent_foreground", hex(bg)),
+        ("accent_foreground", hex(if is_light(p.ansi[4]) { 0x09090b } else { 0xffffff })),
         ("solid", hex(fg)),
         ("solid_foreground", hex(if light { 0xffffff } else { mix(bg, 0, 0.28) })),
         ("ring", hex(mix(bg, fg, 0.7))),
@@ -376,6 +420,9 @@ pub struct Person {
     /// Default ACP agent preset or command when starting a new pane with empty argv.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_agent: Option<String>,
+    /// Preferred local terminal shell (`"auto"`, `"powershell"`, `"pwsh"`, `"git-bash"`, `"cmd"`, or custom executable path).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
     /// Fonts for layouts that don't set their own.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font: Option<String>,
@@ -494,6 +541,7 @@ impl Default for Person {
             sounds: Sounds::default(),
             core: None,
             default_agent: None,
+            shell: None,
             font: None,
             font_size: None,
             font_weight: None,
@@ -557,6 +605,7 @@ pub struct Settings {
     pub option_as_alt: OptionAsAlt,
     pub language: Language,
     pub sounds: Sounds,
+    pub shell: String,
 }
 
 /// Attention sounds: when an agent needs you, and when one finished while you
@@ -605,6 +654,7 @@ impl Default for Settings {
             option_as_alt: OptionAsAlt::Auto,
             language: Language::En,
             sounds: Sounds::default(),
+            shell: "auto".into(),
         }
     }
 }
@@ -649,6 +699,13 @@ impl Settings {
             minimum_contrast: person.minimum_contrast,
             option_as_alt: person.option_as_alt,
             language: person.language,
+            shell: person
+                .shell
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !(cfg!(windows) && s.eq_ignore_ascii_case("wsl")))
+                .unwrap_or("auto")
+                .to_owned(),
         }
     }
 }
@@ -1148,5 +1205,23 @@ mod tests {
         let section = guide.split("## The person").nth(1).and_then(|s| s.split("\n## ").next()).unwrap_or_default();
         let missing: Vec<&String> = keys.iter().filter(|k| !section.contains(&format!("`{k}`"))).collect();
         assert!(missing.is_empty(), "defaults/AGENTS.md (## The person) doesn't explain: {missing:?}");
+    }
+
+    #[test]
+    fn t3_default_dark_and_light_palettes_resolve_cleanly() {
+        let (dark_p, dark_o) = palette(DEFAULT_DARK).unwrap();
+        let dark = resolve(&dark_p, &dark_o);
+        assert_eq!(dark["background"], "#000000");
+        assert_eq!(dark["chrome"], "#000000");
+        assert_eq!(dark["message"], "#141417");
+        assert_eq!(dark["border"], "#ffffff14");
+        assert_eq!(dark["accent_foreground"], "#ffffff");
+
+        let (light_p, light_o) = palette(DEFAULT_LIGHT).unwrap();
+        let light = resolve(&light_p, &light_o);
+        assert_eq!(light["background"], "#fcfcfd");
+        assert_eq!(light["message"], "#ededf0");
+        assert_eq!(light["border"], "#e4e4e7");
+        assert_eq!(light["accent_foreground"], "#ffffff");
     }
 }

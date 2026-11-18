@@ -30,12 +30,20 @@ pub struct SessionClientCapabilities {
     pub config_options: SessionConfigOptionsCapability,
 }
 
+#[derive(Serialize, Debug, Clone, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientCapabilitiesMeta {
+    pub parameterized_model_picker: bool,
+}
+
 #[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ClientCapabilities {
     pub fs: FsCapabilities,
     pub terminal: bool,
     pub session: SessionClientCapabilities,
+    #[serde(rename = "_meta")]
+    pub meta: ClientCapabilitiesMeta,
 }
 
 impl ClientCapabilities {
@@ -45,6 +53,7 @@ impl ClientCapabilities {
             fs: FsCapabilities { read_text_file: false, write_text_file: false },
             terminal: false,
             session: SessionClientCapabilities::default(),
+            meta: ClientCapabilitiesMeta { parameterized_model_picker: true },
         }
     }
 }
@@ -403,7 +412,7 @@ pub enum ParsedUpdate {
     AssistantChunk(String),
     ThoughtChunk(String),
     UserChunk(String),
-    ToolCall { id: String, title: String, kind: Option<String>, status: String },
+    ToolCall { id: String, title: String, kind: Option<String>, status: String, detail: Option<String> },
     Plan(Vec<String>),
     ConfigOptions(Vec<AcpConfigOption>),
     CurrentMode(String),
@@ -428,7 +437,8 @@ pub fn parse_session_update(params: &Value) -> Option<(String, ParsedUpdate)> {
                 .and_then(Value::as_str)
                 .unwrap_or(if kind == "tool_call" { "pending" } else { "" })
                 .to_string();
-            ParsedUpdate::ToolCall { id, title, kind: tool_kind, status }
+            let detail = extract_tool_detail(update);
+            ParsedUpdate::ToolCall { id, title, kind: tool_kind, status, detail }
         }
         "plan" => {
             let items = update
@@ -487,6 +497,109 @@ fn extract_text(update: &Value) -> Option<String> {
         }
     }
     None
+}
+
+fn extract_tool_detail(update: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(arr) = update.get("content").and_then(Value::as_array) {
+        for item in arr {
+            match item.get("type").and_then(Value::as_str) {
+                Some("content") => {
+                    if let Some(text) = item.pointer("/content/text").and_then(Value::as_str)
+                        && !text.trim().is_empty()
+                    {
+                        parts.push(text.trim().to_string());
+                    }
+                }
+                Some("diff") => {
+                    let path = item.get("path").and_then(Value::as_str).unwrap_or("file");
+                    let old_t = item.get("oldText").and_then(Value::as_str).unwrap_or("");
+                    let new_t = item.get("newText").and_then(Value::as_str).unwrap_or("");
+                    let mut diff = format!("--- {path}\n+++ {path}");
+                    if !old_t.trim().is_empty() {
+                        for line in old_t.lines().take(25) {
+                            diff.push_str("\n- ");
+                            diff.push_str(line);
+                        }
+                    }
+                    if !new_t.trim().is_empty() {
+                        for line in new_t.lines().take(25) {
+                            diff.push_str("\n+ ");
+                            diff.push_str(line);
+                        }
+                    }
+                    parts.push(diff);
+                }
+                Some("terminal") => {
+                    if let Some(tid) = item.get("terminalId").and_then(Value::as_str) {
+                        parts.push(format!("terminal: {tid}"));
+                    }
+                }
+                _ => {
+                    if let Some(text) = item.get("text").and_then(Value::as_str)
+                        && !text.trim().is_empty()
+                    {
+                        parts.push(text.trim().to_string());
+                    }
+                }
+            }
+        }
+    } else if let Some(text) = extract_text(update)
+        && !text.trim().is_empty()
+    {
+        parts.push(text.trim().to_string());
+    }
+
+    if parts.is_empty()
+        && let Some(raw_out) = update.get("rawOutput")
+    {
+        match raw_out {
+            Value::String(s) if !s.trim().is_empty() => parts.push(s.trim().to_string()),
+            Value::Object(obj) => {
+                if let Some(s) = obj
+                    .get("stdout")
+                    .or_else(|| obj.get("output"))
+                    .or_else(|| obj.get("text"))
+                    .and_then(Value::as_str)
+                    && !s.trim().is_empty()
+                {
+                    parts.push(s.trim().to_string());
+                } else if let Some(s) = obj.get("stderr").and_then(Value::as_str)
+                    && !s.trim().is_empty()
+                {
+                    parts.push(s.trim().to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if parts.is_empty()
+        && let Some(locs) = update.get("locations").and_then(Value::as_array)
+    {
+        let paths: Vec<String> = locs
+            .iter()
+            .filter_map(|loc| {
+                let p = loc.get("path").and_then(Value::as_str)?.trim();
+                if p.is_empty() {
+                    return None;
+                }
+                Some(match loc.get("line").and_then(Value::as_u64) {
+                    Some(l) => format!("{p}:{l}"),
+                    None => p.to_string(),
+                })
+            })
+            .collect();
+        if !paths.is_empty() {
+            parts.push(paths.join("\n"));
+        }
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        crate::transcript::cap_tool_detail(&parts.join("\n\n"))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -550,6 +663,7 @@ mod tests {
         assert_eq!(value["clientCapabilities"]["fs"]["readTextFile"], false);
         assert_eq!(value["clientCapabilities"]["fs"]["writeTextFile"], false);
         assert_eq!(value["clientCapabilities"]["session"]["configOptions"]["boolean"], json!({}));
+        assert_eq!(value["clientCapabilities"]["_meta"]["parameterizedModelPicker"], true);
         assert_eq!(value["clientInfo"]["name"], "herdr2");
     }
 

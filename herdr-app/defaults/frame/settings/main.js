@@ -10,9 +10,8 @@ const SECTIONS = () => [
   { id: "look", title: "Look", zh: "外观", icon: "palette" },
   ...(window()?.platform === "macos" ? [{ id: "keyboard", title: "Keyboard", zh: "键盘", icon: "keyboard" }] : []),
   { id: "machines", title: "Machines", zh: "主机", icon: "server" },
-  { id: "drove", title: "Drove", zh: "编队", icon: "layers" },
+  { id: "drove", title: "Drove", zh: "Drove", icon: "layers" },
   { id: "alerts", title: "Alerts", zh: "提醒", icon: "bell" },
-  { id: "updates", title: "Updates", zh: "更新", icon: "refresh" },
   { id: "privacy", title: "Privacy", zh: "隐私", icon: "shield" },
 ];
 
@@ -111,7 +110,7 @@ export default class Settings extends View {
     this.droveShowAddRole = false;
     this.droveModelFilter = "";
     this.droveModelSubmit = null;
-    this.droveModelInput = InputState.new({ placeholder: this.tr("Search or enter custom model ID…", "搜索或输入自定义模型 ID…") });
+    this.droveModelInput = InputState.new({ placeholder: this.tr("Search or enter custom value…", "搜索或输入自定义值…") });
     this.droveModelInput.on("change", (_e, cx) => {
       this.droveModelFilter = this.droveModelInput.value();
       cx.notify();
@@ -144,14 +143,6 @@ export default class Settings extends View {
           this.maybeAutoProbeDrove(cx);
         }
       }
-      cx.notify();
-    });
-    // After "Check now": follow the look (the answer comes from the app), then
-    // "Up to date" for a moment.
-    cx.timer.every(300, (cx) => {
-      if (!this.asked) return;
-      if (updates().checking) this.asked = Date.now();
-      else if (Date.now() - this.asked >= 3000) this.asked = null;
       cx.notify();
     });
     cx.timer.every(3000, (cx) => {
@@ -656,6 +647,26 @@ export default class Settings extends View {
               .when(Boolean(sizeKey), (el) => el.child(this.stepper(t, `st-${sizeKey}`, `${Math.round(sizeNow)}`, (_e, cx) => size(sizeKey, sizeNow, -1, cx), (_e, cx) => size(sizeKey, sizeNow, 1, cx)))),
           ),
         );
+    const isWin = window()?.platform === "windows";
+    const shellChoices = isWin
+      ? [
+          { value: "auto", label: this.tr("Auto (pwsh / PowerShell)", "自动（pwsh / PowerShell）"), meta: "default" },
+          { value: "powershell", label: "Windows PowerShell", meta: "powershell.exe" },
+          { value: "pwsh", label: "PowerShell 7 (pwsh)", meta: "pwsh.exe" },
+          { value: "git-bash", label: "Git Bash", meta: "bash.exe" },
+          { value: "cmd", label: this.tr("Command Prompt (cmd)", "命令提示符 (cmd)"), meta: "cmd.exe" },
+        ]
+      : [
+          { value: "auto", label: this.tr("Auto ($SHELL)", "自动（系统 $SHELL）"), meta: "default" },
+          { value: "zsh", label: "zsh", meta: "zsh" },
+          { value: "bash", label: "bash", meta: "bash" },
+          { value: "fish", label: "fish", meta: "fish" },
+          { value: "sh", label: "sh", meta: "sh" },
+        ];
+    const rawShell = String(p.shell ?? s.shell ?? "auto").trim() || "auto";
+    const currentShell = isWin && rawShell.toLowerCase() === "wsl" ? "auto" : rawShell;
+    const shellItems = shellChoices.map((opt) => ({ ...opt, active: opt.value === currentShell }));
+    const currentShellLabel = shellChoices.find((opt) => opt.value === currentShell)?.label ?? currentShell;
     return v_flex()
       .w_full()
       .child(this.heading(t, this.tr("Language", "语言")))
@@ -695,6 +706,27 @@ export default class Settings extends View {
             .items_center()
             .child(this.stepper(t, "st-zoom", `${Math.round(s.zoom * 100)}%`, () => run("app.zoom_out"), () => run("app.zoom_in")))
             .child(this.button(t, "st-zoom-reset", this.tr("Reset", "重置"), () => run("app.zoom_reset"))),
+        ),
+      )
+      .child(
+        this.row(
+          t,
+          this.tr("Default terminal shell", "默认终端类型"),
+          this.tr("Which shell local terminal tabs and splits open with.", "本地新建终端标签页或分栏时默认使用的终端程序。"),
+          this.drovePicker(
+            t,
+            "term-shell",
+            currentShellLabel,
+            shellItems,
+            (val, cx) => {
+              this.change((q) => {
+                if (!val || val === "auto") delete q.shell;
+                else q.shell = val;
+              }, cx);
+            },
+            { width: 220, popupWidth: 280, anchor: "bottom_right" },
+            cx,
+          ),
         ),
       )
       .child(fontRow("font", "font_size", this.tr("Terminal font", "终端字体"), s.font_family, DEFAULT_FONT, s.font_size))
@@ -827,7 +859,6 @@ export default class Settings extends View {
     const controls = h_flex().gap(6).items_center();
     if (busy) controls.child(svg("mods/workspace-chrome/spinner.svg").size(12).text_color(t.working).spin(900)).child(div().text_size(12).text_color(t.muted).child(busy === "update" ? this.tr("Updating…", "更新中…") : busy === "rename" ? this.tr("Renaming…", "重命名中…") : this.tr("Removing…", "移除中…")));
     else {
-      if (this.olderCore(m.version, localVersion)) controls.child(this.button(t, `st-m-update-${m.name}`, this.tr("Update", "更新"), (_e, cx) => this.machineAction(m.name, "update", cx)));
       for (const [action, label, zh] of [["rename", "Rename", "重命名"], ["rm", "Remove", "移除"]]) {
         controls.child(this.button(t, `st-m-${action}-${m.name}`, this.tr(label, zh), (_e, cx) => {
           this.machineEdit = { machine: m.name, action, name: m.name };
@@ -954,7 +985,7 @@ export default class Settings extends View {
         }
       } catch (e) {
         this.droveError = String(e?.message ?? e);
-        notify({ title: this.tr("Drove settings not saved", "编队设置保存失败"), body: this.droveError, level: "error" });
+        notify({ title: this.tr("Drove settings not saved", "Drove 设置保存失败"), body: this.droveError, level: "error" });
       } finally {
         this.droveSaving = false;
         cx.notify();
@@ -1101,6 +1132,44 @@ export default class Settings extends View {
     }
   }
 
+  aiEffortLabel(eff) {
+    switch (eff) {
+      case "auto": return this.tr("Auto", "默认");
+      case "none": return this.tr("Off", "关闭");
+      case "low": return this.tr("Low", "低");
+      case "medium": return this.tr("Med", "中");
+      case "high": return this.tr("High", "高");
+      default: return eff;
+    }
+  }
+
+  normalizeAiContextInput(raw) {
+    const clean = String(raw ?? "").trim().toLowerCase();
+    if (!clean || clean === "auto" || clean === "default") return "";
+    return clean;
+  }
+
+  parseAiMaxTokensInput(raw) {
+    if (typeof raw === "number") {
+      if (!Number.isFinite(raw)) return null;
+      const n = Math.round(raw);
+      return n <= 0 ? 0 : Math.max(64, Math.min(131072, n));
+    }
+    const clean = String(raw ?? "").trim().toLowerCase();
+    if (!clean || clean === "auto" || clean === "default" || clean === "0") return 0;
+    let n;
+    if (clean.endsWith("k")) {
+      const num = Number(clean.slice(0, -1).trim());
+      if (!Number.isFinite(num) || num <= 0) return null;
+      n = Math.round(num * 1024);
+    } else {
+      const num = Number(clean);
+      if (!Number.isFinite(num) || num <= 0) return null;
+      n = Math.round(num);
+    }
+    return Math.max(64, Math.min(131072, n));
+  }
+
   drovePicker(t, id, label, items, onSelect, opts = 156, cx) {
     const o = typeof opts === "number" ? { width: opts } : (opts ?? {});
     const width = o.width ?? 156;
@@ -1112,7 +1181,7 @@ export default class Settings extends View {
     const open = this.picking === key;
     const trigger = h_flex()
       .id(`st-drp-${id}`)
-      .w_full()
+      .when(flex1, (el) => el.flex_1().min_w(0), (el) => el.w_full())
       .h(28)
       .px(9)
       .rounded(7)
@@ -1166,7 +1235,8 @@ export default class Settings extends View {
 
     return Popup.new(`st-drpp-${id}`, trigger)
       .anchor(anchor)
-      .when(flex1, (el) => el.flex_1().min_w(width), (el) => el.w(width).flex_none())
+      .flex()
+      .when(flex1, (el) => el.flex_1().min_w(width), (el) => el.w(width).min_w(width).max_w(width).flex_none())
       .when(open, (el) =>
         el.content(
           v_flex()
@@ -1235,6 +1305,90 @@ export default class Settings extends View {
       );
   }
 
+  modelHasEmbeddedEffort(modelId) {
+    const raw = String(modelId ?? "").trim();
+    const lower = raw.toLowerCase();
+    if (!lower || lower === "auto" || lower === "default" || lower === "default[]") return false;
+    let slug = lower;
+    const bracketStart = lower.indexOf("[");
+    if (bracketStart >= 0 && lower.endsWith("]")) {
+      const inner = lower.slice(bracketStart + 1, -1);
+      for (const entry of inner.split(",")) {
+        const eq = entry.indexOf("=");
+        if (eq < 0) continue;
+        const k = entry.slice(0, eq).trim();
+        const v = entry.slice(eq + 1).trim();
+        if (["effort", "reasoning_effort", "reasoning", "thought_level", "thinking"].includes(k) && v && v !== "auto" && v !== "default") {
+          return true;
+        }
+      }
+      slug = lower.slice(0, bracketStart).trim();
+    }
+    if (slug.endsWith("-fast")) slug = slug.slice(0, -5);
+    return ["-none", "-minimal", "-low", "-medium", "-med", "-high", "-xhigh", "-extra-high", "-max", "-thinking"].some((s) =>
+      slug.endsWith(s),
+    );
+  }
+
+  normalizeCursorBaseModel(modelId) {
+    let base = String(modelId ?? "").trim();
+    if (!base) return "";
+    const bracketStart = base.indexOf("[");
+    if (bracketStart >= 0 && base.endsWith("]")) {
+      base = base.slice(0, bracketStart).trim();
+    }
+    if (base.toLowerCase().startsWith("cursor-")) base = base.slice(7);
+    if (base.toLowerCase().endsWith("-fast")) base = base.slice(0, -5);
+    if (base.toLowerCase().endsWith("-thinking")) base = base.slice(0, -9);
+    for (const suffix of ["-extra-high", "-xhigh", "-minimal", "-medium", "-none", "-high", "-low", "-med", "-max"]) {
+      if (base.toLowerCase().endsWith(suffix)) {
+        base = base.slice(0, -suffix.length);
+        break;
+      }
+    }
+    if (base.toLowerCase().endsWith("-thinking")) base = base.slice(0, -9);
+    return base;
+  }
+
+  cursorContextChoicesFor(modelId) {
+    const probedCursor = this.probedAgents().find((a) => a.id === "cursor" || a.id === "cursor-agent");
+    const map = probedCursor?.modelContexts ?? {};
+    const m = String(modelId ?? "").trim();
+    const base = this.normalizeCursorBaseModel(m);
+    const rawKey = m && Array.isArray(map[m]) ? map[m] : (base && Array.isArray(map[base]) ? map[base] : null);
+    let raw = rawKey && rawKey.length > 0 ? rawKey : null;
+    if (!raw) {
+      const lower = (base || m).toLowerCase();
+      if (lower.startsWith("grok-4.7")) raw = ["256k", "500k"];
+      else if (lower.startsWith("claude-opus-5") || lower.startsWith("claude-sonnet-5") || lower.startsWith("claude-fable-5") || lower.startsWith("muse-")) {
+        raw = ["300k", "1m"];
+      } else if (lower.startsWith("gpt-5.")) raw = ["272k", "1m"];
+      else if (lower.startsWith("claude-sonnet-4") || lower.startsWith("claude-opus-4-6")) raw = ["200k", "1m"];
+      else raw = ["200k", "256k", "272k", "300k", "500k", "1m"];
+    }
+    const seen = new Set();
+    const out = [];
+    for (const v of raw) {
+      const s = String(v ?? "").trim();
+      if (!s || seen.has(s.toLowerCase())) continue;
+      seen.add(s.toLowerCase());
+      out.push(s);
+    }
+    return out;
+  }
+
+  formatContextLabel(ctx, compact = false) {
+    const raw = String(ctx ?? "").trim();
+    if (!raw || raw.toLowerCase() === "auto") {
+      return compact ? this.tr("Ctx Auto", "Ctx 默认") : this.tr("Auto (default)", "默认（随模型）");
+    }
+    if (raw.toLowerCase() === "max") {
+      return compact ? "Ctx Max" : this.tr("Max (500K / 1M)", "最大上下文 (500K / 1M)");
+    }
+    const pretty = raw.toUpperCase();
+    return compact ? `Ctx ${pretty}` : pretty;
+  }
+
   roleChain(role) {
     const raw = [];
     if (role?.primary?.agent) raw.push(role.primary);
@@ -1248,6 +1402,8 @@ export default class Settings extends View {
       agent: String(item.agent).trim(),
       model: item.model ? String(item.model) : null,
       effort: item.effort ?? "high",
+      ...(item.fast ? { fast: true } : {}),
+      ...(item.context ? { context: String(item.context).trim() } : {}),
     }));
   }
 
@@ -1258,6 +1414,8 @@ export default class Settings extends View {
         agent: String(item.agent).trim(),
         model: item.model ? String(item.model) : null,
         effort: item.effort ?? "high",
+        ...(item.fast ? { fast: true } : {}),
+        ...(item.context ? { context: String(item.context).trim() } : {}),
       }));
     if (clean.length === 0) return;
     role.primary = clean[0];
@@ -1307,7 +1465,7 @@ export default class Settings extends View {
         label: a.name && a.name !== a.id ? `${a.id} · ${a.name}` : a.id,
         icon: a.id,
         dot: Boolean(a.installed),
-        meta: a.models?.length ? `${a.models.length} ${this.tr("models", "模型")}` : a.installed ? "✓" : this.tr("missing", "未安装"),
+        meta: !a.installed ? this.tr("missing", "未安装") : a.models?.length ? `${a.models.length} ${this.tr("models", "模型")}` : "✓",
         active: target.agent === a.id,
       }));
       const models = this.probedModelsFor(target.agent);
@@ -1328,7 +1486,7 @@ export default class Settings extends View {
       const stepBtn = (btnId, glyph, enabled, title, onClick, hoverColor = t.foreground) =>
         div()
           .id(btnId)
-          .w(22)
+          .w(20)
           .h(26)
           .flex_none()
           .flex()
@@ -1350,14 +1508,15 @@ export default class Settings extends View {
       return h_flex()
         .id(`st-dr-cand-${roleId}-${idx}`)
         .w_full()
-        .gap(6)
+        .gap(4)
         .items_center()
         .child(
           div()
-            .w(62)
+            .w(50)
+            .min_w(50)
             .h(28)
             .flex_none()
-            .px(6)
+            .px(4)
             .rounded(5)
             .bg(isPrimary ? t.raised : t.background)
             .border_1()
@@ -1377,10 +1536,20 @@ export default class Settings extends View {
             target.agent,
             agentItems,
             (agent, cx) => {
-              const next = chain.map((c, i) => (i === idx ? { ...c, agent, model: null } : c));
+              const next = chain.map((c, i) =>
+                i === idx
+                  ? {
+                      ...c,
+                      agent,
+                      model: null,
+                      ...(agent === "codex" ? {} : { fast: false }),
+                      ...(agent === "cursor" || agent === "cursor-agent" ? {} : { context: null }),
+                    }
+                  : c,
+              );
               commitChain(next, cx);
             },
-            { width: 148, popupWidth: 280, icon: target.agent, dot: curAgentInfo ? Boolean(curAgentInfo.installed) : undefined },
+            { width: 118, popupWidth: 280, icon: target.agent, dot: curAgentInfo ? Boolean(curAgentInfo.installed) : undefined },
             cx,
           ),
         )
@@ -1394,51 +1563,135 @@ export default class Settings extends View {
               const next = chain.map((c, i) => (i === idx ? { ...c, model } : c));
               commitChain(next, cx);
             },
-            { flex1: true, width: 150, popupWidth: 380, allowCustom: true },
+            { flex1: true, width: 115, popupWidth: 380, allowCustom: true },
             cx,
           ),
         )
         .child(
-          h_flex()
-            .h(28)
-            .flex_none()
-            .p(2)
-            .gap(1)
-            .items_center()
-            .rounded(7)
-            .border_1()
-            .border_color(t.border)
-            .bg(t.background)
-            .children(
-              DROVE_EFFORTS.map((eff) => {
-                const active = (target.effort ?? "high") === eff;
-                return div()
-                  .id(`st-dr-eff-${roleId}-${idx}-${eff}`)
-                  .min_w(32)
-                  .h(22)
-                  .px(6)
-                  .flex()
-                  .items_center()
-                  .justify_center()
-                  .rounded(5)
+          (() => {
+            const isAgy = target.agent === "agy" || target.agent === "antigravity";
+            const isCursor = target.agent === "cursor" || target.agent === "cursor-agent";
+            const cursorHasEffort = isCursor && this.modelHasEmbeddedEffort(target.model);
+            const disableEffort = isAgy || cursorHasEffort;
+            const disabledEffortTip = isAgy
+              ? this.tr("Antigravity model names already include effort", "Antigravity 模型名已自带思考强度，不可单独选择")
+              : this.tr("Selected Cursor model already includes reasoning effort", "当前选中的 Cursor 模型已自带思考强度，不可单独选择");
+            return h_flex()
+              .id(`st-dr-eff-group-${roleId}-${idx}`)
+              .h(28)
+              .flex_none()
+              .p(2)
+              .gap(1)
+              .items_center()
+              .rounded(7)
+              .border_1()
+              .border_color(t.border)
+              .bg(t.background)
+              .when(disableEffort, (el) =>
+                el
+                  .opacity(0.35)
+                  .tooltip(disabledEffortTip),
+              )
+              .children(
+                DROVE_EFFORTS.map((eff) => {
+                  const active = !disableEffort && (target.effort ?? "high") === eff;
+                  return div()
+                    .id(`st-dr-eff-${roleId}-${idx}-${eff}`)
+                    .w(30)
+                    .h(22)
+                    .px(2)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(5)
+                    .bg(active ? t.accent : "#00000000")
+                    .text_size(11)
+                    .when(active, (el) => el.font_semibold())
+                    .text_color(disableEffort ? t.dim : (active ? t.accent_foreground : t.muted))
+                    .when(!disableEffort, (el) =>
+                      el
+                        .cursor_pointer()
+                        .when(!active, (el2) => el2.hover((s) => s.bg(t.hover).text_color(t.foreground)))
+                        .on_click((_e, cx) => {
+                          const next = chain.map((c, i) => (i === idx ? { ...c, effort: eff } : c));
+                          commitChain(next, cx);
+                        }),
+                    )
+                    .child(this.effortLabel(eff));
+                }),
+              );
+          })(),
+        )
+        .child(
+          (() => {
+            const isCursor = target.agent === "cursor" || target.agent === "cursor-agent";
+            if (isCursor) {
+              const rawCtxs = this.cursorContextChoicesFor(target.model);
+              const curCtx = target.context ? String(target.context).trim() : null;
+              const ctxItems = [
+                { value: null, label: this.formatContextLabel(null, false), meta: "auto", active: !curCtx },
+                { value: "max", label: this.formatContextLabel("max", false), meta: this.tr("largest", "最大"), active: curCtx?.toLowerCase() === "max" },
+                ...rawCtxs.map((v) => ({
+                  value: v,
+                  label: this.formatContextLabel(v, false),
+                  meta: v,
+                  active: curCtx?.toLowerCase() === v.toLowerCase(),
+                })),
+              ];
+              if (curCtx && curCtx.toLowerCase() !== "max" && !rawCtxs.some((v) => v.toLowerCase() === curCtx.toLowerCase())) {
+                ctxItems.splice(2, 0, { value: curCtx, label: this.formatContextLabel(curCtx, false), meta: this.tr("custom", "自定义"), active: true });
+              }
+              return this.drovePicker(
+                t,
+                `${roleId}-c${idx}-ctx`,
+                this.formatContextLabel(curCtx, true),
+                ctxItems,
+                (context, cx) => {
+                  const cleanCtx = context && String(context).trim() && String(context).trim().toLowerCase() !== "auto"
+                    ? String(context).trim()
+                    : null;
+                  const next = chain.map((c, i) => (i === idx ? { ...c, context: cleanCtx } : c));
+                  commitChain(next, cx);
+                },
+                { width: 86, popupWidth: 230, anchor: "bottom_right", allowCustom: true },
+                cx,
+              );
+            }
+            const canFast = target.agent === "codex";
+            const fastActive = canFast && Boolean(target.fast);
+            return h_flex()
+              .id(`st-dr-fast-${roleId}-${idx}`)
+              .w(86)
+              .h(28)
+              .flex_none()
+              .px(4)
+              .rounded(7)
+              .border_1()
+              .border_color(fastActive ? t.accent : t.border)
+              .bg(fastActive ? t.accent : t.background)
+              .items_center()
+              .justify_center()
+              .text_size(11)
+              .when(fastActive, (el) => el.font_semibold())
+              .text_color(fastActive ? t.accent_foreground : (canFast ? t.muted : t.dim))
+              .when(!canFast, (el) => el.opacity(0.32).tooltip(this.tr("Fast mode is only supported for Codex", "Fast 加速模式仅支持 Codex")))
+              .when(canFast, (el) =>
+                el
                   .cursor_pointer()
-                  .bg(active ? t.accent : "#00000000")
-                  .text_size(11)
-                  .when(active, (el) => el.font_semibold())
-                  .text_color(active ? t.accent_foreground : t.muted)
-                  .when(!active, (el) => el.hover((s) => s.bg(t.hover).text_color(t.foreground)))
+                  .when(!fastActive, (s) => s.hover((h) => h.bg(t.hover).text_color(t.foreground)))
+                  .tooltip(this.tr("Codex Fast mode (1.5x speed, increased usage)", "Codex Fast 加速模式（约 1.5x 速度，消耗更多额度）"))
                   .on_click((_e, cx) => {
-                    const next = chain.map((c, i) => (i === idx ? { ...c, effort: eff } : c));
+                    const next = chain.map((c, i) => (i === idx ? { ...c, fast: !target.fast } : c));
                     commitChain(next, cx);
-                  })
-                  .child(this.effortLabel(eff));
-              }),
-            ),
+                  }),
+              )
+              .child("⚡ Fast");
+          })(),
         )
         .child(
           h_flex()
             .flex_none()
-            .gap(2)
+            .gap(1)
             .items_center()
             .child(stepBtn(`st-dr-up-${roleId}-${idx}`, "↑", canUp, this.tr("Move up", "上移"), (_e, cx) => {
               const next = [...chain];
@@ -1604,7 +1857,65 @@ export default class Settings extends View {
     if (currentAiModel && !aiModels.includes(currentAiModel)) {
       aiModelItems.splice(1, 0, { value: currentAiModel, label: currentAiModel, meta: this.tr("custom", "自定义"), active: true });
     }
+    const aiEffortChoices = ["auto", "none", "low", "medium", "high"];
+    const rawAiEffort = (cfg.ai?.effort ?? aiStatus.effort ?? "low").trim().toLowerCase() || "low";
+    const currentAiEffort = aiEffortChoices.includes(rawAiEffort) ? rawAiEffort : "low";
+    const currentAiContext = this.normalizeAiContextInput(cfg.ai?.contextWindow ?? aiStatus.contextWindow ?? "");
+    const currentAiMaxTokens = Number(cfg.ai?.maxTokens ?? aiStatus.maxTokens ?? 0) || 0;
+    const aiContextPresets = ["8k", "16k", "32k", "64k", "128k", "256k", "1m"];
+    const aiContextItems = [
+      { value: "", label: this.tr("Auto (model default)", "默认（随模型）"), active: !currentAiContext },
+      ...aiContextPresets.map((v) => ({ value: v, label: v.toUpperCase(), active: currentAiContext === v })),
+    ];
+    if (currentAiContext && !aiContextPresets.includes(currentAiContext)) {
+      aiContextItems.splice(1, 0, {
+        value: currentAiContext,
+        label: currentAiContext.toUpperCase(),
+        meta: this.tr("custom", "自定义"),
+        active: true,
+      });
+    }
+    const aiMaxTokenPresets = [512, 1024, 2048, 4096, 8192, 16384];
+    const aiMaxTokenItems = [
+      { value: 0, label: this.tr("Auto (by effort)", "自动（随思考强度）"), active: !currentAiMaxTokens },
+      ...aiMaxTokenPresets.map((v) => ({ value: v, label: `${v} tokens`, active: currentAiMaxTokens === v })),
+    ];
+    if (currentAiMaxTokens && !aiMaxTokenPresets.includes(currentAiMaxTokens)) {
+      aiMaxTokenItems.splice(1, 0, {
+        value: currentAiMaxTokens,
+        label: `${currentAiMaxTokens} tokens`,
+        meta: this.tr("custom", "自定义"),
+        active: true,
+      });
+    }
     const magpieQuotas = data?.magpieQuotas ?? [];
+    const switches = aiStatus.switches ?? {};
+    const verifyDigest = (cfg.ai?.verifyDigest ?? switches.verifyDigest) !== false;
+    const handoverCompact = (cfg.ai?.handoverCompact ?? switches.handoverCompact) !== false;
+    const autoTitle = (cfg.ai?.autoTitle ?? switches.autoTitle) !== false;
+    const taskEnrich = (cfg.ai?.taskEnrich ?? switches.taskEnrich) !== false;
+    const conflictPolicy = cfg.ai?.conflictPolicy ?? switches.conflictPolicy ?? "warn";
+    const rawQuestionMode = cfg.ai?.questionMode ?? switches.questionMode ?? "draft";
+    const questionMode = rawQuestionMode === "auto" ? "auto_when_offline" : rawQuestionMode;
+    const loopDetect = cfg.ai?.loopDetect ?? switches.loopDetect ?? "off";
+    const conflictOptions = [
+      { value: "off", label: this.tr("Off", "关闭 (off)") },
+      { value: "warn", label: this.tr("Warn", "告警提示 (warn)") },
+      { value: "auto_worktree", label: this.tr("Auto Worktree", "自动隔离工作树 (auto_worktree)") },
+    ].map((it) => ({ ...it, active: it.value === conflictPolicy }));
+    const questionOptions = [
+      { value: "off", label: this.tr("Off", "关闭 (off)") },
+      { value: "draft", label: this.tr("Draft Reply", "生成草稿 (draft)") },
+      { value: "auto_when_offline", label: this.tr("Auto Reply (High Confidence)", "高置信自动回复 (auto_when_offline)") },
+    ].map((it) => ({ ...it, active: it.value === questionMode }));
+    const loopOptions = [
+      { value: "off", label: this.tr("Off", "关闭 (off)") },
+      { value: "warn", label: this.tr("Warn Only", "仅告警 (warn)") },
+      { value: "steer_once", label: this.tr("Steer Once", "自动纠偏一次 (steer_once)") },
+    ].map((it) => ({ ...it, active: it.value === loopDetect }));
+    const conflictLabel = conflictOptions.find((o) => o.active)?.label ?? conflictPolicy;
+    const questionLabel = questionOptions.find((o) => o.active)?.label ?? questionMode;
+    const loopLabel = loopOptions.find((o) => o.active)?.label ?? loopDetect;
 
     return v_flex()
       .w_full()
@@ -1746,6 +2057,126 @@ export default class Settings extends View {
           )
           .child(
             h_flex()
+              .gap(12)
+              .items_center()
+              .justify_between()
+              .child(
+                v_flex()
+                  .gap(2)
+                  .flex_1()
+                  .min_w(0)
+                  .child(div().text_size(12.5).text_color(t.foreground).child(this.tr("Reasoning Effort", "思考强度")))
+                  .child(
+                    div()
+                      .text_size(11.5)
+                      .text_color(t.dim)
+                      .child(this.tr("Thinking depth (reasoning_effort); auto-falls back if unsupported by endpoint", "控制推理思考深度（reasoning_effort），接口不支持时自动回退")),
+                  ),
+              )
+              .child(
+                h_flex()
+                  .id("st-dr-ai-eff-group")
+                  .w(250)
+                  .h(28)
+                  .flex_none()
+                  .p(2)
+                  .gap(1)
+                  .items_center()
+                  .rounded(7)
+                  .border_1()
+                  .border_color(t.border)
+                  .bg(t.background)
+                  .children(
+                    aiEffortChoices.map((eff) => {
+                      const active = currentAiEffort === eff;
+                      return div()
+                        .id(`st-dr-ai-eff-${eff}`)
+                        .flex_1()
+                        .h(22)
+                        .px(2)
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded(5)
+                        .bg(active ? t.accent : "#00000000")
+                        .text_size(11)
+                        .when(active, (el) => el.font_semibold())
+                        .text_color(active ? t.accent_foreground : t.muted)
+                        .cursor_pointer()
+                        .when(!active, (el) => el.hover((s) => s.bg(t.hover).text_color(t.foreground)))
+                        .on_click((_e, cx) => this.saveDrovePatch({ ai: { effort: eff } }, cx))
+                        .child(this.aiEffortLabel(eff));
+                    }),
+                  ),
+              ),
+          )
+          .child(
+            h_flex()
+              .gap(12)
+              .items_center()
+              .justify_between()
+              .child(
+                v_flex()
+                  .gap(2)
+                  .flex_1()
+                  .min_w(0)
+                  .child(div().text_size(12.5).text_color(t.foreground).child(this.tr("Context Size", "上下文大小")))
+                  .child(
+                    div()
+                      .text_size(11.5)
+                      .text_color(t.dim)
+                      .child(this.tr("Caps prompt input budget and sets local num_ctx (e.g. Ollama)", "限制单次输入预算，并为本地服务（如 Ollama）下发 num_ctx")),
+                  ),
+              )
+              .child(
+                this.drovePicker(
+                  t,
+                  "ai-context",
+                  currentAiContext ? currentAiContext.toUpperCase() : this.tr("Auto (model default)", "默认（随模型）"),
+                  aiContextItems,
+                  (val, cx) => this.saveDrovePatch({ ai: { contextWindow: this.normalizeAiContextInput(val) } }, cx),
+                  { width: 250, popupWidth: 320, anchor: "bottom_right", allowCustom: true },
+                  cx,
+                ),
+              ),
+          )
+          .child(
+            h_flex()
+              .gap(12)
+              .items_center()
+              .justify_between()
+              .child(
+                v_flex()
+                  .gap(2)
+                  .flex_1()
+                  .min_w(0)
+                  .child(div().text_size(12.5).text_color(t.foreground).child(this.tr("Max Output Tokens", "最大输出长度")))
+                  .child(
+                    div()
+                      .text_size(11.5)
+                      .text_color(t.dim)
+                      .child(this.tr("Max reply tokens (max_tokens); scales with effort when set to Auto", "单次最大输出长度（max_tokens）；设为自动时随思考强度动态放宽")),
+                  ),
+              )
+              .child(
+                this.drovePicker(
+                  t,
+                  "ai-max-tokens",
+                  currentAiMaxTokens ? `${currentAiMaxTokens} tokens` : this.tr("Auto (by effort)", "自动（随思考强度）"),
+                  aiMaxTokenItems,
+                  (val, cx) => {
+                    const parsed = this.parseAiMaxTokensInput(val);
+                    if (parsed !== null) {
+                      this.saveDrovePatch({ ai: { maxTokens: parsed } }, cx);
+                    }
+                  },
+                  { width: 250, popupWidth: 320, anchor: "bottom_right", allowCustom: true },
+                  cx,
+                ),
+              ),
+          )
+          .child(
+            h_flex()
               .gap(8)
               .items_center()
               .child(this.button(t, "st-dr-ai-save", this.droveSaving ? this.tr("Saving…", "保存中…") : this.tr("Save", "保存"), (_e, cx) => {
@@ -1777,6 +2208,88 @@ export default class Settings extends View {
                 ),
             );
           }),
+      )
+      .child(div().h(14))
+      .child(this.heading(t, this.tr("Control-Plane AI Policies", "控制面 AI 策略开关")))
+      .child(
+        this.row(
+          t,
+          this.tr("Verify Digest", "Verify 失败摘要"),
+          this.tr("Summarize root failure causes when verification commands fail.", "验证命令失败时自动提炼根因摘要。"),
+          this.toggle(t, "st-dr-pol-verify", verifyDigest, (_e, cx) => this.saveDrovePatch({ ai: { verifyDigest: !verifyDigest } }, cx)),
+        ),
+      )
+      .child(
+        this.row(
+          t,
+          this.tr("Handover Compact", "交接上下文压缩"),
+          this.tr("Compact context summaries when handing work across tasks or retries.", "跨任务交接或重试时自动压缩上下文摘要。"),
+          this.toggle(t, "st-dr-pol-handover", handoverCompact, (_e, cx) => this.saveDrovePatch({ ai: { handoverCompact: !handoverCompact } }, cx)),
+        ),
+      )
+      .child(
+        this.row(
+          t,
+          this.tr("Auto Title", "Run 自动命名"),
+          this.tr("Automatically generate a concise title for newly created runs.", "为新建的 Drove Run 自动生成简短标题。"),
+          this.toggle(t, "st-dr-pol-title", autoTitle, (_e, cx) => this.saveDrovePatch({ ai: { autoTitle: !autoTitle } }, cx)),
+        ),
+      )
+      .child(
+        this.row(
+          t,
+          this.tr("Task Enrich", "任务语义补全"),
+          this.tr("Enrich task specifications and metadata with semantic hints.", "自动补全任务描述与语义标签信息。"),
+          this.toggle(t, "st-dr-pol-enrich", taskEnrich, (_e, cx) => this.saveDrovePatch({ ai: { taskEnrich: !taskEnrich } }, cx)),
+        ),
+      )
+      .child(
+        this.row(
+          t,
+          this.tr("Conflict Policy", "写冲突策略"),
+          this.tr("How to handle concurrent file edits across tasks in the same workspace.", "多任务并发修改同一工作区文件时的冲突处理方式。"),
+          this.drovePicker(
+            t,
+            "pol-conflict",
+            conflictLabel,
+            conflictOptions,
+            (val, cx) => this.saveDrovePatch({ ai: { conflictPolicy: val } }, cx),
+            { width: 220, popupWidth: 280, anchor: "bottom_right" },
+            cx,
+          ),
+        ),
+      )
+      .child(
+        this.row(
+          t,
+          this.tr("Question Triage", "提问分诊模式"),
+          this.tr("Draft answers for worker questions or auto-reply at high confidence.", "Worker 提问时自动生成草稿或高置信自动回复。"),
+          this.drovePicker(
+            t,
+            "pol-question",
+            questionLabel,
+            questionOptions,
+            (val, cx) => this.saveDrovePatch({ ai: { questionMode: val } }, cx),
+            { width: 220, popupWidth: 280, anchor: "bottom_right" },
+            cx,
+          ),
+        ),
+      )
+      .child(
+        this.row(
+          t,
+          this.tr("Loop Detect", "死循环检测"),
+          this.tr("Detect repetitive stalling behavior and optionally steer once.", "检测重复空转死循环并决定告警或自动纠偏一次。"),
+          this.drovePicker(
+            t,
+            "pol-loop",
+            loopLabel,
+            loopOptions,
+            (val, cx) => this.saveDrovePatch({ ai: { loopDetect: val } }, cx),
+            { width: 220, popupWidth: 280, anchor: "bottom_right" },
+            cx,
+          ),
+        ),
       )
       .child(div().h(14))
       .child(this.heading(t, this.tr("Magpie Quota (Optional)", "Magpie 额度（可选）")))
@@ -2020,8 +2533,6 @@ export default class Settings extends View {
 
   render(cx) {
     const t = theme();
-    const u = updates();
-    const waiting = Boolean(u.app.ready || (u.core.ready && !u.core.managed));
     const nav = v_flex()
       .flex_none()
       .w(190)
@@ -2058,8 +2569,7 @@ export default class Settings extends View {
               cx.notify();
             })
             .child(svg(I(s.icon)).size(15).text_color(on ? t.accent : t.dim))
-            .child(div().flex_1().text_size(13.5).text_color(on ? t.foreground : t.muted).child(this.tr(s.title, s.zh)))
-            .when(s.id === "updates" && waiting, (el) => el.child(div().w(7).h(7).rounded(4).bg(t.accent)));
+            .child(div().flex_1().text_size(13.5).text_color(on ? t.foreground : t.muted).child(this.tr(s.title, s.zh)));
         }),
       );
     return h_flex()
@@ -2093,7 +2603,7 @@ export default class Settings extends View {
         cx.stop_propagation();
         cx.notify();
       })
-      .child(nav.h_full().child(div().flex_1()).child(this.button(t, "st-feedback", this.tr("Send feedback", "发送反馈"), () => { closeOverlay(props()?.overlay); run("app.feedback"); })))
+      .child(nav.h_full())
       .child(
         // A bar that always shows: the pages are taller than the dialog and
         // people should see that they scroll.
@@ -2126,7 +2636,7 @@ export default class Settings extends View {
                         ? this.alerts(t)
                         : this.section === "privacy"
                           ? this.privacy(t)
-                          : this.updates(t),
+                          : this.look(t, cx),
                   ),
               ),
           )

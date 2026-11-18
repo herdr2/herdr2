@@ -40,6 +40,72 @@ pub fn is_claude_agent(preset: Option<&str>, argv: &[String]) -> bool {
         .is_some_and(|s| s.to_ascii_lowercase().starts_with("claude"))
 }
 
+fn is_agy_binary(program: &str) -> bool {
+    let base = program.rsplit(['/', '\\']).next().unwrap_or(program).to_ascii_lowercase();
+    matches!(base.as_str(), "agy" | "agy.real" | "agy.exe" | "agy.cmd" | "agy.bat" | "agy.ps1")
+}
+
+fn is_cursor_binary(program: &str) -> bool {
+    let base = program.rsplit(['/', '\\']).next().unwrap_or(program).to_ascii_lowercase();
+    matches!(
+        base.as_str(),
+        "cursor-agent" | "cursor-agent.exe" | "cursor-agent.cmd" | "cursor-agent.bat" | "cursor-agent.ps1"
+    )
+}
+
+fn wrapped_cmd_index(argv: &[String]) -> Option<usize> {
+    if let Some(sep) = argv.iter().position(|a| a == "--")
+        && sep + 1 < argv.len()
+    {
+        return Some(sep + 1);
+    }
+    (!argv.is_empty()).then_some(0)
+}
+
+/// Returns `true` when the preset or command argv invokes Antigravity (`agy`).
+pub fn is_agy_agent(preset: Option<&str>, argv: &[String]) -> bool {
+    if matches!(preset, Some("agy" | "antigravity")) {
+        return true;
+    }
+    wrapped_cmd_index(argv).is_some_and(|idx| argv.get(idx).is_some_and(|cmd| is_agy_binary(cmd)))
+}
+
+/// Returns `true` when the preset or command argv invokes Cursor (`cursor-agent`).
+pub fn is_cursor_agent(preset: Option<&str>, argv: &[String]) -> bool {
+    if matches!(preset, Some("cursor" | "cursor-agent")) {
+        return true;
+    }
+    wrapped_cmd_index(argv).is_some_and(|idx| argv.get(idx).is_some_and(|cmd| is_cursor_binary(cmd)))
+}
+
+/// Ensures `agy acp` receives `--dangerously-skip-permissions` on CLI argv once.
+pub fn ensure_agy_skip_permissions(argv: &mut Vec<String>) {
+    let Some(idx) = wrapped_cmd_index(argv) else {
+        return;
+    };
+    if argv.get(idx).is_some_and(|cmd| is_agy_binary(cmd))
+        && argv.get(idx + 1).is_some_and(|sub| sub == "acp")
+        && !argv.iter().any(|a| a == "--dangerously-skip-permissions")
+    {
+        argv.insert(idx + 2, "--dangerously-skip-permissions".into());
+    }
+}
+
+/// Prevents `cursor-agent`'s bundled `global-agent@3.0.0` (`forceGlobalAgent: true` by default)
+/// from hijacking `@connectrpc/connect-node` `https.request` calls during `session/new` when
+/// `HTTP_PROXY` / `HTTPS_PROXY` is set, while preserving Cursor's native HTTP/2 proxy session manager.
+pub fn apply_cursor_env_quirks(argv: &[String], env: &mut BTreeMap<String, String>) {
+    if !is_cursor_agent(None, argv) {
+        return;
+    }
+    let has_override = env
+        .keys()
+        .any(|k| k.eq_ignore_ascii_case("GLOBAL_AGENT_FORCE_GLOBAL_AGENT"));
+    if !has_override {
+        env.insert("GLOBAL_AGENT_FORCE_GLOBAL_AGENT".into(), "false".into());
+    }
+}
+
 pub fn preset_names(config_presets: &BTreeMap<String, Vec<String>>) -> Vec<String> {
     let mut names: Vec<String> = BUILTIN_PRESETS.iter().map(|(n, _)| (*n).into()).collect();
     for k in config_presets.keys() {
@@ -300,5 +366,69 @@ mod tests {
 
         let err = resolve(Some("/home/u/.windsurf-server/bin/claude"), &[], None, &BTreeMap::new()).unwrap_err();
         assert_eq!(err.kind, "config");
+    }
+
+    #[test]
+    fn detects_and_hardens_agy_acp_skip_permissions_flag() {
+        assert!(is_agy_agent(Some("agy"), &[]));
+        assert!(is_agy_agent(Some("antigravity"), &[]));
+
+        let mut direct = vec!["agy".into(), "acp".into()];
+        assert!(is_agy_agent(None, &direct));
+        ensure_agy_skip_permissions(&mut direct);
+        assert_eq!(direct, ["agy", "acp", "--dangerously-skip-permissions"]);
+        ensure_agy_skip_permissions(&mut direct);
+        assert_eq!(direct, ["agy", "acp", "--dangerously-skip-permissions"]);
+
+        let mut win = vec![r"C:\Users\dev\AppData\Local\Programs\Antigravity\agy.exe".into(), "acp".into()];
+        assert!(is_agy_agent(None, &win));
+        ensure_agy_skip_permissions(&mut win);
+        assert_eq!(
+            win,
+            [r"C:\Users\dev\AppData\Local\Programs\Antigravity\agy.exe", "acp", "--dangerously-skip-permissions"]
+        );
+
+        let mut wrapped = vec!["bwrap".into(), "--ro-bind".into(), "/".into(), "/".into(), "--".into(), "agy".into(), "acp".into()];
+        assert!(is_agy_agent(None, &wrapped));
+        ensure_agy_skip_permissions(&mut wrapped);
+        assert_eq!(
+            wrapped,
+            ["bwrap", "--ro-bind", "/", "/", "--", "agy", "acp", "--dangerously-skip-permissions"]
+        );
+
+        let mut non_agy = vec!["claude-agent-acp".into()];
+        ensure_agy_skip_permissions(&mut non_agy);
+        assert_eq!(non_agy, ["claude-agent-acp"]);
+    }
+
+    #[test]
+    fn detects_cursor_agent_and_disables_force_global_agent_hijack() {
+        assert!(is_cursor_agent(Some("cursor"), &[]));
+        assert!(is_cursor_agent(Some("cursor-agent"), &[]));
+
+        let wrapped = vec![
+            "bwrap".into(),
+            "--dev-bind".into(),
+            "/".into(),
+            "/".into(),
+            "--".into(),
+            "cursor-agent".into(),
+            "acp".into(),
+        ];
+        assert!(is_cursor_agent(None, &wrapped));
+
+        let mut env = BTreeMap::new();
+        apply_cursor_env_quirks(&wrapped, &mut env);
+        assert_eq!(env.get("GLOBAL_AGENT_FORCE_GLOBAL_AGENT").map(String::as_str), Some("false"));
+
+        // Explicit caller setting wins.
+        let mut custom = BTreeMap::from([("GLOBAL_AGENT_FORCE_GLOBAL_AGENT".into(), "true".into())]);
+        apply_cursor_env_quirks(&wrapped, &mut custom);
+        assert_eq!(custom.get("GLOBAL_AGENT_FORCE_GLOBAL_AGENT").map(String::as_str), Some("true"));
+
+        // Non-cursor agents are untouched.
+        let mut other = BTreeMap::new();
+        apply_cursor_env_quirks(&["claude-agent-acp".into()], &mut other);
+        assert!(other.is_empty());
     }
 }

@@ -2,9 +2,11 @@
 //! Codex CLI, Gemini CLI, Qwen Code, Pi / oh-my-pi, and Antigravity CLI) plus
 //! optimistic merging of prompts sent via `h2 send`.
 
+use crate::acp::proto::AcpContextUsage;
+use crate::api::ReadSessionMeta;
 use crate::drove::crypto::sha256_hex;
 use crate::terminals::Terminal;
-use crate::transcript::Entry;
+use crate::transcript::{Entry, cap_tool_detail};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -84,23 +86,37 @@ pub fn snapshot_from_terminal(t: &Terminal, sent_prompts: Option<&Vec<(u64, u64,
 }
 
 pub fn extract_entries(snap: &PtySnapshot) -> Vec<Entry> {
-    let mut entries = home_dir()
-        .map(|home| extract_entries_with_home(snap, &home, None, None))
-        .unwrap_or_default();
-    merge_sent_prompts(&mut entries, &snap.sent_prompts);
-    cap_entries(&mut entries);
-    entries
+    extract_transcript(snap).0
 }
 
+pub fn extract_transcript(snap: &PtySnapshot) -> (Vec<Entry>, Option<ReadSessionMeta>) {
+    let (mut entries, meta) = home_dir()
+        .map(|home| extract_transcript_with_home(snap, &home, None, None))
+        .unwrap_or_else(|| (Vec::new(), None));
+    merge_sent_prompts(&mut entries, &snap.sent_prompts);
+    cap_entries(&mut entries);
+    (entries, meta)
+}
+
+#[cfg(test)]
 fn extract_entries_with_home(
     snap: &PtySnapshot,
     home: &Path,
     claude_dir_override: Option<&Path>,
     codex_dir_override: Option<&Path>,
 ) -> Vec<Entry> {
+    extract_transcript_with_home(snap, home, claude_dir_override, codex_dir_override).0
+}
+
+fn extract_transcript_with_home(
+    snap: &PtySnapshot,
+    home: &Path,
+    claude_dir_override: Option<&Path>,
+    codex_dir_override: Option<&Path>,
+) -> (Vec<Entry>, Option<ReadSessionMeta>) {
     let norm_cwd = normalize_cwd(&snap.cwd);
     if norm_cwd.is_empty() {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     let allow_older_fallback = snap.resumed || snap.turn > 0;
     let min_mtime = if snap.resumed {
@@ -121,7 +137,7 @@ fn extract_entries_with_home(
             Provider::Agy => discover_agy(home, min_mtime, snap.fg_pid),
         };
         if let Some(best) = pick_best_candidate(candidates, snap.started_ms, fg_started_ms, allow_older_fallback) {
-            let parsed = match best.provider {
+            let (entries, meta) = match best.provider {
                 Provider::Claude => parse_claude_jsonl(&best.path),
                 Provider::Codex => parse_codex_jsonl(&best.path),
                 Provider::Gemini => parse_gemini_json(&best.path),
@@ -135,12 +151,12 @@ fn extract_entries_with_home(
                 Provider::Pi => parse_pi_jsonl(&best.path),
                 Provider::Agy => parse_agy_jsonl(&best.path),
             };
-            if !parsed.is_empty() {
-                return parsed;
+            if !entries.is_empty() || !meta.is_empty() {
+                return (entries, (!meta.is_empty()).then_some(meta));
             }
         }
     }
-    Vec::new()
+    (Vec::new(), None)
 }
 
 fn home_dir() -> Option<PathBuf> {
@@ -789,9 +805,95 @@ fn read_bounded_lines(path: &Path) -> Vec<String> {
     lines
 }
 
-fn parse_claude_jsonl(path: &Path) -> Vec<Entry> {
+fn merge_tool_output(entries: &mut [Entry], idx: usize, new_status: &str, output_snippet: Option<String>) {
+    let Some(Entry::ToolCall { status, detail, .. }) = entries.get_mut(idx) else {
+        return;
+    };
+    *status = new_status.to_string();
+    let Some(out) = output_snippet.as_deref().and_then(cap_tool_detail) else {
+        return;
+    };
+    match detail {
+        Some(prev) if !prev.contains(&out) => {
+            *detail = cap_tool_detail(&format!("{prev}\n\n{out}"));
+        }
+        None => *detail = Some(out),
+        _ => {}
+    }
+}
+
+fn value_text_snippet(val: Option<&Value>) -> Option<String> {
+    let val = val?;
+    match val {
+        Value::String(s) => cap_tool_detail(s),
+        Value::Array(arr) => {
+            let parts: Vec<&str> = arr
+                .iter()
+                .filter_map(|item| {
+                    item.as_str()
+                        .or_else(|| item.get("text").and_then(Value::as_str))
+                        .or_else(|| item.get("output").and_then(Value::as_str))
+                })
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                cap_tool_detail(&parts.join("\n"))
+            }
+        }
+        Value::Object(obj) => obj
+            .get("output")
+            .or_else(|| obj.get("stdout"))
+            .or_else(|| obj.get("text"))
+            .or_else(|| obj.get("stderr"))
+            .and_then(Value::as_str)
+            .and_then(cap_tool_detail),
+        _ => None,
+    }
+}
+
+fn claude_tool_detail(name: &str, input: &Value) -> Option<String> {
+    match name {
+        "Edit" | "MultiEdit" => {
+            let path = input.get("file_path").and_then(Value::as_str).unwrap_or("file");
+            let old_t = input.get("old_string").and_then(Value::as_str).unwrap_or("");
+            let new_t = input.get("new_string").and_then(Value::as_str).unwrap_or("");
+            if old_t.is_empty() && new_t.is_empty() {
+                return None;
+            }
+            let mut diff = format!("--- {path}\n+++ {path}");
+            for line in old_t.lines().take(25) {
+                diff.push_str("\n- ");
+                diff.push_str(line);
+            }
+            for line in new_t.lines().take(25) {
+                diff.push_str("\n+ ");
+                diff.push_str(line);
+            }
+            cap_tool_detail(&diff)
+        }
+        "Write" => {
+            let content = input.get("content").and_then(Value::as_str)?;
+            cap_tool_detail(content)
+        }
+        "Bash" => {
+            let cmd = input.get("command").and_then(Value::as_str)?.trim();
+            if cmd.contains('\n') || cmd.len() > 120 {
+                cap_tool_detail(cmd)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn parse_claude_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
     let lines = read_bounded_lines(path);
     let mut entries: Vec<Entry> = Vec::new();
+    let mut meta = ReadSessionMeta::default();
     let mut tool_indices: HashMap<String, usize> = HashMap::new();
     let mut turn: u64 = 0;
 
@@ -803,6 +905,13 @@ fn parse_claude_jsonl(path: &Path) -> Vec<Entry> {
         let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
+        if let Some(pm) = v.get("permissionMode").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+            meta.mode = Some(if pm == "bypassPermissions" {
+                "dangerously-skip-permissions".into()
+            } else {
+                pm.to_string()
+            });
+        }
         if v.get("isSidechain").and_then(Value::as_bool) == Some(true)
             || v.get("isMeta").and_then(Value::as_bool) == Some(true)
         {
@@ -832,10 +941,11 @@ fn parse_claude_jsonl(path: &Path) -> Vec<Entry> {
                                 Some("tool_result") => {
                                     if let Some(id) = block.get("tool_use_id").and_then(Value::as_str)
                                         && let Some(&idx) = tool_indices.get(id)
-                                        && let Some(Entry::ToolCall { status, .. }) = entries.get_mut(idx)
                                     {
                                         let is_err = block.get("is_error").and_then(Value::as_bool) == Some(true);
-                                        *status = if is_err { "failed" } else { "completed" }.to_string();
+                                        let new_status = if is_err { "failed" } else { "completed" };
+                                        let out = value_text_snippet(block.get("content"));
+                                        merge_tool_output(&mut entries, idx, new_status, out);
                                     }
                                 }
                                 Some("text") => {
@@ -868,6 +978,18 @@ fn parse_claude_jsonl(path: &Path) -> Vec<Entry> {
                 }
             }
             Some("assistant") => {
+                if let Some(model) = v.pointer("/message/model").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+                    meta.model = Some(model.to_string());
+                }
+                if let Some(usage) = v.pointer("/message/usage") {
+                    let input_tok = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                    let cache_create = usage.get("cache_creation_input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                    let cache_read = usage.get("cache_read_input_tokens").and_then(Value::as_u64).unwrap_or(0);
+                    let used = input_tok + cache_create + cache_read;
+                    if used > 0 {
+                        meta.context_usage = Some(AcpContextUsage { used, size: 200_000 });
+                    }
+                }
                 let Some(blocks) = v.pointer("/message/content").and_then(Value::as_array) else {
                     continue;
                 };
@@ -895,6 +1017,7 @@ fn parse_claude_jsonl(path: &Path) -> Vec<Entry> {
                                 continue;
                             }
                             let (tool_kind, title) = summarize_claude_tool(name, input);
+                            let detail = claude_tool_detail(name, input);
                             let idx = entries.len();
                             entries.push(Entry::ToolCall {
                                 turn,
@@ -902,6 +1025,7 @@ fn parse_claude_jsonl(path: &Path) -> Vec<Entry> {
                                 title,
                                 tool_kind,
                                 status: "in_progress".to_string(),
+                                detail,
                                 ts_ms,
                             });
                             if !id.is_empty() {
@@ -923,7 +1047,7 @@ fn parse_claude_jsonl(path: &Path) -> Vec<Entry> {
             _ => {}
         }
     }
-    entries
+    (entries, meta)
 }
 
 fn is_claude_command_noise(s: &str) -> bool {
@@ -1006,7 +1130,26 @@ fn summarize_claude_tool(name: &str, input: &Value) -> (Option<String>, String) 
     }
 }
 
-fn parse_codex_jsonl(path: &Path) -> Vec<Entry> {
+fn codex_tool_detail(name: &str, args: &Value) -> Option<String> {
+    match name {
+        "apply_patch" => args.as_str().and_then(cap_tool_detail),
+        "shell" | "shell_command" | "exec_command" => {
+            let cmd = args
+                .get("command")
+                .or_else(|| args.get("cmd"))
+                .and_then(Value::as_str)?
+                .trim();
+            if cmd.contains('\n') || cmd.len() > 120 {
+                cap_tool_detail(cmd)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn parse_codex_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
     let lines = read_bounded_lines(path);
     let mut parsed: Vec<Value> = Vec::new();
     let mut has_event_user_msg = false;
@@ -1027,20 +1170,55 @@ fn parse_codex_jsonl(path: &Path) -> Vec<Entry> {
     }
 
     let mut entries: Vec<Entry> = Vec::new();
+    let mut meta = ReadSessionMeta::default();
     let mut tool_indices: HashMap<String, usize> = HashMap::new();
     let mut turn: u64 = 0;
 
     for v in parsed {
         let ts_ms = v.get("timestamp").and_then(Value::as_str).map(parse_ts_ms).unwrap_or(0);
         match v.get("type").and_then(Value::as_str) {
+            Some("session_meta") => {
+                if let Some(m) = v.pointer("/payload/model").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+                    meta.model = Some(m.to_string());
+                }
+            }
+            Some("turn_context") => {
+                if let Some(payload) = v.get("payload") {
+                    if let Some(m) = payload.get("model").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+                        meta.model = Some(m.to_string());
+                    }
+                    if let Some(e) = payload.get("effort").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+                        meta.reasoning_effort = Some(e.to_string());
+                    }
+                    if let Some(p) = payload.get("approval_policy").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+                        meta.mode = Some(p.to_string());
+                    }
+                }
+            }
             Some("event_msg") => {
-                if v.pointer("/payload/type").and_then(Value::as_str) == Some("user_message")
+                let ev_type = v.pointer("/payload/type").and_then(Value::as_str);
+                if ev_type == Some("user_message")
                     && let Some(msg) = v.pointer("/payload/message").and_then(Value::as_str)
                 {
                     let clean = msg.trim();
                     if !clean.is_empty() {
                         turn += 1;
                         entries.push(Entry::User { turn, from: None, text: clean.to_string(), ts_ms });
+                    }
+                } else if ev_type == Some("token_count")
+                    && let Some(info) = v.pointer("/payload/info")
+                {
+                    let used = info
+                        .pointer("/last_token_usage/total_tokens")
+                        .or_else(|| info.pointer("/total_token_usage/total_tokens"))
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    let size = info
+                        .get("model_context_window")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(0);
+                    if size > 0 {
+                        meta.context_usage = Some(AcpContextUsage { used, size });
                     }
                 }
             }
@@ -1098,6 +1276,7 @@ fn parse_codex_jsonl(path: &Path) -> Vec<Entry> {
                             continue;
                         }
                         let (tool_kind, title) = summarize_codex_tool(name, &args_val);
+                        let detail = codex_tool_detail(name, &args_val);
                         let idx = entries.len();
                         entries.push(Entry::ToolCall {
                             turn,
@@ -1105,6 +1284,7 @@ fn parse_codex_jsonl(path: &Path) -> Vec<Entry> {
                             title,
                             tool_kind,
                             status: "in_progress".to_string(),
+                            detail,
                             ts_ms,
                         });
                         if !call_id.is_empty() {
@@ -1114,10 +1294,11 @@ fn parse_codex_jsonl(path: &Path) -> Vec<Entry> {
                     Some("function_call_output") | Some("custom_tool_call_output") => {
                         if let Some(call_id) = payload.get("call_id").and_then(Value::as_str)
                             && let Some(&idx) = tool_indices.get(call_id)
-                            && let Some(Entry::ToolCall { status, .. }) = entries.get_mut(idx)
                         {
                             let failed = codex_output_failed(payload.get("output"));
-                            *status = if failed { "failed" } else { "completed" }.to_string();
+                            let new_status = if failed { "failed" } else { "completed" };
+                            let out = value_text_snippet(payload.get("output"));
+                            merge_tool_output(&mut entries, idx, new_status, out);
                         }
                     }
                     Some("message") => {
@@ -1158,7 +1339,7 @@ fn parse_codex_jsonl(path: &Path) -> Vec<Entry> {
             _ => {}
         }
     }
-    entries
+    (entries, meta)
 }
 
 fn join_codex_message_texts(payload: &Value, types: &[&str]) -> String {
@@ -1246,21 +1427,25 @@ fn codex_output_failed(output: Option<&Value>) -> bool {
     false
 }
 
-fn parse_gemini_json(path: &Path) -> Vec<Entry> {
+fn parse_gemini_json(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
+    let mut meta = ReadSessionMeta::default();
     let Ok(raw) = fs::read_to_string(path) else {
-        return Vec::new();
+        return (Vec::new(), meta);
     };
     let Ok(v) = serde_json::from_str::<Value>(&raw) else {
-        return Vec::new();
+        return (Vec::new(), meta);
     };
     let Some(msgs) = v.get("messages").and_then(Value::as_array) else {
-        return Vec::new();
+        return (Vec::new(), meta);
     };
     let mut entries = Vec::new();
     let mut turn: u64 = 0;
 
     for m in msgs {
         let ts_ms = m.get("timestamp").and_then(Value::as_str).map(parse_ts_ms).unwrap_or(0);
+        if let Some(model) = m.get("model").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+            meta.model = Some(model.to_string());
+        }
         match m.get("type").and_then(Value::as_str) {
             Some("user") => {
                 let text = extract_gemini_text(m.get("content"));
@@ -1302,12 +1487,17 @@ fn parse_gemini_json(path: &Path) -> Vec<Entry> {
                             Some("executing" | "scheduled" | "awaiting_approval" | "pending" | "in_progress") => "in_progress",
                             _ => "completed",
                         };
+                        let detail = merge_tool_detail_parts(
+                            generic_tool_detail(name, args),
+                            value_text_snippet(tc.get("resultDisplay").or_else(|| tc.get("result"))),
+                        );
                         entries.push(Entry::ToolCall {
                             turn,
                             id,
                             title,
                             tool_kind,
                             status: status.to_string(),
+                            detail,
                             ts_ms,
                         });
                     }
@@ -1320,7 +1510,7 @@ fn parse_gemini_json(path: &Path) -> Vec<Entry> {
             _ => {}
         }
     }
-    entries
+    (entries, meta)
 }
 
 fn extract_gemini_text(val: Option<&Value>) -> String {
@@ -1338,6 +1528,83 @@ fn extract_gemini_text(val: Option<&Value>) -> String {
             .join("\n\n"),
         _ => String::new(),
     }
+}
+
+fn generic_tool_detail(name: &str, args: &Value) -> Option<String> {
+    let lower = name.to_ascii_lowercase();
+    let str_field = |k: &str| args.get(k).and_then(Value::as_str);
+    if lower.contains("edit") || lower.contains("replace") {
+        let path = str_field("file_path")
+            .or_else(|| str_field("path"))
+            .or_else(|| str_field("absolute_path"))
+            .or_else(|| str_field("Path"))
+            .unwrap_or("file");
+        let (old_s, new_s) = str_field("old_string")
+            .map(|o| (o, str_field("new_string").unwrap_or("")))
+            .or_else(|| str_field("oldText").map(|o| (o, str_field("newText").unwrap_or(""))))
+            .or_else(|| str_field("Target").map(|o| (o, str_field("Replacement").unwrap_or(""))))
+            .unwrap_or(("", ""));
+        if old_s.is_empty() && new_s.is_empty() {
+            return None;
+        }
+        let mut diff = format!("--- {path}\n+++ {path}");
+        for line in old_s.lines().take(30) {
+            diff.push_str("\n- ");
+            diff.push_str(line);
+        }
+        for line in new_s.lines().take(30) {
+            diff.push_str("\n+ ");
+            diff.push_str(line);
+        }
+        cap_tool_detail(&diff)
+    } else if lower.contains("write") {
+        let content = str_field("content").or_else(|| str_field("Content"))?;
+        cap_tool_detail(content)
+    } else if lower.contains("shell") || lower.contains("bash") || lower.contains("exec") || lower.contains("command") {
+        let cmd = str_field("command")
+            .or_else(|| str_field("cmd"))
+            .or_else(|| str_field("CommandLine"))?
+            .trim();
+        if cmd.contains('\n') || cmd.len() > 100 {
+            cap_tool_detail(cmd)
+        } else {
+            None
+        }
+    } else {
+        None
+    }
+}
+
+fn merge_tool_detail_parts(a: Option<String>, b: Option<String>) -> Option<String> {
+    match (a, b) {
+        (Some(x), Some(y)) if !x.contains(&y) => cap_tool_detail(&format!("{x}\n\n{y}")),
+        (Some(x), _) | (_, Some(x)) => Some(x),
+        (None, None) => None,
+    }
+}
+
+fn extract_plan_lines(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| {
+            line.starts_with("- ")
+                || line.starts_with("* ")
+                || line
+                    .split_once(". ")
+                    .is_some_and(|(num, _)| !num.is_empty() && num.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map(|line| {
+            if let Some(rest) = line.strip_prefix("- ").or_else(|| line.strip_prefix("* ")) {
+                rest.trim().to_string()
+            } else if let Some((_, rest)) = line.split_once(". ") {
+                rest.trim().to_string()
+            } else {
+                line.to_string()
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .take(40)
+        .collect()
 }
 
 fn summarize_generic_tool(name: &str, args: &Value) -> (Option<String>, String) {
@@ -1370,9 +1637,10 @@ fn summarize_generic_tool(name: &str, args: &Value) -> (Option<String>, String) 
     }
 }
 
-fn parse_pi_jsonl(path: &Path) -> Vec<Entry> {
+fn parse_pi_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
     let lines = read_bounded_lines(path);
     let mut entries = Vec::new();
+    let mut meta = ReadSessionMeta::default();
     let mut tool_indices: HashMap<String, usize> = HashMap::new();
     let mut turn: u64 = 0;
 
@@ -1384,6 +1652,21 @@ fn parse_pi_jsonl(path: &Path) -> Vec<Entry> {
         let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
+        if let Some(eff) = v
+            .get("thinkingLevel")
+            .or_else(|| v.get("reasoningEffort"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            meta.reasoning_effort = Some(eff.to_string());
+        }
+        if v.get("type").and_then(Value::as_str) == Some("model_change")
+            && let Some(m) = v.get("modelId").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
+        {
+            meta.model = Some(m.to_string());
+            continue;
+        }
         if v.get("type").and_then(Value::as_str) != Some("message") {
             continue;
         }
@@ -1391,6 +1674,15 @@ fn parse_pi_jsonl(path: &Path) -> Vec<Entry> {
         let Some(msg) = v.get("message") else {
             continue;
         };
+        if let Some(eff) = msg
+            .get("thinkingLevel")
+            .or_else(|| msg.get("reasoningEffort"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            meta.reasoning_effort = Some(eff.to_string());
+        }
         match msg.get("role").and_then(Value::as_str) {
             Some("user") => {
                 let text = extract_gemini_text(msg.get("content"));
@@ -1400,6 +1692,9 @@ fn parse_pi_jsonl(path: &Path) -> Vec<Entry> {
                 }
             }
             Some("assistant") => {
+                if let Some(m) = msg.get("model").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+                    meta.model = Some(m.to_string());
+                }
                 let Some(blocks) = msg.get("content").and_then(Value::as_array) else {
                     continue;
                 };
@@ -1418,6 +1713,7 @@ fn parse_pi_jsonl(path: &Path) -> Vec<Entry> {
                             let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
                             let args = block.get("arguments").unwrap_or(&Value::Null);
                             let (tool_kind, title) = summarize_generic_tool(name, args);
+                            let detail = generic_tool_detail(name, args);
                             let idx = entries.len();
                             entries.push(Entry::ToolCall {
                                 turn,
@@ -1425,6 +1721,7 @@ fn parse_pi_jsonl(path: &Path) -> Vec<Entry> {
                                 title,
                                 tool_kind,
                                 status: "in_progress".to_string(),
+                                detail,
                                 ts_ms,
                             });
                             if !id.is_empty() {
@@ -1446,21 +1743,23 @@ fn parse_pi_jsonl(path: &Path) -> Vec<Entry> {
             Some("toolResult") => {
                 if let Some(id) = msg.get("toolCallId").and_then(Value::as_str)
                     && let Some(&idx) = tool_indices.get(id)
-                    && let Some(Entry::ToolCall { status, .. }) = entries.get_mut(idx)
                 {
                     let is_err = msg.get("isError").and_then(Value::as_bool) == Some(true);
-                    *status = if is_err { "failed" } else { "completed" }.to_string();
+                    let new_status = if is_err { "failed" } else { "completed" };
+                    let out = value_text_snippet(msg.get("content"));
+                    merge_tool_output(&mut entries, idx, new_status, out);
                 }
             }
             _ => {}
         }
     }
-    entries
+    (entries, meta)
 }
 
-fn parse_agy_jsonl(path: &Path) -> Vec<Entry> {
+fn parse_agy_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
     let lines = read_bounded_lines(path);
     let mut entries = Vec::new();
+    let mut meta = ReadSessionMeta::default();
     let mut turn: u64 = 0;
 
     for line in lines {
@@ -1471,6 +1770,9 @@ fn parse_agy_jsonl(path: &Path) -> Vec<Entry> {
         let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
+        if let Some(m) = v.get("model").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+            meta.model = Some(m.to_string());
+        }
         let ts_ms = v.get("created_at").and_then(Value::as_str).map(parse_ts_ms).unwrap_or(0);
         match v.get("type").and_then(Value::as_str) {
             Some("USER_INPUT") => {
@@ -1492,14 +1794,44 @@ fn parse_agy_jsonl(path: &Path) -> Vec<Entry> {
                     for tc in tcs {
                         let id = tc.get("id").and_then(Value::as_str).unwrap_or("").to_string();
                         let name = tc.get("name").and_then(Value::as_str).unwrap_or("tool");
-                        let args = tc.get("arguments").or_else(|| tc.get("args")).unwrap_or(&Value::Null);
+                        let raw_args = tc.get("arguments").or_else(|| tc.get("args"));
+                        let parsed_args: Value;
+                        let args = match raw_args {
+                            Some(Value::String(s)) => {
+                                parsed_args = serde_json::from_str::<Value>(s).unwrap_or(Value::Null);
+                                &parsed_args
+                            }
+                            Some(v) => v,
+                            None => &Value::Null,
+                        };
+                        if name == "exit_plan_mode"
+                            && let Some(plan_text) = args.get("plan").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
+                        {
+                            let items = extract_plan_lines(plan_text);
+                            if !items.is_empty() {
+                                entries.push(Entry::Plan { turn, items, ts_ms });
+                            } else if let Some(detail) = cap_tool_detail(plan_text) {
+                                entries.push(Entry::ToolCall {
+                                    turn,
+                                    id,
+                                    title: "exit_plan_mode".to_string(),
+                                    tool_kind: Some("plan".into()),
+                                    status: "completed".to_string(),
+                                    detail: Some(detail),
+                                    ts_ms,
+                                });
+                            }
+                            continue;
+                        }
                         let (tool_kind, title) = summarize_generic_tool(name, args);
+                        let detail = generic_tool_detail(name, args);
                         entries.push(Entry::ToolCall {
                             turn,
                             id,
                             title,
                             tool_kind,
                             status: "completed".to_string(),
+                            detail,
                             ts_ms,
                         });
                     }
@@ -1514,7 +1846,7 @@ fn parse_agy_jsonl(path: &Path) -> Vec<Entry> {
             _ => {}
         }
     }
-    entries
+    (entries, meta)
 }
 
 fn strip_xml_tag_blocks(raw: &str, tag: &str) -> String {
@@ -1621,8 +1953,12 @@ fn entry_approx_bytes(e: &Entry) -> usize {
     match e {
         Entry::User { text, from, .. } => text.len() + from.as_ref().map_or(0, String::len),
         Entry::Thought { text, .. } | Entry::Assistant { text, .. } | Entry::Stderr { text, .. } => text.len(),
-        Entry::ToolCall { id, title, tool_kind, status, .. } => {
-            id.len() + title.len() + tool_kind.as_ref().map_or(0, String::len) + status.len()
+        Entry::ToolCall { id, title, tool_kind, status, detail, .. } => {
+            id.len()
+                + title.len()
+                + tool_kind.as_ref().map_or(0, String::len)
+                + status.len()
+                + detail.as_ref().map_or(0, String::len)
         }
         Entry::Plan { items, .. } => items.iter().map(String::len).sum(),
         Entry::Permission { title, outcome, .. } => title.len() + outcome.len(),
@@ -1745,6 +2081,7 @@ mod tests {
             serde_json::json!({
                 "type": "user",
                 "cwd": project,
+                "permissionMode": "bypassPermissions",
                 "timestamp": "2026-11-17T10:00:00.000Z",
                 "message": { "role": "user", "content": "<local-command-caveat>ignore</local-command-caveat>" }
             }),
@@ -1760,6 +2097,8 @@ mod tests {
                 "timestamp": "2026-11-17T10:00:02.000Z",
                 "message": {
                     "role": "assistant",
+                    "model": "claude-sonnet-4-5",
+                    "usage": { "input_tokens": 1200, "cache_read_input_tokens": 26800 },
                     "content": [
                         { "type": "thinking", "thinking": "Let me read the file." },
                         { "type": "tool_use", "id": "tu-1", "name": "Read", "input": { "file_path": "src/main.rs" } },
@@ -1784,6 +2123,7 @@ mod tests {
                 "timestamp": "2026-11-17T10:00:04.000Z",
                 "message": {
                     "role": "assistant",
+                    "model": "claude-sonnet-4-5",
                     "content": [{ "type": "text", "text": "All good." }]
                 }
             }),
@@ -1799,13 +2139,17 @@ mod tests {
             resumed: false,
             fg_pid: None,
         };
-        let entries = extract_entries_with_home(&snap, &root, Some(&root), None);
+        let (entries, meta) = extract_transcript_with_home(&snap, &root, Some(&root), None);
         assert_eq!(entries.len(), 5);
         assert!(matches!(&entries[0], Entry::User { text, turn: 1, .. } if text == "Inspect main.rs"));
         assert!(matches!(&entries[1], Entry::Thought { text, .. } if text == "Let me read the file."));
-        assert!(matches!(&entries[2], Entry::ToolCall { title, tool_kind, status, .. } if title == "Read src/main.rs" && tool_kind.as_deref() == Some("read") && status == "completed"));
+        assert!(matches!(&entries[2], Entry::ToolCall { title, tool_kind, status, detail, .. } if title == "Read src/main.rs" && tool_kind.as_deref() == Some("read") && status == "completed" && detail.as_deref() == Some("fn main() {}")));
         assert!(matches!(&entries[3], Entry::Plan { items, .. } if items == &vec!["[x] Check code".to_string()]));
         assert!(matches!(&entries[4], Entry::Assistant { text, .. } if text == "All good."));
+        let meta = meta.expect("expected Claude session metadata");
+        assert_eq!(meta.model.as_deref(), Some("claude-sonnet-4-5"));
+        assert_eq!(meta.mode.as_deref(), Some("dangerously-skip-permissions"));
+        assert_eq!(meta.context_usage, Some(AcpContextUsage { used: 28000, size: 200_000 }));
         fs::remove_dir_all(root).ok();
     }
 
@@ -1821,6 +2165,11 @@ mod tests {
                 "timestamp": "2026-11-17T10:00:00.000Z",
                 "type": "session_meta",
                 "payload": { "cwd": project, "timestamp": "2026-11-17T10:00:00.000Z" }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-11-17T10:00:00.500Z",
+                "type": "turn_context",
+                "payload": { "model": "gpt-5.4", "effort": "high", "approval_policy": "never" }
             }),
             serde_json::json!({
                 "timestamp": "2026-11-17T10:00:01.000Z",
@@ -1852,6 +2201,17 @@ mod tests {
                 }
             }),
             serde_json::json!({
+                "timestamp": "2026-11-17T10:00:04.500Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": { "total_tokens": 34000 },
+                        "model_context_window": 272000
+                    }
+                }
+            }),
+            serde_json::json!({
                 "timestamp": "2026-11-17T10:00:05.000Z",
                 "type": "response_item",
                 "payload": {
@@ -1872,12 +2232,17 @@ mod tests {
             resumed: false,
             fg_pid: None,
         };
-        let entries = extract_entries_with_home(&snap, &root, None, Some(&root));
+        let (entries, meta) = extract_transcript_with_home(&snap, &root, None, Some(&root));
         assert_eq!(entries.len(), 4);
         assert!(matches!(&entries[0], Entry::User { text, .. } if text == "Run tests"));
         assert!(matches!(&entries[1], Entry::Thought { text, .. } if text == "Checking cargo test"));
-        assert!(matches!(&entries[2], Entry::ToolCall { title, tool_kind, status, .. } if title == "cargo test" && tool_kind.as_deref() == Some("execute") && status == "failed"));
+        assert!(matches!(&entries[2], Entry::ToolCall { title, tool_kind, status, detail, .. } if title == "cargo test" && tool_kind.as_deref() == Some("execute") && status == "failed" && detail.as_deref() == Some("Exit code: 1\nfailed")));
         assert!(matches!(&entries[3], Entry::Assistant { text, .. } if text == "Tests failed."));
+        let meta = meta.expect("expected Codex session metadata");
+        assert_eq!(meta.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(meta.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(meta.mode.as_deref(), Some("never"));
+        assert_eq!(meta.context_usage, Some(AcpContextUsage { used: 34000, size: 272000 }));
         fs::remove_dir_all(root).ok();
     }
 
@@ -2132,5 +2497,86 @@ mod tests {
         merge_sent_prompts(&mut entries, &prompts);
         assert_eq!(entries.len(), 2);
         assert!(matches!(&entries[1], Entry::User { text, ts_ms: 2000, .. } if text == "second prompt"));
+    }
+
+    #[test]
+    fn pi_and_agy_populate_diff_details_and_plan_entries() {
+        let root = tmp_dir("pi-agy-diff");
+        let pi_path = root.join("pi.jsonl");
+        let pi_lines = [
+            serde_json::json!({
+                "type": "message",
+                "thinkingLevel": "high",
+                "timestamp": "2026-11-17T10:00:01.000Z",
+                "message": { "role": "user", "content": [{ "type": "text", "text": "Fix foo" }] }
+            }),
+            serde_json::json!({
+                "type": "message",
+                "timestamp": "2026-11-17T10:00:02.000Z",
+                "message": {
+                    "role": "assistant",
+                    "model": "gpt-5.4",
+                    "content": [
+                        {
+                            "type": "toolCall",
+                            "id": "p-edit",
+                            "name": "Edit",
+                            "arguments": { "path": "src/foo.rs", "oldText": "fn a() {}", "newText": "fn b() {}" }
+                        }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "type": "message",
+                "timestamp": "2026-11-17T10:00:03.000Z",
+                "message": { "role": "toolResult", "toolCallId": "p-edit", "isError": false, "content": "Applied" }
+            }),
+        ];
+        fs::write(&pi_path, pi_lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n")).unwrap();
+        let (pi_entries, pi_meta) = parse_pi_jsonl(&pi_path);
+        assert_eq!(pi_meta.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(pi_meta.reasoning_effort.as_deref(), Some("high"));
+        assert!(matches!(
+            &pi_entries[1],
+            Entry::ToolCall { tool_kind, detail: Some(d), .. }
+            if tool_kind.as_deref() == Some("edit") && d.contains("--- src/foo.rs") && d.contains("- fn a() {}") && d.contains("+ fn b() {}")
+        ));
+
+        let agy_path = root.join("agy.jsonl");
+        let agy_lines = [
+            serde_json::json!({
+                "type": "USER_INPUT",
+                "created_at": "1700000000000",
+                "content": "<USER_REQUEST>\nUpdate bar\n</USER_REQUEST>"
+            }),
+            serde_json::json!({
+                "type": "PLANNER_RESPONSE",
+                "created_at": "1700000001000",
+                "model": "claude-opus-4",
+                "tool_calls": [
+                    {
+                        "id": "a-edit",
+                        "name": "edit_file",
+                        "args": { "Path": "src/bar.rs", "Target": "old", "Replacement": "new" }
+                    },
+                    {
+                        "id": "a-plan",
+                        "name": "exit_plan_mode",
+                        "args": { "plan": "- Step one\n- Step two" }
+                    }
+                ],
+                "content": "Updated bar."
+            }),
+        ];
+        fs::write(&agy_path, agy_lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n")).unwrap();
+        let (agy_entries, agy_meta) = parse_agy_jsonl(&agy_path);
+        assert_eq!(agy_meta.model.as_deref(), Some("claude-opus-4"));
+        assert!(matches!(
+            &agy_entries[1],
+            Entry::ToolCall { tool_kind, detail: Some(d), .. }
+            if tool_kind.as_deref() == Some("edit") && d.contains("--- src/bar.rs") && d.contains("- old") && d.contains("+ new")
+        ));
+        assert!(matches!(&agy_entries[2], Entry::Plan { items, .. } if items == &vec!["Step one".to_string(), "Step two".to_string()]));
+        fs::remove_dir_all(root).ok();
     }
 }

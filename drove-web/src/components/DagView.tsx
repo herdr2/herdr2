@@ -46,6 +46,7 @@ import { depRouteKey, dispatchRouteKey, layoutBoard, NODE_SIZE, ROLE_RANK, type 
 import {
   COORD_ID,
   MARK_LABEL,
+  coordinatorAgentModelLine,
   coordinatorHostLabel,
   allMessages,
   attemptMark,
@@ -425,7 +426,10 @@ function ReviewerNode({ id, data }: NodeProps<Node<ReviewerNodeData>>) {
       <div className="gnode__meta"><ContextBar used={w.context.used} size={w.context.size} /></div>
       <div className="gnode__meta gnode__meta--dim">
         <span>{data.taskCount} 个审查任务</span>
-        <span className="gnode__marks" style={{ display: "inline-flex", gap: 4 }}>{data.marks.map((mark) => <span key={mark.key} className={`sdot mark-dot mark-dot--${mark.kind}`} style={{ color: mark.kind === "ok" ? "var(--st-done)" : mark.kind === "fail" ? "var(--st-failed)" : "var(--st-review)" }} title={mark.label} aria-label={mark.label} />)}</span>
+        <span className="gnode__marks" style={{ display: "inline-flex", gap: 4 }}>{data.marks.map((mark) => {
+          const stColor = mark.kind === "ok" ? "var(--st-done)" : mark.kind === "fail" ? "var(--st-failed)" : "var(--st-review)";
+          return <span key={mark.key} className={`sdot mark-dot mark-dot--${mark.kind}`} style={{ "--st": stColor, color: stColor } as CSSProperties} title={mark.label} aria-label={mark.label} />;
+        })}</span>
       </div>
     </div>
   );
@@ -459,6 +463,7 @@ function CoordinatorNode({ id, data }: NodeProps<Node<CoordNodeData>>) {
   const donePct = (p.done / total) * 100;
   const runPct = (p.running / total) * 100;
   const failPct = (p.failed / total) * 100;
+  const coordModel = coordinatorAgentModelLine(data.run);
   return (
     <div className={`gnode gnode--coord${data.selected ? " gnode--selected" : ""}${data.hot ? " gnode--rel-ran" : ""}${data.dim ? " gnode--rel-dim" : ""}${data.lensDim ? " gnode--lens-dim" : ""}`} data-status={data.token} style={tone(data.token)}>
       <div className="gnode__head">
@@ -479,9 +484,15 @@ function CoordinatorNode({ id, data }: NodeProps<Node<CoordNodeData>>) {
           {t(`run.${data.run.status}`)}
         </span>
       </div>
-      <div className="gnode__title gnode__title--sm" title={`${coordinatorHostLabel(data.run)} · ${data.run.coordinator.hostSession}`}>
-        {`${coordinatorHostLabel(data.run)} · ${shortId(data.run.coordinator.hostSession, 10)}`}
-      </div>
+      {coordModel ? (
+        <div className="gnode__meta" title={`${coordModel} · ${coordinatorHostLabel(data.run)} · ${data.run.coordinator.hostSession}`}>
+          <span className="mono gnode__model">{coordModel}</span>
+        </div>
+      ) : (
+        <div className="gnode__title gnode__title--sm" title={`${coordinatorHostLabel(data.run)} · ${data.run.coordinator.hostSession}`}>
+          {`${coordinatorHostLabel(data.run)} · ${shortId(data.run.coordinator.hostSession, 10)}`}
+        </div>
+      )}
       <div className="coord-progress" title={`${p.done}/${p.total} (${p.pct}%)`}>
         <div className="coord-progress__track">
           {p.done > 0 && <span className="coord-progress__seg coord-progress__seg--done" style={{ width: `${donePct}%` }} />}
@@ -491,7 +502,7 @@ function CoordinatorNode({ id, data }: NodeProps<Node<CoordNodeData>>) {
         <span className="coord-progress__pct">{`${p.done}/${p.total} (${p.pct}%)`}</span>
       </div>
       <div className="gnode__meta gnode__meta--dim">
-        <span>{data.workers} {t("tb.workers")}{data.busy ? ` · ${data.busy} ${t("worker.busy")}` : ""}</span>
+        <span>{coordModel ? `${shortId(data.run.coordinator.hostSession, 8)} · ` : ""}{data.workers} {t("tb.workers")}{data.busy ? ` · ${data.busy} ${t("worker.busy")}` : ""}</span>
         {p.pendingActions > 0 && (
           <span className="gnode__flag">{t("coord.actions", { n: p.pendingActions })}</span>
         )}
@@ -513,13 +524,11 @@ const nodeTypes = { task: TaskNode, worker: WorkerNode, reviewer: ReviewerNode, 
 const edgeTypes = { routed: RoutedEdge, exec: ExecEdge, fork: ForkEdge };
 
 function edgeColors(): Record<"depends" | "satisfied" | "dispatch" | "branch", string> {
-  const cs = typeof window !== "undefined" ? getComputedStyle(document.documentElement) : null;
-  const v = (name: string, fallback: string) => cs?.getPropertyValue(name).trim() || fallback;
   return {
-    depends: v("--edge-depends", "#7a8494"),
-    satisfied: v("--edge-satisfied", "#1f8a4c"),
-    dispatch: v("--edge-dispatch", "#0f766e"),
-    branch: v("--edge-branch", "#b45309"),
+    depends: "var(--edge-depends)",
+    satisfied: "var(--edge-satisfied)",
+    dispatch: "var(--edge-dispatch)",
+    branch: "var(--edge-branch)",
   };
 }
 
@@ -532,22 +541,13 @@ const MARK_VAR: Record<CrossMark, string> = {
 };
 
 function markColor(mark: CrossMark): string {
-  const fallback: Record<CrossMark, string> = {
-    ok: "#4f46e5",
-    order: "#4f46e5",
-    fail: "#c93a32",
-    retry: "#7a52c7",
-    run: "#c98a0c",
-  };
-  if (typeof window === "undefined") return fallback[mark];
-  return getComputedStyle(document.documentElement).getPropertyValue(MARK_VAR[mark]).trim() || fallback[mark];
+  return `var(${MARK_VAR[mark]})`;
 }
 
-/** Always-on success edges are green. Other marks keep the selection palette. */
+/** Always-on success edges use the sage done color. Other marks keep the warm palette. */
 function persistColor(mark: CrossMark): string {
   if (mark !== "ok") return markColor(mark);
-  if (typeof window === "undefined") return "#1f8a4c";
-  return getComputedStyle(document.documentElement).getPropertyValue("--st-done").trim() || "#1f8a4c";
+  return "var(--st-done)";
 }
 
 function depsOf(task: Task, byId: Map<string, Task>): { id: string; source: string; target: string }[] {

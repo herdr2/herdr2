@@ -20,6 +20,12 @@ export function coordinatorHostLabel(run: Pick<Run, "coordinator">, fallbackHost
   return host || "unknown";
 }
 
+/** Compact `agent · model` string for the Coordinator when known. */
+export function coordinatorAgentModelLine(run: Pick<Run, "coordinator">): string | null {
+  const line = agentModel(run.coordinator.agent, run.coordinator.model, "");
+  return line || null;
+}
+
 /** Visual mark for one attempt. A retry stays a retry even when it also failed or succeeded. */
 export type AttemptMark = "ok" | "fail" | "retry" | "run";
 
@@ -328,9 +334,11 @@ export function messageParty(
   const taskLabel = (id?: string) => (id ? (snap.tasks.find((t) => t.id === id)?.title ?? id) : null);
   if (addr === "coordinator") {
     const c = snap.run.coordinator;
+    const am = agentModel(c.agent, c.model, "");
+    const parts = [am, c.host ? `${c.host} · ${shortId(c.hostSession, 10)}` : shortId(c.hostSession, 10)].filter(Boolean);
     return {
       role: "coord",
-      name: c.host ? `${c.host} · ${shortId(c.hostSession, 10)}` : null,
+      name: parts.length > 0 ? parts.join(" · ") : null,
       task: null,
       select: COORD_ID,
       raw: addr,

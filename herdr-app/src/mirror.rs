@@ -62,6 +62,10 @@ struct TabView {
 struct Seen {
     word: Option<String>,
     seen: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    work_ms: Option<u64>,
+    #[serde(default)]
+    total_work_ms: u64,
 }
 
 pub fn qualify(id: &str, machine: Option<&str>) -> String {
@@ -166,7 +170,7 @@ impl View {
             recent: model.recent.clone(),
             spaces: model.spaces.iter().map(|s| (s.id.clone(), s.active.clone())).collect(),
             tabs: model.tabs().map(|t| (t.id.clone(), TabView { focused: t.focused.clone(), before: t.before.clone(), zoomed: t.zoomed.clone(), settled: t.settled })).collect(),
-            attention: model.agents.iter().map(|(a, s)| (a.clone(), Seen { word: s.word.clone(), seen: s.seen })).collect(),
+            attention: model.agents.iter().map(|(a, s)| (a.clone(), Seen { word: s.word.clone(), seen: s.seen, work_ms: s.work_ms, total_work_ms: s.total_work_ms })).collect(),
         }
     }
 
@@ -199,9 +203,14 @@ impl View {
         for (address, seen) in &self.attention {
             if address.split_once('/').map(|(m, _)| m) == machine
                 && let Some(agent) = model.agents.get_mut(address)
-                && agent.word == seen.word
             {
-                agent.seen = seen.seen;
+                if agent.word == seen.word {
+                    agent.seen = seen.seen;
+                }
+                if agent.work_ms.is_none() {
+                    agent.work_ms = seen.work_ms;
+                }
+                agent.total_work_ms = agent.total_work_ms.max(seen.total_work_ms);
             }
         }
     }
@@ -231,7 +240,13 @@ impl View {
         model.active = self.active.clone().filter(|id| model.space(id).is_some()).or_else(|| model.spaces.first().map(|s| s.id.clone()));
         model.recent = self.recent.clone();
         for (a, s) in &self.attention {
-            model.agents.entry(a.clone()).or_insert_with(|| Agent { word: s.word.clone(), seen: s.seen, ..Default::default() });
+            model.agents.entry(a.clone()).or_insert_with(|| Agent {
+                word: s.word.clone(),
+                seen: s.seen,
+                work_ms: s.work_ms,
+                total_work_ms: s.total_work_ms,
+                ..Default::default()
+            });
         }
     }
 }

@@ -26,6 +26,8 @@ pub enum PoolSignal {
         usage: Option<AcpContextUsage>,
     },
     AgentExited { worker_id: String, agent_id: u32, reason: String },
+    SessionClosed { address: String },
+    WorkerTrashed { worker_id: String },
 }
 
 /// Runs in background processing transcript, turn-completion, and external kill signals from `Core`.
@@ -38,16 +40,24 @@ pub async fn run_signal_loop(core: Arc<Core>, mut rx: mpsc::UnboundedReceiver<Po
 async fn handle_signal(core: &Arc<Core>, sig: PoolSignal) {
     match sig {
         PoolSignal::Transcript { worker_id, entry } => {
-            let attempt_id = core
-                .drove
-                .store
-                .get_worker(&worker_id)
-                .and_then(|w| w.current_attempt_id);
-            record_transcript_item(core, &worker_id, attempt_id, entry);
+            let is_tool_done = matches!(
+                &entry,
+                Entry::ToolCall { status, .. } if status == "completed" || status == "failed"
+            );
+            let worker_snap = core.drove.store.get_worker(&worker_id);
+            let attempt_id = worker_snap
+                .as_ref()
+                .and_then(|w| w.current_attempt_id.clone());
+            record_transcript_item(core, &worker_id, attempt_id.clone(), entry);
             let _ = core
                 .drove
                 .store
                 .update_worker(&worker_id, |w| w.last_active_at = now_iso());
+            if is_tool_done
+                && let (Some(w), Some(aid)) = (worker_snap, attempt_id)
+            {
+                maybe_detect_spinning_loop(core, &w, &aid).await;
+            }
         }
         PoolSignal::TurnFinished { worker_id, agent_id, error, usage } => {
             if let Some(u) = usage {
@@ -65,6 +75,9 @@ async fn handle_signal(core: &Arc<Core>, sig: PoolSignal) {
             let Some(attempt) = core.drove.store.get_attempt(&attempt_id) else {
                 return;
             };
+            if attempt.kind.as_deref() == Some("review") {
+                return;
+            }
             if attempt.outcome.is_some() || attempt.ended_at.is_some() {
                 return;
             }
@@ -82,6 +95,31 @@ async fn handle_signal(core: &Arc<Core>, sig: PoolSignal) {
                     true,
                 )
                 .await;
+                return;
+            }
+            let recent_assistant = core
+                .drove
+                .store
+                .list_items(&worker_id, Some(&attempt_id), None, 10)
+                .into_iter()
+                .filter(|it| it.kind == "assistant")
+                .filter_map(|it| it.text)
+                .collect::<Vec<_>>()
+                .join("");
+            if let Some(prov_err) = super::review::looks_like_provider_error(&recent_assistant) {
+                finish_unsettled_attempt(
+                    core,
+                    &worker,
+                    &attempt,
+                    FailureKind::AgentError,
+                    prov_err,
+                    false,
+                )
+                .await;
+                let _ = stop_worker(core, &worker_id).await;
+                let _ = core.drove.store.update_worker(&worker_id, |w| {
+                    w.state = WorkerState::Dead;
+                });
                 return;
             }
             if !core.drove.mark_attempt_reminded(&attempt_id) {
@@ -108,36 +146,97 @@ async fn handle_signal(core: &Arc<Core>, sig: PoolSignal) {
             let Some(worker) = core.drove.store.get_worker(&worker_id) else {
                 return;
             };
-            let was_closed = worker.state == WorkerState::Closed;
+            let coord_closed = core
+                .drove
+                .store
+                .get_run(&worker.run_id)
+                .is_some_and(|r| is_coordinator_closed(core, &r));
+            let was_closed = worker.state == WorkerState::Closed || coord_closed;
             let open_att = worker
                 .current_attempt_id
                 .as_deref()
                 .and_then(|aid| core.drove.store.get_attempt(aid))
                 .filter(|a| a.outcome.is_none() && a.ended_at.is_none());
             let _ = core.drove.store.update_worker(&worker_id, |w| {
-                if !was_closed {
-                    w.state = WorkerState::Dead;
-                }
+                w.state = if was_closed { WorkerState::Closed } else { WorkerState::Dead };
                 w.current_attempt_id = None;
+                w.worktree = None;
                 w.pid = None;
                 w.last_active_at = now_iso();
             });
-            if let Some(att) = open_att {
-                let kind = if was_closed {
-                    FailureKind::Cancelled
-                } else {
-                    FailureKind::ProcessExited
-                };
-                finish_unsettled_attempt(
-                    core,
-                    &worker,
-                    &att,
-                    kind,
-                    format!("Worker ACP process ended ({reason})"),
-                    false,
-                )
-                .await;
+            if let Some(wt) = worker.worktree.as_deref().map(str::trim).filter(|s| !s.is_empty())
+                && let Some(run) = core.drove.store.get_run(&worker.run_id)
+            {
+                super::integrate::cleanup_worktree_dir(&run.cwd, std::path::Path::new(wt));
             }
+            core.drove.remove_worker_token(&worker_id);
+            if let Some(att) = open_att
+                && att.kind.as_deref() != Some("review")
+            {
+                if coord_closed {
+                    let ended = now_iso();
+                    let _ = core.drove.store.update_attempt(&att.id, |a| {
+                        a.outcome = Some(Outcome::Failed);
+                        a.ended_at = Some(ended);
+                        a.failure = Some(AttemptFailure {
+                            kind: FailureKind::Cancelled,
+                            message: format!("Coordinator closed ({reason})"),
+                        });
+                    });
+                    let _ = core.drove.store.update_task(&att.task_id, |t| {
+                        if t.status == TaskStatus::Running {
+                            t.status = TaskStatus::Cancelled;
+                        }
+                    });
+                } else {
+                    let kind = if was_closed {
+                        FailureKind::Cancelled
+                    } else {
+                        FailureKind::ProcessExited
+                    };
+                    finish_unsettled_attempt(
+                        core,
+                        &worker,
+                        &att,
+                        kind,
+                        format!("Worker ACP process ended ({reason})"),
+                        false,
+                    )
+                    .await;
+                }
+            }
+            if coord_closed {
+                if let Some(run) = core.drove.store.get_run(&worker.run_id) {
+                    close_run_for_coordinator(core, &run).await;
+                }
+            } else {
+                core.drove.wake_scheduler();
+            }
+        }
+        PoolSignal::SessionClosed { address } => {
+            let runs = core.drove.store.list_runs();
+            for run in runs {
+                let sess = run.coordinator.host_session.trim();
+                let matches_addr = if address.contains('/') {
+                    sess == address
+                } else {
+                    local_session_part(core, sess) == Some(address.as_str())
+                };
+                let has_open_workers = core
+                    .drove
+                    .store
+                    .list_workers(Some(&run.id))
+                    .iter()
+                    .any(|w| !matches!(w.state, WorkerState::Closed | WorkerState::Dead));
+                if (matches_addr || is_coordinator_closed(core, &run))
+                    && (run.status == RunStatus::Active || has_open_workers)
+                {
+                    close_run_for_coordinator(core, &run).await;
+                }
+            }
+        }
+        PoolSignal::WorkerTrashed { worker_id } => {
+            let _ = stop_worker(core, &worker_id).await;
             core.drove.wake_scheduler();
         }
     }
@@ -159,15 +258,40 @@ async fn finish_unsettled_attempt(
             a.failure = Some(AttemptFailure { kind, message: message.clone() });
         }
     });
+    fail_or_retry_task(core, &attempt.run_id, &attempt.task_id, &attempt.id, kind, &message, MAX_AUTO_RETRIES).await;
     if keep_worker_idle {
+        if let Some(wt) = worker.worktree.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            let run_opt = core.drove.store.get_run(&attempt.run_id);
+            let is_aosp = run_opt
+                .as_ref()
+                .is_some_and(|r| super::integrate::is_aosp_harness(&r.cwd));
+            if is_aosp {
+                if let Some(ref r) = run_opt {
+                    super::integrate::cleanup_worktree_dir(&r.cwd, std::path::Path::new(wt));
+                }
+                let run_cwd = run_opt.map(|r| r.cwd).unwrap_or_else(|| worker.cwd.clone());
+                let _ = core.drove.store.update_worker(&worker.id, |w| {
+                    w.worktree = None;
+                    w.cwd = run_cwd;
+                });
+            } else {
+                let wt_str = wt.to_string();
+                let _ = tokio::task::spawn_blocking(move || super::integrate::reset_worktree_clean(&wt_str)).await;
+            }
+        }
         mark_worker_idle(core, &worker.id);
     } else {
+        if let Some(wt) = worker.worktree.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            && let Some(run) = core.drove.store.get_run(&attempt.run_id)
+        {
+            super::integrate::cleanup_worktree_dir(&run.cwd, std::path::Path::new(wt));
+        }
         let _ = core.drove.store.update_worker(&worker.id, |w| {
             w.current_attempt_id = None;
+            w.worktree = None;
             w.last_active_at = now_iso();
         });
     }
-    fail_or_retry_task(core, &attempt.run_id, &attempt.task_id, &attempt.id, kind, &message, MAX_AUTO_RETRIES).await;
     core.drove.wake_scheduler();
 }
 
@@ -177,29 +301,61 @@ pub async fn dispatch_agent_task(
     run: &Run,
     task: &Task,
     decision: RouteDecision,
-    effective_cwd: String,
-    worktree: Option<String>,
+    mut effective_cwd: String,
+    mut worktree: Option<String>,
     retry_of: Option<String>,
     hint: Option<String>,
 ) -> Result<Attempt, String> {
     let dep_tasks = resolved_dep_tasks(&core.drove.store.list_tasks(&run.id), task);
-    let baseline = super::roles::capture_dirty_baseline(&effective_cwd);
     let attempt_id = super::crypto::rand_id("att");
 
-    if let Some(mut warm) = decision.warm_worker.clone() {
-        let aid = warm
-            .h2_agent
-            .as_deref()
-            .and_then(crate::agents::parse_id)
-            .ok_or_else(|| "warm worker missing h2 agent id".to_string())?;
-        // Switch model/effort dynamically if needed.
+    let live_warm = if let Some(warm) = decision.warm_worker.clone() {
+        if let Some(aid) = live_untrashed_agent_id(core, warm.h2_agent.as_deref()) {
+            Some((warm, aid))
+        } else {
+            let _ = core.drove.store.update_worker(&warm.id, |w| {
+                if !matches!(w.state, WorkerState::Closed | WorkerState::Dead) {
+                    w.state = WorkerState::Dead;
+                }
+                w.current_attempt_id = None;
+                w.worktree = None;
+            });
+            if let Some(wt) = warm.worktree.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                super::integrate::cleanup_worktree_dir(&run.cwd, std::path::Path::new(wt));
+            }
+            if worktree.is_some() || task.isolation == Isolation::Worktree {
+                let (next_cwd, next_wt) = super::worktree_for_task(core, run, task, None).await?;
+                effective_cwd = next_cwd;
+                worktree = next_wt;
+            }
+            None
+        }
+    } else {
+        None
+    };
+
+    let baseline = super::roles::capture_dirty_baseline(&effective_cwd);
+
+    if let Some((mut warm, aid)) = live_warm {
+        // Switch model/context/effort/fast dynamically if needed.
         if decision.model.as_deref() != warm.model.as_deref()
             && let Some(m) = &decision.model
         {
             apply_warm_config(core, aid, "model", json!(m)).await;
         }
-        if Some(decision.effort) != warm.effort {
+        let is_agy = matches!(decision.agent.as_str(), "agy" | "antigravity");
+        let is_cursor = matches!(decision.agent.as_str(), "cursor" | "cursor-agent");
+        let cursor_has_effort = is_cursor && decision.model.as_deref().is_some_and(acp::model_has_embedded_effort);
+        if is_cursor && decision.context != warm.context_window
+            && let Some(ctx) = decision.context.as_deref().map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
+        {
+            apply_warm_config(core, aid, "context", json!(ctx)).await;
+        }
+        if !is_agy && !cursor_has_effort && Some(decision.effort) != warm.effort {
             apply_warm_config(core, aid, "reasoning_effort", json!(decision.effort.as_str())).await;
+        }
+        if (decision.fast || warm.fast == Some(true)) && Some(decision.fast) != warm.fast {
+            apply_warm_config(core, aid, "fast-mode", json!(decision.fast)).await;
         }
 
         let display = format!("{} · {}", decision.role, task.key);
@@ -211,10 +367,14 @@ pub async fn dispatch_agent_task(
 
         let now = now_iso();
         warm.state = WorkerState::Busy;
+        warm.cwd = effective_cwd.clone();
+        warm.worktree = worktree;
         warm.current_attempt_id = Some(attempt_id.clone());
         warm.last_active_at = now.clone();
         warm.model = decision.model.clone().or(warm.model);
+        warm.context_window = decision.context.clone().or(warm.context_window);
         warm.effort = Some(decision.effort);
+        warm.fast = (decision.fast || decision.agent == "codex").then_some(decision.fast);
         warm.totals.attempts += 1;
         update_fingerprint(&mut warm.fingerprint, task);
         core.drove.store.update_worker(&warm.id, |w| *w = warm.clone());
@@ -239,6 +399,7 @@ pub async fn dispatch_agent_task(
                 agent: Some(decision.agent.clone()),
                 model: decision.model.clone(),
                 effort: Some(decision.effort),
+                fast: decision.fast.then_some(true),
                 worker: Some(warm.id.clone()),
                 reason: Some(decision.reason.clone()),
                 source: preserved_source.clone(),
@@ -284,8 +445,10 @@ pub async fn dispatch_agent_task(
     labels.insert("drove.display".into(), display.clone());
 
     let mut extra_env = BTreeMap::new();
+    inject_drove_path_env(&mut extra_env);
     extra_env.insert("H2_DROVE_URL".into(), drove_url);
-    extra_env.insert("H2_DROVE_WORKER_TOKEN".into(), worker_token);
+    extra_env.insert("H2_DROVE_WORKER_TOKEN".into(), worker_token.clone());
+    extra_env.insert("H2_DROVE_WORKER_TICKET".into(), worker_token);
     extra_env.insert("H2_DROVE_WORKER_ID".into(), worker_id.clone());
     extra_env.insert("H2_DROVE_RUN_ID".into(), run.id.clone());
     extra_env.insert("H2_DROVE_ATTEMPT_ID".into(), attempt_id.clone());
@@ -299,7 +462,9 @@ pub async fn dispatch_agent_task(
         run_id: run.id.clone(),
         agent: decision.agent.clone(),
         model: decision.model.clone(),
+        context_window: decision.context.clone(),
         effort: Some(decision.effort),
+        fast: (decision.fast || decision.agent == "codex").then_some(decision.fast),
         session_key: format!("{}:{worker_id}", run.id),
         h2_agent: None,
         cwd: effective_cwd.clone(),
@@ -339,6 +504,7 @@ pub async fn dispatch_agent_task(
             agent: Some(decision.agent.clone()),
             model: decision.model.clone(),
             effort: Some(decision.effort),
+            fast: decision.fast.then_some(true),
             worker: Some(worker_id.clone()),
             reason: Some(decision.reason.clone()),
             source: preserved_source.clone(),
@@ -358,7 +524,9 @@ pub async fn dispatch_agent_task(
             labels,
             env: extra_env,
             model: decision.model.clone(),
+            context: decision.context.clone(),
             effort: Some(decision.effort.as_str().to_string()),
+            fast: Some(decision.fast),
             access,
             isolate_secrets: true,
         },
@@ -465,14 +633,22 @@ pub async fn stop_worker(core: &Arc<Core>, worker_id: &str) -> Option<Worker> {
     let updated = core.drove.store.update_worker(worker_id, |w| {
         w.state = WorkerState::Closed;
         w.current_attempt_id = None;
+        w.worktree = None;
         w.last_active_at = now_iso();
     });
+
+    if let Some(wt) = worker.worktree.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        && let Some(run) = core.drove.store.get_run(&worker.run_id)
+    {
+        super::integrate::cleanup_worktree_dir(&run.cwd, std::path::Path::new(wt));
+    }
 
     if let Some(addr) = worker.h2_agent.as_deref()
         && let Some(aid) = crate::agents::parse_id(addr)
     {
         core.kill(&[aid]).await;
     }
+    core.drove.remove_worker_token(worker_id);
 
     if let Some(att) = open_att {
         let ended = now_iso();
@@ -490,13 +666,272 @@ pub async fn stop_worker(core: &Arc<Core>, worker_id: &str) -> Option<Worker> {
     updated
 }
 
-/// Stops all non-closed workers belonging to `run_id`.
+/// Stops all workers belonging to `run_id` and reaps any live `h2_agent` left on closed/dead workers.
 pub async fn stop_run_workers(core: &Arc<Core>, run_id: &str) {
     let workers = core.drove.store.list_workers(Some(run_id));
     for w in workers {
         if w.state != WorkerState::Closed && w.state != WorkerState::Dead {
             let _ = stop_worker(core, &w.id).await;
+        } else if let Some(addr) = w.h2_agent.as_deref()
+            && let Some(aid) = crate::agents::parse_id(addr)
+            && core.lock().reg.agents.get(&aid).is_some_and(|a| a.is_live())
+        {
+            core.kill(&[aid]).await;
         }
+    }
+}
+
+/// Reaps stale workers and lingering `h2_agent` sessions left behind across a daemon restart/hot-update.
+pub async fn reconcile_startup_workers(core: &Arc<Core>) {
+    let workers = core.drove.store.list_workers(None);
+    for w in workers {
+        let has_tok = core.drove.has_worker_token(&w.id);
+        let agent_live = w
+            .h2_agent
+            .as_deref()
+            .and_then(crate::agents::parse_id)
+            .is_some_and(|aid| core.lock().reg.agents.get(&aid).is_some_and(|a| a.is_live()));
+        if !has_tok || !agent_live || matches!(w.state, WorkerState::Closed | WorkerState::Dead) {
+            if agent_live
+                && let Some(addr) = w.h2_agent.as_deref()
+                && let Some(aid) = crate::agents::parse_id(addr)
+            {
+                core.kill(&[aid]).await;
+            }
+            let run = core.drove.store.get_run(&w.run_id);
+            if let Some(wt) = w.worktree.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                if let Some(ref r) = run {
+                    super::integrate::cleanup_worktree_dir(&r.cwd, std::path::Path::new(wt));
+                } else {
+                    let _ = std::fs::remove_dir_all(wt);
+                }
+            }
+            if !matches!(w.state, WorkerState::Closed | WorkerState::Dead)
+                || w.worktree.is_some()
+                || w.current_attempt_id.is_some()
+                || w.pid.is_some()
+            {
+                let _ = core.drove.store.update_worker(&w.id, |upd| {
+                    if upd.state != WorkerState::Dead {
+                        upd.state = WorkerState::Closed;
+                    }
+                    upd.current_attempt_id = None;
+                    upd.worktree = None;
+                    upd.pid = None;
+                });
+            }
+            core.drove.remove_worker_token(&w.id);
+        }
+    }
+    for att in core.drove.store.list_attempts(None, None, None) {
+        if att.outcome.is_none() && att.ended_at.is_none() && !core.drove.has_worker_token(&att.worker_id) {
+            let _ = core.drove.store.update_attempt(&att.id, |a| {
+                a.outcome = Some(Outcome::Failed);
+                a.ended_at = Some(now_iso());
+                a.failure = Some(AttemptFailure {
+                    kind: FailureKind::ProcessExited,
+                    message: "Daemon restarted before attempt finished".into(),
+                });
+            });
+        }
+    }
+}
+
+pub(crate) fn pid_is_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        #[cfg(target_os = "linux")]
+        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            && let Some((_, rest)) = stat.rsplit_once(") ")
+            && rest.trim_start().starts_with('Z')
+        {
+            return false;
+        }
+        let rc = unsafe { libc::kill(pid as i32, 0) };
+        rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::{
+            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        unsafe {
+            let raw = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if raw.is_null() {
+                return false;
+            }
+            let _process = OwnedHandle::from_raw_handle(raw);
+            let mut started: FILETIME = std::mem::zeroed();
+            let mut exited: FILETIME = std::mem::zeroed();
+            let mut kernel: FILETIME = std::mem::zeroed();
+            let mut user: FILETIME = std::mem::zeroed();
+            if GetProcessTimes(raw, &mut started, &mut exited, &mut kernel, &mut user) == 0 {
+                return false;
+            }
+            exited.dwLowDateTime == 0 && exited.dwHighDateTime == 0
+        }
+    }
+}
+
+pub(super) fn live_untrashed_agent_id(core: &Core, addr: Option<&str>) -> Option<u32> {
+    let aid = addr.and_then(crate::agents::parse_id)?;
+    let st = core.lock();
+    st.reg
+        .agents
+        .get(&aid)
+        .is_some_and(|a| a.is_live() && a.labels.get("herdr.trashed").is_none_or(String::is_empty))
+        .then_some(aid)
+}
+
+pub(super) fn local_session_part<'a>(core: &Core, sess: &'a str) -> Option<&'a str> {
+    match sess.split_once('/') {
+        Some((prefix, rest)) => (prefix == core.info.id || prefix == core.info.name).then_some(rest),
+        None => Some(sess),
+    }
+}
+
+/// Returns `true` when the Run's Coordinator session (`a*`, `t*`, shell foreground, or `hostPid`) has closed or been trashed.
+pub fn is_coordinator_closed(core: &Core, run: &Run) -> bool {
+    let sess = run.coordinator.host_session.trim();
+    if sess.is_empty() || sess == "coordinator" {
+        return run.coordinator.host_pid.is_some_and(|pid| !pid_is_alive(pid));
+    }
+    let Some(local_part) = local_session_part(core, sess) else {
+        return false;
+    };
+    let Some(tk) = TargetKey::parse(local_part) else {
+        return run.coordinator.host_pid.is_some_and(|pid| !pid_is_alive(pid));
+    };
+    match tk {
+        TargetKey::Agent(aid) => {
+            let st = core.lock();
+            match st.reg.agents.get(&aid) {
+                Some(a) => !a.is_live() || a.labels.get("herdr.trashed").is_some_and(|s| !s.is_empty()),
+                None => run.coordinator.session_bound == Some(true),
+            }
+        }
+        TargetKey::Terminal(tid) => {
+            let term_info = {
+                let st = core.lock();
+                st.pty_reg.terminals.get(&tid).map(|t| {
+                    let live = t.is_live();
+                    let trashed = t.labels.get("herdr.trashed").is_some_and(|s| !s.is_empty());
+                    let at_shell_root = t.pid.is_some_and(|tpid| {
+                        run.coordinator.host_pid.is_some_and(|hpid| hpid != tpid)
+                            && t.foreground.as_ref().is_some_and(|fg| {
+                                Some(fg.pid as u32) == t.pid && crate::foreground::is_shell_root(fg)
+                            })
+                    });
+                    (live, trashed, at_shell_root)
+                })
+            };
+            match term_info {
+                Some((live, trashed, at_shell_root)) => {
+                    if !live || trashed {
+                        return true;
+                    }
+                    run.coordinator.agent.is_some()
+                        && at_shell_root
+                        && run.coordinator.host_pid.is_some_and(|hpid| !pid_is_alive(hpid))
+                }
+                None => run.coordinator.session_bound == Some(true),
+            }
+        }
+    }
+}
+
+/// Stops all workers of `run` after its Coordinator exits or is trashed, and transitions an Active Run out of Active.
+pub async fn close_run_for_coordinator(core: &Arc<Core>, run: &Run) {
+    let workers = core.drove.store.list_workers(Some(&run.id));
+    stop_run_workers(core, &run.id).await;
+    for w in workers {
+        core.drove.remove_worker_token(&w.id);
+    }
+    if let Some(cur) = core.drove.store.get_run(&run.id)
+        && cur.status == RunStatus::Active
+    {
+        let tasks = core.drove.store.list_tasks(&run.id);
+        let all_terminal = !tasks.is_empty()
+            && tasks
+                .iter()
+                .filter(|t| t.template != Some(true))
+                .all(|t| super::scheduler::is_terminal_status(t.status));
+        let _ = core.drove.store.update_run(&run.id, |r| {
+            if all_terminal {
+                r.status = RunStatus::Done;
+            } else {
+                r.status = RunStatus::Paused;
+                r.pause_reason = Some("coordinator_closed".into());
+            }
+        });
+    }
+    core.drove.wake_scheduler();
+}
+
+async fn maybe_detect_spinning_loop(core: &Arc<Core>, worker: &Worker, attempt_id: &str) {
+    let cfg = core.drove.config_snapshot();
+    if !cfg.ai.enabled || cfg.ai.loop_detect == "off" {
+        return;
+    }
+    let Some(att) = core.drove.store.get_attempt(attempt_id) else {
+        return;
+    };
+    if att.outcome.is_some() || att.ended_at.is_some() || att.spinning_detected_at.is_some() {
+        return;
+    }
+    let items = core.drove.store.list_items(&worker.id, Some(attempt_id), None, 25);
+    let recent_tools: Vec<(&str, &str)> = items
+        .iter()
+        .filter(|it| it.kind == "tool")
+        .filter_map(|it| it.tool.as_ref())
+        .map(|tl| (tl.kind.as_deref().unwrap_or(""), tl.title.as_deref().unwrap_or("").trim()))
+        .filter(|(_, title)| !title.is_empty())
+        .collect();
+    if recent_tools.len() < 5 {
+        return;
+    }
+    let tail = &recent_tools[recent_tools.len() - 5..];
+    let first = tail[0];
+    if !tail.iter().all(|pair| *pair == first) {
+        return;
+    }
+
+    let ts = now_iso();
+    let _ = core.drove.store.update_attempt(attempt_id, |a| {
+        a.spinning_detected_at = Some(ts.clone());
+    });
+    core.drove.store.append_daemon_event(NewDaemonEvent {
+        run_id: Some(att.run_id.clone()),
+        task_id: Some(att.task_id.clone()),
+        attempt_id: Some(att.id.clone()),
+        worker_id: Some(worker.id.clone()),
+        message_id: None,
+        category: "ai".into(),
+        kind: "loop_detect".into(),
+        status: "warn".into(),
+        title: format!("Potential tool loop on `{}`", worker.id),
+        detail: Some(format!("Repeated tool `{}` 5 times", first.1)),
+        duration_ms: None,
+        tokens: None,
+        cost: None,
+    });
+    if cfg.ai.loop_detect == "steer_once"
+        && let Some(addr) = worker.h2_agent.as_deref()
+        && let Some(aid) = crate::agents::parse_id(addr)
+        && core.lock().reg.agents.get(&aid).is_some_and(|a| a.is_live())
+    {
+        let steer = format!(
+            "[drove loop-detect] You repeated identical tool call `{}` 5 times. \
+             Stop repeating it, verify current workspace state, and take a different concrete step \
+             or call `h2 drove worker ask` / `h2 drove worker done --outcome failed`.",
+            first.1
+        );
+        let _ = core.send(aid, &steer, false, None, Some("drove")).await;
     }
 }
 
@@ -555,23 +990,64 @@ pub async fn send_to_task_worker(
     Ok(json!({ "ok": true, "workerId": worker.id, "agent": worker.h2_agent, "interrupted": interrupt }))
 }
 
-async fn apply_warm_config(core: &Arc<Core>, aid: u32, cfg_id: &str, val: Value) {
-    let (sid, src, tr) = {
+pub(super) async fn apply_warm_config(core: &Arc<Core>, aid: u32, cfg_id: &str, val: Value) {
+    let (sid, effective_id, wire_val_initial, src, tr, opts_snapshot) = {
         let st = core.lock();
         let Some(a) = st.reg.agents.get(&aid) else { return };
         let Some(sid) = a.acp_session_id.clone() else { return };
-        let src = a.config_options.iter().find(|o| o.id == cfg_id).map(|o| o.source.clone());
+        let opts = &a.config_options;
+        let Some((eff_id, resolved_val, resolved_src)) = acp::resolve_config_override(opts, cfg_id, &val) else {
+            return;
+        };
         let Some(tr) = st.sessions.get(&aid).map(|h| h.transport.clone()) else { return };
-        (sid, src, tr)
+        (sid, eff_id, resolved_val, resolved_src, tr, opts.clone())
     };
-    if let Ok(maybe_opts) = acp::apply_config_option(&tr, &sid, cfg_id, &val, src.as_deref()).await {
+    let (wire_val, derived) = if effective_id == "model"
+        && let Some(raw) = wire_val_initial.as_str()
+    {
+        let split = acp::split_model_variant_for_options(raw, &opts_snapshot);
+        let mut items: Vec<(&'static str, Value)> = Vec::new();
+        if let Some(eff) = split.effort {
+            items.push(("reasoning_effort", json!(eff)));
+        }
+        if let Some(fast) = split.fast {
+            items.push(("fast-mode", json!(fast)));
+        }
+        if let Some(ctx) = split.context {
+            items.push(("context", json!(ctx)));
+        }
+        (Value::String(split.model), items)
+    } else {
+        (wire_val_initial, Vec::new())
+    };
+    if let Ok(mut maybe_opts) = acp::apply_config_option(&tr, &sid, &effective_id, &wire_val, src.as_deref()).await {
+        let mut applied_extra: Vec<(String, Value)> = Vec::new();
+        for (cid, cval) in derived {
+            let resolved = {
+                let base_opts = maybe_opts.as_deref().unwrap_or(&opts_snapshot);
+                acp::resolve_config_override(base_opts, cid, &cval)
+            };
+            let Some((sub_id, sub_val, sub_src)) = resolved else { continue };
+            if let Ok(sub_opts) = acp::apply_config_option(&tr, &sid, &sub_id, &sub_val, sub_src.as_deref()).await {
+                if let Some(opts) = sub_opts {
+                    maybe_opts = Some(opts);
+                }
+                applied_extra.push((sub_id, sub_val));
+            }
+        }
         let mut st = core.lock();
         if let Some(a) = st.reg.agents.get_mut(&aid) {
-            a.config_overrides.insert(cfg_id.into(), val.clone());
+            a.config_overrides.insert(effective_id.clone(), wire_val.clone());
+            for (sub_id, sub_val) in &applied_extra {
+                a.config_overrides.insert(sub_id.clone(), sub_val.clone());
+            }
             if let Some(opts) = maybe_opts {
                 a.config_options = opts;
             } else {
-                acp::patch_config_value(&mut a.config_options, cfg_id, &val);
+                acp::patch_config_value(&mut a.config_options, &effective_id, &wire_val);
+                for (sub_id, sub_val) in &applied_extra {
+                    acp::patch_config_value(&mut a.config_options, sub_id, sub_val);
+                }
             }
             acp::sync_config_to_agent(a);
             let data = acp::config_event_data(a);
@@ -599,6 +1075,7 @@ fn build_attempt_record(
         agent: decision.agent.clone(),
         model: decision.model.clone(),
         effort: Some(decision.effort),
+        fast: decision.fast.then_some(true),
         route_reason: decision.reason.clone(),
         reused,
         retry_of,
@@ -627,17 +1104,35 @@ fn build_attempt_record(
 }
 
 fn resolved_dep_tasks(all: &[Task], task: &Task) -> Vec<Task> {
-    all.iter()
-        .filter(|candidate| {
-            task.deps
-                .iter()
-                .any(|d| d == &candidate.id || d == &candidate.key)
-        })
-        .cloned()
-        .collect()
+    let mut out = Vec::new();
+    let mut push_unique = |cand: &Task| {
+        if !out.iter().any(|existing: &Task| existing.id == cand.id) {
+            out.push(cand.clone());
+        }
+    };
+    for dep in &task.deps {
+        if let Some(target) = all.iter().find(|c| &c.id == dep || &c.key == dep) {
+            if target.template == Some(true) {
+                if task.expanded_from.as_deref() == Some(target.id.as_str()) {
+                    for tpl_dep in &target.deps {
+                        if let Some(up) = all.iter().find(|c| &c.id == tpl_dep || &c.key == tpl_dep) {
+                            push_unique(up);
+                        }
+                    }
+                } else {
+                    for child in all.iter().filter(|c| c.expanded_from.as_deref() == Some(target.id.as_str())) {
+                        push_unique(child);
+                    }
+                }
+            } else {
+                push_unique(target);
+            }
+        }
+    }
+    out
 }
 
-fn resolve_local_parent(core: &Core, host_session: &str) -> Option<String> {
+pub(super) fn resolve_local_parent(core: &Core, host_session: &str) -> Option<String> {
     let local = match host_session.rsplit_once('/') {
         Some((_, r)) => r,
         None => host_session,
@@ -818,6 +1313,36 @@ pub async fn handle_task_failure(
             None,
         )
         .await;
+    }
+}
+
+/// Ensures Drove worker/reviewer child processes inherit a complete `PATH` (including `~/.nvm` Node
+/// shims, `~/.local/bin`, and `~/.cargo/bin`) even when `herdr2 hold` was spawned by a desktop GUI.
+pub(super) fn inject_drove_path_env(env: &mut BTreeMap<String, String>) {
+    let mut dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+        .map(|v| std::env::split_paths(&v).collect())
+        .unwrap_or_default();
+    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
+        let mut extras = vec![home.join(".local/bin"), home.join(".cargo/bin")];
+        if let Ok(rd) = std::fs::read_dir(home.join(".nvm/versions/node")) {
+            let mut vers: Vec<std::path::PathBuf> =
+                rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
+            vers.sort();
+            if let Some(latest) = vers.pop() {
+                extras.insert(0, latest.join("bin"));
+            }
+        }
+        for ex in extras.into_iter().rev() {
+            if ex.is_dir() && !dirs.iter().any(|d| d == &ex) {
+                dirs.insert(0, ex);
+            }
+        }
+    }
+    if let Ok(joined) = std::env::join_paths(&dirs)
+        && let Some(s) = joined.to_str()
+        && !s.is_empty()
+    {
+        env.insert("PATH".into(), s.to_string());
     }
 }
 

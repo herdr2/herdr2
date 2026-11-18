@@ -1,0 +1,371 @@
+/* ============================================================
+   Drove — Claude Design System tokens
+   Warm parchment / terracotta light, warm obsidian / espresso
+   dark. Editorial serif (Source Serif 4) + clean sans (Plus
+   Jakarta Sans) + JetBrains Mono for code. Every color is a
+   token on :root; components reference tokens only.
+   ============================================================ */
+
+:root {
+  /* typography */
+  --font-serif: "Source Serif 4", "Songti SC", "Noto Serif SC", Georgia, Cambria, serif;
+  --font-sans: "Plus Jakarta Sans", "Inter", "PingFang SC", "Hiragino Sans GB", "Noto Sans CJK SC",
+    system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+
+  /* radii & motion */
+  --r-xs: 6px;
+  --r-sm: 8px;
+  --r-md: 12px;
+  --r-lg: 16px;
+  --r-xl: 20px;
+  --r-pill: 999px;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* surfaces — warm parchment */
+  --bg: #f5f4ed;
+  --bg-canvas: #f2f0e6;
+  --bg-sidebar: #edeae0;
+  --surface: #faf9f5;
+  --surface-elevated: #ffffff;
+  --surface-2: #efede4;
+  --surface-3: #e5e2d6;
+  --border: #e4e1d6;
+  --border-subtle: #ece9df;
+  --border-strong: #cdc7b8;
+
+  /* text — Anthropic near black */
+  --text: #141413;
+  --text-2: #4d4c47;
+  --text-3: #7c7a71;
+
+  /* accent — Claude terracotta */
+  --accent: #c96442;
+  --accent-hover: #b55434;
+  --accent-bright: #d97757;
+  --accent-ink: #faf9f5;
+  --accent-soft: #f7e8e1;
+
+  /* CTA — ink on parchment */
+  --cta-bg: #141413;
+  --cta-ink: #faf9f5;
+
+  --danger: #b83b2f;
+  --danger-soft: #faeae7;
+  --grid: #dcd8cc;
+  --backdrop: rgba(20, 20, 19, 0.34);
+
+  --shadow-xs: 0 1px 2px rgba(20, 20, 19, 0.04);
+  --shadow: 0 1px 3px rgba(20, 20, 19, 0.05), 0 4px 12px rgba(20, 20, 19, 0.035);
+  --shadow-md: 0 6px 20px rgba(20, 20, 19, 0.07), 0 1px 4px rgba(20, 20, 19, 0.04);
+  --shadow-lg: 0 14px 36px rgba(20, 20, 19, 0.12), 0 2px 8px rgba(20, 20, 19, 0.05);
+
+  /* status palette: stroke + soft background, earthy */
+  --st-pending: #8f8c81;
+  --st-pending-bg: #ecebe2;
+  --st-ready: #4a749e;
+  --st-ready-bg: #e6edf5;
+  --st-running: #c46b27;
+  --st-running-bg: #f7eadd;
+  --st-done: #4a7a53;
+  --st-done-bg: #e5efe4;
+  --st-failed: #b83b2f;
+  --st-failed-bg: #faeae7;
+  --st-review: #984b70;
+  --st-review-bg: #f3e6ed;
+  --st-other: #9c6223;
+  --st-other-bg: #f4ead8;
+  --st-blocked: #71589c;
+  --st-blocked-bg: #ebe7f5;
+  --st-skipped: #8a877d;
+  --st-skipped-bg: #ebeae3;
+
+  /* role palette — distinct from status colors on purpose */
+  --role-coord: #b85938;
+  --role-coord-bg: #f6e5dd;
+  --role-worker: #48688f;
+  --role-worker-bg: #e4ebf2;
+  --role-task: #57554e;
+  --role-task-bg: #eceae1;
+  --role-reviewer: #7e4d88;
+  --role-reviewer-bg: #f1e6f3;
+  --role-reviewer-border: #d3bedb;
+  --role-coder: #3f6a99;
+  --role-coder-bg: #e3edf5;
+  --role-tester: #457754;
+  --role-tester-bg: #e3efe5;
+  --role-writer: #a36227;
+  --role-writer-bg: #f5e9d3;
+  --role-researcher: #3b757f;
+  --role-researcher-bg: #e0eff0;
+  --role-custom: #6a675f;
+  --role-custom-bg: #eceae1;
+
+  --edge-depends: #8a877d;
+  --edge-satisfied: #4a7a53;
+  --edge-dispatch: #b85938;
+  --edge-branch: #a36227;
+  --edge-executes: #48688f;
+
+  color-scheme: light;
+  font-family: var(--font-sans);
+  color: var(--text);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    /* surfaces — warm obsidian */
+    --bg: #1a1917;
+    --bg-canvas: #141413;
+    --bg-sidebar: #141413;
+    --surface: #22211e;
+    --surface-elevated: #2a2824;
+    --surface-2: #2b2925;
+    --surface-3: #36342e;
+    --border: #33312b;
+    --border-subtle: #292723;
+    --border-strong: #47443c;
+
+    /* text — parchment */
+    --text: #f5f4ed;
+    --text-2: #b5b2a7;
+    --text-3: #827f75;
+
+    /* accent — terracotta brightened for dark */
+    --accent: #d97757;
+    --accent-hover: #e4896b;
+    --accent-bright: #e89476;
+    --accent-ink: #141413;
+    --accent-soft: #38231b;
+
+    /* CTA — parchment on obsidian */
+    --cta-bg: #f5f4ed;
+    --cta-ink: #141413;
+
+    --danger: #e26d60;
+    --danger-soft: #391f1c;
+    --grid: #2a2924;
+    --backdrop: rgba(0, 0, 0, 0.52);
+
+    --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.3);
+    --shadow: 0 1px 3px rgba(0, 0, 0, 0.35), 0 4px 12px rgba(0, 0, 0, 0.28);
+    --shadow-md: 0 6px 20px rgba(0, 0, 0, 0.42), 0 1px 4px rgba(0, 0, 0, 0.3);
+    --shadow-lg: 0 14px 36px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.35);
+
+    --st-pending: #918e83;
+    --st-pending-bg: #2a2822;
+    --st-ready: #7ba3cd;
+    --st-ready-bg: #232f3e;
+    --st-running: #d98e4a;
+    --st-running-bg: #342719;
+    --st-done: #7fae83;
+    --st-done-bg: #223227;
+    --st-failed: #e26d60;
+    --st-failed-bg: #391f1c;
+    --st-review: #d383a8;
+    --st-review-bg: #37222c;
+    --st-other: #cf9a54;
+    --st-other-bg: #33281a;
+    --st-blocked: #a68cd0;
+    --st-blocked-bg: #2d2640;
+    --st-skipped: #827f75;
+    --st-skipped-bg: #26241f;
+
+    --role-coord: #d98a66;
+    --role-coord-bg: #37241c;
+    --role-worker: #8aa8c9;
+    --role-worker-bg: #232e3b;
+    --role-task: #a5a296;
+    --role-task-bg: #2b2925;
+    --role-reviewer: #c291cf;
+    --role-reviewer-bg: #322537;
+    --role-reviewer-border: #5d4468;
+    --role-coder: #85aece;
+    --role-coder-bg: #22303d;
+    --role-tester: #8cba93;
+    --role-tester-bg: #243226;
+    --role-writer: #cf9a54;
+    --role-writer-bg: #332818;
+    --role-researcher: #7fb2b8;
+    --role-researcher-bg: #1e3234;
+    --role-custom: #a5a296;
+    --role-custom-bg: #2b2925;
+
+    --edge-depends: #7a7669;
+    --edge-satisfied: #7fae83;
+    --edge-dispatch: #d98a66;
+    --edge-branch: #cf9a54;
+    --edge-executes: #8aa8c9;
+    color-scheme: dark;
+  }
+}
+
+:root[data-theme="dark"] {
+  /* surfaces — warm obsidian */
+  --bg: #1a1917;
+  --bg-canvas: #141413;
+  --bg-sidebar: #141413;
+  --surface: #22211e;
+  --surface-elevated: #2a2824;
+  --surface-2: #2b2925;
+  --surface-3: #36342e;
+  --border: #33312b;
+  --border-subtle: #292723;
+  --border-strong: #47443c;
+
+  /* text — parchment */
+  --text: #f5f4ed;
+  --text-2: #b5b2a7;
+  --text-3: #827f75;
+
+  /* accent — terracotta brightened for dark */
+  --accent: #d97757;
+  --accent-hover: #e4896b;
+  --accent-bright: #e89476;
+  --accent-ink: #141413;
+  --accent-soft: #38231b;
+
+  /* CTA — parchment on obsidian */
+  --cta-bg: #f5f4ed;
+  --cta-ink: #141413;
+
+  --danger: #e26d60;
+  --danger-soft: #391f1c;
+  --grid: #2a2924;
+  --backdrop: rgba(0, 0, 0, 0.52);
+
+  --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --shadow: 0 1px 3px rgba(0, 0, 0, 0.35), 0 4px 12px rgba(0, 0, 0, 0.28);
+  --shadow-md: 0 6px 20px rgba(0, 0, 0, 0.42), 0 1px 4px rgba(0, 0, 0, 0.3);
+  --shadow-lg: 0 14px 36px rgba(0, 0, 0, 0.5), 0 2px 8px rgba(0, 0, 0, 0.35);
+
+  --st-pending: #918e83;
+  --st-pending-bg: #2a2822;
+  --st-ready: #7ba3cd;
+  --st-ready-bg: #232f3e;
+  --st-running: #d98e4a;
+  --st-running-bg: #342719;
+  --st-done: #7fae83;
+  --st-done-bg: #223227;
+  --st-failed: #e26d60;
+  --st-failed-bg: #391f1c;
+  --st-review: #d383a8;
+  --st-review-bg: #37222c;
+  --st-other: #cf9a54;
+  --st-other-bg: #33281a;
+  --st-blocked: #a68cd0;
+  --st-blocked-bg: #2d2640;
+  --st-skipped: #827f75;
+  --st-skipped-bg: #26241f;
+
+  --role-coord: #d98a66;
+  --role-coord-bg: #37241c;
+  --role-worker: #8aa8c9;
+  --role-worker-bg: #232e3b;
+  --role-task: #a5a296;
+  --role-task-bg: #2b2925;
+  --role-reviewer: #c291cf;
+  --role-reviewer-bg: #322537;
+  --role-reviewer-border: #5d4468;
+  --role-coder: #85aece;
+  --role-coder-bg: #22303d;
+  --role-tester: #8cba93;
+  --role-tester-bg: #243226;
+  --role-writer: #cf9a54;
+  --role-writer-bg: #332818;
+  --role-researcher: #7fb2b8;
+  --role-researcher-bg: #1e3234;
+  --role-custom: #a5a296;
+  --role-custom-bg: #2b2925;
+
+  --edge-depends: #7a7669;
+  --edge-satisfied: #7fae83;
+  --edge-dispatch: #d98a66;
+  --edge-branch: #cf9a54;
+  --edge-executes: #8aa8c9;
+  color-scheme: dark;
+}
+
+/* ---------- base reset ---------- */
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* editorial serif for headings; component rules may override size/weight */
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--font-serif);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+button,
+input {
+  font: inherit;
+  color: inherit;
+}
+
+code,
+.mono {
+  font-family: var(--font-mono);
+  font-size: 0.92em;
+}
+
+.dim {
+  color: var(--text-3);
+}
+.warn {
+  color: var(--st-failed);
+}
+.hint {
+  display: block;
+  margin-top: 6px;
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+/* thin warm scrollbars */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-strong) transparent;
+}
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: var(--r-pill);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--text-3);
+}

@@ -147,7 +147,7 @@ const HIDDEN = new Set([
   "terminal.park", "terminal.kill", "terminal.show", "agent.focus", "agent.restore", "agent.purge", "agent.status", "layout.set", "layout.toggle",
   "layout.show", "layout.hide", "layout.resize", "layout.select", "mod.open", "overlay.close",
   "tab.settle", "tab.unsettle",
-  "app.palette", "app.hide", "app.hide_others", "app.show_all", "app.theme", "app.language", "app.settings", "app.whats_new",
+  "app.palette", "app.hide", "app.hide_others", "app.show_all", "app.theme", "app.language", "app.settings",
 ]);
 
 function titleOf(name) {

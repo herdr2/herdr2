@@ -7,10 +7,17 @@ import {
   summarizeActivityGroup,
   summarizeToolTitle,
   normalizeThoughtText,
+  thoughtPreview,
+  parsePlanItems,
+  parseTerminalShellBlocks,
+  buildPtySessionBadges,
   toolIconPath,
   shortenPath,
   normalizeConfigOptions,
   filterConfigChoices,
+  parseToolDetail,
+  extractTurnChangedFiles,
+  resolveEffortVisual,
 } from "../defaults/mods/peek/acp_model.js";
 
 describe("parseUserEnvelope", () => {
@@ -449,5 +456,194 @@ describe("PTY structured formatting & snapshot fallback", () => {
     const finalReply = items[3] as any;
     expect(finalReply.text).toBe("All done.");
     expect(finalReply.isFinalTurnReply).toBe(true);
+  });
+
+  test("extracts thought preview, parsed plans, tool detail, PTY badges, and interactive shell CommandBlocks", () => {
+    expect(thoughtPreview("**Inspecting routes**\n\nMore details")).toBe("Inspecting routes");
+    expect(parsePlanItems(["[x] Done step", "[~] Active step", "[ ] Next step"])).toEqual([
+      { status: "completed", text: "Done step" },
+      { status: "in_progress", text: "Active step" },
+      { status: "pending", text: "Next step" },
+    ]);
+
+    const items = buildConversationItems([
+      { kind: "thought", turn: 1, text: "**Plan verification**\nChecking build output", ts_ms: 1 },
+      {
+        kind: "tool_call",
+        turn: 1,
+        id: "t1",
+        title: "cargo check",
+        tool_kind: "execute",
+        status: "completed",
+        detail: "Finished `dev` profile in 1.2s",
+        ts_ms: 2,
+      },
+      { kind: "plan", turn: 1, items: ["[x] Compile", "[ ] Test"], ts_ms: 3 },
+    ]);
+    const grp = items[0] as any;
+    expect(grp.steps[0].preview).toBe("Plan verification");
+    expect(grp.steps[1]).toMatchObject({
+      detail: "Finished `dev` profile in 1.2s",
+      expandable: true,
+    });
+    expect(grp.latestPlan.parsedItems).toHaveLength(2);
+
+    const shellSnap = buildConversationItems([], "zzh@wsl:~/herdr2$ cargo test\nok: 10 passed\n$ git status\nclean", false, {
+      isPty: true,
+      how: "screen",
+      turn: 1,
+      isAgent: false,
+    });
+    expect(shellSnap[0]).toMatchObject({
+      kind: "terminal_snapshot",
+      shellBlocks: [
+        { type: "command", command: "cargo test", output: "ok: 10 passed" },
+        { type: "command", command: "git status", output: "clean" },
+      ],
+    });
+
+    expect(
+      buildPtySessionBadges(
+        { model: "gpt-5.4", reasoning_effort: "high", mode: "never" },
+        {},
+      ).map((b) => `${b.iconKind}:${b.label}`),
+    ).toEqual(["model:gpt-5.4", "thinking:High", "mode:never"]);
+  });
+
+  test("normalizes Cursor context option pill and strips zero-width fast label", () => {
+    const cursorOpts = normalizeConfigOptions(
+      [
+        {
+          id: "model",
+          name: "Model",
+          category: "model",
+          kind: "select",
+          current_value: "grok-4.7",
+          options: [{ value: "grok-4.7", name: "Grok 4.7" }],
+        },
+        {
+          id: "context",
+          name: "Context",
+          category: "model_config",
+          kind: "select",
+          current_value: "500k",
+          options: [
+            { value: "256k", name: "256K" },
+            { value: "500k", name: "500K" },
+          ],
+        },
+        {
+          id: "reasoning_effort",
+          name: "Effort",
+          category: "thought_level",
+          kind: "select",
+          current_value: "high",
+          options: [{ value: "high", name: "High" }],
+        },
+        {
+          id: "fast",
+          name: "Fast",
+          category: "model_config",
+          kind: "select",
+          current_value: "false",
+          options: [
+            { value: "false", name: "Off" },
+            { value: "true", name: "Fast\u200b\u200b" },
+          ],
+        },
+      ],
+      { agent: "cursor" },
+    );
+
+    expect(cursorOpts.map((o) => `${o.id}:${o.pillLabel}`)).toEqual([
+      "model:Grok 4.7",
+      "context:Ctx 500K",
+      "reasoning_effort:High",
+      "fast:Fast · Off",
+    ]);
+    const fastOpt = cursorOpts.find((o) => o.id === "fast")!;
+    expect(fastOpt.isNonDefault).toBe(false);
+    expect(fastOpt.choices[1].name).toBe("Fast");
+  });
+
+  test("resolves T3 Code effort bars, diff/command tool details, changed files, user fold summary, and TUI frame cleaning", () => {
+    expect(resolveEffortVisual("low")).toEqual({ bars: 4, active: 1 });
+    expect(resolveEffortVisual("medium")).toEqual({ bars: 4, active: 2 });
+    expect(resolveEffortVisual("high")).toEqual({ bars: 4, active: 3 });
+    expect(resolveEffortVisual("max")).toEqual({ bars: 4, active: 4 });
+    expect(resolveEffortVisual("unknown")).toBeNull();
+
+    const badges = buildPtySessionBadges({ model: "gpt-5.4", reasoning_effort: "high" }, {});
+    expect((badges.find((b) => b.id === "reasoning") as any)?.effortVisual).toEqual({ bars: 4, active: 3 });
+
+    const diffDetail = parseToolDetail({
+      tool_kind: "edit",
+      title: "Edit /repo/src/app.rs",
+      detail: "--- /repo/src/app.rs\n+++ /repo/src/app.rs\n@@ -1,2 +1,2 @@\n- let x = 1;\n+ let x = 2;\n+ let y = 3;",
+    });
+    expect(diffDetail.mode).toBe("diff");
+    expect(diffDetail.additions).toBe(2);
+    expect(diffDetail.deletions).toBe(1);
+
+    const cmdDetail = parseToolDetail({
+      tool_kind: "execute",
+      title: "cargo test -p app",
+      detail: "cargo test -p app\n\ntest result: ok. 5 passed",
+    });
+    expect(cmdDetail.mode).toBe("command");
+    expect(cmdDetail.command).toBe("cargo test -p app");
+    expect(cmdDetail.output).toBe("test result: ok. 5 passed");
+
+    const items = buildConversationItems(
+      [
+        {
+          kind: "user",
+          turn: 1,
+          from: "t1",
+          text: '<h2 from="t1"># Review PR\n\nPlease inspect `src/app.rs` carefully.</h2>',
+          ts_ms: 100,
+        },
+        {
+          kind: "tool_call",
+          turn: 1,
+          id: "e1",
+          title: "Edit /repo/src/app.rs",
+          tool_kind: "edit",
+          status: "completed",
+          detail: "--- /repo/src/app.rs\n+++ /repo/src/app.rs\n- old\n+ new\n+ extra",
+          ts_ms: 110,
+        },
+        {
+          kind: "assistant",
+          turn: 1,
+          text: "Updated `src/app.rs`.",
+          ts_ms: 120,
+        },
+      ],
+      "",
+      false,
+      { cwd: "/repo" },
+    );
+
+    const userItem = items[0] as any;
+    expect(userItem.isDelegated).toBe(true);
+    expect(userItem.foldSummary).toBe("Review PR");
+
+    const finalReply = items[2] as any;
+    expect(finalReply.changedFiles).toEqual({
+      files: [{ path: "src/app.rs", additions: 2, deletions: 1 }],
+      totalAdditions: 2,
+      totalDeletions: 1,
+    });
+
+    const tui = [
+      "╭────────────────────────╮",
+      "│ ❯ Write tests          │",
+      "│                        │",
+      "╰────────────────────────╯",
+      "│ standalone bar │",
+    ].join("\n");
+    const cleaned = cleanTerminalSnapshot(tui);
+    expect(cleaned).toBe("❯ Write tests\n│ standalone bar │");
   });
 });

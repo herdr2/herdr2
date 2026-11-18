@@ -321,12 +321,36 @@
             "default": "",
             "type": "string"
           },
+          "total_work_ms": {
+            "description": "Cumulative active execution duration (ms) across all runs of this agent.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "turn": {
             "default": 0,
             "description": "Goes up each time the status leaves `working`.",
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
+          },
+          "work_ms": {
+            "description": "Active execution duration (ms) of the current or most recently completed run.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "working_since": {
+            "description": "Epoch ms when the current active working run began (adjusted for prior paused blocked segments in the same run).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -353,9 +377,35 @@
             "default": "warn",
             "type": "string"
           },
+          "contextWindow": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "effort": {
+            "default": "low",
+            "type": "string"
+          },
           "enabled": {
             "default": true,
             "type": "boolean"
+          },
+          "handoverCompact": {
+            "default": true,
+            "type": "boolean"
+          },
+          "loopDetect": {
+            "default": "off",
+            "type": "string"
+          },
+          "maxTokens": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "model": {
             "default": "",
@@ -548,11 +598,20 @@
             "minimum": 0,
             "type": "integer"
           },
+          "contextWindow": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "cooldownUntil": {
             "type": [
               "string",
               "null"
             ]
+          },
+          "effort": {
+            "type": "string"
           },
           "enabled": {
             "type": "boolean"
@@ -575,6 +634,14 @@
               "null"
             ]
           },
+          "maxTokens": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "model": {
             "type": "string"
           },
@@ -589,6 +656,7 @@
           "keyFilePath",
           "baseUrl",
           "model",
+          "effort",
           "circuitOpen",
           "consecutiveFailures",
           "switches"
@@ -702,10 +770,47 @@
               "null"
             ]
           },
+          "contextWindow": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "effort": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "enabled": {
             "default": null,
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "handoverCompact": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "loopDetect": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "maxTokens": {
+            "default": null,
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
               "null"
             ]
           },
@@ -748,7 +853,10 @@
               "autoTitle": true,
               "baseUrl": "",
               "conflictPolicy": "warn",
+              "effort": "low",
               "enabled": true,
+              "handoverCompact": true,
+              "loopDetect": "off",
               "model": "",
               "questionMode": "draft",
               "taskEnrich": true,
@@ -1011,6 +1119,12 @@
           },
           {
             "properties": {
+              "detail": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "id": {
                 "type": "string"
               },
@@ -1824,6 +1938,15 @@
           "installed": {
             "type": "boolean"
           },
+          "modelContexts": {
+            "additionalProperties": {
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "type": "object"
+          },
           "models": {
             "default": [],
             "items": {
@@ -2046,6 +2169,17 @@
             "description": "\"transcript\", \"last\", or \"history\".",
             "type": "string"
           },
+          "session_meta": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReadSessionMeta"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Model/mode/context usage metadata inferred from CLI agent session logs."
+          },
           "text": {
             "type": "string"
           },
@@ -2061,6 +2195,40 @@
           "complete",
           "how"
         ],
+        "type": "object"
+      },
+      "ReadSessionMeta": {
+        "description": "Session configuration & context-usage metadata inferred from a transcript.",
+        "properties": {
+          "context_usage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AcpContextUsage"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mode": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "reasoning_effort": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "RemoveResult": {
@@ -2138,9 +2306,18 @@
           "agent": {
             "type": "string"
           },
+          "context": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "effort": {
             "$ref": "#/components/schemas/Effort",
             "default": "medium"
+          },
+          "fast": {
+            "type": "boolean"
           },
           "model": {
             "type": [
@@ -2389,6 +2566,12 @@
             "default": "",
             "type": "string"
           },
+          "total_work_ms": {
+            "description": "Cumulative active execution duration (ms) across all runs of this agent.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "turn": {
             "default": 0,
             "description": "Goes up each time the status leaves `working`.",
@@ -2406,6 +2589,24 @@
               }
             ],
             "description": "With `wait`: how the wait ended (status, exit, or timeout: still running)."
+          },
+          "work_ms": {
+            "description": "Active execution duration (ms) of the current or most recently completed run.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "working_since": {
+            "description": "Epoch ms when the current active working run began (adjusted for prior paused blocked segments in the same run).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -2875,12 +3076,36 @@
             "default": "",
             "type": "string"
           },
+          "total_work_ms": {
+            "description": "Cumulative active execution duration (ms) across all runs of this agent.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "turn": {
             "default": 0,
             "description": "Goes up each time the status leaves `working`.",
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
+          },
+          "work_ms": {
+            "description": "Active execution duration (ms) of the current or most recently completed run.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "working_since": {
+            "description": "Epoch ms when the current active working run began (adjusted for prior paused blocked segments in the same run).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -3180,6 +3405,12 @@
             "default": "",
             "type": "string"
           },
+          "total_work_ms": {
+            "description": "Cumulative active execution duration (ms) across all runs of this agent.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "turn": {
             "default": 0,
             "description": "Goes up each time the status leaves `working`.",
@@ -3195,6 +3426,24 @@
               {
                 "type": "null"
               }
+            ]
+          },
+          "work_ms": {
+            "description": "Active execution duration (ms) of the current or most recently completed run.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "working_since": {
+            "description": "Epoch ms when the current active working run began (adjusted for prior paused blocked segments in the same run).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
             ]
           }
         },

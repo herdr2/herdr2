@@ -1,6 +1,7 @@
 // Language detection, curated open-source IDE/Markdown themes, and Markdown helpers for Files.
 
 const MARKDOWN_EXTS = new Set(["md", "markdown", "mdx", "mdown", "mkd"]);
+const IMAGE_EXTS = new Set(["png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "tif", "tiff"]);
 
 const EXACT_FILES = {
   dockerfile: { language: "dockerfile", label: "Dockerfile" },
@@ -95,27 +96,31 @@ export function detectFileKind(path) {
   const base = file.split(/[\\/]/).pop() || "";
   const lowerBase = base.toLowerCase();
   if (lowerBase.startsWith(".env.")) {
-    return { ext: "env", language: "ini", label: "Env", isMarkdown: false };
+    return { ext: "env", language: "ini", label: "Env", isMarkdown: false, isImage: false };
   }
   const exact = EXACT_FILES[lowerBase];
   if (exact) {
-    return { ext: exact.language, ...exact, isMarkdown: false };
+    return { ext: exact.language, ...exact, isMarkdown: false, isImage: false };
   }
   const dot = lowerBase.lastIndexOf(".");
   const ext = dot > 0 ? lowerBase.slice(dot + 1) : "";
   if (MARKDOWN_EXTS.has(ext)) {
     const known = EXT_LANGS[ext] ?? { language: "md", label: "Markdown" };
-    return { ext, ...known, isMarkdown: true };
+    return { ext, ...known, isMarkdown: true, isImage: false };
+  }
+  if (IMAGE_EXTS.has(ext)) {
+    return { ext, language: ext, label: ext.toUpperCase(), isMarkdown: false, isImage: true };
   }
   const mapped = EXT_LANGS[ext];
   if (mapped) {
-    return { ext, ...mapped, isMarkdown: false };
+    return { ext, ...mapped, isMarkdown: false, isImage: false };
   }
   return {
     ext: ext || "txt",
     language: ext || "txt",
     label: ext ? ext.toUpperCase() : "Plain Text",
     isMarkdown: false,
+    isImage: false,
   };
 }
 
@@ -777,6 +782,35 @@ export function resolveRelativeFileLink(currentFile, href) {
   baseParts.pop();
   const segments = [...baseParts];
   for (const part of clean.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === "..") {
+      if (segments.length === 0) return null;
+      segments.pop();
+    } else {
+      segments.push(part);
+    }
+  }
+  return segments.length ? segments.join("/") : null;
+}
+
+export function resolveRelativeAssetPath(currentFile, rawHref) {
+  let target = String(rawHref ?? "").trim();
+  if (target.startsWith("<") && target.endsWith(">")) target = target.slice(1, -1).trim();
+  if (!target || target.startsWith("#") || target.startsWith("//")) return null;
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]{1,}:/.test(target)) return null;
+  const clean = target.split(/[?#]/)[0].trim();
+  if (!clean) return null;
+  let decoded = clean;
+  try { decoded = decodeURIComponent(clean); } catch {}
+  const normalized = decoded.replace(/\\/g, "/");
+  if (normalized.startsWith("/")) {
+    const rel = normalized.replace(/^\/+/, "");
+    return rel || null;
+  }
+  const baseParts = String(currentFile ?? "").split("/").filter(Boolean);
+  baseParts.pop();
+  const segments = [...baseParts];
+  for (const part of normalized.split("/")) {
     if (!part || part === ".") continue;
     if (part === "..") {
       if (segments.length === 0) return null;

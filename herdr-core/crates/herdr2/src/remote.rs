@@ -889,6 +889,9 @@ pub async fn orphaned(core: &Arc<Core>, conn: Option<&Arc<Conn>>, params: &Value
     let Some(address) = params["parent"].as_str().filter(|_| from_peer).and_then(|p| peer_address(core, p)) else {
         return Err(RpcError::new("denied", "only a core that dialed in says its parents finished", ""));
     };
+    let _ = core.drove.pool_tx.send(crate::drove::pool::PoolSignal::SessionClosed {
+        address: address.clone(),
+    });
     let (acp_kids, pty_kids): (Vec<u32>, Vec<u32>) = {
         let mut st = core.lock();
         let acp_kids: Vec<u32> = st

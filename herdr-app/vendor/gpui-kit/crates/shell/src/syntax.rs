@@ -1,7 +1,11 @@
 // HERDR: built-in pure-Rust syntax highlighting for script editors, adapted from Base's showcase.
-use std::{collections::HashMap, ops::Range, sync::LazyLock};
+use std::{
+    collections::HashMap,
+    ops::Range,
+    sync::{Arc, LazyLock, Mutex},
+};
 
-use gpui::{Context, FontStyle, FontWeight, HighlightStyle, SharedString, Window};
+use gpui::{Context, FontStyle, FontWeight, HighlightStyle, SharedString, Task, Window};
 use gpui_base::input::{
     EditorState, FoldRange, HighlightStyleResolver, InputEdit, InputHighlighter, Rope,
 };
@@ -14,17 +18,32 @@ use syntect::{
 /// one set across every highlighter instance.
 static SYNTAX_SET: LazyLock<SyntaxSet> = LazyLock::new(SyntaxSet::load_defaults_newlines);
 
+const SYNC_HIGHLIGHT_BYTES: usize = 16 * 1024;
+const MAX_HIGHLIGHT_BYTES: usize = 256 * 1024;
+const MAX_HIGHLIGHT_LINE_BYTES: usize = 2048;
+
+pub(crate) fn warm_syntax() {
+    let _ = &*SYNTAX_SET;
+}
+
+#[derive(Default)]
+struct HighlightState {
+    revision: u64,
+    highlights: Vec<(Range<usize>, &'static str)>,
+    fold_ranges: Vec<FoldRange>,
+}
+
 /// A small, WASM-compatible example adapter for Base's parser-independent
 /// highlighting API. Syntect identifies scopes; the application-owned resolver
 /// supplies all colors and font styles.
 pub(crate) struct SyntectHighlighter {
     language: SharedString,
-    /// Non-overlapping highlights, ordered by start offset.
-    highlights: Vec<(Range<usize>, &'static str)>,
-    fold_ranges: Vec<FoldRange>,
+    revision: u64,
+    state: Arc<Mutex<HighlightState>>,
     /// Scope ids are cheap to compare but expensive to stringify, so remember
     /// the semantic name each one maps to.
     semantic_names: HashMap<Scope, Option<&'static str>>,
+    pending_task: Option<Task<()>>,
 }
 
 impl SyntectHighlighter {
@@ -33,10 +52,30 @@ impl SyntectHighlighter {
 
         Some(Self {
             language: language.to_owned().into(),
-            highlights: Vec::new(),
-            fold_ranges: Vec::new(),
+            revision: 0,
+            state: Arc::new(Mutex::new(HighlightState::default())),
             semantic_names: HashMap::new(),
+            pending_task: None,
         })
+    }
+}
+
+fn slice_prefix_at_line_end(text: &str, max_bytes: usize, round_up: bool) -> usize {
+    if max_bytes >= text.len() {
+        return text.len();
+    }
+    let mut boundary = max_bytes;
+    while boundary > 0 && !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    if round_up {
+        if let Some(rel) = text[boundary..].find('\n') {
+            boundary + rel + 1
+        } else {
+            text.len()
+        }
+    } else {
+        text[..boundary].rfind('\n').map_or(boundary, |i| i + 1)
     }
 }
 
@@ -90,6 +129,10 @@ fn collect_highlights(
     let mut highlights = Vec::new();
 
     for line in LinesWithEndings::from(text) {
+        if line.len() > MAX_HIGHLIGHT_LINE_BYTES {
+            offset += line.len();
+            continue;
+        }
         if let Ok(operations) = parser.parse_line(line, &SYNTAX_SET) {
             let mut cursor = 0;
             for (index, operation) in operations {
@@ -148,24 +191,73 @@ impl InputHighlighter for SyntectHighlighter {
 
     fn update(
         &mut self,
-        _edit: Option<InputEdit>,
+        edit: Option<InputEdit>,
         text: &Rope,
         folding: bool,
         _window: &mut Window,
-        _cx: &mut Context<EditorState>,
+        cx: &mut Context<EditorState>,
     ) {
-        // `syntect` has no incremental mode, so the whole document is reparsed.
-        // Read the rope once and reuse that string for folding too.
-        let text = text.to_string();
+        self.revision = self.revision.wrapping_add(1);
+        let rev = self.revision;
+        self.pending_task = None;
+
+        // `syntect` has no incremental mode; highlight the initial viewport synchronously
+        // and offload larger documents so file switching never blocks the UI thread.
+        let full_text = text.to_string();
+        let sync_limit = if edit.is_some() { 32 * 1024 } else { SYNC_HIGHLIGHT_BYTES };
         let syntax = find_syntax(self.language.as_ref())
             .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
-        self.highlights = collect_highlights(syntax, &text, &mut self.semantic_names);
 
-        self.fold_ranges = if folding {
-            brace_fold_ranges(&text)
-        } else {
-            Vec::new()
-        };
+        if full_text.len() <= sync_limit {
+            let highlights = collect_highlights(syntax, &full_text, &mut self.semantic_names);
+            let fold_ranges = if folding {
+                brace_fold_ranges(&full_text)
+            } else {
+                Vec::new()
+            };
+            let mut guard = self.state.lock().unwrap();
+            guard.revision = rev;
+            guard.highlights = highlights;
+            guard.fold_ranges = fold_ranges;
+            return;
+        }
+
+        let head_end = slice_prefix_at_line_end(&full_text, SYNC_HIGHLIGHT_BYTES, true);
+        let head_highlights = collect_highlights(syntax, &full_text[..head_end], &mut self.semantic_names);
+        {
+            let mut guard = self.state.lock().unwrap();
+            guard.revision = rev;
+            guard.highlights = head_highlights;
+            guard.fold_ranges.clear();
+        }
+
+        let state_arc = self.state.clone();
+        let lang = self.language.clone();
+        let bg = cx.background_executor().spawn(async move {
+            let syntax = find_syntax(lang.as_ref())
+                .unwrap_or_else(|| SYNTAX_SET.find_syntax_plain_text());
+            let mut semantic_names = HashMap::new();
+            let cap = slice_prefix_at_line_end(&full_text, MAX_HIGHLIGHT_BYTES, false);
+            let highlights = collect_highlights(syntax, &full_text[..cap], &mut semantic_names);
+            let fold_ranges = if folding {
+                brace_fold_ranges(&full_text[..cap])
+            } else {
+                Vec::new()
+            };
+            (highlights, fold_ranges)
+        });
+        self.pending_task = Some(cx.spawn(async move |editor, cx| {
+            let (highlights, fold_ranges) = bg.await;
+            let _ = editor.update(cx, |_, cx| {
+                let mut guard = state_arc.lock().unwrap();
+                if guard.revision == rev {
+                    guard.highlights = highlights;
+                    guard.fold_ranges = fold_ranges;
+                    drop(guard);
+                    cx.notify();
+                }
+            });
+        }));
     }
 
     fn styles(
@@ -173,15 +265,16 @@ impl InputHighlighter for SyntectHighlighter {
         range: &Range<usize>,
         resolver: &dyn HighlightStyleResolver,
     ) -> Vec<(Range<usize>, HighlightStyle)> {
-        resolve_styles(&self.highlights, range, resolver)
+        let guard = self.state.lock().unwrap();
+        resolve_styles(&guard.highlights, range, resolver)
     }
 
     fn fold_ranges(&self, _: &Rope) -> Vec<FoldRange> {
-        self.fold_ranges.clone()
+        self.state.lock().unwrap().fold_ranges.clone()
     }
 
     fn fold_ranges_for_edit(&self, _: Range<usize>, _: &Rope) -> Vec<FoldRange> {
-        self.fold_ranges.clone()
+        self.state.lock().unwrap().fold_ranges.clone()
     }
 }
 
@@ -420,5 +513,23 @@ mod tests {
         assert!(highlight_code(Some("tsx"), "const n: number = 1;", &styles).len() > 1);
         assert!(highlight_code(None, "plain", &styles).is_empty());
         assert!(highlight_code(Some("unknown-language"), "plain", &styles).is_empty());
+    }
+
+    #[test]
+    fn skips_long_lines_and_slices_on_utf8_boundaries() {
+        let long_line = format!("let x = \"{}\";\nfn after_long() {{}}\n", "a".repeat(MAX_HIGHLIGHT_LINE_BYTES + 128));
+        let mut names = HashMap::new();
+        let syntax = find_syntax("rs").unwrap();
+        let highlights = collect_highlights(syntax, &long_line, &mut names);
+        // Only the second line should be highlighted; the oversized first line is skipped cleanly.
+        assert!(highlights.iter().all(|(r, _)| r.start > MAX_HIGHLIGHT_LINE_BYTES));
+        assert!(!highlights.is_empty());
+
+        let utf8_text = format!("{}中文内容\nnext line\n", "a".repeat(SYNC_HIGHLIGHT_BYTES - 1));
+        let split_up = slice_prefix_at_line_end(&utf8_text, SYNC_HIGHLIGHT_BYTES, true);
+        let split_down = slice_prefix_at_line_end(&utf8_text, SYNC_HIGHLIGHT_BYTES, false);
+        assert!(utf8_text.is_char_boundary(split_up));
+        assert!(utf8_text.is_char_boundary(split_down));
+        assert!(utf8_text[..split_up].ends_with("中文内容\n"));
     }
 }

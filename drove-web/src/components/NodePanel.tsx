@@ -9,6 +9,7 @@ import {
   MARK_LABEL,
   allMessages,
   attemptMark,
+  coordinatorAgentModelLine,
   coordinatorHostLabel,
   isReviewMessage,
   reviewerTasksInOrder,
@@ -757,6 +758,7 @@ function CoordPanel({
       : run.status === "paused"
         ? "blocked"
         : "pending";
+  const coordModel = coordinatorAgentModelLine(run);
 
   return (
     <Shell
@@ -767,6 +769,7 @@ function CoordPanel({
           <StatusBadge token={statusToken} pulse={statusToken === "running"}>
             {t(`run.${run.status}`)}
           </StatusBadge>
+          {coordModel && <span className="micro-badge mono">{coordModel}</span>}
           <span className="micro-badge">{coordinatorHostLabel(run)}</span>
           <span className="micro-badge">{`${t("panel.generation")} ${run.coordinator.generation}`}</span>
         </>
@@ -778,6 +781,8 @@ function CoordPanel({
       <Group title={t("panel.coordOverview")} hint={t("panel.noReply")}>
         <Field label={t("panel.objective")}>{run.objective}</Field>
         <div className="sp-kv-grid">
+          <StatItem label={t("panel.agent")}>{run.coordinator.agent || coordinatorHostLabel(run)}</StatItem>
+          <StatItem label={t("panel.model")}>{run.coordinator.model || "—"}</StatItem>
           <StatItem label={t("panel.host")}>{coordinatorHostLabel(run)}</StatItem>
           <StatItem label={t("panel.concurrency")}>{run.maxConcurrency}</StatItem>
           <StatItem label={t("panel.spent")}>

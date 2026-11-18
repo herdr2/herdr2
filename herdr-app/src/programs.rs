@@ -62,7 +62,7 @@ impl Entry {
 }
 
 /// The agents people pick most, first in menus; the rest follow by name.
-const AGENTS_FIRST: &[&str] = &["claude", "codex", "pi", "opencode", "cursor", "copilot", "amp", "gemini", "grok", "kimi", "qwen", "hermes", "glm", "zcode"];
+const AGENTS_FIRST: &[&str] = &["claude", "codex", "antigravity", "pi", "opencode", "cursor", "copilot", "amp", "gemini", "grok", "kimi", "qwen", "hermes", "glm", "zcode"];
 
 /// Every agent the table can start (entries with `run`), most picked first:
 /// `{ key, name, icon, tint, tile, color, run }`.
@@ -628,5 +628,14 @@ mod tests {
             let file = icon.strip_prefix("icons/").unwrap();
             assert!(DEFAULT_ICONS.iter().any(|(n, _)| *n == file), "{k}: {icon} not shipped");
         }
+    }
+
+    #[test]
+    fn startable_includes_antigravity_among_top_agents() {
+        let items = startable();
+        let keys: Vec<&str> = items.iter().filter_map(|v| v["key"].as_str()).collect();
+        let agy_pos = keys.iter().position(|k| *k == "antigravity").expect("antigravity in startable");
+        let pi_pos = keys.iter().position(|k| *k == "pi").expect("pi in startable");
+        assert!(agy_pos < pi_pos, "antigravity should appear before pi in {keys:?}");
     }
 }

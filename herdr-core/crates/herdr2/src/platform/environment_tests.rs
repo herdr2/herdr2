@@ -134,3 +134,47 @@ async fn xpc_flags_belong_to_neither_a_replacement_core_nor_its_programs() {
     assert_eq!(env.get(OsStr::new("XPC_SERVICE_NAME")).unwrap(), "0");
     assert!(!super::program_env().await.contains_key("XPC_FLAGS"));
 }
+
+#[test]
+fn strips_agy_wrapper_proxy_without_dropping_explicit_manager_proxy() {
+    use std::collections::BTreeMap;
+    let mut leaked = BTreeMap::from([
+        ("PATH".into(), "/usr/bin".into()),
+        ("AGY_LLM_GATEWAY_PROXY_URL".into(), "http://127.0.0.1:7890".into()),
+        ("ANTIGRAVITY_SOURCE_METADATA".into(), "{}".into()),
+        ("HTTP_PROXY".into(), "http://127.0.0.1:7890".into()),
+        ("HTTPS_PROXY".into(), "http://127.0.0.1:7890".into()),
+        ("ALL_PROXY".into(), "http://127.0.0.1:7890".into()),
+        ("http_proxy".into(), "http://127.0.0.1:7890".into()),
+        ("https_proxy".into(), "http://127.0.0.1:7890".into()),
+        ("all_proxy".into(), "http://127.0.0.1:7890".into()),
+        ("NO_PROXY".into(), "localhost,127.0.0.1,::1".into()),
+    ]);
+    super::strip_agy_wrapper_env(&mut leaked, None);
+    assert_eq!(leaked.get("PATH").map(String::as_str), Some("/usr/bin"));
+    for k in [
+        "AGY_LLM_GATEWAY_PROXY_URL",
+        "ANTIGRAVITY_SOURCE_METADATA",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "NO_PROXY",
+    ] {
+        assert!(!leaked.contains_key(k), "expected {k} stripped");
+    }
+
+    // If the user explicitly configured HTTP_PROXY in the systemd manager, keep it.
+    let mut managed = BTreeMap::from([
+        ("AGY_LLM_GATEWAY_PROXY_URL".into(), "http://127.0.0.1:7890".into()),
+        ("HTTP_PROXY".into(), "http://127.0.0.1:7890".into()),
+        ("NO_PROXY".into(), "localhost,127.0.0.1,::1".into()),
+    ]);
+    let mgr = BTreeMap::from([("HTTP_PROXY".into(), "http://127.0.0.1:7890".into())]);
+    super::strip_agy_wrapper_env(&mut managed, Some(&mgr));
+    assert!(!managed.contains_key("AGY_LLM_GATEWAY_PROXY_URL"));
+    assert_eq!(managed.get("HTTP_PROXY").map(String::as_str), Some("http://127.0.0.1:7890"));
+    assert_eq!(managed.get("NO_PROXY").map(String::as_str), Some("localhost,127.0.0.1,::1"));
+}

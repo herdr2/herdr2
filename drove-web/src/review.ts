@@ -4,7 +4,7 @@ import { taskFailure } from "./failure";
 
 /** A reviewer session is not an authoring worker, even when it is stored on the same table. */
 export function isReviewer(worker: { role?: string; readOnlyDir?: string }): boolean {
-  return worker.role === "reviewer" || Boolean(worker.readOnlyDir && worker.role !== "researcher");
+  return Boolean(worker.readOnlyDir && worker.role !== "researcher");
 }
 
 export function authorWorkers<T extends { role?: string; readOnlyDir?: string }>(workers: readonly T[]): T[] {

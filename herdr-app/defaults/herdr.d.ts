@@ -28,9 +28,13 @@ export function checking(): boolean;
 /** Reads UTF-8 text (up to 1 MiB), or null if absent. Runs off the UI thread.
  *  `on`: from that machine (a space's `machine`). */
 export function readTextFile(path: string, options?: { on?: string | null }): Promise<string | null>;
+/** Reads an image (up to 8 MiB) as a `data:<mime>;base64,...` URL, or null if absent. Runs off the UI thread.
+ *  `on`: from that machine (a space's `machine`). */
+export function readImageDataUrl(path: string, options?: { on?: string | null }): Promise<string | null>;
 /** Writes UTF-8 text only if it still matches expected (null creates a new file).
- * Rejects on a stale snapshot; existing files are replaced atomically. */
-export function writeTextFile(path: string, text: string, expected: string | null): Promise<null>;
+ * Rejects on a stale snapshot; existing files are replaced atomically.
+ * `on`: on that machine (a space's `machine`). */
+export function writeTextFile(path: string, text: string, expected: string | null, options?: { on?: string | null }): Promise<null>;
 
 /** The agents people can start from a menu (entries with `run` in programs.json), most picked
  *  first, and whether each is installed: asked of the shell agents start in (on another machine,
@@ -121,6 +125,10 @@ export interface TabInfo {
   changed_at: number | null;
   /** Since when an agent in it has been working, or null. */
   working_since: number | null;
+  /** Active or most recent completed run duration of an agent in it (ms), or null. */
+  work_ms?: number | null;
+  /** Cumulative active execution duration across agents in it (ms). */
+  total_work_ms?: number;
 }
 
 export interface SpaceInfo {
@@ -187,6 +195,14 @@ export interface AgentInfo {
   program: Program;
   /** The terminal's title. */
   title: string;
+  /** True when mounted as a structured ACP session. */
+  acp?: boolean;
+  /** Epoch ms when the current active working run began, or null. */
+  working_since?: number | null;
+  /** Active or most recent completed run duration (ms), or null. */
+  work_ms?: number | null;
+  /** Cumulative active execution duration across runs (ms). */
+  total_work_ms?: number;
   /** Higher = changed more recently. */
   seq: number;
   /** Pinned with `terminal.pin`, on any Herdr client. */
@@ -229,8 +245,16 @@ export interface PaneInfo {
   zoomed: boolean;
   /** The app's top-center grip can rearrange this pane. False when zoomed or alone. */
   movable: boolean;
+  /** True when mounted as a structured ACP session. */
+  acp?: boolean;
   /** True when a non-ACP terminal pane is currently displayed in structured ACP-style (`peek`) view. */
   structured?: boolean;
+  /** Epoch ms when the current active working run began, or null. */
+  working_since?: number | null;
+  /** Active or most recent completed run duration (ms), or null. */
+  work_ms?: number | null;
+  /** Cumulative active execution duration across runs (ms). */
+  total_work_ms?: number;
   /** History scroll for a terminal pane's attached view; null for mod panes / alt-screen. Live. */
   scroll?: PaneScroll | null;
 }
@@ -323,9 +347,10 @@ export function placement(): {
 } | null;
 
 /** Every theme color by name: background (the terminals'), surface, canvas (behind cards),
- *  chrome (sidebars and bars), popover, raised, hover, selected, border, input, foreground,
- *  muted, dim, accent, accent_foreground, solid and solid_foreground (a primary button: ink on
- *  paper, paper on ink), selection, working, blocked, done, idle, unknown, ansi0..ansi15.
+ *  chrome (sidebars and bars), popover, raised, message (user bubble surface), code_bg, glass,
+ *  hover, selected, border, input, foreground, muted, dim, accent, accent_foreground,
+ *  solid and solid_foreground (a primary button: ink on paper, paper on ink), selection,
+ *  working, blocked, done, idle, unknown, ansi0..ansi15.
  *  Light and dark themes name the same colors, so a mod that uses them follows both. */
 export function theme(): Record<string, string>;
 

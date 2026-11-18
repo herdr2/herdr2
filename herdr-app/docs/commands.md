@@ -564,21 +564,6 @@ Show the welcome again.
 
 No arguments.
 
-## `app.whats_new`
-
-Show what this release brought (it opens once by itself after an update).
-
-No arguments.
-
-## `app.feedback`
-
-Draft feedback for the person to review and send (from: person or agent).
-
-| Argument | Required |
-|---|---|
-| `message` | no |
-| `from` | no |
-
 ## `app.palette`
 
 Toggle the command palette: every command by name, with its key; calling again closes it.
@@ -587,23 +572,11 @@ No arguments.
 
 ## `app.settings`
 
-Open the settings (section: look, machines, drove, alerts, updates, privacy).
+Open the settings (section: look, machines, drove, alerts, privacy).
 
 | Argument | Required |
 |---|---|
 | `section` | no |
-
-## `app.check_updates`
-
-Look for a newer Herdr2 and herdr2-core now.
-
-No arguments.
-
-## `app.update_core`
-
-Update herdr2-core to its latest release of this generation; terminals keep running.
-
-No arguments.
 
 ## `app.reset`
 
@@ -642,12 +615,6 @@ No arguments.
 ## `app.zoom_reset`
 
 Back to normal size.
-
-No arguments.
-
-## `app.update`
-
-Restart into the update Herdr2 downloaded (your terminals keep running).
 
 No arguments.
 

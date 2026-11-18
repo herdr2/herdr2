@@ -341,6 +341,47 @@ pub(crate) fn restored_environment(
     env
 }
 
+/// Strips Antigravity (`agy`) wrapper-scoped proxy & tool-call variables when `herdr2` was
+/// launched from inside an `agy` subprocess so `agy`'s private proxy wrapper never leaks into
+/// sibling agents (`cursor-agent`, `claude`, `codex`) or user terminals, while keeping any
+/// proxy explicitly configured in the login/systemd manager environment.
+pub(crate) fn strip_agy_wrapper_env(
+    env: &mut std::collections::BTreeMap<String, String>,
+    manager: Option<&std::collections::BTreeMap<String, String>>,
+) {
+    env.remove("ANTIGRAVITY_SOURCE_METADATA");
+    let Some(raw_proxy) = env.remove("AGY_LLM_GATEWAY_PROXY_URL") else {
+        return;
+    };
+    let agy_proxy = raw_proxy.trim();
+    if agy_proxy.is_empty() {
+        return;
+    }
+    const PROXY_KEYS: &[&str] = &[
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ];
+    for &key in PROXY_KEYS {
+        let in_manager = manager.is_some_and(|m| m.contains_key(key));
+        if !in_manager && env.get(key).is_some_and(|v| v.trim() == agy_proxy) {
+            env.remove(key);
+        }
+    }
+    let any_proxy_left = PROXY_KEYS.iter().any(|k| env.contains_key(*k));
+    if !any_proxy_left {
+        for key in ["NO_PROXY", "no_proxy"] {
+            let in_manager = manager.is_some_and(|m| m.contains_key(key));
+            if !in_manager && env.get(key).is_some_and(|v| v.trim() == "localhost,127.0.0.1,::1") {
+                env.remove(key);
+            }
+        }
+    }
+}
+
 /// The core's environment as programs get it: never an ssh login's marks,
 /// and on Linux the login session as the user manager has it now.
 pub async fn program_env() -> std::collections::BTreeMap<String, String> {
@@ -349,10 +390,17 @@ pub async fn program_env() -> std::collections::BTreeMap<String, String> {
     #[cfg(target_os = "linux")]
     {
         env.retain(|k, _| !systemd::SERVICE.contains(&k.as_str()));
-        if let Ok(Some(manager)) = tokio::task::spawn_blocking(systemd::manager_env).await {
-            systemd::apply_session(&mut env, &manager);
+        let manager = tokio::task::spawn_blocking(systemd::manager_env)
+            .await
+            .ok()
+            .flatten();
+        if let Some(ref mgr) = manager {
+            systemd::apply_session(&mut env, mgr);
         }
+        strip_agy_wrapper_env(&mut env, manager.as_ref());
     }
+    #[cfg(not(target_os = "linux"))]
+    strip_agy_wrapper_env(&mut env, None);
     #[cfg(windows)]
     {
         env = tokio::task::spawn_blocking(move || {

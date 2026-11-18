@@ -317,8 +317,8 @@ pub(super) async fn worker_done_http(
             a.ended_at = Some(ended);
             a.failure = Some(AttemptFailure { kind: FailureKind::WorkerReported, message: reason.clone() });
         });
-        mark_worker_idle(core, &worker.id);
-        let max_r = if body["noRetry"].as_bool() == Some(true) { 0 } else { super::MAX_AUTO_RETRIES };
+        let no_retry = body["noRetry"].as_bool() == Some(true);
+        let max_r = if no_retry { 0 } else { super::MAX_AUTO_RETRIES };
         super::fail_or_retry_task(
             core,
             &run.id,
@@ -329,6 +329,19 @@ pub(super) async fn worker_done_http(
             max_r,
         )
         .await;
+        if let Some(wt) = worker.worktree.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            if super::integrate::is_aosp_harness(&run.cwd) {
+                super::integrate::cleanup_worktree_dir(&run.cwd, std::path::Path::new(wt));
+                let _ = core.drove.store.update_worker(&worker.id, |w| {
+                    w.worktree = None;
+                    w.cwd = run.cwd.clone();
+                });
+            } else {
+                let wt_str = wt.to_string();
+                let _ = tokio::task::spawn_blocking(move || super::integrate::reset_worktree_clean(&wt_str)).await;
+            }
+        }
+        mark_worker_idle(core, &worker.id);
         core.drove.wake_scheduler();
         return Ok(json!({ "ok": true, "attempt": upd_att, "task": core.drove.store.get_task(&task.id) }));
     }
@@ -385,8 +398,15 @@ pub(super) async fn worker_done_http(
     // M3 Gate 2: Adversarial read-only Review loop
     super::review::run_adversarial_review_gate(core, &run, &refreshed_task, &worker, &refreshed_att, work_cwd).await?;
 
-    // M3 Gate 3: Worktree serialized merge-back & cleanup
-    let merged_files = super::integrate::merge_and_cleanup_worktree(core, &run, worker.worktree.as_deref()).await?;
+    // M3 Gate 3: Worktree serialized merge-back & warm retention
+    let keep_wt = worker.worktree.is_some() && !super::integrate::is_aosp_harness(&run.cwd);
+    let merged_files = super::integrate::merge_and_finalize_worktree(
+        core,
+        &run,
+        worker.worktree.as_deref(),
+        keep_wt,
+    )
+    .await?;
     let merged_or_touched = if !merged_files.is_empty() { Some(merged_files) } else { files_modified };
 
     let result = TaskResult {
@@ -409,13 +429,20 @@ pub(super) async fn worker_done_http(
         t.exec_phase = None;
         t.result = Some(result.clone());
     });
-    mark_worker_idle(core, &worker.id);
-    if worker.worktree.is_some() {
+    super::ai::spawn_handover_compact(
+        core.clone(),
+        run.id.clone(),
+        refreshed_task.id.clone(),
+        refreshed_att.id.clone(),
+        summary.clone(),
+    );
+    if !keep_wt && worker.worktree.is_some() {
         let _ = core.drove.store.update_worker(&worker.id, |w| {
             w.worktree = None;
             w.cwd = run.cwd.clone();
         });
     }
+    mark_worker_idle(core, &worker.id);
     core.drove.store.append_daemon_event(NewDaemonEvent {
         run_id: Some(run.id.clone()),
         task_id: Some(refreshed_task.id.clone()),
@@ -433,7 +460,7 @@ pub(super) async fn worker_done_http(
     });
     core.drove.wake_scheduler();
 
-    // If all non-template tasks in this run are now terminal, notify coordinator cleanly.
+    // If all non-template tasks in this run are now terminal, notify coordinator (keeping idle workers warm for reuse).
     let all_tasks = core.drove.store.list_tasks(&run.id);
     if !all_tasks.is_empty()
         && all_tasks
@@ -458,7 +485,12 @@ pub(super) async fn worker_done_http(
     Ok(json!({ "ok": true, "attempt": upd_att, "task": upd_task }))
 }
 
-pub(super) async fn add_tasks_http(core: &Arc<Core>, run_id: &str, body: &Value) -> Result<Value, ApiErr> {
+pub(super) async fn add_tasks_http(
+    core: &Arc<Core>,
+    run_id: &str,
+    coord_header: Option<&str>,
+    body: &Value,
+) -> Result<Value, ApiErr> {
     let run = core
         .drove
         .store
@@ -529,8 +561,95 @@ pub(super) async fn add_tasks_http(core: &Arc<Core>, run_id: &str, body: &Value)
         }
     }
 
+    normalize_run_task_deps(core, &run.id);
+
+    let rebind_sess = if super::pool::is_coordinator_closed(core, &run) {
+        body["hostSession"]
+            .as_str()
+            .or(coord_header)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    } else {
+        None
+    };
+    let rebound_meta = if let Some(ref next_sess) = rebind_sess {
+        let (agent, model, pid, _, _) =
+            super::http::resolve_session_meta_and_entries(core, next_sess, true, false).await;
+        let bound = super::http::is_local_session_bound(core, next_sess);
+        Some((next_sess.clone(), agent, model, pid, bound))
+    } else {
+        None
+    };
+    let reactivate = run.status == RunStatus::Done
+        || (run.status == RunStatus::Paused
+            && matches!(run.pause_reason.as_deref(), Some("cancelled" | "coordinator_closed")));
+    if rebound_meta.is_some() || reactivate {
+        let _ = core.drove.store.update_run(&run.id, |r| {
+            if let Some((ref next_sess, ref agent, ref model, pid, bound)) = rebound_meta {
+                r.coordinator.generation += 1;
+                r.coordinator.host_session = next_sess.clone();
+                r.coordinator.agent = agent.clone();
+                r.coordinator.model = model.clone();
+                r.coordinator.host_pid = pid;
+                r.coordinator.session_bound = bound;
+            }
+            if reactivate {
+                r.status = RunStatus::Active;
+                r.pause_reason = None;
+            }
+        });
+    }
+
+    let created: Vec<Task> = created
+        .into_iter()
+        .filter_map(|t| core.drove.store.get_task(&t.id))
+        .collect();
+    for t in &created {
+        super::ai::spawn_task_enrich(core.clone(), run.id.clone(), t.id.clone());
+    }
+
     core.drove.wake_scheduler();
     Ok(json!({ "tasks": created }))
+}
+
+fn normalize_run_task_deps(core: &Arc<Core>, run_id: &str) {
+    let all_tasks = core.drove.store.list_tasks(run_id);
+    for task in &all_tasks {
+        let mut resolved = Vec::new();
+        for dep in &task.deps {
+            if let Some(target) = all_tasks.iter().find(|c| &c.id == dep || &c.key == dep) {
+                if !resolved.contains(&target.id) {
+                    resolved.push(target.id.clone());
+                }
+            } else {
+                let mut matched_foreach = false;
+                for child in &all_tasks {
+                    if child
+                        .key
+                        .strip_prefix(dep.as_str())
+                        .is_some_and(|rest| rest.starts_with('#'))
+                    {
+                        matched_foreach = true;
+                        if !resolved.contains(&child.id) {
+                            resolved.push(child.id.clone());
+                        }
+                    }
+                }
+                if !matched_foreach && !resolved.contains(dep) {
+                    resolved.push(dep.clone());
+                }
+            }
+        }
+        if resolved != task.deps {
+            let _ = core.drove.store.update_task(&task.id, |t| {
+                t.deps = resolved.clone();
+                if t.status == TaskStatus::Ready && !t.deps.is_empty() && t.template != Some(true) {
+                    t.status = TaskStatus::Pending;
+                }
+            });
+        }
+    }
 }
 
 fn replace_item_placeholder(spec_opt: Option<&mut Value>, val: &str) {
@@ -671,14 +790,24 @@ pub(super) async fn wait_run_http(
             .into_iter()
             .filter(|m| m.seq > since_seq)
             .collect();
-        let has_failure = tasks.iter().any(|t| t.status == TaskStatus::Failed);
+        let all_failed_msg_tasks: std::collections::HashSet<String> = core
+            .drove
+            .store
+            .list_messages(run_id, None, false, None)
+            .into_iter()
+            .filter(|m| m.kind == MessageType::Failed)
+            .filter_map(|m| m.task_id)
+            .collect();
+        let has_unreported_failure = tasks
+            .iter()
+            .any(|t| t.status == TaskStatus::Failed && !all_failed_msg_tasks.contains(&t.id));
         let all_terminal = !tasks.is_empty()
             && tasks
                 .iter()
                 .filter(|t| t.template != Some(true))
                 .all(|t| super::scheduler::is_terminal_status(t.status));
 
-        if !pending.is_empty() || cur_run.status != RunStatus::Active || all_terminal || has_failure {
+        if !pending.is_empty() || cur_run.status != RunStatus::Active || all_terminal || has_unreported_failure {
             let counts = core
                 .drove
                 .store
@@ -733,8 +862,17 @@ pub(super) async fn complete_run_http(core: &Arc<Core>, run_id: &str, body: &Val
     if active_left && !force {
         return Err(ApiErr::new(409, "tasks_incomplete", "run still has non-terminal tasks (pass force=true to complete anyway)"));
     }
+    let failed_left = tasks
+        .iter()
+        .any(|t| t.template != Some(true) && t.status == TaskStatus::Failed);
+    if failed_left && !force {
+        return Err(ApiErr::new(
+            409,
+            "tasks_failed",
+            "run has failed tasks (retry/cancel them or pass force=true / --force to complete anyway)",
+        ));
+    }
 
-    stop_run_workers(core, &run.id).await;
     let verify_log_id = if !force {
         let (log_id, repair_task) = super::verify::run_level_verify_gate(core, &run).await?;
         if let Some(rt) = repair_task {
@@ -816,26 +954,121 @@ pub(super) fn retry_task_http(core: &Arc<Core>, id: &str, body: &Value) -> Resul
     let updated = core.drove.store.update_task(&task.id, |t| {
         t.status = TaskStatus::Ready;
         t.failures = 0;
+        t.exec_phase = None;
+        t.review_state = None;
+        if body["noReview"].as_bool() == Some(true) {
+            t.review = None;
+        } else {
+            let rev_agent = body["reviewAgent"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            let rev_model = body["reviewModel"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            if rev_agent.is_some() || rev_model.is_some() {
+                let rev = t.review.get_or_insert_with(|| ReviewSpec {
+                    agent: None,
+                    model: None,
+                    effort: None,
+                    fast: None,
+                    different_agent: None,
+                    criteria: None,
+                    max_rounds: Some(2),
+                });
+                if let Some(ra) = rev_agent {
+                    rev.agent = Some(ra.to_string());
+                }
+                if let Some(rm) = rev_model {
+                    rev.model = Some(rm.to_string());
+                }
+            }
+        }
         let mut a = t.assign.clone().unwrap_or_default();
-        if let Some(role) = body["role"].as_str() {
+        let req_agent = body["agent"].as_str().map(str::trim).filter(|s| !s.is_empty());
+        let req_model = body["model"].as_str().map(str::trim).filter(|s| !s.is_empty());
+        let req_effort: Option<Effort> = body
+            .get("effort")
+            .filter(|v| !v.is_null())
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let req_role = body["role"].as_str().map(str::trim).filter(|s| !s.is_empty());
+        let has_explicit_target = req_agent.is_some() || req_model.is_some() || req_effort.is_some();
+        if let Some(role) = req_role {
             a.role = Some(role.to_string());
         }
-        if let Some(agent) = body["agent"].as_str() {
+        if !has_explicit_target && (req_role.is_some() || a.source.as_deref() == Some("router")) {
+            a.source = None;
+            a.agent = None;
+            a.model = None;
+            a.effort = None;
+            a.fast = None;
+        }
+        if let Some(agent) = req_agent {
             a.agent = Some(agent.to_string());
         }
-        if let Some(model) = body["model"].as_str() {
+        if let Some(model) = req_model {
             a.model = Some(model.to_string());
         }
-        if let Some(eff) = body.get("effort").and_then(|v| serde_json::from_value(v.clone()).ok()) {
+        if let Some(eff) = req_effort {
             a.effort = Some(eff);
         }
-        if body["fresh"].as_bool() == Some(true) {
+        if has_explicit_target {
+            a.source = Some("user".into());
+        }
+        if body["fresh"].as_bool() == Some(true) || has_explicit_target || req_role.is_some() {
             a.worker = None;
         }
         t.assign = Some(a);
     });
+    reopen_skipped_dependents(core, &task);
+    for m in core.drove.store.list_messages(&task.run_id, Some(true), true, None) {
+        if m.task_id.as_deref() == Some(task.id.as_str()) && m.kind == MessageType::Failed {
+            let _ = core.drove.store.mark_handled(&m.id);
+        }
+    }
     core.drove.wake_scheduler();
     Ok(json!(updated))
+}
+
+fn reopen_skipped_dependents(core: &Arc<Core>, root: &Task) {
+    let tasks = core.drove.store.list_tasks(&root.run_id);
+    let mut reopened: std::collections::HashSet<String> =
+        [root.id.clone(), root.key.clone()].into_iter().collect();
+    if let Some(tpl_id) = &root.expanded_from
+        && let Some(tpl) = tasks.iter().find(|t| &t.id == tpl_id)
+    {
+        reopened.insert(tpl.id.clone());
+        reopened.insert(tpl.key.clone());
+    }
+    loop {
+        let mut changed = false;
+        for t in &tasks {
+            if t.template == Some(true) || t.status != TaskStatus::Skipped {
+                continue;
+            }
+            let depends_on_reopened = t.deps.iter().any(|d| reopened.contains(d))
+                || t.deps.iter().any(|d| {
+                    root.key
+                        .strip_prefix(d.as_str())
+                        .is_some_and(|rest| rest.starts_with('#'))
+                });
+            if depends_on_reopened && !reopened.contains(&t.id) {
+                let _ = core.drove.store.update_task(&t.id, |upd| {
+                    if upd.status == TaskStatus::Skipped {
+                        upd.status = TaskStatus::Pending;
+                        upd.result = None;
+                    }
+                });
+                reopened.insert(t.id.clone());
+                reopened.insert(t.key.clone());
+                if let Some(tpl_id) = &t.expanded_from
+                    && let Some(tpl) = tasks.iter().find(|cand| &cand.id == tpl_id)
+                {
+                    reopened.insert(tpl.id.clone());
+                    reopened.insert(tpl.key.clone());
+                }
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
 }
 
 pub(super) async fn cancel_task_http(core: &Arc<Core>, id: &str) -> Result<Value, ApiErr> {

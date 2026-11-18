@@ -19,6 +19,7 @@ function extractMeta(slice: CoordinatorTranscriptSlice): HostTranscriptMeta {
   return {
     available: slice.available,
     host: slice.host,
+    agent: slice.agent,
     hostSession: slice.hostSession,
     match: slice.match,
     sourceFile: slice.sourceFile,
@@ -41,7 +42,9 @@ export function HostItemRow({ item }: { item: HostTranscriptItem }) {
         contextSummary: t("item.contextSummary"),
       })
     : null;
-  const toolMeta = item.kind === "tool" ? parseHostToolText(item.text) : null;
+  const toolMeta = item.kind === "tool"
+    ? (item.title ? { title: item.title, detail: item.detail ?? null } : parseHostToolText(item.text))
+    : null;
 
   return (
     <li className={`stream__item stream__item--${item.kind}`}>
@@ -282,6 +285,11 @@ export function HostTranscript({
     </div>
   );
 
+  const effectiveAgent = meta?.agent || run.coordinator.agent;
+  const effectiveModels = meta?.models?.length
+    ? meta.models
+    : (run.coordinator.model ? [run.coordinator.model] : []);
+
   if (variant === "workbench") {
     return (
       <div className="wb-card">
@@ -296,13 +304,14 @@ export function HostTranscript({
           </div>
         </div>
 
-        {meta?.available && (
+        {(meta?.available || effectiveAgent || effectiveModels.length > 0) && (
           <div className="wb-chips">
-            <span className="micro-badge">{t("wb.totalItems", { n: meta.total })}</span>
-            {meta.models.map((m) => (
-              <span key={m} className="micro-badge">{m}</span>
+            {meta?.available && <span className="micro-badge">{t("wb.totalItems", { n: meta.total })}</span>}
+            {effectiveAgent && <span className="micro-badge mono">{effectiveAgent}</span>}
+            {effectiveModels.map((m) => (
+              <span key={m} className="micro-badge mono">{m}</span>
             ))}
-            {meta.tokens && (
+            {meta?.tokens && (
               <span className="micro-badge">
                 In {fmtTokens(meta.tokens.input)} · Out {fmtTokens(meta.tokens.output)} · Cache {fmtTokens(meta.tokens.cacheRead)}
               </span>
@@ -331,6 +340,14 @@ export function HostTranscript({
           <StreamDetailToggle showFull={showFull} onChange={setShowFull} hiddenCount={hiddenCount} />
         )}
       </div>
+      {(effectiveAgent || effectiveModels.length > 0) && (
+        <div className="wb-chips" style={{ marginBottom: 6 }}>
+          {effectiveAgent && <span className="micro-badge mono">{effectiveAgent}</span>}
+          {effectiveModels.map((m) => (
+            <span key={m} className="micro-badge mono">{m}</span>
+          ))}
+        </div>
+      )}
       {!meta?.available && err && <p className="hint" style={{ color: "var(--danger)" }}>{err}</p>}
       {loading && items.length === 0 ? (
         <p className="hint">{t("panel.loading")}</p>

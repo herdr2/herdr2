@@ -116,16 +116,8 @@ fn save(record: &Record) {
     if let Err(e) = result { tracing::warn!("update notes state: {e}"); }
 }
 
-/// Called once the live window has connected and synchronized successfully.
-pub fn started(first_install: bool) {
-    let mut launch = LAUNCH.lock().unwrap();
-    if launch.is_some() { return; }
-    let record = std::fs::read(path("update-notes.json")).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
-    let state = Launch::new(record, env!("CARGO_PKG_VERSION"), first_install);
-    save(&state.record);
-    *launch = Some(state);
-    std::thread::spawn(|| fetch_media(&all()));
-}
+/// Upstream release note / media fetching is disabled.
+pub fn started(_first_install: bool) {}
 
 pub fn cache(text: &str) {
     let notes = parse(text);
@@ -220,23 +212,8 @@ impl MediaCache {
     }
 }
 
-pub fn notes(target: Option<&str>) -> Vec<Note> {
-    let mut notes = all();
-    for note in &mut notes {
-        for item in &mut note.items {
-            item.media = item.media.iter().filter_map(|media| {
-                let preview = preview_media(&media.path);
-                let file = media_path(&media.path);
-                let root = crate::mods::app_dir();
-                if preview {
-                    cached_media(&file, &root)
-                } else {
-                    MEDIA.lock().unwrap().get(&file, &root)
-                }
-            }).collect();
-        }
-    }
-    LAUNCH.lock().unwrap().as_ref().map(|l| l.range(&notes, target)).unwrap_or_default()
+pub fn notes(_target: Option<&str>) -> Vec<Note> {
+    Vec::new()
 }
 
 pub fn spotlights() -> Vec<Note> {

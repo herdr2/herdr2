@@ -55,7 +55,6 @@ Usage:
   herdr2                        open the window
   herdr2 ls                     spaces, their tabs and agents, in the open window
   herdr2 do <command> [args]    run a command: --name api --argv '[\"claude\"]', or one JSON object
-  herdr2 feedback <text>        draft feedback for the person to review and send
   herdr2 commands               every command, its arguments, what it does
   herdr2 status                 what the window shows, and any errors
   herdr2 shot [file.png]        save the current window frame (default: herdr-shot.png)
@@ -103,7 +102,7 @@ fn main() {
         gpui_shell::host::main_with_components(gpui_shell::FrozenComponentRegistry::default());
         return;
     }
-    if matches!(args.get(1).map(String::as_str), Some("do" | "status" | "ls" | "commands" | "feedback" | "shot")) {
+    if matches!(args.get(1).map(String::as_str), Some("do" | "status" | "ls" | "commands" | "shot")) {
         std::process::exit(control::client(&args[1..]));
     }
     // Anything else from a shell answers in the shell; only a bare launch opens the window.
@@ -130,9 +129,6 @@ fn main() {
         .init();
 
     update::leave_install_folder();
-    if update::apply_on_startup() {
-        return;
-    }
 
     telemetry::clock();
     // A first start sizes the app to the screen and the system's text size.
@@ -173,10 +169,6 @@ fn main() {
     };
     #[cfg(target_os = "macos")]
     core_bin::install_cli_link();
-    if let Ok(core) = &core {
-        update::after_update(core.clone());
-    }
-    update::start();
     telemetry::start(settings::telemetry_setting(&person));
     bench::start();
     if let Err(e) = mods::write_workspace() {
@@ -186,6 +178,7 @@ fn main() {
     gpui_platform::application()
         // Mods run programs already; the user's own links (dotfiles, Nix) may point out.
         .with_assets(gpui_shell::AppAssets::new(mods::app_dir()).following_links())
+        .with_http_client(gpui_shell::http_client(concat!("herdr2/", env!("CARGO_PKG_VERSION"))))
         .run(move |cx| {
             let fonts = settings::BUNDLED_FONTS.iter().map(|f| std::borrow::Cow::Borrowed(*f)).collect();
             if let Err(e) = cx.text_system().add_fonts(fonts) {
@@ -209,7 +202,6 @@ fn main() {
                 }
                 mods::finish_shared();
                 telemetry::quit();
-                let _ = update::apply();
                 async {}
             })
             .detach();

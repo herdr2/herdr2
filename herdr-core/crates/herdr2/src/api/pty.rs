@@ -195,13 +195,22 @@ pub(super) async fn terminal_keep(core: Ctx<'_>, p: TerminalKeepParams) -> Resul
 
 pub(super) async fn terminal_label(core: Ctx<'_>, p: TerminalLabelParams) -> Result<TerminalPublic, RpcError> {
     let id = resolve_pty(core, &p.terminal)?;
-    {
+    let trashed = {
         let mut st = core.lock();
         let was = st.pty_reg.terminals.get(&id).cloned();
         st.pty_reg.label(id, &labels(&p.labels))?;
         core.save_pty(&st);
         let labels = serde_json::to_value(&st.pty_reg.terminals[&id].labels).unwrap_or_default();
         core.emit_pty_from(&mut st, "labels", id, json!({"labels": labels}), was.as_ref());
+        st.pty_reg.terminals[&id]
+            .labels
+            .get("herdr.trashed")
+            .is_some_and(|s| !s.is_empty())
+    };
+    if trashed {
+        let _ = core.drove.pool_tx.send(crate::drove::pool::PoolSignal::SessionClosed {
+            address: crate::terminals::address(id),
+        });
     }
     let result = record_pty(core, id).map(TerminalPublic);
     core.flush_saved().await?;

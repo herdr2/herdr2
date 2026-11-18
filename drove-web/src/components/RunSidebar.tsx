@@ -550,17 +550,19 @@ export const RunSidebar = memo(function RunSidebar({
                         </span>
                       )}
                       <span className="run-tab__title">{name}</span>
-                      {run.machine && (
-                        <span className="sbadge mono" style={{ fontSize: 10, padding: "1px 6px", marginRight: 4 }} title={`Remote machine: ${run.machine}`}>
-                          {run.machine}
+                      <span className="run-tab__badges">
+                        <span
+                          className="sbadge run-tab__status"
+                          style={{ "--st": `var(--st-${statusToken})`, "--st-bg": `var(--st-${statusToken}-bg)` } as CSSProperties}
+                        >
+                          <span className={`sdot${status === "running" ? " sdot--pulse" : ""}`} aria-hidden="true" />
+                          {t(`run.${status}`)}
                         </span>
-                      )}
-                      <span
-                        className="sbadge run-tab__status"
-                        style={{ "--st": `var(--st-${statusToken})`, "--st-bg": `var(--st-${statusToken}-bg)` } as CSSProperties}
-                      >
-                        <span className={`sdot${status === "running" ? " sdot--pulse" : ""}`} aria-hidden="true" />
-                        {t(`run.${status}`)}
+                        {run.machine && (
+                          <span className="sbadge run-tab__machine mono" title={`Remote machine: ${run.machine}`}>
+                            {run.machine}
+                          </span>
+                        )}
                       </span>
                       <span className="run-tab__meta">
                         <span className="mono">{run.id}</span>
@@ -580,7 +582,11 @@ export const RunSidebar = memo(function RunSidebar({
                         openMenu(run.id, rect.left, rect.bottom + 4);
                       }}
                     >
-                      ⋯
+                      <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+                        <circle cx="3.5" cy="8" r="1.2" />
+                        <circle cx="8" cy="8" r="1.2" />
+                        <circle cx="12.5" cy="8" r="1.2" />
+                      </svg>
                     </button>
                     <button
                       type="button"
@@ -595,7 +601,9 @@ export const RunSidebar = memo(function RunSidebar({
                         void moveToTrash(run.id);
                       }}
                     >
-                      ×
+                      <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
+                        <path d="M4.5 4.5 11.5 11.5 M11.5 4.5 4.5 11.5" />
+                      </svg>
                     </button>
                   </div>
                 );

@@ -832,6 +832,21 @@ fn opt_str(v: Option<&HostValue>, key: &str) -> Option<String> {
     v.and_then(|o| o.get(key)).and_then(HostValue::as_str).map(str::to_owned)
 }
 
+#[cfg_attr(test, allow(dead_code))]
+static LIVE_CORE: std::sync::Mutex<Option<std::sync::Weak<crate::hc::Core>>> = std::sync::Mutex::new(None);
+
+/// Registers the currently connected Core RPC client so remote file and exec calls bypass subprocess startup.
+pub fn set_live_core(core: &std::sync::Arc<crate::hc::Core>) {
+    if let Ok(mut slot) = LIVE_CORE.lock() {
+        *slot = Some(std::sync::Arc::downgrade(core));
+    }
+}
+
+#[cfg(not(test))]
+fn live_core() -> Option<std::sync::Arc<crate::hc::Core>> {
+    LIVE_CORE.lock().ok().and_then(|slot| slot.as_ref()?.upgrade())
+}
+
 const EXEC_LIMIT: Duration = Duration::from_secs(30);
 const EXEC_MAX: Duration = Duration::from_secs(600);
 const EXEC_OUTPUT: u64 = 8 << 20;
@@ -877,6 +892,7 @@ pub(crate) fn run_blocking(command: &str, args: &[String], cwd: Option<String>, 
     let out = drain(Box::new(child.stdout.take().unwrap()));
     let err = drain(Box::new(child.stderr.take().unwrap()));
     let start = std::time::Instant::now();
+    let mut poll = Duration::from_micros(250);
     let status = loop {
         match child.try_wait() {
             Ok(Some(s)) => break s,
@@ -885,7 +901,10 @@ pub(crate) fn run_blocking(command: &str, args: &[String], cwd: Option<String>, 
                 let _ = child.wait();
                 return Err(format!("{command} took longer than {} s and was stopped", limit.as_secs_f64()));
             }
-            Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                std::thread::sleep(poll);
+                poll = (poll * 2).min(Duration::from_millis(10));
+            }
             Err(e) => return Err(e.to_string()),
         }
     };
@@ -899,6 +918,43 @@ pub fn run_remote(machine: &str, command: &str, args: &[String], cwd: Option<Str
 
 fn run_remote_with_limit(machine: &str, command: &str, args: &[String], cwd: Option<String>, limit: Duration) -> Result<(i32, Vec<u8>, Vec<u8>), String> {
     use base64::Engine;
+    #[cfg(not(test))]
+    if let Some(core) = live_core() {
+        let argv: Vec<String> = std::iter::once(command.to_owned()).chain(args.iter().cloned()).collect();
+        let mut params = json!({
+            "argv": argv,
+            "on": machine,
+            "timeout": limit.as_secs_f64(),
+        });
+        if let Some(ref c) = cwd {
+            params["cwd"] = json!(c);
+        }
+        match core.call_timeout("machine.exec", params, limit + Duration::from_secs(5)) {
+            Ok(v) => {
+                if v.get("timed_out").and_then(Value::as_bool) == Some(true) {
+                    return Err(format!("{command} took longer than {} s on {machine} and was stopped", limit.as_secs_f64()));
+                }
+                let bytes = |k: &str| {
+                    base64::engine::general_purpose::STANDARD
+                        .decode(v.get(k).and_then(Value::as_str).unwrap_or_default())
+                        .map_err(|e| e.to_string())
+                };
+                let code = v.get("code").and_then(Value::as_i64).map_or(-1, |c| c as i32);
+                return Ok((code, bytes("stdout")?, bytes("stderr")?));
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if !msg.contains("lost the core") && !msg.contains("no reply from core") {
+                    let clean = e
+                        .downcast_ref::<crate::hc::RpcError>()
+                        .and_then(|r| r.0.get("message").and_then(Value::as_str))
+                        .map(str::to_owned)
+                        .unwrap_or(msg);
+                    return Err(clean);
+                }
+            }
+        }
+    }
     let mut hc_args: Vec<String> = vec!["exec".into(), "--json".into(), "--on".into(), machine.into(), "--timeout".into(), limit.as_secs_f64().to_string()];
     if let Some(c) = cwd {
         hc_args.extend(["--cwd".into(), c]);
@@ -959,6 +1015,265 @@ fn read_remote(machine: &str, path: &str) -> Result<Option<String>, String> {
     Ok(Some(String::from_utf8_lossy(&out).into_owned()))
 }
 
+fn read_remote_bytes(machine: &str, path: &str, limit: u64) -> Result<Option<Vec<u8>>, String> {
+    use base64::Engine as _;
+    match run_remote(machine, "cat", &["--".into(), path.into()], None) {
+        Ok((code, out, _)) => {
+            if code != 0 {
+                return Ok(None);
+            }
+            if out.len() as u64 > limit {
+                return Err(format!("File exceeds {limit} bytes"));
+            }
+            Ok(Some(out))
+        }
+        Err(e) if e.contains("cannot start") => {
+            let escaped = path.replace('\'', "''");
+            let script = format!(
+                "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & {{ param($p) if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {{ exit 3 }}; [Convert]::ToBase64String([IO.File]::ReadAllBytes($p)) }} '{escaped}'"
+            );
+            let (code, out, _) = run_remote(
+                machine,
+                "powershell",
+                &["-NoProfile".into(), "-Command".into(), script],
+                None,
+            )?;
+            if code != 0 {
+                return Ok(None);
+            }
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(String::from_utf8_lossy(&out).trim())
+                .map_err(|err| err.to_string())?;
+            if decoded.len() as u64 > limit {
+                return Err(format!("File exceeds {limit} bytes"));
+            }
+            Ok(Some(decoded))
+        }
+        Err(e) => Err(e),
+    }
+}
+
+fn write_remote_windows(
+    machine: &str,
+    path: &str,
+    chunks: &[&str],
+    nonce: &str,
+    expect_exists: bool,
+) -> Result<(), String> {
+    let ps_quote = |s: &str| s.replace(['\'', '\u{2018}', '\u{2019}', '\u{201a}', '\u{201b}'], "$&$&");
+    let dest = path.replace('/', "\\");
+    let b64_path = format!("{dest}.herdr-b64-{nonce}");
+    let b64_q = ps_quote(&b64_path);
+    let dest_q = ps_quote(&dest);
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        let op = if i == 0 {
+            "[IO.File]::WriteAllText($b, $c, [System.Text.Encoding]::ASCII)"
+        } else {
+            "[IO.File]::AppendAllText($b, $c, [System.Text.Encoding]::ASCII)"
+        };
+        let script = format!("& {{ param($b,$c) {op} }} '{b64_q}' '{chunk}'");
+        let (code, _, err) = run_remote(
+            machine,
+            "powershell",
+            &["-NoProfile".into(), "-Command".into(), script],
+            None,
+        )?;
+        if code != 0 {
+            let cleanup = format!("Remove-Item -LiteralPath '{b64_q}' -Force -ErrorAction SilentlyContinue");
+            let _ = run_remote(machine, "powershell", &["-NoProfile".into(), "-Command".into(), cleanup], None);
+            let msg = String::from_utf8_lossy(&err).trim().to_owned();
+            return Err(if msg.is_empty() { "Failed to stage remote file".into() } else { msg });
+        }
+    }
+
+    let check = if expect_exists {
+        "if (-not (Test-Path -LiteralPath $d)) { throw 'File no longer exists' }"
+    } else {
+        "if (Test-Path -LiteralPath $d) { throw 'File already exists' }"
+    };
+    let finish = format!(
+        "& {{ param($d,$b) try {{ {check}; $raw = if (Test-Path -LiteralPath $b) {{ [IO.File]::ReadAllText($b) }} else {{ '' }}; $bytes = if ($raw.Length -gt 0) {{ [Convert]::FromBase64String($raw) }} else {{ [byte[]]@() }}; [IO.File]::WriteAllBytes($d, $bytes) }} finally {{ Remove-Item -LiteralPath $b -Force -ErrorAction SilentlyContinue }} }} '{dest_q}' '{b64_q}'"
+    );
+    let (code, _, err) = run_remote(
+        machine,
+        "powershell",
+        &["-NoProfile".into(), "-Command".into(), finish],
+        None,
+    )?;
+    if code != 0 {
+        let msg = String::from_utf8_lossy(&err).trim().to_owned();
+        return Err(if msg.is_empty() { "Failed to write remote file".into() } else { msg });
+    }
+    Ok(())
+}
+
+/// Writes UTF-8 text atomically on another machine, preserving optimistic concurrency.
+fn write_remote(machine: &str, path: &str, text: &str, expected: Option<&str>) -> Result<(), String> {
+    use base64::Engine as _;
+    if text.len() as u64 > crate::mod_files::LIMIT {
+        return Err("Text file exceeds 1 MiB".into());
+    }
+    let current = read_remote(machine, path)?;
+    if current.as_deref() != expected {
+        return Err("The file changed while saving. Reload before saving.".into());
+    }
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let chunks: Vec<&str> = if encoded.is_empty() {
+        vec![""]
+    } else {
+        encoded
+            .as_bytes()
+            .chunks(16_384)
+            .map(|c| std::str::from_utf8(c).expect("base64 is ASCII"))
+            .collect()
+    };
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let nonce = format!("{}-{nanos}", std::process::id());
+    let mode = if expected.is_some() { "update" } else { "create" };
+
+    if chunks.len() == 1 {
+        let script = r#"
+set -e
+dest="$1"; nonce="$2"; mode="$3"; data="$4"
+target="$dest"
+if [ "$mode" = "create" ]; then
+  [ ! -e "$dest" ] && [ ! -L "$dest" ] || { echo "File already exists" >&2; exit 2; }
+else
+  if resolved=$(readlink -f -- "$dest" 2>/dev/null) && [ -n "$resolved" ]; then
+    target="$resolved"
+  elif [ ! -e "$dest" ]; then
+    echo "File no longer exists" >&2; exit 2
+  fi
+fi
+dir=$(dirname -- "$target")
+base=$(basename -- "$target")
+tmp="$dir/.herdr-write-$base-$nonce"
+b64="$dir/.herdr-b64-$base-$nonce"
+trap 'rm -f -- "$tmp" "$b64"' EXIT
+if [ -e "$target" ]; then
+  cp -p -- "$target" "$tmp"
+else
+  : > "$tmp"
+fi
+umask 077
+printf '%s' "$data" > "$b64"
+if [ -s "$b64" ]; then
+  (base64 -d "$b64" 2>/dev/null || base64 -D -i "$b64") > "$tmp"
+else
+  : > "$tmp"
+fi
+mv -f -- "$tmp" "$target"
+"#;
+        match run_remote(
+            machine,
+            "sh",
+            &[
+                "-c".into(),
+                script.into(),
+                "write".into(),
+                path.into(),
+                nonce.clone(),
+                mode.into(),
+                chunks[0].into(),
+            ],
+            None,
+        ) {
+            Ok((0, _, _)) => return Ok(()),
+            Ok((_, _, err)) => {
+                let msg = String::from_utf8_lossy(&err).trim().to_owned();
+                return Err(if msg.is_empty() { "Failed to write remote file".into() } else { msg });
+            }
+            Err(e) if e.contains("cannot start") => {
+                return write_remote_windows(machine, path, &chunks, &nonce, expected.is_some());
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    let b64_stage = format!("{path}.herdr-b64-{nonce}");
+    for (i, chunk) in chunks.iter().enumerate() {
+        let stage_script = if i == 0 {
+            "set -e; umask 077; printf '%s' \"$2\" > \"$1\""
+        } else {
+            "set -e; printf '%s' \"$2\" >> \"$1\""
+        };
+        match run_remote(
+            machine,
+            "sh",
+            &["-c".into(), stage_script.into(), "stage".into(), b64_stage.clone(), (*chunk).into()],
+            None,
+        ) {
+            Ok((0, _, _)) => {}
+            Ok((_, _, err)) => {
+                let _ = run_remote(machine, "sh", &["-c".into(), "rm -f -- \"$1\"".into(), "rm".into(), b64_stage], None);
+                let msg = String::from_utf8_lossy(&err).trim().to_owned();
+                return Err(if msg.is_empty() { "Failed to stage remote file".into() } else { msg });
+            }
+            Err(e) if i == 0 && e.contains("cannot start") => {
+                return write_remote_windows(machine, path, &chunks, &nonce, expected.is_some());
+            }
+            Err(e) => {
+                let _ = run_remote(machine, "sh", &["-c".into(), "rm -f -- \"$1\"".into(), "rm".into(), b64_stage], None);
+                return Err(e);
+            }
+        }
+    }
+
+    let commit_script = r#"
+set -e
+dest="$1"; b64="$2"; nonce="$3"; mode="$4"
+target="$dest"
+cleanup() { rm -f -- "$tmp" "$b64"; }
+trap cleanup EXIT
+if [ "$mode" = "create" ]; then
+  [ ! -e "$dest" ] && [ ! -L "$dest" ] || { echo "File already exists" >&2; exit 2; }
+else
+  if resolved=$(readlink -f -- "$dest" 2>/dev/null) && [ -n "$resolved" ]; then
+    target="$resolved"
+  elif [ ! -e "$dest" ]; then
+    echo "File no longer exists" >&2; exit 2
+  fi
+fi
+dir=$(dirname -- "$target")
+base=$(basename -- "$target")
+tmp="$dir/.herdr-write-$base-$nonce"
+if [ -e "$target" ]; then
+  cp -p -- "$target" "$tmp"
+else
+  : > "$tmp"
+fi
+if [ -s "$b64" ]; then
+  (base64 -d "$b64" 2>/dev/null || base64 -D -i "$b64") > "$tmp"
+else
+  : > "$tmp"
+fi
+mv -f -- "$tmp" "$target"
+"#;
+    let (code, _, err) = run_remote(
+        machine,
+        "sh",
+        &[
+            "-c".into(),
+            commit_script.into(),
+            "write".into(),
+            path.into(),
+            b64_stage,
+            nonce,
+            mode.into(),
+        ],
+        None,
+    )?;
+    if code != 0 {
+        let msg = String::from_utf8_lossy(&err).trim().to_owned();
+        return Err(if msg.is_empty() { "Failed to write remote file".into() } else { msg });
+    }
+    Ok(())
+}
+
 fn exec_future(command: String, args: Vec<String>, cwd: Option<String>, on: Option<String>, limit: Duration) -> impl std::future::Future<Output = Result<HostValue, HostError>> + Send {
     let (tx, rx) = async_channel::bounded(1);
     let run = move || {
@@ -1010,11 +1325,27 @@ fn module(inst: Instance, copy: u64) -> HostModule {
                 None => crate::mod_files::read(Path::new(&path)),
             }))
         })
+        .async_function("readImageDataUrl", |a| {
+            let path = a.string(0)?.to_owned();
+            let on = opt_str(a.get(1), "on");
+            Ok(crate::mod_files::read_with(move || match on {
+                Some(m) => match read_remote_bytes(&m, &path, crate::mod_files::IMAGE_LIMIT)? {
+                    Some(bytes) => crate::mod_files::encode_image_data_url(&path, &bytes).map(Some),
+                    None => Ok(None),
+                },
+                None => crate::mod_files::read_image_data_url(Path::new(&path)),
+            }))
+        })
         .async_function("writeTextFile", |a| {
             let expected = a.get(2).and_then(|v| match v { HostValue::Str(s) => Some(s.clone()), _ => None });
             let path = a.string(0)?.to_owned();
+            let text = a.string(1)?.to_owned();
+            let on = opt_str(a.get(3), "on");
             if checking() { tracing::warn!("check: mod wrote `{path}`; the write lands for real"); }
-            Ok(crate::mod_files::write_text(path, a.string(1)?.to_owned(), expected))
+            Ok(crate::mod_files::write_with(move || match on {
+                Some(m) => write_remote(&m, &path, &text, expected.as_deref()),
+                None => crate::mod_files::write(Path::new(&path), &text, expected.as_deref()),
+            }))
         })
         .async_function("hc", |a| {
             if checking() { tracing::warn!("check: mod called hc; it runs for real"); }

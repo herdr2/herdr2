@@ -234,6 +234,12 @@ pub enum DroveAction {
         #[arg(long)]
         effort: Option<String>,
         #[arg(long)]
+        review_agent: Option<String>,
+        #[arg(long)]
+        review_model: Option<String>,
+        #[arg(long)]
+        no_review: bool,
+        #[arg(long)]
         fresh: bool,
         #[arg(long)]
         run: Option<String>,
@@ -704,7 +710,7 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
         }
         DroveAction::Add { run, file, stdin, key, title, change, role, deps, verify, worktree, on } => {
             let run_id = resolve_run_id(paths, on.as_deref(), run)?;
-            let body = if file.is_some() || stdin {
+            let mut body = if file.is_some() || stdin {
                 let parsed = read_plan_input(file, stdin)?;
                 if parsed.is_array() {
                     json!({ "tasks": parsed })
@@ -733,6 +739,11 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
                 }
                 json!({ "tasks": [t] })
             };
+            if let Some(obj) = body.as_object_mut()
+                && !obj.contains_key("hostSession")
+            {
+                obj.insert("hostSession".into(), Value::String(default_host_session(None)));
+            }
             let res = proxy_call(paths, on.as_deref(), "POST", &format!("/api/runs/{run_id}/tasks"), "", Some(body))?;
             let n = res["tasks"].as_array().map(|a| a.len()).unwrap_or(0);
             Ok((res, format!("added {n} task(s) to {run_id}")))
@@ -838,7 +849,20 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             let human = serde_json::to_string_pretty(&res).unwrap_or_else(|_| res.to_string());
             Ok((res, human))
         }
-        DroveAction::Retry { task, hint, role, agent, model, effort, fresh, run, on } => {
+        DroveAction::Retry {
+            task,
+            hint,
+            role,
+            agent,
+            model,
+            effort,
+            review_agent,
+            review_model,
+            no_review,
+            fresh,
+            run,
+            on,
+        } => {
             let tid = resolve_task_id(paths, on.as_deref(), run, &task)?;
             let res = proxy_call(
                 paths,
@@ -852,6 +876,9 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
                     "agent": agent,
                     "model": model,
                     "effort": effort,
+                    "reviewAgent": review_agent,
+                    "reviewModel": review_model,
+                    "noReview": no_review,
                     "fresh": fresh,
                 })),
             )?;
@@ -938,6 +965,7 @@ fn execute_worker_action(action: WorkerAction) -> Result<(Value, String), RpcErr
     let url = std::env::var("H2_DROVE_URL")
         .map_err(|_| RpcError::invalid_params("H2_DROVE_URL is not set (must be run inside a Drove worker)"))?;
     let tok = std::env::var("H2_DROVE_WORKER_TOKEN")
+        .or_else(|_| std::env::var("H2_DROVE_WORKER_TICKET"))
         .map_err(|_| RpcError::invalid_params("H2_DROVE_WORKER_TOKEN is not set"))?;
     let wid = std::env::var("H2_DROVE_WORKER_ID").unwrap_or_default();
 

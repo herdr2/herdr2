@@ -58,8 +58,14 @@ function dataHit(when: DataWhen, data: unknown): boolean {
   return true;
 }
 
+function stripMachinePrefix(ref: string): string {
+  const idx = ref.indexOf("/");
+  return idx >= 0 ? ref.slice(idx + 1) : ref;
+}
+
 function sourceTask(when: DataWhen, tasks: readonly Task[]): Task | undefined {
-  return tasks.find((task) => task.key === when.task || task.id === when.task);
+  const stripped = stripMachinePrefix(when.task);
+  return tasks.find((task) => task.id === when.task || task.key === when.task || task.key === stripped);
 }
 
 /**

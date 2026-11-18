@@ -31,10 +31,38 @@ function label(tab, lead) {
   return (tab.name === prog || !tab.named) && telling ? live : base;
 }
 
+function paneDisplayName(p) {
+  if (p?.custom_name) return p.custom_name;
+  if (p?.acp || p?.structured) return p.program?.name || clean(p.title) || p.terminal || "Agent";
+  if (p?.program?.agent) {
+    const live = clean(p.title);
+    const path = /^[~/]|^[A-Za-z]:\\/.test((p.title ?? "").replace(/^[^\p{L}\p{N}~/]+/u, ""));
+    const telling = live && live !== p.terminal && live !== p.program.name && !path && !live.includes("@") && live.toLowerCase() !== p.program.key;
+    return telling ? live : p.program.name;
+  }
+  return p?.program?.shell && p.program?.name
+    ? p.program.name
+    : (clean(p?.title) || p?.program?.name || p?.mod || "Terminal");
+}
+
 const TAB_GAP = 3;
 
+function formatElapsed(ms) {
+  const totalSec = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = String(totalSec % 60).padStart(2, "0");
+  if (h >= 24) return `${Math.floor(h / 24)}d ${h % 24}h`;
+  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${s}`;
+  return `${m}:${s}`;
+}
+
+const isAcpPane = (p) => Boolean(p?.acp);
+const isTermAgentPane = (p) => !p?.acp && Boolean(p?.structured || p?.program?.agent);
+const isAgentPane = (p) => isAcpPane(p) || isTermAgentPane(p);
+
 export default class Tabs extends View {
-  init() {
+  init(_props, cx) {
     this.widths = {};
     this.drag = null;
     this.settling = null;
@@ -42,10 +70,72 @@ export default class Tabs extends View {
     this.snapFromOrder = null;
     this.snapUntil = 0;
     this.hoveredTab = null;
+    this.localWorkingSince = {};
+    this.localWorkMs = {};
     this.scroll = ScrollHandle.new();
     try { this.panels = JSON.parse(localStorage.getItem("panels") ?? "{}"); } catch { this.panels = {}; }
     if (!this.panels || typeof this.panels !== "object" || Array.isArray(this.panels)) this.panels = {};
     this.swipe = { acc: 0, steps: 0, at: 0, last: 0 };
+    cx?.timer?.every?.(1000, (tcx) => {
+      const space = spaces().find((p) => p.active);
+      const activeIds = new Set((space?.tabs ?? []).map((c) => c.id));
+      const working = (space?.tabs ?? []).some((c) => c.status === "working")
+        || panes().some((p) => activeIds.has(p.tab) && isAgentPane(p) && p.status === "working");
+      if (working) tcx?.notify?.();
+    });
+  }
+
+  paneElapsed(key, status, workingSince, workMs, totalWorkMs, now) {
+    const hasWs = typeof workingSince === "number" && workingSince > 0;
+    const hasWork = typeof workMs === "number" && workMs >= 0;
+    if (status === "working") {
+      const start = hasWs ? workingSince : (this.localWorkingSince[key] ?? (this.localWorkingSince[key] = now));
+      const ms = Math.max(0, now - start);
+      this.localWorkMs[key] = ms;
+      return { ms, totalMs: Math.max(ms, Number(totalWorkMs) || 0), working: true, ran: true };
+    }
+    if (this.localWorkingSince[key]) {
+      if (!hasWork) {
+        this.localWorkMs[key] = Math.max(this.localWorkMs[key] ?? 0, now - this.localWorkingSince[key]);
+      }
+      delete this.localWorkingSince[key];
+    }
+    if (hasWork) {
+      this.localWorkMs[key] = workMs;
+      return { ms: workMs, totalMs: Math.max(workMs, Number(totalWorkMs) || 0), working: false, ran: true };
+    }
+    if (typeof this.localWorkMs[key] === "number") {
+      const ms = this.localWorkMs[key];
+      return { ms, totalMs: Math.max(ms, Number(totalWorkMs) || 0), working: false, ran: true };
+    }
+    return { ms: 0, totalMs: Number(totalWorkMs) || 0, working: false, ran: false };
+  }
+
+  tabElapsed(c, agentPanes, now) {
+    if (agentPanes.length === 0) {
+      if (typeof c.working_since === "number" || typeof c.work_ms === "number" || c.status === "working") {
+        return this.paneElapsed(`tab:${c.id}`, c.status, c.working_since, c.work_ms, c.total_work_ms, now);
+      }
+      return null;
+    }
+    const entries = agentPanes.map((p) => {
+      const key = p.pane || p.terminal || `tab:${c.id}`;
+      const ws = p.working_since ?? (p.status === "working" && agentPanes.length === 1 ? c.working_since : null);
+      const wm = p.work_ms ?? (agentPanes.length === 1 ? c.work_ms : null);
+      const tm = p.total_work_ms ?? (agentPanes.length === 1 ? c.total_work_ms : 0);
+      return { p, info: this.paneElapsed(key, p.status, ws, wm, tm, now) };
+    });
+    const working = entries.filter((e) => e.info.working);
+    if (working.length > 0) {
+      return working.reduce((best, cur) => (cur.info.ms >= best.info.ms ? cur : best)).info;
+    }
+    const focusedRan = entries.find((e) => e.p.focused && e.info.ran);
+    if (focusedRan) return focusedRan.info;
+    const ran = entries.filter((e) => e.info.ran);
+    if (ran.length > 0) {
+      return ran.reduce((best, cur) => (cur.info.ms >= best.info.ms ? cur : best)).info;
+    }
+    return entries[0].info;
   }
 
   tabWidth(id) {
@@ -275,15 +365,36 @@ export default class Tabs extends View {
     const button = (id, label, action) => div().id(id).size(26).flex_none().flex().items_center().justify_center().rounded(6).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
       .on_mouse_down("left", stop).on_click(action).child(label);
     const motion = this.drag?.moving ? this.drag : this.settling;
+    const now = Date.now();
+    const timeTooltip = (info) => {
+      if (!info) return "";
+      const cur = formatElapsed(info.ms);
+      const base = info.working
+        ? tr(`Working for ${cur}`, `已运行 ${cur}`)
+        : info.ran
+          ? tr(`Last run: ${cur}`, `最近执行：${cur}`)
+          : tr("Not run yet", "尚未执行");
+      if (info.totalMs > info.ms + 1000) {
+        return `${base} · ${tr(`Total ${formatElapsed(info.totalMs)}`, `累计 ${formatElapsed(info.totalMs)}`)}`;
+      }
+      return base;
+    };
     const renderCard = (c, showClose, { isFloating = false, width = null, interactive = true, isMergeTarget = false, showMergeBadge = false } = {}) => {
       const tabPanes = panes().filter(p => p.tab === c.id);
       const lead = tabPanes.find(p => p.program?.agent) ?? tabPanes[0];
-      const allAcp = tabPanes.length > 0 && tabPanes.every(p => p.acp);
-      const isAcpTab = Boolean(lead?.acp) || allAcp;
-      const isStructuredTermTab = !isAcpTab && Boolean(lead?.structured);
-      const isTermAgentTab = !isAcpTab && !isStructuredTermTab && Boolean(lead?.program?.agent);
+      const paneCount = tabPanes.length;
+      const isMerged = paneCount > 1;
+      const mergedNames = isMerged ? tabPanes.map(paneDisplayName).filter(Boolean) : [];
+      const combinedName = mergedNames.length > 1 ? mergedNames.join(" + ") : null;
+      const allAcp = paneCount > 0 && tabPanes.every(p => p.acp);
+      const hasAcpAgent = tabPanes.some(isAcpPane);
+      const hasStructuredTermAgent = tabPanes.some(p => !p?.acp && Boolean(p?.structured));
+      const hasRawTermAgent = tabPanes.some(p => !p?.acp && !p?.structured && Boolean(p?.program?.agent));
+      const hasTermAgent = hasStructuredTermAgent || hasRawTermAgent;
+      const agentPanes = tabPanes.filter(isAgentPane);
+      const elapsed = this.tabElapsed(c, agentPanes, now);
       const program = lead?.program;
-      const name = label(c, lead);
+      const name = c.named ? label(c, lead) : (combinedName || label(c, lead));
       const accent = t.accent ?? "#3b82f6";
       let el = h_flex()
         .id(isFloating ? `tab-float-card-${c.id}` : `tab-${c.id}`)
@@ -302,7 +413,27 @@ export default class Tabs extends View {
         .when(isFloating, node => node.shadow_md().cursor_grabbing())
         .when(!isFloating && interactive, node => node.hover(s => s.bg(t.hover)))
         .when(Boolean(program?.icon), node => node.child(program.tint ? svg(program.icon).size(14).text_color(t.muted) : image(program.icon).size(14)))
-        .child(div().max_w(160).truncate().child(c.zoomed ? `${name} Z` : name))
+        .child(div().max_w(isMerged ? 210 : 160).truncate().child(c.zoomed ? `${name} Z` : name))
+        .when(!isFloating && isMerged, node => node.child(
+          div()
+            .id(`tab-merged-${c.id}`)
+            .px(4.5)
+            .h(15)
+            .flex_none()
+            .flex()
+            .items_center()
+            .rounded(4)
+            .bg(alpha(accent, "1c") ?? t.raised)
+            .border_1()
+            .border_color(alpha(accent, "55") ?? t.border)
+            .text_size(9.5)
+            .font_medium()
+            .text_color(accent)
+            .tooltip(combinedName
+              ? tr(`Merged ${paneCount} panes: ${combinedName}`, `已合并 ${paneCount} 个分栏：${combinedName}`)
+              : tr(`Merged ${paneCount} panes`, `已合并 ${paneCount} 个分栏`))
+            .child(tr(`◫ ${paneCount}`, `合并·${paneCount}`)),
+        ))
         .when(isFloating && showMergeBadge, node => node.child(
           div()
             .id("tab-merge-badge")
@@ -318,7 +449,7 @@ export default class Tabs extends View {
             .text_color(t.accent_foreground ?? "#ffffff")
             .child(tr("◫ Split", "◫ 分栏")),
         ))
-        .when(isAcpTab, node => node.child(
+        .when(hasAcpAgent, node => node.child(
           div()
             .px(4.5)
             .h(15)
@@ -332,10 +463,10 @@ export default class Tabs extends View {
             .text_size(9.5)
             .font_semibold()
             .text_color(accent)
-            .tooltip(tr("ACP Agent", "ACP 智能体"))
+            .when(!isFloating, el => el.tooltip(tr("ACP Agent", "ACP 智能体")))
             .child("ACP"),
         ))
-        .when(isStructuredTermTab, node => node.child(
+        .when(hasTermAgent, node => node.child(
           div()
             .px(4.5)
             .h(15)
@@ -343,31 +474,33 @@ export default class Tabs extends View {
             .flex()
             .items_center()
             .rounded(4)
-            .bg(alpha(accent, "22") ?? t.raised)
+            .bg(hasStructuredTermAgent ? (alpha(accent, "22") ?? t.raised) : t.raised)
             .border_1()
-            .border_color(alpha(accent, "66") ?? t.border)
+            .border_color(hasStructuredTermAgent ? (alpha(accent, "66") ?? t.border) : t.border)
             .text_size(9.5)
             .font_semibold()
-            .text_color(accent)
-            .tooltip(tr("Terminal Agent (Structured View)", "终端智能体（结构化视图）"))
+            .text_color(hasStructuredTermAgent ? accent : t.dim)
+            .when(!isFloating, el => el.tooltip(hasStructuredTermAgent ? tr("Terminal Agent (Structured View)", "终端智能体（结构化视图）") : tr("Terminal Agent", "终端智能体")))
             .child(tr("CLI", "终端")),
         ))
-        .when(isTermAgentTab, node => node.child(
-          div()
+        .when(Boolean(elapsed), node => node.child(
+          h_flex()
+            .id(isFloating ? `tab-float-time-${c.id}` : `tab-time-${c.id}`)
             .px(4.5)
             .h(15)
+            .gap(3)
             .flex_none()
-            .flex()
             .items_center()
             .rounded(4)
-            .bg(t.raised)
+            .bg(elapsed.working ? (alpha(t.working, "1f") ?? t.raised) : t.raised)
             .border_1()
-            .border_color(t.border)
+            .border_color(elapsed.working ? (alpha(t.working, "55") ?? t.border) : t.border)
             .text_size(9.5)
             .font_medium()
-            .text_color(t.dim)
-            .tooltip(tr("Terminal Agent", "终端智能体"))
-            .child(tr("CLI", "终端")),
+            .text_color(elapsed.working ? (t.working ?? accent) : (elapsed.ran ? t.muted : t.dim))
+            .when(!isFloating, el => el.tooltip(timeTooltip(elapsed)))
+            .child(svg("mods/workspace-chrome/clock.svg").size(9.5).flex_none())
+            .child(formatElapsed(elapsed.ms)),
         ))
         .when(c.status === "working", node => node.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
         .when(c.status === "blocked" || c.status === "done", node => node.child(div().size(6).rounded(3).bg(t[c.status])))

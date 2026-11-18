@@ -487,7 +487,7 @@ async fn dispatch_http_inner(
             Ok(json!({ "runs": summaries }))
         }
         ("POST", ["api", "runs"]) => {
-            let run = create_run_http(&core.drove, &req.headers, &body, internal_admin)?;
+            let run = create_run_http(&core, &req.headers, &body, internal_admin).await?;
             if run["name"].is_null()
                 && let Some(id) = run["id"].as_str()
                 && let Some(obj) = run["objective"].as_str()
@@ -496,7 +496,7 @@ async fn dispatch_http_inner(
             }
             Ok(run)
         }
-        ("GET", ["api", "runs", id]) => build_snapshot(&core.drove, id),
+        ("GET", ["api", "runs", id]) => build_snapshot(&core, id).await,
         ("PATCH", ["api", "runs", id]) => patch_run_http(&core.drove, &req.headers, id, &body, internal_admin),
         ("POST", ["api", "runs", "reorder"]) => {
             let ids = body["ids"]
@@ -513,7 +513,7 @@ async fn dispatch_http_inner(
             core.drove.store.reorder_runs(&parsed);
             Ok(json!({ "ok": true }))
         }
-        ("POST", ["api", "runs", id, "trash"]) => trash_run_http(&core.drove, id),
+        ("POST", ["api", "runs", id, "trash"]) => trash_run_http(&core, id).await,
         ("POST", ["api", "runs", id, "restore"]) => restore_run_http(&core.drove, id),
         ("POST", ["api", "runs", id, "pause"]) => pause_run_http(&core.drove, id),
         ("POST", ["api", "runs", id, "resume"]) => resume_run_http(&core.drove, id),
@@ -526,6 +526,18 @@ async fn dispatch_http_inner(
             if confirm != *id {
                 return Err(ApiErr::new(400, "confirmation_required", "missing confirmation header"));
             }
+            let wids: Vec<String> = core
+                .drove
+                .store
+                .list_workers(Some(id))
+                .into_iter()
+                .map(|w| w.id)
+                .collect();
+            super::pool::stop_run_workers(&core, id).await;
+            for wid in wids {
+                core.drove.remove_worker_token(&wid);
+            }
+            let _ = std::fs::remove_dir_all(core.drove.paths.state_dir.join("worktrees").join(id));
             core.drove.store.delete_run(id);
             Ok(json!({ "ok": true }))
         }
@@ -536,10 +548,13 @@ async fn dispatch_http_inner(
         }
         ("GET", ["api", "runs", id, "coordinator-transcript"]) => {
             let run = core.drove.store.get_run(id).ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
-            let local_sess = run.coordinator.host_session.rsplit_once('/').map(|(_, r)| r).unwrap_or(&run.coordinator.host_session);
-            if let Some(aid) = crate::agents::parse_id(local_sess)
-                && let Ok(entries) = core.read_transcript_entries(aid)
-            {
+            let (agent, model, pid, entries, available) =
+                resolve_coordinator_meta_and_entries(&core, &run, true).await;
+            let run = sync_coordinator_meta(&core.drove, run, agent, model, pid);
+            let effective_agent = run.coordinator.agent.clone();
+            let models: Vec<String> = run.coordinator.model.clone().into_iter().collect();
+
+            if available {
                 let total = entries.len();
                 let limit = query.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(200).clamp(1, 500);
                 let before = query.get("before").and_then(|s| s.parse::<usize>().ok()).unwrap_or(total).min(total);
@@ -547,31 +562,39 @@ async fn dispatch_http_inner(
                 let items: Vec<Value> = entries[start..before]
                     .iter()
                     .enumerate()
-                    .map(|(i, e)| json!({ "idx": start + i, "entry": e }))
+                    .map(|(i, e)| entry_to_host_item(start + i, e))
                     .collect();
+                let first_ts = entries.iter().map(entry_ts_ms).find(|ms| *ms > 0).map(super::types::format_ms_iso);
+                let last_ts = entries.iter().rev().map(entry_ts_ms).find(|ms| *ms > 0).map(super::types::format_ms_iso);
                 return Ok(json!({
                     "available": true,
                     "host": run.coordinator.host,
+                    "agent": effective_agent,
                     "hostSession": run.coordinator.host_session,
-                    "items": items,
-                    "models": [],
+                    "models": models,
+                    "firstTs": first_ts,
+                    "lastTs": last_ts,
                     "total": total,
                     "start": start,
                     "hasMore": start > 0,
+                    "items": items,
                 }));
             }
             Ok(json!({
                 "available": false,
                 "host": run.coordinator.host,
+                "agent": effective_agent,
                 "hostSession": run.coordinator.host_session,
-                "items": [],
-                "models": [],
+                "models": models,
                 "total": 0,
                 "start": 0,
                 "hasMore": false,
+                "items": [],
             }))
         }
-        ("POST", ["api", "runs", id, "tasks"]) => add_tasks_http(&core, id, &body).await,
+        ("POST", ["api", "runs", id, "tasks"]) => {
+            add_tasks_http(&core, id, header(&req.headers, "x-drove-coordinator", "x-co-coordinator"), &body).await
+        }
         ("GET", ["api", "runs", id, "wait"]) => wait_run_http(&core, id, &query).await,
         ("POST", ["api", "runs", id, "complete"]) => complete_run_http(&core, id, &body).await,
         ("POST", ["api", "runs", id, "cancel"]) => cancel_run_http(&core, id).await,
@@ -666,8 +689,13 @@ async fn dispatch_http_inner(
         ("POST", ["api", "tasks", id, "cancel"]) => cancel_task_http(&core, id).await,
         ("POST", ["api", "tasks", id, "send"]) => send_task_http(&core, id, &body).await,
         ("GET", ["api", "tasks", id, "inspect"]) => {
-            let diag = super::diagnose::diagnose_task(&core.drove.store, id)
+            let mut diag = super::diagnose::diagnose_task(&core.drove.store, id)
                 .ok_or_else(|| ApiErr::new(404, "not_found", "Task or attempt not found"))?;
+            let want_ai = query.get("ai").is_some_and(|v| v == "1" || v == "true");
+            let refresh = query.get("refresh").is_some_and(|v| v == "1" || v == "true");
+            if want_ai {
+                super::ai::generate_task_diagnosis(&core, &mut diag, refresh).await;
+            }
             Ok(json!(diag))
         }
         ("POST", ["api", "worker", "context"]) => worker_context_http(&core.drove, &req.headers, &body),
@@ -709,8 +737,8 @@ async fn dispatch_http_inner(
     }
 }
 
-fn create_run_http(
-    drove: &DroveRuntime,
+async fn create_run_http(
+    core: &Arc<Core>,
     headers: &BTreeMap<String, String>,
     body: &Value,
     internal_admin: bool,
@@ -729,12 +757,34 @@ fn create_run_http(
     if !(1..=16).contains(&max_conc) {
         return Err(ApiErr::new(400, "bad_request", "maxConcurrency must be 1..16"));
     }
-    let run = drove.store.create_run(super::store::CreateRunInput {
+    let (detected_agent, detected_model, detected_pid, _, _) =
+        resolve_session_meta_and_entries(core, host_session, true, false).await;
+    let session_bound = is_local_session_bound(core, host_session);
+    let agent = body["agent"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .or(detected_agent);
+    let model = body["model"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .or(detected_model);
+    let host_pid = body["hostPid"]
+        .as_u64()
+        .and_then(|v| u32::try_from(v).ok())
+        .or(detected_pid);
+    let run = core.drove.store.create_run(super::store::CreateRunInput {
         objective: objective.into(),
         cwd: cwd.into(),
         host: host.into(),
         host_session: host_session.into(),
-        host_pid: body["hostPid"].as_u64().and_then(|v| u32::try_from(v).ok()),
+        agent,
+        model,
+        host_pid,
+        session_bound,
         max_concurrency: max_conc as u32,
         budget: serde_json::from_value(body["budget"].clone()).ok().flatten(),
         verify: serde_json::from_value(body["verify"].clone()).ok().flatten(),
@@ -785,7 +835,8 @@ fn patch_run_http(
     Ok(json!(updated))
 }
 
-fn trash_run_http(drove: &DroveRuntime, id: &str) -> Result<Value, ApiErr> {
+async fn trash_run_http(core: &Arc<Core>, id: &str) -> Result<Value, ApiErr> {
+    let drove = &core.drove;
     let run = drove.store.get_run(id).ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
     if run.trashed_at.as_ref().is_some_and(|s| !s.is_empty()) {
         return Err(ApiErr::new(409, "invalid_state", "Run is already in trash"));
@@ -795,6 +846,17 @@ fn trash_run_http(drove: &DroveRuntime, id: &str) -> Result<Value, ApiErr> {
     {
         return Err(ApiErr::new(409, "invalid_state", "stop active tasks before trashing"));
     }
+    let wids: Vec<String> = drove
+        .store
+        .list_workers(Some(id))
+        .into_iter()
+        .map(|w| w.id)
+        .collect();
+    super::pool::stop_run_workers(core, id).await;
+    for wid in wids {
+        drove.remove_worker_token(&wid);
+    }
+    let _ = std::fs::remove_dir_all(drove.paths.state_dir.join("worktrees").join(id));
     let prev = run.status;
     let updated = drove.store.update_run(id, |r| {
         r.status_before_trash = Some(prev);
@@ -842,13 +904,280 @@ fn resume_run_http(drove: &DroveRuntime, id: &str) -> Result<Value, ApiErr> {
     Ok(json!(updated))
 }
 
-fn build_snapshot(drove: &DroveRuntime, id: &str) -> Result<Value, ApiErr> {
-    let run = drove.store.get_run(id).ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
-    let tasks = drove.store.list_tasks(id);
-    let workers = drove.store.list_workers(Some(id));
-    let attempts = drove.store.list_attempts(Some(id), None, None);
-    let messages = drove.store.list_messages(id, None, false, None);
-    let pending_messages = drove.store.list_messages(id, Some(true), true, None);
+fn normalize_snapshot_deps(tasks: &mut [Task]) {
+    let snapshot: Vec<Task> = tasks.to_vec();
+    for task in tasks.iter_mut() {
+        let mut resolved = Vec::new();
+        let mut push_unique = |id: String| {
+            if !resolved.contains(&id) {
+                resolved.push(id);
+            }
+        };
+        let parent_tpl = task
+            .expanded_from
+            .as_deref()
+            .and_then(|pid| snapshot.iter().find(|c| c.id == pid));
+        let parent_dep_ids: std::collections::HashSet<String> = parent_tpl
+            .map(|tpl| {
+                tpl.deps
+                    .iter()
+                    .filter_map(|pd| snapshot.iter().find(|c| &c.id == pd || &c.key == pd))
+                    .map(|c| c.id.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        for dep in &task.deps {
+            if let Some(target) = snapshot.iter().find(|c| &c.id == dep || &c.key == dep) {
+                if parent_dep_ids.contains(&target.id) {
+                    continue;
+                }
+                if target.template == Some(true)
+                    && task.expanded_from.as_deref() != Some(target.id.as_str())
+                    && target.expansion_state.as_deref() == Some("done")
+                {
+                    let children: Vec<String> = snapshot
+                        .iter()
+                        .filter(|c| c.expanded_from.as_deref() == Some(target.id.as_str()))
+                        .map(|c| c.id.clone())
+                        .collect();
+                    if !children.is_empty() {
+                        for cid in children {
+                            push_unique(cid);
+                        }
+                    } else {
+                        push_unique(target.id.clone());
+                    }
+                } else {
+                    push_unique(target.id.clone());
+                }
+            } else {
+                let mut matched_foreach = false;
+                for child in snapshot.iter().filter(|c| {
+                    c.key
+                        .strip_prefix(dep.as_str())
+                        .is_some_and(|rest| rest.starts_with('#'))
+                }) {
+                    matched_foreach = true;
+                    push_unique(child.id.clone());
+                }
+                if !matched_foreach {
+                    push_unique(dep.clone());
+                }
+            }
+        }
+        if let Some(tpl) = parent_tpl {
+            push_unique(tpl.id.clone());
+        }
+        task.deps = resolved;
+    }
+}
+
+pub(super) fn is_local_session_bound(core: &Core, host_session: &str) -> Option<bool> {
+    (super::pool::local_session_part(core, host_session).is_some()
+        && super::pool::resolve_local_parent(core, host_session).is_some())
+        .then_some(true)
+}
+
+pub(super) async fn resolve_session_meta_and_entries(
+    core: &Arc<Core>,
+    host_session: &str,
+    probe_model: bool,
+    include_entries: bool,
+) -> (Option<String>, Option<String>, Option<u32>, Vec<crate::transcript::Entry>, bool) {
+    let local_sess = host_session
+        .rsplit_once('/')
+        .map(|(_, r)| r)
+        .unwrap_or(host_session);
+
+    if let Some(aid) = crate::agents::parse_id(local_sess) {
+        let (agent, model, pid, live) = {
+            let st = core.lock();
+            if let Some(a) = st.reg.agents.get(&aid) {
+                let model = a.model.clone().or_else(|| {
+                    a.config_options
+                        .iter()
+                        .find(|o| o.id == "model" || o.category.as_deref() == Some("model"))
+                        .and_then(|o| o.current_value.as_str().map(String::from))
+                });
+                (
+                    a.agent.clone().or_else(|| a.agent_info.clone()),
+                    model,
+                    a.pid,
+                    a.is_live(),
+                )
+            } else {
+                (None, None, None, false)
+            }
+        };
+        let entries = if include_entries {
+            core.read_transcript_entries(aid).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let available = live || !entries.is_empty();
+        return (agent, model, pid, entries, available);
+    }
+
+    if let Some(tid) = crate::terminals::parse_id(local_sess) {
+        let found = {
+            let st = core.lock();
+            st.pty_reg.terminals.get(&tid).map(|t| {
+                (
+                    crate::pty_transcript::snapshot_from_terminal(t, st.pty_prompts.get(&tid)),
+                    t.is_live(),
+                )
+            })
+        };
+        if let Some((snap, _live)) = found {
+            let agent = snap.agent_hint.clone();
+            let pid = snap.fg_pid;
+            if include_entries || probe_model {
+                let extracted = tokio::task::spawn_blocking(move || {
+                    crate::pty_transcript::extract_transcript(&snap)
+                })
+                .await
+                .unwrap_or_else(|_| (Vec::new(), None));
+                let model = extracted.1.and_then(|m| m.model);
+                let entries = if include_entries { extracted.0 } else { Vec::new() };
+                let available = !entries.is_empty() || model.is_some();
+                return (agent, model, pid, entries, available);
+            }
+            return (agent, None, pid, Vec::new(), false);
+        }
+    }
+
+    (None, None, None, Vec::new(), false)
+}
+
+async fn resolve_coordinator_meta_and_entries(
+    core: &Arc<Core>,
+    run: &Run,
+    include_entries: bool,
+) -> (Option<String>, Option<String>, Option<u32>, Vec<crate::transcript::Entry>, bool) {
+    let probe_model = run.coordinator.model.is_none() || run.status == RunStatus::Active;
+    resolve_session_meta_and_entries(core, &run.coordinator.host_session, probe_model, include_entries).await
+}
+
+fn sync_coordinator_meta(
+    drove: &DroveRuntime,
+    run: Run,
+    agent: Option<String>,
+    model: Option<String>,
+    pid: Option<u32>,
+) -> Run {
+    let next_agent = agent.filter(|s| !s.trim().is_empty()).or_else(|| run.coordinator.agent.clone());
+    let next_model = model.filter(|s| !s.trim().is_empty()).or_else(|| run.coordinator.model.clone());
+    let next_pid = pid.or(run.coordinator.host_pid);
+    if next_agent != run.coordinator.agent
+        || next_model != run.coordinator.model
+        || next_pid != run.coordinator.host_pid
+    {
+        return drove
+            .store
+            .update_run(&run.id, |r| {
+                r.coordinator.agent = next_agent.clone();
+                r.coordinator.model = next_model.clone();
+                r.coordinator.host_pid = next_pid;
+            })
+            .unwrap_or(run);
+    }
+    run
+}
+
+fn entry_ts_ms(entry: &crate::transcript::Entry) -> u64 {
+    match entry {
+        crate::transcript::Entry::User { ts_ms, .. }
+        | crate::transcript::Entry::Thought { ts_ms, .. }
+        | crate::transcript::Entry::Assistant { ts_ms, .. }
+        | crate::transcript::Entry::ToolCall { ts_ms, .. }
+        | crate::transcript::Entry::Plan { ts_ms, .. }
+        | crate::transcript::Entry::Permission { ts_ms, .. }
+        | crate::transcript::Entry::Error { ts_ms, .. }
+        | crate::transcript::Entry::Stderr { ts_ms, .. } => *ts_ms,
+    }
+}
+
+fn entry_to_host_item(index: usize, entry: &crate::transcript::Entry) -> Value {
+    let opt_iso = |ms: u64| (ms > 0).then(|| super::types::format_ms_iso(ms));
+    match entry {
+        crate::transcript::Entry::User { text, ts_ms, .. } => json!({
+            "index": index,
+            "kind": "user",
+            "text": text,
+            "ts": opt_iso(*ts_ms),
+        }),
+        crate::transcript::Entry::Assistant { text, ts_ms, .. } => json!({
+            "index": index,
+            "kind": "assistant",
+            "text": text,
+            "ts": opt_iso(*ts_ms),
+        }),
+        crate::transcript::Entry::Thought { text, ts_ms, .. } => json!({
+            "index": index,
+            "kind": "thought",
+            "text": text,
+            "ts": opt_iso(*ts_ms),
+        }),
+        crate::transcript::Entry::ToolCall { title, status, detail, ts_ms, .. } => {
+            let text = match detail.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(d) => format!("{title}: {d}"),
+                None => title.clone(),
+            };
+            json!({
+                "index": index,
+                "kind": "tool",
+                "title": title,
+                "detail": detail,
+                "status": status,
+                "text": text,
+                "ts": opt_iso(*ts_ms),
+            })
+        }
+        crate::transcript::Entry::Plan { items, ts_ms, .. } => json!({
+            "index": index,
+            "kind": "thought",
+            "text": items.join("\n"),
+            "ts": opt_iso(*ts_ms),
+        }),
+        crate::transcript::Entry::Permission { title, outcome, ts_ms, .. } => json!({
+            "index": index,
+            "kind": "tool",
+            "title": title,
+            "status": outcome,
+            "text": title,
+            "ts": opt_iso(*ts_ms),
+        }),
+        crate::transcript::Entry::Error { message, ts_ms, .. } => json!({
+            "index": index,
+            "kind": "tool",
+            "title": "error",
+            "detail": message,
+            "status": "failed",
+            "text": format!("error: {message}"),
+            "ts": opt_iso(*ts_ms),
+        }),
+        crate::transcript::Entry::Stderr { text, ts_ms } => json!({
+            "index": index,
+            "kind": "tool",
+            "title": "stderr",
+            "detail": text,
+            "text": format!("stderr: {text}"),
+            "ts": opt_iso(*ts_ms),
+        }),
+    }
+}
+
+async fn build_snapshot(core: &Arc<Core>, id: &str) -> Result<Value, ApiErr> {
+    let run = core.drove.store.get_run(id).ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
+    let (agent, model, pid, _, _) = resolve_coordinator_meta_and_entries(core, &run, false).await;
+    let run = sync_coordinator_meta(&core.drove, run, agent, model, pid);
+    let mut tasks = core.drove.store.list_tasks(id);
+    normalize_snapshot_deps(&mut tasks);
+    let workers = core.drove.store.list_workers(Some(id));
+    let attempts = core.drove.store.list_attempts(Some(id), None, None);
+    let messages = core.drove.store.list_messages(id, None, false, None);
+    let pending_messages = core.drove.store.list_messages(id, Some(true), true, None);
     let attempt_tokens: u64 = attempts.iter().map(|a| a.tokens.input + a.tokens.output + a.tokens.cache_read).sum();
     let attempt_cost: f64 = attempts.iter().map(|a| a.cost.unwrap_or(0.0)).sum();
     let ai_tokens = run.ai_usage.as_ref().map(|u| u.input_tokens + u.output_tokens).unwrap_or(0);
@@ -1017,6 +1346,14 @@ pub(crate) fn prefix_remote_json(v: &mut Value, machine: &str) {
         "threadId",
         "task",
     ];
+    let looks_like_entity_id = |s: &str| {
+        let local = s.rsplit_once('/').map(|(_, r)| r).unwrap_or(s);
+        [
+            "run_", "tsk_", "wrk_", "att_", "msg_", "r_", "t_", "w_", "a_", "m_",
+        ]
+        .iter()
+        .any(|p| local.starts_with(p))
+    };
     let prefix = |s: &mut String| {
         if !s.is_empty()
             && !s.contains('/')
@@ -1036,6 +1373,8 @@ pub(crate) fn prefix_remote_json(v: &mut Value, machine: &str) {
                 {
                     if let Some(wid) = s.strip_prefix("worker:").map(String::from) {
                         *s = if wid.contains('/') { format!("worker:{wid}") } else { format!("worker:{machine}/{wid}") };
+                    } else if k == "task" && !looks_like_entity_id(s) {
+                        // Keep task key references unprefixed so frontend matches `task.key`.
                     } else {
                         prefix(s);
                     }
@@ -1043,7 +1382,9 @@ pub(crate) fn prefix_remote_json(v: &mut Value, machine: &str) {
                     && let Value::Array(arr) = val
                 {
                     for item in arr.iter_mut() {
-                        if let Value::String(s) = item {
+                        if let Value::String(s) = item
+                            && (k != "deps" || looks_like_entity_id(s))
+                        {
                             prefix(s);
                         }
                     }

@@ -70,8 +70,6 @@ pub(crate) fn menus(layouts: &[String], shown: Option<&str>) -> Vec<Menu> {
         .chain([MenuItem::separator(), command("Next Layout", "layout.switch")]);
     vec![
         Menu::new("Herdr").items([
-            command("Check for Updates…", "app.settings:updates"),
-            MenuItem::separator(),
             command("Settings…", "app.settings"),
             MenuItem::separator(),
             MenuItem::os_submenu("Services", SystemMenuType::Services),
@@ -128,8 +126,6 @@ pub(crate) fn menus(layouts: &[String], shown: Option<&str>) -> Vec<Menu> {
         Menu::new("Help").items([
             command("Keyboard Shortcuts", "app.help"),
             command("Welcome to Herdr", "app.welcome"),
-            MenuItem::separator(),
-            command("Send Feedback…", "app.feedback"),
         ]),
     ]
 }

@@ -182,12 +182,21 @@ export function deriveTaskStatusBadge(
 
 /** Tasks directly waiting on `taskId` via deps, data branches, or foreach expansion. */
 export function taskDependents(taskId: string, tasks: readonly Task[]): Task[] {
+  const target = tasks.find((t) => t.id === taskId);
+  const targetKey = target?.key;
+  const stripMachine = (ref: string) => (ref.includes("/") ? ref.slice(ref.indexOf("/") + 1) : ref);
+  const matchesRef = (ref: string | undefined): boolean => {
+    if (!ref) return false;
+    if (ref === taskId) return true;
+    if (!targetKey) return false;
+    return ref === targetKey || stripMachine(ref) === targetKey;
+  };
   return tasks.filter(
     (item) =>
       item.id !== taskId &&
-      (item.deps.includes(taskId) ||
-        Boolean(item.when && "task" in item.when && item.when.task === taskId) ||
-        item.foreachFrom?.task === taskId),
+      (item.deps.some((d) => matchesRef(d)) ||
+        Boolean(item.when && "task" in item.when && matchesRef(item.when.task)) ||
+        matchesRef(item.foreachFrom?.task)),
   );
 }
 

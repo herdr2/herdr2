@@ -249,9 +249,21 @@ impl<M: InputModeKind> InputBaseState<M> {
         cx: &mut Context<Self>,
     ) {
         if self.is_single_line() {
+            if collapse && move_lines.abs() == 1 {
+                cx.propagate();
+            }
             return;
         }
         self.pause_blink_cursor(cx);
+
+        let boundary_probe = (collapse
+            && move_lines.abs() == 1
+            && self.selections.is_single()
+            && self.active_selection().is_empty())
+        .then(|| {
+            let sel = self.active_selection();
+            (sel.start, sel.end, self.cursor_line_end_affinity)
+        });
 
         let direction = if move_lines < 0 {
             MoveDirection::Up
@@ -288,6 +300,13 @@ impl<M: InputModeKind> InputBaseState<M> {
             window,
             cx,
         );
+
+        if boundary_probe.is_some_and(|prev| {
+            let sel = self.active_selection();
+            (sel.start, sel.end, self.cursor_line_end_affinity) == prev
+        }) {
+            cx.propagate();
+        }
     }
 
     pub(super) fn left(&mut self, _: &MoveLeft, window: &mut Window, cx: &mut Context<Self>) {

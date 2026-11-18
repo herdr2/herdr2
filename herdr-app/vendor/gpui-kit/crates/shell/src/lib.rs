@@ -66,6 +66,10 @@ mod component_registry;
 mod input_tokens;
 // HERDR: syntax highlighting shipped with script editors.
 mod syntax;
+/// Pre-warms built-in syntax definitions so first code-file open never blocks the UI thread.
+pub fn warm_syntax() {
+    syntax::warm_syntax();
+}
 pub use input_tokens::{
     InlineTokenCallbacks, inline_token_click_data, inline_token_context_data,
     inline_token_hover_data, input_token_state_methods, textarea_token_state_methods,
@@ -79,6 +83,9 @@ pub(crate) mod entities;
 pub(crate) mod error;
 pub mod host;
 pub mod host_modules;
+// HERDR: production HttpClient implementation for GPUI Application::with_http_client.
+#[cfg(feature = "quickjs")]
+pub mod http_client;
 pub(crate) mod materialize;
 pub mod metrics;
 pub(crate) mod path;
@@ -126,6 +133,8 @@ pub use gpui;
 pub use host_modules::{
     HostArguments, HostError, HostModule, HostObject, HostResult, HostValue, RESERVED_SPECIFIERS,
 };
+#[cfg(feature = "quickjs")]
+pub use http_client::http_client;
 pub use metrics::RuntimeMetrics;
 pub use root::{DialogOptions, ShellRoot, ToastLevel, ToastRequest};
 pub use runtime::{
