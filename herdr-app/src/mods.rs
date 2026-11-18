@@ -1349,11 +1349,11 @@ fn module(inst: Instance, copy: u64) -> HostModule {
         })
         .async_function("hc", |a| {
             if checking() { tracing::warn!("check: mod called hc; it runs for real"); }
-            Ok(exec_future("hc".into(), strings(a.get(0)), None, None, EXEC_LIMIT))
+            Ok(exec_future("hc".into(), strings(a.get(0)), None, None, exec_limit(a.get(1))?))
         })
         .async_function("h2", |a| {
             if checking() { tracing::warn!("check: mod called h2; it runs for real"); }
-            Ok(exec_future("h2".into(), strings(a.get(0)), None, None, EXEC_LIMIT))
+            Ok(exec_future("h2".into(), strings(a.get(0)), None, None, exec_limit(a.get(1))?))
         })
         .function("checking", |_| Ok(HostValue::Bool(checking())))
         .function("home", |_| Ok(home().to_string_lossy().into_owned().into()))

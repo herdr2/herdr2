@@ -19,6 +19,7 @@ Agents & terminals
 
 Communicate & control
   send <a|t> <text>           queue ACP prompt or paste text into PTY (--steer: cancel & deliver next)
+  inbox ls|edit|rm <a> ...    inspect, edit, or remove prompts queued in an ACP inbox
   approve <a> [--option ID]   approve a blocked ACP agent's pending permission request
   deny <a> [--option ID]      deny a blocked ACP agent's pending permission request
   config <a> --id K (--value V|--bool B)
@@ -26,6 +27,10 @@ Communicate & control
   interrupt <a|t>             send ACP `session/cancel` or PTY interrupt (Esc / Ctrl-C)
   wait <a|t>                  wait until not `working` (--output X, --children any|all)
   put <a|t> <file>            stage a file beside agent or terminal, print path
+  handoff <a|t> [--kind K] [--preset P] [--pty] [--into T] [--prompt TEXT]
+                              hand off, fork, or merge session context across agents
+  checkpoint ls|snap|diff|rollback <a|t>
+                              hidden Git ref snapshots, pure turn diffs, and dual rollback
 
 Non-agent & files
   exec [--on m] <cmd>         run non-agent command directly; exact stdout/stderr & exit code

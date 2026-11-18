@@ -128,6 +128,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
             mode: mode.clone(),
             inject_mcp,
             permission_mode: permissions,
+            lineage: p.lineage.clone(),
         };
         let id = st.reg.create(new, now_ms())?;
         st.recovering.insert(id);
@@ -192,10 +193,9 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
                         let handle = acp::spawn_actor(core_bg.clone(), id, started);
                         let pid = handle.transport.pid();
                         st.sessions.insert(id, handle);
-                        let inbox_len = st.inboxes.get(&id).map_or(0, std::collections::VecDeque::len);
+                        core_bg.sync_inbox(&mut st, id, false);
                         let a = st.reg.agents.get_mut(&id).expect("just created");
                         a.pid = pid;
-                        a.inbox_len = inbox_len;
                         a.acp_session_id = Some(acp_sid);
                         a.can_load_session = can_load;
                         a.config_options = config_options;
@@ -225,6 +225,17 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
                                 core_bg.save(&st);
                             }
                         }
+                    } else {
+                        let _ = crate::checkpoint::capture_target_checkpoint(
+                            &core_bg,
+                            crate::runtime::TargetKey::Agent(id),
+                            Some(0),
+                            None,
+                            None,
+                            true,
+                            false,
+                        )
+                        .await;
                     }
                 }
                 Err(err) => {
@@ -337,7 +348,22 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
                 }
             }
         }
-        None => (None, None),
+        None => {
+            let core_bg = Arc::clone(&core.core);
+            tokio::spawn(async move {
+                let _ = crate::checkpoint::capture_target_checkpoint(
+                    &core_bg,
+                    crate::runtime::TargetKey::Agent(id),
+                    Some(0),
+                    None,
+                    None,
+                    true,
+                    false,
+                )
+                .await;
+            });
+            (None, None)
+        }
     };
 
     let (wait, output) = match timeout {
@@ -524,6 +550,7 @@ pub(crate) async fn spawn_drove_agent(
             mode: None,
             inject_mcp: false,
             permission_mode: crate::permissions::PermissionMode::ApproveAll,
+            lineage: None,
         };
         let id = st.reg.create(new, now_ms())?;
         st.recovering.insert(id);
@@ -600,6 +627,19 @@ pub(crate) async fn spawn_drove_agent(
         pid
     };
     core.flush_saved().await?;
+    let core_bg = Arc::clone(core);
+    tokio::spawn(async move {
+        let _ = crate::checkpoint::capture_target_checkpoint(
+            &core_bg,
+            crate::runtime::TargetKey::Agent(id),
+            Some(0),
+            None,
+            None,
+            true,
+            false,
+        )
+        .await;
+    });
     Ok(DroveSpawnResult { agent_id: id, address, pid, sandbox_mode })
 }
 

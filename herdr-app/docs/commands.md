@@ -29,6 +29,7 @@ Make a space: its name (default: none, so it's called after where its first term
 | `argv` | no |
 | `task` | no |
 | `machine` | no |
+| `shell` | no |
 | `focus` | no |
 
 ## `space.close`
@@ -60,7 +61,7 @@ Move a space to a position (1 = first).
 
 ## `tab.new`
 
-Make a tab in a space (default: the selected one; name default: none, so it's called by its number) with a terminal in folder (default: the focused terminal's), optionally an agent (argv) and its first message (task); or with a mod as its only pane (`mod`, its `props`: a file, a board). It is shown at once; focus false adds it last in its space and keeps the shown space and the target space's selected tab. With no space open, a person's new tab starts a space (as space.new).
+Make a tab in a space (default: the selected one; name default: none, so it's called by its number) with a terminal in folder (default: the focused terminal's), optionally an agent (argv) and its first message (task); or with a mod as its only pane (`mod`, its `props`: a file, a board); or an ACP agent (`acp: true`, `agent`). It is shown at once; focus false adds it last in its space and keeps the shown space and the target space's selected tab. With no space open, a person's new tab starts a space (as space.new).
 
 | Argument | Required |
 |---|---|
@@ -71,6 +72,9 @@ Make a tab in a space (default: the selected one; name default: none, so it's ca
 | `task` | no |
 | `mod` | no |
 | `props` | no |
+| `acp` | no |
+| `agent` | no |
+| `shell` | no |
 | `focus` | no |
 
 ## `tab.close`
@@ -122,6 +126,7 @@ Split a pane (default: the focused one) "right" or "down" with a new terminal, o
 | `argv` | no |
 | `mod` | no |
 | `props` | no |
+| `shell` | no |
 
 ## `pane.close`
 
@@ -149,6 +154,7 @@ Start a terminal: as a new tab (place "tab", default), or "right"/"down" of the 
 | `folder` | no |
 | `place` | no |
 | `name` | no |
+| `shell` | no |
 
 ## `terminal.keep`
 
@@ -438,6 +444,24 @@ Set an agent's status manually ("idle", "working", "blocked", "done"), or "auto"
 |---|---|
 | `status` | yes |
 | `terminal` | no |
+
+## `agent.handoff`
+
+Hand off, fork, open a side-chat, or merge context from an agent or CLI session into a new or existing session (opens the Handoff dialog when neither preset nor into is given).
+
+| Argument | Required |
+|---|---|
+| `source` | no |
+| `preset` | no |
+| `into` | no |
+| `kind` | no |
+| `mode` | no |
+| `prompt` | no |
+| `recent_turns` | no |
+| `max_bytes` | no |
+| `model` | no |
+| `effort` | no |
+| `open` | no |
 
 ## `agent.next`
 

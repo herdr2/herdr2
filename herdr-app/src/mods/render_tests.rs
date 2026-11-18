@@ -392,6 +392,35 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
                         "stderr": ""
                     }))
                 }
+                "hc" | "h2" if first == json!(["inbox", "edit", "--json", "a1", "102", "Updated second prompt"]) => {
+                    calls.borrow_mut().effects.push(("inbox.edit".into(), vec![first.clone()]));
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "address": "a1",
+                            "inbox_len": 2,
+                            "inbox": [
+                                {"id": 101, "text": "First queued prompt", "queued_ms": 1700000000000i64},
+                                {"id": 102, "text": "Updated second prompt", "from": "t1", "queued_ms": 1700000060000i64}
+                            ]
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
+                }
+                "hc" | "h2" if first == json!(["inbox", "rm", "--json", "a1", "101"]) => {
+                    calls.borrow_mut().effects.push(("inbox.rm".into(), vec![first.clone()]));
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "address": "a1",
+                            "inbox_len": 1,
+                            "inbox": [
+                                {"id": 102, "text": "Updated second prompt", "from": "t1", "queued_ms": 1700000060000i64}
+                            ]
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
+                }
                 "hc" | "h2" if first == json!(["interrupt", "--json", "a1"]) => {
                     calls.borrow_mut().interrupted.push("a1".into());
                     Some(json!({"code":0,"stdout":"{\"outcome\":\"stopped\"}","stderr":""}))
@@ -399,6 +428,30 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
                 "hc" | "h2" if first == json!(["interrupt", "--json", "t1"]) => {
                     calls.borrow_mut().interrupted.push("t1".into());
                     Some(json!({"code":0,"stdout":"{\"outcome\":\"stopped\"}","stderr":""}))
+                }
+                "hc" | "h2" if first == json!(["checkpoint", "ls", "--json", "t1"]) => {
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "target": "t1",
+                            "isolation": {"level": "isolated_worktree", "blockers": []},
+                            "checkpoints": [
+                                {"turn": 0, "ts_ms": 1000, "files": []},
+                                {"turn": 1, "prompt": "Fix CLI layout", "ts_ms": 2000, "files": [{"path": "src/main.rs", "added": 2, "deleted": 1}]}
+                            ]
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
+                }
+                "hc" | "h2" if first == json!(["checkpoint", "diff", "--json", "t1", "--to", "1"]) => {
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "turn": 1,
+                            "patch": "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,1 +1,2 @@\n-old\n+new\n+added\n"
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
                 }
                 // The files panel lists a folder with sh: kind and name pairs.
                 "exec" if first == "sh" && a.get(1).map(from_host).and_then(|v| v.get(2).cloned()) == Some(json!("files")) => {
@@ -1559,6 +1612,65 @@ fn acp_capability_popup_opens_anchored_above_trigger_without_warnings(cx: &mut T
 }
 
 #[gpui::test]
+fn acp_peek_renders_and_mutates_queued_inbox_items(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let program = json!({"key":"pi", "name":"Pi", "icon":null, "tint":true, "tile":"#334455", "color":"#aabbcc", "shell":false, "agent":true});
+    let mut values = fixture(true, json!({"terminal":"a1","acp":true,"tab":true,"pane":"p2"}), updates("current", "current"));
+    let inbox = json!([
+        {"id": 101, "text": "First queued prompt", "queued_ms": 1700000000000i64},
+        {"id": 102, "text": "<h2 from=\"t1\">\nSecond queued prompt\n</h2>", "from": "t1", "queued_ms": 1700000060000i64}
+    ]);
+    values.insert("terminals".into(), json!([
+        {"address":"t1","name":"Build","title":"Build","argv":["zsh"],"parent":null,"labels":{},"state":"live","status":"idle","program":program,"cwd":"/fixture/project"},
+        {"address":"a1","name":"Reviewer","title":"Reviewer","argv":["pi"],"parent":"t1","labels":{},"state":"live","status":"working","turn":2,"transcript_seq":4,"inbox_len":2,"inbox":inbox,"report":{"app":"pi"},"program":program,"cwd":"/fixture/project"}
+    ]));
+    values.insert("agents".into(), json!([
+        {"address":"a1","acp":true,"pane":"p2","space":"s1","space_name":"Local","tab":"tab1","tab_index":1,"tab_name":"Reviewer","status":"working","app":"pi","program":program,"title":"Reviewer","seq":1,"focused":true}
+    ]));
+
+    let tree = describe_with_values(cx, &staged, "mods/peek", values.clone(), None).unwrap();
+    assert!(tree.contains("acp-inbox-queue"), "queued inbox container missing: {tree}");
+    assert!(tree.contains("Input queue (2)"), "queue header missing count: {tree}");
+    assert!(tree.contains("First queued prompt"), "first queued item missing: {tree}");
+    assert!(tree.contains("Second queued prompt"), "second queued item missing: {tree}");
+    assert!(tree.contains("Build (t1)"), "friendly sender label missing: {tree}");
+    assert!(tree.contains("acp-inbox-edit-101") && tree.contains("acp-inbox-rm-101"), "edit/remove buttons missing: {tree}");
+    assert!(!tree.contains("<h2"), "raw <h2 envelope leaked into queue UI: {tree}");
+
+    // Inline editor renders for item #102 and saves back via `h2 inbox edit`.
+    let editing_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/peek",
+        values.clone(),
+        Some("const items = this.inboxItemsFor(this.term()); this.startEditInboxItem(items[1], cx);"),
+    ).unwrap();
+    assert!(editing_tree.contains("acp-inbox-editor-102"), "inline editor missing: {editing_tree}");
+    assert!(editing_tree.contains("acp-inbox-save-102") && editing_tree.contains("acp-inbox-cancel-102"), "editor save/cancel buttons missing: {editing_tree}");
+
+    // Saving edit then removing item #101 mutates the rendered queue cleanly.
+    let after_edit = describe_with_values(
+        cx,
+        &staged,
+        "mods/peek",
+        values.clone(),
+        Some("const items = this.inboxItemsFor(this.term()); this.startEditInboxItem(items[1], cx); this.inboxEditInput.set_value('Updated second prompt'); this.saveEditInboxItem(cx);"),
+    ).unwrap();
+    assert!(after_edit.contains("Updated second prompt"), "optimistic/saved edit missing: {after_edit}");
+
+    let after_rm = describe_with_values(
+        cx,
+        &staged,
+        "mods/peek",
+        values,
+        Some("this.removeInboxItem(101, cx);"),
+    ).unwrap();
+    assert!(!after_rm.contains("First queued prompt"), "removed queued item still visible: {after_rm}");
+    assert!(after_rm.contains("Input queue (1)"), "remaining count should drop to 1: {after_rm}");
+}
+
+#[gpui::test]
 fn brand_and_panel_buttons_render_by_default(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);
     let staged = Staged::new();
@@ -1570,6 +1682,7 @@ fn brand_and_panel_buttons_render_by_default(cx: &mut TestAppContext) {
     let tabs = describe(cx, &staged, "mods/tabs", false, props(), updates("current", "current"), None).unwrap();
     assert!(tabs.contains("panel-files"), "Files button missing in top-right tab bar: {tabs}");
     assert!(tabs.contains("panel-changes"), "Changes button missing in top-right tab bar: {tabs}");
+    assert!(tabs.contains("panel-checkpoints"), "Checkpoints button missing in top-right tab bar: {tabs}");
 
     let calls = Rc::new(RefCell::new(Calls::default()));
     let policy = Policy::new()
@@ -1593,6 +1706,7 @@ fn brand_and_panel_buttons_render_by_default(cx: &mut TestAppContext) {
     let settings = describe(cx, &staged, "frame/settings", true, json!({"section":"look"}), updates("current", "current"), None).unwrap();
     assert!(settings.contains("st-panel-files"), "Files panel toggle missing in Settings Look: {settings}");
     assert!(settings.contains("st-panel-changes"), "Changes panel toggle missing in Settings Look: {settings}");
+    assert!(settings.contains("st-panel-checkpoints"), "Checkpoints panel toggle missing in Settings Look: {settings}");
 }
 
 #[gpui::test]

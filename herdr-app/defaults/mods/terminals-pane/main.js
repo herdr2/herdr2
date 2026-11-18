@@ -92,6 +92,10 @@ export default class TerminalsPane extends View {
     const isTermAgent = !isAcp && Boolean(p.structured || g?.agent);
     const isAgent = isAcp || isTermAgent;
     const term = p.terminal ? terminals().find((x) => x.address === p.terminal) : null;
+    const lineageParent = term?.lineage?.parent || null;
+    const showHandoffBtns = Boolean(p.terminal) && p.status !== "ended" && (isAgent || Boolean(lineageParent));
+    const accent = t.accent ?? "#3b82f6";
+    const alpha = (hex, a) => (typeof hex === "string" && /^#[0-9a-fA-F]{6}$/.test(hex) ? hex + a : null);
     const elapsed = isAgent
       ? this.agentElapsed(
           p.terminal || pane,
@@ -152,7 +156,114 @@ export default class TerminalsPane extends View {
           .text_color("#a9adb3")
           .child(tr("CLI", "终端")),
       ))
+      .when(Boolean(lineageParent), (el) =>
+        el.child(
+          div()
+            .id(`tm-lin-${pane}`)
+            .flex_none()
+            .px(5)
+            .py(1)
+            .rounded(4)
+            .bg("#252628")
+            .border_1()
+            .border_color("#383b40")
+            .text_size(11)
+            .text_color(accent)
+            .cursor_pointer()
+            .hover((s) => s.bg("#303338").text_color("#ffffff"))
+            .tooltip(tr(`Focus parent session ${lineageParent}`, `跳转到来源父会话 ${lineageParent}`))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              run("agent.focus", { terminal: lineageParent });
+            })
+            .child(`↳ ${lineageParent}`),
+        ),
+      )
       .child(div().flex_1().truncate().text_color("#8b8f95").child(dir))
+      .when(showHandoffBtns && Boolean(lineageParent), (el) =>
+        el.child(
+          h_flex()
+            .id(`tm-merge-${pane}`)
+            .flex_none()
+            .h(20)
+            .px(6)
+            .gap(4)
+            .items_center()
+            .rounded(5)
+            .bg(alpha(accent, "22") ?? "#252628")
+            .border_1()
+            .border_color(alpha(accent, "66") ?? "#383b40")
+            .text_size(11)
+            .font_medium()
+            .text_color(accent)
+            .cursor_pointer()
+            .hover((s) => s.bg(alpha(accent, "33") ?? "#303338"))
+            .tooltip(tr(`Merge conclusions back into ${lineageParent}`, `一键合回 ${lineageParent}`))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              run("agent.handoff", { source: p.terminal, into: lineageParent, kind: "merge-back" });
+            })
+            .child(svg("mods/peek/corner-up-right.svg").size(11).flex_none().text_color(accent))
+            .child(tr("Merge", "合回")),
+        ),
+      )
+      .when(showHandoffBtns, (el) =>
+        el
+          .child(
+            h_flex()
+              .id(`tm-side-${pane}`)
+              .flex_none()
+              .h(20)
+              .px(6)
+              .gap(4)
+              .items_center()
+              .rounded(5)
+              .bg("#252628")
+              .border_1()
+              .border_color("#383b40")
+              .text_size(11)
+              .font_medium()
+              .text_color("#c4c7cc")
+              .cursor_pointer()
+              .hover((s) => s.bg("#303338").text_color("#ffffff"))
+              .tooltip(tr("Open isolated side-chat with current context", "开启旁路讨论（不污染主会话）"))
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+              .on_click((_e, cx) => {
+                cx.stop_propagation();
+                run("agent.handoff", { source: p.terminal, kind: "side-chat" });
+              })
+              .child(svg("mods/peek/messages-square.svg").size(11).flex_none())
+              .child(tr("Side Chat", "旁路讨论")),
+          )
+          .child(
+            h_flex()
+              .id(`tm-ho-${pane}`)
+              .flex_none()
+              .h(20)
+              .px(6)
+              .gap(4)
+              .items_center()
+              .rounded(5)
+              .bg("#252628")
+              .border_1()
+              .border_color("#383b40")
+              .text_size(11)
+              .font_medium()
+              .text_color("#c4c7cc")
+              .cursor_pointer()
+              .hover((s) => s.bg("#303338").text_color("#ffffff"))
+              .tooltip(tr("Context handoff / Fork", "上下文接力 / 分支探索"))
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+              .on_click((_e, cx) => {
+                cx.stop_propagation();
+                run("agent.handoff", { source: p.terminal, kind: "handoff" });
+              })
+              .child(svg("mods/workspace-chrome/git-branch.svg").size(11).flex_none())
+              .child(tr("Handoff", "接力")),
+          ),
+      )
       .when(Boolean(elapsed), (el) => el.child(
         h_flex()
           .id(`tm-time-${pane}`)

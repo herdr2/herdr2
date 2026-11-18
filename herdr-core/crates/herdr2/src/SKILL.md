@@ -49,11 +49,15 @@ If your host supports running shell commands in the background, do not block you
 h2 ls                                   # list live agents (--all includes finished)
 h2 get worker                           # full JSON/summary agent state
 h2 send worker "Also inspect error.rs"  # queue prompt into serial ACP inbox
+h2 inbox ls|edit|rm worker ...          # inspect, edit, or remove queued prompts before turn starts
 h2 send worker --steer "Stop that; inspect foo.rs instead" # cancel active turn & deliver next
 h2 read worker                          # rendered JSONL transcript
 h2 read worker --last                   # final assistant message from latest turn
 h2 read worker --lines 50               # trailing 50 rendered transcript lines
+h2 read worker --from-turn 2 --to-turn 5 # slice specific turn range for handoff lookup
 h2 read worker --wait --last            # wait for current turn to settle, then read --last
+h2 handoff worker --kind handoff --preset codex --prompt "Finish tests" # cross-provider context handoff
+h2 handoff worker --kind side-chat --into main --prompt "Merge back"    # merge/deliver context into existing target
 h2 interrupt worker                     # send ACP session/cancel without killing process
 h2 kill worker                          # terminate an ACP agent process
 h2 rm worker                            # remove a finished agent record
@@ -99,6 +103,7 @@ Use the `h2` CLI directly together with your host's shell / background command r
 - `h2 file read|write|edit [--on box] <path>`: read lines (`--offset`/`--limit`), atomically write stdin, or exact-match replace (`--old`/`--new`).
 - `h2 machine add|ls|login|update|rename|rm`: orchestrate agents across SSH or custom `--via` hosts (`box/a7` addresses).
 - `h2 server start|stop|status|restart`, `h2 update`, `h2 connect`, `h2 schema`: manage daemon, self-updates, stdio JSON-RPC bridge, and OpenRPC schema.
+- `h2 checkpoint ls|snap|diff|rollback <target>`: inspect hidden Git ref snapshots (`refs/herdr2/checkpoints/<session>/<addr>/<turn>`), view pure authored turn diffs (`--from`/`--to`), or roll back conversation + files (`--to <turn> [--no-files] [--confirm]`).
 
 ## Persistence, recovery, and safety rules
 

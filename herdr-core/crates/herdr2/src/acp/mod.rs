@@ -26,10 +26,25 @@ use transport::{CallError, ChildWaiter, Inbound, Transport};
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(90);
 const TURN_TIMEOUT: Duration = Duration::from_secs(24 * 60 * 60);
 
+static NEXT_INBOX_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 #[derive(Clone, Debug)]
 pub struct QueuedPrompt {
+    pub id: u64,
     pub text: String,
     pub from: Option<String>,
+    pub queued_ms: u64,
+}
+
+impl QueuedPrompt {
+    pub fn new(text: String, from: Option<String>) -> Self {
+        Self {
+            id: NEXT_INBOX_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            text,
+            from,
+            queued_ms: crate::runtime::now_ms(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -49,9 +64,12 @@ pub struct PendingPermission {
     pub turn: u64,
 }
 
+static NEXT_SESSION_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub struct SessionHandle {
     pub cmd_tx: mpsc::UnboundedSender<SessionCommand>,
     pub transport: Transport,
+    pub token: u64,
 }
 
 pub struct SpawnSpec {
@@ -836,14 +854,16 @@ async fn load_session(
 /// Attaches the background actor driving serial ACP turns, updates, and permissions.
 pub fn spawn_actor(core: Arc<Core>, id: u32, started: StartedSession) -> SessionHandle {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
-    let handle = SessionHandle { cmd_tx: cmd_tx.clone(), transport: started.transport.clone() };
-    tokio::spawn(run_actor(core, id, started, cmd_rx));
+    let token = NEXT_SESSION_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let handle = SessionHandle { cmd_tx: cmd_tx.clone(), transport: started.transport.clone(), token };
+    tokio::spawn(run_actor(core, id, token, started, cmd_rx));
     handle
 }
 
 async fn run_actor(
     core: Arc<Core>,
     id: u32,
+    token: u64,
     mut started: StartedSession,
     mut cmd_rx: mpsc::UnboundedReceiver<SessionCommand>,
 ) {
@@ -855,10 +875,13 @@ async fn run_actor(
 
     loop {
         if let Some(prompt) = pop_next_prompt(&core, id) {
+            let expected_turn = current_turn(&core, id);
+            let clean_prompt = crate::transcript::strip_h2_envelope(&prompt.text);
+            let wire_text = prepare_acp_prompt(&core, id, expected_turn, &prompt.text, &clean_prompt).await;
             let turn_num = begin_turn(&core, id, &prompt);
             let req = SessionPromptParams {
                 session_id: session_id.clone(),
-                prompt: vec![ContentBlock::Text { text: prompt.text }],
+                prompt: vec![ContentBlock::Text { text: wire_text }],
             };
             let prompt_fut = transport.request("session/prompt", &req, TURN_TIMEOUT);
             tokio::pin!(prompt_fut);
@@ -908,7 +931,7 @@ async fn run_actor(
                         }
                     },
                     exited = &mut exit_fut => {
-                        finish_exit(&core, id, exited);
+                        finish_exit(&core, id, token, exited);
                         return;
                     }
                 }
@@ -918,6 +941,28 @@ async fn run_actor(
                 break;
             }
             if let Some(res) = outcome {
+                // Drain buffered inbound updates delivered alongside prompt completion before snapshotting.
+                while let Ok(msg) = started.inbound_rx.try_recv() {
+                    match msg {
+                        Inbound::Update(params) => handle_update(&core, id, turn_num, &params),
+                        Inbound::Stderr(line) => {
+                            record_entry(&core, id, Entry::Stderr { text: line, ts_ms: crate::runtime::now_ms() });
+                        }
+                        _ => {}
+                    }
+                }
+                if session_is_current(&core, id, token) {
+                    let _ = crate::checkpoint::capture_target_checkpoint(
+                        &core,
+                        crate::runtime::TargetKey::Agent(id),
+                        Some(turn_num),
+                        Some(clean_prompt),
+                        None,
+                        true,
+                        true,
+                    )
+                    .await;
+                }
                 finish_turn(&core, id, turn_num, res);
             }
             continue;
@@ -960,23 +1005,336 @@ async fn run_actor(
                 }
             },
             exited = &mut exit_fut => {
-                finish_exit(&core, id, exited);
+                finish_exit(&core, id, token, exited);
                 return;
             }
         }
     }
 
     let exited = exit_fut.await;
-    finish_exit(&core, id, exited);
+    finish_exit(&core, id, token, exited);
 }
 
-fn finish_exit(core: &Arc<Core>, id: u32, exited: Option<std::io::Result<std::process::ExitStatus>>) {
+fn session_is_current(core: &Core, id: u32, token: u64) -> bool {
+    core.lock().sessions.get(&id).is_some_and(|h| h.token == token)
+}
+
+async fn prepare_acp_prompt(
+    core: &Arc<Core>,
+    id: u32,
+    turn_num: u64,
+    raw_prompt: &str,
+    clean_prompt: &str,
+) -> String {
+    let (needs_baseline, handoff) = {
+        let mut st = core.lock();
+        let Some(addr) = st.reg.agents.get(&id).map(|a| a.address.clone()) else {
+            return raw_prompt.to_string();
+        };
+        let mut tc = core.target_checkpoints(&mut st, &addr);
+        tc.cli_kind = Some("acp".into());
+        tc.active_turn_prompt = Some(clean_prompt.to_string());
+        tc.active_turn_num = Some(turn_num);
+        tc.pending_rollback_turn = None;
+        let handoff = tc.pending_handoff.take();
+        let needs_baseline = !tc.checkpoints.iter().any(|c| c.turn == 0);
+        core.save_target_checkpoints(&mut st, tc);
+        (needs_baseline, handoff)
+    };
+
+    if needs_baseline {
+        let _ = crate::checkpoint::capture_target_checkpoint(
+            core,
+            crate::runtime::TargetKey::Agent(id),
+            Some(0),
+            None,
+            None,
+            true,
+            false,
+        )
+        .await;
+    }
+
+    match handoff {
+        Some(h) if !h.is_empty() => format!("{h}\n\n{raw_prompt}"),
+        _ => raw_prompt.to_string(),
+    }
+}
+
+fn finish_exit(core: &Arc<Core>, id: u32, token: u64, exited: Option<std::io::Result<std::process::ExitStatus>>) {
     let exit = match exited {
         Some(Ok(status)) => Exit { code: status.code(), signal: platform::exit_signal(&status) },
         Some(Err(_)) | None => Exit { code: None, signal: None },
     };
     let mut st = core.lock();
+    if st.sessions.get(&id).is_some_and(|h| h.token != token) {
+        return;
+    }
     core.finish(&mut st, id, exit);
+}
+
+/// Rolls back a headless ACP `a*` agent by rebuilding a clean session first, optionally restoring
+/// workspace files to `to_turn`, and rewinding the transcript with a bounded portable handoff.
+pub async fn rollback_acp_agent(
+    core: &Arc<Core>,
+    id: u32,
+    to_turn: u64,
+    restore_files: bool,
+    confirm: bool,
+) -> Result<crate::checkpoint::CheckpointRollbackResult, RpcError> {
+        let (
+        addr,
+        cwd,
+        argv,
+        restart_env,
+        system_prompt,
+        model,
+        mode,
+        overrides,
+        inject_mcp,
+        skip_perms,
+        current_turn,
+        target_ref,
+        prev_acp_sid,
+        can_load,
+        agent_info,
+    ) = {
+        let mut st = core.lock();
+        let Some(a) = st.reg.agents.get(&id).cloned() else {
+            return Err(RpcError::new("not_found", format!("agent id {id} not found"), "run `h2 list` to inspect active agents"));
+        };
+        if !a.is_live() {
+            return Err(RpcError::new(
+                "unavailable",
+                format!("{} has finished; only live agents can roll back", a.address),
+                "start a new agent or inspect its existing checkpoints",
+            ));
+        }
+        if a.status.as_ref().is_some_and(|s| s.state == "working") {
+            return Err(RpcError::new(
+                "busy",
+                format!("{} is currently working; interrupt it before rolling back", a.address),
+                format!("run `h2 interrupt {}` first", a.address),
+            ));
+        }
+        let tc = core.target_checkpoints(&mut st, &a.address);
+        let max_ckpt_turn = tc.checkpoints.iter().map(|c| c.turn).max().unwrap_or(0);
+        if to_turn > a.turn.max(max_ckpt_turn) {
+            return Err(RpcError::invalid_params(format!(
+                "cannot roll back {} to turn {to_turn} beyond turn {}",
+                a.address,
+                a.turn.max(max_ckpt_turn)
+            )));
+        }
+        let target_ref = tc.checkpoints.iter().find(|c| c.turn == to_turn).map(|c| c.ref_name.clone());
+        let skip_perms = a.permission_mode == permissions::PermissionMode::ApproveAll;
+        (
+            a.address,
+            a.cwd,
+            a.argv,
+            a.restart_env,
+            a.system_prompt,
+            a.model,
+            a.mode,
+            a.config_overrides,
+            a.inject_mcp,
+            skip_perms,
+            a.turn,
+            target_ref,
+            a.acp_session_id,
+            a.can_load_session,
+            a.agent_info,
+        )
+    };
+
+    let repo = crate::checkpoint::probe_repo(std::path::Path::new(&cwd));
+    if restore_files {
+        let Some(ref r) = repo else {
+            return Err(RpcError::invalid_params(format!("workspace `{cwd}` is not a Git repository; pass --no-files")));
+        };
+        if target_ref.is_none() {
+            return Err(RpcError::invalid_params(format!("no checkpoint found for {} at turn {to_turn}", addr)));
+        }
+        let live_snapshot = {
+            let st = core.lock();
+            crate::checkpoint_safety::snapshot_live_targets(&st)
+        };
+        crate::checkpoint_safety::enforce_restore_safety(&addr, r, &live_snapshot, confirm)?;
+    }
+
+    // Attempt native Claude/Codex JSONL fork when rolling back to `to_turn > 0` so `session/load`
+    // restores exact provider session memory (falling back cleanly to fresh session + handoff otherwise).
+    let forked_sid: Option<String> = if to_turn > 0
+        && let Some(ref prev_sid) = prev_acp_sid
+    {
+        let is_claude = presets::is_claude_agent(agent_info.as_deref(), &argv);
+        let is_codex = !is_claude
+            && (argv.first().is_some_and(|s| s.to_ascii_lowercase().contains("codex"))
+                || agent_info.as_deref().is_some_and(|s| s.to_ascii_lowercase().contains("codex")));
+        if is_claude || is_codex {
+            let cwd_c = cwd.clone();
+            let sid_c = prev_sid.clone();
+            let fork_uuid = crate::checkpoint::random_uuid_v4();
+            let fork_uuid_c = fork_uuid.clone();
+            let ok = tokio::task::spawn_blocking(move || -> bool {
+                if is_claude {
+                    crate::pty_adapters::find_claude_session_file(&cwd_c, &sid_c)
+                        .and_then(|src| crate::pty_adapters::fork_claude_jsonl(&src, to_turn, &fork_uuid_c).ok())
+                        .is_some()
+                } else {
+                    crate::pty_adapters::find_codex_rollout_by_sid(&cwd_c, &sid_c)
+                        .and_then(|src| crate::pty_adapters::fork_codex_jsonl(&src, to_turn, &fork_uuid_c).ok())
+                        .is_some()
+                }
+            })
+            .await
+            .unwrap_or(false);
+            ok.then_some(fork_uuid)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Session-first rebuild: spawn a clean ACP session BEFORE mutating disk files or history.
+    let base_env = platform::program_env().await;
+    let env = crate::api::child_env(base_env, restart_env);
+    let (env, scope) = crate::api::agent_env(core, id, &cwd, env);
+    let mcp_exe = crate::client::exe_path().map(|p| p.display().to_string()).unwrap_or_else(|| "herdr2".into());
+    let spec = SpawnSpec {
+        address: addr.clone(),
+        argv,
+        env,
+        cwd: cwd.clone(),
+        resume_session_id: forked_sid.clone(),
+        can_load_session: can_load || forked_sid.is_some(),
+        system_prompt,
+        model,
+        mode,
+        dangerously_skip_permissions: skip_perms,
+        config_overrides: overrides,
+        inject_mcp,
+        mcp_exe,
+        socket: core.paths.socket.display().to_string(),
+    };
+    let started = spawn_session(spec).await?;
+
+    let slug = core.session_slug();
+    if let Some(ref r) = repo {
+        let _guard = core.repo_ckpt_lock(&r.toplevel).lock_owned().await;
+        let r_clone = r.clone();
+        let ref_to_restore = target_ref.clone();
+        let cwd_path = std::path::PathBuf::from(&cwd);
+        let addr_clone = addr.clone();
+        let slug_clone = slug.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), String> {
+            if restore_files
+                && let Some(ref ref_name) = ref_to_restore
+            {
+                crate::checkpoint::restore_checkpoint(&r_clone, ref_name, Some(&cwd_path))?;
+            }
+            let _ = crate::checkpoint::delete_checkpoint_refs_after(&r_clone, &slug_clone, &addr_clone, to_turn);
+            Ok(())
+        })
+        .await
+        .map_err(|e| RpcError::internal(format!("rollback task failed: {e}")))?
+        .map_err(RpcError::internal)?;
+    }
+
+    let (old_handle, restored_prompt) = {
+        let mut st = core.lock();
+        if !st.reg.agents.get(&id).is_some_and(|a| a.is_live()) {
+            started.transport.kill();
+            return Err(RpcError::new("unavailable", format!("{addr} exited during rollback"), ""));
+        }
+
+        let old_handle = st.sessions.remove(&id);
+        st.inboxes.remove(&id);
+        st.pending_perms.remove(&id);
+
+        let acp_sid = started.session_id.clone();
+        let used_native_load = forked_sid.as_deref() == Some(acp_sid.as_str());
+        let can_load = started.can_load_session;
+        let agent_info = started.agent_info.clone();
+        let config_options = started.config_options.clone();
+        let context_usage = started.context_usage.clone();
+
+        let new_handle = spawn_actor(Arc::clone(core), id, started);
+        let new_pid = new_handle.transport.pid();
+        st.sessions.insert(id, new_handle);
+
+        let tr_path = crate::transcript::path(&core.paths.state, &addr);
+        let mut tr = st
+            .transcripts
+            .remove(&id)
+            .unwrap_or_else(|| crate::transcript::load(&core.paths.state, &addr).unwrap_or_default());
+        let handoff = if to_turn > 0 && !used_native_load {
+            crate::transcript::build_portable_handoff(tr.entries(), to_turn, 24 * 1024)
+        } else {
+            None
+        };
+        let restored_prompt = tr.rewind_to_turn(&tr_path, to_turn, restore_files, crate::runtime::now_ms());
+        st.transcripts.insert(id, tr);
+
+        let mut tc = core.target_checkpoints(&mut st, &addr);
+        tc.cli_kind = Some("acp".into());
+        tc.pending_handoff = handoff;
+        tc.pending_rollback_turn = if to_turn == 0 { None } else { Some(to_turn) };
+        tc.active_turn_prompt = None;
+        tc.active_turn_num = None;
+        tc.checkpoints.retain(|c| c.turn <= to_turn);
+        core.save_target_checkpoints(&mut st, tc);
+
+        if let Some(a) = st.reg.agents.get_mut(&id) {
+            a.pid = new_pid;
+            a.scope = Some(scope);
+            a.acp_session_id = Some(acp_sid);
+            a.can_load_session = can_load;
+            a.config_options = config_options;
+            if let Some(info) = agent_info {
+                a.agent_info = Some(info);
+            }
+            if let Some(usage) = context_usage {
+                a.context_usage = Some(usage);
+            }
+            a.inbox_len = 0;
+            a.inbox.clear();
+            a.pending_permission = None;
+            a.program_started_ms = Some(crate::runtime::now_ms());
+            sync_config_to_agent(a);
+            let _ = crate::status::apply(a, &StatusReport::root("idle"));
+            a.turn = to_turn.min(current_turn.max(to_turn));
+        }
+
+        let public = serde_json::to_value(crate::agents::Public(st.reg.agents[&id].clone())).unwrap_or_default();
+        let rewind_entry = st.transcripts.get(&id).and_then(|t| t.entries().last()).cloned();
+        core.emit(&mut st, "restarted", id, public);
+        if let Some(entry) = rewind_entry {
+            core.emit(&mut st, "transcript", id, json!({ "entry": entry }));
+        }
+        core.emit(
+            &mut st,
+            "checkpoint",
+            id,
+            json!({ "rewound_to": to_turn, "restored_files": restore_files }),
+        );
+        core.save(&st);
+        core.changed.notify_waiters();
+        (old_handle, restored_prompt)
+    };
+
+    if let Some(old) = old_handle {
+        old.transport.kill();
+    }
+
+    Ok(crate::checkpoint::CheckpointRollbackResult {
+        target: addr,
+        turn: to_turn,
+        restored_files: restore_files,
+        rewound_session: true,
+        restored_prompt,
+    })
 }
 
 fn pop_next_prompt(core: &Core, id: u32) -> Option<QueuedPrompt> {
@@ -985,9 +1343,12 @@ fn pop_next_prompt(core: &Core, id: u32) -> Option<QueuedPrompt> {
         return None;
     }
     let prompt = st.inboxes.get_mut(&id).and_then(|q| q.pop_front());
-    let len = st.inboxes.get(&id).map_or(0, std::collections::VecDeque::len);
-    if let Some(a) = st.reg.agents.get_mut(&id) {
-        a.inbox_len = len;
+    if st.inboxes.get(&id).is_some_and(std::collections::VecDeque::is_empty) {
+        st.inboxes.remove(&id);
+    }
+    if prompt.is_some() {
+        core.sync_inbox(&mut st, id, true);
+        core.save_soon();
     }
     prompt
 }
@@ -995,10 +1356,8 @@ fn pop_next_prompt(core: &Core, id: u32) -> Option<QueuedPrompt> {
 fn push_front_prompt(core: &Core, id: u32, prompt: QueuedPrompt) {
     let mut st = core.lock();
     st.inboxes.entry(id).or_default().push_front(prompt);
-    let len = st.inboxes.get(&id).map_or(0, std::collections::VecDeque::len);
-    if let Some(a) = st.reg.agents.get_mut(&id) {
-        a.inbox_len = len;
-    }
+    core.sync_inbox(&mut st, id, true);
+    core.save_soon();
 }
 
 fn current_turn(core: &Core, id: u32) -> u64 {

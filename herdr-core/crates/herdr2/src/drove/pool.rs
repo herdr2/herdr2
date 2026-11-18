@@ -1,7 +1,7 @@
 //! Native `herdr2` headless ACP worker pool lifecycle (`a*` sessions, warm reuse, transcripts, kill sync).
 
 use super::notify::notify_coordinator;
-use super::protocol::build_task_prompt;
+use super::protocol::{PriorAttemptHandover, build_task_prompt_with_handover};
 use super::router::RouteDecision;
 use super::store::NewDaemonEvent;
 use super::types::*;
@@ -335,6 +335,8 @@ pub async fn dispatch_agent_task(
     };
 
     let baseline = super::roles::capture_dirty_baseline(&effective_cwd);
+    let (prior_handover, forked_from_agent) =
+        build_attempt_handover(core, retry_of.as_deref(), &effective_cwd).await;
 
     if let Some((mut warm, aid)) = live_warm {
         // Switch model/context/effort/fast dynamically if needed.
@@ -376,6 +378,9 @@ pub async fn dispatch_agent_task(
         warm.effort = Some(decision.effort);
         warm.fast = (decision.fast || decision.agent == "codex").then_some(decision.fast);
         warm.totals.attempts += 1;
+        if let Some(src_agent) = &forked_from_agent {
+            warm.forked_from = Some(src_agent.clone());
+        }
         update_fingerprint(&mut warm.fingerprint, task);
         core.drove.store.update_worker(&warm.id, |w| *w = warm.clone());
 
@@ -404,11 +409,11 @@ pub async fn dispatch_agent_task(
                 reason: Some(decision.reason.clone()),
                 source: preserved_source.clone(),
                 role: Some(decision.role.clone()),
-                fork: None,
+                fork: forked_from_agent.clone(),
             });
         });
 
-        let prompt = build_task_prompt(
+        let prompt = build_task_prompt_with_handover(
             run,
             task,
             &attempt,
@@ -416,6 +421,7 @@ pub async fn dispatch_agent_task(
             &decision.role_config,
             &dep_tasks,
             hint.as_deref(),
+            prior_handover.as_ref(),
         );
         if let Err(e) = core.send(aid, &prompt, false, None, Some("drove")).await {
             let err_msg = e.message;
@@ -478,7 +484,7 @@ pub async fn dispatch_agent_task(
         created_at: now.clone(),
         last_active_at: now,
         role: Some(decision.role.clone()),
-        forked_from: None,
+        forked_from: forked_from_agent.clone(),
         protocol_gen: Some(1),
         read_only_dir: None,
     };
@@ -509,7 +515,7 @@ pub async fn dispatch_agent_task(
             reason: Some(decision.reason.clone()),
             source: preserved_source.clone(),
             role: Some(decision.role.clone()),
-            fork: None,
+            fork: forked_from_agent.clone(),
         });
     });
 
@@ -572,7 +578,7 @@ pub async fn dispatch_agent_task(
         cost: None,
     });
 
-    let prompt = build_task_prompt(
+    let prompt = build_task_prompt_with_handover(
         run,
         task,
         &attempt,
@@ -580,6 +586,7 @@ pub async fn dispatch_agent_task(
         &decision.role_config,
         &dep_tasks,
         hint.as_deref(),
+        prior_handover.as_ref(),
     );
     if let Err(e) = core.send(spawned.agent_id, &prompt, false, None, Some("drove")).await {
         let err_msg = e.message;
@@ -1055,6 +1062,82 @@ pub(super) async fn apply_warm_config(core: &Arc<Core>, aid: u32, cfg_id: &str, 
             core.save(&st);
         }
     }
+}
+
+async fn build_attempt_handover(
+    core: &Arc<Core>,
+    retry_of: Option<&str>,
+    effective_cwd: &str,
+) -> (Option<PriorAttemptHandover>, Option<String>) {
+    let Some(prev_id) = retry_of.map(str::trim).filter(|s| !s.is_empty()) else {
+        return (None, None);
+    };
+    let Some(prev) = core.drove.store.get_attempt(prev_id) else {
+        return (None, None);
+    };
+    let prev_worker = core.drove.store.get_worker(&prev.worker_id);
+    let forked_from = prev_worker.as_ref().and_then(|w| w.h2_agent.clone());
+
+    let context_markdown = forked_from.as_deref().and_then(|addr| {
+        let aid = crate::agents::parse_id(addr)?;
+        let mut entries = {
+            let st = core.lock();
+            st.transcripts.get(&aid).map(|t| t.entries().to_vec())
+        }?;
+        entries.retain(|e| !matches!(e, Entry::User { .. }));
+        if entries.is_empty() {
+            return None;
+        }
+        let max_turn = entries.iter().filter_map(Entry::turn).max().unwrap_or(0);
+        let from_turn = (max_turn > 4).then_some(max_turn - 3);
+        let pkg = crate::handoff::build_handoff_package(&crate::handoff::HandoffBuildInput {
+            kind: crate::handoff::LineageKind::Handoff,
+            source_address: addr,
+            source_provider: Some(&prev.agent),
+            source_session_id: None,
+            source_model: prev.model.as_deref(),
+            cwd: None,
+            entries: &entries,
+            from_turn,
+            to_turn: None,
+            max_bytes: 12 * 1024,
+            note: None,
+        });
+        (!pkg.markdown.trim().is_empty()).then_some(pkg.markdown)
+    });
+
+    let git_status = tokio::process::Command::new("git")
+        .args(["-C", effective_cwd, "status", "--short", "--untracked-files=normal"])
+        .output()
+        .await
+        .ok()
+        .filter(|out| out.status.success())
+        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+        .filter(|s| !s.trim().is_empty());
+
+    let failure_reason = prev
+        .failure
+        .as_ref()
+        .map(|f| format!("{:?}: {}", f.kind, f.message))
+        .or_else(|| {
+            prev.result
+                .as_ref()
+                .and_then(|r| r.blockers.as_ref())
+                .filter(|b| !b.is_empty())
+                .map(|b| b.join("; "))
+        });
+
+    (
+        Some(PriorAttemptHandover {
+            attempt_id: prev.id,
+            agent: prev.agent,
+            model: prev.model,
+            failure_reason,
+            context_markdown,
+            git_status,
+        }),
+        forked_from,
+    )
 }
 
 fn build_attempt_record(

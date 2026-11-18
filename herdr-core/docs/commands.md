@@ -36,6 +36,10 @@ Communicate & control
   interrupt <a|t>             send ACP `session/cancel` or PTY interrupt (Esc / Ctrl-C)
   wait <a|t>                  wait until not `working` (--output X, --children any|all)
   put <a|t> <file>            stage a file beside agent or terminal, print path
+  handoff <a|t> [--kind K] [--preset P] [--pty] [--into T] [--prompt TEXT]
+                              hand off, fork, or merge session context across agents
+  checkpoint ls|snap|diff|rollback <a|t>
+                              hidden Git ref snapshots, pure turn diffs, and dual rollback
 
 Non-agent & files
   exec [--on m] <cmd>         run non-agent command directly; exact stdout/stderr & exit code
@@ -95,6 +99,91 @@ Options:
       --observe            Watch only: never type or resize
       --history <HISTORY>  Scrollback lines to show first (main screen only) [default: 0]
   -h, --help               Print help
+```
+
+## h2 checkpoint
+
+```text
+Hidden Git ref checkpoints, pure turn diffs, and session/workspace rollback (`ls`, `snap`, `diff`, `rollback`)
+
+Usage: h2 checkpoint [OPTIONS] <COMMAND>
+
+Commands:
+  ls        List hidden Git ref checkpoints and workspace isolation state
+  snap      Manually capture a checkpoint for an agent or terminal (defaults to current pane/agent)
+  diff      Show the pure authored diff between two checkpoints
+  rollback  Roll back session state (and optionally workspace files) to an earlier turn
+  help      Print this message or the help of the given subcommand(s)
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h2 checkpoint diff
+
+```text
+Show the pure authored diff between two checkpoints
+
+Usage: h2 checkpoint diff [OPTIONS] <TARGET>
+
+Arguments:
+  <TARGET>  Agent (`a1`), terminal (`t1`), remote (`machine/t1`), or unique name
+
+Options:
+      --from <FROM>  Starting checkpoint turn (defaults to highest snapshot before `to`)
+      --json         JSON output even in a terminal
+      --to <TO>      Ending checkpoint turn (defaults to latest checkpoint)
+  -h, --help         Print help
+```
+
+## h2 checkpoint ls
+
+```text
+List hidden Git ref checkpoints and workspace isolation state
+
+Usage: h2 checkpoint ls [OPTIONS] <TARGET>
+
+Arguments:
+  <TARGET>  Agent (`a1`), terminal (`t1`), remote (`machine/t1`), or unique name
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h2 checkpoint rollback
+
+```text
+Roll back session state (and optionally workspace files) to an earlier turn
+
+Usage: h2 checkpoint rollback [OPTIONS] --to <TO> <TARGET>
+
+Arguments:
+  <TARGET>  Agent (`a1`), terminal (`t1`), remote (`machine/t1`), or unique name
+
+Options:
+      --json      JSON output even in a terminal
+      --to <TO>   Target checkpoint turn (`0` = baseline before turn 1)
+      --no-files  Rewind conversation memory only; keep current workspace files intact
+      --confirm   Confirm destructive file restore on a main checkout or with co-located idle shells
+  -h, --help      Print help
+```
+
+## h2 checkpoint snap
+
+```text
+Manually capture a checkpoint for an agent or terminal (defaults to current pane/agent)
+
+Usage: h2 checkpoint snap [OPTIONS] [TARGET]
+
+Arguments:
+  [TARGET]  Agent (`a1`), terminal (`t1`), remote (`machine/t1`), or unique name
+
+Options:
+      --json           JSON output even in a terminal
+      --label <LABEL>  Optional bookmark label recorded alongside this checkpoint
+  -h, --help           Print help
 ```
 
 ## h2 config
@@ -459,16 +548,19 @@ Arguments:
   <TASK>  
 
 Options:
-      --hint <HINT>      
-      --json             JSON output even in a terminal
-      --role <ROLE>      
-      --agent <AGENT>    
-      --model <MODEL>    
-      --effort <EFFORT>  
-      --fresh            
-      --run <RUN>        
-      --on <MACHINE>     
-  -h, --help             Print help
+      --hint <HINT>                  
+      --json                         JSON output even in a terminal
+      --role <ROLE>                  
+      --agent <AGENT>                
+      --model <MODEL>                
+      --effort <EFFORT>              
+      --review-agent <REVIEW_AGENT>  
+      --review-model <REVIEW_MODEL>  
+      --no-review                    
+      --fresh                        
+      --run <RUN>                    
+      --on <MACHINE>                 
+  -h, --help                         Print help
 ```
 
 ## h2 drove route
@@ -856,6 +948,83 @@ Options:
   -h, --help  Print help
 ```
 
+## h2 handoff
+
+```text
+Hand off, fork, open a side chat, or merge back context across ACP/PTY agents
+
+Usage: h2 handoff [OPTIONS] <SOURCE> [ARGV]...
+
+Arguments:
+  <SOURCE>
+          Source agent or terminal (`a1`, `t1`, name, or `machine/a1`)
+
+  [ARGV]...
+          Explicit target command/arguments when spawning with `--pty` (or custom ACP command)
+
+Options:
+      --json
+          JSON output even in a terminal
+
+      --kind <KIND>
+          Lineage kind (`handoff`, `fork`, or `side-chat`)
+
+          Possible values:
+          - handoff:   Continue the same line of work in a new or different agent/provider
+          - fork:      Branch off to explore or re-implement independently from a turn/state
+          - side-chat: Open a temporary side-channel discussion without replacing the main session
+          
+          [default: handoff]
+
+      --preset <AGENT>
+          Target preset/program (`claude`, `codex`, `gemini`, `agy`, ...)
+
+      --pty
+          Launch an interactive PTY terminal (`t*`) target instead of headless ACP (`a*`)
+
+      --into <TARGET>
+          Deliver delta/summary into an existing agent or terminal instead of creating a new one
+
+      --from-turn <FROM_TURN>
+          First turn from the source transcript to include (1-based, inclusive)
+
+      --to-turn <TO_TURN>
+          Last turn from the source transcript to include (1-based, inclusive)
+
+      --prompt <TEXT>
+          Optional initial instruction sent after staging handoff context
+
+      --note <TEXT>
+          Short user note included in the generated handoff package header
+
+      --cwd <CWD>
+          Working directory override (defaults to source agent/terminal cwd)
+
+      --name <NAME>
+          Optional unique name for the newly spawned target
+
+      --model <MODEL>
+          Model override for newly spawned ACP agent targets
+
+      --keep
+          Keep newly spawned target alive across restarts (`--keep`)
+
+      --wait
+          With `--prompt`: wait for the first turn on the target to finish
+
+      --timeout <TIMEOUT>
+          With `--wait`: seconds before returning early (default: config, else 180)
+
+      --cols <COLS>
+          Initial columns when spawning a PTY target (`--pty`)
+
+      --rows <ROWS>
+          Initial rows when spawning a PTY target (`--pty`)
+
+  -h, --help
+          Print help (see a summary with '-h')
+```
+
 ## h2 interrupt
 
 ```text
@@ -1102,12 +1271,14 @@ Arguments:
   [AGENT]  The agent: `a7`, a name, or `machine/a7`
 
 Options:
-      --json               JSON output even in a terminal
-      --lines <LINES>      Trailing rendered transcript lines (default: full transcript)
-      --last               Print only the final assistant text from the latest turn
-      --wait               Wait for the agent to finish its current turn or block before reading
-      --timeout <TIMEOUT>  With `--wait`: seconds before returning early (default: config, else 180)
-  -h, --help               Print help
+      --json                   JSON output even in a terminal
+      --lines <LINES>          Trailing rendered transcript lines (default: full transcript)
+      --last                   Print only the final assistant text from the latest turn
+      --wait                   Wait for the agent to finish its current turn or block before reading
+      --timeout <TIMEOUT>      With `--wait`: seconds before returning early (default: config, else 180)
+      --from-turn <FROM_TURN>  First turn to include when slicing transcript entries (1-based, inclusive)
+      --to-turn <TO_TURN>      Last turn to include when slicing transcript entries (1-based, inclusive)
+  -h, --help                   Print help
 ```
 
 ## h2 rm

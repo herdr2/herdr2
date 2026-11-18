@@ -38,6 +38,7 @@ pub const IDENTITY_VARS: &[&str] = &[
 ];
 
 mod doc;
+mod handoff;
 mod pty;
 pub(crate) mod run;
 mod types;
@@ -117,6 +118,12 @@ methods! { Ctx<'_>;
     "agent.send" => agent_send, SendParams => SendResult,
         "Enqueue a prompt into the agent's serial ACP inbox, or cancel the active turn and steer immediately with `steer`.",
         errors ["not_found", "machine_unknown", "finished", "unavailable", "blocked", "status_mismatch", "invalid_params", "config"];
+    "agent.inbox_edit" => agent_inbox_edit, InboxEditParams => Public,
+        "Edit a queued prompt in an ACP agent's serial inbox before its turn starts.",
+        errors ["not_found", "machine_unknown", "finished", "invalid_params"];
+    "agent.inbox_remove" => agent_inbox_remove, InboxRemoveParams => Public,
+        "Remove a queued prompt from an ACP agent's serial inbox before its turn starts.",
+        errors ["not_found", "machine_unknown", "finished"];
     "agent.wait" => agent_wait, WaitParams => crate::wait::WaitResult,
         "Wait until an agent leaves `working` (idle, blocked, error, or exited). Already not working returns immediately. With `children`, wait on subordinate agents.",
         errors ["not_found", "machine_unknown", "invalid_params", "needs_target", "config"];
@@ -135,6 +142,9 @@ methods! { Ctx<'_>;
     "agent.put" => agent_put, PutParams => PutResult,
         "Write bytes to a file beside a live agent, on its machine, for it to read. Lands in an isolated directory removed with the agent.",
         errors ["not_found", "machine_unknown", "finished", "invalid_params"];
+    "agent.handoff" => handoff::agent_handoff, HandoffParams => HandoffResult,
+        "Hand off, fork, open a side chat, or merge back session context across ACP agents and PTY terminals.",
+        errors ["not_found", "machine_unknown", "invalid_params", "name_taken", "config", "spawn_failed", "unavailable", "stopping"];
     "terminal.run" => terminal_run, TerminalRunParams => TerminalRunResult,
         "Start a program in a pseudo-terminal (`shell`, command, or template). With `wait`, wait for it to finish and return its screen.",
         errors ["invalid_params", "name_taken", "spawn_failed", "unavailable", "invalid_template", "not_found", "machine_unknown", "config"];
@@ -237,6 +247,21 @@ methods! { Ctx<'_>;
     "drove.subscribe" => drove_subscribe, Empty => DroveSubscribeResult,
         "Subscribe to Drove change and item events on a framed connection.",
         errors ["needs_framed"];
+    "checkpoint.list" => checkpoint_list, CheckpointListParams => CheckpointListResult,
+        "List hidden Git ref checkpoints and workspace isolation status for an agent or terminal.",
+        errors ["not_found", "machine_unknown", "invalid_params"];
+    "checkpoint.capture" => checkpoint_capture, CheckpointCaptureParams => CheckpointCaptureResult,
+        "Capture a manual hidden Git ref checkpoint for an agent or terminal without modifying the user's index.",
+        errors ["not_found", "machine_unknown", "needs_target", "invalid_params"];
+    "checkpoint.diff" => checkpoint_diff, CheckpointDiffParams => crate::checkpoint::CheckpointDiff,
+        "Compute the pure authored unified diff and file stats between two checkpoints, excluding upstream pull/merge noise.",
+        errors ["not_found", "machine_unknown", "invalid_params"];
+    "checkpoint.rollback" => checkpoint_rollback, CheckpointRollbackParams => crate::checkpoint::CheckpointRollbackResult,
+        "Roll back an agent or terminal session (and optionally workspace files) to an earlier checkpoint turn.",
+        errors ["not_found", "machine_unknown", "invalid_params", "busy", "unavailable", "confirm_required", "shared_workspace", "spawn_failed"];
+    "checkpoint.hook" => checkpoint_hook, CheckpointHookParams => CheckpointHookResult,
+        "Internal lifecycle hook callback invoked by instrumented terminal CLIs (Claude, Codex, Agy).",
+        errors ["not_found", "invalid_params"];
     "rpc.discover" => rpc_discover, Empty => serde_json::Value,
         "The whole API as an OpenRPC document: every method with its params, result and errors in JSON Schema.",
         errors [];
@@ -246,7 +271,7 @@ fn version() -> String {
     env!("CARGO_PKG_VERSION").into()
 }
 
-fn resolve(core: &Core, address: &str) -> Result<u32, RpcError> {
+pub(super) fn resolve(core: &Core, address: &str) -> Result<u32, RpcError> {
     let local = crate::addr::local(address, &core.info.id, &core.info.name)?;
     core.lock().reg.resolve(local)
 }
@@ -477,6 +502,7 @@ async fn agent_label(core: Ctx<'_>, p: LabelParams) -> Result<Public, RpcError> 
 }
 
 async fn agent_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError> {
+    let range_requested = p.from_turn.is_some() || p.to_turn.is_some();
     match resolve_any(core, &p.agent)? {
         TargetKey::Terminal(id) => {
             let term_addr = crate::terminals::address(id);
@@ -485,7 +511,7 @@ async fn agent_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError
                 let spec = WaitSpec { output: None, timeout: Some(timeout), after_turn: None };
                 let _ = watched(core, p.caller.clone(), TargetKey::Terminal(id), spec).await;
             }
-            let snap = (!p.last && p.lines.is_none()).then(|| {
+            let snap = ((!p.last && p.lines.is_none()) || range_requested).then(|| {
                 let st = core.lock();
                 st.pty_reg
                     .terminals
@@ -497,6 +523,18 @@ async fn agent_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError
             } else {
                 (Vec::new(), None)
             };
+            if range_requested {
+                let sliced = crate::transcript::slice_turn_range(&entries, p.from_turn, p.to_turn);
+                let text = crate::transcript::render_entries(&sliced);
+                return Ok(ReadResult {
+                    text,
+                    complete: true,
+                    how: "transcript".into(),
+                    why: None,
+                    entries: sliced,
+                    session_meta,
+                });
+            }
             let lines = match p.lines {
                 Some(n) => n,
                 None if !entries.is_empty() => 0,
@@ -520,6 +558,20 @@ async fn agent_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError
             } else {
                 core.saw(p.caller.as_deref(), id);
             }
+            if range_requested {
+                let all_entries = core.read_transcript_entries(id)?;
+                let sliced = crate::transcript::slice_turn_range(&all_entries, p.from_turn, p.to_turn);
+                let text = crate::transcript::render_entries(&sliced);
+                core.flush_saved().await?;
+                return Ok(ReadResult {
+                    text,
+                    complete: true,
+                    how: "transcript".into(),
+                    why: None,
+                    entries: sliced,
+                    session_meta: None,
+                });
+            }
             let (text, complete, how) = core.read_transcript(id, p.lines, p.last)?;
             let entries = if !p.last && p.lines.is_none() {
                 core.read_transcript_entries(id)?
@@ -532,7 +584,7 @@ async fn agent_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError
     }
 }
 
-async fn agent_send(core: Ctx<'_>, p: SendParams) -> Result<SendResult, RpcError> {
+pub(super) async fn agent_send(core: Ctx<'_>, p: SendParams) -> Result<SendResult, RpcError> {
     match resolve_any(core, &p.agent)? {
         TargetKey::Terminal(id) => {
             let r = terminal_send(
@@ -618,6 +670,20 @@ async fn agent_send(core: Ctx<'_>, p: SendParams) -> Result<SendResult, RpcError
             })
         }
     }
+}
+
+async fn agent_inbox_edit(core: Ctx<'_>, p: InboxEditParams) -> Result<Public, RpcError> {
+    let id = resolve(core, &p.agent)?;
+    let updated = core.edit_inbox(id, p.id, &p.text)?;
+    core.flush_saved().await?;
+    Ok(Public(updated))
+}
+
+async fn agent_inbox_remove(core: Ctx<'_>, p: InboxRemoveParams) -> Result<Public, RpcError> {
+    let id = resolve(core, &p.agent)?;
+    let updated = core.remove_inbox(id, p.id)?;
+    core.flush_saved().await?;
+    Ok(Public(updated))
 }
 
 async fn agent_approve(core: Ctx<'_>, p: ApproveParams) -> Result<ApproveResult, RpcError> {
@@ -1165,4 +1231,154 @@ async fn drove_subscribe(core: Ctx<'_>, _: Empty) -> Result<DroveSubscribeResult
     let val = core.drove.rpc_subscribe(conn)?;
     let ch = val["channel"].as_u64().unwrap_or(0) as u32;
     Ok(DroveSubscribeResult { channel: ch })
+}
+
+async fn checkpoint_list(core: Ctx<'_>, p: CheckpointListParams) -> Result<CheckpointListResult, RpcError> {
+    let tk = resolve_any(core, &p.target)?;
+    let (addr, cwd, tc, live_snapshot) = {
+        let mut st = core.lock();
+        let (addr, cwd) = match tk {
+            TargetKey::Agent(id) => {
+                let a = st.reg.agents.get(&id).ok_or_else(|| RpcError::new("not_found", "agent not found", ""))?;
+                (a.address.clone(), a.cwd.clone())
+            }
+            TargetKey::Terminal(id) => {
+                let t = st.pty_reg.terminals.get(&id).ok_or_else(|| RpcError::new("not_found", "terminal not found", ""))?;
+                let cwd = t
+                    .foreground
+                    .as_ref()
+                    .map(|f| f.cwd.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or(t.last_cwd.as_deref())
+                    .unwrap_or(&t.cwd)
+                    .to_string();
+                (t.address.clone(), cwd)
+            }
+        };
+        let tc = core.target_checkpoints(&mut st, &addr);
+        let live_snapshot = crate::checkpoint_safety::snapshot_live_targets(&st);
+        (addr, cwd, tc, live_snapshot)
+    };
+    let repo = crate::checkpoint::probe_repo(std::path::Path::new(&cwd));
+    let isolation = repo
+        .as_ref()
+        .map(|r| crate::checkpoint_safety::evaluate_isolation(&addr, r, &live_snapshot));
+    Ok(CheckpointListResult {
+        target: addr,
+        repo_root: tc.repo_root.or_else(|| repo.map(|r| r.toplevel.to_string_lossy().to_string())),
+        cli_kind: tc.cli_kind,
+        isolation,
+        checkpoints: tc.checkpoints,
+    })
+}
+
+async fn checkpoint_capture(core: Ctx<'_>, p: CheckpointCaptureParams) -> Result<CheckpointCaptureResult, RpcError> {
+    let Some(target_str) = p.target else {
+        return Err(RpcError::new(
+            "needs_target",
+            "missing target address",
+            "pass target (<a*|t*>) or run inside an h2 terminal/agent",
+        ));
+    };
+    let tk = resolve_any(core, &target_str)?;
+    let record_entry = matches!(tk, TargetKey::Agent(_));
+    let meta = crate::checkpoint::capture_target_checkpoint(core, tk, None, None, p.label, false, record_entry)
+        .await
+        .map_err(RpcError::internal)?
+        .ok_or_else(|| RpcError::invalid_params("target directory is not inside a Git repository"))?;
+    let addr = match tk {
+        TargetKey::Agent(id) => crate::agents::address(id),
+        TargetKey::Terminal(id) => crate::terminals::address(id),
+    };
+    Ok(CheckpointCaptureResult { target: addr, checkpoint: meta })
+}
+
+async fn checkpoint_diff(core: Ctx<'_>, p: CheckpointDiffParams) -> Result<crate::checkpoint::CheckpointDiff, RpcError> {
+    let tk = resolve_any(core, &p.target)?;
+    let (addr, cwd, tc) = {
+        let mut st = core.lock();
+        let (addr, cwd) = match tk {
+            TargetKey::Agent(id) => {
+                let a = st.reg.agents.get(&id).ok_or_else(|| RpcError::new("not_found", "agent not found", ""))?;
+                (a.address.clone(), a.cwd.clone())
+            }
+            TargetKey::Terminal(id) => {
+                let t = st.pty_reg.terminals.get(&id).ok_or_else(|| RpcError::new("not_found", "terminal not found", ""))?;
+                let cwd = t
+                    .foreground
+                    .as_ref()
+                    .map(|f| f.cwd.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or(t.last_cwd.as_deref())
+                    .unwrap_or(&t.cwd)
+                    .to_string();
+                (t.address.clone(), cwd)
+            }
+        };
+        let tc = core.target_checkpoints(&mut st, &addr);
+        (addr, cwd, tc)
+    };
+    if tc.checkpoints.is_empty() {
+        return Err(RpcError::invalid_params(format!("no checkpoints recorded for {addr}")));
+    }
+    let to_turn = p
+        .to
+        .or_else(|| tc.checkpoints.iter().map(|c| c.turn).max())
+        .ok_or_else(|| RpcError::invalid_params(format!("no target checkpoint for {addr}")))?;
+    let from_turn = p
+        .from
+        .or_else(|| tc.checkpoints.iter().filter(|c| c.turn < to_turn).map(|c| c.turn).max())
+        .unwrap_or(0);
+    let from_meta = tc
+        .checkpoints
+        .iter()
+        .find(|c| c.turn == from_turn)
+        .ok_or_else(|| RpcError::invalid_params(format!("no checkpoint at turn {from_turn} for {addr}")))?
+        .clone();
+    let to_meta = tc
+        .checkpoints
+        .iter()
+        .find(|c| c.turn == to_turn)
+        .ok_or_else(|| RpcError::invalid_params(format!("no checkpoint at turn {to_turn} for {addr}")))?
+        .clone();
+    let repo_dir = tc.repo_root.as_deref().unwrap_or(&cwd);
+    let repo = crate::checkpoint::probe_repo(std::path::Path::new(repo_dir))
+        .ok_or_else(|| RpcError::invalid_params(format!("workspace `{repo_dir}` is not a Git repository")))?;
+    let _guard = core.repo_ckpt_lock(&repo.toplevel).lock_owned().await;
+    tokio::task::spawn_blocking(move || {
+        crate::checkpoint::diff_checkpoints(&repo, from_turn, to_turn, &from_meta.ref_name, &to_meta.ref_name)
+    })
+    .await
+    .map_err(|e| RpcError::internal(format!("diff task panicked: {e}")))?
+    .map_err(RpcError::internal)
+}
+
+async fn checkpoint_rollback(
+    core: Ctx<'_>,
+    p: CheckpointRollbackParams,
+) -> Result<crate::checkpoint::CheckpointRollbackResult, RpcError> {
+    match resolve_any(core, &p.target)? {
+        TargetKey::Agent(id) => crate::acp::rollback_acp_agent(core, id, p.to, p.restore_files, p.confirm).await,
+        TargetKey::Terminal(id) => {
+            crate::pty_adapters::rollback_pty_terminal(core, id, p.to, p.restore_files, p.confirm).await
+        }
+    }
+}
+
+async fn checkpoint_hook(core: Ctx<'_>, p: CheckpointHookParams) -> Result<CheckpointHookResult, RpcError> {
+    let tk = resolve_any(core, &p.terminal)?;
+    let TargetKey::Terminal(id) = tk else {
+        return Err(RpcError::invalid_params(format!("{} is not a terminal", p.terminal)));
+    };
+    let val = crate::pty_adapters::handle_checkpoint_hook(
+        core,
+        id,
+        &p.source,
+        p.phase.as_deref(),
+        p.event.as_deref(),
+        &p.payload,
+    )
+    .await;
+    let inject_steps = val.get("injectSteps").and_then(|v| v.as_array()).cloned().unwrap_or_default();
+    Ok(CheckpointHookResult { inject_steps })
 }

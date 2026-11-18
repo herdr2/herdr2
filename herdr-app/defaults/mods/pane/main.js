@@ -167,6 +167,7 @@ export default class Pane extends View {
     const isAgent = isAcp || isTermAgent;
     const term = p.terminal ? terminals().find((x) => x.address === p.terminal) : null;
     const parent = term?.parent ? terminals().find((x) => x.address === term.parent) : null;
+    const lineageParent = term?.lineage?.parent || null;
     const tabPaneCount = panes().filter((x) => x.tab === p.tab).length;
     const singleStructuredTab = isStructured && tabPaneCount <= 1;
     const customName = p.custom_name || term?.labels?.["herdr.name"];
@@ -184,6 +185,32 @@ export default class Pane extends View {
     const pctColor = pct >= 85 ? (t.blocked ?? "#ef4444") : pct >= 65 ? (t.done ?? "#f59e0b") : t.muted;
     const alpha = (hex, a) => (typeof hex === "string" && /^#[0-9a-fA-F]{6}$/.test(hex) ? hex + a : null);
     const accent = t.accent ?? "#3b82f6";
+    const showHandoffBtns = Boolean(p.terminal) && st !== "ended" && (isAgent || isStructured || Boolean(lineageParent));
+    const headerPill = (id, label, iconPath, command, args, tip, highlighted = false) =>
+      h_flex()
+        .id(id)
+        .flex_none()
+        .h(20)
+        .px(6)
+        .gap(4)
+        .items_center()
+        .rounded(6)
+        .bg(highlighted ? (alpha(accent, "18") ?? t.raised) : t.raised)
+        .border_1()
+        .border_color(highlighted ? (alpha(accent, "66") ?? t.border) : t.border)
+        .text_size(10.5)
+        .font_medium()
+        .text_color(highlighted ? accent : t.muted)
+        .cursor_pointer()
+        .hover((s) => s.bg(highlighted ? (alpha(accent, "2a") ?? t.hover) : t.hover).text_color(highlighted ? accent : t.foreground))
+        .when(Boolean(tip), (el) => el.tooltip(tip))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .on_click((_e, cx) => {
+          cx.stop_propagation();
+          run(command, args);
+        })
+        .when(Boolean(iconPath), (el) => el.child(svg(iconPath).size(11).flex_none().when(highlighted, (s) => s.text_color(accent))))
+        .child(label);
     const elapsed = isAgent
       ? this.agentElapsed(
           p.terminal || pane,
@@ -330,7 +357,67 @@ export default class Pane extends View {
       ))
       .when(isStructured && Boolean(p.terminal), el => el.child(div().flex_none().text_size(10.5).text_color(t.dim).child(p.terminal)))
       .when(isAcp && Boolean(parent), el => el.child(div().flex_none().text_size(11).text_color(t.muted).child(tr(`from ${parent.name || parent.address}`, `来自 ${parent.name || parent.address}`))))
+      .when(Boolean(lineageParent) && lineageParent !== parent?.address, (el) =>
+        el.child(
+          div()
+            .id(`ph-lin-${pane}`)
+            .flex_none()
+            .px(5)
+            .py(1)
+            .rounded(4)
+            .bg(t.raised)
+            .border_1()
+            .border_color(t.border)
+            .text_size(10.5)
+            .text_color(accent)
+            .cursor_pointer()
+            .hover((s) => s.bg(t.hover).text_color(t.foreground))
+            .tooltip(tr(`Focus parent session ${lineageParent}`, `跳转到来源父会话 ${lineageParent}`))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              run("agent.focus", { terminal: lineageParent });
+            })
+            .child(`↳ ${lineageParent}`),
+        ),
+      )
       .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(folder(p.cwd)))
+      .when(showHandoffBtns && Boolean(lineageParent), (el) =>
+        el.child(
+          headerPill(
+            `ph-merge-${pane}`,
+            tr("Merge", "合回"),
+            "mods/peek/corner-up-right.svg",
+            "agent.handoff",
+            { source: p.terminal, into: lineageParent, kind: "merge-back" },
+            tr(`Merge conclusions back into ${lineageParent}`, `一键将结论合回 ${lineageParent}`),
+            true,
+          ),
+        ),
+      )
+      .when(showHandoffBtns, (el) =>
+        el
+          .child(
+            headerPill(
+              `ph-side-${pane}`,
+              tr("Side Chat", "旁路讨论"),
+              "mods/peek/messages-square.svg",
+              "agent.handoff",
+              { source: p.terminal, kind: "side-chat" },
+              tr("Open isolated side-chat with current context", "带当前上下文开启旁路讨论（不污染主会话）"),
+            ),
+          )
+          .child(
+            headerPill(
+              `ph-ho-${pane}`,
+              tr("Handoff", "接力"),
+              "mods/workspace-chrome/git-branch.svg",
+              "agent.handoff",
+              { source: p.terminal, kind: "handoff" },
+              tr("Context handoff / Fork / Merge", "上下文接力 / 分支探索 / 合回"),
+            ),
+          ),
+      )
       .when(showViewToggle, el => el.child(
         h_flex()
           .id(`ph-view-${pane}`)

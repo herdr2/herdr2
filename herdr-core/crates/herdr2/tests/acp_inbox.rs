@@ -110,3 +110,43 @@ fn wait_children_any_and_all_and_sender_attribution_tags() {
     assert_eq!(st["raw"], "STATE");
     let _ = c2;
 }
+
+#[test]
+fn inbox_exposes_queued_items_and_supports_live_edit_and_remove() {
+    let s = Session::new();
+    let a = run_fake(&s, &["--prompt", "HOLD"]);
+    wait_until("HOLD working", || get(&s, &a)["status"]["state"] == "working");
+
+    s.json(&["send", &a, "first-msg"]);
+    s.json(&["send", &a, "second-msg"]);
+    s.json(&["send", &a, "third-msg"]);
+
+    wait_until("inbox reached len 3", || get(&s, &a)["inbox_len"] == 3);
+    let g = get(&s, &a);
+    let inbox = g["inbox"].as_array().expect("inbox items exposed");
+    assert_eq!(inbox.len(), 3, "{g}");
+    assert_eq!(inbox[0]["text"], "first-msg");
+    assert_eq!(inbox[1]["text"], "second-msg");
+    assert_eq!(inbox[2]["text"], "third-msg");
+
+    let id2 = inbox[1]["id"].as_u64().unwrap().to_string();
+    let id3 = inbox[2]["id"].as_u64().unwrap().to_string();
+
+    let after_rm = s.json(&["inbox", "rm", &a, &id2]);
+    assert_eq!(after_rm["inbox_len"], 2, "{after_rm}");
+    let after_edit = s.json(&["inbox", "edit", &a, &id3, "third-msg-updated"]);
+    assert_eq!(after_edit["inbox_len"], 2, "{after_edit}");
+    assert_eq!(after_edit["inbox"][0]["text"], "first-msg");
+    assert_eq!(after_edit["inbox"][1]["text"], "third-msg-updated");
+
+    s.json(&["interrupt", &a]);
+    wait_until("queued turns settled", || {
+        let g = get(&s, &a);
+        g["status"]["state"] == "idle" && g["inbox_len"].as_u64().unwrap_or(0) == 0
+    });
+
+    let transcript = s.json(&["read", "--lines", "100", &a])["text"].as_str().unwrap().to_owned();
+    assert!(transcript.contains("echo: first-msg"), "{transcript}");
+    assert!(transcript.contains("echo: third-msg-updated"), "{transcript}");
+    assert!(!transcript.contains("second-msg"), "{transcript}");
+}

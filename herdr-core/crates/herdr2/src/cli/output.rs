@@ -297,6 +297,18 @@ pub(super) fn describe(a: &Value) -> String {
     if let Some(first) = a.get("first_message").filter(|f| f["sent"] == false) {
         description.push_str(&format!("\n  first message NOT sent: {}", first["reason"].as_str().unwrap_or("?")));
     }
+    if let Some(lin) = a.get("lineage").filter(|l| l.is_object()) {
+        let kind = lin["kind"].as_str().unwrap_or("handoff");
+        let parent = lin["parent"].as_str().unwrap_or("?");
+        let mut desc = format!("{kind} from {parent}");
+        if let Some(prov) = lin["parent_provider"].as_str() {
+            desc.push_str(&format!(" ({prov})"));
+        }
+        if let (Some(f), Some(t)) = (lin["from_turn"].as_u64(), lin["to_turn"].as_u64()) {
+            desc.push_str(&format!(" turns {f}-{t}"));
+        }
+        description.push_str(&format!("\n  lineage: {desc}"));
+    }
     description
 }
 

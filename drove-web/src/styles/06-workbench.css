@@ -25,7 +25,7 @@
 .rv button { font: inherit; cursor: pointer; }
 .rv button:disabled { opacity: 0.55; cursor: wait; }
 .rv button:focus-visible {
-  outline: 2px solid var(--role-reviewer);
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 .rv-header {
@@ -110,9 +110,9 @@
 .rv-scope__btn--on,
 .rv-reviewer-switch__btn--on,
 .rv-diff-mode--on {
-  border-color: color-mix(in srgb, var(--role-reviewer) 48%, var(--border));
-  background: color-mix(in srgb, var(--role-reviewer-bg) 82%, var(--surface-elevated, var(--surface)));
-  color: var(--role-reviewer);
+  border-color: color-mix(in srgb, var(--accent) 45%, var(--border));
+  background: var(--accent-soft);
+  color: var(--accent);
   font-weight: 600;
   box-shadow: var(--shadow-xs);
 }
@@ -172,9 +172,9 @@
   background: var(--surface-elevated, var(--surface));
 }
 .rv-task-card--on {
-  background: var(--surface-elevated, var(--surface));
-  border-color: color-mix(in srgb, var(--role-reviewer) 65%, var(--border));
-  box-shadow: var(--shadow-xs), 0 0 0 1px color-mix(in srgb, var(--role-reviewer) 20%, transparent);
+  background: color-mix(in srgb, var(--accent-soft) 48%, var(--surface-elevated, var(--surface)));
+  border-color: color-mix(in srgb, var(--accent) 65%, var(--border));
+  box-shadow: var(--shadow-xs), 0 0 0 1px color-mix(in srgb, var(--accent) 20%, transparent);
 }
 .rv-task-card__title {
   font-size: 13px;
@@ -277,7 +277,7 @@
   border: 1px solid var(--border);
   border-top: 3px solid var(--role-worker);
   border-radius: 12px;
-  background: color-mix(in srgb, var(--role-worker-bg) 22%, var(--surface-elevated, var(--surface)));
+  background: var(--surface-elevated, var(--surface));
   box-shadow: var(--shadow-xs);
   color: var(--text);
   text-align: left;
@@ -286,7 +286,7 @@
 .rv-role--reviewer {
   border-color: var(--role-reviewer-border);
   border-top-color: var(--role-reviewer);
-  background: color-mix(in srgb, var(--role-reviewer-bg) 32%, var(--surface-elevated, var(--surface)));
+  background: var(--surface-elevated, var(--surface));
 }
 button.rv-role:hover {
   box-shadow: var(--shadow);
@@ -395,7 +395,7 @@ button.rv-role:hover {
   bottom: -1px;
   height: 2px;
   border-radius: 999px;
-  background: var(--role-reviewer);
+  background: var(--accent);
   transform: scaleX(0.6);
   opacity: 0;
   transition: transform 180ms var(--ease-out, ease), opacity 160ms ease;
@@ -555,7 +555,7 @@ button.rv-role:hover {
 }
 .rv-item--user {
   border-left-color: var(--role-coord);
-  background: color-mix(in srgb, var(--role-coord-bg) 25%, var(--surface-elevated, var(--surface)));
+  background: var(--surface-elevated, var(--surface));
 }
 .rv-item--thought {
   background: var(--surface-2);
@@ -648,28 +648,16 @@ button.rv-role:hover {
 .page-tabs::-webkit-scrollbar {
   display: none;
 }
-.page-tabs button[data-role] {
+.page-tabs button[data-role],
+.page-tabs button[data-role="coord"],
+.page-tabs button[data-role="task"],
+.page-tabs button[data-role="worker"],
+.page-tabs button[data-role="reviewer"] {
   position: relative;
   --tab-role: var(--accent);
   --tab-role-bg: var(--accent-soft);
 }
-.page-tabs button[data-role="coord"] {
-  --tab-role: var(--role-coord);
-  --tab-role-bg: var(--role-coord-bg);
-}
-.page-tabs button[data-role="task"] {
-  --tab-role: var(--role-task);
-  --tab-role-bg: var(--role-task-bg);
-}
-.page-tabs button[data-role="worker"] {
-  --tab-role: var(--role-worker);
-  --tab-role-bg: var(--role-worker-bg);
-}
-.page-tabs button[data-role="reviewer"] {
-  --tab-role: var(--role-reviewer);
-  --tab-role-bg: var(--role-reviewer-bg);
-}
-/* Harmonize with floating warm ivory .seg button.active: soft role count pill + pulse dot, no heavy border */
+/* Harmonize with floating .seg button.active: neutral inactive count pill, calm accent active state */
 .page-tabs button[data-role].active {
   background: var(--surface-elevated, var(--surface));
   color: var(--text);
@@ -693,14 +681,14 @@ button.rv-role:hover {
   transform: scaleX(1);
 }
 .page-tabs button[data-role] .page-tabs__count {
-  background: color-mix(in srgb, var(--tab-role-bg) 80%, var(--surface));
-  color: var(--tab-role);
-  border: 1px solid color-mix(in srgb, var(--tab-role) 20%, transparent);
+  background: var(--surface-3);
+  color: var(--text-2);
+  border: 1px solid transparent;
 }
 .page-tabs button[data-role].active .page-tabs__count {
-  background: var(--tab-role-bg);
-  color: var(--tab-role);
-  border-color: color-mix(in srgb, var(--tab-role) 32%, transparent);
+  background: var(--accent-soft);
+  color: var(--accent);
+  border-color: color-mix(in srgb, var(--accent) 28%, transparent);
 }
 .page-tabs button[data-role] .page-tabs__pulse {
   --st: var(--tab-role);
@@ -730,21 +718,12 @@ button.rv-role:hover {
   background: var(--bg);
 }
 
-.wb[data-wb-role="coord"] {
-  --wb-accent: var(--role-coord);
-  --wb-accent-bg: var(--role-coord-bg);
-}
-.wb[data-wb-role="task"] {
-  --wb-accent: var(--role-task);
-  --wb-accent-bg: var(--role-task-bg);
-}
-.wb[data-wb-role="worker"] {
-  --wb-accent: var(--role-worker);
-  --wb-accent-bg: var(--role-worker-bg);
-}
+.wb[data-wb-role="coord"],
+.wb[data-wb-role="task"],
+.wb[data-wb-role="worker"],
 .wb[data-wb-role="reviewer"] {
-  --wb-accent: var(--role-reviewer);
-  --wb-accent-bg: var(--role-reviewer-bg);
+  --wb-accent: var(--accent);
+  --wb-accent-bg: var(--accent-soft);
 }
 
 .wb-filter:focus-visible,
@@ -946,7 +925,7 @@ button.rv-role:hover {
 }
 
 .wb-item--active {
-  background: var(--surface-elevated, var(--surface));
+  background: color-mix(in srgb, var(--accent-soft) 48%, var(--surface-elevated, var(--surface)));
   border-color: color-mix(in srgb, var(--wb-accent) 68%, var(--border));
   box-shadow: var(--shadow-xs), 0 0 0 1px color-mix(in srgb, var(--wb-accent) 18%, transparent);
 }

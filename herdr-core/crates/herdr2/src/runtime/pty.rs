@@ -533,6 +533,16 @@ impl Core {
 
     /// A terminal program ended: record it, keep its final screen on disk, let the holder forget it.
     pub fn pty_finish(&self, st: &mut State, id: u32, exit: Exit) {
+        if st.pty_respawning.contains(&id) {
+            if let Some(t) = st.pty_reg.terminals.get_mut(&id) {
+                t.pid = None;
+            }
+            if let Some(link) = st.link(id) {
+                link.send(&proto::frame(proto::RELEASE, id, &[]));
+            }
+            self.changed.notify_waiters();
+            return;
+        }
         let reason = finish_reason(st.pty_killing.contains(&id), st.stopping, false, platform::host_shutdown_in_progress());
         if let Some(link) = st.link(id) {
             link.send(&proto::frame(proto::RELEASE, id, &[]));
@@ -618,9 +628,11 @@ impl Core {
     pub fn pty_remove(&self, st: &mut State, id: u32) {
         let Some(was) = st.pty_reg.terminals.remove(&id) else { return };
         st.pty_prompts.remove(&id);
+        st.pty_respawning.remove(&id);
         self.emit_pty_from(st, "removed", id, serde_json::json!({}), Some(&was));
         let _ = std::fs::remove_file(self.snapshot_path(id));
         let _ = std::fs::remove_dir_all(crate::put::terminal_dir(&self.paths.state, id));
+        self.cleanup_target_checkpoints(st, &was.address, &was.cwd);
         self.save_pty(st);
     }
 

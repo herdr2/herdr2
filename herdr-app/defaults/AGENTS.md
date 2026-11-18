@@ -174,9 +174,10 @@ through them, `layout.switch {name}` picks one; `shared("layout")` is the
 shown one's name. Herdr ships `main` ("Herdr": spaces by machine and the
 agents list on the left, `workspace-chrome`; tabs as pills with a + menu
 that starts a terminal or any installed agent, `new-menu`; panes as cards
-with a header; Files and Changes panels on the right, `files` and
-`changes`, opened from the tab bar and remembered per space (which ones:
-shared `"workspace.panels"`, set by the welcome); a status bar,
+with a header; Files, Changes, and Checkpoints panels on the right,
+`files`, `changes`, and `checkpoints`, opened from the tab bar and remembered
+per space (which ones: shared `"workspace.panels"`, set by the welcome); a
+status bar,
 `workspace-status`), and as examples `terminals` ("Terminals": tabs in
 the title bar, panes as cards, a space picker) and `win98`
 ("Herdr 98": a whole desktop in one mod, `win98`). Add a layout by
@@ -665,7 +666,7 @@ The main ones:
   started, including its release outside the pane; other panes don't receive it.
   Terminals display Kitty graphics, including Unicode placeholder images used by
   programs such as yazi; partial images and scrolling follow the placeholder cells.
-- Agents: `agent.next`, `agent.prev`, `agent.focus {terminal}`, `agent.rename {terminal?, name?}`, `agent.trash {terminal?}`, `agent.restore {terminal}`, `agent.purge {terminal}`, `agent.empty_trash`, `agent.status {status, terminal?}`, `agent.send {agent?, text, steer?}`, `agent.interrupt {agent?}`, `agent.approve {agent?, option?}`, `agent.deny {agent?}`.
+- Agents: `agent.next`, `agent.prev`, `agent.focus {terminal}`, `agent.rename {terminal?, name?}`, `agent.trash {terminal?}`, `agent.restore {terminal}`, `agent.purge {terminal}`, `agent.empty_trash`, `agent.status {status, terminal?}`, `agent.handoff {source?, preset?, into?, kind?, mode?, prompt?, recent_turns?, max_bytes?, model?, effort?, open?}`, `agent.send {agent?, text, steer?}`, `agent.interrupt {agent?}`, `agent.approve {agent?, option?}`, `agent.deny {agent?}`.
 - Layout: `layout.switch {name?}`, `layout.toggle {id}`, `layout.show {id}`, `layout.hide {id}`,
   `layout.resize {id, px | weight}`, `layout.select {stack, child}`, `layout.set {layout}`
   (personal tree edits; on shipped layouts only click/look fields change),

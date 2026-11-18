@@ -3,6 +3,17 @@
 use super::types::*;
 use serde_json::Value;
 
+/// Optional handover snapshot extracted from a failed prior attempt on retry/fallback.
+#[derive(Debug, Clone, Default)]
+pub struct PriorAttemptHandover {
+    pub attempt_id: String,
+    pub agent: String,
+    pub model: Option<String>,
+    pub failure_reason: Option<String>,
+    pub context_markdown: Option<String>,
+    pub git_status: Option<String>,
+}
+
 /// Builds the full task prompt delivered to an ACP worker for `attempt`.
 pub fn build_task_prompt(
     run: &Run,
@@ -12,6 +23,22 @@ pub fn build_task_prompt(
     role_cfg: &RoleConfig,
     dep_tasks: &[Task],
     hint: Option<&str>,
+) -> String {
+    build_task_prompt_with_handover(run, task, attempt, role_name, role_cfg, dep_tasks, hint, None)
+}
+
+/// Builds the full task prompt delivered to an ACP worker for `attempt`, optionally embedding
+/// structured context from a failed prior attempt so fallback/retry workers avoid repeating mistakes.
+#[allow(clippy::too_many_arguments)]
+pub fn build_task_prompt_with_handover(
+    run: &Run,
+    task: &Task,
+    attempt: &Attempt,
+    role_name: &str,
+    role_cfg: &RoleConfig,
+    dep_tasks: &[Task],
+    hint: Option<&str>,
+    prior_handover: Option<&PriorAttemptHandover>,
 ) -> String {
     let mut sections = Vec::new();
     sections.push(format!(
@@ -94,6 +121,27 @@ pub fn build_task_prompt(
 
     if let Some(h) = hint.filter(|s| !s.trim().is_empty()) {
         sections.push(format!("Retry / coordinator hint:\n{h}"));
+    }
+
+    if let Some(prior) = prior_handover {
+        let model_label = prior.model.as_deref().unwrap_or("default");
+        let mut lines = vec![format!(
+            "- Previous attempt: `{}` (`{}` / `{model_label}`)",
+            prior.attempt_id, prior.agent
+        )];
+        if let Some(reason) = prior.failure_reason.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            lines.push(format!("- Failure reason: {reason}"));
+        }
+        if let Some(st) = prior.git_status.as_deref().filter(|s| !s.trim().is_empty()) {
+            lines.push(format!("- Current worktree `git status --short`:\n```text\n{}\n```", st.trim_end()));
+        }
+        if let Some(md) = prior.context_markdown.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            lines.push(format!("- Prior attempt transcript tail:\n{md}"));
+        }
+        sections.push(format!(
+            "Prior failed attempt handover (avoid repeating failed approaches and inspect existing edits before rewriting):\n{}",
+            lines.join("\n")
+        ));
     }
 
     let data_flag = if task.output_schema.as_ref().is_some_and(|s| !s.is_null()) {
@@ -306,11 +354,35 @@ mod tests {
             fallbacks: Vec::new(),
             prompt: None,
         };
-        let prompt = build_task_prompt(&run, &task, &attempt, "coder", &role_cfg, &[dep], None);
+        let prompt = build_task_prompt(&run, &task, &attempt, "coder", &role_cfg, &[dep.clone()], None);
         assert!(prompt.contains("Compact handover sentence"), "{prompt}");
         assert!(!prompt.contains("Very long raw summary"), "{prompt}");
         assert!(prompt.contains("Required outputSchema"), "{prompt}");
         assert!(prompt.contains("\"ok\""), "{prompt}");
         assert!(prompt.contains("--data '<JSON matching outputSchema>' (REQUIRED)"), "{prompt}");
+
+        let prior = PriorAttemptHandover {
+            attempt_id: "att_0".into(),
+            agent: "claude".into(),
+            model: Some("sonnet".into()),
+            failure_reason: Some("AgentError: timed out".into()),
+            context_markdown: Some("## Recent Turns\nTried patching auth.rs".into()),
+            git_status: Some(" M src/lib.rs\n".into()),
+        };
+        let retry_prompt = build_task_prompt_with_handover(
+            &run,
+            &task,
+            &attempt,
+            "coder",
+            &role_cfg,
+            &[dep],
+            Some("Switch to fallback"),
+            Some(&prior),
+        );
+        assert!(retry_prompt.contains("Prior failed attempt handover"), "{retry_prompt}");
+        assert!(retry_prompt.contains("Previous attempt: `att_0` (`claude` / `sonnet`)"), "{retry_prompt}");
+        assert!(retry_prompt.contains("Failure reason: AgentError: timed out"), "{retry_prompt}");
+        assert!(retry_prompt.contains("```text\n M src/lib.rs\n```"), "{retry_prompt}");
+        assert!(retry_prompt.contains("Tried patching auth.rs"), "{retry_prompt}");
     }
 }

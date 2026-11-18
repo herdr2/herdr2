@@ -18,7 +18,17 @@ const APPEARANCES = [
 const PANELS = [
   { id: "files", icon: "files", title: "Files", about: "The folder you're in as a tree. Open a file to read it, highlighted." },
   { id: "changes", icon: "git-compare", title: "Changes", about: "What your agents changed: every file with its diff, and a commit box." },
+  { id: "checkpoints", icon: "clock", title: "Checkpoints", about: "Turn-by-turn snapshots of your session and workspace, ready to diff or restore." },
 ];
+
+function resolveEnabledPanels(defaultIds) {
+  const saved = shared("workspace.panels");
+  if (!Array.isArray(saved)) return defaultIds;
+  if (!shared("workspace.panels_has_checkpoints") && !saved.includes("checkpoints")) {
+    return [...saved, "checkpoints"];
+  }
+  return saved;
+}
 
 // The key bound to a command, as people press it: "Ctrl+Shift+P".
 function bound(action) {
@@ -109,12 +119,13 @@ export default class Welcome extends View {
 
   // The panels picked: the tab bar shows a button for each.
   panels() {
-    return shared("workspace.panels") ?? PANELS.map((p) => p.id);
+    return resolveEnabledPanels(PANELS.map((p) => p.id));
   }
 
   togglePanel(id) {
     const on = this.panels().includes(id);
     const next = on ? this.panels().filter((x) => x !== id) : [...this.panels(), id];
+    setShared("workspace.panels_has_checkpoints", true);
     setShared("workspace.panels", next);
     const L = layout();
     if (!find(L, "panel")) return;
@@ -394,7 +405,7 @@ export default class Welcome extends View {
   }
 
   pageThree(t) {
-    // Default panels stay enabled (["files", "changes"]) unless toggled off.
+    // Default panels stay enabled (["files", "changes", "checkpoints"]) unless toggled off.
     return v_flex()
       .gap(14)
       .child(this.title(t, "Choose your panels", "Herdr comes with a couple of panels. Turn one on and it appears beside your terminals. Drag this window aside to see it. Later, the buttons in the tab bar open and close them."))

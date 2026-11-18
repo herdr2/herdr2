@@ -187,6 +187,7 @@ impl EventLines {
                 if is_agent && kind == "finished" {
                     t["pending_permission"] = Value::Null;
                     t["inbox_len"] = json!(0);
+                    t["inbox"] = json!([]);
                 }
                 t.as_object_mut().map(|r| r.remove("foreground"));
             }
@@ -196,6 +197,11 @@ impl EventLines {
                     t["pending_permission"] = data["pending_permission"].clone();
                     if !data["inbox_len"].is_null() {
                         t["inbox_len"] = data["inbox_len"].clone();
+                    }
+                    if !data["inbox"].is_null() {
+                        t["inbox"] = data["inbox"].clone();
+                    } else if data["inbox_len"].as_u64() == Some(0) {
+                        t["inbox"] = json!([]);
                     }
                 }
             }
@@ -217,26 +223,38 @@ impl EventLines {
     }
 }
 
+fn normalize_parent_address(parent: &str, hello: &Value, machines: &Value) -> Option<String> {
+    let (prefix, id) = parent.split_once('/')?;
+    let local = [hello["core"]["id"].as_str(), hello["core"]["name"].as_str()].contains(&Some(prefix));
+    if local {
+        return Some(id.to_owned());
+    }
+    let known = machines["machines"].as_array().into_iter().flatten();
+    // Preserve normalized names before considering a core's host name.
+    let machine = known.clone().find(|m| m["name"] == prefix || m["id"] == prefix).or_else(|| {
+        let mut hosts = known.filter(|m| m["host"] == prefix);
+        match (hosts.next(), hosts.next()) {
+            (Some(machine), None) => Some(machine),
+            _ => None,
+        }
+    });
+    let name = machine.and_then(|m| m["name"].as_str())?;
+    Some(format!("{name}/{id}"))
+}
+
 fn normalize_parents(records: &mut [Value], hello: &Value, machines: &Value) {
     for record in records {
-        let Some(parent) = record["parent"].as_str() else { continue };
-        let Some((prefix, id)) = parent.split_once('/') else { continue };
-        let local = [hello["core"]["id"].as_str(), hello["core"]["name"].as_str()].contains(&Some(prefix));
-        if local {
-            record["parent"] = id.into();
-            continue;
+        if let Some(parent) = record["parent"].as_str()
+            && let Some(normalized) = normalize_parent_address(parent, hello, machines)
+        {
+            record["parent"] = normalized.into();
         }
-        let known = machines["machines"].as_array().into_iter().flatten();
-        // Preserve normalized names before considering a core's host name.
-        let machine = known.clone().find(|m| m["name"] == prefix || m["id"] == prefix).or_else(|| {
-            let mut hosts = known.filter(|m| m["host"] == prefix);
-            match (hosts.next(), hosts.next()) {
-                (Some(machine), None) => Some(machine),
-                _ => None,
-            }
-        });
-        let Some(name) = machine.and_then(|m| m["name"].as_str()) else { continue };
-        record["parent"] = format!("{name}/{id}").into();
+        if let Some(parent) = record.pointer("/lineage/parent").and_then(Value::as_str)
+            && let Some(normalized) = normalize_parent_address(parent, hello, machines)
+            && let Some(lineage) = record.get_mut("lineage").and_then(Value::as_object_mut)
+        {
+            lineage.insert("parent".into(), normalized.into());
+        }
     }
 }
 
@@ -379,12 +397,12 @@ fn connect_error(stderr: &str) -> Option<ConnectError> {
 
 impl Core {
     /// Connects to the user's core (starting it if needed), restarting an older
-    /// local daemon that lacks Drove support, and switches to framed mode.
+    /// local daemon that lacks Drove or checkpoint rollback support, and switches to framed mode.
     pub fn connect() -> Result<Arc<Core>> {
         let core = Self::connect_once()?;
-        if core.hello["methods"].is_array()
-            && !core.hello["features"].as_array().is_some_and(|f| f.iter().any(|x| x == "drove"))
-        {
+        let has_drove = core.hello["features"].as_array().is_some_and(|f| f.iter().any(|x| x == "drove"));
+        let has_ckpt = core.hello["methods"].as_array().is_some_and(|m| m.iter().any(|x| x == "checkpoint.rollback"));
+        if core.hello["methods"].is_array() && (!has_drove || !has_ckpt) {
             drop(core);
             let _ = crate::spawn::command(crate::core_bin::path())
                 .args(["server", "restart"])
@@ -957,7 +975,17 @@ mod tests {
         };
         let mut stream = String::new();
         stream.push_str(&ev(11, "created", "a1", json!({"address": "a1", "state": "live", "parent": "t1", "status": {"state": "starting"}, "turn": 0, "labels": {}})));
-        stream.push_str(&ev(12, "status", "a1", json!({"status": {"state": "blocked", "kind": "permission"}, "records": {}, "reported": true, "pending_permission": {"request_id": "r1", "title": "Allow bash"}, "inbox_len": 2})));
+        stream.push_str(&ev(12, "status", "a1", json!({
+            "status": {"state": "blocked", "kind": "permission"},
+            "records": {},
+            "reported": true,
+            "pending_permission": {"request_id": "r1", "title": "Allow bash"},
+            "inbox_len": 2,
+            "inbox": [
+                {"id": 10, "text": "first queued", "queued_ms": 1000},
+                {"id": 11, "text": "second queued", "from": "a2", "queued_ms": 2000}
+            ]
+        })));
         stream.push_str(&ev(13, "transcript", "a1", json!({"kind": "assistant", "text": "hello"})));
         stream.push_str(&ev(14, "labels", "a1", json!({"labels": {"herdr.seen": "4"}})));
         stream.push_str(&ev(15, "turn", "a1", json!({"turn": 4, "state": "idle"})));
@@ -979,8 +1007,23 @@ mod tests {
         assert_eq!(agents[0]["status"]["state"], "blocked");
         assert_eq!(agents[0]["pending_permission"]["request_id"], "r1");
         assert_eq!(agents[0]["inbox_len"], 2);
+        assert_eq!(agents[0]["inbox"].as_array().unwrap().len(), 2);
+        assert_eq!(agents[0]["inbox"][1]["from"], "a2");
         assert_eq!(agents[0]["transcript_seq"], 1);
         assert_eq!(agents[0]["turn"], 4);
+
+        let cleared = lines.push(ev(17, "status", "a1", json!({
+            "status": {"state": "idle"},
+            "records": {},
+            "reported": true,
+            "pending_permission": null,
+            "inbox_len": 0,
+            "inbox": []
+        })).as_bytes());
+        assert!(cleared.terminals);
+        let live_cleared = lines.live_for(&hello, &machines);
+        assert_eq!(live_cleared["agents"][0]["inbox_len"], 0);
+        assert_eq!(live_cleared["agents"][0]["inbox"], json!([]));
 
         let missed = format!("{}\n", json!({
             "jsonrpc": "2.0",

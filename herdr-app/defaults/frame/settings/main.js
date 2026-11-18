@@ -41,7 +41,17 @@ const LOOKS = { main: "Herdr2", terminals: "Terminals", win98: "Herdr 98" };
 const PANELS = [
   ["files", "Files", "文件", "The folder you're in as a tree, with highlighted file preview.", "以树形结构浏览当前目录，支持语法高亮只读预览。"],
   ["changes", "Changes", "变更", "Every file changed in git, its diff, and a commit box.", "查看 Git 工作区改动、逐行 diff 并直接提交。"],
+  ["checkpoints", "Checkpoints", "快照", "Turn-by-turn snapshots with diff preview and session/workspace restore.", "按对话轮次查看快照时间轴、对比 diff 并一键恢复会话或工作区。"],
 ];
+
+function resolveEnabledPanels(defaultIds) {
+  const saved = shared("workspace.panels");
+  if (!Array.isArray(saved)) return defaultIds;
+  if (!shared("workspace.panels_has_checkpoints") && !saved.includes("checkpoints")) {
+    return [...saved, "checkpoints"];
+  }
+  return saved;
+}
 const APPEARANCES = [
   [null, "System", "跟随系统"],
   ["light", "Light", "浅色"],
@@ -598,13 +608,14 @@ export default class Settings extends View {
   }
 
   panels() {
-    return shared("workspace.panels") ?? PANELS.map(([id]) => id);
+    return resolveEnabledPanels(PANELS.map(([id]) => id));
   }
 
   togglePanel(id, cx) {
     const cur = this.panels();
     const on = cur.includes(id);
     const next = on ? cur.filter((x) => x !== id) : [...cur, id];
+    setShared("workspace.panels_has_checkpoints", true);
     setShared("workspace.panels", next);
     const find = (node, target) => {
       if (!node) return null;

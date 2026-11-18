@@ -10,14 +10,28 @@ function parseAttrs(raw) {
   return attrs;
 }
 
+export function stripHandoffEnvelope(rawText) {
+  let text = String(rawText ?? "").replace(/\r\n/g, "\n");
+  let handoffMeta = null;
+  const openClosed = text.trimStart().match(/^<herdr2-handoff\b([^>]*)>([\s\S]*?)<\/herdr2-handoff>\s*([\s\S]*)$/i);
+  if (openClosed) {
+    const attrs = parseAttrs(openClosed[1] ?? "");
+    handoffMeta = { kind: attrs.kind || "handoff", from: attrs.from || "" };
+    text = openClosed[3] ?? "";
+  }
+  return { handoffMeta, text: text.trim() };
+}
+
 /**
  * Strips herdr2's `<h2 ...>...</h2>` envelope around delegated user prompts and
- * returns the extracted sender metadata plus clean message text.
+ * `<herdr2-handoff ...>...</herdr2-handoff>` context envelopes, returning the
+ * extracted sender metadata plus clean message text.
  */
 export function parseUserEnvelope(rawText, entryFrom = null) {
   let text = String(rawText ?? "").replace(/\r\n/g, "\n");
   let from = entryFrom || null;
   let reach = null;
+  let handoff = null;
 
   for (let i = 0; i < 3; i++) {
     const trimmed = text.trim();
@@ -40,9 +54,16 @@ export function parseUserEnvelope(rawText, entryFrom = null) {
     break;
   }
 
+  const ho = stripHandoffEnvelope(text);
+  if (ho.handoffMeta) {
+    handoff = ho.handoffMeta;
+    text = ho.text;
+  }
+
   return {
     from,
     reach,
+    handoff,
     body: text.trim(),
   };
 }
@@ -736,6 +757,39 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
   let activeGroup = null;
   let activeStderr = null;
   let currentSpeakerKey = null;
+  const checkpointStatsByTurn = new Map();
+
+  const normalizeCheckpointFiles = (rawFiles) => {
+    const files = (Array.isArray(rawFiles) ? rawFiles : []).map((f) => ({
+      path: String(f?.path ?? ""),
+      additions: Number(f?.added ?? f?.additions ?? 0) || 0,
+      deletions: Number(f?.deleted ?? f?.deletions ?? 0) || 0,
+      ...(f?.binary ? { binary: true } : {}),
+    })).filter((f) => f.path);
+    const totalAdditions = files.reduce((s, f) => s + f.additions, 0);
+    const totalDeletions = files.reduce((s, f) => s + f.deletions, 0);
+    return { files, totalAdditions, totalDeletions };
+  };
+
+  if (options?.checkpointsByTurn) {
+    const src = options.checkpointsByTurn instanceof Map
+      ? Array.from(options.checkpointsByTurn.entries())
+      : Array.isArray(options.checkpointsByTurn)
+        ? options.checkpointsByTurn.map((c) => [c?.turn, c])
+        : Object.entries(options.checkpointsByTurn);
+    for (const [k, meta] of src) {
+      const turn = Number(meta?.turn ?? k);
+      if (!Number.isFinite(turn) || turn <= 0) continue;
+      const norm = normalizeCheckpointFiles(meta?.files);
+      if (norm.files.length > 0) {
+        checkpointStatsByTurn.set(turn, {
+          ...norm,
+          checkpointTurn: turn,
+          fromCheckpoint: true,
+        });
+      }
+    }
+  }
 
   const flushGroup = () => {
     if (!activeGroup) return;
@@ -771,16 +825,39 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
       flushStderr();
       currentSpeakerKey = null;
       const env = parseUserEnvelope(entry.text, entry.from ?? null);
-      const body = env.body || String(entry.text ?? "").trim();
+      const fallbackBody = env.handoff
+        ? `[${env.handoff.kind || "handoff"}${env.handoff.from ? ` from ${env.handoff.from}` : ""}]`
+        : "";
+      const body = env.body || fallbackBody || String(entry.text ?? "").trim();
       items.push({
         kind: "user",
         id: `u-${idx}`,
         turn: entry.turn ?? 0,
         from: env.from,
         reach: env.reach,
+        handoff: env.handoff,
         body,
         isDelegated: Boolean(env.from),
         foldSummary: summarizeUserPrompt(body),
+        ts_ms: entry.ts_ms ?? 0,
+      });
+      return;
+    }
+
+    if (kind === "handoff") {
+      flushGroup();
+      flushStderr();
+      currentSpeakerKey = null;
+      items.push({
+        kind: "handoff",
+        id: `ho-${idx}`,
+        turn: entry.turn ?? 0,
+        handoff_kind: entry.handoff_kind || "handoff",
+        from_address: entry.from_address || "",
+        from_provider: entry.from_provider || null,
+        from_session_id: entry.from_session_id || null,
+        from_turns: entry.from_turns || null,
+        artifact_path: entry.artifact_path || null,
         ts_ms: entry.ts_ms ?? 0,
       });
       return;
@@ -899,6 +976,35 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
       return;
     }
 
+    if (kind === "checkpoint") {
+      const turn = Number(entry.turn ?? 0);
+      if (turn > 0) {
+        const norm = normalizeCheckpointFiles(entry.files);
+        if (norm.files.length > 0) {
+          checkpointStatsByTurn.set(turn, {
+            ...norm,
+            checkpointTurn: turn,
+            fromCheckpoint: true,
+          });
+        }
+      }
+      return;
+    }
+
+    if (kind === "rewind") {
+      flushGroup();
+      flushStderr();
+      currentSpeakerKey = null;
+      items.push({
+        kind: "rewind",
+        id: `rw-${idx}`,
+        to_turn: entry.to_turn ?? 0,
+        restore_files: Boolean(entry.restore_files),
+        ts_ms: entry.ts_ms ?? 0,
+      });
+      return;
+    }
+
     if (kind === "error") {
       flushGroup();
       flushStderr();
@@ -958,6 +1064,9 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
   for (const [turn, steps] of toolStepsByTurn.entries()) {
     const summary = extractTurnChangedFiles(steps, cwd);
     if (summary.files.length > 0) changedByTurn.set(turn, summary);
+  }
+  for (const [turn, ckptSummary] of checkpointStatsByTurn.entries()) {
+    changedByTurn.set(turn, ckptSummary);
   }
   compact.forEach((it, idx) => {
     const turn = it.turn ?? 0;
@@ -1234,4 +1343,38 @@ export function filterConfigChoices(choices, query) {
   return list.filter((c) =>
     [c.name, c.value, c.description, c.group].some((f) => String(f ?? "").toLowerCase().includes(q)),
   );
+}
+
+/**
+ * Normalizes queued ACP inbox items for display and inline edit/removal,
+ * stripping `<h2 ...>...</h2>` envelopes and resolving friendly sender labels.
+ */
+export function normalizeInboxItems(rawInbox, terminalsList = [], currentTerminal = "") {
+  if (!Array.isArray(rawInbox) || rawInbox.length === 0) return [];
+  const slash = typeof currentTerminal === "string" ? currentTerminal.lastIndexOf("/") : -1;
+  const prefix = slash >= 0 ? currentTerminal.slice(0, slash + 1) : "";
+  const list = Array.isArray(terminalsList) ? terminalsList : [];
+  return rawInbox
+    .filter((raw) => raw && raw.id != null)
+    .map((raw, idx) => {
+      const parsed = parseUserEnvelope(raw.text ?? "", raw.from ?? null);
+      const body = parsed.body || String(raw.text ?? "").trim();
+      const from = parsed.from || null;
+      let fromLabel = null;
+      if (from) {
+        const sender = list.find((x) => x?.address === from || (prefix && x?.address === `${prefix}${from}`));
+        fromLabel = sender?.name && sender.name !== from ? `${sender.name} (${from})` : from;
+      }
+      return {
+        id: Number(raw.id),
+        index: idx + 1,
+        rawText: String(raw.text ?? ""),
+        body,
+        preview: body.replace(/\s*\n\s*/g, " ↵ "),
+        from,
+        fromLabel,
+        time: formatTime(raw.queued_ms),
+        queued_ms: Number(raw.queued_ms ?? 0),
+      };
+    });
 }

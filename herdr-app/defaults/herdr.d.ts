@@ -13,9 +13,10 @@ export interface ExecResult {
  *  Rejects when it can't start (not installed, no such folder, the machine is unreachable). */
 export function exec(command: string, args?: string[], options?: { cwd?: string; on?: string | null; timeout?: number }): Promise<ExecResult>;
 
-/** Runs `hc` / `h2` with the given arguments. Add "--json" for machine output. */
-export function hc(args: string[]): Promise<ExecResult>;
-export function h2(args: string[]): Promise<ExecResult>;
+/** Runs `hc` / `h2` with the given arguments. Add "--json" for machine output.
+ *  `timeout`: milliseconds, defaults to 30,000, capped at 600,000 (10 minutes). */
+export function hc(args: string[], options?: { timeout?: number }): Promise<ExecResult>;
+export function h2(args: string[], options?: { timeout?: number }): Promise<ExecResult>;
 
 /** The user's home directory. */
 export function home(): string;

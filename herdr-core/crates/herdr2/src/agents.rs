@@ -15,6 +15,19 @@ fn default_true() -> bool {
     true
 }
 
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+pub struct QueuedInput {
+    /// Monotonic queue item id used for race-safe edit and removal.
+    pub id: u64,
+    /// Raw prompt text queued for delivery (may carry an `<h2 ...>` envelope when delegated).
+    pub text: String,
+    /// Optional sender address (`a3` / `t1`) when sent by another agent or terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Epoch milliseconds when this item entered the inbox queue.
+    pub queued_ms: u64,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq)]
 pub struct Agent {
     /// `a7`: this agent forever on this core.
@@ -65,6 +78,9 @@ pub struct Agent {
     /// Number of user messages queued behind the active ACP turn.
     #[serde(default, skip_serializing_if = "is_zero_usize")]
     pub inbox_len: usize,
+    /// Prompts queued behind the active ACP turn, in FIFO execution order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inbox: Vec<QueuedInput>,
     /// Restart a crashed or stopped kept agent cleanly (`session/load` when supported). Exit with a code and kill remain final.
     #[serde(default)]
     pub keep: bool,
@@ -151,6 +167,9 @@ pub struct Agent {
     /// Machines (core ids) it started work on: they may call back to it.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub afar: std::collections::BTreeSet<String>,
+    /// Context handoff / fork / side-chat parent lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<crate::handoff::Lineage>,
 }
 
 impl Agent {
@@ -241,6 +260,7 @@ pub struct NewAgent {
     pub mode: Option<String>,
     pub inject_mcp: bool,
     pub permission_mode: PermissionMode,
+    pub lineage: Option<crate::handoff::Lineage>,
 }
 
 impl Default for NewAgent {
@@ -262,6 +282,7 @@ impl Default for NewAgent {
             mode: None,
             inject_mcp: true,
             permission_mode: PermissionMode::default(),
+            lineage: None,
         }
     }
 }
@@ -311,6 +332,7 @@ impl Registry {
                 permission_mode: new.permission_mode,
                 pending_permission: None,
                 inbox_len: 0,
+                inbox: Vec::new(),
                 keep: new.keep,
                 restart_env: BTreeMap::new(),
                 restart_after_ms: 0,
@@ -346,6 +368,7 @@ impl Registry {
                 template: new.template.map(|t| t.name),
                 first_message: None,
                 afar: Default::default(),
+                lineage: new.lineage,
             },
         );
         Ok(id)
@@ -380,6 +403,7 @@ impl Registry {
             }
             a.pending_permission = None;
             a.inbox_len = 0;
+            a.inbox.clear();
             a.exit_code = code;
             a.signal = signal;
             a.reason = Some(reason.into());

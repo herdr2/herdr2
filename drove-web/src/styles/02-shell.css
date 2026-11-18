@@ -257,7 +257,7 @@
   padding: 8px;
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 6px;
 }
 
 .run-tab-row {
@@ -276,16 +276,17 @@
   flex: none;
   width: 100%;
   padding: 9px 11px 9px 13px;
-  border: 1px solid transparent;
+  border: 1px solid color-mix(in srgb, var(--border) 82%, transparent);
   border-radius: 10px;
-  background: transparent;
+  background: color-mix(in srgb, var(--surface) 76%, var(--bg-sidebar, var(--surface-2)));
   color: var(--text-2);
   text-align: left;
   cursor: pointer;
   transition: background 140ms ease, border-color 140ms ease, color 140ms ease, box-shadow 140ms ease;
 }
 .run-tab:hover {
-  background: color-mix(in srgb, var(--surface-3) 55%, transparent);
+  background: var(--surface-elevated, var(--surface));
+  border-color: var(--border-strong);
   color: var(--text);
 }
 .run-tab:focus-visible {
@@ -294,8 +295,8 @@
   box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 18%, transparent);
 }
 .run-tab[aria-selected="true"] {
-  background: var(--surface-elevated, var(--surface));
-  border-color: var(--border);
+  background: color-mix(in srgb, var(--accent-soft) 52%, var(--surface-elevated, var(--surface)));
+  border-color: color-mix(in srgb, var(--accent) 52%, var(--border));
   box-shadow: var(--shadow-xs);
   color: var(--text);
 }
@@ -352,10 +353,12 @@
   cursor: grabbing;
 }
 .sidebar__tabs--dragging .run-tab:not(.run-tab--dragging):hover {
-  background: transparent;
+  background: color-mix(in srgb, var(--surface) 76%, var(--bg-sidebar, var(--surface-2)));
+  border-color: color-mix(in srgb, var(--border) 82%, transparent);
 }
 .sidebar__tabs--dragging .run-tab[aria-selected="true"]:not(.run-tab--dragging):hover {
-  background: var(--surface-elevated, var(--surface));
+  background: color-mix(in srgb, var(--accent-soft) 52%, var(--surface-elevated, var(--surface)));
+  border-color: color-mix(in srgb, var(--accent) 52%, var(--border));
 }
 /* the lifted tab: above its neighbours, with a shadow, no transition so it
    tracks the pointer exactly */
@@ -732,13 +735,13 @@
 
 .btn--primary {
   background: var(--accent);
-  border-color: color-mix(in srgb, var(--accent) 85%, #000);
+  border-color: var(--accent);
   color: var(--accent-ink);
   box-shadow: var(--shadow-xs);
 }
 .btn--primary:hover:not(:disabled) {
   background: var(--accent-hover);
-  border-color: color-mix(in srgb, var(--accent-hover) 85%, #000);
+  border-color: var(--accent-hover);
 }
 .btn--secondary {
   background: var(--surface-2);
@@ -752,13 +755,13 @@
 }
 .btn--danger {
   background: var(--danger);
-  border-color: color-mix(in srgb, var(--danger) 85%, #000);
+  border-color: var(--danger);
   color: var(--accent-ink);
   box-shadow: var(--shadow-xs);
 }
 .btn--danger:hover:not(:disabled) {
-  background: color-mix(in srgb, var(--danger) 88%, #000);
-  border-color: color-mix(in srgb, var(--danger) 75%, #000);
+  background: color-mix(in srgb, var(--danger) 90%, #000);
+  border-color: color-mix(in srgb, var(--danger) 90%, #000);
 }
 .btn--ghost {
   background: transparent;

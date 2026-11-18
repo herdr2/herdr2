@@ -498,3 +498,66 @@ test("tabs and pane headers show agent type (ACP / Terminal) and live/paused exe
   expect(findById(shPaneTree, "ph-type-p-sh")).toBeNull();
   expect(findById(shPaneTree, "ph-time-p-sh")).toBeNull();
 });
+
+test("panel buttons render files, changes, and checkpoints side-by-side including legacy saved prefs", () => {
+  const sharedMap: Record<string, unknown> = {};
+  const runCalls: unknown[][] = [];
+  const makeTabs = (lang = "zh-CN") => {
+    const view = new (new Function(...Object.keys(values), source.replace(/^import .*;\n/gm, "").replace("export default class Tabs", "return class Tabs"))(
+      ...Object.values({
+        ...values,
+        shared: (k: string) => (k in sharedMap ? sharedMap[k] : null),
+        settings: () => ({ zoom: 1, language: lang }),
+        layout: () => ({
+          id: "root",
+          children: [
+            { id: "panel", hidden: false },
+            { id: "panel-body", active: "checkpoints" },
+          ],
+        }),
+        run: (cmd: string, args: unknown) => {
+          runCalls.push([cmd, args]);
+        },
+      }),
+    ))();
+    view.init();
+    return view;
+  };
+  const findById = (node: any, id: string): any => {
+    if (!node) return null;
+    if (node.calls?.id?.[0] === id) return node;
+    for (const ch of node.nodes ?? []) {
+      const hit = findById(ch, id);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  const collectTexts = (node: any): string[] => {
+    if (!node) return [];
+    const out: string[] = [];
+    for (const ch of node.nodes ?? []) {
+      if (typeof ch === "string") out.push(ch);
+      else out.push(...collectTexts(ch));
+    }
+    return out;
+  };
+
+  // Fresh install (no shared workspace.panels): all 3 panels show side-by-side.
+  const defaultTree = makeTabs("zh-CN").render();
+  expect(collectTexts(findById(defaultTree, "panel-files"))).toContain("文件");
+  expect(collectTexts(findById(defaultTree, "panel-changes"))).toContain("变更");
+  expect(collectTexts(findById(defaultTree, "panel-checkpoints"))).toContain("快照");
+
+  // Legacy saved ["files", "changes"] without workspace.panels_has_checkpoints still reveals Checkpoints.
+  sharedMap["workspace.panels"] = ["files", "changes"];
+  const legacyTree = makeTabs("en").render();
+  expect(collectTexts(findById(legacyTree, "panel-checkpoints"))).toContain("Checkpoints");
+
+  // Explicitly disabled checkpoints after migration flag is respected.
+  sharedMap["workspace.panels_has_checkpoints"] = true;
+  sharedMap["workspace.panels"] = ["files", "changes"];
+  const disabledTree = makeTabs("zh-CN").render();
+  expect(findById(disabledTree, "panel-files")).not.toBeNull();
+  expect(findById(disabledTree, "panel-changes")).not.toBeNull();
+  expect(findById(disabledTree, "panel-checkpoints")).toBeNull();
+});

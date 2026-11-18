@@ -9,24 +9,16 @@
 .dag-zone {
   position: absolute;
   border-radius: 18px;
-  border: 1.5px dashed color-mix(in srgb, var(--zone-accent, var(--border-strong)) 46%, var(--border));
-  background: color-mix(in srgb, var(--zone-bg, var(--surface-2)) 18%, transparent);
+  border: 1px dashed var(--border-strong);
+  background: color-mix(in srgb, var(--surface-2) 36%, transparent);
   pointer-events: none;
 }
 
-.dag-zone--orch {
-  --zone-accent: var(--role-coord);
-  --zone-bg: var(--role-coord-bg);
-}
-
-.dag-zone--tasks {
-  --zone-accent: var(--role-task);
-  --zone-bg: var(--surface-2);
-}
-
+.dag-zone--orch,
+.dag-zone--tasks,
 .dag-zone--review {
-  --zone-accent: var(--role-reviewer);
-  --zone-bg: var(--role-reviewer-bg);
+  --zone-accent: var(--text-2);
+  --zone-bg: var(--surface-2);
 }
 
 .dag-zone__head {
@@ -44,7 +36,7 @@
   font-family: var(--font-serif);
   font-weight: 600;
   letter-spacing: -0.015em;
-  color: color-mix(in srgb, var(--zone-accent, var(--text-2)) 78%, var(--text));
+  color: var(--text-2);
 }
 
 .dag-zone__meta {
@@ -55,8 +47,8 @@
 .dag-worker-group {
   position: absolute;
   border-radius: 14px;
-  border: 1px dashed color-mix(in srgb, var(--wgroup-accent, var(--border-strong)) 40%, transparent);
-  background: color-mix(in srgb, var(--wgroup-accent, var(--surface-2)) 10%, transparent);
+  border: 1px dashed var(--border);
+  background: transparent;
   pointer-events: none;
   transition: opacity 0.15s, border-color 0.15s;
 }
@@ -90,7 +82,7 @@
 
 .dag-worker-group__title {
   font-weight: 650;
-  color: color-mix(in srgb, var(--wgroup-accent, var(--text-2)) 82%, var(--text));
+  color: var(--text-2);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -122,7 +114,7 @@
 }
 
 .dag-zone-seam--review {
-  border-color: color-mix(in srgb, var(--role-reviewer) 50%, var(--border));
+  border-color: var(--border-strong);
 }
 
 .dag-lens,
@@ -269,13 +261,13 @@
 }
 
 .gnode--worker[data-role] {
-  background: color-mix(in srgb, var(--worker-role, var(--role-worker)) 9%, var(--surface-elevated, var(--surface)));
+  background: var(--surface-elevated, var(--surface));
 }
 .gnode--worker[data-role]:not(.gnode--selected):not(.gnode--rel-ran) {
-  border-color: color-mix(in srgb, var(--worker-role, var(--role-worker)) 30%, var(--border));
+  border-color: var(--border);
 }
 .gnode--worker[data-role]:not(.gnode--selected):not(.gnode--rel-ran):hover {
-  border-color: color-mix(in srgb, var(--worker-role, var(--role-worker)) 48%, var(--border-strong));
+  border-color: var(--border-strong);
 }
 
 .worker-num--role {

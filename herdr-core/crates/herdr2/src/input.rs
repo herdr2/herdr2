@@ -38,6 +38,21 @@ pub fn format_prompt(text: &str, from: Option<&str>) -> String {
     }
 }
 
+/// Replaces the message body while preserving an outer `<h2 ...>...</h2>` envelope when present.
+pub fn replace_prompt_body(existing: &str, new_body: &str) -> String {
+    if new_body.trim_start().starts_with("<h2") {
+        return new_body.to_string();
+    }
+    let trimmed = existing.trim();
+    if trimmed.starts_with("<h2")
+        && let Some(gt) = trimmed.find('>')
+        && trimmed.ends_with("</h2>")
+    {
+        return format!("{}\n{}\n</h2>", &trimmed[..=gt], new_body);
+    }
+    new_body.to_string()
+}
+
 /// Computes the target `after_turn` threshold for waiting on a newly queued or steered prompt.
 pub fn target_after_turn(current_turn: u64, was_working: bool, queued_before: usize, steer: bool) -> u64 {
     if steer {
@@ -96,7 +111,7 @@ impl Core {
             let agent_addr = a.address.clone();
             let queued_before = st.inboxes.get(&id).map_or(0, std::collections::VecDeque::len);
             let after_turn = target_after_turn(turn, was_working, queued_before, steer);
-            let prompt = QueuedPrompt { text: text.to_string(), from: from.map(String::from) };
+            let prompt = QueuedPrompt::new(text.to_string(), from.map(String::from));
 
             let Some(session) = st.sessions.get(&id).map(SessionSender::clone_cmd) else {
                 if st.recovering.contains(&id) {
@@ -106,22 +121,8 @@ impl Core {
                     } else {
                         q.push_back(prompt);
                     }
-                    let len = q.len();
-                    let status_payload = if let Some(agent) = st.reg.agents.get_mut(&id) {
-                        agent.inbox_len = len;
-                        Some(serde_json::json!({
-                            "status": agent.status,
-                            "records": agent.records,
-                            "reported": agent.reported,
-                            "pending_permission": agent.pending_permission,
-                            "inbox_len": len,
-                        }))
-                    } else {
-                        None
-                    };
-                    if let Some(payload) = status_payload {
-                        self.emit(&mut st, "status", id, payload);
-                    }
+                    self.sync_inbox(&mut st, id, true);
+                    let len = st.reg.agents.get(&id).map_or(0, |a| a.inbox_len);
                     self.save(&st);
                     self.changed.notify_waiters();
                     return Ok(Sent { status: word, turn, started: Some(false), after_turn, inbox_len: len });
@@ -134,10 +135,10 @@ impl Core {
                 queued_before + 1
             } else {
                 st.inboxes.entry(id).or_default().push_back(prompt);
-                let len = st.inboxes.get(&id).map_or(0, std::collections::VecDeque::len);
-                if let Some(agent) = st.reg.agents.get_mut(&id) {
-                    agent.inbox_len = len;
-                }
+                self.sync_inbox(&mut st, id, true);
+                let len = st.reg.agents.get(&id).map_or(0, |a| a.inbox_len);
+                self.save_soon();
+                self.changed.notify_waiters();
                 let _ = session.send(SessionCommand::WakeInbox);
                 len
             };
@@ -182,6 +183,77 @@ impl Core {
             _ => Interrupted::Stopped,
         };
         Ok((outcome, "session/cancel".into()))
+    }
+
+    /// Updates a queued inbox item's prompt text in place before its turn begins.
+    pub fn edit_inbox(&self, id: u32, item_id: u64, text: &str) -> Result<Agent, RpcError> {
+        if text.trim().is_empty() {
+            return Err(RpcError::invalid_params("queued prompt text cannot be empty"));
+        }
+        let mut st = self.lock();
+        let addr = {
+            let a = st
+                .reg
+                .agents
+                .get(&id)
+                .ok_or_else(|| RpcError::new("not_found", format!("no agent {}", address(id)), ""))?;
+            if !a.is_live() {
+                return Err(RpcError::new("finished", format!("{} already exited", a.address), ""));
+            }
+            a.address.clone()
+        };
+        let Some(item) = st.inboxes.get_mut(&id).and_then(|q| q.iter_mut().find(|item| item.id == item_id)) else {
+            return Err(RpcError::new(
+                "not_found",
+                format!("queued message #{item_id} is no longer in {addr}'s inbox"),
+                "it may have already started; refresh transcript",
+            ));
+        };
+        item.text = replace_prompt_body(&item.text, text);
+        self.sync_inbox(&mut st, id, true);
+        self.save(&st);
+        self.changed.notify_waiters();
+        Ok(st.reg.agents.get(&id).expect("checked agent").clone())
+    }
+
+    /// Removes a queued inbox item before its turn begins.
+    pub fn remove_inbox(&self, id: u32, item_id: u64) -> Result<Agent, RpcError> {
+        let mut st = self.lock();
+        let addr = {
+            let a = st
+                .reg
+                .agents
+                .get(&id)
+                .ok_or_else(|| RpcError::new("not_found", format!("no agent {}", address(id)), ""))?;
+            if !a.is_live() {
+                return Err(RpcError::new("finished", format!("{} already exited", a.address), ""));
+            }
+            a.address.clone()
+        };
+        let removed = if let Some(q) = st.inboxes.get_mut(&id) {
+            if let Some(pos) = q.iter().position(|item| item.id == item_id) {
+                q.remove(pos);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        if !removed {
+            return Err(RpcError::new(
+                "not_found",
+                format!("queued message #{item_id} is no longer in {addr}'s inbox"),
+                "it may have already started; refresh transcript",
+            ));
+        }
+        if st.inboxes.get(&id).is_some_and(std::collections::VecDeque::is_empty) {
+            st.inboxes.remove(&id);
+        }
+        self.sync_inbox(&mut st, id, true);
+        self.save(&st);
+        self.changed.notify_waiters();
+        Ok(st.reg.agents.get(&id).expect("checked agent").clone())
     }
 }
 
@@ -255,6 +327,7 @@ mod tests {
                         mode: None,
                         inject_mcp: false,
                         permission_mode: crate::permissions::PermissionMode::ApproveAll,
+                        lineage: None,
                     },
                     crate::runtime::now_ms(),
                 )
@@ -279,7 +352,36 @@ mod tests {
             assert_eq!(q[0].text, "first queued");
             assert_eq!(q[1].text, "second queued");
             assert_eq!(st.reg.agents.get(&id).unwrap().inbox_len, 2);
+            assert_eq!(st.reg.agents.get(&id).unwrap().inbox.len(), 2);
         }
+
+        let item2_id = core.lock().inboxes[&id][1].id;
+        let updated = core.edit_inbox(id, item2_id, "edited second").unwrap();
+        assert_eq!(updated.inbox[1].text, "edited second");
+
+        let err = core.edit_inbox(id, item2_id, "   ").unwrap_err();
+        assert_eq!(err.kind, "invalid_params");
+
+        let after_rm = core.remove_inbox(id, item2_id).unwrap();
+        assert_eq!(after_rm.inbox_len, 1);
+        assert_eq!(after_rm.inbox[0].text, "first queued");
+
+        let err = core.remove_inbox(id, item2_id).unwrap_err();
+        assert_eq!(err.kind, "not_found");
+
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replaces_prompt_body_preserving_h2_envelope() {
+        assert_eq!(replace_prompt_body("plain old", "plain new"), "plain new");
+        assert_eq!(
+            replace_prompt_body("<h2 from=\"a1\">\nold body\n</h2>", "new body"),
+            "<h2 from=\"a1\">\nnew body\n</h2>"
+        );
+        assert_eq!(
+            replace_prompt_body("<h2 from=\"a1\">\nold\n</h2>", "<h2 from=\"a2\">\ncustom\n</h2>"),
+            "<h2 from=\"a2\">\ncustom\n</h2>"
+        );
     }
 }

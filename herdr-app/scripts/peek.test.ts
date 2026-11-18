@@ -18,6 +18,7 @@ import {
   parseToolDetail,
   extractTurnChangedFiles,
   resolveEffortVisual,
+  normalizeInboxItems,
 } from "../defaults/mods/peek/acp_model.js";
 
 describe("parseUserEnvelope", () => {
@@ -645,5 +646,130 @@ describe("PTY structured formatting & snapshot fallback", () => {
     ].join("\n");
     const cleaned = cleanTerminalSnapshot(tui);
     expect(cleaned).toBe("❯ Write tests\n│ standalone bar │");
+  });
+
+  test("attaches checkpoint stats and rewind dividers across ACP and PTY turns", () => {
+    const items = buildConversationItems(
+      [
+        { kind: "user", turn: 1, text: "Add helper", ts_ms: 10 },
+        { kind: "assistant", turn: 1, text: "Added helper.", ts_ms: 20 },
+        {
+          kind: "checkpoint",
+          turn: 1,
+          ref_name: "refs/herdr2/checkpoints/default/a1/1",
+          commit_oid: "abc",
+          files: [{ path: "src/helper.rs", added: 14, deleted: 2, binary: false }],
+          ts_ms: 25,
+        },
+        { kind: "rewind", to_turn: 1, restore_files: true, ts_ms: 30 },
+      ],
+      "",
+      false,
+      { cwd: "/repo" },
+    );
+
+    expect(items.length).toBe(3);
+    const reply = items[1] as any;
+    expect(reply.changedFiles).toEqual({
+      checkpointTurn: 1,
+      fromCheckpoint: true,
+      totalAdditions: 14,
+      totalDeletions: 2,
+      files: [{ path: "src/helper.rs", additions: 14, deletions: 2 }],
+    });
+    expect(items[2]).toMatchObject({ kind: "rewind", to_turn: 1, restore_files: true });
+
+    const ptyItems = buildConversationItems(
+      [
+        { kind: "user", turn: 1, text: "Fix bug", ts_ms: 10 },
+        { kind: "assistant", turn: 1, text: "Fixed.", ts_ms: 20 },
+      ],
+      "",
+      false,
+      {
+        isPty: true,
+        checkpointsByTurn: [{ turn: 1, files: [{ path: "main.ts", added: 5, deleted: 1 }] }],
+      },
+    );
+    expect((ptyItems[1] as any).changedFiles.checkpointTurn).toBe(1);
+    expect((ptyItems[1] as any).changedFiles.totalAdditions).toBe(5);
+
+    // Restoring at Turn A keeps Turn A & earlier turns and displays the rewind divider after Turn A.
+    const rewoundA = buildConversationItems([
+      { kind: "user", turn: 1, text: "Prompt A", ts_ms: 10 },
+      { kind: "assistant", turn: 1, text: "Answer A", ts_ms: 20 },
+      { kind: "rewind", to_turn: 1, restore_files: true, ts_ms: 30 },
+    ]);
+    expect(rewoundA.map((it: any) => it.kind)).toEqual(["user", "assistant", "rewind"]);
+    expect((rewoundA[0] as any).turn).toBe(1);
+    expect((rewoundA[1] as any).turn).toBe(1);
+    expect((rewoundA[2] as any).to_turn).toBe(1);
+  });
+
+  test("renders handoff transcript banner and strips <herdr2-handoff> envelope", () => {
+    const items = buildConversationItems([
+      {
+        kind: "handoff",
+        turn: 0,
+        handoff_kind: "side-chat",
+        from_address: "a1",
+        from_provider: "claude",
+        from_turns: "1-3",
+        ts_ms: 5,
+      },
+      {
+        kind: "user",
+        turn: 1,
+        text: '<herdr2-handoff kind="side-chat" from="a1">\n# Context Handoff\nDetails\n</herdr2-handoff>\n\nCheck race condition in auth.rs',
+        ts_ms: 10,
+      },
+      { kind: "assistant", turn: 1, text: "Found mutex ordering issue.", ts_ms: 20 },
+    ]);
+
+    expect(items.map((it: any) => it.kind)).toEqual(["handoff", "user", "assistant"]);
+    expect(items[0]).toMatchObject({
+      kind: "handoff",
+      handoff_kind: "side-chat",
+      from_address: "a1",
+      from_provider: "claude",
+      from_turns: "1-3",
+    });
+    expect((items[1] as any).body).toBe("Check race condition in auth.rs");
+    expect((items[1] as any).handoff).toEqual({ kind: "side-chat", from: "a1" });
+  });
+});
+
+describe("normalizeInboxItems", () => {
+  test("strips <h2 from=...> envelope, resolves friendly sender labels, and formats previews", () => {
+    const items = normalizeInboxItems(
+      [
+        { id: 101, text: "Check logs\nthen retry", queued_ms: 1700000000000 },
+        { id: 102, text: '<h2 from="a2">\nRun integration tests\n</h2>', from: "a2", queued_ms: 1700000060000 },
+      ],
+      [{ address: "wsl/a2", name: "Tester" }],
+      "wsl/a1",
+    );
+    expect(items).toHaveLength(2);
+    expect(items[0]).toMatchObject({
+      id: 101,
+      index: 1,
+      body: "Check logs\nthen retry",
+      preview: "Check logs ↵ then retry",
+      from: null,
+      fromLabel: null,
+    });
+    expect(items[1]).toMatchObject({
+      id: 102,
+      index: 2,
+      body: "Run integration tests",
+      preview: "Run integration tests",
+      from: "a2",
+      fromLabel: "Tester (a2)",
+    });
+  });
+
+  test("returns empty array when inbox is empty or missing", () => {
+    expect(normalizeInboxItems(null)).toEqual([]);
+    expect(normalizeInboxItems([])).toEqual([]);
   });
 });

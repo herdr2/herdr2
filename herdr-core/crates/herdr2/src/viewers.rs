@@ -275,6 +275,7 @@ impl Core {
         if (change.turn_ended || change.stuck || first_task_finished) && st.pty_reg.terminals[&id].is_live() {
             self.pty_news(st, id);
         }
+        crate::pty_adapters::on_pty_status_transition(self, st, id, &change);
     }
 
     fn viewer<'a>(st: &'a mut State, conn: &Arc<Conn>, channel: u32) -> Option<(u32, &'a mut Viewer)> {

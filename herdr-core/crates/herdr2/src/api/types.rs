@@ -193,7 +193,7 @@ pub struct StopResult {
     pub stopped: bool,
 }
 
-#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema, Default)]
 pub struct RunParams {
     /// ACP preset name (`claude`, `codex`, `gemini`, ...) or explicit command line.
     #[arg(long, value_name = "AGENT")]
@@ -300,6 +300,11 @@ pub struct RunParams {
     /// Who is calling (`H2_AGENT_ID` inside an agent).
     #[arg(skip)]
     pub caller: Option<String>,
+    /// Optional parent lineage attached by `agent.handoff`.
+    #[arg(skip)]
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub lineage: Option<crate::handoff::Lineage>,
 }
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
@@ -385,6 +390,14 @@ pub struct ReadParams {
     #[arg(long, value_parser = cli_seconds)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<f64>,
+    /// First turn to include when slicing transcript entries (1-based, inclusive).
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_turn: Option<u64>,
+    /// Last turn to include when slicing transcript entries (1-based, inclusive).
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_turn: Option<u64>,
 }
 
 /// Session configuration & context-usage metadata inferred from a transcript.
@@ -397,6 +410,10 @@ pub struct ReadSessionMeta {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_usage: Option<crate::acp::proto::AcpContextUsage>,
 }
 
@@ -405,6 +422,8 @@ impl ReadSessionMeta {
         self.model.is_none()
             && self.reasoning_effort.is_none()
             && self.mode.is_none()
+            && self.provider.is_none()
+            && self.session_id.is_none()
             && self.context_usage.is_none()
     }
 }
@@ -518,6 +537,25 @@ pub struct SendResult {
     /// With `wait`: how that turn ended.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait: Option<crate::wait::WaitResult>,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct InboxEditParams {
+    /// The agent: `a7`, a name, or `machine/a7`.
+    pub agent: String,
+    /// Queued inbox item id (`inbox[].id` from `h2 get`).
+    pub id: u64,
+    /// Replacement prompt text.
+    #[arg(allow_hyphen_values = true)]
+    pub text: String,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct InboxRemoveParams {
+    /// The agent: `a7`, a name, or `machine/a7`.
+    pub agent: String,
+    /// Queued inbox item id (`inbox[].id` from `h2 get`).
+    pub id: u64,
 }
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
@@ -896,6 +934,10 @@ pub struct TerminalRunParams {
     pub timeout: Option<f64>,
     #[serde(default)]
     pub caller: Option<String>,
+    /// Optional parent lineage attached by `agent.handoff`.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub lineage: Option<crate::handoff::Lineage>,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -1127,4 +1169,183 @@ pub struct DroveWebOpenParams {
 #[derive(Serialize, JsonSchema)]
 pub struct DroveSubscribeResult {
     pub channel: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct CheckpointListParams {
+    /// Agent (`a1`), terminal (`t1`), remote (`machine/t1`), or unique name.
+    pub target: String,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct CheckpointListResult {
+    pub target: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_root: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation: Option<crate::checkpoint_safety::WorkspaceIsolation>,
+    pub checkpoints: Vec<crate::checkpoint::CheckpointMeta>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct CheckpointCaptureParams {
+    /// Agent (`a1`), terminal (`t1`), remote (`machine/t1`), or unique name (optional inside managed panes).
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Optional human bookmark label recorded alongside this checkpoint.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct CheckpointCaptureResult {
+    pub target: String,
+    pub checkpoint: crate::checkpoint::CheckpointMeta,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct CheckpointDiffParams {
+    /// Agent (`a1`), terminal (`t1`), remote (`machine/t1`), or unique name.
+    pub target: String,
+    /// Starting checkpoint turn (defaults to highest snapshot strictly below `to`).
+    #[serde(default)]
+    pub from: Option<u64>,
+    /// Ending checkpoint turn (defaults to the latest captured checkpoint).
+    #[serde(default)]
+    pub to: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct CheckpointRollbackParams {
+    /// Agent (`a1`), terminal (`t1`), remote (`machine/t1`), or unique name.
+    pub target: String,
+    /// Target checkpoint turn to roll back to (`0` = baseline before Turn 1).
+    pub to: u64,
+    /// Restore workspace files back to `to` (false rewinds conversation memory only).
+    #[serde(default = "default_true")]
+    pub restore_files: bool,
+    /// Confirm destructive file restore on non-worktree checkouts or when idle shells share the folder.
+    #[serde(default)]
+    pub confirm: bool,
+}
+
+#[derive(Serialize, Deserialize, JsonSchema)]
+pub struct CheckpointHookParams {
+    pub terminal: String,
+    pub source: String,
+    #[serde(default)]
+    pub phase: Option<String>,
+    #[serde(default)]
+    pub event: Option<String>,
+    #[serde(default)]
+    pub payload: serde_json::Value,
+}
+
+#[derive(Serialize, JsonSchema, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckpointHookResult {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inject_steps: Vec<serde_json::Value>,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema, Default)]
+pub struct HandoffParams {
+    /// Source agent or terminal (`a1`, `t1`, name, or `machine/a1`).
+    pub source: String,
+    /// Lineage kind (`handoff`, `fork`, or `side-chat`).
+    #[arg(long, value_enum, default_value_t = crate::handoff::LineageKind::Handoff)]
+    #[serde(default)]
+    pub kind: crate::handoff::LineageKind,
+    /// Target preset/program (`claude`, `codex`, `gemini`, `agy`, ...).
+    #[arg(long, value_name = "AGENT")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset: Option<String>,
+    /// Launch an interactive PTY terminal (`t*`) target instead of headless ACP (`a*`).
+    #[arg(long)]
+    #[serde(default)]
+    pub pty: bool,
+    /// Deliver delta/summary into an existing agent or terminal instead of creating a new one.
+    #[arg(long, value_name = "TARGET")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub into: Option<String>,
+    /// First turn from the source transcript to include (1-based, inclusive).
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_turn: Option<u64>,
+    /// Last turn from the source transcript to include (1-based, inclusive).
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to_turn: Option<u64>,
+    /// Optional initial instruction sent after staging handoff context.
+    #[arg(long, value_name = "TEXT")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// Short user note included in the generated handoff package header.
+    #[arg(long, value_name = "TEXT")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// Working directory override (defaults to source agent/terminal cwd).
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Optional unique name for the newly spawned target.
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Model override for newly spawned ACP agent targets.
+    #[arg(long, value_name = "MODEL")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Keep newly spawned target alive across restarts (`--keep`).
+    #[arg(long)]
+    #[serde(default)]
+    pub keep: bool,
+    /// With `--prompt`: wait for the first turn on the target to finish.
+    #[arg(long)]
+    #[serde(default)]
+    pub wait: bool,
+    /// With `--wait`: seconds before returning early (default: config, else 180).
+    #[arg(long, value_parser = cli_seconds)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<f64>,
+    /// Initial columns when spawning a PTY target (`--pty`).
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cols: Option<u16>,
+    /// Initial rows when spawning a PTY target (`--pty`).
+    #[arg(long)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u16>,
+    /// Explicit target command/arguments when spawning with `--pty` (or custom ACP command).
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    #[serde(default)]
+    pub argv: Vec<String>,
+    /// Who is calling (`H2_AGENT_ID` / `H2_TERMINAL_ID`).
+    #[arg(skip)]
+    #[serde(default)]
+    pub caller: Option<String>,
+}
+
+#[derive(Serialize, JsonSchema)]
+pub struct HandoffResult {
+    pub target: String,
+    pub target_kind: String,
+    pub kind: crate::handoff::LineageKind,
+    pub source: String,
+    pub lineage: crate::handoff::Lineage,
+    pub included_turns: Vec<u64>,
+    pub omitted_turns: Vec<u64>,
+    pub bytes: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_path: Option<String>,
+    pub native_fork: bool,
+    pub prompt_sent: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wait: Option<WaitResult>,
 }

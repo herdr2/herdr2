@@ -175,6 +175,13 @@
             ],
             "description": "A template first message that was not sent; retained for later inspection."
           },
+          "inbox": {
+            "description": "Prompts queued behind the active ACP turn, in FIFO execution order.",
+            "items": {
+              "$ref": "#/components/schemas/QueuedInput"
+            },
+            "type": "array"
+          },
           "inbox_len": {
             "description": "Number of user messages queued behind the active ACP turn.",
             "format": "uint",
@@ -196,6 +203,17 @@
               "type": "string"
             },
             "type": "object"
+          },
+          "lineage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Lineage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Context handoff / fork / side-chat parent lineage."
           },
           "mode": {
             "description": "Requested mode override (`session/set_mode`).",
@@ -548,6 +566,231 @@
           "terminal",
           "resize_notifications",
           "automatic_input"
+        ],
+        "type": "object"
+      },
+      "CheckpointCaptureResult": {
+        "properties": {
+          "checkpoint": {
+            "$ref": "#/components/schemas/CheckpointMeta"
+          },
+          "target": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "target",
+          "checkpoint"
+        ],
+        "type": "object"
+      },
+      "CheckpointDiff": {
+        "description": "Unified diff payload between two checkpoints.",
+        "properties": {
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/CheckpointFileStat"
+            },
+            "type": "array"
+          },
+          "from_ref": {
+            "type": "string"
+          },
+          "from_turn": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "patch": {
+            "type": "string"
+          },
+          "to_ref": {
+            "type": "string"
+          },
+          "to_turn": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "from_turn",
+          "to_turn",
+          "from_ref",
+          "to_ref",
+          "files",
+          "patch",
+          "truncated"
+        ],
+        "type": "object"
+      },
+      "CheckpointFileStat": {
+        "description": "Per-file diff summary between two checkpoints.",
+        "properties": {
+          "added": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "binary": {
+            "default": false,
+            "type": "boolean"
+          },
+          "deleted": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "type": "string"
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "path",
+          "added",
+          "deleted"
+        ],
+        "type": "object"
+      },
+      "CheckpointHookResult": {
+        "properties": {
+          "injectSteps": {
+            "items": true,
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "CheckpointListResult": {
+        "properties": {
+          "checkpoints": {
+            "items": {
+              "$ref": "#/components/schemas/CheckpointMeta"
+            },
+            "type": "array"
+          },
+          "cli_kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "isolation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WorkspaceIsolation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "repo_root": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "target",
+          "checkpoints"
+        ],
+        "type": "object"
+      },
+      "CheckpointMeta": {
+        "description": "Persisted metadata for a single turn/manual checkpoint.",
+        "properties": {
+          "commit_oid": {
+            "type": "string"
+          },
+          "files": {
+            "items": {
+              "$ref": "#/components/schemas/CheckpointFileStat"
+            },
+            "type": "array"
+          },
+          "head_oid": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ref_name": {
+            "type": "string"
+          },
+          "ts_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "turn": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "turn",
+          "ref_name",
+          "commit_oid",
+          "ts_ms"
+        ],
+        "type": "object"
+      },
+      "CheckpointRollbackResult": {
+        "description": "Response returned by `checkpoint.rollback`.",
+        "properties": {
+          "restored_files": {
+            "type": "boolean"
+          },
+          "restored_prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rewound_session": {
+            "type": "boolean"
+          },
+          "target": {
+            "type": "string"
+          },
+          "turn": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "target",
+          "turn",
+          "restored_files",
+          "rewound_session"
         ],
         "type": "object"
       },
@@ -1277,6 +1520,135 @@
               "ts_ms"
             ],
             "type": "object"
+          },
+          {
+            "properties": {
+              "commit_oid": {
+                "type": "string"
+              },
+              "files": {
+                "items": {
+                  "$ref": "#/components/schemas/CheckpointFileStat"
+                },
+                "type": "array"
+              },
+              "head_oid": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "kind": {
+                "const": "checkpoint",
+                "type": "string"
+              },
+              "ref_name": {
+                "type": "string"
+              },
+              "ts_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "turn": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "turn",
+              "ref_name",
+              "commit_oid",
+              "ts_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "rewind",
+                "type": "string"
+              },
+              "restore_files": {
+                "type": "boolean"
+              },
+              "to_turn": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "ts_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "to_turn",
+              "restore_files",
+              "ts_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Cross-provider/session context handoff, fork, or side-chat record.",
+            "properties": {
+              "artifact_path": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "from_address": {
+                "type": "string"
+              },
+              "from_provider": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "from_session_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "from_turns": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "handoff_kind": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "handoff",
+                "type": "string"
+              },
+              "ts_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "turn": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "kind",
+              "turn",
+              "handoff_kind",
+              "from_address",
+              "ts_ms"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -1444,6 +1816,81 @@
         ],
         "type": "object"
       },
+      "HandoffResult": {
+        "properties": {
+          "artifact_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "bytes": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "included_turns": {
+            "items": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "$ref": "#/components/schemas/LineageKind"
+          },
+          "lineage": {
+            "$ref": "#/components/schemas/Lineage"
+          },
+          "native_fork": {
+            "type": "boolean"
+          },
+          "omitted_turns": {
+            "items": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "prompt_sent": {
+            "type": "boolean"
+          },
+          "source": {
+            "type": "string"
+          },
+          "target": {
+            "type": "string"
+          },
+          "target_kind": {
+            "type": "string"
+          },
+          "wait": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WaitResult"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "target",
+          "target_kind",
+          "kind",
+          "source",
+          "lineage",
+          "included_turns",
+          "omitted_turns",
+          "bytes",
+          "native_fork",
+          "prompt_sent"
+        ],
+        "type": "object"
+      },
       "HelloResult": {
         "properties": {
           "core": {
@@ -1589,6 +2036,77 @@
           "turn"
         ],
         "type": "object"
+      },
+      "Lineage": {
+        "description": "Lightweight parent pointer stored on `Agent`, `Terminal`, and handoff results.",
+        "properties": {
+          "artifact_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from_turn": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "kind": {
+            "$ref": "#/components/schemas/LineageKind"
+          },
+          "parent": {
+            "description": "Source address on this core (e.g. `a1` or `t2`).",
+            "type": "string"
+          },
+          "parent_provider": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parent_session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "to_turn": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "parent"
+        ],
+        "type": "object"
+      },
+      "LineageKind": {
+        "description": "How a derived session was created from an ancestor session.",
+        "oneOf": [
+          {
+            "const": "handoff",
+            "description": "Continue the same line of work in a new or different agent/provider.",
+            "type": "string"
+          },
+          {
+            "const": "fork",
+            "description": "Branch off to explore or re-implement independently from a turn/state.",
+            "type": "string"
+          },
+          {
+            "const": "side-chat",
+            "description": "Open a temporary side-channel discussion without replacing the main session.",
+            "type": "string"
+          }
+        ]
       },
       "ListResult": {
         "properties": {
@@ -2037,6 +2555,39 @@
         ],
         "type": "object"
       },
+      "QueuedInput": {
+        "properties": {
+          "from": {
+            "description": "Optional sender address (`a3` / `t1`) when sent by another agent or terminal.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "Monotonic queue item id used for race-safe edit and removal.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "queued_ms": {
+            "description": "Epoch milliseconds when this item entered the inbox queue.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "text": {
+            "description": "Raw prompt text queued for delivery (may carry an `<h2 ...>` envelope when delegated).",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "text",
+          "queued_ms"
+        ],
+        "type": "object"
+      },
       "QuotaCard": {
         "properties": {
           "asOf": {
@@ -2222,7 +2773,19 @@
               "null"
             ]
           },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "reasoning_effort": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "session_id": {
             "type": [
               "string",
               "null"
@@ -2413,6 +2976,13 @@
             ],
             "description": "Whether the initial prompt went into the agent inbox."
           },
+          "inbox": {
+            "description": "Prompts queued behind the active ACP turn, in FIFO execution order.",
+            "items": {
+              "$ref": "#/components/schemas/QueuedInput"
+            },
+            "type": "array"
+          },
           "inbox_len": {
             "description": "Number of user messages queued behind the active ACP turn.",
             "format": "uint",
@@ -2434,6 +3004,17 @@
               "type": "string"
             },
             "type": "object"
+          },
+          "lineage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Lineage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Context handoff / fork / side-chat parent lineage."
           },
           "mode": {
             "description": "Requested mode override (`session/set_mode`).",
@@ -2949,6 +3530,17 @@
             },
             "type": "object"
           },
+          "lineage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Lineage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Context handoff / fork / side-chat parent lineage."
+          },
           "name": {
             "type": [
               "string",
@@ -3272,6 +3864,17 @@
             },
             "type": "object"
           },
+          "lineage": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Lineage"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Context handoff / fork / side-chat parent lineage."
+          },
           "name": {
             "type": [
               "string",
@@ -3557,6 +4160,96 @@
           "children"
         ],
         "type": "object"
+      },
+      "WorkspaceBlocker": {
+        "description": "Another live process/agent sharing or nesting the workspace that prevents destructive file restore.",
+        "properties": {
+          "addr": {
+            "type": "string"
+          },
+          "cwd": {
+            "type": "string"
+          },
+          "detail": {
+            "type": "string"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "addr",
+          "kind",
+          "status",
+          "detail",
+          "cwd"
+        ],
+        "type": "object"
+      },
+      "WorkspaceIsolation": {
+        "description": "Three-tier workspace safety assessment for checkpoint file restoration.",
+        "oneOf": [
+          {
+            "description": "Dedicated Git worktree with no co-located agents or shells: restore files directly.",
+            "properties": {
+              "level": {
+                "const": "isolated_worktree",
+                "type": "string"
+              }
+            },
+            "required": [
+              "level"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Main checkout or shared with idle shell panes only: allow restore with confirmation.",
+            "properties": {
+              "idle_shells": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              "is_main_checkout": {
+                "type": "boolean"
+              },
+              "level": {
+                "const": "exclusive_confirm",
+                "type": "string"
+              }
+            },
+            "required": [
+              "level",
+              "is_main_checkout",
+              "idle_shells"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Shared or nested with another live agent or non-shell process (e.g. nvim, cargo, claude): hard-block file restore.",
+            "properties": {
+              "blockers": {
+                "items": {
+                  "$ref": "#/components/schemas/WorkspaceBlocker"
+                },
+                "type": "array"
+              },
+              "level": {
+                "const": "shared_blocked",
+                "type": "string"
+              }
+            },
+            "required": [
+              "level",
+              "blockers"
+            ],
+            "type": "object"
+          }
+        ]
       }
     }
   },
@@ -4433,6 +5126,20 @@
           }
         },
         {
+          "description": "First turn to include when slicing transcript entries (1-based, inclusive).",
+          "name": "from_turn",
+          "required": false,
+          "schema": {
+            "description": "First turn to include when slicing transcript entries (1-based, inclusive).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
           "description": "Print only the final assistant text from the latest turn.",
           "name": "last",
           "required": false,
@@ -4465,6 +5172,20 @@
             "format": "double",
             "type": [
               "number",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Last turn to include when slicing transcript entries (1-based, inclusive).",
+          "name": "to_turn",
+          "required": false,
+          "schema": {
+            "description": "Last turn to include when slicing transcript entries (1-based, inclusive).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
               "null"
             ]
           }
@@ -4646,6 +5367,134 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/SendResult"
+        }
+      }
+    },
+    {
+      "description": "Edit a queued prompt in an ACP agent's serial inbox before its turn starts.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "finished"
+          },
+          "message": "finished"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        }
+      ],
+      "name": "agent.inbox_edit",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The agent: `a7`, a name, or `machine/a7`.",
+          "name": "agent",
+          "required": true,
+          "schema": {
+            "description": "The agent: `a7`, a name, or `machine/a7`.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Queued inbox item id (`inbox[].id` from `h2 get`).",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "description": "Queued inbox item id (`inbox[].id` from `h2 get`).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        {
+          "description": "Replacement prompt text.",
+          "name": "text",
+          "required": true,
+          "schema": {
+            "description": "Replacement prompt text.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/Agent"
+        }
+      }
+    },
+    {
+      "description": "Remove a queued prompt from an ACP agent's serial inbox before its turn starts.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "finished"
+          },
+          "message": "finished"
+        }
+      ],
+      "name": "agent.inbox_remove",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The agent: `a7`, a name, or `machine/a7`.",
+          "name": "agent",
+          "required": true,
+          "schema": {
+            "description": "The agent: `a7`, a name, or `machine/a7`.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Queued inbox item id (`inbox[].id` from `h2 get`).",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "description": "Queued inbox item id (`inbox[].id` from `h2 get`).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/Agent"
         }
       }
     },
@@ -5174,6 +6023,307 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/PutResult"
+        }
+      }
+    },
+    {
+      "description": "Hand off, fork, open a side chat, or merge back session context across ACP agents and PTY terminals.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "name_taken"
+          },
+          "message": "name_taken"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "config"
+          },
+          "message": "config"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "spawn_failed"
+          },
+          "message": "spawn_failed"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "stopping"
+          },
+          "message": "stopping"
+        }
+      ],
+      "name": "agent.handoff",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Explicit target command/arguments when spawning with `--pty` (or custom ACP command).",
+          "name": "argv",
+          "required": false,
+          "schema": {
+            "default": [],
+            "description": "Explicit target command/arguments when spawning with `--pty` (or custom ACP command).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        {
+          "description": "Who is calling (`H2_AGENT_ID` / `H2_TERMINAL_ID`).",
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Who is calling (`H2_AGENT_ID` / `H2_TERMINAL_ID`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Initial columns when spawning a PTY target (`--pty`).",
+          "name": "cols",
+          "required": false,
+          "schema": {
+            "description": "Initial columns when spawning a PTY target (`--pty`).",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Working directory override (defaults to source agent/terminal cwd).",
+          "name": "cwd",
+          "required": false,
+          "schema": {
+            "description": "Working directory override (defaults to source agent/terminal cwd).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "First turn from the source transcript to include (1-based, inclusive).",
+          "name": "from_turn",
+          "required": false,
+          "schema": {
+            "description": "First turn from the source transcript to include (1-based, inclusive).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Deliver delta/summary into an existing agent or terminal instead of creating a new one.",
+          "name": "into",
+          "required": false,
+          "schema": {
+            "description": "Deliver delta/summary into an existing agent or terminal instead of creating a new one.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Keep newly spawned target alive across restarts (`--keep`).",
+          "name": "keep",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Keep newly spawned target alive across restarts (`--keep`).",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Lineage kind (`handoff`, `fork`, or `side-chat`).",
+          "name": "kind",
+          "required": false,
+          "schema": {
+            "$ref": "#/components/schemas/LineageKind",
+            "default": "handoff",
+            "description": "Lineage kind (`handoff`, `fork`, or `side-chat`)."
+          }
+        },
+        {
+          "description": "Model override for newly spawned ACP agent targets.",
+          "name": "model",
+          "required": false,
+          "schema": {
+            "description": "Model override for newly spawned ACP agent targets.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Optional unique name for the newly spawned target.",
+          "name": "name",
+          "required": false,
+          "schema": {
+            "description": "Optional unique name for the newly spawned target.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Short user note included in the generated handoff package header.",
+          "name": "note",
+          "required": false,
+          "schema": {
+            "description": "Short user note included in the generated handoff package header.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Target preset/program (`claude`, `codex`, `gemini`, `agy`, ...).",
+          "name": "preset",
+          "required": false,
+          "schema": {
+            "description": "Target preset/program (`claude`, `codex`, `gemini`, `agy`, ...).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Optional initial instruction sent after staging handoff context.",
+          "name": "prompt",
+          "required": false,
+          "schema": {
+            "description": "Optional initial instruction sent after staging handoff context.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Launch an interactive PTY terminal (`t*`) target instead of headless ACP (`a*`).",
+          "name": "pty",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Launch an interactive PTY terminal (`t*`) target instead of headless ACP (`a*`).",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Initial rows when spawning a PTY target (`--pty`).",
+          "name": "rows",
+          "required": false,
+          "schema": {
+            "description": "Initial rows when spawning a PTY target (`--pty`).",
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Source agent or terminal (`a1`, `t1`, name, or `machine/a1`).",
+          "name": "source",
+          "required": true,
+          "schema": {
+            "description": "Source agent or terminal (`a1`, `t1`, name, or `machine/a1`).",
+            "type": "string"
+          }
+        },
+        {
+          "description": "With `--wait`: seconds before returning early (default: config, else 180).",
+          "name": "timeout",
+          "required": false,
+          "schema": {
+            "description": "With `--wait`: seconds before returning early (default: config, else 180).",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Last turn from the source transcript to include (1-based, inclusive).",
+          "name": "to_turn",
+          "required": false,
+          "schema": {
+            "description": "Last turn from the source transcript to include (1-based, inclusive).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "With `--prompt`: wait for the first turn on the target to finish.",
+          "name": "wait",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "With `--prompt`: wait for the first turn on the target to finish.",
+            "type": "boolean"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/HandoffResult"
         }
       }
     },
@@ -7926,6 +9076,378 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/DroveSubscribeResult"
+        }
+      }
+    },
+    {
+      "description": "List hidden Git ref checkpoints and workspace isolation status for an agent or terminal.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        }
+      ],
+      "name": "checkpoint.list",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Agent (`a1`), terminal (`t1`), remote (`machine/t1`), or unique name.",
+          "name": "target",
+          "required": true,
+          "schema": {
+            "description": "Agent (`a1`), terminal (`t1`), remote (`machine/t1`), or unique name.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/CheckpointListResult"
+        }
+      }
+    },
+    {
+      "description": "Capture a manual hidden Git ref checkpoint for an agent or terminal without modifying the user's index.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "needs_target"
+          },
+          "message": "needs_target"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        }
+      ],
+      "name": "checkpoint.capture",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Optional human bookmark label recorded alongside this checkpoint.",
+          "name": "label",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Optional human bookmark label recorded alongside this checkpoint.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Agent (`a1`), terminal (`t1`), remote (`machine/t1`), or unique name (optional inside managed panes).",
+          "name": "target",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Agent (`a1`), terminal (`t1`), remote (`machine/t1`), or unique name (optional inside managed panes).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/CheckpointCaptureResult"
+        }
+      }
+    },
+    {
+      "description": "Compute the pure authored unified diff and file stats between two checkpoints, excluding upstream pull/merge noise.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        }
+      ],
+      "name": "checkpoint.diff",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Starting checkpoint turn (defaults to highest snapshot strictly below `to`).",
+          "name": "from",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Starting checkpoint turn (defaults to highest snapshot strictly below `to`).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Agent (`a1`), terminal (`t1`), remote (`machine/t1`), or unique name.",
+          "name": "target",
+          "required": true,
+          "schema": {
+            "description": "Agent (`a1`), terminal (`t1`), remote (`machine/t1`), or unique name.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Ending checkpoint turn (defaults to the latest captured checkpoint).",
+          "name": "to",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Ending checkpoint turn (defaults to the latest captured checkpoint).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/CheckpointDiff"
+        }
+      }
+    },
+    {
+      "description": "Roll back an agent or terminal session (and optionally workspace files) to an earlier checkpoint turn.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "busy"
+          },
+          "message": "busy"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "confirm_required"
+          },
+          "message": "confirm_required"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "shared_workspace"
+          },
+          "message": "shared_workspace"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "spawn_failed"
+          },
+          "message": "spawn_failed"
+        }
+      ],
+      "name": "checkpoint.rollback",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Confirm destructive file restore on non-worktree checkouts or when idle shells share the folder.",
+          "name": "confirm",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Confirm destructive file restore on non-worktree checkouts or when idle shells share the folder.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Restore workspace files back to `to` (false rewinds conversation memory only).",
+          "name": "restore_files",
+          "required": false,
+          "schema": {
+            "default": true,
+            "description": "Restore workspace files back to `to` (false rewinds conversation memory only).",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Agent (`a1`), terminal (`t1`), remote (`machine/t1`), or unique name.",
+          "name": "target",
+          "required": true,
+          "schema": {
+            "description": "Agent (`a1`), terminal (`t1`), remote (`machine/t1`), or unique name.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Target checkpoint turn to roll back to (`0` = baseline before Turn 1).",
+          "name": "to",
+          "required": true,
+          "schema": {
+            "description": "Target checkpoint turn to roll back to (`0` = baseline before Turn 1).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/CheckpointRollbackResult"
+        }
+      }
+    },
+    {
+      "description": "Internal lifecycle hook callback invoked by instrumented terminal CLIs (Claude, Codex, Agy).",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        }
+      ],
+      "name": "checkpoint.hook",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "event",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "payload",
+          "required": false,
+          "schema": {
+            "default": null
+          }
+        },
+        {
+          "name": "phase",
+          "required": false,
+          "schema": {
+            "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "source",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        },
+        {
+          "name": "terminal",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/CheckpointHookResult"
         }
       }
     },

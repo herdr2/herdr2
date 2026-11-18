@@ -1,8 +1,9 @@
 //! `h2`: one API call per command. Tables for people, JSON when piped or `--json`.
 
 use crate::api::{
-    AgentParams, ApproveParams, AttachParams, ConfigParams, ExecParams, InterruptParams, KeepParams, KeysParams, LabelParams,
-    ListParams, PutParams, ReadParams, RunParams, SendParams, SubscribeParams, WaitParams,
+    AgentParams, ApproveParams, AttachParams, ConfigParams, ExecParams, HandoffParams, InboxEditParams,
+    InboxRemoveParams, InterruptParams, KeepParams, KeysParams, LabelParams, ListParams, PutParams, ReadParams,
+    RunParams, SendParams, SubscribeParams, WaitParams,
 };
 use crate::client;
 use crate::paths::Paths;
@@ -11,6 +12,7 @@ use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::io::{IsTerminal, Read};
 
+mod checkpoint;
 mod file;
 mod machine;
 mod output;
@@ -23,6 +25,16 @@ use output::*;
 use run::*;
 use server::*;
 use update::*;
+
+#[derive(Subcommand)]
+enum InboxCmd {
+    /// List queued prompts waiting in an agent's inbox.
+    Ls(AgentParams),
+    /// Edit a queued prompt before its turn begins.
+    Edit(InboxEditParams),
+    /// Remove a queued prompt before its turn begins.
+    Rm(InboxRemoveParams),
+}
 
 #[derive(Parser)]
 #[command(name = "h2", version, about = "herdr2: headless ACP orchestration runtime for coding agents")]
@@ -52,6 +64,11 @@ enum Cmd {
     Keep(KeepParams),
     /// Queue a prompt into an agent's ACP inbox (or --steer to cancel & deliver next).
     Send(SendParams),
+    /// Inspect, edit, or remove prompts queued in an ACP agent's serial inbox.
+    Inbox {
+        #[command(subcommand)]
+        action: InboxCmd,
+    },
     /// Wait for children (--children any) or one agent; a message to you also ends it.
     Wait(WaitParams),
     /// Send ACP `session/cancel` to stop the current turn cleanly.
@@ -64,6 +81,8 @@ enum Cmd {
     Config(ConfigParams),
     /// Print an agent's transcript or final assistant text (`--last`).
     Read(ReadParams),
+    /// Hand off, fork, open a side chat, or merge back context across ACP/PTY agents.
+    Handoff(HandoffParams),
     /// Stage a local file beside a live agent (on its machine); prints its path.
     Put(PutParams),
     /// Run a non-agent command, here or on a machine: exact stdout/stderr and exit code.
@@ -91,6 +110,8 @@ enum Cmd {
     Mcp,
     /// Manage multi-agent Drove orchestration (`drove status`, `drove web`, `drove settings`, ...).
     Drove(crate::drove::cli::DroveCli),
+    /// Hidden Git ref checkpoints, pure turn diffs, and session/workspace rollback (`ls`, `snap`, `diff`, `rollback`).
+    Checkpoint(checkpoint::CheckpointCli),
     /// Swap this h2 for another build and restart core.
     Update {
         /// A herdr2 binary to use (default: download the latest release).
@@ -173,6 +194,13 @@ pub fn main() -> i32 {
         Err(e) => return fail(&RpcError::new("usage", usage_message(&e), "see `h2 --help`"), true),
     };
     let (cmd, asked) = match cli.cmd {
+        Some(Cmd::Checkpoint(ref c)) if matches!(c.sub, checkpoint::CheckpointSub::Hook { .. }) => {
+            if let Some(noop) = checkpoint::fast_noop_hook(c) {
+                println!("{noop}");
+                return 0;
+            }
+            (cli.cmd, cli.json)
+        }
         Some(Cmd::Run(p)) => match Paths::from_env().and_then(|paths| flags_after_task(&paths, p)) {
             Ok((p, trailing)) => (Some(Cmd::Run(p)), cli.json || trailing),
             Err(err) => return fail(&err, cli.json || piped),
@@ -228,7 +256,17 @@ fn fail(err: &RpcError, json: bool) -> i32 {
 
 fn call(paths: &Paths, method: &str, params: Value) -> Result<Value, RpcError> {
     let stream = client::connect_or_start(paths)?;
-    client::call(&stream, method, params).map_err(|e| client::explain_closed(paths, e))
+    match client::call(&stream, method, params.clone()) {
+        Ok(val) => Ok(val),
+        Err(err) if err.kind == "unknown_method" && crate::api::METHOD_NAMES.contains(&method) => {
+            // If an older background daemon is running without newer RPC methods, restart it once and retry.
+            let _ = client::call(&stream, "server.restart", json!({}));
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let stream = client::connect_or_start(paths)?;
+            client::call(&stream, method, params).map_err(|e| client::explain_closed(paths, e))
+        }
+        Err(err) => Err(client::explain_closed(paths, err)),
+    }
 }
 
 /// Requires an explicit target or fails with candidate agent/terminal addresses and names.
@@ -283,7 +321,16 @@ fn bare(paths: &Paths) -> Result<Option<Out>, RpcError> {
 
 fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcError> {
     let paths = Paths::from_env()?;
-    if !matches!(&cmd, Some(Cmd::Serve | Cmd::Hold { .. } | Cmd::Connect { .. } | Cmd::Mcp)) {
+    if !matches!(
+        &cmd,
+        Some(
+            Cmd::Serve
+                | Cmd::Hold { .. }
+                | Cmd::Connect { .. }
+                | Cmd::Mcp
+                | Cmd::Checkpoint(checkpoint::CheckpointCli { sub: checkpoint::CheckpointSub::Hook { .. } })
+        )
+    ) {
         crate::platform::legacy_bundle_notice(&paths.state);
     }
     let Some(cmd) = cmd else {
@@ -331,6 +378,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             let (json, human) = crate::drove::cli::execute(&paths, p)?;
             Out { json, human }
         }
+        Cmd::Checkpoint(p) => checkpoint::execute(&paths, p)?,
         Cmd::Wait(mut p) => {
             if p.children.is_none() {
                 p.agent = Some(target(p.agent)?);
@@ -359,6 +407,54 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             }
             Out { json: r, human }
         }
+        Cmd::Inbox { action } => match action {
+            InboxCmd::Ls(mut p) => {
+                p.agent = pick(p.agent)?;
+                let r = call("agent.get", to(&p))?;
+                let items = r["inbox"].as_array().cloned().unwrap_or_default();
+                let human = if items.is_empty() {
+                    format!("{}: inbox empty", r["address"].as_str().unwrap_or("?"))
+                } else {
+                    items
+                        .iter()
+                        .map(|item| {
+                            format!(
+                                "#{}: {}",
+                                item["id"],
+                                item["text"].as_str().unwrap_or("").replace('\n', " ")
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                };
+                Out {
+                    json: json!({
+                        "address": r["address"],
+                        "inbox_len": r["inbox_len"].as_u64().unwrap_or(0),
+                        "inbox": items,
+                    }),
+                    human,
+                }
+            }
+            InboxCmd::Edit(p) => {
+                let r = call("agent.inbox_edit", to(&p))?;
+                let human = format!(
+                    "{}: updated queued message (inbox: {})",
+                    r["address"].as_str().unwrap_or("?"),
+                    r["inbox_len"].as_u64().unwrap_or(0),
+                );
+                Out { json: r, human }
+            }
+            InboxCmd::Rm(p) => {
+                let r = call("agent.inbox_remove", to(&p))?;
+                let human = format!(
+                    "{}: removed queued message (inbox: {})",
+                    r["address"].as_str().unwrap_or("?"),
+                    r["inbox_len"].as_u64().unwrap_or(0),
+                );
+                Out { json: r, human }
+            }
+        },
         Cmd::Interrupt(mut p) => {
             p.agent = pick(p.agent)?;
             let r = call("agent.interrupt", to(&p))?;
@@ -518,6 +614,26 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             if !asked {
                 println!("{human}");
                 return Ok(None);
+            }
+            Out { json: r, human }
+        }
+        Cmd::Handoff(mut p) => {
+            p.source = pick(p.source)?;
+            p.cwd = p.cwd.and_then(|c| from_here(Some(c)));
+            p.caller = Some(caller());
+            let r = call("agent.handoff", to(&p))?;
+            let target = r["target"].as_str().unwrap_or("?");
+            let target_kind = r["target_kind"].as_str().unwrap_or("agent");
+            let kind = r["kind"].as_str().unwrap_or("handoff");
+            let source = r["source"].as_str().unwrap_or("?");
+            let bytes = r["bytes"].as_u64().unwrap_or(0);
+            let native = if r["native_fork"] == true { " [native-fork]" } else { "" };
+            let mut human = format!("{target} ({target_kind}) <- {kind} from {source} ({bytes} bytes){native}");
+            if let Some(path) = r["artifact_path"].as_str() {
+                human.push_str(&format!("\n  staged: {path}"));
+            }
+            if !r["wait"].is_null() {
+                human.push_str(&format!("\n  {}", describe_wait(&r["wait"])));
             }
             Out { json: r, human }
         }
@@ -841,12 +957,16 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("label", "agent.label"),
     ("keep", "agent.keep"),
     ("send", "agent.send"),
+    ("inbox ls", "agent.get"),
+    ("inbox edit", "agent.inbox_edit"),
+    ("inbox rm", "agent.inbox_remove"),
     ("wait", "agent.wait"),
     ("interrupt", "agent.interrupt"),
     ("approve", "agent.approve"),
     ("deny", "agent.deny"),
     ("config", "agent.config"),
     ("read", "agent.read"),
+    ("handoff", "agent.handoff"),
     ("attach", "terminal.attach"),
     ("keys", "terminal.keys"),
     ("put", "agent.put"),
@@ -872,6 +992,10 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("drove ai-test", "drove.ai.test"),
     ("drove magpie-test", "drove.magpie.test"),
     ("drove web", "drove.web.open"),
+    ("checkpoint ls", "checkpoint.list"),
+    ("checkpoint snap", "checkpoint.capture"),
+    ("checkpoint diff", "checkpoint.diff"),
+    ("checkpoint rollback", "checkpoint.rollback"),
 ];
 /// Client/app methods not mapped 1:1 from a separate top-level CLI subcommand.
 pub const API_ONLY: &[&str] = &[
@@ -890,6 +1014,7 @@ pub const API_ONLY: &[&str] = &[
     "terminal.wait",
     "terminal.interrupt",
     "terminal.put",
+    "checkpoint.hook",
     "drove.http_proxy",
     "drove.subscribe",
 ];

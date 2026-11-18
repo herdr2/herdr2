@@ -667,10 +667,13 @@ fn apply(record: &mut Value, kind: &str, data: &Value) {
             record["state"] = if kind == "lost" { "live" } else { "finished" }.into();
             if kind == "lost" {
                 record["pid"] = Value::Null;
+            } else {
+                record["inbox_len"] = 0.into();
+                record["inbox"] = json!([]);
             }
             set(record, &["reason", "exit_code", "signal", "finished_ms"]);
         }
-        "status" => set(record, &["status", "records", "reported", "pending_permission", "inbox_len"]),
+        "status" => set(record, &["status", "records", "reported", "pending_permission", "inbox_len", "inbox"]),
         "foreground" => record["foreground"] = data.clone(),
         "turn" => set(record, &["turn"]),
         "title" => set(record, &["title"]),
@@ -950,6 +953,8 @@ const ON_AN_AGENT: &[&str] = &[
     "agent.keep",
     "agent.read",
     "agent.send",
+    "agent.inbox_edit",
+    "agent.inbox_remove",
     "agent.interrupt",
     "agent.wait",
     "agent.approve",
@@ -973,6 +978,9 @@ const ON_A_TERMINAL: &[&str] = &[
     "terminal.wait",
     "terminal.put",
 ];
+
+/// Methods whose `target` names the agent or terminal they act on.
+const ON_A_TARGET: &[&str] = &["checkpoint.list", "checkpoint.capture", "checkpoint.diff", "checkpoint.rollback"];
 
 /// Where a call goes when it isn't here.
 pub enum To {
@@ -1025,8 +1033,21 @@ pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Va
             Some(To::Peer { name, .. }) => return Err(crate::machines::unknown(&st.machines, &name)),
             to => to,
         }
-    } else if (ON_AN_AGENT.contains(&method) || ON_A_TERMINAL.contains(&method)) && params["children"].is_null() {
-        let field = if ON_A_TERMINAL.contains(&method) { "terminal" } else { "agent" };
+    } else if (ON_AN_AGENT.contains(&method)
+        || ON_A_TERMINAL.contains(&method)
+        || ON_A_TARGET.contains(&method)
+        || method == "agent.handoff")
+        && params["children"].is_null()
+    {
+        let field = if method == "agent.handoff" {
+            "source"
+        } else if ON_A_TARGET.contains(&method) {
+            "target"
+        } else if ON_A_TERMINAL.contains(&method) {
+            "terminal"
+        } else {
+            "agent"
+        };
         let Some((prefix, local)) =
             params[field].as_str().and_then(|a| a.split_once('/')).map(|(a, b)| (a.to_string(), b.to_string()))
         else {
@@ -1106,6 +1127,10 @@ fn deadline_for(core: &Core, method: &str, params: &Value) -> Duration {
         // Its own timeout, then the time to end everything it started.
         let secs = params["timeout"].as_f64().unwrap_or(crate::exec::DEFAULT_TIMEOUT).clamp(0.0, 600.0);
         return config.machine_timeout() + Duration::from_secs_f64(secs) + Duration::from_secs(5);
+    }
+    if method == "checkpoint.rollback" {
+        // Rollback may respawn a fresh ACP/PTY session and restore workspace git trees over SSH.
+        return config.machine_timeout() + Duration::from_secs(60);
     }
     let waits = matches!(method, "agent.wait" | "terminal.wait")
         || (params["wait"] == true && matches!(method, "agent.run" | "agent.send" | "terminal.run" | "terminal.send"));
@@ -1231,7 +1256,8 @@ fn map_addresses(v: &mut Value, map: &dyn Fn(&str) -> String) {
                 match v {
                     Value::String(s)
                         if ["address", "parent", "from", "removed"].contains(&k.as_str())
-                            || ((k == "agent" || k == "terminal") && !is_agent_record) =>
+                            || ((k == "agent" || k == "terminal" || k == "target" || k == "addr")
+                                && !is_agent_record) =>
                     {
                         *s = map(s)
                     }

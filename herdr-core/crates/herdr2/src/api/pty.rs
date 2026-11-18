@@ -507,6 +507,7 @@ async fn start_pty(
             cols,
             rows,
             identity: identity.clone(),
+            lineage: p.lineage,
         };
         let id = st.pty_reg.create(new, now_ms())?;
         let mut screen = ghostty_vt::Terminal::new(cols, rows, settings.history_bytes());
@@ -515,13 +516,26 @@ async fn start_pty(
             display.apply(&mut screen);
         }
         st.screens.insert(id, screen);
-        let (env, scope) = terminal_env(core, id, &cwd, env);
-        st.pty_reg.terminals.get_mut(&id).expect("just created").scope = Some(scope);
+        let (mut env, scope) = terminal_env(core, id, &cwd, env);
+        let mut argv = p.argv;
+        let prep = crate::pty_adapters::prepare_pty_launch(core, id, &mut argv, &mut env);
+        let addr = st.pty_reg.terminals[&id].address.clone();
+        let mut tc = core.target_checkpoints(&mut st, &addr);
+        tc.cli_kind = Some(prep.kind.as_str().into());
+        if let Some(sid) = prep.session_id {
+            tc.cli_session_id = Some(sid);
+        }
+        core.save_target_checkpoints(&mut st, tc);
+        {
+            let term = st.pty_reg.terminals.get_mut(&id).expect("just created");
+            term.scope = Some(scope);
+            term.argv = argv.clone();
+            term.restart_env = p.env;
+            term.holder = Some(instance);
+        }
         let (tx, rx) = tokio::sync::oneshot::channel();
         st.pending.insert(id, tx);
-        st.pty_reg.terminals.get_mut(&id).expect("just created").restart_env = p.env;
-        let spawn = proto::Spawn { argv: p.argv, env, cwd, cols, rows };
-        st.pty_reg.terminals.get_mut(&id).expect("just created").holder = Some(instance);
+        let spawn = proto::Spawn { argv, env, cwd, cols, rows };
         core.save_pty(&st);
         st.link(id).expect("assigned holder").send(&proto::json_frame(proto::SPAWN, id, &spawn));
         (id, rx)
@@ -530,7 +544,23 @@ async fn start_pty(
     let spawned = tokio::time::timeout(Duration::from_millis(spawn_ms), rx).await;
     let mut st = core.lock();
     match spawned {
-        Ok(Ok(Ok(started))) => Ok(started),
+        Ok(Ok(Ok(started))) => {
+            drop(st);
+            let core_bg = Arc::clone(core);
+            tokio::spawn(async move {
+                let _ = crate::checkpoint::capture_target_checkpoint(
+                    &core_bg,
+                    crate::runtime::TargetKey::Terminal(id),
+                    Some(0),
+                    None,
+                    None,
+                    true,
+                    false,
+                )
+                .await;
+            });
+            Ok(started)
+        }
         other => {
             st.pending.remove(&id);
             let keep = st.pty_reg.terminals.get(&id).is_some_and(|t| {

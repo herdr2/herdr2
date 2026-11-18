@@ -4,8 +4,8 @@
 
 import { View, div, image, svg } from "gpui-kit";
 import { h_flex, v_flex, Popup, TextareaState, Textarea, InputState, Input, TextView, ScrollHandle } from "gpui-base";
-import { agents, terminals, panes, spaces, run, theme, settings, home, props, closeOverlay, openOverlay, checking, h2 } from "herdr";
-import { buildConversationItems, buildPtySessionBadges, summarizeActivityGroup, toolIconPath, formatTime, shortenPath, normalizeConfigOptions, filterConfigChoices, parseToolDetail, resolveEffortVisual } from "./acp_model.js";
+import { agents, terminals, panes, spaces, run, theme, settings, home, props, closeOverlay, openOverlay, checking, h2, shared, setShared } from "herdr";
+import { buildConversationItems, buildPtySessionBadges, summarizeActivityGroup, toolIconPath, formatTime, shortenPath, normalizeConfigOptions, filterConfigChoices, normalizeInboxItems, parseToolDetail, resolveEffortVisual } from "./acp_model.js";
 
 const LANE_MAX_W = 736; // 46rem editorial content column (--chat-content-max-width)
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -52,6 +52,7 @@ const ICONS = {
   layers: "mods/workspace-chrome/layers.svg",
   spinner: "mods/workspace-chrome/spinner.svg",
   square: "mods/workspace-chrome/square.svg",
+  squarePen: "mods/workspace-chrome/square-pen.svg",
   terminal: "mods/workspace-chrome/terminal.svg",
   x: "mods/workspace-chrome/x.svg",
 };
@@ -119,6 +120,42 @@ export default class Peek extends View {
     this.inputFocused = false;
     this.agentDetail = null;
     this.lastDetailTerminal = "";
+    this.lastDetailInboxLen = 0;
+    this.optimisticInbox = null;
+    this.editingInboxId = null;
+    this.inboxBusy = false;
+    this.queueCollapsed = false;
+    this.inboxEditFocused = false;
+    this.inboxEditInput = TextareaState.new({
+      value: "",
+      placeholder: tr("Edit queued message…", "修改队列中的消息…"),
+    });
+    this.inboxEditInput.set_auto_grow(2, 6);
+    this.inboxEditInput.on("focus", (_e, cx) => {
+      this.inboxEditFocused = true;
+      if (this.openConfigId) this.closeConfigPopover(cx);
+      cx.notify();
+    });
+    this.inboxEditInput.on("blur", (_e, cx) => {
+      this.inboxEditFocused = false;
+      cx.notify();
+    });
+    this.inboxEditInput.on("change", (_e, cx) => {
+      cx.notify();
+    });
+    this.inboxEditInput.on("submit", (e, cx) => {
+      if (e?.shift) return;
+      this.saveEditInboxItem(cx);
+    });
+    this.checkpoints = [];
+    this.isolation = null;
+    this.checkpointDiffs = {};
+    this.checkpointDiffOpen = {};
+    this.checkpointDiffLoading = {};
+    this.rollbackPromptItem = null;
+    this.rollbackBusy = false;
+    this.rollbackError = null;
+    this.maxConversationTurn = 0;
     this.openConfigId = null;
     this.enteringConfigId = null;
     this.closingConfigs = {};
@@ -217,12 +254,15 @@ export default class Peek extends View {
     }
     this.loading = true;
     try {
-      const curTurn = this.term()?.turn ?? -1;
+      const liveTerm = this.term();
+      const curTurn = liveTerm?.turn ?? -1;
+      const curInboxLen = Number(liveTerm?.inbox_len ?? 0);
       const needDetail = !props()?.pty && (
         !this.agentDetail
         || this.lastDetailTerminal !== terminal
         || !this.agentDetail.config_options?.length
         || this.lastDetailTurn !== curTurn
+        || (!Array.isArray(liveTerm?.inbox) && curInboxLen !== this.lastDetailInboxLen)
       );
       const [res, detailRes] = await Promise.all([
         h2(["read", "--json", terminal]),
@@ -235,6 +275,7 @@ export default class Peek extends View {
             this.agentDetail = parsedDetail;
             this.lastDetailTerminal = terminal;
             this.lastDetailTurn = curTurn;
+            this.lastDetailInboxLen = Number(parsedDetail.inbox_len ?? curInboxLen);
           }
         } catch {}
       }
@@ -258,6 +299,107 @@ export default class Peek extends View {
         this.reloadQueued = false;
         this.reloadTranscript();
       }
+    }
+  }
+
+  hasCheckpointTurn(turn) {
+    if (Array.isArray(this.checkpoints) && this.checkpoints.some((c) => Number(c?.turn) === Number(turn))) {
+      return true;
+    }
+    if (Number(turn) === 0 && Array.isArray(this.entries) && this.entries.some((e) => e?.kind === "user" && Number(e?.turn) >= 1)) {
+      return Boolean(this.term()?.cwd);
+    }
+    return Array.isArray(this.entries) && this.entries.some((e) => e?.kind === "checkpoint" && Number(e?.turn) === Number(turn));
+  }
+
+  async openRollbackConfirm(item, toTurn, prompt, cx) {
+    const closing = this.rollbackPromptItem?.id === item.id;
+    this.rollbackError = null;
+    if (closing) {
+      this.rollbackPromptItem = null;
+      (cx ?? this.cx)?.notify?.();
+      return;
+    }
+    this.rollbackPromptItem = { id: item.id, toTurn, prompt, checkingIsolation: true };
+    (cx ?? this.cx)?.notify?.();
+    const terminal = props()?.terminal;
+    if (!terminal || checking()) return;
+    try {
+      const ckptRes = await h2(["checkpoint", "ls", "--json", terminal]);
+      if (ckptRes.code === 0) {
+        const parsed = JSON.parse(ckptRes.stdout || "{}");
+        this.checkpoints = Array.isArray(parsed.checkpoints) ? parsed.checkpoints : [];
+        this.isolation = parsed.isolation ?? null;
+      }
+    } catch {}
+    if (this.rollbackPromptItem?.id === item.id) {
+      this.rollbackPromptItem.checkingIsolation = false;
+    }
+    (cx ?? this.cx)?.notify?.();
+  }
+
+  async toggleCheckpointDiff(turn, cx) {
+    const terminal = props()?.terminal;
+    if (!terminal || checking() || !turn) return;
+    const isOpen = Boolean(this.checkpointDiffOpen?.[turn]);
+    this.checkpointDiffOpen[turn] = !isOpen;
+    if (!isOpen && !this.checkpointDiffs[turn] && !this.checkpointDiffLoading[turn]) {
+      this.checkpointDiffLoading[turn] = true;
+      (cx ?? this.cx)?.notify?.();
+      try {
+        const res = await h2(["checkpoint", "diff", "--json", terminal, "--to", String(turn)]);
+        if (res.code === 0) {
+          this.checkpointDiffs[turn] = JSON.parse(res.stdout || "{}");
+        } else {
+          this.checkpointDiffs[turn] = { patch: "", error: (res.stderr || res.stdout || "Diff unavailable").trim() };
+        }
+      } catch (e) {
+        this.checkpointDiffs[turn] = { patch: "", error: e?.message ?? String(e) };
+      } finally {
+        this.checkpointDiffLoading[turn] = false;
+      }
+    }
+    (cx ?? this.cx)?.notify?.();
+  }
+
+  async executeCheckpointRollback(toTurn, restoreFiles, fallbackPrompt, cx) {
+    const terminal = props()?.terminal;
+    if (!terminal || checking() || this.rollbackBusy) return;
+    this.rollbackBusy = true;
+    this.rollbackError = null;
+    (cx ?? this.cx)?.notify?.();
+    try {
+      const args = [
+        "checkpoint",
+        "rollback",
+        "--json",
+        terminal,
+        "--to",
+        String(toTurn),
+        ...(restoreFiles ? ["--confirm"] : ["--no-files"]),
+      ];
+      const res = await h2(args, { timeout: 90000 });
+      if (res.code !== 0) {
+        let msg = (res.stderr || res.stdout || "Rollback failed").trim();
+        try {
+          const parsedErr = JSON.parse(res.stderr || "{}");
+          msg = parsedErr?.error?.message || msg;
+        } catch {}
+        this.rollbackError = msg;
+        return;
+      }
+      JSON.parse(res.stdout || "{}");
+      this.rollbackPromptItem = null;
+      this.checkpointDiffs = {};
+      this.checkpointDiffOpen = {};
+      this.expandedGroups = {};
+      setShared("checkpoint.sync", `${terminal}:${toTurn}:${Date.now()}`);
+      await this.reloadTranscript();
+    } catch (e) {
+      this.rollbackError = e?.message ?? String(e);
+    } finally {
+      this.rollbackBusy = false;
+      (cx ?? this.cx)?.notify?.();
     }
   }
 
@@ -320,6 +462,97 @@ export default class Peek extends View {
     this.revealedSig = "";
     const args = steer ? ["send", "--json", "--steer", terminal, text] : ["send", "--json", terminal, text];
     await this.runH2(args);
+  }
+
+  rawInboxFor(k = this.term()) {
+    if (props()?.pty) return [];
+    if (Array.isArray(this.optimisticInbox)) return this.optimisticInbox;
+    if (Array.isArray(k?.inbox)) return k.inbox;
+    if (Array.isArray(this.agentDetail?.inbox)) return this.agentDetail.inbox;
+    return [];
+  }
+
+  inboxItemsFor(k = this.term()) {
+    return normalizeInboxItems(this.rawInboxFor(k), terminals(), props()?.terminal ?? "");
+  }
+
+  startEditInboxItem(item, cx) {
+    if (!item || this.inboxBusy) return;
+    this.editingInboxId = item.id;
+    this.queueCollapsed = false;
+    this.inboxEditInput?.set_value?.(item.body ?? "");
+    this.inboxEditInput?.focus?.();
+    (cx ?? this.cx)?.notify?.();
+  }
+
+  cancelEditInboxItem(cx) {
+    this.editingInboxId = null;
+    this.inboxEditFocused = false;
+    this.inboxEditInput?.set_value?.("");
+    (cx ?? this.cx)?.notify?.();
+  }
+
+  async applyInboxCommand(args, cx) {
+    const terminal = props()?.terminal;
+    this.inboxBusy = true;
+    this.error = null;
+    (cx ?? this.cx)?.notify?.();
+    try {
+      const res = await h2(args);
+      if (res.code !== 0) {
+        let msg = (res.stderr || res.stdout || "Queue update failed").trim();
+        try {
+          const parsed = JSON.parse(res.stderr || res.stdout || "{}");
+          if (parsed?.error?.message) msg = parsed.error.message;
+        } catch {}
+        this.optimisticInbox = null;
+        this.error = msg;
+        this.lastDetailTerminal = "";
+        this.reloadTranscript();
+      } else {
+        try {
+          const parsed = JSON.parse(res.stdout || "{}");
+          if (parsed && typeof parsed === "object") {
+            this.agentDetail = parsed;
+            this.lastDetailTerminal = terminal;
+            this.lastDetailInboxLen = Number(parsed.inbox_len ?? (Array.isArray(parsed.inbox) ? parsed.inbox.length : 0));
+          }
+        } catch {}
+        this.optimisticInbox = null;
+      }
+    } catch (e) {
+      this.optimisticInbox = null;
+      this.error = e?.message ?? String(e);
+    } finally {
+      this.inboxBusy = false;
+      (cx ?? this.cx)?.notify?.();
+    }
+  }
+
+  async saveEditInboxItem(cx) {
+    const terminal = props()?.terminal;
+    const itemId = this.editingInboxId;
+    const trimmed = (this.inboxEditInput?.value?.() ?? "").trim();
+    if (!terminal || itemId == null || !trimmed || checking() || this.inboxBusy) return;
+    const current = this.rawInboxFor();
+    this.optimisticInbox = current.map((raw) => (Number(raw?.id) === Number(itemId) ? { ...raw, text: trimmed } : raw));
+    this.editingInboxId = null;
+    this.inboxEditFocused = false;
+    this.inboxEditInput?.set_value?.("");
+    await this.applyInboxCommand(["inbox", "edit", "--json", terminal, String(itemId), trimmed], cx);
+  }
+
+  async removeInboxItem(itemId, cx) {
+    const terminal = props()?.terminal;
+    if (!terminal || itemId == null || checking() || this.inboxBusy) return;
+    if (Number(this.editingInboxId) === Number(itemId)) {
+      this.editingInboxId = null;
+      this.inboxEditFocused = false;
+      this.inboxEditInput?.set_value?.("");
+    }
+    const current = this.rawInboxFor();
+    this.optimisticInbox = current.filter((raw) => Number(raw?.id) !== Number(itemId));
+    await this.applyInboxCommand(["inbox", "rm", "--json", terminal, String(itemId)], cx);
   }
 
   configOptionsFor(k) {
@@ -762,16 +995,138 @@ export default class Peek extends View {
                 ),
               ),
           )
-          .when(Boolean(fullBody) || Boolean(time), (b) =>
-            b.child(
-              h_flex()
-                .px(4)
+          .when(Boolean(fullBody) || Boolean(time), (b) => {
+            const canRewind = item.turn >= 1 && item.turn < (this.maxConversationTurn || 0) && this.status() !== "working" && this.term()?.state !== "finished";
+            const toTurn = Number(item.turn ?? 0);
+            const confirmThis = this.rollbackPromptItem?.id === item.id;
+            return b.child(
+              v_flex()
+                .items_end()
                 .gap(6)
-                .items_center()
-                .opacity(hovered || this.copiedId === `u-${item.id}` ? 1 : 0.45)
-                .when(Boolean(time), (meta) => meta.child(div().text_size(11).text_color(t.dim).child(time)))
-                .when(Boolean(fullBody), (meta) => meta.child(this.copyPill(t, `u-${item.id}`, fullBody, tr("Copy message", "复制消息"), true))),
-            ),
+                .child(
+                  h_flex()
+                    .px(4)
+                    .gap(6)
+                    .items_center()
+                    .opacity(hovered || confirmThis || this.copiedId === `u-${item.id}` ? 1 : 0.45)
+                    .when(Boolean(time), (meta) => meta.child(div().text_size(11).text_color(t.dim).child(time)))
+                    .when(Boolean(fullBody), (meta) => meta.child(this.copyPill(t, `u-${item.id}`, fullBody, tr("Copy message", "复制消息"), true)))
+                    .when(canRewind, (meta) =>
+                      meta.child(
+                        div()
+                          .id(`acp-edit-from-${item.id}`)
+                          .px(7)
+                          .py(2)
+                          .rounded(6)
+                          .border_1()
+                          .border_color(confirmThis ? (t.accent ?? t.border) : t.border)
+                          .text_size(11)
+                          .text_color(confirmThis ? (t.accent ?? t.foreground) : t.muted)
+                          .cursor_pointer()
+                          .hover((s) => s.bg(t.hover))
+                          .on_mouse_down("left", stopMouse)
+                          .on_click((_e, cx) => this.openRollbackConfirm(item, toTurn, fullBody, cx))
+                          .child(tr("↺ Restore here", "↺ 恢复到此轮")),
+                      ),
+                    ),
+                )
+                .when(confirmThis, (panel) => panel.child(this.renderRollbackConfirmPanel(t, item, toTurn, fullBody))),
+            );
+          }),
+      );
+  }
+
+  renderRollbackConfirmPanel(t, item, toTurn, promptText) {
+    const iso = this.isolation;
+    const isoLevel = iso?.level || (this.rollbackPromptItem?.checkingIsolation ? "checking" : "unknown");
+    const filesBlocked = isoLevel === "shared_blocked" || (!this.rollbackPromptItem?.checkingIsolation && !this.hasCheckpointTurn(toTurn));
+    const isDark = Boolean(settings()?.dark ?? true);
+    const amber = isDark ? "#fbbf24" : "#b45309";
+    const danger = isDark ? "#f87171" : "#dc2626";
+    const blockersText = Array.isArray(iso?.blockers) ? iso.blockers.map((x) => x.detail || x.addr).join(", ") : "";
+    const isoNote = isoLevel === "checking"
+      ? tr("Checking workspace isolation safety…", "正在检查工作区并发与安全隔离状态…")
+      : filesBlocked
+      ? (isoLevel === "shared_blocked"
+        ? tr(`Blocked by active peer (${blockersText}) — session-only restore to turn ${toTurn}`, `同工作区存在活跃窗格（${blockersText}），仅允许将对话恢复至第 ${toTurn} 轮`)
+        : tr(`No file checkpoint recorded for turn ${toTurn}`, `第 ${toTurn} 轮无文件快照，仅支持恢复对话记忆`))
+      : isoLevel === "exclusive_confirm"
+        ? tr(`Main checkout — keep turn ${toTurn} & earlier, revert edits & turns after turn ${toTurn}`, `主仓目录：保留第 ${toTurn} 轮及之前会话，撤回后续会话与文件修改`)
+        : tr(`Isolated worktree — keep turn ${toTurn} & earlier, remove turns & edits after turn ${toTurn}`, `独立工作树：保留第 ${toTurn} 轮及之前会话，撤回后续会话与文件修改`);
+    return v_flex()
+      .w_full()
+      .max_w(540)
+      .p(10)
+      .gap(8)
+      .rounded(10)
+      .border_1()
+      .border_color(t.border)
+      .bg(t.popover ?? t.surface ?? t.raised)
+      .child(
+        div()
+          .text_size(11.5)
+          .text_color(filesBlocked ? danger : isoLevel === "exclusive_confirm" ? amber : t.muted)
+          .child(isoNote),
+      )
+      .when(Boolean(this.rollbackError), (p) =>
+        p.child(div().text_size(11.5).text_color(danger).child(this.rollbackError)),
+      )
+      .child(
+        h_flex()
+          .gap(8)
+          .flex_wrap()
+          .items_center()
+          .child(
+            div()
+              .id(`acp-rb-both-${item.id}`)
+              .px(10)
+              .py(5)
+              .rounded(7)
+              .bg(filesBlocked || this.rollbackBusy ? t.raised : (t.solid ?? t.accent))
+              .text_size(11.5)
+              .font_medium()
+              .text_color(filesBlocked || this.rollbackBusy ? t.dim : (t.solid_foreground ?? "#ffffff"))
+              .when(!filesBlocked && !this.rollbackBusy, (el) =>
+                el.cursor_pointer().on_mouse_down("left", stopMouse).on_click((_e, cx) =>
+                  this.executeCheckpointRollback(toTurn, true, promptText, cx),
+                ),
+              )
+              .child(this.rollbackBusy ? tr("Restoring…", "恢复中…") : tr("Restore files & session", "恢复文件与会话")),
+          )
+          .child(
+            div()
+              .id(`acp-rb-mem-${item.id}`)
+              .px(10)
+              .py(5)
+              .rounded(7)
+              .border_1()
+              .border_color(t.border)
+              .text_size(11.5)
+              .text_color(this.rollbackBusy ? t.dim : t.foreground)
+              .when(!this.rollbackBusy, (el) =>
+                el.cursor_pointer().hover((s) => s.bg(t.hover)).on_mouse_down("left", stopMouse).on_click((_e, cx) =>
+                  this.executeCheckpointRollback(toTurn, false, promptText, cx),
+                ),
+              )
+              .child(tr("Session only (keep files)", "仅恢复会话（保留文件）")),
+          )
+          .child(
+            div()
+              .id(`acp-rb-cancel-${item.id}`)
+              .px(8)
+              .py(5)
+              .rounded(7)
+              .text_size(11.5)
+              .text_color(t.muted)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover))
+              .on_mouse_down("left", stopMouse)
+              .on_click((_e, cx) => {
+                this.rollbackPromptItem = null;
+                this.rollbackError = null;
+                cx.notify();
+              })
+              .child(tr("Cancel", "取消")),
           ),
       );
   }
@@ -1202,6 +1557,11 @@ export default class Peek extends View {
     const delColor = isDark ? "#f87171" : "#dc2626";
     const count = cf.files.length;
     const label = tr(`${count} changed file${count === 1 ? "" : "s"}`, `${count} 个变更文件`);
+    const ckptTurn = Number(cf.checkpointTurn ?? 0);
+    const hasCkpt = Boolean(cf.fromCheckpoint && ckptTurn > 0);
+    const diffOpen = Boolean(hasCkpt && this.checkpointDiffOpen?.[ckptTurn]);
+    const diffLoading = Boolean(hasCkpt && this.checkpointDiffLoading?.[ckptTurn]);
+    const diffData = hasCkpt ? this.checkpointDiffs?.[ckptTurn] : null;
     return v_flex()
       .id(`acp-changed-${item.id}`)
       .w_full()
@@ -1237,7 +1597,32 @@ export default class Peek extends View {
               .when(cf.totalAdditions > 0, (s) => s.child(div().font_family(mono).text_size(11).text_color(addColor).child(`+${cf.totalAdditions}`)))
               .when(cf.totalDeletions > 0, (s) => s.child(div().font_family(mono).text_size(11).text_color(delColor).child(`-${cf.totalDeletions}`))),
           )
-          .child(svg(open ? ICONS.chevronDown : ICONS.chevronRight).size(12).flex_none().text_color(t.dim)),
+          .child(
+            h_flex()
+              .gap(8)
+              .items_center()
+              .when(hasCkpt, (el) =>
+                el.child(
+                  div()
+                    .id(`acp-cf-diff-${item.id}`)
+                    .px(7)
+                    .py(2)
+                    .rounded(5)
+                    .border_1()
+                    .border_color(t.border)
+                    .text_size(10.5)
+                    .text_color(diffOpen ? (t.accent ?? t.foreground) : t.muted)
+                    .hover((s) => s.bg(t.hover))
+                    .on_mouse_down("left", stopMouse)
+                    .on_click((_e, cx) => {
+                      if (!open) this.expandedGroups[key] = true;
+                      this.toggleCheckpointDiff(ckptTurn, cx);
+                    })
+                    .child(diffLoading ? tr("Loading…", "加载中…") : diffOpen ? tr("Hide diff", "收起 Diff") : tr("Turn diff", "本轮 Diff")),
+                ),
+              )
+              .child(svg(open ? ICONS.chevronDown : ICONS.chevronRight).size(12).flex_none().text_color(t.dim)),
+          ),
       )
       .when(open, (el) =>
         el.child(
@@ -1287,9 +1672,113 @@ export default class Peek extends View {
                       .when(f.deletions > 0, (s) => s.child(div().text_color(delColor).child(`-${f.deletions}`))),
                   );
               }),
-            ),
+            )
+            .when(diffOpen, (diffBox) => {
+              const rawPatch = String(diffData?.patch ?? "");
+              const previewLines = rawPatch ? rawPatch.split("\n").slice(0, 180) : [];
+              return diffBox.child(
+                v_flex()
+                  .w_full()
+                  .mt(6)
+                  .pt(6)
+                  .border_t(1)
+                  .border_color(t.border)
+                  .font_family(mono)
+                  .text_size(11)
+                  .gap(1)
+                  .when(Boolean(diffData?.error), (el) => el.child(div().px(6).text_color(delColor).child(diffData.error)))
+                  .when(!diffLoading && !diffData?.error && previewLines.length === 0, (el) =>
+                    el.child(div().px(6).text_color(t.dim).child(tr("No text changes in this turn.", "本轮无文本差异"))),
+                  )
+                  .children(
+                    previewLines.map((line) => {
+                      const isAdd = line.startsWith("+") && !line.startsWith("+++");
+                      const isDel = line.startsWith("-") && !line.startsWith("---");
+                      const isHunk = line.startsWith("@@") || line.startsWith("diff --git");
+                      return div()
+                        .w_full()
+                        .px(6)
+                        .truncate()
+                        .when(isAdd, (e) => e.bg(withAlpha(addColor, "1a")).text_color(addColor))
+                        .when(isDel, (e) => e.bg(withAlpha(delColor, "1a")).text_color(delColor))
+                        .when(isHunk, (e) => e.bg(t.raised).text_color(t.dim))
+                        .when(!isAdd && !isDel && !isHunk, (e) => e.text_color(t.muted))
+                        .child(preserveIndentForWrap(line));
+                    }),
+                  ),
+              );
+            }),
         ),
       );
+  }
+
+  renderHandoffBanner(t, item) {
+    const kindLabels = {
+      handoff: tr("Handoff", "上下文接力"),
+      fork: tr("Fork", "分支探索"),
+      "side-chat": tr("Side Chat", "旁路讨论"),
+      "merge-back": tr("Merge Back", "合回上下文"),
+    };
+    const kindLabel = kindLabels[item.handoff_kind] || item.handoff_kind || tr("Handoff", "上下文接力");
+    const src = item.from_address || "?";
+    const prov = item.from_provider ? ` (${item.from_provider})` : "";
+    const turns = item.from_turns ? tr(` · turns ${item.from_turns}`, ` · 第 ${item.from_turns} 轮`) : "";
+    const label = `${kindLabel} · ${tr(`from ${src}${prov}`, `来自 ${src}${prov}`)}${turns}`;
+    const accent = t.accent ?? "#3b82f6";
+    return h_flex()
+      .id(`acp-row-${item.id}`)
+      .w_full()
+      .max_w(LANE_MAX_W)
+      .gap(10)
+      .items_center()
+      .py(4)
+      .child(div().flex_1().h(1).bg(withAlpha(accent, "44") ?? t.border))
+      .child(
+        h_flex()
+          .gap(6)
+          .px(10)
+          .py(3)
+          .rounded(999)
+          .items_center()
+          .bg(withAlpha(accent, "16") ?? t.raised)
+          .border_1()
+          .border_color(withAlpha(accent, "55") ?? t.border)
+          .text_size(11)
+          .font_medium()
+          .text_color(accent)
+          .when(Boolean(item.from_address), (el) =>
+            el
+              .cursor_pointer()
+              .hover((s) => s.bg(withAlpha(accent, "26") ?? t.hover))
+              .tooltip(tr(`Focus source session ${src}`, `点击跳转到来源会话 ${src}`))
+              .on_mouse_down("left", stopMouse)
+              .on_click(() => run("agent.focus", { terminal: item.from_address })),
+          )
+          .child(svg("mods/workspace-chrome/git-branch.svg").size(12).flex_none().text_color(accent))
+          .child(label),
+      )
+      .child(div().flex_1().h(1).bg(withAlpha(accent, "44") ?? t.border));
+  }
+
+  renderRewindDivider(t, item) {
+    const toTurn = Number(item.to_turn ?? 0);
+    const label = toTurn === 0
+      ? (item.restore_files
+        ? tr("⏪ Reset to initial state (files & conversation restored)", "⏪ 已撤回至对话起点（文件与上下文已恢复）")
+        : tr("⏪ Reset to initial state (conversation cleared)", "⏪ 已撤回至对话起点（仅对话上下文已清空）"))
+      : (item.restore_files
+        ? tr(`⏪ Restored to turn ${toTurn} (later turns & edits reverted)`, `⏪ 已恢复至第 ${toTurn} 轮（后续会话与文件修改已撤回）`)
+        : tr(`⏪ Restored to turn ${toTurn} (later turns removed, files kept)`, `⏪ 已恢复至第 ${toTurn} 轮（后续会话已移除，文件保留）`));
+    return h_flex()
+      .id(`acp-row-${item.id}`)
+      .w_full()
+      .max_w(LANE_MAX_W)
+      .py(6)
+      .gap(10)
+      .items_center()
+      .child(div().flex_1().h(1).bg(t.border))
+      .child(div().text_size(11).text_color(t.muted).child(label))
+      .child(div().flex_1().h(1).bg(t.border));
   }
 
   renderActivityGroup(t, item, mono) {
@@ -1550,19 +2039,46 @@ export default class Peek extends View {
       })
       .children(blocks)
       .when(Boolean(item.changedFiles), (el) => el.child(this.renderChangedFilesCard(t, item, mono)))
-      .when(Boolean(item.isFinalTurnReply) && Boolean(item.text), (el) =>
-        el.child(
-          h_flex()
+      .when(Boolean(item.isFinalTurnReply) && Boolean(item.text), (el) => {
+        const canRewind = item.turn >= 1 && item.turn < (this.maxConversationTurn || 0) && this.status() !== "working" && this.term()?.state !== "finished";
+        const toTurn = Number(item.turn ?? 0);
+        const confirmThis = this.rollbackPromptItem?.id === item.id;
+        return el.child(
+          v_flex()
             .w_full()
-            .px(4)
-            .pt(1)
-            .gap(8)
-            .items_center()
-            .opacity(hovered || this.copiedId === copyTurnKey ? 1 : 0.45)
-            .child(this.copyPill(t, copyTurnKey, item.text, tr("Copy", "复制"), true))
-            .when(Boolean(time), (meta) => meta.child(div().text_size(11).text_color(t.dim).child(time))),
-        ),
-      );
+            .gap(6)
+            .child(
+              h_flex()
+                .w_full()
+                .px(4)
+                .pt(1)
+                .gap(8)
+                .items_center()
+                .opacity(hovered || confirmThis || this.copiedId === copyTurnKey ? 1 : 0.45)
+                .child(this.copyPill(t, copyTurnKey, item.text, tr("Copy", "复制"), true))
+                .when(Boolean(time), (meta) => meta.child(div().text_size(11).text_color(t.dim).child(time)))
+                .when(canRewind, (meta) =>
+                  meta.child(
+                    div()
+                      .id(`acp-restore-turn-${item.id}`)
+                      .px(7)
+                      .py(2)
+                      .rounded(6)
+                      .border_1()
+                      .border_color(confirmThis ? (t.accent ?? t.border) : t.border)
+                      .text_size(11)
+                      .text_color(confirmThis ? (t.accent ?? t.foreground) : t.muted)
+                      .cursor_pointer()
+                      .hover((s) => s.bg(t.hover))
+                      .on_mouse_down("left", stopMouse)
+                      .on_click((_e, cx) => this.openRollbackConfirm(item, toTurn, "", cx))
+                      .child(tr("↺ Restore here", "↺ 恢复到此轮")),
+                  ),
+                ),
+            )
+            .when(confirmThis, (panel) => panel.child(this.renderRollbackConfirmPanel(t, item, toTurn, ""))),
+        );
+      });
   }
 
   renderTerminalSnapshot(t, item, terminal, mono) {
@@ -2290,6 +2806,8 @@ export default class Peek extends View {
 
   renderContextStrip(t, k, shortCwd) {
     const addr = props()?.terminal;
+    const ended = k?.state === "finished" || k?.status === "ended";
+    const lineageParent = k?.lineage?.parent || this.agentDetail?.lineage?.parent || null;
     const pInfo = panes().find((p) => p.terminal === addr) ?? null;
     const aInfo = agents().find((a) => a.address === addr) ?? null;
     const sp = (typeof spaces === "function" ? spaces() : []).find((s) => s.id === (aInfo?.space ?? null))
@@ -2309,6 +2827,7 @@ export default class Peek extends View {
     const size = usage?.size ?? 0;
     const pct = hasUsage ? Math.min(100, Math.round((used / size) * 100)) : 0;
     const pctColor = pct >= 85 ? (t.blocked ?? "#ef4444") : pct >= 65 ? (t.done ?? "#f59e0b") : t.dim;
+    const accent = t.accent ?? "#3b82f6";
 
     return h_flex()
       .id("acp-ctx-strip")
@@ -2352,35 +2871,407 @@ export default class Peek extends View {
                 .items_center()
                 .flex_none()
                 .child(svg(ICONS.gitBranch).size(11).text_color(t.dim))
-                .child(div().max_w(160).truncate().child(branch)),
+                .child(div().max_w(140).truncate().child(branch)),
+            ),
+          )
+          .when(Boolean(lineageParent), (el) =>
+            el.child(
+              h_flex()
+                .id("acp-ctx-lineage")
+                .gap(4)
+                .px(5)
+                .py(1)
+                .rounded(5)
+                .flex_none()
+                .items_center()
+                .bg(t.raised)
+                .border_1()
+                .border_color(t.border)
+                .text_color(accent)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                .tooltip(tr(`Parent session: click to focus ${lineageParent}`, `来源父会话：点击跳转到 ${lineageParent}`))
+                .on_mouse_down("left", stopMouse)
+                .on_click((_e, cx) => {
+                  cx.stop_propagation();
+                  run("agent.focus", { terminal: lineageParent });
+                })
+                .child(`↳ ${lineageParent}`),
             ),
           ),
       )
-      .when(hasUsage, (el) =>
+      .child(
+        h_flex()
+          .gap(6)
+          .flex_none()
+          .items_center()
+          .when(Boolean(addr) && !ended && Boolean(lineageParent), (el) =>
+            el.child(
+              h_flex()
+                .id("acp-ctx-merge-back")
+                .h(20)
+                .px(7)
+                .gap(4)
+                .items_center()
+                .rounded(6)
+                .bg(withAlpha(accent, "18") ?? t.raised)
+                .border_1()
+                .border_color(withAlpha(accent, "66") ?? t.border)
+                .text_size(11)
+                .font_medium()
+                .text_color(accent)
+                .cursor_pointer()
+                .hover((s) => s.bg(withAlpha(accent, "2a") ?? t.hover))
+                .tooltip(tr(`Merge conclusions back into ${lineageParent}`, `将当前旁路/分支结论一键合回 ${lineageParent}`))
+                .on_mouse_down("left", stopMouse)
+                .on_click((_e, cx) => {
+                  cx.stop_propagation();
+                  run("agent.handoff", { source: addr, into: lineageParent, kind: "merge-back" });
+                })
+                .child(svg(ICONS.cornerUpRight).size(11).flex_none().text_color(accent))
+                .child(tr(`Merge → ${lineageParent}`, `合回 ${lineageParent}`)),
+            ),
+          )
+          .when(Boolean(addr) && !ended, (el) =>
+            el
+              .child(
+                h_flex()
+                  .id("acp-ctx-side-chat")
+                  .h(20)
+                  .px(7)
+                  .gap(4)
+                  .items_center()
+                  .rounded(6)
+                  .bg(t.raised)
+                  .border_1()
+                  .border_color(t.border)
+                  .text_size(11)
+                  .font_medium()
+                  .text_color(t.muted)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                  .tooltip(tr("Open isolated side-chat with current context", "带当前上下文开启旁路讨论（不污染主会话）"))
+                  .on_mouse_down("left", stopMouse)
+                  .on_click((_e, cx) => {
+                    cx.stop_propagation();
+                    run("agent.handoff", { source: addr, kind: "side-chat" });
+                  })
+                  .child(svg(ICONS.messagesSquare).size(11).flex_none())
+                  .child(tr("Side Chat", "旁路讨论")),
+              )
+              .child(
+                h_flex()
+                  .id("acp-ctx-handoff")
+                  .h(20)
+                  .px(7)
+                  .gap(4)
+                  .items_center()
+                  .rounded(6)
+                  .bg(t.raised)
+                  .border_1()
+                  .border_color(t.border)
+                  .text_size(11)
+                  .font_medium()
+                  .text_color(t.muted)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                  .tooltip(tr("Hand off, fork, or merge session context", "上下文接力 / 分支探索 / 合回"))
+                  .on_mouse_down("left", stopMouse)
+                  .on_click((_e, cx) => {
+                    cx.stop_propagation();
+                    run("agent.handoff", { source: addr, kind: "handoff" });
+                  })
+                  .child(svg(ICONS.gitBranch).size(11).flex_none())
+                  .child(tr("Handoff", "上下文接力")),
+              ),
+          )
+          .when(hasUsage, (el) =>
+            el.child(
+              h_flex()
+                .id("acp-ctx-usage")
+                .gap(6)
+                .flex_none()
+                .items_center()
+                .tooltip(tr(`Context window: ${formatTok(used)} / ${formatTok(size)} tokens (${pct}%)`, `上下文占用：${formatTok(used)} / ${formatTok(size)} tokens (${pct}%)`))
+                .child(
+                  div()
+                    .w(28)
+                    .h(3.5)
+                    .rounded(2)
+                    .bg(t.border)
+                    .overflow_hidden()
+                    .child(div().h_full().w(`${pct}%`).bg(pctColor)),
+                )
+                .child(div().text_size(11).text_color(pctColor).child(`${pct}% · ${formatTok(used)}/${formatTok(size)}`)),
+            ),
+          ),
+      );
+  }
+
+  renderInboxQueue(t, inboxItems, mono) {
+    if (!Array.isArray(inboxItems) || inboxItems.length === 0) return null;
+    const isDark = Boolean(settings()?.dark ?? true);
+    const accentSolid = t.accent ?? t.solid ?? "#2563eb";
+    const dangerColor = t.blocked ?? "#ef4444";
+
+    return v_flex()
+      .id("acp-inbox-queue")
+      .w_full()
+      .max_w(LANE_MAX_W)
+      .mb(6)
+      .rounded(14)
+      .border_1()
+      .border_color(this.editingInboxId != null ? withAlpha(accentSolid, "77") : t.border)
+      .bg(t.glass ?? withAlpha(t.popover ?? t.surface, isDark ? "e4" : "f2"))
+      .shadow_lg()
+      .overflow_hidden()
+      .on_mouse_down("left", stopMouse)
+      .on_scroll_wheel(stopScroll)
+      .child(
+        h_flex()
+          .id("acp-inbox-header")
+          .w_full()
+          .min_h(32)
+          .px(12)
+          .py(5)
+          .gap(8)
+          .items_center()
+          .justify_between()
+          .when(!this.queueCollapsed, (el) => el.border_b(1).border_color(withAlpha(t.border, "99")))
+          .child(
+            h_flex()
+              .flex_1()
+              .min_w(0)
+              .gap(7)
+              .items_center()
+              .child(svg(ICONS.listTodo).size(13).flex_none().text_color(t.accent ?? t.muted))
+              .child(
+                div()
+                  .flex_none()
+                  .text_size(12)
+                  .font_medium()
+                  .text_color(t.foreground)
+                  .child(tr(`Input queue (${inboxItems.length})`, `待发送队列 (${inboxItems.length})`)),
+              )
+              .child(
+                div()
+                  .flex_1()
+                  .min_w(0)
+                  .truncate()
+                  .text_size(11)
+                  .text_color(t.dim)
+                  .child(tr("Sent in order after current turn", "当前对话结束后按序发送")),
+              ),
+          )
+          .child(
+            h_flex()
+              .id("acp-inbox-toggle")
+              .h(22)
+              .px(7)
+              .gap(4)
+              .items_center()
+              .rounded(6)
+              .flex_none()
+              .cursor_pointer()
+              .text_size(11)
+              .text_color(t.muted)
+              .hover((s) => s.bg(t.hover).text_color(t.foreground))
+              .on_mouse_down("left", stopMouse)
+              .on_click((_e, cx) => {
+                this.queueCollapsed = !this.queueCollapsed;
+                cx.notify();
+              })
+              .child(this.queueCollapsed ? tr("Show", "展开") : tr("Hide", "收起"))
+              .child(svg(this.queueCollapsed ? ICONS.chevronUp : ICONS.chevronDown).size(11).text_color(t.dim)),
+          ),
+      )
+      .when(!this.queueCollapsed, (el) =>
         el.child(
-          h_flex()
-            .id("acp-ctx-usage")
-            .gap(6)
-            .flex_none()
-            .items_center()
-            .tooltip(tr(`Context window: ${formatTok(used)} / ${formatTok(size)} tokens (${pct}%)`, `上下文占用：${formatTok(used)} / ${formatTok(size)} tokens (${pct}%)`))
-            .child(
-              div()
-                .w(28)
-                .h(3.5)
-                .rounded(2)
-                .bg(t.border)
-                .overflow_hidden()
-                .child(div().h_full().w(`${pct}%`).bg(pctColor)),
-            )
-            .child(div().text_size(11).text_color(pctColor).child(`${pct}% · ${formatTok(used)}/${formatTok(size)}`)),
+          v_flex()
+            .id("acp-inbox-list")
+            .w_full()
+            .max_h(196)
+            .overflow_y_scrollbar()
+            .p(6)
+            .gap(4)
+            .children(
+              inboxItems.map((item) => {
+                const isEditing = Number(this.editingInboxId) === Number(item.id);
+                if (isEditing) {
+                  const hasEditText = Boolean((this.inboxEditInput?.value?.() ?? "").trim());
+                  return v_flex()
+                    .id(`acp-inbox-editor-${item.id}`)
+                    .w_full()
+                    .p(8)
+                    .gap(6)
+                    .rounded(10)
+                    .bg(t.raised)
+                    .border_1()
+                    .border_color(this.inboxEditFocused ? withAlpha(accentSolid, "90") : t.border)
+                    .child(
+                      h_flex()
+                        .w_full()
+                        .gap(6)
+                        .items_center()
+                        .justify_between()
+                        .child(
+                          h_flex()
+                            .gap(6)
+                            .items_center()
+                            .child(div().font_family(mono).text_size(11).text_color(t.accent ?? t.muted).child(`#${item.index}`))
+                            .child(div().text_size(11.5).font_medium().text_color(t.foreground).child(tr("Editing queued message", "修改队列消息"))),
+                        )
+                        .child(div().text_size(10.5).text_color(t.dim).child(tr("Enter to save · Esc to cancel", "Enter 保存 · Esc 取消"))),
+                    )
+                    .child(
+                      v_flex()
+                        .w_full()
+                        .px(9)
+                        .py(6)
+                        .rounded(8)
+                        .bg(t.canvas ?? t.background)
+                        .border_1()
+                        .border_color(t.border)
+                        .cursor_text()
+                        .on_click(() => this.inboxEditInput?.focus?.())
+                        .child(
+                          Textarea.new(this.inboxEditInput)
+                            .w_full()
+                            .text_size(12.5)
+                            .line_height("18px")
+                            .text_color(t.foreground),
+                        ),
+                    )
+                    .child(
+                      h_flex()
+                        .w_full()
+                        .gap(6)
+                        .justify_end()
+                        .items_center()
+                        .child(
+                          this.pillButton(
+                            t,
+                            `acp-inbox-cancel-${item.id}`,
+                            tr("Cancel", "取消"),
+                            (_e, cx) => this.cancelEditInboxItem(cx),
+                            { outlined: true, h: 24, px: 9 },
+                          ),
+                        )
+                        .child(
+                          this.pillButton(
+                            t,
+                            `acp-inbox-save-${item.id}`,
+                            tr("Save", "保存"),
+                            (_e, cx) => this.saveEditInboxItem(cx),
+                            { primary: true, h: 24, px: 10, disabled: !hasEditText || this.inboxBusy },
+                          ),
+                        ),
+                    );
+                }
+
+                return h_flex()
+                  .id(`acp-inbox-item-${item.id}`)
+                  .w_full()
+                  .min_h(30)
+                  .px(8)
+                  .py(4)
+                  .gap(8)
+                  .items_center()
+                  .rounded(8)
+                  .hover((s) => s.bg(t.hover))
+                  .child(
+                    div()
+                      .flex_none()
+                      .px(5)
+                      .py(1)
+                      .rounded(5)
+                      .bg(t.raised)
+                      .font_family(mono)
+                      .text_size(10.5)
+                      .text_color(t.dim)
+                      .child(`#${item.index}`),
+                  )
+                  .when(Boolean(item.fromLabel), (row) =>
+                    row.child(
+                      div()
+                        .flex_none()
+                        .max_w(140)
+                        .truncate()
+                        .px(6)
+                        .py(1)
+                        .rounded(5)
+                        .bg(withAlpha(accentSolid, "16"))
+                        .text_size(10.5)
+                        .text_color(t.accent ?? t.muted)
+                        .child(item.fromLabel),
+                    ),
+                  )
+                  .child(
+                    div()
+                      .flex_1()
+                      .min_w(0)
+                      .truncate()
+                      .text_size(12.5)
+                      .text_color(t.foreground)
+                      .cursor_pointer()
+                      .tooltip(item.body)
+                      .on_mouse_down("left", stopMouse)
+                      .on_click((_e, cx) => this.startEditInboxItem(item, cx))
+                      .child(item.preview),
+                  )
+                  .when(Boolean(item.time), (row) =>
+                    row.child(div().flex_none().font_family(mono).text_size(10.5).text_color(t.dim).child(item.time)),
+                  )
+                  .child(
+                    h_flex()
+                      .gap(2)
+                      .flex_none()
+                      .items_center()
+                      .child(
+                        h_flex()
+                          .id(`acp-inbox-edit-${item.id}`)
+                          .h(22)
+                          .px(6)
+                          .gap(3)
+                          .items_center()
+                          .rounded(6)
+                          .text_size(11)
+                          .text_color(t.muted)
+                          .when(!this.inboxBusy, (el) => el.cursor_pointer().hover((s) => s.bg(t.raised).text_color(t.foreground)))
+                          .tooltip(tr("Edit queued message", "修改这条队列消息"))
+                          .on_mouse_down("left", stopMouse)
+                          .on_click((_e, cx) => this.startEditInboxItem(item, cx))
+                          .child(svg(ICONS.squarePen).size(11))
+                          .child(tr("Edit", "修改")),
+                      )
+                      .child(
+                        h_flex()
+                          .id(`acp-inbox-rm-${item.id}`)
+                          .h(22)
+                          .px(6)
+                          .gap(3)
+                          .items_center()
+                          .rounded(6)
+                          .text_size(11)
+                          .text_color(t.muted)
+                          .when(!this.inboxBusy, (el) => el.cursor_pointer().hover((s) => s.bg(t.raised).text_color(dangerColor)))
+                          .tooltip(tr("Remove from queue", "从队列移除"))
+                          .on_mouse_down("left", stopMouse)
+                          .on_click((_e, cx) => this.removeInboxItem(item.id, cx))
+                          .child(svg(ICONS.x).size(11))
+                          .child(tr("Remove", "移除")),
+                      ),
+                  );
+              }),
+            ),
         ),
       );
   }
 
-  renderComposer(t, k, st, shortCwd, isTab = false) {
-    const queued = k?.inbox_len ?? 0;
+  renderComposer(t, k, st, shortCwd, isTab = false, mono = "JetBrains Mono", inboxItems = []) {
+    const queued = inboxItems.length > 0 ? inboxItems.length : (k?.inbox_len ?? 0);
     const ended = st === "ended" || k?.state === "finished";
+    const queuePanel = !ended && inboxItems.length > 0 ? this.renderInboxQueue(t, inboxItems, mono) : null;
     const working = st === "working" && !ended;
     const hasText = Boolean((this.input?.value?.() ?? "").trim());
     const opts = this.configOptionsFor(k);
@@ -2405,6 +3296,7 @@ export default class Peek extends View {
       .flex_none()
       .items_center()
       .bg(withAlpha(t.canvas ?? t.background, isDark ? "dc" : "e8"))
+      .when(Boolean(queuePanel), (el) => el.child(queuePanel))
       .child(
         v_flex()
           .id("acp-composer-card")
@@ -2468,6 +3360,7 @@ export default class Peek extends View {
                   .when(queued > 0, (el) =>
                     el.child(
                       div()
+                        .id("acp-queued-pill")
                         .px(8)
                         .py(2)
                         .rounded(999)
@@ -2475,6 +3368,16 @@ export default class Peek extends View {
                         .text_size(11)
                         .text_color(t.accent ?? t.muted)
                         .flex_none()
+                        .when(inboxItems.length > 0, (pill) =>
+                          pill
+                            .cursor_pointer()
+                            .hover((s) => s.bg(t.hover))
+                            .on_mouse_down("left", stopMouse)
+                            .on_click((_e, cx) => {
+                              this.queueCollapsed = !this.queueCollapsed;
+                              cx.notify();
+                            }),
+                        )
                         .child(tr(`${queued} queued`, `队列 ${queued}`)),
                     ),
                   )
@@ -2611,7 +3514,7 @@ export default class Peek extends View {
     const isPty = Boolean(props()?.pty);
     const isDark = Boolean(settings()?.dark ?? true);
     const myPane = pane ?? panes().find((p) => (p.acp || p.structured) && p.terminal === terminal)?.pane ?? null;
-    const key = `${terminal}:${st}:${k?.turn ?? 0}:${k?.transcript_seq ?? 0}:${k?.pending_permission?.request_id ?? ""}:${k?.printed ?? 0}:${k?.status_ms ?? 0}`;
+    const key = `${terminal}:${st}:${k?.turn ?? 0}:${k?.transcript_seq ?? 0}:${k?.pending_permission?.request_id ?? ""}:${k?.inbox_len ?? 0}:${k?.printed ?? 0}:${k?.status_ms ?? 0}:${shared("checkpoint.sync") ?? ""}`;
     if (!checking() && key !== this.lastKey) {
       this.lastKey = key;
       Promise.resolve().then(() => this.reloadTranscript());
@@ -2629,6 +3532,11 @@ export default class Peek extends View {
 
     const perm = k?.pending_permission;
     const mono = settings()?.font_family ?? "JetBrains Mono";
+    const inboxItems = isPty ? [] : this.inboxItemsFor(k);
+    if (this.editingInboxId != null && !inboxItems.some((it) => Number(it.id) === Number(this.editingInboxId)) && !this.inboxBusy) {
+      this.editingInboxId = null;
+      this.inboxEditFocused = false;
+    }
     const program = k?.program;
     const agentName = k?.labels?.["herdr.name"] || k?.name || k?.template || program?.name || terminal || "ACP Agent";
     const shortCwd = shortenPath(k?.cwd, home());
@@ -2638,7 +3546,9 @@ export default class Peek extends View {
       turn: k?.turn ?? 0,
       isAgent: Boolean(program?.agent || k?.status || st),
       cwd: k?.cwd || "",
+      checkpointsByTurn: this.checkpoints,
     });
+    this.maxConversationTurn = items.reduce((m, it) => Math.max(m, Number(it?.turn) || 0), 0);
 
     const threadChildren = [];
     if (parent) {
@@ -2651,6 +3561,8 @@ export default class Peek extends View {
         if (item.kind === "user") threadChildren.push(this.renderUserItem(t, item, terminal));
         else if (item.kind === "activity_group") threadChildren.push(this.renderActivityGroup(t, item, mono));
         else if (item.kind === "assistant") threadChildren.push(this.renderAssistantItem(t, item, mono));
+        else if (item.kind === "handoff") threadChildren.push(this.renderHandoffBanner(t, item));
+        else if (item.kind === "rewind") threadChildren.push(this.renderRewindDivider(t, item));
         else if (item.kind === "terminal_snapshot") threadChildren.push(this.renderTerminalSnapshot(t, item, terminal, mono));
         else if (item.kind === "error") threadChildren.push(this.renderErrorItem(t, item));
         else if (item.kind === "stderr_group") threadChildren.push(this.renderStderrItem(t, item, mono));
@@ -2698,17 +3610,22 @@ export default class Peek extends View {
       );
     }
 
-    const overlayPadBottom = perm || (isPty && st === "blocked") ? 244 : 172;
+    const queuePad = inboxItems.length > 0 && st !== "ended" && k?.state !== "finished"
+      ? (this.queueCollapsed ? 46 : Math.min(220, 48 + inboxItems.length * 40))
+      : 0;
+    const overlayPadBottom = (perm || (isPty && st === "blocked") ? 244 : 172) + queuePad;
     threadChildren.push(div().id("acp-bottom-anchor").h(overlayPadBottom).flex_none());
 
     const last = items[items.length - 1];
-    const tailSig = `${items.length}:${last?.id ?? ""}:${last?.text?.length ?? 0}:${last?.steps?.length ?? 0}:${st ?? ""}:${Boolean(perm)}`;
+    const tailSig = `${items.length}:${last?.id ?? ""}:${last?.text?.length ?? 0}:${last?.steps?.length ?? 0}:${st ?? ""}:${Boolean(perm)}:${inboxItems.length}:${this.queueCollapsed}`;
     if (this.autoFollow && tailSig !== this.revealedSig && threadChildren.length > 0) {
       this.revealedSig = tailSig;
       this.scroll.scroll_to_item(threadChildren.length - 1);
     }
 
     const padX = isTab ? 20 : 28;
+    const modalLineageParent = k?.lineage?.parent || this.agentDetail?.lineage?.parent || null;
+    const modalEnded = st === "ended" || k?.state === "finished";
     const modalHeader = h_flex()
       .id("acp-header")
       .min_h(48)
@@ -2775,6 +3692,38 @@ export default class Peek extends View {
               () => this.reloadTranscript(),
               { h: 26, px: 8 },
             ),
+          )
+          .when(Boolean(terminal) && !modalEnded && Boolean(modalLineageParent), (el) =>
+            el.child(
+              this.pillButton(
+                t,
+                "acp-merge-back",
+                h_flex().gap(4).items_center().child(svg(ICONS.cornerUpRight).size(12)).child(tr(`Merge → ${modalLineageParent}`, `合回 ${modalLineageParent}`)),
+                () => run("agent.handoff", { source: terminal, into: modalLineageParent, kind: "merge-back" }),
+                { outlined: true, h: 26, px: 9 },
+              ),
+            ),
+          )
+          .when(Boolean(terminal) && !modalEnded, (el) =>
+            el
+              .child(
+                this.pillButton(
+                  t,
+                  "acp-side-chat",
+                  h_flex().gap(4).items_center().child(svg(ICONS.messagesSquare).size(12)).child(tr("Side Chat", "旁路讨论")),
+                  () => run("agent.handoff", { source: terminal, kind: "side-chat" }),
+                  { outlined: true, h: 26, px: 9 },
+                ),
+              )
+              .child(
+                this.pillButton(
+                  t,
+                  "acp-handoff",
+                  h_flex().gap(4).items_center().child(svg(ICONS.gitBranch).size(12)).child(tr("Handoff", "上下文接力")),
+                  () => run("agent.handoff", { source: terminal, kind: "handoff" }),
+                  { outlined: true, h: 26, px: 9 },
+                ),
+              ),
           )
           .child(
             this.pillButton(
@@ -2887,7 +3836,7 @@ export default class Peek extends View {
           .w_full()
           .children(fadeStops.map((alpha) => div().w_full().h(4).bg(withAlpha(canvasBase, alpha)))),
       )
-      .child(this.renderComposer(t, k, st, shortCwd, isTab));
+      .child(this.renderComposer(t, k, st, shortCwd, isTab, mono, inboxItems));
 
     return v_flex()
       .id("acp-peek")
@@ -2899,7 +3848,7 @@ export default class Peek extends View {
       .track_focus(this.handle)
       .on_mouse_down("left", (_e, cx) => {
         if (this.openConfigId) this.closeConfigPopover(cx);
-        if (!this.inputFocused && !this.configFilterFocused) this.handle?.focus?.();
+        if (!this.inputFocused && !this.configFilterFocused && !this.inboxEditFocused) this.handle?.focus?.();
       })
       .when(isTab && Boolean(myPane), (el) =>
         el.on_mouse_down("right", (_e, cx) => {
@@ -2909,6 +3858,11 @@ export default class Peek extends View {
       )
       .on_key_down((e, cx) => {
         if (e.key === "escape" && !e.modifiers?.control && !e.modifiers?.alt && !e.modifiers?.platform) {
+          if (this.editingInboxId != null) {
+            this.cancelEditInboxItem(cx);
+            cx.stop_propagation();
+            return;
+          }
           if (this.openConfigId) {
             this.closeConfigPopover(cx);
             cx.stop_propagation();

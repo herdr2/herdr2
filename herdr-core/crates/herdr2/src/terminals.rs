@@ -147,6 +147,9 @@ pub struct Terminal {
     /// Machines (core ids) it started work on: they may call back to it.
     #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
     pub afar: std::collections::BTreeSet<String>,
+    /// Context handoff / fork / side-chat parent lineage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<crate::handoff::Lineage>,
 }
 
 impl Terminal {
@@ -242,6 +245,7 @@ pub struct NewTerminal {
     pub cols: u16,
     pub rows: u16,
     pub identity: String,
+    pub lineage: Option<crate::handoff::Lineage>,
 }
 
 impl Registry {
@@ -323,6 +327,7 @@ impl Registry {
                 template: new.template.map(|t| t.name),
                 first_message: None,
                 holder: None,
+                lineage: new.lineage,
             },
         );
         Ok(id)

@@ -5672,6 +5672,200 @@ impl AppWindow {
                     cx,
                 );
             }
+            "agent.handoff" => {
+                let source = Self::owned(a, "source")
+                    .or_else(|| Self::owned(a, "terminal"))
+                    .or_else(|| self.peeked_agent.clone())
+                    .or_else(|| self.model.focused_pane().and_then(|p| self.model.any_address_of(&p)))
+                    .or_else(|| self.shown_agent())
+                    .unwrap_or_default();
+                if source.is_empty() {
+                    return self.fail("agent.handoff needs a source session");
+                }
+                let preset = Self::owned(a, "preset").filter(|s| !s.is_empty());
+                let into = Self::owned(a, "into").filter(|s| !s.is_empty());
+                let kind_arg = Self::owned(a, "kind").filter(|s| !s.is_empty());
+                if preset.is_none() && into.is_none() {
+                    let kind = kind_arg.unwrap_or_else(|| "handoff".into());
+                    let explicit = a.get("kind").is_some() || a.get("source").is_some() || a.get("terminal").is_some();
+                    let already_open = self.overlays.iter().any(|o| o.id == "handoff");
+                    if already_open {
+                        self.close_overlay("handoff", window, cx);
+                    }
+                    if !already_open || explicit {
+                        let spec = json!({
+                            "mod": "handoff",
+                            "kind": "dialog",
+                            "width": 560,
+                            "props": { "source": source, "kind": kind }
+                        });
+                        self.open_overlay("handoff".into(), spec, window, cx);
+                    }
+                    return;
+                }
+                if self.overlays.iter().any(|o| o.id == "handoff") {
+                    self.close_overlay("handoff", window, cx);
+                }
+                let is_merge = into.is_some();
+                let kind = kind_arg.unwrap_or_else(|| if is_merge { "merge-back".into() } else { "handoff".into() });
+                let rpc_kind = if kind == "merge-back" { "handoff" } else { kind.as_str() };
+                let open = Self::owned(a, "open").unwrap_or_else(|| {
+                    if is_merge {
+                        "focus".into()
+                    } else if kind == "side-chat" {
+                        "split".into()
+                    } else {
+                        "tab".into()
+                    }
+                });
+                let mut params = json!({ "source": source, "kind": rpc_kind });
+                if let Some(p) = preset { params["preset"] = json!(p); }
+                if let Some(dst) = into { params["into"] = json!(dst); }
+                if let Some(m) = Self::owned(a, "mode").filter(|s| !s.is_empty()) { params["mode"] = json!(m); }
+                if let Some(prompt) = Self::owned(a, "prompt").filter(|s| !s.is_empty()) { params["prompt"] = json!(prompt); }
+                if let Some(rt) = a.get("recent_turns").and_then(Value::as_u64) { params["recent_turns"] = json!(rt); }
+                if let Some(mb) = a.get("max_bytes").and_then(Value::as_u64) { params["max_bytes"] = json!(mb); }
+                if let Some(model) = Self::owned(a, "model").filter(|s| !s.is_empty()) { params["model"] = json!(model); }
+                if let Some(effort) = Self::owned(a, "effort").filter(|s| !s.is_empty()) { params["effort"] = json!(effort); }
+
+                let core = self.core.clone();
+                let generation = self.core_generation;
+                let source_for_ui = source.clone();
+                cx.spawn_in(window, async move |this, cx| {
+                    let res = cx
+                        .background_executor()
+                        .spawn(async move {
+                            let out = core.call_timeout("agent.handoff", params, Duration::from_secs(30))?;
+                            let target = out.get("target").and_then(Value::as_str).unwrap_or_default().to_owned();
+                            let target_kind = out.get("target_kind").and_then(Value::as_str).unwrap_or("agent").to_owned();
+                            let fetched = if target.is_empty() {
+                                None
+                            } else if target_kind == "terminal" {
+                                core.call("terminal.get", json!({ "terminal": target })).ok()
+                            } else {
+                                core.call("agent.get", json!({ "agent": target })).ok()
+                            };
+                            Ok::<(Value, String, String, Option<Value>), anyhow::Error>((out, target, target_kind, fetched))
+                        })
+                        .await;
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        if generation != this.core_generation || this.draining {
+                            return;
+                        }
+                        match res {
+                            Ok((out, target, target_kind, fetched)) => {
+                                if !target.is_empty() {
+                                    if let Some(mut rec) = fetched
+                                        && !this.live.contains_key(&target)
+                                        && let Some(obj) = rec.as_object_mut()
+                                    {
+                                        if target_kind == "agent" {
+                                            let report = obj.remove("status").unwrap_or(Value::Null);
+                                            let raw_state = report.get("state").and_then(Value::as_str).or_else(|| report.as_str()).map(str::to_owned);
+                                            let word = match raw_state.as_deref() {
+                                                Some("starting" | "working") => json!("working"),
+                                                Some("blocked" | "error") => json!("blocked"),
+                                                _ => json!("idle"),
+                                            };
+                                            let app_hint = report
+                                                .get("app")
+                                                .and_then(Value::as_str)
+                                                .filter(|s| !s.is_empty())
+                                                .or_else(|| obj.get("agent").and_then(Value::as_str).filter(|s| !s.is_empty()));
+                                            let mut prog = program_of(&json!({ "app": app_hint }), obj.get("argv"));
+                                            prog["agent"] = json!(true);
+                                            let raw_title = obj
+                                                .get("title")
+                                                .and_then(Value::as_str)
+                                                .filter(|s| !s.is_empty())
+                                                .or_else(|| obj.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()))
+                                                .or(app_hint)
+                                                .unwrap_or(&target)
+                                                .to_owned();
+                                            let shown = crate::terminal::shown_title(&raw_title).into_owned();
+                                            obj.insert("acp".into(), json!(true));
+                                            obj.insert("reported".into(), json!(true));
+                                            obj.insert("raw_state".into(), raw_state.map_or(Value::Null, Value::String));
+                                            obj.insert("status".into(), word);
+                                            obj.insert("report".into(), report);
+                                            obj.insert("program".into(), prog);
+                                            obj.insert("raw_title".into(), raw_title.into());
+                                            obj.insert("title".into(), shown.into());
+                                        } else {
+                                            let report = obj.remove("status").unwrap_or(Value::Null);
+                                            let word = report.get("state").cloned().unwrap_or_else(|| if report.is_string() { report.clone() } else { Value::Null });
+                                            obj.insert("status".into(), word);
+                                            let argv = effective_running_argv(obj, false);
+                                            obj.insert("program".into(), program_of(&report, argv.as_ref()));
+                                            obj.insert("report".into(), report);
+                                        }
+                                        if !this.live_order.iter().any(|a| a == &target) {
+                                            this.live_order.push(target.clone());
+                                        }
+                                        this.live.insert(target.clone(), rec);
+                                    }
+                                    if is_merge {
+                                        if let Some(obj) = this.live.get_mut(&target).and_then(Value::as_object_mut) {
+                                            let next_seq = obj.get("transcript_seq").and_then(Value::as_u64).unwrap_or(0) + 1;
+                                            obj.insert("transcript_seq".into(), json!(next_seq));
+                                            if out.get("prompt_sent").and_then(Value::as_bool) == Some(true)
+                                                && target_kind == "agent"
+                                            {
+                                                obj.insert("status".into(), json!("working"));
+                                            }
+                                        }
+                                        mods::publish_terminals(this.ordered_live_values());
+                                        let is_zh = settings::get().language == settings::Language::ZhCn;
+                                        let title = if is_zh {
+                                            format!("已合回上下文至 {target}")
+                                        } else {
+                                            format!("Merged context into {target}")
+                                        };
+                                        let body = if is_zh {
+                                            format!("{source_for_ui} 的接力上下文已注入 {target}，正在继续处理。")
+                                        } else {
+                                            format!("Delivered context from {source_for_ui} to {target}.")
+                                        };
+                                        let notification = json!({
+                                            "title": title,
+                                            "body": body,
+                                            "level": "info",
+                                            "action": { "name": "agent.focus", "args": { "terminal": target } },
+                                        });
+                                        this.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": notification }), window, cx);
+                                        if open != "none" {
+                                            if this.peeked_agent.as_deref() == Some(source_for_ui.as_str()) && target != source_for_ui {
+                                                this.close_overlay("terminal-peek", window, cx);
+                                            }
+                                            if open == "peek" {
+                                                this.dispatch("terminal.peek", &json!({ "terminal": target }), false, window, cx);
+                                            } else {
+                                                this.dispatch("agent.focus", &json!({ "terminal": target }), false, window, cx);
+                                            }
+                                        }
+                                    } else {
+                                        mods::publish_terminals(this.ordered_live_values());
+                                        match open.as_str() {
+                                            "none" => {}
+                                            "peek" => this.dispatch("terminal.peek", &json!({ "terminal": target }), false, window, cx),
+                                            "split" | "right" => this.dispatch("terminal.keep", &json!({ "terminal": target, "place": "right" }), false, window, cx),
+                                            "down" => this.dispatch("terminal.keep", &json!({ "terminal": target, "place": "down" }), false, window, cx),
+                                            _ => this.dispatch("terminal.keep", &json!({ "terminal": target, "place": "tab" }), false, window, cx),
+                                        }
+                                    }
+                                    this.sync(window, cx);
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!("agent.handoff failed: {e:#}");
+                                this.command_error("agent.handoff", &format!("{e:#}"), window, cx);
+                            }
+                        }
+                    });
+                })
+                .detach();
+                return;
+            }
             "agent.next" | "agent.prev" => {
                 let order = self.agent_order();
                 if order.is_empty() {

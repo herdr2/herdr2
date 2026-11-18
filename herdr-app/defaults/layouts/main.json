@@ -160,6 +160,13 @@
                       "content": {
                         "mod": "changes"
                       }
+                    },
+                    {
+                      "id": "checkpoints",
+                      "type": "block",
+                      "content": {
+                        "mod": "checkpoints"
+                      }
                     }
                   ]
                 }

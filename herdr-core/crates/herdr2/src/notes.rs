@@ -21,6 +21,8 @@ pub enum Job {
     Orphaned(TargetKey),
     /// News for a parent on a core that dialed in (`desktop/a3` or `desktop/t3`).
     NotesAfar(String),
+    /// PTY terminal status transitioned (`working` or `turn_ended`): capture baseline/turn checkpoint on Tokio.
+    PtyCheckpoint { id: u32, entered_working: bool, turn_ended: bool, turn: u64 },
 }
 
 fn parent_key(parent: Option<&str>) -> Option<TargetKey> {
@@ -466,6 +468,19 @@ impl Core {
                         core.pty_kill(&pty_kids).await;
                     });
                 }
+                Job::PtyCheckpoint { id, entered_working, turn_ended, turn } => {
+                    let core = self.clone();
+                    tokio::spawn(async move {
+                        crate::pty_adapters::process_pty_checkpoint_job(
+                            &core,
+                            id,
+                            entered_working,
+                            turn_ended,
+                            turn,
+                        )
+                        .await;
+                    });
+                }
             }
         }
     }
@@ -542,11 +557,8 @@ impl Core {
                 t.noted = t.noted.max(*news);
             }
         }
-        st.inboxes.entry(parent).or_default().push_back(QueuedPrompt { text: text.join("\n"), from: None });
-        let inbox_len = st.inboxes.get(&parent).map_or(0, std::collections::VecDeque::len);
-        if let Some(p) = st.reg.agents.get_mut(&parent) {
-            p.inbox_len = inbox_len;
-        }
+        st.inboxes.entry(parent).or_default().push_back(QueuedPrompt::new(text.join("\n"), None));
+        self.sync_inbox(&mut st, parent, true);
         if let Some(session) = st.sessions.get(&parent) {
             let _ = session.cmd_tx.send(SessionCommand::WakeInbox);
         }

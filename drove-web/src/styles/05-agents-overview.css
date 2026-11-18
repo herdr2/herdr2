@@ -603,14 +603,14 @@
   font-weight: 600;
 }
 .micro-badge--exec {
-  color: var(--role-coord);
-  border-color: color-mix(in srgb, var(--role-coord) 35%, var(--border));
-  background: var(--role-coord-bg);
+  color: var(--text-2);
+  border-color: var(--border);
+  background: var(--surface-2);
 }
 .micro-badge--template {
-  color: var(--st-blocked);
-  border-color: color-mix(in srgb, var(--st-blocked) 35%, var(--border));
-  background: var(--st-blocked-bg);
+  color: var(--text-2);
+  border-color: var(--border);
+  background: var(--surface-2);
 }
 .micro-badge--cached {
   color: var(--st-done);
@@ -629,9 +629,9 @@
   text-transform: none;
 }
 .micro-badge--role {
-  color: var(--role-worker);
-  border-color: color-mix(in srgb, var(--role-worker) 35%, var(--border));
-  background: var(--role-worker-bg);
+  color: var(--text-2);
+  border-color: var(--border);
+  background: var(--surface-2);
 }
 
 /* ---------- OverviewBar ---------- */
@@ -814,11 +814,11 @@
   width: 240px;
   height: 108px;
   border-radius: 12px;
-  background: color-mix(in srgb, var(--role-reviewer-bg) 42%, var(--surface-elevated, var(--surface)));
+  background: var(--surface-elevated, var(--surface));
   box-shadow: var(--shadow);
 }
 .gnode--reviewer:not(.gnode--selected):not(.gnode--rel-ran) {
-  border-color: var(--role-reviewer-border);
+  border-color: color-mix(in srgb, var(--role-reviewer) 28%, var(--border));
 }
 .gnode--reviewer:not(.gnode--selected):not(.gnode--rel-ran):hover {
   border-color: color-mix(in srgb, var(--role-reviewer) 52%, var(--border));
@@ -921,10 +921,10 @@
   min-width: 18px;
   padding: 1px 6px;
   border-radius: 999px;
-  background: var(--role-reviewer-bg);
-  color: var(--role-reviewer);
+  background: var(--surface-3);
+  color: var(--text-2);
   font: 600 10px/1.3 var(--font-mono);
 }
 .page-tabs__pulse {
-  background: var(--role-reviewer);
+  background: var(--accent);
 }

@@ -64,10 +64,20 @@ function items(p, git) {
       const inTab = Boolean(paneInfo);
       const tabPaneCount = inTab ? panes().filter((pane) => pane.tab === paneInfo.tab).length : 0;
       const isStructured = Boolean(paneInfo?.structured);
+      const lineageParent = term?.lineage?.parent || null;
       return [
         ...(tg.terminal
           ? [
               [tr("Rename", "重命名"), "agent.rename", { terminal: tg.terminal }],
+            ]
+          : []),
+        ...(term && !isEnded
+          ? [
+              [tr("Context handoff / Fork…", "上下文接力 / 分支…"), "agent.handoff", { source: term.address, kind: "handoff" }],
+              [tr("Side chat…", "旁路讨论…"), "agent.handoff", { source: term.address, kind: "side-chat" }],
+              ...(lineageParent
+                ? [[tr(`Merge back into ${lineageParent}`, `合回 ${lineageParent}`), "agent.handoff", { source: term.address, into: lineageParent, kind: "merge-back" }]]
+                : []),
             ]
           : []),
         ...(inTab
@@ -109,9 +119,20 @@ function items(p, git) {
     case "agent": {
       const term = terminals().find((t) => t.address === tg.terminal);
       const isAcp = Boolean(term?.acp);
+      const isEnded = term?.state === "finished" || term?.status === "ended";
+      const lineageParent = term?.lineage?.parent || null;
       const pinned = Boolean(term?.labels?.["herdr.pinned"]);
       return [
         [tr("Rename", "重命名"), "agent.rename", { terminal: tg.terminal }],
+        ...(tg.terminal && !isEnded
+          ? [
+              [tr("Context handoff / Fork…", "上下文接力 / 分支…"), "agent.handoff", { source: tg.terminal, kind: "handoff" }],
+              [tr("Side chat…", "旁路讨论…"), "agent.handoff", { source: tg.terminal, kind: "side-chat" }],
+              ...(lineageParent
+                ? [[tr(`Merge back into ${lineageParent}`, `合回 ${lineageParent}`), "agent.handoff", { source: tg.terminal, into: lineageParent, kind: "merge-back" }]]
+                : []),
+            ]
+          : []),
         ...(isAcp
           ? [
               ...(!tg.pane ? [[tr("Open as Tab", "挂载为标签页"), "terminal.keep", { terminal: tg.terminal, place: "tab" }]] : []),

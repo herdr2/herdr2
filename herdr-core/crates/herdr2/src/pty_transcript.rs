@@ -41,6 +41,55 @@ enum Provider {
     Agy,
 }
 
+impl Provider {
+    fn as_str(self) -> &'static str {
+        match self {
+            Provider::Claude => "claude",
+            Provider::Codex => "codex",
+            Provider::Gemini => "gemini",
+            Provider::Qwen => "qwen",
+            Provider::Pi => "pi",
+            Provider::Agy => "agy",
+        }
+    }
+}
+
+fn agy_cid_from_path(path: &Path) -> Option<String> {
+    let logs = path.parent()?;
+    if logs.file_name().and_then(|s| s.to_str()) != Some("logs") {
+        return None;
+    }
+    let sys = logs.parent()?;
+    if sys.file_name().and_then(|s| s.to_str()) != Some(".system_generated") {
+        return None;
+    }
+    sys.parent()
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn codex_sid_from_header(path: &Path) -> Option<String> {
+    let file = File::open(path).ok()?;
+    for line in BufReader::new(file).lines().take(12).flatten() {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if v.get("type").and_then(Value::as_str) == Some("session_meta")
+            && let Some(sid) = v
+                .pointer("/payload/id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            return Some(sid.to_string());
+        }
+    }
+    None
+}
+
 struct Candidate {
     path: PathBuf,
     provider: Provider,
@@ -137,7 +186,7 @@ fn extract_transcript_with_home(
             Provider::Agy => discover_agy(home, min_mtime, snap.fg_pid),
         };
         if let Some(best) = pick_best_candidate(candidates, snap.started_ms, fg_started_ms, allow_older_fallback) {
-            let (entries, meta) = match best.provider {
+            let (entries, mut meta) = match best.provider {
                 Provider::Claude => parse_claude_jsonl(&best.path),
                 Provider::Codex => parse_codex_jsonl(&best.path),
                 Provider::Gemini => parse_gemini_json(&best.path),
@@ -152,7 +201,8 @@ fn extract_transcript_with_home(
                 Provider::Agy => parse_agy_jsonl(&best.path),
             };
             if !entries.is_empty() || !meta.is_empty() {
-                return (entries, (!meta.is_empty()).then_some(meta));
+                meta.provider = Some(best.provider.as_str().to_string());
+                return (entries, Some(meta));
             }
         }
     }
@@ -905,6 +955,11 @@ fn parse_claude_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
         let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
             continue;
         };
+        if meta.session_id.is_none()
+            && let Some(sid) = v.get("sessionId").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+        {
+            meta.session_id = Some(sid.to_string());
+        }
         if let Some(pm) = v.get("permissionMode").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
             meta.mode = Some(if pm == "bypassPermissions" {
                 "dangerously-skip-permissions".into()
@@ -1047,6 +1102,18 @@ fn parse_claude_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
             _ => {}
         }
     }
+    if !entries.is_empty() || !meta.is_empty() {
+        if meta.session_id.is_none()
+            && let Some(stem) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty() && !s.starts_with("agent-"))
+        {
+            meta.session_id = Some(stem.to_string());
+        }
+        meta.provider.get_or_insert_with(|| "claude".to_string());
+    }
     (entries, meta)
 }
 
@@ -1178,6 +1245,15 @@ fn parse_codex_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
         let ts_ms = v.get("timestamp").and_then(Value::as_str).map(parse_ts_ms).unwrap_or(0);
         match v.get("type").and_then(Value::as_str) {
             Some("session_meta") => {
+                if meta.session_id.is_none()
+                    && let Some(sid) = v
+                        .pointer("/payload/id")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                {
+                    meta.session_id = Some(sid.to_string());
+                }
                 if let Some(m) = v.pointer("/payload/model").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
                     meta.model = Some(m.to_string());
                 }
@@ -1338,6 +1414,12 @@ fn parse_codex_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
             }
             _ => {}
         }
+    }
+    if !entries.is_empty() || !meta.is_empty() {
+        if meta.session_id.is_none() {
+            meta.session_id = codex_sid_from_header(path);
+        }
+        meta.provider.get_or_insert_with(|| "codex".to_string());
     }
     (entries, meta)
 }
@@ -1510,6 +1592,14 @@ fn parse_gemini_json(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
             _ => {}
         }
     }
+    if !entries.is_empty() || !meta.is_empty() {
+        if meta.session_id.is_none()
+            && let Some(sid) = v.get("sessionId").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+        {
+            meta.session_id = Some(sid.to_string());
+        }
+        meta.provider.get_or_insert_with(|| "gemini".to_string());
+    }
     (entries, meta)
 }
 
@@ -1661,6 +1751,14 @@ fn parse_pi_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
         {
             meta.reasoning_effort = Some(eff.to_string());
         }
+        if v.get("type").and_then(Value::as_str) == Some("session") {
+            if meta.session_id.is_none()
+                && let Some(sid) = v.get("id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+            {
+                meta.session_id = Some(sid.to_string());
+            }
+            continue;
+        }
         if v.get("type").and_then(Value::as_str) == Some("model_change")
             && let Some(m) = v.get("modelId").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
         {
@@ -1752,6 +1850,9 @@ fn parse_pi_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
             }
             _ => {}
         }
+    }
+    if !entries.is_empty() || !meta.is_empty() {
+        meta.provider.get_or_insert_with(|| "pi".to_string());
     }
     (entries, meta)
 }
@@ -1845,6 +1946,12 @@ fn parse_agy_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
             }
             _ => {}
         }
+    }
+    if !entries.is_empty() || !meta.is_empty() {
+        if meta.session_id.is_none() {
+            meta.session_id = agy_cid_from_path(path);
+        }
+        meta.provider.get_or_insert_with(|| "agy".to_string());
     }
     (entries, meta)
 }
@@ -1950,19 +2057,87 @@ fn cap_entries(entries: &mut Vec<Entry>) {
 }
 
 fn entry_approx_bytes(e: &Entry) -> usize {
-    match e {
-        Entry::User { text, from, .. } => text.len() + from.as_ref().map_or(0, String::len),
-        Entry::Thought { text, .. } | Entry::Assistant { text, .. } | Entry::Stderr { text, .. } => text.len(),
-        Entry::ToolCall { id, title, tool_kind, status, detail, .. } => {
-            id.len()
-                + title.len()
-                + tool_kind.as_ref().map_or(0, String::len)
-                + status.len()
-                + detail.as_ref().map_or(0, String::len)
+    e.approx_bytes()
+}
+
+pub(crate) fn user_home_dir() -> Option<PathBuf> {
+    home_dir()
+}
+
+pub(crate) fn is_claude_user_noise(raw: &str) -> bool {
+    is_claude_command_noise(raw) || raw.trim_start().starts_with("[Request interrupted by user")
+}
+
+pub(crate) fn clean_claude_text(raw: &str) -> String {
+    strip_system_reminders(raw)
+}
+
+pub(crate) fn find_claude_session_file(cwd: &str, session_id: &str) -> Option<PathBuf> {
+    if session_id.trim().is_empty() {
+        return None;
+    }
+    let home = home_dir()?;
+    let projects_dir = claude_root(&home, None).join("projects");
+    let direct = projects_dir.join(claude_slug(cwd)).join(format!("{session_id}.jsonl"));
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let entries = fs::read_dir(&projects_dir).ok()?;
+    for entry in entries.flatten() {
+        let candidate = entry.path().join(format!("{session_id}.jsonl"));
+        if candidate.is_file() {
+            return Some(candidate);
         }
-        Entry::Plan { items, .. } => items.iter().map(String::len).sum(),
-        Entry::Permission { title, outcome, .. } => title.len() + outcome.len(),
-        Entry::Error { message, .. } => message.len(),
+    }
+    None
+}
+
+pub(crate) fn find_codex_rollout_by_sid(cwd: &str, sid: &str) -> Option<PathBuf> {
+    let home = home_dir()?;
+    let suffix = format!("-{sid}.jsonl");
+    let mut matches = Vec::new();
+    for c in discover_codex(&home, None, cwd, 0) {
+        let name = c.path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if name.ends_with(&suffix) {
+            matches.push(c);
+        }
+    }
+    matches.sort_by(|a, b| b.mtime_ms.cmp(&a.mtime_ms));
+    matches.into_iter().next().map(|c| c.path)
+}
+
+pub(crate) fn find_agy_transcript_by_cid(cid: &str) -> Option<PathBuf> {
+    if cid.trim().is_empty() {
+        return None;
+    }
+    let home = home_dir()?;
+    let logs = home.join(".gemini/antigravity-cli/brain").join(cid).join(".system_generated/logs");
+    pick_agy_log_file(&logs)
+}
+
+pub(crate) fn discover_cli_transcript(
+    kind: &str,
+    cwd: &str,
+    min_mtime_ms: u64,
+    fg_pid: Option<u32>,
+) -> Option<PathBuf> {
+    let home = home_dir()?;
+    let fg_started = fg_pid.and_then(proc_started_ms);
+    let candidates = match kind {
+        "claude" => discover_claude(&home, None, cwd, min_mtime_ms),
+        "codex" => discover_codex(&home, None, cwd, min_mtime_ms),
+        "agy" => discover_agy(&home, min_mtime_ms, fg_pid),
+        _ => return None,
+    };
+    pick_best_candidate(candidates, min_mtime_ms, fg_started, false).map(|c| c.path)
+}
+
+pub(crate) fn parse_cli_transcript(kind: &str, path: &Path) -> Vec<Entry> {
+    match kind {
+        "claude" => parse_claude_jsonl(path).0,
+        "codex" => parse_codex_jsonl(path).0,
+        "agy" => parse_agy_jsonl(path).0,
+        _ => Vec::new(),
     }
 }
 

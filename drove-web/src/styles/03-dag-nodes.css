@@ -81,14 +81,12 @@
 .gnode--worker {
   width: 240px;
   height: 108px;
-  background: color-mix(in srgb, var(--role-worker-bg) 45%, var(--surface-elevated, var(--surface)));
 }
 .gnode--coord {
   width: 240px;
   height: 112px;
   box-sizing: border-box;
-  background: color-mix(in srgb, var(--role-coord-bg) 55%, var(--surface-elevated, var(--surface)));
-  border-color: color-mix(in srgb, var(--role-coord) 40%, var(--border));
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
 }
 .gnode--coord:hover {
   border-color: var(--border-strong);
@@ -253,20 +251,12 @@
   background: var(--surface-2);
   white-space: nowrap;
 }
-.access-pill--readonly {
-  color: var(--role-reviewer);
-  border-color: var(--role-reviewer-border);
-  background: var(--role-reviewer-bg);
-}
-.access-pill--scoped_write {
-  color: var(--role-tester);
-  border-color: color-mix(in srgb, var(--role-tester) 40%, var(--border));
-  background: var(--role-tester-bg);
-}
+.access-pill--readonly,
+.access-pill--scoped_write,
 .access-pill--writable {
-  color: var(--role-coder);
-  border-color: color-mix(in srgb, var(--role-coder) 35%, var(--border));
-  background: var(--role-coder-bg);
+  color: var(--text-2);
+  border-color: var(--border);
+  background: var(--surface-2);
 }
 
 /* ---------- edges ---------- */

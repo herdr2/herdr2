@@ -75,10 +75,40 @@ pub enum Entry {
         text: String,
         ts_ms: u64,
     },
+    Checkpoint {
+        turn: u64,
+        ref_name: String,
+        commit_oid: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_oid: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        files: Vec<crate::checkpoint::CheckpointFileStat>,
+        ts_ms: u64,
+    },
+    Rewind {
+        to_turn: u64,
+        restore_files: bool,
+        ts_ms: u64,
+    },
+    /// Cross-provider/session context handoff, fork, or side-chat record.
+    Handoff {
+        turn: u64,
+        handoff_kind: String,
+        from_address: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_provider: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from_turns: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        artifact_path: Option<String>,
+        ts_ms: u64,
+    },
 }
 
 impl Entry {
-    fn turn(&self) -> Option<u64> {
+    pub fn turn(&self) -> Option<u64> {
         match self {
             Self::User { turn, .. }
             | Self::Thought { turn, .. }
@@ -86,12 +116,15 @@ impl Entry {
             | Self::ToolCall { turn, .. }
             | Self::Plan { turn, .. }
             | Self::Permission { turn, .. }
-            | Self::Error { turn, .. } => Some(*turn),
+            | Self::Error { turn, .. }
+            | Self::Checkpoint { turn, .. }
+            | Self::Handoff { turn, .. } => Some(*turn),
+            Self::Rewind { to_turn, .. } => Some(*to_turn),
             Self::Stderr { .. } => None,
         }
     }
 
-    fn approx_bytes(&self) -> usize {
+    pub(crate) fn approx_bytes(&self) -> usize {
         match self {
             Self::User { text, from, .. } => text.len() + from.as_ref().map_or(0, String::len),
             Self::Thought { text, .. } | Self::Assistant { text, .. } | Self::Stderr { text, .. } => text.len(),
@@ -105,6 +138,26 @@ impl Entry {
             Self::Plan { items, .. } => items.iter().map(String::len).sum(),
             Self::Permission { title, outcome, .. } => title.len() + outcome.len(),
             Self::Error { message, .. } => message.len(),
+            Self::Checkpoint { ref_name, commit_oid, files, .. } => {
+                ref_name.len() + commit_oid.len() + files.iter().map(|f| f.path.len() + 24).sum::<usize>()
+            }
+            Self::Rewind { .. } => 24,
+            Self::Handoff {
+                handoff_kind,
+                from_address,
+                from_provider,
+                from_session_id,
+                from_turns,
+                artifact_path,
+                ..
+            } => {
+                handoff_kind.len()
+                    + from_address.len()
+                    + from_provider.as_ref().map_or(0, String::len)
+                    + from_session_id.as_ref().map_or(0, String::len)
+                    + from_turns.as_ref().map_or(0, String::len)
+                    + artifact_path.as_ref().map_or(0, String::len)
+            }
         }
     }
 
@@ -155,6 +208,23 @@ impl Entry {
                 for line in text.lines() {
                     out.push(format!("[stderr] {line}"));
                 }
+            }
+            Self::Checkpoint { turn, files, .. } => {
+                out.push(format!("[checkpoint turn {turn}: {} file(s)]", files.len()));
+            }
+            Self::Rewind { to_turn, restore_files, .. } => {
+                out.push(format!("[rewind to turn {to_turn}: files={restore_files}]"));
+            }
+            Self::Handoff { handoff_kind, from_address, from_provider, from_turns, .. } => {
+                let mut msg = format!("[{handoff_kind} from {from_address}");
+                if let Some(p) = from_provider.as_deref().filter(|s| !s.is_empty()) {
+                    msg.push_str(&format!(" ({p})"));
+                }
+                if let Some(t) = from_turns.as_deref().filter(|s| !s.is_empty()) {
+                    msg.push_str(&format!(" turns {t}"));
+                }
+                msg.push(']');
+                out.push(msg);
             }
         }
     }
@@ -339,6 +409,229 @@ impl Transcript {
     pub fn entries(&self) -> &[Entry] {
         &self.entries
     }
+
+    /// Rewinds transcript state to `to_turn`, returning the retracted `(to_turn + 1)` user prompt if present.
+    pub fn rewind_to_turn(&mut self, path: &Path, to_turn: u64, restore_files: bool, ts_ms: u64) -> Option<String> {
+        let restored_prompt = self.entries.iter().find_map(|entry| match entry {
+            Entry::User { turn, text, .. } if *turn == to_turn + 1 => {
+                let clean = strip_h2_envelope(text);
+                (!clean.is_empty()).then_some(clean)
+            }
+            _ => None,
+        });
+
+        let cutoff = self.entries.iter().position(|e| e.turn().is_some_and(|t| t > to_turn));
+        if let Some(idx) = cutoff {
+            self.entries.truncate(idx);
+        }
+        self.entries.retain(|e| e.turn().is_none_or(|t| t <= to_turn));
+        // Deduplicate consecutive rewind markers so repeated rollbacks never stack dividers.
+        while matches!(self.entries.last(), Some(Entry::Rewind { .. })) {
+            self.entries.pop();
+        }
+        self.entries.push(Entry::Rewind { to_turn, restore_files, ts_ms });
+        self.bytes = self.entries.iter().map(Entry::approx_bytes).sum();
+
+        let mut buf = String::new();
+        for entry in &self.entries {
+            if let Ok(line) = serde_json::to_string(entry) {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = crate::paths::write_atomic(path, buf.as_bytes());
+        restored_prompt
+    }
+}
+
+fn strip_prefixed_tag_envelope(raw: &str, tag: &str) -> String {
+    let trimmed = raw.trim_start();
+    let open_prefix = format!("<{tag}");
+    if !trimmed.starts_with(&open_prefix) {
+        return raw.to_string();
+    }
+    let after_name = &trimmed[open_prefix.len()..];
+    if !after_name.starts_with('>') && !after_name.starts_with(char::is_whitespace) {
+        return raw.to_string();
+    }
+    let close = format!("</{tag}>");
+    if let Some(open_end) = trimmed.find('>')
+        && let Some(end) = trimmed[open_end + 1..].find(&close)
+    {
+        return trimmed[open_end + 1 + end + close.len()..].trim().to_string();
+    }
+    raw.to_string()
+}
+
+/// Removes `<herdr2-context-handoff>`, `<herdr2-handoff>`, and `<h2 ...>` inter-agent envelopes from user text.
+pub fn strip_h2_envelope(raw: &str) -> String {
+    let mut s = raw.trim().to_string();
+    loop {
+        let before = s.clone();
+        s = strip_prefixed_tag_envelope(&s, "herdr2-context-handoff");
+        s = strip_prefixed_tag_envelope(&s, "herdr2-handoff");
+        let trimmed = s.trim();
+        if trimmed.starts_with("<h2")
+            && trimmed.ends_with("</h2>")
+            && let Some(open_end) = trimmed.find('>')
+        {
+            s = trimmed[open_end + 1..trimmed.len() - "</h2>".len()].trim().to_string();
+        }
+        if s == before {
+            break;
+        }
+    }
+    s
+}
+
+/// Slices transcript entries to turns within `[from_turn..=to_turn]` (when either bound is given).
+pub fn slice_turn_range(entries: &[Entry], from_turn: Option<u64>, to_turn: Option<u64>) -> Vec<Entry> {
+    if from_turn.is_none() && to_turn.is_none() {
+        return entries.to_vec();
+    }
+    let lo = from_turn.unwrap_or(0);
+    let hi = to_turn.unwrap_or(u64::MAX);
+    entries
+        .iter()
+        .filter(|e| e.turn().is_some_and(|t| t >= lo && t <= hi))
+        .cloned()
+        .collect()
+}
+
+/// Renders structured entries into human-readable transcript text.
+pub fn render_entries(entries: &[Entry]) -> String {
+    let mut lines = Vec::new();
+    for entry in entries {
+        entry.render_line(&mut lines);
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        let mut s = lines.join("\n");
+        s.push('\n');
+        s
+    }
+}
+
+/// Builds a bounded portable handoff block from turns `1..=up_to_turn` for session rehydration.
+pub fn build_portable_handoff(entries: &[Entry], up_to_turn: u64, max_bytes: usize) -> Option<String> {
+    if up_to_turn == 0 || max_bytes < 128 {
+        return None;
+    }
+
+    let mut per_turn: std::collections::BTreeMap<u64, Vec<String>> = std::collections::BTreeMap::new();
+    for entry in entries {
+        let Some(turn) = entry.turn() else { continue };
+        if turn == 0 || turn > up_to_turn {
+            continue;
+        }
+        let bucket = per_turn.entry(turn).or_default();
+        match entry {
+            Entry::User { text, .. } => {
+                let clean = strip_h2_envelope(text);
+                if !clean.is_empty() {
+                    bucket.push(format!("User: {clean}"));
+                }
+            }
+            Entry::ToolCall { title, status, detail, .. } => {
+                let mut line = format!("- Tool `{title}` [{status}]");
+                if let Some(d) = detail.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                    let snippet = cap_chars(d, 180);
+                    line.push_str(&format!(": {snippet}"));
+                }
+                bucket.push(line);
+            }
+            Entry::Assistant { text, .. } => {
+                let clean = text.trim();
+                if !clean.is_empty() {
+                    bucket.push(format!("Assistant: {clean}"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    per_turn.retain(|_, lines| !lines.is_empty());
+    if per_turn.is_empty() {
+        return None;
+    }
+
+    let header = format!(
+        "<herdr2-context-handoff restored_turn=\"{up_to_turn}\">\nConversation history restored after checkpoint rollback to turn {up_to_turn}. Continue naturally without mentioning the rollback wrapper.\n\n"
+    );
+    let footer = "\n</herdr2-context-handoff>";
+    let body_budget = max_bytes.saturating_sub(header.len() + footer.len());
+    if body_budget == 0 {
+        return None;
+    }
+
+    let mut turn_blocks: Vec<(u64, String)> = per_turn
+        .into_iter()
+        .map(|(t, lines)| (t, format!("[Turn {t}]\n{}", lines.join("\n"))))
+        .collect();
+
+    // Always prioritize preserving Turn 1 goal + newest turns backward to `up_to_turn`.
+    let mut selected_indices = Vec::new();
+    let mut used = 0usize;
+    if !turn_blocks.is_empty() {
+        let first_block = cap_chars(&turn_blocks[0].1, body_budget);
+        if first_block.len() <= body_budget {
+            used += first_block.len();
+            turn_blocks[0].1 = first_block;
+            selected_indices.push(0);
+        }
+    }
+    let mut recent = Vec::new();
+    for idx in (1..turn_blocks.len()).rev() {
+        let sep = usize::from(!selected_indices.is_empty() || !recent.is_empty()) * 2;
+        let blk = &turn_blocks[idx].1;
+        if used + sep + blk.len() <= body_budget {
+            used += sep + blk.len();
+            recent.push(idx);
+        } else if recent.is_empty() && body_budget > used + sep + 32 {
+            let trimmed = cap_chars(blk, body_budget - used - sep);
+            turn_blocks[idx].1 = trimmed;
+            recent.push(idx);
+            break;
+        } else {
+            break;
+        }
+    }
+    recent.reverse();
+    selected_indices.extend(recent);
+
+    let mut body = String::new();
+    let mut prev_idx: Option<usize> = None;
+    for idx in selected_indices {
+        if let Some(p) = prev_idx {
+            if idx > p + 1 {
+                body.push_str("\n\n[... earlier turns omitted ...]\n\n");
+            } else {
+                body.push_str("\n\n");
+            }
+        }
+        body.push_str(&turn_blocks[idx].1);
+        prev_idx = Some(idx);
+    }
+    if body.len() > body_budget {
+        body = cap_chars(&body, body_budget);
+    }
+    Some(format!("{header}{body}{footer}"))
+}
+
+fn cap_chars(s: &str, max_bytes: usize) -> String {
+    if s.len() <= max_bytes {
+        return s.to_string();
+    }
+    let suffix = "... [truncated]";
+    let mut end = max_bytes.saturating_sub(suffix.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{suffix}", &s[..end])
 }
 
 pub fn path(state: &Path, address: &str) -> PathBuf {
@@ -444,5 +737,87 @@ mod tests {
             panic!("expected coalesced thought entry");
         };
         assert_eq!(text, "**First heading**\n\n**Second heading**");
+    }
+
+    #[test]
+    fn rewind_trims_turns_extracts_clean_prompt_and_builds_bounded_handoff() {
+        let dir = crate::test_tmp().join(format!("h2-rewind-{}", crate::platform::random_hex()));
+        let path = dir.join("a1.jsonl");
+        let mut t = Transcript::default();
+        t.push(Entry::User { turn: 1, from: None, text: "create lib.rs".into(), ts_ms: 1 });
+        t.push(Entry::ToolCall {
+            turn: 1,
+            id: "tc1".into(),
+            title: "Write lib.rs".into(),
+            tool_kind: Some("edit".into()),
+            status: "completed".into(),
+            detail: Some("pub fn add(a: i32, b: i32) -> i32 { a + b }".into()),
+            ts_ms: 2,
+        });
+        t.push(Entry::Assistant { turn: 1, text: "Created lib.rs".into(), ts_ms: 3 });
+        t.push(Entry::Checkpoint {
+            turn: 1,
+            ref_name: "refs/herdr2/checkpoints/default/a1/1".into(),
+            commit_oid: "abc".into(),
+            head_oid: None,
+            files: vec![],
+            ts_ms: 4,
+        });
+        t.push(Entry::User {
+            turn: 2,
+            from: Some("a0".into()),
+            text: "<h2 from=\"a0\">\nrefactor incorrectly\n</h2>".into(),
+            ts_ms: 5,
+        });
+        t.push(Entry::Assistant { turn: 2, text: "Broken code".into(), ts_ms: 6 });
+
+        assert!(build_portable_handoff(t.entries(), 0, 24 * 1024).is_none());
+        let handoff = build_portable_handoff(t.entries(), 1, 24 * 1024).unwrap();
+        assert!(handoff.contains("create lib.rs"));
+        assert!(handoff.contains("Created lib.rs"));
+        assert!(!handoff.contains("Broken code"));
+
+        let restored = t.rewind_to_turn(&path, 1, true, 100);
+        assert_eq!(restored.as_deref(), Some("refactor incorrectly"));
+        assert!(t.entries.iter().any(|e| matches!(e, Entry::Rewind { to_turn: 1, restore_files: true, .. })));
+        assert!(!t.entries.iter().any(|e| e.turn() == Some(2)));
+        assert_eq!(strip_h2_envelope("<herdr2-context-handoff restored_turn=\"1\">\nx\n</herdr2-context-handoff>\n\nhello"), "hello");
+        assert_eq!(
+            strip_h2_envelope("<herdr2-handoff kind=\"handoff\" from=\"a1\">\nmeta\n</herdr2-handoff>\n\ncontinue"),
+            "continue"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn entry_handoff_and_slice_turn_range() {
+        let e0 = Entry::Handoff {
+            turn: 0,
+            handoff_kind: "handoff".into(),
+            from_address: "a1".into(),
+            from_provider: Some("claude".into()),
+            from_session_id: Some("sess-1".into()),
+            from_turns: Some("1-3".into()),
+            artifact_path: None,
+            ts_ms: 10,
+        };
+        let e1 = Entry::User { turn: 1, from: None, text: "turn one".into(), ts_ms: 11 };
+        let e2 = Entry::Assistant { turn: 2, text: "turn two".into(), ts_ms: 12 };
+        let e3 = Entry::User { turn: 3, from: None, text: "turn three".into(), ts_ms: 13 };
+        let all = vec![e0, e1, e2, e3];
+
+        let mut lines = Vec::new();
+        all[0].render_line(&mut lines);
+        assert_eq!(lines, vec!["[handoff from a1 (claude) turns 1-3]"]);
+
+        let mid = slice_turn_range(&all, Some(2), Some(2));
+        assert_eq!(mid.len(), 1);
+        assert_eq!(mid[0].turn(), Some(2));
+
+        let head = slice_turn_range(&all, None, Some(1));
+        assert_eq!(head.len(), 2);
+        assert_eq!(head[0].turn(), Some(0));
+        assert_eq!(head[1].turn(), Some(1));
     }
 }

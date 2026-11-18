@@ -78,6 +78,7 @@ pub struct Core {
     pub drove: Arc<crate::drove::DroveRuntime>,
     registry_writer: RegistryWriter,
     pty_registry_writer: RegistryWriter,
+    self_ref: std::sync::OnceLock<std::sync::Weak<Core>>,
 }
 
 #[derive(Default)]
@@ -133,6 +134,9 @@ pub struct State {
     pub machine_outbox: HashMap<String, Vec<serde_json::Value>>,
     pub mirrors: HashMap<String, std::collections::BTreeMap<String, serde_json::Value>>,
     pub pty_prompts: HashMap<u32, Vec<(u64, u64, String)>>,
+    pub pty_respawning: std::collections::HashSet<u32>,
+    pub ckpt_locks: HashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>>,
+    pub checkpoints: HashMap<String, crate::checkpoint::TargetCheckpoints>,
 }
 
 const SAVE_SOON: Duration = Duration::from_secs(2);
@@ -168,6 +172,8 @@ impl Core {
             Default::default()
         });
         crate::platform::private_dir(&paths.state.join("transcripts"))?;
+        crate::platform::private_dir(&paths.state.join("checkpoints"))?;
+        crate::platform::private_dir(&paths.state.join("hooks"))?;
         std::fs::create_dir_all(paths.state.join("screens"))?;
         let machines = read_state(&paths.state.join("machines.json"))?;
         let peers = read_state(&paths.state.join("peers.json"))?;
@@ -193,7 +199,9 @@ impl Core {
             save_due: Notify::new(),
             image_due: Notify::new(),
             drove,
+            self_ref: std::sync::OnceLock::new(),
         });
+        let _ = core.self_ref.set(Arc::downgrade(&core));
         core.drove.attach_core(&core);
         crate::exec::sweep_leftovers(&core.paths.state);
         core.reconcile_startup();
@@ -219,6 +227,7 @@ impl Core {
                     a.pid = None;
                     a.pending_permission = None;
                     a.inbox_len = 0;
+                    a.inbox.clear();
                     if a.reason.is_none() {
                         a.reason = Some("stopped_by_restart".into());
                     }
@@ -320,6 +329,43 @@ impl Core {
         }
     }
 
+    /// Synchronizes `Agent::{inbox_len, inbox}` with `st.inboxes[&id]` and emits a live `"status"` event if changed.
+    pub fn sync_inbox(&self, st: &mut State, id: u32, emit: bool) {
+        let items: Vec<crate::agents::QueuedInput> = st
+            .inboxes
+            .get(&id)
+            .into_iter()
+            .flatten()
+            .map(|p| crate::agents::QueuedInput {
+                id: p.id,
+                text: p.text.clone(),
+                from: p.from.clone(),
+                queued_ms: p.queued_ms,
+            })
+            .collect();
+        let payload = {
+            let Some(a) = st.reg.agents.get_mut(&id) else {
+                return;
+            };
+            let changed = a.inbox != items || a.inbox_len != items.len();
+            a.inbox_len = items.len();
+            a.inbox = items;
+            (emit && changed && a.is_live()).then(|| {
+                serde_json::json!({
+                    "status": a.status,
+                    "records": a.records,
+                    "reported": a.reported,
+                    "pending_permission": a.pending_permission,
+                    "inbox_len": a.inbox_len,
+                    "inbox": a.inbox,
+                })
+            })
+        };
+        if let Some(payload) = payload {
+            self.emit(st, "status", id, payload);
+        }
+    }
+
     pub fn apply_status(&self, st: &mut State, id: u32, report: &StatusReport) {
         let word = |st: &State| st.reg.agents.get(&id).and_then(|a| a.status.as_ref().map(|s| s.state.clone()));
         let was = word(st);
@@ -346,13 +392,14 @@ impl Core {
         if first_task_finished {
             a.first_task_turn = None;
         }
-        let (status, records, turn, reported, pending_permission, inbox_len) = (
+        let (status, records, turn, reported, pending_permission, inbox_len, inbox) = (
             a.status.clone(),
             a.records.clone(),
             a.turn,
             a.reported,
             a.pending_permission.clone(),
             a.inbox_len,
+            a.inbox.clone(),
         );
         if change.status {
             self.emit(
@@ -365,6 +412,7 @@ impl Core {
                     "reported": reported,
                     "pending_permission": pending_permission,
                     "inbox_len": inbox_len,
+                    "inbox": inbox,
                 }),
             );
         }
@@ -504,6 +552,7 @@ impl Core {
             a.first_task_turn = None;
             a.pending_permission = None;
             a.inbox_len = 0;
+            a.inbox.clear();
             let change = crate::status::reset(a);
             self.status_changed(st, id, change);
         }
@@ -558,7 +607,85 @@ impl Core {
         self.emit_from(st, "removed", id, serde_json::json!({}), Some(&was));
         let _ = std::fs::remove_file(transcript_path(&self.paths.state, &was.address));
         let _ = std::fs::remove_dir_all(crate::put::dir(&self.paths.state, id));
+        self.cleanup_target_checkpoints(st, &was.address, &was.cwd);
         self.save(st);
+    }
+
+    pub fn arc(&self) -> Option<Arc<Self>> {
+        self.self_ref.get().and_then(std::sync::Weak::upgrade)
+    }
+
+    pub fn session_slug(&self) -> String {
+        let raw = self.paths.state.file_name().and_then(|s| s.to_str()).unwrap_or("default");
+        crate::checkpoint::slug_segment(raw)
+    }
+
+    pub fn checkpoints_dir(&self) -> std::path::PathBuf {
+        self.paths.state.join("checkpoints")
+    }
+
+    pub fn checkpoint_path(&self, addr: &str) -> std::path::PathBuf {
+        self.checkpoints_dir().join(format!("{addr}.json"))
+    }
+
+    pub fn hooks_dir(&self) -> std::path::PathBuf {
+        self.paths.state.join("hooks")
+    }
+
+    pub fn repo_ckpt_lock(&self, repo_root: &std::path::Path) -> Arc<tokio::sync::Mutex<()>> {
+        let key = crate::checkpoint::canonicalize_path(repo_root);
+        let mut st = self.lock();
+        Arc::clone(st.ckpt_locks.entry(key).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))))
+    }
+
+    pub fn target_checkpoints(&self, st: &mut State, addr: &str) -> crate::checkpoint::TargetCheckpoints {
+        if let Some(tc) = st.checkpoints.get(addr) {
+            return tc.clone();
+        }
+        let path = self.checkpoint_path(addr);
+        let mut tc: crate::checkpoint::TargetCheckpoints = crate::paths::read_state(&path).unwrap_or_default();
+        if tc.addr.is_empty() {
+            tc.addr = addr.to_string();
+        }
+        st.checkpoints.insert(addr.to_string(), tc.clone());
+        tc
+    }
+
+    pub fn save_target_checkpoints(&self, st: &mut State, mut tc: crate::checkpoint::TargetCheckpoints) {
+        if tc.addr.is_empty() {
+            return;
+        }
+        let addr = tc.addr.clone();
+        let _ = crate::platform::private_dir(&self.checkpoints_dir());
+        let path = self.checkpoint_path(&addr);
+        if let Ok(bytes) = serde_json::to_vec_pretty(&tc) {
+            let _ = crate::paths::write_atomic(&path, &bytes);
+        }
+        st.checkpoints.insert(addr, std::mem::take(&mut tc));
+    }
+
+    pub fn cleanup_target_checkpoints(&self, st: &mut State, addr: &str, fallback_cwd: &str) {
+        let loaded = st.checkpoints.remove(addr).or_else(|| crate::paths::read_state(&self.checkpoint_path(addr)).ok());
+        let _ = std::fs::remove_file(self.checkpoint_path(addr));
+        let repo_dir = loaded
+            .and_then(|tc| tc.repo_root)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| fallback_cwd.to_string());
+        if repo_dir.is_empty() {
+            return;
+        }
+        let slug = self.session_slug();
+        let addr_owned = addr.to_string();
+        let run = move || {
+            if let Some(repo) = crate::checkpoint::probe_repo(std::path::Path::new(&repo_dir)) {
+                let _ = crate::checkpoint::delete_all_checkpoint_refs(&repo, &slug, &addr_owned);
+            }
+        };
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn_blocking(run);
+        } else {
+            run();
+        }
     }
 
     pub fn signal(&self, st: &State, id: u32, sig: i32) {

@@ -1094,7 +1094,10 @@ fn entry_ts_ms(entry: &crate::transcript::Entry) -> u64 {
         | crate::transcript::Entry::Plan { ts_ms, .. }
         | crate::transcript::Entry::Permission { ts_ms, .. }
         | crate::transcript::Entry::Error { ts_ms, .. }
-        | crate::transcript::Entry::Stderr { ts_ms, .. } => *ts_ms,
+        | crate::transcript::Entry::Stderr { ts_ms, .. }
+        | crate::transcript::Entry::Checkpoint { ts_ms, .. }
+        | crate::transcript::Entry::Rewind { ts_ms, .. }
+        | crate::transcript::Entry::Handoff { ts_ms, .. } => *ts_ms,
     }
 }
 
@@ -1163,6 +1166,41 @@ fn entry_to_host_item(index: usize, entry: &crate::transcript::Entry) -> Value {
             "title": "stderr",
             "detail": text,
             "text": format!("stderr: {text}"),
+            "ts": opt_iso(*ts_ms),
+        }),
+        crate::transcript::Entry::Checkpoint { turn, files, ts_ms, .. } => json!({
+            "index": index,
+            "kind": "thought",
+            "text": format!("[checkpoint turn {turn}: {} file(s)]", files.len()),
+            "files": files,
+            "turn": turn,
+            "ts": opt_iso(*ts_ms),
+        }),
+        crate::transcript::Entry::Rewind { to_turn, restore_files, ts_ms } => json!({
+            "index": index,
+            "kind": "thought",
+            "text": format!("[rewind to turn {to_turn}: files={restore_files}]"),
+            "to_turn": to_turn,
+            "restore_files": restore_files,
+            "ts": opt_iso(*ts_ms),
+        }),
+        crate::transcript::Entry::Handoff {
+            handoff_kind,
+            from_address,
+            from_provider,
+            from_turns,
+            artifact_path,
+            ts_ms,
+            ..
+        } => json!({
+            "index": index,
+            "kind": "thought",
+            "text": format!("[{handoff_kind} from {from_address}]"),
+            "handoff_kind": handoff_kind,
+            "from_address": from_address,
+            "from_provider": from_provider,
+            "from_turns": from_turns,
+            "artifact_path": artifact_path,
             "ts": opt_iso(*ts_ms),
         }),
     }

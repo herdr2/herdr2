@@ -132,7 +132,7 @@ struct Identity {
 /// machine's agents, transcripts, files, execs and the cores that dialed it.
 /// Kept: the machines it reaches and the clients' docs (settings, not life).
 const CLONE_FORGETS: &[&str] =
-    &["agents.json", "terminals.json", "peers.json", "transcripts", "screens", "files", "execs"];
+    &["agents.json", "terminals.json", "peers.json", "transcripts", "screens", "files", "execs", "checkpoints", "hooks"];
 
 /// Permanent core identity: created on first start, kept until state is
 /// wiped, or until the disk turns up under another machine id (a snapshot,

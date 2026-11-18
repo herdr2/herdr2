@@ -190,6 +190,15 @@ fn dispatch_tool(params: &Value, call: &impl Fn(&str, Value) -> Result<Value, Rp
             }
             ("agent.read", Value::Object(obj))
         }
+        "h2_handoff" => {
+            let mut obj = args.as_object().cloned().unwrap_or_default();
+            if let Some(caller) = &me
+                && !obj.contains_key("caller")
+            {
+                obj.insert("caller".into(), json!(caller));
+            }
+            ("agent.handoff", Value::Object(obj))
+        }
         "h2_ls" => {
             let mut obj = args.as_object().cloned().unwrap_or_default();
             if !obj.contains_key("labels")
@@ -308,7 +317,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "h2_read",
-            "description": "Read an agent's transcript (latest turn, --last assistant text, or trailing history lines).",
+            "description": "Read an agent's transcript (latest turn, --last assistant text, trailing history lines, or --from-turn/--to-turn slice).",
             "inputSchema": {
                 "type": "object",
                 "required": ["agent"],
@@ -316,6 +325,33 @@ fn tool_definitions() -> Value {
                     "agent": { "type": "string" },
                     "last": { "type": "boolean" },
                     "lines": { "type": "integer", "minimum": 1 },
+                    "from_turn": { "type": "integer", "minimum": 1 },
+                    "to_turn": { "type": "integer", "minimum": 1 },
+                    "wait": { "type": "boolean" },
+                    "timeout": { "type": "number" }
+                }
+            }
+        },
+        {
+            "name": "h2_handoff",
+            "description": "Hand off, fork, open a side chat, or merge back session context across ACP and PTY agents.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["source"],
+                "properties": {
+                    "source": { "type": "string" },
+                    "kind": { "type": "string", "enum": ["handoff", "fork", "side-chat"] },
+                    "preset": { "type": "string" },
+                    "pty": { "type": "boolean" },
+                    "into": { "type": "string" },
+                    "from_turn": { "type": "integer", "minimum": 1 },
+                    "to_turn": { "type": "integer", "minimum": 1 },
+                    "prompt": { "type": "string" },
+                    "note": { "type": "string" },
+                    "cwd": { "type": "string" },
+                    "name": { "type": "string" },
+                    "model": { "type": "string" },
+                    "keep": { "type": "boolean" },
                     "wait": { "type": "boolean" },
                     "timeout": { "type": "number" }
                 }
@@ -384,7 +420,9 @@ mod tests {
         assert!(text.starts_with("Content-Length: "));
         let (_, json_part) = text.split_once("\r\n\r\n").unwrap();
         let list: Value = serde_json::from_str(json_part).unwrap();
-        assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 7);
+        let tools = list["result"]["tools"].as_array().unwrap();
+        assert_eq!(tools.len(), 8);
+        assert!(tools.iter().any(|t| t["name"] == "h2_handoff"));
     }
 
     #[test]
