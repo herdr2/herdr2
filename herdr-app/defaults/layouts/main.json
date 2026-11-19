@@ -167,6 +167,16 @@
                       "content": {
                         "mod": "checkpoints"
                       }
+                    },
+                    {
+                      "id": "side-chat",
+                      "type": "block",
+                      "content": {
+                        "mod": "peek",
+                        "props": {
+                          "sidePanel": true
+                        }
+                      }
                     }
                   ]
                 }

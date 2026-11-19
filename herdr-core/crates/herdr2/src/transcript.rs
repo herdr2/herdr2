@@ -103,6 +103,8 @@ pub enum Entry {
         from_turns: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         artifact_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_markdown: Option<String>,
         ts_ms: u64,
     },
 }
@@ -149,6 +151,7 @@ impl Entry {
                 from_session_id,
                 from_turns,
                 artifact_path,
+                context_markdown,
                 ..
             } => {
                 handoff_kind.len()
@@ -157,6 +160,7 @@ impl Entry {
                     + from_session_id.as_ref().map_or(0, String::len)
                     + from_turns.as_ref().map_or(0, String::len)
                     + artifact_path.as_ref().map_or(0, String::len)
+                    + context_markdown.as_ref().map_or(0, String::len)
             }
         }
     }
@@ -800,6 +804,7 @@ mod tests {
             from_session_id: Some("sess-1".into()),
             from_turns: Some("1-3".into()),
             artifact_path: None,
+            context_markdown: None,
             ts_ms: 10,
         };
         let e1 = Entry::User { turn: 1, from: None, text: "turn one".into(), ts_ms: 11 };

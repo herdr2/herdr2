@@ -858,6 +858,7 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
         from_session_id: entry.from_session_id || null,
         from_turns: entry.from_turns || null,
         artifact_path: entry.artifact_path || null,
+        context_markdown: entry.context_markdown || null,
         ts_ms: entry.ts_ms ?? 0,
       });
       return;

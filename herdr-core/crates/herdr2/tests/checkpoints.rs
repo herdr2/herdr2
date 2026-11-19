@@ -199,16 +199,40 @@ fn pty_claude_cli_rollback_reenters_claude_even_after_holder_drains() {
     let addr = created["address"].as_str().unwrap().to_string();
     let pid_before = created["pid"].as_u64().unwrap();
 
-    // Capture T0 baseline, mutate workspace, capture T1.
+    // Wait for fake claude to launch and foreground tracking to observe it before capturing checkpoints.
+    wait_until("initial claude foreground observed", || {
+        std::fs::read_to_string(&log_file).is_ok_and(|c| !c.is_empty()) && get(&s, &addr)["foreground"].is_object()
+    });
+
+    // Capture T0 baseline, mutate workspace, capture T1, then send a prompt (populating optimistic
+    // `pty_prompts` just like `h2 send` or `agent.handoff --into`).
     s.json(&["checkpoint", "snap", &addr, "--label", "turn0"]);
     std::fs::write(repo.join("mutated.txt"), "after\n").unwrap();
     s.json(&["checkpoint", "snap", &addr, "--label", "turn1"]);
+    let stale_handoff = "[Handoff from t30] Context handoff saved at: /tmp/handoff-from-t30.md";
+    s.json(&["send", &addr, stale_handoff]);
+    let before_rb_read = s.json(&["read", &addr]);
+    assert!(
+        before_rb_read["entries"]
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|e| e["text"].as_str().is_some_and(|t| t.contains("Handoff from t30")))),
+        "sent prompt should appear in optimistic transcript before rollback: {before_rb_read}"
+    );
 
-    // Roll back to turn 0: must respawn fake claude cleanly in the same terminal pane (not drop to shell).
+    // Roll back to turn 0: must respawn fake claude cleanly in the same terminal pane (not drop to shell)
+    // and clear `pty_prompts` so rolled-back prompts never resurface in the conversation view.
     let rb = s.json(&["checkpoint", "rollback", &addr, "--to", "0", "--confirm"]);
     assert_eq!(rb["turn"], 0, "{rb}");
     assert_eq!(rb["restored_files"], true, "{rb}");
     assert!(!repo.join("mutated.txt").exists(), "workspace file must be restored");
+
+    let after_rb_read = s.json(&["read", &addr]);
+    assert!(
+        !after_rb_read["entries"]
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|e| e["text"].as_str().is_some_and(|t| t.contains("Handoff from t30")))),
+        "rolled-back prompt must not linger in conversation view after rollback: {after_rb_read}"
+    );
 
     wait_until("respawned claude launches", || {
         std::fs::read_to_string(&log_file)

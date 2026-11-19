@@ -23,6 +23,7 @@ struct SourceSnapshot {
     cols: u16,
     rows: u16,
     entries: Vec<Entry>,
+    lineage: Option<Lineage>,
 }
 
 pub(super) async fn agent_handoff(core: Ctx<'_>, p: HandoffParams) -> Result<HandoffResult, RpcError> {
@@ -35,13 +36,28 @@ pub(super) async fn agent_handoff(core: Ctx<'_>, p: HandoffParams) -> Result<Han
     }
 
     let src = collect_source(core, &p.source).await?;
-    let cwd = p
+    let origin_cwd = p
         .cwd
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or(&src.cwd)
         .to_string();
+
+    let mut cwd = origin_cwd.clone();
+    let mut created_worktree: Option<(String, String, String)> = None;
+    if p.into.is_none() && p.kind == LineageKind::Fork && p.worktree {
+        let state_dir = core.paths.state.clone();
+        let origin_bg = origin_cwd.clone();
+        let tag = crate::drove::crypto::rand_id("fk");
+        let (wt_path, wt_branch) = blocking(move || {
+            crate::drove::integrate::create_fork_worktree(&state_dir, &origin_bg, &tag)
+                .map_err(RpcError::invalid_params)
+        })
+        .await?;
+        cwd = wt_path.clone();
+        created_worktree = Some((origin_cwd.clone(), wt_path, wt_branch));
+    }
 
     let cwd_for_pkg = cwd.clone();
     let entries_for_pkg = src.entries.clone();
@@ -80,23 +96,36 @@ pub(super) async fn agent_handoff(core: Ctx<'_>, p: HandoffParams) -> Result<Han
         from_turn: p.from_turn.or_else(|| pkg.included_turns.first().copied()),
         to_turn: p.to_turn.or_else(|| pkg.included_turns.last().copied()),
         artifact_path: None,
+        worktree_path: created_worktree.as_ref().map(|(_, wt, _)| wt.clone()),
+        worktree_origin: created_worktree.as_ref().map(|(orig, _, _)| orig.clone()),
+        worktree_branch: created_worktree.as_ref().map(|(_, _, br)| br.clone()),
+        worktree_merged: false,
     };
 
     if let Some(into_raw) = p.into.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         return handoff_into_existing(core, &p, &src, &pkg, &lineage, turns_label, into_raw).await;
     }
 
-    if p.pty {
-        return handoff_to_new_pty(core, &p, &src, &cwd, &pkg, &mut lineage, turns_label).await;
+    let res = if p.pty {
+        handoff_to_new_pty(core, &p, &src, &cwd, &pkg, &mut lineage, turns_label).await
+    } else {
+        handoff_to_new_acp(core, &p, &src, &cwd, &pkg, &lineage, turns_label).await
+    };
+    if res.is_err()
+        && let Some((orig, wt, br)) = created_worktree
+    {
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::drove::integrate::cleanup_fork_worktree(&orig, std::path::Path::new(&wt), Some(&br));
+        })
+        .await;
     }
-
-    handoff_to_new_acp(core, &p, &src, &cwd, &pkg, &lineage, turns_label).await
+    res
 }
 
 async fn collect_source(core: &Arc<Core>, source: &str) -> Result<SourceSnapshot, RpcError> {
     match resolve_any(core, source)? {
         TargetKey::Agent(id) => {
-            let (address, cwd, provider, session_id, model, argv) = {
+            let (address, cwd, provider, session_id, model, argv, lineage) = {
                 let st = core.lock();
                 let a = st.reg.agents.get(&id).ok_or_else(|| {
                     RpcError::new("not_found", format!("{} not found", crate::agents::address(id)), "")
@@ -108,6 +137,7 @@ async fn collect_source(core: &Arc<Core>, source: &str) -> Result<SourceSnapshot
                     a.acp_session_id.clone(),
                     a.model.clone(),
                     a.argv.clone(),
+                    a.lineage.clone(),
                 )
             };
             let entries = core.read_transcript_entries(id)?;
@@ -122,10 +152,11 @@ async fn collect_source(core: &Arc<Core>, source: &str) -> Result<SourceSnapshot
                 cols: 120,
                 rows: 36,
                 entries,
+                lineage,
             })
         }
         TargetKey::Terminal(id) => {
-            let (address, cwd, cols, rows, argv, snap, fallback_kind, fallback_sid) = {
+            let (address, cwd, cols, rows, argv, snap, fallback_kind, fallback_sid, lineage) = {
                 let mut st = core.lock();
                 let Some(t) = st.pty_reg.terminals.get(&id).cloned() else {
                     return Err(RpcError::new(
@@ -134,17 +165,27 @@ async fn collect_source(core: &Arc<Core>, source: &str) -> Result<SourceSnapshot
                         "",
                     ));
                 };
-                let snap = snapshot_from_terminal(&t, st.pty_prompts.get(&id));
+                let mut snap = snapshot_from_terminal(&t, st.pty_prompts.get(&id));
+                crate::pty_transcript::populate_session_affinity(&mut snap, &t.address, core, &mut st);
                 let tc = core.target_checkpoints(&mut st, &t.address);
+                let live_cwd = t
+                    .foreground
+                    .as_ref()
+                    .map(|f| f.cwd.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| t.last_cwd.as_deref().filter(|s| !s.is_empty()))
+                    .unwrap_or(&t.cwd)
+                    .to_string();
                 (
                     t.address,
-                    t.cwd,
+                    live_cwd,
                     t.cols,
                     t.rows,
                     t.argv,
                     snap,
                     tc.cli_kind,
                     tc.cli_session_id,
+                    t.lineage,
                 )
             };
             let (entries, session_meta) = blocking(move || Ok(extract_transcript(&snap))).await?;
@@ -168,6 +209,7 @@ async fn collect_source(core: &Arc<Core>, source: &str) -> Result<SourceSnapshot
                 cols,
                 rows,
                 entries,
+                lineage,
             })
         }
     }
@@ -182,6 +224,92 @@ async fn handoff_into_existing(
     turns_label: Option<String>,
     into_raw: &str,
 ) -> Result<HandoffResult, RpcError> {
+    let mut merge_instruction = String::new();
+    let mut merged_wt_path: Option<String> = None;
+    let mut merged_wt_branch: Option<String> = None;
+    let mut worktree_merge_requested = false;
+    if p.merge_worktree
+        && let Some(ref src_lin) = src.lineage
+        && let (Some(wt_path), Some(origin_cwd)) = (
+            src_lin.worktree_path.as_deref().filter(|s| !s.trim().is_empty()),
+            src_lin.worktree_origin.as_deref().filter(|s| !s.trim().is_empty()),
+        )
+    {
+        let origin_bg = origin_cwd.to_string();
+        let wt_bg = wt_path.to_string();
+        let branch_bg = src_lin.worktree_branch.clone();
+        let summary = blocking(move || {
+            Ok(crate::drove::integrate::inspect_fork_worktree(
+                &origin_bg,
+                &wt_bg,
+                branch_bg.as_deref(),
+            ))
+        })
+        .await?;
+
+        let branch_display = if summary.branch.is_empty() {
+            src_lin.worktree_branch.clone().unwrap_or_else(|| "(unknown)".into())
+        } else {
+            summary.branch.clone()
+        };
+
+        let mut msg = format!(
+            "[Merge Worktree from {}] Please merge the code changes from this forked worktree into the current main branch/workspace (`{}`):\n- Fork branch: `{}`\n- Fork worktree path: `{}`",
+            src.address, origin_cwd, branch_display, wt_path
+        );
+        if !summary.ahead_commits.is_empty() {
+            msg.push_str("\n- Commits on fork branch:\n");
+            for c in &summary.ahead_commits {
+                msg.push_str(&format!("  - {c}\n"));
+            }
+        }
+        if !summary.dirty_files.is_empty() {
+            msg.push_str("\n- Uncommitted changes inside the fork worktree:\n");
+            for f in &summary.dirty_files {
+                msg.push_str(&format!("  - {f}\n"));
+            }
+            msg.push_str("  (Note: include these uncommitted changes from the fork worktree when merging, e.g. by committing or applying them from that worktree.)");
+        }
+        msg.push_str(&format!(
+            "\n- IMPORTANT: ONLY merge the code changes into the main branch/workspace. Do NOT delete or remove the worktree directory (`{wt_path}`) and do NOT delete the `{branch_display}` branch."
+        ));
+
+        merge_instruction = msg;
+        merged_wt_path = Some(wt_path.to_string());
+        merged_wt_branch = (!branch_display.is_empty() && branch_display != "(unknown)").then_some(branch_display);
+        worktree_merge_requested = true;
+
+        // Mark worktree_merged = true on the source record while keeping worktree_path and branch intact.
+        if let Ok(key) = resolve_any(core, &src.address) {
+            let mut st = core.lock();
+            match key {
+                TargetKey::Agent(aid) => {
+                    if let Some(a) = st.reg.agents.get_mut(&aid)
+                        && let Some(ref mut lin) = a.lineage
+                    {
+                        lin.worktree_merged = true;
+                        if lin.worktree_branch.is_none() {
+                            lin.worktree_branch = merged_wt_branch.clone();
+                        }
+                    }
+                    core.save(&st);
+                }
+                TargetKey::Terminal(tid) => {
+                    if let Some(t) = st.pty_reg.terminals.get_mut(&tid)
+                        && let Some(ref mut lin) = t.lineage
+                    {
+                        lin.worktree_merged = true;
+                        if lin.worktree_branch.is_none() {
+                            lin.worktree_branch = merged_wt_branch.clone();
+                        }
+                    }
+                    core.save_pty(&st);
+                }
+            }
+        }
+        core.flush_saved().await?;
+    }
+
     let clean_prompt = p.prompt.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     match resolve_any(core, into_raw)? {
         TargetKey::Agent(dst_id) => {
@@ -206,6 +334,7 @@ async fn handoff_into_existing(
                         from_session_id: src.session_id.clone(),
                         from_turns: turns_label,
                         artifact_path: None,
+                        context_markdown: (!pkg.markdown.trim().is_empty()).then(|| pkg.markdown.clone()),
                         ts_ms: now_ms(),
                     },
                 );
@@ -213,13 +342,20 @@ async fn handoff_into_existing(
             }
             core.flush_saved().await?;
 
-            let prompt_text = clean_prompt.unwrap_or_else(|| {
-                format!(
-                    "[{} from {}] Please review and incorporate the incoming handoff context above, then summarize key takeaways or next steps.",
-                    p.kind.display_label(),
-                    src.address
-                )
-            });
+            let prompt_text = if !merge_instruction.is_empty() {
+                match clean_prompt {
+                    Some(user_note) => format!("{merge_instruction}\n\n{user_note}"),
+                    None => merge_instruction.clone(),
+                }
+            } else {
+                clean_prompt.unwrap_or_else(|| {
+                    format!(
+                        "[{} from {}] Please review and incorporate the incoming handoff context above, then summarize key takeaways or next steps.",
+                        p.kind.display_label(),
+                        src.address
+                    )
+                })
+            };
             let sent = agent_send(
                 core,
                 SendParams {
@@ -249,6 +385,10 @@ async fn handoff_into_existing(
                 artifact_path: None,
                 native_fork: false,
                 prompt_sent,
+                worktree_path: merged_wt_path,
+                worktree_branch: merged_wt_branch,
+                worktree_merge_requested,
+                merged_files: Vec::new(),
                 wait: wait_res,
             })
         }
@@ -267,7 +407,14 @@ async fn handoff_into_existing(
                 src.address,
                 path_str
             );
-            if let Some(prompt_text) = clean_prompt {
+            if !merge_instruction.is_empty() {
+                pointer.push('\n');
+                pointer.push_str(&merge_instruction);
+                if let Some(prompt_text) = clean_prompt {
+                    pointer.push('\n');
+                    pointer.push_str(&prompt_text);
+                }
+            } else if let Some(prompt_text) = clean_prompt {
                 pointer.push('\n');
                 pointer.push_str(&prompt_text);
             } else {
@@ -304,6 +451,10 @@ async fn handoff_into_existing(
                 artifact_path: Some(path_str),
                 native_fork: false,
                 prompt_sent: sent.started != Some(false),
+                worktree_path: merged_wt_path,
+                worktree_branch: merged_wt_branch,
+                worktree_merge_requested,
+                merged_files: Vec::new(),
                 wait: wait_res,
             })
         }
@@ -381,6 +532,15 @@ async fn handoff_to_new_pty(
         }
     }
 
+    let inherited_display = p.display.clone().or_else(|| {
+        if src.is_agent {
+            return None;
+        }
+        let src_id = pty::resolve_pty(core, &src.address).ok()?;
+        let st = core.lock();
+        core.active_viewer_display(&st, src_id)
+    });
+
     let term_res = pty::terminal_run(
         core,
         TerminalRunParams {
@@ -388,12 +548,13 @@ async fn handoff_to_new_pty(
             cwd: Some(cwd.to_string()),
             name: p.name.clone(),
             keep: p.keep,
-            parent: Some(src.address.clone()),
+            parent: (p.kind == LineageKind::SideChat).then(|| src.address.clone()),
             caller: p.caller.clone(),
             size: Some(InitialSize {
                 cols: p.cols.unwrap_or(src.cols.max(40)),
                 rows: p.rows.unwrap_or(src.rows.max(12)),
             }),
+            display: inherited_display,
             lineage: Some(lineage.clone()),
             ..Default::default()
         },
@@ -442,8 +603,10 @@ async fn handoff_to_new_pty(
         if let Some(prompt_text) = clean_prompt {
             pointer.push('\n');
             pointer.push_str(&prompt_text);
+        } else if p.kind == LineageKind::SideChat {
+            pointer.push_str("\nRead that file first to absorb the context ONLY. Do NOT make any modifications, edit files, or run mutating commands on this turn — briefly confirm you have read the context and wait for the user's next instruction. (This is a read-only side-chat discussion: do NOT modify workspace files unless explicitly requested.)");
         } else {
-            pointer.push_str("\nRead that file first for full context and git state before continuing.");
+            pointer.push_str("\nRead that file first to absorb the handoff context ONLY. Do NOT make any modifications, edit files, or run mutating commands on this turn — briefly confirm you have understood the context and wait for the user's next instruction.");
         }
         initial_msg = Some(pointer);
     }
@@ -478,6 +641,10 @@ async fn handoff_to_new_pty(
         target_kind: "terminal".into(),
         kind: p.kind,
         source: src.address.clone(),
+        worktree_path: lineage.worktree_path.clone(),
+        worktree_branch: lineage.worktree_branch.clone(),
+        worktree_merge_requested: false,
+        merged_files: Vec::new(),
         lineage: lineage.clone(),
         included_turns: pkg.included_turns.clone(),
         omitted_turns: pkg.omitted_turns.clone(),
@@ -523,7 +690,7 @@ async fn handoff_to_new_acp(
             name: p.name.clone(),
             model: p.model.clone(),
             keep,
-            parent: Some(src.address.clone()),
+            parent: (p.kind == LineageKind::SideChat).then(|| src.address.clone()),
             caller: p.caller.clone(),
             wait: false,
             lineage: Some(lineage.clone()),
@@ -552,6 +719,7 @@ async fn handoff_to_new_acp(
                 from_session_id: src.session_id.clone(),
                 from_turns: turns_label,
                 artifact_path: None,
+                context_markdown: (!pkg.markdown.trim().is_empty()).then(|| pkg.markdown.clone()),
                 ts_ms: now_ms(),
             },
         );
@@ -585,6 +753,10 @@ async fn handoff_to_new_acp(
         target_kind: "agent".into(),
         kind: p.kind,
         source: src.address.clone(),
+        worktree_path: lineage.worktree_path.clone(),
+        worktree_branch: lineage.worktree_branch.clone(),
+        worktree_merge_requested: false,
+        merged_files: Vec::new(),
         lineage: lineage.clone(),
         included_turns: pkg.included_turns.clone(),
         omitted_turns: pkg.omitted_turns.clone(),

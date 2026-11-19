@@ -1306,6 +1306,14 @@ pub struct HandoffParams {
     #[arg(long)]
     #[serde(default)]
     pub keep: bool,
+    /// When `kind == fork`, create an isolated Git worktree on its own branch (carrying uncommitted changes) so the forked session can commit freely.
+    #[arg(long)]
+    #[serde(default)]
+    pub worktree: bool,
+    /// When merging back (`--into`), instruct the target/parent agent to merge code from the source session's fork worktree branch into the main workspace without deleting the worktree or branch.
+    #[arg(long)]
+    #[serde(default)]
+    pub merge_worktree: bool,
     /// With `--prompt`: wait for the first turn on the target to finish.
     #[arg(long)]
     #[serde(default)]
@@ -1326,10 +1334,18 @@ pub struct HandoffParams {
     #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     #[serde(default)]
     pub argv: Vec<String>,
+    /// Caller display colors and cell size for newly spawned PTY targets (answers startup OSC 10/11 queries).
+    #[arg(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<crate::viewers::Display>,
     /// Who is calling (`H2_AGENT_ID` / `H2_TERMINAL_ID`).
     #[arg(skip)]
     #[serde(default)]
     pub caller: Option<String>,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -1346,6 +1362,14 @@ pub struct HandoffResult {
     pub artifact_path: Option<String>,
     pub native_fork: bool,
     pub prompt_sent: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub worktree_merge_requested: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub merged_files: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait: Option<WaitResult>,
 }

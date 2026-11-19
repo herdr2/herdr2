@@ -416,7 +416,107 @@ pub async fn program_env() -> std::collections::BTreeMap<String, String> {
     env.remove("XPC_FLAGS");
     env.retain(|k, _| !SSH_LOGIN.contains(&k.as_str()));
     drop_unreachable_displays(&mut env);
+    #[cfg(unix)]
+    augment_user_path_env(&mut env);
     env
+}
+
+/// Ensures direct PTY/ACP children launched by a systemd/GUI/WSL daemon inherit common user tool
+/// directories (NVM Node bin, `~/.local/bin`, `~/bin`, `~/.bun/bin`, `~/.cargo/bin`) that are
+/// normally added only by interactive shell rc files (`~/.zshrc` / `~/.bashrc`).
+#[cfg(unix)]
+pub(crate) fn augment_user_path_env(env: &mut std::collections::BTreeMap<String, String>) {
+    let Some(home) = env
+        .get("HOME")
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").filter(|s| !s.is_empty()).map(std::path::PathBuf::from))
+    else {
+        return;
+    };
+    let mut dirs: Vec<std::path::PathBuf> = env
+        .get("PATH")
+        .map(|v| std::env::split_paths(v).collect())
+        .unwrap_or_default();
+
+    let mut extras: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(nvm_bin) = resolve_nvm_node_bin(&home) {
+        extras.push(nvm_bin);
+    }
+    extras.push(home.join(".local/bin"));
+    extras.push(home.join("bin"));
+    extras.push(home.join(".bun/bin"));
+    extras.push(home.join(".cargo/bin"));
+
+    let mut changed = false;
+    for ex in extras {
+        if ex.is_dir() && !dirs.iter().any(|d| d == &ex) {
+            dirs.push(ex);
+            changed = true;
+        }
+    }
+    if changed
+        && let Ok(joined) = std::env::join_paths(&dirs)
+        && let Some(s) = joined.to_str()
+        && !s.is_empty()
+    {
+        env.insert("PATH".into(), s.to_string());
+    }
+}
+
+#[cfg(unix)]
+fn resolve_nvm_node_bin(home: &std::path::Path) -> Option<std::path::PathBuf> {
+    let nvm_root = home.join(".nvm");
+    let versions_dir = nvm_root.join("versions/node");
+    if !versions_dir.is_dir() {
+        return None;
+    }
+    let mut vers: Vec<(String, std::path::PathBuf)> = std::fs::read_dir(&versions_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let bin = e.path().join("bin");
+            if bin.is_dir() {
+                Some((e.file_name().to_string_lossy().to_string(), bin))
+            } else {
+                None
+            }
+        })
+        .collect();
+    if vers.is_empty() {
+        return None;
+    }
+    vers.sort_by(|a, b| a.0.cmp(&b.0));
+
+    // Prefer `~/.nvm/alias/default` when it points to an installed version (exact or prefix match).
+    if let Ok(raw_default) = std::fs::read_to_string(nvm_root.join("alias/default")) {
+        let mut target = raw_default.trim().to_string();
+        for _ in 0..4 {
+            let alias_path = nvm_root.join("alias").join(&target);
+            if let Ok(next) = std::fs::read_to_string(&alias_path) {
+                let next_trimmed = next.trim();
+                if !next_trimmed.is_empty() && next_trimmed != target {
+                    target = next_trimmed.to_string();
+                    continue;
+                }
+            }
+            break;
+        }
+        let normalized = if target.starts_with('v') {
+            target.clone()
+        } else if target.chars().next().is_some_and(|c| c.is_ascii_digit()) {
+            format!("v{target}")
+        } else {
+            target.clone()
+        };
+        if let Some((_, bin)) = vers.iter().rev().find(|(name, _)| {
+            name == &normalized
+                || name.strip_prefix(&normalized).is_some_and(|rest| rest.starts_with('.'))
+        }) {
+            return Some(bin.clone());
+        }
+    }
+    vers.pop().map(|(_, bin)| bin)
 }
 
 /// 32 random hex digits (ids, socket and folder names).

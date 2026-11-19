@@ -173,6 +173,27 @@ export default class Pane extends View {
     const lineageParent = rawLineageParent
       ? (!rawLineageParent.includes("/") && curSlash > 0 ? `${p.terminal.slice(0, curSlash + 1)}${rawLineageParent}` : rawLineageParent)
       : null;
+    const rawTermParent = typeof term?.parent === "string" ? term.parent.trim() : "";
+    const termParentAddr = rawTermParent
+      ? (!rawTermParent.includes("/") && curSlash > 0 ? `${p.terminal.slice(0, curSlash + 1)}${rawTermParent}` : rawTermParent)
+      : null;
+    const upstreamAddr = lineageParent || parent?.address || termParentAddr || null;
+    const upstreamTerm = upstreamAddr
+      ? (parent?.address === upstreamAddr ? parent : terminals().find((x) => x.address === upstreamAddr) ?? null)
+      : null;
+    const upstreamCustom = upstreamTerm?.labels?.["herdr.name"] || upstreamTerm?.name || null;
+    const upstreamLabel = upstreamCustom && upstreamCustom !== upstreamAddr
+      ? `${upstreamCustom} (${upstreamAddr})`
+      : upstreamAddr;
+    const rawLineageKind = String(term?.lineage?.kind || "").toLowerCase();
+    const lineageKindInfo = rawLineageKind === "fork"
+      ? { label: tr("Fork", "会话分叉"), color: "#a855f7", tip: tr("Forked session from upstream", "由上游会话分叉而来") }
+      : rawLineageKind === "side-chat" || rawLineageKind === "side_chat"
+        ? { label: tr("Side Chat", "旁路讨论"), color: "#14b8a6", tip: tr("Read-only side-channel discussion", "隔离的旁路讨论会话") }
+        : rawLineageKind === "handoff"
+          ? { label: tr("Handoff", "上下文接力"), color: "#3b82f6", tip: tr("Context handoff from upstream", "由上游会话上下文接力而来") }
+          : null;
+    const worktreePath = term?.lineage?.worktree_path || null;
     const tabPaneCount = panes().filter((x) => x.tab === p.tab).length;
     const singleStructuredTab = isStructured && tabPaneCount <= 1;
     const customName = p.custom_name || term?.labels?.["herdr.name"];
@@ -360,12 +381,10 @@ export default class Pane extends View {
           .tooltip(isStructured ? tr("Terminal Agent (Structured View)", "终端智能体（结构化视图）") : tr("Terminal Agent", "终端智能体"))
           .child(tr("CLI", "终端")),
       ))
-      .when(isStructured && Boolean(p.terminal), el => el.child(div().flex_none().text_size(10.5).text_color(t.dim).child(p.terminal)))
-      .when(isAcp && Boolean(parent), el => el.child(div().flex_none().text_size(11).text_color(t.muted).child(tr(`from ${parent.name || parent.address}`, `来自 ${parent.name || parent.address}`))))
-      .when(Boolean(lineageParent) && lineageParent !== parent?.address, (el) =>
+      .when((isAgent || isStructured) && Boolean(p.terminal), (el) =>
         el.child(
           div()
-            .id(`ph-lin-${pane}`)
+            .id(`ph-addr-${pane}`)
             .flex_none()
             .px(5)
             .py(1)
@@ -374,16 +393,76 @@ export default class Pane extends View {
             .border_1()
             .border_color(t.border)
             .text_size(10.5)
+            .text_color(t.muted)
+            .tooltip(tr(`Agent ID: ${p.terminal}`, `智能体编号：${p.terminal}`))
+            .child(p.terminal),
+        ),
+      )
+      .when(Boolean(lineageKindInfo), (el) =>
+        el.child(
+          div()
+            .id(`ph-kind-${pane}`)
+            .flex_none()
+            .px(5)
+            .h(18)
+            .flex()
+            .items_center()
+            .rounded(4)
+            .bg(alpha(lineageKindInfo.color, "20") ?? t.raised)
+            .border_1()
+            .border_color(alpha(lineageKindInfo.color, "66") ?? t.border)
+            .text_size(10)
+            .font_semibold()
+            .text_color(lineageKindInfo.color)
+            .tooltip(lineageKindInfo.tip)
+            .child(lineageKindInfo.label),
+        ),
+      )
+      .when(Boolean(worktreePath), (el) =>
+        el.child(
+          div()
+            .id(`ph-wt-${pane}`)
+            .flex_none()
+            .px(5)
+            .h(18)
+            .flex()
+            .items_center()
+            .rounded(4)
+            .bg(alpha("#f59e0b", "20") ?? t.raised)
+            .border_1()
+            .border_color(alpha("#f59e0b", "66") ?? t.border)
+            .text_size(10)
+            .font_semibold()
+            .text_color("#f59e0b")
+            .tooltip(tr(`Isolated Git Worktree: ${worktreePath}`, `独立 Git Worktree 隔离目录：${worktreePath}`))
+            .child("Worktree"),
+        ),
+      )
+      .when(Boolean(upstreamAddr), (el) =>
+        el.child(
+          h_flex()
+            .id(`ph-lin-${pane}`)
+            .flex_none()
+            .h(20)
+            .px(6)
+            .gap(3)
+            .items_center()
+            .rounded(5)
+            .bg(alpha(accent, "14") ?? t.raised)
+            .border_1()
+            .border_color(alpha(accent, "44") ?? t.border)
+            .text_size(10.5)
+            .font_medium()
             .text_color(accent)
             .cursor_pointer()
-            .hover((s) => s.bg(t.hover).text_color(t.foreground))
-            .tooltip(tr(`Focus parent session ${lineageParent}`, `跳转到来源父会话 ${lineageParent}`))
+            .hover((s) => s.bg(alpha(accent, "28") ?? t.hover).text_color(t.foreground))
+            .tooltip(tr(`Click to return to upstream agent ${upstreamAddr}`, `点击返回上游智能体 ${upstreamAddr}`))
             .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
             .on_click((_e, cx) => {
               cx.stop_propagation();
-              run("agent.focus", { terminal: lineageParent });
+              run("agent.focus", { terminal: upstreamAddr });
             })
-            .child(`↳ ${lineageParent}`),
+            .child(tr(`↳ from ${upstreamLabel}`, `↳ 来自 ${upstreamLabel}`)),
         ),
       )
       .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(folder(p.cwd)))
@@ -394,9 +473,37 @@ export default class Pane extends View {
             tr("Merge", "合回"),
             "mods/peek/corner-up-right.svg",
             "agent.handoff",
-            { source: p.terminal, into: lineageParent, kind: "merge-back" },
-            tr(`Merge conclusions back into ${lineageParent}`, `一键将结论合回 ${lineageParent}`),
+            worktreePath
+              ? { source: p.terminal, kind: "merge-back" }
+              : { source: p.terminal, into: lineageParent, kind: "merge-back" },
+            worktreePath
+              ? tr(`Notify ${lineageParent} to merge Worktree branch (keeps worktree)`, `通知 ${lineageParent} 合并 Worktree 分支代码（保留 Worktree 与分支）`)
+              : tr(`Merge conclusions back into ${lineageParent}`, `一键将结论合回 ${lineageParent}`),
             true,
+          ),
+        ),
+      )
+      .when(showHandoffBtns, (el) =>
+        el.child(
+          headerPill(
+            `ph-side-${pane}`,
+            tr("Side", "旁路"),
+            "mods/peek/messages-square.svg",
+            "agent.handoff",
+            { source: p.terminal, kind: "side-chat" },
+            tr("Open Side Chat in the right panel (read-only)", "在右侧面板打开旁路讨论（只读参谋，不改代码）"),
+          ),
+        ),
+      )
+      .when(showHandoffBtns && String(term?.lineage?.kind || "").toLowerCase().replace("_", "-") !== "side-chat", (el) =>
+        el.child(
+          headerPill(
+            `ph-fork-${pane}`,
+            tr("Fork", "分叉"),
+            "mods/workspace-chrome/git-branch.svg",
+            "agent.handoff",
+            { source: p.terminal, kind: "fork" },
+            tr("Fork Session (optional Git Worktree isolation)", "会话分叉（支持原生无损克隆与可选 Worktree 隔离）"),
           ),
         ),
       )
@@ -405,10 +512,10 @@ export default class Pane extends View {
           headerPill(
             `ph-ho-${pane}`,
             tr("Handoff", "接力"),
-            "mods/workspace-chrome/git-branch.svg",
+            "mods/peek/corner-up-right.svg",
             "agent.handoff",
             { source: p.terminal, kind: "handoff" },
-            tr("Context handoff / Fork / Side Chat / Merge", "上下文接力 / 分支探索 / 旁路讨论 / 合回"),
+            tr("Context Handoff to another agent / provider", "上下文接力给其他 Agent 或模型继续执行"),
           ),
         ),
       )
@@ -507,6 +614,6 @@ export default class Pane extends View {
         .child(this.button(t, `ph-d-${pane}`, "split-down", "pane.split", { direction: "down", pane }, tr("Split down", "向下分栏")))
         .when(tabPaneCount > 1, el => el.child(this.button(t, `ph-z-${pane}`, "zoom", "pane.detach", { pane }, tr("Maximize to new tab", "最大化为独立标签页"))))
         .when(Boolean(p.terminal), el => el.child(this.button(t, `ph-trash-${pane}`, "trash", "agent.trash", { terminal: p.terminal }, tr("Move to recycle bin", "移入回收站"), true)))
-        .child(this.button(t, `ph-x-${pane}`, "close", "pane.close", { pane }, st === "ended" ? tr("Close tab", "关闭标签页") : isAcp ? tr("Move to background", "转入后台") : tr("Close pane", "关闭窗格"))));
+        .child(this.button(t, `ph-x-${pane}`, "close", "pane.close", { pane }, isAgent && st !== "ended" ? tr("Close tab (keep agent in background)", "关闭标签页（Agent 保留在后台）") : tr("Close pane", "关闭窗格"))));
   }
 }

@@ -178,3 +178,35 @@ fn strips_agy_wrapper_proxy_without_dropping_explicit_manager_proxy() {
     assert_eq!(managed.get("HTTP_PROXY").map(String::as_str), Some("http://127.0.0.1:7890"));
     assert_eq!(managed.get("NO_PROXY").map(String::as_str), Some("localhost,127.0.0.1,::1"));
 }
+
+#[cfg(unix)]
+#[test]
+fn augment_user_path_env_appends_nvm_default_and_user_bins_without_duplicating() {
+    use std::collections::BTreeMap;
+    let fake_home = crate::test_tmp().join(format!("h2-path-{}", super::random_hex()));
+    let nvm_v20 = fake_home.join(".nvm/versions/node/v20.11.0/bin");
+    let nvm_v22 = fake_home.join(".nvm/versions/node/v22.22.2/bin");
+    let bun_bin = fake_home.join(".bun/bin");
+    let local_bin = fake_home.join(".local/bin");
+    for d in [&nvm_v20, &nvm_v22, &bun_bin, &local_bin] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+    std::fs::create_dir_all(fake_home.join(".nvm/alias")).unwrap();
+    std::fs::write(fake_home.join(".nvm/alias/default"), "20\n").unwrap();
+
+    let mut env = BTreeMap::from([
+        ("HOME".into(), fake_home.display().to_string()),
+        ("PATH".into(), format!("{}:/usr/bin", local_bin.display())),
+    ]);
+    super::augment_user_path_env(&mut env);
+    let dirs: Vec<std::path::PathBuf> = std::env::split_paths(env.get("PATH").unwrap()).collect();
+    // Existing PATH order preserved and not duplicated.
+    assert_eq!(dirs[0], local_bin);
+    assert_eq!(dirs[1], std::path::PathBuf::from("/usr/bin"));
+    assert_eq!(dirs.iter().filter(|d| *d == &local_bin).count(), 1);
+    // NVM default alias (20 -> v20.11.0) and .bun/bin appended.
+    assert!(dirs.contains(&nvm_v20), "expected default nvm bin in PATH: {dirs:?}");
+    assert!(!dirs.contains(&nvm_v22), "should pick default alias v20, not v22");
+    assert!(dirs.contains(&bun_bin), "expected .bun/bin in PATH: {dirs:?}");
+    let _ = std::fs::remove_dir_all(&fake_home);
+}

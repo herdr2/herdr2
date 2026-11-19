@@ -243,7 +243,7 @@ function keptRender(sort: string, { width = 268, kept = [{ address: "t3", parent
 for (const sort of ["priority", "grouped"]) test(`${sort}: a kept sub-agent shows once, under its parent, and its row focuses its pane`, () => {
   const { ids, clicks, writes, texts, order } = keptRender(sort);
   expect(texts.get("ag-t1")).toContain("Project");
-  expect(texts.get("ag-t1")).not.toContain("t1");
+  expect(texts.get("ag-id-t1")).toBe("t1");
   expect(texts.get("sub-t3")).toContain("Claude");
   expect(texts.get("sub-t3")).not.toContain("Project");
   expect(ids).toContain("ag-t1");
@@ -626,4 +626,68 @@ test("agents header trash button opens recycle bin popup and dispatches restore,
     ["agent.empty_trash", {}],
   ]);
   expect(closedOverlays).toEqual(["ov-trash"]);
+});
+
+test("selecting a sub-agent in a tab or split pane highlights its subRow in the agents list", () => {
+  const claude = { name: "Claude", key: "claude", agent: true };
+  const codex = { name: "Codex", key: "codex", agent: true };
+  const list = [
+    { address: "wsl/t2t", pane: "p1", tab: "tab1", space: "s1", space_name: "Project", program: claude, title: "Claude", status: "idle", seq: 1, focused: false },
+    { address: "wsl/a48", acp: true, pane: "p2", tab: "tab2", space: "s1", space_name: "Project", program: codex, title: "Codex", status: "working", seq: 2, focused: false },
+    { address: "wsl/a49", acp: false, pane: "p3", tab: "tab3", space: "s1", space_name: "Project", program: codex, title: "Fork", status: "idle", seq: 3, focused: false },
+  ];
+  const terms = [
+    { address: "wsl/t2t", parent: null, state: "live", status: "idle", program: claude, labels: {} },
+    { address: "wsl/a48", acp: true, parent: "wsl/t2t", lineage: { kind: "handoff", parent: "wsl/t2t" }, state: "live", status: "working", name: "handoff-codex", program: codex, labels: {} },
+    { address: "wsl/a49", acp: false, parent: "wsl/t2t", lineage: { kind: "fork", parent: "wsl/t2t", worktree_path: "/tmp/wt" }, state: "live", status: "idle", name: "fork-codex", program: codex, labels: {} },
+    { address: "wsl/a50", acp: true, parent: "wsl/t2t", lineage: { kind: "side-chat", parent: "wsl/t2t" }, state: "live", status: "idle", name: "side-claude", program: claude, labels: {} },
+  ];
+  const paneList = [
+    { pane: "p1", tab: "tab1", terminal: "wsl/t2t", program: claude, title: "Claude", focused: false },
+    { pane: "p2", tab: "tab2", terminal: "wsl/a48", acp: true, program: codex, title: "Codex", focused: false },
+    { pane: "p3", tab: "tab3", terminal: "wsl/a49", acp: false, program: codex, title: "Fork", focused: false },
+  ];
+  const { agents } = harness([], {
+    agents: () => list,
+    terminals: () => terms,
+    panes: () => paneList,
+    focused: () => ({ space: "s1", tab: "tab1", pane: "p1", terminal: "wsl/a50", shown: null, agent: "wsl/t2t" }),
+    spaces: () => [{ tabs: [{ id: "tab1", name: "Claude", named: true }, { id: "tab2", name: "Codex", named: true }, { id: "tab3", name: "Fork", named: true }] }],
+    layout: () => ({ id: "sidebar", size: { px: 268 } }),
+    shared: () => "grouped",
+    theme: () => ({ selected: "selected-bg", raised: "raised-bg", hover: "hover-bg", foreground: "fg", muted: "muted", accent: "accent" }),
+    setAgentOrder() {},
+    div: element, v_flex: element, h_flex: element, svg: element, image: element,
+  });
+  const fills = new Map<string, unknown>();
+  const texts = new Map<string, string>();
+  const textOfLocal = (n: any): string => (typeof n === "string" ? n : (n?.children ?? []).map(textOfLocal).join(" "));
+  const walk = (node: any) => {
+    if (node?.id) {
+      fills.set(node.id, node.bg);
+      texts.set(node.id, textOfLocal(node));
+    }
+    (node?.children ?? []).forEach(walk);
+  };
+  walk(agents.render({}).node);
+  expect(fills.get("ag-wsl/t2t")).toBeUndefined();
+  expect(texts.get("ag-id-wsl/t2t")).toBe("t2t");
+  expect(texts.get("ag-rt-wsl/t2t")).toBe("CLI");
+  // Both Handoff and Fork stay standalone top-level sessions with upstream lineage badges.
+  expect(texts.has("ag-wsl/a48")).toBe(true);
+  expect(texts.has("sub-wsl/a48")).toBe(false);
+  expect(texts.get("ag-id-wsl/a48")).toBe("a48");
+  expect(texts.get("ag-kind-wsl/a48")).toContain("Handoff ← t2t");
+  expect(texts.get("ag-rt-wsl/a48")).toBe("ACP");
+  expect(texts.has("ag-wsl/a49")).toBe(true);
+  expect(texts.has("sub-wsl/a49")).toBe(false);
+  expect(texts.get("ag-id-wsl/a49")).toBe("a49");
+  expect(texts.get("ag-kind-wsl/a49")).toContain("Fork ← t2t");
+  expect(texts.get("ag-wt-wsl/a49")).toContain("WT");
+  expect(texts.get("ag-rt-wsl/a49")).toBe("CLI");
+  // Side Chat stays nested as a sub-agent under t2t, with selection highlight when focused.
+  expect(fills.get("sub-wsl/a50")).toBe("selected-bg");
+  expect(texts.get("sub-id-wsl/a50")).toBe("a50");
+  expect(texts.get("sub-rt-wsl/a50")).toBe("ACP");
+  expect(texts.get("sub-kind-wsl/a50")).toContain("Side");
 });

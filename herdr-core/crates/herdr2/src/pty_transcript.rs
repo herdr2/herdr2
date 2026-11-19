@@ -8,7 +8,7 @@ use crate::drove::crypto::sha256_hex;
 use crate::terminals::Terminal;
 use crate::transcript::{Entry, cap_tool_detail};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -20,7 +20,7 @@ const MAX_BYTES: usize = 2 << 20;
 const MTIME_SLACK_MS: u64 = 15_000;
 const START_SLACK_MS: u64 = 10_000;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct PtySnapshot {
     pub cwd: String,
     pub started_ms: u64,
@@ -29,6 +29,11 @@ pub struct PtySnapshot {
     pub turn: u64,
     pub resumed: bool,
     pub fg_pid: Option<u32>,
+    /// Session ID pinned to this terminal (from checkpoint/hook capture), when known.
+    pub pinned_session_id: Option<String>,
+    /// Session IDs owned by other agents/terminals (e.g. ACP side-chat/handoff agents in the same cwd)
+    /// that must never be attributed to this PTY terminal.
+    pub excluded_session_ids: HashSet<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -97,6 +102,21 @@ struct Candidate {
     first_ts_ms: u64,
 }
 
+fn candidate_session_id(c: &Candidate) -> Option<String> {
+    match c.provider {
+        Provider::Claude | Provider::Qwen => c
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.starts_with("agent-"))
+            .map(str::to_string),
+        Provider::Codex => codex_sid_from_header(&c.path),
+        Provider::Agy => agy_cid_from_path(&c.path),
+        Provider::Gemini | Provider::Pi => None,
+    }
+}
+
 pub(crate) fn argv_has_resume(argv: &[String]) -> bool {
     let has_flag = argv.iter().any(|arg| {
         matches!(arg.as_str(), "--resume" | "-r" | "--continue" | "-c")
@@ -134,6 +154,42 @@ pub fn snapshot_from_terminal(t: &Terminal, sent_prompts: Option<&Vec<(u64, u64,
         turn,
         resumed,
         fg_pid,
+        pinned_session_id: None,
+        excluded_session_ids: HashSet::new(),
+    }
+}
+
+/// Populates `pinned_session_id` and `excluded_session_ids` so ACP agents (e.g. side-chat /
+/// handoff / fork agents running in the same cwd) and other terminals never hijack this PTY
+/// terminal's discovered session JSONL.
+pub fn populate_session_affinity(
+    snap: &mut PtySnapshot,
+    target_addr: &str,
+    core: &crate::runtime::Core,
+    st: &mut crate::runtime::State,
+) {
+    let mut acp_sids: HashSet<String> = HashSet::new();
+    for a in st.reg.agents.values() {
+        if let Some(sid) = a.acp_session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            acp_sids.insert(sid.to_string());
+            snap.excluded_session_ids.insert(sid.to_string());
+        }
+    }
+    let own_tc = core.target_checkpoints(st, target_addr);
+    if let Some(sid) = own_tc.cli_session_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        && !acp_sids.contains(sid)
+    {
+        snap.pinned_session_id = Some(sid.to_string());
+    }
+    for (addr, tc) in &st.checkpoints {
+        if addr == target_addr {
+            continue;
+        }
+        if let Some(sid) = tc.cli_session_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+            && snap.pinned_session_id.as_deref() != Some(sid)
+        {
+            snap.excluded_session_ids.insert(sid.to_string());
+        }
     }
 }
 
@@ -180,15 +236,31 @@ fn extract_transcript_with_home(
     let providers = ordered_providers(snap.agent_hint.as_deref());
 
     for provider in providers {
-        let candidates = match provider {
-            Provider::Claude => discover_claude(home, claude_dir_override, &norm_cwd, min_mtime),
-            Provider::Codex => discover_codex(home, codex_dir_override, &norm_cwd, min_mtime),
+        let mut candidates = match provider {
+            Provider::Claude => discover_claude(home, claude_dir_override, &norm_cwd, if snap.pinned_session_id.is_some() { 0 } else { min_mtime }),
+            Provider::Codex => discover_codex(home, codex_dir_override, &norm_cwd, if snap.pinned_session_id.is_some() { 0 } else { min_mtime }),
             Provider::Gemini => discover_gemini_or_qwen(home, ".gemini", Provider::Gemini, &norm_cwd, min_mtime),
             Provider::Qwen => discover_qwen(home, &norm_cwd, min_mtime),
             Provider::Pi => discover_pi(home, &norm_cwd, min_mtime),
             Provider::Agy => discover_agy(home, min_mtime, snap.fg_pid),
         };
-        if let Some(best) = pick_best_candidate(candidates, snap.started_ms, fg_started_ms, allow_older_fallback) {
+        if !snap.excluded_session_ids.is_empty() {
+            candidates.retain(|c| {
+                candidate_session_id(c)
+                    .as_deref()
+                    .is_none_or(|sid| !snap.excluded_session_ids.contains(sid))
+            });
+        }
+        let pinned_hit = snap.pinned_session_id.as_deref().and_then(|wanted| {
+            candidates
+                .iter()
+                .position(|c| candidate_session_id(c).as_deref() == Some(wanted))
+                .map(|idx| candidates.remove(idx))
+        });
+        let picked = pinned_hit.or_else(|| {
+            pick_best_candidate(candidates, snap.started_ms, fg_started_ms, allow_older_fallback)
+        });
+        if let Some(best) = picked {
             let (entries, mut meta) = match best.provider {
                 Provider::Claude => parse_claude_jsonl(&best.path),
                 Provider::Codex => parse_codex_jsonl(&best.path),
@@ -944,11 +1016,38 @@ fn claude_tool_detail(name: &str, input: &Value) -> Option<String> {
 }
 
 fn parse_claude_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
+    let settings = load_claude_settings();
+    parse_claude_jsonl_with_settings(path, settings.as_ref())
+}
+
+fn parse_claude_jsonl_with_settings(path: &Path, settings: Option<&Value>) -> (Vec<Entry>, ReadSessionMeta) {
     let lines = read_bounded_lines(path);
     let mut entries: Vec<Entry> = Vec::new();
     let mut meta = ReadSessionMeta::default();
     let mut tool_indices: HashMap<String, usize> = HashMap::new();
     let mut turn: u64 = 0;
+    let mut active_context_window: Option<u64> = None;
+    let mut model_windows: HashMap<String, u64> = HashMap::new();
+    let mut last_used: Option<u64> = None;
+
+    let apply_model_switch = |raw_spec: &str,
+                              meta: &mut ReadSessionMeta,
+                              active_context_window: &mut Option<u64>,
+                              model_windows: &mut HashMap<String, u64>| {
+        let (resolved_model, resolved_window) = resolve_claude_model_spec(raw_spec, settings);
+        let prev_base = meta.model.as_deref().map(|m| strip_model_context_suffix(m).to_ascii_lowercase());
+        let next_base = strip_model_context_suffix(&resolved_model).to_ascii_lowercase();
+        if prev_base.as_deref() != Some(next_base.as_str()) {
+            *active_context_window = None;
+        }
+        if let Some(sz) = resolved_window {
+            if !next_base.is_empty() {
+                model_windows.insert(next_base, sz);
+            }
+            *active_context_window = Some(sz);
+        }
+        meta.model = Some(resolved_model);
+    };
 
     for line in lines {
         let trimmed = line.trim();
@@ -983,6 +1082,9 @@ fn parse_claude_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                 };
                 match content {
                     Value::String(s) => {
+                        if let Some(raw_spec) = parse_claude_model_switch_stdout(s) {
+                            apply_model_switch(&raw_spec, &mut meta, &mut active_context_window, &mut model_windows);
+                        }
                         if is_claude_command_noise(s) {
                             continue;
                         }
@@ -1008,6 +1110,9 @@ fn parse_claude_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                                 }
                                 Some("text") => {
                                     if let Some(raw) = block.get("text").and_then(Value::as_str) {
+                                        if let Some(raw_spec) = parse_claude_model_switch_stdout(raw) {
+                                            apply_model_switch(&raw_spec, &mut meta, &mut active_context_window, &mut model_windows);
+                                        }
                                         if is_claude_command_noise(raw)
                                             || raw.trim_start().starts_with("[Request interrupted by user")
                                         {
@@ -1035,9 +1140,77 @@ fn parse_claude_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                     _ => {}
                 }
             }
+            Some("api-request") => {
+                let req_model = v.pointer("/params/model").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+                let beta_1m = v
+                    .pointer("/params/betas")
+                    .and_then(Value::as_array)
+                    .is_some_and(|betas| {
+                        betas
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .any(|b| b.to_ascii_lowercase().starts_with("context-1m-"))
+                    });
+                let req_window = req_model
+                    .and_then(parse_context_window_from_model_name)
+                    .or(if beta_1m { Some(1_000_000) } else { None });
+                if let Some(m) = req_model {
+                    let prev_base = meta.model.as_deref().map(|cur| strip_model_context_suffix(cur).to_ascii_lowercase());
+                    let next_base = strip_model_context_suffix(m).to_ascii_lowercase();
+                    if prev_base.as_deref() != Some(next_base.as_str()) {
+                        active_context_window = None;
+                        meta.model = Some(m.to_string());
+                    }
+                    if let Some(sz) = req_window {
+                        if !next_base.is_empty() {
+                            model_windows.insert(next_base, sz);
+                        }
+                        active_context_window = Some(sz);
+                    }
+                } else if let Some(sz) = req_window {
+                    active_context_window = Some(sz);
+                }
+            }
+            Some("cost-state") => {
+                if let Some(map) = v.get("modelUsage").and_then(Value::as_object) {
+                    let cur_base = meta.model.as_deref().map(|m| strip_model_context_suffix(m).to_ascii_lowercase());
+                    for (model_key, entry) in map {
+                        let sz = entry
+                            .get("contextWindow")
+                            .or_else(|| entry.get("context_window"))
+                            .and_then(Value::as_u64)
+                            .filter(|&n| n > 0)
+                            .or_else(|| parse_context_window_from_model_name(model_key));
+                        if let Some(sz) = sz {
+                            let key_base = strip_model_context_suffix(model_key).to_ascii_lowercase();
+                            if !key_base.is_empty() {
+                                model_windows.insert(key_base.clone(), sz);
+                            }
+                            if cur_base.is_none() || cur_base.as_deref() == Some(key_base.as_str()) {
+                                active_context_window = Some(sz);
+                            }
+                        }
+                    }
+                }
+            }
             Some("assistant") => {
                 if let Some(model) = v.pointer("/message/model").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
-                    meta.model = Some(model.to_string());
+                    let prev_base = meta.model.as_deref().map(|m| strip_model_context_suffix(m).to_ascii_lowercase());
+                    let next_base = strip_model_context_suffix(model).to_ascii_lowercase();
+                    if prev_base.as_deref() != Some(next_base.as_str()) {
+                        active_context_window = None;
+                        meta.model = Some(model.to_string());
+                    } else if parse_context_window_from_model_name(model).is_some()
+                        || meta.model.as_deref().and_then(parse_context_window_from_model_name).is_none()
+                    {
+                        meta.model = Some(model.to_string());
+                    }
+                    if let Some(sz) = parse_context_window_from_model_name(model) {
+                        if !next_base.is_empty() {
+                            model_windows.insert(next_base, sz);
+                        }
+                        active_context_window = Some(sz);
+                    }
                 }
                 if let Some(usage) = v.pointer("/message/usage") {
                     let input_tok = usage.get("input_tokens").and_then(Value::as_u64).unwrap_or(0);
@@ -1045,7 +1218,7 @@ fn parse_claude_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                     let cache_read = usage.get("cache_read_input_tokens").and_then(Value::as_u64).unwrap_or(0);
                     let used = input_tok + cache_create + cache_read;
                     if used > 0 {
-                        meta.context_usage = Some(AcpContextUsage { used, size: 200_000 });
+                        last_used = Some(used);
                     }
                 }
                 let Some(blocks) = v.pointer("/message/content").and_then(Value::as_array) else {
@@ -1105,6 +1278,15 @@ fn parse_claude_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
             _ => {}
         }
     }
+    if let Some(used) = last_used {
+        let model_base = meta.model.as_deref().map(|m| strip_model_context_suffix(m).to_ascii_lowercase());
+        let size = active_context_window
+            .or_else(|| meta.model.as_deref().and_then(parse_context_window_from_model_name))
+            .or_else(|| model_base.as_deref().and_then(|b| model_windows.get(b).copied()))
+            .or_else(|| meta.model.as_deref().and_then(|m| lookup_claude_settings_context_window_in(m, settings)))
+            .unwrap_or(if used > 200_000 { 1_000_000 } else { 200_000 });
+        meta.context_usage = Some(AcpContextUsage { used, size });
+    }
     if !entries.is_empty() || !meta.is_empty() {
         if meta.session_id.is_none()
             && let Some(stem) = path
@@ -1118,6 +1300,205 @@ fn parse_claude_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
         meta.provider.get_or_insert_with(|| "claude".to_string());
     }
     (entries, meta)
+}
+
+fn load_claude_settings() -> Option<Value> {
+    let home = home_dir()?;
+    let settings_path = claude_root(&home, None).join("settings.json");
+    let raw = fs::read_to_string(settings_path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn strip_ansi_csi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' && chars.peek() == Some(&'[') {
+            chars.next();
+            for ch in chars.by_ref() {
+                if ('@'..='~').contains(&ch) {
+                    break;
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn parse_claude_model_switch_stdout(raw: &str) -> Option<String> {
+    let inner = if let Some(start) = raw.find("<local-command-stdout>") {
+        let after = &raw[start + "<local-command-stdout>".len()..];
+        let end = after.find("</local-command-stdout>").unwrap_or(after.len());
+        &after[..end]
+    } else {
+        return None;
+    };
+    let clean = strip_ansi_csi(inner);
+    let lower = clean.to_ascii_lowercase();
+    let prefix = "set model to ";
+    let idx = lower.find(prefix)?;
+    let rest = clean[idx + prefix.len()..].trim();
+    if rest.is_empty() {
+        return None;
+    }
+    if let Some(after_tick) = rest.strip_prefix('`') {
+        if let Some(end_tick) = after_tick.find('`') {
+            let spec = after_tick[..end_tick].trim();
+            if !spec.is_empty() {
+                return Some(spec.to_string());
+            }
+        }
+    }
+    let first_line = rest.lines().next().unwrap_or(rest).trim();
+    let lower_line = first_line.to_ascii_lowercase();
+    let cut = [
+        " and saved as your default",
+        " for this session",
+        " (saved as default",
+    ]
+    .iter()
+    .filter_map(|marker| lower_line.find(marker))
+    .min()
+    .unwrap_or(first_line.len());
+    let spec = first_line[..cut].trim().trim_end_matches('.').trim();
+    (!spec.is_empty()).then(|| spec.to_string())
+}
+
+fn resolve_claude_model_spec(raw_spec: &str, settings: Option<&Value>) -> (String, Option<u64>) {
+    let spec = raw_spec.trim();
+    if let Some(v) = settings
+        && let Some(opts) = v.pointer("/modelPicker/options").and_then(Value::as_array)
+    {
+        for opt in opts {
+            let label = opt.get("label").and_then(Value::as_str).map(str::trim).unwrap_or("");
+            let model = opt.get("model").and_then(Value::as_str).map(str::trim).unwrap_or("");
+            if model.is_empty() {
+                continue;
+            }
+            if (!label.is_empty() && label.eq_ignore_ascii_case(spec))
+                || model.eq_ignore_ascii_case(spec)
+                || strip_model_context_suffix(model).eq_ignore_ascii_case(spec)
+            {
+                let sz = parse_context_window_from_model_name(model)
+                    .or_else(|| parse_context_window_from_model_name(spec));
+                return (model.to_string(), sz);
+            }
+        }
+    }
+    // Official Claude Code output like `Default (recommended) (claude-sonnet-4-6)` or `Opus (claude-opus-4-6[1m])`.
+    if let Some(open) = spec.rfind('(')
+        && let Some(inside) = spec[open + 1..].strip_suffix(')')
+    {
+        let cand = inside.trim();
+        if !cand.is_empty()
+            && !cand.contains(char::is_whitespace)
+            && (cand.contains('-') || cand.contains('/') || cand.contains('[') || cand.contains('@'))
+        {
+            let sz = parse_context_window_from_model_name(cand)
+                .or_else(|| parse_context_window_from_model_name(spec))
+                .or_else(|| lookup_claude_settings_context_window_in(cand, settings));
+            return (cand.to_string(), sz);
+        }
+    }
+    let sz = parse_context_window_from_model_name(spec)
+        .or_else(|| lookup_claude_settings_context_window_in(spec, settings));
+    (spec.to_string(), sz)
+}
+
+fn parse_token_size_suffix(raw: &str) -> Option<u64> {
+    let s = raw.trim().to_ascii_lowercase();
+    if let Some(num) = s.strip_suffix('m') {
+        let v: f64 = num.parse().ok()?;
+        if v.is_finite() && v > 0.0 {
+            return Some((v * 1_000_000.0).round() as u64);
+        }
+    } else if let Some(num) = s.strip_suffix('k') {
+        let v: f64 = num.parse().ok()?;
+        if v.is_finite() && v > 0.0 {
+            return Some((v * 1_000.0).round() as u64);
+        }
+    } else if let Ok(v) = s.parse::<u64>()
+        && v >= 16_000
+    {
+        return Some(v);
+    }
+    None
+}
+
+fn strip_model_context_suffix(model: &str) -> &str {
+    let mut s = model.trim();
+    if let Some(idx) = s.rfind('[')
+        && s.ends_with(']')
+    {
+        s = &s[..idx];
+    }
+    if let Some(idx) = s.rfind('@')
+        && parse_token_size_suffix(&s[idx + 1..]).is_some()
+    {
+        s = &s[..idx];
+    }
+    s.trim()
+}
+
+fn parse_context_window_from_model_name(model: &str) -> Option<u64> {
+    let s = model.trim();
+    // Match `[1m]`, `[500k]` anywhere in the model name/label.
+    let mut rest = s;
+    while let Some(start) = rest.find('[') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find(']') else { break };
+        if let Some(sz) = parse_token_size_suffix(&after[..end]) {
+            return Some(sz);
+        }
+        rest = &after[end + 1..];
+    }
+    // Match `@500k` or `@ 500k` (even when followed by ` · Cursor` or whitespace).
+    let mut at_rest = s;
+    while let Some(at) = at_rest.find('@') {
+        let after = at_rest[at + 1..].trim_start();
+        let tok_end = after
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))
+            .unwrap_or(after.len());
+        if tok_end > 0
+            && let Some(sz) = parse_token_size_suffix(&after[..tok_end])
+        {
+            return Some(sz);
+        }
+        at_rest = after;
+    }
+    None
+}
+
+fn lookup_claude_settings_context_window_in(model: &str, settings: Option<&Value>) -> Option<u64> {
+    let v = settings?;
+    let base = strip_model_context_suffix(model).to_ascii_lowercase();
+    if base.is_empty() {
+        return None;
+    }
+    if let Some(opts) = v.pointer("/modelPicker/options").and_then(Value::as_array) {
+        for opt in opts {
+            if let Some(m) = opt.get("model").and_then(Value::as_str)
+                && strip_model_context_suffix(m).eq_ignore_ascii_case(&base)
+                && let Some(sz) = parse_context_window_from_model_name(m)
+            {
+                return Some(sz);
+            }
+        }
+    }
+    if let Some(env) = v.get("env").and_then(Value::as_object) {
+        for (k, val) in env {
+            if k.ends_with("_MODEL")
+                && let Some(m) = val.as_str()
+                && strip_model_context_suffix(m).eq_ignore_ascii_case(&base)
+                && let Some(sz) = parse_context_window_from_model_name(m)
+            {
+                return Some(sz);
+            }
+        }
+    }
+    None
 }
 
 fn is_claude_command_noise(s: &str) -> bool {
@@ -2335,6 +2716,7 @@ mod tests {
             turn: 1,
             resumed: false,
             fg_pid: None,
+            ..Default::default()
         };
         let (entries, meta) = extract_transcript_with_home(&snap, &root, Some(&root), None);
         assert_eq!(entries.len(), 5);
@@ -2347,6 +2729,125 @@ mod tests {
         assert_eq!(meta.model.as_deref(), Some("claude-sonnet-4-5"));
         assert_eq!(meta.mode.as_deref(), Some("dangerously-skip-permissions"));
         assert_eq!(meta.context_usage, Some(AcpContextUsage { used: 28000, size: 200_000 }));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn claude_jsonl_detects_1m_and_500k_context_window_from_betas_and_cost_state() {
+        assert_eq!(parse_context_window_from_model_name("group/deepseek-v4.1-flash[1m]"), Some(1_000_000));
+        assert_eq!(parse_context_window_from_model_name("cursor/grok-4.7@500k"), Some(500_000));
+        assert_eq!(parse_context_window_from_model_name("claude-sonnet-4-5"), None);
+
+        let root = tmp_dir("claude-1m");
+        let file = root.join("sess.jsonl");
+        let lines = [
+            serde_json::json!({
+                "type": "api-request",
+                "params": { "model": "group/deepseek-v4.1-flash", "betas": ["claude-code-20250219", "context-1m-2025-08-07"] }
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "model": "group/deepseek-v4.1-flash",
+                    "usage": { "input_tokens": 109527, "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0 },
+                    "content": [{ "type": "text", "text": "ok" }]
+                }
+            }),
+        ];
+        fs::write(&file, lines.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+        let (_, meta) = parse_claude_jsonl(&file);
+        assert_eq!(meta.context_usage, Some(AcpContextUsage { used: 109_527, size: 1_000_000 }));
+
+        // Also verify `cost-state` modelUsage `@500k` suffix overrides default 200k.
+        let file2 = root.join("sess500k.jsonl");
+        let lines2 = [
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "model": "cursor/grok-4.7",
+                    "usage": { "input_tokens": 50000 },
+                    "content": [{ "type": "text", "text": "hi" }]
+                }
+            }),
+            serde_json::json!({
+                "type": "cost-state",
+                "modelUsage": { "cursor/grok-4.7@500k": { "inputTokens": 50000 } }
+            }),
+        ];
+        fs::write(&file2, lines2.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+        let (_, meta2) = parse_claude_jsonl(&file2);
+        assert_eq!(meta2.context_usage, Some(AcpContextUsage { used: 50_000, size: 500_000 }));
+
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn claude_jsonl_updates_model_and_context_window_after_slash_model_switch() {
+        let settings = serde_json::json!({
+            "modelPicker": {
+                "options": [
+                    { "model": "group/deepseek-v4.1-flash[1m]", "label": "deepseek-v4.1-flash · routing group" },
+                    { "model": "codex/gpt-6.1-sol", "label": "GPT-6.1-Sol · Codex" },
+                    { "model": "cursor/grok-4.7@500k", "label": "Grok 4.7 @ 500k · Cursor" }
+                ]
+            }
+        });
+
+        let root = tmp_dir("claude-model-switch");
+        let file = root.join("sess.jsonl");
+
+        // Turn 1 used a 1M model, then user switched via `/model` to Grok 4.7 @ 500k.
+        let lines_500k = [
+            serde_json::json!({
+                "type": "api-request",
+                "params": { "model": "group/deepseek-v4.1-flash", "betas": ["context-1m-2025-08-07"] }
+            }),
+            serde_json::json!({
+                "type": "assistant",
+                "message": {
+                    "model": "group/deepseek-v4.1-flash",
+                    "usage": { "input_tokens": 33307 },
+                    "content": [{ "type": "text", "text": "hello" }]
+                }
+            }),
+            serde_json::json!({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": "<local-command-stdout>Set model to `Grok 4.7 @ 500k · Cursor` and saved as your default for new sessions</local-command-stdout>"
+                }
+            }),
+        ];
+        fs::write(&file, lines_500k.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+        let (entries, meta) = parse_claude_jsonl_with_settings(&file, Some(&settings));
+        assert_eq!(entries.len(), 1, "local-command-stdout must not appear as a user chat bubble");
+        assert_eq!(meta.model.as_deref(), Some("cursor/grok-4.7@500k"));
+        assert_eq!(meta.context_usage, Some(AcpContextUsage { used: 33_307, size: 500_000 }));
+
+        // Switching next to a 200k default model must drop the stale 1M/500k window.
+        let mut lines_200k = lines_500k.to_vec();
+        lines_200k.push(serde_json::json!({
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": "<local-command-stdout>Set model to `GPT-6.1-Sol · Codex` and saved as your default for new sessions</local-command-stdout>"
+            }
+        }));
+        fs::write(&file, lines_200k.iter().map(|v| v.to_string()).collect::<Vec<_>>().join("\n") + "\n").unwrap();
+        let (_, meta2) = parse_claude_jsonl_with_settings(&file, Some(&settings));
+        assert_eq!(meta2.model.as_deref(), Some("codex/gpt-6.1-sol"));
+        assert_eq!(meta2.context_usage, Some(AcpContextUsage { used: 33_307, size: 200_000 }));
+
+        // Official Claude Code format without backticks works too.
+        assert_eq!(
+            parse_claude_model_switch_stdout("<local-command-stdout>Set model to Opus (claude-opus-4-6[1m]) for this session</local-command-stdout>"),
+            Some("Opus (claude-opus-4-6[1m])".to_string())
+        );
+        assert_eq!(
+            resolve_claude_model_spec("Opus (claude-opus-4-6[1m])", None),
+            ("claude-opus-4-6[1m]".to_string(), Some(1_000_000))
+        );
+
         fs::remove_dir_all(root).ok();
     }
 
@@ -2428,6 +2929,7 @@ mod tests {
             turn: 1,
             resumed: false,
             fg_pid: None,
+            ..Default::default()
         };
         let (entries, meta) = extract_transcript_with_home(&snap, &root, None, Some(&root));
         assert_eq!(entries.len(), 4);
@@ -2474,6 +2976,7 @@ mod tests {
             turn: 1,
             resumed: false,
             fg_pid: None,
+            ..Default::default()
         };
         let entries = extract_entries_with_home(&snap, &root, None, None);
         assert_eq!(entries.len(), 4);
@@ -2522,6 +3025,7 @@ mod tests {
             turn: 1,
             resumed: false,
             fg_pid: None,
+            ..Default::default()
         };
         let entries = extract_entries_with_home(&snap, &root, None, None);
         assert_eq!(entries.len(), 4);
@@ -2563,6 +3067,7 @@ mod tests {
             turn: 1,
             resumed: false,
             fg_pid: None,
+            ..Default::default()
         };
         let entries = extract_entries_with_home(&snap, &root, Some(&root), None);
         assert!(entries.is_empty(), "plain shell must not hijack .claude sessions");
@@ -2602,6 +3107,7 @@ mod tests {
             turn: 0,
             resumed: false,
             fg_pid: None,
+            ..Default::default()
         };
         assert!(extract_entries_with_home(&fresh, &root, Some(&root), None).is_empty());
 
@@ -2609,6 +3115,58 @@ mod tests {
         let entries = extract_entries_with_home(&resumed, &root, Some(&root), None);
         assert_eq!(entries.len(), 2);
         assert!(matches!(&entries[0], Entry::User { text, .. } if text == "Old task"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn claude_discovery_excludes_acp_side_chat_sessions_and_honors_pinned_sid() {
+        let root = tmp_dir("claude-exclude-acp");
+        let project = "/tmp/shared/repo";
+        let slug_dir = root.join("projects").join(claude_slug(project));
+        fs::create_dir_all(&slug_dir).unwrap();
+
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+
+        let main_file = slug_dir.join("main-sess-111.jsonl");
+        let acp_file = slug_dir.join("acp-side-222.jsonl");
+        fs::write(
+            &main_file,
+            serde_json::json!({
+                "type": "user", "cwd": project, "sessionId": "main-sess-111",
+                "message": { "role": "user", "content": "Real main task" }
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(
+            &acp_file,
+            serde_json::json!({
+                "type": "user", "cwd": project, "sessionId": "acp-side-222",
+                "message": { "role": "user", "content": "Side chat message" }
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let mut excluded = HashSet::new();
+        excluded.insert("acp-side-222".to_string());
+        let snap = PtySnapshot {
+            cwd: project.to_string(),
+            started_ms: now_ms.saturating_sub(5_000),
+            agent_hint: Some("claude".into()),
+            turn: 1,
+            excluded_session_ids: excluded,
+            ..Default::default()
+        };
+        let (entries, meta) = extract_transcript_with_home(&snap, &root, Some(&root), None);
+        assert_eq!(meta.and_then(|m| m.session_id).as_deref(), Some("main-sess-111"));
+        assert!(matches!(&entries[0], Entry::User { text, .. } if text == "Real main task"));
         fs::remove_dir_all(root).ok();
     }
 
@@ -2668,6 +3226,7 @@ mod tests {
             turn: 1,
             resumed: false,
             fg_pid: None,
+            ..Default::default()
         };
         let entries = extract_entries_with_home(&snap, &root, None, None);
         assert_eq!(entries.len(), 3);

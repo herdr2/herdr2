@@ -1,10 +1,41 @@
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, ScrollHandle } from "gpui-base";
-import { spaces, panes, run, openOverlay, theme, window, shared, layout, settings } from "herdr";
+import { spaces, panes, terminals, agents, focused, run, openOverlay, theme, window, shared, layout, settings } from "herdr";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
 const zoomScale = () => Math.max(0.25, Number(typeof settings === "function" ? settings()?.zoom : 1) || 1);
+
+function resolvePeerAddr(raw, sibling) {
+  const trimmed = String(raw || "").trim();
+  if (!trimmed || trimmed.includes("/")) return trimmed;
+  const slash = typeof sibling === "string" ? sibling.lastIndexOf("/") : -1;
+  return slash >= 0 ? `${sibling.slice(0, slash + 1)}${trimmed}` : trimmed;
+}
+
+function focusedMainSideChatCount() {
+  const termList = typeof terminals === "function" ? terminals() : [];
+  if (!Array.isArray(termList) || termList.length === 0) return 0;
+  const pList = typeof panes === "function" ? panes() : [];
+  const aList = typeof agents === "function" ? agents() : [];
+  const foc = typeof focused === "function" ? focused() : null;
+  const mainAddr =
+    pList.find((p) => p?.focused && p?.terminal)?.terminal
+    || aList.find((a) => a?.focused && a?.address)?.address
+    || foc?.shown
+    || foc?.terminal
+    || foc?.agent
+    || null;
+  if (!mainAddr) return 0;
+  let count = 0;
+  for (const x of termList) {
+    if (!x?.address || x.state !== "live" || x.labels?.["herdr.trashed"]) continue;
+    if (String(x.lineage?.kind || "").toLowerCase().replace("_", "-") !== "side-chat") continue;
+    const parent = resolvePeerAddr(x.lineage?.parent || x.parent || "", x.address);
+    if (parent === mainAddr) count += 1;
+  }
+  return count;
+}
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -18,10 +49,14 @@ function find(node, id) {
 function resolveEnabledPanels(defaultIds) {
   const saved = shared("workspace.panels");
   if (!Array.isArray(saved)) return defaultIds;
-  if (!shared("workspace.panels_has_checkpoints") && !saved.includes("checkpoints")) {
-    return [...saved, "checkpoints"];
+  const out = [...saved];
+  if (!shared("workspace.panels_has_checkpoints") && !out.includes("checkpoints")) {
+    out.push("checkpoints");
   }
-  return saved;
+  if (!shared("workspace.panels_has_side_chat") && !out.includes("side-chat")) {
+    out.push("side-chat");
+  }
+  return out;
 }
 
 // Same as the agents mod: drops a status glyph, keeps a leading bracket or quote.
@@ -605,8 +640,10 @@ export default class Tabs extends View {
       ? Math.max(10, (root.traffic_lights[0] + 64) / settings().zoom - (sidebar?.hidden ? 0 : sidebar?.size?.px ?? 0))
       : 10;
     const panel = find(root, "panel"), body = find(root, "panel-body");
-    const enabled = resolveEnabledPanels(["files", "changes", "checkpoints"]);
-    this.syncPanel(space, panel, body, enabled);
+    const enabled = resolveEnabledPanels(["files", "changes", "checkpoints", "side-chat"]);
+    const hasSideChats = focusedMainSideChatCount() > 0;
+    const effectiveEnabled = hasSideChats ? enabled : enabled.filter((id) => id !== "side-chat");
+    this.syncPanel(space, panel, body, effectiveEnabled);
     const panelButton = (id, label, icon) => {
       const on = panel && !panel.hidden && body?.active === id;
       return h_flex().id(`panel-${id}`).h(26).px(8).gap(5).flex_none().items_center().rounded(6)
@@ -645,6 +682,7 @@ export default class Tabs extends View {
       .when(enabled.includes("files"), el => el.child(panelButton("files", tr("Files", "文件"), "mods/files/file.svg")))
       .when(enabled.includes("changes"), el => el.child(panelButton("changes", tr("Changes", "变更"), "mods/changes/changes.svg")))
       .when(enabled.includes("checkpoints"), el => el.child(panelButton("checkpoints", tr("Checkpoints", "快照"), "mods/checkpoints/checkpoints.svg")))
+      .when(enabled.includes("side-chat") && hasSideChats, el => el.child(panelButton("side-chat", tr("Side Chat", "旁路"), "mods/peek/messages-square.svg")))
       .when(w?.buttons, el => el.child(button("minimize", w.platform === "windows" ? svg("mods/tabs/win-min.svg").size(16) : "−", () => run("window.minimize")))
         .child(button("maximize", w.platform === "windows" ? svg(`mods/tabs/${w.maximized ? "win-restore" : "win-max"}.svg`).size(16) : "□", () => run("window.maximize")))
         .child(button("close-window", w.platform === "windows" ? svg("mods/tabs/win-close.svg").size(16) : svg("mods/pane/close.svg").size(13), () => run("window.close"))))

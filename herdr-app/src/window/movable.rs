@@ -11,17 +11,31 @@ use super::*;
 const DRAG_START: f32 = 4.0;
 /// How much of a window stays on screen however far it's dragged, px.
 const KEEP_SHOWN: f32 = 48.0;
+/// Edge hit-zone thickness for resizable floating windows, px.
+const RESIZE_EDGE_PX: f32 = 6.0;
+/// Bottom-right corner grip size for resizable floating windows, px.
+const RESIZE_CORNER_PX: f32 = 14.0;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WinOp {
+    Move,
+    Resize { left: bool, right: bool, bottom: bool },
+}
 
 pub struct WinDrag {
     pub id: String,
-    /// The pointer's offset from the window's top left.
+    op: WinOp,
+    /// The pointer's offset from the window's top left (for Move).
     grab: Point<Pixels>,
     down: Point<Pixels>,
     pointer: Point<Pixels>,
     moving: bool,
+    start_origin: Point<Pixels>,
+    start_size: Size<Pixels>,
+    viewport: Size<Pixels>,
 }
 
-// ---- windows.json: spots by key, and the kept windows of each layout
+// ---- windows.json: spots and sizes by key, and the kept windows of each layout
 
 fn path() -> PathBuf {
     file("windows.json")
@@ -44,8 +58,19 @@ pub fn place_of(key: &str) -> Option<Point<Pixels>> {
     Some(point(px(p.first()?.as_f64()? as f32), px(p.get(1)?.as_f64()? as f32)))
 }
 
+pub fn size_of(key: &str) -> Option<Size<f32>> {
+    let p = read().get("sizes")?.get(key)?.as_array()?.clone();
+    let w = p.first()?.as_f64()? as f32;
+    let h = p.get(1)?.as_f64()? as f32;
+    (w > 0.0 && h > 0.0).then_some(size(w, h))
+}
+
 fn remember(key: &str, at: Point<Pixels>) {
     edit(|v| v["places"][key] = json!([f32::from(at.x).round(), f32::from(at.y).round()]));
+}
+
+fn remember_size(key: &str, sz: Size<f32>) {
+    edit(|v| v["sizes"][key] = json!([sz.width.round(), sz.height.round()]));
 }
 
 pub fn keep(layout: &str, key: &str, spec: &Value) {
@@ -90,7 +115,7 @@ impl AppWindow {
         let measured = self.bounds.borrow().get(&o.slot).map(|b| b.size);
         let size = measured.unwrap_or_default();
         let at = match (&self.win_drag, o.place) {
-            (Some(d), _) if d.id == o.id && d.moving => d.pointer - d.grab,
+            (Some(d), _) if d.id == o.id && d.moving && d.op == WinOp::Move => d.pointer - d.grab,
             (_, Some(p)) => p,
             _ => point((viewport.width - size.width) / 2.0, (viewport.height - size.height) / 2.0),
         };
@@ -112,7 +137,7 @@ impl AppWindow {
             .size_full()
         };
         let (raise, press) = (o.id.clone(), o.id.clone());
-        let body = body
+        let mut body = body
             .relative()
             .child(measure)
             // Pressed anywhere, even on the mod's own controls: to the front.
@@ -121,9 +146,51 @@ impl AppWindow {
                 MouseButton::Left,
                 cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
                     cx.stop_propagation();
-                    this.window_press(&press, ev.position, cx);
+                    this.window_press(&press, ev.position, viewport, cx);
                 }),
             );
+        if o.resizable {
+            let edge = px(RESIZE_EDGE_PX);
+            let corner = px(RESIZE_CORNER_PX);
+            let make_handle = |suffix: &'static str, op: WinOp, cursor: CursorStyle| {
+                let id = o.id.clone();
+                div()
+                    .id(SharedString::from(format!("win-{suffix}-{}", o.id)))
+                    .absolute()
+                    .cursor(cursor)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            this.window_resize_press(&id, op, ev.position, viewport, cx);
+                        }),
+                    )
+            };
+            body = body
+                .child(make_handle("rz-r", WinOp::Resize { left: false, right: true, bottom: false }, CursorStyle::ResizeLeftRight).right_0().top_0().bottom(corner).w(edge))
+                .child(make_handle("rz-l", WinOp::Resize { left: true, right: false, bottom: false }, CursorStyle::ResizeLeftRight).left_0().top_0().bottom(corner).w(edge))
+                .child(make_handle("rz-b", WinOp::Resize { left: false, right: false, bottom: true }, CursorStyle::ResizeUpDown).left(edge).right(corner).bottom_0().h(edge))
+                .child(
+                    make_handle("rz-br", WinOp::Resize { left: false, right: true, bottom: true }, CursorStyle::ResizeUpLeftDownRight)
+                        .right_0()
+                        .bottom_0()
+                        .w(corner)
+                        .h(corner)
+                        .flex()
+                        .items_end()
+                        .justify_end()
+                        .p(px(2.0))
+                        .child(
+                            div()
+                                .w(px(7.0))
+                                .h(px(7.0))
+                                .border_r(px(1.5))
+                                .border_b(px(1.5))
+                                .border_color(c("dim"))
+                                .rounded_br(px(2.0)),
+                        ),
+                );
+        }
         div().absolute().left(x).top(y).when(measured.is_none(), |d| d.opacity(0.0)).child(body).into_any_element()
     }
 
@@ -136,7 +203,7 @@ impl AppWindow {
         }
     }
 
-    fn window_press(&mut self, id: &str, at: Point<Pixels>, cx: &mut Context<Self>) {
+    fn window_press(&mut self, id: &str, at: Point<Pixels>, viewport: Size<Pixels>, cx: &mut Context<Self>) {
         // A terminal in the window keeps its presses (selecting text).
         let on_terminal = self.overlays.iter().find(|o| o.id == id).and_then(|o| o.layout.as_ref()).is_some_and(|l| {
             let bounds = self.bounds.borrow();
@@ -146,7 +213,34 @@ impl AppWindow {
             return;
         }
         let Some(b) = self.bounds.borrow().get(&format!("overlay:{id}")).copied() else { return };
-        self.win_drag = Some(WinDrag { id: id.to_owned(), grab: at - b.origin, down: at, pointer: at, moving: false });
+        self.win_drag = Some(WinDrag {
+            id: id.to_owned(),
+            op: WinOp::Move,
+            grab: at - b.origin,
+            down: at,
+            pointer: at,
+            moving: false,
+            start_origin: b.origin,
+            start_size: b.size,
+            viewport,
+        });
+        cx.notify();
+    }
+
+    fn window_resize_press(&mut self, id: &str, op: WinOp, at: Point<Pixels>, viewport: Size<Pixels>, cx: &mut Context<Self>) {
+        let Some(b) = self.bounds.borrow().get(&format!("overlay:{id}")).copied() else { return };
+        self.raise_window(id, cx);
+        self.win_drag = Some(WinDrag {
+            id: id.to_owned(),
+            op,
+            grab: point(px(0.0), px(0.0)),
+            down: at,
+            pointer: at,
+            moving: true,
+            start_origin: b.origin,
+            start_size: b.size,
+            viewport,
+        });
         cx.notify();
     }
 
@@ -159,10 +253,46 @@ impl AppWindow {
         }
         d.pointer = at;
         let dist = f32::from((at.x - d.down.x).abs()).max(f32::from((at.y - d.down.y).abs()));
-        if d.moving || dist >= DRAG_START {
-            d.moving = true;
-            cx.notify();
+        if !d.moving && dist < DRAG_START {
+            return;
         }
+        d.moving = true;
+        if let WinOp::Resize { left, right, bottom } = d.op {
+            let id = d.id.clone();
+            let dx = f32::from(at.x - d.down.x);
+            let dy = f32::from(at.y - d.down.y);
+            let start_w = f32::from(d.start_size.width);
+            let start_h = f32::from(d.start_size.height);
+            let start_x = f32::from(d.start_origin.x);
+            let start_y = f32::from(d.start_origin.y);
+            let max_w = (f32::from(d.viewport.width) - 24.0).max(320.0);
+            let max_h = (f32::from(d.viewport.height) - 24.0).max(240.0);
+            let zoom = f32::from(settings::z(1.0)).max(0.25);
+            if let Some(o) = self.overlays.iter_mut().find(|o| o.id == id) {
+                let min_w = f32::from(settings::z(o.min_size.width)).max(240.0);
+                let min_h = f32::from(settings::z(o.min_size.height)).max(180.0);
+                let mut new_w = start_w;
+                let mut new_h = start_h;
+                let mut new_x = start_x;
+                if right {
+                    new_w = (start_w + dx).clamp(min_w, max_w);
+                }
+                if left {
+                    let clamped_w = (start_w - dx).clamp(min_w, max_w);
+                    new_x = start_x + (start_w - clamped_w);
+                    new_w = clamped_w;
+                }
+                if bottom {
+                    new_h = (start_h + dy).clamp(min_h, max_h);
+                }
+                o.size = size((new_w / zoom).max(o.min_size.width), (new_h / zoom).max(o.min_size.height));
+                o.fit = false;
+                if left || o.place.is_none() {
+                    o.place = Some(point(px(new_x), px(start_y)));
+                }
+            }
+        }
+        cx.notify();
     }
 
     /// Ends a press: a drag leaves the window there (and remembers it under its
@@ -173,11 +303,25 @@ impl AppWindow {
         if !d.moving {
             return false;
         }
-        let at = d.pointer - d.grab;
-        if let Some(o) = self.overlays.iter_mut().find(|o| o.id == d.id) {
-            o.place = Some(at);
-            if let Some(k) = &o.key {
-                remember(k, at);
+        match d.op {
+            WinOp::Move => {
+                let at = d.pointer - d.grab;
+                if let Some(o) = self.overlays.iter_mut().find(|o| o.id == d.id) {
+                    o.place = Some(at);
+                    if let Some(k) = &o.key {
+                        remember(k, at);
+                    }
+                }
+            }
+            WinOp::Resize { .. } => {
+                if let Some(o) = self.overlays.iter().find(|o| o.id == d.id)
+                    && let Some(k) = &o.key
+                {
+                    remember_size(k, o.size);
+                    if let Some(at) = o.place {
+                        remember(k, at);
+                    }
+                }
             }
         }
         true

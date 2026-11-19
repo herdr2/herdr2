@@ -502,23 +502,33 @@ test("tabs and pane headers show agent type (ACP / Terminal) and live/paused exe
 test("panel buttons render files, changes, and checkpoints side-by-side including legacy saved prefs", () => {
   const sharedMap: Record<string, unknown> = {};
   const runCalls: unknown[][] = [];
+  let mockPanes: any[] = [{ pane: "p1", tab: "tab-1", terminal: "wsl/t2t", focused: true }];
+  let mockTerms: any[] = [
+    { address: "wsl/t2t", state: "live", labels: {} },
+    { address: "wsl/a4h", state: "live", parent: "wsl/t2t", lineage: { kind: "side-chat", parent: "wsl/t2t" }, labels: {} },
+  ];
   const makeTabs = (lang = "zh-CN") => {
-    const view = new (new Function(...Object.keys(values), source.replace(/^import .*;\n/gm, "").replace("export default class Tabs", "return class Tabs"))(
-      ...Object.values({
-        ...values,
-        shared: (k: string) => (k in sharedMap ? sharedMap[k] : null),
-        settings: () => ({ zoom: 1, language: lang }),
-        layout: () => ({
-          id: "root",
-          children: [
-            { id: "panel", hidden: false },
-            { id: "panel-body", active: "checkpoints" },
-          ],
-        }),
-        run: (cmd: string, args: unknown) => {
-          runCalls.push([cmd, args]);
-        },
+    const env = {
+      ...values,
+      panes: () => mockPanes,
+      terminals: () => mockTerms,
+      agents: () => [],
+      focused: () => ({ terminal: mockPanes[0]?.terminal ?? null }),
+      shared: (k: string) => (k in sharedMap ? sharedMap[k] : null),
+      settings: () => ({ zoom: 1, language: lang }),
+      layout: () => ({
+        id: "root",
+        children: [
+          { id: "panel", hidden: false },
+          { id: "panel-body", active: "checkpoints" },
+        ],
       }),
+      run: (cmd: string, args: unknown) => {
+        runCalls.push([cmd, args]);
+      },
+    };
+    const view = new (new Function(...Object.keys(env), source.replace(/^import .*;\n/gm, "").replace("export default class Tabs", "return class Tabs"))(
+      ...Object.values(env),
     ))();
     view.init();
     return view;
@@ -542,11 +552,18 @@ test("panel buttons render files, changes, and checkpoints side-by-side includin
     return out;
   };
 
-  // Fresh install (no shared workspace.panels): all 3 panels show side-by-side.
+  // Focused agent wsl/t2t has a live side-chat: all 4 panel tabs show side-by-side.
   const defaultTree = makeTabs("zh-CN").render();
   expect(collectTexts(findById(defaultTree, "panel-files"))).toContain("文件");
   expect(collectTexts(findById(defaultTree, "panel-changes"))).toContain("变更");
   expect(collectTexts(findById(defaultTree, "panel-checkpoints"))).toContain("快照");
+  expect(collectTexts(findById(defaultTree, "panel-side-chat"))).toContain("旁路");
+
+  // Switching focus to an agent without side-chats hides the side-chat panel tab automatically.
+  mockPanes = [{ pane: "p2", tab: "tab-2", terminal: "wsl/t99", focused: true }];
+  const noSideTree = makeTabs("zh-CN").render();
+  expect(findById(noSideTree, "panel-side-chat")).toBeNull();
+  mockPanes = [{ pane: "p1", tab: "tab-1", terminal: "wsl/t2t", focused: true }];
 
   // Legacy saved ["files", "changes"] without workspace.panels_has_checkpoints still reveals Checkpoints.
   sharedMap["workspace.panels"] = ["files", "changes"];
@@ -560,4 +577,100 @@ test("panel buttons render files, changes, and checkpoints side-by-side includin
   expect(findById(disabledTree, "panel-files")).not.toBeNull();
   expect(findById(disabledTree, "panel-changes")).not.toBeNull();
   expect(findById(disabledTree, "panel-checkpoints")).toBeNull();
+});
+
+test("pane header shows agent ID for manual terminal agents and clickable upstream link for handoff agents", async () => {
+  const paneSource = await readFile("defaults/mods/pane/main.js", "utf8");
+  const claude = { key: "claude", name: "Claude", agent: true, shell: false, icon: null, tint: true };
+  const codex = { key: "codex", name: "Codex", agent: true, shell: false, icon: null, tint: true };
+  const shell = { key: "shell", name: "zsh", agent: false, shell: true, icon: null, tint: true };
+  const runCalls: unknown[][] = [];
+  const paneList = [
+    { pane: "p-cli", tab: "tab-1", terminal: "wsl/t2t", title: "Claude", cwd: "/repo", status: "idle", program: claude, structured: false, focused: true },
+    { pane: "p-ho", tab: "tab-2", acp: true, terminal: "wsl/a49", title: "Codex", cwd: "/repo", status: "working", program: codex, focused: false },
+    { pane: "p-sh", tab: "tab-3", terminal: "wsl/t99", title: "zsh", cwd: "/repo", status: null, program: shell, focused: false },
+  ];
+  const termList = [
+    { address: "wsl/t2t", parent: null, state: "live", status: "idle", program: claude, labels: {} },
+    { address: "wsl/a49", acp: true, parent: "wsl/t2t", lineage: { kind: "fork", parent: "wsl/t2t", worktree_path: "/tmp/wt-1" }, state: "live", status: "working", program: codex, labels: {} },
+    { address: "wsl/t99", parent: null, state: "live", status: null, program: shell, labels: {} },
+  ];
+  let activeProp = { pane: "p-cli", terminal: "wsl/t2t" };
+  const paneValues = {
+    View: class {},
+    div: element,
+    svg: element,
+    image: element,
+    h_flex: element,
+    InputState: { new: () => ({ on() {}, value: () => "", set_value() {}, set_selected_range() {}, focus() {} }) },
+    Input: { new: () => element() },
+    panes: () => paneList,
+    terminals: () => termList,
+    props: () => activeProp,
+    run: (cmd: string, args: unknown) => { runCalls.push([cmd, args]); },
+    h2() {},
+    openOverlay() {},
+    theme: () => ({ accent: "#3b82f6", raised: "#222", border: "#333", hover: "#444", foreground: "#fff", muted: "#aaa", dim: "#777", background: "#111" }),
+    home: () => "/home/me",
+    layout: () => null,
+    settings: () => ({ language: "zh-CN" }),
+  };
+  const PaneCtor = new Function(
+    ...Object.keys(paneValues),
+    paneSource.replace(/^import .*;\n/gm, "").replace("export default class Pane", "return class Pane"),
+  )(...Object.values(paneValues));
+  const paneView = new PaneCtor();
+  paneView.init({}, { timer: { every() {} } });
+
+  const findById = (node: any, id: string): any => {
+    if (!node) return null;
+    if (node.calls?.id?.[0] === id) return node;
+    for (const ch of node.nodes ?? []) {
+      const hit = findById(ch, id);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  const collectTexts = (node: any): string[] => {
+    if (!node) return [];
+    const out: string[] = [];
+    for (const ch of node.nodes ?? []) {
+      if (typeof ch === "string") out.push(ch);
+      else out.push(...collectTexts(ch));
+    }
+    return out;
+  };
+
+  // Manual raw-terminal CLI agent displays its own ID badge wsl/t2t.
+  const cliTree = paneView.render({});
+  const cliAddr = findById(cliTree, "ph-addr-p-cli");
+  expect(cliAddr).not.toBeNull();
+  expect(collectTexts(cliAddr)).toContain("wsl/t2t");
+  expect(findById(cliTree, "ph-lin-p-cli")).toBeNull();
+
+  // Handoff/fork ACP agent displays own ID, lineage kind badge, Worktree badge, standalone Side button, and clickable upstream badge.
+  activeProp = { pane: "p-ho", terminal: "wsl/a49" };
+  const hoTree = paneView.render({});
+  expect(collectTexts(findById(hoTree, "ph-addr-p-ho"))).toContain("wsl/a49");
+  expect(collectTexts(findById(hoTree, "ph-kind-p-ho"))).toContain("会话分叉");
+  expect(collectTexts(findById(hoTree, "ph-wt-p-ho"))).toContain("Worktree");
+  const sideBtn = findById(hoTree, "ph-side-p-ho");
+  expect(sideBtn).not.toBeNull();
+  expect(collectTexts(sideBtn)).toContain("旁路");
+  const forkBtn = findById(hoTree, "ph-fork-p-ho");
+  expect(forkBtn).not.toBeNull();
+  expect(collectTexts(forkBtn)).toContain("分叉");
+  const hoBtn = findById(hoTree, "ph-ho-p-ho");
+  expect(hoBtn).not.toBeNull();
+  expect(collectTexts(hoBtn)).toContain("接力");
+  const upstreamBtn = findById(hoTree, "ph-lin-p-ho");
+  expect(upstreamBtn).not.toBeNull();
+  expect(collectTexts(upstreamBtn).join(" ")).toContain("wsl/t2t");
+  upstreamBtn.calls.on_click[0]({}, { stop_propagation() {} });
+  expect(runCalls).toEqual([["agent.focus", { terminal: "wsl/t2t" }]]);
+
+  // Plain shell pane omits ph-addr.
+  activeProp = { pane: "p-sh", terminal: "wsl/t99" };
+  const shTree = paneView.render({});
+  expect(findById(shTree, "ph-addr-p-sh")).toBeNull();
 });

@@ -1481,7 +1481,7 @@ fn acp_peek_renders_t3_conversation_and_permission_card(cx: &mut TestAppContext)
     assert!(tree.contains("from Build"), "parent badge missing: {tree}");
     assert!(tree.contains("1 tool call · 1 thought · 1 plan"), "activity group summary missing: {tree}");
     assert!(tree.contains("copy-as-4-code-1"), "code card copy button missing: {tree}");
-    assert!(tree.contains("Diagnostic stderr (1 line)"), "stderr drawer missing: {tree}");
+    assert!(!tree.contains("Diagnostic stderr"), "noisy stderr diagnostic drawer should be hidden: {tree}");
     assert!(tree.contains("Sandbox warning"), "error card missing: {tree}");
     assert!(tree.contains("Run cargo test"), "permission card title missing: {tree}");
     assert!(tree.contains("perm-opt-0"), "permission approve option missing: {tree}");
@@ -3011,4 +3011,78 @@ export default class SwitchTest extends Real {
     switch_visual.update(|window, _| window.remove_window());
     gpui_shell::policy::set_default(Policy::new());
     cx.run_until_parked();
+}
+
+#[gpui::test]
+fn side_panel_multiple_side_chats_and_handoff_dialog_render_cleanly(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let claude = json!({"key":"claude", "name":"Claude Code", "icon":null, "tint":false, "tile":"#1c1d21", "color":"#ffffff", "shell":false, "agent":true});
+    let codex = json!({"key":"codex", "name":"Codex", "icon":null, "tint":false, "tile":"#1c1d21", "color":"#ffffff", "shell":false, "agent":true});
+    let mut values = fixture(true, json!({"sidePanel": true}), updates("current", "current"));
+    values.insert("checking".into(), json!(true));
+    values.insert("shared".into(), json!({"side-chat.active": "wsl/a4j"}));
+    values.insert("terminals".into(), json!([
+        {"address":"wsl/t2t","parent":null,"state":"live","status":"idle","program":claude,"cwd":"/tmp/test","labels":{}},
+        {"address":"wsl/a4h","acp":true,"agent":"claude","parent":"wsl/t2t","lineage":{"kind":"side-chat","parent":"wsl/t2t"},"state":"live","status":"idle","turn":1,"program":claude,"cwd":"/tmp/test","labels":{}},
+        {"address":"wsl/a4j","acp":true,"agent":"codex","parent":"wsl/t2t","lineage":{"kind":"side-chat","parent":"wsl/t2t"},"state":"live","status":"idle","turn":1,"program":codex,"cwd":"/tmp/test","labels":{}}
+    ]));
+    values.insert("panes".into(), json!([
+        {"pane":"p1","tab":"tab1","terminal":"wsl/t2t","title":"Claude","status":"idle","program":claude,"focused":true}
+    ]));
+    values.insert("agents".into(), json!([
+        {"address":"wsl/t2t","pane":"p1","space":"s1","space_name":"Local","tab":"tab1","tab_index":1,"tab_name":"Claude","status":"idle","program":claude,"title":"Claude","seq":1,"focused":true}
+    ]));
+
+    // Render side-chat panel with 2 live side-chats, expanded handoff context card, AND a completed user+assistant turn.
+    let tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/peek",
+        values.clone(),
+        Some("this.loadedTerminal = 'wsl/a4j'; this.expandedGroups['ho-exp-ho-0'] = true; this.entries = [{kind:'handoff',turn:0,handoff_kind:'side-chat',from_address:'wsl/t2t',from_provider:'claude',from_turns:'1-3',context_markdown:'# Context\\nTurn 1'},{kind:'user',turn:1,text:'check?'},{kind:'assistant',turn:1,text:'all good'}]; this.loadedOnce = true;"),
+    ).unwrap();
+    assert!(tree.contains("side-chat-switcher"), "expected side-chat switcher with 2 side-chats: {tree}");
+    assert!(tree.contains("side-sw-wsl/a4h"), "expected first side-chat pill: {tree}");
+    assert!(tree.contains("side-sw-wsl/a4j"), "expected second side-chat pill: {tree}");
+    assert!(tree.contains("acp-ho-toggle-ho-0"), "expected expandable handoff context card: {tree}");
+    assert!(tree.contains("acp-ho-md-ho-0"), "expected expanded handoff markdown view: {tree}");
+    assert!(!tree.contains("acp-side-new"), "top + New button must be removed from side-chat header: {tree}");
+    assert!(!tree.contains("acp-fork-turn-"), "side-chat must not expose assistant fork button: {tree}");
+    assert!(!tree.contains("acp-fork-from-"), "side-chat must not expose user fork button: {tree}");
+
+    // Render CLI side-chat terminal header AND CLI side-chat structured chat view toggle buttons.
+    let mut cli_values = values.clone();
+    cli_values.insert("shared".into(), json!({"side-chat.active": "wsl/t30"}));
+    cli_values.insert("terminals".into(), json!([
+        {"address":"wsl/t2t","parent":null,"state":"live","status":"idle","program":claude,"cwd":"/tmp/test","labels":{}},
+        {"address":"wsl/a4h","acp":true,"agent":"claude","parent":"wsl/t2t","lineage":{"kind":"side-chat","parent":"wsl/t2t"},"state":"live","status":"idle","turn":1,"program":claude,"cwd":"/tmp/test","labels":{}},
+        {"address":"wsl/t30","acp":false,"parent":"wsl/t2t","lineage":{"kind":"side-chat","parent":"wsl/t2t"},"state":"live","status":"idle","program":codex,"cwd":"/tmp/test","labels":{}}
+    ]));
+    let mut cli_hdr_values = cli_values.clone();
+    cli_hdr_values.insert("props".into(), json!({"sidePanel": true, "sideTermHeader": true}));
+    let cli_hdr_tree = describe_with_values(cx, &staged, "mods/peek", cli_hdr_values, None).unwrap();
+    assert!(cli_hdr_tree.contains("side-term-header"), "CLI side-chat terminal mode should render compact header: {cli_hdr_tree}");
+    assert!(cli_hdr_tree.contains("side-to-chat"), "CLI side-chat terminal mode should expose switch-to-chat button: {cli_hdr_tree}");
+    assert!(cli_hdr_tree.contains("side-chat-switcher"), "CLI side-chat terminal header should include multi-side switcher: {cli_hdr_tree}");
+    assert!(!cli_hdr_tree.contains("acp-side-new"), "CLI side-chat terminal header must not have + New button: {cli_hdr_tree}");
+
+    let cli_chat_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/peek",
+        cli_values,
+        Some("this.loadedTerminal = 'wsl/t30'; this.entries = [{kind:'user',turn:1,text:'hi'},{kind:'assistant',turn:1,text:'yo'}]; this.loadedOnce = true;"),
+    ).unwrap();
+    assert!(cli_chat_tree.contains("side-to-term"), "CLI side-chat chat view should expose switch-back-to-terminal button: {cli_chat_tree}");
+    assert!(!cli_chat_tree.contains("acp-side-new"), "CLI side-chat chat view must not have + New button: {cli_chat_tree}");
+    assert!(!cli_chat_tree.contains("acp-fork-turn-"), "CLI side-chat chat view must not expose fork button: {cli_chat_tree}");
+
+    // Render handoff dialog in side-chat mode and verify both ACP and CLI runtime chips exist and Merge Back tab is absent.
+    let mut ho_values = values;
+    ho_values.insert("props".into(), json!({"overlay":"handoff","source":"wsl/t2t","kind":"side-chat"}));
+    let ho_tree = describe_with_values(cx, &staged, "mods/handoff", ho_values, None).unwrap();
+    assert!(ho_tree.contains("ho-rt-acp"), "expected ACP option in side-chat dialog: {ho_tree}");
+    assert!(ho_tree.contains("ho-rt-pty"), "expected CLI Terminal option in side-chat dialog: {ho_tree}");
+    assert!(!ho_tree.contains("ho-mode-merge-back"), "merge-back tab must not appear in creation dialog: {ho_tree}");
 }

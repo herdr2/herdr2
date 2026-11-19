@@ -1176,6 +1176,40 @@ fn resolve_rollback_transcript_turn(checkpoints: &[crate::checkpoint::Checkpoint
     if ordinal > 0 { ordinal } else { to_turn }
 }
 
+/// Returns true for Codex CLI's internal background helper LLM calls (such as automatic
+/// single-line thread-title generation) that also trigger `codex-notify` hooks.
+fn is_codex_internal_helper_prompt(prompt: &str) -> bool {
+    let lower = prompt.trim_start().to_ascii_lowercase();
+    lower.starts_with("generate a concise, single-line task title")
+        || (lower.starts_with("generate a ")
+            && lower.contains("title")
+            && lower.contains("do not answer the request"))
+        || (lower.contains("do not answer the request.") && lower.contains("\nuser prompt:\n"))
+}
+
+/// Returns true when `checkpoints` already contains an automatic turn snapshot for `session_turn`,
+/// preventing duplicate snapshots when both a CLI hook (`codex-notify`) and OSC `turn_ended` fire
+/// for the same turn, or when `codex resume` / `claude -c` pulses `working -> idle` on load.
+fn has_captured_session_turn(
+    checkpoints: &[crate::checkpoint::CheckpointMeta],
+    session_turn: Option<u64>,
+    prompt: Option<&str>,
+) -> bool {
+    let Some(sturn) = session_turn.filter(|&n| n > 0) else {
+        return false;
+    };
+    checkpoints.iter().any(|c| {
+        if c.turn == 0 || c.label.is_some() {
+            return false;
+        }
+        if c.session_turn == Some(sturn) {
+            return true;
+        }
+        c.session_turn.is_none()
+            && prompt.is_some_and(|p| !p.is_empty() && c.prompt.as_deref() == Some(p))
+    })
+}
+
 /// Processes a synchronous CLI hook invocation (`claude`, `codex-notify`, `agy`) and returns JSON output for stdout.
 pub async fn handle_checkpoint_hook(
     core: &Arc<Core>,
@@ -1291,6 +1325,14 @@ pub async fn handle_checkpoint_hook(
             json!({})
         }
         "codex-notify" => {
+            let input_msgs = payload.get("input-messages").and_then(Value::as_array);
+            if input_msgs.is_some_and(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .any(is_codex_internal_helper_prompt)
+            }) {
+                return json!({});
+            }
             let sid = payload
                 .get("thread-id")
                 .or_else(|| payload.get("session-id"))
@@ -1298,9 +1340,7 @@ pub async fn handle_checkpoint_hook(
                 .or_else(|| payload.get("conversation-id"))
                 .and_then(Value::as_str)
                 .map(str::to_string);
-            let turn_prompt = payload
-                .get("input-messages")
-                .and_then(Value::as_array)
+            let turn_prompt = input_msgs
                 .and_then(|arr| arr.last())
                 .and_then(Value::as_str)
                 .map(strip_h2_envelope)
@@ -1310,6 +1350,12 @@ pub async fn handle_checkpoint_hook(
                 let mut st = core.lock();
                 reset_if_new_cli_session(core, &mut st, id, &addr, &cwd, "codex", sid.as_deref());
                 let fg_pid = terminal_cli_fg_pid(&st, id);
+                let (started_ms, resumed) = st
+                    .pty_reg
+                    .terminals
+                    .get(&id)
+                    .map(|t| (t.program_started_ms.unwrap_or(0), terminal_active_resume_argv(t).is_some()))
+                    .unwrap_or((0, false));
                 let mut tc = core.target_checkpoints(&mut st, &addr);
                 tc.cli_kind = Some("codex".into());
                 if let Some(pid) = fg_pid {
@@ -1324,7 +1370,13 @@ pub async fn handle_checkpoint_hook(
                     }
                 }
                 if tc.cli_transcript_path.is_none()
-                    && let Some(found) = discover_cli_transcript("codex", &cwd, 0, None, true)
+                    && let Some(found) = discover_cli_transcript(
+                        "codex",
+                        &cwd,
+                        if resumed { 0 } else { started_ms },
+                        if resumed { None } else { fg_pid },
+                        resumed,
+                    )
                 {
                     tc.cli_transcript_path = Some(found.to_string_lossy().to_string());
                 }
@@ -1352,17 +1404,25 @@ pub async fn handle_checkpoint_hook(
                     .unwrap_or((None, None)),
                 None => (None, None),
             };
-            let _ = capture_target_checkpoint_with_session_turn(
-                core,
-                TargetKey::Terminal(id),
-                Some(turn_num),
-                session_turn,
-                effective_prompt.or(parsed_prompt),
-                None,
-                true,
-                false,
-            )
-            .await;
+            let final_prompt = effective_prompt.or(parsed_prompt);
+            let already_captured = {
+                let mut st = core.lock();
+                let tc = core.target_checkpoints(&mut st, &addr);
+                has_captured_session_turn(&tc.checkpoints, session_turn, final_prompt.as_deref())
+            };
+            if !already_captured {
+                let _ = capture_target_checkpoint_with_session_turn(
+                    core,
+                    TargetKey::Terminal(id),
+                    Some(turn_num),
+                    session_turn,
+                    final_prompt,
+                    None,
+                    true,
+                    false,
+                )
+                .await;
+            }
             json!({})
         }
         "agy" => {
@@ -1750,6 +1810,7 @@ pub async fn process_pty_checkpoint_job(
         .await
         .ok();
         if let Some((found_path, parsed_sturn, parsed_prompt)) = res {
+            let had_transcript = found_path.is_some();
             if let Some(p) = found_path {
                 let p_str = p.to_string_lossy().to_string();
                 let mut st = core.lock();
@@ -1773,6 +1834,21 @@ pub async fn process_pty_checkpoint_job(
             if prompt.is_none() {
                 prompt = parsed_prompt;
             }
+            // Ignore spurious startup `working -> idle` OSC transitions when the discovered CLI
+            // transcript still has zero user turns.
+            if had_transcript && session_turn.is_none() && prompt.is_none() {
+                return;
+            }
+        }
+        // Skip duplicate fallback capture when a hook (`codex-notify`, `claude` Stop) or prior
+        // session turn already recorded this exact `session_turn` (e.g. `codex resume` startup pulse).
+        let already_captured = {
+            let mut st = core.lock();
+            let tc = core.target_checkpoints(&mut st, &addr);
+            has_captured_session_turn(&tc.checkpoints, session_turn, prompt.as_deref())
+        };
+        if already_captured {
+            return;
         }
     }
 
@@ -2156,6 +2232,7 @@ pub async fn rollback_pty_terminal(
         screen.set_xtversion(&identity);
         st.screens.insert(id, screen);
         st.relays.remove(&id);
+        st.pty_prompts.remove(&id);
         core.output(&mut st, id, b"\x1bc");
 
         let mut tc = core.target_checkpoints(&mut st, &addr);
@@ -2177,6 +2254,8 @@ pub async fn rollback_pty_terminal(
         if let Some(t) = st.pty_reg.terminals.get_mut(&id) {
             t.holder = Some(target_instance);
             t.argv = new_argv.clone();
+            t.cwd = orig_cwd.clone();
+            t.last_cwd = Some(orig_cwd.clone());
             t.scope = Some(scope);
             t.foreground = None;
             t.restart_after_ms = 0;
@@ -2627,5 +2706,91 @@ mod tests {
         assert_eq!(resolve_rollback_transcript_turn(&offset_ckpts, 5), 1);
         assert_eq!(resolve_rollback_transcript_turn(&offset_ckpts, 6), 2);
         assert_eq!(resolve_rollback_transcript_turn(&offset_ckpts, 8), 3);
+    }
+
+    #[test]
+    fn codex_internal_title_helper_prompt_is_ignored_by_checkpoint_hook() {
+        let helper = "Generate a concise, single-line task title of at most 36 characters and under five words where possible. Start with an imperative verb. Do not answer the request.\n\nUser prompt:\n[Handoff from t2t] Read the full context handoff";
+        assert!(is_codex_internal_helper_prompt(helper));
+        assert!(!is_codex_internal_helper_prompt("[Handoff from t2t] Read the full context handoff"));
+        assert!(!is_codex_internal_helper_prompt("Generate a title bar component for the app"));
+
+        let root = crate::test_tmp().join(format!("h2-codex-helper-{}-{}", std::process::id(), crate::platform::random_hex()));
+        let paths = crate::paths::Paths {
+            socket: root.join("core.sock"),
+            holder_socket: root.join("holder.sock"),
+            state: root.clone(),
+            config: root.join("config.toml"),
+        };
+        paths.create_dirs().unwrap();
+        let core = Arc::new(
+            Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap(),
+        );
+        let id = {
+            let mut st = core.lock();
+            st.pty_reg
+                .create(
+                    crate::terminals::NewTerminal {
+                        argv: vec!["codex".into()],
+                        cwd: root.to_string_lossy().to_string(),
+                        cols: 80,
+                        rows: 24,
+                        ..Default::default()
+                    },
+                    1,
+                )
+                .unwrap()
+        };
+        let addr = crate::terminals::address(id);
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(handle_checkpoint_hook(
+            &core,
+            id,
+            "codex-notify",
+            None,
+            None,
+            &json!({
+                "type": "agent-turn-complete",
+                "thread-id": "codex-title-helper-thread",
+                "input-messages": [helper]
+            }),
+        ));
+        {
+            let mut st = core.lock();
+            let tc = core.target_checkpoints(&mut st, &addr);
+            assert!(tc.checkpoints.is_empty(), "internal title helper must not capture a checkpoint");
+            assert!(tc.cli_session_id.is_none(), "internal title helper must not bind session_id");
+        }
+        // Duplicate session_turn deduplication prevents codex-notify + OSC turn_ended double snapshots.
+        let existing = vec![
+            crate::checkpoint::CheckpointMeta {
+                turn: 0,
+                session_turn: None,
+                ref_name: "refs/herdr2/checkpoints/default/t1/0".into(),
+                commit_oid: "aaa".into(),
+                head_oid: None,
+                prompt: None,
+                label: None,
+                files: vec![],
+                ts_ms: 1,
+            },
+            crate::checkpoint::CheckpointMeta {
+                turn: 1,
+                session_turn: Some(1),
+                ref_name: "refs/herdr2/checkpoints/default/t1/1".into(),
+                commit_oid: "bbb".into(),
+                head_oid: None,
+                prompt: Some("[Handoff from t2t] continue".into()),
+                label: None,
+                files: vec![],
+                ts_ms: 2,
+            },
+        ];
+        assert!(has_captured_session_turn(&existing, Some(1), Some("[Handoff from t2t] continue")));
+        assert!(!has_captured_session_turn(&existing, Some(2), Some("next question")));
+        assert!(!has_captured_session_turn(&existing, None, Some("anything")));
+
+        drop(core);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

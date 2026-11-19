@@ -162,6 +162,65 @@ export default class TerminalsPane extends View {
           .text_color("#a9adb3")
           .child(tr("CLI", "终端")),
       ))
+      .when((isAgent || isStructured) && Boolean(p.terminal), (el) =>
+        el.child(
+          div()
+            .id(`tm-addr-${pane}`)
+            .flex_none()
+            .px(5)
+            .py(1)
+            .rounded(4)
+            .bg("#252628")
+            .border_1()
+            .border_color("#383b40")
+            .text_size(11)
+            .text_color("#a9adb3")
+            .tooltip(tr(`Agent ID: ${p.terminal}`, `智能体编号：${p.terminal}`))
+            .child(p.terminal),
+        ),
+      )
+      .when(Boolean(term?.lineage?.kind), (el) => {
+        const k = String(term.lineage.kind).toLowerCase();
+        const label = k === "fork" ? tr("Fork", "会话分叉") : (k === "side-chat" || k === "side_chat") ? tr("Side Chat", "旁路讨论") : tr("Handoff", "上下文接力");
+        const color = k === "fork" ? "#a855f7" : (k === "side-chat" || k === "side_chat") ? "#14b8a6" : "#3b82f6";
+        return el.child(
+          div()
+            .id(`tm-kind-${pane}`)
+            .flex_none()
+            .px(5)
+            .h(18)
+            .flex()
+            .items_center()
+            .rounded(4)
+            .bg(alpha(color, "22") ?? "#252628")
+            .border_1()
+            .border_color(alpha(color, "66") ?? "#383b40")
+            .text_size(10)
+            .font_semibold()
+            .text_color(color)
+            .child(label),
+        );
+      })
+      .when(Boolean(term?.lineage?.worktree_path), (el) =>
+        el.child(
+          div()
+            .id(`tm-wt-${pane}`)
+            .flex_none()
+            .px(5)
+            .h(18)
+            .flex()
+            .items_center()
+            .rounded(4)
+            .bg(alpha("#f59e0b", "22") ?? "#252628")
+            .border_1()
+            .border_color(alpha("#f59e0b", "66") ?? "#383b40")
+            .text_size(10)
+            .font_semibold()
+            .text_color("#f59e0b")
+            .tooltip(tr(`Isolated Git Worktree: ${term.lineage.worktree_path}`, `独立 Git Worktree：${term.lineage.worktree_path}`))
+            .child("Worktree"),
+        ),
+      )
       .when(Boolean(lineageParent), (el) =>
         el.child(
           div()
@@ -218,6 +277,62 @@ export default class TerminalsPane extends View {
       .when(showHandoffBtns, (el) =>
         el.child(
           h_flex()
+            .id(`tm-side-${pane}`)
+            .flex_none()
+            .h(20)
+            .px(6)
+            .gap(4)
+            .items_center()
+            .rounded(5)
+            .bg("#252628")
+            .border_1()
+            .border_color("#383b40")
+            .text_size(11)
+            .font_medium()
+            .text_color("#c4c7cc")
+            .cursor_pointer()
+            .hover((s) => s.bg("#303338").text_color("#ffffff"))
+            .tooltip(tr("Open Side Chat in right panel", "在右侧面板打开旁路讨论"))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              run("agent.handoff", { source: p.terminal, kind: "side-chat" });
+            })
+            .child(svg("mods/peek/messages-square.svg").size(11).flex_none())
+            .child(tr("Side", "旁路")),
+        ),
+      )
+      .when(showHandoffBtns && String(term?.lineage?.kind || "").toLowerCase().replace("_", "-") !== "side-chat", (el) =>
+        el.child(
+          h_flex()
+            .id(`tm-fork-${pane}`)
+            .flex_none()
+            .h(20)
+            .px(6)
+            .gap(4)
+            .items_center()
+            .rounded(5)
+            .bg("#252628")
+            .border_1()
+            .border_color("#383b40")
+            .text_size(11)
+            .font_medium()
+            .text_color("#c4c7cc")
+            .cursor_pointer()
+            .hover((s) => s.bg("#303338").text_color("#ffffff"))
+            .tooltip(tr("Fork Session (optional Worktree isolation)", "会话分叉（可选 Worktree 隔离）"))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              run("agent.handoff", { source: p.terminal, kind: "fork" });
+            })
+            .child(svg("mods/workspace-chrome/git-branch.svg").size(11).flex_none())
+            .child(tr("Fork", "分叉")),
+        ),
+      )
+      .when(showHandoffBtns, (el) =>
+        el.child(
+          h_flex()
             .id(`tm-ho-${pane}`)
             .flex_none()
             .h(20)
@@ -233,13 +348,13 @@ export default class TerminalsPane extends View {
             .text_color("#c4c7cc")
             .cursor_pointer()
             .hover((s) => s.bg("#303338").text_color("#ffffff"))
-            .tooltip(tr("Context handoff / Fork / Side Chat", "上下文接力 / 分支探索 / 旁路讨论"))
+            .tooltip(tr("Context Handoff", "上下文接力"))
             .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
             .on_click((_e, cx) => {
               cx.stop_propagation();
               run("agent.handoff", { source: p.terminal, kind: "handoff" });
             })
-            .child(svg("mods/workspace-chrome/git-branch.svg").size(11).flex_none())
+            .child(svg("mods/peek/corner-up-right.svg").size(11).flex_none())
             .child(tr("Handoff", "接力")),
         ),
       )
@@ -265,6 +380,6 @@ export default class TerminalsPane extends View {
       .child(this.button(`th-d-${pane}`, "split-down", "pane.split", { direction: "down", pane }, tr("Split down", "向下分栏")))
       .when(tabPaneCount > 1, (el) => el.child(this.button(`th-z-${pane}`, "zoom", "pane.detach", { pane }, tr("Maximize to new tab", "最大化为独立标签页"))))
       .when(Boolean(p.terminal), (el) => el.child(this.button(`th-trash-${pane}`, "trash", "agent.trash", { terminal: p.terminal }, tr("Move to recycle bin", "移入回收站"), true)))
-      .child(this.button(`th-x-${pane}`, "close", "pane.close", { pane }, tr("Close pane", "关闭窗格")));
+      .child(this.button(`th-x-${pane}`, "close", "pane.close", { pane }, isAgent ? tr("Close pane (keep agent in background)", "关闭窗格（Agent 保留在后台）") : tr("Close pane", "关闭窗格")));
   }
 }

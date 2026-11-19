@@ -435,7 +435,7 @@ async fn agent_rm(core: Ctx<'_>, p: AgentParams) -> Result<RemoveResult, RpcErro
             terminal_rm(core, TerminalParams { terminal: crate::terminals::address(id), caller: p.caller }).await
         }
         TargetKey::Agent(id) => {
-            {
+            let cleanup_wt: Option<(String, String, Option<String>)> = {
                 let mut st = core.lock();
                 if st.reg.agents.get(&id).is_some_and(|a| a.is_live()) {
                     return Err(RpcError::new(
@@ -444,7 +444,26 @@ async fn agent_rm(core: Ctx<'_>, p: AgentParams) -> Result<RemoveResult, RpcErro
                         format!("kill it first: h2 kill {}", crate::agents::address(id)),
                     ));
                 }
+                let wt = st.reg.agents.get(&id).and_then(|a| {
+                    let lin = a.lineage.as_ref()?;
+                    Some((
+                        lin.worktree_origin.clone()?,
+                        lin.worktree_path.clone()?,
+                        lin.worktree_branch.clone(),
+                    ))
+                });
                 core.remove(&mut st, id);
+                wt
+            };
+            if let Some((origin, wt_path, wt_branch)) = cleanup_wt {
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::drove::integrate::cleanup_fork_worktree(
+                        &origin,
+                        std::path::Path::new(&wt_path),
+                        wt_branch.as_deref(),
+                    );
+                })
+                .await;
             }
             core.flush_saved().await?;
             Ok(RemoveResult { removed: crate::agents::address(id) })
@@ -515,11 +534,15 @@ async fn agent_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError
                 let _ = watched(core, p.caller.clone(), TargetKey::Terminal(id), spec).await;
             }
             let snap = ((!p.last && p.lines.is_none()) || range_requested).then(|| {
-                let st = core.lock();
-                st.pty_reg
+                let mut st = core.lock();
+                let mut snap = st
+                    .pty_reg
                     .terminals
                     .get(&id)
-                    .map(|t| crate::pty_transcript::snapshot_from_terminal(t, st.pty_prompts.get(&id)))
+                    .map(|t| crate::pty_transcript::snapshot_from_terminal(t, st.pty_prompts.get(&id)))?;
+                let addr = crate::terminals::address(id);
+                crate::pty_transcript::populate_session_affinity(&mut snap, &addr, core, &mut st);
+                Some(snap)
             }).flatten();
             let (entries, session_meta) = if let Some(snap) = snap {
                 blocking(move || Ok(crate::pty_transcript::extract_transcript(&snap))).await?

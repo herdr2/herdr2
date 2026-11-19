@@ -175,8 +175,9 @@ export default class Settings extends View {
     this.droveMagpieResult = null;
     this.droveKeyDirty = false;
     this.droveShowAddRole = false;
-    this.droveAiConfigMode = null; // null | "models" | "strengths"
+    this.droveAiConfigMode = null; // null | "all" | "models" | "strengths"
     this.droveAiConfiguring = false;
+    this.droveAiRunningMode = null; // null | "all" | "models" | "strengths"
     this.droveAiConfigResult = null;
     this.droveRolesBackup = null;
     this.droveAiPromptFocused = false;
@@ -1144,11 +1145,12 @@ export default class Settings extends View {
 
   aiConfigureDroveRoles(mode, cx) {
     if (this.droveAiConfiguring) return;
-    const effMode = mode === "strengths" ? "strengths" : "models";
+    const effMode = mode === "strengths" ? "strengths" : mode === "all" ? "all" : "models";
     const prevRoles = this.droveData?.config?.roles
       ? JSON.parse(JSON.stringify(this.droveData.config.roles))
       : null;
     this.droveAiConfiguring = true;
+    this.droveAiRunningMode = effMode;
     this.droveAiConfigResult = null;
     this.droveError = null;
     cx.notify();
@@ -1179,6 +1181,7 @@ export default class Settings extends View {
         this.droveAiConfigResult = { ok: false, mode: effMode, error: String(e?.message ?? e) };
       } finally {
         this.droveAiConfiguring = false;
+        this.droveAiRunningMode = null;
         cx.notify();
       }
     });
@@ -2706,7 +2709,56 @@ export default class Settings extends View {
                   .flex_wrap()
                   .child(
                     (() => {
+                      const active = this.droveAiConfigMode === "all";
+                      const runningAll = this.droveAiConfiguring && this.droveAiRunningMode === "all";
+                      return h_flex()
+                        .id("st-dr-ai-all-btn")
+                        .px(10)
+                        .py(5)
+                        .gap(5)
+                        .rounded(6)
+                        .border_1()
+                        .border_color(active ? t.accent : t.border)
+                        .bg(active ? t.accent : t.raised)
+                        .items_center()
+                        .cursor_pointer()
+                        .text_size(12)
+                        .font_semibold()
+                        .text_color(active ? t.accent_foreground : t.foreground)
+                        .when(!active, (el) => el.hover((s) => s.bg(t.hover)))
+                        .tooltip(
+                          this.tr(
+                            "One-click AI auto-configure: enter optional preferences and configure both Role Agents/Models and Candidate Strengths together (auto-probes agents if not cached)",
+                            "一键调用智能辅助模型，同时自动配置所有角色的模型与擅长任务（支持输入自然语言需求，未缓存模型将先自动检测刷新）",
+                          ),
+                        )
+                        .on_click((_e, cx) => {
+                          this.droveAiConfigMode = active ? null : "all";
+                          if (this.droveAiConfigMode) {
+                            this.droveShowAddRole = false;
+                            this.droveAiRolePromptInput.focus();
+                          }
+                          cx.notify();
+                        })
+                        .when(runningAll, (el) =>
+                          el.child(
+                            svg("mods/workspace-chrome/spinner.svg")
+                              .size(12)
+                              .text_color(active ? t.accent_foreground : t.foreground)
+                              .spin(900),
+                          ),
+                        )
+                        .child(
+                          runningAll
+                            ? this.tr("Auto-configuring…", "一键配置中…")
+                            : this.tr("⚡ AI One-Click", "⚡ AI 一键配置"),
+                        );
+                    })(),
+                  )
+                  .child(
+                    (() => {
                       const active = this.droveAiConfigMode === "models";
+                      const runningModels = this.droveAiConfiguring && this.droveAiRunningMode === "models";
                       return div()
                         .id("st-dr-ai-models-btn")
                         .px(10)
@@ -2728,12 +2780,13 @@ export default class Settings extends View {
                           }
                           cx.notify();
                         })
-                        .child(this.droveAiConfiguring && active ? this.tr("✨ Configuring…", "✨ 配模型中…") : this.tr("✨ AI Models", "✨ AI 配模型"));
+                        .child(runningModels ? this.tr("✨ Configuring…", "✨ 配模型中…") : this.tr("✨ AI Models", "✨ AI 配模型"));
                     })(),
                   )
                   .child(
                     (() => {
                       const active = this.droveAiConfigMode === "strengths";
+                      const runningStrengths = this.droveAiConfiguring && this.droveAiRunningMode === "strengths";
                       return div()
                         .id("st-dr-ai-strengths-btn")
                         .px(10)
@@ -2755,7 +2808,7 @@ export default class Settings extends View {
                           }
                           cx.notify();
                         })
-                        .child(this.droveAiConfiguring && active ? this.tr("✨ Configuring…", "✨ 配任务中…") : this.tr("✨ AI Strengths", "✨ AI 配擅长任务"));
+                        .child(runningStrengths ? this.tr("✨ Configuring…", "✨ 配任务中…") : this.tr("✨ AI Strengths", "✨ AI 配擅长任务"));
                     })(),
                   )
                   .when(Boolean(this.droveRolesBackup), (row) =>
@@ -2789,19 +2842,25 @@ export default class Settings extends View {
           )
           .when(Boolean(this.droveAiConfigMode), (el) => {
             const mode = this.droveAiConfigMode;
+            const isAllMode = mode === "all";
             const isStrengthsMode = mode === "strengths";
             const aiReady = Boolean((this.droveUrlInput.value().trim() || cfg.ai?.baseUrl?.trim()));
             const activeAiModelLabel = currentAiModel || aiStatus.model || aiModels[0] || this.tr("Auto-detect from endpoint", "自动从服务端获取");
             const hasCache = this.hasCachedAgentModels();
-            const promptPlaceholder = isStrengthsMode
+            const promptPlaceholder = isAllMode
               ? this.tr(
-                  "Optional instructions (e.g. Claude Opus for complex architecture & backend, Gemini for frontend UI, Codex for quick bugfixes & algorithms)…",
-                  "可选要求（例如：Claude Opus 专注复杂架构与后端重构，Gemini 专注前端 UI 与样式，Codex 专注快速修复与算法，使用简洁中文标签）…",
+                  "Optional instructions (e.g. coder primary Claude Opus for complex architecture & backend, Gemini for frontend UI, Codex for quick bugfixes; use a different provider for reviewer)…",
+                  "可选要求（例如：程序员主力用 Claude Opus 负责复杂架构与后端，备选 Gemini 负责前端 UI、Codex 负责快速修复；审查员使用异构厂商模型；擅长任务用简洁中文标签）…",
                 )
-              : this.tr(
-                  "Optional instructions (e.g. coder primary Claude + Codex fallback, reviewer use a different provider from coder, keep token costs low)…",
-                  "可选要求（例如：程序员主力用 Claude Opus、备选用 Codex 和 Gemini；审查员使用不同厂商模型做异构审查；优先控制额度消耗）…",
-                );
+              : isStrengthsMode
+                ? this.tr(
+                    "Optional instructions (e.g. Claude Opus for complex architecture & backend, Gemini for frontend UI, Codex for quick bugfixes & algorithms)…",
+                    "可选要求（例如：Claude Opus 专注复杂架构与后端重构，Gemini 专注前端 UI 与样式，Codex 专注快速修复与算法，使用简洁中文标签）…",
+                  )
+                : this.tr(
+                    "Optional instructions (e.g. coder primary Claude + Codex fallback, reviewer use a different provider from coder, keep token costs low)…",
+                    "可选要求（例如：程序员主力用 Claude Opus、备选用 Codex 和 Gemini；审查员使用不同厂商模型做异构审查；优先控制额度消耗）…",
+                  );
             return el.child(
               v_flex()
                 .id("st-dr-ai-roles-panel")
@@ -2823,9 +2882,11 @@ export default class Settings extends View {
                         .font_semibold()
                         .text_color(t.foreground)
                         .child(
-                          isStrengthsMode
-                            ? this.tr("AI Configure Candidate Strengths (keeps current Agents & Models)", "AI 配置各候选擅长任务（保持现有 Agent 与模型不变）")
-                            : this.tr("AI Configure Role Agents & Models", "AI 配置各角色的 Agent 与模型"),
+                          isAllMode
+                            ? this.tr("AI One-Click Configure Role Models & Candidate Strengths", "AI 一键配置各角色的模型与擅长任务")
+                            : isStrengthsMode
+                              ? this.tr("AI Configure Candidate Strengths (keeps current Agents & Models)", "AI 配置各候选擅长任务（保持现有 Agent 与模型不变）")
+                              : this.tr("AI Configure Role Agents & Models", "AI 配置各角色的 Agent 与模型"),
                         ),
                     )
                     .child(
@@ -2905,7 +2966,11 @@ export default class Settings extends View {
                             .child(
                               this.droveAiConfiguring
                                 ? this.tr("Generating…", "生成中…")
-                                : (isStrengthsMode ? this.tr("✨ Generate Strengths", "✨ 生成并应用擅长任务") : this.tr("✨ Generate Models", "✨ 生成并应用模型")),
+                                : isAllMode
+                                  ? this.tr("⚡ Generate & Apply All", "⚡ 一键生成并应用")
+                                  : isStrengthsMode
+                                    ? this.tr("✨ Generate Strengths", "✨ 生成并应用擅长任务")
+                                    : this.tr("✨ Generate Models", "✨ 生成并应用模型"),
                             ),
                         )
                         .child(
@@ -2922,7 +2987,12 @@ export default class Settings extends View {
             const res = this.droveAiConfigResult;
             const ok = Boolean(res?.ok);
             const restored = Boolean(res?.restored);
-            const modeLabel = res?.mode === "strengths" ? this.tr("candidate strengths", "擅长任务") : this.tr("role agents & models", "角色与模型");
+            const modeLabel =
+              res?.mode === "all"
+                ? this.tr("role models & strengths", "角色模型与擅长任务")
+                : res?.mode === "strengths"
+                  ? this.tr("candidate strengths", "擅长任务")
+                  : this.tr("role agents & models", "角色与模型");
             const refreshNote = res?.probedRefreshed ? this.tr(" · refreshed agents", " · 已自动刷新检测") : "";
             return el.child(
               h_flex()

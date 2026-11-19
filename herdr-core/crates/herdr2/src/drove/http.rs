@@ -1021,13 +1021,14 @@ pub(super) async fn resolve_session_meta_and_entries(
 
     if let Some(tid) = crate::terminals::parse_id(local_sess) {
         let found = {
-            let st = core.lock();
-            st.pty_reg.terminals.get(&tid).map(|t| {
-                (
-                    crate::pty_transcript::snapshot_from_terminal(t, st.pty_prompts.get(&tid)),
-                    t.is_live(),
-                )
-            })
+            let mut st = core.lock();
+            if let Some(t) = st.pty_reg.terminals.get(&tid).cloned() {
+                let mut snap = crate::pty_transcript::snapshot_from_terminal(&t, st.pty_prompts.get(&tid));
+                crate::pty_transcript::populate_session_affinity(&mut snap, &t.address, core, &mut st);
+                Some((snap, t.is_live()))
+            } else {
+                None
+            }
         };
         if let Some((snap, _live)) = found {
             let agent = snap.agent_hint.clone();

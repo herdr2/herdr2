@@ -444,6 +444,9 @@ struct Overlay {
     /// A window: where its top left is (None: centered) and its name (`key`).
     place: Option<Point<Pixels>>,
     key: Option<String>,
+    /// Resizable floating window (`kind: "window"`, `resizable: true`).
+    resizable: bool,
+    min_size: Size<f32>,
     /// The app's own screen (a `frame-` mod: What's new, the welcome): only
     /// its own close ends it, never a layout switch.
     frame: bool,
@@ -581,6 +584,8 @@ pub struct AppWindow {
     shell_child_seen: HashSet<String>,
     /// Headless ACP agent currently shown inside the `terminal-peek` dialog overlay.
     peeked_agent: Option<String>,
+    /// True when the right side-chat panel was auto-retracted because the focused agent has no side-chats.
+    side_panel_auto_hidden: bool,
     /// Which sidebar/work target F2 rename acts on (`Tab`, `Space`, or `Agent`).
     rename_focus: RenameFocus,
     /// Manual status overrides (`herdr.status`), keyed by terminal/agent address.
@@ -703,6 +708,7 @@ impl AppWindow {
             live_order: Vec::new(),
             shell_child_seen: HashSet::new(),
             peeked_agent: None,
+            side_panel_auto_hidden: false,
             rename_focus: RenameFocus::Tab,
             manual_statuses: HashMap::new(),
             listed_once: false,
@@ -1382,6 +1388,112 @@ impl AppWindow {
             && self.live.get(addr).and_then(|r| r.pointer("/labels/herdr.view")).and_then(Value::as_str) == Some("peek")
     }
 
+    fn resolve_peer_addr(raw: &str, sibling: &str) -> String {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed.contains('/') {
+            return trimmed.to_owned();
+        }
+        match sibling.rfind('/') {
+            Some(idx) => format!("{}{}", &sibling[..=idx], trimmed),
+            None => trimmed.to_owned(),
+        }
+    }
+
+    fn focused_main_terminal(&self) -> Option<String> {
+        self.model
+            .focused_pane()
+            .and_then(|p| self.model.any_address_of(&p))
+            .or_else(|| self.shown_agent())
+    }
+
+    fn side_chats_for(&self, main_addr: &str) -> Vec<String> {
+        let ordered = self.ordered_live_values();
+        ordered
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| {
+                if r.get("state").and_then(Value::as_str) != Some("live") {
+                    return None;
+                }
+                if r.pointer("/labels/herdr.trashed").is_some_and(|v| {
+                    v.as_bool() == Some(true) || v.as_str().is_some_and(|s| !s.is_empty())
+                }) {
+                    return None;
+                }
+                let kind = r
+                    .pointer("/lineage/kind")
+                    .and_then(Value::as_str)
+                    .map(|k| k.to_ascii_lowercase().replace('_', "-"));
+                if kind.as_deref() != Some("side-chat") {
+                    return None;
+                }
+                let addr = r.get("address").and_then(Value::as_str)?;
+                let raw_parent = r
+                    .pointer("/lineage/parent")
+                    .or_else(|| r.get("parent"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let parent = Self::resolve_peer_addr(raw_parent, addr);
+                (parent == main_addr).then(|| addr.to_owned())
+            })
+            .collect()
+    }
+
+    fn sync_side_chat_panel(&mut self) {
+        let Some(body_active) = self
+            .chrome
+            .find("panel-body")
+            .and_then(|n| n.active_child())
+            .map(|c| c.id.clone())
+        else {
+            return;
+        };
+        let panel_hidden = self.chrome.find("panel").map(|n| n.hidden).unwrap_or(true);
+        let main_addr = self.focused_main_terminal();
+        let candidates = main_addr.as_deref().map(|m| self.side_chats_for(m)).unwrap_or_default();
+        if candidates.is_empty() {
+            if !panel_hidden && body_active == "side-chat" {
+                if let Some(panel) = self.chrome.find_mut("panel") {
+                    panel.hidden = true;
+                }
+                self.side_panel_auto_hidden = true;
+            }
+        } else {
+            let saved = mods::shared("side-chat.active").and_then(|v| v.as_str().map(str::to_owned));
+            if !saved.as_deref().is_some_and(|s| candidates.iter().any(|c| c == s))
+                && let Some(latest) = candidates.last()
+            {
+                mods::set_shared("side-chat.active".to_string(), json!(latest));
+            }
+            if self.side_panel_auto_hidden && panel_hidden && body_active == "side-chat" {
+                if let Some(panel) = self.chrome.find_mut("panel") {
+                    panel.hidden = false;
+                }
+                self.side_panel_auto_hidden = false;
+            }
+        }
+    }
+
+    fn side_chat_terminal_mode(&self) -> Option<String> {
+        let main_addr = self.focused_main_terminal()?;
+        let candidates = self.side_chats_for(&main_addr);
+        if candidates.is_empty() {
+            return None;
+        }
+        let saved = mods::shared("side-chat.active").and_then(|v| v.as_str().map(str::to_owned));
+        let active = saved
+            .filter(|addr| candidates.iter().any(|c| c == addr))
+            .or_else(|| candidates.last().cloned())?;
+        let is_acp = is_acp_addr(&active)
+            || self.live.get(&active).and_then(|r| r.get("acp")).and_then(Value::as_bool) == Some(true);
+        if is_acp || self.is_structured_terminal(&active) {
+            None
+        } else {
+            Some(active)
+        }
+    }
+
     fn pane_is_structured(&self, pane: &str) -> bool {
         !self.swapped.contains_key(pane)
             && self.model.tab_of(pane).is_some()
@@ -1418,6 +1530,18 @@ impl AppWindow {
         };
         for n in self.chrome.visible_blocks() {
             visit(n, &mut terms, &mut mods);
+            if n.id == "side-chat"
+                && let Some(addr) = self.side_chat_terminal_mode()
+            {
+                terms.push(("side-chat#term".into(), addr));
+                mods.push((
+                    "side-chat#term-header".into(),
+                    Instance {
+                        name: "peek".into(),
+                        props: json!({ "sidePanel": true, "sideTermHeader": true }),
+                    },
+                ));
+            }
             // An agent block with an agent outside every tab gets its own view.
             if matches!(n.content(), Some(Content::Agent { .. }))
                 && let Some(addr) = self.shown_agent()
@@ -1484,6 +1608,15 @@ impl AppWindow {
         for n in self.chrome.walk() {
             if let Some(Content::Mod { name, props }) = n.content() {
                 out.insert(n.id.clone(), inst(name, props));
+                if n.id == "side-chat" {
+                    out.insert(
+                        "side-chat#term-header".into(),
+                        Instance {
+                            name: "peek".into(),
+                            props: json!({ "sidePanel": true, "sideTermHeader": true }),
+                        },
+                    );
+                }
             }
             if let Kind::Stack { header: Some(h), .. } = &n.kind
                 && let HeaderContent::Mod { name, props } = &h.content
@@ -1660,6 +1793,7 @@ impl AppWindow {
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let had_structured_focus = self.focused_pane.as_deref().is_some_and(|p| self.copies.contains_key(&format!("{p}#peek")));
         self.model.order_spaces();
+        self.sync_side_chat_panel();
         let (model, live) = (&self.model, &self.live);
         self.swapped.retain(|p, a| model.address_of(p).is_some() && live.contains_key(a));
         let (mut terms, mods_visible) = self.visible();
@@ -1746,7 +1880,7 @@ impl AppWindow {
         for (slot, inst) in want {
             if !self.copies.contains_key(&slot) {
                 let copy = self.load(inst, window, cx);
-                if slot.starts_with("float:")
+                if (slot.starts_with("float:") || slot == "side-chat#term-header")
                     && let Some(root) = &copy.root
                 {
                     root.update(cx, |r, cx| r.set_fit_content(true, cx));
@@ -2099,9 +2233,11 @@ impl AppWindow {
         let mut acp_by_space: HashMap<String, Vec<String>> = HashMap::new();
         let mut acp_unmatched: Vec<(String, String, String)> = Vec::new();
         for (addr, rec) in &self.live {
+            let is_acp = rec.get("acp").and_then(Value::as_bool) == Some(true) || is_acp_addr(addr);
+            let is_cli_agent = !is_acp && self.is_agent_pty(addr);
             if self.closing_terminals.contains_key(addr)
                 || is_trashed_record(rec)
-                || rec.get("acp").and_then(Value::as_bool) != Some(true)
+                || (!is_acp && !is_cli_agent)
                 || rec.get("state").and_then(Value::as_str) != Some("live")
             {
                 continue;
@@ -2177,9 +2313,11 @@ impl AppWindow {
         let push_acp = |agents: &mut Vec<Value>, addr: &str, space_id: &str, space_name: &str| {
             let (has_rec, a, title, pinned, custom_name, app, _, context_usage) = acp_meta(addr);
             if !has_rec { return; }
+            let is_acp = is_acp_addr(addr)
+                || self.live.get(addr).and_then(|r| r.get("acp")).and_then(Value::as_bool) == Some(true);
             let (working_since, work_ms, total_work_ms) = agent_timing(addr);
             agents.push(json!({
-                "address": addr, "acp": true, "pane": Value::Null, "space": space_id, "space_name": space_name,
+                "address": addr, "acp": is_acp, "pane": Value::Null, "space": space_id, "space_name": space_name,
                 "tab": Value::Null, "tab_index": 0, "tab_name": "headless",
                 "status": m.status(addr).unwrap_or("idle"),
                 "manual_status": a.and_then(|a| a.manual_status.clone()),
@@ -2608,10 +2746,11 @@ impl AppWindow {
         }
         let local_home = home();
         let cwd = self.cwds.get(addr).map(String::as_str).or_else(|| rec.get("cwd").and_then(Value::as_str));
+        let wt_origin = rec.pointer("/lineage/worktree_origin").and_then(Value::as_str).filter(|s| !s.is_empty());
         let top = self.model.folder_info.get(addr).map(|f| f.top.as_str());
         self.space_folders(pr).iter().any(|root| {
             let allow_descendants = !(machine.is_none() && path_within_or_eq(root, &local_home) && path_within_or_eq(&local_home, root));
-            [cwd, top].into_iter().flatten().any(|cand| path_matches_root(cand, root, allow_descendants))
+            [cwd, wt_origin, top].into_iter().flatten().any(|cand| path_matches_root(cand, root, allow_descendants))
         })
     }
 
@@ -3886,9 +4025,7 @@ impl AppWindow {
             })),
             TerminalChange::Park => (false, "1", json!({"herdr.space":"","herdr.tab":"","herdr.parked":"1"})),
         };
-        if is_acp_addr(&address)
-            && let Some(labels_obj) = self.live.get_mut(&address).and_then(|r| r.get_mut("labels")).and_then(Value::as_object_mut)
-        {
+        if let Some(labels_obj) = self.live.get_mut(&address).and_then(|r| r.get_mut("labels")).and_then(Value::as_object_mut) {
             labels_obj.insert("herdr.parked".into(), json!(parked));
         }
         let (tx, rx) = std::sync::mpsc::channel();
@@ -4025,17 +4162,197 @@ impl AppWindow {
         }).detach();
     }
 
-    /// Moves mounted ACP agents back to the background without killing them:
-    /// clears `herdr.space`/`herdr.tab` labels and turns off `keep`.
-    fn park_acp_addresses(&mut self, addresses: &[String], cx: &mut Context<Self>) {
+    /// Terminates and permanently removes the given sessions on core (`kill` + `rm`),
+    /// ensuring any associated fork worktree directory and Git branch are completely deleted.
+    fn kill_and_remove(&mut self, addresses: &[String], cx: &mut Context<Self>) {
+        if addresses.is_empty() {
+            return;
+        }
+        let mut doomed: Vec<String> = addresses.to_vec();
+        let mut i = 0;
+        while i < doomed.len() {
+            let parent = doomed[i].clone();
+            for (addr, rec) in &self.live {
+                let child = rec.get("parent").and_then(Value::as_str) == Some(parent.as_str());
+                let kept = rec.get("labels").and_then(|l| l.get("herdr.space")).and_then(Value::as_str).is_some_and(|w| !w.is_empty());
+                if child && !kept && !doomed.contains(addr) {
+                    doomed.push(addr.clone());
+                }
+            }
+            i += 1;
+        }
+        for addr in &doomed {
+            self.ended_acp.remove(addr);
+        }
+        self.closing_terminals.extend(doomed.iter().cloned().map(|a| (a, false)));
+        if self.peeked_agent.as_ref().is_some_and(|p| doomed.contains(p)) {
+            self.peeked_agent = None;
+        }
+        let mut trash_list = mods::shared("agents.trash")
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        let trash_before = trash_list.len();
+        trash_list.retain(|v| v.get("address").and_then(Value::as_str).is_none_or(|a| !doomed.iter().any(|d| d == a)));
+        if trash_list.len() != trash_before {
+            self.save_trash_list(trash_list, cx);
+        }
+        if mods::publish_terminals(self.ordered_live_values()) {
+            self.refresh_snapshot_mods(cx);
+        }
+        let core = self.core.clone();
+        cx.spawn(async move |this, cx| {
+            for address in doomed {
+                let core = core.clone();
+                let addr = address.clone();
+                let result = cx.background_executor().spawn(async move {
+                    if is_acp_addr(&addr) {
+                        let _ = core.call("agent.kill", json!({ "agent": addr }));
+                        core.call("agent.rm", json!({ "agent": addr }))
+                    } else {
+                        let _ = core.call("terminal.kill", json!({ "terminal": addr }));
+                        core.call("terminal.rm", json!({ "terminal": addr }))
+                    }
+                }).await;
+                let _ = this.update(cx, |this, _| {
+                    if result.is_ok() && this.live.contains_key(&address) {
+                        this.closing_terminals.insert(address, true);
+                    } else {
+                        this.closing_terminals.remove(&address);
+                    }
+                });
+            }
+        }).detach();
+    }
+
+    /// Returns `(worktree_path, worktree_branch, worktree_merged)` if `addr` is a forked agent/terminal
+    /// owning an isolated Git worktree.
+    fn fork_worktree_info(&self, addr: &str) -> Option<(String, Option<String>, bool)> {
+        let rec = self.live.get(addr).or_else(|| self.ended_acp.get(addr))?;
+        let lin = rec.get("lineage")?;
+        let wt_path = lin.get("worktree_path").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())?.to_owned();
+        let wt_branch = lin.get("worktree_branch").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+        let merged = lin.get("worktree_merged").and_then(Value::as_bool).unwrap_or(false);
+        Some((wt_path, wt_branch, merged))
+    }
+
+    /// Opens the appropriate close confirmation dialog for a forked agent that owns an isolated Git worktree:
+    /// - If already merged: warns that closing the agent will permanently delete the worktree and branch.
+    /// - If not merged yet: asks whether to merge first (guiding to the "合回父会话" button), and if skipping
+    ///   merge, confirms that closing the agent will permanently delete the worktree and branch.
+    fn prompt_close_fork_worktree(
+        &mut self,
+        addr: &str,
+        command: &str,
+        args: Value,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((wt_path, wt_branch, merged)) = self.fork_worktree_info(addr) else {
+            return;
+        };
+        let zh = settings::get().language == settings::Language::ZhCn;
+        let branch_label = wt_branch.as_deref().unwrap_or("worktree");
+        let spec = if merged {
+            let title = if zh {
+                "关闭分叉 Agent 并删除 Worktree？"
+            } else {
+                "Close forked agent & delete Worktree?"
+            };
+            let detail = if zh {
+                format!(
+                    "该分叉会话的 Worktree（分支 `{branch_label}`）已合入。\n\n关闭该 Agent 后，将会彻底删除对应的临时 Worktree 目录与分支：\n{wt_path}\n\n确认关闭吗？"
+                )
+            } else {
+                format!(
+                    "This forked agent's worktree (branch `{branch_label}`) has already been merged.\n\nClosing this agent will permanently delete its worktree directory and branch:\n{wt_path}\n\nContinue?"
+                )
+            };
+            json!({
+                "mod": "confirm",
+                "kind": "dialog",
+                "width": 440,
+                "props": {
+                    "title": title,
+                    "detail": detail,
+                    "confirmLabel": if zh { "确认关闭并删除" } else { "Close & Delete Worktree" },
+                    "confirmDanger": true,
+                    "command": { "name": command, "args": args }
+                }
+            })
+        } else {
+            let title = if zh {
+                "分叉 Worktree 尚未合入"
+            } else {
+                "Fork Worktree Not Merged Yet"
+            };
+            let detail = if zh {
+                format!(
+                    "该分叉会话的独立 Worktree（分支 `{branch_label}`）尚未合入主会话，是否需要先合入代码？\n\n• 需要合入：请点击下方「合回父会话」按钮（或会话顶部的「合回」按钮），通知主 Agent 合并代码。\n• 不合入：继续关闭后，将会彻底删除该 Worktree 目录与分支。"
+                )
+            } else {
+                format!(
+                    "This forked agent's isolated worktree (branch `{branch_label}`) has not been merged back yet. Would you like to merge it first?\n\n• Merge first: click \"Merge Back to Parent\" below (or the \"Merge\" button in the header) to ask the parent agent to merge the code.\n• Skip merge: closing this agent will permanently delete the worktree directory and branch."
+                )
+            };
+            let step2_title = if zh {
+                "确认彻底删除未合入的 Worktree？"
+            } else {
+                "Permanently delete unmerged Worktree?"
+            };
+            let step2_detail = if zh {
+                format!(
+                    "你选择了不合入。关闭该 Agent 后，将会彻底删除 Worktree 目录与分支（`{branch_label}`），未合入的代码改动将永久丢失且无法恢复：\n{wt_path}\n\n确认关闭吗？"
+                )
+            } else {
+                format!(
+                    "You chose not to merge. Closing this agent will permanently delete the worktree directory and branch (`{branch_label}`), and any unmerged changes will be lost:\n{wt_path}\n\nContinue?"
+                )
+            };
+            json!({
+                "mod": "confirm",
+                "kind": "dialog",
+                "width": 460,
+                "props": {
+                    "title": title,
+                    "detail": detail,
+                    "confirmLabel": if zh { "不合入，继续关闭" } else { "Don't Merge, Close" },
+                    "secondary": {
+                        "label": if zh { "合回父会话" } else { "Merge Back to Parent" },
+                        "accent": true,
+                        "command": {
+                            "name": "agent.handoff",
+                            "args": { "source": addr, "kind": "merge-back" }
+                        }
+                    },
+                    "nextStep": {
+                        "title": step2_title,
+                        "detail": step2_detail,
+                        "cancelLabel": if zh { "返回" } else { "Back" },
+                        "confirmLabel": if zh { "确认关闭并删除" } else { "Close & Delete Worktree" },
+                        "confirmDanger": true
+                    },
+                    "command": { "name": command, "args": args }
+                }
+            })
+        };
+        self.open_overlay(mods::new_overlay_id(), spec, window, cx);
+    }
+
+    /// Moves mounted ACP or CLI agents back to the background without killing or trashing them:
+    /// clears `herdr.space`/`herdr.tab` labels, marks `herdr.parked`, and turns off `keep`.
+    fn park_agent_addresses(&mut self, addresses: &[String], cx: &mut Context<Self>) {
         for addr in addresses {
             self.ended_acp.remove(addr);
         }
-        let targets: Vec<String> = addresses.iter().filter(|a| is_acp_addr(a) && self.live.contains_key(*a)).cloned().collect();
+        let targets: Vec<(String, bool)> = addresses
+            .iter()
+            .filter(|a| self.live.contains_key(*a) && (is_acp_addr(a) || self.is_agent_pty(a)))
+            .map(|a| (a.clone(), is_acp_addr(a)))
+            .collect();
         if targets.is_empty() {
             return;
         }
-        for addr in &targets {
+        for (addr, _) in &targets {
             if self.peeked_agent.as_deref() == Some(addr.as_str()) {
                 self.peeked_agent = None;
             }
@@ -4054,16 +4371,25 @@ impl AppWindow {
         }
         let core = self.core.clone();
         cx.spawn(async move |_, cx| {
-            for addr in targets {
+            for (addr, is_acp) in targets {
                 let core = core.clone();
                 cx.background_executor()
                     .spawn(async move {
                         let labels = json!({ "herdr.space": "", "herdr.tab": "", "herdr.parked": "1" });
-                        if let Err(e) = core.call("agent.label", json!({ "agent": addr, "labels": labels })) {
-                            tracing::warn!("park acp label {addr}: {e:#}");
-                        }
-                        if let Err(e) = core.call("agent.keep", json!({ "agent": addr, "keep": false })) {
-                            tracing::warn!("park acp keep {addr}: {e:#}");
+                        if is_acp {
+                            if let Err(e) = core.call("agent.label", json!({ "agent": addr, "labels": labels })) {
+                                tracing::warn!("park agent label {addr}: {e:#}");
+                            }
+                            if let Err(e) = core.call("agent.keep", json!({ "agent": addr, "keep": false })) {
+                                tracing::warn!("park agent keep {addr}: {e:#}");
+                            }
+                        } else {
+                            if let Err(e) = core.call("terminal.label", json!({ "terminal": addr, "labels": labels })) {
+                                tracing::warn!("park terminal label {addr}: {e:#}");
+                            }
+                            if let Err(e) = core.call("terminal.keep", json!({ "terminal": addr, "keep": false })) {
+                                tracing::warn!("park terminal keep {addr}: {e:#}");
+                            }
                         }
                     })
                     .await;
@@ -4632,6 +4958,7 @@ impl AppWindow {
             .unwrap_or_default();
         let before = list.len();
         list.retain(|v| v.get("address").and_then(Value::as_str) != Some(addr));
+        let has_wt = self.fork_worktree_info(addr).is_some();
         let in_live = self.live.contains_key(addr);
         let in_ended = self.ended_acp.remove(addr).is_some();
         if list.len() == before && !in_live && !in_ended {
@@ -4640,7 +4967,9 @@ impl AppWindow {
         if list.len() != before {
             self.save_trash_list(list, cx);
         }
-        if in_live {
+        if has_wt {
+            self.kill_and_remove(&[addr.to_owned()], cx);
+        } else if in_live {
             self.kill(&[addr.to_owned()], cx);
         } else if is_acp_addr(addr) {
             let core = self.core.clone();
@@ -4675,8 +5004,14 @@ impl AppWindow {
                 self.live.contains_key(a)
             })
             .collect();
-        if !live_addrs.is_empty() {
-            self.kill(&live_addrs, cx);
+        let (wt_addrs, normal_addrs): (Vec<String>, Vec<String>) = live_addrs
+            .into_iter()
+            .partition(|a| self.fork_worktree_info(a).is_some());
+        if !wt_addrs.is_empty() {
+            self.kill_and_remove(&wt_addrs, cx);
+        }
+        if !normal_addrs.is_empty() {
+            self.kill(&normal_addrs, cx);
         }
     }
 
@@ -4954,11 +5289,23 @@ impl AppWindow {
                         addrs.push(addr);
                     }
                 }
-                for addr in &addrs {
-                    self.ended_acp.remove(addr);
+                let mut agent_snaps: Vec<(String, Value)> = Vec::new();
+                let mut shell_ptys: Vec<String> = Vec::new();
+                for addr in addrs {
+                    if is_acp_addr(&addr) || self.is_agent_pty(&addr) {
+                        if let Some(rec) = self.live.get(&addr).or_else(|| self.ended_acp.get(&addr)).cloned() {
+                            agent_snaps.push((addr.clone(), self.trash_snapshot(&addr, &rec)));
+                        }
+                    } else if self.live.contains_key(&addr) {
+                        shell_ptys.push(addr);
+                    }
                 }
-                addrs.retain(|a| self.live.contains_key(a));
-                self.kill(&addrs, cx);
+                for (addr, snap) in agent_snaps {
+                    self.trash_detached(&addr, snap, cx);
+                }
+                if !shell_ptys.is_empty() {
+                    self.kill(&shell_ptys, cx);
+                }
             }
             "space.rename" => {
                 let Some(id) = Self::owned(a, "id").or_else(|| self.model.active.clone()) else { return self.fail("no space to rename") };
@@ -5011,77 +5358,34 @@ impl AppWindow {
                 let Some(id) = Self::owned(a, "id").or(active_ctx) else { return self.fail("no tab to close") };
                 let Some(p) = self.model.space_of(&id) else { return self.fail(format!("no tab {id:?}")) };
                 let tab_addrs = self.model.tab(&id).map(|c| model::any_addresses(&c.root)).unwrap_or_default();
-                let (acp_addrs, pty_addrs): (Vec<String>, Vec<String>) = tab_addrs.into_iter().partition(|addr| is_acp_addr(addr));
-                // Closing the last ordinary tab takes its space with it; if the tab holds an
-                // ACP agent, park the ACP agent back to the background instead of killing it.
+                let (agent_addrs, shell_ptys): (Vec<String>, Vec<String>) = tab_addrs
+                    .into_iter()
+                    .partition(|addr| is_acp_addr(addr) || self.is_agent_pty(addr));
+                // Closing a tab NEVER kills or trashes any agent (ACP or CLI, including worktree forks):
+                // agents are parked cleanly in the background; only plain shells end with their tab.
+                // Closing the last tab keeps its space alive with a fresh tab if it held an agent.
                 if p.tabs.len() == 1 {
-                    if acp_addrs.is_empty() {
+                    if agent_addrs.is_empty() {
                         let mut args = json!({ "id": p.id });
                         args["confirmed"] = a.get("confirmed").cloned().unwrap_or(Value::Null);
                         return self.dispatch("space.close", &args, person, window, cx);
                     }
                     let space_id = p.id.clone();
                     let _ = self.new_tab(Some(space_id), "", None, None, None, None, true, window);
-                    let agent_snapshots: Vec<(String, Value)> = if person {
-                        pty_addrs
-                            .iter()
-                            .filter(|a| self.is_agent_pty(a))
-                            .filter_map(|a| self.live.get(a).map(|r| (a.clone(), self.trash_snapshot(a, r))))
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    let shell_ptys: Vec<String> = pty_addrs
-                        .iter()
-                        .filter(|a| !agent_snapshots.iter().any(|(ta, _)| ta == *a))
-                        .cloned()
-                        .collect();
-                    if self.model.space_of(&id).is_some_and(|sp| sp.tabs.len() > 1) {
-                        let _ = self.model.remove_tab(&id);
-                        if !shell_ptys.is_empty() {
-                            self.kill(&shell_ptys, cx);
-                        }
-                        for (ta, snap) in agent_snapshots {
-                            self.trash_detached(&ta, snap, cx);
-                        }
-                        self.park_acp_addresses(&acp_addrs, cx);
-                    } else if !pty_addrs.is_empty() {
-                        let acp_panes: Vec<String> = self
-                            .model
-                            .tab(&id)
-                            .map(|c| c.root.panes().into_iter().filter(|n| n.acp_terminal().is_some()).map(|n| n.id.clone()).collect())
-                            .unwrap_or_default();
-                        for pane in acp_panes {
-                            self.model.remove_pane(&pane);
-                        }
-                        self.park_acp_addresses(&acp_addrs, cx);
-                    } else {
-                        let _ = self.model.remove_tab(&id);
-                        self.park_acp_addresses(&acp_addrs, cx);
-                    }
-                } else {
-                    let agent_snapshots: Vec<(String, Value)> = if person {
-                        pty_addrs
-                            .iter()
-                            .filter(|a| self.is_agent_pty(a))
-                            .filter_map(|a| self.live.get(a).map(|r| (a.clone(), self.trash_snapshot(a, r))))
-                            .collect()
-                    } else {
-                        Vec::new()
-                    };
-                    let (addrs, _) = self.model.remove_tab(&id);
-                    let (acp_addrs, pty_addrs): (Vec<String>, Vec<String>) = addrs.into_iter().partition(|addr| is_acp_addr(addr));
-                    let shell_ptys: Vec<String> = pty_addrs
-                        .into_iter()
-                        .filter(|a| !agent_snapshots.iter().any(|(ta, _)| ta == a))
-                        .collect();
+                    let _ = self.model.remove_tab(&id);
                     if !shell_ptys.is_empty() {
                         self.kill(&shell_ptys, cx);
                     }
-                    for (ta, snap) in agent_snapshots {
-                        self.trash_detached(&ta, snap, cx);
+                    self.park_agent_addresses(&agent_addrs, cx);
+                } else {
+                    let (addrs, _) = self.model.remove_tab(&id);
+                    let (removed_agents, removed_shells): (Vec<String>, Vec<String>) = addrs
+                        .into_iter()
+                        .partition(|addr| is_acp_addr(addr) || self.is_agent_pty(addr));
+                    if !removed_shells.is_empty() {
+                        self.kill(&removed_shells, cx);
                     }
-                    self.park_acp_addresses(&acp_addrs, cx);
+                    self.park_agent_addresses(&removed_agents, cx);
                 }
             }
             "tab.rename" => {
@@ -5178,20 +5482,20 @@ impl AppWindow {
                 if c.root.find(&pane).is_some_and(|n| !n.closable()) {
                     return;
                 }
+                let confirmed = a.get("confirmed").and_then(Value::as_bool) == Some(true);
                 if c.root.panes().len() == 1 {
                     let id = c.id.clone();
-                    return self.dispatch("tab.close", &json!({ "id": id }), person, window, cx);
+                    let mut args = json!({ "id": id });
+                    if confirmed {
+                        args["confirmed"] = json!(true);
+                    }
+                    return self.dispatch("tab.close", &args, person, window, cx);
                 }
                 let addr = self.model.any_address_of(&pane);
-                let trash_entry = addr.as_deref().filter(|a| person && self.is_agent_pty(a)).and_then(|a| {
-                    self.live.get(a).map(|rec| (a.to_owned(), self.trash_snapshot(a, rec)))
-                });
                 self.model.remove_pane(&pane);
-                if let Some((addr, entry)) = trash_entry {
-                    self.trash_detached(&addr, entry, cx);
-                } else if let Some(addr) = addr {
-                    if is_acp_addr(&addr) {
-                        self.park_acp_addresses(&[addr], cx);
+                if let Some(addr) = addr {
+                    if is_acp_addr(&addr) || self.is_agent_pty(&addr) {
+                        self.park_agent_addresses(&[addr], cx);
                     } else {
                         self.kill(&[addr], cx);
                     }
@@ -5428,14 +5732,19 @@ impl AppWindow {
                     .detach();
             }
             "terminal.kill" => {
-                let t = Self::arg(a, "terminal").unwrap_or_default();
-                if !self.live.contains_key(t) {
+                let t = Self::arg(a, "terminal").unwrap_or_default().to_owned();
+                if !self.live.contains_key(&t) {
                     return self.fail(format!("no running terminal {t:?}"));
                 }
-                if self.peeked_agent.as_deref() == Some(t) {
+                if is_acp_addr(&t) || self.is_agent_pty(&t) {
+                    let r = self.trash_agent(&t, window, cx).map(|()| json!({ "trashed": t }));
+                    self.answer(r);
+                    return;
+                }
+                if self.peeked_agent.as_deref() == Some(t.as_str()) {
                     self.close_overlay("terminal-peek", window, cx);
                 }
-                self.kill(&[t.to_owned()], cx);
+                self.kill(&[t], cx);
             }
             "terminal.peek" => {
                 let t = Self::arg(a, "terminal").unwrap_or_default();
@@ -5612,6 +5921,17 @@ impl AppWindow {
             }
             "agent.purge" => {
                 let Some(t) = Self::owned(a, "terminal") else { return self.fail("agent.purge needs terminal") };
+                let confirmed = a.get("confirmed").and_then(Value::as_bool) == Some(true);
+                if person && !confirmed && self.fork_worktree_info(&t).is_some() {
+                    self.prompt_close_fork_worktree(
+                        &t,
+                        "agent.purge",
+                        json!({ "terminal": t, "confirmed": true }),
+                        window,
+                        cx,
+                    );
+                    return;
+                }
                 let r = self.purge_trashed_agent(&t, cx).map(|()| json!({ "purged": t }));
                 self.answer(r);
             }
@@ -5691,17 +6011,27 @@ impl AppWindow {
                 let kind_arg = Self::owned(a, "kind").filter(|s| !s.is_empty());
                 if preset.is_none() && into.is_none() {
                     let kind = kind_arg.unwrap_or_else(|| "handoff".into());
-                    let explicit = a.get("kind").is_some() || a.get("source").is_some() || a.get("terminal").is_some();
+                    let explicit = a.get("kind").is_some()
+                        || a.get("source").is_some()
+                        || a.get("terminal").is_some()
+                        || a.get("to_turn").is_some();
                     let already_open = self.overlays.iter().any(|o| o.id == "handoff");
                     if already_open {
                         self.close_overlay("handoff", window, cx);
                     }
                     if !already_open || explicit {
+                        let mut dialog_props = json!({ "source": source, "kind": kind });
+                        if let Some(ft) = a.get("from_turn").and_then(Value::as_u64) {
+                            dialog_props["from_turn"] = json!(ft);
+                        }
+                        if let Some(tt) = a.get("to_turn").and_then(Value::as_u64) {
+                            dialog_props["to_turn"] = json!(tt);
+                        }
                         let spec = json!({
                             "mod": "handoff",
                             "kind": "dialog",
-                            "width": 560,
-                            "props": { "source": source, "kind": kind }
+                            "width": 580,
+                            "props": dialog_props
                         });
                         self.open_overlay("handoff".into(), spec, window, cx);
                     }
@@ -5713,16 +6043,24 @@ impl AppWindow {
                 let is_merge = into.is_some();
                 let kind = kind_arg.unwrap_or_else(|| if is_merge { "merge-back".into() } else { "handoff".into() });
                 let rpc_kind = if kind == "merge-back" { "handoff" } else { kind.as_str() };
+                let archive_source = a.get("archive_source").and_then(Value::as_bool).unwrap_or(false);
+                let close_ov = Self::owned(a, "close_overlay").filter(|s| !s.is_empty());
                 let open = Self::owned(a, "open").unwrap_or_else(|| {
                     if is_merge {
                         "focus".into()
                     } else if kind == "side-chat" {
+                        "panel".into()
+                    } else if kind == "fork" {
                         "split".into()
                     } else {
                         "tab".into()
                     }
                 });
-                let mut params = json!({ "source": source, "kind": rpc_kind });
+                let mut params = json!({
+                    "source": source,
+                    "kind": rpc_kind,
+                    "display": crate::terminal::initial_display(window),
+                });
                 if let Some(p) = preset { params["preset"] = json!(p); }
                 if let Some(dst) = into { params["into"] = json!(dst); }
                 if let Some(m) = Self::owned(a, "mode").filter(|s| !s.is_empty()) {
@@ -5733,9 +6071,16 @@ impl AppWindow {
                 }
                 if let Some(prompt) = Self::owned(a, "prompt").filter(|s| !s.is_empty()) { params["prompt"] = json!(prompt); }
                 if let Some(rt) = a.get("recent_turns").and_then(Value::as_u64) { params["recent_turns"] = json!(rt); }
+                if let Some(ft) = a.get("from_turn").and_then(Value::as_u64) { params["from_turn"] = json!(ft); }
+                if let Some(tt) = a.get("to_turn").and_then(Value::as_u64) { params["to_turn"] = json!(tt); }
                 if let Some(mb) = a.get("max_bytes").and_then(Value::as_u64) { params["max_bytes"] = json!(mb); }
                 if let Some(model) = Self::owned(a, "model").filter(|s| !s.is_empty()) { params["model"] = json!(model); }
                 if let Some(effort) = Self::owned(a, "effort").filter(|s| !s.is_empty()) { params["effort"] = json!(effort); }
+                if a.get("worktree").and_then(Value::as_bool) == Some(true) { params["worktree"] = json!(true); }
+                let explicit_merge_wt = a.get("merge_worktree").and_then(Value::as_bool);
+                if explicit_merge_wt == Some(true) || (is_merge && explicit_merge_wt.is_none() && self.fork_worktree_info(&source).is_some()) {
+                    params["merge_worktree"] = json!(true);
+                }
 
                 let core = self.core.clone();
                 let generation = self.core_generation;
@@ -5814,6 +6159,24 @@ impl AppWindow {
                                         this.live.insert(target.clone(), rec);
                                     }
                                     if is_merge {
+                                        let wt_merge_requested = out.get("worktree_merge_requested").and_then(Value::as_bool) == Some(true);
+                                        let wt_branch_out = out.get("worktree_branch").and_then(Value::as_str).map(str::to_owned);
+                                        if wt_merge_requested {
+                                            for map in [&mut this.live, &mut this.ended_acp] {
+                                                if let Some(lin) = map
+                                                    .get_mut(&source_for_ui)
+                                                    .and_then(|r| r.get_mut("lineage"))
+                                                    .and_then(Value::as_object_mut)
+                                                {
+                                                    lin.insert("worktree_merged".into(), json!(true));
+                                                    if let Some(ref br) = wt_branch_out
+                                                        && !lin.contains_key("worktree_branch")
+                                                    {
+                                                        lin.insert("worktree_branch".into(), json!(br));
+                                                    }
+                                                }
+                                            }
+                                        }
                                         if let Some(obj) = this.live.get_mut(&target).and_then(Value::as_object_mut) {
                                             let next_seq = obj.get("transcript_seq").and_then(Value::as_u64).unwrap_or(0) + 1;
                                             obj.insert("transcript_seq".into(), json!(next_seq));
@@ -5824,13 +6187,37 @@ impl AppWindow {
                                             }
                                         }
                                         mods::publish_terminals(this.ordered_live_values());
+                                        let merged_files = out
+                                            .get("merged_files")
+                                            .and_then(Value::as_array)
+                                            .map(|arr| arr.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+                                            .unwrap_or_default();
                                         let is_zh = settings::get().language == settings::Language::ZhCn;
-                                        let title = if is_zh {
+                                        let title = if wt_merge_requested {
+                                            if is_zh {
+                                                format!("已通知 {target} 合并 Worktree 代码")
+                                            } else {
+                                                format!("Notified {target} to merge Worktree")
+                                            }
+                                        } else if is_zh {
                                             format!("已合回上下文至 {target}")
                                         } else {
                                             format!("Merged context into {target}")
                                         };
-                                        let body = if is_zh {
+                                        let body = if wt_merge_requested {
+                                            let br_suffix = wt_branch_out.as_deref().map(|b| format!(" ({b})")).unwrap_or_default();
+                                            if is_zh {
+                                                format!("已向 {target} 发送合并指令，由主 Agent 合并 {source_for_ui} 的 Worktree 分支{br_suffix}代码（保留 Worktree 与分支）。")
+                                            } else {
+                                                format!("Instructed {target} to merge worktree branch{br_suffix} from {source_for_ui} (keeping worktree & branch).")
+                                            }
+                                        } else if !merged_files.is_empty() {
+                                            if is_zh {
+                                                format!("{source_for_ui} 的结论与 {} 个 Worktree 文件改动已合回 {target}。", merged_files.len())
+                                            } else {
+                                                format!("Merged context and {} worktree file(s) from {source_for_ui} into {target}.", merged_files.len())
+                                            }
+                                        } else if is_zh {
                                             format!("{source_for_ui} 的接力上下文已注入 {target}，正在继续处理。")
                                         } else {
                                             format!("Delivered context from {source_for_ui} to {target}.")
@@ -5842,6 +6229,17 @@ impl AppWindow {
                                             "action": { "name": "agent.focus", "args": { "terminal": target } },
                                         });
                                         this.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": notification }), window, cx);
+                                        if let Some(ref ov_id) = close_ov {
+                                            this.close_overlay(ov_id, window, cx);
+                                        }
+                                        // Also close any floating side-chat window or hide the right side-chat panel for `source_for_ui`.
+                                        let side_ov_id = format!("side-chat:{source_for_ui}");
+                                        if this.overlays.iter().any(|o| o.id == side_ov_id) {
+                                            this.close_overlay(&side_ov_id, window, cx);
+                                        }
+                                        if mods::shared("side-chat.active").and_then(|v| v.as_str().map(str::to_owned)).as_deref() == Some(source_for_ui.as_str()) {
+                                            this.dispatch("layout.hide", &json!({ "id": "panel" }), false, window, cx);
+                                        }
                                         if open != "none" {
                                             if this.peeked_agent.as_deref() == Some(source_for_ui.as_str()) && target != source_for_ui {
                                                 this.close_overlay("terminal-peek", window, cx);
@@ -5856,10 +6254,15 @@ impl AppWindow {
                                         mods::publish_terminals(this.ordered_live_values());
                                         match open.as_str() {
                                             "none" => {}
+                                            "panel" => this.open_side_chat_panel(&target, window, cx),
+                                            "window" | "float" => this.open_side_chat_window(&target, &source_for_ui, window, cx),
                                             "peek" => this.dispatch("terminal.peek", &json!({ "terminal": target }), false, window, cx),
                                             "split" | "right" => this.dispatch("terminal.keep", &json!({ "terminal": target, "place": "right" }), false, window, cx),
                                             "down" => this.dispatch("terminal.keep", &json!({ "terminal": target, "place": "down" }), false, window, cx),
                                             _ => this.dispatch("terminal.keep", &json!({ "terminal": target, "place": "tab" }), false, window, cx),
+                                        }
+                                        if archive_source && kind == "handoff" && source_for_ui != target {
+                                            this.dispatch("terminal.park", &json!({ "terminal": source_for_ui }), false, window, cx);
                                         }
                                     }
                                     this.sync(window, cx);
@@ -5957,6 +6360,9 @@ impl AppWindow {
                     "layout.show" => false,
                     _ => true,
                 };
+                if id == "panel" {
+                    self.side_panel_auto_hidden = false;
+                }
             }
             "layout.resize" => {
                 let id = Self::arg(a, "id").unwrap_or_default();
@@ -5991,6 +6397,9 @@ impl AppWindow {
                 let (s, ch) = (Self::arg(a, "stack").unwrap_or_default(), Self::arg(a, "child").unwrap_or_default());
                 if !self.chrome.select(s, ch) {
                     return self.fail(format!("no stack {s:?} with a child {ch:?}"));
+                }
+                if s == "panel-body" && ch != "side-chat" {
+                    self.side_panel_auto_hidden = false;
                 }
             }
             "mod.open" => {
@@ -6241,19 +6650,28 @@ impl AppWindow {
         }
         props["overlay"] = json!(id);
         let num = |k: &str, d: f32| spec.get(k).and_then(Value::as_f64).map_or(d, |v| v as f32);
-        let size = match kind {
+        let resizable = kind == OverlayKind::Window && spec.get("resizable").and_then(Value::as_bool).unwrap_or(false);
+        let min_size = size(num("min_width", 320.0), num("min_height", 240.0));
+        let mut size = match kind {
             OverlayKind::Toast => size(340.0, num("height", 72.0)),
             // No size: as big as its content (0 = unset).
             OverlayKind::Window => size(num("width", 0.0), num("height", 0.0)),
             // No height: as tall as the content, up to most of the window.
             _ => size(num("width", 420.0), num("height", 0.85)),
         };
+        if resizable
+            && let Some(saved) = key.as_deref().and_then(movable::size_of)
+        {
+            size = gpui::size(saved.width.max(min_size.width), saved.height.max(min_size.height));
+        }
         let at = match spec.get("at") {
             Some(v) if v.get("x").is_some() => point(px(num_in(v, "x")), px(num_in(v, "y"))),
             _ => self.pointer,
         };
         let top = (spec.get("at").and_then(Value::as_str) == Some("top")).then(|| num("offset", 0.0));
-        let fit = layout.is_none() && (kind == OverlayKind::Popup || (matches!(kind, OverlayKind::Dialog | OverlayKind::Window) && spec.get("height").is_none()));
+        let fit = !resizable
+            && layout.is_none()
+            && (kind == OverlayKind::Popup || (matches!(kind, OverlayKind::Dialog | OverlayKind::Window) && spec.get("height").is_none()));
         if kind == OverlayKind::Window && place.is_none() && spec.get("at").is_some_and(|v| v.get("x").is_some()) {
             place = Some(at);
         }
@@ -6294,6 +6712,8 @@ impl AppWindow {
             bare: spec.get("frame").and_then(Value::as_str) == Some("none"),
             place,
             key: key.clone(),
+            resizable,
+            min_size,
             frame: spec.get("mod").and_then(Value::as_str).is_some_and(|m| m.starts_with("frame-")),
         });
         if let Some(k) = &key {
@@ -6316,10 +6736,100 @@ impl AppWindow {
         cx.notify();
     }
 
-    fn peek_terminal(&mut self, address: &str, window: &mut Window, cx: &mut Context<Self>) {
-        self.close_overlay("terminal-peek", window, cx);
+    fn open_side_chat_panel(&mut self, address: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.side_panel_auto_hidden = false;
+        let parent_addr = self
+            .live
+            .get(address)
+            .and_then(|r| r.pointer("/lineage/parent").or_else(|| r.get("parent")))
+            .and_then(Value::as_str)
+            .map(|p| Self::resolve_peer_addr(p, address))
+            .filter(|p| !p.is_empty());
+        if let Some(ref p_addr) = parent_addr
+            && self.focused_main_terminal().as_deref() != Some(p_addr.as_str())
+            && self.live.contains_key(p_addr)
+        {
+            self.dispatch("agent.focus", &json!({ "terminal": p_addr }), false, window, cx);
+        }
+        mods::set_shared("side-chat.active".to_string(), json!(address));
+        let has_side_block = self.chrome.find("side-chat").is_some();
+        if has_side_block {
+            self.dispatch("layout.select", &json!({ "stack": "panel-body", "child": "side-chat" }), false, window, cx);
+            self.dispatch("layout.show", &json!({ "id": "panel" }), false, window, cx);
+            if self.side_chat_terminal_mode().as_deref() == Some(address)
+                && let Some(t) = self.terms.get("side-chat#term")
+            {
+                t.focus.focus(window, cx);
+            }
+            self.refresh_snapshot_mods(cx);
+            self.publish(cx);
+        } else {
+            let parent = parent_addr.unwrap_or_default();
+            self.open_side_chat_window(address, &parent, window, cx);
+        }
+    }
+
+    fn open_side_chat_window(&mut self, address: &str, parent: &str, window: &mut Window, cx: &mut Context<Self>) {
         let is_acp = is_acp_addr(address)
             || self.live.get(address).and_then(|r| r.get("acp")).and_then(Value::as_bool) == Some(true);
+        let ov_id = format!("side-chat:{address}");
+        if is_acp {
+            self.open_overlay(
+                ov_id,
+                json!({
+                    "kind": "window",
+                    "key": "side-chat",
+                    "resizable": true,
+                    "width": 520,
+                    "height": 640,
+                    "min_width": 360,
+                    "min_height": 340,
+                    "mod": "peek",
+                    "props": { "terminal": address, "acp": true, "floating": true, "parent": parent }
+                }),
+                window,
+                cx,
+            );
+        } else {
+            self.open_overlay(
+                ov_id,
+                json!({
+                    "kind": "window",
+                    "key": "side-chat",
+                    "resizable": true,
+                    "width": 620,
+                    "height": 520,
+                    "min_width": 380,
+                    "min_height": 320,
+                    "layout": {
+                        "type": "column",
+                        "children": [
+                            { "type": "block", "size": { "px": 36 }, "content": { "mod": "peek", "props": { "terminal": address, "floating": true, "parent": parent } } },
+                            { "type": "block", "content": { "terminal": address } }
+                        ]
+                    }
+                }),
+                window,
+                cx,
+            );
+        }
+        self.publish(cx);
+    }
+
+    fn peek_terminal(&mut self, address: &str, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_overlay("terminal-peek", window, cx);
+        let is_side_chat = self
+            .live
+            .get(address)
+            .and_then(|r| r.pointer("/lineage/kind"))
+            .and_then(Value::as_str)
+            == Some("side-chat");
+        let is_acp = is_acp_addr(address)
+            || self.live.get(address).and_then(|r| r.get("acp")).and_then(Value::as_bool) == Some(true);
+        if is_side_chat && self.model.any_pane_of(address).is_none() {
+            self.open_side_chat_panel(address, window, cx);
+            return;
+        }
         if is_acp {
             if self.focus_mounted_acp(address, window, cx) {
                 return;
@@ -6949,7 +7459,34 @@ impl AppWindow {
                     None => div().into_any_element(),
                 }
             }
-            Content::Mod { .. } => self.render_slot(&n.id, cx),
+            Content::Mod { .. } => {
+                if n.id == "side-chat" && self.side_chat_terminal_mode().is_some() {
+                    let term_el = match self.terms.get("side-chat#term").map(|t| (t.focus.clone(), shown_terminal(&t.view, cx))) {
+                        Some((focus, inner)) => div()
+                            .flex_1()
+                            .min_h_0()
+                            .w_full()
+                            .bg(c("background"))
+                            .on_any_mouse_down(cx.listener(move |_this, _, window, cx| {
+                                focus.focus(window, cx);
+                            }))
+                            .child(inner)
+                            .into_any_element(),
+                        None => div().flex_1().min_h_0().w_full().bg(c("background")).into_any_element(),
+                    };
+                    div()
+                        .size_full()
+                        .flex()
+                        .flex_col()
+                        .min_h_0()
+                        .bg(c("background"))
+                        .child(div().flex_none().w_full().child(self.render_slot("side-chat#term-header", cx)))
+                        .child(term_el)
+                        .into_any_element()
+                } else {
+                    self.render_slot(&n.id, cx)
+                }
+            }
             Content::Agent { .. } => match self.shown_agent() {
                 Some(addr) => match self.agent_view(&n.id, &addr) {
                     Some(t) => div().size_full().child(shown_terminal(&t.view, cx)).into_any_element(),
@@ -10287,7 +10824,85 @@ export default class SystemToast extends View {
         });
     }
 
-    /// A popup opened near the right edge must snap back inside the window
+    #[test]
+    fn fork_worktree_close_confirmation_handles_unmerged_and_merged() {
+        in_own_process("fork_worktree_close_prompts_for_unmerged_and_merged_states");
+    }
+
+    #[gpui::test]
+    fn fork_worktree_close_prompts_for_unmerged_and_merged_states(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        if !running_alone("fork_worktree_close_prompts_for_unmerged_and_merged_states") { return; }
+        let (view, cx) = open_window(cx, "unused", "", json!({
+            "id": "context", "type": "block", "content": { "tab": "active" }
+        }));
+        view.update_in(cx, |this, window, cx| {
+            this.model.add_space("space", "test", "/tmp", super::Tab::new("tb1", "shell", "pa", "term-a"));
+            this.model.add_tab_unselected("space", super::Tab::with_pane("tb2", "Fork", super::AppWindow::acp_pane_node("acp-fk", "a2")));
+            this.live.insert("term-a".into(), json!({ "address": "term-a", "state": "live", "argv": ["zsh"] }));
+            this.live.insert("a2".into(), json!({
+                "address": "a2",
+                "acp": true,
+                "agent": "claude",
+                "state": "live",
+                "keep": true,
+                "cwd": "/tmp/wt-fork",
+                "lineage": {
+                    "kind": "fork",
+                    "parent": "a1",
+                    "worktree_path": "/tmp/wt-fork",
+                    "worktree_origin": "/tmp/repo",
+                    "worktree_branch": "herdr/fork-fk1",
+                    "worktree_merged": false
+                },
+                "labels": { "herdr.space": "space", "herdr.tab": "tb2" }
+            }));
+            this.documents.entry(String::new()).or_default().available = true;
+            this.sync(window, cx);
+
+            // 1. Closing a fork worktree tab ONLY closes the tab and parks the agent in background (never kills or deletes worktree).
+            let out = this.run_as("tab.close", json!({ "id": "tb2" }), true, window, cx);
+            assert!(out.get("error").is_none(), "{out}");
+            assert!(this.model.tab("tb2").is_none(), "tab should close cleanly");
+            assert!(!this.closing_terminals.contains_key("a2"), "tab.close must never kill agent");
+            assert_eq!(this.live["a2"]["labels"]["herdr.parked"], json!("1"));
+            assert!(this.overlays.is_empty(), "tab.close must not prompt deletion");
+
+            // 2. Moving fork worktree agent to recycle bin preserves it in trash without killing it.
+            let out = this.run_as("agent.trash", json!({ "terminal": "a2" }), true, window, cx);
+            assert!(out.get("error").is_none(), "{out}");
+            assert!(!this.closing_terminals.contains_key("a2"), "agent.trash must never kill agent directly");
+            assert!(this.live["a2"]["labels"]["herdr.trashed"].as_str().is_some_and(|s| !s.is_empty()));
+
+            // 3. Permanently purging unmerged fork worktree from recycle bin prompts 2-step dialog & merge-back guide.
+            let out = this.run_as("agent.purge", json!({ "terminal": "a2" }), true, window, cx);
+            assert!(out.get("error").is_none(), "{out}");
+            assert!(!this.closing_terminals.contains_key("a2"), "unconfirmed purge must keep agent in trash");
+            assert_eq!(this.overlays.len(), 1);
+            let props1 = &this.copies.get(&this.overlays[0].slot).unwrap().inst.props;
+            assert_eq!(props1["secondary"]["command"]["name"], json!("agent.handoff"));
+            assert_eq!(props1["secondary"]["command"]["args"]["kind"], json!("merge-back"));
+            assert_eq!(props1["nextStep"]["confirmDanger"], json!(true));
+            this.overlays.clear();
+
+            // 4. Once marked merged, purging prompts with direct deletion warning (no secondary merge step).
+            this.live.get_mut("a2").unwrap()["lineage"]["worktree_merged"] = json!(true);
+            let out = this.run_as("agent.purge", json!({ "terminal": "a2" }), true, window, cx);
+            assert!(out.get("error").is_none(), "{out}");
+            assert!(!this.closing_terminals.contains_key("a2"), "unconfirmed merged purge must still confirm deletion");
+            assert_eq!(this.overlays.len(), 1);
+            let props2 = &this.copies.get(&this.overlays[0].slot).unwrap().inst.props;
+            assert!(props2.get("secondary").is_none(), "merged prompt should not ask whether to merge: {props2}");
+            assert!(props2.get("nextStep").is_none(), "merged prompt should be single-step: {props2}");
+            assert_eq!(props2["confirmDanger"], json!(true));
+            this.overlays.clear();
+
+            // 5. Confirmed purge from recycle bin initiates kill_and_remove.
+            let out = this.run_as("agent.purge", json!({ "terminal": "a2", "confirmed": true }), true, window, cx);
+            assert!(out.get("error").is_none(), "{out}");
+            assert!(this.closing_terminals.contains_key("a2"));
+        });
+    }
     /// with the 8 px margin: its body may not paint past the window border
     /// (the reported right-edge menu clip).
     #[gpui::test]

@@ -65,6 +65,8 @@ function items(p, git) {
       const tabPaneCount = inTab ? panes().filter((pane) => pane.tab === paneInfo.tab).length : 0;
       const isStructured = Boolean(paneInfo?.structured);
       const rawLineageParent = (term?.lineage?.parent || "").trim();
+      const isSideChat = String(term?.lineage?.kind || "").toLowerCase().replace("_", "-") === "side-chat";
+      const hasWorktree = Boolean(term?.lineage?.worktree_path);
       const termSlash = typeof term?.address === "string" ? term.address.lastIndexOf("/") : -1;
       const lineageParent = rawLineageParent
         ? (!rawLineageParent.includes("/") && termSlash > 0 ? `${term.address.slice(0, termSlash + 1)}${rawLineageParent}` : rawLineageParent)
@@ -77,8 +79,9 @@ function items(p, git) {
           : []),
         ...(term && !isEnded
           ? [
-              [tr("Context handoff / Fork…", "上下文接力 / 分支…"), "agent.handoff", { source: term.address, kind: "handoff" }],
-              [tr("Side chat…", "旁路讨论…"), "agent.handoff", { source: term.address, kind: "side-chat" }],
+              [tr("Context handoff…", "上下文接力…"), "agent.handoff", { source: term.address, kind: "handoff" }],
+              ...(!isSideChat ? [[tr("Fork session…", "会话分叉…"), "agent.handoff", { source: term.address, kind: "fork" }]] : []),
+              [tr("Side chat (right panel)…", "旁路讨论（右侧面板）…"), "agent.handoff", { source: term.address, kind: "side-chat" }],
               ...(lineageParent
                 ? [[tr(`Merge back into ${lineageParent}`, `合回 ${lineageParent}`), "agent.handoff", { source: term.address, into: lineageParent, kind: "merge-back" }]]
                 : []),
@@ -116,8 +119,8 @@ function items(p, git) {
         ...(parent && !isAcp ? [[tr(`Send back to ${parent.name || parent.address}`, `放回 ${parent.name || parent.address} 下`), "terminal.park", { terminal: term.address }]] : []),
         ...(term && isAcp && !isEnded ? [acpPermItem(term)].filter(Boolean) : []),
         ...(term?.manual_status ? [[tr("Reset status to Auto", "恢复自动识别状态"), "agent.status", { terminal: term.address, status: "auto" }]] : []),
-        ...(inTab ? [[isAcp && !isEnded ? tr("Move to background", "转入后台") : tr("Close pane", "关闭窗格"), "pane.close", { pane: tg.pane }]] : []),
-        ...(term && isAcp ? [[tr("Move to recycle bin", "移入回收站"), "agent.trash", { terminal: term.address }]] : []),
+        ...(inTab ? [[(isAcp || term?.program?.agent || paneInfo?.status) && !isEnded ? tr("Close pane (keep agent in background)", "关闭窗格（转入后台）") : tr("Close pane", "关闭窗格"), "pane.close", { pane: tg.pane }]] : []),
+        ...(term && (isAcp || term?.program?.agent || paneInfo?.status) ? [[tr("Move to recycle bin", "移入回收站"), "agent.trash", { terminal: term.address }]] : []),
       ];
     }
     case "agent": {
@@ -125,6 +128,8 @@ function items(p, git) {
       const isAcp = Boolean(term?.acp);
       const isEnded = term?.state === "finished" || term?.status === "ended";
       const rawLineageParent = (term?.lineage?.parent || "").trim();
+      const isSideChat = String(term?.lineage?.kind || "").toLowerCase().replace("_", "-") === "side-chat";
+      const hasWorktree = Boolean(term?.lineage?.worktree_path);
       const termSlash = typeof term?.address === "string" ? term.address.lastIndexOf("/") : -1;
       const lineageParent = rawLineageParent
         ? (!rawLineageParent.includes("/") && termSlash > 0 ? `${term.address.slice(0, termSlash + 1)}${rawLineageParent}` : rawLineageParent)
@@ -134,31 +139,24 @@ function items(p, git) {
         [tr("Rename", "重命名"), "agent.rename", { terminal: tg.terminal }],
         ...(tg.terminal && !isEnded
           ? [
-              [tr("Context handoff / Fork…", "上下文接力 / 分支…"), "agent.handoff", { source: tg.terminal, kind: "handoff" }],
-              [tr("Side chat…", "旁路讨论…"), "agent.handoff", { source: tg.terminal, kind: "side-chat" }],
+              [tr("Context handoff…", "上下文接力…"), "agent.handoff", { source: tg.terminal, kind: "handoff" }],
+              ...(!isSideChat ? [[tr("Fork session…", "会话分叉…"), "agent.handoff", { source: tg.terminal, kind: "fork" }]] : []),
+              [tr("Side chat (right panel)…", "旁路讨论（右侧面板）…"), "agent.handoff", { source: tg.terminal, kind: "side-chat" }],
               ...(lineageParent
                 ? [[tr(`Merge back into ${lineageParent}`, `合回 ${lineageParent}`), "agent.handoff", { source: tg.terminal, into: lineageParent, kind: "merge-back" }]]
                 : []),
             ]
           : []),
-        ...(isAcp
+        ...(term
           ? [
               ...(!tg.pane ? [[tr("Open as Tab", "挂载为标签页"), "terminal.keep", { terminal: tg.terminal, place: "tab" }]] : []),
-              [tr("Split right", "右侧分栏"), "terminal.keep", { terminal: tg.terminal, place: "right" }],
-              [tr("Split down", "下方分栏"), "terminal.keep", { terminal: tg.terminal, place: "down" }],
-              acpPermItem(term),
+              ...(isAcp || !tg.pane ? [[tr("Split right", "右侧分栏"), "terminal.keep", { terminal: tg.terminal, place: "right" }], [tr("Split down", "下方分栏"), "terminal.keep", { terminal: tg.terminal, place: "down" }]] : []),
+              ...(isAcp ? [acpPermItem(term)] : []),
             ].filter(Boolean)
           : []),
         ...(term ? [[pinned ? tr("Unpin agent", "取消置顶") : tr("Pin to top", "置顶"), "terminal.pin", { terminal: tg.terminal, pinned: !pinned }]] : []),
-        ...(tg.pane && isAcp
-          ? [
-              [tr("Move to background", "转入后台"), "pane.close", { pane: tg.pane }],
-              [tr("Move to recycle bin", "移入回收站"), "agent.trash", { terminal: tg.terminal }],
-            ]
-          : [
-              ...(tg.pane ? [[tr("Close pane", "关闭窗格"), "pane.close", { pane: tg.pane }]] : []),
-              [tr("Move to recycle bin", "移入回收站"), "agent.trash", { terminal: tg.terminal }],
-            ]),
+        ...(tg.pane ? [[!isEnded ? tr("Close pane (keep in background)", "关闭窗格（转入后台）") : tr("Close pane", "关闭窗格"), "pane.close", { pane: tg.pane }]] : []),
+        [tr("Move to recycle bin", "移入回收站"), "agent.trash", { terminal: tg.terminal }],
       ];
     }
     case "tab": {
@@ -169,6 +167,13 @@ function items(p, git) {
       const acpTerm = acpPane ? terminals().find((t) => t.address === acpPane.terminal) : null;
       const ptyPanes = tabPanes.filter((pane) => !pane.acp && pane.terminal);
       const isStructured = ptyPanes.length > 0 && ptyPanes.every((pane) => pane.structured);
+      const agentPanes = tabPanes.filter((pane) => {
+        if (!pane.terminal) return false;
+        if (pane.acp) return true;
+        const tRec = terminals().find((t) => t.address === pane.terminal);
+        return Boolean(pane.program?.agent || pane.status || tRec?.program?.agent || tRec?.status);
+      });
+      const primaryAgentPane = agentPanes.find((p) => p.focused) || agentPanes[0] || null;
       return [
         [tr("Rename", "重命名"), "tab.rename", { id: tg.id }],
         [tr("New tab", "新建标签页"), "tab.new", { space: tg.space }],
@@ -183,15 +188,8 @@ function items(p, git) {
             ]
           : []),
         ...(acpTerm ? [acpPermItem(acpTerm)].filter(Boolean) : []),
-        ...(allAcp && !allEnded
-          ? [
-              [tr("Move to background", "转入后台"), "tab.close", { id: tg.id }],
-              ...(tabPanes.length === 1 && acpPane ? [[tr("Move to recycle bin", "移入回收站"), "agent.trash", { terminal: acpPane.terminal }]] : []),
-            ]
-          : [
-              ...(acpPane ? [[tr("Detach ACP to background", "将 ACP 转入后台"), "terminal.park", { terminal: acpPane.terminal }]] : []),
-              [tr("Close", "关闭"), "tab.close", { id: tg.id }],
-            ]),
+        [agentPanes.length > 0 && !allEnded ? tr("Close tab (keep agent)", "关闭标签页（保留 Agent）") : tr("Close tab", "关闭标签页"), "tab.close", { id: tg.id }],
+        ...(primaryAgentPane ? [[tr("Move to recycle bin", "移入回收站"), "agent.trash", { terminal: primaryAgentPane.terminal }]] : []),
       ];
     }
     case "space":

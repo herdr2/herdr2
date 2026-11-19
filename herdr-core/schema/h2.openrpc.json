@@ -1671,6 +1671,12 @@
                   "null"
                 ]
               },
+              "context_markdown": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "from_address": {
                 "type": "string"
               },
@@ -1912,6 +1918,12 @@
           "lineage": {
             "$ref": "#/components/schemas/Lineage"
           },
+          "merged_files": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
           "native_fork": {
             "type": "boolean"
           },
@@ -1943,6 +1955,21 @@
               {
                 "type": "null"
               }
+            ]
+          },
+          "worktree_branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "worktree_merge_requested": {
+            "type": "boolean"
+          },
+          "worktree_path": {
+            "type": [
+              "string",
+              "null"
             ]
           }
         },
@@ -2147,6 +2174,27 @@
             "minimum": 0,
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "worktree_branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "worktree_merged": {
+            "type": "boolean"
+          },
+          "worktree_origin": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "worktree_path": {
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -6228,6 +6276,22 @@
           }
         },
         {
+          "description": "Caller display colors and cell size for newly spawned PTY targets (answers startup OSC 10/11 queries).",
+          "name": "display",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Display"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Caller display colors and cell size for newly spawned PTY targets (answers startup OSC 10/11 queries)."
+          }
+        },
+        {
           "description": "First turn from the source transcript to include (1-based, inclusive).",
           "name": "from_turn",
           "required": false,
@@ -6271,6 +6335,16 @@
             "$ref": "#/components/schemas/LineageKind",
             "default": "handoff",
             "description": "Lineage kind (`handoff`, `fork`, or `side-chat`)."
+          }
+        },
+        {
+          "description": "When merging back (`--into`), instruct the target/parent agent to merge code from the source session's fork worktree branch into the main workspace without deleting the worktree or branch.",
+          "name": "merge_worktree",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "When merging back (`--into`), instruct the target/parent agent to merge code from the source session's fork worktree branch into the main workspace without deleting the worktree or branch.",
+            "type": "boolean"
           }
         },
         {
@@ -6401,6 +6475,16 @@
           "schema": {
             "default": false,
             "description": "With `--prompt`: wait for the first turn on the target to finish.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "When `kind == fork`, create an isolated Git worktree on its own branch (carrying uncommitted changes) so the forked session can commit freely.",
+          "name": "worktree",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "When `kind == fork`, create an isolated Git worktree on its own branch (carrying uncommitted changes) so the forked session can commit freely.",
             "type": "boolean"
           }
         }

@@ -45,6 +45,10 @@ impl LineageKind {
     }
 }
 
+fn is_false(v: &bool) -> bool {
+    !*v
+}
+
 /// Lightweight parent pointer stored on `Agent`, `Terminal`, and handoff results.
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, Default, PartialEq, Eq)]
 pub struct Lineage {
@@ -61,6 +65,14 @@ pub struct Lineage {
     pub to_turn: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_origin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree_branch: Option<String>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub worktree_merged: bool,
 }
 
 /// Inputs used to synthesize a deterministic cross-provider context handoff.
@@ -294,6 +306,20 @@ pub fn build_handoff_package(input: &HandoffBuildInput<'_>) -> HandoffPackage {
         header.push_str("\n## Handoff Note\n\n");
         header.push_str(note);
         header.push('\n');
+    }
+    match input.kind {
+        LineageKind::Handoff => {
+            header.push_str("\n## Session Mode: Context Handoff\n\n");
+            header.push_str("You are taking over this task from the upstream session. **On this initial handoff turn, ONLY read and absorb the handoff context — do NOT modify any files, run mutating commands, or start making changes.** Briefly acknowledge that you have understood the context and wait for the user's next instruction before making any edits.\n");
+        }
+        LineageKind::Fork => {
+            header.push_str("\n## Session Mode: Forked Exploration\n\n");
+            header.push_str("You are exploring an independent branch of conversation from the upstream session. **On this initial fork turn, ONLY read and absorb the handoff context — do NOT modify any files, run mutating commands, or start making changes.** Briefly acknowledge the context and wait for the user's next instruction before proceeding.\n");
+        }
+        LineageKind::SideChat => {
+            header.push_str("\n## Session Mode: Read-Only Side Chat\n\n");
+            header.push_str("This is an isolated side-channel discussion window alongside the user's main agent. **On this initial turn, ONLY read and absorb the handoff context — do NOT modify any files or run mutating commands.** Keep this session read-only (do NOT modify workspace files, run git write commands, or execute destructive/state-changing shell commands unless the user explicitly overrides this rule in this chat), briefly acknowledge the context, and wait for the user's question.\n");
+        }
     }
 
     // Git workspace state
@@ -599,5 +625,90 @@ mod tests {
         assert_eq!(default_pty_argv("codex")[0], "codex");
         let wrapped = wrap_handoff_envelope(LineageKind::Fork, "t2", "# Body\nhi");
         assert_eq!(strip_h2_envelope(&format!("{wrapped}\n\nnext prompt")), "next prompt");
+    }
+
+    #[test]
+    fn side_chat_package_includes_read_only_constraint_and_fork_worktree_roundtrips() {
+        let pkg = build_handoff_package(&HandoffBuildInput {
+            kind: LineageKind::SideChat,
+            source_address: "t1",
+            source_provider: Some("claude"),
+            source_session_id: None,
+            source_model: None,
+            cwd: None,
+            entries: &[Entry::User { turn: 1, from: None, text: "Check caching strategy".into(), ts_ms: 1 }],
+            from_turn: None,
+            to_turn: None,
+            max_bytes: 8 * 1024,
+            note: None,
+        });
+        assert!(pkg.markdown.contains("Read-Only Side Chat"));
+        assert!(pkg.markdown.contains("Do NOT modify workspace files"));
+
+        // Verify fork worktree creation carries uncommitted edits and merges back cleanly.
+        let root = crate::test_tmp().join(format!("h2-fork-wt-{}", crate::platform::random_hex()));
+        let repo = root.join("repo");
+        let state = root.join("state");
+        std::fs::create_dir_all(&repo).unwrap();
+        let run_git = |cwd: &Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(["-C", &cwd.to_string_lossy()])
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@local")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@local")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run_git(&repo, &["init", "-q"]);
+        std::fs::write(repo.join("app.txt"), "base\n").unwrap();
+        run_git(&repo, &["add", "app.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "init"]);
+        // Uncommitted edit in origin repo.
+        std::fs::write(repo.join("app.txt"), "base\norigin-dirty\n").unwrap();
+
+        let (wt, branch) = crate::drove::integrate::create_fork_worktree(&state, &repo.to_string_lossy(), "t1").unwrap();
+        let wt_path = Path::new(&wt);
+        assert!(wt_path.is_dir());
+        assert_eq!(branch, "herdr/fork-t1");
+        assert_eq!(std::fs::read_to_string(wt_path.join("app.txt")).unwrap(), "base\norigin-dirty\n");
+
+        // Fork worktree must be on a real branch (not detached HEAD) so the agent can commit freely.
+        let head_branch = String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["-C", &wt, "rev-parse", "--abbrev-ref", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .trim()
+        .to_string();
+        assert_eq!(head_branch, branch, "fork worktree must not be detached HEAD");
+
+        // Commit a file on the fork branch + leave one uncommitted edit, then inspect (read-only).
+        std::fs::write(wt_path.join("fork_committed.txt"), "committed on fork\n").unwrap();
+        run_git(wt_path, &["add", "fork_committed.txt"]);
+        run_git(wt_path, &["commit", "-q", "-m", "fork feature"]);
+        std::fs::write(wt_path.join("fork_wip.txt"), "wip\n").unwrap();
+
+        let summary = crate::drove::integrate::inspect_fork_worktree(&repo.to_string_lossy(), &wt, Some(&branch));
+        assert_eq!(summary.branch, branch);
+        assert!(summary.ahead_commits.iter().any(|c| c.contains("fork feature")), "summary={summary:?}");
+        assert!(summary.dirty_files.iter().any(|f| f.contains("fork_wip.txt")), "summary={summary:?}");
+        assert!(wt_path.is_dir(), "inspect must never delete the worktree");
+
+        // Permanent cleanup must delete both the worktree directory and the fork Git branch.
+        crate::drove::integrate::cleanup_fork_worktree(&repo.to_string_lossy(), wt_path, Some(&branch));
+        assert!(!wt_path.exists(), "worktree dir should be removed on cleanup");
+        let branch_exists = std::process::Command::new("git")
+            .args(["-C", &repo.to_string_lossy(), "rev-parse", "--verify", &format!("refs/heads/{branch}")])
+            .output()
+            .unwrap()
+            .status
+            .success();
+        assert!(!branch_exists, "fork branch must be deleted on cleanup");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

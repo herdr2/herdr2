@@ -447,7 +447,7 @@ Set an agent's status manually ("idle", "working", "blocked", "done"), or "auto"
 
 ## `agent.handoff`
 
-Hand off, fork, open a side-chat, or merge context from an agent or CLI session into a new or existing session (opens the Handoff dialog when neither preset nor into is given).
+Hand off, fork (optionally in an isolated git worktree), open a floating side-chat, or merge context from an agent or CLI session into a new or existing session (opens the Handoff dialog when neither preset nor into is given).
 
 | Argument | Required |
 |---|---|
@@ -458,9 +458,15 @@ Hand off, fork, open a side-chat, or merge context from an agent or CLI session 
 | `mode` | no |
 | `prompt` | no |
 | `recent_turns` | no |
+| `from_turn` | no |
+| `to_turn` | no |
 | `max_bytes` | no |
 | `model` | no |
 | `effort` | no |
+| `worktree` | no |
+| `merge_worktree` | no |
+| `archive_source` | no |
+| `close_overlay` | no |
 | `open` | no |
 
 ## `agent.next`

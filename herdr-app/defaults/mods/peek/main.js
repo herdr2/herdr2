@@ -4,7 +4,7 @@
 
 import { View, div, image, svg } from "gpui-kit";
 import { h_flex, v_flex, Popup, TextareaState, Textarea, InputState, Input, TextView, ScrollHandle } from "gpui-base";
-import { agents, terminals, panes, spaces, run, theme, settings, home, props, closeOverlay, openOverlay, checking, h2, shared, setShared } from "herdr";
+import { agents, terminals, panes, spaces, focused, run, theme, settings, home, props, closeOverlay, openOverlay, checking, h2, shared, setShared } from "herdr";
 import { buildConversationItems, buildPtySessionBadges, summarizeActivityGroup, toolIconPath, formatTime, shortenPath, normalizeConfigOptions, filterConfigChoices, normalizeInboxItems, parseToolDetail, resolveEffortVisual, resolvePeerAddress } from "./acp_model.js";
 
 const LANE_MAX_W = 736; // 46rem editorial content column (--chat-content-max-width)
@@ -97,7 +97,8 @@ function fenceFor(code) {
 export default class Peek extends View {
   init(_props, cx) {
     this.cx = cx;
-    if (!props()?.acp) return;
+    if (!props()?.acp && !props()?.sidePanel) return;
+    this.loadedTerminal = null;
     this.entries = [];
     this.fallbackText = "";
     this.readHow = null;
@@ -220,20 +221,74 @@ export default class Peek extends View {
       cx.timer.every(1000, (tcx) => {
         if (this.status() === "working") tcx?.notify?.();
       });
-      if (props()?.pty) {
+      if (this.isPtyMode() || props()?.sidePanel) {
         cx.timer.every(1200, () => {
-          if (this.term()?.state === "live") this.reloadTranscript();
+          if (this.isPtyMode() && this.term()?.state === "live") this.reloadTranscript();
         });
       }
     }
   }
 
+  focusedMainAddress() {
+    const pList = typeof panes === "function" ? panes() : [];
+    const fp = pList.find((p) => p?.focused && p?.terminal);
+    if (fp?.terminal) return fp.terminal;
+    const aList = typeof agents === "function" ? agents() : [];
+    const fa = aList.find((a) => a?.focused && a?.address);
+    if (fa?.address) return fa.address;
+    const foc = typeof focused === "function" ? focused() : null;
+    return foc?.shown || foc?.terminal || foc?.agent || null;
+  }
+
+  activeSideChatCandidates() {
+    const mainAddr = this.focusedMainAddress();
+    return terminals().filter((x) => {
+      if (!x?.address || x.state !== "live" || x.labels?.["herdr.trashed"]) return false;
+      if (String(x.lineage?.kind || "").toLowerCase().replace("_", "-") !== "side-chat") return false;
+      if (!mainAddr) return false;
+      const parent = resolvePeerAddress(x.lineage?.parent || x.parent || "", x.address);
+      return parent === mainAddr;
+    });
+  }
+
+  activeTerminal() {
+    const p = props() ?? {};
+    if (!p.sidePanel) return p.terminal || null;
+    const candidates = this.activeSideChatCandidates();
+    if (candidates.length === 0) return null;
+    const saved = typeof shared === "function" ? shared("side-chat.active") : null;
+    if (saved && candidates.some((x) => x.address === saved)) {
+      return saved;
+    }
+    return candidates[candidates.length - 1].address;
+  }
+
+  isPtyMode() {
+    const p = props() ?? {};
+    if (p.pty) return true;
+    if (!p.sidePanel) return false;
+    const addr = this.activeTerminal();
+    if (!addr) return false;
+    const rec = terminals().find((t) => t.address === addr);
+    return Boolean(rec && !rec.acp);
+  }
+
+  isSideChatSession(k = this.term()) {
+    const p = props() ?? {};
+    if (p.sidePanel || p.floating) return true;
+    const lk = String(k?.lineage?.kind || this.agentDetail?.lineage?.kind || "").toLowerCase().replace("_", "-");
+    return lk === "side-chat";
+  }
+
   term() {
-    return terminals().find((t) => t.address === props()?.terminal) ?? this.agentDetail ?? null;
+    const addr = this.activeTerminal();
+    if (!addr) return null;
+    return terminals().find((t) => t.address === addr) ?? (this.lastDetailTerminal === addr ? this.agentDetail : null);
   }
 
   status() {
-    const addr = props()?.terminal;
+    const addr = this.activeTerminal();
+    if (!addr) return null;
     const fromAgent = agents().find((a) => a.address === addr)?.status;
     if (fromAgent) return fromAgent;
     const fromTerm = terminals().find((t) => t.address === addr)?.status;
@@ -241,12 +296,12 @@ export default class Peek extends View {
     if (fromTerm?.state) return fromTerm.state;
     const fromPane = panes().find((p) => p.terminal === addr)?.status;
     if (fromPane) return fromPane;
-    if (this.agentDetail?.status?.state === "working") return "working";
-    return this.agentDetail?.state === "finished" ? "ended" : null;
+    if (this.lastDetailTerminal === addr && this.agentDetail?.status?.state === "working") return "working";
+    return this.lastDetailTerminal === addr && this.agentDetail?.state === "finished" ? "ended" : null;
   }
 
   async reloadTranscript() {
-    const terminal = props()?.terminal;
+    const terminal = this.activeTerminal();
     if (!terminal || checking()) return;
     if (this.loading) {
       this.reloadQueued = true;
@@ -257,7 +312,7 @@ export default class Peek extends View {
       const liveTerm = this.term();
       const curTurn = liveTerm?.turn ?? -1;
       const curInboxLen = Number(liveTerm?.inbox_len ?? 0);
-      const needDetail = !props()?.pty && (
+      const needDetail = !this.isPtyMode() && (
         !this.agentDetail
         || this.lastDetailTerminal !== terminal
         || !this.agentDetail.config_options?.length
@@ -322,7 +377,7 @@ export default class Peek extends View {
     }
     this.rollbackPromptItem = { id: item.id, toTurn, prompt, checkingIsolation: true };
     (cx ?? this.cx)?.notify?.();
-    const terminal = props()?.terminal;
+    const terminal = this.activeTerminal();
     if (!terminal || checking()) return;
     try {
       const ckptRes = await h2(["checkpoint", "ls", "--json", terminal]);
@@ -339,7 +394,7 @@ export default class Peek extends View {
   }
 
   async toggleCheckpointDiff(turn, cx) {
-    const terminal = props()?.terminal;
+    const terminal = this.activeTerminal();
     if (!terminal || checking() || !turn) return;
     const isOpen = Boolean(this.checkpointDiffOpen?.[turn]);
     this.checkpointDiffOpen[turn] = !isOpen;
@@ -363,7 +418,7 @@ export default class Peek extends View {
   }
 
   async executeCheckpointRollback(toTurn, restoreFiles, fallbackPrompt, cx) {
-    const terminal = props()?.terminal;
+    const terminal = this.activeTerminal();
     if (!terminal || checking() || this.rollbackBusy) return;
     this.rollbackBusy = true;
     this.rollbackError = null;
@@ -427,7 +482,7 @@ export default class Peek extends View {
     }
   }
 
-  async interruptAgent(terminal = props()?.terminal, cx = this.cx) {
+  async interruptAgent(terminal = this.activeTerminal(), cx = this.cx) {
     if (!terminal || checking() || this.interrupting) return;
     this.interrupting = true;
     this.error = null;
@@ -452,7 +507,7 @@ export default class Peek extends View {
   }
 
   async sendPrompt(steer) {
-    const terminal = props()?.terminal;
+    const terminal = this.activeTerminal();
     const st = this.status();
     if (st === "ended" || this.term()?.state === "finished") return;
     const text = (this.input?.value?.() ?? "").trim();
@@ -465,7 +520,7 @@ export default class Peek extends View {
   }
 
   rawInboxFor(k = this.term()) {
-    if (props()?.pty) return [];
+    if (this.isPtyMode()) return [];
     if (Array.isArray(this.optimisticInbox)) return this.optimisticInbox;
     if (Array.isArray(k?.inbox)) return k.inbox;
     if (Array.isArray(this.agentDetail?.inbox)) return this.agentDetail.inbox;
@@ -473,7 +528,7 @@ export default class Peek extends View {
   }
 
   inboxItemsFor(k = this.term()) {
-    return normalizeInboxItems(this.rawInboxFor(k), terminals(), props()?.terminal ?? "");
+    return normalizeInboxItems(this.rawInboxFor(k), terminals(), this.activeTerminal() ?? "");
   }
 
   startEditInboxItem(item, cx) {
@@ -493,7 +548,7 @@ export default class Peek extends View {
   }
 
   async applyInboxCommand(args, cx) {
-    const terminal = props()?.terminal;
+    const terminal = this.activeTerminal();
     this.inboxBusy = true;
     this.error = null;
     (cx ?? this.cx)?.notify?.();
@@ -530,7 +585,7 @@ export default class Peek extends View {
   }
 
   async saveEditInboxItem(cx) {
-    const terminal = props()?.terminal;
+    const terminal = this.activeTerminal();
     const itemId = this.editingInboxId;
     const trimmed = (this.inboxEditInput?.value?.() ?? "").trim();
     if (!terminal || itemId == null || !trimmed || checking() || this.inboxBusy) return;
@@ -543,7 +598,7 @@ export default class Peek extends View {
   }
 
   async removeInboxItem(itemId, cx) {
-    const terminal = props()?.terminal;
+    const terminal = this.activeTerminal();
     if (!terminal || itemId == null || checking() || this.inboxBusy) return;
     if (Number(this.editingInboxId) === Number(itemId)) {
       this.editingInboxId = null;
@@ -556,7 +611,7 @@ export default class Peek extends View {
   }
 
   configOptionsFor(k) {
-    if (props()?.pty) return [];
+    if (this.isPtyMode()) return [];
     const rawOpts = k?.config_options?.length ? k.config_options : (this.agentDetail?.config_options ?? []);
     const patchedOpts = rawOpts.map((raw) =>
       raw && Object.prototype.hasOwnProperty.call(this.optimisticConfig, raw.id)
@@ -663,7 +718,7 @@ export default class Peek extends View {
     if (this.openConfigId) {
       this.closeConfigPopover(cx ?? this.cx);
     }
-    const terminal = props()?.terminal;
+    const terminal = this.activeTerminal();
     if (!terminal || !opt || checking()) return;
     this.error = null;
     this.optimisticConfig[opt.id] = val;
@@ -1027,6 +1082,28 @@ export default class Peek extends View {
                           .on_mouse_down("left", stopMouse)
                           .on_click((_e, cx) => this.openRollbackConfirm(item, toTurn, fullBody, cx))
                           .child(tr("↺ Restore here", "↺ 恢复到此轮")),
+                      ),
+                    )
+                    .when(Boolean(currentTerminal) && Number(item.turn) >= 1 && !this.isSideChatSession(), (meta) =>
+                      meta.child(
+                        div()
+                          .id(`acp-fork-from-${item.id}`)
+                          .px(7)
+                          .py(2)
+                          .rounded(6)
+                          .border_1()
+                          .border_color(t.border)
+                          .text_size(11)
+                          .text_color(t.muted)
+                          .cursor_pointer()
+                          .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                          .tooltip(tr(`Fork a new session up to turn ${item.turn}`, `从第 ${item.turn} 轮创建会话分叉`))
+                          .on_mouse_down("left", stopMouse)
+                          .on_click((_e, cx) => {
+                            cx.stop_propagation();
+                            run("agent.handoff", { source: currentTerminal, kind: "fork", to_turn: Number(item.turn) });
+                          })
+                          .child(tr("⑂ Fork here", "⑂ 从此轮分叉")),
                       ),
                     ),
                 )
@@ -1713,52 +1790,143 @@ export default class Peek extends View {
   }
 
   renderHandoffBanner(t, item) {
-    const kindLabels = {
-      handoff: tr("Handoff", "上下文接力"),
-      fork: tr("Fork", "分支探索"),
-      "side-chat": tr("Side Chat", "旁路讨论"),
-      "merge-back": tr("Merge Back", "合回上下文"),
+    const kindMeta = {
+      handoff: { label: tr("Handoff", "上下文接力"), color: "#3b82f6" },
+      fork: { label: tr("Fork Session", "会话分叉"), color: "#a855f7" },
+      "side-chat": { label: tr("Side Chat", "旁路讨论"), color: "#14b8a6" },
+      "merge-back": { label: tr("Merge Back", "合回上下文"), color: "#3b82f6" },
     };
-    const kindLabel = kindLabels[item.handoff_kind] || item.handoff_kind || tr("Handoff", "上下文接力");
-    const srcAddr = resolvePeerAddress(item.from_address, props()?.terminal || "");
+    const meta = kindMeta[item.handoff_kind] || { label: item.handoff_kind || tr("Handoff", "上下文接力"), color: t.accent ?? "#3b82f6" };
+    const accent = meta.color;
+    const srcAddr = resolvePeerAddress(item.from_address, this.activeTerminal() || "");
     const src = srcAddr || "?";
     const prov = item.from_provider ? ` (${item.from_provider})` : "";
-    const turns = item.from_turns ? tr(` · turns ${item.from_turns}`, ` · 第 ${item.from_turns} 轮`) : "";
-    const label = `${kindLabel} · ${tr(`from ${src}${prov}`, `来自 ${src}${prov}`)}${turns}`;
-    const accent = t.accent ?? "#3b82f6";
-    return h_flex()
+    const turns = item.from_turns ? tr(` · turns ${item.from_turns}`, ` · 已携带第 ${item.from_turns} 轮`) : "";
+    const hasCtx = Boolean(item.context_markdown && String(item.context_markdown).trim());
+    const kb = hasCtx ? `${(String(item.context_markdown).length / 1024).toFixed(1)} KB` : null;
+    const injected = (this.maxConversationTurn || 0) >= 1;
+    const expandKey = `ho-exp-${item.id}`;
+    const expanded = Boolean(this.expandedGroups?.[expandKey]);
+    const mdOpts = { ...this.mdOptions(t, this.term()?.cwd), link: accent };
+
+    return v_flex()
       .id(`acp-row-${item.id}`)
       .w_full()
       .max_w(LANE_MAX_W)
-      .gap(10)
-      .items_center()
-      .py(4)
-      .child(div().flex_1().h(1).bg(withAlpha(accent, "44") ?? t.border))
+      .min_w(0)
+      .my(4)
+      .rounded(10)
+      .bg(t.raised)
+      .border_1()
+      .border_color(withAlpha(accent, "55") ?? t.border)
+      .overflow_hidden()
       .child(
         h_flex()
-          .gap(6)
-          .px(10)
-          .py(3)
-          .rounded(999)
+          .w_full()
+          .min_w(0)
+          .px(12)
+          .py(8)
+          .gap(8)
           .items_center()
-          .bg(withAlpha(accent, "16") ?? t.raised)
-          .border_1()
-          .border_color(withAlpha(accent, "55") ?? t.border)
-          .text_size(11)
-          .font_medium()
-          .text_color(accent)
-          .when(Boolean(srcAddr), (el) =>
-            el
-              .cursor_pointer()
-              .hover((s) => s.bg(withAlpha(accent, "26") ?? t.hover))
-              .tooltip(tr(`Focus source session ${src}`, `点击跳转到来源会话 ${src}`))
-              .on_mouse_down("left", stopMouse)
-              .on_click(() => run("agent.focus", { terminal: srcAddr })),
+          .justify_between()
+          .bg(withAlpha(accent, "12") ?? t.raised)
+          .child(
+            h_flex()
+              .flex_1()
+              .min_w(0)
+              .gap(6)
+              .flex_wrap()
+              .items_center()
+              .child(
+                div()
+                  .flex_none()
+                  .px(6)
+                  .py(1)
+                  .rounded(4)
+                  .bg(withAlpha(accent, "24") ?? t.raised)
+                  .border_1()
+                  .border_color(withAlpha(accent, "66") ?? t.border)
+                  .text_size(10.5)
+                  .font_semibold()
+                  .text_color(accent)
+                  .child(meta.label),
+              )
+              .child(
+                div()
+                  .min_w(0)
+                  .text_size(11.5)
+                  .font_medium()
+                  .text_color(t.foreground)
+                  .when(Boolean(srcAddr), (el) =>
+                    el
+                      .cursor_pointer()
+                      .hover((s) => s.text_color(accent))
+                      .on_mouse_down("left", stopMouse)
+                      .on_click(() => run("agent.focus", { terminal: srcAddr })),
+                  )
+                  .child(`${tr(`From ${src}${prov}`, `来自 ${src}${prov}`)}${turns}`),
+              )
+              .when(Boolean(kb), (el) =>
+                el.child(div().flex_none().text_size(10.5).text_color(t.dim).child(`· ${kb}`)),
+              )
+              .child(
+                div()
+                  .flex_none()
+                  .px(5)
+                  .py(1)
+                  .rounded(4)
+                  .bg(injected ? "#22c55e1c" : "#f59e0b1c")
+                  .border_1()
+                  .border_color(injected ? "#22c55e55" : "#f59e0b55")
+                  .text_size(10)
+                  .font_medium()
+                  .text_color(injected ? "#22c55e" : "#f59e0b")
+                  .child(
+                    injected
+                      ? tr("Injected into model", "已注入模型上下文")
+                      : tr("Auto-injected on 1st message", "发送首条消息时自动注入"),
+                  ),
+              ),
           )
-          .child(svg("mods/workspace-chrome/git-branch.svg").size(12).flex_none().text_color(accent))
-          .child(label),
+          .when(hasCtx, (el) =>
+            el.child(
+              div()
+                .id(`acp-ho-toggle-${item.id}`)
+                .flex_none()
+                .px(7)
+                .py(2)
+                .rounded(5)
+                .bg(t.background)
+                .border_1()
+                .border_color(t.border)
+                .text_size(10.5)
+                .text_color(t.muted)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                .on_mouse_down("left", stopMouse)
+                .on_click((_e, cx) => {
+                  this.expandedGroups[expandKey] = !expanded;
+                  cx.notify();
+                })
+                .child(expanded ? tr("Hide context", "收起上下文") : tr("Inspect context", "查看携带的上下文")),
+            ),
+          ),
       )
-      .child(div().flex_1().h(1).bg(withAlpha(accent, "44") ?? t.border));
+      .when(hasCtx && expanded, (el) =>
+        el.child(
+          div()
+            .w_full()
+            .min_w(0)
+            .px(12)
+            .py(10)
+            .border_t(1)
+            .border_color(t.border)
+            .text_size(12)
+            .line_height("19px")
+            .text_color(t.muted)
+            .child(TextView.markdown(`acp-ho-md-${item.id}`, String(item.context_markdown), mdOpts).w_full().min_w(0).selectable(true).scrollable(false)),
+        ),
+      );
   }
 
   renderRewindDivider(t, item) {
@@ -2041,6 +2209,7 @@ export default class Peek extends View {
       .children(blocks)
       .when(Boolean(item.changedFiles), (el) => el.child(this.renderChangedFilesCard(t, item, mono)))
       .when(Boolean(item.isFinalTurnReply) && Boolean(item.text), (el) => {
+        const curTerminal = this.activeTerminal();
         const canRewind = item.turn >= 1 && item.turn < (this.maxConversationTurn || 0) && this.status() !== "working" && this.term()?.state !== "finished";
         const toTurn = Number(item.turn ?? 0);
         const confirmThis = this.rollbackPromptItem?.id === item.id;
@@ -2074,6 +2243,28 @@ export default class Peek extends View {
                       .on_mouse_down("left", stopMouse)
                       .on_click((_e, cx) => this.openRollbackConfirm(item, toTurn, "", cx))
                       .child(tr("↺ Restore here", "↺ 恢复到此轮")),
+                  ),
+                )
+                .when(Boolean(curTerminal) && Number(item.turn) >= 1 && !this.isSideChatSession(), (meta) =>
+                  meta.child(
+                    div()
+                      .id(`acp-fork-turn-${item.id}`)
+                      .px(7)
+                      .py(2)
+                      .rounded(6)
+                      .border_1()
+                      .border_color(t.border)
+                      .text_size(11)
+                      .text_color(t.muted)
+                      .cursor_pointer()
+                      .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                      .tooltip(tr(`Fork a new session up to turn ${item.turn}`, `从第 ${item.turn} 轮创建会话分叉`))
+                      .on_mouse_down("left", stopMouse)
+                      .on_click((_e, cx) => {
+                        cx.stop_propagation();
+                        run("agent.handoff", { source: curTerminal, kind: "fork", to_turn: Number(item.turn) });
+                      })
+                      .child(tr("⑂ Fork here", "⑂ 从此轮分叉")),
                   ),
                 ),
             )
@@ -2295,7 +2486,7 @@ export default class Peek extends View {
 
   renderEmptyState(t, k, program, agentName, shortCwd, st) {
     const folderName = (shortCwd || "").split(/[\\/]/).filter(Boolean).pop() || "";
-    const starting = st === "starting" || (!props()?.pty && k?.state === "live" && !k?.acp_session_id && !this.agentDetail?.acp_session_id && st !== "idle" && st !== "done");
+    const starting = st === "starting" || (!this.isPtyMode() && k?.state === "live" && !k?.acp_session_id && !this.agentDetail?.acp_session_id && st !== "idle" && st !== "done");
     return v_flex()
       .w_full()
       .max_w(LANE_MAX_W)
@@ -2436,13 +2627,16 @@ export default class Peek extends View {
     const activeIdx = Math.min(Math.max(this.highlightedChoiceIdx, 0), Math.max(filtered.length - 1, 0));
     const rows = [];
     let lastGroup = null;
+    let estListH = 8;
 
     filtered.forEach((choice, idx) => {
       if (choice.group && choice.group !== lastGroup) {
         lastGroup = choice.group;
+        estListH += 26;
         rows.push(
           div()
             .id(`acp-cfg-grp-${opt.id}-${idx}`)
+            .flex_none()
             .px(8)
             .pt(6)
             .pb(2)
@@ -2461,10 +2655,12 @@ export default class Peek extends View {
         ? tr(choice.description || "Skip all permission checks (bypassPermissions)", "跳过所有权限检查 (bypassPermissions)")
         : choice.description;
       const titleColor = isBypassChoice ? (t.blocked ?? "#f59e0b") : t.foreground;
+      estListH += choiceDesc ? 48 : 34;
       rows.push(
         h_flex()
           .id(`acp-cfg-choice-${opt.id}-${idx}`)
           .w_full()
+          .flex_none()
           .px(9)
           .py(6)
           .gap(8)
@@ -2520,10 +2716,12 @@ export default class Peek extends View {
     });
 
     if (showSearch && trimmed && !hasExact) {
+      estListH += 36;
       rows.push(
         h_flex()
           .id("acp-cfg-apply-custom")
           .w_full()
+          .flex_none()
           .px(9)
           .py(6)
           .gap(8)
@@ -2564,9 +2762,13 @@ export default class Peek extends View {
       ? tr(opt.description, "当前 ACP 会话的权限策略")
       : opt.description;
 
+    const maxListH = showSearch ? 320 : 420;
+    const listH = Math.min(Math.max(estListH, 40), maxListH);
+
     return div()
       .pb(6)
       .on_mouse_down("left", stopMouse)
+      .on_scroll_wheel((_e, cx) => cx.stop_propagation())
       .child(
         v_flex()
           .id(`acp-cfg-popover-${opt.id}`)
@@ -2650,19 +2852,24 @@ export default class Peek extends View {
             ),
           )
           .child(
-            v_flex()
+            div()
               .id("acp-cfg-list")
               .w_full()
-              .max_h(showSearch ? 320 : 420)
+              .h(listH)
+              .max_h(maxListH)
               .overflow_y_scrollbar()
-              .gap(2)
-              .children(rows),
+              .child(
+                v_flex()
+                  .w_full()
+                  .gap(2)
+                  .children(rows),
+              ),
           ),
       );
   }
 
   renderCapabilityBar(t, opts, k) {
-    const isPty = Boolean(props()?.pty);
+    const isPty = this.isPtyMode();
     const ptyBadges = isPty ? buildPtySessionBadges(this.sessionMeta, k) : [];
     if (!isPty && !opts.length) return null;
 
@@ -2690,7 +2897,7 @@ export default class Peek extends View {
               .hover((s) => s.bg(t.hover).text_color(t.foreground))
               .tooltip(tr("Switch back to raw terminal view", "切回原始终端视图"))
               .on_mouse_down("left", stopMouse)
-              .on_click(() => run("terminal.view", { terminal: props()?.terminal, view: "terminal" }))
+              .on_click(() => run("terminal.view", { terminal: this.activeTerminal(), view: "terminal" }))
               .child(svg(ICONS.terminal).size(13).flex_none().text_color(t.dim))
               .child(tr("Terminal view", "终端视图")),
           )
@@ -2806,7 +3013,7 @@ export default class Peek extends View {
   }
 
   renderContextStrip(t, k, shortCwd) {
-    const addr = props()?.terminal;
+    const addr = this.activeTerminal();
     const ended = k?.state === "finished" || k?.status === "ended";
     const lineageParent = resolvePeerAddress(k?.lineage?.parent || this.agentDetail?.lineage?.parent || "", addr) || null;
     const pInfo = panes().find((p) => p.terminal === addr) ?? null;
@@ -2950,7 +3157,7 @@ export default class Peek extends View {
                 .text_color(t.muted)
                 .cursor_pointer()
                 .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                .tooltip(tr("Context handoff / Fork / Side Chat / Merge", "上下文接力 / 分支探索 / 旁路讨论 / 合回"))
+                .tooltip(tr("Context Handoff / Fork Session / Side Chat / Merge", "上下文接力 / 会话分叉 / 旁路讨论 / 合回"))
                 .on_mouse_down("left", stopMouse)
                 .on_click((_e, cx) => {
                   cx.stop_propagation();
@@ -3420,7 +3627,7 @@ export default class Peek extends View {
                         .on_click((_e, cx) => {
                           if (this.interrupting) return;
                           if (this.openConfigId) this.closeConfigPopover(cx);
-                          this.interruptAgent(props()?.terminal, cx);
+                          this.interruptAgent(this.activeTerminal(), cx);
                         })
                         .child(
                           this.interrupting
@@ -3484,9 +3691,24 @@ export default class Peek extends View {
   }
 
   renderAcp(t, k, st, pic, parent) {
-    const { terminal, overlay, tab, pane } = props() ?? {};
+    const p = props() ?? {};
+    const { overlay, tab, pane } = p;
+    const isSidePanel = Boolean(p.sidePanel);
+    const terminal = this.activeTerminal();
+    if (terminal !== this.loadedTerminal) {
+      this.loadedTerminal = terminal;
+      this.entries = [];
+      this.fallbackText = "";
+      this.readHow = null;
+      this.sessionMeta = null;
+      this.agentDetail = null;
+      this.lastDetailTerminal = "";
+      this.loadedOnce = false;
+      this.error = null;
+      this.lastKey = "";
+    }
     const isTab = Boolean(tab);
-    const isPty = Boolean(props()?.pty);
+    const isPty = this.isPtyMode();
     const isDark = Boolean(settings()?.dark ?? true);
     const myPane = pane ?? panes().find((p) => (p.acp || p.structured) && p.terminal === terminal)?.pane ?? null;
     const ckptEpoch = `${terminal}:${k?.foreground?.pid ?? ""}:${k?.checkpoint_seq ?? 0}:${shared("checkpoint.sync") ?? ""}`;
@@ -3536,10 +3758,11 @@ export default class Peek extends View {
     if (parent) {
       threadChildren.push(this.renderSubagentDivider(t, parent));
     }
-    if (items.length === 0) {
+    const visibleItems = items.filter((item) => item.kind !== "stderr_group");
+    if (visibleItems.length === 0) {
       threadChildren.push(this.renderEmptyState(t, k, program, agentName, shortCwd, st));
     } else {
-      for (const item of items) {
+      for (const item of visibleItems) {
         if (item.kind === "user") threadChildren.push(this.renderUserItem(t, item, terminal));
         else if (item.kind === "activity_group") threadChildren.push(this.renderActivityGroup(t, item, mono));
         else if (item.kind === "assistant") threadChildren.push(this.renderAssistantItem(t, item, mono));
@@ -3547,7 +3770,6 @@ export default class Peek extends View {
         else if (item.kind === "rewind") threadChildren.push(this.renderRewindDivider(t, item));
         else if (item.kind === "terminal_snapshot") threadChildren.push(this.renderTerminalSnapshot(t, item, terminal, mono));
         else if (item.kind === "error") threadChildren.push(this.renderErrorItem(t, item));
-        else if (item.kind === "stderr_group") threadChildren.push(this.renderStderrItem(t, item, mono));
       }
     }
 
@@ -3606,42 +3828,139 @@ export default class Peek extends View {
     }
 
     const padX = isTab ? 20 : 28;
-    const modalLineageParent = resolvePeerAddress(k?.lineage?.parent || this.agentDetail?.lineage?.parent || "", terminal) || null;
+    const isFloating = Boolean(props()?.floating) || isSidePanel;
+    const sideCandidates = isSidePanel ? this.activeSideChatCandidates() : [];
+    const modalLineageKind = String(k?.lineage?.kind || this.agentDetail?.lineage?.kind || (isFloating ? "side-chat" : "")).toLowerCase();
+    const modalKindBadge = modalLineageKind === "fork"
+      ? { label: tr("Fork", "会话分叉"), color: "#a855f7" }
+      : (modalLineageKind === "side-chat" || modalLineageKind === "side_chat")
+        ? { label: tr("Side Chat", "旁路讨论"), color: "#14b8a6" }
+        : modalLineageKind === "handoff"
+          ? { label: tr("Handoff", "上下文接力"), color: "#3b82f6" }
+          : null;
+    const modalWorktree = k?.lineage?.worktree_path || this.agentDetail?.lineage?.worktree_path || null;
+    const modalLineageParent = resolvePeerAddress(k?.lineage?.parent || this.agentDetail?.lineage?.parent || props()?.parent || "", terminal) || null;
+    const modalUpstream = modalLineageParent || parent?.address || resolvePeerAddress(k?.parent || "", terminal) || null;
+    const modalUpstreamTerm = modalUpstream ? (parent?.address === modalUpstream ? parent : terminals().find((x) => x.address === modalUpstream) ?? null) : null;
+    const modalUpstreamName = modalUpstreamTerm?.labels?.["herdr.name"] || modalUpstreamTerm?.name || null;
+    const modalUpstreamLabel = modalUpstreamName && modalUpstreamName !== modalUpstream ? `${modalUpstreamName} (${modalUpstream})` : modalUpstream;
     const modalEnded = st === "ended" || k?.state === "finished";
+    const modalAccent = t.accent ?? "#3b82f6";
     const modalHeader = h_flex()
       .id("acp-header")
+      .w_full()
+      .min_w(0)
       .min_h(48)
-      .px(16)
+      .px(12)
       .py(6)
-      .gap(10)
+      .gap(8)
       .flex_none()
       .items_center()
+      .overflow_hidden()
       .bg(t.canvas ?? t.background)
       .border_b(1)
       .border_color(t.border)
-      .child(this.avatarTile(t, program, pic, 28, 15))
+      .child(this.avatarTile(t, program, pic, 26, 14))
       .child(
         v_flex()
           .flex_1()
           .min_w(0)
-          .gap(1)
+          .gap(2)
           .child(
             h_flex()
-              .gap(7)
+              .w_full()
+              .min_w(0)
+              .gap(6)
               .items_center()
-              .child(div().truncate().text_size(13).font_semibold().text_color(t.foreground).child(agentName))
-              .when(Boolean(terminal), (el) =>
-                el.child(div().font_family(mono).text_size(11).text_color(t.dim).flex_none().child(terminal)),
+              .child(div().min_w(0).truncate().text_size(13).font_semibold().text_color(t.foreground).child(agentName))
+              .when(Boolean(modalKindBadge), (el) =>
+                el.child(
+                  div()
+                    .id("acp-modal-kind")
+                    .flex_none()
+                    .px(5)
+                    .py(1)
+                    .rounded(4)
+                    .bg(withAlpha(modalKindBadge.color, "20") ?? t.raised)
+                    .border_1()
+                    .border_color(withAlpha(modalKindBadge.color, "66") ?? t.border)
+                    .text_size(10)
+                    .font_semibold()
+                    .text_color(modalKindBadge.color)
+                    .child(modalKindBadge.label),
+                ),
+              )
+              .when(modalLineageKind === "side-chat" || modalLineageKind === "side_chat", (el) =>
+                el.child(
+                  div()
+                    .flex_none()
+                    .px(5)
+                    .py(1)
+                    .rounded(4)
+                    .bg(t.raised)
+                    .border_1()
+                    .border_color(t.border)
+                    .text_size(10)
+                    .text_color(t.muted)
+                    .tooltip(tr("Read-only discussion mode (will not edit workspace files unless asked)", "只读参谋模式：默认仅分析探讨，不主动修改工作区文件"))
+                    .child(tr("Read-only", "只读")),
+                ),
+              )
+              .when(Boolean(modalWorktree), (el) =>
+                el.child(
+                  div()
+                    .flex_none()
+                    .px(5)
+                    .py(1)
+                    .rounded(4)
+                    .bg(withAlpha("#f59e0b", "20") ?? t.raised)
+                    .border_1()
+                    .border_color(withAlpha("#f59e0b", "66") ?? t.border)
+                    .text_size(10)
+                    .font_semibold()
+                    .text_color("#f59e0b")
+                    .tooltip(tr(`Isolated Worktree: ${modalWorktree}`, `独立 Worktree：${modalWorktree}`))
+                    .child("Worktree"),
+                ),
+              )
+              .when(Boolean(terminal) && !isSidePanel, (el) =>
+                el.child(div().font_family(mono).text_size(10.5).text_color(t.dim).flex_none().child(terminal)),
               ),
           )
           .child(
             h_flex()
+              .w_full()
+              .min_w(0)
               .gap(8)
               .items_center()
               .text_size(11)
               .text_color(t.dim)
-              .when(Boolean(parent), (el) => el.child(div().flex_none().text_color(t.muted).child(tr(`from ${parent.name || parent.address}`, `来自 ${parent.name || parent.address}`))))
-              .when(Boolean(shortCwd), (el) => el.child(div().min_w(0).truncate().child(shortCwd))),
+              .when(Boolean(modalUpstream), (el) =>
+                el.child(
+                  h_flex()
+                    .id("acp-modal-parent")
+                    .flex_none()
+                    .px(5)
+                    .py(1)
+                    .rounded(4)
+                    .bg(withAlpha(modalAccent, "14") ?? t.raised)
+                    .border_1()
+                    .border_color(withAlpha(modalAccent, "44") ?? t.border)
+                    .text_color(modalAccent)
+                    .cursor_pointer()
+                    .hover((s) => s.bg(withAlpha(modalAccent, "28") ?? t.hover).text_color(t.foreground))
+                    .tooltip(tr(`Click to return to upstream agent ${modalUpstream}`, `点击返回上游智能体 ${modalUpstream}`))
+                    .on_mouse_down("left", stopMouse)
+                    .on_click((_e, cx) => {
+                      cx.stop_propagation();
+                      run("agent.focus", { terminal: modalUpstream });
+                      if (isSidePanel) run("layout.hide", { id: "panel" });
+                      else if (overlay) closeOverlay(overlay);
+                    })
+                    .child(tr(`↳ from ${modalUpstreamLabel}`, `↳ 来自 ${modalUpstreamLabel}`)),
+                ),
+              )
+              .when(Boolean(shortCwd) && !isFloating, (el) => el.child(div().min_w(0).truncate().child(shortCwd))),
           ),
       )
       .child(
@@ -3666,13 +3985,26 @@ export default class Peek extends View {
               ),
             ),
           )
-          .child(
-            this.pillButton(
-              t,
-              "acp-refresh",
-              h_flex().gap(5).items_center().child(svg(ICONS.refresh).size(12).when(this.loading, (s) => s.spin(900))).child(tr("Refresh", "刷新")),
-              () => this.reloadTranscript(),
-              { h: 26, px: 8 },
+          .when(!isFloating, (el) =>
+            el.child(
+              this.pillButton(
+                t,
+                "acp-refresh",
+                h_flex().gap(5).items_center().child(svg(ICONS.refresh).size(12).when(this.loading, (s) => s.spin(900))).child(tr("Refresh", "刷新")),
+                () => this.reloadTranscript(),
+                { h: 26, px: 8 },
+              ),
+            ),
+          )
+          .when(isSidePanel && Boolean(terminal) && isPty && !modalEnded, (el) =>
+            el.child(
+              this.pillButton(
+                t,
+                "side-to-term",
+                h_flex().gap(4).items_center().child(svg(ICONS.terminal).size(12)).child(tr("Terminal", "终端")),
+                () => run("terminal.view", { terminal, view: "terminal" }),
+                { outlined: true, h: 26, px: 8, tooltip: tr("Switch back to live CLI terminal", "切回实时终端视图") },
+              ),
             ),
           )
           .when(Boolean(terminal) && !modalEnded && Boolean(modalLineageParent), (el) =>
@@ -3680,45 +4012,74 @@ export default class Peek extends View {
               this.pillButton(
                 t,
                 "acp-merge-back",
-                h_flex().gap(4).items_center().child(svg(ICONS.cornerUpRight).size(12)).child(tr(`Merge → ${modalLineageParent}`, `合回 ${modalLineageParent}`)),
-                () => run("agent.handoff", { source: terminal, into: modalLineageParent, kind: "merge-back" }),
+                h_flex()
+                  .gap(4)
+                  .items_center()
+                  .child(svg(ICONS.cornerUpRight).size(12))
+                  .child(isSidePanel ? tr("Merge", "合回") : isFloating ? tr("Merge & Close", "合回并关闭") : tr(`Merge → ${modalLineageParent}`, `合回 ${modalLineageParent}`)),
+                () =>
+                  run("agent.handoff", {
+                    source: terminal,
+                    into: modalLineageParent,
+                    kind: "merge-back",
+                    ...(!isSidePanel && isFloating && overlay ? { close_overlay: overlay } : {}),
+                  }),
                 { outlined: true, h: 26, px: 9 },
               ),
             ),
           )
-          .when(Boolean(terminal) && !modalEnded, (el) =>
+          .when(isFloating && Boolean(modalUpstream), (el) =>
+            el.child(
+              this.pillButton(
+                t,
+                "acp-return-main",
+                tr("↩ Main", "↩ 回主 Agent"),
+                () => {
+                  run("agent.focus", { terminal: modalUpstream });
+                  if (isSidePanel) run("layout.hide", { id: "panel" });
+                  else if (overlay) closeOverlay(overlay);
+                },
+                { outlined: true, h: 26, px: 9 },
+              ),
+            ),
+          )
+          .when(Boolean(terminal) && !modalEnded && !isFloating, (el) =>
             el.child(
               this.pillButton(
                 t,
                 "acp-handoff",
                 h_flex().gap(4).items_center().child(svg(ICONS.gitBranch).size(12)).child(tr("Handoff", "接力")),
                 () => run("agent.handoff", { source: terminal, kind: "handoff" }),
-                { outlined: true, h: 26, px: 9, tooltip: tr("Context handoff / Fork / Side Chat / Merge", "上下文接力 / 分支探索 / 旁路讨论 / 合回") },
+                { outlined: true, h: 26, px: 9, tooltip: tr("Context Handoff / Fork Session / Side Chat", "上下文接力 / 会话分叉 / 旁路讨论") },
               ),
             ),
           )
-          .child(
-            this.pillButton(
-              t,
-              "acp-mount-tab",
-              tr("↗ Open as Tab", "↗ 挂载为标签页"),
-              () => {
-                run("terminal.keep", { terminal, place: "tab" });
-                if (overlay) closeOverlay(overlay);
-              },
-              { outlined: true, h: 26, px: 9 },
+          .when(!isFloating, (el) =>
+            el.child(
+              this.pillButton(
+                t,
+                "acp-mount-tab",
+                tr("↗ Open as Tab", "↗ 挂载为标签页"),
+                () => {
+                  run("terminal.keep", { terminal, place: "tab" });
+                  if (overlay) closeOverlay(overlay);
+                },
+                { outlined: true, h: 26, px: 9 },
+              ),
             ),
           )
-          .child(
-            this.pillButton(
-              t,
-              "acp-split-right",
-              tr("Split right", "右侧分栏"),
-              () => {
-                run("terminal.keep", { terminal, place: "right" });
-                if (overlay) closeOverlay(overlay);
-              },
-              { outlined: true, h: 26, px: 9 },
+          .when(!isSidePanel, (el) =>
+            el.child(
+              this.pillButton(
+                t,
+                "acp-split-right",
+                isFloating ? tr("Dock", "转分栏") : tr("Split right", "右侧分栏"),
+                () => {
+                  run("terminal.keep", { terminal, place: "right" });
+                  if (overlay) closeOverlay(overlay);
+                },
+                { outlined: true, h: 26, px: 9 },
+              ),
             ),
           )
           .when(st === "working", (el) =>
@@ -3732,16 +4093,18 @@ export default class Peek extends View {
               ),
             ),
           )
-          .child(
-            this.pillButton(
-              t,
-              "acp-kill",
-              tr("Delete", "移入回收站"),
-              () => {
-                run("agent.trash", { terminal });
-                if (!isTab && overlay) closeOverlay(overlay);
-              },
-              { danger: true, h: 26, px: 8 },
+          .when(!isSidePanel, (el) =>
+            el.child(
+              this.pillButton(
+                t,
+                "acp-kill",
+                tr("Delete", "移入回收站"),
+                () => {
+                  run("agent.trash", { terminal });
+                  if (!isTab && overlay) closeOverlay(overlay);
+                },
+                { danger: true, h: 26, px: 8 },
+              ),
             ),
           )
           .child(
@@ -3749,7 +4112,10 @@ export default class Peek extends View {
               t,
               "acp-close",
               svg(ICONS.x).size(14),
-              () => closeOverlay(overlay),
+              () => {
+                if (isSidePanel) run("layout.hide", { id: "panel" });
+                else if (overlay) closeOverlay(overlay);
+              },
               { h: 26, px: 6 },
             ),
           ),
@@ -3852,6 +4218,7 @@ export default class Peek extends View {
         }
       })
       .when(!isTab, (el) => el.child(modalHeader))
+      .when(isSidePanel && sideCandidates.length > 1, (el) => el.child(this.renderSideChatSwitcher(t, sideCandidates, terminal)))
       .when(Boolean(this.error), (el) =>
         el.child(
           h_flex()
@@ -3909,18 +4276,356 @@ export default class Peek extends View {
       );
   }
 
+  renderSidePanelEmpty(t) {
+    const mainTarget =
+      panes().find((x) => x.focused && x.terminal)?.terminal ||
+      agents().find((a) => a.focused)?.address ||
+      panes().find((x) => x.terminal)?.terminal ||
+      null;
+    const accent = "#14b8a6";
+    return v_flex()
+      .id("side-chat-empty")
+      .size_full()
+      .bg(t.canvas ?? t.background)
+      .border_l(1)
+      .border_color(t.border)
+      .child(
+        h_flex()
+          .h(40)
+          .px(14)
+          .gap(8)
+          .flex_none()
+          .items_center()
+          .justify_between()
+          .bg(t.chrome)
+          .border_b(1)
+          .border_color(t.border)
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .child(svg(ICONS.messagesSquare).size(14).text_color(accent))
+              .child(div().text_size(12.5).font_semibold().text_color(t.foreground).child(tr("Side Chat", "旁路讨论")))
+              .child(div().px(5).py(1).rounded(4).bg(withAlpha(accent, "20") ?? t.raised).text_size(10).font_semibold().text_color(accent).child(tr("Read-Only", "只读"))),
+          )
+          .child(
+            div()
+              .id("side-empty-close")
+              .p(4)
+              .rounded(4)
+              .text_color(t.dim)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover).text_color(t.foreground))
+              .on_click(() => run("layout.hide", { id: "panel" }))
+              .child(svg(ICONS.x).size(13)),
+          ),
+      )
+      .child(
+        v_flex()
+          .flex_1()
+          .px(24)
+          .gap(12)
+          .items_center()
+          .justify_center()
+          .child(
+            div()
+              .w(40)
+              .h(40)
+              .rounded(10)
+              .bg(withAlpha(accent, "1c") ?? t.raised)
+              .border_1()
+              .border_color(withAlpha(accent, "55") ?? t.border)
+              .flex()
+              .items_center()
+              .justify_center()
+              .child(svg(ICONS.messagesSquare).size(20).text_color(accent)),
+          )
+          .child(div().text_size(14).font_semibold().text_color(t.foreground).child(tr("No active Side Chat", "当前暂无旁路讨论")))
+          .child(
+            div()
+              .max_w(320)
+              .text_center()
+              .text_size(12)
+              .line_height("18px")
+              .text_color(t.muted)
+              .whitespace_normal()
+              .child(
+                tr(
+                  "Open a read-only side channel with current agent context to ask second opinions without polluting main history or modifying files.",
+                  "携带当前主会话上下文开启只读旁路讨论，随时找其他模型分析查证，不污染主线记录，也不修改工作区文件。",
+                ),
+              ),
+          )
+          .when(Boolean(mainTarget), (el) =>
+            el.child(
+              h_flex()
+                .id("side-empty-start")
+                .mt(4)
+                .h(32)
+                .px(16)
+                .gap(6)
+                .items_center()
+                .rounded(8)
+                .bg(accent)
+                .text_size(12)
+                .font_semibold()
+                .text_color("#ffffff")
+                .cursor_pointer()
+                .hover((s) => s.opacity(0.9))
+                .on_click(() => run("agent.handoff", { source: mainTarget, kind: "side-chat" }))
+                .child(svg(ICONS.messagesSquare).size(13).text_color("#ffffff"))
+                .child(tr("Start Side Chat", "开启旁路讨论")),
+            ),
+          ),
+      );
+  }
+
+  renderSideChatSwitcher(t, sideCandidates, terminal) {
+    return h_flex()
+      .id("side-chat-switcher")
+      .w_full()
+      .min_w(0)
+      .px(12)
+      .py(6)
+      .gap(6)
+      .flex_none()
+      .flex_wrap()
+      .items_center()
+      .bg(t.chrome)
+      .border_b(1)
+      .border_color(t.border)
+      .children(
+        sideCandidates.map((sc) => {
+          const active = sc.address === terminal;
+          const label = sc.labels?.["herdr.name"] || sc.name || sc.program?.name || sc.address;
+          const showAddr = label !== sc.address;
+          return h_flex()
+            .id(`side-sw-${sc.address}`)
+            .h(24)
+            .px(8)
+            .gap(5)
+            .flex_none()
+            .items_center()
+            .rounded(6)
+            .border_1()
+            .border_color(active ? "#14b8a6" : t.border)
+            .bg(active ? (withAlpha("#14b8a6", "1f") ?? t.selected) : t.raised)
+            .text_size(11)
+            .when(active, (s) => s.font_semibold())
+            .text_color(active ? t.foreground : t.muted)
+            .cursor_pointer()
+            .hover((s) => s.bg(t.hover).text_color(t.foreground))
+            .on_mouse_down("left", stopMouse)
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              if (typeof setShared === "function") setShared("side-chat.active", sc.address);
+              run("terminal.peek", { terminal: sc.address });
+              cx?.notify?.();
+            })
+            .child(label)
+            .when(showAddr, (pill) => pill.child(div().text_size(9.5).text_color(t.dim).child(sc.address)))
+            .child(
+              div()
+                .id(`side-sw-rm-${sc.address}`)
+                .p(2)
+                .rounded(4)
+                .text_color(t.dim)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                .tooltip(tr("Move side chat to recycle bin", "结束并移入回收站"))
+                .on_mouse_down("left", stopMouse)
+                .on_click((_e, cx) => {
+                  cx.stop_propagation();
+                  run("agent.trash", { terminal: sc.address });
+                })
+                .child(svg(ICONS.x).size(10)),
+            );
+        }),
+      );
+  }
+
+  renderSideTermHeader(t, k, st, pic, parent) {
+    const terminal = this.activeTerminal();
+    const sideCandidates = this.activeSideChatCandidates();
+    const agentName = k?.labels?.["herdr.name"] || k?.name || k?.template || k?.program?.name || terminal || "CLI";
+    const modalLineageParent = resolvePeerAddress(k?.lineage?.parent || parent?.address || "", terminal) || null;
+    const modalUpstreamLabel = modalLineageParent
+      ? (terminals().find((x) => x.address === modalLineageParent)?.labels?.["herdr.name"] || parent?.name || modalLineageParent)
+      : "";
+    const accent = "#14b8a6";
+    const ended = st === "ended" || k?.state === "finished";
+    return v_flex()
+      .id("side-term-header")
+      .w_full()
+      .min_w(0)
+      .bg(t.surface)
+      .child(
+        h_flex()
+          .w_full()
+          .min_w(0)
+          .px(12)
+          .py(8)
+          .gap(8)
+          .flex_none()
+          .items_center()
+          .justify_between()
+          .bg(t.surface)
+          .border_b(1)
+          .border_color(t.border)
+          .overflow_hidden()
+          .child(
+            v_flex()
+              .flex_1()
+              .min_w(0)
+              .gap(2)
+              .child(
+                h_flex()
+                  .w_full()
+                  .min_w(0)
+                  .gap(6)
+                  .items_center()
+                  .when(Boolean(pic), (el) => el.child(pic))
+                  .child(div().min_w(0).truncate().text_size(12.5).font_semibold().text_color(t.foreground).child(agentName))
+                  .child(
+                    div()
+                      .flex_none()
+                      .px(5)
+                      .py(1)
+                      .rounded(4)
+                      .bg(withAlpha(accent, "20") ?? t.raised)
+                      .border_1()
+                      .border_color(withAlpha(accent, "66") ?? t.border)
+                      .text_size(10)
+                      .font_semibold()
+                      .text_color(accent)
+                      .child(tr("Side Chat", "旁路讨论")),
+                  )
+                  .child(
+                    div()
+                      .flex_none()
+                      .px(5)
+                      .py(1)
+                      .rounded(4)
+                      .bg(t.raised)
+                      .border_1()
+                      .border_color(t.border)
+                      .text_size(10)
+                      .text_color(t.muted)
+                      .child("CLI"),
+                  ),
+              )
+              .when(Boolean(modalLineageParent), (col) =>
+                col.child(
+                  h_flex()
+                    .w_full()
+                    .min_w(0)
+                    .gap(6)
+                    .items_center()
+                    .text_size(11)
+                    .child(
+                      h_flex()
+                        .id("side-term-parent")
+                        .flex_none()
+                        .px(5)
+                        .py(1)
+                        .rounded(4)
+                        .bg(withAlpha(accent, "14") ?? t.raised)
+                        .border_1()
+                        .border_color(withAlpha(accent, "44") ?? t.border)
+                        .text_color(accent)
+                        .cursor_pointer()
+                        .hover((s) => s.bg(withAlpha(accent, "28") ?? t.hover).text_color(t.foreground))
+                        .on_mouse_down("left", stopMouse)
+                        .on_click((_e, cx) => {
+                          cx.stop_propagation();
+                          run("agent.focus", { terminal: modalLineageParent });
+                          run("layout.hide", { id: "panel" });
+                        })
+                        .child(tr(`↳ from ${modalUpstreamLabel}`, `↳ 来自 ${modalUpstreamLabel}`)),
+                    ),
+                ),
+              ),
+          )
+          .child(
+            h_flex()
+              .gap(4)
+              .items_center()
+              .flex_none()
+              .when(Boolean(terminal) && !ended, (el) =>
+                el.child(
+                  this.pillButton(
+                    t,
+                    "side-to-chat",
+                    h_flex().gap(4).items_center().child(svg(ICONS.messagesSquare).size(12)).child(tr("Chat", "对话视图")),
+                    () => run("terminal.view", { terminal, view: "peek" }),
+                    { outlined: true, h: 26, px: 8, tooltip: tr("Switch to structured chat view", "切换至对话视图") },
+                  ),
+                ),
+              )
+              .when(Boolean(terminal) && !ended && Boolean(modalLineageParent), (el) =>
+                el.child(
+                  this.pillButton(
+                    t,
+                    "acp-merge-back",
+                    h_flex().gap(4).items_center().child(svg(ICONS.cornerUpRight).size(12)).child(tr("Merge", "合回")),
+                    () => run("agent.handoff", { source: terminal, into: modalLineageParent, kind: "merge-back" }),
+                    { outlined: true, h: 26, px: 8 },
+                  ),
+                ),
+              )
+              .when(Boolean(modalLineageParent), (el) =>
+                el.child(
+                  this.pillButton(
+                    t,
+                    "acp-return-main",
+                    tr("↩ Main", "↩ 回主 Agent"),
+                    () => {
+                      run("agent.focus", { terminal: modalLineageParent });
+                      run("layout.hide", { id: "panel" });
+                    },
+                    { outlined: true, h: 26, px: 8 },
+                  ),
+                ),
+              ),
+          ),
+      )
+      .when(sideCandidates.length > 1, (el) => el.child(this.renderSideChatSwitcher(t, sideCandidates, terminal)));
+  }
+
   render() {
     const t = theme();
-    const { terminal, overlay, acp } = props() ?? {};
+    const p = props() ?? {};
+    const { overlay, acp, floating, parent: parentProp, sidePanel, sideTermHeader } = p;
+    const terminal = this.activeTerminal();
+    if (sidePanel) {
+      if (!terminal) return this.renderSidePanelEmpty(t);
+      const k = this.term();
+      const st = this.status();
+      const pic = icon(k?.program, 14, t.foreground);
+      const parent = k?.parent ? terminals().find((x) => x.address === k.parent) : null;
+      if (sideTermHeader) {
+        return this.renderSideTermHeader(t, k, st, pic, parent);
+      }
+      return this.renderAcp(t, k, st, pic, parent);
+    }
     const k = this.term();
     const st = this.status();
     const pic = icon(k?.program, 14, t.foreground);
-    const parent = k?.parent ? terminals().find((p) => p.address === k.parent) : null;
+    const parent = k?.parent ? terminals().find((x) => x.address === k.parent) : null;
     if (acp) {
       return this.renderAcp(t, k, st, pic, parent);
     }
     const home = panes().some((p) => p.terminal === terminal);
     const glyph = st === "working" ? SPIN[0] : st === "idle" ? "○" : st ? "●" : "·";
+    const lineageKind = String(k?.lineage?.kind || (floating ? "side-chat" : "")).toLowerCase();
+    const kindBadge = lineageKind === "fork"
+      ? { label: tr("Fork", "会话分叉"), color: "#a855f7" }
+      : (lineageKind === "side-chat" || lineageKind === "side_chat")
+        ? { label: tr("Side Chat", "旁路讨论"), color: "#14b8a6" }
+        : lineageKind === "handoff"
+          ? { label: tr("Handoff", "上下文接力"), color: "#3b82f6" }
+          : null;
+    const upstreamAddr = resolvePeerAddress(k?.lineage?.parent || parent?.address || parentProp || "", terminal) || null;
     return h_flex()
       .size_full()
       .px(12)
@@ -3933,12 +4638,74 @@ export default class Peek extends View {
       .child(div().w(12).flex_none().text_color(t[st] ?? t.dim).when(st === "working", (el) => el.frames(SPIN, 90)).child(glyph))
       .when(Boolean(pic), (el) => el.child(pic))
       .child(div().truncate().font_semibold().text_color(t.foreground).child(k?.labels?.["herdr.name"] || k?.name || k?.template || k?.program?.name || terminal || ""))
-      .when(Boolean(st), (el) => el.child(div().flex_none().text_color(t[st] ?? t.dim).child(statusWords()[st] ?? st)))
-      .when(Boolean(parent), (el) => el.child(div().truncate().text_color(t.dim).child(tr(`from ${parent.name || parent.address}`, `来自 ${parent.name || parent.address}`))))
+      .when(Boolean(kindBadge), (el) =>
+        el.child(
+          div()
+            .flex_none()
+            .px(5)
+            .py(1)
+            .rounded(4)
+            .bg(withAlpha(kindBadge.color, "20") ?? t.raised)
+            .border_1()
+            .border_color(withAlpha(kindBadge.color, "66") ?? t.border)
+            .text_size(10)
+            .font_semibold()
+            .text_color(kindBadge.color)
+            .child(kindBadge.label),
+        ),
+      )
+      .when(Boolean(terminal), (el) =>
+        el.child(div().flex_none().px(5).py(1).rounded(4).bg(t.raised).border_1().border_color(t.border).text_size(10.5).text_color(t.muted).child(terminal)),
+      )
+      .when(Boolean(st) && !floating, (el) => el.child(div().flex_none().text_color(t[st] ?? t.dim).child(statusWords()[st] ?? st)))
+      .when(Boolean(upstreamAddr), (el) =>
+        el.child(
+          div()
+            .id("peek-parent")
+            .flex_none()
+            .px(5)
+            .py(1)
+            .rounded(4)
+            .bg(withAlpha(t.accent ?? "#3b82f6", "14") ?? t.raised)
+            .border_1()
+            .border_color(withAlpha(t.accent ?? "#3b82f6", "44") ?? t.border)
+            .text_size(10.5)
+            .text_color(t.accent ?? "#3b82f6")
+            .cursor_pointer()
+            .hover((s) => s.bg(withAlpha(t.accent ?? "#3b82f6", "28") ?? t.hover).text_color(t.foreground))
+            .tooltip(tr(`Click to return to upstream agent ${upstreamAddr}`, `点击返回上游智能体 ${upstreamAddr}`))
+            .on_mouse_down("left", stopMouse)
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              run("agent.focus", { terminal: upstreamAddr });
+              if (overlay) closeOverlay(overlay);
+            })
+            .child(tr(`↳ from ${parent?.name || upstreamAddr}`, `↳ 来自 ${parent?.name || upstreamAddr}`)),
+        ),
+      )
       .child(div().flex_1())
+      .when(Boolean(floating) && Boolean(upstreamAddr), (el) =>
+        el
+          .child(
+            this.button(t, "merge-close", tr("Merge & Close", "合回并关闭"), () => {
+              run("agent.handoff", {
+                source: terminal,
+                into: upstreamAddr,
+                kind: "merge-back",
+                ...(overlay ? { close_overlay: overlay } : {}),
+              });
+            }),
+          )
+          .child(
+            this.button(t, "back-main", tr("↩ Main", "↩ 回主 Agent"), () => {
+              run("agent.focus", { terminal: upstreamAddr });
+              if (overlay) closeOverlay(overlay);
+            }),
+          ),
+      )
       .child(
-        this.button(t, "keep", home ? tr("↗ go to", "↗ 跳转") : tr("↗ keep", "↗ 挂载"), () => {
-          run(home ? "pane.focus" : "terminal.keep", { terminal });
+        this.button(t, "keep", floating ? tr("Dock", "转分栏") : (home ? tr("↗ go to", "↗ 跳转") : tr("↗ keep", "↗ 挂载")), () => {
+          run(home ? "pane.focus" : "terminal.keep", floating ? { terminal, place: "right" } : { terminal });
           closeOverlay(overlay);
         }),
       )

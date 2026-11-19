@@ -7,6 +7,26 @@ import { agents, terminals, panes, focused, spaces, run, theme, shared, setShare
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
 
+function shortAgentId(addr) {
+  const s = String(addr || "").trim();
+  const idx = s.lastIndexOf("/");
+  return idx >= 0 ? s.slice(idx + 1) : s;
+}
+
+function lineageBadgeInfo(rec) {
+  const kind = String(rec?.lineage?.kind || "").toLowerCase();
+  if (kind === "side-chat" || kind === "side_chat") {
+    return { label: tr("Side", "旁路"), color: "#14b8a6", bg: "#14b8a622", border: "#14b8a655" };
+  }
+  if (kind === "fork") {
+    return { label: tr("Fork", "分叉"), color: "#a855f7", bg: "#a855f722", border: "#a855f755" };
+  }
+  if (kind === "handoff") {
+    return { label: tr("Handoff", "接力"), color: "#3b82f6", bg: "#3b82f622", border: "#3b82f655" };
+  }
+  return null;
+}
+
 function find(node, id) {
   if (node?.id === id) return node;
   for (const child of node?.children ?? []) {
@@ -406,7 +426,7 @@ export default class Agents extends View {
                               .bg(t.hover)
                               .text_size(9.5)
                               .text_color(t.dim)
-                              .child(it.acp ? "ACP" : tr("CLI", "终端")),
+                              .child(it.acp ? "ACP" : "CLI"),
                           ),
                       )
                       .child(div().truncate().text_size(10.5).text_color(live ? (t.done ?? t.muted) : t.dim).child(meta)),
@@ -467,8 +487,13 @@ export default class Agents extends View {
   }
 
   // Live sub-agents of `addr`, depth first, each with the tree lines in front of it.
+  // Handoff and Fork sessions are standalone top-level sessions even if legacy records carry `parent`.
   tree(all, addr, lead = []) {
-    const kids = all.filter((k) => k.parent === addr && k.state === "live" && !k.labels?.["herdr.trashed"]);
+    const kids = all.filter((k) => {
+      if (k.parent !== addr || k.state !== "live" || k.labels?.["herdr.trashed"]) return false;
+      const lk = String(k.lineage?.kind || "").toLowerCase().replace("_", "-");
+      return lk !== "handoff" && lk !== "fork";
+    });
     return kids.flatMap((k, i) => {
       const last = i === kids.length - 1;
       return [
@@ -478,14 +503,20 @@ export default class Agents extends View {
     });
   }
 
-  subRow(t, s, shown, compact) {
+  subRow(t, s, focusedSet, compact) {
     const k = s.t;
     const isAcp = Boolean(k.acp);
     const pane = this.paneByAddr?.get(k.address) ?? null;
     const canFocusPane = Boolean(pane) || (!isAcp && this.listed.has(k.address));
     const st = kidStatus(k, this.listed);
     const pic = icon(k.program, 14, t.foreground);
-    const on = k.address === shown;
+    const on = focusedSet instanceof Set ? focusedSet.has(k.address) : k.address === focusedSet;
+    const lBadge = lineageBadgeInfo(k);
+    const hasWt = Boolean(k.lineage?.worktree_path);
+    const subLabel = k.labels?.["herdr.name"] || k.labels?.["drove.display"] || k.name || (isAcp && clean(k.title) && clean(k.title) !== k.address && clean(k.title) !== k.program?.name ? clean(k.title) : null) || k.template || k.program?.name || k.address;
+    const subShortId = shortAgentId(k.address);
+    const showSubId = Boolean(subShortId) && subLabel !== subShortId && subLabel !== k.address;
+    const mono = (typeof settings === "function" ? settings()?.font_family : null) ?? "JetBrains Mono";
     return h_flex()
       .id(`sub-${k.address}`)
       .pl(39)
@@ -496,7 +527,8 @@ export default class Agents extends View {
       .gap(0)
       .items_center()
       .text_size(12.5)
-      .when(on, (el) => el.bg(t.raised))
+      .cursor_pointer()
+      .when(on, (el) => el.bg(t.selected))
       .hover((s) => s.bg(t.hover))
       .on_hover((on, cx) => {
         if (on) this.hoveredSub = k.address;
@@ -512,12 +544,86 @@ export default class Agents extends View {
         this.selectAgent(k.address);
         canFocusPane ? run("pane.focus", pane ? { pane } : { terminal: k.address }) : this.peek(k.address);
       })
-      .children(s.lines.map(l => div().self_start().mt(-4).w(9).h(17).mr(4).flex_none()
-        .when(Boolean(l), el => el.border_l(1.5).border_color(t.input))
+      .children(s.lines.map((l, idx) => div().self_start().mt(-4).w(9).h(17).mr(4).flex_none()
+        .when(Boolean(l), el => el.border_l(1.5).border_color(on && idx === s.lines.length - 1 ? (t.accent ?? t.foreground) : t.input))
         .when(l === "└" || l === "├", el => el.border_b(1.5).rounded_bl(6))))
       .when(Boolean(pic), el => el.child(div().mr(8).child(pic)))
-      .child(div().flex_1().truncate().text_color(on ? t.foreground : t.muted).child(k.labels?.["herdr.name"] || k.labels?.["drove.display"] || k.name || (isAcp && clean(k.title) && clean(k.title) !== k.address && clean(k.title) !== k.program?.name ? clean(k.title) : null) || k.template || k.program?.name || k.address))
-      .when(isAcp, (el) => el.child(div().mr(4).px(4).py(1).rounded(4).bg(t.hover).text_size(9.5).text_color(t.dim).child("ACP")))
+      .child(
+        h_flex()
+          .flex_1()
+          .min_w(0)
+          .gap(4)
+          .items_center()
+          .child(div().min_w(0).truncate().when(on, (el) => el.font_medium()).text_color(on ? t.foreground : t.muted).child(subLabel))
+          .when(showSubId, (el) =>
+            el.child(
+              div()
+                .id(`sub-id-${k.address}`)
+                .flex_none()
+                .px(3.5)
+                .py(0.5)
+                .rounded(4)
+                .bg(t.raised)
+                .border_1()
+                .border_color(t.border)
+                .font_family(mono)
+                .text_size(9.5)
+                .text_color(t.dim)
+                .tooltip(tr(`Agent ID: ${k.address}`, `智能体编号：${k.address}`))
+                .child(subShortId),
+            ),
+          ),
+      )
+      .when(Boolean(lBadge), (el) =>
+        el.child(
+          div()
+            .id(`sub-kind-${k.address}`)
+            .flex_none()
+            .mr(4)
+            .px(4)
+            .py(1)
+            .rounded(4)
+            .bg(lBadge.bg)
+            .border_1()
+            .border_color(lBadge.border)
+            .text_size(9.5)
+            .font_semibold()
+            .text_color(lBadge.color)
+            .child(lBadge.label),
+        ),
+      )
+      .when(hasWt, (el) =>
+        el.child(
+          div()
+            .id(`sub-wt-${k.address}`)
+            .flex_none()
+            .mr(4)
+            .px(4)
+            .py(1)
+            .rounded(4)
+            .bg("#f59e0b22")
+            .border_1()
+            .border_color("#f59e0b55")
+            .text_size(9.5)
+            .font_semibold()
+            .text_color("#f59e0b")
+            .tooltip(tr(`Isolated Worktree: ${k.lineage.worktree_path}`, `独立 Worktree：${k.lineage.worktree_path}`))
+            .child("WT"),
+        ),
+      )
+      .child(
+        div()
+          .id(`sub-rt-${k.address}`)
+          .flex_none()
+          .mr(4)
+          .px(4)
+          .py(1)
+          .rounded(4)
+          .bg(t.hover)
+          .text_size(9.5)
+          .text_color(t.dim)
+          .child(isAcp ? "ACP" : "CLI"),
+      )
       .when(this.hoveredSub === k.address, (el) =>
         el.child(
           div()
@@ -565,7 +671,19 @@ export default class Agents extends View {
     this.listed = new Map(list.map((a) => [a.address, a.status]));
     const all = terminals();
     this.migratePins(all);
-    const shown = focused()?.agent;
+    // Read the pane snapshot once: every host read copies the whole list into JS.
+    const allPanes = panes();
+    this.paneByAddr = new Map(allPanes.filter((p) => p.terminal && p.pane).map((p) => [p.terminal, p.pane]));
+    const focusedAddrs = new Set();
+    for (const a of list) {
+      if (a.focused) focusedAddrs.add(a.address);
+    }
+    const foc = focused();
+    const activePaneAddr = allPanes.find((p) => p.focused)?.terminal ?? null;
+    if (foc?.shown) focusedAddrs.add(foc.shown);
+    else if (foc?.terminal) focusedAddrs.add(foc.terminal);
+    else if (activePaneAddr) focusedAddrs.add(activePaneAddr);
+    else if (foc?.agent) focusedAddrs.add(foc.agent);
     const now = Date.now();
     this.track(list, now);
     // A kept sub-agent (one with a pane) is in agents() too: where a tree shows
@@ -587,7 +705,7 @@ export default class Agents extends View {
       const subs = collapsed ? [] : this.tree(all, a.address);
       const r = row(a, i, subs);
       if (this.folded.has(a.address)) return [r];
-      return [r, ...subs.map((s) => this.subRow(t, s, shown, byPriority))];
+      return [r, ...subs.map((s) => this.subRow(t, s, focusedAddrs, byPriority))];
     };
 
     // The fold chevron; folded, the count too, colored by the most urgent one.
@@ -595,6 +713,7 @@ export default class Agents extends View {
       const sts = subs.map((s) => kidStatus(s.t, this.listed));
       const top = sts.reduce((m, s) => ((RANK[s] ?? 0) > (RANK[m] ?? 0) ? s : m), null);
       const open = !this.folded.has(a.address);
+      const hasFocusedSub = !open && subs.some((s) => focusedAddrs.has(s.t.address));
       return div()
         .id(`fold-${a.address}`)
         .h(18)
@@ -604,7 +723,8 @@ export default class Agents extends View {
         .items_center()
         .rounded(4)
         .text_size(11)
-        .text_color(open ? t.dim : (t[top] ?? t.dim))
+        .when(hasFocusedSub, (el) => el.bg(t.selected))
+        .text_color(hasFocusedSub ? t.foreground : open ? t.dim : (t[top] ?? t.dim))
         .cursor_pointer()
         .hover((s) => s.bg(t.hover).text_color(t.foreground))
         .on_click((_e, cx) => {
@@ -619,9 +739,6 @@ export default class Agents extends View {
     // A row reads "space \u00b7 detail": the detail is a tab someone named or the
     // agent's own title, never an automatic tab number unless two rows would
     // otherwise read the same.
-    // Read the pane snapshot once: every host read copies the whole list into JS.
-    const allPanes = panes();
-    this.paneByAddr = new Map(allPanes.filter((p) => p.terminal && p.pane).map((p) => [p.terminal, p.pane]));
     const leads = leadPanes(allPanes);
     const tabs = new Map(spaces().flatMap(s => s.tabs).map(tab => [tab.id, tab]));
     const labels = new Map(list.map(a => {
@@ -663,7 +780,9 @@ export default class Agents extends View {
           })
           .on_click(() => {
             this.selectAgent(a.address);
-            a.pane ? run("pane.focus", { pane: a.pane }) : this.peek(a.address);
+            if (a.pane) run("pane.focus", { pane: a.pane });
+            else if (a.acp) this.peek(a.address);
+            else run("terminal.keep", { terminal: a.address, place: "tab" });
           })
           .child(div().flex_1().min_w(0).whitespace_nowrap().text_right().text_color(a.focused ? t.foreground : t.muted).child(String(i + 1)))
           .child(h_flex().w(18).flex_none().items_center().justify_center().child(this.statusButton(t, a.address, a, true)));
@@ -708,6 +827,9 @@ export default class Agents extends View {
       // Without a space header above (priority, pinned) the row names its space.
       const full = byPriority || isPinned;
       const name = full ? a.space_name || label(a) : more ?? (/^\d+$/.test(label(a)) ? a.program?.name || label(a) : label(a));
+      const shortId = shortAgentId(a.address);
+      const showId = Boolean(shortId) && name !== shortId && name !== a.address;
+      const mono = (typeof settings === "function" ? settings()?.font_family : null) ?? "JetBrains Mono";
       return h_flex()
         .id(`ag-${a.address}`)
         .px(8)
@@ -731,7 +853,9 @@ export default class Agents extends View {
         })
         .on_click(() => {
           this.selectAgent(a.address);
-          a.pane ? run("pane.focus", { pane: a.pane }) : this.peek(a.address);
+          if (a.pane) run("pane.focus", { pane: a.pane });
+          else if (a.acp) this.peek(a.address);
+          else run("terminal.keep", { terminal: a.address, place: "tab" });
         })
         .when(Boolean(pic), el => el.child(div().id(`agent-fold-${a.address}`)
           .when(subs.length > 0, el => el.on_click((_e, cx) => {
@@ -741,8 +865,98 @@ export default class Agents extends View {
           })).child(pic)))
         .child(h_flex().flex_1().min_w(0).gap(5).items_center()
           .child(div().min_w(0).max_w(full && more ? 120 : 200).truncate().text_color(idle ? t.muted : t.foreground).child(name))
+          .when(showId, (el) =>
+            el.child(
+              div()
+                .id(`ag-id-${a.address}`)
+                .flex_none()
+                .px(3.5)
+                .py(0.5)
+                .rounded(4)
+                .bg(t.raised)
+                .border_1()
+                .border_color(t.border)
+                .font_family(mono)
+                .text_size(9.5)
+                .text_color(t.dim)
+                .tooltip(tr(`Agent ID: ${a.address}`, `智能体编号：${a.address}`))
+                .child(shortId),
+            ),
+          )
           .when(full && Boolean(more), el => el.child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(`\u00b7 ${more}`))))
-        .when(Boolean(a.acp), el => el.child(div().px(4).py(1).rounded(4).bg(t.hover).text_size(9.5).text_color(t.dim).child("ACP")))
+        .when(Boolean(lineageBadgeInfo(all.find((x) => x.address === a.address))), (el) => {
+          const rec = all.find((x) => x.address === a.address);
+          const lb = lineageBadgeInfo(rec);
+          const rawParent = String(rec?.lineage?.parent || "").trim();
+          const slash = typeof a.address === "string" ? a.address.lastIndexOf("/") : -1;
+          const prefix = slash >= 0 ? a.address.slice(0, slash + 1) : "";
+          const parentAddr = rawParent ? (rawParent.includes("/") ? rawParent : `${prefix}${rawParent}`) : "";
+          const parentRec = parentAddr ? all.find((x) => x.address === parentAddr) : null;
+          const shortParent = parentAddr
+            ? (parentRec?.labels?.["herdr.name"]
+                || parentRec?.name
+                || (prefix && parentAddr.startsWith(prefix) ? parentAddr.slice(prefix.length) : parentAddr))
+            : "";
+          const badgeText = shortParent ? `${lb.label} ← ${shortParent}` : lb.label;
+          return el.child(
+            div()
+              .id(`ag-kind-${a.address}`)
+              .flex_none()
+              .max_w(130)
+              .truncate()
+              .px(4)
+              .py(1)
+              .rounded(4)
+              .bg(lb.bg)
+              .border_1()
+              .border_color(lb.border)
+              .text_size(9.5)
+              .font_semibold()
+              .text_color(lb.color)
+              .when(Boolean(parentAddr), (b) =>
+                b
+                  .cursor_pointer()
+                  .tooltip(tr(`From ${parentAddr} (click to focus)`, `来自 ${parentAddr}（点击定位上级）`))
+                  .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                  .on_click((_e, cx) => {
+                    cx.stop_propagation();
+                    run("agent.focus", { terminal: parentAddr });
+                  }),
+              )
+              .child(badgeText),
+          );
+        })
+        .when(Boolean(all.find((x) => x.address === a.address)?.lineage?.worktree_path), (el) => {
+          const wtPath = all.find((x) => x.address === a.address)?.lineage?.worktree_path;
+          return el.child(
+            div()
+              .id(`ag-wt-${a.address}`)
+              .flex_none()
+              .px(4)
+              .py(1)
+              .rounded(4)
+              .bg("#f59e0b22")
+              .border_1()
+              .border_color("#f59e0b55")
+              .text_size(9.5)
+              .font_semibold()
+              .text_color("#f59e0b")
+              .tooltip(tr(`Isolated Worktree: ${wtPath}`, `独立 Worktree：${wtPath}`))
+              .child("WT"),
+          );
+        })
+        .child(
+          div()
+            .id(`ag-rt-${a.address}`)
+            .flex_none()
+            .px(4)
+            .py(1)
+            .rounded(4)
+            .bg(t.hover)
+            .text_size(9.5)
+            .text_color(t.dim)
+            .child(a.acp ? "ACP" : "CLI"),
+        )
         .when(Boolean(machine), el => el.child(div().text_size(10).text_color(t.dim).child(machine)))
         .when(subs.length > 0, el => el.child(fold(a, subs)))
         .when(this.hovered === a.address, el => el.child(pin).child(remove))

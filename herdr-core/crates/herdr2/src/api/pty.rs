@@ -156,7 +156,7 @@ pub(super) async fn terminal_kill(core: Ctx<'_>, p: TerminalParams) -> Result<Te
 
 pub(super) async fn terminal_rm(core: Ctx<'_>, p: TerminalParams) -> Result<RemoveResult, RpcError> {
     let id = resolve_pty(core, &p.terminal)?;
-    {
+    let cleanup_wt: Option<(String, String, Option<String>)> = {
         let mut st = core.lock();
         if st.pty_reg.terminals.get(&id).is_some_and(|t| t.is_live()) {
             return Err(RpcError::new(
@@ -165,7 +165,26 @@ pub(super) async fn terminal_rm(core: Ctx<'_>, p: TerminalParams) -> Result<Remo
                 format!("kill it first: h2 kill {}", crate::terminals::address(id)),
             ));
         }
+        let wt = st.pty_reg.terminals.get(&id).and_then(|t| {
+            let lin = t.lineage.as_ref()?;
+            Some((
+                lin.worktree_origin.clone()?,
+                lin.worktree_path.clone()?,
+                lin.worktree_branch.clone(),
+            ))
+        });
         core.pty_remove(&mut st, id);
+        wt
+    };
+    if let Some((origin, wt_path, wt_branch)) = cleanup_wt {
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::drove::integrate::cleanup_fork_worktree(
+                &origin,
+                std::path::Path::new(&wt_path),
+                wt_branch.as_deref(),
+            );
+        })
+        .await;
     }
     core.flush_saved().await?;
     Ok(RemoveResult { removed: crate::terminals::address(id) })
@@ -517,6 +536,10 @@ async fn start_pty(
         }
         st.screens.insert(id, screen);
         let (mut env, scope) = terminal_env(core, id, &cwd, env);
+        if let Some(dark) = p.display.as_ref().and_then(|d| d.is_dark()) {
+            env.entry("COLORFGBG".into())
+                .or_insert_with(|| if dark { "15;0".into() } else { "0;15".into() });
+        }
         let mut argv = p.argv;
         let prep = crate::pty_adapters::prepare_pty_launch(core, id, &mut argv, &mut env);
         let addr = st.pty_reg.terminals[&id].address.clone();

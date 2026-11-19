@@ -1030,6 +1030,12 @@ Options:
       --keep
           Keep newly spawned target alive across restarts (`--keep`)
 
+      --worktree
+          When `kind == fork`, create an isolated Git worktree on its own branch (carrying uncommitted changes) so the forked session can commit freely
+
+      --merge-worktree
+          When merging back (`--into`), instruct the target/parent agent to merge code from the source session's fork worktree branch into the main workspace without deleting the worktree or branch
+
       --wait
           With `--prompt`: wait for the first turn on the target to finish
 

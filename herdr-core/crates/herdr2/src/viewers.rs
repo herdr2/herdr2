@@ -48,6 +48,24 @@ impl Display {
     pub(crate) fn apply(&self, screen: &mut ghostty_vt::Terminal) {
         screen.set_display(rgb(&self.fg), rgb(&self.bg), rgb(&self.cursor), self.cell.map(|[w, h]| (w, h)));
     }
+
+    /// Returns whether the background color is dark (matching Ghostty's luminance threshold).
+    pub(crate) fn is_dark(&self) -> Option<bool> {
+        let [r, g, b] = rgb(&self.bg)?;
+        Some((r as u32 * 299 + g as u32 * 587 + b as u32 * 114) / 1000 < 128)
+    }
+}
+
+impl Core {
+    /// Returns the display facts of the active interactive viewer attached to terminal `id`, if any.
+    pub(crate) fn active_viewer_display(&self, st: &State, id: u32) -> Option<Display> {
+        st.viewers
+            .get(&id)?
+            .iter()
+            .filter(|v| !v.observe)
+            .max_by_key(|v| v.active_at)
+            .map(|v| v.display.clone())
+    }
 }
 
 fn rgb(hex: &Option<String>) -> Option<Rgb> {

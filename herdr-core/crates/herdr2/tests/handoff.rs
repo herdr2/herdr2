@@ -79,6 +79,7 @@ fn acp_handoff_lazy_injection_turn_slice_and_merge_back() {
     let a2_get = s.json(&["get", &a2]);
     assert_eq!(a2_get["lineage"]["kind"], "handoff", "{a2_get}");
     assert_eq!(a2_get["lineage"]["parent"], a1, "{a2_get}");
+    assert!(a2_get["parent"].is_null(), "handoff should be a standalone top-level session, not a sub-agent: {a2_get}");
 
     // Read a2: Entry::Handoff at turn 0, clean Entry::User ("STATE"), while raw wire prompt held <herdr2-handoff>.
     let a2_read = s.json(&["read", &a2]);
@@ -180,4 +181,97 @@ fn pty_handoff_stages_markdown_and_records_lineage() {
     let t1_get = s.json(&["get", t1]);
     assert_eq!(t1_get["lineage"]["parent"], a1, "{t1_get}");
     assert_eq!(t1_get["lineage"]["kind"], "handoff", "{t1_get}");
+    assert!(t1_get["parent"].is_null(), "PTY handoff should be a standalone top-level session, not a sub-agent: {t1_get}");
+}
+
+#[test]
+fn fork_worktree_creates_branch_notifies_parent_on_merge_and_cleans_up_on_rm() {
+    let s = Session::new();
+    let repo = s.root.join("repo-wt");
+    init_git_repo(&repo);
+
+    let spec = fake_acp_spec();
+    let run1 = s.json(&[
+        "run",
+        "--agent",
+        &spec,
+        "--cwd",
+        &repo.to_string_lossy(),
+        "--prompt",
+        "Work on calculator",
+    ]);
+    let a1 = run1["address"].as_str().unwrap().to_string();
+
+    // 1. Fork with --worktree: creates a real local Git branch (not detached HEAD).
+    let fk = s.json(&[
+        "handoff",
+        &a1,
+        "--kind",
+        "fork",
+        "--worktree",
+        "--prompt",
+        "Try alternative implementation",
+        "--wait",
+    ]);
+    let a2 = fk["target"].as_str().unwrap().to_string();
+    let wt_path = fk["worktree_path"].as_str().expect("worktree_path must be set").to_string();
+    let wt_branch = fk["worktree_branch"].as_str().expect("worktree_branch must be set").to_string();
+    assert!(wt_branch.starts_with("herdr/fork-"), "unexpected branch: {wt_branch}");
+    assert!(Path::new(&wt_path).is_dir(), "worktree dir must exist: {wt_path}");
+
+    let a2_get = s.json(&["get", &a2]);
+    assert_eq!(a2_get["lineage"]["worktree_branch"].as_str(), Some(wt_branch.as_str()), "{a2_get}");
+    assert_ne!(a2_get["lineage"]["worktree_merged"].as_bool(), Some(true), "{a2_get}");
+
+    // Verify fork worktree is on the real branch and supports commits.
+    let wt_head = String::from_utf8_lossy(
+        &Command::new("git")
+            .args(["-C", &wt_path, "rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(wt_head, wt_branch);
+    std::fs::write(Path::new(&wt_path).join("feature.txt"), "from fork branch\n").unwrap();
+    git(Path::new(&wt_path), &["add", "feature.txt"]);
+    git(Path::new(&wt_path), &["commit", "-m", "add feature on fork"]);
+
+    // 2. Merge back with --merge-worktree: notifies parent to merge WITHOUT deleting worktree or branch,
+    // and marks `worktree_merged = true` on the fork record.
+    let mb = s.json(&["handoff", &a2, "--into", &a1, "--merge-worktree", "--wait"]);
+    assert_eq!(mb["target"], a1, "{mb}");
+    assert_eq!(mb["worktree_merge_requested"], true, "{mb}");
+    assert_eq!(mb["worktree_branch"].as_str(), Some(wt_branch.as_str()), "{mb}");
+    assert!(Path::new(&wt_path).is_dir(), "merge back must NOT delete worktree dir");
+
+    let a2_after_mb = s.json(&["get", &a2]);
+    assert_eq!(a2_after_mb["lineage"]["worktree_merged"].as_bool(), Some(true), "{a2_after_mb}");
+    assert_eq!(a2_after_mb["lineage"]["worktree_path"].as_str(), Some(wt_path.as_str()), "{a2_after_mb}");
+
+    let a1_read = s.json(&["read", &a1]);
+    let merge_user = a1_read["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|e| e["kind"] == "user")
+        .expect("parent should receive merge instruction");
+    let merge_text = merge_user["text"].as_str().unwrap_or_default();
+    assert!(merge_text.contains(&wt_branch), "parent prompt must name fork branch: {merge_text}");
+    assert!(merge_text.contains(&wt_path), "parent prompt must include worktree path: {merge_text}");
+    assert!(merge_text.contains("Do NOT delete"), "parent prompt must forbid deleting worktree/branch: {merge_text}");
+
+    // 3. Killing & removing the fork agent permanently deletes both the worktree directory and Git branch.
+    s.json(&["kill", &a2]);
+    s.json(&["rm", &a2]);
+    assert!(!Path::new(&wt_path).exists(), "rm must delete worktree dir");
+    let branch_exists = Command::new("git")
+        .args(["-C", &repo.to_string_lossy(), "rev-parse", "--verify", &format!("refs/heads/{wt_branch}")])
+        .output()
+        .unwrap()
+        .status
+        .success();
+    assert!(!branch_exists, "rm must delete fork git branch {wt_branch}");
 }
