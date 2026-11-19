@@ -1253,8 +1253,7 @@ async fn checkpoint_list(core: Ctx<'_>, p: CheckpointListParams) -> Result<Check
             {
                 let tc = core.target_checkpoints(&mut st, &t.address);
                 let fg_pid = t.foreground.as_ref().and_then(|f| u32::try_from(f.pid).ok());
-                let resumed = t.foreground.as_ref().is_some_and(|f| crate::pty_transcript::argv_has_resume(&f.argv))
-                    || crate::pty_transcript::argv_has_resume(&t.argv);
+                let resumed = crate::pty_adapters::terminal_active_resume_argv(&t).is_some();
                 resumed && crate::pty_adapters::needs_resumed_reattach(&tc, fg_pid)
             } else {
                 false

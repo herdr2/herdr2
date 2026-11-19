@@ -214,17 +214,22 @@ impl Core {
                 || tc.cli_fg_pid.is_some()
                 || st.pty_prompts.contains_key(&id);
             if has_ckpt_state && tc.pending_rollback_turn.is_none() && tc.pending_handoff.is_none() {
-                let had_cli_session = tc.cli_kind.is_some()
-                    || tc.cli_session_id.is_some()
+                let has_attached_cli_meta = tc
+                    .cli_kind
+                    .as_deref()
+                    .is_some_and(|k| !k.is_empty() && k != "generic")
+                    || tc.cli_session_id.is_some();
+                let had_cli_session = has_attached_cli_meta
                     || tc.cli_fg_pid.is_some()
                     || has_status_or_records
                     || prev_fg.as_ref().is_some_and(is_cli_foreground);
-                let exited_cli_to_shell =
-                    now_is_shell_root && had_cli_session && (!prev_was_shell_root || has_status_or_records);
+                let exited_cli_to_shell = now_is_shell_root
+                    && (has_attached_cli_meta
+                        || (had_cli_session && (!prev_was_shell_root || has_status_or_records)));
                 let started_clean_cli = !now_is_shell_root
                     && now.as_ref().is_some_and(|fg| {
                         let fg_pid = u32::try_from(fg.pid).ok();
-                        let pid_changed = prev_fg.as_ref().is_some_and(|p| p.pid != fg.pid);
+                        let pid_changed = prev_fg.as_ref().is_none_or(|p| p.pid != fg.pid);
                         pid_changed
                             && is_cli_foreground(fg)
                             && !crate::pty_transcript::argv_has_resume(&fg.argv)
@@ -269,11 +274,22 @@ impl Core {
             }
         }
         let foreground_changed = t.foreground != now;
+        let mut argv_updated = false;
         if let Some(f) = &now {
             t.last_cwd = Some(f.cwd.clone());
+            // Once a rollback/launch shell wrapper (`zsh -lic '"$@"; exec "$0" -li' ... claude --resume ...`)
+            // exits back to the interactive shell (`zsh -li`), replace stale wrapper `t.argv` with the live shell
+            // argv so old `--resume` flags cannot linger after exit.
+            if now_is_shell_root
+                && !f.argv.is_empty()
+                && crate::pty_adapters::PtyCliKind::detect(&t.argv) != crate::pty_adapters::PtyCliKind::Generic
+            {
+                t.argv = f.argv.clone();
+                argv_updated = true;
+            }
         }
         t.foreground = now.clone();
-        if change.is_some() || foreground_changed || turn_reset {
+        if change.is_some() || foreground_changed || turn_reset || argv_updated {
             self.save_pty_soon();
         }
         if let Some(change) = change {
@@ -557,6 +573,56 @@ mod tests {
             assert_eq!(restored.cli_session_id.as_deref(), Some("sess-resume-1"));
             assert_eq!(restored.cli_fg_pid, Some(400));
             assert_eq!(st.pty_reg.terminals[&id].turn, 1);
+        }
+
+        // 5. Post-rollback wrapper `t.argv` containing `--resume <sid>` must NOT re-attach checkpoints
+        // after exiting back to `zsh -li` OR when starting a fresh clean `claude --dangerously-skip-permissions`.
+        {
+            let mut st = core_arc.lock();
+            {
+                let t = st.pty_reg.terminals.get_mut(&id).unwrap();
+                t.argv = vec![
+                    "/usr/bin/zsh".into(),
+                    "-lic".into(),
+                    "\"$@\"; exec \"$0\" -li".into(),
+                    "/usr/bin/zsh".into(),
+                    "claude".into(),
+                    "--dangerously-skip-permissions".into(),
+                    "--resume".into(),
+                    "sess-resume-1".into(),
+                ];
+            }
+            let zsh_li = Foreground {
+                pid: 100,
+                name: "zsh".into(),
+                argv: vec!["/usr/bin/zsh".into(), "-li".into()],
+                cwd: root.to_string_lossy().to_string(),
+            };
+            core_arc.apply_foreground_update(&mut st, id, Some(zsh_li));
+            assert!(core_arc.target_checkpoints(&mut st, &addr).checkpoints.is_empty());
+            assert_eq!(st.pty_reg.terminals[&id].argv, vec!["/usr/bin/zsh", "-li"]);
+        }
+        assert!(
+            !rt.block_on(crate::pty_adapters::reattach_resumed_cli_checkpoints(&core_arc, id)),
+            "exited shell root must not re-attach checkpoints from stale wrapper argv"
+        );
+        {
+            let mut st = core_arc.lock();
+            let clean_claude = Foreground {
+                pid: 500,
+                name: "claude".into(),
+                argv: vec!["claude".into(), "--dangerously-skip-permissions".into()],
+                cwd: root.to_string_lossy().to_string(),
+            };
+            core_arc.apply_foreground_update(&mut st, id, Some(clean_claude));
+        }
+        assert!(
+            !rt.block_on(crate::pty_adapters::reattach_resumed_cli_checkpoints(&core_arc, id)),
+            "fresh clean `claude --dangerously-skip-permissions` must not re-attach old checkpoints"
+        );
+        {
+            let mut st = core_arc.lock();
+            assert!(core_arc.target_checkpoints(&mut st, &addr).checkpoints.is_empty());
         }
 
         drop(core_arc);

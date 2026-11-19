@@ -125,12 +125,7 @@ pub fn snapshot_from_terminal(t: &Terminal, sent_prompts: Option<&Vec<(u64, u64,
     let agent_hint = detect_agent_hint(t);
     let turn = t.turn;
     let fg_pid = t.foreground.as_ref().and_then(|f| u32::try_from(f.pid).ok());
-    let resumed = argv_has_resume(
-        t.foreground
-            .as_ref()
-            .map(|f| f.argv.as_slice())
-            .unwrap_or(&[]),
-    ) || argv_has_resume(&t.argv);
+    let resumed = crate::pty_adapters::terminal_active_resume_argv(t).is_some();
     PtySnapshot {
         cwd,
         started_ms,

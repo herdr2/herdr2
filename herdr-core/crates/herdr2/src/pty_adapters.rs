@@ -429,6 +429,25 @@ pub(crate) fn session_id_from_transcript(cli_kind: &str, path: &Path) -> Option<
     }
 }
 
+/// Returns the active command argv if the terminal is currently running a resumed CLI
+/// (`-c`, `--continue`, `-r`, `--resume`, `codex resume`).
+///
+/// When OS foreground tracking knows the live foreground process (`t.foreground`), that process is
+/// authoritative: we never fall back to a historical `t.argv` (e.g. a post-rollback login-shell
+/// wrapper containing `--resume <old-sid>` after the CLI has exited back to `zsh -li` or been
+/// replaced by a fresh non-resumed `claude`).
+pub(crate) fn terminal_active_resume_argv(t: &crate::terminals::Terminal) -> Option<&[String]> {
+    if let Some(ref fg) = t.foreground
+        && !fg.argv.is_empty()
+    {
+        if crate::foreground::is_shell_root(fg) {
+            return None;
+        }
+        return crate::pty_transcript::argv_has_resume(&fg.argv).then_some(fg.argv.as_slice());
+    }
+    crate::pty_transcript::argv_has_resume(&t.argv).then_some(t.argv.as_slice())
+}
+
 /// Returns true when a terminal running a resumed CLI (`-c`, `--continue`, `--resume`, `codex resume`)
 /// should attempt to re-attach archived session checkpoints.
 pub(crate) fn needs_resumed_reattach(tc: &crate::checkpoint::TargetCheckpoints, fg_pid: Option<u32>) -> bool {
@@ -454,12 +473,7 @@ pub async fn reattach_resumed_cli_checkpoints(core: &Arc<Core>, id: u32) -> bool
         if !t.is_live() {
             return false;
         }
-        let fg_argv = t.foreground.as_ref().map(|f| f.argv.clone()).unwrap_or_default();
-        let active_argv = if !fg_argv.is_empty() && crate::pty_transcript::argv_has_resume(&fg_argv) {
-            fg_argv
-        } else if crate::pty_transcript::argv_has_resume(&t.argv) {
-            t.argv.clone()
-        } else {
+        let Some(active_argv) = terminal_active_resume_argv(&t).map(<[String]>::to_vec) else {
             return false;
         };
         let cli_kind = detect_terminal_cli_kind(&t, None);
@@ -1541,9 +1555,7 @@ pub async fn process_pty_checkpoint_job(
         } else if let Some(t) = st.pty_reg.terminals.get(&id).cloned()
             && t.is_live()
         {
-            let resumed = t.foreground.as_ref().is_some_and(|f| crate::pty_transcript::argv_has_resume(&f.argv))
-                || crate::pty_transcript::argv_has_resume(&t.argv);
-            if resumed {
+            if terminal_active_resume_argv(&t).is_some() {
                 let fg_pid = t.foreground.as_ref().and_then(|f| u32::try_from(f.pid).ok());
                 let tc = core.target_checkpoints(&mut st, &t.address);
                 needs_resumed_reattach(&tc, fg_pid)
@@ -1590,8 +1602,7 @@ pub async fn process_pty_checkpoint_job(
             .to_string();
         let fg_pid = t.foreground.as_ref().and_then(|f| u32::try_from(f.pid).ok());
         let started_ms = t.program_started_ms.unwrap_or(0);
-        let resumed = t.foreground.as_ref().is_some_and(|f| crate::pty_transcript::argv_has_resume(&f.argv))
-            || crate::pty_transcript::argv_has_resume(&t.argv);
+        let resumed = terminal_active_resume_argv(&t).is_some();
         let mut tc = core.target_checkpoints(&mut st, &t.address);
         let cli_kind = detect_terminal_cli_kind(&t, tc.cli_kind.as_deref());
         tc.cli_kind = Some(cli_kind.as_str().into());
