@@ -141,13 +141,14 @@ export default class Pane extends View {
     return panes().find((p) => p.pane === props()?.pane);
   }
 
-  button(t, id, icon, command, args, tip = null) {
+  button(t, id, icon, command, args, tip = null, danger = false) {
     return div()
       .id(id)
       .p(3)
       .rounded(4)
       .text_color(t.dim)
-      .hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .cursor_pointer()
+      .hover((s) => s.bg(t.hover).text_color(danger ? (t.blocked ?? "#ef4444") : t.foreground))
       .when(Boolean(tip), (el) => el.tooltip(tip))
       .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => {
@@ -167,7 +168,11 @@ export default class Pane extends View {
     const isAgent = isAcp || isTermAgent;
     const term = p.terminal ? terminals().find((x) => x.address === p.terminal) : null;
     const parent = term?.parent ? terminals().find((x) => x.address === term.parent) : null;
-    const lineageParent = term?.lineage?.parent || null;
+    const rawLineageParent = (term?.lineage?.parent || "").trim();
+    const curSlash = typeof p.terminal === "string" ? p.terminal.lastIndexOf("/") : -1;
+    const lineageParent = rawLineageParent
+      ? (!rawLineageParent.includes("/") && curSlash > 0 ? `${p.terminal.slice(0, curSlash + 1)}${rawLineageParent}` : rawLineageParent)
+      : null;
     const tabPaneCount = panes().filter((x) => x.tab === p.tab).length;
     const singleStructuredTab = isStructured && tabPaneCount <= 1;
     const customName = p.custom_name || term?.labels?.["herdr.name"];
@@ -396,27 +401,16 @@ export default class Pane extends View {
         ),
       )
       .when(showHandoffBtns, (el) =>
-        el
-          .child(
-            headerPill(
-              `ph-side-${pane}`,
-              tr("Side Chat", "旁路讨论"),
-              "mods/peek/messages-square.svg",
-              "agent.handoff",
-              { source: p.terminal, kind: "side-chat" },
-              tr("Open isolated side-chat with current context", "带当前上下文开启旁路讨论（不污染主会话）"),
-            ),
-          )
-          .child(
-            headerPill(
-              `ph-ho-${pane}`,
-              tr("Handoff", "接力"),
-              "mods/workspace-chrome/git-branch.svg",
-              "agent.handoff",
-              { source: p.terminal, kind: "handoff" },
-              tr("Context handoff / Fork / Merge", "上下文接力 / 分支探索 / 合回"),
-            ),
+        el.child(
+          headerPill(
+            `ph-ho-${pane}`,
+            tr("Handoff", "接力"),
+            "mods/workspace-chrome/git-branch.svg",
+            "agent.handoff",
+            { source: p.terminal, kind: "handoff" },
+            tr("Context handoff / Fork / Side Chat / Merge", "上下文接力 / 分支探索 / 旁路讨论 / 合回"),
           ),
+        ),
       )
       .when(showViewToggle, el => el.child(
         h_flex()
@@ -512,6 +506,7 @@ export default class Pane extends View {
         .child(this.button(t, `ph-r-${pane}`, "split-right", "pane.split", { direction: "right", pane }, tr("Split right", "向右分栏")))
         .child(this.button(t, `ph-d-${pane}`, "split-down", "pane.split", { direction: "down", pane }, tr("Split down", "向下分栏")))
         .when(tabPaneCount > 1, el => el.child(this.button(t, `ph-z-${pane}`, "zoom", "pane.detach", { pane }, tr("Maximize to new tab", "最大化为独立标签页"))))
+        .when(Boolean(p.terminal), el => el.child(this.button(t, `ph-trash-${pane}`, "trash", "agent.trash", { terminal: p.terminal }, tr("Move to recycle bin", "移入回收站"), true)))
         .child(this.button(t, `ph-x-${pane}`, "close", "pane.close", { pane }, st === "ended" ? tr("Close tab", "关闭标签页") : isAcp ? tr("Move to background", "转入后台") : tr("Close pane", "关闭窗格"))));
   }
 }

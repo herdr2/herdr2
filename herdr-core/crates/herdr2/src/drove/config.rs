@@ -64,7 +64,7 @@ impl DrovePaths {
     }
 }
 
-pub const BUILTIN_ROLE_IDS: [&str; 5] = ["coder", "tester", "writer", "reviewer", "researcher"];
+pub const BUILTIN_ROLE_IDS: [&str; 6] = ["coder", "tester", "writer", "illustrator", "reviewer", "researcher"];
 
 pub fn default_roles() -> BTreeMap<String, RoleConfig> {
     let mut roles = BTreeMap::new();
@@ -75,10 +75,10 @@ pub fn default_roles() -> BTreeMap<String, RoleConfig> {
             summary: Some("核心功能实现、模块重构与 Bug 修复".into()),
             access: Some(RoleAccessMode::Writable),
             allowed_paths: Vec::new(),
-            primary: RoleTarget { agent: "agy".into(), model: None, effort: Effort::High, fast: false, context: None },
+            primary: RoleTarget { agent: "agy".into(), model: None, effort: Effort::High, fast: false, context: None, strengths: Vec::new() },
             fallbacks: vec![
-                RoleTarget { agent: "claude".into(), model: None, effort: Effort::High, fast: false, context: None },
-                RoleTarget { agent: "codex".into(), model: None, effort: Effort::High, fast: false, context: None },
+                RoleTarget { agent: "claude".into(), model: None, effort: Effort::High, fast: false, context: None, strengths: Vec::new() },
+                RoleTarget { agent: "codex".into(), model: None, effort: Effort::High, fast: false, context: None, strengths: Vec::new() },
             ],
             prompt: None,
         },
@@ -98,8 +98,8 @@ pub fn default_roles() -> BTreeMap<String, RoleConfig> {
                 "**/fixtures/**".into(),
                 "**/testdata/**".into(),
             ],
-            primary: RoleTarget { agent: "dsh".into(), model: None, effort: Effort::Medium, fast: false, context: None },
-            fallbacks: vec![RoleTarget { agent: "agy".into(), model: None, effort: Effort::Medium, fast: false, context: None }],
+            primary: RoleTarget { agent: "dsh".into(), model: None, effort: Effort::Medium, fast: false, context: None, strengths: Vec::new() },
+            fallbacks: vec![RoleTarget { agent: "agy".into(), model: None, effort: Effort::Medium, fast: false, context: None, strengths: Vec::new() }],
             prompt: None,
         },
     );
@@ -120,8 +120,40 @@ pub fn default_roles() -> BTreeMap<String, RoleConfig> {
                 "**/*.mmd".into(),
                 "**/*.puml".into(),
             ],
-            primary: RoleTarget { agent: "agy".into(), model: None, effort: Effort::Medium, fast: false, context: None },
-            fallbacks: vec![RoleTarget { agent: "claude".into(), model: None, effort: Effort::Medium, fast: false, context: None }],
+            primary: RoleTarget { agent: "agy".into(), model: None, effort: Effort::Medium, fast: false, context: None, strengths: Vec::new() },
+            fallbacks: vec![RoleTarget { agent: "claude".into(), model: None, effort: Effort::Medium, fast: false, context: None, strengths: Vec::new() }],
+            prompt: None,
+        },
+    );
+    roles.insert(
+        "illustrator".into(),
+        RoleConfig {
+            label: Some("Illustrator".into()),
+            summary: Some("架构图、流程图、时序图、SVG 矢量图与可视化配图绘制".into()),
+            access: Some(RoleAccessMode::ScopedWrite),
+            allowed_paths: vec![
+                "docs/**".into(),
+                "assets/**".into(),
+                "images/**".into(),
+                "diagrams/**".into(),
+                "**/*.svg".into(),
+                "**/*.png".into(),
+                "**/*.webp".into(),
+                "**/*.mmd".into(),
+                "**/*.mermaid".into(),
+                "**/*.puml".into(),
+                "**/*.dot".into(),
+                "**/*.drawio".into(),
+                "**/*.excalidraw".into(),
+                "**/*.d2".into(),
+                "**/*.html".into(),
+                "**/*.md".into(),
+            ],
+            primary: RoleTarget { agent: "agy".into(), model: None, effort: Effort::High, fast: false, context: None, strengths: Vec::new() },
+            fallbacks: vec![
+                RoleTarget { agent: "claude".into(), model: None, effort: Effort::High, fast: false, context: None, strengths: Vec::new() },
+                RoleTarget { agent: "gemini".into(), model: None, effort: Effort::High, fast: false, context: None, strengths: Vec::new() },
+            ],
             prompt: None,
         },
     );
@@ -132,8 +164,8 @@ pub fn default_roles() -> BTreeMap<String, RoleConfig> {
             summary: Some("只读异构代码审查、并发安全与架构审计".into()),
             access: Some(RoleAccessMode::Readonly),
             allowed_paths: Vec::new(),
-            primary: RoleTarget { agent: "codex".into(), model: None, effort: Effort::High, fast: false, context: None },
-            fallbacks: vec![RoleTarget { agent: "agy".into(), model: None, effort: Effort::High, fast: false, context: None }],
+            primary: RoleTarget { agent: "codex".into(), model: None, effort: Effort::High, fast: false, context: None, strengths: Vec::new() },
+            fallbacks: vec![RoleTarget { agent: "agy".into(), model: None, effort: Effort::High, fast: false, context: None, strengths: Vec::new() }],
             prompt: None,
         },
     );
@@ -144,8 +176,8 @@ pub fn default_roles() -> BTreeMap<String, RoleConfig> {
             summary: Some("跨仓源码检索、架构摸底与日志分析".into()),
             access: Some(RoleAccessMode::Readonly),
             allowed_paths: Vec::new(),
-            primary: RoleTarget { agent: "dsh".into(), model: None, effort: Effort::High, fast: false, context: None },
-            fallbacks: vec![RoleTarget { agent: "agy".into(), model: None, effort: Effort::High, fast: false, context: None }],
+            primary: RoleTarget { agent: "dsh".into(), model: None, effort: Effort::High, fast: false, context: None, strengths: Vec::new() },
+            fallbacks: vec![RoleTarget { agent: "agy".into(), model: None, effort: Effort::High, fast: false, context: None, strengths: Vec::new() }],
             prompt: None,
         },
     );
@@ -252,20 +284,45 @@ pub fn validate_config(cfg: &mut DroveConfig) -> Result<(), RpcError> {
     if cfg.roles.is_empty() {
         return Err(RpcError::invalid_params("roles cannot be empty"));
     }
-    for (id, role) in &cfg.roles {
+    for (id, role) in &mut cfg.roles {
         validate_role_id(id)?;
-        if role.primary.agent.trim().is_empty() {
+        role.primary.agent = role.primary.agent.trim().to_string();
+        if role.primary.agent.is_empty() {
             return Err(RpcError::invalid_params(format!("role {id}: primary.agent cannot be empty")));
         }
-        for fb in &role.fallbacks {
-            if fb.agent.trim().is_empty() {
+        role.primary.strengths = normalize_strengths(&role.primary.strengths);
+        for fb in &mut role.fallbacks {
+            fb.agent = fb.agent.trim().to_string();
+            if fb.agent.is_empty() {
                 return Err(RpcError::invalid_params(format!("role {id}: fallback agent cannot be empty")));
             }
+            fb.strengths = normalize_strengths(&fb.strengths);
         }
     }
     cfg.version = 1;
     cfg.updated_at = now_iso();
     Ok(())
+}
+
+/// Trims, deduplicates (case-insensitively), and caps a candidate's work-type strength tags.
+pub fn normalize_strengths(raw: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for item in raw {
+        let trimmed: String = item.trim().chars().take(64).collect();
+        let clean = trimmed.trim();
+        if clean.is_empty() {
+            continue;
+        }
+        let key = clean.to_lowercase();
+        if seen.insert(key) {
+            out.push(clean.to_string());
+            if out.len() >= 12 {
+                break;
+            }
+        }
+    }
+    out
 }
 
 pub fn validate_role_id(id: &str) -> Result<(), RpcError> {
@@ -451,12 +508,26 @@ pub fn web_agents_payload(
             }
         }
         let (_, _, access, allowed_paths) = role_spec_for(cfg, Some(id));
+        let candidates: Vec<Value> = std::iter::once(&role.primary)
+            .chain(role.fallbacks.iter())
+            .map(|c| {
+                json!({
+                    "agent": c.agent,
+                    "model": c.model,
+                    "effort": c.effort,
+                    "fast": c.fast,
+                    "context": c.context,
+                    "strengths": c.strengths,
+                })
+            })
+            .collect();
         roles_json.insert(
             id.clone(),
             json!({
                 "label": role.label.as_deref().unwrap_or(id),
                 "summary": role.summary,
                 "agents": agents,
+                "candidates": candidates,
                 "model": role.primary.model,
                 "effort": role.primary.effort,
                 "access": access,
@@ -511,6 +582,181 @@ pub struct CachedAgentModels {
     pub agent_info: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub model_contexts: BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_efforts: BTreeMap<String, Vec<String>>,
+}
+
+/// Normalizes raw effort choice strings into the canonical Drove `Effort` levels (`low`, `medium`, `high`, `xhigh`).
+pub fn normalize_effort_choices(raw: &[String]) -> Vec<Effort> {
+    let mut has_low = false;
+    let mut has_med = false;
+    let mut has_high = false;
+    let mut has_xhigh = false;
+    for item in raw {
+        match item.trim().to_ascii_lowercase().as_str() {
+            "low" | "minimal" => has_low = true,
+            "medium" | "med" => has_med = true,
+            "high" => has_high = true,
+            "xhigh" | "extra-high" | "extra_high" | "max" | "ultra" => has_xhigh = true,
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    if has_low {
+        out.push(Effort::Low);
+    }
+    if has_med {
+        out.push(Effort::Medium);
+    }
+    if has_high {
+        out.push(Effort::High);
+    }
+    if has_xhigh {
+        out.push(Effort::Xhigh);
+    }
+    out
+}
+
+fn strip_model_effort_and_bracket(raw: &str) -> String {
+    let mut s = raw.trim().to_ascii_lowercase();
+    if let Some(i) = s.find('[') {
+        s.truncate(i);
+    }
+    s = s.trim().to_string();
+    if let Some(rest) = s.strip_prefix("cursor-") {
+        s = rest.to_string();
+    }
+    if let Some(rest) = s.strip_suffix("-fast") {
+        s = rest.to_string();
+    }
+    for suf in ["-extra-high", "-xhigh", "-minimal", "-medium", "-none", "-high", "-low", "-med", "-max", "-thinking"] {
+        if let Some(rest) = s.strip_suffix(suf) {
+            s = rest.to_string();
+            break;
+        }
+    }
+    if let Some(rest) = s.strip_suffix("-thinking") {
+        s = rest.to_string();
+    }
+    s
+}
+
+/// Returns the supported reasoning effort levels for an `(agent, model)` pair:
+/// either 3 levels (`low`/`medium`/`high`) or 4 levels (`low`/`medium`/`high`/`xhigh`),
+/// preferring live probed per-model metadata when present.
+pub fn supported_efforts_for_model(
+    agent: &str,
+    model: Option<&str>,
+    probed_agent: Option<&ProbedAgent>,
+) -> Vec<Effort> {
+    let three = vec![Effort::Low, Effort::Medium, Effort::High];
+    let four = vec![Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh];
+
+    let raw_model = model.map(str::trim).filter(|s| !s.is_empty());
+    if let (Some(pa), Some(m)) = (probed_agent, raw_model) {
+        let base = strip_model_effort_and_bracket(m);
+        let probed_list = pa
+            .model_efforts
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(m) || k.eq_ignore_ascii_case(&base))
+            .map(|(_, v)| v);
+        if let Some(vals) = probed_list {
+            let norm = normalize_effort_choices(vals);
+            if !norm.is_empty() {
+                return norm;
+            }
+        }
+    }
+
+    if let Some(m) = raw_model {
+        let lower = strip_model_effort_and_bracket(m);
+        let slug = lower.rsplit('/').next().unwrap_or(&lower);
+        let slug = slug.rsplit(':').next().unwrap_or(slug);
+        if slug != "default" && slug != "auto" {
+            // Known 4-level (low/medium/high/xhigh) flagship reasoning families.
+            let supports_xhigh = slug == "opus"
+                || slug == "fable"
+                || slug.contains("opus")
+                || slug.contains("fable")
+                || slug.starts_with("claude-sonnet-5")
+                || slug.starts_with("gpt-6")
+                || slug.starts_with("gpt-5.2")
+                || slug.starts_with("gpt-5.3")
+                || slug.starts_with("gpt-5.4")
+                || slug.starts_with("gpt-5.5")
+                || slug.starts_with("gpt-5.6")
+                || slug.starts_with("gpt-5.7")
+                || slug.starts_with("gpt-5.8")
+                || slug.starts_with("gpt-5.9")
+                || slug.starts_with("o3")
+                || slug.starts_with("o4")
+                || slug.starts_with("grok-4.7")
+                || slug.starts_with("grok-4.8")
+                || slug.starts_with("grok-5")
+                || slug.contains("gemini-4-neon");
+            if supports_xhigh {
+                return four;
+            }
+            // Known 3-level (low/medium/high) families.
+            let three_only = slug == "sonnet"
+                || slug == "haiku"
+                || slug.contains("haiku")
+                || slug.contains("sonnet")
+                || slug.contains("flash")
+                || slug.contains("lite")
+                || slug.contains("mini")
+                || slug.contains("nano")
+                || slug.contains("turbo")
+                || slug.contains("composer")
+                || slug.contains("gemini-2.5")
+                || slug.contains("gemini-3")
+                || slug.contains("gemini-4-carbon")
+                || slug.contains("gemini-4-argon")
+                || slug.contains("grok-4.6")
+                || slug.starts_with("gpt-4")
+                || slug.starts_with("gpt-5.0")
+                || slug.starts_with("gpt-5.1")
+                || slug.contains("glm-")
+                || slug.contains("kimi")
+                || slug.contains("qwen")
+                || slug.contains("deepseek")
+                || slug.contains("doubao");
+            if three_only {
+                return three;
+            }
+        }
+    }
+
+    if let Some(pa) = probed_agent
+        && !pa.efforts.is_empty()
+    {
+        let norm = normalize_effort_choices(&pa.efforts);
+        if !norm.is_empty() {
+            return norm;
+        }
+    }
+
+    match agent.trim().to_ascii_lowercase().as_str() {
+        "claude" | "codex" | "cursor" | "cursor-agent" | "hermes" | "agy" | "antigravity" => four,
+        _ => three,
+    }
+}
+
+/// Clamps `effort` to the closest valid effort supported by `(agent, model)`.
+pub fn clamp_effort_for_model(
+    agent: &str,
+    model: Option<&str>,
+    effort: Effort,
+    probed_agent: Option<&ProbedAgent>,
+) -> Effort {
+    let allowed = supported_efforts_for_model(agent, model, probed_agent);
+    if allowed.contains(&effort) {
+        return effort;
+    }
+    if effort == Effort::Xhigh && allowed.contains(&Effort::High) {
+        return Effort::High;
+    }
+    allowed.last().copied().unwrap_or(Effort::High)
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

@@ -151,11 +151,148 @@ pub(crate) fn is_shell_root(root: &Foreground) -> bool {
     }
     let program =
         if root.name.is_empty() { root.argv.first().map(String::as_str).unwrap_or_default() } else { &root.name };
-    let name = program.rsplit('/').next().unwrap_or(program);
-    matches!(name, "sh" | "bash" | "zsh" | "fish" | "nu" | "dash" | "ksh" | "tcsh")
+    let base = program.rsplit(['/', '\\']).next().unwrap_or(program).to_ascii_lowercase();
+    let name = base.strip_suffix(".exe").unwrap_or(&base);
+    matches!(
+        name,
+        "sh" | "bash" | "zsh" | "fish" | "nu" | "dash" | "ksh" | "tcsh" | "pwsh" | "powershell" | "cmd"
+    )
+}
+
+fn is_cli_foreground(fg: &Foreground) -> bool {
+    if crate::pty_transcript::hint_from_words(
+        std::iter::once(fg.name.as_str()).chain(fg.argv.iter().map(String::as_str)),
+    )
+    .is_some()
+    {
+        return true;
+    }
+    if crate::pty_adapters::PtyCliKind::detect(&fg.argv) != crate::pty_adapters::PtyCliKind::Generic {
+        return true;
+    }
+    std::iter::once(fg.name.as_str()).chain(fg.argv.iter().map(String::as_str)).any(|raw| {
+        if raw.starts_with('-') {
+            return false;
+        }
+        let base = raw.rsplit(['/', '\\']).next().unwrap_or(raw).to_ascii_lowercase();
+        let stem = base.strip_suffix(".exe").unwrap_or(&base);
+        let clean = stem.strip_suffix(".real").unwrap_or(stem);
+        matches!(clean, "cursor-agent" | "opencode" | "kimi" | "copilot" | "hermes" | "zcode" | "qoder" | "dsh")
+    })
 }
 
 impl Core {
+    /// Applies one foreground sample for terminal `id`, resetting agent status and stale CLI checkpoints
+    /// when a CLI exits back to its shell or a fresh non-resumed CLI starts in the same terminal.
+    pub(crate) fn apply_foreground_update(&self, st: &mut crate::runtime::State, id: u32, now: Option<Foreground>) {
+        let Some((t_pid, t_addr, t_cwd, prev_fg, has_status_or_records)) = st
+            .pty_reg
+            .terminals
+            .get(&id)
+            .filter(|t| t.is_live())
+            .map(|t| {
+                let cwd = t.last_cwd.clone().unwrap_or_else(|| t.cwd.clone());
+                (t.pid, t.address.clone(), cwd, t.foreground.clone(), t.status.is_some() || !t.records.is_empty())
+            })
+        else {
+            return;
+        };
+
+        let now_is_shell_root = now.as_ref().is_some_and(|n| Some(n.pid as u32) == t_pid && is_shell_root(n));
+        let prev_was_shell_root = prev_fg.as_ref().is_some_and(|p| Some(p.pid as u32) == t_pid && is_shell_root(p));
+        let at_shell = crate::platform::foreground_tracks_jobs() && now_is_shell_root;
+        let respawning = st.pty_respawning.contains(&id);
+
+        let mut cleared_checkpoints = false;
+        let mut should_reattach_resumed = false;
+        if !respawning {
+            let tc = self.target_checkpoints(st, &t_addr);
+            let has_ckpt_state = !tc.checkpoints.is_empty()
+                || tc.cli_kind.is_some()
+                || tc.cli_session_id.is_some()
+                || tc.cli_transcript_path.is_some()
+                || tc.cli_fg_pid.is_some()
+                || st.pty_prompts.contains_key(&id);
+            if has_ckpt_state && tc.pending_rollback_turn.is_none() && tc.pending_handoff.is_none() {
+                let had_cli_session = tc.cli_kind.is_some()
+                    || tc.cli_session_id.is_some()
+                    || tc.cli_fg_pid.is_some()
+                    || has_status_or_records
+                    || prev_fg.as_ref().is_some_and(is_cli_foreground);
+                let exited_cli_to_shell =
+                    now_is_shell_root && had_cli_session && (!prev_was_shell_root || has_status_or_records);
+                let started_clean_cli = !now_is_shell_root
+                    && now.as_ref().is_some_and(|fg| {
+                        let fg_pid = u32::try_from(fg.pid).ok();
+                        let pid_changed = prev_fg.as_ref().is_some_and(|p| p.pid != fg.pid);
+                        pid_changed
+                            && is_cli_foreground(fg)
+                            && !crate::pty_transcript::argv_has_resume(&fg.argv)
+                            && tc.cli_fg_pid != fg_pid
+                            && had_cli_session
+                    });
+                if exited_cli_to_shell || started_clean_cli {
+                    self.detach_target_checkpoints(st, &t_addr, &t_cwd);
+                    st.pty_prompts.remove(&id);
+                    cleared_checkpoints = true;
+                }
+            }
+            if !now_is_shell_root
+                && let Some(ref fg) = now
+                && is_cli_foreground(fg)
+                && crate::pty_transcript::argv_has_resume(&fg.argv)
+            {
+                let fg_pid = u32::try_from(fg.pid).ok();
+                let pid_changed = prev_fg.as_ref().is_none_or(|p| p.pid != fg.pid);
+                if pid_changed || (fg_pid.is_some() && tc.cli_fg_pid != fg_pid && crate::pty_adapters::needs_resumed_reattach(&tc, fg_pid)) {
+                    should_reattach_resumed = true;
+                }
+            }
+        }
+
+        let Some(t) = st.pty_reg.terminals.get_mut(&id).filter(|t| t.is_live()) else {
+            return;
+        };
+        let mut change = (at_shell && (t.status.is_some() || !t.records.is_empty())).then(|| {
+            t.first_task_turn = None;
+            crate::status::reset_terminal(t)
+        });
+        let mut turn_reset = false;
+        if cleared_checkpoints {
+            if let Some(ref mut ch) = change {
+                // Exiting a working CLI back to shell must not trigger a post-exit shell checkpoint.
+                ch.turn_ended = false;
+            }
+            if t.turn != 0 {
+                t.turn = 0;
+                turn_reset = true;
+            }
+        }
+        let foreground_changed = t.foreground != now;
+        if let Some(f) = &now {
+            t.last_cwd = Some(f.cwd.clone());
+        }
+        t.foreground = now.clone();
+        if change.is_some() || foreground_changed || turn_reset {
+            self.save_pty_soon();
+        }
+        if let Some(change) = change {
+            self.pty_status_changed(st, id, change);
+        }
+        if turn_reset {
+            self.emit_pty(st, "turn", id, serde_json::json!({ "turn": 0 }));
+        }
+        if foreground_changed {
+            self.emit_pty(st, "foreground", id, serde_json::to_value(&now).unwrap_or_default());
+        }
+        if cleared_checkpoints {
+            self.emit_pty(st, "checkpoint", id, serde_json::json!({ "cleared": true }));
+        }
+        if should_reattach_resumed {
+            let _ = self.jobs.send(crate::notes::Job::PtyResumeCheckpoints { id });
+        }
+    }
+
     /// Keeps every live terminal's `foreground` current, with an event on each change.
     pub async fn watch_foreground(self: Arc<Self>) {
         let ms = std::env::var("H2_FOREGROUND_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(500);
@@ -166,29 +303,7 @@ impl Core {
                 let pgid = self.foreground(id).await;
                 let now = (pgid > 0).then(|| about(pgid)).flatten();
                 let mut st = self.lock();
-                let Some(t) = st.pty_reg.terminals.get_mut(&id).filter(|t| t.is_live()) else {
-                    continue;
-                };
-                let at_shell = crate::platform::foreground_tracks_jobs()
-                    && now.as_ref().is_some_and(|n| Some(n.pid as u32) == t.pid && is_shell_root(n));
-                let change = (at_shell && (t.status.is_some() || !t.records.is_empty())).then(|| {
-                    t.first_task_turn = None;
-                    crate::status::reset_terminal(t)
-                });
-                let foreground_changed = t.foreground != now;
-                if let Some(f) = &now {
-                    t.last_cwd = Some(f.cwd.clone());
-                }
-                t.foreground = now.clone();
-                if change.is_some() || foreground_changed {
-                    self.save_pty_soon();
-                }
-                if let Some(change) = change {
-                    self.pty_status_changed(&mut st, id, change);
-                }
-                if foreground_changed {
-                    self.emit_pty(&mut st, "foreground", id, serde_json::to_value(&now).unwrap_or_default());
-                }
+                self.apply_foreground_update(&mut st, id, now);
             }
         }
     }
@@ -212,5 +327,239 @@ mod tests {
                 assert!(!is_shell_root(&root), "{shell} {arg}");
             }
         }
+    }
+
+    #[test]
+    fn exiting_or_switching_cli_agent_clears_stale_checkpoints_but_preserves_plain_shell_snaps() {
+        use crate::checkpoint::{CheckpointMeta, TargetCheckpoints};
+        use crate::paths::Paths;
+        use crate::terminals::NewTerminal;
+
+        let root = crate::test_tmp().join(format!("h2-fg-ckpt-{}-{}", std::process::id(), crate::platform::random_hex()));
+        let paths = Paths {
+            socket: root.join("core.sock"),
+            holder_socket: root.join("holder.sock"),
+            state: root.clone(),
+            config: root.join("config.toml"),
+        };
+        paths.create_dirs().unwrap();
+        let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
+
+        let id = {
+            let mut st = core.lock();
+            let id = st
+                .pty_reg
+                .create(
+                    NewTerminal {
+                        argv: vec!["zsh".into()],
+                        cwd: root.to_string_lossy().to_string(),
+                        cols: 80,
+                        rows: 24,
+                        ..Default::default()
+                    },
+                    1,
+                )
+                .unwrap();
+            st.pty_reg.terminals.get_mut(&id).unwrap().pid = Some(100);
+            id
+        };
+        let addr = crate::terminals::address(id);
+        let cwd = root.to_string_lossy().to_string();
+        let zsh = Foreground { pid: 100, name: "zsh".into(), argv: vec!["zsh".into()], cwd: cwd.clone() };
+        let claude = Foreground { pid: 200, name: "claude".into(), argv: vec!["claude".into()], cwd: cwd.clone() };
+        let codex = Foreground { pid: 300, name: "codex".into(), argv: vec!["codex".into()], cwd: cwd.clone() };
+        let ls = Foreground { pid: 400, name: "ls".into(), argv: vec!["ls".into()], cwd: cwd.clone() };
+
+        // 1. Agent A (claude) runs and leaves checkpoints + sent prompts; exiting back to zsh clears them and resets turn.
+        {
+            let mut st = core.lock();
+            {
+                let t = st.pty_reg.terminals.get_mut(&id).unwrap();
+                t.foreground = Some(claude.clone());
+                t.turn = 4;
+            }
+            st.pty_prompts.insert(id, vec![(1, 10, "prompt A".into())]);
+            core.save_target_checkpoints(
+                &mut st,
+                TargetCheckpoints {
+                    addr: addr.clone(),
+                    cli_kind: Some("claude".into()),
+                    cli_session_id: Some("sess-a".into()),
+                    cli_fg_pid: Some(200),
+                    checkpoints: vec![CheckpointMeta {
+                        turn: 1,
+                        session_turn: Some(1),
+                        ref_name: "refs/herdr2/checkpoints/test/t1/turn-1".into(),
+                        commit_oid: "deadbeef".into(),
+                        head_oid: None,
+                        prompt: Some("prompt A".into()),
+                        label: None,
+                        files: vec![],
+                        ts_ms: 10,
+                    }],
+                    ..Default::default()
+                },
+            );
+            core.apply_foreground_update(&mut st, id, Some(zsh.clone()));
+            let after = core.target_checkpoints(&mut st, &addr);
+            assert!(after.checkpoints.is_empty(), "exiting CLI back to shell must clear Agent A checkpoints");
+            assert!(after.cli_kind.is_none());
+            assert!(after.cli_session_id.is_none());
+            assert!(!st.pty_prompts.contains_key(&id));
+            assert_eq!(st.pty_reg.terminals[&id].turn, 0, "exiting CLI to shell must reset turn to 0");
+        }
+
+        // 2. Rapid switch directly from Agent A (claude) to clean Agent B (codex) also clears stale checkpoints.
+        {
+            let mut st = core.lock();
+            st.pty_reg.terminals.get_mut(&id).unwrap().foreground = Some(claude.clone());
+            core.save_target_checkpoints(
+                &mut st,
+                TargetCheckpoints {
+                    addr: addr.clone(),
+                    cli_kind: Some("claude".into()),
+                    cli_session_id: Some("sess-a".into()),
+                    cli_fg_pid: Some(200),
+                    checkpoints: vec![CheckpointMeta {
+                        turn: 1,
+                        session_turn: Some(1),
+                        ref_name: "refs/herdr2/checkpoints/test/t1/turn-1".into(),
+                        commit_oid: "deadbeef".into(),
+                        head_oid: None,
+                        prompt: Some("prompt A".into()),
+                        label: None,
+                        files: vec![],
+                        ts_ms: 10,
+                    }],
+                    ..Default::default()
+                },
+            );
+            core.apply_foreground_update(&mut st, id, Some(codex.clone()));
+            let after = core.target_checkpoints(&mut st, &addr);
+            assert!(after.checkpoints.is_empty(), "starting fresh clean CLI agent must clear previous CLI checkpoints");
+        }
+
+        // 3. Manual checkpoint taken in a plain shell survives running and exiting `ls`.
+        {
+            let mut st = core.lock();
+            st.pty_reg.terminals.get_mut(&id).unwrap().foreground = Some(zsh.clone());
+            core.save_target_checkpoints(
+                &mut st,
+                TargetCheckpoints {
+                    addr: addr.clone(),
+                    checkpoints: vec![CheckpointMeta {
+                        turn: 0,
+                        session_turn: None,
+                        ref_name: "refs/herdr2/checkpoints/test/t1/turn-0".into(),
+                        commit_oid: "cafebabe".into(),
+                        head_oid: None,
+                        prompt: None,
+                        label: Some("manual".into()),
+                        files: vec![],
+                        ts_ms: 20,
+                    }],
+                    ..Default::default()
+                },
+            );
+            core.apply_foreground_update(&mut st, id, Some(ls));
+            core.apply_foreground_update(&mut st, id, Some(zsh.clone()));
+            let after = core.target_checkpoints(&mut st, &addr);
+            assert_eq!(after.checkpoints.len(), 1, "plain shell manual snapshot must be preserved");
+        }
+
+        // 4. Exiting Claude archives its session checkpoints so later `claude -c` re-attaches them
+        // even if a placeholder T0 baseline was already captured on the same fg_pid.
+        {
+            let mut st = core.lock();
+            st.pty_reg.terminals.get_mut(&id).unwrap().foreground = Some(claude.clone());
+            core.save_target_checkpoints(
+                &mut st,
+                TargetCheckpoints {
+                    addr: addr.clone(),
+                    repo_root: Some(root.to_string_lossy().to_string()),
+                    cli_kind: Some("claude".into()),
+                    cli_session_id: Some("sess-resume-1".into()),
+                    cli_fg_pid: Some(200),
+                    checkpoints: vec![
+                        CheckpointMeta {
+                            turn: 0,
+                            session_turn: None,
+                            ref_name: "refs/herdr2/checkpoints/test/t1/0".into(),
+                            commit_oid: "11111111".into(),
+                            head_oid: None,
+                            prompt: None,
+                            label: None,
+                            files: vec![],
+                            ts_ms: 100,
+                        },
+                        CheckpointMeta {
+                            turn: 1,
+                            session_turn: Some(1),
+                            ref_name: "refs/herdr2/checkpoints/test/t1/1".into(),
+                            commit_oid: "22222222".into(),
+                            head_oid: None,
+                            prompt: Some("add calc".into()),
+                            label: None,
+                            files: vec![],
+                            ts_ms: 200,
+                        },
+                    ],
+                    ..Default::default()
+                },
+            );
+            // Exit to zsh: active view becomes clean...
+            core.apply_foreground_update(&mut st, id, Some(zsh));
+            assert!(core.target_checkpoints(&mut st, &addr).checkpoints.is_empty());
+            // ...but archived session checkpoints are preserved and loadable on `-c` / `--resume`!
+            let archived = core
+                .load_archived_cli_session("claude", Some("sess-resume-1"), Some(&root.to_string_lossy()))
+                .expect("archived claude session must survive exit to shell");
+            assert_eq!(archived.checkpoints.len(), 2);
+
+            // Simulate user running `claude --dangerously-skip-permissions -c` where a blank T0
+            // raced ahead with the same cli_fg_pid before reattach ran.
+            let claude_continue = Foreground {
+                pid: 400,
+                name: "claude".into(),
+                argv: vec!["claude".into(), "--dangerously-skip-permissions".into(), "-c".into()],
+                cwd: root.to_string_lossy().to_string(),
+            };
+            core.apply_foreground_update(&mut st, id, Some(claude_continue));
+            core.save_target_checkpoints(
+                &mut st,
+                TargetCheckpoints {
+                    addr: addr.clone(),
+                    repo_root: Some(root.to_string_lossy().to_string()),
+                    cli_fg_pid: Some(400),
+                    checkpoints: vec![CheckpointMeta {
+                        turn: 0,
+                        session_turn: None,
+                        ref_name: "refs/herdr2/checkpoints/test/t1/0".into(),
+                        commit_oid: "99999999".into(),
+                        head_oid: None,
+                        prompt: None,
+                        label: None,
+                        files: vec![],
+                        ts_ms: 300,
+                    }],
+                    ..Default::default()
+                },
+            );
+        }
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let core_arc = Arc::new(core);
+        let reattached = rt.block_on(crate::pty_adapters::reattach_resumed_cli_checkpoints(&core_arc, id));
+        assert!(reattached, "claude -c must automatically re-attach archived session checkpoints even after placeholder T0");
+        {
+            let mut st = core_arc.lock();
+            let restored = core_arc.target_checkpoints(&mut st, &addr);
+            assert_eq!(restored.checkpoints.len(), 2);
+            assert_eq!(restored.cli_session_id.as_deref(), Some("sess-resume-1"));
+            assert_eq!(restored.cli_fg_pid, Some(400));
+            assert_eq!(st.pty_reg.terminals[&id].turn, 1);
+        }
+
+        drop(core_arc);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

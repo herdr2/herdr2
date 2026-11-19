@@ -65,14 +65,16 @@ export default class TerminalsPane extends View {
     return panes().find((p) => p.pane === props()?.pane);
   }
 
-  button(id, icon, command, args) {
+  button(id, icon, command, args, tip = null, danger = false) {
     return div()
       .id(id)
       .p(4)
       .rounded(5)
       .text_color("#5d6168")
       .cursor_pointer()
-      .hover((s) => s.bg("#ffffff0d").text_color("#d6d8db"))
+      .hover((s) => s.bg("#ffffff0d").text_color(danger ? "#ef4444" : "#d6d8db"))
+      .when(Boolean(tip), (el) => el.tooltip(tip))
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
       .on_click((_e, cx) => {
         cx.stop_propagation();
         run(command, args);
@@ -92,7 +94,11 @@ export default class TerminalsPane extends View {
     const isTermAgent = !isAcp && Boolean(p.structured || g?.agent);
     const isAgent = isAcp || isTermAgent;
     const term = p.terminal ? terminals().find((x) => x.address === p.terminal) : null;
-    const lineageParent = term?.lineage?.parent || null;
+    const rawLineageParent = (term?.lineage?.parent || "").trim();
+    const curSlash = typeof p.terminal === "string" ? p.terminal.lastIndexOf("/") : -1;
+    const lineageParent = rawLineageParent
+      ? (!rawLineageParent.includes("/") && curSlash > 0 ? `${p.terminal.slice(0, curSlash + 1)}${rawLineageParent}` : rawLineageParent)
+      : null;
     const showHandoffBtns = Boolean(p.terminal) && p.status !== "ended" && (isAgent || Boolean(lineageParent));
     const accent = t.accent ?? "#3b82f6";
     const alpha = (hex, a) => (typeof hex === "string" && /^#[0-9a-fA-F]{6}$/.test(hex) ? hex + a : null);
@@ -210,59 +216,32 @@ export default class TerminalsPane extends View {
         ),
       )
       .when(showHandoffBtns, (el) =>
-        el
-          .child(
-            h_flex()
-              .id(`tm-side-${pane}`)
-              .flex_none()
-              .h(20)
-              .px(6)
-              .gap(4)
-              .items_center()
-              .rounded(5)
-              .bg("#252628")
-              .border_1()
-              .border_color("#383b40")
-              .text_size(11)
-              .font_medium()
-              .text_color("#c4c7cc")
-              .cursor_pointer()
-              .hover((s) => s.bg("#303338").text_color("#ffffff"))
-              .tooltip(tr("Open isolated side-chat with current context", "开启旁路讨论（不污染主会话）"))
-              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-              .on_click((_e, cx) => {
-                cx.stop_propagation();
-                run("agent.handoff", { source: p.terminal, kind: "side-chat" });
-              })
-              .child(svg("mods/peek/messages-square.svg").size(11).flex_none())
-              .child(tr("Side Chat", "旁路讨论")),
-          )
-          .child(
-            h_flex()
-              .id(`tm-ho-${pane}`)
-              .flex_none()
-              .h(20)
-              .px(6)
-              .gap(4)
-              .items_center()
-              .rounded(5)
-              .bg("#252628")
-              .border_1()
-              .border_color("#383b40")
-              .text_size(11)
-              .font_medium()
-              .text_color("#c4c7cc")
-              .cursor_pointer()
-              .hover((s) => s.bg("#303338").text_color("#ffffff"))
-              .tooltip(tr("Context handoff / Fork", "上下文接力 / 分支探索"))
-              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-              .on_click((_e, cx) => {
-                cx.stop_propagation();
-                run("agent.handoff", { source: p.terminal, kind: "handoff" });
-              })
-              .child(svg("mods/workspace-chrome/git-branch.svg").size(11).flex_none())
-              .child(tr("Handoff", "接力")),
-          ),
+        el.child(
+          h_flex()
+            .id(`tm-ho-${pane}`)
+            .flex_none()
+            .h(20)
+            .px(6)
+            .gap(4)
+            .items_center()
+            .rounded(5)
+            .bg("#252628")
+            .border_1()
+            .border_color("#383b40")
+            .text_size(11)
+            .font_medium()
+            .text_color("#c4c7cc")
+            .cursor_pointer()
+            .hover((s) => s.bg("#303338").text_color("#ffffff"))
+            .tooltip(tr("Context handoff / Fork / Side Chat", "上下文接力 / 分支探索 / 旁路讨论"))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              run("agent.handoff", { source: p.terminal, kind: "handoff" });
+            })
+            .child(svg("mods/workspace-chrome/git-branch.svg").size(11).flex_none())
+            .child(tr("Handoff", "接力")),
+        ),
       )
       .when(Boolean(elapsed), (el) => el.child(
         h_flex()
@@ -282,9 +261,10 @@ export default class TerminalsPane extends View {
           .child(svg("mods/workspace-chrome/clock.svg").size(11).flex_none())
           .child(formatElapsed(elapsed.ms)),
       ))
-      .child(this.button(`th-r-${pane}`, "split-right", "pane.split", { direction: "right", pane }))
-      .child(this.button(`th-d-${pane}`, "split-down", "pane.split", { direction: "down", pane }))
-      .when(tabPaneCount > 1, (el) => el.child(this.button(`th-z-${pane}`, "zoom", "pane.detach", { pane })))
-      .child(this.button(`th-x-${pane}`, "close", "pane.close", { pane }));
+      .child(this.button(`th-r-${pane}`, "split-right", "pane.split", { direction: "right", pane }, tr("Split right", "向右分栏")))
+      .child(this.button(`th-d-${pane}`, "split-down", "pane.split", { direction: "down", pane }, tr("Split down", "向下分栏")))
+      .when(tabPaneCount > 1, (el) => el.child(this.button(`th-z-${pane}`, "zoom", "pane.detach", { pane }, tr("Maximize to new tab", "最大化为独立标签页"))))
+      .when(Boolean(p.terminal), (el) => el.child(this.button(`th-trash-${pane}`, "trash", "agent.trash", { terminal: p.terminal }, tr("Move to recycle bin", "移入回收站"), true)))
+      .child(this.button(`th-x-${pane}`, "close", "pane.close", { pane }, tr("Close pane", "关闭窗格")));
   }
 }

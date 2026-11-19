@@ -2240,9 +2240,21 @@ fn split_pane_names_merged_tabs_and_windows_shells(cx: &mut TestAppContext) {
         true,
         json!({ "section": "drove" }),
         updates("current", "current"),
-        Some("this.droveData = { config: { roles: { reviewer: { label: 'Reviewer', access: 'readonly', primary: { agent: 'claude', model: 'claude-sonnet-4-5', effort: 'high' }, fallbacks: [{ agent: 'codex', model: 'gpt-5.4', effort: 'high', fast: true }, { agent: 'agy', model: 'gemini-4-carbon-high', effort: 'high' }, { agent: 'cursor', model: 'grok-4.7', effort: 'high', context: '500k' }, { agent: 'cursor', model: 'grok-4.7-high', effort: 'high', context: '256k' }] } }, ai: { enabled: true } }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'claude', installed: true, models: ['claude-sonnet-4-5'] }, { id: 'codex', installed: true, models: ['gpt-5.4'] }, { id: 'agy', installed: true, models: ['gemini-4-carbon-high'] }, { id: 'cursor', installed: true, models: ['grok-4.7', 'grok-4.7-high'], modelContexts: { 'grok-4.7': ['256k', '500k'] } }] } };"),
+        Some("this.droveAiConfigMode = 'models'; this.droveRolesBackup = { mode: 'models', roles: {} }; this.droveData = { config: { roles: { reviewer: { label: 'Reviewer', access: 'readonly', primary: { agent: 'claude', model: 'claude-sonnet-4-5', effort: 'high', strengths: ['Security Audit', 'Architecture Review'] }, fallbacks: [{ agent: 'codex', model: 'gpt-5.4', effort: 'xhigh', fast: true, strengths: ['Concurrency & Locks'] }, { agent: 'agy', model: 'gemini-4-carbon-high', effort: 'high' }, { agent: 'cursor', model: 'grok-4.7', effort: 'high', context: '500k' }, { agent: 'cursor', model: 'grok-4.7-high', effort: 'high', context: '256k' }] } }, ai: { enabled: true, baseUrl: 'https://api.deepseek.com', model: 'deepseek-chat' } }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'claude', installed: true, models: ['claude-sonnet-4-5', 'claude-opus-4-6'] }, { id: 'codex', installed: true, models: ['gpt-5.4'] }, { id: 'agy', installed: true, models: ['gemini-4-carbon-high'] }, { id: 'cursor', installed: true, models: ['grok-4.7', 'grok-4.7-high'], modelContexts: { 'grok-4.7': ['256k', '500k'] } }] } };"),
     )
     .unwrap();
+    assert!(aligned_tree.contains("st-dr-ai-models-btn"), "Roles header should render AI Models button: {aligned_tree}");
+    assert!(aligned_tree.contains("st-dr-ai-strengths-btn"), "Roles header should render AI Strengths button: {aligned_tree}");
+    assert!(aligned_tree.contains("st-dr-ai-roles-undo"), "Roles header should render Restore button when backup exists: {aligned_tree}");
+    assert!(aligned_tree.contains("st-dr-ai-roles-panel"), "Expanded AI Auto-Config panel should render: {aligned_tree}");
+    assert!(aligned_tree.contains("st-dr-ai-roles-prompt"), "Expanded AI panel should render tall multiline Textarea: {aligned_tree}");
+    assert!(aligned_tree.contains("st-dr-ai-roles-run"), "Expanded AI Auto-Config panel should render Generate button: {aligned_tree}");
+    assert!(aligned_tree.contains("st-dr-str-chip-reviewer-0-0"), "Candidate strengths chip should render: {aligned_tree}");
+    assert!(aligned_tree.contains("Security Audit"), "Candidate strength label should render: {aligned_tree}");
+    assert!(aligned_tree.contains("st-dr-str-add-reviewer-c0"), "Candidate strength add picker should render: {aligned_tree}");
+    assert!(aligned_tree.contains("st-dr-eff-reviewer-0-high"), "3-level model (claude-sonnet-4-5) should show High effort: {aligned_tree}");
+    assert!(!aligned_tree.contains("st-dr-eff-reviewer-0-xhigh"), "3-level model (claude-sonnet-4-5) must NOT show xhigh effort: {aligned_tree}");
+    assert!(aligned_tree.contains("st-dr-eff-reviewer-1-xhigh"), "4-level model (gpt-5.4) should show xhigh effort: {aligned_tree}");
     assert!(aligned_tree.contains("st-dr-fast-reviewer-0"), "Non-Codex candidate row should reserve aligned Fast slot: {aligned_tree}");
     assert!(aligned_tree.contains("st-dr-fast-reviewer-1"), "Codex candidate row should render Fast toggle: {aligned_tree}");
     assert!(aligned_tree.contains("st-dr-eff-group-reviewer-2"), "Agy candidate row should render effort container: {aligned_tree}");
@@ -2263,6 +2275,27 @@ fn split_pane_names_merged_tabs_and_windows_shells(cx: &mut TestAppContext) {
     assert!(!eff_pill_4.contains("on_click"), "Embedded-effort Cursor model effort pill must not be clickable: {eff_pill_4}");
     assert!(aligned_tree.contains("st-drp-reviewer-c4-ctx"), "Embedded-effort Cursor row should still render context picker: {aligned_tree}");
     assert!(aligned_tree.contains("Ctx 256K"), "Embedded-effort Cursor row should show selected 256K context: {aligned_tree}");
+    for idx in 0..5 {
+        let popup_line = aligned_tree
+            .lines()
+            .find(|l| l.contains(&format!("st-drpp-reviewer-c{idx}-agent")))
+            .unwrap_or_else(|| panic!("missing agent picker popup for row {idx}: {aligned_tree}"));
+        assert!(
+            popup_line.contains(".w[Number(118.0)]")
+                && popup_line.contains(".min_w[Number(118.0)]")
+                && popup_line.contains(".max_w[Number(118.0)]")
+                && popup_line.contains(".flex_none"),
+            "Agent picker row {idx} must enforce fixed 118px width so rows align vertically: {popup_line}"
+        );
+        let trigger_line = aligned_tree
+            .lines()
+            .find(|l| l.contains(&format!("st-drp-reviewer-c{idx}-agent")))
+            .unwrap_or_else(|| panic!("missing agent picker trigger for row {idx}: {aligned_tree}"));
+        assert!(
+            trigger_line.contains(".w_full"),
+            "Agent picker trigger row {idx} must stretch full width of its 118px popup box: {trigger_line}"
+        );
+    }
 }
 
 #[gpui::test]

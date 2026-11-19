@@ -408,6 +408,7 @@ async fn handoff_to_new_pty(
     let mut prompt_sent = false;
     let mut after_turn = None;
     let use_quiet = !matches!(target_cli_kind, PtyCliKind::Claude | PtyCliKind::Codex | PtyCliKind::Agy) || !p.argv.is_empty();
+    let mut initial_msg: Option<String> = None;
 
     if native_fork {
         if let Some(prompt_text) = clean_prompt {
@@ -415,9 +416,7 @@ async fn handoff_to_new_pty(
                 Some(n) => format!("[Note: {n}]\n{prompt_text}"),
                 None => prompt_text,
             };
-            let fm = core.pty_first_message(new_id, use_quiet, &msg, p.caller.as_deref()).await;
-            prompt_sent = fm.sent;
-            after_turn = fm.turn;
+            initial_msg = Some(msg);
         }
     } else {
         let staged = crate::put::stage_terminal(&core.paths.state, new_id, "handoff.md", pkg.markdown.as_bytes())
@@ -446,9 +445,24 @@ async fn handoff_to_new_pty(
         } else {
             pointer.push_str("\nRead that file first for full context and git state before continuing.");
         }
-        let fm = core.pty_first_message(new_id, use_quiet, &pointer, p.caller.as_deref()).await;
-        prompt_sent = fm.sent;
-        after_turn = fm.turn;
+        initial_msg = Some(pointer);
+    }
+
+    if let Some(msg) = initial_msg {
+        if p.wait {
+            let fm = core.pty_first_message(new_id, use_quiet, &msg, p.caller.as_deref()).await;
+            prompt_sent = fm.sent;
+            after_turn = fm.turn;
+        } else {
+            // Return immediately so UI can mount the new tab/split right away (avoiding a 30s RPC
+            // timeout deadlock if the CLI shows an interactive startup prompt such as Codex update).
+            let core_bg = Arc::clone(core);
+            let caller_bg = p.caller.clone();
+            tokio::spawn(async move {
+                let _ = core_bg.pty_first_message(new_id, use_quiet, &msg, caller_bg.as_deref()).await;
+            });
+            prompt_sent = true;
+        }
     }
 
     let wait_res = if p.wait && prompt_sent {

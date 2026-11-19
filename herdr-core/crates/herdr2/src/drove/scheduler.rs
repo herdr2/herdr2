@@ -3,7 +3,7 @@
 use super::notify::notify_coordinator;
 use super::pool::dispatch_agent_task;
 use super::protocol::when_matches;
-use super::router::route_task_with_quotas;
+use super::router::{candidate_pool_for_ai, route_task_with_preference};
 use super::types::*;
 use super::worktree_for_task;
 use crate::runtime::Core;
@@ -204,13 +204,25 @@ pub async fn tick_once(core: &Arc<Core>) {
             }
 
             let current_workers = core.drove.store.list_workers(Some(&run.id));
-            let mut decision = route_task_with_quotas(
+            let ai_pref = if cfg.ai.enabled {
+                if let Some((rname, pool)) =
+                    candidate_pool_for_ai(&cfg, &task, &current_workers, &probed, quotas.as_deref())
+                {
+                    super::ai::pick_role_candidate(core, &run.id, &task, &rname, &pool).await
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            let mut decision = route_task_with_preference(
                 &cfg,
                 &task,
                 &run.cwd,
                 &current_workers,
                 &probed,
                 quotas.as_deref(),
+                ai_pref.clone(),
             );
             if decision.warm_worker.is_none()
                 && task.isolation == Isolation::None
@@ -236,13 +248,14 @@ pub async fn tick_once(core: &Arc<Core>) {
                         t.isolation = Isolation::Worktree;
                     });
                     task.isolation = Isolation::Worktree;
-                    decision = route_task_with_quotas(
+                    decision = route_task_with_preference(
                         &cfg,
                         &task,
                         &run.cwd,
                         &current_workers,
                         &probed,
                         quotas.as_deref(),
+                        ai_pref,
                     );
                 }
             }

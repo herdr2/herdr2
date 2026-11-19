@@ -85,6 +85,28 @@ pub enum DroveAction {
         #[arg(long)]
         consume: bool,
     },
+    /// Use the configured AI assistant model to auto-configure Drove roles, models, and candidate strengths.
+    RolesAiConfig {
+        #[arg(long, value_name = "FILE")]
+        file: Option<PathBuf>,
+        /// Configuration scope: `models`, `strengths`, or `all`.
+        #[arg(long)]
+        mode: Option<String>,
+        /// Optional preference instruction for how roles should be assigned.
+        #[arg(long)]
+        instruction: Option<String>,
+        /// Preview without saving to drove.json.
+        #[arg(long)]
+        dry_run: bool,
+        /// Preferred language for strength tags and rationale (e.g. zh-CN or en).
+        #[arg(long)]
+        language: Option<String>,
+        #[arg(long, value_name = "MACHINE")]
+        on: Option<String>,
+        /// Delete `--file` right after reading it.
+        #[arg(long)]
+        consume: bool,
+    },
     /// Test the optional Magpie quota gateway.
     MagpieTest {
         #[arg(long, value_name = "URL")]
@@ -630,6 +652,40 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
                 )
             } else {
                 format!("AI FAILED: {}", val["error"].as_str().unwrap_or("unknown"))
+            };
+            Ok((val, human))
+        }
+        DroveAction::RolesAiConfig { file, mode, instruction, dry_run, language, on, consume } => {
+            let mut p = match file {
+                Some(f) => read_json_file(&f, consume)?,
+                None => json!({}),
+            };
+            if let Some(md) = mode {
+                p["mode"] = Value::String(md);
+            }
+            if let Some(inst) = instruction {
+                p["instruction"] = Value::String(inst);
+            }
+            if dry_run {
+                p["apply"] = Value::Bool(false);
+            }
+            if let Some(lang) = language {
+                p["language"] = Value::String(lang);
+            }
+            if let Some(m) = on {
+                p["on"] = Value::String(m);
+            }
+            let val = call_core(paths, "drove.roles.ai_configure", p)?;
+            let ok = val["ok"].as_bool().unwrap_or(false);
+            let human = if ok {
+                format!(
+                    "AI roles configured ({} ms, model={}): {}",
+                    val["latencyMs"].as_u64().unwrap_or(0),
+                    val["modelUsed"].as_str().unwrap_or("?"),
+                    val["rationale"].as_str().unwrap_or("done")
+                )
+            } else {
+                format!("AI roles config failed: {}", val["error"].as_str().unwrap_or("unknown"))
             };
             Ok((val, human))
         }

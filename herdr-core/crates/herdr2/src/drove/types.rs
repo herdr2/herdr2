@@ -1053,6 +1053,9 @@ pub struct RoleTarget {
     pub fast: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<String>,
+    /// Work types / task specialties this agent+model excels at (used by router & coordinator).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub strengths: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1194,6 +1197,8 @@ pub struct ProbedAgent {
     pub default_effort: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub model_contexts: BTreeMap<String, Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub model_efforts: BTreeMap<String, Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -1333,4 +1338,52 @@ pub struct DroveWebOpenResult {
     pub url: String,
     pub opened: bool,
     pub via_peer: bool,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DroveRolesAiConfigureParams {
+    #[serde(default)]
+    pub on: Option<String>,
+    /// Configuration scope: `"models"` (agents/models/effort only), `"strengths"` (candidate task strengths only), or `"all"` (default).
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Optional natural-language preference hint (e.g. preferred agents/models or cost/speed priority).
+    #[serde(default)]
+    pub instruction: Option<String>,
+    /// Optional unsaved AI Assistant endpoint override.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Optional unsaved AI Assistant API key override.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Optional unsaved AI Assistant model override.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Persist generated roles immediately (defaults to true).
+    #[serde(default)]
+    pub apply: Option<bool>,
+    /// Preferred output language ("zh-CN" | "en") for strengths tags and rationale.
+    #[serde(default)]
+    pub language: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DroveRolesAiConfigureResult {
+    pub ok: bool,
+    pub applied: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub probed_refreshed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_used: Option<String>,
+    pub latency_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rationale: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roles: Option<BTreeMap<String, RoleConfig>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settings: Option<DroveSettingsResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }

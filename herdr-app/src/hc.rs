@@ -217,6 +217,10 @@ impl EventLines {
                 let next = t["transcript_seq"].as_u64().unwrap_or(0) + 1;
                 t["transcript_seq"] = json!(next);
             }
+            "checkpoint" => {
+                let next = t["checkpoint_seq"].as_u64().unwrap_or(0) + 1;
+                t["checkpoint_seq"] = json!(next);
+            }
             _ => return false,
         }
         true

@@ -157,7 +157,7 @@ fn drove_settings_get_set_and_secret_key_storage() {
     let s = drove_session();
     let init = s.json(&["drove", "settings"]);
     let roles = init["config"]["roles"].as_object().unwrap();
-    for id in ["coder", "tester", "writer", "reviewer", "researcher"] {
+    for id in ["coder", "tester", "writer", "illustrator", "reviewer", "researcher"] {
         assert!(roles.contains_key(id), "missing built-in role {id}");
     }
     assert_eq!(init["config"]["magpie"]["enabled"], false);
@@ -2264,5 +2264,126 @@ fn drove_subagents_close_on_coordinator_trash_or_exit_and_web_delete() {
             .iter()
             .any(|a| a["address"] == w2_addr),
         "deleted run left live agent {w2_addr}: {ls_live}"
+    );
+}
+
+#[test]
+fn drove_roles_ai_configure_and_strengths_persist_end_to_end() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mock_port = listener.local_addr().unwrap().port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_srv = stop.clone();
+
+    let s = drove_session();
+    // Pre-seed a probed agent list by checking whatever agents are discovered in this test session.
+    let initial = s.json(&["drove", "settings"]);
+    let probed_agents = initial["agents"]["agents"].as_array().cloned().unwrap_or_default();
+    let any_installed = probed_agents.iter().any(|a| a["installed"] == true);
+    let pick_agent = |idx: usize| -> String {
+        probed_agents
+            .iter()
+            .filter(|a| !any_installed || a["installed"] == true)
+            .nth(idx)
+            .or_else(|| probed_agents.iter().find(|a| !any_installed || a["installed"] == true))
+            .and_then(|a| a["id"].as_str())
+            .unwrap_or("claude")
+            .to_string()
+    };
+    let agent_a = pick_agent(0);
+    let agent_b = pick_agent(1);
+
+    let ai_reply_json = json!({
+        "rationale": "按架构与前端分工配置候选",
+        "roles": {
+            "coder": {
+                "candidates": [
+                    { "agent": agent_a, "model": null, "effort": "high", "strengths": ["后端架构", "复杂重构"] },
+                    { "agent": agent_b, "model": null, "effort": "medium", "strengths": ["前端UI", "快速修复"] }
+                ]
+            }
+        }
+    })
+    .to_string();
+
+    let srv = std::thread::spawn(move || {
+        while !stop_srv.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut conn, _)) => {
+                    let mut buf = [0u8; 8192];
+                    let n = conn.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]);
+                    let first_line = req.lines().next().unwrap_or("");
+                    let body = if first_line.starts_with("GET /v1/models") {
+                        json!({"data":[{"id":"mock-planner-model"}]}).to_string()
+                    } else if first_line.starts_with("POST /v1/chat/completions") {
+                        json!({
+                            "id": "chatcmpl-roles",
+                            "choices": [{"message": {"role": "assistant", "content": ai_reply_json}}]
+                        })
+                        .to_string()
+                    } else {
+                        r#"{"error":"not_found"}"#.to_string()
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = conn.write_all(resp.as_bytes());
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let req_file = s.root.join("ai-roles.json");
+    std::fs::write(
+        &req_file,
+        serde_json::to_vec(&json!({
+            "baseUrl": format!("http://127.0.0.1:{mock_port}/v1"),
+            "instruction": "后端主力+前端分工",
+            "apply": true,
+            "language": "zh-CN"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let res = s.json(&[
+        "drove",
+        "roles-ai-config",
+        "--file",
+        req_file.to_str().unwrap(),
+        "--consume",
+    ]);
+    stop.store(true, Ordering::Relaxed);
+    let _ = srv.join();
+
+    assert_eq!(res["ok"], true, "roles-ai-config failed: {res}");
+    assert_eq!(res["applied"], true);
+    assert_eq!(res["modelUsed"], "mock-planner-model");
+    assert_eq!(res["rationale"], "按架构与前端分工配置候选");
+
+    // Verify persisted in drove settings & exposed via /api/agents.
+    let updated = s.json(&["drove", "settings"]);
+    let coder = &updated["config"]["roles"]["coder"];
+    assert_eq!(coder["primary"]["agent"], agent_a);
+    assert_eq!(coder["primary"]["strengths"], json!(["后端架构", "复杂重构"]));
+    if agent_b != agent_a {
+        assert_eq!(coder["fallbacks"][0]["agent"], agent_b);
+        assert_eq!(coder["fallbacks"][0]["strengths"], json!(["前端UI", "快速修复"]));
+    }
+
+    let port = updated["webPort"].as_u64().unwrap() as u16;
+    let agents_resp = http_req(port, "GET", "/api/agents", &[], None);
+    assert_eq!(agents_resp.status, 200);
+    let agents_json: Value = serde_json::from_str(&agents_resp.body).unwrap();
+    assert_eq!(
+        agents_json["profile"]["roles"]["coder"]["candidates"][0]["strengths"],
+        json!(["后端架构", "复杂重构"])
     );
 }

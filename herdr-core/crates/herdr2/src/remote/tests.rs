@@ -178,3 +178,81 @@ fn remote_misses_and_renames_keep_subscribers_on_the_current_machine() {
     drop(core);
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn remote_handoff_localizes_from_address_and_routes_into() {
+    let root = crate::test_tmp().join(format!("h2-handoff-remote-{}-{}", std::process::id(), crate::platform::random_hex()));
+    let paths = Paths { socket: root.join("core.sock"), holder_socket: root.join("holder.sock"), state: root.clone(), config: root.join("config.toml") };
+    paths.create_dirs().unwrap();
+    let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
+    let machine = Machine {
+        name: "wsl".into(),
+        target: "wsl".into(),
+        via: false,
+        temporary: false,
+        session: None,
+        id: "wsl-id".into(),
+        host: "wsl-host".into(),
+        version: "test".into(),
+        keeps_running_after_logout: None,
+        logout_linger_user: None,
+    };
+    core.lock().machines.push(machine);
+
+    // 1. Transcript `Entry::Handoff` must localize `from_address` while leaving non-address `source` fields intact.
+    let read_reply = localize(
+        &core,
+        "wsl",
+        &[],
+        json!({
+            "entries": [{
+                "kind": "handoff",
+                "turn": 0,
+                "handoff_kind": "side-chat",
+                "from_address": "t22",
+                "from_provider": "claude",
+                "from_turns": "1-3"
+            }],
+            "config_options": [{
+                "id": "model",
+                "name": "Model",
+                "kind": "select",
+                "current_value": "opus",
+                "source": "legacy_model"
+            }]
+        }),
+    );
+    assert_eq!(read_reply["entries"][0]["from_address"], "wsl/t22");
+    assert_eq!(read_reply["config_options"][0]["source"], "legacy_model");
+
+    // 2. `HandoffResult` localizes `target`, `source`, and `lineage.parent`.
+    let ho_reply = localize(
+        &core,
+        "wsl",
+        &[],
+        json!({
+            "target": "a4",
+            "target_kind": "agent",
+            "kind": "side-chat",
+            "source": "t22",
+            "lineage": { "kind": "side-chat", "parent": "t22" }
+        }),
+    );
+    assert_eq!(ho_reply["target"], "wsl/a4");
+    assert_eq!(ho_reply["source"], "wsl/t22");
+    assert_eq!(ho_reply["lineage"]["parent"], "wsl/t22");
+
+    // 3. `route` for remote `agent.handoff` strips matching machine prefix from both `source` and `into`.
+    let routed = route(
+        &core,
+        "agent.handoff",
+        &json!({ "source": "wsl/a4", "into": "wsl/t22", "kind": "handoff" }),
+    )
+    .unwrap()
+    .expect("routed to wsl");
+    assert_eq!(routed.1["source"], "a4");
+    assert_eq!(routed.1["into"], "t22");
+
+    drop(core);
+    std::fs::remove_dir_all(root).unwrap();
+}

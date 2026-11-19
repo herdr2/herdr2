@@ -1023,6 +1023,7 @@ pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Va
             | "drove.settings.set"
             | "drove.probe"
             | "drove.ai.test"
+            | "drove.roles.ai_configure"
             | "drove.magpie.test"
             | "drove.http_proxy"
             | "drove.web.open"
@@ -1060,6 +1061,22 @@ pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Va
             return Err(RpcError::new("denied", format!("{name} only takes send, read, get and wait from here"), ""));
         }
         params[field] = local.into();
+        if method == "agent.handoff"
+            && let Some((into_prefix, into_local)) = params["into"]
+                .as_str()
+                .and_then(|a| a.split_once('/'))
+                .map(|(a, b)| (a.to_string(), b.to_string()))
+            && let Ok(Some(into_to)) = named(core, &st, &into_prefix)
+        {
+            let same_dest = match (&to, &into_to) {
+                (Some(To::Machine(a)), To::Machine(b)) => a.id == b.id,
+                (Some(To::Peer { id: a, .. }), To::Peer { id: b, .. }) => a == b,
+                _ => false,
+            };
+            if same_dest {
+                params["into"] = into_local.into();
+            }
+        }
         to
     } else {
         None
@@ -1252,12 +1269,15 @@ fn map_addresses(v: &mut Value, map: &dyn Fn(&str) -> String) {
     match v {
         Value::Object(o) => {
             let is_agent_record = o.contains_key("address") && o.contains_key("state");
+            let is_handoff_result = o.contains_key("lineage") && o.contains_key("target_kind");
             for (k, v) in o.iter_mut() {
                 match v {
                     Value::String(s)
-                        if ["address", "parent", "from", "removed"].contains(&k.as_str())
-                            || ((k == "agent" || k == "terminal" || k == "target" || k == "addr")
-                                && !is_agent_record) =>
+                        if !s.is_empty()
+                            && (["address", "parent", "from", "from_address", "removed"].contains(&k.as_str())
+                                || (k == "source" && is_handoff_result)
+                                || ((k == "agent" || k == "terminal" || k == "target" || k == "addr")
+                                    && !is_agent_record)) =>
                     {
                         *s = map(s)
                     }

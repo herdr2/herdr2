@@ -124,6 +124,7 @@ impl DroveRuntime {
                             default_effort: a.default_effort.clone(),
                             agent_info: a.agent_info.clone(),
                             model_contexts: a.model_contexts.clone(),
+                            model_efforts: a.model_efforts.clone(),
                         },
                     );
                 }
@@ -227,6 +228,7 @@ impl DroveRuntime {
                             default_effort: a.default_effort.clone(),
                             agent_info: a.agent_info.clone(),
                             model_contexts: a.model_contexts.clone(),
+                            model_efforts: a.model_efforts.clone(),
                         },
                     );
                 } else if let Some(saved) = map.get(&a.id) {
@@ -246,6 +248,9 @@ impl DroveRuntime {
                     if a.model_contexts.is_empty() && !saved.model_contexts.is_empty() {
                         a.model_contexts = saved.model_contexts.clone();
                     }
+                    if a.model_efforts.is_empty() && !saved.model_efforts.is_empty() {
+                        a.model_efforts = saved.model_efforts.clone();
+                    }
                 } else if a.installed && !a.models.is_empty() {
                     map.insert(
                         a.id.clone(),
@@ -256,6 +261,7 @@ impl DroveRuntime {
                             default_effort: a.default_effort.clone(),
                             agent_info: a.agent_info.clone(),
                             model_contexts: a.model_contexts.clone(),
+                            model_efforts: a.model_efforts.clone(),
                         },
                     );
                 }
@@ -738,6 +744,14 @@ impl DroveRuntime {
         Ok(self.magpie.test_gateway(target.as_deref()).await)
     }
 
+    pub async fn rpc_roles_ai_configure(
+        &self,
+        params: DroveRolesAiConfigureParams,
+    ) -> Result<DroveRolesAiConfigureResult, RpcError> {
+        let core = self.core().ok_or_else(|| RpcError::internal("core unavailable"))?;
+        Ok(ai::configure_roles_with_ai(&core, params).await)
+    }
+
     pub async fn rpc_http_proxy(&self, req: HttpProxyRequest) -> Result<HttpProxyResponse, RpcError> {
         let core = self.core().ok_or_else(|| RpcError::internal("core unavailable"))?;
         Ok(http::dispatch_http(&core, req, true).await)
@@ -976,6 +990,7 @@ mod tests {
                 efforts: vec!["low".into(), "medium".into(), "high".into()],
                 default_effort: Some("high".into()),
                 model_contexts: BTreeMap::new(),
+                model_efforts: BTreeMap::new(),
                 error: None,
             }],
         };
@@ -1005,6 +1020,7 @@ mod tests {
                 efforts: vec![],
                 default_effort: None,
                 model_contexts: BTreeMap::new(),
+                model_efforts: BTreeMap::new(),
                 error: Some("ACP probe timed out after 10s".into()),
             }],
         };

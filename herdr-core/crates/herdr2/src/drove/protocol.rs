@@ -350,6 +350,7 @@ mod tests {
                 effort: Effort::Medium,
                 fast: false,
                 context: None,
+                strengths: Vec::new(),
             },
             fallbacks: Vec::new(),
             prompt: None,

@@ -5520,6 +5520,9 @@ impl AppWindow {
             "agent.focus" => {
                 let t = Self::arg(a, "terminal").unwrap_or_default().to_owned();
                 if !self.live.contains_key(&t) {
+                    if self.ended_acp.contains_key(&t) && self.focus_mounted_acp(&t, window, cx) {
+                        return;
+                    }
                     return self.fail(format!("no running terminal {t:?}"));
                 }
                 if matches!(self.rename_focus, RenameFocus::Agent(_)) {
@@ -5548,6 +5551,7 @@ impl AppWindow {
                     }
                     return;
                 }
+                self.close_overlay("terminal-peek", window, cx);
                 self.focus_agent(&t);
             }
             "agent.rename" => {
@@ -5721,7 +5725,12 @@ impl AppWindow {
                 let mut params = json!({ "source": source, "kind": rpc_kind });
                 if let Some(p) = preset { params["preset"] = json!(p); }
                 if let Some(dst) = into { params["into"] = json!(dst); }
-                if let Some(m) = Self::owned(a, "mode").filter(|s| !s.is_empty()) { params["mode"] = json!(m); }
+                if let Some(m) = Self::owned(a, "mode").filter(|s| !s.is_empty()) {
+                    if m.eq_ignore_ascii_case("pty") {
+                        params["pty"] = json!(true);
+                    }
+                    params["mode"] = json!(m);
+                }
                 if let Some(prompt) = Self::owned(a, "prompt").filter(|s| !s.is_empty()) { params["prompt"] = json!(prompt); }
                 if let Some(rt) = a.get("recent_turns").and_then(Value::as_u64) { params["recent_turns"] = json!(rt); }
                 if let Some(mb) = a.get("max_bytes").and_then(Value::as_u64) { params["max_bytes"] = json!(mb); }

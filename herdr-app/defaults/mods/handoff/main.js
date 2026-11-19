@@ -34,6 +34,14 @@ function providerPresetOf(rec) {
   return null;
 }
 
+function qualifyPeerAddress(rawAddr, curAddr) {
+  const raw = typeof rawAddr === "string" ? rawAddr.trim() : "";
+  if (!raw || raw.includes("/")) return raw;
+  const cur = typeof curAddr === "string" ? curAddr.trim() : "";
+  const slash = cur.lastIndexOf("/");
+  return slash > 0 ? `${cur.slice(0, slash + 1)}${raw}` : raw;
+}
+
 function sessionLabel(rec) {
   if (!rec) return "";
   const custom = rec.labels?.["herdr.name"];
@@ -155,7 +163,7 @@ export default class Handoff extends View {
     }
     this.ensurePresetSelected();
 
-    const parentAddr = src?.lineage?.parent || src?.parent || "";
+    const parentAddr = qualifyPeerAddress(src?.lineage?.parent || src?.parent || "", sourceAddr);
     const others = this.otherLiveSessions(sourceAddr);
     if (resetTargets || !this.intoTarget || !others.some((o) => o.address === this.intoTarget)) {
       if (parentAddr && others.some((o) => o.address === parentAddr)) {
@@ -309,7 +317,7 @@ export default class Handoff extends View {
     const sourceAddr = p.source || "";
     const src = this.sourceRecord(sourceAddr);
     const sourceLabel = sessionLabel(src) || sourceAddr || "?";
-    const parentAddr = src?.lineage?.parent || src?.parent || "";
+    const parentAddr = qualifyPeerAddress(src?.lineage?.parent || src?.parent || "", sourceAddr);
     const copy = this.modeCopy(sourceLabel);
     const presets = this.availablePresets();
     const others = this.otherLiveSessions(sourceAddr);

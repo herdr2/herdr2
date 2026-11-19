@@ -157,3 +157,75 @@ fn acp_auto_checkpoints_safety_gate_and_dual_rollback_end_to_end() {
         after_reborn["checkpoints"].as_array().unwrap().iter().filter_map(|c| c["turn"].as_u64()).collect();
     assert_eq!(reborn_turns, vec![0, 1], "{after_reborn}");
 }
+
+#[cfg(unix)]
+#[test]
+fn pty_claude_cli_rollback_reenters_claude_even_after_holder_drains() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let s = Session::new();
+    let repo = s.root.join("repo-pty");
+    init_git_repo(&repo);
+
+    // Create a fake `claude` executable in a local bin dir that logs its argv and stays open.
+    let bin_dir = s.root.join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let log_file = s.root.join("claude-launches.log");
+    let fake_claude = bin_dir.join("claude");
+    std::fs::write(
+        &fake_claude,
+        format!(
+            "#!/bin/sh\necho \"LAUNCH:$0 $*\" >> '{}'\ntrap 'exit 0' TERM INT\nwhile true; do sleep 1; done\n",
+            log_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_claude, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    // Launch PTY terminal running fake claude (with --keep, matching interactive workspace panes).
+    let _ = s.json(&["server", "status"]);
+    let mut c = s.connect();
+    let created_resp = c.call(
+        1,
+        "terminal.run",
+        serde_json::json!({
+            "argv": [fake_claude.to_string_lossy(), "--dangerously-skip-permissions"],
+            "cwd": repo.to_string_lossy(),
+            "keep": true,
+        }),
+    );
+    assert!(created_resp.get("error").is_none(), "terminal.run failed: {created_resp}");
+    let created = &created_resp["result"];
+    let addr = created["address"].as_str().unwrap().to_string();
+    let pid_before = created["pid"].as_u64().unwrap();
+
+    // Capture T0 baseline, mutate workspace, capture T1.
+    s.json(&["checkpoint", "snap", &addr, "--label", "turn0"]);
+    std::fs::write(repo.join("mutated.txt"), "after\n").unwrap();
+    s.json(&["checkpoint", "snap", &addr, "--label", "turn1"]);
+
+    // Roll back to turn 0: must respawn fake claude cleanly in the same terminal pane (not drop to shell).
+    let rb = s.json(&["checkpoint", "rollback", &addr, "--to", "0", "--confirm"]);
+    assert_eq!(rb["turn"], 0, "{rb}");
+    assert_eq!(rb["restored_files"], true, "{rb}");
+    assert!(!repo.join("mutated.txt").exists(), "workspace file must be restored");
+
+    wait_until("respawned claude launches", || {
+        std::fs::read_to_string(&log_file)
+            .map(|c| c.lines().count() >= 2)
+            .unwrap_or(false)
+    });
+    let after = get(&s, &addr);
+    assert_eq!(after["state"], "live", "terminal must remain live after rollback: {after}");
+    assert_ne!(after["pid"].as_u64(), Some(pid_before), "rollback must spawn a fresh claude process: {after}");
+    let argv = after["argv"].as_array().unwrap();
+    assert!(
+        argv.iter().any(|a| a.as_str().is_some_and(|v| v.contains("claude"))),
+        "respawned argv must re-enter claude, not fall back to bare shell: {after}"
+    );
+    let launches = std::fs::read_to_string(&log_file).unwrap();
+    assert!(
+        launches.lines().last().is_some_and(|l| l.contains("--session-id")),
+        "expected fresh --session-id on turn-0 rollback: {launches}"
+    );
+}

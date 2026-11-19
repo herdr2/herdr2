@@ -29,6 +29,7 @@ Agents & terminals
 
 Communicate & control
   send <a|t> <text>           queue ACP prompt or paste text into PTY (--steer: cancel & deliver next)
+  inbox ls|edit|rm <a> ...    inspect, edit, or remove prompts queued in an ACP inbox
   approve <a> [--option ID]   approve a blocked ACP agent's pending permission request
   deny <a> [--option ID]      deny a blocked ACP agent's pending permission request
   config <a> --id K (--value V|--bool B)
@@ -241,33 +242,34 @@ Manage multi-agent Drove orchestration (`drove status`, `drove web`, `drove sett
 Usage: h2 drove [OPTIONS] [COMMAND]
 
 Commands:
-  status        Show Drove web server, configured roles, AI status, and active runs
-  web           Print or open the Drove Web UI URL in the browser
-  settings      Read Drove configuration, resolved roles, and AI connection status
-  settings-set  Update Drove configuration from a JSON file (removes temp file if requested)
-  probe         Probe installed ACP agents and discover their live model & effort options
-  ai-test       Test the lightweight AI assistant URL and API key
-  magpie-test   Test the optional Magpie quota gateway
-  use           Set the active default Run ID for subsequent CLI commands
-  plan          Create a Drove Run from a YAML/JSON plan file or stdin and launch its DAG
-  add           Append one or more tasks to an existing Run
-  quick         Quickly launch a single-task Run from the command line
-  wait          Wait for pending coordinator messages, task failures, or Run completion
-  inbox         List unread coordinator inbox messages for a Run
-  show          Inspect a Run, Task, or Message snapshot by ID
-  ack           Acknowledge a coordinator inbox message
-  reply         Reply to a worker question or escalation message
-  send          Send guidance to a running task worker (or interrupt current turn)
-  inspect       Inspect structured diagnostics and recent items for a task or attempt
-  retry         Retry a task with optional hint or new role/agent/model
-  route         Override role/agent/model/effort assignment on a pending or ready task
-  cancel        Cancel a specific task (by ID/key) or an entire Run
-  complete      Finalize a Run (runs Run-level verify gate if configured)
-  pause         Pause scheduling new tasks in a Run
-  resume        Resume a paused Run
-  worker        Worker protocol subcommands invoked by spawned worker ACP sessions
-  install       Install Drove agent skills (`drove`, `drove-add`, `drove-setup`)
-  help          Print this message or the help of the given subcommand(s)
+  status           Show Drove web server, configured roles, AI status, and active runs
+  web              Print or open the Drove Web UI URL in the browser
+  settings         Read Drove configuration, resolved roles, and AI connection status
+  settings-set     Update Drove configuration from a JSON file (removes temp file if requested)
+  probe            Probe installed ACP agents and discover their live model & effort options
+  ai-test          Test the lightweight AI assistant URL and API key
+  roles-ai-config  Use the configured AI assistant model to auto-configure Drove roles, models, and candidate strengths
+  magpie-test      Test the optional Magpie quota gateway
+  use              Set the active default Run ID for subsequent CLI commands
+  plan             Create a Drove Run from a YAML/JSON plan file or stdin and launch its DAG
+  add              Append one or more tasks to an existing Run
+  quick            Quickly launch a single-task Run from the command line
+  wait             Wait for pending coordinator messages, task failures, or Run completion
+  inbox            List unread coordinator inbox messages for a Run
+  show             Inspect a Run, Task, or Message snapshot by ID
+  ack              Acknowledge a coordinator inbox message
+  reply            Reply to a worker question or escalation message
+  send             Send guidance to a running task worker (or interrupt current turn)
+  inspect          Inspect structured diagnostics and recent items for a task or attempt
+  retry            Retry a task with optional hint or new role/agent/model
+  route            Override role/agent/model/effort assignment on a pending or ready task
+  cancel           Cancel a specific task (by ID/key) or an entire Run
+  complete         Finalize a Run (runs Run-level verify gate if configured)
+  pause            Pause scheduling new tasks in a Run
+  resume           Resume a paused Run
+  worker           Worker protocol subcommands invoked by spawned worker ACP sessions
+  install          Install Drove agent skills (`drove`, `drove-add`, `drove-setup`)
+  help             Print this message or the help of the given subcommand(s)
 
 Options:
       --json  JSON output even in a terminal
@@ -561,6 +563,25 @@ Options:
       --run <RUN>                    
       --on <MACHINE>                 
   -h, --help                         Print help
+```
+
+## h2 drove roles-ai-config
+
+```text
+Use the configured AI assistant model to auto-configure Drove roles, models, and candidate strengths
+
+Usage: h2 drove roles-ai-config [OPTIONS]
+
+Options:
+      --file <FILE>                
+      --json                       JSON output even in a terminal
+      --mode <MODE>                Configuration scope: `models`, `strengths`, or `all`
+      --instruction <INSTRUCTION>  Optional preference instruction for how roles should be assigned
+      --dry-run                    Preview without saving to drove.json
+      --language <LANGUAGE>        Preferred language for strength tags and rationale (e.g. zh-CN or en)
+      --on <MACHINE>               
+      --consume                    Delete `--file` right after reading it
+  -h, --help                       Print help
 ```
 
 ## h2 drove route
@@ -1023,6 +1044,72 @@ Options:
 
   -h, --help
           Print help (see a summary with '-h')
+```
+
+## h2 inbox
+
+```text
+Inspect, edit, or remove prompts queued in an ACP agent's serial inbox
+
+Usage: h2 inbox [OPTIONS] <COMMAND>
+
+Commands:
+  ls    List queued prompts waiting in an agent's inbox
+  edit  Edit a queued prompt before its turn begins
+  rm    Remove a queued prompt before its turn begins
+  help  Print this message or the help of the given subcommand(s)
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h2 inbox edit
+
+```text
+Edit a queued prompt before its turn begins
+
+Usage: h2 inbox edit [OPTIONS] <AGENT> <ID> <TEXT>
+
+Arguments:
+  <AGENT>  The agent: `a7`, a name, or `machine/a7`
+  <ID>     Queued inbox item id (`inbox[].id` from `h2 get`)
+  <TEXT>   Replacement prompt text
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h2 inbox ls
+
+```text
+List queued prompts waiting in an agent's inbox
+
+Usage: h2 inbox ls [OPTIONS] [AGENT]
+
+Arguments:
+  [AGENT]  The agent: `a7`, a name, or `machine/a7`
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h2 inbox rm
+
+```text
+Remove a queued prompt before its turn begins
+
+Usage: h2 inbox rm [OPTIONS] <AGENT> <ID>
+
+Arguments:
+  <AGENT>  The agent: `a7`, a name, or `machine/a7`
+  <ID>     Queued inbox item id (`inbox[].id` from `h2 get`)
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
 ```
 
 ## h2 interrupt

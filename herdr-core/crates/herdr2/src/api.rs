@@ -235,6 +235,9 @@ methods! { Ctx<'_>;
     "drove.ai.test" => drove_ai_test, DroveAiTestParams => crate::drove::probe::AiTestResult,
         "Test generic OpenAI-compatible AI endpoint URL and API key.",
         errors ["invalid_params", "machine_unknown", "unavailable"];
+    "drove.roles.ai_configure" => drove_roles_ai_configure, crate::drove::types::DroveRolesAiConfigureParams => crate::drove::types::DroveRolesAiConfigureResult,
+        "Use the configured AI assistant model to automatically configure Drove roles, models, and candidate strengths.",
+        errors ["invalid_params", "machine_unknown", "unavailable"];
     "drove.magpie.test" => drove_magpie_test, DroveMagpieTestParams => crate::drove::magpie::MagpieTestResult,
         "Test optional Magpie quota gateway connectivity.",
         errors ["invalid_params", "machine_unknown", "unavailable"];
@@ -1206,6 +1209,13 @@ async fn drove_ai_test(core: Ctx<'_>, p: DroveAiTestParams) -> Result<crate::dro
     core.drove.rpc_ai_test(p.base_url, p.api_key, p.model).await
 }
 
+async fn drove_roles_ai_configure(
+    core: Ctx<'_>,
+    p: crate::drove::types::DroveRolesAiConfigureParams,
+) -> Result<crate::drove::types::DroveRolesAiConfigureResult, RpcError> {
+    core.drove.rpc_roles_ai_configure(p).await
+}
+
 async fn drove_magpie_test(
     core: Ctx<'_>,
     p: DroveMagpieTestParams,
@@ -1235,6 +1245,25 @@ async fn drove_subscribe(core: Ctx<'_>, _: Empty) -> Result<DroveSubscribeResult
 
 async fn checkpoint_list(core: Ctx<'_>, p: CheckpointListParams) -> Result<CheckpointListResult, RpcError> {
     let tk = resolve_any(core, &p.target)?;
+    if let TargetKey::Terminal(id) = tk {
+        let try_reattach = {
+            let mut st = core.lock();
+            if let Some(t) = st.pty_reg.terminals.get(&id).cloned()
+                && t.is_live()
+            {
+                let tc = core.target_checkpoints(&mut st, &t.address);
+                let fg_pid = t.foreground.as_ref().and_then(|f| u32::try_from(f.pid).ok());
+                let resumed = t.foreground.as_ref().is_some_and(|f| crate::pty_transcript::argv_has_resume(&f.argv))
+                    || crate::pty_transcript::argv_has_resume(&t.argv);
+                resumed && crate::pty_adapters::needs_resumed_reattach(&tc, fg_pid)
+            } else {
+                false
+            }
+        };
+        if try_reattach {
+            let _ = crate::pty_adapters::reattach_resumed_cli_checkpoints(core, id).await;
+        }
+    }
     let (addr, cwd, tc, live_snapshot) = {
         let mut st = core.lock();
         let (addr, cwd) = match tk {

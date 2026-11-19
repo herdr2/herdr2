@@ -27,6 +27,8 @@ pub struct CheckpointFileStat {
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointMeta {
     pub turn: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_turn: Option<u64>,
     pub ref_name: String,
     pub commit_oid: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -47,11 +49,15 @@ pub struct TargetCheckpoints {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub repo_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ref_namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_kind: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_session_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cli_transcript_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cli_fg_pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_handoff: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -851,6 +857,32 @@ pub fn restore_checkpoint(repo: &RepoInfo, ref_name: &str, ensure_dir: Option<&P
     Ok(())
 }
 
+/// Returns true if `ref_name` currently resolves to a valid object in `repo`.
+pub fn ref_exists(repo: &RepoInfo, ref_name: &str) -> bool {
+    !ref_name.trim().is_empty()
+        && run_git_text(&repo.toplevel, &["rev-parse", "--verify", "-q", ref_name], &[])
+            .ok()
+            .is_some_and(|s| !s.is_empty())
+}
+
+/// Deletes an explicit list of hidden checkpoint ref names in `repo`.
+pub fn delete_checkpoint_ref_names(repo: &RepoInfo, ref_names: &[String]) -> Result<(), String> {
+    let mut stdin = String::new();
+    for r in ref_names {
+        let clean = r.trim();
+        if clean.starts_with("refs/herdr2/checkpoints/") {
+            stdin.push_str("delete ");
+            stdin.push_str(clean);
+            stdin.push('\n');
+        }
+    }
+    if stdin.is_empty() {
+        return Ok(());
+    }
+    run_git_bytes(&repo.toplevel, &["update-ref", "--stdin"], &[], Some(stdin.as_bytes()))?;
+    Ok(())
+}
+
 /// Deletes hidden checkpoint refs under `<session_slug>/<addr>/` with `turn > after_turn`.
 pub fn delete_checkpoint_refs_after(
     repo: &RepoInfo,
@@ -903,9 +935,33 @@ pub async fn capture_target_checkpoint(
     skip_if_present: bool,
     record_transcript_entry: bool,
 ) -> Result<Option<CheckpointMeta>, String> {
+    capture_target_checkpoint_with_session_turn(
+        core,
+        target,
+        turn,
+        None,
+        prompt,
+        label,
+        skip_if_present,
+        record_transcript_entry,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn capture_target_checkpoint_with_session_turn(
+    core: &std::sync::Arc<crate::runtime::Core>,
+    target: crate::runtime::TargetKey,
+    turn: Option<u64>,
+    session_turn: Option<u64>,
+    prompt: Option<String>,
+    label: Option<String>,
+    skip_if_present: bool,
+    record_transcript_entry: bool,
+) -> Result<Option<CheckpointMeta>, String> {
     use crate::runtime::TargetKey;
 
-    let (addr, cwd, ckpt_turn, prev_ref, effective_prompt, session_slug) = {
+    let (addr, cwd, ckpt_turn, prev_ref, effective_prompt, session_slug, ref_owner) = {
         let mut st = core.lock();
         let (addr, cwd, target_turn) = match target {
             TargetKey::Agent(id) => {
@@ -929,7 +985,7 @@ pub async fn capture_target_checkpoint(
                 (t.address.clone(), cwd, t.turn)
             }
         };
-        let tc = core.target_checkpoints(&mut st, &addr);
+        let mut tc = core.target_checkpoints(&mut st, &addr);
         let ckpt_turn = match turn {
             Some(t) => t,
             None => {
@@ -944,17 +1000,29 @@ pub async fn capture_target_checkpoint(
         if skip_if_present && tc.checkpoints.iter().any(|c| c.turn == ckpt_turn) {
             return Ok(None);
         }
+        // Isolate CLI session Git refs per session so a fresh CLI session in the same terminal
+        // never overwrites or deletes an archived earlier session's hidden refs.
+        if matches!(target, TargetKey::Terminal(_))
+            && tc.ref_namespace.is_none()
+            && tc.checkpoints.is_empty()
+            && tc.cli_kind.as_deref().is_some_and(|k| !k.is_empty() && k != "generic")
+        {
+            let suffix = &random_uuid_v4()[..8];
+            tc.ref_namespace = Some(format!("{addr}-{suffix}"));
+            core.save_target_checkpoints(&mut st, tc.clone());
+        }
+        let ref_owner = tc.ref_namespace.clone().unwrap_or_else(|| addr.clone());
         let prev_ref =
             tc.checkpoints.iter().filter(|c| c.turn < ckpt_turn).max_by_key(|c| c.turn).map(|c| c.ref_name.clone());
         let effective_prompt = prompt.or_else(|| (ckpt_turn > 0).then(|| tc.active_turn_prompt.clone()).flatten());
-        (addr, cwd, ckpt_turn, prev_ref, effective_prompt, core.session_slug())
+        (addr, cwd, ckpt_turn, prev_ref, effective_prompt, core.session_slug(), ref_owner)
     };
 
     let Some(repo) = probe_repo(Path::new(&cwd)) else {
         return Ok(None);
     };
 
-    let ref_name = checkpoint_ref(&session_slug, &addr, ckpt_turn);
+    let ref_name = checkpoint_ref(&session_slug, &ref_owner, ckpt_turn);
     let _ckpt_guard = core.repo_ckpt_lock(&repo.toplevel).lock_owned().await;
 
     let repo_clone = repo.clone();
@@ -1000,6 +1068,7 @@ pub async fn capture_target_checkpoint(
 
     let meta = CheckpointMeta {
         turn: ckpt_turn,
+        session_turn: (ckpt_turn > 0).then_some(session_turn).flatten(),
         ref_name: ref_name.clone(),
         commit_oid: commit_oid.clone(),
         head_oid: head_oid.clone(),
@@ -1010,6 +1079,14 @@ pub async fn capture_target_checkpoint(
     };
 
     tc.repo_root = Some(repo.toplevel.to_string_lossy().to_string());
+    if let TargetKey::Terminal(id) = target
+        && let Some(t) = st.pty_reg.terminals.get(&id)
+        && let Some(fg) = &t.foreground
+        && fg.pid > 0
+        && Some(fg.pid as u32) != t.pid
+    {
+        tc.cli_fg_pid = Some(fg.pid as u32);
+    }
     tc.checkpoints.retain(|c| c.turn != ckpt_turn);
     tc.checkpoints.push(meta.clone());
     tc.checkpoints.sort_by_key(|c| c.turn);

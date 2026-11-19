@@ -97,6 +97,7 @@ pub async fn probe_agents(core: &Core, skip_acp_handshake: bool) -> ProbeSnapsho
                     efforts: default_efforts(),
                     default_effort: Some("medium".into()),
                     model_contexts: BTreeMap::new(),
+                    model_efforts: BTreeMap::new(),
                     error: None,
                 }
             }));
@@ -140,6 +141,7 @@ async fn probe_one_acp(
             probe_cli_version(&exe_path, &env, &cwd),
         );
         let models = merge_model_lists(&[cli_models, local_models]);
+        let model_efforts = infer_model_efforts_from_variants(&models);
         let default_model = local_default.or_else(|| models.first().cloned());
         return ProbedAgent {
             id,
@@ -152,6 +154,7 @@ async fn probe_one_acp(
             efforts: default_efforts(),
             default_effort: Some("medium".into()),
             model_contexts: BTreeMap::new(),
+            model_efforts,
             error: None,
         };
     }
@@ -184,6 +187,7 @@ async fn probe_one_acp(
             let mut efforts = Vec::new();
             let mut default_effort = None;
             let mut model_contexts: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            let mut model_efforts: BTreeMap<String, Vec<String>> = BTreeMap::new();
             let mut default_model_contexts = Vec::new();
 
             if matches!(id.as_str(), "cursor" | "cursor-agent")
@@ -200,18 +204,40 @@ async fn probe_one_acp(
                     if !m_id.eq_ignore_ascii_case("default") {
                         push_unique(&mut acp_models, m_id);
                     }
-                    if let Some(opts) = item.get("configOptions").and_then(Value::as_array)
-                        && let Some(ctx_opt) = opts.iter().find(|o| o["id"].as_str() == Some("context"))
-                        && let Some(choices) = ctx_opt.get("options").and_then(Value::as_array)
-                    {
-                        let mut vals = Vec::new();
-                        for ch in choices {
-                            if let Some(v) = ch["value"].as_str() {
-                                push_unique(&mut vals, v);
+                    if let Some(opts) = item.get("configOptions").and_then(Value::as_array) {
+                        if let Some(ctx_opt) = opts.iter().find(|o| o["id"].as_str() == Some("context"))
+                            && let Some(choices) = ctx_opt.get("options").and_then(Value::as_array)
+                        {
+                            let mut vals = Vec::new();
+                            for ch in choices {
+                                if let Some(v) = ch["value"].as_str() {
+                                    push_unique(&mut vals, v);
+                                }
+                            }
+                            if !vals.is_empty() {
+                                model_contexts.insert(m_id.to_string(), vals);
                             }
                         }
-                        if !vals.is_empty() {
-                            model_contexts.insert(m_id.to_string(), vals);
+                        if let Some(eff_opt) = opts.iter().find(|o| {
+                            let oid = o["id"].as_str().unwrap_or("").to_ascii_lowercase();
+                            let ocat = o["category"].as_str().unwrap_or("").to_ascii_lowercase();
+                            oid.contains("effort")
+                                || oid == "reasoning"
+                                || oid == "thinking"
+                                || oid == "thought_level"
+                                || ocat == "thought_level"
+                                || ocat == "effort"
+                        }) && let Some(choices) = eff_opt.get("options").and_then(Value::as_array)
+                        {
+                            let mut vals = Vec::new();
+                            for ch in choices {
+                                if let Some(v) = ch["value"].as_str() {
+                                    push_unique(&mut vals, v);
+                                }
+                            }
+                            if !vals.is_empty() {
+                                model_efforts.insert(m_id.to_string(), vals);
+                            }
                         }
                     }
                 }
@@ -263,6 +289,10 @@ async fn probe_one_acp(
                 model_contexts.entry(dm.clone()).or_insert(default_model_contexts);
             }
 
+            for (k, v) in infer_model_efforts_from_variants(&models) {
+                model_efforts.entry(k).or_insert(v);
+            }
+
             ProbedAgent {
                 id,
                 command: argv,
@@ -274,12 +304,14 @@ async fn probe_one_acp(
                 efforts,
                 default_effort,
                 model_contexts,
+                model_efforts,
                 error: None,
             }
         }
         Ok(Err(err)) => {
             let err_opt = if cli_models.is_empty() { Some(err.message) } else { None };
             let models = merge_model_lists(&[cli_models, local_models]);
+            let model_efforts = infer_model_efforts_from_variants(&models);
             let default_model = local_default.or_else(|| models.first().cloned());
             ProbedAgent {
                 id,
@@ -292,6 +324,7 @@ async fn probe_one_acp(
                 efforts: default_efforts(),
                 default_effort: Some("medium".into()),
                 model_contexts: BTreeMap::new(),
+                model_efforts,
                 error: err_opt,
             }
         }
@@ -302,6 +335,7 @@ async fn probe_one_acp(
                 None
             };
             let models = merge_model_lists(&[cli_models, local_models]);
+            let model_efforts = infer_model_efforts_from_variants(&models);
             let default_model = local_default.or_else(|| models.first().cloned());
             ProbedAgent {
                 id,
@@ -314,10 +348,37 @@ async fn probe_one_acp(
                 efforts: default_efforts(),
                 default_effort: Some("medium".into()),
                 model_contexts: BTreeMap::new(),
+                model_efforts,
                 error: err_opt,
             }
         }
     }
+}
+
+fn infer_model_efforts_from_variants(models: &[String]) -> BTreeMap<String, Vec<String>> {
+    let mut map: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for m in models {
+        let lower = m.trim().to_ascii_lowercase();
+        let trimmed = lower.strip_suffix("-fast").unwrap_or(&lower);
+        for &(suf, norm) in &[
+            ("-extra-high", "xhigh"),
+            ("-xhigh", "xhigh"),
+            ("-high", "high"),
+            ("-medium", "medium"),
+            ("-med", "medium"),
+            ("-low", "low"),
+        ] {
+            if let Some(base) = trimmed.strip_suffix(suf)
+                && !base.is_empty()
+            {
+                let entry = map.entry(base.to_string()).or_default();
+                push_unique(entry, norm);
+                break;
+            }
+        }
+    }
+    map.retain(|_, v| v.len() >= 2);
+    map
 }
 
 async fn probe_cli_version(program: &str, env: &BTreeMap<String, String>, cwd: &str) -> Option<String> {

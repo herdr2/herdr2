@@ -141,6 +141,16 @@ pub struct State {
 
 const SAVE_SOON: Duration = Duration::from_secs(2);
 
+fn sanitize_ckpt_key(raw: &str) -> String {
+    let s: String = raw
+        .trim()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .take(128)
+        .collect();
+    if s.is_empty() { "unknown".into() } else { s }
+}
+
 pub fn now_ms() -> u64 {
     SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64)
 }
@@ -651,6 +661,154 @@ impl Core {
         tc
     }
 
+    fn session_checkpoints_dir(&self, cli_kind: &str) -> std::path::PathBuf {
+        self.checkpoints_dir().join("sessions").join(sanitize_ckpt_key(cli_kind))
+    }
+
+    fn session_checkpoint_path(&self, cli_kind: &str, session_id: &str) -> std::path::PathBuf {
+        self.session_checkpoints_dir(cli_kind).join(format!("{}.json", sanitize_ckpt_key(session_id)))
+    }
+
+    /// Mirrors a CLI session's checkpoints into `<state>/checkpoints/sessions/<cli_kind>/<sid>.json`
+    /// so later `claude -c` / `claude --resume <id>` / `codex resume` can automatically re-attach them.
+    pub fn archive_cli_session_checkpoints(&self, tc: &crate::checkpoint::TargetCheckpoints) -> bool {
+        if tc.checkpoints.is_empty() {
+            return false;
+        }
+        let Some(kind) = tc.cli_kind.as_deref().map(str::trim).filter(|k| !k.is_empty() && *k != "generic") else {
+            return false;
+        };
+        let sid = tc
+            .cli_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .or_else(|| {
+                tc.cli_transcript_path
+                    .as_deref()
+                    .and_then(|p| crate::pty_adapters::session_id_from_transcript(kind, std::path::Path::new(p)))
+            });
+        let Some(sid) = sid else {
+            return false;
+        };
+        let mut archived = tc.clone();
+        archived.cli_session_id = Some(sid.clone());
+        archived.cli_fg_pid = None;
+        archived.pending_handoff = None;
+        archived.pending_rollback_turn = None;
+        archived.active_turn_num = None;
+        archived.active_turn_prompt = None;
+        let dir = self.session_checkpoints_dir(kind);
+        let _ = crate::platform::private_dir(&dir);
+        let path = self.session_checkpoint_path(kind, &sid);
+        if let Ok(bytes) = serde_json::to_vec_pretty(&archived) {
+            let _ = crate::paths::write_atomic(&path, &bytes);
+            return true;
+        }
+        false
+    }
+
+    /// Loads archived checkpoints for `(cli_kind, session_id)` (or most recent archive for `cwd_hint`),
+    /// also scanning legacy per-terminal files for sessions created prior to session archiving.
+    pub fn load_archived_cli_session(
+        &self,
+        cli_kind: &str,
+        session_id: Option<&str>,
+        cwd_hint: Option<&str>,
+    ) -> Option<crate::checkpoint::TargetCheckpoints> {
+        let kind = cli_kind.trim();
+        if kind.is_empty() || kind == "generic" {
+            return None;
+        }
+        if let Some(sid) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+            let direct = self.session_checkpoint_path(kind, sid);
+            if let Ok(tc) = crate::paths::read_state::<crate::checkpoint::TargetCheckpoints>(&direct)
+                && !tc.checkpoints.is_empty()
+            {
+                return Some(tc);
+            }
+            // Legacy fallback: scan `<state>/checkpoints/*.json` for matching session_id or transcript stem.
+            if let Ok(entries) = std::fs::read_dir(self.checkpoints_dir()) {
+                let mut best: Option<(u64, crate::checkpoint::TargetCheckpoints)> = None;
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("json") {
+                        continue;
+                    }
+                    let Ok(tc) = crate::paths::read_state::<crate::checkpoint::TargetCheckpoints>(&path) else {
+                        continue;
+                    };
+                    if tc.checkpoints.is_empty() {
+                        continue;
+                    }
+                    let matches_sid = tc.cli_session_id.as_deref() == Some(sid)
+                        || tc.cli_transcript_path.as_deref().is_some_and(|p| {
+                            crate::pty_adapters::session_id_from_transcript(kind, std::path::Path::new(p))
+                                .as_deref()
+                                == Some(sid)
+                        });
+                    if matches_sid {
+                        let ts = tc.checkpoints.iter().map(|c| c.ts_ms).max().unwrap_or(0);
+                        if best.as_ref().is_none_or(|(b_ts, _)| ts > *b_ts) {
+                            best = Some((ts, tc));
+                        }
+                    }
+                }
+                if let Some((_, tc)) = best {
+                    return Some(tc);
+                }
+            }
+            // A concrete session_id was resolved for the resumed CLI, and no archive exists for it.
+            // Do not silently attach a different session's checkpoints from the same repository.
+            return None;
+        }
+
+        // Fallback when only `-c` / `--continue` is known and transcript path hasn't been resolved yet:
+        // match the most recent archived session for `(cli_kind, repo_root/cwd)`.
+        let norm_hint = cwd_hint
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|p| crate::checkpoint::canonicalize_path(std::path::Path::new(p)));
+        let repo_hint = cwd_hint
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .and_then(|p| crate::checkpoint::probe_repo(std::path::Path::new(p)))
+            .map(|r| crate::checkpoint::canonicalize_path(&r.toplevel));
+        let mut best: Option<(u64, crate::checkpoint::TargetCheckpoints)> = None;
+        if let Ok(entries) = std::fs::read_dir(self.session_checkpoints_dir(kind)) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() || path.extension().and_then(|e| e.to_str()) != Some("json") {
+                    continue;
+                }
+                let Ok(tc) = crate::paths::read_state::<crate::checkpoint::TargetCheckpoints>(&path) else {
+                    continue;
+                };
+                if tc.checkpoints.is_empty() {
+                    continue;
+                }
+                let matches_repo = match (&repo_hint, &norm_hint, tc.repo_root.as_deref()) {
+                    (Some(rh), _, Some(tr)) => {
+                        crate::checkpoint::canonicalize_path(std::path::Path::new(tr)) == *rh
+                    }
+                    (_, Some(nh), Some(tr)) => {
+                        let ctr = crate::checkpoint::canonicalize_path(std::path::Path::new(tr));
+                        nh.starts_with(&ctr) || ctr.starts_with(nh)
+                    }
+                    _ => false,
+                };
+                if matches_repo {
+                    let ts = tc.checkpoints.iter().map(|c| c.ts_ms).max().unwrap_or(0);
+                    if best.as_ref().is_none_or(|(b_ts, _)| ts > *b_ts) {
+                        best = Some((ts, tc));
+                    }
+                }
+            }
+        }
+        best.map(|(_, tc)| tc)
+    }
+
     pub fn save_target_checkpoints(&self, st: &mut State, mut tc: crate::checkpoint::TargetCheckpoints) {
         if tc.addr.is_empty() {
             return;
@@ -661,12 +819,29 @@ impl Core {
         if let Ok(bytes) = serde_json::to_vec_pretty(&tc) {
             let _ = crate::paths::write_atomic(&path, &bytes);
         }
+        let _ = self.archive_cli_session_checkpoints(&tc);
         st.checkpoints.insert(addr, std::mem::take(&mut tc));
     }
 
-    pub fn cleanup_target_checkpoints(&self, st: &mut State, addr: &str, fallback_cwd: &str) {
+    /// Detaches checkpoints from `addr` (e.g. when exiting a CLI back to shell or starting a fresh CLI).
+    /// Archives identifiable CLI sessions (preserving their Git refs for later `-c`/`--resume`),
+    /// while pruning Git refs for anonymous/non-CLI checkpoints.
+    pub fn detach_target_checkpoints(&self, st: &mut State, addr: &str, fallback_cwd: &str) {
         let loaded = st.checkpoints.remove(addr).or_else(|| crate::paths::read_state(&self.checkpoint_path(addr)).ok());
         let _ = std::fs::remove_file(self.checkpoint_path(addr));
+        if let Some(ref tc) = loaded
+            && self.archive_cli_session_checkpoints(tc)
+        {
+            return;
+        }
+        let ref_owner = loaded
+            .as_ref()
+            .and_then(|tc| tc.ref_namespace.clone())
+            .filter(|s| !s.is_empty());
+        let explicit_refs: Vec<String> = loaded
+            .as_ref()
+            .map(|tc| tc.checkpoints.iter().map(|c| c.ref_name.clone()).collect())
+            .unwrap_or_default();
         let repo_dir = loaded
             .and_then(|tc| tc.repo_root)
             .filter(|s| !s.is_empty())
@@ -679,6 +854,12 @@ impl Core {
         let run = move || {
             if let Some(repo) = crate::checkpoint::probe_repo(std::path::Path::new(&repo_dir)) {
                 let _ = crate::checkpoint::delete_all_checkpoint_refs(&repo, &slug, &addr_owned);
+                if let Some(owner) = ref_owner.as_deref()
+                    && owner != addr_owned
+                {
+                    let _ = crate::checkpoint::delete_all_checkpoint_refs(&repo, &slug, owner);
+                }
+                let _ = crate::checkpoint::delete_checkpoint_ref_names(&repo, &explicit_refs);
             }
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -686,6 +867,10 @@ impl Core {
         } else {
             run();
         }
+    }
+
+    pub fn cleanup_target_checkpoints(&self, st: &mut State, addr: &str, fallback_cwd: &str) {
+        self.detach_target_checkpoints(st, addr, fallback_cwd);
     }
 
     pub fn signal(&self, st: &State, id: u32, sig: i32) {

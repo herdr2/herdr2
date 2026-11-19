@@ -1,6 +1,6 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, focused, agents, terminals, theme, settings, h2, shared, setShared } from "herdr";
+import { spaces, panes, focused, agents, terminals, theme, settings, h2, shared, setShared, run } from "herdr";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
@@ -97,7 +97,7 @@ export default class Checkpoints extends View {
   viewKey() {
     const target = activeTargetAddress();
     const tRec = target ? (terminals().find((x) => x.address === target) ?? agents().find((x) => x.address === target)) : null;
-    return `checkpoints:${target ?? ""}:${tRec?.turn ?? 0}:${shared("checkpoint.sync") ?? ""}`;
+    return `checkpoints:${target ?? ""}:${tRec?.turn ?? 0}:${tRec?.foreground?.pid ?? ""}:${tRec?.checkpoint_seq ?? 0}:${shared("checkpoint.sync") ?? ""}`;
   }
 
   setLines(lines) {
@@ -252,9 +252,11 @@ export default class Checkpoints extends View {
         } else {
           this.confirmTurn = null;
           this.selectedTurn = turn;
+          this.rollbackBusy = false;
           this.context = "";
           setShared("checkpoint.sync", `${target}:${turn}:${Date.now()}`);
           this.refresh(cx);
+          run("agent.focus", { terminal: target });
         }
       } catch (e) {
         this.note = String(e);
@@ -280,7 +282,8 @@ export default class Checkpoints extends View {
     const targetRec = this.targetAddr
       ? (terminals().find((x) => x.address === this.targetAddr) ?? agents().find((x) => x.address === this.targetAddr))
       : null;
-    const maxTurn = Math.max(Number(targetRec?.turn ?? 0), ...this.checkpoints.map((c) => Number(c.turn) || 0), 0);
+    const ckptMax = this.checkpoints.reduce((m, c) => Math.max(m, Number(c.turn) || 0), 0);
+    const maxTurn = this.checkpoints.length > 0 ? ckptMax : Math.max(Number(targetRec?.turn ?? 0), 0);
     const isoLevel = this.isolation?.level ?? "unknown";
     const filesBlocked = isoLevel === "shared_blocked";
     const listHeight = this.checkpoints.length * 30 + 12;

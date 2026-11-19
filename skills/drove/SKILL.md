@@ -1,6 +1,6 @@
 ---
 name: drove
-description: Multi-agent DAG orchestration inside herdr2. Coordinates specialized Role workers (`coder`, `tester`, `writer`, `reviewer`, `researcher`) spawned as native headless ACP `a*` sub-agents under your session (`parent`), handles blocking worker questions (`inbox` / `reply`), verify gates, git/AOSP worktree merges, and adversarial reviews.
+description: Multi-agent DAG orchestration inside herdr2. Coordinates specialized Role workers (`coder`, `tester`, `writer`, `illustrator`, `reviewer`, `researcher`) spawned as native headless ACP `a*` sub-agents under your session (`parent`), handles blocking worker questions (`inbox` / `reply`), verify gates, git/AOSP worktree merges, and adversarial reviews.
 disable-model-invocation: true
 ---
 
@@ -64,12 +64,13 @@ When invoked, you act as the **Coordinator** for a single Drove Run inside `herd
 
 ## 2. Role Routing (`Settings -> Drove`)
 
-Roles (`coder`, `tester`, `writer`, `reviewer`, `researcher`, plus custom roles) and their `Agent`, `Model`, `Thinking Effort`, and fallbacks are configured by the user in **`Herdr2 App -> Settings -> Drove`**.
+Roles (`coder`, `tester`, `writer`, `illustrator`, `reviewer`, `researcher`, plus custom roles) and their candidate `Agent + Model + Thinking Effort + Strengths` (work types each candidate excels at) are configured by the user (or auto-configured via AI) in **`Herdr2 App -> Settings -> Drove`**.
 
-- Assign tasks by `role:` in YAML or `--role` in CLI; only override `--agent`/`--model`/`--effort` via `h2 drove route` if explicitly requested.
+- Assign tasks by `role:` in YAML or `--role` in CLI; add concise `tags:` (e.g. `[前端UI]`, `[后端架构]`, `[快速修复]`) or clear `title`/`files` so the Drove router automatically picks the candidate whose configured `strengths` best match the task (with optional AI assistant tie-breaking, Magpie quota skipping, and `#1 -> #2 -> #3` retry rotation).
+- You can inspect all roles, candidate models, and their `strengths` at any time via `h2 drove settings`; only override `--agent`/`--model`/`--effort` via `h2 drove route` if explicitly requested.
 - Access guardrails are enforced automatically on `drove worker done`:
   - `readonly` (`reviewer`, `researcher`): zero workspace edits permitted (`bwrap --ro-bind` + diff check).
-  - `scoped_write` (`tester`, `writer`): edits restricted to configured `allowedPaths` globs (`422 role_scope_violation` if exceeded).
+  - `scoped_write` (`tester`, `writer`, `illustrator`): edits restricted to configured `allowedPaths` globs (`422 role_scope_violation` if exceeded).
   - `writable` (`coder`): workspace edits permitted.
 
 ---

@@ -562,6 +562,7 @@ fn build_reviewer_candidates(
             effort: spec.effort.unwrap_or_else(|| matched.map_or(role_cfg.primary.effort, |t| t.effort)),
             fast: spec.fast.unwrap_or_else(|| matched.is_some_and(|t| t.fast)),
             context: matched.and_then(|t| t.context.clone()),
+            strengths: matched.map(|t| t.strengths.clone()).unwrap_or_default(),
         }];
     }
 
@@ -886,6 +887,7 @@ mod tests {
                 effort: Effort::High,
                 fast: false,
                 context: None,
+                strengths: Vec::new(),
             },
             fallbacks: vec![RoleTarget {
                 agent: "agy".into(),
@@ -893,6 +895,7 @@ mod tests {
                 effort: Effort::High,
                 fast: false,
                 context: None,
+                strengths: Vec::new(),
             }],
             prompt: None,
         };

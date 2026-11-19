@@ -23,6 +23,8 @@ pub enum Job {
     NotesAfar(String),
     /// PTY terminal status transitioned (`working` or `turn_ended`): capture baseline/turn checkpoint on Tokio.
     PtyCheckpoint { id: u32, entered_working: bool, turn_ended: bool, turn: u64 },
+    /// PTY terminal launched a resumed CLI (`claude -c` / `--resume` / `codex resume`): re-attach archived session checkpoints.
+    PtyResumeCheckpoints { id: u32 },
 }
 
 fn parent_key(parent: Option<&str>) -> Option<TargetKey> {
@@ -479,6 +481,12 @@ impl Core {
                             turn,
                         )
                         .await;
+                    });
+                }
+                Job::PtyResumeCheckpoints { id } => {
+                    let core = self.clone();
+                    tokio::spawn(async move {
+                        crate::pty_adapters::reattach_resumed_cli_checkpoints(&core, id).await;
                     });
                 }
             }

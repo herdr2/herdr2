@@ -19,6 +19,7 @@ import {
   extractTurnChangedFiles,
   resolveEffortVisual,
   normalizeInboxItems,
+  resolvePeerAddress,
 } from "../defaults/mods/peek/acp_model.js";
 
 describe("parseUserEnvelope", () => {
@@ -771,5 +772,14 @@ describe("normalizeInboxItems", () => {
   test("returns empty array when inbox is empty or missing", () => {
     expect(normalizeInboxItems(null)).toEqual([]);
     expect(normalizeInboxItems([])).toEqual([]);
+  });
+});
+
+describe("resolvePeerAddress", () => {
+  test("prefixes bare handoff source address with current remote machine", () => {
+    expect(resolvePeerAddress("t22", "wsl/a4")).toBe("wsl/t22");
+    expect(resolvePeerAddress("wsl/t22", "wsl/a4")).toBe("wsl/t22");
+    expect(resolvePeerAddress("t22", "a4")).toBe("t22");
+    expect(resolvePeerAddress("", "wsl/a4")).toBe("");
   });
 });

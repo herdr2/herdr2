@@ -5,7 +5,7 @@
 import { View, div, image, svg } from "gpui-kit";
 import { h_flex, v_flex, Popup, TextareaState, Textarea, InputState, Input, TextView, ScrollHandle } from "gpui-base";
 import { agents, terminals, panes, spaces, run, theme, settings, home, props, closeOverlay, openOverlay, checking, h2, shared, setShared } from "herdr";
-import { buildConversationItems, buildPtySessionBadges, summarizeActivityGroup, toolIconPath, formatTime, shortenPath, normalizeConfigOptions, filterConfigChoices, normalizeInboxItems, parseToolDetail, resolveEffortVisual } from "./acp_model.js";
+import { buildConversationItems, buildPtySessionBadges, summarizeActivityGroup, toolIconPath, formatTime, shortenPath, normalizeConfigOptions, filterConfigChoices, normalizeInboxItems, parseToolDetail, resolveEffortVisual, resolvePeerAddress } from "./acp_model.js";
 
 const LANE_MAX_W = 736; // 46rem editorial content column (--chat-content-max-width)
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -1720,7 +1720,8 @@ export default class Peek extends View {
       "merge-back": tr("Merge Back", "合回上下文"),
     };
     const kindLabel = kindLabels[item.handoff_kind] || item.handoff_kind || tr("Handoff", "上下文接力");
-    const src = item.from_address || "?";
+    const srcAddr = resolvePeerAddress(item.from_address, props()?.terminal || "");
+    const src = srcAddr || "?";
     const prov = item.from_provider ? ` (${item.from_provider})` : "";
     const turns = item.from_turns ? tr(` · turns ${item.from_turns}`, ` · 第 ${item.from_turns} 轮`) : "";
     const label = `${kindLabel} · ${tr(`from ${src}${prov}`, `来自 ${src}${prov}`)}${turns}`;
@@ -1746,13 +1747,13 @@ export default class Peek extends View {
           .text_size(11)
           .font_medium()
           .text_color(accent)
-          .when(Boolean(item.from_address), (el) =>
+          .when(Boolean(srcAddr), (el) =>
             el
               .cursor_pointer()
               .hover((s) => s.bg(withAlpha(accent, "26") ?? t.hover))
               .tooltip(tr(`Focus source session ${src}`, `点击跳转到来源会话 ${src}`))
               .on_mouse_down("left", stopMouse)
-              .on_click(() => run("agent.focus", { terminal: item.from_address })),
+              .on_click(() => run("agent.focus", { terminal: srcAddr })),
           )
           .child(svg("mods/workspace-chrome/git-branch.svg").size(12).flex_none().text_color(accent))
           .child(label),
@@ -2807,7 +2808,7 @@ export default class Peek extends View {
   renderContextStrip(t, k, shortCwd) {
     const addr = props()?.terminal;
     const ended = k?.state === "finished" || k?.status === "ended";
-    const lineageParent = k?.lineage?.parent || this.agentDetail?.lineage?.parent || null;
+    const lineageParent = resolvePeerAddress(k?.lineage?.parent || this.agentDetail?.lineage?.parent || "", addr) || null;
     const pInfo = panes().find((p) => p.terminal === addr) ?? null;
     const aInfo = agents().find((a) => a.address === addr) ?? null;
     const sp = (typeof spaces === "function" ? spaces() : []).find((s) => s.id === (aInfo?.space ?? null))
@@ -2933,57 +2934,31 @@ export default class Peek extends View {
             ),
           )
           .when(Boolean(addr) && !ended, (el) =>
-            el
-              .child(
-                h_flex()
-                  .id("acp-ctx-side-chat")
-                  .h(20)
-                  .px(7)
-                  .gap(4)
-                  .items_center()
-                  .rounded(6)
-                  .bg(t.raised)
-                  .border_1()
-                  .border_color(t.border)
-                  .text_size(11)
-                  .font_medium()
-                  .text_color(t.muted)
-                  .cursor_pointer()
-                  .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                  .tooltip(tr("Open isolated side-chat with current context", "带当前上下文开启旁路讨论（不污染主会话）"))
-                  .on_mouse_down("left", stopMouse)
-                  .on_click((_e, cx) => {
-                    cx.stop_propagation();
-                    run("agent.handoff", { source: addr, kind: "side-chat" });
-                  })
-                  .child(svg(ICONS.messagesSquare).size(11).flex_none())
-                  .child(tr("Side Chat", "旁路讨论")),
-              )
-              .child(
-                h_flex()
-                  .id("acp-ctx-handoff")
-                  .h(20)
-                  .px(7)
-                  .gap(4)
-                  .items_center()
-                  .rounded(6)
-                  .bg(t.raised)
-                  .border_1()
-                  .border_color(t.border)
-                  .text_size(11)
-                  .font_medium()
-                  .text_color(t.muted)
-                  .cursor_pointer()
-                  .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                  .tooltip(tr("Hand off, fork, or merge session context", "上下文接力 / 分支探索 / 合回"))
-                  .on_mouse_down("left", stopMouse)
-                  .on_click((_e, cx) => {
-                    cx.stop_propagation();
-                    run("agent.handoff", { source: addr, kind: "handoff" });
-                  })
-                  .child(svg(ICONS.gitBranch).size(11).flex_none())
-                  .child(tr("Handoff", "上下文接力")),
-              ),
+            el.child(
+              h_flex()
+                .id("acp-ctx-handoff")
+                .h(20)
+                .px(7)
+                .gap(4)
+                .items_center()
+                .rounded(6)
+                .bg(t.raised)
+                .border_1()
+                .border_color(t.border)
+                .text_size(11)
+                .font_medium()
+                .text_color(t.muted)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                .tooltip(tr("Context handoff / Fork / Side Chat / Merge", "上下文接力 / 分支探索 / 旁路讨论 / 合回"))
+                .on_mouse_down("left", stopMouse)
+                .on_click((_e, cx) => {
+                  cx.stop_propagation();
+                  run("agent.handoff", { source: addr, kind: "handoff" });
+                })
+                .child(svg(ICONS.gitBranch).size(11).flex_none())
+                .child(tr("Handoff", "接力")),
+            ),
           )
           .when(hasUsage, (el) =>
             el.child(
@@ -3514,7 +3489,14 @@ export default class Peek extends View {
     const isPty = Boolean(props()?.pty);
     const isDark = Boolean(settings()?.dark ?? true);
     const myPane = pane ?? panes().find((p) => (p.acp || p.structured) && p.terminal === terminal)?.pane ?? null;
-    const key = `${terminal}:${st}:${k?.turn ?? 0}:${k?.transcript_seq ?? 0}:${k?.pending_permission?.request_id ?? ""}:${k?.inbox_len ?? 0}:${k?.printed ?? 0}:${k?.status_ms ?? 0}:${shared("checkpoint.sync") ?? ""}`;
+    const ckptEpoch = `${terminal}:${k?.foreground?.pid ?? ""}:${k?.checkpoint_seq ?? 0}:${shared("checkpoint.sync") ?? ""}`;
+    if (ckptEpoch !== this.lastCkptEpoch) {
+      this.lastCkptEpoch = ckptEpoch;
+      this.checkpoints = [];
+      this.checkpointDiffs = {};
+      this.checkpointDiffOpen = {};
+    }
+    const key = `${terminal}:${st}:${k?.turn ?? 0}:${k?.transcript_seq ?? 0}:${k?.foreground?.pid ?? ""}:${k?.checkpoint_seq ?? 0}:${k?.pending_permission?.request_id ?? ""}:${k?.inbox_len ?? 0}:${k?.printed ?? 0}:${k?.status_ms ?? 0}:${shared("checkpoint.sync") ?? ""}`;
     if (!checking() && key !== this.lastKey) {
       this.lastKey = key;
       Promise.resolve().then(() => this.reloadTranscript());
@@ -3624,7 +3606,7 @@ export default class Peek extends View {
     }
 
     const padX = isTab ? 20 : 28;
-    const modalLineageParent = k?.lineage?.parent || this.agentDetail?.lineage?.parent || null;
+    const modalLineageParent = resolvePeerAddress(k?.lineage?.parent || this.agentDetail?.lineage?.parent || "", terminal) || null;
     const modalEnded = st === "ended" || k?.state === "finished";
     const modalHeader = h_flex()
       .id("acp-header")
@@ -3705,25 +3687,15 @@ export default class Peek extends View {
             ),
           )
           .when(Boolean(terminal) && !modalEnded, (el) =>
-            el
-              .child(
-                this.pillButton(
-                  t,
-                  "acp-side-chat",
-                  h_flex().gap(4).items_center().child(svg(ICONS.messagesSquare).size(12)).child(tr("Side Chat", "旁路讨论")),
-                  () => run("agent.handoff", { source: terminal, kind: "side-chat" }),
-                  { outlined: true, h: 26, px: 9 },
-                ),
-              )
-              .child(
-                this.pillButton(
-                  t,
-                  "acp-handoff",
-                  h_flex().gap(4).items_center().child(svg(ICONS.gitBranch).size(12)).child(tr("Handoff", "上下文接力")),
-                  () => run("agent.handoff", { source: terminal, kind: "handoff" }),
-                  { outlined: true, h: 26, px: 9 },
-                ),
+            el.child(
+              this.pillButton(
+                t,
+                "acp-handoff",
+                h_flex().gap(4).items_center().child(svg(ICONS.gitBranch).size(12)).child(tr("Handoff", "接力")),
+                () => run("agent.handoff", { source: terminal, kind: "handoff" }),
+                { outlined: true, h: 26, px: 9, tooltip: tr("Context handoff / Fork / Side Chat / Merge", "上下文接力 / 分支探索 / 旁路讨论 / 合回") },
               ),
+            ),
           )
           .child(
             this.pillButton(

@@ -255,7 +255,13 @@ impl Core {
             .pty_reg
             .terminals
             .values()
-            .filter(|t| t.is_live() && t.keep && t.holder.is_none() && (startup || t.restart_after_ms <= now_ms()))
+            .filter(|t| {
+                t.is_live()
+                    && t.keep
+                    && t.holder.is_none()
+                    && !st.pty_respawning.contains(&t.id())
+                    && (startup || t.restart_after_ms <= now_ms())
+            })
             .map(Terminal::id)
             .collect();
         for id in ids {

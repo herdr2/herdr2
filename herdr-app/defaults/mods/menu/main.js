@@ -64,7 +64,11 @@ function items(p, git) {
       const inTab = Boolean(paneInfo);
       const tabPaneCount = inTab ? panes().filter((pane) => pane.tab === paneInfo.tab).length : 0;
       const isStructured = Boolean(paneInfo?.structured);
-      const lineageParent = term?.lineage?.parent || null;
+      const rawLineageParent = (term?.lineage?.parent || "").trim();
+      const termSlash = typeof term?.address === "string" ? term.address.lastIndexOf("/") : -1;
+      const lineageParent = rawLineageParent
+        ? (!rawLineageParent.includes("/") && termSlash > 0 ? `${term.address.slice(0, termSlash + 1)}${rawLineageParent}` : rawLineageParent)
+        : null;
       return [
         ...(tg.terminal
           ? [
@@ -120,7 +124,11 @@ function items(p, git) {
       const term = terminals().find((t) => t.address === tg.terminal);
       const isAcp = Boolean(term?.acp);
       const isEnded = term?.state === "finished" || term?.status === "ended";
-      const lineageParent = term?.lineage?.parent || null;
+      const rawLineageParent = (term?.lineage?.parent || "").trim();
+      const termSlash = typeof term?.address === "string" ? term.address.lastIndexOf("/") : -1;
+      const lineageParent = rawLineageParent
+        ? (!rawLineageParent.includes("/") && termSlash > 0 ? `${term.address.slice(0, termSlash + 1)}${rawLineageParent}` : rawLineageParent)
+        : null;
       const pinned = Boolean(term?.labels?.["herdr.pinned"]);
       return [
         [tr("Rename", "重命名"), "agent.rename", { terminal: tg.terminal }],

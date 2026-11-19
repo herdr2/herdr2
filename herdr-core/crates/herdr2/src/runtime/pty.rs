@@ -412,6 +412,13 @@ impl Core {
             .collect();
         self.sweep_in_background(theirs.iter().filter_map(|id| st.pty_reg.terminals[id].scope.clone()).collect());
         for id in theirs {
+            if st.pty_respawning.contains(&id) {
+                if let Some(t) = st.pty_reg.terminals.get_mut(&id) {
+                    t.holder = None;
+                    t.pid = None;
+                }
+                continue;
+            }
             self.pty_record_finish(&mut st, id, Exit { code: None, signal: None }, "holder_lost");
         }
         if current {
@@ -465,7 +472,11 @@ impl Core {
         while let Some((kind, id, payload)) = proto::read(stream)? {
             let mut st = self.lock();
             match kind {
-                proto::OUTPUT => self.output(&mut st, id, &payload),
+                proto::OUTPUT => {
+                    if st.pty_reg.terminals.get(&id).is_some_and(|t| t.holder.as_deref() == Some(instance)) {
+                        self.output(&mut st, id, &payload);
+                    }
+                }
                 proto::SPAWNED | proto::SPAWN_FAILED => {
                     let result = if kind == proto::SPAWNED {
                         proto::parse::<proto::Spawned>(&payload).map(|s| s.pid).map_err(|e| e.to_string())
@@ -475,7 +486,9 @@ impl Core {
                     self.spawn_result(&mut st, instance, id, result);
                 }
                 proto::EXITED => {
-                    if let Ok(exit) = proto::parse::<proto::Exit>(&payload) {
+                    if st.pty_reg.terminals.get(&id).is_some_and(|t| t.holder.as_deref() == Some(instance))
+                        && let Ok(exit) = proto::parse::<proto::Exit>(&payload)
+                    {
                         self.pty_finish(&mut st, id, Exit { code: exit.code, signal: exit.signal });
                     }
                 }

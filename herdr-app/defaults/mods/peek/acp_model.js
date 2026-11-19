@@ -1378,3 +1378,16 @@ export function normalizeInboxItems(rawInbox, terminalsList = [], currentTermina
       };
     });
 }
+
+/**
+ * Qualifies a bare sibling session address (e.g. `"t22"`) with the machine prefix
+ * of `currentTerminal` (e.g. `"wsl/a4"` -> `"wsl/t22"`). Already-qualified or local
+ * addresses pass through unchanged.
+ */
+export function resolvePeerAddress(rawAddr, currentTerminal = "") {
+  const raw = typeof rawAddr === "string" ? rawAddr.trim() : "";
+  if (!raw || raw.includes("/")) return raw;
+  const cur = typeof currentTerminal === "string" ? currentTerminal.trim() : "";
+  const slash = cur.lastIndexOf("/");
+  return slash > 0 ? `${cur.slice(0, slash + 1)}${raw}` : raw;
+}

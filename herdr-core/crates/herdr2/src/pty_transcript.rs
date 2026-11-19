@@ -97,11 +97,19 @@ struct Candidate {
     first_ts_ms: u64,
 }
 
-fn argv_has_resume(argv: &[String]) -> bool {
-    argv.iter().any(|arg| {
+pub(crate) fn argv_has_resume(argv: &[String]) -> bool {
+    let has_flag = argv.iter().any(|arg| {
         matches!(arg.as_str(), "--resume" | "-r" | "--continue" | "-c")
             || arg.starts_with("--resume=")
-    })
+    });
+    if has_flag {
+        return true;
+    }
+    let is_codex = argv.iter().any(|a| {
+        let base = a.rsplit(['/', '\\']).next().unwrap_or(a).to_ascii_lowercase();
+        base == "codex" || base == "codex.exe"
+    });
+    is_codex && argv.iter().any(|a| a == "resume")
 }
 
 pub fn snapshot_from_terminal(t: &Terminal, sent_prompts: Option<&Vec<(u64, u64, String)>>) -> PtySnapshot {
@@ -275,7 +283,7 @@ fn detect_agent_hint(t: &Terminal) -> Option<String> {
     None
 }
 
-fn hint_from_words<'a>(words: impl Iterator<Item = &'a str>) -> Option<&'static str> {
+pub(crate) fn hint_from_words<'a>(words: impl Iterator<Item = &'a str>) -> Option<&'static str> {
     for raw in words {
         if raw.starts_with('-') {
             continue;
@@ -2120,16 +2128,35 @@ pub(crate) fn discover_cli_transcript(
     cwd: &str,
     min_mtime_ms: u64,
     fg_pid: Option<u32>,
+    allow_older_fallback: bool,
 ) -> Option<PathBuf> {
     let home = home_dir()?;
-    let fg_started = fg_pid.and_then(proc_started_ms);
-    let candidates = match kind {
-        "claude" => discover_claude(&home, None, cwd, min_mtime_ms),
-        "codex" => discover_codex(&home, None, cwd, min_mtime_ms),
-        "agy" => discover_agy(&home, min_mtime_ms, fg_pid),
+    let fg_started = (!allow_older_fallback).then(|| fg_pid.and_then(proc_started_ms)).flatten();
+    let effective_start = if allow_older_fallback {
+        0
+    } else {
+        fg_started.map_or(min_mtime_ms, |f| min_mtime_ms.max(f))
+    };
+    let scan_min_mtime = if allow_older_fallback {
+        0
+    } else {
+        effective_start.saturating_sub(MTIME_SLACK_MS)
+    };
+    let mut candidates = match kind {
+        "claude" => discover_claude(&home, None, cwd, scan_min_mtime),
+        "codex" => discover_codex(&home, None, cwd, scan_min_mtime),
+        "agy" => discover_agy(&home, scan_min_mtime, fg_pid),
         _ => return None,
     };
-    pick_best_candidate(candidates, min_mtime_ms, fg_started, false).map(|c| c.path)
+    if !allow_older_fallback
+        && let Some(fg_ms) = fg_started
+    {
+        // A clean non-resumed CLI session can only own transcripts created once that foreground
+        // CLI process started (2s slack for filesystem/clock jitter), never a previous session.
+        let strict_floor = fg_ms.saturating_sub(2_000);
+        candidates.retain(|c| c.first_ts_ms == 0 || c.first_ts_ms >= strict_floor);
+    }
+    pick_best_candidate(candidates, effective_start, fg_started, allow_older_fallback).map(|c| c.path)
 }
 
 pub(crate) fn parse_cli_transcript(kind: &str, path: &Path) -> Vec<Entry> {
