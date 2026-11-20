@@ -139,6 +139,8 @@ export default class Agents extends View {
     if (!Array.isArray(this.pendingPins)) this.pendingPins = [];
     if (!this.pendingPins.length) localStorage.removeItem("pins");
     this.migratingPins = new Set();
+    this.firstSeen = {};
+    this.firstSeenSeq = 0;
     this.hovered = null;
     this.hoveredSub = null;
     this.listFocus = cx?.focus_handle?.();
@@ -489,11 +491,18 @@ export default class Agents extends View {
   // Live sub-agents of `addr`, depth first, each with the tree lines in front of it.
   // Handoff and Fork sessions are standalone top-level sessions even if legacy records carry `parent`.
   tree(all, addr, lead = []) {
-    const kids = all.filter((k) => {
-      if (k.parent !== addr || k.state !== "live" || k.labels?.["herdr.trashed"]) return false;
-      const lk = String(k.lineage?.kind || "").toLowerCase().replace("_", "-");
-      return lk !== "handoff" && lk !== "fork";
-    });
+    const kids = all
+      .filter((k) => {
+        if (k.parent !== addr || k.state !== "live" || k.labels?.["herdr.trashed"]) return false;
+        const lk = String(k.lineage?.kind || "").toLowerCase().replace("_", "-");
+        return lk !== "handoff" && lk !== "fork";
+      })
+      .sort((x, y) => {
+        const tx = x.program_started_ms || x.created_ms || 0;
+        const ty = y.program_started_ms || y.created_ms || 0;
+        if (tx > 0 && ty > 0 && tx !== ty) return tx - ty;
+        return 0;
+      });
     return kids.flatMap((k, i) => {
       const last = i === kids.length - 1;
       return [
@@ -693,11 +702,38 @@ export default class Agents extends View {
     const tabCounts = new Map();
     for (const a of list) tabCounts.set(a.tab, (tabCounts.get(a.tab) ?? 0) + 1);
     const byPriority = sort.id === "priority";
+    const allByAddr = new Map(all.map((x) => [x.address, x]));
+    const indexOf = new Map(list.map((a, i) => [a.address, i]));
+    this.firstSeen ??= {};
+    this.firstSeenSeq ??= 0;
+    for (const a of list) {
+      if (!(a.address in this.firstSeen)) this.firstSeen[a.address] = ++this.firstSeenSeq;
+    }
+    const appearedAt = (a) => {
+      const rec = allByAddr.get(a.address);
+      const ts = a.created_ms || rec?.program_started_ms || rec?.created_ms || 0;
+      return ts > 0 ? ts : (this.firstSeen[a.address] ?? 0);
+    };
+    const byAppearance = (x, y) => appearedAt(x) - appearedAt(y) || (indexOf.get(x.address) ?? 0) - (indexOf.get(y.address) ?? 0);
     const urgency = new Map(list.map((a) => [a.address, Math.max(this.rank(a), ...this.tree(all, a.address).map((s) => RANK[kidStatus(s.t, this.listed)] ?? 0))]));
     const rankOf = (a) => urgency.get(a.address);
-    if (byPriority) list = [...list].sort((x, y) => rankOf(y) - rankOf(x) || this.since(y) - this.since(x) || y.seq - x.seq);
-    const pinned = list.filter((a) => a.pinned);
-    const rest = list.filter((a) => !a.pinned);
+    const pinned = list.filter((a) => a.pinned).sort(byAppearance);
+    let rest = list.filter((a) => !a.pinned);
+    if (byPriority) {
+      rest = [...rest].sort((x, y) => rankOf(y) - rankOf(x) || byAppearance(x, y));
+    } else {
+      // Group by space in space order, keeping agents within each space in appearance order (oldest first).
+      const bySpace = new Map();
+      for (const a of rest) {
+        if (!bySpace.has(a.space)) bySpace.set(a.space, []);
+        bySpace.get(a.space).push(a);
+      }
+      rest = [];
+      for (const members of bySpace.values()) {
+        members.sort(byAppearance);
+        rest.push(...members);
+      }
+    }
     list = [...pinned, ...rest];
     setAgentOrder(list.map((a) => a.address));
 

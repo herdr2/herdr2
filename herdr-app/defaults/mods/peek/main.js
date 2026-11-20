@@ -3140,33 +3140,6 @@ export default class Peek extends View {
                 .child(tr(`Merge → ${lineageParent}`, `合回 ${lineageParent}`)),
             ),
           )
-          .when(Boolean(addr) && !ended, (el) =>
-            el.child(
-              h_flex()
-                .id("acp-ctx-handoff")
-                .h(20)
-                .px(7)
-                .gap(4)
-                .items_center()
-                .rounded(6)
-                .bg(t.raised)
-                .border_1()
-                .border_color(t.border)
-                .text_size(11)
-                .font_medium()
-                .text_color(t.muted)
-                .cursor_pointer()
-                .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                .tooltip(tr("Context Handoff / Fork Session / Side Chat / Merge", "上下文接力 / 会话分叉 / 旁路讨论 / 合回"))
-                .on_mouse_down("left", stopMouse)
-                .on_click((_e, cx) => {
-                  cx.stop_propagation();
-                  run("agent.handoff", { source: addr, kind: "handoff" });
-                })
-                .child(svg(ICONS.gitBranch).size(11).flex_none())
-                .child(tr("Handoff", "接力")),
-            ),
-          )
           .when(hasUsage, (el) =>
             el.child(
               h_flex()

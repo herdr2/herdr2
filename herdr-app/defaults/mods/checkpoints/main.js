@@ -1,6 +1,18 @@
 import { View, div } from "gpui-kit";
-import { v_flex, h_flex, Scrollbar, v_virtual_list } from "gpui-base";
+import { v_flex, h_flex, TextareaState, Textarea, Popup, Scrollbar, v_virtual_list } from "gpui-base";
 import { spaces, panes, focused, agents, terminals, theme, settings, h2, shared, setShared, run } from "herdr";
+import {
+  annotateDiffRows,
+  buildSelectionRange,
+  extractSnippet,
+  buildDisplayItems,
+  resolveTargetCandidates,
+  makeDraftScopeKey,
+  readScopeDrafts,
+  writeScopeDrafts,
+  formatLineTag,
+  withAlpha,
+} from "./review_model.js";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
@@ -75,6 +87,21 @@ function normalizeVisibleCheckpoints(rawList, includeInitialZero = false) {
   return sorted;
 }
 
+// Collapses multiline prompts / wrapper tags into a clean single-line summary so GPUI rows never overflow vertically.
+function formatCheckpointSummary(c, turn) {
+  const raw = c?.label || c?.prompt || "";
+  const cleaned = String(raw)
+    .replace(/<\/?pasted_content\b[^>]*>/gi, " ")
+    .replace(/<\/?herdr2-handoff\b[^>]*>/gi, " ")
+    .replace(/[\r\n\t]+/g, " ")
+    .replace(/\s{2,}/g, " ")
+    .trim();
+  if (cleaned) return cleaned;
+  return turn === 0
+    ? tr("Initial state (before Turn 1)", "初始状态 (第 1 轮前)")
+    : tr(`Turn ${turn}`, `第 ${turn} 轮`);
+}
+
 export default class Checkpoints extends View {
   init(_props, cx) {
     this.checkpoints = [];
@@ -83,6 +110,7 @@ export default class Checkpoints extends View {
     this.confirmTurn = null;
     this.targetAddr = null;
     this.rows = [];
+    this.annotatedRows = [];
     this.diffWidth = 0;
     this.rollbackBusy = false;
     this.snapping = false;
@@ -90,6 +118,33 @@ export default class Checkpoints extends View {
     this.error = null;
     this.note = null;
     this.handle = cx.focus_handle();
+
+    // Single reusable inline comment editor (created once in init(), never inside render()).
+    this.commentInput = TextareaState.new({
+      placeholder: tr("Add a review comment… (Ctrl/Cmd+Enter to add)", "输入行级审查意见… (Ctrl/Cmd+Enter 添加)"),
+    });
+    this.commentInput.set_auto_grow(2, 4);
+    this.commentTyping = false;
+    this.commentInput.on("focus", (_e, cx) => { this.commentTyping = true; cx.notify(); });
+    this.commentInput.on("blur", (_e, cx) => { this.commentTyping = false; cx.notify(); });
+    this.commentInput.on("change", (_e, cx) => { cx.notify(); });
+    this.commentInput.on("submit", (e, cx) => {
+      if (e?.ctrl || e?.meta || (!e?.shift && e?.key === "enter")) {
+        this.saveComposer(cx, false);
+      }
+    });
+
+    this.composer = null;
+    this.anchorRowIdx = null;
+    this.lastShift = false;
+    this.targetOverride = null;
+    this.targetPopupOpen = false;
+    this.steerMode = false;
+    this.sendingReqId = null;
+    this.sendingIds = [];
+    this.reviewError = null;
+    this.lastHandledResultId = null;
+
     this.refresh(cx);
     cx.timer.every(10000, (cx) => this.refresh(cx));
   }
@@ -100,9 +155,56 @@ export default class Checkpoints extends View {
     return `checkpoints:${target ?? ""}:${tRec?.turn ?? 0}:${tRec?.foreground?.pid ?? ""}:${tRec?.checkpoint_seq ?? 0}:${shared("checkpoint.sync") ?? ""}`;
   }
 
+  targetMachine() {
+    if (typeof this.targetAddr === "string" && this.targetAddr.includes("/")) {
+      return this.targetAddr.slice(0, this.targetAddr.indexOf("/"));
+    }
+    return spaces().find((s) => s.active)?.machine ?? null;
+  }
+
+  scopeKey() {
+    if (!this.targetAddr || this.selectedTurn == null) return null;
+    return makeDraftScopeKey(this.targetMachine(), `ckpt:${this.targetAddr}:T${this.selectedTurn}`);
+  }
+
+  drafts() {
+    const sk = this.scopeKey();
+    if (!sk) return [];
+    return readScopeDrafts(shared("diff_review.drafts"), sk);
+  }
+
+  setDrafts(nextList) {
+    const sk = this.scopeKey();
+    if (!sk) return;
+    const updated = writeScopeDrafts(shared("diff_review.drafts"), sk, nextList);
+    setShared("diff_review.drafts", updated);
+  }
+
+  syncLastResult() {
+    const res = shared("diff_review.last_result");
+    if (!res || typeof res !== "object") return;
+    const rid = res.request_id;
+    if (!rid || rid === this.lastHandledResultId) return;
+    if (this.sendingReqId && rid === this.sendingReqId) {
+      this.lastHandledResultId = rid;
+      this.sendingReqId = null;
+      if (res.ok) {
+        const sentSet = new Set(this.sendingIds ?? []);
+        const remaining = this.drafts().filter((c) => !sentSet.has(c.id));
+        this.setDrafts(remaining);
+        this.sendingIds = [];
+        this.reviewError = null;
+      } else {
+        this.sendingIds = [];
+        this.reviewError = String(res.error || tr("Failed to send review", "发送审查意见失败"));
+      }
+    }
+  }
+
   setLines(lines) {
     this.rows = diffRows(lines);
-    this.diffWidth = Math.max(300, ...this.rows.map((row) => (row.text.length + 1) * 7 + 50));
+    this.annotatedRows = annotateDiffRows(this.rows, null);
+    this.diffWidth = Math.max(300, ...this.rows.map((row) => (row.text.length + 1) * 7 + 72));
   }
 
   refresh(cx) {
@@ -116,7 +218,14 @@ export default class Checkpoints extends View {
       this.confirmTurn = null;
       this.note = null;
       this.error = null;
-      if (this.targetAddr !== target) this.selectedTurn = null;
+      if (this.targetAddr !== target) {
+        this.selectedTurn = null;
+        this.composer = null;
+        this.anchorRowIdx = null;
+        this.targetOverride = null;
+        this.targetPopupOpen = false;
+        this.reviewError = null;
+      }
       this.targetAddr = target;
       this.setLines([]);
     }
@@ -188,7 +297,10 @@ export default class Checkpoints extends View {
   pickCheckpoint(turn, cx) {
     this.selectedTurn = turn;
     this.confirmTurn = null;
+    this.composer = null;
+    this.anchorRowIdx = null;
     this.note = null;
+    this.reviewError = null;
     const context = this.viewKey();
     cx.spawn(async (cx) => {
       try { await this.loadCheckpointDiff(turn, context); }
@@ -252,6 +364,8 @@ export default class Checkpoints extends View {
         } else {
           this.confirmTurn = null;
           this.selectedTurn = turn;
+          this.composer = null;
+          this.anchorRowIdx = null;
           this.rollbackBusy = false;
           this.context = "";
           setShared("checkpoint.sync", `${target}:${turn}:${Date.now()}`);
@@ -268,15 +382,609 @@ export default class Checkpoints extends View {
     cx.notify();
   }
 
-  diffRow({ kind, number, text }, t) {
-    if (kind === "@") return div().w_full().px(12).h(20).flex_none().truncate().bg(t.raised).text_color(t.dim).child(text);
-    return h_flex().w_full().h(20).flex_none().gap(10).when(kind === "+", (e) => e.bg(t.ansi2 + "18")).when(kind === "-", (e) => e.bg(t.ansi1 + "18"))
-      .child(div().w(30).flex_none().text_right().text_color(t.dim).child(number === undefined ? "" : String(number)))
-      .child(div().flex_1().min_w(0).truncate().child(text));
+  clickDiffRow(row, e, cx) {
+    if (!row?.commentable) return;
+    const shift = Boolean(e?.modifiers?.shift || e?.shift);
+    const anchor = shift && this.anchorRowIdx != null ? this.anchorRowIdx : row.rowIndex;
+    const range = buildSelectionRange(this.annotatedRows, anchor, row.rowIndex);
+    if (!range) return;
+
+    if (!shift && this.composer && !this.composer.editingId && this.composer.startRowIdx === range.startRowIdx && this.composer.endRowIdx === range.endRowIdx && !String(this.commentInput.value() ?? "").trim()) {
+      this.closeComposer(cx);
+      return;
+    }
+
+    this.anchorRowIdx = shift && this.anchorRowIdx != null ? this.anchorRowIdx : row.rowIndex;
+    const preserveText = Boolean(shift && this.composer);
+    this.composer = {
+      ...range,
+      editingId: preserveText ? (this.composer?.editingId ?? null) : null,
+    };
+    if (!preserveText) this.commentInput.set_value("");
+    this.reviewError = null;
+    this.commentInput.focus();
+    cx.notify();
+  }
+
+  editComment(comment, cx) {
+    const idx = this.annotatedRows.findIndex(
+      (r) => r.commentable && r.file === comment.path && ((comment.side === "old" ? r.oldLine : (r.newLine ?? r.oldLine)) === (comment.end_line || comment.start_line)),
+    );
+    const rowIdx = idx >= 0 ? idx : Math.max(0, this.annotatedRows.length - 1);
+    this.anchorRowIdx = rowIdx;
+    this.composer = {
+      file: comment.path,
+      startRowIdx: rowIdx,
+      endRowIdx: rowIdx,
+      side: comment.side || "new",
+      startLine: comment.start_line,
+      endLine: comment.end_line || comment.start_line,
+      hunkHeader: comment.hunk_header || "",
+      existingSnippet: comment.snippet || "",
+      editingId: comment.id,
+    };
+    this.commentInput.set_value(comment.body || "");
+    this.commentInput.focus();
+    cx.notify();
+  }
+
+  deleteComment(id, cx) {
+    const next = this.drafts().filter((c) => c.id !== id);
+    this.setDrafts(next);
+    if (this.composer?.editingId === id) {
+      this.closeComposer(cx);
+      return;
+    }
+    cx.notify();
+  }
+
+  closeComposer(cx) {
+    this.composer = null;
+    this.anchorRowIdx = null;
+    this.commentTyping = false;
+    this.commentInput.set_value("");
+    this.handle.focus();
+    cx.notify();
+  }
+
+  saveComposer(cx, sendImmediately = false) {
+    if (!this.composer) return;
+    const body = String(this.commentInput.value() ?? "").trim();
+    if (!body) return;
+
+    const c = this.composer;
+    const snippet = c.editingId && c.existingSnippet
+      ? c.existingSnippet
+      : extractSnippet(this.annotatedRows, c.startRowIdx, c.endRowIdx);
+    const item = {
+      id: c.editingId || `rc-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      path: c.file,
+      side: c.side || "new",
+      start_line: c.startLine,
+      end_line: c.endLine > c.startLine ? c.endLine : undefined,
+      hunk_header: c.hunkHeader || undefined,
+      snippet: snippet || undefined,
+      body,
+    };
+
+    const current = this.drafts();
+    const next = c.editingId
+      ? current.map((x) => (x.id === c.editingId ? item : x))
+      : [...current, item];
+    this.setDrafts(next);
+    this.composer = null;
+    this.anchorRowIdx = null;
+    this.commentTyping = false;
+    this.commentInput.set_value("");
+    this.reviewError = null;
+
+    if (sendImmediately) {
+      this.sendReview(cx, next);
+    } else {
+      cx.notify();
+    }
+  }
+
+  targetInfo() {
+    const preferred = this.targetOverride || this.targetAddr;
+    const { candidates, defaultTarget } = resolveTargetCandidates({
+      panesList: panes(),
+      agentsList: agents(),
+      terminalsList: terminals(),
+      machine: this.targetMachine(),
+      focusedInfo: focused(),
+      repoRoot: null,
+      preferredAddr: preferred,
+    });
+    const chosen = candidates.find((c) => c.address === preferred) ?? candidates.find((c) => c.address === defaultTarget) ?? null;
+    return { candidates, chosen };
+  }
+
+  sendReview(cx, explicitList = null) {
+    if (this.sendingReqId) return;
+    const list = explicitList ?? this.drafts();
+    if (!list.length) return;
+    const { chosen } = this.targetInfo();
+    if (!chosen?.address) {
+      this.reviewError = tr("No live agent or terminal on this machine", "当前机器暂无运行中的 Agent 或终端");
+      cx.notify();
+      return;
+    }
+    const reqId = `rev-ckpt-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    this.sendingReqId = reqId;
+    this.sendingIds = list.map((c) => c.id);
+    this.reviewError = null;
+    this.targetPopupOpen = false;
+    const comments = list.map((c) => ({
+      path: c.path,
+      side: c.side || "new",
+      start_line: Number(c.start_line) || 1,
+      ...(c.end_line && Number(c.end_line) > Number(c.start_line) ? { end_line: Number(c.end_line) } : {}),
+      ...(c.hunk_header ? { hunk_header: c.hunk_header } : {}),
+      ...(c.snippet ? { snippet: c.snippet } : {}),
+      body: c.body,
+    }));
+    run("agent.send_review", {
+      request_id: reqId,
+      target: chosen.address,
+      source: "checkpoints",
+      ...(this.selectedTurn != null ? { checkpoint_turn: Number(this.selectedTurn) } : {}),
+      comments,
+      steer: Boolean(this.steerMode && chosen.kind === "acp" && chosen.status === "working"),
+      focus: false,
+    });
+    cx.notify();
+  }
+
+  handleVirtualItemClick(itemKey, cx) {
+    if (typeof itemKey !== "string") return;
+    if (itemKey.startsWith("r-")) {
+      const idx = Number(itemKey.slice(2));
+      const row = Number.isFinite(idx) ? this.annotatedRows[idx] : null;
+      if (row?.commentable) {
+        this.clickDiffRow(row, { shift: Boolean(this.lastShift) }, cx);
+      }
+      return;
+    }
+    if (itemKey.startsWith("c-orphan-")) {
+      const id = itemKey.slice("c-orphan-".length);
+      const comment = this.drafts().find((c) => c.id === id);
+      if (comment) this.editComment(comment, cx);
+      return;
+    }
+    if (itemKey.startsWith("c-")) {
+      const id = itemKey.slice(2);
+      const comment = this.drafts().find((c) => c.id === id);
+      if (comment) this.editComment(comment, cx);
+    }
+  }
+
+  renderCodeRow(row, t, selectedRange, commentedSet) {
+    if (row.isFileHeader) {
+      return h_flex()
+        .w_full()
+        .px(12)
+        .h(24)
+        .flex_none()
+        .items_center()
+        .bg(t.raised)
+        .border_y(1)
+        .border_color(t.border)
+        .child(div().font_semibold().text_size(11).text_color(t.foreground).truncate().child(row.text));
+    }
+    if (row.kind === "@") {
+      return div().w_full().px(12).h(20).flex_none().truncate().bg(t.raised).text_color(t.dim).child(row.text);
+    }
+    const inSel = Boolean(
+      selectedRange && row.file === selectedRange.file && row.rowIndex >= selectedRange.startRowIdx && row.rowIndex <= selectedRange.endRowIdx,
+    );
+    const hasComment = commentedSet.has(row.rowIndex);
+    const accent = t.accent ?? "#3b82f6";
+    const rowBg = inSel
+      ? (withAlpha(accent, "24") ?? t.selected)
+      : row.kind === "+"
+        ? (t.ansi2 + "18")
+        : row.kind === "-"
+          ? (t.ansi1 + "18")
+          : null;
+
+    return h_flex()
+      .w_full()
+      .h(20)
+      .flex_none()
+      .gap(6)
+      .items_center()
+      .when(Boolean(rowBg), (e) => e.bg(rowBg))
+      .when(row.commentable, (e) => e.cursor_pointer().hover((s) => s.bg(withAlpha(accent, "18") ?? t.hover)))
+      .child(
+        div()
+          .w(3)
+          .h_full()
+          .flex_none()
+          .when(inSel || hasComment, (e) => e.bg(accent)),
+      )
+      .child(
+        div()
+          .w(14)
+          .flex_none()
+          .text_center()
+          .text_size(11)
+          .text_color(inSel || hasComment ? accent : t.dim)
+          .child(row.commentable ? (hasComment ? "●" : "+") : ""),
+      )
+      .child(
+        div()
+          .w(30)
+          .flex_none()
+          .text_right()
+          .text_color(inSel ? t.foreground : t.dim)
+          .child(row.number === undefined ? "" : String(row.number)),
+      )
+      .child(div().flex_1().min_w(0).truncate().child(row.text));
+  }
+
+  renderSavedComment(item, t) {
+    const { comment, outdated, editing } = item;
+    const accent = t.accent ?? "#3b82f6";
+    return div()
+      .w_full()
+      .px(10)
+      .py(4)
+      .flex_none()
+      .cursor_pointer()
+      .child(
+        v_flex()
+          .w_full()
+          .max_w(580)
+          .p(8)
+          .gap(4)
+          .rounded(8)
+          .bg(editing ? (withAlpha(accent, "1c") ?? t.selected) : t.raised)
+          .border_1()
+          .border_color(editing ? accent : outdated ? t.blocked : (withAlpha(accent, "66") ?? t.border))
+          .font_family("sans-serif")
+          .child(
+            h_flex()
+              .w_full()
+              .items_center()
+              .gap(6)
+              .child(
+                div()
+                  .px(5)
+                  .py(1)
+                  .rounded(4)
+                  .bg(withAlpha(accent, "1f") ?? t.background)
+                  .text_size(10)
+                  .font_semibold()
+                  .text_color(accent)
+                  .child(`${comment.path} · ${formatLineTag(comment)}`),
+              )
+              .child(div().flex_1())
+              .child(
+                div()
+                  .text_size(10)
+                  .text_color(editing ? accent : t.dim)
+                  .child(editing ? tr("Editing below…", "正在下方编辑…") : tr("Click to edit / delete", "点击编辑或删除")),
+              ),
+          )
+          .child(
+            div()
+              .w_full()
+              .text_size(12)
+              .line_height("16px")
+              .text_color(t.foreground)
+              .whitespace_normal()
+              .child(comment.body),
+          ),
+      );
+  }
+
+  renderDockedComposer(composer, t) {
+    const accent = t.accent ?? "#3b82f6";
+    const hasText = Boolean(String(this.commentInput.value() ?? "").trim());
+    const rangeTag = formatLineTag({
+      start_line: composer.startLine,
+      end_line: composer.endLine,
+      side: composer.side,
+    });
+
+    return v_flex()
+      .id("ckpt-inline-composer")
+      .flex_none()
+      .w_full()
+      .p(10)
+      .gap(6)
+      .bg(t.popover ?? t.raised)
+      .border_t(1)
+      .border_color(this.commentTyping ? accent : t.border)
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .child(
+        h_flex()
+          .w_full()
+          .items_center()
+          .gap(6)
+          .child(
+            div()
+              .px(5)
+              .py(1)
+              .rounded(4)
+              .bg(withAlpha(accent, "22") ?? t.raised)
+              .text_size(10)
+              .font_semibold()
+              .text_color(accent)
+              .child(`${composer.file} · ${rangeTag}`),
+          )
+          .child(div().flex_1())
+          .child(
+            div()
+              .text_size(10)
+              .text_color(t.dim)
+              .child(tr("Shift+Click a diff line to extend range", "Shift+点击差异行可扩展行区间")),
+          ),
+      )
+      .child(
+        div()
+          .w_full()
+          .h(54)
+          .px(8)
+          .py(4)
+          .rounded(6)
+          .bg(t.background)
+          .border_1()
+          .border_color(this.commentTyping ? accent : t.border)
+          .cursor_text()
+          .child(Textarea.new(this.commentInput).size_full().text_size(12).text_color(t.foreground)),
+      )
+      .child(
+        h_flex()
+          .w_full()
+          .items_center()
+          .gap(6)
+          .when(Boolean(composer.editingId), (e) =>
+            e.child(
+              div()
+                .id("ckpt-comp-delete")
+                .px(8)
+                .py(3)
+                .rounded(5)
+                .text_size(11)
+                .text_color(t.ansi1)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover))
+                .on_click((_e, cx) => this.deleteComment(composer.editingId, cx))
+                .child(tr("Delete", "删除")),
+            ),
+          )
+          .child(div().flex_1())
+          .child(
+            div()
+              .id("ckpt-comp-cancel")
+              .px(8)
+              .py(3)
+              .rounded(5)
+              .text_size(11)
+              .text_color(t.muted)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover).text_color(t.foreground))
+              .on_click((_e, cx) => this.closeComposer(cx))
+              .child(tr("Cancel", "取消")),
+          )
+          .child(
+            div()
+              .id("ckpt-comp-save")
+              .px(9)
+              .py(3)
+              .rounded(5)
+              .border_1()
+              .border_color(hasText ? accent : t.border)
+              .bg(hasText ? (withAlpha(accent, "1f") ?? t.raised) : t.raised)
+              .text_size(11)
+              .text_color(hasText ? t.foreground : t.dim)
+              .when(hasText, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.saveComposer(cx, false)))
+              .child(composer.editingId ? tr("Update", "更新") : tr("Add", "添加评论")),
+          )
+          .child(
+            div()
+              .id("ckpt-comp-send")
+              .px(9)
+              .py(3)
+              .rounded(5)
+              .bg(hasText && !this.sendingReqId ? t.solid : t.raised)
+              .text_size(11)
+              .text_color(hasText && !this.sendingReqId ? t.solid_foreground : t.dim)
+              .when(hasText && !this.sendingReqId, (e) => e.cursor_pointer().on_click((_e, cx) => this.saveComposer(cx, true)))
+              .child(tr("Send now", "立即回流")),
+          ),
+      );
+  }
+
+  renderReviewBar(t, allDrafts) {
+    const { candidates, chosen } = this.targetInfo();
+    const fileSet = new Set(allDrafts.map((c) => c.path));
+    const accent = t.accent ?? "#3b82f6";
+    const isWorkingAcp = Boolean(chosen && chosen.kind === "acp" && chosen.status === "working");
+    const canSend = Boolean(allDrafts.length > 0 && chosen && !this.sendingReqId);
+    const statusColor = (st) => (st === "working" ? t.working : st === "blocked" ? t.blocked : st === "done" ? t.done : t.dim);
+
+    const trigger = h_flex()
+      .id("ckpt-review-target-btn")
+      .h(26)
+      .max_w(210)
+      .px(8)
+      .gap(5)
+      .items_center()
+      .rounded(6)
+      .bg(t.background)
+      .border_1()
+      .border_color(t.border)
+      .cursor_pointer()
+      .hover((s) => s.bg(t.hover))
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => {
+        this.targetPopupOpen = !this.targetPopupOpen;
+        cx.notify();
+      })
+      .when(Boolean(chosen), (e) => e.child(div().w(6).h(6).flex_none().rounded(3).bg(statusColor(chosen.status))))
+      .child(
+        div()
+          .min_w(0)
+          .truncate()
+          .text_size(11)
+          .text_color(chosen ? t.foreground : t.dim)
+          .child(chosen ? chosen.label : tr("No live agent", "无存活 Agent")),
+      )
+      .child(div().flex_none().text_size(9).text_color(t.dim).child("▾"));
+
+    return v_flex()
+      .id("ckpt-review-bar")
+      .flex_none()
+      .px(10)
+      .py(8)
+      .gap(6)
+      .border_t(1)
+      .border_color(withAlpha(accent, "55") ?? t.border)
+      .bg(t.raised)
+      .when(Boolean(this.reviewError), (e) =>
+        e.child(div().text_size(11).text_color(t.ansi1).whitespace_normal().child(this.reviewError)),
+      )
+      .child(
+        h_flex()
+          .w_full()
+          .gap(6)
+          .items_center()
+          .flex_wrap()
+          .child(
+            div()
+              .px(6)
+              .py(2)
+              .rounded(5)
+              .bg(withAlpha(accent, "20") ?? t.background)
+              .text_size(11)
+              .font_semibold()
+              .text_color(accent)
+              .child(
+                tr(
+                  `T${this.selectedTurn} · ${allDrafts.length} comment${allDrafts.length === 1 ? "" : "s"} (${fileSet.size}f)`,
+                  `T${this.selectedTurn} · ${allDrafts.length} 条评论（${fileSet.size} 文件）`,
+                ),
+              ),
+          )
+          .child(
+            div()
+              .id("ckpt-review-clear")
+              .px(6)
+              .py(2)
+              .rounded(5)
+              .text_size(11)
+              .text_color(t.muted)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover).text_color(t.foreground))
+              .on_click((_e, cx) => {
+                this.setDrafts([]);
+                this.reviewError = null;
+                cx.notify();
+              })
+              .child(tr("Clear", "清空")),
+          )
+          .child(div().flex_1())
+          .child(
+            Popup.new("ckpt-review-target-popup", trigger)
+              .anchor("top_left")
+              .when(this.targetPopupOpen, (el) =>
+                el.content(
+                  v_flex()
+                    .w(240)
+                    .max_h(220)
+                    .p(4)
+                    .gap(2)
+                    .rounded(8)
+                    .bg(t.popover ?? t.background)
+                    .border_1()
+                    .border_color(t.border)
+                    .overflow_y_scroll()
+                    .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                    .children(
+                      candidates.length
+                        ? candidates.map((c) => {
+                            const active = chosen?.address === c.address;
+                            return h_flex()
+                              .id(`ckpt-target-${c.address}`)
+                              .h(26)
+                              .px(8)
+                              .gap(6)
+                              .items_center()
+                              .rounded(6)
+                              .cursor_pointer()
+                              .when(active, (x) => x.bg(t.selected))
+                              .hover((s) => s.bg(t.hover))
+                              .on_click((_e, cx) => {
+                                this.targetOverride = c.address;
+                                this.targetPopupOpen = false;
+                                cx.notify();
+                              })
+                              .child(div().w(6).h(6).flex_none().rounded(3).bg(statusColor(c.status)))
+                              .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.foreground).child(c.label))
+                              .child(
+                                div()
+                                  .flex_none()
+                                  .px(4)
+                                  .py(1)
+                                  .rounded(4)
+                                  .bg(t.raised)
+                                  .text_size(9.5)
+                                  .text_color(t.dim)
+                                  .child(c.kind === "acp" ? "ACP" : "CLI"),
+                              );
+                          })
+                        : [div().p(8).text_size(11).text_color(t.dim).child(tr("No live sessions", "暂无存活会话"))],
+                    ),
+                ),
+              ),
+          )
+          .when(isWorkingAcp, (e) =>
+            e.child(
+              div()
+                .id("ckpt-review-steer")
+                .h(26)
+                .px(7)
+                .flex()
+                .items_center()
+                .rounded(6)
+                .border_1()
+                .border_color(this.steerMode ? t.blocked : t.border)
+                .bg(this.steerMode ? (withAlpha(t.blocked, "22") ?? t.background) : t.background)
+                .text_size(10.5)
+                .text_color(this.steerMode ? t.blocked : t.muted)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover))
+                .on_click((_e, cx) => {
+                  this.steerMode = !this.steerMode;
+                  cx.notify();
+                })
+                .child(this.steerMode ? tr("Steer", "抢占") : tr("Queue", "排队")),
+            ),
+          )
+          .child(
+            div()
+              .id("ckpt-review-send")
+              .h(26)
+              .px(11)
+              .flex()
+              .items_center()
+              .rounded(6)
+              .bg(canSend ? t.solid : t.background)
+              .text_size(11.5)
+              .font_medium()
+              .text_color(canSend ? t.solid_foreground : t.dim)
+              .when(canSend, (e) => e.cursor_pointer().on_click((_e, cx) => this.sendReview(cx)))
+              .child(this.sendingReqId ? tr("Sending…", "发送中…") : tr("Send to Agent", "回流给 Agent")),
+          ),
+      );
   }
 
   render(cx) {
     if (this.viewKey() !== this.context) this.refresh(cx);
+    this.syncLastResult();
     const t = theme();
     const activeTarget = activeTargetAddress();
     const targetRec = this.targetAddr
@@ -286,22 +994,47 @@ export default class Checkpoints extends View {
     const maxTurn = this.checkpoints.length > 0 ? ckptMax : Math.max(Number(targetRec?.turn ?? 0), 0);
     const isoLevel = this.isolation?.level ?? "unknown";
     const filesBlocked = isoLevel === "shared_blocked";
-    const listHeight = this.checkpoints.length * 30 + 12;
+    const rowHeight = 34;
+    const rowGap = 4;
+    const listHeight = this.checkpoints.length > 0
+      ? this.checkpoints.length * rowHeight + Math.max(0, this.checkpoints.length - 1) * rowGap + 14
+      : 48;
+
+    const allDrafts = this.drafts();
+    const { items, sizes } = buildDisplayItems(this.annotatedRows, allDrafts, this.composer);
+    const commentedSet = new Set();
+    let lastCodeRowIdx = null;
+    for (const item of items) {
+      if (item.type === "code") lastCodeRowIdx = item.row.rowIndex;
+      else if (item.type === "comment" && !item.outdated && lastCodeRowIdx != null) commentedSet.add(lastCodeRowIdx);
+    }
 
     return v_flex().id("checkpoints").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13).track_focus(this.handle)
+      .on_key_down((e, cx) => {
+        if (e.key === "escape") {
+          if (this.targetPopupOpen) {
+            this.targetPopupOpen = false;
+            cx.stop_propagation();
+            cx.notify();
+          } else if (this.composer) {
+            this.closeComposer(cx);
+            cx.stop_propagation();
+          }
+        }
+      })
       .child(
         h_flex().h(42).flex_none().px(12).gap(8).items_center().border_b(1).border_color(t.border)
-          .child(div().font_semibold().child(tr("Checkpoints", "快照")))
+          .child(div().flex_none().whitespace_nowrap().font_semibold().child(tr("Checkpoints", "快照")))
           .when(Boolean(this.targetAddr), (el) =>
-            el.child(div().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(this.targetAddr)),
+            el.child(div().flex_none().whitespace_nowrap().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(this.targetAddr)),
           )
           .when(this.checkpoints.length > 0, (el) =>
-            el.child(div().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(tr(`${this.checkpoints.length} turns`, `${this.checkpoints.length} 个节点`))),
+            el.child(div().flex_none().whitespace_nowrap().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(tr(`${this.checkpoints.length} turns`, `${this.checkpoints.length} 个节点`))),
           )
           .child(div().flex_1())
           .when(Boolean(activeTarget || this.targetAddr), (el) =>
             el.child(
-              div().id("checkpoints-snap").px(8).py(3).rounded(6).border_1().border_color(t.border).text_size(11).text_color(t.foreground).cursor_pointer()
+              div().id("checkpoints-snap").flex_none().whitespace_nowrap().px(8).py(3).rounded(6).border_1().border_color(t.border).text_size(11).text_color(t.foreground).cursor_pointer()
                 .hover((s) => s.bg(t.hover))
                 .on_click((_e, cx) => this.snapNow(cx))
                 .child(this.snapping ? tr("Snapping…", "抓取中…") : tr("+ Snap", "+ 存档")),
@@ -309,30 +1042,32 @@ export default class Checkpoints extends View {
           ),
       )
       .child(
-        div().flex_1().min_h(44).max_h(listHeight).relative().border_b(1).border_color(t.border)
+        div().flex_1().min_h(48).max_h(listHeight).relative().border_b(1).border_color(t.border)
           .child(
-            v_flex().id("checkpoints-list").absolute().inset_0().overflow_y_scroll().p(6)
+            v_flex().id("checkpoints-list").absolute().inset_0().overflow_y_scroll().p(6).gap(rowGap)
               .children(this.checkpoints.map((c) => {
                 const turn = Number(c.turn);
                 const files = Array.isArray(c.files) ? c.files : [];
                 const cAdd = files.reduce((n, f) => n + (Number(f.added) || 0), 0);
                 const cDel = files.reduce((n, f) => n + (Number(f.deleted) || 0), 0);
-                const summary = c.label || c.prompt || (turn === 0 ? tr("Initial state (before Turn 1)", "初始状态 (第 1 轮前)") : tr(`Turn ${turn}`, `第 ${turn} 轮`));
+                const summary = formatCheckpointSummary(c, turn);
+                const tip = summary.length > 260 ? `${summary.slice(0, 260)}…` : summary;
                 const selected = Number(this.selectedTurn) === turn;
                 const isCurrent = turn === maxTurn && (turn === 0 || !c.label);
-                return h_flex().id(`ckpt-${turn}`).h(30).flex_none().px(8).gap(8).items_center().rounded(7).cursor_pointer()
+                return h_flex().id(`ckpt-${turn}`).h(rowHeight).flex_none().px(8).gap(8).items_center().rounded(7).overflow_hidden().cursor_pointer()
+                  .tooltip(tip)
                   .when(selected, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover))
                   .on_click((_e, cx) => this.pickCheckpoint(turn, cx))
-                  .child(div().w(44).flex_none().text_size(11).text_color(t.accent ?? t.muted).child(`T${turn}`))
-                  .child(div().flex_1().min_w(0).truncate().child(summary))
-                  .when(cAdd > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child(`+${cAdd}`)))
-                  .when(cDel > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child(`−${cDel}`)))
+                  .child(div().min_w(28).flex_none().whitespace_nowrap().text_size(11).line_height("18px").text_color(t.accent ?? t.muted).child(`T${turn}`))
+                  .child(div().flex_1().min_w(0).overflow_hidden().whitespace_nowrap().truncate().text_size(12.5).line_height("20px").child(summary))
+                  .when(cAdd > 0, (e) => e.child(div().flex_none().whitespace_nowrap().text_size(11).line_height("18px").text_color(t.ansi2).child(`+${cAdd}`)))
+                  .when(cDel > 0, (e) => e.child(div().flex_none().whitespace_nowrap().text_size(11).line_height("18px").text_color(t.ansi1).child(`−${cDel}`)))
                   .when(isCurrent, (e) =>
-                    e.child(div().px(6).py(2).rounded(5).bg(t.raised).text_size(10.5).text_color(t.dim).child(tr("Current", "当前"))),
+                    e.child(div().flex_none().whitespace_nowrap().px(6).py(2).rounded(5).bg(t.raised).text_size(10.5).line_height("14px").text_color(t.dim).child(tr("Current", "当前"))),
                   )
                   .when(!isCurrent, (e) =>
                     e.child(
-                      div().id(`ckpt-rb-${turn}`).px(6).py(2).rounded(5).border_1().border_color(t.border).text_size(10.5).text_color(t.muted)
+                      div().id(`ckpt-rb-${turn}`).flex_none().whitespace_nowrap().px(6).py(2).rounded(5).border_1().border_color(t.border).text_size(10.5).line_height("14px").text_color(t.muted)
                         .hover((s) => s.bg(t.hover))
                         .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
                         .on_click((_e, cx) => {
@@ -358,7 +1093,7 @@ export default class Checkpoints extends View {
         const blockersText = Array.isArray(this.isolation?.blockers) ? this.isolation.blockers.map((b) => b.detail || b.addr).join(", ") : "";
         return panel.child(
           h_flex().p(10).gap(8).items_center().flex_wrap().border_b(1).border_color(t.border).bg(t.raised)
-            .child(div().text_size(11.5).text_color(filesBlocked ? t.ansi1 : t.foreground).child(
+            .child(div().text_size(11.5).line_height("17px").text_color(filesBlocked ? t.ansi1 : t.foreground).child(
               filesBlocked
                 ? (rbTurn === 0
                     ? tr(`Blocked (${blockersText}): session-only reset to initial state T0`, `同目录有活跃程序（${blockersText}），仅允许清空对话恢复到初始状态 T0`)
@@ -394,12 +1129,21 @@ export default class Checkpoints extends View {
       })
       .child(
         div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(11)
+          .on_mouse_down("left", (e) => { this.lastShift = Boolean(e?.modifiers?.shift); })
           .child(
             div().id("checkpoints-diff-x").size_full().overflow_x_scrollbar()
               .child(
                 div().w_full().min_w(this.diffWidth).h_full().child(
-                  v_virtual_list("checkpoints-diff", this.rows.length, 20, (i) => String(i),
-                    (range) => this.rows.slice(range.start, range.end).map((row) => this.diffRow(row, t))).size_full(),
+                  v_virtual_list(
+                    "checkpoints-diff",
+                    items.length,
+                    sizes,
+                    (i) => items[i]?.key ?? String(i),
+                    (range) => items.slice(range.start, range.end).map((item) => {
+                      if (item.type === "comment") return this.renderSavedComment(item, t);
+                      return this.renderCodeRow(item.row, t, this.composer, commentedSet);
+                    }),
+                  ).on_item_click((itemKey, cx) => this.handleVirtualItemClick(itemKey, cx)).size_full(),
                 ),
               ),
           )
@@ -408,6 +1152,8 @@ export default class Checkpoints extends View {
             e.child(div().absolute().top(6).px(12).text_color(t.dim).child(tr("Turn diffs appear after each agent turn completes", "每轮对话完成后将在此显示轮次 diff"))),
           ),
       )
+      .when(Boolean(this.composer), (e) => e.child(this.renderDockedComposer(this.composer, t)))
+      .when(allDrafts.length > 0 || Boolean(this.reviewError), (e) => e.child(this.renderReviewBar(t, allDrafts)))
       .when(Boolean(this.note), (e) => e.child(div().px(10).pb(8).text_size(11).text_color(t.ansi1).child(this.note)));
   }
 }

@@ -691,3 +691,43 @@ test("selecting a sub-agent in a tab or split pane highlights its subRow in the 
   expect(texts.get("sub-rt-wsl/a50")).toBe("ACP");
   expect(texts.get("sub-kind-wsl/a50")).toContain("Side");
 });
+
+for (const sort of ["grouped", "priority"]) test(`${sort}: agents and sub-agents are ordered by appearance time (oldest first, newest last)`, () => {
+  const claude = { name: "Claude", key: "claude", agent: true };
+  // Intentionally out of chronological order and with higher seq on newer agent.
+  const list = [
+    { address: "a3", acp: true, pane: "p3", tab: "tab3", space: "s1", space_name: "Project", program: claude, title: "Third", status: "working", seq: 30, created_ms: 3000 },
+    { address: "a1", acp: true, pane: "p1", tab: "tab1", space: "s1", space_name: "Project", program: claude, title: "First", status: "working", seq: 10, created_ms: 1000 },
+    { address: "a2", acp: true, pane: "p2", tab: "tab2", space: "s1", space_name: "Project", program: claude, title: "Second", status: "working", seq: 20, created_ms: 2000 },
+  ];
+  const terms = [
+    { address: "a3", parent: null, state: "live", status: "working", program: claude, created_ms: 3000, labels: {} },
+    { address: "a1", parent: null, state: "live", status: "working", program: claude, created_ms: 1000, labels: {} },
+    { address: "a2", parent: null, state: "live", status: "working", program: claude, created_ms: 2000, labels: {} },
+    { address: "a1-sub2", parent: "a1", state: "live", status: "idle", program: claude, created_ms: 2500, labels: {} },
+    { address: "a1-sub1", parent: "a1", state: "live", status: "idle", program: claude, created_ms: 1500, labels: {} },
+  ];
+  const orders: string[][] = [];
+  const { agents } = harness([], {
+    agents: () => list,
+    terminals: () => terms,
+    panes: () => list.map((a) => ({ pane: a.pane, tab: a.tab, terminal: a.address, program: claude, title: a.title })),
+    focused: () => null,
+    spaces: () => [{ tabs: list.map((a) => ({ id: a.tab, name: a.title, named: true })) }],
+    layout: () => ({ id: "sidebar", size: { px: 268 } }),
+    shared: () => sort,
+    theme: () => ({}),
+    setAgentOrder: (order: string[]) => orders.push(order),
+    div: element, v_flex: element, h_flex: element, svg: element, image: element,
+  });
+  const rowIds: string[] = [];
+  const walk = (node: any) => {
+    if (typeof node?.id === "string" && (node.id.startsWith("ag-") || node.id.startsWith("sub-")) && !node.id.includes("-id-") && !node.id.includes("-rt-") && !node.id.includes("-kind-") && !node.id.includes("-wt-") && !node.id.startsWith("ag-list") && !node.id.startsWith("ag-recycle") && !node.id.startsWith("ag-sort")) {
+      rowIds.push(node.id);
+    }
+    (node?.children ?? []).forEach(walk);
+  };
+  walk(agents.render({}).node);
+  expect(orders.at(-1)).toEqual(["a1", "a2", "a3"]);
+  expect(rowIds).toEqual(["ag-a1", "sub-a1-sub1", "sub-a1-sub2", "ag-a2", "ag-a3"]);
+});

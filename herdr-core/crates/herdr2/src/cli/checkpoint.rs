@@ -69,6 +69,183 @@ pub enum CheckpointSub {
     },
 }
 
+/// Fast zero-RPC PreToolUse guard for forked worktree sessions (`--phase guard`).
+///
+/// Returns `Some((exit_code, message))` whenever `phase == "guard"`:
+/// - `exit_code == 0`: tool call allowed (or not a worktree session).
+/// - `exit_code == 2`: tool call targets `H2_WORKTREE_ORIGIN` outside `H2_WORKTREE_PATH`; Claude Code
+///   blocks the call and feeds `stderr` back to the model so it retries inside `H2_WORKTREE_PATH`.
+pub fn worktree_guard_hook(cli: &CheckpointCli) -> Option<(i32, Option<String>)> {
+    let CheckpointSub::Hook { source, phase, extra, .. } = &cli.sub else {
+        return None;
+    };
+    if phase.as_deref() != Some("guard") {
+        return None;
+    }
+    let origin = std::env::var("H2_WORKTREE_ORIGIN").ok().map(|s| s.trim().to_string()).unwrap_or_default();
+    let wt_path = std::env::var("H2_WORKTREE_PATH").ok().map(|s| s.trim().to_string()).unwrap_or_default();
+    if origin.is_empty() || wt_path.is_empty() || normalize_path(&origin) == normalize_path(&wt_path) {
+        return Some((0, Some("{}".to_string())));
+    }
+    let payload = read_hook_payload(source, extra);
+    if let Some(reason) = check_worktree_guard(&payload, &origin, &wt_path) {
+        return Some((2, Some(reason)));
+    }
+    Some((0, Some("{}".to_string())))
+}
+
+fn normalize_path(p: &str) -> String {
+    let s = p.trim().replace('\\', "/");
+    let trimmed = s.trim_end_matches('/');
+    if trimmed.is_empty() && s.starts_with('/') { "/".to_string() } else { trimmed.to_string() }
+}
+
+fn eq_path_prefix(a: &str, b: &str) -> bool {
+    if cfg!(windows) { a.eq_ignore_ascii_case(b) } else { a == b }
+}
+
+fn is_under_dir(path_norm: &str, dir_norm: &str) -> bool {
+    if dir_norm.is_empty() {
+        return false;
+    }
+    if path_norm.len() < dir_norm.len() || !path_norm.is_char_boundary(dir_norm.len()) {
+        return false;
+    }
+    if !eq_path_prefix(&path_norm[..dir_norm.len()], dir_norm) {
+        return false;
+    }
+    path_norm.len() == dir_norm.len() || path_norm.as_bytes()[dir_norm.len()] == b'/'
+}
+
+fn resolve_lexical(raw: &str, base_norm: &str) -> String {
+    let s = raw.trim().replace('\\', "/");
+    let is_win_abs = s.len() >= 3 && s.as_bytes()[0].is_ascii_alphabetic() && s.as_bytes()[1] == b':' && s.as_bytes()[2] == b'/';
+    let full = if s.starts_with('/') || is_win_abs {
+        s
+    } else if base_norm.is_empty() {
+        s
+    } else {
+        format!("{base_norm}/{s}")
+    };
+    let (prefix, rest) = if full.len() >= 3 && full.as_bytes()[0].is_ascii_alphabetic() && full.as_bytes()[1] == b':' && full.as_bytes()[2] == b'/' {
+        (&full[..3], &full[3..])
+    } else if let Some(stripped) = full.strip_prefix('/') {
+        ("/", stripped)
+    } else {
+        ("", full.as_str())
+    };
+    let mut stack: Vec<&str> = Vec::new();
+    for seg in rest.split('/') {
+        match seg {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            other => stack.push(other),
+        }
+    }
+    format!("{prefix}{}", stack.join("/"))
+}
+
+fn path_hits_origin(raw: &str, origin_norm: &str, wt_norm: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let resolved = resolve_lexical(trimmed, wt_norm);
+    if is_under_dir(&resolved, wt_norm) {
+        return false;
+    }
+    is_under_dir(&resolved, origin_norm)
+}
+
+fn is_path_word_char(b: u8) -> bool {
+    matches!(b, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b'.')
+}
+
+fn command_hits_origin(cmd: &str, origin_norm: &str, wt_norm: &str) -> bool {
+    if origin_norm.is_empty() {
+        return false;
+    }
+    let cmd_norm = cmd.replace('\\', "/");
+    let haystack = if cfg!(windows) { cmd_norm.to_ascii_lowercase() } else { cmd_norm };
+    let needle = if cfg!(windows) { origin_norm.to_ascii_lowercase() } else { origin_norm.to_string() };
+    let wt_needle = if cfg!(windows) { wt_norm.to_ascii_lowercase() } else { wt_norm.to_string() };
+    let bytes = haystack.as_bytes();
+    let nlen = needle.len();
+    let mut i = 0usize;
+    while i + nlen <= haystack.len() {
+        if haystack.is_char_boundary(i) && haystack[i..].starts_with(&needle) {
+            let left_ok = i == 0 || (!is_path_word_char(bytes[i - 1]) && bytes[i - 1] != b'/');
+            let end = i + nlen;
+            let right_ok = end == haystack.len() || !is_path_word_char(bytes[end]);
+            if left_ok && right_ok {
+                let inside_wt = !wt_needle.is_empty()
+                    && haystack[i..].starts_with(&wt_needle)
+                    && (i + wt_needle.len() == haystack.len() || !is_path_word_char(bytes[i + wt_needle.len()]));
+                if !inside_wt {
+                    return true;
+                }
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Checks a Claude Code `PreToolUse` hook JSON payload against `(origin, wt_path)`.
+/// Returns `Some(reason)` if the tool call attempts to access `origin` outside `wt_path`.
+pub fn check_worktree_guard(payload: &Value, origin: &str, wt_path: &str) -> Option<String> {
+    let origin_norm = normalize_path(origin);
+    let wt_norm = normalize_path(wt_path);
+    if origin_norm.is_empty() || wt_norm.is_empty() || eq_path_prefix(&origin_norm, &wt_norm) {
+        return None;
+    }
+    let input = payload.get("tool_input")?;
+    let tool_name = payload.get("tool_name").and_then(Value::as_str).unwrap_or("tool");
+
+    let mut violation: Option<String> = None;
+    for key in ["file_path", "notebook_path", "path", "target_file", "directory", "cwd"] {
+        if let Some(p) = input.get(key).and_then(Value::as_str)
+            && path_hits_origin(p, &origin_norm, &wt_norm)
+        {
+            violation = Some(format!("{key}={p}"));
+            break;
+        }
+    }
+    if violation.is_none()
+        && let Some(edits) = input.get("edits").and_then(Value::as_array)
+    {
+        for ed in edits {
+            for key in ["file_path", "path"] {
+                if let Some(p) = ed.get(key).and_then(Value::as_str)
+                    && path_hits_origin(p, &origin_norm, &wt_norm)
+                {
+                    violation = Some(format!("edits.{key}={p}"));
+                    break;
+                }
+            }
+            if violation.is_some() {
+                break;
+            }
+        }
+    }
+    if violation.is_none()
+        && let Some(cmd) = input.get("command").and_then(Value::as_str)
+        && command_hits_origin(cmd, &origin_norm, &wt_norm)
+    {
+        violation = Some("command references parent workspace path".into());
+    }
+
+    violation.map(|detail| {
+        format!(
+            "BLOCKED by herdr2 worktree guard: `{tool_name}` targeted parent workspace `{origin}` ({detail}). \
+             You are running in an isolated Git worktree `{wt_path}`. \
+             Retry strictly inside `{wt_path}` and NEVER read, edit, or run commands in `{origin}`."
+        )
+    })
+}
+
 /// Returns `Some(json!({}))` immediately without touching IPC sockets when an external process outside `herdr2` runs `checkpoint hook`.
 pub fn fast_noop_hook(cli: &CheckpointCli) -> Option<String> {
     if !matches!(cli.sub, CheckpointSub::Hook { .. }) {
@@ -215,4 +392,85 @@ fn render_diff(r: &Value) -> String {
         out.push_str("\n... [diff truncated at 512 KiB]");
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn worktree_guard_blocks_parent_workspace_and_allows_worktree() {
+        let origin = "/home/user/temp/test";
+        let wt = "/home/user/.local/state/herdr2/default/worktrees/forks/test-fk1";
+
+        // Direct Write/Edit/Read/Glob into parent workspace -> BLOCKED
+        for (tool, key, path) in [
+            ("Write", "file_path", "/home/user/temp/test/calc.py"),
+            ("Edit", "file_path", "/home/user/temp/test/calc.py"),
+            ("Read", "file_path", "/home/user/temp/test/calc.py"),
+            ("Glob", "path", "/home/user/temp/test"),
+            ("NotebookEdit", "notebook_path", "/home/user/temp/test/nb.ipynb"),
+            ("Edit", "file_path", "../../../../../../../temp/test/calc.py"),
+        ] {
+            let payload = json!({ "tool_name": tool, "tool_input": { key: path } });
+            assert!(
+                check_worktree_guard(&payload, origin, wt).is_some(),
+                "expected block for {tool} {key}={path}"
+            );
+        }
+
+        // Bash referencing parent workspace -> BLOCKED
+        for cmd in [
+            "cd /home/user/temp/test && python3 calc.py",
+            "python3 /home/user/temp/test/calc.py",
+            "git -C /home/user/temp/test status",
+        ] {
+            let payload = json!({ "tool_name": "Bash", "tool_input": { "command": cmd } });
+            assert!(check_worktree_guard(&payload, origin, wt).is_some(), "expected block for bash: {cmd}");
+        }
+
+        // Allowed: inside worktree, staged handoff.md, relative inside worktree, sibling dir
+        for (tool, input) in [
+            ("Edit", json!({ "file_path": format!("{wt}/calc.py") })),
+            ("Write", json!({ "file_path": "calc.py" })),
+            ("Read", json!({ "file_path": "/home/user/.local/state/herdr2/default/files/t3s/handoff.md" })),
+            ("Edit", json!({ "file_path": "/home/user/temp/test-other/calc.py" })),
+            ("Bash", json!({ "command": "python3 calc.py && git status" })),
+            ("Bash", json!({ "command": format!("cd {wt} && python3 calc.py") })),
+            ("Bash", json!({ "command": "ls /home/user/temp/test-other" })),
+        ] {
+            let payload = json!({ "tool_name": tool, "tool_input": input });
+            assert!(
+                check_worktree_guard(&payload, origin, wt).is_none(),
+                "expected allow for {tool} {input}"
+            );
+        }
+
+        // Nested worktree inside origin: worktree allowed, parent outside worktree blocked
+        let nested_wt = "/home/user/temp/test/.wt/fk1";
+        assert!(
+            check_worktree_guard(
+                &json!({ "tool_name": "Edit", "tool_input": { "file_path": "/home/user/temp/test/.wt/fk1/calc.py" } }),
+                origin,
+                nested_wt
+            )
+            .is_none()
+        );
+        assert!(
+            check_worktree_guard(
+                &json!({ "tool_name": "Bash", "tool_input": { "command": "cd /home/user/temp/test/.wt/fk1 && ls" } }),
+                origin,
+                nested_wt
+            )
+            .is_none()
+        );
+        assert!(
+            check_worktree_guard(
+                &json!({ "tool_name": "Edit", "tool_input": { "file_path": "/home/user/temp/test/calc.py" } }),
+                origin,
+                nested_wt
+            )
+            .is_some()
+        );
+    }
 }

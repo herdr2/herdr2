@@ -146,6 +146,35 @@ fn acp_handoff_lazy_injection_turn_slice_and_merge_back() {
         turn4_user["text"].as_str().unwrap_or_default().contains("Handoff from"),
         "{turn4_user}"
     );
+
+    // Prompt-less ACP side-chat / fork / handoff must immediately deliver the carried context on startup
+    // (consistent with CLI mode) using a read-only bootstrap prompt, so the agent receives it right away.
+    let sc = s.json(&["handoff", &a1, "--kind", "side-chat", "--wait"]);
+    let a3 = sc["target"].as_str().unwrap().to_string();
+    assert_eq!(sc["target_kind"], "agent", "{sc}");
+    assert_eq!(sc["prompt_sent"], true, "{sc}");
+    assert_eq!(sc["wait"]["turn"].as_u64(), Some(1), "{sc}");
+
+    let a3_read = s.json(&["read", &a3]);
+    let a3_entries = a3_read["entries"].as_array().unwrap();
+    assert_eq!(a3_entries[0]["kind"], "handoff", "{a3_read}");
+    assert_eq!(a3_entries[1]["kind"], "user", "{a3_read}");
+    assert!(
+        a3_entries[1]["text"].as_str().unwrap_or_default().contains("Do NOT make any modifications"),
+        "expected read-only bootstrap prompt for prompt-less ACP side-chat: {a3_read}"
+    );
+
+    // Next user turn on a3 must NOT re-inject <herdr2-handoff> since turn 1 already delivered it.
+    s.json(&["send", "--wait", &a3, "STATE"]);
+    let a3_last: Value = {
+        let last_txt = s.json(&["read", &a3, "--last"])["text"].as_str().unwrap().to_string();
+        let line = last_txt.lines().find(|l| l.starts_with('{')).unwrap_or_else(|| panic!("bad STATE json: {last_txt:?}"));
+        serde_json::from_str(line).unwrap()
+    };
+    assert!(
+        !a3_last["raw"].as_str().unwrap_or_default().contains("<herdr2-handoff"),
+        "Turn 2 on a3 should not re-inject handoff envelope: {a3_last}"
+    );
 }
 
 #[test]

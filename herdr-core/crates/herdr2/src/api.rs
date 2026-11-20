@@ -40,6 +40,7 @@ pub const IDENTITY_VARS: &[&str] = &[
 mod doc;
 mod handoff;
 mod pty;
+mod review;
 pub(crate) mod run;
 mod types;
 use doc::*;
@@ -145,6 +146,9 @@ methods! { Ctx<'_>;
     "agent.handoff" => handoff::agent_handoff, HandoffParams => HandoffResult,
         "Hand off, fork, open a side chat, or merge back session context across ACP agents and PTY terminals.",
         errors ["not_found", "machine_unknown", "invalid_params", "name_taken", "config", "spawn_failed", "unavailable", "stopping"];
+    "agent.review" => review::agent_review, ReviewParams => ReviewResult,
+        "Deliver structured line-level diff review comments to a live ACP agent or PTY terminal.",
+        errors ["not_found", "machine_unknown", "finished", "invalid_params", "blocked", "stopping"];
     "terminal.run" => terminal_run, TerminalRunParams => TerminalRunResult,
         "Start a program in a pseudo-terminal (`shell`, command, or template). With `wait`, wait for it to finish and return its screen.",
         errors ["invalid_params", "name_taken", "spawn_failed", "unavailable", "invalid_template", "not_found", "machine_unknown", "config"];

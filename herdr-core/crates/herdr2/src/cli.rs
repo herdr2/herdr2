@@ -195,6 +195,16 @@ pub fn main() -> i32 {
     };
     let (cmd, asked) = match cli.cmd {
         Some(Cmd::Checkpoint(ref c)) if matches!(c.sub, checkpoint::CheckpointSub::Hook { .. }) => {
+            if let Some((code, msg)) = checkpoint::worktree_guard_hook(c) {
+                if let Some(m) = msg {
+                    if code == 0 {
+                        println!("{m}");
+                    } else {
+                        eprintln!("{m}");
+                    }
+                }
+                return code;
+            }
             if let Some(noop) = checkpoint::fast_noop_hook(c) {
                 println!("{noop}");
                 return 0;

@@ -2931,6 +2931,111 @@
         ],
         "type": "object"
       },
+      "ReviewComment": {
+        "properties": {
+          "body": {
+            "description": "The reviewer's comment or requested change.",
+            "type": "string"
+          },
+          "end_line": {
+            "description": "Inclusive 1-based end line number (defaults to `start_line`).",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "hunk_header": {
+            "description": "Optional enclosing `@@ ... @@` hunk header.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "description": "Repository-relative file path (e.g. `src/api.rs`).",
+            "type": "string"
+          },
+          "side": {
+            "default": "new",
+            "description": "Diff side: `new`, `old`, or `context`.",
+            "type": "string"
+          },
+          "snippet": {
+            "description": "Optional surrounding unified diff lines (`+`/`-`/` `) for grounding.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "start_line": {
+            "description": "Inclusive 1-based start line number on the indicated side.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path",
+          "start_line",
+          "body"
+        ],
+        "type": "object"
+      },
+      "ReviewResult": {
+        "properties": {
+          "comment_count": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "file_count": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "inbox_len": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "staged_path": {
+            "description": "Path to staged `diff-review*.md` when staged for PTY or oversized ACP payloads.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "target": {
+            "type": "string"
+          },
+          "target_kind": {
+            "description": "`agent` or `terminal`.",
+            "type": "string"
+          },
+          "turn": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "target",
+          "target_kind",
+          "comment_count",
+          "file_count",
+          "turn",
+          "inbox_len"
+        ],
+        "type": "object"
+      },
       "RoleAccessMode": {
         "enum": [
           "readonly",
@@ -6338,6 +6443,18 @@
           }
         },
         {
+          "description": "Caller UI language (e.g. `zh-CN` or `en`) for localized handoff prompts and context headers.",
+          "name": "language",
+          "required": false,
+          "schema": {
+            "description": "Caller UI language (e.g. `zh-CN` or `en`) for localized handoff prompts and context headers.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
           "description": "When merging back (`--into`), instruct the target/parent agent to merge code from the source session's fork worktree branch into the main workspace without deleting the worktree or branch.",
           "name": "merge_worktree",
           "required": false,
@@ -6493,6 +6610,168 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/HandoffResult"
+        }
+      }
+    },
+    {
+      "description": "Deliver structured line-level diff review comments to a live ACP agent or PTY terminal.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "finished"
+          },
+          "message": "finished"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "blocked"
+          },
+          "message": "blocked"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "stopping"
+          },
+          "message": "stopping"
+        }
+      ],
+      "name": "agent.review",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Who is calling (`H2_AGENT_ID` / `H2_TERMINAL_ID`).",
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "description": "Who is calling (`H2_AGENT_ID` / `H2_TERMINAL_ID`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Optional checkpoint turn number when reviewing a checkpoint diff.",
+          "name": "checkpoint_turn",
+          "required": false,
+          "schema": {
+            "description": "Optional checkpoint turn number when reviewing a checkpoint diff.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "One or more line-level review comments.",
+          "name": "comments",
+          "required": true,
+          "schema": {
+            "description": "One or more line-level review comments.",
+            "items": {
+              "$ref": "#/components/schemas/ReviewComment"
+            },
+            "type": "array"
+          }
+        },
+        {
+          "description": "Caller UI language (`en` or `zh-CN`) for localized headers and prompts.",
+          "name": "language",
+          "required": false,
+          "schema": {
+            "description": "Caller UI language (`en` or `zh-CN`) for localized headers and prompts.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Optional overall instruction accompanying the line comments.",
+          "name": "note",
+          "required": false,
+          "schema": {
+            "description": "Optional overall instruction accompanying the line comments.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Optional repository root path for grounding.",
+          "name": "repo_root",
+          "required": false,
+          "schema": {
+            "description": "Optional repository root path for grounding.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Origin surface (`changes` or `checkpoints`).",
+          "name": "source",
+          "required": false,
+          "schema": {
+            "description": "Origin surface (`changes` or `checkpoints`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Preempt a working ACP agent via `session/cancel`, or force PTY delivery.",
+          "name": "steer",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Preempt a working ACP agent via `session/cancel`, or force PTY delivery.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Target agent (`a*`), terminal (`t*`), name, or `machine/addr`.",
+          "name": "target",
+          "required": true,
+          "schema": {
+            "description": "Target agent (`a*`), terminal (`t*`), name, or `machine/addr`.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ReviewResult"
         }
       }
     },

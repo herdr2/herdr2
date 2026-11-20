@@ -887,10 +887,38 @@ fn confirm_dialog_background_follows_the_frame_corners(cx: &mut TestAppContext) 
     let staged = Staged::new();
     let mut p = props();
     p["title"] = json!("Close space?");
-    p["command"] = json!({"name": "space.close", "args": {"id": "s1"}});
+    p["detail"] = json!("Worktree warning");
+    p["items"] = json!([
+        {
+            "address": "wsl/a2",
+            "name": "fork-one",
+            "branch": "herdr/fork-fk1",
+            "path": "/home/u/.local/state/herdr2/worktrees/forks/repo-fk1",
+            "space_name": "repo-fk1",
+            "live": true
+        },
+        {
+            "address": "wsl/a3",
+            "name": "fork-two",
+            "branch": "herdr/fork-fk2",
+            "path": "/home/u/.local/state/herdr2/worktrees/forks/repo-fk2",
+            "space_name": "repo-fk2",
+            "live": false
+        }
+    ]);
+    p["command"] = json!({"name": "agent.empty_trash", "args": {"confirmed": true}});
     let tree = describe(cx, &staged, "mods/confirm", true, p, updates("current", "current"), None).unwrap();
     let root = tree.lines().find(|l| l.contains(":id[Str(\"confirm\")]")).unwrap();
     assert!(root.contains(".rounded[Number(8.0)]"), "the dialog background must follow the frame's corners: {root}");
+    assert!(!root.contains(".size_full"), "fit-content confirm dialog must not use size_full: {root}");
+    let detail = tree.lines().find(|l| l.contains(":id[Str(\"confirm-detail\")]")).unwrap();
+    assert!(!detail.contains(".overflow_y_scrollbar"), "fit-content detail must not collapse via flex_1 scroll container: {detail}");
+    assert!(tree.contains("fork-one"), "confirm dialog must render first forked agent name: {tree}");
+    assert!(tree.contains("WT · herdr/fork-fk1"), "confirm dialog must render first branch badge: {tree}");
+    assert!(tree.contains("/home/u/.local/state/herdr2/worktrees/forks/repo-fk1"), "confirm dialog must render first path: {tree}");
+    assert!(tree.contains("fork-two"), "confirm dialog must render second forked agent name: {tree}");
+    assert!(tree.contains("WT · herdr/fork-fk2"), "confirm dialog must render second branch badge: {tree}");
+    assert!(tree.contains("/home/u/.local/state/herdr2/worktrees/forks/repo-fk2"), "confirm dialog must render second path: {tree}");
 }
 
 #[gpui::test]
@@ -3085,4 +3113,159 @@ fn side_panel_multiple_side_chats_and_handoff_dialog_render_cleanly(cx: &mut Tes
     assert!(ho_tree.contains("ho-rt-acp"), "expected ACP option in side-chat dialog: {ho_tree}");
     assert!(ho_tree.contains("ho-rt-pty"), "expected CLI Terminal option in side-chat dialog: {ho_tree}");
     assert!(!ho_tree.contains("ho-mode-merge-back"), "merge-back tab must not appear in creation dialog: {ho_tree}");
+}
+
+#[gpui::test]
+fn checkpoints_long_multiline_names_render_single_line_cleanly(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let values = fixture(true, json!({}), updates("current", "current"));
+    let tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/checkpoints",
+        values,
+        Some(r#"
+            this.targetAddr = 't3y';
+            this.context = this.viewKey();
+            this.selectedTurn = 1;
+            this.checkpoints = [
+                { turn: 0, files: [] },
+                { turn: 1, prompt: '<pasted_content id="1b85">\n[来自 t2t 的会话分叉] 请先读取完整的上下文交接文件\n[Worktree 工作区声明] 很长的中文快照标题用于验证单行截断不遮挡\n</pasted_content id="1b85">', files: [{ path: 'calc.py', added: 140, deleted: 16 }] }
+            ];
+        "#),
+    ).unwrap();
+    assert!(tree.contains("ckpt-0"), "expected T0 checkpoint row: {tree}");
+    assert!(tree.contains("ckpt-1"), "expected T1 checkpoint row: {tree}");
+    assert!(!tree.contains("pasted_content"), "pasted_content wrapper tags should be stripped from summary: {tree}");
+    assert!(
+        tree.contains("[来自 t2t 的会话分叉] 请先读取完整的上下文交接文件 [Worktree 工作区声明]"),
+        "multiline prompt should be collapsed into a single line: {tree}"
+    );
+}
+
+#[gpui::test]
+fn changes_and_checkpoints_render_diff_lines_and_inline_review_without_errors(cx: &mut TestAppContext) {
+    use gpui::VisualTestContext;
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+
+    // 1) Changes mod: verify description AND real GPUI draw() executing v_virtual_list layout pass without throwing.
+    let changes_setup = r#"
+        this.root = '/repo/demo';
+        this.on = null;
+        this.context = this.viewKey();
+        this.files = [{ path: 'src/api.rs', status: 'M', fresh: false, add: 2, del: 1 }];
+        this.open = 'src/api.rs';
+        this.setLines(['@@ -10,2 +10,3 @@', '-let old_v = 1;', '+let new_v = 2;', '+let extra = 3;']);
+        this.setDrafts([{ id: 'c1', path: 'src/api.rs', side: 'new', start_line: 10, end_line: 11, body: 'Validate range before assigning' }]);
+        this.composer = { file: 'src/api.rs', startRowIdx: 2, endRowIdx: 3, side: 'new', startLine: 10, endLine: 11, editingId: null };
+    "#;
+    let changes_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/changes",
+        fixture(true, json!({}), updates("current", "current")),
+        Some(changes_setup),
+    ).unwrap();
+    assert!(changes_tree.contains("v_virtual_list \"changes-diff\" ×5 :on_item_click"), "expected virtual list with 4 diff rows + 1 comment: {changes_tree}");
+    assert!(changes_tree.contains("chg-inline-composer"), "docked composer must render: {changes_tree}");
+    assert!(changes_tree.contains("chg-review-bar"), "review send bar must render: {changes_tree}");
+
+    // Draw real frames so GPUI executes v_virtual_list's layout renderer callback and verify zero runtime errors.
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    gpui_shell::policy::set_default(
+        Policy::new()
+            .with_storage_path(staged.0.join("store-changes-draw.json"))
+            .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+            .with_host_module(module(fixture(true, json!({}), updates("current", "current")), calls.clone()))
+            .unwrap(),
+    );
+    let rt_changes = ShellRuntime::new_isolated().unwrap();
+    let changes_wrapped = staged.wrapper("mods/changes", changes_setup);
+    let win = cx.add_window(|window, cx| RootedView(rt_changes.try_load(&changes_wrapped, window, cx).unwrap()));
+    let mut visual = VisualTestContext::from_window(win.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.run_until_parked();
+    let err = win.read_with(cx, |r, cx| {
+        r.0.read(cx)
+            .content()
+            .clone()
+            .downcast::<gpui_shell::ScriptView>()
+            .ok()
+            .and_then(|v| v.read(cx).build_error().map(str::to_owned))
+    });
+    assert_eq!(err.unwrap(), None, "changes v_virtual_list layout pass must produce zero errors");
+    visual.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+
+    // 2) Checkpoints mod: real multi-file patch diff lines + saved comment + real GPUI draw().
+    let ckpt_setup = r#"
+        this.targetAddr = 'a1';
+        this.context = this.viewKey();
+        this.selectedTurn = 2;
+        this.checkpoints = [{ turn: 0, files: [] }, { turn: 2, prompt: 'Refactor parser', files: [{ path: 'src/p.rs', added: 2, deleted: 1 }] }];
+        this.setLines(['File: src/p.rs', '@@ -1,1 +1,2 @@', '-old_fn()', '+new_fn()', '+check()']);
+        this.setDrafts([{ id: 'k1', path: 'src/p.rs', side: 'new', start_line: 1, body: 'Add unit test for check()' }]);
+    "#;
+    let ckpt_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/checkpoints",
+        fixture(true, json!({}), updates("current", "current")),
+        Some(ckpt_setup),
+    ).unwrap();
+    assert!(ckpt_tree.contains("v_virtual_list \"checkpoints-diff\" ×6 :on_item_click"), "expected virtual list with 5 diff rows + 1 comment: {ckpt_tree}");
+    assert!(ckpt_tree.contains("ckpt-review-bar"), "checkpoints review bar must render: {ckpt_tree}");
+
+    let rt_ckpt = ShellRuntime::new_isolated().unwrap();
+    let ckpt_wrapped = staged.wrapper("mods/checkpoints", ckpt_setup);
+    let win2 = cx.add_window(|window, cx| RootedView(rt_ckpt.try_load(&ckpt_wrapped, window, cx).unwrap()));
+    let mut visual2 = VisualTestContext::from_window(win2.into(), cx);
+    visual2.update(|window, cx| window.draw(cx).clear(cx));
+    visual2.run_until_parked();
+    let err2 = win2.read_with(cx, |r, cx| {
+        r.0.read(cx)
+            .content()
+            .clone()
+            .downcast::<gpui_shell::ScriptView>()
+            .ok()
+            .and_then(|v| v.read(cx).build_error().map(str::to_owned))
+    });
+    assert_eq!(err2.unwrap(), None, "checkpoints v_virtual_list layout pass must produce zero errors");
+    visual2.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+
+    // 3) Files mod: Markdown preview block annotations + shared review bar render cleanly.
+    let files_setup = r#"
+        this.repoRoot = this.root;
+        this.file = 'docs/plan.md';
+        this.selectedFile = 'docs/plan.md';
+        this.loadingFile = false;
+        this.fileError = null;
+        this.mdRenderLimit = 10;
+        this.liveText = '# Plan\n\nImplement inline comments.';
+        this.diskText = this.liveText;
+        this.doc = {
+            leading: '',
+            defs: '',
+            blocks: [
+                { raw: '# Plan', gapAfter: '\n\n', kind: 'heading', lang: '', headingLevel: 1, tasks: [] },
+                { raw: 'Implement inline comments.', gapAfter: '', kind: 'paragraph', lang: '', headingLevel: 0, tasks: [] },
+            ],
+        };
+        this.setReviewDrafts([{ id: 'f1', path: 'docs/plan.md', side: 'file', start_line: 3, body: 'Add fallback note' }]);
+        this.reviewComposer = { path: 'docs/plan.md', startLine: 3, endLine: 3, blockIndex: 1, editingId: null };
+    "#;
+    let files_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/files",
+        fixture(true, json!({}), updates("current", "current")),
+        Some(files_setup),
+    ).unwrap();
+    assert!(files_tree.contains("files-add-comment"), "files toolbar comment button must render: {files_tree}");
+    assert!(files_tree.contains("Add fallback note"), "markdown inline comment card must render: {files_tree}");
+    assert!(files_tree.contains("files-review-composer"), "markdown inline composer must render: {files_tree}");
+    assert!(files_tree.contains("files-review-bar"), "files shared review bar must render: {files_tree}");
 }

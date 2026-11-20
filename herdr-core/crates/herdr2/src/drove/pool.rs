@@ -1102,6 +1102,8 @@ async fn build_attempt_handover(
             to_turn: None,
             max_bytes: 12 * 1024,
             note: None,
+            is_zh: false,
+            worktree_origin: None,
         });
         (!pkg.markdown.trim().is_empty()).then_some(pkg.markdown)
     });

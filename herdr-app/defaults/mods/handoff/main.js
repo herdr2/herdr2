@@ -288,7 +288,7 @@ export default class Handoff extends View {
     } else {
       args.preset = this.preset;
       args.mode = this.runtimeMode;
-      args.open = this.openIn;
+      args.open = (this.mode === "fork" && this.worktree) ? "tab" : this.openIn;
       if (this.mode === "fork" && this.worktree) {
         args.worktree = true;
       }
@@ -619,7 +619,25 @@ export default class Handoff extends View {
                         .child(div().truncate().child(tr("Right Side Panel", "右侧「旁路」面板"))),
                     ),
                   )
-                  .when(this.mode !== "side-chat", (locEl) =>
+                  .when(this.mode === "fork" && this.worktree, (wtLoc) =>
+                    wtLoc.child(
+                      h_flex()
+                        .h(26)
+                        .px(9)
+                        .gap(5)
+                        .items_center()
+                        .rounded(6)
+                        .bg(withAlpha("#f59e0b", "1a") ?? t.raised)
+                        .border_1()
+                        .border_color(withAlpha("#f59e0b", "66") ?? t.border)
+                        .text_size(11.5)
+                        .font_medium()
+                        .text_color("#f59e0b")
+                        .child(svg("mods/workspace-chrome/branch.svg").size(12).flex_none().text_color("#f59e0b"))
+                        .child(div().truncate().child(tr("Worktree Space", "独立 Worktree 工作区"))),
+                    ),
+                  )
+                  .when(this.mode !== "side-chat" && !(this.mode === "fork" && this.worktree), (locEl) =>
                     locEl.child(
                       h_flex()
                         .w_full()
@@ -639,7 +657,7 @@ export default class Handoff extends View {
                 this.worktree,
                 tr("Isolated Git Worktree", "独立 Git Worktree 隔离"),
                 this.worktree
-                  ? tr("Creates a dedicated Git branch & worktree carrying uncommitted edits so the forked agent can commit freely.", "创建独立 Git 分支与 Worktree（非游离 HEAD），分叉 Agent 可自由提交代码，与主线并行互不冲突。")
+                  ? tr("Creates a dedicated Git branch & worktree from HEAD (requires a clean Git repo with at least one commit).", "基于当前 HEAD 创建独立 Git 分支与 Worktree（要求已初始化 Git、至少有一次提交且工作区干净），与主线并行互不冲突。")
                   : tr("Off (shared workspace): fast & keeps caches. Enable only when editing code in parallel.", "默认关闭（共享当前目录，秒开且复用缓存）；需要同时改代码防冲突时勾选。"),
                 () => { this.worktree = !this.worktree; },
                 "#f59e0b",

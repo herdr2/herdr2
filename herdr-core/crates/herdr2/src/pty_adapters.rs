@@ -266,13 +266,20 @@ pub fn ensure_agy_plugin_at(home: &Path, h2_exe: &str) -> Result<PathBuf, String
     Ok(dir)
 }
 
-/// Ensures `<hooks_dir>/claude-hooks.json` exists with `UserPromptSubmit` + `Stop` handlers.
+/// Ensures `<hooks_dir>/claude-hooks.json` exists with `PreToolUse`, `UserPromptSubmit`, and `Stop` handlers.
 pub fn ensure_claude_hooks_file(hooks_dir: &Path, h2_exe: &str) -> Result<PathBuf, String> {
     std::fs::create_dir_all(hooks_dir).map_err(|e| format!("failed creating {}: {e}", hooks_dir.display()))?;
     let path = hooks_dir.join("claude-hooks.json");
     let quoted = shell_quote(h2_exe);
     let payload = serde_json::to_vec_pretty(&json!({
         "hooks": {
+            "PreToolUse": [{
+                "matcher": "Read|Edit|Write|MultiEdit|NotebookEdit|Bash|Glob|Grep",
+                "hooks": [{
+                    "type": "command",
+                    "command": format!("{quoted} checkpoint hook --source claude --phase guard")
+                }]
+            }],
             "UserPromptSubmit": [{
                 "hooks": [{
                     "type": "command",

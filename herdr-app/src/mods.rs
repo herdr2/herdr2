@@ -619,6 +619,10 @@ pub fn publish_spaces(v: Value) -> bool {
 pub fn publish_agents(v: Value) -> bool {
     publish("agents", |s| (std::mem::replace(&mut s.agents, v.clone()), v))
 }
+#[cfg(test)]
+pub fn agents() -> Value {
+    SNAPSHOT.with(|s| s.borrow().agents.clone())
+}
 pub fn panes_scrolled() {
     REVISIONS.with_borrow_mut(|r| *r.entry("panes").or_default() += 1);
 }

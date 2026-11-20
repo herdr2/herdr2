@@ -980,7 +980,8 @@ const ON_A_TERMINAL: &[&str] = &[
 ];
 
 /// Methods whose `target` names the agent or terminal they act on.
-const ON_A_TARGET: &[&str] = &["checkpoint.list", "checkpoint.capture", "checkpoint.diff", "checkpoint.rollback"];
+const ON_A_TARGET: &[&str] =
+    &["agent.review", "checkpoint.list", "checkpoint.capture", "checkpoint.diff", "checkpoint.rollback"];
 
 /// Where a call goes when it isn't here.
 pub enum To {

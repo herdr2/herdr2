@@ -415,3 +415,52 @@ test("Files parses and serializes fenced code blocks safely", () => {
   const emptyFence = serializeCodeFence(fence, "", "py");
   expect(emptyFence).toBe("```py\n```");
 });
+
+import {
+  resolveRepoRelativePath,
+  selectionToLines,
+  linesToSelectionRange,
+  extractFileSnippet,
+  computeMarkdownBlockRanges,
+  mapCommentsToMarkdownBlocks,
+} from "../defaults/mods/files/review_model.js";
+
+test("Files review_model maps editor UTF-16 selections and Markdown blocks to exact 1-based lines", () => {
+  const src = "line 1\nline 2\nline 3\nline 4\nline 5";
+  // Cursor on line 2
+  expect(selectionToLines(src, { start: 8, end: 8 })).toEqual({ startLine: 2, endLine: 2 });
+  // Full-line selection ending right after newline on line 2 stays on line 2
+  expect(selectionToLines(src, { start: 7, end: 14 })).toEqual({ startLine: 2, endLine: 2 });
+  // Multi-line selection across lines 2..4
+  expect(selectionToLines(src, { start: 8, end: 23 })).toEqual({ startLine: 2, endLine: 4 });
+
+  // Inverse mapping round-trips cleanly
+  const back = linesToSelectionRange(src, 2, 4);
+  expect(src.slice(back.start, back.end)).toBe("line 2\nline 3\nline 4");
+
+  const snippet = extractFileSnippet(src, 2, 3, 1);
+  expect(snippet).toContain("  1 | line 1");
+  expect(snippet).toContain("> 2 | line 2");
+  expect(snippet).toContain("> 3 | line 3");
+  expect(snippet).toContain("  4 | line 4");
+
+  // Repo-relative path matches Changes mod when browsing a subdirectory
+  expect(resolveRepoRelativePath("/repo/apps/web", "/repo", "src/App.tsx")).toBe("apps/web/src/App.tsx");
+  expect(resolveRepoRelativePath("/repo", "/repo", "README.md")).toBe("README.md");
+
+  // Markdown block ranges & comment mapping
+  const md = "# Title\n\nFirst para line 1\nFirst para line 2\n\n```ts\nconst x = 1;\n```";
+  const doc = parseMarkdownBlocks(md);
+  const ranges = computeMarkdownBlockRanges(doc);
+  expect(ranges).toEqual([
+    { index: 0, startLine: 1, endLine: 1 },
+    { index: 1, startLine: 3, endLine: 4 },
+    { index: 2, startLine: 6, endLine: 8 },
+  ]);
+  const mapped = mapCommentsToMarkdownBlocks(ranges, [
+    { id: "c1", path: "README.md", start_line: 3, end_line: 4, body: "Clarify wording" },
+    { id: "c2", path: "README.md", start_line: 7, body: "Use let" },
+  ]);
+  expect(mapped.byBlock.get(1)?.map((c) => c.id)).toEqual(["c1"]);
+  expect(mapped.byBlock.get(2)?.map((c) => c.id)).toEqual(["c2"]);
+});

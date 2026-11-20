@@ -1,8 +1,22 @@
 // A side-by-side collapsible file browser for the focused pane's folder, with Typora-style live Markdown editing, image rendering, and IDE-themed code viewing.
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, h_resizable, resizable_panel, Editor, EditorState, Input, InputState, TextView } from "gpui-base";
-import { spaces, panes, focused, exec, readTextFile, readImageDataUrl, writeTextFile, watchFolder, theme, settings, window, layout, run, props, shared, setShared, checking, notify } from "herdr";
+import { v_flex, h_flex, h_resizable, resizable_panel, Editor, EditorState, Input, InputState, TextareaState, Textarea, Popup, TextView } from "gpui-base";
+import { spaces, panes, agents, terminals, focused, exec, readTextFile, readImageDataUrl, writeTextFile, watchFolder, theme, settings, window, layout, run, props, shared, setShared, checking, notify } from "herdr";
 import { detectFileKind, CODE_THEMES, MD_THEMES, resolveCodeTheme, resolveMdTheme, resolveRelativeFileLink, resolveRelativeAssetPath } from "./themes.js";
+import {
+  resolveRepoRelativePath,
+  selectionToLines,
+  linesToSelectionRange,
+  extractFileSnippet,
+  computeMarkdownBlockRanges,
+  mapCommentsToMarkdownBlocks,
+  resolveTargetCandidates,
+  makeDraftScopeKey,
+  readScopeDrafts,
+  writeScopeDrafts,
+  formatLineTag,
+  withAlpha,
+} from "./review_model.js";
 import {
   parseMarkdownBlocks,
   serializeMarkdownBlocks,
@@ -174,6 +188,29 @@ export default class Files extends View {
     this.remoteAttempted = new Set();
     this.remoteImageRev = 0;
     this.themeMenuOpen = false; this.copiedUntil = 0; this.saving = false;
+    this.repoRoot = null;
+    this.commentInput = TextareaState.new({
+      placeholder: tr("Add a comment for the Agent… (Ctrl/Cmd+Enter to add)", "输入给 Agent 的批注意见… (Ctrl/Cmd+Enter 添加)"),
+    });
+    this.commentInput.set_auto_grow(2, 4);
+    this.commentTyping = false;
+    this.commentInput.on("focus", (_e, cx) => { this.commentTyping = true; cx.notify(); });
+    this.commentInput.on("blur", (_e, cx) => { this.commentTyping = false; cx.notify(); });
+    this.commentInput.on("change", (_e, cx) => { cx.notify(); });
+    this.commentInput.on("submit", (e, cx) => {
+      if (e?.ctrl || e?.meta || (!e?.shift && e?.key === "enter")) {
+        this.saveReviewComposer(cx, false);
+      }
+    });
+    this.reviewComposer = null;
+    this.reviewTargetOverride = null;
+    this.reviewTargetPopupOpen = false;
+    this.reviewSteerMode = false;
+    this.reviewSendingReqId = null;
+    this.reviewSendingIds = [];
+    this.reviewError = null;
+    this.lastHandledReviewResultId = null;
+    this.hoveredMdBlock = null;
     this.handle = cx.focus_handle();
     if (!checking()) {
       try {
@@ -285,9 +322,9 @@ export default class Files extends View {
     if (next !== this.context?.key) {
       if (this.context) this.saved.set(this.context.key, { folders: this.folders, file: this.file });
       const saved = this.saved.get(next);
-      this.context = { key: next, cwd, on }; this.root = cwd; this.on = on; this.entries = new Map(); this.folders = new Set(saved?.folders);
+      this.context = { key: next, cwd, on }; this.root = cwd; this.repoRoot = null; this.on = on; this.entries = new Map(); this.folders = new Set(saved?.folders);
       this.fileCache.clear();
-      this.pending = new Set(); this.marks = {}; this.show(null); this.watched = null; this.error = null; this.limited = false;
+      this.pending = new Set(); this.marks = {}; this.reviewComposer = null; this.reviewTargetPopupOpen = false; this.reviewError = null; this.show(null); this.watched = null; this.error = null; this.limited = false;
       this.loading = false;
       if (saved?.file) this.show(saved.file, cx);
     }
@@ -312,6 +349,7 @@ export default class Files extends View {
           }
         }
         if (!this.current(context)) return;
+        this.repoRoot = top?.code === 0 ? top.stdout.trim() : null;
         this.marks = marks; this.error = null; this.watch(cwd, cx);
       } catch (e) { if (this.current(context)) this.error = String(e); }
       finally { if (this.context === context) this.loading = false; cx.notify(); }
@@ -1230,6 +1268,7 @@ export default class Files extends View {
       this.cancelMdPump();
       this.selectedFile = null;
       this.themeMenuOpen = false;
+      this.reviewComposer = null;
       this.resetFileViewState(null);
       return;
     }
@@ -1238,6 +1277,7 @@ export default class Files extends View {
       if (cx) this.expandParents(path, cx);
       return;
     }
+    this.reviewComposer = null;
     this.cancelAutoSave();
     this.flushActiveInlineToDoc();
     if (
@@ -1413,14 +1453,616 @@ export default class Files extends View {
     }
   }
 
-  rows(prefix, depth, out, t) {
+  reviewScopeRoot() {
+    return this.repoRoot || this.root || null;
+  }
+
+  reviewScopeKey() {
+    const scope = this.reviewScopeRoot();
+    return scope ? makeDraftScopeKey(this.on, scope) : null;
+  }
+
+  repoPathFor(relFile = this.file) {
+    if (!relFile) return "";
+    return resolveRepoRelativePath(this.root, this.repoRoot, relFile);
+  }
+
+  reviewDrafts() {
+    const sk = this.reviewScopeKey();
+    if (!sk) return [];
+    return readScopeDrafts(shared("diff_review.drafts"), sk);
+  }
+
+  setReviewDrafts(nextList) {
+    const sk = this.reviewScopeKey();
+    if (!sk) return;
+    const updated = writeScopeDrafts(shared("diff_review.drafts"), sk, nextList);
+    setShared("diff_review.drafts", updated);
+  }
+
+  syncLastReviewResult() {
+    const res = shared("diff_review.last_result");
+    if (!res || typeof res !== "object") return;
+    const rid = res.request_id;
+    if (!rid || rid === this.lastHandledReviewResultId) return;
+    if (this.reviewSendingReqId && rid === this.reviewSendingReqId) {
+      this.lastHandledReviewResultId = rid;
+      this.reviewSendingReqId = null;
+      if (res.ok) {
+        const sentSet = new Set(this.reviewSendingIds ?? []);
+        const remaining = this.reviewDrafts().filter((c) => !sentSet.has(c.id));
+        this.setReviewDrafts(remaining);
+        this.reviewSendingIds = [];
+        this.reviewError = null;
+      } else {
+        this.reviewSendingIds = [];
+        this.reviewError = String(res.error || tr("Failed to send review", "发送批注意见失败"));
+      }
+    }
+  }
+
+  openCommentForSelection(cx) {
+    if (!this.file || this.loadingFile || this.fileError) return;
+    const kind = detectFileKind(this.file);
+    if (kind.isImage) return;
+    const relPath = this.repoPathFor(this.file);
+    let startLine = 1;
+    let endLine = 1;
+    let blockIndex = null;
+
+    if (kind.isMarkdown && this.mdMode() === "preview") {
+      const ranges = computeMarkdownBlockRanges(this.doc);
+      const activeIdx = this.editingBlock != null ? this.editingBlock : 0;
+      const targetRange = ranges[activeIdx] ?? ranges[0] ?? { index: 0, startLine: 1, endLine: 1 };
+      startLine = targetRange.startLine;
+      endLine = targetRange.endLine;
+      blockIndex = ranges.length > 0 ? targetRange.index : null;
+    } else if (this.code) {
+      let range = { start: 0, end: 0 };
+      try { range = this.code.selected_range() ?? range; } catch {}
+      const lines = selectionToLines(this.liveText, range);
+      startLine = lines.startLine;
+      endLine = lines.endLine;
+    }
+
+    this.reviewComposer = {
+      path: relPath,
+      startLine,
+      endLine,
+      blockIndex,
+      editingId: null,
+      existingSnippet: null,
+    };
+    this.reviewError = null;
+    this.commentInput.set_value("");
+    this.commentInput.focus();
+    cx.notify();
+  }
+
+  openCommentForMarkdownBlock(blockIndex, startLine, endLine, cx) {
+    if (!this.file) return;
+    this.reviewComposer = {
+      path: this.repoPathFor(this.file),
+      startLine,
+      endLine,
+      blockIndex,
+      editingId: null,
+      existingSnippet: null,
+    };
+    this.reviewError = null;
+    this.commentInput.set_value("");
+    this.commentInput.focus();
+    cx.notify();
+  }
+
+  editReviewComment(comment, blockIndex, cx) {
+    this.reviewComposer = {
+      path: comment.path,
+      startLine: Number(comment.start_line) || 1,
+      endLine: Math.max(Number(comment.start_line) || 1, Number(comment.end_line) || Number(comment.start_line) || 1),
+      blockIndex: blockIndex ?? null,
+      editingId: comment.id,
+      existingSnippet: comment.snippet || null,
+    };
+    this.reviewError = null;
+    this.commentInput.set_value(comment.body || "");
+    this.commentInput.focus();
+    cx.notify();
+  }
+
+  deleteReviewComment(id, cx) {
+    const next = this.reviewDrafts().filter((c) => c.id !== id);
+    this.setReviewDrafts(next);
+    if (this.reviewComposer?.editingId === id) {
+      this.closeReviewComposer(cx);
+      return;
+    }
+    cx.notify();
+  }
+
+  closeReviewComposer(cx) {
+    this.reviewComposer = null;
+    this.commentTyping = false;
+    this.commentInput.set_value("");
+    this.handle.focus();
+    cx.notify();
+  }
+
+  jumpToReviewComment(comment, cx) {
+    if (!this.code || !comment) return;
+    try {
+      const range = linesToSelectionRange(this.liveText, comment.start_line, comment.end_line || comment.start_line);
+      this.code.set_selected_range(range);
+      this.code.focus();
+    } catch {}
+    cx.notify();
+  }
+
+  saveReviewComposer(cx, sendImmediately = false) {
+    if (!this.reviewComposer) return;
+    const body = String(this.commentInput.value() ?? "").trim();
+    if (!body) return;
+
+    const c = this.reviewComposer;
+    const snippet = c.editingId && c.existingSnippet
+      ? c.existingSnippet
+      : extractFileSnippet(this.liveText, c.startLine, c.endLine);
+    const item = {
+      id: c.editingId || `rc-file-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      path: c.path,
+      side: "file",
+      start_line: c.startLine,
+      end_line: c.endLine > c.startLine ? c.endLine : undefined,
+      snippet: snippet || undefined,
+      body,
+    };
+
+    const current = this.reviewDrafts();
+    const next = c.editingId
+      ? current.map((x) => (x.id === c.editingId ? item : x))
+      : [...current, item];
+    this.setReviewDrafts(next);
+    this.reviewComposer = null;
+    this.commentTyping = false;
+    this.commentInput.set_value("");
+    this.reviewError = null;
+
+    if (sendImmediately) {
+      this.sendFileReview(cx, next);
+    } else {
+      cx.notify();
+    }
+  }
+
+  reviewTargetInfo() {
+    const { candidates, defaultTarget } = resolveTargetCandidates({
+      panesList: panes(),
+      agentsList: agents(),
+      terminalsList: terminals(),
+      machine: this.on ?? null,
+      focusedInfo: focused(),
+      repoRoot: this.reviewScopeRoot(),
+      preferredAddr: this.reviewTargetOverride,
+    });
+    const chosen = candidates.find((c) => c.address === this.reviewTargetOverride) ?? candidates.find((c) => c.address === defaultTarget) ?? null;
+    return { candidates, chosen };
+  }
+
+  sendFileReview(cx, explicitList = null) {
+    if (this.reviewSendingReqId) return;
+    const list = explicitList ?? this.reviewDrafts();
+    if (!list.length) return;
+    const { chosen } = this.reviewTargetInfo();
+    if (!chosen?.address) {
+      this.reviewError = tr("No live agent or terminal on this machine", "当前机器暂无运行中的 Agent 或终端");
+      cx.notify();
+      return;
+    }
+    const reqId = `rev-file-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+    this.reviewSendingReqId = reqId;
+    this.reviewSendingIds = list.map((c) => c.id);
+    this.reviewError = null;
+    this.reviewTargetPopupOpen = false;
+    const comments = list.map((c) => ({
+      path: c.path,
+      side: c.side || "file",
+      start_line: Number(c.start_line) || 1,
+      ...(c.end_line && Number(c.end_line) > Number(c.start_line) ? { end_line: Number(c.end_line) } : {}),
+      ...(c.hunk_header ? { hunk_header: c.hunk_header } : {}),
+      ...(c.snippet ? { snippet: c.snippet } : {}),
+      body: c.body,
+    }));
+    const hasDiffItems = list.some((c) => c.side && c.side !== "file");
+    run("agent.send_review", {
+      request_id: reqId,
+      target: chosen.address,
+      source: hasDiffItems ? "changes" : "files",
+      ...(this.reviewScopeRoot() ? { repo_root: this.reviewScopeRoot() } : {}),
+      comments,
+      steer: Boolean(this.reviewSteerMode && chosen.kind === "acp" && chosen.status === "working"),
+      focus: false,
+    });
+    cx.notify();
+  }
+
+  renderReviewCommentCard(comment, blockIndex, t, clickableJump = false) {
+    const accent = t.accent ?? "#3b82f6";
+    return v_flex()
+      .id(`files-rc-${comment.id}`)
+      .w_full()
+      .p(8)
+      .gap(4)
+      .rounded(7)
+      .bg(t.raised)
+      .border_1()
+      .border_color(withAlpha(accent, "66") ?? t.border)
+      .when(clickableJump, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.jumpToReviewComment(comment, cx)))
+      .child(
+        h_flex()
+          .w_full()
+          .items_center()
+          .gap(6)
+          .child(
+            div()
+              .px(5)
+              .py(1)
+              .rounded(4)
+              .bg(withAlpha(accent, "1f") ?? t.background)
+              .text_size(10)
+              .font_semibold()
+              .text_color(accent)
+              .child(formatLineTag(comment)),
+          )
+          .child(div().flex_1())
+          .child(
+            div()
+              .id(`files-rc-edit-${comment.id}`)
+              .px(5)
+              .py(1)
+              .rounded(4)
+              .text_size(10.5)
+              .text_color(t.muted)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover).text_color(t.foreground))
+              .on_mouse_down("left", stopMouse)
+              .on_click((_e, cx) => { cx.stop_propagation(); this.editReviewComment(comment, blockIndex, cx); })
+              .child(tr("Edit", "编辑")),
+          )
+          .child(
+            div()
+              .id(`files-rc-del-${comment.id}`)
+              .px(5)
+              .py(1)
+              .rounded(4)
+              .text_size(10.5)
+              .text_color(t.ansi1)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover))
+              .on_mouse_down("left", stopMouse)
+              .on_click((_e, cx) => { cx.stop_propagation(); this.deleteReviewComment(comment.id, cx); })
+              .child(tr("Delete", "删除")),
+          ),
+      )
+      .child(
+        div()
+          .w_full()
+          .text_size(12)
+          .line_height("16px")
+          .text_color(t.foreground)
+          .whitespace_normal()
+          .child(comment.body),
+      );
+  }
+
+  renderReviewComposerCard(composer, t, inline = false) {
+    const accent = t.accent ?? "#3b82f6";
+    const hasText = Boolean(String(this.commentInput.value() ?? "").trim());
+    const rangeTag = formatLineTag({ start_line: composer.startLine, end_line: composer.endLine, side: "file" });
+
+    return v_flex()
+      .id("files-review-composer")
+      .flex_none()
+      .w_full()
+      .p(inline ? 8 : 10)
+      .gap(6)
+      .when(inline, (e) => e.rounded(8).border_1().border_color(this.commentTyping ? accent : t.border))
+      .when(!inline, (e) => e.border_t(1).border_color(this.commentTyping ? accent : t.border))
+      .bg(t.popover ?? t.raised)
+      .on_mouse_down("left", stopMouse)
+      .child(
+        h_flex()
+          .w_full()
+          .items_center()
+          .gap(6)
+          .child(
+            div()
+              .px(5)
+              .py(1)
+              .rounded(4)
+              .bg(withAlpha(accent, "22") ?? t.raised)
+              .text_size(10)
+              .font_semibold()
+              .text_color(accent)
+              .child(`${composer.path} · ${rangeTag}`),
+          )
+          .child(div().flex_1())
+          .child(
+            div()
+              .text_size(10)
+              .text_color(t.dim)
+              .child(tr("Ctrl/Cmd+Enter to add", "Ctrl/Cmd+Enter 添加")),
+          ),
+      )
+      .child(
+        div()
+          .w_full()
+          .h(54)
+          .px(8)
+          .py(4)
+          .rounded(6)
+          .bg(t.background)
+          .border_1()
+          .border_color(this.commentTyping ? accent : t.border)
+          .cursor_text()
+          .child(Textarea.new(this.commentInput).size_full().text_size(12).text_color(t.foreground)),
+      )
+      .child(
+        h_flex()
+          .w_full()
+          .items_center()
+          .gap(6)
+          .when(Boolean(composer.editingId), (e) =>
+            e.child(
+              div()
+                .id("files-rc-comp-del")
+                .px(8)
+                .py(3)
+                .rounded(5)
+                .text_size(11)
+                .text_color(t.ansi1)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover))
+                .on_click((_e, cx) => this.deleteReviewComment(composer.editingId, cx))
+                .child(tr("Delete", "删除")),
+            ),
+          )
+          .child(div().flex_1())
+          .child(
+            div()
+              .id("files-rc-comp-cancel")
+              .px(8)
+              .py(3)
+              .rounded(5)
+              .text_size(11)
+              .text_color(t.muted)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover).text_color(t.foreground))
+              .on_click((_e, cx) => this.closeReviewComposer(cx))
+              .child(tr("Cancel", "取消")),
+          )
+          .child(
+            div()
+              .id("files-rc-comp-save")
+              .px(9)
+              .py(3)
+              .rounded(5)
+              .border_1()
+              .border_color(hasText ? accent : t.border)
+              .bg(hasText ? (withAlpha(accent, "1f") ?? t.raised) : t.raised)
+              .text_size(11)
+              .text_color(hasText ? t.foreground : t.dim)
+              .when(hasText, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.saveReviewComposer(cx, false)))
+              .child(composer.editingId ? tr("Update", "更新") : tr("Add", "添加批注")),
+          )
+          .child(
+            div()
+              .id("files-rc-comp-send")
+              .px(9)
+              .py(3)
+              .rounded(5)
+              .bg(hasText && !this.reviewSendingReqId ? t.solid : t.raised)
+              .text_size(11)
+              .text_color(hasText && !this.reviewSendingReqId ? t.solid_foreground : t.dim)
+              .when(hasText && !this.reviewSendingReqId, (e) => e.cursor_pointer().on_click((_e, cx) => this.saveReviewComposer(cx, true)))
+              .child(tr("Send now", "立即回流")),
+          ),
+      );
+  }
+
+  renderReviewBar(t, allDrafts) {
+    const { candidates, chosen } = this.reviewTargetInfo();
+    const fileSet = new Set(allDrafts.map((c) => c.path));
+    const accent = t.accent ?? "#3b82f6";
+    const isWorkingAcp = Boolean(chosen && chosen.kind === "acp" && chosen.status === "working");
+    const canSend = Boolean(allDrafts.length > 0 && chosen && !this.reviewSendingReqId);
+    const statusColor = (st) => (st === "working" ? t.working : st === "blocked" ? t.blocked : st === "done" ? t.done : t.dim);
+
+    const trigger = h_flex()
+      .id("files-review-target-btn")
+      .h(26)
+      .max_w(210)
+      .px(8)
+      .gap(5)
+      .items_center()
+      .rounded(6)
+      .bg(t.background)
+      .border_1()
+      .border_color(t.border)
+      .cursor_pointer()
+      .hover((s) => s.bg(t.hover))
+      .on_mouse_down("left", stopMouse)
+      .on_click((_e, cx) => {
+        this.reviewTargetPopupOpen = !this.reviewTargetPopupOpen;
+        cx.notify();
+      })
+      .when(Boolean(chosen), (e) => e.child(div().w(6).h(6).flex_none().rounded(3).bg(statusColor(chosen.status))))
+      .child(
+        div()
+          .min_w(0)
+          .truncate()
+          .text_size(11)
+          .text_color(chosen ? t.foreground : t.dim)
+          .child(chosen ? chosen.label : tr("No live agent", "无存活 Agent")),
+      )
+      .child(div().flex_none().text_size(9).text_color(t.dim).child("▾"));
+
+    return v_flex()
+      .id("files-review-bar")
+      .flex_none()
+      .px(10)
+      .py(8)
+      .gap(6)
+      .border_t(1)
+      .border_color(withAlpha(accent, "55") ?? t.border)
+      .bg(t.raised)
+      .when(Boolean(this.reviewError), (e) =>
+        e.child(div().text_size(11).text_color(t.ansi1).whitespace_normal().child(this.reviewError)),
+      )
+      .child(
+        h_flex()
+          .w_full()
+          .gap(6)
+          .items_center()
+          .flex_wrap()
+          .child(
+            div()
+              .px(6)
+              .py(2)
+              .rounded(5)
+              .bg(withAlpha(accent, "20") ?? t.background)
+              .text_size(11)
+              .font_semibold()
+              .text_color(accent)
+              .child(
+                tr(
+                  `${allDrafts.length} comment${allDrafts.length === 1 ? "" : "s"} · ${fileSet.size} file${fileSet.size === 1 ? "" : "s"}`,
+                  `${allDrafts.length} 条批注 · ${fileSet.size} 个文件`,
+                ),
+              ),
+          )
+          .child(
+            div()
+              .id("files-review-clear")
+              .px(6)
+              .py(2)
+              .rounded(5)
+              .text_size(11)
+              .text_color(t.muted)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover).text_color(t.foreground))
+              .on_click((_e, cx) => {
+                this.setReviewDrafts([]);
+                this.reviewError = null;
+                cx.notify();
+              })
+              .child(tr("Clear", "清空")),
+          )
+          .child(div().flex_1())
+          .child(
+            Popup.new("files-review-target-popup", trigger)
+              .anchor("top_left")
+              .when(this.reviewTargetPopupOpen, (el) =>
+                el.content(
+                  v_flex()
+                    .w(240)
+                    .max_h(220)
+                    .p(4)
+                    .gap(2)
+                    .rounded(8)
+                    .bg(t.popover ?? t.background)
+                    .border_1()
+                    .border_color(t.border)
+                    .overflow_y_scroll()
+                    .on_mouse_down("left", stopMouse)
+                    .children(
+                      candidates.length
+                        ? candidates.map((c) => {
+                            const active = chosen?.address === c.address;
+                            return h_flex()
+                              .id(`files-target-${c.address}`)
+                              .h(26)
+                              .px(8)
+                              .gap(6)
+                              .items_center()
+                              .rounded(6)
+                              .cursor_pointer()
+                              .when(active, (x) => x.bg(t.selected))
+                              .hover((s) => s.bg(t.hover))
+                              .on_click((_e, cx) => {
+                                this.reviewTargetOverride = c.address;
+                                this.reviewTargetPopupOpen = false;
+                                cx.notify();
+                              })
+                              .child(div().w(6).h(6).flex_none().rounded(3).bg(statusColor(c.status)))
+                              .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.foreground).child(c.label))
+                              .child(
+                                div()
+                                  .flex_none()
+                                  .px(4)
+                                  .py(1)
+                                  .rounded(4)
+                                  .bg(t.raised)
+                                  .text_size(9.5)
+                                  .text_color(t.dim)
+                                  .child(c.kind === "acp" ? "ACP" : "CLI"),
+                              );
+                          })
+                        : [div().p(8).text_size(11).text_color(t.dim).child(tr("No live sessions", "暂无存活会话"))],
+                    ),
+                ),
+              ),
+          )
+          .when(isWorkingAcp, (e) =>
+            e.child(
+              div()
+                .id("files-review-steer")
+                .h(26)
+                .px(7)
+                .flex()
+                .items_center()
+                .rounded(6)
+                .border_1()
+                .border_color(this.reviewSteerMode ? t.blocked : t.border)
+                .bg(this.reviewSteerMode ? (withAlpha(t.blocked, "22") ?? t.background) : t.background)
+                .text_size(10.5)
+                .text_color(this.reviewSteerMode ? t.blocked : t.muted)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover))
+                .on_click((_e, cx) => {
+                  this.reviewSteerMode = !this.reviewSteerMode;
+                  cx.notify();
+                })
+                .child(this.reviewSteerMode ? tr("Steer", "抢占") : tr("Queue", "排队")),
+            ),
+          )
+          .child(
+            div()
+              .id("files-review-send")
+              .h(26)
+              .px(11)
+              .flex()
+              .items_center()
+              .rounded(6)
+              .bg(canSend ? t.solid : t.background)
+              .text_size(11.5)
+              .font_medium()
+              .text_color(canSend ? t.solid_foreground : t.dim)
+              .when(canSend, (e) => e.cursor_pointer().on_click((_e, cx) => this.sendFileReview(cx)))
+              .child(this.reviewSendingReqId ? tr("Sending…", "发送中…") : tr("Send to Agent", "回流给 Agent")),
+          ),
+      );
+  }
+
+  rows(prefix, depth, out, t, commentCountByPath = null) {
     if (out.length >= TOTAL || depth > 40) return out;
+    const accent = t.accent ?? "#3b82f6";
     for (const entry of this.entries.get(prefix) ?? []) {
       if (out.length >= TOTAL) break;
       const path = prefix ? `${prefix}/${entry.name}` : entry.name;
       const open = this.folders.has(path);
       const selected = !entry.dir && (this.selectedFile ?? this.file) === path;
       const mark = this.marks[`${this.root}/${path}`];
+      const cCount = !entry.dir && commentCountByPath ? (commentCountByPath.get(this.repoPathFor(path)) ?? 0) : 0;
       out.push(h_flex().id(`file-${path}`).h(26).flex_none().pl(6 + depth * 15).pr(6).gap(6).items_center().rounded(6).cursor_pointer()
         .bg(selected ? (t.selected ?? t.raised) : "#00000000")
         .hover(s => s.bg(selected ? (t.selected ?? t.raised) : t.hover))
@@ -1428,8 +2070,9 @@ export default class Files extends View {
         .child(entry.dir ? svg(`mods/files/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim) : div().w(12).flex_none())
         .child(svg(`mods/files/${entry.dir ? "folder" : "file"}.svg`).size(13).flex_none().text_color(selected ? t.foreground : t.muted))
         .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(selected ? t.foreground : t.muted).child(entry.name))
+        .when(cCount > 0, el => el.child(div().px(4).py(1).rounded(4).bg(withAlpha(accent, "22") ?? t.raised).text_size(9.5).font_semibold().text_color(accent).child(String(cCount))))
         .when(Boolean(mark), el => el.child(div().text_size(10.5).text_color(mark === "A" ? t.ansi2 : mark === "D" || mark === "U" ? t.ansi1 : t.blocked).child(mark))));
-      if (entry.dir && open) this.rows(path, depth + 1, out, t);
+      if (entry.dir && open) this.rows(path, depth + 1, out, t, commentCountByPath);
     }
     return out;
   }
@@ -1605,6 +2248,15 @@ export default class Files extends View {
               .child(div().text_size(11).text_color(t.foreground).child(themeLabel))
               .child(div().text_size(10).text_color(t.dim).child("▾"))
           ))
+          .when(!kind.isImage && !this.loadingFile && !this.fileError, el =>
+            el.child(this.pillButton(
+              "files-add-comment",
+              tr("+ Comment", "+ 批注"),
+              Boolean(this.reviewComposer && this.reviewComposer.path === this.repoPathFor(this.file)),
+              t,
+              (_e, cx) => this.openCommentForSelection(cx),
+            ))
+          )
           .when(!kind.isImage && !this.loadingFile && !this.fileError, el =>
             el.child(this.pillButton("files-copy", copied ? tr("Copied", "已复制") : tr("Copy", "复制"), copied, t, (_e, cx) => {
               try { cx.write_to_clipboard(this.liveText); } catch {}
@@ -2005,13 +2657,77 @@ export default class Files extends View {
     const monoFont = settings()?.font_family;
 
     const limit = Math.min(blocks.length, this.mdRenderLimit ?? blocks.length);
+    const repoPath = this.repoPathFor(this.file);
+    const openFileComments = this.reviewDrafts().filter((c) => c.path === repoPath);
+    const blockRanges = computeMarkdownBlockRanges(this.doc);
+    const { byBlock: commentsByBlock, unmatched: unmatchedComments } = mapCommentsToMarkdownBlocks(blockRanges, openFileComments);
+    const accent = t.accent ?? "#3b82f6";
+
+    const pushBlockWithAnnotations = (idx, el) => {
+      const range = blockRanges[idx] ?? { startLine: 1, endLine: 1 };
+      const blockComments = commentsByBlock.get(idx) ?? [];
+      const composerHere = Boolean(this.reviewComposer && this.reviewComposer.path === repoPath && this.reviewComposer.blockIndex === idx);
+      const isHovered = this.hoveredMdBlock === idx;
+      const showBtn = isHovered || composerHere || blockComments.length > 0;
+      const lineLabel = range.endLine > range.startLine ? `L${range.startLine}–L${range.endLine}` : `L${range.startLine}`;
+
+      items.push(
+        v_flex()
+          .id(`files-md-wrap-${idx}`)
+          .w_full()
+          .min_w(0)
+          .relative()
+          .on_hover((hovered, cx) => {
+            if (hovered && this.hoveredMdBlock !== idx) { this.hoveredMdBlock = idx; cx.notify(); }
+            else if (!hovered && this.hoveredMdBlock === idx) { this.hoveredMdBlock = null; cx.notify(); }
+          })
+          .child(el)
+          .when(showBtn && this.editingBlock !== idx, (wrap) =>
+            wrap.child(
+              h_flex()
+                .id(`files-md-cmt-btn-${idx}`)
+                .absolute()
+                .top(2)
+                .right(4)
+                .px(6)
+                .py(1)
+                .gap(4)
+                .items_center()
+                .rounded(5)
+                .bg(composerHere ? (withAlpha(accent, "24") ?? t.selected) : (t.popover ?? t.raised))
+                .border_1()
+                .border_color(composerHere || blockComments.length > 0 ? accent : t.border)
+                .text_size(10)
+                .text_color(composerHere || blockComments.length > 0 ? accent : t.muted)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                .on_mouse_down("left", stopMouse)
+                .on_click((_e, cx) => {
+                  cx.stop_propagation();
+                  this.openCommentForMarkdownBlock(idx, range.startLine, range.endLine, cx);
+                })
+                .child(blockComments.length > 0 ? tr(`+${blockComments.length} · ${lineLabel}`, `+ 批注 (${blockComments.length})`) : tr(`+ Comment`, `+ 批注`)),
+            ),
+          ),
+      );
+
+      for (const comment of blockComments) {
+        if (this.reviewComposer?.editingId === comment.id) continue;
+        items.push(div().w_full().px(8).py(2).child(this.renderReviewCommentCard(comment, idx, t, false)));
+      }
+      if (composerHere) {
+        items.push(div().w_full().px(8).py(3).child(this.renderReviewComposerCard(this.reviewComposer, t, true)));
+      }
+    };
+
     const items = [];
     for (let i = 0; i < limit; i++) {
       const block = blocks[i];
       if (this.editingBlock === i && this.editingMode === "block" && this.blockEditor) {
         const typo = blockTypography(block, this.sansFont, monoFont);
         const editorHeight = Math.max(typo.lineHeight + 8, Math.min(540, this.blockEditorRows * typo.lineHeight + 8));
-        items.push(
+        pushBlockWithAnnotations(
+          i,
           v_flex()
             .id("files-md-block-editor")
             .w_full()
@@ -2058,7 +2774,7 @@ export default class Files extends View {
       if (block.kind === "table") {
         const table = this.getBlockTable(block);
         if (table) {
-          items.push(this.renderTableBlock(i, block, table, t, mdTheme, textViewOptions, blockHover, editable));
+          pushBlockWithAnnotations(i, this.renderTableBlock(i, block, table, t, mdTheme, textViewOptions, blockHover, editable));
           continue;
         }
       }
@@ -2066,7 +2782,7 @@ export default class Files extends View {
       if (block.kind === "code") {
         const fence = this.getBlockFence(block);
         if (fence) {
-          items.push(this.renderCodeFenceBlock(i, block, fence, t, mdTheme, textViewOptions, blockHover, editable));
+          pushBlockWithAnnotations(i, this.renderCodeFenceBlock(i, block, fence, t, mdTheme, textViewOptions, blockHover, editable));
           continue;
         }
       }
@@ -2140,7 +2856,15 @@ export default class Files extends View {
               ))
           )
         );
-      items.push(blockEl);
+      pushBlockWithAnnotations(i, blockEl);
+    }
+
+    for (const comment of unmatchedComments) {
+      if (this.reviewComposer?.editingId === comment.id) continue;
+      items.push(div().w_full().px(8).py(2).child(this.renderReviewCommentCard(comment, null, t, false)));
+    }
+    if (this.reviewComposer && this.reviewComposer.path === repoPath && this.reviewComposer.blockIndex == null) {
+      items.push(div().w_full().px(8).py(3).child(this.renderReviewComposerCard(this.reviewComposer, t, true)));
     }
 
     return v_flex()
@@ -2222,18 +2946,52 @@ export default class Files extends View {
       return this.renderMarkdownPreview(t, mdTheme);
     }
 
-    return div()
+    const repoPath = this.repoPathFor(this.file);
+    const openComments = this.reviewDrafts().filter((c) => c.path === repoPath);
+    const activeDockedComposer = this.reviewComposer && this.reviewComposer.path === repoPath ? this.reviewComposer : null;
+
+    return v_flex()
       .id("files-code-view")
       .flex_1()
       .min_h(0)
       .overflow_hidden()
       .bg(codeTheme.colors.background)
-      .child(this.code ? Editor.new(this.code).size_full().bg(codeTheme.colors.background) : div().p(12).text_color(t.dim).child(tr("Preparing editor…", "正在准备编辑器…")));
+      .child(
+        div()
+          .flex_1()
+          .min_h(0)
+          .overflow_hidden()
+          .child(this.code ? Editor.new(this.code).size_full().bg(codeTheme.colors.background) : div().p(12).text_color(t.dim).child(tr("Preparing editor…", "正在准备编辑器…"))),
+      )
+      .when(openComments.length > 0, (el) =>
+        el.child(
+          v_flex()
+            .id("files-code-comments")
+            .flex_none()
+            .max_h(136)
+            .overflow_y_scrollbar()
+            .p(8)
+            .gap(6)
+            .bg(t.surface ?? t.background)
+            .border_t(1)
+            .border_color(t.border)
+            .children(openComments.map((comment) => this.renderReviewCommentCard(comment, null, t, true))),
+        ),
+      )
+      .when(Boolean(activeDockedComposer), (el) =>
+        el.child(this.renderReviewComposerCard(activeDockedComposer, t, false)),
+      );
   }
 
   render(cx) {
     if (key() !== this.context?.key) this.refresh(cx);
+    this.syncLastReviewResult();
     const t = theme();
+    const allDrafts = this.reviewDrafts();
+    const commentCountByPath = new Map();
+    for (const d of allDrafts) {
+      commentCountByPath.set(d.path, (commentCountByPath.get(d.path) ?? 0) + 1);
+    }
     const kind = this.file ? detectFileKind(this.file) : null;
     const mdMode = this.mdMode();
     if (this.file && !this.fileError && !this.loadingFile && !kind.isImage && (!kind.isMarkdown || mdMode === "code")) {
@@ -2287,7 +3045,7 @@ export default class Files extends View {
           .min_h(0)
           .overflow_y_scrollbar()
           .p(6)
-          .children(this.rows("", 0, [], t))
+          .children(this.rows("", 0, [], t, commentCountByPath))
           .when(Boolean(this.error) || !this.entries.get("")?.length, el => el.child(div().p(8).text_size(12).text_color(t.dim).child(this.error || (this.loading ? tr("Loading files…", "正在加载文件…") : this.root ? tr("No files", "暂无文件") : tr("No folder", "无工作目录")))))
           .when(this.limited, el => el.child(div().p(8).text_size(11).text_color(t.dim).child(tr("File list limited to 500 entries per folder and 5,000 total", "文件列表限制为每目录最多 500 项，总计 5,000 项"))))
       ) : null;
@@ -2300,16 +3058,23 @@ export default class Files extends View {
           .child(this.renderToolbar(t, kind, mdMode, treeOpen))
           .when(this.themeMenuOpen && !kind.isImage, panel => panel.child(this.renderThemePicker(t, kind, mdMode)))
           .child(this.renderFileBody(t, kind, mdMode))
+          .when(allDrafts.length > 0 || Boolean(this.reviewError), panel => panel.child(this.renderReviewBar(t, allDrafts)))
       : v_flex()
           .size_full()
           .min_w(0)
           .min_h(0)
-          .items_center()
-          .justify_center()
-          .p(20)
-          .text_size(12.5)
-          .text_color(t.dim)
-          .child(tr("Select a file from the directory on the right to view or edit", "从右侧目录选择文件以预览或编辑"));
+          .child(
+            v_flex()
+              .flex_1()
+              .min_h(0)
+              .items_center()
+              .justify_center()
+              .p(20)
+              .text_size(12.5)
+              .text_color(t.dim)
+              .child(tr("Select a file from the directory on the right to view or edit", "从右侧目录选择文件以预览或编辑")),
+          )
+          .when(allDrafts.length > 0 || Boolean(this.reviewError), panel => panel.child(this.renderReviewBar(t, allDrafts)));
 
     return v_flex()
       .id("files")
@@ -2327,6 +3092,18 @@ export default class Files extends View {
         if ((e.keystroke === "cmd-s" || e.keystroke === "ctrl-s") && this.file && !detectFileKind(this.file).isImage && !this.truncated) {
           cx.stop_propagation();
           this.saveFile(cx);
+        } else if ((e.keystroke === "cmd-shift-m" || e.keystroke === "ctrl-shift-m") && this.file && !detectFileKind(this.file).isImage) {
+          cx.stop_propagation();
+          this.openCommentForSelection(cx);
+        } else if (e.key === "escape") {
+          if (this.reviewTargetPopupOpen) {
+            this.reviewTargetPopupOpen = false;
+            cx.stop_propagation();
+            cx.notify();
+          } else if (this.reviewComposer) {
+            this.closeReviewComposer(cx);
+            cx.stop_propagation();
+          }
         }
       })
       .child(

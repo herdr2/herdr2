@@ -135,6 +135,7 @@ Close a pane and end its terminal.
 | Argument | Required |
 |---|---|
 | `pane` | no |
+| `confirmed` | no |
 
 ## `pane.detach`
 
@@ -413,6 +414,7 @@ Move an agent (default: the focused or selected agent) to the recycle bin, closi
 | Argument | Required |
 |---|---|
 | `terminal` | no |
+| `confirmed` | no |
 
 ## `agent.restore`
 
@@ -429,12 +431,15 @@ Permanently delete an agent from the recycle bin and end its session.
 | Argument | Required |
 |---|---|
 | `terminal` | yes |
+| `confirmed` | no |
 
 ## `agent.empty_trash`
 
 Permanently delete all agents in the recycle bin.
 
-No arguments.
+| Argument | Required |
+|---|---|
+| `confirmed` | no |
 
 ## `agent.status`
 
@@ -468,6 +473,22 @@ Hand off, fork (optionally in an isolated git worktree), open a floating side-ch
 | `archive_source` | no |
 | `close_overlay` | no |
 | `open` | no |
+
+## `agent.send_review`
+
+Send structured line-level diff review comments to a live ACP agent or PTY terminal (default target: focused or active session).
+
+| Argument | Required |
+|---|---|
+| `target` | no |
+| `comments` | yes |
+| `source` | no |
+| `checkpoint_turn` | no |
+| `repo_root` | no |
+| `note` | no |
+| `steer` | no |
+| `focus` | no |
+| `request_id` | no |
 
 ## `agent.next`
 

@@ -51,8 +51,13 @@ pub(super) async fn agent_handoff(core: Ctx<'_>, p: HandoffParams) -> Result<Han
         let origin_bg = origin_cwd.clone();
         let tag = crate::drove::crypto::rand_id("fk");
         let (wt_path, wt_branch) = blocking(move || {
-            crate::drove::integrate::create_fork_worktree(&state_dir, &origin_bg, &tag)
-                .map_err(RpcError::invalid_params)
+            crate::drove::integrate::create_fork_worktree(&state_dir, &origin_bg, &tag).map_err(|msg| {
+                if msg.starts_with("WORKTREE_BLOCKED:") {
+                    RpcError::new("worktree_blocked", msg, "")
+                } else {
+                    RpcError::invalid_params(msg)
+                }
+            })
         })
         .await?;
         cwd = wt_path.clone();
@@ -60,6 +65,7 @@ pub(super) async fn agent_handoff(core: Ctx<'_>, p: HandoffParams) -> Result<Han
     }
 
     let cwd_for_pkg = cwd.clone();
+    let wt_origin_for_pkg = created_worktree.as_ref().map(|(orig, _, _)| orig.clone());
     let entries_for_pkg = src.entries.clone();
     let kind = p.kind;
     let src_addr_pkg = src.address.clone();
@@ -69,6 +75,10 @@ pub(super) async fn agent_handoff(core: Ctx<'_>, p: HandoffParams) -> Result<Han
     let from_turn = p.from_turn;
     let to_turn = p.to_turn;
     let note_pkg = p.note.clone();
+    let is_zh = p
+        .language
+        .as_deref()
+        .is_some_and(|l| l.trim().to_ascii_lowercase().starts_with("zh"));
 
     let pkg = blocking(move || {
         Ok(build_handoff_package(&HandoffBuildInput {
@@ -83,6 +93,8 @@ pub(super) async fn agent_handoff(core: Ctx<'_>, p: HandoffParams) -> Result<Han
             to_turn,
             max_bytes: DEFAULT_HANDOFF_MAX_BYTES,
             note: note_pkg.as_deref(),
+            is_zh,
+            worktree_origin: wt_origin_for_pkg.as_deref(),
         }))
     })
     .await?;
@@ -253,26 +265,51 @@ async fn handoff_into_existing(
             summary.branch.clone()
         };
 
-        let mut msg = format!(
-            "[Merge Worktree from {}] Please merge the code changes from this forked worktree into the current main branch/workspace (`{}`):\n- Fork branch: `{}`\n- Fork worktree path: `{}`",
-            src.address, origin_cwd, branch_display, wt_path
-        );
+        let is_zh = p
+            .language
+            .as_deref()
+            .is_some_and(|l| l.trim().to_ascii_lowercase().starts_with("zh"));
+        let mut msg = if is_zh {
+            format!(
+                "[合回来自 {} 的 Worktree] 请将该分叉 Worktree 中的代码改动合并到当前主分支/工作区（`{}`）：\n- 分叉分支：`{}`\n- 分叉 Worktree 路径：`{}`",
+                src.address, origin_cwd, branch_display, wt_path
+            )
+        } else {
+            format!(
+                "[Merge Worktree from {}] Please merge the code changes from this forked worktree into the current main branch/workspace (`{}`):\n- Fork branch: `{}`\n- Fork worktree path: `{}`",
+                src.address, origin_cwd, branch_display, wt_path
+            )
+        };
         if !summary.ahead_commits.is_empty() {
-            msg.push_str("\n- Commits on fork branch:\n");
+            msg.push_str(if is_zh { "\n- 分叉分支上的提交：\n" } else { "\n- Commits on fork branch:\n" });
             for c in &summary.ahead_commits {
                 msg.push_str(&format!("  - {c}\n"));
             }
         }
         if !summary.dirty_files.is_empty() {
-            msg.push_str("\n- Uncommitted changes inside the fork worktree:\n");
+            msg.push_str(if is_zh {
+                "\n- 分叉 Worktree 中的未提交改动：\n"
+            } else {
+                "\n- Uncommitted changes inside the fork worktree:\n"
+            });
             for f in &summary.dirty_files {
                 msg.push_str(&format!("  - {f}\n"));
             }
-            msg.push_str("  (Note: include these uncommitted changes from the fork worktree when merging, e.g. by committing or applying them from that worktree.)");
+            msg.push_str(if is_zh {
+                "  （注意：合并时请一并包含该 Worktree 中的这些未提交改动。）"
+            } else {
+                "  (Note: include these uncommitted changes from the fork worktree when merging, e.g. by committing or applying them from that worktree.)"
+            });
         }
-        msg.push_str(&format!(
-            "\n- IMPORTANT: ONLY merge the code changes into the main branch/workspace. Do NOT delete or remove the worktree directory (`{wt_path}`) and do NOT delete the `{branch_display}` branch."
-        ));
+        msg.push_str(&if is_zh {
+            format!(
+                "\n- 重要：请仅将代码改动合并到主分支/工作区，不要删除 Worktree 目录（`{wt_path}`），也不要删除 `{branch_display}` 分支。"
+            )
+        } else {
+            format!(
+                "\n- IMPORTANT: ONLY merge the code changes into the main branch/workspace. Do NOT delete or remove the worktree directory (`{wt_path}`) and do NOT delete the `{branch_display}` branch."
+            )
+        });
 
         merge_instruction = msg;
         merged_wt_path = Some(wt_path.to_string());
@@ -349,11 +386,23 @@ async fn handoff_into_existing(
                 }
             } else {
                 clean_prompt.unwrap_or_else(|| {
-                    format!(
-                        "[{} from {}] Please review and incorporate the incoming handoff context above, then summarize key takeaways or next steps.",
-                        p.kind.display_label(),
-                        src.address
-                    )
+                    let is_zh = p
+                        .language
+                        .as_deref()
+                        .is_some_and(|l| l.trim().to_ascii_lowercase().starts_with("zh"));
+                    if is_zh {
+                        format!(
+                            "[来自 {} 的{}] 请阅读并吸收上述合回的上下文与结论，总结关键要点或下一步建议。",
+                            src.address,
+                            p.kind.display_label_zh()
+                        )
+                    } else {
+                        format!(
+                            "[{} from {}] Please review and incorporate the incoming handoff context above, then summarize key takeaways or next steps.",
+                            p.kind.display_label(),
+                            src.address
+                        )
+                    }
                 })
             };
             let sent = agent_send(
@@ -401,12 +450,25 @@ async fn handoff_into_existing(
                 )?;
             let path_str = staged_path.display().to_string();
 
-            let mut pointer = format!(
-                "[{} from {}] Context handoff saved at: {}",
-                p.kind.display_label(),
-                src.address,
-                path_str
-            );
+            let is_zh = p
+                .language
+                .as_deref()
+                .is_some_and(|l| l.trim().to_ascii_lowercase().starts_with("zh"));
+            let mut pointer = if is_zh {
+                format!(
+                    "[来自 {} 的{}] 上下文交接文件已保存至：{}",
+                    src.address,
+                    p.kind.display_label_zh(),
+                    path_str
+                )
+            } else {
+                format!(
+                    "[{} from {}] Context handoff saved at: {}",
+                    p.kind.display_label(),
+                    src.address,
+                    path_str
+                )
+            };
             if !merge_instruction.is_empty() {
                 pointer.push('\n');
                 pointer.push_str(&merge_instruction);
@@ -417,6 +479,8 @@ async fn handoff_into_existing(
             } else if let Some(prompt_text) = clean_prompt {
                 pointer.push('\n');
                 pointer.push_str(&prompt_text);
+            } else if is_zh {
+                pointer.push_str("\n请先读取该文件了解合回的上下文内容后再继续。");
             } else {
                 pointer.push_str("\nRead that file for the incoming context package before continuing.");
             }
@@ -541,6 +605,15 @@ async fn handoff_to_new_pty(
         core.active_viewer_display(&st, src_id)
     });
 
+    let mut env = BTreeMap::new();
+    if let (Some(wt_path), Some(wt_origin)) = (
+        lineage.worktree_path.as_deref().filter(|s| !s.trim().is_empty()),
+        lineage.worktree_origin.as_deref().filter(|s| !s.trim().is_empty()),
+    ) {
+        env.insert("H2_WORKTREE_PATH".into(), wt_path.to_string());
+        env.insert("H2_WORKTREE_ORIGIN".into(), wt_origin.to_string());
+    }
+
     let term_res = pty::terminal_run(
         core,
         TerminalRunParams {
@@ -548,6 +621,7 @@ async fn handoff_to_new_pty(
             cwd: Some(cwd.to_string()),
             name: p.name.clone(),
             keep: p.keep,
+            env,
             parent: (p.kind == LineageKind::SideChat).then(|| src.address.clone()),
             caller: p.caller.clone(),
             size: Some(InitialSize {
@@ -594,19 +668,42 @@ async fn handoff_to_new_pty(
         }
         core.flush_saved().await?;
 
-        let mut pointer = format!(
-            "[{} from {}] Read the full context handoff at: {}",
-            p.kind.display_label(),
-            src.address,
-            path_str
-        );
+        let is_zh = p
+            .language
+            .as_deref()
+            .is_some_and(|l| l.trim().to_ascii_lowercase().starts_with("zh"));
+        let mut pointer = if is_zh {
+            format!(
+                "[来自 {} 的{}] 请先读取完整的上下文交接文件：{}",
+                src.address,
+                p.kind.display_label_zh(),
+                path_str
+            )
+        } else {
+            format!(
+                "[{} from {}] Read the full context handoff at: {}",
+                p.kind.display_label(),
+                src.address,
+                path_str
+            )
+        };
         if let Some(prompt_text) = clean_prompt {
             pointer.push('\n');
             pointer.push_str(&prompt_text);
         } else if p.kind == LineageKind::SideChat {
-            pointer.push_str("\nRead that file first to absorb the context ONLY. Do NOT make any modifications, edit files, or run mutating commands on this turn — briefly confirm you have read the context and wait for the user's next instruction. (This is a read-only side-chat discussion: do NOT modify workspace files unless explicitly requested.)");
+            if is_zh {
+                pointer.push_str("\n请先读取该文件以消化上下文。本轮仅读取交接上下文，不要做任何文件修改或执行变更类命令，简短确认已理解后等待用户的下一步提问。（当前为只读旁路讨论，除非明确要求，否则不要修改工作区文件。）");
+            } else {
+                pointer.push_str("\nRead that file first to absorb the context ONLY. Do NOT make any modifications, edit files, or run mutating commands on this turn — briefly confirm you have read the context and wait for the user's next instruction. (This is a read-only side-chat discussion: do NOT modify workspace files unless explicitly requested.)");
+            }
+        } else if is_zh {
+            pointer.push_str("\n请先读取该文件以消化交接上下文。本轮仅读取交接的上下文，不要做任何修改、不要编辑文件或执行变更类命令，简短确认已理解后等待用户的下一步指令。");
         } else {
             pointer.push_str("\nRead that file first to absorb the handoff context ONLY. Do NOT make any modifications, edit files, or run mutating commands on this turn — briefly confirm you have understood the context and wait for the user's next instruction.");
+        }
+        if let Some(wt_notice) = worktree_workspace_notice(lineage, is_zh) {
+            pointer.push('\n');
+            pointer.push_str(&wt_notice);
         }
         initial_msg = Some(pointer);
     }
@@ -656,6 +753,34 @@ async fn handoff_to_new_pty(
     })
 }
 
+fn worktree_workspace_notice(lineage: &Lineage, is_zh: bool) -> Option<String> {
+    let wt_path = lineage.worktree_path.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+    let wt_origin = lineage.worktree_origin.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+    let branch_suffix_zh = lineage
+        .worktree_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|b| format!("（分支 `{b}`）"))
+        .unwrap_or_default();
+    let branch_suffix_en = lineage
+        .worktree_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|b| format!(" (branch `{b}`)"))
+        .unwrap_or_default();
+    Some(if is_zh {
+        format!(
+            "[Worktree 工作区声明] 当前你的工作区位于独立的 Git Worktree 目录 `{wt_path}`{branch_suffix_zh}，而不是父 Agent 所在的原目录 `{wt_origin}`。后续所有代码读取、修改、测试与命令都必须严格限定在 `{wt_path}` 中执行，严禁访问或修改父工作区 `{wt_origin}`。"
+        )
+    } else {
+        format!(
+            "[Worktree Workspace] Your workspace is an isolated Git worktree at `{wt_path}`{branch_suffix_en}, NOT the parent agent's directory `{wt_origin}`. All subsequent file reads, edits, tests, and commands MUST stay strictly inside `{wt_path}`; NEVER access or modify `{wt_origin}`."
+        )
+    })
+}
+
 async fn handoff_to_new_acp(
     core: Ctx<'_>,
     p: &HandoffParams,
@@ -679,6 +804,20 @@ async fn handoff_to_new_acp(
 
     let clean_prompt = p.prompt.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     let keep = p.keep || clean_prompt.is_none();
+    let is_zh = p
+        .language
+        .as_deref()
+        .is_some_and(|l| l.trim().to_ascii_lowercase().starts_with("zh"));
+
+    let mut env = BTreeMap::new();
+    if let (Some(wt_path), Some(wt_origin)) = (
+        lineage.worktree_path.as_deref().filter(|s| !s.trim().is_empty()),
+        lineage.worktree_origin.as_deref().filter(|s| !s.trim().is_empty()),
+    ) {
+        env.insert("H2_WORKTREE_PATH".into(), wt_path.to_string());
+        env.insert("H2_WORKTREE_ORIGIN".into(), wt_origin.to_string());
+    }
+    let system_prompt = worktree_workspace_notice(lineage, is_zh);
 
     let run_res = run::agent_run(
         core,
@@ -686,10 +825,12 @@ async fn handoff_to_new_acp(
             agent: target_agent,
             argv: target_argv,
             prompt: None,
+            system_prompt,
             cwd: Some(cwd.to_string()),
             name: p.name.clone(),
             model: p.model.clone(),
             keep,
+            env,
             parent: (p.kind == LineageKind::SideChat).then(|| src.address.clone()),
             caller: p.caller.clone(),
             wait: false,
@@ -727,26 +868,60 @@ async fn handoff_to_new_acp(
     }
     core.flush_saved().await?;
 
-    let mut prompt_sent = false;
-    let mut wait_res = None;
-    if let Some(prompt_text) = clean_prompt {
-        let sent = agent_send(
-            core,
-            SendParams {
-                agent: new_addr.clone(),
-                text: prompt_text,
-                steer: false,
-                only_if: None,
-                wait: p.wait,
-                timeout: p.timeout,
-                from: None,
-                caller: p.caller.clone(),
-            },
-        )
-        .await?;
-        prompt_sent = sent.started != Some(false);
-        wait_res = sent.wait;
-    }
+    let prompt_text = clean_prompt.unwrap_or_else(|| {
+        let mut msg = match p.kind {
+            LineageKind::SideChat => {
+                if is_zh {
+                    format!(
+                        "[来自 {} 的旁路讨论] 请先阅读并消化上述携带的交接上下文。本轮仅读取交接的上下文，不要做任何文件修改或执行变更类命令，简短确认已理解后等待用户的下一步提问。（当前为只读旁路讨论，除非明确要求，否则不要修改工作区文件。）",
+                        src.address
+                    )
+                } else {
+                    format!(
+                        "[Side Chat from {}] Please read and absorb the incoming handoff context above ONLY. Do NOT make any modifications, edit files, or run mutating commands on this turn — briefly confirm you have understood the context and wait for the user's next question. (This is a read-only side-chat discussion: do NOT modify workspace files unless explicitly requested.)",
+                        src.address
+                    )
+                }
+            }
+            LineageKind::Handoff | LineageKind::Fork => {
+                if is_zh {
+                    format!(
+                        "[来自 {} 的{}] 请先阅读并消化上述携带的交接上下文。本轮仅读取交接的上下文，不要做任何修改、不要编辑文件或执行变更类命令，简短确认已理解后等待用户的下一步指令。",
+                        src.address,
+                        p.kind.display_label_zh()
+                    )
+                } else {
+                    format!(
+                        "[{} from {}] Please read and absorb the incoming handoff context above ONLY. Do NOT make any modifications, edit files, or run mutating commands on this turn — briefly confirm you have understood the context and wait for the user's next instruction.",
+                        p.kind.display_label(),
+                        src.address
+                    )
+                }
+            }
+        };
+        if let Some(wt_notice) = worktree_workspace_notice(lineage, is_zh) {
+            msg.push('\n');
+            msg.push_str(&wt_notice);
+        }
+        msg
+    });
+
+    let sent = agent_send(
+        core,
+        SendParams {
+            agent: new_addr.clone(),
+            text: prompt_text,
+            steer: false,
+            only_if: None,
+            wait: p.wait,
+            timeout: p.timeout,
+            from: None,
+            caller: p.caller.clone(),
+        },
+    )
+    .await?;
+    let prompt_sent = sent.started != Some(false);
+    let wait_res = sent.wait;
 
     Ok(HandoffResult {
         target: new_addr,

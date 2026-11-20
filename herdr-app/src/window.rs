@@ -2310,12 +2310,22 @@ impl AppWindow {
                 .max(work_ms.unwrap_or(0));
             (working_since, work_ms, total_work_ms)
         };
+        let agent_appeared_ms = |addr: &str| -> u64 {
+            let rec = self.live.get(addr).or_else(|| self.ended_acp.get(addr));
+            rec.and_then(|r| r.get("program_started_ms"))
+                .and_then(Value::as_u64)
+                .filter(|&v| v > 0)
+                .or_else(|| rec.and_then(|r| r.get("created_ms")).and_then(Value::as_u64))
+                .unwrap_or(0)
+        };
+        let appearance_sort_key = |ts: u64| if ts > 0 { ts } else { u64::MAX };
         let push_acp = |agents: &mut Vec<Value>, addr: &str, space_id: &str, space_name: &str| {
             let (has_rec, a, title, pinned, custom_name, app, _, context_usage) = acp_meta(addr);
             if !has_rec { return; }
             let is_acp = is_acp_addr(addr)
                 || self.live.get(addr).and_then(|r| r.get("acp")).and_then(Value::as_bool) == Some(true);
             let (working_since, work_ms, total_work_ms) = agent_timing(addr);
+            let created_ms = agent_appeared_ms(addr);
             agents.push(json!({
                 "address": addr, "acp": is_acp, "pane": Value::Null, "space": space_id, "space_name": space_name,
                 "tab": Value::Null, "tab_index": 0, "tab_name": "headless",
@@ -2324,6 +2334,7 @@ impl AppWindow {
                 "app": app, "program": self.program(addr), "title": title,
                 "custom_name": custom_name,
                 "context_usage": context_usage,
+                "created_ms": created_ms,
                 "working_since": working_since,
                 "work_ms": work_ms,
                 "total_work_ms": total_work_ms,
@@ -2333,6 +2344,7 @@ impl AppWindow {
             }));
         };
         for pr in &m.spaces {
+            let sp_start = agents.len();
             for (ci, ctx) in pr.tabs.iter().enumerate() {
                 for p in ctx.root.panes() {
                     let focused = m.active.as_deref() == Some(pr.id.as_str()) && focused_pane.as_deref() == Some(p.id.as_str());
@@ -2354,6 +2366,7 @@ impl AppWindow {
                             "focused": focused, "zoomed": zoomed, "movable": self.pane_movable(&p.id),
                         }));
                         if !is_ended && !self.closing_terminals.contains_key(addr) && !self.live.get(addr).is_some_and(is_trashed_record) {
+                            let created_ms = agent_appeared_ms(addr);
                             agents.push(json!({
                                 "address": addr, "acp": true, "pane": p.id, "space": pr.id, "space_name": m.space_name(pr, &home),
                                 "tab": ctx.id, "tab_index": ci + 1, "tab_name": Model::tab_name(pr, ctx),
@@ -2362,6 +2375,7 @@ impl AppWindow {
                                 "app": app, "program": self.program(addr), "title": title,
                                 "custom_name": custom_name,
                                 "context_usage": context_usage,
+                                "created_ms": created_ms,
                                 "working_since": working_since,
                                 "work_ms": work_ms,
                                 "total_work_ms": total_work_ms,
@@ -2400,6 +2414,7 @@ impl AppWindow {
                         continue;
                     }
                     let Some(status) = m.status(addr).or_else(|| has_live_child(addr, &self.live, &self.closing_terminals).then_some("idle")) else { continue };
+                    let created_ms = agent_appeared_ms(addr);
                     agents.push(json!({
                         "address": addr, "pane": p.id, "space": pr.id, "space_name": m.space_name(pr, &home),
                         "tab": ctx.id, "tab_index": ci + 1, "tab_name": Model::tab_name(pr, ctx),
@@ -2407,6 +2422,7 @@ impl AppWindow {
                         "manual_status": a.and_then(|a| a.manual_status.clone()),
                         "app": a.and_then(|a| a.app.clone()), "program": self.program(addr), "title": title.unwrap_or_default(),
                         "custom_name": custom_name,
+                        "created_ms": created_ms,
                         "working_since": working_since,
                         "work_ms": work_ms,
                         "total_work_ms": total_work_ms,
@@ -2417,14 +2433,23 @@ impl AppWindow {
                 }
             }
             if let Some(mut matched) = acp_by_space.remove(&pr.id) {
-                matched.sort();
+                matched.sort_by(|a, b| {
+                    appearance_sort_key(agent_appeared_ms(a))
+                        .cmp(&appearance_sort_key(agent_appeared_ms(b)))
+                        .then_with(|| a.cmp(b))
+                });
                 let sp_name = m.space_name(pr, &home);
                 for addr in matched {
                     push_acp(&mut agents, &addr, &pr.id, &sp_name);
                 }
             }
+            agents[sp_start..].sort_by_key(|v| appearance_sort_key(v.get("created_ms").and_then(Value::as_u64).unwrap_or(0)));
         }
-        acp_unmatched.sort();
+        acp_unmatched.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| appearance_sort_key(agent_appeared_ms(&a.2)).cmp(&appearance_sort_key(agent_appeared_ms(&b.2))))
+                .then_with(|| a.2.cmp(&b.2))
+        });
         for (space_id, space_name, addr) in acp_unmatched {
             push_acp(&mut agents, &addr, &space_id, &space_name);
         }
@@ -2730,10 +2755,46 @@ impl AppWindow {
         folders
     }
 
+    fn space_matches_worktree(&self, pr: &model::Space, wt_path: &str, machine: Option<&str>) -> bool {
+        if pr.machine.as_deref() != machine {
+            return false;
+        }
+        if same_path(&pr.folder, wt_path) {
+            return true;
+        }
+        if pr.folder.is_empty()
+            && let Some(first) = pr.tabs.iter().flat_map(|c| c.root.panes()).next()
+        {
+            if self.model.pane_folders.get(&first.id).is_some_and(|f| same_path(f, wt_path)) {
+                return true;
+            }
+            if let Some(addr) = first.any_terminal()
+                && (self.model.folder_info.get(addr).is_some_and(|f| same_path(&f.top, wt_path))
+                    || self.cwds.get(addr).is_some_and(|f| same_path(f, wt_path)))
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     fn acp_matches_space(&self, addr: &str, rec: &Value, pr: &model::Space) -> bool {
         let machine = addr.split_once('/').map(|(mc, _)| mc);
         if pr.machine.as_deref() != machine {
             return false;
+        }
+        if let Some(wt_path) = rec
+            .pointer("/lineage/worktree_path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            if self.space_matches_worktree(pr, wt_path, machine) {
+                return true;
+            }
+            if self.model.spaces.iter().any(|s| self.space_matches_worktree(s, wt_path, machine)) {
+                return false;
+            }
         }
         if rec.pointer("/labels/herdr.space").and_then(Value::as_str) == Some(crate::mirror::local(&pr.id, machine)) {
             return true;
@@ -3910,11 +3971,15 @@ impl AppWindow {
     fn keep_terminal_with_focus(&mut self, addr: &str, place: &str, focus: bool, window: &mut Window, cx: &mut Context<Self>) -> Result<Value, String> {
         let is_acp = is_acp_addr(addr);
         let addr_machine = addr.split_once('/').map(|(m, _)| m);
+        let wt_path = self.fork_worktree_info(addr).map(|(p, _, _)| p);
         if let Some(p) = self.model.any_pane_of(addr) {
             if is_acp && matches!(place, "right" | "down")
                 && let Some(target_pane) = self.model.focused_pane()
                 && target_pane != p
                 && self.model.space_of(&target_pane).and_then(|s| s.machine.as_deref()) == addr_machine
+                && (wt_path.is_none()
+                    || self.model.space_of(&target_pane).map(|s| s.id.as_str())
+                        == self.model.space_of(&p).map(|s| s.id.as_str()))
             {
                 let edge = if place == "right" { crate::layout::Edge::Right } else { crate::layout::Edge::Bottom };
                 let axis = if place == "right" { Axis::Row } else { Axis::Column };
@@ -3959,8 +4024,24 @@ impl AppWindow {
             return Ok(json!({ "pane": p }));
         }
         if !self.live.contains_key(addr) { return Err(format!("no running terminal {addr:?}")); }
-        if self.changing_terminals.contains(addr) { return Err("This terminal already has a pane change in progress.".into()); }
-        let (space, machine, create_space) = if !is_acp {
+        if self.changing_terminals.contains(addr) {
+            if focus
+                && let Some(pending) = self.pending_terminals.get_mut(addr)
+                && let TerminalChange::Keep { focus: ref mut f, .. } = pending.change
+            {
+                *f = true;
+                return Ok(json!({ "pending": true, "terminal": addr }));
+            }
+            return Err("This terminal already has a pane change in progress.".into());
+        }
+        let (space, machine, create_space) = if let Some(wt_path) = wt_path {
+            if let Some(sp) = self.model.spaces.iter().find(|pr| self.space_matches_worktree(pr, &wt_path, addr_machine)) {
+                (sp.id.clone(), sp.machine.clone(), None)
+            } else {
+                let space = self.model.fresh_id_on("sp", addr_machine);
+                (space, addr_machine.map(str::to_owned), Some((wt_path, addr_machine.map(str::to_owned))))
+            }
+        } else if !is_acp {
             let space = self.model.active_space().map(|p| p.id.clone()).ok_or("no space to keep it in")?;
             let machine = self.machine_of(&space);
             if addr_machine != machine.as_deref() {
@@ -4073,7 +4154,12 @@ impl AppWindow {
                 if self.model.space(&space).is_none() {
                     if let Some((folder, machine)) = create_space {
                         let block = if is_acp { Self::acp_pane_node(&pane, &address) } else { model::pane(&pane, &address) };
-                        self.model.add_space(&space, "", &folder, Tab::with_pane(&tab, &name, block));
+                        let tab_obj = Tab::with_pane(&tab, &name, block);
+                        if focus {
+                            self.model.add_space(&space, "", &folder, tab_obj);
+                        } else {
+                            self.model.add_space_unshown(&space, "", &folder, tab_obj);
+                        }
                         if let Some(p) = self.model.space_mut(&space) {
                             p.machine = machine;
                         }
@@ -4163,7 +4249,8 @@ impl AppWindow {
     }
 
     /// Terminates and permanently removes the given sessions on core (`kill` + `rm`),
-    /// ensuring any associated fork worktree directory and Git branch are completely deleted.
+    /// ensuring any associated fork worktree directory, Git branch, and matching worktree space
+    /// are completely cleaned up.
     fn kill_and_remove(&mut self, addresses: &[String], cx: &mut Context<Self>) {
         if addresses.is_empty() {
             return;
@@ -4181,9 +4268,19 @@ impl AppWindow {
             }
             i += 1;
         }
+        let wt_targets: Vec<(Option<String>, String)> = doomed
+            .iter()
+            .filter_map(|addr| {
+                let (wt_path, _, _) = self.fork_worktree_info(addr)?;
+                let machine = addr.split_once('/').map(|(m, _)| m.to_owned());
+                Some((machine, wt_path))
+            })
+            .collect();
+        let pre_kill_shells = self.close_worktree_spaces_for(&wt_targets, &doomed, cx);
         for addr in &doomed {
             self.ended_acp.remove(addr);
         }
+        self.closing_terminals.extend(pre_kill_shells.iter().cloned().map(|a| (a, false)));
         self.closing_terminals.extend(doomed.iter().cloned().map(|a| (a, false)));
         if self.peeked_agent.as_ref().is_some_and(|p| doomed.contains(p)) {
             self.peeked_agent = None;
@@ -4201,6 +4298,25 @@ impl AppWindow {
         }
         let core = self.core.clone();
         cx.spawn(async move |this, cx| {
+            // Kill any shells sitting inside worktree spaces first so the folder isn't locked during `rm`.
+            for shell_addr in pre_kill_shells {
+                let core = core.clone();
+                let addr = shell_addr.clone();
+                let result = cx.background_executor().spawn(async move {
+                    if is_acp_addr(&addr) {
+                        core.call("agent.kill", json!({ "agent": addr }))
+                    } else {
+                        core.call("terminal.kill", json!({ "terminal": addr }))
+                    }
+                }).await;
+                let _ = this.update(cx, |this, _| {
+                    if result.is_ok() && this.live.contains_key(&shell_addr) {
+                        this.closing_terminals.insert(shell_addr, true);
+                    } else {
+                        this.closing_terminals.remove(&shell_addr);
+                    }
+                });
+            }
             for address in doomed {
                 let core = core.clone();
                 let addr = address.clone();
@@ -4224,10 +4340,51 @@ impl AppWindow {
         }).detach();
     }
 
-    /// Returns `(worktree_path, worktree_branch, worktree_merged)` if `addr` is a forked agent/terminal
-    /// owning an isolated Git worktree.
-    fn fork_worktree_info(&self, addr: &str) -> Option<(String, Option<String>, bool)> {
-        let rec = self.live.get(addr).or_else(|| self.ended_acp.get(addr))?;
+    /// Closes any dedicated worktree spaces matching `wt_targets`, trashing unrelated live agents
+    /// and returning plain shell PTYs to terminate before core deletes the worktree directories.
+    fn close_worktree_spaces_for(
+        &mut self,
+        wt_targets: &[(Option<String>, String)],
+        doomed: &[String],
+        cx: &mut Context<Self>,
+    ) -> Vec<String> {
+        if wt_targets.is_empty() {
+            return Vec::new();
+        }
+        let space_ids: Vec<String> = self
+            .model
+            .spaces
+            .iter()
+            .filter(|sp| {
+                wt_targets
+                    .iter()
+                    .any(|(machine, wt_path)| self.space_matches_worktree(sp, wt_path, machine.as_deref()))
+            })
+            .map(|sp| sp.id.clone())
+            .collect();
+        let mut shells_to_kill = Vec::new();
+        for sp_id in space_ids {
+            let addrs = self.model.remove_space(&sp_id);
+            for addr in addrs {
+                if doomed.iter().any(|d| d == &addr) {
+                    continue;
+                }
+                if is_acp_addr(&addr) || self.is_agent_pty(&addr) {
+                    if let Some(rec) = self.live.get(&addr).or_else(|| self.ended_acp.get(&addr)).cloned()
+                        && !is_trashed_record(&rec)
+                    {
+                        let snap = self.trash_snapshot(&addr, &rec);
+                        self.trash_detached(&addr, snap, cx);
+                    }
+                } else if self.live.contains_key(&addr) && !shells_to_kill.contains(&addr) {
+                    shells_to_kill.push(addr);
+                }
+            }
+        }
+        shells_to_kill
+    }
+
+    fn extract_worktree_info(rec: &Value) -> Option<(String, Option<String>, bool)> {
         let lin = rec.get("lineage")?;
         let wt_path = lin.get("worktree_path").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())?.to_owned();
         let wt_branch = lin.get("worktree_branch").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
@@ -4235,106 +4392,407 @@ impl AppWindow {
         Some((wt_path, wt_branch, merged))
     }
 
-    /// Opens the appropriate close confirmation dialog for a forked agent that owns an isolated Git worktree:
-    /// - If already merged: warns that closing the agent will permanently delete the worktree and branch.
-    /// - If not merged yet: asks whether to merge first (guiding to the "合回父会话" button), and if skipping
-    ///   merge, confirms that closing the agent will permanently delete the worktree and branch.
-    fn prompt_close_fork_worktree(
+    /// Returns `(worktree_path, worktree_branch, worktree_merged)` if `addr` is a forked agent/terminal
+    /// owning an isolated Git worktree (checking live, ended ACP, and recycle-bin records).
+    fn fork_worktree_info(&self, addr: &str) -> Option<(String, Option<String>, bool)> {
+        if let Some(rec) = self.live.get(addr).or_else(|| self.ended_acp.get(addr))
+            && let Some(info) = Self::extract_worktree_info(rec)
+        {
+            return Some(info);
+        }
+        let trash = mods::shared("agents.trash")?;
+        let entry = trash
+            .as_array()?
+            .iter()
+            .find(|v| v.get("address").and_then(Value::as_str) == Some(addr))?;
+        Self::extract_worktree_info(entry)
+    }
+
+    fn parse_worktree_blocked_error(err_text: &str) -> Option<Value> {
+        let marker = "WORKTREE_BLOCKED:";
+        let idx = err_text.find(marker)?;
+        let rest = &err_text[idx + marker.len()..];
+        let mut de = serde_json::Deserializer::from_str(rest).into_iter::<Value>();
+        match de.next() {
+            Some(Ok(v)) if v.is_object() => Some(v),
+            _ => None,
+        }
+    }
+
+    fn open_worktree_blocked_dialog(&mut self, source: &str, info: &Value, window: &mut Window, cx: &mut Context<Self>) {
+        let zh = settings::get().language == settings::Language::ZhCn;
+        let code = info.get("code").and_then(Value::as_str).unwrap_or("unknown");
+        let cwd = info.get("cwd").and_then(Value::as_str).unwrap_or("").trim();
+        let op = info.get("op").and_then(Value::as_str).unwrap_or("git");
+        let files: Vec<String> = info
+            .get("files")
+            .and_then(Value::as_array)
+            .map(|arr| arr.iter().filter_map(Value::as_str).map(str::to_owned).collect())
+            .unwrap_or_default();
+        let total_dirty = info.get("total_dirty").and_then(Value::as_u64).unwrap_or(files.len() as u64);
+        let source_name = self.worktree_agent_display_name(source, None);
+        let target_label = if source_name == source {
+            source.to_owned()
+        } else {
+            format!("{source_name} ({source})")
+        };
+
+        let op_zh = match op {
+            "merge" => "合并（merge）",
+            "rebase" => "变基（rebase）",
+            "cherry-pick" => "拣选（cherry-pick）",
+            "revert" => "还原（revert）",
+            "bisect" => "二分排查（bisect）",
+            "conflict" => "冲突合并",
+            other => other,
+        };
+
+        let title = if zh { "无法创建 Worktree 分叉" } else { "Cannot Create Worktree Fork" };
+
+        let (detail, fix_prompt): (String, Option<String>) = match code {
+            "not_git_repo" => (
+                if zh {
+                    format!(
+                        "原因：当前工作目录尚未初始化 Git 仓库。\n工作目录：{cwd}\n创建独立 Worktree 分叉前，需要先初始化 Git 仓库并完成至少一次初始提交。你可以点击下方按钮，让当前 Agent（{target_label}）帮你处理。"
+                    )
+                } else {
+                    format!(
+                        "Reason: the current working directory is not a Git repository.\nDirectory: {cwd}\nCreating an isolated Worktree fork requires initializing Git and making at least one initial commit. Click below to ask the current agent ({target_label}) to set it up for you."
+                    )
+                },
+                Some(if zh {
+                    format!(
+                        "我需要基于当前工作目录（{cwd}）创建独立的 Git Worktree 分叉，但当前目录尚未初始化 Git 仓库。请帮我在当前目录执行 git init，按需添加合理的 .gitignore（忽略临时缓存与构建产物），并将现有代码文件做一次初始提交（initial commit），完成后告诉我以便我重新创建 Worktree 分叉。"
+                    )
+                } else {
+                    format!(
+                        "I want to create an isolated Git worktree fork from the current directory ({cwd}), but it is not a Git repository yet. Please run `git init`, add a sensible `.gitignore` for build/cache artifacts, and create an initial commit with the existing files. Let me know once it's ready so I can retry creating the Worktree fork."
+                    )
+                }),
+            ),
+            "no_commits" => (
+                if zh {
+                    format!(
+                        "原因：当前目录虽然已执行 git init，但还没有任何提交记录（No commits yet）。\n工作目录：{cwd}\nGit Worktree 需要基于至少一个已有提交（HEAD）才能创建独立分支。你可以点击下方按钮，让当前 Agent（{target_label}）帮你完成初始提交。"
+                    )
+                } else {
+                    format!(
+                        "Reason: this directory was initialized with `git init`, but has no commits yet.\nDirectory: {cwd}\nGit worktree requires at least one existing commit (HEAD) to branch from. Click below to ask the current agent ({target_label}) to make the initial commit."
+                    )
+                },
+                Some(if zh {
+                    format!(
+                        "我需要基于当前工作目录（{cwd}）创建独立的 Git Worktree 分叉，但当前 Git 仓库仅初始化了，还没有任何提交记录（No commits yet）。请帮我检查目录中的文件，通过 .gitignore 合理忽略临时缓存文件（如 __pycache__/、node_modules/ 等），然后完成一次初始提交（initial commit），完成后告诉我以便我重新创建 Worktree 分叉。"
+                    )
+                } else {
+                    format!(
+                        "I want to create an isolated Git worktree fork from the current directory ({cwd}), but this Git repository has no commits yet. Please review the files, ignore temporary cache artifacts via `.gitignore` (such as `__pycache__/`, `node_modules/`), and make an initial commit. Let me know once it's ready so I can retry creating the Worktree fork."
+                    )
+                }),
+            ),
+            "in_progress_op" => (
+                if zh {
+                    format!(
+                        "原因：当前 Git 仓库存在未完成的{op_zh}操作或未解决的合并冲突。\n工作目录：{cwd}\n请先完成或中止当前 Git 操作并保持工作区干净，再创建 Worktree 分叉。你可以点击下方按钮，让当前 Agent（{target_label}）帮你处理。"
+                    )
+                } else {
+                    format!(
+                        "Reason: the current Git repository has an unfinished {op} operation or unresolved conflicts.\nDirectory: {cwd}\nPlease finish or abort the in-progress Git operation and leave the working tree clean before creating a Worktree fork. Click below to ask the current agent ({target_label}) to resolve it."
+                    )
+                },
+                Some(if zh {
+                    format!(
+                        "我需要基于当前工作目录（{cwd}）创建独立的 Git Worktree 分叉，但当前 Git 仓库存在未完成的{op_zh}操作或冲突。请帮我查看 git status，安全地完成或中止该操作并使工作区恢复干净状态，完成后告诉我以便我重新创建 Worktree 分叉。"
+                    )
+                } else {
+                    format!(
+                        "I want to create an isolated Git worktree fork from the current directory ({cwd}), but the Git repository has an unfinished {op} operation or unresolved conflicts. Please inspect `git status`, safely finish or abort the operation so the working tree is clean, and let me know once ready."
+                    )
+                }),
+            ),
+            "dirty_worktree" => {
+                let preview = if files.is_empty() {
+                    String::new()
+                } else if total_dirty as usize > files.len() {
+                    format!("{} ...", files.join(", "))
+                } else {
+                    files.join(", ")
+                };
+                (
+                    if zh {
+                        format!(
+                            "原因：当前 Git 仓库存在 {total_dirty} 项未提交的修改或未跟踪文件。\n工作目录：{cwd}\n为避免主干与 Worktree 仓库提交历史不一致，请先提交（或清理/忽略）这些未提交改动后再创建 Worktree 分叉。你可以点击下方按钮，让当前 Agent（{target_label}）帮你整理并提交。"
+                        )
+                    } else {
+                        format!(
+                            "Reason: the current Git repository has {total_dirty} uncommitted change(s) or untracked file(s).\nDirectory: {cwd}\nTo keep Git history consistent between main and the forked worktree, please commit (or clean/ignore) these changes first. Click below to ask the current agent ({target_label}) to handle it."
+                        )
+                    },
+                    Some(if zh {
+                        format!(
+                            "我需要基于当前工作目录（{cwd}）创建独立的 Git Worktree 分叉，但当前 Git 仓库还有未提交的改动（{preview}）。请帮我检查 git status 和 diff，合理配置 .gitignore（忽略临时缓存文件）并将需要保留的改动提交到当前分支，使工作区保持干净后告诉我，以便我重新创建 Worktree 分叉。"
+                        )
+                    } else {
+                        format!(
+                            "I want to create an isolated Git worktree fork from the current directory ({cwd}), but the Git repository has uncommitted changes ({preview}). Please inspect `git status` and diff, ignore any temporary cache artifacts via `.gitignore`, and commit the intended changes so the working tree is clean. Let me know once ready."
+                        )
+                    }),
+                )
+            }
+            "aosp_harness" => (
+                if zh {
+                    format!(
+                        "原因：当前工作目录属于 AOSP Harness 工作区，已禁用 Git Worktree 隔离。\n工作目录：{cwd}\n请取消勾选「独立 Git Worktree 隔离」，改为在共享工作区中分叉。"
+                    )
+                } else {
+                    format!(
+                        "Reason: worktree isolation is disabled for AOSP harness workspaces.\nDirectory: {cwd}\nUncheck \"Isolated Git Worktree\" to fork in the shared workspace instead."
+                    )
+                },
+                None,
+            ),
+            _ => (
+                if zh {
+                    format!("原因：当前工作目录（{cwd}）暂不满足创建 Git Worktree 的条件。")
+                } else {
+                    format!("Reason: the current directory ({cwd}) is not ready for creating a Git worktree.")
+                },
+                None,
+            ),
+        };
+
+        let items: Vec<Value> = files
+            .iter()
+            .map(|entry| {
+                let trimmed = entry.trim();
+                json!({ "name": trimmed })
+            })
+            .collect();
+
+        let mut props = json!({
+            "title": title,
+            "detail": detail,
+            "items": items,
+            "cancelLabel": if zh { "关闭" } else { "Close" },
+        });
+        if let Some(prompt_text) = fix_prompt {
+            props["confirmLabel"] = json!(if zh {
+                format!("发消息让 {source} 处理")
+            } else {
+                format!("Ask {source} to Fix")
+            });
+            props["command"] = json!({
+                "name": "agent.send",
+                "args": {
+                    "agent": source,
+                    "text": prompt_text,
+                    "focus": true,
+                }
+            });
+        } else {
+            props["confirmLabel"] = json!(if zh { "知道了" } else { "Got It" });
+        }
+
+        self.open_overlay(
+            "worktree-blocked".into(),
+            json!({
+                "mod": "confirm",
+                "kind": "dialog",
+                "width": 520,
+                "props": props,
+            }),
+            window,
+            cx,
+        );
+    }
+
+    fn worktree_agent_display_name(&self, addr: &str, entry: Option<&Value>) -> String {
+        let rec = self.live.get(addr).or_else(|| self.ended_acp.get(addr));
+        let pick = |v: Option<&Value>, ptr: &str| {
+            v.and_then(|x| x.pointer(ptr))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        };
+        pick(entry, "/custom_name")
+            .or_else(|| pick(rec, "/labels/herdr.name"))
+            .or_else(|| pick(entry, "/name"))
+            .or_else(|| pick(rec, "/name"))
+            .or_else(|| pick(entry, "/tab_name"))
+            .or_else(|| pick(entry, "/title"))
+            .or_else(|| pick(rec, "/title"))
+            .unwrap_or_else(|| addr.to_owned())
+    }
+
+    fn worktree_confirm_item(
+        &self,
+        addr: &str,
+        entry: Option<&Value>,
+        wt_path: &str,
+        wt_branch: Option<&str>,
+    ) -> Value {
+        let label = self.worktree_agent_display_name(addr, entry);
+        let space_name = entry
+            .and_then(|e| e.get("space_name"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                std::path::Path::new(wt_path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned)
+            });
+        let live = !self.closing_terminals.contains_key(addr)
+            && self
+                .live
+                .get(addr)
+                .is_some_and(|r| r.get("state").and_then(Value::as_str) == Some("live"));
+        json!({
+            "address": addr,
+            "name": label,
+            "branch": wt_branch.unwrap_or("worktree"),
+            "path": wt_path,
+            "space_name": space_name,
+            "live": live,
+        })
+    }
+
+    /// Collects all worktree-type forked agents currently in the recycle bin as structured
+    /// confirmation items (`address`, `name`, `branch`, `path`, `space_name`, `live`).
+    fn trashed_fork_worktrees(&self) -> Vec<Value> {
+        let list = mods::shared("agents.trash")
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        let mut seen = HashSet::new();
+        let mut out = Vec::new();
+        for entry in &list {
+            let Some(addr) = entry.get("address").and_then(Value::as_str).map(str::to_owned) else {
+                continue;
+            };
+            if self.closing_terminals.contains_key(&addr) || !seen.insert(addr.clone()) {
+                continue;
+            }
+            if let Some((wt_path, wt_branch, _)) = self.fork_worktree_info(&addr) {
+                out.push(self.worktree_confirm_item(&addr, Some(entry), &wt_path, wt_branch.as_deref()));
+            }
+        }
+        let mut extra_addrs: Vec<String> = self
+            .live
+            .iter()
+            .filter(|(addr, rec)| {
+                !self.closing_terminals.contains_key(*addr)
+                    && is_trashed_record(rec)
+                    && !seen.contains(*addr)
+            })
+            .map(|(addr, _)| addr.clone())
+            .collect();
+        extra_addrs.sort();
+        for addr in extra_addrs {
+            if let Some((wt_path, wt_branch, _)) = self.fork_worktree_info(&addr) {
+                out.push(self.worktree_confirm_item(&addr, None, &wt_path, wt_branch.as_deref()));
+            }
+        }
+        out
+    }
+
+    /// Prompts a single confirmation dialog reminding the user that permanently deleting this
+    /// worktree-type forked agent from the recycle bin will also remove its entire worktree directory.
+    fn prompt_purge_fork_worktree(
         &mut self,
         addr: &str,
-        command: &str,
-        args: Value,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some((wt_path, wt_branch, merged)) = self.fork_worktree_info(addr) else {
+        let Some((wt_path, wt_branch, _)) = self.fork_worktree_info(addr) else {
             return;
         };
+        let entry = mods::shared("agents.trash")
+            .and_then(|v| v.as_array().cloned())
+            .and_then(|list| list.into_iter().find(|e| e.get("address").and_then(Value::as_str) == Some(addr)));
+        let item = self.worktree_confirm_item(addr, entry.as_ref(), &wt_path, wt_branch.as_deref());
         let zh = settings::get().language == settings::Language::ZhCn;
-        let branch_label = wt_branch.as_deref().unwrap_or("worktree");
-        let spec = if merged {
-            let title = if zh {
-                "关闭分叉 Agent 并删除 Worktree？"
-            } else {
-                "Close forked agent & delete Worktree?"
-            };
-            let detail = if zh {
-                format!(
-                    "该分叉会话的 Worktree（分支 `{branch_label}`）已合入。\n\n关闭该 Agent 后，将会彻底删除对应的临时 Worktree 目录与分支：\n{wt_path}\n\n确认关闭吗？"
-                )
-            } else {
-                format!(
-                    "This forked agent's worktree (branch `{branch_label}`) has already been merged.\n\nClosing this agent will permanently delete its worktree directory and branch:\n{wt_path}\n\nContinue?"
-                )
-            };
-            json!({
-                "mod": "confirm",
-                "kind": "dialog",
-                "width": 440,
-                "props": {
-                    "title": title,
-                    "detail": detail,
-                    "confirmLabel": if zh { "确认关闭并删除" } else { "Close & Delete Worktree" },
-                    "confirmDanger": true,
-                    "command": { "name": command, "args": args }
-                }
-            })
+        let title = if zh {
+            "删除分叉 Agent 并移除 Worktree？"
         } else {
-            let title = if zh {
-                "分叉 Worktree 尚未合入"
-            } else {
-                "Fork Worktree Not Merged Yet"
-            };
-            let detail = if zh {
-                format!(
-                    "该分叉会话的独立 Worktree（分支 `{branch_label}`）尚未合入主会话，是否需要先合入代码？\n\n• 需要合入：请点击下方「合回父会话」按钮（或会话顶部的「合回」按钮），通知主 Agent 合并代码。\n• 不合入：继续关闭后，将会彻底删除该 Worktree 目录与分支。"
-                )
-            } else {
-                format!(
-                    "This forked agent's isolated worktree (branch `{branch_label}`) has not been merged back yet. Would you like to merge it first?\n\n• Merge first: click \"Merge Back to Parent\" below (or the \"Merge\" button in the header) to ask the parent agent to merge the code.\n• Skip merge: closing this agent will permanently delete the worktree directory and branch."
-                )
-            };
-            let step2_title = if zh {
-                "确认彻底删除未合入的 Worktree？"
-            } else {
-                "Permanently delete unmerged Worktree?"
-            };
-            let step2_detail = if zh {
-                format!(
-                    "你选择了不合入。关闭该 Agent 后，将会彻底删除 Worktree 目录与分支（`{branch_label}`），未合入的代码改动将永久丢失且无法恢复：\n{wt_path}\n\n确认关闭吗？"
-                )
-            } else {
-                format!(
-                    "You chose not to merge. Closing this agent will permanently delete the worktree directory and branch (`{branch_label}`), and any unmerged changes will be lost:\n{wt_path}\n\nContinue?"
-                )
-            };
-            json!({
-                "mod": "confirm",
-                "kind": "dialog",
-                "width": 460,
-                "props": {
-                    "title": title,
-                    "detail": detail,
-                    "confirmLabel": if zh { "不合入，继续关闭" } else { "Don't Merge, Close" },
-                    "secondary": {
-                        "label": if zh { "合回父会话" } else { "Merge Back to Parent" },
-                        "accent": true,
-                        "command": {
-                            "name": "agent.handoff",
-                            "args": { "source": addr, "kind": "merge-back" }
-                        }
-                    },
-                    "nextStep": {
-                        "title": step2_title,
-                        "detail": step2_detail,
-                        "cancelLabel": if zh { "返回" } else { "Back" },
-                        "confirmLabel": if zh { "确认关闭并删除" } else { "Close & Delete Worktree" },
-                        "confirmDanger": true
-                    },
-                    "command": { "name": command, "args": args }
-                }
-            })
+            "Delete forked agent & remove Worktree?"
         };
+        let detail = if zh {
+            "彻底删除该分叉 Agent 后，将会同时移除以下整个 Worktree 目录及其分支，目录内的所有文件改动将无法恢复："
+        } else {
+            "Permanently deleting this forked agent will also remove the entire Worktree directory and its branch below, and all files inside it will be lost:"
+        };
+        let spec = json!({
+            "mod": "confirm",
+            "kind": "dialog",
+            "width": 480,
+            "props": {
+                "title": title,
+                "detail": detail,
+                "items": [item],
+                "confirmLabel": if zh { "确认删除" } else { "Delete & Remove Worktree" },
+                "confirmDanger": true,
+                "command": {
+                    "name": "agent.purge",
+                    "args": { "terminal": addr, "confirmed": true }
+                }
+            }
+        });
+        self.open_overlay(mods::new_overlay_id(), spec, window, cx);
+    }
+
+    /// Prompts a single aggregated confirmation dialog when emptying the recycle bin while it
+    /// contains one or more worktree-type forked agents.
+    fn prompt_empty_trash_fork_worktrees(
+        &mut self,
+        wt_items: &[Value],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if wt_items.is_empty() {
+            return;
+        }
+        let zh = settings::get().language == settings::Language::ZhCn;
+        let count = wt_items.len();
+        let title = if zh {
+            if count == 1 {
+                "清空回收站并移除 Worktree？".to_owned()
+            } else {
+                format!("清空回收站并移除 {count} 个 Worktree？")
+            }
+        } else if count == 1 {
+            "Empty recycle bin & remove Worktree?".to_owned()
+        } else {
+            format!("Empty recycle bin & remove {count} Worktrees?")
+        };
+        let detail = if zh {
+            format!(
+                "回收站中包含 {count} 个 Worktree 类型的分叉 Agent，清空回收站后将会同时移除以下整个 Worktree 目录及其分支，目录内的所有文件改动将无法恢复："
+            )
+        } else {
+            format!(
+                "The recycle bin contains {count} forked agent(s) with isolated Worktrees. Emptying the recycle bin will also permanently remove the entire Worktree directories and branches below:"
+            )
+        };
+        let spec = json!({
+            "mod": "confirm",
+            "kind": "dialog",
+            "width": 520,
+            "props": {
+                "title": title,
+                "detail": detail,
+                "items": wt_items,
+                "confirmLabel": if zh { "确认清空并删除" } else { "Empty & Remove Worktrees" },
+                "confirmDanger": true,
+                "command": {
+                    "name": "agent.empty_trash",
+                    "args": { "confirmed": true }
+                }
+            }
+        });
         self.open_overlay(mods::new_overlay_id(), spec, window, cx);
     }
 
@@ -4456,7 +4914,7 @@ impl AppWindow {
             let matched = raw_sp
                 .as_deref()
                 .and_then(|sid| self.model.space(sid))
-                .or_else(|| acp.then(|| self.model.spaces.iter().find(|pr| self.acp_matches_space(addr, rec, pr))).flatten());
+                .or_else(|| self.model.spaces.iter().find(|pr| self.acp_matches_space(addr, rec, pr)));
             let sid = matched.map(|s| s.id.clone()).or(raw_sp);
             let sname = matched
                 .map(|s| self.model.space_name(s, &home_dir))
@@ -4475,9 +4933,11 @@ impl AppWindow {
             .and_then(|s| s.parse::<u64>().ok())
             .unwrap_or_else(model::now_ms);
         let live = rec.get("state").and_then(Value::as_str) == Some("live");
+        let lineage = rec.get("lineage").cloned().unwrap_or(Value::Null);
         json!({
             "address": addr,
             "acp": acp,
+            "lineage": lineage,
             "name": name,
             "custom_name": custom_name,
             "title": title,
@@ -4528,6 +4988,11 @@ impl AppWindow {
                     .is_some_and(|r| r.get("state").and_then(Value::as_str) == Some("live"));
             if let Some(obj) = item.as_object_mut() {
                 obj.insert("live".into(), json!(live_now));
+                if obj.get("lineage").is_none_or(Value::is_null)
+                    && let Some(lin) = self.live.get(&addr).and_then(|r| r.get("lineage")).filter(|v| !v.is_null())
+                {
+                    obj.insert("lineage".into(), lin.clone());
+                }
             }
         }
         let mut extras: Vec<(String, Value)> = self
@@ -4655,6 +5120,46 @@ impl AppWindow {
         Ok(())
     }
 
+    fn clear_trash_labels_for_side_chat(&mut self, addr: &str, cx: &mut Context<Self>) {
+        let is_acp = is_acp_addr(addr);
+        if let Some(obj) = self.live.get_mut(addr).and_then(Value::as_object_mut) {
+            obj.insert("keep".into(), json!(false));
+            let labels = obj.entry("labels").or_insert_with(|| json!({}));
+            if let Some(labels) = labels.as_object_mut() {
+                labels.insert("herdr.space".into(), json!(""));
+                labels.insert("herdr.tab".into(), json!(""));
+                labels.insert("herdr.parked".into(), json!("1"));
+                labels.insert("herdr.trashed".into(), json!(""));
+                labels.insert("herdr.trash_space".into(), json!(""));
+                labels.insert("herdr.trash_name".into(), json!(""));
+            }
+        }
+        let core = self.core.clone();
+        let address = addr.to_owned();
+        let labels = json!({
+            "herdr.space": "",
+            "herdr.tab": "",
+            "herdr.parked": "1",
+            "herdr.trashed": "",
+            "herdr.trash_space": "",
+            "herdr.trash_name": "",
+        });
+        cx.background_executor()
+            .spawn(async move {
+                let (l_method, l_key, k_method) = if is_acp {
+                    ("agent.label", "agent", "agent.keep")
+                } else {
+                    ("terminal.label", "terminal", "terminal.keep")
+                };
+                let _ = core.call(l_method, json!({ l_key: address, "labels": labels }));
+                let _ = core.call(k_method, json!({ l_key: address, "keep": false }));
+            })
+            .detach();
+        if mods::publish_terminals(self.ordered_live_values()) {
+            self.refresh_snapshot_mods(cx);
+        }
+    }
+
     fn clear_trash_labels_and_keep(&mut self, addr: &str, space_id: &str, tab_id: &str, on: Option<&str>, cx: &mut Context<Self>) {
         let is_acp = is_acp_addr(addr);
         let local_sp = crate::mirror::local(space_id, on).to_owned();
@@ -4738,24 +5243,33 @@ impl AppWindow {
         let on = machine.as_deref();
         self.require_document(on)?;
 
-        let target_space = entry
-            .get("space")
-            .and_then(Value::as_str)
-            .filter(|s| self.model.space(s).is_some_and(|sp| sp.machine.as_deref() == on))
-            .map(str::to_owned)
-            .or_else(|| {
-                self.model
-                    .active_space()
-                    .filter(|sp| sp.machine.as_deref() == on)
-                    .map(|sp| sp.id.clone())
-            })
-            .or_else(|| {
-                self.model
-                    .spaces
-                    .iter()
-                    .find(|sp| sp.machine.as_deref() == on)
-                    .map(|sp| sp.id.clone())
-            });
+        let wt_path = self.fork_worktree_info(addr).map(|(p, _, _)| p);
+        let target_space = if let Some(ref wt) = wt_path {
+            self.model
+                .spaces
+                .iter()
+                .find(|sp| self.space_matches_worktree(sp, wt, on))
+                .map(|sp| sp.id.clone())
+        } else {
+            entry
+                .get("space")
+                .and_then(Value::as_str)
+                .filter(|s| self.model.space(s).is_some_and(|sp| sp.machine.as_deref() == on))
+                .map(str::to_owned)
+                .or_else(|| {
+                    self.model
+                        .active_space()
+                        .filter(|sp| sp.machine.as_deref() == on)
+                        .map(|sp| sp.id.clone())
+                })
+                .or_else(|| {
+                    self.model
+                        .spaces
+                        .iter()
+                        .find(|sp| sp.machine.as_deref() == on)
+                        .map(|sp| sp.id.clone())
+                })
+        };
 
         let custom_name = entry
             .get("custom_name")
@@ -4774,15 +5288,36 @@ impl AppWindow {
         } else {
             custom_name.clone().unwrap_or_default()
         };
-        let cwd = entry
-            .get("cwd")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned);
+        let cwd = wt_path.clone().or_else(|| {
+            entry
+                .get("cwd")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+        });
         let is_live = self
             .live
             .get(addr)
             .is_some_and(|r| r.get("state").and_then(Value::as_str) == Some("live"));
+        let is_side_chat = self
+            .live
+            .get(addr)
+            .and_then(|r| r.pointer("/lineage/kind"))
+            .or_else(|| entry.pointer("/lineage/kind"))
+            .and_then(Value::as_str)
+            .map(|k| k.to_ascii_lowercase().replace('_', "-"))
+            .as_deref()
+            == Some("side-chat");
+
+        if is_live && is_side_chat {
+            self.clear_trash_labels_for_side_chat(addr, cx);
+            if let Some(idx) = pos {
+                list.remove(idx);
+                self.save_trash_list(list, cx);
+            }
+            self.open_side_chat_panel(addr, window, cx);
+            return Ok(());
+        }
 
         if is_live {
             let ctx_id = self.model.fresh_id_on("tb", on);
@@ -4803,7 +5338,11 @@ impl AppWindow {
                 }
                 None => {
                     let sp = self.model.fresh_id_on("sp", on);
-                    let space_label = entry.get("space_name").and_then(Value::as_str).unwrap_or("");
+                    let space_label = if wt_path.is_some() {
+                        ""
+                    } else {
+                        entry.get("space_name").and_then(Value::as_str).unwrap_or("")
+                    };
                     let folder = cwd.unwrap_or_else(|| if on.is_some() { String::new() } else { home() });
                     self.model.add_space(&sp, space_label, &folder, tab);
                     if let Some(space) = self.model.space_mut(&sp) {
@@ -4958,18 +5497,22 @@ impl AppWindow {
             .unwrap_or_default();
         let before = list.len();
         list.retain(|v| v.get("address").and_then(Value::as_str) != Some(addr));
+        let in_list = list.len() != before;
         let has_wt = self.fork_worktree_info(addr).is_some();
         let in_live = self.live.contains_key(addr);
-        let in_ended = self.ended_acp.remove(addr).is_some();
-        if list.len() == before && !in_live && !in_ended {
+        let in_ended = self.ended_acp.contains_key(addr);
+        if !in_list && !in_live && !in_ended {
             return Err(format!("no trashed agent {addr:?}"));
-        }
-        if list.len() != before {
-            self.save_trash_list(list, cx);
         }
         if has_wt {
             self.kill_and_remove(&[addr.to_owned()], cx);
-        } else if in_live {
+            return Ok(());
+        }
+        self.ended_acp.remove(addr);
+        if in_list {
+            self.save_trash_list(list, cx);
+        }
+        if in_live {
             self.kill(&[addr.to_owned()], cx);
         } else if is_acp_addr(addr) {
             let core = self.core.clone();
@@ -4992,26 +5535,39 @@ impl AppWindow {
             .filter_map(|v| v.get("address").and_then(Value::as_str).map(str::to_owned))
             .collect();
         for (addr, rec) in &self.live {
-            if is_trashed_record(rec) && !addrs.contains(addr) {
+            if !self.closing_terminals.contains_key(addr) && is_trashed_record(rec) && !addrs.contains(addr) {
                 addrs.push(addr.clone());
             }
         }
-        self.save_trash_list(Vec::new(), cx);
-        let live_addrs: Vec<String> = addrs
-            .into_iter()
-            .filter(|a| {
-                self.ended_acp.remove(a);
-                self.live.contains_key(a)
-            })
-            .collect();
-        let (wt_addrs, normal_addrs): (Vec<String>, Vec<String>) = live_addrs
+        let (wt_addrs, normal_addrs): (Vec<String>, Vec<String>) = addrs
             .into_iter()
             .partition(|a| self.fork_worktree_info(a).is_some());
         if !wt_addrs.is_empty() {
             self.kill_and_remove(&wt_addrs, cx);
         }
-        if !normal_addrs.is_empty() {
-            self.kill(&normal_addrs, cx);
+        self.save_trash_list(Vec::new(), cx);
+        let mut normal_live = Vec::new();
+        let mut ended_acp_rm = Vec::new();
+        for a in normal_addrs {
+            self.ended_acp.remove(&a);
+            if self.live.contains_key(&a) {
+                normal_live.push(a);
+            } else if is_acp_addr(&a) {
+                ended_acp_rm.push(a);
+            }
+        }
+        if !normal_live.is_empty() {
+            self.kill(&normal_live, cx);
+        }
+        if !ended_acp_rm.is_empty() {
+            let core = self.core.clone();
+            cx.background_executor()
+                .spawn(async move {
+                    for a in ended_acp_rm {
+                        let _ = core.call("agent.rm", json!({ "agent": a }));
+                    }
+                })
+                .detach();
         }
     }
 
@@ -5923,19 +6479,21 @@ impl AppWindow {
                 let Some(t) = Self::owned(a, "terminal") else { return self.fail("agent.purge needs terminal") };
                 let confirmed = a.get("confirmed").and_then(Value::as_bool) == Some(true);
                 if person && !confirmed && self.fork_worktree_info(&t).is_some() {
-                    self.prompt_close_fork_worktree(
-                        &t,
-                        "agent.purge",
-                        json!({ "terminal": t, "confirmed": true }),
-                        window,
-                        cx,
-                    );
+                    self.prompt_purge_fork_worktree(&t, window, cx);
                     return;
                 }
                 let r = self.purge_trashed_agent(&t, cx).map(|()| json!({ "purged": t }));
                 self.answer(r);
             }
             "agent.empty_trash" => {
+                let confirmed = a.get("confirmed").and_then(Value::as_bool) == Some(true);
+                if person && !confirmed {
+                    let wt_items = self.trashed_fork_worktrees();
+                    if !wt_items.is_empty() {
+                        self.prompt_empty_trash_fork_worktrees(&wt_items, window, cx);
+                        return;
+                    }
+                }
                 self.empty_trash(cx);
             }
             "agent.status" => {
@@ -6043,6 +6601,7 @@ impl AppWindow {
                 let is_merge = into.is_some();
                 let kind = kind_arg.unwrap_or_else(|| if is_merge { "merge-back".into() } else { "handoff".into() });
                 let rpc_kind = if kind == "merge-back" { "handoff" } else { kind.as_str() };
+                let is_worktree = a.get("worktree").and_then(Value::as_bool) == Some(true);
                 let archive_source = a.get("archive_source").and_then(Value::as_bool).unwrap_or(false);
                 let close_ov = Self::owned(a, "close_overlay").filter(|s| !s.is_empty());
                 let open = Self::owned(a, "open").unwrap_or_else(|| {
@@ -6050,7 +6609,7 @@ impl AppWindow {
                         "focus".into()
                     } else if kind == "side-chat" {
                         "panel".into()
-                    } else if kind == "fork" {
+                    } else if kind == "fork" && !is_worktree {
                         "split".into()
                     } else {
                         "tab".into()
@@ -6060,6 +6619,7 @@ impl AppWindow {
                     "source": source,
                     "kind": rpc_kind,
                     "display": crate::terminal::initial_display(window),
+                    "language": if settings::get().language == settings::Language::ZhCn { "zh-CN" } else { "en" },
                 });
                 if let Some(p) = preset { params["preset"] = json!(p); }
                 if let Some(dst) = into { params["into"] = json!(dst); }
@@ -6251,15 +6811,65 @@ impl AppWindow {
                                             }
                                         }
                                     } else {
+                                        let wt_path = out
+                                            .get("worktree_path")
+                                            .and_then(Value::as_str)
+                                            .map(str::trim)
+                                            .filter(|s| !s.is_empty())
+                                            .map(str::to_owned)
+                                            .or_else(|| this.fork_worktree_info(&target).map(|(p, _, _)| p));
+                                        if let Some(ref wt) = wt_path {
+                                            this.cwds.entry(target.clone()).or_insert_with(|| wt.clone());
+                                        }
                                         mods::publish_terminals(this.ordered_live_values());
-                                        match open.as_str() {
-                                            "none" => {}
-                                            "panel" => this.open_side_chat_panel(&target, window, cx),
-                                            "window" | "float" => this.open_side_chat_window(&target, &source_for_ui, window, cx),
-                                            "peek" => this.dispatch("terminal.peek", &json!({ "terminal": target }), false, window, cx),
-                                            "split" | "right" => this.dispatch("terminal.keep", &json!({ "terminal": target, "place": "right" }), false, window, cx),
-                                            "down" => this.dispatch("terminal.keep", &json!({ "terminal": target, "place": "down" }), false, window, cx),
-                                            _ => this.dispatch("terminal.keep", &json!({ "terminal": target, "place": "tab" }), false, window, cx),
+                                        if let Some(ref wt) = wt_path {
+                                            let target_machine = target.split_once('/').map(|(m, _)| m);
+                                            match open.as_str() {
+                                                "none" => {
+                                                    if !this.model.spaces.iter().any(|sp| this.space_matches_worktree(sp, wt, target_machine)) {
+                                                        let _ = this.new_space(
+                                                            "",
+                                                            Some(wt.clone()),
+                                                            None,
+                                                            None,
+                                                            None,
+                                                            target_machine.map(str::to_owned),
+                                                            None,
+                                                            false,
+                                                            window,
+                                                        );
+                                                    }
+                                                }
+                                                "peek" => {
+                                                    if !this.model.spaces.iter().any(|sp| this.space_matches_worktree(sp, wt, target_machine)) {
+                                                        let _ = this.new_space(
+                                                            "",
+                                                            Some(wt.clone()),
+                                                            None,
+                                                            None,
+                                                            None,
+                                                            target_machine.map(str::to_owned),
+                                                            None,
+                                                            false,
+                                                            window,
+                                                        );
+                                                    }
+                                                    this.dispatch("terminal.peek", &json!({ "terminal": target }), false, window, cx);
+                                                }
+                                                "panel" => this.open_side_chat_panel(&target, window, cx),
+                                                "window" | "float" => this.open_side_chat_window(&target, &source_for_ui, window, cx),
+                                                _ => this.dispatch("terminal.keep", &json!({ "terminal": target, "place": "tab" }), false, window, cx),
+                                            }
+                                        } else {
+                                            match open.as_str() {
+                                                "none" => {}
+                                                "panel" => this.open_side_chat_panel(&target, window, cx),
+                                                "window" | "float" => this.open_side_chat_window(&target, &source_for_ui, window, cx),
+                                                "peek" => this.dispatch("terminal.peek", &json!({ "terminal": target }), false, window, cx),
+                                                "split" | "right" => this.dispatch("terminal.keep", &json!({ "terminal": target, "place": "right" }), false, window, cx),
+                                                "down" => this.dispatch("terminal.keep", &json!({ "terminal": target, "place": "down" }), false, window, cx),
+                                                _ => this.dispatch("terminal.keep", &json!({ "terminal": target, "place": "tab" }), false, window, cx),
+                                            }
                                         }
                                         if archive_source && kind == "handoff" && source_for_ui != target {
                                             this.dispatch("terminal.park", &json!({ "terminal": source_for_ui }), false, window, cx);
@@ -6269,8 +6879,217 @@ impl AppWindow {
                                 }
                             }
                             Err(e) => {
-                                tracing::warn!("agent.handoff failed: {e:#}");
-                                this.command_error("agent.handoff", &format!("{e:#}"), window, cx);
+                                let err_msg = format!("{e:#}");
+                                tracing::warn!("agent.handoff failed: {err_msg}");
+                                if let Some(info) = Self::parse_worktree_blocked_error(&err_msg) {
+                                    this.open_worktree_blocked_dialog(&source_for_ui, &info, window, cx);
+                                } else {
+                                    this.command_error("agent.handoff", &err_msg, window, cx);
+                                }
+                            }
+                        }
+                    });
+                })
+                .detach();
+                return;
+            }
+            "agent.send" => {
+                let target = Self::owned(a, "agent")
+                    .or_else(|| Self::owned(a, "terminal"))
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| self.peeked_agent.clone())
+                    .or_else(|| self.model.focused_pane().and_then(|p| self.model.any_address_of(&p)))
+                    .or_else(|| self.shown_agent())
+                    .unwrap_or_default();
+                if target.is_empty() {
+                    return self.fail("agent.send needs a target agent or terminal");
+                }
+                let text = Self::owned(a, "text").unwrap_or_default();
+                if text.trim().is_empty() {
+                    return self.fail("agent.send needs non-empty text");
+                }
+                let steer = a.get("steer").and_then(Value::as_bool).unwrap_or(false);
+                let focus = a.get("focus").and_then(Value::as_bool).unwrap_or(false);
+                if focus {
+                    self.dispatch("agent.focus", &json!({ "terminal": target }), false, window, cx);
+                }
+                let core = self.core.clone();
+                let generation = self.core_generation;
+                let target_for_ui = target.clone();
+                let params = json!({
+                    "agent": target,
+                    "text": text,
+                    "steer": steer,
+                });
+                cx.spawn_in(window, async move |this, cx| {
+                    let res = cx
+                        .background_executor()
+                        .spawn(async move { core.call_timeout("agent.send", params, Duration::from_secs(15)) })
+                        .await;
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        if generation != this.core_generation || this.draining {
+                            return;
+                        }
+                        match res {
+                            Ok(_) => {
+                                if let Some(obj) = this.live.get_mut(&target_for_ui).and_then(Value::as_object_mut) {
+                                    let next_seq = obj.get("transcript_seq").and_then(Value::as_u64).unwrap_or(0) + 1;
+                                    obj.insert("transcript_seq".into(), json!(next_seq));
+                                    if is_acp_addr(&target_for_ui) || obj.get("acp").and_then(Value::as_bool) == Some(true) {
+                                        obj.insert("status".into(), json!("working"));
+                                    }
+                                }
+                                mods::publish_terminals(this.ordered_live_values());
+                                let zh = settings::get().language == settings::Language::ZhCn;
+                                let notification = json!({
+                                    "title": if zh { format!("已向 {target_for_ui} 发送消息") } else { format!("Message sent to {target_for_ui}") },
+                                    "body": if zh { "当前 Agent 正在处理你的请求，处理完成后可重新创建 Worktree 分叉。" } else { "The current agent is handling your request; retry creating the Worktree fork once finished." },
+                                    "level": "info",
+                                    "action": { "name": "agent.focus", "args": { "terminal": target_for_ui } },
+                                });
+                                this.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": notification }), window, cx);
+                                this.sync(window, cx);
+                            }
+                            Err(e) => {
+                                let err_msg = format!("{e:#}");
+                                tracing::warn!("agent.send failed: {err_msg}");
+                                this.command_error("agent.send", &err_msg, window, cx);
+                            }
+                        }
+                    });
+                })
+                .detach();
+                return;
+            }
+            "agent.send_review" => {
+                let req_id = Self::owned(a, "request_id").unwrap_or_default();
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(0);
+                let target = Self::owned(a, "target")
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| self.peeked_agent.clone())
+                    .or_else(|| self.model.focused_pane().and_then(|p| self.model.any_address_of(&p)))
+                    .or_else(|| self.shown_agent())
+                    .unwrap_or_default();
+                if target.is_empty() {
+                    let msg = "agent.send_review needs a target agent or terminal";
+                    if !req_id.is_empty() {
+                        mods::set_shared(
+                            "diff_review.last_result".into(),
+                            json!({ "request_id": req_id, "ok": false, "error": msg, "ts": now_ms }),
+                        );
+                    }
+                    return self.fail(msg);
+                }
+                let Some(comments) = a.get("comments").filter(|v| v.as_array().is_some_and(|arr| !arr.is_empty())).cloned() else {
+                    let msg = "agent.send_review requires a non-empty comments array";
+                    if !req_id.is_empty() {
+                        mods::set_shared(
+                            "diff_review.last_result".into(),
+                            json!({ "request_id": req_id, "ok": false, "target": target, "error": msg, "ts": now_ms }),
+                        );
+                    }
+                    return self.fail(msg);
+                };
+                let is_zh = settings::get().language == settings::Language::ZhCn;
+                let mut params = json!({
+                    "target": target,
+                    "comments": comments,
+                    "steer": a.get("steer").and_then(Value::as_bool).unwrap_or(false),
+                    "language": if is_zh { "zh-CN" } else { "en" },
+                });
+                if let Some(src) = Self::owned(a, "source").filter(|s| !s.is_empty()) {
+                    params["source"] = json!(src);
+                }
+                if let Some(turn) = a.get("checkpoint_turn").and_then(Value::as_u64) {
+                    params["checkpoint_turn"] = json!(turn);
+                }
+                if let Some(root) = Self::owned(a, "repo_root").filter(|s| !s.is_empty()) {
+                    params["repo_root"] = json!(root);
+                }
+                if let Some(note) = Self::owned(a, "note").filter(|s| !s.is_empty()) {
+                    params["note"] = json!(note);
+                }
+
+                let focus_after = a.get("focus").and_then(Value::as_bool).unwrap_or(false);
+                let core = self.core.clone();
+                let generation = self.core_generation;
+                let target_for_ui = target.clone();
+                cx.spawn_in(window, async move |this, cx| {
+                    let res = cx
+                        .background_executor()
+                        .spawn(async move { core.call_timeout("agent.review", params, Duration::from_secs(20)) })
+                        .await;
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        let ts = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as u64)
+                            .unwrap_or(0);
+                        match res {
+                            Ok(out) => {
+                                if this.core_generation == generation {
+                                    let returned_target = out.get("target").and_then(Value::as_str).unwrap_or_default();
+                                    let resolved_target = if target_for_ui.contains('/') || returned_target.is_empty() {
+                                        target_for_ui.clone()
+                                    } else {
+                                        returned_target.to_owned()
+                                    };
+                                    let target_kind = out.get("target_kind").and_then(Value::as_str).unwrap_or("agent").to_owned();
+                                    let comment_count = out.get("comment_count").and_then(Value::as_u64).unwrap_or(0);
+                                    let file_count = out.get("file_count").and_then(Value::as_u64).unwrap_or(0);
+                                    let staged_path = out.get("staged_path").cloned().unwrap_or(Value::Null);
+                                    mods::set_shared(
+                                        "diff_review.last_result".into(),
+                                        json!({
+                                            "request_id": req_id,
+                                            "ok": true,
+                                            "target": resolved_target,
+                                            "target_kind": target_kind,
+                                            "comment_count": comment_count,
+                                            "file_count": file_count,
+                                            "staged_path": staged_path,
+                                            "ts": ts,
+                                        }),
+                                    );
+                                    let is_zh = settings::get().language == settings::Language::ZhCn;
+                                    let title = if is_zh { "已发送行级代码审查意见" } else { "Diff review sent" };
+                                    let body = if is_zh {
+                                        format!("已将 {comment_count} 条评论（{file_count} 个文件）回流至 {resolved_target}，点击跳转查看。")
+                                    } else {
+                                        let cw = if comment_count == 1 { "comment" } else { "comments" };
+                                        let fw = if file_count == 1 { "file" } else { "files" };
+                                        format!("Sent {comment_count} {cw} ({file_count} {fw}) to {resolved_target}. Click to focus.")
+                                    };
+                                    let notification = json!({
+                                        "title": title,
+                                        "body": body,
+                                        "level": "success",
+                                        "action": { "name": "agent.focus", "args": { "terminal": resolved_target } },
+                                    });
+                                    this.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": notification }), window, cx);
+                                    if focus_after {
+                                        this.dispatch("agent.focus", &json!({ "terminal": resolved_target }), false, window, cx);
+                                    }
+                                    this.sync(window, cx);
+                                }
+                            }
+                            Err(e) => {
+                                let err_msg = format!("{e:#}");
+                                tracing::warn!("agent.send_review failed: {err_msg}");
+                                mods::set_shared(
+                                    "diff_review.last_result".into(),
+                                    json!({
+                                        "request_id": req_id,
+                                        "ok": false,
+                                        "target": target_for_ui,
+                                        "error": err_msg,
+                                        "ts": ts,
+                                    }),
+                                );
+                                this.command_error("agent.send_review", &err_msg, window, cx);
+                                cx.notify();
                             }
                         }
                     });
@@ -8095,6 +8914,20 @@ fn trim_path_sep(p: &str) -> &str {
     p.trim_end_matches(['/', '\\'])
 }
 
+fn normalize_path_cmp(p: &str) -> String {
+    let mut s = p.trim().replace('\\', "/");
+    while s.len() > 1 && s.ends_with('/') {
+        s.pop();
+    }
+    s
+}
+
+fn same_path(a: &str, b: &str) -> bool {
+    let a = normalize_path_cmp(a);
+    let b = normalize_path_cmp(b);
+    !a.is_empty() && a == b
+}
+
 pub(crate) fn path_within_or_eq(child: &str, root: &str) -> bool {
     let child = trim_path_sep(child);
     let root = trim_path_sep(root);
@@ -8148,6 +8981,15 @@ fn should_auto_mount_acp(rec: &Value) -> bool {
         return false;
     }
     if rec.pointer("/labels/herdr.parked").and_then(Value::as_str) == Some("1") {
+        return false;
+    }
+    if rec
+        .pointer("/lineage/kind")
+        .and_then(Value::as_str)
+        .map(|k| k.to_ascii_lowercase().replace('_', "-"))
+        .as_deref()
+        == Some("side-chat")
+    {
         return false;
     }
     let has_explicit_space = rec
@@ -10807,6 +11649,27 @@ export default class SystemToast extends View {
             let trash = crate::mods::shared("agents.trash").and_then(|v| v.as_array().cloned()).unwrap_or_default();
             assert!(trash.is_empty());
 
+            // Restoring a trashed side-chat agent opens it in the right side-chat panel, NOT as a top tab.
+            this.live.insert("a9".into(), json!({
+                "address": "a9",
+                "acp": true,
+                "agent": "claude",
+                "parent": "term-a",
+                "lineage": { "kind": "side-chat", "parent": "term-a" },
+                "state": "live",
+                "keep": false,
+                "cwd": "/tmp",
+                "labels": {}
+            }));
+            let tabs_before = this.model.space("space").unwrap().tabs.len();
+            assert!(this.run_as("agent.trash", json!({ "terminal": "a9" }), true, window, cx).get("error").is_none());
+            assert!(this.live["a9"]["labels"]["herdr.trashed"].as_str().is_some_and(|s| !s.is_empty()));
+            assert!(this.run_as("agent.restore", json!({ "terminal": "a9" }), true, window, cx).get("error").is_none());
+            assert_eq!(this.live["a9"]["labels"]["herdr.trashed"], json!(""));
+            assert!(this.model.any_pane_of("a9").is_none(), "restored side-chat must not open as a top tab");
+            assert_eq!(this.model.space("space").unwrap().tabs.len(), tabs_before);
+            assert_eq!(crate::mods::shared("side-chat.active"), Some(json!("a9")));
+
             // Dead/exited agent key and shell-wrapped argv normalization.
             assert_eq!(super::AppWindow::normalize_agent_program_key("claude-code"), "claude");
             assert_eq!(super::AppWindow::normalize_agent_program_key("cursor-agent"), "cursor");
@@ -10837,70 +11700,204 @@ export default class SystemToast extends View {
             "id": "context", "type": "block", "content": { "tab": "active" }
         }));
         view.update_in(cx, |this, window, cx| {
-            this.model.add_space("space", "test", "/tmp", super::Tab::new("tb1", "shell", "pa", "term-a"));
-            this.model.add_tab_unselected("space", super::Tab::with_pane("tb2", "Fork", super::AppWindow::acp_pane_node("acp-fk", "a2")));
-            this.live.insert("term-a".into(), json!({ "address": "term-a", "state": "live", "argv": ["zsh"] }));
+            // Main repo space + dedicated worktree space.
+            this.model.add_space("sp-main", "repo", "/tmp/repo", super::Tab::new("tb1", "shell", "pa", "term-a"));
+            this.model.add_space("sp-wt1", "", "/tmp/wt-fork-1", super::Tab::new("tb-wt1-sh", "shell", "p-wt1-sh", "term-wt1"));
+            this.model.add_tab("sp-wt1", super::Tab::with_pane("tb2", "Fork 1", super::AppWindow::acp_pane_node("acp-fk1", "a2")));
+            this.live.insert("term-a".into(), json!({ "address": "term-a", "state": "live", "argv": ["zsh"], "cwd": "/tmp/repo" }));
+            this.live.insert("term-wt1".into(), json!({ "address": "term-wt1", "state": "live", "argv": ["zsh"], "cwd": "/tmp/wt-fork-1" }));
             this.live.insert("a2".into(), json!({
                 "address": "a2",
                 "acp": true,
                 "agent": "claude",
                 "state": "live",
                 "keep": true,
-                "cwd": "/tmp/wt-fork",
+                "cwd": "/tmp/wt-fork-1",
                 "lineage": {
                     "kind": "fork",
                     "parent": "a1",
-                    "worktree_path": "/tmp/wt-fork",
+                    "worktree_path": "/tmp/wt-fork-1",
                     "worktree_origin": "/tmp/repo",
                     "worktree_branch": "herdr/fork-fk1",
                     "worktree_merged": false
                 },
-                "labels": { "herdr.space": "space", "herdr.tab": "tb2" }
+                "labels": { "herdr.space": "sp-wt1", "herdr.tab": "tb2", "herdr.name": "fork-one" }
             }));
             this.documents.entry(String::new()).or_default().available = true;
             this.sync(window, cx);
 
-            // 1. Closing a fork worktree tab ONLY closes the tab and parks the agent in background (never kills or deletes worktree).
+            // 1. Mounted worktree forked agent belongs to its dedicated worktree space in agents snapshot.
+            let published_agents = crate::mods::agents().as_array().cloned().unwrap_or_default();
+            let a2_entry = published_agents.iter().find(|v| v["address"] == json!("a2")).expect("a2 in agents");
+            assert_eq!(a2_entry["space"], json!("sp-wt1"));
+            assert_eq!(a2_entry["space_name"], json!("wt-fork-1"));
+
+            // 2. Closing a fork worktree tab parks the agent in background, AND parked worktree agent STILL
+            //    belongs to its dedicated worktree space (never hijacked by the parent origin space).
             let out = this.run_as("tab.close", json!({ "id": "tb2" }), true, window, cx);
             assert!(out.get("error").is_none(), "{out}");
             assert!(this.model.tab("tb2").is_none(), "tab should close cleanly");
             assert!(!this.closing_terminals.contains_key("a2"), "tab.close must never kill agent");
             assert_eq!(this.live["a2"]["labels"]["herdr.parked"], json!("1"));
             assert!(this.overlays.is_empty(), "tab.close must not prompt deletion");
+            let sp_main = this.model.space("sp-main").unwrap();
+            let sp_wt1 = this.model.space("sp-wt1").unwrap();
+            assert!(!this.acp_matches_space("a2", &this.live["a2"], sp_main), "worktree fork must not match parent space when worktree space exists");
+            assert!(this.acp_matches_space("a2", &this.live["a2"], sp_wt1), "worktree fork must match its own worktree space");
+            let published_agents = crate::mods::agents().as_array().cloned().unwrap_or_default();
+            let a2_parked = published_agents.iter().find(|v| v["address"] == json!("a2")).expect("parked a2 in agents");
+            assert_eq!(a2_parked["space"], json!("sp-wt1"));
 
-            // 2. Moving fork worktree agent to recycle bin preserves it in trash without killing it.
-            let out = this.run_as("agent.trash", json!({ "terminal": "a2" }), true, window, cx);
-            assert!(out.get("error").is_none(), "{out}");
-            assert!(!this.closing_terminals.contains_key("a2"), "agent.trash must never kill agent directly");
-            assert!(this.live["a2"]["labels"]["herdr.trashed"].as_str().is_some_and(|s| !s.is_empty()));
+            // 3. Keeping an unmounted worktree fork with NO existing worktree space targets a brand-new worktree space.
+            this.live.insert("a3".into(), json!({
+                "address": "a3",
+                "acp": true,
+                "agent": "claude",
+                "state": "live",
+                "keep": false,
+                "cwd": "/tmp/wt-fork-2",
+                "lineage": {
+                    "kind": "fork",
+                    "parent": "a1",
+                    "worktree_path": "/tmp/wt-fork-2",
+                    "worktree_origin": "/tmp/repo",
+                    "worktree_branch": "herdr/fork-fk2",
+                    "worktree_merged": false
+                },
+                "labels": { "herdr.name": "fork-two" }
+            }));
+            this.model.active = Some("sp-main".into());
+            let keep_out = this.keep_terminal_with_focus("a3", "tab", true, window, cx).unwrap();
+            assert_eq!(keep_out["pending"], json!(true));
+            let pending = this.pending_terminals.remove("a3").expect("pending keep for a3");
+            this.apply_terminal_change("a3".into(), pending.change, Ok(()), window, cx);
+            let wt2_space = this.model.spaces.iter().find(|s| s.folder == "/tmp/wt-fork-2").expect("dedicated worktree space created for a3");
+            let wt2_id = wt2_space.id.clone();
+            assert_eq!(wt2_space.name, "", "worktree space stays unnamed so spaces mod nests it under the repo");
+            assert_eq!(this.model.active.as_deref(), Some(wt2_id.as_str()));
+            let published_agents = crate::mods::agents().as_array().cloned().unwrap_or_default();
+            let a3_entry = published_agents.iter().find(|v| v["address"] == json!("a3")).expect("a3 in agents");
+            assert_eq!(a3_entry["space"], json!(wt2_id));
+            assert_eq!(a3_entry["space_name"], json!("wt-fork-2"));
 
-            // 3. Permanently purging unmerged fork worktree from recycle bin prompts 2-step dialog & merge-back guide.
+            // 4. Trashing a worktree fork when its space closes, then restoring it recreates its dedicated worktree space
+            //    (NOT restoring into sp-main).
+            assert!(this.run_as("agent.trash", json!({ "terminal": "a3" }), true, window, cx).get("error").is_none());
+            assert!(this.model.space(&wt2_id).is_none(), "test without live core closes 1-tab space");
+            this.model.active = Some("sp-main".into());
+            assert!(this.run_as("agent.restore", json!({ "terminal": "a3" }), true, window, cx).get("error").is_none());
+            let wt2_restored = this.model.spaces.iter().find(|s| s.folder == "/tmp/wt-fork-2").expect("restore must recreate worktree space");
+            let wt2_restored_id = wt2_restored.id.clone();
+            assert_eq!(wt2_restored.name, "", "recreated worktree space stays unnamed");
+            this.model.add_tab_unselected(&wt2_restored_id, super::Tab::new("tb-wt2-sh", "shell", "p-wt2-sh", "term-wt2"));
+            this.live.insert("term-wt2".into(), json!({ "address": "term-wt2", "state": "live", "argv": ["zsh"], "cwd": "/tmp/wt-fork-2" }));
+
+            // 5. Move both fork worktree agents to recycle bin (preserving them in trash without killing).
+            assert!(this.run_as("agent.trash", json!({ "terminal": "a2" }), true, window, cx).get("error").is_none());
+            assert!(this.run_as("agent.trash", json!({ "terminal": "a3" }), true, window, cx).get("error").is_none());
+            assert!(!this.closing_terminals.contains_key("a2"));
+            assert!(!this.closing_terminals.contains_key("a3"));
+
+            // 6. Permanently purging an unmerged fork worktree from recycle bin shows a single-step deletion warning
+            //    (NO merge-back prompt, NO secondary button, NO nextStep).
             let out = this.run_as("agent.purge", json!({ "terminal": "a2" }), true, window, cx);
             assert!(out.get("error").is_none(), "{out}");
             assert!(!this.closing_terminals.contains_key("a2"), "unconfirmed purge must keep agent in trash");
             assert_eq!(this.overlays.len(), 1);
             let props1 = &this.copies.get(&this.overlays[0].slot).unwrap().inst.props;
-            assert_eq!(props1["secondary"]["command"]["name"], json!("agent.handoff"));
-            assert_eq!(props1["secondary"]["command"]["args"]["kind"], json!("merge-back"));
-            assert_eq!(props1["nextStep"]["confirmDanger"], json!(true));
+            assert!(props1.get("secondary").is_none(), "purge must NOT ask to merge back: {props1}");
+            assert!(props1.get("nextStep").is_none(), "purge must be single-step: {props1}");
+            assert_eq!(props1["confirmDanger"], json!(true));
+            let items1 = props1["items"].as_array().expect("purge dialog includes structured items");
+            assert_eq!(items1.len(), 1);
+            assert_eq!(items1[0]["address"], json!("a2"));
+            assert_eq!(items1[0]["name"], json!("fork-one"));
+            assert_eq!(items1[0]["branch"], json!("herdr/fork-fk1"));
+            assert_eq!(items1[0]["path"], json!("/tmp/wt-fork-1"));
+            assert_eq!(props1["command"]["name"], json!("agent.purge"));
+            assert_eq!(props1["command"]["args"]["confirmed"], json!(true));
             this.overlays.clear();
 
-            // 4. Once marked merged, purging prompts with direct deletion warning (no secondary merge step).
-            this.live.get_mut("a2").unwrap()["lineage"]["worktree_merged"] = json!(true);
-            let out = this.run_as("agent.purge", json!({ "terminal": "a2" }), true, window, cx);
+            // 7. Emptying recycle bin with multiple worktree forked agents shows ONE aggregated confirmation dialog
+            //    listing both worktrees instead of prompting one by one.
+            let out = this.run_as("agent.empty_trash", json!({}), true, window, cx);
             assert!(out.get("error").is_none(), "{out}");
-            assert!(!this.closing_terminals.contains_key("a2"), "unconfirmed merged purge must still confirm deletion");
-            assert_eq!(this.overlays.len(), 1);
-            let props2 = &this.copies.get(&this.overlays[0].slot).unwrap().inst.props;
-            assert!(props2.get("secondary").is_none(), "merged prompt should not ask whether to merge: {props2}");
-            assert!(props2.get("nextStep").is_none(), "merged prompt should be single-step: {props2}");
-            assert_eq!(props2["confirmDanger"], json!(true));
+            assert!(!this.closing_terminals.contains_key("a2"));
+            assert!(!this.closing_terminals.contains_key("a3"));
+            assert_eq!(this.overlays.len(), 1, "must aggregate multiple worktrees into a single dialog");
+            let empty_props = &this.copies.get(&this.overlays[0].slot).unwrap().inst.props;
+            assert!(empty_props.get("secondary").is_none());
+            assert!(empty_props.get("nextStep").is_none());
+            assert_eq!(empty_props["confirmDanger"], json!(true));
+            let empty_items = empty_props["items"].as_array().expect("empty_trash dialog includes structured items");
+            assert_eq!(empty_items.len(), 2, "must list both worktree forked agents: {empty_items:?}");
+            assert!(empty_items.iter().any(|it| it["address"] == json!("a2") && it["path"] == json!("/tmp/wt-fork-1") && it["branch"] == json!("herdr/fork-fk1")));
+            assert!(empty_items.iter().any(|it| it["address"] == json!("a3") && it["path"] == json!("/tmp/wt-fork-2") && it["branch"] == json!("herdr/fork-fk2")));
+            assert_eq!(empty_props["command"]["name"], json!("agent.empty_trash"));
+            assert_eq!(empty_props["command"]["args"]["confirmed"], json!(true));
             this.overlays.clear();
 
-            // 5. Confirmed purge from recycle bin initiates kill_and_remove.
-            let out = this.run_as("agent.purge", json!({ "terminal": "a2", "confirmed": true }), true, window, cx);
+            // 8. Confirmed empty_trash permanently removes both worktree agents, closes their worktree spaces,
+            //    and schedules their worktree shells to terminate before removal.
+            let out = this.run_as("agent.empty_trash", json!({ "confirmed": true }), true, window, cx);
             assert!(out.get("error").is_none(), "{out}");
             assert!(this.closing_terminals.contains_key("a2"));
+            assert!(this.closing_terminals.contains_key("a3"));
+            assert!(this.closing_terminals.contains_key("term-wt1"));
+            assert!(this.closing_terminals.contains_key("term-wt2"));
+            assert!(this.model.space("sp-wt1").is_none(), "worktree space sp-wt1 should close on purge");
+            assert!(this.model.space(&wt2_restored_id).is_none(), "worktree space wt2 should close on purge");
+            assert!(this.model.space("sp-main").is_some(), "parent repo space must remain intact");
+
+            // 9. Empty trash with only non-worktree agents executes immediately without prompting.
+            this.live.insert("a4".into(), json!({
+                "address": "a4",
+                "acp": true,
+                "agent": "claude",
+                "state": "live",
+                "keep": false,
+                "cwd": "/tmp/repo",
+                "labels": {}
+            }));
+            assert!(this.run_as("agent.trash", json!({ "terminal": "a4" }), true, window, cx).get("error").is_none());
+            let out = this.run_as("agent.empty_trash", json!({}), true, window, cx);
+            assert!(out.get("error").is_none(), "{out}");
+            assert!(this.overlays.is_empty(), "non-worktree empty_trash should not prompt");
+            assert!(this.closing_terminals.contains_key("a4"));
+        });
+    }
+
+    #[gpui::test]
+    fn worktree_blocked_dialog_explains_reason_and_offers_agent_send_fix(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        if !running_alone("worktree_blocked_dialog_explains_reason_and_offers_agent_send_fix") { return; }
+        let parsed = super::AppWindow::parse_worktree_blocked_error(
+            r#"agent.handoff: wsl: WORKTREE_BLOCKED:{"code":"dirty_worktree","cwd":"/home/u/test","op":null,"files":["M calc.py"],"total_dirty":1}"#,
+        )
+        .expect("should parse WORKTREE_BLOCKED JSON");
+        assert_eq!(parsed["code"], json!("dirty_worktree"));
+        assert_eq!(parsed["total_dirty"], json!(1));
+
+        let (view, cx) = open_window(cx, "unused", "", json!({
+            "id": "context", "type": "block", "content": { "tab": "active" }
+        }));
+        view.update_in(cx, |this, window, cx| {
+            this.live.insert("t2t".into(), json!({
+                "address": "t2t",
+                "title": "Claude Code",
+                "state": "live",
+                "cwd": "/home/u/test",
+                "labels": {}
+            }));
+            this.open_worktree_blocked_dialog("t2t", &parsed, window, cx);
+            let ov = this.overlays.iter().find(|o| o.id == "worktree-blocked").expect("worktree-blocked dialog must open");
+            let props = &this.copies.get(&ov.slot).unwrap().inst.props;
+            assert_eq!(props["command"]["name"], json!("agent.send"));
+            assert_eq!(props["command"]["args"]["agent"], json!("t2t"));
+            assert_eq!(props["command"]["args"]["focus"], json!(true));
+            let prompt = props["command"]["args"]["text"].as_str().unwrap_or("");
+            assert!(prompt.contains("/home/u/test") && prompt.contains("M calc.py"), "unexpected fix prompt: {prompt}");
+            assert_eq!(props["items"].as_array().map(Vec::len), Some(1));
         });
     }
     /// with the 8 px margin: its body may not paint past the window border

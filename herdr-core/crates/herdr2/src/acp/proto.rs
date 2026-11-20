@@ -220,6 +220,8 @@ pub struct SessionLoadParams {
     pub session_id: String,
     pub cwd: String,
     pub mcp_servers: Vec<Value>,
+    #[serde(rename = "_meta", skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
 #[derive(Serialize, Debug, Clone)]

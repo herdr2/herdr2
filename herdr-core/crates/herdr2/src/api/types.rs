@@ -1338,6 +1338,10 @@ pub struct HandoffParams {
     #[arg(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<crate::viewers::Display>,
+    /// Caller UI language (e.g. `zh-CN` or `en`) for localized handoff prompts and context headers.
+    #[arg(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     /// Who is calling (`H2_AGENT_ID` / `H2_TERMINAL_ID`).
     #[arg(skip)]
     #[serde(default)]
@@ -1372,4 +1376,74 @@ pub struct HandoffResult {
     pub merged_files: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wait: Option<WaitResult>,
+}
+
+fn default_review_side() -> String {
+    "new".into()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewComment {
+    /// Repository-relative file path (e.g. `src/api.rs`).
+    pub path: String,
+    /// Diff side: `new`, `old`, or `context`.
+    #[serde(default = "default_review_side")]
+    pub side: String,
+    /// Inclusive 1-based start line number on the indicated side.
+    pub start_line: u32,
+    /// Inclusive 1-based end line number (defaults to `start_line`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end_line: Option<u32>,
+    /// Optional enclosing `@@ ... @@` hunk header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hunk_header: Option<String>,
+    /// Optional surrounding unified diff lines (`+`/`-`/` `) for grounding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<String>,
+    /// The reviewer's comment or requested change.
+    pub body: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewParams {
+    /// Target agent (`a*`), terminal (`t*`), name, or `machine/addr`.
+    pub target: String,
+    /// Origin surface (`changes` or `checkpoints`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Optional checkpoint turn number when reviewing a checkpoint diff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_turn: Option<u64>,
+    /// Optional repository root path for grounding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_root: Option<String>,
+    /// Optional overall instruction accompanying the line comments.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// One or more line-level review comments.
+    pub comments: Vec<ReviewComment>,
+    /// Preempt a working ACP agent via `session/cancel`, or force PTY delivery.
+    #[serde(default)]
+    pub steer: bool,
+    /// Caller UI language (`en` or `zh-CN`) for localized headers and prompts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Who is calling (`H2_AGENT_ID` / `H2_TERMINAL_ID`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ReviewResult {
+    pub target: String,
+    /// `agent` or `terminal`.
+    pub target_kind: String,
+    pub comment_count: usize,
+    pub file_count: usize,
+    /// Path to staged `diff-review*.md` when staged for PTY or oversized ACP payloads.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub staged_path: Option<String>,
+    pub status: Option<String>,
+    pub turn: u64,
+    pub inbox_len: usize,
 }

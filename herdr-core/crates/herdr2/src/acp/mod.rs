@@ -683,7 +683,7 @@ async fn setup_session(
 
     let (session_id, mut config_options, context_usage) = match (spec.resume_session_id.as_deref(), can_load_session) {
         (Some(prev_id), true) => {
-            match load_session(transport, prev_id, &spec.cwd, server.as_ref()).await {
+            match load_session(transport, prev_id, spec, server.as_ref()).await {
                 Ok(mut opts) => {
                     let mut usage = None;
                     // Drain historical session/update notifications replayed by session/load
@@ -805,16 +805,40 @@ async fn setup_session(
     Ok(SetupOk { session_id, agent_info, can_load_session, config_options, context_usage })
 }
 
+fn build_session_meta(spec: &SpawnSpec, include_system_prompt: bool) -> Option<Value> {
+    let mut obj = serde_json::Map::new();
+    if include_system_prompt
+        && let Some(s) = spec.system_prompt.as_deref().filter(|s| !s.is_empty())
+    {
+        obj.insert("systemPrompt".into(), json!({ "append": s }));
+    }
+    if presets::is_claude_agent(None, &spec.argv) && !spec.env.contains_key("ENABLE_TOOL_SEARCH") {
+        // Claude Code applies `~/.claude/settings.json` env after subprocess env. When a user has
+        // `ENABLE_TOOL_SEARCH=true` alongside non-Anthropic/Magpie routes, Turn 1 fails with
+        // `400 tools.defer_loading`. Programmatic `_meta.claudeCode.options.settings.env` overrides
+        // user settings cleanly so tools are declared in full on every route.
+        obj.insert(
+            "claudeCode".into(),
+            json!({
+                "options": {
+                    "settings": {
+                        "env": {
+                            "ENABLE_TOOL_SEARCH": "false"
+                        }
+                    }
+                }
+            }),
+        );
+    }
+    (!obj.is_empty()).then_some(Value::Object(obj))
+}
+
 async fn new_session(
     transport: &Transport,
     spec: &SpawnSpec,
     mcp: Option<&StdioMcpServer>,
 ) -> Result<(String, Vec<AcpConfigOption>), RpcError> {
-    let meta = spec
-        .system_prompt
-        .as_ref()
-        .filter(|s| !s.is_empty())
-        .map(|s| json!({ "systemPrompt": { "append": s } }));
+    let meta = build_session_meta(spec, true);
 
     for tagged in [true, false] {
         let mcp_servers = mcp.map(|m| m.to_value(tagged)).into_iter().collect();
@@ -836,12 +860,18 @@ async fn new_session(
 async fn load_session(
     transport: &Transport,
     session_id: &str,
-    cwd: &str,
+    spec: &SpawnSpec,
     mcp: Option<&StdioMcpServer>,
 ) -> Result<Vec<AcpConfigOption>, CallError> {
+    let meta = build_session_meta(spec, false);
     for tagged in [true, false] {
         let mcp_servers = mcp.map(|m| m.to_value(tagged)).into_iter().collect();
-        let params = SessionLoadParams { session_id: session_id.into(), cwd: cwd.into(), mcp_servers };
+        let params = SessionLoadParams {
+            session_id: session_id.into(),
+            cwd: spec.cwd.clone(),
+            mcp_servers,
+            meta: meta.clone(),
+        };
         match transport.request("session/load", &params, HANDSHAKE_TIMEOUT).await {
             Ok(val) => return Ok(parse_session_config(&val)),
             Err(e) if tagged && e.is_invalid_params() && mcp.is_some() => continue,

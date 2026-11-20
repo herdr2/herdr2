@@ -43,6 +43,14 @@ impl LineageKind {
             Self::SideChat => "Side Chat",
         }
     }
+
+    pub fn display_label_zh(self) -> &'static str {
+        match self {
+            Self::Handoff => "上下文接力",
+            Self::Fork => "会话分叉",
+            Self::SideChat => "旁路讨论",
+        }
+    }
 }
 
 fn is_false(v: &bool) -> bool {
@@ -88,6 +96,8 @@ pub struct HandoffBuildInput<'a> {
     pub to_turn: Option<u64>,
     pub max_bytes: usize,
     pub note: Option<&'a str>,
+    pub is_zh: bool,
+    pub worktree_origin: Option<&'a str>,
 }
 
 /// Output from [`build_handoff_package`].
@@ -207,6 +217,37 @@ pub fn default_pty_argv(preset: &str) -> Vec<String> {
     }
 }
 
+/// Rewrites path-bounded references to `origin` inside carried history text to `wt` so a forked
+/// worktree agent never gets baited into editing the parent workspace via stale absolute paths.
+pub fn rewrite_origin_paths(text: &str, origin: &str, wt: &str) -> String {
+    let orig = origin.trim().trim_end_matches(['/', '\\']);
+    let target = wt.trim().trim_end_matches(['/', '\\']);
+    if orig.is_empty() || target.is_empty() || orig == target || !text.contains(orig) {
+        return text.to_string();
+    }
+    let bytes = text.as_bytes();
+    let orig_len = orig.len();
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0usize;
+    while i < text.len() {
+        if text[i..].starts_with(orig) {
+            let left_ok = i == 0 || !matches!(bytes[i - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'/' | b'\\');
+            let end = i + orig_len;
+            let right_ok = end == text.len()
+                || !matches!(bytes[end], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b'.');
+            if left_ok && right_ok {
+                out.push_str(target);
+                i = end;
+                continue;
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// Builds a bounded deterministic Markdown context handoff package from transcript entries
 /// and live workspace git status.
 ///
@@ -222,6 +263,20 @@ pub fn build_handoff_package(input: &HandoffBuildInput<'_>) -> HandoffPackage {
     let lo = input.from_turn.unwrap_or(1);
     let hi = input.to_turn.unwrap_or(u64::MAX);
 
+    let wt_pair = match (
+        input.worktree_origin.map(str::trim).filter(|s| !s.is_empty()),
+        input.cwd.map(str::trim).filter(|s| !s.is_empty()),
+    ) {
+        (Some(orig), Some(wt)) if orig.trim_end_matches(['/', '\\']) != wt.trim_end_matches(['/', '\\']) => Some((orig, wt)),
+        _ => None,
+    };
+    let map_text = |s: &str| -> String {
+        match wt_pair {
+            Some((orig, wt)) => rewrite_origin_paths(s, orig, wt),
+            None => s.to_string(),
+        }
+    };
+
     let mut total_turns = 0u64;
     let mut per_turn: BTreeMap<u64, TurnBucket> = BTreeMap::new();
     for entry in input.entries {
@@ -235,20 +290,20 @@ pub fn build_handoff_package(input: &HandoffBuildInput<'_>) -> HandoffPackage {
             Entry::User { text, .. } => {
                 let clean = strip_h2_envelope(text);
                 if !clean.is_empty() {
-                    bucket.users.push(clean);
+                    bucket.users.push(map_text(&clean));
                 }
             }
             Entry::Plan { items, .. } => {
                 if !items.is_empty() {
-                    bucket.plan = Some(items.clone());
+                    bucket.plan = Some(items.iter().map(|it| map_text(it)).collect());
                 }
             }
             Entry::ToolCall { title, status, detail, .. } => {
-                let mut line = format!("- `[{status}]` {title}");
+                let mut line = format!("- `[{status}]` {}", map_text(title));
                 if status == "failed"
                     && let Some(d) = detail.as_deref().map(str::trim).filter(|s| !s.is_empty())
                 {
-                    let snippet = truncate_utf8_with_ellipsis(d, 200).replace('\n', " ");
+                    let snippet = truncate_utf8_with_ellipsis(&map_text(d), 200).replace('\n', " ");
                     line.push_str(&format!(" — {snippet}"));
                 }
                 bucket.tools.push(line);
@@ -256,13 +311,13 @@ pub fn build_handoff_package(input: &HandoffBuildInput<'_>) -> HandoffPackage {
             Entry::Assistant { text, .. } => {
                 let clean = text.trim();
                 if !clean.is_empty() {
-                    bucket.assistants.push(clean.to_string());
+                    bucket.assistants.push(map_text(clean));
                 }
             }
             Entry::Error { message, .. } => {
                 let clean = message.trim();
                 if !clean.is_empty() {
-                    bucket.errors.push(clean.to_string());
+                    bucket.errors.push(map_text(clean));
                 }
             }
             Entry::Thought { .. }
@@ -276,49 +331,108 @@ pub fn build_handoff_package(input: &HandoffBuildInput<'_>) -> HandoffPackage {
 
     // Header
     let mut header = String::new();
-    header.push_str(&format!(
-        "# {} Context Package (from `{}`)\n\n",
-        input.kind.display_label(),
-        input.source_address
-    ));
-    header.push_str(&format!("- **Source address:** `{}`\n", input.source_address));
-    header.push_str(&format!("- **Kind:** `{}`\n", input.kind.as_str()));
-    if let Some(p) = input.source_provider.map(str::trim).filter(|s| !s.is_empty()) {
-        header.push_str(&format!("- **Source provider:** `{p}`\n"));
-    }
-    if let Some(m) = input.source_model.map(str::trim).filter(|s| !s.is_empty()) {
-        header.push_str(&format!("- **Source model:** `{m}`\n"));
-    }
-    if let Some(sid) = input.source_session_id.map(str::trim).filter(|s| !s.is_empty()) {
-        header.push_str(&format!("- **Source session ID:** `{sid}`\n"));
-    }
-    if let Some(cwd) = input.cwd.map(str::trim).filter(|s| !s.is_empty()) {
-        header.push_str(&format!("- **Working directory:** `{cwd}`\n"));
-    }
     let selected_turns: Vec<u64> = per_turn.keys().copied().collect();
-    if !selected_turns.is_empty() {
+    if input.is_zh {
         header.push_str(&format!(
-            "- **Selected turns:** {} (of {total_turns} total)\n",
-            format_turn_ranges(&selected_turns)
+            "# {}上下文交接包（来自 `{}`）\n\n",
+            input.kind.display_label_zh(),
+            input.source_address
         ));
-    }
-    if let Some(note) = input.note.map(str::trim).filter(|s| !s.is_empty()) {
-        header.push_str("\n## Handoff Note\n\n");
-        header.push_str(note);
-        header.push('\n');
-    }
-    match input.kind {
-        LineageKind::Handoff => {
-            header.push_str("\n## Session Mode: Context Handoff\n\n");
-            header.push_str("You are taking over this task from the upstream session. **On this initial handoff turn, ONLY read and absorb the handoff context — do NOT modify any files, run mutating commands, or start making changes.** Briefly acknowledge that you have understood the context and wait for the user's next instruction before making any edits.\n");
+        header.push_str(&format!("- **来源会话：** `{}`\n", input.source_address));
+        header.push_str(&format!("- **交接类型：** `{}`\n", input.kind.display_label_zh()));
+        if let Some(p) = input.source_provider.map(str::trim).filter(|s| !s.is_empty()) {
+            header.push_str(&format!("- **来源提供商：** `{p}`\n"));
         }
-        LineageKind::Fork => {
-            header.push_str("\n## Session Mode: Forked Exploration\n\n");
-            header.push_str("You are exploring an independent branch of conversation from the upstream session. **On this initial fork turn, ONLY read and absorb the handoff context — do NOT modify any files, run mutating commands, or start making changes.** Briefly acknowledge the context and wait for the user's next instruction before proceeding.\n");
+        if let Some(m) = input.source_model.map(str::trim).filter(|s| !s.is_empty()) {
+            header.push_str(&format!("- **来源模型：** `{m}`\n"));
         }
-        LineageKind::SideChat => {
-            header.push_str("\n## Session Mode: Read-Only Side Chat\n\n");
-            header.push_str("This is an isolated side-channel discussion window alongside the user's main agent. **On this initial turn, ONLY read and absorb the handoff context — do NOT modify any files or run mutating commands.** Keep this session read-only (do NOT modify workspace files, run git write commands, or execute destructive/state-changing shell commands unless the user explicitly overrides this rule in this chat), briefly acknowledge the context, and wait for the user's question.\n");
+        if let Some(sid) = input.source_session_id.map(str::trim).filter(|s| !s.is_empty()) {
+            header.push_str(&format!("- **来源会话 ID：** `{sid}`\n"));
+        }
+        if let Some(cwd) = input.cwd.map(str::trim).filter(|s| !s.is_empty()) {
+            header.push_str(&format!("- **工作目录：** `{cwd}`\n"));
+        }
+        if !selected_turns.is_empty() {
+            header.push_str(&format!(
+                "- **携带轮次：** 第 {} 轮（共 {total_turns} 轮）\n",
+                format_turn_ranges(&selected_turns)
+            ));
+        }
+        if let Some(note) = input.note.map(str::trim).filter(|s| !s.is_empty()) {
+            header.push_str("\n## 交接备注\n\n");
+            header.push_str(note);
+            header.push('\n');
+        }
+        match input.kind {
+            LineageKind::Handoff => {
+                header.push_str("\n## 会话模式：上下文接力\n\n");
+                header.push_str("你正在从上游会话接手当前任务。**本轮作为交接初始化轮次，请仅读取并消化上述交接上下文，本轮不要修改任何文件、不要执行变更类命令、也不要提前开始改动。** 请简短确认已理解上下文，然后等待用户的下一条指令再开始操作。\n");
+            }
+            LineageKind::Fork => {
+                header.push_str("\n## 会话模式：会话分叉\n\n");
+                header.push_str("你正在从上游会话分叉出的独立探索分支中工作。**本轮作为分叉初始化轮次，请仅读取并消化上述交接上下文，本轮不要修改任何文件、不要执行变更类命令、也不要提前开始改动。** 请简短确认已理解上下文，然后等待用户的下一条指令。\n");
+            }
+            LineageKind::SideChat => {
+                header.push_str("\n## 会话模式：只读旁路讨论\n\n");
+                header.push_str("这是一个位于主智能体旁边的只读旁路讨论窗口。**本轮请仅读取并消化上述交接上下文，不要修改任何文件或执行变更类命令。** 除非用户在本对话中明确要求，否则请始终保持只读分析（不要改动工作区文件、不要执行 git 写操作或破坏性命令），简短确认已理解上下文后等待用户提问。\n");
+            }
+        }
+        if let Some((orig, wt)) = wt_pair {
+            header.push_str("\n## Worktree 隔离约束（必须严格遵守）\n\n");
+            header.push_str(&format!(
+                "- **当前独立 Worktree 目录（唯一允许操作的源码目录）：** `{wt}`\n- **上游主 Agent 原目录（严禁触碰）：** `{orig}`\n- **硬性规则：** 后续所有文件读取、编辑、测试与 git 命令都**必须严格限定在 `{wt}` 目录内**（使用相对路径或 `{wt}/...`），**绝对禁止读取、修改、写入或 `cd` 到 `{orig}`**。下方历史记录中的原目录路径已自动映射为 `{wt}`。\n"
+            ));
+        }
+    } else {
+        header.push_str(&format!(
+            "# {} Context Package (from `{}`)\n\n",
+            input.kind.display_label(),
+            input.source_address
+        ));
+        header.push_str(&format!("- **Source address:** `{}`\n", input.source_address));
+        header.push_str(&format!("- **Kind:** `{}`\n", input.kind.as_str()));
+        if let Some(p) = input.source_provider.map(str::trim).filter(|s| !s.is_empty()) {
+            header.push_str(&format!("- **Source provider:** `{p}`\n"));
+        }
+        if let Some(m) = input.source_model.map(str::trim).filter(|s| !s.is_empty()) {
+            header.push_str(&format!("- **Source model:** `{m}`\n"));
+        }
+        if let Some(sid) = input.source_session_id.map(str::trim).filter(|s| !s.is_empty()) {
+            header.push_str(&format!("- **Source session ID:** `{sid}`\n"));
+        }
+        if let Some(cwd) = input.cwd.map(str::trim).filter(|s| !s.is_empty()) {
+            header.push_str(&format!("- **Working directory:** `{cwd}`\n"));
+        }
+        if !selected_turns.is_empty() {
+            header.push_str(&format!(
+                "- **Selected turns:** {} (of {total_turns} total)\n",
+                format_turn_ranges(&selected_turns)
+            ));
+        }
+        if let Some(note) = input.note.map(str::trim).filter(|s| !s.is_empty()) {
+            header.push_str("\n## Handoff Note\n\n");
+            header.push_str(note);
+            header.push('\n');
+        }
+        match input.kind {
+            LineageKind::Handoff => {
+                header.push_str("\n## Session Mode: Context Handoff\n\n");
+                header.push_str("You are taking over this task from the upstream session. **On this initial handoff turn, ONLY read and absorb the handoff context — do NOT modify any files, run mutating commands, or start making changes.** Briefly acknowledge that you have understood the context and wait for the user's next instruction before making any edits.\n");
+            }
+            LineageKind::Fork => {
+                header.push_str("\n## Session Mode: Forked Exploration\n\n");
+                header.push_str("You are exploring an independent branch of conversation from the upstream session. **On this initial fork turn, ONLY read and absorb the handoff context — do NOT modify any files, run mutating commands, or start making changes.** Briefly acknowledge the context and wait for the user's next instruction before proceeding.\n");
+            }
+            LineageKind::SideChat => {
+                header.push_str("\n## Session Mode: Read-Only Side Chat\n\n");
+                header.push_str("This is an isolated side-channel discussion window alongside the user's main agent. **On this initial turn, ONLY read and absorb the handoff context — do NOT modify any files or run mutating commands.** Keep this session read-only (Do NOT modify workspace files, run git write commands, or execute destructive/state-changing shell commands unless the user explicitly overrides this rule in this chat), briefly acknowledge the context, and wait for the user's question.\n");
+            }
+        }
+        if let Some((orig, wt)) = wt_pair {
+            header.push_str("\n## Worktree Isolation Rules (STRICT)\n\n");
+            header.push_str(&format!(
+                "- **Isolated worktree directory (the ONLY source directory you may touch):** `{wt}`\n- **Upstream parent directory (FORBIDDEN):** `{orig}`\n- **Hard rule:** Every file read, edit, test, and shell/git command **MUST stay strictly inside `{wt}`** (use relative paths or `{wt}/...`). **NEVER read, edit, write, or `cd` into `{orig}`.** Historical paths below have already been remapped to `{wt}`.\n"
+            ));
         }
     }
 
@@ -607,6 +721,8 @@ mod tests {
             to_turn: None,
             max_bytes: 8 * 1024,
             note: Some("Continue implementation"),
+            is_zh: false,
+            worktree_origin: None,
         });
 
         assert!(pkg.bytes <= 8 * 1024, "package exceeded budget: {}", pkg.bytes);
@@ -641,9 +757,29 @@ mod tests {
             to_turn: None,
             max_bytes: 8 * 1024,
             note: None,
+            is_zh: false,
+            worktree_origin: None,
         });
         assert!(pkg.markdown.contains("Read-Only Side Chat"));
         assert!(pkg.markdown.contains("Do NOT modify workspace files"));
+
+        let zh_pkg = build_handoff_package(&HandoffBuildInput {
+            kind: LineageKind::Handoff,
+            source_address: "t1",
+            source_provider: Some("claude"),
+            source_session_id: None,
+            source_model: None,
+            cwd: None,
+            entries: &[Entry::User { turn: 1, from: None, text: "检查缓存策略".into(), ts_ms: 1 }],
+            from_turn: None,
+            to_turn: None,
+            max_bytes: 8 * 1024,
+            note: None,
+            is_zh: true,
+            worktree_origin: None,
+        });
+        assert!(zh_pkg.markdown.contains("会话模式：上下文接力"));
+        assert!(zh_pkg.markdown.contains("本轮不要修改任何文件"));
 
         // Verify fork worktree creation carries uncommitted edits and merges back cleanly.
         let root = crate::test_tmp().join(format!("h2-fork-wt-{}", crate::platform::random_hex()));
@@ -666,8 +802,14 @@ mod tests {
         std::fs::write(repo.join("app.txt"), "base\n").unwrap();
         run_git(&repo, &["add", "app.txt"]);
         run_git(&repo, &["commit", "-q", "-m", "init"]);
-        // Uncommitted edit in origin repo.
+        // Uncommitted edit in origin repo must be rejected by preflight check.
         std::fs::write(repo.join("app.txt"), "base\norigin-dirty\n").unwrap();
+        let blocked = crate::drove::integrate::create_fork_worktree(&state, &repo.to_string_lossy(), "t1").unwrap_err();
+        assert!(blocked.contains("\"code\":\"dirty_worktree\""), "expected dirty_worktree blocker: {blocked}");
+
+        // Commit the edit so origin repo is clean, then fork worktree succeeds directly off HEAD.
+        run_git(&repo, &["add", "app.txt"]);
+        run_git(&repo, &["commit", "-q", "-m", "origin clean"]);
 
         let (wt, branch) = crate::drove::integrate::create_fork_worktree(&state, &repo.to_string_lossy(), "t1").unwrap();
         let wt_path = Path::new(&wt);
@@ -710,5 +852,80 @@ mod tests {
             .success();
         assert!(!branch_exists, "fork branch must be deleted on cleanup");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn worktree_fork_rewrites_origin_paths_and_injects_isolation_rules() {
+        let origin = "/home/user/proj";
+        let wt = "/home/user/.local/state/herdr2/worktrees/forks/proj-fk1";
+        assert_eq!(
+            rewrite_origin_paths(
+                "Edit /home/user/proj/calc.py and keep /home/user/proj-other/calc.py and /home/user/proj，完成",
+                origin,
+                wt
+            ),
+            format!("Edit {wt}/calc.py and keep /home/user/proj-other/calc.py and {wt}，完成")
+        );
+
+        let entries = vec![
+            Entry::User {
+                turn: 1,
+                from: None,
+                text: "请修改 /home/user/proj/calc.py 添加乘法".into(),
+                ts_ms: 1,
+            },
+            Entry::ToolCall {
+                turn: 1,
+                id: "tc1".into(),
+                title: "Write /home/user/proj/calc.py".into(),
+                tool_kind: None,
+                status: "completed".into(),
+                detail: None,
+                ts_ms: 2,
+            },
+            Entry::Assistant {
+                turn: 1,
+                text: "已更新 `/home/user/proj/calc.py`，未动 `/home/user/proj2/x.py`。".into(),
+                ts_ms: 3,
+            },
+        ];
+
+        let pkg_zh = build_handoff_package(&HandoffBuildInput {
+            kind: LineageKind::Fork,
+            source_address: "t1",
+            source_provider: Some("claude"),
+            source_session_id: None,
+            source_model: None,
+            cwd: Some(wt),
+            entries: &entries,
+            from_turn: None,
+            to_turn: None,
+            max_bytes: 16 * 1024,
+            note: None,
+            is_zh: true,
+            worktree_origin: Some(origin),
+        });
+        assert!(pkg_zh.markdown.contains("Worktree 隔离约束"));
+        assert!(pkg_zh.markdown.contains(&format!("Write {wt}/calc.py")));
+        assert!(!pkg_zh.markdown.contains(&format!("Write {origin}/calc.py")));
+        assert!(pkg_zh.markdown.contains("/home/user/proj2/x.py"));
+
+        let pkg_en = build_handoff_package(&HandoffBuildInput {
+            kind: LineageKind::Fork,
+            source_address: "t1",
+            source_provider: Some("claude"),
+            source_session_id: None,
+            source_model: None,
+            cwd: Some(wt),
+            entries: &entries,
+            from_turn: None,
+            to_turn: None,
+            max_bytes: 16 * 1024,
+            note: None,
+            is_zh: false,
+            worktree_origin: Some(origin),
+        });
+        assert!(pkg_en.markdown.contains("Worktree Isolation Rules (STRICT)"));
+        assert!(pkg_en.markdown.contains(&format!("Write {wt}/calc.py")));
     }
 }

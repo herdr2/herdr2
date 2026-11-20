@@ -419,17 +419,150 @@ pub(crate) fn cleanup_fork_worktree(origin_cwd: &str, wt_dir: &Path, branch: Opt
     }
 }
 
-/// Creates a Git worktree on a dedicated local branch (never detached HEAD) for a forked session,
-/// capturing uncommitted working-tree modifications into a base commit so the forked agent can
-/// freely commit changes on its own branch without mutating the user's `HEAD` or index.
-/// Returns `(worktree_path, branch_name)`.
-pub(crate) fn create_fork_worktree(state_dir: &Path, origin_cwd: &str, tag: &str) -> Result<(String, String), String> {
+/// Structured preflight blocker returned when a repository is not ready for a forked Git worktree.
+#[derive(Clone, Debug)]
+pub(crate) struct WorktreeBlocker {
+    pub code: &'static str,
+    pub cwd: String,
+    pub op: Option<String>,
+    pub files: Vec<String>,
+    pub total_dirty: usize,
+}
+
+impl WorktreeBlocker {
+    pub(crate) fn wire_message(&self) -> String {
+        let payload = serde_json::json!({
+            "code": self.code,
+            "cwd": self.cwd,
+            "op": self.op,
+            "files": self.files,
+            "total_dirty": self.total_dirty,
+        });
+        format!("WORKTREE_BLOCKED:{payload}")
+    }
+}
+
+fn detect_in_progress_git_op(origin_cwd: &str) -> Option<String> {
+    let git_dir_str = git_stdout_trimmed(origin_cwd, &["rev-parse", "--git-dir"], None).ok()?;
+    let git_dir_path = Path::new(&git_dir_str);
+    let git_dir = if git_dir_path.is_absolute() {
+        git_dir_path.to_path_buf()
+    } else {
+        Path::new(origin_cwd).join(git_dir_path)
+    };
+    if git_dir.join("MERGE_HEAD").exists() {
+        return Some("merge".into());
+    }
+    if git_dir.join("rebase-merge").exists()
+        || git_dir.join("rebase-apply").exists()
+        || git_dir.join("REBASE_HEAD").exists()
+    {
+        return Some("rebase".into());
+    }
+    if git_dir.join("CHERRY_PICK_HEAD").exists() {
+        return Some("cherry-pick".into());
+    }
+    if git_dir.join("REVERT_HEAD").exists() {
+        return Some("revert".into());
+    }
+    if git_dir.join("BISECT_LOG").exists() {
+        return Some("bisect".into());
+    }
+    None
+}
+
+/// Validates that `origin_cwd` is a clean Git repository with at least one commit and no in-progress
+/// merge/rebase/conflict before creating a forked worktree. Returns `HEAD` SHA when ready.
+pub(crate) fn check_fork_worktree_ready(origin_cwd: &str) -> Result<String, WorktreeBlocker> {
     if is_aosp_harness(origin_cwd) {
-        return Err("Worktree isolation is disabled for AOSP harness workspaces; use shared directory fork instead.".into());
+        return Err(WorktreeBlocker {
+            code: "aosp_harness",
+            cwd: origin_cwd.to_string(),
+            op: None,
+            files: Vec::new(),
+            total_dirty: 0,
+        });
     }
     if !is_git_repo(origin_cwd) {
-        return Err(format!("Worktree isolation requires a Git repository (`{origin_cwd}` is not a git work tree)."));
+        return Err(WorktreeBlocker {
+            code: "not_git_repo",
+            cwd: origin_cwd.to_string(),
+            op: None,
+            files: Vec::new(),
+            total_dirty: 0,
+        });
     }
+    let Ok(head_sha) = git_stdout_trimmed(origin_cwd, &["rev-parse", "--verify", "HEAD"], None) else {
+        return Err(WorktreeBlocker {
+            code: "no_commits",
+            cwd: origin_cwd.to_string(),
+            op: None,
+            files: Vec::new(),
+            total_dirty: 0,
+        });
+    };
+
+    let mut op = detect_in_progress_git_op(origin_cwd);
+    let mut dirty: Vec<String> = Vec::new();
+    if let Ok(out) = super::bg_std_command("git")
+        .args(["-C", origin_cwd, "status", "--porcelain=v1", "-z", "-unormal"])
+        .output()
+        && out.status.success()
+    {
+        let mut iter = out.stdout.split(|b| *b == 0);
+        while let Some(raw) = iter.next() {
+            if raw.len() < 4 {
+                continue;
+            }
+            let x = raw[0] as char;
+            let y = raw[1] as char;
+            let xy = [x, y];
+            let path = String::from_utf8_lossy(&raw[3..]).to_string();
+            if matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C') {
+                let _ = iter.next(); // consume original path for rename/copy
+            }
+            if matches!(
+                xy,
+                ['D', 'D'] | ['A', 'U'] | ['U', 'D'] | ['U', 'A'] | ['D', 'U'] | ['A', 'A'] | ['U', 'U']
+            ) && op.is_none()
+            {
+                op = Some("conflict".into());
+            }
+            if xy == ['?', '?'] && super::roles::is_ephemeral_cache_path(path.trim_end_matches('/')) {
+                continue;
+            }
+            dirty.push(format!("{x}{y} {path}"));
+        }
+    }
+
+    if let Some(in_prog) = op {
+        let total_dirty = dirty.len();
+        return Err(WorktreeBlocker {
+            code: "in_progress_op",
+            cwd: origin_cwd.to_string(),
+            op: Some(in_prog),
+            files: dirty.into_iter().take(8).collect(),
+            total_dirty,
+        });
+    }
+    if !dirty.is_empty() {
+        let total_dirty = dirty.len();
+        return Err(WorktreeBlocker {
+            code: "dirty_worktree",
+            cwd: origin_cwd.to_string(),
+            op: None,
+            files: dirty.into_iter().take(8).collect(),
+            total_dirty,
+        });
+    }
+    Ok(head_sha)
+}
+
+/// Creates a Git worktree on a dedicated local branch (never detached HEAD) for a forked session
+/// directly from the repository's clean `HEAD` commit so main and fork share exact Git history.
+/// Returns `(worktree_path, branch_name)`.
+pub(crate) fn create_fork_worktree(state_dir: &Path, origin_cwd: &str, tag: &str) -> Result<(String, String), String> {
+    let head_sha = check_fork_worktree_ready(origin_cwd).map_err(|b| b.wire_message())?;
     let repo_name: String = Path::new(origin_cwd)
         .file_name()
         .and_then(|s| s.to_str())
@@ -443,11 +576,10 @@ pub(crate) fn create_fork_worktree(state_dir: &Path, origin_cwd: &str, tag: &str
     let wt_parent = state_dir.join("worktrees").join("forks");
     std::fs::create_dir_all(&wt_parent).map_err(|e| format!("mkdir fork worktree parent: {e}"))?;
     let wt_dir = wt_parent.join(format!("{repo_name}-{tag}"));
-    let base_commit = snapshot_working_tree_commit(origin_cwd, &wt_parent)?;
     let wt_str = wt_dir.display().to_string();
     let branch = format!("herdr/fork-{tag}");
     let out = super::bg_std_command("git")
-        .args(["-C", origin_cwd, "worktree", "add", "-b", &branch, &wt_str, &base_commit])
+        .args(["-C", origin_cwd, "worktree", "add", "-b", &branch, &wt_str, &head_sha])
         .output()
         .map_err(|e| format!("spawn git worktree add: {e}"))?;
     if !out.status.success() {
@@ -559,34 +691,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fork_worktree_works_on_unborn_git_repo_and_merges_back() {
-        let base = std::env::temp_dir().join(format!("herdr2-unborn-wt-{}", super::super::crypto::rand_id("t")));
-        let repo = base.join("unborn-repo");
+    fn fork_worktree_preflight_blocks_unready_repos_and_succeeds_when_clean() {
+        let base = std::env::temp_dir().join(format!("herdr2-preflight-wt-{}", super::super::crypto::rand_id("t")));
+        let repo = base.join("repo");
         let state = base.join("state");
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::create_dir_all(&state).unwrap();
 
-        let init = super::super::bg_std_command("git")
-            .args(["-C", repo.to_str().unwrap(), "init", "-q"])
-            .output()
-            .unwrap();
-        assert!(init.status.success(), "git init failed: {:?}", init);
-        std::fs::write(repo.join("calc.py"), "print(1)\n").unwrap();
+        // 1. Not a git repo -> not_git_repo
+        let err1 = create_fork_worktree(&state, repo.to_str().unwrap(), "fk0").unwrap_err();
+        assert!(err1.contains("\"code\":\"not_git_repo\""), "err1={err1}");
 
+        // 2. Initialized with git init, no commits yet -> no_commits
+        let run_git = |args: &[&str]| {
+            let out = super::super::bg_std_command("git")
+                .args(["-C", repo.to_str().unwrap()])
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@local")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@local")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run_git(&["init", "-q"]);
+        std::fs::write(repo.join("calc.py"), "print(1)\n").unwrap();
+        let err2 = create_fork_worktree(&state, repo.to_str().unwrap(), "fk0").unwrap_err();
+        assert!(err2.contains("\"code\":\"no_commits\""), "err2={err2}");
+
+        // 3. Committed, then dirty working tree -> dirty_worktree
+        run_git(&["add", "calc.py"]);
+        run_git(&["commit", "-q", "-m", "init"]);
+        std::fs::write(repo.join("calc.py"), "print(1)\nprint(2)\n").unwrap();
+        let err3 = create_fork_worktree(&state, repo.to_str().unwrap(), "fk0").unwrap_err();
+        assert!(err3.contains("\"code\":\"dirty_worktree\""), "err3={err3}");
+        assert!(err3.contains("calc.py"), "err3={err3}");
+
+        // 4. Clean working tree (ephemeral __pycache__ ignored) + simulated MERGE_HEAD -> in_progress_op
+        run_git(&["checkout", "--", "calc.py"]);
+        std::fs::create_dir_all(repo.join("__pycache__")).unwrap();
+        std::fs::write(repo.join("__pycache__/calc.cpython-312.pyc"), "bin").unwrap();
+        std::fs::write(repo.join(".git/MERGE_HEAD"), "0000000000000000000000000000000000000000\n").unwrap();
+        let err4 = create_fork_worktree(&state, repo.to_str().unwrap(), "fk0").unwrap_err();
+        assert!(err4.contains("\"code\":\"in_progress_op\""), "err4={err4}");
+        assert!(err4.contains("\"op\":\"merge\""), "err4={err4}");
+        std::fs::remove_file(repo.join(".git/MERGE_HEAD")).unwrap();
+
+        // 5. Clean working tree -> succeeds directly off HEAD and merges back cleanly!
         let (wt, branch) = create_fork_worktree(&state, repo.to_str().unwrap(), "fk1").unwrap();
         assert_eq!(branch, "herdr/fork-fk1");
-        assert!(Path::new(&wt).join("calc.py").is_file());
         assert_eq!(std::fs::read_to_string(Path::new(&wt).join("calc.py")).unwrap(), "print(1)\n");
 
-        // Edit existing untracked file and add a new file inside the fork worktree.
         std::fs::write(Path::new(&wt).join("calc.py"), "print(1)\nprint(2)\n").unwrap();
         std::fs::write(Path::new(&wt).join("helper.py"), "ok = True\n").unwrap();
-
         let merged = merge_fork_worktree(repo.to_str().unwrap(), &wt, true).unwrap();
         assert!(merged.iter().any(|f| f == "calc.py"), "merged={merged:?}");
         assert!(merged.iter().any(|f| f == "helper.py"), "merged={merged:?}");
         assert_eq!(std::fs::read_to_string(repo.join("calc.py")).unwrap(), "print(1)\nprint(2)\n");
-        assert_eq!(std::fs::read_to_string(repo.join("helper.py")).unwrap(), "ok = True\n");
         assert!(!Path::new(&wt).exists(), "worktree dir should be cleaned up");
         let _ = std::fs::remove_dir_all(&base);
     }
