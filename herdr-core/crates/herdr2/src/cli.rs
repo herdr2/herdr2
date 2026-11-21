@@ -109,6 +109,21 @@ enum AiCmd {
         #[arg(long)]
         no_ai: bool,
     },
+    /// Generate a concise Git commit message for uncommitted changes using Core AI.
+    CommitMessage {
+        /// Git repository directory (defaults to current working directory).
+        #[arg(long)]
+        cwd: Option<String>,
+        /// Target remote machine (`h2 machine ls`).
+        #[arg(long)]
+        on: Option<String>,
+        /// Preferred language (`zh-CN` / `en`).
+        #[arg(long)]
+        lang: Option<String>,
+        /// Return deterministic fallback without calling Core AI.
+        #[arg(long)]
+        no_ai: bool,
+    },
 }
 
 #[derive(Parser)]
@@ -591,6 +606,21 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
                     r["semanticTitle"].as_str().unwrap_or("-"),
                     r["microSummary"].as_str().unwrap_or("-"),
                 );
+                Out { json: r, human }
+            }
+            AiCmd::CommitMessage { cwd, on, lang, no_ai } => {
+                let mut params = json!({ "includeAi": !no_ai });
+                if let Some(dir) = cwd.or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string())) {
+                    params["cwd"] = json!(dir);
+                }
+                if let Some(m) = on {
+                    params["on"] = json!(m);
+                }
+                if let Some(l) = lang {
+                    params["language"] = json!(l);
+                }
+                let r = call("ai.commit_message", params)?;
+                let human = r["message"].as_str().unwrap_or("").to_string();
                 Out { json: r, human }
             }
         },
@@ -1225,6 +1255,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("ai handoff-recommend", "ai.handoff_recommend"),
     ("ai briefing", "ai.briefing"),
     ("ai summarize-agent", "ai.summarize_agent"),
+    ("ai commit-message", "ai.commit_message"),
     ("checkpoint ls", "checkpoint.list"),
     ("checkpoint snap", "checkpoint.capture"),
     ("checkpoint diff", "checkpoint.diff"),

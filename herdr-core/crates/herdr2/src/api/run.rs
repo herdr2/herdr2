@@ -159,6 +159,14 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
 
     let spec_skip = p.dangerously_skip_permissions && mode.is_none();
     let mcp_exe = crate::client::exe_path().map(|exe| exe.display().to_string()).unwrap_or_else(|| "herdr2".into());
+    let mut config_overrides = BTreeMap::new();
+    let is_cursor = matches!(resolved.preset.as_deref(), Some("cursor" | "cursor-agent"));
+    let cursor_has_effort = is_cursor && model.as_deref().is_some_and(crate::acp::model_has_embedded_effort);
+    if !cursor_has_effort
+        && let Some(eff) = p.effort.as_deref().map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("default"))
+    {
+        config_overrides.insert("reasoning_effort".into(), serde_json::Value::String(eff.to_string()));
+    }
     let spec = SpawnSpec {
         address,
         argv: resolved.argv,
@@ -170,7 +178,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         model,
         mode,
         dangerously_skip_permissions: spec_skip,
-        config_overrides: BTreeMap::new(),
+        config_overrides,
         inject_mcp,
         mcp_exe,
         socket: core.paths.socket.display().to_string(),

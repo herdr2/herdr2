@@ -139,7 +139,7 @@
                     "content": {
                       "mod": "pane"
                     },
-                    "height": 32,
+                    "height": 56,
                     "position": "top",
                     "reveal": "always"
                   }

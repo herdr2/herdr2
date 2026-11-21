@@ -293,6 +293,75 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
                         "stderr": ""
                     }))
                 }
+                "hc" | "h2" if first == json!(["read", "--json", "t_large_working"]) => {
+                    let mut entries = Vec::new();
+                    let mut ts = 1_795_250_000_000i64;
+                    for turn in 1..=26 {
+                        entries.push(json!({
+                            "kind": "user",
+                            "turn": turn,
+                            "text": format!("Turn {turn}: inspect `herdr-app/defaults/mods/peek/main.js:120` and fix working CLI chat view rendering."),
+                            "ts_ms": ts
+                        }));
+                        ts += 1000;
+                        for step in 0..4 {
+                            entries.push(json!({
+                                "kind": "thought",
+                                "turn": turn,
+                                "text": format!("**Step {step}** Checking transcript rendering and QuickJS budget for turn {turn}."),
+                                "ts_ms": ts
+                            }));
+                            entries.push(json!({
+                                "id": "",
+                                "kind": "tool_call",
+                                "turn": turn,
+                                "title": format!("read_file /home/zzh0838/Project/herdr2/herdr-app/defaults/mods/peek/main.js #{step}"),
+                                "tool_kind": "read",
+                                "status": "completed",
+                                "detail": format!("line 1: fn sample_{turn}_{step}() {{}}\nline 2: return ok;\n"),
+                                "ts_ms": ts + 100
+                            }));
+                            ts += 500;
+                        }
+                        if turn < 26 {
+                            entries.push(json!({
+                                "kind": "assistant",
+                                "turn": turn,
+                                "text": format!("Finished turn {turn} after inspecting `herdr-app/src/window.rs:1600` and `herdr-app/defaults/mods/peek/acp_model.js:900`.\n\n```js\nconst turn = {turn};\n```"),
+                                "ts_ms": ts
+                            }));
+                        } else {
+                            // Active working turn with many steps (defaultExpanded = true while working)
+                            for extra in 0..45 {
+                                entries.push(json!({
+                                    "id": "",
+                                    "kind": "tool_call",
+                                    "turn": turn,
+                                    "title": format!("run_command cargo test step_{extra}"),
+                                    "tool_kind": "execute",
+                                    "status": if extra == 44 { "in_progress" } else { "completed" },
+                                    "detail": format!("cargo test --locked step_{extra}\npassed"),
+                                    "ts_ms": ts + extra * 100
+                                }));
+                            }
+                        }
+                    }
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "complete": true,
+                            "how": "transcript",
+                            "session_meta": {
+                                "model": "gemini-4-neon-high",
+                                "provider": "agy",
+                                "session_id": "test-large-working"
+                            },
+                            "entries": entries,
+                            "text": "working..."
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
+                }
                 "hc" | "h2" if first == json!(["get", "--json", "t1"]) => {
                     Some(json!({
                         "code": 0,
@@ -3543,9 +3612,9 @@ fn flash_note_button_composer_and_sidebar_list_work_end_to_end(cx: &mut TestAppC
     cx.update(gpui_shell::init);
     let staged = Staged::new();
 
-    // 1) Top-right tabs bar renders the Flash Notes (Ideas) button.
+    // 1) Top-right tabs bar does not render the removed Flash Notes button.
     let tabs_tree = describe(cx, &staged, "mods/tabs", true, props(), updates("current", "current"), None).unwrap();
-    assert!(tabs_tree.contains("btn-flash-note"), "top-right flash note button missing: {tabs_tree}");
+    assert!(!tabs_tree.contains("btn-flash-note"), "top-right flash note button should be removed: {tabs_tree}");
 
     // 2) Bottom-left sidebar list renders empty state and saved notes cleanly.
     let list_empty = describe_with_values(
@@ -3880,4 +3949,43 @@ fn catchup_briefing_semantic_naming_and_ai_switch_render_cleanly(cx: &mut TestAp
     .unwrap();
     assert!(ai_tree.contains("st-ai-sw-semantic"), "AI settings missing st-ai-sw-semantic: {ai_tree}");
     assert!(ai_tree.contains("语义命名与悬停微摘要"), "AI settings missing zh label: {ai_tree}");
+}
+
+#[gpui::test]
+fn working_cli_peek_renders_large_transcript_within_quickjs_budget(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let program = json!({"key":"antigravity", "name":"Antigravity", "icon":null, "tint":false, "tile":"#1c1d21", "color":"#ffffff", "shell":false, "agent":true});
+    let mut pty_values = fixture(true, json!({"terminal":"t_large_working","acp":true,"pty":true,"tab":true,"pane":"p1"}), updates("current", "current"));
+    pty_values.insert("terminals".into(), json!([
+        {"address":"t_large_working","name":"Antigravity","title":"Antigravity","argv":["agy"],"parent":null,"labels":{"herdr.view":"peek"},"state":"live","status":"working","turn":26,"program":program,"cwd":"/home/zzh0838/Project/herdr2","working_since":1795267674185i64}
+    ]));
+    pty_values.insert("agents".into(), json!([
+        {"address":"t_large_working","pane":"p1","space":"s1","space_name":"Local","tab":"tab1","tab_index":1,"tab_name":"Antigravity","status":"working","app":"antigravity","program":program,"title":"Antigravity","seq":1,"focused":true}
+    ]));
+    pty_values.insert("panes".into(), json!([
+        {"pane":"p1","terminal":"t_large_working","tab":"tab1","title":"Antigravity","cwd":"/home/zzh0838/Project/herdr2","status":"working","program":program,"structured":true,"focused":true,"zoomed":false,"movable":false}
+    ]));
+
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    let policy = Policy::new()
+        .with_storage_path(staged.0.join("store-large-working-cli.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(module(pty_values, calls.clone()))
+        .unwrap();
+    let runtime = ShellRuntime::new_isolated().unwrap();
+    let root = staged.0.join("mods/peek");
+    let window = cx.add_window(|_, _| Empty);
+    let mut session = window.update(cx, |_, window, cx| {
+        let mut session = DescriptionSession::load(runtime, root, policy, window, cx).unwrap();
+        let _ = session.describe(window, cx).unwrap();
+        session
+    }).unwrap();
+    cx.run_until_parked();
+    let tree = window.update(cx, |_, window, cx| session.describe(window, cx)).unwrap().unwrap();
+    assert!(!tree.contains("acp-error-banner"), "working CLI peek should render without error banner: {tree}");
+    assert!(tree.contains("acp-load-earlier"), "long transcript should window earlier items: {tree}");
+    assert!(tree.contains("acp-grp-more-"), "expanded working activity group should cap visible steps: {tree}");
+    assert!(tree.contains("acp-working-tail"), "working CLI peek should show active working tail: {tree}");
+    assert!(tree.contains("acp-stop"), "working CLI peek should render stop button: {tree}");
 }

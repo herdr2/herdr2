@@ -211,6 +211,10 @@ pub struct RunParams {
     #[arg(long, value_name = "MODEL")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reasoning effort override passed to `session/set_config_option` (`reasoning_effort` / `thought_level`).
+    #[arg(long, value_name = "EFFORT")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// Session mode override passed to `session/set_mode`.
     #[arg(long, value_name = "MODE")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1314,10 +1318,14 @@ pub struct HandoffParams {
     #[arg(long)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// Model override for newly spawned ACP agent targets.
+    /// Model override for newly spawned ACP or PTY agent targets.
     #[arg(long, value_name = "MODEL")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Reasoning effort override (`low`, `medium`, `high`, `xhigh`, `max`) for newly spawned targets.
+    #[arg(long, value_name = "EFFORT")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// Keep newly spawned target alive across restarts (`--keep`).
     #[arg(long)]
     #[serde(default)]

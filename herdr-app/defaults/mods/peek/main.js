@@ -9,7 +9,14 @@ import { buildConversationItems, buildPtySessionBadges, summarizeActivityGroup, 
 
 const LANE_MAX_W = 736; // 46rem editorial content column (--chat-content-max-width)
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
+const DEFAULT_VISIBLE_ITEMS = 30;
+const VISIBLE_ITEMS_STEP = 30;
+const DEFAULT_VISIBLE_STEPS = 24;
+const LINKIFY_CACHE_MAX = 256;
+const LINKIFY_CACHE = new Map();
+let _frameSettings = null;
+const readSettings = () => _frameSettings ?? (typeof settings === "function" ? settings() : null);
+const isZh = () => String(readSettings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
 const KNOWN_ROOT_FILE_RE = /^(?:Makefile|Dockerfile|Cargo\.(?:toml|lock)|package(?:-lock)?\.json|tsconfig\.json|README\.md|CLAUDE\.md|AGENTS\.md|SKILL\.md|justfile|\.gitignore|\.env(?:\.\w+)?)$/i;
 
@@ -72,11 +79,14 @@ function looksLikeFilePath(raw) {
 
 function linkifyFilePaths(text) {
   if (!text || typeof text !== "string") return "";
+  if (text.length > 65536) return text;
+  const cached = LINKIFY_CACHE.get(text);
+  if (cached !== undefined) return cached;
   const lines = text.split("\n");
   let inFence = false;
   let fenceChar = "";
   const tokenRe = /(!?\[[^\]]*\]\([^)]+\)|`[^`\n]+`|https?:\/\/[^\s)<>]+|(?:~\/|\.\.?\/|\/(?:[A-Za-z0-9._-]+\/)+|[A-Za-z0-9._-]+\/(?:[A-Za-z0-9._-]+\/)*)[A-Za-z0-9._-]+(?::\d+(?:-\d+|:\d+)?|#L\d+(?:-L?\d+)?)?)/g;
-  return lines
+  const out = lines
     .map((line) => {
       const trimmed = line.trimStart();
       if (/^(`{3,}|~{3,})/.test(trimmed)) {
@@ -110,6 +120,11 @@ function linkifyFilePaths(text) {
       });
     })
     .join("\n");
+  if (LINKIFY_CACHE.size >= LINKIFY_CACHE_MAX) {
+    LINKIFY_CACHE.clear();
+  }
+  LINKIFY_CACHE.set(text, out);
+  return out;
 }
 
 function parseClickableFileLink(rawUrl) {
@@ -235,6 +250,12 @@ export default class Peek extends View {
     this.reloadForceDetail = false;
     this.reloadEpoch = 0;
     this.lastCkptEpoch = "";
+    this.lastReadStdout = "";
+    this._itemsCache = null;
+    this.visibleItemLimit = DEFAULT_VISIBLE_ITEMS;
+    this.expandedStepLimits = {};
+    this.ptyPollTick = 0;
+    this._frame = null;
     this.expandedGroups = {};
     this.expandedSteps = {};
     this.wrappedCodes = {};
@@ -349,13 +370,36 @@ export default class Peek extends View {
       });
       if (this.isPtyMode() || this.ownProps()?.sidePanel) {
         cx.timer.every(1200, (tcx) => {
-          if (this.isPtyMode() && this.term()?.state === "live") this.scheduleReload(tcx);
+          if (!this.isPtyMode() || this.term()?.state !== "live") return;
+          const curSt = this.status();
+          const busy = curSt === "working" || curSt === "starting" || !this.loadedOnce;
+          this.ptyPollTick = (this.ptyPollTick || 0) + 1;
+          if (busy || this.ptyPollTick % 3 === 0) {
+            this.scheduleReload(tcx);
+          }
         });
       }
     }
   }
 
+  frameTerminals() {
+    return this._frame?.terminals ?? terminals();
+  }
+
+  frameAgents() {
+    return this._frame?.agents ?? agents();
+  }
+
+  framePanes() {
+    return this._frame?.panes ?? panes();
+  }
+
+  frameSpaces() {
+    return this._frame?.spaces ?? (typeof spaces === "function" ? spaces() : []);
+  }
+
   ownProps() {
+    if (this._frame?.props) return this._frame.props;
     const p = props();
     if (p && typeof p === "object" && Object.keys(p).length > 0) {
       return p;
@@ -364,10 +408,10 @@ export default class Peek extends View {
   }
 
   focusedMainAddress() {
-    const pList = typeof panes === "function" ? panes() : [];
+    const pList = this.framePanes();
     const fp = pList.find((p) => p?.focused && p?.terminal);
     if (fp?.terminal) return fp.terminal;
-    const aList = typeof agents === "function" ? agents() : [];
+    const aList = this.frameAgents();
     const fa = aList.find((a) => a?.focused && a?.address);
     if (fa?.address) return fa.address;
     const foc = typeof focused === "function" ? focused() : null;
@@ -375,8 +419,9 @@ export default class Peek extends View {
   }
 
   activeSideChatCandidates() {
+    if (this._frame?.sideCandidates) return this._frame.sideCandidates;
     const mainAddr = this.focusedMainAddress();
-    return terminals().filter((x) => {
+    return this.frameTerminals().filter((x) => {
       if (!x?.address || x.state !== "live" || x.labels?.["herdr.trashed"]) return false;
       if (String(x.lineage?.kind || "").toLowerCase().replace("_", "-") !== "side-chat") return false;
       if (!mainAddr) return false;
@@ -386,6 +431,9 @@ export default class Peek extends View {
   }
 
   activeTerminal() {
+    if (this._frame && Object.prototype.hasOwnProperty.call(this._frame, "terminal")) {
+      return this._frame.terminal;
+    }
     const p = this.ownProps();
     if (!p.sidePanel) return p.terminal || null;
     const candidates = this.activeSideChatCandidates();
@@ -398,16 +446,22 @@ export default class Peek extends View {
   }
 
   isPtyMode() {
+    if (this._frame && typeof this._frame.isPty === "boolean") {
+      return this._frame.isPty;
+    }
     const p = this.ownProps();
     if (p.pty) return true;
     if (!p.sidePanel) return false;
     const addr = this.activeTerminal();
     if (!addr) return false;
-    const rec = terminals().find((t) => t.address === addr);
+    const rec = this.frameTerminals().find((t) => t.address === addr);
     return Boolean(rec && !rec.acp);
   }
 
   isSideChatSession(k = this.term()) {
+    if (this._frame && typeof this._frame.isSideChat === "boolean" && k === this._frame.term) {
+      return this._frame.isSideChat;
+    }
     const p = this.ownProps();
     if (p.sidePanel || p.floating) return true;
     const lk = String(k?.lineage?.kind || this.agentDetail?.lineage?.kind || "").toLowerCase().replace("_", "-");
@@ -415,23 +469,95 @@ export default class Peek extends View {
   }
 
   term() {
+    if (this._frame && Object.prototype.hasOwnProperty.call(this._frame, "term")) {
+      return this._frame.term;
+    }
     const addr = this.activeTerminal();
     if (!addr) return null;
-    return terminals().find((t) => t.address === addr) ?? (this.lastDetailTerminal === addr ? this.agentDetail : null);
+    return this.frameTerminals().find((t) => t.address === addr) ?? (this.lastDetailTerminal === addr ? this.agentDetail : null);
   }
 
   status() {
+    if (this._frame && Object.prototype.hasOwnProperty.call(this._frame, "status")) {
+      return this._frame.status;
+    }
     const addr = this.activeTerminal();
     if (!addr) return null;
-    const fromAgent = agents().find((a) => a.address === addr)?.status;
+    const fromAgent = this.frameAgents().find((a) => a.address === addr)?.status;
     if (fromAgent) return fromAgent;
-    const fromTerm = terminals().find((t) => t.address === addr)?.status;
+    const fromTerm = this.frameTerminals().find((t) => t.address === addr)?.status;
     if (typeof fromTerm === "string" && fromTerm) return fromTerm;
     if (fromTerm?.state) return fromTerm.state;
-    const fromPane = panes().find((p) => p.terminal === addr)?.status;
+    const fromPane = this.framePanes().find((p) => p.terminal === addr)?.status;
     if (fromPane) return fromPane;
     if (this.lastDetailTerminal === addr && this.agentDetail?.status?.state === "working") return "working";
     return this.lastDetailTerminal === addr && this.agentDetail?.state === "finished" ? "ended" : null;
+  }
+
+  getConversationItems(k, st, isPty) {
+    const working = st === "working";
+    const how = this.readHow ?? null;
+    const turn = k?.turn ?? 0;
+    const isAgent = Boolean(k?.program?.agent || k?.status || st);
+    const cwd = k?.cwd || "";
+    const c = this._itemsCache;
+    if (
+      c
+      && c.entries === this.entries
+      && c.fallbackText === this.fallbackText
+      && c.working === working
+      && c.isPty === isPty
+      && c.how === how
+      && c.turn === turn
+      && c.isAgent === isAgent
+      && c.cwd === cwd
+      && c.checkpoints === this.checkpoints
+    ) {
+      return c;
+    }
+    const items = buildConversationItems(this.entries, this.fallbackText, working, {
+      isPty,
+      how,
+      turn,
+      isAgent,
+      cwd,
+      checkpointsByTurn: this.checkpoints,
+    });
+    const visibleItems = items.filter((item) => item.kind !== "stderr_group");
+    const maxTurn = items.reduce((m, it) => Math.max(m, Number(it?.turn) || 0), 0);
+    const built = {
+      entries: this.entries,
+      fallbackText: this.fallbackText,
+      working,
+      isPty,
+      how,
+      turn,
+      isAgent,
+      cwd,
+      checkpoints: this.checkpoints,
+      items,
+      visibleItems,
+      maxTurn,
+    };
+    this._itemsCache = built;
+    return built;
+  }
+
+  warmTailLinkify(visibleItems) {
+    if (!Array.isArray(visibleItems) || visibleItems.length === 0) return;
+    const limit = Math.max(DEFAULT_VISIBLE_ITEMS, this.visibleItemLimit || DEFAULT_VISIBLE_ITEMS);
+    const start = Math.max(0, visibleItems.length - limit);
+    for (let i = start; i < visibleItems.length; i++) {
+      const it = visibleItems[i];
+      if (it?.kind === "assistant" && Array.isArray(it.blocks)) {
+        for (const b of it.blocks) {
+          if (b && b.type !== "code" && b.text) linkifyFilePaths(b.text);
+        }
+      } else if (it?.kind === "user" && it.body) {
+        const body = it.body.length > 900 ? `${it.body.slice(0, 720).trimEnd()}…` : it.body;
+        linkifyFilePaths(body);
+      }
+    }
   }
 
   scheduleReload(cx = null, opts = {}) {
@@ -471,6 +597,7 @@ export default class Peek extends View {
     const forceDetail = Boolean(this.reloadForceDetail);
     this.reloadForceDetail = false;
     let yielded = false;
+    let changed = true;
     try {
       const liveTerm = this.term();
       const curTurn = liveTerm?.turn ?? -1;
@@ -494,6 +621,7 @@ export default class Peek extends View {
         if (forceDetail) this.reloadForceDetail = true;
         return;
       }
+      let detailUpdated = false;
       if (detailRes && detailRes.code === 0) {
         try {
           const parsedDetail = JSON.parse(detailRes.stdout || "{}");
@@ -502,19 +630,32 @@ export default class Peek extends View {
             this.lastDetailTerminal = terminal;
             this.lastDetailTurn = Number(parsedDetail.turn ?? curTurn);
             this.lastDetailInboxLen = Number(parsedDetail.inbox_len ?? curInboxLen);
+            detailUpdated = true;
           }
         } catch {}
       }
       if (res.code !== 0) {
+        this.lastReadStdout = "";
         this.error = (res.stderr || res.stdout || "Failed to read transcript").trim();
       } else {
-        const parsed = JSON.parse(res.stdout || "{}");
-        this.entries = Array.isArray(parsed.entries) ? parsed.entries : [];
-        this.fallbackText = parsed.text || "";
-        this.readHow = parsed.how || null;
-        this.sessionMeta = parsed.session_meta ?? null;
-        this.loadedOnce = true;
-        this.error = null;
+        const rawStdout = res.stdout || "{}";
+        if (rawStdout === this.lastReadStdout && this.loadedOnce && !this.error && !detailUpdated) {
+          changed = false;
+        } else {
+          this.lastReadStdout = rawStdout;
+          const parsed = JSON.parse(rawStdout);
+          this.entries = Array.isArray(parsed.entries) ? parsed.entries : [];
+          this.fallbackText = parsed.text || "";
+          this.readHow = parsed.how || null;
+          this.sessionMeta = parsed.session_meta ?? null;
+          this.loadedOnce = true;
+          this.error = null;
+          // Precompute conversation items & linkify inside the async task (500ms budget)
+          // so the next GPUI render() (50ms budget) hits warm caches.
+          const latestTerm = this.term();
+          const built = this.getConversationItems(latestTerm, this.status(), this.isPtyMode());
+          this.warmTailLinkify(built.visibleItems);
+        }
       }
     } catch (e) {
       if (myEpoch === this.reloadEpoch) {
@@ -522,7 +663,7 @@ export default class Peek extends View {
       }
     } finally {
       this.loading = false;
-      if (yielded) {
+      if (yielded && changed) {
         try {
           (notifyCx ?? this.cx)?.notify?.();
         } catch {}
@@ -628,10 +769,13 @@ export default class Peek extends View {
         this.checkpointDiffs = {};
         this.checkpointDiffOpen = {};
         this.expandedGroups = {};
+        this.expandedStepLimits = {};
         this.autoFollow = true;
         this.revealedSig = "";
         this.optimisticInbox = null;
         this.lastDetailTerminal = "";
+        this.lastReadStdout = "";
+        this._itemsCache = null;
         this.reloadEpoch = (this.reloadEpoch || 0) + 1;
         setShared("checkpoint.sync", `${terminal}:${toTurn}:${Date.now()}`);
         await this.reloadTranscript(taskCx ?? this.cx, { forceDetail: true });
@@ -722,7 +866,7 @@ export default class Peek extends View {
   }
 
   inboxItemsFor(k = this.term()) {
-    return normalizeInboxItems(this.rawInboxFor(k), terminals(), this.activeTerminal() ?? "");
+    return normalizeInboxItems(this.rawInboxFor(k), this.frameTerminals(), this.activeTerminal() ?? "");
   }
 
   startEditInboxItem(item, cx) {
@@ -1074,7 +1218,7 @@ export default class Peek extends View {
   }
 
   mdOptions(t, cwd) {
-    const isDark = settings()?.dark ?? true;
+    const isDark = readSettings()?.dark ?? true;
     const opts = {
       dark: Boolean(isDark),
       foreground: t.foreground,
@@ -1168,13 +1312,13 @@ export default class Peek extends View {
   }
 
   renderUserItem(t, item, currentTerminal) {
-    const isDark = Boolean(settings()?.dark ?? true);
+    const isDark = Boolean(readSettings()?.dark ?? true);
     const time = formatTime(item.ts_ms);
     let fromLabel = item.from ? `from ${item.from}` : null;
     if (item.from) {
       const slash = typeof currentTerminal === "string" ? currentTerminal.lastIndexOf("/") : -1;
       const prefix = slash >= 0 ? currentTerminal.slice(0, slash + 1) : "";
-      const sender = terminals().find((x) => x.address === item.from || (prefix && x.address === `${prefix}${item.from}`));
+      const sender = this.frameTerminals().find((x) => x.address === item.from || (prefix && x.address === `${prefix}${item.from}`));
       if (sender?.name && sender.name !== item.from) {
         fromLabel = `from ${sender.name} (${item.from})`;
       }
@@ -1359,7 +1503,7 @@ export default class Peek extends View {
     const iso = this.isolation;
     const isoLevel = iso?.level || (this.rollbackPromptItem?.checkingIsolation ? "checking" : "unknown");
     const filesBlocked = isoLevel === "shared_blocked" || (!this.rollbackPromptItem?.checkingIsolation && !this.hasCheckpointTurn(toTurn));
-    const isDark = Boolean(settings()?.dark ?? true);
+    const isDark = Boolean(readSettings()?.dark ?? true);
     const amber = isDark ? "#fbbf24" : "#b45309";
     const danger = isDark ? "#f87171" : "#dc2626";
     const blockersText = Array.isArray(iso?.blockers) ? iso.blockers.map((x) => x.detail || x.addr).join(", ") : "";
@@ -1463,7 +1607,7 @@ export default class Peek extends View {
     const open = Boolean(this.expandedSteps?.[step.id]);
     const iconColor = failed ? (t.blocked ?? "#ef4444") : running ? t.foreground : t.dim;
     const textColor = failed ? (t.blocked ?? "#ef4444") : running ? t.foreground : t.muted;
-    const isDark = Boolean(settings()?.dark ?? true);
+    const isDark = Boolean(readSettings()?.dark ?? true);
     const addColor = isDark ? "#4ade80" : "#16a34a";
     const delColor = isDark ? "#f87171" : "#dc2626";
     const addBg = isDark ? "#22c55e1a" : "#16a34a14";
@@ -1878,7 +2022,7 @@ export default class Peek extends View {
     if (!cf || !Array.isArray(cf.files) || cf.files.length === 0) return null;
     const key = `cf-${item.id}`;
     const open = Boolean(this.expandedGroups?.[key]);
-    const isDark = Boolean(settings()?.dark ?? true);
+    const isDark = Boolean(readSettings()?.dark ?? true);
     const addColor = isDark ? "#4ade80" : "#16a34a";
     const delColor = isDark ? "#f87171" : "#dc2626";
     const count = cf.files.length;
@@ -2248,7 +2392,36 @@ export default class Peek extends View {
     };
 
     const singleNonPlan = item.steps.length === 1 && nonPlanSteps.length === 1;
-    const stepNodes = (item.latestPlan ? nonPlanSteps : item.steps).map(renderStep).filter(Boolean);
+    const rawSteps = item.latestPlan ? nonPlanSteps : item.steps;
+    const stepLimit = this.expandedStepLimits?.[item.id] ?? DEFAULT_VISIBLE_STEPS;
+    const hiddenStepCount = !singleNonPlan && open && rawSteps.length > stepLimit ? rawSteps.length - stepLimit : 0;
+    const renderedSteps = (singleNonPlan || open)
+      ? (hiddenStepCount > 0 ? rawSteps.slice(hiddenStepCount) : rawSteps)
+      : [];
+    const stepNodes = renderedSteps.map(renderStep).filter(Boolean);
+    if (hiddenStepCount > 0) {
+      stepNodes.unshift(
+        h_flex()
+          .id(`acp-grp-more-${item.id}`)
+          .w_full()
+          .min_h(24)
+          .px(6)
+          .py(2)
+          .gap(6)
+          .items_center()
+          .rounded(6)
+          .text_size(11.5)
+          .text_color(t.accent ?? t.muted)
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover))
+          .on_mouse_down("left", stopMouse)
+          .on_click((_e, cx) => {
+            this.expandedStepLimits[item.id] = rawSteps.length;
+            cx.notify();
+          })
+          .child(tr(`Show ${hiddenStepCount} earlier steps`, `展开更早的 ${hiddenStepCount} 个步骤`)),
+      );
+    }
     const primaryStep = nonPlanSteps[0];
     const groupIconPath = running
       ? ICONS.spinner
@@ -2343,7 +2516,7 @@ export default class Peek extends View {
     const copyTurnKey = `turn-${item.id}`;
     const time = formatTime(item.ts_ms);
     const mdOpts = this.mdOptions(t, this.term()?.cwd);
-    const isDark = Boolean(settings()?.dark ?? true);
+    const isDark = Boolean(readSettings()?.dark ?? true);
     const rowHoverKey = `row-as-${item.id}`;
     const hovered = Boolean(this.hoveredRows?.[rowHoverKey]);
     const blocks = (item.blocks ?? []).map((block, bi) => {
@@ -2807,7 +2980,7 @@ export default class Peek extends View {
       modeOpt.currentValue !== "dangerously-skip-permissions",
     );
     const padX = isTab ? 20 : 28;
-    const isDark = Boolean(settings()?.dark ?? true);
+    const isDark = Boolean(readSettings()?.dark ?? true);
     const warnColor = t.blocked ?? "#f59e0b";
     return v_flex()
       .w_full()
@@ -3279,10 +3452,11 @@ export default class Peek extends View {
     const addr = this.activeTerminal();
     const ended = k?.state === "finished" || k?.status === "ended";
     const lineageParent = resolvePeerAddress(k?.lineage?.parent || this.agentDetail?.lineage?.parent || "", addr) || null;
-    const pInfo = panes().find((p) => p.terminal === addr) ?? null;
-    const aInfo = agents().find((a) => a.address === addr) ?? null;
-    const sp = (typeof spaces === "function" ? spaces() : []).find((s) => s.id === (aInfo?.space ?? null))
-      ?? (typeof spaces === "function" ? spaces() : []).find((s) => s.active)
+    const pInfo = this.framePanes().find((p) => p.terminal === addr) ?? null;
+    const aInfo = this.frameAgents().find((a) => a.address === addr) ?? null;
+    const allSpaces = this.frameSpaces();
+    const sp = allSpaces.find((s) => s.id === (aInfo?.space ?? null))
+      ?? allSpaces.find((s) => s.active)
       ?? null;
     const machineName = sp?.machine || tr("Local", "本地");
     const branch = pInfo?.branch || sp?.branch || k?.branch || null;
@@ -3428,7 +3602,7 @@ export default class Peek extends View {
 
   renderInboxQueue(t, inboxItems, mono) {
     if (!Array.isArray(inboxItems) || inboxItems.length === 0) return null;
-    const isDark = Boolean(settings()?.dark ?? true);
+    const isDark = Boolean(readSettings()?.dark ?? true);
     const accentSolid = t.accent ?? t.solid ?? "#2563eb";
     const dangerColor = t.blocked ?? "#ef4444";
 
@@ -3714,7 +3888,7 @@ export default class Peek extends View {
     const capBar = ended ? null : this.renderCapabilityBar(t, opts, k);
     const canSend = !ended && hasText && !this.busyAction;
     const padX = isTab ? 20 : 28;
-    const isDark = Boolean(settings()?.dark ?? true);
+    const isDark = Boolean(readSettings()?.dark ?? true);
     const accentSolid = t.accent ?? t.solid ?? "#2563eb";
     const dangerSolid = t.blocked ?? "#ef4444";
     const sendTip = ended
@@ -3898,7 +4072,7 @@ export default class Peek extends View {
 
   renderPtyBlockedBanner(t, terminal, isTab = false) {
     const padX = isTab ? 20 : 28;
-    const isDark = Boolean(settings()?.dark ?? true);
+    const isDark = Boolean(readSettings()?.dark ?? true);
     const warnColor = t.blocked ?? "#f59e0b";
     return v_flex()
       .id("pty-blocked-banner")
@@ -3961,12 +4135,16 @@ export default class Peek extends View {
       this.error = null;
       this.lastKey = "";
       this.lastCkptEpoch = "";
+      this.lastReadStdout = "";
+      this._itemsCache = null;
+      this.visibleItemLimit = DEFAULT_VISIBLE_ITEMS;
+      this.expandedStepLimits = {};
       this.reloadEpoch = (this.reloadEpoch || 0) + 1;
     }
     const isTab = Boolean(tab);
     const isPty = this.isPtyMode();
-    const isDark = Boolean(settings()?.dark ?? true);
-    const myPane = pane ?? panes().find((p) => (p.acp || p.structured) && p.terminal === terminal)?.pane ?? null;
+    const isDark = Boolean(readSettings()?.dark ?? true);
+    const myPane = pane ?? this.framePanes().find((p) => (p.acp || p.structured) && p.terminal === terminal)?.pane ?? null;
     const ckptEpoch = `${terminal}:${k?.foreground?.pid ?? ""}:${k?.checkpoint_seq ?? 0}:${shared("checkpoint.sync") ?? ""}`;
     let ckptChanged = false;
     if (ckptEpoch !== this.lastCkptEpoch) {
@@ -3978,10 +4156,13 @@ export default class Peek extends View {
       if (ckptChanged) {
         this.rollbackPromptItem = null;
         this.expandedGroups = {};
+        this.expandedStepLimits = {};
         this.autoFollow = true;
         this.revealedSig = "";
         this.optimisticInbox = null;
         this.lastDetailTerminal = "";
+        this.lastReadStdout = "";
+        this._itemsCache = null;
         this.reloadEpoch = (this.reloadEpoch || 0) + 1;
       }
     }
@@ -4002,7 +4183,7 @@ export default class Peek extends View {
     }
 
     const perm = k?.pending_permission;
-    const mono = settings()?.font_family ?? "JetBrains Mono";
+    const mono = readSettings()?.font_family ?? "JetBrains Mono";
     const inboxItems = isPty ? [] : this.inboxItemsFor(k);
     if (this.editingInboxId != null && !inboxItems.some((it) => Number(it.id) === Number(this.editingInboxId)) && !this.inboxBusy) {
       this.editingInboxId = null;
@@ -4011,25 +4192,53 @@ export default class Peek extends View {
     const program = k?.program;
     const agentName = k?.labels?.["herdr.name"] || k?.name || k?.template || program?.name || terminal || "ACP Agent";
     const shortCwd = shortenPath(k?.cwd, home());
-    const items = buildConversationItems(this.entries, this.fallbackText, st === "working", {
-      isPty,
-      how: this.readHow,
-      turn: k?.turn ?? 0,
-      isAgent: Boolean(program?.agent || k?.status || st),
-      cwd: k?.cwd || "",
-      checkpointsByTurn: this.checkpoints,
-    });
-    this.maxConversationTurn = items.reduce((m, it) => Math.max(m, Number(it?.turn) || 0), 0);
+    const conv = this.getConversationItems(k, st, isPty);
+    const items = conv.items;
+    this.maxConversationTurn = conv.maxTurn;
 
     const threadChildren = [];
     if (parent) {
       threadChildren.push(this.renderSubagentDivider(t, parent));
     }
-    const visibleItems = items.filter((item) => item.kind !== "stderr_group");
+    const visibleItems = conv.visibleItems;
     if (visibleItems.length === 0) {
       threadChildren.push(this.renderEmptyState(t, k, program, agentName, shortCwd, st));
     } else {
-      for (const item of visibleItems) {
+      const limit = Math.max(DEFAULT_VISIBLE_ITEMS, this.visibleItemLimit || DEFAULT_VISIBLE_ITEMS);
+      const hiddenCount = visibleItems.length > limit ? visibleItems.length - limit : 0;
+      const renderedItems = hiddenCount > 0 ? visibleItems.slice(hiddenCount) : visibleItems;
+      if (hiddenCount > 0) {
+        threadChildren.push(
+          h_flex()
+            .id("acp-load-earlier")
+            .w_full()
+            .max_w(LANE_MAX_W)
+            .justify_center()
+            .py(4)
+            .child(
+              h_flex()
+                .h(26)
+                .px(12)
+                .gap(6)
+                .items_center()
+                .rounded(999)
+                .bg(t.raised)
+                .border_1()
+                .border_color(t.border)
+                .text_size(11.5)
+                .text_color(t.muted)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                .on_mouse_down("left", stopMouse)
+                .on_click((_e, c) => {
+                  this.visibleItemLimit = limit + VISIBLE_ITEMS_STEP;
+                  c.notify();
+                })
+                .child(tr(`Show earlier messages (${hiddenCount} hidden)`, `加载更早的对话（已折叠 ${hiddenCount} 条）`)),
+            ),
+        );
+      }
+      for (const item of renderedItems) {
         if (item.kind === "user") threadChildren.push(this.renderUserItem(t, item, terminal));
         else if (item.kind === "activity_group") threadChildren.push(this.renderActivityGroup(t, item, mono));
         else if (item.kind === "assistant") threadChildren.push(this.renderAssistantItem(t, item, mono));
@@ -4095,7 +4304,7 @@ export default class Peek extends View {
     }
 
     const padX = isTab ? 20 : 28;
-    const isFloating = Boolean(props()?.floating) || isSidePanel;
+    const isFloating = Boolean(p.floating) || isSidePanel;
     const sideCandidates = isSidePanel ? this.activeSideChatCandidates() : [];
     const modalLineageKind = String(k?.lineage?.kind || this.agentDetail?.lineage?.kind || (isFloating ? "side-chat" : "")).toLowerCase();
     const modalKindBadge = modalLineageKind === "fork"
@@ -4106,9 +4315,9 @@ export default class Peek extends View {
           ? { label: tr("Handoff", "上下文接力"), color: "#3b82f6" }
           : null;
     const modalWorktree = k?.lineage?.worktree_path || this.agentDetail?.lineage?.worktree_path || null;
-    const modalLineageParent = resolvePeerAddress(k?.lineage?.parent || this.agentDetail?.lineage?.parent || props()?.parent || "", terminal) || null;
+    const modalLineageParent = resolvePeerAddress(k?.lineage?.parent || this.agentDetail?.lineage?.parent || p.parent || "", terminal) || null;
     const modalUpstream = modalLineageParent || parent?.address || resolvePeerAddress(k?.parent || "", terminal) || null;
-    const modalUpstreamTerm = modalUpstream ? (parent?.address === modalUpstream ? parent : terminals().find((x) => x.address === modalUpstream) ?? null) : null;
+    const modalUpstreamTerm = modalUpstream ? (parent?.address === modalUpstream ? parent : this.frameTerminals().find((x) => x.address === modalUpstream) ?? null) : null;
     const modalUpstreamName = modalUpstreamTerm?.labels?.["herdr.name"] || modalUpstreamTerm?.name || null;
     const modalUpstreamLabel = modalUpstreamName && modalUpstreamName !== modalUpstream ? `${modalUpstreamName} (${modalUpstream})` : modalUpstream;
     const modalEnded = st === "ended" || k?.state === "finished";
@@ -4860,125 +5069,149 @@ export default class Peek extends View {
   }
 
   render(cx) {
-    const t = theme();
+    _frameSettings = typeof settings === "function" ? settings() : null;
     const p = props() ?? {};
     if (Object.keys(p).length > 0) this.boundProps = p;
-    const { overlay, acp, floating, parent: parentProp, sidePanel, sideTermHeader } = this.ownProps();
-    const terminal = this.activeTerminal();
-    if (sidePanel) {
-      if (!terminal) return this.renderSidePanelEmpty(t);
+    const ownP = Object.keys(p).length > 0 ? p : (this.boundProps ?? p ?? {});
+    const allTerminals = terminals();
+    const allAgents = agents();
+    const allPanes = panes();
+    const allSpaces = typeof spaces === "function" ? spaces() : [];
+    this._frame = {
+      props: ownP,
+      terminals: allTerminals,
+      agents: allAgents,
+      panes: allPanes,
+      spaces: allSpaces,
+    };
+    try {
+      const t = theme();
+      const { overlay, acp, floating, parent: parentProp, sidePanel, sideTermHeader } = ownP;
+      const sideCandidates = sidePanel ? this.activeSideChatCandidates() : null;
+      if (sideCandidates) this._frame.sideCandidates = sideCandidates;
+      const terminal = this.activeTerminal();
+      this._frame.terminal = terminal;
       const k = this.term();
+      this._frame.term = k;
+      const isPty = this.isPtyMode();
+      this._frame.isPty = isPty;
       const st = this.status();
-      const pic = icon(k?.program, 14, t.foreground);
-      const parent = k?.parent ? terminals().find((x) => x.address === k.parent) : null;
-      if (sideTermHeader) {
-        return this.renderSideTermHeader(t, k, st, pic, parent);
+      this._frame.status = st;
+      this._frame.isSideChat = this.isSideChatSession(k);
+      if (sidePanel) {
+        if (!terminal) return this.renderSidePanelEmpty(t);
+        const pic = icon(k?.program, 14, t.foreground);
+        const parent = k?.parent ? allTerminals.find((x) => x.address === k.parent) : null;
+        if (sideTermHeader) {
+          return this.renderSideTermHeader(t, k, st, pic, parent);
+        }
+        return this.renderAcp(t, k, st, pic, parent, cx);
       }
-      return this.renderAcp(t, k, st, pic, parent, cx);
-    }
-    const k = this.term();
-    const st = this.status();
-    const pic = icon(k?.program, 14, t.foreground);
-    const parent = k?.parent ? terminals().find((x) => x.address === k.parent) : null;
-    if (acp) {
-      return this.renderAcp(t, k, st, pic, parent, cx);
-    }
-    const home = panes().some((p) => p.terminal === terminal);
-    const glyph = st === "working" ? SPIN[0] : st === "idle" ? "○" : st ? "●" : "·";
-    const lineageKind = String(k?.lineage?.kind || (floating ? "side-chat" : "")).toLowerCase();
-    const kindBadge = lineageKind === "fork"
-      ? { label: tr("Fork", "会话分叉"), color: "#a855f7" }
-      : (lineageKind === "side-chat" || lineageKind === "side_chat")
-        ? { label: tr("Side Chat", "旁路讨论"), color: "#14b8a6" }
-        : lineageKind === "handoff"
-          ? { label: tr("Handoff", "上下文接力"), color: "#3b82f6" }
-          : null;
-    const upstreamAddr = resolvePeerAddress(k?.lineage?.parent || parent?.address || parentProp || "", terminal) || null;
-    return h_flex()
-      .size_full()
-      .px(12)
-      .gap(8)
-      .items_center()
-      .bg(t.surface)
-      .border_b(1)
-      .border_color(t.border)
-      .text_size(12)
-      .child(div().w(12).flex_none().text_color(t[st] ?? t.dim).when(st === "working", (el) => el.frames(SPIN, 90)).child(glyph))
-      .when(Boolean(pic), (el) => el.child(pic))
-      .child(div().truncate().font_semibold().text_color(t.foreground).child(k?.labels?.["herdr.name"] || k?.name || k?.template || k?.program?.name || terminal || ""))
-      .when(Boolean(kindBadge), (el) =>
-        el.child(
-          div()
-            .flex_none()
-            .px(5)
-            .py(1)
-            .rounded(4)
-            .bg(withAlpha(kindBadge.color, "20") ?? t.raised)
-            .border_1()
-            .border_color(withAlpha(kindBadge.color, "66") ?? t.border)
-            .text_size(10)
-            .font_semibold()
-            .text_color(kindBadge.color)
-            .child(kindBadge.label),
-        ),
-      )
-      .when(Boolean(terminal), (el) =>
-        el.child(div().flex_none().px(5).py(1).rounded(4).bg(t.raised).border_1().border_color(t.border).text_size(10.5).text_color(t.muted).child(terminal)),
-      )
-      .when(Boolean(st) && !floating, (el) => el.child(div().flex_none().text_color(t[st] ?? t.dim).child(statusWords()[st] ?? st)))
-      .when(Boolean(upstreamAddr), (el) =>
-        el.child(
-          div()
-            .id("peek-parent")
-            .flex_none()
-            .px(5)
-            .py(1)
-            .rounded(4)
-            .bg(withAlpha(t.accent ?? "#3b82f6", "14") ?? t.raised)
-            .border_1()
-            .border_color(withAlpha(t.accent ?? "#3b82f6", "44") ?? t.border)
-            .text_size(10.5)
-            .text_color(t.accent ?? "#3b82f6")
-            .cursor_pointer()
-            .hover((s) => s.bg(withAlpha(t.accent ?? "#3b82f6", "28") ?? t.hover).text_color(t.foreground))
-            .tooltip(tr(`Click to return to upstream agent ${upstreamAddr}`, `点击返回上游智能体 ${upstreamAddr}`))
-            .on_mouse_down("left", stopMouse)
-            .on_click((_e, cx) => {
-              cx.stop_propagation();
-              run("agent.focus", { terminal: upstreamAddr });
-              if (overlay) closeOverlay(overlay);
-            })
-            .child(tr(`↳ from ${parent?.name || upstreamAddr}`, `↳ 来自 ${parent?.name || upstreamAddr}`)),
-        ),
-      )
-      .child(div().flex_1())
-      .when(Boolean(floating) && Boolean(upstreamAddr), (el) =>
-        el
-          .child(
-            this.button(t, "merge-close", tr("Merge & Close", "合回并关闭"), () => {
-              run("agent.handoff", {
-                source: terminal,
-                into: upstreamAddr,
-                kind: "merge-back",
-                ...(overlay ? { close_overlay: overlay } : {}),
-              });
-            }),
-          )
-          .child(
-            this.button(t, "back-main", tr("↩ Main", "↩ 回主 Agent"), () => {
-              run("agent.focus", { terminal: upstreamAddr });
-              if (overlay) closeOverlay(overlay);
+      const pic = icon(k?.program, 14, t.foreground);
+      const parent = k?.parent ? allTerminals.find((x) => x.address === k.parent) : null;
+      if (acp) {
+        return this.renderAcp(t, k, st, pic, parent, cx);
+      }
+      const home = allPanes.some((p) => p.terminal === terminal);
+      const glyph = st === "working" ? SPIN[0] : st === "idle" ? "○" : st ? "●" : "·";
+      const lineageKind = String(k?.lineage?.kind || (floating ? "side-chat" : "")).toLowerCase();
+      const kindBadge = lineageKind === "fork"
+        ? { label: tr("Fork", "会话分叉"), color: "#a855f7" }
+        : (lineageKind === "side-chat" || lineageKind === "side_chat")
+          ? { label: tr("Side Chat", "旁路讨论"), color: "#14b8a6" }
+          : lineageKind === "handoff"
+            ? { label: tr("Handoff", "上下文接力"), color: "#3b82f6" }
+            : null;
+      const upstreamAddr = resolvePeerAddress(k?.lineage?.parent || parent?.address || parentProp || "", terminal) || null;
+      return h_flex()
+        .size_full()
+        .px(12)
+        .gap(8)
+        .items_center()
+        .bg(t.surface)
+        .border_b(1)
+        .border_color(t.border)
+        .text_size(12)
+        .child(div().w(12).flex_none().text_color(t[st] ?? t.dim).when(st === "working", (el) => el.frames(SPIN, 90)).child(glyph))
+        .when(Boolean(pic), (el) => el.child(pic))
+        .child(div().truncate().font_semibold().text_color(t.foreground).child(k?.labels?.["herdr.name"] || k?.name || k?.template || k?.program?.name || terminal || ""))
+        .when(Boolean(kindBadge), (el) =>
+          el.child(
+            div()
+              .flex_none()
+              .px(5)
+              .py(1)
+              .rounded(4)
+              .bg(withAlpha(kindBadge.color, "20") ?? t.raised)
+              .border_1()
+              .border_color(withAlpha(kindBadge.color, "66") ?? t.border)
+              .text_size(10)
+              .font_semibold()
+              .text_color(kindBadge.color)
+              .child(kindBadge.label),
+          ),
+        )
+        .when(Boolean(terminal), (el) =>
+          el.child(div().flex_none().px(5).py(1).rounded(4).bg(t.raised).border_1().border_color(t.border).text_size(10.5).text_color(t.muted).child(terminal)),
+        )
+        .when(Boolean(st) && !floating, (el) => el.child(div().flex_none().text_color(t[st] ?? t.dim).child(statusWords()[st] ?? st)))
+        .when(Boolean(upstreamAddr), (el) =>
+          el.child(
+            div()
+              .id("peek-parent")
+              .flex_none()
+              .px(5)
+              .py(1)
+              .rounded(4)
+              .bg(withAlpha(t.accent ?? "#3b82f6", "14") ?? t.raised)
+              .border_1()
+              .border_color(withAlpha(t.accent ?? "#3b82f6", "44") ?? t.border)
+              .text_size(10.5)
+              .text_color(t.accent ?? "#3b82f6")
+              .cursor_pointer()
+              .hover((s) => s.bg(withAlpha(t.accent ?? "#3b82f6", "28") ?? t.hover).text_color(t.foreground))
+              .tooltip(tr(`Click to return to upstream agent ${upstreamAddr}`, `点击返回上游智能体 ${upstreamAddr}`))
+              .on_mouse_down("left", stopMouse)
+              .on_click((_e, cx) => {
+                cx.stop_propagation();
+                run("agent.focus", { terminal: upstreamAddr });
+                if (overlay) closeOverlay(overlay);
+              })
+              .child(tr(`↳ from ${parent?.name || upstreamAddr}`, `↳ 来自 ${parent?.name || upstreamAddr}`)),
+          ),
+        )
+        .child(div().flex_1())
+        .when(Boolean(floating) && Boolean(upstreamAddr), (el) =>
+          el
+            .child(
+              this.button(t, "merge-close", tr("Merge & Close", "合回并关闭"), () => {
+                run("agent.handoff", {
+                  source: terminal,
+                  into: upstreamAddr,
+                  kind: "merge-back",
+                  ...(overlay ? { close_overlay: overlay } : {}),
+                });
+              }),
+            )
+            .child(
+              this.button(t, "back-main", tr("↩ Main", "↩ 回主 Agent"), () => {
+                run("agent.focus", { terminal: upstreamAddr });
+                if (overlay) closeOverlay(overlay);
+              }),
+            ),
+        )
+        .when(lineageKind !== "side-chat" && lineageKind !== "side_chat", (el) =>
+          el.child(
+            this.button(t, "keep", floating ? tr("Dock", "转分栏") : (home ? tr("↗ go to", "↗ 跳转") : tr("↗ keep", "↗ 挂载")), () => {
+              run(home ? "pane.focus" : "terminal.keep", floating ? { terminal, place: "right" } : { terminal });
+              closeOverlay(overlay);
             }),
           ),
-      )
-      .when(lineageKind !== "side-chat" && lineageKind !== "side_chat", (el) =>
-        el.child(
-          this.button(t, "keep", floating ? tr("Dock", "转分栏") : (home ? tr("↗ go to", "↗ 跳转") : tr("↗ keep", "↗ 挂载")), () => {
-            run(home ? "pane.focus" : "terminal.keep", floating ? { terminal, place: "right" } : { terminal });
-            closeOverlay(overlay);
-          }),
-        ),
-      )
-      .child(this.button(t, "close", "✕", () => closeOverlay(overlay)));
+        )
+        .child(this.button(t, "close", "✕", () => closeOverlay(overlay)));
+    } finally {
+      this._frame = null;
+      _frameSettings = null;
+    }
   }
 }

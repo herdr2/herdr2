@@ -1,6 +1,6 @@
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, Popup, Scrollbar, v_virtual_list } from "gpui-base";
-import { spaces, panes, agents, terminals, focused, exec, readTextFile, watchFolder, theme, settings, shared, setShared, run } from "herdr";
+import { spaces, panes, agents, terminals, focused, exec, h2, readTextFile, watchFolder, theme, settings, shared, setShared, run } from "herdr";
 import {
   annotateDiffRows,
   buildSelectionRange,
@@ -89,6 +89,8 @@ export default class Changes extends View {
     this.sendingIds = [];
     this.reviewError = null;
     this.lastHandledResultId = null;
+    this.aiCommitLoading = false;
+    this.aiCommitUsedAi = false;
 
     this.refresh(cx);
     cx.timer.every(10000, (cx) => this.refresh(cx));
@@ -428,11 +430,45 @@ export default class Changes extends View {
           const r = await exec("git", args, { cwd: root, on });
           if (r.code !== 0) throw new Error((r.stderr || r.stdout).trim());
         }
-        if (this.viewKey() === context) { this.message = ""; this.input.set_value(""); }
+        if (this.viewKey() === context) { this.message = ""; this.aiCommitUsedAi = false; this.input.set_value(""); }
       } catch (e) { if (this.viewKey() === context) this.note = `Commit failed: ${e}`; }
       finally { this.busy = false; this.refresh(cx); cx.notify(); }
     });
     cx.notify();
+  }
+
+  suggestCommitMessage(cx) {
+    if (this.aiCommitLoading || !this.root || !this.files.length || this.busy || typeof h2 !== "function") return;
+    const root = this.root, on = this.on, context = this.context;
+    this.aiCommitLoading = true;
+    this.note = null;
+    cx.notify();
+    cx.spawn(async (acx) => {
+      try {
+        const args = ["ai", "commit-message", "--json", "--cwd", root, "--lang", isZh() ? "zh-CN" : "en"];
+        if (on) args.push("--on", on);
+        const res = await h2(args, { timeout: 15000 });
+        if (this.viewKey() !== context) return;
+        if (res?.code === 0 && res.stdout) {
+          const parsed = JSON.parse(res.stdout);
+          const msg = String(parsed?.message ?? "").trim();
+          if (msg) {
+            this.message = msg;
+            this.aiCommitUsedAi = Boolean(parsed?.usedAi);
+            this.input.set_value(msg);
+            this.input.focus();
+          }
+        } else {
+          const errText = String(res?.stderr || res?.stdout || "").trim();
+          if (errText) this.note = tr(`AI commit message failed: ${errText}`, `AI 生成提交信息失败：${errText}`);
+        }
+      } catch (e) {
+        if (this.viewKey() === context) this.note = tr(`AI commit message failed: ${e}`, `AI 生成提交信息失败：${e}`);
+      } finally {
+        this.aiCommitLoading = false;
+        acx.notify();
+      }
+    });
   }
 
   handleVirtualItemClick(itemKey, cx) {
@@ -992,8 +1028,61 @@ export default class Changes extends View {
       .when(Boolean(activeComposer), (e) => e.child(this.renderDockedComposer(activeComposer, t)))
       .when(allDrafts.length > 0 || Boolean(this.reviewError), (e) => e.child(this.renderReviewBar(t, allDrafts)))
       .when(Boolean(this.note), (e) => e.child(div().px(10).pb(8).text_size(11).text_color(t.ansi1).child(this.note)))
-      .child(h_flex().flex_none().p(10).gap(8).border_t(1).border_color(t.border)
-        .child(div().id("commit-message").flex_1().min_w(0).h(32).px(10).flex().items_center().rounded(8).border_1().border_color(this.typing ? t.accent : t.border).cursor_text().on_mouse_down("left", (_e, cx) => cx.stop_propagation()).child(Input.new(this.input).h_full().text_size(12).text_color(t.foreground)))
+      .child(h_flex().flex_none().p(10).gap(6).items_center().border_t(1).border_color(t.border)
+        .child(
+          h_flex()
+            .id("commit-message")
+            .flex_1()
+            .min_w(0)
+            .h(32)
+            .px(10)
+            .gap(6)
+            .items_center()
+            .rounded(8)
+            .border_1()
+            .border_color(this.typing ? t.accent : t.border)
+            .cursor_text()
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .child(Input.new(this.input).flex_1().min_w(0).h_full().text_size(12).text_color(t.foreground))
+            .when(this.aiCommitUsedAi && Boolean(this.message.trim()), (el) =>
+              el.child(
+                div()
+                  .flex_none()
+                  .px(4)
+                  .py(1)
+                  .rounded(4)
+                  .bg(withAlpha("#a855f7", "22") ?? t.raised)
+                  .text_size(9.5)
+                  .font_semibold()
+                  .text_color("#a855f7")
+                  .child("✨ AI"),
+              ),
+            ),
+        )
+        .child((() => {
+          const canAi = Boolean(this.root && this.files.length > 0 && !this.busy && !this.loading && !this.aiCommitLoading);
+          return h_flex()
+            .id("chg-ai-commit")
+            .h(32)
+            .px(9)
+            .flex_none()
+            .items_center()
+            .rounded(8)
+            .border_1()
+            .border_color(canAi ? (withAlpha("#a855f7", "66") ?? t.border) : t.border)
+            .bg(canAi ? (withAlpha("#a855f7", "18") ?? t.raised) : t.raised)
+            .text_size(11.5)
+            .font_semibold()
+            .text_color(canAi ? "#a855f7" : t.dim)
+            .when(canAi, (e) => e.cursor_pointer().hover((s) => s.bg(withAlpha("#a855f7", "2c") ?? t.hover)))
+            .tooltip(tr("Generate commit message with Core AI from current changes", "由 Core AI 根据当前代码变更生成 Git 提交信息"))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              this.suggestCommitMessage(cx);
+            })
+            .child(this.aiCommitLoading ? tr("✨ …", "✨ 生成中…") : tr("✨ AI", "✨ AI 生成"));
+        })())
         .child(div().id("commit").h(32).px(14).flex().items_center().rounded(8).bg(enabled ? t.solid : t.raised).text_color(enabled ? t.solid_foreground : t.dim).text_size(12).when(enabled, (e) => e.cursor_pointer()).on_click((_e, cx) => this.commit(cx)).child(this.busy ? tr("Committing…", "提交中…") : tr("Commit", "提交"))));
   }
 }

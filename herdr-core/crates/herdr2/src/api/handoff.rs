@@ -686,6 +686,35 @@ async fn handoff_to_new_pty(
         }
     }
 
+    if let Some(m) = p.model.as_deref().map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("default")) {
+        let has_model_flag = spawn_argv
+            .iter()
+            .any(|a| a == "--model" || a.starts_with("--model=") || a == "-m");
+        if !has_model_flag {
+            spawn_argv.push("--model".into());
+            spawn_argv.push(m.to_string());
+        }
+    }
+    if let Some(eff) = p.effort.as_deref().map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("default")) {
+        match target_cli_kind {
+            PtyCliKind::Claude => {
+                let has_effort = spawn_argv.iter().any(|a| a == "--effort" || a.starts_with("--effort="));
+                if !has_effort {
+                    spawn_argv.push("--effort".into());
+                    spawn_argv.push(eff.to_string());
+                }
+            }
+            PtyCliKind::Codex => {
+                let has_effort = spawn_argv.iter().any(|a| a.contains("model_reasoning_effort"));
+                if !has_effort {
+                    spawn_argv.push("-c".into());
+                    spawn_argv.push(format!("model_reasoning_effort={eff}"));
+                }
+            }
+            _ => {}
+        }
+    }
+
     let inherited_display = p.display.clone().or_else(|| {
         if src.is_agent {
             return None;
@@ -929,6 +958,7 @@ async fn handoff_to_new_acp(
             cwd: Some(cwd.to_string()),
             name: p.name.clone(),
             model: p.model.clone(),
+            effort: p.effort.clone(),
             keep,
             env,
             parent: (p.kind == LineageKind::SideChat).then(|| src.address.clone()),

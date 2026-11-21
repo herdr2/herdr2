@@ -5,8 +5,8 @@
 // this pane. Props from the app: { pane, terminal }. Click: focus the pane.
 
 import { View, div, svg, image } from "gpui-kit";
-import { h_flex, InputState, Input } from "gpui-base";
-import { panes, terminals, props, run, h2, openOverlay, theme, home, layout, settings } from "herdr";
+import { v_flex, h_flex, InputState, Input } from "gpui-base";
+import { panes, terminals, spaces, props, run, h2, exec, openOverlay, theme, home, layout, settings, shared } from "herdr";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
@@ -55,6 +55,162 @@ function formatElapsed(ms) {
   return `${m}:${s}`;
 }
 
+const GIT_STATUS_ARGS = ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v2", "--branch"];
+
+function parseGitPorcelainV2(stdout) {
+  let branch = "";
+  let ahead = 0;
+  let behind = 0;
+  let staged = 0;
+  let modified = 0;
+  let untracked = 0;
+  let conflicts = 0;
+  const files = [];
+  for (const rawLine of String(stdout || "").split("\n")) {
+    const line = rawLine.trimEnd();
+    if (!line) continue;
+    if (line.startsWith("# branch.head ")) {
+      branch = line.slice("# branch.head ".length).trim();
+    } else if (line.startsWith("# branch.ab ")) {
+      const m = /\+(\d+)\s+-(\d+)/.exec(line);
+      if (m) {
+        ahead = Number(m[1]) || 0;
+        behind = Number(m[2]) || 0;
+      }
+    } else if (line.startsWith("u ")) {
+      conflicts += 1;
+      const p = line.split(" ").slice(10).join(" ");
+      if (p && files.length < 10) files.push(`! ${p}`);
+    } else if (line.startsWith("1 ") || line.startsWith("2 ")) {
+      const xy = line.slice(2, 4);
+      const x = xy[0] || ".";
+      const y = xy[1] || ".";
+      if (x !== ".") staged += 1;
+      if (y !== ".") modified += 1;
+      const parts = line.split(" ");
+      const pathPart = line.startsWith("2 ") ? parts.slice(9).join(" ").split("\t")[0] : parts.slice(8).join(" ");
+      if (pathPart && files.length < 10) files.push(`${xy} ${pathPart}`);
+    } else if (line.startsWith("? ")) {
+      untracked += 1;
+      const p = line.slice(2).trim();
+      if (p && files.length < 10) files.push(`?? ${p}`);
+    }
+  }
+  let changedFiles = 0;
+  for (const rawLine of String(stdout || "").split("\n")) {
+    if (rawLine.startsWith("1 ") || rawLine.startsWith("2 ") || rawLine.startsWith("u ") || rawLine.startsWith("? ")) {
+      changedFiles += 1;
+    }
+  }
+  return { branch, ahead, behind, staged, modified, untracked, conflicts, changedFiles, files, ok: true };
+}
+
+function formatGitSummary(info, fallbackBranch) {
+  const branch = info?.ok ? (info.branch === "(detached)" ? tr("detached", "游离 HEAD") : info.branch) : (fallbackBranch || "");
+  if (!branch && !info?.ok) return null;
+  const abParts = [];
+  if (info?.ahead > 0) abParts.push(`↑${info.ahead}`);
+  if (info?.behind > 0) abParts.push(`↓${info.behind}`);
+  const ab = abParts.length ? ` ${abParts.join(" ")}` : "";
+  if (!info?.ok) {
+    return {
+      text: `${branch}`,
+      statusKind: "unknown",
+      tooltip: tr(`Git branch: ${branch} — click to open Changes`, `Git 分支：${branch} — 点击打开右侧「变更」面板`),
+    };
+  }
+  if (info.conflicts > 0) {
+    const label = tr(`${info.conflicts} conflicts`, `${info.conflicts} 处冲突`);
+    return {
+      text: `${branch}${ab} · ${label}`,
+      statusKind: "conflict",
+      tooltip: [
+        `${branch}${ab} · ${label}`,
+        ...info.files,
+        tr("Click to open Changes panel", "点击打开右侧「变更」面板"),
+      ].join("\n"),
+    };
+  }
+  if (info.changedFiles === 0) {
+    const cleanText = tr("clean", "干净");
+    return {
+      text: `${branch}${ab} · ✓ ${cleanText}`,
+      statusKind: "clean",
+      tooltip: `${branch}${ab} · ${tr("Working tree clean", "工作区干净")} — ${tr("Click to open Changes panel", "点击打开右侧「变更」面板")}`,
+    };
+  }
+  const details = [];
+  if (info.staged > 0) details.push(tr(`${info.staged} staged`, `暂存 ${info.staged}`));
+  if (info.modified > 0) details.push(tr(`${info.modified} mod`, `修改 ${info.modified}`));
+  if (info.untracked > 0) details.push(tr(`${info.untracked} new`, `新增 ${info.untracked}`));
+  const detailStr = details.length > 0 ? ` (${details.join(" · ")})` : "";
+  const countStr = tr(`${info.changedFiles} changed`, `${info.changedFiles} 改动`);
+  return {
+    text: `${branch}${ab} · ${countStr}${detailStr}`,
+    statusKind: "dirty",
+    tooltip: [
+      `${branch}${ab} · ${countStr}${detailStr}`,
+      ...info.files,
+      info.changedFiles > info.files.length ? tr(`… and ${info.changedFiles - info.files.length} more`, `… 其余 ${info.changedFiles - info.files.length} 个文件`) : "",
+      tr("Click to open Changes panel", "点击打开右侧「变更」面板"),
+    ].filter(Boolean).join("\n"),
+  };
+}
+
+function buildWorkSummary(p, term, isAgent, displayName) {
+  const st = p.status ?? term?.status ?? "idle";
+  const manual = Boolean(p.manual_status || term?.manual_status);
+  const permTitle = term?.pending_permission?.title ? String(term.pending_permission.title).trim() : "";
+  const micro = String(p.micro_summary ?? term?.micro_summary ?? "").trim();
+  const semantic = String(p.semantic_title ?? term?.semantic_title ?? "").trim();
+  const aiSummary = !manual ? String(p.ai_status_summary ?? term?.ai_status_summary ?? "").trim() : "";
+  const turn = Number(term?.turn ?? 0);
+
+  let text = "";
+  let tone = "muted";
+  if (permTitle) {
+    text = tr(`Waiting approval: ${permTitle}`, `等待审批：${permTitle}`);
+    tone = "blocked";
+  } else if (micro) {
+    const prefix = semantic && semantic !== displayName && !micro.startsWith(semantic) ? `${semantic} · ` : "";
+    text = `${prefix}${micro}`;
+    tone = st === "working" ? "working" : st === "blocked" ? "blocked" : st === "done" ? "done" : "muted";
+  } else if (aiSummary) {
+    text = aiSummary;
+    tone = st === "blocked" ? "blocked" : "muted";
+  } else if (isAgent) {
+    if (st === "working") {
+      text = turn > 0
+        ? tr(`Working on turn ${turn}…`, `正在执行中（第 ${turn} 轮）…`)
+        : tr("Working in progress…", "正在执行任务…");
+      tone = "working";
+    } else if (st === "done") {
+      text = tr("Completed — ready to inspect changes", "本轮已完成，可检视改动 Diff");
+      tone = "done";
+    } else if (st === "blocked") {
+      text = tr("Paused — waiting for your input or confirmation", "已暂停，等待你的输入或确认");
+      tone = "blocked";
+    } else if (st === "ended") {
+      text = tr("Session ended", "会话已结束");
+      tone = "dim";
+    } else {
+      text = semantic
+        ? `${semantic} · ${tr("Idle, ready for next prompt", "空闲中，随时可发新指令")}`
+        : tr("Idle — ready for next prompt", "空闲中，随时可发新指令");
+      tone = "dim";
+    }
+  } else {
+    text = p.title && p.title !== displayName ? p.title : tr("Interactive terminal", "交互式终端");
+    tone = "dim";
+  }
+
+  const tipLines = [];
+  if (semantic) tipLines.push(tr(`Task: ${semantic}`, `任务：${semantic}`));
+  tipLines.push(text);
+  if (turn > 0) tipLines.push(tr(`Turn ${turn}`, `当前第 ${turn} 轮`));
+  return { text, tone, tooltip: tipLines.join("\n") };
+}
+
 export default class Pane extends View {
   init(_props, cx) {
     this.hovered = false;
@@ -63,6 +219,10 @@ export default class Pane extends View {
     this.renameText = "";
     this.localWorkingSince = {};
     this.localWorkMs = {};
+    this.gitStatus = null;
+    this.gitKey = "";
+    this.gitLoading = false;
+    this.gitLastAt = 0;
     this.renameInput = InputState.new({
       placeholder: tr("Pane name (empty: default)", "分栏名称（留空恢复默认）"),
     });
@@ -72,10 +232,51 @@ export default class Pane extends View {
     this.renameInput.on("submit", (_e, cx) => this.commitRename(cx));
     this.renameInput.on("blur", (_e, cx) => this.commitRename(cx));
     this.handle = cx?.focus_handle?.() ?? null;
+    this.refreshGit(cx, true);
     cx?.timer?.every?.(1000, (tcx) => {
       const p = this.me();
       if (p?.status === "working" && (p.acp || p.structured || p.program?.agent)) {
         tcx?.notify?.();
+      }
+    });
+    cx?.timer?.every?.(8000, (tcx) => this.refreshGit(tcx, false));
+  }
+
+  gitScope(p) {
+    const cwd = String(p?.cwd || "").trim();
+    if (!cwd) return null;
+    const addr = String(p?.terminal || "");
+    const slash = addr.indexOf("/");
+    const on = slash > 0 ? addr.slice(0, slash) : (spaces().find((s) => s.active)?.machine ?? null);
+    return { cwd, on };
+  }
+
+  refreshGit(cx, force = false) {
+    if (this.gitLoading || typeof exec !== "function" || typeof cx?.spawn !== "function") return;
+    const p = this.me();
+    const scope = this.gitScope(p);
+    if (!scope) return;
+    const syncToken = String(shared("checkpoint.sync") ?? "");
+    const key = `${scope.on ?? ""}|${scope.cwd}|${p?.status ?? ""}|${syncToken}`;
+    const now = Date.now();
+    if (!force && this.gitKey === key && now - this.gitLastAt < 6000) return;
+    this.gitKey = key;
+    this.gitLoading = true;
+    this.gitLastAt = now;
+    cx.spawn(async (acx) => {
+      try {
+        const res = await exec("git", GIT_STATUS_ARGS, scope.on ? { cwd: scope.cwd, on: scope.on } : { cwd: scope.cwd });
+        if (this.gitKey !== key) return;
+        if (res && res.code === 0) {
+          this.gitStatus = parseGitPorcelainV2(res.stdout);
+        } else {
+          this.gitStatus = { ok: false };
+        }
+      } catch {
+        if (this.gitKey === key) this.gitStatus = { ok: false };
+      } finally {
+        this.gitLoading = false;
+        acx?.notify?.();
       }
     });
   }
@@ -261,24 +462,32 @@ export default class Pane extends View {
       return base;
     };
     const bottom = paneFrame(layout())?.header?.position === "bottom";
-    return h_flex()
-      .id(`pane-head-${pane}`)
-      .when(Boolean(this.handle), (el) => el.track_focus(this.handle))
-      .size_full()
+    // Trigger git refresh lazily when cwd / status / checkpoint sync changes.
+    this.refreshGit(cx, false);
+    const workSummary = buildWorkSummary(p, term, isAgent, name);
+    const gitSummary = formatGitSummary(this.gitStatus, p.branch);
+    const workDotColor =
+      workSummary.tone === "working"
+        ? (t.working ?? accent)
+        : workSummary.tone === "blocked"
+          ? (t.blocked ?? "#f59e0b")
+          : workSummary.tone === "done"
+            ? (t.done ?? "#22c55e")
+            : t.dim;
+    const gitColor =
+      gitSummary?.statusKind === "conflict"
+        ? "#ef4444"
+        : gitSummary?.statusKind === "dirty"
+          ? "#f59e0b"
+          : gitSummary?.statusKind === "clean"
+            ? (t.done ?? "#22c55e")
+            : t.muted;
+    const topRow = h_flex()
+      .w_full()
+      .h(30)
       .px(10)
       .gap(8)
       .items_center()
-      .bg(t.background)
-      .when(bottom, el => el.border_t(1))
-      .when(!bottom, el => el.border_b(1))
-      .border_color(t.border)
-      .text_size(12)
-      .on_hover((hovered, cx) => { this.hovered = hovered; cx.notify(); })
-      .on_mouse_down("right", (_e, cx) => {
-        cx.stop_propagation();
-        openOverlay({ mod: "menu", kind: "popup", width: isAcp ? 280 : 220, props: { tab: "pane", target: { pane, terminal: p.terminal } } });
-      })
-      .on_click(() => run("pane.focus", { pane }))
       .when(!singleStructuredTab && Boolean(pic), (el) => el.child(pic))
       .when(!singleStructuredTab && isEditing, (el) =>
         el.child(
@@ -615,5 +824,87 @@ export default class Pane extends View {
         .when(tabPaneCount > 1, el => el.child(this.button(t, `ph-z-${pane}`, "zoom", "pane.detach", { pane }, tr("Maximize to new tab", "最大化为独立标签页"))))
         .when(Boolean(p.terminal), el => el.child(this.button(t, `ph-trash-${pane}`, "trash", "agent.trash", { terminal: p.terminal }, tr("Move to recycle bin", "移入回收站"), true)))
         .child(this.button(t, `ph-x-${pane}`, "close", "pane.close", { pane }, isAgent && st !== "ended" ? tr("Close tab (keep agent in background)", "关闭标签页（Agent 保留在后台）") : tr("Close pane", "关闭窗格"))));
+
+    const summaryRow = h_flex()
+      .id(`ph-brief-row-${pane}`)
+      .w_full()
+      .flex_1()
+      .min_h(22)
+      .px(10)
+      .gap(10)
+      .items_center()
+      .bg(t.raised)
+      .border_t(1)
+      .border_color(t.border)
+      .text_size(11)
+      .child(
+        h_flex()
+          .id(`ph-work-summary-${pane}`)
+          .flex_1()
+          .min_w(0)
+          .gap(6)
+          .items_center()
+          .tooltip(workSummary.tooltip)
+          .child(
+            workSummary.tone === "working"
+              ? svg("mods/workspace-chrome/spinner.svg").size(10).flex_none().text_color(workDotColor).spin(900)
+              : div().size(6).flex_none().rounded(3).bg(workDotColor),
+          )
+          .child(
+            div()
+              .flex_1()
+              .min_w(0)
+              .truncate()
+              .text_color(workSummary.tone === "dim" ? t.dim : t.muted)
+              .child(workSummary.text),
+          ),
+      )
+      .when(Boolean(gitSummary), (el) =>
+        el.child(
+          h_flex()
+            .id(`ph-git-${pane}`)
+            .flex_none()
+            .h(18)
+            .px(6)
+            .gap(4)
+            .items_center()
+            .rounded(5)
+            .bg(gitSummary.statusKind === "clean" || gitSummary.statusKind === "unknown" ? t.background : (alpha(gitColor, "18") ?? t.background))
+            .border_1()
+            .border_color(gitSummary.statusKind === "clean" || gitSummary.statusKind === "unknown" ? t.border : (alpha(gitColor, "55") ?? t.border))
+            .text_size(10.5)
+            .font_medium()
+            .text_color(gitColor)
+            .cursor_pointer()
+            .hover((s) => s.bg(t.hover))
+            .tooltip(gitSummary.tooltip)
+            .on_mouse_down("left", (_e, evCx) => evCx.stop_propagation())
+            .on_click((_e, evCx) => {
+              evCx.stop_propagation();
+              run("layout.select", { stack: "panel-body", child: "changes" });
+              run("layout.show", { id: "panel" });
+            })
+            .child(svg("mods/workspace-chrome/git-branch.svg").size(10.5).flex_none().text_color(gitColor))
+            .child(gitSummary.text),
+        ),
+      );
+
+    return v_flex()
+      .id(`pane-head-${pane}`)
+      .when(Boolean(this.handle), (el) => el.track_focus(this.handle))
+      .size_full()
+      .bg(t.background)
+      .when(bottom, el => el.border_t(1))
+      .when(!bottom, el => el.border_b(1))
+      .border_color(t.border)
+      .text_size(12)
+      .on_hover((hovered, cx) => { this.hovered = hovered; cx.notify(); })
+      .on_mouse_down("right", (_e, cx) => {
+        cx.stop_propagation();
+        openOverlay({ mod: "menu", kind: "popup", width: isAcp ? 280 : 220, props: { tab: "pane", target: { pane, terminal: p.terminal } } });
+      })
+      .on_click(() => run("pane.focus", { pane }))
+      .child(topRow)
+      .child(summaryRow);
   }
 }

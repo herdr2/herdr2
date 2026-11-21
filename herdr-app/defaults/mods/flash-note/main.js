@@ -620,7 +620,7 @@ export default class FlashNote extends View {
                 .text_size(11.5)
                 .text_color(t.dim)
                 .whitespace_normal()
-                .child(tr("Click Ideas at top-right or + to jot down thoughts.", "点击右上角「闪念」或 + 随时记录想法。")),
+                .child(tr("Click + to jot down thoughts or dispatch to an agent.", "点击 + 随时记录想法或派发给 Agent。")),
             )
             .when(trashed.length > 0, (el2) =>
               el2.child(

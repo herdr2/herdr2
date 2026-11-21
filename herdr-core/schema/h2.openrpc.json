@@ -1585,6 +1585,26 @@
         ],
         "type": "object"
       },
+      "CommitMessageResult": {
+        "properties": {
+          "fromCache": {
+            "default": false,
+            "type": "boolean"
+          },
+          "message": {
+            "description": "Suggested single-line Git commit message.",
+            "type": "string"
+          },
+          "usedAi": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "message",
+          "usedAi"
+        ],
+        "type": "object"
+      },
       "CoreInfo": {
         "properties": {
           "id": {
@@ -5638,6 +5658,18 @@
           }
         },
         {
+          "description": "Reasoning effort override passed to `session/set_config_option` (`reasoning_effort` / `thought_level`).",
+          "name": "effort",
+          "required": false,
+          "schema": {
+            "description": "Reasoning effort override passed to `session/set_config_option` (`reasoning_effort` / `thought_level`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
           "description": "Extra environment variables merged onto the core's environment.",
           "name": "env",
           "required": false,
@@ -7316,6 +7348,18 @@
           }
         },
         {
+          "description": "Reasoning effort override (`low`, `medium`, `high`, `xhigh`, `max`) for newly spawned targets.",
+          "name": "effort",
+          "required": false,
+          "schema": {
+            "description": "Reasoning effort override (`low`, `medium`, `high`, `xhigh`, `max`) for newly spawned targets.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
           "description": "First turn from the source transcript to include (1-based, inclusive).",
           "name": "from_turn",
           "required": false,
@@ -7398,11 +7442,11 @@
           }
         },
         {
-          "description": "Model override for newly spawned ACP agent targets.",
+          "description": "Model override for newly spawned ACP or PTY agent targets.",
           "name": "model",
           "required": false,
           "schema": {
-            "description": "Model override for newly spawned ACP agent targets.",
+            "description": "Model override for newly spawned ACP or PTY agent targets.",
             "type": [
               "string",
               "null"
@@ -11374,6 +11418,88 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/AgentDigestResult"
+        }
+      }
+    },
+    {
+      "description": "Generate a concise Git commit message for uncommitted changes in a repository using Core AI.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "ai.commit_message",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Git working directory to inspect (defaults to core cwd).",
+          "name": "cwd",
+          "required": false,
+          "schema": {
+            "description": "Git working directory to inspect (defaults to core cwd).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Skip AI call and return deterministic fallback when false (default true).",
+          "name": "includeAi",
+          "required": false,
+          "schema": {
+            "default": true,
+            "description": "Skip AI call and return deterministic fallback when false (default true).",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Preferred UI language (`zh-CN` / `en`).",
+          "name": "language",
+          "required": false,
+          "schema": {
+            "description": "Preferred UI language (`zh-CN` / `en`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Target remote machine (`--on`).",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "Target remote machine (`--on`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/CommitMessageResult"
         }
       }
     },

@@ -84,6 +84,7 @@ Commands:
   handoff-recommend  Recommend a complementary target provider, handoff mode, and note for an upstream session
   briefing           Aggregate local & remote agents and Drove runs into a priority catch-up briefing
   summarize-agent    Generate or refresh a concise semantic title and progress micro-summary for an agent or terminal
+  commit-message     Generate a concise Git commit message for uncommitted changes using Core AI
   help               Print this message or the help of the given subcommand(s)
 
 Options:
@@ -105,6 +106,22 @@ Options:
       --away-minutes <AWAY_MINUTES>  Away duration in minutes (optional context for executive headline)
       --no-ai                        Return deterministic aggregation only without calling Core AI
   -h, --help                         Print help
+```
+
+## h2 ai commit-message
+
+```text
+Generate a concise Git commit message for uncommitted changes using Core AI
+
+Usage: h2 ai commit-message [OPTIONS]
+
+Options:
+      --cwd <CWD>    Git repository directory (defaults to current working directory)
+      --json         JSON output even in a terminal
+      --on <ON>      Target remote machine (`h2 machine ls`)
+      --lang <LANG>  Preferred language (`zh-CN` / `en`)
+      --no-ai        Return deterministic fallback without calling Core AI
+  -h, --help         Print help
 ```
 
 ## h2 ai handoff-recommend
@@ -1166,7 +1183,10 @@ Options:
           Optional unique name for the newly spawned target
 
       --model <MODEL>
-          Model override for newly spawned ACP agent targets
+          Model override for newly spawned ACP or PTY agent targets
+
+      --effort <EFFORT>
+          Reasoning effort override (`low`, `medium`, `high`, `xhigh`, `max`) for newly spawned targets
 
       --keep
           Keep newly spawned target alive across restarts (`--keep`)
@@ -1566,6 +1586,7 @@ Options:
       --prompt <TEXT>                 Initial prompt queued right after ACP session setup
       --system-prompt <TEXT>          System prompt appended via `_meta.systemPrompt` on session creation
       --model <MODEL>                 Model override passed to `session/set_config_option` (`model`)
+      --effort <EFFORT>               Reasoning effort override passed to `session/set_config_option` (`reasoning_effort` / `thought_level`)
       --mode <MODE>                   Session mode override passed to `session/set_mode`
       --permissions <MODE>            Permission policy (`approve-all`, `approve-reads`, `deny-all`, `ask`, `dangerously-skip-permissions`) [possible values: approve-all, approve-reads, deny-all, ask]
       --dangerously-skip-permissions  Skip all permission checks (`approve-all` policy plus `bypassPermissions` session mode when supported)

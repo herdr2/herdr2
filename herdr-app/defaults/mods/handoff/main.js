@@ -24,6 +24,42 @@ const TURN_CHOICES = () => [
   { value: 0, label: tr("All", "全部") },
 ];
 
+const EFFORT_ORDER = ["off", "low", "medium", "high", "xhigh", "max"];
+const EFFORT_LABELS = () => ({
+  "": tr("Default", "默认"),
+  off: tr("Off", "关闭"),
+  low: tr("Low", "低"),
+  medium: tr("Med", "中"),
+  high: tr("High", "高"),
+  xhigh: tr("XHigh", "超高"),
+  max: tr("Max", "最高"),
+});
+
+function stripEffortSuffix(modelId) {
+  return String(modelId ?? "").replace(/-(low|medium|high|xhigh|max)$/i, "");
+}
+
+function normalizeAgentCatalog(rawAgents) {
+  const map = {};
+  for (const a of Array.isArray(rawAgents) ? rawAgents : []) {
+    const id = ACP_ALIAS[String(a?.id ?? "").toLowerCase()] ?? String(a?.id ?? "").toLowerCase();
+    if (!id) continue;
+    const rawModels = Array.isArray(a.models) ? a.models.map((m) => String(m).trim()).filter(Boolean) : [];
+    const modelEfforts = a.modelEfforts && typeof a.modelEfforts === "object" ? a.modelEfforts : {};
+    const efforts = (Array.isArray(a.efforts) ? a.efforts : [])
+      .map((e) => String(e).trim().toLowerCase())
+      .filter((e) => e && e !== "default");
+    map[id] = {
+      rawModels,
+      defaultModel: typeof a.defaultModel === "string" ? a.defaultModel.trim() : "",
+      efforts,
+      defaultEffort: typeof a.defaultEffort === "string" ? a.defaultEffort.trim().toLowerCase() : "",
+      modelEfforts,
+    };
+  }
+  return map;
+}
+
 function withAlpha(hex, alphaHex) {
   if (typeof hex !== "string") return null;
   if (/^#[0-9a-fA-F]{6}$/.test(hex)) return `${hex}${alphaHex}`;
@@ -104,6 +140,22 @@ export default class Handoff extends View {
       if (this.canSubmit()) this.submit();
     });
     this.preset = "";
+    this.model = "";
+    this.effort = "";
+    this.modelPickerOpen = false;
+    this.agentCatalog = shared("handoff.agentCatalog") ?? {};
+    this.customModelInput = InputState.new({
+      value: "",
+      placeholder: tr("Custom model ID…", "自定义模型 ID…"),
+    });
+    this.customModelInput.on("submit", (_e, cx) => {
+      const val = String(this.customModelInput?.value?.() ?? "").trim();
+      if (val) {
+        this.selectModel(val);
+        this.modelPickerOpen = false;
+        cx.notify();
+      }
+    });
     this.runtimeMode = "acp";
     this.openIn = "tab";
     this.intoTarget = "";
@@ -133,12 +185,27 @@ export default class Handoff extends View {
             this.knownList = res;
             setShared("new-menu.agents", { ...(shared("new-menu.agents") ?? {}), [machine]: res });
             this.ensurePresetSelected();
-            this.requestRecommendation(cx, true);
             cx.notify();
           }
         } catch {}
       });
-      this.requestRecommendation(cx, false);
+      if (props()?.source) {
+        cx.spawn(async (cx) => {
+          try {
+            const args = ["drove", "settings", "--json", ...(machine ? ["--on", machine] : [])];
+            const res = await h2(args, { timeout: 5000 });
+            if (res?.code === 0 && res.stdout) {
+              const parsed = JSON.parse(res.stdout);
+              const catalog = normalizeAgentCatalog(parsed?.agents?.agents);
+              if (Object.keys(catalog).length > 0) {
+                this.agentCatalog = catalog;
+                setShared("handoff.agentCatalog", catalog);
+                cx.notify();
+              }
+            }
+          } catch {}
+        });
+      }
     }
     this.handle.focus();
   }
@@ -231,25 +298,109 @@ export default class Handoff extends View {
     }
   }
 
-  applyPrefillFromRecommendation(rec, includeMode = false) {
+  catalogForPreset(presetKey) {
+    const key = ACP_ALIAS[String(presetKey ?? "").toLowerCase()] ?? String(presetKey ?? "").toLowerCase();
+    const entry = this.agentCatalog?.[key] ?? null;
+    const rawModels = entry?.rawModels ?? [];
+    const modelEfforts = entry?.modelEfforts ?? {};
+    const models = [];
+    const seen = new Set();
+    for (const raw of rawModels) {
+      if (!raw || raw.toLowerCase() === "default") continue;
+      if (key === "agy") {
+        const base = stripEffortSuffix(raw);
+        const candidate = Object.prototype.hasOwnProperty.call(modelEfforts, base) ? base : raw;
+        if (!seen.has(candidate)) {
+          seen.add(candidate);
+          models.push(candidate);
+        }
+      } else if (!seen.has(raw)) {
+        seen.add(raw);
+        models.push(raw);
+      }
+    }
+    const defaultModel = entry?.defaultModel && entry.defaultModel.toLowerCase() !== "default"
+      ? (key === "agy" && Object.prototype.hasOwnProperty.call(modelEfforts, stripEffortSuffix(entry.defaultModel))
+          ? stripEffortSuffix(entry.defaultModel)
+          : entry.defaultModel)
+      : "";
+    const selectedBase = this.model ? (key === "agy" ? stripEffortSuffix(this.model) : this.model) : defaultModel;
+    const perModelEffs = selectedBase && Array.isArray(modelEfforts[selectedBase])
+      ? modelEfforts[selectedBase].map((e) => String(e).toLowerCase()).filter((e) => e && e !== "default")
+      : [];
+    const rawEffs = perModelEffs.length > 0
+      ? perModelEffs
+      : (entry?.efforts?.length > 0 ? entry.efforts : ["low", "medium", "high"]);
+    const efforts = [...new Set(rawEffs)].sort((a, b) => {
+      const ia = EFFORT_ORDER.indexOf(a);
+      const ib = EFFORT_ORDER.indexOf(b);
+      return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+    });
+    return {
+      key,
+      models,
+      rawModels,
+      defaultModel,
+      efforts,
+      defaultEffort: entry?.defaultEffort ?? "",
+      modelEfforts,
+    };
+  }
+
+  selectPreset(nextPreset) {
+    if (this.preset !== nextPreset) {
+      this.preset = nextPreset;
+      this.model = "";
+      this.effort = "";
+      this.modelPickerOpen = false;
+      this.customModelInput?.set_value?.("");
+    }
+  }
+
+  selectModel(nextModel) {
+    this.model = String(nextModel ?? "").trim();
+    const cat = this.catalogForPreset(this.preset);
+    if (this.effort && !cat.efforts.includes(this.effort)) {
+      this.effort = "";
+    }
+  }
+
+  resolveEffectiveModel() {
+    const cat = this.catalogForPreset(this.preset);
+    const eff = this.effort;
+    if (!this.model) {
+      if (cat.key === "agy" && eff && cat.defaultModel) {
+        const combined = `${cat.defaultModel}-${eff}`;
+        if (cat.rawModels.includes(combined)) return combined;
+      }
+      return "";
+    }
+    if (cat.key === "agy") {
+      if (eff) {
+        const combined = `${this.model}-${eff}`;
+        if (cat.rawModels.includes(combined)) return combined;
+      }
+      if (!cat.rawModels.includes(this.model)) {
+        const pref = cat.defaultEffort ? `${this.model}-${cat.defaultEffort}` : "";
+        if (pref && cat.rawModels.includes(pref)) return pref;
+        const firstMatch = cat.rawModels.find((m) => m.startsWith(`${this.model}-`));
+        if (firstMatch) return firstMatch;
+      }
+    }
+    return this.model;
+  }
+
+  applyPrefillFromRecommendation(rec, includeMode = true) {
     if (!rec) return;
     const { all } = this.availablePresets();
-    if (includeMode && rec.recommendedKind && ["handoff", "fork", "side-chat"].includes(rec.recommendedKind)) {
+    if (includeMode && !this.toTurn && rec.recommendedKind && ["handoff", "fork", "side-chat"].includes(rec.recommendedKind)) {
       this.applyMode(rec.recommendedKind, false);
     }
-    if (
-      (includeMode || !this.userTouchedPreset) &&
-      rec.recommendedPreset &&
-      all.some((p) => p.key === rec.recommendedPreset)
-    ) {
-      this.preset = rec.recommendedPreset;
+    if (rec.recommendedPreset && all.some((p) => p.key === rec.recommendedPreset)) {
+      this.selectPreset(rec.recommendedPreset);
+      this.userTouchedPreset = true;
     }
-    const existing = String(this.promptInput?.value?.() ?? "").trim();
-    if (
-      rec.suggestedNote &&
-      !this.userTouchedPrompt &&
-      !existing
-    ) {
+    if (rec.suggestedNote) {
       this._applyingPrefill = true;
       try {
         this.promptInput.set_value(rec.suggestedNote);
@@ -266,8 +417,8 @@ export default class Handoff extends View {
     if (!sourceAddr || this.mode === "merge-back") return;
     const { installed } = this.availablePresets();
     const installedKeys = installed.map((x) => x.key);
-    const key = `${sourceAddr}:${installedKeys.join(",")}:${isZh() ? "zh" : "en"}`;
-    if (!force && this.recKey === key) return;
+    const key = `${sourceAddr}:${installedKeys.join(",")}:${isZh() ? "zh" : "en"}:${force ? Date.now() : "0"}`;
+    if (!force && this.recLoading) return;
     this.recKey = key;
     this.recLoading = true;
     const spawner = cx?.spawn ? cx : this._cx;
@@ -292,9 +443,6 @@ export default class Handoff extends View {
           const parsed = JSON.parse(res.stdout);
           if (parsed && typeof parsed === "object" && parsed.recommendedPreset) {
             this.recommendation = parsed;
-            if (this.mode !== "merge-back") {
-              this.applyPrefillFromRecommendation(parsed, false);
-            }
           }
         }
       } catch {}
@@ -316,10 +464,13 @@ export default class Handoff extends View {
       this.userTouchedMode = false;
       this.userTouchedPreset = false;
       this.userTouchedPrompt = false;
+      this.model = "";
+      this.effort = "";
+      this.modelPickerOpen = false;
       this.recommendation = null;
+      this.recLoading = false;
       this.recKey = "";
       this.applyMode(p.kind || "handoff", true);
-      if (!force) this.requestRecommendation(this._cx, false);
     }
   }
 
@@ -425,6 +576,13 @@ export default class Handoff extends View {
       args.preset = this.preset;
       args.mode = this.runtimeMode;
       args.open = (this.mode === "fork" && this.worktree) ? "tab" : this.openIn;
+      const effectiveModel = this.resolveEffectiveModel();
+      if (effectiveModel) {
+        args.model = effectiveModel;
+      }
+      if (this.effort) {
+        args.effort = this.effort;
+      }
       if (this.mode === "fork" && this.worktree) {
         args.worktree = true;
       }
@@ -594,16 +752,52 @@ export default class Handoff extends View {
               ),
           )
           .child(
-            div()
-              .id("ho-close-x")
+            h_flex()
               .flex_none()
-              .p(4)
-              .rounded(5)
-              .text_color(t.dim)
-              .cursor_pointer()
-              .hover((s) => s.bg(t.hover).text_color(t.foreground))
-              .on_click(() => closeOverlay(p.overlay))
-              .child(svg("mods/pane/close.svg").size(13)),
+              .items_center()
+              .gap(6)
+              .when(!isMerge, (recBtnEl) =>
+                recBtnEl.child(
+                  h_flex()
+                    .id("ho-rec-btn")
+                    .h(24)
+                    .px(8)
+                    .gap(4)
+                    .flex_none()
+                    .items_center()
+                    .rounded(6)
+                    .bg(withAlpha("#a855f7", this.recommendation ? "24" : "14") ?? t.raised)
+                    .border_1()
+                    .border_color(withAlpha("#a855f7", this.recommendation ? "77" : "4d") ?? t.border)
+                    .text_size(11)
+                    .font_semibold()
+                    .text_color("#a855f7")
+                    .cursor_pointer()
+                    .hover((s) => s.bg(withAlpha("#a855f7", "2e") ?? t.hover))
+                    .tooltip(tr("Ask Core AI to suggest a complementary agent, mode, and handoff note (manual trigger)", "点击让 Core AI 结合近期对话推荐互补模型、接力方式与备注（不会默认自动覆盖）"))
+                    .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                    .on_click((_e, cx) => {
+                      cx.stop_propagation();
+                      if (!this.recLoading) {
+                        this.requestRecommendation(cx, true);
+                        cx.notify();
+                      }
+                    })
+                    .child(this.recLoading ? tr("✨ Analyzing…", "✨ 分析中…") : tr("✨ AI Recommend", "✨ AI 推荐")),
+                ),
+              )
+              .child(
+                div()
+                  .id("ho-close-x")
+                  .flex_none()
+                  .p(4)
+                  .rounded(5)
+                  .text_color(t.dim)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                  .on_click(() => closeOverlay(p.overlay))
+                  .child(svg("mods/pane/close.svg").size(13)),
+              ),
           ),
       )
       // 3-segment mode switcher (creation modes only — NO Merge Back tab here)
@@ -768,31 +962,52 @@ export default class Handoff extends View {
                 .whitespace_normal()
                 .child(`${rec.reason} (${rec.recommendedPreset} · ${kindLabel})`),
             )
-            .when(modeDiffers, (btnEl) =>
-              btnEl.child(
-                div()
-                  .id("ho-rec-apply-mode")
-                  .flex_none()
-                  .px(7)
-                  .py(3)
-                  .rounded(5)
-                  .bg(t.background)
-                  .border_1()
-                  .border_color(withAlpha(recColor, "77") ?? t.border)
-                  .text_size(10.5)
-                  .font_medium()
-                  .text_color(recColor)
-                  .cursor_pointer()
-                  .hover((s) => s.bg(t.hover))
-                  .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-                  .on_click((_e, cx) => {
-                    cx.stop_propagation();
-                    this.userTouchedMode = true;
-                    this.applyPrefillFromRecommendation(rec, true);
-                    cx.notify();
-                  })
-                  .child(tr(`Switch to ${kindLabel}`, `切到${kindLabel}`)),
-              ),
+            .child(
+              h_flex()
+                .flex_none()
+                .items_center()
+                .gap(5)
+                .child(
+                  div()
+                    .id("ho-rec-apply")
+                    .flex_none()
+                    .px(8)
+                    .py(3)
+                    .rounded(5)
+                    .bg(withAlpha(recColor, "22") ?? t.background)
+                    .border_1()
+                    .border_color(withAlpha(recColor, "77") ?? t.border)
+                    .text_size(10.5)
+                    .font_semibold()
+                    .text_color(recColor)
+                    .cursor_pointer()
+                    .hover((s) => s.bg(withAlpha(recColor, "33") ?? t.hover))
+                    .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                    .on_click((_e, cx) => {
+                      cx.stop_propagation();
+                      this.userTouchedMode = true;
+                      this.applyPrefillFromRecommendation(rec, true);
+                      cx.notify();
+                    })
+                    .child(modeDiffers ? tr(`Apply (${kindLabel})`, `应用并切到${kindLabel}`) : tr("Apply", "应用推荐")),
+                )
+                .child(
+                  div()
+                    .id("ho-rec-dismiss")
+                    .flex_none()
+                    .p(3)
+                    .rounded(4)
+                    .text_color(t.dim)
+                    .cursor_pointer()
+                    .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                    .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                    .on_click((_e, cx) => {
+                      cx.stop_propagation();
+                      this.recommendation = null;
+                      cx.notify();
+                    })
+                    .child(svg("mods/pane/close.svg").size(10)),
+                ),
             ),
         );
       })
@@ -844,7 +1059,7 @@ export default class Handoff extends View {
                         this.preset === pr.key,
                         () => {
                           this.userTouchedPreset = true;
-                          this.preset = pr.key;
+                          this.selectPreset(pr.key);
                         },
                         accent,
                         this.recommendation?.recommendedPreset === pr.key
@@ -855,6 +1070,228 @@ export default class Handoff extends View {
                   ),
               ),
           )
+          // Target Model + Reasoning Effort selector
+          .child((() => {
+            const cat = this.catalogForPreset(this.preset);
+            const effLabels = EFFORT_LABELS();
+            const modelDisplay = this.model
+              ? this.model
+              : cat.defaultModel
+                ? `${tr("Default", "默认")} (${cat.defaultModel})`
+                : tr("Default", "默认");
+            return v_flex()
+              .w_full()
+              .min_w(0)
+              .gap(6)
+              .child(
+                h_flex()
+                  .w_full()
+                  .min_w(0)
+                  .gap(14)
+                  .items_start()
+                  .child(
+                    v_flex()
+                      .flex_1()
+                      .min_w(0)
+                      .gap(6)
+                      .child(sectionLabel(tr("Target Model", "目标模型")))
+                      .child(
+                        h_flex()
+                          .id("ho-model-toggle")
+                          .w_full()
+                          .min_w(0)
+                          .h(26)
+                          .px(9)
+                          .gap(6)
+                          .items_center()
+                          .justify_between()
+                          .rounded(6)
+                          .border_1()
+                          .border_color(this.modelPickerOpen || this.model ? accent : t.border)
+                          .bg(this.model ? (withAlpha(accent, "18") ?? t.raised) : t.raised)
+                          .text_size(11.5)
+                          .text_color(this.model ? t.foreground : t.muted)
+                          .cursor_pointer()
+                          .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                          .on_click((_e, cx) => {
+                            cx.stop_propagation();
+                            this.modelPickerOpen = !this.modelPickerOpen;
+                            cx.notify();
+                          })
+                          .child(div().flex_1().min_w(0).truncate().child(modelDisplay))
+                          .child(
+                            svg(this.modelPickerOpen ? "mods/workspace-chrome/chevron-down.svg" : "mods/workspace-chrome/chevron-right.svg")
+                              .size(11)
+                              .flex_none()
+                              .text_color(t.dim),
+                          ),
+                      ),
+                  )
+                  .child(
+                    v_flex()
+                      .flex_1()
+                      .min_w(0)
+                      .gap(6)
+                      .child(sectionLabel(tr("Reasoning Effort", "思考强度")))
+                      .child(
+                        h_flex()
+                          .w_full()
+                          .min_w(0)
+                          .gap(4)
+                          .flex_wrap()
+                          .child(
+                            this.chip(
+                              t,
+                              "ho-eff-default",
+                              effLabels[""],
+                              !this.effort,
+                              () => { this.effort = ""; },
+                              accent,
+                            ),
+                          )
+                          .children(
+                            cat.efforts.map((eff) =>
+                              this.chip(
+                                t,
+                                `ho-eff-${eff}`,
+                                effLabels[eff] ?? eff,
+                                this.effort === eff,
+                                () => { this.effort = eff; },
+                                accent,
+                              ),
+                            ),
+                          ),
+                      ),
+                  ),
+              )
+              .when(this.modelPickerOpen, (dropEl) =>
+                dropEl.child(
+                  v_flex()
+                    .id("ho-model-dropdown")
+                    .w_full()
+                    .min_w(0)
+                    .p(6)
+                    .gap(4)
+                    .rounded(8)
+                    .bg(t.background)
+                    .border_1()
+                    .border_color(t.border)
+                    .child(
+                      v_flex()
+                        .id("ho-model-list")
+                        .w_full()
+                        .min_w(0)
+                        .max_h(148)
+                        .gap(2)
+                        .overflow_y_scrollbar()
+                        .child(
+                          h_flex()
+                            .id("ho-model-opt-default")
+                            .h(25)
+                            .px(8)
+                            .gap(6)
+                            .items_center()
+                            .justify_between()
+                            .rounded(5)
+                            .bg(!this.model ? (withAlpha(accent, "1f") ?? t.selected ?? t.hover) : "#00000000")
+                            .text_size(11.5)
+                            .text_color(!this.model ? t.foreground : t.muted)
+                            .cursor_pointer()
+                            .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                            .on_click((_e, cx) => {
+                              cx.stop_propagation();
+                              this.selectModel("");
+                              this.modelPickerOpen = false;
+                              cx.notify();
+                            })
+                            .child(div().flex_1().min_w(0).truncate().child(cat.defaultModel ? `${tr("Default", "默认")} (${cat.defaultModel})` : tr("Default (agent choice)", "默认（跟随 Agent 配置）")))
+                            .when(!this.model, (ck) => ck.child(svg("mods/workspace-chrome/check.svg").size(11).text_color(accent))),
+                        )
+                        .children(
+                          cat.models.map((m, idx) => {
+                            const picked = this.model === m;
+                            return h_flex()
+                              .id(`ho-model-opt-${idx}`)
+                              .h(25)
+                              .px(8)
+                              .gap(6)
+                              .items_center()
+                              .justify_between()
+                              .rounded(5)
+                              .bg(picked ? (withAlpha(accent, "1f") ?? t.selected ?? t.hover) : "#00000000")
+                              .text_size(11.5)
+                              .text_color(picked ? t.foreground : t.muted)
+                              .cursor_pointer()
+                              .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                              .on_click((_e, cx) => {
+                                cx.stop_propagation();
+                                this.selectModel(m);
+                                this.modelPickerOpen = false;
+                                cx.notify();
+                              })
+                              .child(div().flex_1().min_w(0).truncate().child(m))
+                              .when(picked, (ck) => ck.child(svg("mods/workspace-chrome/check.svg").size(11).text_color(accent)));
+                          }),
+                        ),
+                    )
+                    .child(
+                      h_flex()
+                        .w_full()
+                        .min_w(0)
+                        .pt(4)
+                        .gap(6)
+                        .items_center()
+                        .border_t(1)
+                        .border_color(t.border)
+                        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                        .child(
+                          Input.new(this.customModelInput)
+                            .id("ho-model-custom-input")
+                            .flex_1()
+                            .min_w(0)
+                            .h(24)
+                            .px(7)
+                            .rounded(5)
+                            .border_1()
+                            .border_color(t.input)
+                            .bg(t.raised)
+                            .text_size(11)
+                            .text_color(t.foreground),
+                        )
+                        .child(
+                          div()
+                            .id("ho-model-custom-ok")
+                            .h(24)
+                            .px(8)
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .rounded(5)
+                            .bg(t.raised)
+                            .border_1()
+                            .border_color(t.border)
+                            .text_size(10.5)
+                            .text_color(t.foreground)
+                            .cursor_pointer()
+                            .hover((s) => s.bg(t.hover))
+                            .on_click((_e, cx) => {
+                              cx.stop_propagation();
+                              const val = String(this.customModelInput?.value?.() ?? "").trim();
+                              if (val) {
+                                this.selectModel(val);
+                                this.modelPickerOpen = false;
+                                cx.notify();
+                              }
+                            })
+                            .child(tr("Use", "使用")),
+                        ),
+                    ),
+                ),
+              );
+          })())
           // Compact 2-column settings: Runtime + Open Location
           .child(
             h_flex()

@@ -29,8 +29,8 @@ pub use config::{
     parse_ai_token_size, parse_iso_ms, validate_http_url, write_secret_file,
 };
 pub use digest::{
-    AgentDigestResult, DeterministicDigest, SummarizeAgentParams, build_deterministic_acp_digest,
-    refine_agent_digest,
+    AgentDigestResult, CommitMessageParams, CommitMessageResult, DeterministicDigest, SummarizeAgentParams,
+    build_deterministic_acp_digest, generate_commit_message, refine_agent_digest,
 };
 pub use handoff_ai::{
     HandoffRecommendParams, HandoffRecommendResult, distill_merge_back, distill_omitted_turns,

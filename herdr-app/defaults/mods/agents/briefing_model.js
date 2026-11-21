@@ -66,10 +66,20 @@ export function formatShortDuration(ms) {
   return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`;
 }
 
+function formatClockElapsed(ms) {
+  const totalSec = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = String(totalSec % 60).padStart(2, "0");
+  if (h >= 24) return `${Math.floor(h / 24)}d ${h % 24}h`;
+  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${s}`;
+  return `${m}:${s}`;
+}
+
 /**
  * Formats a concise 3-line zero-click hover tooltip for an agent row or tab card.
  */
-export function buildHoverTooltip(agent, rec, { isZh = false, now = Date.now(), since = 0, displayLabel = "" } = {}) {
+export function buildHoverTooltip(agent, rec, { isZh = false, now = Date.now(), since = 0, elapsedMs = null, displayLabel = "" } = {}) {
   const tr = (en, zh) => (isZh ? zh : en);
   const statusMap = {
     working: tr("Working", "运行中"),
@@ -81,7 +91,12 @@ export function buildHoverTooltip(agent, rec, { isZh = false, now = Date.now(), 
   const addr = agent?.address ?? rec?.address ?? "";
   const statusKey = agent?.status ?? rec?.status ?? "idle";
   const statusText = statusMap[statusKey] ?? statusKey;
-  const elapsed = since > 0 && now >= since ? ` ${formatShortDuration(now - since)}` : "";
+  const elapsed =
+    typeof elapsedMs === "number" && elapsedMs > 0
+      ? ` ${formatClockElapsed(elapsedMs)}`
+      : since > 0 && now >= since
+        ? ` ${formatShortDuration(now - since)}`
+        : "";
   const prog = agent?.program?.name ?? rec?.program?.name ?? (agent?.acp || rec?.acp ? "ACP" : "CLI");
   const title =
     String(displayLabel || agent?.semantic_title || rec?.semantic_title || cleanTitle(agent?.title || rec?.title) || prog).trim();

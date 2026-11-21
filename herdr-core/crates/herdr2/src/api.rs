@@ -282,6 +282,9 @@ methods! { Ctx<'_>;
     "ai.summarize_agent" => ai_summarize_agent, crate::ai::SummarizeAgentParams => crate::ai::AgentDigestResult,
         "Generate or refresh an adaptive semantic title and one-sentence progress micro-summary for an agent or terminal.",
         errors ["not_found", "machine_unknown", "invalid_params", "unavailable"];
+    "ai.commit_message" => ai_commit_message, crate::ai::CommitMessageParams => crate::ai::CommitMessageResult,
+        "Generate a concise Git commit message for uncommitted changes in a repository using Core AI.",
+        errors ["machine_unknown", "invalid_params", "unavailable"];
     "checkpoint.list" => checkpoint_list, CheckpointListParams => CheckpointListResult,
         "List hidden Git ref checkpoints and workspace isolation status for an agent or terminal.",
         errors ["not_found", "machine_unknown", "invalid_params"];
@@ -1623,6 +1626,16 @@ async fn ai_summarize_agent(
             Ok(result)
         }
     }
+}
+
+async fn ai_commit_message(
+    core: Ctx<'_>,
+    p: crate::ai::CommitMessageParams,
+) -> Result<crate::ai::CommitMessageResult, RpcError> {
+    let cwd = crate::exec::folder(p.cwd.as_deref(), false);
+    crate::ai::generate_commit_message(&core.ai, &cwd, p.language.as_deref(), p.include_ai)
+        .await
+        .map_err(RpcError::invalid_params)
 }
 
 async fn checkpoint_list(core: Ctx<'_>, p: CheckpointListParams) -> Result<CheckpointListResult, RpcError> {

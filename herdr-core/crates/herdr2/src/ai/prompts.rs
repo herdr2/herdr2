@@ -145,7 +145,16 @@ Input fields: `away_minutes`, `counts`, `top_blockers`, `permission_clusters`, `
 Rules:
 - Prioritize critical blockers impacting downstream tasks, then batch-approvable permissions, then verified work ready to inspect.
 - <= 110 Chinese chars or <= 220 English chars. Factual, no filler.
-Output JSON: {"headline":"1-2 concise actionable sentences"}"#;
+Output JSON: {"headline":"1-2 concise actionable sentences"}
+
+[OP: commit_message]
+Purpose: Generate a single concise Git commit message summarizing the staged/unstaged workspace changes.
+Input fields: `branch`, `files`, `diff_stat`, `diff_excerpt`.
+Rules:
+- Follow Conventional Commits style (`feat(scope): ...`, `fix(scope): ...`, `refactor(scope): ...`, `docs: ...`, `chore: ...`).
+- Keep the subject line <= 72 chars, factual, describing WHAT changed and WHY; no markdown fences or trailing period.
+- Respect `lang` (`zh` -> English type/scope + concise Simplified Chinese summary; `en` -> concise English summary).
+Output JSON: {"message":"type(scope): concise summary"}"#;
 
 /// Compact fallback system prompt used only when `context_window <= 4096` or `prompt_cache_enabled == false`.
 pub fn compact_system_for_op(op: &str) -> &'static str {
@@ -169,6 +178,7 @@ pub fn compact_system_for_op(op: &str) -> &'static str {
         "checkpoint_bisect_verify" => "Pure text JSON analyzer (no tools). Identify which candidate turn patch introduced the bug: {\"suspect_turn\":4,\"confidence\":0.0,\"reason\":\"...\",\"evidence_files\":[],\"alternatives\":[]}. Reply JSON only.",
         "agent_digest" => "Pure text JSON summarizer (no tools). Return {\"semantic_title\":\"<=12 zh / <=24 en chars\",\"micro_summary\":\"<=42 zh / <=90 en chars\"}. Reply JSON only.",
         "catchup_briefing" => "Pure text JSON briefer (no tools). Write a 1-2 sentence priority catch-up headline: {\"headline\":\"...\"}. Reply JSON only.",
+        "commit_message" => "Pure text JSON commit message writer (no tools). Write a single-line conventional commit message (<=72 chars): {\"message\":\"type(scope): summary\"}. Reply JSON only.",
         _ => "You are a pure text assistant with NO tools or shell access. Never emit tool tags or shell commands.",
     }
 }
@@ -243,6 +253,7 @@ mod tests {
             "checkpoint_bisect_verify",
             "agent_digest",
             "catchup_briefing",
+            "commit_message",
         ] {
             assert!(HERDR2_CONTROL_PLANE_SYSTEM.contains(&format!("[OP: {op}]")), "missing {op}");
         }

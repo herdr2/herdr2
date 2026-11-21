@@ -690,53 +690,6 @@ export default class Tabs extends View {
     const hasSideChats = focusedMainSideChatCount() > 0;
     const effectiveEnabled = hasSideChats ? enabled : enabled.filter((id) => id !== "side-chat");
     this.syncPanel(space, panel, body, effectiveEnabled);
-    const rawFlashNotes = shared("flash_notes.items");
-    const unsentFlashCount = Array.isArray(rawFlashNotes)
-      ? rawFlashNotes.filter((n) => n && typeof n.text === "string" && n.text.trim() && !n.sentTo).length
-      : 0;
-    const flashNoteButton = h_flex()
-      .id("btn-flash-note")
-      .h(26)
-      .px(8)
-      .gap(5)
-      .flex_none()
-      .items_center()
-      .rounded(6)
-      .text_size(12)
-      .bg(t.chrome)
-      .text_color(t.muted)
-      .cursor_pointer()
-      .hover((s) => s.bg(t.hover).text_color(t.foreground))
-      .tooltip(tr("Capture a flash note (floating window)", "打开闪念悬浮窗，随时记录灵感或派发给 Agent"))
-      .on_mouse_down("left", stop)
-      .on_click(() =>
-        openOverlay({
-          mod: "flash-note",
-          kind: "window",
-          key: "flash-note",
-          resizable: true,
-          width: 456,
-          height: 436,
-          min_width: 360,
-          min_height: 330,
-          props: { mode: "compose" },
-        }),
-      )
-      .child(svg("mods/peek/lightbulb.svg").size(14).text_color(unsentFlashCount > 0 ? "#f59e0b" : t.muted))
-      .child(tr("Ideas", "闪念"))
-      .when(unsentFlashCount > 0, (el) =>
-        el.child(
-          div()
-            .px(4.5)
-            .py(0.5)
-            .rounded(999)
-            .bg("#f59e0b24")
-            .text_size(10)
-            .font_semibold()
-            .text_color("#f59e0b")
-            .child(String(unsentFlashCount)),
-        ),
-      );
     const panelButton = (id, label, icon) => {
       const on = panel && !panel.hidden && body?.active === id;
       return h_flex().id(`panel-${id}`).h(26).px(8).gap(5).flex_none().items_center().rounded(6)
@@ -776,7 +729,6 @@ export default class Tabs extends View {
       .when(enabled.includes("changes"), el => el.child(panelButton("changes", tr("Changes", "变更"), "mods/changes/changes.svg")))
       .when(enabled.includes("checkpoints"), el => el.child(panelButton("checkpoints", tr("Checkpoints", "快照"), "mods/checkpoints/checkpoints.svg")))
       .when(enabled.includes("side-chat") && hasSideChats, el => el.child(panelButton("side-chat", tr("Side Chat", "旁路"), "mods/peek/messages-square.svg")))
-      .child(flashNoteButton)
       .when(w?.buttons, el => el.child(button("minimize", w.platform === "windows" ? svg("mods/tabs/win-min.svg").size(16) : "−", () => run("window.minimize")))
         .child(button("maximize", w.platform === "windows" ? svg(`mods/tabs/${w.maximized ? "win-restore" : "win-max"}.svg`).size(16) : "□", () => run("window.maximize")))
         .child(button("close-window", w.platform === "windows" ? svg("mods/tabs/win-close.svg").size(16) : svg("mods/pane/close.svg").size(13), () => run("window.close"))))

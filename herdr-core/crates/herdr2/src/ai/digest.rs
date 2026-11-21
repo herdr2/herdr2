@@ -332,6 +332,181 @@ pub async fn refine_agent_digest(
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitMessageParams {
+    /// Target remote machine (`--on`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+    /// Git working directory to inspect (defaults to core cwd).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
+    /// Preferred UI language (`zh-CN` / `en`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Skip AI call and return deterministic fallback when false (default true).
+    #[serde(default = "default_true")]
+    pub include_ai: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CommitMessageResult {
+    /// Suggested single-line Git commit message.
+    pub message: String,
+    pub used_ai: bool,
+    #[serde(default)]
+    pub from_cache: bool,
+}
+
+struct GitDiffSnapshot {
+    branch: String,
+    files: Vec<String>,
+    diff_stat: String,
+    diff_excerpt: String,
+}
+
+fn run_git_ro(cwd: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .arg("--no-optional-locks")
+        .arg("-c")
+        .arg("core.fsmonitor=false")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if out.status.success() {
+        Some(String::from_utf8_lossy(&out.stdout).to_string())
+    } else {
+        None
+    }
+}
+
+fn collect_git_diff_snapshot(cwd: &str) -> Result<GitDiffSnapshot, String> {
+    let status = run_git_ro(cwd, &["status", "--porcelain=v1", "-b"])
+        .ok_or_else(|| format!("not a git repository: {cwd}"))?;
+    let mut branch = String::new();
+    let mut files = Vec::new();
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("## ") {
+            branch = rest.split("...").next().unwrap_or(rest).trim().to_string();
+        } else if !line.trim().is_empty() && files.len() < 40 {
+            files.push(line.to_string());
+        }
+    }
+    if files.is_empty() {
+        return Err("no uncommitted changes".into());
+    }
+    let has_head = run_git_ro(cwd, &["rev-parse", "--verify", "HEAD"]).is_some();
+    let stat_args: &[&str] = if has_head {
+        &["diff", "HEAD", "--stat", "--no-color"]
+    } else {
+        &["diff", "--cached", "--stat", "--no-color"]
+    };
+    let diff_stat = run_git_ro(cwd, stat_args).unwrap_or_default();
+    let diff_args: &[&str] = if has_head {
+        &["diff", "HEAD", "--no-color", "--unified=1"]
+    } else {
+        &["diff", "--cached", "--no-color", "--unified=1"]
+    };
+    let raw_diff = run_git_ro(cwd, diff_args).unwrap_or_default();
+    let diff_excerpt = strip_and_dedup_lines(&raw_diff, 80, 160, 3200);
+    Ok(GitDiffSnapshot { branch, files, diff_stat: strip_and_dedup_lines(&diff_stat, 30, 120, 1200), diff_excerpt })
+}
+
+pub fn build_deterministic_commit_message(files: &[String], is_zh: bool) -> String {
+    let names: Vec<String> = files
+        .iter()
+        .filter_map(|line| line.get(3..).map(str::trim))
+        .filter(|p| !p.is_empty())
+        .map(|p| p.rsplit('/').next().unwrap_or(p).to_string())
+        .take(3)
+        .collect();
+    let count = files.len();
+    let all_new = files.iter().all(|l| l.starts_with("??") || l.starts_with("A "));
+    let all_docs = files.iter().all(|l| l.to_ascii_lowercase().ends_with(".md"));
+    let kind = if all_docs {
+        "docs"
+    } else if all_new {
+        "feat"
+    } else {
+        "chore"
+    };
+    let list = names.join(", ");
+    if is_zh {
+        if count <= 3 && !list.is_empty() {
+            format!("{kind}: 更新 {list}")
+        } else {
+            format!("{kind}: 更新 {list} 等 {count} 个文件")
+        }
+    } else if count <= 3 && !list.is_empty() {
+        format!("{kind}: update {list}")
+    } else {
+        format!("{kind}: update {list} and {} more files", count.saturating_sub(names.len()))
+    }
+}
+
+/// Generates a concise Git commit message from uncommitted changes in `cwd` using Core AI,
+/// with a deterministic fallback when AI is disabled or unavailable.
+pub async fn generate_commit_message(
+    ai: &AiRuntime,
+    cwd: &str,
+    language: Option<&str>,
+    include_ai: bool,
+) -> Result<CommitMessageResult, String> {
+    let cwd_owned = cwd.to_string();
+    let snap = tokio::task::spawn_blocking(move || collect_git_diff_snapshot(&cwd_owned))
+        .await
+        .map_err(|e| e.to_string())??;
+    let is_zh = language.is_some_and(|l| l.to_ascii_lowercase().starts_with("zh"));
+    let fallback_msg = build_deterministic_commit_message(&snap.files, is_zh);
+    let fallback = CommitMessageResult { message: fallback_msg, used_ai: false, from_cache: false };
+
+    let cfg = ai.config_snapshot();
+    if !include_ai || !cfg.enabled || cfg.base_url.trim().is_empty() || ai.is_circuit_open() {
+        return Ok(fallback);
+    }
+
+    let lang = if is_zh { "zh" } else { "en" };
+    let files_joined = snap.files.join("\n");
+    let cache_key = format!(
+        "commit_msg:{lang}:{}",
+        fingerprint_hex(&[&snap.branch, &files_joined, &snap.diff_stat, &snap.diff_excerpt])
+    );
+    let payload = json!({
+        "branch": snap.branch,
+        "files": snap.files,
+        "diff_stat": snap.diff_stat,
+        "diff_excerpt": snap.diff_excerpt,
+    });
+    let user_prompt = format_op_user_message("commit_message", lang, &payload);
+    let Some(resp) = ai
+        .complete_bg(AiCompleteRequest {
+            op: "commit_message".into(),
+            tier: AiTaskTier::Nano,
+            mode: AiConversationMode::StatelessSharedPrefix,
+            user_prompt,
+            max_tokens: 256,
+            timeout: DIGEST_TIMEOUT,
+            cache_key: Some(cache_key),
+            cache_ttl: Some(Duration::from_secs(120)),
+            prompt_cache_bucket: Some("cp".into()),
+            ..Default::default()
+        })
+        .await
+    else {
+        return Ok(fallback);
+    };
+
+    let parsed_msg = extract_json_object(&resp.content)
+        .and_then(|v| clean_bounded(v["message"].as_str(), 84))
+        .or_else(|| clean_bounded(resp.content.lines().next(), 84));
+    match parsed_msg {
+        Some(message) => Ok(CommitMessageResult { message, used_ai: true, from_cache: resp.from_local_cache }),
+        None => Ok(fallback),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

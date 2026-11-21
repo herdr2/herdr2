@@ -1,7 +1,7 @@
 // Agents in grouped or priority views; parents take their most urgent sub-agent's place.
 
 import { View, div, image, svg } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input } from "gpui-base";
+import { v_flex, h_flex, InputState, Input, Popup } from "gpui-base";
 import { agents, terminals, panes, focused, spaces, run, h2, checking, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout, settings } from "herdr";
 import { resolveSemanticLabel, buildHoverTooltip, buildLocalFallbackBriefing, mergeBriefingSnapshots } from "./briefing_model.js";
 
@@ -108,6 +108,32 @@ function duration(ms) {
   return h < 24 ? `${h}h` : `${Math.floor(h / 24)}d`;
 }
 
+function formatElapsed(ms) {
+  const totalSec = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+  const h = Math.floor(totalSec / 3600);
+  const m = Math.floor((totalSec % 3600) / 60);
+  const s = String(totalSec % 60).padStart(2, "0");
+  if (h >= 24) return `${Math.floor(h / 24)}d ${h % 24}h`;
+  if (h > 0) return `${h}:${String(m).padStart(2, "0")}:${s}`;
+  return `${m}:${s}`;
+}
+
+function elapsedTooltip(info) {
+  const cur = formatElapsed(info.ms);
+  const tot = formatElapsed(info.totalMs);
+  if (info.working) {
+    return info.totalMs > info.ms
+      ? tr(`Running for ${cur} (total ${tot})`, `本次运行已耗时 ${cur}（累计 ${tot}）`)
+      : tr(`Running for ${cur}`, `本次运行已耗时 ${cur}`);
+  }
+  if (info.ran) {
+    return info.totalMs > info.ms
+      ? tr(`Last run took ${cur} (total ${tot})`, `最近一次运行耗时 ${cur}（累计 ${tot}）`)
+      : tr(`Last run took ${cur}`, `最近一次运行耗时 ${cur}`);
+  }
+  return tr("No completed run yet", "尚未开始计时");
+}
+
 // The agent's icon from the app's program table: a one-color glyph or a picture.
 function icon(p, size, color) {
   if (!p?.icon) return null;
@@ -140,6 +166,7 @@ export default class Agents extends View {
       this.briefingError = "";
       this.workingExpanded = false;
       this.idleExpanded = false;
+      this.briefingStatusAddr = null;
       this.batchBusy = new Set();
       this.resolvedIds = new Set();
       this.replyInputs = new Map();
@@ -169,8 +196,39 @@ export default class Agents extends View {
     this.digestInflight = new Set();
     this.digestLastFetch = new Map();
     this.hoverDigestTask = null;
+    this.localWorkingSince = {};
+    this.localWorkMs = {};
     this.listFocus = cx?.focus_handle?.();
+    cx.timer.every(1000, (tcx) => {
+      if (agents().some((a) => a.status === "working")) tcx.notify();
+    });
     cx.timer.every(30000, (cx) => cx.notify());
+  }
+
+  agentElapsed(key, status, workingSince, workMs, totalWorkMs, now) {
+    const hasWs = typeof workingSince === "number" && workingSince > 0;
+    const hasWork = typeof workMs === "number" && workMs >= 0;
+    if (status === "working") {
+      const start = hasWs ? workingSince : (this.localWorkingSince[key] ?? (this.localWorkingSince[key] = now));
+      const ms = Math.max(0, now - start);
+      this.localWorkMs[key] = ms;
+      return { ms, totalMs: Math.max(ms, Number(totalWorkMs) || 0), working: true, ran: true };
+    }
+    if (this.localWorkingSince[key]) {
+      if (!hasWork) {
+        this.localWorkMs[key] = Math.max(this.localWorkMs[key] ?? 0, now - this.localWorkingSince[key]);
+      }
+      delete this.localWorkingSince[key];
+    }
+    if (hasWork) {
+      this.localWorkMs[key] = workMs;
+      return { ms: workMs, totalMs: Math.max(workMs, Number(totalWorkMs) || 0), working: false, ran: true };
+    }
+    if (typeof this.localWorkMs[key] === "number") {
+      const ms = this.localWorkMs[key];
+      return { ms, totalMs: Math.max(ms, Number(totalWorkMs) || 0), working: false, ran: true };
+    }
+    return { ms: 0, totalMs: Number(totalWorkMs) || 0, working: false, ran: false };
   }
 
   refreshBriefing(cx) {
@@ -520,11 +578,18 @@ export default class Agents extends View {
       if (!stObj || !item?.address) return null;
       const addr = item.address;
       const label = statusLabels()[stObj.status] ?? tr("Idle", "空闲");
+      const open = this.briefingStatusAddr === addr;
+      const activeId = stObj.manual_status ?? "auto";
+      const items = statusItems();
       const tip = tr(
         `Status: ${label}${stObj.manual_status ? " (manual)" : ""} — click to change`,
         `状态：${label}${stObj.manual_status ? "（手动）" : ""} — 点击手动修改`,
       );
-      return h_flex()
+      const glyph = (it) => {
+        if (it.id === "auto") return svg("mods/workspace-chrome/clock.svg").size(13).flex_none().text_color(t.muted);
+        return div().w(13).flex_none().flex().items_center().justify_center().child(this.status(t, { status: it.id }, true));
+      };
+      const trigger = h_flex()
         .id(`br-status-${addr}`)
         .h(24)
         .px(7)
@@ -534,14 +599,15 @@ export default class Agents extends View {
         .rounded(6)
         .bg(t.background)
         .border_1()
-        .border_color(stObj.manual_status ? accent : t.border)
+        .border_color(open || stObj.manual_status ? accent : t.border)
         .cursor_pointer()
         .hover((s) => s.bg(t.hover).border_color(accent))
         .tooltip(tip)
         .on_mouse_down("left", (_e, evCx) => evCx.stop_propagation())
         .on_click((_e, evCx) => {
           evCx.stop_propagation();
-          openOverlay({ mod: "agents", kind: "popup", width: 215, height: 220, props: { statusMenu: true, terminal: addr } });
+          this.briefingStatusAddr = open ? null : addr;
+          evCx.notify();
         })
         .child(this.status(t, stObj, true))
         .child(
@@ -550,6 +616,55 @@ export default class Agents extends View {
             .font_medium()
             .text_color(stObj.manual_status ? t.foreground : t.muted)
             .child(stObj.manual_status ? `${label}·${tr("M", "手")}` : label),
+        );
+
+      return Popup.new(`br-status-popup-${addr}`, trigger)
+        .anchor("bottom_right")
+        .when(open, (popEl) =>
+          popEl.content(
+            v_flex()
+              .id(`br-status-menu-${addr}`)
+              .w(196)
+              .p(5)
+              .rounded(8)
+              .bg(t.popover ?? t.background)
+              .border_1()
+              .border_color(t.border)
+              .text_size(12)
+              .on_mouse_down("left", (_e, evCx) => evCx.stop_propagation())
+              .child(div().px(8).pt(3).pb(5).text_size(10.5).text_color(t.dim).child(tr("Agent status", "智能体状态")))
+              .children(
+                items.map((it) => {
+                  const picked = it.id === activeId;
+                  const hint = it.id === "auto" ? (stObj.manual_status ? "" : tr("Default", "默认")) : picked ? tr("Manual", "手动") : "";
+                  return v_flex()
+                    .when(it.id === "auto", (sep) => sep.child(div().mx(6).my(3).h(1).bg(t.border)))
+                    .child(
+                      h_flex()
+                        .id(`br-st-opt-${addr}-${it.id}`)
+                        .h(28)
+                        .px(8)
+                        .gap(8)
+                        .rounded(6)
+                        .items_center()
+                        .text_color(t.foreground)
+                        .cursor_pointer()
+                        .when(picked, (s) => s.bg(t.selected ?? t.hover))
+                        .hover((s) => s.bg(t.hover))
+                        .on_click((_e, evCx) => {
+                          evCx.stop_propagation();
+                          run("agent.status", { terminal: addr, status: it.id });
+                          this.briefingStatusAddr = null;
+                          evCx.notify();
+                        })
+                        .child(glyph(it))
+                        .child(div().flex_1().child(it.label))
+                        .when(Boolean(hint), (h) => h.child(div().text_size(10).text_color(t.dim).child(hint)))
+                        .when(picked, (ck) => ck.child(svg("mods/workspace-chrome/check.svg").size(12).flex_none().text_color(accent))),
+                    );
+                }),
+              ),
+          ),
         );
     };
 
@@ -794,8 +909,22 @@ export default class Agents extends View {
       .gap(10)
       .bg(t.popover)
       .text_size(12.5)
-      .on_key_down((e) => {
-        if (e?.key === "escape" && overlay) closeOverlay(overlay);
+      .on_mouse_down("left", (_e, evCx) => {
+        if (this.briefingStatusAddr) {
+          this.briefingStatusAddr = null;
+          evCx?.notify?.();
+        }
+      })
+      .on_key_down((e, evCx) => {
+        if (e?.key === "escape") {
+          if (this.briefingStatusAddr) {
+            this.briefingStatusAddr = null;
+            evCx?.stop_propagation?.();
+            evCx?.notify?.();
+          } else if (overlay) {
+            closeOverlay(overlay);
+          }
+        }
       })
       // Header bar
       .child(
@@ -1025,8 +1154,22 @@ export default class Agents extends View {
       .gap(6)
       .bg(t.popover)
       .text_size(12.5)
-      .on_key_down((e) => {
-        if (e?.key === "escape" && overlay) closeOverlay(overlay);
+      .on_mouse_down("left", (_e, evCx) => {
+        if (this.briefingStatusAddr) {
+          this.briefingStatusAddr = null;
+          evCx?.notify?.();
+        }
+      })
+      .on_key_down((e, evCx) => {
+        if (e?.key === "escape") {
+          if (this.briefingStatusAddr) {
+            this.briefingStatusAddr = null;
+            evCx?.stop_propagation?.();
+            evCx?.notify?.();
+          } else if (overlay) {
+            closeOverlay(overlay);
+          }
+        }
       })
       .child(
         h_flex()
@@ -1588,10 +1731,19 @@ export default class Agents extends View {
       const shortId = shortAgentId(a.address);
       const showId = Boolean(shortId) && name !== shortId && name !== a.address;
       const mono = (typeof settings === "function" ? settings()?.font_family : null) ?? "JetBrains Mono";
+      const rowElapsed = this.agentElapsed(
+        a.address,
+        a.status,
+        a.working_since ?? rowTerm?.working_since,
+        a.work_ms ?? rowTerm?.work_ms,
+        a.total_work_ms ?? rowTerm?.total_work_ms ?? 0,
+        now,
+      );
       const rowHoverTip = buildHoverTooltip(a, rowTerm, {
         isZh: isZh(),
         now,
         since: when,
+        elapsedMs: rowElapsed.ms,
         displayLabel: more || name,
       });
       return h_flex()
@@ -1730,7 +1882,17 @@ export default class Agents extends View {
         .when(Boolean(machine), el => el.child(div().text_size(10).text_color(t.dim).child(machine)))
         .when(subs.length > 0, el => el.child(fold(a, subs)))
         .when(this.hovered === a.address, el => el.child(pin).child(remove))
-        .when(this.hovered !== a.address && Boolean(when), el => el.child(div().flex_none().text_size(11).text_color(t.dim).child(duration(now - when))))
+        .when(this.hovered !== a.address, el =>
+          el.child(
+            div()
+              .id(`ag-time-${a.address}`)
+              .flex_none()
+              .text_size(11)
+              .text_color(rowElapsed.working ? (t.working ?? t.accent ?? t.foreground) : (rowElapsed.ran ? t.muted : t.dim))
+              .tooltip(elapsedTooltip(rowElapsed))
+              .child(formatElapsed(rowElapsed.ms)),
+          ),
+        )
         .child((() => {
           const liveRec = all.find((x) => x.address === a.address);
           const merged = liveRec

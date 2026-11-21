@@ -904,7 +904,17 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
         const title = entry.title || entry.id || "Tool call";
         const info = summarizeToolTitle(title);
         const detail = entry.detail ? String(entry.detail) : null;
-        const parsedDetail = detail ? parseToolDetail({ tool_kind: entry.tool_kind, title, detail }) : null;
+        const mayBeDiff = Boolean(
+          detail && (
+            detail.startsWith("--- ")
+            || detail.startsWith("diff --git")
+            || detail.startsWith("*** ")
+            || detail.includes("\n@@")
+            || detail.includes("\n+++ ")
+            || detail.includes("\n--- ")
+          ),
+        );
+        const parsedDetail = mayBeDiff ? parseToolDetail({ tool_kind: entry.tool_kind, title, detail }) : null;
         activeGroup.toolCount += 1;
         if (isRunningStatus(status)) {
           activeGroup.runningCount += 1;
