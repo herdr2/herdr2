@@ -435,11 +435,14 @@ async fn dispatch_http_inner(
             "version": env!("CARGO_PKG_VERSION"),
             "startedAt": core.drove.started_at,
         })),
+        ("POST", ["api", "preflight", "worktree"]) => {
+            preflight_worktree_http(core, &body).await
+        }
         ("GET", ["api", "ai", "status"]) => Ok(json!(core.drove.ai_status())),
         ("PUT", ["api", "ai", "config"]) => Err(ApiErr::new(
             405,
             "configured_in_app",
-            "Please configure AI Assistant in Herdr2 App -> Settings -> Drove",
+            "Please configure AI Assistant in Herdr2 App -> Settings -> AI",
         )),
         ("POST", ["api", "ai", "test"]) => {
             let res = core.drove.rpc_ai_test(None, None, None).await.map_err(rpc_to_api)?;
@@ -835,6 +838,41 @@ fn patch_run_http(
     Ok(json!(updated))
 }
 
+async fn preflight_worktree_http(core: &Arc<Core>, body: &Value) -> Result<Value, ApiErr> {
+    let cwd = body["cwd"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| ApiErr::new(400, "bad_request", "cwd is required"))?
+        .to_string();
+    let raw_tasks: Vec<Value> = body["tasks"].as_array().cloned().unwrap_or_default();
+    let force = body["force"].as_bool() == Some(true);
+    let cfg = core.drove.config_snapshot();
+    let needed = force || super::routes::tasks_need_worktree_preflight(&cfg, &[], &raw_tasks);
+    if !needed {
+        return Ok(json!({ "ok": true, "checked": false }));
+    }
+    let cwd_clone = cwd.clone();
+    let check = tokio::task::spawn_blocking(move || super::integrate::check_drove_worktree_ready(&cwd_clone))
+        .await
+        .map_err(|e| ApiErr::new(500, "internal", format!("preflight join error: {e}")))?;
+    match check {
+        Ok(ok) => Ok(json!({
+            "ok": true,
+            "checked": true,
+            "isAosp": ok.is_aosp,
+            "dirtyFiles": ok.dirty_files,
+            "totalDirty": ok.total_dirty,
+            "dirtyWarning": ok.dirty_warning,
+        })),
+        Err(blocker) => Err(ApiErr::new(
+            422,
+            "worktree_not_ready",
+            format!("{} | 建议处理：{}", blocker.message, blocker.fix_hint),
+        )),
+    }
+}
+
 async fn trash_run_http(core: &Arc<Core>, id: &str) -> Result<Value, ApiErr> {
     let drove = &core.drove;
     let run = drove.store.get_run(id).ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
@@ -853,6 +891,7 @@ async fn trash_run_http(core: &Arc<Core>, id: &str) -> Result<Value, ApiErr> {
         .map(|w| w.id)
         .collect();
     super::pool::stop_run_workers(core, id).await;
+    core.ai.evict_session_prefix(&format!("drove:run:{id}"));
     for wid in wids {
         drove.remove_worker_token(&wid);
     }
@@ -1789,4 +1828,36 @@ async fn write_http_bytes(
 pub(crate) fn _keep_read_ai_key_unused_silence() -> usize {
     let _ = read_ai_key;
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn embedded_web_bundle_contains_index_and_assets() {
+        let web_pkg = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../drove-web/package.json");
+        if !web_pkg.is_file() || std::env::var("H2_SKIP_WEB_BUILD").as_deref() == Ok("1") {
+            return;
+        }
+        let (index_rel, index_bytes) =
+            embedded_web_asset("", true).expect("DROVE_WEB_ASSETS should embed index.html");
+        assert_eq!(index_rel, "index.html");
+        let html = String::from_utf8_lossy(index_bytes);
+        assert!(html.contains("<div id=\"root\"></div>"), "unexpected index.html: {html}");
+
+        let injected = String::from_utf8(inject_web_token(index_bytes, "tok-123")).unwrap();
+        assert!(injected.contains("window.__DROVE_TOKEN__=\"tok-123\""));
+        assert!(injected.contains("</head>"));
+
+        let has_js = DROVE_WEB_ASSETS.iter().any(|(k, b)| k.starts_with("assets/") && k.ends_with(".js") && !b.is_empty());
+        let has_css =
+            DROVE_WEB_ASSETS.iter().any(|(k, b)| k.starts_with("assets/") && k.ends_with(".css") && !b.is_empty());
+        assert!(has_js, "embedded bundle should include JS asset");
+        assert!(has_css, "embedded bundle should include CSS asset");
+
+        // Unknown SPA routes fall back to index.html; traversal attempts also safely fall back.
+        assert_eq!(embedded_web_asset("runs/r1", true).map(|(k, _)| k), Some("index.html"));
+        assert_eq!(embedded_web_asset("../secret", false).map(|(k, _)| k), Some("index.html"));
+    }
 }

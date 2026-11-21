@@ -25,6 +25,7 @@ pub const FEATURES: &[&str] = &[
     "automatic_input",
     "restart_environment",
     "drove",
+    "ai",
 ];
 pub const FINISHED_LINES: usize = 1000;
 /// Agent and terminal identity variables stripped unless explicitly passed by a caller.
@@ -125,6 +126,9 @@ methods! { Ctx<'_>;
     "agent.inbox_remove" => agent_inbox_remove, InboxRemoveParams => Public,
         "Remove a queued prompt from an ACP agent's serial inbox before its turn starts.",
         errors ["not_found", "machine_unknown", "finished"];
+    "agent.inbox_send" => agent_inbox_send, InboxSendParams => Public,
+        "Interrupt the active turn if needed and immediately send a queued prompt from an ACP agent's serial inbox.",
+        errors ["not_found", "machine_unknown", "finished", "unavailable"];
     "agent.wait" => agent_wait, WaitParams => crate::wait::WaitResult,
         "Wait until an agent leaves `working` (idle, blocked, error, or exited). Already not working returns immediately. With `children`, wait on subordinate agents.",
         errors ["not_found", "machine_unknown", "invalid_params", "needs_target", "config"];
@@ -254,6 +258,30 @@ methods! { Ctx<'_>;
     "drove.subscribe" => drove_subscribe, Empty => DroveSubscribeResult,
         "Subscribe to Drove change and item events on a framed connection.",
         errors ["needs_framed"];
+    "ai.status" => ai_status, crate::ai::AiOnParams => crate::ai::AiStatus,
+        "Read global Core AI Assistant configuration, masked secret status, available models, circuit breaker state, and KV-cache / token usage metrics.",
+        errors ["machine_unknown", "unavailable"];
+    "ai.settings.set" => ai_settings_set, crate::ai::AiSettingsSetParams => crate::ai::AiStatus,
+        "Update global Core AI Assistant settings, Core-level switches, and 0600 API key secret.",
+        errors ["invalid_params", "machine_unknown", "unavailable"];
+    "ai.test" => ai_test, crate::ai::AiTestParams => crate::ai::AiTestResult,
+        "Test OpenAI-compatible AI endpoint connectivity and refresh discovered models.",
+        errors ["invalid_params", "machine_unknown", "unavailable"];
+    "ai.complete" => ai_complete, crate::ai::AiCompleteParams => crate::ai::AiCompleteResult,
+        "Run a bounded pure-text completion through the shared Core AI runtime with KV-cache prefix reuse.",
+        errors ["invalid_params", "machine_unknown", "unavailable"];
+    "ai.classify_terminal_state" => ai_classify_terminal_state, crate::ai::ClassifyTerminalStateParams => crate::ai::ClassifyTerminalStateResult,
+        "Arbitrate a non-OSC-7501 interactive PTY CLI agent's execution state from its quiet screen tail.",
+        errors ["invalid_params", "machine_unknown", "unavailable"];
+    "ai.handoff_recommend" => handoff::ai_handoff_recommend, crate::ai::HandoffRecommendParams => crate::ai::HandoffRecommendResult,
+        "Recommend a complementary target agent preset, handoff mode, and pre-filled note from an upstream session's recent turns.",
+        errors ["not_found", "machine_unknown", "invalid_params", "stopping"];
+    "ai.briefing" => ai_briefing, crate::ai::BriefingParams => crate::ai::BriefingSnapshot,
+        "Aggregate local and remote agents, terminals, and Drove DAG runs into a priority catch-up briefing with permission clustering and downstream impact ranking.",
+        errors ["machine_unknown", "invalid_params", "unavailable"];
+    "ai.summarize_agent" => ai_summarize_agent, crate::ai::SummarizeAgentParams => crate::ai::AgentDigestResult,
+        "Generate or refresh an adaptive semantic title and one-sentence progress micro-summary for an agent or terminal.",
+        errors ["not_found", "machine_unknown", "invalid_params", "unavailable"];
     "checkpoint.list" => checkpoint_list, CheckpointListParams => CheckpointListResult,
         "List hidden Git ref checkpoints and workspace isolation status for an agent or terminal.",
         errors ["not_found", "machine_unknown", "invalid_params"];
@@ -266,6 +294,9 @@ methods! { Ctx<'_>;
     "checkpoint.rollback" => checkpoint_rollback, CheckpointRollbackParams => crate::checkpoint::CheckpointRollbackResult,
         "Roll back an agent or terminal session (and optionally workspace files) to an earlier checkpoint turn.",
         errors ["not_found", "machine_unknown", "invalid_params", "busy", "unavailable", "confirm_required", "shared_workspace", "spawn_failed"];
+    "checkpoint.bisect" => checkpoint_bisect, crate::ai::CheckpointBisectParams => crate::ai::CheckpointBisectResult,
+        "Locate which checkpoint turn most likely introduced a reported bug or regression and recommend a safe rollback anchor.",
+        errors ["not_found", "machine_unknown", "invalid_params", "unavailable"];
     "checkpoint.hook" => checkpoint_hook, CheckpointHookParams => CheckpointHookResult,
         "Internal lifecycle hook callback invoked by instrumented terminal CLIs (Claude, Codex, Agy).",
         errors ["not_found", "invalid_params"];
@@ -712,6 +743,13 @@ async fn agent_inbox_edit(core: Ctx<'_>, p: InboxEditParams) -> Result<Public, R
 async fn agent_inbox_remove(core: Ctx<'_>, p: InboxRemoveParams) -> Result<Public, RpcError> {
     let id = resolve(core, &p.agent)?;
     let updated = core.remove_inbox(id, p.id)?;
+    core.flush_saved().await?;
+    Ok(Public(updated))
+}
+
+async fn agent_inbox_send(core: Ctx<'_>, p: InboxSendParams) -> Result<Public, RpcError> {
+    let id = resolve(core, &p.agent)?;
+    let updated = core.send_inbox_now(id, p.id)?;
     core.flush_saved().await?;
     Ok(Public(updated))
 }
@@ -1270,6 +1308,291 @@ async fn drove_subscribe(core: Ctx<'_>, _: Empty) -> Result<DroveSubscribeResult
     Ok(DroveSubscribeResult { channel: ch })
 }
 
+async fn ai_status(core: Ctx<'_>, _: crate::ai::AiOnParams) -> Result<crate::ai::AiStatus, RpcError> {
+    Ok(core.ai.status_refresh_models().await)
+}
+
+async fn ai_settings_set(
+    core: Ctx<'_>,
+    p: crate::ai::AiSettingsSetParams,
+) -> Result<crate::ai::AiStatus, RpcError> {
+    let st = core.ai.update_settings(p).await?;
+    core.drove.sync_ai_from_core();
+    Ok(st)
+}
+
+async fn ai_test(core: Ctx<'_>, p: crate::ai::AiTestParams) -> Result<crate::ai::AiTestResult, RpcError> {
+    core.ai.test_connection(p.base_url, p.api_key, p.model).await
+}
+
+async fn ai_complete(
+    core: Ctx<'_>,
+    p: crate::ai::AiCompleteParams,
+) -> Result<crate::ai::AiCompleteResult, RpcError> {
+    core.ai.rpc_complete(p).await
+}
+
+async fn ai_classify_terminal_state(
+    core: Ctx<'_>,
+    p: crate::ai::ClassifyTerminalStateParams,
+) -> Result<crate::ai::ClassifyTerminalStateResult, RpcError> {
+    Ok(crate::ai::classify_terminal_state(&core.ai, p).await)
+}
+
+async fn ai_briefing(
+    core: Ctx<'_>,
+    p: crate::ai::BriefingParams,
+) -> Result<crate::ai::BriefingSnapshot, RpcError> {
+    let is_zh = p
+        .language
+        .as_deref()
+        .is_some_and(|l| l.to_ascii_lowercase().starts_with("zh"));
+    let (agent_inputs, core_terminals) = {
+        let st = core.lock();
+        let mut agents_out: Vec<crate::ai::BriefingAgentInput> = Vec::new();
+        for a in st.reg.agents.values() {
+            if !a.is_live() || a.labels.get("herdr.trashed").is_some_and(|s| !s.is_empty()) {
+                continue;
+            }
+            let status = a.status.as_ref().map(|s| s.state.clone()).unwrap_or_else(|| "idle".into());
+            let display_name = a
+                .labels
+                .get("herdr.name")
+                .or_else(|| a.labels.get("drove.display"))
+                .or(a.name.as_ref())
+                .cloned()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| {
+                    if !a.title.trim().is_empty() {
+                        a.title.clone()
+                    } else {
+                        a.agent.clone().unwrap_or_else(|| a.address.clone())
+                    }
+                });
+            let has_diff = st
+                .checkpoints
+                .get(&a.address)
+                .is_some_and(|tc| tc.checkpoints.iter().any(|c| !c.files.is_empty()));
+            agents_out.push(crate::ai::BriefingAgentInput {
+                address: a.address.clone(),
+                machine: None,
+                display_name,
+                status,
+                status_ms: a.status_ms,
+                turn: a.turn,
+                semantic_title: a.semantic_title.clone(),
+                micro_summary: a.micro_summary.clone(),
+                pending_permission: a.pending_permission.clone(),
+                has_diff,
+            });
+        }
+        // Include mirrored remote ACP agents.
+        for (machine, map) in &st.mirrors {
+            for rec in map.values() {
+                if rec["state"].as_str() != Some("live") {
+                    continue;
+                }
+                if rec.pointer("/labels/herdr.trashed").and_then(serde_json::Value::as_str).is_some_and(|s| !s.is_empty()) {
+                    continue;
+                }
+                let Some(addr) = rec["address"].as_str() else { continue };
+                let status = rec
+                    .pointer("/status/state")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| rec["status"].as_str())
+                    .unwrap_or("idle")
+                    .to_string();
+                let display_name = rec
+                    .pointer("/labels/herdr.name")
+                    .or_else(|| rec.pointer("/labels/drove.display"))
+                    .or_else(|| rec.get("name"))
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .or_else(|| rec["title"].as_str().filter(|s| !s.trim().is_empty()))
+                    .or_else(|| rec["agent"].as_str())
+                    .unwrap_or(addr)
+                    .to_string();
+                let pending_permission: Option<crate::permissions::PublicPermission> =
+                    serde_json::from_value(rec["pending_permission"].clone()).ok();
+                agents_out.push(crate::ai::BriefingAgentInput {
+                    address: addr.to_string(),
+                    machine: Some(machine.clone()),
+                    display_name,
+                    status,
+                    status_ms: rec["status_ms"].as_u64(),
+                    turn: rec["turn"].as_u64().unwrap_or(0),
+                    semantic_title: rec["semantic_title"].as_str().map(String::from),
+                    micro_summary: rec["micro_summary"].as_str().map(String::from),
+                    pending_permission,
+                    has_diff: false,
+                });
+            }
+        }
+        // Collect live core PTY terminals carrying a status as fallback for CLI callers.
+        let mut terms_out: Vec<crate::ai::BriefingTerminalInput> = p.terminals.clone();
+        for t in st.pty_reg.terminals.values() {
+            if !t.is_live() || t.labels.get("herdr.trashed").is_some_and(|s| !s.is_empty()) {
+                continue;
+            }
+            let Some(status) = t.status.as_ref().map(|s| s.state.clone()) else {
+                continue;
+            };
+            terms_out.push(crate::ai::BriefingTerminalInput {
+                address: t.address.clone(),
+                title: t.labels.get("herdr.name").cloned().unwrap_or_else(|| t.title.clone()),
+                status,
+                space_name: t.labels.get("where").cloned(),
+                cwd: Some(t.cwd.clone()),
+                ..Default::default()
+            });
+        }
+        (agents_out, terms_out)
+    };
+
+    let mut drove_inputs: Vec<crate::ai::BriefingDroveInput> = Vec::new();
+    for run in core.drove.store.list_runs() {
+        if run.trashed_at.is_some() {
+            continue;
+        }
+        let tasks = core.drove.store.list_tasks(&run.id);
+        let unread_messages = core.drove.store.list_messages(&run.id, Some(true), true, Some(50));
+        drove_inputs.push(crate::ai::BriefingDroveInput { run, tasks, unread_messages });
+    }
+
+    let mut snap = crate::ai::build_deterministic_briefing(
+        &agent_inputs,
+        &core_terminals,
+        &drove_inputs,
+        p.away_minutes,
+        is_zh,
+        crate::runtime::now_ms(),
+    );
+    if p.include_ai {
+        crate::ai::enhance_briefing_headline(&core.ai, &mut snap, p.away_minutes, p.language.as_deref()).await;
+    }
+    Ok(snap)
+}
+
+async fn ai_summarize_agent(
+    core: Ctx<'_>,
+    p: crate::ai::SummarizeAgentParams,
+) -> Result<crate::ai::AgentDigestResult, RpcError> {
+    let is_zh = p
+        .language
+        .as_deref()
+        .is_some_and(|l| l.to_ascii_lowercase().starts_with("zh"));
+    match resolve_any(core, &p.target)? {
+        TargetKey::Agent(id) => {
+            let (addr, program, status, turn, pending, existing, entries) = {
+                let st = core.lock();
+                let a = st
+                    .reg
+                    .agents
+                    .get(&id)
+                    .ok_or_else(|| RpcError::new("not_found", "agent not found", ""))?;
+                let entries = st
+                    .transcripts
+                    .get(&id)
+                    .map(|t| t.entries().to_vec())
+                    .unwrap_or_else(|| {
+                        crate::transcript::load(&core.paths.state, &a.address)
+                            .map(|t| t.entries().to_vec())
+                            .unwrap_or_default()
+                    });
+                (
+                    a.address.clone(),
+                    a.agent.clone().unwrap_or_else(|| "acp".into()),
+                    a.status.as_ref().map(|s| s.state.clone()).unwrap_or_else(|| "idle".into()),
+                    a.turn,
+                    a.pending_permission.clone(),
+                    a.semantic_title.clone(),
+                    entries,
+                )
+            };
+            let det = crate::ai::build_deterministic_acp_digest(
+                &status,
+                turn,
+                pending.as_ref(),
+                &entries,
+                existing.as_deref(),
+                is_zh,
+            );
+            let result = if p.include_ai {
+                crate::ai::refine_agent_digest(
+                    &core.ai,
+                    &addr,
+                    &program,
+                    &status,
+                    &det,
+                    existing.as_deref(),
+                    p.language.as_deref(),
+                )
+                .await
+            } else {
+                crate::ai::AgentDigestResult {
+                    address: addr,
+                    semantic_title: det.semantic_title,
+                    micro_summary: det.micro_summary,
+                    used_ai: false,
+                    from_cache: false,
+                }
+            };
+            {
+                let mut st = core.lock();
+                core.apply_digest(
+                    &mut st,
+                    id,
+                    result.semantic_title.clone(),
+                    result.micro_summary.clone(),
+                    false,
+                );
+            }
+            Ok(result)
+        }
+        TargetKey::Terminal(id) => {
+            let (addr, program, status, title, snap) = {
+                let mut st = core.lock();
+                let t = st
+                    .pty_reg
+                    .terminals
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| RpcError::new("not_found", "terminal not found", ""))?;
+                let mut snap = crate::pty_transcript::snapshot_from_terminal(&t, st.pty_prompts.get(&id));
+                let addr = t.address.clone();
+                crate::pty_transcript::populate_session_affinity(&mut snap, &addr, core, &mut st);
+                let program = t.argv.first().cloned().unwrap_or_else(|| "terminal".into());
+                let status = t.status.as_ref().map(|s| s.state.clone()).unwrap_or_else(|| "idle".into());
+                (addr, program, status, t.title.clone(), snap)
+            };
+            let (entries, _) = blocking(move || Ok(crate::pty_transcript::extract_transcript(&snap))).await?;
+            let existing = (!title.trim().is_empty()).then_some(title.as_str());
+            let det = crate::ai::build_deterministic_acp_digest(&status, 1, None, &entries, existing, is_zh);
+            let result = if p.include_ai {
+                crate::ai::refine_agent_digest(
+                    &core.ai,
+                    &addr,
+                    &program,
+                    &status,
+                    &det,
+                    existing,
+                    p.language.as_deref(),
+                )
+                .await
+            } else {
+                crate::ai::AgentDigestResult {
+                    address: addr,
+                    semantic_title: det.semantic_title,
+                    micro_summary: det.micro_summary,
+                    used_ai: false,
+                    from_cache: false,
+                }
+            };
+            Ok(result)
+        }
+    }
+}
+
 async fn checkpoint_list(core: Ctx<'_>, p: CheckpointListParams) -> Result<CheckpointListResult, RpcError> {
     let tk = resolve_any(core, &p.target)?;
     if let TargetKey::Terminal(id) = tk {
@@ -1418,6 +1741,49 @@ async fn checkpoint_rollback(
             crate::pty_adapters::rollback_pty_terminal(core, id, p.to, p.restore_files, p.confirm).await
         }
     }
+}
+
+async fn checkpoint_bisect(
+    core: Ctx<'_>,
+    p: crate::ai::CheckpointBisectParams,
+) -> Result<crate::ai::CheckpointBisectResult, RpcError> {
+    let tk = resolve_any(core, &p.target)?;
+    let (addr, cwd, tc) = {
+        let mut st = core.lock();
+        let (addr, cwd) = match tk {
+            TargetKey::Agent(id) => {
+                let a = st.reg.agents.get(&id).ok_or_else(|| RpcError::new("not_found", "agent not found", ""))?;
+                (a.address.clone(), a.cwd.clone())
+            }
+            TargetKey::Terminal(id) => {
+                let t = st.pty_reg.terminals.get(&id).ok_or_else(|| RpcError::new("not_found", "terminal not found", ""))?;
+                let cwd = t
+                    .foreground
+                    .as_ref()
+                    .map(|f| f.cwd.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or(t.last_cwd.as_deref())
+                    .unwrap_or(&t.cwd)
+                    .to_string();
+                (t.address.clone(), cwd)
+            }
+        };
+        let tc = core.target_checkpoints(&mut st, &addr);
+        (addr, cwd, tc)
+    };
+    let repo_dir = tc.repo_root.as_deref().unwrap_or(&cwd);
+    let repo = crate::checkpoint::probe_repo(std::path::Path::new(repo_dir))
+        .ok_or_else(|| RpcError::invalid_params(format!("workspace `{repo_dir}` is not a Git repository")))?;
+    let _guard = core.repo_ckpt_lock(&repo.toplevel).lock_owned().await;
+    crate::ai::bisect::bisect_checkpoints(
+        &core.ai,
+        repo,
+        &addr,
+        &tc.checkpoints,
+        &p.query,
+        p.language.as_deref(),
+    )
+    .await
 }
 
 async fn checkpoint_hook(core: Ctx<'_>, p: CheckpointHookParams) -> Result<CheckpointHookResult, RpcError> {

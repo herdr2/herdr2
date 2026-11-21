@@ -10,6 +10,7 @@ const SECTIONS = () => [
   { id: "look", title: "Look", zh: "外观", icon: "palette" },
   ...(window()?.platform === "macos" ? [{ id: "keyboard", title: "Keyboard", zh: "键盘", icon: "keyboard" }] : []),
   { id: "machines", title: "Machines", zh: "主机", icon: "server" },
+  { id: "ai", title: "AI", zh: "AI 助手", icon: "sparkles" },
   { id: "drove", title: "Drove", zh: "Drove", icon: "layers" },
   { id: "alerts", title: "Alerts", zh: "提醒", icon: "bell" },
   { id: "privacy", title: "Privacy", zh: "隐私", icon: "shield" },
@@ -163,10 +164,17 @@ export default class Settings extends View {
     this.machineNotice = null;
     const activeSpaceMachine = typeof spaces === "function" ? (spaces()?.find((s) => s.active)?.machine ?? null) : null;
     this.droveMachine = activeSpaceMachine || null;
+    this.aiStatus = null;
+    this.aiLoading = false;
+    this.aiSaving = false;
+    this.aiTesting = false;
+    this.aiError = null;
+    this.aiTestResult = null;
     this.droveData = null;
     this.droveLoading = false;
     this.droveSaving = false;
     this.droveProbing = false;
+    this.droveProbePromise = null;
     this.droveAutoProbed = {};
     this.droveAiTesting = false;
     this.droveMagpieTesting = false;
@@ -178,6 +186,7 @@ export default class Settings extends View {
     this.droveAiConfigMode = null; // null | "all" | "models" | "strengths"
     this.droveAiConfiguring = false;
     this.droveAiRunningMode = null; // null | "all" | "models" | "strengths"
+    this.droveAiStage = null; // null | "probing" | "generating"
     this.droveAiConfigResult = null;
     this.droveRolesBackup = null;
     this.droveAiPromptFocused = false;
@@ -239,6 +248,10 @@ export default class Settings extends View {
       await this.load();
       if (!(typeof checking === "function" && checking())) {
         if (this.section === "machines") await this.loadMachines();
+        if (this.section === "ai") {
+          await this.loadMachines();
+          await this.loadAi();
+        }
         if (this.section === "drove") {
           await this.loadMachines();
           await this.loadDrove();
@@ -1059,6 +1072,77 @@ export default class Settings extends View {
     this.droveKeyDirty = false;
   }
 
+  syncAiInputs(status) {
+    this.droveUrlInput.set_value(status?.baseUrl ?? "");
+    this.droveKeyInput.set_value("");
+    this.droveKeyDirty = false;
+  }
+
+  async loadAi() {
+    if (this.aiLoading || (typeof checking === "function" && checking())) return;
+    this.aiLoading = true;
+    this.aiError = null;
+    try {
+      const data = await this.droveHcJson(["ai", "status"]);
+      this.aiStatus = data;
+      this.syncAiInputs(data);
+    } catch (e) {
+      this.aiError = String(e?.message ?? e);
+    } finally {
+      this.aiLoading = false;
+    }
+  }
+
+  saveAiPatch(patch, cx, syncInputs = false) {
+    if (this.aiSaving) return;
+    this.aiSaving = true;
+    this.aiError = null;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const next = await this.droveCallWithJsonFile(["ai", "settings-set"], patch);
+        if (next) {
+          this.aiStatus = next;
+          if (syncInputs) this.syncAiInputs(next);
+          this.droveData = null;
+        }
+      } catch (e) {
+        this.aiError = String(e?.message ?? e);
+        notify({ title: this.tr("AI settings not saved", "AI 设置保存失败"), body: this.aiError, level: "error" });
+      } finally {
+        this.aiSaving = false;
+        cx.notify();
+      }
+    });
+  }
+
+  testCoreAi(cx) {
+    if (this.aiTesting) return;
+    this.aiTesting = true;
+    this.aiTestResult = null;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const baseUrl = this.droveUrlInput.value().trim();
+        const apiKey = this.droveKeyInput.value().trim();
+        const payload = {};
+        if (baseUrl) payload.baseUrl = baseUrl;
+        if (apiKey) payload.apiKey = apiKey;
+        const res = await this.droveCallWithJsonFile(["ai", "test"], payload);
+        this.aiTestResult = res;
+        this.droveTestResult = res;
+        if (res?.ok && this.aiStatus && Array.isArray(res.availableModels) && res.availableModels.length > 0) {
+          this.aiStatus = { ...this.aiStatus, availableModels: res.availableModels };
+        }
+      } catch (e) {
+        this.aiTestResult = { ok: false, error: String(e?.message ?? e) };
+      } finally {
+        this.aiTesting = false;
+        cx.notify();
+      }
+    });
+  }
+
   async loadDrove() {
     if (this.droveLoading || (typeof checking === "function" && checking())) return;
     this.droveLoading = true;
@@ -1096,22 +1180,40 @@ export default class Settings extends View {
     });
   }
 
-  probeDroveAgents(cx) {
-    if (this.droveProbing) return;
+  async runDroveProbe(cx) {
+    if (this.droveProbePromise) return this.droveProbePromise;
+    const targetMachine = this.droveMachine;
+    const key = targetMachine ?? "__local__";
     this.droveProbing = true;
     this.droveError = null;
-    cx.notify();
-    cx.spawn(async (cx) => {
+    cx?.notify?.();
+    const task = (async () => {
       try {
         const snap = await this.droveHcJson(["drove", "probe", "--refresh"]);
+        if (this.droveMachine !== targetMachine) return false;
         if (snap && this.droveData) this.droveData = { ...this.droveData, agents: snap };
         else await this.loadDrove();
+        this.droveAutoProbed = { ...(this.droveAutoProbed ?? {}), [key]: true };
+        return true;
       } catch (e) {
-        this.droveError = String(e?.message ?? e);
+        if (this.droveMachine === targetMachine) {
+          this.droveError = String(e?.message ?? e);
+        }
+        return false;
       } finally {
         this.droveProbing = false;
-        cx.notify();
+        if (this.droveProbePromise === task) this.droveProbePromise = null;
+        cx?.notify?.();
       }
+    })();
+    this.droveProbePromise = task;
+    return task;
+  }
+
+  probeDroveAgents(cx) {
+    if (this.droveProbing || this.droveProbePromise) return;
+    cx.spawn(async (cx) => {
+      await this.runDroveProbe(cx);
     });
   }
 
@@ -1140,25 +1242,45 @@ export default class Settings extends View {
   hasCachedAgentModels() {
     const snap = this.droveData?.agents;
     if (!snap?.fullProbe) return false;
-    return (snap.agents ?? []).some((a) => a.installed && (a.models?.length ?? 0) > 0);
+    const agents = snap.agents ?? [];
+    if (agents.length === 0) return false;
+    return agents.some((a) => a.installed && (a.models?.length ?? 0) > 0);
   }
 
   aiConfigureDroveRoles(mode, cx) {
     if (this.droveAiConfiguring) return;
     const effMode = mode === "strengths" ? "strengths" : mode === "all" ? "all" : "models";
-    const prevRoles = this.droveData?.config?.roles
-      ? JSON.parse(JSON.stringify(this.droveData.config.roles))
-      : null;
     this.droveAiConfiguring = true;
     this.droveAiRunningMode = effMode;
+    this.droveAiStage = null;
     this.droveAiConfigResult = null;
     this.droveError = null;
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const instruction = this.droveAiRolePromptInput.value().trim();
-        const baseUrl = this.droveUrlInput.value().trim();
-        const apiKey = this.droveKeyInput.value().trim();
+        if (!this.droveData) {
+          await this.loadDrove();
+          cx.notify();
+        }
+        const prevRoles = this.droveData?.config?.roles
+          ? JSON.parse(JSON.stringify(this.droveData.config.roles))
+          : null;
+        let refreshedBeforeAi = false;
+        if (this.droveProbePromise) {
+          this.droveAiStage = "probing";
+          cx.notify();
+          if (await this.droveProbePromise) refreshedBeforeAi = true;
+        }
+        if (!this.hasCachedAgentModels()) {
+          this.droveAiStage = "probing";
+          cx.notify();
+          if (await this.runDroveProbe(cx)) refreshedBeforeAi = true;
+        }
+        this.droveAiStage = "generating";
+        cx.notify();
+        const instruction = (this.droveAiRolePromptInput?.value?.() ?? "").trim();
+        const baseUrl = (this.droveUrlInput?.value?.() ?? "").trim();
+        const apiKey = (this.droveKeyInput?.value?.() ?? "").trim();
         const model = (this.droveData?.config?.ai?.model ?? "").trim();
         const payload = { mode: effMode, apply: true, language: this.lang() };
         if (instruction) payload.instruction = instruction;
@@ -1166,7 +1288,9 @@ export default class Settings extends View {
         if (apiKey) payload.apiKey = apiKey;
         if (model) payload.model = model;
         const res = await this.droveCallWithJsonFile(["drove", "roles-ai-config"], payload);
-        this.droveAiConfigResult = res ? { ...res, mode: effMode } : res;
+        this.droveAiConfigResult = res
+          ? { ...res, mode: effMode, probedRefreshed: Boolean(res.probedRefreshed || refreshedBeforeAi) }
+          : res;
         if (res?.ok) {
           if (prevRoles) {
             this.droveRolesBackup = { roles: prevRoles, mode: effMode, at: Date.now() };
@@ -1182,6 +1306,7 @@ export default class Settings extends View {
       } finally {
         this.droveAiConfiguring = false;
         this.droveAiRunningMode = null;
+        this.droveAiStage = null;
         cx.notify();
       }
     });
@@ -1254,8 +1379,11 @@ export default class Settings extends View {
         out.push(id);
       }
     };
+    for (const m of this.aiTestResult?.availableModels ?? []) add(m);
+    if (this.aiTestResult?.discoveredModel) add(this.aiTestResult.discoveredModel);
     for (const m of this.droveTestResult?.availableModels ?? []) add(m);
     if (this.droveTestResult?.discoveredModel) add(this.droveTestResult.discoveredModel);
+    for (const m of this.aiStatus?.availableModels ?? []) add(m);
     for (const m of this.droveData?.aiStatus?.availableModels ?? []) add(m);
     return out;
   }
@@ -2489,6 +2617,477 @@ export default class Settings extends View {
       .child(div().flex_none().child(control));
   }
 
+  ai(t, cx) {
+    const machines = (this.machineList ?? []).filter((m) => !m.temporary);
+    const st = this.aiStatus ?? {};
+    const switches = st.switches ?? {};
+    const usage = st.usage ?? {};
+    const aiOn = st.enabled !== false;
+    const ptyArb = switches.ptyStatusArbitration !== false;
+    const notesDigest = switches.notesDigest !== false;
+    const promptCache = switches.promptCacheEnabled !== false;
+    const handoffDistill = switches.handoffDistill !== false;
+    const checkpointLabeling = switches.checkpointLabeling !== false;
+    const semanticSummary = switches.semanticSummary !== false;
+    const aiModels = this.aiAvailableModels();
+    const currentAiModel = (st.model ?? "").trim();
+    const aiModelItems = [
+      { value: "", label: this.tr("Auto (first available model)", "自动选择（首个可用模型）"), active: !currentAiModel },
+      ...aiModels.map((m) => ({ value: m, label: m, active: currentAiModel === m })),
+    ];
+    if (currentAiModel && !aiModels.includes(currentAiModel)) {
+      aiModelItems.splice(1, 0, { value: currentAiModel, label: currentAiModel, meta: this.tr("custom", "自定义"), active: true });
+    }
+    const aiEffortChoices = ["auto", "none", "low", "medium", "high"];
+    const rawAiEffort = (st.effort ?? "low").trim().toLowerCase() || "low";
+    const currentAiEffort = aiEffortChoices.includes(rawAiEffort) ? rawAiEffort : "low";
+    const currentAiContext = this.normalizeAiContextInput(st.contextWindow ?? "");
+    const currentAiMaxTokens = Number(st.maxTokens ?? 0) || 0;
+    const aiContextPresets = ["8k", "16k", "32k", "64k", "128k", "256k", "1m"];
+    const aiContextItems = [
+      { value: "", label: this.tr("Auto (model default)", "默认（随模型）"), active: !currentAiContext },
+      ...aiContextPresets.map((v) => ({ value: v, label: v.toUpperCase(), active: currentAiContext === v })),
+    ];
+    if (currentAiContext && !aiContextPresets.includes(currentAiContext)) {
+      aiContextItems.splice(1, 0, {
+        value: currentAiContext,
+        label: currentAiContext.toUpperCase(),
+        meta: this.tr("custom", "自定义"),
+        active: true,
+      });
+    }
+    const aiMaxTokenPresets = [512, 1024, 2048, 4096, 8192, 16384];
+    const aiMaxTokenItems = [
+      { value: 0, label: this.tr("Auto (by tier/effort)", "自动（按任务分级）"), active: !currentAiMaxTokens },
+      ...aiMaxTokenPresets.map((v) => ({ value: v, label: `${v} tokens`, active: currentAiMaxTokens === v })),
+    ];
+    if (currentAiMaxTokens && !aiMaxTokenPresets.includes(currentAiMaxTokens)) {
+      aiMaxTokenItems.splice(1, 0, {
+        value: currentAiMaxTokens,
+        label: `${currentAiMaxTokens} tokens`,
+        meta: this.tr("custom", "自定义"),
+        active: true,
+      });
+    }
+    const machineChip = (id, label, value) => {
+      const on = this.droveMachine === value;
+      return div()
+        .id(`st-ai-m-${id}`)
+        .px(10)
+        .py(4)
+        .rounded(6)
+        .border_1()
+        .border_color(on ? t.accent : t.border)
+        .bg(on ? t.accent : t.raised)
+        .cursor_pointer()
+        .text_size(12.5)
+        .text_color(on ? t.accent_foreground : t.foreground)
+        .on_click((_e, cx) => {
+          this.droveMachine = value;
+          this.aiStatus = null;
+          this.aiTestResult = null;
+          this.droveData = null;
+          this.picking = null;
+          cx.spawn(async (cx) => {
+            await this.loadAi();
+            cx.notify();
+          });
+        })
+        .child(label);
+    };
+    const totalCalls = Number(usage.totalCalls ?? 0);
+    const localHits = Number(usage.localCacheHits ?? 0);
+    const sessionsReused = Number(usage.sessionsReused ?? 0);
+    const activeSessions = Number(usage.activeSessions ?? 0);
+    const inTokens = Number(usage.inputTokens ?? 0);
+    const cachedTokens = Number(usage.cachedInputTokens ?? 0);
+    const outTokens = Number(usage.outputTokens ?? 0);
+    const hitPct = `${Math.round(Number(usage.cacheHitRatio ?? 0) * 1000) / 10}%`;
+    const statPill = (label, value, accent = false) =>
+      v_flex()
+        .flex_1()
+        .min_w(110)
+        .px(11)
+        .py(8)
+        .rounded(8)
+        .border_1()
+        .border_color(t.border)
+        .bg(t.background)
+        .gap(2)
+        .child(div().text_size(11).text_color(t.dim).child(label))
+        .child(div().text_size(14).font_semibold().text_color(accent ? t.accent : t.foreground).child(String(value)));
+
+    return v_flex()
+      .w_full()
+      .gap(16)
+      // 0. Target Machine Bar
+      .child(
+        h_flex()
+          .w_full()
+          .px(14)
+          .py(10)
+          .rounded(10)
+          .border_1()
+          .border_color(t.border)
+          .bg(t.surface)
+          .items_center()
+          .justify_between()
+          .gap(10)
+          .flex_wrap()
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .flex_wrap()
+              .child(div().text_size(12).text_color(t.dim).child(this.tr("Machine:", "目标主机：")))
+              .child(machineChip("local", this.tr("This computer", "本机"), null))
+              .children(machines.map((m) => machineChip(m.name, m.name, m.name))),
+          )
+          .child(
+            h_flex()
+              .gap(8)
+              .items_center()
+              .child(
+                div()
+                  .px(7)
+                  .py(3)
+                  .rounded(5)
+                  .bg(t.background)
+                  .border_1()
+                  .border_color(t.border)
+                  .text_size(11)
+                  .text_color(st.configured ? t.ansi2 : t.dim)
+                  .child(st.configured ? this.tr("Connected", "已配置") : this.tr("Not configured", "未配置")),
+              )
+              .child(this.button(t, "st-ai-refresh", this.aiLoading ? this.tr("Refreshing…", "刷新中…") : this.tr("Refresh", "刷新"), (_e, cx) => {
+                cx.spawn(async (cx) => { await this.loadAi(); cx.notify(); });
+              })),
+          ),
+      )
+      .when(Boolean(this.aiError), (el) =>
+        el.child(div().px(12).py(8).rounded(8).border_1().border_color(t.blocked).bg(t.surface).text_size(12.5).text_color(t.blocked).child(this.aiError)),
+      )
+      // 1. Core AI Endpoint & Model Card
+      .child(
+        v_flex()
+          .w_full()
+          .gap(8)
+          .child(this.heading(t, this.tr("Core AI Assistant", "核心 AI 助手")))
+          .child(
+            v_flex()
+              .w_full()
+              .rounded(10)
+              .border_1()
+              .border_color(t.border)
+              .bg(t.surface)
+              .overflow_hidden()
+              .child(
+                this.droveCardRow(
+                  t,
+                  this.tr("Enable Core AI assistant", "启用全局 AI 助手"),
+                  this.tr("Shared lightweight OpenAI-compatible runtime used by PTY status arbitration, parent note digests, and Drove orchestration.", "全局共享的轻量 OpenAI 兼容接口，同时服务于终端状态仲裁、子 Agent 摘要与 Drove 编排。"),
+                  this.toggle(t, "st-ai-on", aiOn, (_e, cx) => this.saveAiPatch({ enabled: !aiOn }, cx)),
+                  true,
+                ),
+              )
+              .child(
+                h_flex()
+                  .w_full()
+                  .px(14)
+                  .py(12)
+                  .gap(12)
+                  .border_t(1)
+                  .border_color(t.border)
+                  .items_start()
+                  .child(
+                    v_flex()
+                      .flex_1()
+                      .min_w(0)
+                      .gap(4)
+                      .child(div().text_size(12).text_color(t.foreground).child(this.tr("Service URL", "远端服务地址")))
+                      .child(div().px(8).py(2).rounded(7).border_1().border_color(t.border).bg(t.background).child(Input.new(this.droveUrlInput).h(26).text_size(12.5).text_color(t.foreground))),
+                  )
+                  .child(
+                    v_flex()
+                      .flex_1()
+                      .min_w(0)
+                      .gap(4)
+                      .child(
+                        h_flex()
+                          .justify_between()
+                          .items_center()
+                          .gap(6)
+                          .child(div().text_size(12).text_color(t.foreground).child(this.tr("API Key", "API Key")))
+                          .when(Boolean(st.keyMasked), (el) =>
+                            el.child(div().truncate().text_size(11).text_color(t.dim).child(this.tr(`Saved: ${st.keyMasked}`, `已保存：${st.keyMasked}`))),
+                          ),
+                      )
+                      .child(div().px(8).py(2).rounded(7).border_1().border_color(t.border).bg(t.background).child(Input.new(this.droveKeyInput).h(26).text_size(12.5).text_color(t.foreground))),
+                  ),
+              )
+              .child(
+                this.droveCardRow(
+                  t,
+                  this.tr("Model", "使用模型"),
+                  aiModels.length > 0
+                    ? this.tr(`${aiModels.length} model(s) discovered from endpoint`, `已从服务端拉取 ${aiModels.length} 个可用模型`)
+                    : this.tr("Save or test connection to load models, or type a custom model ID", "保存或测试连通性后自动拉取模型列表，也可直接输入自定义模型"),
+                  this.drovePicker(
+                    t,
+                    "core-ai-model",
+                    currentAiModel || this.tr("Auto (first available)", "自动选择（首个可用）"),
+                    aiModelItems,
+                    (model, cx) => this.saveAiPatch({ model: model || "" }, cx),
+                    { width: 240, popupWidth: 380, anchor: "bottom_right", allowCustom: true },
+                    cx,
+                  ),
+                ),
+              )
+              .child(
+                this.droveCardRow(
+                  t,
+                  this.tr("Reasoning Effort", "思考强度"),
+                  this.tr("Controls default reasoning_effort; Nano tasks automatically use minimal thinking when set to Auto/Low.", "控制默认思考深度；设为自动或低时，超轻量分类任务会自动关闭长思考以省 Token。"),
+                  h_flex()
+                    .id("st-ai-eff-group")
+                    .w(240)
+                    .h(28)
+                    .flex_none()
+                    .p(2)
+                    .gap(1)
+                    .items_center()
+                    .rounded(7)
+                    .border_1()
+                    .border_color(t.border)
+                    .bg(t.background)
+                    .children(
+                      aiEffortChoices.map((eff) => {
+                        const active = currentAiEffort === eff;
+                        return div()
+                          .id(`st-ai-eff-${eff}`)
+                          .flex_1()
+                          .h(22)
+                          .px(2)
+                          .flex()
+                          .items_center()
+                          .justify_center()
+                          .rounded(5)
+                          .bg(active ? t.accent : "#00000000")
+                          .text_size(11)
+                          .when(active, (el) => el.font_semibold())
+                          .text_color(active ? t.accent_foreground : t.muted)
+                          .cursor_pointer()
+                          .when(!active, (el) => el.hover((s) => s.bg(t.hover).text_color(t.foreground)))
+                          .on_click((_e, cx) => this.saveAiPatch({ effort: eff }, cx))
+                          .child(this.aiEffortLabel(eff));
+                      }),
+                    ),
+                ),
+              )
+              .child(
+                this.droveCardRow(
+                  t,
+                  this.tr("Context Size", "上下文大小"),
+                  this.tr("Caps prompt input budget and sets local num_ctx (e.g. Ollama).", "限制输入预算并为本地服务（如 Ollama）下发 num_ctx。"),
+                  this.drovePicker(
+                    t,
+                    "core-ai-context",
+                    currentAiContext ? currentAiContext.toUpperCase() : this.tr("Auto (model default)", "默认（随模型）"),
+                    aiContextItems,
+                    (val, cx) => this.saveAiPatch({ contextWindow: this.normalizeAiContextInput(val) }, cx),
+                    { width: 240, popupWidth: 320, anchor: "bottom_right", allowCustom: true },
+                    cx,
+                  ),
+                ),
+              )
+              .child(
+                this.droveCardRow(
+                  t,
+                  this.tr("Max Output Tokens", "最大输出长度"),
+                  this.tr("Max reply tokens; Auto keeps classification/digest responses compact.", "最大输出长度；设为自动时对分类与摘要任务自动收敛长度。"),
+                  this.drovePicker(
+                    t,
+                    "core-ai-max-tokens",
+                    currentAiMaxTokens ? `${currentAiMaxTokens} tokens` : this.tr("Auto (by tier/effort)", "自动（按任务分级）"),
+                    aiMaxTokenItems,
+                    (val, cx) => {
+                      const parsed = this.parseAiMaxTokensInput(val);
+                      if (parsed !== null) {
+                        this.saveAiPatch({ maxTokens: parsed }, cx);
+                      }
+                    },
+                    { width: 240, popupWidth: 320, anchor: "bottom_right", allowCustom: true },
+                    cx,
+                  ),
+                ),
+              )
+              .child(
+                h_flex()
+                  .w_full()
+                  .px(14)
+                  .py(9)
+                  .gap(8)
+                  .border_t(1)
+                  .border_color(t.border)
+                  .bg(t.background)
+                  .items_center()
+                  .justify_between()
+                  .flex_wrap()
+                  .child(
+                    h_flex()
+                      .gap(8)
+                      .items_center()
+                      .child(
+                        div()
+                          .id("st-ai-save")
+                          .px(12)
+                          .py(5)
+                          .rounded(6)
+                          .bg(t.accent)
+                          .cursor_pointer()
+                          .text_size(12.5)
+                          .font_semibold()
+                          .text_color(t.accent_foreground)
+                          .hover((s) => s.opacity(0.9))
+                          .on_click((_e, cx) => {
+                            const patch = { baseUrl: this.droveUrlInput.value().trim(), enabled: aiOn };
+                            const k = this.droveKeyInput.value().trim();
+                            if (this.droveKeyDirty && k) patch.apiKey = k;
+                            this.saveAiPatch(patch, cx, true);
+                          })
+                          .child(this.aiSaving ? this.tr("Saving…", "保存中…") : this.tr("Save", "保存")),
+                      )
+                      .child(this.button(t, "st-ai-test", this.aiTesting ? this.tr("Testing…", "测试中…") : this.tr("Test Connection", "测试连通性"), (_e, cx) => this.testCoreAi(cx)))
+                      .when(Boolean(st.keyMasked), (el) =>
+                        el.child(this.button(t, "st-ai-clear", this.tr("Clear Key", "清除 Key"), (_e, cx) => {
+                          this.droveKeyInput.set_value("");
+                          this.droveKeyDirty = false;
+                          this.saveAiPatch({ clearKey: true }, cx);
+                        })),
+                      ),
+                  )
+                  .when(Boolean(this.aiTestResult), (el) => {
+                    const trRes = this.aiTestResult;
+                    const n = (trRes.availableModels ?? []).length;
+                    return el.child(
+                      div()
+                        .text_size(12)
+                        .text_color(trRes.ok ? t.ansi2 : t.blocked)
+                        .child(
+                          trRes.ok
+                            ? `✓ OK (${trRes.latencyMs ?? 0}ms) · ${trRes.discoveredModel ?? ""}${n > 0 ? ` · ${n} ${this.tr("models", "个模型")}` : ""}`
+                            : `✗ ${trRes.error ?? "Failed"}${n > 0 ? ` (${n} ${this.tr("models listed", "个模型可选")})` : ""}`,
+                        ),
+                    );
+                  }),
+              ),
+          ),
+      )
+      // 2. Core AI Feature Switches
+      .child(
+        v_flex()
+          .w_full()
+          .gap(8)
+          .child(this.heading(t, this.tr("Core Semantic Capabilities", "核心语义能力开关")))
+          .child(
+            v_flex()
+              .w_full()
+              .rounded(10)
+              .border_1()
+              .border_color(t.border)
+              .bg(t.surface)
+              .overflow_hidden()
+              .child(
+                this.droveCardRow(
+                  t,
+                  this.tr("PTY Terminal State Arbitration", "非协议终端语义状态仲裁"),
+                  this.tr("Fallback semantic classification for non-OSC-7501 CLI agents when quiet, surfacing approval prompts or errors in the sidebar.", "当非 OSC 7501 终端静默且启发式不确定时，异步兜底识别审批提问、错误或思考中状态。"),
+                  this.toggle(t, "st-ai-sw-pty", ptyArb, (_e, cx) => this.saveAiPatch({ ptyStatusArbitration: !ptyArb }, cx)),
+                  true,
+                ),
+              )
+              .child(
+                this.droveCardRow(
+                  t,
+                  this.tr("Child Note Error Digest", "父子通知异常智能摘要"),
+                  this.tr("Append a compact root-cause digest to parent <h2> envelopes when a child agent errors or exits abnormally.", "子 Agent 报错或异常退出时，向父 Agent 的 <h2> 通知信封附加根因与建议摘要，避免盲目读取大日志。"),
+                  this.toggle(t, "st-ai-sw-notes", notesDigest, (_e, cx) => this.saveAiPatch({ notesDigest: !notesDigest }, cx)),
+                ),
+              )
+              .child(
+                this.droveCardRow(
+                  t,
+                  this.tr("Prompt KV-Cache Optimization", "Prompt 缓存与多轮会话复用"),
+                  this.tr("Share a byte-immutable >1024-token system prefix, append-only Run/Attempt sessions, and prompt_cache_key to cut token cost.", "统一静态系统前缀（>1024 tokens）、追加式多轮会话复用与 prompt_cache_key，最大化缓存命中率。"),
+                  this.toggle(t, "st-ai-sw-cache", promptCache, (_e, cx) => this.saveAiPatch({ promptCacheEnabled: !promptCache }, cx)),
+                ),
+              )
+              .child(
+                this.droveCardRow(
+                  t,
+                  this.tr("Handoff Semantic Distillation", "接力与合回语义记忆蒸馏"),
+                  this.tr("Distill omitted middle turns and side-chat merge-backs into structured memory (rejected approaches, conventions, blockers).", "在上下文接力与旁路合回时，将截断的中间轮次与长讨论提炼为高密度避坑记忆，避免新 Agent 重蹈覆辙。"),
+                  this.toggle(t, "st-ai-sw-handoff", handoffDistill, (_e, cx) => this.saveAiPatch({ handoffDistill: !handoffDistill }, cx)),
+                ),
+              )
+              .child(
+                this.droveCardRow(
+                  t,
+                  this.tr("Checkpoint Semantic Labeling", "快照语义里程碑命名"),
+                  this.tr("Asynchronously summarize each turn's diff into a 10-15 char milestone label without touching manual bookmarks.", "每轮快照落盘后异步根据改动生成 10–15 字语义标签（替代“继续 / 修报错”），且绝不覆盖手动书签。"),
+                  this.toggle(t, "st-ai-sw-ckpt-label", checkpointLabeling, (_e, cx) => this.saveAiPatch({ checkpointLabeling: !checkpointLabeling }, cx)),
+                ),
+              )
+              .child(
+                this.droveCardRow(
+                  t,
+                  this.tr("Semantic Naming & Hover Micro-Summary", "语义命名与悬停微摘要"),
+                  this.tr("Generate short task titles for unnamed tabs/agents, one-sentence hover progress tooltips, and Catch-up Briefing executive summaries.", "为未命名标签页与智能体生成简短任务标题、悬停一句话进展，以及离开重连简报顶栏总览。"),
+                  this.toggle(t, "st-ai-sw-semantic", semanticSummary, (_e, cx) => this.saveAiPatch({ semanticSummary: !semanticSummary }, cx)),
+                ),
+              ),
+          ),
+      )
+      // 3. Live Cache Efficiency & Token Usage Card
+      .child(
+        v_flex()
+          .w_full()
+          .gap(8)
+          .child(this.heading(t, this.tr("Cache Efficiency & Token Usage", "缓存命中率与 Token 统计")))
+          .child(
+            v_flex()
+              .w_full()
+              .p(14)
+              .gap(10)
+              .rounded(10)
+              .border_1()
+              .border_color(t.border)
+              .bg(t.surface)
+              .child(
+                h_flex()
+                  .w_full()
+                  .gap(8)
+                  .flex_wrap()
+                  .child(statPill(this.tr("KV Cache Hit Rate", "KV 缓存命中率"), hitPct, true))
+                  .child(statPill(this.tr("Local 0-Token Hits", "本地零消耗命中"), localHits))
+                  .child(statPill(this.tr("Sessions Reused", "多轮会话复用"), `${sessionsReused} (${activeSessions} ${this.tr("active", "活跃")})`))
+                  .child(statPill(this.tr("API Calls", "远端调用次数"), totalCalls)),
+              )
+              .child(
+                div()
+                  .text_size(11.5)
+                  .text_color(t.dim)
+                  .child(
+                    this.tr(
+                      `Tokens — Input: ${inTokens.toLocaleString()} (Cached: ${cachedTokens.toLocaleString()}) · Output: ${outTokens.toLocaleString()} · Config: ${st.configPath ?? "~/.config/herdr2/ai.json"}`,
+                      `Token 消耗 — 输入：${inTokens.toLocaleString()}（缓存命中：${cachedTokens.toLocaleString()}）· 输出：${outTokens.toLocaleString()} · 配置：${st.configPath ?? "~/.config/herdr2/ai.json"}`,
+                    ),
+                  ),
+              ),
+          ),
+      );
+  }
+
   drove(t, cx) {
     const machines = (this.machineList ?? []).filter((m) => !m.temporary);
     const data = this.droveData;
@@ -2516,6 +3115,8 @@ export default class Settings extends View {
         .text_color(on ? t.accent_foreground : t.foreground)
         .on_click((_e, cx) => {
           this.droveMachine = value;
+          this.droveData = null;
+          this.droveProbePromise = null;
           this.picking = null;
           this.droveModelSubmit = null;
           this.droveStrengthSubmit = null;
@@ -2737,6 +3338,9 @@ export default class Settings extends View {
                           if (this.droveAiConfigMode) {
                             this.droveShowAddRole = false;
                             this.droveAiRolePromptInput.focus();
+                            if (!this.hasCachedAgentModels() && !this.droveProbing && !this.droveProbePromise && !(typeof checking === "function" && checking())) {
+                              this.probeDroveAgents(cx);
+                            }
                           }
                           cx.notify();
                         })
@@ -2777,6 +3381,9 @@ export default class Settings extends View {
                           if (this.droveAiConfigMode) {
                             this.droveShowAddRole = false;
                             this.droveAiRolePromptInput.focus();
+                            if (!this.hasCachedAgentModels() && !this.droveProbing && !this.droveProbePromise && !(typeof checking === "function" && checking())) {
+                              this.probeDroveAgents(cx);
+                            }
                           }
                           cx.notify();
                         })
@@ -2805,6 +3412,9 @@ export default class Settings extends View {
                           if (this.droveAiConfigMode) {
                             this.droveShowAddRole = false;
                             this.droveAiRolePromptInput.focus();
+                            if (!this.hasCachedAgentModels() && !this.droveProbing && !this.droveProbePromise && !(typeof checking === "function" && checking())) {
+                              this.probeDroveAgents(cx);
+                            }
                           }
                           cx.notify();
                         })
@@ -2939,9 +3549,11 @@ export default class Settings extends View {
                         .text_size(11)
                         .text_color(t.dim)
                         .child(
-                          this.droveAiConfiguring && !hasCache
-                            ? this.tr("Probing installed agents & models, then generating…", "正在刷新检测可用 Agent 与模型，并调用 AI 生成…")
-                            : this.tr("Multi-line instructions supported · Ctrl+Enter to apply", "支持多行自然语言要求 · Ctrl+Enter 快速生成"),
+                          this.droveAiConfiguring && (this.droveAiStage === "probing" || !hasCache)
+                            ? this.tr("Probing installed agents & models before AI configuration…", "正在刷新检测可用 Agent 与模型，完成后将自动调用 AI 配置…")
+                            : this.droveAiConfiguring
+                              ? this.tr("Generating role configuration with AI…", "正在调用 AI 生成角色配置…")
+                              : this.tr("Multi-line instructions supported · Ctrl+Enter to apply", "支持多行自然语言要求 · Ctrl+Enter 快速生成"),
                         ),
                     )
                     .child(
@@ -2965,7 +3577,9 @@ export default class Settings extends View {
                             .when(this.droveAiConfiguring, (b) => b.child(svg("mods/workspace-chrome/spinner.svg").size(12).text_color(t.accent_foreground).spin(900)))
                             .child(
                               this.droveAiConfiguring
-                                ? this.tr("Generating…", "生成中…")
+                                ? (this.droveAiStage === "probing"
+                                    ? this.tr("Probing agents…", "检测 Agent 中…")
+                                    : this.tr("Generating…", "生成中…"))
                                 : isAllMode
                                   ? this.tr("⚡ Generate & Apply All", "⚡ 一键生成并应用")
                                   : isStrengthsMode
@@ -3103,12 +3717,12 @@ export default class Settings extends View {
               .children(roleIds.map((id) => this.droveRoleCard(t, id, roles[id], cx))),
           ),
       )
-      // 2. AI Assistant Section Card
+      // 2. Shared Core AI Assistant Summary Card (configured in Settings -> AI)
       .child(
         v_flex()
           .w_full()
           .gap(8)
-          .child(this.heading(t, this.tr("AI Assistant", "智能辅助模型")))
+          .child(this.heading(t, this.tr("AI Assistant (Shared Core)", "智能辅助模型（全局共享）")))
           .child(
             v_flex()
               .w_full()
@@ -3120,202 +3734,40 @@ export default class Settings extends View {
               .child(
                 this.droveCardRow(
                   t,
-                  this.tr("Enable AI assistant", "启用智能辅助"),
-                  this.tr("Optional lightweight OpenAI-compatible helper for auto-config, run titles, and digest summaries.", "可选的轻量 OpenAI 兼容接口，用于 AI 自动配角色、Run 命名与摘要。"),
-                  this.toggle(t, "st-dr-ai-on", aiOn, (_e, cx) => this.saveDrovePatch({ ai: { enabled: !aiOn } }, cx)),
-                  true,
-                ),
-              )
-              .child(
-                h_flex()
-                  .w_full()
-                  .px(14)
-                  .py(12)
-                  .gap(12)
-                  .border_t(1)
-                  .border_color(t.border)
-                  .items_start()
-                  .child(
-                    v_flex()
-                      .flex_1()
-                      .min_w(0)
-                      .gap(4)
-                      .child(div().text_size(12).text_color(t.foreground).child(this.tr("Service URL", "远端服务地址")))
-                      .child(div().px(8).py(2).rounded(7).border_1().border_color(t.border).bg(t.background).child(Input.new(this.droveUrlInput).h(26).text_size(12.5).text_color(t.foreground))),
-                  )
-                  .child(
-                    v_flex()
-                      .flex_1()
-                      .min_w(0)
-                      .gap(4)
-                      .child(
-                        h_flex()
-                          .justify_between()
-                          .items_center()
-                          .gap(6)
-                          .child(div().text_size(12).text_color(t.foreground).child(this.tr("API Key", "API Key")))
-                          .when(Boolean(aiStatus.keyMasked), (el) =>
-                            el.child(div().truncate().text_size(11).text_color(t.dim).child(this.tr(`Saved: ${aiStatus.keyMasked}`, `已保存：${aiStatus.keyMasked}`))),
-                          ),
+                  aiStatus.configured
+                    ? this.tr(
+                        `Ready · ${currentAiModel || aiModels[0] || "Auto"}`,
+                        `已就绪 · ${currentAiModel || aiModels[0] || "自动模型"}`,
                       )
-                      .child(div().px(8).py(2).rounded(7).border_1().border_color(t.border).bg(t.background).child(Input.new(this.droveKeyInput).h(26).text_size(12.5).text_color(t.foreground))),
-                  ),
-              )
-              .child(
-                this.droveCardRow(
-                  t,
-                  this.tr("Model", "使用模型"),
-                  aiModels.length > 0
-                    ? this.tr(`${aiModels.length} model(s) discovered from endpoint`, `已从服务端拉取 ${aiModels.length} 个可用模型`)
-                    : this.tr("Save or test connection to load models, or type a custom model ID", "保存或测试连通性后将自动拉取模型列表，也可直接输入自定义模型"),
-                  this.drovePicker(
-                    t,
-                    "ai-model",
-                    currentAiModel || this.tr("Auto (first available)", "自动选择（首个可用）"),
-                    aiModelItems,
-                    (model, cx) => this.saveDrovePatch({ ai: { model: model || "" } }, cx),
-                    { width: 240, popupWidth: 380, anchor: "bottom_right", allowCustom: true },
-                    cx,
-                  ),
-                ),
-              )
-              .child(
-                this.droveCardRow(
-                  t,
-                  this.tr("Reasoning Effort", "思考强度"),
-                  this.tr("Thinking depth (reasoning_effort); auto-falls back if unsupported by endpoint", "控制推理思考深度（reasoning_effort），接口不支持时自动回退"),
+                    : this.tr("AI Assistant not configured", "尚未配置全局 AI 助手"),
+                  aiStatus.configured
+                    ? this.tr(
+                        `Shared across Core & Drove (${cfg.ai?.baseUrl || aiStatus.baseUrl || "local"}). Edit endpoint, API key, cache & core switches in Settings → AI.`,
+                        `由 Core 与 Drove 共享（${cfg.ai?.baseUrl || aiStatus.baseUrl || "本地"}）。前往「设置 → AI 助手」管理接口地址、Key 与缓存统计。`,
+                      )
+                    : this.tr(
+                        "Configure an OpenAI-compatible helper once in Settings → AI to unlock role auto-config, semantic conflict/loop checks, and PTY state arbitration.",
+                        "在「设置 → AI 助手」中配置一次轻量 OpenAI 兼容模型，即可同时启用 Drove 编排辅助、死循环/冲突分析与终端状态仲裁。",
+                      ),
                   h_flex()
-                    .id("st-dr-ai-eff-group")
-                    .w(240)
-                    .h(28)
-                    .flex_none()
-                    .p(2)
-                    .gap(1)
+                    .gap(8)
                     .items_center()
-                    .rounded(7)
-                    .border_1()
-                    .border_color(t.border)
-                    .bg(t.background)
-                    .children(
-                      aiEffortChoices.map((eff) => {
-                        const active = currentAiEffort === eff;
-                        return div()
-                          .id(`st-dr-ai-eff-${eff}`)
-                          .flex_1()
-                          .h(22)
-                          .px(2)
-                          .flex()
-                          .items_center()
-                          .justify_center()
-                          .rounded(5)
-                          .bg(active ? t.accent : "#00000000")
-                          .text_size(11)
-                          .when(active, (el) => el.font_semibold())
-                          .text_color(active ? t.accent_foreground : t.muted)
-                          .cursor_pointer()
-                          .when(!active, (el) => el.hover((s) => s.bg(t.hover).text_color(t.foreground)))
-                          .on_click((_e, cx) => this.saveDrovePatch({ ai: { effort: eff } }, cx))
-                          .child(this.aiEffortLabel(eff));
+                    .child(
+                      this.toggle(t, "st-dr-ai-on", aiOn, (_e, cx) => this.saveDrovePatch({ ai: { enabled: !aiOn } }, cx)),
+                    )
+                    .child(
+                      this.button(t, "st-dr-open-ai", this.tr("Open AI Settings →", "前往 AI 设置 →"), (_e, cx) => {
+                        this.section = "ai";
+                        this.picking = null;
+                        cx.spawn(async (cx) => {
+                          await this.loadAi();
+                          cx.notify();
+                        });
+                        cx.notify();
                       }),
                     ),
+                  true,
                 ),
-              )
-              .child(
-                this.droveCardRow(
-                  t,
-                  this.tr("Context Size", "上下文大小"),
-                  this.tr("Caps prompt input budget and sets local num_ctx (e.g. Ollama)", "限制单次输入预算，并为本地服务（如 Ollama）下发 num_ctx"),
-                  this.drovePicker(
-                    t,
-                    "ai-context",
-                    currentAiContext ? currentAiContext.toUpperCase() : this.tr("Auto (model default)", "默认（随模型）"),
-                    aiContextItems,
-                    (val, cx) => this.saveDrovePatch({ ai: { contextWindow: this.normalizeAiContextInput(val) } }, cx),
-                    { width: 240, popupWidth: 320, anchor: "bottom_right", allowCustom: true },
-                    cx,
-                  ),
-                ),
-              )
-              .child(
-                this.droveCardRow(
-                  t,
-                  this.tr("Max Output Tokens", "最大输出长度"),
-                  this.tr("Max reply tokens (max_tokens); scales with effort when set to Auto", "单次最大输出长度（max_tokens）；设为自动时随思考强度动态放宽"),
-                  this.drovePicker(
-                    t,
-                    "ai-max-tokens",
-                    currentAiMaxTokens ? `${currentAiMaxTokens} tokens` : this.tr("Auto (by effort)", "自动（随思考强度）"),
-                    aiMaxTokenItems,
-                    (val, cx) => {
-                      const parsed = this.parseAiMaxTokensInput(val);
-                      if (parsed !== null) {
-                        this.saveDrovePatch({ ai: { maxTokens: parsed } }, cx);
-                      }
-                    },
-                    { width: 240, popupWidth: 320, anchor: "bottom_right", allowCustom: true },
-                    cx,
-                  ),
-                ),
-              )
-              .child(
-                h_flex()
-                  .w_full()
-                  .px(14)
-                  .py(9)
-                  .gap(8)
-                  .border_t(1)
-                  .border_color(t.border)
-                  .bg(t.background)
-                  .items_center()
-                  .justify_between()
-                  .flex_wrap()
-                  .child(
-                    h_flex()
-                      .gap(8)
-                      .items_center()
-                      .child(
-                        div()
-                          .id("st-dr-ai-save")
-                          .px(12)
-                          .py(5)
-                          .rounded(6)
-                          .bg(t.accent)
-                          .cursor_pointer()
-                          .text_size(12.5)
-                          .font_semibold()
-                          .text_color(t.accent_foreground)
-                          .hover((s) => s.opacity(0.9))
-                          .on_click((_e, cx) => {
-                            const ai = { baseUrl: this.droveUrlInput.value().trim(), enabled: aiOn };
-                            const k = this.droveKeyInput.value().trim();
-                            if (this.droveKeyDirty && k) ai.apiKey = k;
-                            this.saveDrovePatch({ ai }, cx, true);
-                          })
-                          .child(this.droveSaving ? this.tr("Saving…", "保存中…") : this.tr("Save", "保存")),
-                      )
-                      .child(this.button(t, "st-dr-ai-test", this.droveAiTesting ? this.tr("Testing…", "测试中…") : this.tr("Test Connection", "测试连通性"), (_e, cx) => this.testDroveAi(cx)))
-                      .when(Boolean(aiStatus.keyMasked), (el) =>
-                        el.child(this.button(t, "st-dr-ai-clear", this.tr("Clear Key", "清除 Key"), (_e, cx) => {
-                          this.droveKeyInput.set_value("");
-                          this.droveKeyDirty = false;
-                          this.saveDrovePatch({ clearAiKey: true }, cx);
-                        })),
-                      ),
-                  )
-                  .when(Boolean(this.droveTestResult), (el) => {
-                    const trRes = this.droveTestResult;
-                    const n = (trRes.availableModels ?? []).length;
-                    return el.child(
-                      div()
-                        .text_size(12)
-                        .text_color(trRes.ok ? t.ansi2 : t.blocked)
-                        .child(
-                          trRes.ok
-                            ? `✓ OK (${trRes.latencyMs ?? 0}ms) · ${trRes.discoveredModel ?? ""}${n > 0 ? ` · ${n} ${this.tr("models", "个模型")}` : ""}`
-                            : `✗ ${trRes.error ?? "Failed"}${n > 0 ? ` (${n} ${this.tr("models listed", "个模型可选")})` : ""}`,
-                        ),
-                    );
-                  }),
               ),
           ),
       )
@@ -3706,6 +4158,11 @@ export default class Settings extends View {
               this.machineEdit = null;
               this.handle.focus();
               if (s.id === "machines") cx.spawn(async (cx) => { await this.loadMachines(); cx.notify(); });
+              if (s.id === "ai") cx.spawn(async (cx) => {
+                if (this.machineList === null) await this.loadMachines();
+                await this.loadAi();
+                cx.notify();
+              });
               if (s.id === "drove") cx.spawn(async (cx) => {
                 if (this.machineList === null) await this.loadMachines();
                 await this.loadDrove();
@@ -3776,6 +4233,8 @@ export default class Settings extends View {
                         ? this.keyboard(t)
                       : this.section === "machines"
                         ? this.machines(t)
+                      : this.section === "ai"
+                        ? this.ai(t, cx)
                       : this.section === "drove"
                         ? this.drove(t, cx)
                       : this.section === "alerts"

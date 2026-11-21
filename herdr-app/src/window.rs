@@ -511,6 +511,20 @@ enum RenameFocus {
     Agent(Option<String>),
 }
 
+#[derive(Clone, Debug)]
+struct AiTerminalVerdict {
+    screen_hash: u64,
+    output_at: Option<Instant>,
+    typed_at: Option<Instant>,
+    state: &'static str,
+    kind: String,
+    summary: String,
+    semantic_title: String,
+    micro_summary: String,
+    decided_at: Instant,
+    working_rechecks: u8,
+}
+
 pub struct AppWindow {
     core: Arc<Core>,
     runtime: Option<Rc<ShellRuntime>>,
@@ -590,6 +604,16 @@ pub struct AppWindow {
     rename_focus: RenameFocus,
     /// Manual status overrides (`herdr.status`), keyed by terminal/agent address.
     manual_statuses: HashMap<String, ManualStatus>,
+    /// Cached async semantic arbitration verdicts for non-OSC-7501 PTY CLI agents.
+    ai_terminal_states: HashMap<String, AiTerminalVerdict>,
+    /// PTY addresses currently awaiting an in-flight `ai.classify_terminal_state` RPC.
+    ai_inflight: HashSet<String>,
+    /// Per-terminal throttle timestamp for semantic status arbitration.
+    ai_last_attempt: HashMap<String, Instant>,
+    /// Backoff deadline when local Core AI is unconfigured or disabled.
+    ai_unavailable_until: Option<Instant>,
+    /// Monotonic counter for `files.open` requests routed to the Files panel.
+    file_open_seq: u64,
     listed_once: bool,
     /// Live folders by address (from the shell process).
     cwds: HashMap<String, String>,
@@ -625,6 +649,10 @@ pub struct AppWindow {
     tab_shown: bool,
     pane_history: Vec<String>,
     window_active: bool,
+    /// When the window last lost OS focus, for away-return Catch-up Briefing detection.
+    blurred_at: Option<Instant>,
+    /// Agent/terminal statuses snapshotted at blur time to count new changes while away.
+    away_statuses: HashMap<String, String>,
     /// The system's appearance; a layout with a light and a dark theme follows it.
     system_dark: bool,
     /// The OS tells us when files change (`files.rs`); else the disk is polled.
@@ -711,6 +739,11 @@ impl AppWindow {
             side_panel_auto_hidden: false,
             rename_focus: RenameFocus::Tab,
             manual_statuses: HashMap::new(),
+            ai_terminal_states: HashMap::new(),
+            ai_inflight: HashSet::new(),
+            ai_last_attempt: HashMap::new(),
+            ai_unavailable_until: None,
+            file_open_seq: 0,
             listed_once: false,
             cwds: HashMap::new(),
             folders_checked: HashMap::new(),
@@ -740,6 +773,8 @@ impl AppWindow {
             tab_shown: true,
             pane_history: Vec::new(),
             window_active: true,
+            blurred_at: None,
+            away_statuses: HashMap::new(),
             system_dark: is_dark(window.appearance()),
             file_events,
             polls: 0,
@@ -1406,6 +1441,62 @@ impl AppWindow {
             .or_else(|| self.shown_agent())
     }
 
+    fn is_side_chat(&self, addr: &str) -> bool {
+        self.live
+            .get(addr)
+            .or_else(|| self.ended_acp.get(addr))
+            .is_some_and(is_side_chat_record)
+    }
+
+    /// Removes a side-chat agent from any tab/pane and clears tab-mounting labels so it only lives
+    /// in its parent agent's right-side side-chat panel.
+    fn evict_side_chat_from_tabs(&mut self, addr: &str, cx: &mut Context<Self>) -> bool {
+        let mut evicted = false;
+        while let Some(pane) = self.model.any_pane_of(addr) {
+            self.swapped.remove(&pane);
+            self.model.remove_pane(&pane);
+            evicted = true;
+        }
+        let has_tab_labels = self.live.get(addr).is_some_and(|r| {
+            r.pointer("/labels/herdr.space").and_then(Value::as_str).is_some_and(|s| !s.is_empty())
+                || r.pointer("/labels/herdr.tab").and_then(Value::as_str).is_some_and(|s| !s.is_empty())
+        });
+        if evicted || has_tab_labels {
+            let is_acp = is_acp_addr(addr);
+            if let Some(obj) = self.live.get_mut(addr).and_then(Value::as_object_mut) {
+                if !is_acp {
+                    obj.insert("keep".into(), json!(false));
+                }
+                if let Some(labels) = obj.entry("labels").or_insert_with(|| json!({})).as_object_mut() {
+                    labels.insert("herdr.space".into(), json!(""));
+                    labels.insert("herdr.tab".into(), json!(""));
+                    labels.insert("herdr.parked".into(), json!("1"));
+                }
+            }
+            let core = self.core.clone();
+            let address = addr.to_owned();
+            let labels = json!({
+                "herdr.space": "",
+                "herdr.tab": "",
+                "herdr.parked": "1",
+            });
+            cx.background_executor()
+                .spawn(async move {
+                    let (l_method, l_key) = if is_acp {
+                        ("agent.label", "agent")
+                    } else {
+                        ("terminal.label", "terminal")
+                    };
+                    let _ = core.call(l_method, json!({ l_key: address, "labels": labels }));
+                    if !is_acp {
+                        let _ = core.call("terminal.keep", json!({ "terminal": address, "keep": false }));
+                    }
+                })
+                .detach();
+        }
+        evicted
+    }
+
     fn side_chats_for(&self, main_addr: &str) -> Vec<String> {
         let ordered = self.ordered_live_values();
         ordered
@@ -1840,6 +1931,9 @@ impl AppWindow {
             let (block, addr) = (id.clone(), address.clone());
             let sub = cx.subscribe_in(&view, window, move |this, _, ev: &TerminalEvent, window, cx| match ev {
                 TerminalEvent::Peek(address) => this.peek_terminal(address, window, cx),
+                TerminalEvent::OpenFile { path, line, end_line, on } => {
+                    this.open_file_in_panel(path, *line, *end_line, on.as_deref(), None, window, cx);
+                }
                 TerminalEvent::TitleChanged => this.publish(cx),
                 TerminalEvent::ScrollChanged => {
                     mods::panes_scrolled();
@@ -2326,6 +2420,9 @@ impl AppWindow {
                 || self.live.get(addr).and_then(|r| r.get("acp")).and_then(Value::as_bool) == Some(true);
             let (working_since, work_ms, total_work_ms) = agent_timing(addr);
             let created_ms = agent_appeared_ms(addr);
+            let live_rec = self.live.get(addr).or_else(|| self.ended_acp.get(addr));
+            let semantic_title = live_rec.and_then(|r| r.get("semantic_title")).and_then(Value::as_str).filter(|s| !s.is_empty());
+            let micro_summary = live_rec.and_then(|r| r.get("micro_summary")).and_then(Value::as_str).filter(|s| !s.is_empty());
             agents.push(json!({
                 "address": addr, "acp": is_acp, "pane": Value::Null, "space": space_id, "space_name": space_name,
                 "tab": Value::Null, "tab_index": 0, "tab_name": "headless",
@@ -2333,6 +2430,8 @@ impl AppWindow {
                 "manual_status": a.and_then(|a| a.manual_status.clone()),
                 "app": app, "program": self.program(addr), "title": title,
                 "custom_name": custom_name,
+                "semantic_title": semantic_title,
+                "micro_summary": micro_summary,
                 "context_usage": context_usage,
                 "created_ms": created_ms,
                 "working_since": working_since,
@@ -2354,9 +2453,14 @@ impl AppWindow {
                         let is_ended = !self.live.contains_key(addr) && self.ended_acp.contains_key(addr);
                         let status = if is_ended { "ended" } else { m.status(addr).unwrap_or("idle") };
                         let (working_since, work_ms, total_work_ms) = agent_timing(addr);
+                        let live_rec = self.live.get(addr).or_else(|| self.ended_acp.get(addr));
+                        let semantic_title = live_rec.and_then(|r| r.get("semantic_title")).and_then(Value::as_str).filter(|s| !s.is_empty());
+                        let micro_summary = live_rec.and_then(|r| r.get("micro_summary")).and_then(Value::as_str).filter(|s| !s.is_empty());
                         panes.push(json!({
                             "pane": p.id, "acp": true, "mod": "peek", "terminal": addr, "tab": ctx.id, "title": title,
                             "custom_name": custom_name,
+                            "semantic_title": semantic_title,
+                            "micro_summary": micro_summary,
                             "cwd": cwd, "branch": m.folder_info.get(addr).and_then(|f| f.branch.clone()),
                             "status": status, "app": app, "program": self.program(addr),
                             "context_usage": context_usage,
@@ -2374,6 +2478,8 @@ impl AppWindow {
                                 "manual_status": a.and_then(|a| a.manual_status.clone()),
                                 "app": app, "program": self.program(addr), "title": title,
                                 "custom_name": custom_name,
+                                "semantic_title": semantic_title,
+                                "micro_summary": micro_summary,
                                 "context_usage": context_usage,
                                 "created_ms": created_ms,
                                 "working_since": working_since,
@@ -2398,10 +2504,14 @@ impl AppWindow {
                     });
                     let structured = !self.swapped.contains_key(&p.id) && self.is_structured_terminal(addr);
                     let custom_name = self.live.get(addr).and_then(|r| r.pointer("/labels/herdr.name")).and_then(Value::as_str).filter(|s| !s.is_empty());
+                    let semantic_title = self.live.get(addr).and_then(|r| r.get("semantic_title")).and_then(Value::as_str).filter(|s| !s.is_empty());
+                    let micro_summary = self.live.get(addr).and_then(|r| r.get("micro_summary")).and_then(Value::as_str).filter(|s| !s.is_empty());
                     let (working_since, work_ms, total_work_ms) = agent_timing(addr);
                     panes.push(json!({
                         "pane": p.id, "terminal": addr, "tab": ctx.id, "title": title.clone().unwrap_or_default(),
                         "custom_name": custom_name,
+                        "semantic_title": semantic_title,
+                        "micro_summary": micro_summary,
                         "cwd": self.cwds.get(addr), "branch": m.folder_info.get(addr).and_then(|f| f.branch.clone()),
                         "status": m.status(addr), "app": a.and_then(|a| a.app.clone()), "program": self.program(addr),
                         "structured": structured,
@@ -2422,6 +2532,8 @@ impl AppWindow {
                         "manual_status": a.and_then(|a| a.manual_status.clone()),
                         "app": a.and_then(|a| a.app.clone()), "program": self.program(addr), "title": title.unwrap_or_default(),
                         "custom_name": custom_name,
+                        "semantic_title": semantic_title,
+                        "micro_summary": micro_summary,
                         "created_ms": created_ms,
                         "working_since": working_since,
                         "work_ms": work_ms,
@@ -2926,9 +3038,25 @@ impl AppWindow {
     }
 
     /// Infer execution state on live non-7501 PTY terminals running an interactive coding CLI agent.
-    fn refresh_inferred_statuses(&mut self, cx: &App) -> bool {
+    /// Deterministic rules always run synchronously at 0ms; when quiet + ambiguous (`idle`), dispatches
+    /// a debounced async fallback to Core's `ai.classify_terminal_state` RPC.
+    fn refresh_inferred_statuses(&mut self, cx: &mut Context<Self>) -> bool {
         let now = Instant::now();
-        let mut updates: Vec<(String, Value)> = Vec::new();
+        struct ArbitrationJob {
+            addr: String,
+            program: Option<String>,
+            raw_title: String,
+            screen_hash: u64,
+            output_at: Option<Instant>,
+            typed_at: Option<Instant>,
+            tail_lines: Vec<String>,
+            next_rechecks: u8,
+        }
+        let mut updates: Vec<(String, Value, Value, Value)> = Vec::new();
+        let mut clear_verdicts: Vec<String> = Vec::new();
+        let mut jobs: Vec<ArbitrationJob> = Vec::new();
+        let can_ai = self.core.supports_ai() && self.ai_unavailable_until.is_none_or(|until| now >= until);
+
         for (addr, rec) in &self.live {
             let manually_held = match self.manual_statuses.get(addr) {
                 Some(entry) => entry.status.is_some(),
@@ -2938,27 +3066,197 @@ impl AppWindow {
                 || rec.get("reported").and_then(Value::as_bool) == Some(true)
                 || manually_held
             {
+                if self.ai_terminal_states.contains_key(addr) {
+                    clear_verdicts.push(addr.clone());
+                }
                 continue;
             }
             let is_agent = rec.pointer("/program/agent").and_then(Value::as_bool) == Some(true);
-            let want = if is_agent {
+            let (want, want_summary, want_kind) = if is_agent {
                 let raw_title = rec.get("raw_title").and_then(Value::as_str).unwrap_or_default();
                 let view = self.best_terminal_view(addr, cx);
-                let state = view.map(|v| v.read(cx).inferred_agent_state(raw_title, now)).unwrap_or("idle");
-                Value::String(state.to_owned())
+                let det = view.as_ref().map(|v| v.read(cx).inferred_agent_state(raw_title, now)).unwrap_or("idle");
+                if det != "idle" {
+                    if self.ai_terminal_states.contains_key(addr) {
+                        clear_verdicts.push(addr.clone());
+                    }
+                    (Value::String(det.to_owned()), Value::Null, Value::Null)
+                } else if let Some(view) = view {
+                    let v = view.read(cx);
+                    let output_at = v.last_output_at();
+                    let typed_at = v.last_typed_at();
+                    let cached = self.ai_terminal_states.get(addr).filter(|c| c.output_at == output_at && c.typed_at == typed_at);
+                    if cached.is_none() && self.ai_terminal_states.contains_key(addr) {
+                        clear_verdicts.push(addr.clone());
+                    }
+                    let (eff_state, eff_summary, eff_kind, eff_sem_title, eff_micro, need_recheck, next_rechecks) = match cached {
+                        Some(c) => {
+                            let recheck = c.state == "working"
+                                && c.working_rechecks < 2
+                                && now.saturating_duration_since(c.decided_at) >= Duration::from_secs(15);
+                            let sum = if c.summary.is_empty() { Value::Null } else { Value::String(c.summary.clone()) };
+                            let kind = if c.kind.is_empty() { Value::Null } else { Value::String(c.kind.clone()) };
+                            let st = (!c.semantic_title.is_empty()).then(|| c.semantic_title.clone());
+                            let ms = (!c.micro_summary.is_empty()).then(|| c.micro_summary.clone());
+                            (c.state, sum, kind, st, ms, recheck, c.working_rechecks.saturating_add(1))
+                        }
+                        None => ("idle", Value::Null, Value::Null, None, None, true, 0),
+                    };
+                    let _ = (eff_sem_title, eff_micro);
+                    if need_recheck
+                        && can_ai
+                        && !self.ai_inflight.contains(addr)
+                        && self.ai_inflight.len() + jobs.len() < 2
+                        && self.ai_last_attempt.get(addr).is_none_or(|t| now.saturating_duration_since(*t) >= Duration::from_secs(5))
+                        && output_at.is_some_and(|t| now.saturating_duration_since(t) >= Duration::from_secs(2))
+                        && typed_at.is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(1500))
+                    {
+                        let (screen_hash, tail_lines) = v.tail_snapshot_for_arbitration(15);
+                        if !tail_lines.is_empty()
+                            && cached.is_none_or(|c| c.screen_hash != screen_hash || c.state == "working")
+                        {
+                            jobs.push(ArbitrationJob {
+                                addr: addr.clone(),
+                                program: rec.pointer("/program/key").and_then(Value::as_str).map(str::to_owned),
+                                raw_title: raw_title.to_owned(),
+                                screen_hash,
+                                output_at,
+                                typed_at,
+                                tail_lines,
+                                next_rechecks,
+                            });
+                        }
+                    }
+                    (Value::String(eff_state.to_owned()), eff_summary, eff_kind)
+                } else {
+                    (Value::String("idle".into()), Value::Null, Value::Null)
+                }
             } else {
-                Value::Null
+                if self.ai_terminal_states.contains_key(addr) {
+                    clear_verdicts.push(addr.clone());
+                }
+                (Value::Null, Value::Null, Value::Null)
             };
-            let current = rec.get("status").unwrap_or(&Value::Null);
-            if current != &want {
-                updates.push((addr.clone(), want));
+            let cur_status = rec.get("status").unwrap_or(&Value::Null);
+            let cur_summary = rec.get("ai_status_summary").unwrap_or(&Value::Null);
+            let cur_kind = rec.get("ai_status_kind").unwrap_or(&Value::Null);
+            if cur_status != &want || cur_summary != &want_summary || cur_kind != &want_kind {
+                updates.push((addr.clone(), want, want_summary, want_kind));
             }
         }
+        for addr in clear_verdicts {
+            self.ai_terminal_states.remove(&addr);
+        }
         let changed = !updates.is_empty();
-        for (addr, want) in updates {
+        for (addr, want, want_summary, want_kind) in updates {
             if let Some(obj) = self.live.get_mut(&addr).and_then(Value::as_object_mut) {
                 obj.insert("status".into(), want);
+                obj.insert("ai_status_summary".into(), want_summary);
+                obj.insert("ai_status_kind".into(), want_kind);
             }
+        }
+        for job in jobs {
+            self.ai_inflight.insert(job.addr.clone());
+            self.ai_last_attempt.insert(job.addr.clone(), now);
+            let core = self.core.clone();
+            let language = self.person.language.clone();
+            let params = json!({
+                "program": job.program,
+                "rawTitle": job.raw_title,
+                "tailLines": job.tail_lines,
+                "language": language,
+            });
+            let addr = job.addr;
+            let screen_hash = job.screen_hash;
+            let output_at = job.output_at;
+            let typed_at = job.typed_at;
+            let next_rechecks = job.next_rechecks;
+            cx.spawn(async move |this, cx| {
+                let res = cx.background_executor().spawn(async move { core.classify_terminal_state(params) }).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.ai_inflight.remove(&addr);
+                    let Ok(val) = res else {
+                        return;
+                    };
+                    if val.get("usedAi").and_then(Value::as_bool) != Some(true) {
+                        this.ai_unavailable_until = Some(Instant::now() + Duration::from_secs(30));
+                        return;
+                    }
+                    // Guard against stale results: discard if terminal received new output or user input.
+                    let Some(view) = this.best_terminal_view(&addr, cx) else {
+                        return;
+                    };
+                    let v = view.read(cx);
+                    if v.last_output_at() != output_at || v.last_typed_at() != typed_at {
+                        return;
+                    }
+                    let Some(rec) = this.live.get(&addr) else {
+                        return;
+                    };
+                    if rec.get("reported").and_then(Value::as_bool) == Some(true)
+                        || rec.get("manual_status").and_then(Value::as_str).is_some_and(|s| !s.is_empty())
+                    {
+                        return;
+                    }
+                    let accepted = val.get("accepted").and_then(Value::as_bool) == Some(true);
+                    let semantic_title = val.get("semanticTitle").and_then(Value::as_str).unwrap_or("").trim().to_owned();
+                    let micro_summary = val.get("microSummary").and_then(Value::as_str).unwrap_or("").trim().to_owned();
+                    let (mapped_state, kind, summary) = if accepted {
+                        let raw_state = val.get("state").and_then(Value::as_str).unwrap_or("idle");
+                        let mapped = match raw_state {
+                            "working" => "working",
+                            "blocked" | "error" => "blocked",
+                            _ => "idle",
+                        };
+                        let k = val.get("kind").and_then(Value::as_str).unwrap_or(raw_state).to_owned();
+                        let s = val.get("summary").and_then(Value::as_str).unwrap_or("").trim().to_owned();
+                        (mapped, k, s)
+                    } else {
+                        ("idle", String::new(), String::new())
+                    };
+                    let verdict = AiTerminalVerdict {
+                        screen_hash,
+                        output_at,
+                        typed_at,
+                        state: mapped_state,
+                        kind: kind.clone(),
+                        summary: summary.clone(),
+                        semantic_title: semantic_title.clone(),
+                        micro_summary: micro_summary.clone(),
+                        decided_at: Instant::now(),
+                        working_rechecks: next_rechecks,
+                    };
+                    this.ai_terminal_states.insert(addr.clone(), verdict);
+                    if let Some(obj) = this.live.get_mut(&addr).and_then(Value::as_object_mut) {
+                        obj.insert("status".into(), Value::String(mapped_state.to_owned()));
+                        obj.insert(
+                            "ai_status_kind".into(),
+                            if kind.is_empty() { Value::Null } else { Value::String(kind) },
+                        );
+                        obj.insert(
+                            "ai_status_summary".into(),
+                            if summary.is_empty() { Value::Null } else { Value::String(summary) },
+                        );
+                        if !semantic_title.is_empty() {
+                            obj.insert("semantic_title".into(), Value::String(semantic_title));
+                        }
+                        if !micro_summary.is_empty() {
+                            obj.insert("micro_summary".into(), Value::String(micro_summary));
+                        }
+                    }
+                    let app = this
+                        .live
+                        .get(&addr)
+                        .and_then(|r| r.pointer("/program/key").and_then(Value::as_str))
+                        .map(str::to_owned);
+                    let looking = this.visible_addresses().iter().any(|x| x == &addr) && this.window_active;
+                    this.model.set_word(&addr, Some(mapped_state.to_owned()), app, looking);
+                    mods::publish_terminals(this.ordered_live_values());
+                    this.refresh_snapshot_mods(cx);
+                    cx.notify();
+                });
+            })
+            .detach();
         }
         changed
     }
@@ -3048,6 +3346,8 @@ impl AppWindow {
         self.live_order = order;
         self.shell_child_seen.retain(|a| self.live.contains_key(a));
         self.manual_statuses.retain(|a, _| self.live.contains_key(a));
+        self.ai_terminal_states.retain(|a, _| self.live.contains_key(a));
+        self.ai_last_attempt.retain(|a, _| self.live.contains_key(a));
         self.closing_terminals.retain(|addr, completed| !*completed || self.live.contains_key(addr));
         // Seed `manual_status` on live records before inferring or publishing `terminals()`.
         let addrs: Vec<String> = self.live.keys().cloned().collect();
@@ -3239,7 +3539,19 @@ impl AppWindow {
         if QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
             return false;
         }
-        self.ended_acp.retain(|a, _| !self.live.contains_key(a) && self.model.acp_pane_of(a).is_some());
+        self.ended_acp.retain(|a, rec| !self.live.contains_key(a) && self.model.acp_pane_of(a).is_some() && !is_side_chat_record(rec));
+        // Side-chat agents belong strictly in their parent's right-side panel, never in tabs.
+        let mounted_side_chats: Vec<String> = self
+            .model
+            .tabs()
+            .flat_map(|c| c.root.panes())
+            .filter_map(|n| n.any_terminal().map(str::to_owned))
+            .filter(|a| self.is_side_chat(a))
+            .collect();
+        let mut evicted_side_chat = false;
+        for addr in mounted_side_chats {
+            evicted_side_chat |= self.evict_side_chat_from_tabs(&addr, cx);
+        }
         let missing = self.model.tabs().flat_map(|c| c.root.panes()).chain(self.chrome.terminals())
             .filter_map(|n| n.any_terminal().filter(|a| !self.live.contains_key(*a) && !self.ended_acp.contains_key(*a) && !self.just_born(a)).map(|a| (n.id.clone(), a.to_owned())))
             .collect::<Vec<_>>();
@@ -3247,7 +3559,7 @@ impl AppWindow {
             self.check_closed(missing, window, cx);
         }
         let mut orphans = self.live.iter()
-            .filter(|(a, r)| !is_acp_addr(a) && r.get("acp").and_then(Value::as_bool) != Some(true) && !is_trashed_record(r))
+            .filter(|(a, r)| !is_acp_addr(a) && r.get("acp").and_then(Value::as_bool) != Some(true) && !is_trashed_record(r) && !is_side_chat_record(r))
             .filter(|(a, _)| self.model.pane_of(a).is_none() && !self.changing_terminals.contains(*a) && !self.closing_terminals.contains_key(*a))
             .filter_map(|(a, r)| {
                 let machine = a.split_once('/').map(|(m, _)| m);
@@ -3279,7 +3591,7 @@ impl AppWindow {
         for addr in unmounted_acp {
             let _ = self.keep_terminal_with_focus(&addr, "tab", false, window, cx);
         }
-        false
+        evicted_side_chat
     }
 
     fn start_adoption(&mut self, addr: String, space: String, tab: Option<String>, window: &mut Window, cx: &mut Context<Self>) {
@@ -3679,7 +3991,7 @@ impl AppWindow {
     }
 
     /// Starts an ACP agent directly inside a dedicated tab and optionally focuses it.
-    fn new_acp_tab(&mut self, space: Option<String>, name: &str, folder: Option<String>, agent: &str, focus: bool, window: &mut Window, cx: &mut Context<Self>) -> Result<Value, String> {
+    fn new_acp_tab(&mut self, space: Option<String>, name: &str, folder: Option<String>, agent: &str, task: Option<&str>, focus: bool, window: &mut Window, cx: &mut Context<Self>) -> Result<Value, String> {
         let agent_key = agent.trim();
         if agent_key.is_empty() {
             return Err("tab.new acp requires agent".into());
@@ -3718,6 +4030,9 @@ impl AppWindow {
                 "herdr.parked": ""
             }
         });
+        if let Some(prompt) = task.map(str::trim).filter(|s| !s.is_empty()) {
+            params["prompt"] = json!(prompt);
+        }
         if !space_folder.is_empty() {
             params["cwd"] = json!(space_folder);
         }
@@ -3969,6 +4284,16 @@ impl AppWindow {
     }
 
     fn keep_terminal_with_focus(&mut self, addr: &str, place: &str, focus: bool, window: &mut Window, cx: &mut Context<Self>) -> Result<Value, String> {
+        if self.is_side_chat(addr) {
+            if self.evict_side_chat_from_tabs(addr, cx) {
+                self.sync(window, cx);
+                self.flush_documents(false, window, cx);
+            }
+            if focus {
+                self.open_side_chat_panel(addr, window, cx);
+            }
+            return Ok(json!({ "side_chat": addr }));
+        }
         let is_acp = is_acp_addr(addr);
         let addr_machine = addr.split_once('/').map(|(m, _)| m);
         let wt_path = self.fork_worktree_info(addr).map(|(p, _, _)| p);
@@ -5318,6 +5643,14 @@ impl AppWindow {
             self.open_side_chat_panel(addr, window, cx);
             return Ok(());
         }
+        if is_side_chat {
+            let zh = settings::get().language == settings::Language::ZhCn;
+            return Err(if zh {
+                "已结束的旁路会话不能恢复为标签页，请在其父 Agent 的右侧旁路面板重新发起旁路讨论".into()
+            } else {
+                "exited side-chat cannot be restored as a tab; start a new side-chat from its parent agent".into()
+            });
+        }
 
         if is_live {
             let ctx_id = self.model.fresh_id_on("tb", on);
@@ -5900,7 +6233,7 @@ impl AppWindow {
                     Some(m) => self.new_mod_tab(Self::owned(a, "space"), name, m, a.get("props").cloned().unwrap_or(Value::Null), focus),
                     None if acp => {
                         let Some(agent) = Self::owned(a, "agent") else { return self.fail("tab.new acp needs agent") };
-                        self.new_acp_tab(Self::owned(a, "space"), name, Self::owned(a, "folder"), &agent, focus, window, cx)
+                        self.new_acp_tab(Self::owned(a, "space"), name, Self::owned(a, "folder"), &agent, Self::arg(a, "task"), focus, window, cx)
                     }
                     // A person's new tab with no space open starts one, as space.new does.
                     None if person && a.get("space").is_none() && self.model.active_space().is_none() => {
@@ -6110,6 +6443,14 @@ impl AppWindow {
                 self.reply = Some(json!({ "tab": new_tab_id, "pane": pane }));
             }
             "pane.focus" => {
+                if let Some(terminal) = Self::arg(a, "terminal")
+                    && self.is_side_chat(terminal)
+                {
+                    let addr = terminal.to_owned();
+                    self.evict_side_chat_from_tabs(&addr, cx);
+                    self.open_side_chat_panel(&addr, window, cx);
+                    return;
+                }
                 if Self::arg(a, "pane").is_none()
                     && let Some(terminal) = Self::arg(a, "terminal")
                     && let Some(block) = self.chrome.visible_blocks().into_iter().find(|n| n.terminal() == Some(terminal))
@@ -6130,6 +6471,13 @@ impl AppWindow {
                 }
                 let pane = Self::owned(a, "pane").or_else(|| Self::arg(a, "terminal").and_then(|t| self.model.any_pane_of(t)));
                 let Some(p) = pane.filter(|p| self.model.tab_of(p).is_some()) else { return self.fail("no such pane") };
+                if let Some(addr) = self.model.any_address_of(&p)
+                    && self.is_side_chat(&addr)
+                {
+                    self.evict_side_chat_from_tabs(&addr, cx);
+                    self.open_side_chat_panel(&addr, window, cx);
+                    return;
+                }
                 self.focused_block = None;
                 self.model.focus_pane(&p);
                 self.focused_pane = None;
@@ -6393,6 +6741,15 @@ impl AppWindow {
                 if matches!(self.rename_focus, RenameFocus::Agent(_)) {
                     self.rename_focus = RenameFocus::Agent(Some(t.clone()));
                 }
+                if self.is_side_chat(&t) {
+                    self.close_overlay("terminal-peek", window, cx);
+                    if self.evict_side_chat_from_tabs(&t, cx) {
+                        self.sync(window, cx);
+                        self.flush_documents(false, window, cx);
+                    }
+                    self.open_side_chat_panel(&t, window, cx);
+                    return;
+                }
                 let is_acp = is_acp_addr(&t)
                     || self.live.get(&t).and_then(|r| r.get("acp")).and_then(Value::as_bool) == Some(true);
                 if is_acp {
@@ -6553,6 +6910,23 @@ impl AppWindow {
                     next.map_or_else(String::new, |s| format!("{s}@{turn}")),
                     cx,
                 );
+            }
+            "agent.briefing" => {
+                let away_minutes = a.get("away_minutes").and_then(Value::as_u64);
+                mods::set_shared("briefing.away".into(), Value::Null);
+                let mut props = json!({ "briefing": true });
+                if let Some(mins) = away_minutes {
+                    props["awayMinutes"] = json!(mins);
+                }
+                let spec = json!({
+                    "mod": "agents",
+                    "kind": "dialog",
+                    "key": "catchup-briefing",
+                    "width": 740,
+                    "height": 580,
+                    "props": props,
+                });
+                self.open_overlay(mods::new_overlay_id(), spec, window, cx);
             }
             "agent.handoff" => {
                 let source = Self::owned(a, "source")
@@ -6822,7 +7196,15 @@ impl AppWindow {
                                             this.cwds.entry(target.clone()).or_insert_with(|| wt.clone());
                                         }
                                         mods::publish_terminals(this.ordered_live_values());
-                                        if let Some(ref wt) = wt_path {
+                                        let created_side_chat = kind.eq_ignore_ascii_case("side-chat")
+                                            || kind.eq_ignore_ascii_case("side_chat")
+                                            || this.is_side_chat(&target);
+                                        if created_side_chat {
+                                            this.evict_side_chat_from_tabs(&target, cx);
+                                            if open != "none" {
+                                                this.open_side_chat_panel(&target, window, cx);
+                                            }
+                                        } else if let Some(ref wt) = wt_path {
                                             let target_machine = target.split_once('/').map(|(m, _)| m);
                                             match open.as_str() {
                                                 "none" => {
@@ -7054,13 +7436,13 @@ impl AppWindow {
                                         }),
                                     );
                                     let is_zh = settings::get().language == settings::Language::ZhCn;
-                                    let title = if is_zh { "已发送行级代码审查意见" } else { "Diff review sent" };
+                                    let title = if is_zh { "已发送文件行级消息" } else { "Line notes sent" };
                                     let body = if is_zh {
-                                        format!("已将 {comment_count} 条评论（{file_count} 个文件）回流至 {resolved_target}，点击跳转查看。")
+                                        format!("已将 {comment_count} 条行级消息（{file_count} 个文件）发送至 {resolved_target}，点击跳转查看。")
                                     } else {
-                                        let cw = if comment_count == 1 { "comment" } else { "comments" };
+                                        let nw = if comment_count == 1 { "note" } else { "notes" };
                                         let fw = if file_count == 1 { "file" } else { "files" };
-                                        format!("Sent {comment_count} {cw} ({file_count} {fw}) to {resolved_target}. Click to focus.")
+                                        format!("Sent {comment_count} {nw} ({file_count} {fw}) to {resolved_target}. Click to focus.")
                                     };
                                     let notification = json!({
                                         "title": title,
@@ -7220,6 +7602,18 @@ impl AppWindow {
                 if s == "panel-body" && ch != "side-chat" {
                     self.side_panel_auto_hidden = false;
                 }
+            }
+            "files.open" => {
+                let raw_path = Self::arg(a, "path").unwrap_or_default();
+                if raw_path.trim().is_empty() {
+                    return self.fail("files.open: path is required");
+                }
+                let line = a.get("line").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0);
+                let end_line = a.get("end_line").and_then(Value::as_u64).and_then(|n| u32::try_from(n).ok()).filter(|n| *n > 0);
+                let on = Self::arg(a, "on").filter(|s| !s.is_empty());
+                let cwd = Self::arg(a, "cwd").filter(|s| !s.is_empty());
+                self.open_file_in_panel(raw_path, line, end_line, on, cwd, window, cx);
+                return;
             }
             "mod.open" => {
                 let name = Self::arg(a, "name").unwrap_or_default();
@@ -7560,13 +7954,16 @@ impl AppWindow {
         let parent_addr = self
             .live
             .get(address)
+            .or_else(|| self.ended_acp.get(address))
             .and_then(|r| r.pointer("/lineage/parent").or_else(|| r.get("parent")))
             .and_then(Value::as_str)
             .map(|p| Self::resolve_peer_addr(p, address))
             .filter(|p| !p.is_empty());
         if let Some(ref p_addr) = parent_addr
+            && p_addr != address
+            && !self.is_side_chat(p_addr)
             && self.focused_main_terminal().as_deref() != Some(p_addr.as_str())
-            && self.live.contains_key(p_addr)
+            && (self.live.contains_key(p_addr) || self.ended_acp.contains_key(p_addr))
         {
             self.dispatch("agent.focus", &json!({ "terminal": p_addr }), false, window, cx);
         }
@@ -7585,6 +7982,116 @@ impl AppWindow {
         } else {
             let parent = parent_addr.unwrap_or_default();
             self.open_side_chat_window(address, &parent, window, cx);
+        }
+    }
+
+    fn open_file_in_panel(
+        &mut self,
+        raw_path: &str,
+        line: Option<u32>,
+        end_line: Option<u32>,
+        on: Option<&str>,
+        cwd: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let trimmed = raw_path.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let active_space = self.model.active_space();
+        let effective_on = on
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| active_space.and_then(|s| s.machine.clone()));
+        let base_cwd = cwd
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .or_else(|| {
+                self.focused_pane
+                    .as_deref()
+                    .and_then(|pid| self.terms.get(pid))
+                    .and_then(|t| self.cwds.get(&t.address).cloned())
+            })
+            .or_else(|| active_space.map(|s| s.folder.clone()));
+
+        let resolved = if effective_on.is_none() {
+            let expanded = if let Some(rest) = trimmed.strip_prefix("~/") {
+                std::env::home_dir()
+                    .map(|h| h.join(rest))
+                    .unwrap_or_else(|| std::path::PathBuf::from(trimmed))
+            } else {
+                std::path::PathBuf::from(trimmed)
+            };
+            let joined = if expanded.is_absolute() {
+                expanded
+            } else if let Some(ref base) = base_cwd {
+                std::path::Path::new(base).join(expanded)
+            } else {
+                expanded
+            };
+            let mut normalized = std::path::PathBuf::new();
+            for comp in joined.components() {
+                match comp {
+                    std::path::Component::CurDir => {}
+                    std::path::Component::ParentDir => {
+                        normalized.pop();
+                    }
+                    other => normalized.push(other),
+                }
+            }
+            if normalized.is_dir() {
+                crate::links::open(&crate::links::Target::File(normalized));
+                return;
+            }
+            normalized.to_string_lossy().into_owned()
+        } else if trimmed.starts_with('/') || trimmed.starts_with("~/") {
+            trimmed.to_owned()
+        } else if let Some(ref base) = base_cwd {
+            format!("{}/{}", base.trim_end_matches('/'), trimmed.trim_start_matches("./"))
+        } else {
+            trimmed.to_owned()
+        };
+
+        self.file_open_seq = self.file_open_seq.wrapping_add(1).max(1);
+        mods::set_shared(
+            "files.open_request".to_string(),
+            json!({
+                "seq": self.file_open_seq,
+                "path": resolved,
+                "line": line,
+                "end_line": end_line,
+                "on": effective_on,
+            }),
+        );
+        if self.chrome.find("files").is_some() {
+            self.dispatch("layout.select", &json!({ "stack": "panel-body", "child": "files" }), false, window, cx);
+            self.dispatch("layout.show", &json!({ "id": "panel" }), false, window, cx);
+            self.refresh_snapshot_mods(cx);
+            self.publish(cx);
+            cx.notify();
+        } else {
+            self.open_overlay(
+                "files-preview".to_string(),
+                json!({
+                    "kind": "window",
+                    "key": "files-preview",
+                    "resizable": true,
+                    "width": 720,
+                    "height": 640,
+                    "mod": "files",
+                    "props": {
+                        "file": resolved,
+                        "line": line,
+                        "end_line": end_line,
+                        "on": effective_on,
+                    }
+                }),
+                window,
+                cx,
+            );
         }
     }
 
@@ -7637,15 +8144,13 @@ impl AppWindow {
 
     fn peek_terminal(&mut self, address: &str, window: &mut Window, cx: &mut Context<Self>) {
         self.close_overlay("terminal-peek", window, cx);
-        let is_side_chat = self
-            .live
-            .get(address)
-            .and_then(|r| r.pointer("/lineage/kind"))
-            .and_then(Value::as_str)
-            == Some("side-chat");
         let is_acp = is_acp_addr(address)
             || self.live.get(address).and_then(|r| r.get("acp")).and_then(Value::as_bool) == Some(true);
-        if is_side_chat && self.model.any_pane_of(address).is_none() {
+        if self.is_side_chat(address) {
+            if self.evict_side_chat_from_tabs(address, cx) {
+                self.sync(window, cx);
+                self.flush_documents(false, window, cx);
+            }
             self.open_side_chat_panel(address, window, cx);
             return;
         }
@@ -7917,8 +8422,63 @@ impl AppWindow {
         if active != self.window_active {
             self.window_active = active;
             if active {
+                if let Some(blurred_at) = self.blurred_at.take() {
+                    let away_secs = now.saturating_duration_since(blurred_at).as_secs();
+                    const DEFAULT_AWAY_SECS: u64 = 300;
+                    if away_secs >= DEFAULT_AWAY_SECS {
+                        let mut changed_count = 0usize;
+                        for (addr, rec) in &self.live {
+                            if is_trashed_record(rec) {
+                                continue;
+                            }
+                            let cur = self
+                                .model
+                                .status(addr)
+                                .map(str::to_owned)
+                                .or_else(|| rec.get("status").and_then(Value::as_str).map(str::to_owned))
+                                .unwrap_or_default();
+                            if matches!(cur.as_str(), "blocked" | "done" | "error")
+                                && self.away_statuses.get(addr).map(String::as_str) != Some(cur.as_str())
+                            {
+                                changed_count += 1;
+                            }
+                        }
+                        if changed_count > 0 {
+                            let away_minutes = (away_secs / 60).max(1);
+                            let triggered_at = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map_or(0, |d| d.as_millis() as u64);
+                            mods::set_shared(
+                                "briefing.away".into(),
+                                json!({
+                                    "away_ms": away_secs * 1000,
+                                    "away_minutes": away_minutes,
+                                    "changed_count": changed_count,
+                                    "triggered_at": triggered_at,
+                                }),
+                            );
+                        }
+                    }
+                    self.away_statuses.clear();
+                }
                 self.sync(window, cx);
             } else {
+                self.blurred_at = Some(now);
+                self.away_statuses.clear();
+                for (addr, rec) in &self.live {
+                    if is_trashed_record(rec) {
+                        continue;
+                    }
+                    let cur = self
+                        .model
+                        .status(addr)
+                        .map(str::to_owned)
+                        .or_else(|| rec.get("status").and_then(Value::as_str).map(str::to_owned))
+                        .unwrap_or_default();
+                    if !cur.is_empty() {
+                        self.away_statuses.insert(addr.clone(), cur);
+                    }
+                }
                 self.looked.clear();
             }
             // Tell mods now: render publishes window() too, but a mod it refreshes
@@ -8974,6 +9534,14 @@ fn is_acp_subagent(rec: &Value) -> bool {
             .is_some_and(|s| !s.trim().is_empty())
 }
 
+fn is_side_chat_record(rec: &Value) -> bool {
+    rec.pointer("/lineage/kind")
+        .and_then(Value::as_str)
+        .map(|k| k.to_ascii_lowercase().replace('_', "-"))
+        .as_deref()
+        == Some("side-chat")
+}
+
 /// Returns whether `reconcile` should auto-mount an unmounted live ACP agent into its own tab.
 /// Sub-agents stay in the background under their main agent unless explicitly labeled with `herdr.space`.
 fn should_auto_mount_acp(rec: &Value) -> bool {
@@ -8983,13 +9551,7 @@ fn should_auto_mount_acp(rec: &Value) -> bool {
     if rec.pointer("/labels/herdr.parked").and_then(Value::as_str) == Some("1") {
         return false;
     }
-    if rec
-        .pointer("/lineage/kind")
-        .and_then(Value::as_str)
-        .map(|k| k.to_ascii_lowercase().replace('_', "-"))
-        .as_deref()
-        == Some("side-chat")
-    {
+    if is_side_chat_record(rec) {
         return false;
     }
     let has_explicit_space = rec
@@ -9047,7 +9609,7 @@ fn effective_running_argv(rec: &serde_json::Map<String, Value>, child_seen: bool
 /// it still runs. A listing taken just before it ended still shows it running,
 /// and labels outlive the program: putting it back would show a dead pane.
 fn adoptable(record: &Value, space: &str, tab: Option<&str>, machine: Option<&str>) -> bool {
-    if record["acp"] == true || record["address"].as_str().is_some_and(is_acp_addr) {
+    if record["acp"] == true || record["address"].as_str().is_some_and(is_acp_addr) || is_side_chat_record(record) {
         return false;
     }
     let label = record.pointer("/labels/herdr.space").and_then(Value::as_str);
@@ -11669,6 +12231,36 @@ export default class SystemToast extends View {
             assert!(this.model.any_pane_of("a9").is_none(), "restored side-chat must not open as a top tab");
             assert_eq!(this.model.space("space").unwrap().tabs.len(), tabs_before);
             assert_eq!(crate::mods::shared("side-chat.active"), Some(json!("a9")));
+
+            // terminal.keep / agent.focus / terminal.peek on a side-chat must never mount it in a tab.
+            for (cmd, args) in [
+                ("terminal.keep", json!({ "terminal": "a9", "place": "tab" })),
+                ("terminal.keep", json!({ "terminal": "a9", "place": "right" })),
+                ("agent.focus", json!({ "terminal": "a9" })),
+                ("terminal.peek", json!({ "terminal": "a9" })),
+            ] {
+                let res = this.run_as(cmd, args, true, window, cx);
+                assert!(res.get("error").is_none(), "{cmd}: {res}");
+                assert!(this.model.any_pane_of("a9").is_none(), "{cmd} mounted side-chat in a tab");
+                assert_eq!(this.model.space("space").unwrap().tabs.len(), tabs_before);
+                assert_eq!(crate::mods::shared("side-chat.active"), Some(json!("a9")));
+            }
+
+            // If a side-chat ever slipped into a tab (e.g. from a persisted layout), reconcile evicts it.
+            this.model.add_tab("space", super::Tab::with_pane("tb-sc", "side", super::AppWindow::acp_pane_node("p-sc", "a9")));
+            assert!(this.model.any_pane_of("a9").is_some());
+            assert!(this.reconcile(window, cx));
+            assert!(this.model.any_pane_of("a9").is_none(), "reconcile must evict side-chat from tabs");
+
+            // PTY side-chats are never adoptable into tabs even if labeled with herdr.space.
+            let pty_side_chat = json!({
+                "address": "t9",
+                "state": "live",
+                "parent": "term-a",
+                "lineage": { "kind": "side-chat", "parent": "term-a" },
+                "labels": { "herdr.space": "space" }
+            });
+            assert!(!super::adoptable(&pty_side_chat, "space", None, None));
 
             // Dead/exited agent key and shell-wrapped argv normalization.
             assert_eq!(super::AppWindow::normalize_agent_program_key("claude-code"), "claude");

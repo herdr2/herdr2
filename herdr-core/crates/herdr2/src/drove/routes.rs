@@ -279,6 +279,8 @@ pub(super) async fn worker_done_http(
     body: &Value,
 ) -> Result<Value, ApiErr> {
     let att = authenticate_worker(&core.drove, headers, body)?;
+    core.drove.clear_loop_watermark(&att.id);
+    core.ai.evict_session(&format!("drove:loop:{}", att.id));
     let run = core
         .drove
         .store
@@ -513,6 +515,31 @@ pub(super) async fn add_tasks_http(
         return Err(ApiErr::new(400, "bad_request", "at least one task is required"));
     }
 
+    let mut worktree_warning: Option<String> = None;
+    let skip_preflight = body["skipWorktreePreflight"].as_bool() == Some(true);
+    if !skip_preflight {
+        let cfg = core.drove.config_snapshot();
+        let existing_tasks = core.drove.store.list_tasks(&run.id);
+        if tasks_need_worktree_preflight(&cfg, &existing_tasks, &raw_list) {
+            let cwd_check = run.cwd.clone();
+            let check = tokio::task::spawn_blocking(move || {
+                super::integrate::check_drove_worktree_ready(&cwd_check)
+            })
+            .await
+            .map_err(|e| ApiErr::new(500, "internal", format!("preflight join error: {e}")))?;
+            match check {
+                Ok(ok) => worktree_warning = ok.dirty_warning,
+                Err(blocker) => {
+                    return Err(ApiErr::new(
+                        422,
+                        "worktree_not_ready",
+                        format!("{} | 建议处理：{}", blocker.message, blocker.fix_hint),
+                    ));
+                }
+            }
+        }
+    }
+
     let existing_keys: BTreeSet<String> = core
         .drove
         .store
@@ -610,7 +637,101 @@ pub(super) async fn add_tasks_http(
     }
 
     core.drove.wake_scheduler();
-    Ok(json!({ "tasks": created }))
+    let mut out = json!({ "tasks": created });
+    if let Some(warn) = worktree_warning {
+        out["worktreeWarning"] = Value::String(warn);
+    }
+    Ok(out)
+}
+
+/// Returns true when submitted tasks explicitly request `isolation: worktree`, or when
+/// `conflictPolicy == "auto_worktree"` and >= 2 writable tasks may execute concurrently.
+pub(super) fn tasks_need_worktree_preflight(
+    cfg: &DroveConfig,
+    existing_tasks: &[Task],
+    raw_incoming: &[Value],
+) -> bool {
+    let is_writable_role = |role: Option<&str>| -> bool {
+        let (_, _, access, _) = super::config::role_spec_for(cfg, role);
+        access != RoleAccessMode::Readonly
+    };
+
+    let mut incoming_writers = 0usize;
+    for raw in raw_incoming {
+        let iso = raw["isolation"].as_str().map(|s| s.trim().to_ascii_lowercase());
+        if iso.as_deref() == Some("worktree") {
+            return true;
+        }
+        if raw["kind"].as_str() == Some("exec") {
+            continue;
+        }
+        let role = raw["role"]
+            .as_str()
+            .or_else(|| raw["assign"]["role"].as_str());
+        if is_writable_role(role) {
+            let count = raw
+                .get("foreach")
+                .and_then(Value::as_array)
+                .map_or(1, |a| a.len().max(1));
+            incoming_writers += count;
+        }
+    }
+
+    if cfg.ai.conflict_policy != "auto_worktree" {
+        return false;
+    }
+
+    let existing_live_writers = existing_tasks
+        .iter()
+        .filter(|t| {
+            !super::scheduler::is_terminal_status(t.status)
+                && t.kind.as_deref() != Some("exec")
+                && t.template != Some(true)
+                && is_writable_role(t.assign.as_ref().and_then(|a| a.role.as_deref()))
+        })
+        .count();
+
+    if existing_live_writers + incoming_writers < 2 {
+        return false;
+    }
+
+    // If incoming tasks form a strict linear chain (every subsequent writable task declares deps)
+    // and there are no existing live writers, they won't overlap in parallel.
+    if existing_live_writers == 0 {
+        let root_writers = raw_incoming
+            .iter()
+            .filter(|raw| {
+                raw["kind"].as_str() != Some("exec")
+                    && is_writable_role(raw["role"].as_str().or_else(|| raw["assign"]["role"].as_str()))
+                    && raw["deps"].as_array().is_none_or(|d| d.is_empty())
+            })
+            .map(|raw| {
+                raw.get("foreach")
+                    .and_then(Value::as_array)
+                    .map_or(1, |a| a.len().max(1))
+            })
+            .sum::<usize>();
+        if root_writers < 2 {
+            // Check if any two incoming writers share the same dep (fan-out).
+            let mut by_dep: BTreeMap<String, usize> = BTreeMap::new();
+            for raw in raw_incoming {
+                if raw["kind"].as_str() == Some("exec")
+                    || !is_writable_role(raw["role"].as_str().or_else(|| raw["assign"]["role"].as_str()))
+                {
+                    continue;
+                }
+                if let Some(deps) = raw["deps"].as_array() {
+                    for d in deps.iter().filter_map(Value::as_str) {
+                        *by_dep.entry(d.to_string()).or_default() += 1;
+                    }
+                }
+            }
+            if !by_dep.values().any(|&c| c >= 2) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 fn normalize_run_task_deps(core: &Arc<Core>, run_id: &str) {

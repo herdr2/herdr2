@@ -111,4 +111,5 @@ Use the `h2` CLI directly together with your host's shell / background command r
 - Side-by-side coexistence: `herdr2`/`h2` uses completely separate binaries, env vars (`H2_*`), sockets, and state paths from legacy `herdr-core`/`hc`.
 - Never call `h2 server stop` or `h2 server restart` on a shared session unless requested; tests must use a dedicated `H2_SESSION` and scratch XDG paths.
 - `h2 drove status|web|probe` manages native Drove role-based multi-agent orchestration (Workers appear as `a*` sub-agents).
+- `h2 ai status|settings-set|test` inspects, updates, or tests the shared Core AI assistant (KV-cache metrics, terminal state arbitration, and Drove/notes helpers).
 - Exit codes: `2` usage, `3` not_found, `4` machine_unknown, `5` unavailable, `6` invalid_params, `7` needs_target, `8` config, `9` blocked, `10` status_mismatch, `11` finished, `124` waited run/exec timeout.

@@ -34,7 +34,19 @@ fn wait_web_port(s: &Session) -> (u16, PathBuf) {
 }
 
 fn read_coordinator_secret(key_file: &std::path::Path) -> String {
-    let token_path = key_file.parent().unwrap().join("coordinator.token");
+    let direct = key_file.parent().unwrap().join("coordinator.token");
+    let token_path = if direct.exists() {
+        direct
+    } else {
+        // Core AI key lives at `<state>/secrets/ai.key`, while Drove coordinator token lives at `<state>/drove/secrets/coordinator.token`.
+        key_file
+            .parent()
+            .and_then(|p| p.parent())
+            .unwrap()
+            .join("drove")
+            .join("secrets")
+            .join("coordinator.token")
+    };
     std::fs::read_to_string(&token_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", token_path.display()))
         .trim()
@@ -2386,4 +2398,123 @@ fn drove_roles_ai_configure_and_strengths_persist_end_to_end() {
         agents_json["profile"]["roles"]["coder"]["candidates"][0]["strengths"],
         json!(["后端架构", "复杂重构"])
     );
+}
+
+#[test]
+fn core_ai_cli_and_worktree_preflight_guard() {
+    let s = drove_session();
+    let (port, key_file) = wait_web_port(&s);
+    let coord_tok = read_coordinator_secret(&key_file);
+
+    // 1. Shared Core AI CLI (`h2 ai status` + `h2 ai settings-set`).
+    let ai_status = s.json(&["ai", "status"]);
+    assert_eq!(ai_status["switches"]["ptyStatusArbitration"], true);
+    assert_eq!(ai_status["switches"]["notesDigest"], true);
+    assert_eq!(ai_status["switches"]["promptCacheEnabled"], true);
+    assert!(ai_status["usage"].is_object());
+
+    let ai_patch = s.root.join("ai-patch.json");
+    std::fs::write(
+        &ai_patch,
+        serde_json::to_vec(&json!({
+            "ptyStatusArbitration": false,
+            "notesDigest": true,
+            "effort": "low"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let updated_ai = s.json(&["ai", "settings-set", "--file", ai_patch.to_str().unwrap(), "--consume"]);
+    assert_eq!(updated_ai["switches"]["ptyStatusArbitration"], false);
+    assert!(!ai_patch.exists(), "--consume should delete temp json file");
+
+    // 2. POST /api/preflight/worktree catches non-git, unborn HEAD, and dirty warnings.
+    let auth_hdrs = [
+        ("x-drove-coordinator-secret", coord_tok.as_str()),
+        ("x-drove-coordinator", "t1"),
+    ];
+    let plain_dir = s.root.join("plain_dir");
+    std::fs::create_dir_all(&plain_dir).unwrap();
+    let r1 = http_req(
+        port,
+        "POST",
+        "/api/preflight/worktree",
+        &auth_hdrs,
+        Some(&json!({ "cwd": plain_dir.to_string_lossy(), "force": true })),
+    );
+    assert_eq!(r1.status, 422, "preflight plain_dir: {}", r1.body);
+    let j1: Value = serde_json::from_str(&r1.body).unwrap();
+    assert_eq!(j1["error"], "worktree_not_ready");
+    assert!(j1["message"].as_str().unwrap_or("").contains("Git"));
+
+    let empty_git = s.root.join("empty_git");
+    std::fs::create_dir_all(&empty_git).unwrap();
+    assert!(std::process::Command::new("git").args(["init"]).current_dir(&empty_git).output().unwrap().status.success());
+    let r2 = http_req(
+        port,
+        "POST",
+        "/api/preflight/worktree",
+        &auth_hdrs,
+        Some(&json!({ "cwd": empty_git.to_string_lossy(), "force": true })),
+    );
+    assert_eq!(r2.status, 422, "preflight empty_git: {}", r2.body);
+    let j2: Value = serde_json::from_str(&r2.body).unwrap();
+    assert_eq!(j2["error"], "worktree_not_ready");
+
+    // Ready repo with uncommitted modification -> 200 ok + non-blocking dirtyWarning.
+    let dirty_git = s.root.join("dirty_git");
+    std::fs::create_dir_all(&dirty_git).unwrap();
+    std::fs::write(dirty_git.join("a.txt"), "v1\n").unwrap();
+    for args in [
+        &["init"][..],
+        &["config", "user.email", "t@drove.local"][..],
+        &["config", "user.name", "Drove Test"][..],
+        &["add", "."][..],
+        &["commit", "-m", "init"][..],
+    ] {
+        assert!(std::process::Command::new("git").arg("-C").arg(&dirty_git).args(args).output().unwrap().status.success());
+    }
+    std::fs::write(dirty_git.join("a.txt"), "v2-uncommitted\n").unwrap();
+    let r3 = http_req(
+        port,
+        "POST",
+        "/api/preflight/worktree",
+        &auth_hdrs,
+        Some(&json!({ "cwd": dirty_git.to_string_lossy(), "force": true })),
+    );
+    assert_eq!(r3.status, 200, "preflight dirty_git: {}", r3.body);
+    let j3: Value = serde_json::from_str(&r3.body).unwrap();
+    assert_eq!(j3["ok"], true);
+    assert_eq!(j3["checked"], true);
+    assert!(j3["dirtyWarning"].as_str().is_some_and(|w| !w.is_empty()));
+
+    // 3. Adding worktree tasks to a Run rooted in plain_dir returns 422 worktree_not_ready.
+    let created = http_req(
+        port,
+        "POST",
+        "/api/runs",
+        &auth_hdrs,
+        Some(&json!({ "hostSession": "t1", "objective": "preflight test", "cwd": plain_dir.to_string_lossy() })),
+    );
+    assert_eq!(created.status, 200, "create run: {}", created.body);
+    let run_id = serde_json::from_str::<Value>(&created.body).unwrap()["id"].as_str().unwrap().to_string();
+
+    let blocked = http_req(
+        port,
+        "POST",
+        &format!("/api/runs/{run_id}/tasks"),
+        &auth_hdrs,
+        Some(&json!({
+            "tasks": [{
+                "key": "wt_fail",
+                "title": "Needs worktree",
+                "isolation": "worktree",
+                "spec": { "target": "a.txt", "change": "x", "acceptance": "y" }
+            }]
+        })),
+    );
+    assert_eq!(blocked.status, 422, "expected 422 worktree_not_ready: {}", blocked.body);
+    let bj: Value = serde_json::from_str(&blocked.body).unwrap();
+    assert_eq!(bj["error"], "worktree_not_ready");
+    assert!(bj["message"].as_str().unwrap_or("").contains("Git"));
 }

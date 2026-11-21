@@ -1,6 +1,7 @@
 pub mod acp;
 pub mod addr;
 pub mod agents;
+pub mod ai;
 pub mod api;
 pub mod attach;
 pub mod checkpoint;

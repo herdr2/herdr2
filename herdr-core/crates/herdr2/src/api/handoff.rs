@@ -72,32 +72,98 @@ pub(super) async fn agent_handoff(core: Ctx<'_>, p: HandoffParams) -> Result<Han
     let src_prov_pkg = src.provider.clone();
     let src_sid_pkg = src.session_id.clone();
     let src_model_pkg = src.model.clone();
-    let from_turn = p.from_turn;
     let to_turn = p.to_turn;
+    let from_turn = match (p.from_turn, p.recent_turns) {
+        (Some(f), _) => Some(f),
+        (None, Some(n)) if n > 0 => resolve_recent_from_turn(&src.entries, to_turn, n),
+        _ => None,
+    };
+    let max_bytes = p.max_bytes.unwrap_or(DEFAULT_HANDOFF_MAX_BYTES);
     let note_pkg = p.note.clone();
     let is_zh = p
         .language
         .as_deref()
         .is_some_and(|l| l.trim().to_ascii_lowercase().starts_with("zh"));
 
-    let pkg = blocking(move || {
-        Ok(build_handoff_package(&HandoffBuildInput {
-            kind,
-            source_address: &src_addr_pkg,
-            source_provider: src_prov_pkg.as_deref(),
-            source_session_id: src_sid_pkg.as_deref(),
-            source_model: src_model_pkg.as_deref(),
-            cwd: (!cwd_for_pkg.is_empty()).then_some(cwd_for_pkg.as_str()),
-            entries: &entries_for_pkg,
-            from_turn,
-            to_turn,
-            max_bytes: DEFAULT_HANDOFF_MAX_BYTES,
-            note: note_pkg.as_deref(),
+    let mut pkg = {
+        let cwd_for_pkg = cwd_for_pkg.clone();
+        let wt_origin_for_pkg = wt_origin_for_pkg.clone();
+        let entries_for_pkg = entries_for_pkg.clone();
+        let src_addr_pkg = src_addr_pkg.clone();
+        let src_prov_pkg = src_prov_pkg.clone();
+        let src_sid_pkg = src_sid_pkg.clone();
+        let src_model_pkg = src_model_pkg.clone();
+        let note_pkg = note_pkg.clone();
+        blocking(move || {
+            Ok(build_handoff_package(&HandoffBuildInput {
+                kind,
+                source_address: &src_addr_pkg,
+                source_provider: src_prov_pkg.as_deref(),
+                source_session_id: src_sid_pkg.as_deref(),
+                source_model: src_model_pkg.as_deref(),
+                cwd: (!cwd_for_pkg.is_empty()).then_some(cwd_for_pkg.as_str()),
+                entries: &entries_for_pkg,
+                from_turn,
+                to_turn,
+                max_bytes,
+                note: note_pkg.as_deref(),
+                is_zh,
+                worktree_origin: wt_origin_for_pkg.as_deref(),
+                omitted_summary: None,
+            }))
+        })
+        .await?
+    };
+
+    let mut distilled = false;
+    if !p.raw && p.into.is_none() && !pkg.omitted_turns.is_empty() && core.ai.handoff_distill_enabled() {
+        if let Some(summary) = crate::ai::distill_omitted_turns(
+            &core.ai,
+            &src.address,
+            &src.entries,
+            &pkg.omitted_turns,
             is_zh,
-            worktree_origin: wt_origin_for_pkg.as_deref(),
-        }))
-    })
-    .await?;
+        )
+        .await
+        {
+            let summary_bg = summary;
+            pkg = blocking(move || {
+                Ok(build_handoff_package(&HandoffBuildInput {
+                    kind,
+                    source_address: &src_addr_pkg,
+                    source_provider: src_prov_pkg.as_deref(),
+                    source_session_id: src_sid_pkg.as_deref(),
+                    source_model: src_model_pkg.as_deref(),
+                    cwd: (!cwd_for_pkg.is_empty()).then_some(cwd_for_pkg.as_str()),
+                    entries: &entries_for_pkg,
+                    from_turn,
+                    to_turn,
+                    max_bytes,
+                    note: note_pkg.as_deref(),
+                    is_zh,
+                    worktree_origin: wt_origin_for_pkg.as_deref(),
+                    omitted_summary: Some(&summary_bg),
+                }))
+            })
+            .await?;
+            distilled = true;
+        }
+    } else if !p.raw && p.into.is_some() && core.ai.handoff_distill_enabled() {
+        if let Some(merged_md) = crate::ai::distill_merge_back(
+            &core.ai,
+            &src.address,
+            p.kind,
+            &src.entries,
+            pkg.bytes,
+            is_zh,
+        )
+        .await
+        {
+            pkg.bytes = merged_md.len();
+            pkg.markdown = merged_md;
+            distilled = true;
+        }
+    }
 
     let turns_label = (!pkg.included_turns.is_empty()).then(|| format_turn_ranges(&pkg.included_turns));
     let mut lineage = Lineage {
@@ -105,7 +171,7 @@ pub(super) async fn agent_handoff(core: Ctx<'_>, p: HandoffParams) -> Result<Han
         parent: src.address.clone(),
         parent_provider: src.provider.clone(),
         parent_session_id: src.session_id.clone(),
-        from_turn: p.from_turn.or_else(|| pkg.included_turns.first().copied()),
+        from_turn: from_turn.or_else(|| pkg.included_turns.first().copied()),
         to_turn: p.to_turn.or_else(|| pkg.included_turns.last().copied()),
         artifact_path: None,
         worktree_path: created_worktree.as_ref().map(|(_, wt, _)| wt.clone()),
@@ -115,13 +181,13 @@ pub(super) async fn agent_handoff(core: Ctx<'_>, p: HandoffParams) -> Result<Han
     };
 
     if let Some(into_raw) = p.into.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        return handoff_into_existing(core, &p, &src, &pkg, &lineage, turns_label, into_raw).await;
+        return handoff_into_existing(core, &p, &src, &pkg, &lineage, turns_label, into_raw, distilled).await;
     }
 
     let res = if p.pty {
-        handoff_to_new_pty(core, &p, &src, &cwd, &pkg, &mut lineage, turns_label).await
+        handoff_to_new_pty(core, &p, &src, &cwd, &pkg, &mut lineage, turns_label, distilled).await
     } else {
-        handoff_to_new_acp(core, &p, &src, &cwd, &pkg, &lineage, turns_label).await
+        handoff_to_new_acp(core, &p, &src, &cwd, &pkg, &lineage, turns_label, distilled).await
     };
     if res.is_err()
         && let Some((orig, wt, br)) = created_worktree
@@ -132,6 +198,24 @@ pub(super) async fn agent_handoff(core: Ctx<'_>, p: HandoffParams) -> Result<Han
         .await;
     }
     res
+}
+
+pub(super) async fn ai_handoff_recommend(
+    core: Ctx<'_>,
+    p: crate::ai::HandoffRecommendParams,
+) -> Result<crate::ai::HandoffRecommendResult, RpcError> {
+    not_stopping(&core.lock())?;
+    let src = collect_source(core, &p.source).await?;
+    Ok(crate::ai::recommend_handoff(
+        &core.ai,
+        &src.address,
+        src.provider.as_deref(),
+        src.model.as_deref(),
+        &src.entries,
+        &p.installed_presets,
+        p.language.as_deref(),
+    )
+    .await)
 }
 
 async fn collect_source(core: &Arc<Core>, source: &str) -> Result<SourceSnapshot, RpcError> {
@@ -227,6 +311,7 @@ async fn collect_source(core: &Arc<Core>, source: &str) -> Result<SourceSnapshot
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handoff_into_existing(
     core: Ctx<'_>,
     p: &HandoffParams,
@@ -235,6 +320,7 @@ async fn handoff_into_existing(
     lineage: &Lineage,
     turns_label: Option<String>,
     into_raw: &str,
+    distilled: bool,
 ) -> Result<HandoffResult, RpcError> {
     let mut merge_instruction = String::new();
     let mut merged_wt_path: Option<String> = None;
@@ -433,6 +519,7 @@ async fn handoff_into_existing(
                 bytes: pkg.bytes,
                 artifact_path: None,
                 native_fork: false,
+                distilled,
                 prompt_sent,
                 worktree_path: merged_wt_path,
                 worktree_branch: merged_wt_branch,
@@ -514,6 +601,7 @@ async fn handoff_into_existing(
                 bytes: pkg.bytes,
                 artifact_path: Some(path_str),
                 native_fork: false,
+                distilled,
                 prompt_sent: sent.started != Some(false),
                 worktree_path: merged_wt_path,
                 worktree_branch: merged_wt_branch,
@@ -525,6 +613,7 @@ async fn handoff_into_existing(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handoff_to_new_pty(
     core: Ctx<'_>,
     p: &HandoffParams,
@@ -533,6 +622,7 @@ async fn handoff_to_new_pty(
     pkg: &crate::handoff::HandoffPackage,
     lineage: &mut Lineage,
     _turns_label: Option<String>,
+    distilled: bool,
 ) -> Result<HandoffResult, RpcError> {
     let preset = p
         .preset
@@ -748,6 +838,7 @@ async fn handoff_to_new_pty(
         bytes: pkg.bytes,
         artifact_path,
         native_fork,
+        distilled,
         prompt_sent,
         wait: wait_res,
     })
@@ -781,6 +872,7 @@ fn worktree_workspace_notice(lineage: &Lineage, is_zh: bool) -> Option<String> {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handoff_to_new_acp(
     core: Ctx<'_>,
     p: &HandoffParams,
@@ -789,6 +881,7 @@ async fn handoff_to_new_acp(
     pkg: &crate::handoff::HandoffPackage,
     lineage: &Lineage,
     turns_label: Option<String>,
+    distilled: bool,
 ) -> Result<HandoffResult, RpcError> {
     let (target_agent, target_argv) = if !p.argv.is_empty() {
         (p.preset.clone(), p.argv.clone())
@@ -938,7 +1031,51 @@ async fn handoff_to_new_acp(
         bytes: pkg.bytes,
         artifact_path: None,
         native_fork: false,
+        distilled,
         prompt_sent,
         wait: wait_res,
     })
+}
+
+fn resolve_recent_from_turn(entries: &[Entry], to_turn: Option<u64>, recent_turns: u64) -> Option<u64> {
+    if recent_turns == 0 {
+        return None;
+    }
+    let hi = to_turn.unwrap_or(u64::MAX);
+    let mut turns: Vec<u64> = entries.iter().filter_map(|e| e.turn().filter(|&t| t > 0 && t <= hi)).collect();
+    turns.sort_unstable();
+    turns.dedup();
+    if turns.is_empty() {
+        return None;
+    }
+    let keep = usize::try_from(recent_turns).unwrap_or(usize::MAX);
+    Some(turns[turns.len().saturating_sub(keep)])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_recent_from_turn;
+    use crate::transcript::Entry;
+
+    fn user_entry(turn: u64) -> Entry {
+        Entry::User { turn, from: None, text: format!("turn {turn}"), ts_ms: turn }
+    }
+
+    #[test]
+    fn resolve_recent_from_turn_selects_tail_turns() {
+        let entries: Vec<Entry> = (1..=10).map(user_entry).collect();
+        assert_eq!(resolve_recent_from_turn(&entries, None, 3), Some(8));
+        assert_eq!(resolve_recent_from_turn(&entries, None, 10), Some(1));
+        assert_eq!(resolve_recent_from_turn(&entries, None, 25), Some(1));
+        assert_eq!(resolve_recent_from_turn(&entries, Some(6), 2), Some(5));
+        assert_eq!(resolve_recent_from_turn(&entries, None, 0), None);
+        assert_eq!(resolve_recent_from_turn(&[], None, 5), None);
+    }
+
+    #[test]
+    fn resolve_recent_from_turn_handles_sparse_and_duplicate_turns() {
+        let entries = vec![user_entry(1), user_entry(1), user_entry(3), user_entry(7), user_entry(9)];
+        assert_eq!(resolve_recent_from_turn(&entries, None, 2), Some(7));
+        assert_eq!(resolve_recent_from_turn(&entries, None, 3), Some(3));
+    }
 }

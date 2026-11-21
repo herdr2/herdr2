@@ -1,8 +1,9 @@
 // Agents in grouped or priority views; parents take their most urgent sub-agent's place.
 
 import { View, div, image, svg } from "gpui-kit";
-import { v_flex, h_flex } from "gpui-base";
-import { agents, terminals, panes, focused, spaces, run, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout, settings } from "herdr";
+import { v_flex, h_flex, InputState, Input } from "gpui-base";
+import { agents, terminals, panes, focused, spaces, run, h2, checking, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout, settings } from "herdr";
+import { resolveSemanticLabel, buildHoverTooltip, buildLocalFallbackBriefing, mergeBriefingSnapshots } from "./briefing_model.js";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
@@ -131,6 +132,27 @@ export default class Agents extends View {
       this.handle?.focus?.();
       return;
     }
+    if (props()?.briefing) {
+      this.handle = cx.focus_handle?.();
+      this.handle?.focus?.();
+      this.briefingLoading = false;
+      this.coreBriefing = null;
+      this.briefingError = "";
+      this.workingExpanded = false;
+      this.batchBusy = new Set();
+      this.resolvedIds = new Set();
+      this.replyInputs = new Map();
+      this.replyTexts = new Map();
+      const awayShared = typeof shared === "function" ? shared("briefing.away") : null;
+      this.awayMinutes = Number(props()?.awayMinutes ?? awayShared?.away_minutes ?? 0) || null;
+      if (awayShared && typeof setShared === "function") {
+        setShared("briefing.away", null);
+      }
+      if (!(typeof checking === "function" && checking())) {
+        this.refreshBriefing(cx);
+      }
+      return;
+    }
     this.folded = new Set();
     // Each agent's last state and when it changed (ms), kept across restarts.
     try { this.changed = JSON.parse(localStorage.getItem("changed") ?? "{}"); } catch { this.changed = {}; }
@@ -143,8 +165,71 @@ export default class Agents extends View {
     this.firstSeenSeq = 0;
     this.hovered = null;
     this.hoveredSub = null;
+    this.digestInflight = new Set();
+    this.digestLastFetch = new Map();
+    this.hoverDigestTask = null;
     this.listFocus = cx?.focus_handle?.();
     cx.timer.every(30000, (cx) => cx.notify());
+  }
+
+  refreshBriefing(cx) {
+    if (this.briefingLoading || typeof h2 !== "function") return;
+    this.briefingLoading = true;
+    this.briefingError = "";
+    cx?.notify?.();
+    cx?.spawn?.(async (acx) => {
+      try {
+        const args = ["ai", "briefing", "--json", "--lang", isZh() ? "zh-CN" : "en"];
+        if (this.awayMinutes && this.awayMinutes > 0) {
+          args.push("--away-minutes", String(this.awayMinutes));
+        }
+        const res = await h2(args);
+        if (res && res.code === 0 && res.stdout) {
+          this.coreBriefing = JSON.parse(res.stdout);
+        }
+      } catch (err) {
+        this.briefingError = String(err?.message ?? err ?? "");
+      }
+      this.briefingLoading = false;
+      acx?.notify?.();
+    });
+  }
+
+  scheduleHoverDigest(addr, rec, cx) {
+    this.hoverDigestTask?.cancel?.();
+    this.hoverDigestTask = null;
+    if (!addr || !rec?.acp || typeof h2 !== "function" || (typeof checking === "function" && checking())) return;
+    if (this.digestInflight?.has(addr)) return;
+    const now = Date.now();
+    const last = this.digestLastFetch?.get(addr) ?? 0;
+    if (rec.micro_summary && now - last < 30000) return;
+    if (now - last < 15000) return;
+    if (typeof cx?.spawn !== "function") return;
+    this.hoverDigestTask = cx.spawn(async (acx) => {
+      await acx.sleep(350);
+      if (this.hovered !== addr && this.hoveredSub !== addr) return;
+      this.digestInflight.add(addr);
+      this.digestLastFetch.set(addr, Date.now());
+      try {
+        await h2(["ai", "summarize-agent", addr, "--json", "--lang", isZh() ? "zh-CN" : "en"]);
+      } catch {}
+      this.digestInflight.delete(addr);
+      acx?.notify?.();
+    });
+  }
+
+  openBriefing() {
+    const away = typeof shared === "function" ? shared("briefing.away") : null;
+    const mins = Number(away?.away_minutes ?? 0) || null;
+    if (away && typeof setShared === "function") setShared("briefing.away", null);
+    openOverlay({
+      mod: "agents",
+      kind: "dialog",
+      key: "catchup-briefing",
+      width: 740,
+      height: 580,
+      props: { briefing: true, ...(mins ? { awayMinutes: mins } : {}) },
+    });
   }
 
   // Stamps agents whose state changed. Done and idle count as one: looking at a
@@ -277,9 +362,14 @@ export default class Agents extends View {
 
   statusButton(t, addr, a, compact = false) {
     const label = statusLabels()[a.status] ?? tr("Idle", "空闲");
+    const aiSummary = !a.manual_status && typeof a.ai_status_summary === "string" ? a.ai_status_summary.trim() : "";
+    const aiKind = !a.manual_status && typeof a.ai_status_kind === "string" ? a.ai_status_kind.trim() : "";
+    const aiTag = aiSummary
+      ? ` · ${aiKind === "error" ? tr("Error", "异常") : "AI"}: ${aiSummary}`
+      : "";
     const tip = tr(
-      `Status: ${label}${a.manual_status ? " (manual)" : ""} — click to change`,
-      `状态：${label}${a.manual_status ? "（手动）" : ""} — 点击更改`,
+      `Status: ${label}${a.manual_status ? " (manual)" : ""}${aiTag} — click to change`,
+      `状态：${label}${a.manual_status ? "（手动）" : ""}${aiTag} — 点击更改`,
     );
     const active = this.hovered === addr || this.hoveredSub === addr || Boolean(a.manual_status);
     const btn = h_flex()
@@ -310,6 +400,511 @@ export default class Agents extends View {
 
   selectAgent(addr) {
     if (addr && typeof setShared === "function") setShared("agents.selected", addr);
+  }
+
+  batchResolveCluster(group, approve, cx) {
+    if (!group?.addresses?.length || this.batchBusy.has(group.clusterKey)) return;
+    this.batchBusy.add(group.clusterKey);
+    cx?.notify?.();
+    cx?.spawn?.(async (acx) => {
+      const cmd = approve ? "agent.approve" : "agent.deny";
+      for (const addr of group.addresses) {
+        try {
+          run(cmd, { agent: addr });
+        } catch {}
+      }
+      this.resolvedIds.add(`cluster:${group.clusterKey}`);
+      for (const addr of group.addresses) this.resolvedIds.add(`agent:${addr}`);
+      this.batchBusy.delete(group.clusterKey);
+      acx?.notify?.();
+      await acx.sleep(600);
+      this.refreshBriefing(acx);
+    });
+  }
+
+  resolveSinglePermission(item, approve, cx) {
+    if (!item?.address) return;
+    run(approve ? "agent.approve" : "agent.deny", { agent: item.address });
+    this.resolvedIds.add(item.id);
+    cx?.notify?.();
+  }
+
+  replyDroveQuestion(item, cx) {
+    const text = String(this.replyTexts.get(item.id) ?? "").trim();
+    if (!text || !item?.messageId || typeof h2 !== "function" || this.batchBusy.has(item.id)) return;
+    this.batchBusy.add(item.id);
+    cx?.notify?.();
+    cx?.spawn?.(async (acx) => {
+      try {
+        const args = ["drove", "reply", item.messageId, text];
+        if (item.machine) args.push("--on", item.machine);
+        const r = await h2(args);
+        if (r && r.code === 0) {
+          this.resolvedIds.add(item.id);
+          this.replyTexts.delete(item.id);
+        }
+      } catch {}
+      this.batchBusy.delete(item.id);
+      acx?.notify?.();
+    });
+  }
+
+  focusBriefingTarget(item, openChanges = false) {
+    const overlay = props()?.overlay;
+    if (item?.address) {
+      this.selectAgent(item.address);
+      const p = panes().find((x) => x.terminal === item.address);
+      if (p?.pane) run("pane.focus", { pane: p.pane });
+      else if (item.kind?.startsWith("acp_")) run("terminal.peek", { terminal: item.address });
+      else run("agent.focus", { terminal: item.address });
+      if (openChanges) {
+        run("layout.select", { stack: "panel-body", child: "changes" });
+        run("layout.show", { id: "panel" });
+      }
+    } else if (item?.runId && typeof h2 === "function") {
+      const args = ["drove", "web", "--run", item.runId];
+      if (item.machine) args.push("--on", item.machine);
+      h2(args).catch?.(() => {});
+    }
+    if (overlay) closeOverlay(overlay);
+  }
+
+  briefingView(t, cx) {
+    const overlay = props()?.overlay;
+    const localSnap = buildLocalFallbackBriefing({
+      agents: agents(),
+      terminals: terminals(),
+      awayMinutes: this.awayMinutes,
+      isZh: isZh(),
+      now: Date.now(),
+    });
+    const snap = mergeBriefingSnapshots(localSnap, this.coreBriefing);
+    const accent = t.accent ?? "#3b82f6";
+    const blockedColor = t.blocked ?? "#f59e0b";
+    const doneColor = t.done ?? "#22c55e";
+    const workingColor = t.working ?? accent;
+    const errColor = "#ef4444";
+
+    const blockers = (snap.criticalBlockers ?? []).filter((x) => !this.resolvedIds.has(x.id));
+    const clusters = (snap.permissionClusters ?? []).filter((g) => !this.resolvedIds.has(`cluster:${g.clusterKey}`));
+    const decisions = (snap.pendingDecisions ?? []).filter((x) => !this.resolvedIds.has(x.id));
+    const ready = (snap.readyToReview ?? []).filter((x) => !this.resolvedIds.has(x.id));
+    const working = snap.workingItems ?? [];
+
+    const pill = (text, color, bg) =>
+      div()
+        .px(6)
+        .py(1.5)
+        .flex_none()
+        .rounded(999)
+        .bg(bg ?? `${color}22`)
+        .text_size(10.5)
+        .font_semibold()
+        .text_color(color)
+        .child(text);
+
+    const actionBtn = (id, label, onClick, { primary = false, danger = false, disabled = false } = {}) =>
+      div()
+        .id(id)
+        .h(24)
+        .px(9)
+        .flex_none()
+        .flex()
+        .items_center()
+        .rounded(6)
+        .border_1()
+        .border_color(primary ? accent : danger ? `${errColor}66` : t.border)
+        .bg(primary ? `${accent}26` : danger ? `${errColor}1a` : t.raised)
+        .text_size(11)
+        .font_medium()
+        .text_color(disabled ? t.dim : danger ? errColor : t.foreground)
+        .when(!disabled, (el) => el.cursor_pointer().hover((s) => s.bg(t.hover)))
+        .on_mouse_down("left", (_e, evCx) => evCx.stop_propagation())
+        .on_click((_e, evCx) => {
+          evCx.stop_propagation();
+          if (!disabled) onClick(evCx);
+        })
+        .child(label);
+
+    const sectionTitle = (id, titleText, count, color) =>
+      h_flex()
+        .id(id)
+        .pt(6)
+        .pb(2)
+        .gap(6)
+        .items_center()
+        .child(div().size(7).rounded(4).bg(color))
+        .child(div().text_size(11.5).font_semibold().text_color(t.foreground).child(titleText))
+        .child(div().text_size(11).text_color(t.dim).child(String(count)));
+
+    const renderItemCard = (item, badgeColor, buttons) =>
+      h_flex()
+        .id(`br-item-${item.id}`)
+        .px(10)
+        .py(8)
+        .gap(10)
+        .flex_none()
+        .rounded(8)
+        .bg(t.raised)
+        .border_1()
+        .border_color(t.border)
+        .items_center()
+        .child(
+          v_flex()
+            .flex_1()
+            .min_w(0)
+            .gap(3)
+            .child(
+              h_flex()
+                .gap(6)
+                .items_center()
+                .min_w(0)
+                .child(div().truncate().text_size(12.5).font_semibold().text_color(t.foreground).child(item.title))
+                .when(Boolean(item.address), (el) =>
+                  el.child(div().px(4).py(0.5).rounded(4).bg(t.hover).text_size(9.5).text_color(t.dim).child(item.address)),
+                )
+                .when(Boolean(item.spaceName), (el) =>
+                  el.child(div().truncate().max_w(120).text_size(10.5).text_color(t.dim).child(item.spaceName)),
+                )
+                .when((item.blockedDownstreamCount ?? 0) > 0, (el) =>
+                  el.child(
+                    pill(
+                      tr(`Blocks +${item.blockedDownstreamCount} downstream`, `阻塞 +${item.blockedDownstreamCount} 下游`),
+                      errColor,
+                    ),
+                  ),
+                ),
+            )
+            .child(div().truncate().text_size(11.5).text_color(badgeColor ?? t.muted).child(item.summary)),
+        )
+        .child(h_flex().gap(5).flex_none().items_center().children(buttons));
+
+    const renderClusterCard = (g) => {
+      const busy = this.batchBusy.has(g.clusterKey);
+      return v_flex()
+        .id(`br-cluster-${g.clusterKey}`)
+        .px(10)
+        .py(9)
+        .gap(7)
+        .flex_none()
+        .rounded(8)
+        .bg(`${blockedColor}14`)
+        .border_1()
+        .border_color(`${blockedColor}55`)
+        .child(
+          h_flex()
+            .gap(8)
+            .items_center()
+            .justify_between()
+            .child(
+              h_flex()
+                .flex_1()
+                .min_w(0)
+                .gap(6)
+                .items_center()
+                .child(pill(tr(`Batch · ${g.addresses.length}`, `合并批复 · ${g.addresses.length}`), blockedColor))
+                .child(div().truncate().text_size(12.5).font_semibold().text_color(t.foreground).child(g.title)),
+            )
+            .child(
+              h_flex()
+                .gap(5)
+                .flex_none()
+                .child(
+                  actionBtn(
+                    `br-batch-ok-${g.clusterKey}`,
+                    busy ? "…" : tr(`Approve All (${g.addresses.length})`, `一键全批 (${g.addresses.length})`),
+                    (evCx) => this.batchResolveCluster(g, true, evCx),
+                    { primary: true, disabled: busy },
+                  ),
+                )
+                .child(
+                  actionBtn(
+                    `br-batch-no-${g.clusterKey}`,
+                    tr("Deny All", "全部拒绝"),
+                    (evCx) => this.batchResolveCluster(g, false, evCx),
+                    { danger: true, disabled: busy },
+                  ),
+                ),
+            ),
+        )
+        .child(
+          h_flex()
+            .gap(5)
+            .flex_wrap()
+            .children(
+              g.addresses.map((addr, idx) =>
+                div()
+                  .id(`br-cluster-chip-${g.clusterKey}-${addr}`)
+                  .px(6)
+                  .py(1.5)
+                  .rounded(5)
+                  .bg(t.raised)
+                  .border_1()
+                  .border_color(t.border)
+                  .text_size(10.5)
+                  .text_color(t.muted)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                  .on_click(() => this.focusBriefingTarget({ address: addr, kind: "acp_permission" }))
+                  .child(`${g.labels?.[idx] || addr} (${addr})`),
+              ),
+            ),
+        );
+    };
+
+    const renderQuestionCard = (item) => {
+      let state = this.replyInputs.get(item.id);
+      if (!state) {
+        state = InputState.new({ placeholder: tr("Type quick reply and press Enter…", "输入简短回复后按回车或点发送…") });
+        state.on("change", (_e, icx) => {
+          this.replyTexts.set(item.id, state.value());
+          icx?.notify?.();
+        });
+        state.on("submit", (_e, icx) => this.replyDroveQuestion(item, icx));
+        this.replyInputs.set(item.id, state);
+      }
+      const busy = this.batchBusy.has(item.id);
+      return v_flex()
+        .id(`br-q-${item.id}`)
+        .px(10)
+        .py(8)
+        .gap(6)
+        .flex_none()
+        .rounded(8)
+        .bg(t.raised)
+        .border_1()
+        .border_color(t.border)
+        .child(
+          h_flex()
+            .gap(6)
+            .items_center()
+            .child(pill("Drove", accent))
+            .child(div().flex_1().min_w(0).truncate().text_size(12.5).font_semibold().text_color(t.foreground).child(item.title))
+            .when((item.blockedDownstreamCount ?? 0) > 0, (el) =>
+              el.child(pill(tr(`Blocks +${item.blockedDownstreamCount}`, `阻塞 +${item.blockedDownstreamCount}`), errColor)),
+            ),
+        )
+        .child(div().text_size(11.5).text_color(t.muted).child(item.summary))
+        .child(
+          h_flex()
+            .gap(6)
+            .items_center()
+            .child(
+              Input.new(state)
+                .flex_1()
+                .h(26)
+                .px(8)
+                .rounded(5)
+                .border_1()
+                .border_color(t.input)
+                .bg(t.background)
+                .text_size(11.5)
+                .text_color(t.foreground),
+            )
+            .child(
+              actionBtn(
+                `br-q-send-${item.id}`,
+                busy ? "…" : tr("Reply", "回复"),
+                (evCx) => this.replyDroveQuestion(item, evCx),
+                { primary: true, disabled: busy },
+              ),
+            ),
+        );
+    };
+
+    const nothingUrgent = blockers.length === 0 && clusters.length === 0 && decisions.length === 0 && ready.length === 0;
+
+    return v_flex()
+      .id("ag-briefing-dialog")
+      .when(Boolean(this.handle), (el) => el.track_focus(this.handle))
+      .size_full()
+      .min_h(0)
+      .p(14)
+      .gap(10)
+      .bg(t.popover)
+      .text_size(12.5)
+      .on_key_down((e) => {
+        if (e?.key === "escape" && overlay) closeOverlay(overlay);
+      })
+      // Header bar
+      .child(
+        h_flex()
+          .pb(8)
+          .gap(8)
+          .flex_none()
+          .items_center()
+          .justify_between()
+          .border_b(1)
+          .border_color(t.border)
+          .child(
+            h_flex()
+              .gap(8)
+              .items_center()
+              .child(svg("mods/workspace-chrome/layers.svg").size(15).text_color(accent))
+              .child(div().text_size(14).font_semibold().text_color(t.foreground).child(tr("Catch-up Briefing", "全局进展速览")))
+              .when(Boolean(this.awayMinutes), (el) =>
+                el.child(pill(tr(`Away ${this.awayMinutes}m`, `离开 ${this.awayMinutes} 分钟`), accent)),
+              )
+              .when(Boolean(snap.headlineFromAi), (el) => el.child(pill("AI", doneColor))),
+          )
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .child(
+                actionBtn(
+                  "br-refresh",
+                  this.briefingLoading ? tr("Syncing…", "刷新中…") : tr("Refresh", "刷新"),
+                  (evCx) => this.refreshBriefing(evCx),
+                  { disabled: this.briefingLoading },
+                ),
+              )
+              .child(
+                actionBtn(
+                  "br-mark-read",
+                  tr("Mark Caught Up", "全部已阅"),
+                  () => {
+                    if (typeof setShared === "function") setShared("briefing.away", null);
+                    if (overlay) closeOverlay(overlay);
+                  },
+                ),
+              )
+              .child(
+                div()
+                  .id("br-close")
+                  .size(24)
+                  .flex()
+                  .items_center()
+                  .justify_center()
+                  .rounded(5)
+                  .text_color(t.dim)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                  .on_click(() => overlay && closeOverlay(overlay))
+                  .child(svg("mods/pane/close.svg").size(12)),
+              ),
+          ),
+      )
+      // Executive summary banner
+      .child(
+        v_flex()
+          .px(12)
+          .py(10)
+          .gap(6)
+          .flex_none()
+          .rounded(8)
+          .bg(t.raised)
+          .border_1()
+          .border_color(t.border)
+          .child(div().text_size(12.5).text_color(t.foreground).child(snap.headline || tr("Workspace is quiet.", "当前工作区暂无待处理事项。")))
+          .child(
+            h_flex()
+              .gap(6)
+              .flex_wrap()
+              .child(pill(tr(`${blockers.length} Critical`, `${blockers.length} 异常阻塞`), blockers.length > 0 ? errColor : t.dim))
+              .child(pill(tr(`${clusters.reduce((s, g) => s + g.addresses.length, 0) + decisions.length} Needs You`, `${clusters.reduce((s, g) => s + g.addresses.length, 0) + decisions.length} 待拍板`), clusters.length + decisions.length > 0 ? blockedColor : t.dim))
+              .child(pill(tr(`${ready.length} Ready Diff`, `${ready.length} 可验收`), ready.length > 0 ? doneColor : t.dim))
+              .child(pill(tr(`${working.length} Working`, `${working.length} 进行中`), working.length > 0 ? workingColor : t.dim)),
+          ),
+      )
+      // Scrollable body
+      .child(
+        v_flex()
+          .id("br-scroll")
+          .flex_1()
+          .min_h(0)
+          .gap(8)
+          .overflow_y_scrollbar()
+          .when(nothingUrgent && working.length === 0, (el) =>
+            el.child(
+              v_flex()
+                .py(28)
+                .items_center()
+                .justify_center()
+                .child(div().text_size(12.5).text_color(t.dim).child(tr("All clear! No pending approvals, blockers, or unread completions.", "一切就绪！当前没有待审批项、异常阻塞或未检视的完成项。"))),
+            ),
+          )
+          // 1. Critical Blockers
+          .when(blockers.length > 0, (el) =>
+            el
+              .child(sectionTitle("br-sec-crit", tr("Critical Blockers (Highest Impact First)", "阻塞大局（按影响下游数排序）"), blockers.length, errColor))
+              .children(
+                blockers.map((item) =>
+                  renderItemCard(item, errColor, [
+                    actionBtn(`br-go-${item.id}`, tr("Inspect", "立即排查"), () => this.focusBriefingTarget(item), { danger: true }),
+                  ]),
+                ),
+              ),
+          )
+          // 2. Needs Your Decision (Batch Clusters + Single Items)
+          .when(clusters.length > 0 || decisions.length > 0, (el) =>
+            el
+              .child(sectionTitle("br-sec-dec", tr("Needs Your Decision", "待拍板与审批"), clusters.reduce((s, g) => s + g.addresses.length, 0) + decisions.length, blockedColor))
+              .children(clusters.map(renderClusterCard))
+              .children(
+                decisions.map((item) => {
+                  if (item.kind === "drove_question") return renderQuestionCard(item);
+                  const btns = item.kind === "acp_permission" && item.address
+                    ? [
+                        actionBtn(`br-ok-${item.id}`, tr("Approve", "允许"), (evCx) => this.resolveSinglePermission(item, true, evCx), { primary: true }),
+                        actionBtn(`br-no-${item.id}`, tr("Deny", "拒绝"), (evCx) => this.resolveSinglePermission(item, false, evCx), { danger: true }),
+                        actionBtn(`br-peek-${item.id}`, tr("Open", "查看"), () => this.focusBriefingTarget(item)),
+                      ]
+                    : [
+                        actionBtn(`br-focus-${item.id}`, tr("Focus", "跳转处理"), () => this.focusBriefingTarget(item), { primary: true }),
+                      ];
+                  return renderItemCard(item, blockedColor, btns);
+                }),
+              ),
+          )
+          // 3. Ready to Review
+          .when(ready.length > 0, (el) =>
+            el
+              .child(sectionTitle("br-sec-done", tr("Ready to Review", "已完成可验收"), ready.length, doneColor))
+              .children(
+                ready.map((item) =>
+                  renderItemCard(item, t.muted, [
+                    ...(item.address
+                      ? [
+                          actionBtn(`br-diff-${item.id}`, tr("Review Diff", "检视 Diff"), () => this.focusBriefingTarget(item, true), { primary: true }),
+                          actionBtn(`br-open-${item.id}`, tr("Open", "打开"), () => this.focusBriefingTarget(item, false)),
+                        ]
+                      : [actionBtn(`br-open-${item.id}`, tr("Open Run", "查看任务"), () => this.focusBriefingTarget(item, false))]),
+                  ]),
+                ),
+              ),
+          )
+          // 4. Working (collapsible)
+          .when(working.length > 0, (el) =>
+            el
+              .child(
+                h_flex()
+                  .id("br-sec-work-toggle")
+                  .pt(6)
+                  .pb(2)
+                  .gap(6)
+                  .items_center()
+                  .cursor_pointer()
+                  .on_click((_e, evCx) => {
+                    this.workingExpanded = !this.workingExpanded;
+                    evCx?.notify?.();
+                  })
+                  .child(svg(`mods/workspace-chrome/chevron-${this.workingExpanded ? "down" : "right"}.svg`).size(12).text_color(t.dim))
+                  .child(div().size(7).rounded(4).bg(workingColor))
+                  .child(div().text_size(11.5).font_semibold().text_color(t.muted).child(tr("Working in Background", "后台推进中")))
+                  .child(div().text_size(11).text_color(t.dim).child(String(working.length))),
+              )
+              .when(this.workingExpanded, (el2) =>
+                el2.children(
+                  working.map((item) =>
+                    renderItemCard(item, t.dim, [
+                      actionBtn(`br-w-open-${item.id}`, tr("Peek", "查看"), () => this.focusBriefingTarget(item)),
+                    ]),
+                  ),
+                ),
+              ),
+          ),
+      );
   }
 
   trashMenu(t) {
@@ -515,17 +1110,24 @@ export default class Agents extends View {
   subRow(t, s, focusedSet, compact) {
     const k = s.t;
     const isAcp = Boolean(k.acp);
+    const isSideChat = String(k.lineage?.kind || "").toLowerCase().replace("_", "-") === "side-chat";
     const pane = this.paneByAddr?.get(k.address) ?? null;
-    const canFocusPane = Boolean(pane) || (!isAcp && this.listed.has(k.address));
+    const canFocusPane = !isSideChat && (Boolean(pane) || (!isAcp && this.listed.has(k.address)));
     const st = kidStatus(k, this.listed);
     const pic = icon(k.program, 14, t.foreground);
     const on = focusedSet instanceof Set ? focusedSet.has(k.address) : k.address === focusedSet;
     const lBadge = lineageBadgeInfo(k);
     const hasWt = Boolean(k.lineage?.worktree_path);
-    const subLabel = k.labels?.["herdr.name"] || k.labels?.["drove.display"] || k.name || (isAcp && clean(k.title) && clean(k.title) !== k.address && clean(k.title) !== k.program?.name ? clean(k.title) : null) || k.template || k.program?.name || k.address;
+    const subLabel = k.labels?.["herdr.name"] || k.labels?.["drove.display"] || k.name || k.semantic_title || (isAcp && clean(k.title) && clean(k.title) !== k.address && clean(k.title) !== k.program?.name ? clean(k.title) : null) || k.template || k.program?.name || k.address;
     const subShortId = shortAgentId(k.address);
     const showSubId = Boolean(subShortId) && subLabel !== subShortId && subLabel !== k.address;
     const mono = (typeof settings === "function" ? settings()?.font_family : null) ?? "JetBrains Mono";
+    const subHoverTip = buildHoverTooltip({ ...k, status: st }, k, {
+      isZh: isZh(),
+      now: Date.now(),
+      since: this.since(k),
+      displayLabel: subLabel,
+    });
     return h_flex()
       .id(`sub-${k.address}`)
       .pl(39)
@@ -539,9 +1141,14 @@ export default class Agents extends View {
       .cursor_pointer()
       .when(on, (el) => el.bg(t.selected))
       .hover((s) => s.bg(t.hover))
+      .tooltip(subHoverTip)
       .on_hover((on, cx) => {
-        if (on) this.hoveredSub = k.address;
-        else if (this.hoveredSub === k.address) this.hoveredSub = null;
+        if (on) {
+          this.hoveredSub = k.address;
+          this.scheduleHoverDigest(k.address, k, cx);
+        } else if (this.hoveredSub === k.address) {
+          this.hoveredSub = null;
+        }
         cx.notify();
       })
       .on_mouse_down("right", (_e, cx) => {
@@ -654,7 +1261,12 @@ export default class Agents extends View {
             .child(svg("mods/pane/close.svg").size(11)),
         ),
       )
-      .child(this.statusButton(t, k.address, { status: st, manual_status: k.manual_status }, compact));
+      .child(this.statusButton(t, k.address, {
+        status: st,
+        manual_status: k.manual_status,
+        ai_status_summary: k.ai_status_summary,
+        ai_status_kind: k.ai_status_kind,
+      }, compact));
   }
 
   // compact: a ! for blocked where a header already says "Needs you".
@@ -662,7 +1274,12 @@ export default class Agents extends View {
     const color = t[a.status] ?? t.dim;
     if (a.status === "working") return svg("mods/workspace-chrome/spinner.svg").size(12).mx(1).flex_none().text_color(t.working).spin(900);
     if (a.status === "blocked" && compact) return div().size(14).flex_none().rounded(4).bg(t.blocked + "26").text_size(10.5).font_bold().text_color(t.blocked).flex().items_center().justify_center().child("!");
-    if (a.status === "blocked") return div().flex_none().px(6).h(18).rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).flex().items_center().child(tr("Needs you", "待确认"));
+    if (a.status === "blocked") {
+      const aiSummary = !a.manual_status && typeof a.ai_status_summary === "string" ? a.ai_status_summary.trim() : "";
+      const isErr = !a.manual_status && a.ai_status_kind === "error";
+      const badgeLabel = aiSummary || (isErr ? tr("Error", "异常") : tr("Needs you", "待确认"));
+      return div().flex_none().max_w(130).truncate().px(6).h(18).rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).flex().items_center().child(badgeLabel);
+    }
     // Idle: a ring; done: a dot.
     if (a.status === "idle") return div().size(7).mx(3).flex_none().rounded(4).border(1.5).border_color(t.idle ?? t.dim);
     return div().size(7).mx(3).flex_none().rounded(4).bg(a.status === "done" ? color : t.dim + "00");
@@ -673,6 +1290,7 @@ export default class Agents extends View {
     if (props()?.sortMenu) return this.sortMenu(t);
     if (props()?.statusMenu) return this.statusMenu(t);
     if (props()?.trashMenu) return this.trashMenu(t);
+    if (props()?.briefing) return this.briefingView(t, cx);
     const trashed = trashedList();
     const collapsed = narrow();
     const sort = sortOf();
@@ -778,11 +1396,10 @@ export default class Agents extends View {
     const leads = leadPanes(allPanes);
     const tabs = new Map(spaces().flatMap(s => s.tabs).map(tab => [tab.id, tab]));
     const labels = new Map(list.map(a => {
-      const custom = a.custom_name || all.find((x) => x.address === a.address)?.labels?.["herdr.name"];
-      if (custom) return [a.address, custom];
+      const rec = allByAddr.get(a.address);
       const tab = tabs.get(a.tab);
       const many = tabCounts.get(a.tab) > 1;
-      return [a.address, tab ? title(many ? { ...tab, named: false } : tab, many ? a : leads.get(a.tab)) : (a.title || a.program?.name || "")];
+      return [a.address, resolveSemanticLabel(a, rec, tab, leads.get(a.tab), { manyInTab: many })];
     }));
     const label = (a) => labels.get(a.address);
     const detail = new Map(list.map(a => [a.address, /^\d+$/.test(label(a)) ? null : label(a)]));
@@ -795,6 +1412,8 @@ export default class Agents extends View {
     const row = (a, i, subs = []) => {
       const pic = icon(a.program, 16, t.foreground);
       const more = detail.get(a.address);
+      const rowTerm = all.find((x) => x.address === a.address);
+      const isSideChat = String(rowTerm?.lineage?.kind || "").toLowerCase().replace("_", "-") === "side-chat";
       // An agent on another machine (`vps/t7`) says which.
       const machine = a.address.includes("/") ? a.address.split("/")[0] : null;
       if (collapsed) {
@@ -816,7 +1435,8 @@ export default class Agents extends View {
           })
           .on_click(() => {
             this.selectAgent(a.address);
-            if (a.pane) run("pane.focus", { pane: a.pane });
+            if (isSideChat) this.peek(a.address);
+            else if (a.pane) run("pane.focus", { pane: a.pane });
             else if (a.acp) this.peek(a.address);
             else run("terminal.keep", { terminal: a.address, place: "tab" });
           })
@@ -866,6 +1486,12 @@ export default class Agents extends View {
       const shortId = shortAgentId(a.address);
       const showId = Boolean(shortId) && name !== shortId && name !== a.address;
       const mono = (typeof settings === "function" ? settings()?.font_family : null) ?? "JetBrains Mono";
+      const rowHoverTip = buildHoverTooltip(a, rowTerm, {
+        isZh: isZh(),
+        now,
+        since: when,
+        displayLabel: more || name,
+      });
       return h_flex()
         .id(`ag-${a.address}`)
         .px(8)
@@ -877,9 +1503,14 @@ export default class Agents extends View {
         .when(a.focused, (el) => el.bg(t.selected))
         .cursor_pointer()
         .hover((s) => s.bg(t.hover))
+        .tooltip(rowHoverTip)
         .on_hover((on, cx) => {
-          if (on) this.hovered = a.address;
-          else if (this.hovered === a.address) this.hovered = null;
+          if (on) {
+            this.hovered = a.address;
+            this.scheduleHoverDigest(a.address, rowTerm ?? a, cx);
+          } else if (this.hovered === a.address) {
+            this.hovered = null;
+          }
           cx.notify();
         })
         .on_mouse_down("right", (_e, cx) => {
@@ -889,7 +1520,8 @@ export default class Agents extends View {
         })
         .on_click(() => {
           this.selectAgent(a.address);
-          if (a.pane) run("pane.focus", { pane: a.pane });
+          if (isSideChat) this.peek(a.address);
+          else if (a.pane) run("pane.focus", { pane: a.pane });
           else if (a.acp) this.peek(a.address);
           else run("terminal.keep", { terminal: a.address, place: "tab" });
         })
@@ -997,7 +1629,17 @@ export default class Agents extends View {
         .when(subs.length > 0, el => el.child(fold(a, subs)))
         .when(this.hovered === a.address, el => el.child(pin).child(remove))
         .when(this.hovered !== a.address && Boolean(when), el => el.child(div().flex_none().text_size(11).text_color(t.dim).child(duration(now - when))))
-        .child(this.statusButton(t, a.address, a, byPriority && !isPinned));
+        .child((() => {
+          const liveRec = all.find((x) => x.address === a.address);
+          const merged = liveRec
+            ? {
+                ...a,
+                ai_status_summary: a.ai_status_summary ?? liveRec.ai_status_summary,
+                ai_status_kind: a.ai_status_kind ?? liveRec.ai_status_kind,
+              }
+            : a;
+          return this.statusButton(t, a.address, merged, byPriority && !isPinned);
+        })());
     };
 
     // Groups in list order: spaces (grouped) or priority sections. Agents of a
@@ -1041,6 +1683,15 @@ export default class Agents extends View {
       ? list.flatMap(withKids)
       : groups.flatMap((g) => [header(g), ...(this.folded.has(g.id) ? [] : g.members.flatMap(withKids))]);
 
+    const awayBanner = typeof shared === "function" ? shared("briefing.away") : null;
+    const awayChangedCount = Number(awayBanner?.changed_count ?? 0) || 0;
+    const urgentCount = list.filter((a) => {
+      const r = rankOf(a);
+      return r >= RANK.done;
+    }).length;
+    const briefingBadgeCount = awayChangedCount > 0 ? awayChangedCount : urgentCount;
+    const briefingHot = awayChangedCount > 0 || list.some((a) => rankOf(a) >= RANK.blocked);
+
     return v_flex()
       .size_full()
       .min_h(0)
@@ -1073,6 +1724,29 @@ export default class Agents extends View {
               h_flex()
                 .gap(6)
                 .items_center()
+                .child(
+                  h_flex()
+                    .id("ag-briefing")
+                    .h(20)
+                    .px(briefingBadgeCount > 0 ? 6 : 5)
+                    .gap(4)
+                    .items_center()
+                    .rounded(5)
+                    .text_size(10.5)
+                    .when(briefingHot, (b) => b.bg(`${t.blocked ?? "#f59e0b"}24`).border_1().border_color(`${t.blocked ?? "#f59e0b"}66`).text_color(t.blocked ?? "#f59e0b"))
+                    .when(!briefingHot, (b) => b.text_color(briefingBadgeCount > 0 ? t.foreground : t.dim))
+                    .cursor_pointer()
+                    .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                    .on_click(() => this.openBriefing())
+                    .tooltip(
+                      awayChangedCount > 0
+                        ? tr(`Catch-up Briefing (${awayChangedCount} updates while away)`, `离开重连简报（离开期间 ${awayChangedCount} 项新动态）`)
+                        : tr("Catch-up Briefing: priority blockers, batch approvals & diffs", "全局进展速览：阻塞排序、同类审批一键合批、完成项验收"),
+                    )
+                    .child(svg("mods/workspace-chrome/layers.svg").size(12))
+                    .child(div().font_medium().child(tr("Brief", "速览")))
+                    .when(briefingBadgeCount > 0, (b) => b.child(div().font_semibold().child(String(briefingBadgeCount)))),
+                )
                 .child(
                   h_flex()
                     .id("ag-recycle")
@@ -1139,6 +1813,18 @@ export default class Agents extends View {
             .items_center()
             .gap(4)
             .pb(4)
+            .child(
+              div()
+                .id("ag-briefing-rail")
+                .p(4)
+                .rounded(5)
+                .text_color(briefingHot ? (t.blocked ?? "#f59e0b") : t.muted)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                .tooltip(tr("Catch-up Briefing", "全局进展速览"))
+                .on_click(() => this.openBriefing())
+                .child(svg("mods/workspace-chrome/layers.svg").size(13)),
+            )
             .when(trashed.length > 0, (el2) =>
               el2.child(
                 div()

@@ -1,5 +1,5 @@
 import { View, div } from "gpui-kit";
-import { v_flex, h_flex, TextareaState, Textarea, Popup, Scrollbar, v_virtual_list } from "gpui-base";
+import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, Popup, Scrollbar, v_virtual_list } from "gpui-base";
 import { spaces, panes, focused, agents, terminals, theme, settings, h2, shared, setShared, run } from "herdr";
 import {
   annotateDiffRows,
@@ -102,6 +102,32 @@ function formatCheckpointSummary(c, turn) {
     : tr(`Turn ${turn}`, `第 ${turn} 轮`);
 }
 
+function isManualCheckpointBookmark(c) {
+  return Boolean(c?.label && c?.label_source !== "ai");
+}
+
+function isCurrentCheckpoint(c, turn, maxTurn) {
+  return turn === maxTurn && (turn === 0 || !isManualCheckpointBookmark(c));
+}
+
+function formatCheckpointTooltip(c, turn) {
+  const summary = formatCheckpointSummary(c, turn);
+  const base = summary.length > 260 ? `${summary.slice(0, 260)}…` : summary;
+  if (c?.label && c?.label_source === "ai" && c?.prompt) {
+    const rawPrompt = String(c.prompt)
+      .replace(/<\/?pasted_content\b[^>]*>/gi, " ")
+      .replace(/<\/?herdr2-handoff\b[^>]*>/gi, " ")
+      .replace(/[\r\n\t]+/g, " ")
+      .replace(/\s{2,}/g, " ")
+      .trim();
+    if (rawPrompt && rawPrompt !== summary) {
+      const clipped = rawPrompt.length > 160 ? `${rawPrompt.slice(0, 160)}…` : rawPrompt;
+      return `${base}\n${tr("Prompt", "原始指令")}: ${clipped}`;
+    }
+  }
+  return base;
+}
+
 export default class Checkpoints extends View {
   init(_props, cx) {
     this.checkpoints = [];
@@ -121,7 +147,7 @@ export default class Checkpoints extends View {
 
     // Single reusable inline comment editor (created once in init(), never inside render()).
     this.commentInput = TextareaState.new({
-      placeholder: tr("Add a review comment… (Ctrl/Cmd+Enter to add)", "输入行级审查意见… (Ctrl/Cmd+Enter 添加)"),
+      placeholder: tr("Ask, note, or comment on selected lines… (Ctrl/Cmd+Enter to add)", "针对选中行提问、批注或写修改说明… (Ctrl/Cmd+Enter 添加)"),
     });
     this.commentInput.set_auto_grow(2, 4);
     this.commentTyping = false;
@@ -144,6 +170,19 @@ export default class Checkpoints extends View {
     this.sendingIds = [];
     this.reviewError = null;
     this.lastHandledResultId = null;
+    this.loadedCommitOid = null;
+
+    this.bisectInput = InputState.new({
+      placeholder: tr("Locate bug turn, e.g. \"which turn broke auth?\"", "反查故障引入轮次，如“哪一轮导致鉴权测试失败？”"),
+    });
+    this.bisectTyping = false;
+    this.bisectBusy = false;
+    this.bisectResult = null;
+    this.bisectError = null;
+    this.bisectInput.on("focus", (_e, cx) => { this.bisectTyping = true; cx.notify(); });
+    this.bisectInput.on("blur", (_e, cx) => { this.bisectTyping = false; cx.notify(); });
+    this.bisectInput.on("change", (_e, cx) => { this.bisectError = null; cx.notify(); });
+    this.bisectInput.on("submit", (_e, cx) => this.runBisect(cx));
 
     this.refresh(cx);
     cx.timer.every(10000, (cx) => this.refresh(cx));
@@ -196,7 +235,7 @@ export default class Checkpoints extends View {
         this.reviewError = null;
       } else {
         this.sendingIds = [];
-        this.reviewError = String(res.error || tr("Failed to send review", "发送审查意见失败"));
+        this.reviewError = String(res.error || tr("Failed to send line notes", "发送行级消息失败"));
       }
     }
   }
@@ -211,23 +250,28 @@ export default class Checkpoints extends View {
     if (this.loading || this.rollbackBusy) return;
     const target = activeTargetAddress();
     const context = this.viewKey();
+    const targetChanged = this.targetAddr !== target;
     if (context !== this.context) {
       this.context = context;
-      this.checkpoints = [];
-      this.isolation = null;
-      this.confirmTurn = null;
       this.note = null;
       this.error = null;
-      if (this.targetAddr !== target) {
+      if (targetChanged) {
+        this.checkpoints = [];
+        this.isolation = null;
+        this.confirmTurn = null;
         this.selectedTurn = null;
+        this.loadedCommitOid = null;
         this.composer = null;
         this.anchorRowIdx = null;
         this.targetOverride = null;
         this.targetPopupOpen = false;
         this.reviewError = null;
+        this.bisectResult = null;
+        this.bisectError = null;
+        this.bisectInput.set_value("");
+        this.setLines([]);
       }
       this.targetAddr = target;
-      this.setLines([]);
     }
     if (!target) {
       this.targetAddr = null;
@@ -244,6 +288,7 @@ export default class Checkpoints extends View {
         if (res.code !== 0) {
           this.checkpoints = [];
           this.isolation = null;
+          this.loadedCommitOid = null;
           this.error = (res.stderr || res.stdout || "No checkpoints").trim();
           this.setLines([]);
           return;
@@ -257,10 +302,17 @@ export default class Checkpoints extends View {
         if (this.selectedTurn == null || !list.some((c) => Number(c.turn) === Number(this.selectedTurn))) {
           const latest = list[list.length - 1] ?? null;
           this.selectedTurn = latest ? Number(latest.turn) : null;
+          this.loadedCommitOid = null;
         }
         if (this.selectedTurn != null) {
-          await this.loadCheckpointDiff(this.selectedTurn, context);
+          const selMeta = list.find((c) => Number(c.turn) === Number(this.selectedTurn));
+          const selOid = selMeta?.commit_oid ?? `t${this.selectedTurn}`;
+          if (targetChanged || this.rows.length === 0 || this.loadedCommitOid !== selOid) {
+            await this.loadCheckpointDiff(this.selectedTurn, context);
+            if (this.viewKey() === context) this.loadedCommitOid = selOid;
+          }
         } else {
+          this.loadedCommitOid = null;
           this.setLines([]);
         }
       } catch (e) {
@@ -301,11 +353,56 @@ export default class Checkpoints extends View {
     this.anchorRowIdx = null;
     this.note = null;
     this.reviewError = null;
+    const selMeta = this.checkpoints.find((c) => Number(c.turn) === Number(turn));
+    this.loadedCommitOid = selMeta?.commit_oid ?? `t${turn}`;
     const context = this.viewKey();
     cx.spawn(async (cx) => {
       try { await this.loadCheckpointDiff(turn, context); }
       catch (e) { if (this.viewKey() === context) this.note = String(e); }
       cx.notify();
+    });
+    cx.notify();
+  }
+
+  runBisect(cx) {
+    const target = this.targetAddr;
+    const q = String(this.bisectInput?.value?.() ?? "").trim();
+    if (!target || !q || this.bisectBusy) return;
+    this.bisectBusy = true;
+    this.bisectError = null;
+    const context = this.viewKey();
+    cx.spawn(async (cx) => {
+      try {
+        const res = await h2(
+          ["checkpoint", "bisect", "--json", target, "--query", q, "--lang", isZh() ? "zh" : "en"],
+          { timeout: 25000 },
+        );
+        if (this.targetAddr !== target) return;
+        if (res.code !== 0) {
+          let msg = (res.stderr || res.stdout || tr("Bisect failed", "故障定位失败")).trim();
+          try {
+            const p = JSON.parse(res.stderr || res.stdout || "{}");
+            if (p?.error?.message) msg = p.error.message;
+          } catch {}
+          this.bisectError = msg;
+          this.bisectResult = null;
+        } else {
+          const parsed = JSON.parse(res.stdout || "{}");
+          this.bisectResult = parsed;
+          this.bisectError = null;
+          if (typeof parsed?.suspectTurn === "number" && this.viewKey() === context) {
+            this.pickCheckpoint(parsed.suspectTurn, cx);
+          }
+        }
+      } catch (e) {
+        if (this.targetAddr === target) {
+          this.bisectError = String(e);
+          this.bisectResult = null;
+        }
+      } finally {
+        this.bisectBusy = false;
+        cx.notify();
+      }
     });
     cx.notify();
   }
@@ -781,7 +878,7 @@ export default class Checkpoints extends View {
               .text_size(11)
               .text_color(hasText ? t.foreground : t.dim)
               .when(hasText, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.saveComposer(cx, false)))
-              .child(composer.editingId ? tr("Update", "更新") : tr("Add", "添加评论")),
+              .child(composer.editingId ? tr("Update", "更新") : tr("Add", "添加")),
           )
           .child(
             div()
@@ -793,7 +890,7 @@ export default class Checkpoints extends View {
               .text_size(11)
               .text_color(hasText && !this.sendingReqId ? t.solid_foreground : t.dim)
               .when(hasText && !this.sendingReqId, (e) => e.cursor_pointer().on_click((_e, cx) => this.saveComposer(cx, true)))
-              .child(tr("Send now", "立即回流")),
+              .child(tr("Send now", "立即发送")),
           ),
       );
   }
@@ -864,8 +961,8 @@ export default class Checkpoints extends View {
               .text_color(accent)
               .child(
                 tr(
-                  `T${this.selectedTurn} · ${allDrafts.length} comment${allDrafts.length === 1 ? "" : "s"} (${fileSet.size}f)`,
-                  `T${this.selectedTurn} · ${allDrafts.length} 条评论（${fileSet.size} 文件）`,
+                  `T${this.selectedTurn} · ${allDrafts.length} note${allDrafts.length === 1 ? "" : "s"} (${fileSet.size}f)`,
+                  `T${this.selectedTurn} · ${allDrafts.length} 条批注（${fileSet.size} 文件）`,
                 ),
               ),
           )
@@ -977,7 +1074,7 @@ export default class Checkpoints extends View {
               .font_medium()
               .text_color(canSend ? t.solid_foreground : t.dim)
               .when(canSend, (e) => e.cursor_pointer().on_click((_e, cx) => this.sendReview(cx)))
-              .child(this.sendingReqId ? tr("Sending…", "发送中…") : tr("Send to Agent", "回流给 Agent")),
+              .child(this.sendingReqId ? tr("Sending…", "发送中…") : tr("Send to Agent", "发给 Agent")),
           ),
       );
   }
@@ -1019,6 +1116,11 @@ export default class Checkpoints extends View {
           } else if (this.composer) {
             this.closeComposer(cx);
             cx.stop_propagation();
+          } else if (this.bisectTyping) {
+            this.bisectTyping = false;
+            this.handle.focus();
+            cx.stop_propagation();
+            cx.notify();
           }
         }
       })
@@ -1041,6 +1143,205 @@ export default class Checkpoints extends View {
             ),
           ),
       )
+      .when(this.checkpoints.some((c) => Number(c.turn) > 0) || Boolean(this.bisectResult || this.bisectError), (el) => {
+        const hasQuery = Boolean(String(this.bisectInput?.value?.() ?? "").trim());
+        const canBisect = Boolean(hasQuery && this.targetAddr && !this.bisectBusy);
+        const accent = t.accent ?? "#3b82f6";
+        return el.child(
+          h_flex()
+            .id("ckpt-bisect-bar")
+            .flex_none()
+            .px(10)
+            .py(6)
+            .gap(6)
+            .items_center()
+            .border_b(1)
+            .border_color(t.border)
+            .bg(t.raised)
+            .child(
+              div()
+                .id("ckpt-bisect-input-wrap")
+                .flex_1()
+                .min_w(0)
+                .h(26)
+                .px(8)
+                .flex()
+                .items_center()
+                .rounded(6)
+                .bg(t.background)
+                .border_1()
+                .border_color(this.bisectTyping ? accent : t.border)
+                .cursor_text()
+                .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                .child(Input.new(this.bisectInput).h_full().text_size(11.5).text_color(t.foreground)),
+            )
+            .child(
+              div()
+                .id("ckpt-bisect-run")
+                .flex_none()
+                .h(26)
+                .px(9)
+                .flex()
+                .items_center()
+                .rounded(6)
+                .bg(canBisect ? t.solid : t.background)
+                .border_1()
+                .border_color(canBisect ? t.solid : t.border)
+                .text_size(11)
+                .font_medium()
+                .text_color(canBisect ? t.solid_foreground : t.dim)
+                .when(canBisect, (e) => e.cursor_pointer().on_click((_e, cx) => this.runBisect(cx)))
+                .child(this.bisectBusy ? tr("Locating…", "定位中…") : tr("Locate", "定位故障")),
+            ),
+        );
+      })
+      .when(Boolean(this.bisectError), (el) =>
+        el.child(
+          h_flex()
+            .flex_none()
+            .px(10)
+            .py(6)
+            .gap(6)
+            .items_center()
+            .border_b(1)
+            .border_color(t.border)
+            .bg(t.raised)
+            .child(div().flex_1().min_w(0).text_size(11).text_color(t.ansi1).whitespace_normal().child(this.bisectError))
+            .child(
+              div()
+                .id("ckpt-bisect-err-close")
+                .flex_none()
+                .px(5)
+                .py(1)
+                .rounded(4)
+                .text_size(11)
+                .text_color(t.dim)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                .on_click((_e, cx) => { this.bisectError = null; cx.notify(); })
+                .child("×"),
+            ),
+        ),
+      )
+      .when(Boolean(this.bisectResult), (el) => {
+        const br = this.bisectResult;
+        const suspect = Number(br.suspectTurn ?? 0);
+        const safe = Number(br.recommendedRollbackTurn ?? 0);
+        const pct = Math.round(Number(br.confidence ?? 0) * 100);
+        const files = Array.isArray(br.evidenceFiles) ? br.evidenceFiles : [];
+        return el.child(
+          v_flex()
+            .id("ckpt-bisect-card")
+            .flex_none()
+            .px(10)
+            .py(8)
+            .gap(5)
+            .border_b(1)
+            .border_color(withAlpha(t.blocked, "66") ?? t.border)
+            .bg(withAlpha(t.blocked, "12") ?? t.raised)
+            .child(
+              h_flex()
+                .w_full()
+                .items_center()
+                .gap(6)
+                .child(
+                  div()
+                    .px(5)
+                    .py(1)
+                    .rounded(4)
+                    .bg(withAlpha(t.ansi1, "22") ?? t.background)
+                    .text_size(10)
+                    .font_semibold()
+                    .text_color(t.ansi1)
+                    .child(tr(`Suspect T${suspect} (${pct}%)`, `疑似引入 T${suspect} (${pct}%)`)),
+                )
+                .child(
+                  div()
+                    .px(5)
+                    .py(1)
+                    .rounded(4)
+                    .bg(withAlpha(t.ansi2, "22") ?? t.background)
+                    .text_size(10)
+                    .font_semibold()
+                    .text_color(t.ansi2)
+                    .child(tr(`Safe anchor T${safe}`, `推荐回滚 T${safe}`)),
+                )
+                .child(div().flex_1())
+                .child(
+                  div()
+                    .id("ckpt-bisect-clear")
+                    .px(5)
+                    .py(1)
+                    .rounded(4)
+                    .text_size(11)
+                    .text_color(t.dim)
+                    .cursor_pointer()
+                    .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                    .on_click((_e, cx) => { this.bisectResult = null; cx.notify(); })
+                    .child("×"),
+                ),
+            )
+            .child(
+              div()
+                .w_full()
+                .text_size(11.5)
+                .line_height("16px")
+                .text_color(t.foreground)
+                .whitespace_normal()
+                .child(br.reason || ""),
+            )
+            .when(files.length > 0, (fe) =>
+              fe.child(
+                div()
+                  .w_full()
+                  .text_size(10.5)
+                  .text_color(t.muted)
+                  .truncate()
+                  .child(`${tr("Evidence", "涉及文件")}: ${files.join(", ")}`),
+              ),
+            )
+            .child(
+              h_flex()
+                .w_full()
+                .gap(6)
+                .items_center()
+                .child(
+                  div()
+                    .id("ckpt-bisect-view")
+                    .px(8)
+                    .py(3)
+                    .rounded(5)
+                    .border_1()
+                    .border_color(t.border)
+                    .bg(t.background)
+                    .text_size(10.5)
+                    .text_color(t.foreground)
+                    .cursor_pointer()
+                    .hover((s) => s.bg(t.hover))
+                    .on_click((_e, cx) => this.pickCheckpoint(suspect, cx))
+                    .child(tr(`Inspect T${suspect} Diff`, `查看 T${suspect} 变更`)),
+                )
+                .child(
+                  div()
+                    .id("ckpt-bisect-rb")
+                    .px(8)
+                    .py(3)
+                    .rounded(5)
+                    .bg(t.solid)
+                    .text_size(10.5)
+                    .font_medium()
+                    .text_color(t.solid_foreground)
+                    .cursor_pointer()
+                    .on_click((_e, cx) => {
+                      this.confirmTurn = safe;
+                      this.note = null;
+                      cx.notify();
+                    })
+                    .child(tr(`Prepare Rollback to T${safe}`, `准备回滚到 T${safe}`)),
+                ),
+            ),
+        );
+      })
       .child(
         div().flex_1().min_h(48).max_h(listHeight).relative().border_b(1).border_color(t.border)
           .child(
@@ -1051,15 +1352,27 @@ export default class Checkpoints extends View {
                 const cAdd = files.reduce((n, f) => n + (Number(f.added) || 0), 0);
                 const cDel = files.reduce((n, f) => n + (Number(f.deleted) || 0), 0);
                 const summary = formatCheckpointSummary(c, turn);
-                const tip = summary.length > 260 ? `${summary.slice(0, 260)}…` : summary;
+                const tip = formatCheckpointTooltip(c, turn);
                 const selected = Number(this.selectedTurn) === turn;
-                const isCurrent = turn === maxTurn && (turn === 0 || !c.label);
+                const isCurrent = isCurrentCheckpoint(c, turn, maxTurn);
+                const isAiLabel = Boolean(c?.label && c?.label_source === "ai");
+                const isBisectSuspect = Boolean(this.bisectResult && Number(this.bisectResult.suspectTurn) === turn);
+                const isBisectSafe = Boolean(this.bisectResult && Number(this.bisectResult.recommendedRollbackTurn) === turn);
                 return h_flex().id(`ckpt-${turn}`).h(rowHeight).flex_none().px(8).gap(8).items_center().rounded(7).overflow_hidden().cursor_pointer()
                   .tooltip(tip)
                   .when(selected, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover))
                   .on_click((_e, cx) => this.pickCheckpoint(turn, cx))
                   .child(div().min_w(28).flex_none().whitespace_nowrap().text_size(11).line_height("18px").text_color(t.accent ?? t.muted).child(`T${turn}`))
                   .child(div().flex_1().min_w(0).overflow_hidden().whitespace_nowrap().truncate().text_size(12.5).line_height("20px").child(summary))
+                  .when(isAiLabel && !isBisectSuspect && !isBisectSafe, (e) =>
+                    e.child(div().flex_none().whitespace_nowrap().px(4).py(0.5).rounded(4).bg(t.raised).text_size(9.5).text_color(t.dim).child("AI")),
+                  )
+                  .when(isBisectSuspect, (e) =>
+                    e.child(div().flex_none().whitespace_nowrap().px(5).py(1).rounded(4).bg(withAlpha(t.ansi1, "22") ?? t.raised).text_size(9.5).font_semibold().text_color(t.ansi1).child(tr("Suspect", "疑似引入"))),
+                  )
+                  .when(isBisectSafe, (e) =>
+                    e.child(div().flex_none().whitespace_nowrap().px(5).py(1).rounded(4).bg(withAlpha(t.ansi2, "22") ?? t.raised).text_size(9.5).font_semibold().text_color(t.ansi2).child(tr("Safe", "推荐回滚"))),
+                  )
                   .when(cAdd > 0, (e) => e.child(div().flex_none().whitespace_nowrap().text_size(11).line_height("18px").text_color(t.ansi2).child(`+${cAdd}`)))
                   .when(cDel > 0, (e) => e.child(div().flex_none().whitespace_nowrap().text_size(11).line_height("18px").text_color(t.ansi1).child(`−${cDel}`)))
                   .when(isCurrent, (e) =>

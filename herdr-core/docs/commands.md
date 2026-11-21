@@ -59,6 +59,7 @@ More
                               manage remote machines over SSH or `--via`
   connect                     JSON-RPC API over stdin/stdout
   drove status|web|probe|...  manage Drove DAG orchestration and Web UI
+  ai status|settings-set|test manage shared Core AI assistant & cache stats
   schema                      print OpenRPC 1.3.2 JSON Schema
 
 <a> / <t> is an agent (`a1`), terminal (`t1`), remote (`machine/a7`), or unique name.
@@ -67,6 +68,122 @@ Options: --json (default when piped except read/file read/exec), -V --version, -
 Per command: h2 <command> --help
 Settings: ~/.config/herdr2/config.toml (default_permissions, inject_mcp, [agents]).
 Agent manual: h2 --skill
+```
+
+## h2 ai
+
+```text
+Inspect or configure the shared Core AI assistant (`ai status`, `ai settings-set`, `ai test`)
+
+Usage: h2 ai [OPTIONS] <COMMAND>
+
+Commands:
+  status             Show shared Core AI assistant status, configuration, and KV-cache metrics
+  settings-set       Update shared Core AI assistant settings from a JSON file
+  test               Test the shared Core AI assistant URL and API key
+  handoff-recommend  Recommend a complementary target provider, handoff mode, and note for an upstream session
+  briefing           Aggregate local & remote agents and Drove runs into a priority catch-up briefing
+  summarize-agent    Generate or refresh a concise semantic title and progress micro-summary for an agent or terminal
+  help               Print this message or the help of the given subcommand(s)
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h2 ai briefing
+
+```text
+Aggregate local & remote agents and Drove runs into a priority catch-up briefing
+
+Usage: h2 ai briefing [OPTIONS]
+
+Options:
+      --json                         JSON output even in a terminal
+      --on <ON>                      Target remote machine (`h2 machine ls`)
+      --lang <LANG>                  Preferred language (`zh-CN` / `en`)
+      --away-minutes <AWAY_MINUTES>  Away duration in minutes (optional context for executive headline)
+      --no-ai                        Return deterministic aggregation only without calling Core AI
+  -h, --help                         Print help
+```
+
+## h2 ai handoff-recommend
+
+```text
+Recommend a complementary target provider, handoff mode, and note for an upstream session
+
+Usage: h2 ai handoff-recommend [OPTIONS] <SOURCE>
+
+Arguments:
+  <SOURCE>  Source agent or terminal (`a1`, `t1`, name, or `machine/a1`)
+
+Options:
+      --installed <INSTALLED>  Installed presets available on the target machine (repeatable or comma-separated)
+      --json                   JSON output even in a terminal
+      --lang <LANG>            Caller UI language (`zh` / `en`)
+  -h, --help                   Print help
+```
+
+## h2 ai settings-set
+
+```text
+Update shared Core AI assistant settings from a JSON file
+
+Usage: h2 ai settings-set [OPTIONS] --file <FILE>
+
+Options:
+      --file <FILE>   
+      --json          JSON output even in a terminal
+      --on <MACHINE>  Target remote machine (`h2 machine ls`)
+      --consume       Delete the input JSON file right after reading it (safe for API keys)
+  -h, --help          Print help
+```
+
+## h2 ai status
+
+```text
+Show shared Core AI assistant status, configuration, and KV-cache metrics
+
+Usage: h2 ai status [OPTIONS]
+
+Options:
+      --json          JSON output even in a terminal
+      --on <MACHINE>  Target remote machine (`h2 machine ls`)
+  -h, --help          Print help
+```
+
+## h2 ai summarize-agent
+
+```text
+Generate or refresh a concise semantic title and progress micro-summary for an agent or terminal
+
+Usage: h2 ai summarize-agent [OPTIONS] <TARGET>
+
+Arguments:
+  <TARGET>  Target agent or terminal (`a1`, `t1`, name, or `machine/a1`)
+
+Options:
+      --json         JSON output even in a terminal
+      --lang <LANG>  Preferred language (`zh-CN` / `en`)
+      --no-ai        Return deterministic summary only without calling Core AI
+  -h, --help         Print help
+```
+
+## h2 ai test
+
+```text
+Test the shared Core AI assistant URL and API key
+
+Usage: h2 ai test [OPTIONS]
+
+Options:
+      --file <FILE>    
+      --json           JSON output even in a terminal
+      --url <URL>      
+      --model <MODEL>  
+      --on <MACHINE>   Target remote machine (`h2 machine ls`)
+      --consume        Delete `--file` right after reading it
+  -h, --help           Print help
 ```
 
 ## h2 approve
@@ -114,11 +231,29 @@ Commands:
   snap      Manually capture a checkpoint for an agent or terminal (defaults to current pane/agent)
   diff      Show the pure authored diff between two checkpoints
   rollback  Roll back session state (and optionally workspace files) to an earlier turn
+  bisect    Locate which checkpoint turn most likely introduced a bug or regression
   help      Print this message or the help of the given subcommand(s)
 
 Options:
       --json  JSON output even in a terminal
   -h, --help  Print help
+```
+
+## h2 checkpoint bisect
+
+```text
+Locate which checkpoint turn most likely introduced a bug or regression
+
+Usage: h2 checkpoint bisect [OPTIONS] --query <QUERY> <TARGET>
+
+Arguments:
+  <TARGET>  Agent (`a1`), terminal (`t1`), remote (`machine/t1`), or unique name
+
+Options:
+      --json           JSON output even in a terminal
+      --query <QUERY>  Symptom or regression query (e.g. "which turn broke auth tests?")
+      --lang <LANG>    Caller UI language (`zh` / `en`)
+  -h, --help           Print help
 ```
 
 ## h2 checkpoint diff
@@ -1012,6 +1147,12 @@ Options:
       --to-turn <TO_TURN>
           Last turn from the source transcript to include (1-based, inclusive)
 
+      --recent-turns <N>
+          Include only the most recent N turns from the source transcript (ignored when `from_turn` is set; 0 = all)
+
+      --max-bytes <BYTES>
+          Maximum byte budget for the generated handoff package (defaults to 24 KiB)
+
       --prompt <TEXT>
           Optional initial instruction sent after staging handoff context
 
@@ -1035,6 +1176,9 @@ Options:
 
       --merge-worktree
           When merging back (`--into`), instruct the target/parent agent to merge code from the source session's fork worktree branch into the main workspace without deleting the worktree or branch
+
+      --raw
+          Skip semantic memory distillation / merge-back takeaway compression and send raw bounded turns
 
       --wait
           With `--prompt`: wait for the first turn on the target to finish
@@ -1063,6 +1207,7 @@ Commands:
   ls    List queued prompts waiting in an agent's inbox
   edit  Edit a queued prompt before its turn begins
   rm    Remove a queued prompt before its turn begins
+  send  Interrupt the active turn if needed and immediately send a queued prompt
   help  Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1108,6 +1253,22 @@ Options:
 Remove a queued prompt before its turn begins
 
 Usage: h2 inbox rm [OPTIONS] <AGENT> <ID>
+
+Arguments:
+  <AGENT>  The agent: `a7`, a name, or `machine/a7`
+  <ID>     Queued inbox item id (`inbox[].id` from `h2 get`)
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h2 inbox send
+
+```text
+Interrupt the active turn if needed and immediately send a queued prompt
+
+Usage: h2 inbox send [OPTIONS] <AGENT> <ID>
 
 Arguments:
   <AGENT>  The agent: `a7`, a name, or `machine/a7`

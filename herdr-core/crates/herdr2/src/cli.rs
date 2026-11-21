@@ -2,8 +2,8 @@
 
 use crate::api::{
     AgentParams, ApproveParams, AttachParams, ConfigParams, ExecParams, HandoffParams, InboxEditParams,
-    InboxRemoveParams, InterruptParams, KeepParams, KeysParams, LabelParams, ListParams, PutParams, ReadParams,
-    RunParams, SendParams, SubscribeParams, WaitParams,
+    InboxRemoveParams, InboxSendParams, InterruptParams, KeepParams, KeysParams, LabelParams, ListParams, PutParams,
+    ReadParams, RunParams, SendParams, SubscribeParams, WaitParams,
 };
 use crate::client;
 use crate::paths::Paths;
@@ -34,6 +34,81 @@ enum InboxCmd {
     Edit(InboxEditParams),
     /// Remove a queued prompt before its turn begins.
     Rm(InboxRemoveParams),
+    /// Interrupt the active turn if needed and immediately send a queued prompt.
+    Send(InboxSendParams),
+}
+
+#[derive(Subcommand)]
+enum AiCmd {
+    /// Show shared Core AI assistant status, configuration, and KV-cache metrics.
+    Status {
+        /// Target remote machine (`h2 machine ls`).
+        #[arg(long, value_name = "MACHINE")]
+        on: Option<String>,
+    },
+    /// Update shared Core AI assistant settings from a JSON file.
+    SettingsSet {
+        #[arg(long, value_name = "FILE")]
+        file: std::path::PathBuf,
+        /// Target remote machine (`h2 machine ls`).
+        #[arg(long, value_name = "MACHINE")]
+        on: Option<String>,
+        /// Delete the input JSON file right after reading it (safe for API keys).
+        #[arg(long)]
+        consume: bool,
+    },
+    /// Test the shared Core AI assistant URL and API key.
+    Test {
+        #[arg(long, value_name = "FILE")]
+        file: Option<std::path::PathBuf>,
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        #[arg(long, value_name = "MODEL")]
+        model: Option<String>,
+        /// Target remote machine (`h2 machine ls`).
+        #[arg(long, value_name = "MACHINE")]
+        on: Option<String>,
+        /// Delete `--file` right after reading it.
+        #[arg(long)]
+        consume: bool,
+    },
+    /// Recommend a complementary target provider, handoff mode, and note for an upstream session.
+    HandoffRecommend {
+        /// Source agent or terminal (`a1`, `t1`, name, or `machine/a1`).
+        source: String,
+        /// Installed presets available on the target machine (repeatable or comma-separated).
+        #[arg(long = "installed", value_delimiter = ',')]
+        installed: Vec<String>,
+        /// Caller UI language (`zh` / `en`).
+        #[arg(long)]
+        lang: Option<String>,
+    },
+    /// Aggregate local & remote agents and Drove runs into a priority catch-up briefing.
+    Briefing {
+        /// Target remote machine (`h2 machine ls`).
+        #[arg(long)]
+        on: Option<String>,
+        /// Preferred language (`zh-CN` / `en`).
+        #[arg(long)]
+        lang: Option<String>,
+        /// Away duration in minutes (optional context for executive headline).
+        #[arg(long)]
+        away_minutes: Option<u32>,
+        /// Return deterministic aggregation only without calling Core AI.
+        #[arg(long)]
+        no_ai: bool,
+    },
+    /// Generate or refresh a concise semantic title and progress micro-summary for an agent or terminal.
+    SummarizeAgent {
+        /// Target agent or terminal (`a1`, `t1`, name, or `machine/a1`).
+        target: String,
+        /// Preferred language (`zh-CN` / `en`).
+        #[arg(long)]
+        lang: Option<String>,
+        /// Return deterministic summary only without calling Core AI.
+        #[arg(long)]
+        no_ai: bool,
+    },
 }
 
 #[derive(Parser)]
@@ -110,6 +185,11 @@ enum Cmd {
     Mcp,
     /// Manage multi-agent Drove orchestration (`drove status`, `drove web`, `drove settings`, ...).
     Drove(crate::drove::cli::DroveCli),
+    /// Inspect or configure the shared Core AI assistant (`ai status`, `ai settings-set`, `ai test`).
+    Ai {
+        #[command(subcommand)]
+        action: AiCmd,
+    },
     /// Hidden Git ref checkpoints, pure turn diffs, and session/workspace rollback (`ls`, `snap`, `diff`, `rollback`).
     Checkpoint(checkpoint::CheckpointCli),
     /// Swap this h2 for another build and restart core.
@@ -388,6 +468,132 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             let (json, human) = crate::drove::cli::execute(&paths, p)?;
             Out { json, human }
         }
+        Cmd::Ai { action } => match action {
+            AiCmd::Status { on } => {
+                let mut params = json!({});
+                if let Some(m) = on {
+                    params["on"] = json!(m);
+                }
+                let r = call("ai.status", params)?;
+                let human = format!(
+                    "AI {}: {} (model: {}, cache hit: {:.0}%, local hits: {})",
+                    if r["configured"].as_bool().unwrap_or(false) { "ready" } else { "unconfigured" },
+                    r["baseUrl"].as_str().filter(|s| !s.is_empty()).unwrap_or("-"),
+                    r["model"].as_str().filter(|s| !s.is_empty()).unwrap_or("auto"),
+                    r["usage"]["cacheHitRatio"].as_f64().unwrap_or(0.0) * 100.0,
+                    r["usage"]["localCacheHits"].as_u64().unwrap_or(0),
+                );
+                Out { json: r, human }
+            }
+            AiCmd::SettingsSet { file, on, consume } => {
+                let text = std::fs::read_to_string(&file)
+                    .map_err(|e| RpcError::new("usage", format!("cannot read {}: {e}", file.display()), ""))?;
+                if consume {
+                    let _ = std::fs::remove_file(&file);
+                }
+                let mut params: Value = serde_json::from_str(&text)
+                    .map_err(|e| RpcError::new("usage", format!("invalid JSON in {}: {e}", file.display()), ""))?;
+                if let Some(m) = on
+                    && let Some(obj) = params.as_object_mut()
+                {
+                    obj.insert("on".into(), json!(m));
+                }
+                let r = call("ai.settings.set", params)?;
+                Out { json: r, human: "AI settings saved".into() }
+            }
+            AiCmd::Test { file, url, model, on, consume } => {
+                let mut params = if let Some(path) = file {
+                    let text = std::fs::read_to_string(&path)
+                        .map_err(|e| RpcError::new("usage", format!("cannot read {}: {e}", path.display()), ""))?;
+                    if consume {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    serde_json::from_str::<Value>(&text)
+                        .map_err(|e| RpcError::new("usage", format!("invalid JSON in {}: {e}", path.display()), ""))?
+                } else {
+                    json!({})
+                };
+                if let Some(obj) = params.as_object_mut() {
+                    if let Some(u) = url {
+                        obj.insert("baseUrl".into(), json!(u));
+                    }
+                    if let Some(m) = model {
+                        obj.insert("model".into(), json!(m));
+                    }
+                    if let Some(o) = on {
+                        obj.insert("on".into(), json!(o));
+                    }
+                }
+                let r = call("ai.test", params)?;
+                let ok = r["ok"].as_bool().unwrap_or(false);
+                let human = if ok {
+                    format!(
+                        "AI OK ({}ms) model={}",
+                        r["latencyMs"].as_u64().unwrap_or(0),
+                        r["discoveredModel"].as_str().unwrap_or("-")
+                    )
+                } else {
+                    format!("AI test failed: {}", r["error"].as_str().unwrap_or("unknown error"))
+                };
+                Out { json: r, human }
+            }
+            AiCmd::HandoffRecommend { source, installed, lang } => {
+                let source = target(Some(source))?;
+                let r = call(
+                    "ai.handoff_recommend",
+                    json!({
+                        "source": source,
+                        "installedPresets": installed,
+                        "language": lang,
+                    }),
+                )?;
+                let human = format!(
+                    "recommend {} ({}) — {}",
+                    r["recommendedPreset"].as_str().unwrap_or("-"),
+                    r["recommendedKind"].as_str().unwrap_or("handoff"),
+                    r["reason"].as_str().unwrap_or("")
+                );
+                Out { json: r, human }
+            }
+            AiCmd::Briefing { on, lang, away_minutes, no_ai } => {
+                let mut params = json!({ "includeAi": !no_ai });
+                if let Some(m) = on {
+                    params["on"] = json!(m);
+                }
+                if let Some(l) = lang {
+                    params["language"] = json!(l);
+                }
+                if let Some(mins) = away_minutes {
+                    params["awayMinutes"] = json!(mins);
+                }
+                let r = call("ai.briefing", params)?;
+                let headline = r["headline"].as_str().unwrap_or("No active items");
+                let c = &r["counts"];
+                let human = format!(
+                    "{headline}\n  critical={} needs_you={} (batch={}) ready_review={} working={}",
+                    c["critical"].as_u64().unwrap_or(0),
+                    c["needsYou"].as_u64().unwrap_or(0),
+                    c["batchGroups"].as_u64().unwrap_or(0),
+                    c["readyReview"].as_u64().unwrap_or(0),
+                    c["working"].as_u64().unwrap_or(0),
+                );
+                Out { json: r, human }
+            }
+            AiCmd::SummarizeAgent { target: raw_target, lang, no_ai } => {
+                let tgt = target(Some(raw_target))?;
+                let mut params = json!({ "target": tgt, "includeAi": !no_ai });
+                if let Some(l) = lang {
+                    params["language"] = json!(l);
+                }
+                let r = call("ai.summarize_agent", params)?;
+                let human = format!(
+                    "{}: {}",
+                    r["semanticTitle"].as_str().unwrap_or("-"),
+                    r["microSummary"].as_str().unwrap_or("-"),
+                );
+                Out { json: r, human }
+            }
+        },
         Cmd::Checkpoint(p) => checkpoint::execute(&paths, p)?,
         Cmd::Wait(mut p) => {
             if p.children.is_none() {
@@ -459,6 +665,15 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
                 let r = call("agent.inbox_remove", to(&p))?;
                 let human = format!(
                     "{}: removed queued message (inbox: {})",
+                    r["address"].as_str().unwrap_or("?"),
+                    r["inbox_len"].as_u64().unwrap_or(0),
+                );
+                Out { json: r, human }
+            }
+            InboxCmd::Send(p) => {
+                let r = call("agent.inbox_send", to(&p))?;
+                let human = format!(
+                    "{}: sending queued message now (inbox: {})",
                     r["address"].as_str().unwrap_or("?"),
                     r["inbox_len"].as_u64().unwrap_or(0),
                 );
@@ -970,6 +1185,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("inbox ls", "agent.get"),
     ("inbox edit", "agent.inbox_edit"),
     ("inbox rm", "agent.inbox_remove"),
+    ("inbox send", "agent.inbox_send"),
     ("wait", "agent.wait"),
     ("interrupt", "agent.interrupt"),
     ("approve", "agent.approve"),
@@ -1003,10 +1219,17 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("drove roles-ai-config", "drove.roles.ai_configure"),
     ("drove magpie-test", "drove.magpie.test"),
     ("drove web", "drove.web.open"),
+    ("ai status", "ai.status"),
+    ("ai settings-set", "ai.settings.set"),
+    ("ai test", "ai.test"),
+    ("ai handoff-recommend", "ai.handoff_recommend"),
+    ("ai briefing", "ai.briefing"),
+    ("ai summarize-agent", "ai.summarize_agent"),
     ("checkpoint ls", "checkpoint.list"),
     ("checkpoint snap", "checkpoint.capture"),
     ("checkpoint diff", "checkpoint.diff"),
     ("checkpoint rollback", "checkpoint.rollback"),
+    ("checkpoint bisect", "checkpoint.bisect"),
 ];
 /// Client/app methods not mapped 1:1 from a separate top-level CLI subcommand.
 pub const API_ONLY: &[&str] = &[
@@ -1026,6 +1249,9 @@ pub const API_ONLY: &[&str] = &[
     "terminal.interrupt",
     "terminal.put",
     "checkpoint.hook",
+    "agent.review",
+    "ai.complete",
+    "ai.classify_terminal_state",
     "drove.http_proxy",
     "drove.subscribe",
 ];

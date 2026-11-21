@@ -8,25 +8,58 @@ cd "$(dirname "$0")/.."
 cargo build --release
 
 data=${XDG_DATA_HOME:-$HOME/.local/share}
-mkdir -p "$HOME/.local/bin" "$data/applications" "$data/icons/hicolor/scalable/apps"
+mkdir -p "$HOME/.local/bin" "$data/applications" "$data/icons/hicolor/scalable/apps" "$data/icons/hicolor/256x256/apps" "$data/icons/hicolor/512x512/apps"
 ln -sfn "$PWD/target/release/herdr2" "$HOME/.local/bin/herdr2"
-cp assets/icons/herdr-ui-icon-clean.svg "$data/icons/hicolor/scalable/apps/herdr2.svg"
+svg_icon="$data/icons/hicolor/scalable/apps/herdr2.svg"
+png_256="$data/icons/hicolor/256x256/apps/herdr2.png"
+png_512="$data/icons/hicolor/512x512/apps/herdr2.png"
+cp assets/icons/herdr-ui-icon-clean.svg "$svg_icon"
+desktop_icon="$svg_icon"
+if [[ -f assets/icons/herdr-ui-icon-clean.png ]]; then
+  if command -v python3 >/dev/null 2>&1 && python3 -c '
+import sys
+src, dst256, dst512 = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    import gi
+    gi.require_version("GdkPixbuf", "2.0")
+    from gi.repository import GdkPixbuf
+    for size, dst in [(256, dst256), (512, dst512)]:
+        pb = GdkPixbuf.Pixbuf.new_from_file_at_scale(src, size, size, True)
+        pb.savev(dst, "png", [], [])
+except Exception:
+    from PIL import Image
+    im = Image.open(src)
+    for size, dst in [(256, dst256), (512, dst512)]:
+        im.resize((size, size), Image.LANCZOS).save(dst, "PNG")
+' assets/icons/herdr-ui-icon-clean.png "$png_256" "$png_512" 2>/dev/null; then
+    desktop_icon="$png_256"
+  else
+    cp assets/icons/herdr-ui-icon-clean.png "$png_512"
+    desktop_icon="$png_512"
+  fi
+fi
+# Use an absolute Icon path so already-running GNOME/Wayland sessions display the icon immediately
+# without needing a shell restart or icon-theme cache reload.
 cat > "$data/applications/herdr2.desktop" <<EOF
 [Desktop Entry]
+Version=1.0
 Type=Application
 Name=Herdr2
 Comment=Headless ACP coding agents
 Exec=$HOME/.local/bin/herdr2
-Icon=herdr2
+Icon=$desktop_icon
 Terminal=false
+StartupNotify=true
 Categories=Development;
 StartupWMClass=herdr2
 EOF
 update-desktop-database "$data/applications" 2>/dev/null || true
-# A stale icon cache hides new icons until it's rebuilt.
-[[ -f $data/icons/hicolor/icon-theme.cache ]] && gtk-update-icon-cache -f -t "$data/icons/hicolor" >/dev/null 2>&1 || true
+touch "$data/icons/hicolor" "$data/applications/herdr2.desktop" 2>/dev/null || true
+# Rebuild icon cache so theme-based lookups also pick up newly added icons immediately.
+command -v gtk-update-icon-cache >/dev/null 2>&1 &&
+  gtk-update-icon-cache -f -t "$data/icons/hicolor" >/dev/null 2>&1 || true
 # Plasma remembers a missing icon until it is told the theme changed,
 # so a fresh install shows an empty page in the taskbar.
 command -v dbus-send >/dev/null 2>&1 &&
   dbus-send --session --type=signal /KIconLoader org.kde.KIconLoader.iconChanged int32:0 2>/dev/null || true
-echo "Installed herdr-app. Quit and reopen Herdr to use the new build."
+echo "Installed herdr2. Quit and reopen Herdr2 to use the new build."

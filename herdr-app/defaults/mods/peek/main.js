@@ -4,13 +4,135 @@
 
 import { View, div, image, svg } from "gpui-kit";
 import { h_flex, v_flex, Popup, TextareaState, Textarea, InputState, Input, TextView, ScrollHandle } from "gpui-base";
-import { agents, terminals, panes, spaces, focused, run, theme, settings, home, props, closeOverlay, openOverlay, checking, h2, shared, setShared } from "herdr";
+import { agents, terminals, panes, spaces, focused, run, theme, settings, home, props, closeOverlay, openOverlay, checking, h2, shared, setShared, window as appWindow } from "herdr";
 import { buildConversationItems, buildPtySessionBadges, summarizeActivityGroup, toolIconPath, formatTime, shortenPath, normalizeConfigOptions, filterConfigChoices, normalizeInboxItems, parseToolDetail, resolveEffortVisual, resolvePeerAddress } from "./acp_model.js";
 
 const LANE_MAX_W = 736; // 46rem editorial content column (--chat-content-max-width)
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
+const KNOWN_ROOT_FILE_RE = /^(?:Makefile|Dockerfile|Cargo\.(?:toml|lock)|package(?:-lock)?\.json|tsconfig\.json|README\.md|CLAUDE\.md|AGENTS\.md|SKILL\.md|justfile|\.gitignore|\.env(?:\.\w+)?)$/i;
+
+function splitFileLineSuffix(raw) {
+  let s = String(raw ?? "").trim();
+  if (!s) return null;
+  let line = null;
+  let endLine = null;
+  const hashMatch = s.match(/#L(\d+)(?:-L?(\d+))?$/i);
+  if (hashMatch) {
+    s = s.slice(0, hashMatch.index);
+    line = Number(hashMatch[1]) || null;
+    endLine = hashMatch[2] ? Math.max(line ?? 1, Number(hashMatch[2]) || 0) : null;
+  } else {
+    const rangeMatch = s.match(/:(\d+)-(\d+)$/);
+    if (rangeMatch) {
+      s = s.slice(0, rangeMatch.index);
+      line = Number(rangeMatch[1]) || null;
+      endLine = Math.max(line ?? 1, Number(rangeMatch[2]) || 0);
+    } else {
+      const colMatch = s.match(/:(\d+):(\d+)$/);
+      if (colMatch) {
+        s = s.slice(0, colMatch.index);
+        line = Number(colMatch[1]) || null;
+      } else {
+        const lineMatch = s.match(/:(\d+)$/);
+        if (lineMatch) {
+          s = s.slice(0, lineMatch.index);
+          line = Number(lineMatch[1]) || null;
+        }
+      }
+    }
+  }
+  return { path: s, line: line && line > 0 ? line : null, endLine: endLine && endLine > 0 ? endLine : null };
+}
+
+function looksLikeFilePath(raw) {
+  const parsed = splitFileLineSuffix(raw);
+  if (!parsed || !parsed.path) return false;
+  const p = parsed.path;
+  if (p.length > 260 || /[\s<>"'`|;&=(){}[\]*?\\]/.test(p)) return false;
+  if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(p)) return false;
+  if (p.startsWith("//") || p === "/" || p === "./" || p === "../" || p === "~/") return false;
+  if (/^(?:\/|~\/|\.\/|\.\.\/)/.test(p)) {
+    if (p.startsWith("/")) {
+      const segs = p.split("/").filter(Boolean);
+      const last = segs[segs.length - 1] ?? "";
+      return segs.length >= 2 && (last.includes(".") || segs.length >= 3);
+    }
+    return p.length > 2;
+  }
+  if (p.includes("/")) {
+    const segs = p.split("/").filter(Boolean);
+    if (segs.length < 2) return false;
+    const last = segs[segs.length - 1];
+    return /\.[a-zA-Z0-9]{1,10}$/.test(last) || KNOWN_ROOT_FILE_RE.test(last);
+  }
+  return KNOWN_ROOT_FILE_RE.test(p) || (Boolean(parsed.line) && /^[A-Za-z0-9_.-]+\.[a-zA-Z0-9]{1,8}$/.test(p));
+}
+
+function linkifyFilePaths(text) {
+  if (!text || typeof text !== "string") return "";
+  const lines = text.split("\n");
+  let inFence = false;
+  let fenceChar = "";
+  const tokenRe = /(!?\[[^\]]*\]\([^)]+\)|`[^`\n]+`|https?:\/\/[^\s)<>]+|(?:~\/|\.\.?\/|\/(?:[A-Za-z0-9._-]+\/)+|[A-Za-z0-9._-]+\/(?:[A-Za-z0-9._-]+\/)*)[A-Za-z0-9._-]+(?::\d+(?:-\d+|:\d+)?|#L\d+(?:-L?\d+)?)?)/g;
+  return lines
+    .map((line) => {
+      const trimmed = line.trimStart();
+      if (/^(`{3,}|~{3,})/.test(trimmed)) {
+        const ch = trimmed[0];
+        if (!inFence) {
+          inFence = true;
+          fenceChar = ch;
+        } else if (ch === fenceChar) {
+          inFence = false;
+          fenceChar = "";
+        }
+        return line;
+      }
+      if (inFence) return line;
+      return line.replace(tokenRe, (match, _g, offset, full) => {
+        if (match.startsWith("[") || match.startsWith("![") || /^https?:\/\//i.test(match)) {
+          return match;
+        }
+        if (match.startsWith("`") && match.endsWith("`")) {
+          const inner = match.slice(1, -1).trim();
+          if (!looksLikeFilePath(inner)) return match;
+          return `[\`${inner}\`](herdr-file://${encodeURI(inner)})`;
+        }
+        // Avoid matching mid-identifier or after URL schemes like `foo://bar/baz.rs`.
+        const prev = offset > 0 ? full[offset - 1] : "";
+        if (prev && /[\w:@]/.test(prev)) return match;
+        const clean = match.replace(/[.,;:]+$/, "");
+        const trailing = match.slice(clean.length);
+        if (!looksLikeFilePath(clean)) return match;
+        return `[${clean}](herdr-file://${encodeURI(clean)})${trailing}`;
+      });
+    })
+    .join("\n");
+}
+
+function parseClickableFileLink(rawUrl) {
+  const url = String(rawUrl ?? "").trim();
+  if (!url || /^https?:\/\//i.test(url) || /^mailto:/i.test(url)) return null;
+  let decoded = url;
+  if (url.startsWith("herdr-file://")) {
+    const rest = url.slice("herdr-file://".length);
+    try { decoded = decodeURI(rest); } catch { decoded = rest; }
+  } else if (url.startsWith("file://")) {
+    let rest = url.slice("file://".length);
+    if (rest.startsWith("localhost/")) rest = rest.slice("localhost".length);
+    try { decoded = decodeURI(rest); } catch { decoded = rest; }
+    if (/^\/[A-Za-z]:\//.test(decoded)) decoded = decoded.slice(1);
+  } else if (/^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(url)) {
+    return null;
+  } else {
+    try { decoded = decodeURI(url); } catch { decoded = url; }
+  }
+  const parsed = splitFileLineSuffix(decoded);
+  if (!parsed || !parsed.path) return null;
+  return parsed;
+}
 const statusWords = () => ({
   starting: tr("Starting…", "启动中…"),
   working: tr("Working", "运行中"),
@@ -97,8 +219,9 @@ function fenceFor(code) {
 export default class Peek extends View {
   init(_props, cx) {
     this.cx = cx;
-    if (!props()?.acp && !props()?.sidePanel) return;
-    this.loadedTerminal = null;
+    this.boundProps = props() ?? _props ?? {};
+    if (!this.boundProps?.acp && !this.boundProps?.sidePanel) return;
+    this.loadedTerminal = this.activeTerminal();
     this.entries = [];
     this.fallbackText = "";
     this.readHow = null;
@@ -109,6 +232,9 @@ export default class Peek extends View {
     this.interrupting = false;
     this.loading = false;
     this.reloadQueued = false;
+    this.reloadForceDetail = false;
+    this.reloadEpoch = 0;
+    this.lastCkptEpoch = "";
     this.expandedGroups = {};
     this.expandedSteps = {};
     this.wrappedCodes = {};
@@ -217,16 +343,24 @@ export default class Peek extends View {
     this.handle = cx.focus_handle();
     if (!checking()) this.handle.focus();
     if (!checking()) {
-      this.reloadTranscript();
+      this.scheduleReload(cx);
       cx.timer.every(1000, (tcx) => {
         if (this.status() === "working") tcx?.notify?.();
       });
-      if (this.isPtyMode() || props()?.sidePanel) {
-        cx.timer.every(1200, () => {
-          if (this.isPtyMode() && this.term()?.state === "live") this.reloadTranscript();
+      if (this.isPtyMode() || this.ownProps()?.sidePanel) {
+        cx.timer.every(1200, (tcx) => {
+          if (this.isPtyMode() && this.term()?.state === "live") this.scheduleReload(tcx);
         });
       }
     }
+  }
+
+  ownProps() {
+    const p = props();
+    if (p && typeof p === "object" && Object.keys(p).length > 0) {
+      return p;
+    }
+    return this.boundProps ?? p ?? {};
   }
 
   focusedMainAddress() {
@@ -252,7 +386,7 @@ export default class Peek extends View {
   }
 
   activeTerminal() {
-    const p = props() ?? {};
+    const p = this.ownProps();
     if (!p.sidePanel) return p.terminal || null;
     const candidates = this.activeSideChatCandidates();
     if (candidates.length === 0) return null;
@@ -264,7 +398,7 @@ export default class Peek extends View {
   }
 
   isPtyMode() {
-    const p = props() ?? {};
+    const p = this.ownProps();
     if (p.pty) return true;
     if (!p.sidePanel) return false;
     const addr = this.activeTerminal();
@@ -274,7 +408,7 @@ export default class Peek extends View {
   }
 
   isSideChatSession(k = this.term()) {
-    const p = props() ?? {};
+    const p = this.ownProps();
     if (p.sidePanel || p.floating) return true;
     const lk = String(k?.lineage?.kind || this.agentDetail?.lineage?.kind || "").toLowerCase().replace("_", "-");
     return lk === "side-chat";
@@ -300,36 +434,73 @@ export default class Peek extends View {
     return this.lastDetailTerminal === addr && this.agentDetail?.state === "finished" ? "ended" : null;
   }
 
-  async reloadTranscript() {
+  scheduleReload(cx = null, opts = {}) {
     const terminal = this.activeTerminal();
     if (!terminal || checking()) return;
+    if (opts?.forceDetail) this.reloadForceDetail = true;
+    if (this.loading) {
+      this.reloadQueued = true;
+      return;
+    }
+    const trySpawn = (target) => {
+      if (!target?.spawn) return false;
+      try {
+        target.spawn(async (taskCx) => {
+          await this.reloadTranscript(taskCx, opts);
+        });
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    if (!trySpawn(cx) && !trySpawn(this.cx)) {
+      Promise.resolve().then(() => this.reloadTranscript(this.cx, opts));
+    }
+  }
+
+  async reloadTranscript(notifyCx = null, opts = {}) {
+    const terminal = this.activeTerminal();
+    if (!terminal || checking()) return;
+    if (opts?.forceDetail) this.reloadForceDetail = true;
     if (this.loading) {
       this.reloadQueued = true;
       return;
     }
     this.loading = true;
+    const myEpoch = ++this.reloadEpoch;
+    const forceDetail = Boolean(this.reloadForceDetail);
+    this.reloadForceDetail = false;
+    let yielded = false;
     try {
       const liveTerm = this.term();
       const curTurn = liveTerm?.turn ?? -1;
       const curInboxLen = Number(liveTerm?.inbox_len ?? 0);
       const needDetail = !this.isPtyMode() && (
-        !this.agentDetail
+        forceDetail
+        || !this.agentDetail
         || this.lastDetailTerminal !== terminal
         || !this.agentDetail.config_options?.length
         || this.lastDetailTurn !== curTurn
         || (!Array.isArray(liveTerm?.inbox) && curInboxLen !== this.lastDetailInboxLen)
       );
-      const [res, detailRes] = await Promise.all([
+      const req = Promise.all([
         h2(["read", "--json", terminal]),
         needDetail ? h2(["get", "--json", terminal]) : Promise.resolve(null),
       ]);
+      yielded = true;
+      const [res, detailRes] = await req;
+      if (this.activeTerminal() !== terminal || myEpoch !== this.reloadEpoch) {
+        this.reloadQueued = true;
+        if (forceDetail) this.reloadForceDetail = true;
+        return;
+      }
       if (detailRes && detailRes.code === 0) {
         try {
           const parsedDetail = JSON.parse(detailRes.stdout || "{}");
           if (parsedDetail && typeof parsedDetail === "object") {
             this.agentDetail = parsedDetail;
             this.lastDetailTerminal = terminal;
-            this.lastDetailTurn = curTurn;
+            this.lastDetailTurn = Number(parsedDetail.turn ?? curTurn);
             this.lastDetailInboxLen = Number(parsedDetail.inbox_len ?? curInboxLen);
           }
         } catch {}
@@ -346,13 +517,21 @@ export default class Peek extends View {
         this.error = null;
       }
     } catch (e) {
-      this.error = e?.message ?? String(e);
+      if (myEpoch === this.reloadEpoch) {
+        this.error = e?.message ?? String(e);
+      }
     } finally {
       this.loading = false;
-      this.cx?.notify();
+      if (yielded) {
+        try {
+          (notifyCx ?? this.cx)?.notify?.();
+        } catch {}
+      }
       if (this.reloadQueued) {
+        const nextForceDetail = this.reloadForceDetail;
         this.reloadQueued = false;
-        this.reloadTranscript();
+        this.reloadForceDetail = false;
+        this.scheduleReload(notifyCx ?? this.cx, { forceDetail: nextForceDetail });
       }
     }
   }
@@ -417,44 +596,59 @@ export default class Peek extends View {
     (cx ?? this.cx)?.notify?.();
   }
 
-  async executeCheckpointRollback(toTurn, restoreFiles, fallbackPrompt, cx) {
+  executeCheckpointRollback(toTurn, restoreFiles, fallbackPrompt, cx) {
     const terminal = this.activeTerminal();
     if (!terminal || checking() || this.rollbackBusy) return;
     this.rollbackBusy = true;
     this.rollbackError = null;
     (cx ?? this.cx)?.notify?.();
-    try {
-      const args = [
-        "checkpoint",
-        "rollback",
-        "--json",
-        terminal,
-        "--to",
-        String(toTurn),
-        ...(restoreFiles ? ["--confirm"] : ["--no-files"]),
-      ];
-      const res = await h2(args, { timeout: 90000 });
-      if (res.code !== 0) {
-        let msg = (res.stderr || res.stdout || "Rollback failed").trim();
+    const runRollback = async (taskCx) => {
+      try {
+        const args = [
+          "checkpoint",
+          "rollback",
+          "--json",
+          terminal,
+          "--to",
+          String(toTurn),
+          ...(restoreFiles ? ["--confirm"] : ["--no-files"]),
+        ];
+        const res = await h2(args, { timeout: 90000 });
+        if (res.code !== 0) {
+          let msg = (res.stderr || res.stdout || "Rollback failed").trim();
+          try {
+            const parsedErr = JSON.parse(res.stderr || "{}");
+            msg = parsedErr?.error?.message || msg;
+          } catch {}
+          this.rollbackError = msg;
+          return;
+        }
+        JSON.parse(res.stdout || "{}");
+        this.rollbackPromptItem = null;
+        this.checkpointDiffs = {};
+        this.checkpointDiffOpen = {};
+        this.expandedGroups = {};
+        this.autoFollow = true;
+        this.revealedSig = "";
+        this.optimisticInbox = null;
+        this.lastDetailTerminal = "";
+        this.reloadEpoch = (this.reloadEpoch || 0) + 1;
+        setShared("checkpoint.sync", `${terminal}:${toTurn}:${Date.now()}`);
+        await this.reloadTranscript(taskCx ?? this.cx, { forceDetail: true });
+      } catch (e) {
+        this.rollbackError = e?.message ?? String(e);
+      } finally {
+        this.rollbackBusy = false;
         try {
-          const parsedErr = JSON.parse(res.stderr || "{}");
-          msg = parsedErr?.error?.message || msg;
+          (taskCx ?? this.cx)?.notify?.();
         } catch {}
-        this.rollbackError = msg;
-        return;
       }
-      JSON.parse(res.stdout || "{}");
-      this.rollbackPromptItem = null;
-      this.checkpointDiffs = {};
-      this.checkpointDiffOpen = {};
-      this.expandedGroups = {};
-      setShared("checkpoint.sync", `${terminal}:${toTurn}:${Date.now()}`);
-      await this.reloadTranscript();
-    } catch (e) {
-      this.rollbackError = e?.message ?? String(e);
-    } finally {
-      this.rollbackBusy = false;
-      (cx ?? this.cx)?.notify?.();
+    };
+    const spawner = cx?.spawn ? cx : this.cx;
+    if (spawner?.spawn) {
+      spawner.spawn(runRollback);
+    } else {
+      runRollback(this.cx);
     }
   }
 
@@ -478,7 +672,7 @@ export default class Peek extends View {
     } finally {
       this.busyAction = false;
       this.cx?.notify();
-      this.reloadTranscript();
+      this.scheduleReload(this.cx);
     }
   }
 
@@ -502,7 +696,7 @@ export default class Peek extends View {
     } finally {
       this.interrupting = false;
       this.cx?.notify();
-      this.reloadTranscript();
+      this.scheduleReload(this.cx);
     }
   }
 
@@ -563,7 +757,7 @@ export default class Peek extends View {
         this.optimisticInbox = null;
         this.error = msg;
         this.lastDetailTerminal = "";
-        this.reloadTranscript();
+        this.scheduleReload(this.cx, { forceDetail: true });
       } else {
         try {
           const parsed = JSON.parse(res.stdout || "{}");
@@ -608,6 +802,20 @@ export default class Peek extends View {
     const current = this.rawInboxFor();
     this.optimisticInbox = current.filter((raw) => Number(raw?.id) !== Number(itemId));
     await this.applyInboxCommand(["inbox", "rm", "--json", terminal, String(itemId)], cx);
+  }
+
+  async sendInboxItemNow(itemId, cx) {
+    const terminal = this.activeTerminal();
+    if (!terminal || itemId == null || checking() || this.inboxBusy) return;
+    if (Number(this.editingInboxId) === Number(itemId)) {
+      this.editingInboxId = null;
+      this.inboxEditFocused = false;
+      this.inboxEditInput?.set_value?.("");
+    }
+    const current = this.rawInboxFor();
+    this.optimisticInbox = current.filter((raw) => Number(raw?.id) !== Number(itemId));
+    await this.applyInboxCommand(["inbox", "send", "--json", terminal, String(itemId)], cx);
+    this.scheduleReload(cx);
   }
 
   configOptionsFor(k) {
@@ -883,6 +1091,31 @@ export default class Peek extends View {
     return opts;
   }
 
+  handleMarkdownLinkClick(url, ev, cx) {
+    const fileTarget = parseClickableFileLink(url);
+    if (fileTarget) {
+      const isMac = typeof appWindow === "function" && appWindow()?.platform === "macos";
+      const ctrlClick = isMac
+        ? (Boolean(ev?.meta) && !ev?.ctrl)
+        : (Boolean(ev?.ctrl) && !ev?.meta);
+      const isLeft = !ev?.button || ev.button === "left";
+      if (!ctrlClick || !isLeft || ev?.alt || ev?.shift) return;
+      const addr = this.activeTerminal();
+      const on = typeof addr === "string" && addr.includes("/") ? addr.split("/")[0] : null;
+      const cwd = this.term()?.cwd || spaces().find((s) => s.active)?.folder || null;
+      const args = { path: fileTarget.path };
+      if (fileTarget.line) args.line = fileTarget.line;
+      if (fileTarget.endLine) args.end_line = fileTarget.endLine;
+      if (on) args.on = on;
+      if (cwd) args.cwd = cwd;
+      run("files.open", args);
+      return;
+    }
+    if (/^https?:\/\//i.test(String(url ?? ""))) {
+      try { cx.open_url(url); } catch {}
+    }
+  }
+
   renderEffortGlyph(t, visual, activeColor) {
     if (!visual) return null;
     const heights = [4, 6.5, 9.5, 12.5];
@@ -1021,9 +1254,18 @@ export default class Peek extends View {
               .text_color(t.foreground)
               .gap(6)
               .child(
-                isRich
-                  ? TextView.markdown(`acp-u-${item.id}`, displayBody, this.mdOptions(t, this.term()?.cwd)).w_full().min_w(0).selectable(true).scrollable(false)
-                  : div().whitespace_normal().child(displayBody),
+                (() => {
+                  const linkedUser = linkifyFilePaths(displayBody);
+                  if (isRich || linkedUser !== displayBody) {
+                    return TextView.markdown(`acp-u-${item.id}`, linkedUser, this.mdOptions(t, this.term()?.cwd))
+                      .w_full()
+                      .min_w(0)
+                      .selectable(true)
+                      .scrollable(false)
+                      .on_link_click((url, cx, ev) => this.handleMarkdownLinkClick(url, ev, cx));
+                  }
+                  return div().whitespace_normal().child(displayBody);
+                })(),
               )
               .when(isLong, (b) =>
                 b.child(
@@ -1517,7 +1759,14 @@ export default class Peek extends View {
             .text_size(12.5)
             .line_height("19px")
             .text_color(t.muted)
-            .child(TextView.markdown(`acp-th-${step.id}`, step.text, this.mdOptions(t, this.term()?.cwd)).w_full().min_w(0).selectable(true).scrollable(false)),
+            .child(
+              TextView.markdown(`acp-th-${step.id}`, linkifyFilePaths(step.text), this.mdOptions(t, this.term()?.cwd))
+                .w_full()
+                .min_w(0)
+                .selectable(true)
+                .scrollable(false)
+                .on_link_click((url, cx, ev) => this.handleMarkdownLinkClick(url, ev, cx)),
+            ),
         ),
       );
   }
@@ -1924,7 +2173,14 @@ export default class Peek extends View {
             .text_size(12)
             .line_height("19px")
             .text_color(t.muted)
-            .child(TextView.markdown(`acp-ho-md-${item.id}`, String(item.context_markdown), mdOpts).w_full().min_w(0).selectable(true).scrollable(false)),
+            .child(
+              TextView.markdown(`acp-ho-md-${item.id}`, linkifyFilePaths(String(item.context_markdown)), mdOpts)
+                .w_full()
+                .min_w(0)
+                .selectable(true)
+                .scrollable(false)
+                .on_link_click((url, cx, ev) => this.handleMarkdownLinkClick(url, ev, cx)),
+            ),
         ),
       );
   }
@@ -2190,7 +2446,14 @@ export default class Peek extends View {
         .text_size(14)
         .line_height("22px")
         .text_color(t.foreground)
-        .child(TextView.markdown(`acp-md-${item.id}-${bi}`, block.text, mdOpts).w_full().min_w(0).selectable(true).scrollable(false));
+        .child(
+          TextView.markdown(`acp-md-${item.id}-${bi}`, linkifyFilePaths(block.text), mdOpts)
+            .w_full()
+            .min_w(0)
+            .selectable(true)
+            .scrollable(false)
+            .on_link_click((url, cx, ev) => this.handleMarkdownLinkClick(url, ev, cx)),
+        );
     });
 
     return v_flex()
@@ -3384,6 +3647,24 @@ export default class Peek extends View {
                       .items_center()
                       .child(
                         h_flex()
+                          .id(`acp-inbox-send-${item.id}`)
+                          .h(22)
+                          .px(6)
+                          .gap(3)
+                          .items_center()
+                          .rounded(6)
+                          .text_size(11)
+                          .font_medium()
+                          .text_color(t.accent ?? t.foreground)
+                          .when(!this.inboxBusy, (el) => el.cursor_pointer().hover((s) => s.bg(withAlpha(accentSolid, "1a")).text_color(accentSolid)))
+                          .tooltip(tr("Interrupt current turn and send immediately", "中断当前输出并立即发送这条消息"))
+                          .on_mouse_down("left", stopMouse)
+                          .on_click((_e, cx) => this.sendInboxItemNow(item.id, cx))
+                          .child(svg(ICONS.arrowUp).size(11))
+                          .child(tr("Send now", "立即发送")),
+                      )
+                      .child(
+                        h_flex()
                           .id(`acp-inbox-edit-${item.id}`)
                           .h(22)
                           .px(6)
@@ -3663,8 +3944,8 @@ export default class Peek extends View {
       );
   }
 
-  renderAcp(t, k, st, pic, parent) {
-    const p = props() ?? {};
+  renderAcp(t, k, st, pic, parent, cx) {
+    const p = this.ownProps();
     const { overlay, tab, pane } = p;
     const isSidePanel = Boolean(p.sidePanel);
     const terminal = this.activeTerminal();
@@ -3679,22 +3960,35 @@ export default class Peek extends View {
       this.loadedOnce = false;
       this.error = null;
       this.lastKey = "";
+      this.lastCkptEpoch = "";
+      this.reloadEpoch = (this.reloadEpoch || 0) + 1;
     }
     const isTab = Boolean(tab);
     const isPty = this.isPtyMode();
     const isDark = Boolean(settings()?.dark ?? true);
     const myPane = pane ?? panes().find((p) => (p.acp || p.structured) && p.terminal === terminal)?.pane ?? null;
     const ckptEpoch = `${terminal}:${k?.foreground?.pid ?? ""}:${k?.checkpoint_seq ?? 0}:${shared("checkpoint.sync") ?? ""}`;
+    let ckptChanged = false;
     if (ckptEpoch !== this.lastCkptEpoch) {
+      ckptChanged = this.lastCkptEpoch !== "";
       this.lastCkptEpoch = ckptEpoch;
       this.checkpoints = [];
       this.checkpointDiffs = {};
       this.checkpointDiffOpen = {};
+      if (ckptChanged) {
+        this.rollbackPromptItem = null;
+        this.expandedGroups = {};
+        this.autoFollow = true;
+        this.revealedSig = "";
+        this.optimisticInbox = null;
+        this.lastDetailTerminal = "";
+        this.reloadEpoch = (this.reloadEpoch || 0) + 1;
+      }
     }
     const key = `${terminal}:${st}:${k?.turn ?? 0}:${k?.transcript_seq ?? 0}:${k?.foreground?.pid ?? ""}:${k?.checkpoint_seq ?? 0}:${k?.pending_permission?.request_id ?? ""}:${k?.inbox_len ?? 0}:${k?.printed ?? 0}:${k?.status_ms ?? 0}:${shared("checkpoint.sync") ?? ""}`;
-    if (!checking() && key !== this.lastKey) {
+    if (!checking() && (ckptChanged || key !== this.lastKey)) {
       this.lastKey = key;
-      Promise.resolve().then(() => this.reloadTranscript());
+      this.scheduleReload(cx, { forceDetail: ckptChanged });
     }
     if (st === "working") {
       const fromTerm = typeof k?.working_since === "number" && k.working_since > 0 ? k.working_since : null;
@@ -3964,7 +4258,7 @@ export default class Peek extends View {
                 t,
                 "acp-refresh",
                 h_flex().gap(5).items_center().child(svg(ICONS.refresh).size(12).when(this.loading, (s) => s.spin(900))).child(tr("Refresh", "刷新")),
-                () => this.reloadTranscript(),
+                (_e, cx) => this.scheduleReload(cx, { forceDetail: true }),
                 { h: 26, px: 8 },
               ),
             ),
@@ -4027,7 +4321,7 @@ export default class Peek extends View {
               ),
             ),
           )
-          .when(!isFloating, (el) =>
+          .when(!isFloating && modalLineageKind !== "side-chat" && modalLineageKind !== "side_chat", (el) =>
             el.child(
               this.pillButton(
                 t,
@@ -4041,7 +4335,7 @@ export default class Peek extends View {
               ),
             ),
           )
-          .when(!isSidePanel, (el) =>
+          .when(!isSidePanel && modalLineageKind !== "side-chat" && modalLineageKind !== "side_chat", (el) =>
             el.child(
               this.pillButton(
                 t,
@@ -4565,10 +4859,11 @@ export default class Peek extends View {
       .when(sideCandidates.length > 1, (el) => el.child(this.renderSideChatSwitcher(t, sideCandidates, terminal)));
   }
 
-  render() {
+  render(cx) {
     const t = theme();
     const p = props() ?? {};
-    const { overlay, acp, floating, parent: parentProp, sidePanel, sideTermHeader } = p;
+    if (Object.keys(p).length > 0) this.boundProps = p;
+    const { overlay, acp, floating, parent: parentProp, sidePanel, sideTermHeader } = this.ownProps();
     const terminal = this.activeTerminal();
     if (sidePanel) {
       if (!terminal) return this.renderSidePanelEmpty(t);
@@ -4579,14 +4874,14 @@ export default class Peek extends View {
       if (sideTermHeader) {
         return this.renderSideTermHeader(t, k, st, pic, parent);
       }
-      return this.renderAcp(t, k, st, pic, parent);
+      return this.renderAcp(t, k, st, pic, parent, cx);
     }
     const k = this.term();
     const st = this.status();
     const pic = icon(k?.program, 14, t.foreground);
     const parent = k?.parent ? terminals().find((x) => x.address === k.parent) : null;
     if (acp) {
-      return this.renderAcp(t, k, st, pic, parent);
+      return this.renderAcp(t, k, st, pic, parent, cx);
     }
     const home = panes().some((p) => p.terminal === terminal);
     const glyph = st === "working" ? SPIN[0] : st === "idle" ? "○" : st ? "●" : "·";
@@ -4676,11 +4971,13 @@ export default class Peek extends View {
             }),
           ),
       )
-      .child(
-        this.button(t, "keep", floating ? tr("Dock", "转分栏") : (home ? tr("↗ go to", "↗ 跳转") : tr("↗ keep", "↗ 挂载")), () => {
-          run(home ? "pane.focus" : "terminal.keep", floating ? { terminal, place: "right" } : { terminal });
-          closeOverlay(overlay);
-        }),
+      .when(lineageKind !== "side-chat" && lineageKind !== "side_chat", (el) =>
+        el.child(
+          this.button(t, "keep", floating ? tr("Dock", "转分栏") : (home ? tr("↗ go to", "↗ 跳转") : tr("↗ keep", "↗ 挂载")), () => {
+            run(home ? "pane.focus" : "terminal.keep", floating ? { terminal, place: "right" } : { terminal });
+            closeOverlay(overlay);
+          }),
+        ),
       )
       .child(this.button(t, "close", "✕", () => closeOverlay(overlay)));
   }

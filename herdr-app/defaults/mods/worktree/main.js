@@ -3,7 +3,48 @@
 
 import { View, div } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Scrollbar } from "gpui-base";
-import { run, props, closeOverlay, theme, spaces, panes, exec, home, appHome, readTextFile } from "herdr";
+import { run, props, closeOverlay, theme, spaces, panes, agents, focused, exec, h2, home, appHome, readTextFile, settings } from "herdr";
+
+const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
+const tr = (en, zh) => (isZh() ? zh : en);
+
+function sanitizeBranchCandidate(raw) {
+  const line = String(raw ?? "")
+    .trim()
+    .split(/\r?\n/)[0]
+    .replace(/^['"`]+|['"`]+$/g, "")
+    .toLowerCase()
+    .replace(/[^a-z0-9/_-]+/g, "-")
+    .replace(/\/+/g, "/")
+    .replace(/-+/g, "-")
+    .replace(/^[-/]+|[-/]+$/g, "");
+  return line.slice(0, 48);
+}
+
+function localSemanticBranch(input) {
+  const raw = String(input ?? "").trim();
+  if (!raw) return "";
+  const lower = raw.toLowerCase();
+  const prefix = /(fix|bug|error|timeout|crash|修复|报错|异常|超时)/.test(lower)
+    ? "fix"
+    : /(refactor|cleanup|重构|优化)/.test(lower)
+      ? "refactor"
+      : /(doc|readme|文档)/.test(lower)
+        ? "docs"
+        : /(test|spec|测试)/.test(lower)
+          ? "test"
+          : "feat";
+  const asciiWords = lower
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter((w) => w.length >= 2 && !["the", "and", "for", "with", "into", "from"].includes(w))
+    .slice(0, 4);
+  if (asciiWords.length > 0) {
+    return `${prefix}/${asciiWords.join("-")}`;
+  }
+  return `${prefix}/${slug(raw)}`;
+}
 
 // Where a space is now: its first terminal's live folder, else where it was made.
 function place(s, all = panes()) {
@@ -138,6 +179,7 @@ export default class Worktree extends View {
     this.handle.focus(); // the root is mounted from the first frame: keep the keyboard here while loading
     if (props()?.action !== "remove") this.input.focus();
     this.busy = false;
+    this.suggesting = false;
     this.error = "";
     this.repo = undefined; // undefined: looking, null: not in git
     this.dirty = false;
@@ -184,6 +226,27 @@ export default class Worktree extends View {
   go(cx) {
     if (this.busy || !this.repo) return;
     cx.spawn(async (cx) => this.work(cx));
+  }
+
+  suggestBranch(cx) {
+    if (this.busy || this.suggesting || !this.repo) return;
+    const foc = typeof focused === "function" ? focused() : null;
+    const focAddr = foc?.shown || foc?.terminal || foc?.agent || null;
+    const focAgent = focAddr && typeof agents === "function" ? agents().find((a) => a.address === focAddr) : null;
+    const seed = this.text.trim()
+      || String(focAgent?.semantic_title || focAgent?.micro_summary || focAgent?.title || "").trim();
+    if (!seed) {
+      this.error = tr("Type a task description first to generate a semantic branch name.", "请先输入一句话任务描述，再点击生成语义分支名。");
+      cx.notify();
+      return;
+    }
+    const branch = sanitizeBranchCandidate(localSemanticBranch(seed));
+    if (branch) {
+      this.text = branch;
+      this.input?.set_value?.(branch);
+      this.error = "";
+    }
+    cx.notify();
   }
 
   async work(cx) {
@@ -356,15 +419,45 @@ export default class Worktree extends View {
       .when(remove && this.unpushed.length > 0, (el) => el.child(div().text_color(t.blocked).child(`Submodule ${this.unpushed.join(", ")} has commits that aren't pushed anywhere: they will be lost.`)))
       .when(!remove && !blocked, (el) =>
         el.child(
-          Input.new(this.input)
-            .h(32)
-            .px(10)
+          h_flex()
+            .gap(6)
             .items_center()
-            .rounded(6)
-            .border(1)
-            .border_color(this.inputFocused ? t.accent : t.input)
-            .bg(t.background)
-            .text_color(t.foreground),
+            .child(
+              Input.new(this.input)
+                .flex_1()
+                .h(32)
+                .px(10)
+                .items_center()
+                .rounded(6)
+                .border(1)
+                .border_color(this.inputFocused ? t.accent : t.input)
+                .bg(t.background)
+                .text_color(t.foreground),
+            )
+            .child(
+              div()
+                .id("wt-suggest-branch")
+                .h(32)
+                .px(9)
+                .flex_none()
+                .flex()
+                .items_center()
+                .rounded(6)
+                .border(1)
+                .border_color(t.border)
+                .bg(t.raised)
+                .text_size(11.5)
+                .text_color(this.suggesting ? t.dim : t.foreground)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover))
+                .tooltip(tr("Convert task text (or focused agent title) into a clean semantic git branch name", "根据任务描述或当前 Agent 语义标题生成规范分支名"))
+                .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                .on_click((_e, cx) => {
+                  cx.stop_propagation();
+                  this.suggestBranch(cx);
+                })
+                .child(this.suggesting ? "…" : tr("✨ Name", "✨ 语义名")),
+            ),
         ),
       )
       .when(Boolean(this.error), (el) => el.child(div().text_color(t.blocked).child(this.error)))

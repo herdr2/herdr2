@@ -747,6 +747,19 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
                 run_body["budget"] = b.clone();
             }
 
+            let preflight = proxy_call(
+                paths,
+                on.as_deref(),
+                "POST",
+                "/api/preflight/worktree",
+                "",
+                Some(json!({
+                    "cwd": cwd_resolved,
+                    "tasks": tasks_val["tasks"],
+                })),
+            )?;
+            let wt_warn = preflight["dirtyWarning"].as_str().map(String::from);
+
             let run = proxy_call(paths, on.as_deref(), "POST", "/api/runs", "", Some(run_body))?;
             let run_id = run["id"].as_str().unwrap_or("").to_string();
             if on.is_none() && !run_id.is_empty() {
@@ -761,8 +774,13 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
                 Some(tasks_val),
             )?;
             let n = tasks["tasks"].as_array().map(|a| a.len()).unwrap_or(0);
-            let out = json!({ "run": run, "tasks": tasks["tasks"] });
-            Ok((out, format!("started run {run_id} with {n} task(s)")))
+            let mut out = json!({ "run": run, "tasks": tasks["tasks"] });
+            let mut human = format!("started run {run_id} with {n} task(s)");
+            if let Some(w) = wt_warn.or_else(|| tasks["worktreeWarning"].as_str().map(String::from)) {
+                out["worktreeWarning"] = Value::String(w.clone());
+                human.push_str(&format!("\n{w}"));
+            }
+            Ok((out, human))
         }
         DroveAction::Add { run, file, stdin, key, title, change, role, deps, verify, worktree, on } => {
             let run_id = resolve_run_id(paths, on.as_deref(), run)?;
@@ -802,7 +820,11 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             }
             let res = proxy_call(paths, on.as_deref(), "POST", &format!("/api/runs/{run_id}/tasks"), "", Some(body))?;
             let n = res["tasks"].as_array().map(|a| a.len()).unwrap_or(0);
-            Ok((res, format!("added {n} task(s) to {run_id}")))
+            let mut human = format!("added {n} task(s) to {run_id}");
+            if let Some(w) = res["worktreeWarning"].as_str() {
+                human.push_str(&format!("\n{w}"));
+            }
+            Ok((res, human))
         }
         DroveAction::Quick { prompt, role, cwd, verify, worktree, wait, on } => {
             let cwd_resolved = cwd.unwrap_or_else(|| {
@@ -810,20 +832,6 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|_| ".".into())
             });
-            let mut run_body = json!({
-                "hostSession": default_host_session(None),
-                "objective": prompt,
-                "cwd": cwd_resolved,
-                "maxConcurrency": 2,
-            });
-            if let Some(v) = &verify {
-                run_body["verify"] = Value::String(v.clone());
-            }
-            let run = proxy_call(paths, on.as_deref(), "POST", "/api/runs", "", Some(run_body))?;
-            let run_id = run["id"].as_str().unwrap_or("").to_string();
-            if on.is_none() && !run_id.is_empty() {
-                save_current_run(paths, &run_id);
-            }
             let task = json!({
                 "tasks": [{
                     "key": "task",
@@ -838,12 +846,45 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
                     "isolation": if worktree { "worktree" } else { "none" },
                 }]
             });
+            let preflight = proxy_call(
+                paths,
+                on.as_deref(),
+                "POST",
+                "/api/preflight/worktree",
+                "",
+                Some(json!({
+                    "cwd": cwd_resolved,
+                    "tasks": task["tasks"],
+                })),
+            )?;
+            let wt_warn = preflight["dirtyWarning"].as_str().map(String::from);
+
+            let mut run_body = json!({
+                "hostSession": default_host_session(None),
+                "objective": prompt,
+                "cwd": cwd_resolved,
+                "maxConcurrency": 2,
+            });
+            if let Some(v) = &verify {
+                run_body["verify"] = Value::String(v.clone());
+            }
+            let run = proxy_call(paths, on.as_deref(), "POST", "/api/runs", "", Some(run_body))?;
+            let run_id = run["id"].as_str().unwrap_or("").to_string();
+            if on.is_none() && !run_id.is_empty() {
+                save_current_run(paths, &run_id);
+            }
             let added = proxy_call(paths, on.as_deref(), "POST", &format!("/api/runs/{run_id}/tasks"), "", Some(task))?;
             if wait {
                 let waited = wait_loop(paths, on.as_deref(), &run_id, 600, 0)?;
                 return Ok((waited.clone(), format!("run {run_id} settled={}", waited["settled"])));
             }
-            Ok((json!({ "run": run, "tasks": added["tasks"] }), format!("started quick run {run_id}")))
+            let mut out = json!({ "run": run, "tasks": added["tasks"] });
+            let mut human = format!("started quick run {run_id}");
+            if let Some(w) = wt_warn.or_else(|| added["worktreeWarning"].as_str().map(String::from)) {
+                out["worktreeWarning"] = Value::String(w.clone());
+                human.push_str(&format!("\n{w}"));
+            }
+            Ok((out, human))
         }
         DroveAction::Wait { run, timeout, since_seq, on } => {
             let run_id = resolve_run_id(paths, on.as_deref(), run)?;

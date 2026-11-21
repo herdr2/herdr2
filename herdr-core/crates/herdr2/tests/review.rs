@@ -52,12 +52,12 @@ fn agent_review_delivers_inline_to_acp_and_stages_oversized_payload() {
     let _ = s.json(&["wait", &a1]);
     let read = s.json(&["read", &a1]);
     let text = read["text"].as_str().unwrap();
-    assert!(text.contains("Code Review Feedback (2 comments across 2 files)"), "{text}");
+    assert!(text.contains("File Line Notes (2 notes across 2 files)"), "{text}");
     assert!(text.contains("src/api.rs:L42-L48"), "{text}");
     assert!(text.contains("Handle empty string cleanly before parsing."), "{text}");
     assert!(text.contains("src/lib.rs:L12 (old/deleted side)"), "{text}");
 
-    // Oversized ACP payload (> 24 KiB) should auto-stage diff-review.md and send a compact pointer.
+    // Oversized ACP payload (> 24 KiB) should auto-stage line-notes.md and send a compact pointer.
     let huge_comments: Vec<_> = (0..30)
         .map(|i| {
             json!({
@@ -65,7 +65,7 @@ fn agent_review_delivers_inline_to_acp_and_stages_oversized_payload() {
                 "side": "new",
                 "start_line": i + 1,
                 "snippet": format!("+{}", "x".repeat(900)),
-                "body": format!("Review item {i}: {}", "detail ".repeat(40)),
+                "body": format!("Note item {i}: {}", "detail ".repeat(40)),
             })
         })
         .collect();
@@ -81,9 +81,9 @@ fn agent_review_delivers_inline_to_acp_and_stages_oversized_payload() {
     );
     let big_res = &big["result"];
     assert_eq!(big_res["comment_count"], 30, "{big}");
-    let staged = big_res["staged_path"].as_str().expect("oversized ACP review must stage file");
-    let staged_body = std::fs::read_to_string(staged).expect("staged review file readable");
-    assert!(staged_body.contains("代码审查意见（30 条评论"), "{staged_body}");
+    let staged = big_res["staged_path"].as_str().expect("oversized ACP payload must stage file");
+    let staged_body = std::fs::read_to_string(staged).expect("staged notes file readable");
+    assert!(staged_body.contains("文件行级消息（30 条"), "{staged_body}");
 }
 
 #[test]

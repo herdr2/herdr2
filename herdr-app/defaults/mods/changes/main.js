@@ -66,7 +66,7 @@ export default class Changes extends View {
 
     // Single reusable inline comment editor (created once in init(), never inside render()).
     this.commentInput = TextareaState.new({
-      placeholder: tr("Add a review comment… (Ctrl/Cmd+Enter to add)", "输入行级审查意见… (Ctrl/Cmd+Enter 添加)"),
+      placeholder: tr("Ask, note, or comment on selected lines… (Ctrl/Cmd+Enter to add)", "针对选中行提问、批注或写修改说明… (Ctrl/Cmd+Enter 添加)"),
     });
     this.commentInput.set_auto_grow(2, 4);
     this.commentTyping = false;
@@ -144,7 +144,7 @@ export default class Changes extends View {
         this.reviewError = null;
       } else {
         this.sendingIds = [];
-        this.reviewError = String(res.error || tr("Failed to send review", "发送审查意见失败"));
+        this.reviewError = String(res.error || tr("Failed to send line notes", "发送行级消息失败"));
       }
     }
   }
@@ -680,7 +680,7 @@ export default class Changes extends View {
               .text_size(11)
               .text_color(hasText ? t.foreground : t.dim)
               .when(hasText, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.saveComposer(cx, false)))
-              .child(composer.editingId ? tr("Update", "更新") : tr("Add", "添加评论")),
+              .child(composer.editingId ? tr("Update", "更新") : tr("Add", "添加")),
           )
           .child(
             div()
@@ -692,7 +692,7 @@ export default class Changes extends View {
               .text_size(11)
               .text_color(hasText && !this.sendingReqId ? t.solid_foreground : t.dim)
               .when(hasText && !this.sendingReqId, (e) => e.cursor_pointer().on_click((_e, cx) => this.saveComposer(cx, true)))
-              .child(tr("Send now", "立即回流")),
+              .child(tr("Send now", "立即发送")),
           ),
       );
   }
@@ -763,8 +763,8 @@ export default class Changes extends View {
               .text_color(accent)
               .child(
                 tr(
-                  `${allDrafts.length} comment${allDrafts.length === 1 ? "" : "s"} · ${fileSet.size} file${fileSet.size === 1 ? "" : "s"}`,
-                  `${allDrafts.length} 条评论 · ${fileSet.size} 个文件`,
+                  `${allDrafts.length} note${allDrafts.length === 1 ? "" : "s"} · ${fileSet.size} file${fileSet.size === 1 ? "" : "s"}`,
+                  `${allDrafts.length} 条批注 · ${fileSet.size} 个文件`,
                 ),
               ),
           )
@@ -876,7 +876,7 @@ export default class Changes extends View {
               .font_medium()
               .text_color(canSend ? t.solid_foreground : t.dim)
               .when(canSend, (e) => e.cursor_pointer().on_click((_e, cx) => this.sendReview(cx)))
-              .child(this.sendingReqId ? tr("Sending…", "发送中…") : tr("Send to Agent", "回流给 Agent")),
+              .child(this.sendingReqId ? tr("Sending…", "发送中…") : tr("Send to Agent", "发给 Agent")),
           ),
       );
   }
@@ -936,7 +936,7 @@ export default class Changes extends View {
                 .text_size(10)
                 .font_semibold()
                 .text_color(accent)
-                .child(tr(`${allDrafts.length} review`, `${allDrafts.length} 条批注`)),
+                .child(tr(`${allDrafts.length} note${allDrafts.length === 1 ? "" : "s"}`, `${allDrafts.length} 条批注`)),
             ),
           )
           .child(div().flex_1())

@@ -72,6 +72,7 @@ Roles (`coder`, `tester`, `writer`, `illustrator`, `reviewer`, `researcher`, plu
   - `readonly` (`reviewer`, `researcher`): zero workspace edits permitted (`bwrap --ro-bind` + diff check).
   - `scoped_write` (`tester`, `writer`, `illustrator`): edits restricted to configured `allowedPaths` globs (`422 role_scope_violation` if exceeded).
   - `writable` (`coder`): workspace edits permitted.
+- **Worktree Preflight Guard**: Before starting a Run that uses `--worktree` / `isolation: worktree` or concurrent writable tasks under `conflictPolicy=auto_worktree`, Drove verifies the workspace is ready for Git worktrees. If it returns `worktree_not_ready` (e.g., not a Git repo, no initial commit yet, in-progress merge/rebase, lock file, or nested unborn `.git`), immediately show the user the reported reason and fix command and wait for them to resolve it before retrying.
 
 ---
 

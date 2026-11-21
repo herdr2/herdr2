@@ -81,6 +81,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("agent.purge", &[req("terminal"), opt("confirmed")], "Permanently delete an agent from the recycle bin and end its session."),
     cmd("agent.empty_trash", &[opt("confirmed")], "Permanently delete all agents in the recycle bin."),
     cmd("agent.status", &[req("status"), opt("terminal")], "Set an agent's status manually (\"idle\", \"working\", \"blocked\", \"done\"), or \"auto\" to return to automatic detection (default target: the focused terminal or shown agent)."),
+    cmd("agent.briefing", &[opt("away_minutes")], "Open the Catch-up Briefing overlay summarizing critical blockers, batchable permission approvals, and completed agents."),
     cmd(
         "agent.handoff",
         &[
@@ -137,6 +138,11 @@ pub const COMMANDS: &[Command] = &[
     cmd("layout.select", &[req("stack"), req("child")], "Show one child of a stack."),
     cmd("layout.reset", &[opt("name")], "Reset a shipped layout and its clicks (the old file is kept aside)."),
     cmd("mod.open", &[req("name")], "Toggle a mod as the overlay its mod.json describes; calling again closes it."),
+    cmd(
+        "files.open",
+        &[req("path"), opt("line"), opt("end_line"), opt("on"), opt("cwd")],
+        "Open a file in the Files panel (works for workspace and external paths), optionally jumping to a line.",
+    ),
     cmd("overlay.close", &[opt("id")], "Close an overlay (default: the top dialog or popup)."),
     // The app.
     cmd("app.help", &[], "Toggle the keys dialog."),

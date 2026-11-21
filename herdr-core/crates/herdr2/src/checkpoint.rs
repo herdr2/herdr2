@@ -37,9 +37,20 @@ pub struct CheckpointMeta {
     pub prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// Origin of `label`: `"manual"` (user bookmark) or `"ai"` (async semantic milestone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label_source: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<CheckpointFileStat>,
     pub ts_ms: u64,
+}
+
+impl CheckpointMeta {
+    /// Returns true for user-created manual bookmarks (explicit `--label` or legacy labeled
+    /// snapshots where `label_source` is not `"ai"`).
+    pub fn is_manual_bookmark(&self) -> bool {
+        self.label.is_some() && self.label_source.as_deref() != Some("ai")
+    }
 }
 
 /// On-disk per-target checkpoint registry (`<state>/checkpoints/<addr>.json`).
@@ -1027,6 +1038,7 @@ pub async fn capture_target_checkpoint_with_session_turn(
 
     let repo_clone = repo.clone();
     let ref_clone = ref_name.clone();
+    let prev_ref_for_bg = prev_ref.clone();
     let (commit_oid, head_oid, files, ts_ms) = tokio::task::spawn_blocking(move || -> Result<_, String> {
         let (commit_oid, head_oid, ts_ms) = capture_checkpoint(&repo_clone, &ref_clone)?;
         let files = if ckpt_turn > 0
@@ -1041,92 +1053,176 @@ pub async fn capture_target_checkpoint_with_session_turn(
     .await
     .map_err(|e| format!("checkpoint task panicked: {e}"))??;
 
-    let mut st = core.lock();
-    let still_exists = match target {
-        TargetKey::Agent(id) => st.reg.agents.contains_key(&id),
-        TargetKey::Terminal(id) => st.pty_reg.terminals.contains_key(&id),
-    };
-    if !still_exists {
-        return Ok(None);
-    }
+    let clean_label = label.and_then(|s| {
+        let t = s.trim().to_string();
+        (!t.is_empty()).then_some(t)
+    });
+    let label_source = clean_label.as_ref().map(|_| "manual".to_string());
 
-    let mut tc = core.target_checkpoints(&mut st, &addr);
-    if skip_if_present && tc.checkpoints.iter().any(|c| c.turn == ckpt_turn) {
-        return Ok(None);
-    }
-
-    let prompt_final = if ckpt_turn > 0 {
-        let p = effective_prompt.or_else(|| tc.active_turn_prompt.clone());
-        tc.active_turn_prompt = None;
-        if tc.active_turn_num == Some(ckpt_turn) {
-            tc.active_turn_num = None;
+    let meta = {
+        let mut st = core.lock();
+        let still_exists = match target {
+            TargetKey::Agent(id) => st.reg.agents.contains_key(&id),
+            TargetKey::Terminal(id) => st.pty_reg.terminals.contains_key(&id),
+        };
+        if !still_exists {
+            return Ok(None);
         }
-        p
-    } else {
-        None
+
+        let mut tc = core.target_checkpoints(&mut st, &addr);
+        if skip_if_present && tc.checkpoints.iter().any(|c| c.turn == ckpt_turn) {
+            return Ok(None);
+        }
+
+        let prompt_final = if ckpt_turn > 0 {
+            let p = effective_prompt.or_else(|| tc.active_turn_prompt.clone());
+            tc.active_turn_prompt = None;
+            if tc.active_turn_num == Some(ckpt_turn) {
+                tc.active_turn_num = None;
+            }
+            p
+        } else {
+            None
+        };
+
+        let meta = CheckpointMeta {
+            turn: ckpt_turn,
+            session_turn: (ckpt_turn > 0).then_some(session_turn).flatten(),
+            ref_name: ref_name.clone(),
+            commit_oid: commit_oid.clone(),
+            head_oid: head_oid.clone(),
+            prompt: prompt_final,
+            label: clean_label,
+            label_source,
+            files: files.clone(),
+            ts_ms,
+        };
+
+        tc.repo_root = Some(repo.toplevel.to_string_lossy().to_string());
+        if let TargetKey::Terminal(id) = target
+            && let Some(t) = st.pty_reg.terminals.get(&id)
+            && let Some(fg) = &t.foreground
+            && fg.pid > 0
+            && Some(fg.pid as u32) != t.pid
+        {
+            tc.cli_fg_pid = Some(fg.pid as u32);
+        }
+        tc.checkpoints.retain(|c| c.turn != ckpt_turn);
+        tc.checkpoints.push(meta.clone());
+        tc.checkpoints.sort_by_key(|c| c.turn);
+        core.save_target_checkpoints(&mut st, tc);
+
+        match target {
+            TargetKey::Agent(id) => {
+                if turn.is_none()
+                    && let Some(a) = st.reg.agents.get_mut(&id)
+                    && ckpt_turn > a.turn
+                {
+                    a.turn = ckpt_turn;
+                    core.save(&st);
+                }
+                if record_transcript_entry && ckpt_turn > 0 {
+                    core.record_transcript(
+                        &mut st,
+                        id,
+                        crate::transcript::Entry::Checkpoint {
+                            turn: ckpt_turn,
+                            ref_name: ref_name.clone(),
+                            commit_oid: commit_oid.clone(),
+                            head_oid,
+                            files: files.clone(),
+                            ts_ms,
+                        },
+                    );
+                }
+                core.emit(&mut st, "checkpoint", id, serde_json::json!({ "meta": &meta }));
+            }
+            TargetKey::Terminal(id) => {
+                if turn.is_none()
+                    && let Some(t) = st.pty_reg.terminals.get_mut(&id)
+                    && ckpt_turn > t.turn
+                {
+                    t.turn = ckpt_turn;
+                    core.save_pty(&st);
+                }
+                core.emit_pty(&mut st, "checkpoint", id, serde_json::json!({ "meta": &meta }));
+            }
+        }
+        meta
     };
 
-    let meta = CheckpointMeta {
-        turn: ckpt_turn,
-        session_turn: (ckpt_turn > 0).then_some(session_turn).flatten(),
-        ref_name: ref_name.clone(),
-        commit_oid: commit_oid.clone(),
-        head_oid: head_oid.clone(),
-        prompt: prompt_final,
-        label,
-        files: files.clone(),
-        ts_ms,
-    };
-
-    tc.repo_root = Some(repo.toplevel.to_string_lossy().to_string());
-    if let TargetKey::Terminal(id) = target
-        && let Some(t) = st.pty_reg.terminals.get(&id)
-        && let Some(fg) = &t.foreground
-        && fg.pid > 0
-        && Some(fg.pid as u32) != t.pid
+    // Out-of-lock async semantic milestone labeling for non-manual, non-empty turn checkpoints.
+    if ckpt_turn > 0
+        && meta.label.is_none()
+        && !meta.files.is_empty()
+        && let Some(prev_ref_bg) = prev_ref_for_bg
+        && core.ai.checkpoint_labeling_enabled()
     {
-        tc.cli_fg_pid = Some(fg.pid as u32);
-    }
-    tc.checkpoints.retain(|c| c.turn != ckpt_turn);
-    tc.checkpoints.push(meta.clone());
-    tc.checkpoints.sort_by_key(|c| c.turn);
-    core.save_target_checkpoints(&mut st, tc);
+        let core_bg = std::sync::Arc::clone(core);
+        let addr_bg = addr.clone();
+        let repo_bg = repo.clone();
+        let ref_bg = ref_name.clone();
+        let oid_bg = meta.commit_oid.clone();
+        let prompt_bg = meta.prompt.clone();
+        let files_bg = meta.files.clone();
+        tokio::spawn(async move {
+            let patch = {
+                let _guard = core_bg.repo_ckpt_lock(&repo_bg.toplevel).lock_owned().await;
+                let r_bg = repo_bg.clone();
+                let from_r = prev_ref_bg;
+                let to_r = ref_bg;
+                tokio::task::spawn_blocking(move || {
+                    diff_checkpoints(&r_bg, ckpt_turn.saturating_sub(1), ckpt_turn, &from_r, &to_r)
+                        .map(|d| d.patch)
+                        .unwrap_or_default()
+                })
+                .await
+                .unwrap_or_default()
+            };
 
-    match target {
-        TargetKey::Agent(id) => {
-            if turn.is_none()
-                && let Some(a) = st.reg.agents.get_mut(&id)
-                && ckpt_turn > a.turn
+            let Some(ai_label) = crate::ai::generate_checkpoint_label(
+                &core_bg.ai,
+                &oid_bg,
+                ckpt_turn,
+                prompt_bg.as_deref(),
+                &files_bg,
+                &patch,
+            )
+            .await
+            else {
+                return;
+            };
+
+            let mut st = core_bg.lock();
+            let alive = match target {
+                TargetKey::Agent(id) => st.reg.agents.contains_key(&id),
+                TargetKey::Terminal(id) => st.pty_reg.terminals.contains_key(&id),
+            };
+            if !alive {
+                return;
+            }
+            let mut tc = core_bg.target_checkpoints(&mut st, &addr_bg);
+            let mut updated_meta = None;
+            if let Some(entry) = tc.checkpoints.iter_mut().find(|c| c.turn == ckpt_turn)
+                && entry.commit_oid == oid_bg
+                && entry.label.is_none()
             {
-                a.turn = ckpt_turn;
-                core.save(&st);
+                entry.label = Some(ai_label);
+                entry.label_source = Some("ai".into());
+                updated_meta = Some(entry.clone());
             }
-            if record_transcript_entry && ckpt_turn > 0 {
-                core.record_transcript(
-                    &mut st,
-                    id,
-                    crate::transcript::Entry::Checkpoint {
-                        turn: ckpt_turn,
-                        ref_name,
-                        commit_oid,
-                        head_oid,
-                        files,
-                        ts_ms,
-                    },
-                );
+            if let Some(m) = updated_meta {
+                core_bg.save_target_checkpoints(&mut st, tc);
+                match target {
+                    TargetKey::Agent(id) => {
+                        core_bg.emit(&mut st, "checkpoint", id, serde_json::json!({ "meta": &m }));
+                    }
+                    TargetKey::Terminal(id) => {
+                        core_bg.emit_pty(&mut st, "checkpoint", id, serde_json::json!({ "meta": &m }));
+                    }
+                }
             }
-            core.emit(&mut st, "checkpoint", id, serde_json::json!({ "meta": &meta }));
-        }
-        TargetKey::Terminal(id) => {
-            if turn.is_none()
-                && let Some(t) = st.pty_reg.terminals.get_mut(&id)
-                && ckpt_turn > t.turn
-            {
-                t.turn = ckpt_turn;
-                core.save_pty(&st);
-            }
-            core.emit_pty(&mut st, "checkpoint", id, serde_json::json!({ "meta": &meta }));
-        }
+        });
     }
 
     Ok(Some(meta))

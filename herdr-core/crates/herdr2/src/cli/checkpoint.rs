@@ -55,6 +55,17 @@ pub enum CheckpointSub {
         #[arg(long)]
         confirm: bool,
     },
+    /// Locate which checkpoint turn most likely introduced a bug or regression.
+    Bisect {
+        /// Agent (`a1`), terminal (`t1`), remote (`machine/t1`), or unique name.
+        target: String,
+        /// Symptom or regression query (e.g. "which turn broke auth tests?").
+        #[arg(long)]
+        query: String,
+        /// Caller UI language (`zh` / `en`).
+        #[arg(long)]
+        lang: Option<String>,
+    },
     /// Internal CLI hook bridge (`claude`, `codex-notify`, `agy`).
     #[command(hide = true)]
     Hook {
@@ -296,6 +307,26 @@ pub fn execute(paths: &Paths, cli: CheckpointCli) -> Result<Out, RpcError> {
             let files_msg =
                 if r["restored_files"].as_bool() == Some(true) { "files + session" } else { "session only" };
             Ok(Out { json: r.clone(), human: format!("rolled back {tgt} to turn {to} ({files_msg})") })
+        }
+        CheckpointSub::Bisect { target, query, lang } => {
+            let target = super::target(paths, Some(target), true)?;
+            let r = super::call(
+                paths,
+                "checkpoint.bisect",
+                json!({
+                    "target": target,
+                    "query": query,
+                    "language": lang,
+                }),
+            )?;
+            let suspect = r["suspectTurn"].as_u64().unwrap_or(0);
+            let safe = r["recommendedRollbackTurn"].as_u64().unwrap_or(0);
+            let conf = (r["confidence"].as_f64().unwrap_or(0.0) * 100.0).round() as u64;
+            let reason = r["reason"].as_str().unwrap_or("");
+            Ok(Out {
+                json: r.clone(),
+                human: format!("suspect T{suspect} ({conf}%) -> recommend rollback to T{safe}: {reason}"),
+            })
         }
         CheckpointSub::Hook { source, phase, event, extra } => {
             let Some(terminal) = std::env::var("H2_TERMINAL_ID").ok().filter(|s| !s.trim().is_empty()) else {

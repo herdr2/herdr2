@@ -559,6 +559,14 @@ pub struct InboxRemoveParams {
 }
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+pub struct InboxSendParams {
+    /// The agent: `a7`, a name, or `machine/a7`.
+    pub agent: String,
+    /// Queued inbox item id (`inbox[].id` from `h2 get`).
+    pub id: u64,
+}
+
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
 pub struct WaitParams {
     /// The agent; with `children`, whose children (default: the caller).
     pub agent: Option<String>,
@@ -1282,6 +1290,14 @@ pub struct HandoffParams {
     #[arg(long)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub to_turn: Option<u64>,
+    /// Include only the most recent N turns from the source transcript (ignored when `from_turn` is set; 0 = all).
+    #[arg(long, value_name = "N")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recent_turns: Option<u64>,
+    /// Maximum byte budget for the generated handoff package (defaults to 24 KiB).
+    #[arg(long, value_name = "BYTES")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
     /// Optional initial instruction sent after staging handoff context.
     #[arg(long, value_name = "TEXT")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1314,6 +1330,10 @@ pub struct HandoffParams {
     #[arg(long)]
     #[serde(default)]
     pub merge_worktree: bool,
+    /// Skip semantic memory distillation / merge-back takeaway compression and send raw bounded turns.
+    #[arg(long)]
+    #[serde(default)]
+    pub raw: bool,
     /// With `--prompt`: wait for the first turn on the target to finish.
     #[arg(long)]
     #[serde(default)]
@@ -1365,6 +1385,8 @@ pub struct HandoffResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_path: Option<String>,
     pub native_fork: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub distilled: bool,
     pub prompt_sent: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree_path: Option<String>,

@@ -34,10 +34,16 @@ pub fn is_claude_agent(preset: Option<&str>, argv: &[String]) -> bool {
     if preset == Some("claude") {
         return true;
     }
-    argv.first()
+    if wrapped_cmd_index(argv)
+        .and_then(|idx| argv.get(idx))
         .and_then(|p| Path::new(p).file_stem())
         .and_then(|s| s.to_str())
         .is_some_and(|s| s.to_ascii_lowercase().starts_with("claude"))
+    {
+        return true;
+    }
+    argv.iter()
+        .any(|arg| arg.to_ascii_lowercase().contains("claude-agent-acp"))
 }
 
 fn is_agy_binary(program: &str) -> bool {
@@ -91,6 +97,22 @@ pub fn ensure_agy_skip_permissions(argv: &mut Vec<String>) {
     }
 }
 
+/// Returns `true` when the preset or command argv invokes Codex ACP (`codex-acp`).
+pub fn is_codex_agent(preset: Option<&str>, argv: &[String]) -> bool {
+    if preset == Some("codex") {
+        return true;
+    }
+    if wrapped_cmd_index(argv)
+        .and_then(|idx| argv.get(idx))
+        .and_then(|p| Path::new(p).file_stem())
+        .and_then(|s| s.to_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("codex-acp"))
+    {
+        return true;
+    }
+    argv.iter().any(|arg| arg.to_ascii_lowercase().contains("codex-acp"))
+}
+
 /// Prevents `cursor-agent`'s bundled `global-agent@3.0.0` (`forceGlobalAgent: true` by default)
 /// from hijacking `@connectrpc/connect-node` `https.request` calls during `session/new` when
 /// `HTTP_PROXY` / `HTTPS_PROXY` is set, while preserving Cursor's native HTTP/2 proxy session manager.
@@ -104,6 +126,227 @@ pub fn apply_cursor_env_quirks(argv: &[String], env: &mut BTreeMap<String, Strin
     if !has_override {
         env.insert("GLOBAL_AGENT_FORCE_GLOBAL_AGENT".into(), "false".into());
     }
+}
+
+/// Points `@agentclientprotocol/codex-acp` at the user's installed `codex` CLI (`CODEX_PATH`) when
+/// available on `PATH`, instead of letting an older cached `codex-acp` package fall back to its
+/// stale bundled `@openai/codex` binary (which may miss newer models or `openai_base_url` routing).
+/// Also merges missing entries from `<codex_home>/models_cache.json` into a cached copy of
+/// `model_catalog_json` when a custom catalog (e.g. Magpie) omits newly released Codex models,
+/// passing it both via a tiny `CODEX_PATH` wrapper (`-c model_catalog_json=...` so `codex app-server`'s
+/// `model/list` exposes `reasoning_effort` and `fast-mode` for those models) and via `CODEX_CONFIG`.
+pub fn apply_codex_env_quirks(argv: &[String], env: &mut BTreeMap<String, String>) {
+    if !is_codex_agent(None, argv) {
+        return;
+    }
+    let explicit_codex_path = env_ignore_case(env, "CODEX_PATH").is_some();
+    let resolved_codex = if explicit_codex_path {
+        None
+    } else {
+        let path_override = env_ignore_case(env, "PATH");
+        let pathext_override = env_ignore_case(env, "PATHEXT");
+        resolve_non_shim_binary_in_path("codex", path_override, pathext_override)
+    };
+
+    let merged_catalog = maybe_merge_codex_model_catalog(env);
+
+    if let Some(codex_bin) = resolved_codex {
+        let effective_codex = merged_catalog
+            .as_deref()
+            .and_then(|merged| write_codex_catalog_wrapper(&codex_bin, merged))
+            .unwrap_or(codex_bin);
+        env.insert("CODEX_PATH".into(), effective_codex.display().to_string());
+    }
+}
+
+#[cfg(unix)]
+fn sh_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+fn write_codex_catalog_wrapper(codex_bin: &Path, merged_catalog: &Path) -> Option<std::path::PathBuf> {
+    let parent = merged_catalog.parent()?;
+    std::fs::create_dir_all(parent).ok()?;
+
+    #[cfg(unix)]
+    let (wrapper_path, content) = {
+        let catalog_toml_str = serde_json::to_string(&merged_catalog.display().to_string()).ok()?;
+        let override_arg = format!("model_catalog_json={catalog_toml_str}");
+        let script = format!(
+            "#!/bin/sh\nexec {} -c {} \"$@\"\n",
+            sh_single_quote(&codex_bin.display().to_string()),
+            sh_single_quote(&override_arg),
+        );
+        (parent.join("codex-wrapper.sh"), script)
+    };
+
+    #[cfg(windows)]
+    let (wrapper_path, content) = {
+        let normalized_catalog = merged_catalog.display().to_string().replace('\\', "/");
+        let catalog_toml_str = serde_json::to_string(&normalized_catalog).ok()?;
+        let script = format!(
+            "@echo off\r\n\"{}\" -c model_catalog_json={} %*\r\n",
+            codex_bin.display(),
+            catalog_toml_str,
+        );
+        (parent.join("codex-wrapper.cmd"), script)
+    };
+
+    if std::fs::read_to_string(&wrapper_path).ok().as_deref() == Some(content.as_str()) {
+        return Some(wrapper_path);
+    }
+
+    let tmp_path = wrapper_path.with_extension(format!("tmp.{}", std::process::id()));
+    if std::fs::write(&tmp_path, content.as_bytes()).is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755)).is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return None;
+        }
+    }
+    if std::fs::rename(&tmp_path, &wrapper_path).is_err() {
+        let _ = std::fs::remove_file(&tmp_path);
+        return None;
+    }
+    Some(wrapper_path)
+}
+
+fn codex_home_dir(env: &BTreeMap<String, String>) -> Option<std::path::PathBuf> {
+    if let Some(explicit) = env_ignore_case(env, "CODEX_HOME") {
+        return Some(std::path::PathBuf::from(explicit));
+    }
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(home) = env_ignore_case(env, key) {
+            return Some(std::path::PathBuf::from(home).join(".codex"));
+        }
+    }
+    None
+}
+
+fn codex_merged_catalog_path(env: &BTreeMap<String, String>) -> std::path::PathBuf {
+    if let Some(cache) = env_ignore_case(env, "XDG_CACHE_HOME") {
+        return std::path::PathBuf::from(cache).join("herdr2/codex-merged-models.json");
+    }
+    #[cfg(windows)]
+    if let Some(local) = env_ignore_case(env, "LOCALAPPDATA") {
+        return std::path::PathBuf::from(local).join("herdr2/codex-merged-models.json");
+    }
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(home) = env_ignore_case(env, key) {
+            return std::path::PathBuf::from(home).join(".cache/herdr2/codex-merged-models.json");
+        }
+    }
+    std::env::temp_dir().join("herdr2-codex-merged-models.json")
+}
+
+fn maybe_merge_codex_model_catalog(env: &mut BTreeMap<String, String>) -> Option<std::path::PathBuf> {
+    let existing_cfg_key = env
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case("CODEX_CONFIG"))
+        .cloned();
+    let mut cfg_obj = match existing_cfg_key.as_deref().and_then(|k| env.get(k)) {
+        Some(raw) if !raw.trim().is_empty() => match serde_json::from_str::<serde_json::Value>(raw) {
+            Ok(serde_json::Value::Object(map)) => {
+                if map.contains_key("model_catalog_json") {
+                    return None;
+                }
+                map
+            }
+            _ => return None,
+        },
+        _ => serde_json::Map::new(),
+    };
+
+    let codex_home = codex_home_dir(env)?;
+    let config_toml_path = codex_home.join("config.toml");
+    let toml_text = std::fs::read_to_string(&config_toml_path).ok()?;
+    let parsed_toml = toml::from_str::<toml::Value>(&toml_text).ok()?;
+    let raw_catalog = parsed_toml
+        .get("model_catalog_json")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+
+    let catalog_path = {
+        let p = std::path::PathBuf::from(raw_catalog);
+        if p.is_absolute() { p } else { codex_home.join(p) }
+    };
+    let cache_path = codex_home.join("models_cache.json");
+    if !catalog_path.is_file() || !cache_path.is_file() {
+        return None;
+    }
+
+    let merged_path = codex_merged_catalog_path(env);
+    let mtime_of = |p: &Path| std::fs::metadata(p).ok().and_then(|m| m.modified().ok());
+    let up_to_date = match (mtime_of(&merged_path), mtime_of(&catalog_path), mtime_of(&cache_path)) {
+        (Some(mt), Some(ct), Some(kt)) => mt >= ct && mt >= kt,
+        _ => false,
+    };
+
+    if !up_to_date {
+        let catalog_text = std::fs::read_to_string(&catalog_path).ok()?;
+        let cache_text = std::fs::read_to_string(&cache_path).ok()?;
+        let mut catalog_val = serde_json::from_str::<serde_json::Value>(&catalog_text).ok()?;
+        let cache_val = serde_json::from_str::<serde_json::Value>(&cache_text).ok()?;
+        let catalog_models = catalog_val.get("models").and_then(serde_json::Value::as_array)?;
+        let cache_models = cache_val.get("models").and_then(serde_json::Value::as_array)?;
+
+        let mut existing_slugs = std::collections::HashSet::new();
+        for m in catalog_models {
+            if let Some(slug) = m.get("slug").and_then(serde_json::Value::as_str) {
+                existing_slugs.insert(slug.to_string());
+            }
+        }
+        let missing: Vec<serde_json::Value> = cache_models
+            .iter()
+            .filter(|m| {
+                m.get("slug")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|s| !existing_slugs.contains(s))
+            })
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return None;
+        }
+
+        let mut merged_models = Vec::with_capacity(missing.len() + catalog_models.len());
+        merged_models.extend(missing);
+        merged_models.extend(catalog_models.iter().cloned());
+        if let Some(obj) = catalog_val.as_object_mut() {
+            obj.insert("models".into(), serde_json::Value::Array(merged_models));
+        } else {
+            return None;
+        }
+
+        let bytes = serde_json::to_vec(&catalog_val).ok()?;
+        if let Some(parent) = merged_path.parent()
+            && std::fs::create_dir_all(parent).is_err()
+        {
+            return None;
+        }
+        let tmp_path = merged_path.with_extension(format!("json.tmp.{}", std::process::id()));
+        if std::fs::write(&tmp_path, bytes).is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return None;
+        }
+        if std::fs::rename(&tmp_path, &merged_path).is_err() {
+            let _ = std::fs::remove_file(&tmp_path);
+            return None;
+        }
+    }
+
+    cfg_obj.insert("model_catalog_json".into(), serde_json::Value::String(merged_path.display().to_string()));
+    if let Ok(serialized) = serde_json::to_string(&serde_json::Value::Object(cfg_obj)) {
+        let key = existing_cfg_key.unwrap_or_else(|| "CODEX_CONFIG".into());
+        env.insert(key, serialized);
+    }
+    Some(merged_path)
 }
 
 pub fn preset_names(config_presets: &BTreeMap<String, Vec<String>>) -> Vec<String> {
@@ -315,6 +558,139 @@ pub(crate) fn resolve_non_shim_binary(program: &str) -> Option<std::path::PathBu
     resolve_non_shim_binary_in_path(program, None, None)
 }
 
+fn env_ignore_case<'a>(env: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
+    env.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| v.as_str())
+        .filter(|s| !s.is_empty())
+}
+
+fn npx_cache_roots(env: &BTreeMap<String, String>) -> Vec<std::path::PathBuf> {
+    let mut roots = Vec::new();
+    let mut push_unique = |p: std::path::PathBuf| {
+        if !roots.contains(&p) {
+            roots.push(p);
+        }
+    };
+    if let Some(cache) = env_ignore_case(env, "NPM_CONFIG_CACHE") {
+        push_unique(std::path::PathBuf::from(cache).join("_npx"));
+    }
+    let mut homes: Vec<std::path::PathBuf> = Vec::new();
+    for key in ["HOME", "USERPROFILE"] {
+        if let Some(h) = env_ignore_case(env, key) {
+            let pb = std::path::PathBuf::from(h);
+            if !homes.contains(&pb) {
+                homes.push(pb);
+            }
+        }
+    }
+    if homes.is_empty() && env.is_empty() {
+        for key in ["HOME", "USERPROFILE"] {
+            if let Ok(h) = std::env::var(key)
+                && !h.trim().is_empty()
+            {
+                let pb = std::path::PathBuf::from(h);
+                if !homes.contains(&pb) {
+                    homes.push(pb);
+                }
+            }
+        }
+    }
+    for home in homes {
+        push_unique(home.join(".npm/_npx"));
+    }
+    if let Some(local) = env_ignore_case(env, "LOCALAPPDATA") {
+        push_unique(std::path::PathBuf::from(local).join("npm-cache/_npx"));
+    }
+    roots
+}
+
+fn resolve_in_npx_cache(
+    program: &str,
+    env: &BTreeMap<String, String>,
+    pathext_override: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    if program.contains('/') || program.contains('\\') || is_ide_shim_path(program) {
+        return None;
+    }
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for root in npx_cache_roots(env) {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let bin_dir = entry.path().join("node_modules/.bin");
+            if !bin_dir.is_dir() {
+                continue;
+            }
+            for cand in candidate_files_in_dir(&bin_dir, program, pathext_override) {
+                if !cand.is_file() || is_ide_shim_path(&cand.to_string_lossy()) {
+                    continue;
+                }
+                let mtime = cand
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                if best.as_ref().is_none_or(|(prev, _)| mtime > *prev) {
+                    best = Some((mtime, cand));
+                }
+            }
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+fn companion_npx_adapter(preset_id: Option<&str>, program: &str) -> Option<(&'static str, &'static str)> {
+    let base = program.rsplit(['/', '\\']).next().unwrap_or(program).to_ascii_lowercase();
+    match (preset_id, base.as_str()) {
+        (Some("claude"), "claude-agent-acp") | (_, "claude-agent-acp") => {
+            Some(("claude", "@agentclientprotocol/claude-agent-acp"))
+        }
+        (Some("codex"), "codex-acp") | (_, "codex-acp") => {
+            Some(("codex", "@agentclientprotocol/codex-acp"))
+        }
+        (Some("pi"), "pi-acp") | (_, "pi-acp") => Some(("pi", "pi-acp")),
+        _ => None,
+    }
+}
+
+/// Resolves an ACP agent command against `env` (`PATH`, cached `_npx` adapters, and companion CLI + `npx` fallback).
+/// Returns `(resolved_executable_path, effective_argv)` when the agent is available to run.
+pub(crate) fn resolve_acp_command_in_env(
+    preset_id: Option<&str>,
+    argv: &[String],
+    env: &BTreeMap<String, String>,
+) -> Option<(std::path::PathBuf, Vec<String>)> {
+    let first = argv.first()?;
+    let path_override = env_ignore_case(env, "PATH");
+    let pathext_override = env_ignore_case(env, "PATHEXT");
+
+    if let Some(found) = resolve_non_shim_binary_in_path(first, path_override, pathext_override) {
+        return Some((found, argv.to_vec()));
+    }
+
+    if let Some(cached) = resolve_in_npx_cache(first, env, pathext_override) {
+        let mut effective = Vec::with_capacity(argv.len());
+        effective.push(cached.display().to_string());
+        effective.extend(argv[1..].iter().cloned());
+        return Some((cached, effective));
+    }
+
+    if let Some((companion_cli, npx_pkg)) = companion_npx_adapter(preset_id, first)
+        && resolve_non_shim_binary_in_path(companion_cli, path_override, pathext_override).is_some()
+        && let Some(npx_bin) = resolve_non_shim_binary_in_path("npx", path_override, pathext_override)
+    {
+        let mut effective = Vec::with_capacity(argv.len() + 2);
+        effective.push(npx_bin.display().to_string());
+        effective.push("-y".into());
+        effective.push(npx_pkg.into());
+        effective.extend(argv[1..].iter().cloned());
+        return Some((npx_bin, effective));
+    }
+
+    None
+}
+
 fn shim_error(program: &str) -> RpcError {
     RpcError::new(
         "config",
@@ -430,5 +806,111 @@ mod tests {
         let mut other = BTreeMap::new();
         apply_cursor_env_quirks(&["claude-agent-acp".into()], &mut other);
         assert!(other.is_empty());
+    }
+
+    #[test]
+    fn resolves_acp_adapters_from_npx_cache_and_companion_cli_fallback() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr2-presets-acp-resolve-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        let bin_dir = root.join("bin");
+        let npx_bin_dir = root.join(".npm/_npx/abc123/node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&npx_bin_dir).unwrap();
+
+        let claude_acp = npx_bin_dir.join("claude-agent-acp");
+        std::fs::write(&claude_acp, "#!/bin/sh\n").unwrap();
+        let codex_cli = bin_dir.join("codex");
+        let npx_cli = bin_dir.join("npx");
+        std::fs::write(&codex_cli, "#!/bin/sh\n").unwrap();
+        std::fs::write(&npx_cli, "#!/bin/sh\n").unwrap();
+
+        let env = BTreeMap::from([
+            ("HOME".into(), root.display().to_string()),
+            ("PATH".into(), bin_dir.display().to_string()),
+        ]);
+
+        let (resolved_path, resolved_argv) =
+            resolve_acp_command_in_env(Some("claude"), &["claude-agent-acp".into()], &env).unwrap();
+        assert_eq!(resolved_path, claude_acp);
+        assert_eq!(resolved_argv, vec![claude_acp.display().to_string()]);
+        assert!(is_claude_agent(None, &resolved_argv));
+
+        let (codex_path, codex_argv) =
+            resolve_acp_command_in_env(Some("codex"), &["codex-acp".into()], &env).unwrap();
+        assert_eq!(codex_path, npx_cli);
+        assert_eq!(
+            codex_argv,
+            vec![npx_cli.display().to_string(), "-y".into(), "@agentclientprotocol/codex-acp".into()]
+        );
+
+        let npx_claude = vec![
+            npx_cli.display().to_string(),
+            "-y".into(),
+            "@agentclientprotocol/claude-agent-acp".into(),
+        ];
+        assert!(is_claude_agent(None, &npx_claude));
+
+        assert!(resolve_acp_command_in_env(Some("opencode"), &["opencode".into(), "acp".into()], &env).is_none());
+
+        let mut codex_env = env.clone();
+        apply_codex_env_quirks(&codex_argv, &mut codex_env);
+        assert_eq!(
+            codex_env.get("CODEX_PATH").map(String::as_str),
+            Some(codex_cli.display().to_string().as_str())
+        );
+
+        let mut explicit_env = env.clone();
+        explicit_env.insert("CODEX_PATH".into(), "/custom/codex".into());
+        apply_codex_env_quirks(&["codex-acp".into()], &mut explicit_env);
+        assert_eq!(explicit_env.get("CODEX_PATH").map(String::as_str), Some("/custom/codex"));
+
+        let mut claude_env = env.clone();
+        apply_codex_env_quirks(&["claude-agent-acp".into()], &mut claude_env);
+        assert!(!claude_env.contains_key("CODEX_PATH"));
+
+        // Custom model_catalog_json missing models from models_cache.json gets merged automatically.
+        let codex_home = root.join(".codex");
+        std::fs::create_dir_all(&codex_home).unwrap();
+        let custom_catalog = codex_home.join("magpie-models.json");
+        std::fs::write(&custom_catalog, r#"{"models":[{"slug":"gpt-6.1-sol"}]}"#).unwrap();
+        std::fs::write(
+            codex_home.join("models_cache.json"),
+            r#"{"models":[{"slug":"gpt-6.2-sol","context_window":500000},{"slug":"gpt-6.1-sol"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            codex_home.join("config.toml"),
+            format!("model = \"gpt-6.2-sol\"\nmodel_catalog_json = {:?}\n", custom_catalog.display().to_string()),
+        )
+        .unwrap();
+
+        let mut merged_env = env.clone();
+        merged_env.insert("CODEX_CONFIG".into(), r#"{"existing":true}"#.into());
+        apply_codex_env_quirks(&codex_argv, &mut merged_env);
+        let cfg_val: serde_json::Value =
+            serde_json::from_str(merged_env.get("CODEX_CONFIG").expect("CODEX_CONFIG set")).unwrap();
+        assert_eq!(cfg_val["existing"], serde_json::json!(true));
+        let merged_cat_path = cfg_val["model_catalog_json"].as_str().expect("merged path");
+        let merged_cat: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(merged_cat_path).unwrap()).unwrap();
+        let slugs: Vec<&str> = merged_cat["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|m| m["slug"].as_str())
+            .collect();
+        assert_eq!(slugs, vec!["gpt-6.2-sol", "gpt-6.1-sol"]);
+        let wrapper_path = merged_env.get("CODEX_PATH").expect("wrapper CODEX_PATH set");
+        let wrapper_text = std::fs::read_to_string(wrapper_path).unwrap();
+        assert!(wrapper_text.contains("model_catalog_json="), "unexpected wrapper: {wrapper_text}");
+        assert!(wrapper_text.contains(&codex_cli.display().to_string()), "unexpected wrapper: {wrapper_text}");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

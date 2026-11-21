@@ -81,13 +81,13 @@ function items(p, git) {
           ? [
               [tr("Context handoff…", "上下文接力…"), "agent.handoff", { source: term.address, kind: "handoff" }],
               ...(!isSideChat ? [[tr("Fork session…", "会话分叉…"), "agent.handoff", { source: term.address, kind: "fork" }]] : []),
-              [tr("Side chat (right panel)…", "旁路讨论（右侧面板）…"), "agent.handoff", { source: term.address, kind: "side-chat" }],
+              ...(!isSideChat ? [[tr("Side chat (right panel)…", "旁路讨论（右侧面板）…"), "agent.handoff", { source: term.address, kind: "side-chat" }]] : []),
               ...(lineageParent
                 ? [[tr(`Merge back into ${lineageParent}`, `合回 ${lineageParent}`), "agent.handoff", { source: term.address, into: lineageParent, kind: "merge-back" }]]
                 : []),
             ]
           : []),
-        ...(inTab
+        ...(inTab && !isSideChat
           ? [
               [tr("Split right", "向右分栏"), "pane.split", { direction: "right", pane: tg.pane }],
               [tr("Split down", "向下分栏"), "pane.split", { direction: "down", pane: tg.pane }],
@@ -141,7 +141,7 @@ function items(p, git) {
           ? [
               [tr("Context handoff…", "上下文接力…"), "agent.handoff", { source: tg.terminal, kind: "handoff" }],
               ...(!isSideChat ? [[tr("Fork session…", "会话分叉…"), "agent.handoff", { source: tg.terminal, kind: "fork" }]] : []),
-              [tr("Side chat (right panel)…", "旁路讨论（右侧面板）…"), "agent.handoff", { source: tg.terminal, kind: "side-chat" }],
+              ...(!isSideChat ? [[tr("Side chat (right panel)…", "旁路讨论（右侧面板）…"), "agent.handoff", { source: tg.terminal, kind: "side-chat" }]] : []),
               ...(lineageParent
                 ? [[tr(`Merge back into ${lineageParent}`, `合回 ${lineageParent}`), "agent.handoff", { source: tg.terminal, into: lineageParent, kind: "merge-back" }]]
                 : []),
@@ -149,13 +149,17 @@ function items(p, git) {
           : []),
         ...(term
           ? [
-              ...(!tg.pane ? [[tr("Open as Tab", "挂载为标签页"), "terminal.keep", { terminal: tg.terminal, place: "tab" }]] : []),
-              ...(isAcp || !tg.pane ? [[tr("Split right", "右侧分栏"), "terminal.keep", { terminal: tg.terminal, place: "right" }], [tr("Split down", "下方分栏"), "terminal.keep", { terminal: tg.terminal, place: "down" }]] : []),
+              ...(isSideChat
+                ? [[tr("Open in side panel", "在右侧旁路面板打开"), "terminal.peek", { terminal: tg.terminal }]]
+                : [
+                    ...(!tg.pane ? [[tr("Open as Tab", "挂载为标签页"), "terminal.keep", { terminal: tg.terminal, place: "tab" }]] : []),
+                    ...(isAcp || !tg.pane ? [[tr("Split right", "右侧分栏"), "terminal.keep", { terminal: tg.terminal, place: "right" }], [tr("Split down", "下方分栏"), "terminal.keep", { terminal: tg.terminal, place: "down" }]] : []),
+                  ]),
               ...(isAcp ? [acpPermItem(term)] : []),
             ].filter(Boolean)
           : []),
         ...(term ? [[pinned ? tr("Unpin agent", "取消置顶") : tr("Pin to top", "置顶"), "terminal.pin", { terminal: tg.terminal, pinned: !pinned }]] : []),
-        ...(tg.pane ? [[!isEnded ? tr("Close pane (keep in background)", "关闭窗格（转入后台）") : tr("Close pane", "关闭窗格"), "pane.close", { pane: tg.pane }]] : []),
+        ...(tg.pane && !isSideChat ? [[!isEnded ? tr("Close pane (keep in background)", "关闭窗格（转入后台）") : tr("Close pane", "关闭窗格"), "pane.close", { pane: tg.pane }]] : []),
         [tr("Move to recycle bin", "移入回收站"), "agent.trash", { terminal: tg.terminal }],
       ];
     }

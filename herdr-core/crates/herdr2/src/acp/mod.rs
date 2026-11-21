@@ -106,6 +106,7 @@ pub async fn spawn_session(mut spec: SpawnSpec) -> Result<StartedSession, RpcErr
         presets::ensure_agy_skip_permissions(&mut spec.argv);
     }
     presets::apply_cursor_env_quirks(&spec.argv, &mut spec.env);
+    presets::apply_codex_env_quirks(&spec.argv, &mut spec.env);
     let (transport, waiter, mut inbound_rx) = Transport::spawn(&spec.argv, &spec.env, &spec.cwd)?;
 
     let init_res = match setup_session(&transport, &spec, &mut inbound_rx).await {
@@ -1199,7 +1200,7 @@ pub async fn rollback_acp_agent(
     {
         let is_claude = presets::is_claude_agent(agent_info.as_deref(), &argv);
         let is_codex = !is_claude
-            && (argv.first().is_some_and(|s| s.to_ascii_lowercase().contains("codex"))
+            && (argv.iter().any(|s| s.to_ascii_lowercase().contains("codex"))
                 || agent_info.as_deref().is_some_and(|s| s.to_ascii_lowercase().contains("codex")));
         if is_claude || is_codex {
             let cwd_c = cwd.clone();
@@ -1405,6 +1406,11 @@ fn begin_turn(core: &Core, id: u32, prompt: &QueuedPrompt) -> u64 {
     };
     core.record_transcript(&mut st, id, entry);
     core.apply_status(&mut st, id, &StatusReport::root("working"));
+    core.refresh_agent_digest_deterministic(&mut st, id);
+    drop(st);
+    if turn_num == 1 {
+        core.spawn_agent_digest_ai(id, Duration::from_secs(10));
+    }
     turn_num
 }
 
@@ -1450,6 +1456,9 @@ fn finish_turn(core: &Core, id: u32, turn_num: u64, res: Result<Value, CallError
             usage: a.context_usage,
         });
     }
+    core.refresh_agent_digest_deterministic(&mut st, id);
+    drop(st);
+    core.spawn_agent_digest_ai(id, Duration::from_secs(20));
 }
 
 fn handle_update(core: &Core, id: u32, turn_num: u64, params: &Value) {
@@ -1586,6 +1595,9 @@ fn handle_permission(
                     message: "approval needed (`h2 approve` or `h2 deny`)".into(),
                 },
             );
+            core.refresh_agent_digest_deterministic(&mut st, id);
+            drop(st);
+            core.spawn_agent_digest_ai(id, Duration::from_secs(20));
         }
     }
 }
@@ -1611,8 +1623,12 @@ fn cancel_pending_perm(core: &Core, id: u32, turn_num: u64) {
 }
 
 fn record_entry(core: &Core, id: u32, entry: Entry) {
+    let refresh = matches!(entry, Entry::ToolCall { .. } | Entry::Plan { .. } | Entry::Error { .. });
     let mut st = core.lock();
     core.record_transcript(&mut st, id, entry);
+    if refresh {
+        core.refresh_agent_digest_deterministic(&mut st, id);
+    }
 }
 
 #[cfg(test)]

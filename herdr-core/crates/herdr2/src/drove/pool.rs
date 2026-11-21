@@ -260,7 +260,9 @@ async fn finish_unsettled_attempt(
     });
     fail_or_retry_task(core, &attempt.run_id, &attempt.task_id, &attempt.id, kind, &message, MAX_AUTO_RETRIES).await;
     if keep_worker_idle {
-        if let Some(wt) = worker.worktree.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        core.drove.clear_loop_watermark(&attempt.id);
+    core.ai.evict_session(&format!("drove:loop:{}", attempt.id));
+    if let Some(wt) = worker.worktree.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             let run_opt = core.drove.store.get_run(&attempt.run_id);
             let is_aosp = run_opt
                 .as_ref()
@@ -891,7 +893,7 @@ async fn maybe_detect_spinning_loop(core: &Arc<Core>, worker: &Worker, attempt_i
     if att.outcome.is_some() || att.ended_at.is_some() || att.spinning_detected_at.is_some() {
         return;
     }
-    let items = core.drove.store.list_items(&worker.id, Some(attempt_id), None, 25);
+    let items = core.drove.store.list_items(&worker.id, Some(attempt_id), None, 32);
     let recent_tools: Vec<(&str, &str)> = items
         .iter()
         .filter(|it| it.kind == "tool")
@@ -899,17 +901,120 @@ async fn maybe_detect_spinning_loop(core: &Arc<Core>, worker: &Worker, attempt_i
         .map(|tl| (tl.kind.as_deref().unwrap_or(""), tl.title.as_deref().unwrap_or("").trim()))
         .filter(|(_, title)| !title.is_empty())
         .collect();
-    if recent_tools.len() < 5 {
+
+    // Stage 1 (0ms exact rule): 5 consecutive identical `(kind, title)` tool calls.
+    if recent_tools.len() >= 5 {
+        let tail = &recent_tools[recent_tools.len() - 5..];
+        let first = tail[0];
+        if tail.iter().all(|pair| *pair == first) {
+            trigger_loop_detection(
+                core,
+                worker,
+                &att,
+                &cfg.ai.loop_detect,
+                format!("Repeated tool `{}` 5 times", first.1),
+                format!(
+                    "[drove loop-detect] You repeated identical tool call `{}` 5 times. \
+                     Stop repeating it, verify current workspace state, and take a different concrete step \
+                     or call `h2 drove worker ask` / `h2 drove worker done --outcome failed`.",
+                    first.1
+                ),
+            )
+            .await;
+            return;
+        }
+    }
+
+    // Stage 2 (incremental multi-turn semantic oscillation audit via AiSessionPool):
+    // Trigger only when >= 8 tools ran, >= 4 new tools arrived since watermark, and oscillation signals appear.
+    if recent_tools.len() < 8 || !core.ai.is_configured() || core.ai.is_circuit_open() {
         return;
     }
-    let tail = &recent_tools[recent_tools.len() - 5..];
-    let first = tail[0];
-    if !tail.iter().all(|pair| *pair == first) {
+    let prev_wm = core.drove.get_loop_watermark(attempt_id);
+    let max_id = items.iter().map(|it| it.id).max().unwrap_or(0);
+    if max_id <= prev_wm {
+        return;
+    }
+    let delta_items: Vec<Item> = items.iter().filter(|it| it.id > prev_wm).cloned().collect();
+    let delta_tool_count = delta_items.iter().filter(|it| it.kind == "tool").count();
+    if prev_wm > 0 && delta_tool_count < 4 {
         return;
     }
 
+    let tail10 = &recent_tools[recent_tools.len().saturating_sub(10)..];
+    let unique_tools: std::collections::HashSet<(&str, &str)> = tail10.iter().copied().collect();
+    let oscillation_signal = unique_tools.len() <= 3
+        || has_repeated_edit_failure_pattern(&items)
+        || (recent_tools.len() >= 12 && recent_tools.len() % 12 < 4);
+    if !oscillation_signal {
+        return;
+    }
+
+    let Some(task) = core.drove.store.get_task(&att.task_id) else {
+        return;
+    };
+    core.drove.set_loop_watermark(attempt_id, max_id);
+
+    let Some(verdict) =
+        super::ai::detect_semantic_loop(core, &att.run_id, attempt_id, &task, &delta_items).await
+    else {
+        return;
+    };
+    if !verdict.looping || verdict.confidence < 0.80 {
+        return;
+    }
+
+    let detail = if verdict.root_cause.is_empty() {
+        format!("{} (conf {:.2})", verdict.pattern, verdict.confidence)
+    } else {
+        format!("{}: {} (conf {:.2})", verdict.pattern, verdict.root_cause, verdict.confidence)
+    };
+    let steer_msg = if verdict.steer_hint.is_empty() {
+        format!(
+            "[drove loop-detect] Detected semantic oscillation (`{}`). \
+             Stop repeating this cycle, re-check the root cause, or call `h2 drove worker ask`.",
+            verdict.pattern
+        )
+    } else {
+        format!("[drove loop-detect] {} — {}", verdict.pattern, verdict.steer_hint)
+    };
+    trigger_loop_detection(core, worker, &att, &cfg.ai.loop_detect, detail, steer_msg).await;
+}
+
+fn has_repeated_edit_failure_pattern(items: &[Item]) -> bool {
+    let mut edit_paths: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut failed_cmds = 0usize;
+    for it in items.iter().rev().take(16) {
+        if let Some(tl) = &it.tool {
+            let k = tl.kind.as_deref().unwrap_or("").to_ascii_lowercase();
+            let st = tl.status.as_deref().unwrap_or("").to_ascii_lowercase();
+            if st == "failed" || st == "error" {
+                failed_cmds += 1;
+            }
+            if matches!(k.as_str(), "edit" | "write" | "modify") {
+                if let Some(locs) = &tl.locations {
+                    for loc in locs {
+                        *edit_paths.entry(loc.as_str()).or_default() += 1;
+                    }
+                } else if let Some(title) = tl.title.as_deref() {
+                    *edit_paths.entry(title).or_default() += 1;
+                }
+            }
+        }
+    }
+    edit_paths.values().any(|&n| n >= 3) && failed_cmds >= 2
+}
+
+async fn trigger_loop_detection(
+    core: &Arc<Core>,
+    worker: &Worker,
+    att: &Attempt,
+    loop_detect_policy: &str,
+    detail: String,
+    steer_msg: String,
+) {
     let ts = now_iso();
-    let _ = core.drove.store.update_attempt(attempt_id, |a| {
+    let _ = core.drove.store.update_attempt(&att.id, |a| {
         a.spinning_detected_at = Some(ts.clone());
     });
     core.drove.store.append_daemon_event(NewDaemonEvent {
@@ -922,23 +1027,18 @@ async fn maybe_detect_spinning_loop(core: &Arc<Core>, worker: &Worker, attempt_i
         kind: "loop_detect".into(),
         status: "warn".into(),
         title: format!("Potential tool loop on `{}`", worker.id),
-        detail: Some(format!("Repeated tool `{}` 5 times", first.1)),
+        detail: Some(detail),
         duration_ms: None,
         tokens: None,
         cost: None,
     });
-    if cfg.ai.loop_detect == "steer_once"
+    // Per user-confirmed decision: `steer_once` delivers queued guidance (`steer = false`).
+    if loop_detect_policy == "steer_once"
         && let Some(addr) = worker.h2_agent.as_deref()
         && let Some(aid) = crate::agents::parse_id(addr)
         && core.lock().reg.agents.get(&aid).is_some_and(|a| a.is_live())
     {
-        let steer = format!(
-            "[drove loop-detect] You repeated identical tool call `{}` 5 times. \
-             Stop repeating it, verify current workspace state, and take a different concrete step \
-             or call `h2 drove worker ask` / `h2 drove worker done --outcome failed`.",
-            first.1
-        );
-        let _ = core.send(aid, &steer, false, None, Some("drove")).await;
+        let _ = core.send(aid, &steer_msg, false, None, Some("drove")).await;
     }
 }
 
@@ -1104,6 +1204,7 @@ async fn build_attempt_handover(
             note: None,
             is_zh: false,
             worktree_origin: None,
+            omitted_summary: None,
         });
         (!pkg.markdown.trim().is_empty()).then_some(pkg.markdown)
     });

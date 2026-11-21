@@ -98,6 +98,8 @@ pub struct HandoffBuildInput<'a> {
     pub note: Option<&'a str>,
     pub is_zh: bool,
     pub worktree_origin: Option<&'a str>,
+    /// Optional structured semantic memory distilled from `omitted_turns`.
+    pub omitted_summary: Option<&'a str>,
 }
 
 /// Output from [`build_handoff_package`].
@@ -457,7 +459,26 @@ pub fn build_handoff_package(input: &HandoffBuildInput<'_>) -> HandoffPackage {
         _ => String::new(),
     };
 
-    let reserve_footer = 640usize;
+    let distilled_section = input
+        .omitted_summary
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|summary| {
+            let heading = if input.is_zh {
+                "\n## 省略轮次语义记忆蒸馏\n\n"
+            } else {
+                "\n## Distilled Memory of Omitted Turns\n\n"
+            };
+            let mut block = format!("{heading}{summary}");
+            if !block.ends_with('\n') {
+                block.push('\n');
+            }
+            let cap = (budget / 3).clamp(512, 3584);
+            truncate_utf8_with_ellipsis(&block, cap)
+        })
+        .unwrap_or_default();
+
+    let reserve_footer = 640usize + distilled_section.len();
     let mut fixed = String::new();
     fixed.push_str(&header);
     if fixed.len() + git_section.len() + reserve_footer < budget {
@@ -540,6 +561,9 @@ pub fn build_handoff_package(input: &HandoffBuildInput<'_>) -> HandoffPackage {
         }
     }
     if !omitted_turns.is_empty() {
+        if !distilled_section.is_empty() {
+            body.push_str(&distilled_section);
+        }
         body.push_str("\n## Omitted History (On-Demand Lookup)\n\n");
         body.push_str(&format!(
             "Middle turns ({}) were omitted to stay within the {} KiB handoff budget.\n",
@@ -723,6 +747,7 @@ mod tests {
             note: Some("Continue implementation"),
             is_zh: false,
             worktree_origin: None,
+            omitted_summary: None,
         });
 
         assert!(pkg.bytes <= 8 * 1024, "package exceeded budget: {}", pkg.bytes);
@@ -732,6 +757,28 @@ mod tests {
         assert!(pkg.markdown.contains("Original Objective (Turn 1)"));
         assert!(pkg.markdown.contains("Step A"));
         assert!(pkg.markdown.contains("h2 read a1 --from-turn"));
+
+        // When omitted_summary is provided, it is embedded ahead of the lookup hint within budget.
+        let pkg_distilled = build_handoff_package(&HandoffBuildInput {
+            kind: LineageKind::Handoff,
+            source_address: "a1",
+            source_provider: Some("claude"),
+            source_session_id: Some("sess-123"),
+            source_model: Some("claude-sonnet-4"),
+            cwd: None,
+            entries: &entries,
+            from_turn: None,
+            to_turn: None,
+            max_bytes: 8 * 1024,
+            note: Some("Continue implementation"),
+            is_zh: true,
+            worktree_origin: None,
+            omitted_summary: Some("- **已排除的错误方案：** 不要使用全局锁"),
+        });
+        assert!(pkg_distilled.bytes <= 8 * 1024);
+        assert!(pkg_distilled.markdown.contains("省略轮次语义记忆蒸馏"));
+        assert!(pkg_distilled.markdown.contains("不要使用全局锁"));
+        assert!(pkg_distilled.markdown.contains("h2 read a1 --from-turn"));
     }
 
     #[test]
@@ -759,6 +806,7 @@ mod tests {
             note: None,
             is_zh: false,
             worktree_origin: None,
+            omitted_summary: None,
         });
         assert!(pkg.markdown.contains("Read-Only Side Chat"));
         assert!(pkg.markdown.contains("Do NOT modify workspace files"));
@@ -777,6 +825,7 @@ mod tests {
             note: None,
             is_zh: true,
             worktree_origin: None,
+            omitted_summary: None,
         });
         assert!(zh_pkg.markdown.contains("会话模式：上下文接力"));
         assert!(zh_pkg.markdown.contains("本轮不要修改任何文件"));
@@ -904,6 +953,7 @@ mod tests {
             note: None,
             is_zh: true,
             worktree_origin: Some(origin),
+            omitted_summary: None,
         });
         assert!(pkg_zh.markdown.contains("Worktree 隔离约束"));
         assert!(pkg_zh.markdown.contains(&format!("Write {wt}/calc.py")));
@@ -924,6 +974,7 @@ mod tests {
             note: None,
             is_zh: false,
             worktree_origin: Some(origin),
+            omitted_summary: None,
         });
         assert!(pkg_en.markdown.contains("Worktree Isolation Rules (STRICT)"));
         assert!(pkg_en.markdown.contains(&format!("Write {wt}/calc.py")));

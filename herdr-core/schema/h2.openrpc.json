@@ -215,6 +215,13 @@
             ],
             "description": "Context handoff / fork / side-chat parent lineage."
           },
+          "micro_summary": {
+            "description": "One-sentence real-time progress summary for zero-click hover tooltips.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "mode": {
             "description": "Requested mode override (`session/set_mode`).",
             "type": [
@@ -293,6 +300,13 @@
             "default": false,
             "description": "Removed right after it exits (once a waiting parent has the exit code).",
             "type": "boolean"
+          },
+          "semantic_title": {
+            "description": "Concise adaptive semantic task label (never overrides user `herdr.name`).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "signal": {
             "format": "int32",
@@ -381,6 +395,103 @@
         ],
         "type": "object"
       },
+      "AgentDigestResult": {
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "fromCache": {
+            "default": false,
+            "type": "boolean"
+          },
+          "microSummary": {
+            "description": "One-sentence real-time progress micro-summary (<= 96 chars).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "semanticTitle": {
+            "description": "Concise semantic task title (<= 28 chars).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "usedAi": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "address",
+          "usedAi"
+        ],
+        "type": "object"
+      },
+      "AiCompleteResult": {
+        "properties": {
+          "content": {
+            "type": "string"
+          },
+          "fromLocalCache": {
+            "type": "boolean"
+          },
+          "latencyMs": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "model": {
+            "type": "string"
+          },
+          "sessionReused": {
+            "type": "boolean"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/AiUsage"
+          }
+        },
+        "required": [
+          "content",
+          "model",
+          "latencyMs",
+          "usage",
+          "fromLocalCache",
+          "sessionReused"
+        ],
+        "type": "object"
+      },
+      "AiCoreSwitches": {
+        "properties": {
+          "checkpointLabeling": {
+            "type": "boolean"
+          },
+          "handoffDistill": {
+            "type": "boolean"
+          },
+          "notesDigest": {
+            "type": "boolean"
+          },
+          "promptCacheEnabled": {
+            "type": "boolean"
+          },
+          "ptyStatusArbitration": {
+            "type": "boolean"
+          },
+          "semanticSummary": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ptyStatusArbitration",
+          "notesDigest",
+          "promptCacheEnabled",
+          "handoffDistill",
+          "checkpointLabeling",
+          "semanticSummary"
+        ],
+        "type": "object"
+      },
       "AiSettings": {
         "properties": {
           "autoTitle": {
@@ -444,6 +555,102 @@
         },
         "type": "object"
       },
+      "AiStatus": {
+        "properties": {
+          "availableModels": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "baseUrl": {
+            "type": "string"
+          },
+          "circuitOpen": {
+            "type": "boolean"
+          },
+          "configPath": {
+            "type": "string"
+          },
+          "configured": {
+            "type": "boolean"
+          },
+          "consecutiveFailures": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "contextWindow": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cooldownUntil": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "effort": {
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "keyFilePath": {
+            "type": "string"
+          },
+          "keyMasked": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "keySource": {
+            "type": "string"
+          },
+          "lastError": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "maxTokens": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "switches": {
+            "$ref": "#/components/schemas/AiCoreSwitches"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/AiUsageStats"
+          }
+        },
+        "required": [
+          "enabled",
+          "configured",
+          "keySource",
+          "keyFilePath",
+          "configPath",
+          "baseUrl",
+          "model",
+          "effort",
+          "circuitOpen",
+          "consecutiveFailures",
+          "switches",
+          "usage"
+        ],
+        "type": "object"
+      },
       "AiSwitches": {
         "properties": {
           "autoTitle": {
@@ -478,6 +685,25 @@
           "loopDetect"
         ],
         "type": "object"
+      },
+      "AiTaskTier": {
+        "oneOf": [
+          {
+            "const": "nano",
+            "description": "Trivial classification/routing: suppresses thinking (`none` -> `low`), temperature 0, strict max_tokens.",
+            "type": "string"
+          },
+          {
+            "const": "fast",
+            "description": "Concise extraction/summarization: `low` effort, bounded output tokens.",
+            "type": "string"
+          },
+          {
+            "const": "standard",
+            "description": "Deeper analysis (loop audit, diagnosis, role architect): honors user's configured effort/max_tokens.",
+            "type": "string"
+          }
+        ]
       },
       "AiTestResult": {
         "properties": {
@@ -516,6 +742,94 @@
           "ok",
           "baseUrl",
           "latencyMs"
+        ],
+        "type": "object"
+      },
+      "AiUsage": {
+        "properties": {
+          "cachedInputTokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "inputTokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "outputTokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "inputTokens",
+          "outputTokens",
+          "cachedInputTokens"
+        ],
+        "type": "object"
+      },
+      "AiUsageStats": {
+        "properties": {
+          "activeSessions": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "byOp": {
+            "additionalProperties": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "object"
+          },
+          "cacheHitRatio": {
+            "description": "`cached_input_tokens / input_tokens` in `0.0..=1.0`.",
+            "format": "double",
+            "type": "number"
+          },
+          "cachedInputTokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "inputTokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "localCacheHits": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "outputTokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "sessionsReused": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "totalCalls": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "totalCalls",
+          "localCacheHits",
+          "sessionsReused",
+          "activeSessions",
+          "inputTokens",
+          "cachedInputTokens",
+          "outputTokens",
+          "cacheHitRatio"
         ],
         "type": "object"
       },
@@ -566,6 +880,396 @@
           "terminal",
           "resize_notifications",
           "automatic_input"
+        ],
+        "type": "object"
+      },
+      "BatchPermissionGroup": {
+        "properties": {
+          "addresses": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "clusterKey": {
+            "type": "string"
+          },
+          "labels": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "permissionKind": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "clusterKey",
+          "permissionKind",
+          "title",
+          "summary",
+          "addresses",
+          "labels"
+        ],
+        "type": "object"
+      },
+      "BisectAlternative": {
+        "properties": {
+          "confidence": {
+            "format": "float",
+            "type": "number"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "turn": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "turn",
+          "confidence",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "BriefingCounts": {
+        "properties": {
+          "batchGroups": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "critical": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "needsYou": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "readyReview": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "totalActive": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "working": {
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "critical",
+          "needsYou",
+          "batchGroups",
+          "readyReview",
+          "working",
+          "totalActive"
+        ],
+        "type": "object"
+      },
+      "BriefingItem": {
+        "properties": {
+          "address": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "blockedDownstreamCount": {
+            "default": 0,
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "blockedDownstreamKeys": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "hasDiff": {
+            "default": false,
+            "type": "boolean"
+          },
+          "id": {
+            "description": "Stable identifier (`agent:<addr>`, `terminal:<addr>`, `drove_task:<id>`, `drove_msg:<id>`).",
+            "type": "string"
+          },
+          "kind": {
+            "description": "Kind: `\"acp_permission\"`, `\"acp_error\"`, `\"acp_done\"`, `\"acp_working\"`,\n`\"pty_blocked\"`, `\"pty_done\"`, `\"pty_working\"`, `\"drove_blocker\"`, `\"drove_question\"`, `\"drove_verified\"`.",
+            "type": "string"
+          },
+          "machine": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "messageId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "permissionKind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "permissionTitle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runId": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "spaceName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "type": "string"
+          },
+          "statusMs": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "summary": {
+            "type": "string"
+          },
+          "taskKey": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "kind",
+          "title",
+          "summary",
+          "status"
+        ],
+        "type": "object"
+      },
+      "BriefingSnapshot": {
+        "properties": {
+          "counts": {
+            "$ref": "#/components/schemas/BriefingCounts"
+          },
+          "criticalBlockers": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/BriefingItem"
+            },
+            "type": "array"
+          },
+          "generatedMs": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "headline": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "headlineFromAi": {
+            "type": "boolean"
+          },
+          "pendingDecisions": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/BriefingItem"
+            },
+            "type": "array"
+          },
+          "permissionClusters": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/BatchPermissionGroup"
+            },
+            "type": "array"
+          },
+          "readyToReview": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/BriefingItem"
+            },
+            "type": "array"
+          },
+          "workingItems": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/BriefingItem"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "generatedMs",
+          "headlineFromAi",
+          "counts"
+        ],
+        "type": "object"
+      },
+      "BriefingTerminalInput": {
+        "properties": {
+          "address": {
+            "type": "string"
+          },
+          "aiStatusKind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "aiStatusSummary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "branch": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cwd": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "microSummary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "programName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "semanticTitle": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "spaceName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "default": "",
+            "type": "string"
+          },
+          "title": {
+            "default": "",
+            "type": "string"
+          }
+        },
+        "required": [
+          "address"
+        ],
+        "type": "object"
+      },
+      "CheckpointBisectResult": {
+        "properties": {
+          "alternatives": {
+            "items": {
+              "$ref": "#/components/schemas/BisectAlternative"
+            },
+            "type": "array"
+          },
+          "analyzedTurns": {
+            "default": [],
+            "items": {
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "confidence": {
+            "format": "float",
+            "type": "number"
+          },
+          "evidenceFiles": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "fromCache": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "recommendedRollbackTurn": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "suspectTurn": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "target": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "target",
+          "suspectTurn",
+          "recommendedRollbackTurn",
+          "confidence",
+          "reason",
+          "fromCache"
         ],
         "type": "object"
       },
@@ -734,6 +1438,13 @@
               "null"
             ]
           },
+          "label_source": {
+            "description": "Origin of `label`: `\"manual\"` (user bookmark) or `\"ai\"` (async semantic milestone).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "prompt": {
             "type": [
               "string",
@@ -808,6 +1519,71 @@
           "all"
         ],
         "type": "string"
+      },
+      "ClassifyTerminalStateResult": {
+        "properties": {
+          "accepted": {
+            "description": "Whether the verdict met confidence threshold and should override deterministic `\"idle\"`.",
+            "type": "boolean"
+          },
+          "confidence": {
+            "description": "Calibrated model confidence (0.0..=1.0).",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "fromCache": {
+            "default": false,
+            "description": "Whether result came from the 0-token local normalized cache.",
+            "type": "boolean"
+          },
+          "kind": {
+            "description": "Sub-kind when `blocked` (`permission`, `question`, `auth`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "microSummary": {
+            "description": "One-sentence real-time progress summary (<= 96 chars) for zero-click hover tooltip.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "semanticTitle": {
+            "description": "Concise semantic task title (<= 24 chars) for unnamed tab / sidebar subtitle.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "description": "Classified state (`working`, `blocked`, `done`, `error`, or `idle`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "summary": {
+            "description": "Concise human-readable reason (<= 48 chars) for sidebar tooltip/subtitle.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "usedAi": {
+            "description": "Whether AI arbitration was enabled & attempted (false when disabled/unconfigured/circuit open).",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "usedAi",
+          "accepted"
+        ],
+        "type": "object"
       },
       "CoreInfo": {
         "properties": {
@@ -1891,6 +2667,41 @@
         ],
         "type": "object"
       },
+      "HandoffRecommendResult": {
+        "properties": {
+          "fromCache": {
+            "type": "boolean"
+          },
+          "reason": {
+            "description": "Short human-readable explanation for the recommendation.",
+            "type": "string"
+          },
+          "recommendedKind": {
+            "description": "Recommended handoff mode: `\"handoff\"`, `\"fork\"`, or `\"side-chat\"`.",
+            "type": "string"
+          },
+          "recommendedPreset": {
+            "description": "Recommended complementary target preset (e.g. `\"codex\"`, `\"claude\"`, `\"gemini\"`).",
+            "type": "string"
+          },
+          "suggestedNote": {
+            "description": "Actionable pre-filled handoff instruction / note.",
+            "type": "string"
+          },
+          "usedAi": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "recommendedKind",
+          "recommendedPreset",
+          "reason",
+          "suggestedNote",
+          "usedAi",
+          "fromCache"
+        ],
+        "type": "object"
+      },
       "HandoffResult": {
         "properties": {
           "artifact_path": {
@@ -1903,6 +2714,9 @@
             "format": "uint",
             "minimum": 0,
             "type": "integer"
+          },
+          "distilled": {
+            "type": "boolean"
           },
           "included_turns": {
             "items": {
@@ -3254,6 +4068,13 @@
             ],
             "description": "Context handoff / fork / side-chat parent lineage."
           },
+          "micro_summary": {
+            "description": "One-sentence real-time progress summary for zero-click hover tooltips.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "mode": {
             "description": "Requested mode override (`session/set_mode`).",
             "type": [
@@ -3339,6 +4160,13 @@
             "default": false,
             "description": "Removed right after it exits (once a waiting parent has the exit code).",
             "type": "boolean"
+          },
+          "semantic_title": {
+            "description": "Concise adaptive semantic task label (never overrides user `herdr.name`).",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "signal": {
             "format": "int32",
@@ -5737,6 +6565,69 @@
       }
     },
     {
+      "description": "Interrupt the active turn if needed and immediately send a queued prompt from an ACP agent's serial inbox.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "finished"
+          },
+          "message": "finished"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "agent.inbox_send",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The agent: `a7`, a name, or `machine/a7`.",
+          "name": "agent",
+          "required": true,
+          "schema": {
+            "description": "The agent: `a7`, a name, or `machine/a7`.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Queued inbox item id (`inbox[].id` from `h2 get`).",
+          "name": "id",
+          "required": true,
+          "schema": {
+            "description": "Queued inbox item id (`inbox[].id` from `h2 get`).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/Agent"
+        }
+      }
+    },
+    {
       "description": "Wait until an agent leaves `working` (idle, blocked, error, or exited). Already not working returns immediately. With `children`, wait on subordinate agents.",
       "errors": [
         {
@@ -6455,6 +7346,20 @@
           }
         },
         {
+          "description": "Maximum byte budget for the generated handoff package (defaults to 24 KiB).",
+          "name": "max_bytes",
+          "required": false,
+          "schema": {
+            "description": "Maximum byte budget for the generated handoff package (defaults to 24 KiB).",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
           "description": "When merging back (`--into`), instruct the target/parent agent to merge code from the source session's fork worktree branch into the main workspace without deleting the worktree or branch.",
           "name": "merge_worktree",
           "required": false,
@@ -6532,6 +7437,30 @@
             "default": false,
             "description": "Launch an interactive PTY terminal (`t*`) target instead of headless ACP (`a*`).",
             "type": "boolean"
+          }
+        },
+        {
+          "description": "Skip semantic memory distillation / merge-back takeaway compression and send raw bounded turns.",
+          "name": "raw",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Skip semantic memory distillation / merge-back takeaway compression and send raw bounded turns.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Include only the most recent N turns from the source transcript (ignored when `from_turn` is set; 0 = all).",
+          "name": "recent_turns",
+          "required": false,
+          "schema": {
+            "description": "Include only the most recent N turns from the source transcript (ignored when `from_turn` is set; 0 = all).",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         {
@@ -9666,6 +10595,761 @@
       }
     },
     {
+      "description": "Read global Core AI Assistant configuration, masked secret status, available models, circuit breaker state, and KV-cache / token usage metrics.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "ai.status",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "on",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/AiStatus"
+        }
+      }
+    },
+    {
+      "description": "Update global Core AI Assistant settings, Core-level switches, and 0600 API key secret.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "ai.settings.set",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "apiKey",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "baseUrl",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "checkpointLabeling",
+          "required": false,
+          "schema": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "clearKey",
+          "required": false,
+          "schema": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "contextWindow",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "effort",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "enabled",
+          "required": false,
+          "schema": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "handoffDistill",
+          "required": false,
+          "schema": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "maxTokens",
+          "required": false,
+          "schema": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "model",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "notesDigest",
+          "required": false,
+          "schema": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "on",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "promptCacheEnabled",
+          "required": false,
+          "schema": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "ptyStatusArbitration",
+          "required": false,
+          "schema": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "semanticSummary",
+          "required": false,
+          "schema": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/AiStatus"
+        }
+      }
+    },
+    {
+      "description": "Test OpenAI-compatible AI endpoint connectivity and refresh discovered models.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "ai.test",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "apiKey",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "baseUrl",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "model",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "on",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/AiTestResult"
+        }
+      }
+    },
+    {
+      "description": "Run a bounded pure-text completion through the shared Core AI runtime with KV-cache prefix reuse.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "ai.complete",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "maxTokens",
+          "required": false,
+          "schema": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "on",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "op",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "sessionKey",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "systemPrompt",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "tier",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AiTaskTier"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        {
+          "name": "userPrompt",
+          "required": true,
+          "schema": {
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/AiCompleteResult"
+        }
+      }
+    },
+    {
+      "description": "Arbitrate a non-OSC-7501 interactive PTY CLI agent's execution state from its quiet screen tail.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "ai.classify_terminal_state",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Preferred UI language (`zh-CN` / `en`) for concise `summary`.",
+          "name": "language",
+          "required": false,
+          "schema": {
+            "description": "Preferred UI language (`zh-CN` / `en`) for concise `summary`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Target machine (`--on`). Omit for local core (recommended for local VT arbitration).",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "Target machine (`--on`). Omit for local core (recommended for local VT arbitration).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Detected interactive CLI program key (e.g. `claude`, `codex`, `gemini`, `opencode`).",
+          "name": "program",
+          "required": false,
+          "schema": {
+            "description": "Detected interactive CLI program key (e.g. `claude`, `codex`, `gemini`, `opencode`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Raw terminal window title (preserving spinners / status markers).",
+          "name": "rawTitle",
+          "required": false,
+          "schema": {
+            "default": "",
+            "description": "Raw terminal window title (preserving spinners / status markers).",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Bottom lines of the live terminal viewport (at most 15 lines kept).",
+          "name": "tailLines",
+          "required": false,
+          "schema": {
+            "default": [],
+            "description": "Bottom lines of the live terminal viewport (at most 15 lines kept).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/ClassifyTerminalStateResult"
+        }
+      }
+    },
+    {
+      "description": "Recommend a complementary target agent preset, handoff mode, and pre-filled note from an upstream session's recent turns.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "stopping"
+          },
+          "message": "stopping"
+        }
+      ],
+      "name": "ai.handoff_recommend",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Installed target presets available on the source machine (optional).",
+          "name": "installedPresets",
+          "required": false,
+          "schema": {
+            "default": [],
+            "description": "Installed target presets available on the source machine (optional).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        {
+          "description": "Caller UI language (`zh` / `zh-CN` / `en`).",
+          "name": "language",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Caller UI language (`zh` / `zh-CN` / `en`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Source agent or terminal (`a1`, `t1`, name, or `machine/a1`).",
+          "name": "source",
+          "required": true,
+          "schema": {
+            "description": "Source agent or terminal (`a1`, `t1`, name, or `machine/a1`).",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/HandoffRecommendResult"
+        }
+      }
+    },
+    {
+      "description": "Aggregate local and remote agents, terminals, and Drove DAG runs into a priority catch-up briefing with permission clustering and downstream impact ranking.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "ai.briefing",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "How long the user was away (minutes), if triggered from an away-return event.",
+          "name": "awayMinutes",
+          "required": false,
+          "schema": {
+            "description": "How long the user was away (minutes), if triggered from an away-return event.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Whether to request an AI executive headline (default true).",
+          "name": "includeAi",
+          "required": false,
+          "schema": {
+            "default": true,
+            "description": "Whether to request an AI executive headline (default true).",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Preferred UI language (`zh-CN` / `en`).",
+          "name": "language",
+          "required": false,
+          "schema": {
+            "description": "Preferred UI language (`zh-CN` / `en`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Target remote machine (`--on`). Omit to aggregate local + connected machines.",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "Target remote machine (`--on`). Omit to aggregate local + connected machines.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Optional desktop-known PTY terminal agent summaries (supplements Core's live records).",
+          "name": "terminals",
+          "required": false,
+          "schema": {
+            "description": "Optional desktop-known PTY terminal agent summaries (supplements Core's live records).",
+            "items": {
+              "$ref": "#/components/schemas/BriefingTerminalInput"
+            },
+            "type": "array"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/BriefingSnapshot"
+        }
+      }
+    },
+    {
+      "description": "Generate or refresh an adaptive semantic title and one-sentence progress micro-summary for an agent or terminal.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "ai.summarize_agent",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Skip AI call and return only deterministic summary when false (default true).",
+          "name": "includeAi",
+          "required": false,
+          "schema": {
+            "default": true,
+            "description": "Skip AI call and return only deterministic summary when false (default true).",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Preferred UI language (`zh-CN` / `en`).",
+          "name": "language",
+          "required": false,
+          "schema": {
+            "description": "Preferred UI language (`zh-CN` / `en`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Target agent or terminal address (`a1`, `t1`, name, or `machine/a1`).",
+          "name": "target",
+          "required": true,
+          "schema": {
+            "description": "Target agent or terminal address (`a1`, `t1`, name, or `machine/a1`).",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/AgentDigestResult"
+        }
+      }
+    },
+    {
       "description": "List hidden Git ref checkpoints and workspace isolation status for an agent or terminal.",
       "errors": [
         {
@@ -9962,6 +11646,80 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/CheckpointRollbackResult"
+        }
+      }
+    },
+    {
+      "description": "Locate which checkpoint turn most likely introduced a reported bug or regression and recommend a safe rollback anchor.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "checkpoint.bisect",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Caller UI language (`zh` / `zh-CN` / `en`).",
+          "name": "language",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Caller UI language (`zh` / `zh-CN` / `en`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Bug or regression description (e.g. \"which turn broke auth tests?\").",
+          "name": "query",
+          "required": true,
+          "schema": {
+            "description": "Bug or regression description (e.g. \"which turn broke auth tests?\").",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Agent (`a1`), terminal (`t1`), remote (`machine/t1`), or unique name.",
+          "name": "target",
+          "required": true,
+          "schema": {
+            "description": "Agent (`a1`), terminal (`t1`), remote (`machine/t1`), or unique name.",
+            "type": "string"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/CheckpointBisectResult"
         }
       }
     },

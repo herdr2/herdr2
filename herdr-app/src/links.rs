@@ -75,15 +75,73 @@ pub enum Target {
 /// What a link opens. File paths count only when they exist here; relative
 /// ones need the terminal's folder.
 pub fn resolve(link: &str, cwd: Option<&Path>) -> Option<Target> {
+    resolve_with_location(link, cwd).map(|(target, _, _)| target)
+}
+
+/// Parses `#L10-L20`, `#L10`, `:10-20`, `:10:5`, or `:10` suffix into `(base, start_line, end_line)`.
+fn split_line_suffix(raw: &str) -> (&str, Option<u32>, Option<u32>) {
+    let bare = raw.strip_suffix('.').unwrap_or(raw);
+    if let Some((head, frag)) = bare.rsplit_once('#')
+        && let Some(rest) = frag.strip_prefix('L').or_else(|| frag.strip_prefix('l'))
+    {
+        if let Some((a, b)) = rest.split_once('-') {
+            let b = b.strip_prefix('L').or_else(|| b.strip_prefix('l')).unwrap_or(b);
+            if let (Ok(s), Ok(e)) = (a.parse::<u32>(), b.parse::<u32>())
+                && s > 0
+            {
+                return (head, Some(s), Some(e.max(s)));
+            }
+        } else if let Ok(s) = rest.parse::<u32>()
+            && s > 0
+        {
+            return (head, Some(s), None);
+        }
+    }
+    if let Some((head, tail)) = bare.rsplit_once(':') {
+        // `:10-20`
+        if let Some((a, b)) = tail.split_once('-')
+            && !a.is_empty()
+            && !b.is_empty()
+            && a.bytes().all(|c| c.is_ascii_digit())
+            && b.bytes().all(|c| c.is_ascii_digit())
+            && let (Ok(s), Ok(e)) = (a.parse::<u32>(), b.parse::<u32>())
+            && s > 0
+        {
+            return (head, Some(s), Some(e.max(s)));
+        }
+        // `:42` or `:42:7`
+        if !tail.is_empty() && tail.bytes().all(|c| c.is_ascii_digit())
+            && let Ok(n1) = tail.parse::<u32>()
+        {
+            if let Some((head2, line_s)) = head.rsplit_once(':')
+                && !line_s.is_empty()
+                && line_s.bytes().all(|c| c.is_ascii_digit())
+                && let Ok(line) = line_s.parse::<u32>()
+                && line > 0
+            {
+                return (head2, Some(line), None);
+            }
+            if n1 > 0 {
+                return (head, Some(n1), None);
+            }
+        }
+    }
+    (bare, None, None)
+}
+
+/// Resolves a terminal link into a target plus optional 1-based `(start_line, end_line)`.
+pub fn resolve_with_location(link: &str, cwd: Option<&Path>) -> Option<(Target, Option<u32>, Option<u32>)> {
     let scheme = link.split_once(':').is_some_and(|(s, _)| {
         s.len() > 1 && s.starts_with(|c: char| c.is_ascii_alphabetic()) && s.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
     });
     if scheme {
         // Windows can't open a file URL whose path is percent-encoded, the way programs write them.
-        if let Some(path) = file_url_path(link).filter(|p| p.exists()) {
-            return Some(Target::File(path));
+        if let Some((path, line, end_line)) = file_url_path_with_location(link)
+            && path.exists()
+        {
+            return Some((Target::File(path), line, end_line));
         }
-        return Some(Target::Url(link.to_owned()));
+        return Some((Target::Url(link.to_owned()), None, None));
     }
     let home = std::env::home_dir();
     let expanded = if let Some(rest) = link.strip_prefix("~/") {
@@ -102,45 +160,87 @@ pub fn resolve(link: &str, cwd: Option<&Path>) -> Option<Target> {
     let full = if expanded.is_absolute() { expanded } else { cwd?.join(expanded) };
     // Windows ignores a trailing period when checking whether a path exists.
     if !(cfg!(windows) && full.extension().is_some_and(|ext| ext.is_empty())) && full.exists() {
-        return Some(Target::File(full));
+        return Some((Target::File(full), None, None));
     }
-    // The period ending a sentence, or `:42` / `:42:7` naming a place in the file.
-    let mut bare = full.to_str()?.strip_suffix('.').unwrap_or(full.to_str()?);
-    for _ in 0..2 {
-        match bare.rsplit_once(':') {
-            Some((head, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => bare = head,
-            _ => break,
-        }
-    }
-    Path::new(bare).exists().then(|| Target::File(PathBuf::from(bare)))
+    // The period ending a sentence, or `:42` / `:42:7` / `#L10-L20` naming a place in the file.
+    let full_str = full.to_str()?;
+    let (bare, line, end_line) = split_line_suffix(full_str);
+    Path::new(bare)
+        .exists()
+        .then(|| (Target::File(PathBuf::from(bare)), line, end_line))
 }
 
-/// The path a `file:` URL names on this computer, percent-decoded.
-fn file_url_path(link: &str) -> Option<PathBuf> {
+/// Resolves a link printed inside a remote SSH terminal (cannot check local `Path::exists()`).
+pub fn resolve_remote_with_location(link: &str, cwd: Option<&str>) -> Option<(Target, Option<u32>, Option<u32>)> {
+    let scheme = link.split_once(':').is_some_and(|(s, _)| {
+        s.len() > 1 && s.starts_with(|c: char| c.is_ascii_alphabetic()) && s.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    });
+    if scheme {
+        if let Some((path, line, end_line)) = file_url_path_with_location(link) {
+            return Some((Target::File(path), line, end_line));
+        }
+        return Some((Target::Url(link.to_owned()), None, None));
+    }
+    let (bare, line, end_line) = split_line_suffix(link);
+    if bare.is_empty() || bare.starts_with('$') {
+        return None;
+    }
+    let full = if bare.starts_with('/') || bare.starts_with("~/") {
+        bare.to_owned()
+    } else if let Some(dir) = cwd.map(str::trim).filter(|s| !s.is_empty()) {
+        format!("{}/{}", dir.trim_end_matches('/'), bare.trim_start_matches("./"))
+    } else {
+        return None;
+    };
+    Some((Target::File(PathBuf::from(full)), line, end_line))
+}
+
+/// The path a `file:` URL names on this computer, percent-decoded, with optional `#L10-L20` / `:10`.
+fn file_url_path_with_location(link: &str) -> Option<(PathBuf, Option<u32>, Option<u32>)> {
     let rest = link.strip_prefix("file://")?;
     let rest = rest.strip_prefix("localhost").unwrap_or(rest);
     // Another host's file, or no path.
     if !rest.starts_with('/') {
         return None;
     }
-    let rest = rest.split(['?', '#']).next()?;
-    let mut bytes = Vec::with_capacity(rest.len());
+    let (path_and_query, frag) = match rest.split_once('#') {
+        Some((p, f)) => (p, Some(f)),
+        None => (rest, None),
+    };
+    let path_part = path_and_query.split('?').next()?;
+    let mut bytes = Vec::with_capacity(path_part.len());
     let mut i = 0;
-    while i < rest.len() {
-        if rest.as_bytes()[i] == b'%' {
-            bytes.push(u8::from_str_radix(rest.get(i + 1..i + 3)?, 16).ok()?);
+    while i < path_part.len() {
+        if path_part.as_bytes()[i] == b'%' {
+            bytes.push(u8::from_str_radix(path_part.get(i + 1..i + 3)?, 16).ok()?);
             i += 3;
         } else {
-            bytes.push(rest.as_bytes()[i]);
+            bytes.push(path_part.as_bytes()[i]);
             i += 1;
         }
     }
-    let path = String::from_utf8(bytes).ok()?;
+    let mut path = String::from_utf8(bytes).ok()?;
     // `/C:/Users/...` names `C:\Users\...`.
     if cfg!(windows) && path.as_bytes().get(2) == Some(&b':') && path.as_bytes()[1].is_ascii_alphabetic() {
-        return Some(PathBuf::from(path[1..].replace('/', "\\")));
+        path = path[1..].replace('/', "\\");
     }
-    Some(PathBuf::from(path))
+    let mut line = None;
+    let mut end_line = None;
+    if let Some(f) = frag {
+        let probe = format!("x#{f}");
+        let (_, l, e) = split_line_suffix(&probe);
+        line = l;
+        end_line = e;
+    }
+    if line.is_none() && !Path::new(&path).exists() {
+        let (stripped, l, e) = split_line_suffix(&path);
+        if l.is_some() {
+            path = stripped.to_owned();
+            line = l;
+            end_line = e;
+        }
+    }
+    Some((PathBuf::from(path), line, end_line))
 }
 
 /// Hands the target to the system's default handler.
@@ -427,6 +527,26 @@ mod tests {
         for url in [format!("file://{root}{encoded}.gone"), format!("file://{root}{encoded}%ZZ"), format!("file://box{root}{encoded}")] {
             assert_eq!(resolve(&url, None), Some(Target::Url(url.clone())), "{url}");
         }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resolve_with_location_preserves_line_ranges_and_remote_paths() {
+        let dir = std::env::temp_dir().join(format!("herdr-links-loc-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let path = dir.join("src/app.rs");
+        std::fs::write(&path, "fn main() {}\n").unwrap();
+        assert_eq!(resolve_with_location("src/app.rs:42", Some(&dir)), Some((Target::File(path.clone()), Some(42), None)));
+        assert_eq!(resolve_with_location("src/app.rs:42:7", Some(&dir)), Some((Target::File(path.clone()), Some(42), None)));
+        assert_eq!(resolve_with_location("src/app.rs:10-25", Some(&dir)), Some((Target::File(path.clone()), Some(10), Some(25))));
+        assert_eq!(resolve_with_location("src/app.rs#L12-L20", Some(&dir)), Some((Target::File(path.clone()), Some(12), Some(20))));
+        let root = if cfg!(windows) { "/" } else { "" };
+        let url = format!("file://{root}{}#L5-L9", path.to_str().unwrap().replace('\\', "/"));
+        assert_eq!(resolve_with_location(&url, None), Some((Target::File(path.clone()), Some(5), Some(9))));
+        assert_eq!(
+            resolve_remote_with_location("src/foo.rs:18:2", Some("/srv/repo")),
+            Some((Target::File(PathBuf::from("/srv/repo/src/foo.rs")), Some(18), None)),
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

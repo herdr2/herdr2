@@ -80,6 +80,11 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
     }
     let base_env = crate::platform::program_env().await;
     let env = child_env(base_env, p.env.clone());
+    if let Some((_, effective_argv)) =
+        presets::resolve_acp_command_in_env(resolved.preset.as_deref(), &resolved.argv, &env)
+    {
+        resolved.argv = effective_argv;
+    }
 
     let parent = match (&p.parent, &caller) {
         (Some(parent), _) => Some(resolve_any(core, parent)?.address()),
@@ -486,16 +491,7 @@ pub(crate) async fn spawn_drove_agent(
         return Err(RpcError::new("spawn_failed", format!("missing working directory {}", req.cwd), ""));
     }
     let settings = crate::config::load(&core.paths.config)?;
-    let resolved = presets::resolve(Some(&req.agent), &[], None, &settings.agents)?;
-
-    let (mut wrapped_argv, sandbox_mode) = crate::drove::sandbox::wrap_worker_argv(
-        &resolved.argv,
-        &core.drove.paths,
-        &req.cwd,
-        req.access,
-        req.isolate_secrets,
-    );
-    presets::ensure_agy_skip_permissions(&mut wrapped_argv);
+    let mut resolved = presets::resolve(Some(&req.agent), &[], None, &settings.agents)?;
 
     let bin_dir = ensure_drove_bin_links(&core.drove.paths.state_dir);
     let base_env = crate::platform::program_env().await;
@@ -505,6 +501,20 @@ pub(crate) async fn spawn_drove_agent(
         let combined = if old.is_empty() { bdir } else { format!("{bdir}:{old}") };
         env.insert("PATH".into(), combined);
     }
+    if let Some((_, effective_argv)) =
+        presets::resolve_acp_command_in_env(resolved.preset.as_deref(), &resolved.argv, &env)
+    {
+        resolved.argv = effective_argv;
+    }
+
+    let (mut wrapped_argv, sandbox_mode) = crate::drove::sandbox::wrap_worker_argv(
+        &resolved.argv,
+        &core.drove.paths,
+        &req.cwd,
+        req.access,
+        req.isolate_secrets,
+    );
+    presets::ensure_agy_skip_permissions(&mut wrapped_argv);
 
     let mut overrides = BTreeMap::new();
     let is_agy = matches!(req.agent.as_str(), "agy" | "antigravity");

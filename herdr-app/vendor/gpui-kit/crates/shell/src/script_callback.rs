@@ -50,7 +50,13 @@ impl ScriptCallbackRoute {
         Self(Arc::new(RouteId(id)))
     }
 
-    pub(crate) fn emit(&self, payload: HostValue, window: &mut Window, cx: &mut App) {
+    pub(crate) fn emit_with_meta(
+        &self,
+        payload: HostValue,
+        meta: HostValue,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
         let target = ROUTES.with_borrow(|routes| {
             routes
                 .get(&self.0.0)
@@ -60,7 +66,7 @@ impl ScriptCallbackRoute {
             return;
         };
         if let Some(runtime) = runtime.upgrade() {
-            runtime.dispatch_host_event(callback, payload, window, cx);
+            runtime.dispatch_host_event_with_meta(callback, payload, Some(meta), window, cx);
         }
     }
 }

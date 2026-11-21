@@ -955,6 +955,7 @@ const ON_AN_AGENT: &[&str] = &[
     "agent.send",
     "agent.inbox_edit",
     "agent.inbox_remove",
+    "agent.inbox_send",
     "agent.interrupt",
     "agent.wait",
     "agent.approve",
@@ -980,8 +981,15 @@ const ON_A_TERMINAL: &[&str] = &[
 ];
 
 /// Methods whose `target` names the agent or terminal they act on.
-const ON_A_TARGET: &[&str] =
-    &["agent.review", "checkpoint.list", "checkpoint.capture", "checkpoint.diff", "checkpoint.rollback"];
+const ON_A_TARGET: &[&str] = &[
+    "agent.review",
+    "ai.summarize_agent",
+    "checkpoint.list",
+    "checkpoint.capture",
+    "checkpoint.diff",
+    "checkpoint.rollback",
+    "checkpoint.bisect",
+];
 
 /// Where a call goes when it isn't here.
 pub enum To {
@@ -1028,6 +1036,12 @@ pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Va
             | "drove.magpie.test"
             | "drove.http_proxy"
             | "drove.web.open"
+            | "ai.status"
+            | "ai.settings.set"
+            | "ai.test"
+            | "ai.complete"
+            | "ai.classify_terminal_state"
+            | "ai.briefing"
     ) {
         let Some(on) = params["on"].as_str().map(String::from) else { return Ok(None) };
         params.as_object_mut().map(|p| p.remove("on"));
@@ -1038,10 +1052,11 @@ pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Va
     } else if (ON_AN_AGENT.contains(&method)
         || ON_A_TERMINAL.contains(&method)
         || ON_A_TARGET.contains(&method)
-        || method == "agent.handoff")
+        || method == "agent.handoff"
+        || method == "ai.handoff_recommend")
         && params["children"].is_null()
     {
-        let field = if method == "agent.handoff" {
+        let field = if method == "agent.handoff" || method == "ai.handoff_recommend" {
             "source"
         } else if ON_A_TARGET.contains(&method) {
             "target"
@@ -1251,7 +1266,7 @@ pub async fn forward_to(core: &Core, to: &To, method: &str, params: Value) -> Re
             let calls_me = core.lock().peers.get(id).map(|p| p.calls_me.clone()).unwrap_or_default();
             let deadline = deadline_for(core, method, &params);
             let reply = line.call(name, method, params, deadline).await?;
-            Ok(if method.starts_with("doc.") || method.starts_with("drove.") {
+            Ok(if method.starts_with("doc.") || method.starts_with("drove.") || method.starts_with("ai.") {
                 reply
             } else {
                 localize(core, name, &[calls_me.as_str()], reply)

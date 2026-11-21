@@ -75,6 +75,7 @@ pub struct Core {
     pty_dirty: std::sync::atomic::AtomicBool,
     save_due: Notify,
     pub(crate) image_due: Notify,
+    pub ai: Arc<crate::ai::AiRuntime>,
     pub drove: Arc<crate::drove::DroveRuntime>,
     registry_writer: RegistryWriter,
     pty_registry_writer: RegistryWriter,
@@ -137,6 +138,8 @@ pub struct State {
     pub pty_respawning: std::collections::HashSet<u32>,
     pub ckpt_locks: HashMap<std::path::PathBuf, Arc<tokio::sync::Mutex<()>>>,
     pub checkpoints: HashMap<String, crate::checkpoint::TargetCheckpoints>,
+    /// Per-agent throttle timestamp for background AI semantic digest refreshes.
+    pub digest_last_ai: HashMap<u32, Instant>,
 }
 
 const SAVE_SOON: Duration = Duration::from_secs(2);
@@ -187,7 +190,8 @@ impl Core {
         std::fs::create_dir_all(paths.state.join("screens"))?;
         let machines = read_state(&paths.state.join("machines.json"))?;
         let peers = read_state(&paths.state.join("peers.json"))?;
-        let drove = crate::drove::DroveRuntime::open(&paths)?;
+        let ai = crate::ai::AiRuntime::open(&paths)?;
+        let drove = crate::drove::DroveRuntime::open(&paths, ai.clone())?;
         let (jobs, jobs_rx) = tokio::sync::mpsc::unbounded_channel();
         let core = Arc::new(Core {
             info,
@@ -208,6 +212,7 @@ impl Core {
             pty_dirty: Default::default(),
             save_due: Notify::new(),
             image_due: Notify::new(),
+            ai,
             drove,
             self_ref: std::sync::OnceLock::new(),
         });
@@ -433,6 +438,118 @@ impl Core {
         if (change.turn_ended || change.stuck || first_task_finished) && st.reg.agents[&id].is_live() {
             self.news(st, id);
         }
+    }
+
+    /// Updates an ACP agent's adaptive `semantic_title` / `micro_summary` and emits a `"digest"` event if changed.
+    pub fn apply_digest(
+        &self,
+        st: &mut State,
+        id: u32,
+        semantic_title: Option<String>,
+        micro_summary: Option<String>,
+        preserve_title: bool,
+    ) {
+        let payload = {
+            let Some(a) = st.reg.agents.get_mut(&id).filter(|a| a.is_live()) else {
+                return;
+            };
+            let next_title = if preserve_title && a.semantic_title.is_some() {
+                a.semantic_title.clone()
+            } else {
+                semantic_title.or_else(|| a.semantic_title.clone())
+            };
+            let next_summary = micro_summary.or_else(|| a.micro_summary.clone());
+            if a.semantic_title == next_title && a.micro_summary == next_summary {
+                return;
+            }
+            a.semantic_title = next_title.clone();
+            a.micro_summary = next_summary.clone();
+            serde_json::json!({
+                "semantic_title": next_title,
+                "micro_summary": next_summary,
+            })
+        };
+        self.emit(st, "digest", id, payload);
+        self.save_soon();
+    }
+
+    /// Synchronously computes and applies a 0ms deterministic digest for an ACP agent.
+    pub fn refresh_agent_digest_deterministic(&self, st: &mut State, id: u32) {
+        let Some(a) = st.reg.agents.get(&id).filter(|a| a.is_live()) else {
+            return;
+        };
+        let status = a.status.as_ref().map(|s| s.state.as_str()).unwrap_or("idle");
+        let turn = a.turn;
+        let pending = a.pending_permission.clone();
+        let existing_title = a.semantic_title.clone();
+        let entries = st.transcripts.get(&id).map(|t| t.entries()).unwrap_or(&[]);
+        let det = crate::ai::build_deterministic_acp_digest(
+            status,
+            turn,
+            pending.as_ref(),
+            entries,
+            existing_title.as_deref(),
+            false,
+        );
+        self.apply_digest(st, id, det.semantic_title, det.micro_summary, true);
+    }
+
+    /// Spawns a throttled, lock-free background Core AI digest refinement for an ACP agent.
+    pub fn spawn_agent_digest_ai(&self, id: u32, min_interval: Duration) {
+        let Some(core) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
+            return;
+        };
+        let cfg = self.ai.config_snapshot();
+        if !cfg.enabled || !cfg.semantic_summary || cfg.base_url.trim().is_empty() || self.ai.is_circuit_open() {
+            return;
+        }
+        let snapshot = {
+            let mut st = self.lock();
+            let now = Instant::now();
+            if st
+                .digest_last_ai
+                .get(&id)
+                .is_some_and(|last| now.saturating_duration_since(*last) < min_interval)
+            {
+                return;
+            }
+            let Some(a) = st.reg.agents.get(&id).filter(|a| a.is_live()).cloned() else {
+                return;
+            };
+            st.digest_last_ai.insert(id, now);
+            let status = a.status.as_ref().map(|s| s.state.clone()).unwrap_or_else(|| "idle".into());
+            let program = a.agent.clone().unwrap_or_else(|| "acp".into());
+            let existing = a.semantic_title.clone();
+            let pending = a.pending_permission.clone();
+            let turn = a.turn;
+            let entries = st.transcripts.get(&id).map(|t| t.entries().to_vec()).unwrap_or_default();
+            (a.address, program, status, turn, pending, existing, entries)
+        };
+        tokio::spawn(async move {
+            let (addr, program, status, turn, pending, existing, entries) = snapshot;
+            let det = crate::ai::build_deterministic_acp_digest(
+                &status,
+                turn,
+                pending.as_ref(),
+                &entries,
+                existing.as_deref(),
+                false,
+            );
+            let refined = crate::ai::refine_agent_digest(
+                &core.ai,
+                &addr,
+                &program,
+                &status,
+                &det,
+                existing.as_deref(),
+                None,
+            )
+            .await;
+            if refined.used_ai {
+                let mut st = core.lock();
+                core.apply_digest(&mut st, id, refined.semantic_title, refined.micro_summary, existing.is_some());
+            }
+        });
     }
 
     /// Resolves a blocked permission prompt for agent `id`.

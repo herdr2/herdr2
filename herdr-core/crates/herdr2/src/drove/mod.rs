@@ -24,15 +24,14 @@ pub mod verify;
 pub mod yaml;
 
 use self::config::{
-    CachedAgentModels, DrovePaths, PersistedModelsCache, clear_ai_key, load_config,
-    load_models_cache, mask_key, read_ai_key, save_config, save_models_cache, write_ai_key,
-    write_secret_file,
+    CachedAgentModels, DrovePaths, PersistedModelsCache, load_config, load_models_cache,
+    save_config, save_models_cache, write_secret_file,
 };
 use self::http::{HttpProxyRequest, HttpProxyResponse};
 use self::magpie::{MagpieClient, MagpieTestResult};
-use self::probe::AiTestResult;
 use self::store::{Store, StoreEvent};
 use self::types::*;
+use crate::ai::{AiRuntime, AiSettingsSetParams, AiTestResult};
 use crate::paths::{Paths, write_atomic};
 use crate::rpc::RpcError;
 use crate::runtime::Core;
@@ -47,14 +46,6 @@ use tokio::sync::{Notify, mpsc};
 
 pub const MAX_AUTO_RETRIES: u32 = 2;
 
-#[derive(Default)]
-pub struct AiCircuitState {
-    pub consecutive_failures: u32,
-    pub circuit_open: bool,
-    pub cooldown_until: Option<String>,
-    pub last_error: Option<String>,
-}
-
 struct FramedSub {
     conn: Arc<Conn>,
     channel: u32,
@@ -64,6 +55,7 @@ struct FramedSub {
 /// Live runtime state for Drove inside a single `herdr2` daemon.
 pub struct DroveRuntime {
     pub paths: DrovePaths,
+    pub ai: Arc<AiRuntime>,
     pub store: Arc<Store>,
     pub config: Mutex<DroveConfig>,
     pub magpie: Arc<MagpieClient>,
@@ -81,9 +73,6 @@ pub struct DroveRuntime {
     probe_cache: Mutex<Option<ProbeSnapshot>>,
     probe_is_full: AtomicBool,
     agent_models_cache: Mutex<BTreeMap<String, CachedAgentModels>>,
-    ai_models_cache: Mutex<Vec<String>>,
-    ai_models_url: Mutex<String>,
-    ai_circuit: Mutex<AiCircuitState>,
     subs: Mutex<Vec<FramedSub>>,
     worker_tokens: Mutex<HashMap<String, String>>,
     reserved_tasks: Mutex<HashSet<String>>,
@@ -92,22 +81,33 @@ pub struct DroveRuntime {
     active_asks: Mutex<HashSet<String>>,
     reminded_attempts: Mutex<HashSet<String>>,
     stall_warned: Mutex<HashSet<String>>,
+    loop_audit_watermark: Mutex<HashMap<String, u64>>,
+    conflict_cache: Mutex<HashMap<String, (bool, String)>>,
     run_merge_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl DroveRuntime {
     /// Initializes Drove runtime directories, config, store, and daemon secrets.
-    pub fn open(paths: &Paths) -> io::Result<Arc<Self>> {
+    pub fn open(paths: &Paths, ai: Arc<AiRuntime>) -> io::Result<Arc<Self>> {
         let dpaths = DrovePaths::from_paths(paths);
         dpaths.ensure_dirs()?;
         let store = Store::open(&dpaths)?;
-        let cfg = match load_config(&dpaths) {
+        let mut cfg = match load_config(&dpaths) {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("drove: using defaults because {}: {}", dpaths.config_file.display(), e.message);
                 DroveConfig::default()
             }
         };
+        // Mirror shared Core AI connection fields into DroveConfig snapshot so existing Drove UI/API stay in sync.
+        let core_ai = ai.config_snapshot();
+        cfg.ai.enabled = core_ai.enabled;
+        cfg.ai.base_url = core_ai.base_url;
+        cfg.ai.model = core_ai.model;
+        cfg.ai.effort = core_ai.effort;
+        cfg.ai.context_window = core_ai.context_window;
+        cfg.ai.max_tokens = core_ai.max_tokens;
+
         let coordinator_secret = crypto::rand_secret();
         write_secret_file(&dpaths.coordinator_token_file, &format!("{coordinator_secret}\n"))?;
         let disk_cache = load_models_cache(&dpaths);
@@ -131,18 +131,10 @@ impl DroveRuntime {
             }
         }
         let probe_is_full = disk_cache.probe.as_ref().is_some_and(|p| p.full_probe);
-        let cfg_url = cfg.ai.base_url.trim().to_string();
-        let use_saved_ai = !disk_cache.ai_models.is_empty()
-            && (cfg_url.is_empty() || disk_cache.ai_base_url.is_empty() || disk_cache.ai_base_url == cfg_url);
-        let ai_models_cache = if use_saved_ai { disk_cache.ai_models } else { Vec::new() };
-        let ai_models_url = if use_saved_ai {
-            if disk_cache.ai_base_url.is_empty() { cfg_url } else { disk_cache.ai_base_url }
-        } else {
-            String::new()
-        };
         let (pool_tx, pool_rx) = mpsc::unbounded_channel();
         Ok(Arc::new(Self {
             paths: dpaths,
+            ai,
             store,
             config: Mutex::new(cfg),
             magpie: Arc::new(MagpieClient::default()),
@@ -160,9 +152,6 @@ impl DroveRuntime {
             probe_cache: Mutex::new(disk_cache.probe),
             probe_is_full: AtomicBool::new(probe_is_full),
             agent_models_cache: Mutex::new(agent_models_cache),
-            ai_models_cache: Mutex::new(ai_models_cache),
-            ai_models_url: Mutex::new(ai_models_url),
-            ai_circuit: Mutex::new(AiCircuitState::default()),
             subs: Mutex::new(Vec::new()),
             worker_tokens: Mutex::new(HashMap::new()),
             reserved_tasks: Mutex::new(HashSet::new()),
@@ -171,8 +160,61 @@ impl DroveRuntime {
             active_asks: Mutex::new(HashSet::new()),
             reminded_attempts: Mutex::new(HashSet::new()),
             stall_warned: Mutex::new(HashSet::new()),
+            loop_audit_watermark: Mutex::new(HashMap::new()),
+            conflict_cache: Mutex::new(HashMap::new()),
             run_merge_locks: Mutex::new(HashMap::new()),
         }))
+    }
+
+    /// Refreshes mirrored AI connection fields in `DroveConfig` after `ai.settings.set`.
+    pub fn sync_ai_from_core(&self) {
+        let core_ai = self.ai.config_snapshot();
+        let mut cfg = self.config.lock().unwrap_or_else(|p| p.into_inner());
+        cfg.ai.enabled = core_ai.enabled;
+        cfg.ai.base_url = core_ai.base_url;
+        cfg.ai.model = core_ai.model;
+        cfg.ai.effort = core_ai.effort;
+        cfg.ai.context_window = core_ai.context_window;
+        cfg.ai.max_tokens = core_ai.max_tokens;
+    }
+
+    pub fn get_loop_watermark(&self, attempt_id: &str) -> u64 {
+        self.loop_audit_watermark
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(attempt_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub fn set_loop_watermark(&self, attempt_id: &str, item_id: u64) {
+        self.loop_audit_watermark
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(attempt_id.to_string(), item_id);
+    }
+
+    pub fn clear_loop_watermark(&self, attempt_id: &str) {
+        self.loop_audit_watermark
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(attempt_id);
+    }
+
+    pub fn get_conflict_cached(&self, key: &str) -> Option<(bool, String)> {
+        self.conflict_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(key)
+            .cloned()
+    }
+
+    pub fn put_conflict_cached(&self, key: String, verdict: (bool, String)) {
+        let mut map = self.conflict_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if map.len() >= 256 {
+            map.clear();
+        }
+        map.insert(key, verdict);
     }
 
     pub fn run_merge_lock(&self, run_id: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -202,14 +244,13 @@ impl DroveRuntime {
     fn persist_models_cache(&self) {
         let probe = self.probe_cache.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let agent_models = self.agent_models_cache.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        let ai_base_url = self.ai_models_url.lock().unwrap_or_else(|p| p.into_inner()).clone();
-        let ai_models = self.ai_models_cache.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        let ai_st = self.ai.status();
         let cache = PersistedModelsCache {
             updated_at: now_iso(),
             probe,
             agent_models,
-            ai_base_url,
-            ai_models,
+            ai_base_url: ai_st.base_url,
+            ai_models: ai_st.available_models,
         };
         save_models_cache(&self.paths, &cache);
     }
@@ -277,16 +318,6 @@ impl DroveRuntime {
             self.persist_models_cache();
         }
         snap
-    }
-
-    fn update_ai_models(&self, base_url: &str, models: Vec<String>) {
-        let deduped = merge_unique_models(&models, &[]);
-        if deduped.is_empty() {
-            return;
-        }
-        *self.ai_models_cache.lock().unwrap_or_else(|p| p.into_inner()) = deduped;
-        *self.ai_models_url.lock().unwrap_or_else(|p| p.into_inner()) = base_url.trim().to_string();
-        self.persist_models_cache();
     }
 
     pub fn register_worker_token(&self, worker_id: &str) -> String {
@@ -402,38 +433,15 @@ impl DroveRuntime {
     }
 
     pub fn is_ai_circuit_open(&self) -> bool {
-        let mut cir = self.ai_circuit.lock().unwrap_or_else(|p| p.into_inner());
-        if !cir.circuit_open {
-            return false;
-        }
-        if let Some(until) = &cir.cooldown_until
-            && let Some(until_ms) = parse_iso_ms(until)
-            && now_ms_u64() >= until_ms
-        {
-            cir.circuit_open = false;
-            cir.consecutive_failures = 0;
-            cir.cooldown_until = None;
-            return false;
-        }
-        true
+        self.ai.is_circuit_open()
     }
 
     pub fn record_ai_success(&self) {
-        let mut cir = self.ai_circuit.lock().unwrap_or_else(|p| p.into_inner());
-        cir.consecutive_failures = 0;
-        cir.circuit_open = false;
-        cir.cooldown_until = None;
-        cir.last_error = None;
+        self.ai.record_success();
     }
 
     pub fn record_ai_failure(&self, err: &str) {
-        let mut cir = self.ai_circuit.lock().unwrap_or_else(|p| p.into_inner());
-        cir.consecutive_failures += 1;
-        cir.last_error = Some(err.to_string());
-        if cir.consecutive_failures >= ai::circuit_threshold() {
-            cir.circuit_open = true;
-            cir.cooldown_until = Some(format_ms_iso(now_ms_u64() + ai::circuit_cooldown_secs() * 1000));
-        }
+        self.ai.record_failure(err);
     }
 
     pub fn attach_core(&self, core: &Arc<Core>) {
@@ -501,37 +509,27 @@ impl DroveRuntime {
         }
     }
 
-    /// Computes AI status without exposing the raw API key.
+    /// Computes AI status without exposing the raw API key, combining shared Core AI status
+    /// with Drove-specific control-plane switches.
     pub fn ai_status(&self) -> DaemonAiStatus {
         let cfg = self.config_snapshot();
-        let (key, src) = read_ai_key(&self.paths);
-        let cir = self.ai_circuit.lock().unwrap_or_else(|p| p.into_inner());
-        let has_key = key.is_some();
-        let is_local = config::is_loopback_http_url(&cfg.ai.base_url);
-        let configured = cfg.ai.enabled && !cfg.ai.base_url.trim().is_empty() && (has_key || is_local);
-        let key_source = if has_key {
-            src.to_string()
-        } else if is_local && !cfg.ai.base_url.trim().is_empty() {
-            "local".into()
-        } else {
-            src.to_string()
-        };
+        let st = self.ai.status();
         DaemonAiStatus {
-            enabled: cfg.ai.enabled,
-            configured,
-            key_source,
-            key_file_path: self.paths.ai_key_file.display().to_string(),
-            key_masked: key.as_deref().map(mask_key),
-            base_url: cfg.ai.base_url.clone(),
-            model: cfg.ai.model.clone(),
-            effort: cfg.ai.effort.clone(),
-            context_window: cfg.ai.context_window.clone(),
-            max_tokens: cfg.ai.max_tokens,
-            available_models: self.ai_models_cache.lock().unwrap_or_else(|p| p.into_inner()).clone(),
-            circuit_open: cir.circuit_open,
-            cooldown_until: cir.cooldown_until.clone(),
-            consecutive_failures: cir.consecutive_failures,
-            last_error: cir.last_error.clone(),
+            enabled: st.enabled,
+            configured: st.configured,
+            key_source: st.key_source,
+            key_file_path: st.key_file_path,
+            key_masked: st.key_masked,
+            base_url: st.base_url,
+            model: st.model,
+            effort: st.effort,
+            context_window: st.context_window,
+            max_tokens: st.max_tokens,
+            available_models: st.available_models,
+            circuit_open: st.circuit_open,
+            cooldown_until: st.cooldown_until,
+            consecutive_failures: st.consecutive_failures,
+            last_error: st.last_error,
             switches: AiSwitches {
                 verify_digest: cfg.ai.verify_digest,
                 handover_compact: cfg.ai.handover_compact,
@@ -547,26 +545,22 @@ impl DroveRuntime {
     // --- RPC handlers -------------------------------------------------------
 
     pub async fn rpc_settings_get(&self) -> DroveSettingsResult {
+        let _ = self.ai.status_refresh_models().await;
+        self.sync_ai_from_core();
         let cfg = self.config_snapshot();
-        let cfg_url = cfg.ai.base_url.trim();
-        if !cfg_url.is_empty() {
-            let need_fetch = {
-                let cached = self.ai_models_cache.lock().unwrap_or_else(|p| p.into_inner());
-                let cached_url = self.ai_models_url.lock().unwrap_or_else(|p| p.into_inner());
-                cached.is_empty() || *cached_url != cfg_url
-            };
-            if need_fetch {
-                let (stored_key, _) = read_ai_key(&self.paths);
-                let discovered = probe::fetch_ai_models(cfg_url, stored_key.as_deref()).await;
-                if !discovered.is_empty() {
-                    self.update_ai_models(cfg_url, discovered);
-                }
-            }
-        }
         let ai_status = self.ai_status();
         let cached = self.probe_cache.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let agents = match cached {
-            Some(snap) => snap,
+            Some(mut snap) => {
+                if let Some(core) = self.core()
+                    && probe::refresh_installed_status(&core, &mut snap).await
+                {
+                    *self.probe_cache.lock().unwrap_or_else(|p| p.into_inner()) = Some(snap.clone());
+                    self.probe_is_full.store(snap.full_probe, Ordering::SeqCst);
+                    self.persist_models_cache();
+                }
+                snap
+            }
             None => match self.core() {
                 Some(core) => {
                     let quick = probe::probe_agents(&core, true).await;
@@ -595,7 +589,6 @@ impl DroveRuntime {
     }
 
     pub async fn rpc_settings_set(&self, params: DroveSettingsSetParams) -> Result<DroveSettingsResult, RpcError> {
-        let prev_base_url = self.config_snapshot().ai.base_url;
         let mut next = params.config.unwrap_or_else(|| self.config_snapshot());
 
         if let Some(mc) = params.max_concurrency_default {
@@ -604,20 +597,30 @@ impl DroveRuntime {
         if let Some(roles) = params.roles {
             next.roles = roles;
         }
+        let mut core_ai_patch = AiSettingsSetParams::default();
+        let mut has_core_ai_update = false;
         let mut patch_api_key: Option<String> = None;
         let mut patch_clear = false;
         if let Some(ai) = params.ai {
             if let Some(b) = ai.enabled {
                 next.ai.enabled = b;
+                core_ai_patch.enabled = Some(b);
+                has_core_ai_update = true;
             }
             if let Some(s) = ai.base_url {
-                next.ai.base_url = s;
+                next.ai.base_url = s.clone();
+                core_ai_patch.base_url = Some(s);
+                has_core_ai_update = true;
             }
             if let Some(s) = ai.model {
-                next.ai.model = s;
+                next.ai.model = s.clone();
+                core_ai_patch.model = Some(s);
+                has_core_ai_update = true;
             }
             if let Some(s) = ai.effort {
-                next.ai.effort = s;
+                next.ai.effort = s.clone();
+                core_ai_patch.effort = Some(s);
+                has_core_ai_update = true;
             }
             if let Some(s) = ai.context_window {
                 let clean = s.trim().to_ascii_lowercase();
@@ -626,9 +629,13 @@ impl DroveRuntime {
                 } else {
                     Some(clean)
                 };
+                core_ai_patch.context_window = Some(s);
+                has_core_ai_update = true;
             }
             if let Some(n) = ai.max_tokens {
                 next.ai.max_tokens = if n == 0 { None } else { Some(n) };
+                core_ai_patch.max_tokens = Some(n);
+                has_core_ai_update = true;
             }
             if let Some(b) = ai.auto_title {
                 next.ai.auto_title = b;
@@ -663,30 +670,27 @@ impl DroveRuntime {
             }
         }
 
-        let mut key_changed = false;
         if params.clear_ai_key == Some(true) || patch_clear {
-            clear_ai_key(&self.paths).map_err(|e| RpcError::internal(format!("clear key: {e}")))?;
-            key_changed = true;
+            core_ai_patch.clear_key = Some(true);
+            has_core_ai_update = true;
         } else if let Some(key) = params
             .api_key
             .or(patch_api_key)
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
         {
-            write_ai_key(&self.paths, &key)?;
-            key_changed = true;
+            core_ai_patch.api_key = Some(key);
+            has_core_ai_update = true;
+        }
+
+        if has_core_ai_update {
+            self.ai.update_settings(core_ai_patch).await?;
         }
 
         save_config(&self.paths, &mut next)?;
-        let url_changed = next.ai.base_url.trim() != prev_base_url.trim();
-        let cached_matches = *self.ai_models_url.lock().unwrap_or_else(|p| p.into_inner()) == next.ai.base_url.trim();
         *self.config.lock().unwrap_or_else(|p| p.into_inner()) = next;
+        self.sync_ai_from_core();
         self.magpie.invalidate();
-        if (url_changed && !cached_matches) || key_changed {
-            self.ai_models_cache.lock().unwrap_or_else(|p| p.into_inner()).clear();
-            self.ai_models_url.lock().unwrap_or_else(|p| p.into_inner()).clear();
-            self.persist_models_cache();
-        }
         Ok(self.rpc_settings_get().await)
     }
 
@@ -708,33 +712,8 @@ impl DroveRuntime {
         key_override: Option<String>,
         model_override: Option<String>,
     ) -> Result<AiTestResult, RpcError> {
-        let cfg = self.config_snapshot();
-        let base_url = url_override.filter(|s| !s.trim().is_empty()).unwrap_or(cfg.ai.base_url);
-        if base_url.trim().is_empty() {
-            return Err(RpcError::invalid_params("AI Service URL is empty"));
-        }
-        let (stored_key, _) = read_ai_key(&self.paths);
-        let key = key_override.filter(|s| !s.trim().is_empty()).or(stored_key);
-        let model = model_override
-            .filter(|s| !s.trim().is_empty())
-            .or_else(|| (!cfg.ai.model.trim().is_empty()).then_some(cfg.ai.model));
-        let res = probe::test_ai_connection(&base_url, key.as_deref(), model.as_deref()).await;
-        let discovered: Vec<String> = res.discovered_model.iter().cloned().collect();
-        let merged = merge_unique_models(&discovered, &res.available_models);
-        if !merged.is_empty() {
-            self.update_ai_models(&base_url, merged);
-        }
-        {
-            let mut cir = self.ai_circuit.lock().unwrap_or_else(|p| p.into_inner());
-            if res.ok {
-                cir.consecutive_failures = 0;
-                cir.circuit_open = false;
-                cir.cooldown_until = None;
-                cir.last_error = None;
-            } else {
-                cir.last_error = res.error.clone();
-            }
-        }
+        let res = self.ai.test_connection(url_override, key_override, model_override).await?;
+        self.persist_models_cache();
         Ok(res)
     }
 
@@ -975,7 +954,8 @@ mod tests {
         let paths = test_paths(&tmp);
         paths.create_dirs().unwrap();
 
-        let rt = DroveRuntime::open(&paths).unwrap();
+        let ai = AiRuntime::open(&paths).unwrap();
+        let rt = DroveRuntime::open(&paths, ai).unwrap();
         let initial = ProbeSnapshot {
             probed_at: now_iso(),
             full_probe: true,
@@ -995,15 +975,17 @@ mod tests {
             }],
         };
         rt.apply_and_persist_probe(initial, true);
-        rt.update_ai_models("http://127.0.0.1:4000/v1", vec!["deepseek-chat".into(), "gpt-4o-mini".into()]);
+        rt.ai.update_models("http://127.0.0.1:4000/v1", vec!["deepseek-chat".into(), "gpt-4o-mini".into()]);
+        rt.persist_models_cache();
         drop(rt);
 
         // Reopen runtime -> loads persisted probe + full_probe + agent models + AI models.
-        let rt2 = DroveRuntime::open(&paths).unwrap();
+        let ai2 = AiRuntime::open(&paths).unwrap();
+        let rt2 = DroveRuntime::open(&paths, ai2).unwrap();
         let cached = rt2.cached_probe();
         assert!(cached.full_probe);
         assert_eq!(cached.agents[0].models, vec!["claude-opus-4-6", "claude-sonnet-4-6"]);
-        assert_eq!(rt2.ai_models_cache.lock().unwrap().as_slice(), &["deepseek-chat", "gpt-4o-mini"]);
+        assert_eq!(rt2.ai.cached_models(), vec!["deepseek-chat", "gpt-4o-mini"]);
 
         // Subsequent full probe where claude times out preserves previously saved models.
         let timed_out = ProbeSnapshot {

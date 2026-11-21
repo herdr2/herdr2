@@ -49,6 +49,7 @@ More
                               manage remote machines over SSH or `--via`
   connect                     JSON-RPC API over stdin/stdout
   drove status|web|probe|...  manage Drove DAG orchestration and Web UI
+  ai status|settings-set|test manage shared Core AI assistant & cache stats
   schema                      print OpenRPC 1.3.2 JSON Schema
 
 <a> / <t> is an agent (`a1`), terminal (`t1`), remote (`machine/a7`), or unique name.

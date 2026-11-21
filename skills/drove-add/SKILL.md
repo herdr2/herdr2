@@ -20,7 +20,7 @@ h2 drove add \
   --verify "cargo clippy --all-targets"
 ```
 
-Pass `--worktree` to isolate the task in a detached Git / AOSP harness worktree merged back automatically on completion.
+Pass `--worktree` to isolate the task in a detached Git / AOSP harness worktree merged back automatically on completion. If Drove returns `worktree_not_ready`, report the blocker reason and fix hint to the user before retrying.
 
 ## Batch Tasks (YAML/JSON)
 

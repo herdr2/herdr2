@@ -63,12 +63,25 @@ pub fn hsla(c: Rgb) -> Hsla {
 
 #[derive(Clone, Debug, PartialEq)]
 enum LinkTarget {
-    External(links::Target),
+    Url(String),
+    File {
+        path: String,
+        line: Option<u32>,
+        end_line: Option<u32>,
+        on: Option<String>,
+    },
     Terminal(String),
 }
 
 pub enum TerminalEvent {
     Peek(String),
+    /// Ctrl/Cmd+Click on a file path in the terminal: open in the built-in Files panel.
+    OpenFile {
+        path: String,
+        line: Option<u32>,
+        end_line: Option<u32>,
+        on: Option<String>,
+    },
     TitleChanged,
     SelectionChanged,
     /// History scroll position changed enough for mods that watch `panes().scroll`.
@@ -535,6 +548,31 @@ impl TerminalView {
 
     pub fn last_typed_at(&self) -> Option<Instant> {
         self.typed_at.get()
+    }
+
+    pub fn last_output_at(&self) -> Option<Instant> {
+        self.last_output_at
+    }
+
+    /// Captures bottom non-empty lines and a stable FNV-1a fingerprint for async semantic status arbitration.
+    pub fn tail_snapshot_for_arbitration(&self, max_lines: usize) -> (u64, Vec<String>) {
+        let raw = self.grid.borrow().vt.tail_lines(max_lines);
+        let mut lines = Vec::new();
+        let mut hash: u64 = 0xcbf29ce484222325;
+        for line in raw {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            for b in trimmed.as_bytes() {
+                hash ^= u64::from(*b);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            hash ^= u64::from(b'\n');
+            hash = hash.wrapping_mul(0x100000001b3);
+            lines.push(trimmed.to_owned());
+        }
+        (hash, lines)
     }
 
     pub fn has_active_output(&self, now: Instant) -> bool {
@@ -1186,14 +1224,32 @@ impl TerminalView {
         let g = self.grid.borrow();
         let (x, y) = local(&g, pos);
         let (col, row) = (x / f32::from(g.cell.width), y / f32::from(g.cell.height));
+        let remote_machine = self.address.split_once('/').map(|(m, _)| m.to_owned());
+        let cwd_str = self.cwd.as_deref().and_then(|p| p.to_str());
+        let to_target = |(link, line, end_line): (links::Target, Option<u32>, Option<u32>)| match link {
+            links::Target::Url(u) => LinkTarget::Url(u),
+            links::Target::File(p) => LinkTarget::File {
+                path: p.to_string_lossy().into_owned(),
+                line,
+                end_line,
+                on: remote_machine.clone(),
+            },
+        };
+        let resolve_link = |raw: &str| {
+            if remote_machine.is_some() {
+                links::resolve_remote_with_location(raw, cwd_str)
+            } else {
+                links::resolve_with_location(raw, self.cwd.as_deref())
+            }
+        };
         let mut target = None;
         let hit = g.vt.link_at(col as u16, row as u16, |text, at, joined| {
             // In lines joined back together only a file that exists proves the join right.
             if let Some(range) = links::find(text, at)
-                && let Some(link) = links::resolve(&text[range.clone()], self.cwd.as_deref())
-                && (!joined || matches!(link, links::Target::File(_)))
+                && let Some(resolved) = resolve_link(&text[range.clone()])
+                && (!joined || (remote_machine.is_none() && matches!(resolved.0, links::Target::File(_))))
             {
-                target = Some(LinkTarget::External(link));
+                target = Some(to_target(resolved));
                 return Some(range);
             }
             if joined {
@@ -1205,7 +1261,7 @@ impl TerminalView {
             Some(range)
         })?;
         // OSC 8 links bypass text detection.
-        let target = target.or_else(|| links::resolve(&hit.target, self.cwd.as_deref()).map(LinkTarget::External))?;
+        let target = target.or_else(|| resolve_link(&hit.target).map(to_target))?;
         Some((target, hit.spans))
     }
 
@@ -2607,7 +2663,10 @@ impl Render for TerminalView {
                     && let Some((target, _)) = this.link_at(ev.position)
                 {
                     match target {
-                        LinkTarget::External(target) => links::open(&target),
+                        LinkTarget::Url(u) => links::open(&links::Target::Url(u)),
+                        LinkTarget::File { path, line, end_line, on } => {
+                            cx.emit(TerminalEvent::OpenFile { path, line, end_line, on });
+                        }
                         LinkTarget::Terminal(address) => cx.emit(TerminalEvent::Peek(address)),
                     }
                     return;

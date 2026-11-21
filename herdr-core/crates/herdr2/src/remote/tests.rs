@@ -253,6 +253,25 @@ fn remote_handoff_localizes_from_address_and_routes_into() {
     assert_eq!(routed.1["source"], "a4");
     assert_eq!(routed.1["into"], "t22");
 
+    // 4. `route` for remote `ai.handoff_recommend` and `checkpoint.bisect` strips matching machine prefix.
+    let rec_routed = route(
+        &core,
+        "ai.handoff_recommend",
+        &json!({ "source": "wsl/a4", "installedPresets": ["claude", "codex"] }),
+    )
+    .unwrap()
+    .expect("ai.handoff_recommend routed to wsl");
+    assert_eq!(rec_routed.1["source"], "a4");
+
+    let bisect_routed = route(
+        &core,
+        "checkpoint.bisect",
+        &json!({ "target": "wsl/t22", "query": "which turn broke auth?" }),
+    )
+    .unwrap()
+    .expect("checkpoint.bisect routed to wsl");
+    assert_eq!(bisect_routed.1["target"], "t22");
+
     drop(core);
     std::fs::remove_dir_all(root).unwrap();
 }

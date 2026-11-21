@@ -2,7 +2,12 @@
 // Shares `shared("diff_review.drafts")` scope format with Changes so file and diff comments
 // in the same repository can be batched and sent to an Agent together.
 
+export const ROW_HEIGHT = 20;
 export const MAX_SNIPPET_CHARS = 1800;
+
+// Text draws a tab as nothing: pad each to the next 4-column stop.
+export const untab = (text) =>
+  String(text ?? "").replace(/[^\t]*\t/g, (s) => s.slice(0, -1).padEnd((s.length - 1) - (s.length - 1) % 4 + 4));
 
 export function withAlpha(hex, alphaHex) {
   if (typeof hex !== "string") return hex;
@@ -182,6 +187,117 @@ export function mapCommentsToMarkdownBlocks(blockRanges, fileComments) {
     }
   }
   return { byBlock, unmatched };
+}
+
+/**
+ * Builds 1-based line rows for a source/text file so the Files mod can render the exact same
+ * click-to-comment / Shift+Click range / inline-comment experience as Checkpoints and Changes.
+ */
+export function buildFileRows(text, filePath) {
+  const normalized = String(text ?? "").replace(/\r\n/g, "\n");
+  if (!normalized && !filePath) return [];
+  const rawLines = normalized === "" ? [""] : normalized.split("\n");
+  return rawLines.map((raw, rowIndex) => {
+    const clipped = raw.length > 4000 ? `${raw.slice(0, 4000)}… (line truncated)` : raw;
+    const lineNumber = rowIndex + 1;
+    return {
+      rowIndex,
+      file: filePath || "",
+      lineNumber,
+      text: untab(clipped) || " ",
+      commentable: Boolean(filePath),
+    };
+  });
+}
+
+/**
+ * Computes a normalized selection range between two 0-based file row indices.
+ */
+export function buildFileSelectionRange(fileRows, anchorIdx, focusIdx) {
+  const focus = fileRows[focusIdx];
+  if (!focus?.commentable) return null;
+  const anchor = fileRows[anchorIdx];
+  const validAnchor = Boolean(anchor?.commentable && anchor.file === focus.file);
+  const lo = validAnchor ? Math.min(anchorIdx, focusIdx) : focusIdx;
+  const hi = validAnchor ? Math.max(anchorIdx, focusIdx) : focusIdx;
+  const startRow = fileRows[lo];
+  const endRow = fileRows[hi];
+  if (!startRow || !endRow) return null;
+  return {
+    path: focus.file,
+    startRowIdx: lo,
+    endRowIdx: hi,
+    startLine: startRow.lineNumber,
+    endLine: endRow.lineNumber,
+  };
+}
+
+export function estimateCommentHeight(body) {
+  const paragraphs = String(body ?? "").split("\n");
+  let lines = 0;
+  for (const p of paragraphs) {
+    lines += Math.max(1, Math.ceil(Math.max(1, p.length) / 42));
+  }
+  const clamped = Math.max(1, Math.min(8, lines));
+  return 54 + clamped * 16;
+}
+
+export function matchFileCommentRowIndex(fileRows, comment) {
+  if (!Array.isArray(fileRows) || fileRows.length === 0) return -1;
+  const targetLine = Math.max(Number(comment?.start_line) || 1, Number(comment?.end_line) || 1);
+  const idx = targetLine - 1;
+  if (idx >= 0 && idx < fileRows.length) return idx;
+  return -1;
+}
+
+/**
+ * Flattens file lines and saved inline comment cards into display-only virtual-list items
+ * matching the Checkpoints & Changes review layout.
+ */
+export function buildFileDisplayItems(fileRows, visibleComments, activeComposer) {
+  if (!visibleComments || visibleComments.length === 0) {
+    return {
+      items: fileRows.map((row) => ({ type: "code", key: `r-${row.rowIndex}`, row })),
+      sizes: ROW_HEIGHT,
+    };
+  }
+
+  const byRow = new Map();
+  const orphaned = [];
+  for (const c of visibleComments) {
+    const anchor = matchFileCommentRowIndex(fileRows, c);
+    if (anchor >= 0) {
+      if (!byRow.has(anchor)) byRow.set(anchor, []);
+      byRow.get(anchor).push(c);
+    } else {
+      orphaned.push(c);
+    }
+  }
+
+  const items = [];
+  const sizes = [];
+
+  for (const row of fileRows) {
+    items.push({ type: "code", key: `r-${row.rowIndex}`, row });
+    sizes.push(ROW_HEIGHT);
+
+    const attached = byRow.get(row.rowIndex);
+    if (attached) {
+      for (const comment of attached) {
+        const editing = Boolean(activeComposer?.editingId && activeComposer.editingId === comment.id);
+        items.push({ type: "comment", key: `c-${comment.id}`, comment, outdated: false, editing });
+        sizes.push(estimateCommentHeight(comment.body));
+      }
+    }
+  }
+
+  for (const comment of orphaned) {
+    const editing = Boolean(activeComposer?.editingId && activeComposer.editingId === comment.id);
+    items.push({ type: "comment", key: `c-orphan-${comment.id}`, comment, outdated: true, editing });
+    sizes.push(estimateCommentHeight(comment.body));
+  }
+
+  return { items, sizes };
 }
 
 function machineOfAddress(addr) {

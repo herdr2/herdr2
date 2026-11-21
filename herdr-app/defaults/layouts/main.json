@@ -63,6 +63,20 @@
               "content": {
                 "mod": "agents"
               }
+            },
+            {
+              "id": "flash-notes",
+              "type": "block",
+              "size": {
+                "weight": 0.75
+              },
+              "min": 84,
+              "content": {
+                "mod": "flash-note",
+                "props": {
+                  "list": true
+                }
+              }
             }
           ]
         },

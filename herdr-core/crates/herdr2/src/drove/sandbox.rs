@@ -40,7 +40,17 @@ pub fn wrap_worker_argv(
     let _ = paths.ensure_dirs();
     let state_dir = canonical_or_raw(&paths.state_dir);
     let secrets_dir = canonical_or_raw(&paths.secrets_dir);
+    let core_secrets_dir = paths
+        .state_dir
+        .parent()
+        .map(|p| p.join("secrets"))
+        .map(|p| canonical_or_raw(&p));
     let cfg_file = canonical_or_raw(&paths.config_file);
+    let ai_cfg_file = paths
+        .config_file
+        .parent()
+        .map(|p| p.join("ai.json"))
+        .map(|p| canonical_or_raw(&p));
     let cwd_path = canonical_or_raw(Path::new(cwd));
 
     // Avoid binding root `/` as tmpfs if something went wrong with paths.
@@ -61,6 +71,11 @@ pub fn wrap_worker_argv(
     if Path::new(&cfg_file).exists() {
         out.extend(["--ro-bind".into(), cfg_file.clone(), cfg_file]);
     }
+    if let Some(ai_cfg) = ai_cfg_file
+        && Path::new(&ai_cfg).exists()
+    {
+        out.extend(["--ro-bind".into(), ai_cfg.clone(), ai_cfg]);
+    }
 
     if cwd_path != "/" && Path::new(&cwd_path).is_dir() {
         if access == RoleAccessMode::Readonly {
@@ -72,6 +87,12 @@ pub fn wrap_worker_argv(
     }
 
     // Mask secrets last so neither --dev-bind / nor writable cwd can reveal coordinator/AI secrets.
+    if let Some(core_sec) = core_secrets_dir
+        && core_sec != "/"
+        && Path::new(&core_sec).is_dir()
+    {
+        out.extend(["--tmpfs".into(), core_sec]);
+    }
     out.extend([
         "--tmpfs".into(),
         secrets_dir,

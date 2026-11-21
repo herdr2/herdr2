@@ -1206,8 +1206,33 @@ fn materialize_component(
                     Rc::downgrade(runtime),
                     callback,
                 );
-                view = view.on_link_click(move |url, _event, window, cx| {
-                    route.emit(crate::HostValue::from(url.to_string()), window, cx);
+                view = view.on_link_click(move |url, event, window, cx| {
+                    let meta = match event {
+                        gpui::ClickEvent::Mouse(click) => {
+                            let m = click.up.modifiers;
+                            let button = match click.up.button {
+                                MouseButton::Left => "left",
+                                MouseButton::Right => "right",
+                                MouseButton::Middle => "middle",
+                                _ => "other",
+                            };
+                            crate::HostValue::Object(vec![
+                                ("button".into(), crate::HostValue::from(button)),
+                                ("ctrl".into(), crate::HostValue::from(m.control)),
+                                ("meta".into(), crate::HostValue::from(m.platform)),
+                                ("shift".into(), crate::HostValue::from(m.shift)),
+                                ("alt".into(), crate::HostValue::from(m.alt)),
+                            ])
+                        }
+                        gpui::ClickEvent::Keyboard(_) => crate::HostValue::Object(vec![
+                            ("keyboard".into(), crate::HostValue::from(true)),
+                        ]),
+                        gpui::ClickEvent::Touch(click) => crate::HostValue::Object(vec![
+                            ("touch".into(), crate::HostValue::from(true)),
+                            ("long_press".into(), crate::HostValue::from(click.long_press)),
+                        ]),
+                    };
+                    route.emit_with_meta(crate::HostValue::from(url.to_string()), meta, window, cx);
                 });
             } else {
                 view = view.on_link_click(|url, event, _, cx| {

@@ -1,5 +1,6 @@
 import { test, expect } from "bun:test";
 import { readFile } from "node:fs/promises";
+import { resolveSemanticLabel, buildHoverTooltip, buildLocalFallbackBriefing, mergeBriefingSnapshots } from "../defaults/mods/agents/briefing_model.js";
 
 const source = (await readFile(new URL("../defaults/mods/agents/main.js", import.meta.url), "utf8"))
   .replace(/^import .*;\n/gm, "").replace("export default class Agents", "class Agents");
@@ -8,9 +9,17 @@ function harness(pins: string[], globals: Record<string, unknown> = {}) {
   const data = new Map([["pins", JSON.stringify(pins)]]);
   const writes: unknown[] = [];
   const storage = { getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => data.set(k, v), removeItem: (k: string) => data.delete(k) };
-  const Agents = new Function("View", "localStorage", "props", "run", ...Object.keys(globals), `${source}; return Agents;`)(
+  const mergedGlobals: Record<string, unknown> = {
+    resolveSemanticLabel,
+    buildHoverTooltip,
+    buildLocalFallbackBriefing,
+    mergeBriefingSnapshots,
+    checking: () => true,
+    ...globals,
+  };
+  const Agents = new Function("View", "localStorage", "props", "run", ...Object.keys(mergedGlobals), `${source}; return Agents;`)(
     class {}, storage, () => ({}), (...args: unknown[]) => writes.push(args),
-    ...Object.values(globals),
+    ...Object.values(mergedGlobals),
   );
   const agents = new Agents();
   agents.init({}, { timer: { every() {} } });
@@ -722,7 +731,7 @@ for (const sort of ["grouped", "priority"]) test(`${sort}: agents and sub-agents
   });
   const rowIds: string[] = [];
   const walk = (node: any) => {
-    if (typeof node?.id === "string" && (node.id.startsWith("ag-") || node.id.startsWith("sub-")) && !node.id.includes("-id-") && !node.id.includes("-rt-") && !node.id.includes("-kind-") && !node.id.includes("-wt-") && !node.id.startsWith("ag-list") && !node.id.startsWith("ag-recycle") && !node.id.startsWith("ag-sort")) {
+    if (typeof node?.id === "string" && (node.id.startsWith("ag-") || node.id.startsWith("sub-")) && !node.id.includes("-id-") && !node.id.includes("-rt-") && !node.id.includes("-kind-") && !node.id.includes("-wt-") && !node.id.startsWith("ag-list") && !node.id.startsWith("ag-recycle") && !node.id.startsWith("ag-sort") && !node.id.startsWith("ag-briefing")) {
       rowIds.push(node.id);
     }
     (node?.children ?? []).forEach(walk);
@@ -730,4 +739,93 @@ for (const sort of ["grouped", "priority"]) test(`${sort}: agents and sub-agents
   walk(agents.render({}).node);
   expect(orders.at(-1)).toEqual(["a1", "a2", "a3"]);
   expect(rowIds).toEqual(["ag-a1", "sub-a1-sub1", "sub-a1-sub2", "ag-a2", "ag-a3"]);
+});
+
+test("semantic naming strictly preserves user custom names and explicit tab names", () => {
+  const prog = { name: "Claude Code", key: "claude", agent: true };
+  // 1. User custom name always wins over semantic_title
+  expect(
+    resolveSemanticLabel(
+      { address: "a1", custom_name: "My Custom Name", semantic_title: "Fix login", program: prog },
+      { address: "a1", labels: {} },
+      { name: "1", named: false },
+      null,
+    ),
+  ).toBe("My Custom Name");
+  // 2. Explicit user-renamed tab wins over semantic_title
+  expect(
+    resolveSemanticLabel(
+      { address: "t1", semantic_title: "Fix login", program: prog },
+      { address: "t1", labels: {} },
+      { name: "Release Prep", named: true },
+      null,
+    ),
+  ).toBe("Release Prep");
+  // 3. Unnamed tab uses semantic_title instead of boring program name or tab number
+  expect(
+    resolveSemanticLabel(
+      { address: "t1", semantic_title: "修复认证超时", title: "Claude Code", program: prog },
+      { address: "t1", labels: {} },
+      { name: "2", named: false },
+      null,
+    ),
+  ).toBe("修复认证超时");
+});
+
+test("zero-click hover tooltip formats status, live micro_summary, and cwd/branch", () => {
+  const tip = buildHoverTooltip(
+    {
+      address: "a3",
+      status: "working",
+      semantic_title: "迁移登录模块",
+      micro_summary: "已完成 3/5 个文件迁移，正在修复 api_test 编译错误",
+      program: { name: "Claude", key: "claude" },
+      branch: "feat/auth",
+    },
+    { address: "a3", cwd: "/home/dev/repo", turn: 3 },
+    { isZh: true, now: 180000, since: 0 },
+  );
+  const lines = tip.split("\n");
+  expect(lines).toHaveLength(3);
+  expect(lines[0]).toContain("迁移登录模块");
+  expect(lines[0]).toContain("运行中 3m");
+  expect(lines[1]).toBe("▸ 已完成 3/5 个文件迁移，正在修复 api_test 编译错误");
+  expect(lines[2]).toContain("/home/dev/repo (feat/auth)");
+});
+
+test("catch-up briefing clusters similar permissions and merges Drove downstream blockers", () => {
+  const local = buildLocalFallbackBriefing({
+    isZh: true,
+    awayMinutes: 12,
+    agents: [
+      { address: "a1", acp: true, status: "blocked", semantic_title: "Auth", program: { name: "Claude" } },
+      { address: "wsl/a2", acp: true, status: "blocked", semantic_title: "Storage", program: { name: "Codex" } },
+      { address: "t1", acp: false, status: "done", semantic_title: "UI 优化", micro_summary: "通过单测", program: { name: "Claude" } },
+    ],
+    terminals: [
+      { address: "a1", acp: true, state: "live", status: "blocked", pending_permission: { kind: "execute", title: "Run cargo test auth" }, labels: {} },
+      { address: "wsl/a2", acp: true, state: "live", status: "blocked", pending_permission: { kind: "execute", title: "Run cargo test storage" }, labels: {} },
+      { address: "t1", acp: false, state: "live", status: "done", labels: {} },
+    ],
+  });
+  expect(local.permissionClusters).toHaveLength(1);
+  expect(local.permissionClusters[0].addresses).toEqual(["a1", "wsl/a2"]);
+  expect(local.readyToReview).toHaveLength(1);
+  expect(local.headline).toContain("离开约 12 分钟");
+
+  const merged = mergeBriefingSnapshots(local, {
+    generatedMs: 2000,
+    headline: "核心 schema 失败正阻塞 3 个下游任务；2 个测试审批可一键全批。",
+    headlineFromAi: true,
+    criticalBlockers: [
+      { id: "drove_task:t_schema", kind: "drove_blocker", title: "schema: Update OpenRPC", summary: "Blocking 3 downstream", status: "error", blockedDownstreamCount: 3 },
+    ],
+    permissionClusters: local.permissionClusters,
+    pendingDecisions: [],
+    readyToReview: [],
+    workingItems: [],
+  });
+  expect(merged.headlineFromAi).toBe(true);
+  expect(merged.criticalBlockers[0].blockedDownstreamCount).toBe(3);
+  expect(merged.readyToReview).toHaveLength(1);
 });

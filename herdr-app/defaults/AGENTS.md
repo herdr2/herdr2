@@ -666,14 +666,14 @@ The main ones:
   started, including its release outside the pane; other panes don't receive it.
   Terminals display Kitty graphics, including Unicode placeholder images used by
   programs such as yazi; partial images and scrolling follow the placeholder cells.
-- Agents: `agent.next`, `agent.prev`, `agent.focus {terminal}`, `agent.rename {terminal?, name?}`, `agent.trash {terminal?}`, `agent.restore {terminal}`, `agent.purge {terminal}`, `agent.empty_trash`, `agent.status {status, terminal?}`, `agent.handoff {source?, preset?, into?, kind?, mode?, prompt?, recent_turns?, max_bytes?, model?, effort?, open?}`, `agent.send_review {target?, comments, source?, checkpoint_turn?, repo_root?, note?, steer?, focus?, request_id?}`, `agent.send {agent?, text, steer?}`, `agent.interrupt {agent?}`, `agent.approve {agent?, option?}`, `agent.deny {agent?}`.
+- Agents: `agent.next`, `agent.prev`, `agent.focus {terminal}`, `agent.rename {terminal?, name?}`, `agent.trash {terminal?}`, `agent.restore {terminal}`, `agent.purge {terminal}`, `agent.empty_trash`, `agent.status {status, terminal?}`, `agent.briefing {away_minutes?}`, `agent.handoff {source?, preset?, into?, kind?, mode?, prompt?, recent_turns?, max_bytes?, model?, effort?, open?}`, `agent.send_review {target?, comments, source?, checkpoint_turn?, repo_root?, note?, steer?, focus?, request_id?}`, `agent.send {agent?, text, steer?}`, `agent.interrupt {agent?}`, `agent.approve {agent?, option?}`, `agent.deny {agent?}`.
 - Layout: `layout.switch {name?}`, `layout.toggle {id}`, `layout.show {id}`, `layout.hide {id}`,
   `layout.resize {id, px | weight}`, `layout.select {stack, child}`, `layout.set {layout}`
   (personal tree edits; on shipped layouts only click/look fields change),
   `layout.reset {name?}` (reset a shipped layout and its clicks),
   `layout.clone {name, as?}` (duplicate, then switch; default `<name>-copy`).
-- App: `mod.clone {name, as?}` (duplicate; default `<name>-copy`), `mod.open {name}` (again: closes it), `overlay.close {id?}`, `app.help` (again: closes it), `app.palette` (again: closes it), `app.settings {section?}`
-  (sections: `look`, `machines`, `drove`, `alerts`, `privacy`; Machines lists, renames and removes ssh machines; Drove configures roles, AI assistant, and optional Magpie quota; settings edit the same files you do),
+- App: `mod.clone {name, as?}` (duplicate; default `<name>-copy`), `mod.open {name}` (again: closes it), `files.open {path, line?, end_line?, on?, cwd?}` (open a workspace or external file in the Files panel and jump to line), `overlay.close {id?}`, `app.help` (again: closes it), `app.palette` (again: closes it), `app.settings {section?}`
+  (sections: `look`, `machines`, `ai`, `drove`, `alerts`, `privacy`; Machines lists, renames and removes ssh machines; AI configures the shared Core AI assistant & KV-cache telemetry; Drove configures roles, AI policies, and optional Magpie quota; settings edit the same files you do),
   `app.welcome`, `app.reset`,
   `app.theme {name}`, `app.language {language}` (`"en"` or `"zh-CN"`), `app.zoom_in`, `app.zoom_out`, `app.zoom_reset`.
   Add machine lists all named ssh-config hosts in a scrollable list. Machines

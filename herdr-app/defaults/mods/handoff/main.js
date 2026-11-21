@@ -2,8 +2,8 @@
 // Props: { overlay, source, kind?, from_turn?, to_turn? }.
 
 import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, TextareaState, Textarea } from "gpui-base";
-import { terminals, spaces, knownAgents, run, props, closeOverlay, theme, settings, shared, setShared } from "herdr";
+import { v_flex, h_flex, InputState, Input, TextareaState, Textarea } from "gpui-base";
+import { terminals, spaces, knownAgents, run, h2, props, closeOverlay, theme, settings, shared, setShared, checking } from "herdr";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
@@ -57,7 +57,9 @@ function sessionLabel(rec) {
 
 export default class Handoff extends View {
   init(_props, cx) {
+    this._cx = cx;
     this.handle = cx.focus_handle();
+    this._applyingPrefill = false;
     this.promptInput = TextareaState.new({
       value: "",
       placeholder: "",
@@ -66,7 +68,10 @@ export default class Handoff extends View {
     this.promptFocused = false;
     this.promptInput.on("focus", (_e, cx) => { this.promptFocused = true; cx.notify(); });
     this.promptInput.on("blur", (_e, cx) => { this.promptFocused = false; cx.notify(); });
-    this.promptInput.on("change", (_e, cx) => { cx.notify(); });
+    this.promptInput.on("change", (_e, cx) => {
+      if (!this._applyingPrefill) this.userTouchedPrompt = true;
+      cx.notify();
+    });
     this.promptInput.on("submit", (e) => {
       if (e?.ctrl || e?.meta || !e?.shift) {
         this.submit();
@@ -76,6 +81,28 @@ export default class Handoff extends View {
     const machine = spaces().find((s) => s.active)?.machine ?? "";
     this.knownList = Array.isArray(shared("new-menu.agents")?.[machine]) ? shared("new-menu.agents")[machine] : [];
     this.recentTurns = 8;
+    this.customTurnsMode = false;
+    this.customTurnsFocused = false;
+    this.customTurnsInput = InputState.new({
+      value: "20",
+      placeholder: tr("Turns", "轮数"),
+    });
+    this.customTurnsInput.on("focus", (_e, cx) => {
+      this.customTurnsFocused = true;
+      this.customTurnsMode = true;
+      cx.notify();
+    });
+    this.customTurnsInput.on("blur", (_e, cx) => {
+      this.customTurnsFocused = false;
+      cx.notify();
+    });
+    this.customTurnsInput.on("change", (_e, cx) => {
+      this.customTurnsMode = true;
+      cx.notify();
+    });
+    this.customTurnsInput.on("submit", () => {
+      if (this.canSubmit()) this.submit();
+    });
     this.preset = "";
     this.runtimeMode = "acp";
     this.openIn = "tab";
@@ -89,19 +116,30 @@ export default class Handoff extends View {
     this.fromTurn = null;
     this.lastPropsKey = "";
 
+    this.recommendation = null;
+    this.recLoading = false;
+    this.recKey = "";
+    this.userTouchedMode = false;
+    this.userTouchedPreset = false;
+    this.userTouchedPrompt = false;
+
     this.syncFromProps(true);
 
-    cx.spawn(async (cx) => {
-      try {
-        const res = await knownAgents({ on: machine || undefined });
-        if (Array.isArray(res) && res.length > 0) {
-          this.knownList = res;
-          setShared("new-menu.agents", { ...(shared("new-menu.agents") ?? {}), [machine]: res });
-          this.ensurePresetSelected();
-          cx.notify();
-        }
-      } catch {}
-    });
+    if (!checking()) {
+      cx.spawn(async (cx) => {
+        try {
+          const res = await knownAgents({ on: machine || undefined });
+          if (Array.isArray(res) && res.length > 0) {
+            this.knownList = res;
+            setShared("new-menu.agents", { ...(shared("new-menu.agents") ?? {}), [machine]: res });
+            this.ensurePresetSelected();
+            this.requestRecommendation(cx, true);
+            cx.notify();
+          }
+        } catch {}
+      });
+      this.requestRecommendation(cx, false);
+    }
     this.handle.focus();
   }
 
@@ -193,6 +231,80 @@ export default class Handoff extends View {
     }
   }
 
+  applyPrefillFromRecommendation(rec, includeMode = false) {
+    if (!rec) return;
+    const { all } = this.availablePresets();
+    if (includeMode && rec.recommendedKind && ["handoff", "fork", "side-chat"].includes(rec.recommendedKind)) {
+      this.applyMode(rec.recommendedKind, false);
+    }
+    if (
+      (includeMode || !this.userTouchedPreset) &&
+      rec.recommendedPreset &&
+      all.some((p) => p.key === rec.recommendedPreset)
+    ) {
+      this.preset = rec.recommendedPreset;
+    }
+    const existing = String(this.promptInput?.value?.() ?? "").trim();
+    if (
+      rec.suggestedNote &&
+      !this.userTouchedPrompt &&
+      !existing
+    ) {
+      this._applyingPrefill = true;
+      try {
+        this.promptInput.set_value(rec.suggestedNote);
+      } finally {
+        this._applyingPrefill = false;
+      }
+    }
+  }
+
+  requestRecommendation(cx, force = false) {
+    if (checking()) return;
+    const p = props() ?? {};
+    const sourceAddr = p.source || "";
+    if (!sourceAddr || this.mode === "merge-back") return;
+    const { installed } = this.availablePresets();
+    const installedKeys = installed.map((x) => x.key);
+    const key = `${sourceAddr}:${installedKeys.join(",")}:${isZh() ? "zh" : "en"}`;
+    if (!force && this.recKey === key) return;
+    this.recKey = key;
+    this.recLoading = true;
+    const spawner = cx?.spawn ? cx : this._cx;
+    if (!spawner?.spawn) {
+      this.recLoading = false;
+      return;
+    }
+    spawner.spawn(async (taskCx) => {
+      try {
+        const args = [
+          "ai",
+          "handoff-recommend",
+          "--json",
+          sourceAddr,
+          "--lang",
+          isZh() ? "zh" : "en",
+          ...(installedKeys.length > 0 ? ["--installed", installedKeys.join(",")] : []),
+        ];
+        const res = await h2(args, { timeout: 6500 });
+        if (this.recKey !== key) return;
+        if (res.code === 0 && res.stdout) {
+          const parsed = JSON.parse(res.stdout);
+          if (parsed && typeof parsed === "object" && parsed.recommendedPreset) {
+            this.recommendation = parsed;
+            if (this.mode !== "merge-back") {
+              this.applyPrefillFromRecommendation(parsed, false);
+            }
+          }
+        }
+      } catch {}
+      finally {
+        if (this.recKey === key) this.recLoading = false;
+        taskCx?.notify?.();
+      }
+    });
+  }
+
   syncFromProps(force = false) {
     const p = props() ?? {};
     const key = `${p.source ?? ""}:${p.kind ?? ""}:${p.from_turn ?? ""}:${p.to_turn ?? ""}`;
@@ -200,7 +312,14 @@ export default class Handoff extends View {
       this.lastPropsKey = key;
       this.fromTurn = typeof p.from_turn === "number" && p.from_turn > 0 ? p.from_turn : null;
       this.toTurn = typeof p.to_turn === "number" && p.to_turn > 0 ? p.to_turn : null;
+      this.customTurnsMode = false;
+      this.userTouchedMode = false;
+      this.userTouchedPreset = false;
+      this.userTouchedPrompt = false;
+      this.recommendation = null;
+      this.recKey = "";
       this.applyMode(p.kind || "handoff", true);
+      if (!force) this.requestRecommendation(this._cx, false);
     }
   }
 
@@ -258,9 +377,25 @@ export default class Handoff extends View {
     }
   }
 
+  parsedCustomTurns() {
+    const raw = String(this.customTurnsInput?.value?.() ?? "").trim();
+    if (!/^\d+$/.test(raw)) return null;
+    const n = Number.parseInt(raw, 10);
+    return Number.isSafeInteger(n) && n >= 1 ? n : null;
+  }
+
+  effectiveRecentTurns() {
+    if (this.customTurnsMode) return this.parsedCustomTurns();
+    return this.recentTurns;
+  }
+
   canSubmit() {
     const p = props() ?? {};
     if (!p.source) return false;
+    const pinnedFork = this.mode === "fork" && Boolean(this.toTurn);
+    if (!pinnedFork && this.customTurnsMode && this.parsedCustomTurns() === null) {
+      return false;
+    }
     if (this.mode === "merge-back") return Boolean(this.intoTarget);
     return Boolean(this.preset);
   }
@@ -273,11 +408,12 @@ export default class Handoff extends View {
       source: p.source,
       kind: this.mode,
     };
+    const effectiveTurns = this.effectiveRecentTurns();
     if (this.toTurn && this.mode === "fork") {
       args.to_turn = this.toTurn;
       if (this.fromTurn) args.from_turn = this.fromTurn;
-    } else if (this.recentTurns > 0) {
-      args.recent_turns = this.recentTurns;
+    } else if (typeof effectiveTurns === "number" && effectiveTurns > 0) {
+      args.recent_turns = effectiveTurns;
     }
     if (promptText) {
       args.prompt = promptText;
@@ -505,6 +641,7 @@ export default class Handoff extends View {
                   .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
                   .on_click((_e, cx) => {
                     cx.stop_propagation();
+                    this.userTouchedMode = true;
                     this.applyMode(m.id, false);
                     cx.notify();
                   })
@@ -525,6 +662,79 @@ export default class Handoff extends View {
           .whitespace_normal()
           .child(copy.subtitle),
       )
+      // AI / heuristic complementary recommendation banner
+      .when(!isMerge && Boolean(this.recommendation?.reason), (el) => {
+        const rec = this.recommendation;
+        const kindLabel =
+          rec.recommendedKind === "fork"
+            ? tr("Fork Session", "会话分叉")
+            : rec.recommendedKind === "side-chat"
+              ? tr("Side Chat", "旁路讨论")
+              : tr("Handoff", "上下文接力");
+        const modeDiffers = Boolean(rec.recommendedKind && rec.recommendedKind !== this.mode && !this.toTurn);
+        return el.child(
+          h_flex()
+            .id("ho-rec-banner")
+            .w_full()
+            .min_w(0)
+            .px(10)
+            .py(7)
+            .gap(8)
+            .items_center()
+            .rounded(8)
+            .bg(withAlpha(accent, "12") ?? t.raised)
+            .border_1()
+            .border_color(withAlpha(accent, "55") ?? t.border)
+            .child(
+              div()
+                .flex_none()
+                .px(5)
+                .py(1)
+                .rounded(4)
+                .bg(withAlpha(accent, "24") ?? t.background)
+                .text_size(10)
+                .font_semibold()
+                .text_color(accent)
+                .child(rec.usedAi ? tr("AI Suggestion", "AI 推荐") : tr("Suggestion", "建议")),
+            )
+            .child(
+              div()
+                .flex_1()
+                .min_w(0)
+                .text_size(11)
+                .line_height("15px")
+                .text_color(t.foreground)
+                .whitespace_normal()
+                .child(`${rec.reason} (${rec.recommendedPreset} · ${kindLabel})`),
+            )
+            .when(modeDiffers, (btnEl) =>
+              btnEl.child(
+                div()
+                  .id("ho-rec-apply-mode")
+                  .flex_none()
+                  .px(7)
+                  .py(3)
+                  .rounded(5)
+                  .bg(t.background)
+                  .border_1()
+                  .border_color(withAlpha(accent, "77") ?? t.border)
+                  .text_size(10.5)
+                  .font_medium()
+                  .text_color(accent)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.hover))
+                  .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                  .on_click((_e, cx) => {
+                    cx.stop_propagation();
+                    this.userTouchedMode = true;
+                    this.applyPrefillFromRecommendation(rec, true);
+                    cx.notify();
+                  })
+                  .child(tr(`Switch to ${kindLabel}`, `切到${kindLabel}`)),
+              ),
+            ),
+        );
+      })
       // Creation modes body
       .when(!isMerge, (el) =>
         el
@@ -566,9 +776,18 @@ export default class Handoff extends View {
                   .flex_wrap()
                   .children(
                     visiblePresets.map((pr) =>
-                      this.chip(t, `ho-pre-${pr.key}`, pr.label, this.preset === pr.key, () => {
-                        this.preset = pr.key;
-                      }, accent),
+                      this.chip(
+                        t,
+                        `ho-pre-${pr.key}`,
+                        pr.label,
+                        this.preset === pr.key,
+                        () => {
+                          this.userTouchedPreset = true;
+                          this.preset = pr.key;
+                        },
+                        accent,
+                        this.recommendation?.recommendedPreset === pr.key ? tr("Suggested", "推荐") : null,
+                      ),
                     ),
                   ),
               ),
@@ -778,29 +997,92 @@ export default class Handoff extends View {
             ),
         ),
       )
-      .when(!(this.mode === "fork" && Boolean(this.toTurn)), (el) =>
-        el.child(
-          h_flex()
+      .when(!(this.mode === "fork" && Boolean(this.toTurn)), (el) => {
+        const customTurns = this.customTurnsMode ? this.parsedCustomTurns() : null;
+        const customInvalid = this.customTurnsMode && customTurns === null;
+        const customBorder = customInvalid
+          ? (t.danger ?? "#ef4444")
+          : (this.customTurnsFocused ? accent : t.input);
+        return el.child(
+          v_flex()
             .w_full()
             .min_w(0)
-            .items_center()
-            .justify_between()
-            .gap(8)
-            .child(div().flex_none().text_size(11).font_medium().text_color(t.dim).child(tr("Context Depth", "携带上下文")))
+            .gap(4)
             .child(
               h_flex()
-                .gap(5)
-                .flex_wrap()
-                .children(
-                  TURN_CHOICES().map((c) =>
-                    this.chip(t, `ho-turns-${c.value}`, c.label, this.recentTurns === c.value, () => {
-                      this.recentTurns = c.value;
-                    }, accent),
-                  ),
+                .w_full()
+                .min_w(0)
+                .items_center()
+                .justify_between()
+                .gap(8)
+                .child(div().flex_none().text_size(11).font_medium().text_color(t.dim).child(tr("Context Depth", "携带上下文")))
+                .child(
+                  h_flex()
+                    .gap(5)
+                    .items_center()
+                    .flex_wrap()
+                    .justify_end()
+                    .children(
+                      TURN_CHOICES().map((c) =>
+                        this.chip(t, `ho-turns-${c.value}`, c.label, !this.customTurnsMode && this.recentTurns === c.value, () => {
+                          this.customTurnsMode = false;
+                          this.recentTurns = c.value;
+                        }, accent),
+                      ),
+                    )
+                    .child(
+                      this.chip(t, "ho-turns-custom", tr("Custom", "自定义"), this.customTurnsMode, () => {
+                        this.customTurnsMode = true;
+                        const cur = String(this.customTurnsInput?.value?.() ?? "").trim();
+                        if (!cur) {
+                          const fallback = this.recentTurns > 0 ? String(this.recentTurns) : "20";
+                          this.customTurnsInput.set_value(fallback);
+                          this.customTurnsInput.set_selected_range({ start: 0, end: fallback.length });
+                        } else {
+                          this.customTurnsInput.set_selected_range({ start: 0, end: cur.length });
+                        }
+                        this.customTurnsInput.focus();
+                      }, accent),
+                    )
+                    .when(this.customTurnsMode, (customEl) =>
+                      customEl.child(
+                        h_flex()
+                          .flex_none()
+                          .items_center()
+                          .gap(4)
+                          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                          .child(
+                            Input.new(this.customTurnsInput)
+                              .id("ho-turns-custom-input")
+                              .w(60)
+                              .h(26)
+                              .px(7)
+                              .rounded(6)
+                              .border_1()
+                              .border_color(customBorder)
+                              .bg(t.background)
+                              .text_size(11.5)
+                              .text_color(t.foreground),
+                          )
+                          .child(div().flex_none().text_size(11).text_color(t.muted).child(tr("turns", "轮"))),
+                      ),
+                    ),
                 ),
+            )
+            .when(customInvalid, (errEl) =>
+              errEl.child(
+                div()
+                  .id("ho-turns-custom-error")
+                  .w_full()
+                  .min_w(0)
+                  .text_right()
+                  .text_size(10.5)
+                  .text_color(t.danger ?? "#ef4444")
+                  .child(tr("Enter a positive integer (≥ 1)", "请输入大于 0 的整数轮次")),
+              ),
             ),
-        ),
-      )
+        );
+      })
       // Prompt input
       .child(
         v_flex()

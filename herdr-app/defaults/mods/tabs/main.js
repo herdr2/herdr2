@@ -62,21 +62,26 @@ function resolveEnabledPanels(defaultIds) {
 // Same as the agents mod: drops a status glyph, keeps a leading bracket or quote.
 const clean = (s) => (s ?? "").replace(/^[^\p{L}\p{N}\p{Ps}\p{Pi}]+/u, "").replace(/^\[ [!.] \] /, "").trim();
 
-// A tab Herdr named (unnamed, or after its program) follows its agent's live
-// title, as the agents list does; a name the person gave stays.
+// A tab Herdr named (unnamed, or after its program) follows its agent's semantic
+// title or live title, as the agents list does; a name the person gave stays.
 function label(tab, lead) {
   const prog = lead?.program?.name;
   const base = tab.named ? tab.name : prog ?? "Terminal";
-  if (!lead?.program?.agent) return base;
+  if (!lead?.program?.agent && !lead?.acp) return base;
+  const auto = tab.name === prog || !tab.named;
+  const semantic = typeof lead?.semantic_title === "string" ? lead.semantic_title.trim() : "";
+  if (auto && semantic) return semantic;
   const live = clean(lead.title);
   // clean() would strip a path's leading ~ or /: test the title with only its status glyph gone.
   const path = /^[~/]|^[A-Za-z]:\\/.test((lead.title ?? "").replace(/^[^\p{L}\p{N}~/]+/u, ""));
-  const telling = live && live !== lead.terminal && live !== prog && !path && !live.includes("@") && live.toLowerCase() !== lead.program.key;
-  return (tab.name === prog || !tab.named) && telling ? live : base;
+  const telling = live && live !== lead.terminal && live !== prog && !path && !live.includes("@") && live.toLowerCase() !== lead.program?.key;
+  return auto && telling ? live : base;
 }
 
 function paneDisplayName(p) {
   if (p?.custom_name) return p.custom_name;
+  const semantic = typeof p?.semantic_title === "string" ? p.semantic_title.trim() : "";
+  if (semantic) return semantic;
   if (p?.acp || p?.structured) return p.program?.name || clean(p.title) || p.terminal || "Agent";
   if (p?.program?.agent) {
     const live = clean(p.title);
@@ -87,6 +92,42 @@ function paneDisplayName(p) {
   return p?.program?.shell && p.program?.name
     ? p.program.name
     : (clean(p?.title) || p?.program?.name || p?.mod || "Terminal");
+}
+
+function buildTabMicroTooltip(tab, lead, displayName, elapsed, termByAddr) {
+  if (!lead) return "";
+  const rec = lead.terminal ? termByAddr.get(lead.terminal) : null;
+  const st = lead.status ?? tab.status ?? "idle";
+  const stMap = {
+    working: tr("Working", "运行中"),
+    blocked: tr("Needs you", "待确认"),
+    done: tr("Done", "已完成"),
+    error: tr("Error", "异常"),
+    idle: tr("Idle", "空闲"),
+  };
+  const prog = lead.program?.name ?? (lead.acp ? "ACP" : "Terminal");
+  const elapsedText = elapsed && elapsed.ms > 0 ? ` ${formatElapsed(elapsed.ms)}` : "";
+  const head = [displayName, prog !== displayName ? prog : "", `${stMap[st] ?? st}${elapsedText}`]
+    .filter(Boolean)
+    .join(" · ");
+  const perm = rec?.pending_permission?.title ? String(rec.pending_permission.title).trim() : "";
+  const micro = String(lead.micro_summary ?? rec?.micro_summary ?? rec?.ai_status_summary ?? "").trim();
+  const progress = perm
+    ? tr(`Waiting approval: ${perm}`, `等待审批：${perm}`)
+    : micro
+      ? micro
+      : st === "working"
+        ? tr("Actively working in background…", "后台执行中…")
+        : st === "done"
+          ? tr("Finished — click tab to inspect", "已完成 — 点击标签页检视")
+          : st === "blocked"
+            ? tr("Needs your input or approval", "等待你的确认或输入")
+            : "";
+  const cwd = String(lead.cwd ?? rec?.cwd ?? "").trim();
+  const branch = String(lead.branch ?? "").trim();
+  const shortCwd = cwd.length > 44 ? `…${cwd.slice(-42)}` : cwd;
+  const meta = shortCwd ? (branch ? `${shortCwd} (${branch})` : shortCwd) : (branch ? `(${branch})` : "");
+  return [head, progress ? `▸ ${progress}` : "", meta].filter(Boolean).join("\n");
 }
 
 const TAB_GAP = 3;
@@ -410,6 +451,7 @@ export default class Tabs extends View {
       .on_mouse_down("left", stop).on_click(action).child(label);
     const motion = this.drag?.moving ? this.drag : this.settling;
     const now = Date.now();
+    const termByAddr = new Map((typeof terminals === "function" ? terminals() : []).filter((x) => x?.address).map((x) => [x.address, x]));
     const timeTooltip = (info) => {
       if (!info) return "";
       const cur = formatElapsed(info.ms);
@@ -439,6 +481,9 @@ export default class Tabs extends View {
       const elapsed = this.tabElapsed(c, agentPanes, now);
       const program = lead?.program;
       const name = c.named ? label(c, lead) : (combinedName || label(c, lead));
+      const hoverTip = !isFloating && !c.active && (isAgentPane(lead) || Boolean(lead?.micro_summary || lead?.semantic_title))
+        ? buildTabMicroTooltip(c, lead, name, elapsed, termByAddr)
+        : "";
       const accent = t.accent ?? "#3b82f6";
       let el = h_flex()
         .id(isFloating ? `tab-float-card-${c.id}` : `tab-${c.id}`)
@@ -448,6 +493,7 @@ export default class Tabs extends View {
         .rounded(7)
         .items_center()
         .flex_none()
+        .when(Boolean(hoverTip), (node) => node.tooltip(hoverTip))
         .text_size(12.8)
         .when(Boolean(isFloating && width > 0), node => node.w(width))
         .border(1)
@@ -644,6 +690,53 @@ export default class Tabs extends View {
     const hasSideChats = focusedMainSideChatCount() > 0;
     const effectiveEnabled = hasSideChats ? enabled : enabled.filter((id) => id !== "side-chat");
     this.syncPanel(space, panel, body, effectiveEnabled);
+    const rawFlashNotes = shared("flash_notes.items");
+    const unsentFlashCount = Array.isArray(rawFlashNotes)
+      ? rawFlashNotes.filter((n) => n && typeof n.text === "string" && n.text.trim() && !n.sentTo).length
+      : 0;
+    const flashNoteButton = h_flex()
+      .id("btn-flash-note")
+      .h(26)
+      .px(8)
+      .gap(5)
+      .flex_none()
+      .items_center()
+      .rounded(6)
+      .text_size(12)
+      .bg(t.chrome)
+      .text_color(t.muted)
+      .cursor_pointer()
+      .hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .tooltip(tr("Capture a flash note (floating window)", "打开闪念悬浮窗，随时记录灵感或派发给 Agent"))
+      .on_mouse_down("left", stop)
+      .on_click(() =>
+        openOverlay({
+          mod: "flash-note",
+          kind: "window",
+          key: "flash-note",
+          resizable: true,
+          width: 456,
+          height: 436,
+          min_width: 360,
+          min_height: 330,
+          props: { mode: "compose" },
+        }),
+      )
+      .child(svg("mods/peek/lightbulb.svg").size(14).text_color(unsentFlashCount > 0 ? "#f59e0b" : t.muted))
+      .child(tr("Ideas", "闪念"))
+      .when(unsentFlashCount > 0, (el) =>
+        el.child(
+          div()
+            .px(4.5)
+            .py(0.5)
+            .rounded(999)
+            .bg("#f59e0b24")
+            .text_size(10)
+            .font_semibold()
+            .text_color("#f59e0b")
+            .child(String(unsentFlashCount)),
+        ),
+      );
     const panelButton = (id, label, icon) => {
       const on = panel && !panel.hidden && body?.active === id;
       return h_flex().id(`panel-${id}`).h(26).px(8).gap(5).flex_none().items_center().rounded(6)
@@ -683,6 +776,7 @@ export default class Tabs extends View {
       .when(enabled.includes("changes"), el => el.child(panelButton("changes", tr("Changes", "变更"), "mods/changes/changes.svg")))
       .when(enabled.includes("checkpoints"), el => el.child(panelButton("checkpoints", tr("Checkpoints", "快照"), "mods/checkpoints/checkpoints.svg")))
       .when(enabled.includes("side-chat") && hasSideChats, el => el.child(panelButton("side-chat", tr("Side Chat", "旁路"), "mods/peek/messages-square.svg")))
+      .child(flashNoteButton)
       .when(w?.buttons, el => el.child(button("minimize", w.platform === "windows" ? svg("mods/tabs/win-min.svg").size(16) : "−", () => run("window.minimize")))
         .child(button("maximize", w.platform === "windows" ? svg(`mods/tabs/${w.maximized ? "win-restore" : "win-max"}.svg`).size(16) : "□", () => run("window.maximize")))
         .child(button("close-window", w.platform === "windows" ? svg("mods/tabs/win-close.svg").size(16) : svg("mods/pane/close.svg").size(13), () => run("window.close"))))

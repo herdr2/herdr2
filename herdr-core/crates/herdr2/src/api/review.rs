@@ -57,8 +57,8 @@ pub(super) async fn agent_review(core: Ctx<'_>, p: ReviewParams) -> Result<Revie
             let (delivery_text, staged_path) = if pkg.bytes <= DEFAULT_REVIEW_INLINE_MAX_BYTES {
                 (pkg.markdown.clone(), None)
             } else {
-                let path = crate::put::stage(&core.paths.state, id, "diff-review.md", pkg.markdown.as_bytes())
-                    .map_err(|e| RpcError::internal(format!("failed to stage review for {target_addr}: {e}")))?;
+                let path = crate::put::stage(&core.paths.state, id, "line-notes.md", pkg.markdown.as_bytes())
+                    .map_err(|e| RpcError::internal(format!("failed to stage line notes for {target_addr}: {e}")))?;
                 let path_str = path.display().to_string();
                 let ptr = build_staged_pointer_message(
                     &pkg,
@@ -97,8 +97,8 @@ pub(super) async fn agent_review(core: Ctx<'_>, p: ReviewParams) -> Result<Revie
                 ));
             }
             let target_addr = crate::terminals::address(id);
-            let staged = crate::put::stage_terminal(&core.paths.state, id, "diff-review.md", pkg.markdown.as_bytes())
-                .map_err(|e| RpcError::internal(format!("failed to stage review for {target_addr}: {e}")))?;
+            let staged = crate::put::stage_terminal(&core.paths.state, id, "line-notes.md", pkg.markdown.as_bytes())
+                .map_err(|e| RpcError::internal(format!("failed to stage line notes for {target_addr}: {e}")))?;
             let path_str = staged.display().to_string();
             let pointer =
                 build_staged_pointer_message(&pkg, &path_str, p.note.as_deref(), p.checkpoint_turn, is_zh);

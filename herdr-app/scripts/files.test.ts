@@ -423,6 +423,11 @@ import {
   extractFileSnippet,
   computeMarkdownBlockRanges,
   mapCommentsToMarkdownBlocks,
+  buildFileRows,
+  buildFileSelectionRange,
+  matchFileCommentRowIndex,
+  buildFileDisplayItems,
+  ROW_HEIGHT,
 } from "../defaults/mods/files/review_model.js";
 
 test("Files review_model maps editor UTF-16 selections and Markdown blocks to exact 1-based lines", () => {
@@ -463,4 +468,31 @@ test("Files review_model maps editor UTF-16 selections and Markdown blocks to ex
   ]);
   expect(mapped.byBlock.get(1)?.map((c) => c.id)).toEqual(["c1"]);
   expect(mapped.byBlock.get(2)?.map((c) => c.id)).toEqual(["c2"]);
+
+  // Line-level file review rows, Shift+Click range, and inline comment interleaving (consistent with Checkpoints)
+  const fileRows = buildFileRows("fn main() {\n\tlet x = 1;\n\tprintln!(\"{x}\");\n}", "src/main.rs");
+  expect(fileRows).toHaveLength(4);
+  expect(fileRows[0]).toMatchObject({ rowIndex: 0, lineNumber: 1, file: "src/main.rs", text: "fn main() {", commentable: true });
+  expect(fileRows[1].text).toBe("    let x = 1;");
+
+  const single = buildFileSelectionRange(fileRows, 1, 1);
+  expect(single).toEqual({ path: "src/main.rs", startRowIdx: 1, endRowIdx: 1, startLine: 2, endLine: 2 });
+  const multi = buildFileSelectionRange(fileRows, 3, 1);
+  expect(multi).toEqual({ path: "src/main.rs", startRowIdx: 1, endRowIdx: 3, startLine: 2, endLine: 4 });
+
+  // Fast scalar sizes when no comments exist
+  const plain = buildFileDisplayItems(fileRows, [], null);
+  expect(plain.items).toHaveLength(4);
+  expect(plain.sizes).toBe(ROW_HEIGHT);
+
+  // Interleaved inline comment immediately after its end_line + orphan comment at end
+  const cInline = { id: "fc1", path: "src/main.rs", side: "file", start_line: 2, end_line: 3, body: "Avoid magic number" };
+  const cOrphan = { id: "fc2", path: "src/main.rs", side: "file", start_line: 99, body: "Outdated line" };
+  expect(matchFileCommentRowIndex(fileRows, cInline)).toBe(2);
+  expect(matchFileCommentRowIndex(fileRows, cOrphan)).toBe(-1);
+  const interleaved = buildFileDisplayItems(fileRows, [cInline, cOrphan], { editingId: "fc1" });
+  expect(interleaved.items.map((it: any) => it.key)).toEqual(["r-0", "r-1", "r-2", "c-fc1", "r-3", "c-orphan-fc2"]);
+  expect((interleaved.items[3] as any).editing).toBe(true);
+  expect((interleaved.items[5] as any).outdated).toBe(true);
+  expect(Array.isArray(interleaved.sizes)).toBe(true);
 });

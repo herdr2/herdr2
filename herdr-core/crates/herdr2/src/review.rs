@@ -1,11 +1,11 @@
-//! Deterministic compiler for line-level diff review feedback delivered to ACP or PTY agents.
+//! Deterministic compiler for line-anchored file/diff notes & messages delivered to ACP or PTY agents.
 
 use crate::api::ReviewComment;
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 /// Maximum inline Markdown payload sent directly into an ACP `session/prompt` turn
-/// before staging a `diff-review.md` file beside the agent.
+/// before staging a `line-notes.md` file beside the agent.
 pub const DEFAULT_REVIEW_INLINE_MAX_BYTES: usize = 24 * 1024;
 
 /// Maximum number of inline review comments accepted in one `agent.review` call.
@@ -102,11 +102,11 @@ pub fn build_review_markdown(input: &ReviewBuildInput<'_>) -> ReviewPackage {
 
     let mut md = String::with_capacity(1024);
     if is_zh {
-        let _ = writeln!(md, "## 代码审查意见（{comment_count} 条评论，涉及 {file_count} 个文件）");
+        let _ = writeln!(md, "## 文件行级消息（{comment_count} 条，涉及 {file_count} 个文件）");
     } else {
-        let c_word = if comment_count == 1 { "comment" } else { "comments" };
+        let n_word = if comment_count == 1 { "note" } else { "notes" };
         let f_word = if file_count == 1 { "file" } else { "files" };
-        let _ = writeln!(md, "## Code Review Feedback ({comment_count} {c_word} across {file_count} {f_word})");
+        let _ = writeln!(md, "## File Line Notes ({comment_count} {n_word} across {file_count} {f_word})");
     }
 
     let mut meta_parts: Vec<String> = Vec::new();
@@ -180,9 +180,9 @@ pub fn build_review_markdown(input: &ReviewBuildInput<'_>) -> ReviewPackage {
 
             let body = c.body.trim();
             if is_zh {
-                let _ = writeln!(md, "**审阅意见：** {body}");
+                let _ = writeln!(md, "**用户消息：** {body}");
             } else {
-                let _ = writeln!(md, "**Review comment:** {body}");
+                let _ = writeln!(md, "**Message:** {body}");
             }
         }
     }
@@ -190,12 +190,12 @@ pub fn build_review_markdown(input: &ReviewBuildInput<'_>) -> ReviewPackage {
     if is_zh {
         let _ = writeln!(
             md,
-            "\n---\n请逐条检查并处理以上审查意见，在修改完成后简要汇报每条评论的处理结果。"
+            "\n---\n请结合上述文件行级上下文，按每条用户消息的实际诉求（如解答疑问、分析讨论、修改代码或审查建议等）逐条回应或处理。"
         );
     } else {
         let _ = writeln!(
             md,
-            "\n---\nPlease address each review comment above and summarize how each item was resolved."
+            "\n---\nPlease respond to or act on each message above based on the attached file line context (e.g. answer questions, explain, discuss, or edit code as requested)."
         );
     }
 
@@ -211,8 +211,8 @@ fn summarize_file_list(files: &[String], max_shown: usize) -> String {
     format!("{head}, +{}", files.len() - max_shown)
 }
 
-/// Builds a compact, TTY-safe pointer prompt for PTY terminals (or oversized ACP reviews)
-/// pointing the agent to the staged `diff-review*.md` file.
+/// Builds a compact, TTY-safe pointer prompt for PTY terminals (or oversized ACP payloads)
+/// pointing the agent to the staged `line-notes*.md` file.
 pub fn build_staged_pointer_message(
     pkg: &ReviewPackage,
     staged_path: &str,
@@ -226,14 +226,14 @@ pub fn build_staged_pointer_message(
         .unwrap_or_default();
     let mut msg = if is_zh {
         format!(
-            "[代码审查{turn_tag}：{} 条行级评论，涉及 {} 个文件（{files_summary}）]\n完整审查意见已保存至：{staged_path}",
+            "[文件行级消息{turn_tag}：{} 条，涉及 {} 个文件（{files_summary}）]\n完整内容已保存至：{staged_path}",
             pkg.comment_count, pkg.file_count
         )
     } else {
-        let c_word = if pkg.comment_count == 1 { "comment" } else { "comments" };
+        let n_word = if pkg.comment_count == 1 { "note" } else { "notes" };
         let f_word = if pkg.file_count == 1 { "file" } else { "files" };
         format!(
-            "[Code Review{turn_tag}: {} inline {c_word} across {} {f_word} ({files_summary})]\nFull review saved at: {staged_path}",
+            "[File Line Notes{turn_tag}: {} {n_word} across {} {f_word} ({files_summary})]\nFull context saved at: {staged_path}",
             pkg.comment_count, pkg.file_count
         )
     };
@@ -248,9 +248,9 @@ pub fn build_staged_pointer_message(
         }
     }
     if is_zh {
-        msg.push_str("\n请先读取该文件并逐条处理其中的代码审查意见。");
+        msg.push_str("\n请先读取该文件，再按其中的用户消息逐条回应或处理。");
     } else {
-        msg.push_str("\nPlease read that file carefully and address each review comment.");
+        msg.push_str("\nPlease read that file first and respond to or act on each message accordingly.");
     }
     msg
 }
@@ -289,7 +289,7 @@ mod tests {
         assert_eq!(pkg.file_count, 2);
         assert_eq!(pkg.comment_count, 3);
         assert_eq!(pkg.files, vec!["src/a.rs", "src/b.rs"]);
-        assert!(pkg.markdown.contains("## Code Review Feedback (3 comments across 2 files)"));
+        assert!(pkg.markdown.contains("## File Line Notes (3 notes across 2 files)"));
         assert!(pkg.markdown.contains("#### 1. `src/a.rs:L12 (old/deleted side)`"));
         assert!(pkg.markdown.contains("#### 2. `src/b.rs:L5`"));
         assert!(pkg.markdown.contains("#### 3. `src/b.rs:L20-L25`"));
@@ -309,14 +309,14 @@ mod tests {
             comments: &comments,
             is_zh: true,
         });
-        assert!(pkg.markdown.contains("## 代码审查意见（1 条评论，涉及 1 个文件）"));
+        assert!(pkg.markdown.contains("## 文件行级消息（1 条，涉及 1 个文件）"));
         assert!(pkg.markdown.contains("来源：快照 T3"));
         assert!(pkg.markdown.contains("````diff"));
-        assert!(pkg.markdown.contains("**审阅意见：** 修正代码块语法"));
+        assert!(pkg.markdown.contains("**用户消息：** 修正代码块语法"));
 
-        let ptr = build_staged_pointer_message(&pkg, "/tmp/files/t1/diff-review.md", None, Some(3), true);
+        let ptr = build_staged_pointer_message(&pkg, "/tmp/files/t1/line-notes.md", None, Some(3), true);
         assert!(ptr.contains("快照 T3"));
-        assert!(ptr.contains("/tmp/files/t1/diff-review.md"));
+        assert!(ptr.contains("/tmp/files/t1/line-notes.md"));
         assert!(ptr.lines().count() <= 4);
     }
 

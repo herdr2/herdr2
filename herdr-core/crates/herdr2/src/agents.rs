@@ -130,6 +130,12 @@ pub struct Agent {
     pub reported: bool,
     #[serde(default)]
     pub title: String,
+    /// Concise adaptive semantic task label (never overrides user `herdr.name`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_title: Option<String>,
+    /// One-sentence real-time progress summary for zero-click hover tooltips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub micro_summary: Option<String>,
     /// The agent that started it (`a3`), set once at start.
     #[serde(default)]
     pub parent: Option<String>,
@@ -355,6 +361,8 @@ impl Registry {
                 first_task_turn: None,
                 reported: false,
                 title: String::new(),
+                semantic_title: None,
+                micro_summary: None,
                 parent: new.parent,
                 notify: new.notify,
                 die_with_parent: new.die_with_parent,

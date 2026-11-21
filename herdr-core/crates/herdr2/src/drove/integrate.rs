@@ -102,8 +102,9 @@ pub async fn prepare_task_worktree(
             cleanup_worktree_dir(&run_cwd, Path::new(existing));
         }
         let wt_str = wt_dir.display().to_string();
-        let out = super::bg_std_command("git")
-            .args(["-C", &run_cwd, "worktree", "add", "--detach", &wt_str, &base_commit])
+        let _ = git_cmd(&run_cwd).args(["worktree", "prune"]).output();
+        let out = git_cmd(&run_cwd)
+            .args(["worktree", "add", "--detach", &wt_str, &base_commit])
             .output()
             .map_err(|e| format!("spawn git worktree add: {e}"))?;
         if !out.status.success() {
@@ -118,6 +119,24 @@ pub async fn prepare_task_worktree(
     .map_err(|e| format!("worktree task join error: {e}"))?
 }
 
+fn git_cmd(run_cwd: &str) -> std::process::Command {
+    let mut cmd = super::bg_std_command("git");
+    cmd.args([
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.splitIndex=false",
+        "-c",
+        "splitIndex.sharedIndexExpire=never",
+        "-c",
+        "core.safecrlf=false",
+    ]);
+    #[cfg(windows)]
+    cmd.args(["-c", "core.longpaths=true"]);
+    cmd.args(["-C", run_cwd]);
+    cmd
+}
+
 struct TempIndexGuard(std::path::PathBuf);
 
 impl Drop for TempIndexGuard {
@@ -127,8 +146,8 @@ impl Drop for TempIndexGuard {
 }
 
 fn git_stdout_trimmed(run_cwd: &str, args: &[&str], idx_env: Option<&Path>) -> Result<String, String> {
-    let mut cmd = super::bg_std_command("git");
-    cmd.args(["-C", run_cwd]).args(args);
+    let mut cmd = git_cmd(run_cwd);
+    cmd.args(args);
     if let Some(idx) = idx_env {
         cmd.env("GIT_INDEX_FILE", idx);
     }
@@ -471,6 +490,255 @@ fn detect_in_progress_git_op(origin_cwd: &str) -> Option<String> {
     None
 }
 
+/// Structured preflight blocker returned before starting Drove orchestration when the workspace
+/// cannot safely create Git worktrees.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DroveWorktreeBlocker {
+    pub code: String,
+    pub cwd: String,
+    pub message: String,
+    pub fix_hint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub op: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<String>,
+}
+
+/// Non-blocking informational status returned when Drove worktree preflight passes.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DroveWorktreePreflightOk {
+    pub is_aosp: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dirty_files: Vec<String>,
+    pub total_dirty: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dirty_warning: Option<String>,
+}
+
+fn find_nested_unborn_git_dirs(origin_cwd: &str) -> Vec<String> {
+    let Ok(out) = git_cmd(origin_cwd)
+        .args(["ls-files", "--others", "--exclude-standard", "--directory", "-z"])
+        .output()
+    else {
+        return Vec::new();
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    let root = Path::new(origin_cwd);
+    let mut nested = Vec::new();
+    for rec in out.stdout.split(|&b| b == 0) {
+        if rec.is_empty() {
+            continue;
+        }
+        let rel = String::from_utf8_lossy(rec).trim_end_matches('/').to_string();
+        if rel.is_empty() {
+            continue;
+        }
+        let dot_git = root.join(&rel).join(".git");
+        if dot_git.is_dir() && !dot_git.join("HEAD").exists() {
+            nested.push(rel);
+            if nested.len() >= 8 {
+                break;
+            }
+        }
+    }
+    nested
+}
+
+/// Pre-flight check run before starting Drove orchestration whenever tasks require or may trigger
+/// Git worktree isolation. Fails fast with actionable guidance instead of creating failing tasks.
+pub fn check_drove_worktree_ready(origin_cwd: &str) -> Result<DroveWorktreePreflightOk, DroveWorktreeBlocker> {
+    if is_aosp_harness(origin_cwd) {
+        return Ok(DroveWorktreePreflightOk { is_aosp: true, ..Default::default() });
+    }
+    if !Path::new(origin_cwd).is_dir() {
+        return Err(DroveWorktreeBlocker {
+            code: "missing_cwd".into(),
+            cwd: origin_cwd.to_string(),
+            message: format!("工作目录不存在：{origin_cwd}"),
+            fix_hint: "请确认 --cwd 指向一个有效的本地目录。".into(),
+            op: None,
+            files: Vec::new(),
+        });
+    }
+
+    let probe_out = git_cmd(origin_cwd)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .output();
+    match probe_out {
+        Err(e) => {
+            return Err(DroveWorktreeBlocker {
+                code: "git_missing".into(),
+                cwd: origin_cwd.to_string(),
+                message: format!("无法执行 git：{e}"),
+                fix_hint: "请确认已安装 git 且位于 PATH 中。".into(),
+                op: None,
+                files: Vec::new(),
+            });
+        }
+        Ok(out) if !out.status.success() => {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            let lower = stderr.to_ascii_lowercase();
+            if lower.contains("dubious ownership") {
+                return Err(DroveWorktreeBlocker {
+                    code: "dubious_ownership".into(),
+                    cwd: origin_cwd.to_string(),
+                    message: format!("Git 拒绝访问目录（dubious ownership）：{origin_cwd}"),
+                    fix_hint: format!("请先执行：git config --global --add safe.directory {origin_cwd}"),
+                    op: None,
+                    files: Vec::new(),
+                });
+            }
+            let is_bare = git_cmd(origin_cwd)
+                .args(["rev-parse", "--is-bare-repository"])
+                .output()
+                .is_ok_and(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true");
+            if is_bare {
+                return Err(DroveWorktreeBlocker {
+                    code: "bare_repo".into(),
+                    cwd: origin_cwd.to_string(),
+                    message: format!("当前目录是裸仓库（bare repository），无法直接用于 Drove Worktree 编排：{origin_cwd}"),
+                    fix_hint: "请切换到非裸工作树目录后再启动编排。".into(),
+                    op: None,
+                    files: Vec::new(),
+                });
+            }
+            return Err(DroveWorktreeBlocker {
+                code: "not_git_repo".into(),
+                cwd: origin_cwd.to_string(),
+                message: format!("当前目录不是 Git 仓库，无法创建并行 Worktree：{origin_cwd}"),
+                fix_hint: format!(
+                    "请先初始化 Git 仓库并完成首次提交：cd {origin_cwd} && git init && git add -A && git commit -m \"chore: initial commit\"（或取消 --worktree / 关闭 auto_worktree）"
+                ),
+                op: None,
+                files: Vec::new(),
+            });
+        }
+        Ok(_) => {}
+    }
+
+    if git_stdout_trimmed(origin_cwd, &["rev-parse", "--verify", "HEAD"], None).is_err() {
+        return Err(DroveWorktreeBlocker {
+            code: "no_commits".into(),
+            cwd: origin_cwd.to_string(),
+            message: format!("当前 Git 仓库尚未有任何提交（无 HEAD），无法创建 Worktree：{origin_cwd}"),
+            fix_hint: format!(
+                "请先创建一次初始提交：cd {origin_cwd} && git add -A && git commit -m \"chore: initial commit\""
+            ),
+            op: None,
+            files: Vec::new(),
+        });
+    }
+
+    let git_dir_raw = git_stdout_trimmed(origin_cwd, &["rev-parse", "--git-dir"], None).unwrap_or_default();
+    let common_dir_raw = git_stdout_trimmed(origin_cwd, &["rev-parse", "--git-common-dir"], None).unwrap_or_default();
+    let resolve_dir = |raw: &str| {
+        let p = Path::new(raw);
+        if p.is_absolute() { p.to_path_buf() } else { Path::new(origin_cwd).join(p) }
+    };
+    if !git_dir_raw.is_empty() {
+        let lock_file = resolve_dir(&git_dir_raw).join("index.lock");
+        if lock_file.exists() {
+            return Err(DroveWorktreeBlocker {
+                code: "git_locked".into(),
+                cwd: origin_cwd.to_string(),
+                message: format!("检测到 Git 锁文件残留（{}），无法创建 Worktree", lock_file.display()),
+                fix_hint: format!("请确认无其他 git 进程运行后清理锁文件：rm -f {}", lock_file.display()),
+                op: None,
+                files: vec![lock_file.display().to_string()],
+            });
+        }
+    }
+    if !common_dir_raw.is_empty() {
+        let wt_meta_dir = resolve_dir(&common_dir_raw).join("worktrees");
+        let probe_dir = if wt_meta_dir.is_dir() { wt_meta_dir } else { resolve_dir(&common_dir_raw) };
+        let probe_file = probe_dir.join(format!(".herdr2-wt-probe-{}", super::crypto::rand_id("p")));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&probe_file) {
+            Ok(_) => {
+                let _ = std::fs::remove_file(&probe_file);
+            }
+            Err(e) => {
+                return Err(DroveWorktreeBlocker {
+                    code: "readonly_git_dir".into(),
+                    cwd: origin_cwd.to_string(),
+                    message: format!("Git 元数据目录不可写（{}）：{e}", probe_dir.display()),
+                    fix_hint: "请检查目录权限或磁盘空间（ENOSPC / 只读挂载）后重试。".into(),
+                    op: None,
+                    files: Vec::new(),
+                });
+            }
+        }
+    }
+
+    let mut op = detect_in_progress_git_op(origin_cwd);
+    let mut dirty: Vec<String> = Vec::new();
+    if let Ok(out) = git_cmd(origin_cwd)
+        .args(["status", "--porcelain=v1", "-z", "-unormal"])
+        .output()
+        && out.status.success()
+    {
+        let mut iter = out.stdout.split(|b| *b == 0);
+        while let Some(raw) = iter.next() {
+            if raw.len() < 4 {
+                continue;
+            }
+            let x = raw[0] as char;
+            let y = raw[1] as char;
+            let xy = [x, y];
+            let path = String::from_utf8_lossy(&raw[3..]).to_string();
+            if matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C') {
+                let _ = iter.next();
+            }
+            if matches!(
+                xy,
+                ['D', 'D'] | ['A', 'U'] | ['U', 'D'] | ['U', 'A'] | ['D', 'U'] | ['A', 'A'] | ['U', 'U']
+            ) && op.is_none()
+            {
+                op = Some("conflict".into());
+            }
+            if xy == ['?', '?'] && super::roles::is_ephemeral_cache_path(path.trim_end_matches('/')) {
+                continue;
+            }
+            dirty.push(format!("{x}{y} {path}"));
+        }
+    }
+    if let Some(in_prog) = op {
+        return Err(DroveWorktreeBlocker {
+            code: "in_progress_op".into(),
+            cwd: origin_cwd.to_string(),
+            message: format!("仓库正在进行 `{in_prog}` 操作或存在未解决冲突，无法创建 Worktree：{origin_cwd}"),
+            fix_hint: format!("请先完成或中止当前 `{in_prog}`（如 `git {in_prog} --abort` 或解决冲突提交）后再开始编排。"),
+            op: Some(in_prog),
+            files: dirty.into_iter().take(8).collect(),
+        });
+    }
+
+    let nested = find_nested_unborn_git_dirs(origin_cwd);
+    if !nested.is_empty() {
+        return Err(DroveWorktreeBlocker {
+            code: "nested_unborn_git".into(),
+            cwd: origin_cwd.to_string(),
+            message: format!("工作区包含未初始化的嵌套 .git 目录（{}），会导致 Worktree 快照失败", nested.join(", ")),
+            fix_hint: "请移除这些子目录中的空 .git 目录、提交它们或将其加入 .gitignore 后重试。".into(),
+            op: None,
+            files: nested,
+        });
+    }
+
+    let total_dirty = dirty.len();
+    let dirty_files: Vec<String> = dirty.into_iter().take(8).collect();
+    let dirty_warning = (total_dirty > 0).then(|| {
+        format!(
+            "提示：当前仓库有 {total_dirty} 处未提交修改（{}），Worktree 将基于临时快照继承这些改动，建议先 commit/stash 以降低合回冲突风险。",
+            dirty_files.join(", ")
+        )
+    });
+    Ok(DroveWorktreePreflightOk { is_aosp: false, dirty_files, total_dirty, dirty_warning })
+}
+
 /// Validates that `origin_cwd` is a clean Git repository with at least one commit and no in-progress
 /// merge/rebase/conflict before creating a forked worktree. Returns `HEAD` SHA when ready.
 pub(crate) fn check_fork_worktree_ready(origin_cwd: &str) -> Result<String, WorktreeBlocker> {
@@ -750,6 +1018,64 @@ mod tests {
         assert!(merged.iter().any(|f| f == "helper.py"), "merged={merged:?}");
         assert_eq!(std::fs::read_to_string(repo.join("calc.py")).unwrap(), "print(1)\nprint(2)\n");
         assert!(!Path::new(&wt).exists(), "worktree dir should be cleaned up");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn drove_worktree_preflight_catches_unready_states_and_warns_on_dirty() {
+        let base = std::env::temp_dir().join(format!("herdr2-drove-preflight-{}", super::super::crypto::rand_id("t")));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let cwd = repo.to_str().unwrap();
+
+        // 1. Non-git dir -> not_git_repo
+        let b1 = check_drove_worktree_ready(cwd).unwrap_err();
+        assert_eq!(b1.code, "not_git_repo");
+        assert!(b1.fix_hint.contains("git init"));
+
+        // 2. git init without commits -> no_commits
+        let run_git = |args: &[&str]| {
+            let out = super::super::bg_std_command("git")
+                .args(["-C", cwd])
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@local")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@local")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        run_git(&["init", "-q"]);
+        std::fs::write(repo.join("a.txt"), "hi\n").unwrap();
+        let b2 = check_drove_worktree_ready(cwd).unwrap_err();
+        assert_eq!(b2.code, "no_commits");
+
+        // 3. After first commit -> clean OK
+        run_git(&["add", "a.txt"]);
+        run_git(&["commit", "-q", "-m", "init"]);
+        let ok_clean = check_drove_worktree_ready(cwd).unwrap();
+        assert_eq!(ok_clean.total_dirty, 0);
+        assert!(ok_clean.dirty_warning.is_none());
+
+        // 4. index.lock present -> git_locked
+        std::fs::write(repo.join(".git/index.lock"), "").unwrap();
+        let b3 = check_drove_worktree_ready(cwd).unwrap_err();
+        assert_eq!(b3.code, "git_locked");
+        std::fs::remove_file(repo.join(".git/index.lock")).unwrap();
+
+        // 5. Nested unborn .git directory -> nested_unborn_git
+        std::fs::create_dir_all(repo.join("sub/.git")).unwrap();
+        let b4 = check_drove_worktree_ready(cwd).unwrap_err();
+        assert_eq!(b4.code, "nested_unborn_git");
+        std::fs::remove_dir_all(repo.join("sub")).unwrap();
+
+        // 6. Dirty working tree -> OK with non-blocking dirty_warning
+        std::fs::write(repo.join("a.txt"), "modified\n").unwrap();
+        let ok_dirty = check_drove_worktree_ready(cwd).unwrap();
+        assert_eq!(ok_dirty.total_dirty, 1);
+        assert!(ok_dirty.dirty_warning.is_some());
+
         let _ = std::fs::remove_dir_all(&base);
     }
 }

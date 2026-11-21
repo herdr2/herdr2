@@ -4573,10 +4573,11 @@ impl ShellRuntime {
         scheduler::drain_runtime_jobs(self, window, cx);
     }
 
-    pub(crate) fn dispatch_host_event(
+    pub(crate) fn dispatch_host_event_with_meta(
         self: &Rc<Self>,
         id: CallbackId,
         payload: HostValue,
+        meta: Option<HostValue>,
         window: &mut Window,
         cx: &mut App,
     ) {
@@ -4610,10 +4611,13 @@ impl ShellRuntime {
         let result = self.with_js(|ctx| {
             let handler = entry.value.clone().restore(ctx)?;
             let payload = host_modules::into_js(ctx, payload)?;
-            handler.call::<_, ()>((
-                payload,
-                context_object(ctx, ContextBinding::Call(generation))?,
-            ))
+            let cx_obj = context_object(ctx, ContextBinding::Call(generation))?;
+            if let Some(meta) = meta {
+                let meta_js = host_modules::into_js(ctx, meta)?;
+                handler.call::<_, ()>((payload, cx_obj, meta_js))
+            } else {
+                handler.call::<_, ()>((payload, cx_obj))
+            }
         });
         if let Err(error) = result {
             tracing::error!("error in host component handler: {error}");

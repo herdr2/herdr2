@@ -346,6 +346,46 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
                         "stderr": ""
                     }))
                 }
+                "hc" | "h2" if first == json!(["read", "--json", "a_rb"]) => {
+                    let rewound = calls.borrow().shared.contains_key("checkpoint.sync");
+                    let entries = if rewound {
+                        json!([
+                            {"kind":"user","turn":1,"text":"Add add/sub","ts_ms":1700000000000i64},
+                            {"kind":"assistant","turn":1,"text":"Implemented add and sub.","ts_ms":1700000001000i64},
+                            {"kind":"rewind","to_turn":1,"restore_files":true,"ts_ms":1700000009000i64}
+                        ])
+                    } else {
+                        json!([
+                            {"kind":"user","turn":1,"text":"Add add/sub","ts_ms":1700000000000i64},
+                            {"kind":"assistant","turn":1,"text":"Implemented add and sub.","ts_ms":1700000001000i64},
+                            {"kind":"user","turn":2,"text":"Add trigonometry","ts_ms":1700000002000i64},
+                            {"kind":"assistant","turn":2,"text":"Implemented sin and cos.","ts_ms":1700000003000i64}
+                        ])
+                    };
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "complete": true,
+                            "how": "turn",
+                            "entries": entries
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
+                }
+                "hc" | "h2" if first == json!(["get", "--json", "a_rb"]) => {
+                    let rewound = calls.borrow().shared.contains_key("checkpoint.sync");
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "address": "a_rb",
+                            "state": "live",
+                            "turn": if rewound { 1 } else { 2 },
+                            "cwd": "/fixture/project",
+                            "config_options": []
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
+                }
                 "hc" | "h2" if first == json!(["read", "--json", "a1"]) => {
                     Some(json!({
                         "code": 0,
@@ -420,6 +460,24 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
                         })).unwrap(),
                         "stderr": ""
                     }))
+                }
+                "hc" | "h2" if first == json!(["inbox", "send", "--json", "a1", "102"]) => {
+                    calls.borrow_mut().effects.push(("inbox.send".into(), vec![first.clone()]));
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "address": "a1",
+                            "inbox_len": 1,
+                            "inbox": [
+                                {"id": 101, "text": "First queued prompt", "queued_ms": 1700000000000i64}
+                            ]
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
+                }
+                "hc" | "h2" if first.as_array().is_some_and(|arr| arr.first().and_then(Value::as_str) == Some("send") && arr.get(1).and_then(Value::as_str) == Some("--json")) => {
+                    calls.borrow_mut().effects.push(("h2.send".into(), vec![first.clone()]));
+                    Some(json!({"code":0,"stdout":"{\"status\":\"working\",\"turn\":2,\"started\":true,\"inbox_len\":0}","stderr":""}))
                 }
                 "hc" | "h2" if first == json!(["interrupt", "--json", "a1"]) => {
                     calls.borrow_mut().interrupted.push("a1".into());
@@ -1663,7 +1721,7 @@ fn acp_peek_renders_and_mutates_queued_inbox_items(cx: &mut TestAppContext) {
     assert!(tree.contains("First queued prompt"), "first queued item missing: {tree}");
     assert!(tree.contains("Second queued prompt"), "second queued item missing: {tree}");
     assert!(tree.contains("Build (t1)"), "friendly sender label missing: {tree}");
-    assert!(tree.contains("acp-inbox-edit-101") && tree.contains("acp-inbox-rm-101"), "edit/remove buttons missing: {tree}");
+    assert!(tree.contains("acp-inbox-send-101") && tree.contains("acp-inbox-edit-101") && tree.contains("acp-inbox-rm-101"), "send-now/edit/remove buttons missing: {tree}");
     assert!(!tree.contains("<h2"), "raw <h2 envelope leaked into queue UI: {tree}");
 
     // Inline editor renders for item #102 and saves back via `h2 inbox edit`.
@@ -1687,6 +1745,16 @@ fn acp_peek_renders_and_mutates_queued_inbox_items(cx: &mut TestAppContext) {
     ).unwrap();
     assert!(after_edit.contains("Updated second prompt"), "optimistic/saved edit missing: {after_edit}");
 
+    let after_send_now = describe_with_values(
+        cx,
+        &staged,
+        "mods/peek",
+        values.clone(),
+        Some("this.sendInboxItemNow(102, cx);"),
+    ).unwrap();
+    assert!(!after_send_now.contains("Second queued prompt"), "sent-now queued item still visible: {after_send_now}");
+    assert!(after_send_now.contains("Input queue (1)"), "remaining count should drop to 1 after send now: {after_send_now}");
+
     let after_rm = describe_with_values(
         cx,
         &staged,
@@ -1696,6 +1764,88 @@ fn acp_peek_renders_and_mutates_queued_inbox_items(cx: &mut TestAppContext) {
     ).unwrap();
     assert!(!after_rm.contains("First queued prompt"), "removed queued item still visible: {after_rm}");
     assert!(after_rm.contains("Input queue (1)"), "remaining count should drop to 1: {after_rm}");
+}
+
+#[gpui::test]
+fn acp_peek_syncs_conversation_after_checkpoint_rollback_in_shared_runtime(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let sibling_dir = staged.0.join("mods/sibling-microtask");
+    std::fs::create_dir_all(&sibling_dir).unwrap();
+    std::fs::write(
+        sibling_dir.join("main.js"),
+        r#"
+import { View, div } from "gpui-kit";
+import { shared } from "herdr";
+export default class Sibling extends View {
+  render() {
+    const sync = shared("checkpoint.sync") ?? "";
+    // Queue a bare microtask before peek renders in the same shared QuickJS runtime.
+    Promise.resolve().then(() => {});
+    return div().child(`sibling:${sync}`);
+  }
+}
+"#,
+    )
+    .unwrap();
+
+    let program = json!({"key":"claude", "name":"Claude", "icon":null, "tint":false, "tile":"#1c1d21", "color":"#ffffff", "shell":false, "agent":true});
+    let calls = Rc::new(RefCell::new(Calls::default()));
+
+    let mut peek_values = fixture(true, json!({"terminal":"a_rb","acp":true,"tab":true,"pane":"p2"}), updates("current", "current"));
+    peek_values.insert("terminals".into(), json!([
+        {"address":"a_rb","acp":true,"name":"Claude","title":"Claude","argv":["claude-agent-acp"],"parent":null,"labels":{},"state":"live","status":"idle","turn":2,"transcript_seq":2,"checkpoint_seq":2,"report":{"app":"claude-code"},"program":program,"cwd":"/fixture/project"}
+    ]));
+    peek_values.insert("agents".into(), json!([
+        {"address":"a_rb","acp":true,"pane":"p2","space":"s1","space_name":"Local","tab":"tab1","tab_index":1,"tab_name":"Claude","status":"idle","app":"claude-code","program":program,"title":"Claude","seq":1,"focused":true}
+    ]));
+    let sibling_values = fixture(true, json!({}), updates("current", "current"));
+
+    let peek_policy = Policy::new().with_host_module(module(peek_values, calls.clone())).unwrap();
+    let sibling_policy = Policy::new().with_host_module(module(sibling_values, calls.clone())).unwrap();
+
+    let runtime = ShellRuntime::new_isolated().unwrap();
+    let window = cx.add_window(|_, _| Empty);
+
+    let (mut sibling, mut peek) = window
+        .update(cx, |_, window, cx| {
+            let sibling = DescriptionSession::load(runtime.clone(), &sibling_dir, sibling_policy, window, cx).unwrap();
+            let peek = DescriptionSession::load(runtime.clone(), &staged.0.join("mods/peek"), peek_policy, window, cx).unwrap();
+            (sibling, peek)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let before = window
+        .update(cx, |_, window, cx| {
+            let _ = sibling.describe(window, cx).unwrap();
+            peek.describe(window, cx).unwrap()
+        })
+        .unwrap();
+    assert!(before.contains("Add trigonometry"), "initial turn 2 prompt missing: {before}");
+    assert!(before.contains("Implemented sin and cos."), "initial turn 2 reply missing: {before}");
+
+    // Simulate checkpoint rollback from mods/checkpoints updating shared("checkpoint.sync")
+    // and refreshing both mods in the same frame (sibling renders first with empty props).
+    calls.borrow_mut().shared.insert("checkpoint.sync".into(), json!("a_rb:1:1700000009999"));
+    window
+        .update(cx, |_, window, cx| {
+            let _ = sibling.describe(window, cx).unwrap();
+            let _ = peek.describe(window, cx).unwrap();
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let after = window
+        .update(cx, |_, window, cx| peek.describe(window, cx).unwrap())
+        .unwrap();
+    assert!(after.contains("Implemented add and sub."), "turn 1 reply should remain after rollback: {after}");
+    assert!(after.contains("Restored to turn 1"), "rewind divider missing after rollback: {after}");
+    assert!(!after.contains("Add trigonometry"), "stale turn 2 prompt still rendered after rollback: {after}");
+    assert!(!after.contains("Implemented sin and cos."), "stale turn 2 reply still rendered after rollback: {after}");
+
+    window.update(cx, |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
 }
 
 #[gpui::test]
@@ -2096,16 +2246,40 @@ fn settings_drove_renders_policies_codex_fast_and_english_drove_label(cx: &mut T
         "Conflict Policy",
         "Loop Detect",
         "⚡ Fast",
-        "Reasoning Effort",
-        "Context Size",
-        "Max Output Tokens",
-        "st-dr-ai-eff-group",
-        "st-drp-ai-context",
-        "st-drp-ai-max-tokens",
+        "Open AI Settings →",
+        "st-dr-open-ai",
     ] {
         assert!(en_tree.contains(expected), "EN drove settings missing {expected}: {en_tree}");
     }
     assert!(!en_tree.contains("Send feedback"), "Send feedback should be suppressed: {en_tree}");
+
+    // Dedicated top-level Settings -> AI tab renders model params, core semantic switches, and cache stats.
+    let ai_en_tree = describe(
+        cx,
+        &staged,
+        "frame/settings",
+        true,
+        json!({ "section": "ai" }),
+        updates("current", "current"),
+        Some("this.aiStatus = { enabled: true, configured: true, baseUrl: 'https://api.example.com/v1', model: 'gpt-4o-mini', effort: 'low', contextWindow: '64k', maxTokens: 1024, switches: { ptyStatusArbitration: true, notesDigest: true, promptCacheEnabled: true }, usage: { totalCalls: 12, localCacheHits: 5, sessionsReused: 3, activeSessions: 1, inputTokens: 18000, cachedInputTokens: 14000, outputTokens: 900, cacheHitRatio: 0.777 } };"),
+    )
+    .unwrap();
+    for expected in [
+        "CORE AI ASSISTANT",
+        "Reasoning Effort",
+        "Context Size",
+        "Max Output Tokens",
+        "st-ai-eff-group",
+        "st-drp-core-ai-context",
+        "st-drp-core-ai-max-tokens",
+        "PTY Terminal State Arbitration",
+        "Child Note Error Digest",
+        "Prompt KV-Cache Optimization",
+        "KV Cache Hit Rate",
+        "77.7%",
+    ] {
+        assert!(ai_en_tree.contains(expected), "EN AI settings missing {expected}: {ai_en_tree}");
+    }
 
     let mut zh_values = fixture(true, json!({ "section": "drove" }), updates("current", "current"));
     zh_values.get_mut("settings").unwrap()["language"] = json!("zh-CN");
@@ -2117,11 +2291,25 @@ fn settings_drove_renders_policies_codex_fast_and_english_drove_label(cx: &mut T
         Some("this.droveData = { config: { roles: { reviewer: { label: 'Reviewer', access: 'readonly', primary: { agent: 'codex', model: null, effort: 'high', fast: false }, fallbacks: [] } }, ai: { enabled: true } }, aiStatus: { switches: { verifyDigest: true, handoverCompact: true, autoTitle: true, taskEnrich: true, conflictPolicy: 'warn', questionMode: 'draft', loopDetect: 'off' } }, agents: { fullProbe: true, agents: [{ id: 'codex', installed: true, models: ['gpt-6.1-sol'] }] } };"),
     )
     .unwrap();
-    for expected in ["Drove", "控制面 AI 策略开关", "Verify 失败摘要", "交接上下文压缩", "死循环检测", "思考强度", "上下文大小", "最大输出长度"] {
+    for expected in ["Drove", "控制面 AI 策略开关", "Verify 失败摘要", "交接上下文压缩", "死循环检测", "前往 AI 设置 →"] {
         assert!(zh_tree.contains(expected), "zh-CN drove settings missing {expected}: {zh_tree}");
     }
     assert!(!zh_tree.contains("编队"), "Settings should show English Drove in zh-CN: {zh_tree}");
     assert!(!zh_tree.contains("发送反馈"), "Send feedback should be suppressed in zh-CN: {zh_tree}");
+
+    let mut ai_zh_values = fixture(true, json!({ "section": "ai" }), updates("current", "current"));
+    ai_zh_values.get_mut("settings").unwrap()["language"] = json!("zh-CN");
+    let ai_zh_tree = describe_with_values(
+        cx,
+        &staged,
+        "frame/settings",
+        ai_zh_values,
+        Some("this.aiStatus = { enabled: true, configured: true, baseUrl: 'https://api.example.com/v1', model: 'gpt-4o-mini', effort: 'low', switches: { ptyStatusArbitration: true, notesDigest: true, promptCacheEnabled: true }, usage: { totalCalls: 4, localCacheHits: 2, sessionsReused: 1, activeSessions: 1, inputTokens: 4000, cachedInputTokens: 3000, outputTokens: 200, cacheHitRatio: 0.75 } };"),
+    )
+    .unwrap();
+    for expected in ["核心 AI 助手", "思考强度", "上下文大小", "最大输出长度", "非协议终端语义状态仲裁", "父子通知异常智能摘要", "KV 缓存命中率"] {
+        assert!(ai_zh_tree.contains(expected), "zh-CN AI settings missing {expected}: {ai_zh_tree}");
+    }
 }
 
 #[gpui::test]
@@ -3076,8 +3264,19 @@ fn side_panel_multiple_side_chats_and_handoff_dialog_render_cleanly(cx: &mut Tes
     assert!(tree.contains("acp-ho-toggle-ho-0"), "expected expandable handoff context card: {tree}");
     assert!(tree.contains("acp-ho-md-ho-0"), "expected expanded handoff markdown view: {tree}");
     assert!(!tree.contains("acp-side-new"), "top + New button must be removed from side-chat header: {tree}");
+    assert!(!tree.contains("acp-mount-tab"), "side-chat must not expose Open as Tab button: {tree}");
+    assert!(!tree.contains("acp-split-right"), "side-chat must not expose Split right/Dock button: {tree}");
     assert!(!tree.contains("acp-fork-turn-"), "side-chat must not expose assistant fork button: {tree}");
     assert!(!tree.contains("acp-fork-from-"), "side-chat must not expose user fork button: {tree}");
+
+    // Side-chat agent context menu must never offer mounting into tabs or splits.
+    let mut sc_menu_values = values.clone();
+    sc_menu_values.insert("props".into(), json!({"overlay":"menu","tab":"agent","target":{"terminal":"wsl/a4h","pane":null}}));
+    let sc_menu_tree = describe_with_values(cx, &staged, "mods/menu", sc_menu_values, None).unwrap();
+    assert!(sc_menu_tree.contains("Open in side panel"), "side-chat menu should offer Open in side panel: {sc_menu_tree}");
+    assert!(!sc_menu_tree.contains("Open as Tab"), "side-chat menu must not offer Open as Tab: {sc_menu_tree}");
+    assert!(!sc_menu_tree.contains("Split right"), "side-chat menu must not offer Split right: {sc_menu_tree}");
+    assert!(!sc_menu_tree.contains("Split down"), "side-chat menu must not offer Split down: {sc_menu_tree}");
 
     // Render CLI side-chat terminal header AND CLI side-chat structured chat view toggle buttons.
     let mut cli_values = values.clone();
@@ -3106,13 +3305,36 @@ fn side_panel_multiple_side_chats_and_handoff_dialog_render_cleanly(cx: &mut Tes
     assert!(!cli_chat_tree.contains("acp-side-new"), "CLI side-chat chat view must not have + New button: {cli_chat_tree}");
     assert!(!cli_chat_tree.contains("acp-fork-turn-"), "CLI side-chat chat view must not expose fork button: {cli_chat_tree}");
 
-    // Render handoff dialog in side-chat mode and verify both ACP and CLI runtime chips exist and Merge Back tab is absent.
-    let mut ho_values = values;
-    ho_values.insert("props".into(), json!({"overlay":"handoff","source":"wsl/t2t","kind":"side-chat"}));
-    let ho_tree = describe_with_values(cx, &staged, "mods/handoff", ho_values, None).unwrap();
-    assert!(ho_tree.contains("ho-rt-acp"), "expected ACP option in side-chat dialog: {ho_tree}");
-    assert!(ho_tree.contains("ho-rt-pty"), "expected CLI Terminal option in side-chat dialog: {ho_tree}");
-    assert!(!ho_tree.contains("ho-mode-merge-back"), "merge-back tab must not appear in creation dialog: {ho_tree}");
+    // Render handoff dialog in side-chat, handoff, and fork modes and verify custom turn count UI works across all three.
+    for kind in ["handoff", "fork", "side-chat"] {
+        let mut ho_values = values.clone();
+        ho_values.insert("props".into(), json!({"overlay":"handoff","source":"wsl/t2t","kind":kind}));
+        let ho_tree = describe_with_values(cx, &staged, "mods/handoff", ho_values.clone(), None).unwrap();
+        assert!(ho_tree.contains("ho-rt-acp"), "expected ACP option in {kind} dialog: {ho_tree}");
+        assert!(ho_tree.contains("ho-rt-pty"), "expected CLI Terminal option in {kind} dialog: {ho_tree}");
+        assert!(!ho_tree.contains("ho-mode-merge-back"), "merge-back tab must not appear in {kind} dialog: {ho_tree}");
+        assert!(ho_tree.contains("ho-turns-custom"), "expected Custom turns chip in {kind} dialog: {ho_tree}");
+        assert!(!ho_tree.contains("ho-turns-custom-input"), "custom turns input should stay hidden until Custom is selected: {ho_tree}");
+
+        let custom_tree = describe_with_values(
+            cx,
+            &staged,
+            "mods/handoff",
+            ho_values.clone(),
+            Some("this.customTurnsMode = true; this.customTurnsInput.set_value('12');"),
+        ).unwrap();
+        assert!(custom_tree.contains("ho-turns-custom-input"), "expected custom turns input in {kind} dialog: {custom_tree}");
+        assert!(!custom_tree.contains("ho-turns-custom-error"), "valid custom turns should not show validation error: {custom_tree}");
+
+        let invalid_tree = describe_with_values(
+            cx,
+            &staged,
+            "mods/handoff",
+            ho_values,
+            Some("this.customTurnsMode = true; this.customTurnsInput.set_value('0');"),
+        ).unwrap();
+        assert!(invalid_tree.contains("ho-turns-custom-error"), "invalid custom turns (0) should show validation error in {kind}: {invalid_tree}");
+    }
 }
 
 #[gpui::test]
@@ -3266,6 +3488,396 @@ fn changes_and_checkpoints_render_diff_lines_and_inline_review_without_errors(cx
     ).unwrap();
     assert!(files_tree.contains("files-add-comment"), "files toolbar comment button must render: {files_tree}");
     assert!(files_tree.contains("Add fallback note"), "markdown inline comment card must render: {files_tree}");
-    assert!(files_tree.contains("files-review-composer"), "markdown inline composer must render: {files_tree}");
+    assert!(files_tree.contains("files-review-composer"), "markdown docked composer must render: {files_tree}");
     assert!(files_tree.contains("files-review-bar"), "files shared review bar must render: {files_tree}");
+
+    // 4) Files mod in Line-Comment mode: Checkpoints-identical v_virtual_list + inline comment + docked composer + real GPUI draw().
+    let files_review_setup = r#"
+        this.repoRoot = this.root;
+        this.file = 'src/main.rs';
+        this.selectedFile = 'src/main.rs';
+        this.loadingFile = false;
+        this.fileError = null;
+        this.reviewMode = true;
+        this.liveText = 'fn main() {\n    let x = 1;\n    println!("{x}");\n}';
+        this.diskText = this.liveText;
+        this.setReviewDrafts([{ id: 'fr1', path: 'src/main.rs', side: 'file', start_line: 2, end_line: 3, body: 'Extract helper' }]);
+        this.reviewComposer = { path: 'src/main.rs', startRowIdx: 1, endRowIdx: 2, startLine: 2, endLine: 3, blockIndex: null, editingId: null };
+    "#;
+    let files_review_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/files",
+        fixture(true, json!({}), updates("current", "current")),
+        Some(files_review_setup),
+    ).unwrap();
+    assert!(
+        files_review_tree.contains("v_virtual_list \"files-review-lines\" ×5 :on_item_click"),
+        "expected virtual list with 4 file lines + 1 inline comment: {files_review_tree}"
+    );
+    assert!(files_review_tree.contains("files-edit-mode"), "expected Edit mode toggle in code toolbar: {files_review_tree}");
+    assert!(files_review_tree.contains("files-review-composer"), "expected docked composer in files review mode: {files_review_tree}");
+    assert!(files_review_tree.contains("files-review-bar"), "expected review bar in files review mode: {files_review_tree}");
+
+    let rt_files_rev = ShellRuntime::new_isolated().unwrap();
+    let files_rev_wrapped = staged.wrapper("mods/files", files_review_setup);
+    let win3 = cx.add_window(|window, cx| RootedView(rt_files_rev.try_load(&files_rev_wrapped, window, cx).unwrap()));
+    let mut visual3 = VisualTestContext::from_window(win3.into(), cx);
+    visual3.update(|window, cx| window.draw(cx).clear(cx));
+    visual3.run_until_parked();
+    let err3 = win3.read_with(cx, |r, cx| {
+        r.0.read(cx)
+            .content()
+            .clone()
+            .downcast::<gpui_shell::ScriptView>()
+            .ok()
+            .and_then(|v| v.read(cx).build_error().map(str::to_owned))
+    });
+    assert_eq!(err3.unwrap(), None, "files review v_virtual_list layout pass must produce zero errors");
+    visual3.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn flash_note_button_composer_and_sidebar_list_work_end_to_end(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+
+    // 1) Top-right tabs bar renders the Flash Notes (Ideas) button.
+    let tabs_tree = describe(cx, &staged, "mods/tabs", true, props(), updates("current", "current"), None).unwrap();
+    assert!(tabs_tree.contains("btn-flash-note"), "top-right flash note button missing: {tabs_tree}");
+
+    // 2) Bottom-left sidebar list renders empty state and saved notes cleanly.
+    let list_empty = describe_with_values(
+        cx,
+        &staged,
+        "mods/flash-note",
+        fixture(true, json!({"list": true}), updates("current", "current")),
+        None,
+    ).unwrap();
+    assert!(list_empty.contains("fn-sidebar"), "sidebar flash notes container missing: {list_empty}");
+    assert!(list_empty.contains("fn-recycle"), "sidebar flash notes recycle bin button missing: {list_empty}");
+    assert!(list_empty.contains("fn-list-new"), "sidebar flash notes + button missing: {list_empty}");
+
+    let list_calls = Rc::new(RefCell::new(Calls::default()));
+    list_calls.borrow_mut().shared.insert(
+        "flash_notes.items".into(),
+        json!([
+            { "id": "n1", "title": "Cache refactor", "text": "Refactor cache invalidation before release", "createdAt": 1700000000000i64, "updatedAt": 1700000001000i64, "sentTo": null, "sentAt": null },
+            { "id": "n2", "text": "Add unit test for sidebar list", "createdAt": 1700000000000i64, "updatedAt": 1700000000500i64, "sentTo": "Build (t1)", "sentAt": 1700000000600i64 }
+        ]),
+    );
+    let list_policy = Policy::new()
+        .with_storage_path(staged.0.join("store-flash-list.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(module(fixture(true, json!({"list": true}), updates("current", "current")), list_calls.clone()))
+        .unwrap();
+    let list_rt = ShellRuntime::new_isolated().unwrap();
+    let list_win = cx.add_window(|_, _| Empty);
+    let list_populated = list_win.update(cx, |_, window, cx| {
+        let mut session = DescriptionSession::load(list_rt, staged.0.join("mods/flash-note"), list_policy, window, cx).unwrap();
+        let tree = session.describe(window, cx).unwrap();
+        window.remove_window();
+        tree
+    }).unwrap();
+    cx.run_until_parked();
+    assert!(list_populated.contains("fn-item-n1"), "first saved note missing: {list_populated}");
+    assert!(list_populated.contains("Cache refactor"), "custom note title missing: {list_populated}");
+    assert!(list_populated.contains("Refactor cache invalidation"), "first note preview missing: {list_populated}");
+    assert!(list_populated.contains("fn-item-n2"), "second saved note missing: {list_populated}");
+    assert!(list_populated.contains("Sent → Build (t1)"), "sent badge missing: {list_populated}");
+
+    // 2b) Inline rename + moving a note to recycle bin + recycle bin popup rendering.
+    let ops_calls = Rc::new(RefCell::new(Calls::default()));
+    ops_calls.borrow_mut().shared.insert(
+        "flash_notes.items".into(),
+        json!([
+            { "id": "n1", "text": "Refactor cache invalidation before release", "createdAt": 1700000000000i64, "updatedAt": 1700000001000i64, "sentTo": null, "sentAt": null },
+            { "id": "n2", "text": "Add unit test for sidebar list", "createdAt": 1700000000000i64, "updatedAt": 1700000000500i64, "sentTo": null, "sentAt": null }
+        ]),
+    );
+    let ops_policy = Policy::new()
+        .with_storage_path(staged.0.join("store-flash-ops.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(module(fixture(true, json!({"list": true}), updates("current", "current")), ops_calls.clone()))
+        .unwrap();
+    let ops_rt = ShellRuntime::new_isolated().unwrap();
+    let ops_root = staged.wrapper(
+        "mods/flash-note",
+        r#"
+            const first = this.savedNotes()[0];
+            this.startInlineRename(first, cx);
+            this.renameInput.set_value("Release cache plan");
+            this.commitInlineRename(cx);
+            this.trashNote("n2", cx);
+        "#,
+    );
+    let ops_win = cx.add_window(|_, _| Empty);
+    let ops_tree = ops_win.update(cx, |_, window, cx| {
+        let mut session = DescriptionSession::load(ops_rt, ops_root, ops_policy, window, cx).unwrap();
+        let tree = session.describe(window, cx).unwrap();
+        window.remove_window();
+        tree
+    }).unwrap();
+    cx.run_until_parked();
+    assert!(ops_tree.contains("Release cache plan"), "renamed note title missing after inline rename: {ops_tree}");
+    assert!(!ops_tree.contains("fn-item-n2"), "trashed note should leave active list: {ops_tree}");
+    let items_after = ops_calls.borrow().shared.get("flash_notes.items").cloned().unwrap_or(Value::Null);
+    let trash_after = ops_calls.borrow().shared.get("flash_notes.trash").cloned().unwrap_or(Value::Null);
+    assert_eq!(items_after.as_array().map(|a| a.len()), Some(1));
+    assert_eq!(items_after[0]["title"], json!("Release cache plan"));
+    assert_eq!(trash_after.as_array().map(|a| a.len()), Some(1));
+    assert_eq!(trash_after[0]["id"], json!("n2"));
+
+    let trash_calls = Rc::new(RefCell::new(Calls::default()));
+    trash_calls.borrow_mut().shared.insert("flash_notes.items".into(), items_after.clone());
+    trash_calls.borrow_mut().shared.insert("flash_notes.trash".into(), trash_after.clone());
+    let trash_policy = Policy::new()
+        .with_storage_path(staged.0.join("store-flash-trash.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(module(fixture(true, json!({"overlay": "fn-trash-ov", "trashMenu": true}), updates("current", "current")), trash_calls.clone()))
+        .unwrap();
+    let trash_rt = ShellRuntime::new_isolated().unwrap();
+    let trash_win = cx.add_window(|_, _| Empty);
+    let trash_tree = trash_win.update(cx, |_, window, cx| {
+        let mut session = DescriptionSession::load(trash_rt, staged.0.join("mods/flash-note"), trash_policy, window, cx).unwrap();
+        let tree = session.describe(window, cx).unwrap();
+        window.remove_window();
+        tree
+    }).unwrap();
+    cx.run_until_parked();
+    assert!(trash_tree.contains("fn-trash-menu"), "recycle bin menu missing: {trash_tree}");
+    assert!(trash_tree.contains("fn-trash-empty"), "recycle bin empty button missing: {trash_tree}");
+    assert!(trash_tree.contains("fn-trash-row-n2"), "trashed note row missing: {trash_tree}");
+    assert!(trash_tree.contains("fn-trash-restore-n2"), "restore button missing: {trash_tree}");
+    assert!(trash_tree.contains("fn-trash-purge-n2"), "purge button missing: {trash_tree}");
+
+    // 3) Floating composer window supports title input, existing agent, new agent (ACP/CLI + space), saving, and sending.
+    let compose_existing = describe_with_values(
+        cx,
+        &staged,
+        "mods/flash-note",
+        fixture(true, json!({"overlay": "fn-ov", "mode": "compose"}), updates("current", "current")),
+        None,
+    ).unwrap();
+    assert!(compose_existing.contains("flash-note-window"), "floating flash note window missing: {compose_existing}");
+    assert!(compose_existing.contains("fn-title-wrap"), "composer optional title input missing: {compose_existing}");
+    assert!(compose_existing.contains("fn-mode-existing") && compose_existing.contains("fn-mode-new"), "target mode tabs missing: {compose_existing}");
+    assert!(compose_existing.contains("fn-existing-btn"), "existing agent picker missing: {compose_existing}");
+    assert!(compose_existing.contains("fn-save") && compose_existing.contains("fn-send"), "save/send footer buttons missing: {compose_existing}");
+
+    let compose_new = describe_with_values(
+        cx,
+        &staged,
+        "mods/flash-note",
+        fixture(true, json!({"overlay": "fn-ov", "mode": "compose"}), updates("current", "current")),
+        Some("this.targetMode = 'new';"),
+    ).unwrap();
+    assert!(compose_new.contains("fn-preset-btn"), "new agent preset picker missing: {compose_new}");
+    assert!(compose_new.contains("fn-new-rt-acp") && compose_new.contains("fn-new-rt-cli"), "ACP/CLI mode toggles missing: {compose_new}");
+    assert!(compose_new.contains("fn-space-btn"), "workspace picker missing: {compose_new}");
+
+    // Verify saving persists title + text into shared("flash_notes.items") and sending to a new ACP agent dispatches tab.new with task.
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    let values = fixture(true, json!({"overlay": "fn-ov", "mode": "compose"}), updates("current", "current"));
+    let policy = Policy::new()
+        .with_storage_path(staged.0.join("store-flash-note.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(module(values, calls.clone()))
+        .unwrap();
+    let runtime = ShellRuntime::new_isolated().unwrap();
+    let root = staged.wrapper(
+        "mods/flash-note",
+        r#"
+            this.titleInput.set_value("Idle memory check");
+            this.input.set_value("Investigate memory spike on idle");
+            this.saveIdea(cx);
+            this.targetMode = "new";
+            this.sendIdea(cx);
+        "#,
+    );
+    let window = cx.add_window(|_, _| Empty);
+    window.update(cx, |_, window, cx| {
+        let mut session = DescriptionSession::load(runtime, root, policy, window, cx).unwrap();
+        let _ = session.describe(window, cx).unwrap();
+        window.remove_window();
+    }).unwrap();
+    cx.run_until_parked();
+
+    let saved = calls.borrow().shared.get("flash_notes.items").cloned().unwrap_or(Value::Null);
+    let saved_arr = saved.as_array().expect("flash_notes.items must be persisted as array");
+    assert_eq!(saved_arr.len(), 1);
+    assert_eq!(saved_arr[0]["title"], json!("Idle memory check"));
+    assert_eq!(saved_arr[0]["text"], json!("Investigate memory spike on idle"));
+    let tab_new_call = calls
+        .borrow()
+        .effects
+        .iter()
+        .find(|(name, args)| name == "run" && args.first().and_then(Value::as_str) == Some("tab.new"))
+        .cloned();
+    assert!(tab_new_call.is_some(), "sending flash note to new agent must run tab.new");
+    let tab_new_args = &tab_new_call.unwrap().1[1];
+    assert_eq!(tab_new_args["acp"], json!(true));
+    assert_eq!(tab_new_args["task"], json!("Investigate memory spike on idle"));
+}
+
+#[gpui::test]
+fn files_open_request_loads_external_path_and_peek_ctrl_clicks_files(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+
+    // 1. Files mod consumes shared("files.open_request") for an external absolute path outside workspace root.
+    let calls_files = Rc::new(RefCell::new(Calls::default()));
+    {
+        let mut c = calls_files.borrow_mut();
+        c.files.insert(
+            "/tmp/external-notes/sample.rs".into(),
+            "fn one() {}\nfn two() {}\nfn three() {}\n".into(),
+        );
+        c.shared.insert(
+            "files.open_request".into(),
+            json!({ "seq": 1, "path": "/tmp/external-notes/sample.rs", "line": 2, "end_line": 2 }),
+        );
+    }
+    let files_values = fixture(false, json!({}), updates("current", "current"));
+    let files_policy = Policy::new()
+        .with_storage_path(staged.0.join("store-files-ext.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(module(files_values, calls_files.clone()))
+        .unwrap();
+    let files_rt = ShellRuntime::new_isolated().unwrap();
+    let files_root = staged.wrapper("mods/files", "");
+    let w1 = cx.add_window(|_, _| Empty);
+    let mut tree = String::new();
+    w1.update(cx, |_, window, cx| {
+        let mut session = DescriptionSession::load(files_rt, files_root, files_policy, window, cx).unwrap();
+        let _ = session.describe(window, cx).unwrap();
+        tree = session.describe(window, cx).unwrap();
+        window.remove_window();
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(tree.contains("sample.rs"), "external filename missing in files toolbar: {tree}");
+    assert!(tree.contains("/tmp/external-notes"), "external dir badge missing in files toolbar: {tree}");
+
+    // 2. Peek mod strictly requires Ctrl+left-click for file links and dispatches `files.open`.
+    let calls_peek = Rc::new(RefCell::new(Calls::default()));
+    let mut peek_values = fixture(true, json!({ "terminal": "a1", "acp": true }), updates("current", "current"));
+    peek_values.insert(
+        "terminals".into(),
+        json!([{ "address": "a1", "acp": true, "state": "live", "cwd": "/fixture/project", "status": "idle" }]),
+    );
+    let peek_policy = Policy::new()
+        .with_storage_path(staged.0.join("store-peek-link.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(module(peek_values, calls_peek.clone()))
+        .unwrap();
+    let peek_rt = ShellRuntime::new_isolated().unwrap();
+    let peek_root = staged.wrapper(
+        "mods/peek",
+        r#"
+            this.handleMarkdownLinkClick("herdr-file://src/window.rs:42", { button: "left", ctrl: false, meta: false, shift: false, alt: false }, cx);
+            this.handleMarkdownLinkClick("herdr-file://src/window.rs:42-48", { button: "left", ctrl: true, meta: false, shift: false, alt: false }, cx);
+        "#,
+    );
+    let w2 = cx.add_window(|_, _| Empty);
+    w2.update(cx, |_, window, cx| {
+        let mut session = DescriptionSession::load(peek_rt, peek_root, peek_policy, window, cx).unwrap();
+        let _ = session.describe(window, cx).unwrap();
+        window.remove_window();
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let open_calls: Vec<_> = calls_peek
+        .borrow()
+        .effects
+        .iter()
+        .filter(|(name, args)| name == "run" && args.first().and_then(Value::as_str) == Some("files.open"))
+        .cloned()
+        .collect();
+    assert_eq!(open_calls.len(), 1, "only Ctrl+click should trigger files.open: {open_calls:?}");
+    let args = &open_calls[0].1[1];
+    assert_eq!(args["path"], json!("src/window.rs"));
+    assert_eq!(args["line"], json!(42));
+    assert_eq!(args["end_line"], json!(48));
+    assert_eq!(args["cwd"], json!("/fixture/project"));
+}
+
+#[gpui::test]
+fn catchup_briefing_semantic_naming_and_ai_switch_render_cleanly(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let claude = json!({"key":"claude","name":"Claude Code","icon":null,"tint":false,"tile":"#1c1d21","color":"#ffffff","shell":false,"agent":true});
+
+    let agents_list = json!([
+        {"address":"a1","acp":true,"pane":null,"space":"s1","space_name":"API","tab":null,"tab_index":0,"tab_name":"headless","status":"blocked","program":claude,"title":"Claude Code","semantic_title":"修复登录超时","micro_summary":"等待审批 cargo test","seq":10,"pinned":false,"focused":false},
+        {"address":"wsl/a2","acp":true,"pane":null,"space":"s1","space_name":"API","tab":null,"tab_index":0,"tab_name":"headless","status":"blocked","program":claude,"title":"Claude Code","semantic_title":"迁移存储层","micro_summary":"等待审批 cargo test","seq":11,"pinned":false,"focused":false},
+        {"address":"t1","acp":false,"pane":"p1","space":"s1","space_name":"API","tab":"tab1","tab_index":1,"tab_name":"1","status":"done","program":claude,"title":"Claude Code","semantic_title":"重构缓存键","micro_summary":"已完成 3/3 个文件迁移并通过单测","seq":12,"pinned":false,"focused":false}
+    ]);
+    let terminals_list = json!([
+        {"address":"a1","acp":true,"state":"live","status":"blocked","semantic_title":"修复登录超时","micro_summary":"等待审批 cargo test","pending_permission":{"request_id":"r1","title":"Run cargo test auth","kind":"execute","options":[]},"labels":{},"cwd":"/repo/api","program":claude},
+        {"address":"wsl/a2","acp":true,"state":"live","status":"blocked","semantic_title":"迁移存储层","micro_summary":"等待审批 cargo test","pending_permission":{"request_id":"r2","title":"Run cargo test storage","kind":"execute","options":[]},"labels":{},"cwd":"/repo/api","program":claude},
+        {"address":"t1","acp":false,"state":"live","status":"done","semantic_title":"重构缓存键","micro_summary":"已完成 3/3 个文件迁移并通过单测","labels":{},"cwd":"/repo/api","program":claude}
+    ]);
+    let spaces_list = json!([
+        {"id":"s1","index":1,"name":"API","folder":"/repo/api","machine":null,"branch":"feat/cache","active":true,"status":"blocked","tabs":[{"id":"tab1","index":1,"name":"1","named":false,"active":false,"status":"done","panes":1,"zoomed":false,"settled":false,"settled_at":null}]}
+    ]);
+    let panes_list = json!([
+        {"pane":"p1","terminal":"t1","tab":"tab1","title":"Claude Code","semantic_title":"重构缓存键","micro_summary":"已完成 3/3 个文件迁移并通过单测","cwd":"/repo/api","branch":"feat/cache","status":"done","program":claude,"focused":false,"zoomed":false,"movable":false}
+    ]);
+
+    // 1. Agents sidebar displays semantic titles and Catch-up Briefing trigger button.
+    let mut sidebar_vals = fixture(true, json!({}), updates("current", "current"));
+    sidebar_vals.get_mut("settings").unwrap()["language"] = json!("zh-CN");
+    sidebar_vals.insert("agents".into(), agents_list.clone());
+    sidebar_vals.insert("terminals".into(), terminals_list.clone());
+    sidebar_vals.insert("spaces".into(), spaces_list.clone());
+    sidebar_vals.insert("panes".into(), panes_list.clone());
+    let sidebar_tree = describe_with_values(cx, &staged, "mods/agents", sidebar_vals, None).unwrap();
+    for expected in ["ag-briefing", "速览", "修复登录超时", "迁移存储层", "重构缓存键"] {
+        assert!(sidebar_tree.contains(expected), "Agents sidebar missing {expected}: {sidebar_tree}");
+    }
+
+    // 2. Catch-up Briefing dialog renders clustered batch approvals, Drove downstream impact, and ready-to-review diff actions.
+    let mut brief_vals = fixture(true, json!({ "briefing": true, "awayMinutes": 15, "overlay": "ov-br" }), updates("current", "current"));
+    brief_vals.insert("checking".into(), json!(true));
+    brief_vals.get_mut("settings").unwrap()["language"] = json!("zh-CN");
+    brief_vals.insert("agents".into(), agents_list);
+    brief_vals.insert("terminals".into(), terminals_list.clone());
+    brief_vals.insert("spaces".into(), spaces_list.clone());
+    brief_vals.insert("panes".into(), panes_list.clone());
+    let brief_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/agents",
+        brief_vals,
+        Some("this.coreBriefing = { generatedMs: 2000, headline: '核心 schema 失败正阻塞 3 个下游任务；2 个测试审批可一键全批。', headlineFromAi: true, criticalBlockers: [{ id: 'drove_task:t1', kind: 'drove_blocker', title: 'schema: Update OpenRPC', summary: '正阻塞 3 个下游任务 · compile error', status: 'error', blockedDownstreamCount: 3, runId: 'run_1', taskKey: 'schema' }], permissionClusters: [], pendingDecisions: [], readyToReview: [], workingItems: [] };"),
+    ).unwrap();
+    for expected in ["ag-briefing-dialog", "全局进展速览", "离开 15 分钟", "阻塞 +3 下游", "一键全批 (2)", "检视 Diff", "重构缓存键"] {
+        assert!(brief_tree.contains(expected), "Briefing dialog missing {expected}: {brief_tree}");
+    }
+
+    // 3. Unnamed tab adopts semantic_title in tabs bar.
+    let mut tabs_vals = fixture(true, json!({}), updates("current", "current"));
+    tabs_vals.get_mut("settings").unwrap()["language"] = json!("zh-CN");
+    tabs_vals.insert("spaces".into(), spaces_list);
+    tabs_vals.insert("panes".into(), panes_list);
+    tabs_vals.insert("terminals".into(), terminals_list);
+    let tabs_tree = describe_with_values(cx, &staged, "mods/tabs", tabs_vals, None).unwrap();
+    assert!(tabs_tree.contains("重构缓存键"), "Unnamed tab should adopt semantic_title: {tabs_tree}");
+
+    // 4. Settings -> AI Assistant exposes the new Semantic Naming & Hover Micro-Summary toggle.
+    let mut ai_vals = fixture(true, json!({ "section": "ai" }), updates("current", "current"));
+    ai_vals.get_mut("settings").unwrap()["language"] = json!("zh-CN");
+    let ai_tree = describe_with_values(
+        cx,
+        &staged,
+        "frame/settings",
+        ai_vals,
+        Some("this.aiStatus = { enabled: true, configured: true, baseUrl: 'https://api.example.com/v1', model: 'gpt-4o-mini', effort: 'low', switches: { ptyStatusArbitration: true, notesDigest: true, promptCacheEnabled: true, semanticSummary: true }, usage: { totalCalls: 1, localCacheHits: 0, sessionsReused: 0, activeSessions: 0, inputTokens: 1000, cachedInputTokens: 0, outputTokens: 50, cacheHitRatio: 0 } };"),
+    )
+    .unwrap();
+    assert!(ai_tree.contains("st-ai-sw-semantic"), "AI settings missing st-ai-sw-semantic: {ai_tree}");
+    assert!(ai_tree.contains("语义命名与悬停微摘要"), "AI settings missing zh label: {ai_tree}");
 }

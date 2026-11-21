@@ -108,16 +108,16 @@ pub async fn tick_once(core: &Arc<Core>) {
 
         let repo_supports_wt = super::integrate::is_git_repo(&run.cwd)
             && !super::integrate::is_aosp_harness(&run.cwd);
-        let running_shared_writers = tasks
+        let mut active_shared_writers: Vec<Task> = tasks
             .iter()
             .filter(|t| {
                 t.status == TaskStatus::Running
                     && t.isolation == Isolation::None
                     && task_writes_workspace(&cfg, t)
             })
-            .count();
-        let mut shared_writers_started_this_tick = 0usize;
-        let mut promoted_shared_writers_in_tick = 0usize;
+            .cloned()
+            .collect();
+        let initial_slots = slots as usize;
 
         for (idx, mut task) in ready_tasks.iter().cloned().enumerate() {
             if slots == 0 {
@@ -138,68 +138,83 @@ pub async fn tick_once(core: &Arc<Core>) {
             }
 
             if task.isolation == Isolation::None && task_writes_workspace(&cfg, &task) {
-                let remaining_ready_writers = ready_tasks[idx + 1..]
-                    .iter()
-                    .filter(|other| other.isolation == Isolation::None && task_writes_workspace(&cfg, other))
-                    .count();
-                let can_overlap_in_tick = slots > 0 && remaining_ready_writers > 0;
-                let conflict_risk = running_shared_writers > 0
-                    || shared_writers_started_this_tick > 0
-                    || promoted_shared_writers_in_tick > 0
-                    || can_overlap_in_tick;
-                if conflict_risk {
-                    match cfg.ai.conflict_policy.as_str() {
-                        "auto_worktree" if repo_supports_wt => {
-                            let _ = core.drove.store.update_task(&task.id, |t| {
-                                t.isolation = Isolation::Worktree;
-                            });
-                            task.isolation = Isolation::Worktree;
-                            promoted_shared_writers_in_tick += 1;
-                            core.drove.store.append_daemon_event(super::store::NewDaemonEvent {
-                                run_id: Some(run.id.clone()),
-                                task_id: Some(task.id.clone()),
-                                attempt_id: None,
-                                worker_id: None,
-                                message_id: None,
-                                category: "schedule".into(),
-                                kind: "auto_worktree".into(),
-                                status: "ok".into(),
-                                title: format!("Auto-isolated `{}` into worktree", task.key),
-                                detail: Some(
-                                    "Concurrent writable/scoped_write tasks detected under conflictPolicy=auto_worktree"
-                                        .into(),
-                                ),
-                                duration_ms: None,
-                                tokens: None,
-                                cost: None,
-                            });
+                let mut peer_writers: Vec<&Task> = active_shared_writers.iter().collect();
+                if initial_slots > 1 {
+                    let batch_limit = ready_tasks.len().min(initial_slots);
+                    for (j, other) in ready_tasks[..batch_limit].iter().enumerate() {
+                        if j != idx && other.isolation == Isolation::None && task_writes_workspace(&cfg, other) {
+                            peer_writers.push(other);
                         }
-                        "warn" => {
-                            shared_writers_started_this_tick += 1;
-                            core.drove.store.append_daemon_event(super::store::NewDaemonEvent {
-                                run_id: Some(run.id.clone()),
-                                task_id: Some(task.id.clone()),
-                                attempt_id: None,
-                                worker_id: None,
-                                message_id: None,
-                                category: "schedule".into(),
-                                kind: "write_conflict_warn".into(),
-                                status: "warn".into(),
-                                title: format!("Concurrent shared-cwd write on `{}`", task.key),
-                                detail: Some(
-                                    "Parallel writable tasks share run.cwd under conflictPolicy=warn".into(),
-                                ),
-                                duration_ms: None,
-                                tokens: None,
-                                cost: None,
-                            });
-                        }
-                        _ => {
-                            shared_writers_started_this_tick += 1;
+                    }
+                }
+                if !peer_writers.is_empty() && cfg.ai.conflict_policy != "off" {
+                    let (has_conflict, conflict_reason) =
+                        assess_concurrent_write_conflict(core, &cfg, &run, &task, &peer_writers).await;
+                    if !has_conflict {
+                        active_shared_writers.push(task.clone());
+                        core.drove.store.append_daemon_event(super::store::NewDaemonEvent {
+                            run_id: Some(run.id.clone()),
+                            task_id: Some(task.id.clone()),
+                            attempt_id: None,
+                            worker_id: None,
+                            message_id: None,
+                            category: "schedule".into(),
+                            kind: "write_conflict_cleared".into(),
+                            status: "ok".into(),
+                            title: format!("Cleared shared-cwd write for `{}`", task.key),
+                            detail: Some(conflict_reason),
+                            duration_ms: None,
+                            tokens: None,
+                            cost: None,
+                        });
+                    } else {
+                        match cfg.ai.conflict_policy.as_str() {
+                            "auto_worktree" if repo_supports_wt => {
+                                let _ = core.drove.store.update_task(&task.id, |t| {
+                                    t.isolation = Isolation::Worktree;
+                                });
+                                task.isolation = Isolation::Worktree;
+                                core.drove.store.append_daemon_event(super::store::NewDaemonEvent {
+                                    run_id: Some(run.id.clone()),
+                                    task_id: Some(task.id.clone()),
+                                    attempt_id: None,
+                                    worker_id: None,
+                                    message_id: None,
+                                    category: "schedule".into(),
+                                    kind: "auto_worktree".into(),
+                                    status: "ok".into(),
+                                    title: format!("Auto-isolated `{}` into worktree", task.key),
+                                    detail: Some(conflict_reason),
+                                    duration_ms: None,
+                                    tokens: None,
+                                    cost: None,
+                                });
+                            }
+                            "warn" => {
+                                active_shared_writers.push(task.clone());
+                                core.drove.store.append_daemon_event(super::store::NewDaemonEvent {
+                                    run_id: Some(run.id.clone()),
+                                    task_id: Some(task.id.clone()),
+                                    attempt_id: None,
+                                    worker_id: None,
+                                    message_id: None,
+                                    category: "schedule".into(),
+                                    kind: "write_conflict_warn".into(),
+                                    status: "warn".into(),
+                                    title: format!("Concurrent shared-cwd write on `{}`", task.key),
+                                    detail: Some(conflict_reason),
+                                    duration_ms: None,
+                                    tokens: None,
+                                    cost: None,
+                                });
+                            }
+                            _ => {
+                                active_shared_writers.push(task.clone());
+                            }
                         }
                     }
                 } else {
-                    shared_writers_started_this_tick += 1;
+                    active_shared_writers.push(task.clone());
                 }
             }
 
@@ -777,4 +792,194 @@ fn task_writes_workspace(cfg: &DroveConfig, task: &Task) -> bool {
         .and_then(|r| r.access)
         .unwrap_or(RoleAccessMode::Writable);
     mode != RoleAccessMode::Readonly
+}
+
+fn normalize_rel_path(raw: &str) -> Option<String> {
+    let trimmed = raw
+        .trim()
+        .replace('\\', "/")
+        .trim_start_matches("./")
+        .trim_end_matches('/')
+        .to_string();
+    if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("workspace")
+        || trimmed.eq_ignore_ascii_case("repo")
+        || trimmed == "."
+        || trimmed == "*"
+        || trimmed.contains(' ')
+    {
+        return None;
+    }
+    Some(trimmed)
+}
+
+fn explicit_task_paths(task: &Task) -> Vec<String> {
+    let mut out = Vec::new();
+    for f in &task.files {
+        if let Some(p) = normalize_rel_path(f)
+            && !out.contains(&p)
+        {
+            out.push(p);
+        }
+    }
+    if let Some(p) = normalize_rel_path(&task.spec.target)
+        && (p.contains('/') || p.contains('.'))
+        && !out.contains(&p)
+    {
+        out.push(p);
+    }
+    out
+}
+
+fn paths_overlap(a: &str, b: &str) -> bool {
+    a == b
+        || a.strip_prefix(b).is_some_and(|rest| rest.starts_with('/'))
+        || b.strip_prefix(a).is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn role_scoped_prefixes(cfg: &DroveConfig, task: &Task) -> Option<Vec<String>> {
+    let role_name = task
+        .assign
+        .as_ref()
+        .and_then(|a| a.role.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("coder");
+    let (_, _, access, allowed) = super::config::role_spec_for(cfg, Some(role_name));
+    if access != RoleAccessMode::ScopedWrite || allowed.is_empty() {
+        return None;
+    }
+    Some(allowed)
+}
+
+/// Deterministic fast check between two writable tasks:
+/// - `Some((true, reason))` -> definitely overlapping
+/// - `Some((false, reason))` -> definitely disjoint (0-token fast pass)
+/// - `None` -> ambiguous, requires semantic check or conservative fallback
+pub(crate) fn deterministic_write_conflict(
+    cfg: &DroveConfig,
+    a: &Task,
+    b: &Task,
+) -> Option<(bool, String)> {
+    // 0. ScopedWrite roles verify their git working-tree diff against `allowed_paths`.
+    // Two concurrent writers in the same shared cwd would contaminate each other's git status,
+    // so they must always isolate into separate worktrees.
+    if role_scoped_prefixes(cfg, a).is_some() || role_scoped_prefixes(cfg, b).is_some() {
+        return Some((
+            true,
+            format!("scoped_write role requires isolated worktree during concurrent write ({} vs {})", a.key, b.key),
+        ));
+    }
+
+    let paths_a = explicit_task_paths(a);
+    let paths_b = explicit_task_paths(b);
+
+    // 1. Concrete file/dir overlap -> definite conflict.
+    for pa in &paths_a {
+        for pb in &paths_b {
+            if paths_overlap(pa, pb) {
+                return Some((true, format!("overlapping path `{pa}` vs `{pb}`")));
+            }
+        }
+    }
+    // 2. Both have explicit non-empty file lists with zero overlap -> definite disjoint (0 tokens).
+    if !paths_a.is_empty() && !paths_b.is_empty() {
+        return Some((false, format!("disjoint declared files ({} vs {})", a.key, b.key)));
+    }
+    None
+}
+
+async fn assess_concurrent_write_conflict(
+    core: &Arc<Core>,
+    cfg: &DroveConfig,
+    run: &Run,
+    candidate: &Task,
+    peers: &[&Task],
+) -> (bool, String) {
+    let mut ambiguous_peers: Vec<&Task> = Vec::new();
+    for peer in peers {
+        match deterministic_write_conflict(cfg, candidate, peer) {
+            Some((true, reason)) => return (true, reason),
+            Some((false, _)) => continue,
+            None => ambiguous_peers.push(*peer),
+        }
+    }
+    if ambiguous_peers.is_empty() {
+        return (false, "all concurrent writers have disjoint declared files/scopes".into());
+    }
+
+    // Build deterministic cache key across candidate + ambiguous peers so 2s ticks never re-query LLM.
+    let mut key_parts: Vec<String> = std::iter::once(candidate)
+        .chain(ambiguous_peers.iter().copied())
+        .map(|t| format!("{}:{}", t.id, t.updated_at))
+        .collect();
+    key_parts.sort();
+    let cache_key = format!("{}|{}", run.id, key_parts.join("|"));
+    if let Some(cached) = core.drove.get_conflict_cached(&cache_key) {
+        return cached;
+    }
+
+    let verdict = if cfg.ai.enabled && core.ai.is_configured() && !core.ai.is_circuit_open() {
+        match super::ai::assess_write_conflict(core, &run.id, candidate, &ambiguous_peers).await {
+            Some(v) if !v.conflict && v.confidence >= 0.75 => {
+                (false, format!("AI cleared (conf {:.2}): {}", v.confidence, v.reason))
+            }
+            Some(v) if v.conflict => (true, format!("AI conflict (conf {:.2}): {}", v.confidence, v.reason)),
+            Some(v) => (true, format!("low-confidence fallback ({:.2}): {}", v.confidence, v.reason)),
+            None => (true, "concurrent writable tasks (conservative fallback)".into()),
+        }
+    } else {
+        (true, "concurrent writable tasks in shared workspace".into())
+    };
+    core.drove.put_conflict_cached(cache_key, verdict.clone());
+    verdict
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_task(key: &str, role: &str, target: &str, files: &[&str]) -> Task {
+        let now = now_iso();
+        serde_json::from_value(serde_json::json!({
+            "id": format!("tsk_{key}"),
+            "runId": "run_1",
+            "key": key,
+            "title": key,
+            "status": "ready",
+            "deps": [],
+            "spec": {
+                "target": target,
+                "change": "change",
+                "acceptance": "ok"
+            },
+            "files": files,
+            "tags": [],
+            "assign": { "role": role },
+            "isolation": "none",
+            "failures": 0,
+            "createdAt": now,
+            "updatedAt": now,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn deterministic_conflict_clears_disjoint_and_catches_overlap() {
+        let cfg = DroveConfig::default();
+        let ui = mk_task("ui", "coder", "ui/app.ts", &["ui/app.ts"]);
+        let src = mk_task("code", "coder", "src/api.rs", &["src/api.rs"]);
+        let src2 = mk_task("code2", "coder", "src", &["src/api.rs"]);
+        let vague = mk_task("vague", "coder", "workspace", &[]);
+        let writer = mk_task("docs", "writer", "docs/README.md", &["docs/README.md"]);
+
+        // Disjoint writable files -> 0-token fast pass (no conflict).
+        assert_eq!(deterministic_write_conflict(&cfg, &ui, &src).map(|x| x.0), Some(false));
+        // Overlapping paths -> definite conflict.
+        assert_eq!(deterministic_write_conflict(&cfg, &src, &src2).map(|x| x.0), Some(true));
+        // ScopedWrite role always isolates under concurrent writes so git diff verification stays clean.
+        assert_eq!(deterministic_write_conflict(&cfg, &writer, &src).map(|x| x.0), Some(true));
+        // Two vague writable coders -> None (needs AI or conservative fallback).
+        assert_eq!(deterministic_write_conflict(&cfg, &vague, &src), None);
+    }
 }

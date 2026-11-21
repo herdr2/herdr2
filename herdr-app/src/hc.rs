@@ -164,9 +164,18 @@ impl EventLines {
             _ => None,
         };
         if let Some(record) = whole {
-            match at {
-                Some(i) => list[i] = record.clone(),
-                None => list.push(record.clone()),
+            let mut next = record.clone();
+            if let Some(i) = at {
+                for seq_key in ["transcript_seq", "checkpoint_seq"] {
+                    let prev = list[i][seq_key].as_u64().unwrap_or(0);
+                    let bumped = if kind == "restarted" { prev + 1 } else { prev };
+                    if bumped > 0 {
+                        next[seq_key] = json!(bumped);
+                    }
+                }
+                list[i] = next;
+            } else {
+                list.push(next);
             }
             return true;
         }
@@ -207,6 +216,7 @@ impl EventLines {
             }
             "turn" => set(&["turn"]),
             "title" => set(&["title"]),
+            "digest" if is_agent => set(&["semantic_title", "micro_summary"]),
             "labels" => set(&["labels"]),
             "keep" => set(&["keep"]),
             "size" => set(&["cols", "rows"]),
@@ -405,8 +415,9 @@ impl Core {
     pub fn connect() -> Result<Arc<Core>> {
         let core = Self::connect_once()?;
         let has_drove = core.hello["features"].as_array().is_some_and(|f| f.iter().any(|x| x == "drove"));
+        let has_ai = core.hello["features"].as_array().is_some_and(|f| f.iter().any(|x| x == "ai"));
         let has_ckpt = core.hello["methods"].as_array().is_some_and(|m| m.iter().any(|x| x == "checkpoint.rollback"));
-        if core.hello["methods"].is_array() && (!has_drove || !has_ckpt) {
+        if core.hello["methods"].is_array() && (!has_drove || !has_ckpt || !has_ai) {
             drop(core);
             let _ = crate::spawn::command(crate::core_bin::path())
                 .args(["server", "restart"])
@@ -536,6 +547,26 @@ impl Core {
 
     pub fn call(&self, method: &str, params: Value) -> Result<Value> {
         self.call_timeout(method, params, Duration::from_secs(10))
+    }
+
+    pub fn supports_ai(&self) -> bool {
+        self.hello["features"].as_array().is_some_and(|f| f.iter().any(|x| x == "ai"))
+            || self.hello["methods"].as_array().is_some_and(|m| m.iter().any(|x| x == "ai.classify_terminal_state"))
+    }
+
+    /// Calls local Core's semantic PTY terminal-state classifier with a bounded timeout.
+    pub fn classify_terminal_state(&self, params: Value) -> Result<Value> {
+        self.call_timeout("ai.classify_terminal_state", params, Duration::from_secs(6))
+    }
+
+    /// Calls Core's priority Catch-up Briefing aggregator (`ai.briefing`).
+    pub fn briefing(&self, params: Value) -> Result<Value> {
+        self.call_timeout("ai.briefing", params, Duration::from_secs(10))
+    }
+
+    /// Requests an adaptive semantic title + micro-summary refresh (`ai.summarize_agent`).
+    pub fn summarize_agent(&self, params: Value) -> Result<Value> {
+        self.call_timeout("ai.summarize_agent", params, Duration::from_secs(8))
     }
 
     pub fn call_timeout(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
@@ -1042,5 +1073,49 @@ mod tests {
         assert!(pushed.docs && pushed.terminals);
         let live2 = lines.live_for(&hello, &machines);
         assert_eq!(live2["agents"][0]["parent"], "t1");
+    }
+
+    #[test]
+    fn restarted_and_labels_preserve_and_bump_transcript_and_checkpoint_seqs() {
+        let mut lines = EventLines::new(&json!({
+            "seq": 1,
+            "terminals": [],
+            "agents": [{"address": "a1", "state": "live", "status": {"state": "idle"}, "turn": 5, "labels": {}}],
+        }));
+        let ev = |seq: u64, kind: &str, agent: &str, data: Value| {
+            format!("{}\n", json!({"jsonrpc": "2.0", "method": "event", "params": {"seq": seq, "type": kind, "agent": agent, "data": data}}))
+        };
+        let hello = json!({"core": {"id": "local", "name": "local"}});
+        let machines = json!({"machines": []});
+
+        // Initial transcript & checkpoint updates set seqs to 2 and 1.
+        let mut stream = String::new();
+        stream.push_str(&ev(2, "transcript", "a1", json!({"entry": {"kind": "user", "turn": 5, "text": "hi"}})));
+        stream.push_str(&ev(3, "transcript", "a1", json!({"entry": {"kind": "assistant", "turn": 5, "text": "ok"}})));
+        stream.push_str(&ev(4, "checkpoint", "a1", json!({"turn": 5})));
+        lines.push(stream.as_bytes());
+        let a = &lines.live_for(&hello, &machines)["agents"][0];
+        assert_eq!(a["transcript_seq"], 2);
+        assert_eq!(a["checkpoint_seq"], 1);
+
+        // Label record replacement must preserve existing seqs rather than wiping them.
+        lines.push(ev(5, "labels", "a1", json!({
+            "labels": {"herdr.seen": "5"},
+            "record": {"address": "a1", "state": "live", "status": {"state": "idle"}, "turn": 5, "labels": {"herdr.seen": "5"}}
+        })).as_bytes());
+        let a = &lines.live_for(&hello, &machines)["agents"][0];
+        assert_eq!(a["transcript_seq"], 2);
+        assert_eq!(a["checkpoint_seq"], 1);
+
+        // Rollback emits restarted -> transcript -> checkpoint: seqs must increase monotonically.
+        let mut rb = String::new();
+        rb.push_str(&ev(6, "restarted", "a1", json!({"address": "a1", "state": "live", "status": {"state": "idle"}, "turn": 4, "labels": {}})));
+        rb.push_str(&ev(7, "transcript", "a1", json!({"entry": {"kind": "rewind", "to_turn": 4, "restore_files": true}})));
+        rb.push_str(&ev(8, "checkpoint", "a1", json!({"rewound_to": 4, "restored_files": true})));
+        lines.push(rb.as_bytes());
+        let a = &lines.live_for(&hello, &machines)["agents"][0];
+        assert_eq!(a["turn"], 4);
+        assert_eq!(a["transcript_seq"], 4);
+        assert_eq!(a["checkpoint_seq"], 3);
     }
 }

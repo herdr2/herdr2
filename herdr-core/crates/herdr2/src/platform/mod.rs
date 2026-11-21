@@ -444,9 +444,18 @@ pub(crate) fn augment_user_path_env(env: &mut std::collections::BTreeMap<String,
         extras.push(nvm_bin);
     }
     extras.push(home.join(".local/bin"));
+    extras.push(home.join(".local/lib/node/bin"));
     extras.push(home.join("bin"));
     extras.push(home.join(".bun/bin"));
     extras.push(home.join(".cargo/bin"));
+    extras.push(home.join(".npm-global/bin"));
+    extras.push(home.join(".local/share/pnpm"));
+    extras.push(home.join(".pnpm-global/bin"));
+    extras.push(home.join(".yarn/bin"));
+    extras.push(home.join(".volta/bin"));
+    extras.push(home.join(".local/share/mise/shims"));
+    extras.push(home.join(".asdf/shims"));
+    extras.push(home.join(".fnm/current/bin"));
 
     let mut changed = false;
     for ex in extras {

@@ -1,36 +1,20 @@
 //! ACP agent binary/model discovery and generic AI endpoint connection testing.
 
-use super::config::validate_http_url;
 use super::types::{ProbeSnapshot, ProbedAgent, now_iso};
 use crate::acp::{SpawnSpec, spawn_session};
-use crate::acp::presets::{BUILTIN_PRESETS, resolve_non_shim_binary_in_path};
+use crate::acp::presets::{BUILTIN_PRESETS, resolve_acp_command_in_env};
+pub use crate::ai::client::{
+    AiTestResult, all_model_ids, chat_endpoints, curl_json, curl_json_timeout, fetch_ai_models,
+    first_model_id, models_endpoints, test_ai_connection,
+};
 use crate::runtime::Core;
-use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
+use std::time::Duration;
 
 const ACP_PROBE_TIMEOUT: Duration = Duration::from_secs(35);
 const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
-const AI_MODELS_TIMEOUT: Duration = Duration::from_secs(4);
-const AI_CHAT_TIMEOUT: Duration = Duration::from_secs(12);
-
-#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct AiTestResult {
-    pub ok: bool,
-    pub base_url: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub discovered_model: Option<String>,
-    #[serde(default)]
-    pub available_models: Vec<String>,
-    pub latency_ms: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<String>,
-}
 
 fn env_ignore_case<'a>(env: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
     env.iter()
@@ -39,9 +23,7 @@ fn env_ignore_case<'a>(env: &'a BTreeMap<String, String>, key: &str) -> Option<&
         .filter(|s| !s.is_empty())
 }
 
-/// Probes installed ACP agents (and custom `[agents]` entries in `config.toml`) to extract
-/// live model and reasoning-effort options for `Settings -> Drove -> Roles`.
-pub async fn probe_agents(core: &Core, skip_acp_handshake: bool) -> ProbeSnapshot {
+fn collect_probe_targets(core: &Core) -> Vec<(String, Vec<String>)> {
     let settings = core.settings();
     let mut seen_cmds: BTreeSet<Vec<String>> = BTreeSet::new();
     let mut targets: Vec<(String, Vec<String>)> = Vec::new();
@@ -63,10 +45,81 @@ pub async fn probe_agents(core: &Core, skip_acp_handshake: bool) -> ProbeSnapsho
         }
     }
     targets.sort_by(|a, b| a.0.cmp(&b.0));
+    targets
+}
 
+/// Fast (<2ms) stat-only refresh of `installed`/`path`/`command` flags against the current environment
+/// so newly installed agents never remain stuck as "missing" in a cached probe snapshot.
+/// Returns `true` if `snap` was modified.
+pub async fn refresh_installed_status(core: &Core, snap: &mut ProbeSnapshot) -> bool {
+    let targets = collect_probe_targets(core);
     let base_env = crate::platform::program_env().await;
-    let path_override = env_ignore_case(&base_env, "PATH").map(String::from);
-    let pathext_override = env_ignore_case(&base_env, "PATHEXT").map(String::from);
+    let mut changed = false;
+
+    for (id, base_argv) in targets {
+        let resolved = resolve_acp_command_in_env(Some(&id), &base_argv, &base_env);
+        let now_installed = resolved.is_some();
+        let (now_path, now_cmd) = match resolved {
+            Some((p, cmd)) => (Some(p.display().to_string()), cmd),
+            None => (None, base_argv),
+        };
+        if let Some(existing) = snap.agents.iter_mut().find(|a| a.id == id) {
+            let was_installed = existing.installed;
+            if existing.installed != now_installed || existing.path != now_path || existing.command != now_cmd {
+                existing.installed = now_installed;
+                existing.path = now_path;
+                existing.command = now_cmd;
+                changed = true;
+            }
+            if !was_installed && now_installed {
+                existing.error = None;
+                if existing.models.is_empty() {
+                    let (models, default_model) = discover_local_models(&id, true, &base_env);
+                    existing.models = models;
+                    if existing.default_model.is_none() {
+                        existing.default_model = default_model;
+                    }
+                }
+                if snap.full_probe {
+                    snap.full_probe = false;
+                    changed = true;
+                }
+            }
+        } else {
+            let (models, default_model) = discover_local_models(&id, now_installed, &base_env);
+            snap.agents.push(ProbedAgent {
+                id,
+                command: now_cmd,
+                installed: now_installed,
+                path: now_path,
+                agent_info: None,
+                models,
+                default_model,
+                efforts: default_efforts(),
+                default_effort: Some("medium".into()),
+                model_contexts: BTreeMap::new(),
+                model_efforts: BTreeMap::new(),
+                error: None,
+            });
+            if now_installed && snap.full_probe {
+                snap.full_probe = false;
+            }
+            changed = true;
+        }
+    }
+
+    if changed {
+        snap.agents
+            .sort_by(|a, b| b.installed.cmp(&a.installed).then_with(|| a.id.cmp(&b.id)));
+    }
+    changed
+}
+
+/// Probes installed ACP agents (and custom `[agents]` entries in `config.toml`) to extract
+/// live model and reasoning-effort options for `Settings -> Drove -> Roles`.
+pub async fn probe_agents(core: &Core, skip_acp_handshake: bool) -> ProbeSnapshot {
+    let targets = collect_probe_targets(core);
+    let base_env = crate::platform::program_env().await;
     let cwd = std::env::current_dir()
         .unwrap_or_else(|_| std::env::temp_dir())
         .display()
@@ -76,19 +129,19 @@ pub async fn probe_agents(core: &Core, skip_acp_handshake: bool) -> ProbeSnapsho
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
     let mut handles = Vec::new();
     for (id, argv) in targets {
-        let exe_path = resolve_non_shim_binary_in_path(
-            &argv[0],
-            path_override.as_deref(),
-            pathext_override.as_deref(),
-        );
+        let resolved = resolve_acp_command_in_env(Some(&id), &argv, &base_env);
         let mut env = base_env.clone();
-        if exe_path.is_none() || skip_acp_handshake {
-            let installed = exe_path.is_some();
+        if resolved.is_none() || skip_acp_handshake {
+            let installed = resolved.is_some();
+            let (exe_path, effective_argv) = match resolved {
+                Some((p, cmd)) => (Some(p), cmd),
+                None => (None, argv),
+            };
             handles.push(tokio::spawn(async move {
                 let (models, default_model) = discover_local_models(&id, installed, &env);
                 ProbedAgent {
                     id,
-                    command: argv,
+                    command: effective_argv,
                     installed,
                     path: exe_path.map(|p| p.display().to_string()),
                     agent_info: None,
@@ -103,13 +156,14 @@ pub async fn probe_agents(core: &Core, skip_acp_handshake: bool) -> ProbeSnapsho
             }));
             continue;
         }
+        let (exe_path, effective_argv) = resolved.unwrap();
         env.insert(crate::sweep::VAR.into(), probe_scope.clone());
-        let path_str = exe_path.unwrap().display().to_string();
+        let path_str = exe_path.display().to_string();
         let probe_cwd = cwd.clone();
         let permit_sem = sem.clone();
         handles.push(tokio::spawn(async move {
             let _permit = permit_sem.acquire_owned().await;
-            probe_one_acp(id, argv, path_str, env, probe_cwd).await
+            probe_one_acp(id, effective_argv, path_str, env, probe_cwd).await
         }));
     }
 
@@ -914,206 +968,6 @@ pub(crate) fn discover_local_models_in_homes(
         default_model = models.first().cloned();
     }
     (models, default_model)
-}
-
-/// Fetches all model IDs advertised by an OpenAI-compatible endpoint (`/v1/models` or `/models`).
-pub async fn fetch_ai_models(base_url: &str, api_key: Option<&str>) -> Vec<String> {
-    let Ok(base) = validate_http_url(base_url, "ai.baseUrl") else {
-        return Vec::new();
-    };
-    for models_url in models_endpoints(&base) {
-        if let Ok((status, body)) = curl_json_timeout("GET", &models_url, api_key, None, AI_MODELS_TIMEOUT).await
-            && (200..300).contains(&status)
-        {
-            let ids = all_model_ids(&body);
-            if !ids.is_empty() {
-                return ids;
-            }
-        }
-    }
-    Vec::new()
-}
-
-/// Tests any OpenAI-compatible HTTP endpoint using `Service URL` + `API Key`.
-/// Discovers available models from `/models` and verifies completion connectivity.
-pub async fn test_ai_connection(base_url: &str, api_key: Option<&str>, model_hint: Option<&str>) -> AiTestResult {
-    let started = Instant::now();
-    let base = match validate_http_url(base_url, "ai.baseUrl") {
-        Ok(u) => u,
-        Err(e) => {
-            return AiTestResult {
-                ok: false,
-                base_url: base_url.to_string(),
-                discovered_model: None,
-                available_models: Vec::new(),
-                latency_ms: started.elapsed().as_millis() as u64,
-                error: Some(e.message),
-            };
-        }
-    };
-
-    let available_models = fetch_ai_models(&base, api_key).await;
-    let chosen_model = model_hint
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .or_else(|| available_models.first().cloned());
-
-    let Some(model) = chosen_model else {
-        return AiTestResult {
-            ok: false,
-            base_url: base,
-            discovered_model: None,
-            available_models,
-            latency_ms: started.elapsed().as_millis() as u64,
-            error: Some("could not discover a model from /models; check Service URL or API Key".into()),
-        };
-    };
-
-    let payload = json!({
-        "model": model,
-        "messages": [{"role": "user", "content": "Reply with OK"}],
-        "max_tokens": 8,
-    })
-    .to_string();
-
-    let mut last_err = String::new();
-    for chat_url in chat_endpoints(&base) {
-        match curl_json_timeout("POST", &chat_url, api_key, Some(&payload), AI_CHAT_TIMEOUT).await {
-            Ok((status, body)) if (200..300).contains(&status) => {
-                let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-                let discovered = parsed["model"].as_str().filter(|s| !s.is_empty()).unwrap_or(&model).to_string();
-                let mut models = available_models;
-                push_unique(&mut models, &discovered);
-                return AiTestResult {
-                    ok: true,
-                    base_url: base,
-                    discovered_model: Some(discovered),
-                    available_models: models,
-                    latency_ms: started.elapsed().as_millis() as u64,
-                    error: None,
-                };
-            }
-            Ok((status, body)) => {
-                let msg = serde_json::from_str::<Value>(&body)
-                    .ok()
-                    .and_then(|v| v["error"]["message"].as_str().or_else(|| v["message"].as_str()).map(String::from))
-                    .unwrap_or_else(|| format!("HTTP {status}"));
-                last_err = format!("HTTP {status}: {msg}");
-                if status == 401 || status == 403 {
-                    break;
-                }
-            }
-            Err(e) => {
-                last_err = e;
-            }
-        }
-    }
-
-    AiTestResult {
-        ok: false,
-        base_url: base,
-        discovered_model: Some(model),
-        available_models,
-        latency_ms: started.elapsed().as_millis() as u64,
-        error: Some(if last_err.is_empty() { "chat completion probe failed".into() } else { last_err }),
-    }
-}
-
-pub(crate) fn models_endpoints(base: &str) -> Vec<String> {
-    if base.ends_with("/v1") || base.contains("/v1/") {
-        vec![format!("{base}/models")]
-    } else {
-        vec![format!("{base}/v1/models"), format!("{base}/models")]
-    }
-}
-
-pub(crate) fn chat_endpoints(base: &str) -> Vec<String> {
-    if base.ends_with("/v1") || base.contains("/v1/") {
-        vec![format!("{base}/chat/completions")]
-    } else {
-        vec![format!("{base}/v1/chat/completions"), format!("{base}/chat/completions")]
-    }
-}
-
-pub(crate) fn all_model_ids(body: &str) -> Vec<String> {
-    let mut ids = Vec::new();
-    let Ok(val) = serde_json::from_str::<Value>(body) else {
-        return ids;
-    };
-    if let Some(arr) = val["data"].as_array() {
-        for entry in arr {
-            if let Some(id) = entry["id"].as_str() {
-                push_unique(&mut ids, id);
-            }
-        }
-    }
-    if let Some(arr) = val["models"].as_array() {
-        for entry in arr {
-            if let Some(id) = entry["id"].as_str().or_else(|| entry.as_str()) {
-                push_unique(&mut ids, id);
-            }
-        }
-    }
-    ids
-}
-
-#[allow(dead_code)]
-pub(crate) fn first_model_id(body: &str) -> Option<String> {
-    all_model_ids(body).into_iter().next()
-}
-
-/// Calls an HTTP JSON endpoint via `curl --config -` so bearer tokens stay off process argv.
-pub(crate) async fn curl_json(
-    method: &str,
-    url: &str,
-    api_key: Option<&str>,
-    body: Option<&str>,
-) -> Result<(u16, String), String> {
-    curl_json_timeout(method, url, api_key, body, AI_CHAT_TIMEOUT).await
-}
-
-pub(crate) async fn curl_json_timeout(
-    method: &str,
-    url: &str,
-    api_key: Option<&str>,
-    body: Option<&str>,
-    timeout: Duration,
-) -> Result<(u16, String), String> {
-    let mut cfg = format!("url = \"{}\"\nrequest = \"{}\"\n", escape_curl(url), escape_curl(method));
-    cfg.push_str("header = \"Content-Type: application/json\"\n");
-    if let Some(key) = api_key.map(str::trim).filter(|s| !s.is_empty()) {
-        cfg.push_str(&format!("header = \"Authorization: Bearer {}\"\n", escape_curl(key)));
-    }
-    if let Some(payload) = body {
-        cfg.push_str(&format!("data-raw = \"{}\"\n", escape_curl(payload)));
-    }
-
-    let timeout_secs = timeout.as_secs().max(1).to_string();
-    let mut child = super::bg_tokio_command("curl")
-        .args(["-sS", "--max-time", &timeout_secs, "-w", "\n%{http_code}", "--config", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to spawn curl: {e}"))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin.write_all(cfg.as_bytes()).await.map_err(|e| format!("write curl stdin: {e}"))?;
-    }
-    let out = child.wait_with_output().await.map_err(|e| format!("curl failed: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(if err.is_empty() { format!("curl exited {}", out.status) } else { err });
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let (resp_body, code_str) = raw.rsplit_once('\n').unwrap_or(("", raw.trim()));
-    let status: u16 = code_str.trim().parse().unwrap_or(0);
-    Ok((status, resp_body.to_string()))
-}
-
-fn escape_curl(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r")
 }
 
 #[cfg(test)]

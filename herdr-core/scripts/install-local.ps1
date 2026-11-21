@@ -1,6 +1,9 @@
-# Builds this checkout and installs it with distribution/install.ps1.
+# Builds this checkout (with the embedded Drove Web bundle) and installs it with distribution/install.ps1.
 $ErrorActionPreference = "Stop"
 Set-Location "$PSScriptRoot\.."
+if ((Test-Path "..\drove-web\package.json") -and ($env:H2_SKIP_WEB_BUILD -ne "1")) {
+    $env:H2_REQUIRE_WEB_BUNDLE = "1"
+}
 cargo build --release --locked
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 $tmp = Join-Path ([IO.Path]::GetTempPath()) "h2-local-$PID"

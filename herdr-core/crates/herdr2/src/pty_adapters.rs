@@ -1178,7 +1178,7 @@ fn resolve_rollback_transcript_turn(checkpoints: &[crate::checkpoint::Checkpoint
     }
     let ordinal = checkpoints
         .iter()
-        .filter(|c| c.turn > 0 && c.turn <= to_turn && c.label.is_none())
+        .filter(|c| c.turn > 0 && c.turn <= to_turn && !c.is_manual_bookmark())
         .count() as u64;
     if ordinal > 0 { ordinal } else { to_turn }
 }
@@ -1206,7 +1206,7 @@ fn has_captured_session_turn(
         return false;
     };
     checkpoints.iter().any(|c| {
-        if c.turn == 0 || c.label.is_some() {
+        if c.turn == 0 || c.is_manual_bookmark() {
             return false;
         }
         if c.session_turn == Some(sturn) {
@@ -2546,6 +2546,7 @@ mod tests {
                         head_oid: None,
                         prompt: Some("old".into()),
                         label: None,
+                        label_source: None,
                         files: vec![],
                         ts_ms: 1,
                     }],
@@ -2576,6 +2577,7 @@ mod tests {
                         head_oid: None,
                         prompt: Some("kept".into()),
                         label: None,
+                        label_source: None,
                         files: vec![],
                         ts_ms: 1,
                     }],
@@ -2693,6 +2695,7 @@ mod tests {
             head_oid: None,
             prompt: None,
             label: label.map(str::to_string),
+            label_source: label.map(|_| "manual".to_string()),
             files: vec![],
             ts_ms: turn,
         };
@@ -2778,6 +2781,7 @@ mod tests {
                 head_oid: None,
                 prompt: None,
                 label: None,
+                label_source: None,
                 files: vec![],
                 ts_ms: 1,
             },
@@ -2789,6 +2793,7 @@ mod tests {
                 head_oid: None,
                 prompt: Some("[Handoff from t2t] continue".into()),
                 label: None,
+                label_source: None,
                 files: vec![],
                 ts_ms: 2,
             },

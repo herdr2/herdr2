@@ -255,6 +255,59 @@ impl Core {
         self.changed.notify_waiters();
         Ok(st.reg.agents.get(&id).expect("checked agent").clone())
     }
+
+    /// Removes a queued inbox item and immediately steers it ahead of the queue (cancelling any active turn).
+    pub fn send_inbox_now(&self, id: u32, item_id: u64) -> Result<Agent, RpcError> {
+        let mut st = self.lock();
+        let addr = {
+            let a = st
+                .reg
+                .agents
+                .get(&id)
+                .ok_or_else(|| RpcError::new("not_found", format!("no agent {}", address(id)), ""))?;
+            a.check_program()?;
+            if !a.is_live() {
+                return Err(RpcError::new("finished", format!("{} already exited", a.address), ""));
+            }
+            a.address.clone()
+        };
+        let removed = if let Some(q) = st.inboxes.get_mut(&id) {
+            if let Some(pos) = q.iter().position(|item| item.id == item_id) {
+                q.remove(pos)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let Some(item) = removed else {
+            return Err(RpcError::new(
+                "not_found",
+                format!("queued message #{item_id} is no longer in {addr}'s inbox"),
+                "it may have already started; refresh transcript",
+            ));
+        };
+        let session = st.sessions.get(&id).map(SessionSender::clone_cmd);
+        if let Some(session) = session {
+            if st.inboxes.get(&id).is_some_and(std::collections::VecDeque::is_empty) {
+                st.inboxes.remove(&id);
+            }
+            self.sync_inbox(&mut st, id, true);
+            self.save(&st);
+            self.changed.notify_waiters();
+            let _ = session.send(SessionCommand::Steer(item));
+        } else if st.recovering.contains(&id) {
+            st.inboxes.entry(id).or_default().push_front(item);
+            self.sync_inbox(&mut st, id, true);
+            self.save(&st);
+            self.changed.notify_waiters();
+        } else {
+            st.inboxes.entry(id).or_default().push_front(item);
+            self.sync_inbox(&mut st, id, true);
+            return Err(RpcError::new("unavailable", format!("{addr} has no active ACP session"), ""));
+        }
+        Ok(st.reg.agents.get(&id).expect("checked agent").clone())
+    }
 }
 
 trait SessionSender {
@@ -368,6 +421,24 @@ mod tests {
 
         let err = core.remove_inbox(id, item2_id).unwrap_err();
         assert_eq!(err.kind, "not_found");
+
+        // Re-enqueue a second item and verify send_inbox_now promotes it to front while recovering.
+        core.send(id, "urgent second", false, None, Some("a7")).await.unwrap();
+        let urgent_id = core.lock().inboxes[&id][1].id;
+        let promoted = core.send_inbox_now(id, urgent_id).unwrap();
+        assert_eq!(promoted.inbox_len, 2);
+        assert_eq!(promoted.inbox[0].id, urgent_id);
+        assert_eq!(promoted.inbox[0].text, "urgent second");
+        assert_eq!(promoted.inbox[0].from.as_deref(), Some("a7"));
+
+        let missing = core.send_inbox_now(id, 999_999).unwrap_err();
+        assert_eq!(missing.kind, "not_found");
+
+        // If session is unavailable (not recovering), send_inbox_now preserves the item instead of dropping it.
+        core.lock().recovering.remove(&id);
+        let unavail = core.send_inbox_now(id, urgent_id).unwrap_err();
+        assert_eq!(unavail.kind, "unavailable");
+        assert_eq!(core.lock().inboxes[&id][0].id, urgent_id);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -135,7 +135,53 @@ fn format_note(
     format!("<h2>{address}{name} {what}{gap}{look}: h2 read {address}</h2>")
 }
 
+fn format_note_with_digest(
+    status: Option<&crate::status::Status>,
+    is_blocked: bool,
+    is_stuck: bool,
+    exit_code: Option<i32>,
+    signal: Option<i32>,
+    reason: Option<&str>,
+    name: Option<&str>,
+    address: &str,
+    last: &[String],
+    digest: Option<&crate::ai::ChildNoteDigest>,
+) -> String {
+    if let Some(d) = digest {
+        let (what, look) = if is_blocked {
+            let kind = status.and_then(|s| s.kind.as_deref()).unwrap_or("waiting");
+            (format!("is blocked ({kind})"), "See")
+        } else if is_stuck {
+            ("hit an error".into(), "See")
+        } else {
+            let how = match (exit_code, signal) {
+                (Some(code), _) => format!("exit {code}"),
+                (_, Some(sig)) => format!("signal {sig}"),
+                _ => reason.unwrap_or("ended").to_string(),
+            };
+            (format!("exited ({how})"), "Read")
+        };
+        let name = name.map(|n| format!(" {n}")).unwrap_or_default();
+        let files_part = if d.files.is_empty() {
+            String::new()
+        } else {
+            format!("; files: {}", d.files.join(", "))
+        };
+        let next_part = if d.next_step.is_empty() {
+            String::new()
+        } else {
+            format!("; next: {}", d.next_step)
+        };
+        return format!(
+            "<h2>{address}{name} {what}. Summary: {}{files_part}{next_part}. {look}: h2 read {address}</h2>",
+            d.root_cause
+        );
+    }
+    format_note(status, is_blocked, is_stuck, exit_code, signal, reason, name, address, last)
+}
+
 /// What a child can't say itself: it is blocked, it hit an error, or it is gone.
+#[cfg(test)]
 fn note(a: &Agent, address: &str, last: &[String]) -> String {
     format_note(
         a.status.as_ref(),
@@ -150,8 +196,33 @@ fn note(a: &Agent, address: &str, last: &[String]) -> String {
     )
 }
 
-fn pty_note(t: &Terminal, address: &str, last: &[String]) -> String {
-    format_note(
+fn note_with_digest(
+    a: &Agent,
+    address: &str,
+    last: &[String],
+    digest: Option<&crate::ai::ChildNoteDigest>,
+) -> String {
+    format_note_with_digest(
+        a.status.as_ref(),
+        blocked(a),
+        stuck(a),
+        a.exit_code,
+        a.signal,
+        a.reason.as_deref(),
+        a.name.as_ref().or(a.template.as_ref()).map(String::as_str),
+        address,
+        last,
+        digest,
+    )
+}
+
+fn pty_note_with_digest(
+    t: &Terminal,
+    address: &str,
+    last: &[String],
+    digest: Option<&crate::ai::ChildNoteDigest>,
+) -> String {
+    format_note_with_digest(
         t.status.as_ref(),
         pty_blocked(t),
         pty_stuck(t),
@@ -161,31 +232,142 @@ fn pty_note(t: &Terminal, address: &str, last: &[String]) -> String {
         t.name.as_ref().or(t.template.as_ref()).map(String::as_str),
         address,
         last,
+        digest,
     )
+}
+
+struct ChildDigestCandidate {
+    key: TargetKey,
+    address: String,
+    news_seq: u64,
+    status_label: String,
+    exit_code: Option<i32>,
+    cwd: Option<String>,
+    raw_output: String,
 }
 
 impl Core {
     /// The note about ACP child `id`, called `address` by its parent.
-    fn note_for(&self, st: &State, id: u32, address: &str) -> String {
+    fn note_for_with_digest(
+        &self,
+        st: &State,
+        id: u32,
+        address: &str,
+        digest: Option<&crate::ai::ChildNoteDigest>,
+    ) -> String {
         let a = &st.reg.agents[&id];
-        let last = if !a.is_live() && a.exit_code.is_some_and(|c| c != 0) {
+        let last = if digest.is_none() && !a.is_live() && a.exit_code.is_some_and(|c| c != 0) {
             let text = st.transcripts.get(&id).map(|t| t.render(None, false).0).unwrap_or_default();
             last_lines(&text)
         } else {
             Vec::new()
         };
-        note(a, address, &last)
+        note_with_digest(a, address, &last, digest)
+    }
+
+    #[allow(dead_code)]
+    fn note_for(&self, st: &State, id: u32, address: &str) -> String {
+        self.note_for_with_digest(st, id, address, None)
     }
 
     /// The note about PTY child `id`, called `address` by its parent.
-    fn pty_note_for(&self, st: &State, id: u32, address: &str) -> String {
+    fn pty_note_for_with_digest(
+        &self,
+        st: &State,
+        id: u32,
+        address: &str,
+        digest: Option<&crate::ai::ChildNoteDigest>,
+    ) -> String {
         let t = &st.pty_reg.terminals[&id];
-        let last = if !t.is_live() && !t.reported {
+        let last = if digest.is_none() && !t.is_live() && !t.reported {
             last_lines(&self.screen_text(st, id).unwrap_or_default())
         } else {
             Vec::new()
         };
-        pty_note(t, address, &last)
+        pty_note_with_digest(t, address, &last, digest)
+    }
+
+    #[allow(dead_code)]
+    fn pty_note_for(&self, st: &State, id: u32, address: &str) -> String {
+        self.pty_note_for_with_digest(st, id, address, None)
+    }
+
+    fn collect_digest_candidates(&self, st: &State, acp_kids: &[u32], pty_kids: &[u32]) -> Vec<ChildDigestCandidate> {
+        if !self.ai.notes_digest_enabled() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for &id in acp_kids {
+            let Some(a) = st.reg.agents.get(&id) else { continue };
+            let is_err = says(a, "error");
+            let nonzero_exit = !a.is_live() && a.exit_code.is_some_and(|c| c != 0);
+            if !is_err && !nonzero_exit {
+                continue;
+            }
+            let raw_output = st
+                .transcripts
+                .get(&id)
+                .map(|t| t.render(None, false).0)
+                .unwrap_or_else(|| a.status.as_ref().map(|s| s.msg.clone()).unwrap_or_default());
+            if raw_output.trim().is_empty() {
+                continue;
+            }
+            out.push(ChildDigestCandidate {
+                key: TargetKey::Agent(id),
+                address: a.address.clone(),
+                news_seq: a.news,
+                status_label: if is_err { "error".into() } else { "exited_nonzero".into() },
+                exit_code: a.exit_code,
+                cwd: Some(a.cwd.clone()),
+                raw_output,
+            });
+        }
+        for &id in pty_kids {
+            let Some(t) = st.pty_reg.terminals.get(&id) else { continue };
+            let is_err = pty_says(t, "error");
+            let nonzero_exit = !t.is_live() && (!t.reported || t.exit_code.is_some_and(|c| c != 0));
+            if !is_err && !nonzero_exit {
+                continue;
+            }
+            let raw_output = self.screen_text(st, id).unwrap_or_default();
+            if raw_output.trim().is_empty() {
+                continue;
+            }
+            out.push(ChildDigestCandidate {
+                key: TargetKey::Terminal(id),
+                address: t.address.clone(),
+                news_seq: t.news,
+                status_label: if is_err { "error".into() } else { "exited_nonzero".into() },
+                exit_code: t.exit_code,
+                cwd: Some(t.cwd.clone()),
+                raw_output,
+            });
+        }
+        out
+    }
+
+    async fn resolve_child_digests(
+        &self,
+        candidates: Vec<ChildDigestCandidate>,
+    ) -> std::collections::HashMap<TargetKey, crate::ai::ChildNoteDigest> {
+        let mut out = std::collections::HashMap::new();
+        for c in candidates {
+            if let Some(d) = self
+                .ai
+                .summarize_child_note(
+                    &c.address,
+                    c.news_seq,
+                    &c.status_label,
+                    c.exit_code,
+                    c.cwd.as_deref(),
+                    &c.raw_output,
+                )
+                .await
+            {
+                out.insert(c.key, d);
+            }
+        }
+        out
     }
 
     /// Something notable happened to ACP child `id`.
@@ -407,36 +589,59 @@ impl Core {
                     }
                 }
                 Job::NotesAfar(parent) => {
-                    let mut st = self.lock();
-                    let Some(called) = crate::remote::called_there(&st, &parent) else { continue };
-                    let (acp_kids, pty_kids) = self.unseen(&st, &parent);
-                    if acp_kids.is_empty() && pty_kids.is_empty() {
-                        continue;
-                    }
-                    let mut notes: Vec<String> = acp_kids
-                        .iter()
-                        .map(|id| self.note_for(&st, *id, &format!("{called}/{}", crate::agents::address(*id))))
-                        .collect();
-                    notes.extend(
-                        pty_kids
+                    let core = self.clone();
+                    tokio::spawn(async move {
+                        let candidates = {
+                            let st = core.lock();
+                            let Some(_) = crate::remote::called_there(&st, &parent) else { return };
+                            let (acp_kids, pty_kids) = core.unseen(&st, &parent);
+                            if acp_kids.is_empty() && pty_kids.is_empty() {
+                                return;
+                            }
+                            core.collect_digest_candidates(&st, &acp_kids, &pty_kids)
+                        };
+                        let digests = core.resolve_child_digests(candidates).await;
+                        let mut st = core.lock();
+                        let Some(called) = crate::remote::called_there(&st, &parent) else { return };
+                        let (acp_kids, pty_kids) = core.unseen(&st, &parent);
+                        if acp_kids.is_empty() && pty_kids.is_empty() {
+                            return;
+                        }
+                        let mut notes: Vec<String> = acp_kids
                             .iter()
-                            .map(|id| self.pty_note_for(&st, *id, &format!("{called}/{}", crate::terminals::address(*id)))),
-                    );
-                    for id in &acp_kids {
-                        let a = st.reg.agents.get_mut(id).expect("listed");
-                        a.noted = a.noted.max(a.news);
-                    }
-                    for id in &pty_kids {
-                        let t = st.pty_reg.terminals.get_mut(id).expect("listed");
-                        t.noted = t.noted.max(t.news);
-                    }
-                    if !acp_kids.is_empty() {
-                        self.save(&st);
-                    }
-                    if !pty_kids.is_empty() {
-                        self.save_pty(&st);
-                    }
-                    crate::remote::tell_peer(&self, &mut st, &parent, &notes);
+                            .map(|id| {
+                                core.note_for_with_digest(
+                                    &st,
+                                    *id,
+                                    &format!("{called}/{}", crate::agents::address(*id)),
+                                    digests.get(&TargetKey::Agent(*id)),
+                                )
+                            })
+                            .collect();
+                        notes.extend(pty_kids.iter().map(|id| {
+                            core.pty_note_for_with_digest(
+                                &st,
+                                *id,
+                                &format!("{called}/{}", crate::terminals::address(*id)),
+                                digests.get(&TargetKey::Terminal(*id)),
+                            )
+                        }));
+                        for id in &acp_kids {
+                            let a = st.reg.agents.get_mut(id).expect("listed");
+                            a.noted = a.noted.max(a.news);
+                        }
+                        for id in &pty_kids {
+                            let t = st.pty_reg.terminals.get_mut(id).expect("listed");
+                            t.noted = t.noted.max(t.news);
+                        }
+                        if !acp_kids.is_empty() {
+                            core.save(&st);
+                        }
+                        if !pty_kids.is_empty() {
+                            core.save_pty(&st);
+                        }
+                        crate::remote::tell_peer(&core, &mut st, &parent, &notes);
+                    });
                 }
                 Job::Orphaned(parent) => {
                     let address = parent.address();
@@ -516,11 +721,19 @@ impl Core {
         loop {
             let ready = |st: &State| st.reg.agents.get(&parent).is_none_or(|a| !a.is_live() || can_take_note(a));
             while !self.wait_for(Duration::from_secs(60), ready).await {}
-            let alive = self.lock().reg.agents.get(&parent).is_some_and(|a| a.is_live());
-            if !alive || !enabled {
-                break;
-            }
-            if !self.queue_note_batch(parent) {
+            let candidates = {
+                let st = self.lock();
+                let alive = st.reg.agents.get(&parent).is_some_and(|a| a.is_live());
+                if !alive || !enabled {
+                    break;
+                }
+                let addr = crate::agents::address(parent);
+                let (acp_kids, pty_kids) = self.unseen(&st, &addr);
+                self.collect_digest_candidates(&st, &acp_kids, &pty_kids)
+            };
+            // Resolve optional AI error/exit digests completely outside `self.lock()`.
+            let digests = self.resolve_child_digests(candidates).await;
+            if !self.queue_note_batch(parent, &digests) {
                 let mut st = self.lock();
                 let (acp_kids, pty_kids) = self.unseen(&st, &crate::agents::address(parent));
                 if acp_kids.is_empty() && pty_kids.is_empty() && !st.afar_notes.contains_key(&key) {
@@ -532,7 +745,11 @@ impl Core {
         self.lock().note_tasks.remove(&key);
     }
 
-    fn queue_note_batch(&self, parent: u32) -> bool {
+    fn queue_note_batch(
+        &self,
+        parent: u32,
+        digests: &std::collections::HashMap<TargetKey, crate::ai::ChildNoteDigest>,
+    ) -> bool {
         let mut st = self.lock();
         let Some(p) = st.reg.agents.get(&parent) else {
             return false;
@@ -547,11 +764,25 @@ impl Core {
         if acp_kids.is_empty() && pty_kids.is_empty() && afar.is_empty() {
             return false;
         }
-        let mut text: Vec<String> =
-            acp_kids.iter().map(|id| self.note_for(&st, *id, &st.reg.agents[id].address)).collect();
-        text.extend(
-            pty_kids.iter().map(|id| self.pty_note_for(&st, *id, &st.pty_reg.terminals[id].address)),
-        );
+        let mut text: Vec<String> = acp_kids
+            .iter()
+            .map(|id| {
+                self.note_for_with_digest(
+                    &st,
+                    *id,
+                    &st.reg.agents[id].address,
+                    digests.get(&TargetKey::Agent(*id)),
+                )
+            })
+            .collect();
+        text.extend(pty_kids.iter().map(|id| {
+            self.pty_note_for_with_digest(
+                &st,
+                *id,
+                &st.pty_reg.terminals[id].address,
+                digests.get(&TargetKey::Terminal(*id)),
+            )
+        }));
         text.extend(afar);
         let told_acp: Vec<(u32, u64)> = acp_kids.iter().map(|id| (*id, st.reg.agents[id].news)).collect();
         let told_pty: Vec<(u32, u64)> = pty_kids.iter().map(|id| (*id, st.pty_reg.terminals[id].news)).collect();
@@ -715,6 +946,15 @@ mod tests {
         assert_eq!(
             note(&r.agents[&id], "a1", &last),
             "<h2>a1 reviewer exited (exit 3). Last lines:\na\nb[201~\tc\nRead: h2 read a1</h2>"
+        );
+        let digest = crate::ai::ChildNoteDigest {
+            root_cause: "cargo test failed in auth::verify".into(),
+            files: vec!["src/auth.rs".into()],
+            next_step: "enable serde derive feature".into(),
+        };
+        assert_eq!(
+            note_with_digest(&r.agents[&id], "a1", &last, Some(&digest)),
+            "<h2>a1 reviewer exited (exit 3). Summary: cargo test failed in auth::verify; files: src/auth.rs; next: enable serde derive feature. Read: h2 read a1</h2>"
         );
     }
 

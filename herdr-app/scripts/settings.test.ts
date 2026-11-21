@@ -278,3 +278,92 @@ test("ai assistant parameter helpers format effort and parse context/maxTokens i
   expect(view.parseAiMaxTokensInput("not-a-number")).toBeNull();
   expect(view.parseAiMaxTokensInput("-100")).toBeNull();
 });
+
+test("aiConfigureDroveRoles probes agents & models before calling roles-ai-config when cache is missing", async () => {
+  const view = new Settings();
+  const order: string[] = [];
+  view.droveMachine = null;
+  view.droveData = {
+    config: { roles: { coder: { primary: { agent: "claude", model: null, effort: "high" } } }, ai: { model: "m1" } },
+    agents: { fullProbe: false, agents: [{ id: "claude", installed: true, models: [] }] },
+  };
+  view.droveAiRolePromptInput = { value: () => "prefer claude" };
+  view.droveUrlInput = { value: () => "http://127.0.0.1:3425/v1" };
+  view.droveKeyInput = { value: () => "" };
+  view.droveHcJson = async (args: string[]) => {
+    order.push(args.join(" "));
+    if (args[1] === "probe") {
+      return {
+        fullProbe: true,
+        agents: [{ id: "claude", installed: true, models: ["claude-opus-4-6"] }],
+      };
+    }
+    throw new Error(`unexpected hc call: ${args.join(" ")}`);
+  };
+  view.droveCallWithJsonFile = async (args: string[], payload: any) => {
+    order.push(`${args.join(" ")}:${payload.mode}`);
+    expect(view.hasCachedAgentModels()).toBe(true);
+    return { ok: true, modelUsed: "m1", latencyMs: 12, settings: view.droveData };
+  };
+
+  let spawned: Promise<void> | null = null;
+  const cx = {
+    notify() {},
+    spawn(fn: (cx: any) => Promise<void>) {
+      spawned = fn(cx);
+    },
+  };
+  view.aiConfigureDroveRoles("all", cx);
+  await spawned;
+
+  expect(order).toEqual(["drove probe --refresh", "drove roles-ai-config:all"]);
+  expect(view.droveAiConfigResult?.ok).toBe(true);
+  expect(view.droveAiConfigResult?.probedRefreshed).toBe(true);
+  expect(view.droveAiConfiguring).toBe(false);
+  expect(view.droveAiStage).toBeNull();
+});
+
+test("aiConfigureDroveRoles awaits in-flight probe instead of running a duplicate probe", async () => {
+  const view = new Settings();
+  const order: string[] = [];
+  let releaseProbe!: () => void;
+  const gate = new Promise<void>((resolve) => { releaseProbe = resolve; });
+
+  view.droveMachine = null;
+  view.droveData = {
+    config: { roles: { coder: { primary: { agent: "claude", model: null, effort: "high" } } }, ai: { model: "m1" } },
+    agents: { fullProbe: false, agents: [] },
+  };
+  view.droveAiRolePromptInput = { value: () => "" };
+  view.droveUrlInput = { value: () => "http://127.0.0.1:3425/v1" };
+  view.droveKeyInput = { value: () => "" };
+  view.droveHcJson = async (args: string[]) => {
+    order.push(args.join(" "));
+    await gate;
+    return {
+      fullProbe: true,
+      agents: [{ id: "codex", installed: true, models: ["gpt-5.4"] }],
+    };
+  };
+  view.droveCallWithJsonFile = async (args: string[]) => {
+    order.push(args.join(" "));
+    expect(view.hasCachedAgentModels()).toBe(true);
+    return { ok: true, modelUsed: "m1", latencyMs: 5, settings: view.droveData };
+  };
+
+  const pending: Promise<void>[] = [];
+  const cx = {
+    notify() {},
+    spawn(fn: (cx: any) => Promise<void>) {
+      pending.push(fn(cx));
+    },
+  };
+  view.probeDroveAgents(cx);
+  view.aiConfigureDroveRoles("models", cx);
+  expect(view.droveAiStage).toBe("probing");
+  releaseProbe();
+  await Promise.all(pending);
+
+  expect(order).toEqual(["drove probe --refresh", "drove roles-ai-config"]);
+  expect(view.droveAiConfigResult?.probedRefreshed).toBe(true);
+});

@@ -9,8 +9,15 @@ import {
 
 const source = await readFile(new URL("../defaults/mods/checkpoints/main.js", import.meta.url), "utf8");
 const helpersSource = source.slice(source.indexOf("const untab ="), source.indexOf("\nexport default class"));
-const { diffRows, parseUnifiedPatchLines, normalizeVisibleCheckpoints } = new Function(
-  `${helpersSource}; return { diffRows, parseUnifiedPatchLines, normalizeVisibleCheckpoints };`,
+const {
+  diffRows,
+  parseUnifiedPatchLines,
+  normalizeVisibleCheckpoints,
+  isManualCheckpointBookmark,
+  isCurrentCheckpoint,
+  formatCheckpointTooltip,
+} = new Function(
+  `const tr = (en, _zh) => en; ${helpersSource}; return { diffRows, parseUnifiedPatchLines, normalizeVisibleCheckpoints, isManualCheckpointBookmark, isCurrentCheckpoint, formatCheckpointTooltip };`,
 )();
 
 test("parseUnifiedPatchLines extracts multi-file checkpoint hunks cleanly for diffRows", () => {
@@ -96,4 +103,27 @@ test("Checkpoints multi-file patch annotation scopes Shift+Click ranges within o
     ],
   });
   expect(targets.defaultTarget).toBe("a7");
+});
+
+test("AI-labeled latest checkpoint remains Current while manual bookmarks stay restorable", () => {
+  const aiLatest = { turn: 4, label: "拆分存储锁并修复死锁", label_source: "ai", prompt: "继续" };
+  const manualBookmark = { turn: 4, label: "release-baseline", label_source: "manual", prompt: null };
+  const legacyManual = { turn: 4, label: "old-manual", prompt: null };
+
+  expect(isManualCheckpointBookmark(aiLatest)).toBe(false);
+  expect(isCurrentCheckpoint(aiLatest, 4, 4)).toBe(true);
+  expect(isManualCheckpointBookmark(manualBookmark)).toBe(true);
+  expect(isCurrentCheckpoint(manualBookmark, 4, 4)).toBe(false);
+  expect(isManualCheckpointBookmark(legacyManual)).toBe(true);
+  expect(isCurrentCheckpoint(legacyManual, 4, 4)).toBe(false);
+
+  const tip = formatCheckpointTooltip(aiLatest, 4);
+  expect(tip).toContain("拆分存储锁并修复死锁");
+  expect(tip).toContain("继续");
+});
+
+test("Checkpoints mod wires fault-introduction bisect bar and badges", () => {
+  expect(source).toContain('id("ckpt-bisect-bar")');
+  expect(source).toContain('id("ckpt-bisect-card")');
+  expect(source).toContain('"checkpoint", "bisect"');
 });
