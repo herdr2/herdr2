@@ -809,7 +809,14 @@ async fn handoff_to_new_pty(
             let core_bg = Arc::clone(core);
             let caller_bg = p.caller.clone();
             tokio::spawn(async move {
-                let _ = core_bg.pty_first_message(new_id, use_quiet, &msg, caller_bg.as_deref()).await;
+                let fm = core_bg.pty_first_message(new_id, use_quiet, &msg, caller_bg.as_deref()).await;
+                if !fm.sent {
+                    let mut st = core_bg.lock();
+                    if let Some(t) = st.pty_reg.terminals.get_mut(&new_id) {
+                        t.first_message = Some(fm);
+                        core_bg.save_pty(&st);
+                    }
+                }
             });
             prompt_sent = true;
         }

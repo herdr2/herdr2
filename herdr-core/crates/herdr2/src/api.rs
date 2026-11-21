@@ -1354,7 +1354,13 @@ async fn ai_briefing(
             if !a.is_live() || a.labels.get("herdr.trashed").is_some_and(|s| !s.is_empty()) {
                 continue;
             }
-            let status = a.status.as_ref().map(|s| s.state.clone()).unwrap_or_else(|| "idle".into());
+            let status = a
+                .labels
+                .get("herdr.status")
+                .filter(|s| !s.trim().is_empty())
+                .cloned()
+                .or_else(|| a.status.as_ref().map(|s| s.state.clone()))
+                .unwrap_or_else(|| "idle".into());
             let display_name = a
                 .labels
                 .get("herdr.name")
@@ -1434,7 +1440,13 @@ async fn ai_briefing(
             if !t.is_live() || t.labels.get("herdr.trashed").is_some_and(|s| !s.is_empty()) {
                 continue;
             }
-            let Some(status) = t.status.as_ref().map(|s| s.state.clone()) else {
+            let Some(status) = t
+                .labels
+                .get("herdr.status")
+                .filter(|s| !s.trim().is_empty())
+                .cloned()
+                .or_else(|| t.status.as_ref().map(|s| s.state.clone()))
+            else {
                 continue;
             };
             terms_out.push(crate::ai::BriefingTerminalInput {

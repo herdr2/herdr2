@@ -456,6 +456,18 @@ impl Core {
                     ));
                 }
                 let screen = st.screens.get(&id).expect("live terminal has a screen");
+                if first_task && !force {
+                    let text = crate::stitch::text(&screen.screen_rows());
+                    let non_empty: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+                    let tail = non_empty[non_empty.len().saturating_sub(24)..].join("\n");
+                    if crate::templates::is_pty_startup_dialog(&tail) {
+                        return Err(RpcError::new(
+                            "unavailable",
+                            format!("{} is showing a startup confirmation dialog", crate::terminals::address(id)),
+                            "waiting for the user to confirm the startup dialog before delivering the first message",
+                        ));
+                    }
+                }
                 // A template may say how its agent submits (default: Enter after 200 ms).
                 let submit = match &t.submit {
                     Some(key) => crate::keys::encode(screen, key)?,

@@ -139,6 +139,7 @@ export default class Agents extends View {
       this.coreBriefing = null;
       this.briefingError = "";
       this.workingExpanded = false;
+      this.idleExpanded = false;
       this.batchBusy = new Set();
       this.resolvedIds = new Set();
       this.replyInputs = new Map();
@@ -471,9 +472,16 @@ export default class Agents extends View {
 
   briefingView(t, cx) {
     const overlay = props()?.overlay;
+    const liveAgents = agents();
+    const liveTerms = terminals();
+    const liveAgentByAddr = new Map();
+    for (const a of liveAgents) if (a?.address) liveAgentByAddr.set(a.address, a);
+    const liveTermByAddr = new Map();
+    for (const r of liveTerms) if (r?.address) liveTermByAddr.set(r.address, r);
+
     const localSnap = buildLocalFallbackBriefing({
-      agents: agents(),
-      terminals: terminals(),
+      agents: liveAgents,
+      terminals: liveTerms,
       awayMinutes: this.awayMinutes,
       isZh: isZh(),
       now: Date.now(),
@@ -490,6 +498,60 @@ export default class Agents extends View {
     const decisions = (snap.pendingDecisions ?? []).filter((x) => !this.resolvedIds.has(x.id));
     const ready = (snap.readyToReview ?? []).filter((x) => !this.resolvedIds.has(x.id));
     const working = snap.workingItems ?? [];
+    const idle = snap.idleItems ?? [];
+
+    const liveStatusObj = (item) => {
+      const addr = item?.address;
+      if (!addr) return null;
+      const ag = liveAgentByAddr.get(addr);
+      const rec = liveTermByAddr.get(addr);
+      const manual_status = ag?.manual_status ?? rec?.manual_status ?? item.manualStatus ?? null;
+      const raw = manual_status ?? ag?.status ?? rec?.status ?? (item.status === "error" ? "blocked" : item.status) ?? "idle";
+      return {
+        status: raw === "error" ? "blocked" : raw,
+        manual_status,
+        ai_status_summary: ag?.ai_status_summary ?? rec?.ai_status_summary ?? null,
+        ai_status_kind: ag?.ai_status_kind ?? rec?.ai_status_kind ?? null,
+      };
+    };
+
+    const renderBriefingStatusBtn = (item) => {
+      const stObj = liveStatusObj(item);
+      if (!stObj || !item?.address) return null;
+      const addr = item.address;
+      const label = statusLabels()[stObj.status] ?? tr("Idle", "空闲");
+      const tip = tr(
+        `Status: ${label}${stObj.manual_status ? " (manual)" : ""} — click to change`,
+        `状态：${label}${stObj.manual_status ? "（手动）" : ""} — 点击手动修改`,
+      );
+      return h_flex()
+        .id(`br-status-${addr}`)
+        .h(24)
+        .px(7)
+        .gap(5)
+        .flex_none()
+        .items_center()
+        .rounded(6)
+        .bg(t.background)
+        .border_1()
+        .border_color(stObj.manual_status ? accent : t.border)
+        .cursor_pointer()
+        .hover((s) => s.bg(t.hover).border_color(accent))
+        .tooltip(tip)
+        .on_mouse_down("left", (_e, evCx) => evCx.stop_propagation())
+        .on_click((_e, evCx) => {
+          evCx.stop_propagation();
+          openOverlay({ mod: "agents", kind: "popup", width: 215, height: 220, props: { statusMenu: true, terminal: addr } });
+        })
+        .child(this.status(t, stObj, true))
+        .child(
+          div()
+            .text_size(10.5)
+            .font_medium()
+            .text_color(stObj.manual_status ? t.foreground : t.muted)
+            .child(stObj.manual_status ? `${label}·${tr("M", "手")}` : label),
+        );
+    };
 
     const pill = (text, color, bg) =>
       div()
@@ -537,8 +599,9 @@ export default class Agents extends View {
         .child(div().text_size(11.5).font_semibold().text_color(t.foreground).child(titleText))
         .child(div().text_size(11).text_color(t.dim).child(String(count)));
 
-    const renderItemCard = (item, badgeColor, buttons) =>
-      h_flex()
+    const renderItemCard = (item, badgeColor, buttons) => {
+      const statusCtrl = renderBriefingStatusBtn(item);
+      return h_flex()
         .id(`br-item-${item.id}`)
         .px(10)
         .py(8)
@@ -577,7 +640,15 @@ export default class Agents extends View {
             )
             .child(div().truncate().text_size(11.5).text_color(badgeColor ?? t.muted).child(item.summary)),
         )
-        .child(h_flex().gap(5).flex_none().items_center().children(buttons));
+        .child(
+          h_flex()
+            .gap(5)
+            .flex_none()
+            .items_center()
+            .children(buttons)
+            .when(Boolean(statusCtrl), (el) => el.child(statusCtrl)),
+        );
+    };
 
     const renderClusterCard = (g) => {
       const busy = this.batchBusy.has(g.clusterKey);
@@ -804,7 +875,8 @@ export default class Agents extends View {
               .child(pill(tr(`${blockers.length} Critical`, `${blockers.length} 异常阻塞`), blockers.length > 0 ? errColor : t.dim))
               .child(pill(tr(`${clusters.reduce((s, g) => s + g.addresses.length, 0) + decisions.length} Needs You`, `${clusters.reduce((s, g) => s + g.addresses.length, 0) + decisions.length} 待拍板`), clusters.length + decisions.length > 0 ? blockedColor : t.dim))
               .child(pill(tr(`${ready.length} Ready Diff`, `${ready.length} 可验收`), ready.length > 0 ? doneColor : t.dim))
-              .child(pill(tr(`${working.length} Working`, `${working.length} 进行中`), working.length > 0 ? workingColor : t.dim)),
+              .child(pill(tr(`${working.length} Working`, `${working.length} 进行中`), working.length > 0 ? workingColor : t.dim))
+              .when(idle.length > 0, (el) => el.child(pill(tr(`${idle.length} Idle`, `${idle.length} 空闲`), t.dim))),
           ),
       )
       // Scrollable body
@@ -899,6 +971,36 @@ export default class Agents extends View {
                   working.map((item) =>
                     renderItemCard(item, t.dim, [
                       actionBtn(`br-w-open-${item.id}`, tr("Peek", "查看"), () => this.focusBriefingTarget(item)),
+                    ]),
+                  ),
+                ),
+              ),
+          )
+          // 5. Idle (collapsible — keeps every sidebar agent visible & manually editable)
+          .when(idle.length > 0, (el) =>
+            el
+              .child(
+                h_flex()
+                  .id("br-sec-idle-toggle")
+                  .pt(6)
+                  .pb(2)
+                  .gap(6)
+                  .items_center()
+                  .cursor_pointer()
+                  .on_click((_e, evCx) => {
+                    this.idleExpanded = !this.idleExpanded;
+                    evCx?.notify?.();
+                  })
+                  .child(svg(`mods/workspace-chrome/chevron-${this.idleExpanded ? "down" : "right"}.svg`).size(12).text_color(t.dim))
+                  .child(div().size(7).rounded(4).border(1.5).border_color(t.idle ?? t.dim))
+                  .child(div().text_size(11.5).font_semibold().text_color(t.muted).child(tr("Idle", "空闲中")))
+                  .child(div().text_size(11).text_color(t.dim).child(String(idle.length))),
+              )
+              .when(this.idleExpanded, (el2) =>
+                el2.children(
+                  idle.map((item) =>
+                    renderItemCard(item, t.dim, [
+                      actionBtn(`br-i-open-${item.id}`, tr("Open", "打开"), () => this.focusBriefingTarget(item)),
                     ]),
                   ),
                 ),

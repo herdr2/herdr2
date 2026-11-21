@@ -172,24 +172,27 @@ export function buildLocalFallbackBriefing({
   const pendingDecisions = [];
   const readyToReview = [];
   const workingItems = [];
+  const idleItems = [];
   const permBuckets = new Map();
   const seen = new Set();
 
-  const processEntry = (addr, status, a, rec) => {
+  const processEntry = (addr, rawStatus, a, rec) => {
     if (!addr || seen.has(addr)) return;
     if (rec?.labels?.["herdr.trashed"] || rec?.state === "finished") return;
     seen.add(addr);
 
+    const manualStatus = a?.manual_status || rec?.manual_status || null;
+    const status = manualStatus || rawStatus || "idle";
     const machine = addr.includes("/") ? addr.split("/")[0] : null;
     const isAcp = Boolean(a?.acp ?? rec?.acp);
     const title = resolveSemanticLabel(a, rec, null, null);
     const micro = String(a?.micro_summary ?? rec?.micro_summary ?? "").trim();
-    const aiSummary = String(a?.ai_status_summary ?? rec?.ai_status_summary ?? "").trim();
-    const aiKind = String(a?.ai_status_kind ?? rec?.ai_status_kind ?? "").trim();
+    const aiSummary = !manualStatus ? String(a?.ai_status_summary ?? rec?.ai_status_summary ?? "").trim() : "";
+    const aiKind = !manualStatus ? String(a?.ai_status_kind ?? rec?.ai_status_kind ?? "").trim() : "";
     const perm = rec?.pending_permission ?? null;
     const spaceName = a?.space_name || rec?.labels?.where || null;
 
-    if (status === "error" || (status === "blocked" && aiKind === "error")) {
+    if (status === "error" || (!manualStatus && status === "blocked" && aiKind === "error")) {
       criticalBlockers.push({
         id: `${isAcp ? "agent" : "terminal"}:${addr}`,
         kind: "acp_error",
@@ -199,6 +202,7 @@ export function buildLocalFallbackBriefing({
         title,
         summary: micro || aiSummary || tr("Execution error needs investigation", "执行异常，建议优先排查"),
         status: "error",
+        manualStatus,
         blockedDownstreamCount: 0,
         blockedDownstreamKeys: [],
         hasDiff: false,
@@ -207,7 +211,7 @@ export function buildLocalFallbackBriefing({
     }
 
     if (status === "blocked") {
-      if (isAcp && perm) {
+      if (isAcp && perm && !manualStatus) {
         const { kind, key } = permissionClusterKey(perm);
         if (!permBuckets.has(key)) permBuckets.set(key, { kind, key, entries: [] });
         permBuckets.get(key).entries.push({ addr, title, perm, machine, spaceName });
@@ -221,6 +225,7 @@ export function buildLocalFallbackBriefing({
           title,
           summary: perm?.title || aiSummary || micro || tr("Waiting for your confirmation", "等待你的输入或确认"),
           status: "blocked",
+          manualStatus,
           blockedDownstreamCount: 0,
           blockedDownstreamKeys: [],
           permissionKind: perm?.kind ?? (aiKind || null),
@@ -241,6 +246,7 @@ export function buildLocalFallbackBriefing({
         title,
         summary: micro || aiSummary || tr("Completed — ready to inspect diff", "已完成，可检视改动 Diff"),
         status: "done",
+        manualStatus,
         blockedDownstreamCount: 0,
         blockedDownstreamKeys: [],
         hasDiff: true,
@@ -258,19 +264,39 @@ export function buildLocalFallbackBriefing({
         title,
         summary: micro || aiSummary || tr("Working in background", "后台推进中"),
         status: "working",
+        manualStatus,
         blockedDownstreamCount: 0,
         blockedDownstreamKeys: [],
         hasDiff: false,
       });
+      return;
     }
+
+    idleItems.push({
+      id: `${isAcp ? "agent" : "terminal"}:${addr}`,
+      kind: isAcp ? "acp_idle" : "pty_idle",
+      address: addr,
+      machine,
+      spaceName,
+      title,
+      summary: micro || tr("Idle and ready for next prompt", "空闲中，随时可发新指令"),
+      status: "idle",
+      manualStatus,
+      blockedDownstreamCount: 0,
+      blockedDownstreamKeys: [],
+      hasDiff: false,
+    });
   };
 
   for (const a of agents) {
-    processEntry(a.address, a.status, a, termByAddr.get(a.address) ?? null);
+    const rec = termByAddr.get(a.address) ?? null;
+    processEntry(a.address, a.manual_status || a.status || rec?.manual_status || rec?.status || "idle", a, rec);
   }
   for (const rec of terminals) {
-    if (rec?.state !== "live" || !rec?.status) continue;
-    processEntry(rec.address, rec.status, null, rec);
+    if (rec?.state !== "live") continue;
+    const eff = rec.manual_status || rec.status;
+    if (!eff && !rec.acp && !rec.program?.agent) continue;
+    processEntry(rec.address, eff || "idle", null, rec);
   }
 
   const permissionClusters = [];
@@ -298,6 +324,7 @@ export function buildLocalFallbackBriefing({
         title: e.title,
         summary: String(e.perm?.title || e.perm?.kind || tr("Approval needed", "需要权限审批")),
         status: "blocked",
+        manualStatus: null,
         blockedDownstreamCount: 0,
         blockedDownstreamKeys: [],
         permissionKind: e.perm?.kind ?? null,
@@ -314,6 +341,7 @@ export function buildLocalFallbackBriefing({
     batchGroups: permissionClusters.length,
     readyReview: readyToReview.length,
     working: workingItems.length,
+    idle: idleItems.length,
     totalActive:
       criticalBlockers.length + clusteredTotal + pendingDecisions.length + readyToReview.length + workingItems.length,
   };
@@ -350,15 +378,72 @@ export function buildLocalFallbackBriefing({
     pendingDecisions,
     readyToReview,
     workingItems,
+    idleItems,
+    knownAddresses: [...seen],
   };
 }
 
 /**
  * Merges Core's `ai.briefing` result (Drove DAG impact, unread worker questions, AI headline)
- * with local desktop terminal state (PTY `done` / `blocked` / `ai_status_summary`).
+ * with live desktop agent/terminal state so statuses (including manual overrides) stay 1:1
+ * in sync with the bottom-left Agents list without duplicating stale Core entries.
  */
 export function mergeBriefingSnapshots(local, core) {
   if (!core || typeof core !== "object") return local;
+
+  const localKnown = new Set(local?.knownAddresses ?? []);
+  const localBlockedAddrs = new Set();
+  for (const list of [
+    local?.criticalBlockers,
+    local?.pendingDecisions,
+    local?.readyToReview,
+    local?.workingItems,
+    local?.idleItems,
+  ]) {
+    for (const item of list ?? []) {
+      if (item?.address) localKnown.add(item.address);
+    }
+  }
+  for (const g of local?.permissionClusters ?? []) {
+    for (const addr of g?.addresses ?? []) {
+      localKnown.add(addr);
+      localBlockedAddrs.add(addr);
+    }
+  }
+  for (const item of local?.pendingDecisions ?? []) {
+    if (item?.address) localBlockedAddrs.add(item.address);
+  }
+
+  // Carry Core's DAG impact & diff metadata onto live desktop items without overriding their live status.
+  const coreMetaByAddr = new Map();
+  for (const list of [
+    core.criticalBlockers,
+    core.pendingDecisions,
+    core.readyToReview,
+    core.workingItems,
+  ]) {
+    for (const item of list ?? []) {
+      if (!item?.address || coreMetaByAddr.has(item.address)) continue;
+      coreMetaByAddr.set(item.address, item);
+    }
+  }
+  const enrichLocal = (items) =>
+    (items ?? []).map((item) => {
+      const cm = item?.address ? coreMetaByAddr.get(item.address) : null;
+      if (!cm) return item;
+      return {
+        ...item,
+        blockedDownstreamCount: Math.max(item.blockedDownstreamCount ?? 0, cm.blockedDownstreamCount ?? 0),
+        blockedDownstreamKeys:
+          item.blockedDownstreamKeys?.length > 0 ? item.blockedDownstreamKeys : (cm.blockedDownstreamKeys ?? []),
+        hasDiff: Boolean(item.hasDiff || cm.hasDiff),
+      };
+    });
+
+  // Only keep Core entries for non-address items (Drove tasks/questions) or remote addresses unknown locally.
+  const coreOnly = (items) =>
+    (items ?? []).filter((item) => !item?.address || !localKnown.has(item.address));
+
   const dedup = (primary, secondary) => {
     const seen = new Set();
     const out = [];
@@ -370,19 +455,33 @@ export function mergeBriefingSnapshots(local, core) {
     return out;
   };
 
-  const clusters = Array.isArray(core.permissionClusters) && core.permissionClusters.length > 0
-    ? core.permissionClusters
-    : (local?.permissionClusters ?? []);
+  const rawCoreClusters = Array.isArray(core.permissionClusters) ? core.permissionClusters : [];
+  const filteredCoreClusters = rawCoreClusters
+    .map((g) => {
+      const keptIdx = [];
+      (g.addresses ?? []).forEach((addr, idx) => {
+        if (!localKnown.has(addr) || localBlockedAddrs.has(addr)) keptIdx.push(idx);
+      });
+      if (keptIdx.length < 2) return null;
+      return {
+        ...g,
+        addresses: keptIdx.map((i) => g.addresses[i]),
+        labels: keptIdx.map((i) => g.labels?.[i] ?? g.addresses[i]),
+      };
+    })
+    .filter(Boolean);
+  const clusters = filteredCoreClusters.length > 0 ? filteredCoreClusters : (local?.permissionClusters ?? []);
   const clusteredAddrs = new Set(clusters.flatMap((g) => g.addresses ?? []));
 
-  const criticalBlockers = dedup(core.criticalBlockers, local?.criticalBlockers).sort(
+  const criticalBlockers = dedup(coreOnly(core.criticalBlockers), enrichLocal(local?.criticalBlockers)).sort(
     (a, b) => (b.blockedDownstreamCount ?? 0) - (a.blockedDownstreamCount ?? 0),
   );
-  const pendingDecisions = dedup(core.pendingDecisions, local?.pendingDecisions).filter(
+  const pendingDecisions = dedup(coreOnly(core.pendingDecisions), enrichLocal(local?.pendingDecisions)).filter(
     (it) => !it.address || !clusteredAddrs.has(it.address),
   );
-  const readyToReview = dedup(core.readyToReview, local?.readyToReview);
-  const workingItems = dedup(core.workingItems, local?.workingItems);
+  const readyToReview = dedup(coreOnly(core.readyToReview), enrichLocal(local?.readyToReview));
+  const workingItems = dedup(coreOnly(core.workingItems), enrichLocal(local?.workingItems));
+  const idleItems = enrichLocal(local?.idleItems);
 
   const clusteredTotal = clusters.reduce((s, g) => s + (g.addresses?.length ?? 0), 0);
   const counts = {
@@ -391,19 +490,29 @@ export function mergeBriefingSnapshots(local, core) {
     batchGroups: clusters.length,
     readyReview: readyToReview.length,
     working: workingItems.length,
+    idle: idleItems.length,
     totalActive:
       criticalBlockers.length + clusteredTotal + pendingDecisions.length + readyToReview.length + workingItems.length,
   };
 
+  const coreCountsMatch =
+    core.counts &&
+    core.counts.critical === counts.critical &&
+    core.counts.needsYou === counts.needsYou &&
+    core.counts.readyReview === counts.readyReview &&
+    core.counts.working === counts.working;
+
   return {
     generatedMs: core.generatedMs || local?.generatedMs || Date.now(),
-    headline: core.headline || local?.headline || "",
-    headlineFromAi: Boolean(core.headlineFromAi),
+    headline: coreCountsMatch && core.headline ? core.headline : (local?.headline || core.headline || ""),
+    headlineFromAi: Boolean(coreCountsMatch && core.headline && core.headlineFromAi),
     counts,
     criticalBlockers,
     permissionClusters: clusters,
     pendingDecisions,
     readyToReview,
     workingItems,
+    idleItems,
+    knownAddresses: [...localKnown],
   };
 }
