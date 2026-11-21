@@ -293,6 +293,17 @@ impl Core {
         if (change.turn_ended || change.stuck || first_task_finished) && st.pty_reg.terminals[&id].is_live() {
             self.pty_news(st, id);
         }
+        let is_live = st.pty_reg.terminals.get(&id).is_some_and(|t| t.is_live());
+        let needs_initial_title = st
+            .pty_reg
+            .terminals
+            .get(&id)
+            .is_some_and(|t| t.turn > 0 && t.semantic_title.is_none());
+        if is_live && (change.turn_ended || change.stuck || first_task_finished) {
+            self.spawn_pty_digest_ai_locked(st, id, std::time::Duration::from_secs(15), None);
+        } else if is_live && change.status && needs_initial_title {
+            self.spawn_pty_digest_ai_locked(st, id, std::time::Duration::from_secs(30), None);
+        }
         crate::pty_adapters::on_pty_status_transition(self, st, id, &change);
     }
 

@@ -24,7 +24,7 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Duration;
 
 const BRIEFING_CACHE_TTL: Duration = Duration::from_secs(60);
-const BRIEFING_TIMEOUT: Duration = Duration::from_secs(6);
+const BRIEFING_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -756,10 +756,10 @@ pub async fn enhance_briefing_headline(
     if let Some(resp) = ai
         .complete_bg(AiCompleteRequest {
             op: "catchup_briefing".into(),
-            tier: AiTaskTier::Fast,
+            tier: AiTaskTier::Nano,
             mode: AiConversationMode::StatelessSharedPrefix,
             user_prompt,
-            max_tokens: 140,
+            max_tokens: 512,
             timeout: BRIEFING_TIMEOUT,
             cache_key: Some(cache_key),
             cache_ttl: Some(BRIEFING_CACHE_TTL),

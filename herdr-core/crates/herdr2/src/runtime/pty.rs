@@ -642,6 +642,7 @@ impl Core {
         let Some(was) = st.pty_reg.terminals.remove(&id) else { return };
         st.pty_prompts.remove(&id);
         st.pty_respawning.remove(&id);
+        st.pty_digest_last_ai.remove(&id);
         self.emit_pty_from(st, "removed", id, serde_json::json!({}), Some(&was));
         let _ = std::fs::remove_file(self.snapshot_path(id));
         let _ = std::fs::remove_dir_all(crate::put::terminal_dir(&self.paths.state, id));

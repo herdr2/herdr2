@@ -4607,6 +4607,13 @@
             ],
             "description": "Context handoff / fork / side-chat parent lineage."
           },
+          "micro_summary": {
+            "description": "One-sentence real-time progress micro-summary (<= 96 chars) for zero-click hover tooltips.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "name": {
             "type": [
               "string",
@@ -4675,6 +4682,13 @@
           "screen": {
             "description": "\"exact\", or \"inexact\" after a core crash (older history may be missing).",
             "type": "string"
+          },
+          "semantic_title": {
+            "description": "Concise semantic task label derived from transcript/AI (<= 24 chars); never overrides explicit user rename.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "signal": {
             "format": "int32",
@@ -4941,6 +4955,13 @@
             ],
             "description": "Context handoff / fork / side-chat parent lineage."
           },
+          "micro_summary": {
+            "description": "One-sentence real-time progress micro-summary (<= 96 chars) for zero-click hover tooltips.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "name": {
             "type": [
               "string",
@@ -5015,6 +5036,13 @@
           "screen": {
             "description": "\"exact\", or \"inexact\" after a core crash (older history may be missing).",
             "type": "string"
+          },
+          "semantic_title": {
+            "description": "Concise semantic task label derived from transcript/AI (<= 24 chars); never overrides explicit user rename.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "signal": {
             "format": "int32",

@@ -198,7 +198,7 @@ export default class Agents extends View {
   scheduleHoverDigest(addr, rec, cx) {
     this.hoverDigestTask?.cancel?.();
     this.hoverDigestTask = null;
-    if (!addr || !rec?.acp || typeof h2 !== "function" || (typeof checking === "function" && checking())) return;
+    if (!addr || !rec || typeof h2 !== "function" || (typeof checking === "function" && checking())) return;
     if (this.digestInflight?.has(addr)) return;
     const now = Date.now();
     const last = this.digestLastFetch?.get(addr) ?? 0;

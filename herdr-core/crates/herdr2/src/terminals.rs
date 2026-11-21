@@ -150,6 +150,12 @@ pub struct Terminal {
     /// Context handoff / fork / side-chat parent lineage.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lineage: Option<crate::handoff::Lineage>,
+    /// Concise semantic task label derived from transcript/AI (<= 24 chars); never overrides explicit user rename.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub semantic_title: Option<String>,
+    /// One-sentence real-time progress micro-summary (<= 96 chars) for zero-click hover tooltips.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub micro_summary: Option<String>,
 }
 
 impl Terminal {
@@ -328,6 +334,8 @@ impl Registry {
                 first_message: None,
                 holder: None,
                 lineage: new.lineage,
+                semantic_title: None,
+                micro_summary: None,
             },
         );
         Ok(id)

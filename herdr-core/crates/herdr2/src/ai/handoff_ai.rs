@@ -17,8 +17,8 @@ use crate::transcript::{Entry, strip_h2_envelope};
 
 const MAX_DISTILL_INPUT_BYTES: usize = 14 * 1024;
 const MAX_RECOMMEND_INPUT_BYTES: usize = 6 * 1024;
-const DISTILL_TIMEOUT: Duration = Duration::from_secs(8);
-const RECOMMEND_TIMEOUT: Duration = Duration::from_secs(5);
+const DISTILL_TIMEOUT: Duration = Duration::from_secs(15);
+const RECOMMEND_TIMEOUT: Duration = Duration::from_secs(12);
 const DISTILL_CACHE_TTL: Duration = Duration::from_secs(900);
 const RECOMMEND_CACHE_TTL: Duration = Duration::from_secs(60);
 
@@ -676,10 +676,10 @@ pub async fn recommend_handoff(
     let Ok(resp) = ai
         .complete(AiCompleteRequest {
             op: "handoff_recommend".into(),
-            tier: AiTaskTier::Fast,
+            tier: AiTaskTier::Nano,
             mode: AiConversationMode::StatelessSharedPrefix,
             user_prompt,
-            max_tokens: 180,
+            max_tokens: 512,
             timeout: RECOMMEND_TIMEOUT,
             cache_key: Some(cache_key),
             cache_ttl: Some(RECOMMEND_CACHE_TTL),

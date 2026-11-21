@@ -140,6 +140,8 @@ pub struct State {
     pub checkpoints: HashMap<String, crate::checkpoint::TargetCheckpoints>,
     /// Per-agent throttle timestamp for background AI semantic digest refreshes.
     pub digest_last_ai: HashMap<u32, Instant>,
+    /// Per-terminal throttle timestamp for background AI semantic digest refreshes.
+    pub pty_digest_last_ai: HashMap<u32, Instant>,
 }
 
 const SAVE_SOON: Duration = Duration::from_secs(2);
@@ -547,7 +549,127 @@ impl Core {
             .await;
             if refined.used_ai {
                 let mut st = core.lock();
-                core.apply_digest(&mut st, id, refined.semantic_title, refined.micro_summary, existing.is_some());
+                core.apply_digest(&mut st, id, refined.semantic_title, refined.micro_summary, false);
+            }
+        });
+    }
+
+    /// Updates a live PTY terminal's `semantic_title` / `micro_summary` and emits a `"digest"` event.
+    pub fn apply_pty_digest(
+        &self,
+        st: &mut State,
+        id: u32,
+        semantic_title: Option<String>,
+        micro_summary: Option<String>,
+        preserve_title: bool,
+    ) {
+        let payload = {
+            let Some(t) = st.pty_reg.terminals.get_mut(&id).filter(|t| t.is_live()) else {
+                return;
+            };
+            let next_title = if preserve_title && t.semantic_title.is_some() {
+                t.semantic_title.clone()
+            } else {
+                semantic_title.or_else(|| t.semantic_title.clone())
+            };
+            let next_summary = micro_summary.or_else(|| t.micro_summary.clone());
+            if t.semantic_title == next_title && t.micro_summary == next_summary {
+                return;
+            }
+            t.semantic_title = next_title.clone();
+            t.micro_summary = next_summary.clone();
+            serde_json::json!({
+                "semantic_title": next_title,
+                "micro_summary": next_summary,
+            })
+        };
+        self.emit_pty(st, "digest", id, payload);
+        self.save_pty_soon();
+    }
+
+    /// Spawns a throttled, lock-free background Core AI digest refinement for a live PTY terminal.
+    /// Safe to invoke while holding `&mut State` (does not re-acquire `self.lock()` synchronously).
+    pub fn spawn_pty_digest_ai_locked(
+        &self,
+        st: &mut State,
+        id: u32,
+        min_interval: Duration,
+        language: Option<String>,
+    ) {
+        let Some(core) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
+            return;
+        };
+        let Ok(rt_handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let cfg = self.ai.config_snapshot();
+        if !cfg.enabled || !cfg.semantic_summary || cfg.base_url.trim().is_empty() || self.ai.is_circuit_open() {
+            return;
+        }
+        let now = Instant::now();
+        if st
+            .pty_digest_last_ai
+            .get(&id)
+            .is_some_and(|last| now.saturating_duration_since(*last) < min_interval)
+        {
+            return;
+        }
+        let Some(t) = st.pty_reg.terminals.get(&id).filter(|t| t.is_live()).cloned() else {
+            return;
+        };
+        // Skip bare shells that have never reported status, completed a turn, or received prompts.
+        let has_prompts = st.pty_prompts.get(&id).is_some_and(|p| !p.is_empty());
+        if t.turn == 0 && !t.reported && !has_prompts {
+            return;
+        }
+        st.pty_digest_last_ai.insert(id, now);
+        let mut snap = crate::pty_transcript::snapshot_from_terminal(&t, st.pty_prompts.get(&id));
+        let addr = t.address.clone();
+        crate::pty_transcript::populate_session_affinity(&mut snap, &addr, &core, st);
+        let program = t.argv.first().cloned().unwrap_or_else(|| "terminal".into());
+        let status = t.status.as_ref().map(|s| s.state.clone()).unwrap_or_else(|| "idle".into());
+        let turn = t.turn.max(1);
+        let existing = t.semantic_title.clone();
+
+        rt_handle.spawn(async move {
+            let Ok((entries, _)) =
+                tokio::task::spawn_blocking(move || crate::pty_transcript::extract_transcript(&snap)).await
+            else {
+                return;
+            };
+            if entries.is_empty() {
+                return;
+            }
+            let is_zh = language
+                .as_deref()
+                .is_some_and(|l| l.to_ascii_lowercase().starts_with("zh"));
+            let det = crate::ai::build_deterministic_acp_digest(
+                &status,
+                turn,
+                None,
+                &entries,
+                existing.as_deref(),
+                is_zh,
+            );
+            let refined = crate::ai::refine_agent_digest(
+                &core.ai,
+                &addr,
+                &program,
+                &status,
+                &det,
+                existing.as_deref(),
+                language.as_deref(),
+            )
+            .await;
+            if refined.used_ai || (existing.is_none() && refined.semantic_title.is_some()) {
+                let mut st = core.lock();
+                core.apply_pty_digest(
+                    &mut st,
+                    id,
+                    refined.semantic_title,
+                    refined.micro_summary,
+                    !refined.used_ai,
+                );
             }
         });
     }

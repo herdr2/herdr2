@@ -1443,6 +1443,8 @@ async fn ai_briefing(
                 status,
                 space_name: t.labels.get("where").cloned(),
                 cwd: Some(t.cwd.clone()),
+                semantic_title: t.semantic_title.clone(),
+                micro_summary: t.micro_summary.clone(),
                 ..Default::default()
             });
         }
@@ -1550,7 +1552,7 @@ async fn ai_summarize_agent(
             Ok(result)
         }
         TargetKey::Terminal(id) => {
-            let (addr, program, status, title, snap) = {
+            let (addr, program, status, turn, existing, snap) = {
                 let mut st = core.lock();
                 let t = st
                     .pty_reg
@@ -1563,11 +1565,19 @@ async fn ai_summarize_agent(
                 crate::pty_transcript::populate_session_affinity(&mut snap, &addr, core, &mut st);
                 let program = t.argv.first().cloned().unwrap_or_else(|| "terminal".into());
                 let status = t.status.as_ref().map(|s| s.state.clone()).unwrap_or_else(|| "idle".into());
-                (addr, program, status, t.title.clone(), snap)
+                let turn = t.turn.max(1);
+                let existing = t.semantic_title.clone();
+                (addr, program, status, turn, existing, snap)
             };
             let (entries, _) = blocking(move || Ok(crate::pty_transcript::extract_transcript(&snap))).await?;
-            let existing = (!title.trim().is_empty()).then_some(title.as_str());
-            let det = crate::ai::build_deterministic_acp_digest(&status, 1, None, &entries, existing, is_zh);
+            let det = crate::ai::build_deterministic_acp_digest(
+                &status,
+                turn,
+                None,
+                &entries,
+                existing.as_deref(),
+                is_zh,
+            );
             let result = if p.include_ai {
                 crate::ai::refine_agent_digest(
                     &core.ai,
@@ -1575,7 +1585,7 @@ async fn ai_summarize_agent(
                     &program,
                     &status,
                     &det,
-                    existing,
+                    existing.as_deref(),
                     p.language.as_deref(),
                 )
                 .await
@@ -1588,6 +1598,16 @@ async fn ai_summarize_agent(
                     from_cache: false,
                 }
             };
+            if result.semantic_title.is_some() || result.micro_summary.is_some() {
+                let mut st = core.lock();
+                core.apply_pty_digest(
+                    &mut st,
+                    id,
+                    result.semantic_title.clone(),
+                    result.micro_summary.clone(),
+                    !result.used_ai,
+                );
+            }
             Ok(result)
         }
     }

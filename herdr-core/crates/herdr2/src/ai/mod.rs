@@ -743,16 +743,17 @@ impl AiRuntime {
         let use_shared_prefix = cfg.prompt_cache_enabled && !small_ctx;
 
         let cfg_effort = cfg.effort.trim();
-        let effective_effort = match cfg_effort {
-            "high" | "medium" | "none" => cfg_effort,
-            "low" => match req.tier {
-                AiTaskTier::Nano => "none",
-                AiTaskTier::Fast | AiTaskTier::Standard => "low",
+        let effective_effort = match req.tier {
+            // Nano tasks (pty_status, agent_digest, route_candidate) have tight latency/token
+            // budgets; never let global high/medium reasoning effort burn tokens in thinking.
+            AiTaskTier::Nano => "none",
+            AiTaskTier::Fast => match cfg_effort {
+                "none" => "none",
+                _ => "low",
             },
-            _ => match req.tier {
-                AiTaskTier::Nano => "none",
-                AiTaskTier::Fast => "low",
-                AiTaskTier::Standard => "auto",
+            AiTaskTier::Standard => match cfg_effort {
+                "high" | "medium" | "low" | "none" => cfg_effort,
+                _ => "auto",
             },
         };
         let cap_strict = cfg.max_tokens.is_none() && matches!(req.tier, AiTaskTier::Nano | AiTaskTier::Fast);
@@ -915,8 +916,15 @@ impl AiRuntime {
                         || raw_content.contains("<tool_use")
                         || raw_content.contains("DSML")
                     {
+                        let finish_reason = parsed["choices"][0]["finish_reason"]
+                            .as_str()
+                            .unwrap_or("");
                         let reason = if raw_content.is_empty() {
-                            "empty assistant content"
+                            if finish_reason == "length" {
+                                "empty assistant content (finish_reason=length)"
+                            } else {
+                                "empty assistant content"
+                            }
                         } else {
                             "unexpected tool-call markup in content"
                         };
@@ -1296,6 +1304,74 @@ mod tests {
         assert_eq!(st.usage.sessions_reused, 1);
         assert_eq!(st.usage.cached_input_tokens, 2620);
         assert!(st.usage.cache_hit_ratio > 0.55);
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn nano_and_fast_tiers_cap_reasoning_effort_even_when_global_effort_is_high() {
+        let tmp = crate::test_tmp().join(format!("ai-effort-{}", crate::platform::random_hex()));
+        let paths = Paths {
+            socket: tmp.join("core.sock"),
+            holder_socket: tmp.join("holder.sock"),
+            state: tmp.join("state"),
+            config: tmp.join("config/config.toml"),
+        };
+        paths.create_dirs().unwrap();
+
+        let (url, captured) = spawn_mock_openai(vec![
+            (200, r#"{"choices":[{"message":{"content":"{\"semantic_title\":\"修复重命名\",\"micro_summary\":\"已完成测试\"}"}}]}"#.into()),
+            (200, r#"{"choices":[{"message":{"content":"{\"headline\":\"all good\"}"}}]}"#.into()),
+            (200, r#"{"choices":[{"message":{"content":"{\"ok\":true}"}}]}"#.into()),
+        ])
+        .await;
+
+        let rt = AiRuntime::open(&paths).unwrap();
+        rt.update_settings(AiSettingsSetParams {
+            enabled: Some(true),
+            base_url: Some(url),
+            model: Some("reasoning-model".into()),
+            effort: Some("high".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        rt.complete(AiCompleteRequest {
+            op: "agent_digest".into(),
+            tier: AiTaskTier::Nano,
+            user_prompt: "digest".into(),
+            max_tokens: 180,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        rt.complete(AiCompleteRequest {
+            op: "catchup_briefing".into(),
+            tier: AiTaskTier::Fast,
+            user_prompt: "brief".into(),
+            max_tokens: 200,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        rt.complete(AiCompleteRequest {
+            op: "task_diagnose".into(),
+            tier: AiTaskTier::Standard,
+            user_prompt: "diagnose".into(),
+            max_tokens: 400,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 3);
+        assert_eq!(reqs[0]["reasoning_effort"], "none");
+        assert_eq!(reqs[1]["reasoning_effort"], "low");
+        assert_eq!(reqs[2]["reasoning_effort"], "high");
 
         let _ = std::fs::remove_dir_all(tmp);
     }

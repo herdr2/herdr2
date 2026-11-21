@@ -16,7 +16,7 @@ use serde_json::json;
 use std::time::Duration;
 
 const DIGEST_CACHE_TTL: Duration = Duration::from_secs(300);
-const DIGEST_TIMEOUT: Duration = Duration::from_secs(5);
+const DIGEST_TIMEOUT: Duration = Duration::from_secs(12);
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -306,7 +306,7 @@ pub async fn refine_agent_digest(
             tier: AiTaskTier::Nano,
             mode: AiConversationMode::StatelessSharedPrefix,
             user_prompt,
-            max_tokens: 96,
+            max_tokens: 512,
             timeout: DIGEST_TIMEOUT,
             cache_key: Some(cache_key),
             cache_ttl: Some(DIGEST_CACHE_TTL),

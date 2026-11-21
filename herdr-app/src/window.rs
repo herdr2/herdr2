@@ -610,6 +610,10 @@ pub struct AppWindow {
     ai_inflight: HashSet<String>,
     /// Per-terminal throttle timestamp for semantic status arbitration.
     ai_last_attempt: HashMap<String, Instant>,
+    /// Agent/terminal addresses currently awaiting an in-flight `ai.summarize_agent` RPC.
+    ai_digest_inflight: HashSet<String>,
+    /// Last `(turn, Instant)` attempted for automatic `ai.summarize_agent` backfill.
+    ai_digest_attempted: HashMap<String, (u64, Instant)>,
     /// Backoff deadline when local Core AI is unconfigured or disabled.
     ai_unavailable_until: Option<Instant>,
     /// Monotonic counter for `files.open` requests routed to the Files panel.
@@ -742,6 +746,8 @@ impl AppWindow {
             ai_terminal_states: HashMap::new(),
             ai_inflight: HashSet::new(),
             ai_last_attempt: HashMap::new(),
+            ai_digest_inflight: HashSet::new(),
+            ai_digest_attempted: HashMap::new(),
             ai_unavailable_until: None,
             file_open_seq: 0,
             listed_once: false,
@@ -3261,6 +3267,108 @@ impl AppWindow {
         changed
     }
 
+    /// Lazily backfills `semantic_title` / `micro_summary` via Core's `ai.summarize_agent`
+    /// for live ACP and PTY CLI agent sessions that do not have a semantic title yet
+    /// (for example already-running sessions right after app launch or core restart).
+    fn refresh_missing_semantic_digests(&mut self, cx: &mut Context<Self>) {
+        let now = Instant::now();
+        if !self.core.supports_ai() || self.ai_unavailable_until.is_some_and(|until| now < until) {
+            return;
+        }
+        let mut jobs: Vec<(String, u64)> = Vec::new();
+        for addr in &self.live_order {
+            if self.ai_digest_inflight.len() + jobs.len() >= 2 {
+                break;
+            }
+            if self.closing_terminals.contains_key(addr) || self.ai_digest_inflight.contains(addr) {
+                continue;
+            }
+            let Some(rec) = self.live.get(addr) else {
+                continue;
+            };
+            if rec.pointer("/labels/herdr.trashed").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) {
+                continue;
+            }
+            let is_agent = rec.get("acp").and_then(Value::as_bool) == Some(true)
+                || rec.pointer("/program/agent").and_then(Value::as_bool) == Some(true)
+                || rec.get("reported").and_then(Value::as_bool) == Some(true);
+            if !is_agent {
+                continue;
+            }
+            let has_title = rec
+                .get("semantic_title")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty());
+            if has_title {
+                continue;
+            }
+            let turn = rec.get("turn").and_then(Value::as_u64).unwrap_or(0);
+            if let Some((prev_turn, last_at)) = self.ai_digest_attempted.get(addr)
+                && *prev_turn == turn
+                && now.saturating_duration_since(*last_at) < Duration::from_secs(90)
+            {
+                continue;
+            }
+            jobs.push((addr.clone(), turn));
+        }
+
+        for (addr, turn) in jobs {
+            self.ai_digest_inflight.insert(addr.clone());
+            self.ai_digest_attempted.insert(addr.clone(), (turn, now));
+            let core = self.core.clone();
+            let language = self.person.language.clone();
+            let params = json!({
+                "target": addr,
+                "language": language,
+            });
+            cx.spawn(async move |this, cx| {
+                let res = cx.background_executor().spawn(async move { core.summarize_agent(params) }).await;
+                let _ = this.update(cx, |this, cx| {
+                    this.ai_digest_inflight.remove(&addr);
+                    let Ok(val) = res else {
+                        return;
+                    };
+                    let semantic_title = val
+                        .get("semanticTitle")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    let micro_summary = val
+                        .get("microSummary")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                    if semantic_title.is_none() && micro_summary.is_none() {
+                        return;
+                    }
+                    let mut updated = false;
+                    if let Some(obj) = this.live.get_mut(&addr).and_then(Value::as_object_mut) {
+                        if let Some(st) = semantic_title {
+                            if obj.get("semantic_title").and_then(Value::as_str) != Some(st.as_str()) {
+                                obj.insert("semantic_title".into(), Value::String(st));
+                                updated = true;
+                            }
+                        }
+                        if let Some(ms) = micro_summary {
+                            if obj.get("micro_summary").and_then(Value::as_str) != Some(ms.as_str()) {
+                                obj.insert("micro_summary".into(), Value::String(ms));
+                                updated = true;
+                            }
+                        }
+                    }
+                    if updated {
+                        mods::publish_terminals(this.ordered_live_values());
+                        this.refresh_snapshot_mods(cx);
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+    }
+
     fn best_terminal_view(&self, address: &str, cx: &App) -> Option<Entity<TerminalView>> {
         let own_pane = self.model.pane_of(address);
         self.terms
@@ -3348,6 +3456,7 @@ impl AppWindow {
         self.manual_statuses.retain(|a, _| self.live.contains_key(a));
         self.ai_terminal_states.retain(|a, _| self.live.contains_key(a));
         self.ai_last_attempt.retain(|a, _| self.live.contains_key(a));
+        self.ai_digest_attempted.retain(|a, _| self.live.contains_key(a));
         self.closing_terminals.retain(|addr, completed| !*completed || self.live.contains_key(addr));
         // Seed `manual_status` on live records before inferring or publishing `terminals()`.
         let addrs: Vec<String> = self.live.keys().cloned().collect();
@@ -3358,6 +3467,7 @@ impl AppWindow {
             }
         }
         self.refresh_inferred_statuses(cx);
+        self.refresh_missing_semantic_digests(cx);
         // A new sub-agent or updated inferred state changes `terminals()`.
         let terminals_changed = mods::publish_terminals(self.ordered_live_values());
         self.tend_terminals(true, window, cx);
@@ -3397,6 +3507,9 @@ impl AppWindow {
         }
         if (!listed || manual_released) && self.refresh_inferred_statuses(cx) {
             republished = true;
+        }
+        if !listed {
+            self.refresh_missing_semantic_digests(cx);
         }
         for addr in addrs {
             if self.closing_terminals.contains_key(&addr) {

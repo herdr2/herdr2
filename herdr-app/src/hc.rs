@@ -216,7 +216,7 @@ impl EventLines {
             }
             "turn" => set(&["turn"]),
             "title" => set(&["title"]),
-            "digest" if is_agent => set(&["semantic_title", "micro_summary"]),
+            "digest" => set(&["semantic_title", "micro_summary"]),
             "labels" => set(&["labels"]),
             "keep" => set(&["keep"]),
             "size" => set(&["cols", "rows"]),
@@ -566,7 +566,7 @@ impl Core {
 
     /// Requests an adaptive semantic title + micro-summary refresh (`ai.summarize_agent`).
     pub fn summarize_agent(&self, params: Value) -> Result<Value> {
-        self.call_timeout("ai.summarize_agent", params, Duration::from_secs(8))
+        self.call_timeout("ai.summarize_agent", params, Duration::from_secs(15))
     }
 
     pub fn call_timeout(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
