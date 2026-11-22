@@ -546,6 +546,15 @@ impl TerminalView {
         }
     }
 
+    /// Clears a leftover CLI agent title after returning to an interactive shell.
+    pub fn clear_title(&mut self, cx: &mut Context<Self>) {
+        self.raw_title.clear();
+        if !self.title.is_empty() {
+            self.title.clear();
+            cx.emit(TerminalEvent::TitleChanged);
+        }
+    }
+
     pub fn last_typed_at(&self) -> Option<Instant> {
         self.typed_at.get()
     }

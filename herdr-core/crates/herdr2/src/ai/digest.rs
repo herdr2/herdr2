@@ -26,6 +26,9 @@ pub struct SummarizeAgentParams {
     /// Preferred UI language (`zh-CN` / `en`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// Optional client-inferred status (`working`, `blocked`, `done`, `idle`) for non-7501 PTY CLIs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
     /// Skip AI call and return only deterministic summary when false (default true).
     #[serde(default = "default_true")]
     pub include_ai: bool,
@@ -54,8 +57,29 @@ pub struct AgentDigestResult {
 pub struct DeterministicDigest {
     pub semantic_title: Option<String>,
     pub micro_summary: Option<String>,
+    /// Initial conversation task hint (first meaningful user prompt).
+    pub initial_task_hint: String,
+    /// Latest substantive user intent (skipping trivial follow-up commands when earlier recent turns exist).
     pub task_hint: String,
+    /// Chronological list of the user's recent few turns (up to 5, oldest -> newest).
+    pub recent_user_turns: Vec<String>,
     pub recent_steps: Vec<String>,
+}
+
+/// Returns true when text contains CJK Unified Ideographs (used for language auto-detection when unspecified).
+pub fn has_cjk(s: &str) -> bool {
+    s.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c))
+}
+
+/// Returns true when recent transcript entries contain CJK text.
+pub fn entries_prefer_zh(entries: &[Entry]) -> bool {
+    entries.iter().rev().take(12).any(|e| match e {
+        Entry::User { text, .. } | Entry::Assistant { text, .. } => has_cjk(text),
+        Entry::ToolCall { title, .. } => has_cjk(title),
+        Entry::Plan { items, .. } => items.iter().any(|i| has_cjk(i)),
+        Entry::Error { message, .. } => has_cjk(message),
+        _ => false,
+    })
 }
 
 /// Strips leading `<h2 ...>...</h2` / `<h2 ...>` wrapper tags and normalizes whitespace.
@@ -112,7 +136,101 @@ fn first_meaningful_line(raw: &str) -> Option<String> {
     None
 }
 
-/// Pure, 0ms deterministic digest derived from structured ACP transcript entries.
+const MAX_RECENT_USER_TURNS: usize = 5;
+
+/// Returns true when a short user utterance is merely a generic confirmation, continuation,
+/// or build/test/install follow-up that advances the preceding task rather than introducing a new intent.
+pub(crate) fn is_followup_meta_prompt(raw: &str) -> bool {
+    let trimmed = raw
+        .trim()
+        .trim_end_matches(['.', '!', '?', '。', '！', '？', '~', '～', ' ']);
+    if trimmed.is_empty() {
+        return true;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if matches!(
+        lower.as_str(),
+        "ok" | "okay"
+            | "yes"
+            | "y"
+            | "go"
+            | "go ahead"
+            | "continue"
+            | "proceed"
+            | "retry"
+            | "try again"
+            | "lgtm"
+            | "looks good"
+            | "sure"
+            | "thanks"
+            | "thank you"
+            | "thx"
+            | "build"
+            | "rebuild"
+            | "install"
+            | "build and install"
+            | "compile"
+            | "test"
+            | "run tests"
+            | "run test"
+            | "commit"
+            | "push"
+            | "git push"
+            | "好"
+            | "好的"
+            | "可以"
+            | "可以的"
+            | "行"
+            | "行的"
+            | "嗯"
+            | "是"
+            | "是的"
+            | "对"
+            | "继续"
+            | "继续吧"
+            | "开始"
+            | "开始吧"
+            | "执行"
+            | "执行吧"
+            | "确认"
+            | "同意"
+            | "没问题"
+            | "重试"
+            | "再试一次"
+            | "再来"
+            | "谢谢"
+            | "编译"
+            | "重新编译"
+            | "编译一下"
+            | "安装"
+            | "编译安装"
+            | "编译安装一下"
+            | "编译安装最新版"
+            | "编译安装最新版本"
+            | "编译安装最新的版本"
+            | "编译并安装"
+            | "编译并安装最新版"
+            | "编译并安装最新版本"
+            | "测试"
+            | "测试一下"
+            | "跑测试"
+            | "跑下测试"
+            | "跑一下测试"
+            | "运行测试"
+            | "提交"
+            | "提交代码"
+            | "推送"
+            | "推送代码"
+    ) {
+        return true;
+    }
+    false
+}
+
+/// Pure, 0ms deterministic digest derived from structured ACP/PTY transcript entries.
+/// Captures the user's recent few turns (`recent_user_turns`) and latest execution steps so
+/// `semantic_title` reflects the true intent of recent conversation turns rather than Turn 1
+/// or trivial follow-ups like "continue" / "build & install".
 pub fn build_deterministic_acp_digest(
     status: &str,
     turn: u64,
@@ -121,46 +239,71 @@ pub fn build_deterministic_acp_digest(
     existing_title: Option<&str>,
     is_zh: bool,
 ) -> DeterministicDigest {
-    let mut task_hint = String::new();
+    let mut initial_task_hint = String::new();
+    let mut all_user_turns: Vec<String> = Vec::new();
     for entry in entries {
         if let Entry::User { text, .. } = entry {
             let clean = strip_h2_envelope(text);
             if let Some(line) = first_meaningful_line(&clean) {
-                task_hint = line;
-                break;
+                if initial_task_hint.is_empty() {
+                    initial_task_hint = line.clone();
+                }
+                if let Some(bounded) = clean_bounded(Some(&line), 120) {
+                    all_user_turns.push(bounded);
+                }
             }
         }
     }
+    let recent_user_turns: Vec<String> = if all_user_turns.len() > MAX_RECENT_USER_TURNS {
+        all_user_turns.split_off(all_user_turns.len() - MAX_RECENT_USER_TURNS)
+    } else {
+        all_user_turns
+    };
+    let latest_raw_user = recent_user_turns.last().cloned().unwrap_or_default();
+    let latest_substantive_user = recent_user_turns
+        .iter()
+        .rev()
+        .find(|u| !is_followup_meta_prompt(u))
+        .cloned()
+        .unwrap_or_else(|| latest_raw_user.clone());
+    let mut task_hint = if !latest_substantive_user.is_empty() {
+        latest_substantive_user.clone()
+    } else {
+        initial_task_hint.clone()
+    };
     if task_hint.is_empty()
         && let Some(et) = existing_title.map(str::trim).filter(|s| !s.is_empty())
     {
         task_hint = et.to_string();
     }
 
-    let semantic_title = existing_title
-        .and_then(|s| clean_bounded(Some(s), 24))
+    let semantic_title = clean_bounded((!latest_substantive_user.is_empty()).then_some(latest_substantive_user.as_str()), 22)
+        .or_else(|| existing_title.and_then(|s| clean_bounded(Some(s), 24)))
         .or_else(|| clean_bounded((!task_hint.is_empty()).then_some(task_hint.as_str()), 22));
 
     let mut recent_steps: Vec<String> = Vec::new();
-    let mut latest_tool: Option<String> = None;
-    let mut latest_plan: Option<String> = None;
-    let mut latest_assistant: Option<String> = None;
-    let mut latest_error: Option<String> = None;
-    let mut latest_checkpoint_files: Option<usize> = None;
+    let mut latest_user_idx: Option<usize> = None;
+    let mut latest_tool: Option<(usize, String)> = None;
+    let mut latest_plan: Option<(usize, String)> = None;
+    let mut latest_assistant: Option<(usize, String)> = None;
+    let mut latest_error: Option<(usize, String)> = None;
+    let mut latest_checkpoint_files: Option<(usize, usize)> = None;
 
-    for entry in entries.iter().rev().take(24).collect::<Vec<_>>().into_iter().rev() {
+    let tail: Vec<&Entry> = entries.iter().rev().take(24).collect::<Vec<_>>().into_iter().rev().collect();
+    for (idx, entry) in tail.into_iter().enumerate() {
         match entry {
             Entry::User { text, .. } => {
                 let c = strip_h2_envelope(text);
                 if let Some(line) = first_meaningful_line(&c)
                     && let Some(b) = clean_bounded(Some(&line), 90)
                 {
+                    latest_user_idx = Some(idx);
                     recent_steps.push(format!("user: {b}"));
                 }
             }
             Entry::ToolCall { title, status: ts, .. } => {
                 if let Some(b) = clean_bounded(Some(title), 72) {
-                    latest_tool = Some(b.clone());
+                    latest_tool = Some((idx, b.clone()));
                     recent_steps.push(format!("tool({ts}): {b}"));
                 }
             }
@@ -168,7 +311,7 @@ pub fn build_deterministic_acp_digest(
                 if let Some(first) = items.iter().find(|i| !i.trim().is_empty())
                     && let Some(b) = clean_bounded(Some(first), 72)
                 {
-                    latest_plan = Some(b.clone());
+                    latest_plan = Some((idx, b.clone()));
                     recent_steps.push(format!("plan: {b}"));
                 }
             }
@@ -176,7 +319,7 @@ pub fn build_deterministic_acp_digest(
                 if let Some(line) = first_meaningful_line(text)
                     && let Some(b) = clean_bounded(Some(&line), 90)
                 {
-                    latest_assistant = Some(b.clone());
+                    latest_assistant = Some((idx, b.clone()));
                     recent_steps.push(format!("assistant: {b}"));
                 }
             }
@@ -184,7 +327,7 @@ pub fn build_deterministic_acp_digest(
                 if let Some(line) = first_meaningful_line(message)
                     && let Some(b) = clean_bounded(Some(&line), 90)
                 {
-                    latest_error = Some(b.clone());
+                    latest_error = Some((idx, b.clone()));
                     recent_steps.push(format!("error: {b}"));
                 }
             }
@@ -194,7 +337,7 @@ pub fn build_deterministic_acp_digest(
                 }
             }
             Entry::Checkpoint { files, .. } if !files.is_empty() => {
-                latest_checkpoint_files = Some(files.len());
+                latest_checkpoint_files = Some((idx, files.len()));
             }
             _ => {}
         }
@@ -203,16 +346,28 @@ pub fn build_deterministic_acp_digest(
         recent_steps = recent_steps.split_off(recent_steps.len() - 10);
     }
 
+    let user_floor = latest_user_idx.unwrap_or(0);
+    let current_turn_tool = latest_tool.as_ref().filter(|(i, _)| *i >= user_floor).map(|(_, s)| s.as_str());
+    let current_turn_plan = latest_plan.as_ref().filter(|(i, _)| *i >= user_floor).map(|(_, s)| s.as_str());
+    let current_turn_assistant = latest_assistant.as_ref().filter(|(i, _)| *i >= user_floor);
+    let tool_after_assistant = match (&latest_tool, &latest_assistant) {
+        (Some((ti, ts)), Some((ai, _))) if ti > ai && *ti >= user_floor => Some(ts.as_str()),
+        (Some((ti, ts)), None) if *ti >= user_floor => Some(ts.as_str()),
+        _ => None,
+    };
+
     let micro_summary = if let Some(perm) = pending_permission {
         let label = clean_bounded(Some(&perm.title), 64)
             .or_else(|| perm.kind.clone())
             .unwrap_or_else(|| "permission".into());
         Some(if is_zh { format!("等待审批：{label}") } else { format!("Waiting approval: {label}") })
     } else if status == "error" {
-        let err = latest_error.unwrap_or_else(|| if is_zh { "执行异常".into() } else { "Execution error".into() });
+        let err = latest_error
+            .map(|(_, e)| e)
+            .unwrap_or_else(|| if is_zh { "执行异常".into() } else { "Execution error".into() });
         clean_bounded(Some(&if is_zh { format!("异常：{err}") } else { format!("Error: {err}") }), 90)
     } else if status == "working" {
-        if let Some(tool) = latest_tool {
+        if let Some(tool) = current_turn_tool {
             clean_bounded(
                 Some(&if is_zh {
                     format!("执行中：{tool}（第 {} 轮）", turn.max(1))
@@ -221,8 +376,17 @@ pub fn build_deterministic_acp_digest(
                 }),
                 90,
             )
-        } else if let Some(plan) = latest_plan {
+        } else if let Some(plan) = current_turn_plan {
             clean_bounded(Some(&if is_zh { format!("计划推进：{plan}") } else { format!("Plan: {plan}") }), 90)
+        } else if !latest_raw_user.is_empty() {
+            clean_bounded(
+                Some(&if is_zh {
+                    format!("处理中：{latest_raw_user}")
+                } else {
+                    format!("Working on: {latest_raw_user}")
+                }),
+                90,
+            )
         } else {
             clean_bounded(
                 Some(&if is_zh {
@@ -233,8 +397,13 @@ pub fn build_deterministic_acp_digest(
                 90,
             )
         }
-    } else if let Some(ans) = latest_assistant {
-        let suffix = latest_checkpoint_files.map(|n| {
+    } else if let Some(tool) = tool_after_assistant {
+        clean_bounded(
+            Some(&if is_zh { format!("执行中：{tool}") } else { format!("Running: {tool}") }),
+            90,
+        )
+    } else if let Some((ai, ans)) = current_turn_assistant {
+        let suffix = latest_checkpoint_files.filter(|(ci, _)| *ci >= *ai || *ci >= user_floor).map(|(_, n)| {
             if is_zh {
                 format!("（改动 {n} 个文件）")
             } else {
@@ -243,16 +412,51 @@ pub fn build_deterministic_acp_digest(
         });
         let combined = match suffix {
             Some(s) => format!("{ans}{s}"),
-            None => ans,
+            None => ans.clone(),
         };
         clean_bounded(Some(&combined), 90)
+    } else if !latest_raw_user.is_empty() {
+        clean_bounded(Some(&latest_raw_user), 90)
+    } else if let Some((_, ans)) = latest_assistant {
+        clean_bounded(Some(&ans), 90)
     } else if !task_hint.is_empty() {
         clean_bounded(Some(&task_hint), 90)
     } else {
         None
     };
 
-    DeterministicDigest { semantic_title, micro_summary, task_hint, recent_steps }
+    DeterministicDigest {
+        semantic_title,
+        micro_summary,
+        initial_task_hint,
+        task_hint,
+        recent_user_turns,
+        recent_steps,
+    }
+}
+
+/// Fallback deterministic digest from raw terminal screen text when a CLI agent has no structured
+/// transcript file yet (e.g., opencode, cursor-agent, copilot, or pre-flush sessions).
+pub fn build_deterministic_screen_digest(
+    screen_text: &str,
+    existing_title: Option<&str>,
+) -> DeterministicDigest {
+    let cleaned = strip_and_dedup_lines(screen_text, 16, 120, 1100);
+    let recent_steps: Vec<String> = cleaned
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(|l| format!("screen: {l}"))
+        .collect();
+    let semantic_title = existing_title.and_then(|s| clean_bounded(Some(s), 24));
+    DeterministicDigest {
+        semantic_title,
+        micro_summary: None,
+        initial_task_hint: String::new(),
+        task_hint: existing_title.unwrap_or("").trim().to_string(),
+        recent_user_turns: Vec::new(),
+        recent_steps,
+    }
 }
 
 /// Refines a deterministic agent digest using the shared Core AI runtime (`op = "agent_digest"`).
@@ -277,24 +481,47 @@ pub async fn refine_agent_digest(
         || !cfg.semantic_summary
         || cfg.base_url.trim().is_empty()
         || ai.is_circuit_open()
-        || (det.task_hint.is_empty() && det.recent_steps.is_empty())
+        || (det.task_hint.is_empty() && det.recent_user_turns.is_empty() && det.recent_steps.is_empty())
     {
         return fallback;
     }
 
-    let lang = if language.is_some_and(|l| l.to_ascii_lowercase().starts_with("zh")) { "zh" } else { "en" };
+    let lang = match language {
+        Some(l) if l.to_ascii_lowercase().starts_with("zh") => "zh",
+        Some(_) => "en",
+        None => {
+            if has_cjk(&det.task_hint)
+                || det.recent_user_turns.iter().any(|s| has_cjk(s))
+                || det.recent_steps.iter().any(|s| has_cjk(s))
+            {
+                "zh"
+            } else {
+                "en"
+            }
+        }
+    };
+    let numbered_user_turns: Vec<String> = det
+        .recent_user_turns
+        .iter()
+        .enumerate()
+        .map(|(i, u)| format!("{}. {u}", i + 1))
+        .collect();
+    let user_turns_joined = if numbered_user_turns.is_empty() {
+        strip_and_dedup_lines(&det.task_hint, 2, 140, 240)
+    } else {
+        strip_and_dedup_lines(&numbered_user_turns.join("\n"), MAX_RECENT_USER_TURNS, 140, 720)
+    };
     let steps_joined = strip_and_dedup_lines(&det.recent_steps.join("\n"), 10, 140, 1100);
-    let hint_clean = strip_and_dedup_lines(&det.task_hint, 2, 140, 240);
     let existing = existing_title.unwrap_or("").trim();
     let cache_key = format!(
-        "agent_digest:{lang}:{program}:{status}:{}",
-        fingerprint_hex(&[&hint_clean, &steps_joined, existing])
+        "agent_digest:v2:{lang}:{program}:{status}:{}",
+        fingerprint_hex(&[&user_turns_joined, &steps_joined])
     );
 
     let payload = json!({
         "program": program,
         "status": status,
-        "task_hint": hint_clean,
+        "recent_user_turns": numbered_user_turns,
         "existing_title": if existing.is_empty() { serde_json::Value::Null } else { json!(existing) },
         "recent_steps": steps_joined,
     });
@@ -547,5 +774,109 @@ mod tests {
         let d = build_deterministic_acp_digest("blocked", 2, Some(&perm), &[], Some("Auth refactor"), false);
         assert_eq!(d.semantic_title.as_deref(), Some("Auth refactor"));
         assert_eq!(d.micro_summary.as_deref(), Some("Waiting approval: Run cargo test --workspace"));
+    }
+
+    #[test]
+    fn multi_turn_conversation_updates_semantic_title_and_micro_summary_to_latest_turn() {
+        let entries = vec![
+            Entry::User {
+                turn: 1,
+                from: None,
+                text: "修复登录接口超时重试逻辑".into(),
+                ts_ms: 100,
+            },
+            Entry::Assistant {
+                turn: 1,
+                text: "已完成登录超时重试并验证通过".into(),
+                ts_ms: 200,
+            },
+            Entry::User {
+                turn: 2,
+                from: None,
+                text: "把左下角闪念清单的回收站图标改成和智能体一致".into(),
+                ts_ms: 300,
+            },
+            Entry::ToolCall {
+                turn: 2,
+                id: "tc2".into(),
+                title: "edit_file flash-note/main.js".into(),
+                tool_kind: Some("edit".into()),
+                status: "running".into(),
+                detail: None,
+                ts_ms: 350,
+            },
+        ];
+
+        // Even when status is "idle" (non-7501 CLI whose core status is None) and Turn 1 had an existing_title,
+        // the digest must reflect Turn 2's topic and active tool call instead of staying frozen on Turn 1.
+        let d_mid = build_deterministic_acp_digest("idle", 2, None, &entries, Some("修复登录超时"), true);
+        assert_eq!(d_mid.initial_task_hint, "修复登录接口超时重试逻辑");
+        assert_eq!(d_mid.task_hint, "把左下角闪念清单的回收站图标改成和智能体一致");
+        assert!(
+            d_mid.semantic_title.as_deref().unwrap().contains("闪念清单"),
+            "semantic_title must advance to Turn 2 topic: {:?}",
+            d_mid.semantic_title
+        );
+        assert!(
+            d_mid.micro_summary.as_deref().unwrap().contains("flash-note/main.js"),
+            "micro_summary must not stay stuck on Turn 1 assistant answer: {:?}",
+            d_mid.micro_summary
+        );
+
+        // Once Turn 2 assistant answers, micro_summary updates to Turn 2's reply.
+        let mut finished = entries;
+        finished.push(Entry::Assistant {
+            turn: 2,
+            text: "已统一为 archive.svg 图标并通过测试".into(),
+            ts_ms: 400,
+        });
+        let d_done = build_deterministic_acp_digest("idle", 2, None, &finished, d_mid.semantic_title.as_deref(), true);
+        assert!(
+            d_done.micro_summary.as_deref().unwrap().contains("archive.svg"),
+            "micro_summary must update to Turn 2 assistant answer: {:?}",
+            d_done.micro_summary
+        );
+    }
+
+    #[test]
+    fn recent_user_turns_survive_many_tool_calls_and_skip_meta_followups_for_title() {
+        let mut entries = vec![
+            Entry::User { turn: 1, from: None, text: "清理退出后的残留状态".into(), ts_ms: 10 },
+            Entry::Assistant { turn: 1, text: "已修复退出清理".into(), ts_ms: 20 },
+            Entry::User { turn: 2, from: None, text: "统一闪念清单回收站图标".into(), ts_ms: 30 },
+            Entry::Assistant { turn: 2, text: "已改为 archive.svg".into(), ts_ms: 40 },
+            Entry::User { turn: 3, from: None, text: "修复 Tab 顶部任务信息不随对话更新".into(), ts_ms: 50 },
+        ];
+        // Flood Turn 3 with 30 tool calls to ensure `recent_user_turns` is never crowded out.
+        for i in 0..30 {
+            entries.push(Entry::ToolCall {
+                turn: 3,
+                id: format!("tc-{i}"),
+                title: format!("read_file step_{i}.rs"),
+                tool_kind: Some("read".into()),
+                status: "completed".into(),
+                detail: None,
+                ts_ms: 60 + i as u64,
+            });
+        }
+        entries.push(Entry::Assistant { turn: 3, text: "已修复实时更新".into(), ts_ms: 200 });
+        entries.push(Entry::User { turn: 4, from: None, text: "编译安装最新的版本".into(), ts_ms: 300 });
+
+        let d = build_deterministic_acp_digest("working", 4, None, &entries, None, true);
+        assert_eq!(d.recent_user_turns.len(), 4);
+        assert_eq!(d.recent_user_turns[0], "清理退出后的残留状态");
+        assert_eq!(d.recent_user_turns[3], "编译安装最新的版本");
+        // Follow-up meta command ("编译安装最新的版本") must NOT overwrite the substantive intent from Turn 3.
+        assert!(
+            d.semantic_title.as_deref().unwrap().contains("Tab 顶部任务信息"),
+            "semantic_title should preserve Turn 3 substantive intent over meta follow-up: {:?}",
+            d.semantic_title
+        );
+        // Meanwhile micro_summary reflects the live follow-up action.
+        assert!(
+            d.micro_summary.as_deref().unwrap().contains("编译安装最新的版本"),
+            "micro_summary should reflect current working follow-up: {:?}",
+            d.micro_summary
+        );
     }
 }

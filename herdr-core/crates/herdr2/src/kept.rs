@@ -285,6 +285,13 @@ impl Core {
             t.cwd = cwd.clone();
             t.template = None;
             t.reported = false;
+            t.turn = 0;
+            t.working_since = None;
+            t.work_ms = None;
+            t.total_work_ms = 0;
+            t.status_ms = None;
+            t.semantic_title = None;
+            t.micro_summary = None;
             t.title.clear();
             t.full_screen = false;
             t.win32_input = false;

@@ -245,7 +245,16 @@ impl Core {
             self.report_status(st, id, &reports);
         }
         if let Some(title) = title {
-            st.pty_reg.terminals.get_mut(&id).expect("live terminal").title = title.clone();
+            let track_cli_title = {
+                let t = st.pty_reg.terminals.get_mut(&id).expect("live terminal");
+                t.title = title.clone();
+                !title.is_empty()
+                    && !crate::foreground::is_at_shell_root(t)
+                    && (t.reported || t.foreground.as_ref().is_some_and(crate::foreground::is_cli_foreground))
+            };
+            if track_cli_title {
+                st.pty_cli_titles.insert(id, title.clone());
+            }
             self.save_pty_soon();
             self.emit_pty(st, "title", id, serde_json::json!({"title": title}));
         }
@@ -277,13 +286,30 @@ impl Core {
         if first_task_finished {
             t.first_task_turn = None;
         }
-        let (status, records, turn, reported) = (t.status.clone(), t.records.clone(), t.turn, t.reported);
+        let (status, records, turn, reported, working_since, work_ms, total_work_ms, status_ms) = (
+            t.status.clone(),
+            t.records.clone(),
+            t.turn,
+            t.reported,
+            t.working_since,
+            t.work_ms,
+            t.total_work_ms,
+            t.status_ms,
+        );
         if change.status {
             self.emit_pty(
                 st,
                 "status",
                 id,
-                serde_json::json!({"status": status, "records": records, "reported": reported}),
+                serde_json::json!({
+                    "status": status,
+                    "records": records,
+                    "reported": reported,
+                    "working_since": working_since,
+                    "work_ms": work_ms,
+                    "total_work_ms": total_work_ms,
+                    "status_ms": status_ms,
+                }),
             );
         }
         if change.turn_ended {
@@ -300,9 +326,9 @@ impl Core {
             .get(&id)
             .is_some_and(|t| t.turn > 0 && t.semantic_title.is_none());
         if is_live && (change.turn_ended || change.stuck || first_task_finished) {
-            self.spawn_pty_digest_ai_locked(st, id, std::time::Duration::from_secs(15), None);
+            self.spawn_pty_digest_ai_locked(st, id, std::time::Duration::from_secs(4), None);
         } else if is_live && change.status && needs_initial_title {
-            self.spawn_pty_digest_ai_locked(st, id, std::time::Duration::from_secs(30), None);
+            self.spawn_pty_digest_ai_locked(st, id, std::time::Duration::from_secs(10), None);
         }
         crate::pty_adapters::on_pty_status_transition(self, st, id, &change);
     }

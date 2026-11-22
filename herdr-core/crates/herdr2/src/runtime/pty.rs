@@ -643,6 +643,7 @@ impl Core {
         st.pty_prompts.remove(&id);
         st.pty_respawning.remove(&id);
         st.pty_digest_last_ai.remove(&id);
+        st.pty_cli_titles.remove(&id);
         self.emit_pty_from(st, "removed", id, serde_json::json!({}), Some(&was));
         let _ = std::fs::remove_file(self.snapshot_path(id));
         let _ = std::fs::remove_dir_all(crate::put::terminal_dir(&self.paths.state, id));

@@ -102,9 +102,14 @@ export default class TerminalsPane extends View {
     const showHandoffBtns = Boolean(p.terminal) && p.status !== "ended" && (isAgent || Boolean(lineageParent));
     const accent = t.accent ?? "#3b82f6";
     const alpha = (hex, a) => (typeof hex === "string" && /^#[0-9a-fA-F]{6}$/.test(hex) ? hex + a : null);
+    const elapsedKey = p.terminal || pane;
+    if (!isAgent) {
+      delete this.localWorkingSince[elapsedKey];
+      delete this.localWorkMs[elapsedKey];
+    }
     const elapsed = isAgent
       ? this.agentElapsed(
-          p.terminal || pane,
+          elapsedKey,
           p.status,
           p.working_since ?? term?.working_since,
           p.work_ms ?? term?.work_ms,

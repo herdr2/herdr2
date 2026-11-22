@@ -147,8 +147,22 @@ export default class TerminalsBar extends View {
     return { ms: 0, totalMs: Number(totalWorkMs) || 0, working: false, ran: false };
   }
 
-  tabElapsed(c, agentPanes, now) {
+  tabElapsed(c, tabPanes, agentPanes, now) {
+    for (const p of tabPanes) {
+      if (!isAgentPane(p)) {
+        const key = p.pane || p.terminal;
+        if (key) {
+          delete this.localWorkingSince[key];
+          delete this.localWorkMs[key];
+        }
+      }
+    }
     if (agentPanes.length === 0) {
+      if (tabPanes.length > 0) {
+        delete this.localWorkingSince[`tab:${c.id}`];
+        delete this.localWorkMs[`tab:${c.id}`];
+        return null;
+      }
       if (typeof c.working_since === "number" || typeof c.work_ms === "number" || c.status === "working") {
         return this.paneElapsed(`tab:${c.id}`, c.status, c.working_since, c.work_ms, c.total_work_ms, now);
       }
@@ -190,7 +204,7 @@ export default class TerminalsBar extends View {
       const hasAcpAgent = tabPanes.some(isAcpPane);
       const hasTermAgent = tabPanes.some(isTermAgentPane);
       const agentPanes = tabPanes.filter(isAgentPane);
-      const elapsed = this.tabElapsed(c, agentPanes, now);
+      const elapsed = this.tabElapsed(c, tabPanes, agentPanes, now);
       return own(h_flex())
         .id(`tm-${c.id}`)
         .flex_shrink(1)

@@ -159,7 +159,11 @@ pub(crate) fn is_shell_root(root: &Foreground) -> bool {
     )
 }
 
-fn is_cli_foreground(fg: &Foreground) -> bool {
+pub(crate) fn is_at_shell_root(t: &crate::terminals::Terminal) -> bool {
+    t.foreground.as_ref().is_some_and(|n| Some(n.pid as u32) == t.pid && is_shell_root(n))
+}
+
+pub(crate) fn is_cli_foreground(fg: &Foreground) -> bool {
     if crate::pty_transcript::hint_from_words(
         std::iter::once(fg.name.as_str()).chain(fg.argv.iter().map(String::as_str)),
     )
@@ -182,17 +186,30 @@ fn is_cli_foreground(fg: &Foreground) -> bool {
 }
 
 impl Core {
-    /// Applies one foreground sample for terminal `id`, resetting agent status and stale CLI checkpoints
-    /// when a CLI exits back to its shell or a fresh non-resumed CLI starts in the same terminal.
+    /// Applies one foreground sample for terminal `id`, resetting agent status, task digest, timing,
+    /// and stale CLI checkpoints when a CLI exits back to its shell or a fresh non-resumed CLI starts
+    /// in the same terminal.
     pub(crate) fn apply_foreground_update(&self, st: &mut crate::runtime::State, id: u32, now: Option<Foreground>) {
-        let Some((t_pid, t_addr, t_cwd, prev_fg, has_status_or_records)) = st
+        let Some((t_pid, t_addr, t_cwd, prev_fg, has_status_or_records, has_agent_task_state, t_title)) = st
             .pty_reg
             .terminals
             .get(&id)
             .filter(|t| t.is_live())
             .map(|t| {
                 let cwd = t.last_cwd.clone().unwrap_or_else(|| t.cwd.clone());
-                (t.pid, t.address.clone(), cwd, t.foreground.clone(), t.status.is_some() || !t.records.is_empty())
+                let has_status = t.status.is_some() || !t.records.is_empty();
+                let has_task_state = has_status
+                    || t.semantic_title.is_some()
+                    || t.micro_summary.is_some()
+                    || t.reported
+                    || t.turn > 0
+                    || t.working_since.is_some()
+                    || t.work_ms.is_some()
+                    || t.total_work_ms > 0
+                    || t.status_ms.is_some()
+                    || t.labels.contains_key("herdr.status")
+                    || st.pty_prompts.contains_key(&id);
+                (t.pid, t.address.clone(), cwd, t.foreground.clone(), has_status, has_task_state, t.title.clone())
             })
         else {
             return;
@@ -202,6 +219,13 @@ impl Core {
         let prev_was_shell_root = prev_fg.as_ref().is_some_and(|p| Some(p.pid as u32) == t_pid && is_shell_root(p));
         let at_shell = crate::platform::foreground_tracks_jobs() && now_is_shell_root;
         let respawning = st.pty_respawning.contains(&id);
+
+        if !now_is_shell_root
+            && now.as_ref().is_some_and(is_cli_foreground)
+            && !t_title.is_empty()
+        {
+            st.pty_cli_titles.insert(id, t_title);
+        }
 
         let mut cleared_checkpoints = false;
         let mut should_reattach_resumed = false;
@@ -255,23 +279,84 @@ impl Core {
             }
         }
 
+        let prev_was_cli = prev_fg.as_ref().is_some_and(is_cli_foreground);
+        let exited_to_shell_from_cli = now_is_shell_root
+            && (cleared_checkpoints || prev_was_cli || (at_shell && has_agent_task_state));
+        let started_clean_cli_any = !now_is_shell_root
+            && now.as_ref().is_some_and(|fg| {
+                is_cli_foreground(fg)
+                    && !crate::pty_transcript::argv_has_resume(&fg.argv)
+                    && (cleared_checkpoints
+                        || prev_fg.as_ref().is_some_and(|p| p.pid != fg.pid && is_cli_foreground(p)))
+            });
+        let clear_agent_task_state = !respawning && (exited_to_shell_from_cli || started_clean_cli_any);
+
+        let mut cleared_cli_title = None;
+        if clear_agent_task_state {
+            st.pty_prompts.remove(&id);
+            st.pty_digest_last_ai.remove(&id);
+            cleared_cli_title = st.pty_cli_titles.remove(&id);
+            self.clear_manual_status_pty_locked(st, id);
+            if exited_to_shell_from_cli
+                && st
+                    .pty_reg
+                    .terminals
+                    .get(&id)
+                    .is_some_and(|t| t.labels.get("herdr.view").map(String::as_str) == Some("peek"))
+            {
+                let was = st.pty_reg.terminals.get(&id).cloned();
+                st.pty_reg.terminals.get_mut(&id).expect("checked").labels.remove("herdr.view");
+                let labels = serde_json::to_value(&st.pty_reg.terminals[&id].labels).unwrap_or_default();
+                self.save_pty(st);
+                self.emit_pty_from(st, "labels", id, serde_json::json!({ "labels": labels }), was.as_ref());
+            }
+        }
+
         let Some(t) = st.pty_reg.terminals.get_mut(&id).filter(|t| t.is_live()) else {
             return;
         };
-        let mut change = (at_shell && (t.status.is_some() || !t.records.is_empty())).then(|| {
+        let mut change = ((at_shell || clear_agent_task_state) && (t.status.is_some() || !t.records.is_empty())).then(|| {
             t.first_task_turn = None;
             crate::status::reset_terminal(t)
         });
         let mut turn_reset = false;
-        if cleared_checkpoints {
+        let mut digest_cleared = false;
+        let mut title_cleared = false;
+        let mut status_meta_cleared = false;
+        if clear_agent_task_state {
             if let Some(ref mut ch) = change {
-                // Exiting a working CLI back to shell must not trigger a post-exit shell checkpoint.
+                // Exiting a working CLI back to shell or starting a fresh clean CLI
+                // must not trigger a post-exit shell checkpoint or AI digest.
                 ch.turn_ended = false;
+            }
+            if t.semantic_title.take().is_some() | t.micro_summary.take().is_some() {
+                digest_cleared = true;
+            }
+            if t.first_task_turn.take().is_some()
+                | t.working_since.take().is_some()
+                | t.work_ms.take().is_some()
+                | (t.total_work_ms != 0)
+                | t.status_ms.take().is_some()
+                | t.reported
+            {
+                t.total_work_ms = 0;
+                t.reported = false;
+                status_meta_cleared = true;
             }
             if t.turn != 0 {
                 t.turn = 0;
                 turn_reset = true;
             }
+            if cleared_cli_title
+                .as_deref()
+                .is_some_and(|ct| !ct.is_empty() && ct == t.title)
+            {
+                t.title.clear();
+                title_cleared = true;
+            }
+        }
+        if status_meta_cleared && change.is_none() {
+            change = Some(crate::status::Change { status: true, ..Default::default() });
         }
         let foreground_changed = t.foreground != now;
         let mut argv_updated = false;
@@ -289,7 +374,7 @@ impl Core {
             }
         }
         t.foreground = now.clone();
-        if change.is_some() || foreground_changed || turn_reset || argv_updated {
+        if change.is_some() || foreground_changed || turn_reset || argv_updated || digest_cleared || title_cleared {
             self.save_pty_soon();
         }
         if let Some(change) = change {
@@ -297,6 +382,17 @@ impl Core {
         }
         if turn_reset {
             self.emit_pty(st, "turn", id, serde_json::json!({ "turn": 0 }));
+        }
+        if digest_cleared {
+            self.emit_pty(
+                st,
+                "digest",
+                id,
+                serde_json::json!({ "semantic_title": serde_json::Value::Null, "micro_summary": serde_json::Value::Null }),
+            );
+        }
+        if title_cleared {
+            self.emit_pty(st, "title", id, serde_json::json!({ "title": "" }));
         }
         if foreground_changed {
             self.emit_pty(st, "foreground", id, serde_json::to_value(&now).unwrap_or_default());
@@ -632,6 +728,135 @@ mod tests {
         }
 
         drop(core_arc);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn exiting_cli_agent_to_shell_clears_digest_timing_status_and_stale_title() {
+        use crate::paths::Paths;
+        use crate::terminals::NewTerminal;
+
+        let root =
+            crate::test_tmp().join(format!("h2-fg-exit-task-{}-{}", std::process::id(), crate::platform::random_hex()));
+        let paths = Paths {
+            socket: root.join("core.sock"),
+            holder_socket: root.join("holder.sock"),
+            state: root.clone(),
+            config: root.join("config.toml"),
+        };
+        paths.create_dirs().unwrap();
+        let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
+
+        let id = {
+            let mut st = core.lock();
+            let id = st
+                .pty_reg
+                .create(
+                    NewTerminal {
+                        argv: vec!["zsh".into()],
+                        cwd: root.to_string_lossy().to_string(),
+                        cols: 80,
+                        rows: 24,
+                        ..Default::default()
+                    },
+                    1,
+                )
+                .unwrap();
+            st.pty_reg.terminals.get_mut(&id).unwrap().pid = Some(100);
+            id
+        };
+        let cwd = root.to_string_lossy().to_string();
+        let zsh = Foreground { pid: 100, name: "zsh".into(), argv: vec!["zsh".into()], cwd: cwd.clone() };
+        let claude = Foreground { pid: 200, name: "claude".into(), argv: vec!["claude".into()], cwd: cwd.clone() };
+
+        // 1. First foreground poll of a freshly started CLI that already reported status must NOT wipe its state.
+        {
+            let mut st = core.lock();
+            {
+                let t = st.pty_reg.terminals.get_mut(&id).unwrap();
+                t.reported = true;
+                t.status = Some(crate::status::Status {
+                    state: "working".into(),
+                    kind: None,
+                    progress: None,
+                    app: "claude-code".into(),
+                    title: String::new(),
+                    msg: String::new(),
+                });
+                t.semantic_title = Some("Fix login flow".into());
+                t.micro_summary = Some("Updating auth handler".into());
+                t.turn = 3;
+                t.working_since = Some(1000);
+                t.work_ms = Some(5000);
+                t.total_work_ms = 12_000;
+                t.status_ms = Some(2000);
+                t.title = "✳ Fix login flow".into();
+                t.labels.insert("herdr.status".into(), "blocked@3".into());
+                t.labels.insert("herdr.view".into(), "peek".into());
+            }
+            st.pty_digest_last_ai.insert(id, std::time::Instant::now());
+
+            core.apply_foreground_update(&mut st, id, Some(claude.clone()));
+            let t = &st.pty_reg.terminals[&id];
+            assert_eq!(t.semantic_title.as_deref(), Some("Fix login flow"));
+            assert_eq!(t.micro_summary.as_deref(), Some("Updating auth handler"));
+            assert!(t.reported);
+            assert_eq!(t.turn, 3);
+            assert_eq!(t.status.as_ref().map(|s| s.state.as_str()), Some("working"));
+        }
+
+        // 2. Exiting the CLI back to shell clears all task info even without checkpoints.
+        {
+            let mut st = core.lock();
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            core.subscribe(&mut st, crate::events::Filter::default(), crate::events::Sink::Waiter(tx));
+            core.apply_foreground_update(&mut st, id, Some(zsh.clone()));
+
+            let t = &st.pty_reg.terminals[&id];
+            assert_eq!(t.semantic_title, None, "semantic_title must be cleared on CLI exit");
+            assert_eq!(t.micro_summary, None, "micro_summary must be cleared on CLI exit");
+            assert_eq!(t.status, None, "status must be cleared on CLI exit");
+            assert!(!t.reported, "reported must be reset to false on CLI exit");
+            assert_eq!(t.turn, 0, "turn must be reset to 0 on CLI exit");
+            assert_eq!(t.working_since, None);
+            assert_eq!(t.work_ms, None);
+            assert_eq!(t.total_work_ms, 0);
+            assert_eq!(t.status_ms, None);
+            assert!(!t.labels.contains_key("herdr.status"), "manual status label must be cleared");
+            assert!(!t.labels.contains_key("herdr.view"), "structured peek view must return to raw terminal on CLI exit");
+            assert!(t.title.is_empty(), "unchanged CLI title must be cleared when shell did not overwrite it");
+            assert!(!st.pty_digest_last_ai.contains_key(&id));
+
+            let mut kinds = Vec::new();
+            while let Ok(ev) = rx.try_recv() {
+                if let Some(kind) = ev["type"].as_str() {
+                    kinds.push(kind.to_owned());
+                }
+            }
+            assert!(kinds.iter().any(|k| k == "digest"), "must emit digest clear event: {kinds:?}");
+            assert!(kinds.iter().any(|k| k == "status"), "must emit status clear event: {kinds:?}");
+            assert!(kinds.iter().any(|k| k == "turn"), "must emit turn reset event: {kinds:?}");
+            assert!(kinds.iter().any(|k| k == "title"), "must emit title clear event: {kinds:?}");
+            assert!(kinds.iter().any(|k| k == "labels"), "must emit labels update event: {kinds:?}");
+        }
+
+        // 3. If the shell already updated OSC title before the foreground poll, preserve the shell's title.
+        {
+            let mut st = core.lock();
+            {
+                let t = st.pty_reg.terminals.get_mut(&id).unwrap();
+                t.title = "✳ Second CLI task".into();
+                t.semantic_title = Some("Second CLI task".into());
+            }
+            core.apply_foreground_update(&mut st, id, Some(claude));
+            st.pty_reg.terminals.get_mut(&id).unwrap().title = "~/Project/herdr2".into();
+            core.apply_foreground_update(&mut st, id, Some(zsh));
+            let t = &st.pty_reg.terminals[&id];
+            assert_eq!(t.semantic_title, None);
+            assert_eq!(t.title, "~/Project/herdr2", "shell's fresh title must be preserved");
+        }
+
+        drop(core);
         let _ = std::fs::remove_dir_all(root);
     }
 }

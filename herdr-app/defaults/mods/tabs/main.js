@@ -62,13 +62,28 @@ function resolveEnabledPanels(defaultIds) {
 // Same as the agents mod: drops a status glyph, keeps a leading bracket or quote.
 const clean = (s) => (s ?? "").replace(/^[^\p{L}\p{N}\p{Ps}\p{Pi}]+/u, "").replace(/^\[ [!.] \] /, "").trim();
 
-// A tab Herdr named (unnamed, or after its program) follows its agent's semantic
-// title or live title, as the agents list does; a name the person gave stays.
+const AUTO_TAB_NAMES = new Set([
+  "terminal", "终端", "shell", "zsh", "bash", "sh", "fish", "nu", "nushell", "dash",
+  "pwsh", "powershell", "cmd", "git bash", "wsl",
+  "claude", "claude code", "codex", "gemini", "antigravity", "agy", "opencode",
+  "cursor", "cursor-agent", "pi", "qwen", "kimi", "copilot", "amp", "grok", "hermes", "goose", "agent",
+]);
+
+function isAutoTabName(tab, prog) {
+  if (!tab.named) return true;
+  const name = String(tab.name ?? "").trim();
+  if (!name) return true;
+  if (prog && name === prog) return true;
+  return AUTO_TAB_NAMES.has(name.toLowerCase());
+}
+
+// A tab Herdr named (unnamed, or after a default shell/agent program) follows its agent's
+// semantic title or live title, as the agents list does; a name the person gave stays.
 function label(tab, lead) {
   const prog = lead?.program?.name;
   const base = tab.named ? tab.name : prog ?? "Terminal";
   if (!lead?.program?.agent && !lead?.acp) return base;
-  const auto = tab.name === prog || !tab.named;
+  const auto = isAutoTabName(tab, prog);
   const semantic = typeof lead?.semantic_title === "string" ? lead.semantic_title.trim() : "";
   if (auto && semantic) return semantic;
   const live = clean(lead.title);
@@ -80,7 +95,7 @@ function label(tab, lead) {
 
 function paneDisplayName(p) {
   if (p?.custom_name) return p.custom_name;
-  const semantic = typeof p?.semantic_title === "string" ? p.semantic_title.trim() : "";
+  const semantic = isAgentPane(p) && typeof p?.semantic_title === "string" ? p.semantic_title.trim() : "";
   if (semantic) return semantic;
   if (p?.acp || p?.structured) return p.program?.name || clean(p.title) || p.terminal || "Agent";
   if (p?.program?.agent) {
@@ -196,8 +211,22 @@ export default class Tabs extends View {
     return { ms: 0, totalMs: Number(totalWorkMs) || 0, working: false, ran: false };
   }
 
-  tabElapsed(c, agentPanes, now) {
+  tabElapsed(c, tabPanes, agentPanes, now) {
+    for (const p of tabPanes) {
+      if (!isAgentPane(p)) {
+        const key = p.pane || p.terminal;
+        if (key) {
+          delete this.localWorkingSince[key];
+          delete this.localWorkMs[key];
+        }
+      }
+    }
     if (agentPanes.length === 0) {
+      if (tabPanes.length > 0) {
+        delete this.localWorkingSince[`tab:${c.id}`];
+        delete this.localWorkMs[`tab:${c.id}`];
+        return null;
+      }
       if (typeof c.working_since === "number" || typeof c.work_ms === "number" || c.status === "working") {
         return this.paneElapsed(`tab:${c.id}`, c.status, c.working_since, c.work_ms, c.total_work_ms, now);
       }
@@ -478,10 +507,10 @@ export default class Tabs extends View {
       const hasRawTermAgent = tabPanes.some(p => !p?.acp && !p?.structured && Boolean(p?.program?.agent));
       const hasTermAgent = hasStructuredTermAgent || hasRawTermAgent;
       const agentPanes = tabPanes.filter(isAgentPane);
-      const elapsed = this.tabElapsed(c, agentPanes, now);
+      const elapsed = this.tabElapsed(c, tabPanes, agentPanes, now);
       const program = lead?.program;
       const name = c.named ? label(c, lead) : (combinedName || label(c, lead));
-      const hoverTip = !isFloating && !c.active && (isAgentPane(lead) || Boolean(lead?.micro_summary || lead?.semantic_title))
+      const hoverTip = !isFloating && !c.active && isAgentPane(lead)
         ? buildTabMicroTooltip(c, lead, name, elapsed, termByAddr)
         : "";
       const accent = t.accent ?? "#3b82f6";
@@ -592,8 +621,8 @@ export default class Tabs extends View {
             .child(svg("mods/workspace-chrome/clock.svg").size(9.5).flex_none())
             .child(formatElapsed(elapsed.ms)),
         ))
-        .when(c.status === "working", node => node.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
-        .when(c.status === "blocked" || c.status === "done", node => node.child(div().size(6).rounded(3).bg(t[c.status])))
+        .when((agentPanes.length > 0 || tabPanes.length === 0) && c.status === "working", node => node.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
+        .when((agentPanes.length > 0 || tabPanes.length === 0) && (c.status === "blocked" || c.status === "done"), node => node.child(div().size(6).rounded(3).bg(t[c.status])))
         .when(!isFloating && showClose, node => node.child(
           div()
             .id(`close-${c.id}`)

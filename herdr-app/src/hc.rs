@@ -202,6 +202,11 @@ impl EventLines {
             }
             "status" => {
                 set(&["status", "records", "reported"]);
+                for k in ["working_since", "work_ms", "total_work_ms", "status_ms"] {
+                    if let Some(v) = data.get(k) {
+                        t[k] = v.clone();
+                    }
+                }
                 if is_agent {
                     t["pending_permission"] = data["pending_permission"].clone();
                     if !data["inbox_len"].is_null() {

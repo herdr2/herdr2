@@ -222,7 +222,7 @@ where
     E: Styled,
 {
     let style = element.style();
-    StyleRefinement {
+    let root = StyleRefinement {
         size: style.size.clone(),
         min_size: style.min_size.clone(),
         max_size: style.max_size.clone(),
@@ -235,7 +235,17 @@ where
             y: axis.has_vertical().then_some(Overflow::Hidden),
         },
         ..Default::default()
+    };
+    // Keep max-size constraints on the outer viewport wrapper, never on the
+    // inner content container — otherwise Taffy clamps the content to the
+    // viewport height/width and leaves zero scrollable overflow.
+    if axis.has_vertical() {
+        style.max_size.height = None;
     }
+    if axis.has_horizontal() {
+        style.max_size.width = None;
+    }
+    root
 }
 
 #[inline]
@@ -343,6 +353,70 @@ mod tests {
         assert_eq!(
             footer_bounds.get().expect("footer was laid out").top(),
             px(80.)
+        );
+    }
+
+    #[gpui::test]
+    fn scrollable_with_max_h_overflows_and_wheels(cx: &mut TestAppContext) {
+        struct MaxHScrollTest {
+            handle: ScrollHandle,
+        }
+        impl Render for MaxHScrollTest {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let rows = (0..14).map(|i| {
+                    div()
+                        .id(("row", i))
+                        .w_full()
+                        .h(px(25.))
+                        .flex_none()
+                        .child(format!("model-{i}"))
+                });
+                gpui_base::v_flex()
+                    .w(px(300.))
+                    .child(
+                        Scrollable::new(
+                            div()
+                                .w_full()
+                                .h(px(160.))
+                                .max_h(px(160.))
+                                .child(gpui_base::v_flex().w_full().gap(px(2.)).children(rows)),
+                            ScrollbarAxis::Vertical,
+                        )
+                        .id("max-h-scroll")
+                        .track_scroll(Some(crate::entities::PlainScrollHandle {
+                            handle: self.handle.clone(),
+                            pending: Rc::new(Cell::new(None)),
+                        })),
+                    )
+            }
+        }
+        let handle = ScrollHandle::new();
+        let (_, cx) = cx.add_window_view(|_, _| MaxHScrollTest { handle: handle.clone() });
+        let cx: &mut VisualTestContext = cx;
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            _ = window.draw(cx);
+        });
+        let max_off = handle.max_offset();
+        assert!(
+            max_off.height > px(100.),
+            "content taller than 160px must produce vertical scroll range, got max_offset={max_off:?}"
+        );
+        let pt = gpui::point(px(100.), px(80.));
+        cx.simulate_mouse_move(pt, None, Default::default());
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: pt,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(px(0.), px(-120.))),
+            ..Default::default()
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            _ = window.draw(cx);
+        });
+        assert!(
+            handle.offset().y < px(-50.),
+            "wheel event must scroll the list vertically, got offset={:?}",
+            handle.offset()
         );
     }
 }

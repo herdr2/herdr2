@@ -3626,6 +3626,7 @@ fn flash_note_button_composer_and_sidebar_list_work_end_to_end(cx: &mut TestAppC
     ).unwrap();
     assert!(list_empty.contains("fn-sidebar"), "sidebar flash notes container missing: {list_empty}");
     assert!(list_empty.contains("fn-recycle"), "sidebar flash notes recycle bin button missing: {list_empty}");
+    assert!(list_empty.contains("mods/workspace-chrome/archive.svg"), "flash notes recycle bin should use the same archive icon as agents: {list_empty}");
     assert!(list_empty.contains("fn-list-new"), "sidebar flash notes + button missing: {list_empty}");
 
     let list_calls = Rc::new(RefCell::new(Calls::default()));
@@ -3988,4 +3989,204 @@ fn working_cli_peek_renders_large_transcript_within_quickjs_budget(cx: &mut Test
     assert!(tree.contains("acp-grp-more-"), "expanded working activity group should cap visible steps: {tree}");
     assert!(tree.contains("acp-working-tail"), "working CLI peek should show active working tail: {tree}");
     assert!(tree.contains("acp-stop"), "working CLI peek should render stop button: {tree}");
+}
+
+#[gpui::test]
+fn handoff_model_dropdown_scrolls_long_model_lists(cx: &mut TestAppContext) {
+    use gpui::VisualTestContext;
+    use std::ops::Deref;
+
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let mut vals = fixture(true, json!({"source":"t1","kind":"fork","overlay":"ov-ho"}), updates("current", "current"));
+    vals.insert("checking".into(), json!(true));
+    let setup = "this.modelPickerOpen = true; this.preset = 'codex'; this.agentCatalog = { codex: { rawModels: Array.from({length: 12}, (_, i) => `gpt-5.${i}`), defaultModel: 'gpt-5.0', efforts: ['low', 'medium', 'high'] } };";
+    let tree = describe_with_values(cx, &staged, "mods/handoff", vals.clone(), Some(setup)).unwrap();
+    let dropdown = tree.lines().find(|line| line.contains("ho-model-dropdown")).unwrap();
+    assert!(dropdown.contains("on_scroll_wheel"), "dropdown wrapper must stop scroll chaining: {tree}");
+    let scroll = tree.lines().find(|line| line.contains("ho-model-list")).unwrap();
+    assert!(scroll.contains("overflow_y_scrollbar"), "model list must use native vertical scrollbar: {tree}");
+    assert!(scroll.contains(".h[Number(180.0)]"), "model list needs explicit viewport height to scroll inside fit-content dialog: {tree}");
+    assert!(!scroll.contains("on_scroll_wheel"), "scroller itself must not intercept wheel before native scroll: {tree}");
+    let opt = tree.lines().find(|line| line.contains("ho-model-opt-11")).unwrap();
+    assert!(opt.contains(".flex_none"), "model option rows must not shrink into viewport: {tree}");
+
+    // End-to-end visual scroll verification under `fit_content = true` (matching `open_overlay`
+    // for Dialog): wheel-scrolling over `ho-model-list` must actually move the viewport so a
+    // bottom model (gpt-5.8..gpt-5.11) becomes clickable and triggers `selectModel`.
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    std::fs::write(
+        staged.0.join("main.js"),
+        format!(
+            "import Real from './mods/handoff/main.js'; import {{ setShared }} from 'herdr'; export default class S extends Real {{ init(p, cx) {{ super.init(p, cx); {setup} }} selectModel(m) {{ super.selectModel(m); setShared('test.picked', m); }} }}"
+        ),
+    )
+    .unwrap();
+    let wrapper_dir = staged.0.clone();
+    gpui_shell::policy::set_default(
+        Policy::new()
+            .with_storage_path(staged.0.join("store-ho-scroll.json"))
+            .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+            .with_host_module(module(vals, calls.clone()))
+            .unwrap(),
+    );
+    let runtime = ShellRuntime::new_isolated().unwrap();
+    struct FitDialog(gpui::Entity<gpui_shell::ShellRoot>);
+    impl gpui::Render for FitDialog {
+        fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+            use gpui::{ParentElement as _, Styled as _};
+            gpui::div()
+                .w(gpui::px(580.))
+                .max_h(gpui::px(760.))
+                .flex()
+                .flex_col()
+                .child(self.0.clone())
+        }
+    }
+    let window = cx.add_window(|window, cx| {
+        let root = runtime.try_load(&wrapper_dir, window, cx).unwrap();
+        root.update(cx, |r, cx| r.set_fit_content(true, cx));
+        FitDialog(root)
+    });
+    let mut visual = VisualTestContext::from_window(*window.deref(), cx);
+    for _ in 0..3 {
+        visual.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+        });
+        visual.run_until_parked();
+    }
+    for y in [260.0_f32, 300.0, 340.0, 380.0, 420.0] {
+        let pt = gpui::point(gpui::px(220.), gpui::px(y));
+        visual.simulate_mouse_move(pt, None, Default::default());
+        visual.simulate_event(gpui::ScrollWheelEvent {
+            position: pt,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-500.))),
+            ..Default::default()
+        });
+    }
+    for _ in 0..3 {
+        visual.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+        });
+        visual.run_until_parked();
+    }
+    // Click near the bottom of the scrolled list to pick one of the later models (gpt-5.8..gpt-5.11).
+    let mut picked = None;
+    for y in [440.0_f32, 420.0, 400.0, 380.0, 360.0, 340.0, 320.0, 300.0, 280.0] {
+        visual.simulate_click(gpui::point(gpui::px(220.), gpui::px(y)), Default::default());
+        visual.run_until_parked();
+        if let Some(found) = calls.borrow().shared.get("test.picked").cloned() {
+            picked = Some(found.to_string());
+            break;
+        }
+    }
+    let picked_str = picked.unwrap_or_default();
+    assert!(
+        picked_str.contains("gpt-5.8") || picked_str.contains("gpt-5.9") || picked_str.contains("gpt-5.10") || picked_str.contains("gpt-5.11"),
+        "scrolling ho-model-list must bring later models (gpt-5.8..gpt-5.11) into clickable view, got: {picked_str:?}"
+    );
+    visual.update(|window, _| window.remove_window());
+    gpui_shell::policy::set_default(Policy::new());
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn exited_cli_agent_hides_task_summary_timer_and_badges_in_tabs_and_pane_header(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let shell_prog = json!({
+        "key": "shell",
+        "name": "zsh",
+        "icon": null,
+        "tint": true,
+        "tile": "#334455",
+        "color": "#aabbcc",
+        "shell": true,
+        "agent": false
+    });
+    let mut values = fixture(true, json!({"pane":"p1","terminal":"t1"}), updates("current", "current"));
+    // Simulate a terminal whose CLI agent exited back to zsh even if stale agent metadata is still present.
+    values.insert("spaces".into(), json!([
+        {
+            "id": "s1",
+            "index": 1,
+            "name": "Local",
+            "folder": "/fixture/project",
+            "machine": null,
+            "branch": "main",
+            "active": true,
+            "status": "done",
+            "tabs": [{
+                "id": "tab1",
+                "index": 1,
+                "name": "1",
+                "named": false,
+                "active": true,
+                "status": "done",
+                "panes": 1,
+                "zoomed": false,
+                "settled": false,
+                "settled_at": null,
+                "changed_at": 1700000000000i64,
+                "working_since": null,
+                "work_ms": 42000,
+                "total_work_ms": 42000
+            }]
+        }
+    ]));
+    values.insert("panes".into(), json!([{
+        "pane": "p1",
+        "terminal": "t1",
+        "tab": "tab1",
+        "title": "zsh",
+        "semantic_title": "Stale CLI task title",
+        "micro_summary": "Stale CLI task progress",
+        "ai_status_summary": "Stale AI status",
+        "cwd": "/fixture/project",
+        "branch": "main",
+        "status": null,
+        "app": null,
+        "program": shell_prog,
+        "structured": false,
+        "working_since": null,
+        "work_ms": 42000,
+        "total_work_ms": 42000,
+        "focused": true,
+        "zoomed": false
+    }]));
+    values.insert("terminals".into(), json!([{
+        "address": "t1",
+        "name": null,
+        "title": "zsh",
+        "argv": ["zsh"],
+        "parent": null,
+        "labels": {},
+        "state": "live",
+        "status": null,
+        "turn": 3,
+        "semantic_title": "Stale CLI task title",
+        "micro_summary": "Stale CLI task progress",
+        "ai_status_summary": "Stale AI status",
+        "program": shell_prog,
+        "cwd": "/fixture/project"
+    }]));
+
+    let tabs_tree = describe_with_values(cx, &staged, "mods/tabs", values.clone(), None).unwrap();
+    assert!(!tabs_tree.contains("Stale CLI task title"), "tab bar must not show stale semantic title after CLI exit: {tabs_tree}");
+    assert!(!tabs_tree.contains("Stale CLI task progress"), "tab bar must not show stale micro summary after CLI exit: {tabs_tree}");
+    assert!(!tabs_tree.contains("tab-time-tab1"), "tab bar must not show execution timer after CLI exit: {tabs_tree}");
+    assert!(!tabs_tree.contains("\"CLI\"") && !tabs_tree.contains("\"终端\""), "tab bar must not show CLI badge after CLI exit: {tabs_tree}");
+    assert!(tabs_tree.contains("zsh"), "tab bar should revert to shell program name: {tabs_tree}");
+
+    let pane_tree = describe_with_values(cx, &staged, "mods/pane", values, None).unwrap();
+    assert!(!pane_tree.contains("Stale CLI task title"), "pane header must not show stale semantic title after CLI exit: {pane_tree}");
+    assert!(!pane_tree.contains("Stale CLI task progress"), "pane header must not show stale micro summary after CLI exit: {pane_tree}");
+    assert!(!pane_tree.contains("Stale AI status"), "pane header must not show stale AI status after CLI exit: {pane_tree}");
+    assert!(!pane_tree.contains("ph-type-p1"), "pane header must not show CLI type badge after CLI exit: {pane_tree}");
+    assert!(!pane_tree.contains("ph-time-p1"), "pane header must not show execution timer after CLI exit: {pane_tree}");
+    assert!(!pane_tree.contains("ph-addr-p1"), "pane header must not show agent id badge after CLI exit: {pane_tree}");
+    assert!(!pane_tree.contains("ph-ho-p1"), "pane header must not show handoff button after CLI exit: {pane_tree}");
+    assert!(pane_tree.contains("Interactive terminal"), "pane header summary should revert to Interactive terminal: {pane_tree}");
 }

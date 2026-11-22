@@ -11405,6 +11405,18 @@
           }
         },
         {
+          "description": "Optional client-inferred status (`working`, `blocked`, `done`, `idle`) for non-7501 PTY CLIs.",
+          "name": "status",
+          "required": false,
+          "schema": {
+            "description": "Optional client-inferred status (`working`, `blocked`, `done`, `idle`) for non-7501 PTY CLIs.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
           "description": "Target agent or terminal address (`a1`, `t1`, name, or `machine/a1`).",
           "name": "target",
           "required": true,

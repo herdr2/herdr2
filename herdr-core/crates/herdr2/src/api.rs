@@ -1567,7 +1567,7 @@ async fn ai_summarize_agent(
             Ok(result)
         }
         TargetKey::Terminal(id) => {
-            let (addr, program, status, turn, existing, snap) = {
+            let (addr, program, status, turn, existing, orig_fg_pid, snap, screen_fallback) = {
                 let mut st = core.lock();
                 let t = st
                     .pty_reg
@@ -1575,24 +1575,57 @@ async fn ai_summarize_agent(
                     .get(&id)
                     .cloned()
                     .ok_or_else(|| RpcError::new("not_found", "terminal not found", ""))?;
+                if crate::foreground::is_at_shell_root(&t) {
+                    return Ok(crate::ai::AgentDigestResult {
+                        address: t.address,
+                        semantic_title: None,
+                        micro_summary: None,
+                        used_ai: false,
+                        from_cache: false,
+                    });
+                }
+                let orig_fg_pid = t.foreground.as_ref().map(|f| f.pid);
+                let screen_fallback = core.screen_text(&st, id);
                 let mut snap = crate::pty_transcript::snapshot_from_terminal(&t, st.pty_prompts.get(&id));
                 let addr = t.address.clone();
                 crate::pty_transcript::populate_session_affinity(&mut snap, &addr, core, &mut st);
-                let program = t.argv.first().cloned().unwrap_or_else(|| "terminal".into());
-                let status = t.status.as_ref().map(|s| s.state.clone()).unwrap_or_else(|| "idle".into());
+                let program = t
+                    .foreground
+                    .as_ref()
+                    .map(|f| f.name.clone())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| t.argv.first().cloned())
+                    .unwrap_or_else(|| "terminal".into());
+                let status = t
+                    .status
+                    .as_ref()
+                    .map(|s| s.state.clone())
+                    .or_else(|| p.status.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned))
+                    .unwrap_or_else(|| "idle".into());
                 let turn = t.turn.max(1);
                 let existing = t.semantic_title.clone();
-                (addr, program, status, turn, existing, snap)
+                (addr, program, status, turn, existing, orig_fg_pid, snap, screen_fallback)
             };
             let (entries, _) = blocking(move || Ok(crate::pty_transcript::extract_transcript(&snap))).await?;
-            let det = crate::ai::build_deterministic_acp_digest(
-                &status,
-                turn,
-                None,
-                &entries,
-                existing.as_deref(),
-                is_zh,
-            );
+            let det = if !entries.is_empty() {
+                let eff_zh = p
+                    .language
+                    .as_deref()
+                    .map(|l| l.to_ascii_lowercase().starts_with("zh"))
+                    .unwrap_or_else(|| crate::ai::digest::entries_prefer_zh(&entries));
+                crate::ai::build_deterministic_acp_digest(
+                    &status,
+                    turn,
+                    None,
+                    &entries,
+                    existing.as_deref(),
+                    eff_zh,
+                )
+            } else if let Some(ref screen) = screen_fallback {
+                crate::ai::digest::build_deterministic_screen_digest(screen, existing.as_deref())
+            } else {
+                crate::ai::digest::DeterministicDigest::default()
+            };
             let result = if p.include_ai {
                 crate::ai::refine_agent_digest(
                     &core.ai,
@@ -1615,13 +1648,28 @@ async fn ai_summarize_agent(
             };
             if result.semantic_title.is_some() || result.micro_summary.is_some() {
                 let mut st = core.lock();
-                core.apply_pty_digest(
-                    &mut st,
-                    id,
-                    result.semantic_title.clone(),
-                    result.micro_summary.clone(),
-                    !result.used_ai,
-                );
+                let still_same_cli = st.pty_reg.terminals.get(&id).is_some_and(|cur| {
+                    cur.is_live()
+                        && !crate::foreground::is_at_shell_root(cur)
+                        && (orig_fg_pid.is_none() || cur.foreground.as_ref().map(|f| f.pid) == orig_fg_pid)
+                });
+                if still_same_cli {
+                    core.apply_pty_digest(
+                        &mut st,
+                        id,
+                        result.semantic_title.clone(),
+                        result.micro_summary.clone(),
+                        false,
+                    );
+                } else {
+                    return Ok(crate::ai::AgentDigestResult {
+                        address: result.address,
+                        semantic_title: None,
+                        micro_summary: None,
+                        used_ai: false,
+                        from_cache: false,
+                    });
+                }
             }
             Ok(result)
         }

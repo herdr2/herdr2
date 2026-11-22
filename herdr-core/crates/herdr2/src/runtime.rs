@@ -142,6 +142,9 @@ pub struct State {
     pub digest_last_ai: HashMap<u32, Instant>,
     /// Per-terminal throttle timestamp for background AI semantic digest refreshes.
     pub pty_digest_last_ai: HashMap<u32, Instant>,
+    /// Last OSC title observed while a CLI agent was running in the terminal,
+    /// used to clear stale CLI titles when exiting back to a shell without title hooks.
+    pub pty_cli_titles: HashMap<u32, String>,
 }
 
 const SAVE_SOON: Duration = Duration::from_secs(2);
@@ -409,7 +412,7 @@ impl Core {
         if first_task_finished {
             a.first_task_turn = None;
         }
-        let (status, records, turn, reported, pending_permission, inbox_len, inbox) = (
+        let (status, records, turn, reported, pending_permission, inbox_len, inbox, working_since, work_ms, total_work_ms, status_ms) = (
             a.status.clone(),
             a.records.clone(),
             a.turn,
@@ -417,6 +420,10 @@ impl Core {
             a.pending_permission.clone(),
             a.inbox_len,
             a.inbox.clone(),
+            a.working_since,
+            a.work_ms,
+            a.total_work_ms,
+            a.status_ms,
         );
         if change.status {
             self.emit(
@@ -430,6 +437,10 @@ impl Core {
                     "pending_permission": pending_permission,
                     "inbox_len": inbox_len,
                     "inbox": inbox,
+                    "working_since": working_since,
+                    "work_ms": work_ms,
+                    "total_work_ms": total_work_ms,
+                    "status_ms": status_ms,
                 }),
             );
         }
@@ -476,7 +487,7 @@ impl Core {
     }
 
     /// Synchronously computes and applies a 0ms deterministic digest for an ACP agent.
-    pub fn refresh_agent_digest_deterministic(&self, st: &mut State, id: u32) {
+    pub fn refresh_agent_digest_deterministic(&self, st: &mut State, id: u32, preserve_title: bool) {
         let Some(a) = st.reg.agents.get(&id).filter(|a| a.is_live()) else {
             return;
         };
@@ -485,15 +496,16 @@ impl Core {
         let pending = a.pending_permission.clone();
         let existing_title = a.semantic_title.clone();
         let entries = st.transcripts.get(&id).map(|t| t.entries()).unwrap_or(&[]);
+        let is_zh = crate::ai::digest::entries_prefer_zh(entries);
         let det = crate::ai::build_deterministic_acp_digest(
             status,
             turn,
             pending.as_ref(),
             entries,
             existing_title.as_deref(),
-            false,
+            is_zh,
         );
-        self.apply_digest(st, id, det.semantic_title, det.micro_summary, true);
+        self.apply_digest(st, id, det.semantic_title, det.micro_summary, preserve_title);
     }
 
     /// Spawns a throttled, lock-free background Core AI digest refinement for an ACP agent.
@@ -529,13 +541,14 @@ impl Core {
         };
         tokio::spawn(async move {
             let (addr, program, status, turn, pending, existing, entries) = snapshot;
+            let is_zh = crate::ai::digest::entries_prefer_zh(&entries);
             let det = crate::ai::build_deterministic_acp_digest(
                 &status,
                 turn,
                 pending.as_ref(),
                 &entries,
                 existing.as_deref(),
-                false,
+                is_zh,
             );
             let refined = crate::ai::refine_agent_digest(
                 &core.ai,
@@ -544,7 +557,7 @@ impl Core {
                 &status,
                 &det,
                 existing.as_deref(),
-                None,
+                if is_zh { Some("zh") } else { None },
             )
             .await;
             if refined.used_ai {
@@ -617,12 +630,17 @@ impl Core {
         let Some(t) = st.pty_reg.terminals.get(&id).filter(|t| t.is_live()).cloned() else {
             return;
         };
+        if crate::foreground::is_at_shell_root(&t) {
+            return;
+        }
         // Skip bare shells that have never reported status, completed a turn, or received prompts.
         let has_prompts = st.pty_prompts.get(&id).is_some_and(|p| !p.is_empty());
         if t.turn == 0 && !t.reported && !has_prompts {
             return;
         }
         st.pty_digest_last_ai.insert(id, now);
+        let orig_fg_pid = t.foreground.as_ref().map(|f| f.pid);
+        let screen_fallback = self.screen_text(st, id);
         let mut snap = crate::pty_transcript::snapshot_from_terminal(&t, st.pty_prompts.get(&id));
         let addr = t.address.clone();
         crate::pty_transcript::populate_session_affinity(&mut snap, &addr, &core, st);
@@ -637,20 +655,27 @@ impl Core {
             else {
                 return;
             };
-            if entries.is_empty() {
+            let det = if !entries.is_empty() {
+                let is_zh = language
+                    .as_deref()
+                    .map(|l| l.to_ascii_lowercase().starts_with("zh"))
+                    .unwrap_or_else(|| crate::ai::digest::entries_prefer_zh(&entries));
+                crate::ai::build_deterministic_acp_digest(
+                    &status,
+                    turn,
+                    None,
+                    &entries,
+                    existing.as_deref(),
+                    is_zh,
+                )
+            } else if let Some(ref screen) = screen_fallback {
+                crate::ai::digest::build_deterministic_screen_digest(screen, existing.as_deref())
+            } else {
+                return;
+            };
+            if det.task_hint.is_empty() && det.recent_steps.is_empty() {
                 return;
             }
-            let is_zh = language
-                .as_deref()
-                .is_some_and(|l| l.to_ascii_lowercase().starts_with("zh"));
-            let det = crate::ai::build_deterministic_acp_digest(
-                &status,
-                turn,
-                None,
-                &entries,
-                existing.as_deref(),
-                is_zh,
-            );
             let refined = crate::ai::refine_agent_digest(
                 &core.ai,
                 &addr,
@@ -661,14 +686,22 @@ impl Core {
                 language.as_deref(),
             )
             .await;
-            if refined.used_ai || (existing.is_none() && refined.semantic_title.is_some()) {
+            if refined.semantic_title.is_some() || refined.micro_summary.is_some() {
                 let mut st = core.lock();
+                let still_same_cli = st.pty_reg.terminals.get(&id).is_some_and(|cur| {
+                    cur.is_live()
+                        && !crate::foreground::is_at_shell_root(cur)
+                        && (orig_fg_pid.is_none() || cur.foreground.as_ref().map(|f| f.pid) == orig_fg_pid)
+                });
+                if !still_same_cli {
+                    return;
+                }
                 core.apply_pty_digest(
                     &mut st,
                     id,
                     refined.semantic_title,
                     refined.micro_summary,
-                    !refined.used_ai,
+                    false,
                 );
             }
         });

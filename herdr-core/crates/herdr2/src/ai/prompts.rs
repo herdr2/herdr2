@@ -132,11 +132,11 @@ Purpose: Inspect candidate turn incremental `patch` diffs to pinpoint which sing
 Output JSON: {"suspect_turn":4,"confidence":0.0,"reason":"evidence-backed explanation","evidence_files":["path"],"alternatives":[{"turn":5,"confidence":0.0,"reason":"..."}]}
 
 [OP: agent_digest]
-Purpose: Produce a short semantic task label and a one-sentence real-time progress micro-summary for an agent session from its initial task and recent steps.
-Input fields: `program`, `status`, `task_hint`, `recent_steps`, `existing_title`.
+Purpose: Synthesize a concise semantic title reflecting the TRUE UNDERLYING INTENT of the user's recent few conversation turns, plus a one-sentence real-time progress micro-summary.
+Input fields: `program`, `status`, `recent_user_turns` (chronological recent user messages, oldest to newest), `recent_steps`, `existing_title`.
 Rules:
-- `semantic_title`: <= 12 Chinese chars or <= 24 English chars; concrete task name (no process name or path). Keep `existing_title` if still accurate.
-- `micro_summary`: <= 42 Chinese chars or <= 90 English chars; factual current stage or blocker (e.g., files migrated, failing test, pending approval).
+- `semantic_title`: <= 12 Chinese chars or <= 24 English chars; distill the user's true goal/intent across the recent turns (especially the latest substantive turns), NOT a raw literal snippet, process name, file path, or trivial meta-command (such as "continue", "ok", "build & install", "run tests") when those merely advance the preceding task. When recent turns move to a new goal/topic, update `semantic_title` to match the new intent instead of clinging to `existing_title`.
+- `micro_summary`: <= 42 Chinese chars or <= 90 English chars; factual current stage, latest result, or blocker based on `recent_steps`.
 Output JSON: {"semantic_title":"...","micro_summary":"..."}
 
 [OP: catchup_briefing]

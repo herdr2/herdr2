@@ -524,7 +524,7 @@ export default class FlashNote extends View {
               .hover((s) => s.bg(t.hover).text_color(t.foreground))
               .tooltip(tr(`Recycle bin (${trashed.length})`, `闪念回收站 (${trashed.length})`))
               .on_click(() => openFlashNoteTrashMenu())
-              .child(svg("mods/pane/trash.svg").size(12.5)),
+              .child(svg("mods/workspace-chrome/archive.svg").size(13)),
           ),
         );
     }
@@ -586,7 +586,7 @@ export default class FlashNote extends View {
                   .hover((s) => s.bg(t.hover).text_color(t.foreground))
                   .tooltip(trashed.length > 0 ? tr(`Recycle bin (${trashed.length})`, `闪念回收站 (${trashed.length})`) : tr("Recycle bin", "闪念回收站"))
                   .on_click(() => openFlashNoteTrashMenu())
-                  .child(svg("mods/pane/trash.svg").size(12.5))
+                  .child(svg("mods/workspace-chrome/archive.svg").size(13))
                   .when(trashed.length > 0, (el) =>
                     el.child(div().font_semibold().text_color(t.foreground).child(String(trashed.length))),
                   ),
@@ -639,7 +639,7 @@ export default class FlashNote extends View {
                   .cursor_pointer()
                   .hover((s) => s.bg(t.hover))
                   .on_click(() => openFlashNoteTrashMenu())
-                  .child(svg("mods/pane/trash.svg").size(12.5).text_color(t.muted))
+                  .child(svg("mods/workspace-chrome/archive.svg").size(13).text_color(t.muted))
                   .child(tr(`Recycle bin (${trashed.length} recoverable)`, `打开回收站（${trashed.length} 条可恢复）`)),
               ),
             ),
@@ -891,7 +891,7 @@ export default class FlashNote extends View {
             h_flex()
               .gap(6)
               .items_center()
-              .child(svg("mods/pane/trash.svg").size(14).flex_none().text_color(t.muted))
+              .child(svg("mods/workspace-chrome/archive.svg").size(14).flex_none().text_color(t.muted))
               .child(div().font_semibold().text_color(t.foreground).child(tr(`Flash Notes Bin (${list.length})`, `闪念回收站 (${list.length})`))),
           )
           .when(list.length > 0, (el) =>

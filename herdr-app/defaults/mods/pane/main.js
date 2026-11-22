@@ -158,49 +158,50 @@ function formatGitSummary(info, fallbackBranch) {
 }
 
 function buildWorkSummary(p, term, isAgent, displayName) {
+  if (!isAgent) {
+    const text = p.title && p.title !== displayName ? p.title : tr("Interactive terminal", "交互式终端");
+    return { text, tone: "dim", tooltip: text };
+  }
   const st = p.status ?? term?.status ?? "idle";
   const manual = Boolean(p.manual_status || term?.manual_status);
   const permTitle = term?.pending_permission?.title ? String(term.pending_permission.title).trim() : "";
-  const micro = String(p.micro_summary ?? term?.micro_summary ?? "").trim();
-  const semantic = String(p.semantic_title ?? term?.semantic_title ?? "").trim();
-  const aiSummary = !manual ? String(p.ai_status_summary ?? term?.ai_status_summary ?? "").trim() : "";
+  const micro = String(term?.micro_summary ?? p.micro_summary ?? "").trim();
+  const semantic = String(term?.semantic_title ?? p.semantic_title ?? "").trim();
+  const aiSummary = !manual ? String(term?.ai_status_summary ?? p.ai_status_summary ?? "").trim() : "";
   const turn = Number(term?.turn ?? 0);
 
   let text = "";
   let tone = "muted";
+  const semPrefix = semantic && semantic !== displayName ? `${semantic} · ` : "";
   if (permTitle) {
     text = tr(`Waiting approval: ${permTitle}`, `等待审批：${permTitle}`);
     tone = "blocked";
   } else if (micro) {
-    const prefix = semantic && semantic !== displayName && !micro.startsWith(semantic) ? `${semantic} · ` : "";
+    const prefix = semPrefix && !micro.startsWith(semantic) ? semPrefix : "";
     text = `${prefix}${micro}`;
     tone = st === "working" ? "working" : st === "blocked" ? "blocked" : st === "done" ? "done" : "muted";
   } else if (aiSummary) {
     text = aiSummary;
     tone = st === "blocked" ? "blocked" : "muted";
-  } else if (isAgent) {
-    if (st === "working") {
-      text = turn > 0
-        ? tr(`Working on turn ${turn}…`, `正在执行中（第 ${turn} 轮）…`)
-        : tr("Working in progress…", "正在执行任务…");
-      tone = "working";
-    } else if (st === "done") {
-      text = tr("Completed — ready to inspect changes", "本轮已完成，可检视改动 Diff");
-      tone = "done";
-    } else if (st === "blocked") {
-      text = tr("Paused — waiting for your input or confirmation", "已暂停，等待你的输入或确认");
-      tone = "blocked";
-    } else if (st === "ended") {
-      text = tr("Session ended", "会话已结束");
-      tone = "dim";
-    } else {
-      text = semantic
-        ? `${semantic} · ${tr("Idle, ready for next prompt", "空闲中，随时可发新指令")}`
-        : tr("Idle — ready for next prompt", "空闲中，随时可发新指令");
-      tone = "dim";
-    }
+  } else if (st === "working") {
+    const base = turn > 0
+      ? tr(`Working on turn ${turn}…`, `正在执行中（第 ${turn} 轮）…`)
+      : tr("Working in progress…", "正在执行任务…");
+    text = `${semPrefix}${base}`;
+    tone = "working";
+  } else if (st === "done") {
+    text = `${semPrefix}${tr("Completed — ready to inspect changes", "本轮已完成，可检视改动 Diff")}`;
+    tone = "done";
+  } else if (st === "blocked") {
+    text = `${semPrefix}${tr("Paused — waiting for your input or confirmation", "已暂停，等待你的输入或确认")}`;
+    tone = "blocked";
+  } else if (st === "ended") {
+    text = tr("Session ended", "会话已结束");
+    tone = "dim";
   } else {
-    text = p.title && p.title !== displayName ? p.title : tr("Interactive terminal", "交互式终端");
+    text = semantic
+      ? `${semantic} · ${tr("Idle, ready for next prompt", "空闲中，随时可发新指令")}`
+      : tr("Idle — ready for next prompt", "空闲中，随时可发新指令");
     tone = "dim";
   }
 
@@ -438,9 +439,14 @@ export default class Pane extends View {
         })
         .when(Boolean(iconPath), (el) => el.child(svg(iconPath).size(11).flex_none().when(highlighted, (s) => s.text_color(accent))))
         .child(label);
+    const elapsedKey = p.terminal || pane;
+    if (!isAgent) {
+      delete this.localWorkingSince[elapsedKey];
+      delete this.localWorkMs[elapsedKey];
+    }
     const elapsed = isAgent
       ? this.agentElapsed(
-          p.terminal || pane,
+          elapsedKey,
           st,
           p.working_since ?? term?.working_since,
           p.work_ms ?? term?.work_ms,

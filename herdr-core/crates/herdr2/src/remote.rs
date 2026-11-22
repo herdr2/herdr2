@@ -673,10 +673,18 @@ fn apply(record: &mut Value, kind: &str, data: &Value) {
             }
             set(record, &["reason", "exit_code", "signal", "finished_ms"]);
         }
-        "status" => set(record, &["status", "records", "reported", "pending_permission", "inbox_len", "inbox"]),
+        "status" => {
+            set(record, &["status", "records", "reported", "pending_permission", "inbox_len", "inbox"]);
+            for k in ["working_since", "work_ms", "total_work_ms", "status_ms"] {
+                if let Some(v) = data.get(k) {
+                    record[k] = v.clone();
+                }
+            }
+        }
         "foreground" => record["foreground"] = data.clone(),
         "turn" => set(record, &["turn"]),
         "title" => set(record, &["title"]),
+        "digest" => set(record, &["semantic_title", "micro_summary"]),
         "labels" => set(record, &["labels"]),
         "keep" => set(record, &["keep"]),
         "config" => set(record, &["model", "mode", "permission_mode", "config_options"]),

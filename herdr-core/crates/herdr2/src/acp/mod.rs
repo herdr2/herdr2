@@ -1405,12 +1405,11 @@ fn begin_turn(core: &Core, id: u32, prompt: &QueuedPrompt) -> u64 {
         ts_ms: crate::runtime::now_ms(),
     };
     core.record_transcript(&mut st, id, entry);
+    let preserve_title = crate::ai::digest::is_followup_meta_prompt(&prompt.text);
     core.apply_status(&mut st, id, &StatusReport::root("working"));
-    core.refresh_agent_digest_deterministic(&mut st, id);
+    core.refresh_agent_digest_deterministic(&mut st, id, preserve_title);
     drop(st);
-    if turn_num == 1 {
-        core.spawn_agent_digest_ai(id, Duration::from_secs(10));
-    }
+    core.spawn_agent_digest_ai(id, Duration::from_secs(2));
     turn_num
 }
 
@@ -1456,9 +1455,9 @@ fn finish_turn(core: &Core, id: u32, turn_num: u64, res: Result<Value, CallError
             usage: a.context_usage,
         });
     }
-    core.refresh_agent_digest_deterministic(&mut st, id);
+    core.refresh_agent_digest_deterministic(&mut st, id, true);
     drop(st);
-    core.spawn_agent_digest_ai(id, Duration::from_secs(20));
+    core.spawn_agent_digest_ai(id, Duration::from_secs(3));
 }
 
 fn handle_update(core: &Core, id: u32, turn_num: u64, params: &Value) {
@@ -1595,9 +1594,9 @@ fn handle_permission(
                     message: "approval needed (`h2 approve` or `h2 deny`)".into(),
                 },
             );
-            core.refresh_agent_digest_deterministic(&mut st, id);
+            core.refresh_agent_digest_deterministic(&mut st, id, true);
             drop(st);
-            core.spawn_agent_digest_ai(id, Duration::from_secs(20));
+            core.spawn_agent_digest_ai(id, Duration::from_secs(5));
         }
     }
 }
@@ -1627,7 +1626,7 @@ fn record_entry(core: &Core, id: u32, entry: Entry) {
     let mut st = core.lock();
     core.record_transcript(&mut st, id, entry);
     if refresh {
-        core.refresh_agent_digest_deterministic(&mut st, id);
+        core.refresh_agent_digest_deterministic(&mut st, id, true);
     }
 }
 

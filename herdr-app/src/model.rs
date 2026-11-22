@@ -753,6 +753,11 @@ impl Model {
         true
     }
 
+    /// Clears all agent state (status, app, execution timing, turn) when a terminal exits its CLI agent back to shell.
+    pub fn clear_agent(&mut self, address: &str) -> bool {
+        self.agents.remove(address).is_some()
+    }
+
     /// Syncs core-provided execution timing (`working_since`, `work_ms`, `total_work_ms`, `status_ms`).
     pub fn sync_core_timing(
         &mut self,
@@ -787,6 +792,10 @@ impl Model {
                 a.work_ms = core_work_ms;
             }
             a.total_work_ms = a.total_work_ms.max(core_total_ms.unwrap_or(0));
+        } else if a.word.is_none() {
+            a.working_since = None;
+            a.work_ms = None;
+            a.total_work_ms = 0;
         } else if a.word.as_deref() == Some("working")
             && let Some(status_ms) = core_status_ms.filter(|ms| *ms > 0)
             && a.work_ms.unwrap_or(0) == 0
@@ -1567,5 +1576,14 @@ mod tests {
         assert_eq!(m.agents["a1"].working_since, Some(123_000));
         assert_eq!(m.agents["a1"].work_ms, Some(4_500));
         assert_eq!(m.agents["a1"].total_work_ms, 9_000);
+
+        // Clearing an exited CLI agent removes tab-level status and execution timing.
+        assert!(m.clear_agent("t1"));
+        assert!(!m.clear_agent("t1"));
+        assert_eq!(m.status("t1"), None);
+        let tab = m.tab("c1").unwrap();
+        assert_eq!(m.working_since(tab), None);
+        assert_eq!(m.work_ms(tab), None);
+        assert_eq!(m.total_work_ms(tab), 0);
     }
 }

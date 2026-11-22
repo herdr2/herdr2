@@ -525,6 +525,16 @@ struct AiTerminalVerdict {
     working_rechecks: u8,
 }
 
+#[derive(Clone, Debug)]
+struct DigestWatermark {
+    turn: u64,
+    transcript_seq: u64,
+    status: Option<String>,
+    output_at: Option<Instant>,
+    typed_at: Option<Instant>,
+    attempted_at: Instant,
+}
+
 pub struct AppWindow {
     core: Arc<Core>,
     runtime: Option<Rc<ShellRuntime>>,
@@ -612,8 +622,11 @@ pub struct AppWindow {
     ai_last_attempt: HashMap<String, Instant>,
     /// Agent/terminal addresses currently awaiting an in-flight `ai.summarize_agent` RPC.
     ai_digest_inflight: HashSet<String>,
-    /// Last `(turn, Instant)` attempted for automatic `ai.summarize_agent` backfill.
-    ai_digest_attempted: HashMap<String, (u64, Instant)>,
+    /// Last conversation activity watermark attempted for automatic `ai.summarize_agent` refresh.
+    ai_digest_attempted: HashMap<String, DigestWatermark>,
+    /// Last terminal title observed while a PTY was running a CLI agent,
+    /// used to clear stale CLI titles when returning to a shell without title hooks.
+    last_agent_titles: HashMap<String, String>,
     /// Backoff deadline when local Core AI is unconfigured or disabled.
     ai_unavailable_until: Option<Instant>,
     /// Monotonic counter for `files.open` requests routed to the Files panel.
@@ -748,6 +761,7 @@ impl AppWindow {
             ai_last_attempt: HashMap::new(),
             ai_digest_inflight: HashSet::new(),
             ai_digest_attempted: HashMap::new(),
+            last_agent_titles: HashMap::new(),
             ai_unavailable_until: None,
             file_open_seq: 0,
             listed_once: false,
@@ -3201,6 +3215,7 @@ impl AppWindow {
                     };
                     if rec.get("reported").and_then(Value::as_bool) == Some(true)
                         || rec.get("manual_status").and_then(Value::as_str).is_some_and(|s| !s.is_empty())
+                        || rec.pointer("/program/agent").and_then(Value::as_bool) != Some(true)
                     {
                         return;
                     }
@@ -3258,6 +3273,7 @@ impl AppWindow {
                     let looking = this.visible_addresses().iter().any(|x| x == &addr) && this.window_active;
                     this.model.set_word(&addr, Some(mapped_state.to_owned()), app, looking);
                     mods::publish_terminals(this.ordered_live_values());
+                    this.publish(cx);
                     this.refresh_snapshot_mods(cx);
                     cx.notify();
                 });
@@ -3267,17 +3283,17 @@ impl AppWindow {
         changed
     }
 
-    /// Lazily backfills `semantic_title` / `micro_summary` via Core's `ai.summarize_agent`
-    /// for live ACP and PTY CLI agent sessions that do not have a semantic title yet
-    /// (for example already-running sessions right after app launch or core restart).
+    /// Lazily backfills and continuously refreshes `semantic_title` / `micro_summary` via Core's
+    /// `ai.summarize_agent` for live ACP and PTY CLI agent sessions as conversation content progresses.
     fn refresh_missing_semantic_digests(&mut self, cx: &mut Context<Self>) {
         let now = Instant::now();
-        if !self.core.supports_ai() || self.ai_unavailable_until.is_some_and(|until| now < until) {
+        if !self.core.supports_ai() {
             return;
         }
-        let mut jobs: Vec<(String, u64)> = Vec::new();
+        let include_ai = self.ai_unavailable_until.is_none_or(|until| now >= until);
+        let mut jobs: Vec<(String, DigestWatermark, Option<String>)> = Vec::new();
         for addr in &self.live_order {
-            if self.ai_digest_inflight.len() + jobs.len() >= 2 {
+            if self.ai_digest_inflight.len() + jobs.len() >= 3 {
                 break;
             }
             if self.closing_terminals.contains_key(addr) || self.ai_digest_inflight.contains(addr) {
@@ -3289,9 +3305,14 @@ impl AppWindow {
             if rec.pointer("/labels/herdr.trashed").and_then(Value::as_str).is_some_and(|s| !s.is_empty()) {
                 continue;
             }
-            let is_agent = rec.get("acp").and_then(Value::as_bool) == Some(true)
-                || rec.pointer("/program/agent").and_then(Value::as_bool) == Some(true)
-                || rec.get("reported").and_then(Value::as_bool) == Some(true);
+            let is_acp = is_acp_addr(addr) || rec.get("acp").and_then(Value::as_bool) == Some(true);
+            let is_shell = !is_acp
+                && rec.pointer("/program/shell").and_then(Value::as_bool) == Some(true)
+                && rec.pointer("/program/agent").and_then(Value::as_bool) != Some(true);
+            let is_agent = !is_shell
+                && (is_acp
+                    || rec.pointer("/program/agent").and_then(Value::as_bool) == Some(true)
+                    || rec.get("reported").and_then(Value::as_bool) == Some(true));
             if !is_agent {
                 continue;
             }
@@ -3299,28 +3320,84 @@ impl AppWindow {
                 .get("semantic_title")
                 .and_then(Value::as_str)
                 .is_some_and(|s| !s.trim().is_empty());
-            if has_title {
-                continue;
-            }
+            let has_summary = rec
+                .get("micro_summary")
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.trim().is_empty());
+            let missing = !has_title || !has_summary;
             let turn = rec.get("turn").and_then(Value::as_u64).unwrap_or(0);
-            if let Some((prev_turn, last_at)) = self.ai_digest_attempted.get(addr)
-                && *prev_turn == turn
-                && now.saturating_duration_since(*last_at) < Duration::from_secs(90)
-            {
+            let transcript_seq = rec.get("transcript_seq").and_then(Value::as_u64).unwrap_or(0);
+            let status = rec.get("status").and_then(Value::as_str).map(str::to_owned);
+            let (output_at, typed_at) = if is_acp {
+                (None, None)
+            } else if let Some(view) = self.best_terminal_view(addr, cx) {
+                let v = view.read(cx);
+                (v.last_output_at(), v.last_typed_at())
+            } else {
+                (None, None)
+            };
+
+            let should_refresh = match self.ai_digest_attempted.get(addr) {
+                None => missing || (!is_acp && (output_at.is_some() || typed_at.is_some() || turn > 0)),
+                Some(prev) => {
+                    let since_last = now.saturating_duration_since(prev.attempted_at);
+                    let turn_changed = prev.turn != turn;
+                    let seq_changed = prev.transcript_seq != transcript_seq;
+                    let status_changed = prev.status != status;
+                    let activity_changed = prev.output_at != output_at || prev.typed_at != typed_at;
+                    let output_quiet = output_at.is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(1200));
+
+                    if missing {
+                        if turn_changed || seq_changed || status_changed || activity_changed {
+                            since_last >= Duration::from_secs(3)
+                                && (is_acp || output_quiet || since_last >= Duration::from_secs(6))
+                        } else {
+                            since_last >= Duration::from_secs(30)
+                        }
+                    } else if is_acp {
+                        // Core pushes deterministic + AI digest events on ACP turns; app only refreshes
+                        // as a safety net when transcript/turn/status moved and enough time passed.
+                        (turn_changed || seq_changed || status_changed) && since_last >= Duration::from_secs(12)
+                    } else if status_changed || turn_changed {
+                        since_last >= Duration::from_secs(3)
+                    } else if activity_changed {
+                        (output_quiet && since_last >= Duration::from_secs(5))
+                            || since_last >= Duration::from_secs(12)
+                    } else if status.as_deref() == Some("working") && output_at.is_none() {
+                        // Background/unattached PTY CLI with no local view timestamps.
+                        since_last >= Duration::from_secs(15)
+                    } else {
+                        false
+                    }
+                }
+            };
+            if !should_refresh {
                 continue;
             }
-            jobs.push((addr.clone(), turn));
+            let wm = DigestWatermark {
+                turn,
+                transcript_seq,
+                status: status.clone(),
+                output_at,
+                typed_at,
+                attempted_at: now,
+            };
+            jobs.push((addr.clone(), wm, status));
         }
 
-        for (addr, turn) in jobs {
+        for (addr, wm, status) in jobs {
             self.ai_digest_inflight.insert(addr.clone());
-            self.ai_digest_attempted.insert(addr.clone(), (turn, now));
+            self.ai_digest_attempted.insert(addr.clone(), wm);
             let core = self.core.clone();
             let language = self.person.language.clone();
-            let params = json!({
+            let mut params = json!({
                 "target": addr,
                 "language": language,
+                "includeAi": include_ai,
             });
+            if let Some(st) = status {
+                params["status"] = Value::String(st);
+            }
             cx.spawn(async move |this, cx| {
                 let res = cx.background_executor().spawn(async move { core.summarize_agent(params) }).await;
                 let _ = this.update(cx, |this, cx| {
@@ -3345,6 +3422,15 @@ impl AppWindow {
                     }
                     let mut updated = false;
                     if let Some(obj) = this.live.get_mut(&addr).and_then(Value::as_object_mut) {
+                        let is_shell = obj.get("program").and_then(|p| p.get("shell")).and_then(Value::as_bool) == Some(true)
+                            && obj.get("program").and_then(|p| p.get("agent")).and_then(Value::as_bool) != Some(true);
+                        let still_agent = !is_shell
+                            && (obj.get("acp").and_then(Value::as_bool) == Some(true)
+                                || obj.get("program").and_then(|p| p.get("agent")).and_then(Value::as_bool) == Some(true)
+                                || obj.get("reported").and_then(Value::as_bool) == Some(true));
+                        if !still_agent {
+                            return;
+                        }
                         if let Some(st) = semantic_title {
                             if obj.get("semantic_title").and_then(Value::as_str) != Some(st.as_str()) {
                                 obj.insert("semantic_title".into(), Value::String(st));
@@ -3360,6 +3446,7 @@ impl AppWindow {
                     }
                     if updated {
                         mods::publish_terminals(this.ordered_live_values());
+                        this.publish(cx);
                         this.refresh_snapshot_mods(cx);
                         cx.notify();
                     }
@@ -3457,10 +3544,69 @@ impl AppWindow {
         self.ai_terminal_states.retain(|a, _| self.live.contains_key(a));
         self.ai_last_attempt.retain(|a, _| self.live.contains_key(a));
         self.ai_digest_attempted.retain(|a, _| self.live.contains_key(a));
+        self.last_agent_titles.retain(|a, _| self.live.contains_key(a));
         self.closing_terminals.retain(|addr, completed| !*completed || self.live.contains_key(addr));
         // Seed `manual_status` on live records before inferring or publishing `terminals()`.
+        // Also strip any lingering CLI agent task info when a PTY terminal has returned to its shell.
         let addrs: Vec<String> = self.live.keys().cloned().collect();
         for addr in addrs {
+            let is_acp = is_acp_addr(&addr)
+                || self.live.get(&addr).and_then(|r| r.get("acp")).and_then(Value::as_bool) == Some(true);
+            let is_agent_prog = self.live.get(&addr).and_then(|r| r.pointer("/program/agent")).and_then(Value::as_bool) == Some(true);
+            let is_shell_prog = !is_acp
+                && !is_agent_prog
+                && self.live.get(&addr).and_then(|r| r.pointer("/program/shell")).and_then(Value::as_bool) == Some(true);
+            if !is_acp && is_agent_prog {
+                let view_title = self
+                    .best_terminal_view(&addr, cx)
+                    .map(|v| v.read(cx).title.clone())
+                    .filter(|s| !s.is_empty());
+                let rec_title = self
+                    .live
+                    .get(&addr)
+                    .and_then(|r| r.get("title"))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_owned);
+                if let Some(title) = view_title.or(rec_title) {
+                    self.last_agent_titles.insert(addr.clone(), title);
+                }
+            } else if is_shell_prog {
+                self.ai_terminal_states.remove(&addr);
+                self.ai_digest_attempted.remove(&addr);
+                let had_manual_label = self
+                    .live
+                    .get(&addr)
+                    .and_then(|r| r.pointer("/labels/herdr.status"))
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty());
+                self.manual_statuses.remove(&addr);
+                if had_manual_label {
+                    Self::write_core_label(self.core.clone(), addr.clone(), "herdr.status", String::new(), cx);
+                }
+                if let Some(obj) = self.live.get_mut(&addr).and_then(Value::as_object_mut) {
+                    obj.insert("semantic_title".into(), Value::Null);
+                    obj.insert("micro_summary".into(), Value::Null);
+                    obj.insert("ai_status_summary".into(), Value::Null);
+                    obj.insert("ai_status_kind".into(), Value::Null);
+                    obj.insert("working_since".into(), Value::Null);
+                    obj.insert("work_ms".into(), Value::Null);
+                    obj.insert("total_work_ms".into(), json!(0));
+                    obj.insert("manual_status".into(), Value::Null);
+                }
+                if let Some(prev_agent_title) = self.last_agent_titles.remove(&addr) {
+                    let matching_views: Vec<Entity<TerminalView>> = self
+                        .terms
+                        .values()
+                        .filter(|t| t.address == addr && t.view.read(cx).title == prev_agent_title)
+                        .map(|t| t.view.clone())
+                        .collect();
+                    for view in matching_views {
+                        view.update(cx, |v, cx| v.clear_title(cx));
+                    }
+                }
+                continue;
+            }
             let manual = self.resolve_manual_status(&addr, cx);
             if let Some(obj) = self.live.get_mut(&addr).and_then(Value::as_object_mut) {
                 obj.insert("manual_status".into(), manual.as_deref().map_or(Value::Null, |s| json!(s)));
@@ -3516,8 +3662,25 @@ impl AppWindow {
                 continue;
             }
             let Some(rec) = self.live.get(&addr) else { continue };
+            let is_acp = is_acp_addr(&addr) || rec.get("acp").and_then(Value::as_bool) == Some(true);
+            let is_agent_prog = rec.pointer("/program/agent").and_then(Value::as_bool) == Some(true);
             let manual = rec.get("manual_status").and_then(Value::as_str).map(str::to_owned);
             let word = rec.get("status").and_then(Value::as_str).map(str::to_owned);
+            if !is_acp && !is_agent_prog && word.is_none() && manual.is_none() {
+                changed |= self.model.clear_agent(&addr);
+                if let Some(obj) = self.live.get_mut(&addr).and_then(Value::as_object_mut) {
+                    let cleared_ws = obj.get("working_since").is_some_and(|v| !v.is_null());
+                    let cleared_wm = obj.get("work_ms").is_some_and(|v| !v.is_null());
+                    let cleared_tm = obj.get("total_work_ms").and_then(Value::as_u64).unwrap_or(0) != 0;
+                    if cleared_ws || cleared_wm || cleared_tm {
+                        obj.insert("working_since".into(), Value::Null);
+                        obj.insert("work_ms".into(), Value::Null);
+                        obj.insert("total_work_ms".into(), json!(0));
+                        republished = true;
+                    }
+                }
+                continue;
+            }
             let app = rec
                 .get("report")
                 .and_then(|r| r.get("app"))

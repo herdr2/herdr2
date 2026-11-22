@@ -1165,8 +1165,10 @@ export default class Handoff extends View {
                       ),
                   ),
               )
-              .when(this.modelPickerOpen, (dropEl) =>
-                dropEl.child(
+              .when(this.modelPickerOpen, (dropEl) => {
+                const rowCount = 1 + cat.models.length;
+                const listH = Math.min(Math.max(rowCount * 27 + 4, 32), 180);
+                return dropEl.child(
                   v_flex()
                     .id("ho-model-dropdown")
                     .w_full()
@@ -1177,64 +1179,73 @@ export default class Handoff extends View {
                     .bg(t.background)
                     .border_1()
                     .border_color(t.border)
+                    .on_scroll_wheel((_e, cx) => cx.stop_propagation())
                     .child(
-                      v_flex()
+                      div()
                         .id("ho-model-list")
                         .w_full()
-                        .min_w(0)
-                        .max_h(148)
-                        .gap(2)
+                        .h(listH)
                         .overflow_y_scrollbar()
                         .child(
-                          h_flex()
-                            .id("ho-model-opt-default")
-                            .h(25)
-                            .px(8)
-                            .gap(6)
-                            .items_center()
-                            .justify_between()
-                            .rounded(5)
-                            .bg(!this.model ? (withAlpha(accent, "1f") ?? t.selected ?? t.hover) : "#00000000")
-                            .text_size(11.5)
-                            .text_color(!this.model ? t.foreground : t.muted)
-                            .cursor_pointer()
-                            .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-                            .on_click((_e, cx) => {
-                              cx.stop_propagation();
-                              this.selectModel("");
-                              this.modelPickerOpen = false;
-                              cx.notify();
-                            })
-                            .child(div().flex_1().min_w(0).truncate().child(cat.defaultModel ? `${tr("Default", "默认")} (${cat.defaultModel})` : tr("Default (agent choice)", "默认（跟随 Agent 配置）")))
-                            .when(!this.model, (ck) => ck.child(svg("mods/workspace-chrome/check.svg").size(11).text_color(accent))),
-                        )
-                        .children(
-                          cat.models.map((m, idx) => {
-                            const picked = this.model === m;
-                            return h_flex()
-                              .id(`ho-model-opt-${idx}`)
-                              .h(25)
-                              .px(8)
-                              .gap(6)
-                              .items_center()
-                              .justify_between()
-                              .rounded(5)
-                              .bg(picked ? (withAlpha(accent, "1f") ?? t.selected ?? t.hover) : "#00000000")
-                              .text_size(11.5)
-                              .text_color(picked ? t.foreground : t.muted)
-                              .cursor_pointer()
-                              .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-                              .on_click((_e, cx) => {
-                                cx.stop_propagation();
-                                this.selectModel(m);
-                                this.modelPickerOpen = false;
-                                cx.notify();
-                              })
-                              .child(div().flex_1().min_w(0).truncate().child(m))
-                              .when(picked, (ck) => ck.child(svg("mods/workspace-chrome/check.svg").size(11).text_color(accent)));
-                          }),
+                          v_flex()
+                            .w_full()
+                            .min_w(0)
+                            .gap(2)
+                            .child(
+                              h_flex()
+                                .id("ho-model-opt-default")
+                                .w_full()
+                                .h(25)
+                                .flex_none()
+                                .px(8)
+                                .gap(6)
+                                .items_center()
+                                .justify_between()
+                                .rounded(5)
+                                .bg(!this.model ? (withAlpha(accent, "1f") ?? t.selected ?? t.hover) : "#00000000")
+                                .text_size(11.5)
+                                .text_color(!this.model ? t.foreground : t.muted)
+                                .cursor_pointer()
+                                .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                                .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                                .on_click((_e, cx) => {
+                                  cx.stop_propagation();
+                                  this.selectModel("");
+                                  this.modelPickerOpen = false;
+                                  cx.notify();
+                                })
+                                .child(div().flex_1().min_w(0).truncate().child(cat.defaultModel ? `${tr("Default", "默认")} (${cat.defaultModel})` : tr("Default (agent choice)", "默认（跟随 Agent 配置）")))
+                                .when(!this.model, (ck) => ck.child(svg("mods/workspace-chrome/check.svg").size(11).flex_none().text_color(accent))),
+                            )
+                            .children(
+                              cat.models.map((m, idx) => {
+                                const picked = this.model === m;
+                                return h_flex()
+                                  .id(`ho-model-opt-${idx}`)
+                                  .w_full()
+                                  .h(25)
+                                  .flex_none()
+                                  .px(8)
+                                  .gap(6)
+                                  .items_center()
+                                  .justify_between()
+                                  .rounded(5)
+                                  .bg(picked ? (withAlpha(accent, "1f") ?? t.selected ?? t.hover) : "#00000000")
+                                  .text_size(11.5)
+                                  .text_color(picked ? t.foreground : t.muted)
+                                  .cursor_pointer()
+                                  .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                                  .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                                  .on_click((_e, cx) => {
+                                    cx.stop_propagation();
+                                    this.selectModel(m);
+                                    this.modelPickerOpen = false;
+                                    cx.notify();
+                                  })
+                                  .child(div().flex_1().min_w(0).truncate().child(m))
+                                  .when(picked, (ck) => ck.child(svg("mods/workspace-chrome/check.svg").size(11).flex_none().text_color(accent)));
+                              }),
+                            ),
                         ),
                     )
                     .child(
@@ -1289,8 +1300,8 @@ export default class Handoff extends View {
                             .child(tr("Use", "使用")),
                         ),
                     ),
-                ),
-              );
+                );
+              });
           })())
           // Compact 2-column settings: Runtime + Open Location
           .child(
