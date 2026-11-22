@@ -12,6 +12,12 @@ import {
   readScopeDrafts,
   writeScopeDrafts,
 } from "../defaults/mods/changes/review_model.js";
+import {
+  parseGitStatusV2,
+  parseGitLog,
+  parseStashCount,
+  formatPrimaryRef,
+} from "../defaults/mods/changes/git_info.js";
 
 const source = await readFile(new URL("../defaults/mods/changes/main.js", import.meta.url), "utf8");
 const rowsSource = source.slice(source.indexOf("const untab ="), source.indexOf("\nexport default class"));
@@ -95,4 +101,65 @@ test("resolveTargetCandidates prioritizes same-machine focused & same-repo agent
   const k = makeDraftScopeKey("box", "/work/app/");
   const store = writeScopeDrafts({}, k, [{ id: "1", path: "a.rs", start_line: 2, body: "fix" }]);
   expect(readScopeDrafts(store, k).length).toBe(1);
+});
+
+test("parseGitStatusV2 parses branch, tracking, ahead/behind, and staged/unstaged/untracked/conflict counts", () => {
+  const raw = [
+    "# branch.oid 8962c5907e763c13a7f1a885e20dbc7a2bc2ffca",
+    "# branch.head feat/git-panel",
+    "# branch.upstream origin/feat/git-panel",
+    "# branch.ab +2 -1",
+    "1 M. N... 100644 100644 100644 h1 h2 src/staged file.js",
+    "1 .M N... 100644 100644 100644 h1 h2 src/unstaged.js",
+    "1 MM N... 100644 100644 100644 h1 h2 src/both.js",
+    "u UU N... 100644 100644 100644 100644 h1 h2 h3 src/conflict.js",
+    "? docs/new note.md",
+    "",
+  ].join("\0");
+  const res = parseGitStatusV2(raw);
+  expect(res.branch).toMatchObject({
+    name: "feat/git-panel",
+    detached: false,
+    hasHead: true,
+    headShort: "8962c59",
+    upstream: "origin/feat/git-panel",
+    upstreamGone: false,
+    ahead: 2,
+    behind: 1,
+  });
+  expect(res.status).toEqual({
+    staged: 2,
+    unstaged: 2,
+    untracked: 1,
+    conflicts: 1,
+    total: 5,
+    clean: false,
+  });
+  expect(res.files.map((f) => [f.path, f.status, f.staged, f.fresh])).toEqual([
+    ["src/staged file.js", "M", true, false],
+    ["src/unstaged.js", "M", false, false],
+    ["src/both.js", "M", true, false],
+    ["src/conflict.js", "U", false, false],
+    ["docs/new note.md", "A", false, true],
+  ]);
+});
+
+test("parseGitLog, parseStashCount, and formatPrimaryRef handle recent commit entries cleanly", () => {
+  const raw = [
+    "8962c5907e763c13a7f1a885e20dbc7a2bc2ffca\x1f8962c590\x1ffeat(pty): track cli\x1fAlice\x1f3 mins ago\x1fHEAD -> master, origin/master\x1e",
+    "0206eaeede86ac76fd67e79065cf054f0af33300\x1f0206eaee\x1ffix(ui): layout polish\x1fBob\x1f2 hours ago\x1ftag: v0.4.1\x1e",
+  ].join("\n");
+  const log = parseGitLog(raw);
+  expect(log.length).toBe(2);
+  expect(log[0]).toMatchObject({
+    shortHash: "8962c590",
+    subject: "feat(pty): track cli",
+    author: "Alice",
+    relTime: "3 mins ago",
+    refs: ["HEAD -> master", "origin/master"],
+  });
+  expect(formatPrimaryRef(log[0].refs)).toBe("master");
+  expect(formatPrimaryRef(log[1].refs)).toBe("v0.4.1");
+  expect(parseStashCount("stash@{0}: WIP on master\nstash@{1}: draft\n")).toBe(2);
+  expect(parseStashCount("")).toBe(0);
 });

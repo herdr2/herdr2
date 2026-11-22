@@ -4190,3 +4190,132 @@ fn exited_cli_agent_hides_task_summary_timer_and_badges_in_tabs_and_pane_header(
     assert!(!pane_tree.contains("ph-ho-p1"), "pane header must not show handoff button after CLI exit: {pane_tree}");
     assert!(pane_tree.contains("Interactive terminal"), "pane header summary should revert to Interactive terminal: {pane_tree}");
 }
+
+#[gpui::test]
+fn changes_renders_git_branch_status_and_recent_log_without_errors(cx: &mut TestAppContext) {
+    use gpui::VisualTestContext;
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+
+    // 1) Branch info + git status summary + staged file pill + recent git log.
+    let setup = r#"
+        this.root = '/repo/demo';
+        this.on = null;
+        this.context = this.viewKey();
+        this.hasHead = true;
+        this.gitBranch = {
+            name: 'feat/git-panel',
+            detached: false,
+            hasHead: true,
+            headOid: '8962c5907e763c13a7f1a885e20dbc7a2bc2ffca',
+            headShort: '8962c59',
+            upstream: 'origin/feat/git-panel',
+            upstreamGone: false,
+            ahead: 2,
+            behind: 1,
+        };
+        this.gitStatus = {
+            staged: 1,
+            unstaged: 1,
+            untracked: 1,
+            conflicts: 0,
+            total: 3,
+            clean: false,
+        };
+        this.stashCount = 1;
+        this.files = [
+            { path: 'src/api.rs', status: 'M', staged: true, unstaged: false, fresh: false, add: 4, del: 1 },
+            { path: 'src/new.rs', status: 'A', staged: false, unstaged: false, fresh: true, add: 12, del: 0 },
+        ];
+        this.gitLog = [
+            { hash: '8962c5907e763c13a7f1a885e20dbc7a2bc2ffca', shortHash: '8962c59', subject: 'feat(pty): track CLI foreground', author: 'Alice', relTime: '3m ago', refs: ['HEAD -> feat/git-panel'] },
+            { hash: '0206eaeede86ac76fd67e79065cf054f0af33300', shortHash: '0206eae', subject: 'fix(ui): polish changes panel', author: 'Bob', relTime: '2h ago', refs: ['tag: v0.4.1'] },
+        ];
+        this.open = 'src/api.rs';
+        this.setLines(['@@ -1,2 +1,3 @@', '-old', '+new', '+more']);
+    "#;
+    let tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/changes",
+        fixture(true, json!({}), updates("current", "current")),
+        Some(setup),
+    ).unwrap();
+    assert!(tree.contains("chg-git-info"), "git info bar must render: {tree}");
+    assert!(tree.contains("feat/git-panel"), "branch name must render: {tree}");
+    assert!(tree.contains("8962c59"), "short HEAD sha must render: {tree}");
+    assert!(tree.contains("→ origin/feat/git-panel"), "upstream branch must render: {tree}");
+    assert!(tree.contains("↑2"), "ahead badge must render: {tree}");
+    assert!(tree.contains("↓1"), "behind badge must render: {tree}");
+    assert!(tree.contains("stash 1"), "stash count badge must render: {tree}");
+    assert!(tree.contains("chg-git-status-bar"), "git status bar must render: {tree}");
+    assert!(tree.contains("1 staged"), "staged count pill must render: {tree}");
+    assert!(tree.contains("1 modified"), "modified count pill must render: {tree}");
+    assert!(tree.contains("1 untracked"), "untracked count pill must render: {tree}");
+    assert!(tree.contains("chg-git-log"), "recent git log section must render: {tree}");
+    assert!(tree.contains("chg-commit-8962c59"), "first commit row must render: {tree}");
+    assert!(tree.contains("chg-commit-0206eae"), "second commit row must render: {tree}");
+    assert!(tree.contains("feat(pty): track CLI foreground"), "commit subject must render: {tree}");
+
+    // 2) Commit preview mode + clean working tree + real GPUI draw().
+    let preview_setup = r#"
+        this.root = '/repo/demo';
+        this.on = null;
+        this.context = this.viewKey();
+        this.hasHead = true;
+        this.gitBranch = {
+            name: 'master',
+            detached: false,
+            hasHead: true,
+            headOid: '8962c5907e763c13a7f1a885e20dbc7a2bc2ffca',
+            headShort: '8962c59',
+            upstream: '',
+            upstreamGone: false,
+            ahead: 0,
+            behind: 0,
+        };
+        this.gitStatus = { staged: 0, unstaged: 0, untracked: 0, conflicts: 0, total: 0, clean: true };
+        this.files = [];
+        this.gitLog = [
+            { hash: '8962c5907e763c13a7f1a885e20dbc7a2bc2ffca', shortHash: '8962c59', subject: 'feat(pty): track CLI foreground', author: 'Alice', relTime: '3m ago', refs: ['HEAD -> master'] },
+        ];
+        this.selectedCommit = this.gitLog[0];
+        this.setLines(['commit 8962c59', '@@ -1,1 +1,2 @@', '-old', '+new']);
+    "#;
+    let preview_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/changes",
+        fixture(true, json!({}), updates("current", "current")),
+        Some(preview_setup),
+    ).unwrap();
+    assert!(preview_tree.contains("Clean working tree"), "clean working tree badge must render: {preview_tree}");
+    assert!(preview_tree.contains("chg-commit-banner"), "commit preview banner must render: {preview_tree}");
+    assert!(preview_tree.contains("chg-commit-close"), "commit preview back button must render: {preview_tree}");
+
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    gpui_shell::policy::set_default(
+        Policy::new()
+            .with_storage_path(staged.0.join("store-changes-git-info.json"))
+            .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+            .with_host_module(module(fixture(true, json!({}), updates("current", "current")), calls.clone()))
+            .unwrap(),
+    );
+    let rt = ShellRuntime::new_isolated().unwrap();
+    let wrapped = staged.wrapper("mods/changes", preview_setup);
+    let win = cx.add_window(|window, cx| RootedView(rt.try_load(&wrapped, window, cx).unwrap()));
+    let mut visual = VisualTestContext::from_window(win.into(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.run_until_parked();
+    let err = win.read_with(cx, |r, cx| {
+        r.0.read(cx)
+            .content()
+            .clone()
+            .downcast::<gpui_shell::ScriptView>()
+            .ok()
+            .and_then(|v| v.read(cx).build_error().map(str::to_owned))
+    });
+    assert_eq!(err.unwrap(), None, "changes git info + log + commit preview must draw with zero errors");
+    visual.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+}

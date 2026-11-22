@@ -1,4 +1,4 @@
-import { View, div } from "gpui-kit";
+import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, Popup, Scrollbar, v_virtual_list } from "gpui-base";
 import { spaces, panes, agents, terminals, focused, exec, h2, readTextFile, watchFolder, theme, settings, shared, setShared, run } from "herdr";
 import {
@@ -13,6 +13,12 @@ import {
   formatLineTag,
   withAlpha,
 } from "./review_model.js";
+import {
+  parseGitStatusV2,
+  parseGitLog,
+  parseStashCount,
+  formatPrimaryRef,
+} from "./git_info.js";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
@@ -91,6 +97,13 @@ export default class Changes extends View {
     this.lastHandledResultId = null;
     this.aiCommitLoading = false;
     this.aiCommitUsedAi = false;
+    this.gitBranch = null;
+    this.gitStatus = null;
+    this.gitLog = [];
+    this.stashCount = 0;
+    this.gitLogOpen = true;
+    this.selectedCommit = null;
+    this.commitLoading = false;
 
     this.refresh(cx);
     cx.timer.every(10000, (cx) => this.refresh(cx));
@@ -162,6 +175,12 @@ export default class Changes extends View {
         this.root = null;
         this.files = [];
         this.open = null;
+        this.gitBranch = null;
+        this.gitStatus = null;
+        this.gitLog = [];
+        this.stashCount = 0;
+        this.selectedCommit = null;
+        this.commitLoading = false;
         this.composer = null;
         this.anchorRowIdx = null;
         this.targetPopupOpen = false;
@@ -182,40 +201,68 @@ export default class Changes extends View {
       try {
         const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on });
         if (this.viewKey() !== context) return;
-        if (top.code !== 0) { this.root = null; this.files = []; this.setLines([]); this.open = null; this.error = "Not a git repository"; return; }
+        if (top.code !== 0) {
+          this.root = null;
+          this.files = [];
+          this.gitBranch = null;
+          this.gitStatus = null;
+          this.gitLog = [];
+          this.stashCount = 0;
+          this.selectedCommit = null;
+          this.commitLoading = false;
+          this.setLines([]);
+          this.open = null;
+          this.error = "Not a git repository";
+          return;
+        }
         const root = top.stdout.trim(), git = (args) => exec("git", [...READ, ...args], { cwd: root, on });
-        const status = await git(["status", "--porcelain=v1", "-z", "--no-renames", "--untracked-files=all"]);
-        if (status.code !== 0) throw new Error(status.stderr);
-        const head = await git(["rev-parse", "--verify", "HEAD"]);
+        const [statusRes, logRes, stashRes] = await Promise.all([
+          git(["status", "--porcelain=v2", "--branch", "-z", "--no-renames", "--untracked-files=all"]),
+          git(["log", "-n", "8", "--format=%H%x1f%h%x1f%s%x1f%an%x1f%ar%x1f%D%x1e"]).catch(() => ({ code: 1, stdout: "", stderr: "" })),
+          git(["stash", "list"]).catch(() => ({ code: 1, stdout: "", stderr: "" })),
+        ]);
+        if (statusRes.code !== 0) throw new Error(statusRes.stderr);
+        const parsed = parseGitStatusV2(statusRes.stdout, { limit: 1000 });
+        const hasHead = parsed.branch.hasHead;
+        const gitLog = logRes.code === 0 ? parseGitLog(logRes.stdout) : [];
+        const stashCount = stashRes.code === 0 ? parseStashCount(stashRes.stdout) : 0;
+
         const stats = {};
-        const results = head.code === 0 ? [await git(["diff", "HEAD", "--numstat", "-z", "--no-renames"])] : [await git(["diff", "--cached", "--numstat", "-z", "--no-renames"]), await git(["diff", "--numstat", "-z", "--no-renames"])];
-        for (const result of results) {
-          if (result.code !== 0) throw new Error(result.stderr);
-          for (const entry of result.stdout.split("\0")) {
-            const [a, d, ...parts] = entry.split("\t");
-            if (!parts.length) continue;
-            const path = parts.join("\t"), old = stats[path] ?? { add: 0, del: 0 };
-            stats[path] = { add: old.add + (Number(a) || 0), del: old.del + (Number(d) || 0), binary: a === "-" };
+        if (parsed.files.length > 0) {
+          const results = hasHead
+            ? [await git(["diff", "HEAD", "--numstat", "-z", "--no-renames"])]
+            : [await git(["diff", "--cached", "--numstat", "-z", "--no-renames"]), await git(["diff", "--numstat", "-z", "--no-renames"])];
+          for (const result of results) {
+            if (result.code !== 0) throw new Error(result.stderr);
+            for (const entry of result.stdout.split("\0")) {
+              const [a, d, ...parts] = entry.split("\t");
+              if (!parts.length) continue;
+              const path = parts.join("\t"), old = stats[path] ?? { add: 0, del: 0 };
+              stats[path] = { add: old.add + (Number(a) || 0), del: old.del + (Number(d) || 0), binary: a === "-" };
+            }
           }
         }
-        const files = [];
-        const entries = status.stdout.split("\0").filter(Boolean);
-        for (const entry of entries.slice(0, 1000)) {
-          const xy = entry.slice(0, 2), path = entry.slice(3), fresh = xy === "??";
-          const conflict = xy.includes("U") || xy === "AA" || xy === "DD";
-          const s = conflict ? "U" : xy.includes("D") ? "D" : fresh || xy.includes("A") ? "A" : "M";
-          const stat = stats[path] ?? { add: 0, del: 0 };
-          files.push({ path, status: s, fresh, ...stat });
-        }
+        const files = parsed.files.map((f) => ({ ...f, ...(stats[f.path] ?? { add: 0, del: 0 }) }));
         if (this.viewKey() !== context) return;
-        this.root = root; this.on = on; this.hasHead = head.code === 0; this.files = files; this.limited = entries.length > 1000; this.error = null;
+        this.root = root;
+        this.on = on;
+        this.hasHead = hasHead;
+        this.gitBranch = parsed.branch;
+        this.gitStatus = parsed.status;
+        this.gitLog = gitLog;
+        this.stashCount = stashCount;
+        this.files = files;
+        this.limited = parsed.limited;
+        this.error = null;
         this.watch(root, cx);
-        if (this.open && !files.some((f) => f.path === this.open)) { this.open = null; this.composer = null; this.anchorRowIdx = null; this.setLines([]); }
-        // The first file's diff shows until you pick another.
-        if (!this.open && !this.closed && files.length) this.open = files[0].path;
-        if (this.open) {
-          try { await this.load(this.open, context); }
-          catch { if (this.viewKey() === context) this.setLines(["Cannot preview this diff (too large or unreadable)"]); }
+        if (!this.selectedCommit) {
+          if (this.open && !files.some((f) => f.path === this.open)) { this.open = null; this.composer = null; this.anchorRowIdx = null; this.setLines([]); }
+          // The first file's diff shows until you pick another.
+          if (!this.open && !this.closed && files.length) this.open = files[0].path;
+          if (this.open) {
+            try { await this.load(this.open, context); }
+            catch { if (this.viewKey() === context) this.setLines(["Cannot preview this diff (too large or unreadable)"]); }
+          }
         }
       } catch (e) { if (this.viewKey() === context) this.error = String(e); }
       finally { this.loading = false; cx.notify(); }
@@ -245,13 +292,29 @@ export default class Changes extends View {
     }
   }
 
+  async loadCommit(commit, context) {
+    if (!commit?.hash || !this.root) return;
+    const r = await exec(
+      "git",
+      [...READ, "show", "--no-ext-diff", "--no-textconv", "--no-color", "--stat", "-p", commit.hash],
+      { cwd: this.root, on: this.on },
+    );
+    if (r.code !== 0) throw new Error(r.stderr || r.stdout);
+    const lines = r.stdout ? r.stdout.replace(/\n$/, "").split("\n") : [tr("Empty commit", "空提交")];
+    if (this.viewKey() === context && this.selectedCommit?.hash === commit.hash) {
+      this.setLines(lines.slice(0, 1500).map((line) => (line.length > 4000 ? line.slice(0, 4000) + "… (line truncated)" : line)));
+    }
+  }
+
   setLines(lines) {
     this.rows = diffRows(lines);
-    this.annotatedRows = annotateDiffRows(this.rows, this.open);
+    this.annotatedRows = annotateDiffRows(this.rows, this.selectedCommit ? null : this.open);
     this.diffWidth = Math.max(300, ...this.rows.map((row) => (row.text.length + 1) * 7 + 72));
   }
 
   pick(path, cx) {
+    this.selectedCommit = null;
+    this.commitLoading = false;
     this.open = this.open === path ? null : path;
     this.composer = null;
     this.anchorRowIdx = null;
@@ -267,7 +330,54 @@ export default class Changes extends View {
     cx.notify();
   }
 
+  pickCommit(commit, cx) {
+    if (!commit?.hash) return;
+    if (this.selectedCommit?.hash === commit.hash) {
+      this.closeCommitPreview(cx);
+      return;
+    }
+    this.selectedCommit = commit;
+    this.commitLoading = true;
+    this.open = null;
+    this.composer = null;
+    this.anchorRowIdx = null;
+    this.note = null;
+    this.setLines([]);
+    const context = this.context;
+    cx.spawn(async (cx) => {
+      try {
+        await this.loadCommit(commit, context);
+      } catch (e) {
+        if (this.viewKey() === context && this.selectedCommit?.hash === commit.hash) {
+          this.setLines([tr(`Cannot load commit diff: ${e}`, `无法加载提交差异：${e}`)]);
+        }
+      } finally {
+        if (this.selectedCommit?.hash === commit.hash) this.commitLoading = false;
+        cx.notify();
+      }
+    });
+    cx.notify();
+  }
+
+  closeCommitPreview(cx) {
+    this.selectedCommit = null;
+    this.commitLoading = false;
+    this.setLines([]);
+    this.note = null;
+    const context = this.context;
+    if (!this.closed && this.files.length) {
+      this.open = this.files[0].path;
+      cx.spawn(async (cx) => {
+        try { await this.load(this.open, context); }
+        catch (e) { if (this.viewKey() === context) this.note = `Cannot preview this diff (too large or unreadable): ${e}`; }
+        cx.notify();
+      });
+    }
+    cx.notify();
+  }
+
   clickDiffRow(row, e, cx) {
+    if (this.selectedCommit) return;
     if (!row?.commentable) return;
     const shift = Boolean(e?.modifiers?.shift || e?.shift);
     const anchor = shift && this.anchorRowIdx != null ? this.anchorRowIdx : row.rowIndex;
@@ -917,6 +1027,417 @@ export default class Changes extends View {
       );
   }
 
+  renderGitInfo(t, cx) {
+    const branch = this.gitBranch;
+    const st = this.gitStatus;
+    if (!this.root || (!branch && !st)) return null;
+    const accent = t.accent ?? "#3b82f6";
+    const mono = settings().font_family ?? "JetBrains Mono";
+    const branchLabel = branch
+      ? branch.detached
+        ? tr("Detached HEAD", "游离 HEAD")
+        : branch.name || tr("HEAD", "HEAD")
+      : tr("Repository", "仓库");
+    const branchTooltip = [
+      branch?.detached
+        ? tr(`Detached HEAD at ${branch.headShort || "unknown"}`, `游离 HEAD：${branch.headShort || "未知"}`)
+        : tr(`Branch: ${branchLabel}`, `当前分支：${branchLabel}`),
+      branch?.headOid ? `HEAD: ${branch.headOid}` : tr("No commits yet", "尚无提交"),
+      branch?.upstream
+        ? tr(
+            `Upstream: ${branch.upstream}${branch.upstreamGone ? " (gone)" : ""}`,
+            `上游分支：${branch.upstream}${branch.upstreamGone ? "（已删除）" : ""}`,
+          )
+        : tr("No upstream tracking branch", "未关联上游分支"),
+      branch?.ahead > 0 ? tr(`Ahead by ${branch.ahead} commit(s)`, `领先上游 ${branch.ahead} 个提交`) : "",
+      branch?.behind > 0 ? tr(`Behind by ${branch.behind} commit(s)`, `落后上游 ${branch.behind} 个提交`) : "",
+      this.stashCount > 0 ? tr(`Stashes: ${this.stashCount}`, `贮藏 (stash)：${this.stashCount} 项`) : "",
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    const statusPill = (label, color, bgAlpha = "1e") =>
+      div()
+        .px(5)
+        .py(1)
+        .rounded(4)
+        .bg(withAlpha(color, bgAlpha) ?? t.background)
+        .text_size(10)
+        .font_medium()
+        .text_color(color)
+        .child(label);
+
+    return v_flex()
+      .id("chg-git-info")
+      .flex_none()
+      .px(12)
+      .py(7)
+      .gap(5)
+      .bg(t.raised)
+      .border_b(1)
+      .border_color(t.border)
+      .child(
+        h_flex()
+          .w_full()
+          .gap(6)
+          .items_center()
+          .tooltip(branchTooltip)
+          .child(svg("mods/workspace-chrome/git-branch.svg").size(12).flex_none().text_color(branch?.detached ? t.blocked : accent))
+          .child(
+            div()
+              .min_w(0)
+              .max_w(160)
+              .truncate()
+              .text_size(11.5)
+              .font_semibold()
+              .text_color(branch?.detached ? t.blocked : t.foreground)
+              .child(branchLabel),
+          )
+          .when(Boolean(branch?.headShort), (e) =>
+            e.child(
+              div()
+                .flex_none()
+                .px(4)
+                .py(1)
+                .rounded(4)
+                .bg(t.background)
+                .border_1()
+                .border_color(t.border)
+                .font_family(mono)
+                .text_size(10)
+                .text_color(t.muted)
+                .child(branch.headShort),
+            ),
+          )
+          .when(Boolean(branch && !branch.hasHead), (e) =>
+            e.child(statusPill(tr("unborn", "无提交"), t.dim, "20")),
+          )
+          .when(Boolean(branch?.upstream), (e) =>
+            e.child(
+              div()
+                .min_w(0)
+                .flex_1()
+                .truncate()
+                .text_size(10.5)
+                .text_color(branch.upstreamGone ? t.ansi1 : t.dim)
+                .child(`→ ${branch.upstream}${branch.upstreamGone ? tr(" (gone)", " (已失联)") : ""}`),
+            ),
+          )
+          .when(!branch?.upstream, (e) => e.child(div().flex_1()))
+          .when(Boolean(branch?.ahead > 0), (e) => e.child(statusPill(`↑${branch.ahead}`, t.ansi2)))
+          .when(Boolean(branch?.behind > 0), (e) => e.child(statusPill(`↓${branch.behind}`, t.blocked)))
+          .when(this.stashCount > 0, (e) =>
+            e.child(statusPill(tr(`stash ${this.stashCount}`, `贮藏 ${this.stashCount}`), t.muted, "22")),
+          )
+          .child(
+            div()
+              .id("chg-git-refresh")
+              .flex_none()
+              .px(5)
+              .py(1)
+              .rounded(4)
+              .text_size(11)
+              .text_color(this.loading ? t.dim : t.muted)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover).text_color(t.foreground))
+              .tooltip(tr("Refresh Git status & log", "刷新 Git 状态与提交记录"))
+              .on_click((_e, clickCx) => this.refresh(clickCx))
+              .child("↻"),
+          ),
+      )
+      .when(Boolean(st), (el) =>
+        el.child(
+          h_flex()
+            .id("chg-git-status-bar")
+            .w_full()
+            .gap(5)
+            .items_center()
+            .flex_wrap()
+            .child(
+              div()
+                .flex_none()
+                .font_family(mono)
+                .text_size(10)
+                .text_color(t.dim)
+                .child("status"),
+            )
+            .when(st.clean, (e) =>
+              e.child(
+                h_flex()
+                  .px(6)
+                  .py(1)
+                  .gap(4)
+                  .items_center()
+                  .rounded(4)
+                  .bg(withAlpha(t.ansi2, "1c") ?? t.background)
+                  .text_size(10)
+                  .font_medium()
+                  .text_color(t.ansi2)
+                  .child(svg("mods/workspace-chrome/check.svg").size(10).flex_none().text_color(t.ansi2))
+                  .child(tr("Clean working tree", "工作区干净")),
+              ),
+            )
+            .when(!st.clean && st.conflicts > 0, (e) =>
+              e.child(statusPill(tr(`${st.conflicts} conflict${st.conflicts === 1 ? "" : "s"}`, `冲突 ${st.conflicts}`), t.ansi1, "24")),
+            )
+            .when(!st.clean && st.staged > 0, (e) =>
+              e.child(statusPill(tr(`${st.staged} staged`, `已暂存 ${st.staged}`), t.ansi2)),
+            )
+            .when(!st.clean && st.unstaged > 0, (e) =>
+              e.child(statusPill(tr(`${st.unstaged} modified`, `未暂存 ${st.unstaged}`), t.blocked)),
+            )
+            .when(!st.clean && st.untracked > 0, (e) =>
+              e.child(statusPill(tr(`${st.untracked} untracked`, `未跟踪 ${st.untracked}`), accent)),
+            ),
+        ),
+      );
+  }
+
+  renderCommitBanner(t) {
+    const c = this.selectedCommit;
+    if (!c) return null;
+    const accent = t.accent ?? "#3b82f6";
+    const mono = settings().font_family ?? "JetBrains Mono";
+    return h_flex()
+      .id("chg-commit-banner")
+      .flex_none()
+      .w_full()
+      .px(10)
+      .py(6)
+      .gap(6)
+      .items_center()
+      .bg(withAlpha(accent, "14") ?? t.raised)
+      .border_b(1)
+      .border_color(withAlpha(accent, "44") ?? t.border)
+      .child(
+        div()
+          .flex_none()
+          .px(5)
+          .py(1)
+          .rounded(4)
+          .bg(withAlpha(accent, "24") ?? t.background)
+          .font_family(mono)
+          .text_size(10)
+          .font_semibold()
+          .text_color(accent)
+          .child(c.shortHash),
+      )
+      .child(
+        div()
+          .flex_1()
+          .min_w(0)
+          .truncate()
+          .text_size(11.5)
+          .font_medium()
+          .text_color(t.foreground)
+          .child(c.subject || tr("(no subject)", "(无提交说明)")),
+      )
+      .when(Boolean(c.author || c.relTime), (e) =>
+        e.child(
+          div()
+            .flex_none()
+            .max_w(140)
+            .truncate()
+            .text_size(10)
+            .text_color(t.dim)
+            .child([c.author, c.relTime].filter(Boolean).join(" · ")),
+        ),
+      )
+      .child(
+        div()
+          .id("chg-commit-close")
+          .flex_none()
+          .px(6)
+          .py(2)
+          .rounded(4)
+          .bg(t.background)
+          .border_1()
+          .border_color(t.border)
+          .text_size(10)
+          .text_color(t.muted)
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover).text_color(t.foreground))
+          .on_click((_e, cx) => this.closeCommitPreview(cx))
+          .child(tr("Back to changes", "返回变更")),
+      );
+  }
+
+  renderGitLog(t) {
+    if (!this.root) return null;
+    const accent = t.accent ?? "#3b82f6";
+    const mono = settings().font_family ?? "JetBrains Mono";
+    const commits = this.gitLog ?? [];
+    const latest = commits[0];
+    const bodyHeight = commits.length ? Math.min(136, commits.length * 26 + 8) : 32;
+
+    return v_flex()
+      .id("chg-git-log")
+      .flex_none()
+      .w_full()
+      .border_t(1)
+      .border_color(t.border)
+      .child(
+        h_flex()
+          .id("chg-git-log-toggle")
+          .h(28)
+          .flex_none()
+          .px(12)
+          .gap(6)
+          .items_center()
+          .bg(t.raised)
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover))
+          .on_click((_e, cx) => {
+            this.gitLogOpen = !this.gitLogOpen;
+            cx.notify();
+          })
+          .child(svg(`mods/workspace-chrome/chevron-${this.gitLogOpen ? "down" : "right"}.svg`).size(11).flex_none().text_color(t.dim))
+          .child(svg("mods/workspace-chrome/clock.svg").size(11).flex_none().text_color(t.muted))
+          .child(div().flex_none().text_size(11).font_medium().text_color(t.foreground).child(tr("Recent git log", "最近提交")))
+          .child(
+            div()
+              .flex_none()
+              .px(4)
+              .py(1)
+              .rounded(4)
+              .bg(t.background)
+              .text_size(9.5)
+              .text_color(t.dim)
+              .child(String(commits.length)),
+          )
+          .when(!this.gitLogOpen && Boolean(latest), (e) =>
+            e
+              .child(
+                div()
+                  .flex_none()
+                  .font_family(mono)
+                  .text_size(10)
+                  .text_color(accent)
+                  .child(latest.shortHash),
+              )
+              .child(
+                div()
+                  .flex_1()
+                  .min_w(0)
+                  .truncate()
+                  .text_size(10.5)
+                  .text_color(t.dim)
+                  .child(latest.subject),
+              ),
+          )
+          .when(this.gitLogOpen || !latest, (e) =>
+            e
+              .child(div().flex_1())
+              .when(commits.length > 0, (x) =>
+                x.child(div().flex_none().text_size(10).text_color(t.dim).child(tr("Click to inspect diff", "点击查看变更"))),
+              ),
+          ),
+      )
+      .when(this.gitLogOpen, (el) =>
+        el.child(
+          div()
+            .w_full()
+            .h(bodyHeight)
+            .relative()
+            .border_t(1)
+            .border_color(t.border)
+            .child(
+              v_flex()
+                .id("chg-git-log-list")
+                .absolute()
+                .inset_0()
+                .overflow_y_scroll()
+                .p(4)
+                .gap(2)
+                .when(!commits.length, (e) =>
+                  e.child(div().px(8).py(4).text_size(11).text_color(t.dim).child(tr("No commits yet", "尚无提交记录"))),
+                )
+                .children(
+                  commits.map((c) => {
+                    const active = this.selectedCommit?.hash === c.hash;
+                    const primaryRef = formatPrimaryRef(c.refs);
+                    const tip = [
+                      `${c.shortHash}  ${c.subject}`,
+                      c.refs?.length ? `Refs: ${c.refs.join(", ")}` : "",
+                      [c.author, c.relTime].filter(Boolean).join(" · "),
+                      tr("Click to inspect commit diff", "点击查看本次提交的差异"),
+                    ]
+                      .filter(Boolean)
+                      .join("\n");
+                    return h_flex()
+                      .id(`chg-commit-${c.shortHash}`)
+                      .h(24)
+                      .flex_none()
+                      .px(8)
+                      .gap(6)
+                      .items_center()
+                      .rounded(6)
+                      .cursor_pointer()
+                      .when(active, (e) => e.bg(t.selected))
+                      .hover((s) => s.bg(t.hover))
+                      .tooltip(tip)
+                      .on_click((_e, cx) => this.pickCommit(c, cx))
+                      .child(
+                        div()
+                          .flex_none()
+                          .font_family(mono)
+                          .text_size(10.5)
+                          .text_color(active ? t.foreground : accent)
+                          .child(c.shortHash),
+                      )
+                      .when(Boolean(primaryRef), (e) =>
+                        e.child(
+                          div()
+                            .flex_none()
+                            .max_w(90)
+                            .truncate()
+                            .px(4)
+                            .py(1)
+                            .rounded(4)
+                            .bg(withAlpha(accent, "1c") ?? t.raised)
+                            .text_size(9.5)
+                            .font_medium()
+                            .text_color(accent)
+                            .child(primaryRef),
+                        ),
+                      )
+                      .child(
+                        div()
+                          .flex_1()
+                          .min_w(0)
+                          .truncate()
+                          .text_size(11.5)
+                          .text_color(t.foreground)
+                          .child(c.subject || tr("(no subject)", "(无提交说明)")),
+                      )
+                      .when(Boolean(c.author), (e) =>
+                        e.child(
+                          div()
+                            .flex_none()
+                            .max_w(72)
+                            .truncate()
+                            .text_size(10)
+                            .text_color(t.dim)
+                            .child(c.author),
+                        ),
+                      )
+                      .when(Boolean(c.relTime), (e) =>
+                        e.child(
+                          div()
+                            .flex_none()
+                            .text_size(10)
+                            .text_color(t.dim)
+                            .child(c.relTime),
+                        ),
+                      );
+                  }),
+                ),
+            )
+            .when(commits.length > 5, (e) => e.child(Scrollbar.vertical("chg-git-log-list").absolute().inset_0())),
+        ),
+      );
+  }
+
   render(cx) {
     if (this.viewKey() !== this.context) this.refresh(cx);
     this.syncLastResult();
@@ -929,8 +1450,8 @@ export default class Changes extends View {
     for (const d of allDrafts) {
       countByFile.set(d.path, (countByFile.get(d.path) ?? 0) + 1);
     }
-    const openComments = this.open ? allDrafts.filter((c) => c.path === this.open) : [];
-    const activeComposer = this.composer && this.composer.file === this.open ? this.composer : null;
+    const openComments = !this.selectedCommit && this.open ? allDrafts.filter((c) => c.path === this.open) : [];
+    const activeComposer = !this.selectedCommit && this.composer && this.composer.file === this.open ? this.composer : null;
     const { items, sizes } = buildDisplayItems(this.annotatedRows, openComments, activeComposer);
     const commentedSet = new Set();
     let lastCodeRowIdx = null;
@@ -939,6 +1460,9 @@ export default class Changes extends View {
       else if (item.type === "comment" && !item.outdated && lastCodeRowIdx != null) commentedSet.add(lastCodeRowIdx);
     }
     const accent = t.accent ?? "#3b82f6";
+    const gitInfoEl = this.renderGitInfo(t, cx);
+    const commitBannerEl = this.renderCommitBanner(t);
+    const gitLogEl = this.renderGitLog(t);
 
     return v_flex().id("changes").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13).track_focus(this.handle)
       .on_key_down((e, cx) => {
@@ -949,6 +1473,9 @@ export default class Changes extends View {
             cx.notify();
           } else if (this.composer) {
             this.closeComposer(cx);
+            cx.stop_propagation();
+          } else if (this.selectedCommit) {
+            this.closeCommitPreview(cx);
             cx.stop_propagation();
           } else if (this.typing) {
             this.typing = false;
@@ -979,6 +1506,7 @@ export default class Changes extends View {
           .child(div().text_size(11).text_color(t.ansi2).child(`+${add}`))
           .child(div().text_size(11).text_color(t.ansi1).child(`−${del}`)),
       )
+      .when(Boolean(gitInfoEl), (el) => el.child(gitInfoEl))
       // overflow_y_scrollbar() wraps the list, so its flex sizing never reached the panel's layout.
       .child(div().flex_1().min_h(44).max_h(listHeight).relative().border_b(1).border_color(t.border)
         .child(
@@ -986,9 +1514,23 @@ export default class Changes extends View {
             .children(this.files.map((f) => {
               const parts = f.path.split("/"), name = parts.pop();
               const cCount = countByFile.get(f.path) ?? 0;
-              return h_flex().id(`change-${f.path}`).h(28).flex_none().px(8).gap(8).items_center().rounded(7).cursor_pointer().when(this.open === f.path, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.pick(f.path, cx))
+              return h_flex().id(`change-${f.path}`).h(28).flex_none().px(8).gap(8).items_center().rounded(7).cursor_pointer().when(!this.selectedCommit && this.open === f.path, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.pick(f.path, cx))
                 .child(div().w(14).text_size(11).text_color(f.status === "A" ? t.ansi2 : f.status === "D" ? t.ansi1 : f.status === "U" ? t.ansi1 : t.blocked).child(f.status))
                 .child(h_flex().flex_1().min_w(0).child(div().text_color(t.dim).truncate().child(parts.length ? parts.join("/") + "/" : "")).child(div().max_w(260).min_w(0).truncate().child(name)))
+                .when(Boolean(f.staged), (e) =>
+                  e.child(
+                    div()
+                      .flex_none()
+                      .px(4)
+                      .py(1)
+                      .rounded(4)
+                      .bg(withAlpha(t.ansi2, "1c") ?? t.raised)
+                      .text_size(9.5)
+                      .text_color(t.ansi2)
+                      .tooltip(tr("Staged in index", "已暂存到暂存区"))
+                      .child(tr("staged", "暂存")),
+                  ),
+                )
                 .when(cCount > 0, (e) =>
                   e.child(
                     div()
@@ -1008,6 +1550,7 @@ export default class Changes extends View {
         )
         .child(Scrollbar.vertical("changes-list").absolute().inset_0()))
       .when(this.limited, (el) => el.child(div().px(12).py(4).text_size(11).text_color(t.dim).child(tr("Showing the first 1,000 changed files", "仅显示前 1,000 个变更文件"))))
+      .when(Boolean(commitBannerEl), (el) => el.child(commitBannerEl))
       .child(div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(11)
         .on_mouse_down("left", (e) => { this.lastShift = Boolean(e?.modifiers?.shift); })
         .child(div().id("changes-diff-x").size_full().overflow_x_scrollbar()
@@ -1024,9 +1567,12 @@ export default class Changes extends View {
             ).on_item_click((itemKey, cx) => this.handleVirtualItemClick(itemKey, cx)).size_full(),
           )))
         .child(Scrollbar.vertical("changes-diff").viewport_from_layout().absolute().inset_0())
-        .when(!this.open && this.files.length > 0, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(tr("Select a file to view its changes", "选择一个文件以查看变更详情")))))
+        .when(this.commitLoading, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(tr("Loading commit diff…", "正在加载提交差异…"))))
+        .when(!this.selectedCommit && !this.open && this.files.length > 0, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(tr("Select a file to view its changes", "选择一个文件以查看变更详情"))))
+        .when(!this.selectedCommit && !this.open && !this.files.length && this.gitLog.length > 0, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(tr("Select a commit below to inspect its diff", "点击下方最近提交可查看历史变更详情")))))
       .when(Boolean(activeComposer), (e) => e.child(this.renderDockedComposer(activeComposer, t)))
       .when(allDrafts.length > 0 || Boolean(this.reviewError), (e) => e.child(this.renderReviewBar(t, allDrafts)))
+      .when(Boolean(gitLogEl), (el) => el.child(gitLogEl))
       .when(Boolean(this.note), (e) => e.child(div().px(10).pb(8).text_size(11).text_color(t.ansi1).child(this.note)))
       .child(h_flex().flex_none().p(10).gap(6).items_center().border_t(1).border_color(t.border)
         .child(
