@@ -49,6 +49,7 @@ If your host supports running shell commands in the background, do not block you
 h2 ls                                   # list live agents (--all includes finished)
 h2 get worker                           # full JSON/summary agent state
 h2 send worker "Also inspect error.rs"  # queue prompt into serial ACP inbox
+h2 send worker --image shot.png "Fix this layout bug" # attach native ACP image/resource blocks (--resource, --resource-link)
 h2 inbox ls|edit|rm worker ...          # inspect, edit, or remove queued prompts before turn starts
 h2 send worker --steer "Stop that; inspect foo.rs instead" # cancel active turn & deliver next
 h2 read worker                          # rendered JSONL transcript

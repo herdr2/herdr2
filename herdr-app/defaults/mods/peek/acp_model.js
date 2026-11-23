@@ -85,6 +85,61 @@ export function formatTime(tsMs) {
 }
 
 /**
+ * Returns true when an attachment descriptor represents an image.
+ */
+export function isImageAttachment(att) {
+  if (!att || typeof att !== "object") return false;
+  if (String(att.kind ?? "").toLowerCase() === "image") return true;
+  const mime = String(att.mime_type ?? att.mimeType ?? "").toLowerCase();
+  return mime.startsWith("image/");
+}
+
+/**
+ * Formats a byte size concisely for attachment badges (`420 B`, `18 KB`, `1.4 MB`).
+ */
+export function formatAttachmentBytes(bytes) {
+  const n = Number(bytes);
+  if (!Number.isFinite(n) || n <= 0) return "";
+  if (n < 1024) return `${Math.round(n)} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(n < 10 * 1024 ? 1 : 0)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/**
+ * Extracts a clean display name for an ACP attachment (image, audio, resource, or resource_link).
+ */
+export function attachmentDisplayName(att) {
+  if (!att || typeof att !== "object") return "attachment";
+  const direct = String(att.name ?? "").trim();
+  if (direct) return direct;
+  const src = String(att.path ?? att.uri ?? "").trim();
+  if (src) {
+    const noQuery = src.split(/[?#]/)[0].replace(/[\\/]+$/, "");
+    const parts = noQuery.split(/[\\/]/);
+    const tail = parts[parts.length - 1];
+    if (tail) {
+      try { return decodeURIComponent(tail); } catch { return tail; }
+    }
+  }
+  return String(att.kind ?? "attachment");
+}
+
+function normalizeAttachments(raw) {
+  if (!Array.isArray(raw) || raw.length === 0) return [];
+  return raw
+    .filter((a) => a && typeof a === "object")
+    .map((a) => ({
+      kind: String(a.kind ?? "resource"),
+      mime_type: a.mime_type ?? a.mimeType ?? null,
+      name: attachmentDisplayName(a),
+      path: a.path ? String(a.path) : null,
+      uri: a.uri ? String(a.uri) : null,
+      text: a.text ? String(a.text) : null,
+      bytes: Number.isFinite(Number(a.bytes)) ? Number(a.bytes) : null,
+    }));
+}
+
+/**
  * Replaces a leading home directory path with `~` for header breadcrumbs.
  */
 export function shortenPath(cwd, homeDir) {
@@ -825,10 +880,14 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
       flushStderr();
       currentSpeakerKey = null;
       const env = parseUserEnvelope(entry.text, entry.from ?? null);
+      const attachments = normalizeAttachments(entry.attachments);
       const fallbackBody = env.handoff
         ? `[${env.handoff.kind || "handoff"}${env.handoff.from ? ` from ${env.handoff.from}` : ""}]`
         : "";
       const body = env.body || fallbackBody || String(entry.text ?? "").trim();
+      const attSummary = attachments.length > 0
+        ? `[${attachments.length} ${attachments.length === 1 ? "attachment" : "attachments"}]`
+        : "";
       items.push({
         kind: "user",
         id: `u-${idx}`,
@@ -837,8 +896,9 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
         reach: env.reach,
         handoff: env.handoff,
         body,
+        attachments,
         isDelegated: Boolean(env.from),
-        foldSummary: summarizeUserPrompt(body),
+        foldSummary: summarizeUserPrompt(body) || attSummary,
         ts_ms: entry.ts_ms ?? 0,
       });
       return;
@@ -922,6 +982,7 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
         } else if (status === "failed") {
           activeGroup.failedCount += 1;
         }
+        const attachments = normalizeAttachments(entry.attachments);
         activeGroup.steps.push({
           kind: "tool_call",
           id: `tc-${idx}`,
@@ -931,10 +992,11 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
           extraLines: info.extraLines,
           multiline: info.multiline,
           detail,
+          attachments,
           diffStats: parsedDetail?.mode === "diff"
             ? { additions: parsedDetail.additions, deletions: parsedDetail.deletions }
             : null,
-          expandable: Boolean(info.multiline || (title && title.length > 120) || detail),
+          expandable: Boolean(info.multiline || (title && title.length > 120) || detail || attachments.length > 0),
           tool_kind: entry.tool_kind || "other",
           status,
           ts_ms: entry.ts_ms ?? 0,
@@ -966,12 +1028,18 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
       flushGroup();
       flushStderr();
       const text = String(entry.text ?? "").trim();
-      if (!text) return;
+      const attachments = normalizeAttachments(entry.attachments);
+      if (!text && attachments.length === 0) return;
       const turnNum = entry.turn ?? 0;
       const prev = items[items.length - 1];
       if (prev && prev.kind === "assistant" && prev.turn === turnNum) {
-        prev.text = `${prev.text}\n\n${text}`;
-        prev.blocks = splitMarkdownBlocks(prev.text);
+        if (text) {
+          prev.text = prev.text ? `${prev.text}\n\n${text}` : text;
+          prev.blocks = splitMarkdownBlocks(prev.text);
+        }
+        if (attachments.length > 0) {
+          prev.attachments = [...(prev.attachments ?? []), ...attachments];
+        }
         if (entry.ts_ms) prev.ts_ms = entry.ts_ms;
         return;
       }
@@ -982,6 +1050,7 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
         showSpeakerHeader: speakerNeeded(entry.turn),
         text,
         blocks: splitMarkdownBlocks(text),
+        attachments,
         ts_ms: entry.ts_ms ?? 0,
       });
       return;
@@ -1376,12 +1445,19 @@ export function normalizeInboxItems(rawInbox, terminalsList = [], currentTermina
         const sender = list.find((x) => x?.address === from || (prefix && x?.address === `${prefix}${from}`));
         fromLabel = sender?.name && sender.name !== from ? `${sender.name} (${from})` : from;
       }
+      const attachments = normalizeAttachments(raw.attachments);
+      const previewText = body
+        ? body.replace(/\s*\n\s*/g, " ↵ ")
+        : attachments.length > 0
+          ? `[${attachments.length} ${attachments.length === 1 ? "attachment" : "attachments"}]`
+          : "";
       return {
         id: Number(raw.id),
         index: idx + 1,
         rawText: String(raw.text ?? ""),
         body,
-        preview: body.replace(/\s*\n\s*/g, " ↵ "),
+        preview: previewText,
+        attachments,
         from,
         fromLabel,
         time: formatTime(raw.queued_ms),

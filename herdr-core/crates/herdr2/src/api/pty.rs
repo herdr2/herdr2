@@ -542,6 +542,12 @@ async fn start_pty(
         }
         let mut argv = p.argv;
         let prep = crate::pty_adapters::prepare_pty_launch(core, id, &mut argv, &mut env);
+        let initial_saved_cli = crate::pty_adapters::extract_saved_cli_from_argv(
+            &argv,
+            None,
+            prep.session_id.clone(),
+            None,
+        );
         let addr = st.pty_reg.terminals[&id].address.clone();
         let mut tc = core.target_checkpoints(&mut st, &addr);
         tc.cli_kind = Some(prep.kind.as_str().into());
@@ -555,6 +561,7 @@ async fn start_pty(
             term.argv = argv.clone();
             term.restart_env = p.env;
             term.holder = Some(instance);
+            term.saved_cli = initial_saved_cli;
         }
         let (tx, rx) = tokio::sync::oneshot::channel();
         st.pending.insert(id, tx);

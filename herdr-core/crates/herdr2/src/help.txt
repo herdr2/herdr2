@@ -18,7 +18,8 @@ Agents & terminals
   keep <a|t> [--off]          resume crashed/restarted agent or shell
 
 Communicate & control
-  send <a|t> <text>           queue ACP prompt or paste text into PTY (--steer: cancel & deliver next)
+  send <a|t> [--image F] [--resource F] [--resource-link U] [text]
+                              queue ACP prompt/media or paste into PTY (--steer: cancel & deliver next)
   inbox ls|edit|rm <a> ...    inspect, edit, or remove prompts queued in an ACP inbox
   approve <a> [--option ID]   approve a blocked ACP agent's pending permission request
   deny <a> [--option ID]      deny a blocked ACP agent's pending permission request

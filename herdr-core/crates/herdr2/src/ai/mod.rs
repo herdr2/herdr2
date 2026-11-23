@@ -25,12 +25,14 @@ pub use briefing::{
 };
 pub use client::AiTestResult;
 pub use config::{
-    AiCoreConfig, AiPaths, format_ms_iso, is_loopback_http_url, mask_key, now_iso, now_ms_u64,
-    parse_ai_token_size, parse_iso_ms, validate_http_url, write_secret_file,
+    AiCoreConfig, AiPaths, format_ms_iso, is_loopback_http_url, mask_key, normalize_ai_language,
+    now_iso, now_ms_u64, parse_ai_token_size, parse_iso_ms, prompt_lang_code,
+    read_app_settings_language, validate_http_url, write_secret_file,
 };
 pub use digest::{
-    AgentDigestResult, CommitMessageParams, CommitMessageResult, DeterministicDigest, SummarizeAgentParams,
-    build_deterministic_acp_digest, generate_commit_message, refine_agent_digest,
+    AgentDigestResult, CommitMessageParams, CommitMessageResult, DeterministicDigest, PolishPromptParams,
+    PolishPromptResult, SummarizeAgentParams, build_deterministic_acp_digest, generate_commit_message,
+    polish_prompt, refine_agent_digest,
 };
 pub use handoff_ai::{
     HandoffRecommendParams, HandoffRecommendResult, distill_merge_back, distill_omitted_turns,
@@ -194,6 +196,8 @@ pub struct AiStatus {
     pub context_window: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     #[serde(default)]
     pub available_models: Vec<String>,
     pub circuit_open: bool,
@@ -230,6 +234,8 @@ pub struct AiSettingsSetParams {
     pub context_window: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -449,6 +455,31 @@ impl AiRuntime {
         self.sessions.evict_prefix(prefix);
     }
 
+    /// Resolves the preferred human-facing language tag (`"zh-CN"` or `"en"`):
+    /// explicit `ai.json` `language` > local `herdr2-app/settings.json` `language` > `"en"`.
+    pub fn preferred_language_tag(&self) -> &'static str {
+        if let Some(lang) = self.config_snapshot().language.as_deref() {
+            return if prompt_lang_code(lang) == "zh" { "zh-CN" } else { "en" };
+        }
+        if let Some(lang) = read_app_settings_language(&self.paths.app_settings_file) {
+            return if prompt_lang_code(&lang) == "zh" { "zh-CN" } else { "en" };
+        }
+        "en"
+    }
+
+    /// Resolves the canonical prompt `lang` code (`"zh"` or `"en"`).
+    pub fn preferred_prompt_lang(&self) -> &'static str {
+        prompt_lang_code(self.preferred_language_tag())
+    }
+
+    /// Resolves prompt `lang` code with an optional per-request explicit override.
+    pub fn resolve_prompt_lang(&self, explicit: Option<&str>) -> &'static str {
+        if let Some(raw) = explicit.map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto") && !s.eq_ignore_ascii_case("default")) {
+            return prompt_lang_code(raw);
+        }
+        self.preferred_prompt_lang()
+    }
+
     pub fn status(&self) -> AiStatus {
         let cfg = self.config_snapshot();
         let (key, src) = read_ai_key(&self.paths);
@@ -482,6 +513,7 @@ impl AiRuntime {
             effort: cfg.effort,
             context_window: cfg.context_window,
             max_tokens: cfg.max_tokens,
+            language: cfg.language,
             available_models: self.cached_models(),
             circuit_open: cir.circuit_open,
             cooldown_until: cir.cooldown_until,
@@ -546,6 +578,9 @@ impl AiRuntime {
         if let Some(n) = params.max_tokens {
             next.max_tokens = if n == 0 { None } else { Some(n) };
         }
+        if let Some(s) = params.language {
+            next.language = normalize_ai_language(&s)?;
+        }
         if let Some(b) = params.pty_status_arbitration {
             next.pty_status_arbitration = b;
         }
@@ -574,9 +609,27 @@ impl AiRuntime {
             key_changed = true;
         }
 
+        let cfg_changed = next.enabled != prev.enabled
+            || next.base_url.trim() != prev.base_url.trim()
+            || next.model.trim() != prev.model.trim()
+            || next.effort.trim() != prev.effort.trim()
+            || next.context_window != prev.context_window
+            || next.max_tokens != prev.max_tokens
+            || next.language != prev.language
+            || next.pty_status_arbitration != prev.pty_status_arbitration
+            || next.notes_digest != prev.notes_digest
+            || next.prompt_cache_enabled != prev.prompt_cache_enabled
+            || next.handoff_distill != prev.handoff_distill
+            || next.checkpoint_labeling != prev.checkpoint_labeling
+            || next.semantic_summary != prev.semantic_summary;
+        if !cfg_changed && !key_changed {
+            return Ok(self.status());
+        }
+
         save_config(&self.paths, &mut next)?;
         let url_changed = next.base_url.trim() != prev.base_url.trim();
         let model_changed = next.model.trim() != prev.model.trim();
+        let lang_changed = next.language != prev.language;
         *self.config.lock().unwrap_or_else(|p| p.into_inner()) = next.clone();
 
         if url_changed || key_changed {
@@ -586,7 +639,12 @@ impl AiRuntime {
             save_models_cache(&self.paths, &PersistedAiModelsCache::default());
             self.record_success();
         }
-        if url_changed || model_changed || key_changed || next.prompt_cache_enabled != prev.prompt_cache_enabled {
+        if url_changed
+            || model_changed
+            || key_changed
+            || lang_changed
+            || next.prompt_cache_enabled != prev.prompt_cache_enabled
+        {
             self.sessions.clear_all();
             self.result_cache.clear();
         }
@@ -990,8 +1048,9 @@ impl AiRuntime {
         if line_count < 6 && compact_tail.chars().count() < 360 {
             return None;
         }
+        let lang = self.preferred_prompt_lang();
         let cache_key = format!(
-            "notes_digest:{address}:{news_seq}:{}",
+            "notes_digest:{lang}:{address}:{news_seq}:{}",
             fingerprint_hex(&[status_label, &compact_tail])
         );
         let payload = json!({
@@ -1001,7 +1060,7 @@ impl AiRuntime {
             "cwd": cwd.unwrap_or(""),
             "tail": compact_tail,
         });
-        let user_prompt = format_op_user_message("notes_digest", "en", &payload);
+        let user_prompt = format_op_user_message("notes_digest", lang, &payload);
         let resp = self
             .complete_bg(AiCompleteRequest {
                 op: "notes_digest".into(),
@@ -1372,6 +1431,54 @@ mod tests {
         assert_eq!(reqs[0]["reasoning_effort"], "none");
         assert_eq!(reqs[1]["reasoning_effort"], "low");
         assert_eq!(reqs[2]["reasoning_effort"], "high");
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn preferred_language_follows_explicit_config_then_app_settings_then_en() {
+        let tmp = crate::test_tmp().join(format!("ai-lang-rt-{}", crate::platform::random_hex()));
+        let paths = Paths {
+            socket: tmp.join("core.sock"),
+            holder_socket: tmp.join("holder.sock"),
+            state: tmp.join("state"),
+            config: tmp.join("cfg/herdr2/config.toml"),
+        };
+        paths.create_dirs().unwrap();
+        let app_settings = tmp.join("cfg/herdr2-app/settings.json");
+
+        let rt = AiRuntime::open(&paths).unwrap();
+        // Default without app settings or ai.json language is "en".
+        assert_eq!(rt.preferred_prompt_lang(), "en");
+        assert_eq!(rt.resolve_prompt_lang(Some("zh-CN")), "zh");
+
+        // Writing desktop app settings.json with zh-CN is picked up when ai.json language is unset.
+        std::fs::create_dir_all(app_settings.parent().unwrap()).unwrap();
+        std::fs::write(&app_settings, r#"{"language":"zh-CN"}"#).unwrap();
+        assert_eq!(rt.preferred_language_tag(), "zh-CN");
+        assert_eq!(rt.preferred_prompt_lang(), "zh");
+
+        // Explicit ai.settings.set overrides app settings.json.
+        rt.update_settings(AiSettingsSetParams {
+            language: Some("en".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(rt.preferred_language_tag(), "en");
+        assert_eq!(rt.preferred_prompt_lang(), "en");
+        assert_eq!(rt.status().language.as_deref(), Some("en"));
+
+        // Switching to zh-CN updates status and prompt lang.
+        rt.update_settings(AiSettingsSetParams {
+            language: Some("zh-CN".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(rt.preferred_language_tag(), "zh-CN");
+        assert_eq!(rt.preferred_prompt_lang(), "zh");
+        assert_eq!(rt.status().language.as_deref(), Some("zh-CN"));
 
         let _ = std::fs::remove_dir_all(tmp);
     }

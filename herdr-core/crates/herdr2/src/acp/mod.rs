@@ -1,5 +1,6 @@
 //! ACP session lifecycle: handshake, serial prompt inbox queue, updates, and permissions.
 
+pub mod media;
 pub mod presets;
 pub mod proto;
 pub mod transport;
@@ -8,13 +9,14 @@ use crate::permissions::{self, Decision, PublicPermission, PublicPermissionOptio
 use crate::platform;
 use crate::rpc::RpcError;
 use crate::runtime::{Core, Exit};
+use crate::transcript::{Attachment, Entry};
 use crate::status::StatusReport;
-use crate::transcript::Entry;
 use proto::{
-    AcpConfigChoice, AcpConfigOption, AcpContextUsage, ContentBlock, EnvVar, InitializeParams, InitializeResult,
-    ParsedUpdate, SessionCancelParams, SessionLoadParams, SessionNewParams, SessionNewResult, SessionPromptParams,
-    SessionPromptResult, SessionSetConfigOptionParams, SessionSetModeParams, SessionSetModelParams, StdioMcpServer,
-    parse_request_permission, parse_session_config, parse_session_update, permission_cancelled, permission_selected,
+    AcpConfigChoice, AcpConfigOption, AcpContextUsage, EnvVar, InitializeParams, InitializeResult,
+    ParsedUpdate, PromptCapabilities, SessionCancelParams, SessionLoadParams, SessionNewParams, SessionNewResult,
+    SessionPromptParams, SessionPromptResult, SessionSetConfigOptionParams, SessionSetModeParams,
+    SessionSetModelParams, StdioMcpServer, parse_request_permission, parse_session_config, parse_session_update,
+    permission_cancelled, permission_selected,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -32,15 +34,21 @@ static NEXT_INBOX_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 pub struct QueuedPrompt {
     pub id: u64,
     pub text: String,
+    pub attachments: Vec<Attachment>,
     pub from: Option<String>,
     pub queued_ms: u64,
 }
 
 impl QueuedPrompt {
     pub fn new(text: String, from: Option<String>) -> Self {
+        Self::with_attachments(text, Vec::new(), from)
+    }
+
+    pub fn with_attachments(text: String, attachments: Vec<Attachment>, from: Option<String>) -> Self {
         Self {
             id: NEXT_INBOX_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             text,
+            attachments,
             from,
             queued_ms: crate::runtime::now_ms(),
         }
@@ -80,6 +88,9 @@ pub struct SpawnSpec {
     pub resume_session_id: Option<String>,
     pub can_load_session: bool,
     pub system_prompt: Option<String>,
+    /// Optional portable transcript summary injected into `system_prompt` ONLY if `session/load`
+    /// is unsupported or fails and recovery falls back to `session/new`.
+    pub fallback_handoff_context: Option<String>,
     pub model: Option<String>,
     pub mode: Option<String>,
     pub dangerously_skip_permissions: bool,
@@ -96,6 +107,8 @@ pub struct StartedSession {
     pub session_id: String,
     pub agent_info: Option<String>,
     pub can_load_session: bool,
+    pub resumed_session: bool,
+    pub prompt_capabilities: PromptCapabilities,
     pub config_options: Vec<AcpConfigOption>,
     pub context_usage: Option<AcpContextUsage>,
 }
@@ -125,6 +138,8 @@ pub async fn spawn_session(mut spec: SpawnSpec) -> Result<StartedSession, RpcErr
         session_id: init_res.session_id,
         agent_info: init_res.agent_info,
         can_load_session: init_res.can_load_session,
+        resumed_session: init_res.resumed_session,
+        prompt_capabilities: init_res.prompt_capabilities,
         config_options: init_res.config_options,
         context_usage: init_res.context_usage,
     })
@@ -134,6 +149,8 @@ struct SetupOk {
     session_id: String,
     agent_info: Option<String>,
     can_load_session: bool,
+    resumed_session: bool,
+    prompt_capabilities: PromptCapabilities,
     config_options: Vec<AcpConfigOption>,
     context_usage: Option<AcpContextUsage>,
 }
@@ -661,6 +678,11 @@ async fn setup_session(
     let init: InitializeResult = serde_json::from_value(raw_init).unwrap_or_default();
     let agent_info = init.agent_info.as_ref().and_then(|a| a.display_label());
     let can_load_session = init.agent_capabilities.as_ref().is_some_and(|c| c.load_session);
+    let prompt_capabilities = init
+        .agent_capabilities
+        .as_ref()
+        .map(|c| c.prompt_capabilities)
+        .unwrap_or_default();
 
     let server = if spec.inject_mcp {
         let mut env = vec![
@@ -682,7 +704,34 @@ async fn setup_session(
         None
     };
 
-    let (session_id, mut config_options, context_usage) = match (spec.resume_session_id.as_deref(), can_load_session) {
+    let new_with_fallback = |base: &SpawnSpec| -> SpawnSpec {
+        let mut merged = SpawnSpec {
+            address: base.address.clone(),
+            argv: base.argv.clone(),
+            env: base.env.clone(),
+            cwd: base.cwd.clone(),
+            resume_session_id: None,
+            can_load_session: false,
+            system_prompt: base.system_prompt.clone(),
+            fallback_handoff_context: None,
+            model: base.model.clone(),
+            mode: base.mode.clone(),
+            dangerously_skip_permissions: base.dangerously_skip_permissions,
+            config_overrides: base.config_overrides.clone(),
+            inject_mcp: base.inject_mcp,
+            mcp_exe: base.mcp_exe.clone(),
+            socket: base.socket.clone(),
+        };
+        if let Some(ctx) = base.fallback_handoff_context.as_deref().filter(|s| !s.trim().is_empty()) {
+            merged.system_prompt = Some(match merged.system_prompt.take() {
+                Some(existing) if !existing.trim().is_empty() => format!("{existing}\n\n{ctx}"),
+                _ => ctx.to_string(),
+            });
+        }
+        merged
+    };
+
+    let (session_id, mut config_options, context_usage, resumed_session) = match (spec.resume_session_id.as_deref(), can_load_session) {
         (Some(prev_id), true) => {
             match load_session(transport, prev_id, spec, server.as_ref()).await {
                 Ok(mut opts) => {
@@ -700,17 +749,19 @@ async fn setup_session(
                             }
                         }
                     }
-                    (prev_id.to_string(), opts, usage)
+                    (prev_id.to_string(), opts, usage, true)
                 }
                 Err(_) => {
-                    let (sid, opts) = new_session(transport, spec, server.as_ref()).await?;
-                    (sid, opts, None)
+                    let fallback_spec = new_with_fallback(spec);
+                    let (sid, opts) = new_session(transport, &fallback_spec, server.as_ref()).await?;
+                    (sid, opts, None, false)
                 }
             }
         }
         _ => {
-            let (sid, opts) = new_session(transport, spec, server.as_ref()).await?;
-            (sid, opts, None)
+            let fallback_spec = new_with_fallback(spec);
+            let (sid, opts) = new_session(transport, &fallback_spec, server.as_ref()).await?;
+            (sid, opts, None, false)
         }
     };
 
@@ -803,7 +854,7 @@ async fn setup_session(
         }
     }
 
-    Ok(SetupOk { session_id, agent_info, can_load_session, config_options, context_usage })
+    Ok(SetupOk { session_id, agent_info, can_load_session, resumed_session, prompt_capabilities, config_options, context_usage })
 }
 
 fn build_session_meta(spec: &SpawnSpec, include_system_prompt: bool) -> Option<Value> {
@@ -900,6 +951,7 @@ async fn run_actor(
 ) {
     let transport = started.transport.clone();
     let session_id = started.session_id.clone();
+    let prompt_caps = started.prompt_capabilities;
     let waiter = started.waiter;
     let mut exit_fut = Box::pin(async move { Some(waiter.wait().await) });
     let mut closed = false;
@@ -910,68 +962,85 @@ async fn run_actor(
             let clean_prompt = crate::transcript::strip_h2_envelope(&prompt.text);
             let wire_text = prepare_acp_prompt(&core, id, expected_turn, &prompt.text, &clean_prompt).await;
             let turn_num = begin_turn(&core, id, &prompt);
-            let req = SessionPromptParams {
-                session_id: session_id.clone(),
-                prompt: vec![ContentBlock::Text { text: wire_text }],
-            };
-            let prompt_fut = transport.request("session/prompt", &req, TURN_TIMEOUT);
-            tokio::pin!(prompt_fut);
-            let mut cancel_sent = false;
+            let mut downgraded = false;
 
             let outcome = loop {
-                tokio::select! {
-                    res = &mut prompt_fut => break Some(res),
-                    msg = started.inbound_rx.recv() => match msg {
-                        Some(Inbound::Update(params)) => {
-                            handle_update(&core, id, turn_num, &params);
-                        }
-                        Some(Inbound::Permission { rpc_id, params }) => {
-                            handle_permission(&core, &transport, id, turn_num, rpc_id, &params);
-                        }
-                        Some(Inbound::Stderr(line)) => {
-                            record_entry(&core, id, Entry::Stderr { text: line, ts_ms: crate::runtime::now_ms() });
-                        }
-                        Some(Inbound::Closed) | None => {
-                            closed = true;
-                            break None;
-                        }
-                    },
-                    cmd = cmd_rx.recv() => match cmd {
-                        Some(SessionCommand::WakeInbox) => {}
-                        Some(SessionCommand::Interrupt) => {
-                            cancel_pending_perm(&core, id, turn_num);
-                            if !cancel_sent {
-                                let _ = transport.notify("session/cancel", &SessionCancelParams { session_id: session_id.clone() });
-                                cancel_sent = true;
+                let (wire_blocks, used_rich) =
+                    media::materialize_prompt_blocks(&wire_text, &prompt.attachments, prompt_caps, downgraded);
+                let req = SessionPromptParams { session_id: session_id.clone(), prompt: wire_blocks };
+                let prompt_fut = transport.request("session/prompt", &req, TURN_TIMEOUT);
+                tokio::pin!(prompt_fut);
+                let mut cancel_sent = false;
+
+                let attempt = loop {
+                    tokio::select! {
+                        res = &mut prompt_fut => break Some(res),
+                        msg = started.inbound_rx.recv() => match msg {
+                            Some(Inbound::Update(params)) => {
+                                handle_update(&core, id, turn_num, &params);
                             }
-                        }
-                        Some(SessionCommand::Steer(next)) => {
-                            push_front_prompt(&core, id, next);
-                            cancel_pending_perm(&core, id, turn_num);
-                            if !cancel_sent {
-                                let _ = transport.notify("session/cancel", &SessionCancelParams { session_id: session_id.clone() });
-                                cancel_sent = true;
+                            Some(Inbound::Permission { rpc_id, params }) => {
+                                handle_permission(&core, &transport, id, turn_num, rpc_id, &params);
                             }
+                            Some(Inbound::Stderr(line)) => {
+                                record_entry(&core, id, Entry::Stderr { text: line, ts_ms: crate::runtime::now_ms() });
+                            }
+                            Some(Inbound::Closed) | None => {
+                                closed = true;
+                                break None;
+                            }
+                        },
+                        cmd = cmd_rx.recv() => match cmd {
+                            Some(SessionCommand::WakeInbox) => {}
+                            Some(SessionCommand::Interrupt) => {
+                                cancel_pending_perm(&core, id, turn_num);
+                                if !cancel_sent {
+                                    let _ = transport.notify("session/cancel", &SessionCancelParams { session_id: session_id.clone() });
+                                    cancel_sent = true;
+                                }
+                            }
+                            Some(SessionCommand::Steer(next)) => {
+                                push_front_prompt(&core, id, next);
+                                cancel_pending_perm(&core, id, turn_num);
+                                if !cancel_sent {
+                                    let _ = transport.notify("session/cancel", &SessionCancelParams { session_id: session_id.clone() });
+                                    cancel_sent = true;
+                                }
+                            }
+                            Some(SessionCommand::Signal(sig)) => {
+                                transport.signal(sig);
+                            }
+                            None => {
+                                closed = true;
+                                break None;
+                            }
+                        },
+                        exited = &mut exit_fut => {
+                            finish_exit(&core, id, token, exited);
+                            return;
                         }
-                        Some(SessionCommand::Signal(sig)) => {
-                            transport.signal(sig);
-                        }
-                        None => {
-                            closed = true;
-                            break None;
-                        }
-                    },
-                    exited = &mut exit_fut => {
-                        finish_exit(&core, id, token, exited);
-                        return;
                     }
+                };
+
+                if !downgraded
+                    && used_rich
+                    && !cancel_sent
+                    && let Some(Err(ref err)) = attempt
+                    && err.is_invalid_params()
+                {
+                    downgraded = true;
+                    continue;
                 }
+                break attempt;
             };
 
             if closed {
                 break;
             }
             if let Some(res) = outcome {
+                if matches!(res, Err(CallError::Closed)) {
+                    break;
+                }
                 // Drain buffered inbound updates delivered alongside prompt completion before snapshotting.
                 while let Ok(msg) = started.inbound_rx.try_recv() {
                     match msg {
@@ -1241,6 +1310,7 @@ pub async fn rollback_acp_agent(
         resume_session_id: forked_sid.clone(),
         can_load_session: can_load || forked_sid.is_some(),
         system_prompt,
+        fallback_handoff_context: None,
         model,
         mode,
         dangerously_skip_permissions: skip_perms,
@@ -1287,6 +1357,7 @@ pub async fn rollback_acp_agent(
         let acp_sid = started.session_id.clone();
         let used_native_load = forked_sid.as_deref() == Some(acp_sid.as_str());
         let can_load = started.can_load_session;
+        let prompt_caps = started.prompt_capabilities;
         let agent_info = started.agent_info.clone();
         let config_options = started.config_options.clone();
         let context_usage = started.context_usage.clone();
@@ -1322,6 +1393,7 @@ pub async fn rollback_acp_agent(
             a.scope = Some(scope);
             a.acp_session_id = Some(acp_sid);
             a.can_load_session = can_load;
+            a.prompt_capabilities = Some(prompt_caps);
             a.config_options = config_options;
             if let Some(info) = agent_info {
                 a.agent_info = Some(info);
@@ -1370,7 +1442,11 @@ pub async fn rollback_acp_agent(
 
 fn pop_next_prompt(core: &Core, id: u32) -> Option<QueuedPrompt> {
     let mut st = core.lock();
-    if !st.reg.agents.get(&id).is_some_and(|a| a.is_live()) {
+    if st.stopping
+        || core.restart.load(std::sync::atomic::Ordering::SeqCst)
+        || crate::platform::host_shutdown_in_progress()
+        || !st.reg.agents.get(&id).is_some_and(|a| a.is_live())
+    {
         return None;
     }
     let prompt = st.inboxes.get_mut(&id).and_then(|q| q.pop_front());
@@ -1402,6 +1478,7 @@ fn begin_turn(core: &Core, id: u32, prompt: &QueuedPrompt) -> u64 {
         turn: turn_num,
         from: prompt.from.clone(),
         text: prompt.text.clone(),
+        attachments: prompt.attachments.clone(),
         ts_ms: crate::runtime::now_ms(),
     };
     core.record_transcript(&mut st, id, entry);
@@ -1466,11 +1543,23 @@ fn handle_update(core: &Core, id: u32, turn_num: u64, params: &Value) {
     };
     let ts_ms = crate::runtime::now_ms();
     let entry = match update {
-        ParsedUpdate::AssistantChunk(text) => Entry::Assistant { turn: turn_num, text, ts_ms },
+        ParsedUpdate::AssistantChunk(text) => Entry::Assistant { turn: turn_num, text, attachments: Vec::new(), ts_ms },
+        ParsedUpdate::AssistantBlocks(blocks) => {
+            let (text, attachments) = media::stage_output_blocks(&core.paths.state, id, "out", &blocks);
+            if text.is_empty() && attachments.is_empty() {
+                return;
+            }
+            Entry::Assistant { turn: turn_num, text, attachments, ts_ms }
+        }
         ParsedUpdate::ThoughtChunk(text) => Entry::Thought { turn: turn_num, text, ts_ms },
         ParsedUpdate::UserChunk(_) => return,
-        ParsedUpdate::ToolCall { id: tc_id, title, kind, status, detail } => {
-            Entry::ToolCall { turn: turn_num, id: tc_id, title, tool_kind: kind, status, detail, ts_ms }
+        ParsedUpdate::ToolCall { id: tc_id, title, kind, status, detail, content } => {
+            let (_, attachments) = if content.is_empty() {
+                (String::new(), Vec::new())
+            } else {
+                media::stage_output_blocks(&core.paths.state, id, "tool", &content)
+            };
+            Entry::ToolCall { turn: turn_num, id: tc_id, title, tool_kind: kind, status, detail, attachments, ts_ms }
         }
         ParsedUpdate::Plan(items) => Entry::Plan { turn: turn_num, items, ts_ms },
         ParsedUpdate::ConfigOptions(opts) => {

@@ -367,6 +367,18 @@ export async function saveAiConfig(patch: DaemonAiConfigPatch): Promise<DaemonAi
   return (await send("PUT", "/api/ai/config", patch)) as DaemonAiStatus;
 }
 
+export async function syncAiLanguage(lang: "zh" | "en"): Promise<void> {
+  if (isMock()) return;
+  try {
+    const machine = await targetMachine();
+    await send("PUT", withMachine("/api/ai/language", machine), {
+      language: lang === "zh" ? "zh-CN" : "en",
+    });
+  } catch {
+    /* best-effort sync; ignore older daemons or offline state */
+  }
+}
+
 export async function fetchDaemonEvents(opts?: {
   runId?: string;
   category?: DaemonEventCategory;
@@ -389,12 +401,13 @@ export async function fetchDaemonEvents(opts?: {
   return get<DaemonEventsPage>(`/api/daemon/events${suffix}`);
 }
 
-export async function inspectTask(id: string, opts?: { ai?: boolean; refresh?: boolean }): Promise<Diagnosis> {
+export async function inspectTask(id: string, opts?: { ai?: boolean; refresh?: boolean; lang?: "zh" | "en" }): Promise<Diagnosis> {
   if (isMock()) return mockInspectTask(id, opts);
   const q = new URLSearchParams();
   if (opts?.ai === true) q.set("ai", "1");
   else if (opts?.ai === false) q.set("ai", "0");
   if (opts?.refresh) q.set("refresh", "1");
+  if (opts?.lang) q.set("lang", opts.lang);
   const suffix = q.toString() ? `?${q}` : "";
   return get<Diagnosis>(`/api/tasks/${encodeURIComponent(id)}/inspect${suffix}`);
 }

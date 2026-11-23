@@ -914,7 +914,8 @@ async fn assess_concurrent_write_conflict(
         .map(|t| format!("{}:{}", t.id, t.updated_at))
         .collect();
     key_parts.sort();
-    let cache_key = format!("{}|{}", run.id, key_parts.join("|"));
+    let lang = super::ai::drove_ai_lang(core, None);
+    let cache_key = format!("{}|{}|{}", lang, run.id, key_parts.join("|"));
     if let Some(cached) = core.drove.get_conflict_cached(&cache_key) {
         return cached;
     }

@@ -47,6 +47,25 @@ export function knownAgents(options?: { on?: string | null }): Promise<(Program 
  *  when the person cancels. `prompt`: the confirm button's text (default "Open"). */
 export function pickFolder(options?: { prompt?: string }): Promise<string | null>;
 
+export interface DraftAttachment {
+  kind: "image" | "resource";
+  /** Absolute local path suitable for `h2 send --image` / `--resource`. */
+  path: string;
+  /** App-home relative path for `image()` thumbnails (present for images). */
+  preview?: string | null;
+  name: string;
+  mimeType: string;
+  bytes: number;
+}
+export type DraftAttachmentResult = DraftAttachment | { error: string };
+
+/** Reads an image or copied file paths from the system clipboard and prepares attachment descriptors. */
+export function pasteClipboardAttachments(): DraftAttachmentResult[];
+/** Validates local file paths (e.g. from `.on_drop`) into image/resource attachment descriptors (up to 8, <= 8 MiB each). */
+export function prepareAttachments(paths: string[]): DraftAttachmentResult[];
+/** Opens the system's file picker and returns prepared image/resource attachment descriptors. */
+export function pickAttachments(options?: { prompt?: string; multiple?: boolean }): Promise<DraftAttachmentResult[]>;
+
 /** Plays "done" or "blocked" (the attention sounds, or the files settings.json names), or an MP3
  *  file (absolute, or relative to ~/.config/herdr-app). */
 export function playSound(sound: string): null;
@@ -58,9 +77,10 @@ export function playSound(sound: string): null;
  * the call returns; terminal.keep/park finish in the background and toast on failure.
  * A rename without a name is asked for;
  * "" gives the space or tab Herdr's automatic name again. The main ones:
- * Spaces: space.new {name?, folder?, tab?, argv?, task?, machine?, focus?}, space.close {id?}, space.rename {id?, name},
+ * Spaces: space.new {name?, folder?, tab?, argv?, task?, model?, effort?, machine?, focus?}, space.close {id?}, space.rename {id?, name},
  *   space.move {id, index}, space.select {index | id}, space.next, space.prev.
- * Tabs: tab.new {name?, space?, folder?, argv?, task?, focus?} (argv: an agent, task: its first message)
+ * Tabs: tab.new {name?, space?, folder?, argv?, task?, model?, effort?, focus?} (argv: an agent, task: its first message)
+ *   or {name?, space?, folder?, acp: true, agent, task?, model?, effort?, focus?} (an ACP agent tab)
  *   or {name?, space?, mod, props?, focus?} (a tab whose only pane is a mod),
  *   tab.close {id?}, tab.rename {id?, name}, tab.move {id?, index | by} (by: -1 left, 1 right, wrapping), tab.select {index | id},
  *   tab.next, tab.prev.

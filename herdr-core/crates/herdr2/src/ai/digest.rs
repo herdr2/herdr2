@@ -734,6 +734,177 @@ pub async fn generate_commit_message(
     }
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PolishPromptParams {
+    /// Raw draft prompt to clarify and structure before sending to an agent.
+    pub prompt: String,
+    /// Optional target agent or terminal address (`a1`, `t1`, or `machine/a1`) for brief task/cwd context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// Target agent kind (`acp` or `cli`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_kind: Option<String>,
+    /// Optional extra workspace or conversation context hint.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    /// Preferred UI language (`zh-CN` / `en`); defaults to preserving the prompt's own language.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
+    /// Target remote machine (`h2 machine ls`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PolishPromptResult {
+    pub polished: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    pub used_ai: bool,
+    #[serde(default)]
+    pub from_cache: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_reason: Option<String>,
+}
+
+/// Cleans a multi-line polished prompt while preserving intentional newlines and list formatting.
+pub fn clean_multiline_prompt(raw: &str, max_chars: usize) -> Option<String> {
+    let mut s = raw.trim().replace("\r\n", "\n");
+    if s.starts_with("```") {
+        let mut lines = s.lines();
+        let _ = lines.next();
+        let mut body: Vec<&str> = lines.collect();
+        if body.last().is_some_and(|l| l.trim() == "```") {
+            body.pop();
+        }
+        s = body.join("\n").trim().to_string();
+    }
+    if s.is_empty() {
+        return None;
+    }
+    let out = if s.chars().count() > max_chars {
+        s.chars().take(max_chars).collect::<String>().trim_end().to_string()
+    } else {
+        s
+    };
+    if out.is_empty() { None } else { Some(out) }
+}
+
+/// Rewrites a rough user prompt into a clearer, more structured coding-agent prompt using Core AI.
+pub async fn polish_prompt(
+    ai: &AiRuntime,
+    prompt: &str,
+    agent_kind: Option<&str>,
+    context: Option<&str>,
+    language: Option<&str>,
+) -> Result<PolishPromptResult, String> {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return Err("prompt is empty".to_string());
+    }
+    let is_zh = if has_cjk(trimmed) {
+        true
+    } else if trimmed.chars().any(|c| c.is_ascii_alphabetic()) {
+        false
+    } else {
+        language.is_some_and(|l| l.to_ascii_lowercase().starts_with("zh"))
+    };
+    let lang = if is_zh { "zh" } else { "en" };
+
+    let cfg = ai.config_snapshot();
+    if !cfg.enabled || cfg.base_url.trim().is_empty() {
+        return Ok(PolishPromptResult {
+            polished: trimmed.to_string(),
+            summary: None,
+            used_ai: false,
+            from_cache: false,
+            fallback_reason: Some("ai_not_configured".to_string()),
+        });
+    }
+    if ai.is_circuit_open() {
+        return Ok(PolishPromptResult {
+            polished: trimmed.to_string(),
+            summary: None,
+            used_ai: false,
+            from_cache: false,
+            fallback_reason: Some("ai_circuit_open".to_string()),
+        });
+    }
+
+    let kind = match agent_kind.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("cli") | Some("pty") => "cli",
+        _ => "acp",
+    };
+    let bounded_prompt: String = trimmed.chars().take(4000).collect();
+    let ctx_clean = context.and_then(|c| clean_bounded(Some(c), 240));
+    let cache_key = format!(
+        "polish_prompt:{lang}:{kind}:{}",
+        fingerprint_hex(&[&bounded_prompt, ctx_clean.as_deref().unwrap_or("")])
+    );
+    let payload = json!({
+        "prompt": bounded_prompt,
+        "agent_kind": kind,
+        "context": ctx_clean,
+    });
+    let user_prompt = format_op_user_message("polish_prompt", lang, &payload);
+    let Some(resp) = ai
+        .complete_bg(AiCompleteRequest {
+            op: "polish_prompt".into(),
+            tier: AiTaskTier::Fast,
+            mode: AiConversationMode::StatelessSharedPrefix,
+            user_prompt,
+            max_tokens: 1024,
+            timeout: Duration::from_secs(20),
+            cache_key: Some(cache_key),
+            cache_ttl: Some(Duration::from_secs(300)),
+            prompt_cache_bucket: Some("cp".into()),
+            ..Default::default()
+        })
+        .await
+    else {
+        return Ok(PolishPromptResult {
+            polished: trimmed.to_string(),
+            summary: None,
+            used_ai: false,
+            from_cache: false,
+            fallback_reason: Some("ai_request_failed".to_string()),
+        });
+    };
+
+    if let Some(v) = extract_json_object(&resp.content)
+        && let Some(polished) = v["polished"].as_str().and_then(|s| clean_multiline_prompt(s, 4500))
+    {
+        let summary = clean_bounded(v["summary"].as_str(), 60);
+        return Ok(PolishPromptResult {
+            polished,
+            summary,
+            used_ai: true,
+            from_cache: resp.from_local_cache,
+            fallback_reason: None,
+        });
+    }
+
+    if let Some(polished) = clean_multiline_prompt(&resp.content, 4500) {
+        return Ok(PolishPromptResult {
+            polished,
+            summary: None,
+            used_ai: true,
+            from_cache: resp.from_local_cache,
+            fallback_reason: None,
+        });
+    }
+
+    Ok(PolishPromptResult {
+        polished: trimmed.to_string(),
+        summary: None,
+        used_ai: false,
+        from_cache: false,
+        fallback_reason: Some("ai_empty_response".to_string()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -745,6 +916,7 @@ mod tests {
                 turn: 1,
                 from: Some("t1".into()),
                 text: "<h2 from=\"t1\">修复登录接口超时重试逻辑</h2>".into(),
+                attachments: vec![],
                 ts_ms: 100,
             },
             Entry::ToolCall {
@@ -754,6 +926,7 @@ mod tests {
                 tool_kind: Some("execute".into()),
                 status: "running".into(),
                 detail: None,
+                attachments: vec![],
                 ts_ms: 200,
             },
         ];
@@ -783,17 +956,20 @@ mod tests {
                 turn: 1,
                 from: None,
                 text: "修复登录接口超时重试逻辑".into(),
+                attachments: vec![],
                 ts_ms: 100,
             },
             Entry::Assistant {
                 turn: 1,
                 text: "已完成登录超时重试并验证通过".into(),
+                attachments: vec![],
                 ts_ms: 200,
             },
             Entry::User {
                 turn: 2,
                 from: None,
                 text: "把左下角闪念清单的回收站图标改成和智能体一致".into(),
+                attachments: vec![],
                 ts_ms: 300,
             },
             Entry::ToolCall {
@@ -803,6 +979,7 @@ mod tests {
                 tool_kind: Some("edit".into()),
                 status: "running".into(),
                 detail: None,
+                attachments: vec![],
                 ts_ms: 350,
             },
         ];
@@ -828,6 +1005,7 @@ mod tests {
         finished.push(Entry::Assistant {
             turn: 2,
             text: "已统一为 archive.svg 图标并通过测试".into(),
+            attachments: vec![],
             ts_ms: 400,
         });
         let d_done = build_deterministic_acp_digest("idle", 2, None, &finished, d_mid.semantic_title.as_deref(), true);
@@ -841,11 +1019,11 @@ mod tests {
     #[test]
     fn recent_user_turns_survive_many_tool_calls_and_skip_meta_followups_for_title() {
         let mut entries = vec![
-            Entry::User { turn: 1, from: None, text: "清理退出后的残留状态".into(), ts_ms: 10 },
-            Entry::Assistant { turn: 1, text: "已修复退出清理".into(), ts_ms: 20 },
-            Entry::User { turn: 2, from: None, text: "统一闪念清单回收站图标".into(), ts_ms: 30 },
-            Entry::Assistant { turn: 2, text: "已改为 archive.svg".into(), ts_ms: 40 },
-            Entry::User { turn: 3, from: None, text: "修复 Tab 顶部任务信息不随对话更新".into(), ts_ms: 50 },
+            Entry::User { turn: 1, from: None, text: "清理退出后的残留状态".into(), attachments: vec![], ts_ms: 10 },
+            Entry::Assistant { turn: 1, text: "已修复退出清理".into(), attachments: vec![], ts_ms: 20 },
+            Entry::User { turn: 2, from: None, text: "统一闪念清单回收站图标".into(), attachments: vec![], ts_ms: 30 },
+            Entry::Assistant { turn: 2, text: "已改为 archive.svg".into(), attachments: vec![], ts_ms: 40 },
+            Entry::User { turn: 3, from: None, text: "修复 Tab 顶部任务信息不随对话更新".into(), attachments: vec![], ts_ms: 50 },
         ];
         // Flood Turn 3 with 30 tool calls to ensure `recent_user_turns` is never crowded out.
         for i in 0..30 {
@@ -856,11 +1034,12 @@ mod tests {
                 tool_kind: Some("read".into()),
                 status: "completed".into(),
                 detail: None,
+                attachments: vec![],
                 ts_ms: 60 + i as u64,
             });
         }
-        entries.push(Entry::Assistant { turn: 3, text: "已修复实时更新".into(), ts_ms: 200 });
-        entries.push(Entry::User { turn: 4, from: None, text: "编译安装最新的版本".into(), ts_ms: 300 });
+        entries.push(Entry::Assistant { turn: 3, text: "已修复实时更新".into(), attachments: vec![], ts_ms: 200 });
+        entries.push(Entry::User { turn: 4, from: None, text: "编译安装最新的版本".into(), attachments: vec![], ts_ms: 300 });
 
         let d = build_deterministic_acp_digest("working", 4, None, &entries, None, true);
         assert_eq!(d.recent_user_turns.len(), 4);
@@ -878,5 +1057,15 @@ mod tests {
             "micro_summary should reflect current working follow-up: {:?}",
             d.micro_summary
         );
+    }
+
+    #[test]
+    fn clean_multiline_prompt_strips_code_fence_and_keeps_structure() {
+        let raw = "```markdown\n1. 修复登录超时\n2. 补充单元测试\n```";
+        assert_eq!(
+            clean_multiline_prompt(raw, 500).as_deref(),
+            Some("1. 修复登录超时\n2. 补充单元测试")
+        );
+        assert_eq!(clean_multiline_prompt("   \n  ", 500), None);
     }
 }

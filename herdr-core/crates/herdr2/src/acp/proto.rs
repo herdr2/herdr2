@@ -119,11 +119,24 @@ impl InitializeParams {
     }
 }
 
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptCapabilities {
+    #[serde(default)]
+    pub image: bool,
+    #[serde(default)]
+    pub audio: bool,
+    #[serde(default)]
+    pub embedded_context: bool,
+}
+
 #[derive(Deserialize, Debug, Clone, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentCapabilities {
     #[serde(default)]
     pub load_session: bool,
+    #[serde(default)]
+    pub prompt_capabilities: PromptCapabilities,
 }
 
 #[derive(Deserialize, Debug, Clone, Default)]
@@ -375,10 +388,217 @@ pub struct SessionSetModelParams {
     pub model_id: String,
 }
 
-#[derive(Serialize, Debug, Clone)]
-#[serde(tag = "type", rename_all = "camelCase")]
+/// Embedded resource payload (ACP / MCP compatible): either UTF-8 `text` or base64 `blob`.
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum EmbeddedResourceContent {
+    Text {
+        uri: String,
+        #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        text: String,
+    },
+    Blob {
+        uri: String,
+        #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        blob: String,
+    },
+}
+
+/// ACP multimodal content block (`text`, `image`, `audio`, `resource_link`, `resource`).
+#[derive(Serialize, Deserialize, JsonSchema, Debug, Clone, PartialEq, Eq)]
+#[serde(tag = "type")]
 pub enum ContentBlock {
+    #[serde(rename = "text")]
     Text { text: String },
+    #[serde(rename = "image")]
+    Image {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uri: Option<String>,
+    },
+    #[serde(rename = "audio")]
+    Audio {
+        data: String,
+        #[serde(rename = "mimeType")]
+        mime_type: String,
+    },
+    #[serde(rename = "resource_link")]
+    ResourceLink {
+        uri: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        title: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
+        #[serde(rename = "mimeType", default, skip_serializing_if = "Option::is_none")]
+        mime_type: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        size: Option<u64>,
+    },
+    #[serde(rename = "resource")]
+    Resource { resource: EmbeddedResourceContent },
+}
+
+/// Detects a MIME type from magic bytes first, falling back to filename extension.
+pub fn detect_mime_type(path_or_name: &str, bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    if bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE" {
+        return Some("audio/wav");
+    }
+    if bytes.starts_with(b"BM") {
+        return Some("image/bmp");
+    }
+    if bytes.starts_with(b"%PDF-") {
+        return Some("application/pdf");
+    }
+    if bytes.starts_with(b"OggS") {
+        return Some("audio/ogg");
+    }
+    if bytes.starts_with(b"fLaC") {
+        return Some("audio/flac");
+    }
+    if bytes.starts_with(b"ID3") || (bytes.len() >= 2 && bytes[0] == 0xff && (bytes[1] & 0xe0) == 0xe0) {
+        return Some("audio/mpeg");
+    }
+    if let Ok(head) = std::str::from_utf8(&bytes[..bytes.len().min(2048)]) {
+        let lower = head.trim_start_matches('\u{feff}').trim_start().to_ascii_lowercase();
+        if lower.starts_with("<svg")
+            || ((lower.starts_with("<?xml") || lower.starts_with("<!doctype svg")) && lower.contains("<svg"))
+        {
+            return Some("image/svg+xml");
+        }
+    }
+    let ext = std::path::Path::new(path_or_name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("png") => Some("image/png"),
+        Some("jpg" | "jpeg") => Some("image/jpeg"),
+        Some("gif") => Some("image/gif"),
+        Some("webp") => Some("image/webp"),
+        Some("bmp") => Some("image/bmp"),
+        Some("svg") => Some("image/svg+xml"),
+        Some("wav") => Some("audio/wav"),
+        Some("mp3") => Some("audio/mpeg"),
+        Some("ogg") => Some("audio/ogg"),
+        Some("flac") => Some("audio/flac"),
+        Some("m4a") => Some("audio/mp4"),
+        Some("pdf") => Some("application/pdf"),
+        Some("json") => Some("application/json"),
+        Some("md" | "markdown") => Some("text/markdown"),
+        Some("html" | "htm") => Some("text/html"),
+        Some("css") => Some("text/css"),
+        Some("xml") => Some("application/xml"),
+        Some("yaml" | "yml") => Some("text/yaml"),
+        Some("toml") => Some("application/toml"),
+        Some("csv") => Some("text/csv"),
+        Some("txt" | "log" | "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "c" | "h" | "cpp" | "java" | "sh") => {
+            Some("text/plain")
+        }
+        _ => None,
+    }
+}
+
+/// Maps a MIME type to a clean file extension for staging binary attachments.
+pub fn ext_for_mime(mime: &str) -> &'static str {
+    let base = mime.split(';').next().unwrap_or(mime).trim().to_ascii_lowercase();
+    match base.as_str() {
+        "image/png" => "png",
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        "image/svg+xml" => "svg",
+        "image/tiff" => "tiff",
+        "image/x-icon" | "image/vnd.microsoft.icon" => "ico",
+        "audio/wav" | "audio/x-wav" => "wav",
+        "audio/mpeg" | "audio/mp3" => "mp3",
+        "audio/ogg" => "ogg",
+        "audio/flac" => "flac",
+        "audio/mp4" => "m4a",
+        "application/pdf" => "pdf",
+        "application/json" => "json",
+        "text/markdown" => "md",
+        "text/html" => "html",
+        "text/css" => "css",
+        "text/csv" => "csv",
+        "text/plain" => "txt",
+        _ => "bin",
+    }
+}
+
+/// Formats a local filesystem path as a `file://` URI.
+pub fn file_uri_from_path(path: &str) -> String {
+    if path.starts_with("file://") {
+        return path.to_string();
+    }
+    let normalized = path.replace('\\', "/");
+    let mut encoded = String::with_capacity(normalized.len() + 8);
+    if normalized.starts_with('/') {
+        encoded.push_str("file://");
+    } else {
+        encoded.push_str("file:///");
+    }
+    for byte in normalized.bytes() {
+        let safe = byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_' | b'.' | b'~' | b':');
+        if safe {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
+/// Extracts a local path from a `file://` URI, returning `None` for other schemes.
+pub fn path_from_file_uri(uri: &str) -> Option<String> {
+    let rest = uri.strip_prefix("file://")?;
+    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+    let mut decoded = Vec::with_capacity(rest.len());
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(hex) = std::str::from_utf8(&bytes[i + 1..i + 3])
+            && let Ok(val) = u8::from_str_radix(hex, 16)
+        {
+            decoded.push(val);
+            i += 3;
+            continue;
+        }
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+    let mut s = String::from_utf8(decoded).ok()?;
+    if s.len() >= 3 && s.starts_with('/') && s.as_bytes()[1].is_ascii_alphabetic() && s.as_bytes()[2] == b':' {
+        s.remove(0);
+    }
+    Some(s)
+}
+
+/// Derives a display filename from an optional URI or fallback prefix.
+pub fn name_from_uri(uri: &str) -> Option<String> {
+    let path = path_from_file_uri(uri).unwrap_or_else(|| uri.to_string());
+    let trimmed = path.split(['?', '#']).next().unwrap_or(&path).trim_end_matches(['/', '\\']);
+    let last = trimmed.rsplit(['/', '\\']).next()?.trim();
+    (!last.is_empty()).then(|| last.to_string())
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -412,9 +632,17 @@ pub struct AcpContextUsage {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedUpdate {
     AssistantChunk(String),
+    AssistantBlocks(Vec<ContentBlock>),
     ThoughtChunk(String),
     UserChunk(String),
-    ToolCall { id: String, title: String, kind: Option<String>, status: String, detail: Option<String> },
+    ToolCall {
+        id: String,
+        title: String,
+        kind: Option<String>,
+        status: String,
+        detail: Option<String>,
+        content: Vec<ContentBlock>,
+    },
     Plan(Vec<String>),
     ConfigOptions(Vec<AcpConfigOption>),
     CurrentMode(String),
@@ -427,7 +655,23 @@ pub fn parse_session_update(params: &Value) -> Option<(String, ParsedUpdate)> {
     let update = params.get("update")?;
     let kind = update.get("sessionUpdate").and_then(Value::as_str).unwrap_or_default();
     let parsed = match kind {
-        "agent_message_chunk" => extract_text(update).map_or(ParsedUpdate::Other, ParsedUpdate::AssistantChunk),
+        "agent_message_chunk" => {
+            let blocks = update.get("content").map(extract_content_blocks).unwrap_or_default();
+            if blocks.is_empty() {
+                ParsedUpdate::Other
+            } else if blocks.iter().all(|b| matches!(b, ContentBlock::Text { .. })) {
+                let joined: String = blocks
+                    .into_iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text),
+                        _ => None,
+                    })
+                    .collect();
+                if joined.is_empty() { ParsedUpdate::Other } else { ParsedUpdate::AssistantChunk(joined) }
+            } else {
+                ParsedUpdate::AssistantBlocks(blocks)
+            }
+        }
         "agent_thought_chunk" => extract_text(update).map_or(ParsedUpdate::Other, ParsedUpdate::ThoughtChunk),
         "user_message_chunk" => extract_text(update).map_or(ParsedUpdate::Other, ParsedUpdate::UserChunk),
         "tool_call" | "tool_call_update" => {
@@ -440,7 +684,8 @@ pub fn parse_session_update(params: &Value) -> Option<(String, ParsedUpdate)> {
                 .unwrap_or(if kind == "tool_call" { "pending" } else { "" })
                 .to_string();
             let detail = extract_tool_detail(update);
-            ParsedUpdate::ToolCall { id, title, kind: tool_kind, status, detail }
+            let content = extract_tool_content_blocks(update);
+            ParsedUpdate::ToolCall { id, title, kind: tool_kind, status, detail, content }
         }
         "plan" => {
             let items = update
@@ -482,6 +727,105 @@ pub fn parse_session_update(params: &Value) -> Option<(String, ParsedUpdate)> {
         _ => ParsedUpdate::Other,
     };
     Some((session_id, parsed))
+}
+
+fn parse_one_content_block(item: &Value) -> Option<ContentBlock> {
+    if let Some(text) = item.as_str() {
+        return Some(ContentBlock::Text { text: text.to_string() });
+    }
+    let obj = item.as_object()?;
+    match obj.get("type").and_then(Value::as_str) {
+        Some("text") => obj.get("text").and_then(Value::as_str).map(|t| ContentBlock::Text { text: t.to_string() }),
+        Some("image") => {
+            let data = obj.get("data").and_then(Value::as_str)?.to_string();
+            let mime_type = obj
+                .get("mimeType")
+                .or_else(|| obj.get("mime_type"))
+                .and_then(Value::as_str)
+                .unwrap_or("image/png")
+                .to_string();
+            let uri = obj.get("uri").and_then(Value::as_str).map(String::from);
+            Some(ContentBlock::Image { data, mime_type, uri })
+        }
+        Some("audio") => {
+            let data = obj.get("data").and_then(Value::as_str)?.to_string();
+            let mime_type = obj
+                .get("mimeType")
+                .or_else(|| obj.get("mime_type"))
+                .and_then(Value::as_str)
+                .unwrap_or("audio/wav")
+                .to_string();
+            Some(ContentBlock::Audio { data, mime_type })
+        }
+        Some("resource_link" | "resourceLink") => {
+            let uri = obj.get("uri").and_then(Value::as_str)?.to_string();
+            let name = obj
+                .get("name")
+                .and_then(Value::as_str)
+                .map(String::from)
+                .or_else(|| name_from_uri(&uri))
+                .unwrap_or_else(|| uri.clone());
+            let title = obj.get("title").and_then(Value::as_str).map(String::from);
+            let description = obj.get("description").and_then(Value::as_str).map(String::from);
+            let mime_type = obj
+                .get("mimeType")
+                .or_else(|| obj.get("mime_type"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            let size = obj.get("size").and_then(Value::as_u64);
+            Some(ContentBlock::ResourceLink { uri, name, title, description, mime_type, size })
+        }
+        Some("resource") => {
+            let res = obj.get("resource")?;
+            let uri = res.get("uri").and_then(Value::as_str)?.to_string();
+            let mime_type = res
+                .get("mimeType")
+                .or_else(|| res.get("mime_type"))
+                .and_then(Value::as_str)
+                .map(String::from);
+            if let Some(text) = res.get("text").and_then(Value::as_str) {
+                Some(ContentBlock::Resource {
+                    resource: EmbeddedResourceContent::Text { uri, mime_type, text: text.to_string() },
+                })
+            } else {
+                res.get("blob").and_then(Value::as_str).map(|blob| ContentBlock::Resource {
+                    resource: EmbeddedResourceContent::Blob { uri, mime_type, blob: blob.to_string() },
+                })
+            }
+        }
+        Some(_) => None,
+        None => obj.get("text").and_then(Value::as_str).map(|t| ContentBlock::Text { text: t.to_string() }),
+    }
+}
+
+/// Resiliently extracts one or more ACP `ContentBlock`s from a `content` JSON value.
+pub fn extract_content_blocks(content: &Value) -> Vec<ContentBlock> {
+    if let Some(arr) = content.as_array() {
+        arr.iter().filter_map(parse_one_content_block).collect()
+    } else {
+        parse_one_content_block(content).into_iter().collect()
+    }
+}
+
+/// Extracts non-text multimodal `ContentBlock`s attached to `tool_call` / `tool_call_update` payloads.
+fn extract_tool_content_blocks(update: &Value) -> Vec<ContentBlock> {
+    let mut blocks = Vec::new();
+    let Some(arr) = update.get("content").and_then(Value::as_array) else {
+        return blocks;
+    };
+    for item in arr {
+        let candidate = match item.get("type").and_then(Value::as_str) {
+            Some("content") => item.get("content").and_then(parse_one_content_block),
+            Some("diff" | "terminal") => None,
+            _ => parse_one_content_block(item),
+        };
+        if let Some(blk) = candidate
+            && !matches!(blk, ContentBlock::Text { .. })
+        {
+            blocks.push(blk);
+        }
+    }
+    blocks
 }
 
 fn extract_text(update: &Value) -> Option<String> {
@@ -811,5 +1155,96 @@ mod tests {
         };
         assert_eq!(srv.to_value(true)["type"], "stdio");
         assert!(srv.to_value(false).get("type").is_none());
+    }
+
+    #[test]
+    fn multimodal_content_blocks_and_session_updates_round_trip() {
+        let blocks = vec![
+            ContentBlock::Text { text: "Check screenshot".into() },
+            ContentBlock::Image {
+                data: "iVBORw0KGgo=".into(),
+                mime_type: "image/png".into(),
+                uri: Some("file:///tmp/shot.png".into()),
+            },
+            ContentBlock::Audio { data: "UklGRg==".into(), mime_type: "audio/wav".into() },
+            ContentBlock::ResourceLink {
+                uri: "file:///repo/README.md".into(),
+                name: "README.md".into(),
+                title: Some("Readme".into()),
+                description: Some("Project docs".into()),
+                mime_type: Some("text/markdown".into()),
+                size: Some(42),
+            },
+            ContentBlock::Resource {
+                resource: EmbeddedResourceContent::Text {
+                    uri: "file:///repo/main.rs".into(),
+                    mime_type: Some("text/plain".into()),
+                    text: "fn main() {}".into(),
+                },
+            },
+        ];
+        let val = serde_json::to_value(&blocks).unwrap();
+        assert_eq!(val[0]["type"], "text");
+        assert_eq!(val[1]["type"], "image");
+        assert_eq!(val[1]["mimeType"], "image/png");
+        assert_eq!(val[2]["type"], "audio");
+        assert_eq!(val[3]["type"], "resource_link");
+        assert_eq!(val[4]["type"], "resource");
+        assert_eq!(val[4]["resource"]["text"], "fn main() {}");
+        let back: Vec<ContentBlock> = serde_json::from_value(val).unwrap();
+        assert_eq!(back, blocks);
+
+        let img_update = json!({
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "agent_message_chunk",
+                "content": { "type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png" }
+            }
+        });
+        assert_eq!(
+            parse_session_update(&img_update),
+            Some((
+                "s1".into(),
+                ParsedUpdate::AssistantBlocks(vec![ContentBlock::Image {
+                    data: "iVBORw0KGgo=".into(),
+                    mime_type: "image/png".into(),
+                    uri: None,
+                }])
+            ))
+        );
+
+        let tool_update = json!({
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "tool_call_update",
+                "toolCallId": "tc-img",
+                "title": "Capture screenshot",
+                "kind": "read",
+                "status": "completed",
+                "content": [
+                    { "type": "content", "content": { "type": "text", "text": "Captured 1280x720" } },
+                    { "type": "content", "content": { "type": "image", "data": "iVBORw0KGgo=", "mimeType": "image/png" } }
+                ]
+            }
+        });
+        let Some((sid, ParsedUpdate::ToolCall { id, detail, content, .. })) = parse_session_update(&tool_update) else {
+            panic!("expected tool call update");
+        };
+        assert_eq!(sid, "s1");
+        assert_eq!(id, "tc-img");
+        assert_eq!(detail.as_deref(), Some("Captured 1280x720"));
+        assert_eq!(content.len(), 1);
+        assert!(matches!(&content[0], ContentBlock::Image { mime_type, .. } if mime_type == "image/png"));
+
+        let init: InitializeResult = serde_json::from_value(json!({
+            "protocolVersion": 1,
+            "agentCapabilities": {
+                "loadSession": true,
+                "promptCapabilities": { "image": true, "audio": false, "embeddedContext": true }
+            }
+        }))
+        .unwrap();
+        let caps = init.agent_capabilities.unwrap().prompt_capabilities;
+        assert!(caps.image && !caps.audio && caps.embedded_context);
     }
 }

@@ -208,6 +208,10 @@ pub fn monitor_host_shutdown() -> impl Sized {
     {
         macos_shutdown::monitor()
     }
+    #[cfg(windows)]
+    {
+        windows::monitor_shutdown();
+    }
 }
 
 #[cfg(windows)]
@@ -231,7 +235,7 @@ pub fn host_shutdown_in_progress() -> bool {
     {
         use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SHUTTINGDOWN};
         // Keep USER32 statically linked: first loading it during shutdown can interrupt exit recording.
-        unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) != 0 }
+        windows::host_shutdown_triggered() || unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) != 0 }
     }
     #[cfg(target_os = "macos")]
     {

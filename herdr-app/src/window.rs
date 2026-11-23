@@ -191,6 +191,131 @@ pub fn shell() -> String {
     std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into())
 }
 
+fn cli_model_has_embedded_effort(model: &str) -> bool {
+    let lower = model.trim().to_ascii_lowercase();
+    if lower.is_empty() || matches!(lower.as_str(), "auto" | "default" | "default[]") {
+        return false;
+    }
+    let mut slug = lower.as_str();
+    if let Some(b) = lower.find('[')
+        && lower.ends_with(']')
+    {
+        let inner = &lower[b + 1..lower.len() - 1];
+        for entry in inner.split(',') {
+            if let Some((k, v)) = entry.split_once('=') {
+                let k = k.trim();
+                let v = v.trim();
+                if matches!(k, "effort" | "reasoning_effort" | "reasoning" | "thought_level" | "thinking")
+                    && !v.is_empty()
+                    && !matches!(v, "auto" | "default")
+                {
+                    return true;
+                }
+            }
+        }
+        slug = lower[..b].trim();
+    }
+    let slug = slug.strip_suffix("-fast").unwrap_or(slug);
+    slug.ends_with("-thinking")
+        || ["-extra-high", "-xhigh", "-minimal", "-medium", "-med", "-high", "-low", "-none", "-max"]
+            .iter()
+            .any(|s| slug.ends_with(s))
+}
+
+fn detect_cli_agent_key(cmd: &[String]) -> String {
+    let key = crate::programs::of(None, cmd)["key"].as_str().unwrap_or("").to_owned();
+    if !key.is_empty() && key != "program" && key != "agent" {
+        return key;
+    }
+    if let Some(first) = cmd.first() {
+        let base = first.rsplit(['/', '\\']).next().unwrap_or(first).to_ascii_lowercase();
+        let stem = [".exe", ".cmd", ".bat", ".ps1", ".real"]
+            .iter()
+            .fold(base.as_str(), |acc, ext| acc.strip_suffix(ext).unwrap_or(acc));
+        if matches!(stem, "agy" | "antigravity" | "antigravity-cli") {
+            return "antigravity".into();
+        }
+    }
+    key
+}
+
+fn apply_cli_agent_flags(mut cmd: Vec<String>, model: Option<&str>, effort: Option<&str>) -> Vec<String> {
+    if cmd.is_empty() {
+        return cmd;
+    }
+    let key = detect_cli_agent_key(&cmd);
+    let clean_model = model
+        .map(str::trim)
+        .filter(|m| !m.is_empty() && !m.eq_ignore_ascii_case("default"));
+    let clean_effort = effort
+        .map(str::trim)
+        .filter(|e| !e.is_empty() && !e.eq_ignore_ascii_case("default"));
+
+    if let Some(m) = clean_model {
+        let has_model = cmd.iter().any(|a| a == "--model" || a.starts_with("--model=") || a == "-m");
+        if !has_model {
+            let effective_model = match (key.as_str(), clean_effort) {
+                ("cursor", Some(eff)) if !cli_model_has_embedded_effort(m) => format!("{m}[effort={eff}]"),
+                _ => m.to_owned(),
+            };
+            cmd.push("--model".into());
+            cmd.push(effective_model);
+        }
+    }
+
+    if let Some(eff) = clean_effort {
+        match key.as_str() {
+            "claude" => {
+                if !cmd.iter().any(|a| a == "--effort" || a.starts_with("--effort=")) {
+                    cmd.push("--effort".into());
+                    cmd.push(eff.to_owned());
+                }
+            }
+            "antigravity" => {
+                let model_embeds_effort = clean_model.is_some_and(cli_model_has_embedded_effort);
+                if !model_embeds_effort && !cmd.iter().any(|a| a == "--effort" || a.starts_with("--effort=")) {
+                    cmd.push("--effort".into());
+                    cmd.push(eff.to_owned());
+                }
+            }
+            "codex" => {
+                if !cmd.iter().any(|a| a.contains("model_reasoning_effort")) {
+                    cmd.push("-c".into());
+                    cmd.push(format!("model_reasoning_effort={eff}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    cmd
+}
+
+fn append_cli_agent_task(mut cmd: Vec<String>, task: Option<&str>) -> Vec<String> {
+    let Some(t) = task.map(str::trim).filter(|t| !t.is_empty()) else {
+        return cmd;
+    };
+    if detect_cli_agent_key(&cmd) == "antigravity" {
+        let has_prompt_flag = cmd.iter().any(|a| {
+            matches!(a.as_str(), "-i" | "--prompt-interactive" | "-p" | "--print" | "--prompt")
+                || a.starts_with("--prompt-interactive=")
+                || a.starts_with("--print=")
+                || a.starts_with("--prompt=")
+        });
+        if !has_prompt_flag {
+            cmd.push("--prompt-interactive".into());
+            cmd.push(t.to_owned());
+        }
+    } else {
+        cmd.push(t.to_owned());
+    }
+    cmd
+}
+
+#[cfg(test)]
+fn build_cli_agent_argv(cmd: Vec<String>, model: Option<&str>, effort: Option<&str>, task: Option<&str>) -> Vec<String> {
+    append_cli_agent_task(apply_cli_agent_flags(cmd, model, effort), task)
+}
+
 /// `cmd` in the person's shell, after their rc files (and so their PATH). `stay`: the
 /// shell stays after it (a tab); else the shell becomes it, so its pane ends with it.
 fn unix_agent_argv(sh: String, cmd: Vec<String>, login: bool, stay: bool) -> Vec<String> {
@@ -629,6 +754,8 @@ pub struct AppWindow {
     last_agent_titles: HashMap<String, String>,
     /// Backoff deadline when local Core AI is unconfigured or disabled.
     ai_unavailable_until: Option<Instant>,
+    /// Last interface language pushed to each connected core (`""` = local, else remote machine name).
+    synced_ai_language: HashMap<String, settings::Language>,
     /// Monotonic counter for `files.open` requests routed to the Files panel.
     file_open_seq: u64,
     listed_once: bool,
@@ -763,6 +890,7 @@ impl AppWindow {
             ai_digest_attempted: HashMap::new(),
             last_agent_titles: HashMap::new(),
             ai_unavailable_until: None,
+            synced_ai_language: HashMap::new(),
             file_open_seq: 0,
             listed_once: false,
             cwds: HashMap::new(),
@@ -1017,6 +1145,7 @@ impl AppWindow {
             }
         }));
         Self::note_core(&w.core);
+        w.sync_ai_language();
         w.sync(window, cx);
         w.restore_focus(window, cx);
         // The first time the app opens: the frame's welcome (it sets
@@ -1082,10 +1211,41 @@ impl AppWindow {
         });
     }
 
+    /// Pushes the user's configured interface language to the local core and every connected
+    /// remote machine so Core AI & Drove internal AI hooks follow the user's language setting.
+    fn sync_ai_language(&mut self) {
+        let lang = self.person.language;
+        let targets: Vec<String> = self
+            .documents
+            .iter()
+            .filter(|(_, slot)| slot.connected)
+            .map(|(m, _)| m.clone())
+            .filter(|m| self.synced_ai_language.get(m).copied() != Some(lang))
+            .collect();
+        if targets.is_empty() {
+            return;
+        }
+        for m in &targets {
+            self.synced_ai_language.insert(m.clone(), lang);
+        }
+        let lang_str = if lang == settings::Language::ZhCn { "zh-CN" } else { "en" };
+        let core = self.core.clone();
+        std::thread::spawn(move || {
+            for m in targets {
+                let mut params = json!({ "language": lang_str });
+                if !m.is_empty() {
+                    params["on"] = json!(m);
+                }
+                let _ = core.call("ai.settings.set", params);
+            }
+        });
+    }
+
     fn reconnected(&mut self, core: Arc<Core>, cx: &mut Context<Self>) {
         tracing::info!("reconnected to the core");
         self.core_generation += 1;
         self.ended_acp.clear();
+        self.synced_ai_language.clear();
         self.documents_watching = false;
         for (machine, slot) in &mut self.documents {
             slot.available = false;
@@ -1096,6 +1256,7 @@ impl AppWindow {
         }
         Self::note_core(&core);
         self.core = core.clone();
+        self.sync_ai_language();
         self.publish(cx);
         for t in self.terms.values() {
             t.view.update(cx, |v, cx| v.reattach(core.clone(), cx));
@@ -1143,6 +1304,7 @@ impl AppWindow {
             self.refresh_mods(cx);
             window.refresh();
         }
+        self.sync_ai_language();
     }
 
     fn reload_config(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2827,6 +2989,10 @@ impl AppWindow {
                 self.initial_view = Some(view);
             }
             self.documents.retain(|m, _| m.is_empty() || states.contains_key(m.as_str()));
+            self.synced_ai_language.retain(|m, _| {
+                self.documents.get(m).is_some_and(|slot| slot.connected)
+            });
+            self.sync_ai_language();
             let before = self.model.spaces.len();
             self.model.spaces.retain(|s| s.machine.as_deref().is_none_or(|m| states.contains_key(m)));
             changed |= before != self.model.spaces.len();
@@ -4134,9 +4300,8 @@ impl AppWindow {
     /// An agent with its first message, in a shell that stays when the agent exits
     /// (on another machine: that machine's shell).
     fn agent_argv(argv: Option<Vec<String>>, task: Option<&str>, on: Option<&str>) -> Option<Vec<String>> {
-        let task = task.map(str::trim).filter(|t| !t.is_empty());
-        argv.filter(|a| !a.is_empty()).map(|mut cmd| {
-            cmd.extend(task.map(str::to_owned));
+        argv.filter(|a| !a.is_empty()).map(|cmd| {
+            let cmd = append_cli_agent_task(cmd, task);
             if on.is_some() {
                 return crate::remote_shell::launch(cmd);
             }
@@ -4267,7 +4432,7 @@ impl AppWindow {
     }
 
     /// Starts an ACP agent directly inside a dedicated tab and optionally focuses it.
-    fn new_acp_tab(&mut self, space: Option<String>, name: &str, folder: Option<String>, agent: &str, task: Option<&str>, focus: bool, window: &mut Window, cx: &mut Context<Self>) -> Result<Value, String> {
+    fn new_acp_tab(&mut self, space: Option<String>, name: &str, folder: Option<String>, agent: &str, task: Option<&str>, model: Option<&str>, effort: Option<&str>, focus: bool, window: &mut Window, cx: &mut Context<Self>) -> Result<Value, String> {
         let agent_key = agent.trim();
         if agent_key.is_empty() {
             return Err("tab.new acp requires agent".into());
@@ -4308,6 +4473,12 @@ impl AppWindow {
         });
         if let Some(prompt) = task.map(str::trim).filter(|s| !s.is_empty()) {
             params["prompt"] = json!(prompt);
+        }
+        if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("default")) {
+            params["model"] = json!(m);
+        }
+        if let Some(eff) = effort.map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("default")) {
+            params["effort"] = json!(eff);
         }
         if !space_folder.is_empty() {
             params["cwd"] = json!(space_folder);
@@ -6427,7 +6598,8 @@ impl AppWindow {
             "space.new" => {
                 let Some(focus) = Self::focus(a) else { return self.fail("space.new focus is true or false") };
                 let name = Self::arg(a, "name").unwrap_or_default();
-                let r = self.new_space(name, Self::owned(a, "folder"), Self::arg(a, "tab"), Self::argv(a), Self::arg(a, "task"), Self::owned(a, "machine").filter(|m| !m.is_empty()), Self::owned(a, "shell"), focus, window);
+                let argv = Self::argv(a).map(|cmd| apply_cli_agent_flags(cmd, Self::arg(a, "model"), Self::arg(a, "effort")));
+                let r = self.new_space(name, Self::owned(a, "folder"), Self::arg(a, "tab"), argv, Self::arg(a, "task"), Self::owned(a, "machine").filter(|m| !m.is_empty()), Self::owned(a, "shell"), focus, window);
                 self.answer(r);
             }
             "space.close" => {
@@ -6505,17 +6677,23 @@ impl AppWindow {
                 let name = Self::arg(a, "name").unwrap_or_default();
                 let acp = a.get("acp").and_then(Value::as_bool) == Some(true);
                 let shell = Self::owned(a, "shell");
+                let model = Self::arg(a, "model");
+                let effort = Self::arg(a, "effort");
                 let r = match Self::owned(a, "mod") {
                     Some(m) => self.new_mod_tab(Self::owned(a, "space"), name, m, a.get("props").cloned().unwrap_or(Value::Null), focus),
                     None if acp => {
                         let Some(agent) = Self::owned(a, "agent") else { return self.fail("tab.new acp needs agent") };
-                        self.new_acp_tab(Self::owned(a, "space"), name, Self::owned(a, "folder"), &agent, Self::arg(a, "task"), focus, window, cx)
+                        self.new_acp_tab(Self::owned(a, "space"), name, Self::owned(a, "folder"), &agent, Self::arg(a, "task"), model, effort, focus, window, cx)
                     }
                     // A person's new tab with no space open starts one, as space.new does.
                     None if person && a.get("space").is_none() && self.model.active_space().is_none() => {
-                        self.new_space("", Self::owned(a, "folder"), Some(name), Self::argv(a), Self::arg(a, "task"), None, shell, focus, window)
+                        let argv = Self::argv(a).map(|cmd| apply_cli_agent_flags(cmd, model, effort));
+                        self.new_space("", Self::owned(a, "folder"), Some(name), argv, Self::arg(a, "task"), None, shell, focus, window)
                     }
-                    None => self.new_tab(Self::owned(a, "space"), name, Self::owned(a, "folder"), Self::argv(a), Self::arg(a, "task"), shell, focus, window),
+                    None => {
+                        let argv = Self::argv(a).map(|cmd| apply_cli_agent_flags(cmd, model, effort));
+                        self.new_tab(Self::owned(a, "space"), name, Self::owned(a, "folder"), argv, Self::arg(a, "task"), shell, focus, window)
+                    }
                 };
                 self.answer(r);
             }
@@ -7904,6 +8082,68 @@ impl AppWindow {
                     self.open_overlay(id, spec, window, cx);
                 }
             }
+            "prompt.polish" => {
+                for o in self.overlays.iter().rev() {
+                    if let Some(copy) = self.copies.get(&o.slot)
+                        && matches!(copy.inst.name.as_str(), "flash-note" | "prompt" | "peek")
+                    {
+                        mods::send_command_to(copy.id, "polish");
+                        return;
+                    }
+                }
+                let active_addr = self
+                    .focused_pane
+                    .as_deref()
+                    .and_then(|p| self.model.any_address_of(p))
+                    .or_else(|| self.model.focused_pane().and_then(|p| self.model.any_address_of(&p)))
+                    .or_else(|| self.focused_terminal(window, cx).map(|t| t.address.clone()));
+                if let Some(addr) = active_addr {
+                    if is_acp_addr(&addr) || self.is_structured_terminal(&addr) {
+                        if let Some(copy) = self.copies.values().find(|c| {
+                            c.inst.name == "peek"
+                                && c.inst.props.get("terminal").and_then(Value::as_str) == Some(addr.as_str())
+                        }) {
+                            mods::send_command_to(copy.id, "polish");
+                            return;
+                        }
+                        if mods::send_command("peek", "polish") {
+                            return;
+                        }
+                    }
+                    if self.live.contains_key(&addr) {
+                        let live = self.live.get(&addr);
+                        let agent_name = live
+                            .and_then(|r| {
+                                r.get("labels").and_then(|l| l.get("herdr.name")).and_then(Value::as_str)
+                                    .or_else(|| r.get("name").and_then(Value::as_str))
+                                    .or_else(|| r.get("title").and_then(Value::as_str))
+                            })
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(&addr)
+                            .to_owned();
+                        let cwd = live.and_then(|r| r.get("cwd")).and_then(Value::as_str).unwrap_or("").to_owned();
+                        let spec = json!({
+                            "mod": "prompt",
+                            "kind": "modal",
+                            "width": 580,
+                            "height": 390,
+                            "props": {
+                                "mode": "polish",
+                                "terminal": addr,
+                                "agentName": agent_name,
+                                "agentKind": "cli",
+                                "cwd": cwd,
+                            }
+                        });
+                        self.open_overlay("prompt-polish".into(), spec, window, cx);
+                        return;
+                    }
+                }
+                if !mods::send_command("peek", "polish") {
+                    return self.fail("no active agent or terminal to polish prompt for");
+                }
+                return;
+            }
             "overlay.close" => {
                 let id = Self::owned(a, "id").or_else(|| self.overlays.iter().rev().find(|o| o.kind.modal_keys()).map(|o| o.id.clone()));
                 if let Some(id) = id {
@@ -8482,6 +8722,9 @@ impl AppWindow {
     fn remove_overlay(&mut self, id: &str, window: &mut Window, cx: &mut Context<Self>) {
         if id == "terminal-peek" {
             self.peeked_agent = None;
+        }
+        if id == "settings" {
+            mods::set_shared("settings.recording_shortcut".into(), Value::Bool(false));
         }
         if let Some(i) = self.overlays.iter().position(|o| o.id == id) {
             let o = self.overlays.remove(i);
@@ -10004,6 +10247,11 @@ impl Render for AppWindow {
             .text_color(c("foreground"))
             .font_family(settings::get().ui_font_family.clone())
             .on_action(cx.listener(|this, a: &ShellAction, w, cx| {
+                if mods::shared("settings.recording_shortcut") == Some(Value::Bool(true))
+                    && this.overlays.iter().any(|o| o.id == "settings")
+                {
+                    return;
+                }
                 #[cfg(any(target_os = "macos", test))]
                 if matches!(a.id(), "terminal.copy" | "terminal.paste")
                     && crate::macos::dispatch_edit(a, this.terms.values().any(|t| t.view.read(cx).owns_keyboard_focus(w, cx)), w, cx) {
@@ -10019,6 +10267,11 @@ impl Render for AppWindow {
                 this.run_action(a.id(), w, cx);
             }))
             .on_action(cx.listener(|this, a: &crate::keys::CommandBinding, w, cx| {
+                if mods::shared("settings.recording_shortcut") == Some(Value::Bool(true))
+                    && this.overlays.iter().any(|o| o.id == "settings")
+                {
+                    return;
+                }
                 match a.command() {
                     Ok((name, args)) => {
                         #[cfg(target_os = "macos")]
@@ -10040,6 +10293,30 @@ impl Render for AppWindow {
                 }
             }))
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                if mods::shared("settings.recording_shortcut") == Some(Value::Bool(true))
+                    && this.overlays.iter().any(|o| o.id == "settings")
+                {
+                    let m = &ev.keystroke.modifiers;
+                    let key = ev.keystroke.key.as_str();
+                    let is_bare_mod = matches!(
+                        key,
+                        "control" | "shift" | "alt" | "platform" | "super" | "meta" | "function" | "capslock"
+                    );
+                    if !is_bare_mod {
+                        if key == "escape" && !m.control && !m.alt && !m.platform && !m.shift {
+                            mods::set_shared("settings.recording_shortcut".into(), Value::Bool(false));
+                        } else {
+                            let chord = ev.keystroke.unparse();
+                            static REC_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                            let seq = REC_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            mods::set_shared("settings.recording_shortcut".into(), Value::Bool(false));
+                            mods::set_shared("settings.recorded_shortcut".into(), json!({ "seq": seq, "chord": chord }));
+                        }
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                }
                 if ev.keystroke.key == "escape" {
                     if this.pane_drag.is_some() {
                         this.cancel_pane_drag(cx);
@@ -10612,6 +10889,100 @@ mod tests {
                 assert_eq!(crate::programs::of(None, &agent)["key"], "cursor", "{agent:?}");
             }
         }
+    }
+
+    #[test]
+    fn cli_agent_argv_passes_prompt_interactive_to_agy_and_formats_model_effort() {
+        // Antigravity (`agy`) rejects positional prompt arguments; must receive `--prompt-interactive`.
+        let agy_default = super::build_cli_agent_argv(
+            vec!["agy".into(), "--dangerously-skip-permissions".into()],
+            None,
+            None,
+            Some("markdown 的预览页面能否增加行数和批注功能"),
+        );
+        assert_eq!(
+            agy_default,
+            vec![
+                "agy",
+                "--dangerously-skip-permissions",
+                "--prompt-interactive",
+                "markdown 的预览页面能否增加行数和批注功能",
+            ]
+        );
+
+        // Antigravity with variant model (effort already embedded in slug) omits redundant `--effort`.
+        let agy_variant = super::build_cli_agent_argv(
+            vec!["agy".into(), "--dangerously-skip-permissions".into()],
+            Some("gemini-4-carbon-high"),
+            Some("high"),
+            Some("check diff"),
+        );
+        assert_eq!(
+            agy_variant,
+            vec![
+                "agy",
+                "--dangerously-skip-permissions",
+                "--model",
+                "gemini-4-carbon-high",
+                "--prompt-interactive",
+                "check diff",
+            ]
+        );
+
+        // Antigravity with default model + explicit effort passes `--effort`.
+        let agy_effort_only = super::build_cli_agent_argv(
+            vec!["/home/u/.local/bin/agy.real".into(), "--dangerously-skip-permissions".into()],
+            None,
+            Some("xhigh"),
+            Some("- leading dash prompt"),
+        );
+        assert_eq!(
+            agy_effort_only,
+            vec![
+                "/home/u/.local/bin/agy.real",
+                "--dangerously-skip-permissions",
+                "--effort",
+                "xhigh",
+                "--prompt-interactive",
+                "- leading dash prompt",
+            ]
+        );
+
+        // Claude passes `--model`, `--effort`, and positional prompt.
+        let claude = super::build_cli_agent_argv(
+            vec!["claude".into(), "--dangerously-skip-permissions".into()],
+            Some("opus"),
+            Some("high"),
+            Some("fix tests"),
+        );
+        assert_eq!(
+            claude,
+            vec!["claude", "--dangerously-skip-permissions", "--model", "opus", "--effort", "high", "fix tests"]
+        );
+
+        // Codex passes `--model`, `-c model_reasoning_effort=...`, and positional prompt.
+        let codex = super::build_cli_agent_argv(
+            vec!["codex".into(), "--no-daemon".into()],
+            Some("gpt-5.4"),
+            Some("xhigh"),
+            Some("refactor parser"),
+        );
+        assert_eq!(
+            codex,
+            vec!["codex", "--no-daemon", "--model", "gpt-5.4", "-c", "model_reasoning_effort=xhigh", "refactor parser"]
+        );
+
+        // Cursor parameterizes `[effort=...]` onto `--model` rather than passing an unknown `--effort` flag.
+        let cursor = super::build_cli_agent_argv(
+            vec!["cursor-agent".into(), "--yolo".into(), "--trust".into()],
+            Some("gpt-5.4"),
+            Some("high"),
+            Some("audit types"),
+        );
+        assert_eq!(
+            cursor,
+            vec!["cursor-agent", "--yolo", "--trust", "--model", "gpt-5.4[effort=high]", "audit types"]
+        );
     }
 
     #[cfg(unix)]

@@ -226,6 +226,29 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
     for name in ["feedbackPasteImage", "feedbackClearImages", "feedbackAttachImages"] {
         module = module.function(name, |_| Ok(HostValue::Null));
     }
+    module = module.function("pasteClipboardAttachments", |_| Ok(HostValue::Array(vec![])));
+    module = module.function("prepareAttachments", |a| {
+        let paths = a
+            .get(0)
+            .map(from_host)
+            .and_then(|v| v.as_array().cloned())
+            .unwrap_or_default();
+        let out: Vec<Value> = paths
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_owned))
+            .map(|p| {
+                let name = p.rsplit(['/', '\\']).next().unwrap_or(&p).to_string();
+                let is_img = name.ends_with(".png") || name.ends_with(".jpg") || name.ends_with(".webp");
+                if is_img {
+                    json!({ "kind": "image", "path": p, "preview": null, "name": name, "mimeType": "image/png", "bytes": 2048 })
+                } else {
+                    json!({ "kind": "resource", "path": p, "name": name, "mimeType": "text/markdown", "bytes": 512 })
+                }
+            })
+            .collect();
+        Ok(to_host(&Value::Array(out)))
+    });
+    module = module.async_function("pickAttachments", |_| Ok(async { Ok(HostValue::Array(vec![])) }));
     module = module.async_function("feedbackPickImages", |_| Ok(async { Ok(HostValue::Array(vec![])) }));
     module = module.async_function("knownAgents", |_| Ok(async { Ok(HostValue::Array(vec![])) }));
     module = module.async_function("pickFolder", |_| Ok(async { Ok(HostValue::Null) }));
@@ -455,6 +478,64 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
                         "stderr": ""
                     }))
                 }
+                "hc" | "h2" if first == json!(["read", "--json", "a_media"]) => {
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "complete": true,
+                            "how": "transcript",
+                            "entries": [
+                                {
+                                    "kind": "user",
+                                    "turn": 1,
+                                    "text": "Check this screenshot and spec",
+                                    "attachments": [
+                                        {"kind": "image", "mime_type": "image/png", "name": "bug-shot.png", "path": "/fixture/files/bug-shot.png", "bytes": 2048},
+                                        {"kind": "resource", "mime_type": "text/markdown", "name": "spec.md", "path": "/fixture/files/spec.md", "text": "# Spec\nFix header overlap.", "bytes": 128}
+                                    ],
+                                    "ts_ms": 1700000000000i64
+                                },
+                                {
+                                    "kind": "tool_call",
+                                    "turn": 1,
+                                    "id": "tc-shot",
+                                    "title": "Capture UI preview",
+                                    "tool_kind": "read",
+                                    "status": "completed",
+                                    "attachments": [
+                                        {"kind": "image", "mime_type": "image/png", "name": "after.png", "path": "/fixture/files/after.png", "bytes": 4096}
+                                    ],
+                                    "ts_ms": 1700000001000i64
+                                },
+                                {
+                                    "kind": "assistant",
+                                    "turn": 1,
+                                    "text": "Updated layout and verified screenshot.",
+                                    "attachments": [
+                                        {"kind": "image", "mime_type": "image/png", "name": "verified.png", "path": "/fixture/files/verified.png", "bytes": 3072},
+                                        {"kind": "resource_link", "mime_type": "text/html", "name": "Design doc", "uri": "https://example.com/design"}
+                                    ],
+                                    "ts_ms": 1700000002000i64
+                                }
+                            ]
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
+                }
+                "hc" | "h2" if first == json!(["get", "--json", "a_media"]) => {
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "address": "a_media",
+                            "state": "live",
+                            "turn": 1,
+                            "cwd": "/fixture/project",
+                            "prompt_capabilities": {"image": true, "audio": false, "embeddedContext": true},
+                            "config_options": []
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
+                }
                 "hc" | "h2" if first == json!(["read", "--json", "a1"]) => {
                     Some(json!({
                         "code": 0,
@@ -555,6 +636,57 @@ fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostMod
                 "hc" | "h2" if first == json!(["interrupt", "--json", "t1"]) => {
                     calls.borrow_mut().interrupted.push("t1".into());
                     Some(json!({"code":0,"stdout":"{\"outcome\":\"stopped\"}","stderr":""}))
+                }
+                "hc" | "h2" if first.as_array().is_some_and(|arr| arr.first().and_then(Value::as_str) == Some("drove") && arr.get(1).and_then(Value::as_str) == Some("settings")) => {
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "agents": {
+                                "agents": [
+                                    {
+                                        "id": "claude",
+                                        "installed": true,
+                                        "models": ["claude-opus-4-7", "claude-sonnet-4-6", "opus", "sonnet"],
+                                        "defaultModel": "claude-opus-4-7",
+                                        "efforts": ["low", "medium", "high", "xhigh", "max"],
+                                        "defaultEffort": "high",
+                                        "modelEfforts": {}
+                                    },
+                                    {
+                                        "id": "codex",
+                                        "installed": true,
+                                        "models": ["gpt-5.4", "gpt-5.3-codex"],
+                                        "defaultModel": "gpt-5.4",
+                                        "efforts": ["low", "medium", "high", "xhigh"],
+                                        "defaultEffort": "high",
+                                        "modelEfforts": {}
+                                    },
+                                    {
+                                        "id": "agy",
+                                        "installed": true,
+                                        "models": [
+                                            "gemini-4-carbon-high",
+                                            "gemini-4-carbon-medium",
+                                            "gemini-4-carbon-low",
+                                            "gemini-4-neon-xhigh",
+                                            "gemini-4-neon-high",
+                                            "gemini-4-neon-medium",
+                                            "gemini-4-neon-low",
+                                            "gemini-pro-orchestrator"
+                                        ],
+                                        "defaultModel": "gemini-4-carbon-high",
+                                        "efforts": ["low", "medium", "high", "xhigh"],
+                                        "defaultEffort": "high",
+                                        "modelEfforts": {
+                                            "gemini-4-carbon": ["low", "medium", "high"],
+                                            "gemini-4-neon": ["low", "medium", "high", "xhigh"]
+                                        }
+                                    }
+                                ]
+                            }
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
                 }
                 "hc" | "h2" if first == json!(["checkpoint", "ls", "--json", "t1"]) => {
                     Some(json!({
@@ -1239,7 +1371,13 @@ fn option_key_settings_are_only_shown_on_macos(cx: &mut TestAppContext) {
         for value in ["auto", "on", "off", "left", "right"] {
             assert_eq!(tree.contains(&format!("st-option-{value}")), platform == "macos", "{platform}: {tree}");
         }
-        assert_eq!(tree.contains("st-s-keyboard"), platform == "macos", "{platform}: {tree}");
+        assert!(tree.contains("st-s-keyboard"), "Shortcuts section must be visible on {platform}: {tree}");
+        assert!(tree.contains("st-shortcuts"), "Shortcuts editor must render on {platform}: {tree}");
+        assert!(tree.contains("st-key-global-prompt.polish"), "AI prompt polish shortcut row missing on {platform}: {tree}");
+        assert!(tree.contains("st-key-global-tab.new"), "New tab shortcut row missing on {platform}: {tree}");
+        assert!(tree.contains("st-key-global-terminal.open"), "New terminal shortcut row missing on {platform}: {tree}");
+        assert!(tree.contains("st-key-global-mod.open:flash-note"), "Flash note shortcut row missing on {platform}: {tree}");
+        assert!(tree.contains("st-keys-reset-all"), "Reset all shortcuts button missing on {platform}: {tree}");
     }
 }
 
@@ -1654,6 +1792,58 @@ fn acp_peek_renders_t3_conversation_and_permission_card(cx: &mut TestAppContext)
     assert!(tree.contains("Code"), "mode pill missing: {tree}");
     assert!(tree.contains("acp-mount-tab") && tree.contains("Open as Tab"), "Open as Tab button missing in dialog: {tree}");
     assert!(tree.contains("acp-split-right") && tree.contains("Split right"), "Split right button missing in dialog: {tree}");
+    assert!(tree.contains("acp-attach"), "composer attach button missing: {tree}");
+}
+
+#[gpui::test]
+fn acp_peek_renders_multimodal_attachments_and_composer_drafts(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let program = json!({"key":"pi", "name":"Pi", "icon":null, "tint":true, "tile":"#334455", "color":"#aabbcc", "shell":false, "agent":true});
+    let mut values = fixture(true, json!({"overlay":"o1","terminal":"a_media","acp":true}), updates("current", "current"));
+    values.insert("terminals".into(), json!([
+        {"address":"a_media","name":"Visual","title":"Visual","argv":["pi"],"parent":null,"labels":{},"state":"live","status":"idle","turn":1,"transcript_seq":3,"prompt_capabilities":{"image":true,"audio":false,"embeddedContext":true},"report":{"app":"pi"},"program":program,"cwd":"/fixture/project"}
+    ]));
+    values.insert("agents".into(), json!([
+        {"address":"a_media","pane":"p1","space":"s1","space_name":"Local","tab":"tab1","tab_index":1,"tab_name":"Visual","status":"idle","app":"pi","program":program,"title":"Visual","seq":1,"focused":true}
+    ]));
+
+    let data_png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAAEUlEQVR4nGMUMgn7z8DAwAAACQ0BnfdmzRUAAAAASUVORK5CYII=";
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    calls.borrow_mut().images.insert("/fixture/files/bug-shot.png".into(), data_png.into());
+    calls.borrow_mut().images.insert("/fixture/files/verified.png".into(), data_png.into());
+    calls.borrow_mut().images.insert("/fixture/files/after.png".into(), data_png.into());
+
+    let policy = Policy::new()
+        .with_storage_path(staged.0.join("store-acp-media.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(module(values, calls.clone()))
+        .unwrap();
+    let runtime = ShellRuntime::new_isolated().unwrap();
+    let root = staged.wrapper(
+        "mods/peek",
+        "this.handleDropFiles(['/tmp/dropped.png', '/tmp/report.md'], cx);",
+    );
+    let window = cx.add_window(|_, _| Empty);
+    let mut session = window.update(cx, |_, window, cx| {
+        let mut session = DescriptionSession::load(runtime, root, policy, window, cx).unwrap();
+        let _initial = session.describe(window, cx).unwrap();
+        session
+    }).unwrap();
+
+    cx.run_until_parked();
+    let tree = window.update(cx, |_, window, cx| session.describe(window, cx).unwrap()).unwrap();
+    window.update(cx, |_, window, _| window.remove_window()).unwrap();
+    cx.run_until_parked();
+
+    assert!(calls.borrow().unexpected.is_empty(), "unexpected host calls: {:?}", calls.borrow().unexpected);
+    assert!(tree.contains("acp-media-u-0-att-0") && tree.contains("bug-shot.png"), "user image card missing: {tree}");
+    assert!(tree.contains("acp-res-u-0-att-1") && tree.contains("spec.md"), "user resource card missing: {tree}");
+    assert!(tree.contains("acp-media-as-2-att-0") && tree.contains("verified.png"), "assistant image card missing: {tree}");
+    assert!(tree.contains("acp-res-as-2-att-1") && tree.contains("Design doc"), "assistant resource_link card missing: {tree}");
+    assert!(tree.contains("acp-draft-attachments"), "composer draft attachments bar missing: {tree}");
+    assert!(tree.contains("dropped.png") && tree.contains("report.md"), "dropped draft attachments missing: {tree}");
+    assert!(tree.contains("acp-attach"), "composer attach button missing: {tree}");
 }
 
 #[gpui::test]
@@ -3656,6 +3846,10 @@ fn flash_note_button_composer_and_sidebar_list_work_end_to_end(cx: &mut TestAppC
     assert!(list_populated.contains("Refactor cache invalidation"), "first note preview missing: {list_populated}");
     assert!(list_populated.contains("fn-item-n2"), "second saved note missing: {list_populated}");
     assert!(list_populated.contains("Sent → Build (t1)"), "sent badge missing: {list_populated}");
+    // Ascending chronological order: earlier note (n2: 1700000000500) must appear above later note (n1: 1700000001000).
+    let pos_n2 = list_populated.find("fn-item-n2").unwrap();
+    let pos_n1 = list_populated.find("fn-item-n1").unwrap();
+    assert!(pos_n2 < pos_n1, "flash notes list must sort earlier notes on top and later notes below: {list_populated}");
 
     // 2b) Inline rename + moving a note to recycle bin + recycle bin popup rendering.
     let ops_calls = Rc::new(RefCell::new(Calls::default()));
@@ -3675,8 +3869,8 @@ fn flash_note_button_composer_and_sidebar_list_work_end_to_end(cx: &mut TestAppC
     let ops_root = staged.wrapper(
         "mods/flash-note",
         r#"
-            const first = this.savedNotes()[0];
-            this.startInlineRename(first, cx);
+            const target = this.savedNotes().find((n) => n.id === "n1");
+            this.startInlineRename(target, cx);
             this.renameInput.set_value("Release cache plan");
             this.commitInlineRename(cx);
             this.trashNote("n2", cx);
@@ -3745,9 +3939,11 @@ fn flash_note_button_composer_and_sidebar_list_work_end_to_end(cx: &mut TestAppC
     ).unwrap();
     assert!(compose_new.contains("fn-preset-btn"), "new agent preset picker missing: {compose_new}");
     assert!(compose_new.contains("fn-new-rt-acp") && compose_new.contains("fn-new-rt-cli"), "ACP/CLI mode toggles missing: {compose_new}");
+    assert!(compose_new.contains("fn-model-btn"), "new agent model picker missing: {compose_new}");
+    assert!(compose_new.contains("fn-eff-default") && compose_new.contains("fn-eff-high"), "new agent reasoning effort chips missing: {compose_new}");
     assert!(compose_new.contains("fn-space-btn"), "workspace picker missing: {compose_new}");
 
-    // Verify saving persists title + text into shared("flash_notes.items") and sending to a new ACP agent dispatches tab.new with task.
+    // Verify saving persists title + text into shared("flash_notes.items") and sending to a new ACP/CLI agent dispatches tab.new with model, effort, and task.
     let calls = Rc::new(RefCell::new(Calls::default()));
     let values = fixture(true, json!({"overlay": "fn-ov", "mode": "compose"}), updates("current", "current"));
     let policy = Policy::new()
@@ -3763,6 +3959,15 @@ fn flash_note_button_composer_and_sidebar_list_work_end_to_end(cx: &mut TestAppC
             this.input.set_value("Investigate memory spike on idle");
             this.saveIdea(cx);
             this.targetMode = "new";
+            this.selectPreset("claude");
+            this.selectModel("opus");
+            this.selectedEffort = "high";
+            this.sendIdea(cx);
+            this.newRuntimeMode = "cli";
+            this.selectPreset("antigravity");
+            this.selectModel("gemini-4-carbon");
+            this.selectedEffort = "high";
+            this.input.set_value("markdown 的预览页面能否增加行数和批注功能");
             this.sendIdea(cx);
         "#,
     );
@@ -3778,17 +3983,24 @@ fn flash_note_button_composer_and_sidebar_list_work_end_to_end(cx: &mut TestAppC
     let saved_arr = saved.as_array().expect("flash_notes.items must be persisted as array");
     assert_eq!(saved_arr.len(), 1);
     assert_eq!(saved_arr[0]["title"], json!("Idle memory check"));
-    assert_eq!(saved_arr[0]["text"], json!("Investigate memory spike on idle"));
-    let tab_new_call = calls
+    let tab_new_calls: Vec<Value> = calls
         .borrow()
         .effects
         .iter()
-        .find(|(name, args)| name == "run" && args.first().and_then(Value::as_str) == Some("tab.new"))
-        .cloned();
-    assert!(tab_new_call.is_some(), "sending flash note to new agent must run tab.new");
-    let tab_new_args = &tab_new_call.unwrap().1[1];
-    assert_eq!(tab_new_args["acp"], json!(true));
-    assert_eq!(tab_new_args["task"], json!("Investigate memory spike on idle"));
+        .filter(|(name, args)| name == "run" && args.first().and_then(Value::as_str) == Some("tab.new"))
+        .map(|(_, args)| args[1].clone())
+        .collect();
+    assert_eq!(tab_new_calls.len(), 2, "expected both ACP and CLI tab.new dispatches: {tab_new_calls:?}");
+    assert_eq!(tab_new_calls[0]["acp"], json!(true));
+    assert_eq!(tab_new_calls[0]["agent"], json!("claude"));
+    assert_eq!(tab_new_calls[0]["model"], json!("opus"));
+    assert_eq!(tab_new_calls[0]["effort"], json!("high"));
+    assert_eq!(tab_new_calls[0]["task"], json!("Investigate memory spike on idle"));
+
+    assert_eq!(tab_new_calls[1]["argv"], json!(["agy", "--dangerously-skip-permissions"]));
+    assert_eq!(tab_new_calls[1]["model"], json!("gemini-4-carbon-high"));
+    assert_eq!(tab_new_calls[1]["effort"], json!("high"));
+    assert_eq!(tab_new_calls[1]["task"], json!("markdown 的预览页面能否增加行数和批注功能"));
 }
 
 #[gpui::test]
@@ -4318,4 +4530,98 @@ fn changes_renders_git_branch_status_and_recent_log_without_errors(cx: &mut Test
     assert_eq!(err.unwrap(), None, "changes git info + log + commit preview must draw with zero errors");
     visual.update(|window, _| window.remove_window());
     cx.run_until_parked();
+}
+
+#[gpui::test]
+fn prompt_polish_renders_across_acp_cli_pane_prompt_and_flash_note(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+
+    // 1) Peek composer (ACP & CLI chat view) renders Polish button + polished undo banner.
+    let peek_setup = r#"
+        this.input.set_value('请修复登录超时问题并补充单元测试');
+        this.polishUndoText = '修下登录超时';
+        this.polishSummary = '明确修复范围与测试要求';
+        this.polishApplied = true;
+    "#;
+    let acp_tree = describe(
+        cx,
+        &staged,
+        "mods/peek",
+        true,
+        json!({ "terminal": "a1", "acp": true, "tab": true }),
+        updates("current", "current"),
+        Some(peek_setup),
+    )
+    .unwrap();
+    assert!(acp_tree.contains("acp-polish"), "peek composer must render Polish button: {acp_tree}");
+    assert!(acp_tree.contains("acp-polish-banner"), "peek composer must render polished summary banner: {acp_tree}");
+    assert!(acp_tree.contains("acp-polish-undo"), "peek composer must render undo button: {acp_tree}");
+
+    // 2) Prompt modal in mode="polish" (used by CLI raw terminal panes) renders full polisher & sender UI.
+    let prompt_setup = r#"
+        this.textarea.set_value('Refactor auth middleware and add retry backoff tests');
+        this.polishUndoText = 'refactor auth add tests';
+        this.polishSummary = 'Clarified scope and test target';
+    "#;
+    let prompt_tree = describe(
+        cx,
+        &staged,
+        "mods/prompt",
+        true,
+        json!({
+            "overlay": "ov-polish",
+            "mode": "polish",
+            "terminal": "t1",
+            "agentName": "Codex",
+            "agentKind": "cli",
+            "cwd": "/fixture/project"
+        }),
+        updates("current", "current"),
+        Some(prompt_setup),
+    )
+    .unwrap();
+    assert!(prompt_tree.contains("prompt-polish-modal"), "prompt modal must render polish view: {prompt_tree}");
+    assert!(prompt_tree.contains("pm-polish-run"), "prompt modal must render AI Polish button: {prompt_tree}");
+    assert!(prompt_tree.contains("pm-polish-send"), "prompt modal must render Send button: {prompt_tree}");
+    assert!(prompt_tree.contains("pm-polish-undo"), "prompt modal must render Undo button: {prompt_tree}");
+    assert!(prompt_tree.contains("CLI · Codex"), "prompt modal must show CLI agent badge: {prompt_tree}");
+
+    // 3) Pane header renders Polish entry for live CLI agent in raw terminal view.
+    let mut values = fixture(true, json!({ "pane": "p1" }), updates("current", "current"));
+    values.insert("panes".into(), json!([{
+        "pane": "p1",
+        "terminal": "t1",
+        "acp": false,
+        "structured": false,
+        "title": "Codex",
+        "status": "idle",
+        "focused": true,
+        "cwd": "/fixture/project",
+        "program": { "name": "Codex", "agent": true, "tint": true }
+    }]));
+    values.insert("terminals".into(), json!([{
+        "address": "t1",
+        "title": "Codex",
+        "argv": ["codex"],
+        "state": "live",
+        "status": "idle",
+        "program": { "name": "Codex", "agent": true, "tint": true },
+        "cwd": "/fixture/project"
+    }]));
+    let pane_tree = describe_with_values(cx, &staged, "mods/pane", values, None).unwrap();
+    assert!(pane_tree.contains("ph-polish-p1"), "CLI terminal pane header must render Polish button: {pane_tree}");
+
+    // 4) Flash Note compose window renders Polish button.
+    let fn_tree = describe(
+        cx,
+        &staged,
+        "mods/flash-note",
+        true,
+        json!({}),
+        updates("current", "current"),
+        None,
+    )
+    .unwrap();
+    assert!(fn_tree.contains("fn-polish"), "flash-note composer must render Polish button: {fn_tree}");
 }

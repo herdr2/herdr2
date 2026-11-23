@@ -28,7 +28,8 @@ Agents & terminals
   keep <a|t> [--off]          resume crashed/restarted agent or shell
 
 Communicate & control
-  send <a|t> <text>           queue ACP prompt or paste text into PTY (--steer: cancel & deliver next)
+  send <a|t> [--image F] [--resource F] [--resource-link U] [text]
+                              queue ACP prompt/media or paste into PTY (--steer: cancel & deliver next)
   inbox ls|edit|rm <a> ...    inspect, edit, or remove prompts queued in an ACP inbox
   approve <a> [--option ID]   approve a blocked ACP agent's pending permission request
   deny <a> [--option ID]      deny a blocked ACP agent's pending permission request
@@ -85,6 +86,7 @@ Commands:
   briefing           Aggregate local & remote agents and Drove runs into a priority catch-up briefing
   summarize-agent    Generate or refresh a concise semantic title and progress micro-summary for an agent or terminal
   commit-message     Generate a concise Git commit message for uncommitted changes using Core AI
+  polish-prompt      Polish a rough user prompt into a clearer, more structured prompt for an ACP or CLI agent
   help               Print this message or the help of the given subcommand(s)
 
 Options:
@@ -139,6 +141,26 @@ Options:
       --json                   JSON output even in a terminal
       --lang <LANG>            Caller UI language (`zh` / `en`)
   -h, --help                   Print help
+```
+
+## h2 ai polish-prompt
+
+```text
+Polish a rough user prompt into a clearer, more structured prompt for an ACP or CLI agent
+
+Usage: h2 ai polish-prompt [OPTIONS] <PROMPT>
+
+Arguments:
+  <PROMPT>  Draft prompt text to polish
+
+Options:
+      --json               JSON output even in a terminal
+      --target <TARGET>    Optional target agent or terminal (`a1`, `t1`, name, or `machine/a1`)
+      --kind <KIND>        Target agent kind (`acp` or `cli`)
+      --context <CONTEXT>  Optional extra context hint (workspace or task summary)
+      --lang <LANG>        Preferred language (`zh-CN` / `en`)
+      --on <ON>            Target remote machine (`h2 machine ls`)
+  -h, --help               Print help
 ```
 
 ## h2 ai settings-set
@@ -1224,11 +1246,28 @@ Inspect, edit, or remove prompts queued in an ACP agent's serial inbox
 Usage: h2 inbox [OPTIONS] <COMMAND>
 
 Commands:
-  ls    List queued prompts waiting in an agent's inbox
-  edit  Edit a queued prompt before its turn begins
-  rm    Remove a queued prompt before its turn begins
-  send  Interrupt the active turn if needed and immediately send a queued prompt
-  help  Print this message or the help of the given subcommand(s)
+  ls            List queued prompts waiting in an agent's inbox
+  edit          Edit a queued prompt before its turn begins
+  rm            Remove a queued prompt before its turn begins
+  send          Interrupt the active turn if needed and immediately send a queued prompt
+  resume        Re-enqueue paused prompts preserved across a restart/reboot and resume delivery
+  clear-paused  Discard paused prompts preserved across a restart/reboot
+  help          Print this message or the help of the given subcommand(s)
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h2 inbox clear-paused
+
+```text
+Discard paused prompts preserved across a restart/reboot
+
+Usage: h2 inbox clear-paused [OPTIONS] [AGENT]
+
+Arguments:
+  [AGENT]  The agent: `a7`, a name, or `machine/a7`
 
 Options:
       --json  JSON output even in a terminal
@@ -1258,6 +1297,21 @@ Options:
 List queued prompts waiting in an agent's inbox
 
 Usage: h2 inbox ls [OPTIONS] [AGENT]
+
+Arguments:
+  [AGENT]  The agent: `a7`, a name, or `machine/a7`
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h2 inbox resume
+
+```text
+Re-enqueue paused prompts preserved across a restart/reboot and resume delivery
+
+Usage: h2 inbox resume [OPTIONS] [AGENT]
 
 Arguments:
   [AGENT]  The agent: `a7`, a name, or `machine/a7`
@@ -1623,20 +1677,23 @@ Options:
 ```text
 Queue a prompt into an agent's ACP inbox (or --steer to cancel & deliver next)
 
-Usage: h2 send [OPTIONS] <AGENT> <TEXT>
+Usage: h2 send [OPTIONS] <AGENT> [TEXT]
 
 Arguments:
   <AGENT>  The agent: `a7`, a name, or `machine/a7`
-  <TEXT>   Prompt text queued for the agent's ACP inbox
+  [TEXT]   Prompt text queued for the agent's ACP inbox (may be empty when sending `--image`/`--resource`/`content`)
 
 Options:
-      --json               JSON output even in a terminal
-      --steer              Cancel the active ACP turn (`session/cancel`) and deliver this prompt next
-      --if <STATUS>        Only enqueue if the status is exactly this [possible values: idle, working]
-      --wait               Wait for the turn this send triggers
-      --timeout <TIMEOUT>  With wait: seconds before it checks in (default: config, else 180)
-      --from <FROM>        Sender address attributed in `<h2 from="...">` tags (default: caller)
-  -h, --help               Print help
+      --image <FILE>         Attach one or more local image files (PNG/JPEG/WebP/GIF/SVG, <= 8 MB) as native ACP image blocks
+      --json                 JSON output even in a terminal
+      --resource <FILE>      Attach one or more local files as ACP embedded resource blocks (text or binary <= 8 MB)
+      --resource-link <URI>  Attach one or more URIs or file paths as ACP `resource_link` blocks
+      --steer                Cancel the active ACP turn (`session/cancel`) and deliver this prompt next
+      --if <STATUS>          Only enqueue if the status is exactly this [possible values: idle, working]
+      --wait                 Wait for the turn this send triggers
+      --timeout <TIMEOUT>    With wait: seconds before it checks in (default: config, else 180)
+      --from <FROM>          Sender address attributed in `<h2 from="...">` tags (default: caller)
+  -h, --help                 Print help
 ```
 
 ## h2 server

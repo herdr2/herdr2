@@ -1091,6 +1091,8 @@ pub struct AiSettings {
     pub context_window: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     #[serde(default = "default_true")]
     pub auto_title: bool,
     #[serde(default = "default_true")]
@@ -1132,6 +1134,7 @@ impl Default for AiSettings {
             effort: default_ai_effort(),
             context_window: None,
             max_tokens: None,
+            language: None,
             auto_title: true,
             verify_digest: true,
             handover_compact: true,
@@ -1240,6 +1243,8 @@ pub struct DaemonAiStatus {
     pub context_window: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     #[serde(default)]
     pub available_models: Vec<String>,
     pub circuit_open: bool,
@@ -1266,6 +1271,8 @@ pub struct DroveAiPatch {
     pub context_window: Option<String>,
     #[serde(default)]
     pub max_tokens: Option<u32>,
+    #[serde(default)]
+    pub language: Option<String>,
     #[serde(default)]
     pub auto_title: Option<bool>,
     #[serde(default)]

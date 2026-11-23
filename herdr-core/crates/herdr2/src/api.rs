@@ -26,6 +26,7 @@ pub const FEATURES: &[&str] = &[
     "restart_environment",
     "drove",
     "ai",
+    "multimodal",
 ];
 pub const FINISHED_LINES: usize = 1000;
 /// Agent and terminal identity variables stripped unless explicitly passed by a caller.
@@ -129,6 +130,12 @@ methods! { Ctx<'_>;
     "agent.inbox_send" => agent_inbox_send, InboxSendParams => Public,
         "Interrupt the active turn if needed and immediately send a queued prompt from an ACP agent's serial inbox.",
         errors ["not_found", "machine_unknown", "finished", "unavailable"];
+    "agent.inbox_resume" => agent_inbox_resume, AgentParams => Public,
+        "Re-enqueue paused inbox prompts preserved across a restart or reboot and resume delivery.",
+        errors ["not_found", "machine_unknown", "finished", "unavailable"];
+    "agent.inbox_clear_paused" => agent_inbox_clear_paused, AgentParams => Public,
+        "Discard paused inbox prompts preserved across a restart or reboot.",
+        errors ["not_found", "machine_unknown", "finished"];
     "agent.wait" => agent_wait, WaitParams => crate::wait::WaitResult,
         "Wait until an agent leaves `working` (idle, blocked, error, or exited). Already not working returns immediately. With `children`, wait on subordinate agents.",
         errors ["not_found", "machine_unknown", "invalid_params", "needs_target", "config"];
@@ -284,6 +291,9 @@ methods! { Ctx<'_>;
         errors ["not_found", "machine_unknown", "invalid_params", "unavailable"];
     "ai.commit_message" => ai_commit_message, crate::ai::CommitMessageParams => crate::ai::CommitMessageResult,
         "Generate a concise Git commit message for uncommitted changes in a repository using Core AI.",
+        errors ["machine_unknown", "invalid_params", "unavailable"];
+    "ai.polish_prompt" => ai_polish_prompt, crate::ai::PolishPromptParams => crate::ai::PolishPromptResult,
+        "Rewrite a rough draft prompt into a clearer, well-structured prompt for an ACP or CLI coding agent using Core AI.",
         errors ["machine_unknown", "invalid_params", "unavailable"];
     "checkpoint.list" => checkpoint_list, CheckpointListParams => CheckpointListResult,
         "List hidden Git ref checkpoints and workspace isolation status for an agent or terminal.",
@@ -649,13 +659,87 @@ async fn agent_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError
 }
 
 pub(super) async fn agent_send(core: Ctx<'_>, p: SendParams) -> Result<SendResult, RpcError> {
+    if p.text.trim().is_empty() && p.content.is_empty() {
+        return Err(RpcError::invalid_params("give non-empty text or at least one content block"));
+    }
     match resolve_any(core, &p.agent)? {
         TargetKey::Terminal(id) => {
+            let mut text = p.text;
+            if !p.content.is_empty() {
+                let mut staged_paths = Vec::new();
+                for blk in &p.content {
+                    match blk {
+                        crate::acp::proto::ContentBlock::Text { text: t } if !t.is_empty() => {
+                            if !text.is_empty() {
+                                text.push('\n');
+                            }
+                            text.push_str(t);
+                        }
+                        crate::acp::proto::ContentBlock::Image { data, mime_type, uri } => {
+                            let clean: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+                            let bytes = crate::put::decode(&clean)
+                                .ok_or_else(|| RpcError::invalid_params("image data is not valid base64"))?;
+                            if bytes.len() > crate::put::MAX_BYTES {
+                                return Err(RpcError::invalid_params("image exceeds 8 MB limit"));
+                            }
+                            let name = uri
+                                .as_deref()
+                                .and_then(crate::acp::proto::name_from_uri)
+                                .unwrap_or_else(|| format!("image.{}", crate::acp::proto::ext_for_mime(mime_type)));
+                            let path = crate::put::stage_terminal(&core.paths.state, id, &name, &bytes)
+                                .map_err(|e| RpcError::internal(format!("cannot stage image: {e}")))?;
+                            staged_paths.push(path.display().to_string());
+                        }
+                        crate::acp::proto::ContentBlock::Audio { data, mime_type } => {
+                            let clean: String = data.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+                            let bytes = crate::put::decode(&clean)
+                                .ok_or_else(|| RpcError::invalid_params("audio data is not valid base64"))?;
+                            if bytes.len() > crate::put::MAX_BYTES {
+                                return Err(RpcError::invalid_params("audio exceeds 8 MB limit"));
+                            }
+                            let name = format!("audio.{}", crate::acp::proto::ext_for_mime(mime_type));
+                            let path = crate::put::stage_terminal(&core.paths.state, id, &name, &bytes)
+                                .map_err(|e| RpcError::internal(format!("cannot stage audio: {e}")))?;
+                            staged_paths.push(path.display().to_string());
+                        }
+                        crate::acp::proto::ContentBlock::Resource { resource } => {
+                            let (uri, bytes) = match resource {
+                                crate::acp::proto::EmbeddedResourceContent::Text { uri, text: t, .. } => {
+                                    (uri.as_str(), t.as_bytes().to_vec())
+                                }
+                                crate::acp::proto::EmbeddedResourceContent::Blob { uri, blob, .. } => {
+                                    let clean: String = blob.chars().filter(|c| !c.is_ascii_whitespace()).collect();
+                                    let b = crate::put::decode(&clean)
+                                        .ok_or_else(|| RpcError::invalid_params("resource blob is not valid base64"))?;
+                                    (uri.as_str(), b)
+                                }
+                            };
+                            if bytes.len() > crate::put::MAX_BYTES {
+                                return Err(RpcError::invalid_params("resource exceeds 8 MB limit"));
+                            }
+                            let name = crate::acp::proto::name_from_uri(uri).unwrap_or_else(|| "resource.bin".into());
+                            let path = crate::put::stage_terminal(&core.paths.state, id, &name, &bytes)
+                                .map_err(|e| RpcError::internal(format!("cannot stage resource: {e}")))?;
+                            staged_paths.push(path.display().to_string());
+                        }
+                        crate::acp::proto::ContentBlock::ResourceLink { uri, .. } => {
+                            staged_paths.push(crate::acp::proto::path_from_file_uri(uri).unwrap_or_else(|| uri.clone()));
+                        }
+                        _ => {}
+                    }
+                }
+                if !staged_paths.is_empty() {
+                    if !text.is_empty() {
+                        text.push(' ');
+                    }
+                    text.push_str(&staged_paths.join(" "));
+                }
+            }
             let r = terminal_send(
                 core,
                 TerminalSendParams {
                     terminal: crate::terminals::address(id),
-                    text: p.text,
+                    text,
                     force: p.steer,
                     only_if: p.only_if,
                     wait: p.wait,
@@ -669,9 +753,33 @@ pub(super) async fn agent_send(core: Ctx<'_>, p: SendParams) -> Result<SendResul
         TargetKey::Agent(id) => {
             let timeout = wait_timeout(core, p.timeout)?;
             let sender = p.from.as_deref().or(p.caller.as_deref());
-            let text =
-                if p.text.trim_start().starts_with("<h2") { p.text.clone() } else { core.tagged(sender, id, &p.text, false) };
-            let sent = core.send(id, &text, p.steer, p.only_if.map(|w| word(&w)).as_deref(), sender).await?;
+            let (extra_texts, attachments) = if p.content.is_empty() {
+                (Vec::new(), Vec::new())
+            } else {
+                crate::acp::media::stage_prompt_content(&core.paths.state, id, &p.content)?
+            };
+            let mut combined_raw = p.text;
+            for extra in extra_texts {
+                if !combined_raw.is_empty() {
+                    combined_raw.push('\n');
+                }
+                combined_raw.push_str(&extra);
+            }
+            let text = if combined_raw.is_empty() || combined_raw.trim_start().starts_with("<h2") {
+                combined_raw
+            } else {
+                core.tagged(sender, id, &combined_raw, false)
+            };
+            let sent = core
+                .send_with_attachments(
+                    id,
+                    &text,
+                    attachments,
+                    p.steer,
+                    p.only_if.map(|w| word(&w)).as_deref(),
+                    sender,
+                )
+                .await?;
             core.clear_manual_status_key(TargetKey::Agent(id));
             core.clear_manual_status_caller(p.from.as_deref());
             core.clear_manual_status_caller(p.caller.as_deref());
@@ -753,6 +861,20 @@ async fn agent_inbox_remove(core: Ctx<'_>, p: InboxRemoveParams) -> Result<Publi
 async fn agent_inbox_send(core: Ctx<'_>, p: InboxSendParams) -> Result<Public, RpcError> {
     let id = resolve(core, &p.agent)?;
     let updated = core.send_inbox_now(id, p.id)?;
+    core.flush_saved().await?;
+    Ok(Public(updated))
+}
+
+async fn agent_inbox_resume(core: Ctx<'_>, p: AgentParams) -> Result<Public, RpcError> {
+    let id = resolve(core, &p.agent)?;
+    let updated = core.resume_paused_inbox(id)?;
+    core.flush_saved().await?;
+    Ok(Public(updated))
+}
+
+async fn agent_inbox_clear_paused(core: Ctx<'_>, p: AgentParams) -> Result<Public, RpcError> {
+    let id = resolve(core, &p.agent)?;
+    let updated = core.clear_paused_inbox(id)?;
     core.flush_saved().await?;
     Ok(Public(updated))
 }
@@ -1684,6 +1806,70 @@ async fn ai_commit_message(
     crate::ai::generate_commit_message(&core.ai, &cwd, p.language.as_deref(), p.include_ai)
         .await
         .map_err(RpcError::invalid_params)
+}
+
+async fn ai_polish_prompt(
+    core: Ctx<'_>,
+    p: crate::ai::PolishPromptParams,
+) -> Result<crate::ai::PolishPromptResult, RpcError> {
+    let mut inferred_kind = p.agent_kind.clone();
+    let mut ctx_parts: Vec<String> = Vec::new();
+    if let Some(c) = p.context.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        ctx_parts.push(c.to_string());
+    }
+    if let Some(tgt) = p.target.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        && let Ok(tk) = resolve_any(core, tgt)
+    {
+        let st = core.lock();
+        match tk {
+            TargetKey::Agent(id) => {
+                if inferred_kind.is_none() {
+                    inferred_kind = Some("acp".into());
+                }
+                if let Some(a) = st.reg.agents.get(&id) {
+                    if let Some(prog) = a.agent.as_deref().filter(|s| !s.is_empty()) {
+                        ctx_parts.push(format!("agent={prog}"));
+                    }
+                    if let Some(title) = a.semantic_title.as_deref().filter(|s| !s.is_empty()) {
+                        ctx_parts.push(format!("task={title}"));
+                    }
+                    if !a.cwd.is_empty() {
+                        ctx_parts.push(format!("cwd={}", a.cwd));
+                    }
+                }
+            }
+            TargetKey::Terminal(id) => {
+                if inferred_kind.is_none() {
+                    inferred_kind = Some("cli".into());
+                }
+                if let Some(t) = st.pty_reg.terminals.get(&id) {
+                    if let Some(fg) = t.foreground.as_ref().map(|f| f.name.as_str()).filter(|s| !s.is_empty()) {
+                        ctx_parts.push(format!("cli={fg}"));
+                    }
+                    if let Some(title) = t.semantic_title.as_deref().filter(|s| !s.is_empty()) {
+                        ctx_parts.push(format!("task={title}"));
+                    }
+                    if !t.cwd.is_empty() {
+                        ctx_parts.push(format!("cwd={}", t.cwd));
+                    }
+                }
+            }
+        }
+    }
+    let merged_context = if ctx_parts.is_empty() {
+        None
+    } else {
+        Some(ctx_parts.join(" · "))
+    };
+    crate::ai::polish_prompt(
+        &core.ai,
+        &p.prompt,
+        inferred_kind.as_deref(),
+        merged_context.as_deref(),
+        p.language.as_deref(),
+    )
+    .await
+    .map_err(RpcError::invalid_params)
 }
 
 async fn checkpoint_list(core: Ctx<'_>, p: CheckpointListParams) -> Result<CheckpointListResult, RpcError> {

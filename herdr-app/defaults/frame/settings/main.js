@@ -2,13 +2,24 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, InputState, Input, TextareaState, Textarea, Popup } from "gpui-base";
-import { hc, run, theme, themes, fonts, updates, telemetry, settings, layouts, layout, spaces, shared, setShared, appHome, readTextFile, writeTextFile, playSound, props, closeOverlay, notify, window, checking } from "herdr";
+import { hc, run, theme, themes, fonts, updates, telemetry, settings, layouts, layout, spaces, keys, shared, setShared, appHome, readTextFile, writeTextFile, playSound, props, closeOverlay, notify, window, checking } from "herdr";
+import {
+  SHORTCUT_GROUPS,
+  defaultChordFor,
+  buildDefaultKeysDoc,
+  parseKeysDoc,
+  primaryChordFor,
+  setActionBinding,
+  clearActionBinding,
+  formatChord,
+  findActionLabel,
+} from "./shortcuts_model.js";
 
 const I = (name) => `frame/settings/${name}.svg`;
 
 const SECTIONS = () => [
   { id: "look", title: "Look", zh: "外观", icon: "palette" },
-  ...(window()?.platform === "macos" ? [{ id: "keyboard", title: "Keyboard", zh: "键盘", icon: "keyboard" }] : []),
+  { id: "keyboard", title: "Shortcuts", zh: "快捷键", icon: "keyboard" },
   { id: "machines", title: "Machines", zh: "主机", icon: "server" },
   { id: "ai", title: "AI", zh: "AI 助手", icon: "sparkles" },
   { id: "drove", title: "Drove", zh: "Drove", icon: "layers" },
@@ -242,11 +253,22 @@ export default class Settings extends View {
     this.droveKeyInput.on("change", () => { this.droveKeyDirty = true; });
     this.droveMagpieUrlInput = InputState.new({ placeholder: "http://127.0.0.1:3425" });
     this.droveNewRoleInput = InputState.new({ placeholder: this.tr("New role id (e.g. architect)", "新角色 ID（如 architect）") });
+    this.keysDoc = null;
+    this.keysRaw = null;
+    this.keysLoaded = false;
+    this.keysFilter = "";
+    this.keysFilterInput = InputState.new({ placeholder: this.tr("Search shortcuts or actions…", "搜索快捷键或操作…") });
+    this.keysFilterInput.on("change", (_e, cx) => { this.keysFilter = this.keysFilterInput.value(); cx.notify(); });
+    this.recordingTarget = null;
+    this.lastRecordedSeq = Number(shared("settings.recorded_shortcut")?.seq ?? 0);
+    this.keysNotice = null;
+    this.keysError = null;
     this.handle = cx.focus_handle();
     this.handle.focus();
     cx.spawn(async (cx) => {
       await this.load();
       if (!(typeof checking === "function" && checking())) {
+        if (this.section === "keyboard") await this.loadKeys();
         if (this.section === "machines") await this.loadMachines();
         if (this.section === "ai") {
           await this.loadMachines();
@@ -339,6 +361,10 @@ export default class Settings extends View {
   }
 
   close() {
+    if (this.recordingTarget) {
+      this.recordingTarget = null;
+      setShared("settings.recording_shortcut", false);
+    }
     closeOverlay(props().overlay);
   }
 
@@ -869,33 +895,455 @@ export default class Settings extends View {
       .child(fontRow("ui_font", null, this.tr("Interface font", "界面字体"), s.ui_font_family, DEFAULT_UI_FONT));
   }
 
-  keyboard(t) {
-    const choices = [
+  keysFile() {
+    return `${appHome()}/keys.json`;
+  }
+
+  isMacPlatform() {
+    return window()?.platform === "macos";
+  }
+
+  effectiveKeysDoc() {
+    if (this.keysDoc) return this.keysDoc;
+    const list = typeof keys === "function" ? keys() : [];
+    return parseKeysDoc(null, list, this.isMacPlatform());
+  }
+
+  async loadKeys() {
+    const isMac = this.isMacPlatform();
+    try {
+      const text = await readTextFile(this.keysFile());
+      this.keysRaw = text;
+      this.keysDoc = parseKeysDoc(text, typeof keys === "function" ? keys() : [], isMac);
+      this.keysError = null;
+    } catch {
+      this.keysRaw = null;
+      this.keysDoc = parseKeysDoc(null, typeof keys === "function" ? keys() : [], isMac);
+    } finally {
+      this.keysLoaded = true;
+    }
+  }
+
+  startRecordingShortcut(section, action, label, cx) {
+    this.recordingTarget = { section, action, label };
+    this.keysNotice = null;
+    this.keysError = null;
+    this.lastRecordedSeq = Number(shared("settings.recorded_shortcut")?.seq ?? this.lastRecordedSeq);
+    setShared("settings.recording_shortcut", true);
+    this.handle.focus();
+    cx.notify();
+  }
+
+  cancelRecordingShortcut(cx) {
+    this.recordingTarget = null;
+    setShared("settings.recording_shortcut", false);
+    cx?.notify?.();
+  }
+
+  saveKeysDoc(nextDoc, notice, cx) {
+    const serialized = JSON.stringify(nextDoc, null, 2) + "\n";
+    this.keysDoc = nextDoc;
+    this.keysNotice = notice || null;
+    this.keysError = null;
+    cx?.notify?.();
+    if (typeof checking === "function" && checking()) return;
+    cx.spawn(async (saveCx) => {
+      let err = null;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+          await writeTextFile(this.keysFile(), serialized, this.keysRaw);
+          this.keysRaw = serialized;
+          err = null;
+          break;
+        } catch (e) {
+          err = e;
+          try {
+            this.keysRaw = await readTextFile(this.keysFile());
+          } catch {
+            this.keysRaw = null;
+          }
+        }
+      }
+      if (err) {
+        this.keysError = this.tr(
+          `Failed to save keys.json: ${err?.message ?? err}`,
+          `保存 keys.json 失败：${err?.message ?? err}`,
+        );
+      }
+      saveCx.notify();
+    });
+  }
+
+  applyRecordedShortcut(chord, cx) {
+    const target = this.recordingTarget;
+    if (!target || !chord) return;
+    this.recordingTarget = null;
+    const isMac = this.isMacPlatform();
+    const isZh = this.lang() === "zh-CN";
+    const { doc: nextDoc, displacedAction } = setActionBinding(
+      this.effectiveKeysDoc(),
+      target.section,
+      target.action,
+      chord,
+    );
+    const pretty = formatChord(chord, isMac);
+    const notice = displacedAction
+      ? this.tr(
+          `Bound ${pretty} to "${target.label}" (reassigned from "${findActionLabel(displacedAction, false)}").`,
+          `已将 ${pretty} 绑定到「${target.label}」（已从「${findActionLabel(displacedAction, true)}」移出）。`,
+        )
+      : this.tr(
+          `Bound ${pretty} to "${target.label}". Changes take effect immediately.`,
+          `已将 ${pretty} 绑定到「${target.label}」，立即生效。`,
+        );
+    this.saveKeysDoc(nextDoc, notice, cx);
+  }
+
+  clearShortcut(section, action, label, cx) {
+    if (this.recordingTarget) this.cancelRecordingShortcut(null);
+    const { doc: nextDoc } = clearActionBinding(this.effectiveKeysDoc(), section, action);
+    this.saveKeysDoc(
+      nextDoc,
+      this.tr(`Cleared shortcut for "${label}".`, `已清除「${label}」的快捷键。`),
+      cx,
+    );
+  }
+
+  resetSingleShortcut(item, cx) {
+    if (this.recordingTarget) this.cancelRecordingShortcut(null);
+    const isMac = this.isMacPlatform();
+    const defChord = defaultChordFor(item, isMac);
+    const label = this.tr(item.title, item.zh);
+    const { doc: nextDoc } = setActionBinding(this.effectiveKeysDoc(), item.section, item.action, defChord);
+    this.saveKeysDoc(
+      nextDoc,
+      this.tr(
+        `Reset "${label}" to ${formatChord(defChord, isMac)}.`,
+        `已将「${label}」恢复默认：${formatChord(defChord, isMac)}。`,
+      ),
+      cx,
+    );
+  }
+
+  resetAllShortcuts(cx) {
+    if (this.recordingTarget) this.cancelRecordingShortcut(null);
+    const nextDoc = buildDefaultKeysDoc(this.isMacPlatform());
+    this.saveKeysDoc(
+      nextDoc,
+      this.tr("All shortcuts restored to defaults.", "已将全部快捷键恢复为默认配置。"),
+      cx,
+    );
+  }
+
+  keyboard(t, cx) {
+    const isMac = this.isMacPlatform();
+    const doc = this.effectiveKeysDoc();
+    const query = this.keysFilter.trim().toLowerCase();
+    const purple = "#a855f7";
+    const alpha = (hex, a) => (typeof hex === "string" && /^#[0-9a-fA-F]{6}$/.test(hex) ? hex + a : null);
+    const optionChoices = [
       ["auto", this.tr("Automatic (Alt on US keyboards)", "自动识别（美式键盘作为 Alt）")],
       ["on", "Alt"],
       ["off", this.tr("Types characters", "输入特殊字符")],
       ["left", this.tr("Left Option is Alt", "左 Option 作为 Alt")],
       ["right", this.tr("Right Option is Alt", "右 Option 作为 Alt")],
     ];
+
+    const filteredGroups = SHORTCUT_GROUPS.map((g) => {
+      const items = g.items.filter((it) => {
+        if (!query) return true;
+        const cur = primaryChordFor(doc, it, isMac);
+        const hay = `${it.title} ${it.zh} ${it.action} ${cur} ${formatChord(cur, isMac)}`.toLowerCase();
+        return hay.includes(query);
+      });
+      return { ...g, items };
+    }).filter((g) => g.items.length > 0);
+
     return v_flex()
+      .id("st-shortcuts")
       .w_full()
-      .child(this.heading(t, this.tr("Option key", "Option 键行为")))
-      .child(div().pb(12).text_size(13).text_color(t.dim).child(this.tr("Use Option for terminal shortcuts or to type accents and special characters.", "选择将 Option 键用作终端快捷键，还是用于输入重音与特殊字符。")))
-      .children(choices.map(([value, label]) => {
-        const on = (this.person.option_as_alt ?? "auto") === value;
-        return h_flex()
-          .id(`st-option-${value}`)
-          .gap(10)
-          .px(12)
-          .py(10)
-          .rounded(7)
+      .gap(6)
+      .child(
+        h_flex()
+          .w_full()
           .items_center()
-          .cursor_pointer()
-          .hover((s) => s.bg(t.hover))
-          .on_click((_e, cx) => this.change((p) => { p.option_as_alt = value; }, cx))
-          .child(div().text_color(on ? t.accent : t.muted).child(on ? "◉" : "○"))
-          .child(div().text_size(14).text_color(t.foreground).child(label));
-      }));
+          .justify_between()
+          .gap(10)
+          .child(this.heading(t, this.tr("Keyboard Shortcuts", "快捷键配置")))
+          .child(
+            div()
+              .id("st-keys-reset-all")
+              .px(10)
+              .py(4)
+              .rounded(6)
+              .border_1()
+              .border_color(t.border)
+              .bg(t.raised)
+              .text_size(11.5)
+              .text_color(t.muted)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover).text_color(t.foreground))
+              .on_click((_e, clickCx) => this.resetAllShortcuts(clickCx))
+              .child(this.tr("Reset all to defaults", "恢复全部默认")),
+          ),
+      )
+      .child(
+        div()
+          .pb(6)
+          .text_size(12.5)
+          .text_color(t.dim)
+          .child(
+            this.tr(
+              "Click any shortcut badge and press a new key combination. Saved live to keys.json.",
+              "点击任意快捷键徽章后直接按下新的组合键即可修改，实时写入 keys.json 并立即生效。",
+            ),
+          ),
+      )
+      .child(
+        div()
+          .id("st-keys-filter")
+          .w_full()
+          .pb(6)
+          .child(
+            Input.new(this.keysFilterInput)
+              .w_full()
+              .h(34)
+              .px(10)
+              .rounded(8)
+              .border_1()
+              .border_color(t.border)
+              .bg(t.background)
+              .text_size(12.5)
+              .text_color(t.foreground),
+          ),
+      )
+      .when(Boolean(this.recordingTarget), (el) =>
+        el.child(
+          h_flex()
+            .id("st-keys-recording-banner")
+            .w_full()
+            .px(12)
+            .py(8)
+            .mb(4)
+            .gap(8)
+            .items_center()
+            .rounded(8)
+            .bg(alpha(purple, "1c") ?? t.raised)
+            .border_1()
+            .border_color(alpha(purple, "77") ?? t.accent)
+            .child(
+              div()
+                .flex_1()
+                .text_size(12.5)
+                .font_medium()
+                .text_color(t.foreground)
+                .child(
+                  this.tr(
+                    `Recording shortcut for "${this.recordingTarget.label}" — press new keys now, or Esc to cancel`,
+                    `正在录制「${this.recordingTarget.label}」的快捷键 — 请直接按下组合键，按 Esc 取消`,
+                  ),
+                ),
+            )
+            .child(
+              div()
+                .id("st-keys-cancel-record")
+                .px(8)
+                .py(3)
+                .rounded(5)
+                .bg(t.background)
+                .border_1()
+                .border_color(t.border)
+                .text_size(11)
+                .text_color(t.muted)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                .on_click((_e, clickCx) => this.cancelRecordingShortcut(clickCx))
+                .child(this.tr("Cancel", "取消")),
+            ),
+        ),
+      )
+      .when(Boolean(this.keysNotice), (el) =>
+        el.child(
+          div()
+            .id("st-keys-notice")
+            .px(10)
+            .py(6)
+            .mb(4)
+            .rounded(7)
+            .bg(alpha(t.accent ?? "#3b82f6", "18") ?? t.raised)
+            .border_1()
+            .border_color(alpha(t.accent ?? "#3b82f6", "44") ?? t.border)
+            .text_size(12)
+            .text_color(t.foreground)
+            .child(this.keysNotice),
+        ),
+      )
+      .when(Boolean(this.keysError), (el) =>
+        el.child(
+          div()
+            .id("st-keys-error")
+            .px(10)
+            .py(6)
+            .mb(4)
+            .rounded(7)
+            .bg(alpha(t.blocked ?? "#ef4444", "1a") ?? t.raised)
+            .border_1()
+            .border_color(alpha(t.blocked ?? "#ef4444", "55") ?? t.border)
+            .text_size(12)
+            .text_color(t.blocked ?? "#ef4444")
+            .child(this.keysError),
+        ),
+      )
+      .children(
+        filteredGroups.map((group) =>
+          v_flex()
+            .w_full()
+            .pb(12)
+            .gap(2)
+            .child(
+              div()
+                .pt(8)
+                .pb(4)
+                .text_size(11.5)
+                .font_semibold()
+                .text_color(t.dim)
+                .child(this.tr(group.title, group.zh)),
+            )
+            .children(
+              group.items.map((item) => {
+                const label = this.tr(item.title, item.zh);
+                const curChord = primaryChordFor(doc, item, isMac);
+                const defChord = defaultChordFor(item, isMac);
+                const isModified = curChord !== defChord;
+                const isRecording = Boolean(
+                  this.recordingTarget
+                    && this.recordingTarget.section === item.section
+                    && this.recordingTarget.action === item.action,
+                );
+                const keyId = `st-key-${item.section}-${item.action}`;
+
+                return h_flex()
+                  .w_full()
+                  .py(8)
+                  .px(10)
+                  .gap(10)
+                  .items_center()
+                  .rounded(8)
+                  .border_b(1)
+                  .border_color(alpha(t.border, "66") ?? t.border)
+                  .when(isRecording, (r) => r.bg(alpha(purple, "12") ?? t.raised))
+                  .child(
+                    v_flex()
+                      .flex_1()
+                      .min_w(0)
+                      .gap(1)
+                      .child(div().text_size(13).text_color(t.foreground).truncate().child(label))
+                      .child(
+                        div()
+                          .font_family(settings()?.font_family ?? DEFAULT_FONT)
+                          .text_size(10.5)
+                          .text_color(t.dim)
+                          .truncate()
+                          .child(item.section === "terminal" ? `${item.action}  (terminal)` : item.action),
+                      ),
+                  )
+                  .child(
+                    h_flex()
+                      .flex_none()
+                      .gap(6)
+                      .items_center()
+                      .child(
+                        div()
+                          .id(keyId)
+                          .px(10)
+                          .py(4)
+                          .rounded(6)
+                          .border_1()
+                          .border_color(isRecording ? purple : curChord ? t.border : (alpha(t.border, "66") ?? t.border))
+                          .bg(isRecording ? (alpha(purple, "24") ?? t.raised) : curChord ? t.raised : t.background)
+                          .font_family(settings()?.font_family ?? DEFAULT_FONT)
+                          .text_size(11.5)
+                          .font_medium()
+                          .text_color(isRecording ? purple : curChord ? t.foreground : t.dim)
+                          .cursor_pointer()
+                          .hover((s) => s.bg(isRecording ? (alpha(purple, "30") ?? t.hover) : t.hover))
+                          .tooltip(
+                            isRecording
+                              ? this.tr("Press new key combination (Esc to cancel)", "请按下新组合键（Esc 取消）")
+                              : this.tr("Click to record a new shortcut", "点击录制新的快捷键"),
+                          )
+                          .on_click((_e, clickCx) => {
+                            if (isRecording) this.cancelRecordingShortcut(clickCx);
+                            else this.startRecordingShortcut(item.section, item.action, label, clickCx);
+                          })
+                          .child(
+                            isRecording
+                              ? this.tr("Press keys…", "请按键…")
+                              : curChord
+                                ? formatChord(curChord, isMac)
+                                : this.tr("Unbound", "未设置"),
+                          ),
+                      )
+                      .when(Boolean(curChord) && !isRecording, (el) =>
+                        el.child(
+                          div()
+                            .id(`st-key-clear-${item.section}-${item.action}`)
+                            .px(6)
+                            .py(4)
+                            .rounded(5)
+                            .text_size(11)
+                            .text_color(t.dim)
+                            .cursor_pointer()
+                            .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                            .tooltip(this.tr("Unbind shortcut", "清除快捷键"))
+                            .on_click((_e, clickCx) => this.clearShortcut(item.section, item.action, label, clickCx))
+                            .child("×"),
+                        ),
+                      )
+                      .when(isModified && !isRecording, (el) =>
+                        el.child(
+                          div()
+                            .id(`st-key-reset-${item.section}-${item.action}`)
+                            .px(6)
+                            .py(4)
+                            .rounded(5)
+                            .text_size(10.5)
+                            .text_color(t.muted)
+                            .cursor_pointer()
+                            .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                            .tooltip(this.tr(`Reset to default (${formatChord(defChord, isMac)})`, `恢复默认 (${formatChord(defChord, isMac)})`))
+                            .on_click((_e, clickCx) => this.resetSingleShortcut(item, clickCx))
+                            .child(this.tr("Reset", "恢复")),
+                        ),
+                      ),
+                  );
+              }),
+            ),
+        ),
+      )
+      .when(filteredGroups.length === 0, (el) =>
+        el.child(div().py(16).text_size(12.5).text_color(t.dim).child(this.tr("No matching shortcuts.", "没有匹配的快捷键。"))),
+      )
+      .when(isMac, (el) =>
+        el
+          .child(div().pt(12).child(this.heading(t, this.tr("Option key", "Option 键行为"))))
+          .child(div().pb(12).text_size(13).text_color(t.dim).child(this.tr("Use Option for terminal shortcuts or to type accents and special characters.", "选择将 Option 键用作终端快捷键，还是用于输入重音与特殊字符。")))
+          .children(optionChoices.map(([value, label]) => {
+            const on = (this.person.option_as_alt ?? "auto") === value;
+            return h_flex()
+              .id(`st-option-${value}`)
+              .gap(10)
+              .px(12)
+              .py(10)
+              .rounded(7)
+              .items_center()
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover))
+              .on_click((_e, clickCx) => this.change((p) => { p.option_as_alt = value; }, clickCx))
+              .child(div().text_color(on ? t.accent : t.muted).child(on ? "◉" : "○"))
+              .child(div().text_size(14).text_color(t.foreground).child(label));
+          })),
+      );
   }
 
   // Machines -------------------------------------------------------------
@@ -4129,7 +4577,22 @@ export default class Settings extends View {
 
   // ----------------------------------------------------------------------
 
+  syncRecordedShortcut(cx) {
+    if (!this.recordingTarget) return;
+    const rec = shared("settings.recorded_shortcut");
+    const seq = Number(rec?.seq ?? 0);
+    if (seq > this.lastRecordedSeq && rec?.chord) {
+      this.lastRecordedSeq = seq;
+      this.applyRecordedShortcut(String(rec.chord), cx);
+      return;
+    }
+    if (shared("settings.recording_shortcut") === false) {
+      this.recordingTarget = null;
+    }
+  }
+
   render(cx) {
+    this.syncRecordedShortcut(cx);
     const t = theme();
     const nav = v_flex()
       .flex_none()
@@ -4153,10 +4616,12 @@ export default class Settings extends View {
             .bg(on ? t.raised : "#00000000")
             .hover((st) => st.bg(t.raised))
             .on_click((_e, cx) => {
+              if (this.recordingTarget) this.cancelRecordingShortcut(null);
               this.section = s.id;
               this.picking = null;
               this.machineEdit = null;
               this.handle.focus();
+              if (s.id === "keyboard") cx.spawn(async (cx) => { await this.loadKeys(); cx.notify(); });
               if (s.id === "machines") cx.spawn(async (cx) => { await this.loadMachines(); cx.notify(); });
               if (s.id === "ai") cx.spawn(async (cx) => {
                 if (this.machineList === null) await this.loadMachines();
@@ -4190,6 +4655,13 @@ export default class Settings extends View {
       .items_start()
       .on_key_down((e, cx) => {
         const k = e.key;
+        if (this.recordingTarget) {
+          if (k === "escape") {
+            this.cancelRecordingShortcut(cx);
+            cx.stop_propagation();
+          }
+          return;
+        }
         if (this.machineEdit) {
           if (k === "escape") this.machineEdit = null;
           else return;
@@ -4230,7 +4702,7 @@ export default class Settings extends View {
                     this.section === "look"
                       ? this.look(t, cx)
                       : this.section === "keyboard"
-                        ? this.keyboard(t)
+                        ? this.keyboard(t, cx)
                       : this.section === "machines"
                         ? this.machines(t)
                       : this.section === "ai"

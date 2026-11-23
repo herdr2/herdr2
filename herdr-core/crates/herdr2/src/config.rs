@@ -31,6 +31,9 @@ pub struct Config {
     pub history_mb: Option<f64>,
     /// After a kept program is lost, show its last saved screen above the new shell (default off).
     pub restore_screen: Option<bool>,
+    /// After a kept CLI agent terminal (`claude`, `codex`, `agy`) is lost on reboot/restart,
+    /// automatically resume its CLI session in place instead of dropping to a blank shell (default on).
+    pub restore_cli_sessions: Option<bool>,
     /// Where the core listens (default under $XDG_RUNTIME_DIR). `H2_SOCKET` wins.
     pub socket: Option<String>,
     /// Seconds another machine gets to answer a call (a wait gets its own
@@ -81,6 +84,10 @@ impl Config {
 
     pub fn history_bytes(&self) -> usize {
         (self.history_mb.unwrap_or(5.0).max(0.0) * 1024.0 * 1024.0) as usize
+    }
+
+    pub fn restore_cli_sessions(&self) -> bool {
+        self.restore_cli_sessions.unwrap_or(true)
     }
 
     pub fn validate(&self) -> Result<(), RpcError> {

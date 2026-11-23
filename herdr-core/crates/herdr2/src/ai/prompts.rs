@@ -154,7 +154,16 @@ Rules:
 - Follow Conventional Commits style (`feat(scope): ...`, `fix(scope): ...`, `refactor(scope): ...`, `docs: ...`, `chore: ...`).
 - Keep the subject line <= 72 chars, factual, describing WHAT changed and WHY; no markdown fences or trailing period.
 - Respect `lang` (`zh` -> English type/scope + concise Simplified Chinese summary; `en` -> concise English summary).
-Output JSON: {"message":"type(scope): concise summary"}"#;
+Output JSON: {"message":"type(scope): concise summary"}
+
+[OP: polish_prompt]
+Purpose: Rewrite a developer's rough draft prompt into a clearer, more structured, unambiguous prompt for a coding agent (ACP or CLI) while strictly preserving original intent, constraints, file paths, symbols, and commands.
+Input fields: `prompt`, `agent_kind` (`acp`|`cli`), `context` (optional workspace/task hint).
+Rules:
+- Match the language of `prompt` (use `lang` only if ambiguous). Never translate code identifiers, file paths, commands, or error strings.
+- Clarify vague phrasing, remove redundancy, and organize multi-step requirements into concise sentences or short bullets when helpful; keep simple single-step requests brief without bloating.
+- Never invent new requirements or change user constraints.
+Output JSON: {"polished":"rewritten prompt ready to send","summary":"<=30 char brief note of improvements"}"#;
 
 /// Compact fallback system prompt used only when `context_window <= 4096` or `prompt_cache_enabled == false`.
 pub fn compact_system_for_op(op: &str) -> &'static str {
@@ -179,6 +188,7 @@ pub fn compact_system_for_op(op: &str) -> &'static str {
         "agent_digest" => "Pure text JSON summarizer (no tools). Return {\"semantic_title\":\"<=12 zh / <=24 en chars\",\"micro_summary\":\"<=42 zh / <=90 en chars\"}. Reply JSON only.",
         "catchup_briefing" => "Pure text JSON briefer (no tools). Write a 1-2 sentence priority catch-up headline: {\"headline\":\"...\"}. Reply JSON only.",
         "commit_message" => "Pure text JSON commit message writer (no tools). Write a single-line conventional commit message (<=72 chars): {\"message\":\"type(scope): summary\"}. Reply JSON only.",
+        "polish_prompt" => "Pure text JSON prompt editor (no tools). Rewrite the coding prompt for clarity and structure while keeping exact intent, constraints, paths, and original language. Reply JSON only: {\"polished\":\"...\",\"summary\":\"<=30 chars\"}.",
         _ => "You are a pure text assistant with NO tools or shell access. Never emit tool tags or shell commands.",
     }
 }
@@ -254,6 +264,7 @@ mod tests {
             "agent_digest",
             "catchup_briefing",
             "commit_message",
+            "polish_prompt",
         ] {
             assert!(HERDR2_CONTROL_PLANE_SYSTEM.contains(&format!("[OP: {op}]")), "missing {op}");
         }

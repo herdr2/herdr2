@@ -69,7 +69,7 @@ Roles (`coder`, `tester`, `writer`, `illustrator`, `reviewer`, `researcher`, plu
 - Assign tasks by `role:` in YAML or `--role` in CLI; add concise `tags:` (e.g. `[前端UI]`, `[后端架构]`, `[快速修复]`) or clear `title`/`files` so the Drove router automatically picks the candidate whose configured `strengths` best match the task (with optional AI assistant tie-breaking, Magpie quota skipping, and `#1 -> #2 -> #3` retry rotation).
 - You can inspect all roles, candidate models, and their `strengths` at any time via `h2 drove settings`; only override `--agent`/`--model`/`--effort` via `h2 drove route` if explicitly requested.
 - Access guardrails are enforced automatically on `drove worker done`:
-  - `readonly` (`reviewer`, `researcher`): zero workspace edits permitted (`bwrap --ro-bind` + diff check).
+  - `readonly` (`reviewer`, `researcher`): zero workspace edits permitted (OS sandbox: Linux `bwrap --ro-bind` / macOS `sandbox-exec` / Windows `restricted-token` + diff check).
   - `scoped_write` (`tester`, `writer`, `illustrator`): edits restricted to configured `allowedPaths` globs (`422 role_scope_violation` if exceeded).
   - `writable` (`coder`): workspace edits permitted.
 - **Worktree Preflight Guard**: Before starting a Run that uses `--worktree` / `isolation: worktree` or concurrent writable tasks under `conflictPolicy=auto_worktree`, Drove verifies the workspace is ready for Git worktrees. If it returns `worktree_not_ready` (e.g., not a Git repo, no initial commit yet, in-progress merge/rebase, lock file, or nested unborn `.git`), immediately show the user the reported reason and fix command and wait for them to resolve it before retrying.

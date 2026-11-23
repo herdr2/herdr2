@@ -502,6 +502,7 @@ async fn handoff_into_existing(
                     timeout: p.timeout,
                     from: None,
                     caller: p.caller.clone(),
+                    ..Default::default()
                 },
             )
             .await?;
@@ -700,6 +701,17 @@ async fn handoff_to_new_pty(
             PtyCliKind::Claude => {
                 let has_effort = spawn_argv.iter().any(|a| a == "--effort" || a.starts_with("--effort="));
                 if !has_effort {
+                    spawn_argv.push("--effort".into());
+                    spawn_argv.push(eff.to_string());
+                }
+            }
+            PtyCliKind::Agy => {
+                let model_embeds_effort = p
+                    .model
+                    .as_deref()
+                    .is_some_and(crate::acp::model_has_embedded_effort);
+                let has_effort = spawn_argv.iter().any(|a| a == "--effort" || a.starts_with("--effort="));
+                if !model_embeds_effort && !has_effort {
                     spawn_argv.push("--effort".into());
                     spawn_argv.push(eff.to_string());
                 }
@@ -1047,6 +1059,7 @@ async fn handoff_to_new_acp(
             timeout: p.timeout,
             from: None,
             caller: p.caller.clone(),
+            ..Default::default()
         },
     )
     .await?;
@@ -1095,7 +1108,7 @@ mod tests {
     use crate::transcript::Entry;
 
     fn user_entry(turn: u64) -> Entry {
-        Entry::User { turn, from: None, text: format!("turn {turn}"), ts_ms: turn }
+        Entry::User { turn, from: None, text: format!("turn {turn}"), attachments: vec![], ts_ms: turn }
     }
 
     #[test]

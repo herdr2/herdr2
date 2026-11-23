@@ -337,6 +337,7 @@ fn authorize_request(
 
     let is_web_action = match (method, segs.as_slice()) {
         ("PUT", ["api", "tasks", _, "assign"]) => true,
+        ("PUT", ["api", "ai", "language"]) => true,
         ("POST", ["api", "ai", "test"]) => true,
         ("POST", ["api", "workers", _, "stop"]) => true,
         ("PATCH", ["api", "runs", _]) => true,
@@ -394,6 +395,7 @@ async fn dispatch_http_inner(
         // queries when `?on=` was not explicitly supplied.
         let global_drove_endpoint = (method == "GET" && matches!(segs.as_slice(), ["api", "ai", "status"] | ["api", "agents"]))
             || (method == "POST" && segs.as_slice() == ["api", "ai", "test"])
+            || (method == "PUT" && segs.as_slice() == ["api", "ai", "language"])
             || (method == "GET"
                 && segs.as_slice() == ["api", "daemon", "events"]
                 && query.get("runId").is_none()
@@ -444,6 +446,22 @@ async fn dispatch_http_inner(
             "configured_in_app",
             "Please configure AI Assistant in Herdr2 App -> Settings -> AI",
         )),
+        ("PUT", ["api", "ai", "language"]) => {
+            let lang = body["language"]
+                .as_str()
+                .or_else(|| body["lang"].as_str())
+                .ok_or_else(|| ApiErr::new(400, "bad_request", "language must be a string"))?
+                .to_string();
+            core.ai
+                .update_settings(crate::ai::AiSettingsSetParams {
+                    language: Some(lang),
+                    ..Default::default()
+                })
+                .await
+                .map_err(rpc_to_api)?;
+            core.drove.sync_ai_from_core();
+            Ok(json!(core.drove.ai_status()))
+        }
         ("POST", ["api", "ai", "test"]) => {
             let res = core.drove.rpc_ai_test(None, None, None).await.map_err(rpc_to_api)?;
             Ok(json!(res))
@@ -696,8 +714,12 @@ async fn dispatch_http_inner(
                 .ok_or_else(|| ApiErr::new(404, "not_found", "Task or attempt not found"))?;
             let want_ai = query.get("ai").is_some_and(|v| v == "1" || v == "true");
             let refresh = query.get("refresh").is_some_and(|v| v == "1" || v == "true");
+            let lang = query
+                .get("lang")
+                .or_else(|| query.get("language"))
+                .map(String::as_str);
             if want_ai {
-                super::ai::generate_task_diagnosis(&core, &mut diag, refresh).await;
+                super::ai::generate_task_diagnosis(&core, &mut diag, refresh, lang).await;
             }
             Ok(json!(diag))
         }

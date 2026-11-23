@@ -255,6 +255,13 @@
               "null"
             ]
           },
+          "paused_inbox": {
+            "description": "Prompts that were queued in `inbox` before an unexpected stop/reboot, held until the user resumes or discards them.",
+            "items": {
+              "$ref": "#/components/schemas/QueuedInput"
+            },
+            "type": "array"
+          },
           "pending_permission": {
             "anyOf": [
               {
@@ -278,6 +285,17 @@
               "integer",
               "null"
             ]
+          },
+          "prompt_capabilities": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PromptCapabilities"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Multimodal prompt content capabilities advertised by the ACP adapter during `initialize`."
           },
           "reason": {
             "description": "Why its process ended or is pending: exited, killed, server_stop,\nhost_shutdown, signaled, crashed, stopped_by_restart.",
@@ -524,6 +542,12 @@
             "default": true,
             "type": "boolean"
           },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "loopDetect": {
             "default": "off",
             "type": "string"
@@ -610,6 +634,12 @@
           },
           "keySource": {
             "type": "string"
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "lastError": {
             "type": [
@@ -880,6 +910,63 @@
           "terminal",
           "resize_notifications",
           "automatic_input"
+        ],
+        "type": "object"
+      },
+      "Attachment": {
+        "description": "Lightweight metadata for a multimodal attachment (image, audio, embedded resource, or resource link).\nBinary payloads live beside the agent under `<state>/files/<addr>/` so JSONL transcripts stay compact.",
+        "properties": {
+          "bytes": {
+            "description": "Raw byte length when known.",
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "kind": {
+            "description": "Content kind: `\"image\"`, `\"audio\"`, `\"resource\"`, or `\"resource_link\"`.",
+            "type": "string"
+          },
+          "mime_type": {
+            "description": "MIME type when known (e.g. `\"image/png\"`, `\"text/markdown\"`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Display name or basename (e.g. `\"screenshot.png\"`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "description": "Staged path on the agent's machine for preview, reload, or tool fallback.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text": {
+            "description": "Optional bounded text snippet or description (for text resources / links).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "uri": {
+            "description": "Optional URI (`file:///...`, `https://...`, etc.).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind"
         ],
         "type": "object"
       },
@@ -1605,6 +1692,135 @@
         ],
         "type": "object"
       },
+      "ContentBlock": {
+        "description": "ACP multimodal content block (`text`, `image`, `audio`, `resource_link`, `resource`).",
+        "oneOf": [
+          {
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "const": "text",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "text"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "data": {
+                "type": "string"
+              },
+              "mimeType": {
+                "type": "string"
+              },
+              "type": {
+                "const": "image",
+                "type": "string"
+              },
+              "uri": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "type",
+              "data",
+              "mimeType"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "data": {
+                "type": "string"
+              },
+              "mimeType": {
+                "type": "string"
+              },
+              "type": {
+                "const": "audio",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "data",
+              "mimeType"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "description": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "mimeType": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "name": {
+                "type": "string"
+              },
+              "size": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "resource_link",
+                "type": "string"
+              },
+              "uri": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "uri",
+              "name"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "resource": {
+                "$ref": "#/components/schemas/EmbeddedResourceContent"
+              },
+              "type": {
+                "const": "resource",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "resource"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "CoreInfo": {
         "properties": {
           "id": {
@@ -1674,6 +1890,12 @@
           },
           "keySource": {
             "type": "string"
+          },
+          "language": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "lastError": {
             "type": [
@@ -1842,6 +2064,13 @@
             "default": null,
             "type": [
               "boolean",
+              "null"
+            ]
+          },
+          "language": {
+            "default": null,
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -2133,10 +2362,63 @@
         ],
         "type": "string"
       },
+      "EmbeddedResourceContent": {
+        "anyOf": [
+          {
+            "properties": {
+              "mimeType": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "text": {
+                "type": "string"
+              },
+              "uri": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "uri",
+              "text"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "blob": {
+                "type": "string"
+              },
+              "mimeType": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "uri": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "uri",
+              "blob"
+            ],
+            "type": "object"
+          }
+        ],
+        "description": "Embedded resource payload (ACP / MCP compatible): either UTF-8 `text` or base64 `blob`."
+      },
       "Entry": {
         "oneOf": [
           {
             "properties": {
+              "attachments": {
+                "items": {
+                  "$ref": "#/components/schemas/Attachment"
+                },
+                "type": "array"
+              },
               "from": {
                 "type": [
                   "string",
@@ -2199,6 +2481,12 @@
           },
           {
             "properties": {
+              "attachments": {
+                "items": {
+                  "$ref": "#/components/schemas/Attachment"
+                },
+                "type": "array"
+              },
               "kind": {
                 "const": "assistant",
                 "type": "string"
@@ -2227,6 +2515,12 @@
           },
           {
             "properties": {
+              "attachments": {
+                "items": {
+                  "$ref": "#/components/schemas/Attachment"
+                },
+                "type": "array"
+              },
               "detail": {
                 "type": [
                   "string",
@@ -3340,6 +3634,37 @@
         ],
         "type": "string"
       },
+      "PolishPromptResult": {
+        "properties": {
+          "fallbackReason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fromCache": {
+            "default": false,
+            "type": "boolean"
+          },
+          "polished": {
+            "type": "string"
+          },
+          "summary": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "usedAi": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "polished",
+          "usedAi"
+        ],
+        "type": "object"
+      },
       "ProbeSnapshot": {
         "properties": {
           "agents": {
@@ -3446,6 +3771,23 @@
         ],
         "type": "object"
       },
+      "PromptCapabilities": {
+        "properties": {
+          "audio": {
+            "default": false,
+            "type": "boolean"
+          },
+          "embeddedContext": {
+            "default": false,
+            "type": "boolean"
+          },
+          "image": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
       "PublicPermission": {
         "properties": {
           "kind": {
@@ -3517,6 +3859,13 @@
       },
       "QueuedInput": {
         "properties": {
+          "attachments": {
+            "description": "Multimodal attachments staged for this queued prompt.",
+            "items": {
+              "$ref": "#/components/schemas/Attachment"
+            },
+            "type": "array"
+          },
           "from": {
             "description": "Optional sender address (`a3` / `t1`) when sent by another agent or terminal.",
             "type": [
@@ -4135,6 +4484,13 @@
               "null"
             ]
           },
+          "paused_inbox": {
+            "description": "Prompts that were queued in `inbox` before an unexpected stop/reboot, held until the user resumes or discards them.",
+            "items": {
+              "$ref": "#/components/schemas/QueuedInput"
+            },
+            "type": "array"
+          },
           "pending_permission": {
             "anyOf": [
               {
@@ -4158,6 +4514,17 @@
               "integer",
               "null"
             ]
+          },
+          "prompt_capabilities": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PromptCapabilities"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Multimodal prompt content capabilities advertised by the ACP adapter during `initialize`."
           },
           "reason": {
             "description": "Why its process ended or is pending: exited, killed, server_stop,\nhost_shutdown, signaled, crashed, stopped_by_restart.",
@@ -4283,6 +4650,43 @@
           "cwd",
           "state",
           "created_ms"
+        ],
+        "type": "object"
+      },
+      "SavedCliResume": {
+        "description": "Persisted CLI agent recovery metadata for kept PTY terminals (`t*`).\nMaintained live while a supported CLI (`claude`, `codex`, `agy`) runs in the\nterminal and cleared as soon as the user exits back to an interactive shell.",
+        "properties": {
+          "cli_argv": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "transcript_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "wrapper_shell": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "kind",
+          "cli_argv"
         ],
         "type": "object"
       },
@@ -6419,6 +6823,18 @@
           }
         },
         {
+          "description": "Optional ACP multimodal content blocks (`image`, `audio`, `resource`, `resource_link`, `text`).",
+          "name": "content",
+          "required": false,
+          "schema": {
+            "description": "Optional ACP multimodal content blocks (`image`, `audio`, `resource`, `resource_link`, `text`).",
+            "items": {
+              "$ref": "#/components/schemas/ContentBlock"
+            },
+            "type": "array"
+          }
+        },
+        {
           "description": "Sender address attributed in `<h2 from=\"...\">` tags (default: caller).",
           "name": "from",
           "required": false,
@@ -6457,11 +6873,12 @@
           }
         },
         {
-          "description": "Prompt text queued for the agent's ACP inbox.",
+          "description": "Prompt text queued for the agent's ACP inbox (may be empty when sending `--image`/`--resource`/`content`).",
           "name": "text",
-          "required": true,
+          "required": false,
           "schema": {
-            "description": "Prompt text queued for the agent's ACP inbox.",
+            "default": "",
+            "description": "Prompt text queued for the agent's ACP inbox (may be empty when sending `--image`/`--resource`/`content`).",
             "type": "string"
           }
         },
@@ -6677,6 +7094,127 @@
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/Agent"
+        }
+      }
+    },
+    {
+      "description": "Re-enqueue paused inbox prompts preserved across a restart or reboot and resume delivery.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "finished"
+          },
+          "message": "finished"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "agent.inbox_resume",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The agent: `a7`, a name, or `machine/a7`.",
+          "name": "agent",
+          "required": true,
+          "schema": {
+            "description": "The agent: `a7`, a name, or `machine/a7`.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Who is calling; a parent looking at its child has seen its news.",
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "description": "Who is calling; a parent looking at its child has seen its news.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/Agent"
+        }
+      }
+    },
+    {
+      "description": "Discard paused inbox prompts preserved across a restart or reboot.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "not_found"
+          },
+          "message": "not_found"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "finished"
+          },
+          "message": "finished"
+        }
+      ],
+      "name": "agent.inbox_clear_paused",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "The agent: `a7`, a name, or `machine/a7`.",
+          "name": "agent",
+          "required": true,
+          "schema": {
+            "description": "The agent: `a7`, a name, or `machine/a7`.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Who is calling; a parent looking at its child has seen its news.",
+          "name": "caller",
+          "required": false,
+          "schema": {
+            "description": "Who is calling; a parent looking at its child has seen its news.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       ],
@@ -10814,6 +11352,16 @@
           }
         },
         {
+          "name": "language",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
           "name": "maxTokens",
           "required": false,
           "schema": {
@@ -11512,6 +12060,111 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/CommitMessageResult"
+        }
+      }
+    },
+    {
+      "description": "Rewrite a rough draft prompt into a clearer, well-structured prompt for an ACP or CLI coding agent using Core AI.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "ai.polish_prompt",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Target agent kind (`acp` or `cli`).",
+          "name": "agentKind",
+          "required": false,
+          "schema": {
+            "description": "Target agent kind (`acp` or `cli`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Optional extra workspace or conversation context hint.",
+          "name": "context",
+          "required": false,
+          "schema": {
+            "description": "Optional extra workspace or conversation context hint.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Preferred UI language (`zh-CN` / `en`); defaults to preserving the prompt's own language.",
+          "name": "language",
+          "required": false,
+          "schema": {
+            "description": "Preferred UI language (`zh-CN` / `en`); defaults to preserving the prompt's own language.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Target remote machine (`h2 machine ls`).",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "Target remote machine (`h2 machine ls`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Raw draft prompt to clarify and structure before sending to an agent.",
+          "name": "prompt",
+          "required": true,
+          "schema": {
+            "description": "Raw draft prompt to clarify and structure before sending to an agent.",
+            "type": "string"
+          }
+        },
+        {
+          "description": "Optional target agent or terminal address (`a1`, `t1`, or `machine/a1`) for brief task/cwd context.",
+          "name": "target",
+          "required": false,
+          "schema": {
+            "description": "Optional target agent or terminal address (`a1`, `t1`, or `machine/a1`) for brief task/cwd context.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/PolishPromptResult"
         }
       }
     },

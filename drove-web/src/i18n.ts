@@ -540,7 +540,7 @@ const zh: Record<string, string> = {
   "wb.allAttempts": "全部回合",
   "wb.workerRoleScope": "允许写入范围",
   "wb.workerRoleUnrestricted": "工作区常规读写（受任务 ownership 约束）",
-  "wb.workerRoleReadOnly": "只读快照视图（bwrap 只读隔离，禁止写文件）",
+  "wb.workerRoleReadOnly": "只读快照视图（沙箱只读隔离，禁止写文件）",
   "wb.workerRoleFilterAll": "全角色",
   "agents.rolesTitle": "角色路由矩阵",
   "agents.rolesHint": "Architect（架构师 · 编排者）由当前宿主全局唯一担任，永不作为下游 Worker 派发；其余专业角色按权限边界与首选模型链路由。",

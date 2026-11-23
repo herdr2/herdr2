@@ -497,12 +497,33 @@ pub struct PlainSub {
     pub filter: crate::events::Filter,
 }
 
-#[derive(clap::Args, Serialize, Deserialize, JsonSchema)]
+#[derive(clap::Args, Serialize, Deserialize, JsonSchema, Default)]
 pub struct SendParams {
     /// The agent: `a7`, a name, or `machine/a7`.
     pub agent: String,
-    /// Prompt text queued for the agent's ACP inbox.
+    /// Prompt text queued for the agent's ACP inbox (may be empty when sending `--image`/`--resource`/`content`).
+    #[arg(default_value = "", hide_default_value = true)]
+    #[serde(default)]
     pub text: String,
+    /// Optional ACP multimodal content blocks (`image`, `audio`, `resource`, `resource_link`, `text`).
+    #[arg(skip)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub content: Vec<crate::acp::proto::ContentBlock>,
+    /// Attach one or more local image files (PNG/JPEG/WebP/GIF/SVG, <= 8 MB) as native ACP image blocks.
+    #[arg(long = "image", value_name = "FILE")]
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub images: Vec<String>,
+    /// Attach one or more local files as ACP embedded resource blocks (text or binary <= 8 MB).
+    #[arg(long = "resource", value_name = "FILE")]
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub resources: Vec<String>,
+    /// Attach one or more URIs or file paths as ACP `resource_link` blocks.
+    #[arg(long = "resource-link", value_name = "URI")]
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub resource_links: Vec<String>,
     /// Cancel the active ACP turn (`session/cancel`) and deliver this prompt next.
     #[arg(long)]
     #[serde(default)]

@@ -107,6 +107,9 @@ impl DroveRuntime {
         cfg.ai.effort = core_ai.effort;
         cfg.ai.context_window = core_ai.context_window;
         cfg.ai.max_tokens = core_ai.max_tokens;
+        if core_ai.language.is_some() {
+            cfg.ai.language = core_ai.language;
+        }
 
         let coordinator_secret = crypto::rand_secret();
         write_secret_file(&dpaths.coordinator_token_file, &format!("{coordinator_secret}\n"))?;
@@ -176,6 +179,7 @@ impl DroveRuntime {
         cfg.ai.effort = core_ai.effort;
         cfg.ai.context_window = core_ai.context_window;
         cfg.ai.max_tokens = core_ai.max_tokens;
+        cfg.ai.language = core_ai.language;
     }
 
     pub fn get_loop_watermark(&self, attempt_id: &str) -> u64 {
@@ -525,6 +529,7 @@ impl DroveRuntime {
             effort: st.effort,
             context_window: st.context_window,
             max_tokens: st.max_tokens,
+            language: st.language,
             available_models: st.available_models,
             circuit_open: st.circuit_open,
             cooldown_until: st.cooldown_until,
@@ -635,6 +640,11 @@ impl DroveRuntime {
             if let Some(n) = ai.max_tokens {
                 next.ai.max_tokens = if n == 0 { None } else { Some(n) };
                 core_ai_patch.max_tokens = Some(n);
+                has_core_ai_update = true;
+            }
+            if let Some(s) = ai.language {
+                next.ai.language = crate::ai::normalize_ai_language(&s)?;
+                core_ai_patch.language = Some(s);
                 has_core_ai_update = true;
             }
             if let Some(b) = ai.auto_title {

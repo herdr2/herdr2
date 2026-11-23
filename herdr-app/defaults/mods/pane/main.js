@@ -734,6 +734,44 @@ export default class Pane extends View {
           ),
         ),
       )
+      .when(isAgent && !isStructured && st !== "ended" && Boolean(p.terminal), el => el.child(
+        h_flex()
+          .id(`ph-polish-${pane}`)
+          .flex_none()
+          .h(20)
+          .px(7)
+          .gap(4)
+          .items_center()
+          .rounded(6)
+          .bg(alpha("#a855f7", "1a") ?? t.raised)
+          .border_1()
+          .border_color(alpha("#a855f7", "55") ?? t.border)
+          .text_size(11)
+          .font_medium()
+          .text_color("#a855f7")
+          .cursor_pointer()
+          .hover((s) => s.bg(alpha("#a855f7", "2e") ?? t.hover))
+          .tooltip(tr("Compose & polish prompt with Core AI before sending to CLI agent", "输入并由 Core AI 润色提示词后发送给 CLI Agent"))
+          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+          .on_click((_e, cx) => {
+            cx.stop_propagation();
+            openOverlay({
+              mod: "prompt",
+              kind: "modal",
+              width: 580,
+              height: 390,
+              props: {
+                mode: "polish",
+                terminal: p.terminal,
+                agentName: p.program?.name || p.title || p.terminal,
+                agentKind: "cli",
+                cwd: p.cwd || "",
+              },
+            });
+          })
+          .child(svg("mods/peek/sparkles.svg").size(11).flex_none().text_color("#a855f7"))
+          .child(tr("Polish", "润色输入")),
+      ))
       .when(showViewToggle, el => el.child(
         h_flex()
           .id(`ph-view-${pane}`)

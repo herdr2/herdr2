@@ -119,8 +119,9 @@ fn candidate_session_id(c: &Candidate) -> Option<String> {
 
 pub(crate) fn argv_has_resume(argv: &[String]) -> bool {
     let has_flag = argv.iter().any(|arg| {
-        matches!(arg.as_str(), "--resume" | "-r" | "--continue" | "-c")
+        matches!(arg.as_str(), "--resume" | "-r" | "--continue" | "-c" | "--conversation")
             || arg.starts_with("--resume=")
+            || arg.starts_with("--conversation=")
     });
     if has_flag {
         return true;
@@ -1091,7 +1092,7 @@ fn parse_claude_jsonl_with_settings(path: &Path, settings: Option<&Value>) -> (V
                         let clean = strip_system_reminders(s);
                         if !clean.is_empty() {
                             turn += 1;
-                            entries.push(Entry::User { turn, from: None, text: clean, ts_ms });
+                            entries.push(Entry::User { turn, from: None, text: clean, attachments: vec![], ts_ms });
                         }
                     }
                     Value::Array(blocks) => {
@@ -1133,6 +1134,7 @@ fn parse_claude_jsonl_with_settings(path: &Path, settings: Option<&Value>) -> (V
                                 turn,
                                 from: None,
                                 text: text_parts.join("\n\n"),
+                                attachments: vec![],
                                 ts_ms,
                             });
                         }
@@ -1257,6 +1259,7 @@ fn parse_claude_jsonl_with_settings(path: &Path, settings: Option<&Value>) -> (V
                                 tool_kind,
                                 status: "in_progress".to_string(),
                                 detail,
+                                attachments: vec![],
                                 ts_ms,
                             });
                             if !id.is_empty() {
@@ -1267,7 +1270,7 @@ fn parse_claude_jsonl_with_settings(path: &Path, settings: Option<&Value>) -> (V
                             if let Some(text) = block.get("text").and_then(Value::as_str) {
                                 let clean = text.trim();
                                 if !clean.is_empty() {
-                                    entries.push(Entry::Assistant { turn, text: clean.to_string(), ts_ms });
+                                    entries.push(Entry::Assistant { turn, text: clean.to_string(), attachments: vec![], ts_ms });
                                 }
                             }
                         }
@@ -1663,7 +1666,7 @@ fn parse_codex_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                     let clean = msg.trim();
                     if !clean.is_empty() {
                         turn += 1;
-                        entries.push(Entry::User { turn, from: None, text: clean.to_string(), ts_ms });
+                        entries.push(Entry::User { turn, from: None, text: clean.to_string(), attachments: vec![], ts_ms });
                     }
                 } else if ev_type == Some("token_count")
                     && let Some(info) = v.pointer("/payload/info")
@@ -1745,6 +1748,7 @@ fn parse_codex_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                             tool_kind,
                             status: "in_progress".to_string(),
                             detail,
+                            attachments: vec![],
                             ts_ms,
                         });
                         if !call_id.is_empty() {
@@ -1766,7 +1770,7 @@ fn parse_codex_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                         if role == Some("assistant") {
                             let text = join_codex_message_texts(payload, &["output_text", "text"]);
                             if !text.is_empty() {
-                                entries.push(Entry::Assistant { turn, text, ts_ms });
+                                entries.push(Entry::Assistant { turn, text, attachments: vec![], ts_ms });
                             }
                         } else if role == Some("user") && !has_event_user_msg {
                             let parts: Vec<String> = payload
@@ -1789,7 +1793,7 @@ fn parse_codex_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                                 .unwrap_or_default();
                             if !parts.is_empty() {
                                 turn += 1;
-                                entries.push(Entry::User { turn, from: None, text: parts.join("\n\n"), ts_ms });
+                                entries.push(Entry::User { turn, from: None, text: parts.join("\n\n"), attachments: vec![], ts_ms });
                             }
                         }
                     }
@@ -1917,7 +1921,7 @@ fn parse_gemini_json(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                 let text = extract_gemini_text(m.get("content"));
                 if !text.is_empty() {
                     turn += 1;
-                    entries.push(Entry::User { turn, from: None, text, ts_ms });
+                    entries.push(Entry::User { turn, from: None, text, attachments: vec![], ts_ms });
                 }
             }
             Some("gemini" | "assistant" | "model") => {
@@ -1964,13 +1968,14 @@ fn parse_gemini_json(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                             tool_kind,
                             status: status.to_string(),
                             detail,
+                            attachments: vec![],
                             ts_ms,
                         });
                     }
                 }
                 let text = extract_gemini_text(m.get("content"));
                 if !text.is_empty() {
-                    entries.push(Entry::Assistant { turn, text, ts_ms });
+                    entries.push(Entry::Assistant { turn, text, attachments: vec![], ts_ms });
                 }
             }
             _ => {}
@@ -2170,7 +2175,7 @@ fn parse_pi_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                 let text = extract_gemini_text(msg.get("content"));
                 if !text.is_empty() {
                     turn += 1;
-                    entries.push(Entry::User { turn, from: None, text, ts_ms });
+                    entries.push(Entry::User { turn, from: None, text, attachments: vec![], ts_ms });
                 }
             }
             Some("assistant") => {
@@ -2204,6 +2209,7 @@ fn parse_pi_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                                 tool_kind,
                                 status: "in_progress".to_string(),
                                 detail,
+                                attachments: vec![],
                                 ts_ms,
                             });
                             if !id.is_empty() {
@@ -2214,7 +2220,7 @@ fn parse_pi_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                             if let Some(t) = block.get("text").and_then(Value::as_str) {
                                 let clean = t.trim();
                                 if !clean.is_empty() {
-                                    entries.push(Entry::Assistant { turn, text: clean.to_string(), ts_ms });
+                                    entries.push(Entry::Assistant { turn, text: clean.to_string(), attachments: vec![], ts_ms });
                                 }
                             }
                         }
@@ -2265,7 +2271,7 @@ fn parse_agy_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                 let clean = strip_user_request_wrapper(raw);
                 if !clean.is_empty() {
                     turn += 1;
-                    entries.push(Entry::User { turn, from: None, text: clean, ts_ms });
+                    entries.push(Entry::User { turn, from: None, text: clean, attachments: vec![], ts_ms });
                 }
             }
             Some("PLANNER_RESPONSE") => {
@@ -2303,6 +2309,7 @@ fn parse_agy_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                                     tool_kind: Some("plan".into()),
                                     status: "completed".to_string(),
                                     detail: Some(detail),
+                                    attachments: vec![],
                                     ts_ms,
                                 });
                             }
@@ -2317,6 +2324,7 @@ fn parse_agy_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                             tool_kind,
                             status: "completed".to_string(),
                             detail,
+                            attachments: vec![],
                             ts_ms,
                         });
                     }
@@ -2324,7 +2332,7 @@ fn parse_agy_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                 if let Some(content) = v.get("content").and_then(Value::as_str) {
                     let clean = content.trim();
                     if !clean.is_empty() {
-                        entries.push(Entry::Assistant { turn, text: clean.to_string(), ts_ms });
+                        entries.push(Entry::Assistant { turn, text: clean.to_string(), attachments: vec![], ts_ms });
                     }
                 }
             }
@@ -2417,6 +2425,7 @@ pub(crate) fn merge_sent_prompts(entries: &mut Vec<Entry>, sent_prompts: &[(u64,
                 turn: (*turn).max(1),
                 from: None,
                 text: text.clone(),
+                attachments: vec![],
                 ts_ms: *ts_ms,
             });
             recent_user_texts.push(trimmed.to_string());
@@ -3242,6 +3251,7 @@ mod tests {
             turn: 1,
             from: None,
             text: "first prompt".into(),
+            attachments: vec![],
             ts_ms: 1000,
         }];
         let prompts = vec![

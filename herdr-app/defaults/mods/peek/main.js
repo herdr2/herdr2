@@ -4,8 +4,8 @@
 
 import { View, div, image, svg } from "gpui-kit";
 import { h_flex, v_flex, Popup, TextareaState, Textarea, InputState, Input, TextView, ScrollHandle } from "gpui-base";
-import { agents, terminals, panes, spaces, focused, run, theme, settings, home, props, closeOverlay, openOverlay, checking, h2, shared, setShared, window as appWindow } from "herdr";
-import { buildConversationItems, buildPtySessionBadges, summarizeActivityGroup, toolIconPath, formatTime, shortenPath, normalizeConfigOptions, filterConfigChoices, normalizeInboxItems, parseToolDetail, resolveEffortVisual, resolvePeerAddress } from "./acp_model.js";
+import { agents, terminals, panes, spaces, focused, run, theme, settings, home, props, closeOverlay, openOverlay, checking, h2, shared, setShared, nextCommand, window as appWindow, readImageDataUrl, pasteClipboardAttachments, prepareAttachments, pickAttachments } from "herdr";
+import { buildConversationItems, buildPtySessionBadges, summarizeActivityGroup, toolIconPath, formatTime, shortenPath, normalizeConfigOptions, filterConfigChoices, normalizeInboxItems, parseToolDetail, resolveEffortVisual, resolvePeerAddress, isImageAttachment, formatAttachmentBytes, attachmentDisplayName } from "./acp_model.js";
 
 const LANE_MAX_W = 736; // 46rem editorial content column (--chat-content-max-width)
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -171,12 +171,14 @@ const ICONS = {
   listPlus: "mods/peek/list-plus.svg",
   listTodo: "mods/peek/list-todo.svg",
   messagesSquare: "mods/peek/messages-square.svg",
+  paperclip: "mods/peek/paperclip.svg",
   sparkles: "mods/peek/sparkles.svg",
   wrapText: "mods/peek/wrap-text.svg",
   wrench: "mods/peek/wrench.svg",
   zap: "mods/peek/zap.svg",
   refresh: "frame/settings/refresh.svg",
   shield: "frame/settings/shield.svg",
+  fileText: "mods/workspace-chrome/file-text.svg",
   folder: "mods/workspace-chrome/folder.svg",
   gitBranch: "mods/workspace-chrome/git-branch.svg",
   search: "mods/workspace-chrome/search.svg",
@@ -337,6 +339,14 @@ export default class Peek extends View {
       value: "",
       placeholder: tr("Ask anything…", "输入任何问题…"),
     });
+    this.polishingPrompt = false;
+    this.polishUndoText = null;
+    this.polishSummary = null;
+    this.polishApplied = false;
+    this.draftAttachments = [];
+    this.attachmentImages = new Map();
+    this.expandedMedia = {};
+    this.expandedResourceText = {};
     this.input.set_auto_grow(2, 8);
     this.input.on("focus", (_e, cx) => {
       this.inputFocused = true;
@@ -348,13 +358,19 @@ export default class Peek extends View {
       cx.notify();
     });
     this.input.on("change", (_e, cx) => {
+      if (this.polishApplied) this.polishApplied = false;
+      this.writeSavedDraft(this.loadedTerminal || this.activeTerminal(), this.input?.value?.() ?? "");
       cx.notify();
+    });
+    this.input.on("paste_other", (_e, cx) => {
+      this.handlePasteAttachments(cx);
     });
     this.input.on("submit", (e, cx) => {
       if (e?.shift) return;
       const steer = Boolean(e?.secondary) && this.status() === "working";
       const trimmed = (this.input.value() ?? "").trim();
-      if (!trimmed) {
+      const hasAttachments = Array.isArray(this.draftAttachments) && this.draftAttachments.length > 0;
+      if (!trimmed && !hasAttachments) {
         this.input.set_value("");
         cx.notify();
         return;
@@ -364,7 +380,17 @@ export default class Peek extends View {
     this.handle = cx.focus_handle();
     if (!checking()) this.handle.focus();
     if (!checking()) {
+      this.loadedTerminal = this.activeTerminal();
+      this.restoreDraftFor(this.loadedTerminal);
       this.scheduleReload(cx);
+      if (typeof nextCommand === "function") {
+        cx.spawn(async (cmdCx) => {
+          for (;;) {
+            const cmd = await nextCommand();
+            if (cmd === "polish") await this.polishPrompt(cmdCx);
+          }
+        });
+      }
       cx.timer.every(1000, (tcx) => {
         if (this.status() === "working") tcx?.notify?.();
       });
@@ -844,17 +870,245 @@ export default class Peek extends View {
     }
   }
 
+  activeMachine() {
+    const addr = this.activeTerminal();
+    return typeof addr === "string" && addr.includes("/") ? addr.split("/")[0] : null;
+  }
+
+  addDraftAttachments(results, cx) {
+    const MAX_ATTACH = 8;
+    const list = Array.isArray(results) ? results : [];
+    if (list.length === 0) return false;
+    let added = 0;
+    for (const item of list) {
+      if (!item || typeof item !== "object") continue;
+      if (item.error) {
+        this.error = String(item.error);
+        continue;
+      }
+      if (!item.path) continue;
+      if (this.draftAttachments.length >= MAX_ATTACH) {
+        this.error = tr(`Up to ${MAX_ATTACH} attachments per message.`, `单条消息最多附加 ${MAX_ATTACH} 个文件。`);
+        break;
+      }
+      if (this.draftAttachments.some((d) => d.path === item.path)) continue;
+      this.draftAttachments.push({
+        kind: item.kind === "image" ? "image" : "resource",
+        path: String(item.path),
+        preview: item.preview ? String(item.preview) : null,
+        name: String(item.name || attachmentDisplayName(item)),
+        mimeType: String(item.mimeType || item.mime_type || ""),
+        bytes: Number(item.bytes) || 0,
+      });
+      added += 1;
+    }
+    if (added > 0) {
+      this.error = null;
+      this.input?.focus?.();
+    }
+    (cx ?? this.cx)?.notify?.();
+    return added > 0;
+  }
+
+  handlePasteAttachments(cx) {
+    const st = this.status();
+    if (st === "ended" || this.term()?.state === "finished" || checking()) return false;
+    if (typeof pasteClipboardAttachments !== "function") return false;
+    try {
+      const res = pasteClipboardAttachments();
+      return this.addDraftAttachments(res, cx);
+    } catch (e) {
+      this.error = String(e?.message ?? e);
+      (cx ?? this.cx)?.notify?.();
+      return false;
+    }
+  }
+
+  handleDropFiles(paths, cx) {
+    const st = this.status();
+    if (st === "ended" || this.term()?.state === "finished" || checking()) return false;
+    if (!Array.isArray(paths) || paths.length === 0 || typeof prepareAttachments !== "function") return false;
+    try {
+      const remaining = Math.max(0, 8 - (this.draftAttachments?.length ?? 0));
+      if (remaining === 0) {
+        this.error = tr("Up to 8 attachments per message.", "单条消息最多附加 8 个文件。");
+        (cx ?? this.cx)?.notify?.();
+        return false;
+      }
+      const res = prepareAttachments(paths.slice(0, remaining));
+      return this.addDraftAttachments(res, cx);
+    } catch (e) {
+      this.error = String(e?.message ?? e);
+      (cx ?? this.cx)?.notify?.();
+      return false;
+    }
+  }
+
+  pickDraftAttachments(cx) {
+    const st = this.status();
+    if (st === "ended" || this.term()?.state === "finished" || checking()) return;
+    if (typeof pickAttachments !== "function") return;
+    const targetCx = cx ?? this.cx;
+    if (!targetCx?.spawn) return;
+    targetCx.spawn(async (taskCx) => {
+      try {
+        const res = await pickAttachments({ prompt: tr("Attach", "附加"), multiple: true });
+        this.addDraftAttachments(res, taskCx);
+      } catch (e) {
+        this.error = String(e?.message ?? e);
+        taskCx?.notify?.();
+      }
+    });
+  }
+
+  removeDraftAttachment(idx, cx) {
+    if (!Array.isArray(this.draftAttachments) || idx < 0 || idx >= this.draftAttachments.length) return;
+    this.draftAttachments.splice(idx, 1);
+    (cx ?? this.cx)?.notify?.();
+  }
+
+  attachmentCacheKey(att) {
+    return `${this.activeMachine() ?? "local"}:${att?.path ?? ""}`;
+  }
+
+  ensureAttachmentImage(att, cx) {
+    if (!att?.path || !isImageAttachment(att) || checking()) return null;
+    if (typeof readImageDataUrl !== "function") return null;
+    const key = this.attachmentCacheKey(att);
+    const existing = this.attachmentImages.get(key);
+    if (existing) return existing;
+    const entry = { status: "loading", dataUrl: null };
+    this.attachmentImages.set(key, entry);
+    const on = this.activeMachine();
+    const path = att.path;
+    const spawnOn = cx ?? this.cx;
+    const load = async (notifyCx) => {
+      try {
+        const dataUrl = await readImageDataUrl(path, on ? { on } : undefined);
+        this.attachmentImages.set(key, dataUrl ? { status: "ready", dataUrl } : { status: "error", dataUrl: null });
+      } catch {
+        this.attachmentImages.set(key, { status: "error", dataUrl: null });
+      }
+      try {
+        (notifyCx ?? this.cx)?.notify?.();
+      } catch {}
+    };
+    if (spawnOn?.spawn) {
+      spawnOn.spawn(load);
+    } else {
+      Promise.resolve().then(() => load(this.cx));
+    }
+    return entry;
+  }
+
+  openAttachment(att, cx) {
+    if (!att) return;
+    if (att.path) {
+      const on = this.activeMachine();
+      const args = { path: att.path };
+      if (on) args.on = on;
+      run("files.open", args);
+      return;
+    }
+    if (att.uri && /^https?:\/\//i.test(String(att.uri))) {
+      try { cx?.open_url?.(att.uri); } catch {}
+    }
+  }
+
   async sendPrompt(steer) {
     const terminal = this.activeTerminal();
     const st = this.status();
     if (st === "ended" || this.term()?.state === "finished") return;
     const text = (this.input?.value?.() ?? "").trim();
-    if (!terminal || !text || checking() || this.busyAction) return;
+    const attachments = Array.isArray(this.draftAttachments) ? [...this.draftAttachments] : [];
+    if (!terminal || (!text && attachments.length === 0) || checking() || this.busyAction) return;
     this.input.set_value("");
+    this.writeSavedDraft(terminal, "");
+    this.draftAttachments = [];
+    this.polishUndoText = null;
+    this.polishSummary = null;
+    this.polishApplied = false;
     this.autoFollow = true;
     this.revealedSig = "";
-    const args = steer ? ["send", "--json", "--steer", terminal, text] : ["send", "--json", terminal, text];
+    const args = ["send", "--json"];
+    if (steer) args.push("--steer");
+    for (const att of attachments) {
+      if (att.kind === "image") args.push("--image", att.path);
+      else args.push("--resource", att.path);
+    }
+    args.push("--", terminal);
+    if (text) args.push(text);
     await this.runH2(args);
+  }
+
+  revertPolishedPrompt(cx) {
+    if (this.polishUndoText == null) return;
+    const orig = this.polishUndoText;
+    this.polishUndoText = null;
+    this.polishSummary = null;
+    this.polishApplied = false;
+    this.input?.set_value?.(orig);
+    this.input?.focus?.();
+    (cx ?? this.cx)?.notify?.();
+  }
+
+  async polishPrompt(cx) {
+    const terminal = this.activeTerminal();
+    const st = this.status();
+    if (st === "ended" || this.term()?.state === "finished") return;
+    const raw = (this.input?.value?.() ?? "").trim();
+    if (!raw || checking() || this.polishingPrompt || this.busyAction) return;
+    const kind = this.isPtyMode() ? "cli" : "acp";
+    const machine = terminal && terminal.includes("/") ? terminal.split("/")[0] : null;
+    this.polishingPrompt = true;
+    this.error = null;
+    (cx ?? this.cx)?.notify?.();
+    try {
+      const args = [
+        "ai",
+        "polish-prompt",
+        "--json",
+        "--kind",
+        kind,
+        "--lang",
+        isZh() ? "zh-CN" : "en",
+      ];
+      if (terminal) args.push("--target", terminal);
+      if (machine) args.push("--on", machine);
+      args.push("--", raw);
+      const res = await h2(args, { timeout: 22000 });
+      if (this.activeTerminal() !== terminal) return;
+      if (res?.code === 0 && res.stdout) {
+        const parsed = JSON.parse(res.stdout);
+        const polished = String(parsed?.polished ?? "").trim();
+        if (parsed?.usedAi && polished) {
+          this.polishUndoText = raw;
+          this.polishSummary = parsed?.summary ? String(parsed.summary).trim() : null;
+          this.polishApplied = true;
+          this.input?.set_value?.(polished);
+          this.input?.focus?.();
+        } else {
+          const reason = String(parsed?.fallbackReason ?? "");
+          this.error = reason === "ai_not_configured"
+            ? tr("Core AI is not configured. Enable it in Settings → AI Assistant to polish prompts.", "Core AI 尚未配置，请先在「设置 → AI 助手」中启用后再使用提示词润色。")
+            : reason === "ai_circuit_open"
+              ? tr("Core AI is temporarily cooling down after recent failures. Please retry shortly.", "Core AI 因连续失败暂时熔断冷却中，请稍后重试。")
+              : tr("AI prompt polish did not return an improved version. Please retry.", "AI 润色暂未返回有效结果，请稍后重试。");
+        }
+      } else {
+        let msg = String(res?.stderr || res?.stdout || "").trim();
+        try {
+          const parsed = JSON.parse(res?.stderr || res?.stdout || "{}");
+          if (parsed?.error?.message) msg = parsed.error.message;
+        } catch {}
+        this.error = msg || tr("AI prompt polish failed", "AI 提示词润色失败");
+      }
+    } catch (e) {
+      this.error = tr(`AI prompt polish failed: ${e?.message ?? e}`, `AI 提示词润色失败：${e?.message ?? e}`);
+    } finally {
+      this.polishingPrompt = false;
+      (cx ?? this.cx)?.notify?.();
+    }
   }
 
   rawInboxFor(k = this.term()) {
@@ -960,6 +1214,82 @@ export default class Peek extends View {
     this.optimisticInbox = current.filter((raw) => Number(raw?.id) !== Number(itemId));
     await this.applyInboxCommand(["inbox", "send", "--json", terminal, String(itemId)], cx);
     this.scheduleReload(cx);
+  }
+
+  draftStorageKey(addr) {
+    return addr ? `herdr2.peek.draft.v1:${addr}` : null;
+  }
+
+  readSavedDraft(addr) {
+    if (checking() || typeof localStorage === "undefined") return "";
+    const key = this.draftStorageKey(addr);
+    if (!key) return "";
+    try {
+      const raw = localStorage.getItem(key);
+      return typeof raw === "string" ? raw : "";
+    } catch {
+      return "";
+    }
+  }
+
+  writeSavedDraft(addr, text) {
+    if (checking() || typeof localStorage === "undefined") return;
+    const key = this.draftStorageKey(addr);
+    if (!key) return;
+    try {
+      const value = typeof text === "string" ? text : "";
+      if (!value.trim()) {
+        localStorage.removeItem(key);
+      } else {
+        localStorage.setItem(key, value.slice(0, 32 * 1024));
+      }
+    } catch {}
+  }
+
+  restoreDraftFor(addr) {
+    if (!this.input?.set_value) return;
+    const saved = this.readSavedDraft(addr);
+    if ((this.input.value?.() ?? "") !== saved) {
+      this.input.set_value(saved);
+    }
+  }
+
+  pausedInboxItemsFor(k = this.term()) {
+    const raw = Array.isArray(k?.paused_inbox)
+      ? k.paused_inbox
+      : Array.isArray(this.agentDetail?.paused_inbox)
+        ? this.agentDetail.paused_inbox
+        : [];
+    return normalizeInboxItems(raw);
+  }
+
+  async resumePausedInbox(cx) {
+    const terminal = this.activeTerminal();
+    if (!terminal || checking() || this.inboxBusy) return;
+    await this.applyInboxCommand(["inbox", "resume", "--json", terminal], cx);
+    this.scheduleReload(cx, { forceDetail: true });
+  }
+
+  async clearPausedInbox(cx) {
+    const terminal = this.activeTerminal();
+    if (!terminal || checking() || this.inboxBusy) return;
+    await this.applyInboxCommand(["inbox", "clear-paused", "--json", terminal], cx);
+    this.scheduleReload(cx, { forceDetail: true });
+  }
+
+  async movePausedInboxToInput(pausedItems, cx) {
+    const terminal = this.activeTerminal();
+    if (!terminal || !Array.isArray(pausedItems) || pausedItems.length === 0 || checking() || this.inboxBusy) return;
+    const joined = pausedItems
+      .map((it) => String(it?.body ?? "").trim())
+      .filter(Boolean)
+      .join("\n\n");
+    const existing = (this.input?.value?.() ?? "").trim();
+    const next = existing && joined ? `${existing}\n\n${joined}` : (joined || existing);
+    this.input?.set_value?.(next);
+    this.writeSavedDraft(terminal, next);
+    this.input?.focus?.();
+    await this.clearPausedInbox(cx);
   }
 
   configOptionsFor(k) {
@@ -1230,9 +1560,212 @@ export default class Peek extends View {
       inline_code_background: t.raised,
       border: t.border,
       heading: t.foreground,
+      allow_data_images: true,
     };
     if (cwd) opts.root_dir = cwd;
     return opts;
+  }
+
+  renderAttachments(t, attachments, idPrefix, mono = "JetBrains Mono", opts = {}) {
+    const list = Array.isArray(attachments) ? attachments : [];
+    if (list.length === 0) return null;
+    const isUser = Boolean(opts.isUser);
+    const mdOpts = { ...this.mdOptions(t, this.term()?.cwd), allow_data_images: true };
+    const cards = list.map((att, idx) => {
+      const key = `${idPrefix}-att-${idx}`;
+      const name = attachmentDisplayName(att);
+      const sizeStr = formatAttachmentBytes(att.bytes);
+      const mime = String(att.mime_type ?? att.mimeType ?? "");
+      const clickable = Boolean(att.path || (att.uri && /^https?:\/\//i.test(att.uri)));
+
+      if (isImageAttachment(att) && att.path) {
+        const cached = this.ensureAttachmentImage(att, this.cx);
+        const expanded = Boolean(this.expandedMedia?.[key]);
+        const maxW = expanded ? LANE_MAX_W - 24 : (isUser ? 320 : 420);
+        return v_flex()
+          .id(`acp-media-${key}`)
+          .w_full()
+          .max_w(maxW)
+          .min_w(0)
+          .rounded(10)
+          .border_1()
+          .border_color(t.border)
+          .bg(t.code_bg ?? t.popover ?? t.surface)
+          .overflow_hidden()
+          .child(
+            h_flex()
+              .w_full()
+              .h(26)
+              .px(9)
+              .gap(6)
+              .items_center()
+              .justify_between()
+              .border_b(1)
+              .border_color(t.border)
+              .child(
+                h_flex()
+                  .flex_1()
+                  .min_w(0)
+                  .gap(5)
+                  .items_center()
+                  .child(svg(ICONS.paperclip).size(11).flex_none().text_color(t.dim))
+                  .child(div().flex_1().min_w(0).truncate().text_size(11).font_medium().text_color(t.foreground).child(name))
+                  .when(Boolean(sizeStr), (el) => el.child(div().flex_none().font_family(mono).text_size(10).text_color(t.dim).child(sizeStr))),
+              )
+              .child(
+                h_flex()
+                  .gap(4)
+                  .flex_none()
+                  .items_center()
+                  .child(
+                    div()
+                      .id(`acp-media-zoom-${key}`)
+                      .px(5)
+                      .py(1)
+                      .rounded(4)
+                      .text_size(10.5)
+                      .text_color(t.muted)
+                      .cursor_pointer()
+                      .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                      .on_mouse_down("left", stopMouse)
+                      .on_click((_e, cx) => {
+                        this.expandedMedia[key] = !expanded;
+                        cx.notify();
+                      })
+                      .child(expanded ? tr("Compact", "缩小") : tr("Expand", "放大")),
+                  )
+                  .when(clickable, (el) =>
+                    el.child(
+                      div()
+                        .id(`acp-media-open-${key}`)
+                        .px(5)
+                        .py(1)
+                        .rounded(4)
+                        .text_size(10.5)
+                        .text_color(t.accent ?? t.muted)
+                        .cursor_pointer()
+                        .hover((s) => s.bg(t.hover))
+                        .on_mouse_down("left", stopMouse)
+                        .on_click((_e, cx) => this.openAttachment(att, cx))
+                        .child(tr("Open", "打开")),
+                    ),
+                  ),
+              ),
+          )
+          .child(
+            div()
+              .w_full()
+              .min_w(0)
+              .p(6)
+              .child(
+                cached?.status === "ready" && cached.dataUrl
+                  ? TextView.markdown(`acp-img-${key}`, `![${name.replace(/[\[\]]/g, "")}](${cached.dataUrl})`, mdOpts)
+                      .w_full()
+                      .min_w(0)
+                      .scrollable(false)
+                  : div()
+                      .px(6)
+                      .py(8)
+                      .text_size(11.5)
+                      .text_color(t.dim)
+                      .child(
+                        cached?.status === "error"
+                          ? tr(`Image preview unavailable (${name})`, `无法预览图片（${name}）`)
+                          : tr("Loading image…", "正在加载图片…"),
+                      ),
+              ),
+          );
+      }
+
+      const hasTextSnippet = Boolean(att.text && String(att.text).trim().length > 0);
+      const snippetOpen = Boolean(this.expandedResourceText?.[key]);
+      const isLink = att.kind === "resource_link";
+      const badgeText = [mime || att.kind, sizeStr].filter(Boolean).join(" · ");
+      return v_flex()
+        .id(`acp-res-${key}`)
+        .w_full()
+        .max_w(isUser ? 520 : LANE_MAX_W - 24)
+        .min_w(0)
+        .rounded(9)
+        .border_1()
+        .border_color(t.border)
+        .bg(t.raised ?? t.surface)
+        .overflow_hidden()
+        .child(
+          h_flex()
+            .w_full()
+            .min_h(30)
+            .px(10)
+            .py(5)
+            .gap(7)
+            .items_center()
+            .when(clickable || hasTextSnippet, (el) =>
+              el
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover))
+                .on_mouse_down("left", stopMouse)
+                .on_click((_e, cx) => {
+                  if (hasTextSnippet && !clickable) {
+                    this.expandedResourceText[key] = !snippetOpen;
+                    cx.notify();
+                  } else if (clickable) {
+                    this.openAttachment(att, cx);
+                  }
+                }),
+            )
+            .child(svg(isLink ? ICONS.globe : ICONS.fileText).size(13).flex_none().text_color(t.accent ?? t.muted))
+            .child(div().flex_1().min_w(0).truncate().text_size(12).font_medium().text_color(t.foreground).child(name))
+            .when(Boolean(badgeText), (el) =>
+              el.child(div().flex_none().font_family(mono).text_size(10.5).text_color(t.dim).child(badgeText)),
+            )
+            .when(hasTextSnippet, (el) =>
+              el.child(
+                div()
+                  .id(`acp-res-toggle-${key}`)
+                  .px(5)
+                  .py(1)
+                  .rounded(4)
+                  .text_size(10.5)
+                  .text_color(t.muted)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                  .on_mouse_down("left", stopMouse)
+                  .on_click((_e, cx) => {
+                    cx.stop_propagation();
+                    this.expandedResourceText[key] = !snippetOpen;
+                    cx.notify();
+                  })
+                  .child(snippetOpen ? tr("Hide", "收起") : tr("Preview", "预览")),
+              ),
+            ),
+        )
+        .when(hasTextSnippet && snippetOpen, (el) =>
+          el.child(
+            div()
+              .w_full()
+              .min_w(0)
+              .max_h(200)
+              .overflow_y_scrollbar()
+              .px(10)
+              .py(7)
+              .border_t(1)
+              .border_color(t.border)
+              .bg(t.code_bg ?? t.background)
+              .font_family(mono)
+              .text_size(11.5)
+              .line_height("17px")
+              .text_color(t.muted)
+              .whitespace_normal()
+              .child(String(att.text)),
+          ),
+        );
+    });
+
+    return v_flex()
+      .w_full()
+      .min_w(0)
+      .gap(6)
+      .children(cards);
   }
 
   handleMarkdownLinkClick(url, ev, cx) {
@@ -1324,6 +1857,8 @@ export default class Peek extends View {
       }
     }
     const fullBody = item.body || "";
+    const attachments = Array.isArray(item.attachments) ? item.attachments : [];
+    const mono = readSettings()?.font_family ?? "JetBrains Mono";
     const isDelegated = Boolean(item.isDelegated ?? item.from);
     const foldKey = `u-fold-${item.id}`;
     const foldOpen = !isDelegated || Boolean(this.expandedSteps?.[foldKey]);
@@ -1334,7 +1869,8 @@ export default class Peek extends View {
     const displayBody = showAll
       ? fullBody
       : `${(lines.length > 14 ? lines.slice(0, 12).join("\n") : fullBody.slice(0, 720)).trimEnd()}…`;
-    const isRich = displayBody.includes("\n") || displayBody.length > 72 || /[`*_#[\]|>]/.test(displayBody);
+    const isRich = displayBody.includes("\n") || displayBody.length > 72 || /[`*_#[\]|>]/.test(displayBody) || attachments.length > 0;
+    const attachmentsEl = attachments.length > 0 ? this.renderAttachments(t, attachments, item.id, mono, { isUser: true }) : null;
     const rowHoverKey = `row-u-${item.id}`;
     const hovered = Boolean(this.hoveredRows?.[rowHoverKey]);
 
@@ -1396,20 +1932,23 @@ export default class Peek extends View {
               .text_size(14)
               .line_height("22px")
               .text_color(t.foreground)
-              .gap(6)
-              .child(
-                (() => {
-                  const linkedUser = linkifyFilePaths(displayBody);
-                  if (isRich || linkedUser !== displayBody) {
-                    return TextView.markdown(`acp-u-${item.id}`, linkedUser, this.mdOptions(t, this.term()?.cwd))
-                      .w_full()
-                      .min_w(0)
-                      .selectable(true)
-                      .scrollable(false)
-                      .on_link_click((url, cx, ev) => this.handleMarkdownLinkClick(url, ev, cx));
-                  }
-                  return div().whitespace_normal().child(displayBody);
-                })(),
+              .gap(8)
+              .when(Boolean(attachmentsEl), (b) => b.child(attachmentsEl))
+              .when(Boolean(displayBody), (b) =>
+                b.child(
+                  (() => {
+                    const linkedUser = linkifyFilePaths(displayBody);
+                    if (isRich || linkedUser !== displayBody) {
+                      return TextView.markdown(`acp-u-${item.id}`, linkedUser, this.mdOptions(t, this.term()?.cwd))
+                        .w_full()
+                        .min_w(0)
+                        .selectable(true)
+                        .scrollable(false)
+                        .on_link_click((url, cx, ev) => this.handleMarkdownLinkClick(url, ev, cx));
+                    }
+                    return div().whitespace_normal().child(displayBody);
+                  })(),
+                ),
               )
               .when(isLong, (b) =>
                 b.child(
@@ -1679,6 +2218,22 @@ export default class Peek extends View {
           .when(step.extraLines > 0, (el) =>
             el.child(div().text_size(11).text_color(t.dim).flex_none().child(tr(`+${step.extraLines}L`, `+${step.extraLines}行`))),
           )
+          .when(Array.isArray(step.attachments) && step.attachments.length > 0, (el) =>
+            el.child(
+              h_flex()
+                .flex_none()
+                .px(5)
+                .py(1)
+                .gap(3)
+                .items_center()
+                .rounded(5)
+                .bg(t.raised)
+                .text_size(10.5)
+                .text_color(t.muted)
+                .child(svg(ICONS.paperclip).size(10).text_color(t.dim))
+                .child(String(step.attachments.length)),
+            ),
+          )
           .when(failed, (el) =>
             el.child(div().text_size(11).font_medium().text_color(t.blocked ?? "#ef4444").flex_none().child(tr("failed", "失败"))),
           )
@@ -1852,7 +2407,15 @@ export default class Peek extends View {
                 ),
             ),
         );
-      });
+      })
+      .when(open && Array.isArray(step.attachments) && step.attachments.length > 0, (el) =>
+        el.child(
+          div()
+            .ml(24)
+            .min_w(0)
+            .child(this.renderAttachments(t, step.attachments, `tc-${step.id}`, mono)),
+        ),
+      );
   }
 
   renderThoughtStep(t, step, defaultOpen = false) {
@@ -2629,6 +3192,10 @@ export default class Peek extends View {
         );
     });
 
+    const attachmentsEl = Array.isArray(item.attachments) && item.attachments.length > 0
+      ? this.renderAttachments(t, item.attachments, item.id, mono)
+      : null;
+
     return v_flex()
       .id(`acp-row-${item.id}`)
       .w_full()
@@ -2643,6 +3210,7 @@ export default class Peek extends View {
         }
       })
       .children(blocks)
+      .when(Boolean(attachmentsEl), (el) => el.child(attachmentsEl))
       .when(Boolean(item.changedFiles), (el) => el.child(this.renderChangedFilesCard(t, item, mono)))
       .when(Boolean(item.isFinalTurnReply) && Boolean(item.text), (el) => {
         const curTerminal = this.activeTerminal();
@@ -3811,6 +4379,22 @@ export default class Peek extends View {
                       .on_click((_e, cx) => this.startEditInboxItem(item, cx))
                       .child(item.preview),
                   )
+                  .when(Array.isArray(item.attachments) && item.attachments.length > 0, (row) =>
+                    row.child(
+                      h_flex()
+                        .flex_none()
+                        .px(5)
+                        .py(1)
+                        .gap(3)
+                        .items_center()
+                        .rounded(5)
+                        .bg(t.raised)
+                        .text_size(10.5)
+                        .text_color(t.muted)
+                        .child(svg(ICONS.paperclip).size(10).text_color(t.dim))
+                        .child(String(item.attachments.length)),
+                    ),
+                  )
                   .when(Boolean(item.time), (row) =>
                     row.child(div().flex_none().font_family(mono).text_size(10.5).text_color(t.dim).child(item.time)),
                   )
@@ -3878,15 +4462,213 @@ export default class Peek extends View {
       );
   }
 
+  renderDraftAttachments(t, k, mono) {
+    const list = Array.isArray(this.draftAttachments) ? this.draftAttachments : [];
+    if (list.length === 0) return null;
+    const hasImages = list.some((a) => a.kind === "image");
+    const caps = k?.prompt_capabilities ?? this.agentDetail?.prompt_capabilities ?? null;
+    const imageDowngradeHint = !this.isPtyMode() && hasImages && caps && caps.image === false;
+    return v_flex()
+      .id("acp-draft-attachments")
+      .w_full()
+      .px(12)
+      .pt(10)
+      .pb(4)
+      .gap(6)
+      .border_b(1)
+      .border_color(withAlpha(t.border, "88"))
+      .child(
+        h_flex()
+          .w_full()
+          .flex_wrap()
+          .gap(8)
+          .items_center()
+          .children(
+            list.map((att, idx) => {
+              const sizeStr = formatAttachmentBytes(att.bytes);
+              if (att.kind === "image" && att.preview) {
+                return div()
+                  .id(`acp-draft-att-${idx}`)
+                  .relative()
+                  .h(56)
+                  .min_w(56)
+                  .max_w(160)
+                  .rounded(8)
+                  .overflow_hidden()
+                  .border_1()
+                  .border_color(t.border)
+                  .bg(t.raised)
+                  .tooltip(`${att.name}${sizeStr ? ` (${sizeStr})` : ""}`)
+                  .child(image(att.preview).h(56))
+                  .child(
+                    div()
+                      .id(`acp-draft-att-rm-${idx}`)
+                      .absolute()
+                      .top(3)
+                      .right(3)
+                      .size(18)
+                      .rounded(999)
+                      .bg(withAlpha(t.popover ?? t.background, "dd"))
+                      .border_1()
+                      .border_color(t.border)
+                      .flex()
+                      .items_center()
+                      .justify_center()
+                      .text_size(11)
+                      .text_color(t.foreground)
+                      .cursor_pointer()
+                      .hover((s) => s.bg(t.blocked ?? "#ef4444").text_color("#ffffff"))
+                      .on_mouse_down("left", stopMouse)
+                      .on_click((_e, cx) => this.removeDraftAttachment(idx, cx))
+                      .child("×"),
+                  );
+              }
+              return h_flex()
+                .id(`acp-draft-att-${idx}`)
+                .h(30)
+                .max_w(220)
+                .pl(8)
+                .pr(5)
+                .gap(5)
+                .items_center()
+                .rounded(8)
+                .border_1()
+                .border_color(t.border)
+                .bg(t.raised)
+                .child(svg(att.kind === "image" ? ICONS.paperclip : ICONS.fileText).size(12).flex_none().text_color(t.accent ?? t.muted))
+                .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.foreground).child(att.name))
+                .when(Boolean(sizeStr), (el) => el.child(div().flex_none().font_family(mono).text_size(10).text_color(t.dim).child(sizeStr)))
+                .child(
+                  div()
+                    .id(`acp-draft-att-rm-${idx}`)
+                    .size(18)
+                    .rounded(999)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_size(11)
+                    .text_color(t.dim)
+                    .cursor_pointer()
+                    .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                    .on_mouse_down("left", stopMouse)
+                    .on_click((_e, cx) => this.removeDraftAttachment(idx, cx))
+                    .child("×"),
+                );
+            }),
+          ),
+      )
+      .when(imageDowngradeHint, (el) =>
+        el.child(
+          div()
+            .text_size(10.5)
+            .text_color(t.dim)
+            .child(tr("This ACP adapter does not advertise native image input; images will be staged as resource links.", "当前 ACP 适配器未声明原生图片输入能力，图片将自动降级为资源链接并附带文件路径。")),
+        ),
+      );
+  }
+
+  renderPausedInboxBanner(t, pausedItems) {
+    if (!Array.isArray(pausedItems) || pausedItems.length === 0) return null;
+    const isDark = Boolean(readSettings()?.dark ?? true);
+    const accentSolid = t.accent ?? t.solid ?? "#2563eb";
+    const preview = String(pausedItems[0]?.body ?? "").replace(/\s+/g, " ").trim();
+    const shortPreview = preview.length > 96 ? `${preview.slice(0, 96)}…` : preview;
+    const count = pausedItems.length;
+    return v_flex()
+      .id("acp-paused-inbox")
+      .w_full()
+      .max_w(LANE_MAX_W)
+      .mb(6)
+      .px(12)
+      .py(8)
+      .gap(6)
+      .rounded(12)
+      .border_1()
+      .border_color(withAlpha(accentSolid, "55"))
+      .bg(withAlpha(t.popover ?? t.surface, isDark ? "e8" : "f4"))
+      .child(
+        h_flex()
+          .w_full()
+          .items_center()
+          .justify_between()
+          .gap(8)
+          .child(
+            v_flex()
+              .flex_1()
+              .min_w(0)
+              .gap(2)
+              .child(
+                div()
+                  .text_size(11.5)
+                  .font_semibold()
+                  .text_color(t.foreground)
+                  .child(
+                    tr(
+                      `${count} queued prompt${count > 1 ? "s" : ""} paused before restart`,
+                      `上次重启前有 ${count} 条排队消息已暂停`,
+                    ),
+                  ),
+              )
+              .when(Boolean(shortPreview), (el) =>
+                el.child(
+                  div()
+                    .truncate()
+                    .text_size(11)
+                    .text_color(t.muted)
+                    .child(shortPreview),
+                ),
+              ),
+          )
+          .child(
+            h_flex()
+              .flex_none()
+              .gap(4)
+              .items_center()
+              .child(
+                this.pillButton(
+                  t,
+                  "acp-paused-resume",
+                  tr("Continue", "继续发送"),
+                  (_e, cx) => this.resumePausedInbox(cx),
+                  { h: 24, px: 8, solid: true, accent: accentSolid, disabled: this.inboxBusy },
+                ),
+              )
+              .child(
+                this.pillButton(
+                  t,
+                  "acp-paused-edit",
+                  tr("To input", "回填输入框"),
+                  (_e, cx) => this.movePausedInboxToInput(pausedItems, cx),
+                  { h: 24, px: 8, outlined: true, disabled: this.inboxBusy },
+                ),
+              )
+              .child(
+                this.pillButton(
+                  t,
+                  "acp-paused-discard",
+                  tr("Dismiss", "丢弃"),
+                  (_e, cx) => this.clearPausedInbox(cx),
+                  { h: 24, px: 8, disabled: this.inboxBusy },
+                ),
+              ),
+          ),
+      );
+  }
+
   renderComposer(t, k, st, shortCwd, isTab = false, mono = "JetBrains Mono", inboxItems = []) {
     const queued = inboxItems.length > 0 ? inboxItems.length : (k?.inbox_len ?? 0);
     const ended = st === "ended" || k?.state === "finished";
+    const pausedItems = !ended && !this.isPtyMode() ? this.pausedInboxItemsFor(k) : [];
+    const pausedPanel = pausedItems.length > 0 ? this.renderPausedInboxBanner(t, pausedItems) : null;
     const queuePanel = !ended && inboxItems.length > 0 ? this.renderInboxQueue(t, inboxItems, mono) : null;
     const working = st === "working" && !ended;
     const hasText = Boolean((this.input?.value?.() ?? "").trim());
+    const hasAttachments = Array.isArray(this.draftAttachments) && this.draftAttachments.length > 0;
+    const hasPayload = hasText || hasAttachments;
+    const draftAttachmentsBar = !ended && hasAttachments ? this.renderDraftAttachments(t, k, mono) : null;
     const opts = this.configOptionsFor(k);
     const capBar = ended ? null : this.renderCapabilityBar(t, opts, k);
-    const canSend = !ended && hasText && !this.busyAction;
+    const canSend = !ended && hasPayload && !this.busyAction;
     const padX = isTab ? 20 : 28;
     const isDark = Boolean(readSettings()?.dark ?? true);
     const accentSolid = t.accent ?? t.solid ?? "#2563eb";
@@ -3906,6 +4688,7 @@ export default class Peek extends View {
       .flex_none()
       .items_center()
       .bg(withAlpha(t.canvas ?? t.background, isDark ? "dc" : "e8"))
+      .when(Boolean(pausedPanel), (el) => el.child(pausedPanel))
       .when(Boolean(queuePanel), (el) => el.child(queuePanel))
       .child(
         v_flex()
@@ -3921,6 +4704,74 @@ export default class Peek extends View {
           .on_mouse_down("left", stopMouse)
           .on_scroll_wheel(stopScroll)
           .child(div().w_full().h(1).bg(isDark ? "#ffffff0e" : "#ffffffcc"))
+          .when(this.polishUndoText != null && !ended, (el) =>
+            el.child(
+              h_flex()
+                .id("acp-polish-banner")
+                .w_full()
+                .px(14)
+                .py(5)
+                .gap(8)
+                .items_center()
+                .bg(withAlpha("#a855f7", "14") ?? t.raised)
+                .border_b(1)
+                .border_color(withAlpha("#a855f7", "38") ?? t.border)
+                .child(svg(ICONS.sparkles).size(11.5).flex_none().text_color("#a855f7"))
+                .child(
+                  div()
+                    .flex_1()
+                    .min_w(0)
+                    .truncate()
+                    .text_size(11)
+                    .text_color(t.foreground)
+                    .child(
+                      this.polishSummary
+                        ? tr(`Polished by AI · ${this.polishSummary}`, `AI 已润色 · ${this.polishSummary}`)
+                        : tr("Polished by AI for clarity", "已由 AI 润色，表达更清晰"),
+                    ),
+                )
+                .child(
+                  div()
+                    .id("acp-polish-undo")
+                    .flex_none()
+                    .px(7)
+                    .py(2)
+                    .rounded(5)
+                    .bg(t.background)
+                    .border_1()
+                    .border_color(t.border)
+                    .text_size(10.5)
+                    .font_medium()
+                    .text_color(t.muted)
+                    .cursor_pointer()
+                    .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                    .on_mouse_down("left", stopMouse)
+                    .on_click((_e, cx) => this.revertPolishedPrompt(cx))
+                    .child(tr("↩ Undo", "↩ 还原原文")),
+                )
+                .child(
+                  div()
+                    .id("acp-polish-dismiss")
+                    .flex_none()
+                    .px(4)
+                    .py(1)
+                    .rounded(4)
+                    .text_size(11)
+                    .text_color(t.dim)
+                    .cursor_pointer()
+                    .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                    .on_mouse_down("left", stopMouse)
+                    .on_click((_e, cx) => {
+                      this.polishUndoText = null;
+                      this.polishSummary = null;
+                      this.polishApplied = false;
+                      cx.notify();
+                    })
+                    .child("×"),
+                ),
+            ),
+          )
+          .when(Boolean(draftAttachmentsBar), (el) => el.child(draftAttachmentsBar))
           .child(
             v_flex()
               .id("acp-input-area")
@@ -3991,7 +4842,67 @@ export default class Peek extends View {
                         .child(tr(`${queued} queued`, `队列 ${queued}`)),
                     ),
                   )
-                  .when(working && hasText, (el) =>
+                  .when(!ended, (el) =>
+                    el.child(
+                      h_flex()
+                        .id("acp-attach")
+                        .size(28)
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .rounded(8)
+                        .border_1()
+                        .border_color(hasAttachments ? withAlpha(accentSolid, "66") : t.border)
+                        .bg(hasAttachments ? withAlpha(accentSolid, "16") : t.raised)
+                        .text_color(hasAttachments ? accentSolid : t.muted)
+                        .cursor_pointer()
+                        .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                        .tooltip(tr("Attach image or file (also supports Ctrl+V paste & drag-and-drop)", "附加图片或文件（支持剪贴板粘贴与拖拽）"))
+                        .on_mouse_down("left", stopMouse)
+                        .on_click((_e, cx) => {
+                          if (this.openConfigId) this.closeConfigPopover(cx);
+                          this.pickDraftAttachments(cx);
+                        })
+                        .child(svg(ICONS.paperclip).size(13)),
+                    ),
+                  )
+                  .when(!ended, (el) => {
+                    const canPolish = hasText && !this.polishingPrompt && !this.busyAction;
+                    const purple = "#a855f7";
+                    return el.child(
+                      h_flex()
+                        .id("acp-polish")
+                        .h(28)
+                        .px(9)
+                        .gap(4)
+                        .flex_none()
+                        .items_center()
+                        .justify_center()
+                        .rounded(8)
+                        .border_1()
+                        .border_color(canPolish || this.polishingPrompt ? withAlpha(purple, "66") : t.border)
+                        .bg(canPolish || this.polishingPrompt ? withAlpha(purple, "18") : t.raised)
+                        .text_size(11.5)
+                        .font_medium()
+                        .text_color(canPolish || this.polishingPrompt ? purple : t.dim)
+                        .when(canPolish, (b) => b.cursor_pointer().hover((s) => s.bg(withAlpha(purple, "2c"))))
+                        .tooltip(tr("Polish prompt with Core AI for clarity (one-click undo)", "使用 Core AI 润色提示词，让意图更清晰明确（支持一键还原）"))
+                        .on_mouse_down("left", stopMouse)
+                        .when(canPolish, (b) =>
+                          b.on_click((_e, cx) => {
+                            if (this.openConfigId) this.closeConfigPopover(cx);
+                            this.polishPrompt(cx);
+                          }),
+                        )
+                        .child(
+                          this.polishingPrompt
+                            ? svg(ICONS.spinner).size(12).spin(900).text_color(purple)
+                            : svg(ICONS.sparkles).size(12).text_color(canPolish ? purple : t.dim),
+                        )
+                        .child(this.polishingPrompt ? tr("Polishing…", "润色中…") : tr("Polish", "润色")),
+                    );
+                  })
+                  .when(working && hasPayload, (el) =>
                     el.child(
                       h_flex()
                         .id("acp-steer")
@@ -4015,7 +4926,7 @@ export default class Peek extends View {
                         .child(tr("Steer", "插话")),
                     ),
                   )
-                  .when(!working || hasText, (el) =>
+                  .when(!working || hasPayload, (el) =>
                     el.child(
                       h_flex()
                         .id("acp-send")
@@ -4124,7 +5035,15 @@ export default class Peek extends View {
     const isSidePanel = Boolean(p.sidePanel);
     const terminal = this.activeTerminal();
     if (terminal !== this.loadedTerminal) {
+      if (this.loadedTerminal) {
+        this.writeSavedDraft(this.loadedTerminal, this.input?.value?.() ?? "");
+      }
       this.loadedTerminal = terminal;
+      this.restoreDraftFor(terminal);
+      this.polishUndoText = null;
+      this.polishSummary = null;
+      this.polishApplied = false;
+      this.polishingPrompt = false;
       this.entries = [];
       this.fallbackText = "";
       this.readHow = null;
@@ -4660,6 +5579,11 @@ export default class Peek extends View {
       .text_color(t.foreground)
       .overflow_hidden()
       .track_focus(this.handle)
+      .on_drop((e, cx) => {
+        if (this.handleDropFiles(e?.paths ?? [], cx)) {
+          cx.stop_propagation();
+        }
+      })
       .on_mouse_down("left", (_e, cx) => {
         if (this.openConfigId) this.closeConfigPopover(cx);
         if (!this.inputFocused && !this.configFilterFocused && !this.inboxEditFocused) this.handle?.focus?.();
@@ -4671,6 +5595,15 @@ export default class Peek extends View {
         }),
       )
       .on_key_down((e, cx) => {
+        const isPaste = String(e?.key ?? "").toLowerCase() === "v"
+          && (Boolean(e?.modifiers?.control) || Boolean(e?.modifiers?.platform))
+          && !e?.modifiers?.alt;
+        if (isPaste && !this.inputFocused && !this.configFilterFocused && !this.inboxEditFocused) {
+          if (this.handlePasteAttachments(cx)) {
+            cx.stop_propagation();
+            return;
+          }
+        }
         if (e.key === "escape" && !e.modifiers?.control && !e.modifiers?.alt && !e.modifiers?.platform) {
           if (this.editingInboxId != null) {
             this.cancelEditInboxItem(cx);

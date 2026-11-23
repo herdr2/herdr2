@@ -1,0 +1,1 @@
+{ "place": "none", "title": "Flash Note", "overlay": { "kind": "window", "key": "flash-note", "resizable": true, "width": 468, "height": 488, "min_width": 380, "min_height": 420, "props": { "mode": "compose" } } }

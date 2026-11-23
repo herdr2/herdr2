@@ -1430,6 +1430,70 @@ fn module(inst: Instance, copy: u64) -> HostModule {
             if feedback_frame { crate::feedback::clear_shots(); }
             Ok(HostValue::Null)
         })
+        .function("pasteClipboardAttachments", |_| {
+            let app = app_dir();
+            let entry = gpui_shell::with_current_app(|cx| {
+                let item = cx.read_from_clipboard()?;
+                if let Some(img) = item.entries().iter().find_map(|e| match e {
+                    gpui::ClipboardEntry::Image(i) => Some(i.bytes.clone()),
+                    _ => None,
+                }) {
+                    return Some((Some(img), Vec::new()));
+                }
+                let paths: Vec<std::path::PathBuf> = item
+                    .entries()
+                    .iter()
+                    .filter_map(|e| match e {
+                        gpui::ClipboardEntry::ExternalPaths(p) if !p.paths().is_empty() => Some(p.paths().to_vec()),
+                        _ => None,
+                    })
+                    .flatten()
+                    .collect();
+                (!paths.is_empty()).then_some((None, paths))
+            })
+            .flatten();
+            let out: Vec<Value> = match entry {
+                None => Vec::new(),
+                Some((Some(bytes), _)) => vec![match crate::mod_files::stage_clipboard_image(&app, &bytes) {
+                    Ok(v) => v,
+                    Err(error) => json!({ "error": error }),
+                }],
+                Some((None, paths)) => crate::mod_files::prepare_attachments(&app, &paths),
+            };
+            Ok(to_host(&Value::Array(out)))
+        })
+        .function("prepareAttachments", |a| {
+            let app = app_dir();
+            let paths = strings(a.get(0)).into_iter().map(std::path::PathBuf::from).collect::<Vec<_>>();
+            Ok(to_host(&Value::Array(crate::mod_files::prepare_attachments(&app, &paths))))
+        })
+        .async_function("pickAttachments", |a| {
+            let prompt = a
+                .get(0)
+                .map(from_host)
+                .and_then(|v| v.get("prompt").and_then(Value::as_str).map(str::to_owned))
+                .unwrap_or_else(|| "Attach".into());
+            let multiple = a
+                .get(0)
+                .map(from_host)
+                .and_then(|v| v.get("multiple").and_then(Value::as_bool))
+                .unwrap_or(true);
+            let app = app_dir();
+            let picked = gpui_shell::with_current_app(|cx| {
+                cx.prompt_for_paths(gpui::PathPromptOptions {
+                    files: true,
+                    directories: false,
+                    multiple,
+                    prompt: Some(prompt.into()),
+                })
+            })
+            .ok_or_else(|| HostError::new("no window to pick from"))?;
+            Ok(async move {
+                let paths = picked.await.ok().and_then(Result::ok).flatten().unwrap_or_default();
+                let out = crate::mod_files::prepare_attachments(&app, &paths);
+                Ok(to_host(&Value::Array(out)))
+            })
+        })
         .async_function("sendFeedback", move |a| {
             if !feedback_frame { return Err(HostError::new("sending feedback is frame-only")); }
             let body = from_host(a.value(0)?);

@@ -2,7 +2,7 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { panes, terminals, props, run, home, theme, settings } from "herdr";
+import { panes, terminals, props, run, openOverlay, home, theme, settings } from "herdr";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
@@ -251,6 +251,46 @@ export default class TerminalsPane extends View {
         ),
       )
       .child(div().flex_1().truncate().text_color("#8b8f95").child(dir))
+      .when(showHandoffBtns, (el) =>
+        el.child(
+          h_flex()
+            .id(`tm-polish-${pane}`)
+            .flex_none()
+            .h(20)
+            .px(6)
+            .gap(4)
+            .items_center()
+            .rounded(5)
+            .bg(alpha("#a855f7", "22") ?? "#252628")
+            .border_1()
+            .border_color(alpha("#a855f7", "66") ?? "#383b40")
+            .text_size(11)
+            .font_medium()
+            .text_color("#c084fc")
+            .cursor_pointer()
+            .hover((s) => s.bg(alpha("#a855f7", "33") ?? "#303338"))
+            .tooltip(tr("Compose & polish prompt with Core AI before sending to CLI agent", "输入并由 Core AI 润色提示词后发送给 CLI Agent"))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              openOverlay({
+                mod: "prompt",
+                kind: "modal",
+                width: 580,
+                height: 390,
+                props: {
+                  mode: "polish",
+                  terminal: p.terminal,
+                  agentName: p.program?.name || p.title || p.terminal,
+                  agentKind: "cli",
+                  cwd: p.cwd || "",
+                },
+              });
+            })
+            .child(svg("mods/peek/sparkles.svg").size(11).flex_none().text_color("#c084fc"))
+            .child(tr("Polish", "润色输入")),
+        ),
+      )
       .when(showHandoffBtns && Boolean(lineageParent), (el) =>
         el.child(
           h_flex()

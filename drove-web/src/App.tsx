@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { fetchAgents, fetchRuns, fetchSnapshot, pauseRun, resumeRun } from "./api";
+import { fetchAgents, fetchRuns, fetchSnapshot, pauseRun, resumeRun, syncAiLanguage } from "./api";
 import { hasDataWhen } from "./branch";
 import { authorWorkers, reviewedTasks } from "./review";
 import type { DagLens } from "./dag-lens";
@@ -735,7 +735,15 @@ export default function App() {
           </span>
           <div className="seg" role="group" aria-label={t("top.lang")}>
             {(["zh", "en"] as Lang[]).map((mode) => (
-              <button key={mode} className={lang === mode ? "active" : ""} aria-pressed={lang === mode} onClick={() => setLang(mode)}>
+              <button
+                key={mode}
+                className={lang === mode ? "active" : ""}
+                aria-pressed={lang === mode}
+                onClick={() => {
+                  setLang(mode);
+                  void syncAiLanguage(mode);
+                }}
+              >
                 {t(`lang.${mode}`)}
               </button>
             ))}

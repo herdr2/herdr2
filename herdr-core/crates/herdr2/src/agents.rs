@@ -24,6 +24,9 @@ pub struct QueuedInput {
     /// Optional sender address (`a3` / `t1`) when sent by another agent or terminal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
+    /// Multimodal attachments staged for this queued prompt.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<crate::transcript::Attachment>,
     /// Epoch milliseconds when this item entered the inbox queue.
     pub queued_ms: u64,
 }
@@ -48,6 +51,9 @@ pub struct Agent {
     /// Whether the adapter supports `session/load` on `--keep` recovery.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub can_load_session: bool,
+    /// Multimodal prompt content capabilities advertised by the ACP adapter during `initialize`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_capabilities: Option<crate::acp::proto::PromptCapabilities>,
     /// Optional system prompt passed via `_meta.systemPrompt`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub system_prompt: Option<String>,
@@ -81,6 +87,9 @@ pub struct Agent {
     /// Prompts queued behind the active ACP turn, in FIFO execution order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub inbox: Vec<QueuedInput>,
+    /// Prompts that were queued in `inbox` before an unexpected stop/reboot, held until the user resumes or discards them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub paused_inbox: Vec<QueuedInput>,
     /// Restart a crashed or stopped kept agent cleanly (`session/load` when supported). Exit with a code and kill remain final.
     #[serde(default)]
     pub keep: bool,
@@ -328,6 +337,7 @@ impl Registry {
                 agent_info: None,
                 acp_session_id: None,
                 can_load_session: false,
+                prompt_capabilities: None,
                 system_prompt: new.system_prompt,
                 model: new.model,
                 mode: new.mode,
@@ -339,6 +349,7 @@ impl Registry {
                 pending_permission: None,
                 inbox_len: 0,
                 inbox: Vec::new(),
+                paused_inbox: Vec::new(),
                 keep: new.keep,
                 restart_env: BTreeMap::new(),
                 restart_after_ms: 0,
@@ -408,10 +419,17 @@ impl Registry {
             if pending {
                 a.schedule_restart(now_ms);
                 a.pid = None;
+                for item in a.inbox.drain(..) {
+                    if !a.paused_inbox.iter().any(|existing| existing.id == item.id) {
+                        a.paused_inbox.push(item);
+                    }
+                }
+            } else {
+                a.inbox.clear();
+                a.paused_inbox.clear();
             }
             a.pending_permission = None;
             a.inbox_len = 0;
-            a.inbox.clear();
             a.exit_code = code;
             a.signal = signal;
             a.reason = Some(reason.into());

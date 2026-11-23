@@ -360,21 +360,53 @@ impl Core {
         }
         let foreground_changed = t.foreground != now;
         let mut argv_updated = false;
+        let mut saved_cli_changed = false;
         if let Some(f) = &now {
             t.last_cwd = Some(f.cwd.clone());
             // Once a rollback/launch shell wrapper (`zsh -lic '"$@"; exec "$0" -li' ... claude --resume ...`)
             // exits back to the interactive shell (`zsh -li`), replace stale wrapper `t.argv` with the live shell
             // argv so old `--resume` flags cannot linger after exit.
-            if now_is_shell_root
-                && !f.argv.is_empty()
-                && crate::pty_adapters::PtyCliKind::detect(&t.argv) != crate::pty_adapters::PtyCliKind::Generic
-            {
-                t.argv = f.argv.clone();
-                argv_updated = true;
+            if now_is_shell_root {
+                if !f.argv.is_empty()
+                    && crate::pty_adapters::PtyCliKind::detect(&t.argv) != crate::pty_adapters::PtyCliKind::Generic
+                {
+                    t.argv = f.argv.clone();
+                    argv_updated = true;
+                }
+                if t.saved_cli.take().is_some() {
+                    saved_cli_changed = true;
+                }
+            } else if !respawning {
+                let root_shell = crate::pty_adapters::terminal_shell_executable(&t.argv);
+                if let Some(mut detected) = crate::pty_adapters::extract_saved_cli_from_argv(
+                    &f.argv,
+                    root_shell.as_deref(),
+                    None,
+                    None,
+                ) {
+                    if let Some(ref existing) = t.saved_cli
+                        && existing.kind == detected.kind
+                        && !started_clean_cli_any
+                    {
+                        if detected.session_id.is_none() {
+                            detected.session_id = existing.session_id.clone();
+                        }
+                        if detected.transcript_path.is_none() {
+                            detected.transcript_path = existing.transcript_path.clone();
+                        }
+                        if detected.wrapper_shell.is_none() {
+                            detected.wrapper_shell = existing.wrapper_shell.clone();
+                        }
+                    }
+                    if t.saved_cli.as_ref() != Some(&detected) {
+                        t.saved_cli = Some(detected);
+                        saved_cli_changed = true;
+                    }
+                }
             }
         }
         t.foreground = now.clone();
-        if change.is_some() || foreground_changed || turn_reset || argv_updated || digest_cleared || title_cleared {
+        if change.is_some() || foreground_changed || turn_reset || argv_updated || saved_cli_changed || digest_cleared || title_cleared {
             self.save_pty_soon();
         }
         if let Some(change) = change {
@@ -408,14 +440,32 @@ impl Core {
     /// Keeps every live terminal's `foreground` current, with an event on each change.
     pub async fn watch_foreground(self: Arc<Self>) {
         let ms = std::env::var("H2_FOREGROUND_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(500);
+        let mut last_cli_probe: std::collections::HashMap<u32, std::time::Instant> = std::collections::HashMap::new();
         loop {
             tokio::time::sleep(Duration::from_millis(ms)).await;
             let live: Vec<u32> = self.lock().pty_reg.terminals.values().filter(|t| t.is_live()).map(|t| t.id()).collect();
+            last_cli_probe.retain(|id, _| live.contains(id));
             for id in live {
                 let pgid = self.foreground(id).await;
                 let now = (pgid > 0).then(|| about(pgid)).flatten();
-                let mut st = self.lock();
-                self.apply_foreground_update(&mut st, id, now);
+                let needs_cli_sid = {
+                    let mut st = self.lock();
+                    self.apply_foreground_update(&mut st, id, now);
+                    st.pty_reg
+                        .terminals
+                        .get(&id)
+                        .and_then(|t| t.saved_cli.as_ref())
+                        .is_some_and(|s| s.session_id.is_none() || s.transcript_path.is_none())
+                };
+                if needs_cli_sid
+                    && last_cli_probe.get(&id).is_none_or(|at| at.elapsed() >= Duration::from_secs(3))
+                {
+                    last_cli_probe.insert(id, std::time::Instant::now());
+                    let core_bg = Arc::clone(&self);
+                    tokio::spawn(async move {
+                        crate::pty_adapters::discover_and_bind_cli_session(&core_bg, id).await;
+                    });
+                }
             }
         }
     }

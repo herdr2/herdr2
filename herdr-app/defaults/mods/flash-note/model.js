@@ -3,6 +3,8 @@
 export const FLASH_NOTES_KEY = "flash_notes.items";
 export const FLASH_NOTES_TRASH_KEY = "flash_notes.trash";
 export const KNOWN_AGENTS_KEY = "new-menu.agents";
+export const AGENT_CATALOG_KEY = "handoff.agentCatalog";
+export const EFFORT_ORDER = ["off", "low", "medium", "high", "xhigh", "max"];
 export const ACP_PRESETS = new Set([
   "claude",
   "codex",
@@ -21,7 +23,248 @@ export const ACP_PRESETS = new Set([
   "dsh-tui",
   "dsh",
 ]);
-export const ACP_AGENT_KEY = { antigravity: "agy", "dsh-tui": "dsh" };
+export const ACP_AGENT_KEY = { antigravity: "agy", "dsh-tui": "dsh", "cursor-agent": "cursor" };
+
+const CURATED_AGENT_CATALOG = {
+  claude: {
+    rawModels: ["opus", "sonnet", "haiku", "opusplan", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5"],
+    defaultModel: "",
+    efforts: ["low", "medium", "high", "xhigh", "max"],
+    defaultEffort: "",
+    modelEfforts: {},
+  },
+  codex: {
+    rawModels: ["gpt-5.4", "gpt-5.3-codex", "gpt-5.2-codex", "o3"],
+    defaultModel: "",
+    efforts: ["low", "medium", "high", "xhigh"],
+    defaultEffort: "",
+    modelEfforts: {},
+  },
+  agy: {
+    rawModels: [
+      "gemini-4-neon-high",
+      "gemini-4-neon-xhigh",
+      "gemini-4-neon-medium",
+      "gemini-4-neon-low",
+      "gemini-4-carbon-high",
+      "gemini-4-carbon-medium",
+      "gemini-4-carbon-low",
+      "gemini-4-argon-high",
+      "gemini-4-argon-medium",
+      "gemini-4-argon-low",
+      "gemini-4-hydrogen-xhigh",
+      "gemini-4-hydrogen-high",
+      "gemini-4-hydrogen-medium",
+      "gemini-4-hydrogen-low",
+      "gemini-pro-orchestrator",
+      "gemini-pro-orchestrator-neon",
+      "gemini-pro-orchestrator-argon",
+      "gemini-3.8-flash-high",
+      "gemini-3.8-flash-medium",
+      "gemini-3.8-flash-low",
+      "claude-opus-5-5-high",
+      "claude-opus-5-5-medium",
+      "claude-opus-5-5-low",
+      "claude-sonnet-5-5-high",
+      "claude-sonnet-5-5-medium",
+      "claude-sonnet-5-5-low",
+      "gpt-oss-120b-medium",
+    ],
+    defaultModel: "",
+    efforts: ["low", "medium", "high", "xhigh"],
+    defaultEffort: "",
+    modelEfforts: {
+      "gemini-4-neon": ["low", "medium", "high", "xhigh"],
+      "gemini-4-carbon": ["low", "medium", "high"],
+      "gemini-4-argon": ["low", "medium", "high"],
+      "gemini-4-hydrogen": ["low", "medium", "high", "xhigh"],
+      "gemini-3.8-flash": ["low", "medium", "high"],
+      "claude-opus-5-5": ["low", "medium", "high"],
+      "claude-sonnet-5-5": ["low", "medium", "high"],
+    },
+  },
+  gemini: {
+    rawModels: ["gemini-2.5-pro", "gemini-2.5-flash"],
+    defaultModel: "",
+    efforts: ["low", "medium", "high"],
+    defaultEffort: "",
+    modelEfforts: {},
+  },
+  cursor: {
+    rawModels: ["auto", "claude-4.6-sonnet-thinking", "gpt-5.4", "gemini-2.5-pro"],
+    defaultModel: "",
+    efforts: ["low", "medium", "high", "xhigh"],
+    defaultEffort: "",
+    modelEfforts: {},
+  },
+  kimi: {
+    rawModels: ["kimi-k2.5", "kimi-for-coding"],
+    defaultModel: "",
+    efforts: ["low", "medium", "high"],
+    defaultEffort: "",
+    modelEfforts: {},
+  },
+  qwen: {
+    rawModels: ["qwen3-coder-plus", "qwen-max"],
+    defaultModel: "",
+    efforts: ["low", "medium", "high"],
+    defaultEffort: "",
+    modelEfforts: {},
+  },
+  dsh: {
+    rawModels: ["deepseek-chat", "deepseek-reasoner"],
+    defaultModel: "",
+    efforts: ["low", "medium", "high"],
+    defaultEffort: "",
+    modelEfforts: {},
+  },
+  glm: {
+    rawModels: ["glm-5", "glm-4.7"],
+    defaultModel: "",
+    efforts: ["low", "medium", "high"],
+    defaultEffort: "",
+    modelEfforts: {},
+  },
+  zcode: {
+    rawModels: ["glm-5", "glm-4.7"],
+    defaultModel: "",
+    efforts: ["low", "medium", "high"],
+    defaultEffort: "",
+    modelEfforts: {},
+  },
+};
+
+export function stripEffortSuffix(modelId) {
+  return String(modelId ?? "").replace(/-(extra-high|xhigh|high|medium|med|low|max)$/i, "");
+}
+
+export function normalizeAgentCatalog(rawAgents) {
+  const map = {};
+  for (const a of Array.isArray(rawAgents) ? rawAgents : []) {
+    const rawId = String(a?.id ?? "").trim().toLowerCase();
+    const id = ACP_AGENT_KEY[rawId] ?? rawId;
+    if (!id) continue;
+    const rawModels = Array.isArray(a.models) ? a.models.map((m) => String(m).trim()).filter(Boolean) : [];
+    const modelEfforts = a.modelEfforts && typeof a.modelEfforts === "object" ? a.modelEfforts : {};
+    const efforts = (Array.isArray(a.efforts) ? a.efforts : [])
+      .map((e) => String(e).trim().toLowerCase())
+      .filter((e) => e && e !== "default");
+    map[id] = {
+      rawModels,
+      defaultModel: typeof a.defaultModel === "string" ? a.defaultModel.trim() : "",
+      efforts,
+      defaultEffort: typeof a.defaultEffort === "string" ? a.defaultEffort.trim().toLowerCase() : "",
+      modelEfforts,
+    };
+  }
+  return map;
+}
+
+export function catalogForPreset(agentCatalog, presetKey, selectedModel = "") {
+  const rawKey = String(presetKey ?? "").trim().toLowerCase();
+  const key = ACP_AGENT_KEY[rawKey] ?? rawKey;
+  const live = agentCatalog && typeof agentCatalog === "object" ? agentCatalog[key] : null;
+  const fallback = CURATED_AGENT_CATALOG[key] ?? null;
+  const rawModels = Array.isArray(live?.rawModels) && live.rawModels.length > 0
+    ? live.rawModels
+    : (fallback?.rawModels ?? []);
+  const modelEfforts = {
+    ...(fallback?.modelEfforts ?? {}),
+    ...(live?.modelEfforts && typeof live.modelEfforts === "object" ? live.modelEfforts : {}),
+  };
+
+  const models = [];
+  const seen = new Set();
+  for (const raw of rawModels) {
+    if (!raw || raw.toLowerCase() === "default") continue;
+    if (key === "agy") {
+      const base = stripEffortSuffix(raw);
+      const candidate = Object.prototype.hasOwnProperty.call(modelEfforts, base) ? base : raw;
+      if (!seen.has(candidate)) {
+        seen.add(candidate);
+        models.push(candidate);
+      }
+    } else if (!seen.has(raw)) {
+      seen.add(raw);
+      models.push(raw);
+    }
+  }
+
+  const rawDefault = (live?.defaultModel || fallback?.defaultModel || "").trim();
+  const defaultModel = rawDefault && rawDefault.toLowerCase() !== "default"
+    ? (key === "agy" && Object.prototype.hasOwnProperty.call(modelEfforts, stripEffortSuffix(rawDefault))
+        ? stripEffortSuffix(rawDefault)
+        : rawDefault)
+    : "";
+
+  const cleanSelected = String(selectedModel ?? "").trim();
+  const selectedBase = cleanSelected
+    ? (key === "agy" ? stripEffortSuffix(cleanSelected) : cleanSelected)
+    : defaultModel;
+  const perModelEffs = selectedBase && Array.isArray(modelEfforts[selectedBase])
+    ? modelEfforts[selectedBase].map((e) => String(e).toLowerCase()).filter((e) => e && e !== "default")
+    : [];
+  const baseEffs = Array.isArray(live?.efforts) && live.efforts.length > 0
+    ? live.efforts
+    : (fallback?.efforts ?? ["low", "medium", "high"]);
+  const rawEffs = perModelEffs.length > 0 ? perModelEffs : baseEffs;
+  const efforts = [...new Set(rawEffs)].sort((a, b) => {
+    const ia = EFFORT_ORDER.indexOf(a);
+    const ib = EFFORT_ORDER.indexOf(b);
+    return (ia === -1 ? 99 : ia) - (ib === -1 ? 99 : ib);
+  });
+
+  return {
+    key,
+    models,
+    rawModels,
+    defaultModel,
+    efforts,
+    defaultEffort: live?.defaultEffort || fallback?.defaultEffort || "",
+    modelEfforts,
+  };
+}
+
+export function resolveEffectiveModel(agentCatalog, presetKey, selectedModel, selectedEffort) {
+  const cat = catalogForPreset(agentCatalog, presetKey, selectedModel);
+  const model = String(selectedModel ?? "").trim();
+  const eff = String(selectedEffort ?? "").trim().toLowerCase();
+  if (!model) {
+    if (cat.key === "agy" && eff && cat.defaultModel) {
+      const combined = `${cat.defaultModel}-${eff}`;
+      if (cat.rawModels.includes(combined) || Object.prototype.hasOwnProperty.call(cat.modelEfforts, cat.defaultModel)) {
+        return combined;
+      }
+    }
+    return "";
+  }
+  if (cat.key === "agy") {
+    if (eff) {
+      const combined = `${model}-${eff}`;
+      if (cat.rawModels.includes(combined) || Object.prototype.hasOwnProperty.call(cat.modelEfforts, model)) {
+        return combined;
+      }
+    }
+    if (!cat.rawModels.includes(model)) {
+      const pref = cat.defaultEffort ? `${model}-${cat.defaultEffort}` : "";
+      if (pref && cat.rawModels.includes(pref)) return pref;
+      const highMatch = `${model}-high`;
+      if (cat.rawModels.includes(highMatch)) return highMatch;
+      const firstMatch = cat.rawModels.find((m) => m.startsWith(`${model}-`));
+      if (firstMatch) return firstMatch;
+    }
+  }
+  return model;
+}
+
+export function buildSentToLabel(presetName, isAcp, selectedModel, selectedEffort) {
+  const details = [isAcp ? "ACP" : "CLI"];
+  const m = String(selectedModel ?? "").trim();
+  const e = String(selectedEffort ?? "").trim();
+  if (m) details.push(m);
+  if (e) details.push(e);
+  return `${presetName} (${details.join(" · ")})`;
+}
 
 export function withAlpha(color, alphaHex) {
   if (typeof color !== "string") return color;
@@ -43,7 +286,7 @@ export function normalizeNotes(raw) {
       sentTo: typeof item.sentTo === "string" && item.sentTo.trim() ? item.sentTo.trim() : null,
       sentAt: Number(item.sentAt) || null,
     }))
-    .sort((a, b) => (b.updatedAt || b.createdAt) - (a.updatedAt || a.createdAt));
+    .sort((a, b) => (a.updatedAt || a.createdAt) - (b.updatedAt || b.createdAt) || (a.createdAt - b.createdAt));
 }
 
 export function normalizeTrash(raw) {
@@ -85,7 +328,7 @@ export function upsertNote(rawList, { id = null, title = undefined, text, sentTo
       ...(sentTo !== undefined ? { sentTo } : {}),
       ...(sentAt !== undefined ? { sentAt } : {}),
     };
-    const next = [updated, ...list.slice(0, idx), ...list.slice(idx + 1)];
+    const next = normalizeNotes([...list.slice(0, idx), updated, ...list.slice(idx + 1)]);
     return { list: next, note: updated };
   }
   const created = {
@@ -97,7 +340,7 @@ export function upsertNote(rawList, { id = null, title = undefined, text, sentTo
     sentTo: sentTo ?? null,
     sentAt: sentAt ?? null,
   };
-  return { list: [created, ...list], note: created };
+  return { list: normalizeNotes([...list, created]), note: created };
 }
 
 export function renameNote(rawList, id, title) {
@@ -115,7 +358,7 @@ export function markNoteSent(rawList, id, sentTo, now = Date.now()) {
   const idx = list.findIndex((n) => n.id === id);
   if (idx < 0) return list;
   const updated = { ...list[idx], sentTo: sentTo || null, sentAt: now, updatedAt: now };
-  return [updated, ...list.slice(0, idx), ...list.slice(idx + 1)];
+  return normalizeNotes([...list.slice(0, idx), updated, ...list.slice(idx + 1)]);
 }
 
 export function removeNote(rawList, id) {
@@ -142,7 +385,7 @@ export function restoreNoteFromTrash(rawList, rawTrash, id, now = Date.now()) {
   const { trashedAt: _trashedAt, ...rest } = trash[idx];
   const restored = { ...rest, updatedAt: now };
   const nextTrash = [...trash.slice(0, idx), ...trash.slice(idx + 1)];
-  const nextList = [restored, ...list.filter((n) => n.id !== restored.id)];
+  const nextList = normalizeNotes([...list.filter((n) => n.id !== restored.id), restored]);
   return { list: nextList, trash: nextTrash, note: restored };
 }
 

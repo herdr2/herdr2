@@ -719,11 +719,13 @@ mod tests {
                 turn: t,
                 from: None,
                 text: format!("user turn {t}: {padding}"),
+                attachments: vec![],
                 ts_ms: t,
             });
             entries.push(Entry::Assistant {
                 turn: t,
                 text: format!("assistant turn {t}: {padding}"),
+                attachments: vec![],
                 ts_ms: t + 100,
             });
         }
@@ -799,7 +801,7 @@ mod tests {
             source_session_id: None,
             source_model: None,
             cwd: None,
-            entries: &[Entry::User { turn: 1, from: None, text: "Check caching strategy".into(), ts_ms: 1 }],
+            entries: &[Entry::User { turn: 1, from: None, text: "Check caching strategy".into(), attachments: vec![], ts_ms: 1 }],
             from_turn: None,
             to_turn: None,
             max_bytes: 8 * 1024,
@@ -818,7 +820,7 @@ mod tests {
             source_session_id: None,
             source_model: None,
             cwd: None,
-            entries: &[Entry::User { turn: 1, from: None, text: "检查缓存策略".into(), ts_ms: 1 }],
+            entries: &[Entry::User { turn: 1, from: None, text: "检查缓存策略".into(), attachments: vec![], ts_ms: 1 }],
             from_turn: None,
             to_turn: None,
             max_bytes: 8 * 1024,
@@ -921,6 +923,7 @@ mod tests {
                 turn: 1,
                 from: None,
                 text: "请修改 /home/user/proj/calc.py 添加乘法".into(),
+                attachments: vec![],
                 ts_ms: 1,
             },
             Entry::ToolCall {
@@ -930,11 +933,13 @@ mod tests {
                 tool_kind: None,
                 status: "completed".into(),
                 detail: None,
+                attachments: vec![],
                 ts_ms: 2,
             },
             Entry::Assistant {
                 turn: 1,
                 text: "已更新 `/home/user/proj/calc.py`，未动 `/home/user/proj2/x.py`。".into(),
+                attachments: vec![],
                 ts_ms: 3,
             },
         ];

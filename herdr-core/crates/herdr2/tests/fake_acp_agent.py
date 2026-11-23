@@ -29,7 +29,11 @@ fast_mode: bool = False
 last_cwd: str = ""
 reject_load = "--reject-load" in sys.argv
 no_load_cap = "--no-load-cap" in sys.argv
+no_image_cap = "--no-image-cap" in sys.argv
+reject_image = "--reject-image" in sys.argv
 hang_init = "--hang-init" in sys.argv
+
+TINY_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAAEUlEQVR4nGMUMgn7z8DAwAAACQ0BnfdmzRUAAAAASUVORK5CYII="
 
 
 def send(obj: dict) -> None:
@@ -175,12 +179,83 @@ def strip_wrapper(text: str) -> str:
 def handle_prompt(rpc_id, params: dict) -> None:
     cancel_event.clear()
     blocks = params.get("prompt", [])
-    raw = "\n".join(b.get("text", "") for b in blocks if isinstance(b, dict))
+    if reject_image and any(isinstance(b, dict) and b.get("type") == "image" for b in blocks):
+        reply_err(rpc_id, -32602, "image content blocks rejected by adapter")
+        return
+    raw = "\n".join(b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text")
     inner = strip_wrapper(raw)
 
     outputs: list[str] = []
-    for line in [l.strip() for l in inner.splitlines() if l.strip()]:
-        if line.startswith("EXIT:"):
+    lines = [l.strip() for l in inner.splitlines() if l.strip()]
+    if not lines and blocks:
+        summary = [
+            {
+                "type": b.get("type"),
+                "mimeType": b.get("mimeType") or (b.get("resource") or {}).get("mimeType"),
+                "name": b.get("name"),
+                "uri": b.get("uri") or (b.get("resource") or {}).get("uri"),
+                "hasData": bool(b.get("data") or (b.get("resource") or {}).get("blob") or (b.get("resource") or {}).get("text")),
+            }
+            for b in blocks
+            if isinstance(b, dict)
+        ]
+        outputs.append("BLOCKS:" + json.dumps(summary, separators=(",", ":")))
+    for line in lines:
+        if line == "BLOCKS":
+            summary = [
+                {
+                    "type": b.get("type"),
+                    "mimeType": b.get("mimeType") or (b.get("resource") or {}).get("mimeType"),
+                    "name": b.get("name"),
+                    "uri": b.get("uri") or (b.get("resource") or {}).get("uri"),
+                    "hasData": bool(b.get("data") or (b.get("resource") or {}).get("blob") or (b.get("resource") or {}).get("text")),
+                }
+                for b in blocks
+                if isinstance(b, dict)
+            ]
+            outputs.append("BLOCKS:" + json.dumps(summary, separators=(",", ":")))
+        elif line == "EMIT_IMAGE":
+            notify(
+                "session/update",
+                {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": "tc-shot",
+                        "title": "Capture UI screenshot",
+                        "kind": "read",
+                        "status": "completed",
+                        "content": [
+                            {"type": "content", "content": {"type": "text", "text": "Captured preview"}},
+                            {"type": "content", "content": {"type": "image", "data": TINY_PNG_B64, "mimeType": "image/png"}},
+                        ],
+                    },
+                },
+            )
+            notify(
+                "session/update",
+                {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "agent_message_chunk",
+                        "content": [
+                            {"type": "text", "text": "Here is the rendered screenshot:"},
+                            {"type": "image", "data": TINY_PNG_B64, "mimeType": "image/png"},
+                            {
+                                "type": "resource",
+                                "resource": {
+                                    "uri": "file:///tmp/diag.md",
+                                    "mimeType": "text/markdown",
+                                    "text": "# Diagnostic\nAll checks ok.",
+                                },
+                            },
+                        ],
+                    },
+                },
+            )
+            reply_ok(rpc_id, {"stopReason": "end_turn"})
+            return
+        elif line.startswith("EXIT:"):
             code = int(line.split(":", 1)[1])
             os._exit(code)
         elif line == "HOLD":
@@ -323,7 +398,14 @@ def worker() -> None:
                     {
                         "protocolVersion": 1,
                         "agentInfo": {"name": "fake-acp", "version": "1.0"},
-                        "agentCapabilities": {"loadSession": not no_load_cap},
+                        "agentCapabilities": {
+                            "loadSession": not no_load_cap,
+                            "promptCapabilities": {
+                                "image": not no_image_cap,
+                                "audio": False,
+                                "embeddedContext": not no_image_cap,
+                            },
+                        },
                     },
                 )
             elif method == "session/new":

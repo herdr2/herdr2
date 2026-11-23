@@ -10,6 +10,21 @@ pub const RETAIN_MS: u64 = 24 * 60 * 60 * 1000;
 pub const MAX_FINISHED: usize = 500;
 pub const KEEP_RETRY_MS: u64 = 1500;
 
+/// Persisted CLI agent recovery metadata for kept PTY terminals (`t*`).
+/// Maintained live while a supported CLI (`claude`, `codex`, `agy`) runs in the
+/// terminal and cleared as soon as the user exits back to an interactive shell.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+pub struct SavedCliResume {
+    pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transcript_path: Option<String>,
+    pub cli_argv: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wrapper_shell: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq)]
 pub struct Terminal {
     /// `t7`: this terminal forever on this core.
@@ -156,6 +171,9 @@ pub struct Terminal {
     /// One-sentence real-time progress micro-summary (<= 96 chars) for zero-click hover tooltips.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub micro_summary: Option<String>,
+    /// Active CLI agent session metadata used to resume after host reboot/restart (private).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_cli: Option<SavedCliResume>,
 }
 
 impl Terminal {
@@ -336,6 +354,7 @@ impl Registry {
                 lineage: new.lineage,
                 semantic_title: None,
                 micro_summary: None,
+                saved_cli: None,
             },
         );
         Ok(id)
@@ -374,6 +393,8 @@ impl Registry {
                 t.schedule_restart(now_ms);
                 t.pid = None;
                 t.holder = None;
+            } else {
+                t.saved_cli = None;
             }
             t.exit_code = code;
             t.signal = signal;
@@ -451,6 +472,7 @@ const PRIVATE: &[&str] = &[
     "restart_after_ms",
     "restart_delay_ms",
     "program_started_ms",
+    "saved_cli",
 ];
 
 /// A terminal as clients see it (API results, events): its facts, without

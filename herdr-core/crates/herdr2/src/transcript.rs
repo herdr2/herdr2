@@ -24,6 +24,58 @@ pub(crate) fn cap_tool_detail(raw: &str) -> Option<String> {
     }
 }
 
+/// Lightweight metadata for a multimodal attachment (image, audio, embedded resource, or resource link).
+/// Binary payloads live beside the agent under `<state>/files/<addr>/` so JSONL transcripts stay compact.
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+pub struct Attachment {
+    /// Content kind: `"image"`, `"audio"`, `"resource"`, or `"resource_link"`.
+    pub kind: String,
+    /// MIME type when known (e.g. `"image/png"`, `"text/markdown"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime_type: Option<String>,
+    /// Display name or basename (e.g. `"screenshot.png"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Staged path on the agent's machine for preview, reload, or tool fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Optional URI (`file:///...`, `https://...`, etc.).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uri: Option<String>,
+    /// Optional bounded text snippet or description (for text resources / links).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    /// Raw byte length when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+}
+
+impl Attachment {
+    pub(crate) fn approx_bytes(&self) -> usize {
+        self.kind.len()
+            + self.mime_type.as_ref().map_or(0, String::len)
+            + self.name.as_ref().map_or(0, String::len)
+            + self.path.as_ref().map_or(0, String::len)
+            + self.uri.as_ref().map_or(0, String::len)
+            + self.text.as_ref().map_or(0, String::len)
+            + 32
+    }
+
+    pub fn summary_line(&self) -> String {
+        let label = self
+            .name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| self.uri.as_deref().filter(|s| !s.is_empty()))
+            .or_else(|| self.path.as_deref().filter(|s| !s.is_empty()))
+            .unwrap_or("attachment");
+        match self.path.as_deref().filter(|p| !p.is_empty() && *p != label) {
+            Some(path) => format!("[{}: {label} ({path})]", self.kind),
+            None => format!("[{}: {label}]", self.kind),
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Entry {
@@ -32,6 +84,8 @@ pub enum Entry {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from: Option<String>,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
         ts_ms: u64,
     },
     Thought {
@@ -42,6 +96,8 @@ pub enum Entry {
     Assistant {
         turn: u64,
         text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
         ts_ms: u64,
     },
     ToolCall {
@@ -53,6 +109,8 @@ pub enum Entry {
         status: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        attachments: Vec<Attachment>,
         ts_ms: u64,
     },
     Plan {
@@ -128,14 +186,22 @@ impl Entry {
 
     pub(crate) fn approx_bytes(&self) -> usize {
         match self {
-            Self::User { text, from, .. } => text.len() + from.as_ref().map_or(0, String::len),
-            Self::Thought { text, .. } | Self::Assistant { text, .. } | Self::Stderr { text, .. } => text.len(),
-            Self::ToolCall { id, title, tool_kind, status, detail, .. } => {
+            Self::User { text, from, attachments, .. } => {
+                text.len()
+                    + from.as_ref().map_or(0, String::len)
+                    + attachments.iter().map(Attachment::approx_bytes).sum::<usize>()
+            }
+            Self::Thought { text, .. } | Self::Stderr { text, .. } => text.len(),
+            Self::Assistant { text, attachments, .. } => {
+                text.len() + attachments.iter().map(Attachment::approx_bytes).sum::<usize>()
+            }
+            Self::ToolCall { id, title, tool_kind, status, detail, attachments, .. } => {
                 id.len()
                     + title.len()
                     + tool_kind.as_ref().map_or(0, String::len)
                     + status.len()
                     + detail.as_ref().map_or(0, String::len)
+                    + attachments.iter().map(Attachment::approx_bytes).sum::<usize>()
             }
             Self::Plan { items, .. } => items.iter().map(String::len).sum(),
             Self::Permission { title, outcome, .. } => title.len() + outcome.len(),
@@ -167,13 +233,21 @@ impl Entry {
 
     fn render_line(&self, out: &mut Vec<String>) {
         match self {
-            Self::User { from, text, .. } => {
+            Self::User { from, text, attachments, .. } => {
                 let prefix = match from {
                     Some(from) => format!("[user from {from}]"),
                     None => "[user]".into(),
                 };
-                if text.is_empty() {
+                if text.is_empty() && attachments.is_empty() {
                     out.push(prefix);
+                } else if text.is_empty() {
+                    for (i, att) in attachments.iter().enumerate() {
+                        if i == 0 {
+                            out.push(format!("{prefix} {}", att.summary_line()));
+                        } else {
+                            out.push(att.summary_line());
+                        }
+                    }
                 } else {
                     for (i, line) in text.lines().enumerate() {
                         if i == 0 {
@@ -182,19 +256,30 @@ impl Entry {
                             out.push(line.into());
                         }
                     }
+                    for att in attachments {
+                        out.push(att.summary_line());
+                    }
                 }
             }
             Self::Thought { .. } => {}
-            Self::Assistant { text, .. } => {
+            Self::Assistant { text, attachments, .. } => {
                 for line in text.lines() {
                     out.push(line.into());
                 }
+                for att in attachments {
+                    out.push(att.summary_line());
+                }
             }
-            Self::ToolCall { title, tool_kind, status, .. } => {
+            Self::ToolCall { title, tool_kind, status, attachments, .. } => {
                 let kind = tool_kind.as_deref().filter(|k| !k.is_empty());
+                let suffix = if attachments.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({} attachment(s))", attachments.len())
+                };
                 match kind {
-                    Some(k) => out.push(format!("[tool {k}: {status}] {title}")),
-                    None => out.push(format!("[tool: {status}] {title}")),
+                    Some(k) => out.push(format!("[tool {k}: {status}] {title}{suffix}")),
+                    None => out.push(format!("[tool: {status}] {title}{suffix}")),
                 }
             }
             Self::Plan { items, .. } => {
@@ -246,18 +331,23 @@ impl Transcript {
     pub fn push(&mut self, entry: Entry) {
         let added_bytes = entry.approx_bytes();
         match entry {
-            Entry::Assistant { turn, text, ts_ms } => {
-                if let Some(Entry::Assistant { turn: prev_turn, text: prev_text, ts_ms: prev_ts }) =
-                    self.entries.last_mut()
+            Entry::Assistant { turn, text, attachments, ts_ms } => {
+                if let Some(Entry::Assistant {
+                    turn: prev_turn,
+                    text: prev_text,
+                    attachments: prev_attachments,
+                    ts_ms: prev_ts,
+                }) = self.entries.last_mut()
                     && *prev_turn == turn
                 {
                     prev_text.push_str(&text);
+                    prev_attachments.extend(attachments);
                     *prev_ts = ts_ms;
                     self.bytes += added_bytes;
                     self.evict_old();
                     return;
                 }
-                self.entries.push(Entry::Assistant { turn, text, ts_ms });
+                self.entries.push(Entry::Assistant { turn, text, attachments, ts_ms });
             }
             Entry::Thought { turn, text, ts_ms } => {
                 if let Some(Entry::Thought { turn: prev_turn, text: prev_text, ts_ms: prev_ts }) =
@@ -282,13 +372,14 @@ impl Transcript {
                 }
                 self.entries.push(Entry::Thought { turn, text, ts_ms });
             }
-            Entry::ToolCall { turn, id, title, tool_kind, status, detail, ts_ms } => {
+            Entry::ToolCall { turn, id, title, tool_kind, status, detail, attachments, ts_ms } => {
                 if !id.is_empty()
                     && let Some(Entry::ToolCall {
                         title: old_title,
                         tool_kind: old_kind,
                         status: old_status,
                         detail: old_detail,
+                        attachments: old_attachments,
                         ts_ms: old_ts,
                         ..
                     }) = self.entries.iter_mut().rev().find(|e| {
@@ -299,7 +390,8 @@ impl Transcript {
                         old_title.len()
                             + old_kind.as_ref().map_or(0, String::len)
                             + old_status.len()
-                            + old_detail.as_ref().map_or(0, String::len),
+                            + old_detail.as_ref().map_or(0, String::len)
+                            + old_attachments.iter().map(Attachment::approx_bytes).sum::<usize>(),
                     );
                     if !title.is_empty() {
                         *old_title = title;
@@ -325,15 +417,24 @@ impl Transcript {
                             }
                         }
                     }
+                    for att in attachments {
+                        let dup = old_attachments.iter().any(|existing| {
+                            existing.kind == att.kind && existing.path == att.path && existing.uri == att.uri
+                        });
+                        if !dup {
+                            old_attachments.push(att);
+                        }
+                    }
                     *old_ts = ts_ms;
                     self.bytes += old_title.len()
                         + old_kind.as_ref().map_or(0, String::len)
                         + old_status.len()
-                        + old_detail.as_ref().map_or(0, String::len);
+                        + old_detail.as_ref().map_or(0, String::len)
+                        + old_attachments.iter().map(Attachment::approx_bytes).sum::<usize>();
                     self.evict_old();
                     return;
                 }
-                self.entries.push(Entry::ToolCall { turn, id, title, tool_kind, status, detail, ts_ms });
+                self.entries.push(Entry::ToolCall { turn, id, title, tool_kind, status, detail, attachments, ts_ms });
             }
             other => {
                 self.entries.push(other);
@@ -358,6 +459,22 @@ impl Transcript {
     pub fn render(&self, lines: Option<usize>, last_only: bool) -> (String, bool, &'static str) {
         if last_only {
             let latest_turn = self.entries.iter().filter_map(Entry::turn).max();
+            let format_assistant = |text: &str, attachments: &[Attachment]| -> Option<String> {
+                if text.is_empty() && attachments.is_empty() {
+                    return None;
+                }
+                if attachments.is_empty() {
+                    return Some(text.to_string());
+                }
+                let mut lines = Vec::new();
+                if !text.is_empty() {
+                    lines.push(text.to_string());
+                }
+                for att in attachments {
+                    lines.push(att.summary_line());
+                }
+                Some(lines.join("\n"))
+            };
             let text = latest_turn
                 .and_then(|t| {
                     self.entries
@@ -365,7 +482,7 @@ impl Transcript {
                         .rev()
                         .filter(|e| e.turn() == Some(t))
                         .find_map(|e| match e {
-                            Entry::Assistant { text, .. } if !text.is_empty() => Some(text.clone()),
+                            Entry::Assistant { text, attachments, .. } => format_assistant(text, attachments),
                             _ => None,
                         })
                         .or_else(|| {
@@ -377,7 +494,7 @@ impl Transcript {
                 })
                 .or_else(|| {
                     self.entries.iter().rev().find_map(|e| match e {
-                        Entry::Assistant { text, .. } if !text.is_empty() => Some(text.clone()),
+                        Entry::Assistant { text, attachments, .. } => format_assistant(text, attachments),
                         Entry::Error { message, .. } => Some(format!("[error] {message}")),
                         _ => None,
                     })
@@ -534,24 +651,33 @@ pub fn build_portable_handoff(entries: &[Entry], up_to_turn: u64, max_bytes: usi
         }
         let bucket = per_turn.entry(turn).or_default();
         match entry {
-            Entry::User { text, .. } => {
+            Entry::User { text, attachments, .. } => {
                 let clean = strip_h2_envelope(text);
                 if !clean.is_empty() {
                     bucket.push(format!("User: {clean}"));
                 }
+                for att in attachments {
+                    bucket.push(format!("User attachment: {}", att.summary_line()));
+                }
             }
-            Entry::ToolCall { title, status, detail, .. } => {
+            Entry::ToolCall { title, status, detail, attachments, .. } => {
                 let mut line = format!("- Tool `{title}` [{status}]");
                 if let Some(d) = detail.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
                     let snippet = cap_chars(d, 180);
                     line.push_str(&format!(": {snippet}"));
                 }
+                if !attachments.is_empty() {
+                    line.push_str(&format!(" ({} attachment(s))", attachments.len()));
+                }
                 bucket.push(line);
             }
-            Entry::Assistant { text, .. } => {
+            Entry::Assistant { text, attachments, .. } => {
                 let clean = text.trim();
                 if !clean.is_empty() {
                     bucket.push(format!("Assistant: {clean}"));
+                }
+                for att in attachments {
+                    bucket.push(format!("Assistant attachment: {}", att.summary_line()));
                 }
             }
             _ => {}
@@ -676,7 +802,7 @@ mod tests {
     #[test]
     fn coalesces_assistant_chunks_and_updates_tool_calls() {
         let mut t = Transcript::default();
-        t.push(Entry::User { turn: 1, from: Some("a0".into()), text: "hi".into(), ts_ms: 1 });
+        t.push(Entry::User { turn: 1, from: Some("a0".into()), text: "hi".into(), attachments: vec![], ts_ms: 1 });
         t.push(Entry::ToolCall {
             turn: 1,
             id: "tc1".into(),
@@ -684,6 +810,7 @@ mod tests {
             tool_kind: Some("read".into()),
             status: "pending".into(),
             detail: None,
+            attachments: vec![],
             ts_ms: 2,
         });
         t.push(Entry::ToolCall {
@@ -693,10 +820,11 @@ mod tests {
             tool_kind: None,
             status: "completed".into(),
             detail: Some("fn foo() {}".into()),
+            attachments: vec![],
             ts_ms: 3,
         });
-        t.push(Entry::Assistant { turn: 1, text: "Hello ".into(), ts_ms: 4 });
-        t.push(Entry::Assistant { turn: 1, text: "world".into(), ts_ms: 5 });
+        t.push(Entry::Assistant { turn: 1, text: "Hello ".into(), attachments: vec![], ts_ms: 4 });
+        t.push(Entry::Assistant { turn: 1, text: "world".into(), attachments: vec![], ts_ms: 5 });
 
         assert_eq!(t.render(None, true), ("Hello world".into(), false, "last"));
         assert_eq!(
@@ -709,8 +837,8 @@ mod tests {
     fn history_mode_slices_lines_and_reports_truncation() {
         let mut t = Transcript::default();
         for turn in 1..=3 {
-            t.push(Entry::User { turn, from: None, text: format!("q{turn}"), ts_ms: turn });
-            t.push(Entry::Assistant { turn, text: format!("a{turn}"), ts_ms: turn });
+            t.push(Entry::User { turn, from: None, text: format!("q{turn}"), attachments: vec![], ts_ms: turn });
+            t.push(Entry::Assistant { turn, text: format!("a{turn}"), attachments: vec![], ts_ms: turn });
         }
         assert_eq!(t.render(None, false), ("[user] q3\na3".into(), false, "turn"));
         assert_eq!(t.render(Some(2), false), ("[user] q3\na3".into(), true, "history"));
@@ -721,9 +849,9 @@ mod tests {
     fn jsonl_round_trip_replays_saved_entries() {
         let dir = crate::test_tmp().join(format!("h2-transcript-{}", crate::platform::random_hex()));
         std::fs::create_dir_all(&dir).unwrap();
-        let e1 = Entry::User { turn: 1, from: None, text: "hello".into(), ts_ms: 1 };
-        let e2 = Entry::Assistant { turn: 1, text: "part1 ".into(), ts_ms: 2 };
-        let e3 = Entry::Assistant { turn: 1, text: "part2".into(), ts_ms: 3 };
+        let e1 = Entry::User { turn: 1, from: None, text: "hello".into(), attachments: vec![], ts_ms: 1 };
+        let e2 = Entry::Assistant { turn: 1, text: "part1 ".into(), attachments: vec![], ts_ms: 2 };
+        let e3 = Entry::Assistant { turn: 1, text: "part2".into(), attachments: vec![], ts_ms: 3 };
         append_disk(&dir, "a1", &e1).unwrap();
         append_disk(&dir, "a1", &e2).unwrap();
         append_disk(&dir, "a1", &e3).unwrap();
@@ -748,7 +876,7 @@ mod tests {
         let dir = crate::test_tmp().join(format!("h2-rewind-{}", crate::platform::random_hex()));
         let path = dir.join("a1.jsonl");
         let mut t = Transcript::default();
-        t.push(Entry::User { turn: 1, from: None, text: "create lib.rs".into(), ts_ms: 1 });
+        t.push(Entry::User { turn: 1, from: None, text: "create lib.rs".into(), attachments: vec![], ts_ms: 1 });
         t.push(Entry::ToolCall {
             turn: 1,
             id: "tc1".into(),
@@ -756,9 +884,10 @@ mod tests {
             tool_kind: Some("edit".into()),
             status: "completed".into(),
             detail: Some("pub fn add(a: i32, b: i32) -> i32 { a + b }".into()),
+            attachments: vec![],
             ts_ms: 2,
         });
-        t.push(Entry::Assistant { turn: 1, text: "Created lib.rs".into(), ts_ms: 3 });
+        t.push(Entry::Assistant { turn: 1, text: "Created lib.rs".into(), attachments: vec![], ts_ms: 3 });
         t.push(Entry::Checkpoint {
             turn: 1,
             ref_name: "refs/herdr2/checkpoints/default/a1/1".into(),
@@ -771,9 +900,10 @@ mod tests {
             turn: 2,
             from: Some("a0".into()),
             text: "<h2 from=\"a0\">\nrefactor incorrectly\n</h2>".into(),
+            attachments: vec![],
             ts_ms: 5,
         });
-        t.push(Entry::Assistant { turn: 2, text: "Broken code".into(), ts_ms: 6 });
+        t.push(Entry::Assistant { turn: 2, text: "Broken code".into(), attachments: vec![], ts_ms: 6 });
 
         assert!(build_portable_handoff(t.entries(), 0, 24 * 1024).is_none());
         let handoff = build_portable_handoff(t.entries(), 1, 24 * 1024).unwrap();
@@ -807,9 +937,9 @@ mod tests {
             context_markdown: None,
             ts_ms: 10,
         };
-        let e1 = Entry::User { turn: 1, from: None, text: "turn one".into(), ts_ms: 11 };
-        let e2 = Entry::Assistant { turn: 2, text: "turn two".into(), ts_ms: 12 };
-        let e3 = Entry::User { turn: 3, from: None, text: "turn three".into(), ts_ms: 13 };
+        let e1 = Entry::User { turn: 1, from: None, text: "turn one".into(), attachments: vec![], ts_ms: 11 };
+        let e2 = Entry::Assistant { turn: 2, text: "turn two".into(), attachments: vec![], ts_ms: 12 };
+        let e3 = Entry::User { turn: 3, from: None, text: "turn three".into(), attachments: vec![], ts_ms: 13 };
         let all = vec![e0, e1, e2, e3];
 
         let mut lines = Vec::new();

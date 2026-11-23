@@ -63,11 +63,24 @@ pub fn target_after_turn(current_turn: u64, was_working: bool, queued_before: us
 }
 
 impl Core {
-    /// Queues a prompt into the agent's ACP inbox (or cancels & steers ahead of queued turns).
+    /// Queues a plain-text prompt into the agent's ACP inbox (or cancels & steers ahead of queued turns).
     pub async fn send(
         &self,
         id: u32,
         text: &str,
+        steer: bool,
+        only_if: Option<&str>,
+        from: Option<&str>,
+    ) -> Result<Sent, RpcError> {
+        self.send_with_attachments(id, text, Vec::new(), steer, only_if, from).await
+    }
+
+    /// Queues a prompt with optional staged multimodal attachments into the agent's ACP inbox.
+    pub async fn send_with_attachments(
+        &self,
+        id: u32,
+        text: &str,
+        attachments: Vec<crate::transcript::Attachment>,
         steer: bool,
         only_if: Option<&str>,
         from: Option<&str>,
@@ -111,7 +124,7 @@ impl Core {
             let agent_addr = a.address.clone();
             let queued_before = st.inboxes.get(&id).map_or(0, std::collections::VecDeque::len);
             let after_turn = target_after_turn(turn, was_working, queued_before, steer);
-            let prompt = QueuedPrompt::new(text.to_string(), from.map(String::from));
+            let prompt = QueuedPrompt::with_attachments(text.to_string(), attachments, from.map(String::from));
 
             let Some(session) = st.sessions.get(&id).map(SessionSender::clone_cmd) else {
                 if st.recovering.contains(&id) {
@@ -305,6 +318,89 @@ impl Core {
             st.inboxes.entry(id).or_default().push_front(item);
             self.sync_inbox(&mut st, id, true);
             return Err(RpcError::new("unavailable", format!("{addr} has no active ACP session"), ""));
+        }
+        Ok(st.reg.agents.get(&id).expect("checked agent").clone())
+    }
+
+    /// Moves all paused inbox items (saved across an unexpected stop/reboot) back into the live
+    /// inbox queue and wakes the ACP actor to process them in FIFO order.
+    pub fn resume_paused_inbox(&self, id: u32) -> Result<Agent, RpcError> {
+        let mut st = self.lock();
+        let paused = {
+            let a = st
+                .reg
+                .agents
+                .get_mut(&id)
+                .ok_or_else(|| RpcError::new("not_found", format!("no agent {}", address(id)), ""))?;
+            a.check_program()?;
+            if !a.is_live() {
+                return Err(RpcError::new("finished", format!("{} already exited", a.address), ""));
+            }
+            std::mem::take(&mut a.paused_inbox)
+        };
+        if !paused.is_empty() {
+            let queue = st.inboxes.entry(id).or_default();
+            for item in paused {
+                let mut prompt = QueuedPrompt::with_attachments(item.text, item.attachments, item.from);
+                prompt.queued_ms = item.queued_ms;
+                queue.push_back(prompt);
+            }
+        }
+        let session = st.sessions.get(&id).map(SessionSender::clone_cmd);
+        let payload = st.reg.agents.get(&id).map(|a| {
+            serde_json::json!({
+                "status": a.status,
+                "records": a.records,
+                "reported": a.reported,
+                "pending_permission": a.pending_permission,
+                "inbox_len": st.inboxes.get(&id).map_or(0, std::collections::VecDeque::len),
+                "inbox": a.inbox,
+                "paused_inbox": a.paused_inbox,
+            })
+        });
+        self.sync_inbox(&mut st, id, true);
+        if let Some(p) = payload {
+            self.emit(&mut st, "status", id, p);
+        }
+        self.save(&st);
+        self.changed.notify_waiters();
+        if let Some(session) = session {
+            let _ = session.send(SessionCommand::WakeInbox);
+        }
+        Ok(st.reg.agents.get(&id).expect("checked agent").clone())
+    }
+
+    /// Discards all paused inbox items preserved from before a restart/reboot.
+    pub fn clear_paused_inbox(&self, id: u32) -> Result<Agent, RpcError> {
+        let mut st = self.lock();
+        let changed = {
+            let a = st
+                .reg
+                .agents
+                .get_mut(&id)
+                .ok_or_else(|| RpcError::new("not_found", format!("no agent {}", address(id)), ""))?;
+            if !a.is_live() {
+                return Err(RpcError::new("finished", format!("{} already exited", a.address), ""));
+            }
+            let had = !a.paused_inbox.is_empty();
+            a.paused_inbox.clear();
+            had
+        };
+        if changed {
+            if let Some(a) = st.reg.agents.get(&id) {
+                let payload = serde_json::json!({
+                    "status": a.status,
+                    "records": a.records,
+                    "reported": a.reported,
+                    "pending_permission": a.pending_permission,
+                    "inbox_len": a.inbox_len,
+                    "inbox": a.inbox,
+                    "paused_inbox": a.paused_inbox,
+                });
+                self.emit(&mut st, "status", id, payload);
+            }
+            self.save(&st);
+            self.changed.notify_waiters();
         }
         Ok(st.reg.agents.get(&id).expect("checked agent").clone())
     }

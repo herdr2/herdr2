@@ -20,7 +20,7 @@ use windows_sys::Win32::System::Pipes::*;
 use windows_sys::Win32::System::Threading::*;
 use windows_sys::core::BOOL;
 
-fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
+pub(crate) fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     s.encode_wide().chain(Some(0)).collect()
 }
@@ -675,9 +675,42 @@ pub fn sha256(bytes: &[u8]) -> Option<String> {
     (status == 0).then(|| out.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-/// No SIGTERM: planned restarts come through the API.
+static SHUTDOWN_TRIGGERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SHUTDOWN_NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+
+unsafe extern "system" fn on_host_shutdown(ctrl_type: u32) -> BOOL {
+    if matches!(ctrl_type, CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT) {
+        SHUTDOWN_TRIGGERED.store(true, std::sync::atomic::Ordering::SeqCst);
+        SHUTDOWN_NOTIFY.get_or_init(tokio::sync::Notify::new).notify_waiters();
+        return 1;
+    }
+    0
+}
+
+pub fn monitor_shutdown() {
+    let _ = SHUTDOWN_NOTIFY.get_or_init(tokio::sync::Notify::new);
+    unsafe {
+        SetConsoleCtrlHandler(Some(on_host_shutdown), 1);
+    }
+}
+
+pub fn host_shutdown_triggered() -> bool {
+    SHUTDOWN_TRIGGERED.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// Resolves when Windows reports session logoff or system shutdown so the core can flush state cleanly.
 pub async fn termination() {
-    std::future::pending::<()>().await
+    if host_shutdown_triggered() {
+        return;
+    }
+    let notify = SHUTDOWN_NOTIFY.get_or_init(tokio::sync::Notify::new);
+    loop {
+        let notified = notify.notified();
+        if host_shutdown_triggered() {
+            return;
+        }
+        notified.await;
+    }
 }
 
 pub fn hostname() -> String {
@@ -798,7 +831,7 @@ impl Process {
 
 /// `program` as Windows starts it: found on PATH with PATHEXT, batch files
 /// through cmd (npm installs agents as `.cmd` shims).
-fn command_line(argv: &[String], env: &BTreeMap<String, String>) -> io::Result<Vec<u16>> {
+pub(crate) fn command_line(argv: &[String], env: &BTreeMap<String, String>) -> io::Result<Vec<u16>> {
     let program = argv.first().ok_or_else(|| io::Error::other("empty argv"))?;
     let path = env.iter().find(|(k, _)| k.eq_ignore_ascii_case("PATH")).map(|(_, v)| v.clone()).unwrap_or_default();
     let exts = env
@@ -845,7 +878,7 @@ fn resolve(program: &str, path: &str, exts: &str) -> Option<PathBuf> {
 }
 
 /// One argument as Windows' command line parsing reads it back.
-fn quote(arg: &str) -> String {
+pub(crate) fn quote(arg: &str) -> String {
     if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
         return arg.into();
     }

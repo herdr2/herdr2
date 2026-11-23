@@ -221,6 +221,7 @@ async fn probe_one_acp(
         resume_session_id: None,
         can_load_session: false,
         system_prompt: None,
+        fallback_handoff_context: None,
         model: None,
         mode: None,
         dangerously_skip_permissions: false,

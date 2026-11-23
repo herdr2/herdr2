@@ -198,6 +198,7 @@ export interface DaemonAiStatus {
   effort?: string;
   contextWindow?: string;
   maxTokens?: number;
+  language?: string;
   circuitOpen: boolean;
   cooldownUntil?: string;
   consecutiveFailures: number;
@@ -232,6 +233,7 @@ export interface DaemonAiConfigPatch {
   effort?: string;
   contextWindow?: string;
   maxTokens?: number;
+  language?: string;
   apiKey?: string;
   clearKey?: boolean;
   verifyDigest?: boolean;

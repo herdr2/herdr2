@@ -18,6 +18,7 @@ import {
   notify,
   openOverlay,
   closeOverlay,
+  nextCommand,
   theme,
   settings,
   props,
@@ -30,6 +31,7 @@ import {
   FLASH_NOTES_KEY,
   FLASH_NOTES_TRASH_KEY,
   KNOWN_AGENTS_KEY,
+  AGENT_CATALOG_KEY,
   ACP_PRESETS,
   ACP_AGENT_KEY,
   withAlpha,
@@ -47,17 +49,31 @@ import {
   formatTrashAge,
   resolveSpaceFolder,
   resolveExistingAgents,
+  normalizeAgentCatalog,
+  catalogForPreset,
+  resolveEffectiveModel,
+  buildSentToLabel,
 } from "./model.js";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
 
 const AMBER = "#f59e0b";
+const EFFORT_LABELS = () => ({
+  "": tr("Default", "默认"),
+  off: tr("Off", "关闭"),
+  low: tr("Low", "低"),
+  medium: tr("Med", "中"),
+  high: tr("High", "高"),
+  xhigh: tr("XHigh", "超高"),
+  max: tr("Max", "最高"),
+});
 const FALLBACK_PRESETS = [
   { key: "claude", name: "Claude Code", icon: "icons/claude.svg", tint: false, installed: true, run: ["claude", "--dangerously-skip-permissions"] },
   { key: "codex", name: "Codex", icon: "icons/codex.svg", tint: false, installed: true, run: ["codex", "--no-daemon", "--dangerously-bypass-approvals-and-sandbox"] },
-  { key: "gemini", name: "Gemini", icon: "icons/gemini.svg", tint: true, installed: true, run: ["gemini"] },
-  { key: "opencode", name: "OpenCode", icon: "icons/opencode.svg", tint: true, installed: true, run: ["opencode"] },
+  { key: "antigravity", name: "Antigravity", icon: "icons/antigravity.svg", tint: false, installed: true, run: ["agy", "--dangerously-skip-permissions"] },
+  { key: "gemini", name: "Gemini", icon: "icons/gemini.svg", tint: true, installed: true, run: ["gemini", "--yolo"] },
+  { key: "opencode", name: "OpenCode", icon: "icons/opencode.svg", tint: true, installed: true, run: ["opencode", "--auto"] },
 ];
 
 function findNode(node, id) {
@@ -79,10 +95,10 @@ export function openFlashNoteWindow(noteId = null) {
     kind: "window",
     key: "flash-note",
     resizable: true,
-    width: 456,
-    height: 436,
-    min_width: 360,
-    min_height: 330,
+    width: 468,
+    height: 488,
+    min_width: 380,
+    min_height: 420,
     props: noteId ? { mode: "compose", noteId } : { mode: "compose" },
   });
 }
@@ -147,10 +163,27 @@ export default class FlashNote extends View {
     const cachedKnown = shared(KNOWN_AGENTS_KEY)?.[where];
     this.knownList = Array.isArray(cachedKnown) && cachedKnown.length > 0 ? cachedKnown : [];
     this.selectedPresetKey = null;
+    this.agentCatalog = shared(AGENT_CATALOG_KEY) ?? {};
+    this.selectedModel = "";
+    this.selectedEffort = "";
 
     this.existingPopupOpen = false;
     this.presetPopupOpen = false;
+    this.modelPopupOpen = false;
     this.spacePopupOpen = false;
+
+    this.customModelInput = InputState.new({
+      value: "",
+      placeholder: tr("Custom model ID…", "自定义模型 ID…"),
+    });
+    this.customModelInput.on("submit", (_e, cx) => {
+      const val = String(this.customModelInput?.value?.() ?? "").trim();
+      if (val) {
+        this.selectModel(val);
+        this.modelPopupOpen = false;
+        cx.notify();
+      }
+    });
 
     this.titleInput = InputState.new({
       value: existingNote?.title ?? "",
@@ -177,6 +210,9 @@ export default class FlashNote extends View {
       value: existingNote?.text ?? "",
       placeholder: tr("Jot down a sudden idea, reminder, or prompt…", "记下此刻的灵感、待办或想交给 Agent 处理的想法…"),
     });
+    this.polishing = false;
+    this.polishUndoText = null;
+    this.polishSummary = null;
     this.input.set_auto_grow(4, 10);
     this.input.on("focus", (_e, cx) => {
       this.inputFocused = true;
@@ -201,25 +237,138 @@ export default class FlashNote extends View {
     this.handle = cx.focus_handle();
     if (!checking()) {
       this.input.focus();
-      cx.spawn(async (taskCx) => {
-        try {
-          const machine = this.activeSpace()?.machine;
-          const list = await knownAgents({ on: machine });
-          if (Array.isArray(list) && list.length > 0) {
-            this.knownList = list;
-            const prevCache = shared(KNOWN_AGENTS_KEY);
-            setShared(KNOWN_AGENTS_KEY, { ...(prevCache && typeof prevCache === "object" ? prevCache : {}), [machine ?? ""]: list });
+      if (typeof nextCommand === "function") {
+        cx.spawn(async (cmdCx) => {
+          for (;;) {
+            const cmd = await nextCommand();
+            if (cmd === "polish") await this.polishIdea(cmdCx);
           }
-        } catch {}
-        taskCx.notify();
-      });
+        });
+      }
+      this.refreshMachineAgentsAndCatalog(this.activeSpace()?.machine ?? null, cx);
     }
+  }
+
+  refreshMachineAgentsAndCatalog(machine, cx) {
+    if (checking() || typeof cx?.spawn !== "function") return;
+    const where = machine ?? "";
+    cx.spawn(async (taskCx) => {
+      try {
+        const list = await knownAgents({ on: machine || undefined });
+        if (Array.isArray(list) && list.length > 0) {
+          this.knownList = list;
+          const prevCache = shared(KNOWN_AGENTS_KEY);
+          setShared(KNOWN_AGENTS_KEY, { ...(prevCache && typeof prevCache === "object" ? prevCache : {}), [where]: list });
+        }
+      } catch {}
+      taskCx.notify();
+    });
+    cx.spawn(async (taskCx) => {
+      try {
+        const args = ["drove", "settings", "--json", ...(machine ? ["--on", machine] : [])];
+        const res = await h2(args, { timeout: 6000 });
+        if (res?.code === 0 && res.stdout) {
+          const parsed = JSON.parse(res.stdout);
+          const catalog = normalizeAgentCatalog(parsed?.agents?.agents);
+          if (Object.keys(catalog).length > 0) {
+            this.agentCatalog = catalog;
+            setShared(AGENT_CATALOG_KEY, catalog);
+            const curPreset = this.chosenPreset();
+            if (curPreset && this.selectedEffort) {
+              const cat = catalogForPreset(this.agentCatalog, curPreset.key, this.selectedModel);
+              if (!cat.efforts.includes(this.selectedEffort)) this.selectedEffort = "";
+            }
+          }
+        }
+      } catch {}
+      taskCx.notify();
+    });
   }
 
   closeAllPopups() {
     this.existingPopupOpen = false;
     this.presetPopupOpen = false;
+    this.modelPopupOpen = false;
     this.spacePopupOpen = false;
+  }
+
+  selectPreset(nextKey) {
+    if (this.selectedPresetKey !== nextKey) {
+      this.selectedPresetKey = nextKey;
+      this.selectedModel = "";
+      this.selectedEffort = "";
+      this.modelPopupOpen = false;
+      this.customModelInput?.set_value?.("");
+    }
+  }
+
+  selectModel(nextModel) {
+    this.selectedModel = String(nextModel ?? "").trim();
+    const preset = this.chosenPreset();
+    const cat = catalogForPreset(this.agentCatalog, preset?.key, this.selectedModel);
+    if (this.selectedEffort && !cat.efforts.includes(this.selectedEffort)) {
+      this.selectedEffort = "";
+    }
+  }
+
+  revertPolish(cx) {
+    if (this.polishUndoText == null) return;
+    const orig = this.polishUndoText;
+    this.polishUndoText = null;
+    this.polishSummary = null;
+    this.input?.set_value?.(orig);
+    this.input?.focus?.();
+    cx.notify();
+  }
+
+  async polishIdea(cx) {
+    const raw = String(this.input?.value?.() ?? "").trim();
+    if (!raw || this.polishing || this.busy || checking()) return;
+    const candidates = resolveExistingAgents(terminals(), agents(), panes(), focused());
+    const targetKind = this.targetMode === "existing"
+      ? (candidates.find((c) => c.address === this.selectedExisting)?.kind === "acp" ? "acp" : "cli")
+      : (this.newRuntimeMode === "cli" ? "cli" : "acp");
+    this.polishing = true;
+    this.error = null;
+    cx.notify();
+    try {
+      const args = [
+        "ai",
+        "polish-prompt",
+        "--json",
+        "--kind",
+        targetKind,
+        "--lang",
+        isZh() ? "zh-CN" : "en",
+      ];
+      if (this.targetMode === "existing" && this.selectedExisting) {
+        args.push("--target", this.selectedExisting);
+      }
+      args.push("--", raw);
+      const res = await h2(args, { timeout: 22000 });
+      if (res?.code === 0 && res.stdout) {
+        const parsed = JSON.parse(res.stdout);
+        const polished = String(parsed?.polished ?? "").trim();
+        if (parsed?.usedAi && polished) {
+          this.polishUndoText = raw;
+          this.polishSummary = parsed?.summary ? String(parsed.summary).trim() : null;
+          this.input?.set_value?.(polished);
+          this.input?.focus?.();
+        } else {
+          const reason = String(parsed?.fallbackReason ?? "");
+          this.error = reason === "ai_not_configured"
+            ? tr("Core AI is not configured. Enable it in Settings → AI Assistant first.", "Core AI 尚未配置，请先在「设置 → AI 助手」中启用后再使用润色功能。")
+            : tr("AI polish returned no changes. Please retry.", "AI 润色暂未返回有效结果，请重试。");
+        }
+      } else {
+        this.error = String(res?.stderr || res?.stdout || tr("AI polish failed", "AI 润色失败")).trim();
+      }
+    } catch (e) {
+      this.error = tr(`AI polish failed: ${e?.message ?? e}`, `AI 润色失败：${e?.message ?? e}`);
+    } finally {
+      this.polishing = false;
+      cx.notify();
+    }
   }
 
   savedNotes() {
@@ -380,9 +529,18 @@ export default class FlashNote extends View {
       const space = this.activeSpace();
       const folder = resolveSpaceFolder(space, panes());
       const acpMode = this.newRuntimeMode === "acp" && ACP_PRESETS.has(preset.key);
+      const effectiveModel = resolveEffectiveModel(
+        this.agentCatalog,
+        preset.key,
+        this.selectedModel,
+        this.selectedEffort,
+      );
+      const effectiveEffort = String(this.selectedEffort ?? "").trim();
       if (acpMode) {
         const agentKey = ACP_AGENT_KEY[preset.key] ?? preset.key;
         const args = { acp: true, agent: agentKey, task: text };
+        if (effectiveModel) args.model = effectiveModel;
+        if (effectiveEffort) args.effort = effectiveEffort;
         if (space?.id) args.space = space.id;
         if (folder) args.folder = folder;
         run("tab.new", args);
@@ -392,6 +550,8 @@ export default class FlashNote extends View {
             ? ["cursor-agent", ...preset.run.slice(1)]
             : preset.run;
         const args = { name: preset.name, argv: runArgv, task: text };
+        if (effectiveModel) args.model = effectiveModel;
+        if (effectiveEffort) args.effort = effectiveEffort;
         if (space?.id) args.space = space.id;
         if (folder) args.folder = folder;
         run("tab.new", args);
@@ -401,7 +561,7 @@ export default class FlashNote extends View {
           id: this.editingNoteId,
           title,
           text,
-          sentTo: `${preset.name} (${acpMode ? "ACP" : "CLI"})`,
+          sentTo: buildSentToLabel(preset.name, acpMode, this.selectedModel, effectiveEffort),
           sentAt: Date.now(),
           now: Date.now(),
         });
@@ -1067,6 +1227,9 @@ export default class FlashNote extends View {
       this.editingNoteId = found?.id ?? null;
       this.titleInput?.set_value?.(found?.title ?? "");
       this.input?.set_value?.(found?.text ?? "");
+      this.polishUndoText = null;
+      this.polishSummary = null;
+      this.polishing = false;
       this.error = null;
     }
 
@@ -1195,6 +1358,72 @@ export default class FlashNote extends View {
       )
       .child(svg("mods/workspace-chrome/chevron-down.svg").size(11).flex_none().text_color(t.dim));
 
+    const presetCat = catalogForPreset(this.agentCatalog, chosenPreset?.key, this.selectedModel);
+    const effLabels = EFFORT_LABELS();
+    const modelDisplay = this.selectedModel
+      ? this.selectedModel
+      : presetCat.defaultModel
+        ? `${tr("Default", "默认")} (${presetCat.defaultModel})`
+        : tr("Default (agent choice)", "默认（跟随 Agent 配置）");
+
+    const modelTrigger = h_flex()
+      .id("fn-model-btn")
+      .flex_1()
+      .min_w(0)
+      .h(28)
+      .px(9)
+      .gap(6)
+      .items_center()
+      .rounded(7)
+      .bg(this.selectedModel ? withAlpha(accent, "16") : t.background)
+      .border_1()
+      .border_color(this.modelPopupOpen || this.selectedModel ? accent : t.border)
+      .cursor_pointer()
+      .hover((s) => s.bg(t.hover))
+      .on_mouse_down("left", stop)
+      .on_click((_e, cx) => {
+        const next = !this.modelPopupOpen;
+        this.closeAllPopups();
+        this.modelPopupOpen = next;
+        cx.notify();
+      })
+      .child(
+        div()
+          .flex_1()
+          .min_w(0)
+          .truncate()
+          .text_size(11.5)
+          .text_color(this.selectedModel ? t.foreground : t.muted)
+          .child(modelDisplay),
+      )
+      .child(svg("mods/workspace-chrome/chevron-down.svg").size(11).flex_none().text_color(t.dim));
+
+    const effChip = (id, val, label) => {
+      const active = (this.selectedEffort || "") === val;
+      return h_flex()
+        .id(id)
+        .h(24)
+        .px(8)
+        .flex_none()
+        .items_center()
+        .rounded(6)
+        .border_1()
+        .border_color(active ? accent : t.border)
+        .bg(active ? (withAlpha(accent, "1f") ?? t.selected) : t.background)
+        .text_size(11)
+        .when(active, (x) => x.font_semibold())
+        .text_color(active ? t.foreground : t.muted)
+        .cursor_pointer()
+        .hover((s) => s.bg(active ? (withAlpha(accent, "29") ?? t.selected) : t.hover).text_color(t.foreground))
+        .on_mouse_down("left", stop)
+        .on_click((_e, cx) => {
+          this.selectedEffort = val;
+          this.closeAllPopups();
+          cx.notify();
+        })
+        .child(label);
+    };
+
     const spaceTrigger = h_flex()
       .id("fn-space-btn")
       .w_full()
@@ -1246,7 +1475,14 @@ export default class FlashNote extends View {
         .hover((s) => s.bg(active ? t.selected : t.hover))
         .on_mouse_down("left", stop)
         .on_click((_e, cx) => {
+          const prevKey = this.chosenPreset()?.key ?? null;
           this.newRuntimeMode = rt;
+          const nextKey = this.chosenPreset()?.key ?? null;
+          if (prevKey !== nextKey) {
+            this.selectedModel = "";
+            this.selectedEffort = "";
+            this.customModelInput?.set_value?.("");
+          }
           this.closeAllPopups();
           cx.notify();
         })
@@ -1268,7 +1504,7 @@ export default class FlashNote extends View {
       .track_focus(this.handle)
       .on_key_down((e, cx) => {
         if (e.key === "escape") {
-          if (this.existingPopupOpen || this.presetPopupOpen || this.spacePopupOpen) {
+          if (this.existingPopupOpen || this.presetPopupOpen || this.modelPopupOpen || this.spacePopupOpen) {
             this.closeAllPopups();
             cx.stop_propagation();
             cx.notify();
@@ -1369,6 +1605,49 @@ export default class FlashNote extends View {
                   .text_size(12.5)
                   .text_color(t.foreground),
               ),
+          )
+          .when(this.polishUndoText != null, (el) =>
+            el.child(
+              h_flex()
+                .id("fn-polish-banner")
+                .w_full()
+                .px(9)
+                .py(5)
+                .gap(6)
+                .flex_none()
+                .items_center()
+                .rounded(6)
+                .bg(withAlpha("#a855f7", "16"))
+                .border_1()
+                .border_color(withAlpha("#a855f7", "44"))
+                .child(svg("mods/peek/sparkles.svg").size(11.5).flex_none().text_color("#a855f7"))
+                .child(
+                  div()
+                    .flex_1()
+                    .min_w(0)
+                    .truncate()
+                    .text_size(11)
+                    .text_color(t.foreground)
+                    .child(this.polishSummary ? tr(`Polished · ${this.polishSummary}`, `已润色 · ${this.polishSummary}`) : tr("Polished by AI", "已由 AI 润色")),
+                )
+                .child(
+                  div()
+                    .id("fn-polish-undo")
+                    .flex_none()
+                    .px(6)
+                    .py(1)
+                    .rounded(4)
+                    .bg(t.background)
+                    .border_1()
+                    .border_color(t.border)
+                    .text_size(10.5)
+                    .text_color(t.muted)
+                    .cursor_pointer()
+                    .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                    .on_click((_e, cx) => this.revertPolish(cx))
+                    .child(tr("↩ Undo", "↩ 还原")),
+                ),
+            ),
           )
           .child(
             div()
@@ -1563,7 +1842,7 @@ export default class FlashNote extends View {
                                           .when(active, (x) => x.bg(t.selected))
                                           .hover((s) => s.bg(t.hover))
                                           .on_click((_e, cx) => {
-                                            this.selectedPresetKey = a.key;
+                                            this.selectPreset(a.key);
                                             this.presetPopupOpen = false;
                                             cx.notify();
                                           })
@@ -1580,6 +1859,174 @@ export default class FlashNote extends View {
                       )
                       .child(rtChip("fn-new-rt-acp", "acp", "ACP"))
                       .child(rtChip("fn-new-rt-cli", "cli", tr("CLI", "终端"))),
+                  )
+                  .child(
+                    h_flex()
+                      .w_full()
+                      .gap(8)
+                      .items_center()
+                      .child(div().w(52).flex_none().text_size(11).text_color(t.dim).child(tr("Model", "模型类型")))
+                      .child(
+                        div()
+                          .flex_1()
+                          .min_w(0)
+                          .child(
+                            Popup.new("fn-model-popup", modelTrigger)
+                              .anchor("top_left")
+                              .when(this.modelPopupOpen, (pop) =>
+                                pop.content(
+                                  v_flex()
+                                    .id("fn-model-dropdown")
+                                    .w(320)
+                                    .p(5)
+                                    .gap(4)
+                                    .rounded(8)
+                                    .bg(t.popover ?? t.background)
+                                    .border_1()
+                                    .border_color(t.border)
+                                    .shadow_lg()
+                                    .on_mouse_down("left", stop)
+                                    .on_scroll_wheel(stop)
+                                    .child(
+                                      v_flex()
+                                        .max_h(190)
+                                        .gap(2)
+                                        .overflow_y_scroll()
+                                        .child(
+                                          h_flex()
+                                            .id("fn-model-opt-default")
+                                            .h(26)
+                                            .px(8)
+                                            .gap(6)
+                                            .flex_none()
+                                            .items_center()
+                                            .justify_between()
+                                            .rounded(6)
+                                            .cursor_pointer()
+                                            .when(!this.selectedModel, (x) => x.bg(withAlpha(accent, "1f") ?? t.selected))
+                                            .hover((s) => s.bg(t.hover))
+                                            .on_click((_e, cx) => {
+                                              this.selectModel("");
+                                              this.modelPopupOpen = false;
+                                              cx.notify();
+                                            })
+                                            .child(
+                                              div()
+                                                .flex_1()
+                                                .min_w(0)
+                                                .truncate()
+                                                .text_size(11.5)
+                                                .text_color(!this.selectedModel ? t.foreground : t.muted)
+                                                .child(
+                                                  presetCat.defaultModel
+                                                    ? `${tr("Default", "默认")} (${presetCat.defaultModel})`
+                                                    : tr("Default (agent choice)", "默认（跟随 Agent 配置）"),
+                                                ),
+                                            )
+                                            .when(!this.selectedModel, (ck) =>
+                                              ck.child(svg("mods/workspace-chrome/check.svg").size(11).flex_none().text_color(accent)),
+                                            ),
+                                        )
+                                        .children(
+                                          presetCat.models.map((m, idx) => {
+                                            const picked = this.selectedModel === m;
+                                            return h_flex()
+                                              .id(`fn-model-opt-${idx}`)
+                                              .h(26)
+                                              .px(8)
+                                              .gap(6)
+                                              .flex_none()
+                                              .items_center()
+                                              .justify_between()
+                                              .rounded(6)
+                                              .cursor_pointer()
+                                              .when(picked, (x) => x.bg(withAlpha(accent, "1f") ?? t.selected))
+                                              .hover((s) => s.bg(t.hover))
+                                              .on_click((_e, cx) => {
+                                                this.selectModel(m);
+                                                this.modelPopupOpen = false;
+                                                cx.notify();
+                                              })
+                                              .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(picked ? t.foreground : t.muted).child(m))
+                                              .when(picked, (ck) =>
+                                                ck.child(svg("mods/workspace-chrome/check.svg").size(11).flex_none().text_color(accent)),
+                                              );
+                                          }),
+                                        ),
+                                    )
+                                    .child(
+                                      h_flex()
+                                        .w_full()
+                                        .pt(4)
+                                        .gap(5)
+                                        .items_center()
+                                        .border_t(1)
+                                        .border_color(t.border)
+                                        .child(
+                                          Input.new(this.customModelInput)
+                                            .id("fn-model-custom-input")
+                                            .flex_1()
+                                            .min_w(0)
+                                            .h(24)
+                                            .px(7)
+                                            .rounded(5)
+                                            .border_1()
+                                            .border_color(t.input)
+                                            .bg(t.raised)
+                                            .text_size(11)
+                                            .text_color(t.foreground),
+                                        )
+                                        .child(
+                                          div()
+                                            .id("fn-model-custom-ok")
+                                            .h(24)
+                                            .px(8)
+                                            .flex_none()
+                                            .flex()
+                                            .items_center()
+                                            .rounded(5)
+                                            .bg(t.raised)
+                                            .border_1()
+                                            .border_color(t.border)
+                                            .text_size(10.5)
+                                            .text_color(t.foreground)
+                                            .cursor_pointer()
+                                            .hover((s) => s.bg(t.hover))
+                                            .on_click((_e, cx) => {
+                                              const val = String(this.customModelInput?.value?.() ?? "").trim();
+                                              if (val) {
+                                                this.selectModel(val);
+                                                this.modelPopupOpen = false;
+                                                cx.notify();
+                                              }
+                                            })
+                                            .child(tr("Use", "使用")),
+                                        ),
+                                    ),
+                                ),
+                              ),
+                          ),
+                      ),
+                  )
+                  .child(
+                    h_flex()
+                      .w_full()
+                      .gap(8)
+                      .items_center()
+                      .child(div().w(52).flex_none().text_size(11).text_color(t.dim).child(tr("Effort", "思考强度")))
+                      .child(
+                        h_flex()
+                          .flex_1()
+                          .min_w(0)
+                          .gap(4)
+                          .flex_wrap()
+                          .child(effChip("fn-eff-default", "", effLabels[""]))
+                          .children(
+                            presetCat.efforts.map((eff) =>
+                              effChip(`fn-eff-${eff}`, eff, effLabels[eff] ?? eff),
+                            ),
+                          ),
+                      ),
                   )
                   .when(spaceList.length > 0, (e2) =>
                     e2.child(
@@ -1613,8 +2060,15 @@ export default class FlashNote extends View {
                                     .when(active, (x) => x.bg(t.selected))
                                     .hover((s) => s.bg(t.hover))
                                     .on_click((_e, cx) => {
+                                      const prevMachine = this.activeSpace()?.machine ?? null;
                                       this.selectedSpaceId = sp.id;
                                       this.spacePopupOpen = false;
+                                      const nextMachine = sp.machine ?? null;
+                                      if (prevMachine !== nextMachine) {
+                                        const cached = shared(KNOWN_AGENTS_KEY)?.[nextMachine ?? ""];
+                                        if (Array.isArray(cached) && cached.length > 0) this.knownList = cached;
+                                        this.refreshMachineAgentsAndCatalog(nextMachine, cx);
+                                      }
                                       cx.notify();
                                     })
                                     .child(svg("mods/workspace-chrome/folder.svg").size(12).flex_none().text_color(t.dim))
@@ -1677,6 +2131,31 @@ export default class FlashNote extends View {
             ),
           )
           .child(div().flex_1())
+          .child((() => {
+            const canPolish = Boolean(hasText && !this.polishing && !this.busy);
+            const purple = "#a855f7";
+            return h_flex()
+              .id("fn-polish")
+              .h(28)
+              .px(10)
+              .gap(4)
+              .items_center()
+              .rounded(6)
+              .border_1()
+              .border_color(canPolish || this.polishing ? withAlpha(purple, "66") : t.border)
+              .bg(canPolish || this.polishing ? withAlpha(purple, "18") : t.raised)
+              .text_size(11.5)
+              .font_medium()
+              .text_color(canPolish || this.polishing ? purple : t.dim)
+              .when(canPolish, (e) => e.cursor_pointer().hover((s) => s.bg(withAlpha(purple, "2c"))).on_click((_e, cx) => this.polishIdea(cx)))
+              .tooltip(tr("Polish prompt with Core AI for clarity", "使用 Core AI 润色提示词，让表达更清晰"))
+              .child(
+                this.polishing
+                  ? svg("mods/workspace-chrome/spinner.svg").size(11.5).spin(900).text_color(purple)
+                  : svg("mods/peek/sparkles.svg").size(11.5).text_color(canPolish ? purple : t.dim),
+              )
+              .child(this.polishing ? tr("Polishing…", "润色中…") : tr("Polish", "AI 润色"));
+          })())
           .child(
             h_flex()
               .id("fn-save")

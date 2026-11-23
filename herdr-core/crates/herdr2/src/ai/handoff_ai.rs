@@ -777,7 +777,7 @@ mod tests {
     async fn distills_omitted_turns_merge_back_and_recommends_with_fallback() {
         let (rt, tmp) = temp_runtime();
         let entries = vec![
-            Entry::User { turn: 1, from: None, text: "Implement lock-free cache".into(), ts_ms: 1 },
+            Entry::User { turn: 1, from: None, text: "Implement lock-free cache".into(), attachments: vec![], ts_ms: 1 },
             Entry::Error { turn: 2, message: "deadlock in storage mutex".into(), ts_ms: 2 },
             Entry::ToolCall {
                 turn: 2,
@@ -786,10 +786,11 @@ mod tests {
                 tool_kind: None,
                 status: "failed".into(),
                 detail: Some("test auth_lock timed out".into()),
+                attachments: vec![],
                 ts_ms: 3,
             },
-            Entry::Assistant { turn: 2, text: "Mutex ordering caused deadlock; switched to RwLock.".into(), ts_ms: 4 },
-            Entry::User { turn: 3, from: None, text: "Continue fixing timeout".into(), ts_ms: 5 },
+            Entry::Assistant { turn: 2, text: "Mutex ordering caused deadlock; switched to RwLock.".into(), attachments: vec![], ts_ms: 4 },
+            Entry::User { turn: 3, from: None, text: "Continue fixing timeout".into(), attachments: vec![], ts_ms: 5 },
             Entry::Error { turn: 3, message: "still failing test auth_lock".into(), ts_ms: 6 },
         ];
 

@@ -20,6 +20,8 @@ pub struct AiPaths {
     pub legacy_drove_config: PathBuf,
     pub legacy_drove_key_file: PathBuf,
     pub legacy_drove_models_cache: PathBuf,
+    /// Desktop app settings file (`herdr2-app/settings.json`) used as a language fallback when `ai.json` has no explicit `language`.
+    pub app_settings_file: PathBuf,
 }
 
 impl AiPaths {
@@ -33,6 +35,16 @@ impl AiPaths {
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| config_dir.join("drove.json"));
+        let app_settings_file = std::env::var_os("HERDR2_APP_HOME")
+            .filter(|v| !v.is_empty())
+            .map(|dir| PathBuf::from(dir).join("settings.json"))
+            .unwrap_or_else(|| {
+                config_dir
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join("herdr2-app")
+                    .join("settings.json")
+            });
         let secrets_dir = paths.state.join("secrets");
         let drove_state = paths.state.join("drove");
         Self {
@@ -42,6 +54,7 @@ impl AiPaths {
             legacy_drove_config,
             legacy_drove_key_file: drove_state.join("secrets").join("ai.key"),
             legacy_drove_models_cache: drove_state.join("models-cache.json"),
+            app_settings_file,
             secrets_dir,
         }
     }
@@ -87,6 +100,10 @@ pub struct AiCoreConfig {
     pub context_window: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    /// Preferred human-facing AI output language (`"en"` or `"zh-CN"`).
+    /// When omitted, resolves from local `herdr2-app/settings.json` (if present), else `"en"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub language: Option<String>,
     /// Semantic fallback arbitration for non-OSC-7501 interactive PTY CLI agents.
     #[serde(default = "default_true")]
     pub pty_status_arbitration: bool,
@@ -118,6 +135,7 @@ impl Default for AiCoreConfig {
             effort: default_effort(),
             context_window: None,
             max_tokens: None,
+            language: None,
             pty_status_arbitration: true,
             notes_digest: true,
             prompt_cache_enabled: true,
@@ -271,6 +289,62 @@ pub fn is_loopback_http_url(raw: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
+/// Normalizes an AI language setting (`"en"`, `"zh-CN"`, or `"auto"` / `""` to clear).
+pub fn normalize_ai_language(raw: &str) -> Result<Option<String>, RpcError> {
+    let clean = raw.trim().to_ascii_lowercase();
+    if clean.is_empty() || clean == "auto" || clean == "default" {
+        return Ok(None);
+    }
+    if clean == "zh"
+        || clean == "zh-cn"
+        || clean == "zh_cn"
+        || clean == "zh-hans"
+        || clean == "chinese"
+        || clean.starts_with("zh-")
+        || clean.starts_with("zh_")
+    {
+        return Ok(Some("zh-CN".into()));
+    }
+    if clean == "en"
+        || clean == "en-us"
+        || clean == "en_us"
+        || clean == "english"
+        || clean.starts_with("en-")
+        || clean.starts_with("en_")
+    {
+        return Ok(Some("en".into()));
+    }
+    Err(RpcError::invalid_params(format!(
+        "ai.language must be en, zh-CN, or auto, not {raw:?}"
+    )))
+}
+
+/// Maps any language tag (e.g. `"zh-CN"`, `"zh"`, `"en"`, `"en-US"`) to the prompt `lang` code (`"zh"` or `"en"`).
+pub fn prompt_lang_code(raw: &str) -> &'static str {
+    if raw.trim().to_ascii_lowercase().starts_with("zh") {
+        "zh"
+    } else {
+        "en"
+    }
+}
+
+/// Reads the user's interface language from `herdr2-app/settings.json` when present.
+/// Returns `None` if the file does not exist or cannot be parsed.
+/// When the file exists and omits `"language"`, returns `Some("en")` (matching `herdr-app`'s default).
+pub fn read_app_settings_language(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let val: Value = serde_json::from_str(&text).ok()?;
+    let obj = val.as_object()?;
+    match obj.get("language").and_then(Value::as_str) {
+        Some(raw) => match normalize_ai_language(raw) {
+            Ok(Some(canon)) => Some(canon),
+            Ok(None) => Some("en".into()),
+            Err(_) => Some(if prompt_lang_code(raw) == "zh" { "zh-CN".into() } else { "en".into() }),
+        },
+        None => Some("en".into()),
+    }
+}
+
 pub fn validate_config(cfg: &mut AiCoreConfig) -> Result<(), RpcError> {
     if !cfg.base_url.trim().is_empty() {
         cfg.base_url = validate_http_url(&cfg.base_url, "ai.baseUrl")?;
@@ -302,6 +376,9 @@ pub fn validate_config(cfg: &mut AiCoreConfig) -> Result<(), RpcError> {
         } else if !(64..=131_072).contains(&mt) {
             return Err(RpcError::invalid_params("ai.maxTokens must be between 64 and 131072"));
         }
+    }
+    if let Some(lang) = cfg.language.take() {
+        cfg.language = normalize_ai_language(&lang)?;
     }
     cfg.version = 1;
     cfg.updated_at = now_iso();
@@ -341,6 +418,11 @@ pub fn load_config(paths: &AiPaths) -> Result<AiCoreConfig, RpcError> {
                 }
                 if let Some(n) = ai_obj.get("maxTokens").and_then(Value::as_u64) {
                     cfg.max_tokens = u32::try_from(n).ok();
+                }
+                if let Some(s) = ai_obj.get("language").and_then(Value::as_str)
+                    && let Ok(norm) = normalize_ai_language(s)
+                {
+                    cfg.language = norm;
                 }
                 let _ = validate_config(&mut cfg);
                 return Ok(cfg);
@@ -516,6 +598,34 @@ mod tests {
             let (k3, _) = read_ai_key(&ai_paths);
             assert!(k3.is_none());
         }
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn normalizes_and_reads_app_settings_language() {
+        assert_eq!(normalize_ai_language("zh").unwrap().as_deref(), Some("zh-CN"));
+        assert_eq!(normalize_ai_language("zh-CN").unwrap().as_deref(), Some("zh-CN"));
+        assert_eq!(normalize_ai_language("en").unwrap().as_deref(), Some("en"));
+        assert_eq!(normalize_ai_language("en-US").unwrap().as_deref(), Some("en"));
+        assert_eq!(normalize_ai_language("auto").unwrap(), None);
+        assert_eq!(normalize_ai_language("").unwrap(), None);
+        assert!(normalize_ai_language("klingon").is_err());
+
+        assert_eq!(prompt_lang_code("zh-CN"), "zh");
+        assert_eq!(prompt_lang_code("ZH"), "zh");
+        assert_eq!(prompt_lang_code("en"), "en");
+
+        let tmp = crate::test_tmp().join(format!("ai-lang-app-{}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let settings_path = tmp.join("settings.json");
+        assert_eq!(read_app_settings_language(&settings_path), None);
+
+        std::fs::write(&settings_path, r#"{"language":"zh-CN"}"#).unwrap();
+        assert_eq!(read_app_settings_language(&settings_path).as_deref(), Some("zh-CN"));
+
+        std::fs::write(&settings_path, r#"{"zoom":1.0}"#).unwrap();
+        assert_eq!(read_app_settings_language(&settings_path).as_deref(), Some("en"));
 
         let _ = std::fs::remove_dir_all(tmp);
     }

@@ -51,7 +51,7 @@ export function TaskAiDiagnosisPanel({
   attempts: Attempt[];
   onRefresh: () => void;
 }) {
-  const { t } = useT();
+  const { t, lang } = useT();
   const [fetchedAi, setFetchedAi] = useState<AttemptAiDiagnosis | null>(null);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -88,7 +88,7 @@ export function TaskAiDiagnosisPanel({
     setBusy(true);
     setErr(null);
     try {
-      const diag = await inspectTask(task.id, { ai: true, refresh: Boolean(ai) });
+      const diag = await inspectTask(task.id, { ai: true, refresh: Boolean(ai), lang });
       if (diag.ai) setFetchedAi(diag.ai);
       onRefresh();
     } catch (e) {

@@ -6,7 +6,217 @@ use std::sync::Mutex;
 
 pub const LIMIT: u64 = 1024 * 1024;
 pub const IMAGE_LIMIT: u64 = 8 * 1024 * 1024;
+pub const MAX_ATTACHMENT_BATCH: usize = 8;
+const ATTACHMENT_DIR_REL: &str = "data/acp-attachments";
+const ATTACHMENT_TTL_SECS: u64 = 24 * 60 * 60;
 static WRITES: Mutex<()> = Mutex::new(());
+static NEXT_ATTACH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn mime_ext(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        "image/bmp" => "bmp",
+        "image/tiff" => "tiff",
+        "image/x-icon" => "ico",
+        _ => "png",
+    }
+}
+
+fn detect_resource_mime(path_hint: &str, bytes: &[u8]) -> &'static str {
+    if bytes.starts_with(b"%PDF-") {
+        return "application/pdf";
+    }
+    let ext = Path::new(path_hint)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase());
+    match ext.as_deref() {
+        Some("md" | "markdown") => "text/markdown",
+        Some("json") => "application/json",
+        Some("html" | "htm") => "text/html",
+        Some("css") => "text/css",
+        Some("csv") => "text/csv",
+        Some("xml") => "application/xml",
+        Some("yaml" | "yml") => "text/yaml",
+        Some("toml") => "application/toml",
+        Some("pdf") => "application/pdf",
+        Some("txt" | "log" | "rs" | "ts" | "tsx" | "js" | "jsx" | "py" | "go" | "c" | "h" | "cpp" | "java" | "sh") => {
+            "text/plain"
+        }
+        _ => {
+            if !bytes.contains(&0) && std::str::from_utf8(bytes).is_ok() {
+                "text/plain"
+            } else {
+                "application/octet-stream"
+            }
+        }
+    }
+}
+
+/// Removes temporary composer attachment previews older than 24 hours.
+pub fn prune_stale_attachments(app_dir: &Path) {
+    let dir = app_dir.join(ATTACHMENT_DIR_REL);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        if let Ok(modified) = meta.modified()
+            && let Ok(age) = now.duration_since(modified)
+            && age.as_secs() > ATTACHMENT_TTL_SECS
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn write_preview_file(app_dir: &Path, prefix: &str, ext: &str, bytes: &[u8]) -> Result<(std::path::PathBuf, String), String> {
+    let dir = app_dir.join(ATTACHMENT_DIR_REL);
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or_default();
+    let seq = NEXT_ATTACH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let filename = format!("{prefix}-{stamp}-{seq}.{ext}");
+    let abs = dir.join(&filename);
+    std::fs::write(&abs, bytes).map_err(|e| e.to_string())?;
+    Ok((abs, format!("{ATTACHMENT_DIR_REL}/{filename}")))
+}
+
+/// Stages raw clipboard image bytes into `<app_dir>/data/acp-attachments/` for preview and `h2 send --image`.
+pub fn stage_clipboard_image(app_dir: &Path, raw_bytes: &[u8]) -> Result<serde_json::Value, String> {
+    if raw_bytes.is_empty() {
+        return Err("Clipboard image is empty.".into());
+    }
+    let (bytes, mime) = match detect_image_mime("", raw_bytes) {
+        Some(m @ ("image/png" | "image/jpeg" | "image/gif" | "image/webp")) => (raw_bytes.to_vec(), m),
+        _ => {
+            let img = image::load_from_memory(raw_bytes)
+                .map_err(|_| "Clipboard does not hold a readable image.".to_owned())?;
+            let mut png = std::io::Cursor::new(Vec::new());
+            img.write_to(&mut png, image::ImageFormat::Png)
+                .map_err(|_| "Could not encode clipboard image as PNG.".to_owned())?;
+            (png.into_inner(), "image/png")
+        }
+    };
+    if bytes.len() as u64 > IMAGE_LIMIT {
+        return Err("Pasted image exceeds the 8 MiB limit.".into());
+    }
+    prune_stale_attachments(app_dir);
+    let ext = mime_ext(mime);
+    let (abs, preview) = write_preview_file(app_dir, "clip", ext, &bytes)?;
+    let name = abs
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("clipboard.png")
+        .to_string();
+    Ok(serde_json::json!({
+        "kind": "image",
+        "path": abs.display().to_string(),
+        "preview": preview,
+        "name": name,
+        "mimeType": mime,
+        "bytes": bytes.len(),
+    }))
+}
+
+/// Inspects local paths (from drag-and-drop, file picker, or copied files) into composer attachment descriptors.
+/// Images get a cached preview under `<app_dir>/data/acp-attachments/`; other files attach as ACP resources.
+pub fn prepare_attachments(app_dir: &Path, paths: &[std::path::PathBuf]) -> Vec<serde_json::Value> {
+    prune_stale_attachments(app_dir);
+    paths
+        .iter()
+        .take(MAX_ATTACHMENT_BATCH)
+        .map(|p| {
+            let name = p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("attachment")
+                .to_string();
+            let meta = match std::fs::metadata(p) {
+                Ok(m) => m,
+                Err(_) => return serde_json::json!({ "error": format!("Cannot read `{name}`.") }),
+            };
+            if !meta.is_file() {
+                return serde_json::json!({ "error": format!("`{name}` is not a regular file.") });
+            }
+            if meta.len() > IMAGE_LIMIT {
+                return serde_json::json!({ "error": format!("`{name}` exceeds the 8 MiB limit.") });
+            }
+            let bytes = match std::fs::read(p) {
+                Ok(b) => b,
+                Err(_) => return serde_json::json!({ "error": format!("Cannot read `{name}`.") }),
+            };
+            let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+            if let Some(mime) = detect_image_mime(&name, &bytes) {
+                let (final_bytes, final_mime, send_path) = match mime {
+                    "image/png" | "image/jpeg" | "image/gif" | "image/webp" | "image/svg+xml" => {
+                        (bytes, mime, abs.display().to_string())
+                    }
+                    _ => match image::load_from_memory(&bytes) {
+                        Ok(img) => {
+                            let mut png = std::io::Cursor::new(Vec::new());
+                            if img.write_to(&mut png, image::ImageFormat::Png).is_ok() {
+                                let out = png.into_inner();
+                                if out.len() as u64 > IMAGE_LIMIT {
+                                    return serde_json::json!({ "error": format!("`{name}` exceeds the 8 MiB limit.") });
+                                }
+                                match write_preview_file(app_dir, "att", "png", &out) {
+                                    Ok((conv_abs, preview)) => {
+                                        return serde_json::json!({
+                                            "kind": "image",
+                                            "path": conv_abs.display().to_string(),
+                                            "preview": preview,
+                                            "name": name,
+                                            "mimeType": "image/png",
+                                            "bytes": out.len(),
+                                        });
+                                    }
+                                    Err(e) => return serde_json::json!({ "error": e }),
+                                }
+                            }
+                            (bytes, mime, abs.display().to_string())
+                        }
+                        Err(_) => (bytes, mime, abs.display().to_string()),
+                    },
+                };
+                let preview = write_preview_file(app_dir, "att", mime_ext(final_mime), &final_bytes)
+                    .ok()
+                    .map(|(_, rel)| rel);
+                serde_json::json!({
+                    "kind": "image",
+                    "path": send_path,
+                    "preview": preview,
+                    "name": name,
+                    "mimeType": final_mime,
+                    "bytes": final_bytes.len(),
+                })
+            } else {
+                let mime = detect_resource_mime(&name, &bytes);
+                serde_json::json!({
+                    "kind": "resource",
+                    "path": abs.display().to_string(),
+                    "name": name,
+                    "mimeType": mime,
+                    "bytes": bytes.len(),
+                })
+            }
+        })
+        .collect()
+}
 
 pub fn read_image_data_url(path: &Path) -> Result<Option<String>, String> {
     let file = match std::fs::File::open(path) {
@@ -233,6 +443,47 @@ mod tests {
         assert!(svg_url.starts_with("data:image/svg+xml;base64,"));
         assert_eq!(read_image_data_url(&root.join("missing.png")).unwrap(), None);
         assert!(encode_image_data_url("plain.bin", b"not-an-image").is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stages_clipboard_images_and_prepares_mixed_attachments() {
+        let root = crate::test_tmp().join(format!(
+            "herdr-app-att-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let app_dir = root.join("app");
+        let files_dir = root.join("files");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::create_dir_all(&files_dir).unwrap();
+
+        let png = [
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
+        ];
+        let pasted = stage_clipboard_image(&app_dir, &png).unwrap();
+        assert_eq!(pasted["kind"], "image");
+        assert_eq!(pasted["mimeType"], "image/png");
+        assert!(pasted["preview"].as_str().unwrap().starts_with("data/acp-attachments/clip-"));
+        assert!(Path::new(pasted["path"].as_str().unwrap()).is_file());
+
+        let img_file = files_dir.join("shot.png");
+        let md_file = files_dir.join("spec.md");
+        std::fs::write(&img_file, png).unwrap();
+        std::fs::write(&md_file, "# Spec\n").unwrap();
+
+        let prepared = prepare_attachments(&app_dir, &[img_file, md_file, files_dir.join("missing.png")]);
+        assert_eq!(prepared.len(), 3);
+        assert_eq!(prepared[0]["kind"], "image");
+        assert_eq!(prepared[0]["name"], "shot.png");
+        assert!(prepared[0]["preview"].as_str().unwrap().starts_with("data/acp-attachments/att-"));
+        assert_eq!(prepared[1]["kind"], "resource");
+        assert_eq!(prepared[1]["mimeType"], "text/markdown");
+        assert_eq!(prepared[1]["name"], "spec.md");
+        assert!(prepared[2]["error"].as_str().is_some());
 
         std::fs::remove_dir_all(root).unwrap();
     }

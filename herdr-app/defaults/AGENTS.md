@@ -569,7 +569,7 @@ Target IDs (`id`, `pane`, `space`, `terminal`) must be strings. Other non-null
 types are rejected before a current-target default applies; null means omitted.
 The main ones:
 
-- Spaces: `space.new {name?, folder?, tab?, argv?, task?, machine?, focus?}`
+- Spaces: `space.new {name?, folder?, tab?, argv?, task?, model?, effort?, machine?, focus?}`
   (machine: another machine from `hc machine ls`; omitted: the focused space's
   machine for keys and clicks, this computer for scripts; `""`: this computer.
   The space lives there, its
@@ -578,11 +578,11 @@ The main ones:
   `space.close {id?, confirmed?}`, `space.rename {id?, name}` ("": Herdr's name again),
   `space.move {id, index}`, `space.select {index | id}`, `space.next`, `space.prev`.
   With no `argv`, the target core chooses that machine's default shell (PowerShell 7 when available on Windows).
-- Tabs: `tab.new {name?, space?, folder?, argv?, task?, focus?}` (argv: an
-  agent to run, task: its first message). Agents run in your interactive
+- Tabs: `tab.new {name?, space?, folder?, argv?, task?, model?, effort?, focus?}` (argv: an
+  agent to run, task: its first message, model/effort: optional model and reasoning effort). Agents run in your interactive
   shell (including fish), which stays open after the agent exits. A terminal
   that exits with a nonzero code within two seconds of launch shows an error
-  toast with its exit code and last output lines. Or `tab.new {name?, space?, mod,
+  toast with its exit code and last output lines. Or `tab.new {name?, space?, folder?, acp: true, agent, task?, model?, effort?, focus?}` for an ACP agent tab, or `tab.new {name?, space?, mod,
   props?, focus?}` for a tab whose only pane is a mod (a file, a board; split a shell
   in beside it like any tab), `tab.close {id?, confirmed?}` (closing the last tab
   closes its space and asks first unless confirmed),
@@ -1119,6 +1119,8 @@ All of it is in `herdr.d.ts`. In short:
   rejects if the check fails (failed checks are not cached); start one with `argv: agent.run`.
   `pickFolder({ prompt })`: the system's folder picker (here only),
   resolves with the folder or null.
+  `pasteClipboardAttachments()`, `prepareAttachments(paths)`, `pickAttachments({ prompt, multiple })`:
+  prepare clipboard images, dropped files, or picked files as multimodal attachments (`{ kind, path, preview?, name, mimeType, bytes }`) for `h2 send --image` / `--resource`.
 - Files: `readTextFile(path, { on })` (here, or on that machine),
   `writeTextFile(path, text, expected)` (here only), and
   `watchFolder(dir)` (here only; poll a remote space's folder): resolves with the changed paths the next time anything

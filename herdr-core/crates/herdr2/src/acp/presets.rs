@@ -772,6 +772,50 @@ mod tests {
             ["bwrap", "--ro-bind", "/", "/", "--", "agy", "acp", "--dangerously-skip-permissions"]
         );
 
+        let mut mac_wrapped = vec![
+            "/usr/bin/sandbox-exec".into(),
+            "-p".into(),
+            "(version 1)(allow default)".into(),
+            "--".into(),
+            "agy".into(),
+            "acp".into(),
+        ];
+        assert!(is_agy_agent(None, &mac_wrapped));
+        ensure_agy_skip_permissions(&mut mac_wrapped);
+        assert_eq!(
+            mac_wrapped,
+            [
+                "/usr/bin/sandbox-exec",
+                "-p",
+                "(version 1)(allow default)",
+                "--",
+                "agy",
+                "acp",
+                "--dangerously-skip-permissions",
+            ]
+        );
+
+        let mut win_wrapped = vec![
+            r"C:\Users\dev\bin\herdr2.exe".into(),
+            "__drove-sandbox".into(),
+            "--".into(),
+            r"C:\Users\dev\AppData\Local\Programs\Antigravity\agy.exe".into(),
+            "acp".into(),
+        ];
+        assert!(is_agy_agent(None, &win_wrapped));
+        ensure_agy_skip_permissions(&mut win_wrapped);
+        assert_eq!(
+            win_wrapped,
+            [
+                r"C:\Users\dev\bin\herdr2.exe",
+                "__drove-sandbox",
+                "--",
+                r"C:\Users\dev\AppData\Local\Programs\Antigravity\agy.exe",
+                "acp",
+                "--dangerously-skip-permissions",
+            ]
+        );
+
         let mut non_agy = vec!["claude-agent-acp".into()];
         ensure_agy_skip_permissions(&mut non_agy);
         assert_eq!(non_agy, ["claude-agent-acp"]);

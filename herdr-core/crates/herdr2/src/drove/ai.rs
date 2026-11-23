@@ -33,6 +33,25 @@ pub struct WriteConflictVerdict {
     pub reason: String,
 }
 
+/// Resolves the prompt language (`"zh"` or `"en"`) for internal Drove AI operations:
+/// explicit per-request override > Core AI `language` (`ai.json`) > Drove `ai.language` (`drove.json`)
+/// > local desktop app `settings.json` (`herdr2-app/settings.json`) > `"en"`.
+pub(crate) fn drove_ai_lang(core: &Arc<Core>, explicit: Option<&str>) -> &'static str {
+    if let Some(raw) = explicit
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto") && !s.eq_ignore_ascii_case("default"))
+    {
+        return crate::ai::prompt_lang_code(raw);
+    }
+    if let Some(lang) = core.ai.config_snapshot().language.as_deref() {
+        return crate::ai::prompt_lang_code(lang);
+    }
+    if let Some(lang) = core.drove.config_snapshot().ai.language.as_deref() {
+        return crate::ai::prompt_lang_code(lang);
+    }
+    core.ai.preferred_prompt_lang()
+}
+
 fn build_run_seed_context(core: &Arc<Core>, run_id: &str) -> Option<String> {
     let run = core.drove.store.get_run(run_id)?;
     let cfg = core.drove.config_snapshot();
@@ -153,7 +172,8 @@ pub fn spawn_auto_title(core: Arc<Core>, run_id: String, objective: String) {
         return;
     }
     tokio::spawn(async move {
-        let user_prompt = format_op_user_message("auto_title", "en", &json!({ "objective": objective }));
+        let lang = drove_ai_lang(&core, None);
+        let user_prompt = format_op_user_message("auto_title", lang, &json!({ "objective": objective }));
         let Some(title) = drove_complete(
             &core,
             &run_id,
@@ -203,9 +223,10 @@ pub fn spawn_verify_digest(
     }
     tokio::spawn(async move {
         let compact_tail = strip_and_dedup_lines(&log_tail, 60, 220, 2400);
+        let lang = drove_ai_lang(&core, None);
         let user_prompt = format_op_user_message(
             "verify_digest",
-            "en",
+            lang,
             &json!({ "command": cmd_str, "tail": compact_tail }),
         );
         let seed = build_run_seed_context(&core, &run_id);
@@ -248,9 +269,10 @@ pub fn spawn_question_draft(
     }
     let auto_mode = matches!(cfg.ai.question_mode.as_str(), "auto" | "auto_when_offline");
     tokio::spawn(async move {
+        let lang = drove_ai_lang(&core, None);
         let user_prompt = format_op_user_message(
             "question_draft",
-            "en",
+            lang,
             &json!({
                 "question": question,
                 "options": options.unwrap_or_default(),
@@ -335,7 +357,8 @@ pub fn spawn_handover_compact(
         return;
     }
     tokio::spawn(async move {
-        let user_prompt = format_op_user_message("handover_compact", "en", &json!({ "summary": summary }));
+        let lang = drove_ai_lang(&core, None);
+        let user_prompt = format_op_user_message("handover_compact", lang, &json!({ "summary": summary }));
         let Some(compact) = drove_complete(
             &core,
             &run_id,
@@ -385,9 +408,10 @@ pub fn spawn_task_enrich(core: Arc<Core>, run_id: String, task_id: String) {
         {
             return;
         }
+        let lang = drove_ai_lang(&core, None);
         let user_prompt = format_op_user_message(
             "task_enrich",
-            "en",
+            lang,
             &json!({
                 "key": task.key,
                 "title": task.title,
@@ -452,7 +476,12 @@ pub fn spawn_task_enrich(core: Arc<Core>, run_id: String, task_id: String) {
 }
 
 /// Generates (or returns cached) structured AI failure diagnosis for `GET /api/tasks/:id/inspect?ai=1`.
-pub async fn generate_task_diagnosis(core: &Arc<Core>, diag: &mut Diagnosis, refresh: bool) {
+pub async fn generate_task_diagnosis(
+    core: &Arc<Core>,
+    diag: &mut Diagnosis,
+    refresh: bool,
+    language: Option<&str>,
+) {
     if !core.ai.is_configured() {
         return;
     }
@@ -478,9 +507,10 @@ pub async fn generate_task_diagnosis(core: &Arc<Core>, diag: &mut Diagnosis, ref
         .filter_map(|it| it.text.as_deref())
         .collect::<Vec<_>>()
         .join("\n---\n");
+    let lang = drove_ai_lang(core, language);
     let user_prompt = format_op_user_message(
         "task_diagnose",
-        "en",
+        lang,
         &json!({
             "task_key": diag.task.key,
             "title": diag.task.title,
@@ -577,9 +607,10 @@ pub async fn pick_role_candidate(
             })
         })
         .collect();
+    let lang = drove_ai_lang(core, None);
     let user_prompt = format_op_user_message(
         "route_candidate",
-        "en",
+        lang,
         &json!({
             "role": role_name,
             "task": {
@@ -685,9 +716,10 @@ pub async fn detect_semantic_loop(
     })
     .to_string();
 
+    let lang = drove_ai_lang(core, None);
     let user_prompt = format_op_user_message(
         "loop_detect",
-        "en",
+        lang,
         &json!({ "delta_items": compact_delta }),
     );
 
@@ -763,9 +795,10 @@ pub async fn assess_write_conflict(
         })
     };
     let peer_vals: Vec<Value> = peers.iter().map(|p| brief(p)).collect();
+    let lang = drove_ai_lang(core, None);
     let user_prompt = format_op_user_message(
         "write_conflict",
-        "en",
+        lang,
         &json!({
             "candidate": brief(candidate),
             "peers": peer_vals,
@@ -956,11 +989,13 @@ pub async fn configure_roles_with_ai(
         .collect();
 
     let instruction = params.instruction.as_deref().map(str::trim).unwrap_or("");
-    let prefer_zh = params
-        .language
-        .as_deref()
-        .map(|l| l.to_ascii_lowercase().starts_with("zh"))
-        .unwrap_or_else(|| instruction.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c)) || true);
+    let prefer_zh = match params.language.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(l) => crate::ai::prompt_lang_code(l) == "zh",
+        None => {
+            drove_ai_lang(core, None) == "zh"
+                || instruction.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c))
+        }
+    };
 
     let lang_rule = if prefer_zh {
         "Write `rationale` and any `strengths` tags in concise Simplified Chinese (2-6 chars per tag, e.g. \"复杂架构\", \"前端UI\", \"后端重构\", \"疑难排障\", \"快速修复\", \"单元测试\", \"安全审计\", \"源码调研\", \"长上下文\")."

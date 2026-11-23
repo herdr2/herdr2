@@ -197,6 +197,7 @@ impl EventLines {
                     t["pending_permission"] = Value::Null;
                     t["inbox_len"] = json!(0);
                     t["inbox"] = json!([]);
+                    t["paused_inbox"] = json!([]);
                 }
                 t.as_object_mut().map(|r| r.remove("foreground"));
             }
@@ -216,6 +217,9 @@ impl EventLines {
                         t["inbox"] = data["inbox"].clone();
                     } else if data["inbox_len"].as_u64() == Some(0) {
                         t["inbox"] = json!([]);
+                    }
+                    if let Some(paused) = data.get("paused_inbox") {
+                        t["paused_inbox"] = paused.clone();
                     }
                 }
             }
@@ -1122,5 +1126,46 @@ mod tests {
         assert_eq!(a["turn"], 4);
         assert_eq!(a["transcript_seq"], 4);
         assert_eq!(a["checkpoint_seq"], 3);
+    }
+
+    #[test]
+    fn paused_inbox_syncs_from_status_events_and_clears_on_finish() {
+        let mut lines = EventLines::new(&json!({
+            "seq": 1,
+            "terminals": [],
+            "agents": [{
+                "address": "a1",
+                "state": "live",
+                "status": {"state": "idle"},
+                "turn": 2,
+                "labels": {},
+                "paused_inbox": [{"id": 7, "text": "resume me", "queued_ms": 100}]
+            }],
+        }));
+        let ev = |seq: u64, kind: &str, agent: &str, data: Value| {
+            format!("{}\n", json!({"jsonrpc": "2.0", "method": "event", "params": {"seq": seq, "type": kind, "agent": agent, "data": data}}))
+        };
+        let hello = json!({"core": {"id": "local", "name": "local"}});
+        let machines = json!({"machines": []});
+
+        let a = &lines.live_for(&hello, &machines)["agents"][0];
+        assert_eq!(a["paused_inbox"].as_array().unwrap().len(), 1);
+        assert_eq!(a["paused_inbox"][0]["text"], "resume me");
+
+        lines.push(ev(2, "status", "a1", json!({
+            "status": {"state": "working"},
+            "records": {},
+            "reported": true,
+            "pending_permission": null,
+            "inbox_len": 1,
+            "inbox": [{"id": 8, "text": "resume me", "queued_ms": 100}],
+            "paused_inbox": []
+        })).as_bytes());
+        let a = &lines.live_for(&hello, &machines)["agents"][0];
+        assert_eq!(a["paused_inbox"].as_array().unwrap().len(), 0);
+        assert_eq!(a["inbox"].as_array().unwrap().len(), 1);
+
+        lines.push(ev(3, "finished", "a1", json!({"reason": "exited", "exit_code": 0, "signal": null, "finished_ms": 200})).as_bytes());
+        assert!(lines.live_for(&hello, &machines)["agents"].as_array().unwrap().is_empty());
     }
 }

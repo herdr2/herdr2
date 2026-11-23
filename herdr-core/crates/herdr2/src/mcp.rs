@@ -289,13 +289,18 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "h2_send",
-            "description": "Queue a prompt for an ACP agent (cannot target PTY terminals; terminal agents receive ACP results via h2 wait).",
+            "description": "Queue a text or multimodal prompt (images, resources, resource links) for an ACP agent (cannot target PTY terminals; terminal agents receive ACP results via h2 wait).",
             "inputSchema": {
                 "type": "object",
-                "required": ["agent", "text"],
+                "required": ["agent"],
                 "properties": {
                     "agent": { "type": "string" },
-                    "text": { "type": "string" },
+                    "text": { "type": "string", "description": "Prompt text (may be empty if content blocks are provided)" },
+                    "content": {
+                        "type": "array",
+                        "description": "Optional ACP multimodal content blocks (image, audio, resource, resource_link, text)",
+                        "items": { "type": "object" }
+                    },
                     "steer": { "type": "boolean" },
                     "wait": { "type": "boolean" },
                     "timeout": { "type": "number" }

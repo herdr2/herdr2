@@ -36,6 +36,10 @@ enum InboxCmd {
     Rm(InboxRemoveParams),
     /// Interrupt the active turn if needed and immediately send a queued prompt.
     Send(InboxSendParams),
+    /// Re-enqueue paused prompts preserved across a restart/reboot and resume delivery.
+    Resume(AgentParams),
+    /// Discard paused prompts preserved across a restart/reboot.
+    ClearPaused(AgentParams),
 }
 
 #[derive(Subcommand)]
@@ -123,6 +127,26 @@ enum AiCmd {
         /// Return deterministic fallback without calling Core AI.
         #[arg(long)]
         no_ai: bool,
+    },
+    /// Polish a rough user prompt into a clearer, more structured prompt for an ACP or CLI agent.
+    PolishPrompt {
+        /// Draft prompt text to polish.
+        prompt: String,
+        /// Optional target agent or terminal (`a1`, `t1`, name, or `machine/a1`).
+        #[arg(long)]
+        target: Option<String>,
+        /// Target agent kind (`acp` or `cli`).
+        #[arg(long)]
+        kind: Option<String>,
+        /// Optional extra context hint (workspace or task summary).
+        #[arg(long)]
+        context: Option<String>,
+        /// Preferred language (`zh-CN` / `en`).
+        #[arg(long)]
+        lang: Option<String>,
+        /// Target remote machine (`h2 machine ls`).
+        #[arg(long)]
+        on: Option<String>,
     },
 }
 
@@ -259,6 +283,12 @@ pub fn command_names() -> Vec<String> {
 pub fn main() -> i32 {
     let daemon = crate::platform::daemon_startup();
     client::remember_exe();
+    if !daemon {
+        let raw_args: Vec<_> = std::env::args_os().skip(1).collect();
+        if raw_args.first().and_then(|a| a.to_str()) == Some(crate::drove::sandbox::WINDOWS_SANDBOX_SUBCOMMAND) {
+            return crate::drove::sandbox::run_windows_sandbox_entry(&raw_args[1..]);
+        }
+    }
     if !daemon
         && let Some(arg0) = std::env::args_os().next()
         && let Some(stem) = std::path::Path::new(&arg0).file_stem().and_then(|s| s.to_str())
@@ -623,6 +653,27 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
                 let human = r["message"].as_str().unwrap_or("").to_string();
                 Out { json: r, human }
             }
+            AiCmd::PolishPrompt { prompt, target: raw_target, kind, context, lang, on } => {
+                let mut params = json!({ "prompt": prompt });
+                if let Some(t) = raw_target {
+                    params["target"] = json!(target(Some(t))?);
+                }
+                if let Some(k) = kind {
+                    params["agentKind"] = json!(k);
+                }
+                if let Some(c) = context {
+                    params["context"] = json!(c);
+                }
+                if let Some(l) = lang {
+                    params["language"] = json!(l);
+                }
+                if let Some(m) = on {
+                    params["on"] = json!(m);
+                }
+                let r = call("ai.polish_prompt", params)?;
+                let human = r["polished"].as_str().unwrap_or("").to_string();
+                Out { json: r, human }
+            }
         },
         Cmd::Checkpoint(p) => checkpoint::execute(&paths, p)?,
         Cmd::Wait(mut p) => {
@@ -635,6 +686,16 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             Out { json: r, human }
         }
         Cmd::Send(mut p) => {
+            if !p.images.is_empty() || !p.resources.is_empty() || !p.resource_links.is_empty() {
+                p.content = crate::acp::media::cli_files_to_content_blocks(&p.images, &p.resources, &p.resource_links)?;
+            }
+            if p.text.trim().is_empty() && p.content.is_empty() {
+                return Err(RpcError::new(
+                    "usage",
+                    "send requires <TEXT> or at least one --image / --resource / --resource-link",
+                    "example: h2 send a1 --image shot.png \"Inspect this error\"",
+                ));
+            }
             p.caller = Some(caller());
             let r = call("agent.send", to(&p))?;
             let started = match r["started"].as_bool() {
@@ -706,6 +767,25 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
                     "{}: sending queued message now (inbox: {})",
                     r["address"].as_str().unwrap_or("?"),
                     r["inbox_len"].as_u64().unwrap_or(0),
+                );
+                Out { json: r, human }
+            }
+            InboxCmd::Resume(mut p) => {
+                p.agent = pick(p.agent)?;
+                let r = call("agent.inbox_resume", to(&p))?;
+                let human = format!(
+                    "{}: resumed paused inbox (inbox: {})",
+                    r["address"].as_str().unwrap_or("?"),
+                    r["inbox_len"].as_u64().unwrap_or(0),
+                );
+                Out { json: r, human }
+            }
+            InboxCmd::ClearPaused(mut p) => {
+                p.agent = pick(p.agent)?;
+                let r = call("agent.inbox_clear_paused", to(&p))?;
+                let human = format!(
+                    "{}: cleared paused inbox",
+                    r["address"].as_str().unwrap_or("?"),
                 );
                 Out { json: r, human }
             }
@@ -1216,6 +1296,8 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("inbox edit", "agent.inbox_edit"),
     ("inbox rm", "agent.inbox_remove"),
     ("inbox send", "agent.inbox_send"),
+    ("inbox resume", "agent.inbox_resume"),
+    ("inbox clear-paused", "agent.inbox_clear_paused"),
     ("wait", "agent.wait"),
     ("interrupt", "agent.interrupt"),
     ("approve", "agent.approve"),
@@ -1256,6 +1338,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("ai briefing", "ai.briefing"),
     ("ai summarize-agent", "ai.summarize_agent"),
     ("ai commit-message", "ai.commit_message"),
+    ("ai polish-prompt", "ai.polish_prompt"),
     ("checkpoint ls", "checkpoint.list"),
     ("checkpoint snap", "checkpoint.capture"),
     ("checkpoint diff", "checkpoint.diff"),

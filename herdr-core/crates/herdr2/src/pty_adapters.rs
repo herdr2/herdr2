@@ -70,6 +70,15 @@ impl PtyCliKind {
         if kind != Self::Generic {
             return kind;
         }
+        // Fallback for PowerShell `-Command "& 'claude' ..."` wrappers (Windows herdr-app launches).
+        if let Some((_, ps_cli)) = extract_powershell_cli_argv(argv)
+            && let Some(first) = ps_cli.first()
+        {
+            let kind = Self::detect_cmd_token(first);
+            if kind != Self::Generic {
+                return kind;
+            }
+        }
         // Fallback for `sh -c "<inline command...>"` without separate `$@` arguments.
         if argv.len() == cmd_idx + 3
             && is_shell_stem(&exe_stem(&argv[cmd_idx]))
@@ -84,6 +93,80 @@ impl PtyCliKind {
         }
         Self::Generic
     }
+}
+
+fn powershell_quote(raw: &str) -> String {
+    format!("'{}'", raw.replace('\'', "''"))
+}
+
+/// Parses a single- or double-quoted PowerShell command string like `& 'claude' '--flag'`.
+fn parse_powershell_command_tokens(cmd: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut chars = cmd.trim().chars().peekable();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        if c == '\'' {
+            chars.next();
+            let mut tok = String::new();
+            while let Some(ch) = chars.next() {
+                if ch == '\'' {
+                    if chars.peek() == Some(&'\'') {
+                        chars.next();
+                        tok.push('\'');
+                    } else {
+                        break;
+                    }
+                } else {
+                    tok.push(ch);
+                }
+            }
+            tokens.push(tok);
+        } else if c == '"' {
+            chars.next();
+            let mut tok = String::new();
+            while let Some(ch) = chars.next() {
+                if ch == '\\' && chars.peek() == Some(&'"') {
+                    chars.next();
+                    tok.push('"');
+                } else if ch == '"' {
+                    break;
+                } else {
+                    tok.push(ch);
+                }
+            }
+            tokens.push(tok);
+        } else {
+            let mut tok = String::new();
+            while let Some(&ch) = chars.peek() {
+                if ch.is_whitespace() {
+                    break;
+                }
+                tok.push(ch);
+                chars.next();
+            }
+            tokens.push(tok);
+        }
+    }
+    if tokens.first().is_some_and(|t| t == "&") {
+        tokens.remove(0);
+    }
+    tokens
+}
+
+/// Extracts `(shell_exe, cli_argv)` from a PowerShell wrapper like
+/// `["pwsh", "-ExecutionPolicy", "Bypass", "-NoExit", "-Command", "& 'claude' '--flag'"]`.
+fn extract_powershell_cli_argv(argv: &[String]) -> Option<(String, Vec<String>)> {
+    let sh = argv.first()?;
+    if !matches!(exe_stem(sh).as_str(), "pwsh" | "powershell") {
+        return None;
+    }
+    let cmd_pos = argv.iter().position(|a| a.eq_ignore_ascii_case("-Command") || a.eq_ignore_ascii_case("-c"))?;
+    let cmd_str = argv.get(cmd_pos + 1)?;
+    let tokens = parse_powershell_command_tokens(cmd_str);
+    (!tokens.is_empty()).then(|| (sh.clone(), tokens))
 }
 
 fn is_shell_stem(stem: &str) -> bool {
@@ -131,8 +214,15 @@ fn wrap_cli_in_shell(shell: &str, cli_argv: Vec<String>) -> Vec<String> {
         return out;
     }
     if matches!(stem.as_str(), "pwsh" | "powershell") {
-        let joined = cli_argv.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ");
-        return vec![shell.to_string(), "-NoExit".into(), "-Command".into(), format!("& {joined}")];
+        let joined = cli_argv.iter().map(|a| powershell_quote(a)).collect::<Vec<_>>().join(" ");
+        return vec![
+            shell.to_string(),
+            "-ExecutionPolicy".into(),
+            "Bypass".into(),
+            "-NoExit".into(),
+            "-Command".into(),
+            format!("& {joined}"),
+        ];
     }
     let mut out = vec![shell.to_string(), "-lic".into(), "\"$@\"; exec \"$0\" -li".into(), shell.to_string()];
     out.extend(cli_argv);
@@ -806,11 +896,15 @@ fn build_direct_cli_argv(
             let mut i = 1usize;
             while i < orig_argv.len() {
                 let arg = &orig_argv[i];
-                if matches!(arg.as_str(), "--conversation" | "-c" | "--resume" | "-r") {
+                if matches!(arg.as_str(), "--conversation" | "--resume" | "-r" | "-i" | "--prompt-interactive") {
                     i += 2;
                     continue;
                 }
-                if arg.starts_with("--conversation=") || arg.starts_with("--resume=") {
+                if matches!(arg.as_str(), "-c" | "--continue")
+                    || arg.starts_with("--conversation=")
+                    || arg.starts_with("--resume=")
+                    || arg.starts_with("--prompt-interactive=")
+                {
                     i += 1;
                     continue;
                 }
@@ -820,6 +914,279 @@ fn build_direct_cli_argv(
             out
         }
         PtyCliKind::Generic => orig_argv.to_vec(),
+    }
+}
+
+/// Planned recovery command for a kept PTY terminal that was running a supported CLI agent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecoveredCliPlan {
+    pub argv: Vec<String>,
+    pub cli_argv: Vec<String>,
+    pub wrapper_shell: String,
+    pub resumed_existing: bool,
+    pub session_id: Option<String>,
+}
+
+/// Extracts a persisted `SavedCliResume` snapshot from a terminal's argv (unwrapping login-shell
+/// or PowerShell wrappers). Returns `None` for non-CLI / generic programs.
+pub fn extract_saved_cli_from_argv(
+    argv: &[String],
+    fallback_wrapper_shell: Option<&str>,
+    session_id: Option<String>,
+    transcript_path: Option<String>,
+) -> Option<crate::terminals::SavedCliResume> {
+    let (wrapper_shell, cli_argv) = if let Some((ps_shell, ps_cli)) = extract_powershell_cli_argv(argv) {
+        (Some(ps_shell), ps_cli)
+    } else if let Some(cmd_idx) = pty_command_offset(argv) {
+        let slice = argv[cmd_idx..].to_vec();
+        let wrapper = extract_wrapper_shell(argv).or_else(|| fallback_wrapper_shell.map(str::to_string));
+        (wrapper, slice)
+    } else {
+        return None;
+    };
+
+    if cli_argv.is_empty() {
+        return None;
+    }
+    let kind = PtyCliKind::detect(&cli_argv);
+    if kind == PtyCliKind::Generic {
+        return None;
+    }
+
+    let sid = session_id
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| match kind {
+            PtyCliKind::Claude => extract_flag_value(&cli_argv, &["--session-id", "--resume", "-r"]),
+            PtyCliKind::Codex => extract_codex_resume_id(&cli_argv),
+            PtyCliKind::Agy => extract_flag_value(&cli_argv, &["--conversation", "--resume", "-r"]),
+            PtyCliKind::Generic => None,
+        });
+
+    Some(crate::terminals::SavedCliResume {
+        kind: kind.as_str().to_string(),
+        session_id: sid,
+        transcript_path: transcript_path.filter(|p| !p.trim().is_empty()),
+        cli_argv,
+        wrapper_shell: wrapper_shell.filter(|s| !s.trim().is_empty()),
+    })
+}
+
+/// Returns the interactive or wrapper shell executable recorded in `argv`, if any.
+pub fn terminal_shell_executable(argv: &[String]) -> Option<String> {
+    extract_interactive_shell(argv)
+        .or_else(|| extract_wrapper_shell(argv))
+        .or_else(|| extract_powershell_cli_argv(argv).map(|(sh, _)| sh))
+}
+
+fn non_empty_file(path: &Path) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.is_file() && m.len() > 0)
+}
+
+/// Verifies that a saved CLI session has a real, non-empty transcript/rollout file on disk,
+/// returning the resolved session ID if safe to resume (avoiding `--resume` errors on 0-turn or deleted sessions).
+pub fn verify_cli_session_exists(
+    kind: PtyCliKind,
+    cwd: &str,
+    sid: Option<&str>,
+    transcript_path: Option<&str>,
+) -> Option<String> {
+    let clean_sid = sid.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(tp) = transcript_path.map(str::trim).filter(|s| !s.is_empty()) {
+        let p = Path::new(tp);
+        if non_empty_file(p) {
+            if let Some(s) = clean_sid {
+                return Some(s.to_string());
+            }
+            if let Some(inferred) = session_id_from_transcript(kind.as_str(), p) {
+                return Some(inferred);
+            }
+        }
+    }
+    let sid_str = clean_sid?;
+    let found = match kind {
+        PtyCliKind::Claude => find_claude_session_file(cwd, sid_str),
+        PtyCliKind::Codex => find_codex_rollout_by_sid(cwd, sid_str),
+        PtyCliKind::Agy => find_agy_transcript_by_cid(sid_str),
+        PtyCliKind::Generic => None,
+    };
+    found.filter(|p| non_empty_file(p)).map(|_| sid_str.to_string())
+}
+
+/// Builds the recovery command for a kept PTY terminal that was running a CLI agent before reboot/restart.
+///
+/// - When the saved session exists on disk, resumes it (`claude --resume <id>`, `codex resume <id>`, `agy --conversation <id>`).
+/// - When 0-turn / missing on disk, launches a clean fresh session with the original CLI flags.
+/// - Always wraps inside a login/interactive shell (`wrap_cli_in_shell`) so resume failures gracefully drop to a usable shell.
+pub fn build_recovery_argv(
+    saved: &crate::terminals::SavedCliResume,
+    cwd: &str,
+    default_shell: &[String],
+    hooks_dir: &Path,
+    h2_exe: &str,
+) -> Option<RecoveredCliPlan> {
+    let kind = PtyCliKind::from_str_name(&saved.kind);
+    if kind == PtyCliKind::Generic {
+        return None;
+    }
+    let resolved_sid = verify_cli_session_exists(
+        kind,
+        cwd,
+        saved.session_id.as_deref(),
+        saved.transcript_path.as_deref(),
+    );
+    let wrapper_shell = saved
+        .wrapper_shell
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| default_shell.first().map(String::as_str).filter(|s| !s.trim().is_empty()))
+        .unwrap_or("/bin/sh")
+        .to_string();
+
+    let (cli_argv, resumed_existing, final_sid) = match kind {
+        PtyCliKind::Claude => {
+            if let Some(sid) = resolved_sid {
+                let built = build_direct_cli_argv(PtyCliKind::Claude, &saved.cli_argv, hooks_dir, h2_exe, 1, Some(&sid));
+                (built, true, Some(sid))
+            } else {
+                let fresh_sid = random_uuid_v4();
+                let built = build_direct_cli_argv(PtyCliKind::Claude, &saved.cli_argv, hooks_dir, h2_exe, 0, Some(&fresh_sid));
+                (built, false, Some(fresh_sid))
+            }
+        }
+        PtyCliKind::Codex => {
+            if let Some(sid) = resolved_sid {
+                let built = build_direct_cli_argv(PtyCliKind::Codex, &saved.cli_argv, hooks_dir, h2_exe, 1, Some(&sid));
+                (built, true, Some(sid))
+            } else {
+                let built = build_direct_cli_argv(PtyCliKind::Codex, &saved.cli_argv, hooks_dir, h2_exe, 0, None);
+                (built, false, None)
+            }
+        }
+        PtyCliKind::Agy => {
+            let mut built = build_direct_cli_argv(PtyCliKind::Agy, &saved.cli_argv, hooks_dir, h2_exe, 0, None);
+            if let Some(cid) = resolved_sid {
+                built.push("--conversation".into());
+                built.push(cid.clone());
+                (built, true, Some(cid))
+            } else {
+                (built, false, None)
+            }
+        }
+        PtyCliKind::Generic => return None,
+    };
+
+    let argv = wrap_cli_in_shell(&wrapper_shell, cli_argv.clone());
+    Some(RecoveredCliPlan {
+        argv,
+        cli_argv,
+        wrapper_shell,
+        resumed_existing,
+        session_id: final_sid,
+    })
+}
+
+/// Discovers and pins the CLI session ID & transcript path for a live terminal running a supported
+/// CLI agent (e.g. manually launched `codex` / `claude` / `agy` inside a shell before any hook fires).
+pub async fn discover_and_bind_cli_session(core: &Arc<Core>, id: u32) {
+    let (addr, kind_str, cwd, started_ms, fg_pid, resumed, excluded) = {
+        let st = core.lock();
+        let Some(t) = st.pty_reg.terminals.get(&id).filter(|t| t.is_live()) else {
+            return;
+        };
+        let Some(ref saved) = t.saved_cli else {
+            return;
+        };
+        if saved.session_id.is_some() && saved.transcript_path.is_some() {
+            return;
+        }
+        let cwd = t
+            .foreground
+            .as_ref()
+            .map(|f| f.cwd.as_str())
+            .filter(|s| !s.is_empty())
+            .or(t.last_cwd.as_deref())
+            .unwrap_or(&t.cwd)
+            .to_string();
+        let fg_pid = t.foreground.as_ref().and_then(|f| u32::try_from(f.pid).ok());
+        let resumed = terminal_active_resume_argv(t).is_some();
+        let mut excluded = std::collections::HashSet::new();
+        for (other_id, other) in &st.pty_reg.terminals {
+            if *other_id != id && other.is_live() {
+                if let Some(s) = other.saved_cli.as_ref().and_then(|c| c.session_id.as_deref()) {
+                    excluded.insert(s.to_string());
+                }
+                if let Some(s) = st.checkpoints.get(&other.address).and_then(|c| c.cli_session_id.as_deref()) {
+                    excluded.insert(s.to_string());
+                }
+            }
+        }
+        for other_agent in st.reg.agents.values() {
+            if other_agent.is_live()
+                && let Some(s) = other_agent.acp_session_id.as_deref()
+            {
+                excluded.insert(s.to_string());
+            }
+        }
+        (
+            t.address.clone(),
+            saved.kind.clone(),
+            cwd,
+            t.program_started_ms.unwrap_or(t.created_ms),
+            fg_pid,
+            resumed,
+            excluded,
+        )
+    };
+
+    let kind_c = kind_str.clone();
+    let found = tokio::task::spawn_blocking(move || {
+        let path = discover_cli_transcript(&kind_c, &cwd, if resumed { 0 } else { started_ms }, fg_pid, resumed)?;
+        let sid = session_id_from_transcript(&kind_c, &path)?;
+        if excluded.contains(&sid) {
+            return None;
+        }
+        Some((sid, path.to_string_lossy().to_string()))
+    })
+    .await
+    .ok()
+    .flatten();
+
+    let Some((sid, tpath)) = found else {
+        return;
+    };
+
+    let mut st = core.lock();
+    let Some(t) = st.pty_reg.terminals.get_mut(&id).filter(|t| t.is_live()) else {
+        return;
+    };
+    let Some(saved) = t.saved_cli.as_mut() else {
+        return;
+    };
+    if saved.kind != kind_str {
+        return;
+    }
+    let mut changed = false;
+    if saved.session_id.is_none() {
+        saved.session_id = Some(sid.clone());
+        changed = true;
+    }
+    if saved.transcript_path.is_none() {
+        saved.transcript_path = Some(tpath.clone());
+        changed = true;
+    }
+    if changed {
+        let mut tc = core.target_checkpoints(&mut st, &addr);
+        if tc.cli_kind.is_none() || tc.cli_kind.as_deref() == Some("generic") {
+            tc.cli_kind = Some(kind_str);
+        }
+        if tc.cli_session_id.is_none() {
+            tc.cli_session_id = Some(sid);
+        }
+        if tc.cli_transcript_path.is_none() {
+            tc.cli_transcript_path = Some(tpath);
+        }
+        core.save_target_checkpoints(&mut st, tc);
+        core.save_pty_soon();
     }
 }
 
@@ -2648,10 +3015,14 @@ mod tests {
         assert_eq!(rebuilt_codex[5], "resume");
         assert_eq!(rebuilt_codex[6], "codex-sid");
 
-        // 3. Shell running `agy.real --conversation old` normalizes to `agy` without stale `--conversation`.
+        // 3. Shell running `agy.real --conversation old --prompt-interactive ...` normalizes to `agy` without stale resume or initial prompt flags.
         let fg_agy = vec![
             "/home/u/.local/bin/agy.real".into(),
             "--dangerously-skip-permissions".into(),
+            "--model".into(),
+            "gemini-4-carbon-high".into(),
+            "--prompt-interactive".into(),
+            "initial flash note".into(),
             "--conversation".into(),
             "old-conv".into(),
         ];
@@ -2659,7 +3030,9 @@ mod tests {
             build_rollback_argv_for_terminal(PtyCliKind::Agy, &orig_shell, Some(&fg_agy), &dir, "h2", 1, None);
         assert_eq!(rebuilt_agy[4], "agy");
         assert!(rebuilt_agy.iter().any(|a| a == "--dangerously-skip-permissions"), "{rebuilt_agy:?}");
+        assert!(rebuilt_agy.windows(2).any(|w| w == ["--model", "gemini-4-carbon-high"]), "{rebuilt_agy:?}");
         assert!(!rebuilt_agy.iter().any(|a| a == "--conversation" || a == "old-conv"), "{rebuilt_agy:?}");
+        assert!(!rebuilt_agy.iter().any(|a| a == "--prompt-interactive" || a == "initial flash note"), "{rebuilt_agy:?}");
 
         // 4. Shell running Generic CLI (e.g. `gemini`) re-launches it inside shell wrapper instead of bare zsh.
         let fg_gemini = vec!["gemini".into(), "--yolo".into()];
@@ -2803,6 +3176,122 @@ mod tests {
         assert!(!has_captured_session_turn(&existing, None, Some("anything")));
 
         drop(core);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn extract_and_build_recovery_argv_covers_claude_codex_agy_and_powershell() {
+        let root = crate::test_tmp().join(format!("h2-cli-rec-{}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&root).unwrap();
+        let hooks_dir = root.join("hooks");
+        let cwd = root.to_string_lossy().to_string();
+
+        // 1. POSIX wrapped Claude launch with existing non-empty transcript -> resumes with --resume
+        let claude_tpath = root.join("sid-claude-1.jsonl");
+        std::fs::write(&claude_tpath, "{\"type\":\"user\"}\n").unwrap();
+        let wrapped_claude = vec![
+            "/bin/zsh".into(),
+            "-lic".into(),
+            "\"$@\"; exec \"$0\" -li".into(),
+            "/bin/zsh".into(),
+            "claude".into(),
+            "--dangerously-skip-permissions".into(),
+            "--session-id".into(),
+            "sid-claude-1".into(),
+        ];
+        let saved = extract_saved_cli_from_argv(
+            &wrapped_claude,
+            None,
+            None,
+            Some(claude_tpath.to_string_lossy().to_string()),
+        )
+        .expect("should extract claude");
+        assert_eq!(saved.kind, "claude");
+        assert_eq!(saved.session_id.as_deref(), Some("sid-claude-1"));
+        assert_eq!(saved.wrapper_shell.as_deref(), Some("/bin/zsh"));
+
+        let plan = build_recovery_argv(&saved, &cwd, &["/bin/sh".into()], &hooks_dir, "/usr/bin/h2")
+            .expect("claude recovery plan");
+        assert!(plan.resumed_existing);
+        assert_eq!(plan.session_id.as_deref(), Some("sid-claude-1"));
+        assert!(plan.cli_argv.windows(2).any(|w| w == ["--resume", "sid-claude-1"]));
+        assert!(plan.cli_argv.iter().any(|a| a == "--dangerously-skip-permissions"));
+        assert!(plan.cli_argv.iter().any(|a| a == "--settings"));
+        assert_eq!(plan.argv.first().map(String::as_str), Some("/bin/zsh"));
+
+        // 2. Claude 0-turn / missing transcript -> clean fresh session with new --session-id (no --resume)
+        let missing_claude = crate::terminals::SavedCliResume {
+            transcript_path: Some(root.join("missing.jsonl").to_string_lossy().to_string()),
+            ..saved
+        };
+        let fresh_plan = build_recovery_argv(&missing_claude, &cwd, &["/bin/sh".into()], &hooks_dir, "/usr/bin/h2")
+            .expect("claude fresh fallback");
+        assert!(!fresh_plan.resumed_existing);
+        assert!(!fresh_plan.cli_argv.iter().any(|a| a == "--resume"));
+        assert!(fresh_plan.cli_argv.iter().any(|a| a == "--session-id"));
+        assert_ne!(fresh_plan.session_id.as_deref(), Some("sid-claude-1"));
+
+        // 3. Codex with existing non-empty rollout -> `codex resume <sid> ...`
+        let codex_tpath = root.join("rollout-codex.jsonl");
+        std::fs::write(&codex_tpath, "{\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-sid-9\"}}\n").unwrap();
+        let saved_codex = crate::terminals::SavedCliResume {
+            kind: "codex".into(),
+            session_id: Some("codex-sid-9".into()),
+            transcript_path: Some(codex_tpath.to_string_lossy().to_string()),
+            cli_argv: vec!["codex".into(), "--dangerously-bypass-approvals-and-sandbox".into()],
+            wrapper_shell: Some("/bin/bash".into()),
+        };
+        let codex_plan = build_recovery_argv(&saved_codex, &cwd, &["/bin/sh".into()], &hooks_dir, "/usr/bin/h2")
+            .expect("codex recovery plan");
+        assert!(codex_plan.resumed_existing);
+        assert_eq!(&codex_plan.cli_argv[..3], ["codex", "resume", "codex-sid-9"]);
+        assert!(codex_plan.cli_argv.iter().any(|a| a == "--no-daemon"));
+
+        // 4. Agy with existing non-empty transcript -> `agy ... --conversation <cid>`
+        let agy_tpath = root.join("agy-log.jsonl");
+        std::fs::write(&agy_tpath, "{\"turn\":1}\n").unwrap();
+        let saved_agy = crate::terminals::SavedCliResume {
+            kind: "agy".into(),
+            session_id: Some("conv-xyz".into()),
+            transcript_path: Some(agy_tpath.to_string_lossy().to_string()),
+            cli_argv: vec!["agy".into(), "--dangerously-skip-permissions".into()],
+            wrapper_shell: Some("/bin/zsh".into()),
+        };
+        let agy_plan = build_recovery_argv(&saved_agy, &cwd, &["/bin/sh".into()], &hooks_dir, "/usr/bin/h2")
+            .expect("agy recovery plan");
+        assert!(agy_plan.resumed_existing);
+        assert!(agy_plan.cli_argv.windows(2).any(|w| w == ["--conversation", "conv-xyz"]));
+        assert!(agy_plan.cli_argv.iter().any(|a| a == "--dangerously-skip-permissions"));
+
+        // 5. Windows PowerShell wrapper extraction & reconstruction preserves ExecutionPolicy Bypass
+        let ps_argv = vec![
+            "pwsh.exe".into(),
+            "-ExecutionPolicy".into(),
+            "Bypass".into(),
+            "-NoExit".into(),
+            "-Command".into(),
+            "& 'claude' '--dangerously-skip-permissions'".into(),
+        ];
+        assert_eq!(PtyCliKind::detect(&ps_argv), PtyCliKind::Claude);
+        let ps_saved = extract_saved_cli_from_argv(
+            &ps_argv,
+            None,
+            Some("sid-claude-1".into()),
+            Some(claude_tpath.to_string_lossy().to_string()),
+        )
+        .expect("extract powershell claude");
+        assert_eq!(ps_saved.wrapper_shell.as_deref(), Some("pwsh.exe"));
+        let ps_plan = build_recovery_argv(&ps_saved, &cwd, &["pwsh.exe".into()], &hooks_dir, "h2.exe")
+            .expect("powershell recovery plan");
+        assert!(ps_plan.resumed_existing);
+        assert_eq!(ps_plan.argv[0], "pwsh.exe");
+        assert!(ps_plan.argv.windows(2).any(|w| w == ["-ExecutionPolicy", "Bypass"]));
+        assert!(ps_plan.argv.last().unwrap().contains("'--resume' 'sid-claude-1'"));
+
+        // 6. Plain shell / non-CLI returns None
+        assert!(extract_saved_cli_from_argv(&["/bin/zsh".into(), "-li".into()], None, None, None).is_none());
+        assert!(extract_saved_cli_from_argv(&["vim".into(), "foo.rs".into()], None, None, None).is_none());
+
         let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -19,7 +19,7 @@ Mods can add their own actions, which are not listed here.
 
 ## `space.new`
 
-Make a space: its name (default: none, so it's called after where its first terminal is), the folder its terminals start in (default: the focused terminal's), its first tab's name (default: none, so it's called by its number), optionally an agent (argv) and its first message (task), and the machine it lives on (`h2 machine ls`; default the focused space's machine for keys and clicks, this computer for scripts; empty string: this computer; its terminals start in that machine's home unless folder). It is shown at once; focus false keeps the shown space and tab (with no space shown, the new space is shown).
+Make a space: its name (default: none, so it's called after where its first terminal is), the folder its terminals start in (default: the focused terminal's), its first tab's name (default: none, so it's called by its number), optionally an agent (argv), model, reasoning effort, and its first message (task), and the machine it lives on (`h2 machine ls`; default the focused space's machine for keys and clicks, this computer for scripts; empty string: this computer; its terminals start in that machine's home unless folder). It is shown at once; focus false keeps the shown space and tab (with no space shown, the new space is shown).
 
 | Argument | Required |
 |---|---|
@@ -28,6 +28,8 @@ Make a space: its name (default: none, so it's called after where its first term
 | `tab` | no |
 | `argv` | no |
 | `task` | no |
+| `model` | no |
+| `effort` | no |
 | `machine` | no |
 | `shell` | no |
 | `focus` | no |
@@ -61,7 +63,7 @@ Move a space to a position (1 = first).
 
 ## `tab.new`
 
-Make a tab in a space (default: the selected one; name default: none, so it's called by its number) with a terminal in folder (default: the focused terminal's), optionally an agent (argv) and its first message (task); or with a mod as its only pane (`mod`, its `props`: a file, a board); or an ACP agent (`acp: true`, `agent`). It is shown at once; focus false adds it last in its space and keeps the shown space and the target space's selected tab. With no space open, a person's new tab starts a space (as space.new).
+Make a tab in a space (default: the selected one; name default: none, so it's called by its number) with a terminal in folder (default: the focused terminal's), optionally an agent (argv), model, reasoning effort, and its first message (task); or with a mod as its only pane (`mod`, its `props`: a file, a board); or an ACP agent (`acp: true`, `agent`, optional `model` and `effort`). It is shown at once; focus false adds it last in its space and keeps the shown space and the target space's selected tab. With no space open, a person's new tab starts a space (as space.new).
 
 | Argument | Required |
 |---|---|
@@ -70,6 +72,8 @@ Make a tab in a space (default: the selected one; name default: none, so it's ca
 | `folder` | no |
 | `argv` | no |
 | `task` | no |
+| `model` | no |
+| `effort` | no |
 | `mod` | no |
 | `props` | no |
 | `acp` | no |
@@ -450,6 +454,14 @@ Set an agent's status manually ("idle", "working", "blocked", "done"), or "auto"
 | `status` | yes |
 | `terminal` | no |
 
+## `agent.briefing`
+
+Open the Catch-up Briefing overlay summarizing critical blockers, batchable permission approvals, and completed agents.
+
+| Argument | Required |
+|---|---|
+| `away_minutes` | no |
+
 ## `agent.handoff`
 
 Hand off, fork (optionally in an isolated git worktree), open a floating side-chat, or merge context from an agent or CLI session into a new or existing session (opens the Handoff dialog when neither preset nor into is given).
@@ -473,6 +485,18 @@ Hand off, fork (optionally in an isolated git worktree), open a floating side-ch
 | `archive_source` | no |
 | `close_overlay` | no |
 | `open` | no |
+
+## `agent.send`
+
+Send a message to a live ACP agent or CLI terminal (default target: focused or active session).
+
+| Argument | Required |
+|---|---|
+| `agent` | no |
+| `terminal` | no |
+| `text` | yes |
+| `steer` | no |
+| `focus` | no |
 
 ## `agent.send_review`
 
@@ -594,6 +618,18 @@ Toggle a mod as the overlay its mod.json describes; calling again closes it.
 | Argument | Required |
 |---|---|
 | `name` | yes |
+
+## `files.open`
+
+Open a file in the Files panel (works for workspace and external paths), optionally jumping to a line.
+
+| Argument | Required |
+|---|---|
+| `path` | yes |
+| `line` | no |
+| `end_line` | no |
+| `on` | no |
+| `cwd` | no |
 
 ## `overlay.close`
 

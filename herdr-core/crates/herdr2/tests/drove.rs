@@ -2518,3 +2518,169 @@ fn core_ai_cli_and_worktree_preflight_guard() {
     assert_eq!(bj["error"], "worktree_not_ready");
     assert!(bj["message"].as_str().unwrap_or("").contains("Git"));
 }
+
+#[test]
+fn drove_internal_ai_respects_user_configured_language() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mock_port = listener.local_addr().unwrap().port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_srv = stop.clone();
+    let captured: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let cap_srv = captured.clone();
+
+    let srv = std::thread::spawn(move || {
+        while !stop_srv.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut conn, _)) => {
+                    let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut raw = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match conn.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                raw.extend_from_slice(&buf[..n]);
+                                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    let head = String::from_utf8_lossy(&raw[..pos]);
+                                    let cl = head
+                                        .lines()
+                                        .find_map(|l| {
+                                            let (k, v) = l.split_once(':')?;
+                                            k.eq_ignore_ascii_case("content-length")
+                                                .then(|| v.trim().parse::<usize>().ok())
+                                                .flatten()
+                                        })
+                                        .unwrap_or(0);
+                                    if raw.len() >= pos + 4 + cl {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&raw).into_owned();
+                    let first_line = req.lines().next().unwrap_or("");
+                    let body = if first_line.starts_with("GET /v1/models") {
+                        json!({"data":[{"id":"mock-lang-model"}]}).to_string()
+                    } else if first_line.starts_with("POST /v1/chat/completions") {
+                        let req_body = req.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+                        cap_srv.lock().unwrap().push(req_body.to_string());
+                        let content = if req_body.contains(r#"\"lang\":\"zh\""#) || req_body.contains(r#""lang":"zh""#) {
+                            "中文自动标题"
+                        } else {
+                            "English Auto Title"
+                        };
+                        json!({
+                            "id": "chatcmpl-lang",
+                            "choices": [{"message": {"role": "assistant", "content": content}}]
+                        })
+                        .to_string()
+                    } else {
+                        r#"{"error":"not_found"}"#.to_string()
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = conn.write_all(resp.as_bytes());
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let s = drove_session();
+    let (port, key_file) = wait_web_port(&s);
+    let coord_sec = read_coordinator_secret(&key_file);
+    let web_tok = read_web_token(port);
+
+    // Configure local Core AI pointing to our mock server with language = zh-CN.
+    let cfg_file = s.root.join("ai-cfg.json");
+    std::fs::write(
+        &cfg_file,
+        serde_json::to_vec(&json!({
+            "enabled": true,
+            "baseUrl": format!("http://127.0.0.1:{mock_port}/v1"),
+            "model": "mock-lang-model",
+            "language": "zh-CN"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let st = s.json(&["ai", "settings-set", "--file", cfg_file.to_str().unwrap(), "--consume"]);
+    assert_eq!(st["language"], "zh-CN");
+
+    // 1. Creating a Run with zh-CN configured sends `"lang":"zh"` for auto_title.
+    let work_dir = s.root.join("lang_work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let auth_hdrs = [
+        ("x-drove-coordinator-secret", coord_sec.as_str()),
+        ("x-drove-coordinator", "t1"),
+    ];
+    let r1 = http_req(
+        port,
+        "POST",
+        "/api/runs",
+        &auth_hdrs,
+        Some(&json!({ "hostSession": "t1", "objective": "fix cache invalidation", "cwd": work_dir.to_string_lossy() })),
+    );
+    assert_eq!(r1.status, 200, "create run 1: {}", r1.body);
+    let run1 = serde_json::from_str::<Value>(&r1.body).unwrap()["id"].as_str().unwrap().to_string();
+
+    wait_until("run 1 gets Chinese auto title", || {
+        s.json(&["drove", "show", &run1])["run"]["name"] == "中文自动标题"
+    });
+    {
+        let reqs = captured.lock().unwrap();
+        assert!(!reqs.is_empty(), "expected at least one AI completion call");
+        assert!(
+            reqs[0].contains(r#"\"lang\":\"zh\""#),
+            "expected lang=zh in auto_title payload, got: {}",
+            reqs[0]
+        );
+    }
+
+    // 2. Switching language via Drove Web `PUT /api/ai/language` to "en" updates subsequent Drove AI calls.
+    let lang_resp = http_req(
+        port,
+        "PUT",
+        "/api/ai/language",
+        &[("x-drove-token", web_tok.as_str())],
+        Some(&json!({ "language": "en" })),
+    );
+    assert_eq!(lang_resp.status, 200, "PUT /api/ai/language failed: {}", lang_resp.body);
+    let lang_json: Value = serde_json::from_str(&lang_resp.body).unwrap();
+    assert_eq!(lang_json["language"], "en");
+
+    let r2 = http_req(
+        port,
+        "POST",
+        "/api/runs",
+        &auth_hdrs,
+        Some(&json!({ "hostSession": "t1", "objective": "add metrics dashboard", "cwd": work_dir.to_string_lossy() })),
+    );
+    assert_eq!(r2.status, 200, "create run 2: {}", r2.body);
+    let run2 = serde_json::from_str::<Value>(&r2.body).unwrap()["id"].as_str().unwrap().to_string();
+
+    wait_until("run 2 gets English auto title", || {
+        s.json(&["drove", "show", &run2])["run"]["name"] == "English Auto Title"
+    });
+    {
+        let reqs = captured.lock().unwrap();
+        assert!(reqs.len() >= 2, "expected second AI completion call");
+        assert!(
+            reqs.last().unwrap().contains(r#"\"lang\":\"en\""#),
+            "expected lang=en in second auto_title payload, got: {}",
+            reqs.last().unwrap()
+        );
+    }
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = srv.join();
+}

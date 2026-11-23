@@ -160,9 +160,10 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
     let spec_skip = p.dangerously_skip_permissions && mode.is_none();
     let mcp_exe = crate::client::exe_path().map(|exe| exe.display().to_string()).unwrap_or_else(|| "herdr2".into());
     let mut config_overrides = BTreeMap::new();
+    let is_agy = presets::is_agy_agent(resolved.preset.as_deref(), &resolved.argv);
     let is_cursor = matches!(resolved.preset.as_deref(), Some("cursor" | "cursor-agent"));
-    let cursor_has_effort = is_cursor && model.as_deref().is_some_and(crate::acp::model_has_embedded_effort);
-    if !cursor_has_effort
+    let model_has_effort = (is_cursor || is_agy) && model.as_deref().is_some_and(crate::acp::model_has_embedded_effort);
+    if !model_has_effort
         && let Some(eff) = p.effort.as_deref().map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("default"))
     {
         config_overrides.insert("reasoning_effort".into(), serde_json::Value::String(eff.to_string()));
@@ -175,6 +176,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         resume_session_id: None,
         can_load_session: false,
         system_prompt,
+        fallback_handoff_context: None,
         model,
         mode,
         dangerously_skip_permissions: spec_skip,
@@ -201,6 +203,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
                         let agent_info = started.agent_info.clone();
                         let acp_sid = started.session_id.clone();
                         let can_load = started.can_load_session;
+                        let prompt_caps = started.prompt_capabilities;
                         let config_options = started.config_options.clone();
                         let context_usage = started.context_usage;
                         let handle = acp::spawn_actor(core_bg.clone(), id, started);
@@ -211,6 +214,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
                         a.pid = pid;
                         a.acp_session_id = Some(acp_sid);
                         a.can_load_session = can_load;
+                        a.prompt_capabilities = Some(prompt_caps);
                         a.config_options = config_options;
                         if let Some(usage) = context_usage {
                             a.context_usage = Some(usage);
@@ -299,6 +303,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         let agent_info = started.agent_info.clone();
         let acp_sid = started.session_id.clone();
         let can_load = started.can_load_session;
+        let prompt_caps = started.prompt_capabilities;
         let config_options = started.config_options.clone();
         let handle = acp::spawn_actor(core.core.clone(), id, started);
         let pid = handle.transport.pid();
@@ -307,6 +312,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         a.pid = pid;
         a.acp_session_id = Some(acp_sid);
         a.can_load_session = can_load;
+        a.prompt_capabilities = Some(prompt_caps);
         a.config_options = config_options;
         acp::sync_config_to_agent(a);
         if agent_info.is_some() {
@@ -505,9 +511,24 @@ pub(crate) async fn spawn_drove_agent(
     let base_env = crate::platform::program_env().await;
     let mut env = child_env(base_env, req.env);
     if let Some(bdir) = bin_dir {
-        let old = env.get("PATH").cloned().unwrap_or_default();
-        let combined = if old.is_empty() { bdir } else { format!("{bdir}:{old}") };
-        env.insert("PATH".into(), combined);
+        let path_key = env
+            .keys()
+            .find(|k| k.eq_ignore_ascii_case("PATH"))
+            .cloned()
+            .unwrap_or_else(|| "PATH".into());
+        let old = env.get(&path_key).cloned().unwrap_or_default();
+        let mut dirs: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(&bdir)];
+        if !old.is_empty() {
+            dirs.extend(std::env::split_paths(&old));
+        }
+        let combined = std::env::join_paths(&dirs)
+            .ok()
+            .and_then(|s| s.into_string().ok())
+            .unwrap_or_else(|| {
+                let sep = if cfg!(windows) { ';' } else { ':' };
+                if old.is_empty() { bdir } else { format!("{bdir}{sep}{old}") }
+            });
+        env.insert(path_key, combined);
     }
     if let Some((_, effective_argv)) =
         presets::resolve_acp_command_in_env(resolved.preset.as_deref(), &resolved.argv, &env)
@@ -591,6 +612,7 @@ pub(crate) async fn spawn_drove_agent(
         resume_session_id: None,
         can_load_session: false,
         system_prompt: None,
+        fallback_handoff_context: None,
         model: req.model,
         mode: None,
         dangerously_skip_permissions: true,
@@ -621,6 +643,7 @@ pub(crate) async fn spawn_drove_agent(
         let agent_info = started.agent_info.clone();
         let acp_sid = started.session_id.clone();
         let can_load = started.can_load_session;
+        let prompt_caps = started.prompt_capabilities;
         let config_options = started.config_options.clone();
         let handle = acp::spawn_actor(core.clone(), id, started);
         let pid = handle.transport.pid();
@@ -629,6 +652,7 @@ pub(crate) async fn spawn_drove_agent(
         a.pid = pid;
         a.acp_session_id = Some(acp_sid);
         a.can_load_session = can_load;
+        a.prompt_capabilities = Some(prompt_caps);
         a.config_options = config_options;
         acp::sync_config_to_agent(a);
         if agent_info.is_some() {

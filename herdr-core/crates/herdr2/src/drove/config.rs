@@ -261,6 +261,9 @@ pub fn validate_config(cfg: &mut DroveConfig) -> Result<(), RpcError> {
             return Err(RpcError::invalid_params("ai.maxTokens must be between 64 and 131072"));
         }
     }
+    if let Some(lang) = cfg.ai.language.take() {
+        cfg.ai.language = crate::ai::normalize_ai_language(&lang)?;
+    }
     cfg.ai.conflict_policy = cfg.ai.conflict_policy.trim().to_string();
     cfg.ai.question_mode = cfg.ai.question_mode.trim().to_string();
     cfg.ai.loop_detect = cfg.ai.loop_detect.trim().to_string();

@@ -246,8 +246,12 @@ impl Core {
                 if let Some(a) = st.reg.agents.get_mut(&id) {
                     a.pid = None;
                     a.pending_permission = None;
+                    for item in a.inbox.drain(..) {
+                        if !a.paused_inbox.iter().any(|existing| existing.id == item.id) {
+                            a.paused_inbox.push(item);
+                        }
+                    }
                     a.inbox_len = 0;
-                    a.inbox.clear();
                     if a.reason.is_none() {
                         a.reason = Some("stopped_by_restart".into());
                     }
@@ -360,6 +364,7 @@ impl Core {
                 id: p.id,
                 text: p.text.clone(),
                 from: p.from.clone(),
+                attachments: p.attachments.clone(),
                 queued_ms: p.queued_ms,
             })
             .collect();
@@ -378,6 +383,7 @@ impl Core {
                     "pending_permission": a.pending_permission,
                     "inbox_len": a.inbox_len,
                     "inbox": a.inbox,
+                    "paused_inbox": a.paused_inbox,
                 })
             })
         };
@@ -833,8 +839,6 @@ impl Core {
         if let Some(a) = st.reg.agents.get_mut(&id) {
             a.first_task_turn = None;
             a.pending_permission = None;
-            a.inbox_len = 0;
-            a.inbox.clear();
             let change = crate::status::reset(a);
             self.status_changed(st, id, change);
         }
@@ -1092,6 +1096,45 @@ impl Core {
             let _ = crate::paths::write_atomic(&path, &bytes);
         }
         let _ = self.archive_cli_session_checkpoints(&tc);
+        if let Some(TargetKey::Terminal(id)) = TargetKey::parse(&addr)
+            && let Some(kind_str) = tc.cli_kind.as_deref().filter(|k| !k.is_empty() && *k != "generic")
+            && let Some(t) = st.pty_reg.terminals.get_mut(&id)
+            && t.is_live()
+            && !crate::foreground::is_at_shell_root(t)
+        {
+            let mut changed = false;
+            if let Some(ref mut saved) = t.saved_cli {
+                if saved.kind == kind_str {
+                    if let Some(ref sid) = tc.cli_session_id
+                        && saved.session_id.as_deref() != Some(sid.as_str())
+                    {
+                        saved.session_id = Some(sid.clone());
+                        changed = true;
+                    }
+                    if let Some(ref tp) = tc.cli_transcript_path
+                        && saved.transcript_path.as_deref() != Some(tp.as_str())
+                    {
+                        saved.transcript_path = Some(tp.clone());
+                        changed = true;
+                    }
+                }
+            } else if let Some(mut extracted) = crate::pty_adapters::extract_saved_cli_from_argv(
+                t.foreground
+                    .as_ref()
+                    .filter(|f| !f.argv.is_empty())
+                    .map_or(&t.argv, |f| &f.argv),
+                crate::pty_adapters::terminal_shell_executable(&t.argv).as_deref(),
+                tc.cli_session_id.clone(),
+                tc.cli_transcript_path.clone(),
+            ) {
+                extracted.kind = kind_str.to_string();
+                t.saved_cli = Some(extracted);
+                changed = true;
+            }
+            if changed {
+                self.save_pty_soon();
+            }
+        }
         st.checkpoints.insert(addr, std::mem::take(&mut tc));
     }
 
