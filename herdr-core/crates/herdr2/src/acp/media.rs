@@ -37,17 +37,12 @@ fn decode_checked(raw: &str, label: &str) -> Result<Vec<u8>, RpcError> {
         return Err(RpcError::invalid_params(format!("{label} data cannot be empty")));
     }
     if clean.len() / 4 * 3 > put::MAX_BYTES + 3 {
-        return Err(RpcError::invalid_params(format!(
-            "{label} exceeds {} MB limit",
-            put::MAX_BYTES >> 20
-        )));
+        return Err(RpcError::invalid_params(format!("{label} exceeds {} MB limit", put::MAX_BYTES >> 20)));
     }
-    let bytes = put::decode(&clean).ok_or_else(|| RpcError::invalid_params(format!("{label} data is not valid base64")))?;
+    let bytes =
+        put::decode(&clean).ok_or_else(|| RpcError::invalid_params(format!("{label} data is not valid base64")))?;
     if bytes.len() > put::MAX_BYTES {
-        return Err(RpcError::invalid_params(format!(
-            "{label} exceeds {} MB limit",
-            put::MAX_BYTES >> 20
-        )));
+        return Err(RpcError::invalid_params(format!("{label} exceeds {} MB limit", put::MAX_BYTES >> 20)));
     }
     Ok(bytes)
 }
@@ -60,9 +55,7 @@ pub fn stage_prompt_content(
     blocks: &[ContentBlock],
 ) -> Result<(Vec<String>, Vec<Attachment>), RpcError> {
     if blocks.len() > MAX_BLOCKS_PER_PROMPT {
-        return Err(RpcError::invalid_params(format!(
-            "at most {MAX_BLOCKS_PER_PROMPT} content blocks per prompt"
-        )));
+        return Err(RpcError::invalid_params(format!("at most {MAX_BLOCKS_PER_PROMPT} content blocks per prompt")));
     }
     let mut extra_texts = Vec::new();
     let mut attachments = Vec::new();
@@ -359,11 +352,8 @@ pub fn materialize_prompt_blocks(
             .or_else(|| att.uri.as_deref().and_then(name_from_uri))
             .or_else(|| att.path.as_deref().and_then(name_from_uri))
             .unwrap_or_else(|| att.kind.clone());
-        let link_uri = att
-            .uri
-            .clone()
-            .or_else(|| att.path.as_deref().map(file_uri_from_path))
-            .unwrap_or_else(|| name.clone());
+        let link_uri =
+            att.uri.clone().or_else(|| att.path.as_deref().map(file_uri_from_path)).unwrap_or_else(|| name.clone());
 
         match att.kind.as_str() {
             "image" if !force_downgrade && caps.image => {
@@ -510,9 +500,7 @@ pub fn cli_files_to_content_blocks(
 ) -> Result<Vec<ContentBlock>, RpcError> {
     let total = images.len() + resources.len() + resource_links.len();
     if total > MAX_BLOCKS_PER_PROMPT {
-        return Err(RpcError::invalid_params(format!(
-            "at most {MAX_BLOCKS_PER_PROMPT} attachments per send"
-        )));
+        return Err(RpcError::invalid_params(format!("at most {MAX_BLOCKS_PER_PROMPT} attachments per send")));
     }
     let mut blocks = Vec::with_capacity(total);
     for raw_path in images {
@@ -551,9 +539,8 @@ pub fn cli_files_to_content_blocks(
         let abs = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
         let uri = file_uri_from_path(&abs.display().to_string());
         let mime = detect_mime_type(raw_path, &bytes).map(String::from);
-        let is_text = bytes.len() <= MAX_TEXT_RESOURCE_BYTES
-            && !bytes.contains(&0)
-            && std::str::from_utf8(&bytes).is_ok();
+        let is_text =
+            bytes.len() <= MAX_TEXT_RESOURCE_BYTES && !bytes.contains(&0) && std::str::from_utf8(&bytes).is_ok();
         let resource = if is_text {
             EmbeddedResourceContent::Text {
                 uri,

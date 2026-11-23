@@ -2,10 +2,35 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { panes, terminals, props, run, openOverlay, home, theme, settings } from "herdr";
+import { panes, terminals, props, run, openOverlay, home, theme, settings, shared, keys, window as appWindow } from "herdr";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
+
+function shortcutFor(action) {
+  if (typeof keys !== "function" || !action) return "";
+  const list = keys();
+  if (!Array.isArray(list)) return "";
+  const k = list.find((b) => b.section === "global" && b.action === action);
+  if (!k?.keys?.trim()) return "";
+  const mac = typeof appWindow === "function" && appWindow()?.platform === "macos";
+  const names = mac ? { ctrl: "⌃", alt: "⌥", shift: "⇧", cmd: "⌘", fn: "fn" } : { ctrl: "Ctrl", alt: "Alt", shift: "Shift", cmd: "Super", fn: "Fn" };
+  const alias = { secondary: mac ? "cmd" : "ctrl", super: "cmd", win: "cmd" };
+  return k.keys.trim().split(/\s+/).map((stroke) => {
+    const parts = stroke.split("-");
+    let key = parts.pop();
+    if (key === "") { key = "-"; parts.pop(); }
+    const held = new Set(parts.map((m) => alias[m.toLowerCase()] ?? m.toLowerCase()));
+    if (/^[A-Z]$/.test(key)) held.add("shift");
+    const label = key.length === 1 ? key.toUpperCase() : key[0].toUpperCase() + key.slice(1).toLowerCase();
+    return [...Object.keys(names).filter((m) => held.has(m)).map((m) => names[m]), label].join(mac ? "" : "+");
+  }).join(" ");
+}
+
+function withShortcut(text, action) {
+  const sc = shortcutFor(action);
+  return sc ? `${text} (${sc})` : text;
+}
 
 function formatElapsed(ms) {
   const totalSec = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
@@ -251,46 +276,69 @@ export default class TerminalsPane extends View {
         ),
       )
       .child(div().flex_1().truncate().text_color("#8b8f95").child(dir))
-      .when(showHandoffBtns, (el) =>
-        el.child(
-          h_flex()
-            .id(`tm-polish-${pane}`)
-            .flex_none()
-            .h(20)
-            .px(6)
-            .gap(4)
-            .items_center()
-            .rounded(5)
-            .bg(alpha("#a855f7", "22") ?? "#252628")
-            .border_1()
-            .border_color(alpha("#a855f7", "66") ?? "#383b40")
-            .text_size(11)
-            .font_medium()
-            .text_color("#c084fc")
-            .cursor_pointer()
-            .hover((s) => s.bg(alpha("#a855f7", "33") ?? "#303338"))
-            .tooltip(tr("Compose & polish prompt with Core AI before sending to CLI agent", "输入并由 Core AI 润色提示词后发送给 CLI Agent"))
-            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-            .on_click((_e, cx) => {
-              cx.stop_propagation();
-              openOverlay({
-                mod: "prompt",
-                kind: "modal",
-                width: 580,
-                height: 390,
-                props: {
-                  mode: "polish",
-                  terminal: p.terminal,
-                  agentName: p.program?.name || p.title || p.terminal,
-                  agentKind: "cli",
-                  cwd: p.cwd || "",
-                },
-              });
-            })
-            .child(svg("mods/peek/sparkles.svg").size(11).flex_none().text_color("#c084fc"))
-            .child(tr("Polish", "润色输入")),
-        ),
-      )
+      .when(showHandoffBtns, (el) => {
+        const isPolishing = shared("polish.active") === p.terminal;
+        const polishUndoMap = shared("polish.undo");
+        const canUndoPolish = !isPolishing && Boolean(polishUndoMap && typeof polishUndoMap === "object" && polishUndoMap[p.terminal]);
+        return el
+          .child(
+            h_flex()
+              .id(`tm-polish-${pane}`)
+              .flex_none()
+              .h(20)
+              .px(6)
+              .gap(4)
+              .items_center()
+              .rounded(5)
+              .bg(alpha("#a855f7", isPolishing ? "38" : "22") ?? "#252628")
+              .border_1()
+              .border_color(alpha("#a855f7", isPolishing ? "99" : "66") ?? "#383b40")
+              .text_size(11)
+              .font_medium()
+              .text_color("#c084fc")
+              .cursor_pointer()
+              .hover((s) => s.bg(alpha("#a855f7", "33") ?? "#303338"))
+              .tooltip(withShortcut(tr("Polish current CLI input in-place with Core AI", "使用 Core AI 直接润色当前 CLI Agent 中的输入"), "prompt.polish"))
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+              .on_click((_e, cx) => {
+                cx.stop_propagation();
+                if (!isPolishing) run("prompt.polish", { terminal: p.terminal });
+              })
+              .child(
+                isPolishing
+                  ? svg("mods/workspace-chrome/spinner.svg").size(11).flex_none().spin(900).text_color("#c084fc")
+                  : svg("mods/peek/sparkles.svg").size(11).flex_none().text_color("#c084fc"),
+              )
+              .child(isPolishing ? tr("Polishing…", "润色中…") : tr("Polish", "润色输入")),
+          )
+          .when(canUndoPolish, (e2) =>
+            e2.child(
+              h_flex()
+                .id(`tm-polish-undo-${pane}`)
+                .flex_none()
+                .h(20)
+                .px(6)
+                .gap(4)
+                .items_center()
+                .rounded(5)
+                .bg("#252628")
+                .border_1()
+                .border_color(alpha("#a855f7", "66") ?? "#383b40")
+                .text_size(11)
+                .font_medium()
+                .text_color("#e4e6ea")
+                .cursor_pointer()
+                .hover((s) => s.bg("#303338"))
+                .tooltip(withShortcut(tr("Undo last polish and restore original input", "撤销本次润色并恢复润色前的内容"), "prompt.polish_undo"))
+                .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                .on_click((_e, cx) => {
+                  cx.stop_propagation();
+                  run("prompt.polish_undo", { terminal: p.terminal });
+                })
+                .child(tr("↩ Undo", "↩ 反悔恢复")),
+            ),
+          );
+      })
       .when(showHandoffBtns && Boolean(lineageParent), (el) =>
         el.child(
           h_flex()
@@ -393,7 +441,7 @@ export default class TerminalsPane extends View {
             .text_color("#c4c7cc")
             .cursor_pointer()
             .hover((s) => s.bg("#303338").text_color("#ffffff"))
-            .tooltip(tr("Context Handoff", "上下文接力"))
+            .tooltip(withShortcut(tr("Context Handoff", "上下文接力"), "agent.handoff"))
             .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
             .on_click((_e, cx) => {
               cx.stop_propagation();
@@ -401,6 +449,34 @@ export default class TerminalsPane extends View {
             })
             .child(svg("mods/peek/corner-up-right.svg").size(11).flex_none())
             .child(tr("Handoff", "接力")),
+        ),
+      )
+      .when(showHandoffBtns, (el) =>
+        el.child(
+          h_flex()
+            .id(`tm-send-ctx-${pane}`)
+            .flex_none()
+            .h(20)
+            .px(6)
+            .gap(4)
+            .items_center()
+            .rounded(5)
+            .bg("#252628")
+            .border_1()
+            .border_color("#383b40")
+            .text_size(11)
+            .font_medium()
+            .text_color("#c4c7cc")
+            .cursor_pointer()
+            .hover((s) => s.bg("#303338").text_color("#ffffff"))
+            .tooltip(tr("Send recent context directly to an open CLI or ACP agent", "将近期上下文直接发送给已开启的 CLI / ACP Agent（可附带备注）"))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              run("agent.handoff", { source: p.terminal, kind: "send-context" });
+            })
+            .child(svg("mods/peek/send.svg").size(11).flex_none())
+            .child(tr("Send Context", "发送上下文")),
         ),
       )
       .when(Boolean(elapsed), (el) => el.child(
@@ -421,10 +497,10 @@ export default class TerminalsPane extends View {
           .child(svg("mods/workspace-chrome/clock.svg").size(11).flex_none())
           .child(formatElapsed(elapsed.ms)),
       ))
-      .child(this.button(`th-r-${pane}`, "split-right", "pane.split", { direction: "right", pane }, tr("Split right", "向右分栏")))
-      .child(this.button(`th-d-${pane}`, "split-down", "pane.split", { direction: "down", pane }, tr("Split down", "向下分栏")))
-      .when(tabPaneCount > 1, (el) => el.child(this.button(`th-z-${pane}`, "zoom", "pane.detach", { pane }, tr("Maximize to new tab", "最大化为独立标签页"))))
+      .child(this.button(`th-r-${pane}`, "split-right", "pane.split", { direction: "right", pane }, withShortcut(tr("Split right", "向右分栏"), "pane.split:right")))
+      .child(this.button(`th-d-${pane}`, "split-down", "pane.split", { direction: "down", pane }, withShortcut(tr("Split down", "向下分栏"), "pane.split:down")))
+      .when(tabPaneCount > 1, (el) => el.child(this.button(`th-z-${pane}`, "zoom", "pane.detach", { pane }, withShortcut(tr("Maximize to new tab", "最大化为独立标签页"), "pane.detach"))))
       .when(Boolean(p.terminal), (el) => el.child(this.button(`th-trash-${pane}`, "trash", "agent.trash", { terminal: p.terminal }, tr("Move to recycle bin", "移入回收站"), true)))
-      .child(this.button(`th-x-${pane}`, "close", "pane.close", { pane }, isAgent ? tr("Close pane (keep agent in background)", "关闭窗格（Agent 保留在后台）") : tr("Close pane", "关闭窗格")));
+      .child(this.button(`th-x-${pane}`, "close", "pane.close", { pane }, withShortcut(isAgent ? tr("Close pane (keep agent in background)", "关闭窗格（Agent 保留在后台）") : tr("Close pane", "关闭窗格"), "pane.close")));
   }
 }

@@ -24,7 +24,11 @@ import {
   parseCodeFence,
   serializeCodeFence,
   resolveFenceLanguage,
+  parseMathBlock,
+  serializeMathBlock,
 } from "../defaults/mods/files/markdown_blocks.js";
+import { renderMermaidSvg, detectMermaidKind } from "../defaults/mods/files/mermaid_svg.js";
+import { renderMathSvg, findInlineMathSpans, rewriteInlineMathInMarkdown } from "../defaults/mods/files/math_svg.js";
 
 const source = await readFile(new URL("../defaults/mods/files/main.js", import.meta.url), "utf8");
 const directorySource = source.slice(source.indexOf("async function directory("), source.indexOf("\nexport default class"));
@@ -495,4 +499,218 @@ test("Files review_model maps editor UTF-16 selections and Markdown blocks to ex
   expect((interleaved.items[3] as any).editing).toBe(true);
   expect((interleaved.items[5] as any).outdated).toBe(true);
   expect(Array.isArray(interleaved.sizes)).toBe(true);
+});
+
+test("Files Markdown block parser parses display math blocks losslessly", () => {
+  const samples = [
+    "# Formulas\n\n$$E = mc^2$$\n\n$$\n\\int_{-\\infty}^{\\infty} e^{-x^2}\\,dx = \\sqrt{\\pi}\n$$\n\n\\[\n\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}\n\\]\n\nAfter paragraph.\n",
+    "Inline $a^2 + b^2 = c^2$ and currency $5 and $10 stay paragraph.\n$$x + y$$\n",
+  ];
+  for (const raw of samples) {
+    const doc = parseMarkdownBlocks(raw);
+    expect(serializeMarkdownBlocks(doc)).toBe(raw);
+  }
+  const doc = parseMarkdownBlocks(samples[0]);
+  expect(doc.blocks.map((b: any) => b.kind)).toEqual(["heading", "math", "math", "math", "paragraph"]);
+  expect(parseMathBlock(doc.blocks[1].raw)).toMatchObject({ delim: "$$", singleLine: true, body: "E = mc^2" });
+  expect(parseMathBlock(doc.blocks[2].raw)?.body).toContain("\\int_{-\\infty}^{\\infty}");
+  expect(parseMathBlock(doc.blocks[3].raw)).toMatchObject({ delim: "\\[", singleLine: false });
+
+  const parsed = parseMathBlock("$$\na + b\n$$");
+  expect(serializeMathBlock(parsed, "c + d")).toBe("$$\nc + d\n$$");
+  const single = parseMathBlock("$$x^2$$");
+  expect(serializeMathBlock(single, "y^3")).toBe("$$y^3$$");
+});
+
+test("Files math SVG renderer handles fractions, roots, scripts, matrices, accents, and inline disambiguation", () => {
+  const formulas = [
+    "E = mc^2",
+    "\\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}",
+    "\\sum_{i=1}^{n} \\frac{1}{i^2} = \\frac{\\pi^2}{6}",
+    "\\int_{0}^{\\infty} e^{-x^2} \\, dx = \\frac{\\sqrt{\\pi}}{2}",
+    "\\begin{pmatrix} 1 & 2 \\\\ 3 & 4 \\end{pmatrix} \\begin{bmatrix} x \\\\ y \\end{bmatrix}",
+    "f(x) = \\begin{cases} x^2 & x \\ge 0 \\\\ -x & x < 0 \\end{cases}",
+    "\\left( \\frac{a}{b} \\right) + \\vec{v} + \\widehat{AB} + \\overline{z} + \\boxed{\\mathbb{R}^n}",
+    "\\sqrt[3]{x + y} + \\binom{n}{k} + \\lim_{x \\to 0} \\frac{\\sin x}{x} = 1",
+  ];
+
+  for (const expr of formulas) {
+    const disp = renderMathSvg(expr, { display: true, color: "#e6edf3" });
+    expect(disp.ok).toBe(true);
+    expect(disp.width).toBeGreaterThan(10);
+    expect(disp.height).toBeGreaterThan(15);
+    expect(disp.svg).toContain("<svg xmlns=\"http://www.w3.org/2000/svg\"");
+    expect(disp.svg).not.toContain("<foreignObject");
+    expect(disp.dataUrl.startsWith("data:image/svg+xml,")).toBe(true);
+
+    const inline = renderMathSvg(expr, { display: false, color: "#1f2328" });
+    expect(inline.ok).toBe(true);
+    expect(inline.width).toBeGreaterThan(8);
+    expect(inline.height).toBeGreaterThan(10);
+  }
+
+  // Inline math scanner ignores currency, escaped dollars, inline code, and fenced code
+  const prose = "Costs $5 and $10, escaped \\$x\\$, code `$a+b$`, real $x^2 + y^2$ and \\(\\alpha + \\beta\\).";
+  const spans = findInlineMathSpans(prose);
+  expect(spans.map((s: any) => s.expr)).toEqual(["x^2 + y^2", "\\alpha + \\beta"]);
+
+  const md = [
+    "Equation $E=mc^2$ and `$raw$` and $5 to $10.",
+    "```tex",
+    "$ignored_in_fence$",
+    "```",
+  ].join("\n");
+  const rewritten = rewriteInlineMathInMarkdown(md, { color: "#1f2328", fontSize: 13.5 });
+  expect(rewritten).toContain('<img src="data:image/svg+xml,');
+  expect(rewritten).toContain("`$raw$`");
+  expect(rewritten).toContain("$5 to $10");
+  expect(rewritten).toContain("$ignored_in_fence$");
+});
+
+test("Files Mermaid SVG renderer supports all major diagram types across light and dark themes", () => {
+  const lightTheme = { dark: false, background: "#ffffff", surface: "#f6f8fa", foreground: "#1f2328", muted: "#656d76", border: "#d0d7de", accent: "#0969da" };
+  const darkTheme = { dark: true, background: "#0d1117", surface: "#161b22", foreground: "#e6edf3", muted: "#8b949e", border: "#30363d", accent: "#58a6ff" };
+
+  const diagrams: [string, string][] = [
+    [
+      "flowchart",
+      `flowchart TD
+        subgraph Core["核心流程"]
+          A([开始]) --> B{条件判断?}
+          B -->|是| C[处理数据]
+          B -.->|否| D[(数据库)]
+        end
+        C ==> E((结束))
+        D --> A`,
+    ],
+    [
+      "sequence",
+      `sequenceDiagram
+        autonumber
+        actor U as User
+        participant A as API
+        U->>+A: POST /login
+        alt Valid
+          A-->>U: 200 OK
+        else Invalid
+          A--xU: 401
+        end
+        Note right of A: Audited
+        A->>A: Log metric`,
+    ],
+    [
+      "state",
+      `stateDiagram-v2
+        [*] --> Idle
+        Idle --> Running : start
+        state Running {
+          [*] --> Working
+          Working --> Paused : pause
+        }
+        Running --> [*]`,
+    ],
+    [
+      "class",
+      `classDiagram
+        class Animal {
+          +String name
+          +speak() void
+        }
+        class Dog {
+          +bark() void
+        }
+        Animal <|-- Dog : inherits`,
+    ],
+    [
+      "er",
+      `erDiagram
+        USER ||--o{ ORDER : places
+        USER {
+          int id PK
+          string email
+        }
+        ORDER {
+          int id PK
+          int user_id FK
+        }`,
+    ],
+    [
+      "pie",
+      `pie showData
+        title Language Share
+        "Rust" : 45
+        "TypeScript" : 35
+        "Other" : 20`,
+    ],
+    [
+      "gantt",
+      `gantt
+        title Release Plan
+        dateFormat YYYY-MM-DD
+        section Build
+        Design :done, d1, 2026-01-01, 5d
+        Implement :active, i1, after d1, 7d
+        Ship :milestone, after i1, 0d`,
+    ],
+    [
+      "mindmap",
+      `mindmap
+        root((Herdr))
+          Files
+            Mermaid
+            Math
+          Terminals`,
+    ],
+    [
+      "gitgraph",
+      `gitGraph
+        commit id: "init"
+        branch feat
+        checkout feat
+        commit id: "add-svg" tag: "v0.1"
+        checkout main
+        merge feat`,
+    ],
+    [
+      "timeline",
+      `timeline
+        title Milestones
+        Q1 : Parser : Layout
+        Q2 : SVG : Math`,
+    ],
+    [
+      "xychart",
+      `xychart-beta
+        title "Latency"
+        x-axis [Jan, Feb, Mar]
+        y-axis "ms" 0 --> 100
+        bar [30, 55, 40]
+        line [25, 50, 35]`,
+    ],
+  ];
+
+  for (const [expectedKind, src] of diagrams) {
+    expect(detectMermaidKind(src)).toBe(expectedKind);
+    for (const th of [lightTheme, darkTheme]) {
+      const res = renderMermaidSvg(src, { theme: th, scale: 1 });
+      expect(res.ok).toBe(true);
+      expect(res.kind).toBe(expectedKind);
+      expect(res.width).toBeGreaterThan(60);
+      expect(res.height).toBeGreaterThan(40);
+      expect(res.svg).toContain("<svg xmlns=\"http://www.w3.org/2000/svg\"");
+      expect(res.svg).not.toContain("<foreignObject");
+      expect(res.svg).not.toContain("<image");
+      expect(res.dataUrl.startsWith("data:image/svg+xml,")).toBe(true);
+    }
+  }
+
+  // Zoom scaling adjusts width & height while keeping viewBox intact
+  const zoomed = renderMermaidSvg(diagrams[0][1], { theme: darkTheme, scale: 1.5 });
+  const base = renderMermaidSvg(diagrams[0][1], { theme: darkTheme, scale: 1 });
+  expect(zoomed.width).toBe(Math.round(base.width * 1.5));
+  expect(zoomed.height).toBe(Math.round(base.height * 1.5));
+
+  // Unsupported or empty diagrams fail gracefully
+  expect(renderMermaidSvg("", { theme: darkTheme }).ok).toBe(false);
+  expect(renderMermaidSvg("unknownDiagram\n  A --> B", { theme: darkTheme }).ok).toBe(false);
 });

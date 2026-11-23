@@ -191,9 +191,7 @@ impl Core {
         drop(answered);
         let (bye, bye_rx) = mpsc::channel();
         let build = crate::client::build_id();
-        let disk_build = (welcome.build != build && require_current)
-            .then(crate::client::disk_build_id)
-            .flatten();
+        let disk_build = (welcome.build != build && require_current).then(crate::client::disk_build_id).flatten();
         let effective_build = disk_build.as_deref().filter(|d| *d == welcome.build).unwrap_or(build.as_str());
         let current = platform::holder_current(
             &welcome.build,
@@ -556,7 +554,8 @@ impl Core {
             self.changed.notify_waiters();
             return;
         }
-        let reason = finish_reason(st.pty_killing.contains(&id), st.stopping, false, platform::host_shutdown_in_progress());
+        let reason =
+            finish_reason(st.pty_killing.contains(&id), st.stopping, false, platform::host_shutdown_in_progress());
         if let Some(link) = st.link(id) {
             link.send(&proto::frame(proto::RELEASE, id, &[]));
         }
@@ -595,9 +594,10 @@ impl Core {
             let target = TargetKey::Terminal(id);
             let _ = self.jobs.send(crate::notes::Job::Orphaned(target));
             crate::remote::orphaned_afar(self, st, target);
-            let _ = self.drove.pool_tx.send(crate::drove::pool::PoolSignal::SessionClosed {
-                address: crate::terminals::address(id),
-            });
+            let _ = self
+                .drove
+                .pool_tx
+                .send(crate::drove::pool::PoolSignal::SessionClosed { address: crate::terminals::address(id) });
         }
         if let (Some(relay), Some(screen)) = (st.relays.get_mut(&id), st.screens.get_mut(&id)) {
             relay.flush(screen);
@@ -613,7 +613,9 @@ impl Core {
             let _ = writeln!(io::stderr(), "core: cannot save screen of {}: {e}", crate::terminals::address(id));
         }
         let rm = st.pty_reg.terminals.get(&id).is_some_and(|t| {
-            !t.is_live() && t.rm && !t.parent.as_ref().is_some_and(|p| st.waiting.contains_key(&(p.clone(), TargetKey::Terminal(id))))
+            !t.is_live()
+                && t.rm
+                && !t.parent.as_ref().is_some_and(|p| st.waiting.contains_key(&(p.clone(), TargetKey::Terminal(id))))
         });
         if rm {
             self.pty_remove(st, id);

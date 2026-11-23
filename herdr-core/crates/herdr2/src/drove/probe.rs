@@ -1,11 +1,11 @@
 //! ACP agent binary/model discovery and generic AI endpoint connection testing.
 
 use super::types::{ProbeSnapshot, ProbedAgent, now_iso};
-use crate::acp::{SpawnSpec, spawn_session};
 use crate::acp::presets::{BUILTIN_PRESETS, resolve_acp_command_in_env};
+use crate::acp::{SpawnSpec, spawn_session};
 pub use crate::ai::client::{
-    AiTestResult, all_model_ids, chat_endpoints, curl_json, curl_json_timeout, fetch_ai_models,
-    first_model_id, models_endpoints, test_ai_connection,
+    AiTestResult, all_model_ids, chat_endpoints, curl_json, curl_json_timeout, fetch_ai_models, first_model_id,
+    models_endpoints, test_ai_connection,
 };
 use crate::runtime::Core;
 use serde_json::{Value, json};
@@ -17,10 +17,7 @@ const ACP_PROBE_TIMEOUT: Duration = Duration::from_secs(35);
 const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 fn env_ignore_case<'a>(env: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
-    env.iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(key))
-        .map(|(_, v)| v.as_str())
-        .filter(|s| !s.is_empty())
+    env.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.as_str()).filter(|s| !s.is_empty())
 }
 
 fn collect_probe_targets(core: &Core) -> Vec<(String, Vec<String>)> {
@@ -109,8 +106,7 @@ pub async fn refresh_installed_status(core: &Core, snap: &mut ProbeSnapshot) -> 
     }
 
     if changed {
-        snap.agents
-            .sort_by(|a, b| b.installed.cmp(&a.installed).then_with(|| a.id.cmp(&b.id)));
+        snap.agents.sort_by(|a, b| b.installed.cmp(&a.installed).then_with(|| a.id.cmp(&b.id)));
     }
     changed
 }
@@ -120,10 +116,7 @@ pub async fn refresh_installed_status(core: &Core, snap: &mut ProbeSnapshot) -> 
 pub async fn probe_agents(core: &Core, skip_acp_handshake: bool) -> ProbeSnapshot {
     let targets = collect_probe_targets(core);
     let base_env = crate::platform::program_env().await;
-    let cwd = std::env::current_dir()
-        .unwrap_or_else(|_| std::env::temp_dir())
-        .display()
-        .to_string();
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()).display().to_string();
 
     let probe_scope = crate::sweep::token();
     let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
@@ -190,10 +183,8 @@ async fn probe_one_acp(
     let (local_models, local_default) = discover_local_models(&id, true, &env);
     if matches!(id.as_str(), "agy" | "antigravity") {
         // `agy acp` takes ~29s to boot CCPA + MCP servers on session/new; `agy models` returns the live catalog in ~5s.
-        let (cli_models, cli_ver) = tokio::join!(
-            probe_cli_models(&id, &env, &cwd),
-            probe_cli_version(&exe_path, &env, &cwd),
-        );
+        let (cli_models, cli_ver) =
+            tokio::join!(probe_cli_models(&id, &env, &cwd), probe_cli_version(&exe_path, &env, &cwd),);
         let models = merge_model_lists(&[cli_models, local_models]);
         let model_efforts = infer_model_efforts_from_variants(&models);
         let default_model = local_default.or_else(|| models.first().cloned());
@@ -230,10 +221,8 @@ async fn probe_one_acp(
         mcp_exe: "herdr2".into(),
         socket: String::new(),
     };
-    let (res, cli_models) = tokio::join!(
-        tokio::time::timeout(ACP_PROBE_TIMEOUT, spawn_session(spec)),
-        probe_cli_models(&id, &env, &cwd)
-    );
+    let (res, cli_models) =
+        tokio::join!(tokio::time::timeout(ACP_PROBE_TIMEOUT, spawn_session(spec)), probe_cli_models(&id, &env, &cwd));
 
     match res {
         Ok(Ok(started)) => {
@@ -246,10 +235,8 @@ async fn probe_one_acp(
             let mut default_model_contexts = Vec::new();
 
             if matches!(id.as_str(), "cursor" | "cursor-agent")
-                && let Ok(extra) = started
-                    .transport
-                    .request("cursor/list_available_models", &json!({}), Duration::from_secs(4))
-                    .await
+                && let Ok(extra) =
+                    started.transport.request("cursor/list_available_models", &json!({}), Duration::from_secs(4)).await
                 && let Some(models) = extra.get("models").and_then(Value::as_array)
             {
                 for item in models {
@@ -279,6 +266,7 @@ async fn probe_one_acp(
                             oid.contains("effort")
                                 || oid == "reasoning"
                                 || oid == "thinking"
+                                || oid == "thought"
                                 || oid == "thought_level"
                                 || ocat == "thought_level"
                                 || ocat == "effort"
@@ -312,6 +300,7 @@ async fn probe_one_acp(
                         acp_models.insert(0, dm.clone());
                     }
                 } else if lower_id.contains("effort")
+                    || lower_id == "thought"
                     || lower_cat == "thought_level"
                     || lower_cat == "effort"
                 {
@@ -334,10 +323,8 @@ async fn probe_one_acp(
             let _ = tokio::time::timeout(Duration::from_secs(1), started.waiter.wait()).await;
 
             let models = merge_model_lists(&[acp_models, cli_models, local_models]);
-            let default_model = acp_default
-                .filter(|s| !s.trim().is_empty())
-                .or(local_default)
-                .or_else(|| models.first().cloned());
+            let default_model =
+                acp_default.filter(|s| !s.trim().is_empty()).or(local_default).or_else(|| models.first().cloned());
             if !default_model_contexts.is_empty()
                 && let Some(ref dm) = default_model
             {
@@ -540,10 +527,7 @@ pub(crate) fn parse_cli_models(agent_id: &str, text: &str) -> Vec<String> {
             continue;
         }
         let lower = line.to_ascii_lowercase();
-        if lower.starts_with("fetching ")
-            || lower.starts_with("loading ")
-            || lower.starts_with("available ")
-        {
+        if lower.starts_with("fetching ") || lower.starts_with("loading ") || lower.starts_with("available ") {
             continue;
         }
         let id = match agent_id {
@@ -723,10 +707,8 @@ pub(crate) fn discover_local_models_in_homes(
                     }
                     if let Some(arr) = val["availableModels"].as_array() {
                         for entry in arr {
-                            if let Some(id) = entry
-                                .as_str()
-                                .or_else(|| entry["id"].as_str())
-                                .or_else(|| entry["model"].as_str())
+                            if let Some(id) =
+                                entry.as_str().or_else(|| entry["id"].as_str()).or_else(|| entry["model"].as_str())
                             {
                                 push_unique(&mut models, id);
                             }
@@ -739,7 +721,11 @@ pub(crate) fn discover_local_models_in_homes(
                 if let Ok(text) = std::fs::read_to_string(home.join(".claude/settings.json"))
                     && let Ok(val) = serde_json::from_str::<Value>(&text)
                 {
-                    if let Some(m) = val["model"].as_str().or_else(|| val["env"]["ANTHROPIC_MODEL"].as_str()).filter(|s| !s.is_empty()) {
+                    if let Some(m) = val["model"]
+                        .as_str()
+                        .or_else(|| val["env"]["ANTHROPIC_MODEL"].as_str())
+                        .filter(|s| !s.is_empty())
+                    {
                         default_model.get_or_insert_with(|| m.to_string());
                         push_unique(&mut models, m);
                     }
@@ -759,10 +745,8 @@ pub(crate) fn discover_local_models_in_homes(
                     }
                     if let Some(arr) = val["availableModels"].as_array() {
                         for entry in arr {
-                            if let Some(id) = entry
-                                .as_str()
-                                .or_else(|| entry["id"].as_str())
-                                .or_else(|| entry["model"].as_str())
+                            if let Some(id) =
+                                entry.as_str().or_else(|| entry["id"].as_str()).or_else(|| entry["model"].as_str())
                             {
                                 push_unique(&mut models, id);
                             }
@@ -819,7 +803,8 @@ pub(crate) fn discover_local_models_in_homes(
             for home in homes {
                 if let Ok(text) = std::fs::read_to_string(home.join(".gemini/antigravity-cli/settings.json"))
                     && let Ok(val) = serde_json::from_str::<Value>(&text)
-                    && let Some(raw_m) = val["model"].as_str().or_else(|| val["model"]["name"].as_str()).filter(|s| !s.is_empty())
+                    && let Some(raw_m) =
+                        val["model"].as_str().or_else(|| val["model"]["name"].as_str()).filter(|s| !s.is_empty())
                     && let Some(norm) = normalize_agy_model_id(raw_m)
                 {
                     default_model.get_or_insert_with(|| norm.clone());
@@ -857,7 +842,8 @@ pub(crate) fn discover_local_models_in_homes(
             for home in homes {
                 if let Ok(text) = std::fs::read_to_string(home.join(".gemini/settings.json"))
                     && let Ok(val) = serde_json::from_str::<Value>(&text)
-                    && let Some(m) = val["model"].as_str().or_else(|| val["model"]["name"].as_str()).filter(|s| !s.is_empty())
+                    && let Some(m) =
+                        val["model"].as_str().or_else(|| val["model"]["name"].as_str()).filter(|s| !s.is_empty())
                 {
                     default_model.get_or_insert_with(|| m.to_string());
                     push_unique(&mut models, m);
@@ -872,10 +858,8 @@ pub(crate) fn discover_local_models_in_homes(
                 if let Ok(text) = std::fs::read_to_string(home.join(".cursor/cli-config.json"))
                     && let Ok(val) = serde_json::from_str::<Value>(&text)
                 {
-                    let m = val["model"]["modelId"]
-                        .as_str()
-                        .or_else(|| val["model"].as_str())
-                        .filter(|s| !s.is_empty());
+                    let m =
+                        val["model"]["modelId"].as_str().or_else(|| val["model"].as_str()).filter(|s| !s.is_empty());
                     if let Some(m) = m {
                         default_model.get_or_insert_with(|| m.to_string());
                         push_unique(&mut models, m);
@@ -913,7 +897,9 @@ pub(crate) fn discover_local_models_in_homes(
                     if let Ok(text) = std::fs::read_to_string(home.join(rel))
                         && let Ok(val) = toml::from_str::<toml::Value>(&text)
                     {
-                        if let Some(m) = val.get("default_model").and_then(toml::Value::as_str).filter(|s| !s.is_empty()) {
+                        if let Some(m) =
+                            val.get("default_model").and_then(toml::Value::as_str).filter(|s| !s.is_empty())
+                        {
                             default_model.get_or_insert_with(|| m.to_string());
                             push_unique(&mut models, m);
                         }
@@ -958,7 +944,72 @@ pub(crate) fn discover_local_models_in_homes(
             }
         }
         "zcode" | "glm" => {
-            for curated in ["glm-5", "glm-4.7"] {
+            for home in homes {
+                if let Ok(text) = std::fs::read_to_string(home.join(".zcode/v2/provider_config.json"))
+                    && let Ok(val) = serde_json::from_str::<Value>(&text)
+                {
+                    let cfg = &val["config"];
+                    if let Some(dm) = cfg["defaultModelSelection"]["modelId"].as_str().filter(|s| !s.is_empty()) {
+                        default_model.get_or_insert_with(|| dm.to_string());
+                        push_unique(&mut models, dm);
+                    }
+                    if let Some(rules) = cfg["providerConfigRules"]["providerRules"].as_array() {
+                        for rule in rules {
+                            for field in ["modelOrder", "personalModelIds", "builtinModelIds"] {
+                                if let Some(arr) = rule["config"][field].as_array() {
+                                    for item in arr {
+                                        if let Some(m) = item.as_str().filter(|s| !s.is_empty()) {
+                                            push_unique(&mut models, m);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    for key in ["providerModelRules", "manualProviderModelRules"] {
+                        if let Some(arr) = cfg["modelConfigRules"][key].as_array() {
+                            for rule in arr {
+                                if rule["config"]["enabled"].as_bool() == Some(false) {
+                                    continue;
+                                }
+                                if let Some(m) = rule["modelId"].as_str().filter(|s| !s.is_empty()) {
+                                    push_unique(&mut models, m);
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Ok(text) =
+                    std::fs::read_to_string(home.join(".zcode/runtime/current/agent/provider/zcode-builtin.json"))
+                    && let Ok(val) = serde_json::from_str::<Value>(&text)
+                {
+                    let cfg = &val["config"];
+                    if let Some(rules) = cfg["providerConfigRules"]["providerRules"].as_array() {
+                        for rule in rules {
+                            if rule["providerId"].as_str() == Some("account:bigmodel-individual-coding-plan")
+                                && let Some(arr) = rule["config"]["builtinModelIds"].as_array()
+                            {
+                                for item in arr {
+                                    if let Some(m) = item.as_str().filter(|s| !s.is_empty()) {
+                                        push_unique(&mut models, m);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(arr) = cfg["modelConfigRules"]["builtinProviderModelRules"].as_array() {
+                        for rule in arr {
+                            if rule["providerId"].as_str() == Some("account:bigmodel-individual-coding-plan")
+                                && rule["config"]["enabled"].as_bool() != Some(false)
+                                && let Some(m) = rule["modelId"].as_str().filter(|s| !s.is_empty())
+                            {
+                                push_unique(&mut models, m);
+                            }
+                        }
+                    }
+                }
+            }
+            for curated in ["GLM-5.4", "GLM-5.3", "GLM-5.3-Flash", "GLM-5.2", "GLM-5-Turbo"] {
                 push_unique(&mut models, curated);
             }
         }
@@ -1042,11 +1093,8 @@ mod tests {
             r#"{"env":{"ANTHROPIC_DEFAULT_OPUS_MODEL":"zcode/GLM-5.3[1m]","CLAUDE_CODE_MODEL_CAPABILITIES":"cursor/grok-4.7@500k=500k"}}"#,
         )
         .unwrap();
-        std::fs::write(
-            tmp.join(".gemini/antigravity-cli/settings.json"),
-            r#"{"model":"gemini-4-hydrogen-high"}"#,
-        )
-        .unwrap();
+        std::fs::write(tmp.join(".gemini/antigravity-cli/settings.json"), r#"{"model":"gemini-4-hydrogen-high"}"#)
+            .unwrap();
 
         let (claude_models, _) = discover_local_models_in_homes("claude", true, std::slice::from_ref(&tmp));
         for expected in [
@@ -1067,6 +1115,58 @@ mod tests {
         assert!(agy_models.contains(&"claude-opus-5-5-high".to_string()));
         assert_eq!(normalize_agy_model_id("Gemini 4 Carbon (Medium)").as_deref(), Some("gemini-4-carbon-medium"));
         assert_eq!(normalize_agy_model_id("Orchestrator (Carbon)").as_deref(), Some("gemini-pro-orchestrator"));
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn discover_local_models_reads_zcode_provider_and_builtin_configs() {
+        let tmp = crate::test_tmp().join(format!("drove-zcode-{}", crate::platform::random_hex()));
+        std::fs::create_dir_all(tmp.join(".zcode/v2")).unwrap();
+        std::fs::create_dir_all(tmp.join(".zcode/runtime/current/agent/provider")).unwrap();
+        std::fs::write(
+            tmp.join(".zcode/v2/provider_config.json"),
+            r#"{
+                "config": {
+                    "defaultModelSelection": { "providerId": "account:bigmodel-individual-coding-plan", "modelId": "GLM-5.3-Flash" },
+                    "providerConfigRules": {
+                        "providerRules": [
+                            { "providerId": "account:bigmodel-individual-coding-plan", "config": { "personalModelIds": ["GLM-5.4"], "modelOrder": ["GLM-5.3", "GLM-5.3-Flash", "GLM-5.4"] } }
+                        ]
+                    },
+                    "modelConfigRules": {
+                        "providerModelRules": [
+                            { "providerId": "account:bigmodel-individual-coding-plan", "modelId": "GLM-5.4", "config": { "enabled": true } }
+                        ]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.join(".zcode/runtime/current/agent/provider/zcode-builtin.json"),
+            r#"{
+                "config": {
+                    "providerConfigRules": {
+                        "providerRules": [
+                            { "providerId": "account:bigmodel-individual-coding-plan", "config": { "builtinModelIds": ["GLM-5.3", "GLM-5.3-Flash"] } }
+                        ]
+                    },
+                    "modelConfigRules": {
+                        "builtinProviderModelRules": [
+                            { "providerId": "account:bigmodel-individual-coding-plan", "modelId": "GLM-5.2", "config": { "enabled": true } },
+                            { "providerId": "account:bigmodel-individual-coding-plan", "modelId": "GLM-5-Turbo", "config": { "enabled": true } }
+                        ]
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let (models, def) = discover_local_models_in_homes("zcode", false, std::slice::from_ref(&tmp));
+        assert_eq!(def.as_deref(), Some("GLM-5.3-Flash"));
+        for expected in ["GLM-5.3-Flash", "GLM-5.3", "GLM-5.4", "GLM-5.2", "GLM-5-Turbo"] {
+            assert!(models.contains(&expected.to_string()), "missing {expected} in {models:?}");
+        }
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

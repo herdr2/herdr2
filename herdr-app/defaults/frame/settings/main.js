@@ -24,6 +24,7 @@ const SECTIONS = () => [
   { id: "ai", title: "AI", zh: "AI 助手", icon: "sparkles" },
   { id: "drove", title: "Drove", zh: "Drove", icon: "layers" },
   { id: "alerts", title: "Alerts", zh: "提醒", icon: "bell" },
+  { id: "updates", title: "Updates", zh: "更新", icon: "refresh" },
   { id: "privacy", title: "Privacy", zh: "隐私", icon: "shield" },
 ];
 
@@ -102,7 +103,7 @@ const DROVE_AGENT_ICONS = {
   copilot: { path: "icons/copilot.svg", tint: true },
   hermes: { path: "icons/hermes.svg", tint: true },
   pi: { path: "icons/pi.svg", tint: true },
-  zcode: { path: "icons/agent.svg", tint: true },
+  zcode: { path: "icons/zcode.svg", tint: true },
   glm: { path: "icons/agent.svg", tint: true },
 };
 
@@ -181,6 +182,8 @@ export default class Settings extends View {
     this.aiTesting = false;
     this.aiError = null;
     this.aiTestResult = null;
+    this.aiProbingPromptMode = false;
+    this.aiPromptProbeResult = null;
     this.droveData = null;
     this.droveLoading = false;
     this.droveSaving = false;
@@ -194,10 +197,11 @@ export default class Settings extends View {
     this.droveMagpieResult = null;
     this.droveKeyDirty = false;
     this.droveShowAddRole = false;
-    this.droveAiConfigMode = null; // null | "all" | "models" | "strengths"
+    this.droveAiConfigMode = null; // null | "all" | "models" | "strengths" | "notes"
     this.droveAiConfiguring = false;
-    this.droveAiRunningMode = null; // null | "all" | "models" | "strengths"
+    this.droveAiRunningMode = null; // null | "all" | "models" | "strengths" | "notes"
     this.droveAiStage = null; // null | "probing" | "generating"
+    this.droveNoteAiTarget = null; // null | "global" | "candidate:<roleId>:<idx>"
     this.droveAiConfigResult = null;
     this.droveRolesBackup = null;
     this.droveAiPromptFocused = false;
@@ -247,6 +251,37 @@ export default class Settings extends View {
         this.aiConfigureDroveRoles(this.droveAiConfigMode, cx);
       }
     });
+    this.droveNoteFocused = false;
+    this.droveNoteInput = TextareaState.new({
+      value: "",
+      placeholder: "",
+    });
+    this.droveNoteInput.set_auto_grow(2, 5);
+    this.droveNoteInput.on("focus", (_e, cx) => { this.droveNoteFocused = true; cx.notify(); });
+    this.droveNoteInput.on("blur", (_e, cx) => { this.droveNoteFocused = false; cx.notify(); });
+    this.droveNoteInput.on("change", (_e, cx) => { cx.notify(); });
+    this.droveNoteInput.on("submit", (e, cx) => {
+      if ((e?.ctrl || e?.meta) && !this.droveSaving) {
+        this.saveDroveNote(cx);
+      }
+    });
+    this.droveCandNoteSubmit = null;
+    this.droveCandNoteInput = TextareaState.new({
+      value: "",
+      placeholder: "",
+    });
+    this.droveCandNoteInput.set_auto_grow(2, 4);
+    this.droveCandNoteInput.on("change", (_e, cx) => { cx.notify(); });
+    this.droveCandNoteInput.on("submit", (e, cx) => {
+      if ((e?.ctrl || e?.meta) && this.droveCandNoteSubmit) {
+        const cb = this.droveCandNoteSubmit;
+        const val = this.droveCandNoteInput.value().trim();
+        this.picking = null;
+        this.droveCandNoteSubmit = null;
+        this.handle.focus();
+        cb(val || null, cx);
+      }
+    });
     this.droveUrlInput = InputState.new({ placeholder: "https://api.example.com/v1" });
     this.droveKeyInput = InputState.new({ placeholder: this.tr("API key (stored in 0600 ai.key)", "API Key（保存在 0600 ai.key）") });
     this.droveKeyInput.set_masked?.(true);
@@ -259,6 +294,9 @@ export default class Settings extends View {
     this.keysFilter = "";
     this.keysFilterInput = InputState.new({ placeholder: this.tr("Search shortcuts or actions…", "搜索快捷键或操作…") });
     this.keysFilterInput.on("change", (_e, cx) => { this.keysFilter = this.keysFilterInput.value(); cx.notify(); });
+    this.releasesUrlInput = InputState.new({ placeholder: "https://releases.example.com" });
+    this.releasesUrlSynced = false;
+    this.releasesUrlSavedAt = 0;
     this.recordingTarget = null;
     this.lastRecordedSeq = Number(shared("settings.recorded_shortcut")?.seq ?? 0);
     this.keysNotice = null;
@@ -322,6 +360,10 @@ export default class Settings extends View {
     } catch {
       this.person = {};
       this.broken = true;
+    }
+    if (!this.releasesUrlSynced) {
+      this.releasesUrlInput?.set_value?.(this.person.releases_url ?? "");
+      this.releasesUrlSynced = true;
     }
   }
 
@@ -1516,8 +1558,14 @@ export default class Settings extends View {
     const cfg = data?.config ?? {};
     this.droveUrlInput.set_value(cfg.ai?.baseUrl ?? "");
     this.droveMagpieUrlInput.set_value(cfg.magpie?.gatewayUrl ?? "");
+    this.droveNoteInput.set_value(cfg.note ?? "");
     this.droveKeyInput.set_value("");
     this.droveKeyDirty = false;
+  }
+
+  saveDroveNote(cx) {
+    const nextNote = this.droveNoteInput.value().trim();
+    this.saveDrovePatch({ note: nextNote }, cx, true);
   }
 
   syncAiInputs(status) {
@@ -1552,6 +1600,9 @@ export default class Settings extends View {
         if (next) {
           this.aiStatus = next;
           if (syncInputs) this.syncAiInputs(next);
+          if (patch && ("promptMode" in patch || "promptCacheEnabled" in patch || "model" in patch || "baseUrl" in patch)) {
+            this.aiPromptProbeResult = null;
+          }
           this.droveData = null;
         }
       } catch (e) {
@@ -1562,6 +1613,74 @@ export default class Settings extends View {
         cx.notify();
       }
     });
+  }
+
+  selectAiModel(model, cx) {
+    const nextModel = String(model ?? "").trim();
+    const prevModel = String(this.aiStatus?.model ?? "").trim();
+    if (nextModel === prevModel || this.aiSaving) return;
+    this.aiSaving = true;
+    this.aiError = null;
+    this.aiPromptProbeResult = null;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      let shouldProbe = false;
+      try {
+        const next = await this.droveCallWithJsonFile(["ai", "settings-set"], {
+          model: nextModel,
+          promptMode: "auto",
+        });
+        if (next) {
+          this.aiStatus = next;
+          this.droveData = null;
+          shouldProbe = Boolean(next.configured);
+        }
+      } catch (e) {
+        this.aiError = String(e?.message ?? e);
+        notify({ title: this.tr("AI settings not saved", "AI 设置保存失败"), body: this.aiError, level: "error" });
+      } finally {
+        this.aiSaving = false;
+        cx.notify();
+      }
+      if (shouldProbe) {
+        await this.runPromptModeRedetect(cx, true);
+      }
+    });
+  }
+
+  redetectPromptMode(cx) {
+    if (this.aiProbingPromptMode || this.aiSaving) return;
+    cx.spawn(async (cx) => {
+      await this.runPromptModeRedetect(cx, false);
+    });
+  }
+
+  async runPromptModeRedetect(cx, autoTriggered = false) {
+    if (this.aiProbingPromptMode) return;
+    this.aiProbingPromptMode = true;
+    this.aiError = null;
+    this.aiPromptProbeResult = null;
+    cx.notify();
+    try {
+      const res = await this.droveHcJson(["ai", "probe-prompt-mode"]);
+      if (res) {
+        if (res.status) {
+          this.aiStatus = res.status;
+          this.droveData = null;
+        }
+        this.aiPromptProbeResult = { ...res, autoTriggered };
+      }
+    } catch (e) {
+      this.aiPromptProbeResult = {
+        ok: false,
+        detectedMode: "pending",
+        reason: String(e?.message ?? e),
+        autoTriggered,
+      };
+    } finally {
+      this.aiProbingPromptMode = false;
+      cx.notify();
+    }
   }
 
   testCoreAi(cx) {
@@ -1697,7 +1816,7 @@ export default class Settings extends View {
 
   aiConfigureDroveRoles(mode, cx) {
     if (this.droveAiConfiguring) return;
-    const effMode = mode === "strengths" ? "strengths" : mode === "all" ? "all" : "models";
+    const effMode = mode === "strengths" ? "strengths" : mode === "notes" ? "notes" : mode === "all" ? "all" : "models";
     this.droveAiConfiguring = true;
     this.droveAiRunningMode = effMode;
     this.droveAiStage = null;
@@ -1713,6 +1832,7 @@ export default class Settings extends View {
         const prevRoles = this.droveData?.config?.roles
           ? JSON.parse(JSON.stringify(this.droveData.config.roles))
           : null;
+        const prevNote = String(this.droveData?.config?.note ?? "");
         let refreshedBeforeAi = false;
         if (this.droveProbePromise) {
           this.droveAiStage = "probing";
@@ -1741,10 +1861,11 @@ export default class Settings extends View {
           : res;
         if (res?.ok) {
           if (prevRoles) {
-            this.droveRolesBackup = { roles: prevRoles, mode: effMode, at: Date.now() };
+            this.droveRolesBackup = { roles: prevRoles, note: prevNote, mode: effMode, at: Date.now() };
           }
           if (res.settings) {
             this.droveData = res.settings;
+            this.droveNoteInput.set_value(res.settings?.config?.note ?? "");
           } else {
             await this.loadDrove();
           }
@@ -1760,12 +1881,79 @@ export default class Settings extends View {
     });
   }
 
+  aiGenerateDroveNote(scope, roleId, candIdx, cx) {
+    if (this.droveNoteAiTarget || this.droveAiConfiguring) return;
+    const targetKey = scope === "global" ? "global" : `candidate:${roleId}:${candIdx}`;
+    this.droveNoteAiTarget = targetKey;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        if (!this.droveData) {
+          await this.loadDrove();
+          cx.notify();
+        }
+        const draft = scope === "global"
+          ? (this.droveNoteInput?.value?.() ?? "").trim()
+          : (this.droveCandNoteInput?.value?.() ?? "").trim();
+        const baseUrl = (this.droveUrlInput?.value?.() ?? "").trim();
+        const apiKey = (this.droveKeyInput?.value?.() ?? "").trim();
+        const model = (this.droveData?.config?.ai?.model ?? "").trim();
+        const payload = {
+          mode: "notes",
+          noteScope: scope,
+          apply: false,
+          language: this.lang(),
+        };
+        if (scope === "candidate") {
+          payload.targetRole = roleId;
+          payload.targetCandidateIndex = candIdx;
+        }
+        if (draft) payload.instruction = draft;
+        if (baseUrl) payload.baseUrl = baseUrl;
+        if (apiKey) payload.apiKey = apiKey;
+        if (model) payload.model = model;
+        const res = await this.droveCallWithJsonFile(["drove", "roles-ai-config"], payload);
+        if (res?.ok && res?.note) {
+          const generated = String(res.note).trim();
+          if (scope === "global") {
+            this.droveNoteInput.set_value(generated);
+            this.droveNoteInput.focus();
+          } else if (this.picking === `drove-note:${roleId}-c${candIdx}`) {
+            this.droveCandNoteInput.set_value(generated);
+            this.droveCandNoteInput.focus();
+          }
+        } else {
+          notify({
+            title: this.tr("AI note generation failed", "AI 生成备注失败"),
+            body: String(res?.error ?? this.tr("No note returned by AI", "AI 未返回有效备注")),
+            level: "error",
+          });
+        }
+      } catch (e) {
+        notify({
+          title: this.tr("AI note generation failed", "AI 生成备注失败"),
+          body: String(e?.message ?? e),
+          level: "error",
+        });
+      } finally {
+        if (this.droveNoteAiTarget === targetKey) {
+          this.droveNoteAiTarget = null;
+        }
+        cx.notify();
+      }
+    });
+  }
+
   restoreDroveRolesBackup(cx) {
     if (!this.droveRolesBackup?.roles || this.droveSaving || this.droveAiConfiguring) return;
-    const prev = this.droveRolesBackup.roles;
+    const prev = this.droveRolesBackup;
     this.droveRolesBackup = null;
     this.droveAiConfigResult = { ok: true, restored: true };
-    this.saveDrovePatch({ roles: prev }, cx);
+    const patch = { roles: prev.roles };
+    if (typeof prev.note === "string") {
+      patch.note = prev.note;
+    }
+    this.saveDrovePatch(patch, cx, true);
   }
 
   testDroveMagpie(cx) {
@@ -1878,6 +2066,15 @@ export default class Settings extends View {
       case "medium": return this.tr("Med", "中");
       case "high": return this.tr("High", "高");
       default: return eff;
+    }
+  }
+
+  aiPromptModeLabel(mode) {
+    switch (mode) {
+      case "shared_prefix": return this.tr("Shared Prefix", "长共享前缀");
+      case "compact": return this.tr("Compact", "精简提示词");
+      case "auto":
+      default: return this.tr("Auto", "自动");
     }
   }
 
@@ -2354,6 +2551,7 @@ export default class Settings extends View {
       ...(item.fast ? { fast: true } : {}),
       ...(item.context ? { context: String(item.context).trim() } : {}),
       strengths: this.normalizeStrengthList(item.strengths ?? []),
+      ...(item.note && String(item.note).trim() ? { note: String(item.note).trim() } : {}),
     }));
   }
 
@@ -2362,6 +2560,7 @@ export default class Settings extends View {
       .filter((item) => item && String(item.agent ?? "").trim())
       .map((item) => {
         const strengths = this.normalizeStrengthList(item.strengths ?? []);
+        const note = String(item.note ?? "").trim();
         return {
           agent: String(item.agent).trim(),
           model: item.model ? String(item.model) : null,
@@ -2369,6 +2568,7 @@ export default class Settings extends View {
           ...(item.fast ? { fast: true } : {}),
           ...(item.context ? { context: String(item.context).trim() } : {}),
           ...(strengths.length > 0 ? { strengths } : {}),
+          ...(note ? { note } : {}),
         };
       });
     if (clean.length === 0) return;
@@ -2597,6 +2797,197 @@ export default class Settings extends View {
       );
   }
 
+  droveCandidateNotePicker(t, id, roleId, idx, currentNote, onChange, cx) {
+    const key = `drove-note:${id}`;
+    const open = this.picking === key;
+    const saved = String(currentNote ?? "").trim();
+    const preview = saved.length > 42 ? `${saved.slice(0, 42)}…` : saved;
+    const aiGenerating = this.droveNoteAiTarget === `candidate:${roleId}:${idx}`;
+    const aiBusy = Boolean(this.droveNoteAiTarget || this.droveAiConfiguring);
+
+    const trigger = h_flex()
+      .id(`st-dr-cnote-btn-${id}`)
+      .px(6)
+      .py(1)
+      .gap(4)
+      .rounded(4)
+      .border_1()
+      .border_color(open ? t.accent : t.border)
+      .bg(open || saved ? t.raised : t.background)
+      .items_center()
+      .cursor_pointer()
+      .text_size(11)
+      .text_color(open ? t.accent : (saved ? t.foreground : t.muted))
+      .hover((s) => s.bg(t.hover).text_color(t.foreground))
+      .tooltip(
+        saved
+          ? `${this.tr("Candidate note (click to edit):", "候选备注（点击编辑）：")}\n${saved}`
+          : this.tr("Add a routing note for this Agent + Model (read by AI when launching sub-agents)", "为此 Agent + 模型添加备注（供 AI 选择/启动子 Agent 时参考）"),
+      )
+      .on_click((_e, cx) => {
+        this.picking = open ? null : key;
+        if (this.picking) {
+          this.droveCandNoteInput.set_value(saved);
+          this.droveCandNoteSubmit = onChange;
+          this.droveCandNoteInput.focus();
+        } else {
+          this.droveCandNoteSubmit = null;
+          this.handle.focus();
+        }
+        cx.notify();
+      })
+      .child(saved ? `${this.tr("Note:", "备注：")} ${preview}` : this.tr("+ Note", "+ 备注"));
+
+    return Popup.new(`st-dr-cnotepp-${id}`, trigger)
+      .anchor("bottom_left")
+      .flex()
+      .flex_none()
+      .when(open, (el) =>
+        el.content(
+          v_flex()
+            .w(360)
+            .p(10)
+            .gap(8)
+            .rounded(8)
+            .border_1()
+            .border_color(t.border)
+            .bg(t.background)
+            .on_mouse_down_out((_e, cx) => {
+              this.picking = null;
+              this.droveCandNoteSubmit = null;
+              this.handle.focus();
+              cx.notify();
+            })
+            .on_scroll_wheel((_e, cx) => cx.stop_propagation())
+            .child(
+              div()
+                .text_size(11.5)
+                .font_semibold()
+                .text_color(t.foreground)
+                .child(this.tr("Candidate Note (for AI sub-agent routing)", "候选备注（供 AI 启动子 Agent 参考）")),
+            )
+            .child(
+              div()
+                .w_full()
+                .px(8)
+                .py(6)
+                .rounded(6)
+                .border_1()
+                .border_color(t.border)
+                .bg(t.surface)
+                .child(
+                  Textarea.new(this.droveCandNoteInput)
+                    .id(`st-dr-cnote-ta-${id}`)
+                    .w_full()
+                    .min_h(54)
+                    .text_size(12)
+                    .text_color(t.foreground),
+                )
+                .when(!String(this.droveCandNoteInput?.value?.() ?? "").trim(), (ph) =>
+                  ph.child(
+                    div()
+                      .pt(3)
+                      .text_size(11)
+                      .text_color(t.dim)
+                      .child(
+                        this.tr(
+                          "e.g. Costs 2x quota during 2:00-6:00 PM; avoid unless no other agent is available.",
+                          "例如：下午 2:00–6:00 额度按两倍计算，应避免使用，除非没有其他 agent 可用。",
+                        ),
+                      ),
+                  ),
+                ),
+            )
+            .child(
+              h_flex()
+                .items_center()
+                .justify_between()
+                .gap(6)
+                .child(div().text_size(10.5).text_color(t.dim).child(this.tr("Ctrl+Enter to save", "Ctrl+Enter 快速保存")))
+                .child(
+                  h_flex()
+                    .gap(6)
+                    .items_center()
+                    .child(
+                      h_flex()
+                        .id(`st-dr-cnote-ai-${id}`)
+                        .px(8)
+                        .py(3)
+                        .gap(4)
+                        .rounded(5)
+                        .border_1()
+                        .border_color(t.border)
+                        .bg(t.raised)
+                        .items_center()
+                        .text_size(11)
+                        .text_color(t.foreground)
+                        .tooltip(
+                          this.tr(
+                            "Generate or refine a concise routing note for this candidate with AI and fill it into the editor",
+                            "调用 AI 为此候选生成或润色路由备注，并填入当前输入框",
+                          ),
+                        )
+                        .when(aiBusy, (el) => el.opacity(0.6))
+                        .when(!aiBusy, (el) =>
+                          el
+                            .cursor_pointer()
+                            .hover((s) => s.bg(t.hover))
+                            .on_click((_e, cx) => this.aiGenerateDroveNote("candidate", roleId, idx, cx)),
+                        )
+                        .when(aiGenerating, (el) =>
+                          el.child(svg("mods/workspace-chrome/spinner.svg").size(11).text_color(t.accent).spin(900)),
+                        )
+                        .child(aiGenerating ? this.tr("Generating…", "生成中…") : this.tr("✨ AI Note", "✨ AI 备注")),
+                    )
+                    .when(Boolean(saved), (row) =>
+                      row.child(
+                        div()
+                          .id(`st-dr-cnote-clr-${id}`)
+                          .px(8)
+                          .py(3)
+                          .rounded(5)
+                          .border_1()
+                          .border_color(t.border)
+                          .bg(t.raised)
+                          .cursor_pointer()
+                          .text_size(11)
+                          .text_color(t.muted)
+                          .hover((s) => s.bg(t.hover).text_color(t.blocked))
+                          .on_click((_e, cx) => {
+                            this.picking = null;
+                            this.droveCandNoteSubmit = null;
+                            this.handle.focus();
+                            onChange(null, cx);
+                          })
+                          .child(this.tr("Clear", "清空")),
+                      ),
+                    )
+                    .child(
+                      div()
+                        .id(`st-dr-cnote-save-${id}`)
+                        .px(10)
+                        .py(3)
+                        .rounded(5)
+                        .bg(t.accent)
+                        .cursor_pointer()
+                        .text_size(11)
+                        .font_semibold()
+                        .text_color(t.accent_foreground)
+                        .on_click((_e, cx) => {
+                          const val = this.droveCandNoteInput.value().trim();
+                          this.picking = null;
+                          this.droveCandNoteSubmit = null;
+                          this.handle.focus();
+                          onChange(val || null, cx);
+                        })
+                        .child(this.tr("Save", "保存")),
+                    ),
+                ),
+            ),
+        ),
+      );
+  }
+
   nextCandidateAgent(chain) {
     const probed = this.probedAgents();
     const used = new Set((chain ?? []).map((c) => c.agent));
@@ -2683,6 +3074,18 @@ export default class Settings extends View {
       const strengths = Array.isArray(target.strengths) ? target.strengths : [];
       const setStrengths = (nextStrengths, cx) => {
         const next = chain.map((c, i) => (i === idx ? { ...c, strengths: nextStrengths } : c));
+        commitChain(next, cx);
+      };
+      const candNote = String(target.note ?? "").trim();
+      const setCandNote = (nextNote, cx) => {
+        const clean = String(nextNote ?? "").trim();
+        const next = chain.map((c, i) => {
+          if (i !== idx) return c;
+          const copy = { ...c };
+          if (clean) copy.note = clean;
+          else delete copy.note;
+          return copy;
+        });
         commitChain(next, cx);
       };
 
@@ -2934,7 +3337,8 @@ export default class Settings extends View {
               ),
           ),
         )
-        .child(this.droveStrengthPicker(t, `${roleId}-c${idx}`, roleId, strengths, setStrengths, cx));
+        .child(this.droveStrengthPicker(t, `${roleId}-c${idx}`, roleId, strengths, setStrengths, cx))
+        .child(this.droveCandidateNotePicker(t, `${roleId}-c${idx}`, roleId, idx, candNote, setCandNote, cx));
 
       return v_flex()
         .id(`st-dr-cand-wrap-${roleId}-${idx}`)
@@ -3074,9 +3478,16 @@ export default class Settings extends View {
     const ptyArb = switches.ptyStatusArbitration !== false;
     const notesDigest = switches.notesDigest !== false;
     const promptCache = switches.promptCacheEnabled !== false;
+    const promptModeChoices = ["shared_prefix", "compact", "auto"];
+    const rawPromptMode = String(switches.promptMode ?? (promptCache ? "auto" : "compact")).trim().toLowerCase();
+    const promptMode = promptModeChoices.includes(rawPromptMode) ? rawPromptMode : (promptCache ? "auto" : "compact");
+    const detectedPromptMode = usage.promptCacheDetectedMode ?? (usage.promptCacheAutoDegraded ? "compact" : null);
+    const probeMisses = Number(usage.promptCacheProbeMisses ?? 0);
+    const probeThreshold = Number(usage.promptCacheProbeThreshold ?? 5) || 5;
     const handoffDistill = switches.handoffDistill !== false;
     const checkpointLabeling = switches.checkpointLabeling !== false;
     const semanticSummary = switches.semanticSummary !== false;
+    const redactSecrets = switches.redactSecrets !== false;
     const aiModels = this.aiAvailableModels();
     const currentAiModel = (st.model ?? "").trim();
     const aiModelItems = [
@@ -3134,6 +3545,7 @@ export default class Settings extends View {
           this.droveMachine = value;
           this.aiStatus = null;
           this.aiTestResult = null;
+          this.aiPromptProbeResult = null;
           this.droveData = null;
           this.picking = null;
           cx.spawn(async (cx) => {
@@ -3151,6 +3563,21 @@ export default class Settings extends View {
     const cachedTokens = Number(usage.cachedInputTokens ?? 0);
     const outTokens = Number(usage.outputTokens ?? 0);
     const hitPct = `${Math.round(Number(usage.cacheHitRatio ?? 0) * 1000) / 10}%`;
+    const cacheAutoDegraded = Boolean(usage.promptCacheAutoDegraded);
+    const opMetrics = usage.opMetrics && typeof usage.opMetrics === "object" ? usage.opMetrics : {};
+    const opSummaryItems = Object.entries(opMetrics)
+      .map(([op, m]) => {
+        const calls = Number(m?.calls ?? 0);
+        const hits = Number(m?.localCacheHits ?? 0);
+        const fails = Number(m?.failures ?? 0);
+        const parseErrs = Number(m?.parseErrors ?? 0);
+        const lowConf = Number(m?.lowConfidenceRejects ?? 0);
+        const avgMs = calls > 0 ? Math.round(Number(m?.totalLatencyMs ?? 0) / calls) : 0;
+        return { op, calls, hits, fails, parseErrs, lowConf, avgMs, weight: calls + hits + fails };
+      })
+      .filter((x) => x.weight > 0)
+      .sort((a, b) => b.weight - a.weight)
+      .slice(0, 6);
     const statPill = (label, value, accent = false) =>
       v_flex()
         .flex_1()
@@ -3285,7 +3712,7 @@ export default class Settings extends View {
                     "core-ai-model",
                     currentAiModel || this.tr("Auto (first available)", "自动选择（首个可用）"),
                     aiModelItems,
-                    (model, cx) => this.saveAiPatch({ model: model || "" }, cx),
+                    (model, cx) => this.selectAiModel(model || "", cx),
                     { width: 240, popupWidth: 380, anchor: "bottom_right", allowCustom: true },
                     cx,
                   ),
@@ -3463,12 +3890,172 @@ export default class Settings extends View {
                 ),
               )
               .child(
-                this.droveCardRow(
-                  t,
-                  this.tr("Prompt KV-Cache Optimization", "Prompt 缓存与多轮会话复用"),
-                  this.tr("Share a byte-immutable >1024-token system prefix, append-only Run/Attempt sessions, and prompt_cache_key to cut token cost.", "统一静态系统前缀（>1024 tokens）、追加式多轮会话复用与 prompt_cache_key，最大化缓存命中率。"),
-                  this.toggle(t, "st-ai-sw-cache", promptCache, (_e, cx) => this.saveAiPatch({ promptCacheEnabled: !promptCache }, cx)),
-                ),
+                v_flex()
+                  .w_full()
+                  .px(14)
+                  .py(11)
+                  .gap(8)
+                  .border_t(1)
+                  .border_color(t.border)
+                  .child(
+                    h_flex()
+                      .w_full()
+                      .gap(12)
+                      .items_center()
+                      .justify_between()
+                      .child(
+                        v_flex()
+                          .flex_1()
+                          .min_w(0)
+                          .gap(2)
+                          .child(
+                            div()
+                              .text_size(13)
+                              .text_color(t.foreground)
+                              .child(this.tr("Prompt KV-Cache Optimization", "长共享前缀 / 精简提示词")),
+                          )
+                          .child(
+                            div()
+                              .text_size(11.5)
+                              .line_height("16px")
+                              .text_color(t.dim)
+                              .child(
+                                this.tr(
+                                  "Choose between Shared Prefix (>1024-token KV-cache reuse), Compact short prompts, or Auto detection. Switching models resets this to Auto.",
+                                  "选择使用长共享前缀（>1024 tokens 复用 KV 缓存）、精简提示词，或由程序自动识别；切换模型后将自动切回“自动”并重新识别。",
+                                ),
+                              ),
+                          ),
+                      )
+                      .child(
+                        h_flex()
+                          .id("st-ai-prompt-mode-group")
+                          .w(276)
+                          .h(28)
+                          .flex_none()
+                          .p(2)
+                          .gap(1)
+                          .items_center()
+                          .rounded(7)
+                          .border_1()
+                          .border_color(t.border)
+                          .bg(t.background)
+                          .children(
+                            promptModeChoices.map((mode) => {
+                              const active = promptMode === mode;
+                              return div()
+                                .id(`st-ai-pm-${mode}`)
+                                .flex_1()
+                                .h(22)
+                                .px(4)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(5)
+                                .bg(active ? t.accent : "#00000000")
+                                .text_size(11)
+                                .when(active, (el) => el.font_semibold())
+                                .text_color(active ? t.accent_foreground : t.muted)
+                                .cursor_pointer()
+                                .when(!active, (el) => el.hover((s) => s.bg(t.hover).text_color(t.foreground)))
+                                .on_click((_e, cx) => {
+                                  if (mode === promptMode) return;
+                                  this.saveAiPatch({ promptMode: mode }, cx);
+                                })
+                                .child(this.aiPromptModeLabel(mode));
+                            }),
+                          ),
+                      ),
+                  )
+                  .child(
+                    h_flex()
+                      .w_full()
+                      .px(10)
+                      .py(6)
+                      .gap(8)
+                      .rounded(7)
+                      .border_1()
+                      .border_color(t.border)
+                      .bg(t.background)
+                      .items_center()
+                      .justify_between()
+                      .flex_wrap()
+                      .child(
+                        div()
+                          .id("st-ai-pm-status")
+                          .flex_1()
+                          .min_w(160)
+                          .text_size(11.5)
+                          .text_color(
+                            this.aiPromptProbeResult && this.aiPromptProbeResult.ok === false
+                              ? t.blocked
+                              : this.aiPromptProbeResult?.detectedMode === "shared_prefix"
+                                ? t.ansi2
+                                : t.dim,
+                          )
+                          .child(
+                            this.aiProbingPromptMode
+                              ? this.tr(
+                                  "Clearing prior record and running automatic KV-cache detection…",
+                                  "正在清除此前识别记录并重新执行自动识别…",
+                                )
+                              : this.aiPromptProbeResult
+                                ? this.aiPromptProbeResult.ok === false
+                                  ? this.tr(
+                                      `Detection cleared (probe failed: ${this.aiPromptProbeResult.reason ?? "error"})`,
+                                      `已清除旧记录（探测失败：${this.aiPromptProbeResult.reason ?? "请求异常"}）`,
+                                    )
+                                  : this.aiPromptProbeResult.detectedMode === "shared_prefix"
+                                    ? this.tr(
+                                        `Detected: Shared Prefix (${Number(this.aiPromptProbeResult.cachedInputTokens ?? 0).toLocaleString()} cached tokens hit)`,
+                                        `自动识别完成：长共享前缀（命中 KV 缓存 ${Number(this.aiPromptProbeResult.cachedInputTokens ?? 0).toLocaleString()} tokens）`,
+                                      )
+                                    : this.aiPromptProbeResult.detectedMode === "compact"
+                                      ? this.tr(
+                                          "Detected: Compact prompts (endpoint returned 0 cached tokens)",
+                                          "自动识别完成：精简提示词（当前端点连续探测未命中 KV 缓存）",
+                                        )
+                                      : this.tr(
+                                          `Detection record cleared${this.aiPromptProbeResult.reason ? ` (${this.aiPromptProbeResult.reason})` : ""}`,
+                                          `已清除识别记录，将在后续调用时自动识别${this.aiPromptProbeResult.reason ? `（${this.aiPromptProbeResult.reason}）` : ""}`,
+                                        )
+                                : promptMode === "auto"
+                                  ? detectedPromptMode === "shared_prefix"
+                                    ? this.tr(
+                                        "Auto-detected: Shared Prefix (KV cache verified active)",
+                                        "当前自动识别结果：长共享前缀（已验证命中 KV 缓存）",
+                                      )
+                                    : detectedPromptMode === "compact"
+                                      ? this.tr(
+                                          "Auto-detected: Compact prompts (endpoint did not hit KV cache)",
+                                          "当前自动识别结果：精简提示词（端点未命中 KV 缓存，已自动降级）",
+                                        )
+                                      : probeMisses > 0
+                                        ? this.tr(
+                                            `Auto-detecting (${probeMisses}/${probeThreshold} uncached probes so far)`,
+                                            `自动识别中（已连续 ${probeMisses}/${probeThreshold} 次未命中缓存）`,
+                                          )
+                                        : this.tr(
+                                            "Auto-detection pending (will probe on next call or click Re-detect)",
+                                            "自动识别状态：待识别（将在下次调用或点击右侧按钮时识别）",
+                                          )
+                                  : this.tr(
+                                      `Manually pinned to ${this.aiPromptModeLabel(promptMode)} (resets to Auto when model changes)`,
+                                      `当前已手动选择“${this.aiPromptModeLabel(promptMode)}”（切换模型后将自动切回“自动”）`,
+                                    ),
+                          ),
+                      )
+                      .child(
+                        this.button(
+                          t,
+                          "st-ai-pm-redetect",
+                          this.aiProbingPromptMode
+                            ? this.tr("Detecting…", "识别中…")
+                            : this.tr("Re-detect Automatically", "重新自动识别"),
+                          (_e, cx) => this.redetectPromptMode(cx),
+                        ),
+                      ),
+                  ),
               )
               .child(
                 this.droveCardRow(
@@ -3492,6 +4079,14 @@ export default class Settings extends View {
                   this.tr("Semantic Naming & Hover Micro-Summary", "语义命名与悬停微摘要"),
                   this.tr("Generate short task titles for unnamed tabs/agents, one-sentence hover progress tooltips, and Catch-up Briefing executive summaries.", "为未命名标签页与智能体生成简短任务标题、悬停一句话进展，以及离开重连简报顶栏总览。"),
                   this.toggle(t, "st-ai-sw-semantic", semanticSummary, (_e, cx) => this.saveAiPatch({ semanticSummary: !semanticSummary }, cx)),
+                ),
+              )
+              .child(
+                this.droveCardRow(
+                  t,
+                  this.tr("Outbound Secret Redaction", "外发内容敏感信息脱敏"),
+                  this.tr("Automatically scrub API keys, Bearer tokens, PEM private keys, and URL credentials before sending terminal logs or diffs to external LLMs.", "向外部模型发送终端日志、代码 Diff 或对话片段前，自动将常见密钥、Bearer Token、私钥与 URL 凭据替换为 <REDACTED>。"),
+                  this.toggle(t, "st-ai-sw-redact", redactSecrets, (_e, cx) => this.saveAiPatch({ redactSecrets: !redactSecrets }, cx)),
                 ),
               ),
           ),
@@ -3521,6 +4116,26 @@ export default class Settings extends View {
                   .child(statPill(this.tr("Sessions Reused", "多轮会话复用"), `${sessionsReused} (${activeSessions} ${this.tr("active", "活跃")})`))
                   .child(statPill(this.tr("API Calls", "远端调用次数"), totalCalls)),
               )
+              .when(promptMode === "auto" && cacheAutoDegraded, (el) =>
+                el.child(
+                  div()
+                    .id("st-ai-cache-degraded")
+                    .px(10)
+                    .py(6)
+                    .rounded(7)
+                    .border_1()
+                    .border_color(t.border)
+                    .bg(t.background)
+                    .text_size(11.5)
+                    .text_color(t.dim)
+                    .child(
+                      this.tr(
+                        "Compact prompt mode active: this endpoint returned 0 cached tokens repeatedly, so Herdr2 switched stateless ops to short prompts to save input tokens.",
+                        "已自动切换为精简提示词模式：当前端点连续多次未命中 KV 缓存，已自动停发长共享前缀以节省输入 Token。",
+                      ),
+                    ),
+                ),
+              )
               .child(
                 div()
                   .text_size(11.5)
@@ -3531,6 +4146,50 @@ export default class Settings extends View {
                       `Token 消耗 — 输入：${inTokens.toLocaleString()}（缓存命中：${cachedTokens.toLocaleString()}）· 输出：${outTokens.toLocaleString()} · 配置：${st.configPath ?? "~/.config/herdr2/ai.json"}`,
                     ),
                   ),
+              )
+              .when(opSummaryItems.length > 0, (el) =>
+                el.child(
+                  v_flex()
+                    .id("st-ai-op-metrics")
+                    .w_full()
+                    .pt(8)
+                    .gap(4)
+                    .border_t(1)
+                    .border_color(t.border)
+                    .child(
+                      div()
+                        .text_size(11)
+                        .font_semibold()
+                        .text_color(t.dim)
+                        .child(this.tr("Per-Operation Quality & Latency", "各能力质量与耗时")),
+                    )
+                    .children(
+                      opSummaryItems.map((it) => {
+                        const issues = [];
+                        if (it.fails > 0) issues.push(this.tr(`${it.fails} fail`, `${it.fails} 失败`));
+                        if (it.parseErrs > 0) issues.push(this.tr(`${it.parseErrs} parse err`, `${it.parseErrs} 解析错`));
+                        if (it.lowConf > 0) issues.push(this.tr(`${it.lowConf} low-conf`, `${it.lowConf} 低置信`));
+                        const tail = issues.length > 0 ? ` · ${issues.join(", ")}` : "";
+                        return h_flex()
+                          .w_full()
+                          .justify_between()
+                          .items_center()
+                          .gap(8)
+                          .text_size(11.5)
+                          .child(div().text_color(t.foreground).child(it.op))
+                          .child(
+                            div()
+                              .text_color(issues.length > 0 ? t.blocked : t.dim)
+                              .child(
+                                this.tr(
+                                  `${it.calls} calls · ${it.hits} cached · avg ${it.avgMs}ms${tail}`,
+                                  `${it.calls} 次调用 · ${it.hits} 次命中 · 均耗时 ${it.avgMs}ms${tail}`,
+                                ),
+                              ),
+                          );
+                      }),
+                    ),
+                ),
               ),
           ),
       );
@@ -3777,8 +4436,8 @@ export default class Settings extends View {
                         .when(!active, (el) => el.hover((s) => s.bg(t.hover)))
                         .tooltip(
                           this.tr(
-                            "One-click AI auto-configure: enter optional preferences and configure both Role Agents/Models and Candidate Strengths together (auto-probes agents if not cached)",
-                            "一键调用智能辅助模型，同时自动配置所有角色的模型与擅长任务（支持输入自然语言需求，未缓存模型将先自动检测刷新）",
+                            "One-click AI auto-configure: enter optional preferences and configure Role Agents/Models, Candidate Strengths, and Routing Notes together (auto-probes agents if not cached)",
+                            "一键调用智能辅助模型，同时自动配置所有角色的模型、擅长任务与选人备注（支持输入自然语言需求，未缓存模型将先自动检测刷新）",
                           ),
                         )
                         .on_click((_e, cx) => {
@@ -3869,6 +4528,39 @@ export default class Settings extends View {
                         .child(runningStrengths ? this.tr("✨ Configuring…", "✨ 配任务中…") : this.tr("✨ AI Strengths", "✨ AI 配擅长任务"));
                     })(),
                   )
+                  .child(
+                    (() => {
+                      const active = this.droveAiConfigMode === "notes";
+                      const runningNotes = this.droveAiConfiguring && this.droveAiRunningMode === "notes";
+                      return div()
+                        .id("st-dr-ai-notes-btn")
+                        .px(10)
+                        .py(5)
+                        .rounded(6)
+                        .border_1()
+                        .border_color(active ? t.accent : t.border)
+                        .bg(active ? t.accent : t.raised)
+                        .cursor_pointer()
+                        .text_size(12)
+                        .text_color(active ? t.accent_foreground : t.foreground)
+                        .when(!active, (el) => el.hover((s) => s.bg(t.hover)))
+                        .tooltip(
+                          this.tr(
+                            "Use AI Assistant to generate global and per-candidate routing notes (keeps current Agents, Models, and Strengths)",
+                            "保持现有 Agent、模型与擅长任务不变，调用智能辅助模型自动生成全局与各候选的选人备注",
+                          ),
+                        )
+                        .on_click((_e, cx) => {
+                          this.droveAiConfigMode = active ? null : "notes";
+                          if (this.droveAiConfigMode) {
+                            this.droveShowAddRole = false;
+                            this.droveAiRolePromptInput.focus();
+                          }
+                          cx.notify();
+                        })
+                        .child(runningNotes ? this.tr("✨ Generating…", "✨ 配备注中…") : this.tr("✨ AI Notes", "✨ AI 备注"));
+                    })(),
+                  )
                   .when(Boolean(this.droveRolesBackup), (row) =>
                     row.child(
                       div()
@@ -3902,23 +4594,29 @@ export default class Settings extends View {
             const mode = this.droveAiConfigMode;
             const isAllMode = mode === "all";
             const isStrengthsMode = mode === "strengths";
+            const isNotesMode = mode === "notes";
             const aiReady = Boolean((this.droveUrlInput.value().trim() || cfg.ai?.baseUrl?.trim()));
             const activeAiModelLabel = currentAiModel || aiStatus.model || aiModels[0] || this.tr("Auto-detect from endpoint", "自动从服务端获取");
             const hasCache = this.hasCachedAgentModels();
             const promptPlaceholder = isAllMode
               ? this.tr(
-                  "Optional instructions (e.g. coder primary Claude Opus for complex architecture & backend, Gemini for frontend UI, Codex for quick bugfixes; use a different provider for reviewer)…",
-                  "可选要求（例如：程序员主力用 Claude Opus 负责复杂架构与后端，备选 Gemini 负责前端 UI、Codex 负责快速修复；审查员使用异构厂商模型；擅长任务用简洁中文标签）…",
+                  "Optional instructions (e.g. coder primary Claude Opus for complex architecture, Gemini for frontend UI, avoid GLM 2:00-6:00 PM due to 2x quota; auto-generates models, strengths & notes)…",
+                  "可选要求（例如：程序员主力用 Claude Opus 负责复杂架构，备选 Gemini 负责前端 UI；GLM 相关模型下午 2:00–6:00 双倍额度尽量避开；将一并生成模型、擅长任务与备注）…",
                 )
-              : isStrengthsMode
+              : isNotesMode
                 ? this.tr(
-                    "Optional instructions (e.g. Claude Opus for complex architecture & backend, Gemini for frontend UI, Codex for quick bugfixes & algorithms)…",
-                    "可选要求（例如：Claude Opus 专注复杂架构与后端重构，Gemini 专注前端 UI 与样式，Codex 专注快速修复与算法，使用简洁中文标签）…",
+                    "Optional instructions (e.g. GLM models cost 2x quota from 2:00-6:00 PM so avoid unless no other agent is available; use heterogeneous provider for reviewer)…",
+                    "可选要求（例如：GLM 相关模型在下午 2:00–6:00 额度按两倍计算，应避免使用除非没有其他 agent 可用；审查优先异构模型）…",
                   )
-                : this.tr(
-                    "Optional instructions (e.g. coder primary Claude + Codex fallback, reviewer use a different provider from coder, keep token costs low)…",
-                    "可选要求（例如：程序员主力用 Claude Opus、备选用 Codex 和 Gemini；审查员使用不同厂商模型做异构审查；优先控制额度消耗）…",
-                  );
+                : isStrengthsMode
+                  ? this.tr(
+                      "Optional instructions (e.g. Claude Opus for complex architecture & backend, Gemini for frontend UI, Codex for quick bugfixes & algorithms)…",
+                      "可选要求（例如：Claude Opus 专注复杂架构与后端重构，Gemini 专注前端 UI 与样式，Codex 专注快速修复与算法，使用简洁中文标签）…",
+                    )
+                  : this.tr(
+                      "Optional instructions (e.g. coder primary Claude + Codex fallback, reviewer use a different provider from coder, keep token costs low)…",
+                      "可选要求（例如：程序员主力用 Claude Opus、备选用 Codex 和 Gemini；审查员使用不同厂商模型做异构审查；优先控制额度消耗）…",
+                    );
             return el.child(
               v_flex()
                 .id("st-dr-ai-roles-panel")
@@ -3941,10 +4639,12 @@ export default class Settings extends View {
                         .text_color(t.foreground)
                         .child(
                           isAllMode
-                            ? this.tr("AI One-Click Configure Role Models & Candidate Strengths", "AI 一键配置各角色的模型与擅长任务")
-                            : isStrengthsMode
-                              ? this.tr("AI Configure Candidate Strengths (keeps current Agents & Models)", "AI 配置各候选擅长任务（保持现有 Agent 与模型不变）")
-                              : this.tr("AI Configure Role Agents & Models", "AI 配置各角色的 Agent 与模型"),
+                            ? this.tr("AI One-Click Configure Role Models, Strengths & Notes", "AI 一键配置各角色的模型、擅长任务与备注")
+                            : isNotesMode
+                              ? this.tr("AI Configure Routing Notes (keeps current Agents, Models & Strengths)", "AI 生成全局与各候选选人备注（保持现有模型与擅长任务不变）")
+                              : isStrengthsMode
+                                ? this.tr("AI Configure Candidate Strengths (keeps current Agents & Models)", "AI 配置各候选擅长任务（保持现有 Agent 与模型不变）")
+                                : this.tr("AI Configure Role Agents & Models", "AI 配置各角色的 Agent 与模型"),
                         ),
                     )
                     .child(
@@ -4030,9 +4730,11 @@ export default class Settings extends View {
                                     : this.tr("Generating…", "生成中…"))
                                 : isAllMode
                                   ? this.tr("⚡ Generate & Apply All", "⚡ 一键生成并应用")
-                                  : isStrengthsMode
-                                    ? this.tr("✨ Generate Strengths", "✨ 生成并应用擅长任务")
-                                    : this.tr("✨ Generate Models", "✨ 生成并应用模型"),
+                                  : isNotesMode
+                                    ? this.tr("✨ Generate Notes", "✨ 生成并应用备注")
+                                    : isStrengthsMode
+                                      ? this.tr("✨ Generate Strengths", "✨ 生成并应用擅长任务")
+                                      : this.tr("✨ Generate Models", "✨ 生成并应用模型"),
                             ),
                         )
                         .child(
@@ -4051,10 +4753,12 @@ export default class Settings extends View {
             const restored = Boolean(res?.restored);
             const modeLabel =
               res?.mode === "all"
-                ? this.tr("role models & strengths", "角色模型与擅长任务")
-                : res?.mode === "strengths"
-                  ? this.tr("candidate strengths", "擅长任务")
-                  : this.tr("role agents & models", "角色与模型");
+                ? this.tr("role models, strengths & notes", "角色模型、擅长任务与备注")
+                : res?.mode === "notes"
+                  ? this.tr("routing notes", "选人备注")
+                  : res?.mode === "strengths"
+                    ? this.tr("candidate strengths", "擅长任务")
+                    : this.tr("role agents & models", "角色与模型");
             const refreshNote = res?.probedRefreshed ? this.tr(" · refreshed agents", " · 已自动刷新检测") : "";
             return el.child(
               h_flex()
@@ -4158,6 +4862,175 @@ export default class Settings extends View {
                   }
                 })),
             ),
+          )
+          .child(
+            (() => {
+              const savedNote = String(cfg.note ?? "").trim();
+              const draftNote = String(this.droveNoteInput?.value?.() ?? "").trim();
+              const noteDirty = draftNote !== savedNote;
+              const globalNoteGenerating = this.droveNoteAiTarget === "global";
+              const noteAiBusy = Boolean(this.droveNoteAiTarget || this.droveAiConfiguring);
+              return v_flex()
+                .id("st-dr-role-note-card")
+                .w_full()
+                .p(12)
+                .gap(7)
+                .rounded(10)
+                .border_1()
+                .border_color(this.droveNoteFocused ? t.accent : t.border)
+                .bg(t.surface)
+                .child(
+                  h_flex()
+                    .items_center()
+                    .justify_between()
+                    .gap(8)
+                    .flex_wrap()
+                    .child(
+                      h_flex()
+                        .gap(6)
+                        .items_center()
+                        .child(
+                          div()
+                            .text_size(12.5)
+                            .font_semibold()
+                            .text_color(t.foreground)
+                            .child(this.tr("Routing Note (for AI)", "选人备注（供 AI 参考）")),
+                        )
+                        .when(noteDirty, (row) =>
+                          row.child(
+                            div()
+                              .px(6)
+                              .py(1)
+                              .rounded(4)
+                              .bg(t.raised)
+                              .text_size(10.5)
+                              .text_color(t.accent)
+                              .child(this.tr("Unsaved", "未保存")),
+                          ),
+                        ),
+                    )
+                    .child(
+                      h_flex()
+                        .gap(6)
+                        .items_center()
+                        .child(
+                          h_flex()
+                            .id("st-dr-role-note-ai")
+                            .px(8)
+                            .py(3)
+                            .gap(4)
+                            .rounded(5)
+                            .border_1()
+                            .border_color(t.border)
+                            .bg(t.raised)
+                            .items_center()
+                            .text_size(11.5)
+                            .text_color(t.foreground)
+                            .tooltip(
+                              this.tr(
+                                "Use AI to generate or refine the global routing note and fill it into this box",
+                                "借助 AI 生成或润色全局选人备注，并填入当前输入框",
+                              ),
+                            )
+                            .when(noteAiBusy, (el) => el.opacity(0.6))
+                            .when(!noteAiBusy, (el) =>
+                              el
+                                .cursor_pointer()
+                                .hover((s) => s.bg(t.hover))
+                                .on_click((_e, cx) => this.aiGenerateDroveNote("global", null, null, cx)),
+                            )
+                            .when(globalNoteGenerating, (el) =>
+                              el.child(svg("mods/workspace-chrome/spinner.svg").size(11).text_color(t.accent).spin(900)),
+                            )
+                            .child(globalNoteGenerating ? this.tr("Generating…", "生成中…") : this.tr("✨ AI Note", "✨ AI 备注")),
+                        )
+                        .when(Boolean(draftNote || savedNote), (row) =>
+                          row.child(
+                            div()
+                              .id("st-dr-role-note-clear")
+                              .px(8)
+                              .py(3)
+                              .rounded(5)
+                              .border_1()
+                              .border_color(t.border)
+                              .bg(t.raised)
+                              .cursor_pointer()
+                              .text_size(11.5)
+                              .text_color(t.muted)
+                              .hover((s) => s.bg(t.hover).text_color(t.blocked))
+                              .on_click((_e, cx) => {
+                                this.droveNoteInput.set_value("");
+                                this.saveDrovePatch({ note: "" }, cx, true);
+                              })
+                              .child(this.tr("Clear", "清空")),
+                          ),
+                        )
+                        .child(
+                          div()
+                            .id("st-dr-role-note-save")
+                            .px(10)
+                            .py(3)
+                            .rounded(5)
+                            .border_1()
+                            .border_color(noteDirty ? t.accent : t.border)
+                            .bg(noteDirty ? t.accent : t.raised)
+                            .text_size(11.5)
+                            .when(noteDirty, (el) => el.font_semibold())
+                            .text_color(noteDirty ? t.accent_foreground : t.muted)
+                            .when(!this.droveSaving, (el) =>
+                              el
+                                .cursor_pointer()
+                                .when(!noteDirty, (el2) => el2.hover((s) => s.bg(t.hover).text_color(t.foreground)))
+                                .on_click((_e, cx) => this.saveDroveNote(cx)),
+                            )
+                            .child(this.droveSaving ? this.tr("Saving…", "保存中…") : this.tr("Save Note", "保存备注")),
+                        ),
+                    ),
+                )
+                .child(
+                  div()
+                    .text_size(11.5)
+                    .text_color(t.dim)
+                    .child(
+                      this.tr(
+                        "Read by AI when choosing or launching sub-agents across roles (supports time-window, quota, and priority rules). Ctrl+Enter to save.",
+                        "供 AI 选择或启动子 Agent 时参考（支持时段、双倍额度规避、优先级等自然语言规则），按 Ctrl+Enter 快速保存。",
+                      ),
+                    ),
+                )
+                .child(
+                  div()
+                    .w_full()
+                    .px(10)
+                    .py(6)
+                    .rounded(7)
+                    .border_1()
+                    .border_color(this.droveNoteFocused ? t.accent : t.border)
+                    .bg(t.background)
+                    .child(
+                      Textarea.new(this.droveNoteInput)
+                        .id("st-dr-role-note-input")
+                        .w_full()
+                        .min_h(52)
+                        .text_size(12.5)
+                        .text_color(t.foreground),
+                    )
+                    .when(!draftNote, (ph) =>
+                      ph.child(
+                        div()
+                          .pt(3)
+                          .text_size(11)
+                          .text_color(t.dim)
+                          .child(
+                            this.tr(
+                              "e.g. GLM models cost 2x quota from 2:00 PM to 6:00 PM; avoid using them unless no other agent is available.",
+                              "例如：GLM 相关模型在下午 2:00–6:00 额度按两倍计算，应避免使用，除非没有其他 agent 可用。",
+                            ),
+                          ),
+                      ),
+                    ),
+                );
+            })(),
           )
           .child(
             v_flex()
@@ -4455,8 +5328,10 @@ export default class Settings extends View {
 
   // Updates --------------------------------------------------------------
 
-  updates(t) {
+  updates(t, cx) {
     const u = updates();
+    const ui = u.ui ?? {};
+    const c = u.core ?? {};
     const at = (secs) => {
       const d = new Date(secs * 1000);
       return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
@@ -4464,9 +5339,9 @@ export default class Settings extends View {
     const checked = u.checked ? this.tr(` Checked at ${at(u.checked)}.`, ` 上次检查：${at(u.checked)}。`) : "";
     const result = u.checking ? this.tr("Checking\u2026", "检查中…") : u.checked
       ? this.tr(`Up to date.${checked}`, `已是最新版本。${checked}`)
-      : this.tr("No successful check. Check your connection and try again.", "检查失败，请检查网络连接后重试。");
-    // Pressed: "Checking\u2026" while it looks, then "Up to date" for a moment
-    // (a find changes the row instead). One per row: an element shows once.
+      : u.checks
+        ? this.tr("Ready to check. Click Check now to query the release server.", "就绪，点击「立即检查」查询更新源。")
+        : this.tr("Configure a releases URL below to enable updates.", "请在下方配置更新源地址以开启自动检查。");
     const asked = this.asked && Date.now() - this.asked < 3000;
     const check = (id) =>
       !u.checks
@@ -4482,12 +5357,40 @@ export default class Settings extends View {
               });
     const primary = (id, label, f) =>
       div().id(id).px(12).py(5).rounded(7).cursor_pointer().bg(t.accent).text_color(t.accent_foreground).text_size(13).font_semibold().hover((s) => s.opacity(0.9)).on_click(f).child(label);
+
+    const uiMode = this.person.ui_hot_update ?? ui.mode ?? "prompt";
+    const uiCard = u.dev_defaults
+      ? [
+          this.tr(`Dev live-reload active: ${u.dev_defaults}`, `开发源码直连热重载已开启：${u.dev_defaults}`),
+          this.button(t, "st-reload-mods", this.tr("Reload mods", "重载 Mods"), () => run("app.reload_mods")),
+        ]
+      : ui.applying
+        ? [this.tr("Applying UI hot-update\u2026 terminals stay running.", "正在免重启热更新 UI… 终端不会中断。"), null]
+        : ui.error
+          ? [this.tr(`Last UI update failed: ${ui.error}`, `上次 UI 热更新失败：${ui.error}`), check("st-check-ui")]
+          : ui.ready
+            ? [
+                this.tr(`${ui.ready} is ready. Applies live in ~200ms without restarting.`, `${ui.ready} 已就绪，约 200ms 免重启热生效，不中断终端。`),
+                primary("st-ui-apply", this.tr("Hot-update UI", "立即热更新 UI"), () => run("app.apply_ui_update")),
+              ]
+            : [
+                ui.active_override
+                  ? this.tr(`Hot-updated bundle active (base app ${fmtVer(ui.app_version)}).${checked}`, `当前运行热更新 UI 包（底座 ${fmtVer(ui.app_version)}）。${checked}`)
+                  : result,
+                check("st-check-ui"),
+              ];
+
     const app = !u.app.updates
-      ? [this.tr("A build from source: it updates with git, not here.", "当前为源码构建版本：请通过 git 拉取更新。"), null]
+      ? [
+          u.releases_url
+            ? this.tr("Source / portable binary: app self-swap applies only to installed packages.", "源码/便携运行模式：App 二进制替换仅对正式安装目录生效。")
+            : this.tr("No releases URL configured. Configure one below or build from source.", "未配置更新源地址：可在下方填写更新源或通过源码更新。"),
+          this.button(t, "st-app-restart", this.tr("Restart window", "热重启窗口"), () => run("app.restart")),
+        ]
       : u.app.ready
         ? [this.tr(`${u.app.ready} is ready. Restart to switch now; it also switches when you quit.`, `${u.app.ready} 已就绪，重启后立即生效。`), primary("st-app-update", this.tr("Restart to update", "重启更新"), () => run("app.update"))]
         : [result, check("st-check-app")];
-    const c = u.core;
+
     const core = c.managed
       ? [this.tr(`Managed by ${c.managed}: update it there.${c.ready ? ` ${c.ready} is available.` : ""}`, `由 ${c.managed} 托管：请通过包管理器更新。${c.ready ? ` 已有新版本 ${c.ready}。` : ""}`), u.checks ? check("st-check-core") : null]
       : c.updating
@@ -4498,15 +5401,97 @@ export default class Settings extends View {
             ? [this.tr(`${c.ready} is ready. Your terminals keep running through it.`, `${c.ready} 已就绪，更新过程不会中断现有终端。`), primary("st-core-update", this.tr("Update herdr2-core", "更新 herdr2-core"), () => run("app.update_core"))]
             : u.checks
               ? [result, check("st-check-core")]
-              : [this.tr("Not checked: a build from source looks for no updates.", "源码构建版本不检查自动更新。"), null];
+              : [this.tr("Not checked: configure a releases URL below to check core updates.", "未检查：配置更新源地址后可一键热升级 herdr2-core。"), null];
+
+    const modeOptions = [
+      ["prompt", this.tr("Prompt", "提示后应用")],
+      ["auto", this.tr("Auto", "静默自动")],
+      ["off", this.tr("Off", "关闭")],
+    ];
+    const savedNotice = this.releasesUrlSavedAt && Date.now() - this.releasesUrlSavedAt < 3000;
+
     return v_flex()
       .w_full()
+      .child(this.heading(t, this.tr("UI Hot-Update (No Restart)", "UI 热更新（免重启）")))
+      .child(this.row(t, `UI ${fmtVer(ui.version || u.app.version)}`.trim(), uiCard[0], uiCard[1] ?? div()))
+      .child(
+        this.row(
+          t,
+          this.tr("UI hot-update mode", "UI 热更新策略"),
+          this.tr("Choose whether verified UI bundles prompt in the corner or apply live automatically.", "选择校验通过的 UI 资源包是弹出胶囊确认，还是自动热生效。"),
+          h_flex()
+            .gap(4)
+            .children(
+              modeOptions.map(([val, label]) => {
+                const active = uiMode === val;
+                return div()
+                  .id(`st-ui-mode-${val}`)
+                  .px(10)
+                  .py(5)
+                  .rounded(6)
+                  .cursor_pointer()
+                  .text_size(12.5)
+                  .border_1()
+                  .border_color(active ? t.accent : t.border)
+                  .bg(active ? t.accent : t.surface)
+                  .text_color(active ? t.accent_foreground : t.foreground)
+                  .on_click((_e, cx) => {
+                    this.change((p) => {
+                      if (val === "prompt") delete p.ui_hot_update;
+                      else p.ui_hot_update = val;
+                    }, cx);
+                  })
+                  .child(label);
+              }),
+            ),
+        ),
+      )
+      .child(div().h(18))
       .child(this.heading(t, "Herdr2"))
       .child(this.row(t, `Herdr2 ${fmtVer(u.app.version)}`.trim(), app[0], app[1] ?? div()))
       .child(div().h(18))
       .child(this.heading(t, "herdr2-core"))
       .child(this.row(t, `herdr2-core ${fmtVer(c.version)}`.trim(), core[0], core[1] ?? div()))
-      .child(div().pt(12).text_size(12.5).line_height("18px").text_color(t.dim).child(this.tr("Herdr2 looks for both every hour and tells you in the corner. herdr2-core runs your terminals, so they keep running through its updates.", "Herdr2 每小时检查一次更新，并由后台 herdr2-core 守护确保终端会话在更新时不受影响。")));
+      .child(div().h(18))
+      .child(this.heading(t, this.tr("Release Server", "更新源配置")))
+      .child(
+        v_flex()
+          .gap(8)
+          .pt(6)
+          .child(
+            div()
+              .text_size(12.5)
+              .text_color(t.dim)
+              .child(
+                this.tr(
+                  "Base URL serving app/latest.json, ui/latest.json, and core/latest.json (HERDR2_RELEASES_URL env overrides this).",
+                  "提供 app/latest.json、ui/latest.json、core/latest.json 的静态服务地址（环境变量 HERDR2_RELEASES_URL 优先级更高）。",
+                ),
+              ),
+          )
+          .child(
+            h_flex()
+              .gap(8)
+              .items_center()
+              .child(div().flex_1().child(Input.new(this.releasesUrlInput).small().w_full()))
+              .child(
+                this.button(t, "st-save-releases-url", savedNotice ? this.tr("\u2713 Saved", "✓ 已保存") : this.tr("Save & Check", "保存并检查"), (_e, cx) => {
+                  const val = this.releasesUrlInput.value().trim().replace(/\/+$/, "");
+                  this.change((p) => {
+                    if (val) p.releases_url = val;
+                    else delete p.releases_url;
+                  }, cx);
+                  this.releasesUrlSavedAt = Date.now();
+                  if (val) {
+                    this.asked = Date.now();
+                    run("app.check_updates");
+                  }
+                  cx.notify();
+                }),
+              ),
+          ),
+      )
+      .child(div().pt(12).text_size(12.5).line_height("18px").text_color(t.dim).child(this.tr("Herdr2 checks for App, UI bundle, and Core updates every hour. herdr2-core runs your terminals, so they keep running through UI and Core updates.", "Herdr2 每小时检查一次桌面端、UI 资源包与 Core 更新；UI 与 Core 热更新全程不中断现有终端会话。")));
   }
 
 
@@ -4711,6 +5696,8 @@ export default class Settings extends View {
                         ? this.drove(t, cx)
                       : this.section === "alerts"
                         ? this.alerts(t)
+                      : this.section === "updates"
+                        ? this.updates(t, cx)
                         : this.section === "privacy"
                           ? this.privacy(t)
                           : this.look(t, cx),

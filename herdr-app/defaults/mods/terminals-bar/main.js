@@ -2,10 +2,35 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex } from "gpui-base";
-import { spaces, panes, run, theme, home, openOverlay, window as win, settings } from "herdr";
+import { spaces, panes, run, theme, home, openOverlay, window as win, settings, keys } from "herdr";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
+
+function shortcutFor(action) {
+  if (typeof keys !== "function" || !action) return "";
+  const list = keys();
+  if (!Array.isArray(list)) return "";
+  const k = list.find((b) => b.section === "global" && b.action === action);
+  if (!k?.keys?.trim()) return "";
+  const mac = typeof win === "function" && win()?.platform === "macos";
+  const names = mac ? { ctrl: "⌃", alt: "⌥", shift: "⇧", cmd: "⌘", fn: "fn" } : { ctrl: "Ctrl", alt: "Alt", shift: "Shift", cmd: "Super", fn: "Fn" };
+  const alias = { secondary: mac ? "cmd" : "ctrl", super: "cmd", win: "cmd" };
+  return k.keys.trim().split(/\s+/).map((stroke) => {
+    const parts = stroke.split("-");
+    let key = parts.pop();
+    if (key === "") { key = "-"; parts.pop(); }
+    const held = new Set(parts.map((m) => alias[m.toLowerCase()] ?? m.toLowerCase()));
+    if (/^[A-Z]$/.test(key)) held.add("shift");
+    const label = key.length === 1 ? key.toUpperCase() : key[0].toUpperCase() + key.slice(1).toLowerCase();
+    return [...Object.keys(names).filter((m) => held.has(m)).map((m) => names[m]), label].join(mac ? "" : "+");
+  }).join(" ");
+}
+
+function withShortcut(text, action) {
+  const sc = shortcutFor(action);
+  return sc ? `${text} (${sc})` : text;
+}
 
 function formatElapsed(ms) {
   const totalSec = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
@@ -95,7 +120,7 @@ function windowButton(id, icon, command) {
   );
 }
 
-function iconButton(id, icon, onClick) {
+function iconButton(id, icon, onClick, tip = "") {
   return own(div())
     .id(id)
     .flex_none()
@@ -104,6 +129,7 @@ function iconButton(id, icon, onClick) {
     .text_color(C.dim)
     .cursor_pointer()
     .hover((s) => s.bg(C.chip).text_color(C.text))
+    .when(Boolean(tip), (el) => el.tooltip(tip))
     .on_click(onClick)
     .child(svg(`mods/terminals-bar/${icon}.svg`).size(17));
 }
@@ -308,6 +334,7 @@ export default class TerminalsBar extends View {
           .text_size(13)
           .text_color(C.dim)
           .hover((s) => s.text_color(C.text))
+          .tooltip(withShortcut(tr("Quick switcher", "快速切换工作区与标签页"), "mod.open:picker"))
           .on_click(() => openOverlay({ mod: "picker", kind: "popup", at: "top", offset: 40, width: 640, height: 0.8 }))
           .child(svg("mods/terminals-bar/stack.svg").size(15))
           .child(div().max_w(160).truncate().text_color(C.text).child(space.name)),
@@ -324,8 +351,8 @@ export default class TerminalsBar extends View {
           .children(space.tabs.map(tab)),
       )
       .child(div().flex_1())
-      .child(iconButton("tm-keys", "command", () => run("app.palette")))
-      .child(iconButton("tm-new", "plus", () => run("tab.new", { space: space.id })))
+      .child(iconButton("tm-keys", "command", () => run("app.palette"), withShortcut(tr("Command palette", "命令面板"), "app.palette")))
+      .child(iconButton("tm-new", "plus", () => run("tab.new", { space: space.id }), withShortcut(tr("New tab", "新建标签页"), "tab.new")))
       .when(Boolean(w.buttons), (el) =>
         el.child(
           h_flex()

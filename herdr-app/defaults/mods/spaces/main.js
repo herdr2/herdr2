@@ -5,10 +5,35 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, ScrollHandle } from "gpui-base";
-import { spaces, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout, settings } from "herdr";
+import { spaces, machines, panes, run, openOverlay, exec, hc, theme, shared, setShared, watchFolder, window, layout, settings, keys } from "herdr";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
+
+function shortcutFor(action) {
+  if (typeof keys !== "function" || !action) return "";
+  const list = keys();
+  if (!Array.isArray(list)) return "";
+  const k = list.find((b) => b.section === "global" && b.action === action);
+  if (!k?.keys?.trim()) return "";
+  const mac = typeof window === "function" && window()?.platform === "macos";
+  const names = mac ? { ctrl: "⌃", alt: "⌥", shift: "⇧", cmd: "⌘", fn: "fn" } : { ctrl: "Ctrl", alt: "Alt", shift: "Shift", cmd: "Super", fn: "Fn" };
+  const alias = { secondary: mac ? "cmd" : "ctrl", super: "cmd", win: "cmd" };
+  return k.keys.trim().split(/\s+/).map((stroke) => {
+    const parts = stroke.split("-");
+    let key = parts.pop();
+    if (key === "") { key = "-"; parts.pop(); }
+    const held = new Set(parts.map((m) => alias[m.toLowerCase()] ?? m.toLowerCase()));
+    if (/^[A-Z]$/.test(key)) held.add("shift");
+    const label = key.length === 1 ? key.toUpperCase() : key[0].toUpperCase() + key.slice(1).toLowerCase();
+    return [...Object.keys(names).filter((m) => held.has(m)).map((m) => names[m]), label].join(mac ? "" : "+");
+  }).join(" ");
+}
+
+function withShortcut(text, action) {
+  const sc = shortcutFor(action);
+  return sc ? `${text} (${sc})` : text;
+}
 
 function find(node, id) {
   if (node?.id === id) return node;
@@ -29,6 +54,7 @@ function place(s, ps) {
   return ps.find((p) => tabs.has(p.tab) && p.cwd)?.cwd || s.folder;
 }
 const rowHeight = ({ tree }) => (tree ? 28 : 30);
+const zoomScale = () => Math.max(0.25, Number(settings?.()?.zoom ?? 1) || 1);
 const RAIL_CELL = 32;
 // A space's name and its git tail never shrink below this, so a short one ("api")
 // stays readable instead of turning into an ellipsis next to a long branch.
@@ -81,6 +107,12 @@ export default class Spaces extends View {
     this.born = {};
     this.pressed = null;
     this.over = null;
+    this.drag = null;
+    this.settling = null;
+    this.settleTask = null;
+    this.heights = {};
+    this.snapFromOrder = null;
+    this.snapUntil = 0;
     this.scroll = ScrollHandle.new(); // the list's position: the active space is brought into view through it
     this.activeAt = -1; // the active space's place among the list's children (headers and rows), -1 when not drawn
     this.machines = [];
@@ -339,14 +371,192 @@ export default class Spaces extends View {
     return out.filter(r => this.shown.has(r.w.id));
   }
 
+  spaceHeight(r) {
+    return this.heights?.[r.w.id] ?? rowHeight(r);
+  }
+
+  slotTop(list, index) {
+    let y = 0;
+    for (let j = 0; j < index && j < list.length; j++) y += this.spaceHeight(list[j]);
+    return y;
+  }
+
+  slotOffset(list, from, to) {
+    let off = 0;
+    if (to > from) {
+      for (let j = from + 1; j <= to && j < list.length; j++) off += this.spaceHeight(list[j]);
+    } else if (to < from) {
+      for (let j = to; j < from && j < list.length; j++) off -= this.spaceHeight(list[j]);
+    }
+    return off;
+  }
+
+  computeDragTo(list, from, startTop, dragHeight, dy) {
+    let to = from;
+    const center = startTop + dy + dragHeight * 0.5;
+    if (dy > 0) {
+      for (let j = from + 1; j < list.length; j++) {
+        const top = this.slotTop(list, j);
+        const h = this.spaceHeight(list[j]);
+        if (center > top + h * 0.5) to = j;
+        else break;
+      }
+    } else if (dy < 0) {
+      for (let j = from - 1; j >= 0; j--) {
+        const top = this.slotTop(list, j);
+        const h = this.spaceHeight(list[j]);
+        if (center < top + h * 0.5) to = j;
+        else break;
+      }
+    }
+    return to;
+  }
+
+  clampDragDy(list, from, dragHeight, dy) {
+    let minDy = 0;
+    for (let j = 0; j < from; j++) minDy -= this.spaceHeight(list[j]);
+    let maxDy = 0;
+    for (let j = from + 1; j < list.length; j++) maxDy += this.spaceHeight(list[j]);
+    const extra = Math.max(12, Math.round(dragHeight * 0.4));
+    return Math.max(minDy - extra, Math.min(maxDy + extra, dy));
+  }
+
+  flushSettle() {
+    this.settleTask?.cancel?.();
+    this.settleTask = null;
+    const s = this.settling;
+    if (!s) return;
+    this.settling = null;
+    if (s.moveArgs) {
+      this.snapFromOrder = s.orderSig;
+      this.snapUntil = Date.now() + 240;
+      run("space.move", s.moveArgs);
+    }
+  }
+
+  handleDragMove(e, cx) {
+    if (!this.drag) return;
+    if (e && "pressed_button" in e && e.pressed_button !== undefined && e.pressed_button !== "left") {
+      this.finishDrag(cx);
+      return;
+    }
+    const rawY = e?.position?.y;
+    if (typeof rawY !== "number") return;
+    const rawDy = rawY / zoomScale() - this.drag.startY;
+    if (!this.drag.moving && Math.abs(rawDy) < 4) return;
+    if (!this.drag.moving) {
+      this.drag.moving = true;
+    }
+    const list = this.drag.list;
+    this.drag.dy = this.clampDragDy(list, this.drag.from, this.drag.dragHeight, rawDy);
+    this.drag.to = this.computeDragTo(list, this.drag.from, this.drag.startTop, this.drag.dragHeight, this.drag.dy);
+    cx?.notify?.();
+  }
+
+  finishDrag(cx) {
+    if (!this.drag) return;
+    const d = this.drag;
+    this.drag = null;
+    this.pressed = null;
+    this.over = null;
+    if (!d.moving) {
+      run("space.select", { id: d.id });
+      cx?.notify?.();
+      return;
+    }
+    const list = d.list;
+    const destDy = this.slotOffset(list, d.from, d.to);
+    let moveArgs = null;
+    if (d.to !== d.from && list[d.to]) {
+      const targetId = list[d.to].w.id;
+      const index = spaces().findIndex((s) => s.id === targetId);
+      if (index !== -1) moveArgs = { id: d.id, index: index + 1 };
+    }
+    const orderSig = list.map((r) => r.w.id).join(",");
+    this.settling = {
+      id: d.id,
+      groupKey: d.groupKey,
+      groupBaseTop: d.groupBaseTop ?? 0,
+      from: d.from,
+      to: d.to,
+      startTop: d.startTop,
+      destDy,
+      dragHeight: d.dragHeight,
+      orderSig,
+      moveArgs,
+      rowData: list[d.from],
+    };
+    if (typeof cx?.spawn === "function") {
+      this.settleTask = cx.spawn(async (acx) => {
+        await acx.sleep(170);
+        this.settleTask = null;
+        this.flushSettle();
+        acx.notify();
+      });
+    } else {
+      this.flushSettle();
+    }
+    cx?.notify?.();
+  }
+
+  renderGroupRows(groupKey, groupRows, t, groupBaseTop = 0) {
+    const orderSig = groupRows.map((r) => r.w.id).join(",");
+    if (this.drag && this.drag.groupKey === groupKey && !groupRows.some((r) => r.w.id === this.drag.id)) {
+      this.drag = null;
+    }
+    const snapNeighbors = this.snapFromOrder !== null && (orderSig !== this.snapFromOrder || Date.now() > this.snapUntil);
+    if (snapNeighbors) this.snapFromOrder = null;
+    const motion =
+      (this.drag?.moving && this.drag.groupKey === groupKey)
+        ? this.drag
+        : (this.settling && this.settling.groupKey === groupKey ? this.settling : null);
+
+    const rendered = groupRows.map((r, idx) => {
+      const isHiddenSource = Boolean(motion && motion.from === idx);
+      let shift = 0;
+      if (motion && idx !== motion.from) {
+        if (motion.from < motion.to && idx > motion.from && idx <= motion.to) {
+          shift = -motion.dragHeight;
+        } else if (motion.from > motion.to && idx >= motion.to && idx < motion.from) {
+          shift = motion.dragHeight;
+        }
+      }
+      return this.row(r, t, {
+        groupKey,
+        groupRows,
+        groupBaseTop,
+        idx,
+        shift,
+        isHiddenSource,
+        snapNeighbors,
+      });
+    });
+
+    if (motion && (groupRows[motion.from] || motion.rowData)) {
+      const baseTop = typeof motion.groupBaseTop === "number" ? motion.groupBaseTop : groupBaseTop;
+      this.activeFloatingRow = div()
+        .id(`space-float-${motion.id}`)
+        .absolute()
+        .left(8)
+        .right(8)
+        .top(baseTop + motion.startTop + (this.drag?.moving ? this.drag.dy : motion.destDy))
+        .spring("top", { response: this.drag?.moving ? 0 : 160, damping: 0.88, epsilon: 0.25 })
+        .child(this.row(groupRows[motion.from] ?? motion.rowData, t, { isFloating: true }));
+    }
+
+    return rendered;
+  }
+
   // The rows, under a header per machine once one isn't this computer.
   grouped(t, collapsed) {
+    this.activeFloatingRow = null;
     const rows = this.ordered();
     const draw = (r) => (collapsed ? this.compact(r, t) : this.row(r, t));
     // Where the active space's row lands among the children this returns: the list scrolls by its direct
     // children, and machine headers, login notes and loading rows count too.
     this.activeAt = -1;
     let before = 0;
+    let yCursor = 0;
     const remote = [...new Set([...rows.map(r => r.w.machine).filter(Boolean), ...this.machines.map(m => m.name), ...Object.keys(this.reconnecting)])].sort();
     const loading = m => {
       const layout = machines().find(k => k.name === m)?.layout;
@@ -357,7 +567,7 @@ export default class Spaces extends View {
     if (!remote.length) {
       if (loading(null) && !rows.length) return [loadingRow(null)];
       this.activeAt = rows.findIndex(r => r.w.active);
-      return rows.map(draw);
+      return collapsed ? rows.map(draw) : this.renderGroupRows("local", rows, t, 0);
     }
     const machineNames = [null, ...remote];
     return machineNames.flatMap((m) => {
@@ -394,17 +604,18 @@ export default class Spaces extends View {
               .on_click((_e, cx) => { cx.stop_propagation(); this.reconnect(machine, cx); })
               .child(repair?.busy ? tr("Connecting…", "连接中…") : tr("Connect", "连接")))))
           .when(connected, el => el.child(div().id(`machine-add-${m ?? "local"}`).flex_none().px(4).rounded(4).hover(s => s.bg(t.hover).text_color(t.foreground))
+            .tooltip(withShortcut(tr(`New space on ${m ?? "this computer"}`, `在${m ?? "本机"}新建工作区`), "space.new"))
             .on_click((_e, cx) => { cx.stop_propagation(); run("space.new", { machine: m ?? "" }); }).child("+")))
           .child(div().size(6).rounded(3).flex_none().bg(connected ? t.ansi2 : t.dim))
           .child(svg(`mods/workspace-chrome/chevron-${folded ? "right" : "down"}.svg`).size(11).flex_none()));
       const empty = h_flex().id(`machine-new-${m ?? "local"}`).h(28).flex_none().px(collapsed ? 0 : 8).gap(7).items_center().rounded(7)
         .text_size(12).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
         .on_click(() => run("space.new", { machine: m ?? "" }))
-        .when(collapsed, el => el.w(RAIL_CELL).rounded(6).justify_center().tooltip(tr(`New space on ${m ?? "this computer"}`, `在${m ?? "本机"}新建工作区`))
+        .when(collapsed, el => el.w(RAIL_CELL).rounded(6).justify_center().tooltip(withShortcut(tr(`New space on ${m ?? "this computer"}`, `在${m ?? "本机"}新建工作区`), "space.new"))
           .child(h_flex().size(18).rounded(5).border_1().border_color(t.dim).items_center().justify_center()
             .child(svg("mods/workspace-chrome/plus.svg").size(10))))
         .when(!collapsed, el => el.child(svg("mods/workspace-chrome/plus.svg").size(12)).child(tr("New space there", "在此新建工作区")));
-      if (!collapsed && rebuilt) { before += 1; return [head]; }
+      if (!collapsed && rebuilt) { before += 1; yCursor += 26; return [head]; }
       const cell = collapsed ? railCell : (el) => el;
       const guidance = !collapsed && login ? [v_flex().px(8).pb(6).gap(3).flex_none()
         .child(div().text_size(11).text_color(t.blocked).child(tr("needs a login: run", "需要登录，请运行")))
@@ -414,7 +625,22 @@ export default class Spaces extends View {
             .text_size(11).text_color(t.foreground).bg(t.raised).cursor_pointer().hover(s => s.bg(t.hover))
             .on_click((_e, cx) => { cx.stop_propagation(); cx.write_to_clipboard(login); this.copiedLogin = login; cx.notify(); })
             .child(this.copiedLogin === login ? tr("Copied", "已复制") : tr("Copy", "复制"))))] : [];
-      const items = [cell(head), ...guidance, ...(folded ? [] : mine.length ? mine.map(draw) : [loading(m) ? loadingRow(m) : cell(empty)])];
+      yCursor += 26;
+      if (guidance.length) yCursor += 44;
+      const groupBaseTop = yCursor;
+      const bodyRows = folded
+        ? []
+        : mine.length
+          ? (collapsed ? mine.map(draw) : this.renderGroupRows(m ?? "local", mine, t, groupBaseTop))
+          : [loading(m) ? loadingRow(m) : cell(empty)];
+      if (!folded) {
+        if (mine.length) {
+          for (const mr of mine) yCursor += this.spaceHeight(mr);
+        } else {
+          yCursor += 28;
+        }
+      }
+      const items = [cell(head), ...guidance, ...bodyRows];
       const first = folded ? -1 : mine.findIndex(r => r.w.active);
       if (first >= 0) this.activeAt = before + 1 + guidance.length + first;
       before += items.length;
@@ -445,33 +671,84 @@ export default class Spaces extends View {
       .when(g.behind > 0, (el) => el.child(div().flex_none().text_color(t.ansi1).child(`\u2193${g.behind}`)));
   }
 
-  row({ w, i, g, tree }, t) {
+  row({ w, i, g, tree }, t, opts = {}) {
+    const {
+      groupKey = null,
+      groupRows = null,
+      groupBaseTop = 0,
+      idx = -1,
+      shift = 0,
+      isHiddenSource = false,
+      snapNeighbors = false,
+      isFloating = false,
+    } = opts;
     const on = w.active;
     const fromIndex = this.pressed === null ? -1 : spaces().findIndex(s => s.id === this.pressed);
     const colors = shared("space.colors") ?? {};
     const color = colors[w.id] ?? "ansi6";
     const fill = color.startsWith("#") ? color : (MARK[color] ?? t[color]);
-    return v_flex()
+    const h = rowHeight({ tree });
+    const el = v_flex()
       .relative()
-      .id(`space-${w.id}`)
+      .id(isFloating ? `space-card-float-${w.id}` : `space-${w.id}`)
       .px(8)
-      .h(rowHeight({ tree }))
+      .h(h)
       .flex_none()
       .justify_center()
       .rounded(8)
-      .when(on, (el) => el.bg(t.selected))
-      .when(!on, (el) => el.hover((s) => s.bg(t.hover)))
-      .when(this.pressed === w.id && this.over !== w.id, (el) => el.opacity(0.5))
-      .when(this.pressed !== null && this.over === w.id && this.pressed !== w.id, (el) => el.child(
+      .when(isFloating, (n) => n.bg(t.raised ?? t.selected).border_1().border_color(t.accent ?? t.border).shadow_lg().cursor_grabbing())
+      .when(!isFloating && on, (n) => n.bg(t.selected))
+      .when(!isFloating && !on && !this.drag?.moving, (n) => n.hover((s) => s.bg(t.hover)))
+      .when(!isFloating, (n) =>
+        n
+          .top(shift)
+          .spring("top", { response: snapNeighbors || isHiddenSource ? 0 : 165, damping: 0.86, epsilon: 0.25 })
+          .when(isHiddenSource, (x) => x.opacity(0))
+          .on_size_change((size) => {
+            const z = zoomScale();
+            const mh = size && typeof size.height === "number" ? size.height / z : 0;
+            if (mh > 0 && Math.abs((this.heights?.[w.id] ?? 0) - mh) > 0.5) {
+              this.heights ??= {};
+              this.heights[w.id] = mh;
+            }
+          }),
+      )
+      .when(!isFloating && !this.drag && this.pressed === w.id && this.over !== w.id, (n) => n.opacity(0.5))
+      .when(!isFloating && !this.drag && this.pressed !== null && this.over === w.id && this.pressed !== w.id, (n) => n.child(
         div().absolute().left(0).right(0).h(2).bg(t.accent)
           .when(fromIndex < i, line => line.bottom(0))
           .when(fromIndex > i, line => line.top(0)),
       ))
-      .on_mouse_down("left", () => {
+      .when(!isFloating && !isHiddenSource, (n) => n.cursor_pointer())
+      .on_mouse_down("left", (e) => {
+        if (isFloating || isHiddenSource) return;
+        this.flushSettle?.();
         this.pressed = w.id;
         this.over = w.id;
+        if (groupRows && idx >= 0 && e && typeof e.position?.y === "number") {
+          const z = zoomScale();
+          const dragH = this.spaceHeight({ w, tree });
+          this.drag = {
+            id: w.id,
+            groupKey,
+            groupBaseTop,
+            list: groupRows,
+            from: idx,
+            to: idx,
+            startY: e.position.y / z,
+            startTop: this.slotTop(groupRows, idx),
+            dy: 0,
+            moving: false,
+            dragHeight: dragH,
+          };
+        }
       })
-      .on_mouse_move((_e, cx) => {
+      .on_mouse_move((e, cx) => {
+        if (isFloating || isHiddenSource) return;
+        if (this.drag) {
+          this.handleDragMove(e, cx);
+          return;
+        }
         const source = spaces().find(s => s.id === this.pressed);
         const over = source && (source.machine ?? null) === (w.machine ?? null) ? w.id : null;
         if (this.pressed !== null && this.over !== over) {
@@ -480,6 +757,11 @@ export default class Spaces extends View {
         }
       })
       .on_mouse_up("left", (_e, cx) => {
+        if (isFloating || isHiddenSource) return;
+        if (this.drag) {
+          this.finishDrag(cx);
+          return;
+        }
         const from = this.pressed;
         const over = this.over;
         this.pressed = null;
@@ -490,16 +772,20 @@ export default class Spaces extends View {
         } else if (from === w.id) run("space.select", { id: w.id });
         cx.notify();
       })
-      .on_mouse_down("right", () => this.menu(w))
+      .on_mouse_down("right", () => {
+        if (isFloating || isHiddenSource) return;
+        this.menu(w);
+      })
       .child(
         h_flex()
           .gap(9)
           .items_center()
-          .when(Boolean(tree), el => el.pl(22).child(svg("mods/workspace-chrome/branch.svg").size(13).flex_none().text_color(t.dim)))
-          .when(!tree, el => el.child(h_flex().size(18).flex_none().rounded(5).bg(fill).items_center().justify_center().text_size(10.5).font_bold().text_color("#ffffff").child([...w.name][0]?.toUpperCase() ?? "?")))
+          .when(Boolean(tree), n => n.pl(22).child(svg("mods/workspace-chrome/branch.svg").size(13).flex_none().text_color(t.dim)))
+          .when(!tree, n => n.child(h_flex().size(18).flex_none().rounded(5).bg(fill).items_center().justify_center().text_size(10.5).font_bold().text_color("#ffffff").child([...w.name][0]?.toUpperCase() ?? "?")))
           .child(div().flex_initial().min_w(SIDE_MIN).truncate().text_color(t.foreground).child(w.name))
           .child(g ? this.gitTail(g, tree, w.name, t) : div().flex_1()),
       );
+    return el;
   }
 
   compact({ w, i }, t) {
@@ -541,8 +827,13 @@ export default class Spaces extends View {
       this.revealedAt = this.activeAt;
       if (this.activeAt >= 0) this.scroll.scroll_to_item(this.activeAt);
     }
-    return v_flex().size_full().min_h(0).bg(t.chrome).text_size(13)
+    return v_flex().relative().size_full().min_h(0).bg(t.chrome).text_size(13)
       .when(Boolean(this.listFocus), (el) => el.track_focus(this.listFocus))
+      .on_mouse_move((e, cx) => this.handleDragMove(e, cx))
+      .on_mouse_up("left", (_e, cx) => {
+        if (this.drag) this.finishDrag(cx);
+        else if (this.pressed !== null) { this.pressed = null; this.over = null; cx.notify(); }
+      })
       .on_key_down((e, cx) => {
         if (e?.key === "f2") {
           const id = spaces().find(p => p.active)?.id;
@@ -556,11 +847,26 @@ export default class Spaces extends View {
         .when(collapsed, el => el.pl(0).pr(0).justify_center())
         .when(!collapsed, el => el.child(tr("Spaces", "工作区")))
         .child(div().id("space-new").size(26).flex_none().flex().items_center().justify_center().rounded(6).hover(s => s.bg(t.hover).text_color(t.foreground))
+          .tooltip(withShortcut(tr("New space", "新建工作区"), "space.new"))
           .on_click(() => run("space.new")).child(svg("mods/workspace-chrome/plus.svg").size(14))))
-      .child(v_flex().flex_1().min_h(0).px(collapsed ? 0 : 8).pb(14).overflow_y_scrollbar().mode("always").track_scroll(this.scroll)
+      .child(v_flex().relative().flex_1().min_h(0).px(collapsed ? 0 : 8).pb(14).overflow_y_scrollbar().mode("always").track_scroll(this.scroll)
         // A block above (another mod's) growing, or the window resizing, shrinks this list and can push the active space out.
-        .on_size_change((_size, cx) => { if (this.activeAt >= 0) { this.scroll.scroll_to_item(this.activeAt); cx.notify(); } })
-        .on_mouse_up("left", (_e, cx) => { this.pressed = null; cx.notify(); })
-        .children(list));
+        .on_size_change((_size, cx) => { if (this.activeAt >= 0 && !this.drag && !this.settling) { this.scroll.scroll_to_item(this.activeAt); cx.notify(); } })
+        .on_mouse_up("left", (_e, cx) => {
+          if (this.drag) this.finishDrag(cx);
+          else { this.pressed = null; this.over = null; cx.notify(); }
+        })
+        .children(list)
+        .when(Boolean(this.activeFloatingRow), (el) => el.child(this.activeFloatingRow)))
+      .when(Boolean(this.drag?.moving), (el) => el.child(
+        div()
+          .id("space-drag-shield")
+          .absolute()
+          .inset(0)
+          .bg("#00000000")
+          .cursor_grabbing()
+          .on_mouse_move((e, cx) => this.handleDragMove(e, cx))
+          .on_mouse_up("left", (_e, cx) => { cx.stop_propagation(); this.finishDrag(cx); }),
+      ));
   }
 }

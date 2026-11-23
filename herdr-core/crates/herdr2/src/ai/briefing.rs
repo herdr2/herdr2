@@ -206,11 +206,7 @@ pub fn compute_downstream_impact(tasks: &[Task]) -> HashMap<String, Vec<String>>
                 }
             }
         }
-        let mut list: Vec<String> = visited
-            .into_iter()
-            .filter(|k| active_keys.contains(k))
-            .map(String::from)
-            .collect();
+        let mut list: Vec<String> = visited.into_iter().filter(|k| active_keys.contains(k)).map(String::from).collect();
         list.sort();
         if !list.is_empty() {
             out.insert(t.key.clone(), list);
@@ -223,11 +219,7 @@ pub fn compute_downstream_impact(tasks: &[Task]) -> HashMap<String, Vec<String>>
 pub fn permission_cluster_key(perm: &PublicPermission) -> (String, String) {
     let kind = perm.kind.as_deref().unwrap_or("").trim().to_ascii_lowercase();
     let norm_kind = if kind.is_empty() { "other".to_string() } else { kind };
-    let cleaned = perm
-        .title
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['"', '\'', '`'], "");
+    let cleaned = perm.title.trim().to_ascii_lowercase().replace(['"', '\'', '`'], "");
     let tokens: Vec<&str> = cleaned.split_whitespace().collect();
     let stem = if tokens.is_empty() {
         norm_kind.clone()
@@ -260,12 +252,7 @@ pub fn build_deterministic_briefing(
     // 1. Collect ACP permission requests for clustering & classify other ACP states.
     let mut perm_buckets: BTreeMap<String, Vec<&BriefingAgentInput>> = BTreeMap::new();
     for a in agents {
-        let title = a
-            .semantic_title
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(&a.display_name)
-            .to_string();
+        let title = a.semantic_title.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or(&a.display_name).to_string();
         match a.status.as_str() {
             "error" => {
                 critical_blockers.push(BriefingItem {
@@ -370,12 +357,8 @@ pub fn build_deterministic_briefing(
         } else if let Some(a) = group.into_iter().next() {
             let perm = a.pending_permission.as_ref().expect("single perm");
             let perm_kind = perm.kind.clone().unwrap_or_else(|| "other".into());
-            let title = a
-                .semantic_title
-                .as_deref()
-                .filter(|s| !s.trim().is_empty())
-                .unwrap_or(&a.display_name)
-                .to_string();
+            let title =
+                a.semantic_title.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or(&a.display_name).to_string();
             single_decisions.push(BriefingItem {
                 id: format!("agent:{}", a.address),
                 kind: "acp_permission".into(),
@@ -407,11 +390,7 @@ pub fn build_deterministic_briefing(
             .or(t.program_name.as_deref())
             .unwrap_or(&t.address)
             .to_string();
-        let detail = t
-            .ai_status_summary
-            .clone()
-            .or_else(|| t.micro_summary.clone())
-            .unwrap_or_default();
+        let detail = t.ai_status_summary.clone().or_else(|| t.micro_summary.clone()).unwrap_or_default();
         match t.status.as_str() {
             "blocked" => {
                 let is_err = t.ai_status_kind.as_deref() == Some("error");
@@ -488,12 +467,7 @@ pub fn build_deterministic_briefing(
             continue;
         }
         let impact = compute_downstream_impact(&dr.tasks);
-        let run_label = dr
-            .run
-            .name
-            .as_deref()
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(&dr.run.objective);
+        let run_label = dr.run.name.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or(&dr.run.objective);
 
         for task in &dr.tasks {
             let blocked_keys = impact.get(&task.key).cloned().unwrap_or_default();
@@ -503,7 +477,9 @@ pub fn build_deterministic_briefing(
                     let reason = task
                         .result
                         .as_ref()
-                        .and_then(|r| r.blockers.as_ref().and_then(|b| b.first()).cloned().or_else(|| Some(r.summary.clone())))
+                        .and_then(|r| {
+                            r.blockers.as_ref().and_then(|b| b.first()).cloned().or_else(|| Some(r.summary.clone()))
+                        })
                         .filter(|s| !s.trim().is_empty())
                         .unwrap_or_else(|| {
                             if is_zh { "任务失败或阻塞".into() } else { "Task failed or blocked".into() }
@@ -537,9 +513,15 @@ pub fn build_deterministic_briefing(
                     let summary = task
                         .result
                         .as_ref()
-                        .and_then(|r| r.compact_summary.clone().or_else(|| (!r.summary.is_empty()).then(|| r.summary.clone())))
+                        .and_then(|r| {
+                            r.compact_summary.clone().or_else(|| (!r.summary.is_empty()).then(|| r.summary.clone()))
+                        })
                         .unwrap_or_else(|| {
-                            if is_zh { "任务已完成并通过校验".into() } else { "Task completed and verified".into() }
+                            if is_zh {
+                                "任务已完成并通过校验".into()
+                            } else {
+                                "Task completed and verified".into()
+                            }
                         });
                     ready_to_review.push(BriefingItem {
                         id: format!("drove_task:{}", task.id),
@@ -552,7 +534,11 @@ pub fn build_deterministic_briefing(
                         run_id: Some(dr.run.id.clone()),
                         task_key: Some(task.key.clone()),
                         has_diff: verified
-                            || task.result.as_ref().and_then(|r| r.files_modified.as_ref()).is_some_and(|f| !f.is_empty()),
+                            || task
+                                .result
+                                .as_ref()
+                                .and_then(|r| r.files_modified.as_ref())
+                                .is_some_and(|f| !f.is_empty()),
                         ..Default::default()
                     });
                 }
@@ -564,13 +550,9 @@ pub fn build_deterministic_briefing(
             if !msg.needs_action || msg.handled_at.is_some() {
                 continue;
             }
-            let task_key = msg.task_id.as_deref().and_then(|tid| {
-                dr.tasks.iter().find(|t| t.id == tid).map(|t| t.key.clone())
-            });
-            let blocked_keys = task_key
-                .as_deref()
-                .and_then(|k| impact.get(k).cloned())
-                .unwrap_or_default();
+            let task_key =
+                msg.task_id.as_deref().and_then(|tid| dr.tasks.iter().find(|t| t.id == tid).map(|t| t.key.clone()));
+            let blocked_keys = task_key.as_deref().and_then(|k| impact.get(k).cloned()).unwrap_or_default();
             let title = (!msg.subject.trim().is_empty())
                 .then(|| msg.subject.clone())
                 .or_else(|| task_key.as_ref().map(|k| format!("Drove · {k}")))
@@ -601,14 +583,16 @@ pub fn build_deterministic_briefing(
             .then_with(|| b.status_ms.unwrap_or(0).cmp(&a.status_ms.unwrap_or(0)))
             .then_with(|| a.id.cmp(&b.id))
     });
-    permission_clusters.sort_by(|a, b| b.addresses.len().cmp(&a.addresses.len()).then_with(|| a.cluster_key.cmp(&b.cluster_key)));
+    permission_clusters
+        .sort_by(|a, b| b.addresses.len().cmp(&a.addresses.len()).then_with(|| a.cluster_key.cmp(&b.cluster_key)));
     single_decisions.sort_by(|a, b| {
         b.blocked_downstream_count
             .cmp(&a.blocked_downstream_count)
             .then_with(|| b.status_ms.unwrap_or(0).cmp(&a.status_ms.unwrap_or(0)))
             .then_with(|| a.id.cmp(&b.id))
     });
-    ready_to_review.sort_by(|a, b| b.status_ms.unwrap_or(0).cmp(&a.status_ms.unwrap_or(0)).then_with(|| a.id.cmp(&b.id)));
+    ready_to_review
+        .sort_by(|a, b| b.status_ms.unwrap_or(0).cmp(&a.status_ms.unwrap_or(0)).then_with(|| a.id.cmp(&b.id)));
 
     let clustered_count: usize = permission_clusters.iter().map(|g| g.addresses.len()).sum();
     let counts = BriefingCounts {
@@ -617,7 +601,11 @@ pub fn build_deterministic_briefing(
         batch_groups: permission_clusters.len(),
         ready_review: ready_to_review.len(),
         working: working_items.len(),
-        total_active: critical_blockers.len() + clustered_count + single_decisions.len() + ready_to_review.len() + working_items.len(),
+        total_active: critical_blockers.len()
+            + clustered_count
+            + single_decisions.len()
+            + ready_to_review.len()
+            + working_items.len(),
     };
 
     let headline = Some(deterministic_headline(&counts, &critical_blockers, &permission_clusters, away_minutes, is_zh));
@@ -679,9 +667,19 @@ fn deterministic_headline(
     if counts.needs_you > 0 {
         if let Some(g) = clusters.first() {
             parts.push(if is_zh {
-                format!("{} 项待确认（含 {} 组可合并批复，最多 {} 个同类审批）", counts.needs_you, clusters.len(), g.addresses.len())
+                format!(
+                    "{} 项待确认（含 {} 组可合并批复，最多 {} 个同类审批）",
+                    counts.needs_you,
+                    clusters.len(),
+                    g.addresses.len()
+                )
             } else {
-                format!("{} waiting on you ({} batchable group(s), up to {} similar)", counts.needs_you, clusters.len(), g.addresses.len())
+                format!(
+                    "{} waiting on you ({} batchable group(s), up to {} similar)",
+                    counts.needs_you,
+                    clusters.len(),
+                    g.addresses.len()
+                )
             });
         } else {
             parts.push(if is_zh {
@@ -698,11 +696,7 @@ fn deterministic_headline(
             format!("{} completed and ready to review", counts.ready_review)
         });
     }
-    if is_zh {
-        format!("{}。", parts.join("；"))
-    } else {
-        format!("{}.", parts.join("; "))
-    }
+    if is_zh { format!("{}。", parts.join("；")) } else { format!("{}.", parts.join("; ")) }
 }
 
 /// Optionally upgrades `snapshot.headline` via shared Core AI (`op = "catchup_briefing"`).
@@ -735,12 +729,8 @@ pub async fn enhance_briefing_headline(
         .take(3)
         .map(|g| json!({"kind": g.permission_kind, "title": g.title, "count": g.addresses.len()}))
         .collect();
-    let ready: Vec<Value> = snapshot
-        .ready_to_review
-        .iter()
-        .take(4)
-        .map(|r| json!({"title": r.title, "summary": r.summary}))
-        .collect();
+    let ready: Vec<Value> =
+        snapshot.ready_to_review.iter().take(4).map(|r| json!({"title": r.title, "summary": r.summary})).collect();
 
     let payload = json!({
         "away_minutes": away_minutes,
@@ -753,8 +743,8 @@ pub async fn enhance_briefing_headline(
     let cache_key = format!("catchup_briefing:{lang}:{}", fingerprint_hex(&[&payload_str]));
     let user_prompt = format_op_user_message("catchup_briefing", lang, &payload);
 
-    if let Some(resp) = ai
-        .complete_bg(AiCompleteRequest {
+    if let Ok(resp) = ai
+        .complete_fg(AiCompleteRequest {
             op: "catchup_briefing".into(),
             tier: AiTaskTier::Nano,
             mode: AiConversationMode::StatelessSharedPrefix,
@@ -767,11 +757,15 @@ pub async fn enhance_briefing_headline(
             ..Default::default()
         })
         .await
-        && let Some(parsed) = extract_json_object(&resp.content)
-        && let Some(headline) = clean_bounded(parsed["headline"].as_str(), 220)
     {
-        snapshot.headline = Some(headline);
-        snapshot.headline_from_ai = true;
+        if let Some(parsed) = extract_json_object(&resp.content)
+            && let Some(headline) = clean_bounded(parsed["headline"].as_str(), 220)
+        {
+            snapshot.headline = Some(headline);
+            snapshot.headline_from_ai = true;
+        } else if !resp.from_local_cache {
+            ai.record_parse_error("catchup_briefing");
+        }
     }
 }
 

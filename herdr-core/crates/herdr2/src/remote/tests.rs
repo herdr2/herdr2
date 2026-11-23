@@ -7,7 +7,12 @@ use std::sync::atomic::AtomicBool;
 async fn removing_or_replacing_a_machine_drops_its_status_poll() {
     for replacement in [false, true] {
         let root = std::path::PathBuf::from(format!("/var/tmp/h2-poll-{}", crate::platform::random_hex()));
-        let paths = Paths { socket: root.join("core.sock"), holder_socket: root.join("holder.sock"), state: root.clone(), config: root.join("config.toml") };
+        let paths = Paths {
+            socket: root.join("core.sock"),
+            holder_socket: root.join("holder.sock"),
+            state: root.clone(),
+            config: root.join("config.toml"),
+        };
         paths.create_dirs().unwrap();
         let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
         let machine: Machine = serde_json::from_value(json!({
@@ -92,8 +97,14 @@ async fn a_send_on_an_already_closed_line_fails_without_waiting() {
 
 #[test]
 fn remote_misses_and_renames_keep_subscribers_on_the_current_machine() {
-    let root = crate::test_tmp().join(format!("h2-doc-missed-{}-{}", std::process::id(), crate::platform::random_hex()));
-    let paths = Paths { socket: root.join("core.sock"), holder_socket: root.join("holder.sock"), state: root.clone(), config: root.join("config.toml") };
+    let root =
+        crate::test_tmp().join(format!("h2-doc-missed-{}-{}", std::process::id(), crate::platform::random_hex()));
+    let paths = Paths {
+        socket: root.join("core.sock"),
+        holder_socket: root.join("holder.sock"),
+        state: root.clone(),
+        config: root.join("config.toml"),
+    };
     paths.create_dirs().unwrap();
     let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
     let machine = Machine {
@@ -181,8 +192,14 @@ fn remote_misses_and_renames_keep_subscribers_on_the_current_machine() {
 
 #[test]
 fn remote_handoff_localizes_from_address_and_routes_into() {
-    let root = crate::test_tmp().join(format!("h2-handoff-remote-{}-{}", std::process::id(), crate::platform::random_hex()));
-    let paths = Paths { socket: root.join("core.sock"), holder_socket: root.join("holder.sock"), state: root.clone(), config: root.join("config.toml") };
+    let root =
+        crate::test_tmp().join(format!("h2-handoff-remote-{}-{}", std::process::id(), crate::platform::random_hex()));
+    let paths = Paths {
+        socket: root.join("core.sock"),
+        holder_socket: root.join("holder.sock"),
+        state: root.clone(),
+        config: root.join("config.toml"),
+    };
     paths.create_dirs().unwrap();
     let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
     let machine = Machine {
@@ -243,33 +260,23 @@ fn remote_handoff_localizes_from_address_and_routes_into() {
     assert_eq!(ho_reply["lineage"]["parent"], "wsl/t22");
 
     // 3. `route` for remote `agent.handoff` strips matching machine prefix from both `source` and `into`.
-    let routed = route(
-        &core,
-        "agent.handoff",
-        &json!({ "source": "wsl/a4", "into": "wsl/t22", "kind": "handoff" }),
-    )
-    .unwrap()
-    .expect("routed to wsl");
+    let routed = route(&core, "agent.handoff", &json!({ "source": "wsl/a4", "into": "wsl/t22", "kind": "handoff" }))
+        .unwrap()
+        .expect("routed to wsl");
     assert_eq!(routed.1["source"], "a4");
     assert_eq!(routed.1["into"], "t22");
 
     // 4. `route` for remote `ai.handoff_recommend` and `checkpoint.bisect` strips matching machine prefix.
-    let rec_routed = route(
-        &core,
-        "ai.handoff_recommend",
-        &json!({ "source": "wsl/a4", "installedPresets": ["claude", "codex"] }),
-    )
-    .unwrap()
-    .expect("ai.handoff_recommend routed to wsl");
+    let rec_routed =
+        route(&core, "ai.handoff_recommend", &json!({ "source": "wsl/a4", "installedPresets": ["claude", "codex"] }))
+            .unwrap()
+            .expect("ai.handoff_recommend routed to wsl");
     assert_eq!(rec_routed.1["source"], "a4");
 
-    let bisect_routed = route(
-        &core,
-        "checkpoint.bisect",
-        &json!({ "target": "wsl/t22", "query": "which turn broke auth?" }),
-    )
-    .unwrap()
-    .expect("checkpoint.bisect routed to wsl");
+    let bisect_routed =
+        route(&core, "checkpoint.bisect", &json!({ "target": "wsl/t22", "query": "which turn broke auth?" }))
+            .unwrap()
+            .expect("checkpoint.bisect routed to wsl");
     assert_eq!(bisect_routed.1["target"], "t22");
 
     drop(core);

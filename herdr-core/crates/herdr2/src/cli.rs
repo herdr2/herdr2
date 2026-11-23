@@ -76,6 +76,12 @@ enum AiCmd {
         #[arg(long)]
         consume: bool,
     },
+    /// Clear prior prompt-cache detection records, set prompt mode to auto, and re-detect shared-prefix vs compact mode.
+    ProbePromptMode {
+        /// Target remote machine (`h2 machine ls`).
+        #[arg(long, value_name = "MACHINE")]
+        on: Option<String>,
+    },
     /// Recommend a complementary target provider, handoff mode, and note for an upstream session.
     HandoffRecommend {
         /// Source agent or terminal (`a1`, `t1`, name, or `machine/a1`).
@@ -151,7 +157,7 @@ enum AiCmd {
 }
 
 #[derive(Parser)]
-#[command(name = "h2", version, about = "herdr2: headless ACP orchestration runtime for coding agents")]
+#[command(name = "h2", version = env!("H2_LONG_VERSION"), about = "herdr2: headless ACP orchestration runtime for coding agents")]
 struct Cli {
     /// JSON output even in a terminal.
     #[arg(long, global = true)]
@@ -582,6 +588,18 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
                 };
                 Out { json: r, human }
             }
+            AiCmd::ProbePromptMode { on } => {
+                let mut params = json!({});
+                if let Some(m) = on {
+                    params["on"] = json!(m);
+                }
+                let r = call("ai.probe_prompt_mode", params)?;
+                let mode = r["detectedMode"].as_str().unwrap_or("pending");
+                let probes = r["probesRun"].as_u64().unwrap_or(0);
+                let cached = r["cachedInputTokens"].as_u64().unwrap_or(0);
+                let human = format!("Prompt mode re-detected: {mode} (probes: {probes}, cached tokens: {cached})");
+                Out { json: r, human }
+            }
             AiCmd::HandoffRecommend { source, installed, lang } => {
                 let source = target(Some(source))?;
                 let r = call(
@@ -725,11 +743,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
                     items
                         .iter()
                         .map(|item| {
-                            format!(
-                                "#{}: {}",
-                                item["id"],
-                                item["text"].as_str().unwrap_or("").replace('\n', " ")
-                            )
+                            format!("#{}: {}", item["id"], item["text"].as_str().unwrap_or("").replace('\n', " "))
                         })
                         .collect::<Vec<_>>()
                         .join("\n")
@@ -783,17 +797,15 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             InboxCmd::ClearPaused(mut p) => {
                 p.agent = pick(p.agent)?;
                 let r = call("agent.inbox_clear_paused", to(&p))?;
-                let human = format!(
-                    "{}: cleared paused inbox",
-                    r["address"].as_str().unwrap_or("?"),
-                );
+                let human = format!("{}: cleared paused inbox", r["address"].as_str().unwrap_or("?"),);
                 Out { json: r, human }
             }
         },
         Cmd::Interrupt(mut p) => {
             p.agent = pick(p.agent)?;
             let r = call("agent.interrupt", to(&p))?;
-            let human = format!("sent {}: {}", r["method"].as_str().unwrap_or("?"), r["outcome"].as_str().unwrap_or("?"));
+            let human =
+                format!("sent {}: {}", r["method"].as_str().unwrap_or("?"), r["outcome"].as_str().unwrap_or("?"));
             Out { json: r, human }
         }
         Cmd::Approve(mut p) => {
@@ -862,10 +874,8 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             let tr = call("terminal.list", to(&p)).unwrap_or_else(|_| json!({}));
             if let Some(arr) = tr["terminals"].as_array().filter(|a| !a.is_empty()) {
                 r["terminals"] = Value::Array(arr.clone());
-                r["hidden_finished"] = json!(
-                    r["hidden_finished"].as_u64().unwrap_or(0)
-                        + tr["hidden_finished"].as_u64().unwrap_or(0)
-                );
+                r["hidden_finished"] =
+                    json!(r["hidden_finished"].as_u64().unwrap_or(0) + tr["hidden_finished"].as_u64().unwrap_or(0));
             }
             let human = table(&r);
             let rows: Vec<Value> = r["agents"].as_array().into_iter().flatten().map(short).collect();
@@ -1145,9 +1155,7 @@ fn from_here(cwd: Option<String>) -> Option<String> {
 
 /// Who is asking: this h2 agent or terminal, else the shell or script that ran us.
 fn caller() -> String {
-    client::agent_id()
-        .or_else(client::terminal_id)
-        .unwrap_or_else(|| format!("ppid:{}", crate::platform::parent_pid()))
+    client::agent_id().or_else(client::terminal_id).unwrap_or_else(|| format!("ppid:{}", crate::platform::parent_pid()))
 }
 
 /// Prints the snapshot, then every notification until the core goes away.
@@ -1334,6 +1342,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("ai status", "ai.status"),
     ("ai settings-set", "ai.settings.set"),
     ("ai test", "ai.test"),
+    ("ai probe-prompt-mode", "ai.probe_prompt_mode"),
     ("ai handoff-recommend", "ai.handoff_recommend"),
     ("ai briefing", "ai.briefing"),
     ("ai summarize-agent", "ai.summarize_agent"),

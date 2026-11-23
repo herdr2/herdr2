@@ -1,12 +1,12 @@
 //! M2+M3 orchestration and worker protocol HTTP handlers called by `drove::http`.
 
+use super::DroveRuntime;
 use super::http::ApiErr;
 use super::notify::notify_coordinator;
 use super::pool::{mark_worker_idle, send_to_task_worker, stop_run_workers, stop_worker};
 use super::roles::{diff_touched_paths, find_scope_violations};
 use super::store::{NewDaemonEvent, PostMessageInput, empty_task_counts};
 use super::types::*;
-use super::DroveRuntime;
 use crate::runtime::Core;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
@@ -41,17 +41,12 @@ pub(super) fn authenticate_worker(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| ApiErr::new(400, "bad_request", "attemptId must be a non-empty string"))?;
-    let att = drove
-        .store
-        .get_attempt(att_id)
-        .ok_or_else(|| ApiErr::new(404, "not_found", "Attempt not found"))?;
+    let att = drove.store.get_attempt(att_id).ok_or_else(|| ApiErr::new(404, "not_found", "Attempt not found"))?;
     if !drove.verify_worker_token(&att.worker_id, tok) {
         return Err(ApiErr::new(401, "unauthorized", "invalid worker token"));
     }
-    let worker = drove
-        .store
-        .get_worker(&att.worker_id)
-        .ok_or_else(|| ApiErr::new(404, "not_found", "Worker not found"))?;
+    let worker =
+        drove.store.get_worker(&att.worker_id).ok_or_else(|| ApiErr::new(404, "not_found", "Worker not found"))?;
     if att.outcome.is_some()
         || att.ended_at.is_some()
         || matches!(worker.state, WorkerState::Dead | WorkerState::Closed)
@@ -75,20 +70,13 @@ pub(super) fn worker_context_http(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| ApiErr::new(400, "bad_request", "workerId must be a non-empty string"))?;
-    let worker = drove
-        .store
-        .get_worker(worker_id)
-        .ok_or_else(|| ApiErr::new(404, "not_found", "Worker not found"))?;
+    let worker = drove.store.get_worker(worker_id).ok_or_else(|| ApiErr::new(404, "not_found", "Worker not found"))?;
     if !drove.verify_worker_token(worker_id, tok) {
         return Err(ApiErr::new(401, "unauthorized", "invalid worker token"));
     }
-    let att_id = worker
-        .current_attempt_id
-        .ok_or_else(|| ApiErr::new(409, "stale_attempt", "worker has no active attempt"))?;
-    let att = drove
-        .store
-        .get_attempt(&att_id)
-        .ok_or_else(|| ApiErr::new(409, "stale_attempt", "attempt missing"))?;
+    let att_id =
+        worker.current_attempt_id.ok_or_else(|| ApiErr::new(409, "stale_attempt", "worker has no active attempt"))?;
+    let att = drove.store.get_attempt(&att_id).ok_or_else(|| ApiErr::new(409, "stale_attempt", "attempt missing"))?;
     Ok(json!({
         "workerId": worker.id,
         "currentAttempt": att.id,
@@ -111,18 +99,11 @@ pub(super) async fn worker_ask_http(
         .ok_or_else(|| ApiErr::new(400, "bad_request", "question must be non-empty"))?
         .to_string();
     let options: Option<Vec<String>> = body["options"].as_array().map(|arr| {
-        arr.iter()
-            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
-            .filter(|s| !s.is_empty())
-            .collect()
+        arr.iter().filter_map(|v| v.as_str().map(|s| s.trim().to_string())).filter(|s| !s.is_empty()).collect()
     });
     let recommend = body["recommend"].as_str().map(String::from);
     let why = body["why"].as_str().map(String::from);
-    let run = core
-        .drove
-        .store
-        .get_run(&att.run_id)
-        .ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
+    let run = core.drove.store.get_run(&att.run_id).ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
     let task = core.drove.store.get_task(&att.task_id);
     let msg = core.drove.store.post_message(PostMessageInput {
         run_id: att.run_id.clone(),
@@ -251,10 +232,7 @@ pub(super) fn worker_read_http(
         return Ok(slice);
     }
     if target == "review" {
-        let task = drove
-            .store
-            .get_task(&att.task_id)
-            .ok_or_else(|| ApiErr::new(404, "not_found", "Task not found"))?;
+        let task = drove.store.get_task(&att.task_id).ok_or_else(|| ApiErr::new(404, "not_found", "Task not found"))?;
         let art = att
             .review_round
             .as_ref()
@@ -281,26 +259,13 @@ pub(super) async fn worker_done_http(
     let att = authenticate_worker(&core.drove, headers, body)?;
     core.drove.clear_loop_watermark(&att.id);
     core.ai.evict_session(&format!("drove:loop:{}", att.id));
-    let run = core
-        .drove
-        .store
-        .get_run(&att.run_id)
-        .ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
-    let task = core
-        .drove
-        .store
-        .get_task(&att.task_id)
-        .ok_or_else(|| ApiErr::new(404, "not_found", "Task not found"))?;
-    let worker = core
-        .drove
-        .store
-        .get_worker(&att.worker_id)
-        .ok_or_else(|| ApiErr::new(404, "not_found", "Worker not found"))?;
+    let run = core.drove.store.get_run(&att.run_id).ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
+    let task =
+        core.drove.store.get_task(&att.task_id).ok_or_else(|| ApiErr::new(404, "not_found", "Task not found"))?;
+    let worker =
+        core.drove.store.get_worker(&att.worker_id).ok_or_else(|| ApiErr::new(404, "not_found", "Worker not found"))?;
 
-    let outcome_raw = body["outcome"]
-        .as_str()
-        .map(|s| s.trim().to_ascii_lowercase())
-        .unwrap_or_else(|| "done".into());
+    let outcome_raw = body["outcome"].as_str().map(|s| s.trim().to_ascii_lowercase()).unwrap_or_else(|| "done".into());
     if !matches!(outcome_raw.as_str(), "done" | "succeeded" | "failed") {
         return Err(ApiErr::new(400, "bad_request", "outcome must be done or failed"));
     }
@@ -321,16 +286,7 @@ pub(super) async fn worker_done_http(
         });
         let no_retry = body["noRetry"].as_bool() == Some(true);
         let max_r = if no_retry { 0 } else { super::MAX_AUTO_RETRIES };
-        super::fail_or_retry_task(
-            core,
-            &run.id,
-            &task.id,
-            &att.id,
-            FailureKind::WorkerReported,
-            &reason,
-            max_r,
-        )
-        .await;
+        super::fail_or_retry_task(core, &run.id, &task.id, &att.id, FailureKind::WorkerReported, &reason, max_r).await;
         if let Some(wt) = worker.worktree.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             if super::integrate::is_aosp_harness(&run.cwd) {
                 super::integrate::cleanup_worktree_dir(&run.cwd, std::path::Path::new(wt));
@@ -387,9 +343,7 @@ pub(super) async fn worker_done_http(
     let files_modified = if !touched.is_empty() {
         Some(touched)
     } else {
-        body["filesModified"]
-            .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        body["filesModified"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
     };
 
     // M3 Gate 1: Task `spec.verify`
@@ -402,13 +356,8 @@ pub(super) async fn worker_done_http(
 
     // M3 Gate 3: Worktree serialized merge-back & warm retention
     let keep_wt = worker.worktree.is_some() && !super::integrate::is_aosp_harness(&run.cwd);
-    let merged_files = super::integrate::merge_and_finalize_worktree(
-        core,
-        &run,
-        worker.worktree.as_deref(),
-        keep_wt,
-    )
-    .await?;
+    let merged_files =
+        super::integrate::merge_and_finalize_worktree(core, &run, worker.worktree.as_deref(), keep_wt).await?;
     let merged_or_touched = if !merged_files.is_empty() { Some(merged_files) } else { files_modified };
 
     let result = TaskResult {
@@ -465,10 +414,7 @@ pub(super) async fn worker_done_http(
     // If all non-template tasks in this run are now terminal, notify coordinator (keeping idle workers warm for reuse).
     let all_tasks = core.drove.store.list_tasks(&run.id);
     if !all_tasks.is_empty()
-        && all_tasks
-            .iter()
-            .filter(|t| t.template != Some(true))
-            .all(|t| super::scheduler::is_terminal_status(t.status))
+        && all_tasks.iter().filter(|t| t.template != Some(true)).all(|t| super::scheduler::is_terminal_status(t.status))
     {
         notify_coordinator(
             core,
@@ -493,11 +439,7 @@ pub(super) async fn add_tasks_http(
     coord_header: Option<&str>,
     body: &Value,
 ) -> Result<Value, ApiErr> {
-    let run = core
-        .drove
-        .store
-        .get_run(run_id)
-        .ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
+    let run = core.drove.store.get_run(run_id).ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
     if run.trashed_at.is_some() {
         return Err(ApiErr::new(409, "invalid_state", "Run is in trash"));
     }
@@ -522,11 +464,9 @@ pub(super) async fn add_tasks_http(
         let existing_tasks = core.drove.store.list_tasks(&run.id);
         if tasks_need_worktree_preflight(&cfg, &existing_tasks, &raw_list) {
             let cwd_check = run.cwd.clone();
-            let check = tokio::task::spawn_blocking(move || {
-                super::integrate::check_drove_worktree_ready(&cwd_check)
-            })
-            .await
-            .map_err(|e| ApiErr::new(500, "internal", format!("preflight join error: {e}")))?;
+            let check = tokio::task::spawn_blocking(move || super::integrate::check_drove_worktree_ready(&cwd_check))
+                .await
+                .map_err(|e| ApiErr::new(500, "internal", format!("preflight join error: {e}")))?;
             match check {
                 Ok(ok) => worktree_warning = ok.dirty_warning,
                 Err(blocker) => {
@@ -540,13 +480,7 @@ pub(super) async fn add_tasks_http(
         }
     }
 
-    let existing_keys: BTreeSet<String> = core
-        .drove
-        .store
-        .list_tasks(&run.id)
-        .into_iter()
-        .map(|t| t.key)
-        .collect();
+    let existing_keys: BTreeSet<String> = core.drove.store.list_tasks(&run.id).into_iter().map(|t| t.key).collect();
     let mut created = Vec::new();
     let mut seen_keys = existing_keys;
 
@@ -591,12 +525,7 @@ pub(super) async fn add_tasks_http(
     normalize_run_task_deps(core, &run.id);
 
     let rebind_sess = if super::pool::is_coordinator_closed(core, &run) {
-        body["hostSession"]
-            .as_str()
-            .or(coord_header)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from)
+        body["hostSession"].as_str().or(coord_header).map(str::trim).filter(|s| !s.is_empty()).map(String::from)
     } else {
         None
     };
@@ -628,10 +557,7 @@ pub(super) async fn add_tasks_http(
         });
     }
 
-    let created: Vec<Task> = created
-        .into_iter()
-        .filter_map(|t| core.drove.store.get_task(&t.id))
-        .collect();
+    let created: Vec<Task> = created.into_iter().filter_map(|t| core.drove.store.get_task(&t.id)).collect();
     for t in &created {
         super::ai::spawn_task_enrich(core.clone(), run.id.clone(), t.id.clone());
     }
@@ -665,14 +591,9 @@ pub(super) fn tasks_need_worktree_preflight(
         if raw["kind"].as_str() == Some("exec") {
             continue;
         }
-        let role = raw["role"]
-            .as_str()
-            .or_else(|| raw["assign"]["role"].as_str());
+        let role = raw["role"].as_str().or_else(|| raw["assign"]["role"].as_str());
         if is_writable_role(role) {
-            let count = raw
-                .get("foreach")
-                .and_then(Value::as_array)
-                .map_or(1, |a| a.len().max(1));
+            let count = raw.get("foreach").and_then(Value::as_array).map_or(1, |a| a.len().max(1));
             incoming_writers += count;
         }
     }
@@ -705,11 +626,7 @@ pub(super) fn tasks_need_worktree_preflight(
                     && is_writable_role(raw["role"].as_str().or_else(|| raw["assign"]["role"].as_str()))
                     && raw["deps"].as_array().is_none_or(|d| d.is_empty())
             })
-            .map(|raw| {
-                raw.get("foreach")
-                    .and_then(Value::as_array)
-                    .map_or(1, |a| a.len().max(1))
-            })
+            .map(|raw| raw.get("foreach").and_then(Value::as_array).map_or(1, |a| a.len().max(1)))
             .sum::<usize>();
         if root_writers < 2 {
             // Check if any two incoming writers share the same dep (fan-out).
@@ -746,11 +663,7 @@ fn normalize_run_task_deps(core: &Arc<Core>, run_id: &str) {
             } else {
                 let mut matched_foreach = false;
                 for child in &all_tasks {
-                    if child
-                        .key
-                        .strip_prefix(dep.as_str())
-                        .is_some_and(|rest| rest.starts_with('#'))
-                    {
+                    if child.key.strip_prefix(dep.as_str()).is_some_and(|rest| rest.starts_with('#')) {
                         matched_foreach = true;
                         if !resolved.contains(&child.id) {
                             resolved.push(child.id.clone());
@@ -784,23 +697,14 @@ fn replace_item_placeholder(spec_opt: Option<&mut Value>, val: &str) {
 
 fn create_one_task(core: &Arc<Core>, run_id: &str, raw: &Value) -> Result<Task, ApiErr> {
     let key = raw["key"].as_str().unwrap().trim().to_string();
-    let title = raw["title"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&key)
-        .to_string();
+    let title = raw["title"].as_str().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(&key).to_string();
     let spec: Spec = if raw.get("spec").is_some_and(Value::is_object) {
         serde_json::from_value(raw["spec"].clone())
             .map_err(|e| ApiErr::new(400, "invalid_field", format!("invalid spec on {key}: {e}")))?
     } else {
         Spec {
             target: raw["target"].as_str().unwrap_or("workspace").to_string(),
-            change: raw["change"]
-                .as_str()
-                .or_else(|| raw["prompt"].as_str())
-                .unwrap_or(&title)
-                .to_string(),
+            change: raw["change"].as_str().or_else(|| raw["prompt"].as_str()).unwrap_or(&title).to_string(),
             constraints: raw["constraints"].as_str().map(String::from),
             ownership: raw["ownership"].as_str().map(String::from),
             acceptance: raw["acceptance"].as_str().unwrap_or("Complete cleanly").to_string(),
@@ -819,14 +723,10 @@ fn create_one_task(core: &Arc<Core>, run_id: &str, raw: &Value) -> Result<Task, 
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
-    let foreach_from: Option<ForeachFrom> = raw
-        .get("foreachFrom")
-        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let foreach_from: Option<ForeachFrom> = raw.get("foreachFrom").and_then(|v| serde_json::from_value(v.clone()).ok());
     let is_template = foreach_from.is_some();
 
-    let mut assign: Option<Assign> = raw
-        .get("assign")
-        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let mut assign: Option<Assign> = raw.get("assign").and_then(|v| serde_json::from_value(v.clone()).ok());
     if let Some(role) = raw["role"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
         let mut a = assign.unwrap_or_default();
         if a.role.is_none() {
@@ -835,11 +735,7 @@ fn create_one_task(core: &Arc<Core>, run_id: &str, raw: &Value) -> Result<Task, 
         assign = Some(a);
     }
 
-    let initial_status = if is_template || !deps.is_empty() {
-        TaskStatus::Pending
-    } else {
-        TaskStatus::Ready
-    };
+    let initial_status = if is_template || !deps.is_empty() { TaskStatus::Pending } else { TaskStatus::Ready };
 
     let task = core.drove.store.create_task(super::store::CreateTaskInput {
         run_id: run_id.to_string(),
@@ -851,10 +747,7 @@ fn create_one_task(core: &Arc<Core>, run_id: &str, raw: &Value) -> Result<Task, 
         files,
         deps,
         output_schema: raw.get("outputSchema").cloned(),
-        isolation: raw
-            .get("isolation")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or(Isolation::None),
+        isolation: raw.get("isolation").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or(Isolation::None),
         timeout_sec: raw["timeoutSec"].as_u64(),
         stall_warn_sec: raw["stallWarnSec"].as_u64(),
         stall_kill_sec: raw["stallKillSec"].as_u64(),
@@ -863,9 +756,7 @@ fn create_one_task(core: &Arc<Core>, run_id: &str, raw: &Value) -> Result<Task, 
         status: initial_status,
         result: None,
         kind: raw["kind"].as_str().map(String::from),
-        trigger_rule: raw
-            .get("triggerRule")
-            .and_then(|v| serde_json::from_value(v.clone()).ok()),
+        trigger_rule: raw.get("triggerRule").and_then(|v| serde_json::from_value(v.clone()).ok()),
         context: raw.get("context").cloned(),
         exec: raw.get("exec").and_then(|v| serde_json::from_value(v.clone()).ok()),
         foreach_from,
@@ -883,26 +774,14 @@ pub(super) async fn wait_run_http(
     run_id: &str,
     query: &BTreeMap<String, String>,
 ) -> Result<Value, ApiErr> {
-    let run = core
-        .drove
-        .store
-        .get_run(run_id)
-        .ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
-    let timeout_sec = query
-        .get("timeoutSec")
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(20)
-        .clamp(1, 25);
+    let run = core.drove.store.get_run(run_id).ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
+    let timeout_sec = query.get("timeoutSec").and_then(|s| s.parse::<u64>().ok()).unwrap_or(20).clamp(1, 25);
     let since_seq = query.get("sinceSeq").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
     let _ = run;
 
     let deadline = Instant::now() + Duration::from_secs(timeout_sec);
     loop {
-        let cur_run = core
-            .drove
-            .store
-            .get_run(run_id)
-            .ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
+        let cur_run = core.drove.store.get_run(run_id).ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
         let tasks = core.drove.store.list_tasks(run_id);
         let pending: Vec<Message> = core
             .drove
@@ -919,9 +798,8 @@ pub(super) async fn wait_run_http(
             .filter(|m| m.kind == MessageType::Failed)
             .filter_map(|m| m.task_id)
             .collect();
-        let has_unreported_failure = tasks
-            .iter()
-            .any(|t| t.status == TaskStatus::Failed && !all_failed_msg_tasks.contains(&t.id));
+        let has_unreported_failure =
+            tasks.iter().any(|t| t.status == TaskStatus::Failed && !all_failed_msg_tasks.contains(&t.id));
         let all_terminal = !tasks.is_empty()
             && tasks
                 .iter()
@@ -929,12 +807,7 @@ pub(super) async fn wait_run_http(
                 .all(|t| super::scheduler::is_terminal_status(t.status));
 
         if !pending.is_empty() || cur_run.status != RunStatus::Active || all_terminal || has_unreported_failure {
-            let counts = core
-                .drove
-                .store
-                .count_tasks_by_run()
-                .remove(run_id)
-                .unwrap_or_else(empty_task_counts);
+            let counts = core.drove.store.count_tasks_by_run().remove(run_id).unwrap_or_else(empty_task_counts);
             return Ok(json!({
                 "run": cur_run,
                 "taskCounts": counts,
@@ -946,12 +819,7 @@ pub(super) async fn wait_run_http(
         }
 
         if Instant::now() >= deadline {
-            let counts = core
-                .drove
-                .store
-                .count_tasks_by_run()
-                .remove(run_id)
-                .unwrap_or_else(empty_task_counts);
+            let counts = core.drove.store.count_tasks_by_run().remove(run_id).unwrap_or_else(empty_task_counts);
             return Ok(json!({
                 "run": cur_run,
                 "taskCounts": counts,
@@ -969,11 +837,7 @@ pub(super) async fn wait_run_http(
 }
 
 pub(super) async fn complete_run_http(core: &Arc<Core>, run_id: &str, body: &Value) -> Result<Value, ApiErr> {
-    let run = core
-        .drove
-        .store
-        .get_run(run_id)
-        .ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
+    let run = core.drove.store.get_run(run_id).ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
     let force = body["force"].as_bool() == Some(true);
     let tasks = core.drove.store.list_tasks(run_id);
     let active_left = tasks.iter().any(|t| {
@@ -981,11 +845,13 @@ pub(super) async fn complete_run_http(core: &Arc<Core>, run_id: &str, body: &Val
             && matches!(t.status, TaskStatus::Pending | TaskStatus::Ready | TaskStatus::Running | TaskStatus::Blocked)
     });
     if active_left && !force {
-        return Err(ApiErr::new(409, "tasks_incomplete", "run still has non-terminal tasks (pass force=true to complete anyway)"));
+        return Err(ApiErr::new(
+            409,
+            "tasks_incomplete",
+            "run still has non-terminal tasks (pass force=true to complete anyway)",
+        ));
     }
-    let failed_left = tasks
-        .iter()
-        .any(|t| t.template != Some(true) && t.status == TaskStatus::Failed);
+    let failed_left = tasks.iter().any(|t| t.template != Some(true) && t.status == TaskStatus::Failed);
     if failed_left && !force {
         return Err(ApiErr::new(
             409,
@@ -997,7 +863,9 @@ pub(super) async fn complete_run_http(core: &Arc<Core>, run_id: &str, body: &Val
     let verify_log_id = if !force {
         let (log_id, repair_task) = super::verify::run_level_verify_gate(core, &run).await?;
         if let Some(rt) = repair_task {
-            return Ok(json!({ "ok": false, "repairing": true, "repairTask": rt, "run": core.drove.store.get_run(&run.id) }));
+            return Ok(
+                json!({ "ok": false, "repairing": true, "repairTask": rt, "run": core.drove.store.get_run(&run.id) }),
+            );
         }
         log_id
     } else {
@@ -1041,11 +909,7 @@ pub(super) async fn complete_run_http(core: &Arc<Core>, run_id: &str, body: &Val
 }
 
 pub(super) async fn cancel_run_http(core: &Arc<Core>, run_id: &str) -> Result<Value, ApiErr> {
-    let run = core
-        .drove
-        .store
-        .get_run(run_id)
-        .ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
+    let run = core.drove.store.get_run(run_id).ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
     let tasks = core.drove.store.list_tasks(&run.id);
     for t in tasks {
         if !super::scheduler::is_terminal_status(t.status) {
@@ -1061,11 +925,7 @@ pub(super) async fn cancel_run_http(core: &Arc<Core>, run_id: &str) -> Result<Va
 }
 
 pub(super) fn retry_task_http(core: &Arc<Core>, id: &str, body: &Value) -> Result<Value, ApiErr> {
-    let task = core
-        .drove
-        .store
-        .get_task(id)
-        .ok_or_else(|| ApiErr::new(404, "not_found", "Task not found"))?;
+    let task = core.drove.store.get_task(id).ok_or_else(|| ApiErr::new(404, "not_found", "Task not found"))?;
     if task.status == TaskStatus::Running {
         return Err(ApiErr::new(409, "invalid_state", "cannot retry a running task"));
     }
@@ -1103,10 +963,8 @@ pub(super) fn retry_task_http(core: &Arc<Core>, id: &str, body: &Value) -> Resul
         let mut a = t.assign.clone().unwrap_or_default();
         let req_agent = body["agent"].as_str().map(str::trim).filter(|s| !s.is_empty());
         let req_model = body["model"].as_str().map(str::trim).filter(|s| !s.is_empty());
-        let req_effort: Option<Effort> = body
-            .get("effort")
-            .filter(|v| !v.is_null())
-            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let req_effort: Option<Effort> =
+            body.get("effort").filter(|v| !v.is_null()).and_then(|v| serde_json::from_value(v.clone()).ok());
         let req_role = body["role"].as_str().map(str::trim).filter(|s| !s.is_empty());
         let has_explicit_target = req_agent.is_some() || req_model.is_some() || req_effort.is_some();
         if let Some(role) = req_role {
@@ -1148,8 +1006,7 @@ pub(super) fn retry_task_http(core: &Arc<Core>, id: &str, body: &Value) -> Resul
 
 fn reopen_skipped_dependents(core: &Arc<Core>, root: &Task) {
     let tasks = core.drove.store.list_tasks(&root.run_id);
-    let mut reopened: std::collections::HashSet<String> =
-        [root.id.clone(), root.key.clone()].into_iter().collect();
+    let mut reopened: std::collections::HashSet<String> = [root.id.clone(), root.key.clone()].into_iter().collect();
     if let Some(tpl_id) = &root.expanded_from
         && let Some(tpl) = tasks.iter().find(|t| &t.id == tpl_id)
     {
@@ -1163,11 +1020,7 @@ fn reopen_skipped_dependents(core: &Arc<Core>, root: &Task) {
                 continue;
             }
             let depends_on_reopened = t.deps.iter().any(|d| reopened.contains(d))
-                || t.deps.iter().any(|d| {
-                    root.key
-                        .strip_prefix(d.as_str())
-                        .is_some_and(|rest| rest.starts_with('#'))
-                });
+                || t.deps.iter().any(|d| root.key.strip_prefix(d.as_str()).is_some_and(|rest| rest.starts_with('#')));
             if depends_on_reopened && !reopened.contains(&t.id) {
                 let _ = core.drove.store.update_task(&t.id, |upd| {
                     if upd.status == TaskStatus::Skipped {
@@ -1193,11 +1046,7 @@ fn reopen_skipped_dependents(core: &Arc<Core>, root: &Task) {
 }
 
 pub(super) async fn cancel_task_http(core: &Arc<Core>, id: &str) -> Result<Value, ApiErr> {
-    let task = core
-        .drove
-        .store
-        .get_task(id)
-        .ok_or_else(|| ApiErr::new(404, "not_found", "Task not found"))?;
+    let task = core.drove.store.get_task(id).ok_or_else(|| ApiErr::new(404, "not_found", "Task not found"))?;
     let active_atts: Vec<Attempt> = core
         .drove
         .store
@@ -1212,7 +1061,8 @@ pub(super) async fn cancel_task_http(core: &Arc<Core>, id: &str) -> Result<Value
         let _ = core.drove.store.update_attempt(&att.id, |a| {
             a.outcome = Some(Outcome::Failed);
             a.ended_at = Some(now_iso());
-            a.failure = Some(AttemptFailure { kind: FailureKind::Cancelled, message: "Cancelled by coordinator".into() });
+            a.failure =
+                Some(AttemptFailure { kind: FailureKind::Cancelled, message: "Cancelled by coordinator".into() });
         });
     }
     let updated = core.drove.store.update_task(&task.id, |t| t.status = TaskStatus::Cancelled);
@@ -1221,20 +1071,14 @@ pub(super) async fn cancel_task_http(core: &Arc<Core>, id: &str) -> Result<Value
 }
 
 pub(super) async fn send_task_http(core: &Arc<Core>, id: &str, body: &Value) -> Result<Value, ApiErr> {
-    let task = core
-        .drove
-        .store
-        .get_task(id)
-        .ok_or_else(|| ApiErr::new(404, "not_found", "Task not found"))?;
+    let task = core.drove.store.get_task(id).ok_or_else(|| ApiErr::new(404, "not_found", "Task not found"))?;
     let text = body["text"]
         .as_str()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| ApiErr::new(400, "bad_request", "text must be non-empty"))?;
     let interrupt = body["interrupt"].as_bool() == Some(true);
-    send_to_task_worker(core, &task, text, interrupt)
-        .await
-        .map_err(|e| ApiErr::new(409, "send_failed", e))
+    send_to_task_worker(core, &task, text, interrupt).await.map_err(|e| ApiErr::new(409, "send_failed", e))
 }
 
 pub(super) fn post_message_http(drove: &DroveRuntime, body: &Value) -> Result<Value, ApiErr> {
@@ -1249,10 +1093,7 @@ pub(super) fn post_message_http(drove: &DroveRuntime, body: &Value) -> Result<Va
     let to = body["to"].as_str().unwrap_or("coordinator").to_string();
     let msg = drove.store.post_message(PostMessageInput {
         run_id: run_id.into(),
-        kind: body
-            .get("type")
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .unwrap_or(MessageType::Note),
+        kind: body.get("type").and_then(|v| serde_json::from_value(v.clone()).ok()).unwrap_or(MessageType::Note),
         from: body["from"].as_str().unwrap_or("coordinator").into(),
         to,
         thread_id: body["threadId"].as_str().map(String::from),

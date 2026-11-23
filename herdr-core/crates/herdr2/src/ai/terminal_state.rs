@@ -94,11 +94,7 @@ pub async fn classify_terminal_state(
     params: ClassifyTerminalStateParams,
 ) -> ClassifyTerminalStateResult {
     let cfg = ai.config_snapshot();
-    if !cfg.enabled
-        || !cfg.pty_status_arbitration
-        || cfg.base_url.trim().is_empty()
-        || ai.is_circuit_open()
-    {
+    if !cfg.enabled || !cfg.pty_status_arbitration || cfg.base_url.trim().is_empty() || ai.is_circuit_open() {
         return ClassifyTerminalStateResult::default();
     }
 
@@ -118,22 +114,12 @@ pub async fn classify_terminal_state(
         return ClassifyTerminalStateResult::default();
     }
 
-    let lang = if params
-        .language
-        .as_deref()
-        .is_some_and(|l| l.to_ascii_lowercase().starts_with("zh"))
-    {
-        "zh"
-    } else {
-        "en"
-    };
+    let lang =
+        if params.language.as_deref().is_some_and(|l| l.to_ascii_lowercase().starts_with("zh")) { "zh" } else { "en" };
     let prog = params.program.as_deref().unwrap_or("").trim().to_ascii_lowercase();
     let norm_title = normalize_for_fingerprint(&params.raw_title);
     let norm_tail = normalize_for_fingerprint(&compact_tail);
-    let cache_key = format!(
-        "pty_status:{lang}:{prog}:{}",
-        fingerprint_hex(&[&norm_title, &norm_tail])
-    );
+    let cache_key = format!("pty_status:{lang}:{prog}:{}", fingerprint_hex(&[&norm_title, &norm_tail]));
 
     let payload = json!({
         "program": prog,
@@ -160,17 +146,20 @@ pub async fn classify_terminal_state(
         return ClassifyTerminalStateResult { used_ai: false, ..Default::default() };
     };
 
-    parse_verdict(&resp.content, resp.from_local_cache)
+    let verdict = parse_verdict(&resp.content, resp.from_local_cache);
+    if !resp.from_local_cache {
+        if verdict.state.is_none() && verdict.confidence.is_none() {
+            ai.record_parse_error("pty_status");
+        } else if !verdict.accepted {
+            ai.record_low_conf_reject("pty_status");
+        }
+    }
+    verdict
 }
 
 pub(crate) fn parse_verdict(raw: &str, from_cache: bool) -> ClassifyTerminalStateResult {
     let Some(v) = extract_json_object(raw) else {
-        return ClassifyTerminalStateResult {
-            used_ai: true,
-            accepted: false,
-            from_cache,
-            ..Default::default()
-        };
+        return ClassifyTerminalStateResult { used_ai: true, accepted: false, from_cache, ..Default::default() };
     };
     let state = v["state"]
         .as_str()

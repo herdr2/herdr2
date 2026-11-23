@@ -1,16 +1,19 @@
-//! OpenAI-compatible HTTP transport, endpoint capability memory, payload fallback,
-//! model discovery, and multi-vendor cache-token accounting.
+//! OpenAI-compatible HTTP transport (via pooled `reqwest` client), endpoint capability memory,
+//! payload fallback, model discovery, and multi-vendor cache-token accounting.
 
-use super::config::validate_http_url;
+use super::config::{is_loopback_http_url, validate_http_url};
 use super::session::ChatMessage;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-use tokio::io::AsyncWriteExt;
 
 pub const AI_MODELS_TIMEOUT: Duration = Duration::from_secs(4);
 pub const AI_CHAT_TIMEOUT: Duration = Duration::from_secs(12);
+/// Number of consecutive >=1024-token shared-prefix calls with `cached_input_tokens == 0`
+/// before automatically degrading `StatelessSharedPrefix` to compact per-op prompts.
+pub const KV_CACHE_DEGRADE_THRESHOLD: u8 = 5;
 
 const STRICT_CLOUD_HOSTS: [&str; 6] = [
     "api.openai.com",
@@ -20,6 +23,17 @@ const STRICT_CLOUD_HOSTS: [&str; 6] = [
     "api.anthropic.com",
     "generativelanguage.googleapis.com",
 ];
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug)]
+pub struct HttpJsonResponse {
+    pub status: u16,
+    pub body: String,
+    pub retry_after_secs: Option<u64>,
+}
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -35,27 +49,107 @@ pub struct AiTestResult {
     pub error: Option<String>,
 }
 
-/// Remembered optional-field compatibility per `(base_url, model)` so repeated requests
-/// skip 400/422 probe roundtrips after the first call adapts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Remembered optional-field compatibility & KV-cache effectiveness per `(base_url, model)`
+/// so repeated requests skip 400/422 probe roundtrips and avoid paying full price for
+/// uncached large shared prefixes on gateways without prompt caching.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct EndpointCapabilities {
+    #[serde(default = "default_true")]
     pub supports_prompt_cache_key: bool,
+    #[serde(default = "default_true")]
     pub supports_reasoning_effort: bool,
+    #[serde(default = "default_true")]
     pub supports_effort_none: bool,
+    #[serde(default)]
+    pub supports_enable_thinking: bool,
+    #[serde(default)]
     pub supports_num_ctx: bool,
+    #[serde(default = "default_true")]
     pub supports_temperature: bool,
+    #[serde(default = "default_true")]
+    pub supports_json_object: bool,
+    #[serde(default)]
+    pub supports_cache_control: bool,
+    #[serde(default)]
+    pub prefix_probes_without_cache: u8,
+    #[serde(default)]
+    pub prefix_probes_with_cache: u8,
+    #[serde(default = "default_true")]
+    pub prompt_cache_effective: bool,
 }
 
 impl EndpointCapabilities {
     pub fn default_for_url(base_url: &str) -> Self {
         let strict_cloud = is_known_strict_cloud_url(base_url);
+        let anthropic_like = is_anthropic_compat_url(base_url);
+        let enable_thinking_host = is_enable_thinking_host(base_url);
         Self {
-            supports_prompt_cache_key: true,
+            supports_prompt_cache_key: !anthropic_like,
             supports_reasoning_effort: true,
-            supports_effort_none: true,
+            supports_effort_none: !enable_thinking_host,
+            supports_enable_thinking: enable_thinking_host,
             supports_num_ctx: !strict_cloud,
             supports_temperature: true,
+            supports_json_object: !anthropic_like,
+            supports_cache_control: anthropic_like,
+            prefix_probes_without_cache: 0,
+            prefix_probes_with_cache: 0,
+            prompt_cache_effective: true,
         }
+    }
+
+    /// Clears prior KV-cache auto-detection state so the runtime re-probes this endpoint/model.
+    pub fn reset_prompt_cache_detection(&mut self) {
+        self.prefix_probes_without_cache = 0;
+        self.prefix_probes_with_cache = 0;
+        self.prompt_cache_effective = true;
+    }
+
+    /// Marks the active endpoint/model as not supporting KV prefix caching (switches auto mode to compact).
+    pub fn mark_prompt_cache_ineffective(&mut self) {
+        self.prefix_probes_without_cache = KV_CACHE_DEGRADE_THRESHOLD;
+        self.prefix_probes_with_cache = 0;
+        self.prompt_cache_effective = false;
+    }
+
+    /// Returns the remembered auto-detected prompt mode (`Some("shared_prefix")`, `Some("compact")`),
+    /// or `None` when not yet determined / freshly reset.
+    pub fn detected_prompt_mode(&self) -> Option<&'static str> {
+        if !self.prompt_cache_effective {
+            Some("compact")
+        } else if self.prefix_probes_with_cache > 0 {
+            Some("shared_prefix")
+        } else {
+            None
+        }
+    }
+
+    /// Updates KV-cache effectiveness tracking after a `StatelessSharedPrefix` call using the
+    /// canonical `>1024`-token control-plane system prompt. Returns `true` when state changed.
+    pub fn record_shared_prefix_usage(&mut self, input_tokens: u64, cached_input_tokens: u64) -> bool {
+        if input_tokens < 1024 {
+            return false;
+        }
+        if cached_input_tokens > 0 {
+            let next_hits = self.prefix_probes_with_cache.saturating_add(1);
+            let changed = self.prefix_probes_without_cache != 0
+                || !self.prompt_cache_effective
+                || next_hits != self.prefix_probes_with_cache;
+            self.prefix_probes_without_cache = 0;
+            self.prefix_probes_with_cache = next_hits;
+            self.prompt_cache_effective = true;
+            return changed;
+        }
+        let next = self.prefix_probes_without_cache.saturating_add(1);
+        let changed = next != self.prefix_probes_without_cache
+            || (next >= KV_CACHE_DEGRADE_THRESHOLD && self.prompt_cache_effective);
+        self.prefix_probes_without_cache = next;
+        if next >= KV_CACHE_DEGRADE_THRESHOLD {
+            self.prompt_cache_effective = false;
+            self.prefix_probes_with_cache = 0;
+        }
+        changed
     }
 }
 
@@ -64,23 +158,38 @@ pub struct PayloadVariant {
     pub body: String,
     pub used_cache_key: bool,
     pub used_effort: Option<String>,
+    pub used_enable_thinking: bool,
     pub used_num_ctx: bool,
     pub used_temperature: bool,
+    pub used_json_object: bool,
+    pub used_cache_control: bool,
 }
 
-pub fn is_known_strict_cloud_url(base: &str) -> bool {
-    let rest = base
-        .trim()
-        .strip_prefix("https://")
-        .or_else(|| base.trim().strip_prefix("http://"))
-        .unwrap_or("");
+fn extract_host(base: &str) -> &str {
+    let rest = base.trim().strip_prefix("https://").or_else(|| base.trim().strip_prefix("http://")).unwrap_or("");
     let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
-    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+    if let Some(bracketed) = authority.strip_prefix('[') {
         bracketed.split(']').next().unwrap_or("")
     } else {
         authority.split(':').next().unwrap_or("")
-    };
+    }
+}
+
+pub fn is_known_strict_cloud_url(base: &str) -> bool {
+    let host = extract_host(base);
     STRICT_CLOUD_HOSTS.iter().any(|h| host.eq_ignore_ascii_case(h))
+}
+
+pub fn is_anthropic_compat_url(base: &str) -> bool {
+    let host = extract_host(base);
+    host.eq_ignore_ascii_case("api.anthropic.com") || base.to_ascii_lowercase().contains("/anthropic")
+}
+
+pub fn is_enable_thinking_host(base: &str) -> bool {
+    let host = extract_host(base);
+    host.eq_ignore_ascii_case("dashscope.aliyuncs.com")
+        || host.eq_ignore_ascii_case("dashscope-intl.aliyuncs.com")
+        || host.eq_ignore_ascii_case("open.bigmodel.cn")
 }
 
 pub fn truncate_for_context(text: &str, max_chars: usize) -> String {
@@ -126,6 +235,31 @@ pub fn effective_max_tokens(
     }
 }
 
+fn encode_messages(messages: &[ChatMessage], use_cache_control: bool) -> Value {
+    if !use_cache_control {
+        return serde_json::to_value(messages).unwrap_or_else(|_| json!([]));
+    }
+    let encoded: Vec<Value> = messages
+        .iter()
+        .enumerate()
+        .map(|(idx, m)| {
+            if idx == 0 && m.role == "system" {
+                json!({
+                    "role": "system",
+                    "content": [{
+                        "type": "text",
+                        "text": m.content,
+                        "cache_control": { "type": "ephemeral" }
+                    }]
+                })
+            } else {
+                json!({ "role": m.role, "content": m.content })
+            }
+        })
+        .collect();
+    Value::Array(encoded)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn build_chat_payload_candidates(
     model: &str,
@@ -135,34 +269,46 @@ pub fn build_chat_payload_candidates(
     ctx_tokens: Option<u32>,
     temperature: f32,
     prompt_cache_key: Option<&str>,
+    expect_json: bool,
     caps: EndpointCapabilities,
 ) -> Vec<PayloadVariant> {
-    let msgs_val = serde_json::to_value(messages).unwrap_or_else(|_| json!([]));
     let want_effort = if !caps.supports_reasoning_effort || effort == "auto" || effort.is_empty() {
         None
     } else if effort == "none" && !caps.supports_effort_none {
-        Some("low".to_string())
+        if caps.supports_enable_thinking { None } else { Some("low".to_string()) }
     } else {
         Some(effort.to_string())
     };
+    let want_enable_thinking = effort == "none" && caps.supports_enable_thinking;
     let want_ctx = ctx_tokens.filter(|_| caps.supports_num_ctx);
     let want_cache_key = prompt_cache_key.filter(|s| caps.supports_prompt_cache_key && !s.is_empty());
     let want_temp = caps.supports_temperature;
+    let want_json = expect_json && caps.supports_json_object;
+    let want_cache_control = prompt_cache_key.is_some() && caps.supports_cache_control;
 
     let make_variant = |eff: Option<&str>,
+                        enable_thinking: bool,
                         ctx: Option<u32>,
                         cache_key: Option<&str>,
-                        with_temp: bool|
+                        with_temp: bool,
+                        with_json: bool,
+                        with_cache_control: bool|
      -> PayloadVariant {
         let mut obj = serde_json::Map::new();
         obj.insert("model".into(), json!(model));
-        obj.insert("messages".into(), msgs_val.clone());
+        obj.insert("messages".into(), encode_messages(messages, with_cache_control));
         obj.insert("max_tokens".into(), json!(max_tokens));
         if with_temp {
             obj.insert("temperature".into(), json!(temperature));
         }
         if let Some(e) = eff {
             obj.insert("reasoning_effort".into(), json!(e));
+        }
+        if enable_thinking {
+            obj.insert("enable_thinking".into(), json!(false));
+        }
+        if with_json {
+            obj.insert("response_format".into(), json!({ "type": "json_object" }));
         }
         if let Some(c) = ctx {
             obj.insert("options".into(), json!({ "num_ctx": c }));
@@ -174,8 +320,11 @@ pub fn build_chat_payload_candidates(
             body: Value::Object(obj).to_string(),
             used_cache_key: cache_key.is_some(),
             used_effort: eff.map(String::from),
+            used_enable_thinking: enable_thinking,
             used_num_ctx: ctx.is_some(),
             used_temperature: with_temp,
+            used_json_object: with_json,
+            used_cache_control: with_cache_control,
         }
     };
 
@@ -187,23 +336,52 @@ pub fn build_chat_payload_candidates(
     };
 
     // 1. Full remembered-compatible payload.
-    push_unique(&mut out, make_variant(want_effort.as_deref(), want_ctx, want_cache_key, want_temp));
+    push_unique(
+        &mut out,
+        make_variant(
+            want_effort.as_deref(),
+            want_enable_thinking,
+            want_ctx,
+            want_cache_key,
+            want_temp,
+            want_json,
+            want_cache_control,
+        ),
+    );
     // 2. If `effort = "none"` was requested, fall back to `"low"` before stripping effort.
     if want_effort.as_deref() == Some("none") {
-        push_unique(&mut out, make_variant(Some("low"), want_ctx, want_cache_key, want_temp));
+        push_unique(
+            &mut out,
+            make_variant(
+                Some("low"),
+                want_enable_thinking,
+                want_ctx,
+                want_cache_key,
+                want_temp,
+                want_json,
+                want_cache_control,
+            ),
+        );
     }
-    // 3. Strip `prompt_cache_key` if strict proxy rejects it.
+    let eff_next = if want_effort.as_deref() == Some("none") { Some("low") } else { want_effort.as_deref() };
+    // 3. Strip `enable_thinking` or `cache_control` if rejected.
+    if want_enable_thinking || want_cache_control {
+        push_unique(&mut out, make_variant(eff_next, false, want_ctx, want_cache_key, want_temp, want_json, false));
+    }
+    // 4. Strip `prompt_cache_key` if strict proxy rejects it.
     if want_cache_key.is_some() {
-        let eff_next = if want_effort.as_deref() == Some("none") { Some("low") } else { want_effort.as_deref() };
-        push_unique(&mut out, make_variant(eff_next, want_ctx, None, want_temp));
+        push_unique(&mut out, make_variant(eff_next, false, want_ctx, None, want_temp, want_json, false));
     }
-    // 4. Strip `options.num_ctx`.
+    // 5. Strip `response_format` if endpoint/model does not support `json_object`.
+    if want_json {
+        push_unique(&mut out, make_variant(eff_next, false, want_ctx, None, want_temp, false, false));
+    }
+    // 6. Strip `options.num_ctx`.
     if want_ctx.is_some() {
-        let eff_next = if want_effort.as_deref() == Some("none") { Some("low") } else { want_effort.as_deref() };
-        push_unique(&mut out, make_variant(eff_next, None, None, want_temp));
+        push_unique(&mut out, make_variant(eff_next, false, None, None, want_temp, false, false));
     }
-    // 5. Bare minimal OpenAI payload.
-    push_unique(&mut out, make_variant(None, None, None, false));
+    // 7. Bare minimal OpenAI payload.
+    push_unique(&mut out, make_variant(None, false, None, None, false, false, false));
     out
 }
 
@@ -214,6 +392,10 @@ pub fn should_retry_without_optional_fields(status: u16, body: &str) -> bool {
     let lower = body.to_ascii_lowercase();
     [
         "prompt_cache_key",
+        "cache_control",
+        "response_format",
+        "json_object",
+        "enable_thinking",
         "options",
         "num_ctx",
         "reasoning_effort",
@@ -229,15 +411,23 @@ pub fn should_retry_without_optional_fields(status: u16, body: &str) -> bool {
 }
 
 /// Updates remembered capabilities based on a rejected optional-field 400/422 response body.
-pub fn refine_capabilities_from_error(
-    caps: &mut EndpointCapabilities,
-    attempted: &PayloadVariant,
-    body: &str,
-) {
+pub fn refine_capabilities_from_error(caps: &mut EndpointCapabilities, attempted: &PayloadVariant, body: &str) {
     let lower = body.to_ascii_lowercase();
     let mut matched_specific = false;
     if attempted.used_cache_key && lower.contains("prompt_cache_key") {
         caps.supports_prompt_cache_key = false;
+        matched_specific = true;
+    }
+    if attempted.used_cache_control && (lower.contains("cache_control") || lower.contains("content")) {
+        caps.supports_cache_control = false;
+        matched_specific = true;
+    }
+    if attempted.used_json_object && (lower.contains("response_format") || lower.contains("json_object")) {
+        caps.supports_json_object = false;
+        matched_specific = true;
+    }
+    if attempted.used_enable_thinking && lower.contains("enable_thinking") {
+        caps.supports_enable_thinking = false;
         matched_specific = true;
     }
     if attempted.used_num_ctx && (lower.contains("options") || lower.contains("num_ctx")) {
@@ -256,8 +446,17 @@ pub fn refine_capabilities_from_error(
         matched_specific = true;
     }
     if !matched_specific {
+        if attempted.used_cache_control {
+            caps.supports_cache_control = false;
+        }
+        if attempted.used_enable_thinking {
+            caps.supports_enable_thinking = false;
+        }
         if attempted.used_cache_key {
             caps.supports_prompt_cache_key = false;
+        }
+        if attempted.used_json_object {
+            caps.supports_json_object = false;
         }
         if attempted.used_num_ctx {
             caps.supports_num_ctx = false;
@@ -270,13 +469,14 @@ pub fn record_winning_variant(caps: &mut EndpointCapabilities, winning: &Payload
     if !winning.used_cache_key {
         caps.supports_prompt_cache_key = false;
     }
+    if !winning.used_cache_control {
+        caps.supports_cache_control = false;
+    }
+    if !winning.used_enable_thinking {
+        caps.supports_enable_thinking = false;
+    }
     if !winning.used_num_ctx {
         caps.supports_num_ctx = false;
-    }
-    if winning.used_effort.is_none() {
-        // Only disable reasoning_effort if we didn't intentionally omit it — handled via error refine.
-    } else if winning.used_effort.as_deref() != Some("none") {
-        // Keep current supports_effort_none value.
     }
     if !winning.used_temperature {
         caps.supports_temperature = false;
@@ -286,14 +486,8 @@ pub fn record_winning_variant(caps: &mut EndpointCapabilities, winning: &Payload
 /// Extracts `(input_tokens, output_tokens, cached_input_tokens)` across OpenAI, DeepSeek, and Anthropic proxy schemas.
 pub fn parse_usage_tokens(parsed: &Value) -> (u64, u64, u64) {
     let u = &parsed["usage"];
-    let input = u["prompt_tokens"]
-        .as_u64()
-        .or_else(|| u["input_tokens"].as_u64())
-        .unwrap_or(0);
-    let output = u["completion_tokens"]
-        .as_u64()
-        .or_else(|| u["output_tokens"].as_u64())
-        .unwrap_or(0);
+    let input = u["prompt_tokens"].as_u64().or_else(|| u["input_tokens"].as_u64()).unwrap_or(0);
+    let output = u["completion_tokens"].as_u64().or_else(|| u["output_tokens"].as_u64()).unwrap_or(0);
     let cached = u["prompt_tokens_details"]["cached_tokens"]
         .as_u64()
         .or_else(|| u["prompt_cache_hit_tokens"].as_u64())
@@ -387,11 +581,7 @@ pub async fn fetch_ai_models(base_url: &str, api_key: Option<&str>) -> Vec<Strin
 }
 
 /// Tests any OpenAI-compatible HTTP endpoint using `Service URL` + `API Key`.
-pub async fn test_ai_connection(
-    base_url: &str,
-    api_key: Option<&str>,
-    model_hint: Option<&str>,
-) -> AiTestResult {
+pub async fn test_ai_connection(base_url: &str, api_key: Option<&str>, model_hint: Option<&str>) -> AiTestResult {
     let started = Instant::now();
     let base = match validate_http_url(base_url, "ai.baseUrl") {
         Ok(u) => u,
@@ -437,11 +627,7 @@ pub async fn test_ai_connection(
         match curl_json_timeout("POST", &chat_url, api_key, Some(&payload), AI_CHAT_TIMEOUT).await {
             Ok((status, body)) if (200..300).contains(&status) => {
                 let parsed: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-                let discovered = parsed["model"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(&model)
-                    .to_string();
+                let discovered = parsed["model"].as_str().filter(|s| !s.is_empty()).unwrap_or(&model).to_string();
                 let mut models = available_models;
                 push_unique_str(&mut models, &discovered);
                 return AiTestResult {
@@ -456,12 +642,7 @@ pub async fn test_ai_connection(
             Ok((status, body)) => {
                 let msg = serde_json::from_str::<Value>(&body)
                     .ok()
-                    .and_then(|v| {
-                        v["error"]["message"]
-                            .as_str()
-                            .or_else(|| v["message"].as_str())
-                            .map(String::from)
-                    })
+                    .and_then(|v| v["error"]["message"].as_str().or_else(|| v["message"].as_str()).map(String::from))
                     .unwrap_or_else(|| format!("HTTP {status}"));
                 last_err = format!("HTTP {status}: {msg}");
                 if status == 401 || status == 403 {
@@ -480,20 +661,72 @@ pub async fn test_ai_connection(
         discovered_model: Some(model),
         available_models,
         latency_ms: started.elapsed().as_millis() as u64,
-        error: Some(if last_err.is_empty() {
-            "chat completion probe failed".into()
-        } else {
-            last_err
-        }),
+        error: Some(if last_err.is_empty() { "chat completion probe failed".into() } else { last_err }),
     }
 }
 
-fn bg_tokio_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
-    #[allow(unused_mut)]
-    let mut cmd = tokio::process::Command::new(program);
-    #[cfg(windows)]
-    cmd.creation_flags(0x0800_0000);
-    cmd
+fn http_client_direct() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .no_proxy()
+            .pool_idle_timeout(Duration::from_secs(90))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+fn http_client_proxied() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .pool_idle_timeout(Duration::from_secs(90))
+            .connect_timeout(Duration::from_secs(10))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
+}
+
+fn parse_retry_after_secs(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    let raw = headers.get(reqwest::header::RETRY_AFTER)?.to_str().ok()?.trim();
+    let secs: u64 = raw.parse().ok()?;
+    Some(secs.clamp(1, 120))
+}
+
+/// Calls an HTTP JSON endpoint via the shared pooled `reqwest` client (Keep-Alive / HTTP2).
+/// Loopback URLs bypass environment proxies automatically.
+pub async fn http_json_request(
+    method: &str,
+    url: &str,
+    api_key: Option<&str>,
+    body: Option<&str>,
+    timeout: Duration,
+) -> Result<HttpJsonResponse, String> {
+    let parsed_method =
+        reqwest::Method::from_bytes(method.as_bytes()).map_err(|e| format!("invalid HTTP method {method}: {e}"))?;
+    let client = if is_loopback_http_url(url) { http_client_direct() } else { http_client_proxied() };
+    let mut req = client
+        .request(parsed_method, url)
+        .timeout(timeout.max(Duration::from_secs(1)))
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
+    if let Some(key) = api_key.map(str::trim).filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(key);
+    }
+    if let Some(payload) = body {
+        req = req.body(payload.to_string());
+    }
+    let resp = req.send().await.map_err(|e| {
+        if e.is_timeout() {
+            format!("HTTP request timed out after {}s", timeout.as_secs().max(1))
+        } else {
+            format!("HTTP request failed: {e}")
+        }
+    })?;
+    let status = resp.status().as_u16();
+    let retry_after_secs = parse_retry_after_secs(resp.headers());
+    let text = resp.text().await.map_err(|e| format!("read HTTP response body: {e}"))?;
+    Ok(HttpJsonResponse { status, body: text, retry_after_secs })
 }
 
 pub async fn curl_json(
@@ -505,7 +738,7 @@ pub async fn curl_json(
     curl_json_timeout(method, url, api_key, body, AI_CHAT_TIMEOUT).await
 }
 
-/// Calls an HTTP JSON endpoint via `curl --config -` so bearer tokens stay off process argv.
+/// Compatibility wrapper around `http_json_request` returning `(status, body)`.
 pub async fn curl_json_timeout(
     method: &str,
     url: &str,
@@ -513,53 +746,8 @@ pub async fn curl_json_timeout(
     body: Option<&str>,
     timeout: Duration,
 ) -> Result<(u16, String), String> {
-    let mut cfg = format!("url = \"{}\"\nrequest = \"{}\"\n", escape_curl(url), escape_curl(method));
-    cfg.push_str("header = \"Content-Type: application/json\"\n");
-    if let Some(key) = api_key.map(str::trim).filter(|s| !s.is_empty()) {
-        cfg.push_str(&format!("header = \"Authorization: Bearer {}\"\n", escape_curl(key)));
-    }
-    if let Some(payload) = body {
-        cfg.push_str(&format!("data-raw = \"{}\"\n", escape_curl(payload)));
-    }
-
-    let timeout_secs = timeout.as_secs().max(1).to_string();
-    let mut child = bg_tokio_command("curl")
-        .args(["-sS", "--max-time", &timeout_secs, "-w", "\n%{http_code}", "--config", "-"])
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to spawn curl: {e}"))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(cfg.as_bytes())
-            .await
-            .map_err(|e| format!("write curl stdin: {e}"))?;
-    }
-    let out = child
-        .wait_with_output()
-        .await
-        .map_err(|e| format!("curl failed: {e}"))?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        return Err(if err.is_empty() {
-            format!("curl exited {}", out.status)
-        } else {
-            err
-        });
-    }
-    let raw = String::from_utf8_lossy(&out.stdout);
-    let (resp_body, code_str) = raw.rsplit_once('\n').unwrap_or(("", raw.trim()));
-    let status: u16 = code_str.trim().parse().unwrap_or(0);
-    Ok((status, resp_body.to_string()))
-}
-
-fn escape_curl(s: &str) -> String {
-    s.replace('\\', "\\\\")
-        .replace('"', "\\\"")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
+    let resp = http_json_request(method, url, api_key, body, timeout).await?;
+    Ok((resp.status, resp.body))
 }
 
 #[cfg(test)]
@@ -579,9 +767,10 @@ mod tests {
     }
 
     #[test]
-    fn capability_memory_strips_rejected_prompt_cache_key() {
+    fn capability_memory_strips_rejected_prompt_cache_key_and_json_format() {
         let mut caps = EndpointCapabilities::default_for_url("https://api.deepseek.com");
         assert!(caps.supports_prompt_cache_key);
+        assert!(caps.supports_json_object);
         assert!(!caps.supports_num_ctx);
         let cands = build_chat_payload_candidates(
             "deepseek-chat",
@@ -591,9 +780,11 @@ mod tests {
             Some(32768),
             0.0,
             Some("h2:cp:v1"),
+            true,
             caps,
         );
         assert!(cands[0].used_cache_key);
+        assert!(cands[0].used_json_object);
         refine_capabilities_from_error(&mut caps, &cands[0], "unknown field prompt_cache_key");
         assert!(!caps.supports_prompt_cache_key);
         let cands2 = build_chat_payload_candidates(
@@ -604,8 +795,26 @@ mod tests {
             Some(32768),
             0.0,
             Some("h2:cp:v1"),
+            true,
             caps,
         );
         assert!(!cands2[0].used_cache_key);
+        assert!(cands2[0].used_json_object);
+    }
+
+    #[test]
+    fn kv_cache_auto_degrades_after_five_uncached_large_prefix_calls() {
+        let mut caps = EndpointCapabilities::default_for_url("https://proxy.example.com/v1");
+        assert!(caps.prompt_cache_effective);
+        for _ in 0..4 {
+            caps.record_shared_prefix_usage(1800, 0);
+            assert!(caps.prompt_cache_effective);
+        }
+        caps.record_shared_prefix_usage(1800, 0);
+        assert!(!caps.prompt_cache_effective);
+        // Any subsequent cache hit restores effectiveness immediately.
+        caps.record_shared_prefix_usage(1800, 1200);
+        assert!(caps.prompt_cache_effective);
+        assert_eq!(caps.prefix_probes_without_cache, 0);
     }
 }

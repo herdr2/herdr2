@@ -329,18 +329,14 @@ impl Core {
         let snippet = match &entry {
             Entry::Assistant { text, .. } => (!text.is_empty()).then(|| text.clone()),
             Entry::Error { message, .. } => Some(format!("[error] {message}\n")),
-            Entry::ToolCall { title, status, .. } if !title.is_empty() => {
-                Some(format!("[tool: {status}] {title}\n"))
-            }
+            Entry::ToolCall { title, status, .. } if !title.is_empty() => Some(format!("[tool: {status}] {title}\n")),
             Entry::Permission { title, outcome, .. } => Some(format!("[permission: {outcome}] {title}\n")),
             _ => None,
         };
         st.transcripts.entry(id).or_default().push(entry.clone());
         if let Some(wid) = st.reg.agents.get(&id).and_then(|a| a.labels.get("drove.worker")) {
-            let _ = self.drove.pool_tx.send(crate::drove::pool::PoolSignal::Transcript {
-                worker_id: wid.clone(),
-                entry,
-            });
+            let _ =
+                self.drove.pool_tx.send(crate::drove::pool::PoolSignal::Transcript { worker_id: wid.clone(), entry });
         }
         self.emit(st, "transcript", id, payload);
         if let Some(chunk) = snippet
@@ -418,7 +414,19 @@ impl Core {
         if first_task_finished {
             a.first_task_turn = None;
         }
-        let (status, records, turn, reported, pending_permission, inbox_len, inbox, working_since, work_ms, total_work_ms, status_ms) = (
+        let (
+            status,
+            records,
+            turn,
+            reported,
+            pending_permission,
+            inbox_len,
+            inbox,
+            working_since,
+            work_ms,
+            total_work_ms,
+            status_ms,
+        ) = (
             a.status.clone(),
             a.records.clone(),
             a.turn,
@@ -526,11 +534,7 @@ impl Core {
         let snapshot = {
             let mut st = self.lock();
             let now = Instant::now();
-            if st
-                .digest_last_ai
-                .get(&id)
-                .is_some_and(|last| now.saturating_duration_since(*last) < min_interval)
-            {
+            if st.digest_last_ai.get(&id).is_some_and(|last| now.saturating_duration_since(*last) < min_interval) {
                 return;
             }
             let Some(a) = st.reg.agents.get(&id).filter(|a| a.is_live()).cloned() else {
@@ -622,15 +626,10 @@ impl Core {
             return;
         };
         let cfg = self.ai.config_snapshot();
-        if !cfg.enabled || !cfg.semantic_summary || cfg.base_url.trim().is_empty() || self.ai.is_circuit_open() {
-            return;
-        }
+        let ai_ready =
+            cfg.enabled && cfg.semantic_summary && !cfg.base_url.trim().is_empty() && !self.ai.is_circuit_open();
         let now = Instant::now();
-        if st
-            .pty_digest_last_ai
-            .get(&id)
-            .is_some_and(|last| now.saturating_duration_since(*last) < min_interval)
-        {
+        if st.pty_digest_last_ai.get(&id).is_some_and(|last| now.saturating_duration_since(*last) < min_interval) {
             return;
         }
         let Some(t) = st.pty_reg.terminals.get(&id).filter(|t| t.is_live()).cloned() else {
@@ -641,16 +640,24 @@ impl Core {
         }
         // Skip bare shells that have never reported status, completed a turn, or received prompts.
         let has_prompts = st.pty_prompts.get(&id).is_some_and(|p| !p.is_empty());
-        if t.turn == 0 && !t.reported && !has_prompts {
+        let has_cli_fg = t.foreground.as_ref().is_some_and(crate::foreground::is_cli_foreground);
+        if t.turn == 0 && !t.reported && !has_prompts && !has_cli_fg {
             return;
         }
         st.pty_digest_last_ai.insert(id, now);
-        let orig_fg_pid = t.foreground.as_ref().map(|f| f.pid);
+        let orig_started_ms = t.program_started_ms;
+        let live_title = t.title.clone();
         let screen_fallback = self.screen_text(st, id);
         let mut snap = crate::pty_transcript::snapshot_from_terminal(&t, st.pty_prompts.get(&id));
         let addr = t.address.clone();
         crate::pty_transcript::populate_session_affinity(&mut snap, &addr, &core, st);
-        let program = t.argv.first().cloned().unwrap_or_else(|| "terminal".into());
+        let program = t
+            .foreground
+            .as_ref()
+            .map(|f| f.name.clone())
+            .filter(|s| !s.is_empty())
+            .or_else(|| t.argv.first().cloned())
+            .unwrap_or_else(|| "terminal".into());
         let status = t.status.as_ref().map(|s| s.state.clone()).unwrap_or_else(|| "idle".into());
         let turn = t.turn.max(1);
         let existing = t.semantic_title.clone();
@@ -666,49 +673,56 @@ impl Core {
                     .as_deref()
                     .map(|l| l.to_ascii_lowercase().starts_with("zh"))
                     .unwrap_or_else(|| crate::ai::digest::entries_prefer_zh(&entries));
-                crate::ai::build_deterministic_acp_digest(
-                    &status,
-                    turn,
-                    None,
-                    &entries,
-                    existing.as_deref(),
-                    is_zh,
-                )
+                crate::ai::build_deterministic_acp_digest(&status, turn, None, &entries, existing.as_deref(), is_zh)
             } else if let Some(ref screen) = screen_fallback {
-                crate::ai::digest::build_deterministic_screen_digest(screen, existing.as_deref())
+                crate::ai::digest::build_deterministic_screen_digest_with_title(
+                    screen,
+                    existing.as_deref(),
+                    Some(&live_title),
+                    Some(&program),
+                )
             } else {
-                return;
+                crate::ai::digest::build_deterministic_screen_digest_with_title(
+                    "",
+                    existing.as_deref(),
+                    Some(&live_title),
+                    Some(&program),
+                )
             };
-            if det.task_hint.is_empty() && det.recent_steps.is_empty() {
+            if det.task_hint.is_empty() && det.recent_steps.is_empty() && det.semantic_title.is_none() {
                 return;
             }
-            let refined = crate::ai::refine_agent_digest(
-                &core.ai,
-                &addr,
-                &program,
-                &status,
-                &det,
-                existing.as_deref(),
-                language.as_deref(),
-            )
-            .await;
+            let refined = if ai_ready {
+                crate::ai::refine_agent_digest(
+                    &core.ai,
+                    &addr,
+                    &program,
+                    &status,
+                    &det,
+                    existing.as_deref(),
+                    language.as_deref(),
+                )
+                .await
+            } else {
+                crate::ai::AgentDigestResult {
+                    address: addr,
+                    semantic_title: det.semantic_title,
+                    micro_summary: det.micro_summary,
+                    used_ai: false,
+                    from_cache: false,
+                }
+            };
             if refined.semantic_title.is_some() || refined.micro_summary.is_some() {
                 let mut st = core.lock();
                 let still_same_cli = st.pty_reg.terminals.get(&id).is_some_and(|cur| {
                     cur.is_live()
                         && !crate::foreground::is_at_shell_root(cur)
-                        && (orig_fg_pid.is_none() || cur.foreground.as_ref().map(|f| f.pid) == orig_fg_pid)
+                        && cur.program_started_ms == orig_started_ms
                 });
                 if !still_same_cli {
                     return;
                 }
-                core.apply_pty_digest(
-                    &mut st,
-                    id,
-                    refined.semantic_title,
-                    refined.micro_summary,
-                    false,
-                );
+                core.apply_pty_digest(&mut st, id, refined.semantic_title, refined.micro_summary, false);
             }
         });
     }
@@ -778,7 +792,12 @@ impl Core {
         Ok((pending.request_id, chosen))
     }
 
-    pub fn read_transcript(&self, id: u32, lines: Option<usize>, last: bool) -> Result<(String, bool, &'static str), RpcError> {
+    pub fn read_transcript(
+        &self,
+        id: u32,
+        lines: Option<usize>,
+        last: bool,
+    ) -> Result<(String, bool, &'static str), RpcError> {
         let st = self.lock();
         if let Some(t) = st.transcripts.get(&id) {
             return Ok(t.render(lines, last));
@@ -844,8 +863,7 @@ impl Core {
         }
         st.reg.finish(id, exit.code, exit.signal, reason, now_ms());
         let finished_ms = st.reg.agents.get(&id).and_then(|a| a.finished_ms);
-        let end =
-            serde_json::json!({"reason": reason, "exit_code": exit.code, "signal": exit.signal, "finished_ms": finished_ms});
+        let end = serde_json::json!({"reason": reason, "exit_code": exit.code, "signal": exit.signal, "finished_ms": finished_ms});
         let pending = st.reg.agents[&id].is_live();
         self.emit(st, if pending { "lost" } else { "finished" }, id, end);
         if pending {
@@ -857,9 +875,10 @@ impl Core {
             let target = TargetKey::Agent(id);
             let _ = self.jobs.send(crate::notes::Job::Orphaned(target));
             crate::remote::orphaned_afar(self, st, target);
-            let _ = self.drove.pool_tx.send(crate::drove::pool::PoolSignal::SessionClosed {
-                address: crate::agents::address(id),
-            });
+            let _ = self
+                .drove
+                .pool_tx
+                .send(crate::drove::pool::PoolSignal::SessionClosed { address: crate::agents::address(id) });
         }
         if let Some(wid) = st.reg.agents.get(&id).and_then(|a| a.labels.get("drove.worker")) {
             let _ = self.drove.pool_tx.send(crate::drove::pool::PoolSignal::AgentExited {
@@ -869,7 +888,9 @@ impl Core {
             });
         }
         let rm = st.reg.agents.get(&id).is_some_and(|a| {
-            !a.is_live() && a.rm && !a.parent.as_ref().is_some_and(|p| st.waiting.contains_key(&(p.clone(), TargetKey::Agent(id))))
+            !a.is_live()
+                && a.rm
+                && !a.parent.as_ref().is_some_and(|p| st.waiting.contains_key(&(p.clone(), TargetKey::Agent(id))))
         });
         if rm {
             self.remove(st, id);
@@ -954,13 +975,8 @@ impl Core {
         let Some(kind) = tc.cli_kind.as_deref().map(str::trim).filter(|k| !k.is_empty() && *k != "generic") else {
             return false;
         };
-        let sid = tc
-            .cli_session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .or_else(|| {
+        let sid =
+            tc.cli_session_id.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from).or_else(|| {
                 tc.cli_transcript_path
                     .as_deref()
                     .and_then(|p| crate::pty_adapters::session_id_from_transcript(kind, std::path::Path::new(p)))
@@ -1020,8 +1036,7 @@ impl Core {
                     }
                     let matches_sid = tc.cli_session_id.as_deref() == Some(sid)
                         || tc.cli_transcript_path.as_deref().is_some_and(|p| {
-                            crate::pty_adapters::session_id_from_transcript(kind, std::path::Path::new(p))
-                                .as_deref()
+                            crate::pty_adapters::session_id_from_transcript(kind, std::path::Path::new(p)).as_deref()
                                 == Some(sid)
                         });
                     if matches_sid {
@@ -1065,9 +1080,7 @@ impl Core {
                     continue;
                 }
                 let matches_repo = match (&repo_hint, &norm_hint, tc.repo_root.as_deref()) {
-                    (Some(rh), _, Some(tr)) => {
-                        crate::checkpoint::canonicalize_path(std::path::Path::new(tr)) == *rh
-                    }
+                    (Some(rh), _, Some(tr)) => crate::checkpoint::canonicalize_path(std::path::Path::new(tr)) == *rh,
                     (_, Some(nh), Some(tr)) => {
                         let ctr = crate::checkpoint::canonicalize_path(std::path::Path::new(tr));
                         nh.starts_with(&ctr) || ctr.starts_with(nh)
@@ -1119,10 +1132,7 @@ impl Core {
                     }
                 }
             } else if let Some(mut extracted) = crate::pty_adapters::extract_saved_cli_from_argv(
-                t.foreground
-                    .as_ref()
-                    .filter(|f| !f.argv.is_empty())
-                    .map_or(&t.argv, |f| &f.argv),
+                t.foreground.as_ref().filter(|f| !f.argv.is_empty()).map_or(&t.argv, |f| &f.argv),
                 crate::pty_adapters::terminal_shell_executable(&t.argv).as_deref(),
                 tc.cli_session_id.clone(),
                 tc.cli_transcript_path.clone(),
@@ -1149,18 +1159,11 @@ impl Core {
         {
             return;
         }
-        let ref_owner = loaded
-            .as_ref()
-            .and_then(|tc| tc.ref_namespace.clone())
-            .filter(|s| !s.is_empty());
-        let explicit_refs: Vec<String> = loaded
-            .as_ref()
-            .map(|tc| tc.checkpoints.iter().map(|c| c.ref_name.clone()).collect())
-            .unwrap_or_default();
-        let repo_dir = loaded
-            .and_then(|tc| tc.repo_root)
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| fallback_cwd.to_string());
+        let ref_owner = loaded.as_ref().and_then(|tc| tc.ref_namespace.clone()).filter(|s| !s.is_empty());
+        let explicit_refs: Vec<String> =
+            loaded.as_ref().map(|tc| tc.checkpoints.iter().map(|c| c.ref_name.clone()).collect()).unwrap_or_default();
+        let repo_dir =
+            loaded.and_then(|tc| tc.repo_root).filter(|s| !s.is_empty()).unwrap_or_else(|| fallback_cwd.to_string());
         if repo_dir.is_empty() {
             return;
         }

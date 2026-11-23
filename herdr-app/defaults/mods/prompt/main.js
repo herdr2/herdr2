@@ -2,11 +2,36 @@
 // Enter saves (or Ctrl/Cmd+Enter sends in polish mode), Esc cancels.
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextareaState, Textarea } from "gpui-base";
-import { run, h2, props, closeOverlay, theme, settings, checking, nextCommand } from "herdr";
+import { run, h2, props, closeOverlay, theme, settings, checking, nextCommand, keys, window as appWindow } from "herdr";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
 const PURPLE = "#a855f7";
+
+function shortcutFor(action) {
+  if (typeof keys !== "function" || !action) return "";
+  const list = keys();
+  if (!Array.isArray(list)) return "";
+  const k = list.find((b) => b.section === "global" && b.action === action);
+  if (!k?.keys?.trim()) return "";
+  const mac = typeof appWindow === "function" && appWindow()?.platform === "macos";
+  const names = mac ? { ctrl: "⌃", alt: "⌥", shift: "⇧", cmd: "⌘", fn: "fn" } : { ctrl: "Ctrl", alt: "Alt", shift: "Shift", cmd: "Super", fn: "Fn" };
+  const alias = { secondary: mac ? "cmd" : "ctrl", super: "cmd", win: "cmd" };
+  return k.keys.trim().split(/\s+/).map((stroke) => {
+    const parts = stroke.split("-");
+    let key = parts.pop();
+    if (key === "") { key = "-"; parts.pop(); }
+    const held = new Set(parts.map((m) => alias[m.toLowerCase()] ?? m.toLowerCase()));
+    if (/^[A-Z]$/.test(key)) held.add("shift");
+    const label = key.length === 1 ? key.toUpperCase() : key[0].toUpperCase() + key.slice(1).toLowerCase();
+    return [...Object.keys(names).filter((m) => held.has(m)).map((m) => names[m]), label].join(mac ? "" : "+");
+  }).join(" ");
+}
+
+function withShortcut(text, action) {
+  const sc = shortcutFor(action);
+  return sc ? `${text} (${sc})` : text;
+}
 
 function withAlpha(color, alphaHex) {
   if (typeof color !== "string") return color;
@@ -57,6 +82,7 @@ export default class Prompt extends View {
             for (;;) {
               const cmd = await nextCommand();
               if (cmd === "polish") await this.polish(cmdCx);
+              else if (cmd === "polish_undo") this.revertPolish(cmdCx);
             }
           });
         }
@@ -267,8 +293,9 @@ export default class Prompt extends View {
                 .text_color(t.muted)
                 .cursor_pointer()
                 .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                .tooltip(withShortcut(tr("Undo last polish and restore original input", "撤销本次润色并恢复润色前的内容"), "prompt.polish_undo"))
                 .on_click((_e, cx) => this.revertPolish(cx))
-                .child(tr("↩ Undo", "↩ 还原原文")),
+                .child(tr("↩ Undo", "↩ 反悔恢复")),
             ),
         ),
       )
@@ -350,6 +377,7 @@ export default class Prompt extends View {
               .font_semibold()
               .text_color(canPolish || this.polishing ? PURPLE : t.dim)
               .when(canPolish, (b) => b.cursor_pointer().hover((s) => s.bg(withAlpha(PURPLE, "30"))))
+              .tooltip(withShortcut(tr("Polish prompt with Core AI for clarity", "使用 Core AI 润色提示词，让表达更清晰"), "prompt.polish"))
               .on_click((_e, cx) => this.polish(cx))
               .child(
                 this.polishing

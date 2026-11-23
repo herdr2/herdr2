@@ -5,11 +5,11 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use crate::checkpoint::{capture_target_checkpoint, capture_target_checkpoint_with_session_turn, random_uuid_v4};
-pub(crate) use crate::pty_transcript::{find_claude_session_file, find_codex_rollout_by_sid};
 use crate::pty_transcript::{
     clean_claude_text, discover_cli_transcript, find_agy_transcript_by_cid, is_claude_user_noise, parse_cli_transcript,
     user_home_dir,
 };
+pub(crate) use crate::pty_transcript::{find_claude_session_file, find_codex_rollout_by_sid};
 use crate::runtime::{Core, TargetKey};
 use crate::transcript::{Entry, build_portable_handoff, strip_h2_envelope};
 
@@ -19,6 +19,7 @@ pub enum PtyCliKind {
     Claude,
     Codex,
     Agy,
+    Zcode,
     Generic,
 }
 
@@ -28,6 +29,7 @@ impl PtyCliKind {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Agy => "agy",
+            Self::Zcode => "zcode",
             Self::Generic => "generic",
         }
     }
@@ -37,18 +39,22 @@ impl PtyCliKind {
             "claude" => Self::Claude,
             "codex" => Self::Codex,
             "agy" => Self::Agy,
+            "zcode" => Self::Zcode,
             _ => Self::Generic,
         }
     }
 
     fn detect_cmd_token(raw: &str) -> Self {
+        let lower = raw.replace('\\', "/").to_ascii_lowercase();
         match exe_stem(raw).as_str() {
             "claude" | "claude-code" => return Self::Claude,
             "codex" => return Self::Codex,
             "agy" | "antigravity" | "antigravity-cli" => return Self::Agy,
+            // The ZCode CLI calls its process `zcode-cli`; the desktop app of the same
+            // name lives in /opt, and is not something a terminal reports on.
+            "zcode" | "zcode-cli" if !lower.contains("/opt/zcode/") => return Self::Zcode,
             _ => {}
         }
-        let lower = raw.replace('\\', "/").to_ascii_lowercase();
         if lower.contains("/claude/versions/") || lower.contains("/claude-code/") {
             return Self::Claude;
         }
@@ -61,6 +67,10 @@ impl PtyCliKind {
         }
         if lower.contains("/antigravity/") {
             return Self::Agy;
+        }
+        // Started through its bundled Node: `node .../runtime/zcode.cjs`.
+        if lower.ends_with("/zcode.cjs") {
+            return Self::Zcode;
         }
         Self::Generic
     }
@@ -141,7 +151,8 @@ fn unwrap_interpreter_cli_argv(argv: &[String]) -> Option<(PtyCliKind, Vec<Strin
 }
 
 fn cmd_quote(raw: &str) -> String {
-    if raw.is_empty() || raw.chars().any(|c| c.is_whitespace() || matches!(c, '"' | '&' | '|' | '<' | '>' | '^' | '%')) {
+    if raw.is_empty() || raw.chars().any(|c| c.is_whitespace() || matches!(c, '"' | '&' | '|' | '<' | '>' | '^' | '%'))
+    {
         format!("\"{}\"", raw.replace('"', "\\\""))
     } else {
         raw.to_string()
@@ -154,9 +165,7 @@ fn extract_cmd_cli_argv(argv: &[String]) -> Option<(String, Vec<String>)> {
     if exe_stem(sh) != "cmd" {
         return None;
     }
-    let cmd_pos = argv
-        .iter()
-        .position(|a| a.eq_ignore_ascii_case("/k") || a.eq_ignore_ascii_case("/c"))?;
+    let cmd_pos = argv.iter().position(|a| a.eq_ignore_ascii_case("/k") || a.eq_ignore_ascii_case("/c"))?;
     let rest = argv.get(cmd_pos + 1..)?;
     if rest.is_empty() {
         return None;
@@ -251,7 +260,18 @@ fn extract_powershell_cli_argv(argv: &[String]) -> Option<(String, Vec<String>)>
 fn is_shell_stem(stem: &str) -> bool {
     matches!(
         stem,
-        "sh" | "bash" | "zsh" | "dash" | "ksh" | "mksh" | "ash" | "fish" | "nu" | "tcsh" | "pwsh" | "powershell" | "cmd"
+        "sh" | "bash"
+            | "zsh"
+            | "dash"
+            | "ksh"
+            | "mksh"
+            | "ash"
+            | "fish"
+            | "nu"
+            | "tcsh"
+            | "pwsh"
+            | "powershell"
+            | "cmd"
     )
 }
 
@@ -264,7 +284,10 @@ fn extract_interactive_shell(argv: &[String]) -> Option<String> {
     }
     let has_command = argv.iter().skip(1).any(|arg| {
         (!arg.starts_with('-') && !arg.starts_with('+'))
-            || matches!(arg.split('=').next(), Some("--command" | "--commands" | "-Command" | "/c" | "/C" | "/k" | "/K"))
+            || matches!(
+                arg.split('=').next(),
+                Some("--command" | "--commands" | "-Command" | "/c" | "/C" | "/k" | "/K")
+            )
             || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('c'))
     });
     (!has_command).then(|| first.clone())
@@ -283,12 +306,8 @@ fn extract_wrapper_shell(argv: &[String]) -> Option<String> {
 fn wrap_cli_in_shell(shell: &str, cli_argv: Vec<String>) -> Vec<String> {
     let stem = exe_stem(shell);
     if stem == "fish" {
-        let mut out = vec![
-            shell.to_string(),
-            "-lic".into(),
-            "command $argv[2..]; exec $argv[1] -li".into(),
-            shell.to_string(),
-        ];
+        let mut out =
+            vec![shell.to_string(), "-lic".into(), "command $argv[2..]; exec $argv[1] -li".into(), shell.to_string()];
         out.extend(cli_argv);
         return out;
     }
@@ -360,6 +379,7 @@ pub fn detect_terminal_cli_kind(t: &crate::terminals::Terminal, saved_kind: Opti
             "claude" | "claude-code" | "claude code" => return PtyCliKind::Claude,
             "codex" => return PtyCliKind::Codex,
             "agy" | "antigravity" | "antigravity-cli" => return PtyCliKind::Agy,
+            "zcode" | "zcode-cli" => return PtyCliKind::Zcode,
             _ => {}
         }
     }
@@ -543,10 +563,24 @@ pub fn prepare_pty_launch(
         PtyCliKind::Agy => {
             let _ = ensure_agy_plugin_installed(&h2_exe);
         }
+        // ZCode has no flags for hooks or a session of its own choosing: its hooks live in
+        // one runtime config (registered here, see `zcode`), and it names its session itself.
+        PtyCliKind::Zcode => register_zcode_hooks(&h2_exe),
         PtyCliKind::Generic => {}
     }
 
     PreparedPtyLaunch { kind, session_id }
+}
+
+/// Makes sure ZCode's runtime config has Herdr2's hooks; a failure keeps `zcode` usable
+/// (recognized, with status), only without checkpoints, and is said in the core log.
+fn register_zcode_hooks(h2_exe: &str) {
+    let registered = user_home_dir()
+        .ok_or_else(|| "cannot resolve the user's home folder".to_string())
+        .and_then(|home| crate::zcode::ensure_hooks_registered(&home, h2_exe));
+    if let Err(e) = registered {
+        eprintln!("core: zcode hooks not registered: {e}");
+    }
 }
 
 fn extract_flag_value(argv: &[String], flags: &[&str]) -> Option<String> {
@@ -580,7 +614,8 @@ pub(crate) fn session_id_from_transcript(cli_kind: &str, path: &Path) -> Option<
                 for line in raw.lines().take(12) {
                     if let Ok(v) = serde_json::from_str::<Value>(line.trim())
                         && v.get("type").and_then(Value::as_str) == Some("session_meta")
-                        && let Some(sid) = v.pointer("/payload/id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+                        && let Some(sid) =
+                            v.pointer("/payload/id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
                     {
                         return Some(sid.to_string());
                     }
@@ -631,8 +666,7 @@ pub(crate) fn terminal_active_resume_argv(t: &crate::terminals::Terminal) -> Opt
 /// Returns true when a terminal running a resumed CLI (`-c`, `--continue`, `--resume`, `codex resume`)
 /// should attempt to re-attach archived session checkpoints.
 pub(crate) fn needs_resumed_reattach(tc: &crate::checkpoint::TargetCheckpoints, fg_pid: Option<u32>) -> bool {
-    let only_anonymous_baseline =
-        tc.cli_session_id.is_none() && tc.checkpoints.iter().all(|c| c.turn == 0);
+    let only_anonymous_baseline = tc.cli_session_id.is_none() && tc.checkpoints.iter().all(|c| c.turn == 0);
     if tc.checkpoints.is_empty() || only_anonymous_baseline {
         return true;
     }
@@ -673,23 +707,16 @@ pub async fn reattach_resumed_cli_checkpoints(core: &Arc<Core>, id: u32) -> bool
         if !needs_resumed_reattach(&tc, fg_pid) {
             return false;
         }
-        let only_anonymous_or_empty = tc.checkpoints.is_empty()
-            || (tc.cli_session_id.is_none() && tc.checkpoints.iter().all(|c| c.turn == 0));
-        (
-            t.address,
-            cwd,
-            fg_pid,
-            cli_kind,
-            active_argv,
-            only_anonymous_or_empty,
-            tc.cli_session_id,
-        )
+        let only_anonymous_or_empty =
+            tc.checkpoints.is_empty() || (tc.cli_session_id.is_none() && tc.checkpoints.iter().all(|c| c.turn == 0));
+        (t.address, cwd, fg_pid, cli_kind, active_argv, only_anonymous_or_empty, tc.cli_session_id)
     };
 
     let kind_str = cli_kind.as_str().to_string();
     let explicit_sid = match cli_kind {
         PtyCliKind::Claude | PtyCliKind::Agy => extract_flag_value(&argv, &["--resume", "-r", "--conversation"]),
         PtyCliKind::Codex => extract_codex_resume_id(&argv),
+        PtyCliKind::Zcode => extract_flag_value(&argv, &["--resume"]),
         PtyCliKind::Generic => None,
     };
 
@@ -705,23 +732,14 @@ pub async fn reattach_resumed_cli_checkpoints(core: &Arc<Core>, id: u32) -> bool
             ("agy", Some(s)) => find_agy_transcript_by_cid(s),
             _ => discover_cli_transcript(&kind_c, &cwd_c, 0, None, true),
         };
-        let resolved_sid = explicit_c.or_else(|| {
-            transcript_path
-                .as_deref()
-                .and_then(|p| session_id_from_transcript(&kind_c, p))
-        });
+        let resolved_sid =
+            explicit_c.or_else(|| transcript_path.as_deref().and_then(|p| session_id_from_transcript(&kind_c, p)));
 
-        let archived = core_c
-            .load_archived_cli_session(&kind_c, resolved_sid.as_deref(), Some(&cwd_c))
-            .and_then(|mut arch| {
-                let repo_dir = arch
-                    .repo_root
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(&cwd_c);
+        let archived =
+            core_c.load_archived_cli_session(&kind_c, resolved_sid.as_deref(), Some(&cwd_c)).and_then(|mut arch| {
+                let repo_dir = arch.repo_root.as_deref().filter(|s| !s.is_empty()).unwrap_or(&cwd_c);
                 if let Some(repo) = crate::checkpoint::probe_repo(Path::new(repo_dir)) {
-                    arch.checkpoints
-                        .retain(|c| crate::checkpoint::ref_exists(&repo, &c.ref_name));
+                    arch.checkpoints.retain(|c| crate::checkpoint::ref_exists(&repo, &c.ref_name));
                     if arch.repo_root.is_none() {
                         arch.repo_root = Some(repo.toplevel.to_string_lossy().to_string());
                     }
@@ -768,9 +786,7 @@ pub async fn reattach_resumed_cli_checkpoints(core: &Arc<Core>, id: u32) -> bool
         return false;
     };
 
-    let sid_final = resolved_sid
-        .or_else(|| restored.cli_session_id.clone())
-        .unwrap_or_default();
+    let sid_final = resolved_sid.or_else(|| restored.cli_session_id.clone()).unwrap_or_default();
     if !only_anonymous_or_empty && !sid_final.is_empty() && current_sid.as_deref() == Some(sid_final.as_str()) {
         // Same session already attached; just record the new foreground PID so we don't re-scan.
         let mut st = core.lock();
@@ -827,14 +843,7 @@ pub fn build_rollback_argv(
         && PtyCliKind::detect_cmd_token(&orig_argv[cmd_idx]) == kind
     {
         let mut out = orig_argv[..cmd_idx].to_vec();
-        out.extend(build_direct_cli_argv(
-            kind,
-            &orig_argv[cmd_idx..],
-            hooks_dir,
-            h2_exe,
-            to_turn,
-            fork_session_id,
-        ));
+        out.extend(build_direct_cli_argv(kind, &orig_argv[cmd_idx..], hooks_dir, h2_exe, to_turn, fork_session_id));
         return out;
     }
     build_direct_cli_argv(kind, orig_argv, hooks_dir, h2_exe, to_turn, fork_session_id)
@@ -918,10 +927,8 @@ fn build_direct_cli_argv(
                 out.push("--resume".into());
                 out.push(sid.to_string());
             } else {
-                let sid = fork_session_id
-                    .filter(|s| !s.trim().is_empty())
-                    .map(str::to_string)
-                    .unwrap_or_else(random_uuid_v4);
+                let sid =
+                    fork_session_id.filter(|s| !s.trim().is_empty()).map(str::to_string).unwrap_or_else(random_uuid_v4);
                 out.push("--session-id".into());
                 out.push(sid);
             }
@@ -970,11 +977,8 @@ fn build_direct_cli_argv(
         PtyCliKind::Agy => {
             let _ = ensure_agy_plugin_installed(h2_exe);
             let raw_bin = orig_argv.first().cloned().unwrap_or_else(|| "agy".into());
-            let bin = if raw_bin.ends_with(".real") || raw_bin.ends_with(".real.exe") {
-                "agy".to_string()
-            } else {
-                raw_bin
-            };
+            let bin =
+                if raw_bin.ends_with(".real") || raw_bin.ends_with(".real.exe") { "agy".to_string() } else { raw_bin };
             let mut out = vec![bin];
             let mut i = 1usize;
             while i < orig_argv.len() {
@@ -993,6 +997,41 @@ fn build_direct_cli_argv(
                 }
                 out.push(arg.clone());
                 i += 1;
+            }
+            out
+        }
+        PtyCliKind::Zcode => {
+            // A ZCode started by hand in a shell shows only its title, `zcode-cli`: not a command.
+            // (Its hooks were registered when this terminal's `zcode` was first started.)
+            let raw_bin = orig_argv.first().cloned().unwrap_or_else(|| "zcode".into());
+            let bin = if exe_stem(&raw_bin) == "zcode-cli" && !raw_bin.contains(['/', '\\']) {
+                "zcode".to_string()
+            } else {
+                raw_bin
+            };
+            let mut out = vec![bin];
+            let mut i = 1usize;
+            while i < orig_argv.len() {
+                let arg = &orig_argv[i];
+                if matches!(arg.as_str(), "--resume" | "--session-id") {
+                    i += 2;
+                    continue;
+                }
+                if matches!(arg.as_str(), "-c" | "--continue")
+                    || arg.starts_with("--resume=")
+                    || arg.starts_with("--session-id=")
+                {
+                    i += 1;
+                    continue;
+                }
+                out.push(arg.clone());
+                i += 1;
+            }
+            if to_turn > 0
+                && let Some(sid) = fork_session_id
+            {
+                out.push("--resume".into());
+                out.push(sid.to_string());
             }
             out
         }
@@ -1041,14 +1080,13 @@ pub fn extract_saved_cli_from_argv(
         return None;
     }
 
-    let sid = session_id
-        .filter(|s| !s.trim().is_empty())
-        .or_else(|| match kind {
-            PtyCliKind::Claude => extract_flag_value(&cli_argv, &["--session-id", "--resume", "-r"]),
-            PtyCliKind::Codex => extract_codex_resume_id(&cli_argv),
-            PtyCliKind::Agy => extract_flag_value(&cli_argv, &["--conversation", "--resume", "-r"]),
-            PtyCliKind::Generic => None,
-        });
+    let sid = session_id.filter(|s| !s.trim().is_empty()).or_else(|| match kind {
+        PtyCliKind::Claude => extract_flag_value(&cli_argv, &["--session-id", "--resume", "-r"]),
+        PtyCliKind::Codex => extract_codex_resume_id(&cli_argv),
+        PtyCliKind::Agy => extract_flag_value(&cli_argv, &["--conversation", "--resume", "-r"]),
+        PtyCliKind::Zcode => extract_flag_value(&cli_argv, &["--resume"]),
+        PtyCliKind::Generic => None,
+    });
 
     Some(crate::terminals::SavedCliResume {
         kind: kind.as_str().to_string(),
@@ -1091,19 +1129,25 @@ pub fn verify_cli_session_exists(
             }
         }
     }
+    // ZCode keeps its history in its own database: there is no file to check. Herdr2 learns
+    // a ZCode session's id from the hook after its first prompt, so an id in hand has a turn.
+    if kind == PtyCliKind::Zcode {
+        return clean_sid.filter(|s| s.starts_with("sess_")).map(str::to_string);
+    }
     let sid_str = clean_sid?;
     let found = match kind {
         PtyCliKind::Claude => find_claude_session_file(cwd, sid_str),
         PtyCliKind::Codex => find_codex_rollout_by_sid(cwd, sid_str),
         PtyCliKind::Agy => find_agy_transcript_by_cid(sid_str),
-        PtyCliKind::Generic => None,
+        PtyCliKind::Generic | PtyCliKind::Zcode => None,
     };
     found.filter(|p| non_empty_file(p)).map(|_| sid_str.to_string())
 }
 
 /// Builds the recovery command for a kept PTY terminal that was running a CLI agent before reboot/restart.
 ///
-/// - When the saved session exists on disk, resumes it (`claude --resume <id>`, `codex resume <id>`, `agy --conversation <id>`).
+/// - When the saved session exists on disk, resumes it (`claude --resume <id>`, `codex resume <id>`, `agy --conversation <id>`,
+///   `zcode --resume <id>`).
 /// - When 0-turn / missing on disk, launches a clean fresh session with the original CLI flags.
 /// - Always wraps inside a login/interactive shell (`wrap_cli_in_shell`) so resume failures gracefully drop to a usable shell.
 pub fn build_recovery_argv(
@@ -1117,12 +1161,8 @@ pub fn build_recovery_argv(
     if kind == PtyCliKind::Generic {
         return None;
     }
-    let resolved_sid = verify_cli_session_exists(
-        kind,
-        cwd,
-        saved.session_id.as_deref(),
-        saved.transcript_path.as_deref(),
-    );
+    let resolved_sid =
+        verify_cli_session_exists(kind, cwd, saved.session_id.as_deref(), saved.transcript_path.as_deref());
     let wrapper_shell = saved
         .wrapper_shell
         .as_deref()
@@ -1134,11 +1174,13 @@ pub fn build_recovery_argv(
     let (cli_argv, resumed_existing, final_sid) = match kind {
         PtyCliKind::Claude => {
             if let Some(sid) = resolved_sid {
-                let built = build_direct_cli_argv(PtyCliKind::Claude, &saved.cli_argv, hooks_dir, h2_exe, 1, Some(&sid));
+                let built =
+                    build_direct_cli_argv(PtyCliKind::Claude, &saved.cli_argv, hooks_dir, h2_exe, 1, Some(&sid));
                 (built, true, Some(sid))
             } else {
                 let fresh_sid = random_uuid_v4();
-                let built = build_direct_cli_argv(PtyCliKind::Claude, &saved.cli_argv, hooks_dir, h2_exe, 0, Some(&fresh_sid));
+                let built =
+                    build_direct_cli_argv(PtyCliKind::Claude, &saved.cli_argv, hooks_dir, h2_exe, 0, Some(&fresh_sid));
                 (built, false, Some(fresh_sid))
             }
         }
@@ -1161,17 +1203,21 @@ pub fn build_recovery_argv(
                 (built, false, None)
             }
         }
+        PtyCliKind::Zcode => {
+            let mut built = build_direct_cli_argv(PtyCliKind::Zcode, &saved.cli_argv, hooks_dir, h2_exe, 0, None);
+            if let Some(sid) = resolved_sid {
+                built.push("--resume".into());
+                built.push(sid.clone());
+                (built, true, Some(sid))
+            } else {
+                (built, false, None)
+            }
+        }
         PtyCliKind::Generic => return None,
     };
 
     let argv = wrap_cli_in_shell(&wrapper_shell, cli_argv.clone());
-    Some(RecoveredCliPlan {
-        argv,
-        cli_argv,
-        wrapper_shell,
-        resumed_existing,
-        session_id: final_sid,
-    })
+    Some(RecoveredCliPlan { argv, cli_argv, wrapper_shell, resumed_existing, session_id: final_sid })
 }
 
 /// Discovers and pins the CLI session ID & transcript path for a live terminal running a supported
@@ -1331,10 +1377,9 @@ pub fn fork_claude_jsonl(src: &Path, to_turn: u64, fork_uuid: &str) -> Result<(P
         };
         match v.get("type").and_then(Value::as_str) {
             Some("queue-operation") => true,
-            Some("file-history-snapshot") => v
-                .get("messageId")
-                .and_then(Value::as_str)
-                .is_some_and(|mid| !kept_uuids.contains(mid)),
+            Some("file-history-snapshot") => {
+                v.get("messageId").and_then(Value::as_str).is_some_and(|mid| !kept_uuids.contains(mid))
+            }
             _ => false,
         }
     }) {
@@ -1552,10 +1597,7 @@ fn reset_if_new_cli_session(
     if tc.pending_rollback_turn.is_some() || tc.pending_handoff.is_some() {
         return;
     }
-    let kind_changed = tc
-        .cli_kind
-        .as_deref()
-        .is_some_and(|old| !old.is_empty() && old != "generic" && old != new_kind);
+    let kind_changed = tc.cli_kind.as_deref().is_some_and(|old| !old.is_empty() && old != "generic" && old != new_kind);
     let sid_changed = match (tc.cli_session_id.as_deref(), new_sid) {
         (Some(old), Some(new)) if !old.is_empty() && !new.is_empty() && old != new => true,
         _ => false,
@@ -1632,10 +1674,8 @@ fn resolve_rollback_transcript_turn(checkpoints: &[crate::checkpoint::Checkpoint
     if let Some(st) = checkpoints.iter().find(|c| c.turn == to_turn).and_then(|c| c.session_turn) {
         return st;
     }
-    let ordinal = checkpoints
-        .iter()
-        .filter(|c| c.turn > 0 && c.turn <= to_turn && !c.is_manual_bookmark())
-        .count() as u64;
+    let ordinal =
+        checkpoints.iter().filter(|c| c.turn > 0 && c.turn <= to_turn && !c.is_manual_bookmark()).count() as u64;
     if ordinal > 0 { ordinal } else { to_turn }
 }
 
@@ -1644,9 +1684,7 @@ fn resolve_rollback_transcript_turn(checkpoints: &[crate::checkpoint::Checkpoint
 fn is_codex_internal_helper_prompt(prompt: &str) -> bool {
     let lower = prompt.trim_start().to_ascii_lowercase();
     lower.starts_with("generate a concise, single-line task title")
-        || (lower.starts_with("generate a ")
-            && lower.contains("title")
-            && lower.contains("do not answer the request"))
+        || (lower.starts_with("generate a ") && lower.contains("title") && lower.contains("do not answer the request"))
         || (lower.contains("do not answer the request.") && lower.contains("\nuser prompt:\n"))
 }
 
@@ -1668,12 +1706,11 @@ fn has_captured_session_turn(
         if c.session_turn == Some(sturn) {
             return true;
         }
-        c.session_turn.is_none()
-            && prompt.is_some_and(|p| !p.is_empty() && c.prompt.as_deref() == Some(p))
+        c.session_turn.is_none() && prompt.is_some_and(|p| !p.is_empty() && c.prompt.as_deref() == Some(p))
     })
 }
 
-/// Processes a synchronous CLI hook invocation (`claude`, `codex-notify`, `agy`) and returns JSON output for stdout.
+/// Processes a synchronous CLI hook invocation (`claude`, `codex-notify`, `agy`, `zcode`) and returns JSON output for stdout.
 pub async fn handle_checkpoint_hook(
     core: &Arc<Core>,
     id: u32,
@@ -1699,18 +1736,35 @@ pub async fn handle_checkpoint_hook(
     };
 
     match source {
-        "claude" => {
+        // ZCode speaks Claude Code's hook protocol; where the two differ, `zcode` says.
+        "claude" | "zcode" => {
+            let zcode = source == "zcode";
             let sid = payload.get("session_id").and_then(Value::as_str).map(str::to_string);
-            let tpath = payload.get("transcript_path").and_then(Value::as_str).map(str::to_string);
+            // ZCode's `transcript_path` is a temporary file holding this one message, removed
+            // once the hook returns: never the session's transcript to keep reading.
+            let tpath =
+                if zcode { None } else { payload.get("transcript_path").and_then(Value::as_str).map(str::to_string) };
             let prompt = payload.get("prompt").and_then(Value::as_str).map(strip_h2_envelope).filter(|s| !s.is_empty());
 
             if phase == Some("pre") {
-                let needs_baseline = {
+                let (needs_baseline, handoff) = {
                     let mut st = core.lock();
-                    reset_if_new_cli_session(core, &mut st, id, &addr, &cwd, "claude", sid.as_deref());
+                    if zcode {
+                        // What a rollback left for this session goes in with its next prompt. A note
+                        // still here when another session speaks has waited too long.
+                        let mut tc = core.target_checkpoints(&mut st, &addr);
+                        if tc.pending_handoff.is_some()
+                            && sid.as_deref().is_some_and(|s| tc.cli_session_id.as_deref().is_some_and(|cur| cur != s))
+                        {
+                            tc.pending_handoff = None;
+                            tc.pending_rollback_turn = None;
+                            core.save_target_checkpoints(&mut st, tc);
+                        }
+                    }
+                    reset_if_new_cli_session(core, &mut st, id, &addr, &cwd, source, sid.as_deref());
                     let fg_pid = terminal_cli_fg_pid(&st, id);
                     let mut tc = core.target_checkpoints(&mut st, &addr);
-                    tc.cli_kind = Some("claude".into());
+                    tc.cli_kind = Some(source.into());
                     if let Some(pid) = fg_pid {
                         tc.cli_fg_pid = Some(pid);
                     }
@@ -1728,21 +1782,37 @@ pub async fn handle_checkpoint_hook(
                         let t_turn = st.pty_reg.terminals.get(&id).map_or(0, |t| t.turn);
                         tc.active_turn_num = Some((t_turn + 1).max(max_turn + 1));
                     }
+                    let handoff = zcode.then(|| tc.pending_handoff.take()).flatten();
+                    if handoff.is_some() {
+                        tc.pending_rollback_turn = None;
+                    }
                     let needs = !tc.checkpoints.iter().any(|c| c.turn == 0);
                     core.save_target_checkpoints(&mut st, tc);
-                    needs
+                    (needs, handoff)
                 };
                 if needs_baseline {
                     let _ = capture_target_checkpoint(core, TargetKey::Terminal(id), Some(0), None, None, true, false)
                         .await;
                 }
+                if let Some(context) = handoff {
+                    // One step to inject, in the shape ZCode's hook protocol answers in (the `h2`
+                    // on the CLI's side moves it to where ZCode reads it).
+                    return json!({
+                        "injectSteps": [{
+                            "hookSpecificOutput": {
+                                "hookEventName": "UserPromptSubmit",
+                                "additionalContext": context
+                            }
+                        }]
+                    });
+                }
             } else if phase == Some("post") {
                 let (turn_num, prompt_val, resolved_tpath) = {
                     let mut st = core.lock();
-                    reset_if_new_cli_session(core, &mut st, id, &addr, &cwd, "claude", sid.as_deref());
+                    reset_if_new_cli_session(core, &mut st, id, &addr, &cwd, source, sid.as_deref());
                     let fg_pid = terminal_cli_fg_pid(&st, id);
                     let mut tc = core.target_checkpoints(&mut st, &addr);
-                    tc.cli_kind = Some("claude".into());
+                    tc.cli_kind = Some(source.into());
                     if let Some(pid) = fg_pid {
                         tc.cli_fg_pid = Some(pid);
                     }
@@ -1757,7 +1827,8 @@ pub async fn handle_checkpoint_hook(
                         .take()
                         .unwrap_or_else(|| tc.checkpoints.iter().map(|c| c.turn).max().unwrap_or(0) + 1);
                     let pr = tc.active_turn_prompt.take();
-                    if tc.cli_transcript_path.is_none()
+                    if !zcode
+                        && tc.cli_transcript_path.is_none()
                         && let Some(ref s) = tc.cli_session_id
                         && let Some(found) = find_claude_session_file(&cwd, s)
                     {
@@ -1767,12 +1838,13 @@ pub async fn handle_checkpoint_hook(
                     core.save_target_checkpoints(&mut st, tc);
                     (turn_num, pr, resolved_tpath)
                 };
-                let (session_turn, parsed_prompt) = match resolved_tpath.as_deref().map(PathBuf::from).filter(|p| p.is_file()) {
-                    Some(p) => tokio::task::spawn_blocking(move || latest_transcript_user_turn("claude", &p))
-                        .await
-                        .unwrap_or((None, None)),
-                    None => (None, None),
-                };
+                let (session_turn, parsed_prompt) =
+                    match resolved_tpath.as_deref().map(PathBuf::from).filter(|p| p.is_file()) {
+                        Some(p) => tokio::task::spawn_blocking(move || latest_transcript_user_turn("claude", &p))
+                            .await
+                            .unwrap_or((None, None)),
+                        None => (None, None),
+                    };
                 let _ = capture_target_checkpoint_with_session_turn(
                     core,
                     TargetKey::Terminal(id),
@@ -1789,11 +1861,7 @@ pub async fn handle_checkpoint_hook(
         }
         "codex-notify" => {
             let input_msgs = payload.get("input-messages").and_then(Value::as_array);
-            if input_msgs.is_some_and(|arr| {
-                arr.iter()
-                    .filter_map(Value::as_str)
-                    .any(is_codex_internal_helper_prompt)
-            }) {
+            if input_msgs.is_some_and(|arr| arr.iter().filter_map(Value::as_str).any(is_codex_internal_helper_prompt)) {
                 return json!({});
             }
             let sid = payload
@@ -1845,13 +1913,10 @@ pub async fn handle_checkpoint_hook(
                 }
                 let needs_baseline = !tc.checkpoints.iter().any(|c| c.turn == 0);
                 let t_turn = st.pty_reg.terminals.get(&id).map_or(0, |t| t.turn);
-                let turn_num = tc
-                    .active_turn_num
-                    .take()
-                    .unwrap_or_else(|| {
-                        let max_ckpt = tc.checkpoints.iter().map(|c| c.turn).max().unwrap_or(0);
-                        (t_turn + 1).max(max_ckpt + 1)
-                    });
+                let turn_num = tc.active_turn_num.take().unwrap_or_else(|| {
+                    let max_ckpt = tc.checkpoints.iter().map(|c| c.turn).max().unwrap_or(0);
+                    (t_turn + 1).max(max_ckpt + 1)
+                });
                 let effective_prompt = turn_prompt.or_else(|| tc.active_turn_prompt.take());
                 let resolved_tpath = tc.cli_transcript_path.clone();
                 core.save_target_checkpoints(&mut st, tc);
@@ -1861,12 +1926,13 @@ pub async fn handle_checkpoint_hook(
                 let _ =
                     capture_target_checkpoint(core, TargetKey::Terminal(id), Some(0), None, None, true, false).await;
             }
-            let (session_turn, parsed_prompt) = match resolved_tpath.as_deref().map(PathBuf::from).filter(|p| p.is_file()) {
-                Some(p) => tokio::task::spawn_blocking(move || latest_transcript_user_turn("codex", &p))
-                    .await
-                    .unwrap_or((None, None)),
-                None => (None, None),
-            };
+            let (session_turn, parsed_prompt) =
+                match resolved_tpath.as_deref().map(PathBuf::from).filter(|p| p.is_file()) {
+                    Some(p) => tokio::task::spawn_blocking(move || latest_transcript_user_turn("codex", &p))
+                        .await
+                        .unwrap_or((None, None)),
+                    None => (None, None),
+                };
             let final_prompt = effective_prompt.or(parsed_prompt);
             let already_captured = {
                 let mut st = core.lock();
@@ -2010,12 +2076,13 @@ pub async fn handle_checkpoint_hook(
                         core.save_target_checkpoints(&mut st, tc);
                         (turn_num, pr, resolved_tpath)
                     };
-                    let (session_turn, parsed_prompt) = match resolved_tpath.as_deref().map(PathBuf::from).filter(|p| p.is_file()) {
-                        Some(p) => tokio::task::spawn_blocking(move || latest_transcript_user_turn("agy", &p))
-                            .await
-                            .unwrap_or((None, None)),
-                        None => (None, None),
-                    };
+                    let (session_turn, parsed_prompt) =
+                        match resolved_tpath.as_deref().map(PathBuf::from).filter(|p| p.is_file()) {
+                            Some(p) => tokio::task::spawn_blocking(move || latest_transcript_user_turn("agy", &p))
+                                .await
+                                .unwrap_or((None, None)),
+                            None => (None, None),
+                        };
                     let _ = capture_target_checkpoint_with_session_turn(
                         core,
                         TargetKey::Terminal(id),
@@ -2144,10 +2211,7 @@ pub async fn process_pty_checkpoint_job(
                     .checkpoints
                     .last()
                     .is_some_and(|c| c.turn > 0 && c.ts_ms.saturating_add(5_000) >= crate::runtime::now_ms()));
-        let expected_turn = tc
-            .active_turn_num
-            .unwrap_or_else(|| reported_turn.max(max_ckpt_turn + 1))
-            .max(1);
+        let expected_turn = tc.active_turn_num.unwrap_or_else(|| reported_turn.max(max_ckpt_turn + 1)).max(1);
         let needs_baseline = !tc.checkpoints.iter().any(|c| c.turn == 0);
         // For clean (non-resumed) CLI sessions, defer transcript discovery until `turn_ended` so we
         // never race ahead of the new session's JSONL creation and accidentally bind an older session.
@@ -2174,12 +2238,11 @@ pub async fn process_pty_checkpoint_job(
         if needs_discover {
             let kind_str = cli_kind.as_str().to_string();
             let cwd_c = cwd.clone();
-            if let Some(found) = tokio::task::spawn_blocking(move || {
-                discover_cli_transcript(&kind_str, &cwd_c, 0, None, true)
-            })
-            .await
-            .ok()
-            .flatten()
+            if let Some(found) =
+                tokio::task::spawn_blocking(move || discover_cli_transcript(&kind_str, &cwd_c, 0, None, true))
+                    .await
+                    .ok()
+                    .flatten()
             {
                 let mut st = core.lock();
                 let mut tc = core.target_checkpoints(&mut st, &addr);
@@ -2257,11 +2320,7 @@ pub async fn process_pty_checkpoint_job(
             let path = if !resumed && discovered.is_some() {
                 discovered
             } else {
-                tpath_c
-                    .as_deref()
-                    .map(PathBuf::from)
-                    .filter(|p| p.is_file())
-                    .or(discovered)
+                tpath_c.as_deref().map(PathBuf::from).filter(|p| p.is_file()).or(discovered)
             };
             let Some(ref p) = path else {
                 return (None, None, None);
@@ -2499,7 +2558,7 @@ pub async fn rollback_pty_terminal(
                 .as_deref()
                 .and_then(find_agy_transcript_by_cid)
                 .or_else(|| discover_cli_transcript("agy", &orig_cwd, started_ms, fg_pid, true)),
-            PtyCliKind::Generic => None,
+            PtyCliKind::Generic | PtyCliKind::Zcode => None,
         });
 
     let mut new_sid: Option<String> = None;
@@ -2531,16 +2590,23 @@ pub async fn rollback_pty_terminal(
                     let (_, prompt) = prepare_agy_rollback(src, 0);
                     restored_prompt = prompt;
                 }
-                PtyCliKind::Generic => {}
+                PtyCliKind::Generic | PtyCliKind::Zcode => {}
             }
         }
         rewound_session = cli_kind != PtyCliKind::Generic;
+    } else if cli_kind == PtyCliKind::Zcode {
+        // ZCode's conversation is its own to keep: there is nothing to cut at a turn. The
+        // session is resumed as it was and told about the rollback with its next prompt.
+        if let Some(s) = sid.as_deref().filter(|s| s.starts_with("sess_")) {
+            new_sid = Some(s.to_string());
+            new_handoff = Some(crate::zcode::rollback_note(to_turn));
+            rewound_session = true;
+        }
     } else if let Some(ref src) = transcript_src {
         match cli_kind {
             PtyCliKind::Claude => {
                 let fork_uuid = random_uuid_v4();
-                let (dest, prompt) =
-                    fork_claude_jsonl(src, transcript_turn, &fork_uuid).map_err(RpcError::internal)?;
+                let (dest, prompt) = fork_claude_jsonl(src, transcript_turn, &fork_uuid).map_err(RpcError::internal)?;
                 restored_prompt = prompt;
                 if std::fs::metadata(&dest).is_ok_and(|m| m.len() > 0) {
                     new_sid = Some(fork_uuid);
@@ -2552,8 +2618,7 @@ pub async fn rollback_pty_terminal(
             }
             PtyCliKind::Codex => {
                 let fork_uuid = random_uuid_v4();
-                let (dest, prompt) =
-                    fork_codex_jsonl(src, transcript_turn, &fork_uuid).map_err(RpcError::internal)?;
+                let (dest, prompt) = fork_codex_jsonl(src, transcript_turn, &fork_uuid).map_err(RpcError::internal)?;
                 restored_prompt = prompt;
                 if std::fs::metadata(&dest).is_ok_and(|m| m.len() > 0) {
                     new_sid = Some(fork_uuid);
@@ -2569,7 +2634,7 @@ pub async fn rollback_pty_terminal(
                 restored_prompt = prompt;
                 rewound_session = true;
             }
-            PtyCliKind::Generic => {}
+            PtyCliKind::Generic | PtyCliKind::Zcode => {}
         }
     }
 
@@ -2825,14 +2890,8 @@ mod tests {
         ];
         assert_eq!(pty_command_offset(&wrapper_argv), Some(4));
         assert_eq!(PtyCliKind::detect(&wrapper_argv), PtyCliKind::Claude);
-        let wrapped_rebuilt = build_rollback_argv(
-            PtyCliKind::Claude,
-            &wrapper_argv,
-            &dir,
-            "/usr/bin/h2",
-            1,
-            Some("fork-wrapped-sid"),
-        );
+        let wrapped_rebuilt =
+            build_rollback_argv(PtyCliKind::Claude, &wrapper_argv, &dir, "/usr/bin/h2", 1, Some("fork-wrapped-sid"));
         assert_eq!(&wrapped_rebuilt[..5], ["sh", "-c", wrapper_argv[2].as_str(), "sh", "claude"]);
         assert!(wrapped_rebuilt.contains(&"--dangerously-skip-permissions".to_string()));
         assert!(wrapped_rebuilt.contains(&"--settings".to_string()));
@@ -2877,7 +2936,11 @@ mod tests {
         assert_eq!(prompt.as_deref(), Some("turn 2 mistake"));
         let out_raw = std::fs::read_to_string(&forked).unwrap();
         let out_lines: Vec<Value> = out_raw.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
-        assert_eq!(out_lines.len(), 4, "mixed tool_result stays in turn 1; orphaned file-history-snapshot, queue-operation and turn 2 trimmed");
+        assert_eq!(
+            out_lines.len(),
+            4,
+            "mixed tool_result stays in turn 1; orphaned file-history-snapshot, queue-operation and turn 2 trimmed"
+        );
         assert!(out_lines.iter().all(|v| v["sessionId"] == "fork-uuid-456"));
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2956,7 +3019,8 @@ mod tests {
         use crate::paths::Paths;
         use crate::terminals::NewTerminal;
 
-        let root = crate::test_tmp().join(format!("h2-hook-reset-{}-{}", std::process::id(), crate::platform::random_hex()));
+        let root =
+            crate::test_tmp().join(format!("h2-hook-reset-{}-{}", std::process::id(), crate::platform::random_hex()));
         let paths = Paths {
             socket: root.join("core.sock"),
             holder_socket: root.join("holder.sock"),
@@ -3121,7 +3185,10 @@ mod tests {
         assert!(rebuilt_agy.iter().any(|a| a == "--dangerously-skip-permissions"), "{rebuilt_agy:?}");
         assert!(rebuilt_agy.windows(2).any(|w| w == ["--model", "gemini-4-carbon-high"]), "{rebuilt_agy:?}");
         assert!(!rebuilt_agy.iter().any(|a| a == "--conversation" || a == "old-conv"), "{rebuilt_agy:?}");
-        assert!(!rebuilt_agy.iter().any(|a| a == "--prompt-interactive" || a == "initial flash note"), "{rebuilt_agy:?}");
+        assert!(
+            !rebuilt_agy.iter().any(|a| a == "--prompt-interactive" || a == "initial flash note"),
+            "{rebuilt_agy:?}"
+        );
 
         // 4. Shell running Generic CLI (e.g. `gemini`) re-launches it inside shell wrapper instead of bare zsh.
         let fg_gemini = vec!["gemini".into(), "--yolo".into()];
@@ -3187,7 +3254,8 @@ mod tests {
         assert!(!is_codex_internal_helper_prompt("[Handoff from t2t] Read the full context handoff"));
         assert!(!is_codex_internal_helper_prompt("Generate a title bar component for the app"));
 
-        let root = crate::test_tmp().join(format!("h2-codex-helper-{}-{}", std::process::id(), crate::platform::random_hex()));
+        let root =
+            crate::test_tmp().join(format!("h2-codex-helper-{}-{}", std::process::id(), crate::platform::random_hex()));
         let paths = crate::paths::Paths {
             socket: root.join("core.sock"),
             holder_socket: root.join("holder.sock"),
@@ -3195,9 +3263,8 @@ mod tests {
             config: root.join("config.toml"),
         };
         paths.create_dirs().unwrap();
-        let core = Arc::new(
-            Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap(),
-        );
+        let core =
+            Arc::new(Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap());
         let id = {
             let mut st = core.lock();
             st.pty_reg
@@ -3288,13 +3355,9 @@ mod tests {
             "--session-id".into(),
             "sid-claude-1".into(),
         ];
-        let saved = extract_saved_cli_from_argv(
-            &wrapped_claude,
-            None,
-            None,
-            Some(claude_tpath.to_string_lossy().to_string()),
-        )
-        .expect("should extract claude");
+        let saved =
+            extract_saved_cli_from_argv(&wrapped_claude, None, None, Some(claude_tpath.to_string_lossy().to_string()))
+                .expect("should extract claude");
         assert_eq!(saved.kind, "claude");
         assert_eq!(saved.session_id.as_deref(), Some("sid-claude-1"));
         assert_eq!(saved.wrapper_shell.as_deref(), Some("/bin/zsh"));
@@ -3410,5 +3473,82 @@ mod tests {
         assert!(extract_saved_cli_from_argv(&["vim".into(), "foo.rs".into()], None, None, None).is_none());
 
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn zcode_is_recognized_however_it_is_started_and_relaunched_with_its_own_session() {
+        // Linux and macOS see only the title the CLI gives its process.
+        assert_eq!(PtyCliKind::detect(&["zcode-cli".into()]), PtyCliKind::Zcode);
+        // The command as typed, or as Herdr2 starts it from its menu.
+        assert_eq!(PtyCliKind::detect(&["zcode".into(), "--mode".into(), "yolo".into()]), PtyCliKind::Zcode);
+        // Through the Node it ships with: what Windows shows of the process.
+        let bundled = vec![
+            "C:\\Users\\dev\\.zcode\\server\\releases\\3.19.1\\runtime\\node.exe".to_string(),
+            "C:\\Users\\dev\\.zcode\\server\\releases\\3.19.1\\runtime\\zcode.cjs".to_string(),
+            "--mode".to_string(),
+            "yolo".to_string(),
+        ];
+        assert_eq!(PtyCliKind::detect(&bundled), PtyCliKind::Zcode);
+        let saved = extract_saved_cli_from_argv(&bundled, None, None, None).expect("zcode through Node");
+        assert_eq!(saved.kind, "zcode");
+        assert_eq!(saved.cli_argv[0], "zcode");
+        // The desktop app of the same name is not the CLI.
+        assert_eq!(PtyCliKind::detect_cmd_token("/opt/ZCode/zcode"), PtyCliKind::Generic);
+        assert_eq!(PtyCliKind::from_str_name("zcode"), PtyCliKind::Zcode);
+
+        let root = crate::test_tmp().join(format!("h2-cli-zcode-{}", crate::platform::random_hex()));
+        let hooks_dir = root.join("hooks");
+        let sid = "sess_0f1e2d3c-aaaa-4bbb-8ccc-000000000001";
+
+        // No transcript to check: a session id is in hand only once ZCode's first prompt came
+        // with it. Anything that isn't one of its ids is not resumed.
+        assert_eq!(verify_cli_session_exists(PtyCliKind::Zcode, "/nowhere", Some(sid), None).as_deref(), Some(sid));
+        assert_eq!(verify_cli_session_exists(PtyCliKind::Zcode, "/nowhere", Some("uuid-1"), None), None);
+        assert_eq!(verify_cli_session_exists(PtyCliKind::Zcode, "/nowhere", None, Some("/nowhere/x.jsonl")), None);
+
+        // After a restart: the session again, with the flags it was started with.
+        let launched = vec![
+            "/bin/zsh".to_string(),
+            "-lic".to_string(),
+            "\"$@\"; exec \"$0\" -li".to_string(),
+            "/bin/zsh".to_string(),
+            "zcode".to_string(),
+            "--mode".to_string(),
+            "yolo".to_string(),
+            "--resume".to_string(),
+            sid.to_string(),
+        ];
+        let saved = extract_saved_cli_from_argv(&launched, None, None, None).expect("zcode");
+        assert_eq!(saved.kind, "zcode");
+        assert_eq!(saved.session_id.as_deref(), Some(sid));
+        let plan = build_recovery_argv(&saved, "/", &["/bin/sh".into()], &hooks_dir, "/usr/bin/h2").expect("plan");
+        assert!(plan.resumed_existing);
+        assert_eq!(plan.cli_argv, ["zcode", "--mode", "yolo", "--resume", sid]);
+        assert_eq!(plan.argv.first().map(String::as_str), Some("/bin/zsh"));
+        // No session known (the pane closed before its first prompt): a new one, same flags.
+        let fresh = crate::terminals::SavedCliResume { session_id: None, ..saved };
+        let plan = build_recovery_argv(&fresh, "/", &["/bin/sh".into()], &hooks_dir, "/usr/bin/h2").expect("plan");
+        assert!(!plan.resumed_existing);
+        assert_eq!(plan.cli_argv, ["zcode", "--mode", "yolo"]);
+
+        // Rolling back: to a turn, the same session; to 0, a new one.
+        let back = build_rollback_argv(PtyCliKind::Zcode, &launched, &hooks_dir, "/usr/bin/h2", 1, Some(sid));
+        assert!(back.windows(2).any(|w| w == ["--resume", sid]), "{back:?}");
+        assert_eq!(back.len(), launched.len(), "{back:?}");
+        let start_over = build_rollback_argv(PtyCliKind::Zcode, &launched, &hooks_dir, "/usr/bin/h2", 0, None);
+        assert!(!start_over.iter().any(|a| a == "--resume" || a == sid), "{start_over:?}");
+
+        // Typed by hand in a shell: all the foreground process shows is its title.
+        let by_hand = build_rollback_argv_for_terminal(
+            PtyCliKind::Zcode,
+            &["/bin/zsh".to_string()],
+            Some(&["zcode-cli".to_string()]),
+            &hooks_dir,
+            "/usr/bin/h2",
+            2,
+            Some(sid),
+        );
+        assert_eq!(by_hand[0], "/bin/zsh");
+        assert!(by_hand.windows(3).any(|w| w == ["zcode", "--resume", sid]), "{by_hand:?}");
     }
 }

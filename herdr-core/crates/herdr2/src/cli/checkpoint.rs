@@ -66,7 +66,7 @@ pub enum CheckpointSub {
         #[arg(long)]
         lang: Option<String>,
     },
-    /// Internal CLI hook bridge (`claude`, `codex-notify`, `agy`).
+    /// Internal CLI hook bridge (`claude`, `codex-notify`, `agy`, `zcode`).
     #[command(hide = true)]
     Hook {
         #[arg(long)]
@@ -130,7 +130,8 @@ fn is_under_dir(path_norm: &str, dir_norm: &str) -> bool {
 
 fn resolve_lexical(raw: &str, base_norm: &str) -> String {
     let s = raw.trim().replace('\\', "/");
-    let is_win_abs = s.len() >= 3 && s.as_bytes()[0].is_ascii_alphabetic() && s.as_bytes()[1] == b':' && s.as_bytes()[2] == b'/';
+    let is_win_abs =
+        s.len() >= 3 && s.as_bytes()[0].is_ascii_alphabetic() && s.as_bytes()[1] == b':' && s.as_bytes()[2] == b'/';
     let full = if s.starts_with('/') || is_win_abs {
         s
     } else if base_norm.is_empty() {
@@ -138,7 +139,11 @@ fn resolve_lexical(raw: &str, base_norm: &str) -> String {
     } else {
         format!("{base_norm}/{s}")
     };
-    let (prefix, rest) = if full.len() >= 3 && full.as_bytes()[0].is_ascii_alphabetic() && full.as_bytes()[1] == b':' && full.as_bytes()[2] == b'/' {
+    let (prefix, rest) = if full.len() >= 3
+        && full.as_bytes()[0].is_ascii_alphabetic()
+        && full.as_bytes()[1] == b':'
+        && full.as_bytes()[2] == b'/'
+    {
         (&full[..3], &full[3..])
     } else if let Some(stripped) = full.strip_prefix('/') {
         ("/", stripped)
@@ -361,8 +366,18 @@ pub fn execute(paths: &Paths, cli: CheckpointCli) -> Result<Out, RpcError> {
                 }),
             )
             .unwrap_or_else(|_| json!({}));
-            let serialized = resp.to_string();
-            Ok(Out { json: resp, human: serialized })
+            // `agy` reads the steps itself. ZCode reads Claude Code's hook output, so the one
+            // step Herdr2 has for it is answered in that shape.
+            let printed = if source == "zcode" {
+                resp.pointer("/injectSteps/0/hookSpecificOutput")
+                    .cloned()
+                    .map(|out| json!({ "hookSpecificOutput": out }))
+                    .unwrap_or_else(|| json!({}))
+            } else {
+                resp
+            };
+            let serialized = printed.to_string();
+            Ok(Out { json: printed, human: serialized })
         }
     }
 }
@@ -444,10 +459,7 @@ mod tests {
             ("Edit", "file_path", "../../../../../../../temp/test/calc.py"),
         ] {
             let payload = json!({ "tool_name": tool, "tool_input": { key: path } });
-            assert!(
-                check_worktree_guard(&payload, origin, wt).is_some(),
-                "expected block for {tool} {key}={path}"
-            );
+            assert!(check_worktree_guard(&payload, origin, wt).is_some(), "expected block for {tool} {key}={path}");
         }
 
         // Bash referencing parent workspace -> BLOCKED
@@ -471,10 +483,7 @@ mod tests {
             ("Bash", json!({ "command": "ls /home/user/temp/test-other" })),
         ] {
             let payload = json!({ "tool_name": tool, "tool_input": input });
-            assert!(
-                check_worktree_guard(&payload, origin, wt).is_none(),
-                "expected allow for {tool} {input}"
-            );
+            assert!(check_worktree_guard(&payload, origin, wt).is_none(), "expected allow for {tool} {input}");
         }
 
         // Nested worktree inside origin: worktree allowed, parent outside worktree blocked

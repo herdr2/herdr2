@@ -38,6 +38,7 @@ mod sprites;
 mod telemetry;
 mod feedback;
 mod terminal;
+mod ui_update;
 mod update;
 mod update_notes;
 #[allow(dead_code)]
@@ -129,6 +130,10 @@ fn main() {
         .init();
 
     update::leave_install_folder();
+    update::cleanup_old();
+    if update::apply_on_startup() {
+        return;
+    }
 
     telemetry::clock();
     // A first start sizes the app to the screen and the system's text size.
@@ -201,6 +206,9 @@ fn main() {
                     }
                 }
                 mods::finish_shared();
+                if let Err(e) = update::apply() {
+                    tracing::warn!("update: apply on quit failed: {e}");
+                }
                 telemetry::quit();
                 async {}
             })
@@ -219,7 +227,11 @@ fn main() {
                 control::listen(tx);
             }
             match core {
-                Ok(core) => open_main(core, requests, cx),
+                Ok(core) => {
+                    update::start();
+                    update::after_update(core.clone());
+                    open_main(core, requests, cx);
+                }
                 Err(need) => setup::open(need, requests, cx),
             }
         });

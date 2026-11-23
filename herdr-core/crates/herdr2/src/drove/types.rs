@@ -12,6 +12,77 @@ pub fn now_iso() -> String {
     format_ms_iso(dur.as_millis() as u64)
 }
 
+/// Current local wall-clock time formatted for AI routing context
+/// (`YYYY-MM-DDTHH:MM:SS+HH:MM (Weekday)`), so time-window notes such as
+/// "2:00 PM - 6:00 PM" can be evaluated accurately in the user's local timezone.
+pub fn now_local_time_context() -> String {
+    const WDAYS: [&str; 7] = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+    #[cfg(unix)]
+    {
+        let secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as libc::time_t;
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if unsafe { !libc::localtime_r(&secs, &mut tm).is_null() } {
+            let year = tm.tm_year + 1900;
+            let mon = tm.tm_mon + 1;
+            let day = tm.tm_mday;
+            let hour = tm.tm_hour;
+            let min = tm.tm_min;
+            let sec = tm.tm_sec;
+            let wday = WDAYS.get(tm.tm_wday as usize).copied().unwrap_or("?");
+            let off_secs = tm.tm_gmtoff as i64;
+            let sign = if off_secs < 0 { '-' } else { '+' };
+            let abs_min = off_secs.unsigned_abs() / 60;
+            let oh = abs_min / 60;
+            let om = abs_min % 60;
+            return format!("{year:04}-{mon:02}-{day:02}T{hour:02}:{min:02}:{sec:02}{sign}{oh:02}:{om:02} ({wday})");
+        }
+    }
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        #[derive(Default)]
+        struct SystemTimeWin {
+            year: u16,
+            month: u16,
+            day_of_week: u16,
+            day: u16,
+            hour: u16,
+            minute: u16,
+            second: u16,
+            milliseconds: u16,
+        }
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetLocalTime(lp: *mut SystemTimeWin);
+        }
+        let mut st = SystemTimeWin::default();
+        unsafe { GetLocalTime(&mut st) };
+        let wday = WDAYS.get(st.day_of_week as usize).copied().unwrap_or("?");
+        let local_as_utc_iso = format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.000Z",
+            st.year, st.month, st.day, st.hour, st.minute, st.second
+        );
+        let utc_secs = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+        if let Some(local_ms) = parse_iso_ms(&local_as_utc_iso) {
+            let diff_min = ((local_ms as i64 / 1000) - utc_secs + 30).div_euclid(60);
+            let sign = if diff_min < 0 { '-' } else { '+' };
+            let abs_min = diff_min.unsigned_abs();
+            let oh = abs_min / 60;
+            let om = abs_min % 60;
+            return format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{sign}{oh:02}:{om:02} ({wday})",
+                st.year, st.month, st.day, st.hour, st.minute, st.second
+            );
+        }
+        return format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02} ({wday})",
+            st.year, st.month, st.day, st.hour, st.minute, st.second
+        );
+    }
+    #[cfg(not(windows))]
+    now_iso()
+}
+
 /// Formats epoch milliseconds into ISO-8601 UTC string.
 pub fn format_ms_iso(ms: u64) -> String {
     let secs = (ms / 1000) as i64;
@@ -40,21 +111,22 @@ pub fn format_ms_iso(ms: u64) -> String {
 pub fn parse_iso_ms(iso: &str) -> Option<u64> {
     let trimmed = iso.trim();
     let (date, time_and_tz) = trimmed.split_once('T').or_else(|| trimmed.split_once('t'))?;
-    let (time, tz_offset_secs) = if let Some(t) = time_and_tz.strip_suffix('Z').or_else(|| time_and_tz.strip_suffix('z')) {
-        (t, 0_i64)
-    } else if let Some(pos) = time_and_tz.rfind(['+', '-']) {
-        let (t, off_str) = time_and_tz.split_at(pos);
-        let sign = if off_str.starts_with('-') { -1_i64 } else { 1_i64 };
-        let digits: String = off_str[1..].chars().filter(|c| c.is_ascii_digit()).collect();
-        let (hh, mm) = match digits.len() {
-            2 => (digits.parse::<i64>().ok()?, 0_i64),
-            4 => (digits[..2].parse::<i64>().ok()?, digits[2..4].parse::<i64>().ok()?),
-            _ => return None,
+    let (time, tz_offset_secs) =
+        if let Some(t) = time_and_tz.strip_suffix('Z').or_else(|| time_and_tz.strip_suffix('z')) {
+            (t, 0_i64)
+        } else if let Some(pos) = time_and_tz.rfind(['+', '-']) {
+            let (t, off_str) = time_and_tz.split_at(pos);
+            let sign = if off_str.starts_with('-') { -1_i64 } else { 1_i64 };
+            let digits: String = off_str[1..].chars().filter(|c| c.is_ascii_digit()).collect();
+            let (hh, mm) = match digits.len() {
+                2 => (digits.parse::<i64>().ok()?, 0_i64),
+                4 => (digits[..2].parse::<i64>().ok()?, digits[2..4].parse::<i64>().ok()?),
+                _ => return None,
+            };
+            (t, sign * (hh * 3600 + mm * 60))
+        } else {
+            return None;
         };
-        (t, sign * (hh * 3600 + mm * 60))
-    } else {
-        return None;
-    };
     let mut dp = date.split('-');
     let year: i64 = dp.next()?.parse().ok()?;
     let month: u64 = dp.next()?.parse().ok()?;
@@ -1056,6 +1128,9 @@ pub struct RoleTarget {
     /// Work types / task specialties this agent+model excels at (used by router & coordinator).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub strengths: Vec<String>,
+    /// Optional usage/routing note for this agent+model candidate (read by AI when selecting/launching sub-agents).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1165,6 +1240,10 @@ pub struct DroveConfig {
     pub updated_at: String,
     #[serde(default = "default_concurrency")]
     pub max_concurrency_default: u32,
+    /// Optional global routing/scheduling note for Role -> Agent + Model selection
+    /// (read by AI routers and coordinators when choosing or launching sub-agents).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     #[serde(default)]
     pub roles: BTreeMap<String, RoleConfig>,
     #[serde(default)]
@@ -1311,6 +1390,9 @@ pub struct DroveSettingsSetParams {
     pub config: Option<DroveConfig>,
     #[serde(default)]
     pub max_concurrency_default: Option<u32>,
+    /// Optional global routing/scheduling note update (empty string clears the note).
+    #[serde(default)]
+    pub note: Option<String>,
     #[serde(default)]
     pub roles: Option<BTreeMap<String, RoleConfig>>,
     #[serde(default)]
@@ -1352,10 +1434,20 @@ pub struct DroveWebOpenResult {
 pub struct DroveRolesAiConfigureParams {
     #[serde(default)]
     pub on: Option<String>,
-    /// Configuration scope: `"models"` (agents/models/effort only), `"strengths"` (candidate task strengths only), or `"all"` (default).
+    /// Configuration scope: `"models"` (agents/models/effort only), `"strengths"` (candidate task strengths only),
+    /// `"notes"` (global and/or per-candidate routing notes only), or `"all"` (default: models + strengths + notes).
     #[serde(default)]
     pub mode: Option<String>,
-    /// Optional natural-language preference hint (e.g. preferred agents/models or cost/speed priority).
+    /// Optional target scope when `mode == "notes"`: `"global"`, `"candidate"`, or `"all"` (default).
+    #[serde(default)]
+    pub note_scope: Option<String>,
+    /// Optional role ID when `noteScope == "candidate"`.
+    #[serde(default)]
+    pub target_role: Option<String>,
+    /// Optional 0-based candidate index inside `targetRole` when `noteScope == "candidate"`.
+    #[serde(default)]
+    pub target_candidate_index: Option<usize>,
+    /// Optional natural-language preference hint (e.g. preferred agents/models, cost/speed priority, or draft note to refine).
     #[serde(default)]
     pub instruction: Option<String>,
     /// Optional unsaved AI Assistant endpoint override.
@@ -1367,10 +1459,10 @@ pub struct DroveRolesAiConfigureParams {
     /// Optional unsaved AI Assistant model override.
     #[serde(default)]
     pub model: Option<String>,
-    /// Persist generated roles immediately (defaults to true).
+    /// Persist generated roles/note immediately (defaults to true).
     #[serde(default)]
     pub apply: Option<bool>,
-    /// Preferred output language ("zh-CN" | "en") for strengths tags and rationale.
+    /// Preferred output language ("zh-CN" | "en") for strengths tags, notes, and rationale.
     #[serde(default)]
     pub language: Option<String>,
 }
@@ -1387,6 +1479,9 @@ pub struct DroveRolesAiConfigureResult {
     pub latency_ms: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rationale: Option<String>,
+    /// Generated routing note (global note for `all`/`notes`/`global`, or single candidate note for `candidate`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roles: Option<BTreeMap<String, RoleConfig>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

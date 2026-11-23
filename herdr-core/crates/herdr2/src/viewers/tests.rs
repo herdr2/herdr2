@@ -127,14 +127,20 @@ fn viewer_input_clears_manual_status_only_on_real_interaction() {
         id
     };
     let conn = Arc::new(Conn::default());
-    let channel = core.attach(&conn, id, AttachRequest {
-        observe: false,
-        resize_notifications: false,
-        history: 0,
-        size: (80, 24),
-        display: Display::default(),
-        resumed: false,
-    }).unwrap();
+    let channel = core
+        .attach(
+            &conn,
+            id,
+            AttachRequest {
+                observe: false,
+                resize_notifications: false,
+                history: 0,
+                size: (80, 24),
+                display: Display::default(),
+                resumed: false,
+            },
+        )
+        .unwrap();
 
     // Passive focus & wheel events must not clear manual status.
     core.viewer_input(&conn, channel, b"\x1b[I\x1b[<64;10;10M", false);

@@ -44,6 +44,8 @@ pub struct Config {
     pub default_permissions: Option<PermissionMode>,
     /// Auto-inject the built-in `herdr2` MCP server into ACP sessions (default true).
     pub inject_mcp: Option<bool>,
+    /// Base URL for `h2 update` release manifests (`<url>/core/latest.json`). `HERDR2_RELEASES_URL` wins.
+    pub releases_url: Option<String>,
     /// Custom ACP agent preset commands overriding or extending built-in presets.
     #[serde(default)]
     pub agents: BTreeMap<String, Vec<String>>,

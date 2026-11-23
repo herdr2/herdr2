@@ -18,9 +18,20 @@ if [ "$(uname -s)" = Darwin ]; then
   [ -e "$bin/h2" ] || [ -L "$bin/h2" ] || ln -s herdr2 "$bin/h2"
   sh scripts/restart-core.sh "$bin/herdr2"
 else
-  # Install core as `herdr2-core` + `h2` so `~/.local/bin/herdr2` stays reserved for the desktop app.
-  install -m 755 target/release/herdr2 "$bin/herdr2-core.new"
-  mv -f "$bin/herdr2-core.new" "$bin/herdr2-core"
-  ln -sfn herdr2-core "$bin/h2"
-  sh scripts/restart-core.sh "$bin/herdr2-core"
+  # Respect existing layout: if ~/.local/bin/herdr2 is already a core binary (not the GUI app),
+  # replace it in-place and point both `h2` and `herdr2-core` to it so running `herdr2 serve` daemons
+  # are never left orphaned on an older copy.
+  target="$bin/herdr2-core"
+  if [ -f "$bin/herdr2" ] && [ ! -L "$bin/herdr2" ] && "$bin/herdr2" --version 2>/dev/null | grep -q '^h2 '; then
+    target="$bin/herdr2"
+    install -m 755 target/release/herdr2 "$target.new"
+    mv -f "$target.new" "$target"
+    ln -sfn herdr2 "$bin/h2"
+    ln -sfn herdr2 "$bin/herdr2-core"
+  else
+    install -m 755 target/release/herdr2 "$target.new"
+    mv -f "$target.new" "$target"
+    ln -sfn herdr2-core "$bin/h2"
+  fi
+  sh scripts/restart-core.sh "$target"
 fi

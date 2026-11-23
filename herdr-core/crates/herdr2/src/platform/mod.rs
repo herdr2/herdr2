@@ -189,8 +189,7 @@ pub fn update_source(path: &std::path::Path) -> std::path::PathBuf {
 }
 
 pub fn bundle_update_hint() -> Option<&'static str> {
-    cfg!(target_os = "macos")
-        .then_some("use h2 update, or --from 'Herdr2.app' (its Contents/MacOS/herdr2 also works)")
+    cfg!(target_os = "macos").then_some("use h2 update, or --from 'Herdr2.app' (its Contents/MacOS/herdr2 also works)")
 }
 
 #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
@@ -324,13 +323,7 @@ pub(crate) fn restored_environment(
         if named(key, "XPC_FLAGS") {
             return true;
         }
-        [
-            crate::sweep::VAR,
-            crate::sweep::RUNTIME,
-            "H2_LAUNCHD_DIRECT",
-            "H2_LAUNCHD_DETACH",
-            "_H2_RESPONSIBLE_PID",
-        ]
+        [crate::sweep::VAR, crate::sweep::RUNTIME, "H2_LAUNCHD_DIRECT", "H2_LAUNCHD_DETACH", "_H2_RESPONSIBLE_PID"]
             .iter()
             .any(|name| named(key, name))
     };
@@ -361,14 +354,7 @@ pub(crate) fn strip_agy_wrapper_env(
     if agy_proxy.is_empty() {
         return;
     }
-    const PROXY_KEYS: &[&str] = &[
-        "HTTP_PROXY",
-        "HTTPS_PROXY",
-        "ALL_PROXY",
-        "http_proxy",
-        "https_proxy",
-        "all_proxy",
-    ];
+    const PROXY_KEYS: &[&str] = &["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"];
     for &key in PROXY_KEYS {
         let in_manager = manager.is_some_and(|m| m.contains_key(key));
         if !in_manager && env.get(key).is_some_and(|v| v.trim() == agy_proxy) {
@@ -394,10 +380,7 @@ pub async fn program_env() -> std::collections::BTreeMap<String, String> {
     #[cfg(target_os = "linux")]
     {
         env.retain(|k, _| !systemd::SERVICE.contains(&k.as_str()));
-        let manager = tokio::task::spawn_blocking(systemd::manager_env)
-            .await
-            .ok()
-            .flatten();
+        let manager = tokio::task::spawn_blocking(systemd::manager_env).await.ok().flatten();
         if let Some(ref mgr) = manager {
             systemd::apply_session(&mut env, mgr);
         }
@@ -438,10 +421,8 @@ pub(crate) fn augment_user_path_env(env: &mut std::collections::BTreeMap<String,
     else {
         return;
     };
-    let mut dirs: Vec<std::path::PathBuf> = env
-        .get("PATH")
-        .map(|v| std::env::split_paths(v).collect())
-        .unwrap_or_default();
+    let mut dirs: Vec<std::path::PathBuf> =
+        env.get("PATH").map(|v| std::env::split_paths(v).collect()).unwrap_or_default();
 
     let mut extras: Vec<std::path::PathBuf> = Vec::new();
     if let Some(nvm_bin) = resolve_nvm_node_bin(&home) {
@@ -489,11 +470,7 @@ fn resolve_nvm_node_bin(home: &std::path::Path) -> Option<std::path::PathBuf> {
         .filter_map(|e| e.ok())
         .filter_map(|e| {
             let bin = e.path().join("bin");
-            if bin.is_dir() {
-                Some((e.file_name().to_string_lossy().to_string(), bin))
-            } else {
-                None
-            }
+            if bin.is_dir() { Some((e.file_name().to_string_lossy().to_string(), bin)) } else { None }
         })
         .collect();
     if vers.is_empty() {
@@ -523,8 +500,7 @@ fn resolve_nvm_node_bin(home: &std::path::Path) -> Option<std::path::PathBuf> {
             target.clone()
         };
         if let Some((_, bin)) = vers.iter().rev().find(|(name, _)| {
-            name == &normalized
-                || name.strip_prefix(&normalized).is_some_and(|rest| rest.starts_with('.'))
+            name == &normalized || name.strip_prefix(&normalized).is_some_and(|rest| rest.starts_with('.'))
         }) {
             return Some(bin.clone());
         }

@@ -64,7 +64,8 @@ fn trailing_flags(paths: &Paths, argv: &[String]) -> Result<Option<(RunParams, b
     if flags.is_empty() {
         return Ok(None);
     }
-    let args = ["h2".to_string(), "run".into()].into_iter().chain(flags).chain(["--".into(), argv[0].clone()]).chain(task);
+    let args =
+        ["h2".to_string(), "run".into()].into_iter().chain(flags).chain(["--".into(), argv[0].clone()]).chain(task);
     match Cli::try_parse_from(args) {
         Ok(Cli { cmd: Some(Cmd::Run(q)), json, .. }) => Ok(Some((q, json))),
         Ok(_) => Ok(None),

@@ -22,18 +22,34 @@ pub struct Target {
     pub sha256: String,
 }
 
-fn base() -> Result<String, RpcError> {
-    std::env::var("HERDR2_RELEASES_URL")
-        .ok()
-        .map(|u| u.trim().trim_end_matches('/').to_owned())
-        .filter(|u| !u.is_empty())
+fn normalize_url(raw: Option<String>) -> Option<String> {
+    raw.map(|u| u.trim().trim_end_matches('/').to_owned()).filter(|u| !u.is_empty())
+}
+
+fn resolve_base(
+    env_url: Option<String>,
+    cfg_url: Option<String>,
+    default_url: Option<&str>,
+) -> Result<String, RpcError> {
+    normalize_url(env_url)
+        .or_else(|| normalize_url(cfg_url))
+        .or_else(|| normalize_url(default_url.map(str::to_owned)))
         .ok_or_else(|| {
             RpcError::new(
                 "unavailable",
-                "automatic core updates require HERDR2_RELEASES_URL",
-                "build and install h2 from source, or run h2 update --from <path>",
+                "automatic core updates require HERDR2_RELEASES_URL or releases_url in config.toml",
+                "set HERDR2_RELEASES_URL, add releases_url to ~/.config/herdr2/config.toml, or run h2 update --from <path>",
             )
         })
+}
+
+fn base() -> Result<String, RpcError> {
+    let env_url = std::env::var("HERDR2_RELEASES_URL").ok();
+    let cfg_url = crate::paths::Paths::from_env()
+        .ok()
+        .and_then(|paths| crate::config::load(&paths.config).ok())
+        .and_then(|cfg| cfg.releases_url);
+    resolve_base(env_url, cfg_url, option_env!("HERDR2_DEFAULT_RELEASES_URL"))
 }
 
 fn unavailable(why: String) -> RpcError {
@@ -100,11 +116,7 @@ pub fn download(m: &Manifest, target: &str, scratch: &Path, bundle: bool) -> Res
     let bundled = scratch.join("Herdr2.app/Contents/MacOS/herdr2");
     let bin = if bundle && target.starts_with("macos-") && bundled.is_file() { bundled } else { scratch.join(exe) };
     if !ok || !bin.is_file() {
-        return Err(RpcError::new(
-            "refused",
-            format!("h2 {}'s download for {target} holds no herdr2", m.version),
-            "",
-        ));
+        return Err(RpcError::new("refused", format!("h2 {}'s download for {target} holds no herdr2", m.version), ""));
     }
     crate::platform::verify_release_bundle(&bin)
         .map_err(|e| RpcError::new("refused", format!("invalid release signature: {e}"), ""))?;
@@ -151,4 +163,28 @@ impl Drop for Scratch {
 /// This machine as release targets name it: `linux-x86_64`, `macos-aarch64`.
 pub fn this_target() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn releases_url_prefers_env_then_config_then_default() {
+        assert_eq!(
+            resolve_base(
+                Some(" https://env.example/ ".into()),
+                Some("https://cfg.example".into()),
+                Some("https://def.example")
+            )
+            .unwrap(),
+            "https://env.example"
+        );
+        assert_eq!(
+            resolve_base(Some("  ".into()), Some("https://cfg.example/".into()), Some("https://def.example")).unwrap(),
+            "https://cfg.example"
+        );
+        assert_eq!(resolve_base(None, None, Some("https://def.example/")).unwrap(), "https://def.example");
+        assert!(resolve_base(None, None, None).is_err());
+    }
 }

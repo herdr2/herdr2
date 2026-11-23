@@ -9,11 +9,11 @@ use crate::permissions::{self, Decision, PublicPermission, PublicPermissionOptio
 use crate::platform;
 use crate::rpc::RpcError;
 use crate::runtime::{Core, Exit};
-use crate::transcript::{Attachment, Entry};
 use crate::status::StatusReport;
+use crate::transcript::{Attachment, Entry};
 use proto::{
-    AcpConfigChoice, AcpConfigOption, AcpContextUsage, EnvVar, InitializeParams, InitializeResult,
-    ParsedUpdate, PromptCapabilities, SessionCancelParams, SessionLoadParams, SessionNewParams, SessionNewResult,
+    AcpConfigChoice, AcpConfigOption, AcpContextUsage, EnvVar, InitializeParams, InitializeResult, ParsedUpdate,
+    PromptCapabilities, SessionCancelParams, SessionLoadParams, SessionNewParams, SessionNewResult,
     SessionPromptParams, SessionPromptResult, SessionSetConfigOptionParams, SessionSetModeParams,
     SessionSetModelParams, StdioMcpServer, parse_request_permission, parse_session_config, parse_session_update,
     permission_cancelled, permission_selected,
@@ -186,15 +186,18 @@ pub fn bypass_mode_for_options(options: &[AcpConfigOption]) -> Option<(String, O
 }
 
 /// Resolves a requested config option id against the session's advertised `config_options`.
-/// Maps reasoning aliases (`reasoning_effort` / `thought_level` / `effort` / `thinking` / `reasoning`) cleanly across adapters.
+/// Maps reasoning aliases (`reasoning_effort` / `thought_level` / `thought` / `effort` / `thinking` / `reasoning`) cleanly across adapters.
 pub fn resolve_config_option_id(requested_id: &str, options: &[AcpConfigOption]) -> String {
     if options.iter().any(|o| o.id == requested_id) {
         return requested_id.to_string();
     }
-    if matches!(requested_id, "reasoning_effort" | "thought_level" | "effort" | "thinking" | "reasoning")
+    if matches!(requested_id, "reasoning_effort" | "thought_level" | "thought" | "effort" | "thinking" | "reasoning")
         && let Some(found) = options.iter().find(|o| {
             o.category.as_deref() == Some("thought_level")
-                || matches!(o.id.as_str(), "reasoning_effort" | "thought_level" | "effort" | "thinking" | "reasoning")
+                || matches!(
+                    o.id.as_str(),
+                    "reasoning_effort" | "thought_level" | "thought" | "effort" | "thinking" | "reasoning"
+                )
         })
     {
         return found.id.clone();
@@ -235,10 +238,7 @@ pub(crate) fn resolve_config_override(
             return Some((opt.id.clone(), Value::String(raw.to_string()), Some(opt.source.clone())));
         }
         let chosen = if raw.eq_ignore_ascii_case("max") {
-            opt.options
-                .iter()
-                .max_by_key(|c| parse_context_tokens(&c.value).unwrap_or(0))
-                .map(|c| c.value.clone())?
+            opt.options.iter().max_by_key(|c| parse_context_tokens(&c.value).unwrap_or(0)).map(|c| c.value.clone())?
         } else if let Some(exact) = opt.options.iter().find(|c| c.value.eq_ignore_ascii_case(raw)) {
             exact.value.clone()
         } else if let Some(target_tokens) = parse_context_tokens(raw) {
@@ -258,17 +258,18 @@ pub(crate) fn resolve_config_override(
         return Some((opt.id.clone(), Value::String(chosen), Some(opt.source.clone())));
     }
 
-    let is_effort_req = matches!(cfg_id, "reasoning_effort" | "thought_level" | "effort" | "thinking" | "reasoning");
+    let is_effort_req =
+        matches!(cfg_id, "reasoning_effort" | "thought_level" | "thought" | "effort" | "thinking" | "reasoning");
     let opt = if is_effort_req {
-        config_options
-            .iter()
-            .find(|o| o.id == cfg_id)
-            .or_else(|| {
-                config_options.iter().find(|o| {
-                    o.category.as_deref() == Some("thought_level")
-                        || matches!(o.id.as_str(), "reasoning_effort" | "thought_level" | "effort" | "thinking" | "reasoning")
-                })
+        config_options.iter().find(|o| o.id == cfg_id).or_else(|| {
+            config_options.iter().find(|o| {
+                o.category.as_deref() == Some("thought_level")
+                    || matches!(
+                        o.id.as_str(),
+                        "reasoning_effort" | "thought_level" | "thought" | "effort" | "thinking" | "reasoning"
+                    )
             })
+        })
     } else if matches!(cfg_id, "fast-mode" | "fast") {
         config_options
             .iter()
@@ -320,6 +321,9 @@ pub(crate) fn resolve_config_override(
                 if let Some(xh) = opt.options.iter().find(|c| c.value.eq_ignore_ascii_case("xhigh")) {
                     return Some((opt.id.clone(), Value::String(xh.value.clone()), Some(opt.source.clone())));
                 }
+                if let Some(mx) = opt.options.iter().find(|c| c.value.eq_ignore_ascii_case("max")) {
+                    return Some((opt.id.clone(), Value::String(mx.value.clone()), Some(opt.source.clone())));
+                }
                 if let Some(high) = opt.options.iter().find(|c| c.value.eq_ignore_ascii_case("high")) {
                     return Some((opt.id.clone(), Value::String(high.value.clone()), Some(opt.source.clone())));
                 }
@@ -327,6 +331,9 @@ pub(crate) fn resolve_config_override(
             if raw.eq_ignore_ascii_case("xhigh") {
                 if let Some(xh) = opt.options.iter().find(|c| c.value.eq_ignore_ascii_case("extra-high")) {
                     return Some((opt.id.clone(), Value::String(xh.value.clone()), Some(opt.source.clone())));
+                }
+                if let Some(mx) = opt.options.iter().find(|c| c.value.eq_ignore_ascii_case("max")) {
+                    return Some((opt.id.clone(), Value::String(mx.value.clone()), Some(opt.source.clone())));
                 }
                 if let Some(high) = opt.options.iter().find(|c| c.value.eq_ignore_ascii_case("high")) {
                     return Some((opt.id.clone(), Value::String(high.value.clone()), Some(opt.source.clone())));
@@ -336,6 +343,23 @@ pub(crate) fn resolve_config_override(
                 && let Some(medium) = opt.options.iter().find(|c| c.value.eq_ignore_ascii_case("medium"))
             {
                 return Some((opt.id.clone(), Value::String(medium.value.clone()), Some(opt.source.clone())));
+            }
+            let lower = raw.trim().to_ascii_lowercase();
+            if matches!(lower.as_str(), "off" | "none" | "false" | "disabled")
+                && let Some(dis) = opt
+                    .options
+                    .iter()
+                    .find(|c| c.value.eq_ignore_ascii_case("disabled") || c.value.eq_ignore_ascii_case("off"))
+            {
+                return Some((opt.id.clone(), Value::String(dis.value.clone()), Some(opt.source.clone())));
+            }
+            if matches!(lower.as_str(), "on" | "true" | "enabled" | "low" | "medium" | "high" | "max" | "xhigh")
+                && let Some(en) = opt
+                    .options
+                    .iter()
+                    .find(|c| c.value.eq_ignore_ascii_case("enabled") || c.value.eq_ignore_ascii_case("on"))
+            {
+                return Some((opt.id.clone(), Value::String(en.value.clone()), Some(opt.source.clone())));
             }
             return None;
         }
@@ -383,7 +407,7 @@ pub fn model_has_embedded_effort(model: &str) -> bool {
             let Some((k, v)) = entry.split_once('=') else { continue };
             let k = k.trim();
             let v = v.trim();
-            if matches!(k, "effort" | "reasoning_effort" | "reasoning" | "thought_level" | "thinking")
+            if matches!(k, "effort" | "reasoning_effort" | "reasoning" | "thought" | "thought_level" | "thinking")
                 && !v.is_empty()
                 && !matches!(v, "auto" | "default")
             {
@@ -466,7 +490,7 @@ pub fn split_model_variant_for_options(model: &str, options: &[AcpConfigOption])
                     "false" | "0" | "off" | "no" => bracket_fast = Some(false),
                     _ => {}
                 },
-                "effort" | "reasoning_effort" | "reasoning" | "thought_level" | "thinking"
+                "effort" | "reasoning_effort" | "reasoning" | "thought" | "thought_level" | "thinking"
                     if !matches!(v.to_ascii_lowercase().as_str(), "auto" | "default") =>
                 {
                     let lower_v = v.to_ascii_lowercase();
@@ -482,7 +506,8 @@ pub fn split_model_variant_for_options(model: &str, options: &[AcpConfigOption])
         }
     }
 
-    let mut matched_base = if has_brackets { find_model_choice(raw_slug, model_opt) } else { find_model_choice(raw_slug, model_opt) };
+    let mut matched_base =
+        if has_brackets { find_model_choice(raw_slug, model_opt) } else { find_model_choice(raw_slug, model_opt) };
     let mut peeled_fast: Option<bool> = None;
     let mut peeled_effort: Option<String> = None;
 
@@ -499,9 +524,7 @@ pub fn split_model_variant_for_options(model: &str, options: &[AcpConfigOption])
             for (suffix, mapped) in EFFORT_SUFFIXES {
                 if let Some(without_eff) = s.strip_suffix(suffix) {
                     let base = find_model_choice(without_eff, model_opt).or_else(|| {
-                        without_eff
-                            .strip_suffix("-thinking")
-                            .and_then(|stem| find_model_choice(stem, model_opt))
+                        without_eff.strip_suffix("-thinking").and_then(|stem| find_model_choice(stem, model_opt))
                     });
                     if let Some(base) = base {
                         matched_base = Some(base);
@@ -643,7 +666,8 @@ pub async fn apply_config_option(
             }
             Err(e) if with_type.is_some() && e.is_invalid_params() => continue,
             Err(e) if e.is_method_not_found() && config_id == "model" => {
-                let model_id = value.as_str().ok_or_else(|| RpcError::invalid_params("model requires a string value"))?;
+                let model_id =
+                    value.as_str().ok_or_else(|| RpcError::invalid_params("model requires a string value"))?;
                 let legacy = SessionSetModelParams { session_id: session_id.into(), model_id: model_id.into() };
                 transport
                     .request("session/set_model", &legacy, HANDSHAKE_TIMEOUT)
@@ -678,11 +702,7 @@ async fn setup_session(
     let init: InitializeResult = serde_json::from_value(raw_init).unwrap_or_default();
     let agent_info = init.agent_info.as_ref().and_then(|a| a.display_label());
     let can_load_session = init.agent_capabilities.as_ref().is_some_and(|c| c.load_session);
-    let prompt_capabilities = init
-        .agent_capabilities
-        .as_ref()
-        .map(|c| c.prompt_capabilities)
-        .unwrap_or_default();
+    let prompt_capabilities = init.agent_capabilities.as_ref().map(|c| c.prompt_capabilities).unwrap_or_default();
 
     let server = if spec.inject_mcp {
         let mut env = vec![
@@ -694,12 +714,7 @@ async fn setup_session(
         {
             env.push(EnvVar { name: "H2_SESSION".into(), value: sess });
         }
-        Some(StdioMcpServer {
-            name: "herdr2".into(),
-            command: spec.mcp_exe.clone(),
-            args: vec!["mcp".into()],
-            env,
-        })
+        Some(StdioMcpServer { name: "herdr2".into(), command: spec.mcp_exe.clone(), args: vec!["mcp".into()], env })
     } else {
         None
     };
@@ -731,39 +746,40 @@ async fn setup_session(
         merged
     };
 
-    let (session_id, mut config_options, context_usage, resumed_session) = match (spec.resume_session_id.as_deref(), can_load_session) {
-        (Some(prev_id), true) => {
-            match load_session(transport, prev_id, spec, server.as_ref()).await {
-                Ok(mut opts) => {
-                    let mut usage = None;
-                    // Drain historical session/update notifications replayed by session/load
-                    // before returning so run_actor does not append old turns onto the next turn.
-                    while let Ok(msg) = inbound_rx.try_recv() {
-                        if let Inbound::Update(params) = msg
-                            && let Some((_, parsed)) = parse_session_update(&params)
-                        {
-                            match parsed {
-                                ParsedUpdate::ConfigOptions(fresh) => opts = fresh,
-                                ParsedUpdate::Usage(u) => usage = Some(u),
-                                _ => {}
+    let (session_id, mut config_options, context_usage, resumed_session) =
+        match (spec.resume_session_id.as_deref(), can_load_session) {
+            (Some(prev_id), true) => {
+                match load_session(transport, prev_id, spec, server.as_ref()).await {
+                    Ok(mut opts) => {
+                        let mut usage = None;
+                        // Drain historical session/update notifications replayed by session/load
+                        // before returning so run_actor does not append old turns onto the next turn.
+                        while let Ok(msg) = inbound_rx.try_recv() {
+                            if let Inbound::Update(params) = msg
+                                && let Some((_, parsed)) = parse_session_update(&params)
+                            {
+                                match parsed {
+                                    ParsedUpdate::ConfigOptions(fresh) => opts = fresh,
+                                    ParsedUpdate::Usage(u) => usage = Some(u),
+                                    _ => {}
+                                }
                             }
                         }
+                        (prev_id.to_string(), opts, usage, true)
                     }
-                    (prev_id.to_string(), opts, usage, true)
-                }
-                Err(_) => {
-                    let fallback_spec = new_with_fallback(spec);
-                    let (sid, opts) = new_session(transport, &fallback_spec, server.as_ref()).await?;
-                    (sid, opts, None, false)
+                    Err(_) => {
+                        let fallback_spec = new_with_fallback(spec);
+                        let (sid, opts) = new_session(transport, &fallback_spec, server.as_ref()).await?;
+                        (sid, opts, None, false)
+                    }
                 }
             }
-        }
-        _ => {
-            let fallback_spec = new_with_fallback(spec);
-            let (sid, opts) = new_session(transport, &fallback_spec, server.as_ref()).await?;
-            (sid, opts, None, false)
-        }
-    };
+            _ => {
+                let fallback_spec = new_with_fallback(spec);
+                let (sid, opts) = new_session(transport, &fallback_spec, server.as_ref()).await?;
+                (sid, opts, None, false)
+            }
+        };
 
     if let Some(mode_id) = &spec.mode
         && !spec.config_overrides.contains_key("mode")
@@ -805,10 +821,7 @@ async fn setup_session(
             patch_config_value(&mut config_options, "model", &val);
         }
         let has_explicit_effort = spec.config_overrides.keys().any(|k| {
-            matches!(
-                k.as_str(),
-                "reasoning_effort" | "thought_level" | "effort" | "thinking" | "reasoning"
-            )
+            matches!(k.as_str(), "reasoning_effort" | "thought_level" | "thought" | "effort" | "thinking" | "reasoning")
         });
         let mut derived: Vec<(&str, Value)> = Vec::new();
         if !has_explicit_effort && let Some(eff) = split.effort {
@@ -826,7 +839,8 @@ async fn setup_session(
             derived.push(("context", json!(ctx)));
         }
         for (cfg_id, val) in derived {
-            let Some((effective_id, effective_val, src)) = resolve_config_override(&config_options, cfg_id, &val) else {
+            let Some((effective_id, effective_val, src)) = resolve_config_override(&config_options, cfg_id, &val)
+            else {
                 continue;
             };
             if let Ok(maybe_fresh) =
@@ -845,7 +859,9 @@ async fn setup_session(
         let Some((effective_id, effective_val, src)) = resolve_config_override(&config_options, cfg_id, val) else {
             continue;
         };
-        if let Ok(maybe_fresh) = apply_config_option(transport, &session_id, &effective_id, &effective_val, src.as_deref()).await {
+        if let Ok(maybe_fresh) =
+            apply_config_option(transport, &session_id, &effective_id, &effective_val, src.as_deref()).await
+        {
             if let Some(fresh) = maybe_fresh {
                 config_options = fresh;
             } else {
@@ -854,14 +870,20 @@ async fn setup_session(
         }
     }
 
-    Ok(SetupOk { session_id, agent_info, can_load_session, resumed_session, prompt_capabilities, config_options, context_usage })
+    Ok(SetupOk {
+        session_id,
+        agent_info,
+        can_load_session,
+        resumed_session,
+        prompt_capabilities,
+        config_options,
+        context_usage,
+    })
 }
 
 fn build_session_meta(spec: &SpawnSpec, include_system_prompt: bool) -> Option<Value> {
     let mut obj = serde_json::Map::new();
-    if include_system_prompt
-        && let Some(s) = spec.system_prompt.as_deref().filter(|s| !s.is_empty())
-    {
+    if include_system_prompt && let Some(s) = spec.system_prompt.as_deref().filter(|s| !s.is_empty()) {
         obj.insert("systemPrompt".into(), json!({ "append": s }));
     }
     if presets::is_claude_agent(None, &spec.argv) && !spec.env.contains_key("ENABLE_TOOL_SEARCH") {
@@ -918,12 +940,8 @@ async fn load_session(
     let meta = build_session_meta(spec, false);
     for tagged in [true, false] {
         let mcp_servers = mcp.map(|m| m.to_value(tagged)).into_iter().collect();
-        let params = SessionLoadParams {
-            session_id: session_id.into(),
-            cwd: spec.cwd.clone(),
-            mcp_servers,
-            meta: meta.clone(),
-        };
+        let params =
+            SessionLoadParams { session_id: session_id.into(), cwd: spec.cwd.clone(), mcp_servers, meta: meta.clone() };
         match transport.request("session/load", &params, HANDSHAKE_TIMEOUT).await {
             Ok(val) => return Ok(parse_session_config(&val)),
             Err(e) if tagged && e.is_invalid_params() && mcp.is_some() => continue,
@@ -1119,13 +1137,7 @@ fn session_is_current(core: &Core, id: u32, token: u64) -> bool {
     core.lock().sessions.get(&id).is_some_and(|h| h.token == token)
 }
 
-async fn prepare_acp_prompt(
-    core: &Arc<Core>,
-    id: u32,
-    turn_num: u64,
-    raw_prompt: &str,
-    clean_prompt: &str,
-) -> String {
+async fn prepare_acp_prompt(core: &Arc<Core>, id: u32, turn_num: u64, raw_prompt: &str, clean_prompt: &str) -> String {
     let (needs_baseline, handoff) = {
         let mut st = core.lock();
         let Some(addr) = st.reg.agents.get(&id).map(|a| a.address.clone()) else {
@@ -1182,7 +1194,7 @@ pub async fn rollback_acp_agent(
     restore_files: bool,
     confirm: bool,
 ) -> Result<crate::checkpoint::CheckpointRollbackResult, RpcError> {
-        let (
+    let (
         addr,
         cwd,
         argv,
@@ -1201,7 +1213,11 @@ pub async fn rollback_acp_agent(
     ) = {
         let mut st = core.lock();
         let Some(a) = st.reg.agents.get(&id).cloned() else {
-            return Err(RpcError::new("not_found", format!("agent id {id} not found"), "run `h2 list` to inspect active agents"));
+            return Err(RpcError::new(
+                "not_found",
+                format!("agent id {id} not found"),
+                "run `h2 list` to inspect active agents",
+            ));
         };
         if !a.is_live() {
             return Err(RpcError::new(
@@ -1250,7 +1266,9 @@ pub async fn rollback_acp_agent(
     let repo = crate::checkpoint::probe_repo(std::path::Path::new(&cwd));
     if restore_files {
         let Some(ref r) = repo else {
-            return Err(RpcError::invalid_params(format!("workspace `{cwd}` is not a Git repository; pass --no-files")));
+            return Err(RpcError::invalid_params(format!(
+                "workspace `{cwd}` is not a Git repository; pass --no-files"
+            )));
         };
         if target_ref.is_none() {
             return Err(RpcError::invalid_params(format!("no checkpoint found for {} at turn {to_turn}", addr)));
@@ -1330,9 +1348,7 @@ pub async fn rollback_acp_agent(
         let addr_clone = addr.clone();
         let slug_clone = slug.clone();
         tokio::task::spawn_blocking(move || -> Result<(), String> {
-            if restore_files
-                && let Some(ref ref_name) = ref_to_restore
-            {
+            if restore_files && let Some(ref ref_name) = ref_to_restore {
                 crate::checkpoint::restore_checkpoint(&r_clone, ref_name, Some(&cwd_path))?;
             }
             let _ = crate::checkpoint::delete_checkpoint_refs_after(&r_clone, &slug_clone, &addr_clone, to_turn);
@@ -1416,12 +1432,7 @@ pub async fn rollback_acp_agent(
         if let Some(entry) = rewind_entry {
             core.emit(&mut st, "transcript", id, json!({ "entry": entry }));
         }
-        core.emit(
-            &mut st,
-            "checkpoint",
-            id,
-            json!({ "rewound_to": to_turn, "restored_files": restore_files }),
-        );
+        core.emit(&mut st, "checkpoint", id, json!({ "rewound_to": to_turn, "restored_files": restore_files }));
         core.save(&st);
         core.changed.notify_waiters();
         (old_handle, restored_prompt)
@@ -1603,14 +1614,7 @@ fn handle_update(core: &Core, id: u32, turn_num: u64, params: &Value) {
     record_entry(core, id, entry);
 }
 
-fn handle_permission(
-    core: &Core,
-    transport: &Transport,
-    id: u32,
-    turn_num: u64,
-    rpc_id: Value,
-    params: &Value,
-) {
+fn handle_permission(core: &Core, transport: &Transport, id: u32, turn_num: u64, rpc_id: Value, params: &Value) {
     let Some(parsed) = parse_request_permission(params) else {
         transport.reply_error(rpc_id, -32602, "invalid session/request_permission params");
         return;
@@ -1801,10 +1805,7 @@ mod tests {
             ("claude-opus-5-5".into(), Some("medium".into()))
         );
         // Base model stays unsplit; unknown suffix stays unsplit.
-        assert_eq!(
-            split_model_effort_for_options("gemini-4-carbon", &agy),
-            ("gemini-4-carbon".into(), None)
-        );
+        assert_eq!(split_model_effort_for_options("gemini-4-carbon", &agy), ("gemini-4-carbon".into(), None));
         assert_eq!(
             split_model_effort_for_options("gemini-4-carbon-xhigh", &agy),
             ("gemini-4-carbon-xhigh".into(), None)
@@ -1858,10 +1859,7 @@ mod tests {
             resolve_config_override(&opts, "context", &json!("1m")),
             Some(("context".into(), json!("500k"), Some("config".into())))
         );
-        assert_eq!(
-            resolve_config_override(&opts, "context", &json!("auto")),
-            None
-        );
+        assert_eq!(resolve_config_override(&opts, "context", &json!("auto")), None);
         assert_eq!(
             resolve_config_override(&opts, "fast-mode", &json!(true)),
             Some(("fast".into(), json!("true"), Some("config".into())))
@@ -1945,12 +1943,7 @@ mod tests {
         );
         assert_eq!(
             split_model_variant_for_options("gpt-5.5-extra-high", &cursor_initial),
-            SplitModelVariant {
-                model: "gpt-5.5".into(),
-                effort: Some("xhigh".into()),
-                fast: None,
-                context: None,
-            }
+            SplitModelVariant { model: "gpt-5.5".into(), effort: Some("xhigh".into()), fast: None, context: None }
         );
         assert_eq!(
             split_model_variant_for_options("claude-opus-5-5[context=300k,effort=medium,fast=false]", &cursor_initial),
@@ -1980,6 +1973,27 @@ mod tests {
         assert_eq!(
             resolve_config_override(&cursor_reasoning_opts, "reasoning_effort", &json!("extra-high")),
             Some(("reasoning".into(), json!("xhigh"), Some("config".into())))
+        );
+
+        let zcode_thought_opts = vec![AcpConfigOption {
+            id: "thought".into(),
+            name: "Reasoning Effort".into(),
+            description: None,
+            category: Some("thought_level".into()),
+            kind: "select".into(),
+            current_value: json!("max"),
+            options: vec![choice("disabled"), choice("enabled")],
+            source: "config".into(),
+        }];
+        assert_eq!(resolve_config_option_id("reasoning_effort", &zcode_thought_opts), "thought");
+        assert_eq!(resolve_config_option_id("thought", &zcode_thought_opts), "thought");
+        assert_eq!(
+            resolve_config_override(&zcode_thought_opts, "effort", &json!("off")),
+            Some(("thought".into(), json!("disabled"), Some("config".into())))
+        );
+        assert_eq!(
+            resolve_config_override(&zcode_thought_opts, "reasoning_effort", &json!("high")),
+            Some(("thought".into(), json!("enabled"), Some("config".into())))
         );
     }
 }

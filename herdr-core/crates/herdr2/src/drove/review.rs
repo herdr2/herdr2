@@ -1,12 +1,12 @@
 //! Adversarial read-only reviewer loop (Full Diff -> R1, Delta Diff -> R2..Rn).
 
+use super::MAX_AUTO_RETRIES;
 use super::http::ApiErr;
 use super::notify::notify_coordinator;
 use super::pool::mark_worker_idle;
 use super::roles::diff_touched_paths;
 use super::store::NewDaemonEvent;
 use super::types::*;
-use super::MAX_AUTO_RETRIES;
 use crate::api::run::{DroveSpawnSpec, spawn_drove_agent};
 use crate::runtime::Core;
 use crate::transcript::Entry;
@@ -35,24 +35,21 @@ pub(super) async fn run_adversarial_review_gate(
 
     // 1. Capture candidate patch (`<artifact>.patch`) and tree SHA.
     let tree_sha = git_tree_sha(work_cwd);
-    let patch_text = capture_candidate_patch(work_cwd, &core.drove.get_attempt_baseline(&attempt.id).unwrap_or_default());
+    let patch_text =
+        capture_candidate_patch(work_cwd, &core.drove.get_attempt_baseline(&attempt.id).unwrap_or_default());
     let artifact_id = format!("review-{}-r{round}", attempt.id);
-    let _ = core
-        .drove
-        .store
-        .write_artifact(&run.id, &format!("{artifact_id}.patch"), patch_text.as_bytes());
+    let _ = core.drove.store.write_artifact(&run.id, &format!("{artifact_id}.patch"), patch_text.as_bytes());
 
     let prev_round = attempt.review_round.clone();
     let delta_artifact_id = if round > 1 {
         let delta_id = format!("review-{}-delta-r{round}", attempt.id);
         let delta_text = match (prev_round.as_ref().and_then(|r| r.tree_sha.as_deref()), tree_sha.as_deref()) {
-            (Some(old_t), Some(new_t)) if old_t != new_t => git_diff_trees(work_cwd, old_t, new_t).unwrap_or_else(|| patch_text.clone()),
+            (Some(old_t), Some(new_t)) if old_t != new_t => {
+                git_diff_trees(work_cwd, old_t, new_t).unwrap_or_else(|| patch_text.clone())
+            }
             _ => patch_text.clone(),
         };
-        let _ = core
-            .drove
-            .store
-            .write_artifact(&run.id, &format!("{delta_id}.patch"), delta_text.as_bytes());
+        let _ = core.drove.store.write_artifact(&run.id, &format!("{delta_id}.patch"), delta_text.as_bytes());
         Some(delta_id)
     } else {
         None
@@ -62,21 +59,25 @@ pub(super) async fn run_adversarial_review_gate(
     let cfg = core.drove.config_snapshot();
     let role_cfg = super::config::resolve_role_config(&cfg, "reviewer")
         .unwrap_or_else(|| super::config::default_roles().remove("reviewer").unwrap());
-    let quotas = if cfg.magpie.enabled {
-        core.drove.magpie.fetch_if_enabled(&cfg.magpie, false).await.0
-    } else {
-        None
-    };
+    let quotas = if cfg.magpie.enabled { core.drove.magpie.fetch_if_enabled(&cfg.magpie, false).await.0 } else { None };
     let run_workers = core.drove.store.list_workers(Some(&run.id));
     let run_attempts = core.drove.store.list_attempts(Some(&run.id), None, None);
-    let candidates = build_reviewer_candidates(
-        &role_cfg,
-        spec,
-        &attempt.agent,
-        quotas.as_deref(),
-        &run_workers,
-        &run_attempts,
-    );
+    let mut candidates =
+        build_reviewer_candidates(&role_cfg, spec, &attempt.agent, quotas.as_deref(), &run_workers, &run_attempts);
+    if spec.agent.as_deref().map(str::trim).is_none_or(str::is_empty)
+        && candidates.len() >= 2
+        && cfg.ai.enabled
+        && super::router::has_routing_notes(&cfg, &candidates.iter().collect::<Vec<_>>())
+    {
+        let pool: Vec<(usize, RoleTarget)> = candidates.iter().cloned().enumerate().collect();
+        if let Some((pref_idx, _)) = super::ai::pick_role_candidate(core, &run.id, task, "reviewer", &pool).await
+            && pref_idx > 0
+            && pref_idx < candidates.len()
+        {
+            let preferred = candidates.remove(pref_idx);
+            candidates.insert(0, preferred);
+        }
+    }
 
     let mut chosen_eval: Option<(String, Option<ReviewVerdict>, String)> = None;
     let mut last_agent_err = String::from("No reviewer candidates configured");
@@ -91,21 +92,16 @@ pub(super) async fn run_adversarial_review_gate(
         let rev_att_id = super::crypto::rand_id("att");
         let display = format!("reviewer · {}", task.key);
 
-        let warm_reviewer = core
-            .drove
-            .store
-            .list_workers(Some(&run.id))
-            .into_iter()
-            .find(|w| {
-                w.state == WorkerState::Idle
-                    && w.role.as_deref() == Some("reviewer")
-                    && w.read_only_dir.is_some()
-                    && w.agent == rev_agent
-                    && w.h2_agent
-                        .as_deref()
-                        .and_then(crate::agents::parse_id)
-                        .is_some_and(|aid| core.lock().reg.agents.get(&aid).is_some_and(|a| a.is_live()))
-            });
+        let warm_reviewer = core.drove.store.list_workers(Some(&run.id)).into_iter().find(|w| {
+            w.state == WorkerState::Idle
+                && w.role.as_deref() == Some("reviewer")
+                && w.read_only_dir.is_some()
+                && w.agent == rev_agent
+                && w.h2_agent
+                    .as_deref()
+                    .and_then(crate::agents::parse_id)
+                    .is_some_and(|aid| core.lock().reg.agents.get(&aid).is_some_and(|a| a.is_live()))
+        });
 
         let (rev_worker_id, spawn_agent_id, reused_worker) = if let Some(warm) = warm_reviewer {
             let Some(aid) = warm.h2_agent.as_deref().and_then(crate::agents::parse_id) else {
@@ -317,17 +313,8 @@ pub(super) async fn run_adversarial_review_gate(
             task.key, task.title, task.spec.target, task.spec.acceptance
         );
 
-        let prev_turn = core
-            .lock()
-            .reg
-            .agents
-            .get(&spawn_agent_id)
-            .map(|a| a.turn)
-            .unwrap_or(0);
-        let prev_entry_len = core
-            .read_transcript_entries(spawn_agent_id)
-            .map(|v| v.len())
-            .unwrap_or(0);
+        let prev_turn = core.lock().reg.agents.get(&spawn_agent_id).map(|a| a.turn).unwrap_or(0);
+        let prev_entry_len = core.read_transcript_entries(spawn_agent_id).map(|v| v.len()).unwrap_or(0);
         if let Err(e) = core.send(spawn_agent_id, &review_prompt, false, None, Some("drove")).await {
             let err_msg = format!("Reviewer `{rev_agent}` send failed: {}", e.message);
             core.kill(&[spawn_agent_id]).await;
@@ -344,7 +331,9 @@ pub(super) async fn run_adversarial_review_gate(
                 let st = core.lock();
                 match st.reg.agents.get(&spawn_agent_id) {
                     None => true,
-                    Some(a) => !a.is_live() || (a.turn > prev_turn && a.status.as_ref().is_none_or(|s| s.state != "working")),
+                    Some(a) => {
+                        !a.is_live() || (a.turn > prev_turn && a.status.as_ref().is_none_or(|s| s.state != "working"))
+                    }
                 }
             };
             if done {
@@ -361,8 +350,7 @@ pub(super) async fn run_adversarial_review_gate(
         }
 
         // Collect output before closing or idling reviewer session.
-        let (assistant_text, transcript_err) =
-            collect_reviewer_turn_output(core, spawn_agent_id, prev_entry_len);
+        let (assistant_text, transcript_err) = collect_reviewer_turn_output(core, spawn_agent_id, prev_entry_len);
         let structured = try_parse_review_verdict(&assistant_text);
         let agent_err = if structured.is_some() {
             None
@@ -415,16 +403,7 @@ pub(super) async fn run_adversarial_review_gate(
             a.failure = Some(AttemptFailure { kind: FailureKind::AgentError, message: msg.clone() });
         });
         mark_worker_idle(core, &author_worker.id);
-        super::fail_or_retry_task(
-            core,
-            &run.id,
-            &task.id,
-            &attempt.id,
-            FailureKind::AgentError,
-            &msg,
-            0,
-        )
-        .await;
+        super::fail_or_retry_task(core, &run.id, &task.id, &attempt.id, FailureKind::AgentError, &msg, 0).await;
         notify_coordinator(
             core,
             run,
@@ -497,7 +476,14 @@ pub(super) async fn run_adversarial_review_gate(
         .as_ref()
         .map(|fs| {
             fs.iter()
-                .map(|f| format!("- [{}] {}: {}", f.severity.as_deref().unwrap_or("info"), f.file.as_deref().unwrap_or("*"), f.message))
+                .map(|f| {
+                    format!(
+                        "- [{}] {}: {}",
+                        f.severity.as_deref().unwrap_or("info"),
+                        f.file.as_deref().unwrap_or("*"),
+                        f.message
+                    )
+                })
                 .collect::<Vec<_>>()
                 .join("\n")
         })
@@ -515,16 +501,8 @@ pub(super) async fn run_adversarial_review_gate(
             a.failure = Some(AttemptFailure { kind: FailureKind::ReviewRejected, message: reject_msg.clone() });
         });
         mark_worker_idle(core, &author_worker.id);
-        super::fail_or_retry_task(
-            core,
-            &run.id,
-            &task.id,
-            &attempt.id,
-            FailureKind::ReviewRejected,
-            &reject_msg,
-            0,
-        )
-        .await;
+        super::fail_or_retry_task(core, &run.id, &task.id, &attempt.id, FailureKind::ReviewRejected, &reject_msg, 0)
+            .await;
         let _ = MAX_AUTO_RETRIES;
         notify_coordinator(
             core,
@@ -553,9 +531,8 @@ fn build_reviewer_candidates(
     run_attempts: &[Attempt],
 ) -> Vec<RoleTarget> {
     if let Some(explicit_agent) = spec.agent.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        let matched = std::iter::once(&role_cfg.primary)
-            .chain(role_cfg.fallbacks.iter())
-            .find(|t| t.agent == explicit_agent);
+        let matched =
+            std::iter::once(&role_cfg.primary).chain(role_cfg.fallbacks.iter()).find(|t| t.agent == explicit_agent);
         return vec![RoleTarget {
             agent: explicit_agent.to_string(),
             model: spec.model.clone().or_else(|| matched.and_then(|t| t.model.clone())),
@@ -563,6 +540,7 @@ fn build_reviewer_candidates(
             fast: spec.fast.unwrap_or_else(|| matched.is_some_and(|t| t.fast)),
             context: matched.and_then(|t| t.context.clone()),
             strengths: matched.map(|t| t.strengths.clone()).unwrap_or_default(),
+            note: matched.and_then(|t| t.note.clone()),
         }];
     }
 
@@ -580,10 +558,7 @@ fn build_reviewer_candidates(
         {
             cand.model = Some(m.clone());
         }
-        if !list
-            .iter()
-            .any(|existing| existing.agent == cand.agent && existing.model == cand.model)
-        {
+        if !list.iter().any(|existing| existing.agent == cand.agent && existing.model == cand.model) {
             list.push(cand);
         }
     }
@@ -608,7 +583,10 @@ fn build_reviewer_candidates(
                 && a.failure.as_ref().is_some_and(|f| {
                     matches!(
                         f.kind,
-                        FailureKind::AgentError | FailureKind::Timeout | FailureKind::ProcessExited | FailureKind::QuotaExhausted
+                        FailureKind::AgentError
+                            | FailureKind::Timeout
+                            | FailureKind::ProcessExited
+                            | FailureKind::QuotaExhausted
                     )
                 })
         })
@@ -625,11 +603,7 @@ fn build_reviewer_candidates(
 
     list.sort_by_key(|c| {
         let failed_rank = u8::from(is_failed_cand(c));
-        let same_agent_rank = if spec.different_agent == Some(true) {
-            u8::from(c.agent == author_agent)
-        } else {
-            0
-        };
+        let same_agent_rank = if spec.different_agent == Some(true) { u8::from(c.agent == author_agent) } else { 0 };
         let cold_rank = u8::from(!has_warm_reviewer(c));
         (failed_rank, same_agent_rank, cold_rank)
     });
@@ -653,10 +627,7 @@ fn mark_reviewer_attempt_failed(
     let _ = core.drove.store.update_attempt(rev_att_id, |a| {
         a.outcome = Some(Outcome::Failed);
         a.ended_at = Some(now_iso());
-        a.failure = Some(AttemptFailure {
-            kind: FailureKind::AgentError,
-            message: err_msg.to_string(),
-        });
+        a.failure = Some(AttemptFailure { kind: FailureKind::AgentError, message: err_msg.to_string() });
     });
     core.drove.store.append_daemon_event(NewDaemonEvent {
         run_id: Some(run.id.clone()),
@@ -675,11 +646,7 @@ fn mark_reviewer_attempt_failed(
     });
 }
 
-fn collect_reviewer_turn_output(
-    core: &Core,
-    agent_id: u32,
-    start_idx: usize,
-) -> (String, Option<String>) {
+fn collect_reviewer_turn_output(core: &Core, agent_id: u32, start_idx: usize) -> (String, Option<String>) {
     let Ok(entries) = core.read_transcript_entries(agent_id) else {
         return (String::new(), None);
     };
@@ -708,11 +675,8 @@ pub fn looks_like_provider_error(raw: &str) -> Option<String> {
             && let Some(obj) = v.as_object()
         {
             if let Some(err) = obj.get("error") {
-                let msg = err
-                    .get("message")
-                    .and_then(|m| m.as_str())
-                    .map(String::from)
-                    .unwrap_or_else(|| err.to_string());
+                let msg =
+                    err.get("message").and_then(|m| m.as_str()).map(String::from).unwrap_or_else(|| err.to_string());
                 return Some(msg);
             }
             if obj.get("type").and_then(|t| t.as_str()) == Some("error")
@@ -732,10 +696,7 @@ pub fn looks_like_provider_error(raw: &str) -> Option<String> {
 /// Parses a structured `ReviewVerdict` JSON object when present, ignoring non-verdict prose or placeholders.
 pub fn try_parse_review_verdict(raw: &str) -> Option<ReviewVerdict> {
     if let Ok(v) = serde_json::from_str::<ReviewVerdict>(raw.trim())
-        && matches!(
-            v.verdict.as_str(),
-            "approve" | "approved" | "changes_requested" | "reject" | "rejected"
-        )
+        && matches!(v.verdict.as_str(), "approve" | "approved" | "changes_requested" | "reject" | "rejected")
         && v.summary != "..."
     {
         return Some(v);
@@ -743,10 +704,7 @@ pub fn try_parse_review_verdict(raw: &str) -> Option<ReviewVerdict> {
     for (idx, _) in raw.match_indices('{') {
         let mut de = serde_json::Deserializer::from_str(&raw[idx..]).into_iter::<ReviewVerdict>();
         if let Some(Ok(v)) = de.next()
-            && matches!(
-                v.verdict.as_str(),
-                "approve" | "approved" | "changes_requested" | "reject" | "rejected"
-            )
+            && matches!(v.verdict.as_str(), "approve" | "approved" | "changes_requested" | "reject" | "rejected")
             && v.summary != "..."
         {
             return Some(v);
@@ -812,30 +770,20 @@ fn capture_candidate_patch(work_cwd: &str, baseline: &super::roles::DirtyBaselin
 }
 
 fn git_tree_sha(work_cwd: &str) -> Option<String> {
-    let git_dir_out = Command::new("git")
-        .args(["-C", work_cwd, "rev-parse", "--git-dir"])
-        .output()
-        .ok()?;
+    let git_dir_out = Command::new("git").args(["-C", work_cwd, "rev-parse", "--git-dir"]).output().ok()?;
     if !git_dir_out.status.success() {
         return None;
     }
     let idx_path = std::env::temp_dir().join(format!("drove-idx-{}", super::crypto::rand_id("t")));
     let _ = std::fs::remove_file(&idx_path);
     let idx_str = idx_path.display().to_string();
-    let _ = Command::new("git")
-        .args(["-C", work_cwd, "read-tree", "HEAD"])
-        .env("GIT_INDEX_FILE", &idx_str)
-        .output();
+    let _ = Command::new("git").args(["-C", work_cwd, "read-tree", "HEAD"]).env("GIT_INDEX_FILE", &idx_str).output();
     let mut add_cmd = Command::new("git");
     add_cmd.args(["-C", work_cwd, "add", "-A", "--", "."]);
     add_cmd.args(DIFF_CACHE_EXCLUDES);
     add_cmd.env("GIT_INDEX_FILE", &idx_str);
     let _ = add_cmd.output();
-    let out = Command::new("git")
-        .args(["-C", work_cwd, "write-tree"])
-        .env("GIT_INDEX_FILE", &idx_str)
-        .output()
-        .ok();
+    let out = Command::new("git").args(["-C", work_cwd, "write-tree"]).env("GIT_INDEX_FILE", &idx_str).output().ok();
     let _ = std::fs::remove_file(&idx_path);
     out.filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -847,9 +795,7 @@ fn git_diff_trees(work_cwd: &str, a: &str, b: &str) -> Option<String> {
     diff_cmd.args(["-C", work_cwd, "diff", a, b, "--", "."]);
     diff_cmd.args(DIFF_CACHE_EXCLUDES);
     let out = diff_cmd.output().ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).to_string())
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).to_string())
 }
 
 fn resolve_local_parent_addr(core: &Core, host_session: &str) -> Option<String> {
@@ -857,8 +803,12 @@ fn resolve_local_parent_addr(core: &Core, host_session: &str) -> Option<String> 
     let tk = crate::runtime::TargetKey::parse(local)?;
     let st = core.lock();
     match tk {
-        crate::runtime::TargetKey::Terminal(id) => st.pty_reg.terminals.get(&id).filter(|t| t.is_live()).map(|_| crate::terminals::address(id)),
-        crate::runtime::TargetKey::Agent(id) => st.reg.agents.get(&id).filter(|a| a.is_live()).map(|_| crate::agents::address(id)),
+        crate::runtime::TargetKey::Terminal(id) => {
+            st.pty_reg.terminals.get(&id).filter(|t| t.is_live()).map(|_| crate::terminals::address(id))
+        }
+        crate::runtime::TargetKey::Agent(id) => {
+            st.reg.agents.get(&id).filter(|a| a.is_live()).map(|_| crate::agents::address(id))
+        }
     }
 }
 
@@ -888,6 +838,7 @@ mod tests {
                 fast: false,
                 context: None,
                 strengths: Vec::new(),
+                note: None,
             },
             fallbacks: vec![RoleTarget {
                 agent: "agy".into(),
@@ -896,6 +847,7 @@ mod tests {
                 fast: false,
                 context: None,
                 strengths: Vec::new(),
+                note: None,
             }],
             prompt: None,
         };
@@ -947,15 +899,22 @@ mod tests {
             ai_diagnosis: None,
             spinning_detected_at: None,
         };
-        let cands_after_fail = build_reviewer_candidates(&cfg, &ReviewSpec {
-            agent: None,
-            model: None,
-            effort: None,
-            fast: None,
-            different_agent: None,
-            criteria: None,
-            max_rounds: Some(1),
-        }, "claude", None, &[], &[failed_att]);
+        let cands_after_fail = build_reviewer_candidates(
+            &cfg,
+            &ReviewSpec {
+                agent: None,
+                model: None,
+                effort: None,
+                fast: None,
+                different_agent: None,
+                criteria: None,
+                max_rounds: Some(1),
+            },
+            "claude",
+            None,
+            &[],
+            &[failed_att],
+        );
         assert_eq!(cands_after_fail[0].agent, "agy");
         assert_eq!(cands_after_fail[1].agent, "codex");
     }

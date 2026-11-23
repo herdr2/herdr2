@@ -82,10 +82,8 @@ fn acp_auto_checkpoints_safety_gate_and_dual_rollback_end_to_end() {
 
     // Idle sibling ACP agent requires `--confirm` (`confirm_required`), whereas an actively working
     // sibling in the same workspace blocks file rollback (`shared_workspace`).
-    let sibling = s.json(&["run", "--agent", &spec, "--cwd", &repo.to_string_lossy()])["address"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let sibling =
+        s.json(&["run", "--agent", &spec, "--cwd", &repo.to_string_lossy()])["address"].as_str().unwrap().to_string();
     let (_, sib_confirm_err) = s.err(&["--json", "checkpoint", "rollback", &addr, "--to", "1"]);
     assert_eq!(sib_confirm_err["error"]["kind"], "confirm_required", "{sib_confirm_err}");
 
@@ -235,9 +233,7 @@ fn pty_claude_cli_rollback_reenters_claude_even_after_holder_drains() {
     );
 
     wait_until("respawned claude launches", || {
-        std::fs::read_to_string(&log_file)
-            .map(|c| c.lines().count() >= 2)
-            .unwrap_or(false)
+        std::fs::read_to_string(&log_file).map(|c| c.lines().count() >= 2).unwrap_or(false)
     });
     let after = get(&s, &addr);
     assert_eq!(after["state"], "live", "terminal must remain live after rollback: {after}");
@@ -252,4 +248,178 @@ fn pty_claude_cli_rollback_reenters_claude_even_after_holder_drains() {
         launches.lines().last().is_some_and(|l| l.contains("--session-id")),
         "expected fresh --session-id on turn-0 rollback: {launches}"
     );
+}
+
+/// Runs one of ZCode's hooks the way the CLI does: stdin JSON in Claude Code's shape, with
+/// `transcript_path` a one-message file in a folder removed once the hook has answered.
+fn zcode_hook(s: &Session, addr: &str, phase: &str, sid: &str, prompt: Option<&str>) -> String {
+    use std::io::Write as _;
+    use std::process::Stdio;
+
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    let event = if phase == "pre" { "UserPromptSubmit" } else { "Stop" };
+    let mut payload = serde_json::json!({
+        "hookEventName": event,
+        "hook_event_name": event,
+        "sessionId": sid,
+        "session_id": sid,
+        "mode": "yolo",
+        "permission_mode": "yolo",
+    });
+    let folder = s.root.join(format!(
+        "zcode-hook-{}-{}",
+        std::process::id(),
+        N.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&folder).unwrap();
+    let transcript = folder.join("transcript.jsonl");
+    let line = serde_json::json!({
+        "message": { "content": [{ "text": prompt.unwrap_or("done"), "type": "text" }], "role": if prompt.is_some() { "user" } else { "assistant" } }
+    });
+    std::fs::write(&transcript, format!("{line}\n")).unwrap();
+    if let Some(p) = prompt {
+        payload["prompt"] = serde_json::json!(p);
+    }
+    payload["transcript_path"] = serde_json::json!(transcript.to_string_lossy());
+
+    let mut cmd = s.program(&s.bin);
+    cmd.args(["checkpoint", "hook", "--source", "zcode", "--phase", phase])
+        .env("H2_TERMINAL_ID", addr)
+        .env("H2_TERMINAL_SOCKET", s.socket())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let body = format!("{payload}\n").into_bytes();
+    let feed = std::thread::spawn(move || drop(stdin.write_all(&body)));
+    let out = child.wait_with_output().unwrap();
+    feed.join().unwrap();
+    std::fs::remove_dir_all(&folder).unwrap();
+    assert!(out.status.success(), "zcode {phase} hook failed: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+#[cfg(unix)]
+#[test]
+fn pty_zcode_hooks_capture_turns_and_rollback_resumes_the_session_with_a_note() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let s = Session::new();
+    let repo = s.root.join("repo-zcode");
+    init_git_repo(&repo);
+
+    // A fake `zcode`: logs how it was started and stays open, as the TUI does.
+    let bin_dir = s.root.join("bin");
+    std::fs::create_dir_all(&bin_dir).unwrap();
+    let log_file = s.root.join("zcode-launches.log");
+    let fake_zcode = bin_dir.join("zcode");
+    std::fs::write(
+        &fake_zcode,
+        format!(
+            "#!/bin/sh\necho \"LAUNCH:$*\" >> '{}'\ntrap 'exit 0' TERM INT\nwhile true; do sleep 1; done\n",
+            log_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake_zcode, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let _ = s.json(&["server", "status"]);
+    let mut c = s.connect();
+    let created_resp = c.call(
+        1,
+        "terminal.run",
+        serde_json::json!({
+            "argv": [fake_zcode.to_string_lossy(), "--mode", "yolo"],
+            "cwd": repo.to_string_lossy(),
+            "keep": true,
+        }),
+    );
+    assert!(created_resp.get("error").is_none(), "terminal.run failed: {created_resp}");
+    let addr = created_resp["result"]["address"].as_str().unwrap().to_string();
+    wait_until("zcode foreground observed", || {
+        std::fs::read_to_string(&log_file).is_ok_and(|c| !c.is_empty()) && get(&s, &addr)["foreground"].is_object()
+    });
+
+    // Starting `zcode` from Herdr2 registers the hooks in ZCode's runtime config
+    // (here the session's own HOME).
+    let config: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(s.root.join(".zcode/cli/config.json")).unwrap()).unwrap();
+    assert_eq!(config["hooks"]["enabled"], true, "{config}");
+    for (event, phase) in [("PreToolUse", "guard"), ("UserPromptSubmit", "pre"), ("Stop", "post")] {
+        let ours = config["hooks"]["events"][event]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .flat_map(|g| g["hooks"].as_array().into_iter().flatten())
+            .any(|h| h["args"][3] == "zcode" && h["args"][5] == phase);
+        assert!(ours, "no Herdr2 {phase} hook under {event}: {config}");
+    }
+
+    // Two turns, each as ZCode reports it.
+    let sid = "sess_0f1e2d3c-aaaa-4bbb-8ccc-000000000001";
+    assert_eq!(zcode_hook(&s, &addr, "pre", sid, Some("add a.txt")), "{}");
+    std::fs::write(repo.join("a.txt"), "a\n").unwrap();
+    assert_eq!(zcode_hook(&s, &addr, "post", sid, None), "{}");
+    zcode_hook(&s, &addr, "pre", sid, Some("add b.txt"));
+    std::fs::write(repo.join("b.txt"), "b\n").unwrap();
+    zcode_hook(&s, &addr, "post", sid, None);
+
+    let listed = s.json(&["checkpoint", "ls", &addr]);
+    let turns: Vec<u64> = listed["checkpoints"].as_array().unwrap().iter().filter_map(|c| c["turn"].as_u64()).collect();
+    assert_eq!(turns, vec![0, 1, 2], "{listed}");
+    assert_eq!(listed["cli_kind"], "zcode", "{listed}");
+    assert_eq!(listed["checkpoints"][1]["prompt"], "add a.txt", "{listed}");
+    assert_eq!(listed["checkpoints"][2]["prompt"], "add b.txt", "{listed}");
+
+    // Back to turn 1: b.txt goes, and the session is resumed as it was.
+    let rb = s.json(&["checkpoint", "rollback", &addr, "--to", "1", "--confirm"]);
+    assert_eq!(rb["rewound_session"], true, "{rb}");
+    assert_eq!(rb["restored_files"], true, "{rb}");
+    assert!(!repo.join("b.txt").exists(), "turn 2's file must be gone");
+    assert_eq!(std::fs::read_to_string(repo.join("a.txt")).unwrap(), "a\n");
+    wait_until("respawned zcode launches", || std::fs::read_to_string(&log_file).is_ok_and(|c| c.lines().count() >= 2));
+    let launches = std::fs::read_to_string(&log_file).unwrap();
+    assert_eq!(
+        launches.lines().last(),
+        Some(format!("LAUNCH:--mode yolo --resume {sid}").as_str()),
+        "rollback must resume the same ZCode session: {launches}"
+    );
+
+    // ... and told what happened with its next prompt. Once.
+    let next = zcode_hook(&s, &addr, "pre", sid, Some("continue"));
+    let out: serde_json::Value = serde_json::from_str(&next).unwrap();
+    assert_eq!(out["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit", "{next}");
+    let context = out["hookSpecificOutput"]["additionalContext"].as_str().unwrap_or_default();
+    assert!(context.contains("rolled this workspace back to the end of turn 1"), "{next}");
+    assert_eq!(zcode_hook(&s, &addr, "post", sid, None), "{}");
+    assert_eq!(zcode_hook(&s, &addr, "pre", sid, Some("and again")), "{}");
+
+    // A note left for one session is not another's to hear: when a different ZCode session
+    // speaks first, it is dropped, not saved for later.
+    zcode_hook(&s, &addr, "post", sid, None);
+    s.json(&["checkpoint", "rollback", &addr, "--to", "1", "--confirm"]);
+    let other = "sess_0f1e2d3c-aaaa-4bbb-8ccc-000000000002";
+    assert_eq!(zcode_hook(&s, &addr, "pre", other, Some("another session")), "{}");
+    assert_eq!(zcode_hook(&s, &addr, "pre", sid, Some("back in the first")), "{}");
+}
+
+#[test]
+fn zcode_hook_outside_herdr2_answers_empty_and_starts_nothing() {
+    // Herdr2's hooks are in ZCode's one runtime config, so they run for every ZCode session:
+    // away from Herdr2 they must cost nothing.
+    let root = test_tmp().join(format!("h2-hook-zcode-noop-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let sock = root.join("never-created.sock");
+    let out = Command::new(env!("CARGO_BIN_EXE_herdr2"))
+        .args(["checkpoint", "hook", "--source", "zcode", "--phase", "pre"])
+        .env("H2_SOCKET", &sock)
+        .env_remove("H2_TERMINAL_ID")
+        .env_remove("H2_TERMINAL_SOCKET")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "{}");
+    assert!(!sock.exists(), "hook outside herdr2 must never start a daemon");
+    let _ = std::fs::remove_dir_all(&root);
 }

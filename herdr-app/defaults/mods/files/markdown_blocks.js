@@ -1,5 +1,6 @@
 // Lossless Markdown block parser, serializer, task toggling, and remote image rewriting for live Preview editing.
 import { resolveRelativeAssetPath } from "./themes.js";
+import { rewriteInlineMathInMarkdown } from "./math_svg.js";
 
 const ALERT_LABELS = {
   NOTE: "ⓘ Note",
@@ -67,6 +68,38 @@ const isRefDef = (text) => /^\s{0,3}\[[^\]]+\]:\s*\S+/.test(text);
 const isStandaloneImage = (text) =>
   /^\s*(?:!\[[^\]]*\]\([^)]*\)|\[!\[[^\]]*\]\([^)]*\)\]\([^)]*\)|!\[[^\]]*\]\[[^\]]*\]|<img\b[^>]*>)\s*$/i.test(text);
 
+function matchMathBlockStart(text) {
+  const s = String(text ?? "");
+  const singleDollar = s.match(/^(\s{0,3})\$\$(.+)\$\$\s*$/);
+  if (singleDollar && singleDollar[2].trim() && !singleDollar[2].includes("$$")) {
+    return { delim: "$$", indent: singleDollar[1], singleLine: true };
+  }
+  const openDollar = s.match(/^(\s{0,3})\$\$(.*)$/);
+  if (openDollar) {
+    return { delim: "$$", indent: openDollar[1], singleLine: false };
+  }
+  const singleBracket = s.match(/^(\s{0,3})\\\[(.+)\\\]\s*$/);
+  if (singleBracket && singleBracket[2].trim()) {
+    return { delim: "\\[", indent: singleBracket[1], singleLine: true };
+  }
+  const openBracket = s.match(/^(\s{0,3})\\\[\s*$/);
+  if (openBracket) {
+    return { delim: "\\[", indent: openBracket[1], singleLine: false };
+  }
+  return null;
+}
+
+function isMathBlockEnd(text, delim) {
+  const trimmed = String(text ?? "").trim();
+  if (delim === "$$") {
+    return trimmed === "$$" || (trimmed.endsWith("$$") && !trimmed.endsWith("\\$$"));
+  }
+  if (delim === "\\[") {
+    return trimmed === "\\]" || trimmed.endsWith("\\]");
+  }
+  return false;
+}
+
 function parseTaskLine(text) {
   const m = text.match(/^(\s*(?:[-*+]|\d{1,9}[.)])\s+\[)([ xX])(\]\s*)(.*)$/);
   if (!m) return null;
@@ -75,7 +108,7 @@ function parseTaskLine(text) {
 
 function isBlockStarter(lines, i) {
   const text = lines[i].text;
-  if (matchFenceStart(text) || isAtxHeading(text) || isHr(text) || isBlockquote(text) || isListItem(text) || isRefDef(text)) {
+  if (matchFenceStart(text) || matchMathBlockStart(text) || isAtxHeading(text) || isHr(text) || isBlockquote(text) || isListItem(text) || isRefDef(text)) {
     return true;
   }
   if (text.includes("|") && i + 1 < lines.length && isTableSeparator(lines[i + 1].text)) {
@@ -140,6 +173,17 @@ export function parseMarkdownBlocks(raw) {
         const lineText = lines[end].text;
         end++;
         if (isFenceEnd(lineText, fence.char, fence.len)) break;
+      }
+    } else if (kind === "paragraph" && end === start + 1 && matchMathBlockStart(first)) {
+      const mathStart = matchMathBlockStart(first);
+      kind = "math";
+      if (!mathStart.singleLine) {
+        end = start + 1;
+        while (end < lines.length) {
+          const lineText = lines[end].text;
+          end++;
+          if (isMathBlockEnd(lineText, mathStart.delim)) break;
+        }
       }
     } else if (kind === "paragraph" && /^\s*<!--/.test(first)) {
       kind = "html";
@@ -381,7 +425,7 @@ export function extractMarkdownImageUrls(raw) {
   return urls;
 }
 
-export function prepareBlockMarkdown(blockRaw, defs = "", remoteImages = null, currentFile = "") {
+export function prepareBlockMarkdown(blockRaw, defs = "", remoteImages = null, currentFile = "", options = null) {
   const source = String(blockRaw ?? "");
   const hasAlerts = source.includes("[!");
   const hasRemote = Boolean(remoteImages && remoteImages.size > 0);
@@ -431,6 +475,10 @@ export function prepareBlockMarkdown(blockRaw, defs = "", remoteImages = null, c
       lines[i] = nextLine;
     }
     body = lines.join("\n");
+  }
+
+  if (options?.math) {
+    body = rewriteInlineMathInMarkdown(body, options.math);
   }
 
   if (defs && body.includes("[") && body.trim() !== defs.trim()) {
@@ -686,4 +734,58 @@ export function serializeCodeFence(fence, nextBody, nextLang) {
     return `${openLine}${eol}${closeLine}`;
   }
   return `${openLine}${eol}${body}${eol}${closeLine}`;
+}
+
+export function parseMathBlock(raw) {
+  const lines = splitLinesWithEndings(raw);
+  if (lines.length === 0) return null;
+  const first = lines[0].text;
+  const start = matchMathBlockStart(first);
+  if (!start) return null;
+  const eol = lines[0].eol || "\n";
+
+  if (start.singleLine) {
+    const trimmed = first.trim();
+    const body = start.delim === "$$" ? trimmed.slice(2, -2).trim() : trimmed.slice(2, -2).trim();
+    return { delim: start.delim, indent: start.indent, singleLine: true, body, hasClosing: true, eol };
+  }
+
+  const closeDelim = start.delim === "$$" ? "$$" : "\\]";
+  const openRest = first.trim().slice(2);
+  const bodyLines = [];
+  if (openRest.trim()) bodyLines.push(openRest.trim());
+
+  let hasClosing = false;
+  for (let i = 1; i < lines.length; i++) {
+    const t = lines[i].text;
+    const isLast = i === lines.length - 1;
+    if (isLast && isMathBlockEnd(t, start.delim)) {
+      hasClosing = true;
+      const beforeClose = t.trim().slice(0, -closeDelim.length).trim();
+      if (beforeClose) bodyLines.push(beforeClose);
+      break;
+    }
+    bodyLines.push(t);
+  }
+  return {
+    delim: start.delim,
+    indent: start.indent,
+    singleLine: false,
+    body: bodyLines.join(eol).trim(),
+    hasClosing,
+    eol,
+  };
+}
+
+export function serializeMathBlock(parsed, nextBody) {
+  const body = String(nextBody ?? "").trim();
+  const delim = parsed?.delim === "\\[" ? "\\[" : "$$";
+  const closeDelim = delim === "$$" ? "$$" : "\\]";
+  const indent = parsed?.indent ?? "";
+  const eol = parsed?.eol || "\n";
+  if (parsed?.singleLine && !body.includes("\n")) {
+    return `${indent}${delim}${body}${closeDelim}`;
+  }
+  if (!body) return `${indent}${delim}${eol}${indent}${closeDelim}`;
+  return `${indent}${delim}${eol}${body}${eol}${indent}${closeDelim}`;
 }

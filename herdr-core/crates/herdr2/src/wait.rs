@@ -150,7 +150,13 @@ impl Drop for Registered<'_> {
 
 impl Core {
     /// A wait's answer from the agent's or terminal's current facts; `word` overrides its status.
-    pub fn wait_result(&self, target: TargetKey, ended: bool, reason: &str, word: Option<Option<String>>) -> WaitResult {
+    pub fn wait_result(
+        &self,
+        target: TargetKey,
+        ended: bool,
+        reason: &str,
+        word: Option<Option<String>>,
+    ) -> WaitResult {
         let st = self.lock();
         match target {
             TargetKey::Agent(id) => {
@@ -207,12 +213,16 @@ impl Core {
             let mut st = self.lock();
             let filter = match target {
                 TargetKey::Agent(id) => Filter { agent: Some(crate::agents::address(id)), ..Default::default() },
-                TargetKey::Terminal(id) => Filter { terminal: Some(crate::terminals::address(id)), ..Default::default() },
+                TargetKey::Terminal(id) => {
+                    Filter { terminal: Some(crate::terminals::address(id)), ..Default::default() }
+                }
             };
             self.subscribe(&mut st, filter, Sink::Waiter(tx.clone()));
             if spec.output.is_some() {
                 match (&target, &out_tx) {
-                    (TargetKey::Agent(id), OutTx::Agent(tx)) => st.output_watch.entry(*id).or_default().push(tx.clone()),
+                    (TargetKey::Agent(id), OutTx::Agent(tx)) => {
+                        st.output_watch.entry(*id).or_default().push(tx.clone())
+                    }
                     (TargetKey::Terminal(id), OutTx::Terminal(tx)) => {
                         st.pty_output_watch.entry(*id).or_default().push(tx.clone())
                     }
@@ -235,9 +245,8 @@ impl Core {
             }
         };
         let _registered = Registered { core: self, target, events: tx, output: out_tx };
-        let result = |ended: bool, reason: &str, word: Option<Option<String>>| {
-            self.wait_result(target, ended, reason, word)
-        };
+        let result =
+            |ended: bool, reason: &str, word: Option<Option<String>>| self.wait_result(target, ended, reason, word);
         let Some(start) = start.filter(|s| s.live) else {
             return result(true, "exit", None);
         };

@@ -5,7 +5,7 @@ use super::protocol::{PriorAttemptHandover, build_task_prompt_with_handover};
 use super::router::RouteDecision;
 use super::store::NewDaemonEvent;
 use super::types::*;
-use super::{fail_or_retry_task, MAX_AUTO_RETRIES};
+use super::{MAX_AUTO_RETRIES, fail_or_retry_task};
 use crate::acp::{self, proto::AcpContextUsage};
 use crate::api::run::{DroveSpawnSpec, spawn_drove_agent, update_agent_display};
 use crate::runtime::{Core, TargetKey};
@@ -19,12 +19,7 @@ use tokio::sync::mpsc;
 #[derive(Clone, Debug)]
 pub enum PoolSignal {
     Transcript { worker_id: String, entry: Entry },
-    TurnFinished {
-        worker_id: String,
-        agent_id: u32,
-        error: Option<String>,
-        usage: Option<AcpContextUsage>,
-    },
+    TurnFinished { worker_id: String, agent_id: u32, error: Option<String>, usage: Option<AcpContextUsage> },
     AgentExited { worker_id: String, agent_id: u32, reason: String },
     SessionClosed { address: String },
     WorkerTrashed { worker_id: String },
@@ -45,17 +40,10 @@ async fn handle_signal(core: &Arc<Core>, sig: PoolSignal) {
                 Entry::ToolCall { status, .. } if status == "completed" || status == "failed"
             );
             let worker_snap = core.drove.store.get_worker(&worker_id);
-            let attempt_id = worker_snap
-                .as_ref()
-                .and_then(|w| w.current_attempt_id.clone());
+            let attempt_id = worker_snap.as_ref().and_then(|w| w.current_attempt_id.clone());
             record_transcript_item(core, &worker_id, attempt_id.clone(), entry);
-            let _ = core
-                .drove
-                .store
-                .update_worker(&worker_id, |w| w.last_active_at = now_iso());
-            if is_tool_done
-                && let (Some(w), Some(aid)) = (worker_snap, attempt_id)
-            {
+            let _ = core.drove.store.update_worker(&worker_id, |w| w.last_active_at = now_iso());
+            if is_tool_done && let (Some(w), Some(aid)) = (worker_snap, attempt_id) {
                 maybe_detect_spinning_loop(core, &w, &aid).await;
             }
         }
@@ -86,15 +74,7 @@ async fn handle_signal(core: &Arc<Core>, sig: PoolSignal) {
                 return;
             }
             if let Some(err_msg) = error {
-                finish_unsettled_attempt(
-                    core,
-                    &worker,
-                    &attempt,
-                    FailureKind::AgentError,
-                    err_msg,
-                    true,
-                )
-                .await;
+                finish_unsettled_attempt(core, &worker, &attempt, FailureKind::AgentError, err_msg, true).await;
                 return;
             }
             let recent_assistant = core
@@ -107,15 +87,7 @@ async fn handle_signal(core: &Arc<Core>, sig: PoolSignal) {
                 .collect::<Vec<_>>()
                 .join("");
             if let Some(prov_err) = super::review::looks_like_provider_error(&recent_assistant) {
-                finish_unsettled_attempt(
-                    core,
-                    &worker,
-                    &attempt,
-                    FailureKind::AgentError,
-                    prov_err,
-                    false,
-                )
-                .await;
+                finish_unsettled_attempt(core, &worker, &attempt, FailureKind::AgentError, prov_err, false).await;
                 let _ = stop_worker(core, &worker_id).await;
                 let _ = core.drove.store.update_worker(&worker_id, |w| {
                     w.state = WorkerState::Dead;
@@ -146,11 +118,8 @@ async fn handle_signal(core: &Arc<Core>, sig: PoolSignal) {
             let Some(worker) = core.drove.store.get_worker(&worker_id) else {
                 return;
             };
-            let coord_closed = core
-                .drove
-                .store
-                .get_run(&worker.run_id)
-                .is_some_and(|r| is_coordinator_closed(core, &r));
+            let coord_closed =
+                core.drove.store.get_run(&worker.run_id).is_some_and(|r| is_coordinator_closed(core, &r));
             let was_closed = worker.state == WorkerState::Closed || coord_closed;
             let open_att = worker
                 .current_attempt_id
@@ -189,11 +158,7 @@ async fn handle_signal(core: &Arc<Core>, sig: PoolSignal) {
                         }
                     });
                 } else {
-                    let kind = if was_closed {
-                        FailureKind::Cancelled
-                    } else {
-                        FailureKind::ProcessExited
-                    };
+                    let kind = if was_closed { FailureKind::Cancelled } else { FailureKind::ProcessExited };
                     finish_unsettled_attempt(
                         core,
                         &worker,
@@ -261,12 +226,10 @@ async fn finish_unsettled_attempt(
     fail_or_retry_task(core, &attempt.run_id, &attempt.task_id, &attempt.id, kind, &message, MAX_AUTO_RETRIES).await;
     if keep_worker_idle {
         core.drove.clear_loop_watermark(&attempt.id);
-    core.ai.evict_session(&format!("drove:loop:{}", attempt.id));
-    if let Some(wt) = worker.worktree.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        core.ai.evict_session(&format!("drove:loop:{}", attempt.id));
+        if let Some(wt) = worker.worktree.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             let run_opt = core.drove.store.get_run(&attempt.run_id);
-            let is_aosp = run_opt
-                .as_ref()
-                .is_some_and(|r| super::integrate::is_aosp_harness(&r.cwd));
+            let is_aosp = run_opt.as_ref().is_some_and(|r| super::integrate::is_aosp_harness(&r.cwd));
             if is_aosp {
                 if let Some(ref r) = run_opt {
                     super::integrate::cleanup_worktree_dir(&r.cwd, std::path::Path::new(wt));
@@ -337,8 +300,7 @@ pub async fn dispatch_agent_task(
     };
 
     let baseline = super::roles::capture_dirty_baseline(&effective_cwd);
-    let (prior_handover, forked_from_agent) =
-        build_attempt_handover(core, retry_of.as_deref(), &effective_cwd).await;
+    let (prior_handover, forked_from_agent) = build_attempt_handover(core, retry_of.as_deref(), &effective_cwd).await;
 
     if let Some((mut warm, aid)) = live_warm {
         // Switch model/context/effort/fast dynamically if needed.
@@ -350,8 +312,10 @@ pub async fn dispatch_agent_task(
         let is_agy = matches!(decision.agent.as_str(), "agy" | "antigravity");
         let is_cursor = matches!(decision.agent.as_str(), "cursor" | "cursor-agent");
         let cursor_has_effort = is_cursor && decision.model.as_deref().is_some_and(acp::model_has_embedded_effort);
-        if is_cursor && decision.context != warm.context_window
-            && let Some(ctx) = decision.context.as_deref().map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
+        if is_cursor
+            && decision.context != warm.context_window
+            && let Some(ctx) =
+                decision.context.as_deref().map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
         {
             apply_warm_config(core, aid, "context", json!(ctx)).await;
         }
@@ -386,16 +350,7 @@ pub async fn dispatch_agent_task(
         update_fingerprint(&mut warm.fingerprint, task);
         core.drove.store.update_worker(&warm.id, |w| *w = warm.clone());
 
-        let attempt = build_attempt_record(
-            &attempt_id,
-            run,
-            task,
-            &warm.id,
-            &decision,
-            true,
-            retry_of,
-            hint.clone(),
-        );
+        let attempt = build_attempt_record(&attempt_id, run, task, &warm.id, &decision, true, retry_of, hint.clone());
         core.drove.store.insert_attempt(attempt.clone());
         core.drove.record_attempt_baseline(&attempt_id, baseline);
         let preserved_source = next_assign_source(task);
@@ -492,16 +447,7 @@ pub async fn dispatch_agent_task(
     };
     core.drove.store.insert_worker(worker);
 
-    let attempt = build_attempt_record(
-        &attempt_id,
-        run,
-        task,
-        &worker_id,
-        &decision,
-        false,
-        retry_of,
-        hint.clone(),
-    );
+    let attempt = build_attempt_record(&attempt_id, run, task, &worker_id, &decision, false, retry_of, hint.clone());
     core.drove.store.insert_attempt(attempt.clone());
     core.drove.record_attempt_baseline(&attempt_id, baseline);
     let preserved_source = next_assign_source(task);
@@ -766,9 +712,7 @@ pub(crate) fn pid_is_alive(pid: u32) -> bool {
     {
         use std::os::windows::io::{FromRawHandle, OwnedHandle};
         use windows_sys::Win32::Foundation::FILETIME;
-        use windows_sys::Win32::System::Threading::{
-            GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
+        use windows_sys::Win32::System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
         unsafe {
             let raw = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if raw.is_null() {
@@ -832,9 +776,9 @@ pub fn is_coordinator_closed(core: &Core, run: &Run) -> bool {
                     let trashed = t.labels.get("herdr.trashed").is_some_and(|s| !s.is_empty());
                     let at_shell_root = t.pid.is_some_and(|tpid| {
                         run.coordinator.host_pid.is_some_and(|hpid| hpid != tpid)
-                            && t.foreground.as_ref().is_some_and(|fg| {
-                                Some(fg.pid as u32) == t.pid && crate::foreground::is_shell_root(fg)
-                            })
+                            && t.foreground
+                                .as_ref()
+                                .is_some_and(|fg| Some(fg.pid as u32) == t.pid && crate::foreground::is_shell_root(fg))
                     });
                     (live, trashed, at_shell_root)
                 })
@@ -955,8 +899,7 @@ async fn maybe_detect_spinning_loop(core: &Arc<Core>, worker: &Worker, attempt_i
     };
     core.drove.set_loop_watermark(attempt_id, max_id);
 
-    let Some(verdict) =
-        super::ai::detect_semantic_loop(core, &att.run_id, attempt_id, &task, &delta_items).await
+    let Some(verdict) = super::ai::detect_semantic_loop(core, &att.run_id, attempt_id, &task, &delta_items).await
     else {
         return;
     };
@@ -1043,12 +986,7 @@ async fn trigger_loop_detection(
 }
 
 /// Sends a message to an active task's worker (optionally interrupting current ACP turn first).
-pub async fn send_to_task_worker(
-    core: &Arc<Core>,
-    task: &Task,
-    text: &str,
-    interrupt: bool,
-) -> Result<Value, String> {
+pub async fn send_to_task_worker(core: &Arc<Core>, task: &Task, text: &str, interrupt: bool) -> Result<Value, String> {
     let attempts = core.drove.store.list_attempts(None, Some(&task.id), None);
     let latest = attempts
         .iter()
@@ -1056,11 +994,7 @@ pub async fn send_to_task_worker(
         .find(|a| a.outcome.is_none())
         .or_else(|| attempts.last())
         .ok_or_else(|| "Task has no worker attempt yet".to_string())?;
-    let worker = core
-        .drove
-        .store
-        .get_worker(&latest.worker_id)
-        .ok_or_else(|| "Worker not found".to_string())?;
+    let worker = core.drove.store.get_worker(&latest.worker_id).ok_or_else(|| "Worker not found".to_string())?;
     let aid = worker
         .h2_agent
         .as_deref()
@@ -1068,9 +1002,7 @@ pub async fn send_to_task_worker(
         .ok_or_else(|| "Worker has no live herdr2 ACP agent".to_string())?;
 
     if interrupt {
-        let _ = core
-            .interrupt(aid, std::time::Duration::from_secs(5))
-            .await;
+        let _ = core.interrupt(aid, std::time::Duration::from_secs(5)).await;
     }
     let _ = core.drove.store.post_message(super::store::PostMessageInput {
         run_id: task.run_id.clone(),
@@ -1091,9 +1023,7 @@ pub async fn send_to_task_worker(
         ai_draft: None,
         needs_action: false,
     });
-    core.send(aid, text, interrupt, None, Some("drove"))
-        .await
-        .map_err(|e| e.message)?;
+    core.send(aid, text, interrupt, None, Some("drove")).await.map_err(|e| e.message)?;
     Ok(json!({ "ok": true, "workerId": worker.id, "agent": worker.h2_agent, "interrupted": interrupt }))
 }
 
@@ -1218,17 +1148,9 @@ async fn build_attempt_handover(
         .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
         .filter(|s| !s.trim().is_empty());
 
-    let failure_reason = prev
-        .failure
-        .as_ref()
-        .map(|f| format!("{:?}: {}", f.kind, f.message))
-        .or_else(|| {
-            prev.result
-                .as_ref()
-                .and_then(|r| r.blockers.as_ref())
-                .filter(|b| !b.is_empty())
-                .map(|b| b.join("; "))
-        });
+    let failure_reason = prev.failure.as_ref().map(|f| format!("{:?}: {}", f.kind, f.message)).or_else(|| {
+        prev.result.as_ref().and_then(|r| r.blockers.as_ref()).filter(|b| !b.is_empty()).map(|b| b.join("; "))
+    });
 
     (
         Some(PriorAttemptHandover {
@@ -1326,18 +1248,10 @@ pub(super) fn resolve_local_parent(core: &Core, host_session: &str) -> Option<St
     let tk = TargetKey::parse(local)?;
     let st = core.lock();
     match tk {
-        TargetKey::Terminal(id) => st
-            .pty_reg
-            .terminals
-            .get(&id)
-            .filter(|t| t.is_live())
-            .map(|_| crate::terminals::address(id)),
-        TargetKey::Agent(id) => st
-            .reg
-            .agents
-            .get(&id)
-            .filter(|a| a.is_live())
-            .map(|_| crate::agents::address(id)),
+        TargetKey::Terminal(id) => {
+            st.pty_reg.terminals.get(&id).filter(|t| t.is_live()).map(|_| crate::terminals::address(id))
+        }
+        TargetKey::Agent(id) => st.reg.agents.get(&id).filter(|a| a.is_live()).map(|_| crate::agents::address(id)),
     }
 }
 
@@ -1360,14 +1274,10 @@ fn update_fingerprint(fp: &mut Fingerprint, task: &Task) {
 fn record_transcript_item(core: &Core, worker_id: &str, attempt_id: Option<String>, entry: Entry) {
     match entry {
         Entry::Assistant { text, .. } if !text.is_empty() => {
-            core.drove
-                .store
-                .append_item(worker_id, attempt_id, "assistant", Some(text), None, None);
+            core.drove.store.append_item(worker_id, attempt_id, "assistant", Some(text), None, None);
         }
         Entry::Thought { text, .. } if !text.is_empty() => {
-            core.drove
-                .store
-                .append_item(worker_id, attempt_id, "thought", Some(text), None, None);
+            core.drove.store.append_item(worker_id, attempt_id, "thought", Some(text), None, None);
         }
         Entry::ToolCall { id, title, tool_kind, status, .. } => {
             core.drove.store.append_item(
@@ -1398,9 +1308,7 @@ fn record_transcript_item(core: &Core, worker_id: &str, attempt_id: Option<Strin
             );
         }
         Entry::Stderr { text, .. } if !text.trim().is_empty() => {
-            core.drove
-                .store
-                .append_item(worker_id, attempt_id, "system", Some(text), None, None);
+            core.drove.store.append_item(worker_id, attempt_id, "system", Some(text), None, None);
         }
         _ => {}
     }
@@ -1409,12 +1317,9 @@ fn record_transcript_item(core: &Core, worker_id: &str, attempt_id: Option<Strin
 /// Preserves user/plan explicit overrides while marking router-selected assignments as `"router"` so retries can step down fallback chains.
 fn next_assign_source(task: &Task) -> Option<String> {
     let prev_source = task.assign.as_ref().and_then(|a| a.source.as_deref());
-    let had_explicit_agent = task
-        .assign
-        .as_ref()
-        .and_then(|a| a.agent.as_deref())
-        .is_some_and(|s| !s.trim().is_empty())
-        && prev_source != Some("router");
+    let had_explicit_agent =
+        task.assign.as_ref().and_then(|a| a.agent.as_deref()).is_some_and(|s| !s.trim().is_empty())
+            && prev_source != Some("router");
     match prev_source {
         Some(s) => Some(s.to_string()),
         None if had_explicit_agent => Some("plan".into()),
@@ -1445,8 +1350,7 @@ pub async fn handle_task_failure(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .unwrap_or("coder");
-            let chain_len = super::config::resolve_role_config(&cfg, role_name)
-                .map_or(1, |r| 1 + r.fallbacks.len());
+            let chain_len = super::config::resolve_role_config(&cfg, role_name).map_or(1, |r| 1 + r.fallbacks.len());
             max_retries.max(chain_len.saturating_sub(1) as u32).min(8)
         })
         .unwrap_or(max_retries);
@@ -1464,9 +1368,7 @@ pub async fn handle_task_failure(
             should_notify = true;
         }
     });
-    if should_notify
-        && let (Some(run), Some(task)) = (core.drove.store.get_run(run_id), updated_task)
-    {
+    if should_notify && let (Some(run), Some(task)) = (core.drove.store.get_run(run_id), updated_task) {
         let _ = core.drove.store.post_message(super::store::PostMessageInput {
             run_id: run.id.clone(),
             kind: MessageType::Failed,
@@ -1505,14 +1407,12 @@ pub async fn handle_task_failure(
 /// Ensures Drove worker/reviewer child processes inherit a complete `PATH` (including `~/.nvm` Node
 /// shims, `~/.local/bin`, and `~/.cargo/bin`) even when `herdr2 hold` was spawned by a desktop GUI.
 pub(super) fn inject_drove_path_env(env: &mut BTreeMap<String, String>) {
-    let mut dirs: Vec<std::path::PathBuf> = std::env::var_os("PATH")
-        .map(|v| std::env::split_paths(&v).collect())
-        .unwrap_or_default();
+    let mut dirs: Vec<std::path::PathBuf> =
+        std::env::var_os("PATH").map(|v| std::env::split_paths(&v).collect()).unwrap_or_default();
     if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
         let mut extras = vec![home.join(".local/bin"), home.join(".cargo/bin")];
         if let Ok(rd) = std::fs::read_dir(home.join(".nvm/versions/node")) {
-            let mut vers: Vec<std::path::PathBuf> =
-                rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
+            let mut vers: Vec<std::path::PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
             vers.sort();
             if let Some(latest) = vers.pop() {
                 extras.insert(0, latest.join("bin"));

@@ -231,7 +231,8 @@ pub fn spawn_core(paths: &Paths) -> Result<(), RpcError> {
 pub fn spawn_detached(paths: &Paths, args: &[&str], log: &str) -> std::io::Result<()> {
     paths.create_dirs()?;
     let log = paths.state.join(log);
-    let exe = exe_path().ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "cannot resolve herdr2 executable path"))?;
+    let exe = exe_path()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "cannot resolve herdr2 executable path"))?;
     let exe = if args.first() == Some(&"serve") { platform::core_executable(&exe) } else { exe };
     let mut cmd = Command::new(exe);
     if args.first() == Some(&"serve") {
@@ -317,8 +318,8 @@ pub fn call(stream: &Stream, method: &str, params: Value) -> Result<Value, RpcEr
 /// The h2 agent we run in, if it belongs to the core we talk to: its id
 /// means nothing to another session's core.
 pub fn agent_id() -> Option<String> {
-    let own_core = std::env::var_os("H2_AGENT_SOCKET")
-        .is_none_or(|s| Paths::from_env().is_ok_and(|p| p.socket.as_os_str() == s));
+    let own_core =
+        std::env::var_os("H2_AGENT_SOCKET").is_none_or(|s| Paths::from_env().is_ok_and(|p| p.socket.as_os_str() == s));
     std::env::var("H2_AGENT_ID").ok().filter(|_| own_core)
 }
 

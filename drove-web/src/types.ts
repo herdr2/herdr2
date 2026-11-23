@@ -480,11 +480,21 @@ export interface ProfileAgent {
 }
 export type BuiltInWorkerRole = "coder" | "tester" | "writer" | "reviewer" | "researcher";
 export type RoleAccessMode = "readonly" | "scoped_write" | "writable";
+export interface RoleCandidateConfig {
+  agent: string;
+  model?: string | null;
+  effort?: Effort;
+  fast?: boolean;
+  context?: string | null;
+  strengths?: string[];
+  note?: string | null;
+}
 export interface RoleProfileConfig {
   label?: string;
   summary?: string;
   tags?: string[];
   agents?: string[];
+  candidates?: RoleCandidateConfig[];
   model?: string;
   effort?: Effort;
   access?: RoleAccessMode;
@@ -493,6 +503,7 @@ export interface RoleProfileConfig {
 }
 export interface Profile {
   version: number; updatedAt: string;
+  note?: string | null;
   defaults?: {
     maxInstances?: number;
     idleTtlSec?: number;

@@ -101,33 +101,81 @@ trait StatusTarget {
 }
 
 impl StatusTarget for Agent {
-    fn status(&self) -> Option<&Status> { self.status.as_ref() }
-    fn set_status(&mut self, s: Option<Status>) { self.status = s; }
-    fn records_mut(&mut self) -> &mut BTreeMap<String, Status> { &mut self.records }
-    fn inc_turn(&mut self) { self.turn += 1; }
-    fn set_status_ms(&mut self, ms: Option<u64>) { self.status_ms = ms; }
-    fn working_since(&self) -> Option<u64> { self.working_since }
-    fn set_working_since(&mut self, ms: Option<u64>) { self.working_since = ms; }
-    fn work_ms(&self) -> Option<u64> { self.work_ms }
-    fn set_work_ms(&mut self, ms: Option<u64>) { self.work_ms = ms; }
-    fn total_work_ms(&self) -> u64 { self.total_work_ms }
-    fn set_total_work_ms(&mut self, ms: u64) { self.total_work_ms = ms; }
-    fn set_reported(&mut self) { self.reported = true; }
+    fn status(&self) -> Option<&Status> {
+        self.status.as_ref()
+    }
+    fn set_status(&mut self, s: Option<Status>) {
+        self.status = s;
+    }
+    fn records_mut(&mut self) -> &mut BTreeMap<String, Status> {
+        &mut self.records
+    }
+    fn inc_turn(&mut self) {
+        self.turn += 1;
+    }
+    fn set_status_ms(&mut self, ms: Option<u64>) {
+        self.status_ms = ms;
+    }
+    fn working_since(&self) -> Option<u64> {
+        self.working_since
+    }
+    fn set_working_since(&mut self, ms: Option<u64>) {
+        self.working_since = ms;
+    }
+    fn work_ms(&self) -> Option<u64> {
+        self.work_ms
+    }
+    fn set_work_ms(&mut self, ms: Option<u64>) {
+        self.work_ms = ms;
+    }
+    fn total_work_ms(&self) -> u64 {
+        self.total_work_ms
+    }
+    fn set_total_work_ms(&mut self, ms: u64) {
+        self.total_work_ms = ms;
+    }
+    fn set_reported(&mut self) {
+        self.reported = true;
+    }
 }
 
 impl StatusTarget for Terminal {
-    fn status(&self) -> Option<&Status> { self.status.as_ref() }
-    fn set_status(&mut self, s: Option<Status>) { self.status = s; }
-    fn records_mut(&mut self) -> &mut BTreeMap<String, Status> { &mut self.records }
-    fn inc_turn(&mut self) { self.turn += 1; }
-    fn set_status_ms(&mut self, ms: Option<u64>) { self.status_ms = ms; }
-    fn working_since(&self) -> Option<u64> { self.working_since }
-    fn set_working_since(&mut self, ms: Option<u64>) { self.working_since = ms; }
-    fn work_ms(&self) -> Option<u64> { self.work_ms }
-    fn set_work_ms(&mut self, ms: Option<u64>) { self.work_ms = ms; }
-    fn total_work_ms(&self) -> u64 { self.total_work_ms }
-    fn set_total_work_ms(&mut self, ms: u64) { self.total_work_ms = ms; }
-    fn set_reported(&mut self) { self.reported = true; }
+    fn status(&self) -> Option<&Status> {
+        self.status.as_ref()
+    }
+    fn set_status(&mut self, s: Option<Status>) {
+        self.status = s;
+    }
+    fn records_mut(&mut self) -> &mut BTreeMap<String, Status> {
+        &mut self.records
+    }
+    fn inc_turn(&mut self) {
+        self.turn += 1;
+    }
+    fn set_status_ms(&mut self, ms: Option<u64>) {
+        self.status_ms = ms;
+    }
+    fn working_since(&self) -> Option<u64> {
+        self.working_since
+    }
+    fn set_working_since(&mut self, ms: Option<u64>) {
+        self.working_since = ms;
+    }
+    fn work_ms(&self) -> Option<u64> {
+        self.work_ms
+    }
+    fn set_work_ms(&mut self, ms: Option<u64>) {
+        self.work_ms = ms;
+    }
+    fn total_work_ms(&self) -> u64 {
+        self.total_work_ms
+    }
+    fn set_total_work_ms(&mut self, ms: u64) {
+        self.total_work_ms = ms;
+    }
+    fn set_reported(&mut self) {
+        self.reported = true;
+    }
 }
 
 /// What a report changed, for events and waiters.

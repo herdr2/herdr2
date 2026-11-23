@@ -465,6 +465,15 @@ pub struct Person {
     /// Interface language: `"en"` (default) or `"zh-CN"` (Simplified Chinese).
     #[serde(skip_serializing_if = "Language::is_default")]
     pub language: Language,
+    /// Optional local `defaults/` directory for live zero-recompile dev hot-reload (`HERDR2_DEV_DEFAULTS` wins).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dev_defaults_dir: Option<String>,
+    /// Optional base URL for App / Core / UI bundle release manifests (`HERDR2_RELEASES_URL` wins).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub releases_url: Option<String>,
+    /// UI bundle hot-update policy: `"prompt"` (default), `"auto"`, or `"off"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ui_hot_update: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<crate::layout::ThemeChoice>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -558,6 +567,9 @@ impl Default for Person {
             option_as_alt: OptionAsAlt::Auto,
             appearance: Appearance::System,
             language: Language::En,
+            dev_defaults_dir: None,
+            releases_url: None,
+            ui_hot_update: None,
             theme: None,
             colors: BTreeMap::new(),
         }

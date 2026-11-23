@@ -514,7 +514,12 @@ mod tests {
         assert_eq!(key(Some("agent"), &[]), "cursor");
         assert_eq!(key(Some("cursor-agent"), &[]), "cursor");
         assert_eq!(key(Some("newagent"), &[]), "agent");
+        // ZCode calls its process `zcode-cli`; its command is `zcode`.
+        assert_eq!(key(None, &["zcode-cli"]), "zcode");
+        assert_eq!(key(Some("zcode-cli"), &[]), "zcode");
+        assert_eq!(key(None, &["zcode"]), "zcode");
         assert!(startable().iter().any(|a| a["key"] == "cursor" && a["run"] == json!(["cursor-agent", "--yolo", "--trust"])));
+        assert!(startable().iter().any(|a| a["key"] == "zcode" && a["run"] == json!(["zcode", "--mode", "yolo"])));
         assert!(startable().iter().any(|a| a["key"] == "claude" && a["run"] == json!(["claude", "--dangerously-skip-permissions"])));
         assert!(startable().iter().any(|a| a["key"] == "codex" && a["run"] == json!(["codex", "--no-daemon", "--dangerously-bypass-approvals-and-sandbox"])));
         assert!(startable().iter().any(|a| a["key"] == "opencode" && a["run"] == json!(["opencode", "--auto"])));
@@ -556,8 +561,12 @@ mod tests {
         assert!(is_agent(&["codex"]));
         assert!(is_agent(&["opencode"]));
         assert!(is_agent(&["agent"]));
+        assert!(is_agent(&["zcode"]));
+        assert!(is_agent(&["zcode-cli"]));
         assert!(!is_agent(&["vim"]));
         assert!(!is_agent(&["/bin/zsh"]));
+        assert_eq!(key(None, &["node", "/home/u/.zcode/server/releases/3.19.1/runtime/zcode.cjs"]), "zcode");
+        assert!(is_agent(&["node", "/home/u/.zcode/server/releases/3.19.1/runtime/zcode.cjs"]));
         assert_eq!(key(None, &["node", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"]), "claude");
         assert!(is_agent(&["node", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js"]));
         assert_eq!(key(None, &[r"C:\Program Files\nodejs\node.exe", r"C:\Users\u\AppData\Roaming\npm\node_modules\@openai\codex\bin\codex.js"]), "codex");

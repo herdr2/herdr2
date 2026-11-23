@@ -4,9 +4,29 @@
 
 import { View, div, image } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { props, closeOverlay, run, theme } from "herdr";
+import { props, closeOverlay, run, theme, keys, window as appWindow } from "herdr";
 
 const DOT = { error: "blocked", warning: "working", success: "done", info: "accent" };
+
+function shortcutFor(action) {
+  if (typeof keys !== "function" || !action) return "";
+  const list = keys();
+  if (!Array.isArray(list)) return "";
+  const k = list.find((b) => b.section === "global" && b.action === action);
+  if (!k?.keys?.trim()) return "";
+  const mac = typeof appWindow === "function" && appWindow()?.platform === "macos";
+  const names = mac ? { ctrl: "⌃", alt: "⌥", shift: "⇧", cmd: "⌘", fn: "fn" } : { ctrl: "Ctrl", alt: "Alt", shift: "Shift", cmd: "Super", fn: "Fn" };
+  const alias = { secondary: mac ? "cmd" : "ctrl", super: "cmd", win: "cmd" };
+  return k.keys.trim().split(/\s+/).map((stroke) => {
+    const parts = stroke.split("-");
+    let key = parts.pop();
+    if (key === "") { key = "-"; parts.pop(); }
+    const held = new Set(parts.map((m) => alias[m.toLowerCase()] ?? m.toLowerCase()));
+    if (/^[A-Z]$/.test(key)) held.add("shift");
+    const label = key.length === 1 ? key.toUpperCase() : key[0].toUpperCase() + key.slice(1).toLowerCase();
+    return [...Object.keys(names).filter((m) => held.has(m)).map((m) => names[m]), label].join(mac ? "" : "+");
+  }).join(" ");
+}
 
 export default class Toast extends View {
   render(cx) {
@@ -14,6 +34,11 @@ export default class Toast extends View {
     const p = props() ?? {};
     const login = /^([a-z0-9][a-z0-9_.-]{0,31}) needs login; run hc machine login \1$/.exec(p.body ?? "");
     const command = login ? `hc machine login ${login[1]}` : null;
+    const hasButtonAction = Boolean(p.actionLabel && p.buttonAction?.name);
+    const buttonShortcut = hasButtonAction ? shortcutFor(p.buttonAction.name) : "";
+    const buttonTip = p.actionTooltip
+      ? (buttonShortcut ? `${p.actionTooltip} (${buttonShortcut})` : p.actionTooltip)
+      : (buttonShortcut ? `${p.actionLabel} (${buttonShortcut})` : p.actionLabel);
     return h_flex()
       .id("toast")
       .size_full()
@@ -31,6 +56,7 @@ export default class Toast extends View {
       .child(
         v_flex()
           .flex_1()
+          .min_w(0)
           .overflow_hidden()
           .child(div().truncate().font_semibold().text_size(13).text_color(t.foreground).child(login ? `${login[1]} needs a login: run` : p.title ?? ""))
           .when(!login && Boolean(p.body), (el) => el.child(div().truncate().text_size(12).text_color(t.muted).child(p.body ?? "")))
@@ -40,6 +66,32 @@ export default class Toast extends View {
               .text_size(12).text_color(t.foreground).cursor_pointer().hover(s => s.bg(t.hover))
               .on_click((_e, cx) => { cx.stop_propagation(); cx.write_to_clipboard(command); this.copied = true; cx.notify(); })
               .child(this.copied ? "Copied" : "Copy")))),
+      )
+      .when(hasButtonAction, (el) =>
+        el.child(
+          div()
+            .id("toast-action-btn")
+            .flex_none()
+            .px(8)
+            .py(4)
+            .rounded(6)
+            .bg(t.background)
+            .border_1()
+            .border_color(t.border)
+            .text_size(11.5)
+            .font_medium()
+            .text_color(t.foreground)
+            .cursor_pointer()
+            .hover((s) => s.bg(t.raised))
+            .tooltip(buttonTip)
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              run(p.buttonAction.name, p.buttonAction.args ?? {});
+              closeOverlay(p.overlay);
+            })
+            .child(p.actionLabel),
+        ),
       );
   }
 }

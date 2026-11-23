@@ -363,7 +363,7 @@ impl Model {
         }
     }
 
-    /// Adds a tab after the space's selected one and selects it (not the space).
+    /// Adds a tab at the end of the space and selects it (not the space).
     pub fn add_tab(&mut self, space: &str, ctx: Tab) -> bool {
         self.insert_tab(space, ctx, true)
     }
@@ -375,13 +375,10 @@ impl Model {
 
     fn insert_tab(&mut self, space: &str, ctx: Tab, select: bool) -> bool {
         let Some(p) = self.space_mut(space) else { return false };
-        if !select {
-            p.tabs.push(ctx);
-            return true;
+        if select {
+            p.active = Some(ctx.id.clone());
         }
-        let at = p.active.as_deref().and_then(|a| p.tabs.iter().position(|c| c.id == a)).map_or(p.tabs.len(), |i| i + 1);
-        p.active = Some(ctx.id.clone());
-        p.tabs.insert(at, ctx);
+        p.tabs.push(ctx);
         true
     }
 
@@ -564,7 +561,7 @@ impl Model {
         };
         let moved_addr = extracted.any_terminal().map(str::to_owned);
         let new_tab = Tab::with_pane(&new_tab_id, new_tab_name, extracted);
-        self.spaces[space_idx].tabs.insert(tab_idx + 1, new_tab);
+        self.spaces[space_idx].tabs.push(new_tab);
         self.select_tab(&new_tab_id);
         Ok((new_tab_id, moved_addr))
     }
@@ -1238,13 +1235,13 @@ mod tests {
     }
 
     #[test]
-    fn new_tabs_go_after_the_selected_one() {
+    fn new_tabs_append_to_the_end() {
         let mut m = model_with_one();
         m.add_tab("p1", Tab::new("c2", "b", "x2", "t2"));
         m.select_tab("c1");
         m.add_tab("p1", Tab::new("c3", "c", "x3", "t3"));
         let order: Vec<&str> = m.spaces[0].tabs.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(order, ["c1", "c3", "c2"]);
+        assert_eq!(order, ["c1", "c2", "c3"]);
         assert_eq!(m.active_tab().map(|c| c.id.as_str()), Some("c3"));
     }
 
@@ -1532,7 +1529,7 @@ mod tests {
         assert_eq!(moved_t2.as_deref(), Some("t2"));
         assert_eq!(m.pane_of("t2").as_deref(), Some("x2"));
         let tab_ids: Vec<_> = m.space("p1").unwrap().tabs.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(tab_ids, ["c1", new_x2_tab.as_str(), new_acp_tab.as_str()]);
+        assert_eq!(tab_ids, ["c1", new_acp_tab.as_str(), new_x2_tab.as_str()]);
         assert_eq!(m.tab("c1").unwrap().root.panes().len(), 1);
     }
 

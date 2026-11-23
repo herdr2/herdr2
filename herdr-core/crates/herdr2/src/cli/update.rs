@@ -21,11 +21,25 @@ pub(super) fn release_version(s: &str) -> Result<String, String> {
 }
 
 /// `h2 0.1.9` is older than `h2 0.2.0`; anything unparsed is not older.
+/// Tolerates optional build metadata suffixes such as `h2 0.2.0 (a1b2c3d 2026-11-23T08:15:00Z)`.
 pub(super) fn older(a: &str, b: &str) -> bool {
     let parts = |v: &str| -> Option<Vec<u64>> {
-        v.strip_prefix("h2 ")?.split(['.', '-']).take(3).map(|p| p.parse().ok()).collect()
+        let semver = v.strip_prefix("h2 ")?.split_whitespace().next()?;
+        semver.split(['.', '-']).take(3).map(|p| p.parse().ok()).collect()
     };
     matches!((parts(a), parts(b)), (Some(a), Some(b)) if a < b)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::older;
+
+    #[test]
+    fn older_handles_build_fingerprint_suffixes() {
+        assert!(older("h2 0.1.9", "h2 0.2.0 (a1b2c3d+dirty 2026-11-23T08:15:00Z)"));
+        assert!(!older("h2 0.2.0 (a1b2c3d 2026-11-23T08:15:00Z)", "h2 0.2.0"));
+        assert!(!older("h2 0.2.1 (abc)", "h2 0.2.0 (def)"));
+    }
 }
 
 /// The installed binary can be current while a core started before it was

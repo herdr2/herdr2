@@ -388,16 +388,10 @@ mod tests {
 
     #[test]
     fn only_the_exact_bundle_executable_has_a_bundle_root() {
-        assert_eq!(
-            bundle(Path::new("/share/Herdr2.app/Contents/MacOS/herdr2")),
-            Some(Path::new("/share/Herdr2.app"))
-        );
-        for path in [
-            "/bin/herdr2",
-            "/x.app/Contents/MacOS/herdr2",
-            "/x/Contents/MacOS/herdr2",
-            "/Herdr2.app/Contents/MacOS/h2",
-        ] {
+        assert_eq!(bundle(Path::new("/share/Herdr2.app/Contents/MacOS/herdr2")), Some(Path::new("/share/Herdr2.app")));
+        for path in
+            ["/bin/herdr2", "/x.app/Contents/MacOS/herdr2", "/x/Contents/MacOS/herdr2", "/Herdr2.app/Contents/MacOS/h2"]
+        {
             assert!(bundle(Path::new(path)).is_none(), "{path}");
         }
     }
@@ -425,11 +419,7 @@ mod tests {
 
     #[test]
     fn bundle_base_is_shared_by_active_retained_and_legacy_paths() {
-        for path in [
-            "/share/core/active/Herdr2.app",
-            "/share/core/versions/123/Herdr2.app",
-            "/share/core/Herdr2.app",
-        ] {
+        for path in ["/share/core/active/Herdr2.app", "/share/core/versions/123/Herdr2.app", "/share/core/Herdr2.app"] {
             assert_eq!(base_directory(Path::new(path)), Path::new("/share/core"));
         }
     }

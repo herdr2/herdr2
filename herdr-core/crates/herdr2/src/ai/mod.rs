@@ -26,17 +26,17 @@ pub use briefing::{
 pub use client::AiTestResult;
 pub use config::{
     AiCoreConfig, AiPaths, format_ms_iso, is_loopback_http_url, mask_key, normalize_ai_language,
-    now_iso, now_ms_u64, parse_ai_token_size, parse_iso_ms, prompt_lang_code,
+    normalize_prompt_mode, now_iso, now_ms_u64, parse_ai_token_size, parse_iso_ms, prompt_lang_code,
     read_app_settings_language, validate_http_url, write_secret_file,
 };
 pub use digest::{
-    AgentDigestResult, CommitMessageParams, CommitMessageResult, DeterministicDigest, PolishPromptParams,
-    PolishPromptResult, SummarizeAgentParams, build_deterministic_acp_digest, generate_commit_message,
-    polish_prompt, refine_agent_digest,
+    AgentDigestResult, CommitMessageParams, CommitMessageResult, DeterministicDigest, PolishContextInput,
+    PolishPromptParams, PolishPromptResult, PolishSessionContext, SummarizeAgentParams,
+    build_deterministic_acp_digest, build_polish_session_context, generate_commit_message, polish_prompt,
+    refine_agent_digest,
 };
 pub use handoff_ai::{
-    HandoffRecommendParams, HandoffRecommendResult, distill_merge_back, distill_omitted_turns,
-    recommend_handoff,
+    HandoffRecommendParams, HandoffRecommendResult, distill_merge_back, distill_omitted_turns, recommend_handoff,
 };
 pub use terminal_state::{ClassifyTerminalStateParams, ClassifyTerminalStateResult, classify_terminal_state};
 
@@ -44,21 +44,21 @@ use crate::paths::Paths;
 use crate::rpc::RpcError;
 use cache::AiResultCache;
 use client::{
-    EndpointCapabilities, build_chat_payload_candidates, chat_endpoints, curl_json_timeout,
-    effective_max_tokens, extract_json_object, fetch_ai_models, first_model_id, models_endpoints,
-    parse_usage_tokens, record_winning_variant, refine_capabilities_from_error,
+    EndpointCapabilities, KV_CACHE_DEGRADE_THRESHOLD, build_chat_payload_candidates, chat_endpoints,
+    curl_json_timeout, effective_max_tokens, extract_json_object, fetch_ai_models, first_model_id,
+    http_json_request, models_endpoints, parse_usage_tokens, record_winning_variant, refine_capabilities_from_error,
     should_retry_without_optional_fields, test_ai_connection, truncate_for_context,
 };
-use compact::{fingerprint_hex, fnv1a_64, strip_and_dedup_lines};
+use compact::{fingerprint_hex, fnv1a_64, redact_secrets, strip_and_dedup_lines};
 use config::{
-    PersistedAiModelsCache, clear_ai_key, load_config, load_models_cache, read_ai_key, save_config,
-    save_models_cache, write_ai_key,
+    PersistedAiModelsCache, clear_ai_key, load_config, load_endpoint_caps, load_models_cache, read_ai_key, save_config,
+    save_endpoint_caps, save_models_cache, write_ai_key,
 };
-use prompts::{HERDR2_CONTROL_PLANE_SYSTEM, compact_system_for_op, format_op_user_message};
+use prompts::{HERDR2_CONTROL_PLANE_SYSTEM, compact_system_for_op, format_op_user_message, op_expects_json};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use session::{AiSessionPool, ChatMessage, MAX_SESSION_TOKENS};
+use session::{AiSessionPool, ChatMessage, MAX_SESSION_TOKENS, build_seeded_stateless_messages};
 use std::collections::{BTreeMap, HashMap};
 use std::io;
 use std::sync::{Arc, Mutex};
@@ -66,14 +66,55 @@ use std::time::{Duration, Instant};
 
 const COOLDOWN_SECS: u64 = 300;
 const CIRCUIT_THRESHOLD: u32 = 3;
+const FG_CONCURRENCY_LIMIT: usize = 4;
 const BG_CONCURRENCY_LIMIT: usize = 3;
 
 #[derive(Default, Clone, Debug)]
 pub struct AiCircuitState {
     pub consecutive_failures: u32,
+    pub rate_limit_streak: u32,
     pub circuit_open: bool,
+    pub half_open_probe_in_flight: bool,
     pub cooldown_until: Option<String>,
     pub last_error: Option<String>,
+}
+
+struct CircuitProbeGuard<'a> {
+    rt: &'a AiRuntime,
+    is_probe: bool,
+    settled: bool,
+}
+
+impl<'a> CircuitProbeGuard<'a> {
+    fn settle(&mut self) {
+        self.settled = true;
+    }
+}
+
+impl Drop for CircuitProbeGuard<'_> {
+    fn drop(&mut self) {
+        if self.is_probe && !self.settled {
+            let mut cir = self.rt.circuit.lock().unwrap_or_else(|p| p.into_inner());
+            cir.half_open_probe_in_flight = false;
+        }
+    }
+}
+
+struct InflightGuard<'a> {
+    rt: &'a AiRuntime,
+    key: Option<String>,
+    notify: Option<Arc<tokio::sync::Notify>>,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.rt.inflight.lock().unwrap_or_else(|p| p.into_inner()).remove(&key);
+        }
+        if let Some(notify) = self.notify.take() {
+            notify.notify_waiters();
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -93,7 +134,9 @@ pub enum AiConversationMode {
     /// Reuses canonical static system prompt with no accumulated prior history (best for independent snapshots).
     #[default]
     StatelessSharedPrefix,
-    /// Appends onto an existing per-scope KV-cached conversation (`drove:run:<id>`, `drove:loop:<id>`).
+    /// Shares static system prompt + read-only pinned seed context with zero lock contention across concurrent calls.
+    SeededStateless { seed_context: String },
+    /// Appends onto an existing per-scope KV-cached conversation (`drove:loop:<attempt_id>`).
     Session { key: String, seed_context: Option<String> },
     /// Custom standalone system prompt (e.g. role architect or generic `ai.complete` RPC caller).
     CustomSystem(String),
@@ -152,6 +195,17 @@ pub struct AiCompleteResponse {
     pub session_reused: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AiOpMetrics {
+    pub calls: u64,
+    pub local_cache_hits: u64,
+    pub failures: u64,
+    pub parse_errors: u64,
+    pub low_confidence_rejects: u64,
+    pub total_latency_ms: u64,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AiUsageStats {
@@ -164,8 +218,33 @@ pub struct AiUsageStats {
     pub output_tokens: u64,
     /// `cached_input_tokens / input_tokens` in `0.0..=1.0`.
     pub cache_hit_ratio: f64,
+    /// True when the active endpoint repeatedly reported 0 cached input tokens and automatically fell back to compact prompts.
+    #[serde(default)]
+    pub prompt_cache_auto_degraded: bool,
+    /// Remembered auto-detected prompt mode for the active `(base_url, model)`: `"shared_prefix"`, `"compact"`, or `None` (pending/reset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_detected_mode: Option<String>,
+    /// Effective prompt mode currently applied for stateless control-plane ops (`"shared_prefix"` or `"compact"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_prompt_mode: Option<String>,
+    /// Number of consecutive >=1024-token shared-prefix probes without KV-cache hits so far.
+    #[serde(default)]
+    pub prompt_cache_probe_misses: u8,
+    /// Probe threshold before auto mode degrades to compact prompts.
+    #[serde(default)]
+    pub prompt_cache_probe_threshold: u8,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub by_op: BTreeMap<String, u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub op_metrics: BTreeMap<String, AiOpMetrics>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_prompt_mode() -> String {
+    "auto".into()
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -174,9 +253,13 @@ pub struct AiCoreSwitches {
     pub pty_status_arbitration: bool,
     pub notes_digest: bool,
     pub prompt_cache_enabled: bool,
+    #[serde(default = "default_prompt_mode")]
+    pub prompt_mode: String,
     pub handoff_distill: bool,
     pub checkpoint_labeling: bool,
     pub semantic_summary: bool,
+    #[serde(default = "default_true")]
+    pub redact_secrets: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -247,11 +330,33 @@ pub struct AiSettingsSetParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_cache_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reset_prompt_cache_detection: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_distill: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_labeling: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_summary: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub redact_secrets: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AiProbePromptModeResult {
+    pub ok: bool,
+    /// Detected prompt mode: `"shared_prefix"`, `"compact"`, or `"pending"`.
+    pub detected_mode: String,
+    pub probes_run: u8,
+    pub cached_input_tokens: u64,
+    pub input_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    pub status: AiStatus,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
@@ -310,10 +415,12 @@ pub struct AiRuntime {
     models_cache: Mutex<Vec<String>>,
     models_url: Mutex<String>,
     circuit: Mutex<AiCircuitState>,
-    endpoint_caps: Mutex<HashMap<String, EndpointCapabilities>>,
+    endpoint_caps: Mutex<BTreeMap<String, EndpointCapabilities>>,
     sessions: Arc<AiSessionPool>,
     result_cache: Arc<AiResultCache>,
+    inflight: Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
     usage: Mutex<AiUsageStats>,
+    fg_sem: Arc<tokio::sync::Semaphore>,
     bg_sem: Arc<tokio::sync::Semaphore>,
 }
 
@@ -338,6 +445,7 @@ impl AiRuntime {
         } else {
             String::new()
         };
+        let saved_caps: BTreeMap<String, EndpointCapabilities> = load_endpoint_caps(&ai_paths);
 
         Ok(Arc::new(Self {
             paths: ai_paths,
@@ -345,10 +453,12 @@ impl AiRuntime {
             models_cache: Mutex::new(models_cache),
             models_url: Mutex::new(models_url),
             circuit: Mutex::new(AiCircuitState::default()),
-            endpoint_caps: Mutex::new(HashMap::new()),
+            endpoint_caps: Mutex::new(saved_caps),
             sessions: Arc::new(AiSessionPool::default()),
             result_cache: Arc::new(AiResultCache::default()),
+            inflight: Mutex::new(HashMap::new()),
             usage: Mutex::new(AiUsageStats::default()),
+            fg_sem: Arc::new(tokio::sync::Semaphore::new(FG_CONCURRENCY_LIMIT)),
             bg_sem: Arc::new(tokio::sync::Semaphore::new(BG_CONCURRENCY_LIMIT)),
         }))
     }
@@ -386,7 +496,7 @@ impl AiRuntime {
     }
 
     pub fn is_circuit_open(&self) -> bool {
-        let mut cir = self.circuit.lock().unwrap_or_else(|p| p.into_inner());
+        let cir = self.circuit.lock().unwrap_or_else(|p| p.into_inner());
         if !cir.circuit_open {
             return false;
         }
@@ -394,30 +504,95 @@ impl AiRuntime {
             && let Some(until_ms) = parse_iso_ms(until)
             && now_ms_u64() >= until_ms
         {
-            cir.circuit_open = false;
-            cir.consecutive_failures = 0;
-            cir.cooldown_until = None;
+            // Cooldown elapsed: allow a single half-open probe unless one is already running.
+            if cir.half_open_probe_in_flight {
+                return true;
+            }
             return false;
         }
         true
     }
 
+    fn try_enter_circuit(&self) -> Result<CircuitProbeGuard<'_>, String> {
+        let mut cir = self.circuit.lock().unwrap_or_else(|p| p.into_inner());
+        if !cir.circuit_open {
+            return Ok(CircuitProbeGuard { rt: self, is_probe: false, settled: false });
+        }
+        if let Some(until) = &cir.cooldown_until
+            && let Some(until_ms) = parse_iso_ms(until)
+            && now_ms_u64() >= until_ms
+        {
+            if cir.half_open_probe_in_flight {
+                return Err("AI circuit breaker half-open probe in flight".into());
+            }
+            cir.half_open_probe_in_flight = true;
+            return Ok(CircuitProbeGuard { rt: self, is_probe: true, settled: false });
+        }
+        if cir.rate_limit_streak > 0 {
+            Err("AI rate limit backoff active".into())
+        } else {
+            Err("AI circuit breaker is open".into())
+        }
+    }
+
     pub fn record_success(&self) {
         let mut cir = self.circuit.lock().unwrap_or_else(|p| p.into_inner());
         cir.consecutive_failures = 0;
+        cir.rate_limit_streak = 0;
         cir.circuit_open = false;
+        cir.half_open_probe_in_flight = false;
         cir.cooldown_until = None;
         cir.last_error = None;
     }
 
     pub fn record_failure(&self, err: &str) {
         let mut cir = self.circuit.lock().unwrap_or_else(|p| p.into_inner());
+        let was_probe = cir.half_open_probe_in_flight;
+        cir.half_open_probe_in_flight = false;
         cir.consecutive_failures += 1;
         cir.last_error = Some(err.to_string());
-        if cir.consecutive_failures >= CIRCUIT_THRESHOLD {
+        if was_probe || cir.consecutive_failures >= CIRCUIT_THRESHOLD {
             cir.circuit_open = true;
             cir.cooldown_until = Some(format_ms_iso(now_ms_u64() + COOLDOWN_SECS * 1000));
         }
+    }
+
+    pub fn record_rate_limit(&self, retry_after_secs: Option<u64>, err: &str) {
+        let mut cir = self.circuit.lock().unwrap_or_else(|p| p.into_inner());
+        cir.half_open_probe_in_flight = false;
+        cir.rate_limit_streak = cir.rate_limit_streak.saturating_add(1);
+        cir.last_error = Some(err.to_string());
+        let backoff_secs = retry_after_secs.unwrap_or_else(|| match cir.rate_limit_streak {
+            1 => 10,
+            2 => 30,
+            _ => 60,
+        });
+        cir.circuit_open = true;
+        cir.cooldown_until = Some(format_ms_iso(now_ms_u64() + backoff_secs * 1000));
+    }
+
+    pub fn record_auth_failure(&self, err: &str) {
+        let mut cir = self.circuit.lock().unwrap_or_else(|p| p.into_inner());
+        cir.half_open_probe_in_flight = false;
+        cir.consecutive_failures = CIRCUIT_THRESHOLD;
+        cir.last_error = Some(err.to_string());
+        cir.circuit_open = true;
+        cir.cooldown_until = Some(format_ms_iso(now_ms_u64() + COOLDOWN_SECS * 1000));
+    }
+
+    pub fn record_op_failure(&self, op: &str) {
+        let mut u = self.usage.lock().unwrap_or_else(|p| p.into_inner());
+        u.op_metrics.entry(op.to_string()).or_default().failures += 1;
+    }
+
+    pub fn record_parse_error(&self, op: &str) {
+        let mut u = self.usage.lock().unwrap_or_else(|p| p.into_inner());
+        u.op_metrics.entry(op.to_string()).or_default().parse_errors += 1;
+    }
+
+    pub fn record_low_conf_reject(&self, op: &str) {
+        let mut u = self.usage.lock().unwrap_or_else(|p| p.into_inner());
+        u.op_metrics.entry(op.to_string()).or_default().low_confidence_rejects += 1;
     }
 
     pub fn update_models(&self, base_url: &str, models: Vec<String>) {
@@ -435,11 +610,7 @@ impl AiRuntime {
         *self.models_url.lock().unwrap_or_else(|p| p.into_inner()) = base_url.trim().to_string();
         save_models_cache(
             &self.paths,
-            &PersistedAiModelsCache {
-                updated_at: now_iso(),
-                base_url: base_url.trim().to_string(),
-                models: deduped,
-            },
+            &PersistedAiModelsCache { updated_at: now_iso(), base_url: base_url.trim().to_string(), models: deduped },
         );
     }
 
@@ -474,7 +645,10 @@ impl AiRuntime {
 
     /// Resolves prompt `lang` code with an optional per-request explicit override.
     pub fn resolve_prompt_lang(&self, explicit: Option<&str>) -> &'static str {
-        if let Some(raw) = explicit.map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto") && !s.eq_ignore_ascii_case("default")) {
+        if let Some(raw) = explicit
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto") && !s.eq_ignore_ascii_case("default"))
+        {
             return prompt_lang_code(raw);
         }
         self.preferred_prompt_lang()
@@ -501,6 +675,38 @@ impl AiRuntime {
         } else {
             0.0
         };
+        let active_base = cfg.base_url.trim().trim_end_matches('/');
+        let active_model = if !cfg.model.trim().is_empty() {
+            cfg.model.trim().to_string()
+        } else {
+            self.cached_models().into_iter().next().unwrap_or_default()
+        };
+        let resolved_prompt_mode = cfg.resolved_prompt_mode();
+        let active_caps = if !active_base.is_empty() && !active_model.is_empty() {
+            let cap_key = format!("{active_base}|{active_model}");
+            self.endpoint_caps
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&cap_key)
+                .copied()
+        } else {
+            None
+        };
+        let small_ctx = cfg.context_window.as_deref().and_then(parse_ai_token_size).is_some_and(|c| c <= 4096);
+        let caps_degraded = active_caps.is_some_and(|c| !c.prompt_cache_effective);
+        usage.prompt_cache_auto_degraded = resolved_prompt_mode == "auto" && caps_degraded;
+        usage.prompt_cache_detected_mode = active_caps.and_then(|c| c.detected_prompt_mode()).map(str::to_owned);
+        usage.prompt_cache_probe_misses = active_caps.map_or(0, |c| c.prefix_probes_without_cache);
+        usage.prompt_cache_probe_threshold = KV_CACHE_DEGRADE_THRESHOLD;
+        usage.effective_prompt_mode = Some(
+            match resolved_prompt_mode {
+                "shared_prefix" if !small_ctx => "shared_prefix",
+                "compact" => "compact",
+                _ if !small_ctx && !caps_degraded => "shared_prefix",
+                _ => "compact",
+            }
+            .into(),
+        );
         AiStatus {
             enabled: cfg.enabled,
             configured,
@@ -522,10 +728,12 @@ impl AiRuntime {
             switches: AiCoreSwitches {
                 pty_status_arbitration: cfg.pty_status_arbitration,
                 notes_digest: cfg.notes_digest,
-                prompt_cache_enabled: cfg.prompt_cache_enabled,
+                prompt_cache_enabled: resolved_prompt_mode != "compact",
+                prompt_mode: resolved_prompt_mode.into(),
                 handoff_distill: cfg.handoff_distill,
                 checkpoint_labeling: cfg.checkpoint_labeling,
                 semantic_summary: cfg.semantic_summary,
+                redact_secrets: cfg.redact_secrets,
             },
             usage,
         }
@@ -569,11 +777,8 @@ impl AiRuntime {
         }
         if let Some(s) = params.context_window {
             let clean = s.trim().to_ascii_lowercase();
-            next.context_window = if clean.is_empty() || clean == "auto" || clean == "default" {
-                None
-            } else {
-                Some(clean)
-            };
+            next.context_window =
+                if clean.is_empty() || clean == "auto" || clean == "default" { None } else { Some(clean) };
         }
         if let Some(n) = params.max_tokens {
             next.max_tokens = if n == 0 { None } else { Some(n) };
@@ -587,8 +792,14 @@ impl AiRuntime {
         if let Some(b) = params.notes_digest {
             next.notes_digest = b;
         }
-        if let Some(b) = params.prompt_cache_enabled {
+        let explicit_prompt_mode = params.prompt_mode.is_some();
+        if let Some(ref raw_pm) = params.prompt_mode {
+            let norm = normalize_prompt_mode(raw_pm)?;
+            next.prompt_cache_enabled = norm != "compact";
+            next.prompt_mode = Some(norm);
+        } else if let Some(b) = params.prompt_cache_enabled {
             next.prompt_cache_enabled = b;
+            next.prompt_mode = Some(if b { "auto" } else { "compact" }.into());
         }
         if let Some(b) = params.handoff_distill {
             next.handoff_distill = b;
@@ -598,6 +809,9 @@ impl AiRuntime {
         }
         if let Some(b) = params.semantic_summary {
             next.semantic_summary = b;
+        }
+        if let Some(b) = params.redact_secrets {
+            next.redact_secrets = b;
         }
 
         let mut key_changed = false;
@@ -609,9 +823,24 @@ impl AiRuntime {
             key_changed = true;
         }
 
+        let url_changed = next.base_url.trim() != prev.base_url.trim();
+        let model_changed = next.model.trim() != prev.model.trim();
+        // When the user switches model (without explicitly pinning a prompt mode in the same call),
+        // reset prompt_mode to "auto" so the runtime re-detects KV-cache support for the new model.
+        if model_changed && !explicit_prompt_mode {
+            next.prompt_mode = Some("auto".into());
+            next.prompt_cache_enabled = true;
+        }
+        let reset_detection = params.reset_prompt_cache_detection == Some(true);
+        if reset_detection && !explicit_prompt_mode {
+            next.prompt_mode = Some("auto".into());
+            next.prompt_cache_enabled = true;
+        }
+
+        let prompt_mode_changed = next.resolved_prompt_mode() != prev.resolved_prompt_mode();
         let cfg_changed = next.enabled != prev.enabled
-            || next.base_url.trim() != prev.base_url.trim()
-            || next.model.trim() != prev.model.trim()
+            || url_changed
+            || model_changed
             || next.effort.trim() != prev.effort.trim()
             || next.context_window != prev.context_window
             || next.max_tokens != prev.max_tokens
@@ -619,23 +848,35 @@ impl AiRuntime {
             || next.pty_status_arbitration != prev.pty_status_arbitration
             || next.notes_digest != prev.notes_digest
             || next.prompt_cache_enabled != prev.prompt_cache_enabled
+            || prompt_mode_changed
             || next.handoff_distill != prev.handoff_distill
             || next.checkpoint_labeling != prev.checkpoint_labeling
-            || next.semantic_summary != prev.semantic_summary;
-        if !cfg_changed && !key_changed {
+            || next.semantic_summary != prev.semantic_summary
+            || next.redact_secrets != prev.redact_secrets;
+        if !cfg_changed && !key_changed && !reset_detection {
             return Ok(self.status());
         }
 
-        save_config(&self.paths, &mut next)?;
-        let url_changed = next.base_url.trim() != prev.base_url.trim();
-        let model_changed = next.model.trim() != prev.model.trim();
+        if cfg_changed {
+            save_config(&self.paths, &mut next)?;
+            *self.config.lock().unwrap_or_else(|p| p.into_inner()) = next.clone();
+        }
         let lang_changed = next.language != prev.language;
-        *self.config.lock().unwrap_or_else(|p| p.into_inner()) = next.clone();
 
+        if url_changed || key_changed || model_changed || prompt_mode_changed || reset_detection {
+            let mut caps_map = self.endpoint_caps.lock().unwrap_or_else(|p| p.into_inner());
+            if url_changed || key_changed {
+                caps_map.clear();
+            } else {
+                for c in caps_map.values_mut() {
+                    c.reset_prompt_cache_detection();
+                }
+            }
+            save_endpoint_caps(&self.paths, &caps_map);
+        }
         if url_changed || key_changed {
             self.models_cache.lock().unwrap_or_else(|p| p.into_inner()).clear();
             self.models_url.lock().unwrap_or_else(|p| p.into_inner()).clear();
-            self.endpoint_caps.lock().unwrap_or_else(|p| p.into_inner()).clear();
             save_models_cache(&self.paths, &PersistedAiModelsCache::default());
             self.record_success();
         }
@@ -643,7 +884,9 @@ impl AiRuntime {
             || model_changed
             || key_changed
             || lang_changed
-            || next.prompt_cache_enabled != prev.prompt_cache_enabled
+            || prompt_mode_changed
+            || reset_detection
+            || next.redact_secrets != prev.redact_secrets
         {
             self.sessions.clear_all();
             self.result_cache.clear();
@@ -658,9 +901,7 @@ impl AiRuntime {
         model_override: Option<String>,
     ) -> Result<AiTestResult, RpcError> {
         let cfg = self.config_snapshot();
-        let base_url = url_override
-            .filter(|s| !s.trim().is_empty())
-            .unwrap_or(cfg.base_url);
+        let base_url = url_override.filter(|s| !s.trim().is_empty()).unwrap_or(cfg.base_url);
         if base_url.trim().is_empty() {
             return Err(RpcError::invalid_params("AI Service URL is empty"));
         }
@@ -682,32 +923,277 @@ impl AiRuntime {
             let mut cir = self.circuit.lock().unwrap_or_else(|p| p.into_inner());
             if res.ok {
                 cir.consecutive_failures = 0;
+                cir.rate_limit_streak = 0;
                 cir.circuit_open = false;
+                cir.half_open_probe_in_flight = false;
                 cir.cooldown_until = None;
                 cir.last_error = None;
             } else {
                 cir.last_error = res.error.clone();
             }
         }
+        if res.ok {
+            let mut caps_map = self.endpoint_caps.lock().unwrap_or_else(|p| p.into_inner());
+            for c in caps_map.values_mut() {
+                c.reset_prompt_cache_detection();
+            }
+            save_endpoint_caps(&self.paths, &caps_map);
+        }
         Ok(res)
     }
 
-    /// Non-blocking background completion guarded by a bounded concurrency semaphore.
+    /// Clears previous prompt-prefix detection records, ensures `prompt_mode = "auto"`, and
+    /// immediately executes up to 3 lightweight back-to-back probes against the active endpoint
+    /// to detect whether KV prefix caching is effective (`shared_prefix`) or ineffective (`compact`).
+    pub async fn probe_prompt_mode(&self) -> Result<AiProbePromptModeResult, RpcError> {
+        // 1. Ensure prompt_mode is "auto" and persist if changed.
+        let mut cfg = self.config_snapshot();
+        if cfg.resolved_prompt_mode() != "auto" || !cfg.prompt_cache_enabled {
+            cfg.prompt_mode = Some("auto".into());
+            cfg.prompt_cache_enabled = true;
+            save_config(&self.paths, &mut cfg)?;
+            *self.config.lock().unwrap_or_else(|p| p.into_inner()) = cfg.clone();
+        }
+
+        // 2. Clear prior detection records, sessions, and cached results.
+        {
+            let mut caps_map = self.endpoint_caps.lock().unwrap_or_else(|p| p.into_inner());
+            for c in caps_map.values_mut() {
+                c.reset_prompt_cache_detection();
+            }
+            save_endpoint_caps(&self.paths, &caps_map);
+        }
+        self.sessions.clear_all();
+        self.result_cache.clear();
+
+        let base = cfg.base_url.trim().trim_end_matches('/').to_string();
+        let (key, _) = read_ai_key(&self.paths);
+        let is_local = is_loopback_http_url(&base);
+        if !cfg.enabled || base.is_empty() || (key.is_none() && !is_local) {
+            return Ok(AiProbePromptModeResult {
+                ok: true,
+                detected_mode: "pending".into(),
+                probes_run: 0,
+                cached_input_tokens: 0,
+                input_tokens: 0,
+                model: (!cfg.model.trim().is_empty()).then(|| cfg.model.trim().to_string()),
+                reason: Some("AI endpoint is not configured; prior detection record cleared.".into()),
+                status: self.status(),
+            });
+        }
+
+        // 3. Context window <= 4096 cannot accommodate the >1024-token shared prefix safely.
+        let ctx_tokens = cfg.context_window.as_deref().and_then(parse_ai_token_size);
+        if ctx_tokens.is_some_and(|c| c <= 4096) {
+            let active_model = if !cfg.model.trim().is_empty() {
+                cfg.model.trim().to_string()
+            } else {
+                self.cached_models().into_iter().next().unwrap_or_default()
+            };
+            if !active_model.is_empty() {
+                let cap_key = format!("{base}|{active_model}");
+                let mut map = self.endpoint_caps.lock().unwrap_or_else(|p| p.into_inner());
+                let entry = map.entry(cap_key).or_insert_with(|| EndpointCapabilities::default_for_url(&base));
+                entry.mark_prompt_cache_ineffective();
+                save_endpoint_caps(&self.paths, &map);
+            }
+            return Ok(AiProbePromptModeResult {
+                ok: true,
+                detected_mode: "compact".into(),
+                probes_run: 0,
+                cached_input_tokens: 0,
+                input_tokens: 0,
+                model: (!active_model.is_empty()).then_some(active_model),
+                reason: Some("Context window <= 4096 tokens; compact prompts selected.".into()),
+                status: self.status(),
+            });
+        }
+
+        // 4. User explicitly requested re-detection; clear any transient cooldown so probe can run.
+        {
+            let mut cir = self.circuit.lock().unwrap_or_else(|p| p.into_inner());
+            cir.consecutive_failures = 0;
+            cir.rate_limit_streak = 0;
+            cir.circuit_open = false;
+            cir.half_open_probe_in_flight = false;
+            cir.cooldown_until = None;
+        }
+
+        // 5. Run up to 3 lightweight back-to-back shared-prefix probes (16 output tokens each).
+        let mut probes_run: u8 = 0;
+        let mut max_cached: u64 = 0;
+        let mut last_input: u64 = 0;
+        let mut last_model: Option<String> = None;
+        for attempt in 1..=3_u8 {
+            probes_run = attempt;
+            let user_prompt = format!(
+                r#"{{"op":"session_seed","lang":"en","data":{{"probe":"kv_cache_redetect","attempt":{attempt}}}}}"#
+            );
+            let res = self
+                .complete_fg(AiCompleteRequest {
+                    op: "session_seed".into(),
+                    tier: AiTaskTier::Nano,
+                    mode: AiConversationMode::StatelessSharedPrefix,
+                    user_prompt,
+                    max_tokens: 16,
+                    timeout: Duration::from_secs(12),
+                    cache_key: None,
+                    cache_ttl: None,
+                    prompt_cache_bucket: Some("cp".into()),
+                    ..Default::default()
+                })
+                .await;
+            match res {
+                Ok(resp) => {
+                    last_input = last_input.max(resp.usage.input_tokens);
+                    max_cached = max_cached.max(resp.usage.cached_input_tokens);
+                    if !resp.model.trim().is_empty() {
+                        last_model = Some(resp.model.clone());
+                    }
+                    if resp.usage.cached_input_tokens > 0 {
+                        return Ok(AiProbePromptModeResult {
+                            ok: true,
+                            detected_mode: "shared_prefix".into(),
+                            probes_run,
+                            cached_input_tokens: resp.usage.cached_input_tokens,
+                            input_tokens: resp.usage.input_tokens,
+                            model: last_model,
+                            reason: None,
+                            status: self.status(),
+                        });
+                    }
+                }
+                Err(err) => {
+                    return Ok(AiProbePromptModeResult {
+                        ok: false,
+                        detected_mode: "pending".into(),
+                        probes_run,
+                        cached_input_tokens: max_cached,
+                        input_tokens: last_input,
+                        model: last_model,
+                        reason: Some(err),
+                        status: self.status(),
+                    });
+                }
+            }
+        }
+
+        // All 3 consecutive identical-prefix probes returned 0 cached tokens.
+        if last_input >= 1024 {
+            let model_name = last_model.clone().unwrap_or_else(|| cfg.model.trim().to_string());
+            if !model_name.is_empty() {
+                let cap_key = format!("{base}|{model_name}");
+                let mut map = self.endpoint_caps.lock().unwrap_or_else(|p| p.into_inner());
+                let entry = map.entry(cap_key).or_insert_with(|| EndpointCapabilities::default_for_url(&base));
+                entry.mark_prompt_cache_ineffective();
+                save_endpoint_caps(&self.paths, &map);
+            }
+            return Ok(AiProbePromptModeResult {
+                ok: true,
+                detected_mode: "compact".into(),
+                probes_run,
+                cached_input_tokens: 0,
+                input_tokens: last_input,
+                model: last_model,
+                reason: Some("Endpoint returned 0 cached tokens across 3 consecutive shared-prefix probes.".into()),
+                status: self.status(),
+            });
+        }
+
+        Ok(AiProbePromptModeResult {
+            ok: true,
+            detected_mode: "pending".into(),
+            probes_run,
+            cached_input_tokens: 0,
+            input_tokens: last_input,
+            model: last_model,
+            reason: Some("Endpoint did not report prompt token usage; keeping auto mode.".into()),
+            status: self.status(),
+        })
+    }
+
+    fn try_cached(&self, op: &str, cache_key: Option<&str>) -> Option<AiCompleteResponse> {
+        let ck = cache_key?;
+        let cached = self.result_cache.get(ck)?;
+        self.record_local_cache_hit(op);
+        Some(AiCompleteResponse {
+            content: cached,
+            model: self.config_snapshot().model,
+            latency_ms: 0,
+            usage: AiUsage::default(),
+            from_local_cache: true,
+            session_reused: false,
+        })
+    }
+
+    /// Coalesces concurrent requests sharing the same `cache_key` (singleflight).
+    /// Returns `Ok(guard)` when this caller owns execution, or `Err(cached_resp)` if an
+    /// in-flight leader populated the cache while we waited.
+    async fn acquire_singleflight(
+        &self,
+        op: &str,
+        cache_key: Option<&str>,
+        timeout: Duration,
+    ) -> Result<InflightGuard<'_>, AiCompleteResponse> {
+        let Some(ck) = cache_key.filter(|s| !s.is_empty()) else {
+            return Ok(InflightGuard { rt: self, key: None, notify: None });
+        };
+        let deadline = Instant::now() + timeout.max(Duration::from_secs(1));
+        loop {
+            if let Some(hit) = self.try_cached(op, Some(ck)) {
+                return Err(hit);
+            }
+            let waiter = {
+                let mut map = self.inflight.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(existing) = map.get(ck) {
+                    Some(existing.clone())
+                } else {
+                    let notify = Arc::new(tokio::sync::Notify::new());
+                    map.insert(ck.to_string(), notify.clone());
+                    return Ok(InflightGuard { rt: self, key: Some(ck.to_string()), notify: Some(notify) });
+                }
+            };
+            if let Some(notify) = waiter {
+                let rem = deadline.saturating_duration_since(Instant::now());
+                if rem.is_zero() {
+                    return Ok(InflightGuard { rt: self, key: None, notify: None });
+                }
+                let _ = tokio::time::timeout(rem, notify.notified()).await;
+            }
+        }
+    }
+
+    /// Foreground interactive completion guarded by a dedicated queuing semaphore (`fg_sem`).
+    /// Never starved or silently dropped by background tasks; returns exact error strings.
+    pub async fn complete_fg(&self, req: AiCompleteRequest) -> Result<AiCompleteResponse, String> {
+        if let Some(hit) = self.try_cached(&req.op, req.cache_key.as_deref()) {
+            return Ok(hit);
+        }
+        let permit = tokio::time::timeout(req.timeout.max(Duration::from_secs(1)), self.fg_sem.clone().acquire_owned())
+            .await
+            .map_err(|_| "foreground AI queue timed out".to_string())?
+            .map_err(|_| "foreground AI semaphore closed".to_string())?;
+        let res = self.complete(req).await;
+        drop(permit);
+        res
+    }
+
+    /// Non-blocking background completion guarded by a bounded concurrency semaphore (`bg_sem`).
     /// Drops immediately (returns `None`) if background slots are saturated or circuit is open.
     pub async fn complete_bg(&self, req: AiCompleteRequest) -> Option<AiCompleteResponse> {
         // Check local cache BEFORE acquiring semaphore so 0-token hits never contend.
-        if let Some(ck) = req.cache_key.as_deref()
-            && let Some(cached) = self.result_cache.get(ck)
-        {
-            self.record_local_cache_hit(&req.op);
-            return Some(AiCompleteResponse {
-                content: cached,
-                model: self.config_snapshot().model,
-                latency_ms: 0,
-                usage: AiUsage::default(),
-                from_local_cache: true,
-                session_reused: false,
-            });
+        if let Some(hit) = self.try_cached(&req.op, req.cache_key.as_deref()) {
+            return Some(hit);
+        }
+        // If an identical request is already in-flight, wait for its cached result without burning a bg slot.
+        if let Some(ck) = req.cache_key.as_deref().filter(|s| !s.is_empty()) {
+            let existing = self.inflight.lock().unwrap_or_else(|p| p.into_inner()).get(ck).cloned();
+            if let Some(notify) = existing {
+                let _ = tokio::time::timeout(req.timeout.max(Duration::from_secs(1)), notify.notified()).await;
+                if let Some(hit) = self.try_cached(&req.op, Some(ck)) {
+                    return Some(hit);
+                }
+            }
         }
         let Ok(_permit) = self.bg_sem.clone().try_acquire_owned() else {
             return None;
@@ -716,54 +1202,35 @@ impl AiRuntime {
     }
 
     /// Executes an OpenAI-compatible chat completion with:
-    /// - Local zero-token LRU cache
-    /// - Shared byte-immutable system prefix (>1024 tokens) or append-only `AiSessionPool`
-    /// - Endpoint capability memory & `prompt_cache_key`
-    /// - Circuit breaker and cache-hit accounting
+    /// - Local zero-token LRU cache & singleflight deduplication
+    /// - Automatic secret redaction for outbound untrusted text
+    /// - Shared byte-immutable system prefix (>1024 tokens) with automatic KV-cache degradation
+    /// - Lock-free `SeededStateless` or append-only `AiSessionPool`
+    /// - Persistent endpoint capability memory (`response_format`, `enable_thinking`, `cache_control`, `prompt_cache_key`)
+    /// - Graded circuit breaker with Half-Open single-probe recovery & per-op observability
     pub async fn complete(&self, req: AiCompleteRequest) -> Result<AiCompleteResponse, String> {
         let started = Instant::now();
-        if let Some(ck) = req.cache_key.as_deref()
-            && let Some(cached) = self.result_cache.get(ck)
-        {
-            self.record_local_cache_hit(&req.op);
-            return Ok(AiCompleteResponse {
-                content: cached,
-                model: self.config_snapshot().model,
-                latency_ms: 0,
-                usage: AiUsage::default(),
-                from_local_cache: true,
-                session_reused: false,
-            });
-        }
+        let _inflight_guard = match self.acquire_singleflight(&req.op, req.cache_key.as_deref(), req.timeout).await {
+            Ok(g) => g,
+            Err(cached) => return Ok(cached),
+        };
 
         let cfg = self.config_snapshot();
         let has_override = req.url_override.as_deref().is_some_and(|s| !s.trim().is_empty());
         if !has_override && !cfg.enabled {
             return Err("AI assistant is disabled".into());
         }
-        if !has_override && self.is_circuit_open() {
-            return Err("AI circuit breaker is open".into());
-        }
+        let mut probe_guard = if !has_override { Some(self.try_enter_circuit()?) } else { None };
 
-        let raw_base = req
-            .url_override
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .unwrap_or(cfg.base_url.trim());
+        let raw_base =
+            req.url_override.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(cfg.base_url.trim());
         if raw_base.is_empty() {
             return Err("AI Service URL is not configured".into());
         }
         let base = validate_http_url(raw_base, "ai.baseUrl").map_err(|e| e.message)?;
 
         let (stored_key, _) = read_ai_key(&self.paths);
-        let key = req
-            .key_override
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-            .or(stored_key);
+        let key = req.key_override.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from).or(stored_key);
         if key.is_none() && !is_loopback_http_url(&base) {
             return Err("AI API key is not configured".into());
         }
@@ -782,7 +1249,8 @@ impl AiRuntime {
         }
         if model.is_empty() {
             for url in models_endpoints(&base) {
-                if let Ok((st, body)) = curl_json_timeout("GET", &url, key.as_deref(), None, client::AI_MODELS_TIMEOUT).await
+                if let Ok((st, body)) =
+                    curl_json_timeout("GET", &url, key.as_deref(), None, client::AI_MODELS_TIMEOUT).await
                     && (200..300).contains(&st)
                     && let Some(m) = first_model_id(&body)
                 {
@@ -792,13 +1260,33 @@ impl AiRuntime {
             }
         }
         if model.is_empty() {
+            if let Some(g) = probe_guard.as_mut() {
+                g.settle();
+            }
             self.record_failure("no model configured or discovered");
+            self.record_op_failure(&req.op);
             return Err("no model configured or discovered".into());
         }
 
+        let cap_key = format!("{base}|{model}");
+        let initial_caps = self
+            .endpoint_caps
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&cap_key)
+            .copied()
+            .unwrap_or_else(|| EndpointCapabilities::default_for_url(&base));
+        let mut caps = initial_caps;
+
+        let prompt_mode = cfg.resolved_prompt_mode();
         let ctx_tokens = cfg.context_window.as_deref().and_then(parse_ai_token_size);
         let small_ctx = ctx_tokens.is_some_and(|c| c <= 4096);
-        let use_shared_prefix = cfg.prompt_cache_enabled && !small_ctx;
+        let use_shared_prefix = match prompt_mode {
+            "shared_prefix" => !small_ctx,
+            "compact" => false,
+            _ => !small_ctx && caps.prompt_cache_effective,
+        };
+        let enable_session_cache = prompt_mode != "compact";
 
         let cfg_effort = cfg.effort.trim();
         let effective_effort = match req.tier {
@@ -815,30 +1303,26 @@ impl AiRuntime {
             },
         };
         let cap_strict = cfg.max_tokens.is_none() && matches!(req.tier, AiTaskTier::Nano | AiTaskTier::Fast);
-        let eff_max_tokens = effective_max_tokens(
-            req.max_tokens.max(32),
-            cfg.max_tokens,
-            effective_effort,
-            ctx_tokens,
-            cap_strict,
-        );
+        let eff_max_tokens =
+            effective_max_tokens(req.max_tokens.max(32), cfg.max_tokens, effective_effort, ctx_tokens, cap_strict);
         let temperature = match req.tier {
             AiTaskTier::Nano => 0.0,
             AiTaskTier::Fast => 0.1,
             AiTaskTier::Standard => 0.2,
         };
 
+        let raw_user = if cfg.redact_secrets { redact_secrets(&req.user_prompt) } else { req.user_prompt.clone() };
         let bounded_user = match ctx_tokens {
             Some(ctx) => {
                 let reserve = if use_shared_prefix { eff_max_tokens + 1800 } else { eff_max_tokens + 512 };
                 let input_budget_tokens = ctx.saturating_sub(reserve).max(512);
-                truncate_for_context(&req.user_prompt, (input_budget_tokens as usize).saturating_mul(3))
+                truncate_for_context(&raw_user, (input_budget_tokens as usize).saturating_mul(3))
             }
-            None => req.user_prompt.clone(),
+            None => raw_user,
         };
 
-        // Choose system prompt + conversation messages (holding per-scope session mutex if Session mode).
-        let (system_prompt, session_slot_opt, seed_ctx_opt, cache_bucket) = match &req.mode {
+        // Choose system prompt + conversation messages (holding per-scope session mutex ONLY for Session mode).
+        let (system_prompt, session_slot_opt, seed_ctx_opt, cache_bucket, used_canonical_prefix) = match &req.mode {
             AiConversationMode::StatelessSharedPrefix => {
                 let sys = if use_shared_prefix {
                     HERDR2_CONTROL_PLANE_SYSTEM.to_string()
@@ -846,7 +1330,17 @@ impl AiRuntime {
                     compact_system_for_op(&req.op).to_string()
                 };
                 let bucket = req.prompt_cache_bucket.clone().unwrap_or_else(|| "cp".into());
-                (sys, None, None, Some(format!("h2:{bucket}:v1")))
+                (sys, None, None, Some(format!("h2:{bucket}:v1")), use_shared_prefix)
+            }
+            AiConversationMode::SeededStateless { seed_context } => {
+                let sys = if use_shared_prefix {
+                    HERDR2_CONTROL_PLANE_SYSTEM.to_string()
+                } else {
+                    compact_system_for_op(&req.op).to_string()
+                };
+                let clean_seed = if cfg.redact_secrets { redact_secrets(seed_context) } else { seed_context.clone() };
+                let bucket = req.prompt_cache_bucket.clone().unwrap_or_else(|| "cp".into());
+                (sys, None, Some(clean_seed), Some(format!("h2:{bucket}:v1")), use_shared_prefix)
             }
             AiConversationMode::Session { key: scope_key, seed_context } => {
                 let sys = if use_shared_prefix {
@@ -854,61 +1348,40 @@ impl AiRuntime {
                 } else {
                     compact_system_for_op(&req.op).to_string()
                 };
-                let slot = cfg.prompt_cache_enabled.then(|| self.sessions.acquire_slot(scope_key));
+                let clean_seed =
+                    seed_context.as_ref().map(|s| if cfg.redact_secrets { redact_secrets(s) } else { s.clone() });
+                let slot = enable_session_cache.then(|| self.sessions.acquire_slot(scope_key));
                 let cache_id = format!("h2:s:{}", fingerprint_hex(&[scope_key]));
-                (sys, slot, seed_context.clone(), Some(cache_id))
+                (sys, slot, clean_seed, Some(cache_id), use_shared_prefix)
             }
             AiConversationMode::CustomSystem(custom) => {
                 let framed = format!(
                     "You are a pure text assistant with NO tools or shell access. \
                      Never emit <tool_use>, DSML, XML tool tags, or shell commands. {custom}"
                 );
-                (framed, None, None, None)
+                (framed, None, None, None, false)
             }
         };
 
         let system_hash = fnv1a_64(system_prompt.as_bytes());
-        let session_budget = ctx_tokens
-            .map(|c| (c / 3).clamp(2048, MAX_SESSION_TOKENS))
-            .unwrap_or(MAX_SESSION_TOKENS);
+        let session_budget = ctx_tokens.map(|c| (c / 3).clamp(2048, MAX_SESSION_TOKENS)).unwrap_or(MAX_SESSION_TOKENS);
 
-        // Hold per-scope session lock across prepare -> HTTP -> commit so concurrent calls on the
-        // SAME scope append cleanly without racing and breaking KV cache prefix order.
+        // Hold per-scope session lock across prepare -> HTTP -> commit ONLY for mutable Session mode.
         let mut session_guard = match &session_slot_opt {
             Some(slot) => Some(slot.lock().await),
             None => None,
         };
 
         let (messages, session_reused, fresh_base) = if let Some(st) = session_guard.as_deref_mut() {
-            st.prepare_turn(
-                &system_prompt,
-                system_hash,
-                &model,
-                session_budget,
-                seed_ctx_opt.as_deref(),
-                &bounded_user,
-            )
+            st.prepare_turn(&system_prompt, system_hash, &model, session_budget, seed_ctx_opt.as_deref(), &bounded_user)
+        } else if seed_ctx_opt.is_some() {
+            (build_seeded_stateless_messages(&system_prompt, seed_ctx_opt.as_deref(), &bounded_user), false, Vec::new())
         } else {
-            (
-                vec![ChatMessage::system(&system_prompt), ChatMessage::user(&bounded_user)],
-                false,
-                Vec::new(),
-            )
+            (vec![ChatMessage::system(&system_prompt), ChatMessage::user(&bounded_user)], false, Vec::new())
         };
 
-        let cap_key = format!("{base}|{model}");
-        let mut caps = self
-            .endpoint_caps
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(&cap_key)
-            .copied()
-            .unwrap_or_else(|| EndpointCapabilities::default_for_url(&base));
-
-        let prompt_cache_key = cfg
-            .prompt_cache_enabled
-            .then_some(cache_bucket.as_deref())
-            .flatten();
+        let prompt_cache_key = enable_session_cache.then_some(cache_bucket.as_deref()).flatten();
+        let expect_json = op_expects_json(&req.op);
         let candidates = build_chat_payload_candidates(
             &model,
             &messages,
@@ -917,6 +1390,7 @@ impl AiRuntime {
             ctx_tokens,
             temperature,
             prompt_cache_key,
+            expect_json,
             caps,
         );
 
@@ -924,59 +1398,75 @@ impl AiRuntime {
         for url in chat_endpoints(&base) {
             let mut resp = Err("no payload candidates".into());
             let mut winning_variant = None;
+            let mut fell_back = false;
             for (idx, variant) in candidates.iter().enumerate() {
                 if idx > 0
                     && ((variant.used_num_ctx && !caps.supports_num_ctx)
                         || (variant.used_cache_key && !caps.supports_prompt_cache_key)
+                        || (variant.used_cache_control && !caps.supports_cache_control)
+                        || (variant.used_json_object && !caps.supports_json_object)
+                        || (variant.used_enable_thinking && !caps.supports_enable_thinking)
                         || (variant.used_effort.is_some() && !caps.supports_reasoning_effort)
                         || (variant.used_effort.as_deref() == Some("none") && !caps.supports_effort_none)
                         || (variant.used_temperature && !caps.supports_temperature))
                 {
                     continue;
                 }
-                resp = curl_json_timeout("POST", &url, key.as_deref(), Some(&variant.body), req.timeout).await;
+                resp = http_json_request("POST", &url, key.as_deref(), Some(&variant.body), req.timeout).await;
                 let has_next = idx + 1 < candidates.len();
-                if let Ok((st, ref body)) = resp {
-                    if (200..300).contains(&st) {
+                if let Ok(ref http_resp) = resp {
+                    if (200..300).contains(&http_resp.status) {
                         winning_variant = Some(variant);
                         break;
                     }
-                    if has_next && should_retry_without_optional_fields(st, body) {
-                        refine_capabilities_from_error(&mut caps, variant, body);
+                    if has_next && should_retry_without_optional_fields(http_resp.status, &http_resp.body) {
+                        refine_capabilities_from_error(&mut caps, variant, &http_resp.body);
+                        fell_back = true;
                         continue;
                     }
                 }
                 break;
             }
-            if let Some(win) = winning_variant {
+            if let Some(win) = winning_variant
+                && fell_back
+            {
                 record_winning_variant(&mut caps, win);
-                self.endpoint_caps
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .insert(cap_key.clone(), caps);
             }
 
             match resp {
-                Ok((status, body)) if (200..300).contains(&status) => {
-                    let parsed: Value = serde_json::from_str(&body)
-                        .map_err(|e| format!("failed to parse AI JSON response: {e}"))?;
-                    let (in_tok, out_tok, cache_tok) = parse_usage_tokens(&parsed);
-                    let usage = AiUsage {
-                        input_tokens: in_tok,
-                        output_tokens: out_tok,
-                        cached_input_tokens: cache_tok,
+                Ok(http_resp) if (200..300).contains(&http_resp.status) => {
+                    let latency_ms = started.elapsed().as_millis() as u64;
+                    let parsed: Value = match serde_json::from_str(&http_resp.body) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            if let Some(g) = probe_guard.as_mut() {
+                                g.settle();
+                            }
+                            // Transport succeeded; malformed JSON is a content error, not a global outage.
+                            self.record_success();
+                            self.record_parse_error(&req.op);
+                            self.record_op_failure(&req.op);
+                            return Err(format!("failed to parse AI JSON response: {e}"));
+                        }
                     };
-                    let raw_content = parsed["choices"][0]["message"]["content"]
-                        .as_str()
-                        .map(str::trim)
-                        .unwrap_or("");
-                    if raw_content.is_empty()
-                        || raw_content.contains("<tool_use")
-                        || raw_content.contains("DSML")
+                    let (in_tok, out_tok, cache_tok) = parse_usage_tokens(&parsed);
+                    let usage =
+                        AiUsage { input_tokens: in_tok, output_tokens: out_tok, cached_input_tokens: cache_tok };
+                    if prompt_mode == "auto"
+                        && used_canonical_prefix
+                        && matches!(req.mode, AiConversationMode::StatelessSharedPrefix)
                     {
-                        let finish_reason = parsed["choices"][0]["finish_reason"]
-                            .as_str()
-                            .unwrap_or("");
+                        caps.record_shared_prefix_usage(in_tok, cache_tok);
+                    }
+                    if caps != initial_caps {
+                        let mut map = self.endpoint_caps.lock().unwrap_or_else(|p| p.into_inner());
+                        map.insert(cap_key.clone(), caps);
+                        save_endpoint_caps(&self.paths, &map);
+                    }
+
+                    let raw_content = parsed["choices"][0]["message"]["content"].as_str().map(str::trim).unwrap_or("");
+                    if raw_content.is_empty() || raw_content.contains("<tool_use") || raw_content.contains("DSML") {
+                        let finish_reason = parsed["choices"][0]["finish_reason"].as_str().unwrap_or("");
                         let reason = if raw_content.is_empty() {
                             if finish_reason == "length" {
                                 "empty assistant content (finish_reason=length)"
@@ -986,20 +1476,22 @@ impl AiRuntime {
                         } else {
                             "unexpected tool-call markup in content"
                         };
-                        self.record_failure(reason);
+                        if let Some(g) = probe_guard.as_mut() {
+                            g.settle();
+                        }
+                        // Content-only errors must NOT trip the global circuit breaker.
+                        self.record_success();
+                        self.record_op_failure(&req.op);
                         return Err(reason.into());
                     }
 
+                    if let Some(g) = probe_guard.as_mut() {
+                        g.settle();
+                    }
                     self.record_success();
-                    self.record_network_usage(&req.op, &usage, session_reused);
+                    self.record_network_usage(&req.op, &usage, session_reused, latency_ms);
                     if let Some(st) = session_guard.as_deref_mut() {
-                        st.commit_turn(
-                            system_hash,
-                            &model,
-                            fresh_base,
-                            bounded_user,
-                            raw_content.to_string(),
-                        );
+                        st.commit_turn(system_hash, &model, fresh_base, bounded_user, raw_content.to_string());
                     }
                     if let (Some(ck), Some(ttl)) = (req.cache_key, req.cache_ttl) {
                         self.result_cache.put(ck, raw_content.to_string(), ttl);
@@ -1007,22 +1499,36 @@ impl AiRuntime {
                     return Ok(AiCompleteResponse {
                         content: raw_content.to_string(),
                         model,
-                        latency_ms: started.elapsed().as_millis() as u64,
+                        latency_ms,
                         usage,
                         from_local_cache: false,
                         session_reused,
                     });
                 }
-                Ok((status, body)) => {
-                    let snippet: String = body.chars().take(160).collect();
+                Ok(http_resp) => {
+                    let status = http_resp.status;
+                    let snippet: String = http_resp.body.chars().take(160).collect();
                     last_err = format!("HTTP {status}: {snippet}");
-                    self.record_failure(&last_err);
+                    if let Some(g) = probe_guard.as_mut() {
+                        g.settle();
+                    }
+                    self.record_op_failure(&req.op);
                     if status == 401 || status == 403 {
+                        self.record_auth_failure(&last_err);
                         return Err(last_err);
                     }
+                    if status == 429 {
+                        self.record_rate_limit(http_resp.retry_after_secs, &last_err);
+                        return Err(last_err);
+                    }
+                    self.record_failure(&last_err);
                 }
                 Err(e) => {
                     last_err = e;
+                    if let Some(g) = probe_guard.as_mut() {
+                        g.settle();
+                    }
+                    self.record_op_failure(&req.op);
                     self.record_failure(&last_err);
                 }
             }
@@ -1049,10 +1555,8 @@ impl AiRuntime {
             return None;
         }
         let lang = self.preferred_prompt_lang();
-        let cache_key = format!(
-            "notes_digest:{lang}:{address}:{news_seq}:{}",
-            fingerprint_hex(&[status_label, &compact_tail])
-        );
+        let cache_key =
+            format!("notes_digest:{lang}:{address}:{news_seq}:{}", fingerprint_hex(&[status_label, &compact_tail]));
         let payload = json!({
             "address": address,
             "status": status_label,
@@ -1144,9 +1648,10 @@ impl AiRuntime {
         let mut u = self.usage.lock().unwrap_or_else(|p| p.into_inner());
         u.local_cache_hits += 1;
         *u.by_op.entry(op.to_string()).or_default() += 1;
+        u.op_metrics.entry(op.to_string()).or_default().local_cache_hits += 1;
     }
 
-    fn record_network_usage(&self, op: &str, usage: &AiUsage, session_reused: bool) {
+    fn record_network_usage(&self, op: &str, usage: &AiUsage, session_reused: bool, latency_ms: u64) {
         let mut u = self.usage.lock().unwrap_or_else(|p| p.into_inner());
         u.total_calls += 1;
         if session_reused {
@@ -1156,6 +1661,9 @@ impl AiRuntime {
         u.cached_input_tokens += usage.cached_input_tokens;
         u.output_tokens += usage.output_tokens;
         *u.by_op.entry(op.to_string()).or_default() += 1;
+        let m = u.op_metrics.entry(op.to_string()).or_default();
+        m.calls += 1;
+        m.total_latency_ms = m.total_latency_ms.saturating_add(latency_ms);
     }
 }
 
@@ -1165,9 +1673,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    async fn spawn_mock_openai(
-        responses: Vec<(u16, String)>,
-    ) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
+    async fn spawn_mock_openai(responses: Vec<(u16, String)>) -> (String, Arc<Mutex<Vec<serde_json::Value>>>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let captured = Arc::new(Mutex::new(Vec::new()));
@@ -1208,7 +1714,9 @@ mod tests {
                             break;
                         }
                     }
-                    let req_line = String::from_utf8_lossy(&buf[..buf.iter().position(|b| *b == b'\r').unwrap_or(buf.len())]).into_owned();
+                    let req_line =
+                        String::from_utf8_lossy(&buf[..buf.iter().position(|b| *b == b'\r').unwrap_or(buf.len())])
+                            .into_owned();
                     if req_line.starts_with("GET ") && req_line.contains("/models") {
                         let models_body = r#"{"data":[{"id":"test-fast-model"}]}"#;
                         let http = format!(
@@ -1224,11 +1732,10 @@ mod tests {
                             cap.lock().unwrap().push(val);
                         }
                     }
-                    let (status, resp_body) = q
-                        .lock()
-                        .unwrap()
-                        .pop_front()
-                        .unwrap_or_else(|| (200, r#"{"choices":[{"message":{"content":"{\"ok\":true}"}}]}"#.into()));
+                    let (status, resp_body) =
+                        q.lock().unwrap().pop_front().unwrap_or_else(|| {
+                            (200, r#"{"choices":[{"message":{"content":"{\"ok\":true}"}}]}"#.into())
+                        });
                     let status_text = if status == 200 { "OK" } else { "Bad Request" };
                     let http = format!(
                         "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
@@ -1459,26 +1966,354 @@ mod tests {
         assert_eq!(rt.preferred_prompt_lang(), "zh");
 
         // Explicit ai.settings.set overrides app settings.json.
-        rt.update_settings(AiSettingsSetParams {
-            language: Some("en".into()),
-            ..Default::default()
-        })
-        .await
-        .unwrap();
+        rt.update_settings(AiSettingsSetParams { language: Some("en".into()), ..Default::default() }).await.unwrap();
         assert_eq!(rt.preferred_language_tag(), "en");
         assert_eq!(rt.preferred_prompt_lang(), "en");
         assert_eq!(rt.status().language.as_deref(), Some("en"));
 
         // Switching to zh-CN updates status and prompt lang.
+        rt.update_settings(AiSettingsSetParams { language: Some("zh-CN".into()), ..Default::default() }).await.unwrap();
+        assert_eq!(rt.preferred_language_tag(), "zh-CN");
+        assert_eq!(rt.preferred_prompt_lang(), "zh");
+        assert_eq!(rt.status().language.as_deref(), Some("zh-CN"));
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn singleflight_redaction_graded_circuit_and_kv_cache_auto_degrade() {
+        let tmp = crate::test_tmp().join(format!("ai-hardening-{}", crate::platform::random_hex()));
+        let paths = Paths {
+            socket: tmp.join("core.sock"),
+            holder_socket: tmp.join("holder.sock"),
+            state: tmp.join("state"),
+            config: tmp.join("config/config.toml"),
+        };
+        paths.create_dirs().unwrap();
+
+        let mut responses: Vec<(u16, String)> = Vec::new();
+        // 1. Singleflight leader response (should only be hit ONCE despite 3 concurrent callers).
+        responses.push((
+            200,
+            r#"{"choices":[{"message":{"content":"{\"headline\":\"coalesced\"}"}}],"usage":{"prompt_tokens":1600,"completion_tokens":20,"prompt_tokens_details":{"cached_tokens":0}}}"#.into(),
+        ));
+        // 2..=4. Three content-only errors (empty assistant content) -> MUST NOT trip global circuit!
+        for _ in 0..3 {
+            responses.push((
+                200,
+                r#"{"choices":[{"message":{"content":""},"finish_reason":"length"}],"usage":{"prompt_tokens":1600,"completion_tokens":0,"prompt_tokens_details":{"cached_tokens":0}}}"#.into(),
+            ));
+        }
+        // 5. Next call still succeeds immediately (proving circuit stayed closed) and triggers 5th uncached large-prefix probe!
+        responses.push((
+            200,
+            r#"{"choices":[{"message":{"content":"{\"headline\":\"still-open\"}"}}],"usage":{"prompt_tokens":1600,"completion_tokens":12,"prompt_tokens_details":{"cached_tokens":0}}}"#.into(),
+        ));
+        // 6. After 5 consecutive uncached large-prefix calls, stateless op auto-degrades to compact prompt!
+        responses.push((
+            200,
+            r#"{"choices":[{"message":{"content":"{\"headline\":\"compact-now\"}"}}],"usage":{"prompt_tokens":120,"completion_tokens":12}}"#.into(),
+        ));
+        // 7. 429 rate limit sets short backoff (not 300s).
+        responses.push((429, r#"{"error":{"message":"rate limit exceeded"}}"#.into()));
+
+        let (url, captured) = spawn_mock_openai(responses).await;
+        let rt = AiRuntime::open(&paths).unwrap();
         rt.update_settings(AiSettingsSetParams {
-            language: Some("zh-CN".into()),
+            enabled: Some(true),
+            base_url: Some(url),
+            model: Some("test-model".into()),
             ..Default::default()
         })
         .await
         .unwrap();
-        assert_eq!(rt.preferred_language_tag(), "zh-CN");
-        assert_eq!(rt.preferred_prompt_lang(), "zh");
-        assert_eq!(rt.status().language.as_deref(), Some("zh-CN"));
+
+        // A. Singleflight + outbound secret redaction: 3 concurrent calls with identical cache_key -> 1 HTTP request.
+        let req_template = || {
+            AiCompleteRequest {
+            op: "catchup_briefing".into(),
+            tier: AiTaskTier::Nano,
+            mode: AiConversationMode::StatelessSharedPrefix,
+            user_prompt: "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.supersecret OPENAI_API_KEY=sk-proj-1234567890ABCDEFGHIJKLMNOP".into(),
+            max_tokens: 120,
+            cache_key: Some("sf:test:1".into()),
+            cache_ttl: Some(Duration::from_secs(60)),
+            ..Default::default()
+        }
+        };
+        let (a, b, c) = tokio::join!(
+            rt.complete_fg(req_template()),
+            rt.complete_fg(req_template()),
+            rt.complete_fg(req_template()),
+        );
+        assert_eq!(a.unwrap().content, r#"{"headline":"coalesced"}"#);
+        assert_eq!(b.unwrap().content, r#"{"headline":"coalesced"}"#);
+        assert_eq!(c.unwrap().content, r#"{"headline":"coalesced"}"#);
+        assert_eq!(captured.lock().unwrap().len(), 1);
+        let sent_user = captured.lock().unwrap()[0]["messages"][1]["content"].as_str().unwrap().to_string();
+        assert!(!sent_user.contains("eyJhbGci"));
+        assert!(!sent_user.contains("sk-proj-1234"));
+        assert!(sent_user.contains("<REDACTED>"));
+
+        // B. Three content-only errors do NOT trip the global circuit breaker.
+        for i in 0..3 {
+            let err = rt
+                .complete_fg(AiCompleteRequest {
+                    op: "catchup_briefing".into(),
+                    tier: AiTaskTier::Nano,
+                    mode: AiConversationMode::StatelessSharedPrefix,
+                    user_prompt: format!("empty-{i}"),
+                    max_tokens: 64,
+                    ..Default::default()
+                })
+                .await
+                .unwrap_err();
+            assert!(err.contains("empty assistant content"));
+            assert!(!rt.is_circuit_open(), "content-only error must not open circuit");
+        }
+
+        // C. 5th uncached large-prefix call succeeds and marks endpoint cache degraded.
+        let ok5 = rt
+            .complete_fg(AiCompleteRequest {
+                op: "catchup_briefing".into(),
+                tier: AiTaskTier::Nano,
+                mode: AiConversationMode::StatelessSharedPrefix,
+                user_prompt: "probe-5".into(),
+                max_tokens: 64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(ok5.content, r#"{"headline":"still-open"}"#);
+        assert!(rt.status().usage.prompt_cache_auto_degraded);
+
+        // D. 6th call automatically switches to short compact prompt (< 300 chars vs > 4000 chars).
+        let ok6 = rt
+            .complete_fg(AiCompleteRequest {
+                op: "catchup_briefing".into(),
+                tier: AiTaskTier::Nano,
+                mode: AiConversationMode::StatelessSharedPrefix,
+                user_prompt: "probe-6".into(),
+                max_tokens: 64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(ok6.content, r#"{"headline":"compact-now"}"#);
+        {
+            let reqs = captured.lock().unwrap();
+            let sys_first = reqs[0]["messages"][0]["content"].as_str().unwrap();
+            let sys_sixth = reqs[5]["messages"][0]["content"].as_str().unwrap();
+            assert!(sys_first.len() > 4000);
+            assert!(sys_sixth.len() < 400, "expected auto-degraded compact system prompt, got len {}", sys_sixth.len());
+        }
+
+        // E. 429 triggers short rate-limit backoff (< 30s), NOT 300s circuit lock.
+        let err429 = rt
+            .complete_fg(AiCompleteRequest {
+                op: "catchup_briefing".into(),
+                tier: AiTaskTier::Nano,
+                mode: AiConversationMode::StatelessSharedPrefix,
+                user_prompt: "probe-429".into(),
+                max_tokens: 64,
+                ..Default::default()
+            })
+            .await
+            .unwrap_err();
+        assert!(err429.contains("429"));
+        let st = rt.status();
+        assert!(st.circuit_open);
+        let until_ms = parse_iso_ms(st.cooldown_until.as_deref().unwrap()).unwrap();
+        assert!(until_ms.saturating_sub(now_ms_u64()) <= 20_000, "429 should use short backoff, not 300s");
+        assert!(st.usage.op_metrics.get("catchup_briefing").is_some_and(|m| m.calls >= 3 && m.failures >= 4));
+
+        // F. Endpoint capability persistence survives restart.
+        let rt2 = AiRuntime::open(&paths).unwrap();
+        assert!(rt2.status().usage.prompt_cache_auto_degraded);
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn seeded_stateless_calls_run_concurrently_without_blocking() {
+        let tmp = crate::test_tmp().join(format!("ai-seeded-{}", crate::platform::random_hex()));
+        let paths = Paths {
+            socket: tmp.join("core.sock"),
+            holder_socket: tmp.join("holder.sock"),
+            state: tmp.join("state"),
+            config: tmp.join("config/config.toml"),
+        };
+        paths.create_dirs().unwrap();
+
+        let (url, captured) = spawn_mock_openai(vec![
+            (200, r#"{"choices":[{"message":{"content":"{\"conflict\":false,\"confidence\":0.9,\"reason\":\"disjoint\"}"}}]}"#.into()),
+            (200, r#"{"choices":[{"message":{"content":"{\"index\":0,\"reason\":\"best\"}"}}]}"#.into()),
+        ])
+        .await;
+        let rt = AiRuntime::open(&paths).unwrap();
+        rt.update_settings(AiSettingsSetParams {
+            enabled: Some(true),
+            base_url: Some(url),
+            model: Some("test-model".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let (r1, r2) = tokio::join!(
+            rt.complete(AiCompleteRequest {
+                op: "write_conflict".into(),
+                tier: AiTaskTier::Nano,
+                mode: AiConversationMode::SeededStateless { seed_context: "run objective".into() },
+                user_prompt: "check conflict".into(),
+                max_tokens: 96,
+                ..Default::default()
+            }),
+            rt.complete(AiCompleteRequest {
+                op: "route_candidate".into(),
+                tier: AiTaskTier::Nano,
+                mode: AiConversationMode::SeededStateless { seed_context: "run objective".into() },
+                user_prompt: "pick role".into(),
+                max_tokens: 96,
+                ..Default::default()
+            }),
+        );
+        assert!(r1.is_ok() && r2.is_ok());
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 2);
+        // Both share identical 3-message prefix (system + session_seed + ack) and stay 4 messages total.
+        let m0 = reqs[0]["messages"].as_array().unwrap();
+        let m1 = reqs[1]["messages"].as_array().unwrap();
+        assert_eq!(m0.len(), 4);
+        assert_eq!(m1.len(), 4);
+        assert_eq!(&m0[0..3], &m1[0..3]);
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn prompt_mode_options_model_switch_reset_and_probe_redetect() {
+        let tmp = crate::test_tmp().join(format!("ai-prompt-mode-{}", crate::platform::random_hex()));
+        let paths = Paths {
+            socket: tmp.join("core.sock"),
+            holder_socket: tmp.join("holder.sock"),
+            state: tmp.join("state"),
+            config: tmp.join("config/config.toml"),
+        };
+        paths.create_dirs().unwrap();
+
+        let (url, captured) = spawn_mock_openai(vec![
+            // 1. Forced compact mode -> short system prompt (< 400 chars)
+            (200, r#"{"choices":[{"message":{"content":"{\"headline\":\"c1\"}"}}],"usage":{"prompt_tokens":120,"completion_tokens":10}}"#.into()),
+            // 2-7. Forced shared_prefix mode: 6 consecutive 0-cache calls must NOT auto-degrade
+            (200, r#"{"choices":[{"message":{"content":"{\"headline\":\"s1\"}"}}],"usage":{"prompt_tokens":1800,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":0}}}"#.into()),
+            (200, r#"{"choices":[{"message":{"content":"{\"headline\":\"s2\"}"}}],"usage":{"prompt_tokens":1800,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":0}}}"#.into()),
+            (200, r#"{"choices":[{"message":{"content":"{\"headline\":\"s3\"}"}}],"usage":{"prompt_tokens":1800,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":0}}}"#.into()),
+            (200, r#"{"choices":[{"message":{"content":"{\"headline\":\"s4\"}"}}],"usage":{"prompt_tokens":1800,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":0}}}"#.into()),
+            (200, r#"{"choices":[{"message":{"content":"{\"headline\":\"s5\"}"}}],"usage":{"prompt_tokens":1800,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":0}}}"#.into()),
+            (200, r#"{"choices":[{"message":{"content":"{\"headline\":\"s6\"}"}}],"usage":{"prompt_tokens":1800,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":0}}}"#.into()),
+            // 8-10. probe_prompt_mode #1: 3 consecutive 0-cache probes -> detects "compact"
+            (200, r#"{"choices":[{"message":{"content":"{\"ack\":true}"}}],"usage":{"prompt_tokens":1700,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":0}}}"#.into()),
+            (200, r#"{"choices":[{"message":{"content":"{\"ack\":true}"}}],"usage":{"prompt_tokens":1700,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":0}}}"#.into()),
+            (200, r#"{"choices":[{"message":{"content":"{\"ack\":true}"}}],"usage":{"prompt_tokens":1700,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":0}}}"#.into()),
+            // 11-12. probe_prompt_mode #2: probe 1 warms, probe 2 hits KV cache -> detects "shared_prefix"
+            (200, r#"{"choices":[{"message":{"content":"{\"ack\":true}"}}],"usage":{"prompt_tokens":1700,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":0}}}"#.into()),
+            (200, r#"{"choices":[{"message":{"content":"{\"ack\":true}"}}],"usage":{"prompt_tokens":1700,"completion_tokens":4,"prompt_tokens_details":{"cached_tokens":1400}}}"#.into()),
+        ])
+        .await;
+
+        let rt = AiRuntime::open(&paths).unwrap();
+        // A. Set explicit "compact" mode
+        let st = rt
+            .update_settings(AiSettingsSetParams {
+                enabled: Some(true),
+                base_url: Some(url),
+                model: Some("model-a".into()),
+                prompt_mode: Some("compact".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(st.switches.prompt_mode, "compact");
+        assert!(!st.switches.prompt_cache_enabled);
+        assert_eq!(st.usage.effective_prompt_mode.as_deref(), Some("compact"));
+
+        rt.complete_fg(AiCompleteRequest {
+            op: "catchup_briefing".into(),
+            tier: AiTaskTier::Nano,
+            mode: AiConversationMode::StatelessSharedPrefix,
+            user_prompt: "compact-check".into(),
+            max_tokens: 64,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        {
+            let reqs = captured.lock().unwrap();
+            assert!(reqs[0]["messages"][0]["content"].as_str().unwrap().len() < 400);
+            assert!(reqs[0].get("prompt_cache_key").is_none());
+        }
+
+        // B. Switch to explicit "shared_prefix" -> stays long prefix even after 6 zero-cache calls
+        let st = rt
+            .update_settings(AiSettingsSetParams {
+                prompt_mode: Some("shared_prefix".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(st.switches.prompt_mode, "shared_prefix");
+        assert!(st.switches.prompt_cache_enabled);
+        for i in 0..6 {
+            rt.complete_fg(AiCompleteRequest {
+                op: "catchup_briefing".into(),
+                tier: AiTaskTier::Nano,
+                mode: AiConversationMode::StatelessSharedPrefix,
+                user_prompt: format!("shared-{i}"),
+                max_tokens: 64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        {
+            let reqs = captured.lock().unwrap();
+            assert!(reqs[6]["messages"][0]["content"].as_str().unwrap().len() > 4000);
+        }
+        assert!(!rt.status().usage.prompt_cache_auto_degraded);
+
+        // C. Switching model automatically resets prompt_mode to "auto" and clears detection records
+        let st_switched = rt
+            .update_settings(AiSettingsSetParams {
+                model: Some("model-b".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(st_switched.model, "model-b");
+        assert_eq!(st_switched.switches.prompt_mode, "auto");
+        assert!(st_switched.switches.prompt_cache_enabled);
+        assert_eq!(st_switched.usage.prompt_cache_detected_mode, None);
+        assert!(!st_switched.usage.prompt_cache_auto_degraded);
+
+        // D. Active probe detects "compact" when 3 consecutive probes get 0 cached tokens
+        let probe1 = rt.probe_prompt_mode().await.unwrap();
+        assert!(probe1.ok);
+        assert_eq!(probe1.detected_mode, "compact");
+        assert_eq!(probe1.probes_run, 3);
+        assert!(probe1.status.usage.prompt_cache_auto_degraded);
+        assert_eq!(probe1.status.usage.prompt_cache_detected_mode.as_deref(), Some("compact"));
+        assert_eq!(probe1.status.usage.effective_prompt_mode.as_deref(), Some("compact"));
+
+        // E. Re-detect clears prior "compact" detection and detects "shared_prefix" when cache hits
+        let probe2 = rt.probe_prompt_mode().await.unwrap();
+        assert!(probe2.ok);
+        assert_eq!(probe2.detected_mode, "shared_prefix");
+        assert_eq!(probe2.probes_run, 2);
+        assert_eq!(probe2.cached_input_tokens, 1400);
+        assert!(!probe2.status.usage.prompt_cache_auto_degraded);
+        assert_eq!(probe2.status.usage.prompt_cache_detected_mode.as_deref(), Some("shared_prefix"));
+        assert_eq!(probe2.status.usage.effective_prompt_mode.as_deref(), Some("shared_prefix"));
 
         let _ = std::fs::remove_dir_all(tmp);
     }

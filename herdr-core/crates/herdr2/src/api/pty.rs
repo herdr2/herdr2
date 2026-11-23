@@ -167,11 +167,7 @@ pub(super) async fn terminal_rm(core: Ctx<'_>, p: TerminalParams) -> Result<Remo
         }
         let wt = st.pty_reg.terminals.get(&id).and_then(|t| {
             let lin = t.lineage.as_ref()?;
-            Some((
-                lin.worktree_origin.clone()?,
-                lin.worktree_path.clone()?,
-                lin.worktree_branch.clone(),
-            ))
+            Some((lin.worktree_origin.clone()?, lin.worktree_path.clone()?, lin.worktree_branch.clone()))
         });
         core.pty_remove(&mut st, id);
         wt
@@ -221,15 +217,13 @@ pub(super) async fn terminal_label(core: Ctx<'_>, p: TerminalLabelParams) -> Res
         core.save_pty(&st);
         let labels = serde_json::to_value(&st.pty_reg.terminals[&id].labels).unwrap_or_default();
         core.emit_pty_from(&mut st, "labels", id, json!({"labels": labels}), was.as_ref());
-        st.pty_reg.terminals[&id]
-            .labels
-            .get("herdr.trashed")
-            .is_some_and(|s| !s.is_empty())
+        st.pty_reg.terminals[&id].labels.get("herdr.trashed").is_some_and(|s| !s.is_empty())
     };
     if trashed {
-        let _ = core.drove.pool_tx.send(crate::drove::pool::PoolSignal::SessionClosed {
-            address: crate::terminals::address(id),
-        });
+        let _ = core
+            .drove
+            .pool_tx
+            .send(crate::drove::pool::PoolSignal::SessionClosed { address: crate::terminals::address(id) });
     }
     let result = record_pty(core, id).map(TerminalPublic);
     core.flush_saved().await?;
@@ -343,12 +337,16 @@ pub(super) async fn terminal_send(core: Ctx<'_>, p: TerminalSendParams) -> Resul
         let mut st = core.lock();
         match caller_key {
             TargetKey::Agent(child) => {
-                if let Some(c) = st.reg.agents.get_mut(&child).filter(|c| c.parent.as_deref() == Some(target_addr.as_str())) {
+                if let Some(c) =
+                    st.reg.agents.get_mut(&child).filter(|c| c.parent.as_deref() == Some(target_addr.as_str()))
+                {
                     c.told_parent = true;
                 }
             }
             TargetKey::Terminal(child) => {
-                if let Some(c) = st.pty_reg.terminals.get_mut(&child).filter(|c| c.parent.as_deref() == Some(target_addr.as_str())) {
+                if let Some(c) =
+                    st.pty_reg.terminals.get_mut(&child).filter(|c| c.parent.as_deref() == Some(target_addr.as_str()))
+                {
                     c.told_parent = true;
                 }
             }
@@ -428,7 +426,10 @@ pub(super) async fn terminal_keys(core: Ctx<'_>, p: KeysParams) -> Result<KeysRe
     Ok(KeysResult { status, turn })
 }
 
-pub(super) async fn terminal_interrupt(core: Ctx<'_>, p: TerminalInterruptParams) -> Result<TerminalInterruptResult, RpcError> {
+pub(super) async fn terminal_interrupt(
+    core: Ctx<'_>,
+    p: TerminalInterruptParams,
+) -> Result<TerminalInterruptResult, RpcError> {
     use crate::pty_input::Interrupted;
     let timeout = seconds(p.timeout)?.unwrap_or(Duration::from_secs(10));
     let id = resolve_pty(core, &p.terminal)?;
@@ -482,9 +483,7 @@ async fn start_pty(
             Some(TargetKey::Terminal(id)) if core.lock().pty_reg.terminals.contains_key(&id) => {
                 Some(crate::terminals::address(id))
             }
-            Some(TargetKey::Agent(id)) if core.lock().reg.agents.contains_key(&id) => {
-                Some(crate::agents::address(id))
-            }
+            Some(TargetKey::Agent(id)) if core.lock().reg.agents.contains_key(&id) => Some(crate::agents::address(id)),
             _ => None,
         },
         _ => None,
@@ -537,17 +536,12 @@ async fn start_pty(
         st.screens.insert(id, screen);
         let (mut env, scope) = terminal_env(core, id, &cwd, env);
         if let Some(dark) = p.display.as_ref().and_then(|d| d.is_dark()) {
-            env.entry("COLORFGBG".into())
-                .or_insert_with(|| if dark { "15;0".into() } else { "0;15".into() });
+            env.entry("COLORFGBG".into()).or_insert_with(|| if dark { "15;0".into() } else { "0;15".into() });
         }
         let mut argv = p.argv;
         let prep = crate::pty_adapters::prepare_pty_launch(core, id, &mut argv, &mut env);
-        let initial_saved_cli = crate::pty_adapters::extract_saved_cli_from_argv(
-            &argv,
-            None,
-            prep.session_id.clone(),
-            None,
-        );
+        let initial_saved_cli =
+            crate::pty_adapters::extract_saved_cli_from_argv(&argv, None, prep.session_id.clone(), None);
         let addr = st.pty_reg.terminals[&id].address.clone();
         let mut tc = core.target_checkpoints(&mut st, &addr);
         tc.cli_kind = Some(prep.kind.as_str().into());
@@ -638,8 +632,7 @@ pub(crate) fn pty_child_env(
     let mut env: BTreeMap<String, String> = base
         .into_iter()
         .filter(|(k, _)| {
-            !IDENTITY_VARS.contains(&k.as_str())
-                && ![crate::sweep::VAR, crate::sweep::RUNTIME].contains(&k.as_str())
+            !IDENTITY_VARS.contains(&k.as_str()) && ![crate::sweep::VAR, crate::sweep::RUNTIME].contains(&k.as_str())
         })
         .collect();
     env.insert("TERM".into(), "xterm-256color".into());

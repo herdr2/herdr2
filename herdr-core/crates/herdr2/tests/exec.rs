@@ -108,7 +108,8 @@ fn exec_ends_everything_it_started_when_it_exits_or_times_out() {
     gone(pid_in(&s, "left"));
     assert!(start.elapsed() < Duration::from_secs(8), "a helper holding its output doesn't keep it waiting");
 
-    let out = s.h2(&["exec", "--timeout", "1", "sh", "-c", &format!("{} echo started; sleep 100", stubborn(&s, "slow"))]);
+    let out =
+        s.h2(&["exec", "--timeout", "1", "sh", "-c", &format!("{} echo started; sleep 100", stubborn(&s, "slow"))]);
     assert_eq!((out.stdout.as_slice(), out.status.code()), (&b"started\n"[..], Some(124)), "what came so far");
     gone(pid_in(&s, "slow"));
 }

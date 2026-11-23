@@ -244,9 +244,7 @@ while :; do sleep 1; done\n",
 
     // Wait for initial fake `claude` launch to record its injected `--session-id` and create the JSONL file.
     wait_until("initial claude session recorded", || {
-        std::fs::read_to_string(&log_file)
-            .ok()
-            .is_some_and(|txt| txt.contains("--session-id"))
+        std::fs::read_to_string(&log_file).ok().is_some_and(|txt| txt.contains("--session-id"))
     });
     let first_line = std::fs::read_to_string(&log_file).unwrap().lines().next().unwrap().to_owned();
     let tokens: Vec<&str> = first_line.split_whitespace().collect();

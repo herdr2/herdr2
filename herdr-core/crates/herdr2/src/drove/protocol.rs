@@ -53,8 +53,12 @@ pub fn build_task_prompt_with_handover(
     }
 
     let access_note = match role_cfg.access.unwrap_or(RoleAccessMode::Writable) {
-        RoleAccessMode::Readonly => "Access mode: READONLY. Do NOT create, modify, or delete any tracked or untracked workspace files.",
-        RoleAccessMode::ScopedWrite => "Access mode: SCOPED_WRITE. Only edit files matching the configured allowedPaths.",
+        RoleAccessMode::Readonly => {
+            "Access mode: READONLY. Do NOT create, modify, or delete any tracked or untracked workspace files."
+        }
+        RoleAccessMode::ScopedWrite => {
+            "Access mode: SCOPED_WRITE. Only edit files matching the configured allowedPaths."
+        }
         RoleAccessMode::Writable => "Access mode: WRITABLE. Workspace edits are permitted within task ownership.",
     };
     sections.push(access_note.to_string());
@@ -83,11 +87,8 @@ pub fn build_task_prompt_with_handover(
         let mut dep_lines = Vec::new();
         for d in dep_tasks {
             if let Some(res) = &d.result {
-                let summary_txt = res
-                    .compact_summary
-                    .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or(&res.summary);
+                let summary_txt =
+                    res.compact_summary.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or(&res.summary);
                 dep_lines.push(format!("- `{}` ({:?}): {}", d.key, d.status, summary_txt));
                 if let Some(files) = &res.files_modified
                     && !files.is_empty()
@@ -125,10 +126,8 @@ pub fn build_task_prompt_with_handover(
 
     if let Some(prior) = prior_handover {
         let model_label = prior.model.as_deref().unwrap_or("default");
-        let mut lines = vec![format!(
-            "- Previous attempt: `{}` (`{}` / `{model_label}`)",
-            prior.attempt_id, prior.agent
-        )];
+        let mut lines =
+            vec![format!("- Previous attempt: `{}` (`{}` / `{model_label}`)", prior.attempt_id, prior.agent)];
         if let Some(reason) = prior.failure_reason.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             lines.push(format!("- Failure reason: {reason}"));
         }
@@ -351,6 +350,7 @@ mod tests {
                 fast: false,
                 context: None,
                 strengths: Vec::new(),
+                note: None,
             },
             fallbacks: Vec::new(),
             prompt: None,

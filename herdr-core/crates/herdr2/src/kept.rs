@@ -8,8 +8,8 @@ use crate::runtime::{Core, Exit, now_ms};
 use crate::status::StatusReport;
 use crate::terminals::{KEEP_RETRY_MS as PTY_KEEP_RETRY_MS, SavedCliResume, Terminal};
 use std::io::{self, Write};
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 
 /// Limits simultaneous ACP session handshakes during mass recovery after reboot.
 const MAX_CONCURRENT_ACP_RECOVERIES: usize = 4;
@@ -45,7 +45,8 @@ impl Agent {
 
 impl Terminal {
     pub(crate) fn schedule_restart(&mut self, now: u64) {
-        self.restart_delay_ms = next_retry_delay(self.restart_delay_ms, PTY_KEEP_RETRY_MS, self.program_started_ms, now);
+        self.restart_delay_ms =
+            next_retry_delay(self.restart_delay_ms, PTY_KEEP_RETRY_MS, self.program_started_ms, now);
         self.restart_after_ms = now + self.restart_delay_ms;
         self.program_started_ms = None;
     }
@@ -256,14 +257,15 @@ impl Core {
                                 a.reported = true;
                             }
                             core.apply_status(&mut st, id, &StatusReport::root("idle"));
-                            let public =
-                                serde_json::to_value(crate::agents::Public(st.reg.agents[&id].clone())).unwrap_or_default();
+                            let public = serde_json::to_value(crate::agents::Public(st.reg.agents[&id].clone()))
+                                .unwrap_or_default();
                             core.emit(&mut st, "restarted", id, public);
                             core.save(&st);
                             core.changed.notify_waiters();
                         }
                         Err(err) => {
-                            let _ = writeln!(io::stderr(), "core: kept agent {} restart failed: {}", address, err.message);
+                            let _ =
+                                writeln!(io::stderr(), "core: kept agent {} restart failed: {}", address, err.message);
                             let mut st = core.lock();
                             st.recovering.remove(&id);
                             core.spawn_failed(&mut st, id);
@@ -287,17 +289,18 @@ impl Core {
             let _ = writeln!(io::stderr(), "core: kept terminals waiting for a holder: {e}");
             return;
         }
-        let (shell, restore_screen, restore_cli_sessions) = match crate::config::load(&self.paths.config).and_then(|settings| {
-            settings.shell().map(|shell| {
-                (shell, settings.restore_screen.unwrap_or(false), settings.restore_cli_sessions())
-            })
-        }) {
-            Ok(settings) => settings,
-            Err(e) => {
-                let _ = writeln!(io::stderr(), "core: kept terminals waiting for a shell: {}", e.message);
-                return;
-            }
-        };
+        let (shell, restore_screen, restore_cli_sessions) =
+            match crate::config::load(&self.paths.config).and_then(|settings| {
+                settings
+                    .shell()
+                    .map(|shell| (shell, settings.restore_screen.unwrap_or(false), settings.restore_cli_sessions()))
+            }) {
+                Ok(settings) => settings,
+                Err(e) => {
+                    let _ = writeln!(io::stderr(), "core: kept terminals waiting for a shell: {}", e.message);
+                    return;
+                }
+            };
         let base_env = crate::platform::program_env().await;
 
         struct PendingPty {
@@ -441,11 +444,10 @@ impl Core {
             let is_cli_recovery = cli_plan.is_some();
             if let Some(plan) = cli_plan {
                 t.argv = plan.argv;
-                let kind_str = t
-                    .saved_cli
-                    .as_ref()
-                    .map(|s| s.kind.clone())
-                    .unwrap_or_else(|| crate::pty_adapters::PtyCliKind::detect(&plan.cli_argv).as_str().to_string());
+                let kind_str =
+                    t.saved_cli.as_ref().map(|s| s.kind.clone()).unwrap_or_else(|| {
+                        crate::pty_adapters::PtyCliKind::detect(&plan.cli_argv).as_str().to_string()
+                    });
                 let prev_tp = t.saved_cli.as_ref().and_then(|s| s.transcript_path.clone());
                 t.saved_cli = Some(SavedCliResume {
                     kind: kind_str.clone(),

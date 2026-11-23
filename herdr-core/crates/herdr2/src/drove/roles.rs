@@ -21,10 +21,7 @@ pub fn capture_dirty_baseline(cwd: &str) -> DirtyBaseline {
         }
         DirtyBaseline { is_git: true, hashes }
     } else {
-        DirtyBaseline {
-            is_git: false,
-            hashes: scan_plain_dir_hashes(Path::new(cwd)),
-        }
+        DirtyBaseline { is_git: false, hashes: scan_plain_dir_hashes(Path::new(cwd)) }
     }
 }
 
@@ -151,12 +148,7 @@ pub(super) fn is_ephemeral_cache_path(rel: &str) -> bool {
     if norm.ends_with(".pyc") || norm.ends_with(".pyo") {
         return true;
     }
-    norm.split('/').any(|seg| {
-        matches!(
-            seg,
-            "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".ruff_cache"
-        )
-    })
+    norm.split('/').any(|seg| matches!(seg, "__pycache__" | ".pytest_cache" | ".mypy_cache" | ".ruff_cache"))
 }
 
 fn is_git_repo(cwd: &str) -> bool {
@@ -168,10 +160,8 @@ fn is_git_repo(cwd: &str) -> bool {
 }
 
 fn git_status_paths(cwd: &str) -> Vec<String> {
-    let Ok(out) = super::bg_std_command("git")
-        .args(["status", "--porcelain=v1", "-z", "-uall"])
-        .current_dir(cwd)
-        .output()
+    let Ok(out) =
+        super::bg_std_command("git").args(["status", "--porcelain=v1", "-z", "-uall"]).current_dir(cwd).output()
     else {
         return Vec::new();
     };

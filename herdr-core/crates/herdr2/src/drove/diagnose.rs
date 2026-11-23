@@ -24,10 +24,7 @@ pub fn diagnose_task(store: &Store, id_or_attempt: &str) -> Option<Diagnosis> {
 
     let worker = attempt.as_ref().and_then(|a| store.get_worker(&a.worker_id));
     let run_cwd = store.get_run(&task.run_id).map(|r| r.cwd);
-    let git_cwd = worker
-        .as_ref()
-        .and_then(|w| w.worktree.as_ref().or(Some(&w.cwd)))
-        .or(run_cwd.as_ref());
+    let git_cwd = worker.as_ref().and_then(|w| w.worktree.as_ref().or(Some(&w.cwd))).or(run_cwd.as_ref());
 
     let git_status = match git_cwd {
         Some(dir) => match Command::new("git").args(["status", "--porcelain"]).current_dir(dir).output() {
@@ -52,17 +49,31 @@ pub fn diagnose_task(store: &Store, id_or_attempt: &str) -> Option<Diagnosis> {
 
     let failure = attempt.as_ref().and_then(|a| a.failure.clone());
     let suggestion = match failure.as_ref().map(|f| f.kind) {
-        Some(FailureKind::AgentError) => "Inspect worker stderr/output; retry with --same-worker or switch agent/model via `drove route`.",
-        Some(FailureKind::NoDone) => "Worker finished turn without reporting completion; retry with `--hint \"Call drove worker done\"`.",
+        Some(FailureKind::AgentError) => {
+            "Inspect worker stderr/output; retry with --same-worker or switch agent/model via `drove route`."
+        }
+        Some(FailureKind::NoDone) => {
+            "Worker finished turn without reporting completion; retry with `--hint \"Call drove worker done\"`."
+        }
         Some(FailureKind::Timeout) => "Task stalled or timed out; increase timeoutSec or split into smaller tasks.",
         Some(FailureKind::Schema) => "Result JSON did not satisfy outputSchema; retry with schema hint.",
-        Some(FailureKind::VerificationFailed) => "Verification gate failed; check `artifacts/verify-*` or task logs before retrying.",
-        Some(FailureKind::ReviewRejected) => "Reviewer requested changes across max rounds; review findings and complete manually or adjust spec.",
-        Some(FailureKind::MergeConflict) => "Worktree merge conflicted; resolve conflicts in the workspace before continuing.",
+        Some(FailureKind::VerificationFailed) => {
+            "Verification gate failed; check `artifacts/verify-*` or task logs before retrying."
+        }
+        Some(FailureKind::ReviewRejected) => {
+            "Reviewer requested changes across max rounds; review findings and complete manually or adjust spec."
+        }
+        Some(FailureKind::MergeConflict) => {
+            "Worktree merge conflicted; resolve conflicts in the workspace before continuing."
+        }
         Some(FailureKind::ProcessExited) => "Worker process exited externally; retry cleanly.",
-        Some(FailureKind::WorkerReported) => "Worker reported explicit failure; check reason and adjust task spec or hint.",
+        Some(FailureKind::WorkerReported) => {
+            "Worker reported explicit failure; check reason and adjust task spec or hint."
+        }
         Some(FailureKind::Cancelled) => "Task was cancelled.",
-        Some(FailureKind::QuotaExhausted) => "Model quota/rate limit reached; switch role model or wait before retrying.",
+        Some(FailureKind::QuotaExhausted) => {
+            "Model quota/rate limit reached; switch role model or wait before retrying."
+        }
         None => "No failure recorded; inspect worker transcript and task spec.",
     }
     .to_string();

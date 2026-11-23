@@ -63,15 +63,16 @@ fn build_run_seed_context(core: &Arc<Core>, run_id: &str) -> Option<String> {
             (k.clone(), acc)
         })
         .collect();
-    Some(
-        json!({
-            "run_id": run.id,
-            "cwd": run.cwd,
-            "objective": run.objective.chars().take(400).collect::<String>(),
-            "roles": roles,
-        })
-        .to_string(),
-    )
+    let mut seed = json!({
+        "run_id": run.id,
+        "cwd": run.cwd,
+        "objective": run.objective.chars().take(400).collect::<String>(),
+        "roles": roles,
+    });
+    if let Some(note) = cfg.note.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        seed["routing_note"] = json!(note);
+    }
+    Some(seed.to_string())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -96,11 +97,7 @@ async fn drove_complete(
         timeout,
         cache_key,
         cache_ttl,
-        prompt_cache_bucket: Some(if run_id.trim().is_empty() {
-            "cp".into()
-        } else {
-            format!("run:{run_id}")
-        }),
+        prompt_cache_bucket: Some(if run_id.trim().is_empty() { "cp".into() } else { format!("run:{run_id}") }),
         ..Default::default()
     };
     match core.ai.complete(req).await {
@@ -132,11 +129,7 @@ async fn drove_complete(
                     title: format!("AI {op} ({}{tag})", resp.model),
                     detail: None,
                     duration_ms: Some(resp.latency_ms),
-                    tokens: Some(DaemonEventTokens {
-                        input: in_tok,
-                        output: out_tok,
-                        cache_hit: cache_tok,
-                    }),
+                    tokens: Some(DaemonEventTokens { input: in_tok, output: out_tok, cache_hit: cache_tok }),
                     cost: None,
                 });
             }
@@ -190,15 +183,7 @@ pub fn spawn_auto_title(core: Arc<Core>, run_id: String, objective: String) {
         else {
             return;
         };
-        let clean: String = title
-            .lines()
-            .next()
-            .unwrap_or("")
-            .trim()
-            .trim_matches('"')
-            .chars()
-            .take(60)
-            .collect();
+        let clean: String = title.lines().next().unwrap_or("").trim().trim_matches('"').chars().take(60).collect();
         if !clean.is_empty() {
             let _ = core.drove.store.update_run(&run_id, |r| {
                 if r.name.is_none() {
@@ -209,14 +194,15 @@ pub fn spawn_auto_title(core: Arc<Core>, run_id: String, objective: String) {
     });
 }
 
+fn run_seeded_mode(seed: Option<String>) -> AiConversationMode {
+    match seed.filter(|s| !s.trim().is_empty()) {
+        Some(seed_context) => AiConversationMode::SeededStateless { seed_context },
+        None => AiConversationMode::StatelessSharedPrefix,
+    }
+}
+
 /// Generates a short diagnostic summary on failed verification output.
-pub fn spawn_verify_digest(
-    core: Arc<Core>,
-    run_id: String,
-    attempt_id: String,
-    cmd_str: String,
-    log_tail: String,
-) {
+pub fn spawn_verify_digest(core: Arc<Core>, run_id: String, attempt_id: String, cmd_str: String, log_tail: String) {
     let cfg = core.drove.config_snapshot();
     if !cfg.ai.verify_digest || !core.ai.is_configured() {
         return;
@@ -224,21 +210,15 @@ pub fn spawn_verify_digest(
     tokio::spawn(async move {
         let compact_tail = strip_and_dedup_lines(&log_tail, 60, 220, 2400);
         let lang = drove_ai_lang(&core, None);
-        let user_prompt = format_op_user_message(
-            "verify_digest",
-            lang,
-            &json!({ "command": cmd_str, "tail": compact_tail }),
-        );
+        let user_prompt =
+            format_op_user_message("verify_digest", lang, &json!({ "command": cmd_str, "tail": compact_tail }));
         let seed = build_run_seed_context(&core, &run_id);
         let Some(digest) = drove_complete(
             &core,
             &run_id,
             "verify_digest",
             AiTaskTier::Fast,
-            AiConversationMode::Session {
-                key: format!("drove:run:{run_id}"),
-                seed_context: seed,
-            },
+            run_seeded_mode(seed),
             user_prompt,
             160,
             Duration::from_secs(12),
@@ -284,10 +264,7 @@ pub fn spawn_question_draft(
             &run_id,
             "question_draft",
             AiTaskTier::Fast,
-            AiConversationMode::Session {
-                key: format!("drove:run:{run_id}"),
-                seed_context: seed,
-            },
+            run_seeded_mode(seed),
             user_prompt,
             160,
             Duration::from_secs(12),
@@ -298,8 +275,7 @@ pub fn spawn_question_draft(
         else {
             return;
         };
-        let parsed =
-            extract_json_object(&raw).unwrap_or_else(|| json!({ "answer": raw.trim(), "confidence": 0.5 }));
+        let parsed = extract_json_object(&raw).unwrap_or_else(|| json!({ "answer": raw.trim(), "confidence": 0.5 }));
         let answer = parsed["answer"].as_str().unwrap_or(raw.trim()).trim().to_string();
         if answer.is_empty() {
             return;
@@ -345,13 +321,7 @@ pub fn spawn_question_draft(
 }
 
 /// Compresses a long worker completion summary into a 1-sentence `compactSummary` for downstream handovers.
-pub fn spawn_handover_compact(
-    core: Arc<Core>,
-    run_id: String,
-    task_id: String,
-    attempt_id: String,
-    summary: String,
-) {
+pub fn spawn_handover_compact(core: Arc<Core>, run_id: String, task_id: String, attempt_id: String, summary: String) {
     let cfg = core.drove.config_snapshot();
     if !cfg.ai.handover_compact || !core.ai.is_configured() || summary.chars().count() <= 140 {
         return;
@@ -426,10 +396,7 @@ pub fn spawn_task_enrich(core: Arc<Core>, run_id: String, task_id: String) {
             &run_id,
             "task_enrich",
             AiTaskTier::Fast,
-            AiConversationMode::Session {
-                key: format!("drove:run:{run_id}"),
-                seed_context: seed,
-            },
+            run_seeded_mode(seed),
             user_prompt,
             200,
             Duration::from_secs(12),
@@ -441,6 +408,7 @@ pub fn spawn_task_enrich(core: Arc<Core>, run_id: String, task_id: String) {
             return;
         };
         let Some(parsed) = extract_json_object(&raw) else {
+            core.ai.record_parse_error("task_enrich");
             return;
         };
         let extracted_files: Vec<String> = parsed["files"]
@@ -453,11 +421,7 @@ pub fn spawn_task_enrich(core: Arc<Core>, run_id: String, task_id: String) {
                     .collect()
             })
             .unwrap_or_default();
-        let extracted_acc = parsed["acceptance"]
-            .as_str()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from);
+        let extracted_acc = parsed["acceptance"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
         if extracted_files.is_empty() && extracted_acc.is_none() {
             return;
         }
@@ -476,12 +440,7 @@ pub fn spawn_task_enrich(core: Arc<Core>, run_id: String, task_id: String) {
 }
 
 /// Generates (or returns cached) structured AI failure diagnosis for `GET /api/tasks/:id/inspect?ai=1`.
-pub async fn generate_task_diagnosis(
-    core: &Arc<Core>,
-    diag: &mut Diagnosis,
-    refresh: bool,
-    language: Option<&str>,
-) {
+pub async fn generate_task_diagnosis(core: &Arc<Core>, diag: &mut Diagnosis, refresh: bool, language: Option<&str>) {
     if !core.ai.is_configured() {
         return;
     }
@@ -494,19 +453,10 @@ pub async fn generate_task_diagnosis(
     }
     let att_id = att.id.clone();
     let run_id = diag.task.run_id.clone();
-    let fail_txt = diag
-        .failure
-        .as_ref()
-        .map(|f| format!("{:?}: {}", f.kind, f.message))
-        .unwrap_or_else(|| "none".into());
-    let recent_txt = diag
-        .last_items
-        .iter()
-        .rev()
-        .take(6)
-        .filter_map(|it| it.text.as_deref())
-        .collect::<Vec<_>>()
-        .join("\n---\n");
+    let fail_txt =
+        diag.failure.as_ref().map(|f| format!("{:?}: {}", f.kind, f.message)).unwrap_or_else(|| "none".into());
+    let recent_txt =
+        diag.last_items.iter().rev().take(6).filter_map(|it| it.text.as_deref()).collect::<Vec<_>>().join("\n---\n");
     let lang = drove_ai_lang(core, language);
     let user_prompt = format_op_user_message(
         "task_diagnose",
@@ -529,10 +479,7 @@ pub async fn generate_task_diagnosis(
         &run_id,
         "task_diagnose",
         AiTaskTier::Standard,
-        AiConversationMode::Session {
-            key: format!("drove:run:{run_id}"),
-            seed_context: seed,
-        },
+        run_seeded_mode(seed),
         user_prompt,
         512,
         Duration::from_secs(16),
@@ -550,12 +497,8 @@ pub async fn generate_task_diagnosis(
             "recommendedAction": diag.suggestion.clone(),
         })
     });
-    let root_cause = parsed["rootCause"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&diag.suggestion)
-        .to_string();
+    let root_cause =
+        parsed["rootCause"].as_str().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(&diag.suggestion).to_string();
     let evidence = parsed["evidence"]
         .as_array()
         .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
@@ -581,8 +524,55 @@ pub async fn generate_task_diagnosis(
     diag.ai = Some(ai_diag);
 }
 
-/// Optional fast AI tie-breaker when a role has multiple candidates with `strengths` configured
-/// and deterministic keyword matching had no unique winner.
+/// Builds the structured `route_candidate` input payload including local wall-clock time,
+/// global `routing_note`, per-candidate `note`, and deterministic `strength_score`.
+pub(crate) fn build_route_candidate_payload(
+    cfg: &DroveConfig,
+    task: &Task,
+    role_name: &str,
+    pool: &[(usize, RoleTarget)],
+    local_time: &str,
+) -> Value {
+    let cands_desc: Vec<Value> = pool
+        .iter()
+        .enumerate()
+        .map(|(pos, (_, c))| {
+            let (strength_score, _) = super::router::score_candidate_strengths(c, task);
+            let mut obj = json!({
+                "index": pos,
+                "agent": c.agent,
+                "model": c.model.as_deref().unwrap_or("default"),
+                "effort": format!("{:?}", c.effort).to_lowercase(),
+                "strengths": c.strengths,
+                "strength_score": strength_score,
+            });
+            if let Some(note) = c.note.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                obj["note"] = json!(note);
+            }
+            obj
+        })
+        .collect();
+    let mut payload = json!({
+        "role": role_name,
+        "current_local_time": local_time,
+        "task": {
+            "key": task.key,
+            "title": task.title,
+            "tags": task.tags,
+            "files": task.files.iter().take(16).collect::<Vec<_>>(),
+            "target": task.spec.target,
+            "change": task.spec.change.chars().take(500).collect::<String>(),
+        },
+        "candidates": cands_desc,
+    });
+    if let Some(note) = cfg.note.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        payload["routing_note"] = json!(note);
+    }
+    payload
+}
+
+/// Optional fast AI candidate selector when a role has routing notes configured or multiple
+/// candidates with `strengths` where deterministic keyword matching had no unique winner.
 pub async fn pick_role_candidate(
     core: &Arc<Core>,
     run_id: &str,
@@ -594,36 +584,11 @@ pub async fn pick_role_candidate(
         return None;
     }
 
-    let cands_desc: Vec<Value> = pool
-        .iter()
-        .enumerate()
-        .map(|(pos, (_, c))| {
-            json!({
-                "index": pos,
-                "agent": c.agent,
-                "model": c.model.as_deref().unwrap_or("default"),
-                "effort": format!("{:?}", c.effort).to_lowercase(),
-                "strengths": c.strengths,
-            })
-        })
-        .collect();
+    let cfg = core.drove.config_snapshot();
+    let local_time = now_local_time_context();
+    let payload = build_route_candidate_payload(&cfg, task, role_name, pool, &local_time);
     let lang = drove_ai_lang(core, None);
-    let user_prompt = format_op_user_message(
-        "route_candidate",
-        lang,
-        &json!({
-            "role": role_name,
-            "task": {
-                "key": task.key,
-                "title": task.title,
-                "tags": task.tags,
-                "files": task.files.iter().take(16).collect::<Vec<_>>(),
-                "target": task.spec.target,
-                "change": task.spec.change.chars().take(500).collect::<String>(),
-            },
-            "candidates": cands_desc,
-        }),
-    );
+    let user_prompt = format_op_user_message("route_candidate", lang, &payload);
     let seed = build_run_seed_context(core, run_id);
     let raw = tokio::time::timeout(
         Duration::from_secs(6),
@@ -632,10 +597,7 @@ pub async fn pick_role_candidate(
             run_id,
             "route_candidate",
             AiTaskTier::Nano,
-            AiConversationMode::Session {
-                key: format!("drove:run:{run_id}"),
-                seed_context: seed,
-            },
+            run_seeded_mode(seed),
             user_prompt,
             96,
             Duration::from_secs(6),
@@ -646,17 +608,14 @@ pub async fn pick_role_candidate(
     .await
     .ok()??;
 
-    let parsed = extract_json_object(&raw)?;
+    let Some(parsed) = extract_json_object(&raw) else {
+        core.ai.record_parse_error("route_candidate");
+        return None;
+    };
     let pos = parsed["index"].as_u64()? as usize;
     let &(chain_idx, _) = pool.get(pos)?;
-    let reason: String = parsed["reason"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("ai")
-        .chars()
-        .take(40)
-        .collect();
+    let reason: String =
+        parsed["reason"].as_str().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("ai").chars().take(40).collect();
     Some((chain_idx, reason))
 }
 
@@ -678,11 +637,7 @@ pub async fn detect_semantic_loop(
         .iter()
         .map(|it| {
             if let Some(tl) = &it.tool {
-                let out_tail = tl
-                    .output
-                    .as_deref()
-                    .map(|s| strip_and_dedup_lines(s, 6, 160, 220))
-                    .unwrap_or_default();
+                let out_tail = tl.output.as_deref().map(|s| strip_and_dedup_lines(s, 6, 160, 220)).unwrap_or_default();
                 json!({
                     "id": it.id,
                     "kind": "tool",
@@ -693,11 +648,7 @@ pub async fn detect_semantic_loop(
                     "output_tail": out_tail,
                 })
             } else {
-                let text = it
-                    .text
-                    .as_deref()
-                    .map(|s| strip_and_dedup_lines(s, 4, 160, 220))
-                    .unwrap_or_default();
+                let text = it.text.as_deref().map(|s| strip_and_dedup_lines(s, 4, 160, 220)).unwrap_or_default();
                 json!({
                     "id": it.id,
                     "kind": it.kind,
@@ -717,11 +668,7 @@ pub async fn detect_semantic_loop(
     .to_string();
 
     let lang = drove_ai_lang(core, None);
-    let user_prompt = format_op_user_message(
-        "loop_detect",
-        lang,
-        &json!({ "delta_items": compact_delta }),
-    );
+    let user_prompt = format_op_user_message("loop_detect", lang, &json!({ "delta_items": compact_delta }));
 
     let raw = tokio::time::timeout(
         Duration::from_secs(7),
@@ -730,10 +677,7 @@ pub async fn detect_semantic_loop(
             run_id,
             "loop_detect",
             AiTaskTier::Standard,
-            AiConversationMode::Session {
-                key: format!("drove:loop:{attempt_id}"),
-                seed_context: Some(seed_context),
-            },
+            AiConversationMode::Session { key: format!("drove:loop:{attempt_id}"), seed_context: Some(seed_context) },
             user_prompt,
             220,
             Duration::from_secs(6),
@@ -747,27 +691,10 @@ pub async fn detect_semantic_loop(
     let parsed = extract_json_object(&raw)?;
     let looping = parsed["looping"].as_bool().unwrap_or(false);
     let confidence = parsed["confidence"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0);
-    let pattern = parsed["pattern"]
-        .as_str()
-        .map(str::trim)
-        .unwrap_or("semantic_oscillation")
-        .chars()
-        .take(80)
-        .collect();
-    let root_cause = parsed["root_cause"]
-        .as_str()
-        .map(str::trim)
-        .unwrap_or("")
-        .chars()
-        .take(180)
-        .collect();
-    let steer_hint = parsed["steer_hint"]
-        .as_str()
-        .map(str::trim)
-        .unwrap_or("")
-        .chars()
-        .take(260)
-        .collect();
+    let pattern =
+        parsed["pattern"].as_str().map(str::trim).unwrap_or("semantic_oscillation").chars().take(80).collect();
+    let root_cause = parsed["root_cause"].as_str().map(str::trim).unwrap_or("").chars().take(180).collect();
+    let steer_hint = parsed["steer_hint"].as_str().map(str::trim).unwrap_or("").chars().take(260).collect();
 
     Some(SemanticLoopVerdict { looping, confidence, pattern, root_cause, steer_hint })
 }
@@ -813,10 +740,7 @@ pub async fn assess_write_conflict(
             run_id,
             "write_conflict",
             AiTaskTier::Nano,
-            AiConversationMode::Session {
-                key: format!("drove:run:{run_id}"),
-                seed_context: seed,
-            },
+            run_seeded_mode(seed),
             user_prompt,
             96,
             Duration::from_secs(4),
@@ -827,7 +751,10 @@ pub async fn assess_write_conflict(
     .await
     .ok()??;
 
-    let parsed = extract_json_object(&raw)?;
+    let Some(parsed) = extract_json_object(&raw) else {
+        core.ai.record_parse_error("write_conflict");
+        return None;
+    };
     let conflict = parsed["conflict"].as_bool().unwrap_or(true);
     let confidence = parsed["confidence"].as_f64().unwrap_or(0.0).clamp(0.0, 1.0);
     let reason = parsed["reason"]
@@ -845,6 +772,7 @@ pub async fn assess_write_conflict(
 pub(crate) enum AiRoleConfigMode {
     Models,
     Strengths,
+    Notes,
     All,
 }
 
@@ -853,18 +781,39 @@ impl AiRoleConfigMode {
         match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
             Some("models" | "roles" | "agents") => Self::Models,
             Some("strengths" | "tasks" | "specialties") => Self::Strengths,
+            Some("notes" | "note") => Self::Notes,
             _ => Self::All,
         }
     }
 }
 
-/// Uses the configured AI Assistant LLM to automatically configure Drove roles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AiNoteScope {
+    All,
+    Global,
+    Candidate,
+}
+
+impl AiNoteScope {
+    fn from_params(raw: Option<&str>, target_role: Option<&str>) -> Self {
+        match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("global") => Self::Global,
+            Some("candidate" | "single") => Self::Candidate,
+            Some("all") => Self::All,
+            _ if target_role.map(str::trim).is_some_and(|s| !s.is_empty()) => Self::Candidate,
+            _ => Self::All,
+        }
+    }
+}
+
+/// Uses the configured AI Assistant LLM to automatically configure Drove roles and routing notes.
 pub async fn configure_roles_with_ai(
     core: &Arc<Core>,
     params: DroveRolesAiConfigureParams,
 ) -> DroveRolesAiConfigureResult {
     let started = Instant::now();
     let mode = AiRoleConfigMode::from_opt(params.mode.as_deref());
+    let note_scope = AiNoteScope::from_params(params.note_scope.as_deref(), params.target_role.as_deref());
     let fail = |msg: String, probed_refreshed: bool| DroveRolesAiConfigureResult {
         ok: false,
         applied: false,
@@ -872,6 +821,7 @@ pub async fn configure_roles_with_ai(
         model_used: None,
         latency_ms: started.elapsed().as_millis() as u64,
         rationale: None,
+        note: None,
         roles: None,
         settings: None,
         error: Some(msg),
@@ -879,40 +829,32 @@ pub async fn configure_roles_with_ai(
 
     let cfg = core.drove.config_snapshot();
     let ai_cfg = core.ai.config_snapshot();
-    let raw_base = params
-        .base_url
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(ai_cfg.base_url.trim());
+    let raw_base =
+        params.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(ai_cfg.base_url.trim());
     if raw_base.is_empty() {
         return fail("请先在「AI 设置」中配置远端服务地址（Service URL）".into(), false);
     }
     let (stored_key, _) = core.ai.read_key();
-    let has_key = params
-        .api_key
-        .as_deref()
-        .map(str::trim)
-        .is_some_and(|s| !s.is_empty())
-        || stored_key.is_some();
+    let has_key = params.api_key.as_deref().map(str::trim).is_some_and(|s| !s.is_empty()) || stored_key.is_some();
     if !has_key && !crate::ai::is_loopback_http_url(raw_base) {
         return fail("请先在「AI 设置」中配置 API Key".into(), false);
     }
 
     // Gather agent & model inventory; refresh installed flags first.
+    // Single-field note generation (`global` / `candidate`) only inspects current roles & quotas, so skip slow full probe.
     let mut probed = core.drove.cached_probe();
-    if !probed.agents.is_empty() {
-        let _ = super::probe::refresh_installed_status(core, &mut probed).await;
-    }
     let mut probed_refreshed = false;
-    let has_cached_models = probed.full_probe
-        && !probed.agents.is_empty()
-        && probed.agents.iter().any(|a| a.installed && !a.models.is_empty());
-    if !has_cached_models
-        && let Ok(full) = core.drove.rpc_probe(true).await
-    {
-        probed = full;
-        probed_refreshed = true;
+    if !(mode == AiRoleConfigMode::Notes && note_scope != AiNoteScope::All) {
+        if !probed.agents.is_empty() {
+            let _ = super::probe::refresh_installed_status(core, &mut probed).await;
+        }
+        let has_cached_models = probed.full_probe
+            && !probed.agents.is_empty()
+            && probed.agents.iter().any(|a| a.installed && !a.models.is_empty());
+        if !has_cached_models && let Ok(full) = core.drove.rpc_probe(true).await {
+            probed = full;
+            probed_refreshed = true;
+        }
     }
 
     let any_installed = probed.agents.iter().any(|a| a.installed);
@@ -938,19 +880,12 @@ pub async fn configure_roles_with_ai(
         })
         .collect();
 
-    let quotas = if cfg.magpie.enabled {
-        core.drove.magpie.fetch_if_enabled(&cfg.magpie, false).await.0
-    } else {
-        None
-    };
+    let quotas = if cfg.magpie.enabled { core.drove.magpie.fetch_if_enabled(&cfg.magpie, false).await.0 } else { None };
     let quota_summary: Vec<Value> = quotas
         .unwrap_or_default()
         .into_iter()
         .map(|q| {
-            let min_rem = q
-                .windows
-                .as_ref()
-                .and_then(|ws| ws.iter().map(|w| w.remaining).reduce(f64::min));
+            let min_rem = q.windows.as_ref().and_then(|ws| ws.iter().map(|w| w.remaining).reduce(f64::min));
             json!({
                 "provider": q.provider,
                 "minRemainingPct": min_rem,
@@ -975,6 +910,7 @@ pub async fn configure_roles_with_ai(
                         "fast": c.fast,
                         "context": c.context,
                         "strengths": c.strengths,
+                        "note": c.note,
                     })
                 })
                 .collect();
@@ -992,19 +928,72 @@ pub async fn configure_roles_with_ai(
     let prefer_zh = match params.language.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         Some(l) => crate::ai::prompt_lang_code(l) == "zh",
         None => {
-            drove_ai_lang(core, None) == "zh"
-                || instruction.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c))
+            drove_ai_lang(core, None) == "zh" || instruction.chars().any(|c| ('\u{4E00}'..='\u{9FFF}').contains(&c))
         }
     };
 
     let lang_rule = if prefer_zh {
-        "Write `rationale` and any `strengths` tags in concise Simplified Chinese (2-6 chars per tag, e.g. \"复杂架构\", \"前端UI\", \"后端重构\", \"疑难排障\", \"快速修复\", \"单元测试\", \"安全审计\", \"源码调研\", \"长上下文\")."
+        "Write `rationale`, any `note` fields, and any `strengths` tags in concise Simplified Chinese (2-6 chars per strength tag, e.g. \"复杂架构\", \"前端UI\", \"后端重构\", \"疑难排障\", \"快速修复\", \"单元测试\", \"安全审计\", \"源码调研\", \"长上下文\")."
     } else {
-        "Write `rationale` and any `strengths` tags in concise English (2-3 words per tag, e.g. \"Backend Architecture\", \"Frontend UI\", \"Complex Refactor\", \"Bugfix & Debug\", \"Unit Tests\", \"Security Review\", \"Codebase Research\")."
+        "Write `rationale`, any `note` fields, and any `strengths` tags in concise English (2-3 words per strength tag, e.g. \"Backend Architecture\", \"Frontend UI\", \"Complex Refactor\", \"Bugfix & Debug\", \"Unit Tests\", \"Security Review\", \"Codebase Research\")."
     };
 
-    let system_prompt = match mode {
-        AiRoleConfigMode::Models => format!(
+    // Validate candidate target up front when `mode == Notes && note_scope == Candidate`.
+    let candidate_target_info: Option<(String, usize, Value)> = if mode == AiRoleConfigMode::Notes
+        && note_scope == AiNoteScope::Candidate
+    {
+        let role_id = params.target_role.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let Some(rid) = role_id else {
+            return fail("缺少 targetRole 参数，无法生成单候选备注".into(), probed_refreshed);
+        };
+        let Some(role_cfg) = cfg.roles.get(rid) else {
+            return fail(format!("未找到角色 `{rid}`"), probed_refreshed);
+        };
+        let cand_idx = params.target_candidate_index.unwrap_or(0);
+        let chain: Vec<&RoleTarget> = std::iter::once(&role_cfg.primary).chain(role_cfg.fallbacks.iter()).collect();
+        let Some(target) = chain.get(cand_idx) else {
+            return fail(format!("角色 `{rid}` 中不存在候选 #{cand_idx}"), probed_refreshed);
+        };
+        let siblings: Vec<Value> = chain
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                json!({
+                    "index": i,
+                    "isTarget": i == cand_idx,
+                    "agent": c.agent,
+                    "model": c.model,
+                    "effort": c.effort,
+                    "strengths": c.strengths,
+                    "note": c.note,
+                })
+            })
+            .collect();
+        Some((
+            rid.to_string(),
+            cand_idx,
+            json!({
+                "roleId": rid,
+                "roleLabel": role_cfg.label,
+                "roleSummary": role_cfg.summary,
+                "roleAccess": role_cfg.access,
+                "candidateIndex": cand_idx,
+                "agent": target.agent,
+                "model": target.model,
+                "effort": target.effort,
+                "fast": target.fast,
+                "context": target.context,
+                "strengths": target.strengths,
+                "currentNote": target.note,
+                "siblings": siblings,
+            }),
+        ))
+    } else {
+        None
+    };
+
+    let system_prompt = match (mode, note_scope) {
+        (AiRoleConfigMode::Models, _) => format!(
             "You are a pure JSON configuration architect for Drove (a multi-agent software engineering orchestrator). \
              Configure ONLY the `agent`, `model`, `effort`, `fast`, and `context` of 1 to 3 complementary `candidates` for every role in `roles`.\n\
              Rules:\n\
@@ -1019,7 +1008,7 @@ pub async fn configure_roles_with_ai(
              9. Output ONLY valid JSON matching:\n\
              {{\"rationale\":\"1-2 sentences\",\"roles\":{{\"<roleId>\":{{\"candidates\":[{{\"agent\":\"...\",\"model\":\"...\"|null,\"effort\":\"high\",\"fast\":false,\"context\":null}}]}}}}}}"
         ),
-        AiRoleConfigMode::Strengths => format!(
+        (AiRoleConfigMode::Strengths, _) => format!(
             "You are a pure JSON configuration architect for Drove (a multi-agent software engineering orchestrator). \
              Each role in `roles` already has its `currentCandidates` (`index`, `agent`, `model`, `effort`). \
              Do NOT change, add, or remove any candidate's `agent` or `model`; configure ONLY the `strengths` array (2-4 distinct work-type tags) for EVERY existing candidate in EVERY role.\n\
@@ -1031,9 +1020,46 @@ pub async fn configure_roles_with_ai(
              5. Output ONLY valid JSON matching:\n\
              {{\"rationale\":\"1-2 sentences\",\"roles\":{{\"<roleId>\":{{\"candidates\":[{{\"index\":0,\"agent\":\"...\",\"model\":\"...\"|null,\"strengths\":[\"...\",\"...\"]}}]}}}}}}"
         ),
-        AiRoleConfigMode::All => format!(
+        (AiRoleConfigMode::Notes, AiNoteScope::Global) => format!(
             "You are a pure JSON configuration architect for Drove (a multi-agent software engineering orchestrator). \
-             Configure every role in `roles` with 1 to 3 complementary `candidates` (`agent` + `model` + `effort` + `fast` + `context` + `strengths`).\n\
+             Write ONE concise, practical global routing `note` (1-3 short sentences, <= 240 chars) that the AI sub-agent router will read before launching workers across all roles.\n\
+             Rules:\n\
+             1. Base the note on the configured `roles`, models/providers, `quotas`, and existing `routingNote`.\n\
+             2. Include actionable selection policies: e.g., when to prefer flagship vs fast/lightweight models, heterogeneous reviewer preference, fallback/quota protection rules, and any time-window or cost constraints.\n\
+             3. If `userPreference` is non-empty (such as a rough draft or explicit rule), preserve and refine all user-specified constraints without dropping any rule.\n\
+             4. Do NOT invent fake time-window pricing rules unless mentioned in `userPreference` or `routingNote`.\n\
+             5. {lang_rule}\n\
+             6. Output ONLY valid JSON matching:\n\
+             {{\"rationale\":\"1 short sentence\",\"note\":\"concise actionable routing note\"}}"
+        ),
+        (AiRoleConfigMode::Notes, AiNoteScope::Candidate) => format!(
+            "You are a pure JSON configuration architect for Drove (a multi-agent software engineering orchestrator). \
+             Write ONE concise, actionable routing `note` (1 short sentence, <= 120 chars) specifically for `targetCandidate`, which the AI sub-agent router will read when choosing between sibling candidates in that role.\n\
+             Rules:\n\
+             1. Focus on when to choose or avoid this specific `agent` + `model` relative to `targetCandidate.siblings` (e.g., preferred task scope, speed/cost/context trade-off, fallback role, or quota caution).\n\
+             2. Respect the global `routingNote` if present, without merely repeating it verbatim.\n\
+             3. If `userPreference` is non-empty (such as a rough draft or explicit rule), preserve and polish all user-specified constraints.\n\
+             4. {lang_rule}\n\
+             5. Output ONLY valid JSON matching:\n\
+             {{\"rationale\":\"1 short sentence\",\"note\":\"concise candidate routing note\"}}"
+        ),
+        (AiRoleConfigMode::Notes, AiNoteScope::All) => format!(
+            "You are a pure JSON configuration architect for Drove (a multi-agent software engineering orchestrator). \
+             Each role in `roles` already has its `currentCandidates` (`index`, `agent`, `model`, `effort`, `strengths`). \
+             Do NOT change, add, or remove any candidate's `agent`, `model`, `effort`, or `strengths`; configure ONLY:\n\
+             - top-level global routing `note` (1-3 concise sentences, <= 240 chars, cross-role selection/fallback/quota policy), AND\n\
+             - per-candidate `note` (1 crisp sentence, <= 100 chars) for EVERY existing candidate in EVERY role explaining when the AI router should prefer or avoid that candidate.\n\
+             Rules:\n\
+             1. Return top-level `note` and an entry for EVERY role in `roles` and EVERY candidate index `0..currentCandidates.length`.\n\
+             2. Preserve any existing user constraints in `routingNote` / candidate `note` and strictly honor `userPreference` if non-empty.\n\
+             3. Do NOT fabricate time-window pricing rules unless mentioned in `userPreference` or existing notes.\n\
+             4. {lang_rule}\n\
+             5. Output ONLY valid JSON matching:\n\
+             {{\"rationale\":\"1-2 sentences\",\"note\":\"global routing note\",\"roles\":{{\"<roleId>\":{{\"candidates\":[{{\"index\":0,\"agent\":\"...\",\"model\":\"...\"|null,\"note\":\"concise candidate note\"}}]}}}}}}"
+        ),
+        (AiRoleConfigMode::All, _) => format!(
+            "You are a pure JSON configuration architect for Drove (a multi-agent software engineering orchestrator). \
+             Configure every role in `roles` with 1 to 3 complementary `candidates` (`agent` + `model` + `effort` + `fast` + `context` + `strengths` + `note`), AND a top-level global routing `note` for AI sub-agent selection.\n\
              Rules:\n\
              1. ONLY choose `agent` values from `availableAgents[].id`.\n\
              2. For each candidate's `model`, ONLY choose an exact string from that agent's `models` array, or `null` to use the agent's default.\n\
@@ -1042,25 +1068,37 @@ pub async fn configure_roles_with_ai(
              5. Within roles that benefit from specialization, when multiple agents/models are installed, assign 2-3 complementary candidates with distinct `strengths` (2-4 tags each).\n\
              6. Prefer a different primary agent for `reviewer` than `coder` when multiple agents are available.\n\
              7. If `quotas` shows a provider at 0% remaining with no balance, avoid putting it as candidate #1.\n\
-             8. Strictly honor `userPreference` if non-empty.\n\
-             9. {lang_rule}\n\
-             10. Output ONLY valid JSON matching:\n\
-             {{\"rationale\":\"1-2 sentences\",\"roles\":{{\"<roleId>\":{{\"candidates\":[{{\"agent\":\"...\",\"model\":\"...\"|null,\"effort\":\"high\",\"fast\":false,\"context\":null,\"strengths\":[\"...\",\"...\"]}}]}}}}}}"
+             8. Write a concise top-level global routing `note` (1-3 short sentences, <= 240 chars) and a concise per-candidate `note` (<= 100 chars) for each candidate describing when AI should pick or avoid it (preserve any existing constraints in `routingNote` or `userPreference`; do not invent fake time-window rules).\n\
+             9. Strictly honor `userPreference` if non-empty.\n\
+             10. {lang_rule}\n\
+             11. Output ONLY valid JSON matching:\n\
+             {{\"rationale\":\"1-2 sentences\",\"note\":\"global routing note\",\"roles\":{{\"<roleId>\":{{\"candidates\":[{{\"agent\":\"...\",\"model\":\"...\"|null,\"effort\":\"high\",\"fast\":false,\"context\":null,\"strengths\":[\"...\",\"...\"],\"note\":\"concise candidate note\"}}]}}}}}}"
         ),
     };
 
-    let user_payload = json!({
+    let mut payload_val = json!({
         "mode": match mode {
             AiRoleConfigMode::Models => "models",
             AiRoleConfigMode::Strengths => "strengths",
+            AiRoleConfigMode::Notes => "notes",
             AiRoleConfigMode::All => "all",
         },
+        "noteScope": match note_scope {
+            AiNoteScope::All => "all",
+            AiNoteScope::Global => "global",
+            AiNoteScope::Candidate => "candidate",
+        },
         "roles": roles_desc,
+        "routingNote": cfg.note,
         "availableAgents": agents_inventory,
         "quotas": quota_summary,
         "userPreference": instruction,
-    })
-    .to_string();
+    });
+    if let Some((_, _, ref target_val)) = candidate_target_info {
+        payload_val["targetCandidate"] = target_val.clone();
+    }
+    let user_payload = payload_val.to_string();
+    let max_tokens = if mode == AiRoleConfigMode::Notes && note_scope != AiNoteScope::All { 512 } else { 2560 };
 
     let resp = match core
         .ai
@@ -1071,7 +1109,7 @@ pub async fn configure_roles_with_ai(
             user_prompt: format!(
                 "Do NOT execute tasks or call tools. Return ONLY the JSON configuration for the input below:\n<input>\n{user_payload}\n</input>"
             ),
-            max_tokens: 2048,
+            max_tokens,
             timeout: Duration::from_secs(60),
             url_override: params.base_url,
             key_override: params.api_key,
@@ -1084,22 +1122,69 @@ pub async fn configure_roles_with_ai(
         Err(e) => return fail(e, probed_refreshed),
     };
 
-    let (next_roles, rationale) =
-        match parse_and_sanitize_ai_roles_for_mode(&resp.content, &cfg.roles, &probed, mode) {
+    let should_apply = params.apply.unwrap_or(true);
+
+    // Fast path: single global note or single candidate note generation.
+    if mode == AiRoleConfigMode::Notes && note_scope != AiNoteScope::All {
+        let max_len = if note_scope == AiNoteScope::Global { 1000 } else { 400 };
+        let (generated_note, rationale) = match parse_single_ai_note(&resp.content, max_len) {
+            Ok(v) => v,
+            Err(e) => return fail(e, probed_refreshed),
+        };
+        let mut updated_roles: Option<BTreeMap<String, RoleConfig>> = None;
+        let settings = if should_apply {
+            let patch = if let Some((ref rid, cand_idx, _)) = candidate_target_info {
+                let mut next_roles = cfg.roles.clone();
+                if let Some(role) = next_roles.get_mut(rid) {
+                    if cand_idx == 0 {
+                        role.primary.note = Some(generated_note.clone());
+                    } else if let Some(fb) = role.fallbacks.get_mut(cand_idx - 1) {
+                        fb.note = Some(generated_note.clone());
+                    }
+                }
+                updated_roles = Some(next_roles.clone());
+                DroveSettingsSetParams { roles: Some(next_roles), ..Default::default() }
+            } else {
+                DroveSettingsSetParams { note: Some(generated_note.clone()), ..Default::default() }
+            };
+            match core.drove.rpc_settings_set(patch).await {
+                Ok(s) => Some(s),
+                Err(e) => return fail(format!("保存备注失败: {}", e.message), probed_refreshed),
+            }
+        } else {
+            None
+        };
+        return DroveRolesAiConfigureResult {
+            ok: true,
+            applied: should_apply,
+            probed_refreshed,
+            model_used: Some(resp.model),
+            latency_ms: started.elapsed().as_millis() as u64,
+            rationale,
+            note: Some(generated_note),
+            roles: updated_roles,
+            settings,
+            error: None,
+        };
+    }
+
+    let (next_roles, next_note, rationale) =
+        match parse_and_sanitize_ai_roles_with_note(&resp.content, &cfg.roles, &probed, mode) {
             Ok(res) => res,
             Err(e) => return fail(e, probed_refreshed),
         };
 
-    let should_apply = params.apply.unwrap_or(true);
     let settings = if should_apply {
-        match core
-            .drove
-            .rpc_settings_set(DroveSettingsSetParams {
-                roles: Some(next_roles.clone()),
-                ..Default::default()
-            })
-            .await
-        {
+        let patch = DroveSettingsSetParams {
+            roles: Some(next_roles.clone()),
+            note: if matches!(mode, AiRoleConfigMode::All | AiRoleConfigMode::Notes) {
+                next_note.clone()
+            } else {
+                None
+            },
+            ..Default::default()
+        };
+        match core.drove.rpc_settings_set(patch).await {
             Ok(s) => Some(s),
             Err(e) => return fail(format!("保存配置失败: {}", e.message), probed_refreshed),
         }
@@ -1114,10 +1199,32 @@ pub async fn configure_roles_with_ai(
         model_used: Some(resp.model),
         latency_ms: started.elapsed().as_millis() as u64,
         rationale,
+        note: next_note,
         roles: Some(next_roles),
         settings,
         error: None,
     }
+}
+
+pub(crate) fn parse_single_ai_note(raw: &str, max_chars: usize) -> Result<(String, Option<String>), String> {
+    let parsed = extract_json_object(raw)
+        .ok_or_else(|| format!("AI 未返回有效的 JSON 备注: {}", raw.chars().take(160).collect::<String>()))?;
+    let note = super::config::normalize_note(
+        parsed
+            .get("note")
+            .or_else(|| parsed.get("routingNote"))
+            .or_else(|| parsed.get("routing_note"))
+            .and_then(Value::as_str),
+        max_chars,
+    )
+    .ok_or_else(|| "AI 未生成有效的备注内容".to_string())?;
+    let rationale = parsed
+        .get("rationale")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(400).collect::<String>());
+    Ok((note, rationale))
 }
 
 fn parse_effort(raw: Option<&str>, fallback: Effort) -> Effort {
@@ -1136,22 +1243,35 @@ pub(crate) fn parse_and_sanitize_ai_roles(
     existing_roles: &BTreeMap<String, RoleConfig>,
     probed: &ProbeSnapshot,
 ) -> Result<(BTreeMap<String, RoleConfig>, Option<String>), String> {
-    parse_and_sanitize_ai_roles_for_mode(raw, existing_roles, probed, AiRoleConfigMode::All)
+    let (roles, _note, rationale) =
+        parse_and_sanitize_ai_roles_with_note(raw, existing_roles, probed, AiRoleConfigMode::All)?;
+    Ok((roles, rationale))
 }
 
-pub(crate) fn parse_and_sanitize_ai_roles_for_mode(
+pub(crate) fn parse_and_sanitize_ai_roles_with_note(
     raw: &str,
     existing_roles: &BTreeMap<String, RoleConfig>,
     probed: &ProbeSnapshot,
     mode: AiRoleConfigMode,
-) -> Result<(BTreeMap<String, RoleConfig>, Option<String>), String> {
+) -> Result<(BTreeMap<String, RoleConfig>, Option<String>, Option<String>), String> {
     let parsed = extract_json_object(raw)
         .ok_or_else(|| format!("AI 未返回有效的 JSON 配置: {}", raw.chars().take(160).collect::<String>()))?;
+    let global_note = if matches!(mode, AiRoleConfigMode::All | AiRoleConfigMode::Notes) {
+        super::config::normalize_note(
+            parsed
+                .get("note")
+                .or_else(|| parsed.get("routingNote"))
+                .or_else(|| parsed.get("routing_note"))
+                .and_then(Value::as_str),
+            1000,
+        )
+    } else {
+        None
+    };
     let roles_obj = parsed
         .get("roles")
         .and_then(Value::as_object)
-        .or_else(|| parsed.as_object())
-        .ok_or_else(|| "AI 响应中缺少 roles 字段".to_string())?;
+        .or_else(|| parsed.as_object());
     let rationale = parsed
         .get("rationale")
         .and_then(Value::as_str)
@@ -1161,174 +1281,176 @@ pub(crate) fn parse_and_sanitize_ai_roles_for_mode(
 
     let any_installed = probed.agents.iter().any(|a| a.installed);
     let mut out = existing_roles.clone();
-    let mut updated_any = false;
+    let mut updated_any = global_note.is_some();
 
-    for (role_id, existing) in existing_roles {
-        let Some(role_val) = roles_obj.get(role_id) else {
-            continue;
-        };
-        let mut raw_cands: Vec<&Value> = Vec::new();
-        if let Some(arr) = role_val.get("candidates").and_then(Value::as_array) {
-            raw_cands.extend(arr.iter());
-        } else {
-            if let Some(p) = role_val.get("primary") {
-                raw_cands.push(p);
+    if let Some(roles_obj) = roles_obj {
+        for (role_id, existing) in existing_roles {
+            let Some(role_val) = roles_obj.get(role_id) else {
+                continue;
+            };
+            let mut raw_cands: Vec<&Value> = Vec::new();
+            if let Some(arr) = role_val.get("candidates").and_then(Value::as_array) {
+                raw_cands.extend(arr.iter());
+            } else {
+                if let Some(p) = role_val.get("primary") {
+                    raw_cands.push(p);
+                }
+                if let Some(fbs) = role_val.get("fallbacks").and_then(Value::as_array) {
+                    raw_cands.extend(fbs.iter());
+                }
             }
-            if let Some(fbs) = role_val.get("fallbacks").and_then(Value::as_array) {
-                raw_cands.extend(fbs.iter());
-            }
-        }
 
-        if mode == AiRoleConfigMode::Strengths {
-            let mut chain: Vec<RoleTarget> = std::iter::once(existing.primary.clone())
-                .chain(existing.fallbacks.iter().cloned())
-                .collect();
-            let mut role_changed = false;
-            for (pos, item) in raw_cands.iter().enumerate() {
-                let raw_strengths: Vec<String> = item
-                    .get("strengths")
-                    .and_then(Value::as_array)
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
-                let clean = normalize_strengths(&raw_strengths);
-                if clean.is_empty() {
+            if matches!(mode, AiRoleConfigMode::Strengths | AiRoleConfigMode::Notes) {
+                let mut chain: Vec<RoleTarget> =
+                    std::iter::once(existing.primary.clone()).chain(existing.fallbacks.iter().cloned()).collect();
+                let mut role_changed = false;
+                for (pos, item) in raw_cands.iter().enumerate() {
+                    let target_idx = item
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .map(|i| i as usize)
+                        .filter(|&i| i < chain.len())
+                        .or_else(|| {
+                            let a = item.get("agent").and_then(Value::as_str).map(str::trim)?;
+                            let m = item.get("model").and_then(Value::as_str).map(str::trim);
+                            chain
+                                .iter()
+                                .position(|c| {
+                                    c.agent.eq_ignore_ascii_case(a)
+                                        && m.is_none_or(|mv| {
+                                            c.model.as_deref().is_some_and(|cm| cm.eq_ignore_ascii_case(mv))
+                                        })
+                                })
+                                .or_else(|| chain.iter().position(|c| c.agent.eq_ignore_ascii_case(a)))
+                        })
+                        .or_else(|| (pos < chain.len()).then_some(pos));
+                    let Some(idx) = target_idx else { continue };
+                    if mode == AiRoleConfigMode::Strengths {
+                        let raw_strengths: Vec<String> = item
+                            .get("strengths")
+                            .and_then(Value::as_array)
+                            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                            .unwrap_or_default();
+                        let clean = normalize_strengths(&raw_strengths);
+                        if !clean.is_empty() {
+                            chain[idx].strengths = clean;
+                            role_changed = true;
+                        }
+                    } else if let Some(clean_note) =
+                        super::config::normalize_note(item.get("note").and_then(Value::as_str), 400)
+                    {
+                        chain[idx].note = Some(clean_note);
+                        role_changed = true;
+                    }
+                }
+                if role_changed && let Some(primary) = chain.first().cloned() {
+                    let mut next_role = existing.clone();
+                    next_role.primary = primary;
+                    next_role.fallbacks = chain.into_iter().skip(1).collect();
+                    out.insert(role_id.clone(), next_role);
+                    updated_any = true;
+                }
+                continue;
+            }
+
+            let existing_chain: Vec<&RoleTarget> =
+                std::iter::once(&existing.primary).chain(existing.fallbacks.iter()).collect();
+            let mut clean_cands: Vec<RoleTarget> = Vec::new();
+            let mut seen_pairs: HashSet<(String, Option<String>)> = HashSet::new();
+
+            for item in raw_cands {
+                let Some(raw_agent) =
+                    item.get("agent").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+                else {
                     continue;
-                }
-                let target_idx = item
-                    .get("index")
-                    .and_then(Value::as_u64)
-                    .map(|i| i as usize)
-                    .filter(|&i| i < chain.len())
-                    .or_else(|| {
-                        let a = item.get("agent").and_then(Value::as_str).map(str::trim)?;
-                        let m = item.get("model").and_then(Value::as_str).map(str::trim);
-                        chain
-                            .iter()
-                            .position(|c| {
-                                c.agent.eq_ignore_ascii_case(a)
-                                    && m.is_none_or(|mv| {
-                                        c.model.as_deref().is_some_and(|cm| cm.eq_ignore_ascii_case(mv))
-                                    })
-                            })
-                            .or_else(|| chain.iter().position(|c| c.agent.eq_ignore_ascii_case(a)))
-                    })
-                    .or_else(|| (pos < chain.len()).then_some(pos));
-                if let Some(idx) = target_idx {
-                    chain[idx].strengths = clean;
-                    role_changed = true;
-                }
-            }
-            if role_changed && let Some(primary) = chain.first().cloned() {
-                let mut next_role = existing.clone();
-                next_role.primary = primary;
-                next_role.fallbacks = chain.into_iter().skip(1).collect();
-                out.insert(role_id.clone(), next_role);
-                updated_any = true;
-            }
-            continue;
-        }
+                };
+                let matched_agent = probed
+                    .agents
+                    .iter()
+                    .find(|a| a.id.eq_ignore_ascii_case(raw_agent) && (!any_installed || a.installed));
+                let (agent_id, discovered_models) = match matched_agent {
+                    Some(a) => (a.id.clone(), a.models.as_slice()),
+                    None if !probed.agents.is_empty() => continue,
+                    None => (raw_agent.to_ascii_lowercase(), &[][..]),
+                };
 
-        let existing_chain: Vec<&RoleTarget> = std::iter::once(&existing.primary)
-            .chain(existing.fallbacks.iter())
-            .collect();
-        let mut clean_cands: Vec<RoleTarget> = Vec::new();
-        let mut seen_pairs: HashSet<(String, Option<String>)> = HashSet::new();
-
-        for item in raw_cands {
-            let Some(raw_agent) = item
-                .get("agent")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-            else {
-                continue;
-            };
-            let matched_agent = probed
-                .agents
-                .iter()
-                .find(|a| a.id.eq_ignore_ascii_case(raw_agent) && (!any_installed || a.installed));
-            let (agent_id, discovered_models) = match matched_agent {
-                Some(a) => (a.id.clone(), a.models.as_slice()),
-                None if !probed.agents.is_empty() => continue,
-                None => (raw_agent.to_ascii_lowercase(), &[][..]),
-            };
-
-            let raw_model = item
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| {
-                    !s.is_empty() && !s.eq_ignore_ascii_case("auto") && !s.eq_ignore_ascii_case("default")
-                });
-            let model = match raw_model {
-                Some(m) if !discovered_models.is_empty() => {
-                    discovered_models.iter().find(|dm| dm.eq_ignore_ascii_case(m)).cloned()
-                }
-                Some(m) => Some(m.to_string()),
-                None => None,
-            };
-
-            let pair_key = (agent_id.clone(), model.as_ref().map(|m| m.to_ascii_lowercase()));
-            if !seen_pairs.insert(pair_key) {
-                continue;
-            }
-
-            let raw_effort = parse_effort(item.get("effort").and_then(Value::as_str), existing.primary.effort);
-            let effort = clamp_effort_for_model(&agent_id, model.as_deref(), raw_effort, matched_agent);
-            let fast = agent_id == "codex" && item.get("fast").and_then(Value::as_bool).unwrap_or(false);
-            let context = if matches!(agent_id.as_str(), "cursor" | "cursor-agent") {
-                item.get("context")
+                let raw_model = item
+                    .get("model")
                     .and_then(Value::as_str)
                     .map(str::trim)
-                    .filter(|s| {
-                        !s.is_empty() && !s.eq_ignore_ascii_case("auto") && !s.eq_ignore_ascii_case("default")
-                    })
-                    .map(String::from)
-            } else {
-                None
-            };
-            let strengths = if mode == AiRoleConfigMode::Models {
-                existing_chain
+                    .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto") && !s.eq_ignore_ascii_case("default"));
+                let model = match raw_model {
+                    Some(m) if !discovered_models.is_empty() => {
+                        discovered_models.iter().find(|dm| dm.eq_ignore_ascii_case(m)).cloned()
+                    }
+                    Some(m) => Some(m.to_string()),
+                    None => None,
+                };
+
+                let pair_key = (agent_id.clone(), model.as_ref().map(|m| m.to_ascii_lowercase()));
+                if !seen_pairs.insert(pair_key) {
+                    continue;
+                }
+
+                let raw_effort = parse_effort(item.get("effort").and_then(Value::as_str), existing.primary.effort);
+                let effort = clamp_effort_for_model(&agent_id, model.as_deref(), raw_effort, matched_agent);
+                let fast = agent_id == "codex" && item.get("fast").and_then(Value::as_bool).unwrap_or(false);
+                let context = if matches!(agent_id.as_str(), "cursor" | "cursor-agent") {
+                    item.get("context")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|s| {
+                            !s.is_empty() && !s.eq_ignore_ascii_case("auto") && !s.eq_ignore_ascii_case("default")
+                        })
+                        .map(String::from)
+                } else {
+                    None
+                };
+                let matched_existing = existing_chain
                     .iter()
                     .find(|c| {
                         c.agent.eq_ignore_ascii_case(&agent_id)
                             && c.model.as_deref().map(str::to_ascii_lowercase)
                                 == model.as_deref().map(str::to_ascii_lowercase)
                     })
-                    .or_else(|| existing_chain.iter().find(|c| c.agent.eq_ignore_ascii_case(&agent_id)))
-                    .map(|c| c.strengths.clone())
-                    .unwrap_or_default()
-            } else {
-                let raw_strengths: Vec<String> = item
-                    .get("strengths")
-                    .and_then(Value::as_array)
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
-                normalize_strengths(&raw_strengths)
-            };
+                    .or_else(|| existing_chain.iter().find(|c| c.agent.eq_ignore_ascii_case(&agent_id)));
+                let strengths = if mode == AiRoleConfigMode::Models {
+                    matched_existing.map(|c| c.strengths.clone()).unwrap_or_default()
+                } else {
+                    let raw_strengths: Vec<String> = item
+                        .get("strengths")
+                        .and_then(Value::as_array)
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        .unwrap_or_default();
+                    normalize_strengths(&raw_strengths)
+                };
+                let note = super::config::normalize_note(item.get("note").and_then(Value::as_str), 400)
+                    .or_else(|| matched_existing.and_then(|c| c.note.clone()));
 
-            clean_cands.push(RoleTarget { agent: agent_id, model, effort, fast, context, strengths });
-            if clean_cands.len() >= 5 {
-                break;
+                clean_cands.push(RoleTarget { agent: agent_id, model, effort, fast, context, strengths, note });
+                if clean_cands.len() >= 5 {
+                    break;
+                }
             }
-        }
 
-        if let Some(primary) = clean_cands.first().cloned() {
-            let mut next_role = existing.clone();
-            next_role.primary = primary;
-            next_role.fallbacks = clean_cands.into_iter().skip(1).collect();
-            out.insert(role_id.clone(), next_role);
-            updated_any = true;
+            if let Some(primary) = clean_cands.first().cloned() {
+                let mut next_role = existing.clone();
+                next_role.primary = primary;
+                next_role.fallbacks = clean_cands.into_iter().skip(1).collect();
+                out.insert(role_id.clone(), next_role);
+                updated_any = true;
+            }
         }
     }
 
     if !updated_any {
         return Err(match mode {
             AiRoleConfigMode::Strengths => "AI 未返回任何有效的擅长任务标签".into(),
+            AiRoleConfigMode::Notes => "AI 未返回任何有效的备注内容".into(),
             _ => "AI 未生成任何匹配当前已安装 Agent 的有效角色配置".into(),
         });
     }
-    Ok((out, rationale))
+    Ok((out, global_note, rationale))
 }
 
 #[cfg(test)]
@@ -1427,5 +1549,148 @@ mod tests {
         assert_eq!(reviewer.access, Some(RoleAccessMode::Readonly));
         assert_eq!(reviewer.primary.agent, "codex");
         assert_eq!(reviewer.primary.model.as_deref(), Some("gpt-5.4"));
+    }
+
+    #[test]
+    fn route_candidate_payload_includes_local_time_global_note_and_candidate_notes() {
+        let mut cfg = DroveConfig::default();
+        cfg.note = Some("GLM 相关模型在下午 2:00–6:00 额度按两倍计算，应避免使用，除非没有其他 agent 可用。".into());
+        let task = Task {
+            id: "t1".into(),
+            run_id: "r1".into(),
+            key: "impl".into(),
+            title: "Implement auth".into(),
+            phase: None,
+            spec: Spec {
+                target: "src/auth.rs".into(),
+                change: "Add middleware".into(),
+                constraints: None,
+                ownership: None,
+                acceptance: "Tests pass".into(),
+                verify: None,
+            },
+            tags: vec!["后端".into()],
+            files: vec!["src/auth.rs".into()],
+            deps: Vec::new(),
+            output_schema: None,
+            isolation: Isolation::None,
+            timeout_sec: None,
+            stall_warn_sec: None,
+            stall_kill_sec: None,
+            when: None,
+            assign: None,
+            status: TaskStatus::Ready,
+            result: None,
+            failures: 0,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            kind: None,
+            exec_phase: None,
+            execution_version: None,
+            trigger_rule: None,
+            context: None,
+            exec: None,
+            foreach_from: None,
+            template: None,
+            expansion_state: None,
+            expanded_from: None,
+            review: None,
+            review_state: None,
+            candidate_result: None,
+            cache: None,
+            cached_from: None,
+        };
+        let pool = vec![
+            (
+                0,
+                RoleTarget {
+                    agent: "claude".into(),
+                    model: Some("zcode/GLM-5.3[1m]".into()),
+                    effort: Effort::High,
+                    fast: false,
+                    context: None,
+                    strengths: vec!["后端".into()],
+                    note: Some("高峰期双倍计费".into()),
+                },
+            ),
+            (
+                1,
+                RoleTarget {
+                    agent: "codex".into(),
+                    model: Some("gpt-5.4".into()),
+                    effort: Effort::High,
+                    fast: false,
+                    context: None,
+                    strengths: vec!["后端".into()],
+                    note: None,
+                },
+            ),
+        ];
+
+        let payload = build_route_candidate_payload(&cfg, &task, "coder", &pool, "2026-11-23T15:30:00+08:00 (Mon)");
+        assert_eq!(payload["current_local_time"], "2026-11-23T15:30:00+08:00 (Mon)");
+        assert_eq!(
+            payload["routing_note"],
+            "GLM 相关模型在下午 2:00–6:00 额度按两倍计算，应避免使用，除非没有其他 agent 可用。"
+        );
+        assert_eq!(payload["candidates"][0]["note"], "高峰期双倍计费");
+        assert!(payload["candidates"][1].get("note").is_none());
+        assert!(payload["candidates"][0]["strength_score"].as_u64().unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn ai_roles_configure_parses_notes_mode_and_all_mode_with_global_and_candidate_notes() {
+        let existing = super::super::config::default_roles();
+        let probed = ProbeSnapshot::default();
+
+        // 1. All mode parses both top-level global note and per-candidate notes.
+        let raw_all = r#"{
+          "rationale": "完成角色与备注一键配置",
+          "note": "GLM 相关模型在下午 2:00–6:00 额度按两倍计算，应避免使用，除非没有其他 agent 可用。",
+          "roles": {
+            "coder": {
+              "candidates": [
+                { "agent": "claude", "model": "claude-opus-4-6", "effort": "high", "strengths": ["复杂架构"], "note": "主力复杂任务" },
+                { "agent": "codex", "model": "gpt-5.4", "effort": "high", "fast": true, "strengths": ["快速修复"], "note": "轻量快速修改" }
+              ]
+            }
+          }
+        }"#;
+        let (all_roles, global_note, rationale) =
+            parse_and_sanitize_ai_roles_with_note(raw_all, &existing, &probed, AiRoleConfigMode::All).unwrap();
+        assert_eq!(rationale.as_deref(), Some("完成角色与备注一键配置"));
+        assert_eq!(
+            global_note.as_deref(),
+            Some("GLM 相关模型在下午 2:00–6:00 额度按两倍计算，应避免使用，除非没有其他 agent 可用。")
+        );
+        assert_eq!(all_roles["coder"].primary.note.as_deref(), Some("主力复杂任务"));
+        assert_eq!(all_roles["coder"].fallbacks[0].note.as_deref(), Some("轻量快速修改"));
+
+        // 2. Notes mode keeps existing agents/models/strengths unchanged and updates notes only.
+        let raw_notes = r#"{
+          "rationale": "已更新路由备注",
+          "note": "优先控制高峰期额度消耗，审查与编码尽量跨厂商。",
+          "roles": {
+            "coder": {
+              "candidates": [
+                { "index": 0, "note": "仅复杂架构首选" },
+                { "index": 1, "note": "主力忙或超额时兜底" }
+              ]
+            }
+          }
+        }"#;
+        let (notes_roles, notes_global, _) =
+            parse_and_sanitize_ai_roles_with_note(raw_notes, &all_roles, &probed, AiRoleConfigMode::Notes).unwrap();
+        assert_eq!(notes_global.as_deref(), Some("优先控制高峰期额度消耗，审查与编码尽量跨厂商。"));
+        assert_eq!(notes_roles["coder"].primary.agent, "claude");
+        assert_eq!(notes_roles["coder"].primary.strengths, vec!["复杂架构"]);
+        assert_eq!(notes_roles["coder"].primary.note.as_deref(), Some("仅复杂架构首选"));
+        assert_eq!(notes_roles["coder"].fallbacks[0].note.as_deref(), Some("主力忙或超额时兜底"));
+
+        // 3. Single note parser for global / candidate inline AI Note buttons.
+        let (single, single_why) =
+            parse_single_ai_note(r#"{"rationale":"已整理","note":"下午 2:00–6:00 避开 GLM，除非无替代"}"#, 400).unwrap();
+        assert_eq!(single, "下午 2:00–6:00 避开 GLM，除非无替代");
+        assert_eq!(single_why.as_deref(), Some("已整理"));
     }
 }

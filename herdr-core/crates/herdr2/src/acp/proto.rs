@@ -259,11 +259,8 @@ pub fn parse_session_config(val: &Value) -> Vec<AcpConfigOption> {
     let mut out = Vec::new();
     if let Some(arr) = val.get("configOptions").and_then(Value::as_array) {
         for item in arr {
-            let Some(id) = item
-                .get("configId")
-                .or_else(|| item.get("id"))
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
+            let Some(id) =
+                item.get("configId").or_else(|| item.get("id")).and_then(Value::as_str).filter(|s| !s.is_empty())
             else {
                 continue;
             };
@@ -483,10 +480,7 @@ pub fn detect_mime_type(path_or_name: &str, bytes: &[u8]) -> Option<&'static str
             return Some("image/svg+xml");
         }
     }
-    let ext = std::path::Path::new(path_or_name)
-        .extension()
-        .and_then(|s| s.to_str())
-        .map(str::to_ascii_lowercase);
+    let ext = std::path::Path::new(path_or_name).extension().and_then(|s| s.to_str()).map(str::to_ascii_lowercase);
     match ext.as_deref() {
         Some("png") => Some("image/png"),
         Some("jpg" | "jpeg") => Some("image/jpeg"),
@@ -694,10 +688,7 @@ pub fn parse_session_update(params: &Value) -> Option<(String, ParsedUpdate)> {
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|item| {
-                            item.get("content")
-                                .or_else(|| item.get("title"))
-                                .and_then(Value::as_str)
-                                .map(String::from)
+                            item.get("content").or_else(|| item.get("title")).and_then(Value::as_str).map(String::from)
                         })
                         .collect()
                 })
@@ -767,22 +758,16 @@ fn parse_one_content_block(item: &Value) -> Option<ContentBlock> {
                 .unwrap_or_else(|| uri.clone());
             let title = obj.get("title").and_then(Value::as_str).map(String::from);
             let description = obj.get("description").and_then(Value::as_str).map(String::from);
-            let mime_type = obj
-                .get("mimeType")
-                .or_else(|| obj.get("mime_type"))
-                .and_then(Value::as_str)
-                .map(String::from);
+            let mime_type =
+                obj.get("mimeType").or_else(|| obj.get("mime_type")).and_then(Value::as_str).map(String::from);
             let size = obj.get("size").and_then(Value::as_u64);
             Some(ContentBlock::ResourceLink { uri, name, title, description, mime_type, size })
         }
         Some("resource") => {
             let res = obj.get("resource")?;
             let uri = res.get("uri").and_then(Value::as_str)?.to_string();
-            let mime_type = res
-                .get("mimeType")
-                .or_else(|| res.get("mime_type"))
-                .and_then(Value::as_str)
-                .map(String::from);
+            let mime_type =
+                res.get("mimeType").or_else(|| res.get("mime_type")).and_then(Value::as_str).map(String::from);
             if let Some(text) = res.get("text").and_then(Value::as_str) {
                 Some(ContentBlock::Resource {
                     resource: EmbeddedResourceContent::Text { uri, mime_type, text: text.to_string() },
@@ -902,11 +887,8 @@ fn extract_tool_detail(update: &Value) -> Option<String> {
         match raw_out {
             Value::String(s) if !s.trim().is_empty() => parts.push(s.trim().to_string()),
             Value::Object(obj) => {
-                if let Some(s) = obj
-                    .get("stdout")
-                    .or_else(|| obj.get("output"))
-                    .or_else(|| obj.get("text"))
-                    .and_then(Value::as_str)
+                if let Some(s) =
+                    obj.get("stdout").or_else(|| obj.get("output")).or_else(|| obj.get("text")).and_then(Value::as_str)
                     && !s.trim().is_empty()
                 {
                     parts.push(s.trim().to_string());
@@ -941,11 +923,7 @@ fn extract_tool_detail(update: &Value) -> Option<String> {
         }
     }
 
-    if parts.is_empty() {
-        None
-    } else {
-        crate::transcript::cap_tool_detail(&parts.join("\n\n"))
-    }
+    if parts.is_empty() { None } else { crate::transcript::cap_tool_detail(&parts.join("\n\n")) }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

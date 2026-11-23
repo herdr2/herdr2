@@ -1,9 +1,34 @@
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, ScrollHandle } from "gpui-base";
-import { spaces, panes, terminals, agents, focused, run, openOverlay, theme, window, shared, layout, settings } from "herdr";
+import { spaces, panes, terminals, agents, focused, run, openOverlay, theme, window, shared, layout, settings, keys } from "herdr";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
+
+function shortcutFor(action) {
+  if (typeof keys !== "function" || !action) return "";
+  const list = keys();
+  if (!Array.isArray(list)) return "";
+  const k = list.find((b) => b.section === "global" && b.action === action);
+  if (!k?.keys?.trim()) return "";
+  const mac = typeof window === "function" && window()?.platform === "macos";
+  const names = mac ? { ctrl: "⌃", alt: "⌥", shift: "⇧", cmd: "⌘", fn: "fn" } : { ctrl: "Ctrl", alt: "Alt", shift: "Shift", cmd: "Super", fn: "Fn" };
+  const alias = { secondary: mac ? "cmd" : "ctrl", super: "cmd", win: "cmd" };
+  return k.keys.trim().split(/\s+/).map((stroke) => {
+    const parts = stroke.split("-");
+    let key = parts.pop();
+    if (key === "") { key = "-"; parts.pop(); }
+    const held = new Set(parts.map((m) => alias[m.toLowerCase()] ?? m.toLowerCase()));
+    if (/^[A-Z]$/.test(key)) held.add("shift");
+    const label = key.length === 1 ? key.toUpperCase() : key[0].toUpperCase() + key.slice(1).toLowerCase();
+    return [...Object.keys(names).filter((m) => held.has(m)).map((m) => names[m]), label].join(mac ? "" : "+");
+  }).join(" ");
+}
+
+function withShortcut(text, action) {
+  const sc = shortcutFor(action);
+  return sc ? `${text} (${sc})` : text;
+}
 const zoomScale = () => Math.max(0.25, Number(typeof settings === "function" ? settings()?.zoom : 1) || 1);
 
 function resolvePeerAddr(raw, sibling) {
@@ -64,37 +89,62 @@ const clean = (s) => (s ?? "").replace(/^[^\p{L}\p{N}\p{Ps}\p{Pi}]+/u, "").repla
 
 const AUTO_TAB_NAMES = new Set([
   "terminal", "终端", "shell", "zsh", "bash", "sh", "fish", "nu", "nushell", "dash",
-  "pwsh", "powershell", "cmd", "git bash", "wsl",
-  "claude", "claude code", "codex", "gemini", "antigravity", "agy", "opencode",
-  "cursor", "cursor-agent", "pi", "qwen", "kimi", "copilot", "amp", "grok", "hermes", "goose", "agent",
+  "pwsh", "powershell", "powershell 7", "windows powershell", "cmd", "command prompt", "git bash", "wsl", "dos prompt", "headless",
+  "claude", "claude code", "claude-code", "codex", "gemini", "antigravity", "agy", "opencode",
+  "cursor", "cursor-agent", "pi", "pig", "qwen", "kimi", "kimi-code", "kiro", "kiro-cli",
+  "qoder", "qodercli", "copilot", "github-copilot", "amp", "grok", "hermes", "goose", "crush",
+  "omp", "oh-my-pi", "dsh", "dsh-tui", "deepseek", "deepseek harness", "zcode", "zcode-cli", "glm", "agent",
 ]);
 
-function isAutoTabName(tab, prog) {
-  if (!tab.named) return true;
-  const name = String(tab.name ?? "").trim();
+function isAutoName(rawName, prog, lead = null) {
+  const name = String(rawName ?? "").trim();
   if (!name) return true;
-  if (prog && name === prog) return true;
-  return AUTO_TAB_NAMES.has(name.toLowerCase());
+  const lower = name.toLowerCase();
+  if (prog && lower === String(prog).trim().toLowerCase()) return true;
+  if (lead?.program?.key && lower === String(lead.program.key).trim().toLowerCase()) return true;
+  if (lead?.terminal) {
+    const addr = String(lead.terminal).trim().toLowerCase();
+    const slash = addr.lastIndexOf("/");
+    const shortAddr = slash >= 0 ? addr.slice(slash + 1) : addr;
+    if (lower === addr || (shortAddr && lower === shortAddr)) return true;
+  }
+  return AUTO_TAB_NAMES.has(lower);
+}
+
+function isAutoTabName(tab, prog, lead = null) {
+  if (!tab.named) return true;
+  return isAutoName(tab.name, prog, lead);
 }
 
 // A tab Herdr named (unnamed, or after a default shell/agent program) follows its agent's
 // semantic title or live title, as the agents list does; a name the person gave stays.
-function label(tab, lead) {
+function label(tab, lead, rec = null) {
   const prog = lead?.program?.name;
+  const custom = lead?.custom_name || rec?.labels?.["herdr.name"];
+  if (custom && String(custom).trim() && !isAutoName(custom, prog, lead)) return String(custom).trim();
   const base = tab.named ? tab.name : prog ?? "Terminal";
   if (!lead?.program?.agent && !lead?.acp) return base;
-  const auto = isAutoTabName(tab, prog);
-  const semantic = typeof lead?.semantic_title === "string" ? lead.semantic_title.trim() : "";
+  const auto = isAutoTabName(tab, prog, lead);
+  const semantic = String(lead?.semantic_title ?? rec?.semantic_title ?? "").trim();
   if (auto && semantic) return semantic;
-  const live = clean(lead.title);
-  // clean() would strip a path's leading ~ or /: test the title with only its status glyph gone.
-  const path = /^[~/]|^[A-Za-z]:\\/.test((lead.title ?? "").replace(/^[^\p{L}\p{N}~/]+/u, ""));
-  const telling = live && live !== lead.terminal && live !== prog && !path && !live.includes("@") && live.toLowerCase() !== lead.program?.key;
-  return auto && telling ? live : base;
+  for (const raw of [lead?.title, rec?.title]) {
+    const live = clean(raw);
+    // clean() would strip a path's leading ~ or /: test the title with only its status glyph gone.
+    const path = /^[~/]|^[A-Za-z]:\\/.test((raw ?? "").replace(/^[^\p{L}\p{N}~/]+/u, ""));
+    const telling = live && live !== lead.terminal && live !== prog && !path && !live.includes("@") && live.toLowerCase() !== lead.program?.key;
+    if (auto && telling) return live;
+  }
+  if (auto) {
+    const perm = String(rec?.pending_permission?.title ?? "").trim();
+    if (perm) return perm;
+    const micro = String(lead?.micro_summary ?? rec?.micro_summary ?? "").trim();
+    if (micro) return micro;
+  }
+  return auto && prog ? prog : base;
 }
 
 function paneDisplayName(p) {
-  if (p?.custom_name) return p.custom_name;
+  if (p?.custom_name && !isAutoName(p.custom_name, p?.program?.name, p)) return p.custom_name;
   const semantic = isAgentPane(p) && typeof p?.semantic_title === "string" ? p.semantic_title.trim() : "";
   if (semantic) return semantic;
   if (p?.acp || p?.structured) return p.program?.name || clean(p.title) || p.terminal || "Agent";
@@ -146,6 +196,8 @@ function buildTabMicroTooltip(tab, lead, displayName, elapsed, termByAddr) {
 }
 
 const TAB_GAP = 3;
+const MIN_EQUAL_TAB_WIDTH = 36;
+const DEFAULT_NATURAL_TAB_WIDTH = 150;
 
 function formatElapsed(ms) {
   const totalSec = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
@@ -164,6 +216,11 @@ const isAgentPane = (p) => isAcpPane(p) || isTermAgentPane(p);
 export default class Tabs extends View {
   init(_props, cx) {
     this.widths = {};
+    this.naturalWidths = {};
+    this.stripWidth = 0;
+    this.equalTabWidth = null;
+    this.seenTabsSpace = null;
+    this.seenTabIds = new Set();
     this.drag = null;
     this.settling = null;
     this.settleTask = null;
@@ -252,8 +309,61 @@ export default class Tabs extends View {
     return entries[0].info;
   }
 
+  ensureNewTabsAtTail(space, shown) {
+    const spaceId = space?.id ?? null;
+    if (!spaceId) {
+      this.seenTabsSpace = null;
+      this.seenTabIds = new Set();
+      return;
+    }
+    const ids = shown.map((c) => c.id);
+    if (this.seenTabsSpace !== spaceId) {
+      this.seenTabsSpace = spaceId;
+      this.seenTabIds = new Set(ids);
+      return;
+    }
+    const prev = this.seenTabIds ?? new Set();
+    const added = [];
+    for (let i = 0; i < shown.length; i++) {
+      if (!prev.has(shown[i].id)) added.push({ id: shown[i].id, index: i });
+    }
+    this.seenTabIds = new Set(ids);
+    if (added.length === 0 || this.drag || this.settling) return;
+    // If any newly added tab was inserted before the tail (e.g. after active tab), move it to the end.
+    const tailStart = shown.length - added.length;
+    const allAtTail = added.every((item, k) => item.index === tailStart + k);
+    if (!allAtTail) {
+      for (const item of added) {
+        run("tab.move", { id: item.id, index: shown.length });
+      }
+    }
+  }
+
+  computeEqualTabWidth(shown) {
+    const count = shown.length;
+    if (count <= 1 || !(this.stripWidth > 0)) return null;
+    const avail = this.stripWidth - TAB_GAP * (count - 1);
+    if (avail <= 0) return null;
+    let knownSum = 0;
+    let knownCount = 0;
+    for (const c of shown) {
+      const nw = this.naturalWidths?.[c.id];
+      if (typeof nw === "number" && nw > 0) {
+        knownSum += nw;
+        knownCount += 1;
+      }
+    }
+    const fallbackNatural = knownCount > 0 ? knownSum / knownCount : DEFAULT_NATURAL_TAB_WIDTH;
+    let totalNatural = 0;
+    for (const c of shown) {
+      totalNatural += this.naturalWidths?.[c.id] ?? this.widths?.[c.id] ?? fallbackNatural;
+    }
+    if (totalNatural <= avail + 1) return null;
+    return Math.max(MIN_EQUAL_TAB_WIDTH, Math.floor(avail / count));
+  }
+
   tabWidth(id) {
-    return this.widths[id] ?? 136;
+    return this.equalTabWidth ?? this.widths[id] ?? 136;
   }
 
   slotLeft(shown, index) {
@@ -449,6 +559,7 @@ export default class Tabs extends View {
     const t = theme();
     const space = spaces().find(p => p.active);
     const shown = space?.tabs ?? [];
+    this.ensureNewTabsAtTail(space, shown);
     const orderSig = shown.map((x) => x.id).join(",");
     let snapNeighbors = false;
     if (this.snapFromOrder) {
@@ -469,6 +580,14 @@ export default class Tabs extends View {
     }
     const active = shown.findIndex(tab => tab.active);
     const selected = shown[active]?.id;
+    const shownIds = new Set(shown.map((c) => c.id));
+    if (this.naturalWidths) {
+      for (const id of Object.keys(this.naturalWidths)) {
+        if (!shownIds.has(id)) delete this.naturalWidths[id];
+      }
+    }
+    const equalTabWidth = this.computeEqualTabWidth(shown);
+    this.equalTabWidth = equalTabWidth;
     if ((selected !== this.selected || active !== this.selectedIndex) && !this.drag && !this.settling) {
       this.selected = selected;
       this.selectedIndex = active;
@@ -476,7 +595,8 @@ export default class Tabs extends View {
     }
     const alpha = (hex, a) => (typeof hex === "string" && /^#[0-9a-fA-F]{6}$/.test(hex) ? hex + a : null);
     const stop = (_e, cx) => cx.stop_propagation();
-    const button = (id, label, action) => div().id(id).size(26).flex_none().flex().items_center().justify_center().rounded(6).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
+    const button = (id, label, action, tip = "") => div().id(id).size(26).flex_none().flex().items_center().justify_center().rounded(6).text_color(t.dim).hover(s => s.bg(t.hover).text_color(t.foreground))
+      .when(Boolean(tip), el => el.tooltip(tip))
       .on_mouse_down("left", stop).on_click(action).child(label);
     const motion = this.drag?.moving ? this.drag : this.settling;
     const now = Date.now();
@@ -494,7 +614,7 @@ export default class Tabs extends View {
       }
       return base;
     };
-    const renderCard = (c, showClose, { isFloating = false, width = null, interactive = true, isMergeTarget = false, showMergeBadge = false } = {}) => {
+    const renderCard = (c, showClose, { isFloating = false, width = null, interactive = true, isMergeTarget = false, showMergeBadge = false, showSeparator = false } = {}) => {
       const tabPanes = panes().filter(p => p.tab === c.id);
       const lead = tabPanes.find(p => p.program?.agent) ?? tabPanes[0];
       const paneCount = tabPanes.length;
@@ -509,31 +629,43 @@ export default class Tabs extends View {
       const agentPanes = tabPanes.filter(isAgentPane);
       const elapsed = this.tabElapsed(c, tabPanes, agentPanes, now);
       const program = lead?.program;
-      const name = c.named ? label(c, lead) : (combinedName || label(c, lead));
+      const leadRec = lead?.terminal ? termByAddr.get(lead.terminal) : null;
+      const name = c.named ? label(c, lead, leadRec) : (combinedName || label(c, lead, leadRec));
       const hoverTip = !isFloating && !c.active && isAgentPane(lead)
         ? buildTabMicroTooltip(c, lead, name, elapsed, termByAddr)
-        : "";
+        : (!isFloating && width > 0 ? (c.zoomed ? `${name} Z` : name) : "");
       const accent = t.accent ?? "#3b82f6";
+      const constrained = !isFloating && width > 0;
+      const cardW = width > 0 ? width : null;
+      const tight = Boolean(constrained && cardW < 110);
+      const showIcon = Boolean(program?.icon) && (!constrained || cardW >= 56);
+      const showTypePills = !constrained || cardW >= 118;
+      const showElapsedPill = Boolean(elapsed) && (!constrained || cardW >= 155);
+      const sepColor = alpha(t.foreground, "26") ?? t.border;
       let el = h_flex()
         .id(isFloating ? `tab-float-card-${c.id}` : `tab-${c.id}`)
         .h(29)
-        .px(10)
-        .gap(6)
+        .px(tight ? 6 : 10)
+        .gap(tight ? 4 : 6)
         .rounded(7)
         .items_center()
         .flex_none()
+        .when(Boolean(cardW), node => node.w(cardW).overflow_hidden())
         .when(Boolean(hoverTip), (node) => node.tooltip(hoverTip))
         .text_size(12.8)
-        .when(Boolean(isFloating && width > 0), node => node.w(width))
         .border(1)
         .border_color(isFloating || isMergeTarget ? accent : (c.active ? t.border : t.chrome))
         .bg(isMergeTarget ? (alpha(accent, "28") ?? t.selected) : (c.active || isFloating ? t.raised : t.chrome))
         .text_color(c.active || isFloating || isMergeTarget ? t.foreground : t.muted)
         .when(isFloating, node => node.shadow_md().cursor_grabbing())
         .when(!isFloating && interactive, node => node.hover(s => s.bg(t.hover)))
-        .when(Boolean(program?.icon), node => node.child(program.tint ? svg(program.icon).size(14).text_color(t.muted) : image(program.icon).size(14)))
-        .child(div().max_w(isMerged ? 210 : 160).truncate().child(c.zoomed ? `${name} Z` : name))
-        .when(!isFloating && isMerged, node => node.child(
+        .when(showIcon, node => node.child(program.tint ? svg(program.icon).size(14).flex_none().text_color(t.muted) : image(program.icon).size(14).flex_none()))
+        .child(
+          constrained
+            ? div().flex_1().min_w(0).truncate().child(c.zoomed ? `${name} Z` : name)
+            : div().max_w(isMerged ? 210 : 160).truncate().child(c.zoomed ? `${name} Z` : name),
+        )
+        .when(!isFloating && isMerged && showTypePills, node => node.child(
           div()
             .id(`tab-merged-${c.id}`)
             .px(4.5)
@@ -568,7 +700,7 @@ export default class Tabs extends View {
             .text_color(t.accent_foreground ?? "#ffffff")
             .child(tr("◫ Split", "◫ 分栏")),
         ))
-        .when(hasAcpAgent, node => node.child(
+        .when(hasAcpAgent && showTypePills, node => node.child(
           div()
             .px(4.5)
             .h(15)
@@ -585,7 +717,7 @@ export default class Tabs extends View {
             .when(!isFloating, el => el.tooltip(tr("ACP Agent", "ACP 智能体")))
             .child("ACP"),
         ))
-        .when(hasTermAgent, node => node.child(
+        .when(hasTermAgent && showTypePills, node => node.child(
           div()
             .px(4.5)
             .h(15)
@@ -602,7 +734,7 @@ export default class Tabs extends View {
             .when(!isFloating, el => el.tooltip(hasStructuredTermAgent ? tr("Terminal Agent (Structured View)", "终端智能体（结构化视图）") : tr("Terminal Agent", "终端智能体")))
             .child(tr("CLI", "终端")),
         ))
-        .when(Boolean(elapsed), node => node.child(
+        .when(showElapsedPill, node => node.child(
           h_flex()
             .id(isFloating ? `tab-float-time-${c.id}` : `tab-time-${c.id}`)
             .px(4.5)
@@ -622,16 +754,28 @@ export default class Tabs extends View {
             .child(formatElapsed(elapsed.ms)),
         ))
         .when((agentPanes.length > 0 || tabPanes.length === 0) && c.status === "working", node => node.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)))
-        .when((agentPanes.length > 0 || tabPanes.length === 0) && (c.status === "blocked" || c.status === "done"), node => node.child(div().size(6).rounded(3).bg(t[c.status])))
+        .when((agentPanes.length > 0 || tabPanes.length === 0) && (c.status === "blocked" || c.status === "done"), node => node.child(div().size(6).flex_none().rounded(3).bg(t[c.status])))
         .when(!isFloating && showClose, node => node.child(
           div()
             .id(`close-${c.id}`)
+            .flex_none()
             .text_color(t.dim)
             .hover(s => s.text_color(t.foreground))
-            .tooltip(allAcp && tabPanes.some(p => p.status !== "ended") ? tr("Move to background", "转入后台") : tr("Close tab", "关闭标签页"))
+            .tooltip(withShortcut(allAcp && tabPanes.some(p => p.status !== "ended") ? tr("Move to background", "转入后台") : tr("Close tab", "关闭标签页"), "tab.close"))
             .on_mouse_down("left", stop)
             .on_click((_e, cx) => { cx.stop_propagation(); run("tab.close", { id: c.id }); })
             .child(svg("mods/pane/close.svg").size(12)),
+        ))
+        .when(!isFloating && showSeparator, node => node.child(
+          div()
+            .id(`tab-sep-${c.id}`)
+            .absolute()
+            .right(0)
+            .top(7)
+            .w(1)
+            .h(14)
+            .rounded(1)
+            .bg(sepColor),
         ));
       return el;
     };
@@ -639,6 +783,14 @@ export default class Tabs extends View {
       const isMergeTarget = Boolean(this.drag?.moving && this.drag.mergeTarget === c.id);
       const showClose = (c.active || this.hoveredTab === c.id) && !(motion && motion.from === i) && !this.drag?.moving;
       const isHiddenSource = Boolean(motion && motion.from === i);
+      const nextTab = shown[i + 1] ?? null;
+      const nextHidden = Boolean(motion && motion.from === i + 1);
+      const showSeparator =
+        !isHiddenSource &&
+        !isMergeTarget &&
+        !c.active &&
+        this.hoveredTab !== c.id &&
+        (!nextTab || (!nextTab.active && this.hoveredTab !== nextTab.id && !nextHidden));
       let shift = 0;
       if (motion && i !== motion.from) {
         if (motion.from < motion.to && i > motion.from && i <= motion.to) {
@@ -647,7 +799,7 @@ export default class Tabs extends View {
           shift = motion.dragWidth + TAB_GAP;
         }
       }
-      return renderCard(c, showClose, { interactive: !isHiddenSource, isMergeTarget })
+      return renderCard(c, showClose, { width: equalTabWidth, interactive: !isHiddenSource, isMergeTarget, showSeparator })
         .relative()
         .left(shift)
         .spring("left", { response: snapNeighbors || isHiddenSource ? 0 : 165, damping: 0.86, epsilon: 0.25 })
@@ -659,6 +811,10 @@ export default class Tabs extends View {
           let changed = false;
           if (w > 0 && Math.abs((this.widths[c.id] ?? 0) - w) > 0.5) {
             this.widths[c.id] = w;
+            changed = true;
+          }
+          if (!equalTabWidth && w > 0 && Math.abs((this.naturalWidths[c.id] ?? 0) - w) > 0.5) {
+            this.naturalWidths[c.id] = w;
             changed = true;
           }
           if (i <= active && !this.drag && !this.settling) {
@@ -723,7 +879,9 @@ export default class Tabs extends View {
       const on = panel && !panel.hidden && body?.active === id;
       return h_flex().id(`panel-${id}`).h(26).px(8).gap(5).flex_none().items_center().rounded(6)
         .text_size(12).bg(on ? t.selected : t.chrome).text_color(on ? t.foreground : t.muted)
-        .hover(s => s.bg(t.hover)).on_mouse_down("left", stop)
+        .hover(s => s.bg(t.hover))
+        .tooltip(withShortcut(on ? tr(`Hide ${label} panel`, `收起${label}面板`) : tr(`Open ${label} panel`, `打开${label}面板`), "layout.toggle:panel"))
+        .on_mouse_down("left", stop)
         .on_click(() => {
           if (on) run("layout.hide", { id: "panel" });
           else { run("layout.select", { stack: "panel-body", child: id }); run("layout.show", { id: "panel" }); }
@@ -750,10 +908,23 @@ export default class Tabs extends View {
       .on_mouse_up("left", (_e, cx) => this.finishDrag(space, shown, cx))
       .on_scroll_wheel(e => this.wheel(e))
       .child(h_flex().id("tab-scroll").relative().flex_1().min_w(0).h_full().items_center().gap(TAB_GAP).overflow_x_scrollbar().track_scroll(this.scroll)
-        .on_size_change((_size, cx) => { if (active >= 0 && !this.drag && !this.settling) { this.scroll.scroll_to_item(active); cx.notify(); } })
+        .on_size_change((size, cx) => {
+          const z = zoomScale();
+          const sw = size && typeof size.width === "number" ? size.width / z : 0;
+          let changed = false;
+          if (sw > 0 && Math.abs(this.stripWidth - sw) > 0.5) {
+            this.stripWidth = sw;
+            changed = true;
+          }
+          if (active >= 0 && !this.drag && !this.settling) {
+            this.scroll.scroll_to_item(active);
+            changed = true;
+          }
+          if (changed) cx.notify();
+        })
         .children(shown.map(item))
         .when(Boolean(floatingTab), el => el.child(floatingTab)))
-      .child(button("tab-new", "+", () => openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 })))
+      .child(button("tab-new", "+", () => openOverlay({ mod: "new-menu", kind: "popup", width: 250, height: 512 }), withShortcut(tr("New agent or terminal", "新建智能体或终端"), "mod.open:new-menu")))
       .when(enabled.includes("files"), el => el.child(panelButton("files", tr("Files", "文件"), "mods/files/file.svg")))
       .when(enabled.includes("changes"), el => el.child(panelButton("changes", tr("Changes", "变更"), "mods/changes/changes.svg")))
       .when(enabled.includes("checkpoints"), el => el.child(panelButton("checkpoints", tr("Checkpoints", "快照"), "mods/checkpoints/checkpoints.svg")))

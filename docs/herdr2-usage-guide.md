@@ -56,10 +56,11 @@ Herdr2 与原版 Herdr（`herdr-app` + `hc`）使用完全隔离的可执行文�
 - **新建工作区（Space） / 标签页（Tab） / 分屏（Split）**：默认立即在真实 PTY/ConPTY 中启动本机 Shell（Linux/macOS 默认交互 Shell，Windows 为 `powershell.exe`），由 `libghostty-vt` 渲染与 `holder` 托管；顶部 Tab 栏支持**左右拖拽换序（相邻 Tab 弹簧平移动画）**与滚轮切换，关闭桌面窗口后终端仍在后台存活，重新打开窗口即无缝接回。
 - **`+` 菜单（`new-menu`）**：
   - 点击 **`Terminal`**：在当前 Space 打开一个新的真实终端标签页；
-  - 点击 **`Start an agent`** 下方已安装工具（源自 `defaults/programs.json`，包含 Claude Code、Codex、OpenCode、Cursor、Copilot、Amp、Antigravity、Kimi、Kiro、Hermes、Qoder、Crush、Gemini 等）：直接在真实终端标签页内以完整权限参数启动对应交互式 CLI（如 `claude --dangerously-skip-permissions`、`codex --no-daemon --dangerously-bypass-approvals-and-sandbox`、`agent --yolo --trust`、`opencode --auto`、`gemini --yolo`；Windows 下自动附带 `powershell.exe -ExecutionPolicy Bypass` 确保 `.ps1` / `.cmd` 垫片稳定拉起），可在 `~/.config/herdr2-app/programs.json` 按条目覆写；
+  - 点击 **`Start an agent`** 下方已安装工具（源自 `defaults/programs.json`，包含 Claude Code、Codex、OpenCode、Cursor、Copilot、Amp、Antigravity、Kimi、Kiro、Hermes、Qoder、Crush、Gemini、ZCode 等）：直接在真实终端标签页内以完整权限参数启动对应交互式 CLI（如 `claude --dangerously-skip-permissions`、`codex --no-daemon --dangerously-bypass-approvals-and-sandbox`、`agent --yolo --trust`、`opencode --auto`、`gemini --yolo`、`zcode --mode yolo`；Windows 下自动附带 `powershell.exe -ExecutionPolicy Bypass` 确保 `.ps1` / `.cmd` 垫片稳定拉起），可在 `~/.config/herdr2-app/programs.json` 按条目覆写；
   - 点击 **`New space` / `New worktree…` / `Open worktree…`**：新建空间或管理 Git Worktree 空间。
 - **左下角 `Agents` 状态面板（双通道实时感知与快捷控制）**：
   - **交互式 CLI Agent（`t*`）**：无需 CLI 发出 Ghostty `OSC 7501`，在工作区终端运行受支持的编程 CLI（包含 `node .../@anthropic-ai/claude-code/cli.js`、版本路径二进制、PowerShell 包装启动以及退出回落到 Shell）均自动识别并实时展示 `working` / `Needs you`（`blocked`） / `done` / `idle`；若程序本身发出 `OSC 7501` 仍以 `OSC 7501` 为最高优先级。
+  - **ZCode CLI（`zcode`）**：从菜单启动或在工作区终端手动运行 `zcode` 都能识别（进程名 `zcode-cli`）。首次从 Herdr2 启动时，会把 checkpoint hooks 幂等地写入 ZCode 的运行时配置 `~/.zcode/cli/config.json`，并打开其中的 `hooks.enabled`（hooks 是 ZCode 全部会话共用的开关；在 Herdr2 终端之外这些 hook 立即返回 `{}`，不影响其他 ZCode 会话）。此后每轮对话自动留 checkpoint（`h2 checkpoint ls tN`）。回滚到第 k 轮会恢复工作区文件，并以 `zcode --resume <会话>` 重开同一会话，在下一条提示里注入回滚说明：ZCode 的对话历史存在它自己的数据库里，无法像 Claude Code 那样截断。ZCode 不落盘可读的对话 transcript，所以没有基于 transcript 的会话内容和 handoff 上下文。
   - **无头 ACP Agent（`a*` / `wsl/a*`）**：同时纳入工作区窗格派生的子 Agent（挂在所属父终端树下并向上聚合紧急状态）与独立/跨机无头 ACP 根 Agent（标有 `ACP` 标签）。
   - **点击与移除**：点击窗格 Agent 切换聚焦窗格，点击无头 ACP 行打开 **T3 Code 风格对话弹窗（ACP Peek）**：展示去壳 `<h2 ...>` 后的用户消息气泡（含来源徽章与时间）、可折叠推理与工具执行时间线（Thought / Tool Calls / Plan）、富文本 Markdown 排版（表格、列表、带语言顶栏与一键 `Copy` 的代码块卡片、Turn 全文复制与诊断 `stderr` 抽屉）、行内权限定向审批条（`Approve` / `Deny`），以及底部自增高多行输入栏（`Enter` 发送、`Shift+Enter` 换行、`Steer` 抢占插话与队列计数）；悬停任意父行或子行均提供 **`✕` 移除按钮**（关闭窗格或结束 ACP 会话并同步退场）；关闭某个 Space（`space.close`）时会自动结束并同步清理归属该工作区目录的无头 ACP 会话。
   - **手动校准状态（`Idle` / `Working` / `Needs you` / `Done` / `Auto detect`）**：当终端 Agent 识别偏差或需要手动标记状态时，可**点击左下角 Agents 列表中任意 Agent / 子 Agent 左侧的状态圆点/徽标**、**右键点击任意 Agent 行**、通过命令面板（`Ctrl+Shift+P` 搜索 `Set agent status`）或执行 `herdr2 do agent.status` 手动设置状态，并通过 `herdr.status` 标签跨端持久化；新的一轮对话开始或切回 `Auto detect` 时自动恢复自动识别。
@@ -133,7 +134,7 @@ h2 events           # 实时订阅生命周期与结构化 transcript / status �
 - `pi`（`pi-acp`）
 - `hermes`（`hermes-acp`）
 - `glm`（`glm-acp-agent`）
-- `zcode`（`zcode-acp`）
+- `zcode`（`zcode-acp-server`）
 
 ```sh
 # 1) 前台运行并等待首轮完成（不打开任何终端窗格）

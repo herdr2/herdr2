@@ -52,6 +52,7 @@
     "ctrl-shift-enter": "terminal.open",
     "ctrl-alt-n": "mod.open:new-menu",
     "ctrl-alt-p": "prompt.polish",
+    "ctrl-alt-u": "prompt.polish_undo",
     "ctrl-alt-f": "mod.open:flash-note",
     "ctrl-shift-m": "terminal.view:toggle",
     "ctrl-shift-h": "agent.handoff",

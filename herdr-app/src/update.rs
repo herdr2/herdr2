@@ -1,30 +1,30 @@
-//! The app's own updates. An installed app (Linux: `~/.local/share/herdr-app`,
-//! macOS: `Herdr.app`) checks `releases.herdr.dev/app/latest.json` a little
-//! after it opens and every hour, downloads a newer build for this
-//! machine, checks its sha256 and unpacks it next to itself (`<install>.new`).
-//! The frame then shows "Restart"; the swap happens on restart or the next
-//! quit, or before opening the next window after a crash. The first start
-//! after a swap runs `hc update` for the core.
+//! The app's own updates, UI bundle hot-updates, and core updates.
 //!
-//! A build from source never updates: only `scripts/package` (the release
-//! builds) sets `HERDR_APP_RELEASE`. `scripts/install-macos` makes a
-//! Herdr.app too, so the install's shape alone can't tell.
+//! An installed app (Linux: `~/.local/share/herdr2`, macOS: `Herdr2.app`,
+//! Windows: `%LOCALAPPDATA%\Programs\herdr2`) checks `<releases_url>/app/latest.json`,
+//! `<releases_url>/ui/latest.json`, and `<releases_url>/core/latest.json` shortly
+//! after startup and every hour:
+//! - App binary updates download, verify SHA-256, stage to `<root>.new`, and
+//!   swap atomically on Restart or quit (or on next startup after crash).
+//! - UI bundle updates (`ui/latest.json`) download, verify SHA-256 & host API
+//!   compatibility, and hot-apply live without restarting the window.
+//! - Core updates (`core/latest.json`) upgrade `h2` in-place via `h2 update`
+//!   while keeping all live terminals running.
 //!
-//! The core is checked on the same clock (`core/latest.json`): a newer core
-//! of the same generation is offered (also applied after an app update), unless
-//! a package manager owns it. Within a generation a newer core only adds.
-
-#![allow(dead_code)]
+//! Releases URL priority: `HERDR2_RELEASES_URL` env -> `settings.json`
+//! `releases_url` -> compile-time `HERDR2_DEFAULT_RELEASES_URL`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const EVERY: Duration = Duration::from_secs(60 * 60);
 /// After a failed check or download (offline, a damaged file).
 const RETRY: Duration = Duration::from_secs(30 * 60);
+/// Wait briefly after startup so initial UI rendering stays snappy.
+const INITIAL_DELAY: Duration = Duration::from_secs(12);
 
 /// Where this app is installed: the folder (Linux) or bundle (macOS) an
 /// update replaces. Read once: after a swap this process's own file is gone.
@@ -71,15 +71,27 @@ fn target() -> String {
     format!("{os}-{}", std::env::consts::ARCH)
 }
 
-fn releases() -> String {
-    std::env::var("HERDR2_RELEASES_URL").unwrap_or_default()
+fn normalize_url(raw: Option<String>) -> Option<String> {
+    raw.map(|u| u.trim().trim_end_matches('/').to_owned()).filter(|u| !u.is_empty())
 }
 
-/// Self-updates are disabled: always reports None.
+fn resolve_releases_url(env_url: Option<String>, settings_url: Option<String>, default_url: Option<&str>) -> Option<String> {
+    normalize_url(env_url)
+        .or_else(|| normalize_url(settings_url))
+        .or_else(|| normalize_url(default_url.map(str::to_owned)))
+}
+
+/// Configured releases base URL (`HERDR2_RELEASES_URL` > `settings.json` > compile-time default).
+pub fn releases() -> Option<String> {
+    let env_url = std::env::var("HERDR2_RELEASES_URL").ok();
+    let settings_url = crate::settings::load_person().ok().and_then(|p| p.releases_url);
+    resolve_releases_url(env_url, settings_url, option_env!("HERDR2_DEFAULT_RELEASES_URL"))
+}
+
 static READY: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn ready() -> Option<String> {
-    None
+    READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
 }
 
 /// The core the app runs, from its `server.status`, and a newer release waiting.
@@ -126,49 +138,201 @@ fn strip_core_prefix(v: &str) -> &str {
     v.strip_prefix("h2 ").or_else(|| v.strip_prefix("herdr2 ")).or_else(|| v.strip_prefix("hc ")).unwrap_or(v)
 }
 
+fn has_explicit_releases_url() -> bool {
+    std::env::var("HERDR2_RELEASES_URL").ok().is_some_and(|u| !u.trim().is_empty())
+        || crate::settings::load_person()
+            .ok()
+            .and_then(|p| p.releases_url)
+            .is_some_and(|u| !u.trim().is_empty())
+}
+
 fn checks_app() -> Option<PathBuf> {
-    None
+    releases()?;
+    let release_build = option_env!("HERDR2_APP_RELEASE").is_some()
+        || option_env!("HERDR_APP_RELEASE").is_some()
+        || has_explicit_releases_url();
+    if !release_build {
+        return None;
+    }
+    root()
 }
 
-/// Self-updates from upstream Herdr are disabled.
 fn checks_core() -> bool {
-    false
+    releases().is_some()
 }
 
-/// For the settings screen / mods: reports current versions without update prompts.
+fn checks_ui() -> bool {
+    releases().is_some()
+        && crate::mods::dev_defaults_dir().is_none()
+        && crate::ui_update::mode() != "off"
+}
+
+/// For the settings screen / mods: reports current versions, staged updates, and UI bundle state.
 pub fn status() -> serde_json::Value {
+    let app_checks = checks_app().is_some();
+    let any_checks = app_checks || checks_core() || checks_ui();
     serde_json::json!({
-        "app": { "version": env!("CARGO_PKG_VERSION"), "ready": serde_json::Value::Null, "updates": false },
-        "notes": serde_json::Value::Array(Vec::new()),
+        "app": {
+            "version": env!("CARGO_PKG_VERSION"),
+            "ready": ready(),
+            "updates": app_checks,
+        },
+        "ui": crate::ui_update::info(),
+        "notes": crate::update_notes::notes(ready().as_deref()),
         "core": core(),
-        "checked": serde_json::Value::Null,
-        "checks": false,
-        "checking": false,
+        "checked": *CHECKED.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
+        "checks": any_checks,
+        "checking": CHECKING.load(Ordering::Relaxed),
+        "releases_url": releases(),
+        "dev_defaults": crate::mods::dev_defaults_dir().map(|p| p.display().to_string()),
     })
 }
 
-pub fn check_now() {}
+pub fn check_now() {
+    if !RUNNING.load(Ordering::Relaxed) {
+        start();
+    }
+    let mut woken = WAKE.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    *woken = true;
+    WAKE.1.notify_all();
+}
 
 fn sleep(d: Duration) {
-    let woken = WAKE.0.lock().unwrap();
+    let woken = WAKE.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let (mut woken, _) = WAKE.1.wait_timeout_while(woken, d, |w| !*w).unwrap();
     *woken = false;
 }
 
-/// Self-updates from upstream Herdr are disabled.
-pub fn start() {}
+/// Starts the background update checker thread (idempotent).
+pub fn start() {
+    if RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Some(r) = checks_app()
+        && let Some(ver) = staged_version(&r)
+        && newer(&ver, env!("CARGO_PKG_VERSION"))
+    {
+        *READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ver);
+    }
+    let _ = std::thread::Builder::new().name("herdr2-update".into()).spawn(|| {
+        sleep(INITIAL_DELAY);
+        loop {
+            let ok = run_one_check();
+            sleep(if ok { EVERY } else { RETRY });
+        }
+    });
+}
+
+fn is_missing_feed_err(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    lower.contains("404")
+        || lower.contains("not found")
+        || lower.contains("couldn't read a file://")
+        || lower.contains("no such file")
+}
+
+fn check_cycle_succeeded(app_err: Option<&str>, ui_ok: bool, core_err: Option<&str>) -> bool {
+    let optional_ok = |err: Option<&str>| match err {
+        None => true,
+        Some(e) => ui_ok && is_missing_feed_err(e),
+    };
+    optional_ok(app_err) && optional_ok(core_err)
+}
+
+fn run_one_check() -> bool {
+    let Some(base_url) = releases() else {
+        return true;
+    };
+    CHECKING.store(true, Ordering::Relaxed);
+    let mut any_attempted = false;
+    let mut app_err: Option<String> = None;
+    let mut ui_ok = false;
+    let mut core_err: Option<String> = None;
+
+    // 1. App binary update (installed bundles / release installs)
+    let mut app_update_ready = false;
+    if let Some(install_root) = checks_app() {
+        any_attempted = true;
+        match check_from(&install_root, &base_url) {
+            Ok(ver) => {
+                app_update_ready = ver.is_some();
+                *READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = ver;
+            }
+            Err(e) => {
+                if is_missing_feed_err(&e) {
+                    tracing::debug!("app update feed absent: {e}");
+                } else {
+                    tracing::warn!("app update check failed: {e}");
+                }
+                app_err = Some(e);
+            }
+        }
+    }
+
+    // 2. UI bundle hot-update (skip if a full app binary update is already ready)
+    if !app_update_ready && checks_ui() {
+        any_attempted = true;
+        let app_dir = crate::mods::app_dir();
+        match crate::ui_update::check_from(&app_dir, &base_url) {
+            Ok(Some(_ver)) => {
+                ui_ok = true;
+                if crate::ui_update::mode() == "auto" {
+                    crate::mods::request(crate::mods::Request::ApplyUiBundle);
+                }
+            }
+            Ok(None) => {
+                ui_ok = true;
+            }
+            Err(e) => {
+                // UI feed is optional on servers that only host app/core manifests.
+                tracing::debug!("ui bundle check skipped/failed: {e}");
+            }
+        }
+    }
+
+    // 3. Core update check
+    if checks_core() {
+        any_attempted = true;
+        if let Err(e) = check_core_from(&base_url) {
+            if is_missing_feed_err(&e) {
+                tracing::debug!("core update feed absent: {e}");
+            } else {
+                tracing::warn!("core update check failed: {e}");
+            }
+            core_err = Some(e);
+        }
+    }
+
+    let all_ok = check_cycle_succeeded(app_err.as_deref(), ui_ok, core_err.as_deref());
+    CHECKING.store(false, Ordering::Relaxed);
+    if any_attempted {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        *CHECKED.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = checked_at(all_ok, now);
+    }
+    all_ok
+}
 
 fn checked_at(succeeded: bool, now: u64) -> Option<u64> {
     succeeded.then_some(now)
 }
 
 /// Looks for a newer core of this app's generation.
+#[cfg(test)]
 fn check_core() -> Result<(), String> {
-    let have = CORE.lock().unwrap().version.clone();
+    let base_url = releases().ok_or_else(|| "HERDR2_RELEASES_URL not configured".to_owned())?;
+    check_core_from(&base_url)
+}
+
+fn check_core_from(base_url: &str) -> Result<(), String> {
+    let have = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).version.clone();
     let Some(have) = have else { return Ok(()) };
-    let latest = latest_core()?;
+    let latest = latest_core_from(base_url)?;
     let same = latest.generation == Some(crate::hc::GENERATION);
-    CORE.lock().unwrap().ready = (same && newer(&latest.version, &have)).then_some(latest.version);
+    CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ready =
+        (same && newer(&latest.version, &have)).then_some(latest.version);
     Ok(())
 }
 
@@ -178,8 +342,8 @@ struct CoreRelease {
     generation: Option<u64>,
 }
 
-fn latest_core() -> Result<CoreRelease, String> {
-    let text = curl_text(&format!("{}/core/latest.json", releases()))?;
+fn latest_core_from(base_url: &str) -> Result<CoreRelease, String> {
+    let text = curl_text(&format!("{base_url}/core/latest.json"))?;
     serde_json::from_str(&text).map_err(|e| format!("core/latest.json: {e}"))
 }
 
@@ -193,12 +357,37 @@ fn after_update_target<'a>(have: &str, latest: Option<&'a CoreRelease>, generati
     })
 }
 
-/// Core auto-updates are disabled.
-pub fn update_core() {}
+/// Upgrades `h2` in the background (keeping running terminals alive).
+pub fn update_core() {
+    let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if c.managed.is_some() || c.updating {
+        return;
+    }
+    c.updating = true;
+    c.error = None;
+    drop(c);
+    let _ = std::thread::Builder::new().name("herdr2-core-update".into()).spawn(|| {
+        let res = crate::core_bin::update();
+        let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        c.updating = false;
+        match res {
+            Ok(now) => {
+                c.version = Some(strip_core_prefix(&now).to_owned());
+                c.ready = None;
+                c.error = None;
+            }
+            Err(e) => {
+                c.error = Some(e);
+            }
+        }
+    });
+}
 
 /// Downloads the latest release if it's newer. Ok(Some): a version is ready.
+#[allow(dead_code)]
 fn check(root: &Path) -> Result<Option<String>, String> {
-    check_from(root, &releases())
+    let base_url = releases().ok_or_else(|| "HERDR2_RELEASES_URL not configured".to_owned())?;
+    check_from(root, &base_url)
 }
 
 fn check_from(root: &Path, releases: &str) -> Result<Option<String>, String> {
@@ -243,13 +432,14 @@ fn check_from(root: &Path, releases: &str) -> Result<Option<String>, String> {
 
 /// Downloads, checks and unpacks a release into `work`; returns the app inside.
 fn unpack(url: &str, sha: &str, work: &Path) -> Result<PathBuf, String> {
-    let tarball = work.join("app.tar.gz");
-    run(crate::spawn::command(system("curl")).args(["-fsSL", "--max-time", "600", "-o"]).arg(&tarball).arg(url))?;
+    let ext = if url.ends_with(".zip") { "zip" } else { "tar.gz" };
+    let tarball = work.join(format!("app.{ext}"));
+    download_file(url, &tarball)?;
     let bytes = std::fs::read(&tarball).map_err(|e| e.to_string())?;
     if sha256(&bytes) != sha.to_ascii_lowercase() {
         return Err("the download is damaged (checksum mismatch)".into());
     }
-    run(crate::spawn::command(system("tar")).arg("-xzf").arg(&tarball).arg("-C").arg(work))?;
+    unpack_archive(&tarball, work)?;
     let app = work.join(PACKED);
     if cfg!(target_os = "macos") {
         // Authority is absent at -dv, even for a Developer ID release.
@@ -257,6 +447,15 @@ fn unpack(url: &str, sha: &str, work: &Path) -> Result<PathBuf, String> {
         prepare_macos_bundle(&app, &signature)?;
     }
     Ok(app)
+}
+
+pub(crate) fn download_file(url: &str, dest: &Path) -> Result<(), String> {
+    run(crate::spawn::command(system("curl")).args(["-fsSL", "--max-time", "600", "-o"]).arg(dest).arg(url))
+}
+
+pub(crate) fn unpack_archive(archive: &Path, dest: &Path) -> Result<(), String> {
+    let flag = if archive.extension().is_some_and(|e| e == "zip") { "-xf" } else { "-xzf" };
+    run(crate::spawn::command(system("tar")).arg(flag).arg(archive).arg("-C").arg(dest))
 }
 
 fn prepare_macos_bundle(app: &Path, signature: &std::process::Output) -> Result<(), String> {
@@ -299,7 +498,7 @@ pub(crate) fn sha256(bytes: &[u8]) -> String {
     sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn curl_text(url: &str) -> Result<String, String> {
+pub(crate) fn curl_text(url: &str) -> Result<String, String> {
     let out = crate::spawn::command(system("curl")).args(["-fsSL", "--max-time", "30", url]).stdin(Stdio::null()).output().map_err(|e| format!("curl: {e}"))?;
     if !out.status.success() {
         return Err(format!("{url}: {}", String::from_utf8_lossy(&out.stderr).trim()));
@@ -391,14 +590,90 @@ pub fn leave_install_folder() {
     }
 }
 
-/// Self-updates are disabled: startup never swaps binaries.
-pub fn apply_on_startup() -> bool {
-    false
+/// Cleans up leftover `<root>.old` folders and in-place `*.old-*` swap files
+/// from previous updates (Windows cannot delete the previous executable until it exits).
+pub fn cleanup_old() {
+    let Some(root) = root() else { return };
+    let old = beside(&root, ".old");
+    if old.exists() {
+        let _ = std::fs::remove_dir_all(&old);
+    }
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.contains(".old-") && entry.file_type().is_ok_and(|ft| ft.is_file()) {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
 }
 
-/// Self-updates are disabled: nothing is applied.
+/// Applies a previously staged newer update before opening the window.
+/// Returns `true` when swapped & relaunched (caller should exit immediately).
+pub fn apply_on_startup() -> bool {
+    let Some(root) = checks_app() else { return false };
+    let staged = staged_version(&root);
+    let relaunched = std::env::var("HERDR2_APP_UPDATE_EXPECTED").ok();
+    let Some(target) = startup_target(env!("CARGO_PKG_VERSION"), staged.as_deref(), relaunched.as_deref()) else {
+        return false;
+    };
+    if let Err(e) = swap(&root) {
+        tracing::warn!("update: startup swap failed: {e}");
+        return false;
+    }
+    relaunch_expected(Some(target))
+}
+
+/// Swaps a staged update into place; returns `Ok(true)` if swapped.
 pub fn apply() -> std::io::Result<bool> {
-    Ok(false)
+    let Some(root) = checks_app() else { return Ok(false) };
+    let Some(version) = staged_version(&root) else { return Ok(false) };
+    if !newer(&version, env!("CARGO_PKG_VERSION")) {
+        return Ok(false);
+    }
+    swap(&root)?;
+    Ok(true)
+}
+
+/// Relaunches the currently running executable once this process exits.
+/// Used by `app.restart` for fast dev-mode restarts (preserving live terminals in `h2`).
+/// Prefers the canonical install executable (`<root>/herdr2.exe`) when installed so an
+/// in-place rename swap (`herdr2.exe` -> `herdr2.exe.old-*`) always relaunches the new binary.
+#[cfg(windows)]
+pub fn relaunch_current() -> bool {
+    let exe = root()
+        .map(|r| exe_in(&r))
+        .filter(|p| p.is_file())
+        .or_else(|| std::env::current_exe().ok());
+    let Some(exe) = exe else { return false };
+    let exe = exe.to_string_lossy().replace('\'', "''");
+    let script = format!("Wait-Process -Id {} -ErrorAction SilentlyContinue; Start-Process '{exe}'", std::process::id());
+    crate::spawn::command("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .is_ok()
+}
+
+#[cfg(unix)]
+pub fn relaunch_current() -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false };
+    use std::os::unix::process::CommandExt;
+    let script = "while kill -0 \"$0\" 2>/dev/null; do sleep 0.1; done; exec \"$1\"";
+    Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .arg(std::process::id().to_string())
+        .arg(&exe)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .is_ok()
 }
 
 fn swap(root: &Path) -> std::io::Result<()> {
@@ -493,8 +768,48 @@ fn marker() -> PathBuf {
     crate::mods::app_dir().join(".updated")
 }
 
-/// Post-update core auto-upgrade is disabled.
-pub fn after_update(_connected: std::sync::Arc<crate::hc::Core>) {}
+/// Runs once after an app binary swap: brings `h2` core up to date in the same generation.
+pub fn after_update(connected: std::sync::Arc<crate::hc::Core>) {
+    let mark = marker();
+    if !mark.is_file() {
+        return;
+    }
+    let _ = std::fs::remove_file(&mark);
+    if !checks_core() {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("herdr2-after-update".into()).spawn(move || {
+        let status = connected.call("server.status", serde_json::json!({})).map_err(|e| format!("{e:#}"));
+        if after_update_managed(status) {
+            return;
+        }
+        let have = core().version.unwrap_or_default();
+        let latest = releases().and_then(|base| latest_core_from(&base).ok());
+        let Some(target) = after_update_target(&have, latest.as_ref(), crate::hc::GENERATION, crate::hc::core_min()) else {
+            return;
+        };
+        let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if c.updating {
+            return;
+        }
+        c.updating = true;
+        c.error = None;
+        drop(c);
+        let res = crate::core_bin::update_to(Some(target));
+        let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        c.updating = false;
+        match res {
+            Ok(now) => {
+                c.version = Some(strip_core_prefix(&now).to_owned());
+                c.ready = None;
+                c.error = None;
+            }
+            Err(e) => {
+                c.error = Some(e);
+            }
+        }
+    });
+}
 
 fn after_update_managed(status: Result<serde_json::Value, String>) -> bool {
     match status {
@@ -702,7 +1017,7 @@ mod tests {
     #[ignore = "downloads the current release; runs real codesign on isolated bundles"]
     fn macos_unpack_preserves_release_signature_and_prepares_dev_builds() {
         let version = env!("CARGO_PKG_VERSION");
-        let manifest: serde_json::Value = serde_json::from_str(&curl_text(&format!("{}/app/{version}/manifest.json", releases())).unwrap()).unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(&curl_text(&format!("{}/app/{version}/manifest.json", releases().unwrap_or_default())).unwrap()).unwrap();
         let work = std::env::temp_dir().join(format!("herdr-signature-test-{}", std::process::id()));
         let signed = work.join("signed");
         let reference = work.join("reference");
@@ -775,5 +1090,34 @@ mod tests {
     #[test]
     fn sha256_is_hex() {
         assert_eq!(sha256(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    }
+
+    #[test]
+    fn releases_url_resolves_env_then_settings_then_default() {
+        assert_eq!(
+            resolve_releases_url(Some("https://env.test/ ".into()), Some("https://set.test".into()), Some("https://def.test")).as_deref(),
+            Some("https://env.test")
+        );
+        assert_eq!(
+            resolve_releases_url(Some("  ".into()), Some("https://set.test/".into()), Some("https://def.test")).as_deref(),
+            Some("https://set.test")
+        );
+        assert_eq!(
+            resolve_releases_url(None, None, Some("https://def.test/")).as_deref(),
+            Some("https://def.test")
+        );
+        assert_eq!(resolve_releases_url(None, None, None), None);
+    }
+
+    #[test]
+    fn ui_only_feed_404_on_app_and_core_still_counts_as_successful_check() {
+        let missing_http = "http://127.0.0.1:8787/app/latest.json: curl: (22) The requested URL returned error: 404";
+        let missing_file = "file:///tmp/core/latest.json: curl: (37) Couldn't read a file:// file";
+        let net_err = "http://127.0.0.1:8787/app/latest.json: curl: (7) Failed to connect";
+
+        assert!(check_cycle_succeeded(Some(missing_http), true, Some(missing_file)));
+        assert!(!check_cycle_succeeded(Some(missing_http), false, Some(missing_file)));
+        assert!(!check_cycle_succeeded(Some(net_err), true, None));
+        assert!(check_cycle_succeeded(None, false, None));
     }
 }

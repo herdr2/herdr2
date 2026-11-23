@@ -117,6 +117,12 @@ pub struct HelloParams {
 pub struct HelloResult {
     pub generation: u32,
     pub version: String,
+    /// Git short SHA (with `+dirty` when built from a modified tree) of this core binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_sha: Option<String>,
+    /// UTC ISO-8601 build timestamp of this core binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_time: Option<String>,
     pub core: CoreInfo,
     pub framed: bool,
     pub methods: Vec<String>,
@@ -135,6 +141,12 @@ pub struct HelloResult {
 pub struct StatusResult {
     pub core: CoreInfo,
     pub version: String,
+    /// Git short SHA (with `+dirty` when built from a modified tree) of the running core binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_sha: Option<String>,
+    /// UTC ISO-8601 build timestamp of the running core binary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_time: Option<String>,
     pub pid: u32,
     pub uptime_ms: u64,
     pub live: usize,
@@ -1391,6 +1403,22 @@ pub struct HandoffParams {
     #[arg(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// Build and return the handoff markdown package without creating or sending to a target (used for cross-machine delivery).
+    #[arg(skip)]
+    #[serde(default)]
+    pub package_only: bool,
+    /// Pre-built markdown context package forwarded from another machine into an existing local target.
+    #[arg(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_markdown: Option<String>,
+    /// Original source address label paired with `inline_markdown`.
+    #[arg(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_source: Option<String>,
+    /// Optional human-readable turn range label paired with `inline_markdown`.
+    #[arg(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inline_turns: Option<String>,
     /// Who is calling (`H2_AGENT_ID` / `H2_TERMINAL_ID`).
     #[arg(skip)]
     #[serde(default)]
@@ -1413,6 +1441,8 @@ pub struct HandoffResult {
     pub bytes: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub markdown: Option<String>,
     pub native_fork: bool,
     #[serde(default, skip_serializing_if = "is_false")]
     pub distilled: bool,

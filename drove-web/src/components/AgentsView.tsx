@@ -133,13 +133,31 @@ function QuotaOverview({
 }
 
 function RoleRoutingMatrix({ profile, run }: { profile: Profile | null; run?: Run | null }) {
-  const { t } = useT();
+  const { t, lang } = useT();
   const roleIds = [...new Set<string>([...BUILT_IN_ROLE_IDS, ...Object.keys(profile?.roles ?? {})])];
   const coordAgentModel = run ? agentModel(run.coordinator.agent, run.coordinator.model, "") : "";
+  const routingNote = profile?.note?.trim();
   return (
     <section className="agents-roles" style={{ marginBottom: 24 }}>
       <h2 style={{ marginBottom: 6 }}>{t("agents.rolesTitle")}</h2>
       <p className="hint" style={{ marginBottom: 10 }}>{t("agents.rolesHint")}</p>
+      {routingNote && (
+        <div
+          className="hint"
+          style={{
+            marginBottom: 12,
+            padding: "8px 12px",
+            borderRadius: 8,
+            border: "1px solid var(--border)",
+            background: "var(--surface-2, var(--surface))",
+            color: "var(--text-1)",
+            whiteSpace: "pre-wrap",
+          }}
+        >
+          <strong>{lang === "zh" ? "选人备注：" : "Routing note: "}</strong>
+          {routingNote}
+        </div>
+      )}
       <table>
         <thead>
           <tr>

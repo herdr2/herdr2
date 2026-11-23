@@ -70,11 +70,59 @@ pub fn mods_dir() -> PathBuf {
 
 const AGENTS_MD: &str = include_str!("../defaults/AGENTS.md");
 
+/// Host API generation for OTA UI bundles: bump whenever shipped JS mods depend
+/// on a new `herdr` host function or `gpui-shell` capability.
+pub const UI_HOST_API_GENERATION: u32 = 1;
+
+/// Optional local `defaults/` directory for zero-recompile dev hot-reload.
+/// Checks `HERDR2_DEV_DEFAULTS` first, then `settings.json`'s `dev_defaults_dir`.
+pub fn dev_defaults_dir() -> Option<PathBuf> {
+    let raw = std::env::var("HERDR2_DEV_DEFAULTS")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| {
+            crate::settings::load_person()
+                .ok()
+                .and_then(|p| p.dev_defaults_dir)
+                .filter(|v| !v.trim().is_empty())
+        })?;
+    let trimmed = raw.trim();
+    let path = match trimmed.strip_prefix("~/") {
+        Some(rest) => home().join(rest),
+        None => PathBuf::from(trimmed),
+    };
+    if path.join("mods").is_dir() {
+        Some(path.canonicalize().unwrap_or(path))
+    } else {
+        None
+    }
+}
+
 /// Writes the agent guide and API types, and installs or updates the default
 /// mods. Shipped mods are replaced whole; edits are first moved to a clone.
+///
+/// In dev mode (`HERDR2_DEV_DEFAULTS`), mirrors the checkout's `defaults/`
+/// directly without creating `*-edited` clones so edits hot-reload live.
+/// When an OTA UI bundle is active for the running app version, preserves it
+/// instead of overwriting with older embedded files.
 pub fn write_workspace() -> std::io::Result<()> {
     let dir = app_dir();
     std::fs::create_dir_all(mods_dir())?;
+    if let Some(dev) = dev_defaults_dir() {
+        if let Ok(bytes) = std::fs::read(dev.join("AGENTS.md")) {
+            write_if_changed(&dir.join("AGENTS.md"), &bytes)?;
+        } else {
+            write_if_changed(&dir.join("AGENTS.md"), AGENTS_MD)?;
+        }
+        if let Ok(bytes) = std::fs::read(dev.join("herdr.d.ts")) {
+            write_if_changed(&dir.join("herdr.d.ts"), &bytes)?;
+        } else {
+            write_if_changed(&dir.join("herdr.d.ts"), DECLARATIONS)?;
+        }
+        let types = gpui_shell::type_declarations(&gpui_shell::FrozenComponentRegistry::default());
+        write_if_changed(&dir.join("gpui-kit.d.ts"), &types)?;
+        return sync_dev_defaults(&dev, &dir);
+    }
     write_if_changed(&dir.join("AGENTS.md"), AGENTS_MD)?;
     // Agents read AGENTS.md now; the pointer file we used to write goes (only ours).
     if std::fs::read_to_string(dir.join("CLAUDE.md")).is_ok_and(|s| s == "@AGENTS.md\n") {
@@ -83,6 +131,9 @@ pub fn write_workspace() -> std::io::Result<()> {
     write_if_changed(&dir.join("herdr.d.ts"), DECLARATIONS)?;
     let types = gpui_shell::type_declarations(&gpui_shell::FrozenComponentRegistry::default());
     write_if_changed(&dir.join("gpui-kit.d.ts"), &types)?;
+    if crate::ui_update::has_active_override(&dir) {
+        return Ok(());
+    }
     let _ = std::fs::remove_dir_all(frame_dir());
     for (path, bytes) in FRAME_MODS {
         let file = frame_dir().join(path);
@@ -90,6 +141,81 @@ pub fn write_workspace() -> std::io::Result<()> {
         std::fs::write(&file, bytes)?;
     }
     sync_defaults(&mods_dir(), &dir.join("installed.json"), DEFAULT_MODS)
+}
+
+/// Mirrors a single changed relative path from `dev_root` into `home`.
+/// Returns `Some(rel)` if a file or folder was updated/removed.
+pub fn sync_dev_path(dev_root: &Path, home: &Path, rel: &Path) -> Option<PathBuf> {
+    let src = dev_root.join(rel);
+    let dst = home.join(rel);
+    if !src.exists() {
+        if dst.is_dir() {
+            let _ = std::fs::remove_dir_all(&dst);
+            return Some(rel.to_path_buf());
+        } else if dst.is_file() {
+            let _ = std::fs::remove_file(&dst);
+            return Some(rel.to_path_buf());
+        }
+        return None;
+    }
+    if src.is_dir() {
+        if copy_dev_tree(&src, &dst).is_ok() {
+            return Some(rel.to_path_buf());
+        }
+        return None;
+    }
+    if let Some(parent) = dst.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let bytes = std::fs::read(&src).ok()?;
+    if std::fs::read(&dst).ok().as_deref() == Some(bytes.as_slice()) {
+        return None;
+    }
+    std::fs::write(&dst, &bytes).ok()?;
+    Some(rel.to_path_buf())
+}
+
+/// Mirrors `mods/`, `frame/`, `layouts/`, `themes/`, `icons/` from a source
+/// checkout's `defaults/` into `home` without clobbering third-party user mods.
+pub fn sync_dev_defaults(dev_root: &Path, home: &Path) -> std::io::Result<()> {
+    for sub in ["mods", "frame", "layouts", "themes", "icons"] {
+        let src_sub = dev_root.join(sub);
+        if !src_sub.is_dir() {
+            continue;
+        }
+        let dst_sub = home.join(sub);
+        std::fs::create_dir_all(&dst_sub)?;
+        copy_dev_tree(&src_sub, &dst_sub)?;
+    }
+    Ok(())
+}
+
+fn copy_dev_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.starts_with('.') || matches!(name_str.as_ref(), "node_modules" | "gpui-kit.d.ts" | "jsconfig.json") {
+            continue;
+        }
+        let from = entry.path();
+        let to = dst.join(&name);
+        let ft = entry.file_type()?;
+        if ft.is_dir() {
+            copy_dev_tree(&from, &to)?;
+        } else if ft.is_file() {
+            let bytes = std::fs::read(&from)?;
+            write_if_changed(&to, &bytes)?;
+        }
+    }
+    Ok(())
+}
+
+/// Owned-buffer variant of `sync_defaults`, used by OTA UI bundle updates.
+pub fn sync_defaults_owned(mods: &Path, installed_path: &Path, shipped_mods: &[(String, Vec<u8>)]) -> std::io::Result<()> {
+    let borrowed: Vec<(&str, &[u8])> = shipped_mods.iter().map(|(p, b)| (p.as_str(), b.as_slice())).collect();
+    sync_defaults(mods, installed_path, &borrowed)
 }
 
 static SYNC_NOTES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -406,6 +532,10 @@ pub enum Request {
     /// The app icon's badge (the Dock on macOS); `None` clears it.
     SetBadge(Option<String>),
     Refresh,
+    /// Restart the script VM so all mods reload cleanly without restarting the window.
+    ReloadMods,
+    /// Apply a staged OTA UI bundle live (without restarting the window).
+    ApplyUiBundle,
     /// From `herdr-app do` / `herdr-app status` (control.rs); answer on `reply`.
     Control { cmd: Value, reply: std::sync::mpsc::Sender<Value> },
 }
@@ -2150,6 +2280,39 @@ mod tests {
         assert_eq!(read("b/main.js"), "changed again", "edited dropped defaults stay");
         assert_eq!(read("b-edited/main.js"), "mine", "clones stay untouched");
         assert_eq!(read("d/notes.md"), "my notes", "a dropped default with an added file stays");
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn sync_dev_defaults_mirrors_and_preserves_third_party_mods() {
+        let root = std::env::temp_dir().join(format!("herdr-app-dev-sync-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let dev = root.join("dev");
+        let home = root.join("home");
+        std::fs::create_dir_all(dev.join("mods/pane")).unwrap();
+        std::fs::create_dir_all(dev.join("frame/settings")).unwrap();
+        std::fs::create_dir_all(home.join("mods/custom")).unwrap();
+        std::fs::write(dev.join("mods/pane/main.js"), "v1").unwrap();
+        std::fs::write(dev.join("frame/settings/main.js"), "s1").unwrap();
+        std::fs::write(home.join("mods/custom/main.js"), "keep").unwrap();
+
+        sync_dev_defaults(&dev, &home).unwrap();
+        assert_eq!(std::fs::read_to_string(home.join("mods/pane/main.js")).unwrap(), "v1");
+        assert_eq!(std::fs::read_to_string(home.join("frame/settings/main.js")).unwrap(), "s1");
+        assert_eq!(std::fs::read_to_string(home.join("mods/custom/main.js")).unwrap(), "keep");
+
+        // Incremental single-file edit & delete propagation.
+        std::fs::write(dev.join("mods/pane/main.js"), "v2").unwrap();
+        assert_eq!(sync_dev_path(&dev, &home, Path::new("mods/pane/main.js")), Some(PathBuf::from("mods/pane/main.js")));
+        assert_eq!(std::fs::read_to_string(home.join("mods/pane/main.js")).unwrap(), "v2");
+
+        std::fs::write(dev.join("mods/pane/extra.js"), "tmp").unwrap();
+        assert!(sync_dev_path(&dev, &home, Path::new("mods/pane/extra.js")).is_some());
+        assert!(home.join("mods/pane/extra.js").is_file());
+        std::fs::remove_file(dev.join("mods/pane/extra.js")).unwrap();
+        assert!(sync_dev_path(&dev, &home, Path::new("mods/pane/extra.js")).is_some());
+        assert!(!home.join("mods/pane/extra.js").exists());
 
         std::fs::remove_dir_all(&root).unwrap();
     }

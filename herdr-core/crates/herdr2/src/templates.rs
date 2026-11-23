@@ -280,8 +280,8 @@ impl crate::runtime::Core {
                 crate::pty_input::OUTPUT_SETTLE
             };
             let output_quiet = last_out.is_some_and(|t| t.elapsed() >= settle_need);
-            let post_dialog_settled = dialog_cleared_at
-                .is_none_or(|at| at.elapsed() >= std::time::Duration::from_millis(1200));
+            let post_dialog_settled =
+                dialog_cleared_at.is_none_or(|at| at.elapsed() >= std::time::Duration::from_millis(1200));
 
             let ready = if in_dialog || !post_dialog_settled {
                 false

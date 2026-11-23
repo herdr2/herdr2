@@ -52,9 +52,7 @@ pub async fn tick_once(core: &Arc<Core>) {
             }
             continue;
         }
-        if (has_open_workers || run.status == RunStatus::Active)
-            && super::pool::is_coordinator_closed(core, &run)
-        {
+        if (has_open_workers || run.status == RunStatus::Active) && super::pool::is_coordinator_closed(core, &run) {
             super::pool::close_run_for_coordinator(core, &run).await;
             continue;
         }
@@ -74,11 +72,7 @@ pub async fn tick_once(core: &Arc<Core>) {
         check_running_timeouts_and_stalls(core, &run, &tasks).await;
         tasks = core.drove.store.list_tasks(&run.id);
 
-        if !tasks.is_empty()
-            && tasks
-                .iter()
-                .filter(|t| t.template != Some(true))
-                .all(|t| is_terminal_status(t.status))
+        if !tasks.is_empty() && tasks.iter().filter(|t| t.template != Some(true)).all(|t| is_terminal_status(t.status))
         {
             continue;
         }
@@ -86,34 +80,27 @@ pub async fn tick_once(core: &Arc<Core>) {
         // 4. Recompute concurrency & dispatch Ready tasks (`exec` or `agent`).
         let workers = core.drove.store.list_workers(Some(&run.id));
         let busy_agents = workers.iter().filter(|w| w.state == WorkerState::Busy).count() as u32;
-        let running_execs = tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::Running && t.kind.as_deref() == Some("exec"))
-            .count() as u32;
+        let running_execs =
+            tasks.iter().filter(|t| t.status == TaskStatus::Running && t.kind.as_deref() == Some("exec")).count()
+                as u32;
         let mut slots = run.max_concurrency.saturating_sub(busy_agents + running_execs);
         if slots == 0 {
             continue;
         }
 
-        let ready_tasks: Vec<Task> = tasks
-            .iter()
-            .filter(|t| t.status == TaskStatus::Ready && t.template != Some(true))
-            .cloned()
-            .collect();
+        let ready_tasks: Vec<Task> =
+            tasks.iter().filter(|t| t.status == TaskStatus::Ready && t.template != Some(true)).cloned().collect();
         let quotas = if !ready_tasks.is_empty() && cfg.magpie.enabled {
             core.drove.magpie.fetch_if_enabled(&cfg.magpie, false).await.0
         } else {
             None
         };
 
-        let repo_supports_wt = super::integrate::is_git_repo(&run.cwd)
-            && !super::integrate::is_aosp_harness(&run.cwd);
+        let repo_supports_wt = super::integrate::is_git_repo(&run.cwd) && !super::integrate::is_aosp_harness(&run.cwd);
         let mut active_shared_writers: Vec<Task> = tasks
             .iter()
             .filter(|t| {
-                t.status == TaskStatus::Running
-                    && t.isolation == Isolation::None
-                    && task_writes_workspace(&cfg, t)
+                t.status == TaskStatus::Running && t.isolation == Isolation::None && task_writes_workspace(&cfg, t)
             })
             .cloned()
             .collect();
@@ -290,10 +277,7 @@ pub async fn tick_once(core: &Arc<Core>) {
                     decision.warm_worker = None;
                 }
             }
-            let reuse_wt = decision
-                .warm_worker
-                .as_ref()
-                .and_then(|w| w.worktree.clone());
+            let reuse_wt = decision.warm_worker.as_ref().and_then(|w| w.worktree.clone());
             let effective_cwd = match worktree_for_task(core, &run, &task, reuse_wt.as_deref()).await {
                 Ok((cwd, wt)) => (cwd, wt),
                 Err(err) => {
@@ -327,17 +311,9 @@ pub async fn tick_once(core: &Arc<Core>) {
                 .map(|a| a.id);
             let hint = core.drove.take_task_hint(&task.id);
 
-            let res = dispatch_agent_task(
-                core,
-                &run,
-                &task,
-                decision,
-                effective_cwd.0,
-                effective_cwd.1,
-                retry_of,
-                hint,
-            )
-            .await;
+            let res =
+                dispatch_agent_task(core, &run, &task, decision, effective_cwd.0, effective_cwd.1, retry_of, hint)
+                    .await;
             core.drove.release_task_reservation(&task.id);
 
             if let Err(err_msg) = res {
@@ -465,10 +441,7 @@ fn promote_pending_tasks(core: &Arc<Core>, tasks: &[Task]) {
                         unresolved = true;
                     }
                     let mut child_count = 0usize;
-                    for child in tasks
-                        .iter()
-                        .filter(|c| c.expanded_from.as_deref() == Some(d.id.as_str()))
-                    {
+                    for child in tasks.iter().filter(|c| c.expanded_from.as_deref() == Some(d.id.as_str())) {
                         child_count += 1;
                         if !is_terminal_status(child.status) {
                             unresolved = true;
@@ -488,11 +461,9 @@ fn promote_pending_tasks(core: &Arc<Core>, tasks: &[Task]) {
                     dep_statuses.push(d.status);
                 }
             } else {
-                for child in tasks.iter().filter(|c| {
-                    c.key
-                        .strip_prefix(dep_ref.as_str())
-                        .is_some_and(|r| r.starts_with('#'))
-                }) {
+                for child in
+                    tasks.iter().filter(|c| c.key.strip_prefix(dep_ref.as_str()).is_some_and(|r| r.starts_with('#')))
+                {
                     if !is_terminal_status(child.status) {
                         unresolved = true;
                     }
@@ -508,22 +479,14 @@ fn promote_pending_tasks(core: &Arc<Core>, tasks: &[Task]) {
                 {
                     (true, false)
                 } else if !unresolved {
-                    if when_matches(task.when.as_ref(), tasks) {
-                        (false, true)
-                    } else {
-                        (true, false)
-                    }
+                    if when_matches(task.when.as_ref(), tasks) { (false, true) } else { (true, false) }
                 } else {
                     (false, false)
                 }
             }
             TriggerRule::AnySuccess => {
                 if dep_statuses.contains(&TaskStatus::Succeeded) {
-                    if when_matches(task.when.as_ref(), tasks) {
-                        (false, true)
-                    } else {
-                        (true, false)
-                    }
+                    if when_matches(task.when.as_ref(), tasks) { (false, true) } else { (true, false) }
                 } else if !unresolved {
                     (true, false)
                 } else {
@@ -545,13 +508,8 @@ async fn check_running_timeouts_and_stalls(core: &Arc<Core>, run: &Run, tasks: &
         if task.status != TaskStatus::Running || task.template == Some(true) {
             continue;
         }
-        let Some(att) = core
-            .drove
-            .store
-            .list_attempts(None, Some(&task.id), None)
-            .into_iter()
-            .rev()
-            .find(|a| a.outcome.is_none())
+        let Some(att) =
+            core.drove.store.list_attempts(None, Some(&task.id), None).into_iter().rev().find(|a| a.outcome.is_none())
         else {
             continue;
         };
@@ -561,9 +519,7 @@ async fn check_running_timeouts_and_stalls(core: &Arc<Core>, run: &Run, tasks: &
         if core.drove.has_active_ask(&att.id) {
             continue;
         }
-        let last_ms = parse_iso_ms(&worker.last_active_at)
-            .or_else(|| parse_iso_ms(&att.started_at))
-            .unwrap_or(now_ms);
+        let last_ms = parse_iso_ms(&worker.last_active_at).or_else(|| parse_iso_ms(&att.started_at)).unwrap_or(now_ms);
         let idle_sec = now_ms.saturating_sub(last_ms) / 1000;
 
         if let Some(kill_sec) = task.stall_kill_sec
@@ -684,10 +640,7 @@ async fn run_exec_task(core: Arc<Core>, run: Run, task: Task) {
         };
         c
     };
-    cmd.current_dir(&run.cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.current_dir(&run.cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     if let Some(env_map) = &spec.env {
         cmd.envs(env_map);
     }
@@ -703,11 +656,8 @@ async fn run_exec_task(core: Arc<Core>, run: Run, task: Task) {
                 } else {
                     None
                 };
-                let summary = if stdout.is_empty() {
-                    "exec succeeded".into()
-                } else {
-                    stdout.chars().take(400).collect()
-                };
+                let summary =
+                    if stdout.is_empty() { "exec succeeded".into() } else { stdout.chars().take(400).collect() };
                 let tr = TaskResult {
                     summary,
                     compact_summary: None,
@@ -726,26 +676,15 @@ async fn run_exec_task(core: Arc<Core>, run: Run, task: Task) {
                     t.result = Some(tr);
                 });
             } else {
-                let msg = format!(
-                    "exec exited {:?}: {}",
-                    o.status.code(),
-                    if stderr.is_empty() { stdout } else { stderr }
-                );
+                let msg =
+                    format!("exec exited {:?}: {}", o.status.code(), if stderr.is_empty() { stdout } else { stderr });
                 let _ = core.drove.store.update_attempt(&attempt_id, |a| {
                     a.outcome = Some(Outcome::Failed);
                     a.ended_at = Some(now_iso());
                     a.failure = Some(AttemptFailure { kind: FailureKind::AgentError, message: msg.clone() });
                 });
-                super::fail_or_retry_task(
-                    &core,
-                    &run.id,
-                    &task.id,
-                    &attempt_id,
-                    FailureKind::AgentError,
-                    &msg,
-                    0,
-                )
-                .await;
+                super::fail_or_retry_task(&core, &run.id, &task.id, &attempt_id, FailureKind::AgentError, &msg, 0)
+                    .await;
             }
         }
         Ok(Err(e)) => {
@@ -771,10 +710,7 @@ async fn run_exec_task(core: Arc<Core>, run: Run, task: Task) {
 }
 
 pub fn is_terminal_status(s: TaskStatus) -> bool {
-    matches!(
-        s,
-        TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Skipped
-    )
+    matches!(s, TaskStatus::Succeeded | TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Skipped)
 }
 
 fn task_writes_workspace(cfg: &DroveConfig, task: &Task) -> bool {
@@ -788,19 +724,13 @@ fn task_writes_workspace(cfg: &DroveConfig, task: &Task) -> bool {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("coder");
-    let mode = super::config::resolve_role_config(cfg, role_name)
-        .and_then(|r| r.access)
-        .unwrap_or(RoleAccessMode::Writable);
+    let mode =
+        super::config::resolve_role_config(cfg, role_name).and_then(|r| r.access).unwrap_or(RoleAccessMode::Writable);
     mode != RoleAccessMode::Readonly
 }
 
 fn normalize_rel_path(raw: &str) -> Option<String> {
-    let trimmed = raw
-        .trim()
-        .replace('\\', "/")
-        .trim_start_matches("./")
-        .trim_end_matches('/')
-        .to_string();
+    let trimmed = raw.trim().replace('\\', "/").trim_start_matches("./").trim_end_matches('/').to_string();
     if trimmed.is_empty()
         || trimmed.eq_ignore_ascii_case("workspace")
         || trimmed.eq_ignore_ascii_case("repo")
@@ -856,11 +786,7 @@ fn role_scoped_prefixes(cfg: &DroveConfig, task: &Task) -> Option<Vec<String>> {
 /// - `Some((true, reason))` -> definitely overlapping
 /// - `Some((false, reason))` -> definitely disjoint (0-token fast pass)
 /// - `None` -> ambiguous, requires semantic check or conservative fallback
-pub(crate) fn deterministic_write_conflict(
-    cfg: &DroveConfig,
-    a: &Task,
-    b: &Task,
-) -> Option<(bool, String)> {
+pub(crate) fn deterministic_write_conflict(cfg: &DroveConfig, a: &Task, b: &Task) -> Option<(bool, String)> {
     // 0. ScopedWrite roles verify their git working-tree diff against `allowed_paths`.
     // Two concurrent writers in the same shared cwd would contaminate each other's git status,
     // so they must always isolate into separate worktrees.

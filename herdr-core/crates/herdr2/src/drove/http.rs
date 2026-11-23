@@ -1,11 +1,11 @@
 //! Local HTTP/1.1 + SSE server for Drove Web (`127.0.0.1:7799`) with SSH proxy federation.
 
+use super::DroveRuntime;
 use super::config::{read_ai_key, web_agents_payload};
 use super::crypto;
 use super::routes::*;
 use super::store::StoreEvent;
 use super::types::*;
-use super::DroveRuntime;
 use crate::remote::{self, LineState};
 use crate::rpc::RpcError;
 use crate::runtime::Core;
@@ -62,9 +62,7 @@ impl ApiErr {
 
 /// Binds the localhost HTTP/SSE server (`127.0.0.1:<H2_DROVE_PORT or 7799>`) and serves until shutdown.
 pub async fn serve_http(core: Arc<Core>) {
-    let explicit_port = std::env::var("H2_DROVE_PORT")
-        .ok()
-        .and_then(|v| v.trim().parse::<u16>().ok());
+    let explicit_port = std::env::var("H2_DROVE_PORT").ok().and_then(|v| v.trim().parse::<u16>().ok());
     let desired = explicit_port.unwrap_or(7799);
     let listener = match TcpListener::bind(("127.0.0.1", desired)).await {
         Ok(l) => l,
@@ -109,7 +107,8 @@ async fn handle_connection(core: Arc<Core>, stream: TcpStream) -> std::io::Resul
     }
     let parts: Vec<&str> = request_line.trim_end_matches(['\r', '\n']).split_whitespace().collect();
     if parts.len() < 2 {
-        return write_json(&mut write_half, 400, &json!({"error":"bad_request","message":"malformed request line"})).await;
+        return write_json(&mut write_half, 400, &json!({"error":"bad_request","message":"malformed request line"}))
+            .await;
     }
     let method = parts[0].to_ascii_uppercase();
     let raw_target = parts[1];
@@ -131,7 +130,12 @@ async fn handle_connection(core: Arc<Core>, stream: TcpStream) -> std::io::Resul
 
     let host = headers.get("host").map(String::as_str).unwrap_or("");
     if !is_valid_local_host(host) {
-        return write_json(&mut write_half, 403, &json!({"error":"invalid_host","message":"Host must be 127.0.0.1 or localhost"})).await;
+        return write_json(
+            &mut write_half,
+            403,
+            &json!({"error":"invalid_host","message":"Host must be 127.0.0.1 or localhost"}),
+        )
+        .await;
     }
 
     // Read body if Content-Length or chunked.
@@ -155,13 +159,19 @@ async fn handle_connection(core: Arc<Core>, stream: TcpStream) -> std::io::Resul
 
     // Handle SSE separately as a long-lived stream.
     if method == "GET" && segments.len() == 2 && segments[0] == "api" && segments[1] == "events" {
-        return serve_sse(core, write_half, query.get("run").cloned(), query.get("local").is_some_and(|v| v == "1")).await;
+        return serve_sse(core, write_half, query.get("run").cloned(), query.get("local").is_some_and(|v| v == "1"))
+            .await;
     }
 
     // Non-API paths serve Drove Web static assets (SPA fallback to index.html).
     if segments.first().map(String::as_str) != Some("api") {
         if method != "GET" && method != "HEAD" {
-            return write_json(&mut write_half, 405, &json!({"error":"method_not_allowed","message":"method not allowed"})).await;
+            return write_json(
+                &mut write_half,
+                405,
+                &json!({"error":"method_not_allowed","message":"method not allowed"}),
+            )
+            .await;
         }
         return serve_static(&core.drove, &mut write_half, raw_path, method == "HEAD").await;
     }
@@ -173,7 +183,12 @@ async fn handle_connection(core: Arc<Core>, stream: TcpStream) -> std::io::Resul
         match serde_json::from_slice::<Value>(&body_bytes) {
             Ok(v) => Some(v),
             Err(_) => {
-                return write_json(&mut write_half, 400, &json!({"error":"invalid_json","message":"invalid JSON request body"})).await;
+                return write_json(
+                    &mut write_half,
+                    400,
+                    &json!({"error":"invalid_json","message":"invalid JSON request body"}),
+                )
+                .await;
             }
         }
     };
@@ -216,11 +231,13 @@ async fn read_http_body<R: AsyncBufReadExt + Unpin>(
         let mut out = Vec::new();
         loop {
             let mut size_line = String::new();
-            if reader.read_line(&mut size_line).await.map_err(|e| ApiErr::new(400, "bad_request", e.to_string()))? == 0 {
+            if reader.read_line(&mut size_line).await.map_err(|e| ApiErr::new(400, "bad_request", e.to_string()))? == 0
+            {
                 break;
             }
             let hex = size_line.split(';').next().unwrap_or("").trim();
-            let sz = usize::from_str_radix(hex, 16).map_err(|_| ApiErr::new(400, "bad_request", "invalid chunk size"))?;
+            let sz =
+                usize::from_str_radix(hex, 16).map_err(|_| ApiErr::new(400, "bad_request", "invalid chunk size"))?;
             if sz == 0 {
                 let mut trailer = String::new();
                 let _ = reader.read_line(&mut trailer).await;
@@ -317,10 +334,7 @@ fn authorize_request(
 ) -> Result<(), ApiErr> {
     let segs: Vec<&str> = segments.iter().map(String::as_str).collect();
     let is_worker_post = method == "POST"
-        && matches!(
-            segs.as_slice(),
-            ["api", "worker", "context" | "ask" | "note" | "done" | "inbox" | "read"]
-        );
+        && matches!(segs.as_slice(), ["api", "worker", "context" | "ask" | "note" | "done" | "inbox" | "read"]);
 
     if header(headers, "x-drove-worker-token", "x-co-worker-token").is_some() {
         if !is_worker_post {
@@ -393,7 +407,8 @@ async fn dispatch_http_inner(
         // When the local machine has no Drove config yet (`drove.json` missing) and a connected remote
         // machine exists (e.g. Windows desktop app connected to WSL), proxy global Drove status/settings
         // queries when `?on=` was not explicitly supplied.
-        let global_drove_endpoint = (method == "GET" && matches!(segs.as_slice(), ["api", "ai", "status"] | ["api", "agents"]))
+        let global_drove_endpoint = (method == "GET"
+            && matches!(segs.as_slice(), ["api", "ai", "status"] | ["api", "agents"]))
             || (method == "POST" && segs.as_slice() == ["api", "ai", "test"])
             || (method == "PUT" && segs.as_slice() == ["api", "ai", "language"])
             || (method == "GET"
@@ -437,15 +452,11 @@ async fn dispatch_http_inner(
             "version": env!("CARGO_PKG_VERSION"),
             "startedAt": core.drove.started_at,
         })),
-        ("POST", ["api", "preflight", "worktree"]) => {
-            preflight_worktree_http(core, &body).await
-        }
+        ("POST", ["api", "preflight", "worktree"]) => preflight_worktree_http(core, &body).await,
         ("GET", ["api", "ai", "status"]) => Ok(json!(core.drove.ai_status())),
-        ("PUT", ["api", "ai", "config"]) => Err(ApiErr::new(
-            405,
-            "configured_in_app",
-            "Please configure AI Assistant in Herdr2 App -> Settings -> AI",
-        )),
+        ("PUT", ["api", "ai", "config"]) => {
+            Err(ApiErr::new(405, "configured_in_app", "Please configure AI Assistant in Herdr2 App -> Settings -> AI"))
+        }
         ("PUT", ["api", "ai", "language"]) => {
             let lang = body["language"]
                 .as_str()
@@ -453,10 +464,7 @@ async fn dispatch_http_inner(
                 .ok_or_else(|| ApiErr::new(400, "bad_request", "language must be a string"))?
                 .to_string();
             core.ai
-                .update_settings(crate::ai::AiSettingsSetParams {
-                    language: Some(lang),
-                    ..Default::default()
-                })
+                .update_settings(crate::ai::AiSettingsSetParams { language: Some(lang), ..Default::default() })
                 .await
                 .map_err(rpc_to_api)?;
             core.drove.sync_ai_from_core();
@@ -473,11 +481,9 @@ async fn dispatch_http_inner(
             let (quotas, quota_err) = core.drove.magpie.fetch_if_enabled(&cfg.magpie, force).await;
             Ok(web_agents_payload(&cfg, stats, quotas, quota_err))
         }
-        ("PUT", ["api", "agents"]) => Err(ApiErr::new(
-            405,
-            "configured_in_app",
-            "Please configure Roles in Herdr2 App -> Settings -> Drove",
-        )),
+        ("PUT", ["api", "agents"]) => {
+            Err(ApiErr::new(405, "configured_in_app", "Please configure Roles in Herdr2 App -> Settings -> Drove"))
+        }
         ("GET", ["api", "daemon", "events"]) => {
             let run_id = query.get("runId").or_else(|| query.get("run")).map(String::as_str);
             let category = query.get("category").map(String::as_str);
@@ -520,12 +526,13 @@ async fn dispatch_http_inner(
         ("GET", ["api", "runs", id]) => build_snapshot(&core, id).await,
         ("PATCH", ["api", "runs", id]) => patch_run_http(&core.drove, &req.headers, id, &body, internal_admin),
         ("POST", ["api", "runs", "reorder"]) => {
-            let ids = body["ids"]
-                .as_array()
-                .ok_or_else(|| ApiErr::new(400, "bad_request", "ids must be an array"))?;
+            let ids = body["ids"].as_array().ok_or_else(|| ApiErr::new(400, "bad_request", "ids must be an array"))?;
             let mut parsed = Vec::with_capacity(ids.len());
             for v in ids {
-                let s = v.as_str().filter(|s| !s.trim().is_empty()).ok_or_else(|| ApiErr::new(400, "bad_request", "invalid run id"))?;
+                let s = v
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| ApiErr::new(400, "bad_request", "invalid run id"))?;
                 if core.drove.store.get_run(s).is_none() {
                     return Err(ApiErr::new(404, "not_found", "Run not found"));
                 }
@@ -547,13 +554,7 @@ async fn dispatch_http_inner(
             if confirm != *id {
                 return Err(ApiErr::new(400, "confirmation_required", "missing confirmation header"));
             }
-            let wids: Vec<String> = core
-                .drove
-                .store
-                .list_workers(Some(id))
-                .into_iter()
-                .map(|w| w.id)
-                .collect();
+            let wids: Vec<String> = core.drove.store.list_workers(Some(id)).into_iter().map(|w| w.id).collect();
             super::pool::stop_run_workers(&core, id).await;
             for wid in wids {
                 core.drove.remove_worker_token(&wid);
@@ -569,8 +570,7 @@ async fn dispatch_http_inner(
         }
         ("GET", ["api", "runs", id, "coordinator-transcript"]) => {
             let run = core.drove.store.get_run(id).ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
-            let (agent, model, pid, entries, available) =
-                resolve_coordinator_meta_and_entries(&core, &run, true).await;
+            let (agent, model, pid, entries, available) = resolve_coordinator_meta_and_entries(&core, &run, true).await;
             let run = sync_coordinator_meta(&core.drove, run, agent, model, pid);
             let effective_agent = run.coordinator.agent.clone();
             let models: Vec<String> = run.coordinator.model.clone().into_iter().collect();
@@ -580,11 +580,8 @@ async fn dispatch_http_inner(
                 let limit = query.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(200).clamp(1, 500);
                 let before = query.get("before").and_then(|s| s.parse::<usize>().ok()).unwrap_or(total).min(total);
                 let start = before.saturating_sub(limit);
-                let items: Vec<Value> = entries[start..before]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, e)| entry_to_host_item(start + i, e))
-                    .collect();
+                let items: Vec<Value> =
+                    entries[start..before].iter().enumerate().map(|(i, e)| entry_to_host_item(start + i, e)).collect();
                 let first_ts = entries.iter().map(entry_ts_ms).find(|ms| *ms > 0).map(super::types::format_ms_iso);
                 let last_ts = entries.iter().rev().map(entry_ts_ms).find(|ms| *ms > 0).map(super::types::format_ms_iso);
                 return Ok(json!({
@@ -639,7 +636,10 @@ async fn dispatch_http_inner(
             }
             let offset = query.get("offset").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
             let limit = query.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(65536).clamp(1, 262144);
-            let mut slice = core.drove.store.read_artifact_slice(&run.id, artifact, offset, limit, None)
+            let mut slice = core
+                .drove
+                .store
+                .read_artifact_slice(&run.id, artifact, offset, limit, None)
                 .map_err(|e| ApiErr::new(404, "not_found", e.to_string()))?;
             slice["artifact"] = Value::String(artifact.to_string());
             Ok(slice)
@@ -668,20 +668,26 @@ async fn dispatch_http_inner(
         }
         ("POST", ["api", "messages"]) => post_message_http(&core.drove, &body),
         ("GET", ["api", "messages", id]) => {
-            let msg = core.drove.store.get_message(id).ok_or_else(|| ApiErr::new(404, "not_found", "Message not found"))?;
+            let msg =
+                core.drove.store.get_message(id).ok_or_else(|| ApiErr::new(404, "not_found", "Message not found"))?;
             Ok(json!(msg))
         }
         ("POST", ["api", "messages", id, "ack"]) => {
-            let _ = core.drove.store.get_message(id).ok_or_else(|| ApiErr::new(404, "not_found", "Message not found"))?;
+            let _ =
+                core.drove.store.get_message(id).ok_or_else(|| ApiErr::new(404, "not_found", "Message not found"))?;
             core.drove.store.mark_handled(id);
             Ok(json!({ "ok": true }))
         }
         ("POST", ["api", "messages", id, "reply"]) => {
-            let msg = core.drove.store.get_message(id).ok_or_else(|| ApiErr::new(404, "not_found", "Message not found"))?;
+            let msg =
+                core.drove.store.get_message(id).ok_or_else(|| ApiErr::new(404, "not_found", "Message not found"))?;
             if !matches!(msg.kind, MessageType::Question | MessageType::Escalation) {
                 return Err(ApiErr::new(409, "invalid_state", "this message type cannot be replied to"));
             }
-            let reply_body = body["body"].as_str().map(str::trim).filter(|s| !s.is_empty())
+            let reply_body = body["body"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
                 .ok_or_else(|| ApiErr::new(400, "bad_request", "body must be non-empty"))?;
             let reply = core.drove.store.post_message(super::store::PostMessageInput {
                 run_id: msg.run_id.clone(),
@@ -714,10 +720,7 @@ async fn dispatch_http_inner(
                 .ok_or_else(|| ApiErr::new(404, "not_found", "Task or attempt not found"))?;
             let want_ai = query.get("ai").is_some_and(|v| v == "1" || v == "true");
             let refresh = query.get("refresh").is_some_and(|v| v == "1" || v == "true");
-            let lang = query
-                .get("lang")
-                .or_else(|| query.get("language"))
-                .map(String::as_str);
+            let lang = query.get("lang").or_else(|| query.get("language")).map(String::as_str);
             if want_ai {
                 super::ai::generate_task_diagnosis(&core, &mut diag, refresh, lang).await;
             }
@@ -740,7 +743,8 @@ async fn dispatch_http_inner(
             {
                 return Err(ApiErr::new(409, "invalid_state", "task has already started"));
             }
-            let mut assign: Assign = serde_json::from_value(body).map_err(|e| ApiErr::new(400, "invalid_field", e.to_string()))?;
+            let mut assign: Assign =
+                serde_json::from_value(body).map_err(|e| ApiErr::new(400, "invalid_field", e.to_string()))?;
             assign.source = Some("user".into());
             let updated = core.drove.store.update_task(id, |t| t.assign = Some(assign));
             Ok(json!(updated))
@@ -753,7 +757,10 @@ async fn dispatch_http_inner(
             }
             let offset = query.get("offset").and_then(|s| s.parse::<usize>().ok()).unwrap_or(0);
             let limit = query.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(65536).clamp(1, 262144);
-            let mut slice = core.drove.store.read_artifact_slice(&task.run_id, &format!("{artifact}.patch"), offset, limit, None)
+            let mut slice = core
+                .drove
+                .store
+                .read_artifact_slice(&task.run_id, &format!("{artifact}.patch"), offset, limit, None)
                 .map_err(|e| ApiErr::new(404, "not_found", e.to_string()))?;
             slice["artifactId"] = Value::String(artifact.to_string());
             Ok(slice)
@@ -768,14 +775,23 @@ async fn create_run_http(
     body: &Value,
     internal_admin: bool,
 ) -> Result<Value, ApiErr> {
-    let host_session = body["hostSession"].as_str().map(str::trim).filter(|s| !s.is_empty())
+    let host_session = body["hostSession"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| ApiErr::new(400, "bad_request", "hostSession must be a non-empty string"))?;
     if !internal_admin && header(headers, "x-drove-coordinator", "x-co-coordinator") != Some(host_session) {
         return Err(ApiErr::new(409, "fenced", "coordinator session mismatch"));
     }
-    let objective = body["objective"].as_str().map(str::trim).filter(|s| !s.is_empty())
+    let objective = body["objective"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| ApiErr::new(400, "bad_request", "objective must be non-empty"))?;
-    let cwd = body["cwd"].as_str().map(str::trim).filter(|s| !s.is_empty())
+    let cwd = body["cwd"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| ApiErr::new(400, "bad_request", "cwd must be non-empty"))?;
     let host = body["host"].as_str().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("herdr2");
     let max_conc = body["maxConcurrency"].as_u64().unwrap_or(4);
@@ -785,22 +801,9 @@ async fn create_run_http(
     let (detected_agent, detected_model, detected_pid, _, _) =
         resolve_session_meta_and_entries(core, host_session, true, false).await;
     let session_bound = is_local_session_bound(core, host_session);
-    let agent = body["agent"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .or(detected_agent);
-    let model = body["model"]
-        .as_str()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from)
-        .or(detected_model);
-    let host_pid = body["hostPid"]
-        .as_u64()
-        .and_then(|v| u32::try_from(v).ok())
-        .or(detected_pid);
+    let agent = body["agent"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from).or(detected_agent);
+    let model = body["model"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from).or(detected_model);
+    let host_pid = body["hostPid"].as_u64().and_then(|v| u32::try_from(v).ok()).or(detected_pid);
     let run = core.drove.store.create_run(super::store::CreateRunInput {
         objective: objective.into(),
         cwd: cwd.into(),
@@ -887,11 +890,9 @@ async fn preflight_worktree_http(core: &Arc<Core>, body: &Value) -> Result<Value
             "totalDirty": ok.total_dirty,
             "dirtyWarning": ok.dirty_warning,
         })),
-        Err(blocker) => Err(ApiErr::new(
-            422,
-            "worktree_not_ready",
-            format!("{} | 建议处理：{}", blocker.message, blocker.fix_hint),
-        )),
+        Err(blocker) => {
+            Err(ApiErr::new(422, "worktree_not_ready", format!("{} | 建议处理：{}", blocker.message, blocker.fix_hint)))
+        }
     }
 }
 
@@ -906,12 +907,7 @@ async fn trash_run_http(core: &Arc<Core>, id: &str) -> Result<Value, ApiErr> {
     {
         return Err(ApiErr::new(409, "invalid_state", "stop active tasks before trashing"));
     }
-    let wids: Vec<String> = drove
-        .store
-        .list_workers(Some(id))
-        .into_iter()
-        .map(|w| w.id)
-        .collect();
+    let wids: Vec<String> = drove.store.list_workers(Some(id)).into_iter().map(|w| w.id).collect();
     super::pool::stop_run_workers(core, id).await;
     core.ai.evict_session_prefix(&format!("drove:run:{id}"));
     for wid in wids {
@@ -974,10 +970,7 @@ fn normalize_snapshot_deps(tasks: &mut [Task]) {
                 resolved.push(id);
             }
         };
-        let parent_tpl = task
-            .expanded_from
-            .as_deref()
-            .and_then(|pid| snapshot.iter().find(|c| c.id == pid));
+        let parent_tpl = task.expanded_from.as_deref().and_then(|pid| snapshot.iter().find(|c| c.id == pid));
         let parent_dep_ids: std::collections::HashSet<String> = parent_tpl
             .map(|tpl| {
                 tpl.deps
@@ -1014,11 +1007,10 @@ fn normalize_snapshot_deps(tasks: &mut [Task]) {
                 }
             } else {
                 let mut matched_foreach = false;
-                for child in snapshot.iter().filter(|c| {
-                    c.key
-                        .strip_prefix(dep.as_str())
-                        .is_some_and(|rest| rest.starts_with('#'))
-                }) {
+                for child in snapshot
+                    .iter()
+                    .filter(|c| c.key.strip_prefix(dep.as_str()).is_some_and(|rest| rest.starts_with('#')))
+                {
                     matched_foreach = true;
                     push_unique(child.id.clone());
                 }
@@ -1037,7 +1029,7 @@ fn normalize_snapshot_deps(tasks: &mut [Task]) {
 pub(super) fn is_local_session_bound(core: &Core, host_session: &str) -> Option<bool> {
     (super::pool::local_session_part(core, host_session).is_some()
         && super::pool::resolve_local_parent(core, host_session).is_some())
-        .then_some(true)
+    .then_some(true)
 }
 
 pub(super) async fn resolve_session_meta_and_entries(
@@ -1046,10 +1038,7 @@ pub(super) async fn resolve_session_meta_and_entries(
     probe_model: bool,
     include_entries: bool,
 ) -> (Option<String>, Option<String>, Option<u32>, Vec<crate::transcript::Entry>, bool) {
-    let local_sess = host_session
-        .rsplit_once('/')
-        .map(|(_, r)| r)
-        .unwrap_or(host_session);
+    let local_sess = host_session.rsplit_once('/').map(|(_, r)| r).unwrap_or(host_session);
 
     if let Some(aid) = crate::agents::parse_id(local_sess) {
         let (agent, model, pid, live) = {
@@ -1061,21 +1050,12 @@ pub(super) async fn resolve_session_meta_and_entries(
                         .find(|o| o.id == "model" || o.category.as_deref() == Some("model"))
                         .and_then(|o| o.current_value.as_str().map(String::from))
                 });
-                (
-                    a.agent.clone().or_else(|| a.agent_info.clone()),
-                    model,
-                    a.pid,
-                    a.is_live(),
-                )
+                (a.agent.clone().or_else(|| a.agent_info.clone()), model, a.pid, a.is_live())
             } else {
                 (None, None, None, false)
             }
         };
-        let entries = if include_entries {
-            core.read_transcript_entries(aid).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
+        let entries = if include_entries { core.read_transcript_entries(aid).unwrap_or_default() } else { Vec::new() };
         let available = live || !entries.is_empty();
         return (agent, model, pid, entries, available);
     }
@@ -1095,11 +1075,9 @@ pub(super) async fn resolve_session_meta_and_entries(
             let agent = snap.agent_hint.clone();
             let pid = snap.fg_pid;
             if include_entries || probe_model {
-                let extracted = tokio::task::spawn_blocking(move || {
-                    crate::pty_transcript::extract_transcript(&snap)
-                })
-                .await
-                .unwrap_or_else(|_| (Vec::new(), None));
+                let extracted = tokio::task::spawn_blocking(move || crate::pty_transcript::extract_transcript(&snap))
+                    .await
+                    .unwrap_or_else(|_| (Vec::new(), None));
                 let model = extracted.1.and_then(|m| m.model);
                 let entries = if include_entries { extracted.0 } else { Vec::new() };
                 let available = !entries.is_empty() || model.is_some();
@@ -1302,7 +1280,9 @@ async fn build_snapshot(core: &Arc<Core>, id: &str) -> Result<Value, ApiErr> {
 
 fn sort_runs(runs: &mut [Run]) {
     runs.sort_by(|a, b| match (a.order, b.order) {
-        (Some(ao), Some(bo)) if (ao - bo).abs() > f64::EPSILON => ao.partial_cmp(&bo).unwrap_or(std::cmp::Ordering::Equal),
+        (Some(ao), Some(bo)) if (ao - bo).abs() > f64::EPSILON => {
+            ao.partial_cmp(&bo).unwrap_or(std::cmp::Ordering::Equal)
+        }
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
         _ => b.created_at.cmp(&a.created_at),
@@ -1313,11 +1293,7 @@ fn sort_runs(runs: &mut [Run]) {
 
 fn connected_machines(core: &Core) -> Vec<crate::machines::Machine> {
     let st = core.lock();
-    st.machines
-        .iter()
-        .filter(|m| matches!(st.lines.get(&m.id), Some(LineState::Connected(_))))
-        .cloned()
-        .collect()
+    st.machines.iter().filter(|m| matches!(st.lines.get(&m.id), Some(LineState::Connected(_)))).cloned().collect()
 }
 
 fn find_machine(core: &Core, name: &str) -> Result<crate::machines::Machine, ApiErr> {
@@ -1387,7 +1363,9 @@ async fn federated_list_runs(core: &Arc<Core>, query: &BTreeMap<String, String>)
         let ao = a["order"].as_f64();
         let bo = b["order"].as_f64();
         match (ao, bo) {
-            (Some(x), Some(y)) if (x - y).abs() > f64::EPSILON => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+            (Some(x), Some(y)) if (x - y).abs() > f64::EPSILON => {
+                x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+            }
             (Some(_), None) => std::cmp::Ordering::Less,
             (None, Some(_)) => std::cmp::Ordering::Greater,
             _ => b["createdAt"].as_str().unwrap_or("").cmp(a["createdAt"].as_str().unwrap_or("")),
@@ -1399,9 +1377,7 @@ async fn federated_list_runs(core: &Arc<Core>, query: &BTreeMap<String, String>)
 
 async fn proxy_to_machine(core: &Arc<Core>, machine: &str, req: &HttpProxyRequest) -> Result<Value, ApiErr> {
     let m = find_machine(core, machine)?;
-    let resp_val = remote::forward(core, &m, "drove.http_proxy", json!(req))
-        .await
-        .map_err(rpc_to_api)?;
+    let resp_val = remote::forward(core, &m, "drove.http_proxy", json!(req)).await.map_err(rpc_to_api)?;
     let parsed: HttpProxyResponse = serde_json::from_value(resp_val)
         .map_err(|e| ApiErr::new(502, "bad_gateway", format!("invalid proxy reply: {e}")))?;
     let mut body = parsed.body;
@@ -1448,11 +1424,7 @@ pub(crate) fn prefix_remote_json(v: &mut Value, machine: &str) {
     ];
     let looks_like_entity_id = |s: &str| {
         let local = s.rsplit_once('/').map(|(_, r)| r).unwrap_or(s);
-        [
-            "run_", "tsk_", "wrk_", "att_", "msg_", "r_", "t_", "w_", "a_", "m_",
-        ]
-        .iter()
-        .any(|p| local.starts_with(p))
+        ["run_", "tsk_", "wrk_", "att_", "msg_", "r_", "t_", "w_", "a_", "m_"].iter().any(|p| local.starts_with(p))
     };
     let prefix = |s: &mut String| {
         if !s.is_empty()
@@ -1468,11 +1440,11 @@ pub(crate) fn prefix_remote_json(v: &mut Value, machine: &str) {
             let is_msg = map.contains_key("seq") && map.contains_key("needsAction");
             for (k, val) in map.iter_mut() {
                 if let Value::String(s) = val
-                    && (ID_KEYS.contains(&k.as_str())
-                        || (k == "from" && is_msg && s.starts_with("worker:")))
+                    && (ID_KEYS.contains(&k.as_str()) || (k == "from" && is_msg && s.starts_with("worker:")))
                 {
                     if let Some(wid) = s.strip_prefix("worker:").map(String::from) {
-                        *s = if wid.contains('/') { format!("worker:{wid}") } else { format!("worker:{machine}/{wid}") };
+                        *s =
+                            if wid.contains('/') { format!("worker:{wid}") } else { format!("worker:{machine}/{wid}") };
                     } else if k == "task" && !looks_like_entity_id(s) {
                         // Keep task key references unprefixed so frontend matches `task.key`.
                     } else {
@@ -1506,10 +1478,7 @@ pub(crate) fn prefix_remote_json(v: &mut Value, machine: &str) {
 }
 
 fn encode_query(map: &BTreeMap<String, String>) -> String {
-    map.iter()
-        .map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v)))
-        .collect::<Vec<_>>()
-        .join("&")
+    map.iter().map(|(k, v)| format!("{}={}", percent_encode(k), percent_encode(v))).collect::<Vec<_>>().join("&")
 }
 
 fn percent_encode(s: &str) -> String {
@@ -1556,11 +1525,8 @@ async fn serve_sse(
     let mut local_rx = core.drove.store.subscribe();
     let (remote_tx, mut remote_rx) = tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
 
-    let remote_tasks = if local_only {
-        Vec::new()
-    } else {
-        spawn_remote_sse_relays(&core, run_filter.as_deref(), remote_tx).await
-    };
+    let remote_tasks =
+        if local_only { Vec::new() } else { spawn_remote_sse_relays(&core, run_filter.as_deref(), remote_tx).await };
 
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     heartbeat.tick().await;
@@ -1743,7 +1709,8 @@ fn inject_web_token(bytes: &[u8], web_token: &str) -> Vec<u8> {
 }
 
 fn embedded_web_asset(rel: &str, safe_rel: bool) -> Option<(&'static str, &'static [u8])> {
-    if safe_rel && !rel.is_empty()
+    if safe_rel
+        && !rel.is_empty()
         && let Some(found) = DROVE_WEB_ASSETS.iter().find(|(k, _)| *k == rel)
     {
         return Some(*found);
@@ -1786,7 +1753,14 @@ async fn serve_static(
             "<!doctype html><html><head><meta charset='utf-8'><title>Drove</title><script>window.__DROVE_TOKEN__={token};window.__CO_TOKEN__={token};</script></head>\
              <body style='font-family:system-ui;padding:24px'><h1>Drove</h1><p>Drove API is running. Web bundle not found; run <code>npm run build</code> in <code>drove-web/</code>.</p></body></html>"
         );
-        return write_http_bytes(w, 200, "text/html; charset=utf-8", "no-store", if head_only { &[] } else { html.as_bytes() }).await;
+        return write_http_bytes(
+            w,
+            200,
+            "text/html; charset=utf-8",
+            "no-store",
+            if head_only { &[] } else { html.as_bytes() },
+        )
+        .await;
     };
 
     let mut target = if safe_rel && !rel.is_empty() { root.join(rel_path) } else { root.join("index.html") };
@@ -1804,9 +1778,8 @@ async fn serve_static(
     }
 
     let ext = canon_target.extension().and_then(|s| s.to_str()).unwrap_or("").to_string();
-    let bytes = tokio::task::spawn_blocking(move || std::fs::read(&canon_target))
-        .await
-        .map_err(std::io::Error::other)??;
+    let bytes =
+        tokio::task::spawn_blocking(move || std::fs::read(&canon_target)).await.map_err(std::io::Error::other)??;
     write_static_response(drove, w, &ext, &bytes, head_only).await
 }
 
@@ -1862,8 +1835,7 @@ mod tests {
         if !web_pkg.is_file() || std::env::var("H2_SKIP_WEB_BUILD").as_deref() == Ok("1") {
             return;
         }
-        let (index_rel, index_bytes) =
-            embedded_web_asset("", true).expect("DROVE_WEB_ASSETS should embed index.html");
+        let (index_rel, index_bytes) = embedded_web_asset("", true).expect("DROVE_WEB_ASSETS should embed index.html");
         assert_eq!(index_rel, "index.html");
         let html = String::from_utf8_lossy(index_bytes);
         assert!(html.contains("<div id=\"root\"></div>"), "unexpected index.html: {html}");
@@ -1872,7 +1844,8 @@ mod tests {
         assert!(injected.contains("window.__DROVE_TOKEN__=\"tok-123\""));
         assert!(injected.contains("</head>"));
 
-        let has_js = DROVE_WEB_ASSETS.iter().any(|(k, b)| k.starts_with("assets/") && k.ends_with(".js") && !b.is_empty());
+        let has_js =
+            DROVE_WEB_ASSETS.iter().any(|(k, b)| k.starts_with("assets/") && k.ends_with(".js") && !b.is_empty());
         let has_css =
             DROVE_WEB_ASSETS.iter().any(|(k, b)| k.starts_with("assets/") && k.ends_with(".css") && !b.is_empty());
         assert!(has_js, "embedded bundle should include JS asset");

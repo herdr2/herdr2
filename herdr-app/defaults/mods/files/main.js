@@ -33,7 +33,11 @@ import {
   parseCodeFence,
   serializeCodeFence,
   resolveFenceLanguage,
+  parseMathBlock,
 } from "./markdown_blocks.js";
+import { renderMermaidSvg } from "./mermaid_svg.js";
+import { renderMathSvg } from "./math_svg.js";
+import { escapeXml } from "./svg_utils.js";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
@@ -48,8 +52,14 @@ function location() {
 const key = () => JSON.stringify(location());
 const PER_FOLDER = 500, TOTAL = 5000, MAX_PREVIEW_CHARS = 400000;
 const MAX_FILE_CACHE = 24, MAX_CACHE_TEXT_CHARS = 200000, MAX_CACHE_IMAGE_CHARS = 2000000;
+const MAX_SVG_CACHE = 128;
 const INITIAL_MD_BLOCKS = 32, MD_PUMP_STEP = 48;
-const INLINE_MD_RE = /[*_`~\[\]!<]|https?:\/\//i;
+const INLINE_MD_RE = /[*_`~\[\]!<$]|\\\(|https?:\/\//i;
+const isMermaidLang = (lang) => String(lang ?? "").trim().toLowerCase() === "mermaid";
+const isMathFenceLang = (lang) => {
+  const l = String(lang ?? "").trim().toLowerCase();
+  return l === "math" || l === "katex";
+};
 
 function isAbsolutePath(p) {
   return typeof p === "string" && /^(\/|[A-Za-z]:[\\/])/.test(p);
@@ -146,7 +156,7 @@ function blockTypography(block, sansFont, monoFont) {
   if (level === 3) return { fontFamily: sansFont, fontSize: 15, lineHeight: 21, wrapCols: 48, bold: true };
   if (level === 4) return { fontFamily: sansFont, fontSize: 13.5, lineHeight: 20, wrapCols: 52, bold: true };
   if (level >= 5) return { fontFamily: sansFont, fontSize: 13, lineHeight: 19, wrapCols: 56, bold: true };
-  if (block?.kind === "frontmatter" || block?.kind === "html") {
+  if (block?.kind === "frontmatter" || block?.kind === "html" || block?.kind === "math") {
     return { fontFamily: monoFont, fontSize: 12.5, lineHeight: 20, wrapCols: 58, bold: false };
   }
   return { fontFamily: sansFont, fontSize: 13.5, lineHeight: 21, wrapCols: 54, bold: false };
@@ -204,6 +214,9 @@ export default class Files extends View {
     this.mdPumpTask = null;
     this.mdRenderLimit = INITIAL_MD_BLOCKS;
     this.fileCache = new Map();
+    this.svgRenderCache = new Map();
+    this.mermaidSourceBlocks = new Set();
+    this.mermaidZoom = new Map();
     this.selectedFile = null;
     this.showSeq = 0;
     this.lastHandledOpenSeq = 0;
@@ -709,12 +722,53 @@ export default class Files extends View {
     return block._fence;
   }
 
-  getBlockRendered(block, defs) {
+  getBlockMath(block) {
+    if (block._mathRaw === block.raw) return block._math;
+    block._mathRaw = block.raw;
+    block._math = parseMathBlock(block.raw);
+    return block._math;
+  }
+
+  svgCacheGetOrCompute(cacheKey, computeFn) {
+    if (this.svgRenderCache.has(cacheKey)) {
+      const hit = this.svgRenderCache.get(cacheKey);
+      this.svgRenderCache.delete(cacheKey);
+      this.svgRenderCache.set(cacheKey, hit);
+      return hit;
+    }
+    const val = computeFn();
+    while (this.svgRenderCache.size >= MAX_SVG_CACHE) {
+      const oldest = this.svgRenderCache.keys().next().value;
+      if (oldest === undefined) break;
+      this.svgRenderCache.delete(oldest);
+    }
+    this.svgRenderCache.set(cacheKey, val);
+    return val;
+  }
+
+  getCachedMermaid(source, mdTheme, scale = 1) {
+    const themeKey = `${mdTheme.id}|${mdTheme.background}|${mdTheme.surface}|${mdTheme.textView.foreground}|${mdTheme.textView.link}|${mdTheme.border}|${mdTheme.textView.dark ? 1 : 0}`;
+    const cacheKey = `m:${scale}:${themeKey}:${source}`;
+    return this.svgCacheGetOrCompute(cacheKey, () => renderMermaidSvg(source, { theme: mdTheme, scale }));
+  }
+
+  getCachedDisplayMath(latex, mdTheme) {
+    const cacheKey = `d:${mdTheme.id}|${mdTheme.textView.foreground}:${latex}`;
+    return this.svgCacheGetOrCompute(cacheKey, () =>
+      renderMathSvg(latex, { display: true, fontSize: 17, color: mdTheme.textView.foreground })
+    );
+  }
+
+  getBlockRendered(block, defs, mdTheme) {
+    const level = block.headingLevel || 0;
+    const mathFontSize = level === 1 ? 22 : level === 2 ? 17.5 : level === 3 ? 15 : 13.5;
+    const mathSig = mdTheme ? `${mdTheme.id}|${mdTheme.textView.foreground}|${mathFontSize}|${level > 0 ? 1 : 0}` : "";
     if (
       block._renderedRaw === block.raw &&
       block._renderedDefs === defs &&
       block._renderedRev === this.remoteImageRev &&
-      block._renderedFile === this.file
+      block._renderedFile === this.file &&
+      block._renderedMathSig === mathSig
     ) {
       return block._rendered;
     }
@@ -722,7 +776,16 @@ export default class Files extends View {
     block._renderedDefs = defs;
     block._renderedRev = this.remoteImageRev;
     block._renderedFile = this.file;
-    block._rendered = prepareBlockMarkdown(block.raw, defs, this.remoteImages, this.file);
+    block._renderedMathSig = mathSig;
+    block._rendered = prepareBlockMarkdown(
+      block.raw,
+      defs,
+      this.remoteImages,
+      this.file,
+      mdTheme
+        ? { math: { color: mdTheme.textView.foreground, fontSize: mathFontSize, bold: level > 0 } }
+        : null
+    );
     return block._rendered;
   }
 
@@ -1273,6 +1336,8 @@ export default class Files extends View {
     this.savedUntil = 0;
     this.doc = parseMarkdownBlocks("");
     this.mdRenderLimit = 0;
+    this.mermaidSourceBlocks.clear();
+    this.mermaidZoom.clear();
     this.imageDataUrl = null;
     this.remoteImages = new Map();
     this.remoteAttempted = new Set();
@@ -2704,7 +2769,13 @@ export default class Files extends View {
                 INLINE_MD_RE.test(displayText)
                   ? TextView.markdown(
                       `files-md-cell-tv-${this.file}-${blockIndex}-${rowKey}-${col}`,
-                      isHeader ? `**${displayText}**` : displayText,
+                      prepareBlockMarkdown(
+                        isHeader ? `**${displayText}**` : displayText,
+                        this.doc.defs,
+                        this.remoteImages,
+                        this.file,
+                        { math: { color: mdTheme.textView.foreground, fontSize: 12.5, bold: isHeader } }
+                      ),
                       textViewOptions
                     )
                       .w_full()
@@ -2857,6 +2928,499 @@ export default class Files extends View {
               this.startBlockEdit(i, cx)
             ))
         )
+      );
+  }
+
+  renderMermaidBlock(i, block, fence, t, mdTheme, textViewOptions, blockHover, editable) {
+    const isEditingBody = this.editingBlock === i && this.editingMode === "code" && this.blockEditor;
+    const isEditingLang = this.editingCodeLang?.blockIndex === i && this.codeLangInput;
+    const showSource = this.mermaidSourceBlocks.has(i);
+    const zoom = this.mermaidZoom.get(i) ?? 1;
+    const zoomPct = Math.round(zoom * 100);
+    const codeBg = mdTheme.textView.code_background ?? mdTheme.surface ?? mdTheme.background;
+    const diagramBg = mdTheme.surface ?? mdTheme.background;
+    const mono = settings()?.font_family;
+    const editorHeight = Math.max(54, Math.min(420, this.blockEditorRows * 19 + 12));
+    const currentSource = isEditingBody ? this.blockEditor.value() : fence.body;
+    const rendered = currentSource.trim() ? this.getCachedMermaid(currentSource, mdTheme, zoom) : null;
+
+    const diagramPreview = (idPrefix) => {
+      if (!currentSource.trim()) {
+        return div()
+          .px(12)
+          .py(14)
+          .when(Boolean(mono), s => s.font_family(mono))
+          .text_size(12)
+          .text_color(mdTheme.textView.muted)
+          .child(tr("Empty Mermaid diagram · click to write", "空 Mermaid 图表 · 点击编写"));
+      }
+      if (!rendered || !rendered.ok) {
+        return v_flex()
+          .w_full()
+          .gap(6)
+          .px(10)
+          .py(8)
+          .child(
+            h_flex()
+              .w_full()
+              .px(8)
+              .py(5)
+              .gap(6)
+              .items_center()
+              .rounded(5)
+              .bg(withAlpha(t.blocked ?? "#d97706", "1a") ?? codeBg)
+              .border_1()
+              .border_color(withAlpha(t.blocked ?? "#d97706", "55") ?? mdTheme.border)
+              .child(div().text_size(11).font_semibold().text_color(t.blocked ?? "#d97706").child(tr("Mermaid render fallback", "Mermaid 语法暂不支持或有误")))
+              .child(div().flex_1().min_w(0).truncate().text_size(11).text_color(mdTheme.textView.muted).child(rendered?.error || ""))
+          )
+          .when(!isEditingBody, el =>
+            el.child(
+              TextView.markdown(`files-md-mermaid-fallback-${this.file}-${i}`, block.raw, textViewOptions)
+                .w_full()
+                .min_w(0)
+                .text_color(mdTheme.textView.foreground)
+                .selectable(true)
+                .scrollable(false)
+            )
+          );
+      }
+
+      const imgMd = `<img src="${rendered.dataUrl}" width="${rendered.width}" height="${rendered.height}" alt="${escapeXml(rendered.label)}" />`;
+      return div()
+        .id(`${idPrefix}-scroll-${i}`)
+        .w_full()
+        .min_w(0)
+        .overflow_x_scrollbar()
+        .px(12)
+        .py(12)
+        .bg(diagramBg)
+        .child(
+          h_flex()
+            .w_full()
+            .min_w(rendered.width)
+            .justify_center()
+            .child(
+              div()
+                .w(rendered.width)
+                .flex_none()
+                .child(
+                  TextView.markdown(`${idPrefix}-tv-${this.file}-${i}-${zoomPct}`, imgMd, textViewOptions)
+                    .w(rendered.width)
+                    .text_color(mdTheme.textView.foreground)
+                    .selectable(false)
+                    .scrollable(false)
+                )
+            )
+        );
+    };
+
+    return v_flex()
+      .id(`files-md-mermaid-block-${i}`)
+      .w_full()
+      .min_w(0)
+      .my(4)
+      .rounded(6)
+      .overflow_hidden()
+      .bg(codeBg)
+      .border_1()
+      .border_color(isEditingBody ? (mdTheme.textView.link ?? t.accent ?? mdTheme.border) : mdTheme.border)
+      .when(isEditingBody, el =>
+        el
+          .on_mouse_down("left", stopMouse)
+          .on_mouse_down_out((_e, cx) => this.commitBlockEdit(cx))
+          .on_key_down((e, cx) => {
+            if (e.key === "escape" || e.keystroke === "cmd-enter" || e.keystroke === "ctrl-enter") {
+              cx.stop_propagation();
+              this.commitBlockEdit(cx);
+            } else if (e.keystroke === "cmd-s" || e.keystroke === "ctrl-s") {
+              cx.stop_propagation();
+              this.saveFile(cx);
+            }
+          })
+      )
+      .child(
+        h_flex()
+          .h(28)
+          .px(10)
+          .gap(6)
+          .items_center()
+          .justify_between()
+          .border_b(1)
+          .border_color(mdTheme.border)
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .child(
+                isEditingLang
+                  ? div()
+                      .id("files-md-code-lang-input")
+                      .w(110)
+                      .on_mouse_down("left", stopMouse)
+                      .on_mouse_down_out((_e, cx) => this.commitCodeLangEdit(cx))
+                      .on_key_down((e, cx) => {
+                        if (e.key === "escape") {
+                          cx.stop_propagation();
+                          this.commitCodeLangEdit(cx);
+                        } else if (e.keystroke === "cmd-s" || e.keystroke === "ctrl-s") {
+                          cx.stop_propagation();
+                          this.saveFile(cx);
+                        }
+                      })
+                      .child(
+                        Input.new(this.codeLangInput)
+                          .w_full()
+                          .h(20)
+                          .when(Boolean(mono), s => s.font_family(mono))
+                          .text_size(11)
+                          .text_color(mdTheme.textView.foreground)
+                      )
+                  : div()
+                      .id(`files-md-code-lang-${i}`)
+                      .px(5)
+                      .py(1)
+                      .rounded(4)
+                      .when(Boolean(mono), s => s.font_family(mono))
+                      .text_size(11)
+                      .font_medium()
+                      .text_color(mdTheme.textView.link ?? t.accent ?? mdTheme.textView.foreground)
+                      .when(editable, s =>
+                        s
+                          .cursor_pointer()
+                          .hover(h => h.bg(blockHover))
+                          .on_mouse_down("left", stopMouse)
+                          .on_click((_e, cx) => {
+                            cx.stop_propagation();
+                            this.startCodeLangEdit(i, cx);
+                          })
+                      )
+                      .child(fence.lang || "mermaid")
+              )
+              .when(Boolean(rendered?.ok && rendered?.label), el =>
+                el.child(
+                  div()
+                    .px(5)
+                    .py(1)
+                    .rounded(4)
+                    .bg(mdTheme.background)
+                    .border_1()
+                    .border_color(mdTheme.border)
+                    .text_size(10)
+                    .text_color(mdTheme.textView.muted)
+                    .child(rendered.label)
+                )
+              )
+          )
+          .child(
+            h_flex()
+              .gap(3)
+              .items_center()
+              .when(!showSource && Boolean(rendered?.ok), el =>
+                el
+                  .child(
+                    this.tableActionButton(`files-md-mermaid-zoom-out-${i}`, "−", t, mdTheme, blockHover, cx => {
+                      const next = Math.max(0.5, Math.round((zoom - 0.25) * 100) / 100);
+                      this.mermaidZoom.set(i, next);
+                      cx.notify();
+                    })
+                  )
+                  .child(
+                    this.tableActionButton(`files-md-mermaid-zoom-reset-${i}`, `${zoomPct}%`, t, mdTheme, blockHover, cx => {
+                      this.mermaidZoom.set(i, 1);
+                      cx.notify();
+                    })
+                  )
+                  .child(
+                    this.tableActionButton(`files-md-mermaid-zoom-in-${i}`, "+", t, mdTheme, blockHover, cx => {
+                      const next = Math.min(2, Math.round((zoom + 0.25) * 100) / 100);
+                      this.mermaidZoom.set(i, next);
+                      cx.notify();
+                    })
+                  )
+              )
+              .when(!isEditingBody, el =>
+                el.child(
+                  this.tableActionButton(
+                    `files-md-mermaid-toggle-${i}`,
+                    showSource ? tr("Diagram", "图表") : tr("Source", "源码"),
+                    t,
+                    mdTheme,
+                    blockHover,
+                    cx => {
+                      if (this.mermaidSourceBlocks.has(i)) this.mermaidSourceBlocks.delete(i);
+                      else this.mermaidSourceBlocks.add(i);
+                      cx.notify();
+                    }
+                  )
+                )
+              )
+              .when(editable && !isEditingBody, el =>
+                el.child(
+                  this.tableActionButton(`files-md-mermaid-edit-${i}`, tr("Edit", "编辑"), t, mdTheme, blockHover, cx => {
+                    this.startCodeBlockEdit(i, cx, "end");
+                  })
+                )
+              )
+              .when(isEditingBody, el =>
+                el.child(
+                  this.tableActionButton(`files-md-mermaid-done-${i}`, tr("Done", "完成"), t, mdTheme, blockHover, cx => {
+                    this.commitBlockEdit(cx);
+                  })
+                )
+              )
+              .child(
+                this.tableActionButton(`files-md-mermaid-copy-${i}`, tr("Copy", "复制"), t, mdTheme, blockHover, cx => {
+                  try { cx.write_to_clipboard(currentSource); } catch {}
+                  notify({ title: tr("Copied Mermaid source", "已复制 Mermaid 源码"), level: "info" });
+                })
+              )
+          )
+      )
+      .when(isEditingBody, el =>
+        el
+          .child(
+            div()
+              .id("files-md-code-editor")
+              .w_full()
+              .h(editorHeight)
+              .px(6)
+              .py(4)
+              .child(Editor.new(this.blockEditor).size_full().bg(codeBg))
+          )
+          .child(
+            v_flex()
+              .w_full()
+              .border_t(1)
+              .border_color(mdTheme.border)
+              .child(diagramPreview("files-md-mermaid-live"))
+          )
+      )
+      .when(!isEditingBody && showSource, el =>
+        el.child(
+          div()
+            .id(`files-md-mermaid-source-${i}`)
+            .w_full()
+            .min_w(0)
+            .px(10)
+            .py(6)
+            .when(editable, body =>
+              body
+                .cursor_text()
+                .hover(s => s.bg(blockHover))
+                .on_mouse_down("left", e => {
+                  this.codeBlockPress = { index: i, x: e.position?.x ?? 0, y: e.position?.y ?? 0 };
+                })
+                .on_mouse_up("left", (e, cx) => {
+                  const press = this.codeBlockPress;
+                  this.codeBlockPress = null;
+                  const commitOut = this.committedOut;
+                  this.committedOut = null;
+                  if (!press || press.index !== i) return;
+                  const dx = (e.position?.x ?? press.x) - press.x;
+                  const dy = (e.position?.y ?? press.y) - press.y;
+                  if (dx * dx + dy * dy > 64) return;
+                  const targetIndex = commitOut && i > commitOut.editedIdx ? i + commitOut.delta : i;
+                  if (this.doc?.blocks?.[targetIndex]) this.startCodeBlockEdit(targetIndex, cx, "end");
+                })
+            )
+            .child(
+              TextView.markdown(`files-md-mermaid-src-tv-${this.file}-${i}`, block.raw, textViewOptions)
+                .w_full()
+                .min_w(0)
+                .text_color(mdTheme.textView.foreground)
+                .selectable(true)
+                .scrollable(false)
+            )
+        )
+      )
+      .when(!isEditingBody && !showSource, el =>
+        el.child(
+          div()
+            .id(`files-md-mermaid-body-${i}`)
+            .w_full()
+            .min_w(0)
+            .when(editable, body =>
+              body
+                .cursor_pointer()
+                .on_mouse_down("left", e => {
+                  this.codeBlockPress = { index: i, x: e.position?.x ?? 0, y: e.position?.y ?? 0 };
+                })
+                .on_mouse_up("left", (e, cx) => {
+                  const press = this.codeBlockPress;
+                  this.codeBlockPress = null;
+                  const commitOut = this.committedOut;
+                  this.committedOut = null;
+                  if (!press || press.index !== i) return;
+                  const dx = (e.position?.x ?? press.x) - press.x;
+                  const dy = (e.position?.y ?? press.y) - press.y;
+                  if (dx * dx + dy * dy > 64) return;
+                  const targetIndex = commitOut && i > commitOut.editedIdx ? i + commitOut.delta : i;
+                  if (this.doc?.blocks?.[targetIndex]) this.startCodeBlockEdit(targetIndex, cx, "end");
+                })
+            )
+            .child(diagramPreview("files-md-mermaid"))
+        )
+      );
+  }
+
+  renderMathBlock(i, block, latex, isFenced, fence, t, mdTheme, textViewOptions, blockHover, editable) {
+    const isEditing =
+      this.editingBlock === i &&
+      this.blockEditor &&
+      ((isFenced && this.editingMode === "code") || (!isFenced && this.editingMode === "block"));
+    const codeBg = mdTheme.textView.code_background ?? mdTheme.surface ?? mdTheme.background;
+    const mono = settings()?.font_family;
+    const liveLatex = isEditing
+      ? (isFenced ? this.blockEditor.value().trim() : (parseMathBlock(this.blockEditor.value())?.body ?? this.blockEditor.value().trim()))
+      : String(latex ?? "").trim();
+    const rendered = liveLatex ? this.getCachedDisplayMath(liveLatex, mdTheme) : null;
+    const editorHeight = Math.max(44, Math.min(360, this.blockEditorRows * 20 + 12));
+
+    const formulaView = (idPrefix) => {
+      if (!liveLatex) {
+        return div()
+          .px(12)
+          .py(10)
+          .text_size(12)
+          .text_color(mdTheme.textView.muted)
+          .child(tr("Empty formula · click to write LaTeX", "空公式 · 点击输入 LaTeX"));
+      }
+      if (!rendered || !rendered.ok) {
+        return v_flex()
+          .w_full()
+          .px(12)
+          .py(8)
+          .gap(4)
+          .child(div().text_size(11).text_color(t.blocked ?? "#d97706").child(rendered?.error || tr("Formula error", "公式解析错误")))
+          .child(
+            div()
+              .when(Boolean(mono), s => s.font_family(mono))
+              .text_size(12)
+              .text_color(mdTheme.textView.foreground)
+              .whitespace_normal()
+              .child(liveLatex)
+          );
+      }
+      const imgMd = `<img src="${rendered.dataUrl}" width="${rendered.width}" height="${rendered.height}" alt="${escapeXml(liveLatex.slice(0, 80))}" />`;
+      return div()
+        .id(`${idPrefix}-scroll-${i}`)
+        .w_full()
+        .min_w(0)
+        .overflow_x_scrollbar()
+        .px(12)
+        .py(10)
+        .child(
+          h_flex()
+            .w_full()
+            .min_w(rendered.width)
+            .justify_center()
+            .child(
+              div()
+                .w(rendered.width)
+                .flex_none()
+                .child(
+                  TextView.markdown(`${idPrefix}-tv-${this.file}-${i}`, imgMd, textViewOptions)
+                    .w(rendered.width)
+                    .text_color(mdTheme.textView.foreground)
+                    .selectable(false)
+                    .scrollable(false)
+                )
+            )
+        );
+    };
+
+    if (isEditing) {
+      return v_flex()
+        .id(isFenced ? "files-md-code-editor" : "files-md-block-editor")
+        .w_full()
+        .min_w(0)
+        .my(4)
+        .rounded(6)
+        .overflow_hidden()
+        .bg(codeBg)
+        .border_1()
+        .border_color(mdTheme.textView.link ?? t.accent ?? mdTheme.border)
+        .on_mouse_down("left", stopMouse)
+        .on_mouse_down_out((_e, cx) => this.commitBlockEdit(cx))
+        .on_key_down((e, cx) => {
+          if (e.key === "escape" || e.keystroke === "cmd-enter" || e.keystroke === "ctrl-enter") {
+            cx.stop_propagation();
+            this.commitBlockEdit(cx);
+          } else if (e.keystroke === "cmd-s" || e.keystroke === "ctrl-s") {
+            cx.stop_propagation();
+            this.saveFile(cx);
+          }
+        })
+        .child(
+          h_flex()
+            .h(24)
+            .px(10)
+            .items_center()
+            .justify_between()
+            .border_b(1)
+            .border_color(mdTheme.border)
+            .child(div().when(Boolean(mono), s => s.font_family(mono)).text_size(10.5).text_color(mdTheme.textView.muted).child(isFenced ? (fence?.lang || "math") : "LaTeX Math"))
+            .child(this.tableActionButton(`files-md-math-done-${i}`, tr("Done", "完成"), t, mdTheme, blockHover, cx => this.commitBlockEdit(cx)))
+        )
+        .child(
+          div()
+            .w_full()
+            .h(editorHeight)
+            .px(6)
+            .py(4)
+            .child(Editor.new(this.blockEditor).size_full().bg(codeBg))
+        )
+        .child(
+          div()
+            .w_full()
+            .bg(mdTheme.background)
+            .border_t(1)
+            .border_color(mdTheme.border)
+            .child(formulaView("files-md-math-live"))
+        );
+    }
+
+    return v_flex()
+      .id(`files-md-math-block-${i}`)
+      .w_full()
+      .min_w(0)
+      .my(4)
+      .rounded(6)
+      .bg(mdTheme.surface ?? mdTheme.background)
+      .border_1()
+      .border_color(mdTheme.border)
+      .when(editable, el =>
+        el
+          .cursor_text()
+          .hover(s => s.bg(blockHover))
+          .on_mouse_down("left", e => {
+            if (isFenced) this.codeBlockPress = { index: i, x: e.position?.x ?? 0, y: e.position?.y ?? 0 };
+            else this.blockPress = { index: i, x: e.position?.x ?? 0, y: e.position?.y ?? 0 };
+          })
+          .on_mouse_up("left", (e, cx) => {
+            const press = isFenced ? this.codeBlockPress : this.blockPress;
+            if (isFenced) this.codeBlockPress = null;
+            else this.blockPress = null;
+            const commitOut = this.committedOut;
+            this.committedOut = null;
+            if (!press || press.index !== i) return;
+            const dx = (e.position?.x ?? press.x) - press.x;
+            const dy = (e.position?.y ?? press.y) - press.y;
+            if (dx * dx + dy * dy > 64) return;
+            const targetIndex = commitOut && i > commitOut.editedIdx ? i + commitOut.delta : i;
+            if (this.doc?.blocks?.[targetIndex]) {
+              if (isFenced) this.startCodeBlockEdit(targetIndex, cx, "end");
+              else this.startBlockEdit(targetIndex, cx, "end");
+            }
+          })
+      )
+      .child(
+        div()
+          .id(`files-md-math-body-${i}`)
+          .w_full()
+          .min_w(0)
+          .child(formulaView("files-md-math"))
       );
   }
 
@@ -3035,7 +3599,7 @@ export default class Files extends View {
     const { byBlock: commentsByBlock, unmatched: unmatchedComments } = mapCommentsToMarkdownBlocks(blockRanges, openFileComments);
     const accent = t.accent ?? "#3b82f6";
 
-    const pushBlockWithAnnotations = (idx, el) => {
+    const pushBlockWithAnnotations = (idx, el, cmtTop = 2) => {
       const range = blockRanges[idx] ?? { startLine: 1, endLine: 1 };
       const blockComments = commentsByBlock.get(idx) ?? [];
       const composerHere = Boolean(this.reviewComposer && this.reviewComposer.path === repoPath && this.reviewComposer.blockIndex === idx);
@@ -3059,7 +3623,7 @@ export default class Files extends View {
               h_flex()
                 .id(`files-md-cmt-btn-${idx}`)
                 .absolute()
-                .top(2)
+                .top(cmtTop)
                 .right(4)
                 .px(6)
                 .py(1)
@@ -3094,6 +3658,14 @@ export default class Files extends View {
     const items = [];
     for (let i = 0; i < limit; i++) {
       const block = blocks[i];
+      if (block.kind === "math") {
+        const parsedMath = this.getBlockMath(block);
+        if (parsedMath) {
+          pushBlockWithAnnotations(i, this.renderMathBlock(i, block, parsedMath.body, false, null, t, mdTheme, textViewOptions, blockHover, editable));
+          continue;
+        }
+      }
+
       if (this.editingBlock === i && this.editingMode === "block" && this.blockEditor) {
         const typo = blockTypography(block, this.sansFont, monoFont);
         const editorHeight = Math.max(typo.lineHeight + 8, Math.min(540, this.blockEditorRows * typo.lineHeight + 8));
@@ -3153,12 +3725,20 @@ export default class Files extends View {
       if (block.kind === "code") {
         const fence = this.getBlockFence(block);
         if (fence) {
+          if (isMermaidLang(fence.lang)) {
+            pushBlockWithAnnotations(i, this.renderMermaidBlock(i, block, fence, t, mdTheme, textViewOptions, blockHover, editable), 34);
+            continue;
+          }
+          if (isMathFenceLang(fence.lang)) {
+            pushBlockWithAnnotations(i, this.renderMathBlock(i, block, fence.body, true, fence, t, mdTheme, textViewOptions, blockHover, editable));
+            continue;
+          }
           pushBlockWithAnnotations(i, this.renderCodeFenceBlock(i, block, fence, t, mdTheme, textViewOptions, blockHover, editable));
           continue;
         }
       }
 
-      const rendered = this.getBlockRendered(block, this.doc.defs);
+      const rendered = this.getBlockRendered(block, this.doc.defs, mdTheme);
       const blockEl = v_flex()
         .id(`files-md-block-${i}`)
         .w_full()

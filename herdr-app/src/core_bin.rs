@@ -208,8 +208,8 @@ fn login_path_answer(out: &str) -> Option<std::ffi::OsString> {
 /// ~/.local/bin, or H2_INSTALL_DIR), then finds it. Err: what went wrong.
 #[allow(dead_code)]
 pub fn install() -> Result<PathBuf, String> {
-    let releases = std::env::var("HERDR2_RELEASES_URL").ok().filter(|u| !u.is_empty())
-        .ok_or_else(|| "automatic core install is disabled (build and install h2 from source)".to_owned())?;
+    let releases = crate::update::releases()
+        .ok_or_else(|| "automatic core install is disabled (configure releases_url or build h2 from source)".to_owned())?;
     let mut cmd = if cfg!(windows) {
         let mut c = crate::spawn::command("powershell");
         c.args(["-NoProfile", "-Command", &format!("irm {releases}/core/install.ps1 | iex")]);
@@ -219,6 +219,7 @@ pub fn install() -> Result<PathBuf, String> {
         c.args(["-c", &format!("curl -fsSL {releases}/core/install.sh | sh")]);
         c
     };
+    cmd.env("HERDR2_RELEASES_URL", &releases);
     let out = cmd.stdin(Stdio::null()).output().map_err(|e| format!("cannot run the installer: {e}"))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr).trim().to_owned();
@@ -259,10 +260,9 @@ pub fn update() -> Result<String, String> {
     update_to(None)
 }
 
-/// `hc update --version X`: at least X (a newer core stays). Cores before 0.1.5 lack it.
-#[allow(dead_code)]
+/// `h2 update --version X`: at least X (a newer core stays).
 pub fn update_to(at_least: Option<&str>) -> Result<String, String> {
-    if std::env::var_os("HERDR2_RELEASES_URL").filter(|v| !v.is_empty()).is_none() {
+    let Some(releases) = crate::update::releases() else {
         let need = at_least.unwrap_or(crate::hc::core_min());
         if let Some(disk_ver) = version(&path())
             && match at_least {
@@ -273,9 +273,10 @@ pub fn update_to(at_least: Option<&str>) -> Result<String, String> {
             restart()?;
             return Ok(disk_ver);
         }
-        return Err(format!("automatic core updates are disabled; install h2 {need} or newer and click Retry"));
-    }
+        return Err(format!("automatic core updates require releases_url; install h2 {need} or newer and click Retry"));
+    };
     let mut cmd = crate::spawn::command(path());
+    cmd.env("HERDR2_RELEASES_URL", &releases);
     cmd.args(["update", "--json"]);
     if let Some(v) = at_least {
         cmd.args(["--version", v]);

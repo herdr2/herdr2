@@ -8,6 +8,7 @@
     "cmd-alt-t": "terminal.open",
     "cmd-shift-n": "mod.open:new-menu",
     "cmd-alt-p": "prompt.polish",
+    "cmd-alt-u": "prompt.polish_undo",
     "cmd-alt-f": "mod.open:flash-note",
     "cmd-shift-m": "terminal.view:toggle",
     "cmd-shift-h": "agent.handoff",

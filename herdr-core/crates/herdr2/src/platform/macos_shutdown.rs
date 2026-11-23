@@ -254,7 +254,12 @@ mod tests {
             }
             assert_eq!(in_progress(), index == 4);
         }
-        use crate::{agents::NewAgent, api::CoreInfo, paths::Paths, runtime::{Core, Exit}};
+        use crate::{
+            agents::NewAgent,
+            api::CoreInfo,
+            paths::Paths,
+            runtime::{Core, Exit},
+        };
         use std::io::{BufRead, BufReader};
         let root = crate::test_tmp().join(format!("h2-mac-shutdown-{}", super::super::random_hex()));
         let paths = || Paths {

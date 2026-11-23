@@ -55,12 +55,8 @@ fn mcp_server_is_injected_and_drives_child_lifecycle_and_permissions() {
     let wait1 = mcp_call(&s, &parent, "h2_wait", serde_json::json!({"agent": "kid", "timeout": 10}));
     assert!(wait1.contains("MCP_RESULT:"), "{wait1}");
 
-    let send_out = mcp_call(
-        &s,
-        &parent,
-        "h2_send",
-        serde_json::json!({"agent": "kid", "text": "hello-via-mcp", "wait": true}),
-    );
+    let send_out =
+        mcp_call(&s, &parent, "h2_send", serde_json::json!({"agent": "kid", "text": "hello-via-mcp", "wait": true}));
     assert!(send_out.contains("MCP_RESULT:"), "{send_out}");
 
     let read_out = mcp_call(&s, &parent, "h2_read", serde_json::json!({"agent": "kid", "lines": 100}));

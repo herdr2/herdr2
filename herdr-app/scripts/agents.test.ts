@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { readFile } from "node:fs/promises";
-import { resolveSemanticLabel, buildHoverTooltip, buildLocalFallbackBriefing, mergeBriefingSnapshots } from "../defaults/mods/agents/briefing_model.js";
+import { resolveSemanticLabel, resolveSubAgentLabel, buildHoverTooltip, buildLocalFallbackBriefing, mergeBriefingSnapshots } from "../defaults/mods/agents/briefing_model.js";
 
 const source = (await readFile(new URL("../defaults/mods/agents/main.js", import.meta.url), "utf8"))
   .replace(/^import .*;\n/gm, "").replace("export default class Agents", "class Agents");
@@ -11,6 +11,7 @@ function harness(pins: string[], globals: Record<string, unknown> = {}) {
   const storage = { getItem: (k: string) => data.get(k) ?? null, setItem: (k: string, v: string) => data.set(k, v), removeItem: (k: string) => data.delete(k) };
   const mergedGlobals: Record<string, unknown> = {
     resolveSemanticLabel,
+    resolveSubAgentLabel,
     buildHoverTooltip,
     buildLocalFallbackBriefing,
     mergeBriefingSnapshots,
@@ -324,7 +325,7 @@ test("a title that opens with a bracket keeps it; each agent's own prefix still 
   for (const [raw, shown] of titles) expect(clean(raw)).toBe(shown);
 });
 
-for (const sort of ["priority", "grouped"]) test(`${sort}: headless ACP sub-agents nest and roll up urgency, and standalone ACP rows open terminal.peek`, () => {
+for (const sort of ["priority", "grouped"]) test(`${sort}: headless ACP sub-agents nest and roll up urgency, and clicking ACP rows opens or switches to their tab`, () => {
   const opencode = { name: "OpenCode", key: "opencode", agent: true };
   const claude = { name: "Claude Code", key: "claude", agent: true };
   const list = [
@@ -373,8 +374,8 @@ for (const sort of ["priority", "grouped"]) test(`${sort}: headless ACP sub-agen
   clicks.get("sub-a7")!();
   clicks.get("ag-wsl/a6")!();
   expect(writes).toEqual([
-    ["terminal.peek", { terminal: "a7" }],
-    ["terminal.peek", { terminal: "wsl/a6" }],
+    ["terminal.keep", { terminal: "a7", place: "tab" }],
+    ["terminal.keep", { terminal: "wsl/a6", place: "tab" }],
   ]);
 });
 
@@ -828,4 +829,286 @@ test("catch-up briefing clusters similar permissions and merges Drove downstream
   expect(merged.headlineFromAi).toBe(true);
   expect(merged.criticalBlockers[0].blockedDownstreamCount).toBe(3);
   expect(merged.readyToReview).toHaveLength(1);
+});
+
+test("auto-named tabs (shells, agent aliases, addresses) dynamically follow semantic_title and live title updates", () => {
+  const claude = { name: "Claude Code", key: "claude", agent: true };
+  const codex = { name: "Codex", key: "codex", agent: true };
+  // 1. Shell-named tab (e.g. PowerShell / WSL / Terminal) running Claude follows semantic_title and live title
+  expect(
+    resolveSemanticLabel(
+      { address: "t1", semantic_title: "修复侧边栏名称", title: "Claude Code", program: claude },
+      { address: "t1", labels: {} },
+      { name: "PowerShell", named: true },
+      { terminal: "t1", program: claude, title: "Claude Code" },
+    ),
+  ).toBe("修复侧边栏名称");
+  expect(
+    resolveSemanticLabel(
+      { address: "t1", title: "Debug websocket", program: claude },
+      { address: "t1", labels: {} },
+      { name: "WSL", named: true },
+      { terminal: "t1", program: claude, title: "Debug websocket" },
+    ),
+  ).toBe("Debug websocket");
+  // Before any semantic_title or telling title arrives, show the running agent name instead of stale shell name
+  expect(
+    resolveSemanticLabel(
+      { address: "t1", title: "~/repo", program: claude },
+      { address: "t1", labels: {} },
+      { name: "PowerShell", named: true },
+      { terminal: "t1", program: claude, title: "~/repo" },
+    ),
+  ).toBe("Claude Code");
+  // 2. Agent-alias or address tab name (e.g. "Claude" vs "Claude Code", or "a12" / "wsl/a12") follows updates
+  expect(
+    resolveSemanticLabel(
+      { address: "wsl/a12", acp: true, semantic_title: "重构渲染管线", program: claude },
+      { address: "wsl/a12", labels: {} },
+      { name: "Claude", named: true },
+      null,
+    ),
+  ).toBe("重构渲染管线");
+  expect(
+    resolveSemanticLabel(
+      { address: "wsl/a12", acp: true, semantic_title: "重构渲染管线", program: codex },
+      { address: "wsl/a12", labels: {} },
+      { name: "a12", named: true },
+      null,
+    ),
+  ).toBe("重构渲染管线");
+  // 3. Split tab (manyInTab=true) does NOT leak sibling lead.semantic_title onto another agent
+  expect(
+    resolveSemanticLabel(
+      { address: "t2", title: "Second task", program: codex },
+      { address: "t2", labels: {} },
+      { name: "Split", named: true },
+      { terminal: "t1", program: claude, semantic_title: "First task", title: "First task" },
+      { manyInTab: true },
+    ),
+  ).toBe("Second task");
+  // 4. Sub-agent auto names (e.g. side-claude, codex) update to semantic_title / live ACP title / custom name
+  expect(
+    resolveSubAgentLabel(
+      { address: "wsl/a50", acp: true, name: "side-claude", semantic_title: "排查内存泄漏", program: claude, labels: {} },
+      null,
+    ),
+  ).toBe("排查内存泄漏");
+  expect(
+    resolveSubAgentLabel(
+      { address: "wsl/a50", acp: true, name: "side-claude", program: claude, labels: {} },
+      { terminal: "wsl/a50", acp: true, title: "Live ACP Title", program: claude },
+    ),
+  ).toBe("Live ACP Title");
+  expect(
+    resolveSubAgentLabel(
+      { address: "wsl/a50", acp: true, name: "side-claude", semantic_title: "排查内存泄漏", program: claude, labels: { "herdr.name": "手动改名" } },
+      null,
+    ),
+  ).toBe("手动改名");
+  // 5. PowerShell 7 and live work fallbacks (pending_permission / micro_summary) keep left list synced with top header
+  expect(
+    resolveSemanticLabel(
+      { address: "t5", title: "Claude Code", micro_summary: "正在运行 cargo test", program: claude },
+      { address: "t5", labels: {} },
+      { name: "PowerShell 7", named: true },
+      { terminal: "t5", program: claude, title: "Claude Code" },
+    ),
+  ).toBe("正在运行 cargo test");
+  expect(
+    resolveSemanticLabel(
+      { address: "t6", title: "Claude Code", program: claude },
+      { address: "t6", pending_permission: { title: "Run git status" }, labels: {} },
+      { name: "PowerShell 7", named: true },
+      { terminal: "t6", program: claude, title: "Claude Code" },
+    ),
+  ).toBe("Run git status");
+  // 6. Stale auto/program herdr.name labels (e.g. "Antigravity" / "Claude Code") do not block real-time semantic_title updates
+  const agy = { name: "Antigravity", key: "antigravity", agent: true };
+  expect(
+    resolveSemanticLabel(
+      { address: "wsl/t4j", custom_name: "Antigravity", semantic_title: "修复热更新同步问题", program: agy },
+      { address: "wsl/t4j", labels: { "herdr.name": "Antigravity" }, semantic_title: "修复热更新同步问题" },
+      { name: "2", named: false },
+      { terminal: "wsl/t4j", custom_name: "Antigravity", program: agy, semantic_title: "修复热更新同步问题" },
+    ),
+  ).toBe("修复热更新同步问题");
+  expect(
+    resolveSemanticLabel(
+      { address: "wsl/t4n", custom_name: "Claude Code", semantic_title: "ZCode终端接入排查", program: claude },
+      { address: "wsl/t4n", labels: { "herdr.name": "Claude Code" }, semantic_title: "ZCode终端接入排查" },
+      { name: "Claude Code", named: true },
+      { terminal: "wsl/t4n", custom_name: "Claude Code", program: claude, semantic_title: "ZCode终端接入排查" },
+    ),
+  ).toBe("ZCode终端接入排查");
+  // Genuine user custom names still win over semantic_title
+  expect(
+    resolveSemanticLabel(
+      { address: "wsl/t4j", custom_name: "主架构助手", semantic_title: "修复热更新同步问题", program: agy },
+      { address: "wsl/t4j", labels: { "herdr.name": "主架构助手" }, semantic_title: "修复热更新同步问题" },
+      { name: "2", named: false },
+      { terminal: "wsl/t4j", custom_name: "主架构助手", program: agy, semantic_title: "修复热更新同步问题" },
+    ),
+  ).toBe("主架构助手");
+});
+
+test("handoff badge in agents list handles live, trashed (restore confirm), and permanently deleted parent", () => {
+  const claude = { name: "Claude Code", key: "claude", agent: true };
+  const findNode = (node: any, pred: (n: any) => boolean): any => {
+    if (!node || typeof node !== "object") return null;
+    if (pred(node)) return node;
+    for (const c of node.children ?? []) {
+      const hit = findNode(c, pred);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  const collectText = (node: any): string => {
+    if (typeof node === "string") return node;
+    if (!node || typeof node !== "object") return "";
+    return (node.children ?? []).map(collectText).join(" ");
+  };
+
+  let curAgents: any[] = [];
+  let curTerminals: any[] = [];
+  let curPanes: any[] = [];
+  let curTrash: any[] = [];
+  let currentProps: any = {};
+  const overlays: any[] = [];
+  const closedOverlays: any[] = [];
+  const notices: any[] = [];
+
+  const { agents, writes } = harness([], {
+    agents: () => curAgents,
+    terminals: () => curTerminals,
+    panes: () => curPanes,
+    focused: () => null,
+    spaces: () => [{ id: "s1", name: "herdr2", tabs: [{ id: "tb1", name: "t4y", named: true }] }],
+    layout: () => ({ id: "sidebar", size: { px: 268 } }),
+    shared: (k: string) => (k === "agents.trash" ? curTrash : "grouped"),
+    theme: () => ({}),
+    settings: () => ({ language: "zh-CN" }),
+    props: () => currentProps,
+    openOverlay: (spec: any) => overlays.push(spec),
+    closeOverlay: (id: any) => closedOverlays.push(id),
+    notify: (n: any) => notices.push(n),
+    setAgentOrder() {},
+    div: element, v_flex: element, h_flex: element, svg: element, image: element,
+  });
+  const cx = { stop_propagation() {}, notify() {}, close() {} };
+
+  const childAgent = { address: "t4y", tab: "tb1", space: "s1", space_name: "herdr2", status: "idle", program: claude };
+  const childTerm = { address: "t4y", state: "live", labels: {}, lineage: { kind: "handoff", parent: "t4n" } };
+
+  // 1) Parent t4n is live -> normal focus jump
+  curAgents = [
+    { address: "t4n", tab: "tb0", space: "s1", space_name: "herdr2", status: "idle", program: claude },
+    childAgent,
+  ];
+  curTerminals = [{ address: "t4n", state: "live", labels: {} }, childTerm];
+  curPanes = [{ pane: "p1", tab: "tb1", terminal: "t4y", program: claude }];
+  curTrash = [];
+  currentProps = {};
+  let badge = findNode(agents.render(cx).node, (n) => n.id === "ag-kind-t4y");
+  expect(badge).toBeTruthy();
+  expect(collectText(badge)).toContain("接力 ← t4n");
+  badge.click({}, cx);
+  expect(writes).toEqual([["agent.focus", { terminal: "t4n" }]]);
+  expect(overlays).toHaveLength(0);
+  expect(notices).toHaveLength(0);
+
+  // 2) Parent t4n moved to recycle bin (even while still live in terminals with herdr.trashed) -> prompt & ask restore
+  writes.length = 0;
+  curAgents = [childAgent];
+  curTerminals = [
+    { address: "t4n", state: "live", labels: { "herdr.trashed": "1795420000000" } },
+    childTerm,
+  ];
+  curTrash = [{ address: "t4n", live: true, program: claude, trashed_at: Date.now() - 5000 }];
+  badge = findNode(agents.render(cx).node, (n) => n.id === "ag-kind-t4y");
+  badge.click({}, cx);
+  expect(writes).toEqual([]);
+  expect(notices).toHaveLength(0);
+  expect(overlays).toHaveLength(1);
+  expect(overlays[0].kind).toBe("dialog");
+  expect(overlays[0].props).toMatchObject({ parentRestoreDialog: true, parentAddr: "t4n", shortParent: "t4n", live: true });
+
+  // Render the confirmation dialog: shows exact prompt & asks restore; cancel closes, confirm restores
+  currentProps = { ...overlays[0].props, overlay: "ov-parent-restore" };
+  const dialogNode = agents.render(cx).node;
+  const dialogText = collectText(dialogNode);
+  expect(dialogText).toContain("t4n 已移除到回收站");
+  expect(dialogText).toContain("是否需要恢复");
+  const cancelBtn = findNode(dialogNode, (n) => n.id === "parent-restore-cancel");
+  const confirmBtn = findNode(dialogNode, (n) => n.id === "parent-restore-confirm");
+  expect(cancelBtn).toBeTruthy();
+  expect(confirmBtn).toBeTruthy();
+  cancelBtn.click({}, cx);
+  expect(writes).toEqual([]);
+  expect(closedOverlays).toEqual(["ov-parent-restore"]);
+  confirmBtn.click({}, cx);
+  expect(writes).toEqual([["agent.restore", { terminal: "t4n" }]]);
+  expect(closedOverlays).toEqual(["ov-parent-restore", "ov-parent-restore"]);
+
+  // 3) Parent t4n permanently deleted -> notify "父 agent 已删除" and block jump
+  writes.length = 0;
+  overlays.length = 0;
+  currentProps = {};
+  curAgents = [childAgent];
+  curTerminals = [childTerm];
+  curTrash = [];
+  badge = findNode(agents.render(cx).node, (n) => n.id === "ag-kind-t4y");
+  badge.click({}, cx);
+  expect(writes).toEqual([]);
+  expect(overlays).toHaveLength(0);
+  expect(notices).toHaveLength(1);
+  expect(notices[0].title).toBe("父 agent 已删除");
+  expect(notices[0].level).toBe("warning");
+});
+
+test("grouped mode orders space groups strictly by spaces() order without splitting spaces", () => {
+  const orders: string[][] = [];
+  const { agents } = harness([], {
+    agents: () => [
+      { address: "wsl/a2", space: "wsl/sp2", space_name: "herdr2", tab: "tb2", status: "idle", program: { name: "ZCode" } },
+      { address: "wsl/a1", space: "wsl/sp1", space_name: "Game", tab: "tb1", status: "idle", program: { name: "Claude" } },
+      { address: "wsl/a3", space: "wsl/sp2", space_name: "herdr2", tab: "tb3", status: "idle", program: { name: "Claude" } },
+    ],
+    terminals: () => [],
+    panes: () => [],
+    focused: () => ({}),
+    spaces: () => [
+      { id: "wsl/sp1", name: "Game", tabs: [] },
+      { id: "wsl/sp2", name: "herdr2", tabs: [] },
+    ],
+    shared: (k: string) => (k === "agents.sort" ? "grouped" : undefined),
+    setShared: () => {},
+    setAgentOrder: (o: string[]) => orders.push(o),
+    theme: () => ({}),
+    window: () => ({ platform: "windows" }),
+    layout: () => ({ id: "sidebar", size: { px: 268 } }),
+    settings: () => ({ language: "zh-CN" }),
+    keys: () => [],
+    openOverlay: () => {},
+    closeOverlay: () => {},
+    notify: () => {},
+    h2: () => Promise.resolve({ code: 0, stdout: "{}" }),
+    div: () => element(),
+    v_flex: () => element(),
+    h_flex: () => element(),
+    svg: () => element(),
+    image: () => element(),
+    Input: { new: () => element() },
+    InputState: class {},
+    Popup: { new: () => element() },
+  });
+  const root = agents.render({}).node;
+  const headerIds: string[] = [];
+  const walk = (n: any) => {
+    if (typeof n?.id === "string" && n.id.startsWith("sp-")) headerIds.push(n.id);
+    (n?.children ?? []).forEach(walk);
+  };
+  walk(root);
+  expect(headerIds).toEqual(["sp-wsl/sp1", "sp-wsl/sp2"]);
+  expect(orders.at(-1)).toEqual(["wsl/a1", "wsl/a2", "wsl/a3"]);
 });

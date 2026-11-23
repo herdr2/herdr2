@@ -49,6 +49,7 @@ pub mod transcript;
 pub mod viewers;
 pub mod wait;
 pub mod wire;
+mod zcode;
 
 /// The folder tests put their scratch data in: `H2_TEST_TMPDIR` if set, else
 /// /var/tmp, whose short path keeps socket paths under the macOS limit.

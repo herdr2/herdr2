@@ -17,7 +17,8 @@ struct RunGrant<'a> {
 impl<'a> RunGrant<'a> {
     fn start(core: &'a Core, m: &Machine, method: &str, params: &Value) -> Option<Self> {
         // An explicit parent is resolved on the destination, not on this core.
-        if !matches!(method, "agent.run" | "terminal.run") || params["no_parent"] == true || !params["parent"].is_null() {
+        if !matches!(method, "agent.run" | "terminal.run") || params["no_parent"] == true || !params["parent"].is_null()
+        {
             return None;
         }
         let caller = crate::addr::local(params["caller"].as_str()?, &core.info.id, &core.info.name).ok()?;
@@ -123,5 +124,9 @@ pub(super) async fn forward_once(core: &Core, m: &Machine, method: &str, mut par
         _ => e,
     })?;
     // Document and Drove contents are opaque: address-shaped keys belong to the client/subsystem.
-    Ok(if method.starts_with("doc.") || method.starts_with("drove.") { reply } else { localize(core, &m.name, &[], reply) })
+    Ok(if method.starts_with("doc.") || method.starts_with("drove.") {
+        reply
+    } else {
+        localize(core, &m.name, &[], reply)
+    })
 }

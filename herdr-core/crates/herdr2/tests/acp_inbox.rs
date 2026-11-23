@@ -59,10 +59,7 @@ fn steer_cancels_active_turn_and_delivers_ahead_of_queued_prompts() {
     let p_cancel = transcript.find("cancelled").unwrap_or_else(|| panic!("{transcript}"));
     let p_steer = transcript.find("echo: urgent-steer").unwrap_or_else(|| panic!("{transcript}"));
     let p_queued = transcript.find("echo: queued-later").unwrap_or_else(|| panic!("{transcript}"));
-    assert!(
-        p_cancel < p_steer && p_steer < p_queued,
-        "steer must run after cancel and ahead of queued:\n{transcript}"
-    );
+    assert!(p_cancel < p_steer && p_steer < p_queued, "steer must run after cancel and ahead of queued:\n{transcript}");
 }
 
 #[test]
@@ -94,12 +91,8 @@ fn wait_children_any_and_all_and_sender_attribution_tags() {
     assert_eq!(all_v["children"].as_array().unwrap().len(), 2, "{all_v}");
 
     // Send from child c1 back to parent checks <h2 from="c1 fast">...</h2> wrapping in raw prompt & transcript entry.
-    let send = s
-        .cmd()
-        .env("H2_AGENT_ID", &c1)
-        .args(["--json", "send", "--wait", &parent, "report-ready"])
-        .output()
-        .unwrap();
+    let send =
+        s.cmd().env("H2_AGENT_ID", &c1).args(["--json", "send", "--wait", &parent, "report-ready"]).output().unwrap();
     assert!(send.status.success(), "{}", String::from_utf8_lossy(&send.stderr));
     let p_hist = s.json(&["read", "--lines", "50", &parent])["text"].as_str().unwrap().to_owned();
     assert!(p_hist.contains(&format!("[user from {c1}] <h2 from=\"{c1} fast\">report-ready</h2>")), "{p_hist}");

@@ -11,51 +11,189 @@ function isPathLike(raw) {
   return /^[~/]|^[A-Za-z]:\\/.test(String(raw ?? "").replace(/^[^\p{L}\p{N}~/]+/u, ""));
 }
 
+const AUTO_TAB_NAMES = new Set([
+  "terminal", "终端", "shell", "zsh", "bash", "sh", "fish", "nu", "nushell", "dash",
+  "pwsh", "powershell", "powershell 7", "windows powershell", "cmd", "command prompt", "git bash", "wsl", "dos prompt", "headless",
+  "claude", "claude code", "claude-code", "codex", "gemini", "antigravity", "agy",
+  "opencode", "cursor", "cursor-agent", "pi", "pig", "qwen", "kimi", "kimi-code",
+  "kiro", "kiro-cli", "qoder", "qodercli", "copilot", "github-copilot", "amp", "grok",
+  "hermes", "goose", "crush", "omp", "oh-my-pi", "dsh", "dsh-tui", "deepseek", "deepseek harness",
+  "mastra code", "mastracode", "command code", "command-code", "prime", "prime-agent",
+  "empryo", "muse", "ollama", "zcode", "zcode-cli", "glm", "agent",
+]);
+
+function shortAddress(address) {
+  const s = String(address ?? "").trim();
+  const idx = s.lastIndexOf("/");
+  return idx >= 0 ? s.slice(idx + 1) : s;
+}
+
+export function isAutoTabName(tab, { address, programName, programKey } = {}) {
+  if (!tab?.named) return true;
+  const name = String(tab.name ?? "").trim();
+  if (!name) return true;
+  const lower = name.toLowerCase();
+  if (programName && lower === String(programName).trim().toLowerCase()) return true;
+  if (programKey && lower === String(programKey).trim().toLowerCase()) return true;
+  if (address) {
+    const addr = String(address).trim().toLowerCase();
+    const shortAddr = shortAddress(address).toLowerCase();
+    if (lower === addr || (shortAddr && lower === shortAddr)) return true;
+  }
+  return AUTO_TAB_NAMES.has(lower);
+}
+
+function isAutoSubAgentName(rawName, { address, programName, programKey } = {}) {
+  const name = String(rawName ?? "").trim();
+  if (!name) return true;
+  const lower = name.toLowerCase();
+  if (programName && lower === String(programName).trim().toLowerCase()) return true;
+  if (programKey && lower === String(programKey).trim().toLowerCase()) return true;
+  if (address) {
+    const addr = String(address).trim().toLowerCase();
+    const shortAddr = shortAddress(address).toLowerCase();
+    if (lower === addr || (shortAddr && lower === shortAddr)) return true;
+  }
+  if (AUTO_TAB_NAMES.has(lower)) return true;
+  const prefixMatch = /^(?:side|fork|handoff)[-_](.+)$/.exec(lower);
+  if (prefixMatch) {
+    const rest = prefixMatch[1].trim();
+    if (
+      AUTO_TAB_NAMES.has(rest)
+      || (programName && rest === String(programName).trim().toLowerCase())
+      || (programKey && rest === String(programKey).trim().toLowerCase())
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 export function isTellingTitle(rawTitle, { address, programName, programKey } = {}) {
   const live = cleanTitle(rawTitle);
   if (!live) return false;
-  if (live === address || live === programName) return false;
+  const lower = live.toLowerCase();
+  const addrLower = String(address ?? "").trim().toLowerCase();
+  const shortAddrLower = shortAddress(address).toLowerCase();
+  if (live === address || (addrLower && lower === addrLower) || (shortAddrLower && lower === shortAddrLower)) return false;
+  if (programName && lower === String(programName).trim().toLowerCase()) return false;
   if (isPathLike(rawTitle) || live.includes("@")) return false;
-  if (programKey && live.toLowerCase() === String(programKey).toLowerCase()) return false;
+  if (programKey && lower === String(programKey).trim().toLowerCase()) return false;
   return true;
+}
+
+export function isAutoCustomName(rawName, { address, programName, programKey } = {}) {
+  const name = String(rawName ?? "").trim();
+  if (!name) return true;
+  const lower = name.toLowerCase();
+  if (programName && lower === String(programName).trim().toLowerCase()) return true;
+  if (programKey && lower === String(programKey).trim().toLowerCase()) return true;
+  if (address) {
+    const addr = String(address).trim().toLowerCase();
+    const shortAddr = shortAddress(address).toLowerCase();
+    if (lower === addr || (shortAddr && lower === shortAddr)) return true;
+  }
+  return AUTO_TAB_NAMES.has(lower);
 }
 
 /**
  * Resolves display label with strict user-first precedence:
- * 1. User custom name (`herdr.name` / `custom_name`)
+ * 1. User custom name (`herdr.name` / `custom_name`, ignoring stale auto/program names)
  * 2. Drove role/task display (`drove.display`)
- * 3. User-named tab (`tab.named && tab.name !== program.name`)
+ * 3. User-named tab (`tab.named && !isAutoTabName(tab)`)
  * 4. Adaptive `semantic_title` (replaces boring process name / path / tab number)
  * 5. Telling live terminal/agent title
  * 6. Fallback (`tab.name` / `program.name` / `address`)
  */
 export function resolveSemanticLabel(agent, rec, tab, lead, { manyInTab = false } = {}) {
-  const custom = agent?.custom_name || rec?.labels?.["herdr.name"];
-  if (custom && String(custom).trim()) return String(custom).trim();
+  const prog = (manyInTab ? agent?.program?.name : lead?.program?.name) ?? agent?.program?.name ?? rec?.program?.name ?? "";
+  const progKey = (manyInTab ? agent?.program?.key : lead?.program?.key) ?? agent?.program?.key ?? rec?.program?.key ?? "";
+  const addr = agent?.address ?? rec?.address ?? "";
+
+  const custom = agent?.custom_name || rec?.labels?.["herdr.name"] || (!manyInTab ? lead?.custom_name : null);
+  if (custom && String(custom).trim() && !isAutoCustomName(custom, { address: addr, programName: prog, programKey: progKey })) {
+    return String(custom).trim();
+  }
 
   const droveDisplay = rec?.labels?.["drove.display"];
   if (droveDisplay && String(droveDisplay).trim()) return String(droveDisplay).trim();
 
-  const prog = lead?.program?.name ?? agent?.program?.name ?? rec?.program?.name ?? "";
-  const progKey = lead?.program?.key ?? agent?.program?.key ?? rec?.program?.key ?? "";
-
-  if (tab && !manyInTab && tab.named && tab.name && tab.name !== prog) {
-    return tab.name;
+  if (tab && !manyInTab && !isAutoTabName(tab, { address: addr, programName: prog, programKey: progKey })) {
+    return String(tab.name).trim();
   }
 
   const semantic = String(
-    agent?.semantic_title ?? rec?.semantic_title ?? lead?.semantic_title ?? "",
+    agent?.semantic_title ?? rec?.semantic_title ?? (!manyInTab ? lead?.semantic_title : null) ?? "",
   ).trim();
   if (semantic) return semantic;
 
-  const target = manyInTab ? agent : (lead ?? agent);
-  const rawTitle = target?.title ?? rec?.title ?? "";
-  if (isTellingTitle(rawTitle, { address: target?.terminal ?? agent?.address, programName: prog, programKey: progKey })) {
-    return cleanTitle(rawTitle);
+  const titleCandidates = manyInTab
+    ? [
+        [agent?.title, agent?.address ?? addr],
+        [rec?.title, rec?.address ?? addr],
+      ]
+    : [
+        [lead?.title, lead?.terminal ?? addr],
+        [agent?.title, agent?.address ?? addr],
+        [rec?.title, rec?.address ?? addr],
+      ];
+  for (const [rawTitle, titleAddr] of titleCandidates) {
+    if (isTellingTitle(rawTitle, { address: titleAddr, programName: prog, programKey: progKey })) {
+      return cleanTitle(rawTitle);
+    }
   }
 
-  if (tab?.name) return tab.name;
-  return cleanTitle(agent?.title) || prog || agent?.address || "";
+  const permTitle = String(rec?.pending_permission?.title ?? "").trim();
+  if (permTitle) return permTitle;
+
+  const micro = String(
+    agent?.micro_summary ?? rec?.micro_summary ?? (!manyInTab ? lead?.micro_summary : null) ?? "",
+  ).trim();
+  if (micro) return micro;
+
+  const manual = Boolean(agent?.manual_status || rec?.manual_status);
+  const aiSummary = !manual
+    ? String(agent?.ai_status_summary ?? rec?.ai_status_summary ?? (!manyInTab ? lead?.ai_status_summary : null) ?? "").trim()
+    : "";
+  if (aiSummary) return aiSummary;
+
+  if (tab && !tab.named && tab.name) return tab.name;
+  return prog || tab?.name || cleanTitle(agent?.title) || addr || "";
+}
+
+/**
+ * Resolves display label for a nested sub-agent row in the sidebar.
+ */
+export function resolveSubAgentLabel(rec, pane = null) {
+  const prog = pane?.program?.name ?? rec?.program?.name ?? "";
+  const progKey = pane?.program?.key ?? rec?.program?.key ?? "";
+  const addr = rec?.address ?? pane?.terminal ?? "";
+  const custom = rec?.labels?.["herdr.name"] || pane?.custom_name;
+  if (custom && String(custom).trim() && !isAutoSubAgentName(custom, { address: addr, programName: prog, programKey: progKey })) {
+    return String(custom).trim();
+  }
+
+  const droveDisplay = rec?.labels?.["drove.display"];
+  if (droveDisplay && String(droveDisplay).trim()) return String(droveDisplay).trim();
+
+  const rawName = String(rec?.name ?? "").trim();
+  const explicitName = rawName && !isAutoSubAgentName(rawName, { address: addr, programName: prog, programKey: progKey }) ? rawName : "";
+
+  if (explicitName) return explicitName;
+
+  const semantic = String(rec?.semantic_title ?? pane?.semantic_title ?? "").trim();
+  if (semantic) return semantic;
+
+  const isAcp = Boolean(rec?.acp || pane?.acp);
+  if (isAcp) {
+    for (const rawTitle of [pane?.title, rec?.title]) {
+      if (isTellingTitle(rawTitle, { address: addr, programName: prog, programKey: progKey })) {
+        return cleanTitle(rawTitle);
+      }
+    }
+  }
+
+  return rawName || rec?.template || prog || addr || "";
 }
 
 export function formatShortDuration(ms) {

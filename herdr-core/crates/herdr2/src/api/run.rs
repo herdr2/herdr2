@@ -34,11 +34,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
             let model = p.model.clone().or_else(|| t.model.clone());
             let mode = p.mode.clone().or_else(|| t.mode.clone());
             let explicit_permissions = p.permissions.or(t.permissions).or(settings.default_permissions);
-            let inject_mcp = if p.no_mcp {
-                false
-            } else {
-                t.inject_mcp.or(settings.inject_mcp).unwrap_or(true)
-            };
+            let inject_mcp = if p.no_mcp { false } else { t.inject_mcp.or(settings.inject_mcp).unwrap_or(true) };
             let system_prompt = p.system_prompt.clone().or_else(|| t.system_prompt.clone());
             (resolved, prompt, model, mode, explicit_permissions, inject_mcp, system_prompt)
         }
@@ -47,7 +43,15 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
             let prompt = resolved.prompt.clone().filter(|s| !s.trim().is_empty());
             let explicit_permissions = p.permissions.or(settings.default_permissions);
             let inject_mcp = !p.no_mcp && settings.inject_mcp.unwrap_or(true);
-            (resolved, prompt, p.model.clone(), p.mode.clone(), explicit_permissions, inject_mcp, p.system_prompt.clone())
+            (
+                resolved,
+                prompt,
+                p.model.clone(),
+                p.mode.clone(),
+                explicit_permissions,
+                inject_mcp,
+                p.system_prompt.clone(),
+            )
         }
     };
 
@@ -72,11 +76,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
     let from_afar = caller.as_deref().is_some_and(|c| c.contains('/'));
     let cwd = crate::exec::folder(p.cwd.as_deref(), from_afar);
     if p.async_start && !p.wait && !std::path::Path::new(&cwd).is_dir() {
-        return Err(RpcError::new(
-            "spawn_failed",
-            format!("missing working directory {cwd}"),
-            "",
-        ));
+        return Err(RpcError::new("spawn_failed", format!("missing working directory {cwd}"), ""));
     }
     let base_env = crate::platform::program_env().await;
     let env = child_env(base_env, p.env.clone());
@@ -92,9 +92,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
             caller.split_once('/').and_then(|(_, a)| TargetKey::parse(a)).map(|_| caller.clone())
         }
         (None, Some(caller)) if !p.no_parent => match TargetKey::parse(caller) {
-            Some(TargetKey::Agent(id)) if core.lock().reg.agents.contains_key(&id) => {
-                Some(crate::agents::address(id))
-            }
+            Some(TargetKey::Agent(id)) if core.lock().reg.agents.contains_key(&id) => Some(crate::agents::address(id)),
             Some(TargetKey::Terminal(id)) if core.lock().pty_reg.terminals.contains_key(&id) => {
                 Some(crate::terminals::address(id))
             }
@@ -164,7 +162,8 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
     let is_cursor = matches!(resolved.preset.as_deref(), Some("cursor" | "cursor-agent"));
     let model_has_effort = (is_cursor || is_agy) && model.as_deref().is_some_and(crate::acp::model_has_embedded_effort);
     if !model_has_effort
-        && let Some(eff) = p.effort.as_deref().map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("default"))
+        && let Some(eff) =
+            p.effort.as_deref().map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("default"))
     {
         config_overrides.insert("reasoning_effort".into(), serde_json::Value::String(eff.to_string()));
     }
@@ -195,7 +194,10 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
                     {
                         let mut st = core_bg.lock();
                         st.recovering.remove(&id);
-                        if st.stopping || st.killing.contains(&id) || !st.reg.agents.get(&id).is_some_and(Agent::is_live) {
+                        if st.stopping
+                            || st.killing.contains(&id)
+                            || !st.reg.agents.get(&id).is_some_and(Agent::is_live)
+                        {
                             started.transport.kill();
                             core_bg.remove(&mut st, id);
                             return;
@@ -265,11 +267,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
                         core_bg.record_transcript(
                             &mut st,
                             id,
-                            crate::transcript::Entry::Error {
-                                turn: 0,
-                                message: err.message,
-                                ts_ms: now_ms(),
-                            },
+                            crate::transcript::Entry::Error { turn: 0, message: err.message, ts_ms: now_ms() },
                         );
                         core_bg.record_finish(&mut st, id, crate::runtime::Exit::default(), "spawn_failed");
                         core_bg.save(&st);
@@ -352,12 +350,8 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
                     )
                 }
                 Err(err) => {
-                    let failed = templates::FirstMessage {
-                        sent: false,
-                        started: None,
-                        reason: Some(err.message),
-                        turn: None,
-                    };
+                    let failed =
+                        templates::FirstMessage { sent: false, started: None, reason: Some(err.message), turn: None };
                     let mut st = core.lock();
                     if let Some(a) = st.reg.agents.get_mut(&id) {
                         a.first_message = Some(failed.clone());
@@ -389,11 +383,9 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         None => (None, None),
         Some(timeout) => {
             let target = crate::runtime::TargetKey::Agent(id);
-            let r = watch(core, caller.clone(), target, WaitSpec { output: None, timeout: Some(timeout), after_turn }).await;
-            let text = tail(
-                core.read_transcript(id, Some(FINISHED_LINES), false).map(|t| t.0).unwrap_or_default(),
-                id,
-            );
+            let r = watch(core, caller.clone(), target, WaitSpec { output: None, timeout: Some(timeout), after_turn })
+                .await;
+            let text = tail(core.read_transcript(id, Some(FINISHED_LINES), false).map(|t| t.0).unwrap_or_default(), id);
             has_seen(core, caller.as_deref(), target);
             (Some(r), Some(text))
         }
@@ -420,10 +412,7 @@ pub(crate) fn tail_address(text: String, address: &str) -> String {
         from += 1;
     }
     let from = text[from..].find('\n').map_or(from, |at| from + at + 1);
-    format!(
-        "[h2] earlier output cut: h2 read {address} --lines {FINISHED_LINES}\n{}",
-        &text[from..]
-    )
+    format!("[h2] earlier output cut: h2 read {address} --lines {FINISHED_LINES}\n{}", &text[from..])
 }
 
 /// A stopping core starts nothing: whatever it started now would outlive the stop.
@@ -496,10 +485,7 @@ pub(crate) struct DroveSpawnResult {
 
 /// Spawns a native `herdr2` headless ACP `a*` worker for Drove (without an initial prompt yet)
 /// so the caller can persist Worker/Attempt state before sending the task prompt.
-pub(crate) async fn spawn_drove_agent(
-    core: &Arc<Core>,
-    req: DroveSpawnSpec,
-) -> Result<DroveSpawnResult, RpcError> {
+pub(crate) async fn spawn_drove_agent(core: &Arc<Core>, req: DroveSpawnSpec) -> Result<DroveSpawnResult, RpcError> {
     not_stopping(&core.lock())?;
     if !std::path::Path::new(&req.cwd).is_dir() {
         return Err(RpcError::new("spawn_failed", format!("missing working directory {}", req.cwd), ""));
@@ -511,23 +497,16 @@ pub(crate) async fn spawn_drove_agent(
     let base_env = crate::platform::program_env().await;
     let mut env = child_env(base_env, req.env);
     if let Some(bdir) = bin_dir {
-        let path_key = env
-            .keys()
-            .find(|k| k.eq_ignore_ascii_case("PATH"))
-            .cloned()
-            .unwrap_or_else(|| "PATH".into());
+        let path_key = env.keys().find(|k| k.eq_ignore_ascii_case("PATH")).cloned().unwrap_or_else(|| "PATH".into());
         let old = env.get(&path_key).cloned().unwrap_or_default();
         let mut dirs: Vec<std::path::PathBuf> = vec![std::path::PathBuf::from(&bdir)];
         if !old.is_empty() {
             dirs.extend(std::env::split_paths(&old));
         }
-        let combined = std::env::join_paths(&dirs)
-            .ok()
-            .and_then(|s| s.into_string().ok())
-            .unwrap_or_else(|| {
-                let sep = if cfg!(windows) { ';' } else { ':' };
-                if old.is_empty() { bdir } else { format!("{bdir}{sep}{old}") }
-            });
+        let combined = std::env::join_paths(&dirs).ok().and_then(|s| s.into_string().ok()).unwrap_or_else(|| {
+            let sep = if cfg!(windows) { ';' } else { ':' };
+            if old.is_empty() { bdir } else { format!("{bdir}{sep}{old}") }
+        });
         env.insert(path_key, combined);
     }
     if let Some((_, effective_argv)) =

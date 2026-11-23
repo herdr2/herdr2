@@ -35,14 +35,37 @@ pub(super) async fn agent_handoff(core: Ctx<'_>, p: HandoffParams) -> Result<Han
         return Err(RpcError::invalid_params("from_turn must be <= to_turn"));
     }
 
+    if let Some(inline_md) = p.inline_markdown.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        && let Some(into_raw) = p.into.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    {
+        let src_addr = p.inline_source.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(&p.source).to_string();
+        let src = SourceSnapshot {
+            address: src_addr.clone(),
+            cwd: String::new(),
+            provider: None,
+            session_id: None,
+            model: None,
+            argv: Vec::new(),
+            is_agent: false,
+            cols: 120,
+            rows: 36,
+            entries: Vec::new(),
+            lineage: None,
+        };
+        let pkg = crate::handoff::HandoffPackage {
+            bytes: inline_md.len(),
+            markdown: inline_md.to_string(),
+            included_turns: Vec::new(),
+            omitted_turns: Vec::new(),
+            total_turns: 0,
+        };
+        let lineage = Lineage { kind: p.kind, parent: src_addr, ..Default::default() };
+        let turns_label = p.inline_turns.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+        return handoff_into_existing(core, &p, &src, &pkg, &lineage, turns_label, into_raw, false).await;
+    }
+
     let src = collect_source(core, &p.source).await?;
-    let origin_cwd = p
-        .cwd
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(&src.cwd)
-        .to_string();
+    let origin_cwd = p.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(&src.cwd).to_string();
 
     let mut cwd = origin_cwd.clone();
     let mut created_worktree: Option<(String, String, String)> = None;
@@ -80,10 +103,7 @@ pub(super) async fn agent_handoff(core: Ctx<'_>, p: HandoffParams) -> Result<Han
     };
     let max_bytes = p.max_bytes.unwrap_or(DEFAULT_HANDOFF_MAX_BYTES);
     let note_pkg = p.note.clone();
-    let is_zh = p
-        .language
-        .as_deref()
-        .is_some_and(|l| l.trim().to_ascii_lowercase().starts_with("zh"));
+    let is_zh = p.language.as_deref().is_some_and(|l| l.trim().to_ascii_lowercase().starts_with("zh"));
 
     let mut pkg = {
         let cwd_for_pkg = cwd_for_pkg.clone();
@@ -117,14 +137,8 @@ pub(super) async fn agent_handoff(core: Ctx<'_>, p: HandoffParams) -> Result<Han
 
     let mut distilled = false;
     if !p.raw && p.into.is_none() && !pkg.omitted_turns.is_empty() && core.ai.handoff_distill_enabled() {
-        if let Some(summary) = crate::ai::distill_omitted_turns(
-            &core.ai,
-            &src.address,
-            &src.entries,
-            &pkg.omitted_turns,
-            is_zh,
-        )
-        .await
+        if let Some(summary) =
+            crate::ai::distill_omitted_turns(&core.ai, &src.address, &src.entries, &pkg.omitted_turns, is_zh).await
         {
             let summary_bg = summary;
             pkg = blocking(move || {
@@ -148,16 +162,9 @@ pub(super) async fn agent_handoff(core: Ctx<'_>, p: HandoffParams) -> Result<Han
             .await?;
             distilled = true;
         }
-    } else if !p.raw && p.into.is_some() && core.ai.handoff_distill_enabled() {
-        if let Some(merged_md) = crate::ai::distill_merge_back(
-            &core.ai,
-            &src.address,
-            p.kind,
-            &src.entries,
-            pkg.bytes,
-            is_zh,
-        )
-        .await
+    } else if !p.raw && p.into.is_some() && p.kind != LineageKind::SendContext && core.ai.handoff_distill_enabled() {
+        if let Some(merged_md) =
+            crate::ai::distill_merge_back(&core.ai, &src.address, p.kind, &src.entries, pkg.bytes, is_zh).await
         {
             pkg.bytes = merged_md.len();
             pkg.markdown = merged_md;
@@ -179,6 +186,29 @@ pub(super) async fn agent_handoff(core: Ctx<'_>, p: HandoffParams) -> Result<Han
         worktree_branch: created_worktree.as_ref().map(|(_, _, br)| br.clone()),
         worktree_merged: false,
     };
+
+    if p.package_only {
+        return Ok(HandoffResult {
+            target: String::new(),
+            target_kind: if src.is_agent { "agent".into() } else { "terminal".into() },
+            kind: p.kind,
+            source: src.address.clone(),
+            lineage,
+            included_turns: pkg.included_turns,
+            omitted_turns: pkg.omitted_turns,
+            bytes: pkg.bytes,
+            artifact_path: None,
+            markdown: Some(pkg.markdown),
+            native_fork: false,
+            distilled,
+            prompt_sent: false,
+            worktree_path: None,
+            worktree_branch: None,
+            worktree_merge_requested: false,
+            merged_files: Vec::new(),
+            wait: None,
+        });
+    }
 
     if let Some(into_raw) = p.into.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         return handoff_into_existing(core, &p, &src, &pkg, &lineage, turns_label, into_raw, distilled).await;
@@ -252,18 +282,15 @@ async fn collect_source(core: &Arc<Core>, source: &str) -> Result<SourceSnapshot
             })
         }
         TargetKey::Terminal(id) => {
-            let (address, cwd, cols, rows, argv, snap, fallback_kind, fallback_sid, lineage) = {
+            let (address, cwd, cols, rows, argv, snap, fallback_kind, fallback_sid, lineage, screen_fallback) = {
                 let mut st = core.lock();
                 let Some(t) = st.pty_reg.terminals.get(&id).cloned() else {
-                    return Err(RpcError::new(
-                        "not_found",
-                        format!("{} not found", crate::terminals::address(id)),
-                        "",
-                    ));
+                    return Err(RpcError::new("not_found", format!("{} not found", crate::terminals::address(id)), ""));
                 };
                 let mut snap = snapshot_from_terminal(&t, st.pty_prompts.get(&id));
                 crate::pty_transcript::populate_session_affinity(&mut snap, &t.address, core, &mut st);
                 let tc = core.target_checkpoints(&mut st, &t.address);
+                let screen_fallback = core.screen_text(&st, id);
                 let live_cwd = t
                     .foreground
                     .as_ref()
@@ -282,17 +309,43 @@ async fn collect_source(core: &Arc<Core>, source: &str) -> Result<SourceSnapshot
                     tc.cli_kind,
                     tc.cli_session_id,
                     t.lineage,
+                    screen_fallback,
                 )
             };
-            let (entries, session_meta) = blocking(move || Ok(extract_transcript(&snap))).await?;
-            let provider = session_meta
-                .as_ref()
-                .and_then(|m| m.provider.clone())
-                .or(fallback_kind);
-            let session_id = session_meta
-                .as_ref()
-                .and_then(|m| m.session_id.clone())
-                .or(fallback_sid);
+            let (mut entries, session_meta) = blocking(move || Ok(extract_transcript(&snap))).await?;
+            if entries.is_empty()
+                && let Some(screen_text) = screen_fallback.as_deref()
+            {
+                let screen_lines: Vec<&str> = screen_text
+                    .lines()
+                    .map(str::trim_end)
+                    .skip_while(|l| l.is_empty())
+                    .collect();
+                let end = screen_lines.iter().rposition(|l| !l.is_empty()).map_or(0, |i| i + 1);
+                if end > 0 {
+                    let mut tail = Vec::new();
+                    let mut bytes = 0usize;
+                    for &line in screen_lines[..end].iter().rev() {
+                        if bytes + line.len() + 1 > 6144 && !tail.is_empty() {
+                            break;
+                        }
+                        bytes += line.len() + 1;
+                        tail.push(line);
+                    }
+                    tail.reverse();
+                    let snippet = tail.join("\n");
+                    if !snippet.trim().is_empty() {
+                        entries.push(Entry::Assistant {
+                            turn: 1,
+                            text: format!("[Terminal screen snapshot]\n```text\n{snippet}\n```"),
+                            attachments: Vec::new(),
+                            ts_ms: now_ms(),
+                        });
+                    }
+                }
+            }
+            let provider = session_meta.as_ref().and_then(|m| m.provider.clone()).or(fallback_kind);
+            let session_id = session_meta.as_ref().and_then(|m| m.session_id.clone()).or(fallback_sid);
             let model = session_meta.and_then(|m| m.model);
             Ok(SourceSnapshot {
                 address,
@@ -337,11 +390,7 @@ async fn handoff_into_existing(
         let wt_bg = wt_path.to_string();
         let branch_bg = src_lin.worktree_branch.clone();
         let summary = blocking(move || {
-            Ok(crate::drove::integrate::inspect_fork_worktree(
-                &origin_bg,
-                &wt_bg,
-                branch_bg.as_deref(),
-            ))
+            Ok(crate::drove::integrate::inspect_fork_worktree(&origin_bg, &wt_bg, branch_bg.as_deref()))
         })
         .await?;
 
@@ -351,10 +400,7 @@ async fn handoff_into_existing(
             summary.branch.clone()
         };
 
-        let is_zh = p
-            .language
-            .as_deref()
-            .is_some_and(|l| l.trim().to_ascii_lowercase().starts_with("zh"));
+        let is_zh = p.language.as_deref().is_some_and(|l| l.trim().to_ascii_lowercase().starts_with("zh"));
         let mut msg = if is_zh {
             format!(
                 "[合回来自 {} 的 Worktree] 请将该分叉 Worktree 中的代码改动合并到当前主分支/工作区（`{}`）：\n- 分叉分支：`{}`\n- 分叉 Worktree 路径：`{}`",
@@ -476,7 +522,19 @@ async fn handoff_into_existing(
                         .language
                         .as_deref()
                         .is_some_and(|l| l.trim().to_ascii_lowercase().starts_with("zh"));
-                    if is_zh {
+                    if p.kind == LineageKind::SendContext {
+                        if is_zh {
+                            format!(
+                                "[来自 {} 的会话上下文] 请阅读上述发送过来的近期会话上下文，简短确认已理解并说明可协助的下一步。",
+                                src.address
+                            )
+                        } else {
+                            format!(
+                                "[Shared context from {}] Please review the forwarded recent session context above, briefly confirm you have it, and let me know how you can help next.",
+                                src.address
+                            )
+                        }
+                    } else if is_zh {
                         format!(
                             "[来自 {} 的{}] 请阅读并吸收上述合回的上下文与结论，总结关键要点或下一步建议。",
                             src.address,
@@ -519,6 +577,7 @@ async fn handoff_into_existing(
                 omitted_turns: pkg.omitted_turns.clone(),
                 bytes: pkg.bytes,
                 artifact_path: None,
+                markdown: None,
                 native_fork: false,
                 distilled,
                 prompt_sent,
@@ -531,31 +590,23 @@ async fn handoff_into_existing(
         }
         TargetKey::Terminal(dst_id) => {
             let dst_addr = crate::terminals::address(dst_id);
-            let filename = format!("handoff-from-{}.md", src.address.replace('/', "_"));
-            let staged_path =
-                crate::put::stage_terminal(&core.paths.state, dst_id, &filename, pkg.markdown.as_bytes()).map_err(
-                    |e| RpcError::internal(format!("failed to stage handoff markdown for {dst_addr}: {e}")),
-                )?;
+            let file_prefix = if p.kind == LineageKind::SendContext { "context-from" } else { "handoff-from" };
+            let filename = format!("{file_prefix}-{}.md", src.address.replace('/', "_"));
+            let staged_path = crate::put::stage_terminal(&core.paths.state, dst_id, &filename, pkg.markdown.as_bytes())
+                .map_err(|e| RpcError::internal(format!("failed to stage handoff markdown for {dst_addr}: {e}")))?;
             let path_str = staged_path.display().to_string();
 
-            let is_zh = p
-                .language
-                .as_deref()
-                .is_some_and(|l| l.trim().to_ascii_lowercase().starts_with("zh"));
-            let mut pointer = if is_zh {
-                format!(
-                    "[来自 {} 的{}] 上下文交接文件已保存至：{}",
-                    src.address,
-                    p.kind.display_label_zh(),
-                    path_str
-                )
+            let is_zh = p.language.as_deref().is_some_and(|l| l.trim().to_ascii_lowercase().starts_with("zh"));
+            let mut pointer = if p.kind == LineageKind::SendContext {
+                if is_zh {
+                    format!("[来自 {} 的会话上下文] 近期会话上下文已保存至：{}", src.address, path_str)
+                } else {
+                    format!("[Shared context from {}] Recent session context saved at: {}", src.address, path_str)
+                }
+            } else if is_zh {
+                format!("[来自 {} 的{}] 上下文交接文件已保存至：{}", src.address, p.kind.display_label_zh(), path_str)
             } else {
-                format!(
-                    "[{} from {}] Context handoff saved at: {}",
-                    p.kind.display_label(),
-                    src.address,
-                    path_str
-                )
+                format!("[{} from {}] Context handoff saved at: {}", p.kind.display_label(), src.address, path_str)
             };
             if !merge_instruction.is_empty() {
                 pointer.push('\n');
@@ -565,8 +616,22 @@ async fn handoff_into_existing(
                     pointer.push_str(&prompt_text);
                 }
             } else if let Some(prompt_text) = clean_prompt {
-                pointer.push('\n');
-                pointer.push_str(&prompt_text);
+                if p.kind == LineageKind::SendContext {
+                    if is_zh {
+                        pointer.push_str(&format!("\n备注：{prompt_text}\n请先读取上述上下文文件，再结合备注直接回复或处理。"));
+                    } else {
+                        pointer.push_str(&format!("\nNote: {prompt_text}\nPlease read the context file above and respond or act according to this note."));
+                    }
+                } else {
+                    pointer.push('\n');
+                    pointer.push_str(&prompt_text);
+                }
+            } else if p.kind == LineageKind::SendContext {
+                if is_zh {
+                    pointer.push_str("\n请先读取该文件了解上述会话的近期上下文，简短确认已理解并说明可协助的下一步。");
+                } else {
+                    pointer.push_str("\nPlease read that file for the forwarded recent session context, briefly confirm you have it, and let me know how you can help next.");
+                }
             } else if is_zh {
                 pointer.push_str("\n请先读取该文件了解合回的上下文内容后再继续。");
             } else {
@@ -601,6 +666,7 @@ async fn handoff_into_existing(
                 omitted_turns: pkg.omitted_turns.clone(),
                 bytes: pkg.bytes,
                 artifact_path: Some(path_str),
+                markdown: None,
                 native_fork: false,
                 distilled,
                 prompt_sent: sent.started != Some(false),
@@ -625,11 +691,7 @@ async fn handoff_to_new_pty(
     _turns_label: Option<String>,
     distilled: bool,
 ) -> Result<HandoffResult, RpcError> {
-    let preset = p
-        .preset
-        .clone()
-        .or_else(|| src.provider.clone())
-        .unwrap_or_else(|| "claude".into());
+    let preset = p.preset.clone().or_else(|| src.provider.clone()).unwrap_or_else(|| "claude".into());
     let base_argv = if !p.argv.is_empty() {
         p.argv.clone()
     } else if !src.is_agent && p.preset.is_none() && !src.argv.is_empty() {
@@ -675,28 +737,22 @@ async fn handoff_to_new_pty(
         if matches!(fork_res, Ok(true)) {
             let to_turn = p.to_turn.unwrap_or_else(|| pkg.total_turns.max(1));
             let h2_exe = h2_exe_string();
-            spawn_argv = build_rollback_argv(
-                target_cli_kind,
-                &base_argv,
-                &core.hooks_dir(),
-                &h2_exe,
-                to_turn,
-                Some(&fork_uuid),
-            );
+            spawn_argv =
+                build_rollback_argv(target_cli_kind, &base_argv, &core.hooks_dir(), &h2_exe, to_turn, Some(&fork_uuid));
             native_fork = true;
         }
     }
 
     if let Some(m) = p.model.as_deref().map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("default")) {
-        let has_model_flag = spawn_argv
-            .iter()
-            .any(|a| a == "--model" || a.starts_with("--model=") || a == "-m");
+        let has_model_flag = spawn_argv.iter().any(|a| a == "--model" || a.starts_with("--model=") || a == "-m");
         if !has_model_flag {
             spawn_argv.push("--model".into());
             spawn_argv.push(m.to_string());
         }
     }
-    if let Some(eff) = p.effort.as_deref().map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("default")) {
+    if let Some(eff) =
+        p.effort.as_deref().map(str::trim).filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("default"))
+    {
         match target_cli_kind {
             PtyCliKind::Claude => {
                 let has_effort = spawn_argv.iter().any(|a| a == "--effort" || a.starts_with("--effort="));
@@ -706,10 +762,7 @@ async fn handoff_to_new_pty(
                 }
             }
             PtyCliKind::Agy => {
-                let model_embeds_effort = p
-                    .model
-                    .as_deref()
-                    .is_some_and(crate::acp::model_has_embedded_effort);
+                let model_embeds_effort = p.model.as_deref().is_some_and(crate::acp::model_has_embedded_effort);
                 let has_effort = spawn_argv.iter().any(|a| a == "--effort" || a.starts_with("--effort="));
                 if !model_embeds_effort && !has_effort {
                     spawn_argv.push("--effort".into());
@@ -773,7 +826,8 @@ async fn handoff_to_new_pty(
     let mut artifact_path = None;
     let mut prompt_sent = false;
     let mut after_turn = None;
-    let use_quiet = !matches!(target_cli_kind, PtyCliKind::Claude | PtyCliKind::Codex | PtyCliKind::Agy) || !p.argv.is_empty();
+    let use_quiet =
+        !matches!(target_cli_kind, PtyCliKind::Claude | PtyCliKind::Codex | PtyCliKind::Agy) || !p.argv.is_empty();
     let mut initial_msg: Option<String> = None;
 
     if native_fork {
@@ -799,24 +853,11 @@ async fn handoff_to_new_pty(
         }
         core.flush_saved().await?;
 
-        let is_zh = p
-            .language
-            .as_deref()
-            .is_some_and(|l| l.trim().to_ascii_lowercase().starts_with("zh"));
+        let is_zh = p.language.as_deref().is_some_and(|l| l.trim().to_ascii_lowercase().starts_with("zh"));
         let mut pointer = if is_zh {
-            format!(
-                "[来自 {} 的{}] 请先读取完整的上下文交接文件：{}",
-                src.address,
-                p.kind.display_label_zh(),
-                path_str
-            )
+            format!("[来自 {} 的{}] 请先读取完整的上下文交接文件：{}", src.address, p.kind.display_label_zh(), path_str)
         } else {
-            format!(
-                "[{} from {}] Read the full context handoff at: {}",
-                p.kind.display_label(),
-                src.address,
-                path_str
-            )
+            format!("[{} from {}] Read the full context handoff at: {}", p.kind.display_label(), src.address, path_str)
         };
         if let Some(prompt_text) = clean_prompt {
             pointer.push('\n');
@@ -885,6 +926,7 @@ async fn handoff_to_new_pty(
         omitted_turns: pkg.omitted_turns.clone(),
         bytes: pkg.bytes,
         artifact_path,
+        markdown: None,
         native_fork,
         distilled,
         prompt_sent,
@@ -945,10 +987,7 @@ async fn handoff_to_new_acp(
 
     let clean_prompt = p.prompt.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     let keep = p.keep || clean_prompt.is_none();
-    let is_zh = p
-        .language
-        .as_deref()
-        .is_some_and(|l| l.trim().to_ascii_lowercase().starts_with("zh"));
+    let is_zh = p.language.as_deref().is_some_and(|l| l.trim().to_ascii_lowercase().starts_with("zh"));
 
     let mut env = BTreeMap::new();
     if let (Some(wt_path), Some(wt_origin)) = (
@@ -1025,7 +1064,7 @@ async fn handoff_to_new_acp(
                     )
                 }
             }
-            LineageKind::Handoff | LineageKind::Fork => {
+            LineageKind::Handoff | LineageKind::Fork | LineageKind::SendContext => {
                 if is_zh {
                     format!(
                         "[来自 {} 的{}] 请先阅读并消化上述携带的交接上下文。本轮仅读取交接的上下文，不要做任何修改、不要编辑文件或执行变更类命令，简短确认已理解后等待用户的下一步指令。",
@@ -1080,6 +1119,7 @@ async fn handoff_to_new_acp(
         omitted_turns: pkg.omitted_turns.clone(),
         bytes: pkg.bytes,
         artifact_path: None,
+        markdown: None,
         native_fork: false,
         distilled,
         prompt_sent,

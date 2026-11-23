@@ -252,8 +252,10 @@ fn apply_cli_agent_flags(mut cmd: Vec<String>, model: Option<&str>, effort: Opti
         .filter(|e| !e.is_empty() && !e.eq_ignore_ascii_case("default"));
 
     if let Some(m) = clean_model {
+        // ZCode selects models inside the TUI via `/model` and rejects `--model` on startup.
+        let accepts_model_flag = key != "zcode";
         let has_model = cmd.iter().any(|a| a == "--model" || a.starts_with("--model=") || a == "-m");
-        if !has_model {
+        if accepts_model_flag && !has_model {
             let effective_model = match (key.as_str(), clean_effort) {
                 ("cursor", Some(eff)) if !cli_model_has_embedded_effort(m) => format!("{m}[effort={eff}]"),
                 _ => m.to_owned(),
@@ -294,19 +296,22 @@ fn append_cli_agent_task(mut cmd: Vec<String>, task: Option<&str>) -> Vec<String
     let Some(t) = task.map(str::trim).filter(|t| !t.is_empty()) else {
         return cmd;
     };
-    if detect_cli_agent_key(&cmd) == "antigravity" {
-        let has_prompt_flag = cmd.iter().any(|a| {
-            matches!(a.as_str(), "-i" | "--prompt-interactive" | "-p" | "--print" | "--prompt")
-                || a.starts_with("--prompt-interactive=")
-                || a.starts_with("--print=")
-                || a.starts_with("--prompt=")
-        });
-        if !has_prompt_flag {
-            cmd.push("--prompt-interactive".into());
-            cmd.push(t.to_owned());
+    match detect_cli_agent_key(&cmd).as_str() {
+        "antigravity" => {
+            let has_prompt_flag = cmd.iter().any(|a| {
+                matches!(a.as_str(), "-i" | "--prompt-interactive" | "-p" | "--print" | "--prompt")
+                    || a.starts_with("--prompt-interactive=")
+                    || a.starts_with("--print=")
+                    || a.starts_with("--prompt=")
+            });
+            if !has_prompt_flag {
+                cmd.push("--prompt-interactive".into());
+                cmd.push(t.to_owned());
+            }
         }
-    } else {
-        cmd.push(t.to_owned());
+        // ZCode reads its first word as a command, not a message: given one, it won't start.
+        "zcode" => {}
+        _ => cmd.push(t.to_owned()),
     }
     cmd
 }
@@ -506,6 +511,32 @@ struct PendingTerminalChange {
     reply: std::sync::mpsc::Receiver<Result<(), String>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PolishStage {
+    Polishing,
+    Applying,
+}
+
+#[derive(Clone)]
+struct PolishProgress {
+    id: u64,
+    addr: String,
+    overlay_id: String,
+    preview: String,
+    line_count: usize,
+    started_at_ms: u64,
+    stage: PolishStage,
+}
+
+#[derive(Clone)]
+struct PolishUndo {
+    original: String,
+    polished: String,
+    summary: Option<String>,
+    created_at_ms: u64,
+    enter_at_after: Option<Instant>,
+}
+
 /// The slot of a terminal shown in a pane in place of its own (`<pane>#swap`).
 const SWAP: &str = "#swap";
 
@@ -535,6 +566,8 @@ enum OverlayKind {
     Dialog,
     Popup,
     Toast,
+    /// Non-blocking floating card (e.g. polish progress) anchored cleanly without stealing focus.
+    Float,
     /// Stays until closed, moves where it's dropped, comes to the front when
     /// pressed (`movable.rs`). Never holds the keyboard on its own.
     Window,
@@ -560,6 +593,8 @@ struct Overlay {
     layout: Option<Node>,
     /// `at: "top"`: centered, this far below the window's top.
     top: Option<f32>,
+    /// `at: "bottom"`: centered, this far above the window's bottom.
+    bottom: Option<f32>,
     /// As tall as its content (size.height is the most).
     fit: bool,
     /// A click beside it doesn't close it (the first-run welcome).
@@ -655,6 +690,7 @@ struct DigestWatermark {
     turn: u64,
     transcript_seq: u64,
     status: Option<String>,
+    title: String,
     output_at: Option<Instant>,
     typed_at: Option<Instant>,
     attempted_at: Instant,
@@ -739,10 +775,16 @@ pub struct AppWindow {
     rename_focus: RenameFocus,
     /// Manual status overrides (`herdr.status`), keyed by terminal/agent address.
     manual_statuses: HashMap<String, ManualStatus>,
+    /// Recently written `herdr.name` labels awaiting Core echo so in-flight listings don't revert renames.
+    pending_names: HashMap<String, (String, Instant)>,
     /// Cached async semantic arbitration verdicts for non-OSC-7501 PTY CLI agents.
     ai_terminal_states: HashMap<String, AiTerminalVerdict>,
     /// PTY addresses currently awaiting an in-flight `ai.classify_terminal_state` RPC.
     ai_inflight: HashSet<String>,
+    polish_inflight: HashSet<String>,
+    polish_seq: u64,
+    polish_progress: Option<PolishProgress>,
+    polish_undo: HashMap<String, PolishUndo>,
     /// Per-terminal throttle timestamp for semantic status arbitration.
     ai_last_attempt: HashMap<String, Instant>,
     /// Agent/terminal addresses currently awaiting an in-flight `ai.summarize_agent` RPC.
@@ -822,7 +864,8 @@ pub struct AppWindow {
 
 impl AppWindow {
     pub fn new(core: Arc<Core>, requests: async_channel::Receiver<Request>, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let file_events = crate::files::watch(&mods::app_dir(), #[cfg(test)] cx.background_executor().clone());
+        let dev_defaults = mods::dev_defaults_dir();
+        let file_events = crate::files::watch(&mods::app_dir(), dev_defaults.as_deref(), #[cfg(test)] cx.background_executor().clone());
         Self::with_file_events(core, requests, file_events, window, cx)
     }
 
@@ -883,8 +926,13 @@ impl AppWindow {
             side_panel_auto_hidden: false,
             rename_focus: RenameFocus::Tab,
             manual_statuses: HashMap::new(),
+            pending_names: HashMap::new(),
             ai_terminal_states: HashMap::new(),
             ai_inflight: HashSet::new(),
+            polish_inflight: HashSet::new(),
+            polish_seq: 0,
+            polish_progress: None,
+            polish_undo: HashMap::new(),
             ai_last_attempt: HashMap::new(),
             ai_digest_inflight: HashSet::new(),
             ai_digest_attempted: HashMap::new(),
@@ -1634,7 +1682,28 @@ impl AppWindow {
     /// in its parent agent's right-side side-chat panel.
     fn evict_side_chat_from_tabs(&mut self, addr: &str, cx: &mut Context<Self>) -> bool {
         let mut evicted = false;
+        let machine = addr.split_once('/').map(|(m, _)| m);
+        let mut owner_space = self
+            .model
+            .any_pane_of(addr)
+            .and_then(|pane| self.model.space_of(&pane))
+            .map(|s| crate::mirror::local(&s.id, machine).to_owned())
+            .or_else(|| {
+                self.live.get(addr).and_then(|r| {
+                    r.pointer("/labels/herdr.space")
+                        .or_else(|| r.pointer("/labels/herdr.owner_space"))
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                })
+            });
         while let Some(pane) = self.model.any_pane_of(addr) {
+            if owner_space.is_none() {
+                owner_space = self
+                    .model
+                    .space_of(&pane)
+                    .map(|s| crate::mirror::local(&s.id, machine).to_owned());
+            }
             self.swapped.remove(&pane);
             self.model.remove_pane(&pane);
             evicted = true;
@@ -1653,15 +1722,21 @@ impl AppWindow {
                     labels.insert("herdr.space".into(), json!(""));
                     labels.insert("herdr.tab".into(), json!(""));
                     labels.insert("herdr.parked".into(), json!("1"));
+                    if let Some(ref owner) = owner_space {
+                        labels.insert("herdr.owner_space".into(), json!(owner));
+                    }
                 }
             }
             let core = self.core.clone();
             let address = addr.to_owned();
-            let labels = json!({
+            let mut labels = json!({
                 "herdr.space": "",
                 "herdr.tab": "",
                 "herdr.parked": "1",
             });
+            if let Some(owner) = owner_space {
+                labels["herdr.owner_space"] = json!(owner);
+            }
             cx.background_executor()
                 .spawn(async move {
                     let (l_method, l_key) = if is_acp {
@@ -2116,7 +2191,10 @@ impl AppWindow {
                 TerminalEvent::OpenFile { path, line, end_line, on } => {
                     this.open_file_in_panel(path, *line, *end_line, on.as_deref(), None, window, cx);
                 }
-                TerminalEvent::TitleChanged => this.publish(cx),
+                TerminalEvent::TitleChanged => {
+                    this.publish(cx);
+                    this.refresh_missing_semantic_digests(cx);
+                }
                 TerminalEvent::ScrollChanged => {
                     mods::panes_scrolled();
                     this.refresh_snapshot_mods(cx);
@@ -2523,7 +2601,7 @@ impl AppWindow {
             }
             let machine = addr.split_once('/').map(|(mc, _)| mc);
             let cwd = self.cwds.get(addr).map(String::as_str).or_else(|| rec.get("cwd").and_then(Value::as_str));
-            if let Some(sp) = m.spaces.iter().find(|pr| self.acp_matches_space(addr, rec, pr)) {
+            if let Some(sp) = self.resolve_agent_space(addr, rec) {
                 acp_by_space.entry(sp.id.clone()).or_default().push(addr.clone());
             } else {
                 let space_id = match machine {
@@ -2548,7 +2626,11 @@ impl AppWindow {
                 .map(str::to_owned)
                 .unwrap_or_else(|| addr.to_owned());
             let pinned = rec.and_then(|r| r.pointer("/labels/herdr.pinned")).and_then(Value::as_str).is_some_and(|v| !v.is_empty());
-            let custom_name = rec.and_then(|r| r.pointer("/labels/herdr.name")).and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
+            let custom_name = rec
+                .and_then(|r| r.pointer("/labels/herdr.name"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty() && !Self::is_auto_tab_name_for_addr(s, rec, addr))
+                .map(str::to_owned);
             let app = a
                 .and_then(|a| a.app.clone())
                 .or_else(|| rec.and_then(|r| r.get("agent")).and_then(Value::as_str).map(str::to_owned));
@@ -2681,11 +2763,25 @@ impl AppWindow {
                     }
                     let Some(addr) = p.terminal() else { continue };
                     let a = m.agents.get(addr);
-                    let title = self.terms.get(&p.id).map(|t| t.view.read(cx).title.clone()).or_else(|| {
-                        self.live.get(addr).and_then(|r| r.get("title")).and_then(Value::as_str).map(str::to_owned)
-                    });
+                    let title = self
+                        .terms
+                        .get(&p.id)
+                        .map(|t| t.view.read(cx).title.clone())
+                        .filter(|s| !s.is_empty() && s != addr)
+                        .or_else(|| {
+                            self.live
+                                .get(addr)
+                                .and_then(|r| r.get("title"))
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_owned)
+                        });
                     let structured = !self.swapped.contains_key(&p.id) && self.is_structured_terminal(addr);
-                    let custom_name = self.live.get(addr).and_then(|r| r.pointer("/labels/herdr.name")).and_then(Value::as_str).filter(|s| !s.is_empty());
+                    let live_rec = self.live.get(addr);
+                    let custom_name = live_rec
+                        .and_then(|r| r.pointer("/labels/herdr.name"))
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty() && !Self::is_auto_tab_name_for_addr(s, live_rec, addr));
                     let semantic_title = self.live.get(addr).and_then(|r| r.get("semantic_title")).and_then(Value::as_str).filter(|s| !s.is_empty());
                     let micro_summary = self.live.get(addr).and_then(|r| r.get("micro_summary")).and_then(Value::as_str).filter(|s| !s.is_empty());
                     let (working_since, work_ms, total_work_ms) = agent_timing(addr);
@@ -3026,33 +3122,6 @@ impl AppWindow {
         )
     }
 
-    /// Folders associated with `pr` across its explicit root and its open panes.
-    fn space_folders(&self, pr: &model::Space) -> Vec<String> {
-        let mut folders = Vec::new();
-        let mut push = |f: &str| {
-            if !f.is_empty() && !folders.iter().any(|x| x == f) {
-                folders.push(f.to_owned());
-            }
-        };
-        push(&pr.folder);
-        for c in &pr.tabs {
-            for n in c.root.panes() {
-                if let Some(f) = self.model.pane_folders.get(&n.id) {
-                    push(f);
-                }
-                if let Some(addr) = n.any_terminal() {
-                    if let Some(f) = self.model.folder_info.get(addr) {
-                        push(&f.top);
-                    }
-                    if let Some(f) = self.cwds.get(addr) {
-                        push(f);
-                    }
-                }
-            }
-        }
-        folders
-    }
-
     fn space_matches_worktree(&self, pr: &model::Space, wt_path: &str, machine: Option<&str>) -> bool {
         if pr.machine.as_deref() != machine {
             return false;
@@ -3076,53 +3145,215 @@ impl AppWindow {
         false
     }
 
-    fn acp_matches_space(&self, addr: &str, rec: &Value, pr: &model::Space) -> bool {
+    /// Resolves the single authoritative space for an unmounted/parked agent using strict priority tiers:
+    /// 1. Isolated worktree (`lineage.worktree_path`)
+    /// 2. Explicit ownership labels (`herdr.space` -> `herdr.owner_space`)
+    /// 3. Parent / lineage parent space
+    /// 4. Legacy `where` label space name (when uniquely matching a space on the same machine)
+    /// 5. Most specific folder match across spaces on the same machine (never blindly first-match)
+    fn resolve_agent_space(&self, addr: &str, rec: &Value) -> Option<&model::Space> {
         let machine = addr.split_once('/').map(|(mc, _)| mc);
-        if pr.machine.as_deref() != machine {
-            return false;
-        }
+        let on_machine = |pr: &&model::Space| pr.machine.as_deref() == machine;
+
+        // Tier 1: isolated fork worktree owns its dedicated space when one exists.
         if let Some(wt_path) = rec
             .pointer("/lineage/worktree_path")
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|s| !s.is_empty())
+            && let Some(sp) = self.model.spaces.iter().find(|pr| self.space_matches_worktree(pr, wt_path, machine))
         {
-            if self.space_matches_worktree(pr, wt_path, machine) {
-                return true;
-            }
-            if self.model.spaces.iter().any(|s| self.space_matches_worktree(s, wt_path, machine)) {
-                return false;
+            return Some(sp);
+        }
+
+        // Tier 2: explicit space ownership labels (checked across ALL spaces before any heuristic).
+        for label_ptr in ["/labels/herdr.space", "/labels/herdr.owner_space"] {
+            if let Some(local_id) = rec.pointer(label_ptr).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+                && let Some(sp) = self
+                    .model
+                    .spaces
+                    .iter()
+                    .filter(on_machine)
+                    .find(|pr| crate::mirror::local(&pr.id, machine) == local_id || pr.id == local_id)
+            {
+                return Some(sp);
             }
         }
-        if rec.pointer("/labels/herdr.space").and_then(Value::as_str) == Some(crate::mirror::local(&pr.id, machine)) {
-            return true;
-        }
-        if let Some(parent_local) = rec.get("parent").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-            let parent_addr = crate::mirror::qualify(parent_local, machine);
-            if self.model.any_pane_of(&parent_addr).and_then(|p| self.model.space_of(&p)).is_some_and(|s| s.id == pr.id) {
-                return true;
+
+        // Tier 3: parent or lineage parent space.
+        for parent_ptr in ["/parent", "/lineage/parent"] {
+            if let Some(parent_local) = rec.pointer(parent_ptr).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                let parent_addr = if parent_local.contains('/') {
+                    parent_local.to_owned()
+                } else {
+                    crate::mirror::qualify(parent_local, machine)
+                };
+                if let Some(sp) = self.model.any_pane_of(&parent_addr).and_then(|p| self.model.space_of(&p))
+                    && sp.machine.as_deref() == machine
+                {
+                    return Some(sp);
+                }
+                if let Some(parent_rec) = self.live.get(&parent_addr) {
+                    for label_ptr in ["/labels/herdr.space", "/labels/herdr.owner_space"] {
+                        if let Some(local_id) = parent_rec.pointer(label_ptr).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+                            && let Some(sp) = self
+                                .model
+                                .spaces
+                                .iter()
+                                .filter(on_machine)
+                                .find(|pr| crate::mirror::local(&pr.id, machine) == local_id || pr.id == local_id)
+                        {
+                            return Some(sp);
+                        }
+                    }
+                }
             }
         }
+
         let local_home = home();
+
+        // Tier 4: legacy `where` label (`"<space name> / <tab>"`) for agents parked before `herdr.owner_space`.
+        if let Some(where_space) = rec
+            .pointer("/labels/where")
+            .and_then(Value::as_str)
+            .and_then(|w| w.split(" / ").next())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let named: Vec<&model::Space> = self
+                .model
+                .spaces
+                .iter()
+                .filter(on_machine)
+                .filter(|pr| self.model.space_name(pr, &local_home) == where_space)
+                .collect();
+            if named.len() == 1 {
+                return Some(named[0]);
+            }
+        }
+
+        // Tier 5: most specific folder match across all spaces on the same machine.
         let cwd = self.cwds.get(addr).map(String::as_str).or_else(|| rec.get("cwd").and_then(Value::as_str));
         let wt_origin = rec.pointer("/lineage/worktree_origin").and_then(Value::as_str).filter(|s| !s.is_empty());
         let top = self.model.folder_info.get(addr).map(|f| f.top.as_str());
-        self.space_folders(pr).iter().any(|root| {
-            let allow_descendants = !(machine.is_none() && path_within_or_eq(root, &local_home) && path_within_or_eq(&local_home, root));
-            [cwd, wt_origin, top].into_iter().flatten().any(|cand| path_matches_root(cand, root, allow_descendants))
-        })
+        let cands: Vec<&str> = [cwd, wt_origin, top]
+            .into_iter()
+            .flatten()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if cands.is_empty() {
+            return None;
+        }
+
+        let mut best: Option<((u8, usize, u8, u8, u8), &model::Space)> = None;
+        for pr in self.model.spaces.iter().filter(on_machine) {
+            let space_name = self.model.space_name(pr, &local_home);
+            // Collect candidate roots with provenance rank: explicit space folder (2) > pane repo/folder (1) > pane live cwd (0).
+            let mut roots: Vec<(String, u8)> = Vec::new();
+            let mut push_root = |f: &str, rank: u8| {
+                let f = f.trim();
+                if f.is_empty() {
+                    return;
+                }
+                if let Some(existing) = roots.iter_mut().find(|(p, _)| same_path(p, f)) {
+                    existing.1 = existing.1.max(rank);
+                } else {
+                    roots.push((f.to_owned(), rank));
+                }
+            };
+            push_root(&pr.folder, 2);
+            let mut total_panes = 0usize;
+            let mut matching_panes = 0usize;
+            for c in &pr.tabs {
+                for n in c.root.panes() {
+                    let mut pane_matched = false;
+                    let mut pane_has_path = false;
+                    if let Some(f) = self.model.pane_folders.get(&n.id) {
+                        pane_has_path = true;
+                        push_root(f, 1);
+                        let allow_desc = !(machine.is_none() && path_within_or_eq(f, &local_home) && path_within_or_eq(&local_home, f));
+                        if cands.iter().any(|cand| path_matches_root(cand, f, allow_desc)) {
+                            pane_matched = true;
+                        }
+                    }
+                    if let Some(p_addr) = n.any_terminal() {
+                        if let Some(f) = self.model.folder_info.get(p_addr) {
+                            pane_has_path = true;
+                            push_root(&f.top, 1);
+                            let allow_desc = !(machine.is_none() && path_within_or_eq(&f.top, &local_home) && path_within_or_eq(&local_home, &f.top));
+                            if cands.iter().any(|cand| path_matches_root(cand, &f.top, allow_desc)) {
+                                pane_matched = true;
+                            }
+                        }
+                        if let Some(f) = self.cwds.get(p_addr) {
+                            pane_has_path = true;
+                            push_root(f, 0);
+                            let allow_desc = !(machine.is_none() && path_within_or_eq(f, &local_home) && path_within_or_eq(&local_home, f));
+                            if cands.iter().any(|cand| path_matches_root(cand, f, allow_desc)) {
+                                pane_matched = true;
+                            }
+                        }
+                    }
+                    if pane_has_path {
+                        total_panes += 1;
+                        if pane_matched {
+                            matching_panes += 1;
+                        }
+                    }
+                }
+            }
+            let pane_match_pct: u8 = if total_panes > 0 {
+                ((matching_panes * 100) / total_panes) as u8
+            } else {
+                0
+            };
+
+            let mut space_best: Option<(u8, usize, u8, u8, u8)> = None;
+            for (root, root_rank) in &roots {
+                let allow_descendants = !(machine.is_none() && path_within_or_eq(root, &local_home) && path_within_or_eq(&local_home, root));
+                for cand in &cands {
+                    if !path_matches_root(cand, root, allow_descendants) {
+                        continue;
+                    }
+                    let exact = u8::from(same_path(cand, root));
+                    let segments = trim_path_sep(root).split(['/', '\\']).filter(|s| !s.is_empty()).count();
+                    let cand_base = std::path::Path::new(trim_path_sep(cand))
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+                    let name_matches = u8::from(!cand_base.is_empty() && space_name.eq_ignore_ascii_case(cand_base));
+                    let score = (exact, segments, name_matches, pane_match_pct, *root_rank);
+                    if space_best.is_none_or(|cur| score > cur) {
+                        space_best = Some(score);
+                    }
+                }
+            }
+            if let Some(score) = space_best
+                && best.is_none_or(|(cur, _)| score > cur)
+            {
+                best = Some((score, pr));
+            }
+        }
+        best.map(|(_, sp)| sp)
+    }
+
+    #[cfg(test)]
+    fn acp_matches_space(&self, addr: &str, rec: &Value, pr: &model::Space) -> bool {
+        self.resolve_agent_space(addr, rec).is_some_and(|sp| sp.id == pr.id)
     }
 
     fn space_acp_agents(&self, space_id: &str) -> Vec<String> {
-        let Some(closing_sp) = self.model.space(space_id) else { return Vec::new() };
+        if self.model.space(space_id).is_none() {
+            return Vec::new();
+        }
         self.live
             .iter()
             .filter(|(addr, rec)| {
                 !self.closing_terminals.contains_key(*addr)
                     && rec.get("acp").and_then(Value::as_bool) == Some(true)
                     && rec.get("state").and_then(Value::as_str) == Some("live")
-                    && self.acp_matches_space(addr, rec, closing_sp)
-                    && !self.model.spaces.iter().any(|other| other.id != space_id && self.acp_matches_space(addr, rec, other))
+                    && self.resolve_agent_space(addr, rec).is_some_and(|sp| sp.id == space_id)
             })
             .map(|(addr, _)| addr.clone())
             .collect()
@@ -3142,6 +3373,37 @@ impl AppWindow {
                 }
             })
             .detach();
+    }
+
+    /// Updates `herdr.name` locally, shields it briefly against in-flight core listings,
+    /// publishes `terminals()` (refreshing sub-agent rows immediately), and persists to Core.
+    /// Auto/generic program names (e.g. "Antigravity", "Claude Code") are normalized to empty
+    /// so dynamic `semantic_title` / live title updates remain active.
+    fn apply_agent_custom_name(&mut self, addr: &str, trimmed: &str, cx: &mut Context<Self>) {
+        let effective = {
+            let rec = self.live.get(addr).or_else(|| self.ended_acp.get(addr));
+            if trimmed.is_empty() || Self::is_auto_tab_name_for_addr(trimmed, rec, addr) {
+                ""
+            } else {
+                trimmed
+            }
+        };
+        for map in [&mut self.live, &mut self.ended_acp] {
+            if let Some(obj) = map.get_mut(addr).and_then(Value::as_object_mut)
+                && let Some(labels) = obj.entry("labels").or_insert_with(|| json!({})).as_object_mut()
+            {
+                if effective.is_empty() {
+                    labels.remove("herdr.name");
+                } else {
+                    labels.insert("herdr.name".into(), json!(effective));
+                }
+            }
+        }
+        self.pending_names.insert(addr.to_owned(), (effective.to_owned(), Instant::now()));
+        if mods::publish_terminals(self.ordered_live_values()) {
+            self.refresh_snapshot_mods(cx);
+        }
+        Self::write_core_label(self.core.clone(), addr.to_owned(), "herdr.name", effective.to_owned(), cx);
     }
 
     /// Resolves and auto-releases any manual status override (`herdr.status`) for `addr`.
@@ -3238,7 +3500,7 @@ impl AppWindow {
             tail_lines: Vec<String>,
             next_rechecks: u8,
         }
-        let mut updates: Vec<(String, Value, Value, Value)> = Vec::new();
+        let mut updates: Vec<(String, Value, Value, Value, Option<String>, Option<String>)> = Vec::new();
         let mut clear_verdicts: Vec<String> = Vec::new();
         let mut jobs: Vec<ArbitrationJob> = Vec::new();
         let can_ai = self.core.supports_ai() && self.ai_unavailable_until.is_none_or(|until| now >= until);
@@ -3258,7 +3520,7 @@ impl AppWindow {
                 continue;
             }
             let is_agent = rec.pointer("/program/agent").and_then(Value::as_bool) == Some(true);
-            let (want, want_summary, want_kind) = if is_agent {
+            let (want, want_summary, want_kind, cached_sem_title, cached_micro) = if is_agent {
                 let raw_title = rec.get("raw_title").and_then(Value::as_str).unwrap_or_default();
                 let view = self.best_terminal_view(addr, cx);
                 let det = view.as_ref().map(|v| v.read(cx).inferred_agent_state(raw_title, now)).unwrap_or("idle");
@@ -3266,7 +3528,7 @@ impl AppWindow {
                     if self.ai_terminal_states.contains_key(addr) {
                         clear_verdicts.push(addr.clone());
                     }
-                    (Value::String(det.to_owned()), Value::Null, Value::Null)
+                    (Value::String(det.to_owned()), Value::Null, Value::Null, None, None)
                 } else if let Some(view) = view {
                     let v = view.read(cx);
                     let output_at = v.last_output_at();
@@ -3288,7 +3550,6 @@ impl AppWindow {
                         }
                         None => ("idle", Value::Null, Value::Null, None, None, true, 0),
                     };
-                    let _ = (eff_sem_title, eff_micro);
                     if need_recheck
                         && can_ai
                         && !self.ai_inflight.contains(addr)
@@ -3313,32 +3574,42 @@ impl AppWindow {
                             });
                         }
                     }
-                    (Value::String(eff_state.to_owned()), eff_summary, eff_kind)
+                    (Value::String(eff_state.to_owned()), eff_summary, eff_kind, eff_sem_title, eff_micro)
                 } else {
-                    (Value::String("idle".into()), Value::Null, Value::Null)
+                    (Value::String("idle".into()), Value::Null, Value::Null, None, None)
                 }
             } else {
                 if self.ai_terminal_states.contains_key(addr) {
                     clear_verdicts.push(addr.clone());
                 }
-                (Value::Null, Value::Null, Value::Null)
+                (Value::Null, Value::Null, Value::Null, None, None)
             };
             let cur_status = rec.get("status").unwrap_or(&Value::Null);
             let cur_summary = rec.get("ai_status_summary").unwrap_or(&Value::Null);
             let cur_kind = rec.get("ai_status_kind").unwrap_or(&Value::Null);
-            if cur_status != &want || cur_summary != &want_summary || cur_kind != &want_kind {
-                updates.push((addr.clone(), want, want_summary, want_kind));
+            let has_core_sem = rec.get("semantic_title").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty());
+            let has_core_micro = rec.get("micro_summary").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty());
+            let fill_sem = (!has_core_sem).then_some(cached_sem_title).flatten();
+            let fill_micro = (!has_core_micro).then_some(cached_micro).flatten();
+            if cur_status != &want || cur_summary != &want_summary || cur_kind != &want_kind || fill_sem.is_some() || fill_micro.is_some() {
+                updates.push((addr.clone(), want, want_summary, want_kind, fill_sem, fill_micro));
             }
         }
         for addr in clear_verdicts {
             self.ai_terminal_states.remove(&addr);
         }
         let changed = !updates.is_empty();
-        for (addr, want, want_summary, want_kind) in updates {
+        for (addr, want, want_summary, want_kind, fill_sem, fill_micro) in updates {
             if let Some(obj) = self.live.get_mut(&addr).and_then(Value::as_object_mut) {
                 obj.insert("status".into(), want);
                 obj.insert("ai_status_summary".into(), want_summary);
                 obj.insert("ai_status_kind".into(), want_kind);
+                if let Some(st) = fill_sem {
+                    obj.insert("semantic_title".into(), Value::String(st));
+                }
+                if let Some(ms) = fill_micro {
+                    obj.insert("micro_summary".into(), Value::String(ms));
+                }
             }
         }
         for job in jobs {
@@ -3449,6 +3720,452 @@ impl AppWindow {
         changed
     }
 
+    fn now_epoch_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn publish_polish_state(progress: Option<&PolishProgress>, stage_changed_at_ms: u64) {
+        match progress {
+            Some(p) => {
+                mods::set_shared("polish.active".into(), json!(p.addr));
+                mods::set_shared(
+                    "polish.state".into(),
+                    json!({
+                        "id": p.id,
+                        "addr": p.addr,
+                        "preview": p.preview,
+                        "lineCount": p.line_count,
+                        "stage": match p.stage {
+                            PolishStage::Polishing => "polishing",
+                            PolishStage::Applying => "applying",
+                        },
+                        "startedAtMs": p.started_at_ms,
+                        "stageChangedAtMs": stage_changed_at_ms,
+                    }),
+                );
+            }
+            None => {
+                mods::set_shared("polish.active".into(), Value::Null);
+                mods::set_shared("polish.state".into(), Value::Null);
+            }
+        }
+    }
+
+    fn publish_polish_undo(undo: &HashMap<String, PolishUndo>) {
+        if undo.is_empty() {
+            mods::set_shared("polish.undo".into(), Value::Null);
+            return;
+        }
+        let mut map = serde_json::Map::new();
+        for (addr, item) in undo {
+            map.insert(
+                addr.clone(),
+                json!({
+                    "summary": item.summary,
+                    "createdAtMs": item.created_at_ms,
+                }),
+            );
+        }
+        mods::set_shared("polish.undo".into(), Value::Object(map));
+    }
+
+    fn prune_stale_polish_undo(&mut self, cx: &Context<Self>) {
+        if self.polish_undo.is_empty() {
+            return;
+        }
+        let stale: Vec<String> = self
+            .polish_undo
+            .iter()
+            .filter_map(|(addr, item)| {
+                if !self.live.contains_key(addr) {
+                    return Some(addr.clone());
+                }
+                if let Some(view) = self.best_terminal_view(addr, cx)
+                    && view.read(cx).last_enter_at() != item.enter_at_after
+                {
+                    return Some(addr.clone());
+                }
+                None
+            })
+            .collect();
+        if !stale.is_empty() {
+            for addr in stale {
+                self.polish_undo.remove(&addr);
+            }
+            Self::publish_polish_undo(&self.polish_undo);
+        }
+    }
+
+    fn cancel_polish(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(progress) = self.polish_progress.take() {
+            self.polish_inflight.remove(&progress.addr);
+            Self::publish_polish_state(None, 0);
+            self.close_overlay(&progress.overlay_id, window, cx);
+            if let Some(view) = self.best_terminal_view(&progress.addr, cx) {
+                let handle = view.read(cx).focus_handle().clone();
+                window.focus(&handle, cx);
+            }
+            cx.notify();
+        }
+    }
+
+    /// Polishes the user's current unsent input directly inside a raw CLI terminal in-place,
+    /// showing a lightweight hot-reloadable JS progress card (`mods/polish-progress`).
+    fn polish_cli_terminal_in_place(&mut self, addr: String, window: &mut Window, cx: &mut Context<Self>) {
+        let is_zh = self.person.language == settings::Language::ZhCn;
+        let Some(view) = self.best_terminal_view(&addr, cx) else {
+            let note = json!({
+                "title": if is_zh { "未找到活动终端" } else { "No active terminal" },
+                "body": if is_zh { "请先切换到该 CLI Agent 终端后再试。" } else { "Focus the CLI agent terminal first and retry." },
+                "level": "info",
+            });
+            self.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": note }), window, cx);
+            return;
+        };
+        if self.polish_inflight.contains(&addr) {
+            return;
+        }
+        let (raw_draft, typed_at_before, focus_handle) = {
+            let v = view.read(cx);
+            (v.cli_input_draft(), v.last_typed_at(), v.focus_handle().clone())
+        };
+        let Some(raw) = raw_draft.filter(|s| !s.trim().is_empty()) else {
+            window.focus(&focus_handle, cx);
+            let note = json!({
+                "title": if is_zh { "暂无可润色的输入" } else { "No input to polish" },
+                "body": if is_zh {
+                    "请先在 CLI Agent 输入框中输入提示词，再点击「润色输入」。"
+                } else {
+                    "Type your prompt in the CLI agent input first, then click Polish."
+                },
+                "level": "info",
+            });
+            self.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": note }), window, cx);
+            return;
+        };
+
+        self.polish_inflight.insert(addr.clone());
+        self.polish_seq = self.polish_seq.wrapping_add(1);
+        let req_id = self.polish_seq;
+        let line_count = raw.lines().count().max(1);
+        let preview = {
+            let compact: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+            let mut out: String = compact.chars().take(72).collect();
+            if compact.chars().count() > 72 {
+                out.push('…');
+            }
+            out
+        };
+        let now_ms = Self::now_epoch_ms();
+        let overlay_id = mods::new_overlay_id();
+        let progress = PolishProgress {
+            id: req_id,
+            addr: addr.clone(),
+            overlay_id: overlay_id.clone(),
+            preview,
+            line_count,
+            started_at_ms: now_ms,
+            stage: PolishStage::Polishing,
+        };
+        Self::publish_polish_state(Some(&progress), now_ms);
+        self.polish_progress = Some(progress);
+        self.open_overlay(
+            overlay_id,
+            json!({
+                "kind": "float",
+                "mod": "polish-progress",
+                "at": "bottom",
+                "offset": 16,
+                "width": 388,
+                "frame": "none",
+            }),
+            window,
+            cx,
+        );
+        cx.notify();
+
+        let cwd = self
+            .live
+            .get(&addr)
+            .and_then(|r| r.get("cwd"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let machine = addr.split_once('/').map(|(m, _)| m.to_owned());
+        let mut params = json!({
+            "prompt": raw,
+            "target": addr,
+            "agentKind": "cli",
+            "language": if is_zh { "zh-CN" } else { "en" },
+        });
+        if !cwd.is_empty() {
+            params["context"] = json!(format!("cwd={cwd}"));
+        }
+        if let Some(m) = machine {
+            params["on"] = json!(m);
+        }
+        let core = self.core.clone();
+        let raw_for_replace = raw;
+        cx.spawn_in(window, async move |this, cx| {
+            let res = cx.background_executor().spawn(async move { core.polish_prompt(params) }).await;
+            let write_wait: Option<(Duration, String, String, String, Option<String>)> = this
+                .update_in(cx, |this, window, cx| {
+                    // Respect user cancellation while in-flight.
+                    if !this.polish_progress.as_ref().is_some_and(|p| p.id == req_id) {
+                        this.polish_inflight.remove(&addr);
+                        return None;
+                    }
+                    let finish = |this: &mut AppWindow, window: &mut Window, cx: &mut Context<AppWindow>| {
+                        this.polish_inflight.remove(&addr);
+                        let closed_overlay = if this.polish_progress.as_ref().is_some_and(|p| p.id == req_id) {
+                            this.polish_progress.take().map(|p| p.overlay_id)
+                        } else {
+                            None
+                        };
+                        Self::publish_polish_state(None, 0);
+                        if let Some(ov_id) = closed_overlay {
+                            this.close_overlay(&ov_id, window, cx);
+                        }
+                        cx.notify();
+                    };
+                    let show_toast = |this: &mut AppWindow, title: &str, body: String, level: &str, window: &mut Window, cx: &mut Context<AppWindow>| {
+                        let note = json!({ "title": title, "body": body, "level": level });
+                        this.open_overlay(
+                        mods::new_overlay_id(),
+                        json!({ "kind": "toast", "width": 388, "notification": note }),
+                        window,
+                        cx,
+                    );
+                    };
+                    let val = match res {
+                        Ok(v) => v,
+                        Err(e) => {
+                            finish(this, window, cx);
+                            show_toast(
+                                this,
+                                if is_zh { "AI 润色失败" } else { "AI polish failed" },
+                                e.to_string(),
+                                "error",
+                                window,
+                                cx,
+                            );
+                            return None;
+                        }
+                    };
+                    let used_ai = val.get("usedAi").and_then(Value::as_bool) == Some(true);
+                    let polished = val.get("polished").and_then(Value::as_str).unwrap_or("").trim().to_owned();
+                    if !used_ai || polished.is_empty() {
+                        finish(this, window, cx);
+                        let reason = val.get("fallbackReason").and_then(Value::as_str).unwrap_or("");
+                        let body = match reason {
+                            "ai_not_configured" => if is_zh {
+                                "Core AI 尚未配置，请先在「设置 → AI 助手」中启用后再使用润色功能。".to_owned()
+                            } else {
+                                "Core AI is not configured. Enable it in Settings → AI Assistant first.".to_owned()
+                            },
+                            "ai_circuit_open" => if is_zh {
+                                "Core AI 暂时熔断冷却中，请稍后重试。".to_owned()
+                            } else {
+                                "Core AI is temporarily cooling down after recent failures.".to_owned()
+                            },
+                            _ => if is_zh {
+                                "AI 润色暂未返回有效结果，请重试。".to_owned()
+                            } else {
+                                "AI polish returned no changes. Please retry.".to_owned()
+                            },
+                        };
+                        show_toast(
+                            this,
+                            if is_zh { "AI 润色不可用" } else { "AI polish unavailable" },
+                            body,
+                            "error",
+                            window,
+                            cx,
+                        );
+                        return None;
+                    }
+                    let Some(view) = this.best_terminal_view(&addr, cx) else {
+                        finish(this, window, cx);
+                        return None;
+                    };
+                    if view.read(cx).last_typed_at() != typed_at_before {
+                        finish(this, window, cx);
+                        show_toast(
+                            this,
+                            if is_zh { "已跳过替换" } else { "Skipped replacing input" },
+                            if is_zh {
+                                "检测到你在润色期间修改了输入，已保留你当前的输入内容。".to_owned()
+                            } else {
+                                "Input changed while polishing; kept your latest text.".to_owned()
+                            },
+                            "info",
+                            window,
+                            cx,
+                        );
+                        return None;
+                    }
+                    if let Some(p) = this.polish_progress.as_mut().filter(|p| p.id == req_id) {
+                        p.stage = PolishStage::Applying;
+                        Self::publish_polish_state(Some(p), Self::now_epoch_ms());
+                        cx.notify();
+                    }
+                    let wait = view.update(cx, |v, cx| v.replace_cli_input_in_place(&raw_for_replace, &polished, cx));
+                    let summary = val.get("summary").and_then(Value::as_str).unwrap_or("").trim();
+                    let summary_opt = (!summary.is_empty()).then(|| summary.to_owned());
+                    let body = if !summary.is_empty() {
+                        summary.to_owned()
+                    } else if is_zh {
+                        "已直接写入 CLI 输入框，检查后按 Enter 发送。".to_owned()
+                    } else {
+                        "Written inline to CLI input — review and press Enter to send.".to_owned()
+                    };
+                    Some((wait, body, raw_for_replace.clone(), polished, summary_opt))
+                })
+                .ok()
+                .flatten();
+
+            if let Some((wait, body, original, polished, summary)) = write_wait {
+                cx.background_executor().timer(wait).await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.polish_inflight.remove(&addr);
+                    let closed_overlay = if this.polish_progress.as_ref().is_some_and(|p| p.id == req_id) {
+                        this.polish_progress.take().map(|p| p.overlay_id)
+                    } else {
+                        None
+                    };
+                    Self::publish_polish_state(None, 0);
+                    if let Some(ov_id) = closed_overlay {
+                        this.close_overlay(&ov_id, window, cx);
+                    }
+                    let enter_at_after = if let Some(view) = this.best_terminal_view(&addr, cx) {
+                        let v = view.read(cx);
+                        let enter_at = v.last_enter_at();
+                        let handle = v.focus_handle().clone();
+                        window.focus(&handle, cx);
+                        enter_at
+                    } else {
+                        None
+                    };
+                    this.polish_undo.insert(
+                        addr.clone(),
+                        PolishUndo {
+                            original,
+                            polished,
+                            summary,
+                            created_at_ms: Self::now_epoch_ms(),
+                            enter_at_after,
+                        },
+                    );
+                    Self::publish_polish_undo(&this.polish_undo);
+                    let note = json!({
+                        "title": if is_zh { "✨ 已润色输入" } else { "✨ Input polished" },
+                        "body": body,
+                        "level": "info",
+                        "timeout": 8000,
+                        "actionLabel": if is_zh { "↩ 反悔恢复" } else { "↩ Undo" },
+                        "actionTooltip": if is_zh {
+                            "撤销本次润色并恢复润色前的内容"
+                        } else {
+                            "Undo last polish and restore original input"
+                        },
+                        "buttonAction": {
+                            "name": "prompt.polish_undo",
+                            "args": { "terminal": addr },
+                        },
+                    });
+                    this.open_overlay(
+                        mods::new_overlay_id(),
+                        json!({ "kind": "toast", "width": 388, "notification": note }),
+                        window,
+                        cx,
+                    );
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Reverts the last in-place CLI prompt polish for `addr` and restores the pre-polish input.
+    fn undo_cli_polish_in_place(&mut self, addr: String, window: &mut Window, cx: &mut Context<Self>) {
+        let is_zh = self.person.language == settings::Language::ZhCn;
+        if self.polish_inflight.contains(&addr) {
+            return;
+        }
+        let Some(entry) = self.polish_undo.get(&addr).cloned() else {
+            let note = json!({
+                "title": if is_zh { "暂无可恢复的润色记录" } else { "Nothing to undo" },
+                "body": if is_zh {
+                    "当前终端没有可反悔恢复的上次润色内容。"
+                } else {
+                    "No recent prompt polish to undo in this terminal."
+                },
+                "level": "info",
+            });
+            self.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": note }), window, cx);
+            return;
+        };
+        let Some(view) = self.best_terminal_view(&addr, cx) else {
+            self.polish_undo.remove(&addr);
+            Self::publish_polish_undo(&self.polish_undo);
+            return;
+        };
+        if view.read(cx).last_enter_at() != entry.enter_at_after {
+            self.polish_undo.remove(&addr);
+            Self::publish_polish_undo(&self.polish_undo);
+            let note = json!({
+                "title": if is_zh { "无法反悔恢复" } else { "Cannot undo polish" },
+                "body": if is_zh {
+                    "检测到润色后的内容已发送，无法再撤销恢复。"
+                } else {
+                    "The polished prompt was already submitted."
+                },
+                "level": "info",
+            });
+            self.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": note }), window, cx);
+            cx.notify();
+            return;
+        }
+
+        self.polish_undo.remove(&addr);
+        Self::publish_polish_undo(&self.polish_undo);
+        self.polish_inflight.insert(addr.clone());
+
+        let current_text = view
+            .read(cx)
+            .cli_input_draft()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| entry.polished.clone());
+        let wait = view.update(cx, |v, cx| v.replace_cli_input_in_place(&current_text, &entry.original, cx));
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(wait).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.polish_inflight.remove(&addr);
+                if let Some(view) = this.best_terminal_view(&addr, cx) {
+                    let handle = view.read(cx).focus_handle().clone();
+                    window.focus(&handle, cx);
+                }
+                let note = json!({
+                    "title": if is_zh { "↩ 已反悔恢复" } else { "↩ Restored original input" },
+                    "body": if is_zh {
+                        "已撤销本次润色并恢复润色前的内容。"
+                    } else {
+                        "Reverted the last polish and restored your original prompt."
+                    },
+                    "level": "info",
+                });
+                this.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": note }), window, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     /// Lazily backfills and continuously refreshes `semantic_title` / `micro_summary` via Core's
     /// `ai.summarize_agent` for live ACP and PTY CLI agent sessions as conversation content progresses.
     fn refresh_missing_semantic_digests(&mut self, cx: &mut Context<Self>) {
@@ -3494,44 +4211,51 @@ impl AppWindow {
             let turn = rec.get("turn").and_then(Value::as_u64).unwrap_or(0);
             let transcript_seq = rec.get("transcript_seq").and_then(Value::as_u64).unwrap_or(0);
             let status = rec.get("status").and_then(Value::as_str).map(str::to_owned);
-            let (output_at, typed_at) = if is_acp {
-                (None, None)
+            let (output_at, typed_at, view_title) = if is_acp {
+                (None, None, None)
             } else if let Some(view) = self.best_terminal_view(addr, cx) {
                 let v = view.read(cx);
-                (v.last_output_at(), v.last_typed_at())
+                let vt = (!v.title.is_empty() && v.title != *addr).then(|| v.title.clone());
+                (v.last_output_at(), v.last_typed_at(), vt)
             } else {
-                (None, None)
+                (None, None, None)
             };
+            let title = view_title.unwrap_or_else(|| {
+                rec.get("title").and_then(Value::as_str).unwrap_or_default().to_owned()
+            });
 
             let should_refresh = match self.ai_digest_attempted.get(addr) {
-                None => missing || (!is_acp && (output_at.is_some() || typed_at.is_some() || turn > 0)),
+                None => missing || (!is_acp && (output_at.is_some() || typed_at.is_some() || turn > 0 || !title.is_empty())),
                 Some(prev) => {
                     let since_last = now.saturating_duration_since(prev.attempted_at);
                     let turn_changed = prev.turn != turn;
                     let seq_changed = prev.transcript_seq != transcript_seq;
                     let status_changed = prev.status != status;
+                    let title_changed = prev.title != title;
                     let activity_changed = prev.output_at != output_at || prev.typed_at != typed_at;
                     let output_quiet = output_at.is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(1200));
 
                     if missing {
-                        if turn_changed || seq_changed || status_changed || activity_changed {
-                            since_last >= Duration::from_secs(3)
-                                && (is_acp || output_quiet || since_last >= Duration::from_secs(6))
+                        if turn_changed || seq_changed || status_changed || title_changed || activity_changed {
+                            since_last >= Duration::from_secs(2)
+                                && (is_acp || output_quiet || since_last >= Duration::from_secs(5))
                         } else {
-                            since_last >= Duration::from_secs(30)
+                            since_last >= Duration::from_secs(20)
                         }
                     } else if is_acp {
                         // Core pushes deterministic + AI digest events on ACP turns; app only refreshes
-                        // as a safety net when transcript/turn/status moved and enough time passed.
-                        (turn_changed || seq_changed || status_changed) && since_last >= Duration::from_secs(12)
+                        // as a safety net when transcript/turn/status/title moved and enough time passed.
+                        (turn_changed || seq_changed || status_changed || title_changed) && since_last >= Duration::from_secs(10)
+                    } else if title_changed {
+                        since_last >= Duration::from_secs(2)
                     } else if status_changed || turn_changed {
                         since_last >= Duration::from_secs(3)
                     } else if activity_changed {
                         (output_quiet && since_last >= Duration::from_secs(5))
                             || since_last >= Duration::from_secs(12)
-                    } else if status.as_deref() == Some("working") && output_at.is_none() {
-                        // Background/unattached PTY CLI with no local view timestamps.
-                        since_last >= Duration::from_secs(15)
+                    } else if matches!(status.as_deref(), Some("working" | "done" | "blocked")) && output_at.is_none() {
+                        // Background/structured-view PTY CLI with no local TerminalView timestamps.
+                        since_last >= Duration::from_secs(12)
                     } else {
                         false
                     }
@@ -3544,6 +4268,7 @@ impl AppWindow {
                 turn,
                 transcript_seq,
                 status: status.clone(),
+                title,
                 output_at,
                 typed_at,
                 attempted_at: now,
@@ -3707,6 +4432,28 @@ impl AppWindow {
         self.live_order = order;
         self.shell_child_seen.retain(|a| self.live.contains_key(a));
         self.manual_statuses.retain(|a, _| self.live.contains_key(a));
+        let now_pending = Instant::now();
+        self.pending_names.retain(|addr, (want, at)| {
+            let Some(rec) = self.live.get(addr) else {
+                return false;
+            };
+            let cur = rec.pointer("/labels/herdr.name").and_then(Value::as_str).unwrap_or_default();
+            if cur == want.as_str() || now_pending.saturating_duration_since(*at) >= Duration::from_secs(3) {
+                return false;
+            }
+            true
+        });
+        for (addr, (want, _)) in &self.pending_names {
+            if let Some(obj) = self.live.get_mut(addr).and_then(Value::as_object_mut)
+                && let Some(labels) = obj.entry("labels").or_insert_with(|| json!({})).as_object_mut()
+            {
+                if want.is_empty() {
+                    labels.remove("herdr.name");
+                } else {
+                    labels.insert("herdr.name".into(), json!(want));
+                }
+            }
+        }
         self.ai_terminal_states.retain(|a, _| self.live.contains_key(a));
         self.ai_last_attempt.retain(|a, _| self.live.contains_key(a));
         self.ai_digest_attempted.retain(|a, _| self.live.contains_key(a));
@@ -3761,6 +4508,11 @@ impl AppWindow {
                     obj.insert("manual_status".into(), Value::Null);
                 }
                 if let Some(prev_agent_title) = self.last_agent_titles.remove(&addr) {
+                    if let Some(obj) = self.live.get_mut(&addr).and_then(Value::as_object_mut)
+                        && obj.get("title").and_then(Value::as_str) == Some(prev_agent_title.as_str())
+                    {
+                        obj.insert("title".into(), json!(""));
+                    }
                     let matching_views: Vec<Entity<TerminalView>> = self
                         .terms
                         .values()
@@ -4259,7 +5011,13 @@ impl AppWindow {
     fn spawn(&mut self, argv: Option<Vec<String>>, stay: bool, cwd: String, follow: bool, space: &str, ctx: &str, on: Option<&str>, size: Option<(u16, u16)>, window: &Window) -> Result<(String, String), String> {
         let argv = argv.unwrap_or_default();
         self.require_document(on)?;
-        let mut labels = json!({ "herdr.space": crate::mirror::local(space, on), "herdr.tab": crate::mirror::local(ctx, on), "herdr.seen": "0" });
+        let local_space = crate::mirror::local(space, on);
+        let mut labels = json!({
+            "herdr.space": local_space,
+            "herdr.owner_space": local_space,
+            "herdr.tab": crate::mirror::local(ctx, on),
+            "herdr.seen": "0",
+        });
         // A split's wrapper shows it only when it can't start the program (`remote_shell::cannot_start`).
         if !stay && !argv.is_empty() {
             use std::hash::{BuildHasher, Hasher};
@@ -4354,6 +5112,39 @@ impl AppWindow {
         Some(vec![choice.to_owned()])
     }
 
+    fn is_auto_tab_name_for_addr(tab_name: &str, rec: Option<&Value>, addr: &str) -> bool {
+        let lower = tab_name.trim().to_ascii_lowercase();
+        if lower.is_empty() {
+            return true;
+        }
+        let addr_lower = addr.trim().to_ascii_lowercase();
+        let short_addr = addr_lower.rsplit_once('/').map_or(addr_lower.as_str(), |(_, s)| s);
+        if lower == addr_lower || lower == short_addr {
+            return true;
+        }
+        if let Some(r) = rec {
+            for ptr in ["/program/name", "/program/key", "/agent"] {
+                if let Some(v) = r.pointer(ptr).and_then(Value::as_str)
+                    && lower == v.trim().to_ascii_lowercase()
+                {
+                    return true;
+                }
+            }
+        }
+        matches!(
+            lower.as_str(),
+            "terminal" | "终端" | "shell" | "zsh" | "bash" | "sh" | "fish" | "nu" | "nushell" | "dash"
+                | "pwsh" | "powershell" | "powershell 7" | "windows powershell" | "cmd" | "command prompt"
+                | "git bash" | "wsl" | "dos prompt" | "headless"
+                | "claude" | "claude code" | "claude-code" | "codex" | "gemini" | "antigravity" | "agy"
+                | "opencode" | "cursor" | "cursor-agent" | "pi" | "pig" | "qwen" | "kimi" | "kimi-code"
+                | "kiro" | "kiro-cli" | "qoder" | "qodercli" | "copilot" | "github-copilot" | "amp" | "grok"
+                | "hermes" | "goose" | "crush" | "omp" | "oh-my-pi" | "dsh" | "dsh-tui" | "deepseek"
+                | "deepseek harness" | "mastra code" | "mastracode" | "command code" | "command-code"
+                | "prime" | "prime-agent" | "empryo" | "muse" | "ollama" | "zcode" | "zcode-cli" | "glm" | "agent"
+        )
+    }
+
     /// Saves a single-pane tab's custom tab name onto its terminal's `herdr.name` label
     /// before merging multiple panes into one tab.
     fn preserve_single_pane_tab_name(&mut self, tab_id: &str, cx: &mut Context<Self>) -> bool {
@@ -4366,22 +5157,16 @@ impl AppWindow {
         if !tab_name.is_empty()
             && let Some(addr) = self.model.any_address_of(&pane_id)
         {
-            let has_custom = self
-                .live
-                .get(&addr)
-                .or_else(|| self.ended_acp.get(&addr))
+            let rec = self.live.get(&addr).or_else(|| self.ended_acp.get(&addr));
+            if Self::is_auto_tab_name_for_addr(&tab_name, rec, &addr) {
+                return true;
+            }
+            let has_custom = rec
                 .and_then(|r| r.pointer("/labels/herdr.name"))
                 .and_then(Value::as_str)
                 .is_some_and(|s| !s.trim().is_empty());
             if !has_custom {
-                for map in [&mut self.live, &mut self.ended_acp] {
-                    if let Some(obj) = map.get_mut(&addr).and_then(Value::as_object_mut)
-                        && let Some(labels) = obj.entry("labels").or_insert_with(|| json!({})).as_object_mut()
-                    {
-                        labels.insert("herdr.name".into(), json!(tab_name.clone()));
-                    }
-                }
-                Self::write_core_label(self.core.clone(), addr, "herdr.name", tab_name, cx);
+                self.apply_agent_custom_name(&addr, &tab_name, cx);
             }
         }
         true
@@ -4466,6 +5251,7 @@ impl AppWindow {
             "async_start": true,
             "labels": {
                 "herdr.space": space_label,
+                "herdr.owner_space": space_label,
                 "herdr.tab": tab_label,
                 "herdr.seen": "0",
                 "herdr.parked": ""
@@ -4698,14 +5484,7 @@ impl AppWindow {
         {
             return custom.to_owned();
         }
-        if !is_acp_addr(&addr) {
-            return String::new();
-        }
-        rec.and_then(|r| r["name"].as_str().filter(|s| !s.is_empty()).map(str::to_owned))
-            .or_else(|| rec.and_then(|r| r["title"].as_str().filter(|s| !s.is_empty()).map(str::to_owned)))
-            .or_else(|| self.model.agents.get(&addr).and_then(|a| a.app.as_deref()).map(crate::programs::name))
-            .or_else(|| rec.and_then(|r| r["agent"].as_str().filter(|s| !s.is_empty()).map(crate::programs::name)))
-            .unwrap_or(addr)
+        String::new()
     }
 
     fn focus_mounted_acp(&mut self, addr: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -4771,11 +5550,12 @@ impl AppWindow {
                     let tab_label = crate::mirror::local(&target_tab, addr_machine).to_owned();
                     if let Some(labels) = self.live.get_mut(addr).and_then(|r| r.get_mut("labels")).and_then(Value::as_object_mut) {
                         labels.insert("herdr.space".into(), json!(space_label));
+                        labels.insert("herdr.owner_space".into(), json!(space_label));
                         labels.insert("herdr.tab".into(), json!(tab_label));
                     }
                     let core = self.core.clone();
                     let agent = addr.to_owned();
-                    let labels = json!({ "herdr.space": space_label, "herdr.tab": tab_label });
+                    let labels = json!({ "herdr.space": space_label, "herdr.owner_space": space_label, "herdr.tab": tab_label });
                     cx.background_executor()
                         .spawn(async move {
                             if let Err(e) = core.call("agent.label", json!({ "agent": agent, "labels": labels })) {
@@ -4814,16 +5594,27 @@ impl AppWindow {
                 (space, addr_machine.map(str::to_owned), Some((wt_path, addr_machine.map(str::to_owned))))
             }
         } else if !is_acp {
-            let space = self.model.active_space().map(|p| p.id.clone()).ok_or("no space to keep it in")?;
-            let machine = self.machine_of(&space);
-            if addr_machine != machine.as_deref() {
-                return Err("A terminal's pane must stay on its own machine.".into());
-            }
-            (space, machine, None)
+            let rec = &self.live[addr];
+            let active_same = self.model.active_space().filter(|p| p.machine.as_deref() == addr_machine);
+            let matched = self.resolve_agent_space(addr, rec);
+            let same_machine = self.model.spaces.iter().find(|pr| pr.machine.as_deref() == addr_machine);
+            let chosen = if matches!(place, "right" | "down") {
+                active_same.or(matched).or(same_machine)
+            } else {
+                matched.or(active_same).or(same_machine)
+            };
+            let sp = chosen.ok_or_else(|| {
+                if self.model.active_space().is_some() {
+                    "A terminal's pane must stay on its own machine."
+                } else {
+                    "no space to keep it in"
+                }
+            })?;
+            (sp.id.clone(), sp.machine.clone(), None)
         } else {
             let rec = &self.live[addr];
             let active_same = self.model.active_space().filter(|p| p.machine.as_deref() == addr_machine);
-            let matched = self.model.spaces.iter().find(|pr| self.acp_matches_space(addr, rec, pr));
+            let matched = self.resolve_agent_space(addr, rec);
             let same_machine = self.model.spaces.iter().find(|pr| pr.machine.as_deref() == addr_machine);
             let chosen = if matches!(place, "right" | "down") {
                 active_same.or(matched).or(same_machine)
@@ -4849,11 +5640,15 @@ impl AppWindow {
             .unwrap_or_else(|| self.model.fresh_id_on("tb", machine.as_deref()));
         let pane = self.model.fresh_id_on("p", machine.as_deref());
         let rec = &self.live[addr];
-        let name = rec["name"].as_str().filter(|s| !s.is_empty()).map(str::to_owned)
-            .or_else(|| is_acp.then(|| rec["title"].as_str().filter(|s| !s.is_empty())).flatten().map(str::to_owned))
-            .or_else(|| self.model.agents.get(addr).and_then(|a| a.app.as_deref()).map(crate::programs::name))
-            .or_else(|| is_acp.then(|| rec["agent"].as_str().filter(|s| !s.is_empty()).map(crate::programs::name)).flatten())
-            .unwrap_or_else(|| addr.to_owned());
+        // Only preserve an explicit user custom name on the newly mounted tab; leave
+        // auto-named agents with an empty tab name so tab bar & sidebar track live/semantic titles.
+        let name = rec
+            .pointer("/labels/herdr.name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_default();
         let (address, place) = (addr.to_owned(), place.to_owned());
         let reply = json!({"pending":true,"terminal":addr,"pane":pane,"tab":ctx});
         self.start_terminal_change(address, TerminalChange::Keep {
@@ -4872,14 +5667,48 @@ impl AppWindow {
 
     fn start_terminal_change(&mut self, address: String, change: TerminalChange, window: &mut Window, cx: &mut Context<Self>) {
         let machine = address.split_once('/').map(|(m, _)| m);
+        let owner_for_park = if matches!(change, TerminalChange::Park) {
+            self.model
+                .any_pane_of(&address)
+                .and_then(|p| self.model.space_of(&p))
+                .map(|s| crate::mirror::local(&s.id, machine).to_owned())
+                .or_else(|| {
+                    self.live.get(&address).and_then(|r| {
+                        r.pointer("/labels/herdr.space")
+                            .or_else(|| r.pointer("/labels/herdr.owner_space"))
+                            .and_then(Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                    })
+                })
+        } else {
+            None
+        };
         let (keep, parked, labels) = match &change {
-            TerminalChange::Keep { space, tab, .. } => (true, "", json!({
-                "herdr.space":crate::mirror::local(space, machine), "herdr.tab":crate::mirror::local(tab, machine), "herdr.parked":"",
-            })),
-            TerminalChange::Park => (false, "1", json!({"herdr.space":"","herdr.tab":"","herdr.parked":"1"})),
+            TerminalChange::Keep { space, tab, .. } => {
+                let local_sp = crate::mirror::local(space, machine);
+                (true, "", json!({
+                    "herdr.space": local_sp,
+                    "herdr.owner_space": local_sp,
+                    "herdr.tab": crate::mirror::local(tab, machine),
+                    "herdr.parked": "",
+                }))
+            }
+            TerminalChange::Park => {
+                let mut l = json!({"herdr.space":"","herdr.tab":"","herdr.parked":"1"});
+                if let Some(ref owner) = owner_for_park {
+                    l["herdr.owner_space"] = json!(owner);
+                }
+                (false, "1", l)
+            }
         };
         if let Some(labels_obj) = self.live.get_mut(&address).and_then(|r| r.get_mut("labels")).and_then(Value::as_object_mut) {
             labels_obj.insert("herdr.parked".into(), json!(parked));
+            if let TerminalChange::Keep { space, .. } = &change {
+                labels_obj.insert("herdr.owner_space".into(), json!(crate::mirror::local(space, machine)));
+            } else if let Some(ref owner) = owner_for_park {
+                labels_obj.insert("herdr.owner_space".into(), json!(owner));
+            }
         }
         let (tx, rx) = std::sync::mpsc::channel();
         self.changing_terminals.insert(address.clone());
@@ -5569,20 +6398,41 @@ impl AppWindow {
     }
 
     /// Moves mounted ACP or CLI agents back to the background without killing or trashing them:
-    /// clears `herdr.space`/`herdr.tab` labels, marks `herdr.parked`, and turns off `keep`.
-    fn park_agent_addresses(&mut self, addresses: &[String], cx: &mut Context<Self>) {
+    /// clears `herdr.space`/`herdr.tab` mount labels, preserves `herdr.owner_space`, marks `herdr.parked`, and turns off `keep`.
+    fn park_agent_addresses(&mut self, addresses: &[String], source_space: Option<&str>, cx: &mut Context<Self>) {
         for addr in addresses {
             self.ended_acp.remove(addr);
         }
-        let targets: Vec<(String, bool)> = addresses
+        let targets: Vec<(String, bool, Option<String>)> = addresses
             .iter()
             .filter(|a| self.live.contains_key(*a) && (is_acp_addr(a) || self.is_agent_pty(a)))
-            .map(|a| (a.clone(), is_acp_addr(a)))
+            .map(|a| {
+                let machine = a.split_once('/').map(|(m, _)| m);
+                let owner = source_space
+                    .filter(|s| !s.is_empty())
+                    .map(|s| crate::mirror::local(s, machine).to_owned())
+                    .or_else(|| {
+                        self.model
+                            .any_pane_of(a)
+                            .and_then(|p| self.model.space_of(&p))
+                            .map(|s| crate::mirror::local(&s.id, machine).to_owned())
+                    })
+                    .or_else(|| {
+                        self.live.get(a).and_then(|r| {
+                            r.pointer("/labels/herdr.space")
+                                .or_else(|| r.pointer("/labels/herdr.owner_space"))
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                                .map(str::to_owned)
+                        })
+                    });
+                (a.clone(), is_acp_addr(a), owner)
+            })
             .collect();
         if targets.is_empty() {
             return;
         }
-        for (addr, _) in &targets {
+        for (addr, _, owner) in &targets {
             if self.peeked_agent.as_deref() == Some(addr.as_str()) {
                 self.peeked_agent = None;
             }
@@ -5593,6 +6443,9 @@ impl AppWindow {
                     labels.insert("herdr.space".into(), json!(""));
                     labels.insert("herdr.tab".into(), json!(""));
                     labels.insert("herdr.parked".into(), json!("1"));
+                    if let Some(owner_sp) = owner {
+                        labels.insert("herdr.owner_space".into(), json!(owner_sp));
+                    }
                 }
             }
         }
@@ -5601,11 +6454,14 @@ impl AppWindow {
         }
         let core = self.core.clone();
         cx.spawn(async move |_, cx| {
-            for (addr, is_acp) in targets {
+            for (addr, is_acp, owner) in targets {
                 let core = core.clone();
                 cx.background_executor()
                     .spawn(async move {
-                        let labels = json!({ "herdr.space": "", "herdr.tab": "", "herdr.parked": "1" });
+                        let mut labels = json!({ "herdr.space": "", "herdr.tab": "", "herdr.parked": "1" });
+                        if let Some(owner_sp) = owner {
+                            labels["herdr.owner_space"] = json!(owner_sp);
+                        }
                         if is_acp {
                             if let Err(e) = core.call("agent.label", json!({ "agent": addr, "labels": labels })) {
                                 tracing::warn!("park agent label {addr}: {e:#}");
@@ -5680,13 +6536,14 @@ impl AppWindow {
             let raw_sp = rec
                 .pointer("/labels/herdr.trash_space")
                 .or_else(|| rec.pointer("/labels/herdr.space"))
+                .or_else(|| rec.pointer("/labels/herdr.owner_space"))
                 .and_then(Value::as_str)
                 .filter(|s| !s.is_empty())
                 .map(|s| crate::mirror::qualify(s, machine.as_deref()));
             let matched = raw_sp
                 .as_deref()
                 .and_then(|sid| self.model.space(sid))
-                .or_else(|| self.model.spaces.iter().find(|pr| self.acp_matches_space(addr, rec, pr)));
+                .or_else(|| self.resolve_agent_space(addr, rec));
             let sid = matched.map(|s| s.id.clone()).or(raw_sp);
             let sname = matched
                 .map(|s| self.model.space_name(s, &home_dir))
@@ -5941,6 +6798,7 @@ impl AppWindow {
             let labels = obj.entry("labels").or_insert_with(|| json!({}));
             if let Some(labels) = labels.as_object_mut() {
                 labels.insert("herdr.space".into(), json!(local_sp));
+                labels.insert("herdr.owner_space".into(), json!(local_sp));
                 labels.insert("herdr.tab".into(), json!(local_tb));
                 labels.insert("herdr.parked".into(), json!(""));
                 labels.insert("herdr.trashed".into(), json!(""));
@@ -5952,6 +6810,7 @@ impl AppWindow {
         let address = addr.to_owned();
         let labels = json!({
             "herdr.space": local_sp,
+            "herdr.owner_space": local_sp,
             "herdr.tab": local_tb,
             "herdr.parked": "",
             "herdr.trashed": "",
@@ -5982,6 +6841,7 @@ impl AppWindow {
             "qwen-code" => "qwen",
             "kiro-cli" => "kiro",
             "antigravity-cli" | "agy" => "antigravity",
+            "zcode-cli" => "zcode",
             "oh-my-pi" => "omp",
             other => other,
         }
@@ -6050,16 +6910,9 @@ impl AppWindow {
             .filter(|s| !s.is_empty())
             .map(str::to_owned);
         let is_acp = entry.get("acp").and_then(Value::as_bool) == Some(true) || is_acp_addr(addr);
-        let tab_name = if is_acp {
-            custom_name
-                .clone()
-                .or_else(|| entry.get("name").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned))
-                .or_else(|| entry.get("tab_name").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned))
-                .or_else(|| entry.get("title").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned))
-                .unwrap_or_else(|| addr.to_owned())
-        } else {
-            custom_name.clone().unwrap_or_default()
-        };
+        // Only preserve an explicit user custom name on the restored tab; otherwise keep
+        // the tab unnamed so both tab bar and sidebar follow live/semantic titles.
+        let tab_name = custom_name.clone().unwrap_or_default();
         let cwd = wt_path.clone().or_else(|| {
             entry
                 .get("cwd")
@@ -6161,7 +7014,7 @@ impl AppWindow {
         if is_acp {
             let is_builtin = matches!(
                 prog_key.as_str(),
-                "claude" | "codex" | "gemini" | "opencode" | "cursor" | "kimi" | "qwen" | "kiro" | "goose"
+                "claude" | "codex" | "gemini" | "opencode" | "cursor" | "kimi" | "qwen" | "kiro" | "goose" | "zcode"
             );
             let mut params = json!({ "keep": true });
             if is_builtin {
@@ -6186,7 +7039,9 @@ impl AppWindow {
             let mut labels = serde_json::Map::new();
             labels.insert("herdr.parked".into(), json!(""));
             if let Some(ref sp) = target_space {
-                labels.insert("herdr.space".into(), json!(crate::mirror::local(sp, on)));
+                let local_sp = crate::mirror::local(sp, on);
+                labels.insert("herdr.space".into(), json!(local_sp));
+                labels.insert("herdr.owner_space".into(), json!(local_sp));
             }
             if let Some(ref cname) = custom_name {
                 labels.insert("herdr.name".into(), json!(cname));
@@ -6707,19 +7562,19 @@ impl AppWindow {
                 // Closing a tab NEVER kills or trashes any agent (ACP or CLI, including worktree forks):
                 // agents are parked cleanly in the background; only plain shells end with their tab.
                 // Closing the last tab keeps its space alive with a fresh tab if it held an agent.
+                let space_id = p.id.clone();
                 if p.tabs.len() == 1 {
                     if agent_addrs.is_empty() {
-                        let mut args = json!({ "id": p.id });
+                        let mut args = json!({ "id": space_id });
                         args["confirmed"] = a.get("confirmed").cloned().unwrap_or(Value::Null);
                         return self.dispatch("space.close", &args, person, window, cx);
                     }
-                    let space_id = p.id.clone();
-                    let _ = self.new_tab(Some(space_id), "", None, None, None, None, true, window);
+                    let _ = self.new_tab(Some(space_id.clone()), "", None, None, None, None, true, window);
                     let _ = self.model.remove_tab(&id);
                     if !shell_ptys.is_empty() {
                         self.kill(&shell_ptys, cx);
                     }
-                    self.park_agent_addresses(&agent_addrs, cx);
+                    self.park_agent_addresses(&agent_addrs, Some(&space_id), cx);
                 } else {
                     let (addrs, _) = self.model.remove_tab(&id);
                     let (removed_agents, removed_shells): (Vec<String>, Vec<String>) = addrs
@@ -6728,14 +7583,24 @@ impl AppWindow {
                     if !removed_shells.is_empty() {
                         self.kill(&removed_shells, cx);
                     }
-                    self.park_agent_addresses(&removed_agents, cx);
+                    self.park_agent_addresses(&removed_agents, Some(&space_id), cx);
                 }
             }
             "tab.rename" => {
                 let Some(id) = Self::owned(a, "id").or(active_ctx) else { return self.fail("no tab to rename") };
                 let Some(name) = Self::arg(a, "name") else { return self.fail("tab.rename needs name (empty: its number)") };
+                let trimmed = name.trim().to_owned();
+                let single_pane_addr = self.model.tab(&id).and_then(|c| {
+                    let panes = c.root.panes();
+                    (panes.len() == 1).then(|| self.model.any_address_of(&panes[0].id)).flatten()
+                });
                 let Some(c) = self.model.tab_mut(&id) else { return self.fail(format!("no tab {id:?}")) };
-                c.name = name.trim().to_owned();
+                c.name = trimmed.clone();
+                if let Some(addr) = single_pane_addr
+                    && (self.live.contains_key(&addr) || self.ended_acp.contains_key(&addr))
+                {
+                    self.apply_agent_custom_name(&addr, &trimmed, cx);
+                }
             }
             "tab.move" => {
                 let Some(id) = Self::owned(a, "id").or(active_ctx) else { return self.fail("no tab") };
@@ -6834,11 +7699,12 @@ impl AppWindow {
                     }
                     return self.dispatch("tab.close", &args, person, window, cx);
                 }
+                let space_id = self.model.space_of(&pane).map(|s| s.id.clone());
                 let addr = self.model.any_address_of(&pane);
                 self.model.remove_pane(&pane);
                 if let Some(addr) = addr {
                     if is_acp_addr(&addr) || self.is_agent_pty(&addr) {
-                        self.park_agent_addresses(&[addr], cx);
+                        self.park_agent_addresses(&[addr], space_id.as_deref(), cx);
                     } else {
                         self.kill(&[addr], cx);
                     }
@@ -7246,17 +8112,6 @@ impl AppWindow {
                     return self.fail("agent.rename needs name (empty: automatic)");
                 };
                 let trimmed = raw.trim().to_owned();
-                for map in [&mut self.live, &mut self.ended_acp] {
-                    if let Some(obj) = map.get_mut(&t).and_then(Value::as_object_mut)
-                        && let Some(labels) = obj.entry("labels").or_insert_with(|| json!({})).as_object_mut()
-                    {
-                        if trimmed.is_empty() {
-                            labels.remove("herdr.name");
-                        } else {
-                            labels.insert("herdr.name".into(), json!(trimmed));
-                        }
-                    }
-                }
                 if let Some(pane) = self.model.any_pane_of(&t)
                     && let Some(tab_id) = self.model.tab_of(&pane).map(|c| c.id.clone())
                     && self.model.tab(&tab_id).is_some_and(|c| c.root.panes().len() == 1)
@@ -7268,8 +8123,7 @@ impl AppWindow {
                         c.name = trimmed.clone();
                     }
                 }
-                mods::publish_terminals(self.ordered_live_values());
-                Self::write_core_label(self.core.clone(), t, "herdr.name", trimmed, cx);
+                self.apply_agent_custom_name(&t, &trimmed, cx);
             }
             "agent.trash" => {
                 let t = Self::owned(a, "terminal")
@@ -7428,7 +8282,14 @@ impl AppWindow {
                 }
                 let is_merge = into.is_some();
                 let kind = kind_arg.unwrap_or_else(|| if is_merge { "merge-back".into() } else { "handoff".into() });
-                let rpc_kind = if kind == "merge-back" { "handoff" } else { kind.as_str() };
+                let is_send_context = kind.eq_ignore_ascii_case("send-context") || kind.eq_ignore_ascii_case("send_context");
+                let rpc_kind = if kind == "merge-back" {
+                    "handoff"
+                } else if is_send_context {
+                    "send-context"
+                } else {
+                    kind.as_str()
+                };
                 let is_worktree = a.get("worktree").and_then(Value::as_bool) == Some(true);
                 let archive_source = a.get("archive_source").and_then(Value::as_bool).unwrap_or(false);
                 let close_ov = Self::owned(a, "close_overlay").filter(|s| !s.is_empty());
@@ -7443,12 +8304,14 @@ impl AppWindow {
                         "tab".into()
                     }
                 });
+                let language = if settings::get().language == settings::Language::ZhCn { "zh-CN" } else { "en" };
                 let mut params = json!({
                     "source": source,
                     "kind": rpc_kind,
                     "display": crate::terminal::initial_display(window),
-                    "language": if settings::get().language == settings::Language::ZhCn { "zh-CN" } else { "en" },
+                    "language": language,
                 });
+                let into_for_cross = into.clone();
                 if let Some(p) = preset { params["preset"] = json!(p); }
                 if let Some(dst) = into { params["into"] = json!(dst); }
                 if let Some(m) = Self::owned(a, "mode").filter(|s| !s.is_empty()) {
@@ -7458,26 +8321,81 @@ impl AppWindow {
                     params["mode"] = json!(m);
                 }
                 if let Some(prompt) = Self::owned(a, "prompt").filter(|s| !s.is_empty()) { params["prompt"] = json!(prompt); }
+                if let Some(note) = Self::owned(a, "note").filter(|s| !s.is_empty()) { params["note"] = json!(note); }
                 if let Some(rt) = a.get("recent_turns").and_then(Value::as_u64) { params["recent_turns"] = json!(rt); }
                 if let Some(ft) = a.get("from_turn").and_then(Value::as_u64) { params["from_turn"] = json!(ft); }
                 if let Some(tt) = a.get("to_turn").and_then(Value::as_u64) { params["to_turn"] = json!(tt); }
                 if let Some(mb) = a.get("max_bytes").and_then(Value::as_u64) { params["max_bytes"] = json!(mb); }
+                if a.get("raw").and_then(Value::as_bool) == Some(true) { params["raw"] = json!(true); }
                 if let Some(model) = Self::owned(a, "model").filter(|s| !s.is_empty()) { params["model"] = json!(model); }
                 if let Some(effort) = Self::owned(a, "effort").filter(|s| !s.is_empty()) { params["effort"] = json!(effort); }
                 if a.get("worktree").and_then(Value::as_bool) == Some(true) { params["worktree"] = json!(true); }
                 let explicit_merge_wt = a.get("merge_worktree").and_then(Value::as_bool);
-                if explicit_merge_wt == Some(true) || (is_merge && explicit_merge_wt.is_none() && self.fork_worktree_info(&source).is_some()) {
+                if !is_send_context
+                    && (explicit_merge_wt == Some(true)
+                        || (is_merge && explicit_merge_wt.is_none() && self.fork_worktree_info(&source).is_some()))
+                {
                     params["merge_worktree"] = json!(true);
                 }
 
                 let core = self.core.clone();
                 let generation = self.core_generation;
                 let source_for_ui = source.clone();
+                let source_for_cross = source.clone();
+                let rpc_kind_owned = rpc_kind.to_string();
+                let language_owned = language.to_string();
                 cx.spawn_in(window, async move |this, cx| {
                     let res = cx
                         .background_executor()
                         .spawn(async move {
-                            let out = core.call_timeout("agent.handoff", params, Duration::from_secs(30))?;
+                            let cross_machine_into = into_for_cross.as_deref().and_then(|dst| {
+                                let src_m = source_for_cross.split_once('/').map(|(m, _)| m).unwrap_or("");
+                                let dst_m = dst.split_once('/').map(|(m, _)| m).unwrap_or("");
+                                (src_m != dst_m).then_some(dst.to_string())
+                            });
+                            let out = if let Some(dst) = cross_machine_into {
+                                let mut pkg_params = params.clone();
+                                if let Some(obj) = pkg_params.as_object_mut() {
+                                    obj.remove("into");
+                                    obj.remove("prompt");
+                                    obj.insert("package_only".into(), json!(true));
+                                }
+                                let pkg_out = core.call_timeout("agent.handoff", pkg_params, Duration::from_secs(30))?;
+                                let markdown = pkg_out
+                                    .get("markdown")
+                                    .and_then(Value::as_str)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                let turns_label = pkg_out
+                                    .get("included_turns")
+                                    .and_then(Value::as_array)
+                                    .map(|arr| {
+                                        let nums: Vec<u64> = arr.iter().filter_map(Value::as_u64).collect();
+                                        match (nums.first(), nums.last()) {
+                                            (Some(a), Some(b)) if a == b => a.to_string(),
+                                            (Some(a), Some(b)) => format!("{a}-{b}"),
+                                            _ => String::new(),
+                                        }
+                                    })
+                                    .filter(|s| !s.is_empty());
+                                let mut deliver_params = json!({
+                                    "source": dst,
+                                    "into": dst,
+                                    "kind": rpc_kind_owned,
+                                    "language": language_owned,
+                                    "inline_markdown": markdown,
+                                    "inline_source": source_for_cross,
+                                });
+                                if let Some(tl) = turns_label {
+                                    deliver_params["inline_turns"] = json!(tl);
+                                }
+                                if let Some(prompt_v) = params.get("prompt") {
+                                    deliver_params["prompt"] = prompt_v.clone();
+                                }
+                                core.call_timeout("agent.handoff", deliver_params, Duration::from_secs(30))?
+                            } else {
+                                core.call_timeout("agent.handoff", params, Duration::from_secs(30))?
+                            };
                             let target = out.get("target").and_then(Value::as_str).unwrap_or_default().to_owned();
                             let target_kind = out.get("target_kind").and_then(Value::as_str).unwrap_or("agent").to_owned();
                             let fetched = if target.is_empty() {
@@ -7587,6 +8505,12 @@ impl AppWindow {
                                             } else {
                                                 format!("Notified {target} to merge Worktree")
                                             }
+                                        } else if is_send_context {
+                                            if is_zh {
+                                                format!("已发送上下文至 {target}")
+                                            } else {
+                                                format!("Sent context to {target}")
+                                            }
                                         } else if is_zh {
                                             format!("已合回上下文至 {target}")
                                         } else {
@@ -7605,6 +8529,12 @@ impl AppWindow {
                                             } else {
                                                 format!("Merged context and {} worktree file(s) from {source_for_ui} into {target}.", merged_files.len())
                                             }
+                                        } else if is_send_context {
+                                            if is_zh {
+                                                format!("已将 {source_for_ui} 的近期会话上下文发送给 {target}。")
+                                            } else {
+                                                format!("Sent recent context from {source_for_ui} to {target}.")
+                                            }
                                         } else if is_zh {
                                             format!("{source_for_ui} 的接力上下文已注入 {target}，正在继续处理。")
                                         } else {
@@ -7620,13 +8550,15 @@ impl AppWindow {
                                         if let Some(ref ov_id) = close_ov {
                                             this.close_overlay(ov_id, window, cx);
                                         }
-                                        // Also close any floating side-chat window or hide the right side-chat panel for `source_for_ui`.
-                                        let side_ov_id = format!("side-chat:{source_for_ui}");
-                                        if this.overlays.iter().any(|o| o.id == side_ov_id) {
-                                            this.close_overlay(&side_ov_id, window, cx);
-                                        }
-                                        if mods::shared("side-chat.active").and_then(|v| v.as_str().map(str::to_owned)).as_deref() == Some(source_for_ui.as_str()) {
-                                            this.dispatch("layout.hide", &json!({ "id": "panel" }), false, window, cx);
+                                        // Only close side-chat windows/panels when merging back, not on peer send-context.
+                                        if !is_send_context {
+                                            let side_ov_id = format!("side-chat:{source_for_ui}");
+                                            if this.overlays.iter().any(|o| o.id == side_ov_id) {
+                                                this.close_overlay(&side_ov_id, window, cx);
+                                            }
+                                            if mods::shared("side-chat.active").and_then(|v| v.as_str().map(str::to_owned)).as_deref() == Some(source_for_ui.as_str()) {
+                                                this.dispatch("layout.hide", &json!({ "id": "panel" }), false, window, cx);
+                                            }
                                         }
                                         if open != "none" {
                                             if this.peeked_agent.as_deref() == Some(source_for_ui.as_str()) && target != source_for_ui {
@@ -8083,18 +9015,23 @@ impl AppWindow {
                 }
             }
             "prompt.polish" => {
-                for o in self.overlays.iter().rev() {
-                    if let Some(copy) = self.copies.get(&o.slot)
-                        && matches!(copy.inst.name.as_str(), "flash-note" | "prompt" | "peek")
-                    {
-                        mods::send_command_to(copy.id, "polish");
-                        return;
+                let explicit_addr = Self::owned(a, "terminal").filter(|s| !s.is_empty());
+                if explicit_addr.is_none() {
+                    for o in self.overlays.iter().rev() {
+                        if let Some(copy) = self.copies.get(&o.slot)
+                            && matches!(copy.inst.name.as_str(), "flash-note" | "prompt" | "peek")
+                        {
+                            mods::send_command_to(copy.id, "polish");
+                            return;
+                        }
                     }
                 }
-                let active_addr = self
-                    .focused_pane
-                    .as_deref()
-                    .and_then(|p| self.model.any_address_of(p))
+                let active_addr = explicit_addr
+                    .or_else(|| {
+                        self.focused_pane
+                            .as_deref()
+                            .and_then(|p| self.model.any_address_of(p))
+                    })
                     .or_else(|| self.model.focused_pane().and_then(|p| self.model.any_address_of(&p)))
                     .or_else(|| self.focused_terminal(window, cx).map(|t| t.address.clone()));
                 if let Some(addr) = active_addr {
@@ -8111,37 +9048,60 @@ impl AppWindow {
                         }
                     }
                     if self.live.contains_key(&addr) {
-                        let live = self.live.get(&addr);
-                        let agent_name = live
-                            .and_then(|r| {
-                                r.get("labels").and_then(|l| l.get("herdr.name")).and_then(Value::as_str)
-                                    .or_else(|| r.get("name").and_then(Value::as_str))
-                                    .or_else(|| r.get("title").and_then(Value::as_str))
-                            })
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or(&addr)
-                            .to_owned();
-                        let cwd = live.and_then(|r| r.get("cwd")).and_then(Value::as_str).unwrap_or("").to_owned();
-                        let spec = json!({
-                            "mod": "prompt",
-                            "kind": "modal",
-                            "width": 580,
-                            "height": 390,
-                            "props": {
-                                "mode": "polish",
-                                "terminal": addr,
-                                "agentName": agent_name,
-                                "agentKind": "cli",
-                                "cwd": cwd,
-                            }
-                        });
-                        self.open_overlay("prompt-polish".into(), spec, window, cx);
+                        self.polish_cli_terminal_in_place(addr, window, cx);
                         return;
                     }
                 }
                 if !mods::send_command("peek", "polish") {
                     return self.fail("no active agent or terminal to polish prompt for");
                 }
+                return;
+            }
+            "prompt.polish_undo" => {
+                let explicit_addr = Self::owned(a, "terminal").filter(|s| !s.is_empty());
+                if explicit_addr.is_none() {
+                    for o in self.overlays.iter().rev() {
+                        if let Some(copy) = self.copies.get(&o.slot)
+                            && matches!(copy.inst.name.as_str(), "flash-note" | "prompt" | "peek")
+                        {
+                            mods::send_command_to(copy.id, "polish_undo");
+                            return;
+                        }
+                    }
+                }
+                let active_addr = explicit_addr
+                    .or_else(|| {
+                        self.focused_pane
+                            .as_deref()
+                            .and_then(|p| self.model.any_address_of(p))
+                    })
+                    .or_else(|| self.model.focused_pane().and_then(|p| self.model.any_address_of(&p)))
+                    .or_else(|| self.focused_terminal(window, cx).map(|t| t.address.clone()));
+                if let Some(addr) = active_addr {
+                    if is_acp_addr(&addr) || self.is_structured_terminal(&addr) {
+                        if let Some(copy) = self.copies.values().find(|c| {
+                            c.inst.name == "peek"
+                                && c.inst.props.get("terminal").and_then(Value::as_str) == Some(addr.as_str())
+                        }) {
+                            mods::send_command_to(copy.id, "polish_undo");
+                            return;
+                        }
+                        if mods::send_command("peek", "polish_undo") {
+                            return;
+                        }
+                    }
+                    if self.live.contains_key(&addr) {
+                        self.undo_cli_polish_in_place(addr, window, cx);
+                        return;
+                    }
+                }
+                if !mods::send_command("peek", "polish_undo") {
+                    return self.fail("no active agent or terminal to undo prompt polish for");
+                }
+                return;
+            }
+            "prompt.polish_cancel" => {
+                self.cancel_polish(window, cx);
                 return;
             }
             "overlay.close" => {
@@ -8192,6 +9152,58 @@ impl AppWindow {
                 return;
             }
             "app.reset" => self.reset(window, cx),
+            "app.reload_mods" => {
+                self.folders = mods::scan().into_iter().map(|f| (f.id.clone(), f)).collect();
+                self.reload_config(window, cx);
+                self.apply_look(window, cx);
+                self.restart_mods(window, cx);
+                return;
+            }
+            "app.restart" => {
+                let deadline = std::time::Instant::now() + Duration::from_millis(250);
+                self.drain_documents(window, cx);
+                self.close_mods_now(deadline, window, cx);
+                crate::place::save(window, cx);
+                mods::finish_shared();
+                if crate::update::relaunch_current() {
+                    cx.quit();
+                } else {
+                    self.fail("cannot relaunch herdr2 executable");
+                }
+                return;
+            }
+            "app.check_updates" => {
+                crate::update::check_now();
+                return;
+            }
+            "app.apply_ui_update" => {
+                self.apply_ui_bundle_live(window, cx);
+                return;
+            }
+            "app.update" => {
+                let deadline = std::time::Instant::now() + Duration::from_millis(250);
+                self.drain_documents(window, cx);
+                self.close_mods_now(deadline, window, cx);
+                crate::place::save(window, cx);
+                mods::finish_shared();
+                match crate::update::apply() {
+                    Ok(true) => {
+                        crate::update::relaunch();
+                        cx.quit();
+                    }
+                    Ok(false) => {
+                        self.fail("no staged app update ready");
+                    }
+                    Err(e) => {
+                        self.fail(format!("cannot apply update: {e}"));
+                    }
+                }
+                return;
+            }
+            "app.update_core" => {
+                crate::update::update_core();
+                return;
+            }
             "app.theme" => {
                 let name = Self::arg(a, "name").unwrap_or_default().to_owned();
                 if !settings::theme_exists(&name) {
@@ -8350,6 +9362,7 @@ impl AppWindow {
         let kind = match spec.get("kind").and_then(Value::as_str) {
             Some("popup") => OverlayKind::Popup,
             Some("toast") => OverlayKind::Toast,
+            Some("float") => OverlayKind::Float,
             Some("window") => OverlayKind::Window,
             _ => OverlayKind::Dialog,
         };
@@ -8382,7 +9395,7 @@ impl AppWindow {
         let resizable = kind == OverlayKind::Window && spec.get("resizable").and_then(Value::as_bool).unwrap_or(false);
         let min_size = size(num("min_width", 320.0), num("min_height", 240.0));
         let mut size = match kind {
-            OverlayKind::Toast => size(340.0, num("height", 72.0)),
+            OverlayKind::Toast => size(num("width", 340.0), num("height", 72.0)),
             // No size: as big as its content (0 = unset).
             OverlayKind::Window => size(num("width", 0.0), num("height", 0.0)),
             // No height: as tall as the content, up to most of the window.
@@ -8398,9 +9411,11 @@ impl AppWindow {
             _ => self.pointer,
         };
         let top = (spec.get("at").and_then(Value::as_str) == Some("top")).then(|| num("offset", 0.0));
+        let bottom = (spec.get("at").and_then(Value::as_str) == Some("bottom")).then(|| num("offset", 20.0));
         let fit = !resizable
             && layout.is_none()
-            && (kind == OverlayKind::Popup || (matches!(kind, OverlayKind::Dialog | OverlayKind::Window) && spec.get("height").is_none()));
+            && (matches!(kind, OverlayKind::Popup | OverlayKind::Float)
+                || (matches!(kind, OverlayKind::Dialog | OverlayKind::Window) && spec.get("height").is_none()));
         if kind == OverlayKind::Window && place.is_none() && spec.get("at").is_some_and(|v| v.get("x").is_some()) {
             place = Some(at);
         }
@@ -8436,6 +9451,7 @@ impl AppWindow {
             focus,
             layout,
             top,
+            bottom,
             fit,
             modal: spec.get("modal").and_then(Value::as_bool).unwrap_or(false),
             bare: spec.get("frame").and_then(Value::as_str) == Some("none"),
@@ -8782,6 +9798,13 @@ impl AppWindow {
             Request::SetWindowTitle(title) => window.set_window_title(title.as_deref().unwrap_or("Herdr2")),
             Request::SetBadge(text) => crate::badge::set(text.as_deref()),
             Request::Refresh => self.refresh_mods(cx),
+            Request::ReloadMods => {
+                self.folders = mods::scan().into_iter().map(|f| (f.id.clone(), f)).collect();
+                self.reload_config(window, cx);
+                self.apply_look(window, cx);
+                self.restart_mods(window, cx);
+            }
+            Request::ApplyUiBundle => self.apply_ui_bundle_live(window, cx),
             Request::Control { cmd, reply } => {
                 let _ = reply.send(self.control(cmd, window, cx));
             }
@@ -8827,6 +9850,8 @@ impl AppWindow {
                     Some(_) => Some("layout".to_owned()),
                     None => self.copies.get(&o.slot).map(|c| c.inst.name.clone()),
                 }).collect::<Vec<_>>(),
+                "dev_defaults": mods::dev_defaults_dir().map(|p| p.display().to_string()),
+                "ui_bundle": crate::ui_update::info(),
                 "errors": errors,
             });
         }
@@ -9655,6 +10680,17 @@ impl AppWindow {
                     out.push(div().absolute().right(settings::z(16.0)).bottom(settings::z(toast_y)).child(body).into_any_element());
                     toast_y += o.size.height + 8.0;
                 }
+                OverlayKind::Float => {
+                    let left_x = ((viewport.width - w) / 2.0).max(settings::z(16.0));
+                    let positioned = if let Some(off) = o.bottom {
+                        div().absolute().left(left_x).bottom(settings::z(off)).child(body)
+                    } else if let Some(off) = o.top {
+                        div().absolute().left(left_x).top(settings::z(off)).child(body)
+                    } else {
+                        div().absolute().left(o.at.x).top(o.at.y).child(body)
+                    };
+                    out.push(positioned.into_any_element());
+                }
             }
         }
         out.extend(pill);
@@ -9665,13 +10701,150 @@ impl AppWindow {
 const UPDATE_PILL_HEIGHT: f32 = 34.0;
 
 impl AppWindow {
-    /// Original Herdr update banner and pill are disabled.
+    /// Applies a staged OTA UI bundle live without restarting the window,
+    /// rolling back automatically if any loaded mod errors out.
+    fn apply_ui_bundle_live(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let app_dir = mods::app_dir();
+        let zh = self.person.language == settings::Language::ZhCn;
+        crate::ui_update::set_applying(true);
+        let applied = match crate::ui_update::apply_staged(&app_dir) {
+            Ok(applied) => applied,
+            Err(err) => {
+                crate::ui_update::set_error(Some(err.clone()));
+                self.fail(err);
+                return;
+            }
+        };
+        for sub in ["mods", "frame", "icons"] {
+            for path in changed_asset_paths(&app_dir, &[std::path::PathBuf::from(sub)]) {
+                invalidate_asset(&path, window, cx);
+            }
+        }
+        self.folders = mods::scan().into_iter().map(|f| (f.id.clone(), f)).collect();
+        self.reload_config(window, cx);
+        self.apply_look(window, cx);
+        let restarted = self.restart_mods(window, cx);
+        let first_err = self.copies.values().find_map(|c| c.error.as_ref().map(|e| format!("{}: {e}", c.inst.name)));
+        if !restarted || first_err.is_some() {
+            let reason = first_err.unwrap_or_else(|| "script runtime restart failed".into());
+            tracing::warn!("ui_update: rolling back {} after reload failure: {reason}", applied.version);
+            let _ = crate::ui_update::rollback(&app_dir, &applied.version, &reason);
+            self.folders = mods::scan().into_iter().map(|f| (f.id.clone(), f)).collect();
+            self.reload_config(window, cx);
+            self.apply_look(window, cx);
+            self.restart_mods(window, cx);
+            let note = json!({
+                "title": if zh { "UI 热更新失败，已自动回滚" } else { "UI hot-update rolled back" },
+                "body": format!("v{}: {reason}", applied.version),
+                "level": "error",
+                "timeout": 8000,
+            });
+            self.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": note }), window, cx);
+            return;
+        }
+        crate::ui_update::commit_applied(&app_dir);
+        self.update_ready = Self::update_label();
+        self.update_status = crate::update::status().to_string();
+        let body = applied.notes.unwrap_or_else(|| {
+            if zh {
+                "无需重启，当前终端与会话均保持运行。".into()
+            } else {
+                "Applied live without restarting; your terminals stayed running.".into()
+            }
+        });
+        let note = json!({
+            "title": if zh { format!("UI 已热更新至 v{}", applied.version) } else { format!("UI updated live to v{}", applied.version) },
+            "body": body,
+            "level": "info",
+            "timeout": 5000,
+        });
+        self.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": note }), window, cx);
+        cx.notify();
+    }
+
     fn update_label() -> Option<String> {
+        if let Some(ver) = crate::update::ready() {
+            return Some(format!("app:{ver}"));
+        }
+        if let Some(ver) = crate::ui_update::ready() {
+            return Some(format!("ui:{ver}"));
+        }
+        let core = crate::update::core();
+        if core.managed.is_none() && !core.updating && let Some(ver) = core.ready {
+            return Some(format!("core:{ver}"));
+        }
         None
     }
 
-    fn render_update_pill(&self, _cx: &mut Context<Self>) -> Option<AnyElement> {
-        None
+    fn render_update_pill(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let key = self.update_ready.as_ref()?;
+        if self.update_dismissed.as_deref() == Some(key.as_str()) {
+            return None;
+        }
+        let zh = self.person.language == settings::Language::ZhCn;
+        let (label, action): (String, &'static str) = if let Some(ver) = key.strip_prefix("app:") {
+            (
+                if zh { format!("重启更新 v{ver}") } else { format!("Restart to update v{ver}") },
+                "app.update",
+            )
+        } else if let Some(ver) = key.strip_prefix("ui:") {
+            (
+                if zh { format!("热更新 UI v{ver}（免重启）") } else { format!("Hot-update UI v{ver}") },
+                "app.apply_ui_update",
+            )
+        } else if let Some(ver) = key.strip_prefix("core:") {
+            (
+                if zh { format!("更新 Core v{ver}") } else { format!("Update Core v{ver}") },
+                "app.update_core",
+            )
+        } else {
+            return None;
+        };
+        let dismiss_key = key.clone();
+        Some(
+            div()
+                .absolute()
+                .right(settings::z(16.0))
+                .bottom(settings::z(16.0))
+                .h(settings::z(UPDATE_PILL_HEIGHT))
+                .px(settings::z(12.0))
+                .rounded(settings::z(17.0))
+                .bg(c("accent"))
+                .text_color(c("accent_foreground"))
+                .shadow_lg()
+                .flex()
+                .items_center()
+                .gap(settings::z(8.0))
+                .occlude()
+                .child(
+                    div()
+                        .id("update-pill-action")
+                        .cursor_pointer()
+                        .text_size(settings::z(12.5))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(label)
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.run(action, Value::Null, window, cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .id("update-pill-dismiss")
+                        .cursor_pointer()
+                        .px(settings::z(4.0))
+                        .text_size(settings::z(12.0))
+                        .opacity(0.8)
+                        .hover(|s| s.opacity(1.0))
+                        .child("×")
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.update_dismissed = Some(dismiss_key.clone());
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
     }
 }
 
@@ -10223,6 +11396,7 @@ impl Render for AppWindow {
             self.publish(cx);
         }
         self.publish_focused_selection(window, cx);
+        self.prune_stale_polish_undo(cx);
         self.tick_floats(window);
         self.apply_titlebar(window);
         self.apply_blur(window);
@@ -10318,7 +11492,10 @@ impl Render for AppWindow {
                     }
                 }
                 if ev.keystroke.key == "escape" {
-                    if this.pane_drag.is_some() {
+                    if this.polish_progress.as_ref().is_some_and(|p| p.stage == PolishStage::Polishing) {
+                        this.cancel_polish(window, cx);
+                        cx.stop_propagation();
+                    } else if this.pane_drag.is_some() {
                         this.cancel_pane_drag(cx);
                         cx.stop_propagation();
                     } else if cx.stop_active_drag(window) {
@@ -10420,7 +11597,11 @@ fn changed_asset_paths(home: &std::path::Path, changed: &[std::path::PathBuf]) -
     const MAX_FILES: usize = 2000;
     let mut paths: std::collections::BTreeSet<_> = changed.iter().cloned().collect();
     let mut seen = std::collections::HashSet::new();
-    let mut pending: Vec<_> = changed.iter().filter(|p| p.starts_with("mods")).cloned().collect();
+    let mut pending: Vec<_> = changed
+        .iter()
+        .filter(|p| p.starts_with("mods") || p.starts_with("frame") || p.starts_with("icons"))
+        .cloned()
+        .collect();
     while let Some(path) = pending.pop() {
         // Do not follow symlinks out of the mod folder (or into a cycle).
         if !seen.insert(path.clone()) || !home.join(&path).symlink_metadata().is_ok_and(|m| m.is_dir()) { continue; }
@@ -10983,6 +12164,15 @@ mod tests {
             cursor,
             vec!["cursor-agent", "--yolo", "--trust", "--model", "gpt-5.4[effort=high]", "audit types"]
         );
+
+        // ZCode rejects `--model` / `--effort` and reads a bare first word as a subcommand, not a message.
+        let zcode = super::build_cli_agent_argv(
+            vec!["zcode".into(), "--mode".into(), "yolo".into()],
+            Some("glm-5.4"),
+            Some("high"),
+            Some("audit types"),
+        );
+        assert_eq!(zcode, vec!["zcode", "--mode", "yolo"]);
     }
 
     #[cfg(unix)]
@@ -12912,6 +14102,7 @@ export default class SystemToast extends View {
             // Dead/exited agent key and shell-wrapped argv normalization.
             assert_eq!(super::AppWindow::normalize_agent_program_key("claude-code"), "claude");
             assert_eq!(super::AppWindow::normalize_agent_program_key("cursor-agent"), "cursor");
+            assert_eq!(super::AppWindow::normalize_agent_program_key("zcode-cli"), "zcode");
             assert_eq!(
                 super::AppWindow::unwrap_shell_agent_argv(vec![
                     "sh".into(),
@@ -13172,5 +14363,211 @@ export default class SystemToast extends View {
             "popup lost its left margin: left = {:?}",
             bounds.left(),
         );
+    }
+
+    #[gpui::test]
+    fn agent_and_tab_renames_sync_names_and_keep_terminal_stays_dynamic(cx: &mut TestAppContext) {
+        use serde_json::{Value, json};
+        if !running_alone("agent_and_tab_renames_sync_names_and_keep_terminal_stays_dynamic") { return; }
+        let (view, cx) = open_window(cx, "unused", "", json!({
+            "id": "context", "type": "block", "content": { "tab": "active" }
+        }));
+        view.update_in(cx, |this, window, cx| {
+            this.documents.entry(String::new()).or_default().available = true;
+            this.model.spaces.clear();
+            let mut tb1 = super::Tab::with_pane("tb1", "", super::AppWindow::acp_pane_node("p1", "a1"));
+            tb1.focus("p1");
+            this.model.add_space("sp1", "Repo", "/tmp/repo", tb1);
+            this.live.insert("a1".into(), json!({
+                "address": "a1",
+                "acp": true,
+                "agent": "claude",
+                "state": "live",
+                "status": "idle",
+                "title": "Claude Code",
+                "semantic_title": "初始任务",
+                "labels": {}
+            }));
+            this.live_order = vec!["a1".into()];
+            this.publish(cx);
+
+            // 1. agent.rename sets herdr.name and tab.name, and survives an in-flight stale listing.
+            assert!(this.run_as("agent.rename", json!({ "terminal": "a1", "name": "自定义名称" }), false, window, cx).get("error").is_none());
+            assert_eq!(this.live["a1"]["labels"]["herdr.name"], json!("自定义名称"));
+            assert_eq!(this.model.tab("tb1").map(|t| t.name.as_str()), Some("自定义名称"));
+            let published = crate::mods::agents().as_array().cloned().unwrap_or_default();
+            assert_eq!(published.iter().find(|v| v["address"] == json!("a1")).unwrap()["custom_name"], json!("自定义名称"));
+
+            // Simulate an in-flight core event arriving before write_core_label finishes.
+            this.terminals_listed(json!({
+                "terminals": [],
+                "agents": [{
+                    "address": "a1",
+                    "agent": "claude",
+                    "state": "live",
+                    "status": { "state": "working" },
+                    "title": "Claude Code",
+                    "semantic_title": "初始任务",
+                    "labels": {}
+                }]
+            }), window, cx);
+            assert_eq!(this.live["a1"]["labels"]["herdr.name"], json!("自定义名称"), "pending rename must not be reverted by stale listing");
+
+            // 2. tab.rename on a single-pane tab syncs herdr.name so sidebar agents list updates too.
+            assert!(this.run_as("tab.rename", json!({ "id": "tb1", "name": "标签改名" }), false, window, cx).get("error").is_none());
+            assert_eq!(this.live["a1"]["labels"]["herdr.name"], json!("标签改名"));
+            let published = crate::mods::agents().as_array().cloned().unwrap_or_default();
+            assert_eq!(published.iter().find(|v| v["address"] == json!("a1")).unwrap()["custom_name"], json!("标签改名"));
+
+            // Clearing tab name also clears herdr.name so automatic semantic_title resumes.
+            assert!(this.run_as("tab.rename", json!({ "id": "tb1", "name": "" }), false, window, cx).get("error").is_none());
+            assert!(this.live["a1"]["labels"].get("herdr.name").is_none());
+            let published = crate::mods::agents().as_array().cloned().unwrap_or_default();
+            assert_eq!(published.iter().find(|v| v["address"] == json!("a1")).unwrap()["custom_name"], Value::Null);
+
+            // 3. Mounting a headless ACP agent without herdr.name leaves its new tab unnamed so semantic_title updates work.
+            this.live.insert("a2".into(), json!({
+                "address": "a2",
+                "acp": true,
+                "agent": "codex",
+                "state": "live",
+                "keep": false,
+                "title": "Old initial title",
+                "cwd": "/tmp/repo",
+                "labels": {}
+            }));
+            let keep_out = this.keep_terminal_with_focus("a2", "tab", false, window, cx).unwrap();
+            let new_tab_id = keep_out["tab"].as_str().unwrap().to_owned();
+            let pending = this.pending_terminals.remove("a2").expect("pending keep for a2");
+            this.apply_terminal_change("a2".into(), pending.change, Ok(()), window, cx);
+            assert_eq!(this.model.tab(&new_tab_id).map(|t| t.name.as_str()), Some(""), "auto-mounted ACP tab must stay unnamed so semantic_title/title can update");
+
+            // 4. Stale auto/program `herdr.name` (e.g. "Antigravity" on t4j) is filtered out of published
+            // `custom_name` so `semantic_title` updates display in real time, and renaming to an auto name clears it.
+            this.model.spaces[0].tabs.push(crate::model::Tab::new("tb-t4j", "", "p-t4j", "wsl/t4j"));
+            this.terminals_listed(json!({
+                "terminals": [{
+                    "address": "wsl/t4j",
+                    "state": "live",
+                    "status": { "app": "antigravity", "state": "working" },
+                    "semantic_title": "修复热更新同步问题",
+                    "labels": { "herdr.name": "Antigravity" }
+                }],
+                "agents": []
+            }), window, cx);
+            let published_t4j = crate::mods::agents().as_array().cloned().unwrap_or_default();
+            let t4j_entry = published_t4j.iter().find(|v| v["address"] == json!("wsl/t4j")).expect("wsl/t4j published");
+            assert_eq!(t4j_entry["custom_name"], Value::Null, "auto program herdr.name must not lock custom_name");
+            assert_eq!(t4j_entry["semantic_title"], json!("修复热更新同步问题"));
+            assert!(this.run_as("agent.rename", json!({ "terminal": "wsl/t4j", "name": "Antigravity" }), false, window, cx).get("error").is_none());
+            assert!(this.live["wsl/t4j"]["labels"].get("herdr.name").is_none(), "renaming to auto program name clears herdr.name");
+        });
+    }
+
+    #[test]
+    fn parked_and_headless_agents_keep_space_ownership_without_cross_space_drift() {
+        in_own_process("agent_space_ownership_never_leaks_across_spaces");
+    }
+
+    #[gpui::test]
+    fn agent_space_ownership_never_leaks_across_spaces(cx: &mut gpui::TestAppContext) {
+        use serde_json::json;
+        if !running_alone("agent_space_ownership_never_leaks_across_spaces") { return; }
+        let (view, cx) = open_window(cx, "unused", "", json!({
+            "id": "context", "type": "block", "content": { "tab": "active" }
+        }));
+        view.update_in(cx, |this, window, cx| {
+            // Reproduce real cross-space collision:
+            // Space 1 ("GameAntimotionSickness") is earlier in `spaces` and inherited stale folder `/home/u/Work/herdr2`
+            // plus one pane still in `herdr2` and one in `GameAntimotionSickness`.
+            // Space 2 ("herdr2") is later in `spaces`, has empty `folder`, and all its panes are in `/home/u/Work/herdr2`.
+            this.model.add_space("wsl/sp-game", "GameAntimotionSickness", "/home/u/Work/herdr2", super::Tab::new("wsl/tb-g1", "1", "wsl/p-g1", "wsl/t-g1"));
+            this.model.space_mut("wsl/sp-game").unwrap().machine = Some("wsl".into());
+            this.model.add_tab("wsl/sp-game", super::Tab::new("wsl/tb-g2", "2", "wsl/p-g2", "wsl/t-g2"));
+
+            this.model.add_space("wsl/sp-herdr2", "herdr2", "", super::Tab::new("wsl/tb-h1", "1", "wsl/p-h1", "wsl/t1"));
+            this.model.space_mut("wsl/sp-herdr2").unwrap().machine = Some("wsl".into());
+            this.model.add_tab("wsl/sp-herdr2", super::Tab::with_pane("wsl/tb-h2", "ZCode", super::AppWindow::acp_pane_node("wsl/p-h2", "wsl/a10")));
+
+            this.cwds.insert("wsl/t-g1".into(), "/home/u/Work/herdr2".into());
+            this.cwds.insert("wsl/t-g2".into(), "/home/u/Work/GameAntimotionSickness".into());
+            this.cwds.insert("wsl/t1".into(), "/home/u/Work/herdr2".into());
+            this.cwds.insert("wsl/a10".into(), "/home/u/Work/herdr2".into());
+
+            this.live.insert("wsl/t-g1".into(), json!({ "address": "wsl/t-g1", "state": "live", "argv": ["zsh"], "cwd": "/home/u/Work/herdr2" }));
+            this.live.insert("wsl/t-g2".into(), json!({ "address": "wsl/t-g2", "state": "live", "argv": ["zsh"], "cwd": "/home/u/Work/GameAntimotionSickness" }));
+            this.live.insert("wsl/t1".into(), json!({ "address": "wsl/t1", "state": "live", "argv": ["zsh"], "cwd": "/home/u/Work/herdr2" }));
+            this.live.insert("wsl/a10".into(), json!({
+                "address": "wsl/a10",
+                "acp": true,
+                "agent": "zcode",
+                "state": "live",
+                "keep": true,
+                "cwd": "/home/u/Work/herdr2",
+                "labels": { "herdr.space": "sp-herdr2", "herdr.tab": "tb-h2" }
+            }));
+            // Already-parked legacy agent without herdr.owner_space, only `where: "herdr2 / 6"`
+            this.live.insert("wsl/a11".into(), json!({
+                "address": "wsl/a11",
+                "acp": true,
+                "agent": "zcode",
+                "state": "live",
+                "keep": false,
+                "cwd": "/home/u/Work/herdr2",
+                "labels": { "herdr.parked": "1", "where": "herdr2 / 6" }
+            }));
+            // Brand-new label-less headless agent in `/home/u/Work/herdr2`
+            this.live.insert("wsl/a12".into(), json!({
+                "address": "wsl/a12",
+                "acp": true,
+                "agent": "zcode",
+                "state": "live",
+                "keep": false,
+                "cwd": "/home/u/Work/herdr2",
+                "labels": {}
+            }));
+            // Parked CLI agent owned by `sp-herdr2`
+            this.live.insert("wsl/t10".into(), json!({
+                "address": "wsl/t10",
+                "state": "live",
+                "keep": false,
+                "argv": ["claude"],
+                "cwd": "/home/u/Work/herdr2",
+                "labels": { "herdr.parked": "1", "herdr.owner_space": "sp-herdr2" }
+            }));
+            this.documents.entry("wsl".into()).or_default().available = true;
+            this.sync(window, cx);
+
+            // 1. Closing a tab in `herdr2` parks `wsl/a10` and persists `herdr.owner_space = "sp-herdr2"`,
+            //    keeping it strictly under `wsl/sp-herdr2` (never hijacked by earlier `wsl/sp-game`).
+            let out = this.run_as("tab.close", json!({ "id": "wsl/tb-h2" }), true, window, cx);
+            assert!(out.get("error").is_none(), "{out}");
+            assert_eq!(this.live["wsl/a10"]["labels"]["herdr.space"], json!(""));
+            assert_eq!(this.live["wsl/a10"]["labels"]["herdr.owner_space"], json!("sp-herdr2"));
+            assert_eq!(this.resolve_agent_space("wsl/a10", &this.live["wsl/a10"]).map(|s| s.id.as_str()), Some("wsl/sp-herdr2"));
+
+            // 2. Legacy parked agent (`where: "herdr2 / 6"`) and label-less headless agent both resolve to `wsl/sp-herdr2`.
+            assert_eq!(this.resolve_agent_space("wsl/a11", &this.live["wsl/a11"]).map(|s| s.id.as_str()), Some("wsl/sp-herdr2"));
+            assert_eq!(this.resolve_agent_space("wsl/a12", &this.live["wsl/a12"]).map(|s| s.id.as_str()), Some("wsl/sp-herdr2"));
+
+            // 3. Published agents snapshot puts all three under `wsl/sp-herdr2`.
+            this.sync(window, cx);
+            let published = crate::mods::agents().as_array().cloned().unwrap_or_default();
+            for addr in ["wsl/a10", "wsl/a11", "wsl/a12"] {
+                let entry = published.iter().find(|v| v["address"] == json!(addr)).expect("agent published");
+                assert_eq!(entry["space"], json!("wsl/sp-herdr2"), "{addr} drifted to wrong space: {entry}");
+            }
+
+            // 4. Reopening a parked CLI agent (`terminal.keep place="tab"`) while viewing `wsl/sp-game`
+            //    must restore it into its own space `wsl/sp-herdr2`, NOT the active space `wsl/sp-game`.
+            this.model.active = Some("wsl/sp-game".into());
+            let keep_res = this.keep_terminal_with_focus("wsl/t10", "tab", true, window, cx);
+            assert!(keep_res.is_ok(), "{keep_res:?}");
+            let pending = this.pending_terminals.get("wsl/t10").expect("pending keep");
+            match &pending.change {
+                super::TerminalChange::Keep { space, .. } => assert_eq!(space, "wsl/sp-herdr2"),
+                super::TerminalChange::Park => panic!("expected TerminalChange::Keep, got Park"),
+            }
+        });
     }
 }

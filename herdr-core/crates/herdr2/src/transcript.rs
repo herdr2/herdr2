@@ -17,11 +17,7 @@ pub(crate) fn cap_tool_detail(raw: &str) -> Option<String> {
     }
     let mut chars = trimmed.chars();
     let capped: String = chars.by_ref().take(MAX_TOOL_DETAIL_CHARS).collect();
-    if chars.next().is_some() {
-        Some(format!("{capped}\n…"))
-    } else {
-        Some(capped)
-    }
+    if chars.next().is_some() { Some(format!("{capped}\n…")) } else { Some(capped) }
 }
 
 /// Lightweight metadata for a multimodal attachment (image, audio, embedded resource, or resource link).
@@ -382,9 +378,11 @@ impl Transcript {
                         attachments: old_attachments,
                         ts_ms: old_ts,
                         ..
-                    }) = self.entries.iter_mut().rev().find(|e| {
-                        matches!(e, Entry::ToolCall { turn: t, id: eid, .. } if *t == turn && eid == &id)
-                    })
+                    }) = self
+                        .entries
+                        .iter_mut()
+                        .rev()
+                        .find(|e| matches!(e, Entry::ToolCall { turn: t, id: eid, .. } if *t == turn && eid == &id))
                 {
                     self.bytes = self.bytes.saturating_sub(
                         old_title.len()
@@ -615,11 +613,7 @@ pub fn slice_turn_range(entries: &[Entry], from_turn: Option<u64>, to_turn: Opti
     }
     let lo = from_turn.unwrap_or(0);
     let hi = to_turn.unwrap_or(u64::MAX);
-    entries
-        .iter()
-        .filter(|e| e.turn().is_some_and(|t| t >= lo && t <= hi))
-        .cloned()
-        .collect()
+    entries.iter().filter(|e| e.turn().is_some_and(|t| t >= lo && t <= hi)).cloned().collect()
 }
 
 /// Renders structured entries into human-readable transcript text.
@@ -698,10 +692,8 @@ pub fn build_portable_handoff(entries: &[Entry], up_to_turn: u64, max_bytes: usi
         return None;
     }
 
-    let mut turn_blocks: Vec<(u64, String)> = per_turn
-        .into_iter()
-        .map(|(t, lines)| (t, format!("[Turn {t}]\n{}", lines.join("\n"))))
-        .collect();
+    let mut turn_blocks: Vec<(u64, String)> =
+        per_turn.into_iter().map(|(t, lines)| (t, format!("[Turn {t}]\n{}", lines.join("\n")))).collect();
 
     // Always prioritize preserving Turn 1 goal + newest turns backward to `up_to_turn`.
     let mut selected_indices = Vec::new();
@@ -915,7 +907,10 @@ mod tests {
         assert_eq!(restored.as_deref(), Some("refactor incorrectly"));
         assert!(t.entries.iter().any(|e| matches!(e, Entry::Rewind { to_turn: 1, restore_files: true, .. })));
         assert!(!t.entries.iter().any(|e| e.turn() == Some(2)));
-        assert_eq!(strip_h2_envelope("<herdr2-context-handoff restored_turn=\"1\">\nx\n</herdr2-context-handoff>\n\nhello"), "hello");
+        assert_eq!(
+            strip_h2_envelope("<herdr2-context-handoff restored_turn=\"1\">\nx\n</herdr2-context-handoff>\n\nhello"),
+            "hello"
+        );
         assert_eq!(
             strip_h2_envelope("<herdr2-handoff kind=\"handoff\" from=\"a1\">\nmeta\n</herdr2-handoff>\n\ncontinue"),
             "continue"

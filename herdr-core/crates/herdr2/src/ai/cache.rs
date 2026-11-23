@@ -50,10 +50,7 @@ impl AiResultCache {
             map.retain(|_, v| v.expires_at > now);
         }
         while map.len() >= self.max_entries {
-            let oldest = map
-                .iter()
-                .min_by_key(|(_, v)| v.last_hit_at)
-                .map(|(k, _)| k.clone());
+            let oldest = map.iter().min_by_key(|(_, v)| v.last_hit_at).map(|(k, _)| k.clone());
             let Some(k) = oldest else { break };
             map.remove(&k);
         }

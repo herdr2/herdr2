@@ -162,16 +162,8 @@ fn format_note_with_digest(
             (format!("exited ({how})"), "Read")
         };
         let name = name.map(|n| format!(" {n}")).unwrap_or_default();
-        let files_part = if d.files.is_empty() {
-            String::new()
-        } else {
-            format!("; files: {}", d.files.join(", "))
-        };
-        let next_part = if d.next_step.is_empty() {
-            String::new()
-        } else {
-            format!("; next: {}", d.next_step)
-        };
+        let files_part = if d.files.is_empty() { String::new() } else { format!("; files: {}", d.files.join(", ")) };
+        let next_part = if d.next_step.is_empty() { String::new() } else { format!("; next: {}", d.next_step) };
         return format!(
             "<h2>{address}{name} {what}. Summary: {}{files_part}{next_part}. {look}: h2 read {address}</h2>",
             d.root_cause
@@ -196,12 +188,7 @@ fn note(a: &Agent, address: &str, last: &[String]) -> String {
     )
 }
 
-fn note_with_digest(
-    a: &Agent,
-    address: &str,
-    last: &[String],
-    digest: Option<&crate::ai::ChildNoteDigest>,
-) -> String {
+fn note_with_digest(a: &Agent, address: &str, last: &[String], digest: Option<&crate::ai::ChildNoteDigest>) -> String {
     format_note_with_digest(
         a.status.as_ref(),
         blocked(a),
@@ -504,7 +491,9 @@ impl Core {
         let from = from?;
         if let Some(key) = TargetKey::parse(from).filter(|k| *k != to) {
             return match key {
-                TargetKey::Agent(f) => st.reg.agents.get(&f).filter(|s| s.reported).map(|s| (who(s), s.address.clone())),
+                TargetKey::Agent(f) => {
+                    st.reg.agents.get(&f).filter(|s| s.reported).map(|s| (who(s), s.address.clone()))
+                }
                 TargetKey::Terminal(f) => {
                     st.pty_reg.terminals.get(&f).filter(|s| s.reported).map(|s| (pty_who(s), s.address.clone()))
                 }
@@ -522,11 +511,15 @@ impl Core {
         if !st.reg.agents.get(&to).is_some_and(|a| a.reported) {
             return text.to_string();
         }
-        if let Some(afar) = from.filter(|f| f.rsplit_once('/').is_some_and(|(_, local)| TargetKey::parse(local).is_some())) {
+        if let Some(afar) =
+            from.filter(|f| f.rsplit_once('/').is_some_and(|(_, local)| TargetKey::parse(local).is_some()))
+        {
             return format!("<h2 from=\"{afar}\">{text}</h2>");
         }
         match self.sender_label(&st, from, TargetKey::Agent(to)) {
-            Some((label, addr)) if reach && TargetKey::parse(&addr).is_some_and(|k| matches!(k, TargetKey::Agent(_))) => {
+            Some((label, addr))
+                if reach && TargetKey::parse(&addr).is_some_and(|k| matches!(k, TargetKey::Agent(_))) =>
+            {
                 format!("<h2 from=\"{label}\" reach=\"h2 send {addr} when done or stuck\">{text}</h2>")
             }
             Some((label, _)) => format!("<h2 from=\"{label}\">{text}</h2>"),
@@ -543,7 +536,9 @@ impl Core {
         if !st.pty_reg.terminals.get(&to).is_some_and(|t| t.reported) {
             return text.to_string();
         }
-        if let Some(afar) = from.filter(|f| f.rsplit_once('/').is_some_and(|(_, local)| TargetKey::parse(local).is_some())) {
+        if let Some(afar) =
+            from.filter(|f| f.rsplit_once('/').is_some_and(|(_, local)| TargetKey::parse(local).is_some()))
+        {
             return format!("<h2 from=\"{afar}\">{text}</h2>");
         }
         match self.sender_label(&st, from, TargetKey::Terminal(to)) {
@@ -678,14 +673,8 @@ impl Core {
                 Job::PtyCheckpoint { id, entered_working, turn_ended, turn } => {
                     let core = self.clone();
                     tokio::spawn(async move {
-                        crate::pty_adapters::process_pty_checkpoint_job(
-                            &core,
-                            id,
-                            entered_working,
-                            turn_ended,
-                            turn,
-                        )
-                        .await;
+                        crate::pty_adapters::process_pty_checkpoint_job(&core, id, entered_working, turn_ended, turn)
+                            .await;
                     });
                 }
                 Job::PtyResumeCheckpoints { id } => {
@@ -767,12 +756,7 @@ impl Core {
         let mut text: Vec<String> = acp_kids
             .iter()
             .map(|id| {
-                self.note_for_with_digest(
-                    &st,
-                    *id,
-                    &st.reg.agents[id].address,
-                    digests.get(&TargetKey::Agent(*id)),
-                )
+                self.note_for_with_digest(&st, *id, &st.reg.agents[id].address, digests.get(&TargetKey::Agent(*id)))
             })
             .collect();
         text.extend(pty_kids.iter().map(|id| {
@@ -814,7 +798,8 @@ impl Core {
         let enabled = self.notes_on();
         let key = TargetKey::Terminal(parent);
         loop {
-            let ready = |st: &State| st.pty_reg.terminals.get(&parent).is_none_or(|t| !t.is_live() || pty_can_take_note(t));
+            let ready =
+                |st: &State| st.pty_reg.terminals.get(&parent).is_none_or(|t| !t.is_live() || pty_can_take_note(t));
             while !self.wait_for(Duration::from_secs(60), ready).await {}
             let alive = self.lock().pty_reg.terminals.get(&parent).is_some_and(|t| t.is_live());
             if !alive || !enabled {
@@ -852,13 +837,12 @@ impl Core {
                 }
                 let mut text: Vec<String> =
                     acp_kids.iter().map(|id| self.note_for(st, *id, &st.reg.agents[id].address)).collect();
-                text.extend(
-                    pty_kids.iter().map(|id| self.pty_note_for(st, *id, &st.pty_reg.terminals[id].address)),
-                );
+                text.extend(pty_kids.iter().map(|id| self.pty_note_for(st, *id, &st.pty_reg.terminals[id].address)));
                 text.extend(afar.iter().cloned());
                 let bracketed = st.screens.get(&parent).is_some_and(|s| s.dec_mode(2004));
                 let told_acp: Vec<(u32, u64)> = acp_kids.iter().map(|id| (*id, st.reg.agents[id].news)).collect();
-                let told_pty: Vec<(u32, u64)> = pty_kids.iter().map(|id| (*id, st.pty_reg.terminals[id].news)).collect();
+                let told_pty: Vec<(u32, u64)> =
+                    pty_kids.iter().map(|id| (*id, st.pty_reg.terminals[id].news)).collect();
                 let steps = vec![
                     Step::Write(paste(bracketed, &text.join("\n"))),
                     Step::Pause(crate::pty_input::PASTE_GAP),

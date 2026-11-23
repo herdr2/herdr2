@@ -1,22 +1,22 @@
 #!/bin/bash
-# Builds a release of the app for this machine and packs it:
+# Builds a release of the Herdr2 desktop app and packs it:
 #
-#   scripts/package            -> dist/herdr-app-<os>-<arch>.tar.gz
-#   scripts/package <triple>   -> the same for another supported Rust target
+#   scripts/package                        -> dist/herdr2-<os>-<arch>.tar.gz
+#   scripts/package <triple>               -> cross-compiled target archive
 #
-# Linux: a folder holding herdr-app and the icon.
-# macOS: Herdr.app, signed with APPLE_CERTIFICATE_P12 when available,
-# otherwise ad hoc. The notarized DMG is a separate, non-blocking CI job.
-# Windows (Git Bash): a folder holding herdr-app.exe and the icon.
-# Windows has curl and tar too, so the app updates the same way.
-# No core inside: the installer and the app install the core's own release
-# (distribution/core-version is the oldest core this app works with).
+# Linux: a folder `herdr2/` holding `herdr2` and `herdr2.svg`.
+# macOS: `Herdr2.app`, signed with APPLE_CERTIFICATE_P12 when available,
+# otherwise ad hoc.
+# Windows (native or Linux cargo-xwin cross-compile): `herdr2/` holding
+# `herdr2.exe` and `herdr2.svg`.
+# Optional env: HERDR2_DEFAULT_RELEASES_URL bakes a default release server URL.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 
 triple=${1:-}
+host_os=$(uname -s)
 if [[ -n $triple ]]; then
   case "$triple" in
     *-linux-*) os=linux ;;
@@ -27,11 +27,11 @@ if [[ -n $triple ]]; then
   arch=${triple%%-*}
   bin=target/$triple/release
 else
-  case "$(uname -s)" in
+  case "$host_os" in
     Linux) os=linux ;;
     Darwin) os=macos ;;
     MINGW* | MSYS* | CYGWIN*) os=windows ;;
-    *) echo "package: unsupported OS $(uname -s)" >&2; exit 1 ;;
+    *) echo "package: unsupported OS $host_os" >&2; exit 1 ;;
   esac
   arch=$(uname -m)
   bin=target/release
@@ -49,54 +49,58 @@ target="$os-$arch"
 
 sha256() { if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1; else shasum -a 256 "$1" | cut -d' ' -f1; fi; }
 
-echo "package: herdr-app $version for $target"
+echo "package: herdr2 $version for $target"
 for notice in LICENSE THIRD-PARTY-NOTICES; do
   [[ -s $notice ]] || { echo "package: $notice is missing or empty" >&2; exit 1; }
 done
-# Only release builds update themselves (src/update.rs).
-HERDR_APP_RELEASE=1 cargo build --release --locked ${triple:+--target "$triple"}
+# Only release builds auto-update themselves by default (src/update.rs).
+if [[ $host_os == Linux && $os == windows && -n $triple ]]; then
+  ZIG="${ZIG:-$(cd .. && pwd)/scripts/zig-xwin.sh}" HERDR2_APP_RELEASE=1 cargo xwin build --release --locked --target "$triple"
+else
+  HERDR2_APP_RELEASE=1 cargo build --release --locked ${triple:+--target "$triple"}
+fi
 
 if [[ $os == linux ]]; then export TMPDIR=${TMPDIR:-/var/tmp}; fi
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 mkdir -p dist
-out="dist/herdr-app-$target.tar.gz"
+out="dist/herdr2-$target.tar.gz"
 if [[ $os == linux || $os == windows ]]; then
-  dir="$work/herdr-app"
+  dir="$work/herdr2"
   mkdir -p "$dir"
-  if [[ $os == windows ]]; then cp "$bin/herdr-app.exe" "$dir/"; else cp "$bin/herdr-app" "$dir/"; fi
-  cp assets/icons/herdr-ui-icon-clean.svg "$dir/herdr-app.svg"
+  if [[ $os == windows ]]; then cp "$bin/herdr2.exe" "$dir/"; else cp "$bin/herdr2" "$dir/"; fi
+  cp assets/icons/herdr-ui-icon-clean.svg "$dir/herdr2.svg"
   cp LICENSE THIRD-PARTY-NOTICES "$dir/"
-  notices_path=herdr-app/THIRD-PARTY-NOTICES
-  tar -czf "$out" -C "$work" herdr-app
+  notices_path=herdr2/THIRD-PARTY-NOTICES
+  tar -czf "$out" -C "$work" herdr2
 else
-  app="$work/Herdr.app"
+  app="$work/Herdr2.app"
   mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-  cp "$bin/herdr-app" "$app/Contents/MacOS/Herdr"
-  cp assets/icons/Herdr.icns "$app/Contents/Resources/Herdr.icns"
+  cp "$bin/herdr2" "$app/Contents/MacOS/Herdr2"
+  cp assets/icons/Herdr.icns "$app/Contents/Resources/Herdr2.icns"
   cp LICENSE THIRD-PARTY-NOTICES "$app/Contents/Resources/"
-  notices_path=Herdr.app/Contents/Resources/THIRD-PARTY-NOTICES
+  notices_path=Herdr2.app/Contents/Resources/THIRD-PARTY-NOTICES
   cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-    <key>CFBundleExecutable</key><string>Herdr</string>
-    <key>CFBundleIdentifier</key><string>dev.herdr.app</string>
-    <key>CFBundleName</key><string>Herdr</string>
-    <key>CFBundleDisplayName</key><string>Herdr</string>
-    <key>CFBundleIconFile</key><string>Herdr</string>
+    <key>CFBundleExecutable</key><string>Herdr2</string>
+    <key>CFBundleIdentifier</key><string>dev.herdr2.app</string>
+    <key>CFBundleName</key><string>Herdr2</string>
+    <key>CFBundleDisplayName</key><string>Herdr2</string>
+    <key>CFBundleIconFile</key><string>Herdr2</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$version</string>
     <key>CFBundleVersion</key><string>$version</string>
-    <key>NSMicrophoneUsageDescription</key><string>Terminal programs running in Herdr can use the microphone, for example for voice input.</string>
-    <key>NSCameraUsageDescription</key><string>Terminal programs running in Herdr can use the camera.</string>
-    <key>NSAppleEventsUsageDescription</key><string>Terminal programs running in Herdr can use AppleScript to control other apps.</string>
+    <key>NSMicrophoneUsageDescription</key><string>Terminal programs running in Herdr2 can use the microphone, for example for voice input.</string>
+    <key>NSCameraUsageDescription</key><string>Terminal programs running in Herdr2 can use the camera.</string>
+    <key>NSAppleEventsUsageDescription</key><string>Terminal programs running in Herdr2 can use AppleScript to control other apps.</string>
     <key>NSPrincipalClass</key><string>NSApplication</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>LSEnvironment</key><dict/></dict></plist>
 PLIST
   scripts/mac-sign "$app"
-  tar -czf "$out" -C "$work" Herdr.app
+  tar -czf "$out" -C "$work" Herdr2.app
 fi
 tar -xOf "$out" "$notices_path" | cmp - THIRD-PARTY-NOTICES
 license_path="${notices_path%/*}/LICENSE"

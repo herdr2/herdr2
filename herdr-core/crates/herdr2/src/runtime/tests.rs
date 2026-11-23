@@ -19,10 +19,7 @@ async fn startup_finishes_unkept_agents_and_prepares_kept_ones_for_recovery() {
     {
         let mut st = core.lock();
         let unkept = st.reg.create(NewAgent { argv: vec!["cat".into()], ..Default::default() }, 1).unwrap();
-        let kept = st
-            .reg
-            .create(NewAgent { argv: vec!["cat".into()], keep: true, ..Default::default() }, 2)
-            .unwrap();
+        let kept = st.reg.create(NewAgent { argv: vec!["cat".into()], keep: true, ..Default::default() }, 2).unwrap();
         st.reg.agents.get_mut(&kept).unwrap().acp_session_id = Some("sess-42".into());
         core.record_transcript(
             &mut st,
@@ -51,14 +48,22 @@ async fn startup_finishes_unkept_agents_and_prepares_kept_ones_for_recovery() {
 #[tokio::test]
 async fn status_changed_updates_turn_and_emits_news_to_parent() {
     let root = crate::test_tmp().join(format!("h2-rt-status-{}", platform::random_hex()));
-    let paths = Paths { socket: root.join("core.sock"), holder_socket: root.join("holder.sock"), state: root.join("state"), config: root.join("config.toml") };
+    let paths = Paths {
+        socket: root.join("core.sock"),
+        holder_socket: root.join("holder.sock"),
+        state: root.join("state"),
+        config: root.join("config.toml"),
+    };
     paths.create_dirs().unwrap();
     let core = Core::start(paths, CoreInfo { id: "c1".into(), name: "box".into() }).unwrap();
     let mut st = core.lock();
     let parent = st.reg.create(NewAgent { argv: vec!["a".into()], ..Default::default() }, 1).unwrap();
     let child = st
         .reg
-        .create(NewAgent { argv: vec!["b".into()], parent: Some(address(parent)), notify: true, ..Default::default() }, 2)
+        .create(
+            NewAgent { argv: vec!["b".into()], parent: Some(address(parent)), notify: true, ..Default::default() },
+            2,
+        )
         .unwrap();
     core.apply_status(&mut st, child, &StatusReport::root("working"));
     assert_eq!(st.reg.agents[&child].turn, 0);
@@ -74,13 +79,22 @@ async fn status_changed_updates_turn_and_emits_news_to_parent() {
 #[tokio::test]
 async fn approve_and_deny_validate_options_and_remove_cleans_transcript() {
     let root = crate::test_tmp().join(format!("h2-rt-perm-{}", platform::random_hex()));
-    let paths = Paths { socket: root.join("core.sock"), holder_socket: root.join("holder.sock"), state: root.join("state"), config: root.join("config.toml") };
+    let paths = Paths {
+        socket: root.join("core.sock"),
+        holder_socket: root.join("holder.sock"),
+        state: root.join("state"),
+        config: root.join("config.toml"),
+    };
     paths.create_dirs().unwrap();
     let core = Core::start(paths, CoreInfo { id: "c1".into(), name: "box".into() }).unwrap();
     let id = {
         let mut st = core.lock();
         let id = st.reg.create(NewAgent { argv: vec!["sh".into()], ..Default::default() }, 1).unwrap();
-        core.record_transcript(&mut st, id, Entry::User { turn: 1, from: None, text: "hi".into(), attachments: vec![], ts_ms: 1 });
+        core.record_transcript(
+            &mut st,
+            id,
+            Entry::User { turn: 1, from: None, text: "hi".into(), attachments: vec![], ts_ms: 1 },
+        );
         id
     };
     assert!(transcript_path(&core.paths.state, &address(id)).is_file());
@@ -97,8 +111,16 @@ async fn approve_and_deny_validate_options_and_remove_cleans_transcript() {
                 rpc_id: serde_json::json!(7),
                 title: "Write file".into(),
                 options: vec![
-                    PublicPermissionOption { option_id: "allow".into(), name: "Allow".into(), kind: "allow_once".into() },
-                    PublicPermissionOption { option_id: "deny".into(), name: "Deny".into(), kind: "reject_once".into() },
+                    PublicPermissionOption {
+                        option_id: "allow".into(),
+                        name: "Allow".into(),
+                        kind: "allow_once".into(),
+                    },
+                    PublicPermissionOption {
+                        option_id: "deny".into(),
+                        name: "Deny".into(),
+                        kind: "reject_once".into(),
+                    },
                 ],
                 transport: transport.clone(),
                 turn: 1,
@@ -138,10 +160,7 @@ async fn kept_agent_restart_preserves_queued_inbox_as_paused_and_supports_resume
     let core = Core::start(paths(), info()).unwrap();
     {
         let mut st = core.lock();
-        let id = st
-            .reg
-            .create(NewAgent { argv: vec!["cat".into()], keep: true, ..Default::default() }, 1)
-            .unwrap();
+        let id = st.reg.create(NewAgent { argv: vec!["cat".into()], keep: true, ..Default::default() }, 1).unwrap();
         let p1 = crate::acp::QueuedPrompt::new("first queued follow-up".into(), None);
         let p2 = crate::acp::QueuedPrompt::new("second queued follow-up".into(), None);
         st.inboxes.entry(id).or_default().push_back(p1);
@@ -240,7 +259,12 @@ async fn foreground_tracks_saved_cli_and_clears_it_on_exit_to_shell() {
             Some(Foreground {
                 pid: 200,
                 name: "claude".into(),
-                argv: vec!["claude".into(), "--dangerously-skip-permissions".into(), "--session-id".into(), "sid-live".into()],
+                argv: vec![
+                    "claude".into(),
+                    "--dangerously-skip-permissions".into(),
+                    "--session-id".into(),
+                    "sid-live".into(),
+                ],
                 cwd: cwd.clone(),
             }),
         );

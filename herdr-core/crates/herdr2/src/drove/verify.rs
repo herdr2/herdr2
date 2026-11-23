@@ -34,10 +34,7 @@ pub async fn run_verify_command(cwd: &str, cmd_str: &str, timeout_sec: u64) -> C
         c.args(["-c", cmd_str]);
         c
     };
-    cmd.current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    cmd.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
 
     match tokio::time::timeout(Duration::from_secs(timeout_sec.clamp(1, 3600)), cmd.output()).await {
         Ok(Ok(out)) => {
@@ -61,24 +58,12 @@ pub async fn run_verify_command(cwd: &str, cmd_str: &str, timeout_sec: u64) -> C
         Ok(Err(e)) => {
             let msg = format!("failed to spawn verify command: {e}");
             let output_hash = sha256_hex(msg.as_bytes());
-            CommandRunOutput {
-                success: false,
-                exit_code: None,
-                timed_out: false,
-                combined_output: msg,
-                output_hash,
-            }
+            CommandRunOutput { success: false, exit_code: None, timed_out: false, combined_output: msg, output_hash }
         }
         Err(_) => {
             let msg = format!("verify command timed out after {timeout_sec}s");
             let output_hash = sha256_hex(msg.as_bytes());
-            CommandRunOutput {
-                success: false,
-                exit_code: None,
-                timed_out: true,
-                combined_output: msg,
-                output_hash,
-            }
+            CommandRunOutput { success: false, exit_code: None, timed_out: true, combined_output: msg, output_hash }
         }
     }
 }
@@ -127,10 +112,7 @@ pub(super) async fn run_task_verify_gate(
         "$ {cmd_str}\ncwd: {work_cwd}\nexit: {:?} timedOut: {}\n\n{}\n",
         res.exit_code, res.timed_out, res.combined_output
     );
-    let _ = core
-        .drove
-        .store
-        .write_artifact(&run.id, &artifact_id, log_body.as_bytes());
+    let _ = core.drove.store.write_artifact(&run.id, &artifact_id, log_body.as_bytes());
 
     if res.success {
         let _ = core.drove.store.update_attempt(&attempt.id, |a| {
@@ -140,11 +122,8 @@ pub(super) async fn run_task_verify_gate(
     }
 
     let prev_hash = attempt.last_verify_hash.as_deref();
-    let next_stag = if prev_hash == Some(res.output_hash.as_str()) {
-        attempt.stagnant_rejections.unwrap_or(0) + 1
-    } else {
-        1
-    };
+    let next_stag =
+        if prev_hash == Some(res.output_hash.as_str()) { attempt.stagnant_rejections.unwrap_or(0) + 1 } else { 1 };
     let tail = tail_lines(&res.combined_output, 1800);
     let _ = core.drove.store.update_attempt(&attempt.id, |a| {
         a.verify_rejections = Some(next_n);
@@ -168,13 +147,7 @@ pub(super) async fn run_task_verify_gate(
         tokens: None,
         cost: None,
     });
-    super::ai::spawn_verify_digest(
-        core.clone(),
-        run.id.clone(),
-        attempt.id.clone(),
-        cmd_str.to_string(),
-        tail.clone(),
-    );
+    super::ai::spawn_verify_digest(core.clone(), run.id.clone(), attempt.id.clone(), cmd_str.to_string(), tail.clone());
 
     let msg = format!(
         "Verification failed (attempt {next_n}/{max_rej}, stagnant {next_stag}/{max_stag}): `{cmd_str}`\n{tail}"
@@ -186,16 +159,7 @@ pub(super) async fn run_task_verify_gate(
             a.failure = Some(AttemptFailure { kind: FailureKind::VerificationFailed, message: msg.clone() });
         });
         mark_worker_idle(core, &worker.id);
-        super::fail_or_retry_task(
-            core,
-            &run.id,
-            &task.id,
-            &attempt.id,
-            FailureKind::VerificationFailed,
-            &msg,
-            0,
-        )
-        .await;
+        super::fail_or_retry_task(core, &run.id, &task.id, &attempt.id, FailureKind::VerificationFailed, &msg, 0).await;
         return Err(ApiErr::new(422, "verify_failed_exhausted", msg));
     }
 
@@ -204,7 +168,10 @@ pub(super) async fn run_task_verify_gate(
 
 /// Runs Run-level `run.verify` during `complete_run_http`. Returns `Ok(None)` when skipped/passed,
 /// `Ok(Some(repair_task))` when `goal.autoRepair` spawned a repair task, or `Err(ApiErr)` on hard failure.
-pub(super) async fn run_level_verify_gate(core: &Arc<Core>, run: &Run) -> Result<(Option<String>, Option<Task>), ApiErr> {
+pub(super) async fn run_level_verify_gate(
+    core: &Arc<Core>,
+    run: &Run,
+) -> Result<(Option<String>, Option<Task>), ApiErr> {
     let Some(vspec) = &run.verify else {
         return Ok((None, None));
     };
@@ -223,10 +190,7 @@ pub(super) async fn run_level_verify_gate(core: &Arc<Core>, run: &Run) -> Result
         "$ {cmd_str}\ncwd: {}\nexit: {:?} timedOut: {}\n\n{}\n",
         run.cwd, res.exit_code, res.timed_out, res.combined_output
     );
-    let _ = core
-        .drove
-        .store
-        .write_artifact(&run.id, &artifact_id, log_body.as_bytes());
+    let _ = core.drove.store.write_artifact(&run.id, &artifact_id, log_body.as_bytes());
 
     if res.success {
         return Ok((Some(artifact_id), None));
@@ -319,9 +283,5 @@ pub(super) async fn run_level_verify_gate(core: &Arc<Core>, run: &Run) -> Result
             log_artifact_id: Some(artifact_id.clone()),
         });
     });
-    Err(ApiErr::new(
-        422,
-        "run_verify_failed",
-        format!("Run verification failed: `{cmd_str}`\n{tail}"),
-    ))
+    Err(ApiErr::new(422, "run_verify_failed", format!("Run verification failed: `{cmd_str}`\n{tail}")))
 }

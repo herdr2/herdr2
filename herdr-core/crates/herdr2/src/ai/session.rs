@@ -32,6 +32,23 @@ impl ChatMessage {
     }
 }
 
+/// Builds a lock-free message list sharing the byte-identical `system + session_seed` KV-cache prefix
+/// without appending to or contending on a mutable session mutex.
+pub fn build_seeded_stateless_messages(
+    system_prompt: &str,
+    seed_context: Option<&str>,
+    user_content: &str,
+) -> Vec<ChatMessage> {
+    let mut msgs = vec![ChatMessage::system(system_prompt)];
+    if let Some(seed) = seed_context.map(str::trim).filter(|s| !s.is_empty()) {
+        let seed_msg = format_op_user_message("session_seed", "en", &json!({ "context": seed }));
+        msgs.push(ChatMessage::user(seed_msg));
+        msgs.push(ChatMessage::assistant("{\"ack\":true}"));
+    }
+    msgs.push(ChatMessage::user(user_content));
+    msgs
+}
+
 pub struct SessionState {
     pub system_hash: u64,
     pub model: String,
@@ -142,10 +159,7 @@ impl AiSessionPool {
             map.retain(|_, v| now.saturating_duration_since(v.touched) < SESSION_TTL);
         }
         while map.len() >= MAX_ACTIVE_SESSIONS {
-            let oldest = map
-                .iter()
-                .min_by_key(|(_, v)| v.touched)
-                .map(|(k, _)| k.clone());
+            let oldest = map.iter().min_by_key(|(_, v)| v.touched).map(|(k, _)| k.clone());
             let Some(k) = oldest else { break };
             map.remove(&k);
         }
@@ -159,10 +173,7 @@ impl AiSessionPool {
     }
 
     pub fn evict_prefix(&self, prefix: &str) {
-        self.slots
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .retain(|k, _| !k.starts_with(prefix));
+        self.slots.lock().unwrap_or_else(|p| p.into_inner()).retain(|k, _| !k.starts_with(prefix));
     }
 
     pub fn clear_all(&self) {
@@ -172,9 +183,7 @@ impl AiSessionPool {
     pub fn active_count(&self) -> usize {
         let now = Instant::now();
         let map = self.slots.lock().unwrap_or_else(|p| p.into_inner());
-        map.values()
-            .filter(|v| now.saturating_duration_since(v.touched) < SESSION_TTL)
-            .count()
+        map.values().filter(|v| now.saturating_duration_since(v.touched) < SESSION_TTL).count()
     }
 }
 

@@ -14,9 +14,7 @@ pub(super) async fn agent_review(core: Ctx<'_>, p: ReviewParams) -> Result<Revie
         return Err(RpcError::invalid_params("comments must contain at least one review comment"));
     }
     if p.comments.len() > MAX_REVIEW_COMMENTS {
-        return Err(RpcError::invalid_params(format!(
-            "at most {MAX_REVIEW_COMMENTS} review comments per call"
-        )));
+        return Err(RpcError::invalid_params(format!("at most {MAX_REVIEW_COMMENTS} review comments per call")));
     }
     for (idx, c) in p.comments.iter().enumerate() {
         if c.path.trim().is_empty() {
@@ -30,10 +28,7 @@ pub(super) async fn agent_review(core: Ctx<'_>, p: ReviewParams) -> Result<Revie
         }
     }
 
-    let is_zh = p
-        .language
-        .as_deref()
-        .is_some_and(|l| l.trim().to_ascii_lowercase().starts_with("zh"));
+    let is_zh = p.language.as_deref().is_some_and(|l| l.trim().to_ascii_lowercase().starts_with("zh"));
 
     let pkg = build_review_markdown(&ReviewBuildInput {
         source: p.source.as_deref(),
@@ -60,13 +55,7 @@ pub(super) async fn agent_review(core: Ctx<'_>, p: ReviewParams) -> Result<Revie
                 let path = crate::put::stage(&core.paths.state, id, "line-notes.md", pkg.markdown.as_bytes())
                     .map_err(|e| RpcError::internal(format!("failed to stage line notes for {target_addr}: {e}")))?;
                 let path_str = path.display().to_string();
-                let ptr = build_staged_pointer_message(
-                    &pkg,
-                    &path_str,
-                    p.note.as_deref(),
-                    p.checkpoint_turn,
-                    is_zh,
-                );
+                let ptr = build_staged_pointer_message(&pkg, &path_str, p.note.as_deref(), p.checkpoint_turn, is_zh);
                 (ptr, Some(path_str))
             };
 
@@ -100,8 +89,7 @@ pub(super) async fn agent_review(core: Ctx<'_>, p: ReviewParams) -> Result<Revie
             let staged = crate::put::stage_terminal(&core.paths.state, id, "line-notes.md", pkg.markdown.as_bytes())
                 .map_err(|e| RpcError::internal(format!("failed to stage line notes for {target_addr}: {e}")))?;
             let path_str = staged.display().to_string();
-            let pointer =
-                build_staged_pointer_message(&pkg, &path_str, p.note.as_deref(), p.checkpoint_turn, is_zh);
+            let pointer = build_staged_pointer_message(&pkg, &path_str, p.note.as_deref(), p.checkpoint_turn, is_zh);
 
             let sender = p.caller.as_deref();
             let sent = core.pty_send(id, &pointer, p.steer, None).await?;

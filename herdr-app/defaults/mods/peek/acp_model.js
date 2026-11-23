@@ -739,13 +739,13 @@ export function extractTurnChangedFiles(steps, cwd = "") {
 export function resolveEffortVisual(rawValue) {
   const v = String(rawValue ?? "").trim().toLowerCase();
   if (!v) return null;
-  if (v === "off" || v === "none") return { bars: 4, active: 0 };
+  if (v === "off" || v === "none" || v === "disabled" || v === "false") return { bars: 4, active: 0 };
   if (v === "minimal" || v === "low" || v === "min") return { bars: 4, active: 1 };
   if (v === "medium" || v === "med" || v === "normal" || v === "balanced" || v === "default") {
     return { bars: 4, active: 2 };
   }
-  if (v === "high") return { bars: 4, active: 3 };
-  if (v === "xhigh" || v === "extra_high" || v === "extra-high" || v === "max" || v === "ultrathink") {
+  if (v === "high" || v === "on" || v === "enabled" || v === "true") return { bars: 4, active: 3 };
+  if (v === "xhigh" || v === "extra_high" || v === "extra-high" || v === "max" || v === "ultra" || v === "ultrathink") {
     return { bars: 4, active: 4 };
   }
   return null;
@@ -1179,15 +1179,56 @@ const isModeOption = (o) =>
   o?.id === "permission_mode" ||
   o?.id === "approval_policy";
 
+const isThinkingOption = (o) =>
+  o?.category === "thought_level" ||
+  o?.id === "thought" ||
+  o?.id === "thought_level" ||
+  o?.id === "reasoning_effort" ||
+  o?.id === "reasoning" ||
+  o?.id === "effort" ||
+  o?.id === "thinking";
+
+const EFFORT_DISPLAY_LABELS = {
+  off: "Off",
+  none: "None",
+  disabled: "Disabled",
+  on: "On",
+  enabled: "Enabled",
+  minimal: "Minimal",
+  low: "Low",
+  medium: "Medium",
+  med: "Medium",
+  high: "High",
+  xhigh: "Extra High",
+  "extra-high": "Extra High",
+  extra_high: "Extra High",
+  max: "Max",
+  ultra: "Ultra",
+  ultrathink: "Ultrathink",
+};
+
+function formatEffortChoiceName(value, rawName) {
+  const cleanName = String(rawName ?? "").replace(/\u200b/g, "").trim();
+  const key = String(value ?? "").trim().toLowerCase();
+  if (!cleanName || cleanName.toLowerCase() === key) {
+    return EFFORT_DISPLAY_LABELS[key] ?? cleanName ?? String(value ?? "");
+  }
+  return cleanName;
+}
+
+function normalizeThinkingOptionName(rawName, id) {
+  const clean = String(rawName || id || "").trim();
+  const lower = clean.toLowerCase();
+  if (!clean || lower === "thought" || lower === "thought_level" || lower === "thought level") {
+    return "Reasoning Effort";
+  }
+  return clean;
+}
+
 const CAPABILITY_ORDER = [
   (o) => o.category === "model" || o.id === "model",
   (o) => o.id === "context" || o.id === "context_window",
-  (o) =>
-    o.category === "thought_level" ||
-    o.id === "reasoning_effort" ||
-    o.id === "reasoning" ||
-    o.id === "effort" ||
-    o.id === "thinking",
+  isThinkingOption,
   (o) => o.id === "fast-mode" || o.id === "fast" || (o.kind === "boolean" && o.category === "model_config"),
   isModeOption,
 ];
@@ -1302,8 +1343,13 @@ export function normalizeConfigOptions(rawOptions, record) {
       }))
       .filter((c) => c.value.length > 0);
     const isMode = isModeOption({ category, id });
+    const isThinking = isThinkingOption({ category, id });
     const isClaudeMode = isMode && isClaudeAgentRecord(record, rawChoices);
-    const choices = isMode ? normalizeModeChoices(rawChoices, isClaudeMode) : rawChoices;
+    const choices = isMode
+      ? normalizeModeChoices(rawChoices, isClaudeMode)
+      : isThinking
+        ? rawChoices.map((c) => ({ ...c, name: formatEffortChoiceName(c.value, c.name) }))
+        : rawChoices;
 
     let currentLabel;
     if (kind === "boolean") {
@@ -1312,12 +1358,12 @@ export function normalizeConfigOptions(rawOptions, record) {
       const rawNeedle = currentValue == null ? "" : String(currentValue);
       const needle = isClaudeMode && rawNeedle === CLAUDE_BYPASS_LABEL ? "bypassPermissions" : rawNeedle;
       const hit = choices.find((c) => c.value === needle);
-      currentLabel = hit?.name || (rawNeedle || "Default");
+      currentLabel = hit?.name || (isThinking && rawNeedle ? formatEffortChoiceName(rawNeedle, "") : (rawNeedle || "Default"));
     }
 
     const descriptor = {
       id,
-      name: String(raw.name || id),
+      name: isThinking ? normalizeThinkingOptionName(raw.name, id) : String(raw.name || id),
       description: raw.description ? String(raw.description) : null,
       category,
       kind,

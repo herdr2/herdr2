@@ -251,7 +251,7 @@ methods! { Ctx<'_>;
         "Test generic OpenAI-compatible AI endpoint URL and API key.",
         errors ["invalid_params", "machine_unknown", "unavailable"];
     "drove.roles.ai_configure" => drove_roles_ai_configure, crate::drove::types::DroveRolesAiConfigureParams => crate::drove::types::DroveRolesAiConfigureResult,
-        "Use the configured AI assistant model to automatically configure Drove roles, models, and candidate strengths.",
+        "Use the configured AI assistant model to automatically configure Drove roles, models, candidate strengths, and routing notes.",
         errors ["invalid_params", "machine_unknown", "unavailable"];
     "drove.magpie.test" => drove_magpie_test, DroveMagpieTestParams => crate::drove::magpie::MagpieTestResult,
         "Test optional Magpie quota gateway connectivity.",
@@ -273,6 +273,9 @@ methods! { Ctx<'_>;
         errors ["invalid_params", "machine_unknown", "unavailable"];
     "ai.test" => ai_test, crate::ai::AiTestParams => crate::ai::AiTestResult,
         "Test OpenAI-compatible AI endpoint connectivity and refresh discovered models.",
+        errors ["invalid_params", "machine_unknown", "unavailable"];
+    "ai.probe_prompt_mode" => ai_probe_prompt_mode, crate::ai::AiOnParams => crate::ai::AiProbePromptModeResult,
+        "Clear prior prompt-prefix KV-cache detection records, set prompt mode to auto, and actively re-detect whether shared prefix or compact prompt mode should be used.",
         errors ["invalid_params", "machine_unknown", "unavailable"];
     "ai.complete" => ai_complete, crate::ai::AiCompleteParams => crate::ai::AiCompleteResult,
         "Run a bounded pure-text completion through the shared Core AI runtime with KV-cache prefix reuse.",
@@ -322,6 +325,14 @@ fn version() -> String {
     env!("CARGO_PKG_VERSION").into()
 }
 
+fn build_sha() -> Option<String> {
+    option_env!("H2_BUILD_GIT_SHA").filter(|s| !s.is_empty()).map(String::from)
+}
+
+fn build_time() -> Option<String> {
+    option_env!("H2_BUILD_TIME").filter(|s| !s.is_empty()).map(String::from)
+}
+
 pub(super) fn resolve(core: &Core, address: &str) -> Result<u32, RpcError> {
     let local = crate::addr::local(address, &core.info.id, &core.info.name)?;
     core.lock().reg.resolve(local)
@@ -357,6 +368,8 @@ async fn hello(core: Ctx<'_>, p: HelloParams) -> Result<HelloResult, RpcError> {
     Ok(HelloResult {
         generation: GENERATION,
         version: version(),
+        build_sha: build_sha(),
+        build_time: build_time(),
         core: core.info.clone(),
         framed: p.framed,
         methods: METHOD_NAMES.iter().map(|m| m.to_string()).collect(),
@@ -377,6 +390,8 @@ async fn server_status(core: Ctx<'_>, _: Empty) -> Result<StatusResult, RpcError
     Ok(StatusResult {
         core: core.info.clone(),
         version: version(),
+        build_sha: build_sha(),
+        build_time: build_time(),
         pid: std::process::id(),
         uptime_ms: core.started.elapsed().as_millis() as u64,
         live,
@@ -428,8 +443,12 @@ async fn agent_list(core: Ctx<'_>, p: ListParams) -> Result<ListResult, RpcError
         let matching: Vec<&Agent> =
             st.reg.agents.values().filter(|a| p.labels.iter().all(|Label(k, v)| a.labels.get(k) == Some(v))).collect();
         let hidden = if p.all { 0 } else { matching.iter().filter(|a| !a.is_live()).count() };
-        let agents: Vec<serde_json::Value> =
-            matching.into_iter().filter(|a| p.all || a.is_live()).cloned().map(|a| compact_list_entry(json!(Public(a)))).collect();
+        let agents: Vec<serde_json::Value> = matching
+            .into_iter()
+            .filter(|a| p.all || a.is_live())
+            .cloned()
+            .map(|a| compact_list_entry(json!(Public(a))))
+            .collect();
         let machines = if afar { Vec::new() } else { st.machines.clone() };
         (agents, hidden, machines)
     };
@@ -494,11 +513,7 @@ async fn agent_rm(core: Ctx<'_>, p: AgentParams) -> Result<RemoveResult, RpcErro
                 }
                 let wt = st.reg.agents.get(&id).and_then(|a| {
                     let lin = a.lineage.as_ref()?;
-                    Some((
-                        lin.worktree_origin.clone()?,
-                        lin.worktree_path.clone()?,
-                        lin.worktree_branch.clone(),
-                    ))
+                    Some((lin.worktree_origin.clone()?, lin.worktree_path.clone()?, lin.worktree_branch.clone()))
                 });
                 core.remove(&mut st, id);
                 wt
@@ -551,18 +566,13 @@ async fn agent_label(core: Ctx<'_>, p: LabelParams) -> Result<Public, RpcError> 
         let labels = serde_json::to_value(&st.reg.agents[&id].labels).unwrap_or_default();
         core.emit_from(&mut st, "labels", id, json!({"labels": labels}), was.as_ref());
         let a = &st.reg.agents[&id];
-        (
-            a.labels.get("herdr.trashed").is_some_and(|s| !s.is_empty()),
-            a.labels.get("drove.worker").cloned(),
-        )
+        (a.labels.get("herdr.trashed").is_some_and(|s| !s.is_empty()), a.labels.get("drove.worker").cloned())
     };
     if trashed {
         let sig = if let Some(wid) = worker_id {
             crate::drove::pool::PoolSignal::WorkerTrashed { worker_id: wid }
         } else {
-            crate::drove::pool::PoolSignal::SessionClosed {
-                address: crate::agents::address(id),
-            }
+            crate::drove::pool::PoolSignal::SessionClosed { address: crate::agents::address(id) }
         };
         let _ = core.drove.pool_tx.send(sig);
     }
@@ -581,17 +591,19 @@ async fn agent_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError
                 let spec = WaitSpec { output: None, timeout: Some(timeout), after_turn: None };
                 let _ = watched(core, p.caller.clone(), TargetKey::Terminal(id), spec).await;
             }
-            let snap = ((!p.last && p.lines.is_none()) || range_requested).then(|| {
-                let mut st = core.lock();
-                let mut snap = st
-                    .pty_reg
-                    .terminals
-                    .get(&id)
-                    .map(|t| crate::pty_transcript::snapshot_from_terminal(t, st.pty_prompts.get(&id)))?;
-                let addr = crate::terminals::address(id);
-                crate::pty_transcript::populate_session_affinity(&mut snap, &addr, core, &mut st);
-                Some(snap)
-            }).flatten();
+            let snap = ((!p.last && p.lines.is_none()) || range_requested)
+                .then(|| {
+                    let mut st = core.lock();
+                    let mut snap = st
+                        .pty_reg
+                        .terminals
+                        .get(&id)
+                        .map(|t| crate::pty_transcript::snapshot_from_terminal(t, st.pty_prompts.get(&id)))?;
+                    let addr = crate::terminals::address(id);
+                    crate::pty_transcript::populate_session_affinity(&mut snap, &addr, core, &mut st);
+                    Some(snap)
+                })
+                .flatten();
             let (entries, session_meta) = if let Some(snap) = snap {
                 blocking(move || Ok(crate::pty_transcript::extract_transcript(&snap))).await?
             } else {
@@ -613,14 +625,14 @@ async fn agent_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError
                 Some(n) => n,
                 None if !entries.is_empty() => 0,
                 None => {
-                    if core.lock().screens.get(&id).is_some_and(|s| s.alt_screen()) { 0 } else { 160 }
+                    if core.lock().screens.get(&id).is_some_and(|s| s.alt_screen()) {
+                        0
+                    } else {
+                        160
+                    }
                 }
             };
-            let r = terminal_read(
-                core,
-                TerminalReadParams { terminal: term_addr, caller: p.caller, lines },
-            )
-            .await?;
+            let r = terminal_read(core, TerminalReadParams { terminal: term_addr, caller: p.caller, lines }).await?;
             let how = if !entries.is_empty() { "transcript".into() } else { r.how };
             Ok(ReadResult { text: r.text, complete: r.complete, how, why: r.why, entries, session_meta })
         }
@@ -647,11 +659,7 @@ async fn agent_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError
                 });
             }
             let (text, complete, how) = core.read_transcript(id, p.lines, p.last)?;
-            let entries = if !p.last && p.lines.is_none() {
-                core.read_transcript_entries(id)?
-            } else {
-                Vec::new()
-            };
+            let entries = if !p.last && p.lines.is_none() { core.read_transcript_entries(id)? } else { Vec::new() };
             core.flush_saved().await?;
             Ok(ReadResult { text, complete, how: how.into(), why: None, entries, session_meta: None })
         }
@@ -723,7 +731,8 @@ pub(super) async fn agent_send(core: Ctx<'_>, p: SendParams) -> Result<SendResul
                             staged_paths.push(path.display().to_string());
                         }
                         crate::acp::proto::ContentBlock::ResourceLink { uri, .. } => {
-                            staged_paths.push(crate::acp::proto::path_from_file_uri(uri).unwrap_or_else(|| uri.clone()));
+                            staged_paths
+                                .push(crate::acp::proto::path_from_file_uri(uri).unwrap_or_else(|| uri.clone()));
                         }
                         _ => {}
                     }
@@ -771,14 +780,7 @@ pub(super) async fn agent_send(core: Ctx<'_>, p: SendParams) -> Result<SendResul
                 core.tagged(sender, id, &combined_raw, false)
             };
             let sent = core
-                .send_with_attachments(
-                    id,
-                    &text,
-                    attachments,
-                    p.steer,
-                    p.only_if.map(|w| word(&w)).as_deref(),
-                    sender,
-                )
+                .send_with_attachments(id, &text, attachments, p.steer, p.only_if.map(|w| word(&w)).as_deref(), sender)
                 .await?;
             core.clear_manual_status_key(TargetKey::Agent(id));
             core.clear_manual_status_caller(p.from.as_deref());
@@ -940,7 +942,9 @@ async fn agent_config(core: Ctx<'_>, p: ConfigParams) -> Result<Public, RpcError
 async fn apply_permissions_config(core: Ctx<'_>, id: u32, val: &serde_json::Value) -> Result<bool, RpcError> {
     let raw_str = val.as_str().map(str::trim);
     let next_perm = match val {
-        serde_json::Value::String(s) => s.parse::<crate::permissions::PermissionMode>().map_err(RpcError::invalid_params)?,
+        serde_json::Value::String(s) => {
+            s.parse::<crate::permissions::PermissionMode>().map_err(RpcError::invalid_params)?
+        }
         serde_json::Value::Bool(true) => crate::permissions::PermissionMode::ApproveAll,
         serde_json::Value::Bool(false) => crate::permissions::PermissionMode::ApproveReads,
         _ => unreachable!(),
@@ -994,16 +998,9 @@ async fn apply_permissions_config(core: Ctx<'_>, id: u32, val: &serde_json::Valu
     Ok(next_perm == crate::permissions::PermissionMode::ApproveAll && st.pending_perms.contains_key(&id))
 }
 
-async fn apply_acp_config(
-    core: Ctx<'_>,
-    id: u32,
-    config_id: &str,
-    val: serde_json::Value,
-) -> Result<bool, RpcError> {
-    let default_permissions = crate::config::load(&core.paths.config)
-        .ok()
-        .and_then(|c| c.default_permissions)
-        .unwrap_or_default();
+async fn apply_acp_config(core: Ctx<'_>, id: u32, config_id: &str, val: serde_json::Value) -> Result<bool, RpcError> {
+    let default_permissions =
+        crate::config::load(&core.paths.config).ok().and_then(|c| c.default_permissions).unwrap_or_default();
     let (session_id, effective_id, source, transport, is_claude, mode_choices, opts_snapshot) = {
         let st = core.lock();
         let a = st.reg.agents.get(&id).ok_or_else(|| {
@@ -1025,11 +1022,10 @@ async fn apply_acp_config(
             .find(|o| o.id == "mode" || o.category.as_deref() == Some("mode"))
             .map(|o| o.options.clone())
             .unwrap_or_default();
-        let transport = st
-            .sessions
-            .get(&id)
-            .map(|h| h.transport.clone())
-            .ok_or_else(|| RpcError::new("unavailable", format!("{} has no active ACP transport", a.address), ""))?;
+        let transport =
+            st.sessions.get(&id).map(|h| h.transport.clone()).ok_or_else(|| {
+                RpcError::new("unavailable", format!("{} has no active ACP transport", a.address), "")
+            })?;
         (session_id, effective_id, source, transport, is_claude, mode_choices, a.config_options.clone())
     };
 
@@ -1047,11 +1043,12 @@ async fn apply_acp_config(
     };
     let wants_bypass = effective_id == "mode" && val.as_str().is_some_and(crate::permissions::is_bypass_mode_id);
 
-    let mut fresh = match crate::acp::apply_config_option(&transport, &session_id, &effective_id, &val, source.as_deref()).await {
-        Ok(opts) => opts,
-        Err(_) if wants_bypass => None,
-        Err(e) => return Err(e),
-    };
+    let mut fresh =
+        match crate::acp::apply_config_option(&transport, &session_id, &effective_id, &val, source.as_deref()).await {
+            Ok(opts) => opts,
+            Err(_) if wants_bypass => None,
+            Err(e) => return Err(e),
+        };
 
     let mut applied_effort: Option<(String, serde_json::Value)> = None;
     if let Some(eff) = split_effort {
@@ -1189,29 +1186,26 @@ async fn agent_interrupt(core: Ctx<'_>, p: InterruptParams) -> Result<InterruptR
 
 async fn events_subscribe(core: Ctx<'_>, p: SubscribeParams) -> Result<SubscribeResult, RpcError> {
     use crate::events::{Filter, Sink};
-    let address_agent = |a: &str| match a.split_once('/').filter(|(m, _)| core.lock().machines.iter().any(|x| x.name == *m)) {
-        Some(_) => Ok(a.to_string()),
-        None => resolve(core, a).map(crate::agents::address),
-    };
-    let address_term = |t: &str| match t.split_once('/').filter(|(m, _)| core.lock().machines.iter().any(|x| x.name == *m)) {
-        Some(_) => Ok(t.to_string()),
-        None => resolve_pty(core, t).map(crate::terminals::address),
-    };
-    let address_any = |x: &str| match x.split_once('/').filter(|(m, _)| core.lock().machines.iter().any(|x| x.name == *m)) {
-        Some(_) => Ok(x.to_string()),
-        None => resolve_any(core, x).map(TargetKey::address),
-    };
+    let address_agent =
+        |a: &str| match a.split_once('/').filter(|(m, _)| core.lock().machines.iter().any(|x| x.name == *m)) {
+            Some(_) => Ok(a.to_string()),
+            None => resolve(core, a).map(crate::agents::address),
+        };
+    let address_term =
+        |t: &str| match t.split_once('/').filter(|(m, _)| core.lock().machines.iter().any(|x| x.name == *m)) {
+            Some(_) => Ok(t.to_string()),
+            None => resolve_pty(core, t).map(crate::terminals::address),
+        };
+    let address_any =
+        |x: &str| match x.split_once('/').filter(|(m, _)| core.lock().machines.iter().any(|x| x.name == *m)) {
+            Some(_) => Ok(x.to_string()),
+            None => resolve_any(core, x).map(TargetKey::address),
+        };
     let agent = p.agent.as_deref().map(address_agent).transpose()?;
     let terminal = p.terminal.as_deref().map(address_term).transpose()?;
     let children_of = p.children_of.as_deref().map(address_any).transpose()?;
-    let filter = Filter {
-        agent,
-        terminal,
-        children_of,
-        labels: labels(&p.labels),
-        docs: p.docs,
-        here_only: from_afar(core),
-    };
+    let filter =
+        Filter { agent, terminal, children_of, labels: labels(&p.labels), docs: p.docs, here_only: from_afar(core) };
     let (sink, channel) = match (core.conn, core.plain) {
         (Some(conn), _) => {
             let channel = conn.new_channel();
@@ -1413,7 +1407,10 @@ async fn drove_magpie_test(
     core.drove.rpc_magpie_test(p.gateway_url).await
 }
 
-async fn drove_web_open(core: Ctx<'_>, p: DroveWebOpenParams) -> Result<crate::drove::types::DroveWebOpenResult, RpcError> {
+async fn drove_web_open(
+    core: Ctx<'_>,
+    p: DroveWebOpenParams,
+) -> Result<crate::drove::types::DroveWebOpenResult, RpcError> {
     core.drove.open_web(p.run_id.as_deref(), p.no_open)
 }
 
@@ -1426,7 +1423,11 @@ async fn drove_http_proxy(
 
 async fn drove_subscribe(core: Ctx<'_>, _: Empty) -> Result<DroveSubscribeResult, RpcError> {
     let Some(conn) = core.conn else {
-        return Err(RpcError::new("needs_framed", "drove.subscribe needs a framed connection", "send hello with framed: true"));
+        return Err(RpcError::new(
+            "needs_framed",
+            "drove.subscribe needs a framed connection",
+            "send hello with framed: true",
+        ));
     };
     let val = core.drove.rpc_subscribe(conn)?;
     let ch = val["channel"].as_u64().unwrap_or(0) as u32;
@@ -1437,10 +1438,7 @@ async fn ai_status(core: Ctx<'_>, _: crate::ai::AiOnParams) -> Result<crate::ai:
     Ok(core.ai.status_refresh_models().await)
 }
 
-async fn ai_settings_set(
-    core: Ctx<'_>,
-    p: crate::ai::AiSettingsSetParams,
-) -> Result<crate::ai::AiStatus, RpcError> {
+async fn ai_settings_set(core: Ctx<'_>, p: crate::ai::AiSettingsSetParams) -> Result<crate::ai::AiStatus, RpcError> {
     let st = core.ai.update_settings(p).await?;
     core.drove.sync_ai_from_core();
     Ok(st)
@@ -1450,10 +1448,13 @@ async fn ai_test(core: Ctx<'_>, p: crate::ai::AiTestParams) -> Result<crate::ai:
     core.ai.test_connection(p.base_url, p.api_key, p.model).await
 }
 
-async fn ai_complete(
-    core: Ctx<'_>,
-    p: crate::ai::AiCompleteParams,
-) -> Result<crate::ai::AiCompleteResult, RpcError> {
+async fn ai_probe_prompt_mode(core: Ctx<'_>, _: crate::ai::AiOnParams) -> Result<crate::ai::AiProbePromptModeResult, RpcError> {
+    let res = core.ai.probe_prompt_mode().await?;
+    core.drove.sync_ai_from_core();
+    Ok(res)
+}
+
+async fn ai_complete(core: Ctx<'_>, p: crate::ai::AiCompleteParams) -> Result<crate::ai::AiCompleteResult, RpcError> {
     core.ai.rpc_complete(p).await
 }
 
@@ -1464,14 +1465,8 @@ async fn ai_classify_terminal_state(
     Ok(crate::ai::classify_terminal_state(&core.ai, p).await)
 }
 
-async fn ai_briefing(
-    core: Ctx<'_>,
-    p: crate::ai::BriefingParams,
-) -> Result<crate::ai::BriefingSnapshot, RpcError> {
-    let is_zh = p
-        .language
-        .as_deref()
-        .is_some_and(|l| l.to_ascii_lowercase().starts_with("zh"));
+async fn ai_briefing(core: Ctx<'_>, p: crate::ai::BriefingParams) -> Result<crate::ai::BriefingSnapshot, RpcError> {
+    let is_zh = p.language.as_deref().is_some_and(|l| l.to_ascii_lowercase().starts_with("zh"));
     let (agent_inputs, core_terminals) = {
         let st = core.lock();
         let mut agents_out: Vec<crate::ai::BriefingAgentInput> = Vec::new();
@@ -1500,10 +1495,8 @@ async fn ai_briefing(
                         a.agent.clone().unwrap_or_else(|| a.address.clone())
                     }
                 });
-            let has_diff = st
-                .checkpoints
-                .get(&a.address)
-                .is_some_and(|tc| tc.checkpoints.iter().any(|c| !c.files.is_empty()));
+            let has_diff =
+                st.checkpoints.get(&a.address).is_some_and(|tc| tc.checkpoints.iter().any(|c| !c.files.is_empty()));
             agents_out.push(crate::ai::BriefingAgentInput {
                 address: a.address.clone(),
                 machine: None,
@@ -1523,7 +1516,11 @@ async fn ai_briefing(
                 if rec["state"].as_str() != Some("live") {
                     continue;
                 }
-                if rec.pointer("/labels/herdr.trashed").and_then(serde_json::Value::as_str).is_some_and(|s| !s.is_empty()) {
+                if rec
+                    .pointer("/labels/herdr.trashed")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|s| !s.is_empty())
+                {
                     continue;
                 }
                 let Some(addr) = rec["address"].as_str() else { continue };
@@ -1616,28 +1613,17 @@ async fn ai_summarize_agent(
     core: Ctx<'_>,
     p: crate::ai::SummarizeAgentParams,
 ) -> Result<crate::ai::AgentDigestResult, RpcError> {
-    let is_zh = p
-        .language
-        .as_deref()
-        .is_some_and(|l| l.to_ascii_lowercase().starts_with("zh"));
+    let is_zh = p.language.as_deref().is_some_and(|l| l.to_ascii_lowercase().starts_with("zh"));
     match resolve_any(core, &p.target)? {
         TargetKey::Agent(id) => {
             let (addr, program, status, turn, pending, existing, entries) = {
                 let st = core.lock();
-                let a = st
-                    .reg
-                    .agents
-                    .get(&id)
-                    .ok_or_else(|| RpcError::new("not_found", "agent not found", ""))?;
-                let entries = st
-                    .transcripts
-                    .get(&id)
-                    .map(|t| t.entries().to_vec())
-                    .unwrap_or_else(|| {
-                        crate::transcript::load(&core.paths.state, &a.address)
-                            .map(|t| t.entries().to_vec())
-                            .unwrap_or_default()
-                    });
+                let a = st.reg.agents.get(&id).ok_or_else(|| RpcError::new("not_found", "agent not found", ""))?;
+                let entries = st.transcripts.get(&id).map(|t| t.entries().to_vec()).unwrap_or_else(|| {
+                    crate::transcript::load(&core.paths.state, &a.address)
+                        .map(|t| t.entries().to_vec())
+                        .unwrap_or_default()
+                });
                 (
                     a.address.clone(),
                     a.agent.clone().unwrap_or_else(|| "acp".into()),
@@ -1678,18 +1664,12 @@ async fn ai_summarize_agent(
             };
             {
                 let mut st = core.lock();
-                core.apply_digest(
-                    &mut st,
-                    id,
-                    result.semantic_title.clone(),
-                    result.micro_summary.clone(),
-                    false,
-                );
+                core.apply_digest(&mut st, id, result.semantic_title.clone(), result.micro_summary.clone(), false);
             }
             Ok(result)
         }
         TargetKey::Terminal(id) => {
-            let (addr, program, status, turn, existing, orig_fg_pid, snap, screen_fallback) = {
+            let (addr, program, status, turn, existing, orig_started_ms, live_title, snap, screen_fallback) = {
                 let mut st = core.lock();
                 let t = st
                     .pty_reg
@@ -1706,7 +1686,8 @@ async fn ai_summarize_agent(
                         from_cache: false,
                     });
                 }
-                let orig_fg_pid = t.foreground.as_ref().map(|f| f.pid);
+                let orig_started_ms = t.program_started_ms;
+                let live_title = t.title.clone();
                 let screen_fallback = core.screen_text(&st, id);
                 let mut snap = crate::pty_transcript::snapshot_from_terminal(&t, st.pty_prompts.get(&id));
                 let addr = t.address.clone();
@@ -1726,7 +1707,7 @@ async fn ai_summarize_agent(
                     .unwrap_or_else(|| "idle".into());
                 let turn = t.turn.max(1);
                 let existing = t.semantic_title.clone();
-                (addr, program, status, turn, existing, orig_fg_pid, snap, screen_fallback)
+                (addr, program, status, turn, existing, orig_started_ms, live_title, snap, screen_fallback)
             };
             let (entries, _) = blocking(move || Ok(crate::pty_transcript::extract_transcript(&snap))).await?;
             let det = if !entries.is_empty() {
@@ -1735,18 +1716,21 @@ async fn ai_summarize_agent(
                     .as_deref()
                     .map(|l| l.to_ascii_lowercase().starts_with("zh"))
                     .unwrap_or_else(|| crate::ai::digest::entries_prefer_zh(&entries));
-                crate::ai::build_deterministic_acp_digest(
-                    &status,
-                    turn,
-                    None,
-                    &entries,
-                    existing.as_deref(),
-                    eff_zh,
-                )
+                crate::ai::build_deterministic_acp_digest(&status, turn, None, &entries, existing.as_deref(), eff_zh)
             } else if let Some(ref screen) = screen_fallback {
-                crate::ai::digest::build_deterministic_screen_digest(screen, existing.as_deref())
+                crate::ai::digest::build_deterministic_screen_digest_with_title(
+                    screen,
+                    existing.as_deref(),
+                    Some(&live_title),
+                    Some(&program),
+                )
             } else {
-                crate::ai::digest::DeterministicDigest::default()
+                crate::ai::digest::build_deterministic_screen_digest_with_title(
+                    "",
+                    existing.as_deref(),
+                    Some(&live_title),
+                    Some(&program),
+                )
             };
             let result = if p.include_ai {
                 crate::ai::refine_agent_digest(
@@ -1773,7 +1757,7 @@ async fn ai_summarize_agent(
                 let still_same_cli = st.pty_reg.terminals.get(&id).is_some_and(|cur| {
                     cur.is_live()
                         && !crate::foreground::is_at_shell_root(cur)
-                        && (orig_fg_pid.is_none() || cur.foreground.as_ref().map(|f| f.pid) == orig_fg_pid)
+                        && cur.program_started_ms == orig_started_ms
                 });
                 if still_same_cli {
                     core.apply_pty_digest(
@@ -1813,59 +1797,123 @@ async fn ai_polish_prompt(
     p: crate::ai::PolishPromptParams,
 ) -> Result<crate::ai::PolishPromptResult, RpcError> {
     let mut inferred_kind = p.agent_kind.clone();
-    let mut ctx_parts: Vec<String> = Vec::new();
-    if let Some(c) = p.context.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
-        ctx_parts.push(c.to_string());
-    }
-    if let Some(tgt) = p.target.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    let caller_context = p.context.as_deref().map(str::trim).filter(|s| !s.is_empty());
+
+    let session_ctx = if let Some(tgt) = p.target.as_deref().map(str::trim).filter(|s| !s.is_empty())
         && let Ok(tk) = resolve_any(core, tgt)
     {
-        let st = core.lock();
         match tk {
             TargetKey::Agent(id) => {
                 if inferred_kind.is_none() {
                     inferred_kind = Some("acp".into());
                 }
-                if let Some(a) = st.reg.agents.get(&id) {
-                    if let Some(prog) = a.agent.as_deref().filter(|s| !s.is_empty()) {
-                        ctx_parts.push(format!("agent={prog}"));
-                    }
-                    if let Some(title) = a.semantic_title.as_deref().filter(|s| !s.is_empty()) {
-                        ctx_parts.push(format!("task={title}"));
-                    }
-                    if !a.cwd.is_empty() {
-                        ctx_parts.push(format!("cwd={}", a.cwd));
-                    }
+                let snap = {
+                    let st = core.lock();
+                    st.reg.agents.get(&id).map(|a| {
+                        let entries = st.transcripts.get(&id).map(|t| t.entries().to_vec()).unwrap_or_else(|| {
+                            crate::transcript::load(&core.paths.state, &a.address)
+                                .map(|t| t.entries().to_vec())
+                                .unwrap_or_default()
+                        });
+                        (
+                            a.agent.as_deref().filter(|s| !s.is_empty()).map(|s| format!("agent={s}")),
+                            a.semantic_title.clone(),
+                            a.micro_summary.clone(),
+                            a.cwd.clone(),
+                            a.pending_permission.clone(),
+                            entries,
+                        )
+                    })
+                };
+                if let Some((program_tag, semantic_title, micro_summary, cwd, pending_permission, entries)) = snap {
+                    crate::ai::build_polish_session_context(crate::ai::PolishContextInput {
+                        caller_context,
+                        program_tag,
+                        semantic_title: semantic_title.as_deref(),
+                        progress_summary: micro_summary.as_deref(),
+                        cwd: Some(&cwd),
+                        pending_permission: pending_permission.as_ref(),
+                        entries: &entries,
+                        screen_text: None,
+                        draft_prompt: &p.prompt,
+                    })
+                } else {
+                    crate::ai::build_polish_session_context(crate::ai::PolishContextInput {
+                        caller_context,
+                        draft_prompt: &p.prompt,
+                        ..Default::default()
+                    })
                 }
             }
             TargetKey::Terminal(id) => {
                 if inferred_kind.is_none() {
                     inferred_kind = Some("cli".into());
                 }
-                if let Some(t) = st.pty_reg.terminals.get(&id) {
-                    if let Some(fg) = t.foreground.as_ref().map(|f| f.name.as_str()).filter(|s| !s.is_empty()) {
-                        ctx_parts.push(format!("cli={fg}"));
-                    }
-                    if let Some(title) = t.semantic_title.as_deref().filter(|s| !s.is_empty()) {
-                        ctx_parts.push(format!("task={title}"));
-                    }
-                    if !t.cwd.is_empty() {
-                        ctx_parts.push(format!("cwd={}", t.cwd));
-                    }
+                let term_info = {
+                    let mut st = core.lock();
+                    st.pty_reg.terminals.get(&id).cloned().map(|t| {
+                        let at_shell_root = crate::foreground::is_at_shell_root(&t);
+                        let screen_text = core.screen_text(&st, id);
+                        let snap = if at_shell_root {
+                            None
+                        } else {
+                            let mut s = crate::pty_transcript::snapshot_from_terminal(&t, st.pty_prompts.get(&id));
+                            let addr = t.address.clone();
+                            crate::pty_transcript::populate_session_affinity(&mut s, &addr, core, &mut st);
+                            Some(s)
+                        };
+                        let program_tag = t
+                            .foreground
+                            .as_ref()
+                            .map(|f| f.name.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| format!("cli={s}"));
+                        let progress = t.micro_summary.clone();
+                        (program_tag, t.semantic_title.clone(), progress, t.cwd.clone(), screen_text, snap)
+                    })
+                };
+                if let Some((program_tag, semantic_title, progress, cwd, screen_text, snap)) = term_info {
+                    let entries = if let Some(s) = snap {
+                        blocking(move || Ok(crate::pty_transcript::extract_transcript(&s)))
+                            .await
+                            .map(|(entries, _)| entries)
+                            .unwrap_or_default()
+                    } else {
+                        Vec::new()
+                    };
+                    crate::ai::build_polish_session_context(crate::ai::PolishContextInput {
+                        caller_context,
+                        program_tag,
+                        semantic_title: semantic_title.as_deref(),
+                        progress_summary: progress.as_deref(),
+                        cwd: Some(&cwd),
+                        pending_permission: None,
+                        entries: &entries,
+                        screen_text: screen_text.as_deref(),
+                        draft_prompt: &p.prompt,
+                    })
+                } else {
+                    crate::ai::build_polish_session_context(crate::ai::PolishContextInput {
+                        caller_context,
+                        draft_prompt: &p.prompt,
+                        ..Default::default()
+                    })
                 }
             }
         }
-    }
-    let merged_context = if ctx_parts.is_empty() {
-        None
     } else {
-        Some(ctx_parts.join(" · "))
+        crate::ai::build_polish_session_context(crate::ai::PolishContextInput {
+            caller_context,
+            draft_prompt: &p.prompt,
+            ..Default::default()
+        })
     };
+
     crate::ai::polish_prompt(
         &core.ai,
         &p.prompt,
         inferred_kind.as_deref(),
-        merged_context.as_deref(),
+        &session_ctx,
         p.language.as_deref(),
     )
     .await
@@ -1900,7 +1948,11 @@ async fn checkpoint_list(core: Ctx<'_>, p: CheckpointListParams) -> Result<Check
                 (a.address.clone(), a.cwd.clone())
             }
             TargetKey::Terminal(id) => {
-                let t = st.pty_reg.terminals.get(&id).ok_or_else(|| RpcError::new("not_found", "terminal not found", ""))?;
+                let t = st
+                    .pty_reg
+                    .terminals
+                    .get(&id)
+                    .ok_or_else(|| RpcError::new("not_found", "terminal not found", ""))?;
                 let cwd = t
                     .foreground
                     .as_ref()
@@ -1917,9 +1969,7 @@ async fn checkpoint_list(core: Ctx<'_>, p: CheckpointListParams) -> Result<Check
         (addr, cwd, tc, live_snapshot)
     };
     let repo = crate::checkpoint::probe_repo(std::path::Path::new(&cwd));
-    let isolation = repo
-        .as_ref()
-        .map(|r| crate::checkpoint_safety::evaluate_isolation(&addr, r, &live_snapshot));
+    let isolation = repo.as_ref().map(|r| crate::checkpoint_safety::evaluate_isolation(&addr, r, &live_snapshot));
     Ok(CheckpointListResult {
         target: addr,
         repo_root: tc.repo_root.or_else(|| repo.map(|r| r.toplevel.to_string_lossy().to_string())),
@@ -1950,7 +2000,10 @@ async fn checkpoint_capture(core: Ctx<'_>, p: CheckpointCaptureParams) -> Result
     Ok(CheckpointCaptureResult { target: addr, checkpoint: meta })
 }
 
-async fn checkpoint_diff(core: Ctx<'_>, p: CheckpointDiffParams) -> Result<crate::checkpoint::CheckpointDiff, RpcError> {
+async fn checkpoint_diff(
+    core: Ctx<'_>,
+    p: CheckpointDiffParams,
+) -> Result<crate::checkpoint::CheckpointDiff, RpcError> {
     let tk = resolve_any(core, &p.target)?;
     let (addr, cwd, tc) = {
         let mut st = core.lock();
@@ -1960,7 +2013,11 @@ async fn checkpoint_diff(core: Ctx<'_>, p: CheckpointDiffParams) -> Result<crate
                 (a.address.clone(), a.cwd.clone())
             }
             TargetKey::Terminal(id) => {
-                let t = st.pty_reg.terminals.get(&id).ok_or_else(|| RpcError::new("not_found", "terminal not found", ""))?;
+                let t = st
+                    .pty_reg
+                    .terminals
+                    .get(&id)
+                    .ok_or_else(|| RpcError::new("not_found", "terminal not found", ""))?;
                 let cwd = t
                     .foreground
                     .as_ref()
@@ -1978,14 +2035,11 @@ async fn checkpoint_diff(core: Ctx<'_>, p: CheckpointDiffParams) -> Result<crate
     if tc.checkpoints.is_empty() {
         return Err(RpcError::invalid_params(format!("no checkpoints recorded for {addr}")));
     }
-    let to_turn = p
-        .to
-        .or_else(|| tc.checkpoints.iter().map(|c| c.turn).max())
-        .ok_or_else(|| RpcError::invalid_params(format!("no target checkpoint for {addr}")))?;
-    let from_turn = p
-        .from
-        .or_else(|| tc.checkpoints.iter().filter(|c| c.turn < to_turn).map(|c| c.turn).max())
-        .unwrap_or(0);
+    let to_turn =
+        p.to.or_else(|| tc.checkpoints.iter().map(|c| c.turn).max())
+            .ok_or_else(|| RpcError::invalid_params(format!("no target checkpoint for {addr}")))?;
+    let from_turn =
+        p.from.or_else(|| tc.checkpoints.iter().filter(|c| c.turn < to_turn).map(|c| c.turn).max()).unwrap_or(0);
     let from_meta = tc
         .checkpoints
         .iter()
@@ -2035,7 +2089,11 @@ async fn checkpoint_bisect(
                 (a.address.clone(), a.cwd.clone())
             }
             TargetKey::Terminal(id) => {
-                let t = st.pty_reg.terminals.get(&id).ok_or_else(|| RpcError::new("not_found", "terminal not found", ""))?;
+                let t = st
+                    .pty_reg
+                    .terminals
+                    .get(&id)
+                    .ok_or_else(|| RpcError::new("not_found", "terminal not found", ""))?;
                 let cwd = t
                     .foreground
                     .as_ref()
@@ -2054,15 +2112,7 @@ async fn checkpoint_bisect(
     let repo = crate::checkpoint::probe_repo(std::path::Path::new(repo_dir))
         .ok_or_else(|| RpcError::invalid_params(format!("workspace `{repo_dir}` is not a Git repository")))?;
     let _guard = core.repo_ckpt_lock(&repo.toplevel).lock_owned().await;
-    crate::ai::bisect::bisect_checkpoints(
-        &core.ai,
-        repo,
-        &addr,
-        &tc.checkpoints,
-        &p.query,
-        p.language.as_deref(),
-    )
-    .await
+    crate::ai::bisect::bisect_checkpoints(&core.ai, repo, &addr, &tc.checkpoints, &p.query, p.language.as_deref()).await
 }
 
 async fn checkpoint_hook(core: Ctx<'_>, p: CheckpointHookParams) -> Result<CheckpointHookResult, RpcError> {

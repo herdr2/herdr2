@@ -184,7 +184,13 @@ fn fixture(populated: bool, props: Value, update: Value) -> BTreeMap<String, Val
     values
 }
 
-fn module(values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostModule {
+fn module(mut values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> HostModule {
+    if let Some(Value::Object(map)) = values.remove("shared") {
+        let mut s = calls.borrow_mut();
+        for (k, v) in map {
+            s.shared.insert(k, v);
+        }
+    }
     let mut module = HostModule::new("herdr");
     for (name, value) in values {
         module = module.function(name, move |_| Ok(to_host(&value)));
@@ -1374,6 +1380,7 @@ fn option_key_settings_are_only_shown_on_macos(cx: &mut TestAppContext) {
         assert!(tree.contains("st-s-keyboard"), "Shortcuts section must be visible on {platform}: {tree}");
         assert!(tree.contains("st-shortcuts"), "Shortcuts editor must render on {platform}: {tree}");
         assert!(tree.contains("st-key-global-prompt.polish"), "AI prompt polish shortcut row missing on {platform}: {tree}");
+        assert!(tree.contains("st-key-global-prompt.polish_undo"), "Undo AI polish shortcut row missing on {platform}: {tree}");
         assert!(tree.contains("st-key-global-tab.new"), "New tab shortcut row missing on {platform}: {tree}");
         assert!(tree.contains("st-key-global-terminal.open"), "New terminal shortcut row missing on {platform}: {tree}");
         assert!(tree.contains("st-key-global-mod.open:flash-note"), "Flash note shortcut row missing on {platform}: {tree}");
@@ -2520,7 +2527,7 @@ fn settings_drove_renders_policies_codex_fast_and_english_drove_label(cx: &mut T
         true,
         json!({ "section": "ai" }),
         updates("current", "current"),
-        Some("this.aiStatus = { enabled: true, configured: true, baseUrl: 'https://api.example.com/v1', model: 'gpt-4o-mini', effort: 'low', contextWindow: '64k', maxTokens: 1024, switches: { ptyStatusArbitration: true, notesDigest: true, promptCacheEnabled: true }, usage: { totalCalls: 12, localCacheHits: 5, sessionsReused: 3, activeSessions: 1, inputTokens: 18000, cachedInputTokens: 14000, outputTokens: 900, cacheHitRatio: 0.777 } };"),
+        Some("this.aiStatus = { enabled: true, configured: true, baseUrl: 'https://api.example.com/v1', model: 'gpt-4o-mini', effort: 'low', contextWindow: '64k', maxTokens: 1024, switches: { ptyStatusArbitration: true, notesDigest: true, promptCacheEnabled: true, redactSecrets: true }, usage: { totalCalls: 12, localCacheHits: 5, sessionsReused: 3, activeSessions: 1, inputTokens: 18000, cachedInputTokens: 14000, outputTokens: 900, cacheHitRatio: 0.777, promptCacheAutoDegraded: true, opMetrics: { pty_status: { calls: 6, localCacheHits: 4, failures: 0, parseErrors: 0, lowConfidenceRejects: 1, totalLatencyMs: 2400 } } } };"),
     )
     .unwrap();
     for expected in [
@@ -2534,8 +2541,21 @@ fn settings_drove_renders_policies_codex_fast_and_english_drove_label(cx: &mut T
         "PTY Terminal State Arbitration",
         "Child Note Error Digest",
         "Prompt KV-Cache Optimization",
+        "st-ai-prompt-mode-group",
+        "st-ai-pm-shared_prefix",
+        "st-ai-pm-compact",
+        "st-ai-pm-auto",
+        "st-ai-pm-redetect",
+        "Shared Prefix",
+        "Compact",
+        "Re-detect Automatically",
+        "Outbound Secret Redaction",
+        "st-ai-sw-redact",
         "KV Cache Hit Rate",
         "77.7%",
+        "st-ai-cache-degraded",
+        "st-ai-op-metrics",
+        "pty_status",
     ] {
         assert!(ai_en_tree.contains(expected), "EN AI settings missing {expected}: {ai_en_tree}");
     }
@@ -2566,7 +2586,19 @@ fn settings_drove_renders_policies_codex_fast_and_english_drove_label(cx: &mut T
         Some("this.aiStatus = { enabled: true, configured: true, baseUrl: 'https://api.example.com/v1', model: 'gpt-4o-mini', effort: 'low', switches: { ptyStatusArbitration: true, notesDigest: true, promptCacheEnabled: true }, usage: { totalCalls: 4, localCacheHits: 2, sessionsReused: 1, activeSessions: 1, inputTokens: 4000, cachedInputTokens: 3000, outputTokens: 200, cacheHitRatio: 0.75 } };"),
     )
     .unwrap();
-    for expected in ["核心 AI 助手", "思考强度", "上下文大小", "最大输出长度", "非协议终端语义状态仲裁", "父子通知异常智能摘要", "KV 缓存命中率"] {
+    for expected in [
+        "核心 AI 助手",
+        "思考强度",
+        "上下文大小",
+        "最大输出长度",
+        "非协议终端语义状态仲裁",
+        "父子通知异常智能摘要",
+        "长共享前缀",
+        "精简提示词",
+        "自动",
+        "重新自动识别",
+        "KV 缓存命中率",
+    ] {
         assert!(ai_zh_tree.contains(expected), "zh-CN AI settings missing {expected}: {ai_zh_tree}");
     }
 }
@@ -2715,18 +2747,37 @@ fn split_pane_names_merged_tabs_and_windows_shells(cx: &mut TestAppContext) {
         true,
         json!({ "section": "drove" }),
         updates("current", "current"),
-        Some("this.droveAiConfigMode = 'models'; this.droveRolesBackup = { mode: 'models', roles: {} }; this.droveData = { config: { roles: { reviewer: { label: 'Reviewer', access: 'readonly', primary: { agent: 'claude', model: 'claude-sonnet-4-5', effort: 'high', strengths: ['Security Audit', 'Architecture Review'] }, fallbacks: [{ agent: 'codex', model: 'gpt-5.4', effort: 'xhigh', fast: true, strengths: ['Concurrency & Locks'] }, { agent: 'agy', model: 'gemini-4-carbon-high', effort: 'high' }, { agent: 'cursor', model: 'grok-4.7', effort: 'high', context: '500k' }, { agent: 'cursor', model: 'grok-4.7-high', effort: 'high', context: '256k' }] } }, ai: { enabled: true, baseUrl: 'https://api.deepseek.com', model: 'deepseek-chat' } }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'claude', installed: true, models: ['claude-sonnet-4-5', 'claude-opus-4-6'] }, { id: 'codex', installed: true, models: ['gpt-5.4'] }, { id: 'agy', installed: true, models: ['gemini-4-carbon-high'] }, { id: 'cursor', installed: true, models: ['grok-4.7', 'grok-4.7-high'], modelContexts: { 'grok-4.7': ['256k', '500k'] } }] } };"),
+        Some("this.droveAiConfigMode = 'models'; this.droveRolesBackup = { mode: 'models', roles: {} }; this.droveData = { config: { note: 'Avoid GLM between 14:00 and 18:00', roles: { reviewer: { label: 'Reviewer', access: 'readonly', primary: { agent: 'claude', model: 'claude-sonnet-4-5', effort: 'high', strengths: ['Security Audit', 'Architecture Review'], note: 'Prefer for security audits' }, fallbacks: [{ agent: 'codex', model: 'gpt-5.4', effort: 'xhigh', fast: true, strengths: ['Concurrency & Locks'] }, { agent: 'agy', model: 'gemini-4-carbon-high', effort: 'high' }, { agent: 'cursor', model: 'grok-4.7', effort: 'high', context: '500k' }, { agent: 'cursor', model: 'grok-4.7-high', effort: 'high', context: '256k' }] } }, ai: { enabled: true, baseUrl: 'https://api.deepseek.com', model: 'deepseek-chat' } }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'claude', installed: true, models: ['claude-sonnet-4-5', 'claude-opus-4-6'] }, { id: 'codex', installed: true, models: ['gpt-5.4'] }, { id: 'agy', installed: true, models: ['gemini-4-carbon-high'] }, { id: 'cursor', installed: true, models: ['grok-4.7', 'grok-4.7-high'], modelContexts: { 'grok-4.7': ['256k', '500k'] } }] } }; this.syncDroveInputs(this.droveData);"),
     )
     .unwrap();
     assert!(aligned_tree.contains("st-dr-ai-models-btn"), "Roles header should render AI Models button: {aligned_tree}");
     assert!(aligned_tree.contains("st-dr-ai-strengths-btn"), "Roles header should render AI Strengths button: {aligned_tree}");
+    assert!(aligned_tree.contains("st-dr-ai-notes-btn"), "Roles header should render AI Notes button: {aligned_tree}");
     assert!(aligned_tree.contains("st-dr-ai-roles-undo"), "Roles header should render Restore button when backup exists: {aligned_tree}");
+    assert!(aligned_tree.contains("st-dr-role-note-card"), "Roles section should render global Routing Note card: {aligned_tree}");
+    assert!(aligned_tree.contains("st-dr-role-note-ai"), "Global Routing Note card should render AI Note button: {aligned_tree}");
+    assert!(aligned_tree.contains("st-dr-role-note-input"), "Roles section should render global Routing Note textarea: {aligned_tree}");
+    assert!(aligned_tree.contains("st-dr-role-note-save"), "Roles section should render Save Note button: {aligned_tree}");
     assert!(aligned_tree.contains("st-dr-ai-roles-panel"), "Expanded AI Auto-Config panel should render: {aligned_tree}");
     assert!(aligned_tree.contains("st-dr-ai-roles-prompt"), "Expanded AI panel should render tall multiline Textarea: {aligned_tree}");
     assert!(aligned_tree.contains("st-dr-ai-roles-run"), "Expanded AI Auto-Config panel should render Generate button: {aligned_tree}");
     assert!(aligned_tree.contains("st-dr-str-chip-reviewer-0-0"), "Candidate strengths chip should render: {aligned_tree}");
     assert!(aligned_tree.contains("Security Audit"), "Candidate strength label should render: {aligned_tree}");
     assert!(aligned_tree.contains("st-dr-str-add-reviewer-c0"), "Candidate strength add picker should render: {aligned_tree}");
+    assert!(aligned_tree.contains("st-dr-cnote-btn-reviewer-c0"), "Candidate note trigger should render: {aligned_tree}");
+    assert!(aligned_tree.contains("Prefer for security audits"), "Candidate note preview should render: {aligned_tree}");
+    assert!(aligned_tree.contains("st-dr-cnote-btn-reviewer-c1"), "Empty candidate note trigger should render: {aligned_tree}");
+    let cnote_popup_tree = describe(
+        cx,
+        &staged,
+        "frame/settings",
+        true,
+        json!({ "section": "drove" }),
+        updates("current", "current"),
+        Some("this.picking = 'drove-note:reviewer-c0'; this.droveData = { config: { roles: { reviewer: { label: 'Reviewer', access: 'readonly', primary: { agent: 'claude', model: 'claude-sonnet-4-5', effort: 'high' }, fallbacks: [] } }, ai: { enabled: true } }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'claude', installed: true, models: ['claude-sonnet-4-5'] }] } };"),
+    )
+    .unwrap();
+    assert!(cnote_popup_tree.contains("st-dr-cnote-ai-reviewer-c0"), "Candidate note popup should render AI Note button: {cnote_popup_tree}");
     assert!(aligned_tree.contains("st-dr-eff-reviewer-0-high"), "3-level model (claude-sonnet-4-5) should show High effort: {aligned_tree}");
     assert!(!aligned_tree.contains("st-dr-eff-reviewer-0-xhigh"), "3-level model (claude-sonnet-4-5) must NOT show xhigh effort: {aligned_tree}");
     assert!(aligned_tree.contains("st-dr-eff-reviewer-1-xhigh"), "4-level model (gpt-5.4) should show xhigh effort: {aligned_tree}");
@@ -3489,6 +3540,125 @@ export default class SwitchTest extends Real {
 }
 
 #[gpui::test]
+fn files_mod_renders_mermaid_diagrams_and_math_formulas_as_valid_svgs(cx: &mut TestAppContext) {
+    use gpui::VisualTestContext;
+    use std::ops::Deref as _;
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let rich_md = concat!(
+        "# Architecture & Math\n\n",
+        "Inline formula $E = mc^2$ and $\\frac{a+b}{c}$ with price $5 and $10.\n\n",
+        "```mermaid\n",
+        "flowchart TD\n",
+        "  subgraph Core[\"核心引擎\"]\n",
+        "    A([开始]) --> B{判断?}\n",
+        "    B -->|是| C[执行]\n",
+        "    B -.->|否| D[(存储)]\n",
+        "  end\n",
+        "```\n\n",
+        "```mermaid\n",
+        "sequenceDiagram\n",
+        "  participant U as User\n",
+        "  participant S as Server\n",
+        "  U->>+S: Request\n",
+        "  S-->>-U: Response\n",
+        "```\n\n",
+        "$$\n",
+        "\\int_{0}^{\\infty} e^{-x^2} \\, dx = \\frac{\\sqrt{\\pi}}{2}\n",
+        "$$\n\n",
+        "```math\n",
+        "\\begin{pmatrix} 1 & 2 \\\\ 3 & 4 \\end{pmatrix}\n",
+        "```\n\n",
+        "| Metric | Formula |\n",
+        "| --- | --- |\n",
+        "| Quadratic | $ax^2 + bx + c = 0$ |\n",
+    );
+
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    calls.borrow_mut().files.insert("/fixture/project/DOC.md".into(), rich_md.into());
+    calls.borrow_mut().shared.insert("files.treeOpen".into(), json!(false));
+
+    gpui_shell::policy::set_default(
+        Policy::new()
+            .with_storage_path(staged.0.join("store-files-mermaid-math.json"))
+            .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+            .with_host_module(module(fixture(true, json!({ "file": "DOC.md" }), updates("current", "current")), calls.clone()))
+            .unwrap(),
+    );
+    let runtime = ShellRuntime::new_isolated().unwrap();
+    let win = cx.add_window(|window, cx| RootedView(runtime.try_load(&staged.0.join("mods/files"), window, cx).unwrap()));
+    let view: gpui::Entity<gpui_shell::ScriptView> = win
+        .read_with(cx, |root, cx| root.0.read(cx).content().clone().downcast().unwrap())
+        .unwrap();
+    let mut visual = VisualTestContext::from_window(*win.deref(), cx);
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+    visual.run_until_parked();
+    visual.update(|window, cx| window.draw(cx).clear(cx));
+
+    let tree = visual.update(|_, cx| {
+        view.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
+    });
+    for expected in [
+        "files-md-view",
+        "files-md-mermaid-block-2",
+        "files-md-mermaid-body-2",
+        "Flowchart",
+        "files-md-mermaid-block-3",
+        "files-md-mermaid-body-3",
+        "Sequence",
+        "files-md-math-block-4",
+        "files-md-math-body-4",
+        "files-md-math-block-5",
+        "files-md-table-6",
+        "data:image/svg+xml,",
+    ] {
+        assert!(tree.contains(expected), "Mermaid/Math preview missing {expected}: {tree}");
+    }
+    assert!(calls.borrow().unexpected.is_empty(), "unexpected host calls: {:?}", calls.borrow().unexpected);
+
+    // Extract every generated `data:image/svg+xml,...` URL from the rendered tree and prove
+    // GPUI's real usvg/resvg SvgRenderer decodes and rasterizes each one cleanly.
+    let mut svg_count = 0usize;
+    let mut rest = tree.as_str();
+    while let Some(pos) = rest.find("data:image/svg+xml,") {
+        let after = &rest[pos + "data:image/svg+xml,".len()..];
+        let end = after.find(|c: char| matches!(c, '"' | '\'' | '\\' | ' ' | ')' | '>')).unwrap_or(after.len());
+        let encoded = &after[..end];
+        let decoded = percent_decode_test(encoded);
+        assert!(decoded.starts_with("<svg "), "expected decoded SVG payload, got: {}", &decoded[..decoded.len().min(80)]);
+        let rendered = visual.update(|_, cx| cx.svg_renderer().render_single_frame(decoded.as_bytes(), 1.0));
+        let image = rendered.unwrap_or_else(|e| panic!("SvgRenderer failed on SVG #{svg_count}: {e}\n{decoded}"));
+        let size = image.size(0);
+        assert!(i32::from(size.width) > 0 && i32::from(size.height) > 0, "rendered SVG #{svg_count} has zero size: {size:?}");
+        svg_count += 1;
+        rest = &after[end..];
+    }
+    assert!(svg_count >= 6, "expected at least 6 rendered SVG data URLs (2 mermaid + 2 display math + 2+ inline math), got {svg_count}");
+
+    visual.update(|window, _| window.remove_window());
+    gpui_shell::policy::set_default(Policy::new());
+    cx.run_until_parked();
+}
+
+fn percent_decode_test(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let Ok(val) = u8::from_str_radix(&input[i + 1..i + 3], 16) {
+                out.push(val);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).expect("valid UTF-8 SVG")
+}
+
+#[gpui::test]
 fn side_panel_multiple_side_chats_and_handoff_dialog_render_cleanly(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);
     let staged = Staged::new();
@@ -4001,6 +4171,163 @@ fn flash_note_button_composer_and_sidebar_list_work_end_to_end(cx: &mut TestAppC
     assert_eq!(tab_new_calls[1]["model"], json!("gemini-4-carbon-high"));
     assert_eq!(tab_new_calls[1]["effort"], json!("high"));
     assert_eq!(tab_new_calls[1]["task"], json!("markdown 的预览页面能否增加行数和批注功能"));
+}
+
+#[gpui::test]
+fn flash_note_group_supports_multiple_inputs_selective_send_and_group_send(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+
+    // 1) Compose window with 3 entries: save group, send selected subset (keeps window open),
+    //    send a single entry directly, and send the whole group to a new agent.
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    let values = fixture(true, json!({"overlay": "fn-group-ov", "mode": "compose"}), updates("current", "current"));
+    let policy = Policy::new()
+        .with_storage_path(staged.0.join("store-flash-group.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(module(values, calls.clone()))
+        .unwrap();
+    let runtime = ShellRuntime::new_isolated().unwrap();
+    let root = staged.wrapper(
+        "mods/flash-note",
+        r#"
+            this.titleInput.set_value("Sprint Ideas");
+            this.entryStates[0].input.set_value("Optimize terminal scroll");
+            this.addEntry(cx, "Render mermaid diagrams");
+            this.addEntry(cx, "Support LaTeX formulas");
+            this.targetMode = "new";
+            this.selectPreset("claude");
+            // Uncheck entry #1 (second item) -> auto-switches to sendScope="selected" (items #1 and #3).
+            this.toggleEntrySelected(1, cx);
+            this.sendIdea(cx);
+        "#,
+    );
+    let win = cx.add_window(|_, _| Empty);
+    let partial_tree = win
+        .update(cx, |_, window, cx| {
+            let mut session = DescriptionSession::load(runtime, root, policy, window, cx).unwrap();
+            let tree = session.describe(window, cx).unwrap();
+            window.remove_window();
+            tree
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    for expected in [
+        "fn-group-bar",
+        "fn-add-entry",
+        "fn-entries-list",
+        "fn-entry-check-0",
+        "fn-entry-check-1",
+        "fn-entry-check-2",
+        "fn-entry-send-1",
+        "fn-send-scope",
+        "fn-scope-all",
+        "fn-scope-selected",
+    ] {
+        assert!(partial_tree.contains(expected), "multi-entry flash note composer missing {expected}: {partial_tree}");
+    }
+
+    // Verify partial send dispatched ONLY the 2 selected items, saved the 3-entry group, and kept overlay open.
+    let tab_new_partial: Vec<Value> = calls
+        .borrow()
+        .effects
+        .iter()
+        .filter(|(name, args)| name == "run" && args.first().and_then(Value::as_str) == Some("tab.new"))
+        .map(|(_, args)| args[1].clone())
+        .collect();
+    assert_eq!(tab_new_partial.len(), 1, "expected 1 selective send tab.new call: {tab_new_partial:?}");
+    assert_eq!(
+        tab_new_partial[0]["task"],
+        json!("[Sprint Ideas]\n\n1. Optimize terminal scroll\n\n2. Support LaTeX formulas"),
+    );
+    let closed_after_partial = calls
+        .borrow()
+        .effects
+        .iter()
+        .any(|(name, _)| name == "closeOverlay");
+    assert!(!closed_after_partial, "partial group send must keep composer open for remaining unsent items");
+
+    let saved_group = calls.borrow().shared.get("flash_notes.items").cloned().unwrap_or(Value::Null);
+    let saved_arr = saved_group.as_array().expect("flash_notes.items must be array");
+    assert_eq!(saved_arr.len(), 1);
+    let saved_entries = saved_arr[0]["entries"].as_array().expect("entries array missing");
+    assert_eq!(saved_entries.len(), 3);
+    assert!(saved_entries[0]["sentTo"].is_string(), "entry 0 must be marked sent");
+    assert!(saved_entries[1]["sentTo"].is_null(), "entry 1 must remain unsent");
+    assert!(saved_entries[2]["sentTo"].is_string(), "entry 2 must be marked sent");
+
+    // 2) Sidebar list renders the saved group badge (3 ideas) and partial sent progress (2/3 sent).
+    let list_calls = Rc::new(RefCell::new(Calls::default()));
+    list_calls.borrow_mut().shared.insert("flash_notes.items".into(), saved_group.clone());
+    let list_policy = Policy::new()
+        .with_storage_path(staged.0.join("store-flash-group-list.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(module(fixture(true, json!({"list": true}), updates("current", "current")), list_calls.clone()))
+        .unwrap();
+    let list_rt = ShellRuntime::new_isolated().unwrap();
+    let list_win = cx.add_window(|_, _| Empty);
+    let list_tree = list_win
+        .update(cx, |_, window, cx| {
+            let mut session = DescriptionSession::load(list_rt, staged.0.join("mods/flash-note"), list_policy, window, cx).unwrap();
+            let tree = session.describe(window, cx).unwrap();
+            window.remove_window();
+            tree
+        })
+        .unwrap();
+    cx.run_until_parked();
+    assert!(list_tree.contains("Sprint Ideas"), "group title missing in sidebar: {list_tree}");
+    assert!(list_tree.contains("3 ideas"), "group count badge missing in sidebar: {list_tree}");
+    assert!(list_tree.contains("2/3 sent"), "partial sent progress missing in sidebar: {list_tree}");
+
+    // 3) Re-opening the saved group restores all 3 entries; sending the whole group dispatches all 3 and closes overlay.
+    let group_id = saved_arr[0]["id"].as_str().unwrap().to_owned();
+    let full_calls = Rc::new(RefCell::new(Calls::default()));
+    full_calls.borrow_mut().shared.insert("flash_notes.items".into(), saved_group);
+    let full_policy = Policy::new()
+        .with_storage_path(staged.0.join("store-flash-group-full.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(module(
+            fixture(true, json!({"overlay": "fn-group-ov2", "mode": "compose", "noteId": group_id}), updates("current", "current")),
+            full_calls.clone(),
+        ))
+        .unwrap();
+    let full_rt = ShellRuntime::new_isolated().unwrap();
+    let full_root = staged.wrapper(
+        "mods/flash-note",
+        r#"
+            this.targetMode = "new";
+            this.selectPreset("codex");
+            this.sendScope = "all";
+            this.sendIdea(cx);
+        "#,
+    );
+    let full_win = cx.add_window(|_, _| Empty);
+    full_win
+        .update(cx, |_, window, cx| {
+            let mut session = DescriptionSession::load(full_rt, full_root, full_policy, window, cx).unwrap();
+            let _ = session.describe(window, cx).unwrap();
+            window.remove_window();
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let tab_new_full: Vec<Value> = full_calls
+        .borrow()
+        .effects
+        .iter()
+        .filter(|(name, args)| name == "run" && args.first().and_then(Value::as_str) == Some("tab.new"))
+        .map(|(_, args)| args[1].clone())
+        .collect();
+    assert_eq!(tab_new_full.len(), 1, "expected 1 whole-group tab.new dispatch: {tab_new_full:?}");
+    assert_eq!(
+        tab_new_full[0]["task"],
+        json!("[Sprint Ideas]\n\n1. Optimize terminal scroll\n\n2. Render mermaid diagrams\n\n3. Support LaTeX formulas"),
+    );
+    assert!(
+        full_calls.borrow().effects.iter().any(|(name, _)| name == "closeOverlay"),
+        "sending the whole group must close the composer overlay",
+    );
 }
 
 #[gpui::test]
@@ -4537,37 +4864,56 @@ fn prompt_polish_renders_across_acp_cli_pane_prompt_and_flash_note(cx: &mut Test
     cx.update(gpui_shell::init);
     let staged = Staged::new();
 
-    // 1) Peek composer (ACP & CLI chat view) renders Polish button + polished undo banner.
+    // 1) Peek composer (ACP & CLI chat view) renders Polish button + polished undo banner with shortcut hint.
     let peek_setup = r#"
         this.input.set_value('请修复登录超时问题并补充单元测试');
         this.polishUndoText = '修下登录超时';
         this.polishSummary = '明确修复范围与测试要求';
         this.polishApplied = true;
     "#;
-    let acp_tree = describe(
+    let mut peek_values = fixture(true, json!({ "terminal": "a1", "acp": true, "tab": true }), updates("current", "current"));
+    peek_values.insert("keys".into(), json!([
+        { "section": "global", "keys": "ctrl-alt-p", "action": "prompt.polish" },
+        { "section": "global", "keys": "ctrl-alt-u", "action": "prompt.polish_undo" }
+    ]));
+    let acp_tree = describe_with_values(
         cx,
         &staged,
         "mods/peek",
-        true,
-        json!({ "terminal": "a1", "acp": true, "tab": true }),
-        updates("current", "current"),
+        peek_values.clone(),
         Some(peek_setup),
     )
     .unwrap();
     assert!(acp_tree.contains("acp-polish"), "peek composer must render Polish button: {acp_tree}");
     assert!(acp_tree.contains("acp-polish-banner"), "peek composer must render polished summary banner: {acp_tree}");
     assert!(acp_tree.contains("acp-polish-undo"), "peek composer must render undo button: {acp_tree}");
+    assert!(acp_tree.contains("Ctrl+Alt+U"), "peek undo button tooltip must include undo shortcut hint: {acp_tree}");
 
-    // 2) Prompt modal in mode="polish" (used by CLI raw terminal panes) renders full polisher & sender UI.
+    // Verify revertPolishedPrompt restores original text and hides the undo banner.
+    let peek_reverted_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/peek",
+        peek_values,
+        Some(r#"
+            this.input.set_value('请修复登录超时问题并补充单元测试');
+            this.polishUndoText = '修下登录超时';
+            this.polishSummary = '明确修复范围与测试要求';
+            this.polishApplied = true;
+            this.revertPolishedPrompt({ notify() {} });
+            if (this.input.value() !== '修下登录超时') throw new Error('expected restored text');
+        "#),
+    )
+    .unwrap();
+    assert!(!peek_reverted_tree.contains("acp-polish-banner"), "peek undo banner must disappear after revert: {peek_reverted_tree}");
+
+    // 2) Prompt modal in mode="polish" (used by CLI raw terminal panes) renders full polisher, undo button & shortcut.
     let prompt_setup = r#"
         this.textarea.set_value('Refactor auth middleware and add retry backoff tests');
         this.polishUndoText = 'refactor auth add tests';
         this.polishSummary = 'Clarified scope and test target';
     "#;
-    let prompt_tree = describe(
-        cx,
-        &staged,
-        "mods/prompt",
+    let mut prompt_values = fixture(
         true,
         json!({
             "overlay": "ov-polish",
@@ -4578,6 +4924,16 @@ fn prompt_polish_renders_across_acp_cli_pane_prompt_and_flash_note(cx: &mut Test
             "cwd": "/fixture/project"
         }),
         updates("current", "current"),
+    );
+    prompt_values.insert("keys".into(), json!([
+        { "section": "global", "keys": "ctrl-alt-p", "action": "prompt.polish" },
+        { "section": "global", "keys": "ctrl-alt-u", "action": "prompt.polish_undo" }
+    ]));
+    let prompt_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/prompt",
+        prompt_values.clone(),
         Some(prompt_setup),
     )
     .unwrap();
@@ -4585,10 +4941,33 @@ fn prompt_polish_renders_across_acp_cli_pane_prompt_and_flash_note(cx: &mut Test
     assert!(prompt_tree.contains("pm-polish-run"), "prompt modal must render AI Polish button: {prompt_tree}");
     assert!(prompt_tree.contains("pm-polish-send"), "prompt modal must render Send button: {prompt_tree}");
     assert!(prompt_tree.contains("pm-polish-undo"), "prompt modal must render Undo button: {prompt_tree}");
+    assert!(prompt_tree.contains("Ctrl+Alt+U"), "prompt modal undo button tooltip must include shortcut hint: {prompt_tree}");
     assert!(prompt_tree.contains("CLI · Codex"), "prompt modal must show CLI agent badge: {prompt_tree}");
 
-    // 3) Pane header renders Polish entry for live CLI agent in raw terminal view.
+    // Verify revertPolish in Prompt modal restores original text.
+    let prompt_reverted_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/prompt",
+        prompt_values,
+        Some(r#"
+            this.textarea.set_value('Refactor auth middleware and add retry backoff tests');
+            this.polishUndoText = 'refactor auth add tests';
+            this.polishSummary = 'Clarified scope and test target';
+            this.revertPolish({ notify() {} });
+            if (this.textarea.value() !== 'refactor auth add tests') throw new Error('expected prompt restored');
+        "#),
+    )
+    .unwrap();
+    assert!(!prompt_reverted_tree.contains("pm-polish-undo"), "prompt undo button must disappear after revert: {prompt_reverted_tree}");
+
+    // 3) Pane header & terminals-pane header render Polish + post-polish Undo button with live shortcuts.
     let mut values = fixture(true, json!({ "pane": "p1" }), updates("current", "current"));
+    values.insert("keys".into(), json!([
+        { "section": "global", "keys": "ctrl-alt-p", "action": "prompt.polish" },
+        { "section": "global", "keys": "ctrl-alt-u", "action": "prompt.polish_undo" },
+        { "section": "global", "keys": "ctrl-shift-h", "action": "agent.handoff" }
+    ]));
     values.insert("panes".into(), json!([{
         "pane": "p1",
         "terminal": "t1",
@@ -4609,19 +4988,216 @@ fn prompt_polish_renders_across_acp_cli_pane_prompt_and_flash_note(cx: &mut Test
         "program": { "name": "Codex", "agent": true, "tint": true },
         "cwd": "/fixture/project"
     }]));
-    let pane_tree = describe_with_values(cx, &staged, "mods/pane", values, None).unwrap();
-    assert!(pane_tree.contains("ph-polish-p1"), "CLI terminal pane header must render Polish button: {pane_tree}");
+    let pane_tree_no_undo = describe_with_values(cx, &staged, "mods/pane", values.clone(), None).unwrap();
+    let polish_pos = pane_tree_no_undo.find("ph-polish-p1").expect("CLI terminal pane header must render Polish button");
+    assert!(pane_tree_no_undo.contains("Ctrl+Alt+P"), "Polish tooltip must include shortcut hint: {pane_tree_no_undo}");
+    assert!(!pane_tree_no_undo.contains("ph-polish-undo-p1"), "Undo button must stay hidden before polish completes: {pane_tree_no_undo}");
+    if let Some(side_pos) = pane_tree_no_undo.find("ph-side-p1") {
+        assert!(polish_pos < side_pos, "Polish button must appear before Side/Fork/Handoff buttons: {pane_tree_no_undo}");
+    }
 
-    // 4) Flash Note compose window renders Polish button.
-    let fn_tree = describe(
+    let mut values_with_undo = values.clone();
+    values_with_undo.insert("shared".into(), json!({
+        "polish.undo": {
+            "t1": { "summary": "Clarified prompt", "createdAtMs": 1_700_000_000_000u64 }
+        }
+    }));
+    let pane_tree_undo = describe_with_values(cx, &staged, "mods/pane", values_with_undo.clone(), None).unwrap();
+    assert!(pane_tree_undo.contains("ph-polish-undo-p1"), "CLI pane header must render post-polish undo button: {pane_tree_undo}");
+    assert!(pane_tree_undo.contains("Ctrl+Alt+U"), "CLI pane undo tooltip must include shortcut hint: {pane_tree_undo}");
+
+    let term_pane_tree = describe_with_values(cx, &staged, "mods/terminals-pane", values_with_undo, None).unwrap();
+    assert!(term_pane_tree.contains("tm-polish-p1"), "terminals-pane header must render Polish button: {term_pane_tree}");
+    assert!(term_pane_tree.contains("tm-polish-undo-p1"), "terminals-pane header must render post-polish undo button: {term_pane_tree}");
+    assert!(term_pane_tree.contains("Ctrl+Alt+U"), "terminals-pane undo tooltip must include shortcut hint: {term_pane_tree}");
+
+    // 4) Flash Note compose window renders Polish + Undo button (single-entry & multi-entry) and restores on revertPolish.
+    let mut fn_values = fixture(true, json!({}), updates("current", "current"));
+    fn_values.insert("keys".into(), json!([
+        { "section": "global", "keys": "ctrl-alt-p", "action": "prompt.polish" },
+        { "section": "global", "keys": "ctrl-alt-u", "action": "prompt.polish_undo" }
+    ]));
+    let fn_tree = describe_with_values(
         cx,
         &staged,
         "mods/flash-note",
-        true,
-        json!({}),
-        updates("current", "current"),
-        None,
+        fn_values.clone(),
+        Some(r#"
+            this.entryStates[0].input.set_value('优化后的闪念提示词');
+            this.entryStates[0].polishUndoText = '原始闪念';
+            this.entryStates[0].polishSummary = '表达更清晰';
+            this.polishUndoText = '原始闪念';
+            this.polishSummary = '表达更清晰';
+            this.lastPolishedEntryId = this.entryStates[0].id;
+        "#),
     )
     .unwrap();
     assert!(fn_tree.contains("fn-polish"), "flash-note composer must render Polish button: {fn_tree}");
+    assert!(fn_tree.contains("fn-polish-undo"), "flash-note single-entry must render Undo button: {fn_tree}");
+    assert!(fn_tree.contains("Ctrl+Alt+U"), "flash-note undo tooltip must include shortcut hint: {fn_tree}");
+
+    // Verify multi-entry shortcut undo restores the last polished entry even if focus moved to another entry.
+    let fn_multi_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/flash-note",
+        fn_values,
+        Some(r#"
+            const e2 = this.addEntry({ notify() {} }, '润色后的第二条');
+            e2.polishUndoText = '第二条原文';
+            e2.polishSummary = '补充细节';
+            this.lastPolishedEntryId = e2.id;
+            this.activeEntryIndex = 0;
+            this.revertPolish({ notify() {} });
+            if (e2.input.value() !== '第二条原文') throw new Error('expected multi-entry undo to restore last polished entry');
+            if (e2.polishUndoText !== null) throw new Error('expected polishUndoText cleared');
+        "#),
+    )
+    .unwrap();
+    assert!(!fn_multi_tree.contains("fn-polish-undo-1"), "multi-entry undo banner must clear after revert: {fn_multi_tree}");
+
+    // 4b) Toast renders explicit post-polish undo button with shortcut tooltip when buttonAction + actionLabel are set.
+    let mut toast_values = fixture(
+        true,
+        json!({
+            "overlay": "ov-toast-1",
+            "title": "✨ Input polished",
+            "body": "Clarified prompt",
+            "level": "info",
+            "actionLabel": "↩ Undo",
+            "actionTooltip": "Undo last polish and restore original input",
+            "buttonAction": { "name": "prompt.polish_undo", "args": { "terminal": "t1" } }
+        }),
+        updates("current", "current"),
+    );
+    toast_values.insert("keys".into(), json!([
+        { "section": "global", "keys": "ctrl-alt-u", "action": "prompt.polish_undo" }
+    ]));
+    let toast_tree = describe_with_values(cx, &staged, "mods/toast", toast_values, None).unwrap();
+    assert!(toast_tree.contains("toast-action-btn"), "post-polish toast must render undo action button: {toast_tree}");
+    assert!(toast_tree.contains("Ctrl+Alt+U"), "post-polish toast button tooltip must include shortcut hint: {toast_tree}");
+
+    // 5) Floating hot-reloadable polish-progress mod renders polishing & applying states cleanly.
+    let mut pp_values = fixture(true, json!({}), updates("current", "current"));
+    pp_values.insert(
+        "shared".into(),
+        json!({
+            "polish.state": {
+                "id": 7,
+                "addr": "t1",
+                "preview": "第一行输入 第二行约束",
+                "lineCount": 3,
+                "stage": "polishing",
+                "startedAtMs": 1_700_000_000_000u64,
+                "stageChangedAtMs": 1_700_000_000_000u64
+            }
+        }),
+    );
+    let pp_tree = describe_with_values(cx, &staged, "mods/polish-progress", pp_values, None).unwrap();
+    assert!(pp_tree.contains("polish-progress-card"), "polish-progress mod must render card: {pp_tree}");
+    assert!(pp_tree.contains("polish-progress-cancel"), "polish-progress mod must render cancel button while polishing: {pp_tree}");
+    assert!(pp_tree.contains("3 lines"), "polish-progress mod must show multi-line badge: {pp_tree}");
+    assert!(pp_tree.contains("第一行输入 第二行约束"), "polish-progress mod must show prompt preview: {pp_tree}");
+}
+
+#[gpui::test]
+fn send_context_button_and_dialog_support_cli_and_acp_targets(cx: &mut TestAppContext) {
+    let staged = Staged::new();
+    let mut values = fixture(true, json!({ "pane": "p1" }), updates("current", "current"));
+    values.insert(
+        "terminals".into(),
+        json!([
+            {
+                "address": "wsl/t1",
+                "title": "Claude CLI",
+                "argv": ["claude"],
+                "state": "live",
+                "status": "idle",
+                "program": { "name": "Claude", "agent": true, "tint": true },
+                "cwd": "/fixture/project"
+            },
+            {
+                "address": "wsl/a2",
+                "title": "Codex ACP",
+                "acp": true,
+                "agent": "codex",
+                "state": "live",
+                "status": "working",
+                "program": { "name": "Codex", "agent": true, "tint": true },
+                "cwd": "/fixture/project"
+            },
+            {
+                "address": "t3",
+                "title": "ZCode CLI",
+                "argv": ["zcode"],
+                "state": "live",
+                "status": "idle",
+                "program": { "name": "ZCode", "agent": true, "tint": true },
+                "cwd": "D:/work/project"
+            }
+        ]),
+    );
+    values.insert(
+        "agents".into(),
+        json!([
+            { "address": "wsl/t1", "title": "Claude CLI", "status": "idle", "space_name": "Main" },
+            { "address": "wsl/a2", "title": "Codex ACP", "acp": true, "status": "working", "space_name": "Main" },
+            { "address": "t3", "title": "ZCode CLI", "status": "idle", "space_name": "Windows" }
+        ]),
+    );
+
+    // 1) CLI agent pane header renders Send Context button.
+    values.insert(
+        "panes".into(),
+        json!([{
+            "pane": "p1",
+            "tab": "tab1",
+            "terminal": "wsl/t1",
+            "acp": false,
+            "structured": false,
+            "status": "idle",
+            "program": { "name": "Claude", "agent": true, "tint": true },
+            "cwd": "/fixture/project"
+        }]),
+    );
+    let cli_pane = describe_with_values(cx, &staged, "mods/pane", values.clone(), None).unwrap();
+    assert!(cli_pane.contains("ph-send-ctx-p1"), "CLI pane header must render Send Context button: {cli_pane}");
+    let cli_term_pane = describe_with_values(cx, &staged, "mods/terminals-pane", values.clone(), None).unwrap();
+    assert!(cli_term_pane.contains("tm-send-ctx-p1"), "terminals-pane header must render Send Context button: {cli_term_pane}");
+
+    // 2) ACP agent pane header also renders Send Context button.
+    let mut acp_values = values.clone();
+    acp_values.insert(
+        "panes".into(),
+        json!([{
+            "pane": "p1",
+            "tab": "tab1",
+            "terminal": "wsl/a2",
+            "acp": true,
+            "structured": true,
+            "status": "working",
+            "program": { "name": "Codex", "agent": true, "tint": true },
+            "cwd": "/fixture/project"
+        }]),
+    );
+    let acp_pane = describe_with_values(cx, &staged, "mods/pane", acp_values, None).unwrap();
+    assert!(acp_pane.contains("ph-send-ctx-p1"), "ACP pane header must render Send Context button: {acp_pane}");
+
+    // 3) Handoff dialog in `send-context` mode lists both ACP and CLI live targets (excluding source), hides creation tabs, and renders note input.
+    let mut dlg_values = values.clone();
+    dlg_values.insert("props".into(), json!({ "overlay": "handoff", "source": "wsl/t1", "kind": "send-context" }));
+    let dlg_tree = describe_with_values(cx, &staged, "mods/handoff", dlg_values, None).unwrap();
+    assert!(dlg_tree.contains("ho-send-target-wsl/a2"), "send-context dialog must list live ACP target: {dlg_tree}");
+    assert!(dlg_tree.contains("ho-send-target-t3"), "send-context dialog must list live CLI target: {dlg_tree}");
+    assert!(!dlg_tree.contains("ho-send-target-wsl/t1"), "send-context dialog must exclude source session: {dlg_tree}");
+    assert!(!dlg_tree.contains("ho-mode-handoff"), "send-context dialog must hide creation mode tabs: {dlg_tree}");
+    assert!(dlg_tree.contains("ho-prompt-input"), "send-context dialog must render optional note textarea: {dlg_tree}");
+    assert!(dlg_tree.contains("ho-focus-target-toggle"), "send-context dialog must render focus toggle: {dlg_tree}");
+    assert!(dlg_tree.contains("ho-turns-1"), "send-context dialog must render 1-turn preset: {dlg_tree}");
+    assert!(dlg_tree.contains("ho-turns-2"), "send-context dialog must render 2-turn preset: {dlg_tree}");
+    assert!(dlg_tree.contains("ho-turns-4"), "send-context dialog must render 4-turn preset: {dlg_tree}");
+    assert!(dlg_tree.contains("ho-turns-0"), "send-context dialog must render All preset: {dlg_tree}");
+    assert!(dlg_tree.contains("ho-turns-custom"), "send-context dialog must render Custom turn option: {dlg_tree}");
+    assert!(!dlg_tree.contains("ho-turns-8"), "send-context dialog must not render 8-turn preset: {dlg_tree}");
+    assert!(!dlg_tree.contains("ho-turns-15"), "send-context dialog must not render 15-turn preset: {dlg_tree}");
 }

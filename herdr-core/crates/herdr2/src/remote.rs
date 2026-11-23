@@ -82,9 +82,8 @@ impl Line {
     /// Opens a framed Drove SSE relay channel on the remote machine without losing initial frames.
     pub async fn subscribe_drove(&self, machine: &str) -> Result<(u32, mpsc::UnboundedReceiver<Vec<u8>>), RpcError> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let res = self
-            .call_into_raw(machine, "drove.subscribe", json!({}), None, Some(tx), Duration::from_secs(10))
-            .await?;
+        let res =
+            self.call_into_raw(machine, "drove.subscribe", json!({}), None, Some(tx), Duration::from_secs(10)).await?;
         let ch = res["channel"]
             .as_u64()
             .and_then(|c| u32::try_from(c).ok())
@@ -883,8 +882,7 @@ pub fn orphaned_afar(core: &Core, st: &mut State, parent: TargetKey) {
         TargetKey::Terminal(id) => st.pty_reg.terminals.get(&id).map(|t| t.afar.clone()),
     }
     .unwrap_or_default();
-    let message =
-        json!({"jsonrpc": "2.0", "method": "$/orphaned", "params": {"parent": format!("{}/{}", core.info.id, parent.address())}});
+    let message = json!({"jsonrpc": "2.0", "method": "$/orphaned", "params": {"parent": format!("{}/{}", core.info.id, parent.address())}});
     for id in afar {
         match st.lines.get(&id) {
             Some(LineState::Connected(line)) => line.message(&message),
@@ -900,9 +898,7 @@ pub async fn orphaned(core: &Arc<Core>, conn: Option<&Arc<Conn>>, params: &Value
     let Some(address) = params["parent"].as_str().filter(|_| from_peer).and_then(|p| peer_address(core, p)) else {
         return Err(RpcError::new("denied", "only a core that dialed in says its parents finished", ""));
     };
-    let _ = core.drove.pool_tx.send(crate::drove::pool::PoolSignal::SessionClosed {
-        address: address.clone(),
-    });
+    let _ = core.drove.pool_tx.send(crate::drove::pool::PoolSignal::SessionClosed { address: address.clone() });
     let (acp_kids, pty_kids): (Vec<u32>, Vec<u32>) = {
         let mut st = core.lock();
         let acp_kids: Vec<u32> = st
@@ -992,6 +988,7 @@ const ON_A_TERMINAL: &[&str] = &[
 const ON_A_TARGET: &[&str] = &[
     "agent.review",
     "ai.summarize_agent",
+    "ai.polish_prompt",
     "checkpoint.list",
     "checkpoint.capture",
     "checkpoint.diff",
@@ -1047,16 +1044,36 @@ pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Va
             | "ai.status"
             | "ai.settings.set"
             | "ai.test"
+            | "ai.probe_prompt_mode"
             | "ai.complete"
             | "ai.classify_terminal_state"
             | "ai.briefing"
-    ) {
+            | "ai.commit_message"
+            | "ai.polish_prompt"
+    ) && !(method == "ai.polish_prompt" && params["on"].is_null())
+    {
         let Some(on) = params["on"].as_str().map(String::from) else { return Ok(None) };
         params.as_object_mut().map(|p| p.remove("on"));
-        match named(core, &st, &on)? {
+        let to = match named(core, &st, &on)? {
             Some(To::Peer { name, .. }) => return Err(crate::machines::unknown(&st.machines, &name)),
             to => to,
+        };
+        if method == "ai.polish_prompt"
+            && let Some(ref dest) = to
+            && let Some((tgt_prefix, tgt_local)) =
+                params["target"].as_str().and_then(|a| a.split_once('/')).map(|(a, b)| (a.to_string(), b.to_string()))
+            && let Ok(Some(tgt_to)) = named(core, &st, &tgt_prefix)
+        {
+            let same_dest = match (dest, &tgt_to) {
+                (To::Machine(a), To::Machine(b)) => a.id == b.id,
+                (To::Peer { id: a, .. }, To::Peer { id: b, .. }) => a == b,
+                _ => false,
+            };
+            if same_dest {
+                params["target"] = tgt_local.into();
+            }
         }
+        to
     } else if (ON_AN_AGENT.contains(&method)
         || ON_A_TERMINAL.contains(&method)
         || ON_A_TARGET.contains(&method)
@@ -1086,10 +1103,8 @@ pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Va
         }
         params[field] = local.into();
         if method == "agent.handoff"
-            && let Some((into_prefix, into_local)) = params["into"]
-                .as_str()
-                .and_then(|a| a.split_once('/'))
-                .map(|(a, b)| (a.to_string(), b.to_string()))
+            && let Some((into_prefix, into_local)) =
+                params["into"].as_str().and_then(|a| a.split_once('/')).map(|(a, b)| (a.to_string(), b.to_string()))
             && let Ok(Some(into_to)) = named(core, &st, &into_prefix)
         {
             let same_dest = match (&to, &into_to) {
@@ -1179,8 +1194,7 @@ fn deadline_for(core: &Core, method: &str, params: &Value) -> Duration {
         Some(secs) => secs,
         None => config.wait_timeout.unwrap_or(180.0),
     };
-    config.machine_timeout()
-        + if waits { Duration::from_secs_f64(wait.clamp(0.0, 86_400.0)) } else { Duration::ZERO }
+    config.machine_timeout() + if waits { Duration::from_secs_f64(wait.clamp(0.0, 86_400.0)) } else { Duration::ZERO }
 }
 
 fn waits(method: &str, params: &Value) -> bool {

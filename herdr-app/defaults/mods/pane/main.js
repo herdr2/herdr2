@@ -6,10 +6,35 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input } from "gpui-base";
-import { panes, terminals, spaces, props, run, h2, exec, openOverlay, theme, home, layout, settings, shared } from "herdr";
+import { panes, terminals, spaces, props, run, h2, exec, openOverlay, theme, home, layout, settings, shared, keys, window as appWindow } from "herdr";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
+
+function shortcutFor(action) {
+  if (typeof keys !== "function" || !action) return "";
+  const list = keys();
+  if (!Array.isArray(list)) return "";
+  const k = list.find((b) => b.section === "global" && b.action === action);
+  if (!k?.keys?.trim()) return "";
+  const mac = typeof appWindow === "function" && appWindow()?.platform === "macos";
+  const names = mac ? { ctrl: "⌃", alt: "⌥", shift: "⇧", cmd: "⌘", fn: "fn" } : { ctrl: "Ctrl", alt: "Alt", shift: "Shift", cmd: "Super", fn: "Fn" };
+  const alias = { secondary: mac ? "cmd" : "ctrl", super: "cmd", win: "cmd" };
+  return k.keys.trim().split(/\s+/).map((stroke) => {
+    const parts = stroke.split("-");
+    let key = parts.pop();
+    if (key === "") { key = "-"; parts.pop(); }
+    const held = new Set(parts.map((m) => alias[m.toLowerCase()] ?? m.toLowerCase()));
+    if (/^[A-Z]$/.test(key)) held.add("shift");
+    const label = key.length === 1 ? key.toUpperCase() : key[0].toUpperCase() + key.slice(1).toLowerCase();
+    return [...Object.keys(names).filter((m) => held.has(m)).map((m) => names[m]), label].join(mac ? "" : "+");
+  }).join(" ");
+}
+
+function withShortcut(text, action) {
+  const sc = shortcutFor(action);
+  return sc ? `${text} (${sc})` : text;
+}
 
 // Match the first visible tab frame, including the active child of a stack.
 function paneFrame(node) {
@@ -681,6 +706,69 @@ export default class Pane extends View {
         ),
       )
       .child(div().flex_1().min_w(0).truncate().text_color(t.dim).child(folder(p.cwd)))
+      .when(isAgent && !isStructured && st !== "ended" && Boolean(p.terminal), el => {
+        const isPolishing = shared("polish.active") === p.terminal;
+        const polishUndoMap = shared("polish.undo");
+        const canUndoPolish = !isPolishing && Boolean(polishUndoMap && typeof polishUndoMap === "object" && polishUndoMap[p.terminal]);
+        return el
+          .child(
+            h_flex()
+              .id(`ph-polish-${pane}`)
+              .flex_none()
+              .h(20)
+              .px(7)
+              .gap(4)
+              .items_center()
+              .rounded(6)
+              .bg(alpha("#a855f7", isPolishing ? "2e" : "1a") ?? t.raised)
+              .border_1()
+              .border_color(alpha("#a855f7", isPolishing ? "99" : "55") ?? t.border)
+              .text_size(11)
+              .font_medium()
+              .text_color("#a855f7")
+              .cursor_pointer()
+              .hover((s) => s.bg(alpha("#a855f7", "2e") ?? t.hover))
+              .tooltip(withShortcut(tr("Polish current CLI input in-place with Core AI", "使用 Core AI 直接润色当前 CLI Agent 中的输入"), "prompt.polish"))
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+              .on_click((_e, cx) => {
+                cx.stop_propagation();
+                if (!isPolishing) run("prompt.polish", { terminal: p.terminal });
+              })
+              .child(
+                isPolishing
+                  ? svg("mods/workspace-chrome/spinner.svg").size(11).flex_none().spin(900).text_color("#a855f7")
+                  : svg("mods/peek/sparkles.svg").size(11).flex_none().text_color("#a855f7"),
+              )
+              .child(isPolishing ? tr("Polishing…", "润色中…") : tr("Polish", "润色输入")),
+          )
+          .when(canUndoPolish, (e2) =>
+            e2.child(
+              h_flex()
+                .id(`ph-polish-undo-${pane}`)
+                .flex_none()
+                .h(20)
+                .px(7)
+                .gap(4)
+                .items_center()
+                .rounded(6)
+                .bg(t.raised)
+                .border_1()
+                .border_color(alpha("#a855f7", "55") ?? t.border)
+                .text_size(11)
+                .font_medium()
+                .text_color(t.foreground)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover))
+                .tooltip(withShortcut(tr("Undo last polish and restore original input", "撤销本次润色并恢复润色前的内容"), "prompt.polish_undo"))
+                .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                .on_click((_e, cx) => {
+                  cx.stop_propagation();
+                  run("prompt.polish_undo", { terminal: p.terminal });
+                })
+                .child(tr("↩ Undo", "↩ 反悔恢复")),
+            ),
+          );
+      })
       .when(showHandoffBtns && Boolean(lineageParent), (el) =>
         el.child(
           headerPill(
@@ -730,48 +818,25 @@ export default class Pane extends View {
             "mods/peek/corner-up-right.svg",
             "agent.handoff",
             { source: p.terminal, kind: "handoff" },
-            tr("Context Handoff to another agent / provider", "上下文接力给其他 Agent 或模型继续执行"),
+            withShortcut(tr("Context Handoff to another agent / provider", "上下文接力给其他 Agent 或模型继续执行"), "agent.handoff"),
           ),
         ),
       )
-      .when(isAgent && !isStructured && st !== "ended" && Boolean(p.terminal), el => el.child(
-        h_flex()
-          .id(`ph-polish-${pane}`)
-          .flex_none()
-          .h(20)
-          .px(7)
-          .gap(4)
-          .items_center()
-          .rounded(6)
-          .bg(alpha("#a855f7", "1a") ?? t.raised)
-          .border_1()
-          .border_color(alpha("#a855f7", "55") ?? t.border)
-          .text_size(11)
-          .font_medium()
-          .text_color("#a855f7")
-          .cursor_pointer()
-          .hover((s) => s.bg(alpha("#a855f7", "2e") ?? t.hover))
-          .tooltip(tr("Compose & polish prompt with Core AI before sending to CLI agent", "输入并由 Core AI 润色提示词后发送给 CLI Agent"))
-          .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-          .on_click((_e, cx) => {
-            cx.stop_propagation();
-            openOverlay({
-              mod: "prompt",
-              kind: "modal",
-              width: 580,
-              height: 390,
-              props: {
-                mode: "polish",
-                terminal: p.terminal,
-                agentName: p.program?.name || p.title || p.terminal,
-                agentKind: "cli",
-                cwd: p.cwd || "",
-              },
-            });
-          })
-          .child(svg("mods/peek/sparkles.svg").size(11).flex_none().text_color("#a855f7"))
-          .child(tr("Polish", "润色输入")),
-      ))
+      .when(showHandoffBtns, (el) =>
+        el.child(
+          headerPill(
+            `ph-send-ctx-${pane}`,
+            tr("Send Context", "发送上下文"),
+            "mods/peek/send.svg",
+            "agent.handoff",
+            { source: p.terminal, kind: "send-context" },
+            tr(
+              "Send recent conversation context (with optional note) directly to an open CLI or ACP agent",
+              "将当前会话的近期上下文直接发送给已开启的 CLI / ACP Agent（可附带备注信息）",
+            ),
+          ),
+        ),
+      )
       .when(showViewToggle, el => el.child(
         h_flex()
           .id(`ph-view-${pane}`)
@@ -789,7 +854,7 @@ export default class Pane extends View {
           .text_color(t.muted)
           .cursor_pointer()
           .hover((s) => s.bg(t.hover).text_color(t.foreground))
-          .tooltip(isStructured ? tr("Switch back to raw terminal view", "切回原始终端视图") : tr("Switch to structured chat view", "切换到结构化对话视图"))
+          .tooltip(withShortcut(isStructured ? tr("Switch back to raw terminal view", "切回原始终端视图") : tr("Switch to structured chat view", "切换到结构化对话视图"), "terminal.view:toggle"))
           .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
           .on_click((_e, cx) => {
             cx.stop_propagation();
@@ -851,6 +916,7 @@ export default class Pane extends View {
             .text_color(t.blocked ?? "#ef4444")
             .cursor_pointer()
             .hover((s) => s.bg(t.hover))
+            .tooltip(tr("Stop generation (Esc)", "停止生成 (Esc)"))
             .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
             .on_click((_e, cx) => {
               cx.stop_propagation();
@@ -863,11 +929,11 @@ export default class Pane extends View {
       .when(st === "blocked", el => el.child(div().flex_none().px(6).h(18).flex().items_center().rounded(5).bg(t.blocked + "26").text_size(10.5).font_semibold().text_color(t.blocked).child(tr("Needs you", "待确认"))))
       .when(st === "done", el => el.child(div().size(7).flex_none().rounded(4).bg(t.done)))
       .when(this.hovered || isStructured, el => el
-        .child(this.button(t, `ph-r-${pane}`, "split-right", "pane.split", { direction: "right", pane }, tr("Split right", "向右分栏")))
-        .child(this.button(t, `ph-d-${pane}`, "split-down", "pane.split", { direction: "down", pane }, tr("Split down", "向下分栏")))
-        .when(tabPaneCount > 1, el => el.child(this.button(t, `ph-z-${pane}`, "zoom", "pane.detach", { pane }, tr("Maximize to new tab", "最大化为独立标签页"))))
+        .child(this.button(t, `ph-r-${pane}`, "split-right", "pane.split", { direction: "right", pane }, withShortcut(tr("Split right", "向右分栏"), "pane.split:right")))
+        .child(this.button(t, `ph-d-${pane}`, "split-down", "pane.split", { direction: "down", pane }, withShortcut(tr("Split down", "向下分栏"), "pane.split:down")))
+        .when(tabPaneCount > 1, el => el.child(this.button(t, `ph-z-${pane}`, "zoom", "pane.detach", { pane }, withShortcut(tr("Maximize to new tab", "最大化为独立标签页"), "pane.detach"))))
         .when(Boolean(p.terminal), el => el.child(this.button(t, `ph-trash-${pane}`, "trash", "agent.trash", { terminal: p.terminal }, tr("Move to recycle bin", "移入回收站"), true)))
-        .child(this.button(t, `ph-x-${pane}`, "close", "pane.close", { pane }, isAgent && st !== "ended" ? tr("Close tab (keep agent in background)", "关闭标签页（Agent 保留在后台）") : tr("Close pane", "关闭窗格"))));
+        .child(this.button(t, `ph-x-${pane}`, "close", "pane.close", { pane }, withShortcut(isAgent && st !== "ended" ? tr("Close tab (keep agent in background)", "关闭标签页（Agent 保留在后台）") : tr("Close pane", "关闭窗格"), "pane.close"))));
 
     const summaryRow = h_flex()
       .id(`ph-brief-row-${pane}`)

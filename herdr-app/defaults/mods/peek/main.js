@@ -4,8 +4,33 @@
 
 import { View, div, image, svg } from "gpui-kit";
 import { h_flex, v_flex, Popup, TextareaState, Textarea, InputState, Input, TextView, ScrollHandle } from "gpui-base";
-import { agents, terminals, panes, spaces, focused, run, theme, settings, home, props, closeOverlay, openOverlay, checking, h2, shared, setShared, nextCommand, window as appWindow, readImageDataUrl, pasteClipboardAttachments, prepareAttachments, pickAttachments } from "herdr";
+import { agents, terminals, panes, spaces, focused, run, theme, settings, home, props, closeOverlay, openOverlay, checking, h2, shared, setShared, nextCommand, keys, window as appWindow, readImageDataUrl, pasteClipboardAttachments, prepareAttachments, pickAttachments } from "herdr";
 import { buildConversationItems, buildPtySessionBadges, summarizeActivityGroup, toolIconPath, formatTime, shortenPath, normalizeConfigOptions, filterConfigChoices, normalizeInboxItems, parseToolDetail, resolveEffortVisual, resolvePeerAddress, isImageAttachment, formatAttachmentBytes, attachmentDisplayName } from "./acp_model.js";
+
+function shortcutFor(action) {
+  if (typeof keys !== "function" || !action) return "";
+  const list = keys();
+  if (!Array.isArray(list)) return "";
+  const k = list.find((b) => b.section === "global" && b.action === action);
+  if (!k?.keys?.trim()) return "";
+  const mac = typeof appWindow === "function" && appWindow()?.platform === "macos";
+  const names = mac ? { ctrl: "⌃", alt: "⌥", shift: "⇧", cmd: "⌘", fn: "fn" } : { ctrl: "Ctrl", alt: "Alt", shift: "Shift", cmd: "Super", fn: "Fn" };
+  const alias = { secondary: mac ? "cmd" : "ctrl", super: "cmd", win: "cmd" };
+  return k.keys.trim().split(/\s+/).map((stroke) => {
+    const parts = stroke.split("-");
+    let key = parts.pop();
+    if (key === "") { key = "-"; parts.pop(); }
+    const held = new Set(parts.map((m) => alias[m.toLowerCase()] ?? m.toLowerCase()));
+    if (/^[A-Z]$/.test(key)) held.add("shift");
+    const label = key.length === 1 ? key.toUpperCase() : key[0].toUpperCase() + key.slice(1).toLowerCase();
+    return [...Object.keys(names).filter((m) => held.has(m)).map((m) => names[m]), label].join(mac ? "" : "+");
+  }).join(" ");
+}
+
+function withShortcut(text, action) {
+  const sc = shortcutFor(action);
+  return sc ? `${text} (${sc})` : text;
+}
 
 const LANE_MAX_W = 736; // 46rem editorial content column (--chat-content-max-width)
 const SPIN = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -388,6 +413,7 @@ export default class Peek extends View {
           for (;;) {
             const cmd = await nextCommand();
             if (cmd === "polish") await this.polishPrompt(cmdCx);
+            else if (cmd === "polish_undo") this.revertPolishedPrompt(cmdCx);
           }
         });
       }
@@ -1048,6 +1074,8 @@ export default class Peek extends View {
     this.polishSummary = null;
     this.polishApplied = false;
     this.input?.set_value?.(orig);
+    const terminal = this.activeTerminal();
+    if (terminal) this.writeSavedDraft(terminal, orig);
     this.input?.focus?.();
     (cx ?? this.cx)?.notify?.();
   }
@@ -2751,6 +2779,7 @@ export default class Peek extends View {
       fork: { label: tr("Fork Session", "会话分叉"), color: "#a855f7" },
       "side-chat": { label: tr("Side Chat", "旁路讨论"), color: "#14b8a6" },
       "merge-back": { label: tr("Merge Back", "合回上下文"), color: "#3b82f6" },
+      "send-context": { label: tr("Shared Context", "发送上下文"), color: "#10b981" },
     };
     const meta = kindMeta[item.handoff_kind] || { label: item.handoff_kind || tr("Handoff", "上下文接力"), color: t.accent ?? "#3b82f6" };
     const accent = meta.color;
@@ -3621,6 +3650,36 @@ export default class Peek extends View {
     return ICONS.layers;
   }
 
+  localizeThinkingLabel(value, fallbackName) {
+    const key = String(value ?? "").trim().toLowerCase();
+    const map = {
+      off: tr("Off", "关闭"),
+      none: tr("None", "关闭"),
+      disabled: tr("Disabled", "关闭"),
+      on: tr("On", "开启"),
+      enabled: tr("Enabled", "开启"),
+      minimal: tr("Minimal", "极低"),
+      low: tr("Low", "低"),
+      medium: tr("Medium", "中"),
+      med: tr("Medium", "中"),
+      high: tr("High", "高"),
+      xhigh: tr("Extra High", "极高"),
+      "extra-high": tr("Extra High", "极高"),
+      extra_high: tr("Extra High", "极高"),
+      max: tr("Max", "最高"),
+      ultra: tr("Ultra", "极致"),
+      ultrathink: tr("Ultrathink", "极致"),
+    };
+    return map[key] ?? (fallbackName || String(value ?? ""));
+  }
+
+  capabilityTitle(opt) {
+    if (opt.iconKind === "mode") return tr(opt.name, "权限模式");
+    if (opt.iconKind === "thinking") return tr(opt.name || "Reasoning Effort", "思考强度");
+    if (opt.iconKind === "model") return tr(opt.name || "Model", "模型");
+    return opt.name;
+  }
+
   renderConfigPopupContent(t, opt, phase) {
     const showSearch = this.shouldShowConfigSearch(opt);
     const query = showSearch ? (this.configFilter?.value?.() ?? "") : "";
@@ -3655,6 +3714,12 @@ export default class Peek extends View {
       const isBypassChoice = choice.name === "dangerously-skip-permissions"
         || choice.value === "bypassPermissions"
         || choice.value === "dangerously-skip-permissions";
+      const displayName = opt.iconKind === "thinking"
+        ? this.localizeThinkingLabel(choice.value, choice.name)
+        : choice.name;
+      const showRawValue = !isBypassChoice
+        && choice.value !== displayName
+        && choice.value.toLowerCase() !== displayName.toLowerCase();
       const choiceDesc = isBypassChoice
         ? tr(choice.description || "Skip all permission checks (bypassPermissions)", "跳过所有权限检查 (bypassPermissions)")
         : choice.description;
@@ -3705,9 +3770,9 @@ export default class Peek extends View {
                       .when(!isBypassChoice, (el) => el.font_medium())
                       .when(isBypassChoice, (el) => el.font_semibold())
                       .text_color(titleColor)
-                      .child(choice.name),
+                      .child(displayName),
                   )
-                  .when(choice.value !== choice.name && !isBypassChoice, (el) =>
+                  .when(showRawValue, (el) =>
                     el.child(div().min_w(0).max_w(135).flex_none().truncate().text_size(11).text_color(t.dim).child(choice.value)),
                   ),
               )
@@ -3757,11 +3822,7 @@ export default class Peek extends View {
     const closing = phase === "closing";
     const targetOpacity = phase === "open" ? 1 : 0;
     const targetTop = phase === "entering" ? 10 : closing ? 8 : 0;
-    const headerTitle = opt.iconKind === "mode"
-      ? tr(opt.name, "权限模式")
-      : opt.iconKind === "thinking"
-        ? tr(opt.name, "思考强度")
-        : opt.name;
+    const headerTitle = this.capabilityTitle(opt);
     const headerDesc = opt.iconKind === "mode" && opt.description
       ? tr(opt.description, "当前 ACP 会话的权限策略")
       : opt.description;
@@ -3899,7 +3960,7 @@ export default class Peek extends View {
               .text_color(t.muted)
               .cursor_pointer()
               .hover((s) => s.bg(t.hover).text_color(t.foreground))
-              .tooltip(tr("Switch back to raw terminal view", "切回原始终端视图"))
+              .tooltip(withShortcut(tr("Switch back to raw terminal view", "切回原始终端视图"), "terminal.view:toggle"))
               .on_mouse_down("left", stopMouse)
               .on_click(() => run("terminal.view", { terminal: this.activeTerminal(), view: "terminal" }))
               .child(svg(ICONS.terminal).size(13).flex_none().text_color(t.dim))
@@ -3946,7 +4007,11 @@ export default class Peek extends View {
           const isModel = opt.iconKind === "model";
           const isBypassMode = opt.iconKind === "mode"
             && (opt.currentValue === "bypassPermissions" || opt.currentValue === "dangerously-skip-permissions");
-          const pillText = opt.pillLabel;
+          const displayCurrentLabel = opt.iconKind === "thinking"
+            ? this.localizeThinkingLabel(opt.currentValue, opt.currentLabel)
+            : opt.currentLabel;
+          const pillText = opt.iconKind === "thinking" ? displayCurrentLabel : opt.pillLabel;
+          const tooltipTitle = this.capabilityTitle(opt);
           const open = this.openConfigId === opt.id;
           const isClosing = !open && Boolean(this.closingConfigs[opt.id]);
           const on = isBool && opt.currentValue === true;
@@ -3992,7 +4057,7 @@ export default class Peek extends View {
             .cursor_pointer()
             .hover((s) => s.bg(t.hover).text_color(t.foreground))
             .active((s) => s.opacity(0.76))
-            .tooltip(`${opt.name}: ${opt.currentLabel}`)
+            .tooltip(`${tooltipTitle}: ${displayCurrentLabel}`)
             .on_mouse_down("left", stopMouse)
             .on_click((_e, cx) => {
               if (isBool) {
@@ -4745,9 +4810,10 @@ export default class Peek extends View {
                     .text_color(t.muted)
                     .cursor_pointer()
                     .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                    .tooltip(withShortcut(tr("Undo last polish and restore original input", "撤销本次润色并恢复润色前的内容"), "prompt.polish_undo"))
                     .on_mouse_down("left", stopMouse)
                     .on_click((_e, cx) => this.revertPolishedPrompt(cx))
-                    .child(tr("↩ Undo", "↩ 还原原文")),
+                    .child(tr("↩ Undo", "↩ 反悔恢复")),
                 )
                 .child(
                   div()
@@ -4886,7 +4952,7 @@ export default class Peek extends View {
                         .font_medium()
                         .text_color(canPolish || this.polishingPrompt ? purple : t.dim)
                         .when(canPolish, (b) => b.cursor_pointer().hover((s) => s.bg(withAlpha(purple, "2c"))))
-                        .tooltip(tr("Polish prompt with Core AI for clarity (one-click undo)", "使用 Core AI 润色提示词，让意图更清晰明确（支持一键还原）"))
+                        .tooltip(withShortcut(tr("Polish prompt with Core AI for clarity (one-click undo)", "使用 Core AI 润色提示词，让意图更清晰明确（支持一键还原）"), "prompt.polish"))
                         .on_mouse_down("left", stopMouse)
                         .when(canPolish, (b) =>
                           b.on_click((_e, cx) => {

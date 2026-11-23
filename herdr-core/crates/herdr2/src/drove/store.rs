@@ -425,13 +425,8 @@ impl Store {
 
     pub fn list_workers(&self, run_id: Option<&str>) -> Vec<Worker> {
         let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let mut out: Vec<Worker> = g
-            .data
-            .workers
-            .values()
-            .filter(|w| run_id.is_none_or(|r| w.run_id == r))
-            .cloned()
-            .collect();
+        let mut out: Vec<Worker> =
+            g.data.workers.values().filter(|w| run_id.is_none_or(|r| w.run_id == r)).cloned().collect();
         out.sort_by(|a, b| a.created_at.cmp(&b.created_at));
         out
     }
@@ -660,13 +655,30 @@ impl Store {
 
     // --- Worker Transcript Items --------------------------------------------
 
-    pub fn append_item(&self, worker_id: &str, attempt_id: Option<String>, kind: &str, text: Option<String>, tool: Option<ItemTool>, usage: Option<ItemUsage>) -> Item {
+    pub fn append_item(
+        &self,
+        worker_id: &str,
+        attempt_id: Option<String>,
+        kind: &str,
+        text: Option<String>,
+        tool: Option<ItemTool>,
+        usage: Option<ItemUsage>,
+    ) -> Item {
         let (item, run_id) = {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             g.data.next_item_id += 1;
             let id = g.data.next_item_id;
             let run_id = g.data.workers.get(worker_id).map(|w| w.run_id.clone());
-            let item = Item { id, worker_id: worker_id.into(), attempt_id, ts: now_iso(), kind: kind.into(), text, tool, usage };
+            let item = Item {
+                id,
+                worker_id: worker_id.into(),
+                attempt_id,
+                ts: now_iso(),
+                kind: kind.into(),
+                text,
+                tool,
+                usage,
+            };
             let _ = g.load_worker_items(worker_id);
             g.items.entry(worker_id.to_string()).or_default().push(item.clone());
             let _ = g.append_item_disk(worker_id, &item);
@@ -678,7 +690,13 @@ impl Store {
         item
     }
 
-    pub fn list_items(&self, worker_id: &str, attempt_id: Option<&str>, before: Option<u64>, limit: usize) -> Vec<Item> {
+    pub fn list_items(
+        &self,
+        worker_id: &str,
+        attempt_id: Option<&str>,
+        before: Option<u64>,
+        limit: usize,
+    ) -> Vec<Item> {
         let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
         let all = g.load_worker_items(worker_id);
         let filtered: Vec<Item> = all
@@ -687,11 +705,7 @@ impl Store {
             .filter(|it| before.is_none_or(|b| it.id < b))
             .cloned()
             .collect();
-        if filtered.len() > limit {
-            filtered[filtered.len() - limit..].to_vec()
-        } else {
-            filtered
-        }
+        if filtered.len() > limit { filtered[filtered.len() - limit..].to_vec() } else { filtered }
     }
 
     // --- Daemon Events ------------------------------------------------------

@@ -110,9 +110,7 @@ fn events_carry_every_changing_fact_and_filter_parent_children() {
 
     s.json(&["kill", &child]);
     let exited = next_event(&mut conn, |m| {
-        m["method"] == "event"
-            && m["params"]["agent"] == child
-            && m["params"]["type"] == "finished"
+        m["method"] == "event" && m["params"]["agent"] == child && m["params"]["type"] == "finished"
     });
     assert!(exited["params"]["data"]["exit_code"].is_null() || exited["params"]["data"]["signal"].is_number());
 
@@ -141,10 +139,8 @@ fn config_sets_default_permissions_inject_mcp_and_agent_presets() {
     )
     .unwrap();
 
-    let a = s.json(&["run", "--bg", "--agent", "custom", "--prompt", "WRITE_TOOL"])["address"]
-        .as_str()
-        .unwrap()
-        .to_owned();
+    let a =
+        s.json(&["run", "--bg", "--agent", "custom", "--prompt", "WRITE_TOOL"])["address"].as_str().unwrap().to_owned();
     wait_until("approve-all completed WRITE_TOOL", || {
         let g = get(&s, &a);
         g["turn"] == 1 && g["status"]["state"] == "idle"

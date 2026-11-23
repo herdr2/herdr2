@@ -25,6 +25,10 @@ pub enum LineageKind {
     #[serde(alias = "side_chat")]
     #[value(name = "side-chat", alias = "side_chat")]
     SideChat,
+    /// Forward recent session context directly into another currently live session.
+    #[serde(alias = "send_context")]
+    #[value(name = "send-context", alias = "send_context")]
+    SendContext,
 }
 
 impl LineageKind {
@@ -33,6 +37,7 @@ impl LineageKind {
             Self::Handoff => "handoff",
             Self::Fork => "fork",
             Self::SideChat => "side-chat",
+            Self::SendContext => "send-context",
         }
     }
 
@@ -41,6 +46,7 @@ impl LineageKind {
             Self::Handoff => "Handoff",
             Self::Fork => "Fork",
             Self::SideChat => "Side Chat",
+            Self::SendContext => "Shared Context",
         }
     }
 
@@ -49,6 +55,7 @@ impl LineageKind {
             Self::Handoff => "上下文接力",
             Self::Fork => "会话分叉",
             Self::SideChat => "旁路讨论",
+            Self::SendContext => "发送上下文",
         }
     }
 }
@@ -151,20 +158,12 @@ pub fn format_turn_ranges(turns: &[u64]) -> String {
         if t == prev + 1 {
             prev = t;
         } else {
-            ranges.push(if start == prev {
-                start.to_string()
-            } else {
-                format!("{start}-{prev}")
-            });
+            ranges.push(if start == prev { start.to_string() } else { format!("{start}-{prev}") });
             start = t;
             prev = t;
         }
     }
-    ranges.push(if start == prev {
-        start.to_string()
-    } else {
-        format!("{start}-{prev}")
-    });
+    ranges.push(if start == prev { start.to_string() } else { format!("{start}-{prev}") });
     ranges.join(", ")
 }
 
@@ -198,11 +197,7 @@ pub fn default_pty_argv(preset: &str) -> Vec<String> {
         "claude" | "claude-code" => {
             vec!["claude".into(), "--dangerously-skip-permissions".into()]
         }
-        "codex" => vec![
-            "codex".into(),
-            "--no-daemon".into(),
-            "--dangerously-bypass-approvals-and-sandbox".into(),
-        ],
+        "codex" => vec!["codex".into(), "--no-daemon".into(), "--dangerously-bypass-approvals-and-sandbox".into()],
         "gemini" | "gemini-cli" => vec!["gemini".into(), "--yolo".into()],
         "agy" | "antigravity" | "antigravity-cli" => {
             vec!["agy".into(), "--dangerously-skip-permissions".into()]
@@ -213,6 +208,7 @@ pub fn default_pty_argv(preset: &str) -> Vec<String> {
         "cursor" | "cursor-agent" => {
             vec!["cursor-agent".into(), "--yolo".into(), "--trust".into()]
         }
+        "zcode" | "zcode-cli" => vec!["zcode".into(), "--mode".into(), "yolo".into()],
         "goose" => vec!["goose".into()],
         other if !other.is_empty() => vec![other.to_string()],
         _ => Vec::new(),
@@ -233,7 +229,8 @@ pub fn rewrite_origin_paths(text: &str, origin: &str, wt: &str) -> String {
     let mut i = 0usize;
     while i < text.len() {
         if text[i..].starts_with(orig) {
-            let left_ok = i == 0 || !matches!(bytes[i - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'/' | b'\\');
+            let left_ok = i == 0
+                || !matches!(bytes[i - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b'.' | b'/' | b'\\');
             let end = i + orig_len;
             let right_ok = end == text.len()
                 || !matches!(bytes[end], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_' | b'-' | b'.');
@@ -269,7 +266,9 @@ pub fn build_handoff_package(input: &HandoffBuildInput<'_>) -> HandoffPackage {
         input.worktree_origin.map(str::trim).filter(|s| !s.is_empty()),
         input.cwd.map(str::trim).filter(|s| !s.is_empty()),
     ) {
-        (Some(orig), Some(wt)) if orig.trim_end_matches(['/', '\\']) != wt.trim_end_matches(['/', '\\']) => Some((orig, wt)),
+        (Some(orig), Some(wt)) if orig.trim_end_matches(['/', '\\']) != wt.trim_end_matches(['/', '\\']) => {
+            Some((orig, wt))
+        }
         _ => None,
     };
     let map_text = |s: &str| -> String {
@@ -361,7 +360,11 @@ pub fn build_handoff_package(input: &HandoffBuildInput<'_>) -> HandoffPackage {
             ));
         }
         if let Some(note) = input.note.map(str::trim).filter(|s| !s.is_empty()) {
-            header.push_str("\n## 交接备注\n\n");
+            header.push_str(if input.kind == LineageKind::SendContext {
+                "\n## 用户备注\n\n"
+            } else {
+                "\n## 交接备注\n\n"
+            });
             header.push_str(note);
             header.push('\n');
         }
@@ -377,6 +380,13 @@ pub fn build_handoff_package(input: &HandoffBuildInput<'_>) -> HandoffPackage {
             LineageKind::SideChat => {
                 header.push_str("\n## 会话模式：只读旁路讨论\n\n");
                 header.push_str("这是一个位于主智能体旁边的只读旁路讨论窗口。**本轮请仅读取并消化上述交接上下文，不要修改任何文件或执行变更类命令。** 除非用户在本对话中明确要求，否则请始终保持只读分析（不要改动工作区文件、不要执行 git 写操作或破坏性命令），简短确认已理解上下文后等待用户提问。\n");
+            }
+            LineageKind::SendContext => {
+                header.push_str("\n## 上下文说明\n\n");
+                header.push_str(&format!(
+                    "以下内容由当前另一个活跃会话 `{}` 直接发送过来。请结合本轮附带的用户备注或问题（如有）理解上下文并直接回应或继续协助处理。\n",
+                    input.source_address
+                ));
             }
         }
         if let Some((orig, wt)) = wt_pair {
@@ -412,7 +422,11 @@ pub fn build_handoff_package(input: &HandoffBuildInput<'_>) -> HandoffPackage {
             ));
         }
         if let Some(note) = input.note.map(str::trim).filter(|s| !s.is_empty()) {
-            header.push_str("\n## Handoff Note\n\n");
+            header.push_str(if input.kind == LineageKind::SendContext {
+                "\n## User Note\n\n"
+            } else {
+                "\n## Handoff Note\n\n"
+            });
             header.push_str(note);
             header.push('\n');
         }
@@ -428,6 +442,13 @@ pub fn build_handoff_package(input: &HandoffBuildInput<'_>) -> HandoffPackage {
             LineageKind::SideChat => {
                 header.push_str("\n## Session Mode: Read-Only Side Chat\n\n");
                 header.push_str("This is an isolated side-channel discussion window alongside the user's main agent. **On this initial turn, ONLY read and absorb the handoff context — do NOT modify any files or run mutating commands.** Keep this session read-only (Do NOT modify workspace files, run git write commands, or execute destructive/state-changing shell commands unless the user explicitly overrides this rule in this chat), briefly acknowledge the context, and wait for the user's question.\n");
+            }
+            LineageKind::SendContext => {
+                header.push_str("\n## Context Note\n\n");
+                header.push_str(&format!(
+                    "Below is recent conversation context forwarded directly from another live session (`{}`). Use it together with the attached user note or request (if any) to respond or act directly.\n",
+                    input.source_address
+                ));
             }
         }
         if let Some((orig, wt)) = wt_pair {
@@ -515,11 +536,7 @@ pub fn build_handoff_package(input: &HandoffBuildInput<'_>) -> HandoffPackage {
         if avail < 120 {
             break;
         }
-        let max_this = if recent_sections.is_empty() {
-            avail
-        } else {
-            avail.min(6 * 1024)
-        };
+        let max_this = if recent_sections.is_empty() { avail } else { avail.min(6 * 1024) };
         let rendered = render_turn_section(turn, bucket, max_this, false);
         if rendered.is_empty() {
             continue;
@@ -542,11 +559,7 @@ pub fn build_handoff_package(input: &HandoffBuildInput<'_>) -> HandoffPackage {
 
     included_turns.sort_unstable();
     included_turns.dedup();
-    let omitted_turns: Vec<u64> = per_turn
-        .keys()
-        .copied()
-        .filter(|t| !included_turns.contains(t))
-        .collect();
+    let omitted_turns: Vec<u64> = per_turn.keys().copied().filter(|t| !included_turns.contains(t)).collect();
 
     recent_sections.reverse();
 
@@ -572,10 +585,7 @@ pub fn build_handoff_package(input: &HandoffBuildInput<'_>) -> HandoffPackage {
         ));
         body.push_str("Use `h2 read` (or MCP tool `h2_read`) to inspect specific omitted turn ranges:\n");
         for (a, b) in contiguous_turn_ranges(&omitted_turns) {
-            body.push_str(&format!(
-                "- `h2 read {} --from-turn {a} --to-turn {b}`\n",
-                input.source_address
-            ));
+            body.push_str(&format!("- `h2 read {} --from-turn {a} --to-turn {b}`\n", input.source_address));
         }
     }
 
@@ -584,13 +594,7 @@ pub fn build_handoff_package(input: &HandoffBuildInput<'_>) -> HandoffPackage {
     }
     let bytes = body.len();
 
-    HandoffPackage {
-        markdown: body,
-        included_turns,
-        omitted_turns,
-        total_turns,
-        bytes,
-    }
+    HandoffPackage { markdown: body, included_turns, omitted_turns, total_turns, bytes }
 }
 
 fn render_turn_section(turn: u64, bucket: &TurnBucket, max_bytes: usize, is_turn_one: bool) -> String {
@@ -729,11 +733,7 @@ mod tests {
                 ts_ms: t + 100,
             });
         }
-        entries.push(Entry::Plan {
-            turn: 11,
-            items: vec!["Step A".into(), "Step B".into()],
-            ts_ms: 999,
-        });
+        entries.push(Entry::Plan { turn: 11, items: vec!["Step A".into(), "Step B".into()], ts_ms: 999 });
 
         let pkg = build_handoff_package(&HandoffBuildInput {
             kind: LineageKind::Handoff,
@@ -788,6 +788,8 @@ mod tests {
         assert_eq!(format_turn_ranges(&[2, 3, 4, 7, 9, 10]), "2-4, 7, 9-10");
         assert_eq!(default_pty_argv("claude"), vec!["claude", "--dangerously-skip-permissions"]);
         assert_eq!(default_pty_argv("codex")[0], "codex");
+        assert_eq!(default_pty_argv("zcode"), vec!["zcode", "--mode", "yolo"]);
+        assert_eq!(default_pty_argv("zcode-cli"), vec!["zcode", "--mode", "yolo"]);
         let wrapped = wrap_handoff_envelope(LineageKind::Fork, "t2", "# Body\nhi");
         assert_eq!(strip_h2_envelope(&format!("{wrapped}\n\nnext prompt")), "next prompt");
     }
@@ -801,7 +803,13 @@ mod tests {
             source_session_id: None,
             source_model: None,
             cwd: None,
-            entries: &[Entry::User { turn: 1, from: None, text: "Check caching strategy".into(), attachments: vec![], ts_ms: 1 }],
+            entries: &[Entry::User {
+                turn: 1,
+                from: None,
+                text: "Check caching strategy".into(),
+                attachments: vec![],
+                ts_ms: 1,
+            }],
             from_turn: None,
             to_turn: None,
             max_bytes: 8 * 1024,
@@ -820,7 +828,9 @@ mod tests {
             source_session_id: None,
             source_model: None,
             cwd: None,
-            entries: &[Entry::User { turn: 1, from: None, text: "检查缓存策略".into(), attachments: vec![], ts_ms: 1 }],
+            entries: &[Entry::User {
+                turn: 1, from: None, text: "检查缓存策略".into(), attachments: vec![], ts_ms: 1
+            }],
             from_turn: None,
             to_turn: None,
             max_bytes: 8 * 1024,
@@ -862,7 +872,8 @@ mod tests {
         run_git(&repo, &["add", "app.txt"]);
         run_git(&repo, &["commit", "-q", "-m", "origin clean"]);
 
-        let (wt, branch) = crate::drove::integrate::create_fork_worktree(&state, &repo.to_string_lossy(), "t1").unwrap();
+        let (wt, branch) =
+            crate::drove::integrate::create_fork_worktree(&state, &repo.to_string_lossy(), "t1").unwrap();
         let wt_path = Path::new(&wt);
         assert!(wt_path.is_dir());
         assert_eq!(branch, "herdr/fork-t1");
@@ -983,5 +994,55 @@ mod tests {
         });
         assert!(pkg_en.markdown.contains("Worktree Isolation Rules (STRICT)"));
         assert!(pkg_en.markdown.contains(&format!("Write {wt}/calc.py")));
+    }
+
+    #[test]
+    fn send_context_package_uses_collaborative_framing_and_user_note() {
+        let entries = vec![
+            Entry::User { turn: 1, from: None, text: "Check auth timeout".into(), attachments: vec![], ts_ms: 1 },
+            Entry::Assistant { turn: 1, text: "Found 5s timeout in auth.rs".into(), attachments: vec![], ts_ms: 2 },
+        ];
+        let pkg_zh = build_handoff_package(&HandoffBuildInput {
+            kind: LineageKind::SendContext,
+            source_address: "t1",
+            source_provider: Some("claude"),
+            source_session_id: None,
+            source_model: None,
+            cwd: None,
+            entries: &entries,
+            from_turn: None,
+            to_turn: None,
+            max_bytes: 16 * 1024,
+            note: Some("请帮我顺手看看是否需要加单元测试"),
+            is_zh: true,
+            worktree_origin: None,
+            omitted_summary: None,
+        });
+        assert!(pkg_zh.markdown.contains("发送上下文"));
+        assert!(pkg_zh.markdown.contains("## 用户备注"));
+        assert!(pkg_zh.markdown.contains("请帮我顺手看看是否需要加单元测试"));
+        assert!(!pkg_zh.markdown.contains("本轮不要修改任何文件"));
+        assert!(pkg_zh.markdown.contains("Found 5s timeout in auth.rs"));
+
+        let pkg_en = build_handoff_package(&HandoffBuildInput {
+            kind: LineageKind::SendContext,
+            source_address: "a2",
+            source_provider: Some("codex"),
+            source_session_id: None,
+            source_model: None,
+            cwd: None,
+            entries: &entries,
+            from_turn: None,
+            to_turn: None,
+            max_bytes: 16 * 1024,
+            note: Some("Please review and suggest a fix"),
+            is_zh: false,
+            worktree_origin: None,
+            omitted_summary: None,
+        });
+        assert!(pkg_en.markdown.contains("Shared Context"));
+        assert!(pkg_en.markdown.contains("## User Note"));
+        assert!(pkg_en.markdown.contains("Please review and suggest a fix"));
+        assert!(!pkg_en.markdown.contains("do NOT modify any files"));
     }
 }

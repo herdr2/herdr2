@@ -4,7 +4,7 @@ export const FLASH_NOTES_KEY = "flash_notes.items";
 export const FLASH_NOTES_TRASH_KEY = "flash_notes.trash";
 export const KNOWN_AGENTS_KEY = "new-menu.agents";
 export const AGENT_CATALOG_KEY = "handoff.agentCatalog";
-export const EFFORT_ORDER = ["off", "low", "medium", "high", "xhigh", "max"];
+export const EFFORT_ORDER = ["off", "disabled", "minimal", "low", "medium", "enabled", "on", "high", "xhigh", "max", "ultra"];
 export const ACP_PRESETS = new Set([
   "claude",
   "codex",
@@ -119,18 +119,30 @@ const CURATED_AGENT_CATALOG = {
     modelEfforts: {},
   },
   glm: {
-    rawModels: ["glm-5", "glm-4.7"],
-    defaultModel: "",
-    efforts: ["low", "medium", "high"],
-    defaultEffort: "",
-    modelEfforts: {},
+    rawModels: ["GLM-5.4", "GLM-5.3", "GLM-5.3-Flash", "GLM-5.2", "GLM-5-Turbo"],
+    defaultModel: "GLM-5.3",
+    efforts: ["low", "high", "max"],
+    defaultEffort: "max",
+    modelEfforts: {
+      "GLM-5.4": ["low", "high", "max"],
+      "GLM-5.3": ["low", "high", "max"],
+      "GLM-5.3-Flash": ["low", "high", "max"],
+      "GLM-5.2": ["disabled", "high", "max"],
+      "GLM-5-Turbo": ["disabled", "enabled"],
+    },
   },
   zcode: {
-    rawModels: ["glm-5", "glm-4.7"],
-    defaultModel: "",
-    efforts: ["low", "medium", "high"],
-    defaultEffort: "",
-    modelEfforts: {},
+    rawModels: ["GLM-5.4", "GLM-5.3", "GLM-5.3-Flash", "GLM-5.2", "GLM-5-Turbo"],
+    defaultModel: "GLM-5.3",
+    efforts: ["low", "high", "max"],
+    defaultEffort: "max",
+    modelEfforts: {
+      "GLM-5.4": ["low", "high", "max"],
+      "GLM-5.3": ["low", "high", "max"],
+      "GLM-5.3-Flash": ["low", "high", "max"],
+      "GLM-5.2": ["disabled", "high", "max"],
+      "GLM-5-Turbo": ["disabled", "enabled"],
+    },
   },
 };
 
@@ -201,8 +213,20 @@ export function catalogForPreset(agentCatalog, presetKey, selectedModel = "") {
   const selectedBase = cleanSelected
     ? (key === "agy" ? stripEffortSuffix(cleanSelected) : cleanSelected)
     : defaultModel;
-  const perModelEffs = selectedBase && Array.isArray(modelEfforts[selectedBase])
-    ? modelEfforts[selectedBase].map((e) => String(e).toLowerCase()).filter((e) => e && e !== "default")
+  const lookupModelEfforts = (name) => {
+    if (!name) return null;
+    if (Array.isArray(modelEfforts[name])) return modelEfforts[name];
+    const bare = name.includes("\\") ? name.slice(name.lastIndexOf("\\") + 1) : name;
+    if (Array.isArray(modelEfforts[bare])) return modelEfforts[bare];
+    const lowerBare = bare.toLowerCase();
+    for (const [k, v] of Object.entries(modelEfforts)) {
+      if (k.toLowerCase() === lowerBare && Array.isArray(v)) return v;
+    }
+    return null;
+  };
+  const matchedPerModel = lookupModelEfforts(selectedBase);
+  const perModelEffs = matchedPerModel
+    ? matchedPerModel.map((e) => String(e).toLowerCase()).filter((e) => e && e !== "default")
     : [];
   const baseEffs = Array.isArray(live?.efforts) && live.efforts.length > 0
     ? live.efforts
@@ -273,74 +297,260 @@ export function withAlpha(color, alphaHex) {
   return color;
 }
 
-export function normalizeNotes(raw) {
-  if (!Array.isArray(raw)) return [];
-  return raw
-    .filter((item) => item && typeof item === "object" && typeof item.id === "string" && item.id.trim() && typeof item.text === "string" && item.text.trim())
-    .map((item) => ({
-      id: item.id,
-      title: typeof item.title === "string" && item.title.trim() ? item.title.trim() : null,
-      text: item.text,
-      createdAt: Number(item.createdAt) || Number(item.updatedAt) || 0,
-      updatedAt: Number(item.updatedAt) || Number(item.createdAt) || 0,
-      sentTo: typeof item.sentTo === "string" && item.sentTo.trim() ? item.sentTo.trim() : null,
-      sentAt: Number(item.sentAt) || null,
-    }))
-    .sort((a, b) => (a.updatedAt || a.createdAt) - (b.updatedAt || b.createdAt) || (a.createdAt - b.createdAt));
-}
-
-export function normalizeTrash(raw) {
-  if (!Array.isArray(raw)) return [];
-  return raw
-    .filter((item) => item && typeof item === "object" && typeof item.id === "string" && item.id.trim() && typeof item.text === "string" && item.text.trim())
-    .map((item) => ({
-      id: item.id,
-      title: typeof item.title === "string" && item.title.trim() ? item.title.trim() : null,
-      text: item.text,
-      createdAt: Number(item.createdAt) || Number(item.updatedAt) || 0,
-      updatedAt: Number(item.updatedAt) || Number(item.createdAt) || 0,
-      sentTo: typeof item.sentTo === "string" && item.sentTo.trim() ? item.sentTo.trim() : null,
-      sentAt: Number(item.sentAt) || null,
-      trashedAt: Number(item.trashedAt) || Number(item.updatedAt) || Number(item.createdAt) || 0,
-    }))
-    .sort((a, b) => (b.trashedAt || b.updatedAt || b.createdAt) - (a.trashedAt || a.updatedAt || a.createdAt));
-}
-
 export function makeNoteId(now = Date.now()) {
   const rand = Math.random().toString(36).slice(2, 7);
   return `fn-${now}-${rand}`;
 }
 
-export function upsertNote(rawList, { id = null, title = undefined, text, sentTo = undefined, sentAt = undefined, now = Date.now() }) {
-  const cleanText = String(text ?? "").trim();
+export function makeEntryId(index = 0, now = Date.now()) {
+  const rand = Math.random().toString(36).slice(2, 6);
+  return `fe-${now}-${index}-${rand}`;
+}
+
+export function normalizeEntries(rawEntries, fallbackText = "", fallbackId = "fn", fallbackSentTo = null, fallbackSentAt = null) {
+  const list = [];
+  if (Array.isArray(rawEntries) && rawEntries.length > 0) {
+    rawEntries.forEach((entry, idx) => {
+      if (!entry || typeof entry !== "object") return;
+      const text = typeof entry.text === "string" ? entry.text.trim() : "";
+      if (!text) return;
+      const id = typeof entry.id === "string" && entry.id.trim() ? entry.id.trim() : `${fallbackId}-e${idx}`;
+      const sentTo = typeof entry.sentTo === "string" && entry.sentTo.trim() ? entry.sentTo.trim() : null;
+      const sentAt = Number(entry.sentAt) || null;
+      list.push({ id, text, sentTo, sentAt });
+    });
+  }
+  if (list.length === 0) {
+    const cleanFallback = String(fallbackText ?? "").trim();
+    if (cleanFallback) {
+      list.push({
+        id: `${fallbackId}-e0`,
+        text: cleanFallback,
+        sentTo: typeof fallbackSentTo === "string" && fallbackSentTo.trim() ? fallbackSentTo.trim() : null,
+        sentAt: Number(fallbackSentAt) || null,
+      });
+    }
+  }
+  return list;
+}
+
+function deriveGroupSent(entries, explicitSentTo = null, explicitSentAt = null) {
+  if (entries.length === 0) {
+    return { sentTo: explicitSentTo || null, sentAt: explicitSentAt || null };
+  }
+  const sentEntries = entries.filter((e) => Boolean(e.sentTo));
+  if (sentEntries.length === entries.length) {
+    const latest = sentEntries.reduce((best, cur) => ((cur.sentAt || 0) >= (best.sentAt || 0) ? cur : best), sentEntries[0]);
+    return {
+      sentTo: latest.sentTo || explicitSentTo || null,
+      sentAt: latest.sentAt || explicitSentAt || null,
+    };
+  }
+  return { sentTo: null, sentAt: null };
+}
+
+function joinEntriesText(entries) {
+  if (entries.length === 0) return "";
+  if (entries.length === 1) return entries[0].text;
+  return entries.map((e) => e.text).join("\n\n");
+}
+
+export function normalizeNotes(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object" || typeof item.id !== "string" || !item.id.trim()) continue;
+    const rawSentTo = typeof item.sentTo === "string" && item.sentTo.trim() ? item.sentTo.trim() : null;
+    const rawSentAt = Number(item.sentAt) || null;
+    const entries = normalizeEntries(item.entries, item.text, item.id, rawSentTo, rawSentAt);
+    if (entries.length === 0) continue;
+    const derivedSent = deriveGroupSent(entries, rawSentTo, rawSentAt);
+    const text = joinEntriesText(entries);
+    out.push({
+      id: item.id,
+      title: typeof item.title === "string" && item.title.trim() ? item.title.trim() : null,
+      text,
+      entries,
+      createdAt: Number(item.createdAt) || Number(item.updatedAt) || 0,
+      updatedAt: Number(item.updatedAt) || Number(item.createdAt) || 0,
+      sentTo: derivedSent.sentTo,
+      sentAt: derivedSent.sentAt,
+      ...(typeof item.order === "number" && Number.isFinite(item.order) ? { order: item.order } : {}),
+    });
+  }
+  const hasOrder = out.some((n) => typeof n.order === "number");
+  if (hasOrder) {
+    return out.sort((a, b) => {
+      const oa = typeof a.order === "number" ? a.order : Number.POSITIVE_INFINITY;
+      const ob = typeof b.order === "number" ? b.order : Number.POSITIVE_INFINITY;
+      if (oa !== ob) return oa - ob;
+      return (a.updatedAt || a.createdAt) - (b.updatedAt || b.createdAt) || (a.createdAt - b.createdAt);
+    });
+  }
+  return out.sort((a, b) => (a.updatedAt || a.createdAt) - (b.updatedAt || b.createdAt) || (a.createdAt - b.createdAt));
+}
+
+export function reorderNotes(rawList, fromId, toIndex) {
+  const list = normalizeNotes(rawList);
+  const from = list.findIndex((n) => n.id === fromId);
+  if (from < 0 || list.length < 2) return list;
+  const clamped = Math.max(0, Math.min(list.length - 1, Number(toIndex) || 0));
+  if (from === clamped) return list;
+  const next = [...list];
+  const [moved] = next.splice(from, 1);
+  next.splice(clamped, 0, moved);
+  return next.map((n, idx) => ({ ...n, order: idx }));
+}
+
+export function normalizeTrash(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object" || typeof item.id !== "string" || !item.id.trim()) continue;
+    const rawSentTo = typeof item.sentTo === "string" && item.sentTo.trim() ? item.sentTo.trim() : null;
+    const rawSentAt = Number(item.sentAt) || null;
+    const entries = normalizeEntries(item.entries, item.text, item.id, rawSentTo, rawSentAt);
+    if (entries.length === 0) continue;
+    const derivedSent = deriveGroupSent(entries, rawSentTo, rawSentAt);
+    const text = joinEntriesText(entries);
+    out.push({
+      id: item.id,
+      title: typeof item.title === "string" && item.title.trim() ? item.title.trim() : null,
+      text,
+      entries,
+      createdAt: Number(item.createdAt) || Number(item.updatedAt) || 0,
+      updatedAt: Number(item.updatedAt) || Number(item.createdAt) || 0,
+      sentTo: derivedSent.sentTo,
+      sentAt: derivedSent.sentAt,
+      trashedAt: Number(item.trashedAt) || Number(item.updatedAt) || Number(item.createdAt) || 0,
+    });
+  }
+  return out.sort((a, b) => (b.trashedAt || b.updatedAt || b.createdAt) - (a.trashedAt || a.updatedAt || a.createdAt));
+}
+
+export function upsertNote(rawList, { id = null, title = undefined, text = "", entries = undefined, sentTo = undefined, sentAt = undefined, now = Date.now() }) {
   const hasTitleArg = title !== undefined;
   const cleanTitle = hasTitleArg ? (String(title ?? "").trim() || null) : undefined;
   const list = normalizeNotes(rawList);
-  if (!cleanText) return { list, note: null };
   const idx = id ? list.findIndex((n) => n.id === id) : -1;
+  const prev = idx >= 0 ? list[idx] : null;
+  const noteId = prev?.id || id || makeNoteId(now);
+
+  let nextEntries;
+  if (Array.isArray(entries)) {
+    nextEntries = entries
+      .map((e, i) => {
+        const clean = String(e?.text ?? "").trim();
+        if (!clean) return null;
+        return {
+          id: typeof e?.id === "string" && e.id.trim() ? e.id.trim() : makeEntryId(i, now),
+          text: clean,
+          sentTo: typeof e?.sentTo === "string" && e.sentTo.trim() ? e.sentTo.trim() : null,
+          sentAt: Number(e?.sentAt) || null,
+        };
+      })
+      .filter(Boolean);
+    if (sentTo !== undefined && nextEntries.length === 1 && !nextEntries[0].sentTo) {
+      nextEntries[0] = { ...nextEntries[0], sentTo: sentTo || null, sentAt: sentAt ?? now };
+    }
+  } else {
+    const cleanText = String(text ?? "").trim();
+    if (!cleanText) return { list, note: null };
+    const existingFirst = prev?.entries?.[0];
+    nextEntries = [
+      {
+        id: existingFirst?.id || `${noteId}-e0`,
+        text: cleanText,
+        sentTo: sentTo !== undefined ? (sentTo || null) : (existingFirst?.sentTo ?? prev?.sentTo ?? null),
+        sentAt: sentAt !== undefined ? (sentAt || null) : (existingFirst?.sentAt ?? prev?.sentAt ?? null),
+      },
+    ];
+  }
+
+  if (nextEntries.length === 0) return { list, note: null };
+  const derivedSent = deriveGroupSent(nextEntries, sentTo ?? null, sentAt ?? null);
+  const joinedText = joinEntriesText(nextEntries);
+
   if (idx >= 0) {
-    const prev = list[idx];
     const updated = {
       ...prev,
       ...(hasTitleArg ? { title: cleanTitle } : {}),
-      text: cleanText,
+      text: joinedText,
+      entries: nextEntries,
       updatedAt: now,
-      ...(sentTo !== undefined ? { sentTo } : {}),
-      ...(sentAt !== undefined ? { sentAt } : {}),
+      sentTo: derivedSent.sentTo,
+      sentAt: derivedSent.sentAt,
     };
     const next = normalizeNotes([...list.slice(0, idx), updated, ...list.slice(idx + 1)]);
     return { list: next, note: updated };
   }
+
+  const maxOrder = list.reduce((m, n) => (typeof n.order === "number" && Number.isFinite(n.order) ? Math.max(m, n.order) : m), -1);
   const created = {
-    id: id || makeNoteId(now),
+    id: noteId,
     title: cleanTitle ?? null,
-    text: cleanText,
+    text: joinedText,
+    entries: nextEntries,
     createdAt: now,
     updatedAt: now,
-    sentTo: sentTo ?? null,
-    sentAt: sentAt ?? null,
+    sentTo: derivedSent.sentTo,
+    sentAt: derivedSent.sentAt,
+    ...(maxOrder >= 0 ? { order: maxOrder + 1 } : {}),
   };
   return { list: normalizeNotes([...list, created]), note: created };
+}
+
+export function markEntriesSent(rawList, noteId, entryIds, sentTo, now = Date.now()) {
+  const list = normalizeNotes(rawList);
+  const idx = list.findIndex((n) => n.id === noteId);
+  if (idx < 0) return { list, note: null };
+  const prev = list[idx];
+  const idSet = Array.isArray(entryIds) ? new Set(entryIds) : null;
+  const nextEntries = prev.entries.map((entry) => {
+    if (!idSet || idSet.has(entry.id)) {
+      return { ...entry, sentTo: sentTo || null, sentAt: now };
+    }
+    return entry;
+  });
+  const derivedSent = deriveGroupSent(nextEntries, sentTo || null, now);
+  const updated = {
+    ...prev,
+    entries: nextEntries,
+    text: joinEntriesText(nextEntries),
+    sentTo: derivedSent.sentTo,
+    sentAt: derivedSent.sentAt,
+    updatedAt: now,
+  };
+  const next = normalizeNotes([...list.slice(0, idx), updated, ...list.slice(idx + 1)]);
+  return { list: next, note: updated };
+}
+
+export function noteEntryStats(note) {
+  const entries = Array.isArray(note?.entries) && note.entries.length > 0
+    ? note.entries
+    : (note?.text ? [{ id: "e0", text: note.text, sentTo: note.sentTo ?? null, sentAt: note.sentAt ?? null }] : []);
+  const total = entries.length;
+  const sentCount = entries.filter((e) => Boolean(e.sentTo)).length;
+  const unsentCount = total - sentCount;
+  return {
+    total,
+    sentCount,
+    unsentCount,
+    allSent: total > 0 && sentCount === total,
+    partialSent: sentCount > 0 && sentCount < total,
+    isGroup: total > 1,
+  };
+}
+
+export function formatEntriesForSend(entries, groupTitle = "") {
+  const clean = (Array.isArray(entries) ? entries : [])
+    .map((e) => (typeof e === "string" ? e.trim() : String(e?.text ?? "").trim()))
+    .filter(Boolean);
+  if (clean.length === 0) return "";
+  if (clean.length === 1) return clean[0];
+  const title = String(groupTitle ?? "").trim();
+  const numbered = clean.map((text, idx) => `${idx + 1}. ${text}`).join("\n\n");
+  return title ? `[${title}]\n\n${numbered}` : numbered;
 }
 
 export function renameNote(rawList, id, title) {
@@ -407,7 +617,8 @@ export function noteDisplayTitle(note, maxLen = 64) {
   if (note && typeof note.title === "string" && note.title.trim()) {
     return notePreview(note.title, maxLen);
   }
-  return notePreview(note?.text ?? "", maxLen);
+  const firstEntryText = Array.isArray(note?.entries) && note.entries[0]?.text ? note.entries[0].text : (note?.text ?? "");
+  return notePreview(firstEntryText, maxLen);
 }
 
 export function formatTrashAge(tsMs, nowMs = Date.now()) {

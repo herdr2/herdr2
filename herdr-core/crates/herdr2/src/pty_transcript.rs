@@ -83,11 +83,7 @@ fn codex_sid_from_header(path: &Path) -> Option<String> {
             continue;
         };
         if v.get("type").and_then(Value::as_str) == Some("session_meta")
-            && let Some(sid) = v
-                .pointer("/payload/id")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
+            && let Some(sid) = v.pointer("/payload/id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
         {
             return Some(sid.to_string());
         }
@@ -228,18 +224,24 @@ fn extract_transcript_with_home(
         return (Vec::new(), None);
     }
     let allow_older_fallback = snap.resumed || snap.turn > 0;
-    let min_mtime = if snap.resumed {
-        0
-    } else {
-        snap.started_ms.saturating_sub(MTIME_SLACK_MS)
-    };
+    let min_mtime = if snap.resumed { 0 } else { snap.started_ms.saturating_sub(MTIME_SLACK_MS) };
     let fg_started_ms = snap.fg_pid.and_then(proc_started_ms);
     let providers = ordered_providers(snap.agent_hint.as_deref());
 
     for provider in providers {
         let mut candidates = match provider {
-            Provider::Claude => discover_claude(home, claude_dir_override, &norm_cwd, if snap.pinned_session_id.is_some() { 0 } else { min_mtime }),
-            Provider::Codex => discover_codex(home, codex_dir_override, &norm_cwd, if snap.pinned_session_id.is_some() { 0 } else { min_mtime }),
+            Provider::Claude => discover_claude(
+                home,
+                claude_dir_override,
+                &norm_cwd,
+                if snap.pinned_session_id.is_some() { 0 } else { min_mtime },
+            ),
+            Provider::Codex => discover_codex(
+                home,
+                codex_dir_override,
+                &norm_cwd,
+                if snap.pinned_session_id.is_some() { 0 } else { min_mtime },
+            ),
             Provider::Gemini => discover_gemini_or_qwen(home, ".gemini", Provider::Gemini, &norm_cwd, min_mtime),
             Provider::Qwen => discover_qwen(home, &norm_cwd, min_mtime),
             Provider::Pi => discover_pi(home, &norm_cwd, min_mtime),
@@ -247,9 +249,7 @@ fn extract_transcript_with_home(
         };
         if !snap.excluded_session_ids.is_empty() {
             candidates.retain(|c| {
-                candidate_session_id(c)
-                    .as_deref()
-                    .is_none_or(|sid| !snap.excluded_session_ids.contains(sid))
+                candidate_session_id(c).as_deref().is_none_or(|sid| !snap.excluded_session_ids.contains(sid))
             });
         }
         let pinned_hit = snap.pinned_session_id.as_deref().and_then(|wanted| {
@@ -258,9 +258,8 @@ fn extract_transcript_with_home(
                 .position(|c| candidate_session_id(c).as_deref() == Some(wanted))
                 .map(|idx| candidates.remove(idx))
         });
-        let picked = pinned_hit.or_else(|| {
-            pick_best_candidate(candidates, snap.started_ms, fg_started_ms, allow_older_fallback)
-        });
+        let picked = pinned_hit
+            .or_else(|| pick_best_candidate(candidates, snap.started_ms, fg_started_ms, allow_older_fallback));
         if let Some(best) = picked {
             let (entries, mut meta) = match best.provider {
                 Provider::Claude => parse_claude_jsonl(&best.path),
@@ -286,10 +285,7 @@ fn extract_transcript_with_home(
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME")
-        .or_else(|| std::env::var_os("USERPROFILE"))
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
+    std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).filter(|s| !s.is_empty()).map(PathBuf::from)
 }
 
 fn ordered_providers(hint: Option<&str>) -> Vec<Provider> {
@@ -327,6 +323,10 @@ fn hint_from_label(raw: &str) -> Option<&'static str> {
     if lower == "agy" || lower == "antigravity" || lower == "antigravity-cli" {
         return Some("agy");
     }
+    // ZCode keeps its history in a database, not a transcript: the hint names the program only.
+    if lower == "zcode" || lower == "zcode-cli" {
+        return Some("zcode");
+    }
     None
 }
 
@@ -343,7 +343,8 @@ fn detect_agent_hint(t: &Terminal) -> Option<String> {
         return Some(h.to_string());
     }
     let title = t.title.trim();
-    if !title.contains('/') && !title.contains('\\')
+    if !title.contains('/')
+        && !title.contains('\\')
         && let Some(h) = hint_from_label(title)
     {
         return Some(h.to_string());
@@ -356,11 +357,7 @@ pub(crate) fn hint_from_words<'a>(words: impl Iterator<Item = &'a str>) -> Optio
         if raw.starts_with('-') {
             continue;
         }
-        let stem = Path::new(raw)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or(raw)
-            .to_ascii_lowercase();
+        let stem = Path::new(raw).file_stem().and_then(|s| s.to_str()).unwrap_or(raw).to_ascii_lowercase();
         let clean = stem.strip_suffix(".real").unwrap_or(stem.as_str());
         if let Some(h) = hint_from_label(clean) {
             return Some(h);
@@ -443,9 +440,7 @@ fn pick_best_candidate(
         after_start.sort_by(|a, b| {
             let a_fg = fg_floor.is_some_and(|f| a.first_ts_ms == 0 || a.first_ts_ms >= f);
             let b_fg = fg_floor.is_some_and(|f| b.first_ts_ms == 0 || b.first_ts_ms >= f);
-            b_fg.cmp(&a_fg)
-                .then_with(|| b.mtime_ms.cmp(&a.mtime_ms))
-                .then_with(|| b.first_ts_ms.cmp(&a.first_ts_ms))
+            b_fg.cmp(&a_fg).then_with(|| b.mtime_ms.cmp(&a.mtime_ms)).then_with(|| b.first_ts_ms.cmp(&a.first_ts_ms))
         });
         after_start.into_iter().next()
     } else if allow_older_fallback {
@@ -612,7 +607,10 @@ fn discover_codex(home: &Path, override_dir: Option<&Path>, cwd: &str, min_mtime
         for entry in entries.flatten() {
             let path = entry.path();
             let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if !name.starts_with("rollout-") || path.extension().and_then(|s| s.to_str()) != Some("jsonl") || !path.is_file() {
+            if !name.starts_with("rollout-")
+                || path.extension().and_then(|s| s.to_str()) != Some("jsonl")
+                || !path.is_file()
+            {
                 continue;
             }
             let mt = mtime_ms(&path);
@@ -709,9 +707,7 @@ fn discover_gemini_or_qwen(
         }
         let dir_name = proj.file_name().and_then(|s| s.to_str()).unwrap_or("");
         let root_file = proj.join(".project_root");
-        let root_matches = fs::read_to_string(&root_file)
-            .ok()
-            .is_some_and(|s| cwd_matches(&s, cwd));
+        let root_matches = fs::read_to_string(&root_file).ok().is_some_and(|s| cwd_matches(&s, cwd));
         let hash_matches = dir_name == cwd_hash;
 
         let chats = proj.join("chats");
@@ -724,7 +720,10 @@ fn discover_gemini_or_qwen(
         for cf in chat_files.flatten() {
             let path = cf.path();
             let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if !name.starts_with("session-") || path.extension().and_then(|s| s.to_str()) != Some("json") || !path.is_file() {
+            if !name.starts_with("session-")
+                || path.extension().and_then(|s| s.to_str()) != Some("json")
+                || !path.is_file()
+            {
                 continue;
             }
             let mt = mtime_ms(&path);
@@ -855,10 +854,7 @@ fn find_agy_brain_from_proc(fg_pid: u32, home: &Path) -> Option<PathBuf> {
         let Some(uuid) = target.file_stem().and_then(|s| s.to_str()).filter(|s| !s.is_empty()) else {
             continue;
         };
-        let logs = home
-            .join(".gemini/antigravity-cli/brain")
-            .join(uuid)
-            .join(".system_generated/logs");
+        let logs = home.join(".gemini/antigravity-cli/brain").join(uuid).join(".system_generated/logs");
         if let Some(log) = pick_agy_log_file(&logs) {
             return Some(log);
         }
@@ -963,11 +959,7 @@ fn value_text_snippet(val: Option<&Value>) -> Option<String> {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .collect();
-            if parts.is_empty() {
-                None
-            } else {
-                cap_tool_detail(&parts.join("\n"))
-            }
+            if parts.is_empty() { None } else { cap_tool_detail(&parts.join("\n")) }
         }
         Value::Object(obj) => obj
             .get("output")
@@ -1006,11 +998,7 @@ fn claude_tool_detail(name: &str, input: &Value) -> Option<String> {
         }
         "Bash" => {
             let cmd = input.get("command").and_then(Value::as_str)?.trim();
-            if cmd.contains('\n') || cmd.len() > 120 {
-                cap_tool_detail(cmd)
-            } else {
-                None
-            }
+            if cmd.contains('\n') || cmd.len() > 120 { cap_tool_detail(cmd) } else { None }
         }
         _ => None,
     }
@@ -1064,11 +1052,8 @@ fn parse_claude_jsonl_with_settings(path: &Path, settings: Option<&Value>) -> (V
             meta.session_id = Some(sid.to_string());
         }
         if let Some(pm) = v.get("permissionMode").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
-            meta.mode = Some(if pm == "bypassPermissions" {
-                "dangerously-skip-permissions".into()
-            } else {
-                pm.to_string()
-            });
+            meta.mode =
+                Some(if pm == "bypassPermissions" { "dangerously-skip-permissions".into() } else { pm.to_string() });
         }
         if v.get("isSidechain").and_then(Value::as_bool) == Some(true)
             || v.get("isMeta").and_then(Value::as_bool) == Some(true)
@@ -1112,7 +1097,12 @@ fn parse_claude_jsonl_with_settings(path: &Path, settings: Option<&Value>) -> (V
                                 Some("text") => {
                                     if let Some(raw) = block.get("text").and_then(Value::as_str) {
                                         if let Some(raw_spec) = parse_claude_model_switch_stdout(raw) {
-                                            apply_model_switch(&raw_spec, &mut meta, &mut active_context_window, &mut model_windows);
+                                            apply_model_switch(
+                                                &raw_spec,
+                                                &mut meta,
+                                                &mut active_context_window,
+                                                &mut model_windows,
+                                            );
                                         }
                                         if is_claude_command_noise(raw)
                                             || raw.trim_start().starts_with("[Request interrupted by user")
@@ -1143,21 +1133,19 @@ fn parse_claude_jsonl_with_settings(path: &Path, settings: Option<&Value>) -> (V
                 }
             }
             Some("api-request") => {
-                let req_model = v.pointer("/params/model").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
-                let beta_1m = v
-                    .pointer("/params/betas")
-                    .and_then(Value::as_array)
-                    .is_some_and(|betas| {
-                        betas
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .any(|b| b.to_ascii_lowercase().starts_with("context-1m-"))
-                    });
-                let req_window = req_model
-                    .and_then(parse_context_window_from_model_name)
-                    .or(if beta_1m { Some(1_000_000) } else { None });
+                let req_model =
+                    v.pointer("/params/model").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+                let beta_1m = v.pointer("/params/betas").and_then(Value::as_array).is_some_and(|betas| {
+                    betas.iter().filter_map(Value::as_str).any(|b| b.to_ascii_lowercase().starts_with("context-1m-"))
+                });
+                let req_window = req_model.and_then(parse_context_window_from_model_name).or(if beta_1m {
+                    Some(1_000_000)
+                } else {
+                    None
+                });
                 if let Some(m) = req_model {
-                    let prev_base = meta.model.as_deref().map(|cur| strip_model_context_suffix(cur).to_ascii_lowercase());
+                    let prev_base =
+                        meta.model.as_deref().map(|cur| strip_model_context_suffix(cur).to_ascii_lowercase());
                     let next_base = strip_model_context_suffix(m).to_ascii_lowercase();
                     if prev_base.as_deref() != Some(next_base.as_str()) {
                         active_context_window = None;
@@ -1196,7 +1184,9 @@ fn parse_claude_jsonl_with_settings(path: &Path, settings: Option<&Value>) -> (V
                 }
             }
             Some("assistant") => {
-                if let Some(model) = v.pointer("/message/model").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+                if let Some(model) =
+                    v.pointer("/message/model").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
+                {
                     let prev_base = meta.model.as_deref().map(|m| strip_model_context_suffix(m).to_ascii_lowercase());
                     let next_base = strip_model_context_suffix(model).to_ascii_lowercase();
                     if prev_base.as_deref() != Some(next_base.as_str()) {
@@ -1270,7 +1260,12 @@ fn parse_claude_jsonl_with_settings(path: &Path, settings: Option<&Value>) -> (V
                             if let Some(text) = block.get("text").and_then(Value::as_str) {
                                 let clean = text.trim();
                                 if !clean.is_empty() {
-                                    entries.push(Entry::Assistant { turn, text: clean.to_string(), attachments: vec![], ts_ms });
+                                    entries.push(Entry::Assistant {
+                                        turn,
+                                        text: clean.to_string(),
+                                        attachments: vec![],
+                                        ts_ms,
+                                    });
                                 }
                             }
                         }
@@ -1356,15 +1351,11 @@ fn parse_claude_model_switch_stdout(raw: &str) -> Option<String> {
     }
     let first_line = rest.lines().next().unwrap_or(rest).trim();
     let lower_line = first_line.to_ascii_lowercase();
-    let cut = [
-        " and saved as your default",
-        " for this session",
-        " (saved as default",
-    ]
-    .iter()
-    .filter_map(|marker| lower_line.find(marker))
-    .min()
-    .unwrap_or(first_line.len());
+    let cut = [" and saved as your default", " for this session", " (saved as default"]
+        .iter()
+        .filter_map(|marker| lower_line.find(marker))
+        .min()
+        .unwrap_or(first_line.len());
     let spec = first_line[..cut].trim().trim_end_matches('.').trim();
     (!spec.is_empty()).then(|| spec.to_string())
 }
@@ -1384,8 +1375,8 @@ fn resolve_claude_model_spec(raw_spec: &str, settings: Option<&Value>) -> (Strin
                 || model.eq_ignore_ascii_case(spec)
                 || strip_model_context_suffix(model).eq_ignore_ascii_case(spec)
             {
-                let sz = parse_context_window_from_model_name(model)
-                    .or_else(|| parse_context_window_from_model_name(spec));
+                let sz =
+                    parse_context_window_from_model_name(model).or_else(|| parse_context_window_from_model_name(spec));
                 return (model.to_string(), sz);
             }
         }
@@ -1405,8 +1396,8 @@ fn resolve_claude_model_spec(raw_spec: &str, settings: Option<&Value>) -> (Strin
             return (cand.to_string(), sz);
         }
     }
-    let sz = parse_context_window_from_model_name(spec)
-        .or_else(|| lookup_claude_settings_context_window_in(spec, settings));
+    let sz =
+        parse_context_window_from_model_name(spec).or_else(|| lookup_claude_settings_context_window_in(spec, settings));
     (spec.to_string(), sz)
 }
 
@@ -1461,9 +1452,7 @@ fn parse_context_window_from_model_name(model: &str) -> Option<u64> {
     let mut at_rest = s;
     while let Some(at) = at_rest.find('@') {
         let after = at_rest[at + 1..].trim_start();
-        let tok_end = after
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))
-            .unwrap_or(after.len());
+        let tok_end = after.find(|c: char| !(c.is_ascii_alphanumeric() || c == '.')).unwrap_or(after.len());
         if tok_end > 0
             && let Some(sz) = parse_token_size_suffix(&after[..tok_end])
         {
@@ -1550,9 +1539,7 @@ fn summarize_claude_tool(name: &str, input: &Value) -> (Option<String>, String) 
     let str_field = |k: &str| input.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
     match name {
         "Bash" => {
-            let title = str_field("command")
-                .or_else(|| str_field("description"))
-                .unwrap_or("Bash");
+            let title = str_field("command").or_else(|| str_field("description")).unwrap_or("Bash");
             (Some("execute".into()), title.to_string())
         }
         "Read" => {
@@ -1571,9 +1558,7 @@ fn summarize_claude_tool(name: &str, input: &Value) -> (Option<String>, String) 
             (Some("edit".into()), title)
         }
         "Grep" | "Glob" | "WebSearch" | "WebFetch" => {
-            let q = str_field("pattern")
-                .or_else(|| str_field("query"))
-                .or_else(|| str_field("url"));
+            let q = str_field("pattern").or_else(|| str_field("query")).or_else(|| str_field("url"));
             let title = match q {
                 Some(q) => format!("{name} {q}"),
                 None => name.to_string(),
@@ -1588,16 +1573,8 @@ fn codex_tool_detail(name: &str, args: &Value) -> Option<String> {
     match name {
         "apply_patch" => args.as_str().and_then(cap_tool_detail),
         "shell" | "shell_command" | "exec_command" => {
-            let cmd = args
-                .get("command")
-                .or_else(|| args.get("cmd"))
-                .and_then(Value::as_str)?
-                .trim();
-            if cmd.contains('\n') || cmd.len() > 120 {
-                cap_tool_detail(cmd)
-            } else {
-                None
-            }
+            let cmd = args.get("command").or_else(|| args.get("cmd")).and_then(Value::as_str)?.trim();
+            if cmd.contains('\n') || cmd.len() > 120 { cap_tool_detail(cmd) } else { None }
         }
         _ => None,
     }
@@ -1633,11 +1610,8 @@ fn parse_codex_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
         match v.get("type").and_then(Value::as_str) {
             Some("session_meta") => {
                 if meta.session_id.is_none()
-                    && let Some(sid) = v
-                        .pointer("/payload/id")
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|s| !s.is_empty())
+                    && let Some(sid) =
+                        v.pointer("/payload/id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
                 {
                     meta.session_id = Some(sid.to_string());
                 }
@@ -1653,7 +1627,9 @@ fn parse_codex_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                     if let Some(e) = payload.get("effort").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
                         meta.reasoning_effort = Some(e.to_string());
                     }
-                    if let Some(p) = payload.get("approval_policy").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) {
+                    if let Some(p) =
+                        payload.get("approval_policy").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
+                    {
                         meta.mode = Some(p.to_string());
                     }
                 }
@@ -1666,7 +1642,13 @@ fn parse_codex_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                     let clean = msg.trim();
                     if !clean.is_empty() {
                         turn += 1;
-                        entries.push(Entry::User { turn, from: None, text: clean.to_string(), attachments: vec![], ts_ms });
+                        entries.push(Entry::User {
+                            turn,
+                            from: None,
+                            text: clean.to_string(),
+                            attachments: vec![],
+                            ts_ms,
+                        });
                     }
                 } else if ev_type == Some("token_count")
                     && let Some(info) = v.pointer("/payload/info")
@@ -1676,10 +1658,7 @@ fn parse_codex_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                         .or_else(|| info.pointer("/total_token_usage/total_tokens"))
                         .and_then(Value::as_u64)
                         .unwrap_or(0);
-                    let size = info
-                        .get("model_context_window")
-                        .and_then(Value::as_u64)
-                        .unwrap_or(0);
+                    let size = info.get("model_context_window").and_then(Value::as_u64).unwrap_or(0);
                     if size > 0 {
                         meta.context_usage = Some(AcpContextUsage { used, size });
                     }
@@ -1711,7 +1690,9 @@ fn parse_codex_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                         let name = payload.get("name").and_then(Value::as_str).unwrap_or("tool");
                         let raw_args = payload.get("arguments").or_else(|| payload.get("input"));
                         let args_val = match raw_args {
-                            Some(Value::String(s)) => serde_json::from_str::<Value>(s).unwrap_or(Value::String(s.clone())),
+                            Some(Value::String(s)) => {
+                                serde_json::from_str::<Value>(s).unwrap_or(Value::String(s.clone()))
+                            }
                             Some(other) => other.clone(),
                             None => Value::Null,
                         };
@@ -1793,7 +1774,13 @@ fn parse_codex_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                                 .unwrap_or_default();
                             if !parts.is_empty() {
                                 turn += 1;
-                                entries.push(Entry::User { turn, from: None, text: parts.join("\n\n"), attachments: vec![], ts_ms });
+                                entries.push(Entry::User {
+                                    turn,
+                                    from: None,
+                                    text: parts.join("\n\n"),
+                                    attachments: vec![],
+                                    ts_ms,
+                                });
                             }
                         }
                     }
@@ -1846,7 +1833,13 @@ fn summarize_codex_tool(name: &str, args: &Value) -> (Option<String>, String) {
         "apply_patch" => {
             let summary = args
                 .as_str()
-                .and_then(|s| s.lines().find(|l| l.starts_with("*** Update File:") || l.starts_with("*** Add File:") || l.starts_with("*** Delete File:")))
+                .and_then(|s| {
+                    s.lines().find(|l| {
+                        l.starts_with("*** Update File:")
+                            || l.starts_with("*** Add File:")
+                            || l.starts_with("*** Delete File:")
+                    })
+                })
                 .map(|l| l.trim_start_matches('*').trim().to_string())
                 .unwrap_or_else(|| "apply_patch".to_string());
             (Some("edit".into()), summary)
@@ -1954,7 +1947,9 @@ fn parse_gemini_json(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                         let (tool_kind, title) = summarize_generic_tool(name, args);
                         let status = match tc.get("status").and_then(Value::as_str) {
                             Some("error" | "failed" | "cancelled") => "failed",
-                            Some("executing" | "scheduled" | "awaiting_approval" | "pending" | "in_progress") => "in_progress",
+                            Some("executing" | "scheduled" | "awaiting_approval" | "pending" | "in_progress") => {
+                                "in_progress"
+                            }
                             _ => "completed",
                         };
                         let detail = merge_tool_detail_parts(
@@ -2040,15 +2035,8 @@ fn generic_tool_detail(name: &str, args: &Value) -> Option<String> {
         let content = str_field("content").or_else(|| str_field("Content"))?;
         cap_tool_detail(content)
     } else if lower.contains("shell") || lower.contains("bash") || lower.contains("exec") || lower.contains("command") {
-        let cmd = str_field("command")
-            .or_else(|| str_field("cmd"))
-            .or_else(|| str_field("CommandLine"))?
-            .trim();
-        if cmd.contains('\n') || cmd.len() > 100 {
-            cap_tool_detail(cmd)
-        } else {
-            None
-        }
+        let cmd = str_field("command").or_else(|| str_field("cmd")).or_else(|| str_field("CommandLine"))?.trim();
+        if cmd.contains('\n') || cmd.len() > 100 { cap_tool_detail(cmd) } else { None }
     } else {
         None
     }
@@ -2090,10 +2078,8 @@ fn summarize_generic_tool(name: &str, args: &Value) -> (Option<String>, String) 
     let lower = name.to_ascii_lowercase();
     let str_field = |k: &str| args.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
     if lower.contains("shell") || lower.contains("bash") || lower.contains("exec") || lower.contains("command") {
-        let cmd = str_field("command")
-            .or_else(|| str_field("cmd"))
-            .or_else(|| str_field("CommandLine"))
-            .unwrap_or(name);
+        let cmd =
+            str_field("command").or_else(|| str_field("cmd")).or_else(|| str_field("CommandLine")).unwrap_or(name);
         (Some("execute".into()), cmd.to_string())
     } else if lower.contains("read") {
         let p = str_field("file_path")
@@ -2102,14 +2088,10 @@ fn summarize_generic_tool(name: &str, args: &Value) -> (Option<String>, String) 
             .or_else(|| str_field("Path"));
         (Some("read".into()), p.map_or_else(|| name.to_string(), |p| format!("{name} {p}")))
     } else if lower.contains("edit") || lower.contains("write") || lower.contains("replace") {
-        let p = str_field("file_path")
-            .or_else(|| str_field("path"))
-            .or_else(|| str_field("Path"));
+        let p = str_field("file_path").or_else(|| str_field("path")).or_else(|| str_field("Path"));
         (Some("edit".into()), p.map_or_else(|| name.to_string(), |p| format!("{name} {p}")))
     } else if lower.contains("search") || lower.contains("grep") || lower.contains("glob") || lower.contains("find") {
-        let q = str_field("pattern")
-            .or_else(|| str_field("query"))
-            .or_else(|| str_field("Query"));
+        let q = str_field("pattern").or_else(|| str_field("query")).or_else(|| str_field("Query"));
         (Some("search".into()), q.map_or_else(|| name.to_string(), |q| format!("{name} {q}")))
     } else {
         (None, name.to_string())
@@ -2220,7 +2202,12 @@ fn parse_pi_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                             if let Some(t) = block.get("text").and_then(Value::as_str) {
                                 let clean = t.trim();
                                 if !clean.is_empty() {
-                                    entries.push(Entry::Assistant { turn, text: clean.to_string(), attachments: vec![], ts_ms });
+                                    entries.push(Entry::Assistant {
+                                        turn,
+                                        text: clean.to_string(),
+                                        attachments: vec![],
+                                        ts_ms,
+                                    });
                                 }
                             }
                         }
@@ -2296,7 +2283,8 @@ fn parse_agy_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
                             None => &Value::Null,
                         };
                         if name == "exit_plan_mode"
-                            && let Some(plan_text) = args.get("plan").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
+                            && let Some(plan_text) =
+                                args.get("plan").and_then(Value::as_str).filter(|s| !s.trim().is_empty())
                         {
                             let items = extract_plan_lines(plan_text);
                             if !items.is_empty() {
@@ -2418,9 +2406,7 @@ pub(crate) fn merge_sent_prompts(entries: &mut Vec<Entry>, sent_prompts: &[(u64,
         if trimmed.is_empty() {
             continue;
         }
-        if (last_disk_user_ts == 0 || *ts_ms > last_disk_user_ts)
-            && !recent_user_texts.iter().any(|u| u == trimmed)
-        {
+        if (last_disk_user_ts == 0 || *ts_ms > last_disk_user_ts) && !recent_user_texts.iter().any(|u| u == trimmed) {
             entries.push(Entry::User {
                 turn: (*turn).max(1),
                 from: None,
@@ -2517,25 +2503,16 @@ pub(crate) fn discover_cli_transcript(
 ) -> Option<PathBuf> {
     let home = home_dir()?;
     let fg_started = (!allow_older_fallback).then(|| fg_pid.and_then(proc_started_ms)).flatten();
-    let effective_start = if allow_older_fallback {
-        0
-    } else {
-        fg_started.map_or(min_mtime_ms, |f| min_mtime_ms.max(f))
-    };
-    let scan_min_mtime = if allow_older_fallback {
-        0
-    } else {
-        effective_start.saturating_sub(MTIME_SLACK_MS)
-    };
+    let effective_start =
+        if allow_older_fallback { 0 } else { fg_started.map_or(min_mtime_ms, |f| min_mtime_ms.max(f)) };
+    let scan_min_mtime = if allow_older_fallback { 0 } else { effective_start.saturating_sub(MTIME_SLACK_MS) };
     let mut candidates = match kind {
         "claude" => discover_claude(&home, None, cwd, scan_min_mtime),
         "codex" => discover_codex(&home, None, cwd, scan_min_mtime),
         "agy" => discover_agy(&home, scan_min_mtime, fg_pid),
         _ => return None,
     };
-    if !allow_older_fallback
-        && let Some(fg_ms) = fg_started
-    {
+    if !allow_older_fallback && let Some(fg_ms) = fg_started {
         // A clean non-resumed CLI session can only own transcripts created once that foreground
         // CLI process started (2s slack for filesystem/clock jitter), never a previous session.
         let strict_floor = fg_ms.saturating_sub(2_000);
@@ -2604,10 +2581,7 @@ pub(crate) fn parse_ts_ms(raw: &str) -> u64 {
             let (hh, mm) = if let Some((h, m)) = tz_rest.split_once(':') {
                 (h.parse::<i64>().ok().unwrap_or(0), m.get(..2).and_then(|x| x.parse::<i64>().ok()).unwrap_or(0))
             } else if tz_rest.len() >= 4 {
-                (
-                    tz_rest[..2].parse::<i64>().ok().unwrap_or(0),
-                    tz_rest[2..4].parse::<i64>().ok().unwrap_or(0),
-                )
+                (tz_rest[..2].parse::<i64>().ok().unwrap_or(0), tz_rest[2..4].parse::<i64>().ok().unwrap_or(0))
             } else if tz_rest.len() >= 2 {
                 (tz_rest[..2].parse::<i64>().ok().unwrap_or(0), 0)
             } else {
@@ -2731,7 +2705,9 @@ mod tests {
         assert_eq!(entries.len(), 5);
         assert!(matches!(&entries[0], Entry::User { text, turn: 1, .. } if text == "Inspect main.rs"));
         assert!(matches!(&entries[1], Entry::Thought { text, .. } if text == "Let me read the file."));
-        assert!(matches!(&entries[2], Entry::ToolCall { title, tool_kind, status, detail, .. } if title == "Read src/main.rs" && tool_kind.as_deref() == Some("read") && status == "completed" && detail.as_deref() == Some("fn main() {}")));
+        assert!(
+            matches!(&entries[2], Entry::ToolCall { title, tool_kind, status, detail, .. } if title == "Read src/main.rs" && tool_kind.as_deref() == Some("read") && status == "completed" && detail.as_deref() == Some("fn main() {}"))
+        );
         assert!(matches!(&entries[3], Entry::Plan { items, .. } if items == &vec!["[x] Check code".to_string()]));
         assert!(matches!(&entries[4], Entry::Assistant { text, .. } if text == "All good."));
         let meta = meta.expect("expected Claude session metadata");
@@ -2849,7 +2825,9 @@ mod tests {
 
         // Official Claude Code format without backticks works too.
         assert_eq!(
-            parse_claude_model_switch_stdout("<local-command-stdout>Set model to Opus (claude-opus-4-6[1m]) for this session</local-command-stdout>"),
+            parse_claude_model_switch_stdout(
+                "<local-command-stdout>Set model to Opus (claude-opus-4-6[1m]) for this session</local-command-stdout>"
+            ),
             Some("Opus (claude-opus-4-6[1m])".to_string())
         );
         assert_eq!(
@@ -2944,7 +2922,9 @@ mod tests {
         assert_eq!(entries.len(), 4);
         assert!(matches!(&entries[0], Entry::User { text, .. } if text == "Run tests"));
         assert!(matches!(&entries[1], Entry::Thought { text, .. } if text == "Checking cargo test"));
-        assert!(matches!(&entries[2], Entry::ToolCall { title, tool_kind, status, detail, .. } if title == "cargo test" && tool_kind.as_deref() == Some("execute") && status == "failed" && detail.as_deref() == Some("Exit code: 1\nfailed")));
+        assert!(
+            matches!(&entries[2], Entry::ToolCall { title, tool_kind, status, detail, .. } if title == "cargo test" && tool_kind.as_deref() == Some("execute") && status == "failed" && detail.as_deref() == Some("Exit code: 1\nfailed"))
+        );
         assert!(matches!(&entries[3], Entry::Assistant { text, .. } if text == "Tests failed."));
         let meta = meta.expect("expected Codex session metadata");
         assert_eq!(meta.model.as_deref(), Some("gpt-5.4"));
@@ -2990,8 +2970,12 @@ mod tests {
         let entries = extract_entries_with_home(&snap, &root, None, None);
         assert_eq!(entries.len(), 4);
         assert!(matches!(&entries[0], Entry::User { text, .. } if text == "Explain lib.rs"));
-        assert!(matches!(&entries[1], Entry::Thought { text, .. } if text.contains("Reading") && text.contains("Check exports")));
-        assert!(matches!(&entries[2], Entry::ToolCall { status, tool_kind, .. } if status == "completed" && tool_kind.as_deref() == Some("read")));
+        assert!(
+            matches!(&entries[1], Entry::Thought { text, .. } if text.contains("Reading") && text.contains("Check exports"))
+        );
+        assert!(
+            matches!(&entries[2], Entry::ToolCall { status, tool_kind, .. } if status == "completed" && tool_kind.as_deref() == Some("read"))
+        );
         assert!(matches!(&entries[3], Entry::Assistant { text, .. } if text == "It exports modules."));
         fs::remove_dir_all(root).ok();
     }
@@ -3040,7 +3024,9 @@ mod tests {
         assert_eq!(entries.len(), 4);
         assert!(matches!(&entries[0], Entry::User { text, .. } if text == "Hello Pi"));
         assert!(matches!(&entries[1], Entry::Thought { text, .. } if text == "Thinking..."));
-        assert!(matches!(&entries[2], Entry::ToolCall { status, tool_kind, .. } if status == "completed" && tool_kind.as_deref() == Some("execute")));
+        assert!(
+            matches!(&entries[2], Entry::ToolCall { status, tool_kind, .. } if status == "completed" && tool_kind.as_deref() == Some("execute"))
+        );
         assert!(matches!(&entries[3], Entry::Assistant { text, .. } if text == "Done!"));
         fs::remove_dir_all(root).ok();
     }
@@ -3134,10 +3120,7 @@ mod tests {
         let slug_dir = root.join("projects").join(claude_slug(project));
         fs::create_dir_all(&slug_dir).unwrap();
 
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64;
+        let now_ms = std::time::SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
 
         let main_file = slug_dir.join("main-sess-111.jsonl");
         let acp_file = slug_dir.join("acp-side-222.jsonl");
@@ -3202,7 +3185,8 @@ mod tests {
         fs::write(
             logs.join("transcript.jsonl"),
             truncated_lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n"),
-        ).unwrap();
+        )
+        .unwrap();
 
         let full_lines = [
             serde_json::json!({
@@ -3225,7 +3209,8 @@ mod tests {
         fs::write(
             logs.join("transcript_full.jsonl"),
             full_lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n"),
-        ).unwrap();
+        )
+        .unwrap();
 
         let snap = PtySnapshot {
             cwd: "/tmp/repo".to_string(),
@@ -3240,20 +3225,17 @@ mod tests {
         let entries = extract_entries_with_home(&snap, &root, None, None);
         assert_eq!(entries.len(), 3);
         assert!(matches!(&entries[0], Entry::User { text, .. } if text == "Summarize rankings"));
-        assert!(matches!(&entries[1], Entry::ToolCall { title, tool_kind, .. } if title == "h2 ls" && tool_kind.as_deref() == Some("execute")));
+        assert!(
+            matches!(&entries[1], Entry::ToolCall { title, tool_kind, .. } if title == "h2 ls" && tool_kind.as_deref() == Some("execute"))
+        );
         assert!(matches!(&entries[2], Entry::Assistant { text, .. } if text.contains("| A | B |")));
         fs::remove_dir_all(root).ok();
     }
 
     #[test]
     fn optimistic_prompt_dedup_works() {
-        let mut entries = vec![Entry::User {
-            turn: 1,
-            from: None,
-            text: "first prompt".into(),
-            attachments: vec![],
-            ts_ms: 1000,
-        }];
+        let mut entries =
+            vec![Entry::User { turn: 1, from: None, text: "first prompt".into(), attachments: vec![], ts_ms: 1000 }];
         let prompts = vec![
             (1, 1050, "first prompt".into()),
             (1, 900, "older prompt".into()),
@@ -3342,7 +3324,9 @@ mod tests {
             Entry::ToolCall { tool_kind, detail: Some(d), .. }
             if tool_kind.as_deref() == Some("edit") && d.contains("--- src/bar.rs") && d.contains("- old") && d.contains("+ new")
         ));
-        assert!(matches!(&agy_entries[2], Entry::Plan { items, .. } if items == &vec!["Step one".to_string(), "Step two".to_string()]));
+        assert!(
+            matches!(&agy_entries[2], Entry::Plan { items, .. } if items == &vec!["Step one".to_string(), "Step two".to_string()])
+        );
         fs::remove_dir_all(root).ok();
     }
 }

@@ -30,7 +30,7 @@ impl Revisions {
             self.next += 1;
             self.all = self.next;
         }
-        for root in changed.iter().filter_map(|path| mod_of(path).map(|name| PathBuf::from("mods").join(name))).collect::<HashSet<_>>() {
+        for root in changed.iter().filter_map(|path| mod_root_of(path)).collect::<HashSet<_>>() {
             self.next += 1;
             self.roots.insert(root, self.next);
         }
@@ -49,7 +49,7 @@ impl FileEvents {
         let revisions = self.revisions.clone();
         move |root| {
             let relative = root.strip_prefix(&base).ok()?;
-            if relative.components().count() != 2 || !relative.starts_with("mods") {
+            if relative.components().count() != 2 || !(relative.starts_with("mods") || relative.starts_with("frame")) {
                 return None;
             }
             let mut revisions = revisions.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -65,25 +65,51 @@ fn changes(base: &Path, event: notify::Result<notify::Event>) -> (Changed, bool)
         return (Vec::new(), false);
     }
     let rescan = event.need_rescan() || event.paths.iter().any(|path| {
-        base.starts_with(path) || path.strip_prefix(base).is_ok_and(|relative| relative.starts_with("mods") && mod_of(relative).is_none())
+        base.starts_with(path) || path.strip_prefix(base).is_ok_and(|relative| (relative.starts_with("mods") || relative.starts_with("frame")) && mod_of(relative).is_none())
     });
     let changed = event.paths.iter().filter_map(|path| path.strip_prefix(base).ok())
         .filter(|path| watched(path)).map(Path::to_path_buf).collect();
     (changed, rescan)
 }
 
-/// Starts watching `home`; None if the OS watcher can't start (the app then
-/// polls as before).
-pub fn watch(home: &Path, #[cfg(test)] executor: gpui::BackgroundExecutor) -> Option<FileEvents> {
+/// Starts watching `home` (and optionally a live `dev_defaults` source checkout);
+/// None if the OS watcher can't start (the app then polls as before).
+pub fn watch(home: &Path, dev_defaults: Option<&Path>, #[cfg(test)] executor: gpui::BackgroundExecutor) -> Option<FileEvents> {
     static WATCHER: OnceLock<std::sync::Mutex<notify::RecommendedWatcher>> = OnceLock::new();
     let (tx, rx) = async_channel::unbounded();
     #[cfg(test)]
     let tx = test_notifications(tx, executor);
     let root = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
+    let dev_root = dev_defaults.map(|d| d.canonicalize().unwrap_or_else(|_| d.to_path_buf()));
     let base = root.clone();
+    let dev_base = dev_root.clone();
     let revisions = Arc::new(Mutex::new(Revisions::default()));
     let event_revisions = revisions.clone();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+        if let Some(ref dev) = dev_base
+            && let Ok(ref ev) = event
+            && !matches!(ev.kind, notify::EventKind::Access(_))
+        {
+            let mut mirrored = Vec::new();
+            for path in &ev.paths {
+                if let Ok(rel) = path.strip_prefix(dev)
+                    && watched_dev(rel)
+                    && let Some(synced) = crate::mods::sync_dev_path(dev, &base, rel)
+                {
+                    mirrored.push(synced);
+                }
+            }
+            if !mirrored.is_empty() {
+                let mut revisions = event_revisions.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                revisions.changed(&mirrored, ev.need_rescan());
+                drop(revisions);
+                #[cfg(not(test))]
+                let _ = tx.send_blocking(mirrored);
+                #[cfg(test)]
+                let _ = tx.send(mirrored);
+                return;
+            }
+        }
         let mut revisions = event_revisions.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (changed, rescan) = changes(&base, event);
         revisions.changed(&changed, rescan);
@@ -98,6 +124,13 @@ pub fn watch(home: &Path, #[cfg(test)] executor: gpui::BackgroundExecutor) -> Op
     .map_err(|e| tracing::warn!("file watching unavailable ({e}); polling instead"))
     .ok()?;
     watcher.watch(&root, RecursiveMode::Recursive).map_err(|e| tracing::warn!("cannot watch {} ({e}); polling instead", root.display())).ok()?;
+    if let Some(ref dev) = dev_root {
+        if let Err(e) = watcher.watch(dev, RecursiveMode::Recursive) {
+            tracing::warn!("cannot watch dev defaults {} ({e}); dev live reload disabled", dev.display());
+        } else {
+            tracing::info!("watching dev defaults at {} for live hot-reload", dev.display());
+        }
+    }
     WATCHER.set(std::sync::Mutex::new(watcher)).ok()?;
     Some(FileEvents { changes: rx, root, revisions })
 }
@@ -124,9 +157,20 @@ fn watched(rel: &Path) -> bool {
     let mut parts = rel.components();
     let first = parts.next().and_then(|c| c.as_os_str().to_str()).unwrap_or_default();
     match first {
-        "mods" => mod_file_counts(parts),
-        "layouts" | "themes" => true,
+        "mods" | "frame" => mod_file_counts(parts),
+        "layouts" | "themes" | "icons" => true,
         "settings.json" | "keys.json" | "programs.json" => parts.next().is_none(),
+        _ => false,
+    }
+}
+
+/// What files in a live `dev_defaults` checkout mirror into `app_dir()`.
+fn watched_dev(rel: &Path) -> bool {
+    let mut parts = rel.components();
+    let first = parts.next().and_then(|c| c.as_os_str().to_str()).unwrap_or_default();
+    match first {
+        "mods" | "frame" => mod_file_counts(parts),
+        "layouts" | "themes" | "icons" => true,
         _ => false,
     }
 }
@@ -483,11 +527,30 @@ pub fn mod_stamp(root: &Path) -> ModStamp {
     Some(stamp)
 }
 
-/// The mod a changed path belongs to (`mods/<name>/...`).
+/// The mod a changed path belongs to (`mods/<name>/...` -> `<name>`,
+/// `frame/<name>/...` -> `frame-<name>`).
 pub fn mod_of(rel: &Path) -> Option<String> {
     let mut parts = rel.components();
-    (parts.next()?.as_os_str() == "mods").then_some(())?;
-    parts.next()?.as_os_str().to_str().map(str::to_owned)
+    let kind = parts.next()?.as_os_str();
+    let name = parts.next()?.as_os_str().to_str()?;
+    if kind == "mods" {
+        Some(name.to_owned())
+    } else if kind == "frame" {
+        Some(format!("frame-{name}"))
+    } else {
+        None
+    }
+}
+
+/// The relative folder root of a mod (`mods/<name>` or `frame/<name>`).
+fn mod_root_of(rel: &Path) -> Option<PathBuf> {
+    let mut parts = rel.components();
+    let kind = parts.next()?.as_os_str();
+    if kind != "mods" && kind != "frame" {
+        return None;
+    }
+    let name = parts.next()?.as_os_str();
+    Some(PathBuf::from(kind).join(name))
 }
 
 #[cfg(test)]
@@ -628,11 +691,33 @@ mod tests {
     fn only_what_people_edit_counts() {
         assert!(watched(Path::new("settings.json")));
         assert!(watched(Path::new("mods/agents/main.js")));
+        assert!(watched(Path::new("frame/settings/main.js")));
         assert!(watched(Path::new("layouts/main.json")));
+        assert!(watched(Path::new("icons/claude.svg")));
         assert!(!watched(Path::new("view.json")));
         assert!(!watched(Path::new("shared.json")));
         assert!(!watched(Path::new("data/x")));
         assert_eq!(mod_of(Path::new("mods/agents/main.js")).as_deref(), Some("agents"));
+        assert_eq!(mod_of(Path::new("frame/settings/main.js")).as_deref(), Some("frame-settings"));
+        assert_eq!(mod_root_of(Path::new("frame/settings/main.js")), Some(PathBuf::from("frame/settings")));
+    }
+
+    #[test]
+    fn frame_revisions_increment_independently_from_mods() {
+        let (_, changes) = async_channel::unbounded();
+        let events = FileEvents {
+            changes,
+            root: PathBuf::from("/home/probe"),
+            revisions: Default::default(),
+        };
+        let revision = events.revision_provider();
+        let frame_settings = Path::new("/home/probe/frame/settings");
+        let mod_agents = Path::new("/home/probe/mods/agents");
+        assert_eq!(revision(frame_settings), Some(0));
+        assert_eq!(revision(mod_agents), Some(0));
+        events.revisions.lock().unwrap().changed(&vec!["frame/settings/main.js".into()], false);
+        assert_eq!(revision(frame_settings), Some(1));
+        assert_eq!(revision(mod_agents), Some(0));
     }
 
     #[test]

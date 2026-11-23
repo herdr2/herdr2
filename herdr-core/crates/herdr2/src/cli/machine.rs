@@ -157,7 +157,12 @@ mod tests {
 
     #[test]
     fn logout_warning_is_human_only_and_requires_observed_false() {
-        let paths = Paths { socket: "unused".into(), holder_socket: "unused".into(), state: "unused".into(), config: "unused".into() };
+        let paths = Paths {
+            socket: "unused".into(),
+            holder_socket: "unused".into(),
+            state: "unused".into(),
+            config: "unused".into(),
+        };
         for state in [json!(false), json!(true), Value::Null] {
             let remote = json!({"name":"cloud", "target":"user@cloud", "version":"test",
                 "keeps_running_after_logout":state, "logout_linger_user":"-remote-user"});

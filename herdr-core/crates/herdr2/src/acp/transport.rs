@@ -127,7 +127,11 @@ impl Transport {
         cwd: &str,
     ) -> Result<(Self, ChildWaiter, mpsc::UnboundedReceiver<Inbound>), RpcError> {
         let mut cmd = platform::agent_command(argv, env, cwd).map_err(|e| {
-            RpcError::new("spawn_failed", format!("cannot prepare {}: {e}", argv.first().map_or("", String::as_str)), "")
+            RpcError::new(
+                "spawn_failed",
+                format!("cannot prepare {}: {e}", argv.first().map_or("", String::as_str)),
+                "",
+            )
         })?;
         let mut child = cmd.spawn().map_err(|e| {
             let program = argv.first().map_or("", String::as_str);
@@ -244,22 +248,10 @@ impl Transport {
     }
 
     pub fn recent_stderr(&self) -> String {
-        self.inner
-            .stderr_tail
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>()
-            .join("\n")
+        self.inner.stderr_tail.lock().unwrap_or_else(|p| p.into_inner()).iter().cloned().collect::<Vec<_>>().join("\n")
     }
 
-    pub async fn request<P: Serialize>(
-        &self,
-        method: &str,
-        params: &P,
-        timeout: Duration,
-    ) -> Result<Value, CallError> {
+    pub async fn request<P: Serialize>(&self, method: &str, params: &P, timeout: Duration) -> Result<Value, CallError> {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let payload = serde_json::to_string(&json!({
             "jsonrpc": "2.0",

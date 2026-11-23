@@ -39,13 +39,7 @@ fn read_coordinator_secret(key_file: &std::path::Path) -> String {
         direct
     } else {
         // Core AI key lives at `<state>/secrets/ai.key`, while Drove coordinator token lives at `<state>/drove/secrets/coordinator.token`.
-        key_file
-            .parent()
-            .and_then(|p| p.parent())
-            .unwrap()
-            .join("drove")
-            .join("secrets")
-            .join("coordinator.token")
+        key_file.parent().and_then(|p| p.parent()).unwrap().join("drove").join("secrets").join("coordinator.token")
     };
     std::fs::read_to_string(&token_path)
         .unwrap_or_else(|e| panic!("read {}: {e}", token_path.display()))
@@ -57,14 +51,9 @@ fn read_web_token(port: u16) -> String {
     let index = http_req(port, "GET", "/", &[], None);
     assert_eq!(index.status, 200, "GET / failed: {}", index.body);
     let marker = "window.__DROVE_TOKEN__=\"";
-    let start = index
-        .body
-        .find(marker)
-        .unwrap_or_else(|| panic!("missing __DROVE_TOKEN__ in index HTML"));
+    let start = index.body.find(marker).unwrap_or_else(|| panic!("missing __DROVE_TOKEN__ in index HTML"));
     let rest = &index.body[start + marker.len()..];
-    let end = rest
-        .find('"')
-        .unwrap_or_else(|| panic!("unterminated __DROVE_TOKEN__ in index HTML"));
+    let end = rest.find('"').unwrap_or_else(|| panic!("unterminated __DROVE_TOKEN__ in index HTML"));
     rest[..end].to_string()
 }
 
@@ -74,13 +63,7 @@ struct HttpResp {
     json: Option<Value>,
 }
 
-fn http_req(
-    port: u16,
-    method: &str,
-    path: &str,
-    headers: &[(&str, &str)],
-    body: Option<&Value>,
-) -> HttpResp {
+fn http_req(port: u16, method: &str, path: &str, headers: &[(&str, &str)], body: Option<&Value>) -> HttpResp {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -105,12 +88,8 @@ fn http_req(
     stream.read_to_end(&mut resp_bytes).unwrap();
     let text = String::from_utf8_lossy(&resp_bytes);
     let (head, rest) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
-    let status = head
-        .lines()
-        .next()
-        .and_then(|l| l.split_whitespace().nth(1))
-        .and_then(|s| s.parse::<u16>().ok())
-        .unwrap_or(0);
+    let status =
+        head.lines().next().and_then(|l| l.split_whitespace().nth(1)).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
     let json = serde_json::from_str::<Value>(rest).ok();
     HttpResp { status, body: rest.to_string(), json }
 }
@@ -118,9 +97,7 @@ fn http_req(
 fn open_sse(port: u16, path: &str) -> BufReader<TcpStream> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/event-stream\r\n\r\n"
-    );
+    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: text/event-stream\r\n\r\n");
     stream.write_all(req.as_bytes()).unwrap();
     stream.flush().unwrap();
 
@@ -156,8 +133,8 @@ fn next_sse_event(reader: &mut BufReader<TcpStream>) -> (String, Value) {
         } else if let Some(data) = trimmed.strip_prefix("data:") {
             data_line = data.trim().to_string();
         } else if trimmed.is_empty() && !event_name.is_empty() && !data_line.is_empty() {
-            let parsed: Value = serde_json::from_str(&data_line)
-                .unwrap_or_else(|e| panic!("bad SSE JSON ({e}): {data_line}"));
+            let parsed: Value =
+                serde_json::from_str(&data_line).unwrap_or_else(|e| panic!("bad SSE JSON ({e}): {data_line}"));
             return (event_name, parsed);
         }
     }
@@ -328,10 +305,7 @@ fn drove_http_server_and_sse_and_read_only_agents() {
         port,
         "POST",
         "/api/runs",
-        &[
-            ("x-drove-coordinator-secret", &coord_secret),
-            ("x-drove-coordinator", "t1"),
-        ],
+        &[("x-drove-coordinator-secret", &coord_secret), ("x-drove-coordinator", "t1")],
         Some(&json!({ "hostSession": "t1", "objective": "Verify HTTP + SSE", "cwd": "/tmp" })),
     );
     assert_eq!(created.status, 200, "create run failed: {}", created.body);
@@ -357,19 +331,14 @@ fn drove_ssh_federation_proxies_runs_and_streams_events() {
     local.env.push(fake_ssh(&local, &[("rohan", &rohan)]));
     local.env.push(("H2_RECONNECT_MS".into(), "200".into()));
     local.json(&["machine", "add", "rohan"]);
-    wait_until("rohan connected", || {
-        local.json(&["machine", "ls"])["machines"][0]["state"] == "connected"
-    });
+    wait_until("rohan connected", || local.json(&["machine", "ls"])["machines"][0]["state"] == "connected");
     let (local_port, _) = wait_web_port(&local);
 
     let created = http_req(
         rohan_port,
         "POST",
         "/api/runs",
-        &[
-            ("x-drove-coordinator-secret", &rohan_secret),
-            ("x-drove-coordinator", "t9"),
-        ],
+        &[("x-drove-coordinator-secret", &rohan_secret), ("x-drove-coordinator", "t9")],
         Some(&json!({ "hostSession": "t9", "objective": "Remote SSH run", "cwd": "/tmp" })),
     );
     assert_eq!(created.status, 200, "remote run create failed: {}", created.body);
@@ -475,15 +444,7 @@ fn drove_dag_executes_with_native_acp_workers_and_tree_labels() {
     let out = s
         .cmd()
         .env("H2_AGENT_ID", &coord)
-        .args([
-            "--json",
-            "drove",
-            "plan",
-            "--file",
-            plan_path.to_str().unwrap(),
-            "--cwd",
-            work_dir.to_str().unwrap(),
-        ])
+        .args(["--json", "drove", "plan", "--file", plan_path.to_str().unwrap(), "--cwd", work_dir.to_str().unwrap()])
         .output()
         .unwrap();
     assert!(out.status.success(), "drove plan failed: {}", String::from_utf8_lossy(&out.stderr));
@@ -564,12 +525,7 @@ fn drove_dag_executes_with_native_acp_workers_and_tree_labels() {
     let step3 = snap2["tasks"].as_array().unwrap().iter().find(|t| t["key"] == "step3").unwrap();
     assert_eq!(step3["status"], "succeeded", "step3 not succeeded: {step3}");
     let step3_id = step3["id"].as_str().unwrap();
-    let step3_att = snap2["attempts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|a| a["taskId"] == step3_id)
-        .unwrap();
+    let step3_att = snap2["attempts"].as_array().unwrap().iter().find(|a| a["taskId"] == step3_id).unwrap();
     assert_eq!(step3_att["reused"], true, "step3 must reuse warm worker: {step3_att}");
     assert_eq!(step3_att["workerId"], worker_id);
 
@@ -723,15 +679,7 @@ fn drove_role_scope_violation_rejects_and_recovers() {
     // ScopedWrite `tester` (allowedPaths: ["tests/**"]) writes `illegal.txt` -> `worker done` rejects with 422;
     // deleting `illegal.txt` and writing inside `tests/ok.txt` succeeds.
     let prompt = "SH:echo dirty > illegal.txt && ! herdr2 drove worker done --outcome done --summary \"should fail\" && rm -f illegal.txt && mkdir -p tests && echo ok > tests/ok.txt && herdr2 drove worker done --outcome done --summary \"scoped write ok\"";
-    let started = s.json(&[
-        "drove",
-        "quick",
-        "--role",
-        "tester",
-        "--cwd",
-        work_dir.to_str().unwrap(),
-        prompt,
-    ]);
+    let started = s.json(&["drove", "quick", "--role", "tester", "--cwd", work_dir.to_str().unwrap(), prompt]);
     let run_id = started["run"]["id"].as_str().unwrap().to_string();
 
     let settled = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "15"]);
@@ -770,14 +718,8 @@ fn drove_verify_gate_rejects_failure_then_passes_with_artifact_log() {
     )
     .unwrap();
 
-    let planned = s.json(&[
-        "drove",
-        "plan",
-        "--file",
-        plan_path.to_str().unwrap(),
-        "--cwd",
-        work_dir.to_str().unwrap(),
-    ]);
+    let planned =
+        s.json(&["drove", "plan", "--file", plan_path.to_str().unwrap(), "--cwd", work_dir.to_str().unwrap()]);
     let run_id = planned["run"]["id"].as_str().unwrap().to_string();
 
     let waited = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "15"]);
@@ -790,22 +732,12 @@ fn drove_verify_gate_rejects_failure_then_passes_with_artifact_log() {
     assert_eq!(att["verifyRejections"], 1);
     let art_id = att["verifyLogArtifactId"].as_str().unwrap();
 
-    let log_resp = http_req(
-        port,
-        "GET",
-        &format!("/api/runs/{run_id}/verify-log?artifact={art_id}"),
-        &[],
-        None,
-    );
+    let log_resp = http_req(port, "GET", &format!("/api/runs/{run_id}/verify-log?artifact={art_id}"), &[], None);
     assert_eq!(log_resp.status, 200, "verify-log response: {}", log_resp.body);
     assert!(log_resp.body.contains("ready.flag"));
 
     // Run-level verify fails before final.ok exists, then succeeds once created.
-    let err_out = s
-        .cmd()
-        .args(["--json", "drove", "complete", &run_id])
-        .output()
-        .unwrap();
+    let err_out = s.cmd().args(["--json", "drove", "complete", &run_id]).output().unwrap();
     assert!(!err_out.status.success(), "run complete should fail before final.ok");
     std::fs::write(work_dir.join("final.ok"), "ok\n").unwrap();
     let ok_done = s.json(&["drove", "complete", &run_id]);
@@ -821,17 +753,8 @@ fn drove_worktree_isolation_merges_git_changes_cleanly() {
     let repo = s.root.join("git_repo");
     std::fs::create_dir_all(&repo).unwrap();
     let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let out = std::process::Command::new("git").arg("-C").arg(&repo).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8_lossy(&out.stdout).to_string()
     };
     git(&["init"]);
@@ -860,14 +783,7 @@ fn drove_worktree_isolation_merges_git_changes_cleanly() {
     );
     std::fs::write(&plan_path, script).unwrap();
 
-    let planned = s.json(&[
-        "drove",
-        "plan",
-        "--file",
-        plan_path.to_str().unwrap(),
-        "--cwd",
-        &repo_str,
-    ]);
+    let planned = s.json(&["drove", "plan", "--file", plan_path.to_str().unwrap(), "--cwd", &repo_str]);
     let run_id = planned["run"]["id"].as_str().unwrap().to_string();
 
     let waited = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "15"]);
@@ -903,13 +819,7 @@ fn drove_worktree_isolation_merges_git_changes_cleanly() {
 
     // Trashing & deleting the run via Web HTTP closes the warm worktree worker and removes its git worktree.
     let web_tok = read_web_token(port);
-    let trashed = http_req(
-        port,
-        "POST",
-        &format!("/api/runs/{run_id}/trash"),
-        &[("x-drove-token", &web_tok)],
-        None,
-    );
+    let trashed = http_req(port, "POST", &format!("/api/runs/{run_id}/trash"), &[("x-drove-token", &web_tok)], None);
     assert_eq!(trashed.status, 200, "trash failed: {}", trashed.body);
     let deleted = http_req(
         port,
@@ -920,15 +830,9 @@ fn drove_worktree_isolation_merges_git_changes_cleanly() {
     );
     assert_eq!(deleted.status, 200, "delete failed: {}", deleted.body);
 
-    wait_until("worktree worker finished after web delete", || {
-        s.json(&["get", &worker_addr])["state"] == "finished"
-    });
+    wait_until("worktree worker finished after web delete", || s.json(&["get", &worker_addr])["state"] == "finished");
     let wt_list = git(&["worktree", "list", "--porcelain"]);
-    assert_eq!(
-        wt_list.lines().filter(|l| l.starts_with("worktree ")).count(),
-        1,
-        "stale worktree remained: {wt_list}"
-    );
+    assert_eq!(wt_list.lines().filter(|l| l.starts_with("worktree ")).count(), 1, "stale worktree remained: {wt_list}");
 }
 
 #[test]
@@ -940,12 +844,7 @@ fn drove_adversarial_review_requests_changes_then_approves() {
     let repo = s.root.join("rev_repo");
     std::fs::create_dir_all(&repo).unwrap();
     let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(args)
-            .output()
-            .unwrap();
+        let out = std::process::Command::new("git").arg("-C").arg(&repo).args(args).output().unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     };
     git(&["init"]);
@@ -988,14 +887,7 @@ fn drove_adversarial_review_requests_changes_then_approves() {
     )
     .unwrap();
 
-    let planned = s.json(&[
-        "drove",
-        "plan",
-        "--file",
-        plan_path.to_str().unwrap(),
-        "--cwd",
-        repo.to_str().unwrap(),
-    ]);
+    let planned = s.json(&["drove", "plan", "--file", plan_path.to_str().unwrap(), "--cwd", repo.to_str().unwrap()]);
     let run_id = planned["run"]["id"].as_str().unwrap().to_string();
 
     let waited = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "15"]);
@@ -1005,40 +897,21 @@ fn drove_adversarial_review_requests_changes_then_approves() {
     assert_eq!(task["result"]["summary"], "v2");
 
     let snap = s.json(&["drove", "show", &run_id]);
-    let author_att = snap["attempts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|a| a["kind"] == "author")
-        .unwrap();
+    let author_att = snap["attempts"].as_array().unwrap().iter().find(|a| a["kind"] == "author").unwrap();
     assert_eq!(author_att["reviewRound"]["round"], 2);
     assert_eq!(author_att["reviewRound"]["verdict"], "approve");
 
-    let rev_atts: Vec<_> = snap["attempts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|a| a["kind"] == "review")
-        .collect();
+    let rev_atts: Vec<_> = snap["attempts"].as_array().unwrap().iter().filter(|a| a["kind"] == "review").collect();
     assert_eq!(rev_atts.len(), 2, "expected 2 review attempts: {rev_atts:?}");
     assert_eq!(
         rev_atts[0]["workerId"], rev_atts[1]["workerId"],
         "round 2 should reuse round 1 reviewer worker: {rev_atts:?}"
     );
-    assert_eq!(
-        rev_atts[1]["reused"], true,
-        "round 2 review attempt should record reused=true: {rev_atts:?}"
-    );
+    assert_eq!(rev_atts[1]["reused"], true, "round 2 review attempt should record reused=true: {rev_atts:?}");
 
     let task_id = task["id"].as_str().unwrap();
     let patch_art = author_att["reviewRound"]["patchArtifactId"].as_str().unwrap();
-    let diff_resp = http_req(
-        port,
-        "GET",
-        &format!("/api/tasks/{task_id}/review-diff?artifact={patch_art}"),
-        &[],
-        None,
-    );
+    let diff_resp = http_req(port, "GET", &format!("/api/tasks/{task_id}/review-diff?artifact={patch_art}"), &[], None);
     assert_eq!(diff_resp.status, 200, "review-diff response: {}", diff_resp.body);
     assert!(diff_resp.body.contains("out.txt"));
 }
@@ -1051,8 +924,7 @@ fn drove_install_writes_all_three_skills() {
     assert_eq!(res["ok"], true);
     for name in ["drove", "drove-add", "drove-setup"] {
         let p = target.join(name).join("SKILL.md");
-        let text = std::fs::read_to_string(&p)
-            .unwrap_or_else(|e| panic!("missing skill {}: {e}", p.display()));
+        let text = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("missing skill {}: {e}", p.display()));
         assert!(text.contains(&format!("name: {name}")), "unexpected skill header in {p:?}");
     }
 }
@@ -1123,10 +995,7 @@ fn drove_ai_auto_title_and_question_draft_hooks() {
         port,
         "POST",
         "/api/runs",
-        &[
-            ("x-drove-coordinator-secret", &coord_secret),
-            ("x-drove-coordinator", "t1"),
-        ],
+        &[("x-drove-coordinator-secret", &coord_secret), ("x-drove-coordinator", "t1")],
         Some(&json!({ "hostSession": "t1", "objective": "Clean up auth middleware", "cwd": "/tmp" })),
     );
     assert_eq!(created.status, 200);
@@ -1134,8 +1003,7 @@ fn drove_ai_auto_title_and_question_draft_hooks() {
 
     wait_until("AI auto_title populated on Run", || {
         let snap = s.json(&["drove", "show", &run_id]);
-        snap["run"]["name"] == "Auth Middleware Cleanup"
-            && snap["run"]["aiUsage"]["calls"].as_u64().unwrap_or(0) >= 1
+        snap["run"]["name"] == "Auth Middleware Cleanup" && snap["run"]["aiUsage"]["calls"].as_u64().unwrap_or(0) >= 1
     });
 
     stop.store(true, Ordering::Relaxed);
@@ -1306,17 +1174,8 @@ fn drove_chained_worktrees_inherit_dirty_merges_and_ignore_pycache() {
     std::fs::create_dir_all(repo.join("src")).unwrap();
     std::fs::create_dir_all(repo.join("docs")).unwrap();
     let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        let out = std::process::Command::new("git").arg("-C").arg(&repo).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
         String::from_utf8_lossy(&out.stdout).to_string()
     };
     git(&["init"]);
@@ -1377,14 +1236,7 @@ fn drove_chained_worktrees_inherit_dirty_merges_and_ignore_pycache() {
     )
     .unwrap();
 
-    let planned = s.json(&[
-        "drove",
-        "plan",
-        "--file",
-        plan_path.to_str().unwrap(),
-        "--cwd",
-        repo.to_str().unwrap(),
-    ]);
+    let planned = s.json(&["drove", "plan", "--file", plan_path.to_str().unwrap(), "--cwd", repo.to_str().unwrap()]);
     let run_id = planned["run"]["id"].as_str().unwrap().to_string();
 
     let waited = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "25"]);
@@ -1403,29 +1255,16 @@ fn drove_chained_worktrees_inherit_dirty_merges_and_ignore_pycache() {
     assert!(!repo.join("src/__pycache__").exists(), "ephemeral cache should not be merged");
     assert_eq!(git(&["rev-list", "--count", "HEAD"]).trim(), "1");
 
-    let impl_id = tasks.iter().find(|t| t["key"] == "impl").unwrap()["id"]
-        .as_str()
-        .unwrap();
-    let impl2_id = tasks.iter().find(|t| t["key"] == "impl2").unwrap()["id"]
-        .as_str()
-        .unwrap();
+    let impl_id = tasks.iter().find(|t| t["key"] == "impl").unwrap()["id"].as_str().unwrap();
+    let impl2_id = tasks.iter().find(|t| t["key"] == "impl2").unwrap()["id"].as_str().unwrap();
     assert_eq!(tasks.iter().find(|t| t["key"] == "impl2").unwrap()["deps"], json!([impl_id]));
     assert_eq!(tasks.iter().find(|t| t["key"] == "tests").unwrap()["deps"], json!([impl2_id]));
     assert_eq!(tasks.iter().find(|t| t["key"] == "docs").unwrap()["deps"], json!([impl_id]));
 
-    let coder_workers: Vec<&Value> = shown["workers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|w| w["role"] == "coder")
-        .collect();
+    let coder_workers: Vec<&Value> =
+        shown["workers"].as_array().unwrap().iter().filter(|w| w["role"] == "coder").collect();
     assert_eq!(coder_workers.len(), 1, "expected 1 reused coder worker: {coder_workers:?}");
-    let impl2_att = shown["attempts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|a| a["taskId"] == impl2_id)
-        .unwrap();
+    let impl2_att = shown["attempts"].as_array().unwrap().iter().find(|a| a["taskId"] == impl2_id).unwrap();
     assert_eq!(impl2_att["reused"], true, "impl2 should reuse warm coder worker: {impl2_att}");
 
     for w in shown["workers"].as_array().unwrap() {
@@ -1433,13 +1272,7 @@ fn drove_chained_worktrees_inherit_dirty_merges_and_ignore_pycache() {
     }
 
     let web_tok = read_web_token(port);
-    let trashed = http_req(
-        port,
-        "POST",
-        &format!("/api/runs/{run_id}/trash"),
-        &[("x-drove-token", &web_tok)],
-        None,
-    );
+    let trashed = http_req(port, "POST", &format!("/api/runs/{run_id}/trash"), &[("x-drove-token", &web_tok)], None);
     assert_eq!(trashed.status, 200, "trash failed: {}", trashed.body);
 
     let shown_after_trash = s.json(&["drove", "show", &run_id]);
@@ -1448,11 +1281,7 @@ fn drove_chained_worktrees_inherit_dirty_merges_and_ignore_pycache() {
         assert!(w["worktree"].is_null(), "worktree path should be cleared: {w}");
     }
     let wt_list = git(&["worktree", "list", "--porcelain"]);
-    assert_eq!(
-        wt_list.lines().filter(|l| l.starts_with("worktree ")).count(),
-        1,
-        "stale worktree remained: {wt_list}"
-    );
+    assert_eq!(wt_list.lines().filter(|l| l.starts_with("worktree ")).count(), 1, "stale worktree remained: {wt_list}");
 }
 
 #[test]
@@ -1503,14 +1332,8 @@ fn drove_retry_reopens_skipped_dependents_and_applies_agent_override() {
     )
     .unwrap();
 
-    let planned = s.json(&[
-        "drove",
-        "plan",
-        "--file",
-        plan_path.to_str().unwrap(),
-        "--cwd",
-        work_dir.to_str().unwrap(),
-    ]);
+    let planned =
+        s.json(&["drove", "plan", "--file", plan_path.to_str().unwrap(), "--cwd", work_dir.to_str().unwrap()]);
     let run_id = planned["run"]["id"].as_str().unwrap().to_string();
 
     let waited1 = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "15"]);
@@ -1521,7 +1344,8 @@ fn drove_retry_reopens_skipped_dependents_and_applies_agent_override() {
     assert_eq!(tasks1.iter().find(|t| t["key"] == "step2").unwrap()["status"], "skipped");
 
     std::fs::write(&allow_file, "ok\n").unwrap();
-    let retried = s.json(&["drove", "retry", "step1", "--run", &run_id, "--agent", "codex", "--hint", "marker exists now"]);
+    let retried =
+        s.json(&["drove", "retry", "step1", "--run", &run_id, "--agent", "codex", "--hint", "marker exists now"]);
     assert_eq!(retried["assign"]["source"], "user", "retry override must mark source=user: {retried}");
     assert_eq!(retried["assign"]["agent"], "codex");
 
@@ -1535,13 +1359,7 @@ fn drove_retry_reopens_skipped_dependents_and_applies_agent_override() {
     assert_eq!(s2["status"], "succeeded", "step2 should reopen from skipped and succeed: {s2}");
 
     let s1_id = s1["id"].as_str().unwrap();
-    let latest_s1_att = show2["attempts"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|a| a["taskId"] == s1_id)
-        .last()
-        .unwrap();
+    let latest_s1_att = show2["attempts"].as_array().unwrap().iter().filter(|a| a["taskId"] == s1_id).last().unwrap();
     assert_eq!(latest_s1_att["agent"], "codex", "retried attempt should use overridden agent: {latest_s1_att}");
 }
 
@@ -1551,36 +1369,21 @@ fn drove_coordinator_exposes_agent_model_and_host_transcript() {
     let bin_dir = s.root.join("bin");
     std::fs::create_dir_all(&bin_dir).unwrap();
     let wrapper = bin_dir.join("codex-acp");
-    std::fs::write(
-        &wrapper,
-        format!("#!/bin/sh\nexec python3 \"{}\" \"$@\"\n", fake_acp_path()),
-    )
-    .unwrap();
+    std::fs::write(&wrapper, format!("#!/bin/sh\nexec python3 \"{}\" \"$@\"\n", fake_acp_path())).unwrap();
     std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
     s.env.push(("PATH".into(), format!("{}:/usr/bin:/bin", bin_dir.display())));
 
     let (port, key_file) = wait_web_port(&s);
     let coord_secret = read_coordinator_secret(&key_file);
 
-    let coord = s.json(&[
-        "run",
-        "--agent",
-        "codex",
-        "--model",
-        "gpt-5.4",
-        "--prompt",
-        "ECHO:coordinator ready",
-    ]);
+    let coord = s.json(&["run", "--agent", "codex", "--model", "gpt-5.4", "--prompt", "ECHO:coordinator ready"]);
     let coord_addr = coord["address"].as_str().unwrap().to_string();
 
     let created = http_req(
         port,
         "POST",
         "/api/runs",
-        &[
-            ("x-drove-coordinator-secret", &coord_secret),
-            ("x-drove-coordinator", &coord_addr),
-        ],
+        &[("x-drove-coordinator-secret", &coord_secret), ("x-drove-coordinator", &coord_addr)],
         Some(&json!({
             "hostSession": coord_addr,
             "objective": "Verify coordinator metadata & transcript",
@@ -1596,13 +1399,7 @@ fn drove_coordinator_exposes_agent_model_and_host_transcript() {
     assert_eq!(snap_json["run"]["coordinator"]["agent"], "codex", "{snap_json}");
     assert_eq!(snap_json["run"]["coordinator"]["model"], "gpt-5.4", "{snap_json}");
 
-    let tr = http_req(
-        port,
-        "GET",
-        &format!("/api/runs/{run_id}/coordinator-transcript?limit=20"),
-        &[],
-        None,
-    );
+    let tr = http_req(port, "GET", &format!("/api/runs/{run_id}/coordinator-transcript?limit=20"), &[], None);
     assert_eq!(tr.status, 200, "transcript failed: {}", tr.body);
     let tr_json = tr.json.unwrap();
     assert_eq!(tr_json["available"], true, "{tr_json}");
@@ -1612,8 +1409,9 @@ fn drove_coordinator_exposes_agent_model_and_host_transcript() {
     assert!(!items.is_empty(), "expected host transcript items: {tr_json}");
     assert!(items.iter().all(|it| it["index"].is_u64() && it["kind"].is_string()), "{tr_json}");
     assert!(
-        items.iter().any(|it| it["kind"] == "assistant"
-            && it["text"].as_str().unwrap_or("").contains("coordinator ready")),
+        items
+            .iter()
+            .any(|it| it["kind"] == "assistant" && it["text"].as_str().unwrap_or("").contains("coordinator ready")),
         "expected assistant text in coordinator transcript: {tr_json}"
     );
 }
@@ -1659,10 +1457,7 @@ for line in sys.stdin:
         "bad_reviewer.py",
         r#"{"error":{"type":"invalid_request_error","message":"The 'gpt-6.2-sol' model is not supported","code":"model_not_found"}}"#,
     );
-    let ok_rev_spec = acp_stub(
-        "ok_reviewer.py",
-        r#"{"verdict":"approve","summary":"Reviewed cleanly","findings":[]}"#,
-    );
+    let ok_rev_spec = acp_stub("ok_reviewer.py", r#"{"verdict":"approve","summary":"Reviewed cleanly","findings":[]}"#);
 
     let coder_spec = fake_acp_spec();
     let cfg_file = s.root.join("rev-reuse-cfg.json");
@@ -1699,12 +1494,7 @@ for line in sys.stdin:
         &["add", "."][..],
         &["commit", "-m", "init"][..],
     ] {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&work_dir)
-            .args(args)
-            .output()
-            .unwrap();
+        let out = std::process::Command::new("git").arg("-C").arg(&work_dir).args(args).output().unwrap();
         assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
     }
 
@@ -1762,14 +1552,8 @@ for line in sys.stdin:
     )
     .unwrap();
 
-    let planned = s.json(&[
-        "drove",
-        "plan",
-        "--file",
-        plan_path.to_str().unwrap(),
-        "--cwd",
-        work_dir.to_str().unwrap(),
-    ]);
+    let planned =
+        s.json(&["drove", "plan", "--file", plan_path.to_str().unwrap(), "--cwd", work_dir.to_str().unwrap()]);
     let run_id = planned["run"]["id"].as_str().unwrap().to_string();
 
     // Wait until fail_leaf triggers a `failed` message, ack it, then verify `wait` still blocks until sibling/rev_t2 settle.
@@ -1787,10 +1571,7 @@ for line in sys.stdin:
             settled = true;
             break;
         }
-        assert!(
-            w["timedOut"] != true,
-            "drove wait timed out before settling after acking failure: {w}"
-        );
+        assert!(w["timedOut"] != true, "drove wait timed out before settling after acking failure: {w}");
     }
     assert!(settled, "run did not settle");
 
@@ -1820,12 +1601,8 @@ for line in sys.stdin:
     assert_eq!(ok_revs[1]["reused"], true, "t2 should warm-reuse t1 reviewer worker: {ok_revs:?}");
     assert_eq!(ok_revs[0]["workerId"], ok_revs[1]["workerId"]);
 
-    let rev_workers: Vec<&Value> = shown["workers"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|w| w["agent"] == ok_rev_spec)
-        .collect();
+    let rev_workers: Vec<&Value> =
+        shown["workers"].as_array().unwrap().iter().filter(|w| w["agent"] == ok_rev_spec).collect();
     assert_eq!(rev_workers.len(), 1, "expected 1 reused ok reviewer worker: {rev_workers:?}");
 
     // Complete without --force must reject because fail_leaf is failed; with --force it succeeds and keeps healthy workers idle until run is trashed/closed.
@@ -1843,13 +1620,7 @@ for line in sys.stdin:
     }
 
     let web_tok = read_web_token(port);
-    let trashed = http_req(
-        port,
-        "POST",
-        &format!("/api/runs/{run_id}/trash"),
-        &[("x-drove-token", &web_tok)],
-        None,
-    );
+    let trashed = http_req(port, "POST", &format!("/api/runs/{run_id}/trash"), &[("x-drove-token", &web_tok)], None);
     assert_eq!(trashed.status, 200, "trash failed: {}", trashed.body);
     let final_snap = http_req(port, "GET", &format!("/api/runs/{run_id}"), &[], None).json.unwrap();
     for w in final_snap["workers"].as_array().unwrap() {
@@ -1922,12 +1693,7 @@ fn drove_auto_worktree_isolates_parallel_scoped_writers_and_foreach_template_edg
         &["add", "."][..],
         &["commit", "-m", "init"][..],
     ] {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(args)
-            .output()
-            .unwrap();
+        let out = std::process::Command::new("git").arg("-C").arg(&repo).args(args).output().unwrap();
         assert!(out.status.success(), "git {args:?}");
     }
 
@@ -1989,14 +1755,7 @@ fn drove_auto_worktree_isolates_parallel_scoped_writers_and_foreach_template_edg
     )
     .unwrap();
 
-    let planned = s.json(&[
-        "drove",
-        "plan",
-        "--file",
-        plan_path.to_str().unwrap(),
-        "--cwd",
-        repo.to_str().unwrap(),
-    ]);
+    let planned = s.json(&["drove", "plan", "--file", plan_path.to_str().unwrap(), "--cwd", repo.to_str().unwrap()]);
     let run_id = planned["run"]["id"].as_str().unwrap().to_string();
 
     let waited = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "25"]);
@@ -2022,21 +1781,10 @@ fn drove_auto_worktree_isolates_parallel_scoped_writers_and_foreach_template_edg
     assert_eq!(tests_t["isolation"], "worktree");
     assert_eq!(docs_t["isolation"], "worktree");
 
-    let ev_resp = http_req(
-        port,
-        "GET",
-        &format!("/api/daemon/events?runId={run_id}&category=schedule"),
-        &[],
-        None,
-    )
-    .json
-    .unwrap();
-    let auto_events: Vec<&Value> = ev_resp["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|e| e["kind"] == "auto_worktree")
-        .collect();
+    let ev_resp =
+        http_req(port, "GET", &format!("/api/daemon/events?runId={run_id}&category=schedule"), &[], None).json.unwrap();
+    let auto_events: Vec<&Value> =
+        ev_resp["events"].as_array().unwrap().iter().filter(|e| e["kind"] == "auto_worktree").collect();
     assert!(!auto_events.is_empty(), "expected auto_worktree schedule events: {ev_resp}");
     assert_eq!(std::fs::read_to_string(repo.join("tests/t.txt")).unwrap(), "t1\n");
     assert_eq!(std::fs::read_to_string(repo.join("docs/d.txt")).unwrap(), "d1\n");
@@ -2127,10 +1875,7 @@ fn drove_ai_model_params_persist_clear_and_fallback_when_options_rejected() {
         port,
         "POST",
         "/api/runs",
-        &[
-            ("x-drove-coordinator-secret", &coord_secret),
-            ("x-drove-coordinator", "t1"),
-        ],
+        &[("x-drove-coordinator-secret", &coord_secret), ("x-drove-coordinator", "t1")],
         Some(&json!({ "hostSession": "t1", "objective": "Verify AI model parameter propagation", "cwd": "/tmp" })),
     );
     assert_eq!(created.status, 200);
@@ -2211,9 +1956,7 @@ fn drove_subagents_close_on_coordinator_trash_or_exit_and_web_delete() {
     assert_eq!(s.json(&["get", &w1_addr])["state"], "live");
 
     s.json(&["label", &coord1, "herdr.trashed=123456"]);
-    wait_until("worker finished when coordinator trashed", || {
-        s.json(&["get", &w1_addr])["state"] == "finished"
-    });
+    wait_until("worker finished when coordinator trashed", || s.json(&["get", &w1_addr])["state"] == "finished");
     wait_until("drove worker closed when coordinator trashed", || {
         s.json(&["drove", "show", &run1])["workers"][0]["state"] == "closed"
     });
@@ -2245,18 +1988,10 @@ fn drove_subagents_close_on_coordinator_trash_or_exit_and_web_delete() {
     assert_eq!(s.json(&["get", &w2_addr])["state"], "live");
 
     let web_tok = read_web_token(port);
-    let trash_resp = http_req(
-        port,
-        "POST",
-        &format!("/api/runs/{run2}/trash"),
-        &[("x-drove-token", &web_tok)],
-        None,
-    );
+    let trash_resp = http_req(port, "POST", &format!("/api/runs/{run2}/trash"), &[("x-drove-token", &web_tok)], None);
     assert_eq!(trash_resp.status, 200, "web trash failed: {}", trash_resp.body);
     assert_eq!(s.json(&["drove", "show", &run2])["workers"][0]["state"], "closed");
-    wait_until("worker finished when run trashed in web", || {
-        s.json(&["get", &w2_addr])["state"] == "finished"
-    });
+    wait_until("worker finished when run trashed in web", || s.json(&["get", &w2_addr])["state"] == "finished");
 
     let del_resp = http_req(
         port,
@@ -2270,11 +2005,7 @@ fn drove_subagents_close_on_coordinator_trash_or_exit_and_web_delete() {
     assert_eq!(missing_resp.status, 404);
     let ls_live = s.json(&["ls"]);
     assert!(
-        !ls_live["agents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|a| a["address"] == w2_addr),
+        !ls_live["agents"].as_array().unwrap().iter().any(|a| a["address"] == w2_addr),
         "deleted run left live agent {w2_addr}: {ls_live}"
     );
 }
@@ -2365,13 +2096,7 @@ fn drove_roles_ai_configure_and_strengths_persist_end_to_end() {
     )
     .unwrap();
 
-    let res = s.json(&[
-        "drove",
-        "roles-ai-config",
-        "--file",
-        req_file.to_str().unwrap(),
-        "--consume",
-    ]);
+    let res = s.json(&["drove", "roles-ai-config", "--file", req_file.to_str().unwrap(), "--consume"]);
     stop.store(true, Ordering::Relaxed);
     let _ = srv.join();
 
@@ -2394,10 +2119,7 @@ fn drove_roles_ai_configure_and_strengths_persist_end_to_end() {
     let agents_resp = http_req(port, "GET", "/api/agents", &[], None);
     assert_eq!(agents_resp.status, 200);
     let agents_json: Value = serde_json::from_str(&agents_resp.body).unwrap();
-    assert_eq!(
-        agents_json["profile"]["roles"]["coder"]["candidates"][0]["strengths"],
-        json!(["后端架构", "复杂重构"])
-    );
+    assert_eq!(agents_json["profile"]["roles"]["coder"]["candidates"][0]["strengths"], json!(["后端架构", "复杂重构"]));
 }
 
 #[test]
@@ -2429,10 +2151,7 @@ fn core_ai_cli_and_worktree_preflight_guard() {
     assert!(!ai_patch.exists(), "--consume should delete temp json file");
 
     // 2. POST /api/preflight/worktree catches non-git, unborn HEAD, and dirty warnings.
-    let auth_hdrs = [
-        ("x-drove-coordinator-secret", coord_tok.as_str()),
-        ("x-drove-coordinator", "t1"),
-    ];
+    let auth_hdrs = [("x-drove-coordinator-secret", coord_tok.as_str()), ("x-drove-coordinator", "t1")];
     let plain_dir = s.root.join("plain_dir");
     std::fs::create_dir_all(&plain_dir).unwrap();
     let r1 = http_req(
@@ -2449,7 +2168,9 @@ fn core_ai_cli_and_worktree_preflight_guard() {
 
     let empty_git = s.root.join("empty_git");
     std::fs::create_dir_all(&empty_git).unwrap();
-    assert!(std::process::Command::new("git").args(["init"]).current_dir(&empty_git).output().unwrap().status.success());
+    assert!(
+        std::process::Command::new("git").args(["init"]).current_dir(&empty_git).output().unwrap().status.success()
+    );
     let r2 = http_req(
         port,
         "POST",
@@ -2472,7 +2193,9 @@ fn core_ai_cli_and_worktree_preflight_guard() {
         &["add", "."][..],
         &["commit", "-m", "init"][..],
     ] {
-        assert!(std::process::Command::new("git").arg("-C").arg(&dirty_git).args(args).output().unwrap().status.success());
+        assert!(
+            std::process::Command::new("git").arg("-C").arg(&dirty_git).args(args).output().unwrap().status.success()
+        );
     }
     std::fs::write(dirty_git.join("a.txt"), "v2-uncommitted\n").unwrap();
     let r3 = http_req(
@@ -2567,7 +2290,8 @@ fn drove_internal_ai_respects_user_configured_language() {
                     } else if first_line.starts_with("POST /v1/chat/completions") {
                         let req_body = req.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
                         cap_srv.lock().unwrap().push(req_body.to_string());
-                        let content = if req_body.contains(r#"\"lang\":\"zh\""#) || req_body.contains(r#""lang":"zh""#) {
+                        let content = if req_body.contains(r#"\"lang\":\"zh\""#) || req_body.contains(r#""lang":"zh""#)
+                        {
                             "中文自动标题"
                         } else {
                             "English Auto Title"
@@ -2619,10 +2343,7 @@ fn drove_internal_ai_respects_user_configured_language() {
     // 1. Creating a Run with zh-CN configured sends `"lang":"zh"` for auto_title.
     let work_dir = s.root.join("lang_work");
     std::fs::create_dir_all(&work_dir).unwrap();
-    let auth_hdrs = [
-        ("x-drove-coordinator-secret", coord_sec.as_str()),
-        ("x-drove-coordinator", "t1"),
-    ];
+    let auth_hdrs = [("x-drove-coordinator-secret", coord_sec.as_str()), ("x-drove-coordinator", "t1")];
     let r1 = http_req(
         port,
         "POST",
@@ -2633,17 +2354,11 @@ fn drove_internal_ai_respects_user_configured_language() {
     assert_eq!(r1.status, 200, "create run 1: {}", r1.body);
     let run1 = serde_json::from_str::<Value>(&r1.body).unwrap()["id"].as_str().unwrap().to_string();
 
-    wait_until("run 1 gets Chinese auto title", || {
-        s.json(&["drove", "show", &run1])["run"]["name"] == "中文自动标题"
-    });
+    wait_until("run 1 gets Chinese auto title", || s.json(&["drove", "show", &run1])["run"]["name"] == "中文自动标题");
     {
         let reqs = captured.lock().unwrap();
         assert!(!reqs.is_empty(), "expected at least one AI completion call");
-        assert!(
-            reqs[0].contains(r#"\"lang\":\"zh\""#),
-            "expected lang=zh in auto_title payload, got: {}",
-            reqs[0]
-        );
+        assert!(reqs[0].contains(r#"\"lang\":\"zh\""#), "expected lang=zh in auto_title payload, got: {}", reqs[0]);
     }
 
     // 2. Switching language via Drove Web `PUT /api/ai/language` to "en" updates subsequent Drove AI calls.
@@ -2680,6 +2395,366 @@ fn drove_internal_ai_respects_user_configured_language() {
             reqs.last().unwrap()
         );
     }
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = srv.join();
+}
+
+#[test]
+fn drove_routing_note_guides_ai_subagent_selection_end_to_end() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mock_port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_srv = stop.clone();
+    let captured = Arc::new(Mutex::new(Vec::<String>::new()));
+    let cap_srv = captured.clone();
+
+    let srv = std::thread::spawn(move || {
+        while !stop_srv.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut conn, _)) => {
+                    let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut raw = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match conn.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                raw.extend_from_slice(&buf[..n]);
+                                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    let head = String::from_utf8_lossy(&raw[..pos]);
+                                    let cl = head
+                                        .lines()
+                                        .find_map(|l| {
+                                            let (k, v) = l.split_once(':')?;
+                                            k.eq_ignore_ascii_case("content-length")
+                                                .then(|| v.trim().parse::<usize>().ok())
+                                                .flatten()
+                                        })
+                                        .unwrap_or(0);
+                                    if raw.len() >= pos + 4 + cl {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&raw).into_owned();
+                    let first_line = req.lines().next().unwrap_or("");
+                    let body = if first_line.starts_with("GET /v1/models") {
+                        json!({"data":[{"id":"mock-router-model"}]}).to_string()
+                    } else if first_line.starts_with("POST /v1/chat/completions") {
+                        let req_body = req.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+                        cap_srv.lock().unwrap().push(req_body.to_string());
+                        let content = if req_body.contains(r#"\"op\":\"route_candidate\""#)
+                            || req_body.contains(r#""op":"route_candidate""#)
+                        {
+                            r#"{"index":1,"reason":"avoid GLM 14-18h"}"#
+                        } else if req_body.contains(r#"\"op\":\"session_seed\""#)
+                            || req_body.contains(r#""op":"session_seed""#)
+                        {
+                            r#"{"ack":true}"#
+                        } else {
+                            "Routing Note Test"
+                        };
+                        json!({
+                            "id": "chatcmpl-note",
+                            "choices": [{"message": {"role": "assistant", "content": content}}]
+                        })
+                        .to_string()
+                    } else {
+                        r#"{"error":"not_found"}"#.to_string()
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = conn.write_all(resp.as_bytes());
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let s = drove_session();
+    let (port, key_file) = wait_web_port(&s);
+    let _coord_sec = read_coordinator_secret(&key_file);
+    let web_tok = read_web_token(port);
+
+    let fake_cmd = fake_acp_spec();
+    let global_note = "GLM 相关模型在下午 2:00–6:00 额度按两倍计算，应避免使用，除非没有其他 agent 可用。";
+
+    let cfg_file = s.root.join("drove-note-cfg.json");
+    std::fs::write(
+        &cfg_file,
+        serde_json::to_vec(&json!({
+            "note": global_note,
+            "roles": {
+                "coder": {
+                    "label": "Coder",
+                    "access": "writable",
+                    "primary": {
+                        "agent": fake_cmd,
+                        "model": "zcode/GLM-5.3[1m]",
+                        "effort": "high",
+                        "strengths": ["后端"],
+                        "note": "高峰期双倍额度"
+                    },
+                    "fallbacks": [
+                        {
+                            "agent": fake_cmd,
+                            "model": "gpt-5.4",
+                            "effort": "high",
+                            "strengths": ["通用"]
+                        }
+                    ]
+                }
+            },
+            "ai": {
+                "enabled": true,
+                "baseUrl": format!("http://127.0.0.1:{mock_port}/v1"),
+                "model": "mock-router-model",
+                "autoTitle": false,
+                "taskEnrich": false,
+                "handoverCompact": false
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let set_res = s.json(&["drove", "settings-set", "--file", cfg_file.to_str().unwrap(), "--consume"]);
+    assert_eq!(set_res["config"]["note"], global_note);
+    assert_eq!(set_res["config"]["roles"]["coder"]["primary"]["note"], "高峰期双倍额度");
+
+    // Verify GET /api/agents exposes global and candidate notes to Drove Web / coordinators.
+    let agents_resp = http_req(port, "GET", "/api/agents", &[("x-drove-token", web_tok.as_str())], None);
+    assert_eq!(agents_resp.status, 200, "GET /api/agents: {}", agents_resp.body);
+    let agents_json: Value = serde_json::from_str(&agents_resp.body).unwrap();
+    assert_eq!(agents_json["profile"]["note"], global_note);
+    assert_eq!(agents_json["profile"]["roles"]["coder"]["candidates"][0]["note"], "高峰期双倍额度");
+
+    // Submit a task whose tag ("后端") uniquely matches GLM candidate #0; because routing note is set,
+    // Drove MUST consult AI route_candidate (with local time + global note + candidate note) and launch #1 (gpt-5.4).
+    let work_dir = s.root.join("note_route_work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let plan_file = s.root.join("note-plan.yaml");
+    std::fs::write(
+        &plan_file,
+        "objective: Test routing note\ntasks:\n  - key: api\n    title: Implement backend API\n    role: coder\n    tags: [后端]\n    spec:\n      target: api.rs\n      change: \"SH:herdr2 drove worker done --outcome done --summary \\\"api ok\\\"\"\n      acceptance: done\n",
+    )
+    .unwrap();
+    let planned = s.json(&["drove", "plan", "--file", plan_file.to_str().unwrap(), "--cwd", work_dir.to_str().unwrap()]);
+    let run_id = planned["run"]["id"].as_str().unwrap().to_string();
+    let waited = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "20"]);
+    assert_eq!(waited["settled"], json!(true), "wait result: {waited}");
+
+    let shown = s.json(&["drove", "show", &run_id]);
+    let task = &shown["tasks"][0];
+    assert_eq!(task["status"], "succeeded", "task: {task}");
+    assert_eq!(task["assign"]["model"], "gpt-5.4", "expected AI note-guided fallback gpt-5.4, got: {task}");
+    assert!(
+        task["assign"]["reason"].as_str().unwrap_or("").contains("ai_match=avoid GLM 14-18h"),
+        "expected ai_match reason, got: {task}"
+    );
+
+    let reqs = captured.lock().unwrap();
+    let route_req = reqs
+        .iter()
+        .find(|r| r.contains("route_candidate"))
+        .unwrap_or_else(|| panic!("expected a route_candidate AI call, captured: {reqs:?}"));
+    assert!(route_req.contains("current_local_time"), "missing current_local_time: {route_req}");
+    assert!(route_req.contains("routing_note"), "missing routing_note: {route_req}");
+    assert!(route_req.contains("GLM"), "missing GLM note content: {route_req}");
+    assert!(route_req.contains("高峰期双倍额度"), "missing candidate note: {route_req}");
+
+    stop.store(true, Ordering::Relaxed);
+    let _ = srv.join();
+}
+
+#[test]
+fn drove_ai_note_buttons_and_one_click_configure_generate_notes_end_to_end() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mock_port = listener.local_addr().unwrap().port();
+    listener.set_nonblocking(true).unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_srv = stop.clone();
+
+    let srv = std::thread::spawn(move || {
+        while !stop_srv.load(Ordering::Relaxed) {
+            match listener.accept() {
+                Ok((mut conn, _)) => {
+                    let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut raw = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match conn.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => {
+                                raw.extend_from_slice(&buf[..n]);
+                                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                                    let head = String::from_utf8_lossy(&raw[..pos]);
+                                    let cl = head
+                                        .lines()
+                                        .find_map(|l| {
+                                            let (k, v) = l.split_once(':')?;
+                                            k.eq_ignore_ascii_case("content-length")
+                                                .then(|| v.trim().parse::<usize>().ok())
+                                                .flatten()
+                                        })
+                                        .unwrap_or(0);
+                                    if raw.len() >= pos + 4 + cl {
+                                        break;
+                                    }
+                                }
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&raw).into_owned();
+                    let first_line = req.lines().next().unwrap_or("");
+                    let body = if first_line.starts_with("GET /v1/models") {
+                        json!({"data":[{"id":"mock-notes-model"}]}).to_string()
+                    } else if first_line.starts_with("POST /v1/chat/completions") {
+                        let req_body = req.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
+                        let content = if req_body.contains(r#"\"noteScope\":\"global\""#)
+                            || req_body.contains(r#""noteScope":"global""#)
+                        {
+                            r#"{"rationale":"已生成全局备注","note":"全局规则：高峰期避开双倍计费模型，审查优先使用异构厂商。"}"#
+                        } else if req_body.contains(r#"\"noteScope\":\"candidate\""#)
+                            || req_body.contains(r#""noteScope":"candidate""#)
+                        {
+                            r#"{"rationale":"已生成候选备注","note":"单候选规则：仅在主力不可用或轻量改动时优先选用。"}"#
+                        } else if req_body.contains(r#"\"mode\":\"all\""#) || req_body.contains(r#""mode":"all""#) {
+                            r#"{"rationale":"已完成模型、擅长任务与备注一键配置","note":"一键全局备注：GLM 相关模型在下午 2:00–6:00 额度按两倍计算，应避免使用，除非没有其他 agent 可用。","roles":{"coder":{"candidates":[{"agent":"claude","model":null,"effort":"high","fast":false,"context":null,"strengths":["复杂架构"],"note":"主力复杂实现"},{"agent":"codex","model":null,"effort":"high","fast":true,"context":null,"strengths":["快速修复"],"note":"高速修复备选"}]}}}"#
+                        } else {
+                            r#"{"rationale":"已更新全部备注","note":"批量备注：按任务复杂度与额度余量灵活切换。","roles":{"coder":{"candidates":[{"index":0,"note":"批量主力备注"}]}}}"#
+                        };
+                        json!({
+                            "id": "chatcmpl-ai-notes",
+                            "choices": [{"message": {"role": "assistant", "content": content}}]
+                        })
+                        .to_string()
+                    } else {
+                        r#"{"error":"not_found"}"#.to_string()
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = conn.write_all(resp.as_bytes());
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let s = drove_session();
+    let _ = wait_web_port(&s);
+
+    // Point Core AI at mock server.
+    let ai_cfg = s.root.join("ai-notes-cfg.json");
+    std::fs::write(
+        &ai_cfg,
+        serde_json::to_vec(&json!({
+            "ai": {
+                "enabled": true,
+                "baseUrl": format!("http://127.0.0.1:{mock_port}/v1"),
+                "model": "mock-notes-model"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let _ = s.json(&["drove", "settings-set", "--file", ai_cfg.to_str().unwrap(), "--consume"]);
+
+    // 1. Inline Global AI Note button (`mode: notes`, `noteScope: global`, `apply: false`)
+    let g_req = s.root.join("req-global-note.json");
+    std::fs::write(
+        &g_req,
+        serde_json::to_vec(&json!({
+            "mode": "notes",
+            "noteScope": "global",
+            "apply": false,
+            "language": "zh-CN"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let g_res = s.json(&["drove", "roles-ai-config", "--file", g_req.to_str().unwrap(), "--consume"]);
+    assert_eq!(g_res["ok"], json!(true), "global AI note failed: {g_res}");
+    assert_eq!(g_res["applied"], json!(false));
+    assert_eq!(g_res["note"], "全局规则：高峰期避开双倍计费模型，审查优先使用异构厂商。");
+
+    // 2. Inline Single-Candidate AI Note button (`mode: notes`, `noteScope: candidate`, `apply: false`)
+    let c_req = s.root.join("req-cand-note.json");
+    std::fs::write(
+        &c_req,
+        serde_json::to_vec(&json!({
+            "mode": "notes",
+            "noteScope": "candidate",
+            "targetRole": "coder",
+            "targetCandidateIndex": 0,
+            "apply": false,
+            "language": "zh-CN"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let c_res = s.json(&["drove", "roles-ai-config", "--file", c_req.to_str().unwrap(), "--consume"]);
+    assert_eq!(c_res["ok"], json!(true), "candidate AI note failed: {c_res}");
+    assert_eq!(c_res["applied"], json!(false));
+    assert_eq!(c_res["note"], "单候选规则：仅在主力不可用或轻量改动时优先选用。");
+
+    // 3. AI One-Click (`mode: all`, `apply: true`) generates & persists BOTH global note and candidate notes.
+    let all_req = s.root.join("req-all-note.json");
+    std::fs::write(
+        &all_req,
+        serde_json::to_vec(&json!({
+            "mode": "all",
+            "apply": true,
+            "language": "zh-CN"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let all_res = s.json(&["drove", "roles-ai-config", "--file", all_req.to_str().unwrap(), "--consume"]);
+    assert_eq!(all_res["ok"], json!(true), "all AI configure failed: {all_res}");
+    assert_eq!(all_res["applied"], json!(true));
+    assert_eq!(
+        all_res["note"],
+        "一键全局备注：GLM 相关模型在下午 2:00–6:00 额度按两倍计算，应避免使用，除非没有其他 agent 可用。"
+    );
+    let persisted = s.json(&["drove", "settings"]);
+    assert_eq!(
+        persisted["config"]["note"],
+        "一键全局备注：GLM 相关模型在下午 2:00–6:00 额度按两倍计算，应避免使用，除非没有其他 agent 可用。"
+    );
+    let coder_primary_note = persisted["config"]["roles"]["coder"]["primary"]["note"].as_str().unwrap_or("");
+    assert!(!coder_primary_note.is_empty(), "expected coder primary note after one-click configure: {persisted}");
 
     stop.store(true, Ordering::Relaxed);
     let _ = srv.join();

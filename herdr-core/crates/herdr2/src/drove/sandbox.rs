@@ -179,11 +179,7 @@ pub fn run_windows_sandbox_entry(args: &[OsString]) -> i32 {
 
 #[cfg_attr(not(any(target_os = "macos", test)), allow(dead_code))]
 fn macos_sandbox_exec_bin() -> &'static str {
-    if Path::new(MACOS_SANDBOX_EXEC_PATH).is_file() {
-        MACOS_SANDBOX_EXEC_PATH
-    } else {
-        "sandbox-exec"
-    }
+    if Path::new(MACOS_SANDBOX_EXEC_PATH).is_file() { MACOS_SANDBOX_EXEC_PATH } else { "sandbox-exec" }
 }
 
 /// Canonicalizes `p` if it exists; otherwise canonicalizes its nearest existing ancestor and
@@ -219,27 +215,16 @@ fn is_root_path(p: &Path) -> bool {
 }
 
 #[cfg_attr(not(any(target_os = "linux", test)), allow(dead_code))]
-fn build_bwrap_argv(
-    argv: &[String],
-    paths: &DrovePaths,
-    cwd: &str,
-    access: RoleAccessMode,
-) -> Option<Vec<String>> {
+fn build_bwrap_argv(argv: &[String], paths: &DrovePaths, cwd: &str, access: RoleAccessMode) -> Option<Vec<String>> {
     if argv.is_empty() {
         return None;
     }
 
     let state_dir = canonicalize_best_effort(&paths.state_dir);
     let secrets_dir = canonicalize_best_effort(&paths.secrets_dir);
-    let core_secrets_dir = paths
-        .state_dir
-        .parent()
-        .map(|p| canonicalize_best_effort(&p.join("secrets")));
+    let core_secrets_dir = paths.state_dir.parent().map(|p| canonicalize_best_effort(&p.join("secrets")));
     let cfg_file = canonicalize_best_effort(&paths.config_file);
-    let ai_cfg_file = paths
-        .config_file
-        .parent()
-        .map(|p| canonicalize_best_effort(&p.join("ai.json")));
+    let ai_cfg_file = paths.config_file.parent().map(|p| canonicalize_best_effort(&p.join("ai.json")));
     let cwd_path = canonicalize_best_effort(Path::new(cwd));
 
     // Avoid binding root `/` as tmpfs or read-only if something went wrong with paths.
@@ -327,15 +312,9 @@ fn sbpl_escape(path: &Path) -> Option<String> {
 fn build_macos_sbpl_profile(paths: &DrovePaths, cwd: &str, access: RoleAccessMode) -> Option<String> {
     let state_dir = canonicalize_best_effort(&paths.state_dir);
     let secrets_dir = canonicalize_best_effort(&paths.secrets_dir);
-    let core_secrets_dir = paths
-        .state_dir
-        .parent()
-        .map(|p| canonicalize_best_effort(&p.join("secrets")));
+    let core_secrets_dir = paths.state_dir.parent().map(|p| canonicalize_best_effort(&p.join("secrets")));
     let cfg_file = canonicalize_best_effort(&paths.config_file);
-    let ai_cfg_file = paths
-        .config_file
-        .parent()
-        .map(|p| canonicalize_best_effort(&p.join("ai.json")));
+    let ai_cfg_file = paths.config_file.parent().map(|p| canonicalize_best_effort(&p.join("ai.json")));
     let cwd_path = canonicalize_best_effort(Path::new(cwd));
 
     if is_root_path(&secrets_dir) || is_root_path(&state_dir) {
@@ -463,9 +442,7 @@ mod win_sandbox {
     fn restricted_code_sid() -> io::Result<Vec<u8>> {
         let mut size = SECURITY_MAX_SID_SIZE;
         let mut buf = vec![0u8; size as usize];
-        let ok = unsafe {
-            CreateWellKnownSid(WinRestrictedCodeSid, null_mut(), buf.as_mut_ptr().cast(), &mut size)
-        };
+        let ok = unsafe { CreateWellKnownSid(WinRestrictedCodeSid, null_mut(), buf.as_mut_ptr().cast(), &mut size) };
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -482,9 +459,7 @@ mod win_sandbox {
             return Err(io::Error::last_os_error());
         }
         let mut buf = vec![0usize; (needed as usize).div_ceil(size_of::<usize>())];
-        let ok = unsafe {
-            GetTokenInformation(token, class, buf.as_mut_ptr().cast(), needed, &mut needed)
-        };
+        let ok = unsafe { GetTokenInformation(token, class, buf.as_mut_ptr().cast(), needed, &mut needed) };
         if ok == 0 {
             return Err(io::Error::last_os_error());
         }
@@ -711,12 +686,7 @@ mod win_sandbox {
         }
     }
 
-    fn ensure_deny_ace(
-        path: &Path,
-        restricted_sid: PSID,
-        deny_mask: u32,
-        inheritance: u32,
-    ) -> io::Result<()> {
+    fn ensure_deny_ace(path: &Path, restricted_sid: PSID, deny_mask: u32, inheritance: u32) -> io::Result<()> {
         let wide = crate::platform::wide(path.as_os_str());
         unsafe {
             let mut old_dacl: *mut ACL = null_mut();
@@ -888,10 +858,7 @@ mod win_sandbox {
             eprintln!("error: missing command after --");
             return 1;
         }
-        let inner_argv: Vec<String> = inner_os
-            .iter()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
+        let inner_argv: Vec<String> = inner_os.iter().map(|a| a.to_string_lossy().into_owned()).collect();
         match spawn_restricted_and_wait(&inner_argv) {
             Ok(code) => code,
             Err(err) => {
@@ -1125,13 +1092,7 @@ mod tests {
         let wrapped = build_windows_sandbox_argv(exe, &argv).unwrap();
         assert_eq!(
             wrapped,
-            vec![
-                r"C:\Users\dev\bin\herdr2.exe",
-                WINDOWS_SANDBOX_SUBCOMMAND,
-                "--",
-                "codex-acp",
-                "--stdio",
-            ]
+            vec![r"C:\Users\dev\bin\herdr2.exe", WINDOWS_SANDBOX_SUBCOMMAND, "--", "codex-acp", "--stdio",]
         );
     }
 

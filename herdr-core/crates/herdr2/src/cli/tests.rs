@@ -100,9 +100,7 @@ fn a_command_line_becomes_the_api_request() {
 
 #[test]
 fn a_wait_prints_what_happened() {
-    let one = |reason: &str| {
-        json!({"agent": "a1", "ended": reason != "timeout", "reason": reason, "status": "working", "turn": 2, "exit_code": 42, "children": []})
-    };
+    let one = |reason: &str| json!({"agent": "a1", "ended": reason != "timeout", "reason": reason, "status": "working", "turn": 2, "exit_code": 42, "children": []});
     assert!(describe_wait(&one("timeout")).starts_with("a1 still running: working"));
     assert!(describe_wait(&one("exit")).starts_with("a1 exited (exit 42"));
     let all = json!({"agent": "a0", "reason": "children", "children": [one("exit")]});

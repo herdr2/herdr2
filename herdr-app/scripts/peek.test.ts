@@ -573,7 +573,34 @@ describe("PTY structured formatting & snapshot fallback", () => {
     expect(resolveEffortVisual("medium")).toEqual({ bars: 4, active: 2 });
     expect(resolveEffortVisual("high")).toEqual({ bars: 4, active: 3 });
     expect(resolveEffortVisual("max")).toEqual({ bars: 4, active: 4 });
+    expect(resolveEffortVisual("disabled")).toEqual({ bars: 4, active: 0 });
+    expect(resolveEffortVisual("enabled")).toEqual({ bars: 4, active: 3 });
+    expect(resolveEffortVisual("ultra")).toEqual({ bars: 4, active: 4 });
     expect(resolveEffortVisual("unknown")).toBeNull();
+
+    const zcodeOpts = normalizeConfigOptions(
+      [
+        {
+          id: "thought",
+          name: "Thought Level",
+          category: "thought_level",
+          kind: "select",
+          current_value: "max",
+          options: [
+            { value: "low", name: "low" },
+            { value: "high", name: "high" },
+            { value: "max", name: "max" },
+          ],
+        },
+      ],
+      { agent: "zcode" },
+    );
+    const zcodeThought = zcodeOpts.find((o) => o.id === "thought")!;
+    expect(zcodeThought.name).toBe("Reasoning Effort");
+    expect(zcodeThought.iconKind).toBe("thinking");
+    expect(zcodeThought.pillLabel).toBe("Max");
+    expect(zcodeThought.choices.map((c) => c.name)).toEqual(["Low", "High", "Max"]);
+    expect(zcodeThought.effortVisual).toEqual({ bars: 4, active: 4 });
 
     const badges = buildPtySessionBadges({ model: "gpt-5.4", reasoning_effort: "high" }, {});
     expect((badges.find((b) => b.id === "reasoning") as any)?.effortVisual).toEqual({ bars: 4, active: 3 });

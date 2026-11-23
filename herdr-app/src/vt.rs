@@ -62,6 +62,21 @@ fn readable(fg: Rgb, bg: Rgb, minimum: f32) -> Rgb {
     if contrast(light, bg) >= contrast(dark, bg) { light } else { dark }
 }
 
+/// Ensures the cursor color stays visible against the cell background underneath
+/// (e.g. OpenTUI / ZCode in light mode paints a `#ffffff` input box while still
+/// sending `OSC 12 ; #ffffff`), and picks a legible text color for block cursors.
+fn visible_cursor_colors(raw_cursor: Rgb, cell_bg: Rgb, theme_cursor: Rgb) -> (Rgb, Rgb) {
+    let cursor = if contrast(raw_cursor, cell_bg) >= 1.8 {
+        raw_cursor
+    } else if contrast(theme_cursor, cell_bg) >= 2.5 {
+        theme_cursor
+    } else {
+        readable(raw_cursor, cell_bg, 2.5)
+    };
+    let text = readable(cell_bg, cursor, 2.5);
+    (cursor, text)
+}
+
 #[derive(Clone, PartialEq)]
 pub struct Theme {
     pub fg: Rgb,
@@ -124,6 +139,8 @@ pub struct Cursor {
     pub y: u16,
     pub shape: CursorShape,
     pub color: Rgb,
+    /// Legible glyph color drawn over a solid block cursor.
+    pub text_color: Rgb,
 }
 
 pub struct Frame {
@@ -495,6 +512,19 @@ fn install_png_decoder() {
         let f: GhosttySysDecodePngFn = Some(decode_png);
         ghostty_sys_set(GHOSTTY_SYS_OPT_DECODE_PNG, std::mem::transmute::<GhosttySysDecodePngFn, *const c_void>(f));
     });
+}
+
+/// One active viewport row with per-character dim/inverse style flags, used to
+/// inspect a CLI agent's live input box (distinguishing real user text from
+/// faint placeholder hints and preserving multi-line indentation).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PromptRow {
+    /// Right-trimmed row text (leading spaces preserved).
+    pub text: String,
+    /// Per-char flag matching `text.chars()`: true if styled faint or palette bright-black (8).
+    pub dim: Vec<bool>,
+    /// Per-char flag matching `text.chars()`: true if styled inverse (fake TUI block cursor).
+    pub inverse: Vec<bool>,
 }
 
 pub struct Vt {
@@ -1353,6 +1383,73 @@ impl Vt {
         Some(LinkHit { target, spans })
     }
 
+    /// Up to `limit` bottommost rows of the active viewport (preserving empty
+    /// rows and leading indentation) along with the cursor's index within the
+    /// returned slice if it lies inside that range.
+    pub fn active_prompt_rows(&self, limit: usize) -> (Vec<PromptRow>, Option<usize>) {
+        if limit == 0 || self.rows == 0 || self.cols == 0 {
+            return (Vec::new(), None);
+        }
+        let total = usize::from(self.rows);
+        let start = total.saturating_sub(limit);
+        let mut cursor_y = 0u16;
+        unsafe {
+            ghostty_terminal_get(self.term, GHOSTTY_TERMINAL_DATA_CURSOR_Y, &mut cursor_y as *mut _ as *mut c_void);
+        }
+        let cursor_idx = usize::from(cursor_y).checked_sub(start).filter(|&i| i < total - start);
+        let mut out = Vec::with_capacity(total - start);
+        for y in start..total {
+            let Some(mut r) = self.grid_ref(GHOSTTY_POINT_TAG_ACTIVE, 0, y as u32) else {
+                out.push(PromptRow { text: String::new(), dim: Vec::new(), inverse: Vec::new() });
+                continue;
+            };
+            let mut text = String::new();
+            let mut dim = Vec::new();
+            let mut inverse = Vec::new();
+            for x in 0..self.cols {
+                r.x = x;
+                let wide = unsafe {
+                    let mut cell: GhosttyCell = Default::default();
+                    ghostty_grid_ref_cell(&r, &mut cell);
+                    let mut wide: GhosttyCellWide = GHOSTTY_CELL_WIDE_NARROW;
+                    ghostty_cell_get(cell, GHOSTTY_CELL_DATA_WIDE, &mut wide as *mut _ as *mut c_void);
+                    wide
+                };
+                if wide == GHOSTTY_CELL_WIDE_SPACER_TAIL || wide == GHOSTTY_CELL_WIDE_SPACER_HEAD {
+                    continue;
+                }
+                let mut style = GhosttyStyle { size: std::mem::size_of::<GhosttyStyle>(), ..Default::default() };
+                let has_style = unsafe { ghostty_grid_ref_style(&r, &mut style) == GHOSTTY_SUCCESS };
+                let is_dim = has_style
+                    && (style.faint
+                        || (style.fg_color.tag == GHOSTTY_STYLE_COLOR_PALETTE
+                            && unsafe { style.fg_color.value.palette } == 8));
+                let is_inv = has_style && style.inverse;
+                let before_chars = dim.len();
+                let mut cps = [0u32; 16];
+                let mut len = 0usize;
+                unsafe { ghostty_grid_ref_graphemes(&r, cps.as_mut_ptr(), cps.len(), &mut len) };
+                for ch in cps[..len.min(cps.len())].iter().filter_map(|c| char::from_u32(*c)) {
+                    text.push(ch);
+                    dim.push(is_dim);
+                    inverse.push(is_inv);
+                }
+                if dim.len() == before_chars {
+                    text.push(' ');
+                    dim.push(is_dim);
+                    inverse.push(is_inv);
+                }
+            }
+            let trimmed = text.trim_end();
+            let keep_chars = trimmed.chars().count();
+            text.truncate(trimmed.len());
+            dim.truncate(keep_chars);
+            inverse.truncate(keep_chars);
+            out.push(PromptRow { text, dim, inverse });
+        }
+        (out, cursor_idx)
+    }
+
     /// Up to `limit` bottommost non-empty rows of the active viewport.
     pub fn tail_lines(&self, limit: usize) -> Vec<String> {
         if limit == 0 || self.rows == 0 || self.cols == 0 {
@@ -1393,6 +1490,64 @@ impl Vt {
         }
         lines.reverse();
         lines
+    }
+
+    /// Fingerprint of the active viewport's plain text and total scrollback height `(total_rows, text_hash)`.
+    /// Ignores pure color/style/cursor updates (such as TUI welcome-logo shimmer animations) while
+    /// detecting any visible character change or new scrolled lines.
+    pub fn active_text_fingerprint(&self) -> (u64, u64) {
+        let total = self.scrollbar().total;
+        if self.rows == 0 || self.cols == 0 {
+            return (total, 0);
+        }
+        let Some(start) = self.grid_ref(GHOSTTY_POINT_TAG_ACTIVE, 0, 0) else {
+            return (total, 0);
+        };
+        let Some(end) = self.grid_ref(GHOSTTY_POINT_TAG_ACTIVE, self.cols - 1, u32::from(self.rows - 1)) else {
+            return (total, 0);
+        };
+        let selection = GhosttySelection {
+            size: std::mem::size_of::<GhosttySelection>(),
+            start,
+            end,
+            rectangle: false,
+        };
+        let opts = GhosttyFormatterTerminalOptions {
+            size: std::mem::size_of::<GhosttyFormatterTerminalOptions>(),
+            emit: GHOSTTY_FORMATTER_FORMAT_PLAIN,
+            unwrap: false,
+            trim: true,
+            extra: GhosttyFormatterTerminalExtra {
+                size: std::mem::size_of::<GhosttyFormatterTerminalExtra>(),
+                screen: GhosttyFormatterScreenExtra {
+                    size: std::mem::size_of::<GhosttyFormatterScreenExtra>(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            selection: &selection,
+        };
+        let mut formatter: GhosttyFormatter = std::ptr::null_mut();
+        let mut hash: u64 = 0xcbf29ce484222325;
+        unsafe {
+            if ghostty_formatter_terminal_new(std::ptr::null(), &mut formatter, self.term, opts) == GHOSTTY_SUCCESS
+                && !formatter.is_null()
+            {
+                let mut ptr: *mut u8 = std::ptr::null_mut();
+                let mut len = 0usize;
+                if ghostty_formatter_format_alloc(formatter, std::ptr::null(), &mut ptr, &mut len) == GHOSTTY_SUCCESS
+                    && !ptr.is_null()
+                {
+                    for &b in std::slice::from_raw_parts(ptr, len) {
+                        hash ^= u64::from(b);
+                        hash = hash.wrapping_mul(0x100000001b3);
+                    }
+                    ghostty_free(std::ptr::null(), ptr, len);
+                }
+                ghostty_formatter_free(formatter);
+            }
+        }
+        (total, hash)
     }
 
     pub fn clear_selection(&mut self) {
@@ -1782,16 +1937,28 @@ impl Vt {
 
             let mut cur = GhosttyRenderStateCursor { size: std::mem::size_of::<GhosttyRenderStateCursor>(), ..Default::default() };
             ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_CURSOR, &mut cur as *mut _ as *mut c_void);
-            let cursor = (cur.visible && cur.viewport_has_value).then(|| Cursor {
-                x: if cur.wide_tail { cur.viewport_x.saturating_sub(1) } else { cur.viewport_x },
-                y: cur.viewport_y,
-                shape: match cur.visual_style {
-                    GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR => CursorShape::Bar,
-                    GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE => CursorShape::Underline,
-                    GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW => CursorShape::Hollow,
-                    _ => CursorShape::Block,
-                },
-                color: if colors.cursor_has_value { colors.cursor.into() } else { fg_default },
+            let cursor = (cur.visible && cur.viewport_has_value).then(|| {
+                let x = if cur.wide_tail { cur.viewport_x.saturating_sub(1) } else { cur.viewport_x };
+                let y = cur.viewport_y;
+                let cell_bg = rows
+                    .get(y as usize)
+                    .and_then(|r| r.get(x as usize))
+                    .and_then(|c| c.bg)
+                    .unwrap_or(bg_default);
+                let raw_color = if colors.cursor_has_value { colors.cursor.into() } else { fg_default };
+                let (color, text_color) = visible_cursor_colors(raw_color, cell_bg, self.theme.cursor);
+                Cursor {
+                    x,
+                    y,
+                    shape: match cur.visual_style {
+                        GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR => CursorShape::Bar,
+                        GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE => CursorShape::Underline,
+                        GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW => CursorShape::Hollow,
+                        _ => CursorShape::Block,
+                    },
+                    color,
+                    text_color,
+                }
             });
 
             self.drawn = self.drawable();
@@ -2286,6 +2453,32 @@ mod tests {
         assert_eq!(readable(Rgb(0xfa, 0xfa, 0xfa), white, 1.6), Rgb(0x1b, 0x1b, 0x1e));
         // Dim text keeps its color.
         assert_eq!(readable(Rgb(0x7b, 0x7e, 0x87), white, 1.6), Rgb(0x7b, 0x7e, 0x87));
+    }
+
+    #[test]
+    fn cursor_stays_visible_when_osc12_matches_cell_background() {
+        let mut vt = Vt::new(30, 4);
+        let mut light = theme();
+        light.bg = Rgb(0xfc, 0xfc, 0xfd);
+        light.fg = Rgb(0x18, 0x18, 0x1b);
+        light.cursor = Rgb(0x18, 0x18, 0x1b);
+        vt.set_theme(light);
+
+        // OpenTUI / ZCode in light mode paints a pure-white input box while still sending OSC 12 #ffffff.
+        vt.write(b"\x1b]12;#ffffff\x07\x1b[1 q\x1b[2;4H\x1b[38;2;100;116;139m\x1b[48;2;255;255;255mType\x1b[0m\x1b[2;4H\x1b[?25h");
+        let f = vt.frame();
+        let cur = f.cursor.expect("cursor should be visible");
+        assert_eq!((cur.x, cur.y), (3, 1));
+        assert_eq!(cur.color, Rgb(0x18, 0x18, 0x1b), "white OSC 12 cursor on white cell must fall back to high-contrast theme cursor");
+        assert!(contrast(cur.color, Rgb(255, 255, 255)) >= 2.5);
+        assert!(contrast(cur.text_color, cur.color) >= 2.5, "glyph under block cursor must stay legible");
+
+        // On a dark cell background (#161b22), the program's #ffffff OSC 12 cursor is kept untouched.
+        vt.write(b"\x1b[3;4H\x1b[38;2;229;231;235m\x1b[48;2;22;27;34mType\x1b[0m\x1b[3;4H");
+        let f_dark = vt.frame();
+        let cur_dark = f_dark.cursor.expect("cursor should be visible on dark cell");
+        assert_eq!(cur_dark.color, Rgb(255, 255, 255));
+        assert_eq!(cur_dark.text_color, Rgb(22, 27, 34));
     }
 
     #[test]
@@ -2985,5 +3178,35 @@ mod tests {
         vt.scroll_to_bottom();
         let bottom = visible(&mut vt);
         assert!(bottom.iter().any(|row| row.starts_with("0050")), "{bottom:?}");
+    }
+
+    #[test]
+    fn active_text_fingerprint_ignores_color_shimmer_and_detects_text_or_scroll() {
+        let mut vt = Vt::new(60, 10);
+        // Enter alternate screen and draw a colored logo (like ZCode's welcome screen).
+        vt.write(b"\x1b[?1049h\x1b[2;5H\x1b[38;2;125;211;252m\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88 ZCODE\x1b[0m");
+        let fp1 = vt.active_text_fingerprint();
+        // Repaint the exact same characters at the exact same position with a new RGB shimmer color.
+        vt.write(b"\x1b[?2026h\x1b[?25l\x1b[2;5H\x1b[38;2;219;229;237m\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88 ZCODE\x1b[0m\x1b[?2026l");
+        let fp2 = vt.active_text_fingerprint();
+        assert_eq!(fp1, fp2, "color-only shimmer must not change active text fingerprint");
+
+        // Changing a single character (e.g. rotating braille spinner) MUST change the fingerprint.
+        vt.write(b"\x1b[8;2H\xe2\xa0\x8b esc to interrupt");
+        let fp3 = vt.active_text_fingerprint();
+        assert_ne!(fp2, fp3, "real text change must change active text fingerprint");
+        vt.write(b"\x1b[8;2H\xe2\xa0\x99");
+        let fp4 = vt.active_text_fingerprint();
+        assert_ne!(fp3, fp4, "spinner glyph tick must change active text fingerprint");
+
+        // Primary screen scrolling repeated identical lines still changes total_rows.
+        let mut primary = Vt::new(20, 4);
+        for _ in 0..6 {
+            primary.write(b"same\r\n");
+        }
+        let s1 = primary.active_text_fingerprint();
+        primary.write(b"same\r\n");
+        let s2 = primary.active_text_fingerprint();
+        assert_ne!(s1, s2, "scrollback growth must change fingerprint even for identical lines");
     }
 }

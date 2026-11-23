@@ -3,12 +3,12 @@
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, TextareaState, Textarea } from "gpui-base";
-import { terminals, spaces, knownAgents, run, h2, props, closeOverlay, theme, settings, shared, setShared, checking } from "herdr";
+import { terminals, agents, panes, spaces, knownAgents, run, h2, props, closeOverlay, theme, settings, shared, setShared, checking } from "herdr";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
 
-const ACP_PRESETS = ["claude", "codex", "gemini", "agy", "cursor", "opencode", "qwen", "kimi", "copilot", "hermes", "glm", "pi"];
+const ACP_PRESETS = ["claude", "codex", "gemini", "agy", "cursor", "opencode", "qwen", "kimi", "copilot", "hermes", "glm", "zcode", "pi"];
 const ACP_ALIAS = { antigravity: "agy" };
 
 const CREATE_MODES = () => [
@@ -21,6 +21,13 @@ const TURN_CHOICES = () => [
   { value: 4, label: tr("4 turns", "最近 4 轮") },
   { value: 8, label: tr("8 turns", "最近 8 轮") },
   { value: 15, label: tr("15 turns", "最近 15 轮") },
+  { value: 0, label: tr("All", "全部") },
+];
+
+const SEND_CONTEXT_TURN_CHOICES = () => [
+  { value: 1, label: tr("1 turn", "最近 1 轮") },
+  { value: 2, label: tr("2 turns", "最近 2 轮") },
+  { value: 4, label: tr("4 turns", "最近 4 轮") },
   { value: 0, label: tr("All", "全部") },
 ];
 
@@ -70,7 +77,7 @@ function withAlpha(hex, alphaHex) {
 function providerPresetOf(rec) {
   if (!rec) return null;
   const raw = String(rec.agent || rec.program?.key || rec.report?.app || rec.template || "").toLowerCase();
-  for (const key of ["claude", "codex", "gemini", "agy", "antigravity", "cursor", "opencode", "qwen", "kimi", "copilot", "hermes", "glm", "pi"]) {
+  for (const key of ["claude", "codex", "gemini", "agy", "antigravity", "cursor", "opencode", "qwen", "kimi", "copilot", "hermes", "glm", "zcode", "pi"]) {
     if (raw.includes(key)) return ACP_ALIAS[key] ?? key;
   }
   return null;
@@ -162,6 +169,7 @@ export default class Handoff extends View {
     this.mode = "handoff";
     this.worktree = false;
     this.mergeWorktree = true;
+    this.focusTargetAfterSend = true;
     this.archiveSource = false;
     this.showAllProviders = false;
     this.toTurn = null;
@@ -243,6 +251,95 @@ export default class Handoff extends View {
     );
   }
 
+  liveTargetAgents(sourceAddr) {
+    const termList = terminals();
+    const agentList = typeof agents === "function" ? agents() : [];
+    const paneList = typeof panes === "function" ? panes() : [];
+    const spaceList = typeof spaces === "function" ? spaces() : [];
+
+    const agentByAddr = new Map();
+    for (const a of Array.isArray(agentList) ? agentList : []) {
+      if (a?.address) agentByAddr.set(a.address, a);
+    }
+    const paneByAddr = new Map();
+    for (const p of Array.isArray(paneList) ? paneList : []) {
+      if (p?.terminal) paneByAddr.set(p.terminal, p);
+    }
+    const spaceNameByTab = new Map();
+    for (const sp of Array.isArray(spaceList) ? spaceList : []) {
+      const spName = sp?.name || "";
+      for (const tb of Array.isArray(sp?.tabs) ? sp.tabs : []) {
+        if (tb?.id) spaceNameByTab.set(tb.id, spName);
+      }
+    }
+    const srcPane = paneByAddr.get(sourceAddr);
+    const srcSpace = agentByAddr.get(sourceAddr)?.space_name || (srcPane?.tab ? spaceNameByTab.get(srcPane.tab) : "") || "";
+
+    const buildEntry = (rec, aInfo) => {
+      const addr = rec?.address || aInfo?.address;
+      const pInfo = paneByAddr.get(addr);
+      const isAcp = Boolean(rec?.acp || aInfo?.acp || /(^|\/)a[0-9a-z]+$/i.test(addr));
+      const custom = rec?.labels?.["herdr.name"] || aInfo?.custom_name || pInfo?.custom_name || "";
+      const progName = rec?.program?.name || aInfo?.program?.name || rec?.agent || aInfo?.app || "";
+      const rawTitle = rec?.name || aInfo?.title || rec?.title || "";
+      const baseName = custom || (rawTitle && rawTitle !== addr ? rawTitle : "") || progName || addr;
+      const label = baseName !== addr ? `${baseName} (${addr})` : addr;
+      const rawStatus = aInfo?.status || (typeof rec?.status === "string" ? rec.status : rec?.status?.state) || pInfo?.status || "idle";
+      const status = rawStatus === "working" || rawStatus === "starting"
+        ? "working"
+        : rawStatus === "blocked" || rawStatus === "error"
+          ? "blocked"
+          : "idle";
+      const spaceName = aInfo?.space_name || (pInfo?.tab ? spaceNameByTab.get(pInfo.tab) : "") || "";
+      const isSideChat = String(rec?.lineage?.kind || "").toLowerCase().replace("_", "-") === "side-chat";
+      return {
+        address: addr,
+        label,
+        kind: isAcp ? "acp" : "cli",
+        status,
+        spaceName,
+        sameSpace: Boolean(srcSpace && spaceName && srcSpace === spaceName),
+        isSideChat,
+      };
+    };
+
+    const strict = [];
+    const fallback = [];
+    const seen = new Set();
+
+    const inspect = (rec, aInfo) => {
+      const addr = rec?.address || aInfo?.address;
+      if (!addr || addr === sourceAddr || seen.has(addr)) return;
+      if (rec?.labels?.["herdr.trashed"]) return;
+      const st = rec?.state ?? "live";
+      if (st !== "live" && st !== "running") return;
+      seen.add(addr);
+      const isAcp = Boolean(rec?.acp || aInfo?.acp || /(^|\/)a[0-9a-z]+$/i.test(addr));
+      const isCliAgent = !isAcp && Boolean(aInfo || rec?.program?.agent || rec?.structured || rec?.status);
+      const entry = buildEntry(rec, aInfo);
+      if (isAcp || isCliAgent) {
+        strict.push(entry);
+      } else {
+        fallback.push(entry);
+      }
+    };
+
+    for (const rec of Array.isArray(termList) ? termList : []) {
+      inspect(rec, agentByAddr.get(rec?.address));
+    }
+    for (const aInfo of Array.isArray(agentList) ? agentList : []) {
+      inspect(null, aInfo);
+    }
+
+    const list = strict.length > 0 ? strict : fallback;
+    list.sort((a, b) => {
+      if (a.sameSpace !== b.sameSpace) return a.sameSpace ? -1 : 1;
+      if (a.isSideChat !== b.isSideChat) return a.isSideChat ? 1 : -1;
+      return 0;
+    });
+    return list;
+  }
+
   ensurePresetSelected() {
     const src = this.sourceRecord(props()?.source);
     const srcPreset = providerPresetOf(src);
@@ -262,7 +359,7 @@ export default class Handoff extends View {
     const p = props() ?? {};
     const sourceAddr = p.source || "";
     const src = this.sourceRecord(sourceAddr);
-    const valid = ["handoff", "fork", "side-chat", "merge-back"];
+    const valid = ["handoff", "fork", "side-chat", "merge-back", "send-context"];
     this.mode = valid.includes(nextMode) ? nextMode : "handoff";
 
     if (this.mode === "side-chat") {
@@ -283,6 +380,23 @@ export default class Handoff extends View {
       this.archiveSource = false;
     }
     this.ensurePresetSelected();
+
+    if (this.mode === "send-context") {
+      const targets = this.liveTargetAgents(sourceAddr);
+      if (resetTargets || !this.intoTarget || !targets.some((o) => o.address === this.intoTarget)) {
+        this.intoTarget = targets[0]?.address || "";
+      }
+      if (resetTargets) {
+        this.focusTargetAfterSend = true;
+        this.recentTurns = 2;
+      } else if (![1, 2, 4, 0].includes(this.recentTurns)) {
+        this.recentTurns = 2;
+      }
+      return;
+    }
+    if (resetTargets) {
+      this.recentTurns = 8;
+    }
 
     const parentAddr = qualifyPeerAddress(src?.lineage?.parent || src?.parent || "", sourceAddr);
     const others = this.otherLiveSessions(sourceAddr);
@@ -414,7 +528,7 @@ export default class Handoff extends View {
     if (checking()) return;
     const p = props() ?? {};
     const sourceAddr = p.source || "";
-    if (!sourceAddr || this.mode === "merge-back") return;
+    if (!sourceAddr || this.mode === "merge-back" || this.mode === "send-context") return;
     const { installed } = this.availablePresets();
     const installedKeys = installed.map((x) => x.key);
     const key = `${sourceAddr}:${installedKeys.join(",")}:${isZh() ? "zh" : "en"}:${force ? Date.now() : "0"}`;
@@ -514,6 +628,20 @@ export default class Handoff extends View {
           placeholder: tr("Optional follow-up instruction for parent…", "可选：补充合回后的处理要求…"),
           submitLabel: tr("Merge Back", "确认合回"),
         };
+      case "send-context":
+        return {
+          title: tr("Send Context", "发送上下文"),
+          accent: "#10b981",
+          subtitle: tr(
+            "Send recent conversation context directly to a currently open live agent (CLI or ACP), with an optional note.",
+            "将当前会话的近期上下文直接发送给已开启的 CLI 或 ACP Agent，可附带备注信息一并发出。",
+          ),
+          placeholder: tr(
+            "Optional note or question to send along with the recent context…",
+            "可选：填写备注或说明，将与近期上下文一并发送给目标 Agent…",
+          ),
+          submitLabel: tr("Send Context", "发送上下文"),
+        };
       default:
         return {
           title: tr("Context Handoff", "上下文接力"),
@@ -547,7 +675,7 @@ export default class Handoff extends View {
     if (!pinnedFork && this.customTurnsMode && this.parsedCustomTurns() === null) {
       return false;
     }
-    if (this.mode === "merge-back") return Boolean(this.intoTarget);
+    if (this.mode === "merge-back" || this.mode === "send-context") return Boolean(this.intoTarget);
     return Boolean(this.preset);
   }
 
@@ -572,6 +700,10 @@ export default class Handoff extends View {
     if (this.mode === "merge-back") {
       args.into = this.intoTarget;
       args.merge_worktree = Boolean(this.mergeWorktree);
+    } else if (this.mode === "send-context") {
+      args.into = this.intoTarget;
+      args.merge_worktree = false;
+      args.open = this.focusTargetAfterSend ? "focus" : "none";
     } else {
       args.preset = this.preset;
       args.mode = this.runtimeMode;
@@ -645,9 +777,15 @@ export default class Handoff extends View {
     const { installed, others: extraPresets, all: allPresets } = this.availablePresets();
     const visiblePresets = (installed.length > 0 && !this.showAllProviders) ? installed : allPresets;
     const otherSessions = this.otherLiveSessions(sourceAddr);
+    const liveTargets = this.mode === "send-context" ? this.liveTargetAgents(sourceAddr) : [];
+    if (this.mode === "send-context" && liveTargets.length > 0 && !liveTargets.some((o) => o.address === this.intoTarget)) {
+      this.intoTarget = liveTargets[0].address;
+    }
     const canGo = this.canSubmit();
     const hasSrcWorktree = Boolean(src?.lineage?.worktree_path);
     const isMerge = this.mode === "merge-back";
+    const isSendContext = this.mode === "send-context";
+    const isIntoExisting = isMerge || isSendContext;
 
     const sectionLabel = (txt) =>
       div().w_full().min_w(0).text_size(11).font_medium().text_color(t.dim).child(txt);
@@ -756,7 +894,7 @@ export default class Handoff extends View {
               .flex_none()
               .items_center()
               .gap(6)
-              .when(!isMerge, (recBtnEl) =>
+              .when(!isIntoExisting, (recBtnEl) =>
                 recBtnEl.child(
                   h_flex()
                     .id("ho-rec-btn")
@@ -800,8 +938,8 @@ export default class Handoff extends View {
               ),
           ),
       )
-      // 3-segment mode switcher (creation modes only — NO Merge Back tab here)
-      .when(!isMerge, (el) =>
+      // 3-segment mode switcher (creation modes only — NO Merge Back / Send Context tab here)
+      .when(!isIntoExisting, (el) =>
         el.child(
           h_flex()
             .w_full()
@@ -873,7 +1011,7 @@ export default class Handoff extends View {
           .child(copy.subtitle),
       )
       // AI recommendation loading indicator
-      .when(!isMerge && this.recLoading && !this.recommendation, (el) =>
+      .when(!isIntoExisting && this.recLoading && !this.recommendation, (el) =>
         el.child(
           h_flex()
             .id("ho-rec-loading")
@@ -910,7 +1048,7 @@ export default class Handoff extends View {
         ),
       )
       // AI / heuristic complementary recommendation banner
-      .when(!isMerge && Boolean(this.recommendation?.reason), (el) => {
+      .when(!isIntoExisting && Boolean(this.recommendation?.reason), (el) => {
         const rec = this.recommendation;
         const isAi = Boolean(rec.usedAi);
         const recColor = isAi ? "#a855f7" : accent;
@@ -1012,7 +1150,7 @@ export default class Handoff extends View {
         );
       })
       // Creation modes body
-      .when(!isMerge, (el) =>
+      .when(!isIntoExisting, (el) =>
         el
           // Target provider
           .child(
@@ -1472,6 +1610,181 @@ export default class Handoff extends View {
             ),
           ),
       )
+      // Dedicated Send-Context target live agent picker (supports both CLI and ACP agents)
+      .when(isSendContext, (el) => {
+        const renderTargetRow = (item) => {
+          const active = this.intoTarget === item.address;
+          const isAcpItem = item.kind === "acp";
+          const kindColor = isAcpItem ? "#6366f1" : "#f59e0b";
+          const dotColor =
+            item.status === "working"
+              ? (t.working ?? "#3b82f6")
+              : item.status === "blocked"
+                ? (t.blocked ?? "#f59e0b")
+                : (t.done ?? "#22c55e");
+          return h_flex()
+            .id(`ho-send-target-${item.address}`)
+            .w_full()
+            .min_w(0)
+            .h(30)
+            .flex_none()
+            .px(9)
+            .gap(7)
+            .items_center()
+            .justify_between()
+            .rounded(7)
+            .border_1()
+            .border_color(active ? accent : t.border)
+            .bg(active ? (withAlpha(accent, "1c") ?? t.selected ?? t.raised) : t.raised)
+            .cursor_pointer()
+            .hover((s) => s.bg(t.hover))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              this.intoTarget = item.address;
+              cx.notify();
+            })
+            .child(
+              h_flex()
+                .flex_1()
+                .min_w(0)
+                .items_center()
+                .gap(7)
+                .child(div().w(6).h(6).flex_none().rounded(3).bg(dotColor))
+                .child(
+                  div()
+                    .flex_none()
+                    .px(5)
+                    .py(1)
+                    .rounded(4)
+                    .bg(withAlpha(kindColor, "20") ?? t.background)
+                    .text_size(9.5)
+                    .font_semibold()
+                    .text_color(kindColor)
+                    .child(isAcpItem ? "ACP" : "CLI"),
+                )
+                .child(
+                  div()
+                    .flex_1()
+                    .min_w(0)
+                    .truncate()
+                    .text_size(12)
+                    .when(active, (s) => s.font_semibold())
+                    .text_color(active ? t.foreground : t.muted)
+                    .child(item.label),
+                ),
+            )
+            .child(
+              h_flex()
+                .flex_none()
+                .items_center()
+                .gap(6)
+                .when(Boolean(item.spaceName), (spEl) =>
+                  spEl.child(
+                    div()
+                      .px(5)
+                      .py(1)
+                      .rounded(4)
+                      .bg(t.background)
+                      .text_size(10)
+                      .text_color(t.dim)
+                      .child(item.spaceName),
+                  ),
+                )
+                .when(active, (ck) =>
+                  ck.child(svg("mods/workspace-chrome/check.svg").size(12).flex_none().text_color(accent)),
+                ),
+            );
+        };
+        const rowsHeight = Math.min(Math.max(liveTargets.length * 34 - 4, 34), 192);
+        return el
+          .child(
+            v_flex()
+              .w_full()
+              .min_w(0)
+              .gap(6)
+              .child(
+                h_flex()
+                  .w_full()
+                  .min_w(0)
+                  .items_center()
+                  .justify_between()
+                  .child(sectionLabel(tr("Target Live Agent (CLI / ACP)", "接收上下文的目标 Agent（已开启 · 支持 CLI / ACP）")))
+                  .when(liveTargets.length > 0, (cntEl) =>
+                    cntEl.child(
+                      div()
+                        .flex_none()
+                        .text_size(10.5)
+                        .text_color(t.dim)
+                        .child(tr(`${liveTargets.length} open`, `${liveTargets.length} 个在线`)),
+                    ),
+                  ),
+              )
+              .when(liveTargets.length > 0 && liveTargets.length <= 5, (listEl) =>
+                listEl.child(
+                  v_flex()
+                    .id("ho-send-target-list")
+                    .w_full()
+                    .min_w(0)
+                    .gap(4)
+                    .children(liveTargets.map(renderTargetRow)),
+                ),
+              )
+              .when(liveTargets.length > 5, (scrollEl) =>
+                scrollEl.child(
+                  div()
+                    .id("ho-send-target-scroll")
+                    .w_full()
+                    .h(rowsHeight)
+                    .overflow_y_scrollbar()
+                    .on_scroll_wheel((_e, cx) => cx.stop_propagation())
+                    .child(
+                      v_flex()
+                        .id("ho-send-target-list")
+                        .w_full()
+                        .min_w(0)
+                        .gap(4)
+                        .children(liveTargets.map(renderTargetRow)),
+                    ),
+                ),
+              )
+              .when(liveTargets.length === 0, (emptyEl) =>
+                emptyEl.child(
+                  div()
+                    .id("ho-send-target-empty")
+                    .w_full()
+                    .min_w(0)
+                    .px(10)
+                    .py(8)
+                    .rounded(7)
+                    .border_1()
+                    .border_color(t.border)
+                    .text_size(11.5)
+                    .text_color(t.dim)
+                    .whitespace_normal()
+                    .child(
+                      tr(
+                        "No other open live agent sessions available. Start a CLI or ACP agent first.",
+                        "当前没有其他已开启的 Agent 会话，请先打开一个 CLI 或 ACP Agent。",
+                      ),
+                    ),
+                ),
+              ),
+          )
+          .child(
+            toggleRow(
+              "ho-focus-target-toggle",
+              this.focusTargetAfterSend,
+              tr("Switch to target agent after sending", "发送后切换到目标 Agent"),
+              tr(
+                "Jump to the receiving agent tab immediately so you can watch its response.",
+                "发送完成后自动跳转到目标 Agent 标签页查看回复；关闭则留在当前会话。",
+              ),
+              () => { this.focusTargetAfterSend = !this.focusTargetAfterSend; },
+              accent,
+            ),
+          );
+      })
       // Context depth (or pinned fork turn)
       .when(this.mode === "fork" && Boolean(this.toTurn), (el) =>
         el.child(
@@ -1534,7 +1847,7 @@ export default class Handoff extends View {
                     .flex_wrap()
                     .justify_end()
                     .children(
-                      TURN_CHOICES().map((c) =>
+                      (isSendContext ? SEND_CONTEXT_TURN_CHOICES() : TURN_CHOICES()).map((c) =>
                         this.chip(t, `ho-turns-${c.value}`, c.label, !this.customTurnsMode && this.recentTurns === c.value, () => {
                           this.customTurnsMode = false;
                           this.recentTurns = c.value;
@@ -1546,7 +1859,7 @@ export default class Handoff extends View {
                         this.customTurnsMode = true;
                         const cur = String(this.customTurnsInput?.value?.() ?? "").trim();
                         if (!cur) {
-                          const fallback = this.recentTurns > 0 ? String(this.recentTurns) : "20";
+                          const fallback = this.recentTurns > 0 ? String(this.recentTurns) : (isSendContext ? "6" : "20");
                           this.customTurnsInput.set_value(fallback);
                           this.customTurnsInput.set_selected_range({ start: 0, end: fallback.length });
                         } else {
@@ -1594,13 +1907,19 @@ export default class Handoff extends View {
             ),
         );
       })
-      // Prompt input
+      // Prompt / Remark input
       .child(
         v_flex()
           .w_full()
           .min_w(0)
           .gap(5)
-          .child(sectionLabel(tr("Instruction (optional · Ctrl+Enter)", "补充指令（可选 · Ctrl+Enter 确认）")))
+          .child(
+            sectionLabel(
+              isSendContext
+                ? tr("Note / Remark (optional · Ctrl+Enter)", "附加备注（可选 · Ctrl+Enter 发送）")
+                : tr("Instruction (optional · Ctrl+Enter)", "补充指令（可选 · Ctrl+Enter 确认）"),
+            ),
+          )
           .child(
             div()
               .w_full()

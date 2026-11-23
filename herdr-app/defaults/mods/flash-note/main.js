@@ -26,7 +26,34 @@ import {
   shared,
   setShared,
   checking,
+  keys,
+  window as appWindow,
 } from "herdr";
+
+function shortcutFor(action) {
+  if (typeof keys !== "function" || !action) return "";
+  const list = keys();
+  if (!Array.isArray(list)) return "";
+  const k = list.find((b) => b.section === "global" && b.action === action);
+  if (!k?.keys?.trim()) return "";
+  const mac = typeof appWindow === "function" && appWindow()?.platform === "macos";
+  const names = mac ? { ctrl: "⌃", alt: "⌥", shift: "⇧", cmd: "⌘", fn: "fn" } : { ctrl: "Ctrl", alt: "Alt", shift: "Shift", cmd: "Super", fn: "Fn" };
+  const alias = { secondary: mac ? "cmd" : "ctrl", super: "cmd", win: "cmd" };
+  return k.keys.trim().split(/\s+/).map((stroke) => {
+    const parts = stroke.split("-");
+    let key = parts.pop();
+    if (key === "") { key = "-"; parts.pop(); }
+    const held = new Set(parts.map((m) => alias[m.toLowerCase()] ?? m.toLowerCase()));
+    if (/^[A-Z]$/.test(key)) held.add("shift");
+    const label = key.length === 1 ? key.toUpperCase() : key[0].toUpperCase() + key.slice(1).toLowerCase();
+    return [...Object.keys(names).filter((m) => held.has(m)).map((m) => names[m]), label].join(mac ? "" : "+");
+  }).join(" ");
+}
+
+function withShortcut(text, action) {
+  const sc = shortcutFor(action);
+  return sc ? `${text} (${sc})` : text;
+}
 import {
   FLASH_NOTES_KEY,
   FLASH_NOTES_TRASH_KEY,
@@ -36,15 +63,20 @@ import {
   ACP_AGENT_KEY,
   withAlpha,
   normalizeNotes,
+  reorderNotes,
   normalizeTrash,
+  makeEntryId,
   upsertNote,
   renameNote,
+  markEntriesSent,
   moveNoteToTrash,
   restoreNoteFromTrash,
   purgeTrashedNote,
   emptyNotesTrash,
   notePreview,
   noteDisplayTitle,
+  noteEntryStats,
+  formatEntriesForSend,
   formatNoteTime,
   formatTrashAge,
   resolveSpaceFolder,
@@ -95,10 +127,10 @@ export function openFlashNoteWindow(noteId = null) {
     kind: "window",
     key: "flash-note",
     resizable: true,
-    width: 468,
-    height: 488,
-    min_width: 380,
-    min_height: 420,
+    width: 500,
+    height: 560,
+    min_width: 400,
+    min_height: 440,
     props: noteId ? { mode: "compose", noteId } : { mode: "compose" },
   });
 }
@@ -127,6 +159,12 @@ export default class FlashNote extends View {
     if (props()?.list) {
       this.renamingId = null;
       this.renameText = "";
+      this.noteDrag = null;
+      this.noteSettling = null;
+      this.noteSettleTask = null;
+      this.noteHeights = {};
+      this.noteSnapFromOrder = null;
+      this.noteSnapUntil = 0;
       this.listFocus = cx.focus_handle?.() ?? null;
       this.renameInput = InputState.new({
         placeholder: tr("Name (empty: auto preview)", "名称（留空使用正文预览）"),
@@ -187,7 +225,7 @@ export default class FlashNote extends View {
 
     this.titleInput = InputState.new({
       value: existingNote?.title ?? "",
-      placeholder: tr("Name (optional — defaults to idea preview)", "名称（可选，留空自动使用正文预览）"),
+      placeholder: tr("Group or idea name (optional — defaults to first idea)", "闪念组或条目名称（可选，留空自动使用首条预览）"),
     });
     this.titleInput.on("focus", (_e, cx) => {
       this.titleFocused = true;
@@ -206,47 +244,216 @@ export default class FlashNote extends View {
       this.input?.focus?.();
     });
 
-    this.input = TextareaState.new({
-      value: existingNote?.text ?? "",
-      placeholder: tr("Jot down a sudden idea, reminder, or prompt…", "记下此刻的灵感、待办或想交给 Agent 处理的想法…"),
-    });
+    this.entryStates = [];
+    this.activeEntryIndex = 0;
+    this.sendScope = "all";
     this.polishing = false;
     this.polishUndoText = null;
     this.polishSummary = null;
-    this.input.set_auto_grow(4, 10);
-    this.input.on("focus", (_e, cx) => {
-      this.inputFocused = true;
-      this.closeAllPopups();
-      cx.notify();
-    });
-    this.input.on("blur", (_e, cx) => {
-      this.inputFocused = false;
-      cx.notify();
-    });
-    this.input.on("change", (_e, cx) => {
-      this.error = null;
-      cx.notify();
-    });
-    this.input.on("submit", (e, cx) => {
-      if (e?.shift) return;
-      if (e?.secondary || e?.modifiers?.control || e?.modifiers?.platform) {
-        this.sendIdea(cx);
-      }
-    });
+    this.lastPolishedEntryId = null;
+    this.loadNoteIntoComposer(existingNote, false);
 
     this.handle = cx.focus_handle();
     if (!checking()) {
-      this.input.focus();
+      this.input?.focus?.();
       if (typeof nextCommand === "function") {
         cx.spawn(async (cmdCx) => {
           for (;;) {
             const cmd = await nextCommand();
             if (cmd === "polish") await this.polishIdea(cmdCx);
+            else if (cmd === "polish_undo") this.revertPolish(cmdCx);
           }
         });
       }
       this.refreshMachineAgentsAndCatalog(this.activeSpace()?.machine ?? null, cx);
     }
+  }
+
+  get input() {
+    return this.entryStates?.[this.activeEntryIndex]?.input ?? this.entryStates?.[0]?.input ?? null;
+  }
+
+  activeEntry() {
+    return this.entryStates?.[this.activeEntryIndex] ?? this.entryStates?.[0] ?? null;
+  }
+
+  createEntryState({ id = null, text = "", sentTo = null, sentAt = null, selected = true } = {}, idx = 0) {
+    const entryId = id || makeEntryId(idx, Date.now());
+    const ta = TextareaState.new({
+      value: String(text ?? ""),
+      placeholder: idx === 0
+        ? tr("Jot down a sudden idea, reminder, or prompt…", "记下此刻的灵感、待办或想交给 Agent 处理的想法…")
+        : tr(`Idea #${idx + 1}…`, `第 ${idx + 1} 条闪念…`),
+    });
+    ta.set_auto_grow(3, 8);
+    const entry = {
+      id: entryId,
+      input: ta,
+      selected: Boolean(selected),
+      focused: false,
+      sentTo: sentTo || null,
+      sentAt: sentAt || null,
+      polishUndoText: null,
+      polishSummary: null,
+    };
+    ta.on("focus", (_e, cx) => {
+      const curIdx = this.entryStates.indexOf(entry);
+      if (curIdx >= 0) this.activeEntryIndex = curIdx;
+      for (const e of this.entryStates) e.focused = e === entry;
+      this.inputFocused = true;
+      this.polishUndoText = entry.polishUndoText;
+      this.polishSummary = entry.polishSummary;
+      this.closeAllPopups();
+      cx.notify();
+    });
+    ta.on("blur", (_e, cx) => {
+      entry.focused = false;
+      this.inputFocused = this.entryStates.some((e) => e.focused);
+      cx.notify();
+    });
+    ta.on("change", (_e, cx) => {
+      this.error = null;
+      cx.notify();
+    });
+    ta.on("submit", (e, cx) => {
+      if (e?.shift) return;
+      if (e?.secondary || e?.modifiers?.control || e?.modifiers?.platform) {
+        this.sendIdea(cx);
+      }
+    });
+    return entry;
+  }
+
+  releaseEntryStates() {
+    for (const entry of this.entryStates ?? []) {
+      try { entry.input?.release?.(); } catch {}
+    }
+    this.entryStates = [];
+  }
+
+  loadNoteIntoComposer(note, shouldFocus = false) {
+    this.releaseEntryStates();
+    this.editingNoteId = note?.id ?? null;
+    this.titleInput?.set_value?.(note?.title ?? "");
+    const rawEntries = Array.isArray(note?.entries) && note.entries.length > 0
+      ? note.entries
+      : (note?.text ? [{ id: `${note.id}-e0`, text: note.text, sentTo: note.sentTo ?? null, sentAt: note.sentAt ?? null }] : []);
+    if (rawEntries.length > 0) {
+      const hasPartialSent = rawEntries.some((e) => Boolean(e.sentTo)) && rawEntries.some((e) => !e.sentTo);
+      this.entryStates = rawEntries.map((e, idx) =>
+        this.createEntryState({
+          id: e.id,
+          text: e.text,
+          sentTo: e.sentTo ?? null,
+          sentAt: e.sentAt ?? null,
+          selected: hasPartialSent ? !e.sentTo : true,
+        }, idx),
+      );
+      this.sendScope = hasPartialSent ? "selected" : "all";
+    } else {
+      this.entryStates = [this.createEntryState({ selected: true }, 0)];
+      this.sendScope = "all";
+    }
+    this.activeEntryIndex = 0;
+    this.inputFocused = false;
+    this.polishUndoText = null;
+    this.polishSummary = null;
+    this.lastPolishedEntryId = null;
+    this.polishing = false;
+    this.error = null;
+    if (shouldFocus && !checking()) {
+      this.entryStates[0]?.input?.focus?.();
+    }
+  }
+
+  addEntry(cx, initialText = "") {
+    if (this.busy) return null;
+    const idx = this.entryStates.length;
+    const entry = this.createEntryState({ text: initialText, selected: true }, idx);
+    this.entryStates.push(entry);
+    this.activeEntryIndex = idx;
+    this.error = null;
+    if (!checking()) entry.input.focus();
+    cx?.notify?.();
+    return entry;
+  }
+
+  removeEntry(idx, cx) {
+    if (this.busy || this.entryStates.length <= 1) return;
+    if (idx < 0 || idx >= this.entryStates.length) return;
+    const [removed] = this.entryStates.splice(idx, 1);
+    try { removed?.input?.release?.(); } catch {}
+    if (this.activeEntryIndex >= this.entryStates.length) {
+      this.activeEntryIndex = Math.max(0, this.entryStates.length - 1);
+    }
+    const active = this.activeEntry();
+    this.polishUndoText = active?.polishUndoText ?? null;
+    this.polishSummary = active?.polishSummary ?? null;
+    this.error = null;
+    cx?.notify?.();
+  }
+
+  toggleEntrySelected(idx, cx) {
+    const entry = this.entryStates[idx];
+    if (!entry) return;
+    entry.selected = !entry.selected;
+    const nonEmpty = this.collectNonEmptyEntries();
+    const selCount = nonEmpty.filter((e) => e.selected).length;
+    if (nonEmpty.length > 1) {
+      this.sendScope = selCount < nonEmpty.length ? "selected" : "all";
+    }
+    this.error = null;
+    cx?.notify?.();
+  }
+
+  selectEntries(mode, cx) {
+    for (const entry of this.entryStates) {
+      if (mode === "all") entry.selected = true;
+      else if (mode === "none") entry.selected = false;
+      else if (mode === "unsent") entry.selected = !entry.sentTo;
+    }
+    this.sendScope = mode === "all" ? "all" : "selected";
+    this.error = null;
+    cx?.notify?.();
+  }
+
+  collectNonEmptyEntries() {
+    const out = [];
+    this.entryStates.forEach((entry, index) => {
+      const text = String(entry.input?.value?.() ?? "").trim();
+      if (text) {
+        out.push({
+          index,
+          id: entry.id,
+          text,
+          selected: Boolean(entry.selected),
+          sentTo: entry.sentTo || null,
+          sentAt: entry.sentAt || null,
+          state: entry,
+        });
+      }
+    });
+    return out;
+  }
+
+  collectTargetEntries(overrideEntryIds = null) {
+    const nonEmpty = this.collectNonEmptyEntries();
+    if (Array.isArray(overrideEntryIds)) {
+      const idSet = new Set(overrideEntryIds);
+      return nonEmpty.filter((e) => idSet.has(e.id));
+    }
+    if (nonEmpty.length <= 1) return nonEmpty;
+    if (this.sendScope === "selected") {
+      return nonEmpty.filter((e) => e.selected);
+    }
+    return nonEmpty;
+  }
+
+  close() {
+    this.releaseEntryStates();
+    try { this.titleInput?.release?.(); } catch {}
+    try { this.customModelInput?.release?.(); } catch {}
+    try { this.renameInput?.release?.(); } catch {}
   }
 
   refreshMachineAgentsAndCatalog(machine, cx) {
@@ -311,18 +518,52 @@ export default class FlashNote extends View {
     }
   }
 
-  revertPolish(cx) {
-    if (this.polishUndoText == null) return;
-    const orig = this.polishUndoText;
-    this.polishUndoText = null;
-    this.polishSummary = null;
-    this.input?.set_value?.(orig);
-    this.input?.focus?.();
+  revertPolish(cx, entryIndex = null) {
+    let entry = null;
+    if (entryIndex !== null) {
+      entry = this.entryStates?.[entryIndex] ?? null;
+    } else {
+      const active = this.activeEntry();
+      if (active?.polishUndoText != null) {
+        entry = active;
+      } else if (this.lastPolishedEntryId) {
+        entry = this.entryStates?.find((e) => e.id === this.lastPolishedEntryId && e.polishUndoText != null) ?? null;
+      }
+      if (!entry) {
+        for (let i = (this.entryStates?.length ?? 0) - 1; i >= 0; i--) {
+          if (this.entryStates[i]?.polishUndoText != null) {
+            entry = this.entryStates[i];
+            break;
+          }
+        }
+      }
+    }
+    const orig = entry ? entry.polishUndoText : (entryIndex === null ? this.polishUndoText : null);
+    if (orig == null) return;
+    if (entry) {
+      const idx = this.entryStates.indexOf(entry);
+      if (idx >= 0) this.activeEntryIndex = idx;
+      entry.polishUndoText = null;
+      entry.polishSummary = null;
+      entry.input?.set_value?.(orig);
+      entry.input?.focus?.();
+      if (this.lastPolishedEntryId === entry.id) this.lastPolishedEntryId = null;
+    } else {
+      this.input?.set_value?.(orig);
+      this.input?.focus?.();
+    }
+    const active = this.activeEntry();
+    this.polishUndoText = active?.polishUndoText ?? null;
+    this.polishSummary = active?.polishSummary ?? null;
     cx.notify();
   }
 
-  async polishIdea(cx) {
-    const raw = String(this.input?.value?.() ?? "").trim();
+  async polishIdea(cx, entryIndex = null) {
+    let entry = entryIndex !== null ? this.entryStates?.[entryIndex] : this.activeEntry();
+    if (!entry || !String(entry.input?.value?.() ?? "").trim()) {
+      entry = this.entryStates?.find((e) => String(e.input?.value?.() ?? "").trim()) ?? entry;
+    }
+    const raw = String(entry?.input?.value?.() ?? "").trim();
     if (!raw || this.polishing || this.busy || checking()) return;
     const candidates = resolveExistingAgents(terminals(), agents(), panes(), focused());
     const targetKind = this.targetMode === "existing"
@@ -341,8 +582,24 @@ export default class FlashNote extends View {
         "--lang",
         isZh() ? "zh-CN" : "en",
       ];
+      const noteTitle = String(this.titleInput?.value?.() ?? "").trim();
+      const ctxParts = [];
+      if (noteTitle) ctxParts.push(`note=${noteTitle}`);
       if (this.targetMode === "existing" && this.selectedExisting) {
         args.push("--target", this.selectedExisting);
+        if (this.selectedExisting.includes("/")) {
+          args.push("--on", this.selectedExisting.split("/")[0]);
+        }
+      } else {
+        const space = this.activeSpace();
+        const folder = resolveSpaceFolder(space, panes());
+        if (space?.name) ctxParts.push(`space=${space.name}`);
+        if (folder) ctxParts.push(`cwd=${folder}`);
+        const spaceMachine = space?.machine ?? null;
+        if (spaceMachine) args.push("--on", spaceMachine);
+      }
+      if (ctxParts.length > 0) {
+        args.push("--context", ctxParts.join(" · "));
       }
       args.push("--", raw);
       const res = await h2(args, { timeout: 22000 });
@@ -350,10 +607,18 @@ export default class FlashNote extends View {
         const parsed = JSON.parse(res.stdout);
         const polished = String(parsed?.polished ?? "").trim();
         if (parsed?.usedAi && polished) {
+          const summary = parsed?.summary ? String(parsed.summary).trim() : null;
+          if (entry) {
+            const idx = this.entryStates.indexOf(entry);
+            if (idx >= 0) this.activeEntryIndex = idx;
+            entry.polishUndoText = raw;
+            entry.polishSummary = summary;
+            this.lastPolishedEntryId = entry.id;
+            entry.input?.set_value?.(polished);
+            entry.input?.focus?.();
+          }
           this.polishUndoText = raw;
-          this.polishSummary = parsed?.summary ? String(parsed.summary).trim() : null;
-          this.input?.set_value?.(polished);
-          this.input?.focus?.();
+          this.polishSummary = summary;
         } else {
           const reason = String(parsed?.fallbackReason ?? "");
           this.error = reason === "ai_not_configured"
@@ -470,20 +735,22 @@ export default class FlashNote extends View {
   }
 
   saveIdea(cx) {
-    const text = String(this.input?.value?.() ?? "").trim();
+    const nonEmpty = this.collectNonEmptyEntries();
     const title = String(this.titleInput?.value?.() ?? "").trim();
-    if (!text || this.busy) return;
+    if (nonEmpty.length === 0 || this.busy) return;
     const { list, note } = upsertNote(shared(FLASH_NOTES_KEY), {
       id: this.editingNoteId,
       title,
-      text,
+      entries: nonEmpty.map((e) => ({ id: e.id, text: e.text, sentTo: e.sentTo, sentAt: e.sentAt })),
       now: Date.now(),
     });
     setShared(FLASH_NOTES_KEY, list);
     this.editingNoteId = note?.id ?? this.editingNoteId;
     notify({
-      title: tr("Idea saved", "闪念已保存"),
-      body: noteDisplayTitle(note ?? { title, text }, 64),
+      title: nonEmpty.length > 1
+        ? tr(`Saved flash note group (${nonEmpty.length})`, `已保存闪念组（${nonEmpty.length} 条）`)
+        : tr("Idea saved", "闪念已保存"),
+      body: noteDisplayTitle(note ?? { title, text: nonEmpty[0].text }, 64),
       level: "info",
     });
     const ov = props()?.overlay;
@@ -513,11 +780,66 @@ export default class FlashNote extends View {
     else cx?.notify?.();
   }
 
-  sendIdea(cx) {
-    const text = String(this.input?.value?.() ?? "").trim();
+  finalizeSentEntries(targetEntries, sentLabel, now, cx) {
+    const sentIdSet = new Set(targetEntries.map((e) => e.id));
+    for (const entry of this.entryStates) {
+      if (sentIdSet.has(entry.id)) {
+        entry.sentTo = sentLabel;
+        entry.sentAt = now;
+      }
+    }
+    const allNonEmpty = this.collectNonEmptyEntries();
+    const remainingUnsent = allNonEmpty.filter((e) => !e.sentTo);
+    const isPartialGroupSend = allNonEmpty.length > 1 && remainingUnsent.length > 0;
     const title = String(this.titleInput?.value?.() ?? "").trim();
-    if (!text || this.busy) return;
+
+    if (this.editingNoteId || isPartialGroupSend) {
+      const upserted = upsertNote(shared(FLASH_NOTES_KEY), {
+        id: this.editingNoteId,
+        title,
+        entries: allNonEmpty.map((e) => ({ id: e.id, text: e.text, sentTo: e.sentTo, sentAt: e.sentAt })),
+        now,
+      });
+      setShared(FLASH_NOTES_KEY, upserted.list);
+      if (upserted.note?.id) this.editingNoteId = upserted.note.id;
+    }
+
+    if (isPartialGroupSend) {
+      // Keep the group window open with remaining unsent entries pre-selected for easy dispatch.
+      for (const entry of this.entryStates) {
+        entry.selected = !entry.sentTo;
+      }
+      this.sendScope = "selected";
+      cx?.notify?.();
+      return;
+    }
+
+    const ov = props()?.overlay;
+    if (ov) closeOverlay(ov);
+    else cx?.notify?.();
+  }
+
+  sendSingleEntry(idx, cx) {
+    const entry = this.entryStates?.[idx];
+    if (!entry) return;
+    const text = String(entry.input?.value?.() ?? "").trim();
+    if (!text) return;
+    this.sendIdea(cx, [entry.id]);
+  }
+
+  sendIdea(cx, overrideEntryIds = null) {
+    const title = String(this.titleInput?.value?.() ?? "").trim();
+    const targetEntries = this.collectTargetEntries(overrideEntryIds);
+    const text = formatEntriesForSend(targetEntries, title);
+    if (!text || this.busy) {
+      if (!this.busy && this.collectNonEmptyEntries().length > 0 && targetEntries.length === 0) {
+        this.error = tr("Select at least one flash note to send, or switch to Send Whole Group.", "请至少勾选一条要发送的闪念，或切换为「整组发送」。");
+        cx?.notify?.();
+      }
+      return;
+    }
     this.error = null;
+    const sentCount = targetEntries.length;
 
     if (this.targetMode === "new") {
       const preset = this.chosenPreset();
@@ -556,24 +878,15 @@ export default class FlashNote extends View {
         if (folder) args.folder = folder;
         run("tab.new", args);
       }
-      if (this.editingNoteId) {
-        const updated = upsertNote(shared(FLASH_NOTES_KEY), {
-          id: this.editingNoteId,
-          title,
-          text,
-          sentTo: buildSentToLabel(preset.name, acpMode, this.selectedModel, effectiveEffort),
-          sentAt: Date.now(),
-          now: Date.now(),
-        });
-        setShared(FLASH_NOTES_KEY, updated.list);
-      }
+      const sentLabel = buildSentToLabel(preset.name, acpMode, this.selectedModel, effectiveEffort);
       notify({
-        title: tr(`Started ${preset.name} with idea`, `已新建 ${preset.name} 并发送闪念`),
-        body: noteDisplayTitle({ title, text }, 64),
+        title: sentCount > 1
+          ? tr(`Started ${preset.name} with ${sentCount} ideas`, `已新建 ${preset.name} 并发送 ${sentCount} 条闪念`)
+          : tr(`Started ${preset.name} with idea`, `已新建 ${preset.name} 并发送闪念`),
+        body: noteDisplayTitle({ title: sentCount > 1 ? title : "", text: targetEntries[0].text }, 64),
         level: "info",
       });
-      const ov = props()?.overlay;
-      if (ov) closeOverlay(ov);
+      this.finalizeSentEntries(targetEntries, sentLabel, Date.now(), cx);
       return;
     }
 
@@ -602,26 +915,16 @@ export default class FlashNote extends View {
           this.error = msg;
           return;
         }
-        if (this.editingNoteId) {
-          const updated = upsertNote(shared(FLASH_NOTES_KEY), {
-            id: this.editingNoteId,
-            title,
-            text,
-            sentTo: target.label,
-            sentAt: Date.now(),
-            now: Date.now(),
-          });
-          setShared(FLASH_NOTES_KEY, updated.list);
-        }
         run("agent.focus", { terminal: target.address });
         notify({
-          title: tr(`Sent idea to ${target.label}`, `已将闪念发送给 ${target.label}`),
-          body: noteDisplayTitle({ title, text }, 64),
+          title: sentCount > 1
+            ? tr(`Sent ${sentCount} ideas to ${target.label}`, `已将 ${sentCount} 条闪念发送给 ${target.label}`)
+            : tr(`Sent idea to ${target.label}`, `已将闪念发送给 ${target.label}`),
+          body: noteDisplayTitle({ title: sentCount > 1 ? title : "", text: targetEntries[0].text }, 64),
           level: "info",
           action: { name: "agent.focus", args: { terminal: target.address } },
         });
-        const ov = props()?.overlay;
-        if (ov) closeOverlay(ov);
+        this.finalizeSentEntries(targetEntries, target.label, Date.now(), taskCx ?? this.cx);
       } catch (e) {
         this.error = e?.message ?? String(e);
       } finally {
@@ -636,6 +939,130 @@ export default class FlashNote extends View {
   }
 
   // ---- Mode A: Bottom-left saved flash notes list ---------------------------
+
+  noteZoom() {
+    return Math.max(0.25, Number(settings?.()?.zoom ?? 1) || 1);
+  }
+
+  noteHeight(id) {
+    return this.noteHeights?.[id] ?? 44;
+  }
+
+  noteSlotTop(notes, index) {
+    const GAP = 2;
+    let y = 0;
+    for (let j = 0; j < index && j < notes.length; j++) y += this.noteHeight(notes[j].id) + GAP;
+    return y;
+  }
+
+  noteSlotOffset(notes, from, to) {
+    const GAP = 2;
+    let off = 0;
+    if (to > from) {
+      for (let j = from + 1; j <= to && j < notes.length; j++) off += this.noteHeight(notes[j].id) + GAP;
+    } else if (to < from) {
+      for (let j = to; j < from && j < notes.length; j++) off -= this.noteHeight(notes[j].id) + GAP;
+    }
+    return off;
+  }
+
+  computeNoteDragTo(notes, from, startTop, dragHeight, dy) {
+    let to = from;
+    const center = startTop + dy + dragHeight * 0.5;
+    if (dy > 0) {
+      for (let j = from + 1; j < notes.length; j++) {
+        const top = this.noteSlotTop(notes, j);
+        const h = this.noteHeight(notes[j].id);
+        if (center > top + h * 0.5) to = j;
+        else break;
+      }
+    } else if (dy < 0) {
+      for (let j = from - 1; j >= 0; j--) {
+        const top = this.noteSlotTop(notes, j);
+        const h = this.noteHeight(notes[j].id);
+        if (center < top + h * 0.5) to = j;
+        else break;
+      }
+    }
+    return to;
+  }
+
+  clampNoteDragDy(notes, from, dragHeight, dy) {
+    const GAP = 2;
+    let minDy = 0;
+    for (let j = 0; j < from; j++) minDy -= this.noteHeight(notes[j].id) + GAP;
+    let maxDy = 0;
+    for (let j = from + 1; j < notes.length; j++) maxDy += this.noteHeight(notes[j].id) + GAP;
+    const extra = Math.max(14, Math.round(dragHeight * 0.4));
+    return Math.max(minDy - extra, Math.min(maxDy + extra, dy));
+  }
+
+  flushNoteSettle() {
+    this.noteSettleTask?.cancel?.();
+    this.noteSettleTask = null;
+    const s = this.noteSettling;
+    if (!s) return;
+    this.noteSettling = null;
+    if (s.to !== s.from) {
+      this.noteSnapFromOrder = s.orderSig;
+      this.noteSnapUntil = Date.now() + 240;
+      const reordered = reorderNotes(shared(FLASH_NOTES_KEY), s.id, s.to);
+      setShared(FLASH_NOTES_KEY, reordered);
+    }
+  }
+
+  handleNoteDragMove(e, cx) {
+    if (!this.noteDrag) return;
+    if (e && "pressed_button" in e && e.pressed_button !== undefined && e.pressed_button !== "left") {
+      this.finishNoteDrag(cx);
+      return;
+    }
+    const rawY = e?.position?.y;
+    if (typeof rawY !== "number") return;
+    const rawDy = rawY / this.noteZoom() - this.noteDrag.startY;
+    if (!this.noteDrag.moving && Math.abs(rawDy) < 4) return;
+    if (!this.noteDrag.moving) {
+      this.noteDrag.moving = true;
+    }
+    const list = this.noteDrag.list;
+    this.noteDrag.dy = this.clampNoteDragDy(list, this.noteDrag.from, this.noteDrag.dragHeight, rawDy);
+    this.noteDrag.to = this.computeNoteDragTo(list, this.noteDrag.from, this.noteDrag.startTop, this.noteDrag.dragHeight, this.noteDrag.dy);
+    cx?.notify?.();
+  }
+
+  finishNoteDrag(cx) {
+    if (!this.noteDrag) return;
+    const d = this.noteDrag;
+    this.noteDrag = null;
+    if (!d.moving) {
+      openFlashNoteWindow(d.id);
+      cx?.notify?.();
+      return;
+    }
+    const destDy = this.noteSlotOffset(d.list, d.from, d.to);
+    const orderSig = d.list.map((n) => n.id).join(",");
+    this.noteSettling = {
+      id: d.id,
+      from: d.from,
+      to: d.to,
+      startTop: d.startTop,
+      destDy,
+      dragHeight: d.dragHeight,
+      orderSig,
+      note: d.list[d.from],
+    };
+    if (typeof cx?.spawn === "function") {
+      this.noteSettleTask = cx.spawn(async (acx) => {
+        await acx.sleep(170);
+        this.noteSettleTask = null;
+        this.flushNoteSettle();
+        acx.notify();
+      });
+    } else {
+      this.flushNoteSettle();
+    }
+    cx?.notify?.();
+  }
 
   renderSidebarList(t) {
     const collapsed = isSidebarNarrow();
@@ -666,7 +1093,7 @@ export default class FlashNote extends View {
             .rounded(6)
             .cursor_pointer()
             .hover((s) => s.bg(t.hover))
-            .tooltip(notes.length > 0 ? tr(`Flash Notes (${notes.length})`, `闪念清单 (${notes.length})`) : tr("Flash Notes", "闪念清单"))
+            .tooltip(withShortcut(notes.length > 0 ? tr(`Flash Notes (${notes.length})`, `闪念清单 (${notes.length})`) : tr("Flash Notes", "闪念清单"), "mod.open:flash-note"))
             .on_click(() => openFlashNoteWindow())
             .child(svg("mods/peek/lightbulb.svg").size(14).text_color(unsentCount > 0 ? AMBER : t.muted))
             .when(notes.length > 0, (el) =>
@@ -689,9 +1116,315 @@ export default class FlashNote extends View {
         );
     }
 
+    const noteOrderSig = notes.map((n) => n.id).join(",");
+    if (this.noteDrag && !notes.some((n) => n.id === this.noteDrag.id)) {
+      this.noteDrag = null;
+    }
+    const snapNotes = this.noteSnapFromOrder !== null && (noteOrderSig !== this.noteSnapFromOrder || Date.now() > this.noteSnapUntil);
+    if (snapNotes) this.noteSnapFromOrder = null;
+    const noteMotion = this.noteDrag?.moving ? this.noteDrag : this.noteSettling;
+
+    const renderNoteRow = (note, idx, opts = {}) => {
+      const { shift = 0, isHiddenSource = false, isFloating = false } = opts;
+      const hovered = !isFloating && !this.noteDrag?.moving && this.hoveredId === note.id;
+      const renaming = !isFloating && this.renamingId === note.id;
+      const timeStr = formatNoteTime(note.updatedAt || note.createdAt);
+      const stats = noteEntryStats(note);
+      const sent = stats.allSent;
+      const hasCustomTitle = Boolean(note.title);
+      const displayTitle = noteDisplayTitle(note, 64);
+      const bodySnippet = hasCustomTitle
+        ? notePreview(note.entries?.[0]?.text ?? note.text, 56)
+        : (stats.isGroup && note.entries?.[1]?.text ? notePreview(note.entries[1].text, 52) : "");
+      const showBodySnippet = Boolean(bodySnippet && bodySnippet !== displayTitle);
+      return h_flex()
+        .relative()
+        .id(isFloating ? `fn-item-float-${note.id}` : `fn-item-${note.id}`)
+        .w_full()
+        .min_h(36)
+        .px(8)
+        .py(5)
+        .gap(7)
+        .flex_none()
+        .items_start()
+        .rounded(7)
+        .when(isFloating, (e2) => e2.bg(t.raised ?? t.selected).border_1().border_color(AMBER).shadow_lg().cursor_grabbing())
+        .when(!isFloating && !renaming && !this.noteDrag?.moving, (e2) => e2.cursor_pointer().hover((s) => s.bg(t.hover)))
+        .when(!isFloating && renaming, (e2) => e2.bg(t.raised))
+        .when(!isFloating, (e2) =>
+          e2
+            .top(shift)
+            .spring("top", { response: snapNotes || isHiddenSource ? 0 : 165, damping: 0.86, epsilon: 0.25 })
+            .when(isHiddenSource, (x) => x.opacity(0))
+            .on_size_change((size) => {
+              const z = this.noteZoom();
+              const mh = size && typeof size.height === "number" ? size.height / z : 0;
+              if (mh > 0 && Math.abs((this.noteHeights?.[note.id] ?? 0) - mh) > 0.5) {
+                this.noteHeights ??= {};
+                this.noteHeights[note.id] = mh;
+              }
+            }),
+        )
+        .when(!isFloating && !isHiddenSource, (e2) =>
+          e2
+            .on_hover((on, cx) => {
+              if (this.noteDrag?.moving) return;
+              if (on) this.hoveredId = note.id;
+              else if (this.hoveredId === note.id) this.hoveredId = null;
+              cx.notify();
+            })
+            .when(!renaming, (e3) =>
+              e3
+                .on_mouse_down("left", (e) => {
+                  this.flushNoteSettle();
+                  if (notes.length > 1 && e && typeof e.position?.y === "number") {
+                    const z = this.noteZoom();
+                    const dragH = this.noteHeight(note.id);
+                    this.noteDrag = {
+                      id: note.id,
+                      list: notes,
+                      from: idx,
+                      to: idx,
+                      startY: e.position.y / z,
+                      startTop: this.noteSlotTop(notes, idx),
+                      dy: 0,
+                      moving: false,
+                      dragHeight: dragH,
+                    };
+                  } else {
+                    openFlashNoteWindow(note.id);
+                  }
+                })
+                .on_mouse_move((e, cx) => this.handleNoteDragMove(e, cx))
+                .on_mouse_up("left", (_e, cx) => {
+                  if (this.noteDrag) {
+                    cx.stop_propagation();
+                    this.finishNoteDrag(cx);
+                  }
+                }),
+            ),
+        )
+        .child(
+          div()
+            .mt(5)
+            .size(6)
+            .flex_none()
+            .rounded(3)
+            .bg(sent ? (t.done ?? t.dim) : AMBER),
+        )
+        .child(
+          v_flex()
+            .flex_1()
+            .min_w(0)
+            .gap(2)
+            .when(renaming, (e2) =>
+              e2.child(
+                h_flex()
+                  .id(`fn-rename-wrap-${note.id}`)
+                  .w_full()
+                  .gap(4)
+                  .items_center()
+                  .on_mouse_down("left", stop)
+                  .on_click(stop)
+                  .on_key_down((e, cx) => {
+                    if (e?.key === "escape") {
+                      cx.stop_propagation();
+                      this.cancelInlineRename(cx);
+                    }
+                  })
+                  .child(
+                    Input.new(this.renameInput)
+                      .id(`fn-rename-input-${note.id}`)
+                      .flex_1()
+                      .min_w(0)
+                      .h(22)
+                      .px(6)
+                      .rounded(4)
+                      .border_1()
+                      .border_color(accent)
+                      .bg(t.background)
+                      .text_size(11.5)
+                      .text_color(t.foreground),
+                  )
+                  .child(
+                    div()
+                      .id(`fn-rename-ok-${note.id}`)
+                      .p(3)
+                      .flex_none()
+                      .rounded(4)
+                      .text_color(accent)
+                      .cursor_pointer()
+                      .hover((s) => s.bg(t.hover))
+                      .tooltip(tr("Save name", "保存名称"))
+                      .on_mouse_down("left", (_e, cx) => {
+                        cx.stop_propagation();
+                        this.commitInlineRename(cx);
+                      })
+                      .child(svg("mods/workspace-chrome/check.svg").size(11)),
+                  )
+                  .child(
+                    div()
+                      .id(`fn-rename-cancel-${note.id}`)
+                      .p(3)
+                      .flex_none()
+                      .rounded(4)
+                      .text_color(t.dim)
+                      .cursor_pointer()
+                      .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                      .tooltip(tr("Cancel", "取消"))
+                      .on_mouse_down("left", (_e, cx) => {
+                        cx.stop_propagation();
+                        this.cancelInlineRename(cx);
+                      })
+                      .child(svg("mods/workspace-chrome/x.svg").size(11)),
+                  ),
+              ),
+            )
+            .when(!renaming, (e2) =>
+              e2
+                .child(
+                  h_flex()
+                    .w_full()
+                    .min_w(0)
+                    .gap(5)
+                    .items_center()
+                    .child(
+                      div()
+                        .flex_1()
+                        .min_w(0)
+                        .truncate()
+                        .text_size(12)
+                        .when(hasCustomTitle || stats.isGroup, (x) => x.font_medium())
+                        .text_color(sent ? t.muted : t.foreground)
+                        .child(displayTitle),
+                    )
+                    .when(stats.isGroup, (e3) =>
+                      e3.child(
+                        div()
+                          .id(isFloating ? `fn-group-badge-float-${note.id}` : `fn-group-badge-${note.id}`)
+                          .flex_none()
+                          .px(5)
+                          .py(0.5)
+                          .rounded(999)
+                          .bg(sent ? t.raised : withAlpha(AMBER, "20"))
+                          .text_size(9.5)
+                          .font_semibold()
+                          .text_color(sent ? t.dim : AMBER)
+                          .child(tr(`${stats.total} ideas`, `${stats.total} 条`)),
+                      ),
+                    ),
+                )
+                .when(showBodySnippet, (e3) =>
+                  e3.child(
+                    div()
+                      .w_full()
+                      .min_w(0)
+                      .truncate()
+                      .text_size(10.5)
+                      .text_color(t.dim)
+                      .child(bodySnippet),
+                  ),
+                ),
+            )
+            .child(
+              h_flex()
+                .gap(6)
+                .items_center()
+                .text_size(10)
+                .text_color(t.dim)
+                .when(Boolean(timeStr), (e2) => e2.child(div().flex_none().child(timeStr)))
+                .when(stats.partialSent, (e2) =>
+                  e2.child(
+                    div()
+                      .flex_none()
+                      .px(4)
+                      .py(0.5)
+                      .rounded(4)
+                      .bg(withAlpha(accent, "1c") ?? t.raised)
+                      .text_color(accent)
+                      .child(tr(`${stats.sentCount}/${stats.total} sent`, `已发 ${stats.sentCount}/${stats.total}`)),
+                  ),
+                )
+                .when(sent && Boolean(note.sentTo), (e2) =>
+                  e2.child(
+                    div()
+                      .min_w(0)
+                      .truncate()
+                      .px(4)
+                      .py(0.5)
+                      .rounded(4)
+                      .bg(t.raised)
+                      .text_color(t.muted)
+                      .child(tr(`Sent → ${note.sentTo}`, `已发 → ${note.sentTo}`)),
+                  ),
+                ),
+            ),
+        )
+        .when(hovered && !renaming, (e2) =>
+          e2.child(
+            h_flex()
+              .mt(1)
+              .gap(2)
+              .flex_none()
+              .items_center()
+              .child(
+                div()
+                  .id(`fn-rename-${note.id}`)
+                  .p(3)
+                  .flex_none()
+                  .rounded(4)
+                  .text_color(t.dim)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.selected).text_color(t.foreground))
+                  .tooltip(tr("Rename idea", "修改名称"))
+                  .on_mouse_down("left", stop)
+                  .on_click((_e, cx) => {
+                    cx.stop_propagation();
+                    this.startInlineRename(note, cx);
+                  })
+                  .child(svg("mods/workspace-chrome/square-pen.svg").size(11)),
+              )
+              .child(
+                div()
+                  .id(`fn-del-${note.id}`)
+                  .p(3)
+                  .flex_none()
+                  .rounded(4)
+                  .text_color(t.dim)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(t.selected).text_color(t.blocked ?? t.foreground))
+                  .tooltip(tr("Move to recycle bin", "移至回收站"))
+                  .on_mouse_down("left", stop)
+                  .on_click((_e, cx) => {
+                    cx.stop_propagation();
+                    this.trashNote(note.id, cx);
+                  })
+                  .child(svg("mods/pane/trash.svg").size(11)),
+              ),
+          ),
+        );
+    };
+
+    const floatingNote =
+      noteMotion && (notes[noteMotion.from] || noteMotion.note)
+        ? div()
+            .id(`fn-float-${noteMotion.id}`)
+            .absolute()
+            .left(0)
+            .right(0)
+            .top(noteMotion.startTop + (this.noteDrag?.moving ? this.noteDrag.dy : noteMotion.destDy))
+            .spring("top", { response: this.noteDrag?.moving ? 0 : 160, damping: 0.88, epsilon: 0.25 })
+            .child(renderNoteRow(notes[noteMotion.from] ?? noteMotion.note, noteMotion.from, { isFloating: true }))
+        : null;
+
     return v_flex()
+      .relative()
       .id("fn-sidebar")
       .when(Boolean(this.listFocus), (el) => el.track_focus(this.listFocus))
+      .on_mouse_move((e, cx) => this.handleNoteDragMove(e, cx))
+      .on_mouse_up("left", (_e, cx) => {
+        if (this.noteDrag) this.finishNoteDrag(cx);
+      })
       .size_full()
       .min_h(0)
       .bg(t.chrome)
@@ -762,7 +1495,7 @@ export default class FlashNote extends View {
                   .text_color(t.dim)
                   .cursor_pointer()
                   .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                  .tooltip(tr("Capture a flash note", "新建闪念"))
+                  .tooltip(withShortcut(tr("Capture a flash note", "新建闪念"), "mod.open:flash-note"))
                   .on_click(() => openFlashNoteWindow())
                   .child(svg("mods/workspace-chrome/plus.svg").size(13)),
               ),
@@ -813,204 +1546,46 @@ export default class FlashNote extends View {
             .min_h(0)
             .px(8)
             .pb(6)
-            .gap(2)
             .overflow_y_scrollbar()
             .mode("always")
-            .children(
-              notes.map((note) => {
-                const hovered = this.hoveredId === note.id;
-                const renaming = this.renamingId === note.id;
-                const timeStr = formatNoteTime(note.updatedAt || note.createdAt);
-                const sent = Boolean(note.sentTo);
-                const hasCustomTitle = Boolean(note.title);
-                const displayTitle = noteDisplayTitle(note, 64);
-                const bodySnippet = hasCustomTitle ? notePreview(note.text, 56) : "";
-                const showBodySnippet = Boolean(bodySnippet && bodySnippet !== displayTitle);
-                return h_flex()
-                  .id(`fn-item-${note.id}`)
-                  .w_full()
-                  .min_h(36)
-                  .px(8)
-                  .py(5)
-                  .gap(7)
-                  .flex_none()
-                  .items_start()
-                  .rounded(7)
-                  .when(!renaming, (e2) => e2.cursor_pointer().hover((s) => s.bg(t.hover)))
-                  .when(renaming, (e2) => e2.bg(t.raised))
-                  .on_hover((on, cx) => {
-                    if (on) this.hoveredId = note.id;
-                    else if (this.hoveredId === note.id) this.hoveredId = null;
-                    cx.notify();
-                  })
-                  .when(!renaming, (e2) => e2.on_click(() => openFlashNoteWindow(note.id)))
-                  .child(
-                    div()
-                      .mt(5)
-                      .size(6)
-                      .flex_none()
-                      .rounded(3)
-                      .bg(sent ? (t.done ?? t.dim) : AMBER),
-                  )
-                  .child(
-                    v_flex()
-                      .flex_1()
-                      .min_w(0)
-                      .gap(2)
-                      .when(renaming, (e2) =>
-                        e2.child(
-                          h_flex()
-                            .id(`fn-rename-wrap-${note.id}`)
-                            .w_full()
-                            .gap(4)
-                            .items_center()
-                            .on_mouse_down("left", stop)
-                            .on_click(stop)
-                            .on_key_down((e, cx) => {
-                              if (e?.key === "escape") {
-                                cx.stop_propagation();
-                                this.cancelInlineRename(cx);
-                              }
-                            })
-                            .child(
-                              Input.new(this.renameInput)
-                                .id(`fn-rename-input-${note.id}`)
-                                .flex_1()
-                                .min_w(0)
-                                .h(22)
-                                .px(6)
-                                .rounded(4)
-                                .border_1()
-                                .border_color(accent)
-                                .bg(t.background)
-                                .text_size(11.5)
-                                .text_color(t.foreground),
-                            )
-                            .child(
-                              div()
-                                .id(`fn-rename-ok-${note.id}`)
-                                .p(3)
-                                .flex_none()
-                                .rounded(4)
-                                .text_color(accent)
-                                .cursor_pointer()
-                                .hover((s) => s.bg(t.hover))
-                                .tooltip(tr("Save name", "保存名称"))
-                                .on_mouse_down("left", (_e, cx) => {
-                                  cx.stop_propagation();
-                                  this.commitInlineRename(cx);
-                                })
-                                .child(svg("mods/workspace-chrome/check.svg").size(11)),
-                            )
-                            .child(
-                              div()
-                                .id(`fn-rename-cancel-${note.id}`)
-                                .p(3)
-                                .flex_none()
-                                .rounded(4)
-                                .text_color(t.dim)
-                                .cursor_pointer()
-                                .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                                .tooltip(tr("Cancel", "取消"))
-                                .on_mouse_down("left", (_e, cx) => {
-                                  cx.stop_propagation();
-                                  this.cancelInlineRename(cx);
-                                })
-                                .child(svg("mods/workspace-chrome/x.svg").size(11)),
-                            ),
-                        ),
-                      )
-                      .when(!renaming, (e2) =>
-                        e2
-                          .child(
-                            div()
-                              .w_full()
-                              .min_w(0)
-                              .truncate()
-                              .text_size(12)
-                              .when(hasCustomTitle, (x) => x.font_medium())
-                              .text_color(sent ? t.muted : t.foreground)
-                              .child(displayTitle),
-                          )
-                          .when(showBodySnippet, (e3) =>
-                            e3.child(
-                              div()
-                                .w_full()
-                                .min_w(0)
-                                .truncate()
-                                .text_size(10.5)
-                                .text_color(t.dim)
-                                .child(bodySnippet),
-                            ),
-                          ),
-                      )
-                      .child(
-                        h_flex()
-                          .gap(6)
-                          .items_center()
-                          .text_size(10)
-                          .text_color(t.dim)
-                          .when(Boolean(timeStr), (e2) => e2.child(div().flex_none().child(timeStr)))
-                          .when(sent, (e2) =>
-                            e2.child(
-                              div()
-                                .min_w(0)
-                                .truncate()
-                                .px(4)
-                                .py(0.5)
-                                .rounded(4)
-                                .bg(t.raised)
-                                .text_color(t.muted)
-                                .child(tr(`Sent → ${note.sentTo}`, `已发 → ${note.sentTo}`)),
-                            ),
-                          ),
-                      ),
-                  )
-                  .when(hovered && !renaming, (e2) =>
-                    e2.child(
-                      h_flex()
-                        .mt(1)
-                        .gap(2)
-                        .flex_none()
-                        .items_center()
-                        .child(
-                          div()
-                            .id(`fn-rename-${note.id}`)
-                            .p(3)
-                            .flex_none()
-                            .rounded(4)
-                            .text_color(t.dim)
-                            .cursor_pointer()
-                            .hover((s) => s.bg(t.selected).text_color(t.foreground))
-                            .tooltip(tr("Rename idea", "修改名称"))
-                            .on_mouse_down("left", stop)
-                            .on_click((_e, cx) => {
-                              cx.stop_propagation();
-                              this.startInlineRename(note, cx);
-                            })
-                            .child(svg("mods/workspace-chrome/square-pen.svg").size(11)),
-                        )
-                        .child(
-                          div()
-                            .id(`fn-del-${note.id}`)
-                            .p(3)
-                            .flex_none()
-                            .rounded(4)
-                            .text_color(t.dim)
-                            .cursor_pointer()
-                            .hover((s) => s.bg(t.selected).text_color(t.blocked ?? t.foreground))
-                            .tooltip(tr("Move to recycle bin", "移至回收站"))
-                            .on_mouse_down("left", stop)
-                            .on_click((_e, cx) => {
-                              cx.stop_propagation();
-                              this.trashNote(note.id, cx);
-                            })
-                            .child(svg("mods/pane/trash.svg").size(11)),
-                        ),
-                    ),
-                  );
-              }),
+            .child(
+              v_flex()
+                .id("fn-list-track")
+                .relative()
+                .w_full()
+                .flex_none()
+                .gap(2)
+                .children(
+                  notes.map((note, idx) => {
+                    const isHiddenSource = Boolean(noteMotion && noteMotion.from === idx);
+                    let shift = 0;
+                    if (noteMotion && idx !== noteMotion.from) {
+                      if (noteMotion.from < noteMotion.to && idx > noteMotion.from && idx <= noteMotion.to) {
+                        shift = -(noteMotion.dragHeight + 2);
+                      } else if (noteMotion.from > noteMotion.to && idx >= noteMotion.to && idx < noteMotion.from) {
+                        shift = noteMotion.dragHeight + 2;
+                      }
+                    }
+                    return renderNoteRow(note, idx, { shift, isHiddenSource });
+                  }),
+                )
+                .when(Boolean(floatingNote), (x) => x.child(floatingNote)),
             ),
+        ),
+      )
+      .when(Boolean(this.noteDrag?.moving), (el) =>
+        el.child(
+          div()
+            .id("fn-drag-shield")
+            .absolute()
+            .inset(0)
+            .bg("#00000000")
+            .cursor_grabbing()
+            .on_mouse_move((e, cx) => this.handleNoteDragMove(e, cx))
+            .on_mouse_up("left", (_e, cx) => {
+              cx.stop_propagation();
+              this.finishNoteDrag(cx);
+            }),
         ),
       );
   }
@@ -1107,9 +1682,11 @@ export default class FlashNote extends View {
             .children(
               list.map((it) => {
                 const displayTitle = noteDisplayTitle(it, 44);
-                const bodySnippet = it.title ? notePreview(it.text, 36) : "";
+                const stats = noteEntryStats(it);
+                const bodySnippet = it.title ? notePreview(it.entries?.[0]?.text ?? it.text, 36) : "";
                 const age = it.trashedAt ? formatTrashAge(it.trashedAt, now) : "";
                 const meta = [
+                  stats.isGroup ? tr(`${stats.total} ideas`, `${stats.total} 条闪念`) : "",
                   bodySnippet && bodySnippet !== displayTitle ? bodySnippet : "",
                   it.sentTo ? tr(`Sent → ${it.sentTo}`, `已发 → ${it.sentTo}`) : "",
                   age ? tr(`Deleted ${age} ago`, `${age} 前删除`) : "",
@@ -1224,13 +1801,7 @@ export default class FlashNote extends View {
     if (requestedNoteId !== this.lastPropNoteId) {
       this.lastPropNoteId = requestedNoteId;
       const found = requestedNoteId ? this.savedNotes().find((n) => n.id === requestedNoteId) ?? null : null;
-      this.editingNoteId = found?.id ?? null;
-      this.titleInput?.set_value?.(found?.title ?? "");
-      this.input?.set_value?.(found?.text ?? "");
-      this.polishUndoText = null;
-      this.polishSummary = null;
-      this.polishing = false;
-      this.error = null;
+      this.loadNoteIntoComposer(found, false);
     }
 
     const accent = t.accent ?? "#3b82f6";
@@ -1240,10 +1811,19 @@ export default class FlashNote extends View {
     const chosenPreset = this.chosenPreset();
     const spaceList = spaces();
     const chosenSpace = this.activeSpace();
-    const text = String(this.input?.value?.() ?? "").trim();
-    const hasText = text.length > 0;
+    const nonEmptyEntries = this.collectNonEmptyEntries();
+    const nonEmptyCount = nonEmptyEntries.length;
+    const selectedNonEmpty = nonEmptyEntries.filter((e) => e.selected);
+    const selectedCount = selectedNonEmpty.length;
+    const unsentCount = nonEmptyEntries.filter((e) => !e.sentTo).length;
+    const hasPartialSent = unsentCount > 0 && unsentCount < nonEmptyCount;
+    const isMultiEntry = this.entryStates.length > 1;
+    const hasMultiNonEmpty = nonEmptyCount > 1;
+    const targetEntries = this.collectTargetEntries();
+    const hasText = nonEmptyCount > 0;
+    const targetReady = this.targetMode === "new" ? Boolean(chosenPreset) : Boolean(chosenExisting);
     const isWorkingAcp = Boolean(this.targetMode === "existing" && chosenExisting?.kind === "acp" && chosenExisting?.status === "working");
-    const canSend = hasText && !this.busy && (this.targetMode === "new" ? Boolean(chosenPreset) : Boolean(chosenExisting));
+    const canSend = targetEntries.length > 0 && !this.busy && targetReady;
     const statusColor = (st) => (st === "working" ? (t.working ?? "#3b82f6") : st === "blocked" ? (t.blocked ?? "#ef4444") : st === "done" ? (t.done ?? "#22c55e") : t.dim);
 
     const modeTab = (id, mode, label) => {
@@ -1542,7 +2122,24 @@ export default class FlashNote extends View {
               .font_semibold()
               .text_size(13)
               .text_color(t.foreground)
-              .child(this.editingNoteId ? tr("Edit Flash Note", "编辑闪念") : tr("Flash Note", "闪念")),
+              .child(
+                isMultiEntry
+                  ? (this.editingNoteId ? tr("Edit Flash Group", "编辑闪念组") : tr("Flash Note Group", "闪念组"))
+                  : (this.editingNoteId ? tr("Edit Flash Note", "编辑闪念") : tr("Flash Note", "闪念")),
+              ),
+          )
+          .when(isMultiEntry, (el) =>
+            el.child(
+              div()
+                .px(5)
+                .py(0.5)
+                .rounded(999)
+                .bg(withAlpha(AMBER, "22"))
+                .text_size(10)
+                .font_semibold()
+                .text_color(AMBER)
+                .child(tr(`${this.entryStates.length} ideas`, `${this.entryStates.length} 条`)),
+            ),
           )
           .child(
             div()
@@ -1551,7 +2148,7 @@ export default class FlashNote extends View {
               .truncate()
               .text_size(11)
               .text_color(t.dim)
-              .child(tr("Drag to move · Save or dispatch to an agent", "可拖动 · 保存到清单或发送给 Agent")),
+              .child(tr("Record multiple ideas · Send selected or whole group", "可记录多条闪念 · 支持单条/多选或整组发送")),
           )
           .child(
             div()
@@ -1606,7 +2203,101 @@ export default class FlashNote extends View {
                   .text_color(t.foreground),
               ),
           )
-          .when(this.polishUndoText != null, (el) =>
+          .child(
+            h_flex()
+              .id("fn-group-bar")
+              .w_full()
+              .px(2)
+              .gap(6)
+              .flex_none()
+              .items_center()
+              .justify_between()
+              .on_mouse_down("left", stop)
+              .child(
+                h_flex()
+                  .gap(5)
+                  .items_center()
+                  .min_w(0)
+                  .child(
+                    div()
+                      .text_size(11)
+                      .font_medium()
+                      .text_color(t.muted)
+                      .child(
+                        isMultiEntry
+                          ? tr(`Ideas (${selectedCount}/${nonEmptyCount} selected)`, `闪念条目（已选 ${selectedCount}/${nonEmptyCount}）`)
+                          : tr("Idea", "闪念内容"),
+                      ),
+                  )
+                  .when(isMultiEntry, (e2) =>
+                    e2
+                      .child(
+                        div()
+                          .id("fn-select-all")
+                          .px(5)
+                          .py(1)
+                          .rounded(4)
+                          .text_size(10.5)
+                          .text_color(selectedCount === nonEmptyCount && nonEmptyCount > 0 ? accent : t.dim)
+                          .cursor_pointer()
+                          .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                          .on_click((_e, cx) => this.selectEntries("all", cx))
+                          .child(tr("All", "全选")),
+                      )
+                      .when(hasPartialSent, (e3) =>
+                        e3.child(
+                          div()
+                            .id("fn-select-unsent")
+                            .px(5)
+                            .py(1)
+                            .rounded(4)
+                            .text_size(10.5)
+                            .text_color(t.dim)
+                            .cursor_pointer()
+                            .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                            .on_click((_e, cx) => this.selectEntries("unsent", cx))
+                            .child(tr("Unsent", "仅未发")),
+                        ),
+                      )
+                      .child(
+                        div()
+                          .id("fn-select-none")
+                          .px(5)
+                          .py(1)
+                          .rounded(4)
+                          .text_size(10.5)
+                          .text_color(t.dim)
+                          .cursor_pointer()
+                          .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                          .on_click((_e, cx) => this.selectEntries("none", cx))
+                          .child(tr("Clear", "取消勾选")),
+                      ),
+                  ),
+              )
+              .child(
+                h_flex()
+                  .id("fn-add-entry")
+                  .h(22)
+                  .px(7)
+                  .gap(4)
+                  .flex_none()
+                  .items_center()
+                  .rounded(5)
+                  .bg(withAlpha(accent, "18") ?? t.raised)
+                  .border_1()
+                  .border_color(withAlpha(accent, "44") ?? t.border)
+                  .text_size(11)
+                  .font_medium()
+                  .text_color(accent)
+                  .cursor_pointer()
+                  .hover((s) => s.bg(withAlpha(accent, "28") ?? t.hover))
+                  .tooltip(tr("Add another flash note input to this group", "在当前闪念组中新增一个输入区域"))
+                  .on_click((_e, cx) => this.addEntry(cx))
+                  .child(svg("mods/workspace-chrome/plus.svg").size(11))
+                  .child(tr("Add Idea", "添加闪念")),
+              ),
+          )
+          .when(this.polishUndoText != null && !isMultiEntry, (el) =>
             el.child(
               h_flex()
                 .id("fn-polish-banner")
@@ -1644,32 +2335,261 @@ export default class FlashNote extends View {
                     .text_color(t.muted)
                     .cursor_pointer()
                     .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                    .on_click((_e, cx) => this.revertPolish(cx))
-                    .child(tr("↩ Undo", "↩ 还原")),
+                    .tooltip(withShortcut(tr("Undo last polish and restore original input", "撤销本次润色并恢复润色前的内容"), "prompt.polish_undo"))
+                    .on_mouse_down("left", stop)
+                    .on_click((_e, cx) => {
+                      cx.stop_propagation();
+                      this.revertPolish(cx);
+                    })
+                    .child(tr("↩ Undo", "↩ 反悔恢复")),
                 ),
             ),
           )
           .child(
-            div()
-              .id("fn-input-wrap")
+            v_flex()
+              .id("fn-entries-list")
               .flex_1()
-              .min_h(90)
+              .min_h(100)
               .w_full()
-              .px(10)
-              .py(8)
-              .rounded(8)
-              .bg(t.background)
-              .border_1()
-              .border_color(this.inputFocused ? accent : t.border)
-              .cursor_text()
+              .gap(8)
+              .overflow_y_scrollbar()
               .on_mouse_down("left", stop)
-              .on_click(() => this.input?.focus?.())
-              .child(
-                Textarea.new(this.input)
-                  .size_full()
-                  .text_size(13)
-                  .line_height("20px")
-                  .text_color(t.foreground),
+              .children(
+                this.entryStates.map((entry, idx) => {
+                  const isActive = idx === this.activeEntryIndex;
+                  const val = String(entry.input?.value?.() ?? "").trim();
+                  const entryHasText = val.length > 0;
+                  const canQuickSend = entryHasText && !this.busy && targetReady;
+                  const checked = Boolean(entry.selected);
+                  const borderCol = entry.focused
+                    ? accent
+                    : (isMultiEntry && checked && this.sendScope === "selected" ? withAlpha(accent, "66") : t.border);
+
+                  return v_flex()
+                    .id(isActive ? "fn-input-wrap" : `fn-entry-card-${idx}`)
+                    .w_full()
+                    .when(!isMultiEntry, (el) => el.flex_1().min_h(90))
+                    .when(isMultiEntry, (el) => el.flex_none())
+                    .rounded(8)
+                    .overflow_hidden()
+                    .bg(t.background)
+                    .border_1()
+                    .border_color(borderCol)
+                    .when(isMultiEntry, (card) =>
+                      card.child(
+                        h_flex()
+                          .id(`fn-entry-hdr-${idx}`)
+                          .h(26)
+                          .px(8)
+                          .gap(6)
+                          .flex_none()
+                          .items_center()
+                          .justify_between()
+                          .bg(isActive ? (withAlpha(accent, "10") ?? t.surface) : (t.surface ?? t.raised))
+                          .border_b(1)
+                          .border_color(t.border)
+                          .child(
+                            h_flex()
+                              .gap(6)
+                              .items_center()
+                              .min_w(0)
+                              .flex_1()
+                              .child(
+                                div()
+                                  .id(`fn-entry-check-${idx}`)
+                                  .size(14)
+                                  .flex_none()
+                                  .flex()
+                                  .items_center()
+                                  .justify_center()
+                                  .rounded(3.5)
+                                  .border_1()
+                                  .border_color(checked ? accent : t.border)
+                                  .bg(checked ? accent : t.background)
+                                  .cursor_pointer()
+                                  .tooltip(checked ? tr("Selected for sending", "已勾选，发送时包含此条") : tr("Click to include when sending selected", "勾选以便选择发送此条"))
+                                  .on_mouse_down("left", stop)
+                                  .on_click((_e, cx) => {
+                                    cx.stop_propagation();
+                                    this.toggleEntrySelected(idx, cx);
+                                  })
+                                  .when(checked, (ck) =>
+                                    ck.child(svg("mods/workspace-chrome/check.svg").size(9.5).text_color(t.solid_foreground ?? "#ffffff")),
+                                  ),
+                              )
+                              .child(
+                                div()
+                                  .flex_none()
+                                  .text_size(10.5)
+                                  .font_semibold()
+                                  .text_color(isActive ? accent : t.muted)
+                                  .child(`#${idx + 1}`),
+                              )
+                              .when(Boolean(entry.sentTo), (s) =>
+                                s.child(
+                                  div()
+                                    .min_w(0)
+                                    .truncate()
+                                    .px(5)
+                                    .py(0.5)
+                                    .rounded(4)
+                                    .bg(t.raised)
+                                    .text_size(9.5)
+                                    .text_color(t.done ?? t.muted)
+                                    .child(tr(`Sent → ${entry.sentTo}`, `已发 → ${entry.sentTo}`)),
+                                ),
+                              ),
+                          )
+                          .child(
+                            h_flex()
+                              .gap(3)
+                              .flex_none()
+                              .items_center()
+                              .when(entryHasText, (e2) =>
+                                e2.child(
+                                  h_flex()
+                                    .id(`fn-entry-send-${idx}`)
+                                    .h(18)
+                                    .px(5)
+                                    .gap(3)
+                                    .items_center()
+                                    .rounded(4)
+                                    .bg(canQuickSend ? withAlpha(accent, "1a") : t.raised)
+                                    .text_size(10)
+                                    .font_medium()
+                                    .text_color(canQuickSend ? accent : t.dim)
+                                    .when(canQuickSend, (b) =>
+                                      b
+                                        .cursor_pointer()
+                                        .hover((st) => st.bg(withAlpha(accent, "2c")))
+                                        .on_mouse_down("left", stop)
+                                        .on_click((_e, cx) => {
+                                          cx.stop_propagation();
+                                          this.sendSingleEntry(idx, cx);
+                                        }),
+                                    )
+                                    .tooltip(tr("Send only this flash note to the selected agent", "仅将此条闪念发给当前目标 Agent"))
+                                    .child(svg("mods/peek/arrow-up.svg").size(9.5))
+                                    .child(tr("Send", "发此条")),
+                                ),
+                              )
+                              .child(
+                                div()
+                                  .id(`fn-entry-del-${idx}`)
+                                  .size(18)
+                                  .flex()
+                                  .items_center()
+                                  .justify_center()
+                                  .rounded(4)
+                                  .text_color(t.dim)
+                                  .cursor_pointer()
+                                  .hover((st) => st.bg(t.hover).text_color(t.blocked ?? t.foreground))
+                                  .tooltip(tr("Remove this input area", "删除此闪念输入区"))
+                                  .on_mouse_down("left", stop)
+                                  .on_click((_e, cx) => {
+                                    cx.stop_propagation();
+                                    this.removeEntry(idx, cx);
+                                  })
+                                  .child(svg("mods/workspace-chrome/x.svg").size(10.5)),
+                              ),
+                          ),
+                      ),
+                    )
+                    .when(isMultiEntry && entry.polishUndoText != null, (card) =>
+                      card.child(
+                        h_flex()
+                          .id(`fn-polish-banner-${idx}`)
+                          .w_full()
+                          .px(8)
+                          .py(3)
+                          .gap(6)
+                          .flex_none()
+                          .items_center()
+                          .bg(withAlpha("#a855f7", "14"))
+                          .border_b(1)
+                          .border_color(withAlpha("#a855f7", "33"))
+                          .child(svg("mods/peek/sparkles.svg").size(10.5).flex_none().text_color("#a855f7"))
+                          .child(
+                            div()
+                              .flex_1()
+                              .min_w(0)
+                              .truncate()
+                              .text_size(10.5)
+                              .text_color(t.foreground)
+                              .child(entry.polishSummary ? tr(`Polished · ${entry.polishSummary}`, `已润色 · ${entry.polishSummary}`) : tr("Polished by AI", "已由 AI 润色")),
+                          )
+                          .child(
+                            div()
+                              .id(`fn-polish-undo-${idx}`)
+                              .flex_none()
+                              .px(5)
+                              .py(0.5)
+                              .rounded(4)
+                              .bg(t.background)
+                              .border_1()
+                              .border_color(t.border)
+                              .text_size(10)
+                              .text_color(t.muted)
+                              .cursor_pointer()
+                              .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                              .tooltip(withShortcut(tr("Undo last polish and restore original input", "撤销本次润色并恢复润色前的内容"), "prompt.polish_undo"))
+                              .on_mouse_down("left", stop)
+                              .on_click((_e, cx) => {
+                                cx.stop_propagation();
+                                this.revertPolish(cx, idx);
+                              })
+                              .child(tr("↩ Undo", "↩ 反悔恢复")),
+                          ),
+                      ),
+                    )
+                    .child(
+                      div()
+                        .id(`fn-entry-input-${idx}`)
+                        .w_full()
+                        .when(!isMultiEntry, (el) => el.flex_1().min_h(84))
+                        .when(isMultiEntry, (el) => el.min_h(62))
+                        .px(10)
+                        .py(7)
+                        .cursor_text()
+                        .on_mouse_down("left", stop)
+                        .on_click(() => {
+                          this.activeEntryIndex = idx;
+                          entry.input?.focus?.();
+                        })
+                        .child(
+                          Textarea.new(entry.input)
+                            .when(!isMultiEntry, (el) => el.size_full())
+                            .when(isMultiEntry, (el) => el.w_full().min_h(48))
+                            .text_size(12.5)
+                            .line_height("19px")
+                            .text_color(t.foreground),
+                        ),
+                    );
+                }),
+              )
+              .when(isMultiEntry, (listEl) =>
+                listEl.child(
+                  h_flex()
+                    .id("fn-add-entry-bottom")
+                    .w_full()
+                    .h(28)
+                    .px(10)
+                    .gap(5)
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .rounded(7)
+                    .border_1()
+                    .border_color(t.border)
+                    .bg(t.surface ?? t.raised)
+                    .text_size(11)
+                    .text_color(t.muted)
+                    .cursor_pointer()
+                    .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                    .on_click((_e, cx) => this.addEntry(cx))
+                    .child(svg("mods/workspace-chrome/plus.svg").size(11))
+                    .child(tr("Add another flash note", "再添加一条闪念")),
+                ),
               ),
           )
           // Dispatch target selector card
@@ -1684,6 +2604,70 @@ export default class FlashNote extends View {
               .border_1()
               .border_color(t.border)
               .on_mouse_down("left", stop)
+              .when(hasMultiNonEmpty, (el) =>
+                el.child(
+                  h_flex()
+                    .id("fn-send-scope")
+                    .w_full()
+                    .gap(6)
+                    .items_center()
+                    .child(
+                      div()
+                        .flex_none()
+                        .text_size(11)
+                        .text_color(t.dim)
+                        .child(tr("Scope", "发送范围")),
+                    )
+                    .child(
+                      h_flex()
+                        .id("fn-scope-all")
+                        .flex_1()
+                        .h(24)
+                        .px(8)
+                        .items_center()
+                        .justify_center()
+                        .rounded(5)
+                        .border_1()
+                        .border_color(this.sendScope === "all" ? accent : t.border)
+                        .bg(this.sendScope === "all" ? (withAlpha(accent, "1f") ?? t.selected) : t.background)
+                        .text_size(11)
+                        .when(this.sendScope === "all", (x) => x.font_semibold())
+                        .text_color(this.sendScope === "all" ? t.foreground : t.muted)
+                        .cursor_pointer()
+                        .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                        .on_click((_e, cx) => {
+                          this.sendScope = "all";
+                          this.error = null;
+                          cx.notify();
+                        })
+                        .child(tr(`Whole Group (${nonEmptyCount})`, `整组发送 (${nonEmptyCount})`)),
+                    )
+                    .child(
+                      h_flex()
+                        .id("fn-scope-selected")
+                        .flex_1()
+                        .h(24)
+                        .px(8)
+                        .items_center()
+                        .justify_center()
+                        .rounded(5)
+                        .border_1()
+                        .border_color(this.sendScope === "selected" ? accent : t.border)
+                        .bg(this.sendScope === "selected" ? (withAlpha(accent, "1f") ?? t.selected) : t.background)
+                        .text_size(11)
+                        .when(this.sendScope === "selected", (x) => x.font_semibold())
+                        .text_color(this.sendScope === "selected" ? t.foreground : t.muted)
+                        .cursor_pointer()
+                        .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                        .on_click((_e, cx) => {
+                          this.sendScope = "selected";
+                          this.error = null;
+                          cx.notify();
+                        })
+                        .child(tr(`Selected (${selectedCount}/${nonEmptyCount})`, `发送已选 (${selectedCount}/${nonEmptyCount})`)),
+                    ),
+                ),
+              )
               .child(
                 h_flex()
                   .w_full()
@@ -2148,7 +3132,7 @@ export default class FlashNote extends View {
               .font_medium()
               .text_color(canPolish || this.polishing ? purple : t.dim)
               .when(canPolish, (e) => e.cursor_pointer().hover((s) => s.bg(withAlpha(purple, "2c"))).on_click((_e, cx) => this.polishIdea(cx)))
-              .tooltip(tr("Polish prompt with Core AI for clarity", "使用 Core AI 润色提示词，让表达更清晰"))
+              .tooltip(withShortcut(tr("Polish prompt with Core AI for clarity", "使用 Core AI 润色提示词，让表达更清晰"), "prompt.polish"))
               .child(
                 this.polishing
                   ? svg("mods/workspace-chrome/spinner.svg").size(11.5).spin(900).text_color(purple)
@@ -2171,7 +3155,11 @@ export default class FlashNote extends View {
               .font_medium()
               .text_color(hasText ? t.foreground : t.dim)
               .when(hasText && !this.busy, (e) => e.cursor_pointer().hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.saveIdea(cx)))
-              .child(this.editingNoteId ? tr("Update", "保存修改") : tr("Save", "保存到清单")),
+              .child(
+                hasMultiNonEmpty
+                  ? (this.editingNoteId ? tr(`Update Group (${nonEmptyCount})`, `保存闪念组 (${nonEmptyCount})`) : tr(`Save Group (${nonEmptyCount})`, `保存闪念组 (${nonEmptyCount})`))
+                  : (this.editingNoteId ? tr("Update", "保存修改") : tr("Save", "保存到清单")),
+              ),
           )
           .child(
             h_flex()
@@ -2190,9 +3178,17 @@ export default class FlashNote extends View {
               .child(
                 this.busy
                   ? tr("Sending…", "发送中…")
-                  : this.targetMode === "new"
-                    ? tr("Start & Send", "新建并发送")
-                    : tr("Send", "发送给 Agent"),
+                  : hasMultiNonEmpty
+                    ? (this.sendScope === "all"
+                        ? (this.targetMode === "new"
+                            ? tr(`Start & Send Group (${nonEmptyCount})`, `新建并整组发送 (${nonEmptyCount})`)
+                            : tr(`Send Group (${nonEmptyCount})`, `整组发送 (${nonEmptyCount})`))
+                        : (this.targetMode === "new"
+                            ? tr(`Start & Send (${targetEntries.length})`, `新建并发送已选 (${targetEntries.length})`)
+                            : tr(`Send Selected (${targetEntries.length})`, `发送已选 (${targetEntries.length})`)))
+                    : (this.targetMode === "new"
+                        ? tr("Start & Send", "新建并发送")
+                        : tr("Send", "发送给 Agent")),
               ),
           ),
       );

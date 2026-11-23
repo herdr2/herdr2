@@ -72,8 +72,7 @@ fn read_message<R: BufRead>(reader: &mut R, hint: Option<Framing>) -> io::Result
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing Content-Length header"))?;
             let mut buf = vec![0u8; len];
             reader.read_exact(&mut buf)?;
-            let val: Value =
-                serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let val: Value = serde_json::from_slice(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             return Ok(Some((val, Framing::ContentLength)));
         }
         let val: Value = serde_json::from_str(trimmed).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -112,8 +111,7 @@ fn handle_json_rpc(msg: Value, call: &impl Fn(&str, Value) -> Result<Value, RpcE
 
     let result = match method {
         Some("initialize") => {
-            let protocol =
-                params.get("protocolVersion").and_then(Value::as_str).unwrap_or("2024-11-05");
+            let protocol = params.get("protocolVersion").and_then(Value::as_str).unwrap_or("2024-11-05");
             json!({
                 "protocolVersion": protocol,
                 "capabilities": { "tools": {} },

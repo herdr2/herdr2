@@ -75,10 +75,34 @@ pub fn default_roles() -> BTreeMap<String, RoleConfig> {
             summary: Some("核心功能实现、模块重构与 Bug 修复".into()),
             access: Some(RoleAccessMode::Writable),
             allowed_paths: Vec::new(),
-            primary: RoleTarget { agent: "agy".into(), model: None, effort: Effort::High, fast: false, context: None, strengths: Vec::new() },
+            primary: RoleTarget {
+                agent: "agy".into(),
+                model: None,
+                effort: Effort::High,
+                fast: false,
+                context: None,
+                strengths: Vec::new(),
+                note: None,
+            },
             fallbacks: vec![
-                RoleTarget { agent: "claude".into(), model: None, effort: Effort::High, fast: false, context: None, strengths: Vec::new() },
-                RoleTarget { agent: "codex".into(), model: None, effort: Effort::High, fast: false, context: None, strengths: Vec::new() },
+                RoleTarget {
+                    agent: "claude".into(),
+                    model: None,
+                    effort: Effort::High,
+                    fast: false,
+                    context: None,
+                    strengths: Vec::new(),
+                    note: None,
+                },
+                RoleTarget {
+                    agent: "codex".into(),
+                    model: None,
+                    effort: Effort::High,
+                    fast: false,
+                    context: None,
+                    strengths: Vec::new(),
+                    note: None,
+                },
             ],
             prompt: None,
         },
@@ -98,8 +122,24 @@ pub fn default_roles() -> BTreeMap<String, RoleConfig> {
                 "**/fixtures/**".into(),
                 "**/testdata/**".into(),
             ],
-            primary: RoleTarget { agent: "dsh".into(), model: None, effort: Effort::Medium, fast: false, context: None, strengths: Vec::new() },
-            fallbacks: vec![RoleTarget { agent: "agy".into(), model: None, effort: Effort::Medium, fast: false, context: None, strengths: Vec::new() }],
+            primary: RoleTarget {
+                agent: "dsh".into(),
+                model: None,
+                effort: Effort::Medium,
+                fast: false,
+                context: None,
+                strengths: Vec::new(),
+                note: None,
+            },
+            fallbacks: vec![RoleTarget {
+                agent: "agy".into(),
+                model: None,
+                effort: Effort::Medium,
+                fast: false,
+                context: None,
+                strengths: Vec::new(),
+                note: None,
+            }],
             prompt: None,
         },
     );
@@ -120,8 +160,24 @@ pub fn default_roles() -> BTreeMap<String, RoleConfig> {
                 "**/*.mmd".into(),
                 "**/*.puml".into(),
             ],
-            primary: RoleTarget { agent: "agy".into(), model: None, effort: Effort::Medium, fast: false, context: None, strengths: Vec::new() },
-            fallbacks: vec![RoleTarget { agent: "claude".into(), model: None, effort: Effort::Medium, fast: false, context: None, strengths: Vec::new() }],
+            primary: RoleTarget {
+                agent: "agy".into(),
+                model: None,
+                effort: Effort::Medium,
+                fast: false,
+                context: None,
+                strengths: Vec::new(),
+                note: None,
+            },
+            fallbacks: vec![RoleTarget {
+                agent: "claude".into(),
+                model: None,
+                effort: Effort::Medium,
+                fast: false,
+                context: None,
+                strengths: Vec::new(),
+                note: None,
+            }],
             prompt: None,
         },
     );
@@ -149,10 +205,34 @@ pub fn default_roles() -> BTreeMap<String, RoleConfig> {
                 "**/*.html".into(),
                 "**/*.md".into(),
             ],
-            primary: RoleTarget { agent: "agy".into(), model: None, effort: Effort::High, fast: false, context: None, strengths: Vec::new() },
+            primary: RoleTarget {
+                agent: "agy".into(),
+                model: None,
+                effort: Effort::High,
+                fast: false,
+                context: None,
+                strengths: Vec::new(),
+                note: None,
+            },
             fallbacks: vec![
-                RoleTarget { agent: "claude".into(), model: None, effort: Effort::High, fast: false, context: None, strengths: Vec::new() },
-                RoleTarget { agent: "gemini".into(), model: None, effort: Effort::High, fast: false, context: None, strengths: Vec::new() },
+                RoleTarget {
+                    agent: "claude".into(),
+                    model: None,
+                    effort: Effort::High,
+                    fast: false,
+                    context: None,
+                    strengths: Vec::new(),
+                    note: None,
+                },
+                RoleTarget {
+                    agent: "gemini".into(),
+                    model: None,
+                    effort: Effort::High,
+                    fast: false,
+                    context: None,
+                    strengths: Vec::new(),
+                    note: None,
+                },
             ],
             prompt: None,
         },
@@ -164,8 +244,24 @@ pub fn default_roles() -> BTreeMap<String, RoleConfig> {
             summary: Some("只读异构代码审查、并发安全与架构审计".into()),
             access: Some(RoleAccessMode::Readonly),
             allowed_paths: Vec::new(),
-            primary: RoleTarget { agent: "codex".into(), model: None, effort: Effort::High, fast: false, context: None, strengths: Vec::new() },
-            fallbacks: vec![RoleTarget { agent: "agy".into(), model: None, effort: Effort::High, fast: false, context: None, strengths: Vec::new() }],
+            primary: RoleTarget {
+                agent: "codex".into(),
+                model: None,
+                effort: Effort::High,
+                fast: false,
+                context: None,
+                strengths: Vec::new(),
+                note: None,
+            },
+            fallbacks: vec![RoleTarget {
+                agent: "agy".into(),
+                model: None,
+                effort: Effort::High,
+                fast: false,
+                context: None,
+                strengths: Vec::new(),
+                note: None,
+            }],
             prompt: None,
         },
     );
@@ -176,8 +272,24 @@ pub fn default_roles() -> BTreeMap<String, RoleConfig> {
             summary: Some("跨仓源码检索、架构摸底与日志分析".into()),
             access: Some(RoleAccessMode::Readonly),
             allowed_paths: Vec::new(),
-            primary: RoleTarget { agent: "dsh".into(), model: None, effort: Effort::High, fast: false, context: None, strengths: Vec::new() },
-            fallbacks: vec![RoleTarget { agent: "agy".into(), model: None, effort: Effort::High, fast: false, context: None, strengths: Vec::new() }],
+            primary: RoleTarget {
+                agent: "dsh".into(),
+                model: None,
+                effort: Effort::High,
+                fast: false,
+                context: None,
+                strengths: Vec::new(),
+                note: None,
+            },
+            fallbacks: vec![RoleTarget {
+                agent: "agy".into(),
+                model: None,
+                effort: Effort::High,
+                fast: false,
+                context: None,
+                strengths: Vec::new(),
+                note: None,
+            }],
             prompt: None,
         },
     );
@@ -190,6 +302,7 @@ impl Default for DroveConfig {
             version: 1,
             updated_at: now_iso(),
             max_concurrency_default: 4,
+            note: None,
             roles: default_roles(),
             ai: AiSettings::default(),
             magpie: MagpieSettings::default(),
@@ -287,6 +400,7 @@ pub fn validate_config(cfg: &mut DroveConfig) -> Result<(), RpcError> {
     if cfg.roles.is_empty() {
         return Err(RpcError::invalid_params("roles cannot be empty"));
     }
+    cfg.note = normalize_note(cfg.note.as_deref(), 1000);
     for (id, role) in &mut cfg.roles {
         validate_role_id(id)?;
         role.primary.agent = role.primary.agent.trim().to_string();
@@ -294,17 +408,30 @@ pub fn validate_config(cfg: &mut DroveConfig) -> Result<(), RpcError> {
             return Err(RpcError::invalid_params(format!("role {id}: primary.agent cannot be empty")));
         }
         role.primary.strengths = normalize_strengths(&role.primary.strengths);
+        role.primary.note = normalize_note(role.primary.note.as_deref(), 400);
         for fb in &mut role.fallbacks {
             fb.agent = fb.agent.trim().to_string();
             if fb.agent.is_empty() {
                 return Err(RpcError::invalid_params(format!("role {id}: fallback agent cannot be empty")));
             }
             fb.strengths = normalize_strengths(&fb.strengths);
+            fb.note = normalize_note(fb.note.as_deref(), 400);
         }
     }
     cfg.version = 1;
     cfg.updated_at = now_iso();
     Ok(())
+}
+
+/// Trims and caps a free-form routing/selection note; returns `None` when blank.
+pub fn normalize_note(raw: Option<&str>, max_chars: usize) -> Option<String> {
+    let trimmed = raw?.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let clean: String = trimmed.chars().take(max_chars).collect();
+    let clean = clean.trim();
+    (!clean.is_empty()).then(|| clean.to_string())
 }
 
 /// Trims, deduplicates (case-insensitively), and caps a candidate's work-type strength tags.
@@ -372,8 +499,9 @@ pub fn is_loopback_http_url(raw: &str) -> bool {
 pub fn load_config(paths: &DrovePaths) -> Result<DroveConfig, RpcError> {
     match std::fs::read_to_string(&paths.config_file) {
         Ok(text) => {
-            let mut cfg: DroveConfig = serde_json::from_str(&text)
-                .map_err(|e| RpcError::new("config", format!("{}: {e}", paths.config_file.display()), "fix drove.json"))?;
+            let mut cfg: DroveConfig = serde_json::from_str(&text).map_err(|e| {
+                RpcError::new("config", format!("{}: {e}", paths.config_file.display()), "fix drove.json")
+            })?;
             // Ensure all built-in roles exist if missing from older config, preserving user edits.
             for (k, v) in default_roles() {
                 cfg.roles.entry(k).or_insert(v);
@@ -381,7 +509,9 @@ pub fn load_config(paths: &DrovePaths) -> Result<DroveConfig, RpcError> {
             Ok(cfg)
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(DroveConfig::default()),
-        Err(e) => Err(RpcError::new("config", format!("{}: {e}", paths.config_file.display()), "check file permissions")),
+        Err(e) => {
+            Err(RpcError::new("config", format!("{}: {e}", paths.config_file.display()), "check file permissions"))
+        }
     }
 }
 
@@ -455,7 +585,10 @@ pub fn mask_key(key: &str) -> String {
 }
 
 /// Resolves role access & allowed path globs (merging built-in defaults with overrides).
-pub fn role_spec_for<'a>(cfg: &'a DroveConfig, role_id: Option<&str>) -> (String, RoleConfig, RoleAccessMode, Vec<String>) {
+pub fn role_spec_for<'a>(
+    cfg: &'a DroveConfig,
+    role_id: Option<&str>,
+) -> (String, RoleConfig, RoleAccessMode, Vec<String>) {
     let id = role_id.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("coder").to_string();
     let builtins = default_roles();
     let role = cfg
@@ -464,12 +597,8 @@ pub fn role_spec_for<'a>(cfg: &'a DroveConfig, role_id: Option<&str>) -> (String
         .cloned()
         .or_else(|| builtins.get(&id).cloned())
         .unwrap_or_else(|| builtins.get("coder").cloned().expect("coder role exists"));
-    let access = role.access.unwrap_or_else(|| {
-        builtins
-            .get(&id)
-            .and_then(|b| b.access)
-            .unwrap_or(RoleAccessMode::Writable)
-    });
+    let access =
+        role.access.unwrap_or_else(|| builtins.get(&id).and_then(|b| b.access).unwrap_or(RoleAccessMode::Writable));
     let allowed = if !role.allowed_paths.is_empty() {
         role.allowed_paths.clone()
     } else {
@@ -521,6 +650,7 @@ pub fn web_agents_payload(
                     "fast": c.fast,
                     "context": c.context,
                     "strengths": c.strengths,
+                    "note": c.note,
                 })
             })
             .collect();
@@ -555,6 +685,7 @@ pub fn web_agents_payload(
         "profile": {
             "version": cfg.version,
             "updatedAt": cfg.updated_at,
+            "note": cfg.note,
             "agents": agents_list,
             "roles": Value::Object(roles_json),
         },
@@ -898,5 +1029,28 @@ mod tests {
         cfg.ai.context_window = None;
         cfg.ai.max_tokens = Some(16);
         assert!(validate_config(&mut cfg).is_err());
+    }
+
+    #[test]
+    fn normalizes_global_and_candidate_routing_notes() {
+        let mut cfg = DroveConfig::default();
+        cfg.note = Some("  GLM 相关模型在下午 2:00–6:00 额度按两倍计算，应避免使用，除非没有其他 agent 可用。  ".into());
+        cfg.roles.get_mut("coder").unwrap().primary.note = Some("  首选主力  ".into());
+        cfg.roles.get_mut("coder").unwrap().fallbacks[0].note = Some("   ".into());
+        validate_config(&mut cfg).unwrap();
+
+        assert_eq!(
+            cfg.note.as_deref(),
+            Some("GLM 相关模型在下午 2:00–6:00 额度按两倍计算，应避免使用，除非没有其他 agent 可用。")
+        );
+        assert_eq!(cfg.roles["coder"].primary.note.as_deref(), Some("首选主力"));
+        assert_eq!(cfg.roles["coder"].fallbacks[0].note, None);
+
+        let payload = web_agents_payload(&cfg, BTreeMap::new(), None, None);
+        assert_eq!(
+            payload["profile"]["note"].as_str(),
+            Some("GLM 相关模型在下午 2:00–6:00 额度按两倍计算，应避免使用，除非没有其他 agent 可用。")
+        );
+        assert_eq!(payload["profile"]["roles"]["coder"]["candidates"][0]["note"].as_str(), Some("首选主力"));
     }
 }

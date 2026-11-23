@@ -578,6 +578,11 @@ impl Core {
         self.call_timeout("ai.summarize_agent", params, Duration::from_secs(15))
     }
 
+    /// Rewrites a rough user prompt into a clearer, more structured prompt (`ai.polish_prompt`).
+    pub fn polish_prompt(&self, params: Value) -> Result<Value> {
+        self.call_timeout("ai.polish_prompt", params, Duration::from_secs(25))
+    }
+
     pub fn call_timeout(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();

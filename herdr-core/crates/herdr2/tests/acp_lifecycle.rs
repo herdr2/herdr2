@@ -74,18 +74,11 @@ fn presets_templates_model_mode_and_system_prompt_flow_to_acp() {
     let (_, shim_err) = s.err(&["--json", "run", "--bg", "--agent", "/tmp/.windsurf-server/bin/claude"]);
     assert_eq!(shim_err["error"]["kind"], "config", "{shim_err}");
 
-    let b = run_fake(
-        &s,
-        &["--model", "gpt-test", "--mode", "plan", "--system-prompt", "Be terse", "--prompt", "STATE"],
-    );
+    let b =
+        run_fake(&s, &["--model", "gpt-test", "--mode", "plan", "--system-prompt", "Be terse", "--prompt", "STATE"]);
     wait_until("b finished STATE", || get(&s, &b)["turn"] == 1 && get(&s, &b)["status"]["state"] == "idle");
     let st_b = serde_json::from_str::<Value>(
-        s.json(&["read", "--last", &b])["text"]
-            .as_str()
-            .unwrap()
-            .lines()
-            .find(|l| l.starts_with('{'))
-            .unwrap(),
+        s.json(&["read", "--last", &b])["text"].as_str().unwrap().lines().find(|l| l.starts_with('{')).unwrap(),
     )
     .unwrap();
     assert_eq!(st_b["model"], "gpt-test", "{st_b}");
@@ -134,22 +127,30 @@ fn async_start_returns_starting_immediately_and_records_spawn_failure() {
 
     // Valid fake ACP agent with async_start: returns immediately with "starting", then transitions to "idle".
     let parts: Vec<String> = fake_acp_spec().split_whitespace().map(str::to_owned).collect();
-    let res = conn.call(1, "agent.run", serde_json::json!({
-        "argv": parts,
-        "keep": true,
-        "async_start": true,
-    }));
+    let res = conn.call(
+        1,
+        "agent.run",
+        serde_json::json!({
+            "argv": parts,
+            "keep": true,
+            "async_start": true,
+        }),
+    );
     let ok = &res["result"];
     let addr = ok["address"].as_str().unwrap().to_owned();
     assert_eq!(ok["status"]["state"], "starting", "{res}");
     wait_until("async_start becomes idle", || get(&s, &addr)["status"]["state"] == "idle");
 
     // Nonexistent binary with async_start + keep: returns immediately, then records Error + spawn_failed with keep=false.
-    let bad = conn.call(2, "agent.run", serde_json::json!({
-        "argv": ["herdr2-missing-binary-for-test-999"],
-        "keep": true,
-        "async_start": true,
-    }));
+    let bad = conn.call(
+        2,
+        "agent.run",
+        serde_json::json!({
+            "argv": ["herdr2-missing-binary-for-test-999"],
+            "keep": true,
+            "async_start": true,
+        }),
+    );
     let bad_addr = bad["result"]["address"].as_str().unwrap().to_owned();
     assert_eq!(bad["result"]["status"]["state"], "starting", "{bad}");
     wait_until("bad async_start transitions to finished spawn_failed", || {
@@ -175,21 +176,12 @@ fn session_config_options_and_h2_config_update_work_end_to_end() {
     assert_eq!(after_model["model"], "gpt-test-2", "{after_model}");
 
     let after_effort = s.json(&["config", &a, "--id", "reasoning_effort", "--value", "xhigh"]);
-    let effort_opt = after_effort["config_options"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|o| o["id"] == "reasoning_effort")
-        .unwrap();
+    let effort_opt =
+        after_effort["config_options"].as_array().unwrap().iter().find(|o| o["id"] == "reasoning_effort").unwrap();
     assert_eq!(effort_opt["current_value"], "xhigh", "{after_effort}");
 
     let after_fast = s.json(&["config", &a, "--id", "fast-mode", "--bool", "true"]);
-    let fast_opt = after_fast["config_options"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|o| o["id"] == "fast-mode")
-        .unwrap();
+    let fast_opt = after_fast["config_options"].as_array().unwrap().iter().find(|o| o["id"] == "fast-mode").unwrap();
     assert_eq!(fast_opt["current_value"], true, "{after_fast}");
 
     let after_bypass = s.json(&["config", &a, "--id", "mode", "--value", "dangerously-skip-permissions"]);
@@ -224,7 +216,8 @@ fn claude_preset_defaults_to_dangerously_skip_permissions() {
     assert_eq!(st["mode"], "bypassPermissions", "{st}");
 
     // Explicit non-bypass mode is still respected.
-    let manual = s.json(&["run", "--bg", "--agent", "claude", "--mode", "default"])["address"].as_str().unwrap().to_owned();
+    let manual =
+        s.json(&["run", "--bg", "--agent", "claude", "--mode", "default"])["address"].as_str().unwrap().to_owned();
     let manual_rec = get(&s, &manual);
     assert_eq!(manual_rec["mode"], "default", "{manual_rec}");
     assert_eq!(manual_rec["permission_mode"], "approve-reads", "{manual_rec}");
@@ -241,12 +234,7 @@ fn agent_send_resets_manual_status_on_sender_and_receiver() {
     assert_eq!(get(&s, &a1)["labels"]["herdr.status"], "done@0");
     assert_eq!(get(&s, &a2)["labels"]["herdr.status"], "blocked@0");
 
-    let send_out = s
-        .cmd()
-        .env("H2_AGENT_ID", &a1)
-        .args(["send", &a2, "--wait", "PING"])
-        .output()
-        .unwrap();
+    let send_out = s.cmd().env("H2_AGENT_ID", &a1).args(["send", &a2, "--wait", "PING"]).output().unwrap();
     assert!(send_out.status.success(), "{}", String::from_utf8_lossy(&send_out.stderr));
 
     let after_a1 = get(&s, &a1);

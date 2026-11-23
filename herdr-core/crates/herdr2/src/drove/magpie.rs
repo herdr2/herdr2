@@ -2,8 +2,8 @@
 
 use super::config::validate_http_url;
 use super::types::{MagpieSettings, QuotaCard, QuotaWindow, parse_iso_ms};
-use serde::{Deserialize, Serialize};
 use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -143,7 +143,13 @@ impl MagpieClient {
                         error: None,
                     };
                 }
-                MagpieTestResult { ok: false, gateway_url: url, cards_count: 0, providers: Vec::new(), error: Some(err) }
+                MagpieTestResult {
+                    ok: false,
+                    gateway_url: url,
+                    cards_count: 0,
+                    providers: Vec::new(),
+                    error: Some(err),
+                }
             }
         }
     }
@@ -199,7 +205,8 @@ pub(crate) fn gateway_from_dir(dir: &Path) -> Option<String> {
         && let Ok(val) = serde_json::from_str::<Value>(&text)
         && let Some(addr) = val["addr"].as_str().map(str::trim).filter(|s| !s.is_empty())
     {
-        let normalized = addr.strip_prefix("0.0.0.0:").map(|p| format!("127.0.0.1:{p}")).unwrap_or_else(|| addr.to_string());
+        let normalized =
+            addr.strip_prefix("0.0.0.0:").map(|p| format!("127.0.0.1:{p}")).unwrap_or_else(|| addr.to_string());
         let url = if normalized.starts_with("http://") || normalized.starts_with("https://") {
             normalized
         } else {
@@ -363,20 +370,11 @@ fn evaluate_card(card: &QuotaCard, agent: &str, model: Option<&str>, now_ms: u64
             let lname = w.name.to_ascii_lowercase();
             !lname.contains("image") && !lname.contains("grok") && !lname.contains("free usage")
         })
-        .filter(|w| {
-            w.resets_at
-                .as_deref()
-                .and_then(parse_iso_ms)
-                .is_none_or(|ms| ms > now_ms)
-        })
+        .filter(|w| w.resets_at.as_deref().and_then(parse_iso_ms).is_none_or(|ms| ms > now_ms))
         .collect();
 
     if windows.is_empty() {
-        return if balance_amt.is_some_and(|v| v > 0.0) {
-            CardStatus::Available
-        } else {
-            CardStatus::Unknown
-        };
+        return if balance_amt.is_some_and(|v| v > 0.0) { CardStatus::Available } else { CardStatus::Unknown };
     }
 
     // Cursor differentiates native Cursor Models from "Other Models"; don't block Cursor when Cursor Models > 0.
@@ -456,10 +454,8 @@ pub(crate) fn quota_exhausted_reason_at(
     if aliases.is_empty() || cards.is_empty() {
         return None;
     }
-    let matching: Vec<&QuotaCard> = cards
-        .iter()
-        .filter(|c| aliases.iter().any(|a| c.provider.eq_ignore_ascii_case(a)))
-        .collect();
+    let matching: Vec<&QuotaCard> =
+        cards.iter().filter(|c| aliases.iter().any(|a| c.provider.eq_ignore_ascii_case(a))).collect();
     if matching.is_empty() {
         return None;
     }
@@ -481,10 +477,7 @@ pub(crate) fn quota_exhausted_reason_at(
 
 async fn fetch_quotas_http(gateway: &str) -> Result<Vec<QuotaCard>, String> {
     let url = format!("{gateway}/v1/magpie/quotas?kept=1");
-    let cfg = format!(
-        "url = \"{}\"\nheader = \"Authorization: Bearer magpie\"\n",
-        escape_curl_str(&url)
-    );
+    let cfg = format!("url = \"{}\"\nheader = \"Authorization: Bearer magpie\"\n", escape_curl_str(&url));
     let out = super::bg_tokio_command("curl")
         .args(["-sS", "--max-time", "2", "-w", "\n%{http_code}", "--config", "-"])
         .stdin(std::process::Stdio::piped())

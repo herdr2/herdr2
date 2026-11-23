@@ -169,7 +169,9 @@ pub fn build_review_markdown(input: &ReviewBuildInput<'_>) -> ReviewPackage {
                 .unwrap_or_default();
             let _ = writeln!(md, "\n#### {idx}. `{file}:{anchor}`{hunk}");
 
-            if let Some(raw_snip) = c.snippet.as_deref().map(|s| s.trim_end_matches('\n')).filter(|s| !s.trim().is_empty()) {
+            if let Some(raw_snip) =
+                c.snippet.as_deref().map(|s| s.trim_end_matches('\n')).filter(|s| !s.trim().is_empty())
+            {
                 let bounded = truncate_utf8(raw_snip, MAX_SNIPPET_BYTES);
                 let fence = code_fence_for(&bounded);
                 let is_file_snip = c.side.eq_ignore_ascii_case("file")

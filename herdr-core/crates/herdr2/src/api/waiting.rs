@@ -155,12 +155,16 @@ impl Child {
             Self::Agent(a) => {
                 a.is_live()
                     && !a.program_lost()
-                    && (!a.reported || a.first_task_turn.is_some() || a.status.as_ref().is_some_and(|s| s.state == "working"))
+                    && (!a.reported
+                        || a.first_task_turn.is_some()
+                        || a.status.as_ref().is_some_and(|s| s.state == "working"))
             }
             Self::Terminal(t) => {
                 t.is_live()
                     && !t.program_lost()
-                    && (!t.reported || t.first_task_turn.is_some() || t.status.as_ref().is_some_and(|s| s.state == "working"))
+                    && (!t.reported
+                        || t.first_task_turn.is_some()
+                        || t.status.as_ref().is_some_and(|s| s.state == "working"))
             }
         }
     }
@@ -239,9 +243,9 @@ pub(super) fn children_of(
             Some(afar) => Ok((None, afar)),
             None => resolve_any(core, a).map(|k| (Some(k), k.address())),
         },
-        (None, Some(caller)) => TargetKey::parse(caller)
-            .map(|k| (Some(k), k.address()))
-            .ok_or_else(|| RpcError::new("needs_target", "whose children?", "run it inside an agent or terminal, or name the parent")),
+        (None, Some(caller)) => TargetKey::parse(caller).map(|k| (Some(k), k.address())).ok_or_else(|| {
+            RpcError::new("needs_target", "whose children?", "run it inside an agent or terminal, or name the parent")
+        }),
         (None, None) => Err(RpcError::new("needs_target", "whose children?", "name the parent")),
     }
 }

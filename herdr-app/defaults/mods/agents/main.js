@@ -2,11 +2,36 @@
 
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Popup } from "gpui-base";
-import { agents, terminals, panes, focused, spaces, run, h2, checking, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, props, window, layout, settings } from "herdr";
-import { resolveSemanticLabel, buildHoverTooltip, buildLocalFallbackBriefing, mergeBriefingSnapshots } from "./briefing_model.js";
+import { agents, terminals, panes, focused, spaces, run, h2, checking, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, notify, props, window, layout, settings, keys } from "herdr";
+import { resolveSemanticLabel, resolveSubAgentLabel, buildHoverTooltip, buildLocalFallbackBriefing, mergeBriefingSnapshots } from "./briefing_model.js";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
+
+function shortcutFor(action) {
+  if (typeof keys !== "function" || !action) return "";
+  const list = keys();
+  if (!Array.isArray(list)) return "";
+  const k = list.find((b) => b.section === "global" && b.action === action);
+  if (!k?.keys?.trim()) return "";
+  const mac = typeof window === "function" && window()?.platform === "macos";
+  const names = mac ? { ctrl: "⌃", alt: "⌥", shift: "⇧", cmd: "⌘", fn: "fn" } : { ctrl: "Ctrl", alt: "Alt", shift: "Shift", cmd: "Super", fn: "Fn" };
+  const alias = { secondary: mac ? "cmd" : "ctrl", super: "cmd", win: "cmd" };
+  return k.keys.trim().split(/\s+/).map((stroke) => {
+    const parts = stroke.split("-");
+    let key = parts.pop();
+    if (key === "") { key = "-"; parts.pop(); }
+    const held = new Set(parts.map((m) => alias[m.toLowerCase()] ?? m.toLowerCase()));
+    if (/^[A-Z]$/.test(key)) held.add("shift");
+    const label = key.length === 1 ? key.toUpperCase() : key[0].toUpperCase() + key.slice(1).toLowerCase();
+    return [...Object.keys(names).filter((m) => held.has(m)).map((m) => names[m]), label].join(mac ? "" : "+");
+  }).join(" ");
+}
+
+function withShortcut(text, action) {
+  const sc = shortcutFor(action);
+  return sc ? `${text} (${sc})` : text;
+}
 
 function shortAgentId(addr) {
   const s = String(addr || "").trim();
@@ -152,7 +177,7 @@ const trashTitle = (it) => {
 
 export default class Agents extends View {
   init(_props, cx) {
-    if (props()?.sortMenu || props()?.statusMenu || props()?.trashMenu) {
+    if (props()?.sortMenu || props()?.statusMenu || props()?.trashMenu || props()?.parentRestoreDialog) {
       this.at = 0;
       this.handle = cx.focus_handle?.();
       this.handle?.focus?.();
@@ -198,6 +223,14 @@ export default class Agents extends View {
     this.hoverDigestTask = null;
     this.localWorkingSince = {};
     this.localWorkMs = {};
+    this.agentDrag = null;
+    this.agentSettling = null;
+    this.agentSettleTask = null;
+    this.agentHeights = {};
+    this.agentSnapFromOrder = null;
+    this.agentSnapUntil = 0;
+    this.suppressClickUntil = 0;
+    this.localGroupOrder = {};
     this.listFocus = cx?.focus_handle?.();
     cx.timer.every(1000, (tcx) => {
       if (agents().some((a) => a.status === "working")) tcx.notify();
@@ -457,6 +490,154 @@ export default class Agents extends View {
     run("terminal.peek", { terminal: addr });
   }
 
+  readGroupOrder() {
+    const raw = typeof shared === "function" ? shared("agents.spaceOrder") : null;
+    if (raw && typeof raw === "object" && !Array.isArray(raw)) return raw;
+    return this.localGroupOrder && typeof this.localGroupOrder === "object" ? this.localGroupOrder : {};
+  }
+
+  writeGroupOrder(groupId, ids) {
+    const next = { ...this.readGroupOrder(), [groupId]: ids };
+    this.localGroupOrder = next;
+    if (typeof setShared === "function") setShared("agents.spaceOrder", next);
+  }
+
+  agentZoom() {
+    return Math.max(0.25, Number(typeof settings === "function" ? settings()?.zoom : 1) || 1);
+  }
+
+  agentUnitHeight(addr, visibleSubCount = 0) {
+    return this.agentHeights?.[addr] ?? (30 + visibleSubCount * 26);
+  }
+
+  agentSlotTop(members, index, subCountOf) {
+    let y = 0;
+    for (let j = 0; j < index && j < members.length; j++) {
+      const m = members[j];
+      y += this.agentUnitHeight(m.address, subCountOf(m));
+    }
+    return y;
+  }
+
+  agentSlotOffset(members, from, to, subCountOf) {
+    let off = 0;
+    if (to > from) {
+      for (let j = from + 1; j <= to && j < members.length; j++) {
+        off += this.agentUnitHeight(members[j].address, subCountOf(members[j]));
+      }
+    } else if (to < from) {
+      for (let j = to; j < from && j < members.length; j++) {
+        off -= this.agentUnitHeight(members[j].address, subCountOf(members[j]));
+      }
+    }
+    return off;
+  }
+
+  computeAgentDragTo(members, from, startTop, dragHeight, dy, subCountOf) {
+    let to = from;
+    const center = startTop + dy + dragHeight * 0.5;
+    if (dy > 0) {
+      for (let j = from + 1; j < members.length; j++) {
+        const top = this.agentSlotTop(members, j, subCountOf);
+        const h = this.agentUnitHeight(members[j].address, subCountOf(members[j]));
+        if (center > top + h * 0.5) to = j;
+        else break;
+      }
+    } else if (dy < 0) {
+      for (let j = from - 1; j >= 0; j--) {
+        const top = this.agentSlotTop(members, j, subCountOf);
+        const h = this.agentUnitHeight(members[j].address, subCountOf(members[j]));
+        if (center < top + h * 0.5) to = j;
+        else break;
+      }
+    }
+    return to;
+  }
+
+  clampAgentDragDy(members, from, dragHeight, dy, subCountOf) {
+    let minDy = 0;
+    for (let j = 0; j < from; j++) minDy -= this.agentUnitHeight(members[j].address, subCountOf(members[j]));
+    let maxDy = 0;
+    for (let j = from + 1; j < members.length; j++) maxDy += this.agentUnitHeight(members[j].address, subCountOf(members[j]));
+    const extra = Math.max(12, Math.round(dragHeight * 0.35));
+    return Math.max(minDy - extra, Math.min(maxDy + extra, dy));
+  }
+
+  flushAgentSettle() {
+    this.agentSettleTask?.cancel?.();
+    this.agentSettleTask = null;
+    const s = this.agentSettling;
+    if (!s) return;
+    this.agentSettling = null;
+    if (s.to !== s.from) {
+      this.agentSnapFromOrder = { groupId: s.groupId, sig: s.orderSig };
+      this.agentSnapUntil = Date.now() + 240;
+      const next = [...s.ids];
+      const [moved] = next.splice(s.from, 1);
+      if (moved !== undefined) {
+        next.splice(s.to, 0, moved);
+        this.writeGroupOrder(s.groupId, next);
+      }
+    }
+  }
+
+  handleAgentDragMove(e, cx) {
+    if (!this.agentDrag) return;
+    if (e && "pressed_button" in e && e.pressed_button !== undefined && e.pressed_button !== "left") {
+      this.finishAgentDrag(cx);
+      return;
+    }
+    const rawY = e?.position?.y;
+    if (typeof rawY !== "number") return;
+    const rawDy = rawY / this.agentZoom() - this.agentDrag.startY;
+    if (!this.agentDrag.moving && Math.abs(rawDy) < 4) return;
+    if (!this.agentDrag.moving) {
+      this.agentDrag.moving = true;
+      this.hovered = null;
+    }
+    const d = this.agentDrag;
+    d.dy = this.clampAgentDragDy(d.members, d.from, d.dragHeight, rawDy, d.subCountOf);
+    d.to = this.computeAgentDragTo(d.members, d.from, d.startTop, d.dragHeight, d.dy, d.subCountOf);
+    cx?.notify?.();
+  }
+
+  finishAgentDrag(cx) {
+    if (!this.agentDrag) return;
+    const d = this.agentDrag;
+    this.agentDrag = null;
+    if (!d.moving) {
+      cx?.notify?.();
+      return;
+    }
+    this.suppressClickUntil = Date.now() + 250;
+    const destDy = this.agentSlotOffset(d.members, d.from, d.to, d.subCountOf);
+    const orderSig = d.ids.join(",");
+    this.agentSettling = {
+      groupId: d.groupId,
+      id: d.id,
+      from: d.from,
+      to: d.to,
+      startTop: d.startTop,
+      destDy,
+      dragHeight: d.dragHeight,
+      orderSig,
+      ids: d.ids,
+      member: d.member,
+      subs: d.subs,
+    };
+    if (typeof cx?.spawn === "function") {
+      this.agentSettleTask = cx.spawn(async (acx) => {
+        await acx.sleep(170);
+        this.agentSettleTask = null;
+        this.flushAgentSettle();
+        acx.notify();
+      });
+    } else {
+      this.flushAgentSettle();
+    }
+    cx?.notify?.();
+  }
+
   selectAgent(addr) {
     if (addr && typeof setShared === "function") setShared("agents.selected", addr);
   }
@@ -514,7 +695,7 @@ export default class Agents extends View {
       this.selectAgent(item.address);
       const p = panes().find((x) => x.terminal === item.address);
       if (p?.pane) run("pane.focus", { pane: p.pane });
-      else if (item.kind?.startsWith("acp_")) run("terminal.peek", { terminal: item.address });
+      else if (item.kind?.startsWith("acp_")) run("terminal.keep", { terminal: item.address, place: "tab" });
       else run("agent.focus", { terminal: item.address });
       if (openChanges) {
         run("layout.select", { stack: "panel-body", child: "changes" });
@@ -1328,6 +1509,128 @@ export default class Agents extends View {
       );
   }
 
+  parentRestoreDialog(t) {
+    const p = props() ?? {};
+    const overlay = p.overlay;
+    const parentAddr = String(p.parentAddr ?? "").trim();
+    const shortParent = String(p.shortParent ?? "").trim() || shortAgentId(parentAddr) || parentAddr;
+    const live = Boolean(p.live);
+    const accent = t.accent ?? t.foreground;
+    const close = () => {
+      if (overlay) closeOverlay(overlay);
+    };
+    const confirmRestore = () => {
+      if (parentAddr) run("agent.restore", { terminal: parentAddr });
+      close();
+    };
+    return v_flex()
+      .id("ag-parent-restore-dialog")
+      .when(Boolean(this.handle), (el) => el.track_focus(this.handle))
+      .w_full()
+      .h_full()
+      .p(16)
+      .gap(12)
+      .bg(t.popover)
+      .text_size(12.5)
+      .on_key_down((e, evCx) => {
+        if (e?.key === "escape") {
+          evCx?.stop_propagation?.();
+          close();
+        } else if (e?.key === "enter") {
+          evCx?.stop_propagation?.();
+          confirmRestore();
+        }
+      })
+      .child(
+        h_flex()
+          .gap(8)
+          .items_center()
+          .child(svg("mods/workspace-chrome/archive.svg").size(15).flex_none().text_color(t.muted))
+          .child(
+            div()
+              .flex_1()
+              .min_w(0)
+              .truncate()
+              .text_size(13.5)
+              .font_semibold()
+              .text_color(t.foreground)
+              .child(tr(`${shortParent} has been moved to the recycle bin`, `${shortParent} 已移除到回收站`)),
+          ),
+      )
+      .child(
+        v_flex()
+          .flex_1()
+          .gap(4)
+          .child(
+            div()
+              .text_size(12.5)
+              .text_color(t.muted)
+              .child(tr("Do you want to restore it?", "是否需要恢复？")),
+          )
+          .child(
+            div()
+              .text_size(11.5)
+              .text_color(t.dim)
+              .child(
+                live
+                  ? tr("The session is still live and can be restored losslessly.", "会话仍存活，恢复后将无损回到工作区。")
+                  : tr("The session has ended and will be relaunched on restore.", "会话已退出，恢复后将重新启动。"),
+              ),
+          ),
+      )
+      .child(
+        h_flex()
+          .gap(8)
+          .justify_end()
+          .items_center()
+          .child(
+            div()
+              .id("parent-restore-cancel")
+              .px(12)
+              .h(28)
+              .flex()
+              .items_center()
+              .rounded(6)
+              .bg(t.raised)
+              .border_1()
+              .border_color(t.border)
+              .text_size(12)
+              .text_color(t.muted)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover).text_color(t.foreground))
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+              .on_click((_e, cx) => {
+                cx.stop_propagation();
+                close();
+              })
+              .child(tr("Cancel", "取消")),
+          )
+          .child(
+            div()
+              .id("parent-restore-confirm")
+              .px(12)
+              .h(28)
+              .flex()
+              .items_center()
+              .rounded(6)
+              .bg(t.selected ?? t.hover)
+              .border_1()
+              .border_color(accent)
+              .text_size(12)
+              .font_medium()
+              .text_color(t.foreground)
+              .cursor_pointer()
+              .hover((s) => s.bg(t.hover))
+              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+              .on_click((_e, cx) => {
+                cx.stop_propagation();
+                confirmRestore();
+              })
+              .child(tr("Restore", "恢复")),
+          ),
+      );
+  }
+
   // Live sub-agents of `addr`, depth first, each with the tree lines in front of it.
   // Handoff and Fork sessions are standalone top-level sessions even if legacy records carry `parent`.
   tree(all, addr, lead = []) {
@@ -1357,13 +1660,14 @@ export default class Agents extends View {
     const isAcp = Boolean(k.acp);
     const isSideChat = String(k.lineage?.kind || "").toLowerCase().replace("_", "-") === "side-chat";
     const pane = this.paneByAddr?.get(k.address) ?? null;
+    const paneObj = this.paneObjByAddr?.get(k.address) ?? null;
     const canFocusPane = !isSideChat && (Boolean(pane) || (!isAcp && this.listed.has(k.address)));
     const st = kidStatus(k, this.listed);
     const pic = icon(k.program, 14, t.foreground);
     const on = focusedSet instanceof Set ? focusedSet.has(k.address) : k.address === focusedSet;
     const lBadge = lineageBadgeInfo(k);
     const hasWt = Boolean(k.lineage?.worktree_path);
-    const subLabel = k.labels?.["herdr.name"] || k.labels?.["drove.display"] || k.name || k.semantic_title || (isAcp && clean(k.title) && clean(k.title) !== k.address && clean(k.title) !== k.program?.name ? clean(k.title) : null) || k.template || k.program?.name || k.address;
+    const subLabel = resolveSubAgentLabel(k, paneObj);
     const subShortId = shortAgentId(k.address);
     const showSubId = Boolean(subShortId) && subLabel !== subShortId && subLabel !== k.address;
     const mono = (typeof settings === "function" ? settings()?.font_family : null) ?? "JetBrains Mono";
@@ -1403,7 +1707,10 @@ export default class Agents extends View {
       })
       .on_click(() => {
         this.selectAgent(k.address);
-        canFocusPane ? run("pane.focus", pane ? { pane } : { terminal: k.address }) : this.peek(k.address);
+        if (isSideChat) this.peek(k.address);
+        else if (canFocusPane) run("pane.focus", pane ? { pane } : { terminal: k.address });
+        else if (isAcp) run("terminal.keep", { terminal: k.address, place: "tab" });
+        else this.peek(k.address);
       })
       .children(s.lines.map((l, idx) => div().self_start().mt(-4).w(9).h(17).mr(4).flex_none()
         .when(Boolean(l), el => el.border_l(1.5).border_color(on && idx === s.lines.length - 1 ? (t.accent ?? t.foreground) : t.input))
@@ -1535,6 +1842,7 @@ export default class Agents extends View {
     if (props()?.sortMenu) return this.sortMenu(t);
     if (props()?.statusMenu) return this.statusMenu(t);
     if (props()?.trashMenu) return this.trashMenu(t);
+    if (props()?.parentRestoreDialog) return this.parentRestoreDialog(t);
     if (props()?.briefing) return this.briefingView(t, cx);
     const trashed = trashedList();
     const collapsed = narrow();
@@ -1546,6 +1854,7 @@ export default class Agents extends View {
     // Read the pane snapshot once: every host read copies the whole list into JS.
     const allPanes = panes();
     this.paneByAddr = new Map(allPanes.filter((p) => p.terminal && p.pane).map((p) => [p.terminal, p.pane]));
+    this.paneObjByAddr = new Map(allPanes.filter((p) => p.terminal).map((p) => [p.terminal, p]));
     const focusedAddrs = new Set();
     for (const a of list) {
       if (a.focused) focusedAddrs.add(a.address);
@@ -1580,41 +1889,67 @@ export default class Agents extends View {
     const byAppearance = (x, y) => appearedAt(x) - appearedAt(y) || (indexOf.get(x.address) ?? 0) - (indexOf.get(y.address) ?? 0);
     const urgency = new Map(list.map((a) => [a.address, Math.max(this.rank(a), ...this.tree(all, a.address).map((s) => RANK[kidStatus(s.t, this.listed)] ?? 0))]));
     const rankOf = (a) => urgency.get(a.address);
-    const pinned = list.filter((a) => a.pinned).sort(byAppearance);
+    const groupOrder = this.readGroupOrder();
+    const orderComparator = (groupId) => {
+      const saved = Array.isArray(groupOrder[groupId]) ? groupOrder[groupId] : null;
+      if (!saved || saved.length === 0) return byAppearance;
+      const pos = new Map(saved.map((addr, idx) => [addr, idx]));
+      return (x, y) => {
+        const px = pos.has(x.address) ? pos.get(x.address) : Number.POSITIVE_INFINITY;
+        const py = pos.has(y.address) ? pos.get(y.address) : Number.POSITIVE_INFINITY;
+        if (px !== py) return px - py;
+        return byAppearance(x, y);
+      };
+    };
+    const pinned = list.filter((a) => a.pinned).sort(orderComparator("pinned"));
     let rest = list.filter((a) => !a.pinned);
     if (byPriority) {
-      rest = [...rest].sort((x, y) => rankOf(y) - rankOf(x) || byAppearance(x, y));
+      rest = [...rest].sort((x, y) => {
+        const rx = rankOf(x) || RANK.idle;
+        const ry = rankOf(y) || RANK.idle;
+        if (ry !== rx) return ry - rx;
+        return orderComparator(`sec-${rx}`)(x, y);
+      });
     } else {
-      // Group by space in space order, keeping agents within each space in appearance order (oldest first).
+      // Group by space in canonical spaces() order, keeping agents within each space in custom or appearance order (oldest first).
+      const spaceRank = new Map(spaces().map((s, idx) => [s.id, idx]));
       const bySpace = new Map();
       for (const a of rest) {
         if (!bySpace.has(a.space)) bySpace.set(a.space, []);
         bySpace.get(a.space).push(a);
       }
+      const orderedSpaceIds = [...bySpace.keys()].sort((a, b) => {
+        const ra = spaceRank.has(a) ? spaceRank.get(a) : Number.POSITIVE_INFINITY;
+        const rb = spaceRank.has(b) ? spaceRank.get(b) : Number.POSITIVE_INFINITY;
+        return ra - rb;
+      });
       rest = [];
-      for (const members of bySpace.values()) {
-        members.sort(byAppearance);
+      for (const spaceId of orderedSpaceIds) {
+        const members = bySpace.get(spaceId);
+        members.sort(orderComparator(`sp-${spaceId}`));
         rest.push(...members);
       }
     }
     list = [...pinned, ...rest];
     setAgentOrder(list.map((a) => a.address));
 
+    const subsByAddr = new Map(list.map((a) => [a.address, collapsed ? [] : this.tree(all, a.address)]));
+    const subCountOf = (a) => (this.folded.has(a.address) ? 0 : (subsByAddr.get(a.address)?.length ?? 0));
     const withKids = (a, i) => {
-      const subs = collapsed ? [] : this.tree(all, a.address);
+      const subs = subsByAddr.get(a.address) ?? [];
       const r = row(a, i, subs);
       if (this.folded.has(a.address)) return [r];
       return [r, ...subs.map((s) => this.subRow(t, s, focusedAddrs, byPriority))];
     };
 
     // The fold chevron; folded, the count too, colored by the most urgent one.
-    const fold = (a, subs) => {
+    const fold = (a, subs, isFloating = false) => {
       const sts = subs.map((s) => kidStatus(s.t, this.listed));
       const top = sts.reduce((m, s) => ((RANK[s] ?? 0) > (RANK[m] ?? 0) ? s : m), null);
       const open = !this.folded.has(a.address);
       const hasFocusedSub = !open && subs.some((s) => focusedAddrs.has(s.t.address));
       return div()
-        .id(`fold-${a.address}`)
+        .id(`${isFloating ? "float-" : ""}fold-${a.address}`)
         .h(18)
         .px(3)
         .gap(3)
@@ -1624,13 +1959,17 @@ export default class Agents extends View {
         .text_size(11)
         .when(hasFocusedSub, (el) => el.bg(t.selected))
         .text_color(hasFocusedSub ? t.foreground : open ? t.dim : (t[top] ?? t.dim))
-        .cursor_pointer()
-        .hover((s) => s.bg(t.hover).text_color(t.foreground))
-        .on_click((_e, cx) => {
-          cx.stop_propagation();
-          open ? this.folded.add(a.address) : this.folded.delete(a.address);
-          cx.notify();
-        })
+        .when(!isFloating, (el) =>
+          el
+            .cursor_pointer()
+            .hover((s) => s.bg(t.hover).text_color(t.foreground))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              open ? this.folded.add(a.address) : this.folded.delete(a.address);
+              cx.notify();
+            }),
+        )
         .child(svg(`mods/workspace-chrome/chevron-${open ? "down" : "right"}.svg`).size(11).flex_none())
         .when(!open, (el) => el.child(String(subs.length)));
     };
@@ -1644,7 +1983,8 @@ export default class Agents extends View {
       const rec = allByAddr.get(a.address);
       const tab = tabs.get(a.tab);
       const many = tabCounts.get(a.tab) > 1;
-      return [a.address, resolveSemanticLabel(a, rec, tab, leads.get(a.tab), { manyInTab: many })];
+      const ownPane = this.paneObjByAddr.get(a.address) ?? leads.get(a.tab);
+      return [a.address, resolveSemanticLabel(a, rec, tab, ownPane, { manyInTab: many })];
     }));
     const label = (a) => labels.get(a.address);
     const detail = new Map(list.map(a => [a.address, /^\d+$/.test(label(a)) ? null : label(a)]));
@@ -1654,7 +1994,10 @@ export default class Agents extends View {
       if (detail.get(a.address) == null && seen[`${a.space_name}\u0000`] > 1) detail.set(a.address, label(a));
     }
 
-    const row = (a, i, subs = []) => {
+    const row = (a, i, subs = [], dragCtx = null) => {
+      const isFloating = Boolean(dragCtx?.isFloating);
+      const dragGroup = dragCtx?.group ?? null;
+      const memberIdx = dragCtx?.memberIdx ?? i;
       const pic = icon(a.program, 16, t.foreground);
       const more = detail.get(a.address);
       const rowTerm = all.find((x) => x.address === a.address);
@@ -1680,9 +2023,9 @@ export default class Agents extends View {
           })
           .on_click(() => {
             this.selectAgent(a.address);
+            const targetPane = a.pane || this.paneByAddr?.get(a.address) || null;
             if (isSideChat) this.peek(a.address);
-            else if (a.pane) run("pane.focus", { pane: a.pane });
-            else if (a.acp) this.peek(a.address);
+            else if (targetPane) run("pane.focus", { pane: targetPane });
             else run("terminal.keep", { terminal: a.address, place: "tab" });
           })
           .child(div().flex_1().min_w(0).whitespace_nowrap().text_right().text_color(a.focused ? t.foreground : t.muted).child(String(i + 1)))
@@ -1700,6 +2043,7 @@ export default class Agents extends View {
         .cursor_pointer()
         .hover((s) => s.bg(t.hover).text_color(t.foreground))
         .tooltip(isPinned ? tr("Unpin", "取消置顶") : tr("Pin to the top", "置顶"))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
         .on_click((_e, cx) => {
           cx.stop_propagation();
           run("terminal.pin", { terminal: a.address, pinned: !isPinned });
@@ -1717,6 +2061,7 @@ export default class Agents extends View {
         .cursor_pointer()
         .hover((s) => s.bg(t.hover).text_color(t.foreground))
         .tooltip(tr("Move to recycle bin", "移入回收站"))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
         .on_click((_e, cx) => {
           cx.stop_propagation();
           this.hovered = null;
@@ -1746,51 +2091,102 @@ export default class Agents extends View {
         elapsedMs: rowElapsed.ms,
         displayLabel: more || name,
       });
+      const canDrag = !isFloating && dragGroup && dragGroup.members.length > 1;
+      const showHoverActions = !isFloating && !this.agentDrag?.moving && this.hovered === a.address;
       return h_flex()
-        .id(`ag-${a.address}`)
+        .id(isFloating ? `float-row-${a.address}` : `ag-${a.address}`)
         .px(8)
         .h(30)
         .flex_none()
         .rounded(8)
         .items_center()
         .gap(9)
-        .when(a.focused, (el) => el.bg(t.selected))
-        .cursor_pointer()
-        .hover((s) => s.bg(t.hover))
-        .tooltip(rowHoverTip)
-        .on_hover((on, cx) => {
-          if (on) {
-            this.hovered = a.address;
-            this.scheduleHoverDigest(a.address, rowTerm ?? a, cx);
-          } else if (this.hovered === a.address) {
-            this.hovered = null;
-          }
-          cx.notify();
-        })
-        .on_mouse_down("right", (_e, cx) => {
-          cx.stop_propagation();
-          this.selectAgent(a.address);
-          openOverlay({ mod: "menu", kind: "popup", width: a.acp ? 280 : 220, props: { tab: "agent", target: { terminal: a.address, pane: a.pane ?? null } } });
-        })
-        .on_click(() => {
-          this.selectAgent(a.address);
-          if (isSideChat) this.peek(a.address);
-          else if (a.pane) run("pane.focus", { pane: a.pane });
-          else if (a.acp) this.peek(a.address);
-          else run("terminal.keep", { terminal: a.address, place: "tab" });
-        })
-        .when(Boolean(pic), el => el.child(div().id(`agent-fold-${a.address}`)
-          .when(subs.length > 0, el => el.on_click((_e, cx) => {
-            cx.stop_propagation();
-            this.folded.has(a.address) ? this.folded.delete(a.address) : this.folded.add(a.address);
-            cx.notify();
-          })).child(pic)))
+        .when(!isFloating && a.focused, (el) => el.bg(t.selected))
+        .when(!isFloating, (el) =>
+          el
+            .cursor_pointer()
+            .hover((s) => (this.agentDrag?.moving ? s : s.bg(t.hover)))
+            .tooltip(rowHoverTip)
+            .on_hover((on, cx) => {
+              if (this.agentDrag?.moving) return;
+              if (on) {
+                this.hovered = a.address;
+                this.scheduleHoverDigest(a.address, rowTerm ?? a, cx);
+              } else if (this.hovered === a.address) {
+                this.hovered = null;
+              }
+              cx.notify();
+            })
+            .on_mouse_down("right", (_e, cx) => {
+              cx.stop_propagation();
+              this.selectAgent(a.address);
+              openOverlay({ mod: "menu", kind: "popup", width: a.acp ? 280 : 220, props: { tab: "agent", target: { terminal: a.address, pane: a.pane ?? null } } });
+            })
+            .when(canDrag, (dragEl) =>
+              dragEl
+                .on_mouse_down("left", (e, cx) => {
+                  const rawY = e?.position?.y;
+                  if (typeof rawY !== "number") return;
+                  this.flushAgentSettle();
+                  this.suppressClickUntil = 0;
+                  const members = dragGroup.members;
+                  const dragHeight = this.agentUnitHeight(a.address, subCountOf(a));
+                  const startTop = this.agentSlotTop(members, memberIdx, subCountOf);
+                  this.agentDrag = {
+                    groupId: dragGroup.id,
+                    id: a.address,
+                    from: memberIdx,
+                    to: memberIdx,
+                    startY: rawY / this.agentZoom(),
+                    startTop,
+                    dragHeight,
+                    dy: 0,
+                    moving: false,
+                    ids: members.map((m) => m.address),
+                    members,
+                    member: a,
+                    subs,
+                    subCountOf,
+                  };
+                  cx?.notify?.();
+                })
+                .on_mouse_move((e, cx) => this.handleAgentDragMove(e, cx))
+                .on_mouse_up("left", (_e, cx) => this.finishAgentDrag(cx)),
+            )
+            .on_click(() => {
+              if (this.suppressClickUntil && Date.now() < this.suppressClickUntil) {
+                this.suppressClickUntil = 0;
+                return;
+              }
+              this.selectAgent(a.address);
+              const targetPane = a.pane || this.paneByAddr?.get(a.address) || null;
+              if (isSideChat) this.peek(a.address);
+              else if (targetPane) run("pane.focus", { pane: targetPane });
+              else run("terminal.keep", { terminal: a.address, place: "tab" });
+            }),
+        )
+        .when(Boolean(pic), (el) =>
+          el.child(
+            div()
+              .id(isFloating ? `float-fold-icon-${a.address}` : `agent-fold-${a.address}`)
+              .when(!isFloating && subs.length > 0, (fel) =>
+                fel
+                  .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                  .on_click((_e, cx) => {
+                    cx.stop_propagation();
+                    this.folded.has(a.address) ? this.folded.delete(a.address) : this.folded.add(a.address);
+                    cx.notify();
+                  }),
+              )
+              .child(pic),
+          ),
+        )
         .child(h_flex().flex_1().min_w(0).gap(5).items_center()
           .child(div().min_w(0).max_w(full && more ? 120 : 200).truncate().text_color(idle ? t.muted : t.foreground).child(name))
           .when(showId, (el) =>
             el.child(
               div()
-                .id(`ag-id-${a.address}`)
+                .id(isFloating ? `float-id-${a.address}` : `ag-id-${a.address}`)
                 .flex_none()
                 .px(3.5)
                 .py(0.5)
@@ -1801,7 +2197,7 @@ export default class Agents extends View {
                 .font_family(mono)
                 .text_size(9.5)
                 .text_color(t.dim)
-                .tooltip(tr(`Agent ID: ${a.address}`, `智能体编号：${a.address}`))
+                .when(!isFloating, (tipEl) => tipEl.tooltip(tr(`Agent ID: ${a.address}`, `智能体编号：${a.address}`)))
                 .child(shortId),
             ),
           )
@@ -1813,16 +2209,31 @@ export default class Agents extends View {
           const slash = typeof a.address === "string" ? a.address.lastIndexOf("/") : -1;
           const prefix = slash >= 0 ? a.address.slice(0, slash + 1) : "";
           const parentAddr = rawParent ? (rawParent.includes("/") ? rawParent : `${prefix}${rawParent}`) : "";
-          const parentRec = parentAddr ? all.find((x) => x.address === parentAddr) : null;
-          const shortParent = parentAddr
-            ? (parentRec?.labels?.["herdr.name"]
-                || parentRec?.name
-                || (prefix && parentAddr.startsWith(prefix) ? parentAddr.slice(prefix.length) : parentAddr))
-            : "";
+          const shortParent = parentAddr ? shortAgentId(parentAddr) : "";
           const badgeText = shortParent ? `${lb.label} ← ${shortParent}` : lb.label;
+          const isHandoff = String(rec?.lineage?.kind || "").toLowerCase() === "handoff";
+          const isTrashedLabel = (r) => {
+            const v = r?.labels?.["herdr.trashed"];
+            return v === true || (typeof v === "string" && v.trim().length > 0);
+          };
+          const parentTrashedEntry = parentAddr ? (trashed.find((it) => it?.address === parentAddr) ?? null) : null;
+          const parentRec = parentAddr ? (allByAddr.get(parentAddr) ?? null) : null;
+          const parentInTrash = Boolean(parentTrashedEntry) || isTrashedLabel(parentRec);
+          const parentAlive =
+            Boolean(parentAddr) &&
+            !parentInTrash &&
+            (Boolean(parentRec && parentRec.state === "live") ||
+              list.some((x) => x.address === parentAddr) ||
+              allPanes.some((p) => p.terminal === parentAddr));
+          const tip =
+            isHandoff && parentInTrash
+              ? tr(`${shortParent || parentAddr} is in the recycle bin (click to restore)`, `${shortParent || parentAddr} 已移除到回收站（点击可恢复）`)
+              : isHandoff && !parentAlive
+                ? tr("Parent agent has been deleted", "父 agent 已删除")
+                : tr(`From ${parentAddr} (click to focus)`, `来自 ${parentAddr}（点击定位上级）`);
           return el.child(
             div()
-              .id(`ag-kind-${a.address}`)
+              .id(isFloating ? `float-kind-${a.address}` : `ag-kind-${a.address}`)
               .flex_none()
               .max_w(130)
               .truncate()
@@ -1835,13 +2246,44 @@ export default class Agents extends View {
               .text_size(9.5)
               .font_semibold()
               .text_color(lb.color)
-              .when(Boolean(parentAddr), (b) =>
+              .when(!isFloating && Boolean(parentAddr), (b) =>
                 b
                   .cursor_pointer()
-                  .tooltip(tr(`From ${parentAddr} (click to focus)`, `来自 ${parentAddr}（点击定位上级）`))
+                  .tooltip(tip)
                   .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
                   .on_click((_e, cx) => {
                     cx.stop_propagation();
+                    if (isHandoff) {
+                      if (parentInTrash) {
+                        openOverlay({
+                          mod: "agents",
+                          kind: "dialog",
+                          key: `parent-restore-${parentAddr}`,
+                          width: 380,
+                          height: 168,
+                          props: {
+                            parentRestoreDialog: true,
+                            parentAddr,
+                            shortParent: shortParent || parentAddr,
+                            live: Boolean(parentTrashedEntry?.live ?? (parentRec?.state === "live")),
+                          },
+                        });
+                        return;
+                      }
+                      if (!parentAlive) {
+                        if (typeof notify === "function") {
+                          notify({
+                            title: tr("Parent agent has been deleted", "父 agent 已删除"),
+                            body: tr(
+                              `${shortParent || parentAddr} has been permanently deleted`,
+                              `${shortParent || parentAddr} 已被彻底删除，无法跳转`,
+                            ),
+                            level: "warning",
+                          });
+                        }
+                        return;
+                      }
+                    }
                     run("agent.focus", { terminal: parentAddr });
                   }),
               )
@@ -1852,7 +2294,7 @@ export default class Agents extends View {
           const wtPath = all.find((x) => x.address === a.address)?.lineage?.worktree_path;
           return el.child(
             div()
-              .id(`ag-wt-${a.address}`)
+              .id(isFloating ? `float-wt-${a.address}` : `ag-wt-${a.address}`)
               .flex_none()
               .px(4)
               .py(1)
@@ -1863,13 +2305,13 @@ export default class Agents extends View {
               .text_size(9.5)
               .font_semibold()
               .text_color("#f59e0b")
-              .tooltip(tr(`Isolated Worktree: ${wtPath}`, `独立 Worktree：${wtPath}`))
+              .when(!isFloating, (tipEl) => tipEl.tooltip(tr(`Isolated Worktree: ${wtPath}`, `独立 Worktree：${wtPath}`)))
               .child("WT"),
           );
         })
         .child(
           div()
-            .id(`ag-rt-${a.address}`)
+            .id(isFloating ? `float-rt-${a.address}` : `ag-rt-${a.address}`)
             .flex_none()
             .px(4)
             .py(1)
@@ -1880,16 +2322,16 @@ export default class Agents extends View {
             .child(a.acp ? "ACP" : "CLI"),
         )
         .when(Boolean(machine), el => el.child(div().text_size(10).text_color(t.dim).child(machine)))
-        .when(subs.length > 0, el => el.child(fold(a, subs)))
-        .when(this.hovered === a.address, el => el.child(pin).child(remove))
-        .when(this.hovered !== a.address, el =>
+        .when(subs.length > 0, el => el.child(fold(a, subs, isFloating)))
+        .when(showHoverActions, el => el.child(pin).child(remove))
+        .when(!showHoverActions, el =>
           el.child(
             div()
-              .id(`ag-time-${a.address}`)
+              .id(isFloating ? `float-time-${a.address}` : `ag-time-${a.address}`)
               .flex_none()
               .text_size(11)
               .text_color(rowElapsed.working ? (t.working ?? t.accent ?? t.foreground) : (rowElapsed.ran ? t.muted : t.dim))
-              .tooltip(elapsedTooltip(rowElapsed))
+              .when(!isFloating, (tipEl) => tipEl.tooltip(elapsedTooltip(rowElapsed)))
               .child(formatElapsed(rowElapsed.ms)),
           ),
         )
@@ -1902,6 +2344,9 @@ export default class Agents extends View {
                 ai_status_kind: a.ai_status_kind ?? liveRec.ai_status_kind,
               }
             : a;
+          if (isFloating) {
+            return h_flex().min_w(24).h(22).px(5).items_center().justify_center().flex_none().child(this.status(t, merged, byPriority && !isPinned));
+          }
           return this.statusButton(t, a.address, merged, byPriority && !isPinned);
         })());
     };
@@ -1943,9 +2388,88 @@ export default class Agents extends View {
           .when(!byPriority && top && top !== "idle", (el) => el.child(this.status(t, { status: top }, true)))
           .child(svg("mods/workspace-chrome/chevron-right.svg").size(11).flex_none().text_color(t.dim)));
     };
+    if (this.agentDrag && !list.some((a) => a.address === this.agentDrag.id)) {
+      this.agentDrag = null;
+    }
+    const activeMotion = this.agentDrag?.moving ? this.agentDrag : this.agentSettling;
+
+    const renderGroupBody = (g) => {
+      const groupSig = g.members.map((m) => m.address).join(",");
+      const snap =
+        this.agentSnapFromOrder?.groupId === g.id &&
+        (groupSig !== this.agentSnapFromOrder.sig || Date.now() > this.agentSnapUntil);
+      if (snap) this.agentSnapFromOrder = null;
+      const groupMotion = activeMotion && activeMotion.groupId === g.id ? activeMotion : null;
+
+      const units = g.members.map((a, mi) => {
+        let shift = 0;
+        let isHiddenSource = false;
+        if (groupMotion) {
+          if (a.address === groupMotion.id) {
+            isHiddenSource = true;
+          } else if (groupMotion.from < groupMotion.to && mi > groupMotion.from && mi <= groupMotion.to) {
+            shift = -groupMotion.dragHeight;
+          } else if (groupMotion.from > groupMotion.to && mi >= groupMotion.to && mi < groupMotion.from) {
+            shift = groupMotion.dragHeight;
+          }
+        }
+        if (isHiddenSource) {
+          return div()
+            .id(`agent-unit-${a.address}`)
+            .h(groupMotion.dragHeight)
+            .flex_none()
+            .opacity(0);
+        }
+        const subs = subsByAddr.get(a.address) ?? [];
+        const visibleSubs = this.folded.has(a.address) ? [] : subs;
+        return v_flex()
+          .id(`agent-unit-${a.address}`)
+          .relative()
+          .top(shift)
+          .spring("top", { response: snap ? 0 : 165, damping: 0.86, epsilon: 0.25 })
+          .on_size_change((sz) => {
+            const z = this.agentZoom();
+            const mh = sz && typeof sz.height === "number" ? sz.height / z : 0;
+            if (mh > 0 && Math.abs((this.agentHeights[a.address] ?? 0) - mh) > 0.5) {
+              this.agentHeights[a.address] = mh;
+            }
+          })
+          .child(row(a, mi, subs, { group: g, memberIdx: mi, isFloating: false }))
+          .children(visibleSubs.map((s) => this.subRow(t, s, focusedAddrs, byPriority)));
+      });
+
+      let floatCard = null;
+      if (groupMotion) {
+        const isLiveDrag = Boolean(this.agentDrag?.moving && this.agentDrag.groupId === g.id);
+        const floatY = groupMotion.startTop + (isLiveDrag ? this.agentDrag.dy : groupMotion.destDy);
+        const floatSubs = this.folded.has(groupMotion.id) ? [] : (subsByAddr.get(groupMotion.id) ?? groupMotion.subs ?? []);
+        floatCard = v_flex()
+          .id(`agent-float-${groupMotion.id}`)
+          .absolute()
+          .left(0)
+          .right(0)
+          .top(floatY)
+          .spring("top", { response: isLiveDrag ? 0 : 160, damping: 0.88, epsilon: 0.25 })
+          .rounded(8)
+          .bg(t.raised ?? t.selected)
+          .border_1()
+          .border_color(t.accent ?? t.border)
+          .shadow_lg()
+          .cursor_grabbing()
+          .child(row(groupMotion.member, groupMotion.from, subsByAddr.get(groupMotion.id) ?? groupMotion.subs ?? [], { isFloating: true }))
+          .children(floatSubs.map((s) => this.subRow(t, s, focusedAddrs, byPriority)));
+      }
+
+      return v_flex()
+        .id(`agent-group-body-${g.id}`)
+        .relative()
+        .children(units)
+        .when(Boolean(floatCard), (el) => el.child(floatCard));
+    };
+
     const rows = collapsed
       ? list.flatMap(withKids)
-      : groups.flatMap((g) => [header(g), ...(this.folded.has(g.id) ? [] : g.members.flatMap(withKids))]);
+      : groups.flatMap((g) => (this.folded.has(g.id) ? [header(g)] : [header(g), renderGroupBody(g)]));
 
     const awayBanner = typeof shared === "function" ? shared("briefing.away") : null;
     const awayChangedCount = Number(awayBanner?.changed_count ?? 0) || 0;
@@ -1957,6 +2481,7 @@ export default class Agents extends View {
     const briefingHot = awayChangedCount > 0 || list.some((a) => rankOf(a) >= RANK.blocked);
 
     return v_flex()
+      .relative()
       .size_full()
       .min_h(0)
       .bg(t.chrome)
@@ -2003,9 +2528,12 @@ export default class Agents extends View {
                     .hover((s) => s.bg(t.hover).text_color(t.foreground))
                     .on_click(() => this.openBriefing())
                     .tooltip(
-                      awayChangedCount > 0
-                        ? tr(`Catch-up Briefing (${awayChangedCount} updates while away)`, `离开重连简报（离开期间 ${awayChangedCount} 项新动态）`)
-                        : tr("Catch-up Briefing: priority blockers, batch approvals & diffs", "全局进展速览：阻塞排序、同类审批一键合批、完成项验收"),
+                      withShortcut(
+                        awayChangedCount > 0
+                          ? tr(`Catch-up Briefing (${awayChangedCount} updates while away)`, `离开重连简报（离开期间 ${awayChangedCount} 项新动态）`)
+                          : tr("Catch-up Briefing: priority blockers, batch approvals & diffs", "全局进展速览：阻塞排序、同类审批一键合批、完成项验收"),
+                        "agent.briefing",
+                      ),
                     )
                     .child(svg("mods/workspace-chrome/layers.svg").size(12))
                     .child(div().font_medium().child(tr("Brief", "速览")))
@@ -2085,7 +2613,7 @@ export default class Agents extends View {
                 .text_color(briefingHot ? (t.blocked ?? "#f59e0b") : t.muted)
                 .cursor_pointer()
                 .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                .tooltip(tr("Catch-up Briefing", "全局进展速览"))
+                .tooltip(withShortcut(tr("Catch-up Briefing", "全局进展速览"), "agent.briefing"))
                 .on_click(() => this.openBriefing())
                 .child(svg("mods/workspace-chrome/layers.svg").size(13)),
             )
@@ -2114,10 +2642,23 @@ export default class Agents extends View {
                     .text_size(13)
                     .text_color(t.dim)
                     .hover((s) => s.text_color(t.foreground))
+                    .tooltip(withShortcut(tr("Expand sidebar", "展开侧边栏"), "layout.toggle:sidebar"))
                     .on_click(toggleSidebar)
                     .child("»"),
                 ),
             ),
+        ),
+      )
+      .when(Boolean(this.agentDrag?.moving), (el) =>
+        el.child(
+          div()
+            .id("agent-drag-shield")
+            .absolute()
+            .inset(0)
+            .bg("#00000000")
+            .cursor_grabbing()
+            .on_mouse_move((e, cx) => this.handleAgentDragMove(e, cx))
+            .on_mouse_up("left", (_e, cx) => this.finishAgentDrag(cx)),
         ),
       );
   }

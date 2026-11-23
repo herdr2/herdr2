@@ -186,12 +186,16 @@ pub struct TerminalView {
     shown_in: Cell<u64>,
     /// When the person last typed here: output right after is shown at once.
     typed_at: Cell<Option<Instant>>,
+    /// Best-effort live tracker of what the person has typed into the CLI prompt since last submit/clear.
+    draft: RefCell<CliDraftTracker>,
     /// When the person last pressed Enter/newline in this pane.
     last_enter_at: Cell<Option<Instant>>,
     /// When the current PTY stream attached (suppresses attach replay from counting as live output).
     attached_at: Instant,
     /// Last non-echo PTY output timestamp (fallback activity signal for CLI agents without OSC 7501).
     last_output_at: Option<Instant>,
+    /// Last observed active-screen text fingerprint (ignores color/style-only TUI animations like ZCode's logo shimmer).
+    last_text_fingerprint: Option<(u64, u64)>,
     /// Last live terminal title change timestamp (distinguishes static `✳` idle titles from active spinners).
     last_title_change_at: Option<Instant>,
     /// Scrolled this gesture, in lines, toward the next whole one.
@@ -210,6 +214,624 @@ pub struct TerminalView {
     published_from_bottom: Option<u64>,
     _render_hold: Option<(Instant, Task<()>)>,
     _reader: Option<Task<()>>,
+}
+
+/// Lightweight tracker of the user's current unsent CLI input buffer in a PTY terminal.
+#[derive(Default)]
+struct CliDraftTracker {
+    chars: Vec<char>,
+    cursor: usize,
+    pasting: bool,
+    esc: Vec<u8>,
+    utf8: Vec<u8>,
+}
+
+impl CliDraftTracker {
+    fn text(&self) -> String {
+        self.chars.iter().collect()
+    }
+
+    fn clear(&mut self) {
+        self.chars.clear();
+        self.cursor = 0;
+        self.utf8.clear();
+    }
+
+    fn set_text(&mut self, text: &str) {
+        self.chars = text.chars().collect();
+        self.cursor = self.chars.len();
+        self.pasting = false;
+        self.esc.clear();
+        self.utf8.clear();
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        let pos = self.cursor.min(self.chars.len());
+        self.chars.insert(pos, ch);
+        self.cursor = pos + 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor > 0 && self.cursor <= self.chars.len() {
+            self.cursor -= 1;
+            self.chars.remove(self.cursor);
+        }
+    }
+
+    fn delete_forward(&mut self) {
+        if self.cursor < self.chars.len() {
+            self.chars.remove(self.cursor);
+        }
+    }
+
+    fn delete_word(&mut self) {
+        while self.cursor > 0 && self.chars[self.cursor - 1].is_whitespace() {
+            self.cursor -= 1;
+            self.chars.remove(self.cursor);
+        }
+        while self.cursor > 0 && !self.chars[self.cursor - 1].is_whitespace() {
+            self.cursor -= 1;
+            self.chars.remove(self.cursor);
+        }
+    }
+
+    fn push_utf8_byte(&mut self, b: u8) {
+        self.utf8.push(b);
+        match std::str::from_utf8(&self.utf8) {
+            Ok(s) => {
+                let owned = s.to_owned();
+                self.utf8.clear();
+                for ch in owned.chars() {
+                    if !ch.is_control() || ch == '\n' || ch == '\t' {
+                        self.insert_char(ch);
+                    }
+                }
+            }
+            Err(e) if e.error_len().is_none() => {
+                // Incomplete multi-byte UTF-8 sequence; wait for remaining bytes.
+                if self.utf8.len() > 4 {
+                    self.utf8.clear();
+                }
+            }
+            Err(_) => self.utf8.clear(),
+        }
+    }
+
+    fn submit_or_backslash_newline(&mut self) {
+        if self.cursor > 0 && self.chars.get(self.cursor - 1) == Some(&'\\') {
+            self.backspace();
+            self.insert_char('\n');
+        } else {
+            self.clear();
+        }
+    }
+
+    fn handle_escape(&mut self) {
+        let seq = self.esc.clone();
+        if seq == b"\x1b[200~" {
+            self.pasting = true;
+            return;
+        }
+        if seq == b"\x1b\r" || seq == b"\x1b\n" {
+            self.insert_char('\n');
+            return;
+        }
+        match seq.as_slice() {
+            b"\x1b[D" | b"\x1bOD" => self.cursor = self.cursor.saturating_sub(1),
+            b"\x1b[C" | b"\x1bOC" => self.cursor = (self.cursor + 1).min(self.chars.len()),
+            b"\x1b[H" | b"\x1bOH" | b"\x1b[1~" => self.cursor = 0,
+            b"\x1b[F" | b"\x1bOF" | b"\x1b[4~" => self.cursor = self.chars.len(),
+            b"\x1b[3~" => self.delete_forward(),
+            // Win32 input mode: CSI Vk;Sc;Uc;Kd;Cs;Rc _
+            _ if seq.starts_with(b"\x1b[") && seq.ends_with(b"_") => {
+                let Ok(body) = std::str::from_utf8(&seq[2..seq.len() - 1]) else { return };
+                let parts: Vec<u32> = body.split(';').filter_map(|p| p.parse::<u32>().ok()).collect();
+                if parts.len() >= 5 {
+                    let (vk, kd, cs) = (parts[0], parts[3], parts[4]);
+                    if kd == 1 && vk == 13 {
+                        if cs != 0 {
+                            self.insert_char('\n');
+                        } else {
+                            self.submit_or_backslash_newline();
+                        }
+                    }
+                }
+            }
+            // modifyOtherKeys: CSI 27;mod;code~
+            _ if seq.starts_with(b"\x1b[27;") && seq.ends_with(b"~") => {
+                let Ok(body) = std::str::from_utf8(&seq[5..seq.len() - 1]) else { return };
+                let mut parts = body.split(';');
+                let modifiers = parts.next().and_then(|p| p.parse::<u32>().ok());
+                let code = parts.next().and_then(|p| p.parse::<u32>().ok());
+                let (Some(modifiers), Some(code)) = (modifiers, code) else { return };
+                match (code, modifiers) {
+                    (13, 1) => self.submit_or_backslash_newline(),
+                    (13, 2..=16) => self.insert_char('\n'),
+                    (99 | 117 | 100, 5) => self.clear(),
+                    (97, 5) => self.cursor = 0,
+                    (101, 5) => self.cursor = self.chars.len(),
+                    (107, 5) => self.chars.truncate(self.cursor),
+                    (119, 5) => self.delete_word(),
+                    _ => {}
+                }
+            }
+            _ if seq.starts_with(b"\x1b[") && seq.ends_with(b"u") => {
+                let Ok(body) = std::str::from_utf8(&seq[2..seq.len() - 1]) else { return };
+                let mut params = body.split(';');
+                let code = params.next().and_then(|p| p.split(':').next()?.parse::<u32>().ok());
+                let mut mods = params.next().unwrap_or("").split(':');
+                let modifiers = mods.next().filter(|s| !s.is_empty()).unwrap_or("1").parse::<u32>().ok();
+                let event = mods.next().unwrap_or("1");
+                if event == "3" {
+                    return;
+                }
+                let (Some(code), Some(modifiers)) = (code, modifiers) else { return };
+                let m = modifiers.saturating_sub(1) & !0xc0;
+                match (code, m + 1) {
+                    (13, 1) => self.submit_or_backslash_newline(),
+                    (13, 2 | 3 | 4) => self.insert_char('\n'),
+                    (8 | 127, 1) => self.backspace(),
+                    (99 | 117 | 100, 5) => self.clear(),
+                    (97, 5) => self.cursor = 0,
+                    (101, 5) => self.cursor = self.chars.len(),
+                    (107, 5) => self.chars.truncate(self.cursor),
+                    (119, 5) => self.delete_word(),
+                    (32..=0x10ffff, 1 | 2)
+                        if char::from_u32(code).is_some_and(|c| !c.is_control())
+                            && !(57344..=63743).contains(&code) =>
+                    {
+                        if let Some(ch) = char::from_u32(code) {
+                            self.insert_char(ch);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn feed(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            if self.pasting {
+                if b == 0x1b || !self.esc.is_empty() {
+                    self.esc.push(b);
+                    if self.esc == b"\x1b[201~" {
+                        self.pasting = false;
+                        self.esc.clear();
+                    } else if !b"\x1b[201~".starts_with(&self.esc) {
+                        let flushed = std::mem::take(&mut self.esc);
+                        for fb in flushed {
+                            if fb == b'\r' {
+                                self.insert_char('\n');
+                            } else if fb >= 0x20 || fb == b'\n' || fb == b'\t' {
+                                self.push_utf8_byte(fb);
+                            }
+                        }
+                    }
+                } else if b == b'\r' {
+                    self.insert_char('\n');
+                } else if b == b'\n' {
+                    if self.cursor == 0 || self.chars.get(self.cursor - 1) != Some(&'\n') {
+                        self.insert_char('\n');
+                    }
+                } else if b >= 0x20 || b == b'\t' {
+                    self.push_utf8_byte(b);
+                }
+                continue;
+            }
+
+            if b == 0x1b || !self.esc.is_empty() {
+                self.utf8.clear();
+                self.esc.push(b);
+                let complete = match self.esc.as_slice() {
+                    [0x1b] | [0x1b, b'[' | b'O'] => false,
+                    [0x1b, b'[', b'M', ..] => self.esc.len() >= 6,
+                    [0x1b, b'[', ..] => (0x40..=0x7e).contains(&b),
+                    _ => true,
+                };
+                if complete || self.esc.len() >= 128 {
+                    self.handle_escape();
+                    self.esc.clear();
+                }
+                continue;
+            }
+
+            match b {
+                b'\r' => self.submit_or_backslash_newline(),
+                // Ctrl+J / LF inserts a newline in CLI agents (Enter sends CR).
+                b'\n' => self.insert_char('\n'),
+                0x03 | 0x15 | 0x04 => self.clear(),
+                0x01 => self.cursor = 0,
+                0x05 => self.cursor = self.chars.len(),
+                0x0b => self.chars.truncate(self.cursor),
+                0x7f | 0x08 => self.backspace(),
+                0x17 => self.delete_word(),
+                b'\t' => self.insert_char('\t'),
+                0x20..=0x7e => self.insert_char(b as char),
+                0x80..=0xff => self.push_utf8_byte(b),
+                _ => {}
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CliScreenInput {
+    /// Active CLI input box was found and is definitively empty or placeholder-only.
+    Empty,
+    /// Active CLI input box was found with non-empty user text (possibly multi-line).
+    Text(String),
+    /// Could not locate a CLI input box on screen (e.g. plain shell or active streaming output).
+    Unknown,
+}
+
+fn is_horizontal_rule(s: &str) -> bool {
+    let trimmed = s.trim();
+    let mut rule_chars = 0usize;
+    for ch in trimmed.chars() {
+        if matches!(ch, '─' | '━' | '═' | '-' | '_') {
+            rule_chars += 1;
+        } else if !matches!(ch, ' ' | '╭' | '╮' | '╰' | '╯' | '┌' | '┐' | '└' | '┘' | '├' | '┤' | '┬' | '┴' | '┼') {
+            return false;
+        }
+    }
+    rule_chars >= 6
+}
+
+fn strip_box_sides(row: &vt::PromptRow) -> vt::PromptRow {
+    let chars: Vec<char> = row.text.chars().collect();
+    let n = chars.len();
+    let mut start = 0usize;
+    while start < n && chars[start] == ' ' {
+        start += 1;
+    }
+    if start < n && matches!(chars[start], '│' | '┃') {
+        start += 1;
+        if start < n && chars[start] == ' ' {
+            start += 1;
+        }
+        let mut end = n;
+        while end > start && chars[end - 1] == ' ' {
+            end -= 1;
+        }
+        if end > start && matches!(chars[end - 1], '│' | '┃') {
+            end -= 1;
+        }
+        while end > start && chars[end - 1] == ' ' {
+            end -= 1;
+        }
+        let text: String = chars[start..end].iter().collect();
+        let dim = if row.dim.len() == n { row.dim[start..end].to_vec() } else { vec![false; end - start] };
+        let inverse = if row.inverse.len() == n { row.inverse[start..end].to_vec() } else { vec![false; end - start] };
+        return vt::PromptRow { text, dim, inverse };
+    }
+    row.clone()
+}
+
+/// Matches a CLI prompt prefix (`❯`, `›`, `>`, `»`) either bare (empty prompt)
+/// or followed by space/NBSP. Returns `(content_char_start, continuation_gutter_cols)`.
+fn match_prompt_prefix(text: &str) -> Option<(usize, usize)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() && chars[i] == ' ' {
+        i += 1;
+    }
+    let ch = *chars.get(i)?;
+    if !matches!(ch, '❯' | '›' | '>' | '»') {
+        return None;
+    }
+    match chars.get(i + 1) {
+        None => Some((i + 1, i + 2)),
+        Some(' ' | '\u{a0}') => Some((i + 2, i + 2)),
+        Some(_) => None,
+    }
+}
+
+fn is_placeholder_text(candidate: &str) -> bool {
+    const PLACEHOLDERS: &[&str] = &[
+        "try \"",
+        "ask anything",
+        "ask claude",
+        "ask codex",
+        "ask gemini",
+        "ask opencode",
+        "ask a question",
+        "type your",
+        "message ",
+        "send a message",
+        "what would you like",
+        "enter a prompt",
+        "describe a ",
+        "describe the ",
+        "explain this codebase",
+        "implement {",
+        "summarize recent",
+        "find and fix a bug",
+        "请输入",
+    ];
+    let lower = candidate.trim().to_ascii_lowercase();
+    PLACEHOLDERS.iter().any(|p| lower.starts_with(p))
+}
+
+/// Extracts non-placeholder user text from a prompt line after `start_char`.
+/// Returns `None` if the content is blank, entirely faint/placeholder, or a known placeholder.
+fn extract_prompt_line_content(row: &vt::PromptRow, start_char: usize) -> Option<String> {
+    let chars: Vec<char> = row.text.chars().collect();
+    if start_char >= chars.len() {
+        return None;
+    }
+    let has_styles = row.dim.len() == chars.len() && row.inverse.len() == chars.len();
+    let slice = &chars[start_char..];
+    let dim_slice = if has_styles { &row.dim[start_char..] } else { &[] };
+    let inv_slice = if has_styles { &row.inverse[start_char..] } else { &[] };
+
+    let mut l = 0usize;
+    let mut r = slice.len();
+    while l < r && slice[l].is_whitespace() {
+        l += 1;
+    }
+    while r > l && slice[r - 1].is_whitespace() {
+        r -= 1;
+    }
+    if l >= r {
+        return None;
+    }
+
+    if has_styles {
+        let mut total = 0usize;
+        let mut dim_count = 0usize;
+        let mut inv_count = 0usize;
+        for idx in l..r {
+            if !slice[idx].is_whitespace() {
+                total += 1;
+                if dim_slice[idx] {
+                    dim_count += 1;
+                } else if inv_slice[idx] {
+                    inv_count += 1;
+                }
+            }
+        }
+        // Entire line is faint/dim (allowing 1 inverse block-cursor char on the first char of a placeholder).
+        if (total == 1 && dim_count == 1)
+            || (total >= 2 && (dim_count == total || (dim_count + inv_count == total && inv_count <= 1)))
+        {
+            return None;
+        }
+        // Strip trailing inline ghost-text autocomplete rendered in faint style.
+        let mut end = r;
+        while end > l && (slice[end - 1].is_whitespace() || (dim_slice[end - 1] && !inv_slice[end - 1])) {
+            end -= 1;
+        }
+        if end > l {
+            r = end;
+        }
+    }
+
+    let content: String = slice[l..r].iter().collect();
+    if content.trim().is_empty() || is_placeholder_text(&content) {
+        return None;
+    }
+    Some(content)
+}
+
+fn strip_continuation_gutter(text: &str, gutter: usize) -> String {
+    let mut skip = 0usize;
+    let mut removed = 0usize;
+    for (byte_idx, ch) in text.char_indices() {
+        if removed < gutter && (ch == ' ' || ch == '\u{a0}') {
+            skip = byte_idx + ch.len_utf8();
+            removed += 1;
+        } else {
+            break;
+        }
+    }
+    text[skip..].trim_end().to_owned()
+}
+
+fn is_cli_footer_row(row: &vt::PromptRow) -> bool {
+    let trimmed = row.text.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    const FOOTERS: &[&str] = &[
+        "? for shortcuts",
+        "shift+tab",
+        "context left",
+        "bypass permissions",
+        "accept edits",
+        "esc to interrupt",
+        "esc to cancel",
+        "ctrl+c",
+        "ctrl+d",
+        "ctrl+j",
+        "auto-accept",
+        "plan mode",
+        "using 1 ",
+        "using 2 ",
+        "tokens",
+        "effort:",
+    ];
+    if FOOTERS.iter().any(|f| lower.contains(f)) {
+        return true;
+    }
+    let chars: Vec<char> = row.text.chars().collect();
+    if row.dim.len() == chars.len() {
+        let mut non_space = 0usize;
+        let mut dim_non_space = 0usize;
+        for (idx, ch) in chars.iter().enumerate() {
+            if !ch.is_whitespace() {
+                non_space += 1;
+                if row.dim[idx] {
+                    dim_non_space += 1;
+                }
+            }
+        }
+        if non_space >= 4 && dim_non_space == non_space {
+            return true;
+        }
+    }
+    false
+}
+
+fn is_assistant_output_row(trimmed: &str) -> bool {
+    let Some(first) = trimmed.chars().next() else { return false };
+    matches!(
+        first,
+        '⏺' | '●' | '✦' | '◆' | '◇' | '✻' | '✽' | '✶' | '✢' | '⠋' | '⠙' | '⠹' | '⠸' | '⠼' | '⠴' | '⠦' | '⠧' | '⠇' | '⠏' | '✓' | '✔' | '✗' | '✘' | '⚠' | '└' | '├'
+    ) || trimmed.starts_with("• ")
+}
+
+fn collect_input_from_slice(rows: &[vt::PromptRow], prompt_idx: usize, end_idx: usize, stop_on_blank: bool) -> CliScreenInput {
+    let first_row = strip_box_sides(&rows[prompt_idx]);
+    let Some((content_start, gutter)) = match_prompt_prefix(&first_row.text) else {
+        return CliScreenInput::Unknown;
+    };
+    let first_line = extract_prompt_line_content(&first_row, content_start);
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut has_continuation = false;
+    for row in &rows[prompt_idx + 1..end_idx] {
+        let clean = strip_box_sides(row);
+        let trimmed = clean.text.trim();
+        if trimmed.is_empty() {
+            if stop_on_blank {
+                break;
+            }
+            lines.push(String::new());
+            continue;
+        }
+        if is_horizontal_rule(trimmed)
+            || (stop_on_blank && (is_cli_footer_row(&clean) || is_assistant_output_row(trimmed) || match_prompt_prefix(&clean.text).is_some()))
+        {
+            break;
+        }
+        let cont = strip_continuation_gutter(&clean.text, gutter);
+        if !cont.trim().is_empty() {
+            has_continuation = true;
+        }
+        lines.push(cont);
+    }
+
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+
+    if first_line.is_none() && !has_continuation {
+        return CliScreenInput::Empty;
+    }
+
+    let mut all = Vec::with_capacity(lines.len() + 1);
+    if let Some(first) = first_line {
+        all.push(first);
+    }
+    all.extend(lines);
+    let joined = all.join("\n");
+    if joined.trim().is_empty() {
+        CliScreenInput::Empty
+    } else {
+        CliScreenInput::Text(joined)
+    }
+}
+
+/// Inspects the active bottom CLI input area (bordered input box or borderless
+/// bottom prompt) without scanning upward into earlier submitted conversation turns.
+fn inspect_cli_input_box(rows: &[vt::PromptRow], _cursor_row: Option<usize>) -> CliScreenInput {
+    let Some(last_non_empty) = rows.iter().rposition(|r| !r.text.trim().is_empty()) else {
+        return CliScreenInput::Unknown;
+    };
+
+    // Pass 1: Bordered input box (Claude Code `─── ... ───`, Gemini `╭─── ... ╰───`).
+    let mut bot_rule = None;
+    let mut non_empty_seen = 0usize;
+    for idx in (0..=last_non_empty).rev() {
+        let trimmed = rows[idx].text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if is_horizontal_rule(trimmed) {
+            bot_rule = Some(idx);
+            break;
+        }
+        non_empty_seen += 1;
+        if non_empty_seen >= 6 {
+            break;
+        }
+    }
+    if let Some(bot) = bot_rule {
+        let search_start = bot.saturating_sub(32);
+        if let Some(top) = (search_start..bot).rev().find(|&i| is_horizontal_rule(&rows[i].text))
+            && top + 1 < bot
+        {
+            if let Some(prompt_rel) = (top + 1..bot).find(|&i| {
+                let clean = strip_box_sides(&rows[i]);
+                match_prompt_prefix(&clean.text).is_some()
+            }) {
+                return collect_input_from_slice(rows, prompt_rel, bot, false);
+            }
+        }
+    }
+
+    // Pass 2: Borderless or top-rule-only bottom prompt (Codex CLI, Aider, etc.).
+    let scan_floor = last_non_empty.saturating_sub(24);
+    let mut content_end = last_non_empty + 1;
+    // Trim trailing footer/chrome lines at the very bottom.
+    while content_end > scan_floor {
+        let idx = content_end - 1;
+        let clean = strip_box_sides(&rows[idx]);
+        let trimmed = clean.text.trim();
+        if trimmed.is_empty() || is_cli_footer_row(&clean) || is_horizontal_rule(trimmed) {
+            content_end -= 1;
+        } else {
+            break;
+        }
+    }
+
+    let mut prompt_idx = None;
+    for idx in (scan_floor..content_end).rev() {
+        let clean = strip_box_sides(&rows[idx]);
+        let trimmed = clean.text.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if is_horizontal_rule(trimmed) || is_assistant_output_row(trimmed) {
+            break;
+        }
+        if match_prompt_prefix(&clean.text).is_some() {
+            prompt_idx = Some(idx);
+            break;
+        }
+    }
+
+    if let Some(p_idx) = prompt_idx {
+        return collect_input_from_slice(rows, p_idx, content_end, true);
+    }
+
+    CliScreenInput::Unknown
+}
+
+fn build_cli_clear_bytes(ctrl_e: &[u8], ctrl_u: &[u8], ctrl_k: &[u8], bs: &[u8], del: &[u8], lines: usize) -> Vec<u8> {
+    let lines = lines.max(1).min(40);
+    let mut clear = Vec::new();
+    // Downward pass: clear current line and pull/clear any lines below cursor.
+    clear.extend_from_slice(ctrl_e);
+    clear.extend_from_slice(ctrl_u);
+    clear.extend_from_slice(ctrl_k);
+    for _ in 1..lines {
+        clear.extend_from_slice(del);
+        clear.extend_from_slice(ctrl_e);
+        clear.extend_from_slice(ctrl_u);
+        clear.extend_from_slice(ctrl_k);
+    }
+    // Upward pass: join and clear any lines above original cursor position.
+    for _ in 1..lines {
+        clear.extend_from_slice(bs);
+        clear.extend_from_slice(ctrl_e);
+        clear.extend_from_slice(ctrl_u);
+        clear.extend_from_slice(ctrl_k);
+    }
+    clear
 }
 
 thread_local! {
@@ -361,9 +983,11 @@ impl TerminalView {
             was_focused: false,
             shown_in: Cell::new(0),
             typed_at: Cell::new(None),
+            draft: RefCell::new(CliDraftTracker::default()),
             last_enter_at: Cell::new(None),
             attached_at: Instant::now(),
             last_output_at: None,
+            last_text_fingerprint: None,
             last_title_change_at: None,
             scrolled: point(0.0, 0.0),
             search_open: false,
@@ -486,6 +1110,7 @@ impl TerminalView {
                 self.lost = false;
                 self.attached_at = Instant::now();
                 self.last_output_at = None;
+                self.last_text_fingerprint = None;
                 let mut g = self.grid.borrow_mut();
                 // Replay uses the size requested by attach, not a newer pane layout.
                 if (g.vt.cols, g.vt.rows) != attached_size {
@@ -559,6 +1184,10 @@ impl TerminalView {
         self.typed_at.get()
     }
 
+    pub fn last_enter_at(&self) -> Option<Instant> {
+        self.last_enter_at.get()
+    }
+
     pub fn last_output_at(&self) -> Option<Instant> {
         self.last_output_at
     }
@@ -604,13 +1233,16 @@ impl TerminalView {
         } else {
             std::borrow::Cow::Borrowed(raw_title)
         };
-        // Short-circuit before touching the grid when title/output already decide.
-        let prelim = infer_pty_agent_state(effective_title.as_ref(), active_output, false, &[]);
-        if prelim != "idle" || !quiet_ready {
-            return prelim;
+        // Short-circuit before touching the grid when title alone already decides.
+        let title_prelim = infer_pty_agent_state(effective_title.as_ref(), false, false, &[]);
+        if title_prelim != "idle" {
+            return title_prelim;
         }
-        let tail = self.grid.borrow().vt.tail_lines(6);
-        infer_pty_agent_state(effective_title.as_ref(), active_output, true, &tail)
+        if !active_output && !quiet_ready {
+            return "idle";
+        }
+        let tail = self.grid.borrow().vt.tail_lines(8);
+        infer_pty_agent_state(effective_title.as_ref(), active_output, quiet_ready, &tail)
     }
 
     #[cfg(test)]
@@ -654,19 +1286,21 @@ impl TerminalView {
     fn ingest(&mut self, batch: impl IntoIterator<Item = Stream>, cx: &mut Context<Self>) -> bool {
         let mut open = true;
         let now = Instant::now();
-        let mut saw_output = false;
-        let title = {
+        let mut saw_data = false;
+        let mut candidate_output = false;
+        let (title, saw_output) = {
             let mut g = self.grid.borrow_mut();
             for item in batch {
                 match item {
                     Stream::Data(bytes) => {
                         if !bytes.is_empty() {
+                            saw_data = true;
                             let settled = now.saturating_duration_since(self.attached_at) >= Duration::from_millis(450);
                             let just_typed = self.typed_at.get().is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(160));
                             let just_entered = self.last_enter_at.get().is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(250));
-                            let echo_only = just_typed && !just_entered && bytes.len() <= 32;
+                            let echo_only = just_typed && !just_entered && bytes.len() <= 256;
                             if settled && !echo_only {
-                                saw_output = true;
+                                candidate_output = true;
                             }
                         }
                         g.vt.allow_clipboard_write(crate::settings::get().clipboard_write);
@@ -701,7 +1335,15 @@ impl TerminalView {
                     }
                 }
             }
-            g.vt.take_title()
+            let text_changed = if saw_data {
+                let fp = g.vt.active_text_fingerprint();
+                let changed = self.last_text_fingerprint != Some(fp);
+                self.last_text_fingerprint = Some(fp);
+                changed
+            } else {
+                false
+            };
+            (g.vt.take_title(), candidate_output && text_changed)
         };
         if saw_output {
             self.last_output_at = Some(now);
@@ -789,6 +1431,7 @@ impl TerminalView {
     fn send(&self, bytes: &[u8]) {
         let now = Instant::now();
         self.typed_at.set(Some(now));
+        self.draft.borrow_mut().feed(bytes);
         if bytes.contains(&b'\r') || bytes.contains(&b'\n') {
             self.last_enter_at.set(Some(now));
         }
@@ -799,6 +1442,102 @@ impl TerminalView {
             g.vt.scroll_to_bottom();
             g.core.input(ch, bytes);
         }
+    }
+
+    /// Returns the user's current unsent CLI input by inspecting the live VT
+    /// input box first and reconciling with the keystroke draft tracker.
+    /// Returns `None` whenever the live input box is visibly empty or shows only
+    /// placeholder text (never reusing an earlier submitted prompt from scrollback).
+    pub fn cli_input_draft(&self) -> Option<String> {
+        let (rows, cursor_row) = self.grid.borrow().vt.active_prompt_rows(40);
+        match inspect_cli_input_box(&rows, cursor_row) {
+            CliScreenInput::Empty => {
+                self.draft.borrow_mut().clear();
+                None
+            }
+            CliScreenInput::Text(screen_text) => {
+                let tracked = self.draft.borrow().text();
+                let tracked_trimmed = tracked.trim();
+                if !tracked_trimmed.is_empty() {
+                    let compact_tracked: String = tracked_trimmed.split_whitespace().collect();
+                    let compact_screen: String = screen_text.split_whitespace().collect();
+                    if !compact_screen.is_empty()
+                        && (compact_tracked == compact_screen
+                            || (compact_tracked.len() > compact_screen.len()
+                                && compact_tracked.contains(&compact_screen)))
+                    {
+                        return Some(tracked_trimmed.to_owned());
+                    }
+                }
+                Some(screen_text)
+            }
+            CliScreenInput::Unknown => {
+                let tracked = self.draft.borrow().text();
+                let trimmed = tracked.trim();
+                (!trimmed.is_empty()).then(|| trimmed.to_owned())
+            }
+        }
+    }
+
+    /// Clears the current CLI input in-place and types `new_text` inline without
+    /// pressing Enter and without triggering bracketed-paste collapse chips
+    /// (`[Pasted text #N +M lines]`) in TUI agents like Claude Code. Returns the
+    /// approximate duration until all inline input chunks have been written to the PTY.
+    pub fn replace_cli_input_in_place(&mut self, old_text: &str, new_text: &str, cx: &mut Context<Self>) -> Duration {
+        let (steps, clear_delay_ms, total_wait) = {
+            let mut g = self.grid.borrow_mut();
+            let (rows, cursor_row) = g.vt.active_prompt_rows(40);
+            let visual_lines = match inspect_cli_input_box(&rows, cursor_row) {
+                CliScreenInput::Text(s) => s.lines().count(),
+                _ => 1,
+            };
+            let ctrl = GHOSTTY_MODS_CTRL as GhosttyMods;
+            let ctrl_e = g.vt.encode_key(GHOSTTY_KEY_E, ctrl, 0, None, Some('e'));
+            let ctrl_u = g.vt.encode_key(GHOSTTY_KEY_U, ctrl, 0, None, Some('u'));
+            let ctrl_k = g.vt.encode_key(GHOSTTY_KEY_K, ctrl, 0, None, Some('k'));
+            let bs = g.vt.encode_key(GHOSTTY_KEY_BACKSPACE, 0, 0, None, None);
+            let del = g.vt.encode_key(GHOSTTY_KEY_DELETE, 0, 0, None, None);
+            let lines = old_text.lines().count().max(visual_lines).max(1).min(40);
+            let clear = build_cli_clear_bytes(&ctrl_e, &ctrl_u, &ctrl_k, &bs, &del, lines);
+            let soft_nl = soft_newline_bytes(&mut g.vt);
+            let steps = build_cli_inline_steps(new_text, &soft_nl);
+            if let Some(ch) = g.channel
+                && !clear.is_empty()
+            {
+                g.vt.scroll_to_bottom();
+                g.core.input(ch, &clear);
+            }
+            let clear_delay_ms = if lines > 1 { 65u64 } else { 45u64 };
+            let steps_ms: u64 = steps.iter().map(|(_, delay)| *delay).sum();
+            (steps, clear_delay_ms, Duration::from_millis(clear_delay_ms + steps_ms + 25))
+        };
+        self.draft.borrow_mut().set_text(new_text);
+        self.typed_at.set(Some(Instant::now()));
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_millis(clear_delay_ms)).await;
+            for (chunk, delay_ms) in steps {
+                let keep_going = this
+                    .update(cx, |this, _| {
+                        let mut g = this.grid.borrow_mut();
+                        if let Some(ch) = g.channel
+                            && !chunk.is_empty()
+                        {
+                            g.vt.scroll_to_bottom();
+                            g.core.input(ch, &chunk);
+                        }
+                        this.typed_at.set(Some(Instant::now()));
+                    })
+                    .is_ok();
+                if !keep_going {
+                    break;
+                }
+                if delay_ms > 0 {
+                    cx.background_executor().timer(Duration::from_millis(delay_ms)).await;
+                }
+            }
+        })
+        .detach();
+        total_wait
     }
 
     fn paste_paths(&self, paths: impl IntoIterator<Item = String>) {
@@ -1458,9 +2197,48 @@ pub(crate) fn shown_title(title: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// True when the bottom screen rows clearly depict a CLI launch splash or an idle
+/// input prompt (e.g. ZCode CLI's startup splash or boxed `│ Type a prompt │` while
+/// background MCP servers connect or the welcome banner animates) with no active
+/// turn/spinner cues.
+fn is_startup_or_idle_prompt_tail(tail_lines: &[String]) -> bool {
+    if tail_lines.is_empty() {
+        return false;
+    }
+    let has_working_cue = tail_lines.iter().any(|line| {
+        if line.chars().any(|c| matches!(c, '\u{2800}'..='\u{28ff}')) {
+            return true;
+        }
+        let l = line.to_ascii_lowercase();
+        l.contains("esc to interrupt")
+            || l.contains("esc to cancel")
+            || l.contains("ctrl+c to interrupt")
+            || l.contains("ctrl+c to cancel")
+            || l.contains("type to queue")
+            || l.contains("thinking...")
+            || l.contains("calling model")
+    });
+    if has_working_cue {
+        return false;
+    }
+    let is_zcode_splash = tail_lines.iter().any(|line| line.to_ascii_lowercase().contains("starting zcode"));
+    if is_zcode_splash {
+        return true;
+    }
+    let has_box_border = tail_lines.iter().any(|line| {
+        let t = line.trim_start();
+        t.starts_with("╭─") || t.starts_with("╰─")
+    });
+    let has_zcode_idle_prompt = tail_lines.iter().any(|line| {
+        let t = line.trim();
+        t.starts_with('│') && t.to_ascii_lowercase().contains("type a prompt")
+    });
+    has_box_border && has_zcode_idle_prompt
+}
+
 /// Infer an interactive CLI agent's execution state when it does not emit OSC 7501:
 /// 1) title cues (`[ ! ]` / `Action Required` / `[ . ]` / spinners / `✦`)
-/// 2) active PTY output
+/// 2) active PTY text output (excluding explicit startup splash / idle prompt boxes)
 /// 3) quiet screen confirmation prompts on the bottom rows
 /// 4) otherwise `"idle"`.
 pub(crate) fn infer_pty_agent_state(raw_title: &str, active_output: bool, quiet_ready: bool, tail_lines: &[String]) -> &'static str {
@@ -1476,6 +2254,9 @@ pub(crate) fn infer_pty_agent_state(raw_title: &str, active_output: bool, quiet_
         return "working";
     }
     if active_output {
+        if is_startup_or_idle_prompt_tail(tail_lines) {
+            return "idle";
+        }
         return "working";
     }
     if quiet_ready
@@ -1849,6 +2630,63 @@ fn control_alias_bytes(vt: &mut vt::Vt, key: GhosttyKey, text: &str, shifted: bo
     let mods = GHOSTTY_MODS_CTRL as GhosttyMods | if shifted { GHOSTTY_MODS_SHIFT as GhosttyMods } else { 0 };
     let encoded = vt.encode_key(key, mods, 0, Some(text), text.chars().next());
     if encoded.starts_with(b"\x1b[27;") { encoded } else { legacy }
+}
+
+/// Encodes a soft newline (`Shift+Enter` when supported by Win32-input / Kitty /
+/// modifyOtherKeys, else `Alt+Enter` `\x1b\r`) so multi-line CLI input never
+/// submits early and never triggers bracketed-paste collapse chips.
+fn soft_newline_bytes(vt: &mut Vt) -> Vec<u8> {
+    if vt.win32.on && vt.kitty_keyboard_flags() == 0 {
+        return crate::win32_keys::enter(true, false, false);
+    }
+    let shift_enter = vt.encode_key(GHOSTTY_KEY_ENTER, GHOSTTY_MODS_SHIFT as GhosttyMods, 0, None, None);
+    if !shift_enter.is_empty() && shift_enter != b"\r" && shift_enter != b"\n" {
+        return shift_enter;
+    }
+    b"\x1b\r".to_vec()
+}
+
+/// Splits polished CLI text into paced, non-bracketed UTF-8 chunks separated by
+/// `soft_newline`, preventing Claude Code CLI from collapsing multi-line input
+/// into `[Pasted text #N +M lines]` and preventing `\t`/ESC control interference.
+fn build_cli_inline_steps(new_text: &str, soft_newline: &[u8]) -> Vec<(Vec<u8>, u64)> {
+    const MAX_CHUNK_CHARS: usize = 32;
+    const CHUNK_DELAY_MS: u64 = 10;
+    const NEWLINE_DELAY_MS: u64 = 18;
+
+    let normalized = new_text.replace("\r\n", "\n").replace('\r', "\n");
+    let lines: Vec<&str> = normalized.split('\n').collect();
+    let mut steps: Vec<(Vec<u8>, u64)> = Vec::new();
+    for (idx, line) in lines.iter().enumerate() {
+        let mut clean = String::with_capacity(line.len());
+        for ch in line.chars() {
+            match ch {
+                '\t' => clean.push_str("  "),
+                c if c.is_control() => {}
+                c => clean.push(c),
+            }
+        }
+        let mut chunk = String::new();
+        let mut count = 0usize;
+        for ch in clean.chars() {
+            chunk.push(ch);
+            count += 1;
+            if count >= MAX_CHUNK_CHARS {
+                steps.push((std::mem::take(&mut chunk).into_bytes(), CHUNK_DELAY_MS));
+                count = 0;
+            }
+        }
+        if !chunk.is_empty() {
+            steps.push((chunk.into_bytes(), CHUNK_DELAY_MS));
+        }
+        if idx + 1 < lines.len() && !soft_newline.is_empty() {
+            steps.push((soft_newline.to_vec(), NEWLINE_DELAY_MS));
+        }
+    }
+    if let Some((_, delay)) = steps.last_mut() {
+        *delay = 0;
+    }
+    steps
 }
 
 fn map_key(key: &str) -> Option<(GhosttyKey, bool, Option<char>)> {
@@ -2444,7 +3282,7 @@ fn paint_grid(bounds: Bounds<Pixels>, grid: &Rc<RefCell<Grid>>, focused: bool, w
                     let run = TextRun {
                         len: c.text.len(),
                         font: cell_font(c.bold, c.italic),
-                        color: hsla(frame.bg),
+                        color: hsla(cur.text_color),
                         background_color: None,
                         underline: None,
                         strikethrough: None,
@@ -5139,6 +5977,302 @@ mod tests {
         assert_eq!(
             super::infer_pty_agent_state("Codex", false, true, &["> Ready for your next prompt".into()]),
             "idle"
+        );
+    }
+
+    #[test]
+    fn infers_zcode_cli_fresh_idle_vs_working_and_blocked() {
+        // 1. Startup splash screen before welcome prompt appears: must be idle, not working.
+        let splash = vec![
+            "███████╗ ██████╗ ██████╗ ██████╗ ███████╗".to_owned(),
+            "/home/dev/project".to_owned(),
+            "Starting ZCode... Ctrl+C to exit".to_owned(),
+        ];
+        assert_eq!(super::infer_pty_agent_state("", true, false, &splash), "idle");
+
+        // 2. Fresh welcome screen while MCP servers connect in sidebar (active_output=true): must be idle.
+        let fresh_idle = vec![
+            "███████╗╚██████╗╚██████╔╝██████╔╝███████╗".to_owned(),
+            "╭─ Yolo ──────────────────────────────────────────────────╮".to_owned(),
+            "│ Type a prompt                                           │".to_owned(),
+            "│ GLM-5.4 account:bigmodel-individual-coding-plan | low   │".to_owned(),
+            "╰─────────────────────────────────────────────────────────╯".to_owned(),
+        ];
+        assert_eq!(super::infer_pty_agent_state("", true, false, &fresh_idle), "idle");
+        assert_eq!(super::infer_pty_agent_state("", false, true, &fresh_idle), "idle");
+
+        // 3. Actively working ZCode turn: placeholder switches to "Type to queue input" + braille spinner.
+        let working = vec![
+            "╭─ Yolo ──────────────────────────────────────────────────╮".to_owned(),
+            "│ Type to queue input                                     │".to_owned(),
+            "│ GLM-5.4 account:bigmodel-individual-coding-plan | low   │".to_owned(),
+            "╰─────────────────────────────────────────────────────────╯".to_owned(),
+            "⠦ esc to interrupt".to_owned(),
+        ];
+        assert_eq!(super::infer_pty_agent_state("", true, false, &working), "working");
+
+        // 4. Even if quoted text mentions "Type a prompt", an active spinner / esc to interrupt still means working.
+        let working_quoting_prompt = vec![
+            "╭─ Yolo ──────────────────────────────────────────────────╮".to_owned(),
+            "│ Type a prompt                                           │".to_owned(),
+            "╰─────────────────────────────────────────────────────────╯".to_owned(),
+            "⠙ esc to interrupt".to_owned(),
+        ];
+        assert_eq!(super::infer_pty_agent_state("", true, false, &working_quoting_prompt), "working");
+
+        // 5. Blocked approval prompt when quiet.
+        let blocked = vec![
+            "Run bash command: rm -rf /tmp/test".to_owned(),
+            "Do you want to allow this tool? (y/n)".to_owned(),
+        ];
+        assert_eq!(super::infer_pty_agent_state("", false, true, &blocked), "blocked");
+    }
+
+    #[gpui::test]
+    fn zcode_logo_color_shimmer_does_not_mark_terminal_working(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        use std::time::{Duration, Instant};
+
+        let terminal = cx.new(|cx| super::TerminalView::attach(crate::hc::offline(), "t_zcode".into(), (60, 12), cx));
+        let settled_past = Instant::now() - Duration::from_secs(5);
+        terminal.update(cx, |t, cx| {
+            t.attached_at = settled_past;
+            // Initial welcome paint in alternate screen (like ZCode CLI at launch).
+            let welcome = concat!(
+                "\x1b[?1049h\x1b[2J",
+                "\x1b[2;5H\x1b[38;2;125;211;252m████ ZCODE\x1b[0m",
+                "\x1b[6;2H╭─ Yolo ──────────────────╮",
+                "\x1b[7;2H│ Type a prompt           │",
+                "\x1b[8;2H╰─────────────────────────╯",
+            );
+            assert!(t.ingest([crate::hc::Stream::Data(welcome.as_bytes().to_vec())], cx));
+            // Even immediately after initial paint, idle prompt box must report idle.
+            assert_eq!(t.inferred_agent_state("", Instant::now()), "idle");
+            // Simulate cooldown after startup settles.
+            t.last_output_at = Some(settled_past);
+
+            // Feed repeated RGB color-shimmer frames on the ZCODE logo (identical characters, different colors).
+            let shimmer = "\x1b[?2026h\x1b[?25l\x1b[2;5H\x1b[38;2;219;229;237m████ ZCODE\x1b[0m\x1b[?2026l";
+            assert!(t.ingest([crate::hc::Stream::Data(shimmer.as_bytes().to_vec())], cx));
+            assert_eq!(t.last_output_at(), Some(settled_past), "color-only shimmer must not refresh last_output_at");
+            assert_eq!(t.inferred_agent_state("", Instant::now()), "idle");
+
+            // Now simulate a real working turn: placeholder becomes "Type to queue input" + braille spinner.
+            let working = concat!(
+                "\x1b[7;2H│ Type to queue input     │",
+                "\x1b[9;2H⠙ esc to interrupt",
+            );
+            assert!(t.ingest([crate::hc::Stream::Data(working.as_bytes().to_vec())], cx));
+            assert_ne!(t.last_output_at(), Some(settled_past), "real working text change must refresh last_output_at");
+            assert_eq!(t.inferred_agent_state("", Instant::now()), "working");
+        });
+    }
+
+    #[test]
+    fn cli_draft_tracker_tracks_typing_editing_paste_and_submit() {
+        let mut t = super::CliDraftTracker::default();
+        t.feed("帮我修一下登录超".as_bytes());
+        t.feed("时".as_bytes());
+        assert_eq!(t.text(), "帮我修一下登录超时");
+        // Backspace + retype
+        t.feed(b"\x7f");
+        assert_eq!(t.text(), "帮我修一下登录超");
+        t.feed("时问题".as_bytes());
+        assert_eq!(t.text(), "帮我修一下登录超时问题");
+        // Bracketed paste with newline does not submit
+        t.feed(b"\x1b[200~\nadd tests\x1b[201~");
+        assert_eq!(t.text(), "帮我修一下登录超时问题\nadd tests");
+        // Enter clears draft
+        t.feed(b"\r");
+        assert_eq!(t.text(), "");
+        // Shift+Enter (Kitty CSI-u) inserts newline without clearing
+        t.feed(b"line1\x1b[13;2uline2");
+        assert_eq!(t.text(), "line1\nline2");
+        // Win32 input mode Shift+Enter inserts newline; Ctrl+J (\n) inserts newline; backslash+CR inserts newline
+        t.feed(&crate::win32_keys::enter(true, false, false));
+        t.feed(b"line3\nline4\\\rline5");
+        assert_eq!(t.text(), "line1\nline2\nline3\nline4\nline5");
+        // modifyOtherKeys Shift+Enter also inserts newline
+        t.feed(b"\x1b[27;2;13~line6");
+        assert_eq!(t.text(), "line1\nline2\nline3\nline4\nline5\nline6");
+        // Ctrl+U clears
+        t.feed(b"\x15");
+        assert_eq!(t.text(), "");
+    }
+
+    fn plain_row(s: &str) -> crate::vt::PromptRow {
+        let n = s.chars().count();
+        crate::vt::PromptRow { text: s.to_owned(), dim: vec![false; n], inverse: vec![false; n] }
+    }
+
+    #[test]
+    fn inspect_cli_input_box_returns_empty_and_never_reuses_previous_prompt() {
+        // Case 1: Claude Code bordered input box is bare `❯` while previous turn `❯ 上一次的输入` sits right above.
+        let rows = vec![
+            plain_row("❯ 上一次已经发送的提示词"),
+            plain_row("⏺ 好的，我已完成修改。"),
+            plain_row("────────────────────────────────────────"),
+            plain_row("❯"),
+            plain_row("────────────────────────────────────────"),
+            plain_row("? for shortcuts"),
+        ];
+        assert_eq!(super::inspect_cli_input_box(&rows, Some(3)), super::CliScreenInput::Empty);
+
+        // Case 2: Bordered input box has a faint/dim placeholder (even with inverse block cursor on first char).
+        let placeholder_text = "❯ Explain how auth.rs works";
+        let n = placeholder_text.chars().count();
+        let mut dim = vec![true; n];
+        let mut inverse = vec![false; n];
+        dim[0] = false; // '❯'
+        dim[1] = false; // ' '
+        dim[2] = false; // 'E' with inverse block cursor
+        inverse[2] = true;
+        let dim_rows = vec![
+            plain_row("❯ 上一次的输入内容"),
+            plain_row("────────────────────────────────────────"),
+            crate::vt::PromptRow { text: placeholder_text.to_owned(), dim, inverse },
+            plain_row("────────────────────────────────────────"),
+            plain_row("? for shortcuts"),
+        ];
+        assert_eq!(super::inspect_cli_input_box(&dim_rows, Some(2)), super::CliScreenInput::Empty);
+
+        // Case 3: Borderless Codex prompt is bare `›` while previous prompt sits above.
+        let codex_empty = vec![
+            plain_row("› 上一次的输入内容"),
+            plain_row("• Done editing files."),
+            plain_row(""),
+            plain_row("›"),
+            plain_row(""),
+            plain_row("  100% context left · ? for shortcuts"),
+        ];
+        assert_eq!(super::inspect_cli_input_box(&codex_empty, Some(3)), super::CliScreenInput::Empty);
+
+        // Case 4: Known text placeholder even without faint SGR.
+        let text_placeholder = vec![
+            plain_row("❯ 上一次输入"),
+            plain_row("──────────"),
+            plain_row("❯ Try \"fix typecheck errors\""),
+            plain_row("──────────"),
+            plain_row("? for shortcuts"),
+        ];
+        assert_eq!(super::inspect_cli_input_box(&text_placeholder, Some(2)), super::CliScreenInput::Empty);
+    }
+
+    #[test]
+    fn inspect_cli_input_box_extracts_full_multiline_input() {
+        // Claude Code multi-line input inside horizontal rules
+        let rows = vec![
+            plain_row("❯ 更早之前的输入"),
+            plain_row("⏺ 已完成"),
+            plain_row("────────────────────────────────────────"),
+            plain_row("❯ 1. 输入区域为空时应提醒用户"),
+            plain_row("  2. 弹出的窗口动画过快"),
+            plain_row("  3. 有换行时不能只润色第一行"),
+            plain_row("────────────────────────────────────────"),
+            plain_row("? for shortcuts"),
+        ];
+        assert_eq!(
+            super::inspect_cli_input_box(&rows, Some(5)),
+            super::CliScreenInput::Text(
+                "1. 输入区域为空时应提醒用户\n2. 弹出的窗口动画过快\n3. 有换行时不能只润色第一行".to_owned()
+            )
+        );
+
+        // Gemini-style rounded box with vertical sides and multi-line input
+        let boxed = vec![
+            plain_row("╭──────────────────────────────────────╮"),
+            plain_row("│ > 第一行提示词                        │"),
+            plain_row("│   第二行约束条件                      │"),
+            plain_row("╰──────────────────────────────────────╯"),
+            plain_row("  using 1 GEMINI.md file"),
+        ];
+        assert_eq!(
+            super::inspect_cli_input_box(&boxed, Some(2)),
+            super::CliScreenInput::Text("第一行提示词\n第二行约束条件".to_owned())
+        );
+
+        // Codex-style borderless multi-line input
+        let codex = vec![
+            plain_row("› 旧输入"),
+            plain_row("• 回复"),
+            plain_row(""),
+            plain_row("› line one"),
+            plain_row("  line two"),
+            plain_row("  line three"),
+            plain_row(""),
+            plain_row("  100% context left · ? for shortcuts"),
+        ];
+        assert_eq!(
+            super::inspect_cli_input_box(&codex, Some(5)),
+            super::CliScreenInput::Text("line one\nline two\nline three".to_owned())
+        );
+    }
+
+    #[test]
+    fn vt_active_prompt_rows_detects_dim_placeholder_end_to_end() {
+        let mut vt = Vt::new(60, 10);
+        // Simulate previous turn + bordered empty prompt with dim placeholder (SGR 2).
+        vt.write(b"previous\r\n\xe2\x9d\xaf old prompt\r\n");
+        vt.write(b"\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\r\n");
+        vt.write(b"\xe2\x9d\xaf \x1b[7mT\x1b[27m\x1b[2mype something...\x1b[0m\r\n");
+        vt.write(b"\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\r\n");
+        vt.write(b"? for shortcuts");
+        let (rows, cursor_row) = vt.active_prompt_rows(10);
+        assert_eq!(super::inspect_cli_input_box(&rows, cursor_row), super::CliScreenInput::Empty);
+    }
+
+    #[test]
+    fn cli_clear_bytes_clears_both_below_and_above_cursor_for_multiline_input() {
+        let clear = super::build_cli_clear_bytes(b"E", b"U", b"K", b"B", b"D", 3);
+        // 3 downward line clears (2 Deletes between them) + 2 upward line clears (2 Backspaces)
+        assert_eq!(clear, b"EUKDEUKDEUKBEUKBEUK");
+    }
+
+    #[test]
+    fn cli_inline_steps_avoid_bracketed_paste_and_preserve_multiline_cjk() {
+        let mut vt = Vt::new(80, 24);
+        // Default mode emits modifyOtherKeys Shift+Enter (never raw CR).
+        assert_eq!(super::soft_newline_bytes(&mut vt), b"\x1b[27;2;13~");
+        // Kitty keyboard mode emits CSI-u Shift+Enter.
+        vt.write(b"\x1b[>1u");
+        let kitty_nl = super::soft_newline_bytes(&mut vt);
+        assert_eq!(kitty_nl, b"\x1b[13;2u");
+        // Win32 input mode (without Kitty) emits win32 Shift+Enter.
+        let mut win_vt = Vt::new(80, 24);
+        win_vt.write(b"\x1b[?9001h");
+        assert_eq!(super::soft_newline_bytes(&mut win_vt), crate::win32_keys::enter(true, false, false));
+
+        let text = "第一行要求：\t请检查登录接口的异常分支并补充单元测试\n第二行\x1b[31m约束：保持向后兼容\r\n第三行：验证通过后输出改动清单";
+        let steps = super::build_cli_inline_steps(text, &kitty_nl);
+        assert!(!steps.is_empty());
+        assert_eq!(steps.last().unwrap().1, 0);
+        // Never emit bracketed paste markers or raw CR/LF or raw Tab.
+        for (bytes, _) in &steps {
+            assert!(!bytes.starts_with(b"\x1b[200~"));
+            assert!(!bytes.ends_with(b"\x1b[201~"));
+            if bytes != &kitty_nl {
+                let s = std::str::from_utf8(bytes).expect("valid utf8 chunk");
+                assert!(!s.contains('\r'));
+                assert!(!s.contains('\n'));
+                assert!(!s.contains('\t'));
+                assert!(!s.contains('\x1b'));
+            }
+        }
+        // Exactly two soft newlines between three lines.
+        let nl_count = steps.iter().filter(|(b, _)| b == &kitty_nl).count();
+        assert_eq!(nl_count, 2);
+        // Reconstructed text preserves all CJK content and tab->spaces.
+        let mut joined = String::new();
+        for (b, _) in &steps {
+            if b == &kitty_nl {
+                joined.push('\n');
+            } else {
+                joined.push_str(std::str::from_utf8(b).unwrap());
+            }
+        }
+        assert_eq!(
+            joined,
+            "第一行要求：  请检查登录接口的异常分支并补充单元测试\n第二行[31m约束：保持向后兼容\n第三行：验证通过后输出改动清单"
         );
     }
 }

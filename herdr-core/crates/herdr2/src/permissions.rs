@@ -10,7 +10,12 @@ use std::str::FromStr;
 #[serde(rename_all = "kebab-case")]
 pub enum PermissionMode {
     #[serde(alias = "approve_all", alias = "dangerously-skip-permissions", alias = "bypassPermissions")]
-    #[value(name = "approve-all", alias = "approve_all", alias = "dangerously-skip-permissions", alias = "bypassPermissions")]
+    #[value(
+        name = "approve-all",
+        alias = "approve_all",
+        alias = "dangerously-skip-permissions",
+        alias = "bypassPermissions"
+    )]
     ApproveAll,
     #[default]
     #[serde(alias = "approve_reads")]
@@ -103,10 +108,7 @@ pub fn is_read_only_kind(kind: Option<&str>) -> bool {
     let Some(raw) = kind else {
         return false;
     };
-    matches!(
-        raw.trim().to_ascii_lowercase().as_str(),
-        "read" | "search" | "think" | "fetch" | "list" | "glob" | "grep"
-    )
+    matches!(raw.trim().to_ascii_lowercase().as_str(), "read" | "search" | "think" | "fetch" | "list" | "glob" | "grep")
 }
 
 pub fn decide(mode: PermissionMode, kind: Option<&str>, options: &[PublicPermissionOption]) -> Decision {
@@ -151,10 +153,7 @@ fn pick_by_kind(options: &[PublicPermissionOption], preferred: &[&str], fallback
 }
 
 fn pick_by_prefix(options: &[PublicPermissionOption], prefix: &str) -> Option<String> {
-    options
-        .iter()
-        .find(|o| o.kind.to_ascii_lowercase().starts_with(prefix))
-        .map(|o| o.option_id.clone())
+    options.iter().find(|o| o.kind.to_ascii_lowercase().starts_with(prefix)).map(|o| o.option_id.clone())
 }
 
 #[cfg(test)]
@@ -163,7 +162,11 @@ mod tests {
 
     fn sample_options() -> Vec<PublicPermissionOption> {
         vec![
-            PublicPermissionOption { option_id: "allow-1".into(), name: "Allow once".into(), kind: "allow_once".into() },
+            PublicPermissionOption {
+                option_id: "allow-1".into(),
+                name: "Allow once".into(),
+                kind: "allow_once".into(),
+            },
             PublicPermissionOption {
                 option_id: "allow-all".into(),
                 name: "Allow always".into(),

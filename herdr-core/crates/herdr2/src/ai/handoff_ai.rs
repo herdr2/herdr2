@@ -216,10 +216,7 @@ pub async fn distill_omitted_turns(
 
     let lang = if is_zh { "zh" } else { "en" };
     let ranges = format_turn_ranges(omitted_turns);
-    let cache_key = format!(
-        "handoff_distill:{source_address}:{lang}:{ranges}:{}",
-        fingerprint_hex(&[&excerpt])
-    );
+    let cache_key = format!("handoff_distill:{source_address}:{lang}:{ranges}:{}", fingerprint_hex(&[&excerpt]));
     let payload = json!({
         "source_address": source_address,
         "omitted_turns": ranges,
@@ -253,12 +250,7 @@ fn format_distilled_omitted_markdown(parsed: &Value, is_zh: bool) -> Option<Stri
     let blockers = json_string_list(parsed, "current_blockers", 5, 160);
     let pending = json_string_list(parsed, "pending_items", 5, 160);
 
-    if goal.is_none()
-        && conventions.is_empty()
-        && rejected.is_empty()
-        && blockers.is_empty()
-        && pending.is_empty()
-    {
+    if goal.is_none() && conventions.is_empty() && rejected.is_empty() && blockers.is_empty() && pending.is_empty() {
         return None;
     }
 
@@ -325,11 +317,7 @@ pub async fn distill_merge_back(
     }
 
     let lang = if is_zh { "zh" } else { "en" };
-    let cache_key = format!(
-        "handoff_merge:{source_address}:{}:{lang}:{}",
-        kind.as_str(),
-        fingerprint_hex(&[&excerpt])
-    );
+    let cache_key = format!("handoff_merge:{source_address}:{}:{lang}:{}", kind.as_str(), fingerprint_hex(&[&excerpt]));
     let payload = json!({
         "source_address": source_address,
         "kind": kind.as_str(),
@@ -388,9 +376,7 @@ pub async fn distill_merge_back(
         write_sec(&mut md, "后续行动项", &action_items);
         write_sec(&mut md, "涉及文件", &changed_files);
         write_sec(&mut md, "遗留风险与注意事项", &open_risks);
-        md.push_str(&format!(
-            "---\n如需查看完整旁路讨论记录，可执行：`h2 read {source_address}`。\n"
-        ));
+        md.push_str(&format!("---\n如需查看完整旁路讨论记录，可执行：`h2 read {source_address}`。\n"));
     } else {
         write_sec(&mut md, "Decisions", &decisions);
         write_sec(&mut md, "Action Items", &action_items);
@@ -451,13 +437,20 @@ fn analyze_recent_signals(turns: &BTreeMap<u64, CompactTurn>) -> RecentSignals {
             {
                 sig.systems_hits += 1;
             }
-            if u.contains('?') || u.contains('？') || low.contains("why ") || u.contains("为什么") || u.contains("分析") {
+            if u.contains('?') || u.contains('？') || low.contains("why ") || u.contains("为什么") || u.contains("分析")
+            {
                 sig.question_hits += 1;
             }
         }
         for t in b.ok_tools.iter().chain(b.failed_tools.iter()) {
             let low = t.to_ascii_lowercase();
-            if low.contains(".tsx") || low.contains(".jsx") || low.contains(".css") || low.contains(".vue") || low.contains(".html") || low.contains("mods/") {
+            if low.contains(".tsx")
+                || low.contains(".jsx")
+                || low.contains(".css")
+                || low.contains(".vue")
+                || low.contains(".html")
+                || low.contains("mods/")
+            {
                 sig.ui_hits += 1;
             }
             if low.contains(".rs") || low.contains(".go") || low.contains(".cpp") || low.contains("cargo test") {
@@ -476,7 +469,7 @@ fn normalize_preset(raw: &str) -> Option<String> {
     if low.contains("antigravity") || low == "agy" {
         return Some("agy".into());
     }
-    for key in ["claude", "codex", "gemini", "cursor", "opencode", "qwen", "kimi", "copilot", "hermes", "glm", "pi"] {
+    for key in ["claude", "codex", "gemini", "cursor", "opencode", "qwen", "kimi", "copilot", "hermes", "glm", "zcode", "pi"] {
         if low.contains(key) {
             return Some(key.into());
         }
@@ -515,9 +508,15 @@ fn heuristic_recommend(
                 "Upstream hit repeated failures; diagnose root cause with a fresh approach and avoid dead ends.".into()
             }
         } else if is_zh {
-            format!("上游持续报错（{}），请重新审视根因并给出替代修复方案。", truncate_utf8(&sig.last_error_snippet, 72))
+            format!(
+                "上游持续报错（{}），请重新审视根因并给出替代修复方案。",
+                truncate_utf8(&sig.last_error_snippet, 72)
+            )
         } else {
-            format!("Upstream repeatedly failed ({}); re-diagnose root cause with an alternative approach.", truncate_utf8(&sig.last_error_snippet, 72))
+            format!(
+                "Upstream repeatedly failed ({}); re-diagnose root cause with an alternative approach.",
+                truncate_utf8(&sig.last_error_snippet, 72)
+            )
         };
         return HandoffRecommendResult {
             recommended_kind: "fork".into(),
@@ -606,9 +605,7 @@ pub async fn recommend_handoff(
     installed_presets: &[String],
     language: Option<&str>,
 ) -> HandoffRecommendResult {
-    let is_zh = language
-        .map(str::trim)
-        .is_some_and(|l| l.to_ascii_lowercase().starts_with("zh"));
+    let is_zh = language.map(str::trim).is_some_and(|l| l.to_ascii_lowercase().starts_with("zh"));
     let src_preset = source_provider.and_then(normalize_preset);
 
     let mut pool: Vec<String> = Vec::new();
@@ -777,7 +774,13 @@ mod tests {
     async fn distills_omitted_turns_merge_back_and_recommends_with_fallback() {
         let (rt, tmp) = temp_runtime();
         let entries = vec![
-            Entry::User { turn: 1, from: None, text: "Implement lock-free cache".into(), attachments: vec![], ts_ms: 1 },
+            Entry::User {
+                turn: 1,
+                from: None,
+                text: "Implement lock-free cache".into(),
+                attachments: vec![],
+                ts_ms: 1,
+            },
             Entry::Error { turn: 2, message: "deadlock in storage mutex".into(), ts_ms: 2 },
             Entry::ToolCall {
                 turn: 2,
@@ -789,7 +792,12 @@ mod tests {
                 attachments: vec![],
                 ts_ms: 3,
             },
-            Entry::Assistant { turn: 2, text: "Mutex ordering caused deadlock; switched to RwLock.".into(), attachments: vec![], ts_ms: 4 },
+            Entry::Assistant {
+                turn: 2,
+                text: "Mutex ordering caused deadlock; switched to RwLock.".into(),
+                attachments: vec![],
+                ts_ms: 4,
+            },
             Entry::User { turn: 3, from: None, text: "Continue fixing timeout".into(), attachments: vec![], ts_ms: 5 },
             Entry::Error { turn: 3, message: "still failing test auth_lock".into(), ts_ms: 6 },
         ];
@@ -831,9 +839,7 @@ mod tests {
         assert!(distilled.contains("全局 Mutex 导致死锁"));
         assert!(distilled.contains("禁止持锁 await"));
 
-        let merged = distill_merge_back(&rt, "a2", LineageKind::SideChat, &entries, 4096, true)
-            .await
-            .unwrap();
+        let merged = distill_merge_back(&rt, "a2", LineageKind::SideChat, &entries, 4096, true).await.unwrap();
         assert!(merged.contains("已确认死锁根因"));
         assert!(merged.contains("h2 read a2"));
 

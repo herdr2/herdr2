@@ -65,14 +65,10 @@ fn fresh_restart_replaces_the_base_without_losing_kept_agents() {
     s.json(&["server", "restart", "--fresh"]);
     assert_ne!(s.json(&["server", "status"])["pid"], core_pid);
     assert_eq!(String::from_utf8_lossy(&s.h2(&["exec", "/bin/sh", "-c", probe]).stdout), "unset|unset");
-    wait_until_for(
-        "kept agent resumes across fresh restart",
-        std::time::Duration::from_secs(20),
-        || {
-            let g = get(&s, &a);
-            g["state"] == "live" && g["pid"].as_i64().is_some_and(|p| p != pid1)
-        },
-    );
+    wait_until_for("kept agent resumes across fresh restart", std::time::Duration::from_secs(20), || {
+        let g = get(&s, &a);
+        g["state"] == "live" && g["pid"].as_i64().is_some_and(|p| p != pid1)
+    });
 }
 
 #[test]

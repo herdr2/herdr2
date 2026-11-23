@@ -226,10 +226,7 @@ fn a_missing_unix_core_does_not_try_the_windows_line() {
     let calls = s.root.join("calls");
     std::fs::write(
         &wrapper,
-        format!(
-            "#!/bin/sh\necho call >> '{}'\necho 'herdr2 is not installed here' >&2\nexit 127\n",
-            calls.display()
-        ),
+        format!("#!/bin/sh\necho call >> '{}'\necho 'herdr2 is not installed here' >&2\nexit 127\n", calls.display()),
     )
     .unwrap();
     std::fs::set_permissions(&wrapper, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();

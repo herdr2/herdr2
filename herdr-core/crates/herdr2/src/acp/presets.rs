@@ -20,7 +20,7 @@ pub const BUILTIN_PRESETS: &[(&str, &[&str])] = &[
     ("pi", &["pi-acp"]),
     ("hermes", &["hermes-acp"]),
     ("glm", &["glm-acp-agent"]),
-    ("zcode", &["zcode-acp"]),
+    ("zcode", &["zcode-acp-server"]),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,8 +42,7 @@ pub fn is_claude_agent(preset: Option<&str>, argv: &[String]) -> bool {
     {
         return true;
     }
-    argv.iter()
-        .any(|arg| arg.to_ascii_lowercase().contains("claude-agent-acp"))
+    argv.iter().any(|arg| arg.to_ascii_lowercase().contains("claude-agent-acp"))
 }
 
 fn is_agy_binary(program: &str) -> bool {
@@ -120,9 +119,7 @@ pub fn apply_cursor_env_quirks(argv: &[String], env: &mut BTreeMap<String, Strin
     if !is_cursor_agent(None, argv) {
         return;
     }
-    let has_override = env
-        .keys()
-        .any(|k| k.eq_ignore_ascii_case("GLOBAL_AGENT_FORCE_GLOBAL_AGENT"));
+    let has_override = env.keys().any(|k| k.eq_ignore_ascii_case("GLOBAL_AGENT_FORCE_GLOBAL_AGENT"));
     if !has_override {
         env.insert("GLOBAL_AGENT_FORCE_GLOBAL_AGENT".into(), "false".into());
     }
@@ -184,11 +181,8 @@ fn write_codex_catalog_wrapper(codex_bin: &Path, merged_catalog: &Path) -> Optio
     let (wrapper_path, content) = {
         let normalized_catalog = merged_catalog.display().to_string().replace('\\', "/");
         let catalog_toml_str = serde_json::to_string(&normalized_catalog).ok()?;
-        let script = format!(
-            "@echo off\r\n\"{}\" -c model_catalog_json={} %*\r\n",
-            codex_bin.display(),
-            catalog_toml_str,
-        );
+        let script =
+            format!("@echo off\r\n\"{}\" -c model_catalog_json={} %*\r\n", codex_bin.display(), catalog_toml_str,);
         (parent.join("codex-wrapper.cmd"), script)
     };
 
@@ -245,10 +239,7 @@ fn codex_merged_catalog_path(env: &BTreeMap<String, String>) -> std::path::PathB
 }
 
 fn maybe_merge_codex_model_catalog(env: &mut BTreeMap<String, String>) -> Option<std::path::PathBuf> {
-    let existing_cfg_key = env
-        .keys()
-        .find(|k| k.eq_ignore_ascii_case("CODEX_CONFIG"))
-        .cloned();
+    let existing_cfg_key = env.keys().find(|k| k.eq_ignore_ascii_case("CODEX_CONFIG")).cloned();
     let mut cfg_obj = match existing_cfg_key.as_deref().and_then(|k| env.get(k)) {
         Some(raw) if !raw.trim().is_empty() => match serde_json::from_str::<serde_json::Value>(raw) {
             Ok(serde_json::Value::Object(map)) => {
@@ -266,11 +257,8 @@ fn maybe_merge_codex_model_catalog(env: &mut BTreeMap<String, String>) -> Option
     let config_toml_path = codex_home.join("config.toml");
     let toml_text = std::fs::read_to_string(&config_toml_path).ok()?;
     let parsed_toml = toml::from_str::<toml::Value>(&toml_text).ok()?;
-    let raw_catalog = parsed_toml
-        .get("model_catalog_json")
-        .and_then(toml::Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?;
+    let raw_catalog =
+        parsed_toml.get("model_catalog_json").and_then(toml::Value::as_str).map(str::trim).filter(|s| !s.is_empty())?;
 
     let catalog_path = {
         let p = std::path::PathBuf::from(raw_catalog);
@@ -304,11 +292,7 @@ fn maybe_merge_codex_model_catalog(env: &mut BTreeMap<String, String>) -> Option
         }
         let missing: Vec<serde_json::Value> = cache_models
             .iter()
-            .filter(|m| {
-                m.get("slug")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|s| !existing_slugs.contains(s))
-            })
+            .filter(|m| m.get("slug").and_then(serde_json::Value::as_str).is_some_and(|s| !existing_slugs.contains(s)))
             .cloned()
             .collect();
         if missing.is_empty() {
@@ -391,7 +375,9 @@ pub fn resolve(
             (Some(p), true) => Some(p),
             (None, false) => Some(argv.join(" ")),
             (Some(_), false) => {
-                return Err(RpcError::invalid_params("give initial prompt either with --prompt or positional arguments, not both"));
+                return Err(RpcError::invalid_params(
+                    "give initial prompt either with --prompt or positional arguments, not both",
+                ));
             }
             (None, true) => None,
         };
@@ -504,7 +490,8 @@ fn check_not_ide_shim(program: &str) -> Result<(), RpcError> {
     if is_ide_shim_path(program) {
         return Err(shim_error(program));
     }
-    if !program.contains('/') && !program.contains('\\')
+    if !program.contains('/')
+        && !program.contains('\\')
         && let Some(path) = std::env::var_os("PATH")
     {
         for dir in std::env::split_paths(&path) {
@@ -559,10 +546,7 @@ pub(crate) fn resolve_non_shim_binary(program: &str) -> Option<std::path::PathBu
 }
 
 fn env_ignore_case<'a>(env: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
-    env.iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case(key))
-        .map(|(_, v)| v.as_str())
-        .filter(|s| !s.is_empty())
+    env.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.as_str()).filter(|s| !s.is_empty())
 }
 
 fn npx_cache_roots(env: &BTreeMap<String, String>) -> Vec<std::path::PathBuf> {
@@ -627,10 +611,7 @@ fn resolve_in_npx_cache(
                 if !cand.is_file() || is_ide_shim_path(&cand.to_string_lossy()) {
                     continue;
                 }
-                let mtime = cand
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .unwrap_or(std::time::UNIX_EPOCH);
+                let mtime = cand.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
                 if best.as_ref().is_none_or(|(prev, _)| mtime > *prev) {
                     best = Some((mtime, cand));
                 }
@@ -646,9 +627,7 @@ fn companion_npx_adapter(preset_id: Option<&str>, program: &str) -> Option<(&'st
         (Some("claude"), "claude-agent-acp") | (_, "claude-agent-acp") => {
             Some(("claude", "@agentclientprotocol/claude-agent-acp"))
         }
-        (Some("codex"), "codex-acp") | (_, "codex-acp") => {
-            Some(("codex", "@agentclientprotocol/codex-acp"))
-        }
+        (Some("codex"), "codex-acp") | (_, "codex-acp") => Some(("codex", "@agentclientprotocol/codex-acp")),
         (Some("pi"), "pi-acp") | (_, "pi-acp") => Some(("pi", "pi-acp")),
         _ => None,
     }
@@ -764,13 +743,11 @@ mod tests {
             [r"C:\Users\dev\AppData\Local\Programs\Antigravity\agy.exe", "acp", "--dangerously-skip-permissions"]
         );
 
-        let mut wrapped = vec!["bwrap".into(), "--ro-bind".into(), "/".into(), "/".into(), "--".into(), "agy".into(), "acp".into()];
+        let mut wrapped =
+            vec!["bwrap".into(), "--ro-bind".into(), "/".into(), "/".into(), "--".into(), "agy".into(), "acp".into()];
         assert!(is_agy_agent(None, &wrapped));
         ensure_agy_skip_permissions(&mut wrapped);
-        assert_eq!(
-            wrapped,
-            ["bwrap", "--ro-bind", "/", "/", "--", "agy", "acp", "--dangerously-skip-permissions"]
-        );
+        assert_eq!(wrapped, ["bwrap", "--ro-bind", "/", "/", "--", "agy", "acp", "--dangerously-skip-permissions"]);
 
         let mut mac_wrapped = vec![
             "/usr/bin/sandbox-exec".into(),
@@ -857,10 +834,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!(
             "herdr2-presets-acp-resolve-{}-{}",
             std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
         ));
         let bin_dir = root.join("bin");
         let npx_bin_dir = root.join(".npm/_npx/abc123/node_modules/.bin");
@@ -885,29 +859,22 @@ mod tests {
         assert_eq!(resolved_argv, vec![claude_acp.display().to_string()]);
         assert!(is_claude_agent(None, &resolved_argv));
 
-        let (codex_path, codex_argv) =
-            resolve_acp_command_in_env(Some("codex"), &["codex-acp".into()], &env).unwrap();
+        let (codex_path, codex_argv) = resolve_acp_command_in_env(Some("codex"), &["codex-acp".into()], &env).unwrap();
         assert_eq!(codex_path, npx_cli);
         assert_eq!(
             codex_argv,
             vec![npx_cli.display().to_string(), "-y".into(), "@agentclientprotocol/codex-acp".into()]
         );
 
-        let npx_claude = vec![
-            npx_cli.display().to_string(),
-            "-y".into(),
-            "@agentclientprotocol/claude-agent-acp".into(),
-        ];
+        let npx_claude =
+            vec![npx_cli.display().to_string(), "-y".into(), "@agentclientprotocol/claude-agent-acp".into()];
         assert!(is_claude_agent(None, &npx_claude));
 
         assert!(resolve_acp_command_in_env(Some("opencode"), &["opencode".into(), "acp".into()], &env).is_none());
 
         let mut codex_env = env.clone();
         apply_codex_env_quirks(&codex_argv, &mut codex_env);
-        assert_eq!(
-            codex_env.get("CODEX_PATH").map(String::as_str),
-            Some(codex_cli.display().to_string().as_str())
-        );
+        assert_eq!(codex_env.get("CODEX_PATH").map(String::as_str), Some(codex_cli.display().to_string().as_str()));
 
         let mut explicit_env = env.clone();
         explicit_env.insert("CODEX_PATH".into(), "/custom/codex".into());
@@ -943,12 +910,8 @@ mod tests {
         let merged_cat_path = cfg_val["model_catalog_json"].as_str().expect("merged path");
         let merged_cat: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(merged_cat_path).unwrap()).unwrap();
-        let slugs: Vec<&str> = merged_cat["models"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(|m| m["slug"].as_str())
-            .collect();
+        let slugs: Vec<&str> =
+            merged_cat["models"].as_array().unwrap().iter().filter_map(|m| m["slug"].as_str()).collect();
         assert_eq!(slugs, vec!["gpt-6.2-sol", "gpt-6.1-sol"]);
         let wrapper_path = merged_env.get("CODEX_PATH").expect("wrapper CODEX_PATH set");
         let wrapper_text = std::fs::read_to_string(wrapper_path).unwrap();

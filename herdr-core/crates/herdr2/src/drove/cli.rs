@@ -85,11 +85,11 @@ pub enum DroveAction {
         #[arg(long)]
         consume: bool,
     },
-    /// Use the configured AI assistant model to auto-configure Drove roles, models, and candidate strengths.
+    /// Use the configured AI assistant model to auto-configure Drove roles, models, candidate strengths, and routing notes.
     RolesAiConfig {
         #[arg(long, value_name = "FILE")]
         file: Option<PathBuf>,
-        /// Configuration scope: `models`, `strengths`, or `all`.
+        /// Configuration scope: `models`, `strengths`, `notes`, or `all`.
         #[arg(long)]
         mode: Option<String>,
         /// Optional preference instruction for how roles should be assigned.
@@ -115,9 +115,7 @@ pub enum DroveAction {
         on: Option<String>,
     },
     /// Set the active default Run ID for subsequent CLI commands.
-    Use {
-        run_id: String,
-    },
+    Use { run_id: String },
     /// Create a Drove Run from a YAML/JSON plan file or stdin and launch its DAG.
     Plan {
         /// Plan YAML or JSON file (`{ objective?, maxConcurrency?, verify?, tasks: [...] }` or task list).
@@ -500,18 +498,14 @@ fn resolve_task_id(
     run_opt: Option<String>,
     task_id_or_key: &str,
 ) -> Result<String, RpcError> {
-    if task_id_or_key.starts_with("tsk_")
-        || task_id_or_key.starts_with("att_")
-        || task_id_or_key.contains('/')
-    {
+    if task_id_or_key.starts_with("tsk_") || task_id_or_key.starts_with("att_") || task_id_or_key.contains('/') {
         return Ok(task_id_or_key.to_string());
     }
     let run_id = resolve_run_id(paths, on, run_opt)?;
     let snap = proxy_call(paths, on, "GET", &format!("/api/runs/{run_id}"), "", None)?;
     if let Some(arr) = snap["tasks"].as_array()
-        && let Some(t) = arr
-            .iter()
-            .find(|t| t["key"].as_str() == Some(task_id_or_key) || t["id"].as_str() == Some(task_id_or_key))
+        && let Some(t) =
+            arr.iter().find(|t| t["key"].as_str() == Some(task_id_or_key) || t["id"].as_str() == Some(task_id_or_key))
         && let Some(id) = t["id"].as_str()
     {
         return Ok(id.to_string());
@@ -549,7 +543,8 @@ fn read_json_file(path: &PathBuf, consume: bool) -> Result<Value, RpcError> {
     if consume {
         let _ = std::fs::remove_file(path);
     }
-    serde_json::from_str(&text).map_err(|e| RpcError::invalid_params(format!("invalid JSON in {}: {e}", path.display())))
+    serde_json::from_str(&text)
+        .map_err(|e| RpcError::invalid_params(format!("invalid JSON in {}: {e}", path.display())))
 }
 
 /// Executes `h2 drove ...` or `drove ...` and returns `(json, human_summary)`.
@@ -574,8 +569,14 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
                 .as_object()
                 .map(|m| m.keys().cloned().collect::<Vec<_>>().join(", "))
                 .unwrap_or_default();
+            let note_line = val["config"]["note"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| format!("\nnote: {}", s.chars().take(120).collect::<String>()))
+                .unwrap_or_default();
             let human = format!(
-                "drove on {machine}\nweb: http://127.0.0.1:{port}/\nroles: {roles}\nruns: {runs} | ai configured: {ai_ok} | magpie quota: {}",
+                "drove on {machine}\nweb: http://127.0.0.1:{port}/\nroles: {roles}{note_line}\nruns: {runs} | ai configured: {ai_ok} | magpie quota: {}",
                 if magpie_on { "on" } else { "off" }
             );
             Ok((val, human))
@@ -700,9 +701,17 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             let val = call_core(paths, "drove.magpie.test", p)?;
             let ok = val["ok"].as_bool().unwrap_or(false);
             let human = if ok {
-                format!("Magpie OK at {} ({} cards)", val["gatewayUrl"].as_str().unwrap_or("?"), val["cardsCount"].as_u64().unwrap_or(0))
+                format!(
+                    "Magpie OK at {} ({} cards)",
+                    val["gatewayUrl"].as_str().unwrap_or("?"),
+                    val["cardsCount"].as_u64().unwrap_or(0)
+                )
             } else {
-                format!("Magpie FAILED at {}: {}", val["gatewayUrl"].as_str().unwrap_or("?"), val["error"].as_str().unwrap_or("unknown"))
+                format!(
+                    "Magpie FAILED at {}: {}",
+                    val["gatewayUrl"].as_str().unwrap_or("?"),
+                    val["error"].as_str().unwrap_or("unknown")
+                )
             };
             Ok((val, human))
         }
@@ -713,9 +722,7 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
         DroveAction::Plan { file, stdin, objective, cwd, max_concurrency, verify, session, on } => {
             let parsed = read_plan_input(file, stdin)?;
             let cwd_resolved = cwd.unwrap_or_else(|| {
-                std::env::current_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| ".".into())
+                std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".into())
             });
             let obj = objective
                 .or_else(|| parsed.get("objective").and_then(Value::as_str).map(String::from))
@@ -765,14 +772,8 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             if on.is_none() && !run_id.is_empty() {
                 save_current_run(paths, &run_id);
             }
-            let tasks = proxy_call(
-                paths,
-                on.as_deref(),
-                "POST",
-                &format!("/api/runs/{run_id}/tasks"),
-                "",
-                Some(tasks_val),
-            )?;
+            let tasks =
+                proxy_call(paths, on.as_deref(), "POST", &format!("/api/runs/{run_id}/tasks"), "", Some(tasks_val))?;
             let n = tasks["tasks"].as_array().map(|a| a.len()).unwrap_or(0);
             let mut out = json!({ "run": run, "tasks": tasks["tasks"] });
             let mut human = format!("started run {run_id} with {n} task(s)");
@@ -828,9 +829,7 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
         }
         DroveAction::Quick { prompt, role, cwd, verify, worktree, wait, on } => {
             let cwd_resolved = cwd.unwrap_or_else(|| {
-                std::env::current_dir()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| ".".into())
+                std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".into())
             });
             let task = json!({
                 "tasks": [{
@@ -914,7 +913,14 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             Ok((res, human))
         }
         DroveAction::Ack { message_id, on } => {
-            let res = proxy_call(paths, on.as_deref(), "POST", &format!("/api/messages/{message_id}/ack"), "", Some(json!({})))?;
+            let res = proxy_call(
+                paths,
+                on.as_deref(),
+                "POST",
+                &format!("/api/messages/{message_id}/ack"),
+                "",
+                Some(json!({})),
+            )?;
             Ok((res, format!("acknowledged {message_id}")))
         }
         DroveAction::Reply { message_id, body, on } => {
@@ -1002,15 +1008,24 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
         DroveAction::Cancel { target, run, on } => {
             if let Some(tgt) = target {
                 if tgt.starts_with("run_") {
-                    let res = proxy_call(paths, on.as_deref(), "POST", &format!("/api/runs/{tgt}/cancel"), "", Some(json!({})))?;
+                    let res = proxy_call(
+                        paths,
+                        on.as_deref(),
+                        "POST",
+                        &format!("/api/runs/{tgt}/cancel"),
+                        "",
+                        Some(json!({})),
+                    )?;
                     return Ok((res, format!("cancelled run {tgt}")));
                 }
                 let tid = resolve_task_id(paths, on.as_deref(), run, &tgt)?;
-                let res = proxy_call(paths, on.as_deref(), "POST", &format!("/api/tasks/{tid}/cancel"), "", Some(json!({})))?;
+                let res =
+                    proxy_call(paths, on.as_deref(), "POST", &format!("/api/tasks/{tid}/cancel"), "", Some(json!({})))?;
                 return Ok((res, format!("cancelled task {tid}")));
             }
             let run_id = resolve_run_id(paths, on.as_deref(), run)?;
-            let res = proxy_call(paths, on.as_deref(), "POST", &format!("/api/runs/{run_id}/cancel"), "", Some(json!({})))?;
+            let res =
+                proxy_call(paths, on.as_deref(), "POST", &format!("/api/runs/{run_id}/cancel"), "", Some(json!({})))?;
             Ok((res, format!("cancelled run {run_id}")))
         }
         DroveAction::Complete { run, summary, force, on } => {
@@ -1027,12 +1042,14 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
         }
         DroveAction::Pause { run, on } => {
             let run_id = resolve_run_id(paths, on.as_deref(), run)?;
-            let res = proxy_call(paths, on.as_deref(), "POST", &format!("/api/runs/{run_id}/pause"), "", Some(json!({})))?;
+            let res =
+                proxy_call(paths, on.as_deref(), "POST", &format!("/api/runs/{run_id}/pause"), "", Some(json!({})))?;
             Ok((res, format!("paused {run_id}")))
         }
         DroveAction::Resume { run, on } => {
             let run_id = resolve_run_id(paths, on.as_deref(), run)?;
-            let res = proxy_call(paths, on.as_deref(), "POST", &format!("/api/runs/{run_id}/resume"), "", Some(json!({})))?;
+            let res =
+                proxy_call(paths, on.as_deref(), "POST", &format!("/api/runs/{run_id}/resume"), "", Some(json!({})))?;
             Ok((res, format!("resumed {run_id}")))
         }
         DroveAction::Worker { action } => execute_worker_action(action),
@@ -1221,17 +1238,12 @@ fn install_skills(target: Option<PathBuf>) -> Result<(Value, String), RpcError> 
         }
     };
     let mut written = Vec::new();
-    for (name, content) in [
-        ("drove", SKILL_DROVE),
-        ("drove-add", SKILL_DROVE_ADD),
-        ("drove-setup", SKILL_DROVE_SETUP),
-    ] {
+    for (name, content) in [("drove", SKILL_DROVE), ("drove-add", SKILL_DROVE_ADD), ("drove-setup", SKILL_DROVE_SETUP)]
+    {
         let dir = base.join(name);
-        std::fs::create_dir_all(&dir)
-            .map_err(|e| RpcError::internal(format!("mkdir {}: {e}", dir.display())))?;
+        std::fs::create_dir_all(&dir).map_err(|e| RpcError::internal(format!("mkdir {}: {e}", dir.display())))?;
         let path = dir.join("SKILL.md");
-        std::fs::write(&path, content)
-            .map_err(|e| RpcError::internal(format!("write {}: {e}", path.display())))?;
+        std::fs::write(&path, content).map_err(|e| RpcError::internal(format!("write {}: {e}", path.display())))?;
         written.push(path.display().to_string());
     }
     let out = json!({ "ok": true, "target": base.display().to_string(), "files": written });

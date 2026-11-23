@@ -75,10 +75,13 @@ Rules:
 Output JSON: {"conflict":true,"confidence":0.0,"reason":"brief factual reason (<= 60 chars)"}
 
 [OP: route_candidate]
-Purpose: Break a tie among multiple configured candidates (`agent`, `model`, `effort`, `strengths`) for a role when deterministic keyword matching had no unique winner.
-Input fields: `role`, `task`, `candidates` (indexed from 0).
-Rules: Pick the single best candidate `index`; if none stands out, pick `0`. Keep `reason` to 3-6 words.
-Output JSON: {"index":0,"reason":"3-6 words"}
+Purpose: Select the best candidate index among configured `candidates` (`agent`, `model`, `effort`, `strengths`, optional `note`) for a role before launching a sub-agent, strictly applying `routing_note` and per-candidate `note` policies alongside `current_local_time` and task fit.
+Input fields: `role`, `current_local_time` (local ISO time + weekday), `routing_note` (optional global role/model selection note), `task`, `candidates` (indexed from 0, each with optional `note` and `strength_score`).
+Rules:
+- Strictly honor `routing_note` and each candidate's `note` (e.g., time-window avoidance such as 14:00-18:00 double-quota rules, quota/cost policies, or fallback-only rules) using `current_local_time`.
+- Avoid any candidate discouraged by a note whenever at least one unaffected candidate exists; only pick a discouraged candidate if no other candidate is available.
+- Among unaffected candidates, prefer the best match by `strengths`/`strength_score`, task fit, and lower `index` (default `0`). Keep `reason` to 3-8 words.
+Output JSON: {"index":0,"reason":"3-8 words"}
 
 [OP: verify_digest]
 Purpose: Summarize the root failure cause of a failed verification command output tail in 1-2 brief factual sentences.
@@ -149,46 +152,116 @@ Output JSON: {"headline":"1-2 concise actionable sentences"}
 
 [OP: commit_message]
 Purpose: Generate a single concise Git commit message summarizing the staged/unstaged workspace changes.
-Input fields: `branch`, `files`, `diff_stat`, `diff_excerpt`.
+Input fields: `branch`, `files`, `diff_stat`, `diff_excerpt`, `recent_commits` (optional recent one-line git log entries).
 Rules:
-- Follow Conventional Commits style (`feat(scope): ...`, `fix(scope): ...`, `refactor(scope): ...`, `docs: ...`, `chore: ...`).
+- Match the commit prefix/scope style of `recent_commits` when consistent; otherwise follow Conventional Commits (`feat(scope): ...`, `fix(scope): ...`, `refactor(scope): ...`, `docs: ...`, `chore: ...`).
 - Keep the subject line <= 72 chars, factual, describing WHAT changed and WHY; no markdown fences or trailing period.
 - Respect `lang` (`zh` -> English type/scope + concise Simplified Chinese summary; `en` -> concise English summary).
 Output JSON: {"message":"type(scope): concise summary"}
 
 [OP: polish_prompt]
 Purpose: Rewrite a developer's rough draft prompt into a clearer, more structured, unambiguous prompt for a coding agent (ACP or CLI) while strictly preserving original intent, constraints, file paths, symbols, and commands.
-Input fields: `prompt`, `agent_kind` (`acp`|`cli`), `context` (optional workspace/task hint).
+Input fields: `prompt`, `agent_kind` (`acp`|`cli`), `context` (optional metadata: agent/cli, task, progress, cwd), `recent_turns` (optional recent conversation excerpts), `recent_steps` (optional recent tool actions/errors/approvals), `screen_tail` (optional recent terminal screen lines).
 Rules:
 - Match the language of `prompt` (use `lang` only if ambiguous). Never translate code identifiers, file paths, commands, or error strings.
 - Clarify vague phrasing, remove redundancy, and organize multi-step requirements into concise sentences or short bullets when helpful; keep simple single-step requests brief without bloating.
+- Use `context`, `recent_turns`, `recent_steps`, and `screen_tail` ONLY to resolve ambiguous references (such as "it", "that error", "the second option", "that file") and align file paths/terminology with the active session; never inject unrelated history or invent requirements the user did not ask for.
+- When `agent_kind` is `"cli"`, keep the layout compact and avoid unnecessary blank lines (`\n\n`) so the prompt remains concise and directly editable in a CLI input box.
 - Never invent new requirements or change user constraints.
 Output JSON: {"polished":"rewritten prompt ready to send","summary":"<=30 char brief note of improvements"}"#;
+
+/// Returns true when the built-in control-plane `op` contract expects a single JSON object response.
+pub fn op_expects_json(op: &str) -> bool {
+    matches!(
+        op,
+        "session_seed"
+            | "pty_status"
+            | "notes_digest"
+            | "loop_detect"
+            | "write_conflict"
+            | "route_candidate"
+            | "question_draft"
+            | "task_enrich"
+            | "task_diagnose"
+            | "handoff_distill"
+            | "handoff_recommend"
+            | "handoff_merge_digest"
+            | "checkpoint_bisect_rank"
+            | "checkpoint_bisect_verify"
+            | "agent_digest"
+            | "catchup_briefing"
+            | "commit_message"
+            | "polish_prompt"
+            | "roles_configure"
+    )
+}
 
 /// Compact fallback system prompt used only when `context_window <= 4096` or `prompt_cache_enabled == false`.
 pub fn compact_system_for_op(op: &str) -> &'static str {
     match op {
-        "pty_status" => "Pure text JSON classifier (no tools). Classify CLI terminal screen into {\"state\":\"working|blocked|done|error|idle\",\"kind\":\"permission|question|auth|null\",\"confidence\":0.0,\"summary\":\"<=20 chars|null\"}. Reply JSON only.",
-        "notes_digest" => "Pure text JSON summarizer (no tools). Summarize child agent error/exit output as {\"root_cause\":\"1 sentence\",\"files\":[\"...\"],\"next_step\":\"concise action\"}. Reply JSON only.",
-        "loop_detect" => "Pure text JSON auditor (no tools). Detect semantic spinning/oscillation loops in tool history. Reply JSON only: {\"looping\":false,\"confidence\":0.0,\"pattern\":\"...\",\"root_cause\":\"...\",\"steer_hint\":\"...\"}.",
-        "write_conflict" => "Pure text JSON analyzer (no tools). Decide if candidate task may conflict with concurrent peer tasks in same repo. Reply JSON only: {\"conflict\":true,\"confidence\":0.0,\"reason\":\"<=60 chars\"}.",
-        "route_candidate" => "Pure text JSON router (no tools). Pick best candidate index by strengths/agent/model (default 0). Reply JSON only: {\"index\":0,\"reason\":\"3-6 words\"}.",
-        "verify_digest" => "Pure text summarizer (no tools). Summarize the root failure cause in 1-2 brief sentences. Plain text only.",
-        "question_draft" => "Pure text assistant (no tools). Draft a concise answer for a worker question. Reply JSON only: {\"answer\":\"...\",\"confidence\":0.0}.",
-        "handover_compact" => "Pure text summarizer (no tools). Compress completion summary into 1 factual sentence (max 120 chars) preserving files and outcome. Plain text only.",
-        "task_enrich" => "Pure text JSON extractor (no tools). Extract workspace files and 1-sentence acceptance criterion. Reply JSON only: {\"files\":[\"...\"],\"acceptance\":\"...\"}.",
-        "task_diagnose" => "Pure text JSON diagnoser (no tools). Diagnose failed Drove task. Reply JSON only: {\"rootCause\":\"...\",\"evidence\":[\"...\"],\"recommendedAction\":\"...\",\"suggestedCommand\":\"h2 drove retry ...\",\"hint\":\"...\"}.",
-        "auto_title" => "Pure text assistant (no tools). Generate a concise 3-6 word title for this coding run. Plain text only, no quotes.",
-        "handoff_distill" => "Pure text JSON summarizer (no tools). Distill omitted coding turns into {\"goal_evolution\":\"...\",\"architecture_conventions\":[],\"rejected_approaches\":[],\"current_blockers\":[],\"pending_items\":[]}. Reply JSON only.",
-        "handoff_recommend" => "Pure text JSON advisor (no tools). Recommend complementary handoff preset/mode/note from installed_presets: {\"recommended_kind\":\"handoff|fork|side-chat\",\"recommended_preset\":\"...\",\"reason\":\"...\",\"suggested_note\":\"...\"}. Reply JSON only.",
-        "handoff_merge_digest" => "Pure text JSON summarizer (no tools). Distill side-chat/fork into {\"summary\":\"...\",\"decisions\":[],\"action_items\":[],\"changed_files\":[],\"open_risks\":[]}. Reply JSON only.",
-        "checkpoint_label" => "Pure text assistant (no tools). Output a 8-15 Chinese char (or 3-7 English word) milestone label describing the concrete code change. Plain text only, no turn prefix or quotes.",
-        "checkpoint_bisect_rank" => "Pure text JSON selector (no tools). Rank up to 3 most plausible turns for the bug query: {\"candidates\":[4,5],\"rationale\":\"...\"}. Reply JSON only.",
-        "checkpoint_bisect_verify" => "Pure text JSON analyzer (no tools). Identify which candidate turn patch introduced the bug: {\"suspect_turn\":4,\"confidence\":0.0,\"reason\":\"...\",\"evidence_files\":[],\"alternatives\":[]}. Reply JSON only.",
-        "agent_digest" => "Pure text JSON summarizer (no tools). Return {\"semantic_title\":\"<=12 zh / <=24 en chars\",\"micro_summary\":\"<=42 zh / <=90 en chars\"}. Reply JSON only.",
-        "catchup_briefing" => "Pure text JSON briefer (no tools). Write a 1-2 sentence priority catch-up headline: {\"headline\":\"...\"}. Reply JSON only.",
-        "commit_message" => "Pure text JSON commit message writer (no tools). Write a single-line conventional commit message (<=72 chars): {\"message\":\"type(scope): summary\"}. Reply JSON only.",
-        "polish_prompt" => "Pure text JSON prompt editor (no tools). Rewrite the coding prompt for clarity and structure while keeping exact intent, constraints, paths, and original language. Reply JSON only: {\"polished\":\"...\",\"summary\":\"<=30 chars\"}.",
+        "pty_status" => {
+            "Pure text JSON classifier (no tools). Classify CLI terminal screen into {\"state\":\"working|blocked|done|error|idle\",\"kind\":\"permission|question|auth|null\",\"confidence\":0.0,\"summary\":\"<=20 chars|null\"}. Reply JSON only."
+        }
+        "notes_digest" => {
+            "Pure text JSON summarizer (no tools). Summarize child agent error/exit output as {\"root_cause\":\"1 sentence\",\"files\":[\"...\"],\"next_step\":\"concise action\"}. Reply JSON only."
+        }
+        "loop_detect" => {
+            "Pure text JSON auditor (no tools). Detect semantic spinning/oscillation loops in tool history. Reply JSON only: {\"looping\":false,\"confidence\":0.0,\"pattern\":\"...\",\"root_cause\":\"...\",\"steer_hint\":\"...\"}."
+        }
+        "write_conflict" => {
+            "Pure text JSON analyzer (no tools). Decide if candidate task may conflict with concurrent peer tasks in same repo. Reply JSON only: {\"conflict\":true,\"confidence\":0.0,\"reason\":\"<=60 chars\"}."
+        }
+        "route_candidate" => {
+            "Pure text JSON router (no tools). Pick best candidate index honoring `routing_note`, candidate `note`, `current_local_time`, and `strengths` (avoid discouraged candidates if any alternative exists; default 0). Reply JSON only: {\"index\":0,\"reason\":\"3-8 words\"}."
+        }
+        "verify_digest" => {
+            "Pure text summarizer (no tools). Summarize the root failure cause in 1-2 brief sentences. Plain text only."
+        }
+        "question_draft" => {
+            "Pure text assistant (no tools). Draft a concise answer for a worker question. Reply JSON only: {\"answer\":\"...\",\"confidence\":0.0}."
+        }
+        "handover_compact" => {
+            "Pure text summarizer (no tools). Compress completion summary into 1 factual sentence (max 120 chars) preserving files and outcome. Plain text only."
+        }
+        "task_enrich" => {
+            "Pure text JSON extractor (no tools). Extract workspace files and 1-sentence acceptance criterion. Reply JSON only: {\"files\":[\"...\"],\"acceptance\":\"...\"}."
+        }
+        "task_diagnose" => {
+            "Pure text JSON diagnoser (no tools). Diagnose failed Drove task. Reply JSON only: {\"rootCause\":\"...\",\"evidence\":[\"...\"],\"recommendedAction\":\"...\",\"suggestedCommand\":\"h2 drove retry ...\",\"hint\":\"...\"}."
+        }
+        "auto_title" => {
+            "Pure text assistant (no tools). Generate a concise 3-6 word title for this coding run. Plain text only, no quotes."
+        }
+        "handoff_distill" => {
+            "Pure text JSON summarizer (no tools). Distill omitted coding turns into {\"goal_evolution\":\"...\",\"architecture_conventions\":[],\"rejected_approaches\":[],\"current_blockers\":[],\"pending_items\":[]}. Reply JSON only."
+        }
+        "handoff_recommend" => {
+            "Pure text JSON advisor (no tools). Recommend complementary handoff preset/mode/note from installed_presets: {\"recommended_kind\":\"handoff|fork|side-chat\",\"recommended_preset\":\"...\",\"reason\":\"...\",\"suggested_note\":\"...\"}. Reply JSON only."
+        }
+        "handoff_merge_digest" => {
+            "Pure text JSON summarizer (no tools). Distill side-chat/fork into {\"summary\":\"...\",\"decisions\":[],\"action_items\":[],\"changed_files\":[],\"open_risks\":[]}. Reply JSON only."
+        }
+        "checkpoint_label" => {
+            "Pure text assistant (no tools). Output a 8-15 Chinese char (or 3-7 English word) milestone label describing the concrete code change. Plain text only, no turn prefix or quotes."
+        }
+        "checkpoint_bisect_rank" => {
+            "Pure text JSON selector (no tools). Rank up to 3 most plausible turns for the bug query: {\"candidates\":[4,5],\"rationale\":\"...\"}. Reply JSON only."
+        }
+        "checkpoint_bisect_verify" => {
+            "Pure text JSON analyzer (no tools). Identify which candidate turn patch introduced the bug: {\"suspect_turn\":4,\"confidence\":0.0,\"reason\":\"...\",\"evidence_files\":[],\"alternatives\":[]}. Reply JSON only."
+        }
+        "agent_digest" => {
+            "Pure text JSON summarizer (no tools). Return {\"semantic_title\":\"<=12 zh / <=24 en chars\",\"micro_summary\":\"<=42 zh / <=90 en chars\"}. Reply JSON only."
+        }
+        "catchup_briefing" => {
+            "Pure text JSON briefer (no tools). Write a 1-2 sentence priority catch-up headline: {\"headline\":\"...\"}. Reply JSON only."
+        }
+        "commit_message" => {
+            "Pure text JSON commit message writer (no tools). Write a single-line conventional commit message (<=72 chars): {\"message\":\"type(scope): summary\"}. Reply JSON only."
+        }
+        "polish_prompt" => {
+            "Pure text JSON prompt editor (no tools). Rewrite the coding prompt for clarity and structure while keeping exact intent, constraints, paths, and original language; use supplied session context/recent_turns/screen_tail only to disambiguate references without inventing requirements. Reply JSON only: {\"polished\":\"...\",\"summary\":\"<=30 chars\"}."
+        }
         _ => "You are a pure text assistant with NO tools or shell access. Never emit tool tags or shell commands.",
     }
 }
@@ -197,8 +270,7 @@ pub fn compact_system_for_op(op: &str) -> &'static str {
 pub fn canonicalize_json(val: &Value) -> Value {
     match val {
         Value::Object(map) => {
-            let sorted: BTreeMap<&String, Value> =
-                map.iter().map(|(k, v)| (k, canonicalize_json(v))).collect();
+            let sorted: BTreeMap<&String, Value> = map.iter().map(|(k, v)| (k, canonicalize_json(v))).collect();
             let mut out = Map::with_capacity(sorted.len());
             for (k, v) in sorted {
                 out.insert(k.clone(), v);
@@ -274,9 +346,6 @@ mod tests {
     fn canonicalize_json_produces_stable_key_order() {
         let a = json!({"z": 1, "a": {"d": 4, "b": 2}});
         let b = json!({"a": {"b": 2, "d": 4}, "z": 1});
-        assert_eq!(
-            format_op_user_message("pty_status", "zh", &a),
-            format_op_user_message("pty_status", "zh", &b)
-        );
+        assert_eq!(format_op_user_message("pty_status", "zh", &a), format_op_user_message("pty_status", "zh", &b));
     }
 }

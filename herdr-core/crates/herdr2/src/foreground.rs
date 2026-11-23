@@ -153,10 +153,7 @@ pub(crate) fn is_shell_root(root: &Foreground) -> bool {
         if root.name.is_empty() { root.argv.first().map(String::as_str).unwrap_or_default() } else { &root.name };
     let base = program.rsplit(['/', '\\']).next().unwrap_or(program).to_ascii_lowercase();
     let name = base.strip_suffix(".exe").unwrap_or(&base);
-    matches!(
-        name,
-        "sh" | "bash" | "zsh" | "fish" | "nu" | "dash" | "ksh" | "tcsh" | "pwsh" | "powershell" | "cmd"
-    )
+    matches!(name, "sh" | "bash" | "zsh" | "fish" | "nu" | "dash" | "ksh" | "tcsh" | "pwsh" | "powershell" | "cmd")
 }
 
 pub(crate) fn is_at_shell_root(t: &crate::terminals::Terminal) -> bool {
@@ -181,7 +178,10 @@ pub(crate) fn is_cli_foreground(fg: &Foreground) -> bool {
         let base = raw.rsplit(['/', '\\']).next().unwrap_or(raw).to_ascii_lowercase();
         let stem = base.strip_suffix(".exe").unwrap_or(&base);
         let clean = stem.strip_suffix(".real").unwrap_or(stem);
-        matches!(clean, "cursor-agent" | "opencode" | "kimi" | "copilot" | "hermes" | "zcode" | "qoder" | "dsh")
+        matches!(
+            clean,
+            "cursor-agent" | "opencode" | "kimi" | "copilot" | "hermes" | "zcode" | "zcode-cli" | "qoder" | "dsh"
+        )
     })
 }
 
@@ -190,12 +190,8 @@ impl Core {
     /// and stale CLI checkpoints when a CLI exits back to its shell or a fresh non-resumed CLI starts
     /// in the same terminal.
     pub(crate) fn apply_foreground_update(&self, st: &mut crate::runtime::State, id: u32, now: Option<Foreground>) {
-        let Some((t_pid, t_addr, t_cwd, prev_fg, has_status_or_records, has_agent_task_state, t_title)) = st
-            .pty_reg
-            .terminals
-            .get(&id)
-            .filter(|t| t.is_live())
-            .map(|t| {
+        let Some((t_pid, t_addr, t_cwd, prev_fg, has_status_or_records, has_agent_task_state, t_title)) =
+            st.pty_reg.terminals.get(&id).filter(|t| t.is_live()).map(|t| {
                 let cwd = t.last_cwd.clone().unwrap_or_else(|| t.cwd.clone());
                 let has_status = t.status.is_some() || !t.records.is_empty();
                 let has_task_state = has_status
@@ -220,10 +216,7 @@ impl Core {
         let at_shell = crate::platform::foreground_tracks_jobs() && now_is_shell_root;
         let respawning = st.pty_respawning.contains(&id);
 
-        if !now_is_shell_root
-            && now.as_ref().is_some_and(is_cli_foreground)
-            && !t_title.is_empty()
-        {
+        if !now_is_shell_root && now.as_ref().is_some_and(is_cli_foreground) && !t_title.is_empty() {
             st.pty_cli_titles.insert(id, t_title);
         }
 
@@ -238,18 +231,14 @@ impl Core {
                 || tc.cli_fg_pid.is_some()
                 || st.pty_prompts.contains_key(&id);
             if has_ckpt_state && tc.pending_rollback_turn.is_none() && tc.pending_handoff.is_none() {
-                let has_attached_cli_meta = tc
-                    .cli_kind
-                    .as_deref()
-                    .is_some_and(|k| !k.is_empty() && k != "generic")
+                let has_attached_cli_meta = tc.cli_kind.as_deref().is_some_and(|k| !k.is_empty() && k != "generic")
                     || tc.cli_session_id.is_some();
                 let had_cli_session = has_attached_cli_meta
                     || tc.cli_fg_pid.is_some()
                     || has_status_or_records
                     || prev_fg.as_ref().is_some_and(is_cli_foreground);
                 let exited_cli_to_shell = now_is_shell_root
-                    && (has_attached_cli_meta
-                        || (had_cli_session && (!prev_was_shell_root || has_status_or_records)));
+                    && (has_attached_cli_meta || (had_cli_session && (!prev_was_shell_root || has_status_or_records)));
                 let started_clean_cli = !now_is_shell_root
                     && now.as_ref().is_some_and(|fg| {
                         let fg_pid = u32::try_from(fg.pid).ok();
@@ -273,15 +262,19 @@ impl Core {
             {
                 let fg_pid = u32::try_from(fg.pid).ok();
                 let pid_changed = prev_fg.as_ref().is_none_or(|p| p.pid != fg.pid);
-                if pid_changed || (fg_pid.is_some() && tc.cli_fg_pid != fg_pid && crate::pty_adapters::needs_resumed_reattach(&tc, fg_pid)) {
+                if pid_changed
+                    || (fg_pid.is_some()
+                        && tc.cli_fg_pid != fg_pid
+                        && crate::pty_adapters::needs_resumed_reattach(&tc, fg_pid))
+                {
                     should_reattach_resumed = true;
                 }
             }
         }
 
         let prev_was_cli = prev_fg.as_ref().is_some_and(is_cli_foreground);
-        let exited_to_shell_from_cli = now_is_shell_root
-            && (cleared_checkpoints || prev_was_cli || (at_shell && has_agent_task_state));
+        let exited_to_shell_from_cli =
+            now_is_shell_root && (cleared_checkpoints || prev_was_cli || (at_shell && has_agent_task_state));
         let started_clean_cli_any = !now_is_shell_root
             && now.as_ref().is_some_and(|fg| {
                 is_cli_foreground(fg)
@@ -315,10 +308,11 @@ impl Core {
         let Some(t) = st.pty_reg.terminals.get_mut(&id).filter(|t| t.is_live()) else {
             return;
         };
-        let mut change = ((at_shell || clear_agent_task_state) && (t.status.is_some() || !t.records.is_empty())).then(|| {
-            t.first_task_turn = None;
-            crate::status::reset_terminal(t)
-        });
+        let mut change =
+            ((at_shell || clear_agent_task_state) && (t.status.is_some() || !t.records.is_empty())).then(|| {
+                t.first_task_turn = None;
+                crate::status::reset_terminal(t)
+            });
         let mut turn_reset = false;
         let mut digest_cleared = false;
         let mut title_cleared = false;
@@ -347,10 +341,7 @@ impl Core {
                 t.turn = 0;
                 turn_reset = true;
             }
-            if cleared_cli_title
-                .as_deref()
-                .is_some_and(|ct| !ct.is_empty() && ct == t.title)
-            {
+            if cleared_cli_title.as_deref().is_some_and(|ct| !ct.is_empty() && ct == t.title) {
                 t.title.clear();
                 title_cleared = true;
             }
@@ -378,12 +369,9 @@ impl Core {
                 }
             } else if !respawning {
                 let root_shell = crate::pty_adapters::terminal_shell_executable(&t.argv);
-                if let Some(mut detected) = crate::pty_adapters::extract_saved_cli_from_argv(
-                    &f.argv,
-                    root_shell.as_deref(),
-                    None,
-                    None,
-                ) {
+                if let Some(mut detected) =
+                    crate::pty_adapters::extract_saved_cli_from_argv(&f.argv, root_shell.as_deref(), None, None)
+                {
                     if let Some(ref existing) = t.saved_cli
                         && existing.kind == detected.kind
                         && !started_clean_cli_any
@@ -406,7 +394,14 @@ impl Core {
             }
         }
         t.foreground = now.clone();
-        if change.is_some() || foreground_changed || turn_reset || argv_updated || saved_cli_changed || digest_cleared || title_cleared {
+        if change.is_some()
+            || foreground_changed
+            || turn_reset
+            || argv_updated
+            || saved_cli_changed
+            || digest_cleared
+            || title_cleared
+        {
             self.save_pty_soon();
         }
         if let Some(change) = change {
@@ -443,7 +438,8 @@ impl Core {
         let mut last_cli_probe: std::collections::HashMap<u32, std::time::Instant> = std::collections::HashMap::new();
         loop {
             tokio::time::sleep(Duration::from_millis(ms)).await;
-            let live: Vec<u32> = self.lock().pty_reg.terminals.values().filter(|t| t.is_live()).map(|t| t.id()).collect();
+            let live: Vec<u32> =
+                self.lock().pty_reg.terminals.values().filter(|t| t.is_live()).map(|t| t.id()).collect();
             last_cli_probe.retain(|id, _| live.contains(id));
             for id in live {
                 let pgid = self.foreground(id).await;
@@ -457,9 +453,7 @@ impl Core {
                         .and_then(|t| t.saved_cli.as_ref())
                         .is_some_and(|s| s.session_id.is_none() || s.transcript_path.is_none())
                 };
-                if needs_cli_sid
-                    && last_cli_probe.get(&id).is_none_or(|at| at.elapsed() >= Duration::from_secs(3))
-                {
+                if needs_cli_sid && last_cli_probe.get(&id).is_none_or(|at| at.elapsed() >= Duration::from_secs(3)) {
                     last_cli_probe.insert(id, std::time::Instant::now());
                     let core_bg = Arc::clone(&self);
                     tokio::spawn(async move {
@@ -497,7 +491,8 @@ mod tests {
         use crate::paths::Paths;
         use crate::terminals::NewTerminal;
 
-        let root = crate::test_tmp().join(format!("h2-fg-ckpt-{}-{}", std::process::id(), crate::platform::random_hex()));
+        let root =
+            crate::test_tmp().join(format!("h2-fg-ckpt-{}-{}", std::process::id(), crate::platform::random_hex()));
         let paths = Paths {
             socket: root.join("core.sock"),
             holder_socket: root.join("holder.sock"),
@@ -717,7 +712,10 @@ mod tests {
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let core_arc = Arc::new(core);
         let reattached = rt.block_on(crate::pty_adapters::reattach_resumed_cli_checkpoints(&core_arc, id));
-        assert!(reattached, "claude -c must automatically re-attach archived session checkpoints even after placeholder T0");
+        assert!(
+            reattached,
+            "claude -c must automatically re-attach archived session checkpoints even after placeholder T0"
+        );
         {
             let mut st = core_arc.lock();
             let restored = core_arc.target_checkpoints(&mut st, &addr);
@@ -873,7 +871,10 @@ mod tests {
             assert_eq!(t.total_work_ms, 0);
             assert_eq!(t.status_ms, None);
             assert!(!t.labels.contains_key("herdr.status"), "manual status label must be cleared");
-            assert!(!t.labels.contains_key("herdr.view"), "structured peek view must return to raw terminal on CLI exit");
+            assert!(
+                !t.labels.contains_key("herdr.view"),
+                "structured peek view must return to raw terminal on CLI exit"
+            );
             assert!(t.title.is_empty(), "unchanged CLI title must be cleared when shell did not overwrite it");
             assert!(!st.pty_digest_last_ai.contains_key(&id));
 

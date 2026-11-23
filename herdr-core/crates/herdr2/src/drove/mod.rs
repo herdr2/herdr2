@@ -24,8 +24,8 @@ pub mod verify;
 pub mod yaml;
 
 use self::config::{
-    CachedAgentModels, DrovePaths, PersistedModelsCache, load_config, load_models_cache,
-    save_config, save_models_cache, write_secret_file,
+    CachedAgentModels, DrovePaths, PersistedModelsCache, load_config, load_models_cache, save_config,
+    save_models_cache, write_secret_file,
 };
 use self::http::{HttpProxyRequest, HttpProxyResponse};
 use self::magpie::{MagpieClient, MagpieTestResult};
@@ -183,34 +183,19 @@ impl DroveRuntime {
     }
 
     pub fn get_loop_watermark(&self, attempt_id: &str) -> u64 {
-        self.loop_audit_watermark
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(attempt_id)
-            .copied()
-            .unwrap_or(0)
+        self.loop_audit_watermark.lock().unwrap_or_else(|p| p.into_inner()).get(attempt_id).copied().unwrap_or(0)
     }
 
     pub fn set_loop_watermark(&self, attempt_id: &str, item_id: u64) {
-        self.loop_audit_watermark
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(attempt_id.to_string(), item_id);
+        self.loop_audit_watermark.lock().unwrap_or_else(|p| p.into_inner()).insert(attempt_id.to_string(), item_id);
     }
 
     pub fn clear_loop_watermark(&self, attempt_id: &str) {
-        self.loop_audit_watermark
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(attempt_id);
+        self.loop_audit_watermark.lock().unwrap_or_else(|p| p.into_inner()).remove(attempt_id);
     }
 
     pub fn get_conflict_cached(&self, key: &str) -> Option<(bool, String)> {
-        self.conflict_cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(key)
-            .cloned()
+        self.conflict_cache.lock().unwrap_or_else(|p| p.into_inner()).get(key).cloned()
     }
 
     pub fn put_conflict_cached(&self, key: String, verdict: (bool, String)) {
@@ -223,10 +208,7 @@ impl DroveRuntime {
 
     pub fn run_merge_lock(&self, run_id: &str) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.run_merge_locks.lock().unwrap_or_else(|p| p.into_inner());
-        locks
-            .entry(run_id.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        locks.entry(run_id.to_string()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
     }
 
     pub fn take_pool_rx(&self) -> Option<mpsc::UnboundedReceiver<pool::PoolSignal>> {
@@ -238,11 +220,7 @@ impl DroveRuntime {
     }
 
     pub fn cached_probe(&self) -> ProbeSnapshot {
-        self.probe_cache
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone()
-            .unwrap_or_default()
+        self.probe_cache.lock().unwrap_or_else(|p| p.into_inner()).clone().unwrap_or_default()
     }
 
     fn persist_models_cache(&self) {
@@ -326,95 +304,57 @@ impl DroveRuntime {
 
     pub fn register_worker_token(&self, worker_id: &str) -> String {
         let tok = crypto::rand_secret();
-        self.worker_tokens
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(worker_id.to_string(), tok.clone());
+        self.worker_tokens.lock().unwrap_or_else(|p| p.into_inner()).insert(worker_id.to_string(), tok.clone());
         tok
     }
 
     pub fn verify_worker_token(&self, worker_id: &str, token: &str) -> bool {
         let map = self.worker_tokens.lock().unwrap_or_else(|p| p.into_inner());
-        map.get(worker_id)
-            .is_some_and(|expected| crypto::secure_eq(expected, token))
+        map.get(worker_id).is_some_and(|expected| crypto::secure_eq(expected, token))
     }
 
     pub fn has_worker_token(&self, worker_id: &str) -> bool {
-        self.worker_tokens
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains_key(worker_id)
+        self.worker_tokens.lock().unwrap_or_else(|p| p.into_inner()).contains_key(worker_id)
     }
 
     pub fn remove_worker_token(&self, worker_id: &str) {
-        self.worker_tokens
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(worker_id);
+        self.worker_tokens.lock().unwrap_or_else(|p| p.into_inner()).remove(worker_id);
     }
 
     pub fn try_reserve_task(&self, task_id: &str) -> bool {
-        self.reserved_tasks
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(task_id.to_string())
+        self.reserved_tasks.lock().unwrap_or_else(|p| p.into_inner()).insert(task_id.to_string())
     }
 
     pub fn release_task_reservation(&self, task_id: &str) {
-        self.reserved_tasks
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(task_id);
+        self.reserved_tasks.lock().unwrap_or_else(|p| p.into_inner()).remove(task_id);
     }
 
     pub fn set_task_hint(&self, task_id: &str, hint: String) {
-        self.task_hints
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(task_id.to_string(), hint);
+        self.task_hints.lock().unwrap_or_else(|p| p.into_inner()).insert(task_id.to_string(), hint);
     }
 
     pub fn take_task_hint(&self, task_id: &str) -> Option<String> {
-        self.task_hints
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(task_id)
+        self.task_hints.lock().unwrap_or_else(|p| p.into_inner()).remove(task_id)
     }
 
     pub fn record_attempt_baseline(&self, attempt_id: &str, baseline: roles::DirtyBaseline) {
-        self.attempt_baselines
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(attempt_id.to_string(), baseline);
+        self.attempt_baselines.lock().unwrap_or_else(|p| p.into_inner()).insert(attempt_id.to_string(), baseline);
     }
 
     pub fn get_attempt_baseline(&self, attempt_id: &str) -> Option<roles::DirtyBaseline> {
-        self.attempt_baselines
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .get(attempt_id)
-            .cloned()
+        self.attempt_baselines.lock().unwrap_or_else(|p| p.into_inner()).get(attempt_id).cloned()
     }
 
     pub fn enter_ask(&self, attempt_id: &str) {
-        self.active_asks
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(attempt_id.to_string());
+        self.active_asks.lock().unwrap_or_else(|p| p.into_inner()).insert(attempt_id.to_string());
     }
 
     pub fn leave_ask(&self, attempt_id: &str) {
-        self.active_asks
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .remove(attempt_id);
+        self.active_asks.lock().unwrap_or_else(|p| p.into_inner()).remove(attempt_id);
     }
 
     pub fn has_active_ask(&self, attempt_id: &str) -> bool {
-        self.active_asks
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .contains(attempt_id)
+        self.active_asks.lock().unwrap_or_else(|p| p.into_inner()).contains(attempt_id)
     }
 
     /// Returns `true` if already reminded before, else records reminder and returns `false`.
@@ -430,10 +370,7 @@ impl DroveRuntime {
 
     /// Returns `true` the first time this attempt crosses its silence warning threshold.
     pub fn mark_stall_warned(&self, attempt_id: &str) -> bool {
-        self.stall_warned
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(attempt_id.to_string())
+        self.stall_warned.lock().unwrap_or_else(|p| p.into_inner()).insert(attempt_id.to_string())
     }
 
     pub fn is_ai_circuit_open(&self) -> bool {
@@ -575,11 +512,8 @@ impl DroveRuntime {
             },
         };
         let magpie_gateway = MagpieClient::resolve_gateway(cfg.magpie.gateway_url.as_deref());
-        let (magpie_quotas, magpie_error) = if cfg.magpie.enabled {
-            self.magpie.fetch_if_enabled(&cfg.magpie, false).await
-        } else {
-            (None, None)
-        };
+        let (magpie_quotas, magpie_error) =
+            if cfg.magpie.enabled { self.magpie.fetch_if_enabled(&cfg.magpie, false).await } else { (None, None) };
         DroveSettingsResult {
             machine: self.core().map(|c| c.info.name.clone()).unwrap_or_else(|| "local".into()),
             web_port: self.web_port.load(Ordering::SeqCst),
@@ -598,6 +532,9 @@ impl DroveRuntime {
 
         if let Some(mc) = params.max_concurrency_default {
             next.max_concurrency_default = mc;
+        }
+        if let Some(note) = params.note {
+            next.note = config::normalize_note(Some(&note), 1000);
         }
         if let Some(roles) = params.roles {
             next.roles = roles;
@@ -629,11 +566,8 @@ impl DroveRuntime {
             }
             if let Some(s) = ai.context_window {
                 let clean = s.trim().to_ascii_lowercase();
-                next.ai.context_window = if clean.is_empty() || clean == "auto" || clean == "default" {
-                    None
-                } else {
-                    Some(clean)
-                };
+                next.ai.context_window =
+                    if clean.is_empty() || clean == "auto" || clean == "default" { None } else { Some(clean) };
                 core_ai_patch.context_window = Some(s);
                 has_core_ai_update = true;
             }
@@ -683,11 +617,8 @@ impl DroveRuntime {
         if params.clear_ai_key == Some(true) || patch_clear {
             core_ai_patch.clear_key = Some(true);
             has_core_ai_update = true;
-        } else if let Some(key) = params
-            .api_key
-            .or(patch_api_key)
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+        } else if let Some(key) =
+            params.api_key.or(patch_api_key).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
         {
             core_ai_patch.api_key = Some(key);
             has_core_ai_update = true;
@@ -784,10 +715,11 @@ impl DroveRuntime {
                 }
             }
         });
-        self.subs
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .push(FramedSub { conn: conn.clone(), channel, task: task.abort_handle() });
+        self.subs.lock().unwrap_or_else(|p| p.into_inner()).push(FramedSub {
+            conn: conn.clone(),
+            channel,
+            task: task.abort_handle(),
+        });
         Ok(json!({ "channel": channel }))
     }
 
@@ -876,10 +808,7 @@ fn merge_unique_models(primary: &[String], extra: &[String]) -> Vec<String> {
 }
 
 pub(crate) fn validate_run_id_chars(id: &str) -> Result<(), RpcError> {
-    if id.is_empty()
-        || id.len() > 96
-        || !id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
-    {
+    if id.is_empty() || id.len() > 96 || !id.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-')) {
         return Err(RpcError::invalid_params(format!("invalid run id {id:?}")));
     }
     Ok(())

@@ -493,7 +493,15 @@
           "promptCacheEnabled": {
             "type": "boolean"
           },
+          "promptMode": {
+            "default": "auto",
+            "type": "string"
+          },
           "ptyStatusArbitration": {
+            "type": "boolean"
+          },
+          "redactSecrets": {
+            "default": true,
             "type": "boolean"
           },
           "semanticSummary": {
@@ -507,6 +515,100 @@
           "handoffDistill",
           "checkpointLabeling",
           "semanticSummary"
+        ],
+        "type": "object"
+      },
+      "AiOpMetrics": {
+        "properties": {
+          "calls": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "failures": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "localCacheHits": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "lowConfidenceRejects": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "parseErrors": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "totalLatencyMs": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "calls",
+          "localCacheHits",
+          "failures",
+          "parseErrors",
+          "lowConfidenceRejects",
+          "totalLatencyMs"
+        ],
+        "type": "object"
+      },
+      "AiProbePromptModeResult": {
+        "properties": {
+          "cachedInputTokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "detectedMode": {
+            "description": "Detected prompt mode: `\"shared_prefix\"`, `\"compact\"`, or `\"pending\"`.",
+            "type": "string"
+          },
+          "inputTokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "probesRun": {
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/AiStatus"
+          }
+        },
+        "required": [
+          "ok",
+          "detectedMode",
+          "probesRun",
+          "cachedInputTokens",
+          "inputTokens",
+          "status"
         ],
         "type": "object"
       },
@@ -825,6 +927,13 @@
             "minimum": 0,
             "type": "integer"
           },
+          "effectivePromptMode": {
+            "description": "Effective prompt mode currently applied for stateless control-plane ops (`\"shared_prefix\"` or `\"compact\"`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "inputTokens": {
             "format": "uint64",
             "minimum": 0,
@@ -835,8 +944,42 @@
             "minimum": 0,
             "type": "integer"
           },
+          "opMetrics": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/AiOpMetrics"
+            },
+            "type": "object"
+          },
           "outputTokens": {
             "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "promptCacheAutoDegraded": {
+            "default": false,
+            "description": "True when the active endpoint repeatedly reported 0 cached input tokens and automatically fell back to compact prompts.",
+            "type": "boolean"
+          },
+          "promptCacheDetectedMode": {
+            "description": "Remembered auto-detected prompt mode for the active `(base_url, model)`: `\"shared_prefix\"`, `\"compact\"`, or `None` (pending/reset).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "promptCacheProbeMisses": {
+            "default": 0,
+            "description": "Number of consecutive >=1024-token shared-prefix probes without KV-cache hits so far.",
+            "format": "uint8",
+            "maximum": 255,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "promptCacheProbeThreshold": {
+            "default": 0,
+            "description": "Probe threshold before auto mode degrades to compact prompts.",
+            "format": "uint8",
+            "maximum": 255,
             "minimum": 0,
             "type": "integer"
           },
@@ -2151,6 +2294,13 @@
             "minimum": 0,
             "type": "integer"
           },
+          "note": {
+            "description": "Optional global routing/scheduling note for Role -> Agent + Model selection\n(read by AI routers and coordinators when choosing or launching sub-agents).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "roles": {
             "additionalProperties": {
               "$ref": "#/components/schemas/RoleConfig"
@@ -2207,6 +2357,13 @@
             "type": "integer"
           },
           "modelUsed": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "note": {
+            "description": "Generated routing note (global note for `all`/`notes`/`global`, or single candidate note for `candidate`).",
             "type": [
               "string",
               "null"
@@ -3046,6 +3203,12 @@
           "lineage": {
             "$ref": "#/components/schemas/Lineage"
           },
+          "markdown": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "merged_files": {
             "items": {
               "type": "string"
@@ -3117,6 +3280,20 @@
       },
       "HelloResult": {
         "properties": {
+          "build_sha": {
+            "description": "Git short SHA (with `+dirty` when built from a modified tree) of this core binary.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "build_time": {
+            "description": "UTC ISO-8601 build timestamp of this core binary.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "core": {
             "$ref": "#/components/schemas/CoreInfo"
           },
@@ -3349,6 +3526,11 @@
           {
             "const": "side-chat",
             "description": "Open a temporary side-channel discussion without replacing the main session.",
+            "type": "string"
+          },
+          {
+            "const": "send-context",
+            "description": "Forward recent session context directly into another currently live session.",
             "type": "string"
           }
         ]
@@ -4302,6 +4484,13 @@
               "null"
             ]
           },
+          "note": {
+            "description": "Optional usage/routing note for this agent+model candidate (read by AI when selecting/launching sub-agents).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "strengths": {
             "description": "Work types / task specialties this agent+model excels at (used by router & coordinator).",
             "items": {
@@ -4777,6 +4966,20 @@
       },
       "StatusResult": {
         "properties": {
+          "build_sha": {
+            "description": "Git short SHA (with `+dirty` when built from a modified tree) of the running core binary.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "build_time": {
+            "description": "UTC ISO-8601 build timestamp of the running core binary.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "core": {
             "$ref": "#/components/schemas/CoreInfo"
           },
@@ -7912,6 +8115,42 @@
           }
         },
         {
+          "description": "Pre-built markdown context package forwarded from another machine into an existing local target.",
+          "name": "inline_markdown",
+          "required": false,
+          "schema": {
+            "description": "Pre-built markdown context package forwarded from another machine into an existing local target.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Original source address label paired with `inline_markdown`.",
+          "name": "inline_source",
+          "required": false,
+          "schema": {
+            "description": "Original source address label paired with `inline_markdown`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Optional human-readable turn range label paired with `inline_markdown`.",
+          "name": "inline_turns",
+          "required": false,
+          "schema": {
+            "description": "Optional human-readable turn range label paired with `inline_markdown`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
           "description": "Deliver delta/summary into an existing agent or terminal instead of creating a new one.",
           "name": "into",
           "required": false,
@@ -8013,6 +8252,16 @@
               "string",
               "null"
             ]
+          }
+        },
+        {
+          "description": "Build and return the handoff markdown package without creating or sending to a target (used for cross-machine delivery).",
+          "name": "package_only",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Build and return the handoff markdown package without creating or sending to a target (used for cross-machine delivery).",
+            "type": "boolean"
           }
         },
         {
@@ -10674,6 +10923,19 @@
           }
         },
         {
+          "description": "Optional global routing/scheduling note update (empty string clears the note).",
+          "name": "note",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Optional global routing/scheduling note update (empty string clears the note).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
           "name": "on",
           "required": false,
           "schema": {
@@ -10836,7 +11098,7 @@
       }
     },
     {
-      "description": "Use the configured AI assistant model to automatically configure Drove roles, models, and candidate strengths.",
+      "description": "Use the configured AI assistant model to automatically configure Drove roles, models, candidate strengths, and routing notes.",
       "errors": [
         {
           "code": -32602,
@@ -10877,12 +11139,12 @@
           }
         },
         {
-          "description": "Persist generated roles immediately (defaults to true).",
+          "description": "Persist generated roles/note immediately (defaults to true).",
           "name": "apply",
           "required": false,
           "schema": {
             "default": null,
-            "description": "Persist generated roles immediately (defaults to true).",
+            "description": "Persist generated roles/note immediately (defaults to true).",
             "type": [
               "boolean",
               "null"
@@ -10903,12 +11165,12 @@
           }
         },
         {
-          "description": "Optional natural-language preference hint (e.g. preferred agents/models or cost/speed priority).",
+          "description": "Optional natural-language preference hint (e.g. preferred agents/models, cost/speed priority, or draft note to refine).",
           "name": "instruction",
           "required": false,
           "schema": {
             "default": null,
-            "description": "Optional natural-language preference hint (e.g. preferred agents/models or cost/speed priority).",
+            "description": "Optional natural-language preference hint (e.g. preferred agents/models, cost/speed priority, or draft note to refine).",
             "type": [
               "string",
               "null"
@@ -10916,12 +11178,12 @@
           }
         },
         {
-          "description": "Preferred output language (\"zh-CN\" | \"en\") for strengths tags and rationale.",
+          "description": "Preferred output language (\"zh-CN\" | \"en\") for strengths tags, notes, and rationale.",
           "name": "language",
           "required": false,
           "schema": {
             "default": null,
-            "description": "Preferred output language (\"zh-CN\" | \"en\") for strengths tags and rationale.",
+            "description": "Preferred output language (\"zh-CN\" | \"en\") for strengths tags, notes, and rationale.",
             "type": [
               "string",
               "null"
@@ -10929,12 +11191,12 @@
           }
         },
         {
-          "description": "Configuration scope: `\"models\"` (agents/models/effort only), `\"strengths\"` (candidate task strengths only), or `\"all\"` (default).",
+          "description": "Configuration scope: `\"models\"` (agents/models/effort only), `\"strengths\"` (candidate task strengths only),\n`\"notes\"` (global and/or per-candidate routing notes only), or `\"all\"` (default: models + strengths + notes).",
           "name": "mode",
           "required": false,
           "schema": {
             "default": null,
-            "description": "Configuration scope: `\"models\"` (agents/models/effort only), `\"strengths\"` (candidate task strengths only), or `\"all\"` (default).",
+            "description": "Configuration scope: `\"models\"` (agents/models/effort only), `\"strengths\"` (candidate task strengths only),\n`\"notes\"` (global and/or per-candidate routing notes only), or `\"all\"` (default: models + strengths + notes).",
             "type": [
               "string",
               "null"
@@ -10955,10 +11217,51 @@
           }
         },
         {
+          "description": "Optional target scope when `mode == \"notes\"`: `\"global\"`, `\"candidate\"`, or `\"all\"` (default).",
+          "name": "noteScope",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Optional target scope when `mode == \"notes\"`: `\"global\"`, `\"candidate\"`, or `\"all\"` (default).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
           "name": "on",
           "required": false,
           "schema": {
             "default": null,
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Optional 0-based candidate index inside `targetRole` when `noteScope == \"candidate\"`.",
+          "name": "targetCandidateIndex",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Optional 0-based candidate index inside `targetRole` when `noteScope == \"candidate\"`.",
+            "format": "uint",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Optional role ID when `noteScope == \"candidate\"`.",
+          "name": "targetRole",
+          "required": false,
+          "schema": {
+            "default": null,
+            "description": "Optional role ID when `noteScope == \"candidate\"`.",
             "type": [
               "string",
               "null"
@@ -11414,7 +11717,37 @@
           }
         },
         {
+          "name": "promptMode",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
           "name": "ptyStatusArbitration",
+          "required": false,
+          "schema": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "redactSecrets",
+          "required": false,
+          "schema": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "resetPromptCacheDetection",
           "required": false,
           "schema": {
             "type": [
@@ -11514,6 +11847,52 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/AiTestResult"
+        }
+      }
+    },
+    {
+      "description": "Clear prior prompt-prefix KV-cache detection records, set prompt mode to auto, and actively re-detect whether shared prefix or compact prompt mode should be used.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "ai.probe_prompt_mode",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "on",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/AiProbePromptModeResult"
         }
       }
     },

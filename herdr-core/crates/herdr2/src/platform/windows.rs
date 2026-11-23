@@ -389,18 +389,23 @@ pub fn make_executable(_: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// The files of a release, as they sit beside herdr2.exe.
-const RELEASE: [&str; 3] = ["herdr2.exe", r"conpty\conpty.dll", r"conpty\x64\OpenConsole.exe"];
+/// Sidecar ConPTY files of a Windows release, as they sit beside the core exe.
+const RELEASE_CONPTY: [&str; 2] = [r"conpty\conpty.dll", r"conpty\x64\OpenConsole.exe"];
+/// Core binary aliases that may live side-by-side in the same Windows install folder.
+const CORE_ALIASES: [&str; 4] = ["herdr2.exe", "herdr2-core.exe", "h2.exe", "drove.exe"];
 
-/// Puts the release whose herdr2.exe is `from` where `dest`'s folder
-/// is. Windows won't overwrite a running file but will rename one: every
-/// file is staged and checked first, then each old one is moved aside and
-/// the new one moved in; any failure moves everything back. Moved-aside
-/// files go on the next update. `h2.exe`, if it is a link to herdr2.exe,
-/// is linked to the new one.
+/// Puts the core binary `from` (and any sidecar ConPTY files beside it) into `dest`'s folder.
+/// Windows won't overwrite a running file but will rename one: every file is staged and checked
+/// first (preserving `.exe` on staged executables so `CreateProcess` can run them), then each old
+/// file is moved aside and the new one moved in; any failure moves everything back. Any sibling
+/// core aliases (`herdr2.exe`, `herdr2-core.exe`, `h2.exe`, `drove.exe`) present in `dest`'s
+/// folder are updated together via hard link (or copy fallback) so they never drift out of sync.
 pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::Result<()> {
     let dir = dest.parent().ok_or_else(|| io::Error::other("no folder"))?;
     let src = from.parent().ok_or_else(|| io::Error::other("no folder"))?;
+    if !from.is_file() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, format!("{} does not exist", from.display())));
+    }
     let _lock = retry(|| {
         std::os::windows::fs::OpenOptionsExt::share_mode(
             std::fs::OpenOptions::new().create(true).truncate(false).write(true),
@@ -414,43 +419,81 @@ pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::R
         .flatten()
         .flatten()
     {
-        // Only what an update named: <release file>.<old|new|failed>-<pid>-<32 hex>.
+        // Clean leftovers from both legacy (`<file>.<what>-<pid>-<32hex>`) and
+        // extension-preserving (`<stem>.<what>-<pid>-<32hex>.<ext>`) naming schemes.
         let name = leftover.file_name().to_string_lossy().to_ascii_lowercase();
         let tagged = |rest: &str| {
-            rest.split_once('-').is_some_and(|(pid, hex)| {
+            let core = rest.strip_suffix(".exe").or_else(|| rest.strip_suffix(".dll")).unwrap_or(rest);
+            core.split_once('-').is_some_and(|(pid, hex)| {
                 !pid.is_empty()
                     && pid.bytes().all(|b| b.is_ascii_digit())
                     && hex.len() == 32
                     && hex.bytes().all(|b| b.is_ascii_hexdigit())
             })
         };
-        let ours = ["herdr2.exe", "conpty.dll", "openconsole.exe", "h2.exe"]
-            .iter()
-            .flat_map(|f| ["old", "new", "failed"].map(|w| format!("{f}.{w}-")))
-            .any(|prefix| name.strip_prefix(&prefix).is_some_and(tagged));
+        let ours = [
+            "herdr2.exe",
+            "herdr2-core.exe",
+            "drove.exe",
+            "h2.exe",
+            "herdr2",
+            "herdr2-core",
+            "drove",
+            "h2",
+            "conpty.dll",
+            "conpty",
+            "openconsole.exe",
+            "openconsole",
+        ]
+        .iter()
+        .flat_map(|f| ["old", "new", "failed"].map(|w| format!("{f}.{w}-")))
+        .any(|prefix| name.strip_prefix(&prefix).is_some_and(tagged));
         if ours {
             let _ = std::fs::remove_file(leftover.path()); // still in use: next time
         }
     }
     let tag = format!("{}-{}", std::process::id(), crate::platform::random_hex());
-    let aside = |p: &Path, what: &str| PathBuf::from(format!("{}.{what}-{tag}", p.display()));
-    let exe = dir.join(RELEASE[0]);
-    let hc = dir.join("h2.exe");
-    let linked = |a: &Path, b: &Path| matches!((std::fs::metadata(a), std::fs::metadata(b)), (Ok(a), Ok(b)) if file_identity(&a) == file_identity(&b));
-    let hc_ours = linked(&hc, &exe);
+    // Preserve `.exe` on staged executables so Windows CreateProcess can execute `works(&staged)`.
+    let aside = |p: &Path, what: &str| -> PathBuf {
+        let stem = p.file_stem().and_then(|s| s.to_str());
+        let ext = p.extension().and_then(|s| s.to_str());
+        match (stem, ext) {
+            (Some(s), Some(e)) => p.with_file_name(format!("{s}.{what}-{tag}.{e}")),
+            _ => PathBuf::from(format!("{}.{what}-{tag}", p.display())),
+        }
+    };
+
+    // Determine primary destination and any sibling core aliases already installed in `dir`.
+    let primary_dest = dest.to_path_buf();
+    let primary_name_lower =
+        primary_dest.file_name().and_then(|s| s.to_str()).map(str::to_ascii_lowercase).unwrap_or_default();
+    let sibling_aliases: Vec<PathBuf> = CORE_ALIASES
+        .iter()
+        .filter(|alias| !alias.eq_ignore_ascii_case(&primary_name_lower))
+        .map(|alias| dir.join(alias))
+        .filter(|p| p.is_file())
+        .collect();
 
     // (staged, final) pairs, all staged before anything moves.
     let mut staged: Vec<(PathBuf, PathBuf)> = Vec::new();
     let stage = || -> io::Result<Vec<(PathBuf, PathBuf)>> {
         let mut done = Vec::new();
-        for rel in RELEASE {
-            let (from, to) = (src.join(rel), dir.join(rel));
-            if !from.is_file() {
+        std::fs::create_dir_all(dir)?;
+        let primary_staged = aside(&primary_dest, "new");
+        std::fs::copy(from, &primary_staged)?;
+        done.push((primary_staged, primary_dest.clone()));
+
+        for rel in RELEASE_CONPTY {
+            let (src_file, to_file) = (src.join(rel), dir.join(rel));
+            if !src_file.is_file() {
                 continue; // a bare exe (an app's own build): its ConPTY stays
             }
-            std::fs::create_dir_all(to.parent().unwrap())?;
-            std::fs::copy(&from, aside(&to, "new"))?;
-            done.push((aside(&to, "new"), to));
+            if let Some(parent) = to_file.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let staged_file = aside(&to_file, "new");
+            std::fs::copy(&src_file, &staged_file)?;
+            done.push((staged_file, to_file));
         }
         Ok(done)
     };
@@ -459,9 +502,13 @@ pub fn swap_in(from: &Path, dest: &Path, works: impl Fn(&Path) -> bool) -> io::R
         if !staged.first().is_some_and(|(s, _)| works(s)) {
             return Err(io::Error::from(io::ErrorKind::InvalidData));
         }
-        if hc_ours {
-            std::fs::hard_link(&staged[0].0, aside(&hc, "new"))?;
-            staged.push((aside(&hc, "new"), hc.clone()));
+        let primary_staged = staged[0].0.clone();
+        for alias_dest in &sibling_aliases {
+            let alias_staged = aside(alias_dest, "new");
+            if std::fs::hard_link(&primary_staged, &alias_staged).is_err() {
+                std::fs::copy(&primary_staged, &alias_staged)?;
+            }
+            staged.push((alias_staged, alias_dest.clone()));
         }
         Ok(())
     })();
@@ -688,15 +735,8 @@ unsafe extern "system" fn on_host_shutdown(ctrl_type: u32) -> BOOL {
     0
 }
 
-unsafe extern "system" fn shutdown_wndproc(
-    hwnd: HWND,
-    msg: u32,
-    wparam: WPARAM,
-    lparam: LPARAM,
-) -> LRESULT {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DefWindowProcW, WM_ENDSESSION, WM_QUERYENDSESSION,
-    };
+unsafe extern "system" fn shutdown_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{DefWindowProcW, WM_ENDSESSION, WM_QUERYENDSESSION};
     match msg {
         WM_QUERYENDSESSION => {
             // Arm early so child exits triggered during Windows logoff/shutdown are
@@ -730,8 +770,7 @@ pub fn monitor_shutdown() {
         let _ = std::thread::Builder::new().name("h2-win-shutdown".into()).spawn(|| {
             use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
             use windows_sys::Win32::UI::WindowsAndMessaging::{
-                CreateWindowExW, DispatchMessageW, GetMessageW, MSG, RegisterClassW,
-                TranslateMessage, WNDCLASSW,
+                CreateWindowExW, DispatchMessageW, GetMessageW, MSG, RegisterClassW, TranslateMessage, WNDCLASSW,
             };
             let class_name: Vec<u16> = "Herdr2ShutdownWatcher\0".encode_utf16().collect();
             let hinstance = unsafe { GetModuleHandleW(null()) };

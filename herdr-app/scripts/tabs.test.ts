@@ -674,3 +674,181 @@ test("pane header shows agent ID for manual terminal agents and clickable upstre
   const shTree = paneView.render({});
   expect(findById(shTree, "ph-addr-p-sh")).toBeNull();
 });
+
+test("tab strip splits available width equally across all tabs when tabs overflow and restores natural widths when they fit", () => {
+  const mkTabs = (n: number) =>
+    Array.from({ length: n }, (_, i) => ({
+      id: `t${i + 1}`,
+      name: `Tab ${i + 1}`,
+      named: true,
+      active: i === 0,
+    }));
+  let currentTabs = mkTabs(2);
+  const currentPanes = Array.from({ length: 8 }, (_, i) => ({
+    pane: `p${i + 1}`,
+    tab: `t${i + 1}`,
+    terminal: `a${i + 1}`,
+    acp: true,
+    status: "idle",
+    program: { name: "Claude Code", key: "claude", agent: true, icon: "icons/claude.svg" },
+  }));
+  const view = new (new Function(
+    ...Object.keys(values),
+    source.replace(/^import .*;\n/gm, "").replace("export default class Tabs", "return class Tabs"),
+  )(
+    ...Object.values({
+      ...values,
+      spaces: () => [{ id: "s1", active: true, tabs: currentTabs }],
+      panes: () => currentPanes,
+      settings: () => ({ zoom: 1, language: "zh-CN" }),
+    }),
+  ))();
+  view.init();
+  const findById = (node: any, id: string): any => {
+    if (!node) return null;
+    if (node.calls?.id?.[0] === id) return node;
+    for (const ch of node.nodes ?? []) {
+      const hit = findById(ch, id);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  const cx = { stop_propagation() {}, notify() {} };
+
+  // 1) 2 tabs of 150px fit comfortably in 600px strip -> natural width (no forced .w())
+  let root = view.render();
+  findById(root, "tab-scroll").calls.on_size_change[0]({ width: 600 }, cx);
+  findById(root, "tab-t1").calls.on_size_change[0]({ width: 150 }, cx);
+  findById(root, "tab-t2").calls.on_size_change[0]({ width: 150 }, cx);
+  root = view.render();
+  expect(findById(root, "tab-t1").calls.w).toBeUndefined();
+  expect(findById(root, "tab-t2").calls.w).toBeUndefined();
+
+  // 2) 6 tabs overflow 600px strip (total natural 900 > 585) -> every tab gets floor((600 - 3*5) / 6) = 97px equally
+  currentTabs = mkTabs(6);
+  root = view.render();
+  for (let i = 1; i <= 6; i++) {
+    const node = findById(root, `tab-t${i}`);
+    expect(node.calls.w?.[0]).toBe(97);
+    expect(node.calls.overflow_hidden).toBeDefined();
+    // Simulate GPUI reporting compressed 97px back: must NOT corrupt naturalWidths or cause oscillation
+    node.calls.on_size_change[0]({ width: 97 }, cx);
+  }
+  const stableRoot = view.render();
+  expect(findById(stableRoot, "tab-t1").calls.w?.[0]).toBe(97);
+  expect(findById(stableRoot, "tab-t6").calls.w?.[0]).toBe(97);
+
+  // 3) Closing back down to 3 tabs (450 <= 594) exits equal-width mode back to natural widths
+  currentTabs = mkTabs(3);
+  root = view.render();
+  expect(findById(root, "tab-t1").calls.w).toBeUndefined();
+  expect(findById(root, "tab-t3").calls.w).toBeUndefined();
+
+  // 4) Widening strip to 1000px with 6 tabs (900 <= 985) also restores natural widths
+  currentTabs = mkTabs(6);
+  root = view.render();
+  expect(findById(root, "tab-t1").calls.w?.[0]).toBe(97);
+  findById(root, "tab-scroll").calls.on_size_change[0]({ width: 1000 }, cx);
+  root = view.render();
+  expect(findById(root, "tab-t1").calls.w).toBeUndefined();
+});
+
+test("newly added tabs are moved to the tail and Chrome-style vertical hairlines separate inactive tabs", () => {
+  const runCalls: Array<[string, any]> = [];
+  let activeSpaceId = "s1";
+  let currentTabs: any[] = [
+    { id: "t1", name: "First", named: true, active: true },
+    { id: "t2", name: "Second", named: true, active: false },
+    { id: "t3", name: "Third", named: true, active: false },
+  ];
+  const view = new (new Function(
+    ...Object.keys(values),
+    source.replace(/^import .*;\n/gm, "").replace("export default class Tabs", "return class Tabs"),
+  )(
+    ...Object.values({
+      ...values,
+      theme: () => ({
+        chrome: "#000000",
+        raised: "#141417",
+        hover: "#1e1e24",
+        selected: "#22222a",
+        border: "#ffffff14",
+        foreground: "#f4f4f5",
+        muted: "#a3a3a4",
+        dim: "#71717a",
+        accent: "#3b82f6",
+      }),
+      spaces: () => [{ id: activeSpaceId, active: true, tabs: currentTabs }],
+      panes: () => [],
+      settings: () => ({ zoom: 1, language: "zh-CN" }),
+      run: (cmd: string, args: any) => runCalls.push([cmd, args]),
+    }),
+  ))();
+  view.init();
+  const findById = (node: any, id: string): any => {
+    if (!node) return null;
+    if (node.calls?.id?.[0] === id) return node;
+    for (const ch of node.nodes ?? []) {
+      const hit = findById(ch, id);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  const cx = { stop_propagation() {}, notify() {} };
+
+  // Initial render: inactive tabs stay borderless/flat like Chrome; hairline divider shows between inactive tabs only.
+  const root1 = view.render();
+  expect(runCalls).toEqual([]);
+  const activeTab = findById(root1, "tab-t1");
+  const inactiveTab2 = findById(root1, "tab-t2");
+  expect(inactiveTab2.calls.border_color?.[0]).toBe("#000000");
+  expect(inactiveTab2.calls.bg?.[0]).toBe("#000000");
+  expect(activeTab.calls.border_color?.[0]).toBe("#ffffff14");
+  expect(activeTab.calls.bg?.[0]).toBe("#141417");
+  expect(findById(root1, "tab-sep-t1")).toBeNull();
+  const sep2 = findById(root1, "tab-sep-t2");
+  expect(sep2).not.toBeNull();
+  expect(sep2.calls.w?.[0]).toBe(1);
+  expect(sep2.calls.h?.[0]).toBe(14);
+  expect(sep2.calls.bg?.[0]).toBe("#f4f4f526");
+  expect(findById(root1, "tab-sep-t3")).not.toBeNull();
+
+  // Hovering t3 hides both its left neighbor's divider (tab-sep-t2) and its own divider (tab-sep-t3), just like Chrome.
+  findById(root1, "tab-t3").calls.on_hover[0](true, cx);
+  const hoverRoot = view.render();
+  expect(findById(hoverRoot, "tab-sep-t2")).toBeNull();
+  expect(findById(hoverRoot, "tab-sep-t3")).toBeNull();
+  findById(hoverRoot, "tab-t3").calls.on_hover[0](false, cx);
+
+  // If a new tab t4 arrives in the middle (after active t1), tabs mod immediately moves it to the tail (index 4).
+  currentTabs = [
+    { id: "t1", name: "First", named: true, active: false },
+    { id: "t4", name: "Fourth", named: true, active: true },
+    { id: "t2", name: "Second", named: true, active: false },
+    { id: "t3", name: "Third", named: true, active: false },
+  ];
+  view.render();
+  expect(runCalls).toEqual([["tab.move", { id: "t4", index: 4 }]]);
+
+  // If a new tab t5 already arrives at the tail, no redundant tab.move is issued.
+  runCalls.length = 0;
+  currentTabs = [
+    { id: "t1", name: "First", named: true, active: false },
+    { id: "t2", name: "Second", named: true, active: false },
+    { id: "t3", name: "Third", named: true, active: false },
+    { id: "t4", name: "Fourth", named: true, active: false },
+    { id: "t5", name: "Fifth", named: true, active: true },
+  ];
+  view.render();
+  expect(runCalls).toEqual([]);
+
+  // Switching to another space initializes its seen set without moving existing tabs.
+  runCalls.length = 0;
+  activeSpaceId = "s2";
+  currentTabs = [
+    { id: "x1", name: "Other 1", named: true, active: true },
+    { id: "x2", name: "Other 2", named: true, active: false },
+  ];
+  view.render();
+  expect(runCalls).toEqual([]);
+});

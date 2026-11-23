@@ -285,11 +285,7 @@ impl Core {
             a.address.clone()
         };
         let removed = if let Some(q) = st.inboxes.get_mut(&id) {
-            if let Some(pos) = q.iter().position(|item| item.id == item_id) {
-                q.remove(pos)
-            } else {
-                None
-            }
+            if let Some(pos) = q.iter().position(|item| item.id == item_id) { q.remove(pos) } else { None }
         } else {
             None
         };
@@ -446,14 +442,7 @@ mod tests {
             config: dir.join("config.toml"),
         };
         paths.create_dirs().unwrap();
-        let core = Core::start(
-            paths,
-            crate::api::CoreInfo {
-                id: "test-id".into(),
-                name: "test".into(),
-            },
-        )
-        .unwrap();
+        let core = Core::start(paths, crate::api::CoreInfo { id: "test-id".into(), name: "test".into() }).unwrap();
         let id = {
             let mut st = core.lock();
             let id = st

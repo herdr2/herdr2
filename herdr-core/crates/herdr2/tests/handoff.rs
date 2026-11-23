@@ -33,15 +33,8 @@ fn acp_handoff_lazy_injection_turn_slice_and_merge_back() {
     init_git_repo(&repo);
 
     let spec = fake_acp_spec();
-    let run1 = s.json(&[
-        "run",
-        "--agent",
-        &spec,
-        "--cwd",
-        &repo.to_string_lossy(),
-        "--prompt",
-        "Design auth token validator",
-    ]);
+    let run1 =
+        s.json(&["run", "--agent", &spec, "--cwd", &repo.to_string_lossy(), "--prompt", "Design auth token validator"]);
     let a1 = run1["address"].as_str().unwrap().to_string();
     assert_eq!(run1["wait"]["turn"].as_u64(), Some(1), "{run1}");
 
@@ -58,17 +51,8 @@ fn acp_handoff_lazy_injection_turn_slice_and_merge_back() {
     assert!(!slice_text.contains("Design auth token validator"), "{slice_text}");
 
     // Hand off from a1 to a2 (auto-reusing a1's raw fake_acp_spec binary when preset is omitted).
-    let ho = s.json(&[
-        "handoff",
-        &a1,
-        "--kind",
-        "handoff",
-        "--note",
-        "Switch to verifier",
-        "--prompt",
-        "STATE",
-        "--wait",
-    ]);
+    let ho =
+        s.json(&["handoff", &a1, "--kind", "handoff", "--note", "Switch to verifier", "--prompt", "STATE", "--wait"]);
     let a2 = ho["target"].as_str().unwrap().to_string();
     assert_eq!(ho["target_kind"], "agent", "{ho}");
     assert_eq!(ho["source"], a1, "{ho}");
@@ -92,7 +76,8 @@ fn acp_handoff_lazy_injection_turn_slice_and_merge_back() {
 
     let last1: Value = {
         let last_txt = s.json(&["read", &a2, "--last"])["text"].as_str().unwrap().to_string();
-        let line = last_txt.lines().find(|l| l.starts_with('{')).unwrap_or_else(|| panic!("bad STATE json: {last_txt:?}"));
+        let line =
+            last_txt.lines().find(|l| l.starts_with('{')).unwrap_or_else(|| panic!("bad STATE json: {last_txt:?}"));
         serde_json::from_str(line).unwrap()
     };
     let wire1 = last1["raw"].as_str().unwrap();
@@ -104,7 +89,8 @@ fn acp_handoff_lazy_injection_turn_slice_and_merge_back() {
     s.json(&["send", "--wait", &a2, "STATE"]);
     let last2: Value = {
         let last_txt = s.json(&["read", &a2, "--last"])["text"].as_str().unwrap().to_string();
-        let line = last_txt.lines().find(|l| l.starts_with('{')).unwrap_or_else(|| panic!("bad STATE json: {last_txt:?}"));
+        let line =
+            last_txt.lines().find(|l| l.starts_with('{')).unwrap_or_else(|| panic!("bad STATE json: {last_txt:?}"));
         serde_json::from_str(line).unwrap()
     };
     let wire2 = last2["raw"].as_str().unwrap();
@@ -123,7 +109,8 @@ fn acp_handoff_lazy_injection_turn_slice_and_merge_back() {
     );
     let a1_last: Value = {
         let last_txt = s.json(&["read", &a1, "--last"])["text"].as_str().unwrap().to_string();
-        let line = last_txt.lines().find(|l| l.starts_with('{')).unwrap_or_else(|| panic!("bad STATE json: {last_txt:?}"));
+        let line =
+            last_txt.lines().find(|l| l.starts_with('{')).unwrap_or_else(|| panic!("bad STATE json: {last_txt:?}"));
         serde_json::from_str(line).unwrap()
     };
     assert!(a1_last["raw"].as_str().unwrap().contains("<herdr2-handoff"), "{a1_last}");
@@ -142,10 +129,7 @@ fn acp_handoff_lazy_injection_turn_slice_and_merge_back() {
         .iter()
         .find(|e| e["kind"] == "user" && e["turn"].as_u64() == Some(4))
         .expect("turn 4 user entry must exist after prompt-less merge back");
-    assert!(
-        turn4_user["text"].as_str().unwrap_or_default().contains("Handoff from"),
-        "{turn4_user}"
-    );
+    assert!(turn4_user["text"].as_str().unwrap_or_default().contains("Handoff from"), "{turn4_user}");
 
     // Prompt-less ACP side-chat / fork / handoff must immediately deliver the carried context on startup
     // (consistent with CLI mode) using a read-only bootstrap prompt, so the agent receives it right away.
@@ -168,7 +152,8 @@ fn acp_handoff_lazy_injection_turn_slice_and_merge_back() {
     s.json(&["send", "--wait", &a3, "STATE"]);
     let a3_last: Value = {
         let last_txt = s.json(&["read", &a3, "--last"])["text"].as_str().unwrap().to_string();
-        let line = last_txt.lines().find(|l| l.starts_with('{')).unwrap_or_else(|| panic!("bad STATE json: {last_txt:?}"));
+        let line =
+            last_txt.lines().find(|l| l.starts_with('{')).unwrap_or_else(|| panic!("bad STATE json: {last_txt:?}"));
         serde_json::from_str(line).unwrap()
     };
     assert!(
@@ -184,15 +169,8 @@ fn pty_handoff_stages_markdown_and_records_lineage() {
     init_git_repo(&repo);
 
     let spec = fake_acp_spec();
-    let run1 = s.json(&[
-        "run",
-        "--agent",
-        &spec,
-        "--cwd",
-        &repo.to_string_lossy(),
-        "--prompt",
-        "Design auth token validator",
-    ]);
+    let run1 =
+        s.json(&["run", "--agent", &spec, "--cwd", &repo.to_string_lossy(), "--prompt", "Design auth token validator"]);
     let a1 = run1["address"].as_str().unwrap().to_string();
     assert_eq!(run1["wait"]["turn"].as_u64(), Some(1), "{run1}");
 
@@ -210,7 +188,10 @@ fn pty_handoff_stages_markdown_and_records_lineage() {
     let t1_get = s.json(&["get", t1]);
     assert_eq!(t1_get["lineage"]["parent"], a1, "{t1_get}");
     assert_eq!(t1_get["lineage"]["kind"], "handoff", "{t1_get}");
-    assert!(t1_get["parent"].is_null(), "PTY handoff should be a standalone top-level session, not a sub-agent: {t1_get}");
+    assert!(
+        t1_get["parent"].is_null(),
+        "PTY handoff should be a standalone top-level session, not a sub-agent: {t1_get}"
+    );
 }
 
 #[test]
@@ -220,15 +201,7 @@ fn fork_worktree_creates_branch_notifies_parent_on_merge_and_cleans_up_on_rm() {
     init_git_repo(&repo);
 
     let spec = fake_acp_spec();
-    let run1 = s.json(&[
-        "run",
-        "--agent",
-        &spec,
-        "--cwd",
-        &repo.to_string_lossy(),
-        "--prompt",
-        "Work on calculator",
-    ]);
+    let run1 = s.json(&["run", "--agent", &spec, "--cwd", &repo.to_string_lossy(), "--prompt", "Work on calculator"]);
     let a1 = run1["address"].as_str().unwrap().to_string();
 
     // 1. Fork with --worktree: creates a real local Git branch (not detached HEAD).
@@ -254,11 +227,7 @@ fn fork_worktree_creates_branch_notifies_parent_on_merge_and_cleans_up_on_rm() {
 
     // Verify fork worktree is on the real branch and supports commits.
     let wt_head = String::from_utf8_lossy(
-        &Command::new("git")
-            .args(["-C", &wt_path, "rev-parse", "--abbrev-ref", "HEAD"])
-            .output()
-            .unwrap()
-            .stdout,
+        &Command::new("git").args(["-C", &wt_path, "rev-parse", "--abbrev-ref", "HEAD"]).output().unwrap().stdout,
     )
     .trim()
     .to_string();

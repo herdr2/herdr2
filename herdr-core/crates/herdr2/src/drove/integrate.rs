@@ -29,10 +29,7 @@ pub async fn prepare_task_worktree(
     }
 
     let run_cwd = run.cwd.clone();
-    let reuse_wt = reuse_worktree
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(String::from);
+    let reuse_wt = reuse_worktree.map(str::trim).filter(|s| !s.is_empty()).map(String::from);
     let repo_name: String = Path::new(&run_cwd)
         .file_name()
         .and_then(|s| s.to_str())
@@ -57,10 +54,7 @@ pub async fn prepare_task_worktree(
 
     let lock = core.drove.run_merge_lock(&run.id);
     let _guard = lock.lock().await;
-    let wt_parent = wt_dir
-        .parent()
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| std::path::PathBuf::from(&run_cwd));
+    let wt_parent = wt_dir.parent().map(Path::to_path_buf).unwrap_or_else(|| std::path::PathBuf::from(&run_cwd));
 
     tokio::task::spawn_blocking(move || {
         if is_aosp_harness(&run_cwd) {
@@ -71,17 +65,17 @@ pub async fn prepare_task_worktree(
                 .output()
                 .map_err(|e| format!("spawn harness worktree add: {e}"))?;
             if !out.status.success() {
-                return Err(format!(
-                    "harness worktree add failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ));
+                return Err(format!("harness worktree add failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
             }
             let s = wt_dir.display().to_string();
             return Ok((s.clone(), Some(s)));
         }
 
         if !is_git_repo(&run_cwd) {
-            return Err(format!("worktree isolation requested, but {} is neither a git repo nor an AOSP harness workspace", run_cwd));
+            return Err(format!(
+                "worktree isolation requested, but {} is neither a git repo nor an AOSP harness workspace",
+                run_cwd
+            ));
         }
         let head_ok = super::bg_std_command("git")
             .args(["-C", &run_cwd, "rev-parse", "--verify", "HEAD"])
@@ -108,10 +102,7 @@ pub async fn prepare_task_worktree(
             .output()
             .map_err(|e| format!("spawn git worktree add: {e}"))?;
         if !out.status.success() {
-            return Err(format!(
-                "git worktree add failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+            return Err(format!("git worktree add failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
         }
         Ok((wt_str.clone(), Some(wt_str)))
     })
@@ -251,10 +242,7 @@ fn snapshot_working_tree_commit(run_cwd: &str, wt_parent: &Path) -> Result<Strin
         .output()
         .map_err(|e| format!("spawn git commit-tree: {e}"))?;
     if !commit_out.status.success() {
-        return Err(format!(
-            "git commit-tree failed: {}",
-            String::from_utf8_lossy(&commit_out.stderr).trim()
-        ));
+        return Err(format!("git commit-tree failed: {}", String::from_utf8_lossy(&commit_out.stderr).trim()));
     }
     Ok(String::from_utf8_lossy(&commit_out.stdout).trim().to_string())
 }
@@ -291,16 +279,10 @@ fn merge_worktree_blocking(run_cwd: &str, wt_dir: &str, keep_for_reuse: bool) ->
             return Err(ApiErr::new(
                 422,
                 "merge_conflict",
-                format!(
-                    "Harness worktree merge failed: {}",
-                    String::from_utf8_lossy(&merge_out.stderr).trim()
-                ),
+                format!("Harness worktree merge failed: {}", String::from_utf8_lossy(&merge_out.stderr).trim()),
             ));
         }
-        let _ = super::bg_std_command(bin)
-            .args(["worktree", "remove", wt_dir])
-            .current_dir(run_cwd)
-            .output();
+        let _ = super::bg_std_command(bin).args(["worktree", "remove", wt_dir]).current_dir(run_cwd).output();
         return Ok(Vec::new());
     }
 
@@ -362,13 +344,10 @@ fn merge_worktree_blocking(run_cwd: &str, wt_dir: &str, keep_for_reuse: bool) ->
                 use std::io::Write;
                 let _ = stdin.write_all(&patch_out.stdout);
             }
-            child
-                .wait_with_output()
-                .map_err(|e| ApiErr::new(500, "internal", format!("git apply wait: {e}")))
+            child.wait_with_output().map_err(|e| ApiErr::new(500, "internal", format!("git apply wait: {e}")))
         };
         let mut apply_out = run_apply(true)?;
-        if !apply_out.status.success()
-            && String::from_utf8_lossy(&apply_out.stderr).contains("does not exist in index")
+        if !apply_out.status.success() && String::from_utf8_lossy(&apply_out.stderr).contains("does not exist in index")
         {
             apply_out = run_apply(false)?;
         }
@@ -393,15 +372,9 @@ fn merge_worktree_blocking(run_cwd: &str, wt_dir: &str, keep_for_reuse: bool) ->
 }
 
 pub(super) fn reset_worktree_clean(wt_dir: &str) {
-    let _ = super::bg_std_command("git")
-        .args(["-C", wt_dir, "reset", "-q", "HEAD"])
-        .output();
-    let _ = super::bg_std_command("git")
-        .args(["-C", wt_dir, "checkout", "-f", "--", "."])
-        .output();
-    let _ = super::bg_std_command("git")
-        .args(["-C", wt_dir, "clean", "-fdx"])
-        .output();
+    let _ = super::bg_std_command("git").args(["-C", wt_dir, "reset", "-q", "HEAD"]).output();
+    let _ = super::bg_std_command("git").args(["-C", wt_dir, "checkout", "-f", "--", "."]).output();
+    let _ = super::bg_std_command("git").args(["-C", wt_dir, "clean", "-fdx"]).output();
 }
 
 fn reset_worktree_to_commit(wt_dir: &str, commit: &str) -> bool {
@@ -410,10 +383,7 @@ fn reset_worktree_to_commit(wt_dir: &str, commit: &str) -> bool {
         .args(["-C", wt_dir, "checkout", "-f", "--detach", commit])
         .output()
         .is_ok_and(|o| o.status.success())
-        && super::bg_std_command("git")
-            .args(["-C", wt_dir, "clean", "-fdx"])
-            .output()
-            .is_ok_and(|o| o.status.success())
+        && super::bg_std_command("git").args(["-C", wt_dir, "clean", "-fdx"]).output().is_ok_and(|o| o.status.success())
 }
 
 pub(crate) fn cleanup_worktree_dir(run_cwd: &str, wt_dir: &Path) {
@@ -423,18 +393,14 @@ pub(crate) fn cleanup_worktree_dir(run_cwd: &str, wt_dir: &Path) {
     if wt_dir.exists() {
         let _ = std::fs::remove_dir_all(wt_dir);
     }
-    let _ = super::bg_std_command("git")
-        .args(["-C", run_cwd, "worktree", "prune"])
-        .output();
+    let _ = super::bg_std_command("git").args(["-C", run_cwd, "worktree", "prune"]).output();
 }
 
 /// Permanently removes a forked session's worktree directory AND deletes its dedicated Git branch.
 pub(crate) fn cleanup_fork_worktree(origin_cwd: &str, wt_dir: &Path, branch: Option<&str>) {
     cleanup_worktree_dir(origin_cwd, wt_dir);
     if let Some(b) = branch.map(str::trim).filter(|s| !s.is_empty() && *s != "HEAD") {
-        let _ = super::bg_std_command("git")
-            .args(["-C", origin_cwd, "branch", "-D", b])
-            .output();
+        let _ = super::bg_std_command("git").args(["-C", origin_cwd, "branch", "-D", b]).output();
     }
 }
 
@@ -464,11 +430,8 @@ impl WorktreeBlocker {
 fn detect_in_progress_git_op(origin_cwd: &str) -> Option<String> {
     let git_dir_str = git_stdout_trimmed(origin_cwd, &["rev-parse", "--git-dir"], None).ok()?;
     let git_dir_path = Path::new(&git_dir_str);
-    let git_dir = if git_dir_path.is_absolute() {
-        git_dir_path.to_path_buf()
-    } else {
-        Path::new(origin_cwd).join(git_dir_path)
-    };
+    let git_dir =
+        if git_dir_path.is_absolute() { git_dir_path.to_path_buf() } else { Path::new(origin_cwd).join(git_dir_path) };
     if git_dir.join("MERGE_HEAD").exists() {
         return Some("merge".into());
     }
@@ -518,9 +481,8 @@ pub struct DroveWorktreePreflightOk {
 }
 
 fn find_nested_unborn_git_dirs(origin_cwd: &str) -> Vec<String> {
-    let Ok(out) = git_cmd(origin_cwd)
-        .args(["ls-files", "--others", "--exclude-standard", "--directory", "-z"])
-        .output()
+    let Ok(out) =
+        git_cmd(origin_cwd).args(["ls-files", "--others", "--exclude-standard", "--directory", "-z"]).output()
     else {
         return Vec::new();
     };
@@ -565,9 +527,7 @@ pub fn check_drove_worktree_ready(origin_cwd: &str) -> Result<DroveWorktreePrefl
         });
     }
 
-    let probe_out = git_cmd(origin_cwd)
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .output();
+    let probe_out = git_cmd(origin_cwd).args(["rev-parse", "--is-inside-work-tree"]).output();
     match probe_out {
         Err(e) => {
             return Err(DroveWorktreeBlocker {
@@ -600,7 +560,9 @@ pub fn check_drove_worktree_ready(origin_cwd: &str) -> Result<DroveWorktreePrefl
                 return Err(DroveWorktreeBlocker {
                     code: "bare_repo".into(),
                     cwd: origin_cwd.to_string(),
-                    message: format!("当前目录是裸仓库（bare repository），无法直接用于 Drove Worktree 编排：{origin_cwd}"),
+                    message: format!(
+                        "当前目录是裸仓库（bare repository），无法直接用于 Drove Worktree 编排：{origin_cwd}"
+                    ),
                     fix_hint: "请切换到非裸工作树目录后再启动编排。".into(),
                     op: None,
                     files: Vec::new(),
@@ -675,9 +637,7 @@ pub fn check_drove_worktree_ready(origin_cwd: &str) -> Result<DroveWorktreePrefl
 
     let mut op = detect_in_progress_git_op(origin_cwd);
     let mut dirty: Vec<String> = Vec::new();
-    if let Ok(out) = git_cmd(origin_cwd)
-        .args(["status", "--porcelain=v1", "-z", "-unormal"])
-        .output()
+    if let Ok(out) = git_cmd(origin_cwd).args(["status", "--porcelain=v1", "-z", "-unormal"]).output()
         && out.status.success()
     {
         let mut iter = out.stdout.split(|b| *b == 0);
@@ -692,10 +652,8 @@ pub fn check_drove_worktree_ready(origin_cwd: &str) -> Result<DroveWorktreePrefl
             if matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C') {
                 let _ = iter.next();
             }
-            if matches!(
-                xy,
-                ['D', 'D'] | ['A', 'U'] | ['U', 'D'] | ['U', 'A'] | ['D', 'U'] | ['A', 'A'] | ['U', 'U']
-            ) && op.is_none()
+            if matches!(xy, ['D', 'D'] | ['A', 'U'] | ['U', 'D'] | ['U', 'A'] | ['D', 'U'] | ['A', 'A'] | ['U', 'U'])
+                && op.is_none()
             {
                 op = Some("conflict".into());
             }
@@ -710,7 +668,9 @@ pub fn check_drove_worktree_ready(origin_cwd: &str) -> Result<DroveWorktreePrefl
             code: "in_progress_op".into(),
             cwd: origin_cwd.to_string(),
             message: format!("仓库正在进行 `{in_prog}` 操作或存在未解决冲突，无法创建 Worktree：{origin_cwd}"),
-            fix_hint: format!("请先完成或中止当前 `{in_prog}`（如 `git {in_prog} --abort` 或解决冲突提交）后再开始编排。"),
+            fix_hint: format!(
+                "请先完成或中止当前 `{in_prog}`（如 `git {in_prog} --abort` 或解决冲突提交）后再开始编排。"
+            ),
             op: Some(in_prog),
             files: dirty.into_iter().take(8).collect(),
         });
@@ -772,9 +732,8 @@ pub(crate) fn check_fork_worktree_ready(origin_cwd: &str) -> Result<String, Work
 
     let mut op = detect_in_progress_git_op(origin_cwd);
     let mut dirty: Vec<String> = Vec::new();
-    if let Ok(out) = super::bg_std_command("git")
-        .args(["-C", origin_cwd, "status", "--porcelain=v1", "-z", "-unormal"])
-        .output()
+    if let Ok(out) =
+        super::bg_std_command("git").args(["-C", origin_cwd, "status", "--porcelain=v1", "-z", "-unormal"]).output()
         && out.status.success()
     {
         let mut iter = out.stdout.split(|b| *b == 0);
@@ -789,10 +748,8 @@ pub(crate) fn check_fork_worktree_ready(origin_cwd: &str) -> Result<String, Work
             if matches!(x, 'R' | 'C') || matches!(y, 'R' | 'C') {
                 let _ = iter.next(); // consume original path for rename/copy
             }
-            if matches!(
-                xy,
-                ['D', 'D'] | ['A', 'U'] | ['U', 'D'] | ['U', 'A'] | ['D', 'U'] | ['A', 'A'] | ['U', 'U']
-            ) && op.is_none()
+            if matches!(xy, ['D', 'D'] | ['A', 'U'] | ['U', 'D'] | ['U', 'A'] | ['D', 'U'] | ['A', 'A'] | ['U', 'U'])
+                && op.is_none()
             {
                 op = Some("conflict".into());
             }
@@ -851,10 +808,7 @@ pub(crate) fn create_fork_worktree(state_dir: &Path, origin_cwd: &str, tag: &str
         .output()
         .map_err(|e| format!("spawn git worktree add: {e}"))?;
     if !out.status.success() {
-        return Err(format!(
-            "git worktree add failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        return Err(format!("git worktree add failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
     Ok((wt_str, branch))
 }
@@ -872,10 +826,8 @@ pub(crate) fn inspect_fork_worktree(
     wt_dir: &str,
     fallback_branch: Option<&str>,
 ) -> ForkWorktreeSummary {
-    let mut summary = ForkWorktreeSummary {
-        branch: fallback_branch.unwrap_or_default().trim().to_string(),
-        ..Default::default()
-    };
+    let mut summary =
+        ForkWorktreeSummary { branch: fallback_branch.unwrap_or_default().trim().to_string(), ..Default::default() };
     if !Path::new(wt_dir).is_dir() {
         return summary;
     }
@@ -889,9 +841,8 @@ pub(crate) fn inspect_fork_worktree(
         && !origin_head.is_empty()
     {
         let range = format!("{origin_head}..HEAD");
-        if let Ok(out) = super::bg_std_command("git")
-            .args(["-C", wt_dir, "log", "--oneline", "-n", "20", &range])
-            .output()
+        if let Ok(out) =
+            super::bg_std_command("git").args(["-C", wt_dir, "log", "--oneline", "-n", "20", &range]).output()
             && out.status.success()
         {
             summary.ahead_commits = String::from_utf8_lossy(&out.stdout)
@@ -901,9 +852,7 @@ pub(crate) fn inspect_fork_worktree(
                 .collect();
         }
     }
-    if let Ok(out) = super::bg_std_command("git")
-        .args(["-C", wt_dir, "status", "--short"])
-        .output()
+    if let Ok(out) = super::bg_std_command("git").args(["-C", wt_dir, "status", "--short"]).output()
         && out.status.success()
     {
         summary.dirty_files = String::from_utf8_lossy(&out.stdout)
@@ -927,9 +876,7 @@ pub(crate) fn merge_fork_worktree(origin_cwd: &str, wt_dir: &str, cleanup: bool)
 }
 
 fn purge_untracked_ephemeral_caches(wt_dir: &str) {
-    let Ok(out) = super::bg_std_command("git")
-        .args(["-C", wt_dir, "status", "--porcelain=v1", "-z", "-uall"])
-        .output()
+    let Ok(out) = super::bg_std_command("git").args(["-C", wt_dir, "status", "--porcelain=v1", "-z", "-uall"]).output()
     else {
         return;
     };

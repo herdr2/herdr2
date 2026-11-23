@@ -13,10 +13,7 @@ use std::time::{Duration, Instant};
 pub const BIN: &str = env!("CARGO_BIN_EXE_herdr2");
 
 pub fn fake_acp_path() -> String {
-    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fake_acp_agent.py")
-        .display()
-        .to_string()
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fake_acp_agent.py").display().to_string()
 }
 
 pub fn fake_acp_spec() -> String {

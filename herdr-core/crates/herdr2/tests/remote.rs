@@ -112,8 +112,7 @@ fn a_big_answer_on_a_slow_link_is_not_mistaken_for_a_frozen_machine() {
     let mut s = Session::new();
     let (var, fake) = fake_ssh(&s, &[("rohan", &rohan)]);
     let slow = s.root.join("slow-ssh");
-    let throttle =
-        "import sys, time\nwhile b := sys.stdin.buffer.read1(32768):\n    sys.stdout.buffer.write(b); sys.stdout.buffer.flush(); time.sleep(0.1)";
+    let throttle = "import sys, time\nwhile b := sys.stdin.buffer.read1(32768):\n    sys.stdout.buffer.write(b); sys.stdout.buffer.flush(); time.sleep(0.1)";
     std::fs::write(&slow, format!("#!/bin/sh\n{fake} \"$@\" | python3 -c '{throttle}'\n")).unwrap();
     std::fs::set_permissions(&slow, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     s.env.push((var, slow.display().to_string()));
@@ -496,7 +495,12 @@ fn a_run_or_wait_there_rides_out_a_dropped_line() {
     drop_line();
     let out = waiting.join().unwrap();
     let r: Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
-    assert_eq!((&r["ended"], &r["exit_code"]), (&json!(true), &json!(0)), "{r} / {}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        (&r["ended"], &r["exit_code"]),
+        (&json!(true), &json!(0)),
+        "{r} / {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]

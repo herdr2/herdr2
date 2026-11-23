@@ -46,12 +46,7 @@ async fn deliver_to_target(core: &Arc<Core>, session: &str, line: &str) -> Strin
     };
     match target {
         TargetKey::Terminal(tid) => {
-            let live = core
-                .lock()
-                .pty_reg
-                .terminals
-                .get(&tid)
-                .is_some_and(|t| t.is_live());
+            let live = core.lock().pty_reg.terminals.get(&tid).is_some_and(|t| t.is_live());
             if !live {
                 return "skipped".into();
             }
@@ -65,12 +60,7 @@ async fn deliver_to_target(core: &Arc<Core>, session: &str, line: &str) -> Strin
             }
         }
         TargetKey::Agent(aid) => {
-            let live = core
-                .lock()
-                .reg
-                .agents
-                .get(&aid)
-                .is_some_and(|a| a.is_live());
+            let live = core.lock().reg.agents.get(&aid).is_some_and(|a| a.is_live());
             if !live {
                 return "skipped".into();
             }

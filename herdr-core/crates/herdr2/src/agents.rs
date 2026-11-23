@@ -402,9 +402,9 @@ impl Registry {
     pub fn resolve(&self, local: &str) -> Result<u32, RpcError> {
         let found = match parse_id(local) {
             Some(id) => self.agents.get(&id),
-            None => self
-                .live_named(local)
-                .or_else(|| self.agents.values().rev().find(|t| t.name.as_deref() == Some(local))),
+            None => {
+                self.live_named(local).or_else(|| self.agents.values().rev().find(|t| t.name.as_deref() == Some(local)))
+            }
         };
         found
             .map(Agent::id)
@@ -568,8 +568,7 @@ mod tests {
 
     #[test]
     fn keep_preserves_losses_without_retention_or_rm_but_exit_and_kill_are_final() {
-        for reason in
-            ["crashed", "stopped_by_restart", "host_shutdown", "server_stop", "signaled", "exited", "killed"]
+        for reason in ["crashed", "stopped_by_restart", "host_shutdown", "server_stop", "signaled", "exited", "killed"]
         {
             for keep in [false, true] {
                 let mut r = Registry::default();

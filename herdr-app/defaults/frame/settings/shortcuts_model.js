@@ -7,6 +7,7 @@ export const SHORTCUT_GROUPS = [
     zh: "AI 与提示词",
     items: [
       { action: "prompt.polish", section: "global", title: "AI Polish prompt", zh: "AI 润色提示词（ACP / CLI / 闪念）", defaultLinux: "ctrl-alt-p", defaultMac: "cmd-alt-p" },
+      { action: "prompt.polish_undo", section: "global", title: "Undo AI Polish (restore original)", zh: "反悔恢复润色前的内容（ACP / CLI / 闪念）", defaultLinux: "ctrl-alt-u", defaultMac: "cmd-alt-u" },
       { action: "mod.open:flash-note", section: "global", title: "Quick Flash Note", zh: "快速记录闪念", defaultLinux: "ctrl-alt-f", defaultMac: "cmd-alt-f" },
       { action: "agent.handoff", section: "global", title: "Context Handoff / Fork / Side Chat", zh: "上下文接力 / 分叉 / 旁路讨论", defaultLinux: "ctrl-shift-h", defaultMac: "cmd-shift-h" },
       { action: "agent.briefing", section: "global", title: "Catch-up Briefing", zh: "打开待办简报", defaultLinux: "ctrl-shift-i", defaultMac: "cmd-shift-i" },

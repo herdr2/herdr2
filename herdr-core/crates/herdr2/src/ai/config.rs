@@ -6,6 +6,7 @@ use crate::rpc::RpcError;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -17,6 +18,7 @@ pub struct AiPaths {
     pub secrets_dir: PathBuf,
     pub ai_key_file: PathBuf,
     pub models_cache_file: PathBuf,
+    pub endpoint_caps_file: PathBuf,
     pub legacy_drove_config: PathBuf,
     pub legacy_drove_key_file: PathBuf,
     pub legacy_drove_models_cache: PathBuf,
@@ -39,11 +41,7 @@ impl AiPaths {
             .filter(|v| !v.is_empty())
             .map(|dir| PathBuf::from(dir).join("settings.json"))
             .unwrap_or_else(|| {
-                config_dir
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join("herdr2-app")
-                    .join("settings.json")
+                config_dir.parent().unwrap_or_else(|| Path::new(".")).join("herdr2-app").join("settings.json")
             });
         let secrets_dir = paths.state.join("secrets");
         let drove_state = paths.state.join("drove");
@@ -51,6 +49,7 @@ impl AiPaths {
             config_file,
             ai_key_file: secrets_dir.join("ai.key"),
             models_cache_file: paths.state.join("ai-models-cache.json"),
+            endpoint_caps_file: paths.state.join("ai-endpoint-caps.json"),
             legacy_drove_config,
             legacy_drove_key_file: drove_state.join("secrets").join("ai.key"),
             legacy_drove_models_cache: drove_state.join("models-cache.json"),
@@ -111,8 +110,13 @@ pub struct AiCoreConfig {
     #[serde(default = "default_true")]
     pub notes_digest: bool,
     /// Shared static system prefix + append-only session reuse for high KV cache hit rate.
+    /// Kept in sync with `prompt_mode` for backward compatibility (`compact` => false, else true).
     #[serde(default = "default_true")]
     pub prompt_cache_enabled: bool,
+    /// Prompt prefix strategy: `"auto"` (probe KV-cache and auto-degrade to compact when uncached),
+    /// `"shared_prefix"` (always use shared >1024-token prefix), or `"compact"` (always use short per-op prompts).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_mode: Option<String>,
     /// Distill omitted middle turns and merge-back discussions during `agent.handoff`.
     #[serde(default = "default_true")]
     pub handoff_distill: bool,
@@ -122,6 +126,9 @@ pub struct AiCoreConfig {
     /// Generate semantic titles, hover micro-summaries, and catch-up briefing headlines.
     #[serde(default = "default_true")]
     pub semantic_summary: bool,
+    /// Redact common API keys, Bearer tokens, PEM keys, and URL credentials before sending text to external LLMs.
+    #[serde(default = "default_true")]
+    pub redact_secrets: bool,
 }
 
 impl Default for AiCoreConfig {
@@ -139,9 +146,11 @@ impl Default for AiCoreConfig {
             pty_status_arbitration: true,
             notes_digest: true,
             prompt_cache_enabled: true,
+            prompt_mode: Some("auto".into()),
             handoff_distill: true,
             checkpoint_labeling: true,
             semantic_summary: true,
+            redact_secrets: true,
         }
     }
 }
@@ -158,9 +167,7 @@ pub struct PersistedAiModelsCache {
 }
 
 pub fn now_ms_u64() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 pub fn now_iso() -> String {
@@ -289,6 +296,37 @@ pub fn is_loopback_http_url(raw: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1"
 }
 
+impl AiCoreConfig {
+    /// Returns the canonical active prompt mode (`"auto"`, `"shared_prefix"`, or `"compact"`),
+    /// falling back gracefully to legacy `prompt_cache_enabled` when `prompt_mode` is absent.
+    pub fn resolved_prompt_mode(&self) -> &'static str {
+        match self.prompt_mode.as_deref().map(str::trim) {
+            Some("shared_prefix") => "shared_prefix",
+            Some("compact") => "compact",
+            Some("auto") => "auto",
+            _ => {
+                if self.prompt_cache_enabled {
+                    "auto"
+                } else {
+                    "compact"
+                }
+            }
+        }
+    }
+}
+
+/// Normalizes a prompt prefix mode (`"auto"`, `"shared_prefix"`, or `"compact"`).
+pub fn normalize_prompt_mode(raw: &str) -> Result<String, RpcError> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "" | "auto" | "default" => Ok("auto".into()),
+        "shared_prefix" | "shared-prefix" | "shared" | "prefix" | "long" => Ok("shared_prefix".into()),
+        "compact" | "short" | "concise" => Ok("compact".into()),
+        _ => Err(RpcError::invalid_params(format!(
+            "ai.promptMode must be auto, shared_prefix, or compact, not {raw:?}"
+        ))),
+    }
+}
+
 /// Normalizes an AI language setting (`"en"`, `"zh-CN"`, or `"auto"` / `""` to clear).
 pub fn normalize_ai_language(raw: &str) -> Result<Option<String>, RpcError> {
     let clean = raw.trim().to_ascii_lowercase();
@@ -314,18 +352,12 @@ pub fn normalize_ai_language(raw: &str) -> Result<Option<String>, RpcError> {
     {
         return Ok(Some("en".into()));
     }
-    Err(RpcError::invalid_params(format!(
-        "ai.language must be en, zh-CN, or auto, not {raw:?}"
-    )))
+    Err(RpcError::invalid_params(format!("ai.language must be en, zh-CN, or auto, not {raw:?}")))
 }
 
 /// Maps any language tag (e.g. `"zh-CN"`, `"zh"`, `"en"`, `"en-US"`) to the prompt `lang` code (`"zh"` or `"en"`).
 pub fn prompt_lang_code(raw: &str) -> &'static str {
-    if raw.trim().to_ascii_lowercase().starts_with("zh") {
-        "zh"
-    } else {
-        "en"
-    }
+    if raw.trim().to_ascii_lowercase().starts_with("zh") { "zh" } else { "en" }
 }
 
 /// Reads the user's interface language from `herdr2-app/settings.json` when present.
@@ -380,6 +412,11 @@ pub fn validate_config(cfg: &mut AiCoreConfig) -> Result<(), RpcError> {
     if let Some(lang) = cfg.language.take() {
         cfg.language = normalize_ai_language(&lang)?;
     }
+    if let Some(pm) = cfg.prompt_mode.take() {
+        let norm = normalize_prompt_mode(&pm)?;
+        cfg.prompt_cache_enabled = norm != "compact";
+        cfg.prompt_mode = Some(norm);
+    }
     cfg.version = 1;
     cfg.updated_at = now_iso();
     Ok(())
@@ -429,11 +466,9 @@ pub fn load_config(paths: &AiPaths) -> Result<AiCoreConfig, RpcError> {
             }
             Ok(AiCoreConfig::default())
         }
-        Err(e) => Err(RpcError::new(
-            "config",
-            format!("{}: {e}", paths.config_file.display()),
-            "check file permissions",
-        )),
+        Err(e) => {
+            Err(RpcError::new("config", format!("{}: {e}", paths.config_file.display()), "check file permissions"))
+        }
     }
 }
 
@@ -549,6 +584,24 @@ pub fn save_models_cache(paths: &AiPaths, cache: &PersistedAiModelsCache) {
     }
     if let Ok(bytes) = serde_json::to_vec_pretty(cache) {
         let _ = write_atomic(&paths.models_cache_file, &bytes);
+    }
+}
+
+pub fn load_endpoint_caps<T: serde::de::DeserializeOwned>(paths: &AiPaths) -> BTreeMap<String, T> {
+    if let Ok(text) = std::fs::read_to_string(&paths.endpoint_caps_file)
+        && let Ok(parsed) = serde_json::from_str::<BTreeMap<String, T>>(&text)
+    {
+        return parsed;
+    }
+    BTreeMap::new()
+}
+
+pub fn save_endpoint_caps<T: Serialize>(paths: &AiPaths, caps: &BTreeMap<String, T>) {
+    if let Some(parent) = paths.endpoint_caps_file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(caps) {
+        let _ = write_atomic(&paths.endpoint_caps_file, &bytes);
     }
 }
 
