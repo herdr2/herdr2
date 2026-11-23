@@ -52,7 +52,11 @@ impl PtyCliKind {
         if lower.contains("/claude/versions/") || lower.contains("/claude-code/") {
             return Self::Claude;
         }
-        if lower.contains("/codex/") {
+        if lower.contains("/codex/")
+            || lower.ends_with("/codex.js")
+            || lower.ends_with("/codex.cjs")
+            || lower.ends_with("/codex.mjs")
+        {
             return Self::Codex;
         }
         if lower.contains("/antigravity/") {
@@ -61,7 +65,8 @@ impl PtyCliKind {
         Self::Generic
     }
 
-    /// Detects the CLI kind from `argv`, skipping `env VAR=val` and Herdr's POSIX login-shell wrapper.
+    /// Detects the CLI kind from `argv`, skipping `env VAR=val`, interpreter shims (`node`/`bun`),
+    /// Herdr's POSIX login-shell wrapper, PowerShell `-Command`, and `cmd.exe /k|/c` wrappers.
     pub fn detect(argv: &[String]) -> Self {
         let Some(cmd_idx) = pty_command_offset(argv) else {
             return Self::Generic;
@@ -70,13 +75,31 @@ impl PtyCliKind {
         if kind != Self::Generic {
             return kind;
         }
+        if let Some((interp_kind, _)) = unwrap_interpreter_cli_argv(&argv[cmd_idx..]) {
+            return interp_kind;
+        }
         // Fallback for PowerShell `-Command "& 'claude' ..."` wrappers (Windows herdr-app launches).
-        if let Some((_, ps_cli)) = extract_powershell_cli_argv(argv)
-            && let Some(first) = ps_cli.first()
-        {
-            let kind = Self::detect_cmd_token(first);
-            if kind != Self::Generic {
-                return kind;
+        if let Some((_, ps_cli)) = extract_powershell_cli_argv(argv) {
+            if let Some(first) = ps_cli.first() {
+                let kind = Self::detect_cmd_token(first);
+                if kind != Self::Generic {
+                    return kind;
+                }
+            }
+            if let Some((interp_kind, _)) = unwrap_interpreter_cli_argv(&ps_cli) {
+                return interp_kind;
+            }
+        }
+        // Fallback for `cmd.exe /k "..."` or `/c "..."` wrappers on Windows.
+        if let Some((_, cmd_cli)) = extract_cmd_cli_argv(argv) {
+            if let Some(first) = cmd_cli.first() {
+                let kind = Self::detect_cmd_token(first);
+                if kind != Self::Generic {
+                    return kind;
+                }
+            }
+            if let Some((interp_kind, _)) = unwrap_interpreter_cli_argv(&cmd_cli) {
+                return interp_kind;
             }
         }
         // Fallback for `sh -c "<inline command...>"` without separate `$@` arguments.
@@ -93,6 +116,62 @@ impl PtyCliKind {
         }
         Self::Generic
     }
+}
+
+/// Unwraps npm/JS interpreter shims such as `["node.exe", "C:\\...\\@anthropic-ai\\claude-code\\cli.js", "--flag"]`
+/// into `(PtyCliKind::Claude, ["claude", "--flag"])`.
+fn unwrap_interpreter_cli_argv(argv: &[String]) -> Option<(PtyCliKind, Vec<String>)> {
+    let first = argv.first()?;
+    if !matches!(exe_stem(first).as_str(), "node" | "bun" | "deno") {
+        return None;
+    }
+    for (idx, arg) in argv.iter().enumerate().skip(1) {
+        if arg.starts_with('-') {
+            continue;
+        }
+        let kind = PtyCliKind::detect_cmd_token(arg);
+        if kind != PtyCliKind::Generic {
+            let mut normalized = vec![kind.as_str().to_string()];
+            normalized.extend(argv[idx + 1..].iter().cloned());
+            return Some((kind, normalized));
+        }
+        break;
+    }
+    None
+}
+
+fn cmd_quote(raw: &str) -> String {
+    if raw.is_empty() || raw.chars().any(|c| c.is_whitespace() || matches!(c, '"' | '&' | '|' | '<' | '>' | '^' | '%')) {
+        format!("\"{}\"", raw.replace('"', "\\\""))
+    } else {
+        raw.to_string()
+    }
+}
+
+/// Extracts `(shell_exe, cli_argv)` from a Windows `cmd.exe /k ...` or `/c ...` wrapper.
+fn extract_cmd_cli_argv(argv: &[String]) -> Option<(String, Vec<String>)> {
+    let sh = argv.first()?;
+    if exe_stem(sh) != "cmd" {
+        return None;
+    }
+    let cmd_pos = argv
+        .iter()
+        .position(|a| a.eq_ignore_ascii_case("/k") || a.eq_ignore_ascii_case("/c"))?;
+    let rest = argv.get(cmd_pos + 1..)?;
+    if rest.is_empty() {
+        return None;
+    }
+    let tokens = if rest.len() == 1 {
+        let mut raw = rest[0].trim();
+        // `cmd /k ""C:\path\claude.exe" --flag"` wraps the whole command in outer quotes.
+        if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') && raw[1..raw.len() - 1].contains('"') {
+            raw = &raw[1..raw.len() - 1];
+        }
+        parse_powershell_command_tokens(raw)
+    } else {
+        rest.to_vec()
+    };
+    (!tokens.is_empty()).then(|| (sh.clone(), tokens))
 }
 
 fn powershell_quote(raw: &str) -> String {
@@ -224,6 +303,11 @@ fn wrap_cli_in_shell(shell: &str, cli_argv: Vec<String>) -> Vec<String> {
             format!("& {joined}"),
         ];
     }
+    if stem == "cmd" {
+        let joined = cli_argv.iter().map(|a| cmd_quote(a)).collect::<Vec<_>>().join(" ");
+        let cmdline = if joined.starts_with('"') { format!("\"{joined}\"") } else { joined };
+        return vec![shell.to_string(), "/d".into(), "/k".into(), cmdline];
+    }
     let mut out = vec![shell.to_string(), "-lic".into(), "\"$@\"; exec \"$0\" -li".into(), shell.to_string()];
     out.extend(cli_argv);
     out
@@ -287,8 +371,7 @@ pub fn detect_terminal_cli_kind(t: &crate::terminals::Terminal, saved_kind: Opti
 }
 
 fn exe_stem(raw: &str) -> String {
-    let base =
-        PathBuf::from(raw).file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| raw.to_string());
+    let base = raw.rsplit(['/', '\\']).next().unwrap_or(raw);
     let lower = base.to_ascii_lowercase();
     let no_exe = lower.strip_suffix(".exe").unwrap_or(&lower);
     no_exe.strip_suffix(".real").unwrap_or(no_exe).to_string()
@@ -935,8 +1018,10 @@ pub fn extract_saved_cli_from_argv(
     session_id: Option<String>,
     transcript_path: Option<String>,
 ) -> Option<crate::terminals::SavedCliResume> {
-    let (wrapper_shell, cli_argv) = if let Some((ps_shell, ps_cli)) = extract_powershell_cli_argv(argv) {
+    let (wrapper_shell, mut cli_argv) = if let Some((ps_shell, ps_cli)) = extract_powershell_cli_argv(argv) {
         (Some(ps_shell), ps_cli)
+    } else if let Some((cmd_shell, cmd_cli)) = extract_cmd_cli_argv(argv) {
+        (Some(cmd_shell), cmd_cli)
     } else if let Some(cmd_idx) = pty_command_offset(argv) {
         let slice = argv[cmd_idx..].to_vec();
         let wrapper = extract_wrapper_shell(argv).or_else(|| fallback_wrapper_shell.map(str::to_string));
@@ -947,6 +1032,9 @@ pub fn extract_saved_cli_from_argv(
 
     if cli_argv.is_empty() {
         return None;
+    }
+    if let Some((_, normalized)) = unwrap_interpreter_cli_argv(&cli_argv) {
+        cli_argv = normalized;
     }
     let kind = PtyCliKind::detect(&cli_argv);
     if kind == PtyCliKind::Generic {
@@ -976,6 +1064,7 @@ pub fn terminal_shell_executable(argv: &[String]) -> Option<String> {
     extract_interactive_shell(argv)
         .or_else(|| extract_wrapper_shell(argv))
         .or_else(|| extract_powershell_cli_argv(argv).map(|(sh, _)| sh))
+        .or_else(|| extract_cmd_cli_argv(argv).map(|(sh, _)| sh))
 }
 
 fn non_empty_file(path: &Path) -> bool {
@@ -3288,7 +3377,35 @@ mod tests {
         assert!(ps_plan.argv.windows(2).any(|w| w == ["-ExecutionPolicy", "Bypass"]));
         assert!(ps_plan.argv.last().unwrap().contains("'--resume' 'sid-claude-1'"));
 
-        // 6. Plain shell / non-CLI returns None
+        // 6. Windows cmd.exe wrapper & node.exe npm shim extraction + cmd.exe /d /k recovery
+        let node_claude = vec![
+            "C:\\Program Files\\nodejs\\node.exe".into(),
+            "C:\\Users\\dev\\AppData\\Roaming\\npm\\node_modules\\@anthropic-ai\\claude-code\\cli.js".into(),
+            "--dangerously-skip-permissions".into(),
+            "--session-id".into(),
+            "sid-claude-1".into(),
+        ];
+        assert_eq!(PtyCliKind::detect(&node_claude), PtyCliKind::Claude);
+        let node_saved = extract_saved_cli_from_argv(
+            &node_claude,
+            Some("cmd.exe"),
+            None,
+            Some(claude_tpath.to_string_lossy().to_string()),
+        )
+        .expect("extract node-wrapped claude");
+        assert_eq!(node_saved.kind, "claude");
+        assert_eq!(node_saved.cli_argv[0], "claude");
+        assert_eq!(node_saved.session_id.as_deref(), Some("sid-claude-1"));
+        assert_eq!(node_saved.wrapper_shell.as_deref(), Some("cmd.exe"));
+        let cmd_plan = build_recovery_argv(&node_saved, &cwd, &["cmd.exe".into()], &hooks_dir, "h2.exe")
+            .expect("cmd.exe recovery plan");
+        assert!(cmd_plan.resumed_existing);
+        assert_eq!(&cmd_plan.argv[..3], ["cmd.exe", "/d", "/k"]);
+        assert!(cmd_plan.argv[3].contains("--resume sid-claude-1"));
+        assert_eq!(PtyCliKind::detect(&cmd_plan.argv), PtyCliKind::Claude);
+        assert_eq!(terminal_shell_executable(&cmd_plan.argv).as_deref(), Some("cmd.exe"));
+
+        // 7. Plain shell / non-CLI returns None
         assert!(extract_saved_cli_from_argv(&["/bin/zsh".into(), "-li".into()], None, None, None).is_none());
         assert!(extract_saved_cli_from_argv(&["vim".into(), "foo.rs".into()], None, None, None).is_none());
 

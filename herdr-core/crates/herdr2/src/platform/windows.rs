@@ -677,6 +677,7 @@ pub fn sha256(bytes: &[u8]) -> Option<String> {
 
 static SHUTDOWN_TRIGGERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 static SHUTDOWN_NOTIFY: std::sync::OnceLock<tokio::sync::Notify> = std::sync::OnceLock::new();
+static SHUTDOWN_MONITOR: std::sync::Once = std::sync::Once::new();
 
 unsafe extern "system" fn on_host_shutdown(ctrl_type: u32) -> BOOL {
     if matches!(ctrl_type, CTRL_LOGOFF_EVENT | CTRL_SHUTDOWN_EVENT) {
@@ -687,11 +688,87 @@ unsafe extern "system" fn on_host_shutdown(ctrl_type: u32) -> BOOL {
     0
 }
 
+unsafe extern "system" fn shutdown_wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DefWindowProcW, WM_ENDSESSION, WM_QUERYENDSESSION,
+    };
+    match msg {
+        WM_QUERYENDSESSION => {
+            // Arm early so child exits triggered during Windows logoff/shutdown are
+            // recorded as `host_shutdown` (preserving kept sessions).
+            SHUTDOWN_TRIGGERED.store(true, std::sync::atomic::Ordering::SeqCst);
+            1
+        }
+        WM_ENDSESSION => {
+            if wparam != 0 {
+                SHUTDOWN_TRIGGERED.store(true, std::sync::atomic::Ordering::SeqCst);
+                SHUTDOWN_NOTIFY.get_or_init(tokio::sync::Notify::new).notify_waiters();
+            } else {
+                // User cancelled the shutdown/logoff dialog.
+                SHUTDOWN_TRIGGERED.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            0
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+/// Registers both a console control handler (for console-attached runs) and a hidden
+/// top-level message window (required for `DETACHED_PROCESS` daemons to receive
+/// `WM_QUERYENDSESSION` / `WM_ENDSESSION` on Windows shutdown and logoff).
 pub fn monitor_shutdown() {
     let _ = SHUTDOWN_NOTIFY.get_or_init(tokio::sync::Notify::new);
-    unsafe {
-        SetConsoleCtrlHandler(Some(on_host_shutdown), 1);
-    }
+    SHUTDOWN_MONITOR.call_once(|| {
+        unsafe {
+            SetConsoleCtrlHandler(Some(on_host_shutdown), 1);
+        }
+        let _ = std::thread::Builder::new().name("h2-win-shutdown".into()).spawn(|| {
+            use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+            use windows_sys::Win32::UI::WindowsAndMessaging::{
+                CreateWindowExW, DispatchMessageW, GetMessageW, MSG, RegisterClassW,
+                TranslateMessage, WNDCLASSW,
+            };
+            let class_name: Vec<u16> = "Herdr2ShutdownWatcher\0".encode_utf16().collect();
+            let hinstance = unsafe { GetModuleHandleW(null()) };
+            let wc = WNDCLASSW {
+                lpfnWndProc: Some(shutdown_wndproc),
+                hInstance: hinstance,
+                lpszClassName: class_name.as_ptr(),
+                ..unsafe { zeroed() }
+            };
+            unsafe {
+                RegisterClassW(&wc);
+                // Must be a hidden top-level window (NOT HWND_MESSAGE) to receive WM_QUERYENDSESSION.
+                let hwnd = CreateWindowExW(
+                    0,
+                    class_name.as_ptr(),
+                    class_name.as_ptr(),
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    null_mut(),
+                    null_mut(),
+                    hinstance,
+                    null(),
+                );
+                if hwnd.is_null() {
+                    return;
+                }
+                let mut msg: MSG = zeroed();
+                while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+        });
+    });
 }
 
 pub fn host_shutdown_triggered() -> bool {
