@@ -48,6 +48,22 @@ pub enum DroveAction {
         #[arg(long)]
         no_open: bool,
     },
+    /// List Drove runs (read-only).
+    #[command(visible_alias = "ls")]
+    Runs {
+        /// List trashed runs instead of active/completed runs.
+        #[arg(long)]
+        trash: bool,
+        /// Target remote machine (`h2 machine ls`).
+        #[arg(long, value_name = "MACHINE")]
+        on: Option<String>,
+    },
+    /// Show configured Drove roles, models, and routing policy (read-only).
+    Roles {
+        /// Target remote machine (`h2 machine ls`).
+        #[arg(long, value_name = "MACHINE")]
+        on: Option<String>,
+    },
     /// Read Drove configuration, resolved roles, and AI connection status.
     Settings {
         #[arg(long, value_name = "MACHINE")]
@@ -95,6 +111,9 @@ pub enum DroveAction {
         /// Optional preference instruction for how roles should be assigned.
         #[arg(long)]
         instruction: Option<String>,
+        /// Explicitly confirm applying the AI-generated role configuration to drove.json.
+        #[arg(long)]
+        apply: bool,
         /// Preview without saving to drove.json.
         #[arg(long)]
         dry_run: bool,
@@ -331,7 +350,11 @@ pub enum WorkerAction {
     /// Print current worker & active attempt context from the daemon.
     Context,
     /// Drain unread notes sent to this worker attempt.
-    Inbox,
+    Inbox {
+        /// Optional explicit attempt ID (defaults to worker's live active attempt).
+        #[arg(long)]
+        attempt: Option<String>,
+    },
     /// Ask the coordinator a blocking question and print the reply.
     Ask {
         question: String,
@@ -343,12 +366,18 @@ pub enum WorkerAction {
         why: Option<String>,
         #[arg(long, default_value_t = 300)]
         timeout: u64,
+        /// Optional explicit attempt ID (defaults to worker's live active attempt).
+        #[arg(long)]
+        attempt: Option<String>,
     },
     /// Post a non-blocking progress note to the coordinator.
     Note {
         text: String,
         #[arg(long)]
         subject: Option<String>,
+        /// Optional explicit attempt ID (defaults to worker's live active attempt).
+        #[arg(long)]
+        attempt: Option<String>,
     },
     /// Read a dependency task result, verify log, or review patch slice.
     Read {
@@ -359,6 +388,9 @@ pub enum WorkerAction {
         limit: usize,
         #[arg(long)]
         grep: Option<String>,
+        /// Optional explicit attempt ID (defaults to worker's live active attempt).
+        #[arg(long)]
+        attempt: Option<String>,
     },
     /// Submit task attempt completion or explicit failure to the Drove daemon gates.
     Done {
@@ -374,6 +406,9 @@ pub enum WorkerAction {
         files: Vec<String>,
         #[arg(long)]
         no_retry: bool,
+        /// Optional explicit attempt ID (defaults to worker's live active attempt).
+        #[arg(long)]
+        attempt: Option<String>,
     },
 }
 
@@ -593,6 +628,64 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             let url = res["url"].as_str().unwrap_or("http://127.0.0.1:7799/").to_string();
             Ok((res, url))
         }
+        DroveAction::Runs { trash, on } => {
+            let query = if trash { "local=1&trash=1" } else { "local=1" };
+            let val = proxy_call(paths, on.as_deref(), "GET", "/api/runs", query, None)?;
+            let mut lines = Vec::new();
+            if let Some(arr) = val["runs"].as_array() {
+                for r in arr {
+                    let id = r["id"].as_str().unwrap_or("?");
+                    let status = r["status"].as_str().unwrap_or("?");
+                    let obj = r["name"]
+                        .as_str()
+                        .or_else(|| r["objective"].as_str())
+                        .unwrap_or("")
+                        .chars()
+                        .take(80)
+                        .collect::<String>();
+                    let tc = &r["taskCounts"];
+                    let done = tc["succeeded"].as_u64().unwrap_or(0);
+                    let failed = tc["failed"].as_u64().unwrap_or(0);
+                    let running = tc["running"].as_u64().unwrap_or(0);
+                    let total: u64 = tc
+                        .as_object()
+                        .map(|m| m.values().filter_map(Value::as_u64).sum())
+                        .unwrap_or(0);
+                    lines.push(format!("{id:<18} {status:<9} {done}/{total} done (run={running} fail={failed})  {obj}"));
+                }
+            }
+            let human = if lines.is_empty() {
+                if trash { "no trashed runs".into() } else { "no runs".into() }
+            } else {
+                lines.join("\n")
+            };
+            Ok((val, human))
+        }
+        DroveAction::Roles { on } => {
+            let mut p = json!({});
+            if let Some(m) = on {
+                p["on"] = Value::String(m);
+            }
+            let val = call_core(paths, "drove.settings.get", p)?;
+            let roles_obj = val["config"]["roles"].clone();
+            let note = val["config"]["note"].clone();
+            let mut lines = Vec::new();
+            if let Some(map) = roles_obj.as_object() {
+                for (name, cfg) in map {
+                    let primary = &cfg["primary"];
+                    let p_agent = primary["agent"].as_str().unwrap_or("?");
+                    let p_model = primary["model"].as_str().unwrap_or("default");
+                    let access = cfg["access"].as_str().unwrap_or("writable");
+                    let fb_count = cfg["fallbacks"].as_array().map(|a| a.len()).unwrap_or(0);
+                    lines.push(format!("{name:<14} {access:<9} primary={p_agent}/{p_model} fallbacks={fb_count}"));
+                }
+            }
+            if let Some(n) = note.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                lines.push(format!("note: {n}"));
+            }
+            let out = json!({ "roles": roles_obj, "note": note });
+            Ok((out, lines.join("\n")))
+        }
         DroveAction::Settings { on } => {
             let mut p = json!({});
             if let Some(m) = on {
@@ -656,7 +749,14 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             };
             Ok((val, human))
         }
-        DroveAction::RolesAiConfig { file, mode, instruction, dry_run, language, on, consume } => {
+        DroveAction::RolesAiConfig { file, mode, instruction, apply, dry_run, language, on, consume } => {
+            if file.is_none() && !apply && !dry_run {
+                return Err(RpcError::new(
+                    "invalid_params",
+                    "roles-ai-config invokes the AI model to reconfigure drove roles; pass --dry-run to preview or --apply to write changes",
+                    "to inspect current roles read-only, run `h2 drove roles` (or `h2 drove settings`)",
+                ));
+            }
             let mut p = match file {
                 Some(f) => read_json_file(&f, consume)?,
                 None => json!({}),
@@ -669,6 +769,8 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             }
             if dry_run {
                 p["apply"] = Value::Bool(false);
+            } else if apply {
+                p["apply"] = Value::Bool(true);
             }
             if let Some(lang) = language {
                 p["language"] = Value::String(lang);
@@ -1057,6 +1159,8 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
     }
 }
 
+const WAIT_RECONNECT_BUDGET: Duration = Duration::from_secs(15);
+
 fn wait_loop(
     paths: &Paths,
     on: Option<&str>,
@@ -1065,12 +1169,34 @@ fn wait_loop(
     since_seq: u64,
 ) -> Result<Value, RpcError> {
     let deadline = Instant::now() + Duration::from_secs(timeout_sec.max(1));
+    let mut disconnected_since: Option<Instant> = None;
+    let mut backoff_ms: u64 = 250;
     loop {
         let remain = deadline.saturating_duration_since(Instant::now()).as_secs().clamp(1, 20);
         let q = format!("timeoutSec={remain}&sinceSeq={since_seq}");
-        let res = proxy_call(paths, on, "GET", &format!("/api/runs/{run_id}/wait"), &q, None)?;
-        if !res["timedOut"].as_bool().unwrap_or(false) || Instant::now() >= deadline {
-            return Ok(res);
+        match proxy_call(paths, on, "GET", &format!("/api/runs/{run_id}/wait"), &q, None) {
+            Ok(res) => {
+                disconnected_since = None;
+                backoff_ms = 250;
+                if !res["timedOut"].as_bool().unwrap_or(false) || Instant::now() >= deadline {
+                    return Ok(res);
+                }
+            }
+            Err(err) if err.kind == "unavailable" => {
+                let now = Instant::now();
+                let first_fail = *disconnected_since.get_or_insert(now);
+                if now >= deadline || now.saturating_duration_since(first_fail) >= WAIT_RECONNECT_BUDGET {
+                    return Err(err);
+                }
+                let sleep_dur = Duration::from_millis(backoff_ms)
+                    .min(deadline.saturating_duration_since(now))
+                    .min(WAIT_RECONNECT_BUDGET.saturating_sub(now.saturating_duration_since(first_fail)));
+                if !sleep_dur.is_zero() {
+                    std::thread::sleep(sleep_dur);
+                }
+                backoff_ms = (backoff_ms * 2).min(2000);
+            }
+            Err(err) => return Err(err),
         }
     }
 }
@@ -1082,36 +1208,63 @@ fn execute_worker_action(action: WorkerAction) -> Result<(Value, String), RpcErr
         .or_else(|_| std::env::var("H2_DROVE_WORKER_TICKET"))
         .map_err(|_| RpcError::invalid_params("H2_DROVE_WORKER_TOKEN is not set"))?;
     let wid = std::env::var("H2_DROVE_WORKER_ID").unwrap_or_default();
+    let env_att = std::env::var("H2_DROVE_ATTEMPT_ID").unwrap_or_default();
 
-    let resolve_attempt = || -> Result<String, RpcError> {
-        if !wid.is_empty() {
-            let ctx = worker_http_post(&url, &tok, "/api/worker/context", &json!({ "workerId": wid }))?;
-            if let Some(a) = ctx["currentAttempt"].as_str()
-                && !a.is_empty()
-            {
-                return Ok(a.to_string());
-            }
+    // Returns `(attempt_id, is_explicit)`. When `--attempt` is omitted, dynamically resolve the
+    // worker's active attempt via `/api/worker/context` (falling back to env attempt + workerId
+    // which the daemon also resolves dynamically to the worker's active attempt).
+    let resolve_attempt = |explicit: Option<String>| -> Result<(String, bool), RpcError> {
+        if let Some(a) = explicit.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            return Ok((a, true));
         }
-        Ok(std::env::var("H2_DROVE_ATTEMPT_ID").unwrap_or_default())
+        if !wid.is_empty()
+            && let Ok(ctx) = worker_http_post(&url, &tok, "/api/worker/context", &json!({ "workerId": wid }))
+            && let Some(a) = ctx["currentAttempt"].as_str()
+            && !a.is_empty()
+        {
+            return Ok((a.to_string(), false));
+        }
+        Ok((env_att.clone(), false))
+    };
+
+    let attach_worker_meta = |body: &mut Value, att_id: String, explicit: bool| {
+        if !wid.is_empty() {
+            body["workerId"] = Value::String(wid.clone());
+        }
+        if !att_id.is_empty() {
+            body["attemptId"] = Value::String(att_id);
+        }
+        if explicit {
+            body["explicitAttempt"] = Value::Bool(true);
+        }
     };
 
     match action {
         WorkerAction::Context => {
-            let val = worker_http_post(&url, &tok, "/api/worker/context", &json!({ "workerId": wid }))?;
+            let mut body = json!({});
+            if !wid.is_empty() {
+                body["workerId"] = Value::String(wid.clone());
+            }
+            if !env_att.is_empty() {
+                body["attemptId"] = Value::String(env_att.clone());
+            }
+            let val = worker_http_post(&url, &tok, "/api/worker/context", &body)?;
             Ok((val.clone(), serde_json::to_string_pretty(&val).unwrap_or_default()))
         }
-        WorkerAction::Inbox => {
-            let att_id = resolve_attempt()?;
-            let val = worker_http_post(&url, &tok, "/api/worker/inbox", &json!({ "attemptId": att_id }))?;
+        WorkerAction::Inbox { attempt } => {
+            let (att_id, explicit) = resolve_attempt(attempt)?;
+            let mut body = json!({});
+            attach_worker_meta(&mut body, att_id, explicit);
+            let val = worker_http_post(&url, &tok, "/api/worker/inbox", &body)?;
             Ok((val.clone(), serde_json::to_string_pretty(&val).unwrap_or_default()))
         }
-        WorkerAction::Ask { question, options, recommend, why, timeout } => {
-            let att_id = resolve_attempt()?;
+        WorkerAction::Ask { question, options, recommend, why, timeout, attempt } => {
+            let (att_id, explicit) = resolve_attempt(attempt)?;
             let mut body = json!({
-                "attemptId": att_id,
                 "question": question,
                 "timeoutSec": timeout,
             });
+            attach_worker_meta(&mut body, att_id, explicit);
             if !options.is_empty() {
                 body["options"] = json!(options);
             }
@@ -1125,34 +1278,27 @@ fn execute_worker_action(action: WorkerAction) -> Result<(Value, String), RpcErr
             let reply_txt = val["reply"]["body"].as_str().unwrap_or("").to_string();
             Ok((val, reply_txt))
         }
-        WorkerAction::Note { text, subject } => {
-            let att_id = resolve_attempt()?;
-            let val = worker_http_post(
-                &url,
-                &tok,
-                "/api/worker/note",
-                &json!({ "attemptId": att_id, "body": text, "subject": subject }),
-            )?;
+        WorkerAction::Note { text, subject, attempt } => {
+            let (att_id, explicit) = resolve_attempt(attempt)?;
+            let mut body = json!({ "body": text, "subject": subject });
+            attach_worker_meta(&mut body, att_id, explicit);
+            let val = worker_http_post(&url, &tok, "/api/worker/note", &body)?;
             Ok((val, "note recorded".into()))
         }
-        WorkerAction::Read { target, offset, limit, grep } => {
-            let att_id = resolve_attempt()?;
-            let val = worker_http_post(
-                &url,
-                &tok,
-                "/api/worker/read",
-                &json!({
-                    "attemptId": att_id,
-                    "target": target,
-                    "offset": offset,
-                    "limit": limit,
-                    "grep": grep,
-                }),
-            )?;
+        WorkerAction::Read { target, offset, limit, grep, attempt } => {
+            let (att_id, explicit) = resolve_attempt(attempt)?;
+            let mut body = json!({
+                "target": target,
+                "offset": offset,
+                "limit": limit,
+                "grep": grep,
+            });
+            attach_worker_meta(&mut body, att_id, explicit);
+            let val = worker_http_post(&url, &tok, "/api/worker/read", &body)?;
             Ok((val.clone(), serde_json::to_string_pretty(&val).unwrap_or_default()))
         }
-        WorkerAction::Done { outcome, summary, reason, data, files, no_retry } => {
-            let att_id = resolve_attempt()?;
+        WorkerAction::Done { outcome, summary, reason, data, files, no_retry, attempt } => {
+            let (att_id, explicit) = resolve_attempt(attempt)?;
             let parsed_data = match data {
                 Some(raw) if !raw.trim().is_empty() => Some(
                     serde_json::from_str::<Value>(&raw)
@@ -1161,10 +1307,10 @@ fn execute_worker_action(action: WorkerAction) -> Result<(Value, String), RpcErr
                 _ => None,
             };
             let mut body = json!({
-                "attemptId": att_id,
                 "outcome": outcome,
                 "noRetry": no_retry,
             });
+            attach_worker_meta(&mut body, att_id, explicit);
             if let Some(s) = summary {
                 body["summary"] = Value::String(s);
             }

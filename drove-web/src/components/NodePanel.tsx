@@ -789,6 +789,13 @@ function CoordPanel({
             <Estimate text={`${fmtTokens(snap.stats.tokens)} tok`} estimated={est.tokens} />
             {" · "}
             <Estimate text={fmtCost(snap.stats.cost)} estimated={est.cost} />
+            {((snap.stats.workerTokens ?? 0) > 0 || (snap.stats.aiTokens ?? 0) > 0) && (
+              <div className="hint" style={{ fontSize: "11px", marginTop: "2px" }}>
+                {(snap.stats.workerTokens ?? 0) > 0 && `${t("wb.workerUsage")}: ${fmtTokens(snap.stats.workerTokens ?? 0)} tok`}
+                {(snap.stats.workerTokens ?? 0) > 0 && (snap.stats.aiTokens ?? 0) > 0 ? " · " : ""}
+                {(snap.stats.aiTokens ?? 0) > 0 && `${t("wb.aiUsage")}: ${fmtTokens(snap.stats.aiTokens ?? 0)} tok`}
+              </div>
+            )}
           </StatItem>
           {budget.length > 0 && (
             <StatItem label={t("panel.budget")}>

@@ -2,7 +2,7 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, InputState, Input, TextareaState, Textarea, Popup } from "gpui-base";
-import { hc, run, theme, themes, fonts, updates, telemetry, settings, layouts, layout, spaces, keys, shared, setShared, appHome, readTextFile, writeTextFile, playSound, props, closeOverlay, notify, window, checking } from "herdr";
+import { hc, run, theme, themes, fonts, updates, settings, layouts, layout, spaces, keys, shared, setShared, appHome, readTextFile, writeTextFile, playSound, props, closeOverlay, notify, window, checking } from "herdr";
 import {
   SHORTCUT_GROUPS,
   defaultChordFor,
@@ -25,7 +25,6 @@ const SECTIONS = () => [
   { id: "drove", title: "Drove", zh: "Drove", icon: "layers" },
   { id: "alerts", title: "Alerts", zh: "提醒", icon: "bell" },
   { id: "updates", title: "Updates", zh: "更新", icon: "refresh" },
-  { id: "privacy", title: "Privacy", zh: "隐私", icon: "shield" },
 ];
 
 const DROVE_BUILTIN_ROLES = ["coder", "tester", "writer", "illustrator", "reviewer", "researcher"];
@@ -166,7 +165,6 @@ export default class Settings extends View {
     this.raw = null;
     this.previews = {}; // layout name -> its "preview" picture
     this.previewsOf = "";
-    this.showData = false;
     this.machineList = null;
     this.machineLoading = false;
     this.machineError = null;
@@ -201,7 +199,8 @@ export default class Settings extends View {
     this.droveAiConfiguring = false;
     this.droveAiRunningMode = null; // null | "all" | "models" | "strengths" | "notes"
     this.droveAiStage = null; // null | "probing" | "generating"
-    this.droveNoteAiTarget = null; // null | "global" | "candidate:<roleId>:<idx>"
+    this.droveNoteAiTarget = null; // null | "candidate:<roleId>:<idx>"
+    this.droveStrengthAiTarget = null; // null | "candidate:<roleId>:<idx>"
     this.droveAiConfigResult = null;
     this.droveRolesBackup = null;
     this.droveAiPromptFocused = false;
@@ -249,20 +248,6 @@ export default class Settings extends View {
     this.droveAiRolePromptInput.on("submit", (e, cx) => {
       if ((e?.ctrl || e?.meta) && !this.droveAiConfiguring && this.droveAiConfigMode) {
         this.aiConfigureDroveRoles(this.droveAiConfigMode, cx);
-      }
-    });
-    this.droveNoteFocused = false;
-    this.droveNoteInput = TextareaState.new({
-      value: "",
-      placeholder: "",
-    });
-    this.droveNoteInput.set_auto_grow(2, 5);
-    this.droveNoteInput.on("focus", (_e, cx) => { this.droveNoteFocused = true; cx.notify(); });
-    this.droveNoteInput.on("blur", (_e, cx) => { this.droveNoteFocused = false; cx.notify(); });
-    this.droveNoteInput.on("change", (_e, cx) => { cx.notify(); });
-    this.droveNoteInput.on("submit", (e, cx) => {
-      if ((e?.ctrl || e?.meta) && !this.droveSaving) {
-        this.saveDroveNote(cx);
       }
     });
     this.droveCandNoteSubmit = null;
@@ -1558,14 +1543,8 @@ export default class Settings extends View {
     const cfg = data?.config ?? {};
     this.droveUrlInput.set_value(cfg.ai?.baseUrl ?? "");
     this.droveMagpieUrlInput.set_value(cfg.magpie?.gatewayUrl ?? "");
-    this.droveNoteInput.set_value(cfg.note ?? "");
     this.droveKeyInput.set_value("");
     this.droveKeyDirty = false;
-  }
-
-  saveDroveNote(cx) {
-    const nextNote = this.droveNoteInput.value().trim();
-    this.saveDrovePatch({ note: nextNote }, cx, true);
   }
 
   syncAiInputs(status) {
@@ -1865,7 +1844,6 @@ export default class Settings extends View {
           }
           if (res.settings) {
             this.droveData = res.settings;
-            this.droveNoteInput.set_value(res.settings?.config?.note ?? "");
           } else {
             await this.loadDrove();
           }
@@ -1882,8 +1860,8 @@ export default class Settings extends View {
   }
 
   aiGenerateDroveNote(scope, roleId, candIdx, cx) {
-    if (this.droveNoteAiTarget || this.droveAiConfiguring) return;
-    const targetKey = scope === "global" ? "global" : `candidate:${roleId}:${candIdx}`;
+    if (this.droveNoteAiTarget || this.droveStrengthAiTarget || this.droveAiConfiguring) return;
+    const targetKey = `candidate:${roleId}:${candIdx}`;
     this.droveNoteAiTarget = targetKey;
     cx.notify();
     cx.spawn(async (cx) => {
@@ -1892,22 +1870,18 @@ export default class Settings extends View {
           await this.loadDrove();
           cx.notify();
         }
-        const draft = scope === "global"
-          ? (this.droveNoteInput?.value?.() ?? "").trim()
-          : (this.droveCandNoteInput?.value?.() ?? "").trim();
+        const draft = (this.droveCandNoteInput?.value?.() ?? "").trim();
         const baseUrl = (this.droveUrlInput?.value?.() ?? "").trim();
         const apiKey = (this.droveKeyInput?.value?.() ?? "").trim();
         const model = (this.droveData?.config?.ai?.model ?? "").trim();
         const payload = {
           mode: "notes",
-          noteScope: scope,
+          noteScope: "candidate",
+          targetRole: roleId,
+          targetCandidateIndex: candIdx,
           apply: false,
           language: this.lang(),
         };
-        if (scope === "candidate") {
-          payload.targetRole = roleId;
-          payload.targetCandidateIndex = candIdx;
-        }
         if (draft) payload.instruction = draft;
         if (baseUrl) payload.baseUrl = baseUrl;
         if (apiKey) payload.apiKey = apiKey;
@@ -1915,10 +1889,7 @@ export default class Settings extends View {
         const res = await this.droveCallWithJsonFile(["drove", "roles-ai-config"], payload);
         if (res?.ok && res?.note) {
           const generated = String(res.note).trim();
-          if (scope === "global") {
-            this.droveNoteInput.set_value(generated);
-            this.droveNoteInput.focus();
-          } else if (this.picking === `drove-note:${roleId}-c${candIdx}`) {
+          if (this.picking === `drove-note:${roleId}-c${candIdx}`) {
             this.droveCandNoteInput.set_value(generated);
             this.droveCandNoteInput.focus();
           }
@@ -1938,6 +1909,72 @@ export default class Settings extends View {
       } finally {
         if (this.droveNoteAiTarget === targetKey) {
           this.droveNoteAiTarget = null;
+        }
+        cx.notify();
+      }
+    });
+  }
+
+  aiConfigureCandidateStrengths(roleId, candIdx, cx) {
+    if (this.droveStrengthAiTarget || this.droveNoteAiTarget || this.droveAiConfiguring) return;
+    const targetKey = `candidate:${roleId}:${candIdx}`;
+    this.droveStrengthAiTarget = targetKey;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        if (!this.droveData) {
+          await this.loadDrove();
+          cx.notify();
+        }
+        const prevRoles = this.droveData?.config?.roles
+          ? JSON.parse(JSON.stringify(this.droveData.config.roles))
+          : null;
+        const prevNote = String(this.droveData?.config?.note ?? "");
+        const hint = (this.droveStrengthInput?.value?.() ?? "").trim();
+        const baseUrl = (this.droveUrlInput?.value?.() ?? "").trim();
+        const apiKey = (this.droveKeyInput?.value?.() ?? "").trim();
+        const model = (this.droveData?.config?.ai?.model ?? "").trim();
+        const payload = {
+          mode: "strengths",
+          targetRole: roleId,
+          targetCandidateIndex: candIdx,
+          apply: true,
+          language: this.lang(),
+        };
+        if (hint) payload.instruction = hint;
+        if (baseUrl) payload.baseUrl = baseUrl;
+        if (apiKey) payload.apiKey = apiKey;
+        if (model) payload.model = model;
+        const res = await this.droveCallWithJsonFile(["drove", "roles-ai-config"], payload);
+        if (res?.ok && Array.isArray(res?.strengths) && res.strengths.length > 0) {
+          if (prevRoles) {
+            this.droveRolesBackup = { roles: prevRoles, note: prevNote, mode: "strengths", at: Date.now() };
+          }
+          if (res.settings) {
+            this.droveData = res.settings;
+          } else {
+            await this.loadDrove();
+          }
+          if (hint && this.picking === `drove-str:${roleId}-c${candIdx}`) {
+            this.droveStrengthFilter = "";
+            this.droveStrengthInput.set_value("");
+          }
+        } else {
+          notify({
+            title: this.tr("AI strengths configuration failed", "AI 配置擅长任务失败"),
+            body: String(res?.error ?? this.tr("No strengths returned by AI", "AI 未返回有效的擅长任务")),
+            level: "error",
+          });
+        }
+      } catch (e) {
+        notify({
+          title: this.tr("AI strengths configuration failed", "AI 配置擅长任务失败"),
+          body: String(e?.message ?? e),
+          level: "error",
+        });
+      } finally {
+        if (this.droveStrengthAiTarget === targetKey) {
+          this.droveStrengthAiTarget = null;
         }
         cx.notify();
       }
@@ -2576,9 +2613,11 @@ export default class Settings extends View {
     role.fallbacks = clean.slice(1);
   }
 
-  droveStrengthPicker(t, id, roleId, currentStrengths, onChange, cx) {
+  droveStrengthPicker(t, id, roleId, idx, currentStrengths, onChange, cx) {
     const key = `drove-str:${id}`;
     const open = this.picking === key;
+    const aiGenerating = this.droveStrengthAiTarget === `candidate:${roleId}:${idx}`;
+    const aiBusy = Boolean(this.droveStrengthAiTarget || this.droveNoteAiTarget || this.droveAiConfiguring);
     const { items: catalogItems, hasHidden } = this.roleStrengthCatalog(roleId);
     const hasTag = (tag) => currentStrengths.some((s) => s.toLowerCase() === tag.toLowerCase());
     const toggleTag = (tag, cx) => {
@@ -2636,7 +2675,7 @@ export default class Settings extends View {
       .when(open, (el) =>
         el.content(
           v_flex()
-            .w(320)
+            .w(360)
             .rounded(8)
             .border_1()
             .border_color(t.border)
@@ -2648,6 +2687,55 @@ export default class Settings extends View {
               cx.notify();
             })
             .on_scroll_wheel((_e, cx) => cx.stop_propagation())
+            .child(
+              h_flex()
+                .px(8)
+                .py(7)
+                .gap(8)
+                .items_center()
+                .justify_between()
+                .border_b(1)
+                .border_color(t.border)
+                .child(
+                  div()
+                    .text_size(11.5)
+                    .font_semibold()
+                    .text_color(t.foreground)
+                    .child(this.tr("Candidate Strengths", "擅长任务管理")),
+                )
+                .child(
+                  h_flex()
+                    .id(`st-dr-str-ai-${id}`)
+                    .flex_none()
+                    .px(8)
+                    .py(3)
+                    .gap(4)
+                    .rounded(5)
+                    .border_1()
+                    .border_color(t.border)
+                    .bg(t.raised)
+                    .items_center()
+                    .text_size(11)
+                    .text_color(t.foreground)
+                    .tooltip(
+                      this.tr(
+                        "Use AI to automatically configure task strengths for this Agent + Model (optionally type hints below first)",
+                        "调用 AI 为当前 Agent + 模型自动配置擅长任务（可先在下方输入补充要求）",
+                      ),
+                    )
+                    .when(aiBusy, (b) => b.opacity(0.6))
+                    .when(!aiBusy, (b) =>
+                      b
+                        .cursor_pointer()
+                        .hover((s) => s.bg(t.hover))
+                        .on_click((_e, cx) => this.aiConfigureCandidateStrengths(roleId, idx, cx)),
+                    )
+                    .when(aiGenerating, (b) =>
+                      b.child(svg("mods/workspace-chrome/spinner.svg").size(11).text_color(t.accent).spin(900)),
+                    )
+                    .child(aiGenerating ? this.tr("Configuring…", "配置中…") : this.tr("✨ AI Configure", "✨ AI 配置")),
+                ),
+            )
             .child(
               h_flex()
                 .px(8)
@@ -2803,7 +2891,7 @@ export default class Settings extends View {
     const saved = String(currentNote ?? "").trim();
     const preview = saved.length > 42 ? `${saved.slice(0, 42)}…` : saved;
     const aiGenerating = this.droveNoteAiTarget === `candidate:${roleId}:${idx}`;
-    const aiBusy = Boolean(this.droveNoteAiTarget || this.droveAiConfiguring);
+    const aiBusy = Boolean(this.droveNoteAiTarget || this.droveStrengthAiTarget || this.droveAiConfiguring);
 
     const trigger = h_flex()
       .id(`st-dr-cnote-btn-${id}`)
@@ -3337,7 +3425,7 @@ export default class Settings extends View {
               ),
           ),
         )
-        .child(this.droveStrengthPicker(t, `${roleId}-c${idx}`, roleId, strengths, setStrengths, cx))
+        .child(this.droveStrengthPicker(t, `${roleId}-c${idx}`, roleId, idx, strengths, setStrengths, cx))
         .child(this.droveCandidateNotePicker(t, `${roleId}-c${idx}`, roleId, idx, candNote, setCandNote, cx));
 
       return v_flex()
@@ -4546,8 +4634,8 @@ export default class Settings extends View {
                         .when(!active, (el) => el.hover((s) => s.bg(t.hover)))
                         .tooltip(
                           this.tr(
-                            "Use AI Assistant to generate global and per-candidate routing notes (keeps current Agents, Models, and Strengths)",
-                            "保持现有 Agent、模型与擅长任务不变，调用智能辅助模型自动生成全局与各候选的选人备注",
+                            "Use AI Assistant to generate candidate routing notes (keeps current Agents, Models, and Strengths)",
+                            "保持现有 Agent、模型与擅长任务不变，调用智能辅助模型自动生成各候选的选人备注",
                           ),
                         )
                         .on_click((_e, cx) => {
@@ -4641,7 +4729,7 @@ export default class Settings extends View {
                           isAllMode
                             ? this.tr("AI One-Click Configure Role Models, Strengths & Notes", "AI 一键配置各角色的模型、擅长任务与备注")
                             : isNotesMode
-                              ? this.tr("AI Configure Routing Notes (keeps current Agents, Models & Strengths)", "AI 生成全局与各候选选人备注（保持现有模型与擅长任务不变）")
+                              ? this.tr("AI Configure Candidate Notes (keeps current Agents, Models & Strengths)", "AI 生成各候选选人备注（保持现有模型与擅长任务不变）")
                               : isStrengthsMode
                                 ? this.tr("AI Configure Candidate Strengths (keeps current Agents & Models)", "AI 配置各候选擅长任务（保持现有 Agent 与模型不变）")
                                 : this.tr("AI Configure Role Agents & Models", "AI 配置各角色的 Agent 与模型"),
@@ -4862,175 +4950,6 @@ export default class Settings extends View {
                   }
                 })),
             ),
-          )
-          .child(
-            (() => {
-              const savedNote = String(cfg.note ?? "").trim();
-              const draftNote = String(this.droveNoteInput?.value?.() ?? "").trim();
-              const noteDirty = draftNote !== savedNote;
-              const globalNoteGenerating = this.droveNoteAiTarget === "global";
-              const noteAiBusy = Boolean(this.droveNoteAiTarget || this.droveAiConfiguring);
-              return v_flex()
-                .id("st-dr-role-note-card")
-                .w_full()
-                .p(12)
-                .gap(7)
-                .rounded(10)
-                .border_1()
-                .border_color(this.droveNoteFocused ? t.accent : t.border)
-                .bg(t.surface)
-                .child(
-                  h_flex()
-                    .items_center()
-                    .justify_between()
-                    .gap(8)
-                    .flex_wrap()
-                    .child(
-                      h_flex()
-                        .gap(6)
-                        .items_center()
-                        .child(
-                          div()
-                            .text_size(12.5)
-                            .font_semibold()
-                            .text_color(t.foreground)
-                            .child(this.tr("Routing Note (for AI)", "选人备注（供 AI 参考）")),
-                        )
-                        .when(noteDirty, (row) =>
-                          row.child(
-                            div()
-                              .px(6)
-                              .py(1)
-                              .rounded(4)
-                              .bg(t.raised)
-                              .text_size(10.5)
-                              .text_color(t.accent)
-                              .child(this.tr("Unsaved", "未保存")),
-                          ),
-                        ),
-                    )
-                    .child(
-                      h_flex()
-                        .gap(6)
-                        .items_center()
-                        .child(
-                          h_flex()
-                            .id("st-dr-role-note-ai")
-                            .px(8)
-                            .py(3)
-                            .gap(4)
-                            .rounded(5)
-                            .border_1()
-                            .border_color(t.border)
-                            .bg(t.raised)
-                            .items_center()
-                            .text_size(11.5)
-                            .text_color(t.foreground)
-                            .tooltip(
-                              this.tr(
-                                "Use AI to generate or refine the global routing note and fill it into this box",
-                                "借助 AI 生成或润色全局选人备注，并填入当前输入框",
-                              ),
-                            )
-                            .when(noteAiBusy, (el) => el.opacity(0.6))
-                            .when(!noteAiBusy, (el) =>
-                              el
-                                .cursor_pointer()
-                                .hover((s) => s.bg(t.hover))
-                                .on_click((_e, cx) => this.aiGenerateDroveNote("global", null, null, cx)),
-                            )
-                            .when(globalNoteGenerating, (el) =>
-                              el.child(svg("mods/workspace-chrome/spinner.svg").size(11).text_color(t.accent).spin(900)),
-                            )
-                            .child(globalNoteGenerating ? this.tr("Generating…", "生成中…") : this.tr("✨ AI Note", "✨ AI 备注")),
-                        )
-                        .when(Boolean(draftNote || savedNote), (row) =>
-                          row.child(
-                            div()
-                              .id("st-dr-role-note-clear")
-                              .px(8)
-                              .py(3)
-                              .rounded(5)
-                              .border_1()
-                              .border_color(t.border)
-                              .bg(t.raised)
-                              .cursor_pointer()
-                              .text_size(11.5)
-                              .text_color(t.muted)
-                              .hover((s) => s.bg(t.hover).text_color(t.blocked))
-                              .on_click((_e, cx) => {
-                                this.droveNoteInput.set_value("");
-                                this.saveDrovePatch({ note: "" }, cx, true);
-                              })
-                              .child(this.tr("Clear", "清空")),
-                          ),
-                        )
-                        .child(
-                          div()
-                            .id("st-dr-role-note-save")
-                            .px(10)
-                            .py(3)
-                            .rounded(5)
-                            .border_1()
-                            .border_color(noteDirty ? t.accent : t.border)
-                            .bg(noteDirty ? t.accent : t.raised)
-                            .text_size(11.5)
-                            .when(noteDirty, (el) => el.font_semibold())
-                            .text_color(noteDirty ? t.accent_foreground : t.muted)
-                            .when(!this.droveSaving, (el) =>
-                              el
-                                .cursor_pointer()
-                                .when(!noteDirty, (el2) => el2.hover((s) => s.bg(t.hover).text_color(t.foreground)))
-                                .on_click((_e, cx) => this.saveDroveNote(cx)),
-                            )
-                            .child(this.droveSaving ? this.tr("Saving…", "保存中…") : this.tr("Save Note", "保存备注")),
-                        ),
-                    ),
-                )
-                .child(
-                  div()
-                    .text_size(11.5)
-                    .text_color(t.dim)
-                    .child(
-                      this.tr(
-                        "Read by AI when choosing or launching sub-agents across roles (supports time-window, quota, and priority rules). Ctrl+Enter to save.",
-                        "供 AI 选择或启动子 Agent 时参考（支持时段、双倍额度规避、优先级等自然语言规则），按 Ctrl+Enter 快速保存。",
-                      ),
-                    ),
-                )
-                .child(
-                  div()
-                    .w_full()
-                    .px(10)
-                    .py(6)
-                    .rounded(7)
-                    .border_1()
-                    .border_color(this.droveNoteFocused ? t.accent : t.border)
-                    .bg(t.background)
-                    .child(
-                      Textarea.new(this.droveNoteInput)
-                        .id("st-dr-role-note-input")
-                        .w_full()
-                        .min_h(52)
-                        .text_size(12.5)
-                        .text_color(t.foreground),
-                    )
-                    .when(!draftNote, (ph) =>
-                      ph.child(
-                        div()
-                          .pt(3)
-                          .text_size(11)
-                          .text_color(t.dim)
-                          .child(
-                            this.tr(
-                              "e.g. GLM models cost 2x quota from 2:00 PM to 6:00 PM; avoid using them unless no other agent is available.",
-                              "例如：GLM 相关模型在下午 2:00–6:00 额度按两倍计算，应避免使用，除非没有其他 agent 可用。",
-                            ),
-                          ),
-                      ),
-                    ),
-                );
-            })(),
           )
           .child(
             v_flex()
@@ -5473,7 +5392,17 @@ export default class Settings extends View {
             h_flex()
               .gap(8)
               .items_center()
-              .child(div().flex_1().child(Input.new(this.releasesUrlInput).small().w_full()))
+              .child(
+                div()
+                  .flex_1()
+                  .px(8)
+                  .py(3)
+                  .rounded(6)
+                  .border_1()
+                  .border_color(t.border)
+                  .bg(t.background)
+                  .child(Input.new(this.releasesUrlInput).h(26).text_size(13).text_color(t.foreground)),
+              )
               .child(
                 this.button(t, "st-save-releases-url", savedNotice ? this.tr("\u2713 Saved", "✓ 已保存") : this.tr("Save & Check", "保存并检查"), (_e, cx) => {
                   const val = this.releasesUrlInput.value().trim().replace(/\/+$/, "");
@@ -5492,72 +5421,6 @@ export default class Settings extends View {
           ),
       )
       .child(div().pt(12).text_size(12.5).line_height("18px").text_color(t.dim).child(this.tr("Herdr2 checks for App, UI bundle, and Core updates every hour. herdr2-core runs your terminals, so they keep running through UI and Core updates.", "Herdr2 每小时检查一次桌面端、UI 资源包与 Core 更新；UI 与 Core 热更新全程不中断现有终端会话。")));
-  }
-
-
-  // Privacy --------------------------------------------------------------
-
-  // A report as it goes out, one line per line of JSON.
-  report(t, id, title, about, report) {
-    const lines = JSON.stringify(report, null, 2).split("\n");
-    return v_flex()
-      .w_full()
-      .pt(14)
-      .gap(4)
-      .child(div().text_size(13.5).text_color(t.foreground).child(title))
-      .when(Boolean(about), (el) => el.child(div().text_size(12.5).text_color(t.dim).child(about)))
-      .child(
-        v_flex()
-          .id(id)
-          .mt(4)
-          .w_full()
-          .p(10)
-          .rounded(8)
-          .border_1()
-          .border_color(t.border)
-          .bg(t.background)
-          .children(lines.map((l) => div().font_family(DEFAULT_FONT).text_size(12).line_height("17px").text_color(t.muted).whitespace_nowrap().child(l || " "))),
-      );
-  }
-
-  privacy(t) {
-    const s = telemetry();
-    const on = s ? s.setting : this.person.telemetry !== false;
-    const at = (secs) => new Date(secs * 1000).toLocaleString();
-    const why = s?.off_because ? this.tr(`Off for now: ${s.off_because} is set where Herdr started.`, `当前已禁用：启动环境中设置了 ${s.off_because}。`) : null;
-    const body = v_flex()
-      .w_full()
-      .child(this.heading(t, this.tr("Usage data", "使用数据")))
-      .child(
-        this.row(
-          t,
-          this.tr("Share anonymous usage data", "分享匿名使用数据"),
-          why ?? this.tr("Once a day: which agents and features you use, how many spaces and tabs, your system and Herdr's version. Never what's in your terminals, never names of files, folders or projects.", "每天一次：仅统计使用的智能体与功能、工作区与标签页数量、系统及应用版本。绝不采集终端内容、文件名、目录或项目名称。"),
-          this.toggle(t, "st-telemetry", on, (_e, cx) =>
-            this.change((p) => {
-              if (on) p.telemetry = false;
-              else delete p.telemetry;
-            }, cx),
-          ),
-        ),
-      )
-      .child(
-        this.row(
-          t,
-          this.tr("What we send", "上报内容预览"),
-          s && !s.sends ? this.tr("This build never sends: it's built from source. You can still see what a release would send.", "源码构建版本不会发送数据，但仍可预览正式版会发送的格式。") : this.tr("Exactly what leaves your computer, word for word.", "逐字展示将离开本机的全部数据内容。"),
-          this.button(t, "st-telemetry-show", this.showData ? this.tr("Hide", "隐藏") : this.tr("Show", "查看"), (_e, cx) => {
-            this.showData = !this.showData;
-            cx.notify();
-          }),
-        ),
-      );
-    if (!this.showData) return body;
-    if (!s?.enabled) return body.child(div().pt(14).text_size(13).text_color(t.dim).child(this.tr("Nothing is collected or sent while it's off.", "关闭期间不会收集或发送任何数据。")));
-    return body
-      .children(s.queued.map((r, i) => this.report(t, `st-tq-${i}`, this.tr(`Waiting to send: ${r.day}`, `待发送：${r.day}`), this.tr("Sent as is, soon.", "将按此内容尽快发送。"), r)))
-      .when(Boolean(s.draft), (el) => el.child(this.report(t, "st-td", this.tr("Today so far", "今日草稿"), this.tr("A draft: it changes until the day ends (UTC), then goes out once.", "当天结束（UTC）前会持续汇总，之后仅发送一次。"), s.draft)))
-      .when(Boolean(s.last_sent), (el) => el.child(this.report(t, "st-tl", this.tr(`Last sent: ${s.last_sent.report.day}`, `上次发送：${s.last_sent.report.day}`), this.tr(`Sent ${at(s.last_sent.at)}.`, `发送于 ${at(s.last_sent.at)}。`), s.last_sent.report)));
   }
 
   // ----------------------------------------------------------------------
@@ -5698,9 +5561,7 @@ export default class Settings extends View {
                         ? this.alerts(t)
                       : this.section === "updates"
                         ? this.updates(t, cx)
-                        : this.section === "privacy"
-                          ? this.privacy(t)
-                          : this.look(t, cx),
+                        : this.look(t, cx),
                   ),
               ),
           )

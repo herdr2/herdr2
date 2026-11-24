@@ -309,7 +309,34 @@ def handle_prompt(rpc_id, params: dict) -> None:
             )
         elif line.startswith("SH:"):
             cmd = line.split(":", 1)[1]
+            tc_id = f"sh-{rpc_id}"
+            notify(
+                "session/update",
+                {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call",
+                        "toolCallId": tc_id,
+                        "title": cmd,
+                        "kind": "execute",
+                        "status": "in_progress",
+                    },
+                },
+            )
             res = subprocess.run(cmd, shell=True, cwd=last_cwd or None, text=True, capture_output=True)
+            notify(
+                "session/update",
+                {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "tool_call_update",
+                        "toolCallId": tc_id,
+                        "title": cmd,
+                        "kind": "execute",
+                        "status": "completed" if res.returncode == 0 else "failed",
+                    },
+                },
+            )
             if res.stdout:
                 emit_text(res.stdout)
             if res.stderr:

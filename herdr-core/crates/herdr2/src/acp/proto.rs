@@ -623,6 +623,97 @@ pub struct AcpContextUsage {
     pub size: u64,
 }
 
+/// Optional detailed token/cost usage extracted from ACP `usage_update` or `session/prompt` responses.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct AcpUsageDetail {
+    pub input: u64,
+    pub output: u64,
+    pub cache_read: u64,
+    pub cost: Option<f64>,
+    pub context: Option<AcpContextUsage>,
+}
+
+fn parse_cost_value(v: &Value) -> Option<f64> {
+    if let Some(n) = v.as_f64() {
+        return (n.is_finite() && n > 0.0).then_some(n);
+    }
+    if let Some(obj) = v.as_object() {
+        for k in ["amount", "usd", "total", "cost"] {
+            if let Some(n) = obj.get(k).and_then(Value::as_f64)
+                && n.is_finite()
+                && n > 0.0
+            {
+                return Some(n);
+            }
+        }
+    }
+    None
+}
+
+fn extract_usage_from_obj(obj: &Value) -> Option<AcpUsageDetail> {
+    let usage_obj = obj.get("usage").filter(|v| v.is_object()).unwrap_or(obj);
+    let input = usage_obj
+        .get("inputTokens")
+        .or_else(|| usage_obj.get("input_tokens"))
+        .or_else(|| usage_obj.get("promptTokens"))
+        .or_else(|| usage_obj.get("prompt_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let output = usage_obj
+        .get("outputTokens")
+        .or_else(|| usage_obj.get("output_tokens"))
+        .or_else(|| usage_obj.get("completionTokens"))
+        .or_else(|| usage_obj.get("completion_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cache_read = usage_obj
+        .get("cachedReadTokens")
+        .or_else(|| usage_obj.get("cacheReadTokens"))
+        .or_else(|| usage_obj.get("cachedInputTokens"))
+        .or_else(|| usage_obj.get("cache_read_input_tokens"))
+        .or_else(|| usage_obj.get("cache_read_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let cost = obj
+        .get("cost")
+        .and_then(parse_cost_value)
+        .or_else(|| usage_obj.get("cost").and_then(parse_cost_value))
+        .or_else(|| obj.get("totalCostUsd").and_then(parse_cost_value))
+        .or_else(|| obj.get("total_cost_usd").and_then(parse_cost_value));
+    let used = usage_obj
+        .get("used")
+        .or_else(|| usage_obj.get("usedTokens"))
+        .or_else(|| usage_obj.get("totalTokens"))
+        .or_else(|| usage_obj.get("total_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let size = usage_obj
+        .get("size")
+        .or_else(|| usage_obj.get("contextWindow"))
+        .or_else(|| usage_obj.get("maxTokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let context = if size > 0 { Some(AcpContextUsage { used, size }) } else { None };
+    if input == 0 && output == 0 && cache_read == 0 && cost.is_none() && context.is_none() {
+        return None;
+    }
+    Some(AcpUsageDetail { input, output, cache_read, cost, context })
+}
+
+/// Extracts detailed usage/cost from an ACP `session/update` (`usage_update`) notification payload.
+pub fn extract_usage_update_detail(params: &Value) -> Option<AcpUsageDetail> {
+    let update = params.get("update")?;
+    if update.get("sessionUpdate").and_then(Value::as_str) != Some("usage_update") {
+        return None;
+    }
+    extract_usage_from_obj(update)
+}
+
+/// Extracts optional token/cost usage from an ACP `session/prompt` result payload.
+pub fn extract_prompt_result_usage(val: &Value) -> Option<AcpUsageDetail> {
+    extract_usage_from_obj(val).or_else(|| val.get("_meta").and_then(extract_usage_from_obj))
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedUpdate {
     AssistantChunk(String),
@@ -1116,6 +1207,38 @@ mod tests {
             parse_session_update(&update),
             Some(("s1".into(), ParsedUpdate::Usage(AcpContextUsage { used: 28400, size: 200000 })))
         );
+        let detail = extract_usage_update_detail(&update).expect("usage detail");
+        assert_eq!(detail.context, Some(AcpContextUsage { used: 28400, size: 200000 }));
+
+        let rich = json!({
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "usage_update",
+                "used": 32000,
+                "size": 200000,
+                "inputTokens": 20000,
+                "outputTokens": 12000,
+                "cachedReadTokens": 4000,
+                "cost": { "amount": 0.125, "currency": "USD" }
+            }
+        });
+        let rich_detail = extract_usage_update_detail(&rich).expect("rich usage detail");
+        assert_eq!(rich_detail.input, 20000);
+        assert_eq!(rich_detail.output, 12000);
+        assert_eq!(rich_detail.cache_read, 4000);
+        assert_eq!(rich_detail.cost, Some(0.125));
+
+        let prompt_res = json!({
+            "stopReason": "end_turn",
+            "usage": { "inputTokens": 1200, "outputTokens": 300, "cacheReadTokens": 500 },
+            "cost": 0.04
+        });
+        let p_detail = extract_prompt_result_usage(&prompt_res).expect("prompt usage detail");
+        assert_eq!(p_detail.input, 1200);
+        assert_eq!(p_detail.output, 300);
+        assert_eq!(p_detail.cache_read, 500);
+        assert_eq!(p_detail.cost, Some(0.04));
+
         let zero = json!({
             "sessionId": "s1",
             "update": { "sessionUpdate": "usage_update", "used": 10, "size": 0 }

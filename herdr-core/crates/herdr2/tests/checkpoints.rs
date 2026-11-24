@@ -423,3 +423,62 @@ fn zcode_hook_outside_herdr2_answers_empty_and_starts_nothing() {
     assert!(!sock.exists(), "hook outside herdr2 must never start a daemon");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn acp_readonly_turn_ignores_concurrent_external_edits_and_omits_synthetic_ppid_from() {
+    let s = Session::new();
+    let repo = s.root.join("repo-readonly");
+    init_git_repo(&repo);
+
+    // Start an ACP agent with no initial prompt (triggers background turn 0 capture).
+    let spec = fake_acp_spec();
+    let run = s.json(&["run", "--agent", &spec, "--cwd", &repo.to_string_lossy()]);
+    let addr = run["address"].as_str().unwrap().to_string();
+
+    // Wait for background turn 0 baseline to exist.
+    wait_until("turn 0 checkpoint created", || {
+        let ls = s.json(&["checkpoint", "ls", &addr]);
+        ls["checkpoints"].as_array().is_some_and(|a| !a.is_empty())
+    });
+
+    // Simulate another agent/editor mutating the shared repo BEFORE turn 1 starts.
+    std::fs::write(repo.join("external_before.txt"), "edited by sibling before turn 1\n").unwrap();
+
+    // Turn 1: pure Q&A turn (zero tool calls) — must NOT attribute external_before.txt,
+    // and Entry::User must NOT record a synthetic `ppid:*` `from` field.
+    let qa = s.json(&["send", "--wait", &addr, "当前是什么大模型？"]);
+    assert_eq!(qa["wait"]["turn"].as_u64(), Some(1), "{qa}");
+
+    let read_out = s.json(&["read", &addr]);
+    let entries = read_out["entries"].as_array().unwrap();
+    let user_entry = entries.iter().find(|e| e["kind"] == "user" && e["turn"] == 1).unwrap();
+    assert!(user_entry.get("from").is_none() || user_entry["from"].is_null(), "synthetic ppid caller leaked into user entry: {user_entry}");
+    let ckpt_entry = entries.iter().find(|e| e["kind"] == "checkpoint" && e["turn"] == 1).unwrap();
+    assert!(
+        ckpt_entry.get("files").and_then(|v| v.as_array()).is_none_or(Vec::is_empty),
+        "pure Q&A turn must not claim changed files: {ckpt_entry}"
+    );
+
+    let diff1 = s.json(&["checkpoint", "diff", &addr, "--to", "1"]);
+    assert!(diff1["files"].as_array().unwrap().is_empty(), "turn 1 diff must be empty: {diff1}");
+    assert!(diff1["patch"].as_str().unwrap().is_empty(), "turn 1 patch must be empty: {diff1}");
+
+    // Simulate another external edit during the idle gap between Turn 1 and Turn 2.
+    std::fs::write(repo.join("external_idle.txt"), "edited by user between turns\n").unwrap();
+
+    // Turn 2: real mutating tool call (`SH:...`) writes only `owned.txt`.
+    // Turn 2's checkpoint & single-turn diff must ONLY include `owned.txt`, NOT `external_idle.txt`.
+    let edit = s.json(&["send", "--wait", &addr, "SH:printf 'agent edit\\n' > owned.txt"]);
+    assert_eq!(edit["wait"]["turn"].as_u64(), Some(2), "{edit}");
+
+    let ls = s.json(&["checkpoint", "ls", &addr]);
+    let t2 = ls["checkpoints"].as_array().unwrap().iter().find(|c| c["turn"] == 2).unwrap();
+    let t2_paths: Vec<&str> =
+        t2["files"].as_array().unwrap().iter().filter_map(|f| f["path"].as_str()).collect();
+    assert_eq!(t2_paths, vec!["owned.txt"], "turn 2 must exclude idle-gap external edits: {t2}");
+
+    let diff2 = s.json(&["checkpoint", "diff", &addr, "--to", "2"]);
+    let diff2_paths: Vec<&str> =
+        diff2["files"].as_array().unwrap().iter().filter_map(|f| f["path"].as_str()).collect();
+    assert_eq!(diff2_paths, vec!["owned.txt"], "single-turn diff must exclude idle-gap external edits: {diff2}");
+}

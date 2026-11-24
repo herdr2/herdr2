@@ -674,6 +674,10 @@ pub struct Task {
     pub cache: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_from: Option<String>,
+    /// Explicitly allow automatic retry when a worker calls `drove worker done --outcome failed`.
+    /// Defaults to `false` so reviewer/business conclusions immediately fail and wake the coordinator.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_on_worker_reported: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1028,6 +1032,10 @@ pub struct Diagnosis {
 pub struct RunStats {
     pub tokens: u64,
     pub cost: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_cost: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_tokens: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1441,10 +1449,10 @@ pub struct DroveRolesAiConfigureParams {
     /// Optional target scope when `mode == "notes"`: `"global"`, `"candidate"`, or `"all"` (default).
     #[serde(default)]
     pub note_scope: Option<String>,
-    /// Optional role ID when `noteScope == "candidate"`.
+    /// Optional role ID for single-candidate generation (`mode == "notes"` with `noteScope == "candidate"`, or `mode == "strengths"`).
     #[serde(default)]
     pub target_role: Option<String>,
-    /// Optional 0-based candidate index inside `targetRole` when `noteScope == "candidate"`.
+    /// Optional 0-based candidate index inside `targetRole` for single-candidate generation.
     #[serde(default)]
     pub target_candidate_index: Option<usize>,
     /// Optional natural-language preference hint (e.g. preferred agents/models, cost/speed priority, or draft note to refine).
@@ -1482,6 +1490,9 @@ pub struct DroveRolesAiConfigureResult {
     /// Generated routing note (global note for `all`/`notes`/`global`, or single candidate note for `candidate`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// Generated task strengths when targeting a single candidate in `strengths` mode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strengths: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roles: Option<BTreeMap<String, RoleConfig>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

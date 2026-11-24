@@ -98,6 +98,7 @@ const THEMES: &[(&str, &str)] = &[
     ("atom-one-dark", include_str!("../defaults/themes/atom-one-dark.json")),
     ("win98", include_str!("../defaults/themes/win98.json")),
 ];
+#[cfg(test)]
 pub const SHIPPED_THEMES: &[&str] = &["atom-one-dark", "win98"];
 
 /// `themes/<name>.json`: a palette, plus `colors` overrides like settings.json's.
@@ -442,9 +443,6 @@ pub struct Person {
     /// The panels' font (their sizes follow zoom).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ui_font: Option<String>,
-    /// Anonymous usage data (telemetry.rs). Off by default.
-    #[serde(skip_serializing_if = "is_false")]
-    pub telemetry: bool,
     /// Allow terminal programs (including remote ones) to copy text locally.
     #[serde(skip_serializing_if = "is_true")]
     pub clipboard_write: bool,
@@ -539,10 +537,6 @@ fn is_true(b: &bool) -> bool {
     *b
 }
 
-fn is_false(b: &bool) -> bool {
-    !*b
-}
-
 impl Default for Person {
     fn default() -> Self {
         Person {
@@ -559,7 +553,6 @@ impl Default for Person {
             terminal_cell_width: 1.0,
             terminal_scroll_speed: 1.0,
             ui_font: None,
-            telemetry: false,
             clipboard_write: true,
             copy_on_select: true,
             pane_scrollbars: true,
@@ -820,18 +813,6 @@ pub fn load_person() -> Result<Person, String> {
     Ok(person)
 }
 
-/// The value of settings.json's own `telemetry`, read even when the file has
-/// another problem: an explicit `false` always counts.
-pub fn telemetry_setting(person: &Result<Person, String>) -> bool {
-    match person {
-        Ok(p) => p.telemetry,
-        Err(_) => {
-            let raw = std::fs::read_to_string(path()).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok());
-            raw.and_then(|v| v.get("telemetry").and_then(serde_json::Value::as_bool)).unwrap_or(false)
-        }
-    }
-}
-
 pub fn write_person(person: &Person) -> std::io::Result<()> {
     let path = path();
     let previous = match std::fs::read_to_string(&path) {
@@ -1028,17 +1009,15 @@ mod tests {
 
     #[test]
     fn zoom_writes_preserve_mod_preferences_and_clear_unset_app_fields() {
-        let raw = r#"{"zoom":1,"font":"custom","telemetry":true,"worktrees":{"directory":"~/Developer/worktrees","future":true},"another_mod":{"enabled":true}}"#;
+        let raw = r#"{"zoom":1,"font":"custom","worktrees":{"directory":"~/Developer/worktrees","future":true},"another_mod":{"enabled":true}}"#;
         let mut person: Person = serde_json::from_str(raw).unwrap();
         person.zoom = 1.5;
         person.font = None;
-        person.telemetry = false;
         let saved: serde_json::Value = serde_json::from_str(&person_text(&person, raw).unwrap()).unwrap();
         assert_eq!(saved["zoom"], 1.5);
         assert_eq!(saved["worktrees"], serde_json::json!({"directory":"~/Developer/worktrees","future":true}));
         assert_eq!(saved["another_mod"], serde_json::json!({"enabled":true}));
         assert!(saved.get("font").is_none());
-        assert!(saved.get("telemetry").is_none());
         assert_eq!(serde_json::from_value::<Person>(saved).unwrap().zoom, 1.5);
         for broken in ["{", "null", "[]", r#"{"zoom":"big"}"#] {
             assert!(person_text(&person, broken).is_err());
@@ -1211,7 +1190,7 @@ mod tests {
     /// settings.json key.
     #[test]
     fn the_guide_explains_every_setting() {
-        let all = Person { core: Some(String::new()), default_agent: Some(String::new()), font: Some(String::new()), font_size: Some(1.0), font_weight: Some(400), ui_font: Some(String::new()), telemetry: true, clipboard_write: false, copy_on_select: false, appearance: Appearance::Light, language: Language::ZhCn, theme: Some(crate::layout::ThemeChoice::One(String::new())), colors: [("text".into(), String::new())].into(), ..Person::default() };
+        let all = Person { core: Some(String::new()), default_agent: Some(String::new()), font: Some(String::new()), font_size: Some(1.0), font_weight: Some(400), ui_font: Some(String::new()), clipboard_write: false, copy_on_select: false, appearance: Appearance::Light, language: Language::ZhCn, theme: Some(crate::layout::ThemeChoice::One(String::new())), colors: [("text".into(), String::new())].into(), ..Person::default() };
         let keys: Vec<String> = serde_json::to_value(&all).unwrap().as_object().unwrap().keys().cloned().collect();
         let guide = include_str!("../defaults/AGENTS.md");
         let section = guide.split("## The person").nth(1).and_then(|s| s.split("\n## ").next()).unwrap_or_default();

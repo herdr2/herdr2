@@ -1,13 +1,15 @@
 #!/bin/sh
-# Installs herdr2 (h2), or updates it:
+# Installs herdr2 (h2), or updates it from a self-hosted release server:
 #
-#   curl -fsSL https://releases.herdr.dev/core/install.sh | sh
+#   HERDR2_RELEASES_URL=https://your-host curl -fsSL "$HERDR2_RELEASES_URL/core/install.sh" | sh
 #
 # Into ~/.local/bin/herdr2, with `h2` beside it only if no `h2` exists.
-# H2_VERSION=0.2.0 picks a version; HERDR2_RELEASES_URL points elsewhere (tests).
+# H2_VERSION=0.2.0 picks a version; HERDR2_RELEASES_URL is required.
 set -eu
 
-releases=${HERDR2_RELEASES_URL:-https://releases.herdr.dev}
+releases=${HERDR2_RELEASES_URL:-}
+[ -n "$releases" ] || { printf 'h2: set HERDR2_RELEASES_URL to your release server base URL\n' >&2; exit 1; }
+releases=${releases%/}
 bin=${H2_INSTALL_DIR:-$HOME/.local/bin}
 
 say() { printf '%s\n' "$*"; }
@@ -85,10 +87,6 @@ if [ "$bundle" = 1 ] && [ -x "$tmp/Herdr2.app/Contents/MacOS/herdr2" ]; then
       for (i=1; i<=3; i++) { if (a[i]+0 > b[i]+0) exit 1; if (a[i]+0 < b[i]+0) exit 0 }
     }' || fail "$candidate is older than $installed; use h2 update --from with --force to downgrade"
   fi
-  case "$releases" in
-    https://releases.herdr.dev | https://releases.herdr.dev/)
-      /usr/bin/codesign --verify --strict -R '=identifier "dev.herdr2.core" and anchor apple generic and certificate leaf[subject.OU] = "2W9652Q7QR"' "$tmp/Herdr2.app" || fail "not a signed Herdr2 release" ;;
-  esac
   "$bundled" --h2-install-bundle "$bundled" "$bin/herdr2" || fail "installing Herdr2.app failed"
   if [ "$action" = updated ]; then
     "$bin/herdr2" server restart >/dev/null || fail "restarting the core failed"

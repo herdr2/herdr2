@@ -167,6 +167,7 @@ pub(super) async fn run_adversarial_review_gate(
                 spinning_detected_at: None,
             };
             core.drove.store.insert_attempt(rev_attempt);
+            core.drove.set_worker_last_attempt(&warm.id, &rev_att_id);
             (warm.id, aid, true)
         } else {
             let port = core.drove.web_port.load(std::sync::atomic::Ordering::SeqCst);
@@ -256,6 +257,7 @@ pub(super) async fn run_adversarial_review_gate(
                 spinning_detected_at: None,
             };
             core.drove.store.insert_attempt(rev_attempt);
+            core.drove.set_worker_last_attempt(&rev_worker_id, &rev_att_id);
 
             let spawn = match spawn_drove_agent(
                 core,

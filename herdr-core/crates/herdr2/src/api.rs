@@ -569,6 +569,12 @@ async fn agent_label(core: Ctx<'_>, p: LabelParams) -> Result<Public, RpcError> 
         (a.labels.get("herdr.trashed").is_some_and(|s| !s.is_empty()), a.labels.get("drove.worker").cloned())
     };
     if trashed {
+        let target = TargetKey::Agent(id);
+        let _ = core.jobs.send(crate::notes::Job::Orphaned(target));
+        {
+            let mut st = core.lock();
+            crate::remote::orphaned_afar(core, &mut st, target);
+        }
         let sig = if let Some(wid) = worker_id {
             crate::drove::pool::PoolSignal::WorkerTrashed { worker_id: wid }
         } else {
@@ -666,6 +672,22 @@ async fn agent_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError
     }
 }
 
+pub(crate) fn is_synthetic_caller(raw: &str) -> bool {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let local = trimmed.rsplit_once('/').map_or(trimmed, |(_, tail)| tail);
+    local.strip_prefix("ppid:").is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+}
+
+pub(crate) fn attributed_sender<'a>(explicit_from: Option<&'a str>, caller: Option<&'a str>) -> Option<&'a str> {
+    explicit_from
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| caller.map(str::trim).filter(|s| !s.is_empty() && !is_synthetic_caller(s)))
+}
+
 pub(super) async fn agent_send(core: Ctx<'_>, p: SendParams) -> Result<SendResult, RpcError> {
     if p.text.trim().is_empty() && p.content.is_empty() {
         return Err(RpcError::invalid_params("give non-empty text or at least one content block"));
@@ -761,7 +783,7 @@ pub(super) async fn agent_send(core: Ctx<'_>, p: SendParams) -> Result<SendResul
         }
         TargetKey::Agent(id) => {
             let timeout = wait_timeout(core, p.timeout)?;
-            let sender = p.from.as_deref().or(p.caller.as_deref());
+            let sender = attributed_sender(p.from.as_deref(), p.caller.as_deref());
             let (extra_texts, attachments) = if p.content.is_empty() {
                 (Vec::new(), Vec::new())
             } else {
@@ -2052,12 +2074,17 @@ async fn checkpoint_diff(
         .find(|c| c.turn == to_turn)
         .ok_or_else(|| RpcError::invalid_params(format!("no checkpoint at turn {to_turn} for {addr}")))?
         .clone();
+    let pre_ref = if p.from.is_none() { tc.pre_turn_refs.get(&to_turn).cloned() } else { None };
     let repo_dir = tc.repo_root.as_deref().unwrap_or(&cwd);
     let repo = crate::checkpoint::probe_repo(std::path::Path::new(repo_dir))
         .ok_or_else(|| RpcError::invalid_params(format!("workspace `{repo_dir}` is not a Git repository")))?;
     let _guard = core.repo_ckpt_lock(&repo.toplevel).lock_owned().await;
     tokio::task::spawn_blocking(move || {
-        crate::checkpoint::diff_checkpoints(&repo, from_turn, to_turn, &from_meta.ref_name, &to_meta.ref_name)
+        let effective_from = pre_ref
+            .as_deref()
+            .filter(|r| crate::checkpoint::ref_exists(&repo, r))
+            .unwrap_or(&from_meta.ref_name);
+        crate::checkpoint::diff_checkpoints(&repo, from_turn, to_turn, effective_from, &to_meta.ref_name)
     })
     .await
     .map_err(|e| RpcError::internal(format!("diff task panicked: {e}")))?

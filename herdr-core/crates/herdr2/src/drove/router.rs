@@ -971,6 +971,7 @@ mod tests {
             candidate_result: None,
             cache: None,
             cached_from: None,
+            retry_on_worker_reported: None,
         }
     }
 

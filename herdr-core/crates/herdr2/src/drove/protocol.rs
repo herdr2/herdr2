@@ -156,9 +156,10 @@ pub fn build_task_prompt_with_handover(
          - Ask coordinator (blocks until reply): `h2 drove worker ask \"Question?\" [--options \"A,B\"]`\n\
          - Send progress note: `h2 drove worker note \"...\"`\n\
          - Read inbox messages: `h2 drove worker inbox`\n\
-         Worker env vars (`H2_DROVE_URL`, `H2_DROVE_WORKER_TOKEN`, `H2_DROVE_ATTEMPT_ID`) are pre-set for you (`attemptId`: `{}`).\n\
+         Worker env vars (`H2_DROVE_URL`, `H2_DROVE_WORKER_TOKEN`, `H2_DROVE_WORKER_ID`) are pre-set for you. Current `attemptId`: `{}`.\n\
+         `h2 drove worker ...` automatically resolves your active attempt (you may also pass `--attempt {}` explicitly if needed; note that `$H2_DROVE_ATTEMPT_ID` may reflect an earlier attempt when a worker is reused).\n\
          NEVER call `drove worker done` until all changes and checks for this attempt are complete.",
-        attempt.id
+        attempt.id, attempt.id
     );
     sections.push(protocol_instr);
     sections.join("\n\n")
@@ -298,6 +299,7 @@ mod tests {
             candidate_result: None,
             cache: None,
             cached_from: None,
+            retry_on_worker_reported: None,
         };
         let mut task = dep.clone();
         task.id = "tsk_2".into();

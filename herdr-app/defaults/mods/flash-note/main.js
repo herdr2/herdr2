@@ -753,9 +753,7 @@ export default class FlashNote extends View {
       body: noteDisplayTitle(note ?? { title, text: nonEmpty[0].text }, 64),
       level: "info",
     });
-    const ov = props()?.overlay;
-    if (ov) closeOverlay(ov);
-    else cx?.notify?.();
+    cx?.notify?.();
   }
 
   deleteEditingNote(cx) {
@@ -775,9 +773,8 @@ export default class FlashNote extends View {
         level: "info",
       });
     }
-    const ov = props()?.overlay;
-    if (ov) closeOverlay(ov);
-    else cx?.notify?.();
+    this.loadNoteIntoComposer(null, true);
+    cx?.notify?.();
   }
 
   finalizeSentEntries(targetEntries, sentLabel, now, cx) {
@@ -810,13 +807,10 @@ export default class FlashNote extends View {
         entry.selected = !entry.sentTo;
       }
       this.sendScope = "selected";
-      cx?.notify?.();
-      return;
     }
 
-    const ov = props()?.overlay;
-    if (ov) closeOverlay(ov);
-    else cx?.notify?.();
+    // Keep the flash note window open after sending; only the top-right close button closes it.
+    cx?.notify?.();
   }
 
   sendSingleEntry(idx, cx) {
@@ -2088,9 +2082,6 @@ export default class FlashNote extends View {
             this.closeAllPopups();
             cx.stop_propagation();
             cx.notify();
-          } else if (props()?.overlay) {
-            closeOverlay(props().overlay);
-            cx.stop_propagation();
           }
         }
       })

@@ -255,7 +255,7 @@ fn tool_definitions() -> Value {
     json!([
         {
             "name": "h2_run",
-            "description": "Start a subordinate ACP agent session (preset or custom command).",
+            "description": "Start a subordinate ACP agent session (preset or custom command). Child sessions stay warm after a turn and auto-exit when their parent closes; check h2_ls and prefer reusing an existing idle child via h2_send for related follow-up tasks instead of spawning a new session.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -287,7 +287,7 @@ fn tool_definitions() -> Value {
         },
         {
             "name": "h2_send",
-            "description": "Queue a text or multimodal prompt (images, resources, resource links) for an ACP agent (cannot target PTY terminals; terminal agents receive ACP results via h2 wait).",
+            "description": "Queue a text or multimodal prompt (images, resources, resource links) for a live ACP agent, reusing its warm session context and prompt cache for follow-up tasks (cannot target PTY terminals; terminal agents receive ACP results via h2 wait).",
             "inputSchema": {
                 "type": "object",
                 "required": ["agent"],

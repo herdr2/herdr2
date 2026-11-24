@@ -1143,6 +1143,7 @@ export default class Peek extends View {
     if (this.isPtyMode()) return [];
     if (Array.isArray(this.optimisticInbox)) return this.optimisticInbox;
     if (Array.isArray(k?.inbox)) return k.inbox;
+    if (k && Number(k.inbox_len ?? 0) === 0) return [];
     if (Array.isArray(this.agentDetail?.inbox)) return this.agentDetail.inbox;
     return [];
   }
@@ -1939,8 +1940,8 @@ export default class Peek extends View {
             })
             .child(svg(ICONS.messagesSquare).size(13).flex_none().text_color(t.dim))
             .when(Boolean(fromLabel), (b) => b.child(div().flex_none().font_medium().text_size(11.5).text_color(t.muted).child(fromLabel)))
-            .when(Boolean(fromLabel), (b) => b.child(div().flex_none().text_size(11.5).text_color(t.dim).child("·")))
-            .child(div().max_w(440).truncate().text_size(12.5).text_color(t.foreground).child(item.foldSummary || fullBody))
+            .when(Boolean(fromLabel) && !foldOpen, (b) => b.child(div().flex_none().text_size(11.5).text_color(t.dim).child("·")))
+            .when(!foldOpen, (b) => b.child(div().max_w(440).truncate().text_size(12.5).text_color(t.foreground).child(item.foldSummary || fullBody)))
             .child(svg(foldOpen ? ICONS.chevronDown : ICONS.chevronRight).size(12).flex_none().text_color(t.dim)),
         ),
       )

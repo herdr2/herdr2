@@ -329,7 +329,9 @@ fn ensure_core_bundle(version: &str) -> Result<(), String> {
     if !official {
         return Ok(());
     }
-    let releases = std::env::var("HERDR2_RELEASES_URL").unwrap_or_else(|_| "https://releases.herdr.dev".into());
+    let Some(releases) = crate::update::releases() else {
+        return Ok(());
+    };
     let mut cmd = crate::spawn::command("sh");
     cmd.args([
         "-c",

@@ -35,12 +35,9 @@ mod sound;
 mod spawn;
 #[allow(dead_code)]
 mod sprites;
-mod telemetry;
-mod feedback;
 mod terminal;
 mod ui_update;
 mod update;
-mod update_notes;
 #[allow(dead_code)]
 mod vt;
 #[allow(dead_code)]
@@ -135,7 +132,6 @@ fn main() {
         return;
     }
 
-    telemetry::clock();
     // A first start sizes the app to the screen and the system's text size.
     let fresh = !settings::path().exists();
     // The core people installed; without one, the setup screen installs it.
@@ -174,7 +170,6 @@ fn main() {
     };
     #[cfg(target_os = "macos")]
     core_bin::install_cli_link();
-    telemetry::start(settings::telemetry_setting(&person));
     bench::start();
     if let Err(e) = mods::write_workspace() {
         eprintln!("herdr2: cannot write {}: {e}", mods::app_dir().display());
@@ -209,7 +204,6 @@ fn main() {
                 if let Err(e) = update::apply() {
                     tracing::warn!("update: apply on quit failed: {e}");
                 }
-                telemetry::quit();
                 async {}
             })
             .detach();

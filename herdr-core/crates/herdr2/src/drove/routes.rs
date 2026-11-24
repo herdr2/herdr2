@@ -36,22 +36,59 @@ pub(super) fn authenticate_worker(
     let tok = header(headers, "x-drove-worker-token", "x-co-worker-token")
         .filter(|s| !s.is_empty())
         .ok_or_else(|| ApiErr::new(401, "unauthorized", "missing worker token"))?;
-    let att_id = body["attemptId"]
+    let body_worker_id = body["workerId"]
         .as_str()
+        .or_else(|| header(headers, "x-drove-worker-id", "x-co-worker-id"))
         .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| ApiErr::new(400, "bad_request", "attemptId must be a non-empty string"))?;
-    let att = drove.store.get_attempt(att_id).ok_or_else(|| ApiErr::new(404, "not_found", "Attempt not found"))?;
-    if !drove.verify_worker_token(&att.worker_id, tok) {
+        .filter(|s| !s.is_empty());
+    let req_att_id = body["attemptId"].as_str().map(str::trim).filter(|s| !s.is_empty());
+    let explicit_attempt = body["explicitAttempt"].as_bool() == Some(true);
+
+    let (worker_id, requested_att) = if let Some(wid) = body_worker_id {
+        (wid.to_string(), req_att_id.and_then(|id| drove.store.get_attempt(id)))
+    } else if let Some(att_id) = req_att_id {
+        let att = drove.store.get_attempt(att_id).ok_or_else(|| ApiErr::new(404, "not_found", "Attempt not found"))?;
+        (att.worker_id.clone(), Some(att))
+    } else {
+        return Err(ApiErr::new(400, "bad_request", "workerId or attemptId must be a non-empty string"));
+    };
+
+    if !drove.verify_worker_token(&worker_id, tok) {
         return Err(ApiErr::new(401, "unauthorized", "invalid worker token"));
     }
     let worker =
-        drove.store.get_worker(&att.worker_id).ok_or_else(|| ApiErr::new(404, "not_found", "Worker not found"))?;
-    if att.outcome.is_some()
-        || att.ended_at.is_some()
-        || matches!(worker.state, WorkerState::Dead | WorkerState::Closed)
-        || worker.current_attempt_id.as_deref() != Some(att.id.as_str())
-    {
+        drove.store.get_worker(&worker_id).ok_or_else(|| ApiErr::new(404, "not_found", "Worker not found"))?;
+    if matches!(worker.state, WorkerState::Dead | WorkerState::Closed) {
+        return Err(ApiErr::new(409, "stale_attempt", "Worker is no longer active"));
+    }
+    let active_att_id = worker
+        .current_attempt_id
+        .as_deref()
+        .ok_or_else(|| ApiErr::new(409, "stale_attempt", "worker has no active attempt"))?;
+
+    if explicit_attempt {
+        let Some(req_id) = req_att_id else {
+            return Err(ApiErr::new(400, "bad_request", "attemptId must be a non-empty string"));
+        };
+        if req_id != active_att_id {
+            return Err(ApiErr::new(
+                409,
+                "stale_attempt",
+                format!("Attempt `{req_id}` has already ended or no longer belongs to this worker (active: `{active_att_id}`)"),
+            ));
+        }
+    }
+
+    // Prefer the worker's live active attempt so reused workers with a frozen `H2_DROVE_ATTEMPT_ID`
+    // env var from their initial attempt seamlessly operate on their current attempt.
+    let att = match requested_att {
+        Some(a) if a.id == active_att_id && a.worker_id == worker.id => a,
+        _ => drove
+            .store
+            .get_attempt(active_att_id)
+            .ok_or_else(|| ApiErr::new(409, "stale_attempt", "active attempt missing"))?,
+    };
+    if att.outcome.is_some() || att.ended_at.is_some() {
         return Err(ApiErr::new(409, "stale_attempt", "Attempt has already ended or no longer belongs to this worker"));
     }
     Ok(att)
@@ -65,13 +102,24 @@ pub(super) fn worker_context_http(
     let tok = header(headers, "x-drove-worker-token", "x-co-worker-token")
         .filter(|s| !s.is_empty())
         .ok_or_else(|| ApiErr::new(401, "unauthorized", "missing worker token"))?;
-    let worker_id = body["workerId"]
+    let worker_id = if let Some(wid) = body["workerId"]
         .as_str()
+        .or_else(|| header(headers, "x-drove-worker-id", "x-co-worker-id"))
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| ApiErr::new(400, "bad_request", "workerId must be a non-empty string"))?;
-    let worker = drove.store.get_worker(worker_id).ok_or_else(|| ApiErr::new(404, "not_found", "Worker not found"))?;
-    if !drove.verify_worker_token(worker_id, tok) {
+    {
+        wid.to_string()
+    } else if let Some(att_id) = body["attemptId"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+        drove
+            .store
+            .get_attempt(att_id)
+            .ok_or_else(|| ApiErr::new(404, "not_found", "Attempt not found"))?
+            .worker_id
+    } else {
+        return Err(ApiErr::new(400, "bad_request", "workerId must be a non-empty string"));
+    };
+    let worker = drove.store.get_worker(&worker_id).ok_or_else(|| ApiErr::new(404, "not_found", "Worker not found"))?;
+    if !drove.verify_worker_token(&worker_id, tok) {
         return Err(ApiErr::new(401, "unauthorized", "invalid worker token"));
     }
     let att_id =
@@ -285,7 +333,11 @@ pub(super) async fn worker_done_http(
             a.failure = Some(AttemptFailure { kind: FailureKind::WorkerReported, message: reason.clone() });
         });
         let no_retry = body["noRetry"].as_bool() == Some(true);
-        let max_r = if no_retry { 0 } else { super::MAX_AUTO_RETRIES };
+        // `worker_reported` is an explicit business/review conclusion (e.g., a read-only reviewer
+        // reporting blocking defects). Never auto-retry unless the task explicitly opts in via
+        // `retryOnWorkerReported: true`, so the task fails immediately and wakes `h2 drove wait`.
+        let allow_retry = !no_retry && task.retry_on_worker_reported == Some(true);
+        let max_r = if allow_retry { super::MAX_AUTO_RETRIES } else { 0 };
         super::fail_or_retry_task(core, &run.id, &task.id, &att.id, FailureKind::WorkerReported, &reason, max_r).await;
         if let Some(wt) = worker.worktree.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             if super::integrate::is_aosp_harness(&run.cwd) {
@@ -765,6 +817,7 @@ fn create_one_task(core: &Arc<Core>, run_id: &str, raw: &Value) -> Result<Task, 
         review: raw.get("review").and_then(|v| serde_json::from_value(v.clone()).ok()),
         cache: raw.get("cache").cloned(),
         cached_from: None,
+        retry_on_worker_reported: raw["retryOnWorkerReported"].as_bool(),
     });
     Ok(task)
 }
@@ -1165,4 +1218,119 @@ fn validate_json_schema(schema: &Value, value: &Value, path: &str) -> Vec<String
         }
     }
     errs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::paths::Paths;
+
+    fn test_drove_runtime() -> Arc<DroveRuntime> {
+        let dir = std::env::temp_dir().join(format!("herdr2-routes-test-{}", super::super::crypto::rand_id("t")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = Paths {
+            state: dir.clone(),
+            config: dir.join("config.toml"),
+            socket: dir.join("core.sock"),
+            holder_socket: dir.join("core.holder.sock"),
+        };
+        let ai = crate::ai::AiRuntime::open(&paths).unwrap();
+        DroveRuntime::open(&paths, ai).unwrap()
+    }
+
+    #[test]
+    fn authenticate_worker_resolves_active_attempt_when_env_attempt_is_stale() {
+        let drove = test_drove_runtime();
+        let tok = drove.register_worker_token("wrk_reused");
+        drove.store.insert_worker(Worker {
+            id: "wrk_reused".into(),
+            run_id: "run_1".into(),
+            agent: "codex".into(),
+            model: None,
+            context_window: None,
+            effort: None,
+            fast: None,
+            session_key: "run_1:wrk_reused".into(),
+            h2_agent: Some("a5q".into()),
+            cwd: "/tmp".into(),
+            worktree: None,
+            state: WorkerState::Busy,
+            current_attempt_id: Some("att_new".into()),
+            pid: None,
+            fingerprint: Fingerprint::default(),
+            context: WorkerContext::default(),
+            totals: WorkerTotals::default(),
+            created_at: now_iso(),
+            last_active_at: now_iso(),
+            role: Some("coder".into()),
+            forked_from: None,
+            protocol_gen: Some(1),
+            read_only_dir: None,
+        });
+        let mk_att = |id: &str, ended: Option<String>, outcome: Option<Outcome>| Attempt {
+            id: id.into(),
+            task_id: "tsk_1".into(),
+            run_id: "run_1".into(),
+            worker_id: "wrk_reused".into(),
+            agent: "codex".into(),
+            model: None,
+            effort: None,
+            fast: None,
+            route_reason: "test".into(),
+            reused: id == "att_new",
+            retry_of: None,
+            hint: None,
+            started_at: now_iso(),
+            ended_at: ended,
+            awaiting_late_done: None,
+            tokens: TokenCounts::default(),
+            cost: None,
+            estimated: None,
+            outcome,
+            failure: None,
+            result: None,
+            kind: Some("author".into()),
+            review_round: None,
+            verifying: None,
+            verify_rejections: None,
+            stagnant_rejections: None,
+            last_verify_hash: None,
+            last_tree_sha: None,
+            verify_log_artifact_id: None,
+            verify_ai_digest: None,
+            ai_diagnosis: None,
+            spinning_detected_at: None,
+        };
+        drove.store.insert_attempt(mk_att("att_old", Some(now_iso()), Some(Outcome::Succeeded)));
+        drove.store.insert_attempt(mk_att("att_new", None, None));
+
+        let mut headers = BTreeMap::new();
+        headers.insert("x-drove-worker-token".into(), tok);
+
+        // 1. Stale env `attemptId` alone resolves dynamically to worker's active attempt `att_new`.
+        let resolved = authenticate_worker(&drove, &headers, &json!({ "attemptId": "att_old" })).unwrap();
+        assert_eq!(resolved.id, "att_new");
+
+        // 2. `workerId` + stale `attemptId` also resolves to `att_new`.
+        let resolved2 =
+            authenticate_worker(&drove, &headers, &json!({ "workerId": "wrk_reused", "attemptId": "att_old" })).unwrap();
+        assert_eq!(resolved2.id, "att_new");
+
+        // 3. Explicit `--attempt att_old` (`explicitAttempt: true`) must still reject stale attempt.
+        let explicit_err = authenticate_worker(
+            &drove,
+            &headers,
+            &json!({ "workerId": "wrk_reused", "attemptId": "att_old", "explicitAttempt": true }),
+        );
+        assert!(explicit_err.is_err());
+
+        // 4. Explicit `--attempt att_new` succeeds.
+        let explicit_ok = authenticate_worker(
+            &drove,
+            &headers,
+            &json!({ "workerId": "wrk_reused", "attemptId": "att_new", "explicitAttempt": true }),
+        )
+        .unwrap();
+        assert_eq!(explicit_ok.id, "att_new");
+    }
 }

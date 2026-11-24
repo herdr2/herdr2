@@ -6,7 +6,10 @@ use super::router::RouteDecision;
 use super::store::NewDaemonEvent;
 use super::types::*;
 use super::{MAX_AUTO_RETRIES, fail_or_retry_task};
-use crate::acp::{self, proto::AcpContextUsage};
+use crate::acp::{
+    self,
+    proto::{AcpContextUsage, AcpUsageDetail},
+};
 use crate::api::run::{DroveSpawnSpec, spawn_drove_agent, update_agent_display};
 use crate::runtime::{Core, TargetKey};
 use crate::transcript::Entry;
@@ -14,52 +17,150 @@ use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use tokio::sync::mpsc;
+use tokio::time::Instant;
+
+const COALESCE_WINDOW: Duration = Duration::from_millis(200);
+const COALESCE_MAX_BYTES: usize = 4096;
+const MIN_LOOP_DETECT_ELAPSED_SEC: u64 = 90;
+const MIN_SEMANTIC_LOOP_ELAPSED_SEC: u64 = 120;
+const SEMANTIC_LOOP_COOLDOWN: Duration = Duration::from_secs(90);
+const SEMANTIC_LOOP_MAX_CHECKS: u32 = 3;
 
 #[derive(Clone, Debug)]
 pub enum PoolSignal {
-    Transcript { worker_id: String, entry: Entry },
-    TurnFinished { worker_id: String, agent_id: u32, error: Option<String>, usage: Option<AcpContextUsage> },
-    AgentExited { worker_id: String, agent_id: u32, reason: String },
-    SessionClosed { address: String },
-    WorkerTrashed { worker_id: String },
+    Transcript {
+        worker_id: String,
+        entry: Entry,
+    },
+    UsageUpdated {
+        worker_id: String,
+        usage: Option<AcpContextUsage>,
+        detail: Option<AcpUsageDetail>,
+    },
+    TurnFinished {
+        worker_id: String,
+        agent_id: u32,
+        turn_num: u64,
+        error: Option<String>,
+        usage: Option<AcpContextUsage>,
+        detail: Option<AcpUsageDetail>,
+    },
+    AgentExited {
+        worker_id: String,
+        agent_id: u32,
+        reason: String,
+    },
+    SessionClosed {
+        address: String,
+    },
+    WorkerTrashed {
+        worker_id: String,
+    },
+}
+
+struct PendingTextChunk {
+    attempt_id: Option<String>,
+    kind: &'static str,
+    text: String,
+    first_at: Instant,
+}
+
+fn flush_worker_chunk(core: &Core, pending: &mut HashMap<String, PendingTextChunk>, worker_id: &str) {
+    if let Some(chunk) = pending.remove(worker_id)
+        && !chunk.text.is_empty()
+    {
+        core.drove.store.append_item(worker_id, chunk.attempt_id, chunk.kind, Some(chunk.text), None, None);
+    }
+}
+
+fn flush_expired_chunks(core: &Core, pending: &mut HashMap<String, PendingTextChunk>) {
+    let now = Instant::now();
+    let expired: Vec<String> = pending
+        .iter()
+        .filter(|(_, chunk)| now.saturating_duration_since(chunk.first_at) >= COALESCE_WINDOW)
+        .map(|(wid, _)| wid.clone())
+        .collect();
+    for wid in expired {
+        flush_worker_chunk(core, pending, &wid);
+    }
 }
 
 /// Runs in background processing transcript, turn-completion, and external kill signals from `Core`.
 pub async fn run_signal_loop(core: Arc<Core>, mut rx: mpsc::UnboundedReceiver<PoolSignal>) {
-    while let Some(sig) = rx.recv().await {
-        handle_signal(&core, sig).await;
+    let mut pending: HashMap<String, PendingTextChunk> = HashMap::new();
+    loop {
+        let next_deadline = pending.values().map(|c| c.first_at + COALESCE_WINDOW).min();
+        match next_deadline {
+            Some(deadline) => {
+                tokio::select! {
+                    maybe_sig = rx.recv() => match maybe_sig {
+                        Some(sig) => handle_signal(&core, &mut pending, sig).await,
+                        None => break,
+                    },
+                    _ = tokio::time::sleep_until(deadline) => {
+                        flush_expired_chunks(&core, &mut pending);
+                    }
+                }
+            }
+            None => match rx.recv().await {
+                Some(sig) => handle_signal(&core, &mut pending, sig).await,
+                None => break,
+            },
+        }
+    }
+    let remaining: Vec<String> = pending.keys().cloned().collect();
+    for wid in remaining {
+        flush_worker_chunk(&core, &mut pending, &wid);
     }
 }
 
-async fn handle_signal(core: &Arc<Core>, sig: PoolSignal) {
+async fn handle_signal(core: &Arc<Core>, pending: &mut HashMap<String, PendingTextChunk>, sig: PoolSignal) {
     match sig {
         PoolSignal::Transcript { worker_id, entry } => {
-            let is_tool_done = matches!(
-                &entry,
-                Entry::ToolCall { status, .. } if status == "completed" || status == "failed"
-            );
             let worker_snap = core.drove.store.get_worker(&worker_id);
             let attempt_id = worker_snap.as_ref().and_then(|w| w.current_attempt_id.clone());
-            record_transcript_item(core, &worker_id, attempt_id.clone(), entry);
-            let _ = core.drove.store.update_worker(&worker_id, |w| w.last_active_at = now_iso());
-            if is_tool_done && let (Some(w), Some(aid)) = (worker_snap, attempt_id) {
-                maybe_detect_spinning_loop(core, &w, &aid).await;
+            core.drove.store.touch_worker_active(&worker_id);
+
+            match entry {
+                Entry::Assistant { text, .. } if !text.is_empty() => {
+                    enqueue_text_chunk(core, pending, &worker_id, attempt_id, "assistant", text);
+                }
+                Entry::Thought { text, .. } if !text.is_empty() => {
+                    enqueue_text_chunk(core, pending, &worker_id, attempt_id, "thought", text);
+                }
+                other => {
+                    flush_worker_chunk(core, pending, &worker_id);
+                    let is_tool_done = matches!(
+                        &other,
+                        Entry::ToolCall { status, .. } if status == "completed" || status == "failed"
+                    );
+                    record_transcript_item(core, &worker_id, attempt_id.clone(), other);
+                    if is_tool_done
+                        && let (Some(w), Some(aid)) = (worker_snap, attempt_id)
+                    {
+                        maybe_detect_spinning_loop(core, &w, &aid).await;
+                    }
+                }
             }
         }
-        PoolSignal::TurnFinished { worker_id, agent_id, error, usage } => {
-            if let Some(u) = usage {
-                let _ = core.drove.store.update_worker(&worker_id, |w| {
-                    w.context = WorkerContext { used: u.used, size: u.size };
-                    w.last_active_at = now_iso();
-                });
-            }
+        PoolSignal::UsageUpdated { worker_id, usage, detail } => {
+            apply_worker_usage(core, &worker_id, usage, detail);
+        }
+        PoolSignal::TurnFinished { worker_id, agent_id, turn_num, error, usage, detail } => {
+            flush_worker_chunk(core, pending, &worker_id);
+            apply_worker_usage(core, &worker_id, usage, detail);
             let Some(worker) = core.drove.store.get_worker(&worker_id) else {
                 return;
             };
             let Some(attempt_id) = worker.current_attempt_id.clone() else {
                 return;
             };
+            let min_turn = core.drove.get_attempt_min_turn(&attempt_id);
+            if turn_num < min_turn {
+                return;
+            }
             let Some(attempt) = core.drove.store.get_attempt(&attempt_id) else {
                 return;
             };
@@ -115,6 +216,7 @@ async fn handle_signal(core: &Arc<Core>, sig: PoolSignal) {
             .await;
         }
         PoolSignal::AgentExited { worker_id, agent_id: _, reason } => {
+            flush_worker_chunk(core, pending, &worker_id);
             let Some(worker) = core.drove.store.get_worker(&worker_id) else {
                 return;
             };
@@ -201,10 +303,153 @@ async fn handle_signal(core: &Arc<Core>, sig: PoolSignal) {
             }
         }
         PoolSignal::WorkerTrashed { worker_id } => {
+            flush_worker_chunk(core, pending, &worker_id);
             let _ = stop_worker(core, &worker_id).await;
             core.drove.wake_scheduler();
         }
     }
+}
+
+fn enqueue_text_chunk(
+    core: &Core,
+    pending: &mut HashMap<String, PendingTextChunk>,
+    worker_id: &str,
+    attempt_id: Option<String>,
+    kind: &'static str,
+    text: String,
+) {
+    let should_flush_prev =
+        pending.get(worker_id).is_some_and(|cur| cur.kind != kind || cur.attempt_id != attempt_id);
+    if should_flush_prev {
+        flush_worker_chunk(core, pending, worker_id);
+    }
+    let flush_now = if let Some(cur) = pending.get_mut(worker_id) {
+        cur.text.push_str(&text);
+        cur.text.len() >= COALESCE_MAX_BYTES || cur.first_at.elapsed() >= COALESCE_WINDOW
+    } else {
+        let len = text.len();
+        pending.insert(
+            worker_id.to_string(),
+            PendingTextChunk { attempt_id, kind, text, first_at: Instant::now() },
+        );
+        len >= COALESCE_MAX_BYTES
+    };
+    if flush_now {
+        flush_worker_chunk(core, pending, worker_id);
+    }
+}
+
+fn apply_worker_usage(
+    core: &Core,
+    worker_id: &str,
+    usage: Option<AcpContextUsage>,
+    detail: Option<AcpUsageDetail>,
+) {
+    let ctx = usage.or_else(|| detail.and_then(|d| d.context));
+    let Some(worker) = core.drove.store.get_worker(worker_id) else {
+        return;
+    };
+
+    let explicit_input = detail.map_or(0, |d| d.input);
+    let explicit_output = detail.map_or(0, |d| d.output);
+    let explicit_cache = detail.map_or(0, |d| d.cache_read);
+    let has_explicit_tokens = explicit_input > 0 || explicit_output > 0 || explicit_cache > 0;
+    let delta_cost = detail.and_then(|d| d.cost).filter(|c| c.is_finite() && *c > 0.0);
+
+    let ctx_delta = ctx
+        .map(|u| core.drove.advance_worker_usage_watermark(worker_id, u.used))
+        .unwrap_or(0);
+
+    let target_attempt_id = worker
+        .current_attempt_id
+        .clone()
+        .or_else(|| core.drove.get_worker_last_attempt(worker_id));
+
+    let mut attempt_changed = false;
+    if let Some(att_id) = target_attempt_id
+        && (has_explicit_tokens || ctx_delta > 0 || delta_cost.is_some())
+    {
+        if core
+            .drove
+            .store
+            .update_attempt(&att_id, |a| {
+                if has_explicit_tokens {
+                    a.tokens.input = a.tokens.input.saturating_add(explicit_input);
+                    a.tokens.output = a.tokens.output.saturating_add(explicit_output);
+                    a.tokens.cache_read = a.tokens.cache_read.saturating_add(explicit_cache);
+                    if let Some(est) = a.estimated.as_mut() {
+                        est.tokens = None;
+                        if est.cost.is_none() {
+                            a.estimated = None;
+                        }
+                    }
+                } else if ctx_delta > 0 {
+                    let had_exact =
+                        (a.tokens.input > 0 || a.tokens.output > 0 || a.tokens.cache_read > 0)
+                            && a.estimated.as_ref().and_then(|e| e.tokens) != Some(true);
+                    if !had_exact {
+                        a.tokens.input = a.tokens.input.saturating_add(ctx_delta);
+                        let est = a.estimated.get_or_insert_with(UsageEstimate::default);
+                        est.tokens = Some(true);
+                    }
+                }
+                if let Some(c) = delta_cost {
+                    a.cost = Some(a.cost.unwrap_or(0.0) + c);
+                }
+            })
+            .is_some()
+        {
+            attempt_changed = true;
+        }
+    }
+
+    let ctx_changed = ctx.is_some_and(|u| u.used != worker.context.used || u.size != worker.context.size);
+    if !ctx_changed && !attempt_changed {
+        return;
+    }
+
+    let (total_tokens, total_cost, any_est_tokens, any_est_cost) = if attempt_changed {
+        let attempts = core.drove.store.list_attempts(None, None, Some(worker_id));
+        let mut toks = 0u64;
+        let mut cost = 0.0f64;
+        let mut est_t = false;
+        let mut est_c = false;
+        for a in &attempts {
+            toks = toks.saturating_add(a.tokens.input + a.tokens.output + a.tokens.cache_read);
+            cost += a.cost.unwrap_or(0.0);
+            if a.estimated.as_ref().and_then(|e| e.tokens) == Some(true) {
+                est_t = true;
+            }
+            if a.estimated.as_ref().and_then(|e| e.cost) == Some(true) {
+                est_c = true;
+            }
+        }
+        (Some(toks), Some(cost), est_t, est_c)
+    } else {
+        (None, None, false, false)
+    };
+
+    let _ = core.drove.store.update_worker(worker_id, |w| {
+        if let Some(u) = ctx {
+            w.context = WorkerContext { used: u.used, size: u.size };
+        }
+        if let Some(toks) = total_tokens {
+            w.totals.tokens = toks;
+        }
+        if let Some(c) = total_cost {
+            w.totals.cost = c;
+        }
+        if attempt_changed {
+            w.totals.estimated = if any_est_tokens || any_est_cost {
+                Some(UsageEstimate {
+                    tokens: any_est_tokens.then_some(true),
+                    cost: any_est_cost.then_some(true),
+                })
+            } else {
+                None
+            };
+        }
+    });
 }
 
 async fn finish_unsettled_attempt(
@@ -344,7 +589,10 @@ pub async fn dispatch_agent_task(
         warm.effort = Some(decision.effort);
         warm.fast = (decision.fast || decision.agent == "codex").then_some(decision.fast);
         warm.totals.attempts += 1;
-        if let Some(src_agent) = &forked_from_agent {
+        let effective_fork = forked_from_agent
+            .clone()
+            .filter(|src| warm.h2_agent.as_deref() != Some(src.as_str()) && src != &warm.id);
+        if let Some(src_agent) = &effective_fork {
             warm.forked_from = Some(src_agent.clone());
         }
         update_fingerprint(&mut warm.fingerprint, task);
@@ -352,6 +600,7 @@ pub async fn dispatch_agent_task(
 
         let attempt = build_attempt_record(&attempt_id, run, task, &warm.id, &decision, true, retry_of, hint.clone());
         core.drove.store.insert_attempt(attempt.clone());
+        core.drove.set_worker_last_attempt(&warm.id, &attempt_id);
         core.drove.record_attempt_baseline(&attempt_id, baseline);
         let preserved_source = next_assign_source(task);
         core.drove.store.update_task(&task.id, |t| {
@@ -366,7 +615,7 @@ pub async fn dispatch_agent_task(
                 reason: Some(decision.reason.clone()),
                 source: preserved_source.clone(),
                 role: Some(decision.role.clone()),
-                fork: forked_from_agent.clone(),
+                fork: effective_fork.clone(),
             });
         });
 
@@ -380,6 +629,18 @@ pub async fn dispatch_agent_task(
             hint.as_deref(),
             prior_handover.as_ref(),
         );
+        // Record the minimum ACP turn number that belongs to this new attempt BEFORE enqueuing
+        // so any trailing `TurnFinished` from the prior attempt's turn is ignored.
+        let min_turn = {
+            let st = core.lock();
+            let base = st.reg.agents.get(&aid).map_or(0, |a| {
+                let in_flight = u64::from(a.status.as_ref().is_some_and(|s| s.state == "working"));
+                a.turn + in_flight
+            });
+            let queued = st.inboxes.get(&aid).map_or(0, |q| q.len() as u64);
+            base + queued + 1
+        };
+        core.drove.set_attempt_min_turn(&attempt_id, min_turn);
         if let Err(e) = core.send(aid, &prompt, false, None, Some("drove")).await {
             let err_msg = e.message;
             mark_worker_idle(core, &warm.id);
@@ -449,6 +710,7 @@ pub async fn dispatch_agent_task(
 
     let attempt = build_attempt_record(&attempt_id, run, task, &worker_id, &decision, false, retry_of, hint.clone());
     core.drove.store.insert_attempt(attempt.clone());
+    core.drove.set_worker_last_attempt(&worker_id, &attempt_id);
     core.drove.record_attempt_baseline(&attempt_id, baseline);
     let preserved_source = next_assign_source(task);
     core.drove.store.update_task(&task.id, |t| {
@@ -604,6 +866,7 @@ pub async fn stop_worker(core: &Arc<Core>, worker_id: &str) -> Option<Worker> {
         core.kill(&[aid]).await;
     }
     core.drove.remove_worker_token(worker_id);
+    core.drove.clear_worker_runtime_state(worker_id);
 
     if let Some(att) = open_att {
         let ended = now_iso();
@@ -826,6 +1089,82 @@ pub async fn close_run_for_coordinator(core: &Arc<Core>, run: &Run) {
     core.drove.wake_scheduler();
 }
 
+fn is_generic_tool_title(title: &str) -> bool {
+    let trimmed = title.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let low = trimmed.to_ascii_lowercase();
+    matches!(
+        low.as_str(),
+        "read"
+            | "read_file"
+            | "read file"
+            | "view"
+            | "view_file"
+            | "cat"
+            | "bash"
+            | "shell"
+            | "terminal"
+            | "run"
+            | "run_command"
+            | "run command"
+            | "execute"
+            | "exec"
+            | "edit"
+            | "edit_file"
+            | "edit file"
+            | "write"
+            | "write_file"
+            | "write file"
+            | "search"
+            | "grep"
+            | "glob"
+            | "find"
+            | "list"
+            | "list_dir"
+            | "ls"
+            | "fetch"
+    )
+}
+
+fn is_readonly_tool_kind(kind: &str) -> bool {
+    matches!(
+        kind.trim().to_ascii_lowercase().as_str(),
+        "read" | "search" | "grep" | "glob" | "find" | "list" | "view" | "fetch"
+    )
+}
+
+/// Deduplicates streaming `tool_call` / `tool_call_update` items by `tool.id` (preserving completion
+/// order and keeping the latest status per unique tool invocation).
+fn collect_distinct_finished_tools(items: &[Item]) -> Vec<&ItemTool> {
+    let mut latest_idx: HashMap<&str, usize> = HashMap::new();
+    let mut seq_tools: Vec<Option<&ItemTool>> = Vec::new();
+    for it in items {
+        if it.kind != "tool" {
+            continue;
+        }
+        let Some(tl) = it.tool.as_ref() else {
+            continue;
+        };
+        let status = tl.status.as_deref().unwrap_or("").to_ascii_lowercase();
+        if !matches!(status.as_str(), "completed" | "failed" | "error") {
+            continue;
+        }
+        if tl.id.is_empty() {
+            seq_tools.push(Some(tl));
+        } else if let Some(&prev) = latest_idx.get(tl.id.as_str()) {
+            seq_tools[prev] = None;
+            latest_idx.insert(tl.id.as_str(), seq_tools.len());
+            seq_tools.push(Some(tl));
+        } else {
+            latest_idx.insert(tl.id.as_str(), seq_tools.len());
+            seq_tools.push(Some(tl));
+        }
+    }
+    seq_tools.into_iter().flatten().collect()
+}
+
 async fn maybe_detect_spinning_loop(core: &Arc<Core>, worker: &Worker, attempt_id: &str) {
     let cfg = core.drove.config_snapshot();
     if !cfg.ai.enabled || cfg.ai.loop_detect == "off" {
@@ -837,31 +1176,48 @@ async fn maybe_detect_spinning_loop(core: &Arc<Core>, worker: &Worker, attempt_i
     if att.outcome.is_some() || att.ended_at.is_some() || att.spinning_detected_at.is_some() {
         return;
     }
-    let items = core.drove.store.list_items(&worker.id, Some(attempt_id), None, 32);
-    let recent_tools: Vec<(&str, &str)> = items
+    let now_ms = super::now_ms_u64();
+    let elapsed_sec = parse_iso_ms(&att.started_at).map_or(0, |s| now_ms.saturating_sub(s) / 1000);
+    if elapsed_sec < MIN_LOOP_DETECT_ELAPSED_SEC {
+        return;
+    }
+
+    let items = core.drove.store.list_items(&worker.id, Some(attempt_id), None, 64);
+    let distinct_tools = collect_distinct_finished_tools(&items);
+    let recent_tools: Vec<(&str, &str, bool)> = distinct_tools
         .iter()
-        .filter(|it| it.kind == "tool")
-        .filter_map(|it| it.tool.as_ref())
-        .map(|tl| (tl.kind.as_deref().unwrap_or(""), tl.title.as_deref().unwrap_or("").trim()))
-        .filter(|(_, title)| !title.is_empty())
+        .map(|tl| {
+            let kind = tl.kind.as_deref().unwrap_or("");
+            let title = tl.title.as_deref().unwrap_or("").trim();
+            let failed = matches!(
+                tl.status.as_deref().unwrap_or("").to_ascii_lowercase().as_str(),
+                "failed" | "error"
+            );
+            (kind, title, failed)
+        })
+        .filter(|(_, title, _)| !title.is_empty())
         .collect();
 
-    // Stage 1 (0ms exact rule): 5 consecutive identical `(kind, title)` tool calls.
-    if recent_tools.len() >= 5 {
-        let tail = &recent_tools[recent_tools.len() - 5..];
-        let first = tail[0];
-        if tail.iter().all(|pair| *pair == first) {
+    // Stage 1 (0ms exact rule): 6 consecutive identical distinct tool calls with either a
+    // specific non-generic title (non-readonly) or repeated failures.
+    if recent_tools.len() >= 6 {
+        let tail = &recent_tools[recent_tools.len() - 6..];
+        let (first_kind, first_title, _) = tail[0];
+        let all_same = tail.iter().all(|(k, t, _)| *k == first_kind && *t == first_title);
+        let any_failed = tail.iter().any(|(_, _, f)| *f);
+        let meaningful = any_failed || (!is_generic_tool_title(first_title) && !is_readonly_tool_kind(first_kind));
+        if all_same && meaningful {
             trigger_loop_detection(
                 core,
                 worker,
                 &att,
                 &cfg.ai.loop_detect,
-                format!("Repeated tool `{}` 5 times", first.1),
+                format!("Repeated tool `{}` 6 times", first_title),
                 format!(
-                    "[drove loop-detect] You repeated identical tool call `{}` 5 times. \
+                    "[drove loop-detect] You repeated identical tool call `{}` 6 times. \
                      Stop repeating it, verify current workspace state, and take a different concrete step \
                      or call `h2 drove worker ask` / `h2 drove worker done --outcome failed`.",
-                    first.1
+                    first_title
                 ),
             )
             .await;
@@ -869,9 +1225,15 @@ async fn maybe_detect_spinning_loop(core: &Arc<Core>, worker: &Worker, attempt_i
         }
     }
 
-    // Stage 2 (incremental multi-turn semantic oscillation audit via AiSessionPool):
-    // Trigger only when >= 8 tools ran, >= 4 new tools arrived since watermark, and oscillation signals appear.
-    if recent_tools.len() < 8 || !core.ai.is_configured() || core.ai.is_circuit_open() {
+    // Stage 2 (incremental semantic oscillation audit via AiSessionPool):
+    // Require >= 120s elapsed, >= 12 distinct finished tool calls, >= 8 new calls since watermark,
+    // per-attempt cooldown & call cap, and concrete oscillation/failure evidence.
+    if elapsed_sec < MIN_SEMANTIC_LOOP_ELAPSED_SEC
+        || recent_tools.len() < 12
+        || !core.ai.is_configured()
+        || core.ai.is_circuit_open()
+        || !core.drove.can_run_loop_audit(attempt_id, SEMANTIC_LOOP_COOLDOWN, SEMANTIC_LOOP_MAX_CHECKS)
+    {
         return;
     }
     let prev_wm = core.drove.get_loop_watermark(attempt_id);
@@ -880,16 +1242,22 @@ async fn maybe_detect_spinning_loop(core: &Arc<Core>, worker: &Worker, attempt_i
         return;
     }
     let delta_items: Vec<Item> = items.iter().filter(|it| it.id > prev_wm).cloned().collect();
-    let delta_tool_count = delta_items.iter().filter(|it| it.kind == "tool").count();
-    if prev_wm > 0 && delta_tool_count < 4 {
+    let delta_distinct_tools = collect_distinct_finished_tools(&delta_items).len();
+    if prev_wm > 0 && delta_distinct_tools < 8 {
         return;
     }
 
-    let tail10 = &recent_tools[recent_tools.len().saturating_sub(10)..];
-    let unique_tools: std::collections::HashSet<(&str, &str)> = tail10.iter().copied().collect();
-    let oscillation_signal = unique_tools.len() <= 3
-        || has_repeated_edit_failure_pattern(&items)
-        || (recent_tools.len() >= 12 && recent_tools.len() % 12 < 4);
+    let tail12 = &recent_tools[recent_tools.len().saturating_sub(12)..];
+    let failed_in_tail = tail12.iter().filter(|(_, _, f)| *f).count();
+    let specific_tail: Vec<(&str, &str)> = tail12
+        .iter()
+        .filter(|(k, t, f)| *f || (!is_generic_tool_title(t) && !is_readonly_tool_kind(k)))
+        .map(|(k, t, _)| (*k, *t))
+        .collect();
+    let unique_specific: std::collections::HashSet<(&str, &str)> = specific_tail.iter().copied().collect();
+    let ping_pong_signal = specific_tail.len() >= 10 && unique_specific.len() <= 2;
+    let oscillation_signal =
+        failed_in_tail >= 3 || has_repeated_edit_failure_pattern(&distinct_tools) || ping_pong_signal;
     if !oscillation_signal {
         return;
     }
@@ -898,6 +1266,7 @@ async fn maybe_detect_spinning_loop(core: &Arc<Core>, worker: &Worker, attempt_i
         return;
     };
     core.drove.set_loop_watermark(attempt_id, max_id);
+    core.drove.record_loop_audit_run(attempt_id);
 
     let Some(verdict) = super::ai::detect_semantic_loop(core, &att.run_id, attempt_id, &task, &delta_items).await
     else {
@@ -924,28 +1293,26 @@ async fn maybe_detect_spinning_loop(core: &Arc<Core>, worker: &Worker, attempt_i
     trigger_loop_detection(core, worker, &att, &cfg.ai.loop_detect, detail, steer_msg).await;
 }
 
-fn has_repeated_edit_failure_pattern(items: &[Item]) -> bool {
+fn has_repeated_edit_failure_pattern(distinct_tools: &[&ItemTool]) -> bool {
     let mut edit_paths: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     let mut failed_cmds = 0usize;
-    for it in items.iter().rev().take(16) {
-        if let Some(tl) = &it.tool {
-            let k = tl.kind.as_deref().unwrap_or("").to_ascii_lowercase();
-            let st = tl.status.as_deref().unwrap_or("").to_ascii_lowercase();
-            if st == "failed" || st == "error" {
-                failed_cmds += 1;
-            }
-            if matches!(k.as_str(), "edit" | "write" | "modify") {
-                if let Some(locs) = &tl.locations {
-                    for loc in locs {
-                        *edit_paths.entry(loc.as_str()).or_default() += 1;
-                    }
-                } else if let Some(title) = tl.title.as_deref() {
-                    *edit_paths.entry(title).or_default() += 1;
+    for tl in distinct_tools.iter().rev().take(16) {
+        let k = tl.kind.as_deref().unwrap_or("").to_ascii_lowercase();
+        let st = tl.status.as_deref().unwrap_or("").to_ascii_lowercase();
+        if st == "failed" || st == "error" {
+            failed_cmds += 1;
+        }
+        if matches!(k.as_str(), "edit" | "write" | "modify") {
+            if let Some(locs) = &tl.locations {
+                for loc in locs {
+                    *edit_paths.entry(loc.as_str()).or_default() += 1;
                 }
+            } else if let Some(title) = tl.title.as_deref().filter(|t| !is_generic_tool_title(t)) {
+                *edit_paths.entry(title).or_default() += 1;
             }
         }
     }
-    edit_paths.values().any(|&n| n >= 3) && failed_cmds >= 2
+    edit_paths.values().any(|&n| n >= 3) && failed_cmds >= 3
 }
 
 async fn trigger_loop_detection(
@@ -1119,7 +1486,7 @@ async fn build_attempt_handover(
             return None;
         }
         let max_turn = entries.iter().filter_map(Entry::turn).max().unwrap_or(0);
-        let from_turn = (max_turn > 4).then_some(max_turn - 3);
+        let from_turn = (max_turn > 4).then(|| max_turn.saturating_sub(3));
         let pkg = crate::handoff::build_handoff_package(&crate::handoff::HandoffBuildInput {
             kind: crate::handoff::LineageKind::Handoff,
             source_address: addr,
@@ -1338,22 +1705,26 @@ pub async fn handle_task_failure(
     max_retries: u32,
 ) {
     let cfg = core.drove.config_snapshot();
-    let effective_max_retries = core
-        .drove
-        .store
-        .get_task(task_id)
-        .map(|t| {
-            let role_name = t
-                .assign
-                .as_ref()
-                .and_then(|a| a.role.as_deref())
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or("coder");
-            let chain_len = super::config::resolve_role_config(&cfg, role_name).map_or(1, |r| 1 + r.fallbacks.len());
-            max_retries.max(chain_len.saturating_sub(1) as u32).min(8)
-        })
-        .unwrap_or(max_retries);
+    let effective_max_retries = if max_retries == 0 {
+        0
+    } else {
+        core.drove
+            .store
+            .get_task(task_id)
+            .map(|t| {
+                let role_name = t
+                    .assign
+                    .as_ref()
+                    .and_then(|a| a.role.as_deref())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("coder");
+                let chain_len =
+                    super::config::resolve_role_config(&cfg, role_name).map_or(1, |r| 1 + r.fallbacks.len());
+                max_retries.max(chain_len.saturating_sub(1) as u32).min(8)
+            })
+            .unwrap_or(max_retries)
+    };
 
     let mut should_notify = false;
     let updated_task = core.drove.store.update_task(task_id, |t| {
@@ -1369,6 +1740,16 @@ pub async fn handle_task_failure(
         }
     });
     if should_notify && let (Some(run), Some(task)) = (core.drove.store.get_run(run_id), updated_task) {
+        // Propagate terminal failure to pending `AllSuccess` dependents immediately so `drove wait`
+        // wakes up with a consistent settled/skipped task graph.
+        for _ in 0..8 {
+            let before = core.drove.store.list_tasks(run_id);
+            super::scheduler::promote_pending_tasks(core, &before);
+            let after = core.drove.store.list_tasks(run_id);
+            if before.iter().map(|t| t.status).eq(after.iter().map(|t| t.status)) {
+                break;
+            }
+        }
         let _ = core.drove.store.post_message(super::store::PostMessageInput {
             run_id: run.id.clone(),
             kind: MessageType::Failed,
@@ -1435,4 +1816,68 @@ pub(super) fn inject_drove_path_env(env: &mut BTreeMap<String, String>) {
 /// Simple token store helpers used across worker endpoints.
 pub fn build_token_map() -> HashMap<String, String> {
     HashMap::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_tool_item(id: u64, tool_id: &str, kind: &str, title: &str, status: &str) -> Item {
+        Item {
+            id,
+            worker_id: "wrk_1".into(),
+            attempt_id: Some("att_1".into()),
+            ts: now_iso(),
+            kind: "tool".into(),
+            text: None,
+            tool: Some(ItemTool {
+                id: tool_id.into(),
+                title: Some(title.into()),
+                kind: Some(kind.into()),
+                status: Some(status.into()),
+                locations: None,
+                input: None,
+                output: None,
+            }),
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn distinct_finished_tools_deduplicates_streaming_updates() {
+        let items = vec![
+            mk_tool_item(1, "tc_1", "execute", "cargo test", "pending"),
+            mk_tool_item(2, "tc_1", "execute", "cargo test", "in_progress"),
+            mk_tool_item(3, "tc_1", "execute", "cargo test", "completed"),
+            mk_tool_item(4, "tc_2", "read", "Read", "completed"),
+            mk_tool_item(5, "tc_1", "execute", "cargo test", "completed"),
+        ];
+        let distinct = collect_distinct_finished_tools(&items);
+        assert_eq!(distinct.len(), 2);
+        assert_eq!(distinct[0].id, "tc_2");
+        assert_eq!(distinct[1].id, "tc_1");
+        assert!(is_generic_tool_title("Read"));
+        assert!(is_generic_tool_title("bash"));
+        assert!(!is_generic_tool_title("cargo test --package herdr2"));
+    }
+
+    #[test]
+    fn worker_usage_watermark_accumulates_deltas_without_double_counting() {
+        let dir = std::env::temp_dir().join(format!("herdr2-pool-test-{}", super::super::crypto::rand_id("t")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = crate::paths::Paths {
+            state: dir.clone(),
+            config: dir.join("config.toml"),
+            socket: dir.join("core.sock"),
+            holder_socket: dir.join("core.holder.sock"),
+        };
+        let ai = crate::ai::AiRuntime::open(&paths).unwrap();
+        let drove = super::super::DroveRuntime::open(&paths, ai).unwrap();
+
+        assert_eq!(drove.advance_worker_usage_watermark("wrk_1", 10_000), 10_000);
+        assert_eq!(drove.advance_worker_usage_watermark("wrk_1", 10_000), 0);
+        assert_eq!(drove.advance_worker_usage_watermark("wrk_1", 25_000), 15_000);
+        // Compaction / session reset drops used tokens below watermark: count new usage cleanly.
+        assert_eq!(drove.advance_worker_usage_watermark("wrk_1", 4_000), 4_000);
+    }
 }

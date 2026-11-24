@@ -403,6 +403,7 @@ fn expand_foreach_from(core: &Arc<Core>, run: &Run, tasks: &[Task]) {
                 review: tpl.review.clone(),
                 cache: tpl.cache.clone(),
                 cached_from: None,
+                retry_on_worker_reported: tpl.retry_on_worker_reported,
             });
         }
         let _ = core.drove.store.update_task(&tpl.id, |t| {
@@ -426,7 +427,7 @@ fn extract_foreach_array(task: &Task, path: Option<&str>) -> Option<Vec<Value>> 
     target.as_array().cloned()
 }
 
-fn promote_pending_tasks(core: &Arc<Core>, tasks: &[Task]) {
+pub(super) fn promote_pending_tasks(core: &Arc<Core>, tasks: &[Task]) {
     for task in tasks {
         if task.status != TaskStatus::Pending || task.template == Some(true) {
             continue;

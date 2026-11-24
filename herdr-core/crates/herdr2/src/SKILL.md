@@ -3,7 +3,8 @@
 `h2` (`herdr2`) combines real Ghostty/PTY workspace terminals (`t1`, `t2`, ...) for human interactive sessions with a headless ACP (Agent Client Protocol) orchestration runtime (`a1`, `a2`, ...) for subordinate agents. Called ACP sub-agents receive `terminal: false` and `fs: false` capabilities, zero PTYs, and zero terminal environment variables (`TERM`, `COLORTERM`, `TERM_PROGRAM` are omitted), and open no terminal panes in `Herdr2`.
 
 - Inside an ACP sub-agent, `$H2_AGENT_ID` holds your address (`a1`, `a7`, ...) and `$H2_AGENT_SOCKET` points to the daemon socket. Inside a workspace PTY terminal, `$H2_TERMINAL_ID` holds `t1`, ... and `$H2_TERMINAL_SOCKET` points to the same socket, so launching `h2 run` or `h2 mcp` from a workspace automatically parents child ACP sub-agents to that terminal.
-- Agents you launch default to becoming your children (they receive `<h2>` tags on inter-agent messages and exit with you unless `--outlive-parent` is passed).
+- Agents you launch default to becoming your children (they receive `<h2>` tags on inter-agent messages and exit automatically when you exit or are closed unless `--outlive-parent` is passed).
+- **Keep & reuse warm sub-agents (do NOT `h2 kill` after a task)**: Healthy ACP sub-agents stay idle after completing a turn and preserve their loaded repo context and prompt/KV cache. Before calling `h2 run`, check `h2 ls` and reuse an existing idle child via `h2 send <name> "..."` for related follow-up tasks (saves input tokens and cold-start overhead). Never `h2 kill` a healthy sub-agent just because a turn finished — let it stay warm until you (its parent) close, and only `h2 kill` if a child is stuck/broken, context-bloated on an unrelated task, or explicitly requested by the user.
 - Piped output is JSON except `run` (waited), `exec`, `read`, and `file read` (text unless `--json`).
 - Run `h2 --help` for commands or `h2 <command> --help` for exact flags.
 
@@ -60,7 +61,7 @@ h2 read worker --wait --last            # wait for current turn to settle, then 
 h2 handoff worker --kind handoff --preset codex --prompt "Finish tests" # cross-provider context handoff
 h2 handoff worker --kind side-chat --into main --prompt "Merge back"    # merge/deliver context into existing target
 h2 interrupt worker                     # send ACP session/cancel without killing process
-h2 kill worker                          # terminate an ACP agent process
+h2 kill worker                          # ONLY when stuck/broken or requested; do NOT kill healthy idle sub-agents after a task (reuse via `h2 send`; they auto-exit when parent closes)
 h2 rm worker                            # remove a finished agent record
 h2 keep worker [--off]                  # resume crashed/restarted agent via session/load
 h2 label worker env=staging             # set or clear labels (`env=` removes)

@@ -178,7 +178,6 @@ pub fn status() -> serde_json::Value {
             "updates": app_checks,
         },
         "ui": crate::ui_update::info(),
-        "notes": crate::update_notes::notes(ready().as_deref()),
         "core": core(),
         "checked": *CHECKED.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
         "checks": any_checks,
@@ -397,12 +396,6 @@ fn check_from(root: &Path, releases: &str) -> Result<Option<String>, String> {
     let version = manifest["version"].as_str().ok_or(format!("{path}: no version"))?;
     if !newer(version, env!("CARGO_PKG_VERSION")) {
         return Ok(None);
-    }
-    // Notes are optional: a missing feed must never hold up the update.
-    if !crate::update_notes::has(version)
-        && let Ok(text) = curl_text(&format!("{releases}/app/{version}/changelog.md"))
-    {
-        crate::update_notes::cache(&text);
     }
     let staged = beside(root, ".new");
     if staged_version(root).as_deref() == Some(version) {

@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -77,6 +77,8 @@ pub struct TargetCheckpoints {
     pub active_turn_prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub active_turn_num: Option<u64>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pre_turn_refs: BTreeMap<u64, String>,
     #[serde(default)]
     pub checkpoints: Vec<CheckpointMeta>,
 }
@@ -163,6 +165,11 @@ pub fn slug_segment(raw: &str) -> String {
 /// Builds the hidden checkpoint ref name for `<session_slug>/<addr>/<turn>`.
 pub fn checkpoint_ref(session_slug: &str, addr: &str, turn: u64) -> String {
     format!("refs/herdr2/checkpoints/{}/{}/{}", slug_segment(session_slug), slug_segment(addr), turn)
+}
+
+/// Builds the hidden pre-turn baseline ref name for `<session_slug>/<addr>/pre-<turn>`.
+pub fn pre_turn_checkpoint_ref(session_slug: &str, addr: &str, turn: u64) -> String {
+    format!("refs/herdr2/checkpoints/{}/{}/pre-{}", slug_segment(session_slug), slug_segment(addr), turn)
 }
 
 /// Prefix under `refs/herdr2/checkpoints/` owning all snapshots for a target.
@@ -920,7 +927,7 @@ where
     for line in text.lines() {
         let r = line.trim();
         if let Some(turn_str) = r.strip_prefix(&prefix)
-            && let Ok(turn) = turn_str.parse::<u64>()
+            && let Ok(turn) = turn_str.strip_prefix("pre-").unwrap_or(turn_str).parse::<u64>()
             && pred(turn)
         {
             stdin.push_str("delete ");
@@ -1023,8 +1030,9 @@ pub async fn capture_target_checkpoint_with_session_turn(
             core.save_target_checkpoints(&mut st, tc.clone());
         }
         let ref_owner = tc.ref_namespace.clone().unwrap_or_else(|| addr.clone());
-        let prev_ref =
-            tc.checkpoints.iter().filter(|c| c.turn < ckpt_turn).max_by_key(|c| c.turn).map(|c| c.ref_name.clone());
+        let prev_ref = tc.pre_turn_refs.get(&ckpt_turn).cloned().or_else(|| {
+            tc.checkpoints.iter().filter(|c| c.turn < ckpt_turn).max_by_key(|c| c.turn).map(|c| c.ref_name.clone())
+        });
         let effective_prompt = prompt.or_else(|| (ckpt_turn > 0).then(|| tc.active_turn_prompt.clone()).flatten());
         (addr, cwd, ckpt_turn, prev_ref, effective_prompt, core.session_slug(), ref_owner)
     };
@@ -1223,6 +1231,215 @@ pub async fn capture_target_checkpoint_with_session_turn(
                 }
             }
         });
+    }
+
+    Ok(Some(meta))
+}
+
+/// Captures a lightweight pre-turn Git snapshot right before an ACP turn starts so idle-gap edits
+/// made by other sessions or editors are never attributed to the upcoming turn's diff.
+pub async fn capture_pre_turn_baseline(
+    core: &std::sync::Arc<crate::runtime::Core>,
+    target: crate::runtime::TargetKey,
+    turn: u64,
+) -> Result<Option<String>, String> {
+    use crate::runtime::TargetKey;
+    if turn == 0 {
+        return Ok(None);
+    }
+    let (addr, cwd, session_slug, ref_owner) = {
+        let mut st = core.lock();
+        let (addr, cwd) = match target {
+            TargetKey::Agent(id) => {
+                let Some(a) = st.reg.agents.get(&id) else {
+                    return Ok(None);
+                };
+                (a.address.clone(), a.cwd.clone())
+            }
+            TargetKey::Terminal(id) => {
+                let Some(t) = st.pty_reg.terminals.get(&id) else {
+                    return Ok(None);
+                };
+                let cwd = t
+                    .foreground
+                    .as_ref()
+                    .map(|f| f.cwd.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or(t.last_cwd.as_deref())
+                    .unwrap_or(&t.cwd)
+                    .to_string();
+                (t.address.clone(), cwd)
+            }
+        };
+        let tc = core.target_checkpoints(&mut st, &addr);
+        let ref_owner = tc.ref_namespace.clone().unwrap_or_else(|| addr.clone());
+        (addr, cwd, core.session_slug(), ref_owner)
+    };
+
+    let Some(repo) = probe_repo(Path::new(&cwd)) else {
+        return Ok(None);
+    };
+    let pre_ref = pre_turn_checkpoint_ref(&session_slug, &ref_owner, turn);
+    let _ckpt_guard = core.repo_ckpt_lock(&repo.toplevel).lock_owned().await;
+    let repo_clone = repo.clone();
+    let ref_clone = pre_ref.clone();
+    tokio::task::spawn_blocking(move || capture_checkpoint(&repo_clone, &ref_clone))
+        .await
+        .map_err(|e| format!("pre-turn checkpoint task panicked: {e}"))??;
+
+    let mut st = core.lock();
+    let still_exists = match target {
+        TargetKey::Agent(id) => st.reg.agents.contains_key(&id),
+        TargetKey::Terminal(id) => st.pty_reg.terminals.contains_key(&id),
+    };
+    if !still_exists {
+        return Ok(None);
+    }
+    let mut tc = core.target_checkpoints(&mut st, &addr);
+    tc.repo_root = Some(repo.toplevel.to_string_lossy().to_string());
+    tc.pre_turn_refs.insert(turn, pre_ref.clone());
+    core.save_target_checkpoints(&mut st, tc);
+    Ok(Some(pre_ref))
+}
+
+/// Records a no-op turn checkpoint for an ACP turn that executed no file-mutating tools.
+/// Reuses the previous checkpoint commit (when present) with an empty file list so concurrent
+/// edits from other agents or editors in a shared repo are never falsely attributed to this turn.
+pub async fn capture_noop_target_checkpoint(
+    core: &std::sync::Arc<crate::runtime::Core>,
+    target: crate::runtime::TargetKey,
+    turn: u64,
+    prompt: Option<String>,
+    skip_if_present: bool,
+    record_transcript_entry: bool,
+) -> Result<Option<CheckpointMeta>, String> {
+    use crate::runtime::TargetKey;
+
+    let (addr, cwd, prev_meta, stale_pre_ref, effective_prompt, session_slug, ref_owner) = {
+        let mut st = core.lock();
+        let (addr, cwd) = match target {
+            TargetKey::Agent(id) => {
+                let Some(a) = st.reg.agents.get(&id) else {
+                    return Ok(None);
+                };
+                (a.address.clone(), a.cwd.clone())
+            }
+            TargetKey::Terminal(id) => {
+                let Some(t) = st.pty_reg.terminals.get(&id) else {
+                    return Ok(None);
+                };
+                let cwd = t
+                    .foreground
+                    .as_ref()
+                    .map(|f| f.cwd.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or(t.last_cwd.as_deref())
+                    .unwrap_or(&t.cwd)
+                    .to_string();
+                (t.address.clone(), cwd)
+            }
+        };
+        let tc = core.target_checkpoints(&mut st, &addr);
+        if skip_if_present && tc.checkpoints.iter().any(|c| c.turn == turn) {
+            return Ok(None);
+        }
+        let ref_owner = tc.ref_namespace.clone().unwrap_or_else(|| addr.clone());
+        let prev_meta = tc.checkpoints.iter().filter(|c| c.turn < turn).max_by_key(|c| c.turn).cloned();
+        let stale_pre_ref = tc.pre_turn_refs.get(&turn).cloned();
+        let effective_prompt = prompt.or_else(|| (turn > 0).then(|| tc.active_turn_prompt.clone()).flatten());
+        (addr, cwd, prev_meta, stale_pre_ref, effective_prompt, core.session_slug(), ref_owner)
+    };
+
+    let Some(repo) = probe_repo(Path::new(&cwd)) else {
+        return Ok(None);
+    };
+
+    let ref_name = checkpoint_ref(&session_slug, &ref_owner, turn);
+    let _ckpt_guard = core.repo_ckpt_lock(&repo.toplevel).lock_owned().await;
+
+    let repo_clone = repo.clone();
+    let ref_clone = ref_name.clone();
+    let (commit_oid, head_oid, ts_ms) = tokio::task::spawn_blocking(move || -> Result<_, String> {
+        if let Some(pre) = stale_pre_ref.as_deref() {
+            let _ = delete_checkpoint_ref_names(&repo_clone, &[pre.to_string()]);
+        }
+        if let Some(prev) = prev_meta
+            && let Ok(oid) = resolve_commit(&repo_clone, &prev.ref_name)
+        {
+            run_git_bytes(&repo_clone.toplevel, &["update-ref", &ref_clone, &oid], &[], None)?;
+            return Ok((oid, prev.head_oid, now_ms()));
+        }
+        capture_checkpoint(&repo_clone, &ref_clone)
+    })
+    .await
+    .map_err(|e| format!("noop checkpoint task panicked: {e}"))??;
+
+    let mut st = core.lock();
+    let still_exists = match target {
+        TargetKey::Agent(id) => st.reg.agents.contains_key(&id),
+        TargetKey::Terminal(id) => st.pty_reg.terminals.contains_key(&id),
+    };
+    if !still_exists {
+        return Ok(None);
+    }
+
+    let mut tc = core.target_checkpoints(&mut st, &addr);
+    if skip_if_present && tc.checkpoints.iter().any(|c| c.turn == turn) {
+        return Ok(None);
+    }
+    tc.pre_turn_refs.remove(&turn);
+
+    let prompt_final = if turn > 0 {
+        let p = effective_prompt.or_else(|| tc.active_turn_prompt.clone());
+        tc.active_turn_prompt = None;
+        if tc.active_turn_num == Some(turn) {
+            tc.active_turn_num = None;
+        }
+        p
+    } else {
+        None
+    };
+
+    let meta = CheckpointMeta {
+        turn,
+        session_turn: None,
+        ref_name: ref_name.clone(),
+        commit_oid: commit_oid.clone(),
+        head_oid: head_oid.clone(),
+        prompt: prompt_final,
+        label: None,
+        label_source: None,
+        files: Vec::new(),
+        ts_ms,
+    };
+
+    tc.repo_root = Some(repo.toplevel.to_string_lossy().to_string());
+    tc.checkpoints.retain(|c| c.turn != turn);
+    tc.checkpoints.push(meta.clone());
+    tc.checkpoints.sort_by_key(|c| c.turn);
+    core.save_target_checkpoints(&mut st, tc);
+
+    match target {
+        TargetKey::Agent(id) => {
+            if record_transcript_entry && turn > 0 {
+                core.record_transcript(
+                    &mut st,
+                    id,
+                    crate::transcript::Entry::Checkpoint {
+                        turn,
+                        ref_name,
+                        commit_oid,
+                        head_oid,
+                        files: Vec::new(),
+                        ts_ms,
+                    },
+                );
+            }
+            core.emit(&mut st, "checkpoint", id, serde_json::json!({ "meta": &meta }));
+        }
+        TargetKey::Terminal(id) => {
+            core.emit_pty(&mut st, "checkpoint", id, serde_json::json!({ "meta": &meta }));
+        }
     }
 
     Ok(Some(meta))

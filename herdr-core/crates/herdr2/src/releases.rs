@@ -1,4 +1,5 @@
-//! Released builds on releases.herdr.dev: the list (`core/latest.json`, or
+//! Released builds from a configured release server (`HERDR2_RELEASES_URL` or
+//! `releases_url` in config.toml): the list (`core/latest.json`, or
 //! `core/<version>/manifest.json` for one version) and its checked
 //! downloads. curl, sha256sum/shasum (Windows: its own crypto) and tar do
 //! the work: no HTTP or crypto code in h2 for something run this rarely.

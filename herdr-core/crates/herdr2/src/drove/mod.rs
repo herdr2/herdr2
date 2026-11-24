@@ -41,7 +41,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Notify, mpsc};
 
 pub const MAX_AUTO_RETRIES: u32 = 2;
@@ -82,6 +82,11 @@ pub struct DroveRuntime {
     reminded_attempts: Mutex<HashSet<String>>,
     stall_warned: Mutex<HashSet<String>>,
     loop_audit_watermark: Mutex<HashMap<String, u64>>,
+    loop_audit_last_at: Mutex<HashMap<String, Instant>>,
+    loop_audit_count: Mutex<HashMap<String, u32>>,
+    attempt_min_turn: Mutex<HashMap<String, u64>>,
+    worker_last_attempt: Mutex<HashMap<String, String>>,
+    worker_usage_watermark: Mutex<HashMap<String, u64>>,
     conflict_cache: Mutex<HashMap<String, (bool, String)>>,
     run_merge_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -164,6 +169,11 @@ impl DroveRuntime {
             reminded_attempts: Mutex::new(HashSet::new()),
             stall_warned: Mutex::new(HashSet::new()),
             loop_audit_watermark: Mutex::new(HashMap::new()),
+            loop_audit_last_at: Mutex::new(HashMap::new()),
+            loop_audit_count: Mutex::new(HashMap::new()),
+            attempt_min_turn: Mutex::new(HashMap::new()),
+            worker_last_attempt: Mutex::new(HashMap::new()),
+            worker_usage_watermark: Mutex::new(HashMap::new()),
             conflict_cache: Mutex::new(HashMap::new()),
             run_merge_locks: Mutex::new(HashMap::new()),
         }))
@@ -192,6 +202,57 @@ impl DroveRuntime {
 
     pub fn clear_loop_watermark(&self, attempt_id: &str) {
         self.loop_audit_watermark.lock().unwrap_or_else(|p| p.into_inner()).remove(attempt_id);
+        self.loop_audit_last_at.lock().unwrap_or_else(|p| p.into_inner()).remove(attempt_id);
+        self.loop_audit_count.lock().unwrap_or_else(|p| p.into_inner()).remove(attempt_id);
+        self.attempt_min_turn.lock().unwrap_or_else(|p| p.into_inner()).remove(attempt_id);
+    }
+
+    pub fn can_run_loop_audit(&self, attempt_id: &str, cooldown: Duration, max_checks: u32) -> bool {
+        let count = self.loop_audit_count.lock().unwrap_or_else(|p| p.into_inner()).get(attempt_id).copied().unwrap_or(0);
+        if count >= max_checks {
+            return false;
+        }
+        let last = self.loop_audit_last_at.lock().unwrap_or_else(|p| p.into_inner()).get(attempt_id).copied();
+        last.is_none_or(|t| t.elapsed() >= cooldown)
+    }
+
+    pub fn record_loop_audit_run(&self, attempt_id: &str) {
+        self.loop_audit_last_at.lock().unwrap_or_else(|p| p.into_inner()).insert(attempt_id.to_string(), Instant::now());
+        let mut counts = self.loop_audit_count.lock().unwrap_or_else(|p| p.into_inner());
+        *counts.entry(attempt_id.to_string()).or_insert(0) += 1;
+    }
+
+    pub fn set_attempt_min_turn(&self, attempt_id: &str, min_turn: u64) {
+        self.attempt_min_turn.lock().unwrap_or_else(|p| p.into_inner()).insert(attempt_id.to_string(), min_turn);
+    }
+
+    pub fn get_attempt_min_turn(&self, attempt_id: &str) -> u64 {
+        self.attempt_min_turn.lock().unwrap_or_else(|p| p.into_inner()).get(attempt_id).copied().unwrap_or(0)
+    }
+
+    pub fn set_worker_last_attempt(&self, worker_id: &str, attempt_id: &str) {
+        self.worker_last_attempt
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(worker_id.to_string(), attempt_id.to_string());
+    }
+
+    pub fn get_worker_last_attempt(&self, worker_id: &str) -> Option<String> {
+        self.worker_last_attempt.lock().unwrap_or_else(|p| p.into_inner()).get(worker_id).cloned()
+    }
+
+    /// Advances the per-worker cumulative context-usage watermark and returns the positive delta.
+    pub fn advance_worker_usage_watermark(&self, worker_id: &str, new_used: u64) -> u64 {
+        let mut map = self.worker_usage_watermark.lock().unwrap_or_else(|p| p.into_inner());
+        let prev = map.get(worker_id).copied().unwrap_or(0);
+        let delta = if new_used >= prev { new_used - prev } else { new_used };
+        map.insert(worker_id.to_string(), new_used);
+        delta
+    }
+
+    pub fn clear_worker_runtime_state(&self, worker_id: &str) {
+        self.worker_last_attempt.lock().unwrap_or_else(|p| p.into_inner()).remove(worker_id);
+        self.worker_usage_watermark.lock().unwrap_or_else(|p| p.into_inner()).remove(worker_id);
     }
 
     pub fn get_conflict_cached(&self, key: &str) -> Option<(bool, String)> {

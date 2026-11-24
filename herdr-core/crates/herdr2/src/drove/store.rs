@@ -11,9 +11,12 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::{Notify, broadcast};
 
 const MAX_DAEMON_EVENTS: usize = 5000;
+const WORKER_HEARTBEAT_EMIT_INTERVAL: Duration = Duration::from_secs(10);
+const ITEM_STATE_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Event broadcast on every state or item mutation for SSE and long-poll waiters.
 #[derive(Clone, Debug)]
@@ -49,6 +52,8 @@ struct StoreInner {
     items_dir: PathBuf,
     artifacts_dir: PathBuf,
     dirty: bool,
+    last_worker_touch_emit: HashMap<String, Instant>,
+    last_item_state_flush: Option<Instant>,
 }
 
 impl StoreInner {
@@ -81,6 +86,9 @@ impl StoreInner {
             if let Ok(file) = File::open(path) {
                 for line in BufReader::new(file).lines().map_while(Result::ok) {
                     if let Ok(item) = serde_json::from_str::<Item>(&line) {
+                        if item.id > self.data.next_item_id {
+                            self.data.next_item_id = item.id;
+                        }
                         loaded.push(item);
                     }
                 }
@@ -134,6 +142,7 @@ pub struct CreateTaskInput {
     pub review: Option<ReviewSpec>,
     pub cache: Option<Value>,
     pub cached_from: Option<String>,
+    pub retry_on_worker_reported: Option<bool>,
 }
 
 pub struct PostMessageInput {
@@ -192,6 +201,8 @@ impl Store {
                 items_dir: paths.items_dir.clone(),
                 artifacts_dir: paths.artifacts_dir.clone(),
                 dirty: false,
+                last_worker_touch_emit: HashMap::new(),
+                last_item_state_flush: None,
             }),
             events,
             changed: Arc::new(Notify::new()),
@@ -395,6 +406,7 @@ impl Store {
             candidate_result: None,
             cache: input.cache,
             cached_from: input.cached_from,
+            retry_on_worker_reported: input.retry_on_worker_reported,
         };
         {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -445,7 +457,8 @@ impl Store {
             .cloned()
     }
 
-    pub fn insert_worker(&self, worker: Worker) -> Worker {
+    pub fn insert_worker(&self, mut worker: Worker) -> Worker {
+        sanitize_worker_forked_from(&mut worker, None);
         {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             g.data.workers.insert(worker.id.clone(), worker.clone());
@@ -460,7 +473,9 @@ impl Store {
         let updated = {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let worker = g.data.workers.get_mut(id)?;
+            let prev_fork = worker.forked_from.clone();
             f(worker);
+            sanitize_worker_forked_from(worker, prev_fork.as_deref());
             worker.last_active_at = now_iso();
             let cloned = worker.clone();
             g.dirty = true;
@@ -469,6 +484,36 @@ impl Store {
         };
         self.emit_change("workers", Value::String(updated.id.clone()), Some(updated.run_id.clone()));
         Some(updated)
+    }
+
+    /// Lightweight heartbeat update for high-frequency streaming chunks: keeps `last_active_at`
+    /// accurate in memory for stall watchdogs while throttling `state.json` disk flushes and
+    /// `table: "workers"` SSE broadcasts to avoid snapshot storms.
+    pub fn touch_worker_active(&self, id: &str) {
+        let emit_run_id = {
+            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(worker) = g.data.workers.get_mut(id) else {
+                return;
+            };
+            worker.last_active_at = now_iso();
+            let run_id = worker.run_id.clone();
+            g.dirty = true;
+            let now = Instant::now();
+            let should_emit = g
+                .last_worker_touch_emit
+                .get(id)
+                .is_none_or(|prev| now.saturating_duration_since(*prev) >= WORKER_HEARTBEAT_EMIT_INTERVAL);
+            if should_emit {
+                g.last_worker_touch_emit.insert(id.to_string(), now);
+                let _ = g.flush_state();
+                Some(run_id)
+            } else {
+                None
+            }
+        };
+        if let Some(run_id) = emit_run_id {
+            self.emit_change("workers", Value::String(id.to_string()), Some(run_id));
+        }
     }
 
     // --- Attempts -----------------------------------------------------------
@@ -683,7 +728,13 @@ impl Store {
             g.items.entry(worker_id.to_string()).or_default().push(item.clone());
             let _ = g.append_item_disk(worker_id, &item);
             g.dirty = true;
-            let _ = g.flush_state();
+            let now = Instant::now();
+            if g.last_item_state_flush
+                .is_none_or(|prev| now.saturating_duration_since(prev) >= ITEM_STATE_FLUSH_INTERVAL)
+            {
+                g.last_item_state_flush = Some(now);
+                let _ = g.flush_state();
+            }
             (item, run_id)
         };
         let _ = self.events.send(StoreEvent::Item { run_id, item: item.clone() });
@@ -942,9 +993,118 @@ fn validate_artifact_name(name: &str) -> io::Result<()> {
     Ok(())
 }
 
+fn sanitize_worker_forked_from(worker: &mut Worker, prev_fork: Option<&str>) {
+    let is_self = worker.forked_from.as_deref().is_some_and(|src| {
+        let trimmed = src.trim();
+        trimmed.is_empty() || trimmed == worker.id || worker.h2_agent.as_deref() == Some(trimmed)
+    });
+    if is_self {
+        worker.forked_from = prev_fork
+            .map(str::trim)
+            .filter(|p| !p.is_empty() && *p != worker.id && worker.h2_agent.as_deref() != Some(*p))
+            .map(String::from);
+    }
+}
+
 /// Ensures path `p` stays inside directory `root`.
 pub fn path_is_inside(root: &Path, candidate: &Path) -> bool {
     let Ok(r) = root.canonicalize() else { return false };
     let Ok(c) = candidate.canonicalize() else { return false };
     c.starts_with(&r)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_store() -> Arc<Store> {
+        let dir = std::env::temp_dir().join(format!("herdr2-store-test-{}", crypto::rand_id("t")));
+        let paths = DrovePaths::from_paths(&crate::paths::Paths {
+            state: dir.clone(),
+            config: dir.join("config.toml"),
+            socket: dir.join("core.sock"),
+            holder_socket: dir.join("core.holder.sock"),
+        });
+        Store::open(&paths).expect("open temp store")
+    }
+
+    #[test]
+    fn touch_worker_active_throttles_workers_change_events() {
+        let store = temp_store();
+        let mut rx = store.subscribe();
+        let w = Worker {
+            id: "wrk_1".into(),
+            run_id: "run_1".into(),
+            agent: "codex".into(),
+            model: None,
+            context_window: None,
+            effort: None,
+            fast: None,
+            session_key: "run_1:wrk_1".into(),
+            h2_agent: Some("a5q".into()),
+            cwd: "/tmp".into(),
+            worktree: None,
+            state: WorkerState::Busy,
+            current_attempt_id: Some("att_1".into()),
+            pid: None,
+            fingerprint: Fingerprint::default(),
+            context: WorkerContext::default(),
+            totals: WorkerTotals::default(),
+            created_at: now_iso(),
+            last_active_at: now_iso(),
+            role: Some("coder".into()),
+            forked_from: Some("a5p".into()),
+            protocol_gen: Some(1),
+            read_only_dir: None,
+        };
+        store.insert_worker(w);
+        let _ = rx.try_recv(); // drain insert event
+
+        // Calling touch_worker_active 20 times in a burst must emit at most 1 workers ChangeEvent.
+        for _ in 0..20 {
+            store.touch_worker_active("wrk_1");
+        }
+        let mut emitted = 0usize;
+        while let Ok(ev) = rx.try_recv() {
+            if matches!(ev, StoreEvent::Change(c) if c.table == "workers") {
+                emitted += 1;
+            }
+        }
+        assert_eq!(emitted, 1, "heartbeat touches must be throttled to prevent snapshot storms");
+    }
+
+    #[test]
+    fn worker_forked_from_rejects_self_reference() {
+        let store = temp_store();
+        let w = Worker {
+            id: "wrk_self".into(),
+            run_id: "run_1".into(),
+            agent: "codex".into(),
+            model: None,
+            context_window: None,
+            effort: None,
+            fast: None,
+            session_key: "run_1:wrk_self".into(),
+            h2_agent: Some("a5q".into()),
+            cwd: "/tmp".into(),
+            worktree: None,
+            state: WorkerState::Busy,
+            current_attempt_id: Some("att_1".into()),
+            pid: None,
+            fingerprint: Fingerprint::default(),
+            context: WorkerContext::default(),
+            totals: WorkerTotals::default(),
+            created_at: now_iso(),
+            last_active_at: now_iso(),
+            role: Some("coder".into()),
+            forked_from: Some("a5p".into()),
+            protocol_gen: Some(1),
+            read_only_dir: None,
+        };
+        store.insert_worker(w);
+        let updated = store.update_worker("wrk_self", |upd| {
+            upd.forked_from = Some("a5q".into());
+        });
+        assert_eq!(updated.unwrap().forked_from.as_deref(), Some("a5p"));
+    }
 }

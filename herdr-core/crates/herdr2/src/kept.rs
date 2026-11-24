@@ -55,6 +55,60 @@ impl Terminal {
 /// Under what a lost PTY program left on screen, so it isn't taken for something still running.
 const RESTORED: &[u8] = b"\x1b[0m\r\n\x1b[2m-- the program above ended; this is a new shell --\x1b[0m\r\n";
 
+fn is_drove_worktree_path(path: &str) -> bool {
+    let norm = path.replace('\\', "/");
+    norm.contains("/drove/worktrees/")
+}
+
+/// Detects when a kept agent cannot be restarted because its deleted Drove worktree or a
+/// `bwrap` bind source path no longer exists on disk.
+fn missing_unrecoverable_workspace_path(a: &Agent) -> Option<String> {
+    if !a.cwd.is_empty()
+        && !std::path::Path::new(&a.cwd).is_dir()
+        && (a.labels.contains_key("drove.worker") || is_drove_worktree_path(&a.cwd))
+    {
+        return Some(a.cwd.clone());
+    }
+    let uses_bwrap = a.argv.first().is_some_and(|bin| {
+        bin == "bwrap" || bin.ends_with("/bwrap") || bin.ends_with("\\bwrap")
+    });
+    if uses_bwrap {
+        let mut i = 1;
+        while i < a.argv.len() {
+            match a.argv[i].as_str() {
+                "--bind" | "--ro-bind" | "--dev-bind" => {
+                    if let Some(src) = a.argv.get(i + 1)
+                        && !src.is_empty()
+                        && !std::path::Path::new(src).exists()
+                    {
+                        return Some(src.clone());
+                    }
+                    i += 3;
+                }
+                "--chdir" => {
+                    if let Some(dir) = a.argv.get(i + 1)
+                        && !dir.is_empty()
+                        && is_drove_worktree_path(dir)
+                        && !std::path::Path::new(dir).is_dir()
+                    {
+                        return Some(dir.clone());
+                    }
+                    i += 2;
+                }
+                "--" => break,
+                _ => i += 1,
+            }
+        }
+    }
+    None
+}
+
+fn is_permanent_missing_path_error(msg: &str) -> bool {
+    let low = msg.to_ascii_lowercase();
+    low.contains("bwrap: can't find source path")
+        || (low.contains("bwrap") && low.contains("no such file or directory"))
+}
+
 impl Core {
     pub(crate) fn spawn_failed(&self, st: &mut crate::runtime::State, id: u32) {
         let Some(a) = st.reg.agents.get_mut(&id) else { return };
@@ -116,36 +170,56 @@ impl Core {
                     a.pid = None;
                 }
             }
-            ids.into_iter()
-                .filter_map(|id| {
-                    let a = st.reg.agents.get(&id)?;
-                    let skip_perms = a.permission_mode == PermissionMode::ApproveAll
-                        || a.mode.as_deref().is_some_and(crate::permissions::is_bypass_mode_id);
-                    let fallback_handoff_context = if a.acp_session_id.is_some() && a.turn > 0 {
-                        st.transcripts
-                            .get(&id)
-                            .and_then(|tr| crate::transcript::build_portable_handoff(tr.entries(), a.turn, 16 * 1024))
-                    } else {
-                        None
-                    };
-                    Some((
-                        id,
-                        a.address.clone(),
-                        a.argv.clone(),
-                        a.cwd.clone(),
-                        a.acp_session_id.clone(),
-                        a.can_load_session,
-                        a.system_prompt.clone(),
-                        fallback_handoff_context,
-                        a.model.clone(),
-                        a.mode.clone(),
-                        skip_perms,
-                        a.config_overrides.clone(),
-                        a.inject_mcp,
-                        a.restart_env.clone(),
-                    ))
-                })
-                .collect()
+            let mut retired_missing_ws: Vec<(u32, String, String)> = Vec::new();
+            let mut active_candidates = Vec::new();
+            for id in ids {
+                let Some(a) = st.reg.agents.get(&id) else { continue };
+                if let Some(missing_path) = missing_unrecoverable_workspace_path(a) {
+                    retired_missing_ws.push((id, a.address.clone(), missing_path));
+                    continue;
+                }
+                let skip_perms = a.permission_mode == PermissionMode::ApproveAll
+                    || a.mode.as_deref().is_some_and(crate::permissions::is_bypass_mode_id);
+                let fallback_handoff_context = if a.acp_session_id.is_some() && a.turn > 0 {
+                    st.transcripts
+                        .get(&id)
+                        .and_then(|tr| crate::transcript::build_portable_handoff(tr.entries(), a.turn, 16 * 1024))
+                } else {
+                    None
+                };
+                active_candidates.push((
+                    id,
+                    a.address.clone(),
+                    a.argv.clone(),
+                    a.cwd.clone(),
+                    a.acp_session_id.clone(),
+                    a.can_load_session,
+                    a.system_prompt.clone(),
+                    fallback_handoff_context,
+                    a.model.clone(),
+                    a.mode.clone(),
+                    skip_perms,
+                    a.config_overrides.clone(),
+                    a.inject_mcp,
+                    a.restart_env.clone(),
+                ));
+            }
+            for (id, address, missing_path) in retired_missing_ws {
+                let _ = writeln!(
+                    io::stderr(),
+                    "core: kept agent {} retired (missing workspace/sandbox path: {})",
+                    address,
+                    missing_path
+                );
+                st.recovering.remove(&id);
+                if let Some(a) = st.reg.agents.get_mut(&id) {
+                    a.keep = false;
+                }
+                self.record_finish(&mut st, id, Exit { code: None, signal: None }, "workspace_removed");
+                self.save(&st);
+                self.changed.notify_waiters();
+            }
+            active_candidates
         };
 
         if !candidates.is_empty() {
@@ -268,6 +342,12 @@ impl Core {
                                 writeln!(io::stderr(), "core: kept agent {} restart failed: {}", address, err.message);
                             let mut st = core.lock();
                             st.recovering.remove(&id);
+                            if is_permanent_missing_path_error(&err.message)
+                                && let Some(a) = st.reg.agents.get_mut(&id)
+                            {
+                                a.keep = false;
+                                a.reason = Some("workspace_removed".into());
+                            }
                             core.spawn_failed(&mut st, id);
                         }
                     }
@@ -556,5 +636,49 @@ mod tests {
         let off: crate::config::Config = toml::from_str("restore_cli_sessions = false\n").unwrap();
         assert!(!off.restore_cli_sessions());
         assert!(!off.restore_screen.unwrap_or(false));
+    }
+
+    #[test]
+    fn detects_missing_drove_worktree_and_bwrap_bind_paths() {
+        use super::{is_permanent_missing_path_error, missing_unrecoverable_workspace_path};
+        let mut reg = Registry::default();
+        let id = reg
+            .create(
+                NewAgent {
+                    argv: vec![
+                        "bwrap".into(),
+                        "--bind".into(),
+                        "/nonexistent/drove/worktrees/run_x/w1".into(),
+                        "/work".into(),
+                    ],
+                    cwd: "/nonexistent/drove/worktrees/run_x/w1".into(),
+                    keep: true,
+                    ..Default::default()
+                },
+                0,
+            )
+            .unwrap();
+        let a = reg.agents.get_mut(&id).unwrap();
+        assert!(missing_unrecoverable_workspace_path(a).is_some());
+
+        a.cwd = "/tmp".into();
+        // Still catches missing --bind source path in bwrap argv!
+        assert_eq!(
+            missing_unrecoverable_workspace_path(a).as_deref(),
+            Some("/nonexistent/drove/worktrees/run_x/w1")
+        );
+
+        let id2 = reg
+            .create(
+                NewAgent { argv: vec!["codex".into()], cwd: "/tmp".into(), keep: true, ..Default::default() },
+                0,
+            )
+            .unwrap();
+        let normal = reg.agents.get(&id2).unwrap();
+        assert!(missing_unrecoverable_workspace_path(normal).is_none());
+
+        assert!(is_permanent_missing_path_error(
+            "bwrap: Can't find source path /home/u/.local/state/herdr2/default/drove/worktrees/run_1/w: No such file or directory"
+        ));
     }
 }

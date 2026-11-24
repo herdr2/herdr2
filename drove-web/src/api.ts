@@ -50,8 +50,8 @@ function webHeaders(): Record<string, string> {
   return headers;
 }
 
-async function get<T>(url: string): Promise<T> {
-  const res = await fetch(url, { headers: webHeaders() });
+async function get<T>(url: string, signal?: AbortSignal): Promise<T> {
+  const res = await fetch(url, { headers: webHeaders(), signal });
   const body = await parse(res);
   if (!res.ok) fail(res, body);
   return body as T;
@@ -159,12 +159,24 @@ export function normalizeSnapshot(snap: RunSnapshot): RunSnapshot {
     return { ...task, deps: resolved };
   });
 
-  return changed ? { ...snap, tasks } : snap;
+  let workersChanged = false;
+  const workers = snap.workers.map((w) => {
+    const rawFork = w.forkedFrom?.trim();
+    if (rawFork && (rawFork === w.id || (w.h2Agent && rawFork === w.h2Agent))) {
+      workersChanged = true;
+      const { forkedFrom: _drop, ...rest } = w;
+      return rest;
+    }
+    return w;
+  });
+
+  if (!changed && !workersChanged) return snap;
+  return { ...snap, tasks: changed ? tasks : snap.tasks, workers: workersChanged ? workers : snap.workers };
 }
 
-export async function fetchSnapshot(runId: string): Promise<RunSnapshot> {
+export async function fetchSnapshot(runId: string, signal?: AbortSignal): Promise<RunSnapshot> {
   if (isMock()) return normalizeSnapshot(mockSnapshot(runId));
-  return normalizeSnapshot(await get<RunSnapshot>(`/api/runs/${encodeURIComponent(runId)}`));
+  return normalizeSnapshot(await get<RunSnapshot>(`/api/runs/${encodeURIComponent(runId)}`, signal));
 }
 
 function asItemPage(body: unknown, limit: number): ItemPage {

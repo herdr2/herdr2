@@ -22,6 +22,14 @@ export function stripHandoffEnvelope(rawText) {
   return { handoffMeta, text: text.trim() };
 }
 
+export function isSyntheticCaller(raw) {
+  const s = String(raw ?? "").trim();
+  if (!s) return false;
+  const slash = s.lastIndexOf("/");
+  const local = slash >= 0 ? s.slice(slash + 1) : s;
+  return /^ppid:\d+$/i.test(local);
+}
+
 /**
  * Strips herdr2's `<h2 ...>...</h2>` envelope around delegated user prompts and
  * `<herdr2-handoff ...>...</herdr2-handoff>` context envelopes, returning the
@@ -29,7 +37,7 @@ export function stripHandoffEnvelope(rawText) {
  */
 export function parseUserEnvelope(rawText, entryFrom = null) {
   let text = String(rawText ?? "").replace(/\r\n/g, "\n");
-  let from = entryFrom || null;
+  let from = entryFrom && !isSyntheticCaller(entryFrom) ? entryFrom : null;
   let reach = null;
   let handoff = null;
 
@@ -38,7 +46,7 @@ export function parseUserEnvelope(rawText, entryFrom = null) {
     const closed = trimmed.match(/^<h2\b([^>]*)>\s*([\s\S]*?)\s*<\/h2>$/i);
     if (closed) {
       const attrs = parseAttrs(closed[1] ?? "");
-      if (!from && attrs.from) from = attrs.from;
+      if (!from && attrs.from && !isSyntheticCaller(attrs.from)) from = attrs.from;
       if (!reach && attrs.reach) reach = attrs.reach;
       text = closed[2] ?? "";
       continue;
@@ -46,7 +54,7 @@ export function parseUserEnvelope(rawText, entryFrom = null) {
     const openOnly = trimmed.match(/^<h2\b([^>]*)>\s*([\s\S]*)$/i);
     if (openOnly) {
       const attrs = parseAttrs(openOnly[1] ?? "");
-      if (!from && attrs.from) from = attrs.from;
+      if (!from && attrs.from && !isSyntheticCaller(attrs.from)) from = attrs.from;
       if (!reach && attrs.reach) reach = attrs.reach;
       text = openOnly[2] ?? "";
       continue;

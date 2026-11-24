@@ -714,3 +714,11 @@ test("Files Mermaid SVG renderer supports all major diagram types across light a
   expect(renderMermaidSvg("", { theme: darkTheme }).ok).toBe(false);
   expect(renderMermaidSvg("unknownDiagram\n  A --> B", { theme: darkTheme }).ok).toBe(false);
 });
+
+test("Files source code editor and line-review list wrap lines to panel width", () => {
+  expect(source).toContain("softWrap() {\n    return true;\n  }");
+  expect(source).toContain('list(\n            "files-review-lines"');
+  expect(source).not.toContain("v_virtual_list");
+  expect(source).not.toContain("files-review-x");
+  expect(source).toContain(".whitespace_normal().child(row.text)");
+});

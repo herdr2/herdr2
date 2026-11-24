@@ -1,5 +1,5 @@
-import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, Popup, Scrollbar, v_virtual_list } from "gpui-base";
+import { View, div, svg, list } from "gpui-kit";
+import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, Popup, Scrollbar } from "gpui-base";
 import { spaces, panes, agents, terminals, focused, exec, h2, readTextFile, watchFolder, theme, settings, shared, setShared, run } from "herdr";
 import {
   annotateDiffRows,
@@ -57,7 +57,7 @@ export default class Changes extends View {
     this.files = [];
     this.rows = [];
     this.annotatedRows = [];
-    this.diffWidth = 0;
+    this.diffNumWidth = 30;
     this.message = "";
     this.handle = cx.focus_handle();
     this.input = InputState.new({ placeholder: tr("Commit message", "输入提交信息") });
@@ -309,7 +309,9 @@ export default class Changes extends View {
   setLines(lines) {
     this.rows = diffRows(lines);
     this.annotatedRows = annotateDiffRows(this.rows, this.selectedCommit ? null : this.open);
-    this.diffWidth = Math.max(300, ...this.rows.map((row) => (row.text.length + 1) * 7 + 72));
+    const maxNum = this.rows.reduce((m, row) => (typeof row.number === "number" && row.number > m ? row.number : m), 0);
+    const numCols = Math.max(3, String(maxNum).length);
+    this.diffNumWidth = Math.max(30, numCols * 8 + 6);
   }
 
   pick(path, cx) {
@@ -606,7 +608,17 @@ export default class Changes extends View {
 
   renderCodeRow(row, t, selectedRange, commentedSet) {
     if (row.kind === "@") {
-      return div().w_full().px(12).h(20).flex_none().truncate().bg(t.raised).text_color(t.dim).child(row.text);
+      return div()
+        .w_full()
+        .min_w(0)
+        .px(12)
+        .py(2)
+        .min_h(20)
+        .line_height("16px")
+        .whitespace_normal()
+        .bg(t.raised)
+        .text_color(t.dim)
+        .child(row.text);
     }
     const inSel = Boolean(
       selectedRange && row.file === selectedRange.file && row.rowIndex >= selectedRange.startRowIdx && row.rowIndex <= selectedRange.endRowIdx,
@@ -623,16 +635,17 @@ export default class Changes extends View {
 
     return h_flex()
       .w_full()
-      .h(20)
-      .flex_none()
+      .min_w(0)
+      .min_h(20)
+      .pr(14)
       .gap(6)
-      .items_center()
+      .items_start()
       .when(Boolean(rowBg), (e) => e.bg(rowBg))
       .when(row.commentable, (e) => e.cursor_pointer().hover((s) => s.bg(withAlpha(accent, "18") ?? t.hover)))
       .child(
         div()
           .w(3)
-          .h_full()
+          .self_stretch()
           .flex_none()
           .when(inSel || hasComment, (e) => e.bg(accent)),
       )
@@ -640,6 +653,8 @@ export default class Changes extends View {
         div()
           .w(14)
           .flex_none()
+          .py(1)
+          .line_height("18px")
           .text_center()
           .text_size(11)
           .text_color(inSel || hasComment ? accent : t.dim)
@@ -647,13 +662,15 @@ export default class Changes extends View {
       )
       .child(
         div()
-          .w(30)
+          .w(this.diffNumWidth ?? 30)
           .flex_none()
+          .py(1)
+          .line_height("18px")
           .text_right()
           .text_color(inSel ? t.foreground : t.dim)
           .child(row.number === undefined ? "" : String(row.number)),
       )
-      .child(div().flex_1().min_w(0).truncate().child(row.text));
+      .child(div().flex_1().min_w(0).py(1).line_height("18px").whitespace_normal().child(row.text));
   }
 
   renderSavedComment(item, t) {
@@ -661,6 +678,7 @@ export default class Changes extends View {
     const accent = t.accent ?? "#3b82f6";
     return div()
       .w_full()
+      .min_w(0)
       .px(10)
       .py(4)
       .flex_none()
@@ -668,6 +686,7 @@ export default class Changes extends View {
       .child(
         v_flex()
           .w_full()
+          .min_w(0)
           .max_w(580)
           .p(8)
           .gap(4)
@@ -1452,7 +1471,7 @@ export default class Changes extends View {
     }
     const openComments = !this.selectedCommit && this.open ? allDrafts.filter((c) => c.path === this.open) : [];
     const activeComposer = !this.selectedCommit && this.composer && this.composer.file === this.open ? this.composer : null;
-    const { items, sizes } = buildDisplayItems(this.annotatedRows, openComments, activeComposer);
+    const { items } = buildDisplayItems(this.annotatedRows, openComments, activeComposer);
     const commentedSet = new Set();
     let lastCodeRowIdx = null;
     for (const item of items) {
@@ -1551,21 +1570,21 @@ export default class Changes extends View {
         .child(Scrollbar.vertical("changes-list").absolute().inset_0()))
       .when(this.limited, (el) => el.child(div().px(12).py(4).text_size(11).text_color(t.dim).child(tr("Showing the first 1,000 changed files", "仅显示前 1,000 个变更文件"))))
       .when(Boolean(commitBannerEl), (el) => el.child(commitBannerEl))
-      .child(div().flex_1().min_h(0).relative().font_family(settings().font_family ?? "JetBrains Mono").text_size(11)
+      .child(div().flex_1().w_full().min_w(0).min_h(0).relative().overflow_hidden().font_family(settings().font_family ?? "JetBrains Mono").text_size(11)
         .on_mouse_down("left", (e) => { this.lastShift = Boolean(e?.modifiers?.shift); })
-        .child(div().id("changes-diff-x").size_full().overflow_x_scrollbar()
-          .child(div().w_full().min_w(this.diffWidth).h_full().child(
-            v_virtual_list(
-              "changes-diff",
-              items.length,
-              sizes,
-              (i) => items[i]?.key ?? String(i),
-              (range) => items.slice(range.start, range.end).map((item) => {
-                if (item.type === "comment") return this.renderSavedComment(item, t);
-                return this.renderCodeRow(item.row, t, activeComposer, commentedSet);
-              }),
-            ).on_item_click((itemKey, cx) => this.handleVirtualItemClick(itemKey, cx)).size_full(),
-          )))
+        .child(
+          list(
+            "changes-diff",
+            items.length,
+            (i) => items[i]?.key ?? String(i),
+            (i) => {
+              const item = items[i];
+              if (!item) return div().h(0);
+              if (item.type === "comment") return this.renderSavedComment(item, t);
+              return this.renderCodeRow(item.row, t, activeComposer, commentedSet);
+            },
+          ).on_item_click((itemKey, cx) => this.handleVirtualItemClick(itemKey, cx)).size_full(),
+        )
         .child(Scrollbar.vertical("changes-diff").viewport_from_layout().absolute().inset_0())
         .when(this.commitLoading, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(tr("Loading commit diff…", "正在加载提交差异…"))))
         .when(!this.selectedCommit && !this.open && this.files.length > 0, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(tr("Select a file to view its changes", "选择一个文件以查看变更详情"))))
@@ -1573,7 +1592,7 @@ export default class Changes extends View {
       .when(Boolean(activeComposer), (e) => e.child(this.renderDockedComposer(activeComposer, t)))
       .when(allDrafts.length > 0 || Boolean(this.reviewError), (e) => e.child(this.renderReviewBar(t, allDrafts)))
       .when(Boolean(gitLogEl), (el) => el.child(gitLogEl))
-      .when(Boolean(this.note), (e) => e.child(div().px(10).pb(8).text_size(11).text_color(t.ansi1).child(this.note)))
+      .when(Boolean(this.note), (e) => e.child(div().px(10).pb(8).text_size(11).text_color(t.ansi1).whitespace_normal().child(this.note)))
       .child(h_flex().flex_none().p(10).gap(6).items_center().border_t(1).border_color(t.border)
         .child(
           h_flex()

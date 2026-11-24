@@ -673,7 +673,7 @@ The main ones:
   `layout.reset {name?}` (reset a shipped layout and its clicks),
   `layout.clone {name, as?}` (duplicate, then switch; default `<name>-copy`).
 - App: `mod.clone {name, as?}` (duplicate; default `<name>-copy`), `mod.open {name}` (again: closes it), `files.open {path, line?, end_line?, on?, cwd?}` (open a workspace or external file in the Files panel and jump to line), `overlay.close {id?}`, `app.help` (again: closes it), `app.palette` (again: closes it), `app.settings {section?}`
-  (sections: `look`, `machines`, `ai`, `drove`, `alerts`, `privacy`; Machines lists, renames and removes ssh machines; AI configures the shared Core AI assistant & KV-cache telemetry; Drove configures roles, AI policies, and optional Magpie quota; settings edit the same files you do),
+  (sections: `look`, `keyboard`, `machines`, `ai`, `drove`, `alerts`, `updates`; Machines lists, renames and removes ssh machines; AI configures the shared Core AI assistant & KV-cache metrics; Drove configures roles, AI policies, and optional Magpie quota; Updates configures self-hosted `releases_url` & UI hot-update policy; settings edit the same files you do),
   `app.welcome`, `app.reset`,
   `app.theme {name}`, `app.language {language}` (`"en"` or `"zh-CN"`), `app.zoom_in`, `app.zoom_out`, `app.zoom_reset`.
   Add machine lists all named ssh-config hosts in a scrollable list. Machines
@@ -763,28 +763,8 @@ What's about the user, never a look:
   Package-managed cores stay with their package manager; Settings shows available releases.
   A core update error can be dismissed with its × or `overlay.close {id:"core-update-error"}`
   until the error changes or the update recovers.
-  Settings → Updates keeps app and core actions together;
-  its What's new button opens the waiting update's release range, or this
-  version's notes, in the What's new window. Reading never clears the waiting-update dot.
-  Rare spotlight releases open What’s new after restart, once; otherwise a
-  quiet Updated pill lasts for that launch. A build from source never updates.
-  Curated notes come from the bundled root `CHANGELOG.md`; remote notes and
-  media are optional. `update-notes.json` records the last successful app
-  version and presented spotlights; `update-notes-cache.md` caches remote
-  notes; `update-notes-media/` caches HTTPS images (including animated WebP clips),
-  referenced below its item in the changelog as `![label](https://...)`.
-  Each version uses `### New` with `- **Headline.** detail` highlights and
-  `### Fixed` with short bullet items. Unsectioned bullets are plain items.
-  Notes expose `items` with `headline`, `detail`, `fixed`, and cached `media`
-  objects (`path`, pixel `width`, pixel `height`). Highlights use matching cards:
-  edge-to-edge media at its original aspect ratio, then headline and detail.
-  For local release-media previews only, launch with
-  `HERDR_NOTES_MEDIA_DIR=/var/tmp/herdr-notes-media`: URLs under
-  `https://media.herdr.dev/<version>/<scene>.webp` use that directory's
-  `<version>/<scene>.webp` instead of downloading. Without the variable,
-  media uses the normal HTTPS cache.
-  Mods use `updates().notes` and `presentUpdateNotes([version])` only
-  for spotlight entries actually shown expanded, not collapsed headlines.
+  Settings → Updates keeps app, UI hot-update, and core actions together
+  (only active when you configure a self-hosted `releases_url` or `HERDR2_RELEASES_URL`).
   macOS releases require Apple Silicon; Intel Macs must build from source.
   Keep signed macOS bundles unchanged: don't edit their Info.plist or
   re-sign them. On launch, an installed macOS bundle creates or repairs its
@@ -824,14 +804,10 @@ What's about the user, never a look:
   pane's right edge (default `true`). It shows only when the pane has
   scrollback — never on the alternate screen (editors, pagers) — and
   drags to move through it.
-- `telemetry`: `false` stops anonymous usage data and deletes what wasn't
-  sent (on when absent; Settings → Privacy shows each report word for
-  word, and `telemetry()` in mods). Once a day the app sends counts:
-  version, OS, which known agents ran, how many spaces, tabs and
-  terminals, which layouts, shipped mods and commands were used. Never
-  terminal content, names of files, folders, spaces or the person's own
-  mods; nothing from herdr-core. `DO_NOT_TRACK=1` or `HERDR_TELEMETRY=0`
-  turns it off for one run. A build from source never sends.
+- `releases_url`: optional base URL of your own static release server for App,
+  UI bundle, and Core updates (`HERDR2_RELEASES_URL` overrides it). When unset,
+  no update checks are performed.
+- `ui_hot_update`: UI bundle hot-update mode (`"prompt"`, `"auto"`, or `"off"`).
 
 ## Programs: `programs.json`
 

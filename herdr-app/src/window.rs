@@ -777,6 +777,8 @@ pub struct AppWindow {
     manual_statuses: HashMap<String, ManualStatus>,
     /// Recently written `herdr.name` labels awaiting Core echo so in-flight listings don't revert renames.
     pending_names: HashMap<String, (String, Instant)>,
+    /// Recently written `herdr.trashed` labels awaiting Core echo so in-flight listings don't revert trash/restore.
+    pending_trash: HashMap<String, (String, Instant)>,
     /// Cached async semantic arbitration verdicts for non-OSC-7501 PTY CLI agents.
     ai_terminal_states: HashMap<String, AiTerminalVerdict>,
     /// PTY addresses currently awaiting an in-flight `ai.classify_terminal_state` RPC.
@@ -927,6 +929,7 @@ impl AppWindow {
             rename_focus: RenameFocus::Tab,
             manual_statuses: HashMap::new(),
             pending_names: HashMap::new(),
+            pending_trash: HashMap::new(),
             ai_terminal_states: HashMap::new(),
             ai_inflight: HashSet::new(),
             polish_inflight: HashSet::new(),
@@ -1180,7 +1183,6 @@ impl AppWindow {
                 let Ok(core) = this.update(cx, |this, _| this.core.clone()) else { break };
                 core.closed().await;
                 tracing::warn!("lost the core; reconnecting");
-                crate::telemetry::count("core_lost");
                 let fresh = loop {
                     cx.background_executor().timer(Duration::from_millis(1000)).await;
                     if let Ok(core) = cx.background_executor().spawn(async { Core::connect() }).await {
@@ -1205,39 +1207,11 @@ impl AppWindow {
         {
             mods::set_shared("space.colors".into(), c);
         }
-        // Upstream Herdr release spotlights ("What's new") are temporarily disabled
-        // until Herdr2 maintains its own release notes.
         if mods::shared("frame.welcomed").is_none() {
             cx.defer_in(window, |this, window, cx| this.open_welcome(window, cx));
         }
-        crate::telemetry::window_open();
         w
     }
-
-    /// What telemetry.rs counts: how much is open, never what's in it.
-    fn observe(&self) {
-        if !crate::telemetry::collecting() {
-            return;
-        }
-        let m = &self.model;
-        let agents: Vec<&model::Agent> = m.agents.iter().filter(|(a, _)| self.live.contains_key(*a) && m.status(a).is_some()).map(|(_, a)| a).collect();
-        crate::telemetry::observe(crate::telemetry::Observation {
-            foreground: self.window_active,
-            agents_working: agents.iter().filter(|a| a.word.as_deref() == Some("working")).count(),
-            agents: agents.iter().map(|a| a.app.clone()).collect(),
-            spaces: m.spaces.len(),
-            tabs: m.spaces.iter().map(|p| p.tabs.len()).sum(),
-            terminals: m.spaces.iter().flat_map(|p| &p.tabs).map(|c| model::addresses(&c.root).len()).sum(),
-            layout: self.layout_name.clone(),
-            mods: self.visible().1.into_iter().map(|(_, i)| i.name).collect(),
-            theme: settings::get().theme.clone(),
-            welcome: mods::shared("frame.welcomed").and_then(|v| v.as_str().map(str::to_owned)),
-        });
-    }
-
-    /// Disabled while original Herdr update/whats-new UI is suppressed.
-    #[allow(dead_code)]
-    fn open_whats_new(&mut self, _asked: bool, _window: &mut Window, _cx: &mut Context<Self>) {}
 
     fn open_welcome(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A window over the live app (nothing dims), centered and movable:
@@ -1359,7 +1333,6 @@ impl AppWindow {
         let s_time = mtime(&settings::path());
         if s_time.is_none() || s_time != self.watched.settings {
             let loaded = settings::load_person();
-            crate::telemetry::set_setting(settings::telemetry_setting(&loaded));
             match loaded {
                 Ok(p) => {
                     self.person = p;
@@ -2801,7 +2774,13 @@ impl AppWindow {
                     if self.closing_terminals.contains_key(addr) || self.live.get(addr).is_some_and(is_trashed_record) {
                         continue;
                     }
-                    let Some(status) = m.status(addr).or_else(|| has_live_child(addr, &self.live, &self.closing_terminals).then_some("idle")) else { continue };
+                    let Some(status) = m
+                        .status(addr)
+                        .or_else(|| has_live_child(addr, &self.live, &self.closing_terminals).then_some("idle"))
+                        .or_else(|| self.is_agent_pty(addr).then_some("idle"))
+                    else {
+                        continue;
+                    };
                     let created_ms = agent_appeared_ms(addr);
                     agents.push(json!({
                         "address": addr, "pane": p.id, "space": pr.id, "space_name": m.space_name(pr, &home),
@@ -4454,6 +4433,28 @@ impl AppWindow {
                 }
             }
         }
+        self.pending_trash.retain(|addr, (want, at)| {
+            let Some(rec) = self.live.get(addr) else {
+                return false;
+            };
+            let cur = rec.pointer("/labels/herdr.trashed").and_then(Value::as_str).unwrap_or_default();
+            if cur == want.as_str() || now_pending.saturating_duration_since(*at) >= Duration::from_secs(3) {
+                return false;
+            }
+            true
+        });
+        for (addr, (want, _)) in &self.pending_trash {
+            if let Some(obj) = self.live.get_mut(addr).and_then(Value::as_object_mut)
+                && let Some(labels) = obj.entry("labels").or_insert_with(|| json!({})).as_object_mut()
+            {
+                labels.insert("herdr.trashed".into(), json!(want));
+                if !want.is_empty() {
+                    labels.insert("herdr.space".into(), json!(""));
+                    labels.insert("herdr.tab".into(), json!(""));
+                    labels.insert("herdr.parked".into(), json!("1"));
+                }
+            }
+        }
         self.ai_terminal_states.retain(|a, _| self.live.contains_key(a));
         self.ai_last_attempt.retain(|a, _| self.live.contains_key(a));
         self.ai_digest_attempted.retain(|a, _| self.live.contains_key(a));
@@ -5136,7 +5137,7 @@ impl AppWindow {
             "terminal" | "终端" | "shell" | "zsh" | "bash" | "sh" | "fish" | "nu" | "nushell" | "dash"
                 | "pwsh" | "powershell" | "powershell 7" | "windows powershell" | "cmd" | "command prompt"
                 | "git bash" | "wsl" | "dos prompt" | "headless"
-                | "claude" | "claude code" | "claude-code" | "codex" | "gemini" | "antigravity" | "agy"
+                | "claude" | "claude code" | "claude-code" | "codex" | "gemini" | "antigravity" | "agy" | "agy.real"
                 | "opencode" | "cursor" | "cursor-agent" | "pi" | "pig" | "qwen" | "kimi" | "kimi-code"
                 | "kiro" | "kiro-cli" | "qoder" | "qodercli" | "copilot" | "github-copilot" | "amp" | "grok"
                 | "hermes" | "goose" | "crush" | "omp" | "oh-my-pi" | "dsh" | "dsh-tui" | "deepseek"
@@ -6604,6 +6605,15 @@ impl AppWindow {
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
+        list.retain(|item| {
+            let Some(addr) = item.get("address").and_then(Value::as_str) else {
+                return true;
+            };
+            let restored_live = self.live.get(addr).is_some_and(|r| {
+                r.get("state").and_then(Value::as_str) == Some("live") && !is_trashed_record(r)
+            });
+            !(restored_live && self.model.any_pane_of(addr).is_some())
+        });
         let mut seen = HashSet::new();
         for item in &mut list {
             let Some(addr) = item.get("address").and_then(Value::as_str).map(str::to_owned) else {
@@ -6676,6 +6686,7 @@ impl AppWindow {
             .unwrap_or_default()
             .to_owned();
         if self.live.contains_key(addr) {
+            self.pending_trash.insert(addr.to_owned(), (trashed_at.clone(), Instant::now()));
             if let Some(obj) = self.live.get_mut(addr).and_then(Value::as_object_mut) {
                 obj.insert("keep".into(), json!(false));
                 let labels = obj.entry("labels").or_insert_with(|| json!({}));
@@ -6751,6 +6762,7 @@ impl AppWindow {
 
     fn clear_trash_labels_for_side_chat(&mut self, addr: &str, cx: &mut Context<Self>) {
         let is_acp = is_acp_addr(addr);
+        self.pending_trash.insert(addr.to_owned(), (String::new(), Instant::now()));
         if let Some(obj) = self.live.get_mut(addr).and_then(Value::as_object_mut) {
             obj.insert("keep".into(), json!(false));
             let labels = obj.entry("labels").or_insert_with(|| json!({}));
@@ -6793,6 +6805,7 @@ impl AppWindow {
         let is_acp = is_acp_addr(addr);
         let local_sp = crate::mirror::local(space_id, on).to_owned();
         let local_tb = crate::mirror::local(tab_id, on).to_owned();
+        self.pending_trash.insert(addr.to_owned(), (String::new(), Instant::now()));
         if let Some(obj) = self.live.get_mut(addr).and_then(Value::as_object_mut) {
             obj.insert("keep".into(), json!(true));
             let labels = obj.entry("labels").or_insert_with(|| json!({}));
@@ -6840,7 +6853,7 @@ impl AppWindow {
             "gemini-cli" => "gemini",
             "qwen-code" => "qwen",
             "kiro-cli" => "kiro",
-            "antigravity-cli" | "agy" => "antigravity",
+            "antigravity-cli" | "agy" | "agy.real" => "antigravity",
             "zcode-cli" => "zcode",
             "oh-my-pi" => "omp",
             other => other,
@@ -6848,8 +6861,19 @@ impl AppWindow {
     }
 
     fn unwrap_shell_agent_argv(argv: Vec<String>) -> Vec<String> {
-        if argv.len() > 4 && argv[0] == "sh" && argv[1] == "-c" && argv[3] == "sh" {
-            return argv[4..].to_vec();
+        if argv.len() > 4 {
+            let sh = argv[0].rsplit(['/', '\\']).next().unwrap_or(&argv[0]).trim_start_matches('-');
+            let is_posix_shell = matches!(sh, "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh");
+            if is_posix_shell
+                && argv[1].starts_with('-')
+                && argv[1].ends_with('c')
+                && (argv[3] == argv[0]
+                    || argv[3].rsplit(['/', '\\']).next() == Some(sh)
+                    || argv[2].contains("\"$@\"")
+                    || argv[2].contains("$argv"))
+            {
+                return argv[4..].to_vec();
+            }
         }
         argv
     }
@@ -7001,8 +7025,14 @@ impl AppWindow {
         let prog_key = entry
             .pointer("/program/key")
             .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-            .or_else(|| entry.get("agent").and_then(Value::as_str).filter(|s| !s.is_empty()))
+            .filter(|s| !s.is_empty() && !matches!(*s, "program" | "shell" | "agent"))
+            .or_else(|| {
+                entry
+                    .get("agent")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty() && !matches!(*s, "program" | "shell" | "agent"))
+            })
+            .or_else(|| entry.pointer("/program/name").and_then(Value::as_str).filter(|s| !s.is_empty()))
             .map(Self::normalize_agent_program_key)
             .unwrap_or_default()
             .to_owned();
@@ -7345,9 +7375,6 @@ impl AppWindow {
         }
         if let Some(arg) = crate::commands::missing(command, &args) {
             return json!({ "error": format!("{name} needs {arg}") });
-        }
-        if person {
-            crate::telemetry::command(command.name);
         }
         if name == "space.new" {
             let machine = new_space_machine(&args, person, &self.model);
@@ -9018,7 +9045,8 @@ impl AppWindow {
                 let explicit_addr = Self::owned(a, "terminal").filter(|s| !s.is_empty());
                 if explicit_addr.is_none() {
                     for o in self.overlays.iter().rev() {
-                        if let Some(copy) = self.copies.get(&o.slot)
+                        if overlay_claims_polish(o.kind, o.focus.contains_focused(window, cx))
+                            && let Some(copy) = self.copies.get(&o.slot)
                             && matches!(copy.inst.name.as_str(), "flash-note" | "prompt" | "peek")
                         {
                             mods::send_command_to(copy.id, "polish");
@@ -9027,6 +9055,12 @@ impl AppWindow {
                     }
                 }
                 let active_addr = explicit_addr
+                    .or_else(|| {
+                        self.terms
+                            .values()
+                            .find(|t| t.view.read(cx).owns_keyboard_focus(window, cx))
+                            .map(|t| t.address.clone())
+                    })
                     .or_else(|| {
                         self.focused_pane
                             .as_deref()
@@ -9061,7 +9095,8 @@ impl AppWindow {
                 let explicit_addr = Self::owned(a, "terminal").filter(|s| !s.is_empty());
                 if explicit_addr.is_none() {
                     for o in self.overlays.iter().rev() {
-                        if let Some(copy) = self.copies.get(&o.slot)
+                        if overlay_claims_polish(o.kind, o.focus.contains_focused(window, cx))
+                            && let Some(copy) = self.copies.get(&o.slot)
                             && matches!(copy.inst.name.as_str(), "flash-note" | "prompt" | "peek")
                         {
                             mods::send_command_to(copy.id, "polish_undo");
@@ -9070,6 +9105,12 @@ impl AppWindow {
                     }
                 }
                 let active_addr = explicit_addr
+                    .or_else(|| {
+                        self.terms
+                            .values()
+                            .find(|t| t.view.read(cx).owns_keyboard_focus(window, cx))
+                            .map(|t| t.address.clone())
+                    })
                     .or_else(|| {
                         self.focused_pane
                             .as_deref()
@@ -9125,9 +9166,6 @@ impl AppWindow {
                     self.open_overlay("palette".into(), spec, window, cx);
                 }
                 return;
-            }
-            "app.feedback" => {
-                return self.fail("feedback is disabled in Herdr2");
             }
             "app.settings" => {
                 // Once: a second press doesn't stack another; asking for a section opens it there.
@@ -9949,9 +9987,6 @@ impl AppWindow {
         // With file events the disk is only checked now and then, in case one
         // was missed.
         self.polls += 1;
-        if self.polls.is_multiple_of(25) {
-            self.observe();
-        }
         if self.file_events.is_none() || self.polls.is_multiple_of(25) {
             self.reload_config(window, cx);
             self.check_layout_file(window, cx);
@@ -11624,6 +11659,10 @@ fn changed_asset_paths(home: &std::path::Path, changed: &[std::path::PathBuf]) -
     paths.into_iter().collect()
 }
 
+fn overlay_claims_polish(kind: OverlayKind, focused: bool) -> bool {
+    kind.modal_keys() || focused
+}
+
 fn reconcile_core_update_error(dismissed: &mut Option<String>, core: &crate::update::CoreInfo) {
     if core.error.as_ref().is_some_and(|error| dismissed.as_ref() != Some(error)) || (!core.updating && core.error.is_none()) {
         *dismissed = None;
@@ -11634,6 +11673,19 @@ fn reconcile_core_update_error(dismissed: &mut Option<String>, core: &crate::upd
 mod tests {
     use gpui::{div, point, px, size, Context, IntoElement, Render, TestAppContext, Window};
     use gpui::prelude::*;
+
+    #[test]
+    fn unfocused_floating_window_overlay_does_not_hijack_cli_polish_shortcut() {
+        use super::{overlay_claims_polish, OverlayKind};
+        // Floating windows (like Flash Note kept open side-by-side) only claim polish when focused.
+        assert!(!overlay_claims_polish(OverlayKind::Window, false));
+        assert!(overlay_claims_polish(OverlayKind::Window, true));
+        assert!(!overlay_claims_polish(OverlayKind::Float, false));
+        assert!(overlay_claims_polish(OverlayKind::Float, true));
+        // Modal dialogs/popups (like Prompt modal) always hold keyboard focus.
+        assert!(overlay_claims_polish(OverlayKind::Dialog, false));
+        assert!(overlay_claims_polish(OverlayKind::Dialog, true));
+    }
 
     #[test]
     fn core_error_dismissal_survives_failed_retries_but_resets_after_recovery() {
@@ -14103,6 +14155,7 @@ export default class SystemToast extends View {
             assert_eq!(super::AppWindow::normalize_agent_program_key("claude-code"), "claude");
             assert_eq!(super::AppWindow::normalize_agent_program_key("cursor-agent"), "cursor");
             assert_eq!(super::AppWindow::normalize_agent_program_key("zcode-cli"), "zcode");
+            assert_eq!(super::AppWindow::normalize_agent_program_key("agy.real"), "antigravity");
             assert_eq!(
                 super::AppWindow::unwrap_shell_agent_argv(vec![
                     "sh".into(),
@@ -14114,6 +14167,115 @@ export default class SystemToast extends View {
                 ]),
                 vec!["claude".to_string(), "--dangerously-skip-permissions".to_string()],
             );
+            assert_eq!(
+                super::AppWindow::unwrap_shell_agent_argv(vec![
+                    "/bin/zsh".into(),
+                    "-ic".into(),
+                    "\"$@\"; exec \"$0\" -i".into(),
+                    "/bin/zsh".into(),
+                    "agy".into(),
+                    "--dangerously-skip-permissions".into(),
+                ]),
+                vec!["agy".to_string(), "--dangerously-skip-permissions".to_string()],
+            );
+
+            // Forked CLI agent running wrapped `agy.real` (no OSC 7501) stays recognized as Antigravity
+            // across trash -> restore and in-flight stale core listings.
+            this.model.add_tab("space", super::Tab::new("tb-fk", "", "p-fk", "t-fk"));
+            this.terminals_listed(json!({
+                "terminals": [
+                    { "address": "term-a", "state": "live", "argv": ["zsh"], "cwd": "/tmp" },
+                    {
+                        "address": "t-fk",
+                        "state": "live",
+                        "keep": true,
+                        "pid": 4242,
+                        "argv": ["agy", "--dangerously-skip-permissions"],
+                        "foreground": {
+                            "pid": 4242,
+                            "name": "agy.real",
+                            "argv": ["/home/u/.local/bin/agy.real", "--dangerously-skip-permissions"],
+                            "cwd": "/tmp"
+                        },
+                        "cwd": "/tmp",
+                        "semantic_title": "分析分叉恢复异常",
+                        "lineage": { "kind": "fork", "parent": "t-parent" },
+                        "labels": { "herdr.space": "space", "herdr.tab": "tb-fk" }
+                    }
+                ],
+                "agents": []
+            }), window, cx);
+            assert_eq!(this.live["t-fk"]["program"]["key"], json!("antigravity"));
+            assert_eq!(this.live["t-fk"]["program"]["name"], json!("Antigravity"));
+            assert_eq!(this.live["t-fk"]["program"]["agent"], json!(true));
+            let published_before = crate::mods::agents().as_array().cloned().unwrap_or_default();
+            assert!(
+                published_before.iter().any(|v| v["address"] == json!("t-fk") && v["program"]["name"] == json!("Antigravity")),
+                "forked agy.real CLI agent must appear in sidebar agents list before trash: {published_before:?}"
+            );
+
+            // Move forked CLI agent to recycle bin.
+            let out = this.run_as("agent.trash", json!({ "terminal": "t-fk" }), true, window, cx);
+            assert!(out.get("error").is_none(), "{out}");
+            assert!(this.model.pane_of("t-fk").is_none());
+            let trashed_at = this.live["t-fk"]["labels"]["herdr.trashed"].as_str().unwrap().to_owned();
+            assert!(!trashed_at.is_empty());
+            let published_trashed = crate::mods::agents().as_array().cloned().unwrap_or_default();
+            assert!(!published_trashed.iter().any(|v| v["address"] == json!("t-fk")));
+
+            // Restore forked CLI agent from recycle bin.
+            let out = this.run_as("agent.restore", json!({ "terminal": "t-fk" }), true, window, cx);
+            assert!(out.get("error").is_none(), "{out}");
+            let restored_pane = this.model.pane_of("t-fk").expect("restored forked CLI agent mounted in a pane");
+            assert_eq!(this.live["t-fk"]["labels"]["herdr.trashed"], json!(""));
+            let trash_after = crate::mods::shared("agents.trash").and_then(|v| v.as_array().cloned()).unwrap_or_default();
+            assert!(!trash_after.iter().any(|v| v["address"] == json!("t-fk")));
+            let published_restored = crate::mods::agents().as_array().cloned().unwrap_or_default();
+            let fk_agent = published_restored
+                .iter()
+                .find(|v| v["address"] == json!("t-fk"))
+                .expect("restored forked agy.real CLI agent must show in sidebar agents list");
+            assert_eq!(fk_agent["program"]["key"], json!("antigravity"));
+            assert_eq!(fk_agent["program"]["name"], json!("Antigravity"));
+            assert_eq!(fk_agent["program"]["agent"], json!(true));
+            assert_eq!(fk_agent["semantic_title"], json!("分析分叉恢复异常"));
+            let restored_prog = this.program("t-fk");
+            assert_eq!(restored_prog["name"], json!("Antigravity"));
+            assert_eq!(restored_prog["agent"], json!(true));
+            assert_eq!(this.model.tab_of(&restored_pane).map(|t| t.name.as_str()), Some(""));
+
+            // Stale in-flight listing carrying the old herdr.trashed timestamp must NOT revert restore or re-hide it.
+            this.terminals_listed(json!({
+                "terminals": [
+                    { "address": "term-a", "state": "live", "argv": ["zsh"], "cwd": "/tmp" },
+                    {
+                        "address": "t-fk",
+                        "state": "live",
+                        "keep": false,
+                        "pid": 4242,
+                        "argv": ["agy", "--dangerously-skip-permissions"],
+                        "foreground": {
+                            "pid": 4242,
+                            "name": "agy.real",
+                            "argv": ["/home/u/.local/bin/agy.real", "--dangerously-skip-permissions"],
+                            "cwd": "/tmp"
+                        },
+                        "cwd": "/tmp",
+                        "semantic_title": "分析分叉恢复异常",
+                        "lineage": { "kind": "fork", "parent": "t-parent" },
+                        "labels": { "herdr.trashed": trashed_at, "herdr.parked": "1" }
+                    }
+                ],
+                "agents": []
+            }), window, cx);
+            assert_eq!(this.live["t-fk"]["labels"]["herdr.trashed"], json!(""));
+            let published_after_stale = crate::mods::agents().as_array().cloned().unwrap_or_default();
+            assert!(
+                published_after_stale.iter().any(|v| v["address"] == json!("t-fk") && v["program"]["name"] == json!("Antigravity")),
+                "stale listing after restore must not hide forked CLI agent: {published_after_stale:?}"
+            );
+            let trash_after_stale = crate::mods::shared("agents.trash").and_then(|v| v.as_array().cloned()).unwrap_or_default();
+            assert!(!trash_after_stale.iter().any(|v| v["address"] == json!("t-fk")));
         });
     }
 

@@ -1,5 +1,6 @@
 import { describe, test, expect } from "bun:test";
 import {
+  isSyntheticCaller,
   parseUserEnvelope,
   splitMarkdownBlocks,
   cleanTerminalSnapshot,
@@ -42,6 +43,37 @@ describe("parseUserEnvelope", () => {
     const parsed = parseUserEnvelope("hello agent\nfix the build", null);
     expect(parsed.from).toBeNull();
     expect(parsed.body).toBe("hello agent\nfix the build");
+  });
+
+  test("ignores synthetic ppid caller ids so human messages are never marked delegated", () => {
+    expect(isSyntheticCaller("ppid:42736")).toBe(true);
+    expect(isSyntheticCaller("d9152abb89f9af269de4f9e537b55cc0/ppid:42736")).toBe(true);
+    expect(isSyntheticCaller("t8")).toBe(false);
+    expect(isSyntheticCaller("wsl/a2")).toBe(false);
+
+    const parsed = parseUserEnvelope("你现在使用的是什么大模型？", "d9152abb89f9af269de4f9e537b55cc0/ppid:42736");
+    expect(parsed.from).toBeNull();
+    expect(parsed.body).toBe("你现在使用的是什么大模型？");
+
+    const items = buildConversationItems([
+      { kind: "user", turn: 1, from: "d9152abb89f9af269de4f9e537b55cc0/ppid:42736", text: "你现在使用的是什么大模型？", ts_ms: 10 },
+      { kind: "assistant", turn: 1, text: "GLM-5.3-Flash", ts_ms: 20 },
+    ]);
+    expect(items[0]).toMatchObject({
+      kind: "user",
+      from: null,
+      isDelegated: false,
+      body: "你现在使用的是什么大模型？",
+    });
+
+    const queued = normalizeInboxItems([
+      { id: 1, text: "follow up", from: "d9152abb89f9af269de4f9e537b55cc0/ppid:42736", queued_ms: 1700000000000 },
+    ]);
+    expect(queued[0]).toMatchObject({
+      from: null,
+      fromLabel: null,
+      body: "follow up",
+    });
   });
 });
 

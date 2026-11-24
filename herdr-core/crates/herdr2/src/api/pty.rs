@@ -220,6 +220,12 @@ pub(super) async fn terminal_label(core: Ctx<'_>, p: TerminalLabelParams) -> Res
         st.pty_reg.terminals[&id].labels.get("herdr.trashed").is_some_and(|s| !s.is_empty())
     };
     if trashed {
+        let target = TargetKey::Terminal(id);
+        let _ = core.jobs.send(crate::notes::Job::Orphaned(target));
+        {
+            let mut st = core.lock();
+            crate::remote::orphaned_afar(core, &mut st, target);
+        }
         let _ = core
             .drove
             .pool_tx

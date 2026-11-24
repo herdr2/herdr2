@@ -147,9 +147,19 @@ export function CoordinatorView({
           estimated={est.cost}
           ratio={costRatio}
         />
-        {(snap.stats.aiTokens ?? 0) > 0 && (
-          <div className="hint" style={{ fontSize: "12px", marginTop: "6px" }}>
-            {t("wb.aiUsage")}: {fmtTokens(snap.stats.aiTokens ?? 0)} tok · {fmtCost(snap.stats.aiCost ?? 0)}
+        {((snap.stats.workerTokens ?? 0) > 0 || (snap.stats.aiTokens ?? 0) > 0) && (
+          <div className="hint" style={{ fontSize: "12px", marginTop: "6px", display: "flex", flexDirection: "column", gap: "2px" }}>
+            {(snap.stats.workerTokens ?? 0) > 0 && (
+              <div>
+                {t("wb.workerUsage")}: {fmtTokens(snap.stats.workerTokens ?? 0)} tok
+                {(snap.stats.workerCost ?? 0) > 0 ? ` · ${fmtCost(snap.stats.workerCost ?? 0)}` : ""}
+              </div>
+            )}
+            {(snap.stats.aiTokens ?? 0) > 0 && (
+              <div>
+                {t("wb.aiUsage")}: {fmtTokens(snap.stats.aiTokens ?? 0)} tok · {fmtCost(snap.stats.aiCost ?? 0)}
+              </div>
+            )}
           </div>
         )}
       </div>

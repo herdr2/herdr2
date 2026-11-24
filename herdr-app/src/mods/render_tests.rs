@@ -161,7 +161,6 @@ fn fixture(populated: bool, props: Value, update: Value) -> BTreeMap<String, Val
         ("settings".into(), serde_json::to_value(crate::settings::Settings::default()).unwrap()),
         ("themes".into(), json!([{"name":"graphite", "colors": &*crate::settings::theme()}])),  ("fonts".into(), json!(["Monospace", "Sans"])),
         ("updates".into(), update),
-        ("telemetry".into(), json!({"enabled":true,"setting":true,"sends":true,"off_because":null,"endpoint":"https://invalid.example", "draft":{},"queued":[],"last_sent":null})),
         ("window".into(), json!({"platform":"linux","titlebar":"none","buttons":true,"maximized":false,"fullscreen":false,"active":true})),
         ("placement".into(), Value::Null),
         ("home".into(), json!("/fixture")), ("appHome".into(), json!("/fixture/app")),
@@ -195,11 +194,6 @@ fn module(mut values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> Hos
     for (name, value) in values {
         module = module.function(name, move |_| Ok(to_host(&value)));
     }
-    module = module.function("feedbackPreview", |a| {
-        Ok(to_host(
-            &json!({"available":true,"body":{"message":a.string(0)?,"email":a.string(1)?}}),
-        ))
-    });
     let shared = calls.clone();
     module = module.function("shared", move |a| {
         Ok(shared.borrow().shared.get(a.string(0)?).map(to_host).unwrap_or(HostValue::Null))
@@ -209,7 +203,7 @@ fn module(mut values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> Hos
         shared.borrow_mut().shared.insert(a.string(0)?.into(), from_host(a.value(1)?));
         Ok(HostValue::Null)
     });
-    for name in ["run", "playSound", "setAgentOrder", "setWindowTitle", "setBadge", "openOverlay", "closeOverlay", "notify", "presentUpdateNotes"] {
+    for name in ["run", "playSound", "setAgentOrder", "setWindowTitle", "setBadge", "openOverlay", "closeOverlay", "notify"] {
         let calls = calls.clone();
         module = module.function(name, move |a| {
             if name == "run" {
@@ -228,9 +222,6 @@ fn module(mut values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> Hos
                 HostValue::Null
             })
         });
-    }
-    for name in ["feedbackPasteImage", "feedbackClearImages", "feedbackAttachImages"] {
-        module = module.function(name, |_| Ok(HostValue::Null));
     }
     module = module.function("pasteClipboardAttachments", |_| Ok(HostValue::Array(vec![])));
     module = module.function("prepareAttachments", |a| {
@@ -255,12 +246,11 @@ fn module(mut values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> Hos
         Ok(to_host(&Value::Array(out)))
     });
     module = module.async_function("pickAttachments", |_| Ok(async { Ok(HostValue::Array(vec![])) }));
-    module = module.async_function("feedbackPickImages", |_| Ok(async { Ok(HostValue::Array(vec![])) }));
     module = module.async_function("knownAgents", |_| Ok(async { Ok(HostValue::Array(vec![])) }));
     module = module.async_function("pickFolder", |_| Ok(async { Ok(HostValue::Null) }));
     module = module.async_function("nextCommand", |_| Ok(std::future::pending::<gpui_shell::HostResult>()));
     module = module.cancellable_async_function("watchFolder", HostValue::Array(vec![]), |_| Ok(std::future::pending::<gpui_shell::HostResult>()));
-    for name in ["exec", "hc", "h2", "readTextFile", "readImageDataUrl", "writeTextFile", "sendFeedback"] {
+    for name in ["exec", "hc", "h2", "readTextFile", "readImageDataUrl", "writeTextFile"] {
         let calls = calls.clone();
         module = module.async_function(name, move |a| {
             let first = a.get(0).map(from_host).unwrap_or(Value::Null);
@@ -1392,16 +1382,21 @@ fn option_key_settings_are_only_shown_on_macos(cx: &mut TestAppContext) {
 fn settings_sections_and_updates(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);
     let staged = Staged::new();
-    for section in ["look", "machines", "drove", "alerts", "privacy"] {
+    for section in ["look", "keyboard", "machines", "ai", "drove", "alerts", "updates"] {
         let mut p = props();
         p["section"] = json!(section);
         let tree = describe(cx, &staged, "frame/settings", true, p, updates("current", "current"), None).unwrap();
-        assert!(!tree.contains("st-s-updates") && !tree.contains("st-check-app") && !tree.contains("st-app-update") && !tree.contains("st-check-core"), "updates UI must stay suppressed in {section}: {tree}");
+        assert!(!tree.contains("st-s-privacy") && !tree.contains("st-telemetry"), "upstream telemetry privacy tab must stay removed in {section}: {tree}");
+        assert!(tree.contains("st-s-updates"), "self-hosted updates tab should render in {section}: {tree}");
     }
     let mut p = props();
     p["section"] = json!("updates");
-    let fallback = describe(cx, &staged, "frame/settings", true, p, updates("ready", "ready"), None).unwrap();
-    assert!(!fallback.contains("st-s-updates") && !fallback.contains("st-check-app") && !fallback.contains("st-app-update") && !fallback.contains("st-check-core"), "updates section must fall back without update UI: {fallback}");
+    let up = describe(cx, &staged, "frame/settings", true, p, updates("ready", "ready"), None).unwrap();
+    assert!(up.contains("st-save-releases-url") && up.contains("st-app-update"), "updates section should render self-hosted release server controls: {up}");
+    let mut p = props();
+    p["section"] = json!("privacy");
+    let fallback = describe(cx, &staged, "frame/settings", true, p, updates("current", "current"), None).unwrap();
+    assert!(!fallback.contains("st-s-privacy") && !fallback.contains("st-telemetry"), "removed privacy section must fall back cleanly: {fallback}");
 }
 
 #[gpui::test]
@@ -1491,29 +1486,6 @@ fn animated_images_advance_with_explicit_and_implicit_ids(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-fn settings_keep_notes_in_the_whats_new_window(cx: &mut TestAppContext) {
-    cx.update(gpui_shell::init);
-    let staged = Staged::new();
-    let notes = json!([
-        {"version":"1.8.0","date":"2026-10-26","items":[{"headline":"Newest headline","detail":"Newest details","fixed":false,"media":[]},{"headline":"","detail":"Newest fix","fixed":true,"media":[]}],"spotlight":true},
-        {"version":"1.7.0","date":"2026-10-25","items":[{"headline":"Older headline","detail":"Older details","fixed":false,"media":[]},{"headline":"Another older headline","detail":"Hidden detail","fixed":false,"media":[]}],"spotlight":true}
-    ]);
-    let mut update = updates("ready", "current");
-    update["notes"] = notes.clone();
-    let mut p = props();
-    p["section"] = json!("look");
-    let tree = describe(cx, &staged, "frame/settings", true, p, update.clone(), None).unwrap();
-    assert!(!tree.contains("st-whats-new") && !tree.contains("st-app-update") && !tree.contains("st-s-updates"));
-    assert!(!tree.contains("Newest details") && !tree.contains("Older headline"));
-    let mut p = props();
-    p["notes"] = notes;
-    let tree = describe(cx, &staged, "frame/whatsnew", true, p, update, None).unwrap();
-    assert!(tree.contains("Newest details") && tree.contains("Older details"));
-    assert!(tree.contains("Also fixed") && tree.contains("Newest fix"));
-    assert!(tree.contains("Oct 26") && !tree.contains("2026-10-26"));
-}
-
-#[gpui::test]
 fn local_state_and_overlay_initial_descriptions(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);
     let start = Instant::now();
@@ -1531,30 +1503,6 @@ fn local_state_and_overlay_initial_descriptions(cx: &mut TestAppContext) {
         .unwrap();
         let expected = ["Herdr runs your terminals in the background", "Add your other machines", "Choose your panels", "Make it yours"][page - 1];
         assert!(tree.contains(expected), "welcome page {page}: {tree}");
-    }
-    for setup in ["", "this.sent = true;", "this.error = 'Fixture error';"] {
-        let tree = describe(
-            cx,
-            &staged,
-            "frame/feedback",
-            true,
-            props(),
-            updates("current", "current"),
-            Some(setup),
-        )
-        .unwrap();
-        assert!(tree.contains("feedback"), "{tree}");
-        if setup.is_empty() {
-            assert!(
-                tree.contains("Input #") && tree.contains("Textarea #") && tree.contains("A prefilled message"),
-                "{tree}"
-            );
-        } else {
-            assert!(
-                tree.contains(if setup.contains("sent") { "Sent. Thanks" } else { "Fixture error" }),
-                "{tree}"
-            );
-        }
     }
     for query in ["settings", "no-such-command"] {
         let tree = describe(
@@ -2754,10 +2702,10 @@ fn split_pane_names_merged_tabs_and_windows_shells(cx: &mut TestAppContext) {
     assert!(aligned_tree.contains("st-dr-ai-strengths-btn"), "Roles header should render AI Strengths button: {aligned_tree}");
     assert!(aligned_tree.contains("st-dr-ai-notes-btn"), "Roles header should render AI Notes button: {aligned_tree}");
     assert!(aligned_tree.contains("st-dr-ai-roles-undo"), "Roles header should render Restore button when backup exists: {aligned_tree}");
-    assert!(aligned_tree.contains("st-dr-role-note-card"), "Roles section should render global Routing Note card: {aligned_tree}");
-    assert!(aligned_tree.contains("st-dr-role-note-ai"), "Global Routing Note card should render AI Note button: {aligned_tree}");
-    assert!(aligned_tree.contains("st-dr-role-note-input"), "Roles section should render global Routing Note textarea: {aligned_tree}");
-    assert!(aligned_tree.contains("st-dr-role-note-save"), "Roles section should render Save Note button: {aligned_tree}");
+    assert!(!aligned_tree.contains("st-dr-role-note-card"), "Roles section should not render redundant global Routing Note card: {aligned_tree}");
+    assert!(!aligned_tree.contains("st-dr-role-note-ai"), "Redundant global Routing Note AI button should not render: {aligned_tree}");
+    assert!(!aligned_tree.contains("st-dr-role-note-input"), "Redundant global Routing Note textarea should not render: {aligned_tree}");
+    assert!(!aligned_tree.contains("st-dr-role-note-save"), "Redundant global Routing Note save button should not render: {aligned_tree}");
     assert!(aligned_tree.contains("st-dr-ai-roles-panel"), "Expanded AI Auto-Config panel should render: {aligned_tree}");
     assert!(aligned_tree.contains("st-dr-ai-roles-prompt"), "Expanded AI panel should render tall multiline Textarea: {aligned_tree}");
     assert!(aligned_tree.contains("st-dr-ai-roles-run"), "Expanded AI Auto-Config panel should render Generate button: {aligned_tree}");
@@ -2778,6 +2726,17 @@ fn split_pane_names_merged_tabs_and_windows_shells(cx: &mut TestAppContext) {
     )
     .unwrap();
     assert!(cnote_popup_tree.contains("st-dr-cnote-ai-reviewer-c0"), "Candidate note popup should render AI Note button: {cnote_popup_tree}");
+    let str_popup_tree = describe(
+        cx,
+        &staged,
+        "frame/settings",
+        true,
+        json!({ "section": "drove" }),
+        updates("current", "current"),
+        Some("this.picking = 'drove-str:reviewer-c0'; this.droveData = { config: { roles: { reviewer: { label: 'Reviewer', access: 'readonly', primary: { agent: 'claude', model: 'claude-sonnet-4-5', effort: 'high', strengths: ['Security Audit'] }, fallbacks: [] } }, ai: { enabled: true } }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'claude', installed: true, models: ['claude-sonnet-4-5'] }] } };"),
+    )
+    .unwrap();
+    assert!(str_popup_tree.contains("st-dr-str-ai-reviewer-c0"), "Candidate strengths popup should render AI Configure button: {str_popup_tree}");
     assert!(aligned_tree.contains("st-dr-eff-reviewer-0-high"), "3-level model (claude-sonnet-4-5) should show High effort: {aligned_tree}");
     assert!(!aligned_tree.contains("st-dr-eff-reviewer-0-xhigh"), "3-level model (claude-sonnet-4-5) must NOT show xhigh effort: {aligned_tree}");
     assert!(aligned_tree.contains("st-dr-eff-reviewer-1-xhigh"), "4-level model (gpt-5.4) should show xhigh effort: {aligned_tree}");
@@ -3801,14 +3760,14 @@ fn changes_and_checkpoints_render_diff_lines_and_inline_review_without_errors(cx
     cx.update(gpui_shell::init);
     let staged = Staged::new();
 
-    // 1) Changes mod: verify description AND real GPUI draw() executing v_virtual_list layout pass without throwing.
+    // 1) Changes mod: verify description AND real GPUI draw() executing measured `list` layout pass without throwing.
     let changes_setup = r#"
         this.root = '/repo/demo';
         this.on = null;
         this.context = this.viewKey();
         this.files = [{ path: 'src/api.rs', status: 'M', fresh: false, add: 2, del: 1 }];
         this.open = 'src/api.rs';
-        this.setLines(['@@ -10,2 +10,3 @@', '-let old_v = 1;', '+let new_v = 2;', '+let extra = 3;']);
+        this.setLines(['@@ -10,2 +10,3 @@', '-let old_v = 1;', '+let new_v = "a very long line that must wrap cleanly to the viewport width instead of being truncated off-screen in narrow panels";', '+let extra = 3;']);
         this.setDrafts([{ id: 'c1', path: 'src/api.rs', side: 'new', start_line: 10, end_line: 11, body: 'Validate range before assigning' }]);
         this.composer = { file: 'src/api.rs', startRowIdx: 2, endRowIdx: 3, side: 'new', startLine: 10, endLine: 11, editingId: null };
     "#;
@@ -3819,11 +3778,12 @@ fn changes_and_checkpoints_render_diff_lines_and_inline_review_without_errors(cx
         fixture(true, json!({}), updates("current", "current")),
         Some(changes_setup),
     ).unwrap();
-    assert!(changes_tree.contains("v_virtual_list \"changes-diff\" ×5 :on_item_click"), "expected virtual list with 4 diff rows + 1 comment: {changes_tree}");
+    assert!(changes_tree.contains("list \"changes-diff\" ×5 :on_item_click"), "expected measured list with 4 diff rows + 1 comment: {changes_tree}");
+    assert!(!changes_tree.contains("changes-diff-x"), "changes diff should wrap to container width without horizontal overflow wrapper: {changes_tree}");
     assert!(changes_tree.contains("chg-inline-composer"), "docked composer must render: {changes_tree}");
     assert!(changes_tree.contains("chg-review-bar"), "review send bar must render: {changes_tree}");
 
-    // Draw real frames so GPUI executes v_virtual_list's layout renderer callback and verify zero runtime errors.
+    // Draw real frames so GPUI executes list's layout renderer callback and verify zero runtime errors.
     let calls = Rc::new(RefCell::new(Calls::default()));
     gpui_shell::policy::set_default(
         Policy::new()
@@ -3846,7 +3806,7 @@ fn changes_and_checkpoints_render_diff_lines_and_inline_review_without_errors(cx
             .ok()
             .and_then(|v| v.read(cx).build_error().map(str::to_owned))
     });
-    assert_eq!(err.unwrap(), None, "changes v_virtual_list layout pass must produce zero errors");
+    assert_eq!(err.unwrap(), None, "changes list layout pass must produce zero errors");
     visual.update(|window, _| window.remove_window());
     cx.run_until_parked();
 
@@ -3856,8 +3816,8 @@ fn changes_and_checkpoints_render_diff_lines_and_inline_review_without_errors(cx
         this.context = this.viewKey();
         this.selectedTurn = 2;
         this.checkpoints = [{ turn: 0, files: [] }, { turn: 2, prompt: 'Refactor parser', files: [{ path: 'src/p.rs', added: 2, deleted: 1 }] }];
-        this.setLines(['File: src/p.rs', '@@ -1,1 +1,2 @@', '-old_fn()', '+new_fn()', '+check()']);
-        this.setDrafts([{ id: 'k1', path: 'src/p.rs', side: 'new', start_line: 1, body: 'Add unit test for check()' }]);
+        this.setLines(['File: src/deeply/nested/path/that/exceeds/narrow/panel/width/p.rs', '@@ -1,1 +1,2 @@', '-old_fn()', '+new_fn("a very long argument string that should wrap cleanly inside checkpoints diff view")', '+check()']);
+        this.setDrafts([{ id: 'k1', path: 'src/deeply/nested/path/that/exceeds/narrow/panel/width/p.rs', side: 'new', start_line: 1, body: 'Add unit test for check()' }]);
     "#;
     let ckpt_tree = describe_with_values(
         cx,
@@ -3866,7 +3826,8 @@ fn changes_and_checkpoints_render_diff_lines_and_inline_review_without_errors(cx
         fixture(true, json!({}), updates("current", "current")),
         Some(ckpt_setup),
     ).unwrap();
-    assert!(ckpt_tree.contains("v_virtual_list \"checkpoints-diff\" ×6 :on_item_click"), "expected virtual list with 5 diff rows + 1 comment: {ckpt_tree}");
+    assert!(ckpt_tree.contains("list \"checkpoints-diff\" ×6 :on_item_click"), "expected measured list with 5 diff rows + 1 comment: {ckpt_tree}");
+    assert!(!ckpt_tree.contains("checkpoints-diff-x"), "checkpoints diff should wrap to container width without horizontal overflow wrapper: {ckpt_tree}");
     assert!(ckpt_tree.contains("ckpt-review-bar"), "checkpoints review bar must render: {ckpt_tree}");
 
     let rt_ckpt = ShellRuntime::new_isolated().unwrap();
@@ -3883,7 +3844,7 @@ fn changes_and_checkpoints_render_diff_lines_and_inline_review_without_errors(cx
             .ok()
             .and_then(|v| v.read(cx).build_error().map(str::to_owned))
     });
-    assert_eq!(err2.unwrap(), None, "checkpoints v_virtual_list layout pass must produce zero errors");
+    assert_eq!(err2.unwrap(), None, "checkpoints list layout pass must produce zero errors");
     visual2.update(|window, _| window.remove_window());
     cx.run_until_parked();
 
@@ -3920,7 +3881,7 @@ fn changes_and_checkpoints_render_diff_lines_and_inline_review_without_errors(cx
     assert!(files_tree.contains("files-review-composer"), "markdown docked composer must render: {files_tree}");
     assert!(files_tree.contains("files-review-bar"), "files shared review bar must render: {files_tree}");
 
-    // 4) Files mod in Line-Comment mode: Checkpoints-identical v_virtual_list + inline comment + docked composer + real GPUI draw().
+    // 4) Files mod in Line-Comment mode: measured `list` with wrapped lines + inline comment + docked composer + real GPUI draw().
     let files_review_setup = r#"
         this.repoRoot = this.root;
         this.file = 'src/main.rs';
@@ -3928,7 +3889,7 @@ fn changes_and_checkpoints_render_diff_lines_and_inline_review_without_errors(cx
         this.loadingFile = false;
         this.fileError = null;
         this.reviewMode = true;
-        this.liveText = 'fn main() {\n    let x = 1;\n    println!("{x}");\n}';
+        this.liveText = 'fn main() {\n    let x = "a very long string literal that must wrap according to panel width in files review mode";\n    println!("{x}");\n}';
         this.diskText = this.liveText;
         this.setReviewDrafts([{ id: 'fr1', path: 'src/main.rs', side: 'file', start_line: 2, end_line: 3, body: 'Extract helper' }]);
         this.reviewComposer = { path: 'src/main.rs', startRowIdx: 1, endRowIdx: 2, startLine: 2, endLine: 3, blockIndex: null, editingId: null };
@@ -3941,9 +3902,10 @@ fn changes_and_checkpoints_render_diff_lines_and_inline_review_without_errors(cx
         Some(files_review_setup),
     ).unwrap();
     assert!(
-        files_review_tree.contains("v_virtual_list \"files-review-lines\" ×5 :on_item_click"),
-        "expected virtual list with 4 file lines + 1 inline comment: {files_review_tree}"
+        files_review_tree.contains("list \"files-review-lines\" ×5 :on_item_click"),
+        "expected measured list with 4 file lines + 1 inline comment: {files_review_tree}"
     );
+    assert!(!files_review_tree.contains("files-review-x"), "files review should wrap to container width without horizontal overflow wrapper: {files_review_tree}");
     assert!(files_review_tree.contains("files-edit-mode"), "expected Edit mode toggle in code toolbar: {files_review_tree}");
     assert!(files_review_tree.contains("files-review-composer"), "expected docked composer in files review mode: {files_review_tree}");
     assert!(files_review_tree.contains("files-review-bar"), "expected review bar in files review mode: {files_review_tree}");
@@ -3962,8 +3924,189 @@ fn changes_and_checkpoints_render_diff_lines_and_inline_review_without_errors(cx
             .ok()
             .and_then(|v| v.read(cx).build_error().map(str::to_owned))
     });
-    assert_eq!(err3.unwrap(), None, "files review v_virtual_list layout pass must produce zero errors");
+    assert_eq!(err3.unwrap(), None, "files review list layout pass must produce zero errors");
     visual3.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn files_changes_and_checkpoints_wrap_long_lines_to_narrow_panel_width(cx: &mut TestAppContext) {
+    use gpui::{Modifiers, VisualTestContext, div, point, px};
+    use gpui::prelude::*;
+
+    struct NarrowRoot(gpui::Entity<gpui_shell::ShellRoot>);
+    impl gpui::Render for NarrowRoot {
+        fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            div().w(px(300.)).h(px(520.)).child(self.0.clone())
+        }
+    }
+
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let long_token = "long_identifier_segment_without_breaks_".repeat(12);
+
+    // 1) Changes: a 400+ char diff line at row 1 must wrap past 50px tall in a 300px panel,
+    //    so clicking 45px below the start of row 1 still selects line 1 (not line 2).
+    let changes_setup = format!(r#"
+        this.viewKey = () => 'pinned-wrap-test';
+        this.refresh = () => {{}};
+        this.loading = false;
+        this.root = '/repo/demo';
+        this.on = null;
+        this.context = 'pinned-wrap-test';
+        this.files = [{{ path: 'src/long.rs', status: 'M', fresh: false, add: 2, del: 0 }}];
+        this.open = 'src/long.rs';
+        this.gitLogOpen = false;
+        this.setLines(['@@ -1,0 +1,2 @@', '+let s = "{long_token}";', '+let short_line = 2;']);
+    "#);
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    gpui_shell::policy::set_default(
+        Policy::new()
+            .with_storage_path(staged.0.join("store-wrap-changes.json"))
+            .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+            .with_host_module(module(fixture(true, json!({}), updates("current", "current")), calls.clone()))
+            .unwrap(),
+    );
+    let rt_chg = ShellRuntime::new_isolated().unwrap();
+    let chg_wrapped = staged.wrapper("mods/changes", &changes_setup);
+    let win_chg = cx.add_window(|window, cx| NarrowRoot(rt_chg.try_load(&chg_wrapped, window, cx).unwrap()));
+    let view_chg: gpui::Entity<gpui_shell::ScriptView> = win_chg
+        .read_with(cx, |root, cx| root.0.read(cx).content().clone().downcast().unwrap())
+        .unwrap();
+    let mut vis_chg = VisualTestContext::from_window(win_chg.into(), cx);
+    vis_chg.update(|window, cx| window.draw(cx).clear(cx));
+    vis_chg.run_until_parked();
+    // Header(42) + file list(44) + hunk(20) = ~106px -> row 1 starts around y=106; clicking at y=160
+    // is >50px inside row 1, which ONLY hits line 1 if row 1 wrapped to >= 3 visual lines!
+    vis_chg.simulate_click(point(px(120.), px(160.)), Modifiers::default());
+    vis_chg.run_until_parked();
+    vis_chg.update(|window, cx| window.draw(cx).clear(cx));
+    let chg_tree = vis_chg.update(|_, cx| {
+        view_chg.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
+    });
+    assert!(
+        chg_tree.contains("src/long.rs · L1\""),
+        "expected wrapped diff line 1 in Changes to span past y=160 (hitting L1, not L2): {chg_tree}"
+    );
+    vis_chg.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+
+    // 2) Checkpoints: same real-layout wrapping proof in a 300px panel.
+    let ckpt_setup = format!(r#"
+        this.viewKey = () => 'pinned-wrap-test';
+        this.refresh = () => {{}};
+        this.loading = false;
+        this.targetAddr = 'a1';
+        this.context = 'pinned-wrap-test';
+        this.selectedTurn = 1;
+        this.checkpoints = [{{ turn: 0, files: [] }}, {{ turn: 1, prompt: 'Wrap test', files: [{{ path: 'src/long.rs', added: 2, deleted: 0 }}] }}];
+        this.setLines(['File: src/long.rs', '@@ -1,0 +1,2 @@', '+let s = "{long_token}";', '+let short_line = 2;']);
+    "#);
+    let rt_ckpt = ShellRuntime::new_isolated().unwrap();
+    let ckpt_wrapped = staged.wrapper("mods/checkpoints", &ckpt_setup);
+    let win_ckpt = cx.add_window(|window, cx| NarrowRoot(rt_ckpt.try_load(&ckpt_wrapped, window, cx).unwrap()));
+    let view_ckpt: gpui::Entity<gpui_shell::ScriptView> = win_ckpt
+        .read_with(cx, |root, cx| root.0.read(cx).content().clone().downcast().unwrap())
+        .unwrap();
+    let mut vis_ckpt = VisualTestContext::from_window(win_ckpt.into(), cx);
+    vis_ckpt.update(|window, cx| window.draw(cx).clear(cx));
+    vis_ckpt.run_until_parked();
+    // Header(42) + bisect bar(39) + checkpoints list(86) + file header(24) + hunk(20) = ~211px;
+    // clicking at y=270 is ~59px inside row 1, which ONLY hits L1 if row 1 wrapped!
+    vis_ckpt.simulate_click(point(px(120.), px(270.)), Modifiers::default());
+    vis_ckpt.run_until_parked();
+    vis_ckpt.update(|window, cx| window.draw(cx).clear(cx));
+    let ckpt_tree = vis_ckpt.update(|_, cx| {
+        view_ckpt.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
+    });
+    assert!(
+        ckpt_tree.contains("src/long.rs · L1\""),
+        "expected wrapped diff line 1 in Checkpoints to span past y=270 (hitting L1, not L2): {ckpt_tree}"
+    );
+    vis_ckpt.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+
+    // 3) Files review mode: same real-layout wrapping proof in a 300px panel.
+    let files_rev_setup = format!(r#"
+        this.refresh = () => {{}};
+        this.pollOpenFile = () => {{}};
+        this.repoRoot = this.root;
+        this.file = 'src/long.rs';
+        this.selectedFile = 'src/long.rs';
+        this.loadingFile = false;
+        this.fileError = null;
+        this.reviewMode = true;
+        this.liveText = 'let s = "{long_token}";\nlet short_line = 2;';
+        this.diskText = this.liveText;
+    "#);
+    let calls_f = Rc::new(RefCell::new(Calls::default()));
+    calls_f.borrow_mut().shared.insert("files.treeOpen".into(), json!(false));
+    gpui_shell::policy::set_default(
+        Policy::new()
+            .with_storage_path(staged.0.join("store-wrap-files.json"))
+            .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+            .with_host_module(module(fixture(true, json!({}), updates("current", "current")), calls_f.clone()))
+            .unwrap(),
+    );
+    let rt_frev = ShellRuntime::new_isolated().unwrap();
+    let frev_wrapped = staged.wrapper("mods/files", &files_rev_setup);
+    let win_frev = cx.add_window(|window, cx| NarrowRoot(rt_frev.try_load(&frev_wrapped, window, cx).unwrap()));
+    let view_frev: gpui::Entity<gpui_shell::ScriptView> = win_frev
+        .read_with(cx, |root, cx| root.0.read(cx).content().clone().downcast().unwrap())
+        .unwrap();
+    let mut vis_frev = VisualTestContext::from_window(win_frev.into(), cx);
+    vis_frev.update(|window, cx| window.draw(cx).clear(cx));
+    vis_frev.run_until_parked();
+    // Toolbar(36) -> row 0 (L1) starts at y=36; clicking at y=96 is 60px below top of L1,
+    // which ONLY hits L1 if line 1 wrapped across multiple visual rows!
+    vis_frev.simulate_click(point(px(120.), px(96.)), Modifiers::default());
+    vis_frev.run_until_parked();
+    vis_frev.update(|window, cx| window.draw(cx).clear(cx));
+    let frev_tree = vis_frev.update(|_, cx| {
+        view_frev.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
+    });
+    assert!(
+        frev_tree.contains("src/long.rs · L1\""),
+        "expected wrapped source line 1 in Files review mode to span past y=96 (hitting L1, not L2): {frev_tree}"
+    );
+    vis_frev.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+
+    // 4) Files source code editor: a 400+ char line 1 wraps across multiple visual rows in a 300px panel,
+    //    so clicking 60px below the top of line 1 and typing 'Z' edits line 1 (not line 2).
+    let long_src = format!("let s = \"{long_token}\";\nlet short_line = 2;\n");
+    let calls_code = Rc::new(RefCell::new(Calls::default()));
+    calls_code.borrow_mut().files.insert("/fixture/project/src/long.rs".into(), long_src.clone());
+    calls_code.borrow_mut().shared.insert("files.treeOpen".into(), json!(false));
+    gpui_shell::policy::set_default(
+        Policy::new()
+            .with_storage_path(staged.0.join("store-wrap-files-code.json"))
+            .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+            .with_host_module(module(fixture(true, json!({ "file": "src/long.rs" }), updates("current", "current")), calls_code.clone()))
+            .unwrap(),
+    );
+    let rt_code = ShellRuntime::new_isolated().unwrap();
+    let win_code = cx.add_window(|window, cx| NarrowRoot(rt_code.try_load(&staged.0.join("mods/files"), window, cx).unwrap()));
+    let mut vis_code = VisualTestContext::from_window(win_code.into(), cx);
+    vis_code.update(|window, cx| window.draw(cx).clear(cx));
+    vis_code.run_until_parked();
+    vis_code.update(|window, cx| window.draw(cx).clear(cx));
+    vis_code.simulate_click(point(px(120.), px(96.)), Modifiers::default());
+    vis_code.simulate_keystrokes("Z");
+    vis_code.run_until_parked();
+    vis_code.simulate_keystrokes("ctrl-s");
+    vis_code.run_until_parked();
+    vis_code.update(|window, cx| window.draw(cx).clear(cx));
+    let written = calls_code.borrow().writes.last().map(|(_, text, _, _)| text.clone()).unwrap_or_default();
+    let mut lines_iter = written.lines();
+    let first_line = lines_iter.next().unwrap_or_default();
+    let second_line = lines_iter.next().unwrap_or_default();
+    assert!(
+        first_line.contains('Z') && second_line == "let short_line = 2;",
+        "expected soft-wrapped source editor line 1 to receive 'Z' at y=96 while line 2 stays untouched, got:\nline1={first_line}\nline2={second_line}"
+    );
+    vis_code.update(|window, _| window.remove_window());
+    gpui_shell::policy::set_default(Policy::new());
     cx.run_until_parked();
 }
 
@@ -4171,6 +4314,10 @@ fn flash_note_button_composer_and_sidebar_list_work_end_to_end(cx: &mut TestAppC
     assert_eq!(tab_new_calls[1]["model"], json!("gemini-4-carbon-high"));
     assert_eq!(tab_new_calls[1]["effort"], json!("high"));
     assert_eq!(tab_new_calls[1]["task"], json!("markdown 的预览页面能否增加行数和批注功能"));
+    assert!(
+        !calls.borrow().effects.iter().any(|(name, _)| name == "closeOverlay"),
+        "saving or sending flash notes must keep the composer window open",
+    );
 }
 
 #[gpui::test]
@@ -4325,8 +4472,8 @@ fn flash_note_group_supports_multiple_inputs_selective_send_and_group_send(cx: &
         json!("[Sprint Ideas]\n\n1. Optimize terminal scroll\n\n2. Render mermaid diagrams\n\n3. Support LaTeX formulas"),
     );
     assert!(
-        full_calls.borrow().effects.iter().any(|(name, _)| name == "closeOverlay"),
-        "sending the whole group must close the composer overlay",
+        !full_calls.borrow().effects.iter().any(|(name, _)| name == "closeOverlay"),
+        "sending the whole group must keep the composer overlay open until closed via the top-right X button",
     );
 }
 

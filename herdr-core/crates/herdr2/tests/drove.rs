@@ -2636,7 +2636,12 @@ fn drove_ai_note_buttons_and_one_click_configure_generate_notes_end_to_end() {
                         json!({"data":[{"id":"mock-notes-model"}]}).to_string()
                     } else if first_line.starts_with("POST /v1/chat/completions") {
                         let req_body = req.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("");
-                        let content = if req_body.contains(r#"\"noteScope\":\"global\""#)
+                        let content = if (req_body.contains(r#"\"mode\":\"strengths\""#)
+                            || req_body.contains(r#""mode":"strengths""#))
+                            && req_body.contains("targetCandidate")
+                        {
+                            r#"{"rationale":"已为该候选匹配擅长任务","strengths":["复杂架构","疑难排障"]}"#
+                        } else if req_body.contains(r#"\"noteScope\":\"global\""#)
                             || req_body.contains(r#""noteScope":"global""#)
                         {
                             r#"{"rationale":"已生成全局备注","note":"全局规则：高峰期避开双倍计费模型，审查优先使用异构厂商。"}"#
@@ -2756,6 +2761,193 @@ fn drove_ai_note_buttons_and_one_click_configure_generate_notes_end_to_end() {
     let coder_primary_note = persisted["config"]["roles"]["coder"]["primary"]["note"].as_str().unwrap_or("");
     assert!(!coder_primary_note.is_empty(), "expected coder primary note after one-click configure: {persisted}");
 
+    // 4. Inline Single-Candidate Strengths AI Configure (`mode: strengths`, `targetRole`, `targetCandidateIndex`, `apply: true`).
+    let s_req = s.root.join("req-cand-strengths.json");
+    std::fs::write(
+        &s_req,
+        serde_json::to_vec(&json!({
+            "mode": "strengths",
+            "targetRole": "coder",
+            "targetCandidateIndex": 0,
+            "apply": true,
+            "language": "zh-CN"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let s_res = s.json(&["drove", "roles-ai-config", "--file", s_req.to_str().unwrap(), "--consume"]);
+    assert_eq!(s_res["ok"], json!(true), "single-candidate AI strengths failed: {s_res}");
+    assert_eq!(s_res["applied"], json!(true));
+    assert_eq!(s_res["strengths"], json!(["复杂架构", "疑难排障"]));
+    let persisted_after_str = s.json(&["drove", "settings"]);
+    assert_eq!(
+        persisted_after_str["config"]["roles"]["coder"]["primary"]["strengths"],
+        json!(["复杂架构", "疑难排障"])
+    );
+    assert_eq!(
+        persisted_after_str["config"]["roles"]["coder"]["fallbacks"][0]["strengths"],
+        json!(["快速修复"]),
+        "sibling fallback candidate strengths must remain untouched"
+    );
+
     stop.store(true, Ordering::Relaxed);
     let _ = srv.join();
+}
+
+#[test]
+fn drove_cli_runs_roles_and_roles_ai_config_guard() {
+    let s = Session::new();
+
+    // Bare `drove roles-ai-config` without --apply / --dry-run / --file must fail safely.
+    let guard_out = s.h2(&["drove", "roles-ai-config"]);
+    assert!(!guard_out.status.success(), "bare roles-ai-config must require --apply or --dry-run");
+    let guard_err = String::from_utf8_lossy(&guard_out.stderr);
+    assert!(
+        guard_err.contains("--apply") && guard_err.contains("--dry-run") && guard_err.contains("h2 drove roles"),
+        "expected helpful guard message, got: {guard_err}"
+    );
+
+    // Read-only `drove roles` and `drove runs` / `drove ls` must succeed cleanly.
+    let roles = s.json(&["drove", "roles"]);
+    assert!(roles["roles"].is_object(), "expected roles object: {roles}");
+    assert!(roles["roles"].get("coder").is_some(), "expected default coder role: {roles}");
+
+    let runs = s.json(&["drove", "runs"]);
+    assert!(runs["runs"].is_array(), "expected runs array: {runs}");
+    let ls = s.json(&["drove", "ls"]);
+    assert!(ls["runs"].is_array(), "expected `drove ls` alias to list runs: {ls}");
+}
+
+#[test]
+fn drove_worker_reported_failure_does_not_auto_retry_and_wakes_wait() {
+    let s = drove_session();
+    let _ = wait_web_port(&s);
+
+    // Configure reviewer role with 2 fallbacks to prove `worker_reported` does NOT blindly retry
+    // through the fallback chain when the worker calls `drove worker done --outcome failed`.
+    let spec = fake_acp_spec();
+    let cfg_file = s.root.join("reviewer-fallbacks-cfg.json");
+    std::fs::write(
+        &cfg_file,
+        serde_json::to_vec(&json!({
+            "roles": {
+                "coder": {
+                    "label": "Coder",
+                    "access": "writable",
+                    "primary": { "agent": spec, "effort": "high" },
+                    "fallbacks": []
+                },
+                "reviewer": {
+                    "label": "Reviewer",
+                    "access": "readonly",
+                    "primary": { "agent": spec, "effort": "high" },
+                    "fallbacks": [
+                        { "agent": spec, "effort": "medium" },
+                        { "agent": spec, "effort": "low" }
+                    ]
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    s.json(&["drove", "settings-set", "--file", cfg_file.to_str().unwrap(), "--consume"]);
+
+    let run_dir = s.root.join("repo-worker-reported");
+    std::fs::create_dir_all(&run_dir).unwrap();
+
+    // 1. Verify reviewer `worker_reported` fails immediately without auto-retry and wakes `drove wait`.
+    let plan = json!({
+        "objective": "Verify worker_reported fails immediately without auto-retry",
+        "cwd": run_dir.display().to_string(),
+        "tasks": [
+            {
+                "key": "review-gate",
+                "title": "Read-only review gate",
+                "spec": {
+                    "target": "repo",
+                    "change": "SH:herdr2 drove worker done --outcome failed --reason \"found 6 critical bugs\"",
+                    "acceptance": "Report defects"
+                },
+                "assign": { "role": "reviewer" }
+            }
+        ]
+    });
+    let plan_file = s.root.join("plan-reviewer.json");
+    std::fs::write(&plan_file, serde_json::to_vec(&plan).unwrap()).unwrap();
+    let started = s.json(&["drove", "plan", "--file", plan_file.to_str().unwrap()]);
+    let run_id = started["run"]["id"].as_str().unwrap().to_string();
+
+    let waited = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "10"]);
+    assert_eq!(waited["timedOut"], false, "wait must wake on worker_reported failure: {waited}");
+    assert_eq!(waited["settled"], true, "single-task run should settle immediately: {waited}");
+    let msgs = waited["messages"].as_array().unwrap();
+    assert!(
+        msgs.iter().any(|m| m["type"] == "failed" && m["body"].as_str().unwrap_or("").contains("6 critical bugs")),
+        "expected failure message waking wait: {msgs:?}"
+    );
+
+    let snap = s.json(&["drove", "show", &run_id]);
+    let task = &snap["tasks"][0];
+    assert_eq!(task["status"], "failed");
+    assert_eq!(task["failures"], 1, "must not auto-retry worker_reported failures");
+    let attempts = snap["attempts"].as_array().unwrap();
+    assert_eq!(attempts.len(), 1, "expected exactly 1 attempt (no fallback retries): {attempts:?}");
+    assert_eq!(attempts[0]["failure"]["kind"], "worker_reported");
+
+    // 2. Verify reused warm worker succeeds across sequential tasks despite frozen H2_DROVE_ATTEMPT_ID,
+    //    and never produces a self-referential `forkedFrom`.
+    let plan2 = json!({
+        "objective": "Verify warm worker reuse across tasks",
+        "cwd": run_dir.display().to_string(),
+        "tasks": [
+            {
+                "key": "t1",
+                "title": "First task",
+                "spec": {
+                    "target": "repo",
+                    "change": "SH:herdr2 drove worker context >/dev/null && herdr2 drove worker done --outcome done --summary \"t1 ok\"",
+                    "acceptance": "t1 done"
+                },
+                "assign": { "role": "coder" }
+            },
+            {
+                "key": "t2",
+                "title": "Second task on reused worker",
+                "deps": ["t1"],
+                "spec": {
+                    "target": "repo",
+                    "change": "SH:herdr2 drove worker context >/dev/null && herdr2 drove worker done --outcome done --summary \"t2 ok\"",
+                    "acceptance": "t2 done"
+                },
+                "assign": { "role": "coder" }
+            }
+        ]
+    });
+    let plan2_file = s.root.join("plan-reuse.json");
+    std::fs::write(&plan2_file, serde_json::to_vec(&plan2).unwrap()).unwrap();
+    let started2 = s.json(&["drove", "plan", "--file", plan2_file.to_str().unwrap()]);
+    let run2_id = started2["run"]["id"].as_str().unwrap().to_string();
+
+    let waited2 = s.json(&["drove", "wait", "--run", &run2_id, "--timeout", "15"]);
+    assert_eq!(waited2["settled"], true, "reused worker run should settle: {waited2}");
+    let snap2 = s.json(&["drove", "show", &run2_id]);
+    for t in snap2["tasks"].as_array().unwrap() {
+        assert_eq!(t["status"], "succeeded", "task should succeed on reused worker: {t}");
+    }
+    let atts2 = snap2["attempts"].as_array().unwrap();
+    assert_eq!(atts2.len(), 2, "expected 2 attempts with zero no_done retries: {atts2:?}");
+    assert_eq!(atts2[1]["reused"], true, "second task should reuse warm worker: {atts2:?}");
+    for w in snap2["workers"].as_array().unwrap() {
+        if let Some(ff) = w.get("forkedFrom").and_then(Value::as_str) {
+            assert_ne!(Some(ff), w.get("h2Agent").and_then(Value::as_str), "forkedFrom must never self-reference: {w}");
+            assert_ne!(ff, w["id"].as_str().unwrap_or(""), "forkedFrom must never equal worker id: {w}");
+        }
+    }
+
+    // 3. Verify `drove runs` lists both runs.
+    let listed = s.json(&["drove", "runs"]);
+    let runs_arr = listed["runs"].as_array().unwrap();
+    assert!(runs_arr.iter().any(|r| r["id"] == run_id), "missing run_id in `drove runs`: {listed}");
+    assert!(runs_arr.iter().any(|r| r["id"] == run2_id), "missing run2_id in `drove runs`: {listed}");
 }

@@ -69,11 +69,13 @@ export function openRunEvents(
     source.addEventListener("error", () => {
       if (dead || source !== es) return;
       handlers.onLink(opened ? "reconnecting" : "connecting");
-      if (source.readyState === EventSource.CLOSED) {
-        const delay = Math.min(10_000, 500 * 2 ** attempt);
-        attempt += 1;
-        retryTimer = window.setTimeout(connect, delay);
-      }
+      // Always close and drive reconnect explicitly with bounded backoff so server restarts
+      // or stalled background tabs never leave EventSource stuck in CONNECTING/CLOSED.
+      es = null;
+      source.close();
+      const delay = Math.min(5_000, 500 * 2 ** attempt);
+      attempt += 1;
+      retryTimer = window.setTimeout(connect, delay);
     });
     source.addEventListener("change", (ev) => {
       if (dead || source !== es) return;

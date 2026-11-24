@@ -377,7 +377,7 @@ export interface Attempt {
 }
 export interface Worker {
   id: string; runId: string; agent: string; model?: string; effort?: Effort;
-  sessionKey: string; cwd: string; worktree?: string;
+  sessionKey: string; h2Agent?: string; cwd: string; worktree?: string;
   state: WorkerState; currentAttemptId?: string;
   /** Host PID of the detached ACP supervisor (outside the sandbox PID namespace). */
   pid?: number;
@@ -555,7 +555,7 @@ export interface StatsEntry {
 export type StatsTable = Record<string, StatsEntry>;
 export interface RunSnapshot {
   run: Run; tasks: Task[]; workers: Worker[]; attempts: Attempt[];
-  pendingMessages: Message[]; messages?: Message[]; stats: { tokens: number; cost: number; aiTokens?: number; aiCost?: number };
+  pendingMessages: Message[]; messages?: Message[]; stats: { tokens: number; cost: number; workerTokens?: number; workerCost?: number; aiTokens?: number; aiCost?: number };
   /** Stall signals computed by the daemon for the overview bar. */
   stalls?: StallSignal[];
 }

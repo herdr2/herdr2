@@ -240,33 +240,6 @@ pub fn name(app: &str) -> String {
     TABLE.with(|t| find(&t.borrow(), app).map(|(key, e)| e.name.clone().unwrap_or_else(|| key.to_owned()))).unwrap_or_else(|| app.to_owned())
 }
 
-/// An agent's 7501 `app` as a name Herdr ships (`claude` for `claude-code`),
-/// else `other` (`unknown` when it gave none): never the person's own words.
-pub fn agent_name(app: Option<&str>) -> String {
-    static NAMES: std::sync::OnceLock<BTreeMap<String, String>> = std::sync::OnceLock::new();
-    let names = NAMES.get_or_init(|| {
-        let table: Table = serde_json::from_str(BUILT_IN).expect("defaults/programs.json");
-        let mut names = BTreeMap::new();
-        for (key, e) in &table.programs {
-            for alias in &e.also {
-                names.insert(alias.to_lowercase(), key.clone());
-            }
-            names.insert(key.to_lowercase(), key.clone());
-        }
-        // Cursor's CLI is `agent`; keep that alias over the generic `agent` key.
-        if let Some(cursor) = table.programs.get("cursor") {
-            for alias in &cursor.also {
-                names.insert(alias.to_lowercase(), "cursor".into());
-            }
-        }
-        names
-    });
-    match app.map(str::trim).filter(|a| !a.is_empty()) {
-        None => "unknown".into(),
-        Some(a) => names.get(&a.to_lowercase()).cloned().unwrap_or_else(|| "other".into()),
-    }
-}
-
 fn base(s: &str) -> &str {
     let s = s.rsplit(['/', '\\']).next().unwrap_or(s);
     let s = s.trim_start_matches('-');
@@ -343,11 +316,21 @@ fn is_agent_entry(key: &str, e: &Entry) -> bool {
     !e.run.is_empty() || key == "agent"
 }
 
+fn strip_real_suffix(s: &str) -> Option<&str> {
+    let i = s.len().checked_sub(5)?;
+    (s.is_char_boundary(i) && s[i..].eq_ignore_ascii_case(".real")).then_some(&s[..i])
+}
+
+fn find_with_real<'a>(t: &'a Table, name: &str) -> Option<(&'a str, &'a Entry)> {
+    find(t, name).or_else(|| strip_real_suffix(name).and_then(|stem| find(t, stem)))
+}
+
 fn find_agent_segment<'a>(t: &'a Table, seg: &str) -> Option<(&'a str, &'a Entry)> {
     let seg = [".exe", ".cmd", ".bat", ".ps1", ".js", ".mjs", ".cjs", ".ts", ".py", ".rb"]
         .iter()
         .find_map(|ext| seg.strip_suffix(ext))
         .unwrap_or(seg);
+    let seg = strip_real_suffix(seg).unwrap_or(seg);
     let trimmed = seg.strip_suffix("-cli").or_else(|| seg.strip_suffix("-ai"));
     for candidate in std::iter::once(seg).chain(trimmed) {
         if let Some((key, e)) = find(t, candidate).filter(|(k, e)| is_agent_entry(k, e)) {
@@ -385,7 +368,7 @@ fn find_agent_in_path<'a>(t: &'a Table, path: &str) -> Option<(&'a str, &'a Entr
 
 fn resolve(t: &Table, app: Option<&str>, argv: &[String]) -> Value {
     if let Some(app) = app.filter(|a| !a.is_empty()) {
-        return match find(t, app) {
+        return match find_with_real(t, app) {
             Some((key, e)) => shown(key, e, None, false, true),
             None => shown("agent", t.programs.get("agent").unwrap_or(&Entry::default()), Some(app), false, true),
         };
@@ -418,7 +401,7 @@ fn resolve(t: &Table, app: Option<&str>, argv: &[String]) -> Value {
             // A script's name without its extension (`vite.js`), never a module path (`http.server`).
             let name = base(arg);
             let stem = [".js", ".mjs", ".cjs", ".ts", ".py", ".rb"].iter().find_map(|x| name.strip_suffix(x)).unwrap_or(name);
-            if let Some((key, e)) = find(t, stem).filter(|(k, _)| !t.interpreters.iter().any(|i| i == k)) {
+            if let Some((key, e)) = find_with_real(t, stem).filter(|(k, _)| !t.interpreters.iter().any(|i| i == k)) {
                 return shown(key, e, None, false, is_agent_entry(key, e));
             }
             if (arg.contains('/') || arg.contains('\\'))
@@ -428,7 +411,7 @@ fn resolve(t: &Table, app: Option<&str>, argv: &[String]) -> Value {
             }
         }
     }
-    if let Some((key, e)) = find(t, first) {
+    if let Some((key, e)) = find_with_real(t, first) {
         return shown(key, e, None, false, is_agent_entry(key, e));
     }
     if !t.shells.iter().any(|s| s == first)
@@ -580,6 +563,18 @@ mod tests {
             "claude"
         );
         assert!(is_agent(&["powershell.exe", "-ExecutionPolicy", "Bypass", "-NoExit", "-Command", "& 'claude' '--dangerously-skip-permissions'"]));
+        // Wrapped `.real` binaries (e.g. proxy wrappers exec'ing `agy.real` / `claude.real`) resolve as their agent.
+        assert_eq!(key(None, &["agy.real"]), "antigravity");
+        assert!(is_agent(&["agy.real"]));
+        assert_eq!(key(None, &["/home/u/.local/bin/agy.real", "--dangerously-skip-permissions"]), "antigravity");
+        assert!(is_agent(&["/home/u/.local/bin/agy.real", "--dangerously-skip-permissions"]));
+        assert_eq!(resolve(&t(), None, &["/home/u/.local/bin/agy.real".into()])["name"], "Antigravity");
+        assert_eq!(key(None, &[r"C:\Users\u\agy.real.exe"]), "antigravity");
+        assert!(is_agent(&[r"C:\Users\u\agy.real.exe"]));
+        assert_eq!(key(None, &["/home/u/.local/bin/claude.real"]), "claude");
+        assert!(is_agent(&["/home/u/.local/bin/claude.real"]));
+        assert_eq!(key(None, &["mytool.real"]), "program");
+        assert!(!is_agent(&["mytool.real"]));
     }
 
     #[cfg(unix)]

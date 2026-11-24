@@ -1,6 +1,6 @@
 // A side-by-side collapsible file browser for the focused pane's folder, with Typora-style live Markdown editing, image rendering, and IDE-themed code viewing.
-import { View, div, svg } from "gpui-kit";
-import { v_flex, h_flex, h_resizable, resizable_panel, Editor, EditorState, Input, InputState, TextareaState, Textarea, Popup, Scrollbar, v_virtual_list, TextView } from "gpui-base";
+import { View, div, svg, list } from "gpui-kit";
+import { v_flex, h_flex, h_resizable, resizable_panel, Editor, EditorState, Input, InputState, TextareaState, Textarea, Popup, Scrollbar, TextView } from "gpui-base";
 import { spaces, panes, agents, terminals, focused, exec, readTextFile, readImageDataUrl, writeTextFile, watchFolder, theme, settings, window, layout, run, props, shared, setShared, checking, notify } from "herdr";
 import { detectFileKind, CODE_THEMES, MD_THEMES, resolveCodeTheme, resolveMdTheme, resolveRelativeFileLink, resolveRelativeAssetPath } from "./themes.js";
 import {
@@ -257,7 +257,6 @@ export default class Files extends View {
     this._reviewRowsText = null;
     this._reviewRowsPath = null;
     this._reviewNumWidth = 30;
-    this._reviewWidth = 300;
     this.reviewTargetOverride = null;
     this.reviewTargetPopupOpen = false;
     this.reviewSteerMode = false;
@@ -422,7 +421,7 @@ export default class Files extends View {
   }
 
   softWrap() {
-    return readBool("files.wordWrap", false);
+    return true;
   }
 
   watch(root, cx) {
@@ -1765,7 +1764,6 @@ export default class Files extends View {
     this._reviewRows = buildFileRows(this.liveText, repoPath);
     const numCols = Math.max(3, String(this._reviewRows.length).length);
     this._reviewNumWidth = Math.max(30, numCols * 8 + 6);
-    this._reviewWidth = Math.max(300, ...this._reviewRows.map((row) => (row.text.length + 1) * 7 + this._reviewNumWidth + 42));
     return this._reviewRows;
   }
 
@@ -2032,16 +2030,17 @@ export default class Files extends View {
 
     return h_flex()
       .w_full()
-      .h(20)
-      .flex_none()
+      .min_w(0)
+      .min_h(20)
+      .pr(14)
       .gap(6)
-      .items_center()
+      .items_start()
       .when(Boolean(rowBg), (e) => e.bg(rowBg))
       .when(row.commentable, (e) => e.cursor_pointer().hover((s) => s.bg(withAlpha(accent, "18") ?? t.hover)))
       .child(
         div()
           .w(3)
-          .h_full()
+          .self_stretch()
           .flex_none()
           .when(inSel || hasComment, (e) => e.bg(accent)),
       )
@@ -2049,6 +2048,8 @@ export default class Files extends View {
         div()
           .w(14)
           .flex_none()
+          .py(1)
+          .line_height("18px")
           .text_center()
           .text_size(11)
           .text_color(inSel || hasComment ? accent : t.dim)
@@ -2058,11 +2059,13 @@ export default class Files extends View {
         div()
           .w(this._reviewNumWidth ?? 30)
           .flex_none()
+          .py(1)
+          .line_height("18px")
           .text_right()
           .text_color(inSel ? t.foreground : t.dim)
           .child(String(row.lineNumber)),
       )
-      .child(div().flex_1().min_w(0).truncate().child(row.text));
+      .child(div().flex_1().min_w(0).py(1).line_height("18px").whitespace_normal().child(row.text));
   }
 
   renderSavedComment(item, t) {
@@ -2070,6 +2073,7 @@ export default class Files extends View {
     const accent = t.accent ?? "#3b82f6";
     return div()
       .w_full()
+      .min_w(0)
       .px(10)
       .py(4)
       .flex_none()
@@ -2077,6 +2081,7 @@ export default class Files extends View {
       .child(
         v_flex()
           .w_full()
+          .min_w(0)
           .max_w(580)
           .p(8)
           .gap(4)
@@ -3894,7 +3899,7 @@ export default class Files extends View {
       const fileRows = this.getFileRows();
       const openComments = this.reviewDrafts().filter((c) => c.path === repoPath);
       const activeComposer = this.reviewComposer && this.reviewComposer.path === repoPath ? this.reviewComposer : null;
-      const { items, sizes } = buildFileDisplayItems(fileRows, openComments, activeComposer);
+      const { items } = buildFileDisplayItems(fileRows, openComments, activeComposer);
       const commentedSet = new Set();
       let lastCodeRowIdx = null;
       for (const item of items) {
@@ -3905,35 +3910,27 @@ export default class Files extends View {
       return div()
         .id("files-review-view")
         .flex_1()
+        .w_full()
+        .min_w(0)
         .min_h(0)
         .relative()
+        .overflow_hidden()
         .bg(t.background)
         .font_family(settings().font_family ?? "JetBrains Mono")
         .text_size(11)
         .on_mouse_down("left", (e) => { this.lastShift = Boolean(e?.modifiers?.shift); })
         .child(
-          div()
-            .id("files-review-x")
-            .size_full()
-            .overflow_x_scrollbar()
-            .child(
-              div()
-                .w_full()
-                .min_w(this._reviewWidth ?? 300)
-                .h_full()
-                .child(
-                  v_virtual_list(
-                    "files-review-lines",
-                    items.length,
-                    sizes,
-                    (i) => items[i]?.key ?? String(i),
-                    (range) => items.slice(range.start, range.end).map((item) => {
-                      if (item.type === "comment") return this.renderSavedComment(item, t);
-                      return this.renderReviewCodeRow(item.row, t, activeComposer, commentedSet);
-                    }),
-                  ).on_item_click((itemKey, cx) => this.handleReviewVirtualItemClick(itemKey, cx)).size_full(),
-                ),
-            ),
+          list(
+            "files-review-lines",
+            items.length,
+            (i) => items[i]?.key ?? String(i),
+            (i) => {
+              const item = items[i];
+              if (!item) return div().h(0);
+              if (item.type === "comment") return this.renderSavedComment(item, t);
+              return this.renderReviewCodeRow(item.row, t, activeComposer, commentedSet);
+            },
+          ).on_item_click((itemKey, cx) => this.handleReviewVirtualItemClick(itemKey, cx)).size_full(),
         )
         .child(Scrollbar.vertical("files-review-lines").viewport_from_layout().absolute().inset_0());
     }
@@ -3945,12 +3942,16 @@ export default class Files extends View {
     return v_flex()
       .id("files-code-view")
       .flex_1()
+      .w_full()
+      .min_w(0)
       .min_h(0)
       .overflow_hidden()
       .bg(codeTheme.colors.background)
       .child(
         div()
           .flex_1()
+          .w_full()
+          .min_w(0)
           .min_h(0)
           .overflow_hidden()
           .child(this.code ? Editor.new(this.code).size_full().bg(codeTheme.colors.background) : div().p(12).text_color(t.dim).child(tr("Preparing editor…", "正在准备编辑器…"))),

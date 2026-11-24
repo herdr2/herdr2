@@ -1,11 +1,11 @@
-# Installs herdr2 (h2) on Windows, or updates it:
+# Installs herdr2 (h2) on Windows, or updates it from a self-hosted release server:
 #
-#   powershell -c "irm https://releases.herdr.dev/core/install.ps1 | iex"
+#   $env:HERDR2_RELEASES_URL="https://your-host"; irm "$env:HERDR2_RELEASES_URL/core/install.ps1" | iex
 #
 # Into %LOCALAPPDATA%\Programs\herdr2 (herdr2.exe), added to your PATH, with
 # h2.exe hardlinked beside it if no `h2` exists. No admin needed.
-# H2_VERSION=0.2.0 picks a version; HERDR2_RELEASES_URL points elsewhere
-# (tests); H2_INSTALL_DIR installs elsewhere.
+# H2_VERSION=0.2.0 picks a version; HERDR2_RELEASES_URL is required unless a local zip is passed;
+# H2_INSTALL_DIR installs elsewhere.
 
 & {
 $zip, $session = $args
@@ -15,7 +15,8 @@ $ProgressPreference = "SilentlyContinue"
 
 function Fail($why) { throw "h2: $why" }
 
-$releases = if ($env:HERDR2_RELEASES_URL) { $env:HERDR2_RELEASES_URL.TrimEnd("/") } else { "https://releases.herdr.dev" }
+$releases = if ($env:HERDR2_RELEASES_URL) { $env:HERDR2_RELEASES_URL.TrimEnd("/") } else { "" }
+if (-not $zip -and -not $releases) { Fail "set `$env:HERDR2_RELEASES_URL to your release server base URL" }
 $dir = if ($env:H2_INSTALL_DIR) { $env:H2_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "Programs\herdr2" }
 $arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
 if ($arch -ne "AMD64") { Fail "no build for $arch Windows yet (x64 only)" }

@@ -814,6 +814,10 @@ pub async fn configure_roles_with_ai(
     let started = Instant::now();
     let mode = AiRoleConfigMode::from_opt(params.mode.as_deref());
     let note_scope = AiNoteScope::from_params(params.note_scope.as_deref(), params.target_role.as_deref());
+    let is_single_candidate_strengths = mode == AiRoleConfigMode::Strengths
+        && params.target_role.as_deref().map(str::trim).is_some_and(|s| !s.is_empty());
+    let is_single_target =
+        (mode == AiRoleConfigMode::Notes && note_scope != AiNoteScope::All) || is_single_candidate_strengths;
     let fail = |msg: String, probed_refreshed: bool| DroveRolesAiConfigureResult {
         ok: false,
         applied: false,
@@ -822,6 +826,7 @@ pub async fn configure_roles_with_ai(
         latency_ms: started.elapsed().as_millis() as u64,
         rationale: None,
         note: None,
+        strengths: None,
         roles: None,
         settings: None,
         error: Some(msg),
@@ -841,10 +846,10 @@ pub async fn configure_roles_with_ai(
     }
 
     // Gather agent & model inventory; refresh installed flags first.
-    // Single-field note generation (`global` / `candidate`) only inspects current roles & quotas, so skip slow full probe.
+    // Single-target generation (`global`/`candidate` note or single-candidate strengths) inspects current roles & quotas, so skip slow full probe.
     let mut probed = core.drove.cached_probe();
     let mut probed_refreshed = false;
-    if !(mode == AiRoleConfigMode::Notes && note_scope != AiNoteScope::All) {
+    if !is_single_target {
         if !probed.agents.is_empty() {
             let _ = super::probe::refresh_installed_status(core, &mut probed).await;
         }
@@ -938,13 +943,14 @@ pub async fn configure_roles_with_ai(
         "Write `rationale`, any `note` fields, and any `strengths` tags in concise English (2-3 words per strength tag, e.g. \"Backend Architecture\", \"Frontend UI\", \"Complex Refactor\", \"Bugfix & Debug\", \"Unit Tests\", \"Security Review\", \"Codebase Research\")."
     };
 
-    // Validate candidate target up front when `mode == Notes && note_scope == Candidate`.
-    let candidate_target_info: Option<(String, usize, Value)> = if mode == AiRoleConfigMode::Notes
-        && note_scope == AiNoteScope::Candidate
+    // Validate candidate target up front for single-candidate note or strengths generation.
+    let candidate_target_info: Option<(String, usize, Value)> = if (mode == AiRoleConfigMode::Notes
+        && note_scope == AiNoteScope::Candidate)
+        || is_single_candidate_strengths
     {
         let role_id = params.target_role.as_deref().map(str::trim).filter(|s| !s.is_empty());
         let Some(rid) = role_id else {
-            return fail("缺少 targetRole 参数，无法生成单候选备注".into(), probed_refreshed);
+            return fail("缺少 targetRole 参数，无法生成单候选配置".into(), probed_refreshed);
         };
         let Some(role_cfg) = cfg.roles.get(rid) else {
             return fail(format!("未找到角色 `{rid}`"), probed_refreshed);
@@ -1007,6 +1013,17 @@ pub async fn configure_roles_with_ai(
              8. {lang_rule}\n\
              9. Output ONLY valid JSON matching:\n\
              {{\"rationale\":\"1-2 sentences\",\"roles\":{{\"<roleId>\":{{\"candidates\":[{{\"agent\":\"...\",\"model\":\"...\"|null,\"effort\":\"high\",\"fast\":false,\"context\":null}}]}}}}}}"
+        ),
+        (AiRoleConfigMode::Strengths, _) if is_single_candidate_strengths => format!(
+            "You are a pure JSON configuration architect for Drove (a multi-agent software engineering orchestrator). \
+             Configure ONLY the `strengths` array (2-4 concise, distinct work-type tags) specifically for `targetCandidate` (`agent` + `model` + `effort`) inside its role.\n\
+             Rules:\n\
+             1. Match `targetCandidate`'s real capabilities and differentiate its `strengths` cleanly from `targetCandidate.siblings` when siblings exist.\n\
+             2. Consider `targetCandidate.roleLabel`, `roleSummary`, `roleAccess`, and `currentNote` if present.\n\
+             3. Strictly honor `userPreference` if non-empty.\n\
+             4. {lang_rule}\n\
+             5. Output ONLY valid JSON matching:\n\
+             {{\"rationale\":\"1 short sentence\",\"strengths\":[\"...\",\"...\"]}}"
         ),
         (AiRoleConfigMode::Strengths, _) => format!(
             "You are a pure JSON configuration architect for Drove (a multi-agent software engineering orchestrator). \
@@ -1098,7 +1115,7 @@ pub async fn configure_roles_with_ai(
         payload_val["targetCandidate"] = target_val.clone();
     }
     let user_payload = payload_val.to_string();
-    let max_tokens = if mode == AiRoleConfigMode::Notes && note_scope != AiNoteScope::All { 512 } else { 2560 };
+    let max_tokens = if is_single_target { 512 } else { 2560 };
 
     let resp = match core
         .ai
@@ -1162,6 +1179,53 @@ pub async fn configure_roles_with_ai(
             latency_ms: started.elapsed().as_millis() as u64,
             rationale,
             note: Some(generated_note),
+            strengths: None,
+            roles: updated_roles,
+            settings,
+            error: None,
+        };
+    }
+
+    // Fast path: single-candidate task strengths generation.
+    if is_single_candidate_strengths {
+        let (generated_strengths, rationale) = match parse_single_ai_strengths(&resp.content) {
+            Ok(v) => v,
+            Err(e) => return fail(e, probed_refreshed),
+        };
+        let mut updated_roles: Option<BTreeMap<String, RoleConfig>> = None;
+        let settings = if should_apply {
+            let Some((ref rid, cand_idx, _)) = candidate_target_info else {
+                return fail("缺少单候选定位信息".into(), probed_refreshed);
+            };
+            let mut next_roles = cfg.roles.clone();
+            if let Some(role) = next_roles.get_mut(rid) {
+                if cand_idx == 0 {
+                    role.primary.strengths = generated_strengths.clone();
+                } else if let Some(fb) = role.fallbacks.get_mut(cand_idx - 1) {
+                    fb.strengths = generated_strengths.clone();
+                }
+            }
+            updated_roles = Some(next_roles.clone());
+            match core
+                .drove
+                .rpc_settings_set(DroveSettingsSetParams { roles: Some(next_roles), ..Default::default() })
+                .await
+            {
+                Ok(s) => Some(s),
+                Err(e) => return fail(format!("保存擅长任务失败: {}", e.message), probed_refreshed),
+            }
+        } else {
+            None
+        };
+        return DroveRolesAiConfigureResult {
+            ok: true,
+            applied: should_apply,
+            probed_refreshed,
+            model_used: Some(resp.model),
+            latency_ms: started.elapsed().as_millis() as u64,
+            rationale,
+            note: None,
+            strengths: Some(generated_strengths),
             roles: updated_roles,
             settings,
             error: None,
@@ -1200,10 +1264,34 @@ pub async fn configure_roles_with_ai(
         latency_ms: started.elapsed().as_millis() as u64,
         rationale,
         note: next_note,
+        strengths: None,
         roles: Some(next_roles),
         settings,
         error: None,
     }
+}
+
+pub(crate) fn parse_single_ai_strengths(raw: &str) -> Result<(Vec<String>, Option<String>), String> {
+    let parsed = extract_json_object(raw)
+        .ok_or_else(|| format!("AI 未返回有效的 JSON 擅长任务: {}", raw.chars().take(160).collect::<String>()))?;
+    let raw_list: Vec<String> = parsed
+        .get("strengths")
+        .or_else(|| parsed.get("tags"))
+        .or_else(|| parsed.get("tasks"))
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let strengths = normalize_strengths(&raw_list);
+    if strengths.is_empty() {
+        return Err("AI 未生成有效的擅长任务标签".to_string());
+    }
+    let rationale = parsed
+        .get("rationale")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(400).collect::<String>());
+    Ok((strengths, rationale))
 }
 
 pub(crate) fn parse_single_ai_note(raw: &str, max_chars: usize) -> Result<(String, Option<String>), String> {
@@ -1599,6 +1687,7 @@ mod tests {
             candidate_result: None,
             cache: None,
             cached_from: None,
+            retry_on_worker_reported: None,
         };
         let pool = vec![
             (
@@ -1692,5 +1781,13 @@ mod tests {
             parse_single_ai_note(r#"{"rationale":"已整理","note":"下午 2:00–6:00 避开 GLM，除非无替代"}"#, 400).unwrap();
         assert_eq!(single, "下午 2:00–6:00 避开 GLM，除非无替代");
         assert_eq!(single_why.as_deref(), Some("已整理"));
+
+        // 4. Single candidate strengths parser for inline AI Configure button in strengths popup.
+        let (cand_str, cand_str_why) = parse_single_ai_strengths(
+            r#"{"rationale":"已按模型特长配置","strengths":["复杂架构","后端重构","复杂架构"]}"#,
+        )
+        .unwrap();
+        assert_eq!(cand_str, vec!["复杂架构", "后端重构"]);
+        assert_eq!(cand_str_why.as_deref(), Some("已按模型特长配置"));
     }
 }

@@ -234,8 +234,9 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
                         core_bg.changed.notify_waiters();
                     }
                     if let Some(text) = initial_prompt {
-                        let tagged = core_bg.tagged(caller_bg.as_deref(), id, &text, true);
-                        if let Ok(sent) = core_bg.send(id, &tagged, false, None, caller_bg.as_deref()).await {
+                        let sender = crate::api::attributed_sender(None, caller_bg.as_deref());
+                        let tagged = core_bg.tagged(sender, id, &text, true);
+                        if let Ok(sent) = core_bg.send(id, &tagged, false, None, sender).await {
                             let mut st = core_bg.lock();
                             if let Some(a) = st.reg.agents.get_mut(&id)
                                 && a.is_live()
@@ -329,8 +330,9 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
 
     let (first_message, after_turn) = match initial_prompt {
         Some(text) => {
-            let tagged = core.tagged(caller.as_deref(), id, &text, true);
-            match core.send(id, &tagged, false, None, caller.as_deref()).await {
+            let sender = crate::api::attributed_sender(None, caller.as_deref());
+            let tagged = core.tagged(sender, id, &text, true);
+            match core.send(id, &tagged, false, None, sender).await {
                 Ok(sent) => {
                     let mut st = core.lock();
                     if let Some(a) = st.reg.agents.get_mut(&id)

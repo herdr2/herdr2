@@ -384,26 +384,64 @@ export default function App() {
       /* ignore */
     }
     let dead = false;
-    const pull = () => {
+    let inFlight = false;
+    let dirty = false;
+    let activeAbort: AbortController | null = null;
+    let timer: number | null = null;
+
+    const schedulePull = (delayMs = 300) => {
+      if (dead || timer !== null) return;
+      timer = window.setTimeout(() => {
+        timer = null;
+        if (!dead) pull();
+      }, delayMs);
+    };
+
+    const pull = (force = false) => {
+      if (dead) return;
+      if (inFlight) {
+        if (!force) {
+          dirty = true;
+          return;
+        }
+        activeAbort?.abort();
+        activeAbort = null;
+        inFlight = false;
+      }
+      inFlight = true;
+      dirty = false;
       const reqId = ++pullSeqRef.current;
-      fetchSnapshot(runId)
+      const controller = new AbortController();
+      activeAbort = controller;
+      fetchSnapshot(runId, controller.signal)
         .then((next) => {
           if (dead || reqId !== pullSeqRef.current) return;
           setSnap(next);
           setError(null);
         })
         .catch((e: Error) => {
+          if (e.name === "AbortError") return;
           if (!dead && reqId === pullSeqRef.current) setError(e.message);
+        })
+        .finally(() => {
+          if (activeAbort === controller) {
+            activeAbort = null;
+            inFlight = false;
+          }
+          if (!dead && dirty) {
+            dirty = false;
+            schedulePull(300);
+          }
         });
     };
-    pullRef.current = pull;
+    pullRef.current = () => pull(true);
     pull();
     if (mock) {
       return () => {
         dead = true;
+        activeAbort?.abort();
       };
     }
-    let timer: number | null = null;
     let queuedItems: Item[] = [];
     let itemRafId: number | null = null;
     const flushItems = () => {
@@ -431,17 +469,16 @@ export default function App() {
           return;
         }
         if (change.table === "runs") reloadRunsRef.current();
-        if (timer !== null) return;
-        timer = window.setTimeout(() => {
-          timer = null;
-          if (!dead) pull();
-        }, 300);
+        schedulePull(300);
       },
       onOpen: () => {
-        if (!dead) pull();
+        if (dead) return;
+        setError(null);
+        pull(true);
       },
       onReconnect: () => {
         if (dead) return;
+        setError(null);
         setStreamEpoch((n) => n + 1);
       },
       onItem: (item) => {
@@ -455,6 +492,7 @@ export default function App() {
     return () => {
       dead = true;
       pullRef.current = () => {};
+      activeAbort?.abort();
       if (timer) window.clearTimeout(timer);
       if (itemRafId !== null) window.cancelAnimationFrame(itemRafId);
       stop();

@@ -70,7 +70,6 @@ const TITLE_ZH = {
   Settings: "设置",
   Keys: "快捷键",
   Welcome: "欢迎页",
-  "What's new": "更新日志",
   "Reset to the default screen": "恢复默认布局与快捷键",
   "Zoom in": "放大界面",
   "Zoom out": "缩小界面",

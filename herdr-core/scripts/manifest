@@ -6,7 +6,7 @@
 {version, generation, notes, targets: {"<os>-<arch>": {url, sha256}}}.
 Version from crates/herdr2/Cargo.toml, generation from api.rs; the
 notes line from $NOTES, else "herdr2 <version>". URLs under
-$RELEASES_URL (default https://releases.herdr.dev)/core/<version>/.
+$RELEASES_URL/core/<version>/ (RELEASES_URL must be set).
 """
 import hashlib, json, os, pathlib, re, sys
 
@@ -15,7 +15,9 @@ cargo = (root / "crates/herdr2/Cargo.toml").read_text()
 version = re.search(r'^version = "(.+)"', cargo, re.M).group(1)
 api = (root / "crates/herdr2/src/api.rs").read_text()
 generation = int(re.search(r"pub const GENERATION: u32 = (\d+);", api).group(1))
-base = os.environ.get("RELEASES_URL", "https://releases.herdr.dev").rstrip("/")
+base = (os.environ.get("RELEASES_URL") or os.environ.get("HERDR2_RELEASES_URL") or "").rstrip("/")
+if not base:
+    sys.exit("manifest: set RELEASES_URL (or HERDR2_RELEASES_URL) to your release server base URL")
 
 targets = {}
 for f in sorted([*pathlib.Path(sys.argv[1]).glob("herdr2-*.tar.gz"), *pathlib.Path(sys.argv[1]).glob("herdr2-*.zip")]):

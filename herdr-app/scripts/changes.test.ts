@@ -33,6 +33,13 @@ test("Changes mod focuses strictly on git working tree without nested checkpoint
   expect(source).not.toContain("changes-tab-checkpoints");
 });
 
+test("Changes diff wraps long lines to viewport width instead of truncating in a fixed-height virtual list", () => {
+  expect(source).toContain('list(\n            "changes-diff"');
+  expect(source).not.toContain("v_virtual_list");
+  expect(source).not.toContain("changes-diff-x");
+  expect(source).toContain(".whitespace_normal().child(row.text)");
+});
+
 test("annotateDiffRows tracks old/new line numbers and selection ranges accurately", () => {
   const rows = diffRows([
     "@@ -10,3 +10,4 @@ fn demo()",

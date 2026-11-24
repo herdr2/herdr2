@@ -1070,16 +1070,28 @@ async fn run_actor(
                     }
                 }
                 if session_is_current(&core, id, token) {
-                    let _ = crate::checkpoint::capture_target_checkpoint(
-                        &core,
-                        crate::runtime::TargetKey::Agent(id),
-                        Some(turn_num),
-                        Some(clean_prompt),
-                        None,
-                        true,
-                        true,
-                    )
-                    .await;
+                    if acp_turn_may_mutate_files(&core, id, turn_num) {
+                        let _ = crate::checkpoint::capture_target_checkpoint(
+                            &core,
+                            crate::runtime::TargetKey::Agent(id),
+                            Some(turn_num),
+                            Some(clean_prompt),
+                            None,
+                            true,
+                            true,
+                        )
+                        .await;
+                    } else {
+                        let _ = crate::checkpoint::capture_noop_target_checkpoint(
+                            &core,
+                            crate::runtime::TargetKey::Agent(id),
+                            turn_num,
+                            Some(clean_prompt),
+                            true,
+                            true,
+                        )
+                        .await;
+                    }
                 }
                 finish_turn(&core, id, turn_num, res);
             }
@@ -1137,8 +1149,26 @@ fn session_is_current(core: &Core, id: u32, token: u64) -> bool {
     core.lock().sessions.get(&id).is_some_and(|h| h.token == token)
 }
 
+fn is_readonly_tool_kind(tool_kind: Option<&str>) -> bool {
+    let kind = tool_kind.unwrap_or("").trim().to_ascii_lowercase();
+    matches!(kind.as_str(), "read" | "search" | "fetch" | "think" | "thought" | "switch_mode" | "web")
+}
+
+/// Returns `true` when `turn_num` recorded at least one `ToolCall` whose kind could mutate workspace files.
+pub(crate) fn turn_entries_may_mutate_files(entries: &[Entry], turn_num: u64) -> bool {
+    entries.iter().any(|entry| match entry {
+        Entry::ToolCall { turn, tool_kind, .. } if *turn == turn_num => !is_readonly_tool_kind(tool_kind.as_deref()),
+        _ => false,
+    })
+}
+
+fn acp_turn_may_mutate_files(core: &Core, id: u32, turn_num: u64) -> bool {
+    let st = core.lock();
+    st.transcripts.get(&id).is_some_and(|tr| turn_entries_may_mutate_files(tr.entries(), turn_num))
+}
+
 async fn prepare_acp_prompt(core: &Arc<Core>, id: u32, turn_num: u64, raw_prompt: &str, clean_prompt: &str) -> String {
-    let (needs_baseline, handoff) = {
+    let (refresh_turn0, capture_pre_turn, handoff) = {
         let mut st = core.lock();
         let Some(addr) = st.reg.agents.get(&id).map(|a| a.address.clone()) else {
             return raw_prompt.to_string();
@@ -1149,22 +1179,28 @@ async fn prepare_acp_prompt(core: &Arc<Core>, id: u32, turn_num: u64, raw_prompt
         tc.active_turn_num = Some(turn_num);
         tc.pending_rollback_turn = None;
         let handoff = tc.pending_handoff.take();
-        let needs_baseline = !tc.checkpoints.iter().any(|c| c.turn == 0);
+        let has_turn0 = tc.checkpoints.iter().any(|c| c.turn == 0);
+        let turn0_is_manual = tc.checkpoints.iter().any(|c| c.turn == 0 && c.is_manual_bookmark());
+        let has_later_turns = tc.checkpoints.iter().any(|c| c.turn > 0);
+        let refresh_turn0 = !has_turn0 || (turn_num == 1 && !has_later_turns && !turn0_is_manual);
+        let capture_pre_turn = !refresh_turn0 && turn_num > 0;
         core.save_target_checkpoints(&mut st, tc);
-        (needs_baseline, handoff)
+        (refresh_turn0, capture_pre_turn, handoff)
     };
 
-    if needs_baseline {
+    if refresh_turn0 {
         let _ = crate::checkpoint::capture_target_checkpoint(
             core,
             crate::runtime::TargetKey::Agent(id),
             Some(0),
             None,
             None,
-            true,
+            false,
             false,
         )
         .await;
+    } else if capture_pre_turn {
+        let _ = crate::checkpoint::capture_pre_turn_baseline(core, crate::runtime::TargetKey::Agent(id), turn_num).await;
     }
 
     match handoff {
@@ -1402,6 +1438,7 @@ pub async fn rollback_acp_agent(
         tc.active_turn_prompt = None;
         tc.active_turn_num = None;
         tc.checkpoints.retain(|c| c.turn <= to_turn);
+        tc.pre_turn_refs.retain(|&t, _| t <= to_turn);
         core.save_target_checkpoints(&mut st, tc);
 
         if let Some(a) = st.reg.agents.get_mut(&id) {
@@ -1508,8 +1545,10 @@ fn finish_turn(core: &Core, id: u32, turn_num: u64, res: Result<Value, CallError
         a.pending_permission = None;
     }
     let mut turn_err = None;
+    let mut turn_usage_detail = None;
     match res {
         Ok(val) => {
+            turn_usage_detail = proto::extract_prompt_result_usage(&val);
             let _parsed: SessionPromptResult = serde_json::from_value(val).unwrap_or_default();
             core.apply_status(&mut st, id, &StatusReport::root("idle"));
         }
@@ -1539,8 +1578,10 @@ fn finish_turn(core: &Core, id: u32, turn_num: u64, res: Result<Value, CallError
         let _ = core.drove.pool_tx.send(crate::drove::pool::PoolSignal::TurnFinished {
             worker_id: wid.clone(),
             agent_id: id,
+            turn_num,
             error: turn_err,
             usage: a.context_usage,
+            detail: turn_usage_detail,
         });
     }
     core.refresh_agent_digest_deterministic(&mut st, id, true);
@@ -1600,16 +1641,41 @@ fn handle_update(core: &Core, id: u32, turn_num: u64, params: &Value) {
             return;
         }
         ParsedUpdate::Usage(usage) => {
-            let mut st = core.lock();
-            if let Some(a) = st.reg.agents.get_mut(&id) {
-                a.context_usage = Some(usage);
-                core.emit(&mut st, "usage", id, json!({ "used": usage.used, "size": usage.size }));
-                core.save(&st);
-                core.changed.notify_waiters();
+            let detail = proto::extract_usage_update_detail(params);
+            let mut drove_wid = None;
+            {
+                let mut st = core.lock();
+                if let Some(a) = st.reg.agents.get_mut(&id) {
+                    a.context_usage = Some(usage);
+                    drove_wid = a.labels.get("drove.worker").cloned();
+                    core.emit(&mut st, "usage", id, json!({ "used": usage.used, "size": usage.size }));
+                    core.save(&st);
+                    core.changed.notify_waiters();
+                }
+            }
+            if let Some(worker_id) = drove_wid {
+                let _ = core.drove.pool_tx.send(crate::drove::pool::PoolSignal::UsageUpdated {
+                    worker_id,
+                    usage: Some(usage),
+                    detail,
+                });
             }
             return;
         }
-        ParsedUpdate::Other => return,
+        ParsedUpdate::Other => {
+            if let Some(detail) = proto::extract_usage_update_detail(params) {
+                let drove_wid =
+                    core.lock().reg.agents.get(&id).and_then(|a| a.labels.get("drove.worker")).cloned();
+                if let Some(worker_id) = drove_wid {
+                    let _ = core.drove.pool_tx.send(crate::drove::pool::PoolSignal::UsageUpdated {
+                        worker_id,
+                        usage: detail.context,
+                        detail: Some(detail),
+                    });
+                }
+            }
+            return;
+        }
     };
     record_entry(core, id, entry);
 }
@@ -1995,5 +2061,77 @@ mod tests {
             resolve_config_override(&zcode_thought_opts, "reasoning_effort", &json!("high")),
             Some(("thought".into(), json!("enabled"), Some("config".into())))
         );
+    }
+
+    #[test]
+    fn distinguishes_mutating_vs_readonly_acp_turns_and_filters_synthetic_ppid_callers() {
+        let qa_entries = vec![
+            Entry::User { turn: 1, from: None, text: "当前是什么大模型".into(), attachments: vec![], ts_ms: 1 },
+            Entry::Thought { turn: 1, text: "Thinking…".into(), ts_ms: 2 },
+            Entry::Assistant { turn: 1, text: "GLM-5.3-Flash".into(), attachments: vec![], ts_ms: 3 },
+            Entry::Plan { turn: 1, items: vec![], ts_ms: 4 },
+        ];
+        assert!(!turn_entries_may_mutate_files(&qa_entries, 1));
+
+        let readonly_entries = vec![
+            Entry::User { turn: 2, from: None, text: "read Cargo.toml".into(), attachments: vec![], ts_ms: 10 },
+            Entry::ToolCall {
+                turn: 2,
+                id: "tc1".into(),
+                title: "Read Cargo.toml".into(),
+                tool_kind: Some("read".into()),
+                status: "completed".into(),
+                detail: None,
+                attachments: vec![],
+                ts_ms: 11,
+            },
+            Entry::ToolCall {
+                turn: 2,
+                id: "tc2".into(),
+                title: "rg main".into(),
+                tool_kind: Some("search".into()),
+                status: "completed".into(),
+                detail: None,
+                attachments: vec![],
+                ts_ms: 12,
+            },
+        ];
+        assert!(!turn_entries_may_mutate_files(&readonly_entries, 2));
+
+        let mutating_entries = vec![
+            Entry::User { turn: 3, from: None, text: "edit lib.rs".into(), attachments: vec![], ts_ms: 20 },
+            Entry::ToolCall {
+                turn: 3,
+                id: "tc3".into(),
+                title: "Edit src/lib.rs".into(),
+                tool_kind: Some("edit".into()),
+                status: "completed".into(),
+                detail: None,
+                attachments: vec![],
+                ts_ms: 21,
+            },
+        ];
+        assert!(turn_entries_may_mutate_files(&mutating_entries, 3));
+
+        let unknown_tool_entries = vec![Entry::ToolCall {
+            turn: 4,
+            id: "tc4".into(),
+            title: "custom_mcp_tool".into(),
+            tool_kind: None,
+            status: "completed".into(),
+            detail: None,
+            attachments: vec![],
+            ts_ms: 30,
+        }];
+        assert!(turn_entries_may_mutate_files(&unknown_tool_entries, 4));
+
+        assert!(crate::api::is_synthetic_caller("ppid:42736"));
+        assert!(crate::api::is_synthetic_caller("d9152abb89f9af269de4f9e537b55cc0/ppid:42736"));
+        assert!(!crate::api::is_synthetic_caller("t8"));
+        assert!(!crate::api::is_synthetic_caller("wsl/a2"));
+        assert_eq!(crate::api::attributed_sender(None, Some("ppid:42736")), None);
+        assert_eq!(crate::api::attributed_sender(None, Some("d9152abb89f9af269de4f9e537b55cc0/ppid:42736")), None);
+        assert_eq!(crate::api::attributed_sender(None, Some("wsl/t8")), Some("wsl/t8"));
+        assert_eq!(crate::api::attributed_sender(Some("coordinator"), Some("ppid:42736")), Some("coordinator"));
     }
 }

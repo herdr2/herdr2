@@ -1270,6 +1270,8 @@ async fn build_snapshot(core: &Arc<Core>, id: &str) -> Result<Value, ApiErr> {
         stats: RunStats {
             tokens: attempt_tokens + ai_tokens,
             cost: attempt_cost + ai_cost,
+            worker_tokens: (attempt_tokens > 0).then_some(attempt_tokens),
+            worker_cost: (attempt_cost > 0.0).then_some(attempt_cost),
             ai_tokens: (ai_tokens > 0).then_some(ai_tokens),
             ai_cost: (ai_cost > 0.0).then_some(ai_cost),
         },
@@ -1583,7 +1585,7 @@ async fn serve_sse(
 }
 
 async fn write_sse_frame(w: &mut tokio::net::tcp::OwnedWriteHalf, frame: &str) -> std::io::Result<()> {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(30), async {
         w.write_all(frame.as_bytes()).await?;
         w.flush().await
     })

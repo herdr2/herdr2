@@ -42,27 +42,9 @@ On macOS the installer and updater verify certificate-signed bundles and preserv
 Apple notarization is tested separately; it is not required for publishing a release.
 Do not assume every download is notarized or signed.
 
-## Telemetry
+## Telemetry and Feedback
 
-Usage telemetry is **on by default**. Release builds send a small daily report to `https://telemetry.herdr.dev/v1/report` with a random install ID.
-Reports include app and core versions, OS and architecture, bucketed usage time and counts, known agent names, built-in layout names, mod counts, app command names, and fixed event counters.
-Custom layout names become `custom`; custom mod names are not sent.
-Terminal text, prompts, file contents, folder paths and free-text names are not included.
-
-Turn it off in **Settings → Privacy**. That page also lets you inspect the report.
-Or set this field in your existing `settings.json`:
-
-```json
-{
-  "telemetry": false
-}
-```
-
-Turning it off deletes the local install ID and unsent reports. It cannot recall reports already sent.
-For one run, set `DO_NOT_TRACK=1` or `HERDR_TELEMETRY=0`. CI environments disable collection too.
-Ordinary source builds collect locally while enabled but do not send, unless pointed at a test endpoint with `HERDR_TELEMETRY_URL`.
-
-Telemetry being off does not stop update checks, mod network requests or feedback you choose to send.
+Upstream Herdr telemetry reporting, beta feedback submission, and release-notes media fetching have been removed in Herdr2. The app does not send usage telemetry or feedback to any external Herdr servers.
 Feedback is drafted for you to review and send, not sent silently.
 
 [Back to Herdr](../README.md)

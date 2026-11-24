@@ -2399,6 +2399,16 @@
                 "type": "null"
               }
             ]
+          },
+          "strengths": {
+            "description": "Generated task strengths when targeting a single candidate in `strengths` mode.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
           }
         },
         "required": [
@@ -11241,12 +11251,12 @@
           }
         },
         {
-          "description": "Optional 0-based candidate index inside `targetRole` when `noteScope == \"candidate\"`.",
+          "description": "Optional 0-based candidate index inside `targetRole` for single-candidate generation.",
           "name": "targetCandidateIndex",
           "required": false,
           "schema": {
             "default": null,
-            "description": "Optional 0-based candidate index inside `targetRole` when `noteScope == \"candidate\"`.",
+            "description": "Optional 0-based candidate index inside `targetRole` for single-candidate generation.",
             "format": "uint",
             "minimum": 0,
             "type": [
@@ -11256,12 +11266,12 @@
           }
         },
         {
-          "description": "Optional role ID when `noteScope == \"candidate\"`.",
+          "description": "Optional role ID for single-candidate generation (`mode == \"notes\"` with `noteScope == \"candidate\"`, or `mode == \"strengths\"`).",
           "name": "targetRole",
           "required": false,
           "schema": {
             "default": null,
-            "description": "Optional role ID when `noteScope == \"candidate\"`.",
+            "description": "Optional role ID for single-candidate generation (`mode == \"notes\"` with `noteScope == \"candidate\"`, or `mode == \"strengths\"`).",
             "type": [
               "string",
               "null"
