@@ -1,0 +1,204 @@
+suite: 01-core-daemon-and-isolation
+cases:
+  - id: TC-CORE-001
+    feature: F01
+    title: 隔离会话启动守护进程与 hello 握手协议协商 (Daemon startup, session isolation & hello handshake)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [hello, server.status]
+      cli: ["h2 server status", "h2 --json server status"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolate XDG_RUNTIME_DIR, XDG_STATE_HOME, XDG_CONFIG_HOME, and H2_SESSION to a fresh temp sandbox directory."
+      - "Unset H2_AGENT_ID, H2_TERMINAL_ID, and legacy HC_* variables."
+    steps:
+      - "Run `h2 server status --json` to auto-start an isolated `herdr2` daemon."
+      - "Open a raw Unix socket / Named Pipe connection to `$XDG_RUNTIME_DIR/herdr2/<session>.sock`."
+      - "Send NDJSON `hello` request with `generation: 1, framed: false`, then open a second connection sending `hello` with `generation: 1, framed: true`."
+      - "Send a `hello` request with `generation: 999` to verify negative version negotiation."
+    oracles:
+      - "`server.status` returns non-empty `id`, `version`, `pid`, `uptime_ms`, and `agent_counts`."
+      - "Socket path resides strictly under `herdr2/` (never `herdr-core/` or `hc`)."
+      - "`framed: true` response confirms upgrade; `generation: 999` returns `unsupported_generation` error."
+    ai_probe_hints:
+      - "Verify no files are created under `$HOME/.local/state/herdr-core`."
+
+  - id: TC-CORE-002
+    feature: F01
+    title: 9 字节二进制多路复用帧头编码与超限载荷拒绝 (9-byte binary framed header & MAX_PAYLOAD bounds)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [hello, server.status]
+      cli: []
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated `herdr2` daemon running and connected in `framed: true` mode."
+    steps:
+      - "Send valid Channel 0 `DATA` (kind=0) JSON-RPC frame `[0u32 LE][0u8][len u32 LE][payload]` for `server.status`."
+      - "Split a valid 9-byte header across two partial socket writes to verify incremental frame reassembly."
+      - "Send malformed frame with `len > 16 MiB` (`MAX_PAYLOAD`) or unknown frame kind."
+    oracles:
+      - "Valid and split-write Channel 0 frames return matching JSON-RPC 2.0 responses on Channel 0."
+      - "Oversized payload (>16 MiB) is rejected cleanly without panicking the daemon or affecting other connected clients."
+    ai_probe_hints:
+      - "Check control channel backpressure behavior up to `MAX_CONTROL = 64 MiB`."
+
+  - id: TC-CORE-003
+    feature: F01
+    title: events.subscribe 滑动信用窗口与 missed 重同步 (Event stream 256 KiB credit flow control & missed resync)
+    tier: L1-core-isolated
+    mode: hybrid
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [events.subscribe, server.status]
+      cli: ["h2 events --json"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated `herdr2` daemon in `framed: true` mode."
+    steps:
+      - "Call `events.subscribe` on Channel 0 and record the assigned non-zero `channel` ID."
+      - "Verify initial snapshot arrives on Channel N containing `agents`, `terminals`, and `doc` facts."
+      - "Trigger rapid `agent.label` / `doc.set` updates while withholding `CREDIT` (kind=1) frames until >256 KiB or >4 MiB `MAX_PENDING` accumulates."
+      - "Resume sending `CREDIT` frames and observe stream recovery."
+    oracles:
+      - "Subscription returns `channel > 0` and immediately emits initial snapshot."
+      - "Daemon bounds memory when consumer stalls; once stalled past `MAX_PENDING`, emits `missed` + fresh snapshot rather than corrupting order."
+    ai_probe_hints:
+      - "Also test plain (unframed) `h2 events --json` CLI output to confirm NDJSON line framing and clean SIGINT teardown."
+
+  - id: TC-CORE-004
+    feature: F01
+    title: 守护进程计划重启、停止与双版本环境变量隔离 (Planned server.restart, server.stop & HC_* isolation)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [server.restart, server.stop, server.status]
+      cli: ["h2 server restart", "h2 server stop", "h2 server start"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated `herdr2` daemon running with `HC_SESSION=legacy_dummy`, `HC_SOCKET=/tmp/bad.sock` exported in client env."
+    steps:
+      - "Invoke `server.status` and confirm `HC_*` vars do not hijack `H2_SESSION`."
+      - "Invoke `server.restart` with invalid params (verify `invalid_params` does not kill daemon), then valid params and poll `server.status`."
+      - "Invoke `server.stop` and verify socket cleanup and process exit."
+    oracles:
+      - "`server.restart` swaps to a new daemon PID without leaving zombie lockfiles."
+      - "`server.stop` terminates the daemon cleanly and removes/unbinds the session socket."
+      - "Legacy `HC_*` variables never alter `herdr2` session routing."
+    ai_probe_hints:
+      - "Verify `h2 server start` cleanly brings up a stopped session."
+
+  - id: TC-CORE-005
+    feature: F01
+    title: rpc.discover 与 h2 schema 完整性检查 (OpenRPC discovery matches static schema)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [rpc.discover]
+      cli: ["h2 schema"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated `herdr2` daemon running."
+    steps:
+      - "Call `rpc.discover` over RPC and run `h2 schema` via CLI."
+      - "Compare returned method names, params schemas, and error codes against `herdr-core/schema/h2.openrpc.json`."
+    oracles:
+      - "`rpc.discover` returns OpenRPC 1.x document containing all 80 methods matching `h2.openrpc.json`."
+      - "`h2 schema` exits 0 with valid JSON."
+    ai_probe_hints:
+      - "Check whether `rpc.discover` includes `drove.*`, `ai.*`, and `checkpoint.*` methods with non-empty descriptions."
+
+  - id: TC-CORE-006
+    feature: F01
+    title: 冷启动并发 connect_or_start 锁竞争与陈旧锁清理 (Concurrent daemon autostart lock contention)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [server.status]
+      cli: ["h2 server status --json"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Fresh cold isolated session with no running `herdr2` daemon."
+    steps:
+      - "Launch 6 parallel `h2 server status --json` commands simultaneously against the same cold `H2_SESSION`."
+      - "Kill the daemon with `SIGKILL` (simulating crash) leaving stale socket/lock, then run `h2 server status --json` again."
+    oracles:
+      - "All 6 parallel callers converge on the exact same daemon PID without race errors."
+      - "After simulated crash, next `connect_or_start` detects dead socket/lock and starts a fresh daemon cleanly."
+    ai_probe_hints:
+      - "Check `sweep.rs` cleans up abandoned temp exec/put entries without touching live sessions."
+
+  - id: TC-CORE-007
+    feature: F01
+    title: config.toml 默认值解析与无效配置容错 (config.toml parsing & sweep cleanup boundaries)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P2
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [server.status]
+      cli: ["h2 server status --json"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated `XDG_CONFIG_HOME/herdr2/` directory."
+    steps:
+      - "Start daemon with missing `config.toml` -> verify defaults apply."
+      - "Write valid `config.toml` overrides (e.g. `notes_quiet` / retention), restart daemon, and verify."
+      - "Write malformed TOML to `config.toml` and verify diagnostic error behavior."
+    oracles:
+      - "Missing `config.toml` starts cleanly with built-in defaults."
+      - "Valid overrides take effect without breaking IPC."
+    ai_probe_hints:
+      - "Inspect `config.rs` fields to ensure no legacy `herdr-core` fallback path is read."
+
+  - id: TC-CORE-008
+    feature: F01
+    title: events.subscribe 标签过滤与 15 秒心跳保活 (events.subscribe label filter & heartbeat events)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P2
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [events.subscribe, agent.label]
+      cli: ["h2 events --json"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated `herdr2` daemon in `framed: true` mode with two agents `a1` (`team=alpha`) and `a2` (`team=beta`)."
+    steps:
+      - "Subscribe via `events.subscribe` filtered by label `team=alpha`."
+      - "Mutate labels/status on both `a1` and `a2`."
+      - "Wait past heartbeat interval (or verify `heartbeat` frame emission)."
+    oracles:
+      - "Initial snapshot and incremental `event` notifications only emit matching `team=alpha` updates."
+      - "Idle stream emits `heartbeat` keepalive notifications cleanly."
+    ai_probe_hints:
+      - "Test `events.subscribe` with `since` or non-existent target filter to check `not_found` handling."

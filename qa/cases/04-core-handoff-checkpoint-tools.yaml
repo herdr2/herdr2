@@ -1,0 +1,297 @@
+suite: 04-core-handoff-checkpoint-tools
+cases:
+  - id: TC-CORE-034
+    feature: F07
+    title: 跨 Provider 上下文 Handoff 与范围轮次裁剪 (Cross-provider agent.handoff turn slicing & max_bytes)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.handoff, agent.get, agent.read]
+      cli: ["h2 handoff"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Source fake ACP agent `a1` with 4 completed turns in a temporary Git repo."
+    steps:
+      - "Invoke `agent.handoff` with `kind: 'handoff'`, `from_turn: 2`, `to_turn: 4`, `max_bytes: 32768`, targeting a second fake ACP preset."
+      - "Also test `recent_turns: 2` and `archive_source: true`."
+    oracles:
+      - "Target session starts with distilled context strictly bounded to turns 2..4 and <= `max_bytes`."
+      - "Lineage links target back to `a1`; `archive_source: true` finishes/archives source cleanly."
+    ai_probe_hints:
+      - "Test `from_turn > to_turn` to confirm `invalid_params` rejection."
+
+  - id: TC-CORE-035
+    feature: F07
+    title: Git Worktree Fork、Side-Chat 侧聊与 Merge-Back 回合 (Handoff fork worktree, side_chat & merge_back)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.handoff, agent.wait, agent.read]
+      cli: ["h2 handoff"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Git repo with clean `main` commit and live source ACP agent `a1`."
+    steps:
+      - "Call `agent.handoff` with `kind: 'fork'`, `worktree: true` to spawn forked agent `a2` in an isolated git worktree."
+      - "Call `agent.handoff` with `kind: 'side_chat'` to open a non-mutating side chat `a3`."
+      - "Call `agent.handoff` with `kind: 'merge_back'` from `a2` into `a1`."
+    oracles:
+      - "`a2` runs in a distinct git worktree path while `a1` remains on original checkout."
+      - "`merge_back` delivers synthesized takeaway back into `a1` inbox."
+    ai_probe_hints:
+      - "Test PTY->ACP handoff from terminal `t1` using `pty_transcript.rs`."
+
+  - id: TC-CORE-036
+    feature: F07
+    title: agent.review 行级 Diff 评审评论投递至 ACP 与 PTY (Line-anchored agent.review delivery & error guards)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.review, agent.read, terminal.read]
+      cli: ["h2 send-review"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Live ACP agent `a1` and live PTY terminal `t1` in a Git repo with modified file `src/lib.rs`."
+    steps:
+      - "Call `agent.review` targeting `a1` with structured line-anchored comments (`path`, `line`, `end_line`, `body`) and `note`."
+      - "Call `agent.review` targeting `t1` with structured comments."
+      - "Test `agent.review` against a `blocked` agent and empty comments."
+    oracles:
+      - "`a1` receives deterministic compiled review markdown in its turn prompt."
+      - "`t1` receives pasted review block cleanly."
+      - "`blocked` target returns `blocked` error; malformed params return `invalid_params`."
+    ai_probe_hints:
+      - "Verify `checkpoint_turn` anchoring attaches turn metadata accurately."
+
+  - id: TC-CORE-037
+    feature: F08
+    title: 隐藏 Git Ref 检查点捕获、纯作者 Diff 与不污染 Index (Hidden ref checkpoints & pure authored diff)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [checkpoint.capture, checkpoint.list, checkpoint.diff]
+      cli: ["h2 checkpoint ls", "h2 checkpoint snap", "h2 checkpoint diff"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Temp Git repo with staged index change (`git add staged.txt`) and a live ACP agent `a1`."
+    steps:
+      - "Capture baseline checkpoint `C1` via `checkpoint.capture`."
+      - "Modify `app.txt`, capture `C2`; simulate upstream commit merge on another file and capture `C3`."
+      - "Call `checkpoint.list` and `checkpoint.diff` between `C1` and `C2`."
+    oracles:
+      - "Hidden refs created under `refs/herdr2/checkpoints/...` without altering user `HEAD`, working tree, or `staged.txt` in Git index."
+      - "`checkpoint.diff` returns pure authored unified diff and file stats excluding upstream merge noise."
+    ai_probe_hints:
+      - "Verify `checkpoint.list` reports workspace isolation level accurately."
+
+  - id: TC-CORE-038
+    feature: F08
+    title: 检查点三层隔离安全评估与回滚拦截 (Three-tier workspace isolation & checkpoint.rollback gates)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [checkpoint.rollback, checkpoint.list]
+      cli: ["h2 checkpoint rollback"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Temp Git repo with checkpoints `C1`, `C2`, `C3`."
+    steps:
+      - "Case A (`SharedBlocked`): run another active ACP agent or non-shell process in same repo and attempt file rollback."
+      - "Case B (`ExclusiveConfirm`): stop secondary agent (main checkout or idle shell only) and call `checkpoint.rollback` without confirm, then with confirm."
+      - "Case C (`IsolatedWorktree`): run in dedicated worktree and roll back directly."
+      - "Attempt rollback while target agent is `working` (`busy`)."
+    oracles:
+      - "Case A hard-blocks with `shared_workspace` listing the active blocker."
+      - "Case B requires confirmation (`confirm_required`) before restoring files."
+      - "Case C restores workspace + session cleanly without confirmation; `working` agent returns `busy`."
+    ai_probe_hints:
+      - "Verify nested subdirectory cwd under repo root is also detected as sharing working tree."
+
+  - id: TC-CORE-039
+    feature: F08
+    title: checkpoint.bisect 故障二分定位与 checkpoint.hook 生命周期回调 (Checkpoint bisect & CLI hook callbacks)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [checkpoint.bisect, checkpoint.hook]
+      cli: ["h2 checkpoint bisect", "h2 checkpoint hook"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Temp Git repo with 4 checkpoint turns (`C1`..`C4`) where `C3` introduced a regression."
+    steps:
+      - "Run `checkpoint.bisect` with regression symptom description."
+      - "Invoke `checkpoint.hook` RPC and `h2 checkpoint hook` CLI with Claude/Codex/Agy payload, plus fast no-op and worktree guard paths."
+    oracles:
+      - "`checkpoint.bisect` identifies suspect turn and safe rollback anchor."
+      - "Valid `checkpoint.hook` captures turn cleanly; fast no-op exits 0 without daemon round-trip; invalid payload returns `invalid_params`."
+    ai_probe_hints:
+      - "Check `zcode.rs` hook integration paths when ZCode CLI hooks are simulated."
+
+  - id: TC-CORE-040
+    feature: F09
+    title: 非 Agent 命令执行与 IDENTITY_VARS 环境隔离 (machine.exec direct argv vs shell line)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [machine.exec]
+      cli: ["h2 exec"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated `herdr2` daemon with `H2_AGENT_ID=a99` in caller env."
+    steps:
+      - "Run `machine.exec` with `argv: ['sh', '-c', 'echo OUT; echo ERR >&2; env']`."
+      - "Run `machine.exec` with `line: 'exit 7'` to verify shell execution and non-zero exit code capture."
+    oracles:
+      - "Returns exact `exit_code` and base64-encoded `stdout`/`stderr`."
+      - "`IDENTITY_VARS` (`H2_AGENT_ID`, `H2_TERMINAL_ID`, etc.) are stripped from executed child env."
+    ai_probe_hints:
+      - "Verify mutual exclusion of `argv` and `line` returns `invalid_params`."
+
+  - id: TC-CORE-041
+    feature: F09
+    title: 原子文件读写与全有或全无文本编辑 (file.read, file.write, file.edit)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [file.read, file.write, file.edit]
+      cli: ["h2 file read", "h2 file write", "h2 file edit"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated `herdr2` daemon and temp directory."
+    steps:
+      - "Write `nested/dir/sample.txt` via `file.write` (auto-creating missing parent dirs)."
+      - "Read line slices via `file.read` (`offset`, `limit`); test reading a binary file -> expect `not_text`."
+      - "Edit via `file.edit`, then send a multi-edit batch where the 2nd edit fails (`edit_failed`) to confirm atomic rollback."
+    oracles:
+      - "`file.write` swaps atomically; `file.read` enforces 8 MB cap and reports total line count."
+      - "`file.edit` is strictly all-or-nothing on `edit_failed`."
+    ai_probe_hints:
+      - "Test `file.read` on non-existent file returns `not_found`."
+
+  - id: TC-CORE-042
+    feature: F09
+    title: 乐观并发 JSON 文档存储与 agent.put 隔离暂存 (doc.get, doc.set & agent.put)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [doc.get, doc.set, agent.put]
+      cli: ["h2 put"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated `herdr2` daemon and live ACP agent `a1`."
+    steps:
+      - "Call `doc.get` on fresh key -> expect version 0."
+      - "Call `doc.set` (0 -> 1), then write with stale version 0 -> expect `conflict`; write >1 MiB -> expect `invalid_params`; delete with `null` -> retains incrementing version."
+      - "Stage bytes via `agent.put` beside `a1`, verify path isolation, then kill `a1` and verify staged file removal."
+    oracles:
+      - "`doc.set` enforces 1 MiB limit and optimistic version CAS."
+      - "`agent.put` never pollutes workspace root and cleans up on agent exit."
+    ai_probe_hints:
+      - "Confirm `doc.set` triggers `doc` incremental notification on `events.subscribe`."
+
+  - id: TC-CORE-043
+    feature: F09
+    title: 跨机 SSH 联邦生命周期：添加、列举、重连、重命名与移除 (machine.add/list/connect/rename/rm)
+    tier: L1-core-isolated
+    mode: hybrid
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [machine.add, machine.list, machine.connect, machine.rename, machine.rm]
+      cli: ["h2 machine add", "h2 machine ls", "h2 machine connect", "h2 machine rename", "h2 machine rm", "h2 connect"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Mock SSH wrapper script in PATH invoking `herdr2 connect --session <remote>` over loopback stdio."
+    steps:
+      - "Add remote machine `box1` via `machine.add` using SSH mock."
+      - "Verify `machine.list`, call `machine.connect` to probe line state, rename `box1` -> `box-renamed` via `machine.rename`."
+      - "Forward `machine.exec` and `file.read` with `on: 'box-renamed'`, then remove via `machine.rm`."
+    oracles:
+      - "`machine.add` rejects duplicate host/name (`already_added` / `name_taken`) and missing `h2` (`h2_missing`)."
+      - "Renamed machine routes `on: 'box-renamed'` calls cleanly; `machine.rm` forgets local alias without killing remote agents."
+    ai_probe_hints:
+      - "Test `--temp` machine flag to verify `herdr-app` hides temporary sandbox machines from `spaces()`."
+
+  - id: TC-CORE-044
+    feature: F09
+    title: 远程目标路径前缀解析与 Viewer 中继 (Remote machine/addr routing & remote viewer relay)
+    tier: L1-core-isolated
+    mode: hybrid
+    priority: P2
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.get, terminal.attach, machine.connect]
+      cli: ["h2 get", "h2 attach"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Mock SSH remote daemon `box` hosting live agent `a1` and live terminal `t1`."
+    steps:
+      - "Query `agent.get` with `address: 'box/a1'` and attach to `box/t1` via framed `terminal.attach`."
+      - "Simulate temporary SSH drop and `machine.connect` recovery."
+    oracles:
+      - "Remote `box/a1` and `box/t1` route over framed SSH relay; `remote/viewers.rs` reattaches viewer stream cleanly on reconnect."
+    ai_probe_hints:
+      - "Verify unknown machine prefix returns `machine_unknown` immediately."
+
+  - id: TC-CORE-045
+    feature: F09
+    title: 本地 Release 服务与 h2 update 升级回退检查 (releases.rs & h2 update --from / version guard)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P2
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [server.status]
+      cli: ["h2 update"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Local static release server (`scripts/release.py serve` or mock `core/latest.json`) + temp copy of `herdr2` binary in isolated `PATH`."
+    steps:
+      - "Test `h2 update --version 99.0.0` against mock release server and `h2 update --from <bin_copy>` on isolated daemon."
+      - "Verify downgrade without `--force` is refused when current version is newer."
+    oracles:
+      - "`h2 update` validates version ordering, refuses unforced downgrade, and swaps binary cleanly with kept-agent resumption."
+    ai_probe_hints:
+      - "Never overwrite the system-installed `herdr2`; run strictly against a temp sandbox copy."

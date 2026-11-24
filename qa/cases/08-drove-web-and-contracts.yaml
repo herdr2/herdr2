@@ -1,0 +1,222 @@
+suite: 08-drove-web-and-contracts
+cases:
+  - id: TC-WEB-001
+    feature: F18
+    title: Drove Web HTTP 安全边界：Host 校验、Token 鉴权与 405 只读策略 (Host header, __DROVE_TOKEN__ & 405 configured_in_app)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [drove.web.open]
+      cli: ["h2 drove web --no-open"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated `herdr2` daemon serving Drove HTTP on `127.0.0.1:<H2_DROVE_PORT>`."
+    steps:
+      - "Call `drove.web.open` (`no_open: true`) and fetch `/` HTML; extract injected `window.__DROVE_TOKEN__`."
+      - "Send request with `Host: evil.example.com` -> expect `403 invalid_host`."
+      - "Send `POST /api/runs/<id>/pause` without `x-drove-token` -> expect `401 unauthorized`."
+      - "Send `PUT /api/agents` and `PUT /api/ai/config` with web token -> expect `405 configured_in_app`."
+      - "Send `DELETE /api/runs/<id>` without matching `x-drove-confirm: <id>` -> expect confirmation rejection."
+    oracles:
+      - "Only `127.0.0.1` / `localhost` Host headers are accepted."
+      - "Mutations require valid `x-drove-token` (or coordinator secret); role/AI mutations remain locked to desktop `Settings -> Drove` (`405`)."
+    ai_probe_hints:
+      - "Verify `window.__DROVE_TOKEN__` never grants worker-only or coordinator-secret-only endpoints."
+
+  - id: TC-WEB-002
+    feature: F18
+    title: Drove Web 7 页面导航、URL 路由与 Mock 模式渲染 E2E (Workbench 7 pages & ?mock=1 Playwright E2E)
+    tier: L3-web-e2e
+    mode: hybrid
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [drove.web.open]
+      cli: ["h2 drove web --no-open"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Headless browser (Playwright/Chromium) against live `127.0.0.1:<H2_DROVE_PORT>/?mock=1`."
+    steps:
+      - "Open `http://127.0.0.1:<port>/?mock=1` and navigate across all 7 workbench pages (`dag`, `coordinator`, `tasks`, `workers`, `reviews`, `daemon`, `agents`)."
+      - "Inspect all `CoordinatorView` subtabs (`host`, `messages`, `stalls`, `goal`)."
+      - "Toggle `layered-lr` / `layered-tb` layout, `light`/`dark` theme, and `zh`/`en` language."
+    oracles:
+      - "Zero uncaught console/page errors or broken SVG/CSS assets across all 7 pages."
+      - "URL query params (`?page=`, `?task=`, `?worker=`, `?tab=`, `?sel=`) round-trip accurately via `buildWorkbenchHref` / `readWorkbenchLocation`."
+    ai_probe_hints:
+      - "Verify `?tab=gates` legacy alias maps cleanly to `stalls`."
+
+  - id: TC-WEB-003
+    feature: F18
+    title: Drove Web DAG 边归一化与 Esc 浮层优先级交互 (normalizeSnapshot edge resolution & Esc overlay precedence)
+    tier: L3-web-e2e
+    mode: scripted
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [drove.web.open]
+      cli: []
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Headless browser on Drove Web workbench with `foreach` (`#0..N`), `expandedFrom`, `<machine>/` prefixed deps, and self-referential `forkedFrom` fixture."
+    steps:
+      - "Select DAG task/worker/reviewer nodes and verify edges render to expanded children without orphan lines."
+      - "Open a run context menu or confirm dialog, press `Esc`, and observe whether only the overlay closes without popping canvas selection."
+    oracles:
+      - "`normalizeSnapshot` resolves key/machine-prefixed deps to canonical IDs and strips self-referential `forkedFrom`."
+      - "`escOverlayOpen()` prevents `Esc` from navigating back while menu/dialog is open."
+    ai_probe_hints:
+      - "Check browser history `popstate` after switching pages so DAG `Esc` never pops into another workbench."
+
+  - id: TC-WEB-004
+    feature: F18
+    title: Drove Web 实时 SSE /api/events 与切片分页加载 E2E (Live SSE streaming, item paging, verify-log & review-diff)
+    tier: L3-web-e2e
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [drove.web.open]
+      cli: ["h2 drove plan", "h2 drove web --no-open"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated `herdr2` daemon with an active Run executing tasks, producing >200 worker items, verify log, and review diff."
+    steps:
+      - "Open live Drove Web URL (`?run=<run_id>`) in Playwright and verify `/api/events?run=<run_id>` SSE stream connects."
+      - "Confirm worker item paging (`GET /api/workers/:id/items?before=...&limit=...`), verify log (`GET /api/runs/:id/verify-log`), and review diff (`GET /api/tasks/:id/review-diff`) load cleanly."
+      - "Inspect failed task diagnostics (`GET /api/tasks/:id/inspect?ai=0`)."
+    oracles:
+      - "Live task/worker transitions appear in UI without manual reload."
+      - "Item pagination and log/diff byte-offset slicing load incrementally without truncation glitches."
+    ai_probe_hints:
+      - "Verify `coordinator-transcript` endpoint (`before`/`limit`) renders host transcript slices cleanly."
+
+  - id: TC-WEB-005
+    feature: F18
+    title: Drove Web Run 管理动作 E2E：暂停、恢复、重命名、排序与回收站 (Web Run pause/resume/rename/reorder/trash/restore/delete)
+    tier: L3-web-e2e
+    mode: scripted
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [drove.web.open]
+      cli: ["h2 drove runs"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated `herdr2` daemon with two Runs and Playwright session open on live Drove Web."
+    steps:
+      - "Exercise UI actions: `pauseRun`, `resumeRun`, `renameRun`, `reorderRuns`, `trashRun`, `restoreRun`, and `deleteRun`."
+      - "Verify `stopWorker` action on an active worker."
+    oracles:
+      - "All mutations succeed with injected `x-drove-token` and reflect immediately in sidebar and `/api/runs`."
+      - "Trashed run moves to trash view, restores back to active list, and permanent delete requires exact run ID confirmation."
+    ai_probe_hints:
+      - "Verify `reorderRuns` preserves order across page reload."
+
+  - id: TC-WEB-006
+    feature: F18
+    title: 跨机 SSH Drove Web 联邦代理与 $/drove_open_web 通知路由 (drove.http_proxy, ?on=<machine> & <machine>/<run_id>)
+    tier: L1-core-isolated
+    mode: hybrid
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [drove.http_proxy, drove.web.open, machine.add]
+      cli: ["h2 drove runs", "h2 drove web --on"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Local daemon connected to mocked SSH remote daemon `wsl` with an active remote Run."
+    steps:
+      - "Fetch `GET /api/runs` and verify local + `wsl/<run_id>` aggregation."
+      - "Fetch `GET /api/runs/wsl/<run_id>` and `GET /api/ai/status?on=wsl` to exercise `drove.http_proxy`."
+      - "Invoke `drove.web.open` on remote session and verify `$/drove_open_web` notification proxies cleanly back to local desktop."
+    oracles:
+      - "Remote `<machine>/<id>` targets rewrite path and confirmation headers (`x-drove-confirm`) seamlessly."
+      - "Remote SSE `/api/events` relays over framed `drove.subscribe`; `?local=1` bypasses federation."
+    ai_probe_hints:
+      - "Verify `extract_machine_target` handles URL-encoded characters safely without path traversal."
+
+  - id: TC-CONTRACT-001
+    feature: F19
+    title: 跨仓契约静态校验：OpenRPC 80 方法与 App Commands 94 命令一致性 (h2.openrpc.json <-> api.rs; commands.rs <-> AGENTS.md)
+    tier: L0-static
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [rpc.discover]
+      cli: ["h2 schema", "herdr2 commands"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Repo checkout with `herdr-core/schema/h2.openrpc.json`, `herdr-core/crates/herdr2/src/api.rs`, `herdr-app/src/commands.rs`, `herdr-app/defaults/AGENTS.md`, and `herdr-app/defaults/herdr.d.ts`."
+    steps:
+      - "Parse `h2.openrpc.json` (80 methods) and verify 1:1 parity with `api.rs` `methods!` table."
+      - "Run `herdr2 commands` (94 commands) and verify every command appears in `herdr-app/defaults/AGENTS.md` and matches `commands.rs`."
+      - "Compare `herdr-app/defaults/herdr.d.ts` exported commands/hooks against `commands.rs`."
+    oracles:
+      - "Zero drift between `h2.openrpc.json` and `api.rs`; zero undocumented commands in `defaults/AGENTS.md`."
+    ai_probe_hints:
+      - "Run `cargo test -p herdr2-app` or `the_guide_names_every_command` test to confirm parity."
+
+  - id: TC-CONTRACT-002
+    feature: F19
+    title: 跨仓类型与布局静态契约：Layouts <-> Mods 与 Drove Web Types <-> Rust Types (Layouts/Mods & TS/Rust type alignment)
+    tier: L0-static
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: []
+      cli: []
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Repo checkout with `herdr-app/defaults/layouts/*.json`, `defaults/mods/*`, `drove-web/src/types.ts`, and `herdr-core/crates/herdr2/src/drove/types.rs`."
+    steps:
+      - "Scan all `defaults/layouts/*.json` mod references and verify every referenced mod exists in `defaults/mods/`."
+      - "Compare `drove-web/src/types.ts` union/enum values (`TaskStatus`, `WorkerState`, `MessageType`, `BuiltInWorkerRole`) against `drove/types.rs`."
+    oracles:
+      - "Zero dangling mod references in shipped layouts."
+      - "Zero enum/field drift between Rust Drove types and TypeScript Drove Web types."
+    ai_probe_hints:
+      - "Verify `drove-web` `npm run build` / `tsc --noEmit` passes cleanly without errors."
+
+  - id: TC-CONTRACT-003
+    feature: F19
+    title: 双版本彻底隔离静态与运行时扫描 (Strict herdr2/H2_*/HERDR2_* vs legacy herdr/HC_*/HERDR_* isolation)
+    tier: L0-static
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [server.status, doc.get]
+      cli: ["h2 --version", "herdr2 status"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Repo checkout and isolated test environment."
+    steps:
+      - "Inspect `herdr-core` and `herdr-app` active configuration keys, socket names, doc keys (`herdr2-app`), and env prefixes (`H2_*`, `HERDR2_*`)."
+      - "Verify `herdr2` core version string starts with `h2 `, app socket uses `herdr2-app.sock`, and Core state uses `herdr2/`."
+    oracles:
+      - "Zero accidental writes to legacy `herdr-app.sock`, `herdr-core/`, `HC_*`, or `HERDR_*` paths/keys."
+    ai_probe_hints:
+      - "Confirm `drove-web` legacy `x-co-*` fallback headers remain compatible without breaking primary `x-drove-*` headers."

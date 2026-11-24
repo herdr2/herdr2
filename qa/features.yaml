@@ -1,0 +1,641 @@
+version: 1
+features:
+  - id: F01
+    subsystem: herdr-core
+    name: 守护进程、双平面与协议隔离
+    description: >
+      Single-daemon `herdr2` (`h2`) lifecycle (`server.status`, `server.stop`, `server.restart`),
+      session/socket/env isolation (`H2_*` vs legacy `HC_*`), plain NDJSON -> 9-byte binary framed
+      multiplexing (`hello` with `framed: true`), channel 0 control vs channel N event/viewer streams
+      with 256 KiB sliding credit window (`events.subscribe`), and OpenRPC discovery (`rpc.discover`).
+    tiers: [L0-static, L1-core-isolated]
+    source_globs:
+      - "herdr-core/crates/herdr2/src/server.rs"
+      - "herdr-core/crates/herdr2/src/wire.rs"
+      - "herdr-core/crates/herdr2/src/events.rs"
+      - "herdr-core/crates/herdr2/src/api.rs"
+      - "herdr-core/crates/herdr2/src/rpc.rs"
+    covers:
+      rpc:
+        - hello
+        - server.status
+        - server.stop
+        - server.restart
+        - events.subscribe
+        - rpc.discover
+      app_commands: []
+      mods: []
+      frames: []
+
+  - id: F02
+    subsystem: herdr-core
+    name: 无头 ACP 会话生命周期与能力协商
+    description: >
+      Headless ACP agent lifecycle (`agent.run`, `templates.list`, `agent.list`, `agent.get`,
+      `agent.kill`, `agent.rm`, `agent.keep`, `agent.label`, `agent.config`). Enforces zero-PTY
+      environment stripping (`TERMINAL_VARS`, `H2_TERMINAL_*`), `ClientCapabilities::headless()`
+      (`fs: false`, `terminal: false`), live config negotiation (`session/set_config_option` with
+      `session/set_model` fallback), and `session/load` recovery across planned restarts.
+    tiers: [L1-core-isolated, L4-live-llm]
+    source_globs:
+      - "herdr-core/crates/herdr2/src/api/run.rs"
+      - "herdr-core/crates/herdr2/src/acp/mod.rs"
+      - "herdr-core/crates/herdr2/src/acp/proto.rs"
+      - "herdr-core/crates/herdr2/src/acp/transport.rs"
+      - "herdr-core/crates/herdr2/src/acp/presets.rs"
+      - "herdr-core/crates/herdr2/src/agents.rs"
+      - "herdr-core/crates/herdr2/src/templates.rs"
+    covers:
+      rpc:
+        - agent.run
+        - templates.list
+        - agent.list
+        - agent.get
+        - agent.kill
+        - agent.rm
+        - agent.keep
+        - agent.label
+        - agent.config
+      app_commands: []
+      mods: []
+      frames: []
+
+  - id: F03
+    subsystem: herdr-core
+    name: ACP 串行收件箱、抢占与等待机制
+    description: >
+      Single-actor serial prompt inbox per ACP agent (`agent.send`), preemptive `--steer` queue
+      front-insertion with `session/cancel`, queued inbox inspection/mutation (`agent.inbox_edit`,
+      `agent.inbox_remove`, `agent.inbox_send`), restart paused-inbox recovery (`agent.inbox_resume`,
+      `agent.inbox_clear_paused`), transcript reading (`agent.read`), event-driven waiting
+      (`agent.wait`), and clean turn cancellation (`agent.interrupt`).
+    tiers: [L1-core-isolated, L4-live-llm]
+    source_globs:
+      - "herdr-core/crates/herdr2/src/acp/mod.rs"
+      - "herdr-core/crates/herdr2/src/api.rs"
+      - "herdr-core/crates/herdr2/src/api/waiting.rs"
+      - "herdr-core/crates/herdr2/src/wait.rs"
+      - "herdr-core/crates/herdr2/src/restart.rs"
+    covers:
+      rpc:
+        - agent.read
+        - agent.send
+        - agent.inbox_edit
+        - agent.inbox_remove
+        - agent.inbox_send
+        - agent.inbox_resume
+        - agent.inbox_clear_paused
+        - agent.wait
+        - agent.interrupt
+      app_commands: []
+      mods: []
+      frames: []
+
+  - id: F04
+    subsystem: herdr-core
+    name: ACP 权限仲裁与结构化 Transcript
+    description: >
+      ACP `session/request_permission` state machine (`ApproveAll`, `ApproveReads` auto-allowing
+      read/search/fetch tools and blocking writes/execs, `DenyAll`, `Ask`), resolution via
+      `agent.approve` / `agent.deny`, and 8-variant typed JSONL transcript persistence
+      (`User`, `Thought`, `Assistant`, `ToolCall`, `Plan`, `Permission`, `Error`, `Stderr`)
+      bounded by `MAX_ENTRIES = 2000` / `MAX_BYTES = 2 MiB`.
+    tiers: [L1-core-isolated]
+    source_globs:
+      - "herdr-core/crates/herdr2/src/permissions.rs"
+      - "herdr-core/crates/herdr2/src/transcript.rs"
+      - "herdr-core/crates/herdr2/src/acp/media.rs"
+      - "herdr-core/crates/herdr2/src/status.rs"
+    covers:
+      rpc:
+        - agent.approve
+        - agent.deny
+      app_commands: []
+      mods: []
+      frames: []
+
+  - id: F05
+    subsystem: herdr-core
+    name: 内置 stdio MCP 与混合父子编排
+    description: >
+      Built-in `h2 mcp` stdio server auto-injected into ACP sessions (with `-32602` legacy schema
+      fallback), caller identity resolution (`H2_AGENT_ID` vs `H2_TERMINAL_ID`), hybrid parent-child
+      notification delivery (`a*` -> `a*` inbox envelope vs `t*` -> `a*` PTY paste with
+      `notes_quiet` / `draft_wait` backoff or `wait --children` wakeup), and `Job::Orphaned`
+      cleanup when parent closes without `--outlive-parent`.
+    tiers: [L1-core-isolated]
+    source_globs:
+      - "herdr-core/crates/herdr2/src/mcp.rs"
+      - "herdr-core/crates/herdr2/src/notes.rs"
+      - "herdr-core/crates/herdr2/src/runtime.rs"
+      - "herdr-core/crates/herdr2/src/pty_input.rs"
+    covers:
+      rpc:
+        - agent.run
+        - agent.wait
+        - terminal.send
+      app_commands: []
+      mods: []
+      frames: []
+
+  - id: F06
+    subsystem: herdr-core
+    name: 交互式 PTY 终端、Holder 与 Ghostty VT 镜像
+    description: >
+      Interactive workspace PTYs via persistent `holder` process (Unix PTY / Windows ConPTY),
+      server-side `ghostty-vt` screen mirror (`screens`), strict cross-registry name uniqueness
+      against live `a*` agents, all 14 `terminal.*` RPCs, multi-viewer foreground resize
+      arbitration (`foreground.rs`, `viewers.rs`), full-screen scrollback stitching (`stitch.rs`),
+      and Kitty graphics reply correlation (`relay/graphics.rs`).
+    tiers: [L1-core-isolated]
+    source_globs:
+      - "herdr-core/crates/herdr2/src/api/pty.rs"
+      - "herdr-core/crates/herdr2/src/runtime/pty.rs"
+      - "herdr-core/crates/herdr2/src/holder.rs"
+      - "herdr-core/crates/herdr2/src/terminals.rs"
+      - "herdr-core/crates/herdr2/src/foreground.rs"
+      - "herdr-core/crates/herdr2/src/viewers.rs"
+      - "herdr-core/crates/herdr2/src/stitch.rs"
+      - "herdr-core/crates/herdr2/src/relay/graphics.rs"
+    covers:
+      rpc:
+        - terminal.run
+        - terminal.list
+        - terminal.get
+        - terminal.kill
+        - terminal.rm
+        - terminal.keep
+        - terminal.label
+        - terminal.read
+        - terminal.attach
+        - terminal.send
+        - terminal.wait
+        - terminal.keys
+        - terminal.interrupt
+        - terminal.put
+      app_commands: []
+      mods: []
+      frames: []
+
+  - id: F07
+    subsystem: herdr-core
+    name: 上下文 Handoff、Fork、侧聊与代码评审交付
+    description: >
+      Cross-provider `agent.handoff` supporting `handoff`, `fork` (including isolated git worktree
+      creation), `side_chat`, and `merge_back` across ACP and PTY sessions, plus `agent.review`
+      deterministic line-anchored diff review compiler and delivery to ACP or PTY targets.
+    tiers: [L1-core-isolated]
+    source_globs:
+      - "herdr-core/crates/herdr2/src/api/handoff.rs"
+      - "herdr-core/crates/herdr2/src/handoff.rs"
+      - "herdr-core/crates/herdr2/src/api/review.rs"
+      - "herdr-core/crates/herdr2/src/review.rs"
+      - "herdr-core/crates/herdr2/src/pty_transcript.rs"
+    covers:
+      rpc:
+        - agent.handoff
+        - agent.review
+      app_commands: []
+      mods: []
+      frames: []
+
+  - id: F08
+    subsystem: herdr-core
+    name: 隐藏 Git Ref 检查点、纯增量 Diff 与回滚二分
+    description: >
+      Hidden Git ref checkpoints (`checkpoint.list`, `checkpoint.capture`, `checkpoint.diff`,
+      `checkpoint.rollback`, `checkpoint.bisect`, `checkpoint.hook`) without mutating user Git
+      index/HEAD, pure authored diff excluding upstream merge noise, three-tier workspace isolation
+      safety (`IsolatedWorktree` / `ExclusiveConfirm` / `SharedBlocked`), and CLI hook callbacks.
+    tiers: [L1-core-isolated]
+    source_globs:
+      - "herdr-core/crates/herdr2/src/checkpoint.rs"
+      - "herdr-core/crates/herdr2/src/checkpoint_safety.rs"
+      - "herdr-core/crates/herdr2/src/cli/checkpoint.rs"
+      - "herdr-core/crates/herdr2/src/zcode.rs"
+    covers:
+      rpc:
+        - checkpoint.list
+        - checkpoint.capture
+        - checkpoint.diff
+        - checkpoint.rollback
+        - checkpoint.bisect
+        - checkpoint.hook
+      app_commands: []
+      mods: []
+      frames: []
+
+  - id: F09
+    subsystem: herdr-core
+    name: 文件、文档、命令执行与跨机 SSH 联邦
+    description: >
+      Non-agent command execution (`machine.exec`), atomic file operations (`file.read`,
+      `file.write`, `file.edit`), versioned JSON document store (`doc.get`, `doc.set` with 1 MiB
+      limit and optimistic conflict checking), `agent.put` isolated staging, SSH machine federation
+      (`machine.add`, `machine.list`, `machine.connect`, `machine.rename`, `machine.rm`), and
+      release self-update (`releases.rs`).
+    tiers: [L1-core-isolated]
+    source_globs:
+      - "herdr-core/crates/herdr2/src/exec.rs"
+      - "herdr-core/crates/herdr2/src/files.rs"
+      - "herdr-core/crates/herdr2/src/api/doc.rs"
+      - "herdr-core/crates/herdr2/src/put.rs"
+      - "herdr-core/crates/herdr2/src/machines.rs"
+      - "herdr-core/crates/herdr2/src/remote.rs"
+      - "herdr-core/crates/herdr2/src/releases.rs"
+    covers:
+      rpc:
+        - machine.exec
+        - file.read
+        - file.write
+        - file.edit
+        - doc.get
+        - doc.set
+        - agent.put
+        - machine.add
+        - machine.list
+        - machine.connect
+        - machine.rename
+        - machine.rm
+      app_commands: []
+      mods: []
+      frames: []
+
+  - id: F10
+    subsystem: herdr-core
+    name: Drove 单守护进程多智能体 DAG 编排与 Worker 协议
+    description: >
+      Native Rust `DroveRuntime` orchestrator: DAG scheduling (`foreach`, `foreachFrom`, `when`,
+      `triggerRule`, `kind: exec`), warm worker pool reuse (`PoolSignal` lock-free sync), silence
+      stall watchdogs, coordinator wakeups, `drove.subscribe` framed event stream, and worker
+      protocol (`context`, `inbox`, `ask`, `note`, `read`, `done`) with token/attempt auth.
+    tiers: [L1-core-isolated, L4-live-llm]
+    source_globs:
+      - "herdr-core/crates/herdr2/src/drove/mod.rs"
+      - "herdr-core/crates/herdr2/src/drove/scheduler.rs"
+      - "herdr-core/crates/herdr2/src/drove/router.rs"
+      - "herdr-core/crates/herdr2/src/drove/pool.rs"
+      - "herdr-core/crates/herdr2/src/drove/routes.rs"
+      - "herdr-core/crates/herdr2/src/drove/notify.rs"
+      - "herdr-core/crates/herdr2/src/drove/store.rs"
+      - "herdr-core/crates/herdr2/src/drove/cli.rs"
+    covers:
+      rpc:
+        - drove.subscribe
+      app_commands: []
+      mods: []
+      frames: []
+
+  - id: F11
+    subsystem: herdr-core
+    name: Drove 隔离沙盒、角色权限围栏、Worktree 合并与对抗评审
+    description: >
+      Drove worker OS process sandboxing (`bwrap` on Linux, `sandbox-exec` on macOS,
+      `restricted-token` on Windows) protecting `secrets/` and `drove.json`, `roles.rs`
+      `readonly`/`scoped_write` diff violation (`422 role_scope_violation`), `verify.rs` gate &
+      stagnant output hash tracking, serialized Git/AOSP worktree merge-back, and multi-round
+      adversarial `review.rs` (R1 full diff, R2+ delta diff).
+    tiers: [L1-core-isolated]
+    source_globs:
+      - "herdr-core/crates/herdr2/src/drove/sandbox.rs"
+      - "herdr-core/crates/herdr2/src/drove/roles.rs"
+      - "herdr-core/crates/herdr2/src/drove/verify.rs"
+      - "herdr-core/crates/herdr2/src/drove/integrate.rs"
+      - "herdr-core/crates/herdr2/src/drove/review.rs"
+    covers:
+      rpc: []
+      app_commands: []
+      mods: []
+      frames: []
+
+  - id: F12
+    subsystem: herdr-core
+    name: 共享 Core AI 运行时、KV-Cache 复用与 Drove 智能配置
+    description: >
+      Shared `Core.ai` runtime with immutable >1024-token prefix, `AiSessionPool`, TTL cache,
+      input compaction, circuit breaker, all 11 `ai.*` RPCs (`ai.status`, `ai.settings.set`,
+      `ai.test`, `ai.probe_prompt_mode`, `ai.complete`, `ai.classify_terminal_state`,
+      `ai.handoff_recommend`, `ai.briefing`, `ai.summarize_agent`, `ai.commit_message`,
+      `ai.polish_prompt`), and Drove config/probe RPCs (`drove.settings.get`/`set`, `drove.probe`,
+      `drove.ai.test`, `drove.roles.ai_configure`, `drove.magpie.test`) with `0600` secret storage.
+    tiers: [L1-core-isolated, L4-live-llm]
+    source_globs:
+      - "herdr-core/crates/herdr2/src/ai/*.rs"
+      - "herdr-core/crates/herdr2/src/drove/ai.rs"
+      - "herdr-core/crates/herdr2/src/drove/config.rs"
+      - "herdr-core/crates/herdr2/src/drove/probe.rs"
+      - "herdr-core/crates/herdr2/src/drove/magpie.rs"
+    covers:
+      rpc:
+        - drove.settings.get
+        - drove.settings.set
+        - drove.probe
+        - drove.ai.test
+        - drove.roles.ai_configure
+        - drove.magpie.test
+        - ai.status
+        - ai.settings.set
+        - ai.test
+        - ai.probe_prompt_mode
+        - ai.complete
+        - ai.classify_terminal_state
+        - ai.handoff_recommend
+        - ai.briefing
+        - ai.summarize_agent
+        - ai.commit_message
+        - ai.polish_prompt
+      app_commands: []
+      mods: []
+      frames: []
+
+  - id: F13
+    subsystem: herdr-app
+    name: 桌面工作区模型、布局引擎与 Core 文档同步
+    description: >
+      Desktop workspace tree (`space.*`, `tab.*`, `pane.*`) and layout engine (`layout.*`,
+      `app.reset`), persisted per machine to Core `herdr2-app` document (`doc.get`/`doc.set`) with
+      multi-machine `mirror.rs`/`mirror_sync.rs` prefix mapping, shipped layouts (`main`,
+      `terminals`, `win98`), and structural chrome mods (`spaces`, `tabs`, `pane`, `terminals-bar`,
+      `terminals-pane`, `workspace-chrome`, `workspace-status`, `win98`, `picker`, `worktree`).
+    tiers: [L2-app-sandbox]
+    source_globs:
+      - "herdr-app/src/model.rs"
+      - "herdr-app/src/layout.rs"
+      - "herdr-app/src/layout_sync.rs"
+      - "herdr-app/src/mirror.rs"
+      - "herdr-app/src/mirror_sync.rs"
+      - "herdr-app/src/persist.rs"
+      - "herdr-app/defaults/layouts/*.json"
+    covers:
+      rpc: []
+      app_commands:
+        - space.new
+        - space.close
+        - space.rename
+        - space.move
+        - space.select
+        - space.next
+        - space.prev
+        - tab.new
+        - tab.close
+        - tab.rename
+        - tab.move
+        - tab.merge
+        - tab.select
+        - tab.settle
+        - tab.unsettle
+        - tab.next
+        - tab.prev
+        - pane.split
+        - pane.close
+        - pane.detach
+        - pane.zoom
+        - pane.focus
+        - pane.go
+        - pane.swap
+        - layout.switch
+        - layout.clone
+        - layout.set
+        - layout.toggle
+        - layout.show
+        - layout.hide
+        - layout.resize
+        - layout.select
+        - layout.reset
+        - app.reset
+      mods:
+        - spaces
+        - tabs
+        - pane
+        - terminals-bar
+        - terminals-pane
+        - workspace-chrome
+        - workspace-status
+        - win98
+        - picker
+        - worktree
+      frames: []
+
+  - id: F14
+    subsystem: herdr-app
+    name: Ghostty-sys GPU 终端渲染、输入选择与程序探测
+    description: >
+      GPU-accelerated terminal panes via `ghostty-sys` + GPUI (`vt.rs`, `terminal.rs`), all
+      desktop `terminal.*` commands (open, keep, park, right_click, view, pin, kill, peek, show,
+      select_all, select, adjust_selection, clear_selection, copy, scroll, paste, paste_image,
+      search), `programs.json` full-permission CLI launch & shell exit recovery, and `keys.json`
+      / `win32_keys.rs` key dispatch.
+    tiers: [L2-app-sandbox]
+    source_globs:
+      - "herdr-app/crates/ghostty-sys/src/lib.rs"
+      - "herdr-app/src/vt.rs"
+      - "herdr-app/src/terminal.rs"
+      - "herdr-app/src/programs.rs"
+      - "herdr-app/src/keys.rs"
+      - "herdr-app/defaults/programs.json"
+      - "herdr-app/defaults/keys*.json"
+    covers:
+      rpc: []
+      app_commands:
+        - terminal.open
+        - terminal.keep
+        - terminal.park
+        - terminal.right_click
+        - terminal.view
+        - terminal.pin
+        - terminal.kill
+        - terminal.peek
+        - terminal.show
+        - terminal.select_all
+        - terminal.select
+        - terminal.adjust_selection
+        - terminal.clear_selection
+        - terminal.copy
+        - terminal.scroll
+        - terminal.paste
+        - terminal.paste_image
+        - terminal.search
+      mods:
+        - new-menu
+        - menu
+      frames: []
+
+  - id: F15
+    subsystem: herdr-app
+    name: 双通道 Agents 侧栏、非 7501 状态推断与回收站闭环
+    description: >
+      Unified `agents` sidebar consuming both `terminals` and `agents` event streams (`hc.rs`),
+      non-OSC-7501 state inference (`raw_title` + output + `Vt::tail_lines`), headless ACP `peek`
+      dialog & tab keeping (`terminal.keep`/`park`), agent recycle bin (`agent.trash`,
+      `agent.restore`, `agent.purge`, `agent.empty_trash`), `agent.focus`/`rename`/`status`/
+      `briefing`/`handoff`/`send`/`send_review`/`next`/`prev`, and `prompt.polish*` with
+      `polish-progress` overlay.
+    tiers: [L2-app-sandbox, L4-live-llm]
+    source_globs:
+      - "herdr-app/src/hc.rs"
+      - "herdr-app/src/window.rs"
+      - "herdr-app/defaults/mods/agents/*.js"
+      - "herdr-app/defaults/mods/peek/*.js"
+      - "herdr-app/defaults/mods/handoff/*.js"
+      - "herdr-app/defaults/mods/changes/*.js"
+      - "herdr-app/defaults/mods/polish-progress/*.js"
+    covers:
+      rpc: []
+      app_commands:
+        - agent.focus
+        - agent.rename
+        - agent.trash
+        - agent.restore
+        - agent.purge
+        - agent.empty_trash
+        - agent.status
+        - agent.briefing
+        - agent.handoff
+        - agent.send
+        - agent.send_review
+        - agent.next
+        - agent.prev
+        - prompt.polish
+        - prompt.polish_undo
+        - prompt.polish_cancel
+      mods:
+        - agents
+        - peek
+        - handoff
+        - changes
+        - polish-progress
+      frames: []
+
+  - id: F16
+    subsystem: herdr-app
+    name: 25 个内置 JS Mods、3 个 Frame 屏幕与热重载沙盒
+    description: >
+      QuickJS `gpui-kit` mod VM (`mods.rs`, `mod_files.rs`), live hot-reload (`app.reload_mods`)
+      with `.error` rollback preservation, `mod.open`, `mod.clone`, `files.open`, `overlay.close`,
+      `herdr2 check <mod>` static verification, `shared.json` atomic persistence, and complete
+      functional coverage of remaining mods (`checkpoints`, `confirm`, `files`, `flash-note`,
+      `help`, `machine-add`, `prompt`, `toast`) and frame screens (`palette`, `settings`, `welcome`).
+    tiers: [L0-static, L2-app-sandbox]
+    source_globs:
+      - "herdr-app/src/mods.rs"
+      - "herdr-app/src/mod_files.rs"
+      - "herdr-app/src/files.rs"
+      - "herdr-app/defaults/mods/*/*"
+      - "herdr-app/defaults/frame/*/*"
+    covers:
+      rpc: []
+      app_commands:
+        - mod.clone
+        - mod.open
+        - files.open
+        - overlay.close
+        - app.reload_mods
+      mods:
+        - checkpoints
+        - confirm
+        - files
+        - flash-note
+        - help
+        - machine-add
+        - prompt
+        - toast
+      frames:
+        - palette
+        - settings
+        - welcome
+
+  - id: F17
+    subsystem: herdr-app
+    name: 桌面控制套接字、自检截图、设置与热更新链路
+    description: >
+      Local control socket `$HERDR2_APP_HOME/herdr2-app.sock` (`control.rs`: `commands`, `ls`,
+      `status`, `do`, `shot`), single-instance window raise, settings & themes (`app.settings`,
+      `app.theme`, `app.language`, `app.zoom_*`, `app.help`, `app.welcome`, `app.palette`),
+      window controls (`window.close`, `window.minimize`, `window.maximize`, `app.quit`/`hide`/
+      `hide_others`/`show_all`), and staged updates (`app.restart`, `app.check_updates`,
+      `app.apply_ui_update`, `app.update`, `app.update_core`).
+    tiers: [L2-app-sandbox]
+    source_globs:
+      - "herdr-app/src/control.rs"
+      - "herdr-app/src/settings.rs"
+      - "herdr-app/src/update.rs"
+      - "herdr-app/src/ui_update.rs"
+      - "herdr-app/defaults/frame/settings/*"
+    covers:
+      rpc: []
+      app_commands:
+        - app.help
+        - app.welcome
+        - app.palette
+        - app.settings
+        - app.restart
+        - app.check_updates
+        - app.apply_ui_update
+        - app.update
+        - app.update_core
+        - app.theme
+        - app.language
+        - app.zoom_in
+        - app.zoom_out
+        - app.zoom_reset
+        - app.quit
+        - app.hide
+        - app.hide_others
+        - app.show_all
+        - window.close
+        - window.minimize
+        - window.maximize
+      mods: []
+      frames:
+        - settings
+        - palette
+        - welcome
+
+  - id: F18
+    subsystem: drove-web
+    name: Drove Web 只读可观测工作台与 HTTP/SSE 联邦
+    description: >
+      Localhost HTTP/1.1 + SSE server (`127.0.0.1:7799` / `H2_DROVE_PORT`) and React workbench
+      (`drove-web/src/`): 7 pages (`dag`, `coordinator`, `tasks`, `workers`, `reviews`, `daemon`,
+      `agents`), `Host` header & `window.__DROVE_TOKEN__` auth, `405 configured_in_app` enforcement
+      on `PUT /api/agents` & `PUT /api/ai/config`, real-time SSE `/api/events`, `?on=<machine>` /
+      `<machine>/<id>` SSH proxy (`drove.http_proxy`, `drove.web.open`), DAG `normalizeSnapshot`
+      edge resolution, and `?mock=1` deterministic fallback.
+    tiers: [L1-core-isolated, L3-web-e2e]
+    source_globs:
+      - "drove-web/src/**/*.ts"
+      - "drove-web/src/**/*.tsx"
+      - "herdr-core/crates/herdr2/src/drove/http.rs"
+      - "herdr-core/crates/herdr2/src/drove/remote.rs"
+    covers:
+      rpc:
+        - drove.web.open
+        - drove.http_proxy
+      app_commands: []
+      mods: []
+      frames: []
+
+  - id: F19
+    subsystem: cross-cutting
+    name: 跨仓协议契约、OpenRPC/App Commands/Defaults 一致性与双版本隔离
+    description: >
+      Cross-repo static and contract invariants: `herdr-core/schema/h2.openrpc.json` (80 methods)
+      in sync with `api.rs` & `cli.rs`; `herdr-app/src/commands.rs` (94 commands) in sync with
+      `defaults/AGENTS.md` & `defaults/herdr.d.ts`; all 25 `defaults/mods/*` and 3
+      `defaults/frame/*` valid against `layouts/*.json` and `herdr2 check`; `drove-web/src/types.ts`
+      aligned with `drove/types.rs`; and strict `herdr2`/`h2`/`H2_*`/`HERDR2_*` isolation from
+      legacy `herdr`/`hc`/`HC_*`/`HERDR_*`.
+    tiers: [L0-static]
+    source_globs:
+      - "herdr-core/schema/h2.openrpc.json"
+      - "herdr-app/src/commands.rs"
+      - "herdr-app/defaults/AGENTS.md"
+      - "herdr-app/defaults/herdr.d.ts"
+      - "drove-web/src/types.ts"
+      - "herdr-core/crates/herdr2/src/drove/types.rs"
+    covers:
+      rpc:
+        - rpc.discover
+      app_commands: []
+      mods: []
+      frames: []

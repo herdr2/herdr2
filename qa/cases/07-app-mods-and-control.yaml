@@ -1,0 +1,266 @@
+suite: 07-app-mods-and-control
+cases:
+  - id: TC-APP-014
+    feature: F16
+    title: 全量 25 Mods 与 3 Frames 静态加载校验 (herdr2 check across all 25 mods & 3 frames)
+    tier: L0-static
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: []
+      cli: ["herdr2 check"]
+      app_commands: [mod.open, overlay.close]
+      mods: [agents, changes, checkpoints, confirm, files, flash-note, handoff, help, machine-add, menu, new-menu, pane, peek, picker, polish-progress, prompt, spaces, tabs, terminals-bar, terminals-pane, toast, win98, workspace-chrome, workspace-status, worktree]
+      frames: [palette, settings, welcome]
+    preconditions:
+      - "Built `herdr2` desktop binary and `herdr-app/defaults/{mods,frame}` present."
+    steps:
+      - "Iterate over all 25 directories in `herdr-app/defaults/mods/` and 3 directories in `herdr-app/defaults/frame/`."
+      - "Run `herdr2 check <dir>` in isolated `HERDR2_APP_HOME` (verifying `shared.json` is left untouched)."
+    oracles:
+      - "Every single mod and frame passes `herdr2 check` with exit code 0 and zero QuickJS runtime/schema errors."
+    ai_probe_hints:
+      - "Notice `polish-progress` has no `mod.json`; verify `herdr2 check` and runtime handle optional `mod.json` gracefully."
+
+  - id: TC-APP-015
+    feature: F16
+    title: QuickJS 热重载、mod.clone、.error 回滚与 shared.json 损坏自愈 (app.reload_mods, mod.clone & shared.json)
+    tier: L2-app-sandbox
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: []
+      cli: ["herdr2 do", "herdr2 status"]
+      app_commands: [app.reload_mods, mod.clone, mod.open, overlay.close]
+      mods: [toast]
+      frames: []
+    preconditions:
+      - "Running isolated Herdr2 window with writable `$HERDR2_APP_HOME`."
+    steps:
+      - "Clone a mod via `mod.clone --name toast --as qa-toast`."
+      - "Inject a JS syntax error into `$HERDR2_APP_HOME/mods/qa-toast/main.js` and run `app.reload_mods`."
+      - "Write invalid JSON to `$HERDR2_APP_HOME/shared.json` and trigger reload/restart."
+    oracles:
+      - "App preserves last good mod version without crashing and writes diagnostic reason to `.error` file."
+      - "Corrupt `shared.json` is quarantined to `shared.json.corrupt-<time>` rather than crashing startup."
+      - "`app.reload_mods` never restarts the window or interrupts running Core terminals."
+    ai_probe_hints:
+      - "Check `toast` mod renders `notify()` action callbacks cleanly."
+
+  - id: TC-APP-016
+    feature: F16
+    title: Files 面板打开工作区与外部文件及行号跳转 (files.open & files mod)
+    tier: L2-app-sandbox
+    mode: hybrid
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: []
+      cli: ["herdr2 do", "herdr2 shot"]
+      app_commands: [files.open]
+      mods: [files]
+      frames: []
+    preconditions:
+      - "Running isolated Herdr2 window open on a temp Git repo containing `README.md`, `src/main.rs`, and an external `/tmp/outside.md`."
+    steps:
+      - "Run `files.open --path README.md --line 3` and `files.open --path /tmp/outside.md --line 1 --end_line 5`."
+      - "Capture `herdr2 shot` verifying Markdown live preview and code syntax view."
+    oracles:
+      - "`files.open` opens both workspace and external paths and highlights/scrolls to target line range."
+    ai_probe_hints:
+      - "Test `files.open` with a binary file or non-existent path for graceful fallback."
+
+  - id: TC-APP-017
+    feature: F16
+    title: Checkpoints、Confirm、Prompt 与 Toast 浮层生命周期 (checkpoints, confirm, prompt, toast mods)
+    tier: L2-app-sandbox
+    mode: hybrid
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [checkpoint.list]
+      cli: ["herdr2 do", "herdr2 shot"]
+      app_commands: [mod.open, overlay.close]
+      mods: [checkpoints, confirm, prompt, toast]
+      frames: []
+    preconditions:
+      - "Running isolated Herdr2 window open on a temp Git repo with at least one checkpoint."
+    steps:
+      - "Open `checkpoints`, `confirm`, and `prompt` overlays via `mod.open`, capture `herdr2 shot`, and dismiss via `overlay.close`."
+      - "Trigger a notification toast and verify `toast` mod renders and clears."
+    oracles:
+      - "All overlays open cleanly, respect `overlay.close`, and emit zero QuickJS errors."
+    ai_probe_hints:
+      - "Test `prompt` mod `Enter` save and `Esc` cancel key handling."
+
+  - id: TC-APP-018
+    feature: F16
+    title: Flash Note 闪念浮窗、底部列表与回收站持久化 (flash-note mod)
+    tier: L2-app-sandbox
+    mode: hybrid
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: []
+      cli: ["herdr2 do", "herdr2 shot"]
+      app_commands: [mod.open, overlay.close]
+      mods: [flash-note]
+      frames: []
+    preconditions:
+      - "Running isolated Herdr2 window with writable `$HERDR2_APP_HOME`."
+    steps:
+      - "Open `flash-note` window via `mod.open --name flash-note`, capture `herdr2 shot`."
+      - "Verify `{ list: true }` bottom-left checklist mode and idea persistence in mod data/shared store."
+    oracles:
+      - "`flash-note` opens resizable floating window (`500x560`, min `400x440`) and closes cleanly."
+    ai_probe_hints:
+      - "Verify deleting an idea moves it to Flash Note recycle bin before purge."
+
+  - id: TC-APP-019
+    feature: F16
+    title: 快捷键帮助列表与添加远程机器向导 (help & machine-add mods)
+    tier: L2-app-sandbox
+    mode: hybrid
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [machine.list]
+      cli: ["herdr2 do", "herdr2 shot"]
+      app_commands: [mod.open, overlay.close, app.help]
+      mods: [help, machine-add]
+      frames: []
+    preconditions:
+      - "Running isolated Herdr2 window with temp `~/.ssh/config` containing test hosts."
+    steps:
+      - "Open `help` via `app.help` / `mod.open --name help` and verify keybindings from `keys.json` render."
+      - "Open `machine-add` via `mod.open --name machine-add`, capture `herdr2 shot`, and dismiss via `overlay.close`."
+    oracles:
+      - "`help` groups and filters bindings cleanly; `machine-add` lists hosts parsed from `~/.ssh/config`."
+    ai_probe_hints:
+      - "Check `help` mod handles `keys.macos.json` vs `keys.json` per platform."
+
+  - id: TC-APP-020
+    feature: F17
+    title: 本地控制套接字、单实例唤醒与畸形参数校验 (herdr2-app.sock ls/status/commands/do/shot & raise_running)
+    tier: L2-app-sandbox
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: []
+      cli: ["herdr2 commands", "herdr2 ls", "herdr2 status", "herdr2 do", "herdr2 shot"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Running isolated Herdr2 window (`HERDR2_APP_HOME=/tmp/qa-app`, `HERDR2_TEST_WINDOW=1`)."
+    steps:
+      - "Run `herdr2 commands`, `herdr2 status`, `herdr2 ls`, and `herdr2 shot /tmp/qa-shot.png`."
+      - "Launch a second `herdr2` process pointing to the same `HERDR2_APP_HOME` to verify `raise_running()`."
+      - "Test invalid `herdr2 shot /tmp/bad.jpg` and misspelled `herdr2 do space.close --space X` and non-string `id` (`--id 123`)."
+    oracles:
+      - "`herdr2 shot` writes valid RGBA PNG matching window physical dimensions; rejects non-`.png` paths with exit 2."
+      - "Second instance raises existing window and exits cleanly; malformed args return structured validation error."
+    ai_probe_hints:
+      - "Verify `herdr2 commands` JSON matches `herdr-app/src/commands.rs` 1:1."
+
+  - id: TC-APP-021
+    feature: F17
+    title: Frame 原生屏幕：Command Palette、Welcome 与 Settings Drove 面板 (palette, welcome, settings frames)
+    tier: L2-app-sandbox
+    mode: hybrid
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [drove.settings.get]
+      cli: ["herdr2 do", "herdr2 shot"]
+      app_commands: [app.palette, app.welcome, app.settings]
+      mods: []
+      frames: [palette, settings, welcome]
+    preconditions:
+      - "Running isolated Herdr2 window."
+    steps:
+      - "Toggle `app.palette`, `app.welcome`, and `app.settings --section drove` (plus `look`, `keyboard`, `machines`, `ai`, `alerts`, `updates` sections)."
+      - "Capture `herdr2 shot` on each frame screen."
+    oracles:
+      - "`palette` lists every command with its keybind and supports fuzzy filtering."
+      - "`welcome` renders 4-page onboarding cleanly; `settings` Drove tab shows Roles, AI Assistant, and optional Magpie Quota without exposing raw API keys."
+    ai_probe_hints:
+      - "Verify `settings` writes temp secret JSON with `--consume` rather than passing API keys on CLI argv."
+
+  - id: TC-APP-022
+    feature: F17
+    title: 主题切换、界面语言与缩放比例控制 (app.theme, app.language, app.zoom_in/out/reset)
+    tier: L2-app-sandbox
+    mode: hybrid
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [drove.settings.set]
+      cli: ["herdr2 do", "herdr2 shot"]
+      app_commands: [app.theme, app.language, app.zoom_in, app.zoom_out, app.zoom_reset]
+      mods: []
+      frames: [settings]
+    preconditions:
+      - "Running isolated Herdr2 window."
+    steps:
+      - "Switch theme (`app.theme --name win98`, `app.theme --name atom-one-dark`)."
+      - "Toggle language (`app.language --language zh-CN`, `app.language --language en`)."
+      - "Adjust zoom (`app.zoom_in`, `app.zoom_out`, `app.zoom_reset`)."
+    oracles:
+      - "Theme and language updates propagate immediately across frame screens and mods without restart."
+      - "`app.zoom_reset` restores 1.0 scale cleanly."
+    ai_probe_hints:
+      - "Test invalid theme name returns error without breaking current theme."
+
+  - id: TC-APP-023
+    feature: F17
+    title: 窗口管理与平台应用生命周期命令 (window.minimize/maximize/close & app.quit/hide/hide_others/show_all)
+    tier: L2-app-sandbox
+    mode: scripted
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: []
+      cli: ["herdr2 do", "herdr2 status"]
+      app_commands: [app.quit, app.hide, app.hide_others, app.show_all, window.close, window.minimize, window.maximize]
+      mods: []
+      frames: []
+    preconditions:
+      - "Running isolated Herdr2 window."
+    steps:
+      - "Invoke `window.minimize` and `window.maximize`."
+      - "Exercise `app.hide`, `app.hide_others`, `app.show_all`, and `app.quit` (on macOS; verify safe handling on Linux/Windows)."
+      - "Invoke `window.close` at teardown and verify socket exit."
+    oracles:
+      - "Window controls respond cleanly without panicking; `window.close` quits cleanly on Linux/Windows."
+    ai_probe_hints:
+      - "Ensure Core daemon terminals remain alive after `window.close`."
+
+  - id: TC-APP-024
+    feature: F17
+    title: 窗口无损重启与 App/UI/Core 三通道更新链路 (app.restart, app.check_updates, app.apply_ui_update, app.update, app.update_core)
+    tier: L2-app-sandbox
+    mode: hybrid
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [server.status]
+      cli: ["herdr2 do", "herdr2 status"]
+      app_commands: [app.restart, app.check_updates, app.apply_ui_update, app.update, app.update_core]
+      mods: []
+      frames: [settings]
+    preconditions:
+      - "Running isolated Herdr2 window with a live Core terminal `t1` and local mock release server (`scripts/release.py serve`)."
+    steps:
+      - "Run `app.check_updates` against mock release server."
+      - "Trigger `app.apply_ui_update` for staged UI bundle hot-update without restarting."
+      - "Trigger `app.restart` and confirm `t1` PID in Core survives window restart."
+      - "Exercise `app.update_core` and `app.update` in sandbox."
+    oracles:
+      - "`app.apply_ui_update` hot-swaps UI bundle live without restarting window or killing terminals."
+      - "`app.restart` and `app.update_core` keep Core `t1` alive seamlessly."
+    ai_probe_hints:
+      - "Verify release manifest signing/hash mismatch aborts update before replacing binaries."

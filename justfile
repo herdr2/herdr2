@@ -70,3 +70,23 @@ test:
     python3 -m unittest discover -s scripts -p "test_*.py"
     cd herdr-core && cargo test --locked
     cd herdr-app && cargo test --locked
+
+# Render qa/CATALOG.md from qa/features.yaml and qa/cases/*.yaml.
+qa-catalog:
+    python3 scripts/qa/sync_check.py --render
+
+# Check contract drift between code/schemas and qa/cases/*.yaml.
+qa-drift *args:
+    python3 scripts/qa/sync_check.py --drift {{args}}
+
+# Analyze changed files and list affected QA features and cases.
+qa-impact ref="HEAD~1" *args:
+    python3 scripts/qa/sync_check.py --impact "{{ref}}" {{args}}
+
+# Run layered Herdr2 QA suite (L0-L4) in an isolated sandbox.
+qa-run *args:
+    python3 scripts/qa/runner.py {{args}}
+
+# Drive the isolated Herdr2 QA sandbox directly.
+qa-sandbox *args:
+    bash scripts/qa/sandbox.sh {{args}}

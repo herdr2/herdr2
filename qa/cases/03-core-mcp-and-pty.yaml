@@ -1,0 +1,245 @@
+suite: 03-core-mcp-and-pty
+cases:
+  - id: TC-CORE-024
+    feature: F05
+    title: 内置 stdio MCP 自动注入与旧版 -32602 Schema 回退 (Built-in h2 mcp injection & -32602 type-strip fallback)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.run, agent.wait]
+      cli: ["h2 mcp", "h2 run"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Fake ACP adapter 1 accepting `{ type: 'stdio', name: 'herdr2', ... }` and fake ACP adapter 2 rejecting `type` field with `-32602`."
+    steps:
+      - "Launch `agent.run` with `inject_mcp: true` against adapter 1 and adapter 2."
+      - "Launch `agent.run` with `inject_mcp: false`."
+      - "Invoke `h2 mcp` directly over stdio sending JSON-RPC `initialize` and `tools/list`."
+    oracles:
+      - "Adapter 1 receives `mcpServers` with `herdr2` stdio entry; Adapter 2 triggers automatic retry with `type` stripped and succeeds."
+      - "`inject_mcp: false` omits `herdr2` MCP entry; `h2 mcp` exposes core orchestration tools cleanly."
+    ai_probe_hints:
+      - "Verify caller identity in `h2 mcp` resolves `H2_AGENT_ID` before `H2_TERMINAL_ID`."
+
+  - id: TC-CORE-025
+    feature: F05
+    title: 混合父子树通知投递与孤儿级联清理 (Hybrid a*->a* inbox, t*->a* PTY backoff & Job::Orphaned cleanup)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.run, agent.wait, terminal.run, terminal.send, terminal.kill]
+      cli: ["h2 run", "h2 wait --children"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated daemon; spawn parent ACP agent `a1` and parent interactive PTY terminal `t1`."
+    steps:
+      - "Inside `a1` (`H2_AGENT_ID=a1`), spawn child `a2`; verify child completion delivers `<h2 from=\"a2\">` envelope into `a1` inbox."
+      - "Inside `t1` (`H2_TERMINAL_ID=t1`), spawn child `a3` (without `--outlive-parent`) and `a4` (with `--outlive-parent`)."
+      - "Trigger `a3` permission block while user is typing draft in `t1`, verifying `notes_quiet` / `draft_wait` backoff before pasting notification."
+      - "Kill `t1` via `terminal.kill`."
+    oracles:
+      - "Closing `t1` triggers `Job::Orphaned(TargetKey::Terminal)` killing `a3` while keeping `a4` (`--outlive-parent`) alive."
+      - "`h2 wait --children` wakes immediately on child blocked/exited/finished."
+    ai_probe_hints:
+      - "Test `t*` running `h2 wait --children any` so notifications wake `wait` instead of pasting raw text."
+
+  - id: TC-CORE-026
+    feature: F06
+    title: 交互式 PTY 终端生命周期与双注册表隔离 (terminal.run/list/get/kill/rm & registry isolation)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [terminal.run, terminal.list, terminal.get, terminal.kill, terminal.rm]
+      cli: ["h2 ls", "h2 get", "h2 kill", "h2 rm"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated `herdr2` daemon with one live ACP agent `a1`."
+    steps:
+      - "Start an interactive shell via `terminal.run` (`shell: true`, `name: pty-test`)."
+      - "Inspect `terminal.list`, `agent.list`, and `terminal.get`."
+      - "Verify `terminal.rm` fails while live (`live`), then call `terminal.kill` followed by `terminal.rm`."
+    oracles:
+      - "Child PTY env has `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=ghostty`, `H2_TERMINAL_ID=t*`."
+      - "`terminal.list` never includes `a1` and `agent.list` never includes `pty-test`."
+      - "`terminal.rm` removes finished terminal cleanly."
+    ai_probe_hints:
+      - "Also test `terminal.run` with `wait: true` on a short exiting command (`echo ok`) returning final VT screen."
+
+  - id: TC-CORE-027
+    feature: F06
+    title: PTY 双向输入输出、模式等待、按键与中断 (terminal.send, terminal.read, terminal.wait, terminal.keys, terminal.interrupt)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [terminal.run, terminal.read, terminal.send, terminal.wait, terminal.keys, terminal.interrupt]
+      cli: ["h2 send", "h2 wait", "h2 keys", "h2 interrupt", "h2 read"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Live interactive PTY terminal `t1` on isolated daemon."
+    steps:
+      - "Send `echo HERDR2_PTY_OK` via `terminal.send` and wait via `terminal.wait` (`output: 'HERDR2_PTY_OK'`)."
+      - "Run `sleep 30` via `terminal.send`, then interrupt with `terminal.interrupt` (`ctrl+c`) and send `terminal.keys` (`enter`, `tab`)."
+      - "Call `terminal.read` for current screen and scrollback."
+    oracles:
+      - "`terminal.wait` wakes as soon as `HERDR2_PTY_OK` appears on screen."
+      - "`terminal.interrupt` aborts `sleep 30` back to shell prompt; `terminal.read` mirrors Ghostty VT screen accurately."
+    ai_probe_hints:
+      - "Verify `pty_input` single-queue serialization when concurrent `send` and `keys` calls arrive."
+
+  - id: TC-CORE-028
+    feature: F06
+    title: PTY 名称跨表去重、标签管理与文件暂存 (terminal.label, terminal.put & cross-registry name uniqueness)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [terminal.run, terminal.label, terminal.put, agent.run]
+      cli: ["h2 label", "h2 put"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated `herdr2` daemon with live ACP agent named `worker-alpha`."
+    steps:
+      - "Attempt `terminal.run` with `name: 'worker-alpha'` -> expect `name_taken`."
+      - "Start a terminal with unique name `shell-beta`, set `role=shell` via `terminal.label`, and stage bytes via `terminal.put`."
+      - "Verify staged file is readable from inside `shell-beta`, then kill `shell-beta` and verify cleanup."
+    oracles:
+      - "Cross-registry name uniqueness blocks live name collision (`name_taken`)."
+      - "`terminal.put` writes bytes into an isolated temp folder beside `shell-beta` and cleans up on teardown."
+    ai_probe_hints:
+      - "Check `terminal.put` rejects path traversal (`../`) with `invalid_params`."
+
+  - id: TC-CORE-029
+    feature: F06
+    title: 多 Viewer terminal.attach 与前台尺寸仲裁 (Multi-viewer attach, RESIZE/FOCUS & needs_framed)
+    tier: L1-core-isolated
+    mode: hybrid
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [terminal.attach, terminal.read]
+      cli: ["h2 attach"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Live PTY terminal `t1` on isolated daemon."
+    steps:
+      - "Attempt `terminal.attach` on an unframed connection -> expect `needs_framed`."
+      - "Open two framed connections calling `terminal.attach` on `t1`."
+      - "Send `RESIZE` (kind=3) + `FOCUS` (kind=4, active) from Viewer A (`120x40`) and `RESIZE` + `FOCUS` (unfocused) from Viewer B (`60x20`)."
+    oracles:
+      - "Focused Viewer A (`120x40`) wins foreground size arbitration; unfocused Viewer B cannot shrink PTY to `60x20`."
+      - "Both viewers receive first paint snapshot and live incremental VT output bytes."
+    ai_probe_hints:
+      - "Verify `FACTS` (kind=5) and `AUTOMATIC_INPUT` (kind=6) frames prevent echo loops."
+
+  - id: TC-CORE-030
+    feature: F06
+    title: terminal.keep 与守护进程重启 Holder 进程领养 (terminal.keep & holder adoption across server.restart)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [terminal.keep, terminal.read, terminal.get, server.restart]
+      cli: ["h2 keep", "h2 server restart"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Live PTY terminal `t1` with shell state (`export QA_VAR=ALIVE`) on isolated daemon."
+    steps:
+      - "Enable `terminal.keep` (`keep: true`) on `t1`."
+      - "Trigger `server.restart`."
+      - "Re-inspect `t1` via `terminal.get`, `terminal.read`, and echo `$QA_VAR`."
+    oracles:
+      - "Holder process survives `server.restart` and is adopted by new daemon."
+      - "`QA_VAR=ALIVE` remains set in live shell and Ghostty VT screen retains prior history."
+    ai_probe_hints:
+      - "Also test `terminal.keep` (`keep: false`) and verify behavior on subsequent restart."
+
+  - id: TC-CORE-031
+    feature: F06
+    title: 全屏程序 Alt-Screen 历史拼接与滚动读取 (Full-screen alt-screen scrollback stitching)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P2
+    platforms: [linux, macos]
+    covers:
+      rpc: [terminal.run, terminal.read, terminal.keys]
+      cli: ["h2 read"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Live PTY terminal running a multi-page pager or scripted alt-screen output (`\x1b[?1049h`)."
+    steps:
+      - "Emit >100 numbered lines inside a full-screen pager."
+      - "Invoke `terminal.read` with history/scroll options to exercise `stitch.rs` deduplicated page gluing."
+    oracles:
+      - "Overlapping lines across scrolled pages are stitched cleanly without duplication or dropped boundary lines."
+    ai_probe_hints:
+      - "Test edge case where consecutive scroll frames have zero overlap."
+
+  - id: TC-CORE-032
+    feature: F06
+    title: Kitty 图形协议应答关联与多客户端透传 (Kitty graphics reply correlation across viewers)
+    tier: L1-core-isolated
+    mode: hybrid
+    priority: P2
+    platforms: [linux, macos]
+    covers:
+      rpc: [terminal.attach, terminal.send]
+      cli: ["h2 attach"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Live PTY terminal `t1` attached by Viewer A and Viewer B on framed connections."
+    steps:
+      - "Send Kitty graphics query APC sequence from Viewer A and verify `relay/graphics.rs` routes the PTY reply back to the requesting viewer without corrupting Viewer B."
+    oracles:
+      - "Graphics replies correlate accurately per-viewer without blocking `pty_input` queue."
+    ai_probe_hints:
+      - "Verify cleanup when Viewer A closes before graphics reply returns."
+
+  - id: TC-CORE-033
+    feature: F06
+    title: PTY 托管编码 Agent 结构化 Transcript 提取 (pty_transcript.rs & pty_adapters.rs extraction)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [terminal.run, terminal.read]
+      cli: ["h2 read --json"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Simulated PTY CLI session writing structured Claude/Codex/Gemini-style session transcript log."
+    steps:
+      - "Run PTY terminal referencing fixture CLI transcript and query `terminal.read` / structured transcript endpoint."
+    oracles:
+      - "`pty_transcript.rs` extracts user/assistant turns cleanly for downstream `handoff` or `peek` consumption."
+    ai_probe_hints:
+      - "Check fallback when PTY CLI has no structured session file on disk."

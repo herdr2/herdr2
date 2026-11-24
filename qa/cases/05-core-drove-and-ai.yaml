@@ -1,0 +1,299 @@
+suite: 05-core-drove-and-ai
+cases:
+  - id: TC-CORE-046
+    feature: F10
+    title: Drove DAG Plan 创建、订阅推送与 Complete 终态验证 (drove plan, drove.subscribe & complete)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [drove.subscribe]
+      cli: ["h2 drove plan", "h2 drove show", "h2 drove wait", "h2 drove complete", "h2 drove runs"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated `herdr2` daemon with `drove.json` roles wired to fake ACP agent."
+    steps:
+      - "Test `drove.subscribe` without `framed: true` -> expect `needs_framed`."
+      - "Open a framed connection and call `drove.subscribe`, then submit a 2-step DAG via `h2 drove plan --file plan.yaml`."
+      - "Wait via `h2 drove wait` and finalize with `h2 drove complete --verify 'true'`."
+    oracles:
+      - "`drove.subscribe` streams ordered task/worker/attempt transitions and item events."
+      - "`h2 drove complete` executes Run-level verify gate and marks Run completed."
+    ai_probe_hints:
+      - "Verify `h2 drove runs --trash` stays empty until a run is trashed."
+
+  - id: TC-CORE-047
+    feature: F10
+    title: Drove DAG 动态扩展 foreach / foreachFrom / when 条件与 kind exec (DAG branching & native exec steps)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [drove.subscribe]
+      cli: ["h2 drove plan", "h2 drove show", "h2 drove wait"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated `herdr2` daemon with `drove.json` roles wired to fake ACP agent."
+    steps:
+      - "Submit a DAG plan with: (a) `kind: exec` producer outputting JSON list, (b) `foreachFrom` consumer, (c) static `foreach` task, (d) `when` condition evaluating false, and (e) downstream join task with `triggerRule: any_success`."
+      - "Wait via `h2 drove wait` and inspect task graph via `h2 drove show`."
+    oracles:
+      - "`foreachFrom` dynamically expands `<key>#0..N` child tasks from upstream JSON artifact."
+      - "False `when` task transitions to `skipped`, while downstream `any_success` task still runs and succeeds."
+    ai_probe_hints:
+      - "Check `all_success` vs `any_success` when one upstream branch fails."
+
+  - id: TC-CORE-048
+    feature: F10
+    title: Worker 协议全套动作与 Token/Attempt 安全边界 (Worker context, inbox, ask/reply, note, read, done)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [drove.subscribe]
+      cli: ["h2 drove worker context", "h2 drove worker inbox", "h2 drove worker ask", "h2 drove worker note", "h2 drove worker read", "h2 drove worker done", "h2 drove reply", "h2 drove ack", "h2 drove inbox"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Active Drove Run with task T1 assigned to worker W1 (attempt A1)."
+    steps:
+      - "Call `h2 drove worker context` and `h2 drove worker note 'progress 50%'`."
+      - "Call `h2 drove worker ask 'Use A or B?' --options 'A,B'` while coordinator polls `h2 drove inbox`, acks/replies via `h2 drove reply`."
+      - "Send coordinator note via `h2 drove send` and drain via `h2 drove worker inbox`."
+      - "Call `h2 drove worker read <dep_task>` with `--offset`/`--limit`/`--grep`, test calling `POST /api/runs` with worker token (`403 forbidden`), then call `h2 drove worker done --outcome done`."
+    oracles:
+      - "`worker ask` blocks until `drove reply` unblocks it; invalid worker token returns `401 unauthorized`; management endpoint with worker token returns `403 forbidden`."
+      - "Reused worker W1 with frozen `H2_DROVE_ATTEMPT_ID=A1` routes transparently to A2 unless `explicitAttempt: true` (`409 stale_attempt`)."
+    ai_probe_hints:
+      - "Test `worker done --outcome failed --reason '...'` to verify failure propagation."
+
+  - id: TC-CORE-049
+    feature: F10
+    title: Warm Worker 复用、动态 Add/Route/Retry、暂停恢复与静默看门狗 (Warm reuse, add, route, retry, pause/resume & watchdog)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [drove.subscribe]
+      cli: ["h2 drove add", "h2 drove route", "h2 drove retry", "h2 drove pause", "h2 drove resume", "h2 drove cancel", "h2 drove inspect", "h2 drove use"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Active Drove Run on isolated daemon."
+    steps:
+      - "Set default run via `h2 drove use <run_id>`, pause via `h2 drove pause`, append task via `h2 drove add`, and override role/model via `h2 drove route`."
+      - "Resume via `h2 drove resume`; verify idle warm worker from previous completed task is reused (`<role> · <task_key>` -> `<role> · idle`)."
+      - "Fail a task, inspect via `h2 drove inspect`, retry via `h2 drove retry --hint 'fix'`, and test `h2 drove cancel`."
+    oracles:
+      - "Paused run queues ready tasks without dispatching until `resume`."
+      - "Warm idle worker is reused across tasks rather than spawning duplicate ACP processes; coordinator close/trash closes workers cleanly via `PoolSignal`."
+    ai_probe_hints:
+      - "Verify external `h2 kill <a*>` syncs back to Drove worker/attempt state lock-free over `PoolSignal`."
+
+  - id: TC-CORE-050
+    feature: F11
+    title: Drove OS 进程沙盒隔离：secrets 遮蔽与 readonly 挂载保护 (Sandbox isolation for secrets/, drove.json & readonly)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: []
+      cli: ["h2 drove quick", "h2 drove worker done"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated daemon with `secrets/ai.key` and `secrets/coordinator.token` populated (`0600`)."
+      - "Check `sandbox_backend()` (`bwrap` on Linux, `sandbox-exec` on macOS, `restricted-token` on Windows)."
+    steps:
+      - "Launch a `researcher` (`readonly`) worker attempting to read `<state>/drove/secrets/ai.key`, write `<state>/drove/state.json`, and write into `<cwd>`."
+      - "Launch a `coder` worker in a worktree under `<state>/drove/worktrees` attempting to write inside its worktree while reading `<state>/drove/secrets/ai.key`."
+    oracles:
+      - "`secrets/ai.key` and `secrets/coordinator.token` are unreadable inside sandboxed worker."
+      - "`state.json` and `drove.json` are non-writable; `readonly` worker cannot mutate `<cwd>`, while worktree worker can write inside its assigned worktree."
+    ai_probe_hints:
+      - "If host user namespaces forbid `bwrap`, record `sandbox_backend == 'none'` clearly and verify `roles.rs` diff guardrail still catches edits."
+
+  - id: TC-CORE-051
+    feature: F11
+    title: 角色权限围栏：readonly 与 scoped_write 越界拦截 (Role scope diff guard 422 role_scope_violation)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: []
+      cli: ["h2 drove plan", "h2 drove worker done"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Temp Git repo with baseline commit and Drove roles (`researcher` readonly, `writer` scoped_write `['docs/**']`)."
+    steps:
+      - "Have `researcher` modify `src/lib.rs` and call `h2 drove worker done`."
+      - "Have `writer` modify `src/main.rs` (outside `docs/**`) and call `h2 drove worker done`."
+      - "Have `writer` revert `src/main.rs`, edit `docs/guide.md`, and re-submit `worker done`."
+    oracles:
+      - "Out-of-scope edits are rejected with `422 role_scope_violation` naming the violating paths."
+      - "In-scope `docs/guide.md` edit succeeds cleanly."
+    ai_probe_hints:
+      - "Verify untracked files created by a `readonly` role are also caught by `diff_touched_paths`."
+
+  - id: TC-CORE-052
+    feature: F11
+    title: Verify Gate 门禁、Stagnant 输出哈希与并行 Worktree 合并互斥锁 (Verify gate, stagnant hash & worktree merge mutex)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: []
+      cli: ["h2 drove plan", "h2 drove worker done", "h2 drove inspect"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Temp Git repo with clean commit."
+    steps:
+      - "Run a task with failing `verify` command twice producing identical output -> confirm stagnant output hash detection."
+      - "Run two parallel `worktree: true` coder tasks touching disjoint files (`a.txt` and `b.txt`) and completing near-simultaneously."
+    oracles:
+      - "Failing `verify` blocks completion and writes `verify-*.log` under `<state>/drove/artifacts/`; identical consecutive failure hashes are flagged stagnant."
+      - "Parallel worktrees merge back sequentially under per-run async mutex with both `a.txt` and `b.txt` landed cleanly and worker worktrees reset clean."
+    ai_probe_hints:
+      - "Test merge conflict during worktree integration to verify clean failure escalation."
+
+  - id: TC-CORE-053
+    feature: F11
+    title: 对抗式多轮 Review：R1 Full Diff 与 R2+ Delta Diff 及 maxRounds 上限 (Adversarial review R1/R2+ & maxRounds)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: []
+      cli: ["h2 drove plan", "h2 drove worker done", "h2 drove show"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Temp Git repo and fake ACP reviewer configured to reject Round 1 and approve Round 2."
+    steps:
+      - "Run a task with `review: { required: true, maxRounds: 2 }`."
+      - "Author edits file and calls `worker done` -> Reviewer inspects R1 Full diff and requests changes."
+      - "Author makes follow-up fix and calls `worker done` -> Reviewer inspects R2 Delta diff and approves."
+      - "Test a second task where reviewer rejects both R1 and R2 (`maxRounds` exhausted)."
+    oracles:
+      - "Immutable candidate patches (`review-*.patch`) contain full diff in R1 and delta diff in R2."
+      - "Exhausting `maxRounds` transitions task to failed/needs-attention cleanly."
+    ai_probe_hints:
+      - "Verify reviewer worker runs with `readonly` role access."
+
+  - id: TC-CORE-054
+    feature: F12
+    title: Drove 配置管理、--consume 密钥清除、Probe 与 Magpie 测试 (drove.settings.get/set, probe, ai.test, magpie.test)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [drove.settings.get, drove.settings.set, drove.probe, drove.ai.test, drove.magpie.test]
+      cli: ["h2 drove settings", "h2 drove settings-set --consume", "h2 drove probe", "h2 drove ai-test", "h2 drove magpie-test", "h2 drove roles", "h2 drove status"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Local mock OpenAI-compatible HTTP endpoint and mock Magpie quota server."
+    steps:
+      - "Write temporary JSON file with API key and apply via `drove.settings.set` / `h2 drove settings-set --file tmp.json --consume`."
+      - "Inspect `drove.settings.get`, `drove.json`, and `secrets/ai.key` permissions."
+      - "Run `drove.probe`, `drove.ai.test`, and `drove.magpie.test`."
+    oracles:
+      - "`--consume` deletes `tmp.json` immediately after reading."
+      - "Raw API key never appears in `drove.json` or `drove.settings.get` response; `ai.key` has `0600` permissions."
+      - "`magpie.enabled` defaults to `false`; `drove.probe`, `drove.ai.test`, and `drove.magpie.test` return structured status."
+    ai_probe_hints:
+      - "Verify `drove.probe` with `refresh: true` probes installed ACP presets live."
+
+  - id: TC-CORE-055
+    feature: F12
+    title: Core AI 运行时配置、KV-Cache >1024 Prefix 与熔断器 (ai.status, ai.settings.set, ai.test, ai.probe_prompt_mode, ai.complete)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [ai.status, ai.settings.set, ai.test, ai.probe_prompt_mode, ai.complete]
+      cli: ["h2 ai status", "h2 ai settings-set", "h2 ai test", "h2 ai probe-prompt-mode"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Local mock OpenAI HTTP server recording request system prompts and simulating 200 OK and 500 error bursts."
+    steps:
+      - "Configure AI endpoint via `ai.settings.set` (`--consume`) and verify `ai.status` and `ai.test`."
+      - "Run `ai.probe_prompt_mode`, then call `ai.complete` twice with identical parameters to check TTL cache deduplication and KV-cache prefix stability (>1024 tokens)."
+      - "Trigger repeated HTTP 500 errors from mock server to trip the circuit breaker and inspect `ai.status`."
+    oracles:
+      - "Shared control-plane system prompt (>1024 tokens) stays byte-immutable across requests; second identical `ai.complete` hits TTL cache."
+      - "Circuit breaker opens cleanly on failure burst and surfaces state in `ai.status`."
+    ai_probe_hints:
+      - "Verify `ai.settings.set` stores secret in `0600` file rather than `ai.json`."
+
+  - id: TC-CORE-056
+    feature: F12
+    title: Core AI 与 Drove 智能辅助 RPC 全集验证 (classify_terminal_state, handoff_recommend, briefing, summarize, commit_message, polish, roles.ai_configure)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [ai.classify_terminal_state, ai.handoff_recommend, ai.briefing, ai.summarize_agent, ai.commit_message, ai.polish_prompt, drove.roles.ai_configure]
+      cli: ["h2 ai handoff-recommend", "h2 ai briefing", "h2 ai summarize-agent", "h2 ai commit-message", "h2 ai polish-prompt", "h2 drove roles-ai-config"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Local mock OpenAI HTTP server returning deterministic JSON payloads; live fake ACP agent `a1` and PTY terminal `t1` in temp Git repo with uncommitted diff."
+    steps:
+      - "Invoke `ai.classify_terminal_state` on `t1` screen tail."
+      - "Invoke `ai.handoff_recommend` (`source: 'a1'`), `ai.briefing` (both AI and `--no-ai`), `ai.summarize_agent` (`a1` with/without `--no-ai`), `ai.commit_message`, and `ai.polish_prompt`."
+      - "Invoke `drove.roles.ai_configure` with `dry_run: true`, then `apply: true`."
+    oracles:
+      - "All 6 `ai.*` helper RPCs and `drove.roles.ai_configure` return schema-valid responses."
+      - "`--no-ai` deterministic fallback works offline without hitting mock server; `dry_run: true` leaves `drove.json` untouched."
+    ai_probe_hints:
+      - "Test `ai.polish_prompt` with `kind: 'cli'` vs `kind: 'acp'` and non-empty `context`."
+
+  - id: TC-CORE-057
+    feature: F12
+    title: L4 实模验证：Drove Quick 与 AI Briefing 真实模型链路 (Live LLM Drove quick + ai.briefing)
+    tier: L4-live-llm
+    mode: ai-exploratory
+    priority: P2
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [ai.briefing, ai.polish_prompt]
+      cli: ["h2 drove quick", "h2 ai briefing"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Live ACP agents and configured Core AI endpoint in isolated environment."
+    steps:
+      - "Run a small read-only `h2 drove quick` task and `h2 ai briefing`."
+    oracles:
+      - "Real LLM worker calls `h2 drove worker done`, passes verification, and `ai.briefing` summarizes accurately."
+    ai_probe_hints:
+      - "Skip automatically if live AI key or ACP credentials are unavailable."

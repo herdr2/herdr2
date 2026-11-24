@@ -1,0 +1,353 @@
+suite: 02-core-acp-lifecycle-inbox-perms
+cases:
+  - id: TC-CORE-010
+    feature: F02
+    title: 无头 ACP 启动、终端环境变量清洗与能力屏蔽 (Headless ACP launch, TERMINAL_VARS stripping & headless capabilities)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.run, agent.get, agent.list]
+      cli: ["h2 run", "h2 ls --json", "h2 get --json"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated `herdr2` daemon; export `TERM=xterm-256color`, `COLORTERM=truecolor`, `TERM_PROGRAM=ghostty`, `H2_TERMINAL_ID=t99` in parent env."
+      - "Fake ACP agent (`herdr-core/crates/herdr2/tests/fake_acp_agent.py`) recording received `env` and `initialize` `clientCapabilities`."
+    steps:
+      - "Start an ACP agent via `agent.run` with `--name acp-cap-test` and initial prompt asking it to echo env and capabilities."
+      - "Inspect `agent.get` and `agent.list`."
+    oracles:
+      - "Child process env contains `H2_AGENT_ID`, `H2_AGENT_SOCKET`, `H2_SESSION`, and lacks `TERM`, `COLORTERM`, `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`, `H2_TERMINAL_ID`."
+      - "`initialize` receives `fs: { readTextFile: false, writeTextFile: false }` and `terminal: false`, plus `session.configOptions.boolean`."
+      - "`agent.list` shows concise agent record; `agent.get` includes full `config_options`."
+    ai_probe_hints:
+      - "Verify `agent.run` strips `ANTIGRAVITY_SOURCE_METADATA` and `AGY_LLM_GATEWAY_PROXY_URL` from child env unless explicitly passed."
+
+  - id: TC-CORE-011
+    feature: F02
+    title: 角色模板列举、热加载与销毁闭环 (templates.list, template agent.run, agent.kill & agent.rm)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [templates.list, agent.run, agent.kill, agent.rm]
+      cli: ["h2 templates --json", "h2 run", "h2 kill", "h2 rm"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Create `$XDG_CONFIG_HOME/herdr2/templates/qa-helper.md` with YAML frontmatter command/args pointing to fake ACP agent."
+    steps:
+      - "Call `templates.list` to verify `qa-helper` appears with description."
+      - "Launch `agent.run` using template name `qa-helper`, wait for completion, then test `agent.rm` before and after `agent.kill`."
+      - "Test launching a non-existent template name and invalid template frontmatter."
+    oracles:
+      - "`templates.list` reflects live edits without daemon restart."
+      - "`agent.rm` fails with `live` before `agent.kill`, and succeeds after process exit."
+      - "Missing/corrupt templates return `not_found` or `invalid_template`."
+    ai_probe_hints:
+      - "Verify `h2 run <template> <task> --json` trailing flags parsing in `cli/run.rs`."
+
+  - id: TC-CORE-012
+    feature: F02
+    title: ACP 实时能力配置协商与 session/set_model 回退 (agent.config & legacy fallback)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.config, agent.get]
+      cli: ["h2 config"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Fake ACP agent 1 supporting `session/set_config_option`, and fake ACP agent 2 returning `-32601` to exercise `session/set_model` fallback."
+    steps:
+      - "Call `agent.config` on agent 1 to update `model`, `reasoning_effort`, and boolean `fast-mode`."
+      - "Call `agent.config` on agent 2 (returning `-32601`) to verify fallback to `session/set_model`."
+      - "Call `agent.config` with an invalid option key/value."
+    oracles:
+      - "`agent.config` returns updated `Public` record with persisted `config_options` and emits a `config` subscription event."
+      - "Fallback agent seamlessly updates model via `session/set_model`."
+      - "Invalid option keys return `invalid_params` without crashing the actor."
+    ai_probe_hints:
+      - "Verify `agent.get` exposes `config_options` while `agent.list` stays compact."
+
+  - id: TC-CORE-013
+    feature: F02
+    title: Agent 标签管理与按标签筛选列表 (agent.label & agent.list label filter)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.label, agent.list, agent.get]
+      cli: ["h2 label", "h2 ls --json"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated daemon with two live ACP agents `a1` and `a2`."
+    steps:
+      - "Set labels `env=qa`, `role=coder` on `a1` via `agent.label`."
+      - "Call `agent.list` filtered by `env=qa`."
+      - "Remove `role=` via `agent.label` and re-check `agent.get`."
+    oracles:
+      - "`agent.list` returns only `a1` when filtered by `env=qa`."
+      - "`role=` deletes the `role` key cleanly while leaving `env=qa` intact."
+    ai_probe_hints:
+      - "Verify malformed label syntax (e.g. empty key `=val`) returns `invalid_params`."
+
+  - id: TC-CORE-014
+    feature: F02
+    title: agent.keep 持久化与重启后 session/load 恢复及配置重应用 (agent.keep & session/load recovery)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.keep, agent.config, agent.get, server.restart]
+      cli: ["h2 keep", "h2 server restart"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Live fake ACP agent supporting `loadSession: true` and `session/load`."
+    steps:
+      - "Enable `agent.keep` (`keep: true`) and apply an `agent.config` override."
+      - "Trigger `server.restart`."
+      - "After restart, call `agent.get` and verify the adapter received `session/load` with original `sessionId` and re-applied `config_options`."
+      - "Disable via `agent.keep` (`keep: false`) and verify persistence flag updates."
+    oracles:
+      - "Agent survives `server.restart` in `idle` state with same address and preserved transcript history."
+      - "Config overrides are re-applied immediately after `session/load`."
+    ai_probe_hints:
+      - "Check what happens if an adapter refuses `session/load` or returns error during restart recovery."
+
+  - id: TC-CORE-015
+    feature: F02
+    title: ACP 握手超时、stderr 诊断缓冲与孤儿守卫 (ACP handshake diagnostics & AgentGuard)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.run]
+      cli: ["h2 run"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Fixture script printing >80 lines (>512 bytes each) to stderr and exiting non-zero before `initialize` completes, plus a slow hanging handshake fixture."
+    steps:
+      - "Call `agent.run` targeting the failing stderr fixture script."
+      - "Verify diagnostics truncate cleanly to <=64 lines / 512 bytes per line and no descendant child remains alive."
+    oracles:
+      - "`agent.run` fails cleanly with `spawn_failed` / `unavailable` and surfaces bounded recent `stderr` lines without OOM or orphan process."
+    ai_probe_hints:
+      - "Confirm `AgentGuard` cleans up grandchildren even on handshake timeout."
+
+  - id: TC-CORE-016
+    feature: F02
+    title: ACP 重名冲突与错误入参负向校验 (agent.run name_taken & negative param validation)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.run, agent.kill]
+      cli: ["h2 run"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated daemon with live ACP agent named `dup-name` and live PTY terminal named `pty-dup`."
+    steps:
+      - "Call `agent.run` with `name: 'dup-name'` -> expect `name_taken`."
+      - "Call `agent.run` with `name: 'pty-dup'` -> expect `name_taken`."
+      - "Call `agent.run` with empty argv / unknown preset -> expect `invalid_params` or `not_found`."
+    oracles:
+      - "Both live ACP and live PTY names block duplicate `agent.run` aliases with `name_taken`."
+      - "Invalid preset/argv returns structured `RpcError` without mutating `agents.json`."
+    ai_probe_hints:
+      - "Verify once `dup-name` is killed (`!is_live()`), its alias can be reclaimed cleanly."
+
+  - id: TC-CORE-017
+    feature: F03
+    title: 串行 Inbox 排队、编辑、删除与插队抢占 --steer (Serial inbox edit/remove/send & --steer preemption)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.send, agent.inbox_edit, agent.inbox_remove, agent.inbox_send, agent.read, agent.wait]
+      cli: ["h2 send", "h2 inbox ls", "h2 inbox edit", "h2 inbox rm", "h2 inbox send", "h2 read"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Live fake ACP agent configured to pause on turn 1 until signaled so turns queue in inbox."
+    steps:
+      - "Send turn 1 (`agent.send`), then queue turn 2 (`msg A`) and turn 3 (`msg B`) while agent is `working`."
+      - "Edit `msg A` -> `msg A-edited` via `agent.inbox_edit`, remove `msg B` via `agent.inbox_remove`."
+      - "Queue `msg C` via `agent.send` with `steer: true` (or `agent.inbox_send`), verifying `session/cancel` cancels turn 1 and executes `msg C` ahead of `msg A-edited`."
+      - "Call `agent.wait` and `agent.read` (`--last` and full transcript)."
+    oracles:
+      - "Turns never execute concurrently; execution order is Turn 1 (cancelled) -> `msg C` -> `msg A-edited`."
+      - "`msg B` never executes; `agent.read --last` returns final assistant response of `msg A-edited`."
+    ai_probe_hints:
+      - "Check editing/removing an already-dispatched inbox item ID returns an error without corrupting queue state."
+
+  - id: TC-CORE-018
+    feature: F03
+    title: 重启后暂停收件箱恢复与清空 (agent.inbox_resume & agent.inbox_clear_paused across restart)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.inbox_resume, agent.inbox_clear_paused, agent.keep, server.restart]
+      cli: ["h2 inbox resume", "h2 inbox clear-paused"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Kept fake ACP agent with 2 queued prompts preserved across `server.restart`."
+    steps:
+      - "Restart daemon with `server.restart` while kept agent has queued prompts (producing paused inbox items)."
+      - "Test `agent.inbox_resume` on agent 1 to re-enqueue and execute paused prompts."
+      - "Repeat on agent 2 and invoke `agent.inbox_clear_paused` instead."
+    oracles:
+      - "Paused prompts are NOT auto-executed silently on reboot until explicit `inbox_resume`."
+      - "`inbox_resume` drains them in order; `inbox_clear_paused` discards them and resets paused count to 0."
+    ai_probe_hints:
+      - "Verify `agent.get` exposes paused inbox count accurately before and after resume/clear."
+
+  - id: TC-CORE-019
+    feature: F03
+    title: agent.interrupt 干净取消当前回合与 agent.wait 超时/状态唤醒 (agent.interrupt & agent.wait)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.interrupt, agent.wait, agent.get]
+      cli: ["h2 interrupt", "h2 wait"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Live fake ACP agent running a long/hanging turn."
+    steps:
+      - "Invoke `agent.interrupt` while turn is `working`."
+      - "Start a second turn and call `agent.wait` with short timeout, then wait to completion."
+      - "Call `agent.wait` when agent is already `idle`."
+    oracles:
+      - "`agent.interrupt` sends `session/cancel`, returns agent to `idle` without killing the child process."
+      - "`agent.wait` returns immediately if already non-working, or returns on state transition."
+    ai_probe_hints:
+      - "Check `agent.wait` behavior when target exits abnormally (`exited` state)."
+
+  - id: TC-CORE-020
+    feature: F04
+    title: ACP 权限仲裁：ApproveReads 自动放行只读与阻断写操作审批 (ApproveReads, agent.approve & agent.deny)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.approve, agent.deny, agent.wait, agent.get, agent.read]
+      cli: ["h2 approve", "h2 deny"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Fake ACP agent emitting `session/request_permission` for `read_file` (read-only) and `write_file` / `bash` (mutating)."
+    steps:
+      - "Run agent under default `ApproveReads` policy."
+      - "Verify `read_file` is auto-approved without blocking."
+      - "When `write_file` triggers `blocked` status with `pending_permission`, verify `agent.wait` returns `blocked`."
+      - "Resolve first request with `agent.approve` and a second request with `agent.deny`."
+    oracles:
+      - "`ApproveReads` auto-grants read/search/fetch tools and blocks write/exec tools."
+      - "`agent.approve` and `agent.deny` unblock the session and record `Permission` entry in transcript."
+      - "Calling `agent.approve` when not blocked returns `invalid_state`."
+    ai_probe_hints:
+      - "Verify `ApproveReads` covers all read-only keywords (`read`, `search`, `think`, `fetch`, `list`, `glob`, `grep`)."
+
+  - id: TC-CORE-021
+    feature: F04
+    title: ACP 权限模式 ApproveAll / DenyAll / Ask 与阻塞态 Send 拒绝 (Permission modes & blocked send guard)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.approve, agent.deny, agent.send, agent.get]
+      cli: ["h2 run", "h2 send"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Fake ACP agent emitting `session/request_permission` for both `read_file` and `write_file`."
+    steps:
+      - "Test `ApproveAll`: both `read_file` and `write_file` auto-complete without blocking."
+      - "Test `DenyAll`: permission requests are auto-denied immediately."
+      - "Test `Ask`: even `read_file` blocks until `agent.approve`; while `blocked`, send a non-steer `agent.send`."
+    oracles:
+      - "Each `PermissionMode` enforces its exact policy."
+      - "Sending into a `blocked` agent without resolving permission returns `blocked` error as specified."
+    ai_probe_hints:
+      - "Test invalid `option_id` passed to `agent.approve` to verify `invalid_params`."
+
+  - id: TC-CORE-022
+    feature: F04
+    title: 8 类强类型 Transcript 持久化、多模态附件与 2000 条/2 MiB 裁剪 (Typed JSONL transcript & bounds)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.read, agent.get]
+      cli: ["h2 read --json"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Fake ACP agent emitting `User`, `Thought`, `Assistant`, `ToolCall`, `Plan`, `Permission`, `Error`, and `Stderr` entries, plus a burst >2100 entries."
+    steps:
+      - "Inspect `$XDG_STATE_HOME/herdr2/<session>/transcripts/<addr>.jsonl`."
+      - "Send a multimodal image attachment via `acp/media.rs` staging and read via `agent.read`."
+      - "Read trailing lines and `--last` after >2100 entries."
+    oracles:
+      - "All 8 entry types deserialize cleanly; in-memory buffer caps at `MAX_ENTRIES = 2000` / `MAX_BYTES = 2 MiB` while JSONL disk file preserves append-only log."
+    ai_probe_hints:
+      - "Verify `agent.read` handles invalid UTF-8 or corrupt trailing JSONL line gracefully."
+
+  - id: TC-CORE-023
+    feature: F02
+    title: L4 实模验证：启动真实 ACP 编码 Agent 执行只读任务 (Live LLM ACP run & read --last)
+    tier: L4-live-llm
+    mode: ai-exploratory
+    priority: P2
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.run, agent.wait, agent.read, agent.kill]
+      cli: ["h2 run", "h2 wait", "h2 read --last", "h2 kill"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Live ACP preset (e.g. `claude`, `codex`, `gemini`, or `agy`) installed and authenticated in isolated environment."
+    steps:
+      - "Run `h2 run <preset> 'List files in current directory and summarize in one sentence' --wait`."
+      - "Inspect `h2 read --last` and `h2 ls --json`, then `h2 kill`."
+    oracles:
+      - "Live ACP session reaches `idle`, produces coherent assistant response, and exits cleanly on `kill`."
+    ai_probe_hints:
+      - "Skip automatically when no live LLM credentials/preset are configured in CI/sandbox."

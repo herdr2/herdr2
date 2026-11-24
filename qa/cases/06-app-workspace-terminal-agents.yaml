@@ -1,0 +1,320 @@
+suite: 06-app-workspace-terminal-agents
+cases:
+  - id: TC-APP-001
+    feature: F13
+    title: Space 工作空间生命周期与 herdr2-app Core 文档持久化 (space.new/close/rename/move/select/next/prev)
+    tier: L2-app-sandbox
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [doc.get, doc.set]
+      cli: ["herdr2 ls", "herdr2 do"]
+      app_commands: [space.new, space.close, space.rename, space.move, space.select, space.next, space.prev]
+      mods: [spaces, workspace-chrome, workspace-status]
+      frames: []
+    preconditions:
+      - "Isolated `HERDR2_APP_HOME` + `HERDR2_TEST_WINDOW=1` + isolated `H2_SESSION`."
+    steps:
+      - "Run `herdr2 do space.new --name alpha --folder /tmp/repo-a` and `space.new --name beta --folder /tmp/repo-b`."
+      - "Cycle with `space.next`, `space.prev`, `space.select --index 1`."
+      - "Reorder via `space.move --id <beta_id> --index 1`, rename via `space.rename --id <alpha_id> --name alpha-renamed` and back to automatic name (`--name ''`)."
+      - "Close via `space.close --id <alpha_id> --confirmed true` and inspect `doc.get` (`herdr2-app`)."
+    oracles:
+      - "`herdr2 ls` reflects exact Space order, names, and `named` flags; `doc.get` persists layout to `herdr2-app`."
+      - "Closing a Space ends its terminals and matched space-scoped ACP sessions cleanly."
+    ai_probe_hints:
+      - "Verify `space.close` with malformed non-string `id` is rejected before falling back to current space."
+
+  - id: TC-APP-002
+    feature: F13
+    title: Tab 页签生命周期、合并与 Settle 状态切换 (tab.new/close/rename/move/merge/select/settle/unsettle/next/prev)
+    tier: L2-app-sandbox
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: []
+      cli: ["herdr2 do", "herdr2 ls"]
+      app_commands: [tab.new, tab.close, tab.rename, tab.move, tab.merge, tab.select, tab.settle, tab.unsettle, tab.next, tab.prev]
+      mods: [tabs, terminals-bar]
+      frames: []
+    preconditions:
+      - "Running isolated Herdr2 window with an open Space."
+    steps:
+      - "Create tabs via `tab.new` (default terminal, `focus: false`, and mod tab), rename with `tab.rename`, navigate via `tab.next`/`tab.prev`/`tab.select`."
+      - "Move with `tab.move --by 1`, merge two tabs via `tab.merge --source <t1> --target <t2> --direction right`."
+      - "Settle and unsettle a tab via `tab.settle` and `tab.unsettle`, then close via `tab.close --confirmed true`."
+    oracles:
+      - "`tab.merge` moves all panes beside target tab and selects target; `tab.settle` hides tab from lists while keeping process alive."
+    ai_probe_hints:
+      - "Check that an agent requesting permission inside a settled tab automatically surfaces it again."
+
+  - id: TC-APP-003
+    feature: F13
+    title: Picker 快速跳转与 Worktree 新建/切换/移除弹窗 (picker & worktree mods)
+    tier: L2-app-sandbox
+    mode: hybrid
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: []
+      cli: ["herdr2 do", "herdr2 shot"]
+      app_commands: [mod.open, overlay.close]
+      mods: [picker, worktree]
+      frames: []
+    preconditions:
+      - "Running isolated Herdr2 window with multiple spaces in a temp Git repo."
+    steps:
+      - "Open `picker` via `mod.open --name picker` and verify space/tab sorting (attention-needing spaces first, quiet spaces collapsed)."
+      - "Open `worktree` via `mod.open --name worktree`, capture `herdr2 shot`, and close overlays via `overlay.close`."
+    oracles:
+      - "`picker` prioritizes active/blocked spaces; `worktree` displays branch creation and worktree paths cleanly."
+    ai_probe_hints:
+      - "Verify `worktree` mod gracefully reports non-git folder errors."
+
+  - id: TC-APP-004
+    feature: F13
+    title: Pane 分屏、分离、缩放、焦点导航与交换 (pane.split/close/detach/zoom/focus/go/swap)
+    tier: L2-app-sandbox
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: []
+      cli: ["herdr2 do", "herdr2 ls"]
+      app_commands: [pane.split, pane.close, pane.detach, pane.zoom, pane.focus, pane.go, pane.swap]
+      mods: [pane, terminals-pane]
+      frames: []
+    preconditions:
+      - "Running isolated Herdr2 window with an active terminal tab."
+    steps:
+      - "Split right and down with `pane.split`, navigate via `pane.go` (`left`/`right`/`up`/`down`), focus via `pane.focus`, swap via `pane.swap --direction left`."
+      - "Toggle `pane.zoom`, detach a split pane via `pane.detach`, and close a pane via `pane.close --confirmed true`."
+    oracles:
+      - "`pane.detach` moves pane into its own adjacent tab and selects it; `pane.swap` rejects passing both `direction` and `target`."
+    ai_probe_hints:
+      - "Verify `pane.split` with `mod` + `props` embeds a JS mod pane inside the split tree."
+
+  - id: TC-APP-005
+    feature: F13
+    title: 布局引擎切换、克隆、节点显隐/尺寸调整与逃生重置 (layout.* commands, win98 & app.reset)
+    tier: L2-app-sandbox
+    mode: hybrid
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: []
+      cli: ["herdr2 do", "herdr2 shot"]
+      app_commands: [layout.switch, layout.clone, layout.set, layout.toggle, layout.show, layout.hide, layout.resize, layout.select, layout.reset, app.reset]
+      mods: [win98]
+      frames: []
+    preconditions:
+      - "Running isolated Herdr2 window."
+    steps:
+      - "Switch shipped layouts via `layout.switch` (`main`, `terminals`, `win98`), capture `herdr2 shot` on `win98`."
+      - "Clone `main` via `layout.clone --name main --as qa-layout`, then exercise `layout.toggle`, `layout.show`, `layout.hide`, `layout.resize`, `layout.select`, and `layout.set`."
+      - "Test `layout.reset` and finally `app.reset`."
+    oracles:
+      - "`layout.set` allows structural changes on cloned `qa-layout` and restricts structural mutations on shipped layouts."
+      - "`win98` layout renders `win98` taskbar/window chrome cleanly; `app.reset` restores default `main` layout safely."
+    ai_probe_hints:
+      - "Confirm invalid `layouts/<name>.json` edit preserves last good layout and writes `layout.error`."
+
+  - id: TC-APP-006
+    feature: F14
+    title: Ghostty-sys 终端打开、滚动、粘贴与搜索 (terminal.open/scroll/paste/paste_image/search/right_click)
+    tier: L2-app-sandbox
+    mode: hybrid
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [terminal.run, terminal.read]
+      cli: ["herdr2 do", "herdr2 shot"]
+      app_commands: [terminal.open, terminal.scroll, terminal.paste, terminal.paste_image, terminal.search, terminal.right_click]
+      mods: []
+      frames: []
+    preconditions:
+      - "Running isolated Herdr2 window with a focused terminal pane printing 200 numbered lines."
+    steps:
+      - "Open terminal via `terminal.open`, scroll via `terminal.scroll` (`lines: -20`, `pages: -1`, `to: 'top'`, `to: 'bottom'`)."
+      - "Test `terminal.paste`, `terminal.paste_image`, `terminal.search`, and `terminal.right_click` (`to: 'program'` and `'menu'`)."
+    oracles:
+      - "`terminal.scroll` scrolls Herdr2 viewport without sending wheel noise unless app requested mouse."
+      - "`terminal.search` persists query per terminal."
+    ai_probe_hints:
+      - "Capture PNG screenshots via `herdr2 shot` before and after `terminal.scroll` and `terminal.search`."
+
+  - id: TC-APP-007
+    feature: F14
+    title: Ghostty-sys 终端选区创建、端点扩展、全选、清除与复制 (terminal.select/select_all/adjust_selection/clear_selection/copy)
+    tier: L2-app-sandbox
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [terminal.read]
+      cli: ["herdr2 do", "herdr2 ls"]
+      app_commands: [terminal.select_all, terminal.select, terminal.adjust_selection, terminal.clear_selection, terminal.copy]
+      mods: []
+      frames: []
+    preconditions:
+      - "Running isolated Herdr2 window with focused terminal displaying known multi-line text."
+    steps:
+      - "Call `terminal.adjust_selection` with no active selection -> expect failure."
+      - "Start selection via `terminal.select` (`at: {row: 0, col: 0}, mode: 'word'`), extend with `terminal.adjust_selection` (`direction: 'line_end'`), and run `terminal.copy`."
+      - "Run `terminal.select_all`, then `terminal.clear_selection`."
+    oracles:
+      - "`focused().selection` tracks inclusive start/end endpoints accurately across `word`, `line`, and `cell` modes."
+      - "On alt-screen, `terminal.select_all` selects only the active alternate screen."
+    ai_probe_hints:
+      - "Verify `terminal.copy` with empty selection forwards key to underlying program."
+
+  - id: TC-APP-008
+    feature: F14
+    title: 后台终端 Peek/Keep/Park/Show、Peek 视图切换与置顶 (terminal.peek/keep/park/show/view/pin/kill)
+    tier: L2-app-sandbox
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.run, terminal.run, agent.label]
+      cli: ["herdr2 do", "herdr2 ls"]
+      app_commands: [terminal.keep, terminal.park, terminal.view, terminal.pin, terminal.kill, terminal.peek, terminal.show]
+      mods: [peek]
+      frames: []
+    preconditions:
+      - "Running isolated Herdr2 window; spawn background fake ACP agent `a1` and sub-terminal `t2`."
+    steps:
+      - "Call `terminal.peek --terminal a1` to open borderless T3-Code style `peek` overlay."
+      - "Promote to tab via `terminal.keep --terminal a1 --place tab`, verify `Content::Mod { mod: 'peek', props: { acp: true, tab: true } }`."
+      - "Toggle view via `terminal.view --view toggle`, swap temporary view via `terminal.show`, pin via `terminal.pin --terminal a1 --pinned true`, park via `terminal.park`, and end via `terminal.kill`."
+    oracles:
+      - "`terminal.keep` promotes `a1` into Space tab tree and closes peek overlay without duplicating in `headless_agents`."
+      - "`terminal.park` removes pane while preserving running Core session; `terminal.pin` persists pin across clients."
+    ai_probe_hints:
+      - "Verify `peek` bottom config bar calls `h2 config --json` cleanly on ACP agents."
+
+  - id: TC-APP-009
+    feature: F14
+    title: New 菜单、右键菜单与 programs.json 程序探测启动 (new-menu & menu mods, programs.json)
+    tier: L2-app-sandbox
+    mode: hybrid
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [terminal.run]
+      cli: ["herdr2 do", "herdr2 shot"]
+      app_commands: [mod.open, overlay.close]
+      mods: [new-menu, menu]
+      frames: []
+    preconditions:
+      - "Running isolated Herdr2 window with custom PATH containing mock `claude` / `codex` executables."
+    steps:
+      - "Open `new-menu` via `mod.open --name new-menu` and capture `herdr2 shot`."
+      - "Open `menu` popup with `{ tab: 'pane' }` and `{ tab: 'tab' }` props."
+      - "Launch shell via `new-menu` and verify `programs.json` full-permission flags and exit-to-shell `agent: false` recovery."
+    oracles:
+      - "`new-menu` detects installed CLI agents from `programs.json` and launches with expected flags."
+      - "`menu` popup navigates with Up/Down/Enter/Esc cleanly."
+    ai_probe_hints:
+      - "Check `programs.error` is written if `programs.json` contains invalid JSON."
+
+  - id: TC-APP-010
+    feature: F15
+    title: 双通道 Agents 侧栏与非 OSC 7501 状态推断 (agents sidebar, focus/rename/status/next/prev & non-7501 inference)
+    tier: L2-app-sandbox
+    mode: hybrid
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [events.subscribe, agent.kill]
+      cli: ["herdr2 do", "herdr2 shot"]
+      app_commands: [agent.focus, agent.rename, agent.status, agent.next, agent.prev]
+      mods: [agents]
+      frames: []
+    preconditions:
+      - "Running isolated Herdr2 window with a PTY CLI simulation that omits OSC 7501 (using spinner `raw_title`, output bursts, and interactive `[y/N]` tail prompt)."
+    steps:
+      - "Observe `agents` sidebar transitioning `working` -> `blocked` (screen tail prompt) -> `done` (unfocused completion) within <=500ms `tend_terminals` tick."
+      - "Override via `agent.status --status blocked` and restore with `agent.status --status auto`."
+      - "Navigate via `agent.focus`, `agent.next`, `agent.prev`, rename via `agent.rename`."
+    oracles:
+      - "OSC 7501 retains highest priority when emitted; non-7501 CLI accurately infers working/blocked/idle/done states."
+      - "Headless ACP `a*` and PTY `t*` both render in unified `agents` tree with parent-child grouping."
+    ai_probe_hints:
+      - "Test `space.close` on a space owning an ACP session to verify `closing_terminals` clears it immediately on the same frame."
+
+  - id: TC-APP-011
+    feature: F15
+    title: Agent 回收站闭环：Trash、Restore、Purge 与 Empty Trash (Agent recycle bin lifecycle)
+    tier: L2-app-sandbox
+    mode: scripted
+    priority: P0
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [agent.kill]
+      cli: ["herdr2 do", "herdr2 ls"]
+      app_commands: [agent.trash, agent.restore, agent.purge, agent.empty_trash]
+      mods: [agents, confirm]
+      frames: []
+    preconditions:
+      - "Running isolated Herdr2 window with two active agent panes `a1` and `a2`."
+    steps:
+      - "Move `a1` to recycle bin via `agent.trash --terminal a1 --confirmed true`."
+      - "Restore `a1` via `agent.restore --terminal a1` and verify it returns to its space/tab."
+      - "Trash `a1` and `a2`, permanently delete `a1` via `agent.purge --terminal a1 --confirmed true`, then clear remaining via `agent.empty_trash --confirmed true`."
+    oracles:
+      - "`agent.trash` closes the pane while preserving session state for restore."
+      - "`agent.purge` and `agent.empty_trash` terminate underlying Core sessions permanently."
+    ai_probe_hints:
+      - "Verify `agent.trash` without `confirmed: true` opens the `confirm` dialog instead of deleting silently."
+
+  - id: TC-APP-012
+    feature: F15
+    title: 桌面 Briefing 简报、Handoff 对话框与 Changes Diff Review 交付 (agent.briefing, agent.handoff, agent.send, agent.send_review)
+    tier: L2-app-sandbox
+    mode: hybrid
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [ai.briefing, agent.handoff, agent.review]
+      cli: ["herdr2 do", "herdr2 shot"]
+      app_commands: [agent.briefing, agent.handoff, agent.send, agent.send_review]
+      mods: [handoff, changes]
+      frames: []
+    preconditions:
+      - "Running isolated Herdr2 window with a Git repo containing modified files and live fake ACP agent `a1`."
+    steps:
+      - "Trigger `agent.briefing`, `agent.handoff` (opening `handoff` dialog), and `agent.send --text 'ping'`."
+      - "Inspect diffs in `changes` mod and submit line comments via `agent.send_review`."
+    oracles:
+      - "`handoff` dialog offers provider presets and mode selection cleanly."
+      - "`changes` mod renders diffs and sends structured line comments via `agent.send_review`."
+    ai_probe_hints:
+      - "Capture `herdr2 shot` of both `handoff` and `changes` overlays."
+
+  - id: TC-APP-013
+    feature: F15
+    title: 原位 Prompt 润色、撤销与取消及 Polish Progress 浮卡 (prompt.polish/undo/cancel & polish-progress)
+    tier: L2-app-sandbox
+    mode: hybrid
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [ai.polish_prompt]
+      cli: ["herdr2 do", "herdr2 shot"]
+      app_commands: [prompt.polish, prompt.polish_undo, prompt.polish_cancel]
+      mods: [polish-progress]
+      frames: []
+    preconditions:
+      - "Running isolated Herdr2 window with mock Core AI configured and focused CLI terminal containing draft text."
+    steps:
+      - "Trigger `prompt.polish` on draft prompt and observe `polish-progress` floating card driven by `shared('polish.state')`."
+      - "Test `prompt.polish_undo` to restore exact pre-polish input."
+      - "Trigger a slow mock polish and call `prompt.polish_cancel` mid-flight."
+    oracles:
+      - "`prompt.polish` replaces CLI draft cleanly; `prompt.polish_undo` restores exact pre-polish text."
+      - "`prompt.polish_cancel` aborts in-flight request and dismisses `polish-progress` card without corrupting terminal input."
+    ai_probe_hints:
+      - "Verify `polish-progress` hot-reloads cleanly via `app.reload_mods`."
