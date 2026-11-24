@@ -822,6 +822,67 @@ fn create_one_task(core: &Arc<Core>, run_id: &str, raw: &Value) -> Result<Task, 
     Ok(task)
 }
 
+fn extract_review_verdicts(tasks: &[Task]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for t in tasks {
+        if t.template == Some(true) {
+            continue;
+        }
+        let Some(data) = t.result.as_ref().and_then(|r| r.data.as_ref()) else {
+            continue;
+        };
+        let raw_verdict = data
+            .get("review_status")
+            .or_else(|| data.get("reviewStatus"))
+            .or_else(|| data.get("verdict"))
+            .and_then(Value::as_str)
+            .map(|s| s.trim().to_ascii_lowercase());
+        if let Some(v) = raw_verdict
+            && matches!(v.as_str(), "changes_requested" | "request_changes" | "rejected")
+        {
+            out.push(json!({
+                "taskId": t.id,
+                "key": t.key,
+                "verdict": v,
+                "summary": t.result.as_ref().map(|r| r.summary.as_str()).unwrap_or(""),
+            }));
+        }
+    }
+    out
+}
+
+pub(crate) fn compact_task_summary(t: &Task) -> Value {
+    let mut obj = json!({
+        "id": t.id,
+        "key": t.key,
+        "title": t.title,
+        "status": t.status,
+        "deps": t.deps,
+        "isolation": t.isolation,
+        "failures": t.failures,
+        "updatedAt": t.updated_at,
+    });
+    if let Some(p) = &t.phase {
+        obj["phase"] = Value::String(p.clone());
+    }
+    if let Some(ei) = t.effective_isolation {
+        obj["effectiveIsolation"] = json!(ei);
+    }
+    if let Some(ir) = &t.isolation_reason {
+        obj["isolationReason"] = Value::String(ir.clone());
+    }
+    if let Some(a) = &t.assign {
+        obj["assign"] = json!(a);
+    }
+    if let Some(ep) = t.exec_phase {
+        obj["execPhase"] = json!(ep);
+    }
+    if let Some(res) = &t.result {
+        obj["result"] = json!(res);
+    }
+    obj
+}
+
 pub(super) async fn wait_run_http(
     core: &Arc<Core>,
     run_id: &str,
@@ -830,6 +891,21 @@ pub(super) async fn wait_run_http(
     let run = core.drove.store.get_run(run_id).ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
     let timeout_sec = query.get("timeoutSec").and_then(|s| s.parse::<u64>().ok()).unwrap_or(20).clamp(1, 25);
     let since_seq = query.get("sinceSeq").and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
+    let compact = query.get("compact").is_some_and(|v| v == "1" || v == "true");
+    let on_task_done = query.get("onTaskDone").is_some_and(|v| v == "1" || v == "true");
+    let baseline_done: BTreeSet<String> = if let Some(raw) = query.get("knownDone").filter(|s| !s.is_empty()) {
+        raw.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()
+    } else if on_task_done {
+        core.drove
+            .store
+            .list_tasks(run_id)
+            .into_iter()
+            .filter(|t| t.template != Some(true) && super::scheduler::is_terminal_status(t.status))
+            .map(|t| t.id)
+            .collect()
+    } else {
+        BTreeSet::new()
+    };
     let _ = run;
 
     let deadline = Instant::now() + Duration::from_secs(timeout_sec);
@@ -858,29 +934,54 @@ pub(super) async fn wait_run_http(
                 .iter()
                 .filter(|t| t.template != Some(true))
                 .all(|t| super::scheduler::is_terminal_status(t.status));
+        let newly_completed: Vec<String> = if on_task_done {
+            tasks
+                .iter()
+                .filter(|t| {
+                    t.template != Some(true)
+                        && super::scheduler::is_terminal_status(t.status)
+                        && !baseline_done.contains(&t.id)
+                })
+                .map(|t| t.key.clone())
+                .collect()
+        } else {
+            Vec::new()
+        };
 
-        if !pending.is_empty() || cur_run.status != RunStatus::Active || all_terminal || has_unreported_failure {
-            let counts = core.drove.store.count_tasks_by_run().remove(run_id).unwrap_or_else(empty_task_counts);
-            return Ok(json!({
-                "run": cur_run,
-                "taskCounts": counts,
-                "messages": pending,
-                "tasks": tasks,
-                "settled": all_terminal || cur_run.status != RunStatus::Active,
-                "timedOut": false,
-            }));
-        }
+        let should_return = !pending.is_empty()
+            || cur_run.status != RunStatus::Active
+            || all_terminal
+            || has_unreported_failure
+            || !newly_completed.is_empty();
+        let timed_out = !should_return && Instant::now() >= deadline;
 
-        if Instant::now() >= deadline {
+        if should_return || timed_out {
             let counts = core.drove.store.count_tasks_by_run().remove(run_id).unwrap_or_else(empty_task_counts);
-            return Ok(json!({
-                "run": cur_run,
+            let review_verdicts = extract_review_verdicts(&tasks);
+            let any_failed = tasks.iter().any(|t| t.template != Some(true) && t.status == TaskStatus::Failed);
+            let needs_attention = !pending.is_empty() || any_failed || !review_verdicts.is_empty();
+            let tasks_json: Value = if compact {
+                Value::Array(tasks.iter().map(compact_task_summary).collect())
+            } else {
+                json!(tasks)
+            };
+            let settled = if timed_out { false } else { all_terminal || cur_run.status != RunStatus::Active };
+            let mut out = json!({
+                "settled": settled,
+                "timedOut": timed_out,
+                "needsAttention": needs_attention,
                 "taskCounts": counts,
-                "messages": [],
-                "tasks": tasks,
-                "settled": false,
-                "timedOut": true,
-            }));
+                "messages": if timed_out { Value::Array(Vec::new()) } else { json!(pending) },
+                "run": cur_run,
+                "tasks": tasks_json,
+            });
+            if !review_verdicts.is_empty() {
+                out["reviewVerdicts"] = Value::Array(review_verdicts);
+            }
+            if !newly_completed.is_empty() {
+                out["newlyCompleted"] = json!(newly_completed);
+            }
+            return Ok(out);
         }
         let notified = core.drove.store.changed.notified();
         tokio::pin!(notified);

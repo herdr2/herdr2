@@ -1216,7 +1216,7 @@ impl AppWindow {
     fn open_welcome(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A window over the live app (nothing dims), centered and movable:
         // each step changes what's behind it, and a click beside it doesn't end it.
-        let spec = json!({ "mod": "frame-welcome", "kind": "window", "width": 660, "height": 600 });
+        let spec = json!({ "mod": "frame-welcome", "kind": "window", "width": 680, "height": 580 });
         self.open_overlay(mods::new_overlay_id(), spec, window, cx);
     }
 
@@ -2162,7 +2162,25 @@ impl AppWindow {
             let sub = cx.subscribe_in(&view, window, move |this, _, ev: &TerminalEvent, window, cx| match ev {
                 TerminalEvent::Peek(address) => this.peek_terminal(address, window, cx),
                 TerminalEvent::OpenFile { path, line, end_line, on } => {
-                    this.open_file_in_panel(path, *line, *end_line, on.as_deref(), None, window, cx);
+                    let pane_id = block.trim_end_matches(SWAP);
+                    let mut focus_changed = false;
+                    if this.focused_pane.as_deref() != Some(pane_id)
+                        && (this.model.tab_of(pane_id).is_some() || terminal_block(&this.chrome, Some(pane_id)).is_some())
+                    {
+                        this.model.focus_pane(pane_id);
+                        this.focused_pane = Some(pane_id.to_owned());
+                        this.synced_model_pane = this.model.focused_pane();
+                        focus_changed = true;
+                    }
+                    let term_cwd = this
+                        .cwds
+                        .get(&addr)
+                        .cloned()
+                        .or_else(|| this.live.get(&addr).and_then(|r| r.get("cwd")).and_then(Value::as_str).map(str::to_owned));
+                    if focus_changed {
+                        this.publish(cx);
+                    }
+                    this.open_file_in_panel(path, *line, *end_line, on.as_deref(), term_cwd.as_deref(), window, cx);
                 }
                 TerminalEvent::TitleChanged => {
                     this.publish(cx);
@@ -3081,12 +3099,40 @@ impl AppWindow {
 
     // ---- core facts --------------------------------------------------------
 
-    /// What a terminal view takes from the core's facts: its folder, where right-clicks go.
+    /// What a terminal view takes from the core's facts: its folder, fallback roots, and where right-clicks go.
     fn tell_term(&self, view: &Entity<TerminalView>, addr: &str, cx: &mut Context<Self>) {
-        let cwd = self.cwds.get(addr).map(std::path::PathBuf::from);
+        let space_folder = self
+            .model
+            .pane_of(addr)
+            .and_then(|p| self.model.space_of(&p))
+            .or_else(|| self.model.active_space())
+            .map(|s| s.folder.as_str())
+            .filter(|f| !f.is_empty());
+        let cwd = self
+            .cwds
+            .get(addr)
+            .map(String::as_str)
+            .or_else(|| self.live.get(addr).and_then(|r| r.get("cwd")).and_then(Value::as_str))
+            .or(space_folder)
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from);
+        let mut fallback_roots = Vec::new();
+        if let Some(top) = self.model.folder_info.get(addr).map(|f| f.top.as_str()).filter(|s| !s.is_empty()) {
+            let p = std::path::PathBuf::from(top);
+            if cwd.as_ref() != Some(&p) {
+                fallback_roots.push(p);
+            }
+        }
+        if let Some(sf) = space_folder {
+            let p = std::path::PathBuf::from(sf);
+            if cwd.as_ref() != Some(&p) && !fallback_roots.contains(&p) {
+                fallback_roots.push(p);
+            }
+        }
         let to_program = self.live.get(addr).and_then(|r| r.pointer("/labels/herdr.right-click")).and_then(Value::as_str) == Some("program");
         view.update(cx, |v, _| {
             v.cwd = cwd;
+            v.fallback_roots = fallback_roots;
             v.right_click_to_program = to_program;
         });
     }
@@ -9626,7 +9672,7 @@ impl AppWindow {
         };
 
         self.file_open_seq = self.file_open_seq.wrapping_add(1).max(1);
-        mods::set_shared(
+        mods::set_shared_ephemeral(
             "files.open_request".to_string(),
             json!({
                 "seq": self.file_open_seq,
@@ -9637,31 +9683,56 @@ impl AppWindow {
             }),
         );
         if self.chrome.find("files").is_some() {
-            self.dispatch("layout.select", &json!({ "stack": "panel-body", "child": "files" }), false, window, cx);
-            self.dispatch("layout.show", &json!({ "id": "panel" }), false, window, cx);
-            self.refresh_snapshot_mods(cx);
-            self.publish(cx);
-            cx.notify();
+            let mut layout_changed = false;
+            let already_files = self.chrome.find("panel-body").is_some_and(|n| {
+                matches!(&n.kind, crate::layout::Kind::Stack { active, .. } if active.as_deref() == Some("files"))
+            });
+            if !already_files && self.chrome.select("panel-body", "files") {
+                self.side_panel_auto_hidden = false;
+                layout_changed = true;
+            }
+            if let Some(panel) = self.chrome.find_mut("panel")
+                && panel.hidden
+            {
+                panel.hidden = false;
+                self.side_panel_auto_hidden = false;
+                layout_changed = true;
+            }
+            let files_mounted = self.copies.contains_key("files");
+            if layout_changed || !files_mounted {
+                self.sync(window, cx);
+            }
+            if files_mounted {
+                // Wake the mounted Files mod immediately via its async nextCommand() loop
+                // instead of refreshing every mod in the window or creating EditorState in render().
+                let _ = mods::send_command("files", "open_request");
+            }
         } else {
-            self.open_overlay(
-                "files-preview".to_string(),
-                json!({
-                    "kind": "window",
-                    "key": "files-preview",
-                    "resizable": true,
-                    "width": 720,
-                    "height": 640,
-                    "mod": "files",
-                    "props": {
-                        "file": resolved,
-                        "line": line,
-                        "end_line": end_line,
-                        "on": effective_on,
-                    }
-                }),
-                window,
-                cx,
-            );
+            let already_open = self.overlays.iter().any(|o| o.id == "files-preview")
+                && self.copies.contains_key("overlay:files-preview");
+            if already_open {
+                let _ = mods::send_command("files", "open_request");
+            } else {
+                self.open_overlay(
+                    "files-preview".to_string(),
+                    json!({
+                        "kind": "window",
+                        "key": "files-preview",
+                        "resizable": true,
+                        "width": 720,
+                        "height": 640,
+                        "mod": "files",
+                        "props": {
+                            "file": resolved,
+                            "line": line,
+                            "end_line": end_line,
+                            "on": effective_on,
+                        }
+                    }),
+                    window,
+                    cx,
+                );
+            }
         }
     }
 

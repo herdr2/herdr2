@@ -175,6 +175,10 @@ pub struct TerminalView {
     selection_scroll: Option<Task<()>>,
     /// The terminal's folder, for links to relative paths.
     pub cwd: Option<PathBuf>,
+    /// Additional base directories (git repo root, space folder) checked when resolving relative links.
+    pub fallback_roots: Vec<PathBuf>,
+    /// Last hovered terminal cell `(col, row)` while link hover is active, avoiding redundant per-pixel redraws.
+    hover_cell: Option<(u16, u16)>,
     /// The link under the pointer while the link modifier is held.
     link: Option<LinkTarget>,
     /// Right-clicks go to the program when it takes the mouse (Shift: the menu).
@@ -955,6 +959,8 @@ impl TerminalView {
             selection_pointer: Point::default(),
             selection_scroll: None,
             cwd: None,
+            fallback_roots: Vec::new(),
+            hover_cell: None,
             link: None,
             right_click_to_program: false,
             grid: Rc::new(RefCell::new(Grid {
@@ -1974,6 +1980,15 @@ impl TerminalView {
         let (col, row) = (x / f32::from(g.cell.width), y / f32::from(g.cell.height));
         let remote_machine = self.address.split_once('/').map(|(m, _)| m.to_owned());
         let cwd_str = self.cwd.as_deref().and_then(|p| p.to_str());
+        let mut roots: Vec<&Path> = Vec::with_capacity(1 + self.fallback_roots.len());
+        if let Some(cwd) = self.cwd.as_deref() {
+            roots.push(cwd);
+        }
+        for root in &self.fallback_roots {
+            if !roots.contains(&root.as_path()) {
+                roots.push(root.as_path());
+            }
+        }
         let to_target = |(link, line, end_line): (links::Target, Option<u32>, Option<u32>)| match link {
             links::Target::Url(u) => LinkTarget::Url(u),
             links::Target::File(p) => LinkTarget::File {
@@ -1983,21 +1998,22 @@ impl TerminalView {
                 on: remote_machine.clone(),
             },
         };
-        let resolve_link = |raw: &str| {
+        let resolve_osc8 = |raw: &str| {
             if remote_machine.is_some() {
                 links::resolve_remote_with_location(raw, cwd_str)
             } else {
-                links::resolve_with_location(raw, self.cwd.as_deref())
+                links::resolve_with_roots(raw, &roots)
             }
         };
         let mut target = None;
         let hit = g.vt.link_at(col as u16, row as u16, |text, at, joined| {
-            // In lines joined back together only a file that exists proves the join right.
-            if let Some(range) = links::find(text, at)
-                && let Some(resolved) = resolve_link(&text[range.clone()])
-                && (!joined || (remote_machine.is_none() && matches!(resolved.0, links::Target::File(_))))
-            {
-                target = Some(to_target(resolved));
+            let found = if remote_machine.is_some() {
+                links::find_and_resolve_remote(text, at, cwd_str, joined)
+            } else {
+                links::find_and_resolve_local(text, at, &roots, joined)
+            };
+            if let Some((range, resolved_target, line, end_line)) = found {
+                target = Some(to_target((resolved_target, line, end_line)));
                 return Some(range);
             }
             if joined {
@@ -2009,7 +2025,7 @@ impl TerminalView {
             Some(range)
         })?;
         // OSC 8 links bypass text detection.
-        let target = target.or_else(|| resolve_link(&hit.target).map(to_target))?;
+        let target = target.or_else(|| resolve_osc8(&hit.target).map(to_target))?;
         Some((target, hit.spans))
     }
 
@@ -3494,6 +3510,7 @@ impl Render for TerminalView {
             .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
                 if !hovered {
                     this.grid.borrow_mut().hover = None;
+                    this.hover_cell = None;
                     if this.link.is_some() {
                         cx.notify();
                     }
@@ -3516,6 +3533,7 @@ impl Render for TerminalView {
                         }
                         LinkTarget::Terminal(address) => cx.emit(TerminalEvent::Peek(address)),
                     }
+                    cx.stop_propagation();
                     return;
                 }
                 let mut g = this.grid.borrow_mut();
@@ -3568,8 +3586,21 @@ impl Render for TerminalView {
                 }
             }))
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, _, cx| {
-                this.grid.borrow_mut().hover = Some(ev.position);
-                if link_mods(&ev.modifiers) || this.link.is_some() {
+                let cell_pos = {
+                    let mut g = this.grid.borrow_mut();
+                    g.hover = Some(ev.position);
+                    let (x, y) = local(&g, ev.position);
+                    let col = (x / f32::from(g.cell.width).max(1.0)) as u16;
+                    let row = (y / f32::from(g.cell.height).max(1.0)) as u16;
+                    (col, row)
+                };
+                if link_mods(&ev.modifiers) {
+                    if this.hover_cell != Some(cell_pos) {
+                        this.hover_cell = Some(cell_pos);
+                        cx.notify();
+                    }
+                } else if this.link.is_some() || this.hover_cell.is_some() {
+                    this.hover_cell = None;
                     cx.notify();
                 }
                 if !this.selecting && ev.pressed_button.is_none() {

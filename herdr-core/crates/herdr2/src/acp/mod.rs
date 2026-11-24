@@ -1656,6 +1656,7 @@ fn handle_update(core: &Core, id: u32, turn_num: u64, params: &Value) {
             if let Some(worker_id) = drove_wid {
                 let _ = core.drove.pool_tx.send(crate::drove::pool::PoolSignal::UsageUpdated {
                     worker_id,
+                    turn_num: Some(turn_num),
                     usage: Some(usage),
                     detail,
                 });
@@ -1669,6 +1670,7 @@ fn handle_update(core: &Core, id: u32, turn_num: u64, params: &Value) {
                 if let Some(worker_id) = drove_wid {
                     let _ = core.drove.pool_tx.send(crate::drove::pool::PoolSignal::UsageUpdated {
                         worker_id,
+                        turn_num: Some(turn_num),
                         usage: detail.context,
                         detail: Some(detail),
                     });

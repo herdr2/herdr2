@@ -18,6 +18,9 @@ import {
   filterConfigChoices,
   parseToolDetail,
   extractTurnChangedFiles,
+  extractTurnFilePatch,
+  resolveChangedFilePath,
+  isAbsoluteFilePath,
   resolveEffortVisual,
   normalizeInboxItems,
   resolvePeerAddress,
@@ -840,5 +843,104 @@ describe("resolvePeerAddress", () => {
     expect(resolvePeerAddress("wsl/t22", "wsl/a4")).toBe("wsl/t22");
     expect(resolvePeerAddress("t22", "a4")).toBe("t22");
     expect(resolvePeerAddress("", "wsl/a4")).toBe("");
+  });
+});
+
+describe("external changed file helpers", () => {
+  test("resolveChangedFilePath resolves relative, external absolute, and tilde paths cleanly", () => {
+    expect(isAbsoluteFilePath("/tmp/audit/a.py")).toBe(true);
+    expect(isAbsoluteFilePath("src/main.rs")).toBe(false);
+    expect(resolveChangedFilePath("src/agent.py", "/home/u/buildlink")).toBe("/home/u/buildlink/src/agent.py");
+    expect(resolveChangedFilePath("/tmp/buildlink-audit-claude/harness.py", "/home/u/buildlink")).toBe(
+      "/tmp/buildlink-audit-claude/harness.py",
+    );
+    expect(resolveChangedFilePath("~/notes/audit.md", "/home/u/buildlink", "/home/u", null)).toBe(
+      "/home/u/notes/audit.md",
+    );
+    expect(resolveChangedFilePath("~/notes/audit.md", "/home/u/buildlink", "/home/u", "remote-box")).toBe(
+      "~/notes/audit.md",
+    );
+    expect(resolveChangedFilePath("../other/foo.py", "/home/u/buildlink")).toBe("/home/u/other/foo.py");
+  });
+
+  test("extractTurnFilePatch collects multi-block proto.rs diffs and distinguishes create-only vs edited files", () => {
+    const entries = [
+      {
+        kind: "tool_call",
+        turn: 1,
+        id: "c1",
+        tool_kind: "edit",
+        status: "completed",
+        title: "Write /tmp/buildlink-audit-claude/x0_smoke.py",
+        detail: "--- /tmp/buildlink-audit-claude/x0_smoke.py\n+++ /tmp/buildlink-audit-claude/x0_smoke.py\n+ print('hi')\n+ print('bye')",
+      },
+      {
+        kind: "tool_call",
+        turn: 1,
+        id: "c2",
+        tool_kind: "edit",
+        status: "completed",
+        title: "Edit /tmp/buildlink-audit-claude/harness.py",
+        detail: [
+          "/tmp/buildlink-audit-claude/harness.py",
+          "",
+          "--- /tmp/buildlink-audit-claude/harness.py",
+          "+++ /tmp/buildlink-audit-claude/harness.py",
+          "- old_a()",
+          "+ new_a()",
+          "",
+          "--- /tmp/buildlink-audit-claude/harness.py",
+          "+++ /tmp/buildlink-audit-claude/harness.py",
+          "- old_b()",
+          "+ new_b()",
+        ].join("\n"),
+      },
+    ];
+
+    const smoke = extractTurnFilePatch(entries, 1, "/tmp/buildlink-audit-claude/x0_smoke.py", "/home/u/buildlink");
+    expect(smoke.isCreateOnly).toBe(true);
+    expect(smoke.hasEdits).toBe(false);
+    expect(smoke.patch).toContain("+ print('hi')");
+
+    const harness = extractTurnFilePatch(entries, 1, "/tmp/buildlink-audit-claude/harness.py", "/home/u/buildlink");
+    expect(harness.isCreateOnly).toBe(false);
+    expect(harness.hasEdits).toBe(true);
+    expect(harness.patch).toContain("- old_a()");
+    expect(harness.patch).toContain("+ new_b()");
+  });
+
+  test("buildConversationItems preserves external edited files alongside git checkpoint files in the same turn", () => {
+    const items = buildConversationItems(
+      [
+        { kind: "user", turn: 1, text: "Edit repo and tmp script", ts_ms: 10 },
+        {
+          kind: "tool_call",
+          turn: 1,
+          id: "e1",
+          tool_kind: "edit",
+          status: "completed",
+          title: "Write /tmp/audit/repro.py",
+          detail: "--- /tmp/audit/repro.py\n+++ /tmp/audit/repro.py\n+ x = 1\n+ y = 2",
+          ts_ms: 15,
+        },
+        { kind: "assistant", turn: 1, text: "Done.", ts_ms: 20 },
+        {
+          kind: "checkpoint",
+          turn: 1,
+          files: [{ path: "src/lib.rs", added: 5, deleted: 1 }],
+          ts_ms: 25,
+        },
+      ],
+      "",
+      false,
+      { cwd: "/repo" },
+    );
+    const reply = items.find((i: any) => i.kind === "assistant") as any;
+    expect(reply.changedFiles.files).toEqual([
+      { path: "src/lib.rs", additions: 5, deletions: 1 },
+      { path: "/tmp/audit/repro.py", additions: 2, deletions: 0 },
+    ]);
+    expect(reply.changedFiles.totalAdditions).toBe(7);
+    expect(reply.changedFiles.totalDeletions).toBe(1);
   });
 });

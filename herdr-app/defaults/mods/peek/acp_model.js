@@ -661,6 +661,59 @@ export function parseToolDetail(step) {
   };
 }
 
+export function isAbsoluteFilePath(p) {
+  return typeof p === "string" && /^(\/|~\/|[A-Za-z]:[\\/])/.test(p.trim());
+}
+
+function normalizeLexicalPath(p) {
+  const raw = String(p ?? "").trim();
+  if (!raw) return "";
+  const winDrive = raw.match(/^([A-Za-z]:)[\\/](.*)$/);
+  if (winDrive) {
+    const drive = winDrive[1];
+    const parts = winDrive[2].replace(/\\/g, "/").split("/");
+    const out = [];
+    for (const seg of parts) {
+      if (!seg || seg === ".") continue;
+      if (seg === "..") {
+        if (out.length > 0) out.pop();
+      } else {
+        out.push(seg);
+      }
+    }
+    return `${drive}/${out.join("/")}`;
+  }
+  const leadingSlash = raw.startsWith("/");
+  const tildePrefix = raw.startsWith("~/");
+  const body = tildePrefix ? raw.slice(2) : raw;
+  const parts = body.replace(/\\/g, "/").split("/");
+  const out = [];
+  for (const seg of parts) {
+    if (!seg || seg === ".") continue;
+    if (seg === "..") {
+      if (out.length > 0 && out[out.length - 1] !== "..") out.pop();
+      else if (!leadingSlash && !tildePrefix) out.push("..");
+    } else {
+      out.push(seg);
+    }
+  }
+  if (tildePrefix) return out.length ? `~/${out.join("/")}` : "~";
+  if (leadingSlash) return `/${out.join("/")}`;
+  return out.join("/");
+}
+
+export function resolveChangedFilePath(rawPath, cwd = "", homeDir = "", on = null) {
+  let p = String(rawPath ?? "").trim().replace(/^['"]|['"]$/g, "");
+  if (!p) return "";
+  if (!on && homeDir && p.startsWith("~/")) {
+    p = `${String(homeDir).replace(/[\\/]+$/, "")}/${p.slice(2)}`;
+  }
+  if (isAbsoluteFilePath(p)) return normalizeLexicalPath(p);
+  const cleanCwd = String(cwd ?? "").trim().replace(/[\\/]+$/, "");
+  if (!cleanCwd) return normalizeLexicalPath(p);
+  return normalizeLexicalPath(`${cleanCwd}/${p.replace(/^\.[\\/]/, "")}`);
+}
+
 function normalizeRelativeFilePath(rawPath, cwd = "") {
   let p = String(rawPath ?? "").trim().replace(/^['"]|['"]$/g, "");
   if (!p || p === "/dev/null") return "";
@@ -673,6 +726,162 @@ function normalizeRelativeFilePath(rawPath, cwd = "") {
   }
   if (p.startsWith("./")) p = p.slice(2);
   return p;
+}
+
+const EDIT_TOOL_TITLE_RE = /^(?:Edit|MultiEdit|Write|Create|Patch|edit_file|write_file|replace_file_content|apply_patch)\s+(.+)$/i;
+
+function isEditToolStep(step) {
+  if (!step || step.status === "failed") return false;
+  const toolKind = String(step.tool_kind ?? "").toLowerCase();
+  const title = String(step.title ?? "").trim();
+  const raw = String(step.detail ?? "");
+  const titleEdit = title.match(EDIT_TOOL_TITLE_RE);
+  const hasDiffDetail =
+    raw.startsWith("--- ") ||
+    raw.startsWith("diff --git") ||
+    /\*\*\*\s+(?:Update|Add|Delete)\s+File:/.test(raw);
+  return {
+    isEdit: toolKind === "edit" || toolKind === "write" || toolKind === "patch" || Boolean(titleEdit) || hasDiffDetail,
+    titlePath: titleEdit?.[1] ?? null,
+    title,
+    raw,
+  };
+}
+
+function extractMatchingPatchSections(raw, targetNorm, cwd) {
+  const text = String(raw ?? "").replace(/\r\n/g, "\n");
+  if (!text.trim()) return [];
+
+  // 1) Codex/apply_patch style: *** Update/Add/Delete File: <path>
+  if (/^\*\*\*\s+(?:Update|Add|Delete)\s+File:/m.test(text)) {
+    const lines = text.split("\n");
+    const out = [];
+    let current = null;
+    for (const line of lines) {
+      const m = line.match(/^\*\*\*\s+(?:Update|Add|Delete)\s+File:\s*(.+)$/);
+      if (m) {
+        if (current && current.match) out.push(current.lines.join("\n"));
+        const p = normalizeRelativeFilePath(m[1], cwd);
+        current = { match: p === targetNorm, lines: [line] };
+        continue;
+      }
+      if (/^\*\*\*\s+End Patch/.test(line)) {
+        if (current && current.match) out.push(current.lines.join("\n"));
+        current = null;
+        continue;
+      }
+      if (current) current.lines.push(line);
+    }
+    if (current && current.match) out.push(current.lines.join("\n"));
+    return out;
+  }
+
+  // 2) Standard diff --git multi-file patches
+  if (/^diff --git /m.test(text)) {
+    const lines = text.split("\n");
+    const out = [];
+    let current = null;
+    for (const line of lines) {
+      if (line.startsWith("diff --git ")) {
+        if (current && current.match) out.push(current.lines.join("\n"));
+        const bMatch = / b\/(.+)$/.exec(line);
+        const p = normalizeRelativeFilePath(bMatch ? bMatch[1] : "", cwd);
+        current = { match: p === targetNorm, lines: [line] };
+        continue;
+      }
+      if (current) {
+        current.lines.push(line);
+        if (!current.match && (line.startsWith("+++ ") || line.startsWith("--- "))) {
+          const cand = line.slice(4).trim();
+          if (cand !== "/dev/null" && normalizeRelativeFilePath(cand, cwd) === targetNorm) {
+            current.match = true;
+          }
+        }
+      }
+    }
+    if (current && current.match) out.push(current.lines.join("\n"));
+    return out;
+  }
+
+  // 3) Unified or proto.rs `--- <path>\n+++ <path>` blocks (possibly multiple blocks in one tool call)
+  if (/^---\s+/m.test(text) && /^\+\+\+\s+/m.test(text)) {
+    const lines = text.split("\n");
+    const out = [];
+    let current = null;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (line.startsWith("--- ") && i + 1 < lines.length && lines[i + 1].startsWith("+++ ")) {
+        if (current && current.match) out.push(current.lines.join("\n"));
+        const minusPath = line.slice(4).trim();
+        const plusPath = lines[i + 1].slice(4).trim();
+        const chosen = plusPath && plusPath !== "/dev/null" ? plusPath : minusPath;
+        const p = normalizeRelativeFilePath(chosen, cwd);
+        current = { match: p === targetNorm, lines: [line, lines[i + 1]] };
+        i += 1;
+        continue;
+      }
+      if (current) {
+        if (!line.trim() && i + 1 < lines.length && lines[i + 1].startsWith("--- ")) {
+          continue;
+        }
+        current.lines.push(line);
+      }
+    }
+    if (current && current.match) out.push(current.lines.join("\n"));
+    return out;
+  }
+
+  return [];
+}
+
+/**
+ * Collects recorded diff patch sections from a turn's edit/write tool calls for a specific file.
+ */
+export function extractTurnFilePatch(entries, turn, targetPath, cwd = "", maxChars = 48000) {
+  const list = Array.isArray(entries) ? entries : [];
+  const targetNorm = normalizeRelativeFilePath(targetPath, cwd);
+  if (!targetNorm) return { patch: "", hasEdits: false, isCreateOnly: false };
+
+  const filterTurn = turn != null && Number(turn) > 0 ? Number(turn) : null;
+  const sections = [];
+  let hasEdits = false;
+  let totalChars = 0;
+
+  for (const entry of list) {
+    if (!entry || entry.kind !== "tool_call" || entry.status === "failed") continue;
+    if (filterTurn !== null && Number(entry.turn ?? 0) !== filterTurn) continue;
+    const info = isEditToolStep(entry);
+    if (!info.isEdit) continue;
+
+    let matched = extractMatchingPatchSections(info.raw, targetNorm, cwd);
+    if (matched.length === 0 && info.titlePath && normalizeRelativeFilePath(info.titlePath, cwd) === targetNorm) {
+      const parsed = parseToolDetail(entry);
+      if (parsed.mode === "diff" && parsed.raw) matched = [parsed.raw];
+    }
+    if (matched.length === 0) continue;
+
+    for (const sec of matched) {
+      const cleanSec = sec.trim();
+      if (!cleanSec) continue;
+      const lines = cleanSec.split("\n");
+      const secHasDel = lines.some((l) => l.startsWith("-") && !l.startsWith("---"));
+      const secHasHunk = lines.some((l) => l.startsWith("@@"));
+      if (secHasDel || secHasHunk) hasEdits = true;
+      if (totalChars + cleanSec.length + 2 <= maxChars) {
+        sections.push(cleanSec);
+        totalChars += cleanSec.length + 2;
+      } else if (sections.length === 0) {
+        sections.push(cleanSec.slice(0, maxChars));
+        totalChars = maxChars;
+      }
+    }
+  }
+
+  return {
+    patch: sections.join("\n\n"),
+    hasEdits,
+    isCreateOnly: sections.length > 0 && !hasEdits,
+  };
 }
 
 /**
@@ -697,17 +906,10 @@ export function extractTurnChangedFiles(steps, cwd = "") {
 
   for (const step of list) {
     if (!step || step.kind !== "tool_call" || step.status === "failed") continue;
-    const toolKind = String(step.tool_kind ?? "").toLowerCase();
-    const title = String(step.title ?? "").trim();
-    const raw = String(step.detail ?? "");
-    const titleEdit = title.match(/^(?:Edit|MultiEdit|Write|Create|Patch|edit_file|write_file|replace_file_content|apply_patch)\s+(.+)$/i);
-    const hasDiffDetail =
-      raw.startsWith("--- ") ||
-      raw.startsWith("diff --git") ||
-      /\*\*\*\s+(?:Update|Add|Delete)\s+File:/.test(raw);
-    const isEditTool = toolKind === "edit" || toolKind === "write" || toolKind === "patch" || Boolean(titleEdit) || hasDiffDetail;
-    if (!isEditTool) continue;
+    const info = isEditToolStep(step);
+    if (!info.isEdit) continue;
 
+    const raw = info.raw;
     const parsed = parseToolDetail(step);
     const additions = parsed.mode === "diff" ? parsed.additions : 0;
     const deletions = parsed.mode === "diff" ? parsed.deletions : 0;
@@ -730,8 +932,8 @@ export function extractTurnChangedFiles(steps, cwd = "") {
       continue;
     }
 
-    if (titleEdit?.[1]) {
-      recordFile(titleEdit[1], additions, deletions);
+    if (info.titlePath) {
+      recordFile(info.titlePath, additions, deletions);
     }
   }
 
@@ -1154,7 +1356,22 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
     if (summary.files.length > 0) changedByTurn.set(turn, summary);
   }
   for (const [turn, ckptSummary] of checkpointStatsByTurn.entries()) {
-    changedByTurn.set(turn, ckptSummary);
+    const toolSummary = changedByTurn.get(turn);
+    const existingPaths = new Set(ckptSummary.files.map((f) => f.path));
+    const extraExternal = toolSummary
+      ? toolSummary.files.filter((f) => isAbsoluteFilePath(f.path) && !existingPaths.has(f.path))
+      : [];
+    if (extraExternal.length > 0) {
+      const mergedFiles = [...ckptSummary.files, ...extraExternal];
+      changedByTurn.set(turn, {
+        ...ckptSummary,
+        files: mergedFiles,
+        totalAdditions: mergedFiles.reduce((s, f) => s + (f.additions || 0), 0),
+        totalDeletions: mergedFiles.reduce((s, f) => s + (f.deletions || 0), 0),
+      });
+    } else {
+      changedByTurn.set(turn, ckptSummary);
+    }
   }
   compact.forEach((it, idx) => {
     const turn = it.turn ?? 0;

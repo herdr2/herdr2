@@ -1,17 +1,23 @@
 import { View, div, svg, list } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input, TextareaState, Textarea, Popup, Scrollbar } from "gpui-base";
-import { spaces, panes, agents, terminals, focused, exec, h2, readTextFile, watchFolder, theme, settings, shared, setShared, run } from "herdr";
+import { v_flex, h_flex, h_resizable, resizable_panel, InputState, Input, TextareaState, Textarea, Popup, Scrollbar } from "gpui-base";
+import { spaces, panes, agents, terminals, focused, exec, h2, readTextFile, watchFolder, theme, settings, shared, setShared, run, home } from "herdr";
 import {
   annotateDiffRows,
   buildSelectionRange,
   extractSnippet,
   buildDisplayItems,
+  buildSplitDisplayItems,
+  matchCommentRowIndex,
   resolveTargetCandidates,
   makeDraftScopeKey,
   readScopeDrafts,
   writeScopeDrafts,
   formatLineTag,
   withAlpha,
+  isAbsolutePath,
+  parentDirectory,
+  resolvePathAgainstRoot,
+  parseToolPatchLines,
 } from "./review_model.js";
 import {
   parseGitStatusV2,
@@ -101,11 +107,25 @@ export default class Changes extends View {
     this.gitStatus = null;
     this.gitLog = [];
     this.stashCount = 0;
-    this.gitLogOpen = true;
+    this.gitLogOpen = false;
     this.selectedCommit = null;
     this.commitLoading = false;
+    this.externalFiles = [];
+    this.selectedExternal = null;
+    this.externalLoading = false;
+    this.pendingOpenRequest = null;
+    this.lastHandledOpenSeq = 0;
+    try {
+      const existingReq = shared("changes.open_request");
+      const reqSeq = Number(existingReq?.seq ?? 0);
+      const reqTs = Number(existingReq?.ts ?? 0);
+      if (reqSeq > 0 && reqTs > 0 && Date.now() - reqTs > 15000) {
+        this.lastHandledOpenSeq = reqSeq;
+      }
+    } catch {}
 
     this.refresh(cx);
+    this.consumeOpenRequest(cx);
     cx.timer.every(10000, (cx) => this.refresh(cx));
   }
 
@@ -127,7 +147,124 @@ export default class Changes extends View {
   }
 
   scopeKey() {
-    return this.root ? makeDraftScopeKey(this.on, this.root) : null;
+    if (this.root) return makeDraftScopeKey(this.on, this.root);
+    if (this.selectedExternal?.path) {
+      return makeDraftScopeKey(
+        this.selectedExternal.on ?? this.on,
+        this.selectedExternal.extRoot || parentDirectory(this.selectedExternal.path) || this.selectedExternal.path,
+      );
+    }
+    return null;
+  }
+
+  expandLocalPath(rawPath, on) {
+    const p = String(rawPath ?? "").trim();
+    if (!p) return "";
+    if (!on && p.startsWith("~/") && typeof home === "function") {
+      const h = String(home() ?? "").replace(/[\\/]+$/, "");
+      if (h) return `${h}/${p.slice(2)}`;
+    }
+    return p;
+  }
+
+  consumeOpenRequest(cx) {
+    let req = null;
+    try { req = shared("changes.open_request"); } catch {}
+    if (!req || typeof req !== "object") return;
+    const seq = Number(req.seq ?? 0);
+    if (!seq || seq <= this.lastHandledOpenSeq) return;
+    if (typeof req.path !== "string" || !req.path.trim()) return;
+    this.lastHandledOpenSeq = seq;
+    if (this.loading) {
+      this.pendingOpenRequest = req;
+      return;
+    }
+    this.applyOpenRequest(req, cx);
+  }
+
+  applyOpenRequest(req, cx) {
+    const reqOn = req?.on ?? null;
+    const rawPath = this.expandLocalPath(req?.path ?? "", reqOn);
+    if (!rawPath) return;
+
+    const sameMachine = (reqOn ?? null) === (this.on ?? null);
+    if (sameMachine && this.root) {
+      const resolved = resolvePathAgainstRoot(rawPath, this.root);
+      if (resolved.inside && resolved.relPath && this.files.some((f) => f.path === resolved.relPath)) {
+        this.selectedCommit = null;
+        this.commitLoading = false;
+        this.selectedExternal = null;
+        this.externalLoading = false;
+        this.open = resolved.relPath;
+        this.closed = false;
+        this.composer = null;
+        this.anchorRowIdx = null;
+        this.note = null;
+        this.setLines([]);
+        const context = this.context;
+        cx.spawn(async (cx) => {
+          try { await this.load(resolved.relPath, context); }
+          catch (e) { if (this.viewKey() === context && this.open === resolved.relPath) this.note = `Cannot preview this diff (too large or unreadable): ${e}`; }
+          cx.notify();
+        });
+        cx.notify();
+        return;
+      }
+    }
+
+    const prevByPath = new Map((this.externalFiles ?? []).map((f) => [f.path, f]));
+    const inRepoSet = sameMachine && this.root ? new Set(this.files.map((f) => f.path)) : new Set();
+    const nextList = [];
+    const seen = new Set();
+    const pushExt = (entry, isPrimary = false) => {
+      const ep = this.expandLocalPath(entry?.path ?? "", reqOn);
+      if (!ep || seen.has(ep)) return null;
+      if (!isPrimary && sameMachine && this.root) {
+        const res = resolvePathAgainstRoot(ep, this.root);
+        if (res.inside && res.relPath && inRepoSet.has(res.relPath)) return null;
+      }
+      seen.add(ep);
+      const prev = prevByPath.get(ep);
+      const add = Number(entry?.additions ?? entry?.add ?? prev?.add ?? 0) || 0;
+      const del = Number(entry?.deletions ?? entry?.del ?? prev?.del ?? 0) || 0;
+      const item = {
+        path: ep,
+        displayPath: String(entry?.displayPath || prev?.displayPath || ep),
+        on: reqOn,
+        add,
+        del,
+        status: prev?.status || (del > 0 ? "M" : "A"),
+        patch: typeof entry?.patch === "string" && entry.patch ? entry.patch : (prev?.patch || ""),
+        isCreateOnly: entry?.isCreateOnly !== undefined ? Boolean(entry.isCreateOnly) : Boolean(prev?.isCreateOnly),
+        sourceKind: prev?.sourceKind || null,
+        extRoot: prev?.extRoot || null,
+        terminal: req?.terminal ?? prev?.terminal ?? null,
+        turn: req?.turn ?? prev?.turn ?? null,
+      };
+      nextList.push(item);
+      return item;
+    };
+
+    const rawSiblings = Array.isArray(req?.files) ? req.files : [];
+    for (const sf of rawSiblings) {
+      const sfPath = this.expandLocalPath(sf?.path ?? "", reqOn);
+      pushExt(sf, sfPath === rawPath);
+    }
+    let target = nextList.find((x) => x.path === rawPath) ?? null;
+    if (!target) {
+      target = pushExt({
+        path: rawPath,
+        displayPath: req?.displayPath || rawPath,
+        additions: req?.additions ?? 0,
+        deletions: req?.deletions ?? 0,
+        patch: req?.patch ?? "",
+        isCreateOnly: req?.isCreateOnly ?? false,
+      }, true);
+    }
+    if (!target) return;
+
+    this.externalFiles = nextList;
+    this.pickExternal(target, cx);
   }
 
   drafts() {
@@ -181,6 +318,9 @@ export default class Changes extends View {
         this.stashCount = 0;
         this.selectedCommit = null;
         this.commitLoading = false;
+        this.externalFiles = [];
+        this.selectedExternal = null;
+        this.externalLoading = false;
         this.composer = null;
         this.anchorRowIdx = null;
         this.targetPopupOpen = false;
@@ -210,8 +350,10 @@ export default class Changes extends View {
           this.stashCount = 0;
           this.selectedCommit = null;
           this.commitLoading = false;
-          this.setLines([]);
-          this.open = null;
+          if (!this.selectedExternal) {
+            this.setLines([]);
+            this.open = null;
+          }
           this.error = "Not a git repository";
           return;
         }
@@ -255,7 +397,7 @@ export default class Changes extends View {
         this.limited = parsed.limited;
         this.error = null;
         this.watch(root, cx);
-        if (!this.selectedCommit) {
+        if (!this.selectedCommit && !this.selectedExternal) {
           if (this.open && !files.some((f) => f.path === this.open)) { this.open = null; this.composer = null; this.anchorRowIdx = null; this.setLines([]); }
           // The first file's diff shows until you pick another.
           if (!this.open && !this.closed && files.length) this.open = files[0].path;
@@ -265,7 +407,16 @@ export default class Changes extends View {
           }
         }
       } catch (e) { if (this.viewKey() === context) this.error = String(e); }
-      finally { this.loading = false; cx.notify(); }
+      finally {
+        this.loading = false;
+        if (this.pendingOpenRequest) {
+          const pending = this.pendingOpenRequest;
+          this.pendingOpenRequest = null;
+          this.applyOpenRequest(pending, cx);
+        } else {
+          cx.notify();
+        }
+      }
     });
   }
 
@@ -306,9 +457,111 @@ export default class Changes extends View {
     }
   }
 
+  async loadExternal(ext, context) {
+    if (!ext?.path) return;
+    const extOn = ext.on ?? this.on ?? null;
+    const extPath = ext.path;
+    let lines = null;
+
+    // 1) If the external file lives inside another Git repository, load its real Git diff/status.
+    const dir = parentDirectory(extPath);
+    if (dir) {
+      const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd: dir, on: extOn }).catch(() => ({ code: 1, stdout: "", stderr: "" }));
+      if (top?.code === 0 && top.stdout?.trim()) {
+        const extRoot = top.stdout.trim();
+        const rel = resolvePathAgainstRoot(extPath, extRoot).relPath;
+        if (rel) {
+          const extGit = (args) => exec("git", [...READ, ...args], { cwd: extRoot, on: extOn });
+          const stRes = await extGit(["status", "--porcelain=v2", "--branch", "-z", "--no-renames", "--untracked-files=all", "--", rel]).catch(() => ({ code: 1, stdout: "", stderr: "" }));
+          const parsedSt = stRes?.code === 0 ? parseGitStatusV2(stRes.stdout, { limit: 10 }) : null;
+          const hasHead = parsedSt ? parsedSt.branch.hasHead : true;
+          const stFile = parsedSt?.files?.find((f) => f.path === rel) ?? null;
+          if (stFile && (stFile.fresh || (!hasHead && stFile.status === "A"))) {
+            const text = await readTextFile(extPath, { on: extOn }).catch(() => null);
+            if (text !== null) {
+              if (text.includes("\0")) {
+                lines = [tr("Binary file · no text diff", "二进制文件 · 无文本差异")];
+              } else {
+                const n = countLines(text);
+                ext.add = n;
+                ext.del = 0;
+                ext.status = "A";
+                ext.sourceKind = "git-untracked";
+                ext.extRoot = extRoot;
+                lines = [`@@ -0,0 +1,${n} @@`, ...text.slice(0, 400000).replace(/\n$/, "").split("\n").slice(0, 1500).map((l) => `+${l}`)];
+              }
+            }
+          } else {
+            const r = await extGit(["diff", ...(hasHead ? ["HEAD"] : []), "--no-ext-diff", "--no-textconv", "--no-color", "--", rel]).catch(() => ({ code: 1, stdout: "", stderr: "" }));
+            if (r?.code === 0 && r.stdout) {
+              const all = r.stdout.replace(/\n$/, "").split("\n");
+              const first = all.findIndex((l) => l.startsWith("@@"));
+              if (first >= 0) {
+                lines = all.slice(first);
+                let addCount = 0;
+                let delCount = 0;
+                for (const l of lines) {
+                  if (l.startsWith("+") && !l.startsWith("+++")) addCount += 1;
+                  else if (l.startsWith("-") && !l.startsWith("---")) delCount += 1;
+                }
+                ext.add = addCount;
+                ext.del = delCount;
+                ext.status = stFile?.status || "M";
+                ext.sourceKind = "git-diff";
+                ext.extRoot = extRoot;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    // 2) For non-Git external files (or already-committed external files) with real recorded edits, show the agent's recorded diff.
+    if (!lines && ext.patch && !ext.isCreateOnly) {
+      const patchLines = parseToolPatchLines(ext.patch);
+      if (patchLines.length > 0) {
+        lines = patchLines;
+        ext.sourceKind = "agent-diff";
+        if (!ext.status) ext.status = ext.del > 0 ? "M" : "A";
+      }
+    }
+
+    // 3) Otherwise read the complete file on disk (preferred for newly created non-Git files so we don't truncate to tool preview),
+    //    falling back to the recorded agent patch if the file was deleted/unreadable.
+    if (!lines) {
+      const text = await readTextFile(extPath, { on: extOn }).catch(() => null);
+      if (text !== null) {
+        if (text.includes("\0")) {
+          lines = [tr("Binary file · no text diff", "二进制文件 · 无文本差异")];
+          ext.sourceKind = "file-content";
+        } else {
+          const n = countLines(text);
+          ext.add = n;
+          ext.del = 0;
+          ext.status = ext.status || "A";
+          ext.sourceKind = "file-content";
+          lines = [`@@ -0,0 +1,${n} @@`, ...text.slice(0, 400000).replace(/\n$/, "").split("\n").slice(0, 1500).map((l) => `+${l}`)];
+        }
+      } else if (ext.patch) {
+        const patchLines = parseToolPatchLines(ext.patch);
+        lines = patchLines.length > 0
+          ? patchLines
+          : [tr("Cannot preview this external file (deleted, binary, too large, or unreadable)", "无法预览该项目外文件（已删除、二进制、过大或不可读）")];
+        ext.sourceKind = "agent-diff";
+      } else {
+        lines = [tr("Cannot preview this external file (deleted, binary, too large, or unreadable)", "无法预览该项目外文件（已删除、二进制、过大或不可读）")];
+      }
+    }
+
+    if (this.viewKey() === context && this.selectedExternal?.path === extPath) {
+      this.setLines(lines.slice(0, 1500).map((line) => (line.length > 4000 ? line.slice(0, 4000) + "… (line truncated)" : line)));
+    }
+  }
+
   setLines(lines) {
     this.rows = diffRows(lines);
-    this.annotatedRows = annotateDiffRows(this.rows, this.selectedCommit ? null : this.open);
+    const activeFile = this.selectedCommit ? null : (this.selectedExternal?.path ?? this.open);
+    this.annotatedRows = annotateDiffRows(this.rows, activeFile);
     const maxNum = this.rows.reduce((m, row) => (typeof row.number === "number" && row.number > m ? row.number : m), 0);
     const numCols = Math.max(3, String(maxNum).length);
     this.diffNumWidth = Math.max(30, numCols * 8 + 6);
@@ -317,6 +570,8 @@ export default class Changes extends View {
   pick(path, cx) {
     this.selectedCommit = null;
     this.commitLoading = false;
+    this.selectedExternal = null;
+    this.externalLoading = false;
     this.open = this.open === path ? null : path;
     this.composer = null;
     this.anchorRowIdx = null;
@@ -332,6 +587,51 @@ export default class Changes extends View {
     cx.notify();
   }
 
+  pickExternal(ext, cx) {
+    if (!ext?.path) return;
+    this.selectedCommit = null;
+    this.commitLoading = false;
+    this.open = null;
+    this.selectedExternal = ext;
+    this.externalLoading = true;
+    this.composer = null;
+    this.anchorRowIdx = null;
+    this.note = null;
+    this.setLines([]);
+    const context = this.context;
+    cx.spawn(async (cx) => {
+      try {
+        await this.loadExternal(ext, context);
+      } catch (e) {
+        if (this.viewKey() === context && this.selectedExternal?.path === ext.path) {
+          this.setLines([tr(`Cannot load external diff: ${e}`, `无法加载项目外变更：${e}`)]);
+        }
+      } finally {
+        if (this.selectedExternal?.path === ext.path) this.externalLoading = false;
+        cx.notify();
+      }
+    });
+    cx.notify();
+  }
+
+  closeExternalPreview(cx, clearList = false) {
+    this.selectedExternal = null;
+    this.externalLoading = false;
+    if (clearList) this.externalFiles = [];
+    this.setLines([]);
+    this.note = null;
+    const context = this.context;
+    if (!this.closed && this.files.length) {
+      this.open = this.files[0].path;
+      cx.spawn(async (cx) => {
+        try { await this.load(this.open, context); }
+        catch (e) { if (this.viewKey() === context) this.note = `Cannot preview this diff (too large or unreadable): ${e}`; }
+        cx.notify();
+      });
+    }
+    cx.notify();
+  }
+
   pickCommit(commit, cx) {
     if (!commit?.hash) return;
     if (this.selectedCommit?.hash === commit.hash) {
@@ -340,6 +640,8 @@ export default class Changes extends View {
     }
     this.selectedCommit = commit;
     this.commitLoading = true;
+    this.selectedExternal = null;
+    this.externalLoading = false;
     this.open = null;
     this.composer = null;
     this.anchorRowIdx = null;
@@ -483,16 +785,17 @@ export default class Changes extends View {
   }
 
   targetInfo() {
+    const preferred = this.targetOverride || this.selectedExternal?.terminal || null;
     const { candidates, defaultTarget } = resolveTargetCandidates({
       panesList: panes(),
       agentsList: agents(),
       terminalsList: terminals(),
-      machine: this.on ?? null,
+      machine: this.selectedExternal?.on ?? this.on ?? null,
       focusedInfo: focused(),
-      repoRoot: this.root,
-      preferredAddr: this.targetOverride,
+      repoRoot: this.selectedExternal?.extRoot || this.root,
+      preferredAddr: preferred,
     });
-    const chosen = candidates.find((c) => c.address === this.targetOverride) ?? candidates.find((c) => c.address === defaultTarget) ?? null;
+    const chosen = candidates.find((c) => c.address === preferred) ?? candidates.find((c) => c.address === defaultTarget) ?? null;
     return { candidates, chosen };
   }
 
@@ -520,11 +823,12 @@ export default class Changes extends View {
       ...(c.snippet ? { snippet: c.snippet } : {}),
       body: c.body,
     }));
+    const repoRoot = this.selectedExternal ? (this.selectedExternal.extRoot || null) : this.root;
     run("agent.send_review", {
       request_id: reqId,
       target: chosen.address,
       source: "changes",
-      ...(this.root ? { repo_root: this.root } : {}),
+      ...(repoRoot ? { repo_root: repoRoot } : {}),
       comments,
       steer: Boolean(this.steerMode && chosen.kind === "acp" && chosen.status === "working"),
       focus: false,
@@ -583,9 +887,24 @@ export default class Changes extends View {
     });
   }
 
+  diffMode() {
+    try {
+      return shared("diff.viewMode") === "split" ? "split" : "unified";
+    } catch {
+      return "unified";
+    }
+  }
+
+  setDiffMode(mode, cx) {
+    const next = mode === "split" ? "split" : "unified";
+    if (this.diffMode() === next) return;
+    setShared("diff.viewMode", next);
+    cx.notify();
+  }
+
   handleVirtualItemClick(itemKey, cx) {
     if (typeof itemKey !== "string") return;
-    if (itemKey.startsWith("r-")) {
+    if (itemKey.startsWith("r-") || itemKey.startsWith("s-")) {
       const idx = Number(itemKey.slice(2));
       const row = Number.isFinite(idx) ? this.annotatedRows[idx] : null;
       if (row?.commentable) {
@@ -671,6 +990,170 @@ export default class Changes extends View {
           .child(row.number === undefined ? "" : String(row.number)),
       )
       .child(div().flex_1().min_w(0).py(1).line_height("18px").whitespace_normal().child(row.text));
+  }
+
+  renderSplitCell(row, side, t, selectedRange, commentedSet, padRight) {
+    const accent = t.accent ?? "#3b82f6";
+    if (!row) {
+      return h_flex()
+        .flex_1()
+        .min_w(0)
+        .min_h(20)
+        .items_start()
+        .bg(withAlpha(t.raised, "99") ?? t.surface ?? t.background)
+        .child(div().w(3).self_stretch().flex_none())
+        .child(div().w(this.diffNumWidth ?? 30).flex_none().py(1).line_height("18px").child(""))
+        .child(div().w(12).flex_none().py(1).line_height("18px").child(""))
+        .child(div().flex_1().min_w(0).py(1).pr(padRight).line_height("18px").child(" "));
+    }
+
+    const inSel = Boolean(
+      selectedRange && row.file === selectedRange.file && row.rowIndex >= selectedRange.startRowIdx && row.rowIndex <= selectedRange.endRowIdx,
+    );
+    const hasComment = commentedSet.has(row.rowIndex);
+    const isDel = side === "left" && row.kind === "-";
+    const isAdd = side === "right" && row.kind === "+";
+    const cellBg = inSel
+      ? (withAlpha(accent, "24") ?? t.selected)
+      : isAdd
+        ? (t.ansi2 + "18")
+        : isDel
+          ? (t.ansi1 + "18")
+          : null;
+    const lineNum = side === "left"
+      ? (row.oldLine ?? (row.kind === "-" ? row.number : null))
+      : (row.newLine ?? (row.kind === "+" ? row.number : null));
+    const sign = isDel ? "−" : isAdd ? "+" : "";
+    const signColor = isDel ? t.ansi1 : isAdd ? t.ansi2 : t.dim;
+
+    return h_flex()
+      .flex_1()
+      .min_w(0)
+      .min_h(20)
+      .gap(4)
+      .items_start()
+      .when(Boolean(cellBg), (e) => e.bg(cellBg))
+      .child(
+        div()
+          .w(3)
+          .self_stretch()
+          .flex_none()
+          .when(inSel || hasComment, (e) => e.bg(accent)),
+      )
+      .child(
+        div()
+          .w(this.diffNumWidth ?? 30)
+          .flex_none()
+          .py(1)
+          .line_height("18px")
+          .text_right()
+          .text_color(inSel ? t.foreground : t.dim)
+          .child(lineNum == null ? "" : String(lineNum)),
+      )
+      .child(
+        div()
+          .w(12)
+          .flex_none()
+          .py(1)
+          .line_height("18px")
+          .text_center()
+          .text_color(hasComment ? accent : signColor)
+          .child(hasComment ? "●" : sign),
+      )
+      .child(
+        div()
+          .flex_1()
+          .min_w(0)
+          .py(1)
+          .pr(padRight)
+          .line_height("18px")
+          .whitespace_normal()
+          .child(row.text),
+      );
+  }
+
+  renderSplitRow(srow, t, selectedRange, commentedSet) {
+    if (srow.kind === "hunk") {
+      return div()
+        .w_full()
+        .min_w(0)
+        .px(12)
+        .py(2)
+        .min_h(20)
+        .line_height("16px")
+        .whitespace_normal()
+        .bg(t.raised)
+        .text_color(t.dim)
+        .child(srow.row.text);
+    }
+    if (srow.kind === "file") {
+      return h_flex()
+        .w_full()
+        .min_w(0)
+        .px(12)
+        .py(4)
+        .min_h(24)
+        .items_center()
+        .bg(t.raised)
+        .border_y(1)
+        .border_color(t.border)
+        .child(div().flex_1().min_w(0).font_semibold().text_size(11).line_height("16px").text_color(t.foreground).whitespace_normal().child(srow.row.text));
+    }
+    if (srow.kind === "meta") {
+      return div()
+        .w_full()
+        .min_w(0)
+        .px(12)
+        .py(1)
+        .min_h(20)
+        .line_height("18px")
+        .whitespace_normal()
+        .text_color(t.muted)
+        .child(srow.row.text);
+    }
+
+    const accent = t.accent ?? "#3b82f6";
+    const commentable = Boolean(srow.right?.commentable || srow.left?.commentable);
+    return h_flex()
+      .w_full()
+      .min_w(0)
+      .items_stretch()
+      .when(commentable, (e) => e.cursor_pointer().hover((s) => s.bg(withAlpha(accent, "12") ?? t.hover)))
+      .child(this.renderSplitCell(srow.left, "left", t, selectedRange, commentedSet, 6))
+      .child(div().w(1).self_stretch().flex_none().bg(t.border))
+      .child(this.renderSplitCell(srow.right, "right", t, selectedRange, commentedSet, 14));
+  }
+
+  renderDiffModeToggle(t, mode) {
+    const pill = (id, label, active, nextMode) =>
+      div()
+        .id(id)
+        .flex_none()
+        .px(7)
+        .py(2)
+        .rounded(4)
+        .text_size(10.5)
+        .font_medium()
+        .cursor_pointer()
+        .when(active, (e) => e.bg(t.selected ?? t.raised))
+        .text_color(active ? t.foreground : t.muted)
+        .hover((s) => s.bg(t.hover).text_color(t.foreground))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .on_click((_e, cx) => this.setDiffMode(nextMode, cx))
+        .child(label);
+
+    return h_flex()
+      .id("chg-diff-mode-toggle")
+      .flex_none()
+      .p(2)
+      .gap(2)
+      .items_center()
+      .rounded(6)
+      .bg(t.background)
+      .border_1()
+      .border_color(t.border)
+      .child(pill("chg-diff-mode-unified", tr("Unified", "直接"), mode === "unified", "unified"))
+      .child(pill("chg-diff-mode-split", tr("Split", "分栏"), mode === "split", "split"));
   }
 
   renderSavedComment(item, t) {
@@ -1212,7 +1695,7 @@ export default class Changes extends View {
       );
   }
 
-  renderCommitBanner(t) {
+  renderCommitBanner(t, diffMode) {
     const c = this.selectedCommit;
     if (!c) return null;
     const accent = t.accent ?? "#3b82f6";
@@ -1221,6 +1704,7 @@ export default class Changes extends View {
       .id("chg-commit-banner")
       .flex_none()
       .w_full()
+      .min_w(0)
       .px(10)
       .py(6)
       .gap(6)
@@ -1255,13 +1739,14 @@ export default class Changes extends View {
         e.child(
           div()
             .flex_none()
-            .max_w(140)
+            .max_w(120)
             .truncate()
             .text_size(10)
             .text_color(t.dim)
             .child([c.author, c.relTime].filter(Boolean).join(" · ")),
         ),
       )
+      .child(this.renderDiffModeToggle(t, diffMode))
       .child(
         div()
           .id("chg-commit-close")
@@ -1278,6 +1763,113 @@ export default class Changes extends View {
           .hover((s) => s.bg(t.hover).text_color(t.foreground))
           .on_click((_e, cx) => this.closeCommitPreview(cx))
           .child(tr("Back to changes", "返回变更")),
+      );
+  }
+
+  renderExternalBanner(t, diffMode) {
+    const ext = this.selectedExternal;
+    if (!ext) return null;
+    const badgeColor = t.blocked ?? "#f59e0b";
+    const sourceLabel = ext.sourceKind === "git-diff"
+      ? tr("Git diff", "Git 差异")
+      : ext.sourceKind === "git-untracked"
+        ? tr("Untracked", "未跟踪文件")
+        : ext.sourceKind === "agent-diff"
+          ? tr("Agent diff", "Agent 变更")
+          : ext.sourceKind === "file-content"
+            ? tr("File", "文件内容")
+            : null;
+    return h_flex()
+      .id("chg-ext-banner")
+      .flex_none()
+      .w_full()
+      .min_w(0)
+      .px(10)
+      .py(6)
+      .gap(6)
+      .items_center()
+      .bg(withAlpha(badgeColor, "14") ?? t.raised)
+      .border_b(1)
+      .border_color(withAlpha(badgeColor, "44") ?? t.border)
+      .child(
+        div()
+          .flex_none()
+          .px(5)
+          .py(1)
+          .rounded(4)
+          .bg(withAlpha(badgeColor, "24") ?? t.background)
+          .text_size(10)
+          .font_semibold()
+          .text_color(badgeColor)
+          .child(tr("External", "项目外")),
+      )
+      .child(
+        div()
+          .flex_1()
+          .min_w(0)
+          .truncate()
+          .text_size(11.5)
+          .font_medium()
+          .text_color(t.foreground)
+          .tooltip(ext.path)
+          .child(ext.path),
+      )
+      .when(Boolean(sourceLabel), (e) =>
+        e.child(
+          div()
+            .flex_none()
+            .px(4)
+            .py(1)
+            .rounded(4)
+            .bg(t.background)
+            .border_1()
+            .border_color(t.border)
+            .text_size(9.5)
+            .text_color(t.muted)
+            .child(sourceLabel),
+        ),
+      )
+      .when(ext.add > 0, (e) => e.child(div().flex_none().text_size(10.5).text_color(t.ansi2).child(`+${ext.add}`)))
+      .when(ext.del > 0, (e) => e.child(div().flex_none().text_size(10.5).text_color(t.ansi1).child(`−${ext.del}`)))
+      .child(
+        div()
+          .id("chg-ext-open-file")
+          .flex_none()
+          .px(6)
+          .py(2)
+          .rounded(4)
+          .bg(t.background)
+          .border_1()
+          .border_color(t.border)
+          .text_size(10)
+          .text_color(t.muted)
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover).text_color(t.foreground))
+          .tooltip(tr("Open file in Files panel", "在文件面板中打开"))
+          .on_click(() => {
+            const args = { path: ext.path };
+            if (ext.on) args.on = ext.on;
+            run("files.open", args);
+          })
+          .child(tr("Open", "打开")),
+      )
+      .child(this.renderDiffModeToggle(t, diffMode))
+      .child(
+        div()
+          .id("chg-ext-close")
+          .flex_none()
+          .px(6)
+          .py(2)
+          .rounded(4)
+          .bg(t.background)
+          .border_1()
+          .border_color(t.border)
+          .text_size(10)
+          .text_color(t.muted)
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover).text_color(t.foreground))
+          .on_click((_e, cx) => this.closeExternalPreview(cx))
+          .child(tr("Back", "返回")),
       );
   }
 
@@ -1342,6 +1934,13 @@ export default class Changes extends View {
                   .text_size(10.5)
                   .text_color(t.dim)
                   .child(latest.subject),
+              )
+              .child(
+                div()
+                  .flex_none()
+                  .text_size(10)
+                  .text_color(t.dim)
+                  .child(tr("Expand", "展开查看")),
               ),
           )
           .when(this.gitLogOpen || !latest, (e) =>
@@ -1459,29 +2058,294 @@ export default class Changes extends View {
 
   render(cx) {
     if (this.viewKey() !== this.context) this.refresh(cx);
+    this.consumeOpenRequest(cx);
     this.syncLastResult();
     const t = theme(), add = this.files.reduce((n, f) => n + f.add, 0), del = this.files.reduce((n, f) => n + f.del, 0);
     const enabled = Boolean(this.message.trim() && this.root && !this.busy && !this.loading);
-    const listHeight = this.files.length * 28 + 12;
 
     const allDrafts = this.drafts();
     const countByFile = new Map();
     for (const d of allDrafts) {
       countByFile.set(d.path, (countByFile.get(d.path) ?? 0) + 1);
     }
-    const openComments = !this.selectedCommit && this.open ? allDrafts.filter((c) => c.path === this.open) : [];
-    const activeComposer = !this.selectedCommit && this.composer && this.composer.file === this.open ? this.composer : null;
-    const { items } = buildDisplayItems(this.annotatedRows, openComments, activeComposer);
+    const diffMode = this.diffMode();
+    const activePath = !this.selectedCommit ? (this.selectedExternal?.path ?? this.open) : null;
+    const openComments = activePath ? allDrafts.filter((c) => c.path === activePath) : [];
+    const activeComposer = activePath && this.composer && this.composer.file === activePath ? this.composer : null;
+    const { items } = diffMode === "split"
+      ? buildSplitDisplayItems(this.annotatedRows, openComments, activeComposer)
+      : buildDisplayItems(this.annotatedRows, openComments, activeComposer);
     const commentedSet = new Set();
-    let lastCodeRowIdx = null;
-    for (const item of items) {
-      if (item.type === "code") lastCodeRowIdx = item.row.rowIndex;
-      else if (item.type === "comment" && !item.outdated && lastCodeRowIdx != null) commentedSet.add(lastCodeRowIdx);
+    for (const c of openComments) {
+      const anchor = matchCommentRowIndex(this.annotatedRows, c);
+      if (anchor >= 0) commentedSet.add(anchor);
     }
     const accent = t.accent ?? "#3b82f6";
     const gitInfoEl = this.renderGitInfo(t, cx);
-    const commitBannerEl = this.renderCommitBanner(t);
+    const commitBannerEl = this.renderCommitBanner(t, diffMode);
+    const externalBannerEl = !commitBannerEl ? this.renderExternalBanner(t, diffMode) : null;
     const gitLogEl = this.renderGitLog(t);
+    const openFileRec = !this.selectedCommit && !this.selectedExternal && this.open ? this.files.find((f) => f.path === this.open) : null;
+    const diffListId = diffMode === "split" ? "changes-diff-split" : "changes-diff";
+    const externalList = Array.isArray(this.externalFiles) ? this.externalFiles : [];
+
+    const fileListPane = v_flex()
+      .id("changes-sidebar")
+      .size_full()
+      .min_w(0)
+      .min_h(0)
+      .border_r(1)
+      .border_color(t.border)
+      .child(
+        div()
+          .flex_1()
+          .w_full()
+          .min_w(0)
+          .min_h(60)
+          .relative()
+          .child(
+            v_flex()
+              .id("changes-list")
+              .absolute()
+              .inset_0()
+              .overflow_y_scroll()
+              .p(6)
+              .children(this.files.map((f) => {
+                const parts = f.path.split("/"), name = parts.pop();
+                const cCount = countByFile.get(f.path) ?? 0;
+                return h_flex()
+                  .id(`change-${f.path}`)
+                  .h(28)
+                  .flex_none()
+                  .px(8)
+                  .gap(6)
+                  .items_center()
+                  .rounded(7)
+                  .cursor_pointer()
+                  .tooltip(f.path)
+                  .when(!this.selectedCommit && !this.selectedExternal && this.open === f.path, (e) => e.bg(t.selected))
+                  .hover((s) => s.bg(t.hover))
+                  .on_click((_e, cx) => this.pick(f.path, cx))
+                  .child(div().w(14).flex_none().text_size(11).text_color(f.status === "A" ? t.ansi2 : f.status === "D" ? t.ansi1 : f.status === "U" ? t.ansi1 : t.blocked).child(f.status))
+                  .child(
+                    h_flex()
+                      .flex_1()
+                      .min_w(0)
+                      .when(parts.length > 0, (e) => e.child(div().min_w(0).truncate().text_color(t.dim).child(parts.join("/") + "/")))
+                      .child(div().min_w(0).truncate().child(name)),
+                  )
+                  .when(Boolean(f.staged), (e) =>
+                    e.child(
+                      div()
+                        .flex_none()
+                        .px(4)
+                        .py(1)
+                        .rounded(4)
+                        .bg(withAlpha(t.ansi2, "1c") ?? t.raised)
+                        .text_size(9.5)
+                        .text_color(t.ansi2)
+                        .tooltip(tr("Staged in index", "已暂存到暂存区"))
+                        .child(tr("staged", "暂存")),
+                    ),
+                  )
+                  .when(cCount > 0, (e) =>
+                    e.child(
+                      div()
+                        .flex_none()
+                        .px(5)
+                        .py(1)
+                        .rounded(4)
+                        .bg(withAlpha(accent, "22") ?? t.raised)
+                        .text_size(10)
+                        .font_semibold()
+                        .text_color(accent)
+                        .child(String(cCount)),
+                    ),
+                  )
+                  .when(f.add > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi2).child(`+${f.add}`)))
+                  .when(f.del > 0, (e) => e.child(div().flex_none().text_size(11).text_color(t.ansi1).child(`−${f.del}`)));
+              }))
+              .when(externalList.length > 0, (e) =>
+                e.child(
+                  v_flex()
+                    .id("changes-external-section")
+                    .w_full()
+                    .min_w(0)
+                    .when(this.files.length > 0, (x) => x.mt(8).pt(8).border_t(1).border_color(t.border))
+                    .gap(2)
+                    .child(
+                      h_flex()
+                        .w_full()
+                        .px(8)
+                        .py(2)
+                        .gap(6)
+                        .items_center()
+                        .child(
+                          div()
+                            .flex_1()
+                            .min_w(0)
+                            .truncate()
+                            .text_size(10.5)
+                            .font_semibold()
+                            .text_color(t.blocked ?? t.muted)
+                            .child(tr(`External (${externalList.length})`, `项目外变更 (${externalList.length})`)),
+                        )
+                        .child(
+                          div()
+                            .id("chg-ext-clear-all")
+                            .flex_none()
+                            .px(4)
+                            .py(1)
+                            .rounded(4)
+                            .text_size(10)
+                            .text_color(t.dim)
+                            .cursor_pointer()
+                            .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                            .tooltip(tr("Clear external files", "清空项目外变更列表"))
+                            .on_click((_e, cx) => this.closeExternalPreview(cx, true))
+                            .child("×"),
+                        ),
+                    )
+                    .children(externalList.map((ext) => {
+                      const norm = String(ext.path ?? "").replace(/\\/g, "/");
+                      const idx = norm.lastIndexOf("/");
+                      const dir = idx >= 0 ? norm.slice(0, idx + 1) : "";
+                      const name = idx >= 0 ? norm.slice(idx + 1) : norm;
+                      const cCount = countByFile.get(ext.path) ?? 0;
+                      const active = !this.selectedCommit && this.selectedExternal?.path === ext.path;
+                      return h_flex()
+                        .id(`change-ext-${ext.path}`)
+                        .h(28)
+                        .flex_none()
+                        .px(8)
+                        .gap(6)
+                        .items_center()
+                        .rounded(7)
+                        .cursor_pointer()
+                        .tooltip(ext.path)
+                        .when(active, (x) => x.bg(t.selected))
+                        .hover((s) => s.bg(t.hover))
+                        .on_click((_e, cx) => this.pickExternal(ext, cx))
+                        .child(div().w(14).flex_none().text_size(11).text_color(ext.status === "A" ? t.ansi2 : t.blocked).child(ext.status || "M"))
+                        .child(
+                          h_flex()
+                            .flex_1()
+                            .min_w(0)
+                            .when(Boolean(dir), (x) => x.child(div().min_w(0).truncate().text_color(t.dim).child(dir)))
+                            .child(div().min_w(0).truncate().child(name)),
+                        )
+                        .when(cCount > 0, (x) =>
+                          x.child(
+                            div()
+                              .flex_none()
+                              .px(5)
+                              .py(1)
+                              .rounded(4)
+                              .bg(withAlpha(accent, "22") ?? t.raised)
+                              .text_size(10)
+                              .font_semibold()
+                              .text_color(accent)
+                              .child(String(cCount)),
+                          ),
+                        )
+                        .when(ext.add > 0, (x) => x.child(div().flex_none().text_size(11).text_color(t.ansi2).child(`+${ext.add}`)))
+                        .when(ext.del > 0, (x) => x.child(div().flex_none().text_size(11).text_color(t.ansi1).child(`−${ext.del}`)));
+                    })),
+                ),
+              )
+              .when(!this.files.length && !externalList.length, (e) => e.child(div().p(8).text_color(t.dim).whitespace_normal().child(this.error || (this.loading ? tr("Loading changes…", "正在加载变更…") : this.root ? tr("No uncommitted changes", "暂无未提交变更") : tr("No folder", "无工作目录"))))),
+          )
+          .child(Scrollbar.vertical("changes-list").absolute().inset_0()),
+      )
+      .when(this.limited, (el) => el.child(div().flex_none().px(10).py(4).text_size(11).text_color(t.dim).whitespace_normal().child(tr("Showing the first 1,000 changed files", "仅显示前 1,000 个变更文件"))));
+
+    const diffDetailPane = v_flex()
+      .id("changes-detail")
+      .size_full()
+      .min_w(0)
+      .min_h(0)
+      .when(Boolean(commitBannerEl), (el) => el.child(commitBannerEl))
+      .when(Boolean(externalBannerEl), (el) => el.child(externalBannerEl))
+      .when(!commitBannerEl && !externalBannerEl, (el) =>
+        el.child(
+          h_flex()
+            .id("chg-diff-toolbar")
+            .h(32)
+            .flex_none()
+            .w_full()
+            .min_w(0)
+            .px(10)
+            .gap(6)
+            .items_center()
+            .bg(t.raised)
+            .border_b(1)
+            .border_color(t.border)
+            .child(
+              div()
+                .flex_1()
+                .min_w(0)
+                .truncate()
+                .text_size(11.5)
+                .font_medium()
+                .text_color(this.open ? t.foreground : t.dim)
+                .when(Boolean(this.open), (e) => e.tooltip(this.open))
+                .child(this.open || tr("Diff", "变更详情")),
+            )
+            .when(Boolean(openFileRec?.add > 0), (e) => e.child(div().flex_none().text_size(10.5).text_color(t.ansi2).child(`+${openFileRec.add}`)))
+            .when(Boolean(openFileRec?.del > 0), (e) => e.child(div().flex_none().text_size(10.5).text_color(t.ansi1).child(`−${openFileRec.del}`)))
+            .child(this.renderDiffModeToggle(t, diffMode)),
+        ),
+      )
+      .when(diffMode === "split" && this.rows.length > 0, (el) =>
+        el.child(
+          h_flex()
+            .id("chg-split-header")
+            .h(22)
+            .flex_none()
+            .w_full()
+            .min_w(0)
+            .items_center()
+            .bg(t.surface ?? t.raised)
+            .border_b(1)
+            .border_color(t.border)
+            .child(div().flex_1().min_w(0).px(10).truncate().text_size(10.5).font_medium().text_color(t.muted).child(tr("Before", "修改前")))
+            .child(div().w(1).h_full().flex_none().bg(t.border))
+            .child(div().flex_1().min_w(0).px(10).truncate().text_size(10.5).font_medium().text_color(t.muted).child(tr("After", "修改后"))),
+        ),
+      )
+      .child(
+        div()
+          .flex_1()
+          .w_full()
+          .min_w(0)
+          .min_h(0)
+          .relative()
+          .overflow_hidden()
+          .font_family(settings().font_family ?? "JetBrains Mono")
+          .text_size(11)
+          .on_mouse_down("left", (e) => { this.lastShift = Boolean(e?.modifiers?.shift); })
+          .child(
+            list(
+              diffListId,
+              items.length,
+              (i) => items[i]?.key ?? String(i),
+              (i) => {
+                const item = items[i];
+                if (!item) return div().h(0);
+                if (item.type === "comment") return this.renderSavedComment(item, t);
+                if (item.type === "split") return this.renderSplitRow(item.srow, t, activeComposer, commentedSet);
+                return this.renderCodeRow(item.row, t, activeComposer, commentedSet);
+              },
+            ).on_item_click((itemKey, cx) => this.handleVirtualItemClick(itemKey, cx)).size_full(),
+          )
+          .child(Scrollbar.vertical(diffListId).viewport_from_layout().absolute().inset_0())
+          .when(this.commitLoading, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(tr("Loading commit diff…", "正在加载提交差异…"))))
+          .when(this.externalLoading, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(tr("Loading external diff…", "正在加载项目外变更…"))))
+          .when(!this.selectedCommit && !this.selectedExternal && !this.open && this.files.length > 0, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(tr("Select a file to view its changes", "选择一个文件以查看变更详情"))))
+          .when(!this.selectedCommit && !this.selectedExternal && !this.open && !this.files.length && this.gitLog.length > 0, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(tr("Select a commit below to inspect its diff", "点击下方最近提交可查看历史变更详情")))),
+      )
+      .when(Boolean(activeComposer), (e) => e.child(this.renderDockedComposer(activeComposer, t)))
+      .when(allDrafts.length > 0 || Boolean(this.reviewError), (e) => e.child(this.renderReviewBar(t, allDrafts)));
 
     return v_flex().id("changes").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13).track_focus(this.handle)
       .on_key_down((e, cx) => {
@@ -1496,6 +2360,9 @@ export default class Changes extends View {
           } else if (this.selectedCommit) {
             this.closeCommitPreview(cx);
             cx.stop_propagation();
+          } else if (this.selectedExternal) {
+            this.closeExternalPreview(cx);
+            cx.stop_propagation();
           } else if (this.typing) {
             this.typing = false;
             this.handle.focus();
@@ -1508,6 +2375,19 @@ export default class Changes extends View {
         h_flex().h(42).flex_none().px(12).gap(8).items_center().border_b(1).border_color(t.border)
           .child(div().font_semibold().child(tr("Changes", "变更")))
           .child(div().px(5).py(1).rounded(4).border_1().border_color(t.border).text_size(10).text_color(t.muted).child(tr(`${this.files.length} files`, `${this.files.length} 个文件`)))
+          .when(externalList.length > 0, (el) =>
+            el.child(
+              div()
+                .px(5)
+                .py(1)
+                .rounded(4)
+                .bg(withAlpha(t.blocked ?? "#f59e0b", "20") ?? t.raised)
+                .text_size(10)
+                .font_semibold()
+                .text_color(t.blocked ?? "#f59e0b")
+                .child(tr(`${externalList.length} external`, `${externalList.length} 项目外`)),
+            ),
+          )
           .when(allDrafts.length > 0, (el) =>
             el.child(
               div()
@@ -1526,71 +2406,23 @@ export default class Changes extends View {
           .child(div().text_size(11).text_color(t.ansi1).child(`−${del}`)),
       )
       .when(Boolean(gitInfoEl), (el) => el.child(gitInfoEl))
-      // overflow_y_scrollbar() wraps the list, so its flex sizing never reached the panel's layout.
-      .child(div().flex_1().min_h(44).max_h(listHeight).relative().border_b(1).border_color(t.border)
-        .child(
-          v_flex().id("changes-list").absolute().inset_0().overflow_y_scroll().p(6)
-            .children(this.files.map((f) => {
-              const parts = f.path.split("/"), name = parts.pop();
-              const cCount = countByFile.get(f.path) ?? 0;
-              return h_flex().id(`change-${f.path}`).h(28).flex_none().px(8).gap(8).items_center().rounded(7).cursor_pointer().when(!this.selectedCommit && this.open === f.path, (e) => e.bg(t.selected)).hover((s) => s.bg(t.hover)).on_click((_e, cx) => this.pick(f.path, cx))
-                .child(div().w(14).text_size(11).text_color(f.status === "A" ? t.ansi2 : f.status === "D" ? t.ansi1 : f.status === "U" ? t.ansi1 : t.blocked).child(f.status))
-                .child(h_flex().flex_1().min_w(0).child(div().text_color(t.dim).truncate().child(parts.length ? parts.join("/") + "/" : "")).child(div().max_w(260).min_w(0).truncate().child(name)))
-                .when(Boolean(f.staged), (e) =>
-                  e.child(
-                    div()
-                      .flex_none()
-                      .px(4)
-                      .py(1)
-                      .rounded(4)
-                      .bg(withAlpha(t.ansi2, "1c") ?? t.raised)
-                      .text_size(9.5)
-                      .text_color(t.ansi2)
-                      .tooltip(tr("Staged in index", "已暂存到暂存区"))
-                      .child(tr("staged", "暂存")),
-                  ),
-                )
-                .when(cCount > 0, (e) =>
-                  e.child(
-                    div()
-                      .px(5)
-                      .py(1)
-                      .rounded(4)
-                      .bg(withAlpha(accent, "22") ?? t.raised)
-                      .text_size(10)
-                      .font_semibold()
-                      .text_color(accent)
-                      .child(String(cCount)),
-                  ),
-                )
-                .when(f.add > 0, (e) => e.child(div().text_size(11).text_color(t.ansi2).child(`+${f.add}`))).when(f.del > 0, (e) => e.child(div().text_size(11).text_color(t.ansi1).child(`−${f.del}`)));
-            }))
-            .when(!this.files.length, (e) => e.child(div().p(8).text_color(t.dim).child(this.error || (this.loading ? tr("Loading changes…", "正在加载变更…") : this.root ? tr("No uncommitted changes", "暂无未提交变更") : tr("No folder", "无工作目录"))))),
-        )
-        .child(Scrollbar.vertical("changes-list").absolute().inset_0()))
-      .when(this.limited, (el) => el.child(div().px(12).py(4).text_size(11).text_color(t.dim).child(tr("Showing the first 1,000 changed files", "仅显示前 1,000 个变更文件"))))
-      .when(Boolean(commitBannerEl), (el) => el.child(commitBannerEl))
-      .child(div().flex_1().w_full().min_w(0).min_h(0).relative().overflow_hidden().font_family(settings().font_family ?? "JetBrains Mono").text_size(11)
-        .on_mouse_down("left", (e) => { this.lastShift = Boolean(e?.modifiers?.shift); })
-        .child(
-          list(
-            "changes-diff",
-            items.length,
-            (i) => items[i]?.key ?? String(i),
-            (i) => {
-              const item = items[i];
-              if (!item) return div().h(0);
-              if (item.type === "comment") return this.renderSavedComment(item, t);
-              return this.renderCodeRow(item.row, t, activeComposer, commentedSet);
-            },
-          ).on_item_click((itemKey, cx) => this.handleVirtualItemClick(itemKey, cx)).size_full(),
-        )
-        .child(Scrollbar.vertical("changes-diff").viewport_from_layout().absolute().inset_0())
-        .when(this.commitLoading, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(tr("Loading commit diff…", "正在加载提交差异…"))))
-        .when(!this.selectedCommit && !this.open && this.files.length > 0, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(tr("Select a file to view its changes", "选择一个文件以查看变更详情"))))
-        .when(!this.selectedCommit && !this.open && !this.files.length && this.gitLog.length > 0, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(tr("Select a commit below to inspect its diff", "点击下方最近提交可查看历史变更详情")))))
-      .when(Boolean(activeComposer), (e) => e.child(this.renderDockedComposer(activeComposer, t)))
-      .when(allDrafts.length > 0 || Boolean(this.reviewError), (e) => e.child(this.renderReviewBar(t, allDrafts)))
+      .child(
+        h_resizable("changes-split")
+          .flex_1()
+          .min_h(0)
+          .w_full()
+          .child(
+            resizable_panel()
+              .size(220)
+              .size_range(120, 480)
+              .child(fileListPane),
+          )
+          .child(
+            resizable_panel()
+              .size_range(160)
+              .child(diffDetailPane),
+          ),
+      )
       .when(Boolean(gitLogEl), (el) => el.child(gitLogEl))
       .when(Boolean(this.note), (e) => e.child(div().px(10).pb(8).text_size(11).text_color(t.ansi1).whitespace_normal().child(this.note)))
       .child(h_flex().flex_none().p(10).gap(6).items_center().border_t(1).border_color(t.border)

@@ -16,6 +16,135 @@ export function normalizePath(p) {
   return typeof p === "string" ? p.replace(/\\/g, "/").replace(/\/+$/, "") : "";
 }
 
+export function isAbsolutePath(p) {
+  return typeof p === "string" && /^(\/|~\/|[A-Za-z]:[\\/])/.test(p.trim());
+}
+
+export function parentDirectory(filePath) {
+  const norm = normalizePath(String(filePath ?? "").trim());
+  if (!norm) return "";
+  const idx = norm.lastIndexOf("/");
+  if (idx < 0) return "";
+  if (idx === 0) return "/";
+  const dir = norm.slice(0, idx);
+  return /^[A-Za-z]:$/.test(dir) ? `${dir}/` : dir;
+}
+
+/**
+ * Resolves a raw file path against a Git repository root.
+ * Returns `{ inside, relPath, absPath }` where `inside` is true only when the path
+ * is located beneath `repoRoot` (or was already a relative repo path).
+ */
+export function resolvePathAgainstRoot(rawPath, repoRoot) {
+  const raw = String(rawPath ?? "").trim();
+  if (!raw) return { inside: false, relPath: null, absPath: "" };
+  const normRoot = normalizePath(repoRoot);
+  if (!isAbsolutePath(raw)) {
+    const cleanRel = raw.replace(/\\/g, "/").replace(/^\.\//, "");
+    return {
+      inside: Boolean(normRoot),
+      relPath: cleanRel,
+      absPath: normRoot ? `${normRoot}/${cleanRel}` : cleanRel,
+    };
+  }
+  const normTarget = normalizePath(raw);
+  if (normRoot && normTarget.startsWith(`${normRoot}/`)) {
+    return {
+      inside: true,
+      relPath: normTarget.slice(normRoot.length + 1),
+      absPath: normTarget,
+    };
+  }
+  return {
+    inside: false,
+    relPath: null,
+    absPath: normTarget,
+  };
+}
+
+/**
+ * Converts a recorded ACP/PTY tool-call diff patch (unified diff, proto.rs
+ * `--- path / +++ path` hunks without `@@`, or `*** Update/Add File` patches)
+ * into lines compatible with `diffRows()` and `annotateDiffRows()`.
+ */
+export function parseToolPatchLines(patch) {
+  const raw = String(patch ?? "").replace(/\r\n/g, "\n").trim();
+  if (!raw) return [];
+  const srcLines = raw.split("\n");
+
+  // 1) Standard unified diff containing `@@` hunk headers.
+  if (srcLines.some((l) => /^@@ -\d+/.test(l))) {
+    const out = [];
+    let inHunk = false;
+    for (const line of srcLines) {
+      if (line.startsWith("diff --git ") || line.startsWith("index ") || line.startsWith("--- ") || line.startsWith("+++ ") || line.startsWith("*** ")) {
+        inHunk = false;
+        continue;
+      }
+      if (line.startsWith("@@")) {
+        inHunk = true;
+        out.push(line);
+        continue;
+      }
+      if (inHunk) out.push(line);
+    }
+    return out;
+  }
+
+  // 2) Hunkless diff blocks (`--- path\n+++ path\n- ...\n+ ...` or `*** Update/Add File:`).
+  const blocks = [];
+  let cur = [];
+  const flushBlock = () => {
+    if (cur.length > 0) {
+      blocks.push(cur);
+      cur = [];
+    }
+  };
+
+  for (let i = 0; i < srcLines.length; i++) {
+    const line = srcLines[i];
+    if (line.startsWith("--- ") && i + 1 < srcLines.length && srcLines[i + 1].startsWith("+++ ")) {
+      flushBlock();
+      i += 1;
+      continue;
+    }
+    if (/^\*\*\*\s+(?:Begin Patch|End Patch|(?:Update|Add|Delete)\s+File:)/.test(line)) {
+      flushBlock();
+      continue;
+    }
+    if (line.startsWith("+") || line.startsWith("-") || line.startsWith(" ")) {
+      cur.push(line);
+    }
+  }
+  flushBlock();
+
+  if (blocks.length === 0) return [];
+
+  const out = [];
+  blocks.forEach((block, idx) => {
+    const changeLines = block.filter((l) => l.startsWith("+") || l.startsWith("-"));
+    // proto.rs prefixes each line with "\n- " / "\n+ "; strip that separator space uniformly when present.
+    const spacedProto =
+      changeLines.length > 0 &&
+      changeLines.every((l) => l.length === 1 || l[1] === " ");
+    const normalized = block.map((l) => {
+      if ((l.startsWith("+") || l.startsWith("-")) && spacedProto && l.length > 1) {
+        return l[0] + l.slice(2);
+      }
+      return l;
+    });
+    const oldCount = normalized.filter((l) => l.startsWith("-") || l.startsWith(" ")).length;
+    const newCount = normalized.filter((l) => l.startsWith("+") || l.startsWith(" ")).length;
+    const oldStart = oldCount > 0 ? 1 : 0;
+    const newStart = newCount > 0 ? 1 : 0;
+    const label = blocks.length > 1 ? ` Edit #${idx + 1}` : "";
+    out.push(`@@ -${oldStart},${oldCount} +${newStart},${newCount} @@${label}`);
+    out.push(...normalized);
+  });
+
+  return out;
+}
+
 export function formatLineTag(comment) {
   const start = Number(comment?.start_line) || 1;
   const end = Math.max(start, Number(comment?.end_line) || start);
@@ -309,6 +438,121 @@ export function buildDisplayItems(annotatedRows, visibleComments, activeComposer
   }
 
   return { items, sizes };
+}
+
+/**
+ * Converts annotated unified diff rows into side-by-side (before/after) rows.
+ * Consecutive '-' and '+' lines within a hunk are paired index-by-index so
+ * modifications align horizontally, with null slots for pure additions/deletions.
+ */
+export function buildSplitDiffRows(annotatedRows) {
+  const out = [];
+  let i = 0;
+  const n = annotatedRows?.length ?? 0;
+
+  while (i < n) {
+    const row = annotatedRows[i];
+    if (!row) {
+      i += 1;
+      continue;
+    }
+    if (row.isFileHeader) {
+      out.push({ kind: "file", key: `sf-${row.rowIndex}`, row, primaryRowIdx: row.rowIndex });
+      i += 1;
+      continue;
+    }
+    if (row.kind === "@") {
+      out.push({ kind: "hunk", key: `sh-${row.rowIndex}`, row, primaryRowIdx: row.rowIndex });
+      i += 1;
+      continue;
+    }
+    if (row.kind === " ") {
+      out.push({
+        kind: "pair",
+        key: `s-${row.rowIndex}`,
+        left: row,
+        right: row,
+        primaryRowIdx: row.rowIndex,
+      });
+      i += 1;
+      continue;
+    }
+    if (row.kind === "-" || row.kind === "+") {
+      const removed = [];
+      const added = [];
+      while (i < n && annotatedRows[i]?.kind === "-") {
+        removed.push(annotatedRows[i]);
+        i += 1;
+      }
+      while (i < n && annotatedRows[i]?.kind === "+") {
+        added.push(annotatedRows[i]);
+        i += 1;
+      }
+      const count = Math.max(removed.length, added.length);
+      for (let k = 0; k < count; k += 1) {
+        const left = removed[k] ?? null;
+        const right = added[k] ?? null;
+        const primary = right ?? left;
+        out.push({
+          kind: "pair",
+          key: `s-${primary.rowIndex}`,
+          left,
+          right,
+          primaryRowIdx: primary.rowIndex,
+        });
+      }
+      continue;
+    }
+    out.push({ kind: "meta", key: `sm-${row.rowIndex}`, row, primaryRowIdx: row.rowIndex });
+    i += 1;
+  }
+  return out;
+}
+
+/**
+ * Flattens side-by-side split rows and saved inline comments into display-only list items.
+ */
+export function buildSplitDisplayItems(annotatedRows, visibleComments, activeComposer) {
+  const splitRows = buildSplitDiffRows(annotatedRows);
+  const byRow = new Map();
+  const orphaned = [];
+  for (const c of visibleComments ?? []) {
+    const anchor = matchCommentRowIndex(annotatedRows, c);
+    if (anchor >= 0) {
+      if (!byRow.has(anchor)) byRow.set(anchor, []);
+      byRow.get(anchor).push(c);
+    } else {
+      orphaned.push(c);
+    }
+  }
+
+  const items = [];
+  for (const srow of splitRows) {
+    items.push({ type: "split", key: srow.key, srow });
+
+    const seenIds = new Set();
+    const attachIdxList = srow.kind === "pair"
+      ? [srow.left?.rowIndex, srow.right?.rowIndex]
+      : [srow.primaryRowIdx];
+    for (const idx of attachIdxList) {
+      if (idx == null) continue;
+      const attached = byRow.get(idx);
+      if (!attached) continue;
+      for (const comment of attached) {
+        if (seenIds.has(comment.id)) continue;
+        seenIds.add(comment.id);
+        const editing = Boolean(activeComposer?.editingId && activeComposer.editingId === comment.id);
+        items.push({ type: "comment", key: `c-${comment.id}`, comment, outdated: false, editing });
+      }
+    }
+  }
+
+  for (const comment of orphaned) {
+    const editing = Boolean(activeComposer?.editingId && activeComposer.editingId === comment.id);
+    items.push({ type: "comment", key: `c-orphan-${comment.id}`, comment, outdated: true, editing });
+  }
+
+  return { items };
 }
 
 function machineOfAddress(addr) {

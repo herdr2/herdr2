@@ -36,6 +36,7 @@ pub enum PoolSignal {
     },
     UsageUpdated {
         worker_id: String,
+        turn_num: Option<u64>,
         usage: Option<AcpContextUsage>,
         detail: Option<AcpUsageDetail>,
     },
@@ -116,18 +117,42 @@ pub async fn run_signal_loop(core: Arc<Core>, mut rx: mpsc::UnboundedReceiver<Po
     }
 }
 
+fn resolve_signal_attempt_id(
+    drove: &super::DroveRuntime,
+    worker_id: &str,
+    worker: Option<&Worker>,
+    turn_num: Option<u64>,
+) -> Option<String> {
+    let cur = worker.and_then(|w| w.current_attempt_id.clone());
+    if let (Some(cur_id), Some(tn)) = (cur.as_deref(), turn_num) {
+        let min_turn = drove.get_attempt_min_turn(cur_id);
+        if min_turn > 0 && tn < min_turn {
+            return drove.get_worker_prev_attempt(worker_id);
+        }
+    }
+    cur.or_else(|| drove.get_worker_last_attempt(worker_id))
+}
+
 async fn handle_signal(core: &Arc<Core>, pending: &mut HashMap<String, PendingTextChunk>, sig: PoolSignal) {
     match sig {
         PoolSignal::Transcript { worker_id, entry } => {
             let worker_snap = core.drove.store.get_worker(&worker_id);
-            let attempt_id = worker_snap.as_ref().and_then(|w| w.current_attempt_id.clone());
+            let attempt_id = resolve_signal_attempt_id(&core.drove, &worker_id, worker_snap.as_ref(), entry.turn());
             core.drove.store.touch_worker_active(&worker_id);
 
             match entry {
                 Entry::Assistant { text, .. } if !text.is_empty() => {
+                    if let Some(ref aid) = attempt_id {
+                        let est_delta = (text.len() as u64).div_ceil(4);
+                        core.drove.add_attempt_estimated_output(aid, est_delta);
+                    }
                     enqueue_text_chunk(core, pending, &worker_id, attempt_id, "assistant", text);
                 }
                 Entry::Thought { text, .. } if !text.is_empty() => {
+                    if let Some(ref aid) = attempt_id {
+                        let est_delta = (text.len() as u64).div_ceil(4);
+                        core.drove.add_attempt_estimated_output(aid, est_delta);
+                    }
                     enqueue_text_chunk(core, pending, &worker_id, attempt_id, "thought", text);
                 }
                 other => {
@@ -145,12 +170,12 @@ async fn handle_signal(core: &Arc<Core>, pending: &mut HashMap<String, PendingTe
                 }
             }
         }
-        PoolSignal::UsageUpdated { worker_id, usage, detail } => {
-            apply_worker_usage(core, &worker_id, usage, detail);
+        PoolSignal::UsageUpdated { worker_id, turn_num, usage, detail } => {
+            apply_worker_usage(core, &worker_id, turn_num, usage, detail);
         }
         PoolSignal::TurnFinished { worker_id, agent_id, turn_num, error, usage, detail } => {
             flush_worker_chunk(core, pending, &worker_id);
-            apply_worker_usage(core, &worker_id, usage, detail);
+            apply_worker_usage(core, &worker_id, Some(turn_num), usage, detail);
             let Some(worker) = core.drove.store.get_worker(&worker_id) else {
                 return;
             };
@@ -342,6 +367,7 @@ fn enqueue_text_chunk(
 fn apply_worker_usage(
     core: &Core,
     worker_id: &str,
+    turn_num: Option<u64>,
     usage: Option<AcpContextUsage>,
     detail: Option<AcpUsageDetail>,
 ) {
@@ -350,9 +376,15 @@ fn apply_worker_usage(
         return;
     };
 
-    let explicit_input = detail.map_or(0, |d| d.input);
-    let explicit_output = detail.map_or(0, |d| d.output);
-    let explicit_cache = detail.map_or(0, |d| d.cache_read);
+    let raw_input = detail.map_or(0, |d| d.input);
+    let raw_output = detail.map_or(0, |d| d.output);
+    let raw_cache = detail.map_or(0, |d| d.cache_read);
+    let has_raw_explicit = raw_input > 0 || raw_output > 0 || raw_cache > 0;
+    let (explicit_input, explicit_output, explicit_cache) = if has_raw_explicit {
+        core.drove.advance_worker_explicit_usage_watermark(worker_id, raw_input, raw_output, raw_cache)
+    } else {
+        (0, 0, 0)
+    };
     let has_explicit_tokens = explicit_input > 0 || explicit_output > 0 || explicit_cache > 0;
     let delta_cost = detail.and_then(|d| d.cost).filter(|c| c.is_finite() && *c > 0.0);
 
@@ -360,35 +392,48 @@ fn apply_worker_usage(
         .map(|u| core.drove.advance_worker_usage_watermark(worker_id, u.used))
         .unwrap_or(0);
 
-    let target_attempt_id = worker
-        .current_attempt_id
-        .clone()
-        .or_else(|| core.drove.get_worker_last_attempt(worker_id));
+    let target_attempt_id = resolve_signal_attempt_id(&core.drove, worker_id, Some(&worker), turn_num);
+    let est_out_total = target_attempt_id
+        .as_deref()
+        .map(|aid| core.drove.add_attempt_estimated_output(aid, 0))
+        .unwrap_or(0);
 
     let mut attempt_changed = false;
     if let Some(att_id) = target_attempt_id
-        && (has_explicit_tokens || ctx_delta > 0 || delta_cost.is_some())
+        && (has_explicit_tokens || ctx_delta > 0 || delta_cost.is_some() || est_out_total > 0)
     {
         if core
             .drove
             .store
             .update_attempt(&att_id, |a| {
+                let was_estimated = a.estimated.as_ref().and_then(|e| e.tokens) == Some(true);
                 if has_explicit_tokens {
-                    a.tokens.input = a.tokens.input.saturating_add(explicit_input);
-                    a.tokens.output = a.tokens.output.saturating_add(explicit_output);
-                    a.tokens.cache_read = a.tokens.cache_read.saturating_add(explicit_cache);
+                    if was_estimated {
+                        // Replace rough estimated counters cleanly when exact ACP usage arrives.
+                        a.tokens.input = explicit_input;
+                        a.tokens.output = explicit_output;
+                        a.tokens.cache_read = explicit_cache;
+                    } else {
+                        a.tokens.input = a.tokens.input.saturating_add(explicit_input);
+                        a.tokens.output = a.tokens.output.saturating_add(explicit_output);
+                        a.tokens.cache_read = a.tokens.cache_read.saturating_add(explicit_cache);
+                    }
                     if let Some(est) = a.estimated.as_mut() {
                         est.tokens = None;
                         if est.cost.is_none() {
                             a.estimated = None;
                         }
                     }
-                } else if ctx_delta > 0 {
+                } else if ctx_delta > 0 || (est_out_total > a.tokens.output && (was_estimated || a.tokens.output == 0)) {
                     let had_exact =
-                        (a.tokens.input > 0 || a.tokens.output > 0 || a.tokens.cache_read > 0)
-                            && a.estimated.as_ref().and_then(|e| e.tokens) != Some(true);
+                        (a.tokens.input > 0 || a.tokens.output > 0 || a.tokens.cache_read > 0) && !was_estimated;
                     if !had_exact {
-                        a.tokens.input = a.tokens.input.saturating_add(ctx_delta);
+                        if ctx_delta > 0 {
+                            a.tokens.input = a.tokens.input.saturating_add(ctx_delta);
+                        }
+                        if est_out_total > a.tokens.output {
+                            a.tokens.output = est_out_total;
+                        }
                         let est = a.estimated.get_or_insert_with(UsageEstimate::default);
                         est.tokens = Some(true);
                     }
@@ -578,6 +623,21 @@ pub async fn dispatch_agent_task(
         patch.insert("drove.display".into(), Some(display.clone()));
         update_agent_display(core, aid, display, patch);
 
+        // Record the minimum ACP turn number BEFORE binding `current_attempt_id` on the worker so
+        // any trailing `Transcript` / `UsageUpdated` / `TurnFinished` frames from the prior attempt's
+        // turn are never misattributed to this new attempt.
+        let min_turn = {
+            let st = core.lock();
+            let base = st.reg.agents.get(&aid).map_or(0, |a| {
+                let in_flight = u64::from(a.status.as_ref().is_some_and(|s| s.state == "working"));
+                a.turn + in_flight
+            });
+            let queued = st.inboxes.get(&aid).map_or(0, |q| q.len() as u64);
+            base + queued + 1
+        };
+        core.drove.set_attempt_min_turn(&attempt_id, min_turn);
+        core.drove.set_worker_last_attempt(&warm.id, &attempt_id);
+
         let now = now_iso();
         warm.state = WorkerState::Busy;
         warm.cwd = effective_cwd.clone();
@@ -600,7 +660,6 @@ pub async fn dispatch_agent_task(
 
         let attempt = build_attempt_record(&attempt_id, run, task, &warm.id, &decision, true, retry_of, hint.clone());
         core.drove.store.insert_attempt(attempt.clone());
-        core.drove.set_worker_last_attempt(&warm.id, &attempt_id);
         core.drove.record_attempt_baseline(&attempt_id, baseline);
         let preserved_source = next_assign_source(task);
         core.drove.store.update_task(&task.id, |t| {
@@ -629,18 +688,6 @@ pub async fn dispatch_agent_task(
             hint.as_deref(),
             prior_handover.as_ref(),
         );
-        // Record the minimum ACP turn number that belongs to this new attempt BEFORE enqueuing
-        // so any trailing `TurnFinished` from the prior attempt's turn is ignored.
-        let min_turn = {
-            let st = core.lock();
-            let base = st.reg.agents.get(&aid).map_or(0, |a| {
-                let in_flight = u64::from(a.status.as_ref().is_some_and(|s| s.state == "working"));
-                a.turn + in_flight
-            });
-            let queued = st.inboxes.get(&aid).map_or(0, |q| q.len() as u64);
-            base + queued + 1
-        };
-        core.drove.set_attempt_min_turn(&attempt_id, min_turn);
         if let Err(e) = core.send(aid, &prompt, false, None, Some("drove")).await {
             let err_msg = e.message;
             mark_worker_idle(core, &warm.id);
@@ -1646,7 +1693,20 @@ fn record_transcript_item(core: &Core, worker_id: &str, attempt_id: Option<Strin
         Entry::Thought { text, .. } if !text.is_empty() => {
             core.drove.store.append_item(worker_id, attempt_id, "thought", Some(text), None, None);
         }
-        Entry::ToolCall { id, title, tool_kind, status, .. } => {
+        Entry::ToolCall { id, title, tool_kind, status, detail, .. } => {
+            let clean_title = title.trim();
+            let clean_status = status.trim();
+            // Skip empty-shell streaming `tool_call_update` chunks (e.g. Codex stdout stream frames
+            // carrying only `toolCallId` with empty `title` and `status`) so `inspect.lastItems` is
+            // never flooded with meaningless duplicates.
+            if clean_title.is_empty() && clean_status.is_empty() {
+                return;
+            }
+            let output = detail
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.chars().take(512).collect::<String>());
             core.drove.store.append_item(
                 worker_id,
                 attempt_id,
@@ -1654,12 +1714,12 @@ fn record_transcript_item(core: &Core, worker_id: &str, attempt_id: Option<Strin
                 None,
                 Some(ItemTool {
                     id,
-                    title: Some(title),
+                    title: (!clean_title.is_empty()).then(|| clean_title.to_string()),
                     kind: tool_kind,
-                    status: Some(status),
+                    status: (!clean_status.is_empty()).then(|| clean_status.to_string()),
                     locations: None,
                     input: None,
-                    output: None,
+                    output,
                 }),
                 None,
             );
@@ -1879,5 +1939,48 @@ mod tests {
         assert_eq!(drove.advance_worker_usage_watermark("wrk_1", 25_000), 15_000);
         // Compaction / session reset drops used tokens below watermark: count new usage cleanly.
         assert_eq!(drove.advance_worker_usage_watermark("wrk_1", 4_000), 4_000);
+
+        // Explicit (input, output, cache_read) usage watermark returns only incremental per-attempt deltas.
+        assert_eq!(drove.advance_worker_explicit_usage_watermark("wrk_1", 1000, 200, 500), (1000, 200, 500));
+        assert_eq!(drove.advance_worker_explicit_usage_watermark("wrk_1", 1600, 350, 900), (600, 150, 400));
+        assert_eq!(drove.advance_worker_explicit_usage_watermark("wrk_1", 1600, 350, 900), (0, 0, 0));
+
+        // Cross-attempt attribution routes stale pre-min_turn frames back to previous attempt.
+        drove.set_worker_last_attempt("wrk_1", "att_1");
+        drove.set_worker_last_attempt("wrk_1", "att_2");
+        drove.set_attempt_min_turn("att_2", 3);
+        let worker = Worker {
+            id: "wrk_1".into(),
+            run_id: "run_1".into(),
+            agent: "agy".into(),
+            model: None,
+            context_window: None,
+            effort: None,
+            fast: None,
+            session_key: "run_1:wrk_1".into(),
+            h2_agent: Some("a1".into()),
+            cwd: "/tmp".into(),
+            worktree: None,
+            state: WorkerState::Busy,
+            current_attempt_id: Some("att_2".into()),
+            pid: None,
+            fingerprint: Fingerprint::default(),
+            context: WorkerContext::default(),
+            totals: WorkerTotals::default(),
+            created_at: now_iso(),
+            last_active_at: now_iso(),
+            role: Some("coder".into()),
+            forked_from: None,
+            protocol_gen: Some(1),
+            read_only_dir: None,
+        };
+        assert_eq!(resolve_signal_attempt_id(&drove, "wrk_1", Some(&worker), Some(2)).as_deref(), Some("att_1"));
+        assert_eq!(resolve_signal_attempt_id(&drove, "wrk_1", Some(&worker), Some(3)).as_deref(), Some("att_2"));
+
+        // Estimated output tokens accumulate and clear cleanly.
+        assert_eq!(drove.add_attempt_estimated_output("att_2", 120), 120);
+        assert_eq!(drove.add_attempt_estimated_output("att_2", 80), 200);
+        drove.clear_loop_watermark("att_2");
+        assert_eq!(drove.add_attempt_estimated_output("att_2", 10), 10);
     }
 }

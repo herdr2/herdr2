@@ -233,7 +233,12 @@ export default class Agents extends View {
     this.localGroupOrder = {};
     this.listFocus = cx?.focus_handle?.();
     cx.timer.every(1000, (tcx) => {
-      if (agents().some((a) => a.status === "working")) tcx.notify();
+      if (
+        agents().some((a) => a.status === "working") ||
+        terminals().some((rec) => rec.state === "live" && (rec.manual_status ?? rec.status) === "working")
+      ) {
+        tcx.notify();
+      }
     });
     cx.timer.every(30000, (cx) => cx.notify());
   }
@@ -1655,12 +1660,13 @@ export default class Agents extends View {
     });
   }
 
-  subRow(t, s, focusedSet, compact) {
+  subRow(t, s, focusedSet, compact, now = Date.now(), isFloating = false) {
     const k = s.t;
     const isAcp = Boolean(k.acp);
     const isSideChat = String(k.lineage?.kind || "").toLowerCase().replace("_", "-") === "side-chat";
     const pane = this.paneByAddr?.get(k.address) ?? null;
     const paneObj = this.paneObjByAddr?.get(k.address) ?? null;
+    const agObj = this.agentByAddr?.get(k.address) ?? null;
     const canFocusPane = !isSideChat && (Boolean(pane) || (!isAcp && this.listed.has(k.address)));
     const st = kidStatus(k, this.listed);
     const pic = icon(k.program, 14, t.foreground);
@@ -1671,14 +1677,24 @@ export default class Agents extends View {
     const subShortId = shortAgentId(k.address);
     const showSubId = Boolean(subShortId) && subLabel !== subShortId && subLabel !== k.address;
     const mono = (typeof settings === "function" ? settings()?.font_family : null) ?? "JetBrains Mono";
+    const subElapsed = this.agentElapsed(
+      k.address,
+      st,
+      agObj?.working_since ?? paneObj?.working_since ?? k.working_since,
+      agObj?.work_ms ?? paneObj?.work_ms ?? k.work_ms,
+      agObj?.total_work_ms ?? paneObj?.total_work_ms ?? k.total_work_ms ?? 0,
+      now,
+    );
     const subHoverTip = buildHoverTooltip({ ...k, status: st }, k, {
       isZh: isZh(),
-      now: Date.now(),
+      now,
       since: this.since(k),
+      elapsedMs: subElapsed.ms,
       displayLabel: subLabel,
     });
+    const showSubHoverRemove = !isFloating && this.hoveredSub === k.address;
     return h_flex()
-      .id(`sub-${k.address}`)
+      .id(isFloating ? `float-sub-${k.address}` : `sub-${k.address}`)
       .pl(39)
       .pr(8)
       .rounded(8)
@@ -1792,7 +1808,7 @@ export default class Agents extends View {
           .text_color(t.dim)
           .child(isAcp ? "ACP" : "CLI"),
       )
-      .when(this.hoveredSub === k.address, (el) =>
+      .when(showSubHoverRemove, (el) =>
         el.child(
           div()
             .id(`rm-sub-${k.address}`)
@@ -1811,6 +1827,18 @@ export default class Agents extends View {
               cx.notify();
             })
             .child(svg("mods/pane/close.svg").size(11)),
+        ),
+      )
+      .when(!showSubHoverRemove, (el) =>
+        el.child(
+          div()
+            .id(isFloating ? `float-sub-time-${k.address}` : `sub-time-${k.address}`)
+            .flex_none()
+            .mr(4)
+            .text_size(11)
+            .text_color(subElapsed.working ? (t.working ?? t.accent ?? t.foreground) : (subElapsed.ran ? t.muted : t.dim))
+            .when(!isFloating, (tipEl) => tipEl.tooltip(elapsedTooltip(subElapsed)))
+            .child(formatElapsed(subElapsed.ms)),
         ),
       )
       .child(this.statusButton(t, k.address, {
@@ -1849,6 +1877,7 @@ export default class Agents extends View {
     const sort = sortOf();
     let list = agents();
     this.listed = new Map(list.map((a) => [a.address, a.status]));
+    this.agentByAddr = new Map(list.map((a) => [a.address, a]));
     const all = terminals();
     this.migratePins(all);
     // Read the pane snapshot once: every host read copies the whole list into JS.
@@ -1939,7 +1968,7 @@ export default class Agents extends View {
       const subs = subsByAddr.get(a.address) ?? [];
       const r = row(a, i, subs);
       if (this.folded.has(a.address)) return [r];
-      return [r, ...subs.map((s) => this.subRow(t, s, focusedAddrs, byPriority))];
+      return [r, ...subs.map((s) => this.subRow(t, s, focusedAddrs, byPriority, now))];
     };
 
     // The fold chevron; folded, the count too, colored by the most urgent one.
@@ -2435,7 +2464,7 @@ export default class Agents extends View {
             }
           })
           .child(row(a, mi, subs, { group: g, memberIdx: mi, isFloating: false }))
-          .children(visibleSubs.map((s) => this.subRow(t, s, focusedAddrs, byPriority)));
+          .children(visibleSubs.map((s) => this.subRow(t, s, focusedAddrs, byPriority, now)));
       });
 
       let floatCard = null;
@@ -2457,7 +2486,7 @@ export default class Agents extends View {
           .shadow_lg()
           .cursor_grabbing()
           .child(row(groupMotion.member, groupMotion.from, subsByAddr.get(groupMotion.id) ?? groupMotion.subs ?? [], { isFloating: true }))
-          .children(floatSubs.map((s) => this.subRow(t, s, focusedAddrs, byPriority)));
+          .children(floatSubs.map((s) => this.subRow(t, s, focusedAddrs, byPriority, now, true)));
       }
 
       return v_flex()

@@ -295,6 +295,9 @@ fn module(mut values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> Hos
                 "hc" | "h2" if first == json!(["machine", "ls", "--json"]) => {
                     Some(json!({"code":0,"stdout":"{\"machines\":[{\"name\":\"remote\",\"state\":\"online\"}]}","stderr":""}))
                 }
+                "hc" | "h2" if first == json!(["ai", "status", "--json"]) => {
+                    Some(json!({"code":0,"stdout":"{\"configured\":true,\"enabled\":true,\"model\":\"gpt-5.4\",\"baseUrl\":\"https://api.example.com/v1\"}","stderr":""}))
+                }
                 "hc" | "h2" if first == json!(["machine", "add", "host", "--json"]) => {
                     Some(json!({"code":1,"stdout":"{\"error\":{\"kind\":\"host_key\",\"message\":\"unknown host key\"}}","stderr":""}))
                 }
@@ -1501,9 +1504,27 @@ fn local_state_and_overlay_initial_descriptions(cx: &mut TestAppContext) {
             Some(&format!("this.page = {page};")),
         )
         .unwrap();
-        let expected = ["Herdr runs your terminals in the background", "Add your other machines", "Choose your panels", "Make it yours"][page - 1];
+        let expected = [
+            "Terminals and agents that stay alive in the background",
+            "Choose your panels",
+            "Core AI & other machines",
+            "Make it yours & h2 CLI",
+        ][page - 1];
         assert!(tree.contains(expected), "welcome page {page}: {tree}");
+        assert!(tree.contains("Welcome to Herdr2"), "welcome header on page {page}: {tree}");
     }
+    let zh_tree = describe(
+        cx,
+        &staged,
+        "frame/welcome",
+        true,
+        props(),
+        updates("current", "current"),
+        Some("this.languageOverride = 'zh-CN'; this.page = 1;"),
+    )
+    .unwrap();
+    assert!(zh_tree.contains("欢迎使用 Herdr2"), "welcome zh-CN header: {zh_tree}");
+    assert!(zh_tree.contains("真终端与无头智能体，关闭窗口也在后台运行"), "welcome zh-CN hero: {zh_tree}");
     for query in ["settings", "no-such-command"] {
         let tree = describe(
             cx,
@@ -2081,7 +2102,7 @@ fn brand_and_panel_buttons_render_by_default(cx: &mut TestAppContext) {
         .with_host_module(module(fixture(true, props(), updates("current", "current")), calls.clone()))
         .unwrap();
     let runtime = ShellRuntime::new_isolated().unwrap();
-    let root = staged.wrapper("frame/welcome", "this.page = 3;");
+    let root = staged.wrapper("frame/welcome", "this.page = 2;");
     let window = cx.add_window(|_, _| Empty);
     let welcome = window.update(cx, |_, window, cx| {
         let mut session = DescriptionSession::load(runtime, root, policy, window, cx).unwrap();
@@ -2092,7 +2113,7 @@ fn brand_and_panel_buttons_render_by_default(cx: &mut TestAppContext) {
     assert!(welcome.contains("Choose your panels"), "{welcome}");
     assert!(
         !calls.borrow().shared.contains_key("workspace.panels"),
-        "welcome page 3 must not reset workspace.panels to []"
+        "welcome panels step must not reset workspace.panels to []"
     );
 
     let settings = describe(cx, &staged, "frame/settings", true, json!({"section":"look"}), updates("current", "current"), None).unwrap();
@@ -3941,12 +3962,20 @@ fn files_changes_and_checkpoints_wrap_long_lines_to_narrow_panel_width(cx: &mut 
         }
     }
 
+    struct SplitRoot(gpui::Entity<gpui_shell::ShellRoot>);
+    impl gpui::Render for SplitRoot {
+        fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            div().w(px(520.)).h(px(520.)).child(self.0.clone())
+        }
+    }
+
     cx.update(gpui_shell::init);
     let staged = Staged::new();
     let long_token = "long_identifier_segment_without_breaks_".repeat(12);
 
-    // 1) Changes: a 400+ char diff line at row 1 must wrap past 50px tall in a 300px panel,
-    //    so clicking 45px below the start of row 1 still selects line 1 (not line 2).
+    // 1) Changes: side-by-side layout (left files ~220px | right diff ~300px).
+    //    A 400+ char diff line at row 1 must wrap past 50px tall in the right ~300px diff pane,
+    //    so clicking at x=360, y=150 (56px below start of row 1) still selects line 1 (not line 2).
     let changes_setup = format!(r#"
         this.viewKey = () => 'pinned-wrap-test';
         this.refresh = () => {{}};
@@ -3969,27 +3998,86 @@ fn files_changes_and_checkpoints_wrap_long_lines_to_narrow_panel_width(cx: &mut 
     );
     let rt_chg = ShellRuntime::new_isolated().unwrap();
     let chg_wrapped = staged.wrapper("mods/changes", &changes_setup);
-    let win_chg = cx.add_window(|window, cx| NarrowRoot(rt_chg.try_load(&chg_wrapped, window, cx).unwrap()));
+    let win_chg = cx.add_window(|window, cx| SplitRoot(rt_chg.try_load(&chg_wrapped, window, cx).unwrap()));
     let view_chg: gpui::Entity<gpui_shell::ScriptView> = win_chg
         .read_with(cx, |root, cx| root.0.read(cx).content().clone().downcast().unwrap())
         .unwrap();
     let mut vis_chg = VisualTestContext::from_window(win_chg.into(), cx);
     vis_chg.update(|window, cx| window.draw(cx).clear(cx));
     vis_chg.run_until_parked();
-    // Header(42) + file list(44) + hunk(20) = ~106px -> row 1 starts around y=106; clicking at y=160
-    // is >50px inside row 1, which ONLY hits line 1 if row 1 wrapped to >= 3 visual lines!
-    vis_chg.simulate_click(point(px(120.), px(160.)), Modifiers::default());
+    // Header(42) + diff toolbar(32) + hunk(20) = ~94px -> row 1 starts around y=94 in the right pane (x > 220);
+    // clicking at (360, 150) is ~56px inside row 1, which ONLY hits L1 if row 1 wrapped to >= 3 visual lines!
+    vis_chg.simulate_click(point(px(360.), px(150.)), Modifiers::default());
     vis_chg.run_until_parked();
     vis_chg.update(|window, cx| window.draw(cx).clear(cx));
     let chg_tree = vis_chg.update(|_, cx| {
         view_chg.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
     });
     assert!(
+        chg_tree.contains("h_resizable \"changes-split\""),
+        "Changes must use draggable h_resizable split layout: {chg_tree}"
+    );
+    assert!(
         chg_tree.contains("src/long.rs · L1\""),
-        "expected wrapped diff line 1 in Changes to span past y=160 (hitting L1, not L2): {chg_tree}"
+        "expected wrapped diff line 1 in Changes right pane to span past y=150 (hitting L1, not L2): {chg_tree}"
     );
     vis_chg.update(|window, _| window.remove_window());
     cx.run_until_parked();
+
+    // 1b) Changes in Split (side-by-side Before / After) diff mode: renders header & wrapped split list with zero errors.
+    let calls_split = Rc::new(RefCell::new(Calls::default()));
+    calls_split.borrow_mut().shared.insert("diff.viewMode".into(), json!("split"));
+    gpui_shell::policy::set_default(
+        Policy::new()
+            .with_storage_path(staged.0.join("store-wrap-changes-split.json"))
+            .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+            .with_host_module(module(fixture(true, json!({}), updates("current", "current")), calls_split.clone()))
+            .unwrap(),
+    );
+    let changes_split_setup = format!(r#"
+        this.viewKey = () => 'pinned-split-test';
+        this.refresh = () => {{}};
+        this.loading = false;
+        this.root = '/repo/demo';
+        this.on = null;
+        this.context = 'pinned-split-test';
+        this.files = [{{ path: 'src/long.rs', status: 'M', fresh: false, add: 2, del: 1 }}];
+        this.open = 'src/long.rs';
+        this.gitLogOpen = false;
+        this.setLines(['@@ -1,1 +1,2 @@', '-let old_s = "{long_token}";', '+let new_s = "{long_token}";', '+let short_line = 2;']);
+    "#);
+    let rt_split = ShellRuntime::new_isolated().unwrap();
+    let split_wrapped = staged.wrapper("mods/changes", &changes_split_setup);
+    let win_split = cx.add_window(|window, cx| SplitRoot(rt_split.try_load(&split_wrapped, window, cx).unwrap()));
+    let view_split: gpui::Entity<gpui_shell::ScriptView> = win_split
+        .read_with(cx, |root, cx| root.0.read(cx).content().clone().downcast().unwrap())
+        .unwrap();
+    let mut vis_split = VisualTestContext::from_window(win_split.into(), cx);
+    vis_split.update(|window, cx| window.draw(cx).clear(cx));
+    vis_split.run_until_parked();
+    let split_err = vis_split.update(|_, cx| view_split.read(cx).build_error().map(str::to_owned));
+    assert_eq!(split_err, None, "changes split diff layout pass must produce zero errors");
+    // Header(42) + toolbar(32) + split header(22) + hunk(20) = ~116px; clicking at (360, 175) hits wrapped pair row 1 (L1).
+    vis_split.simulate_click(point(px(360.), px(175.)), Modifiers::default());
+    vis_split.run_until_parked();
+    vis_split.update(|window, cx| window.draw(cx).clear(cx));
+    let split_tree = vis_split.update(|_, cx| {
+        view_split.read(cx).snapshot().map(gpui_shell::RenderSnapshot::debug_tree).unwrap_or_default()
+    });
+    assert!(split_tree.contains("chg-split-header"), "split mode must render Before/After header: {split_tree}");
+    assert!(split_tree.contains("list \"changes-diff-split\" ×3 :on_item_click"), "split mode must pair -/+ into 3 rows (hunk + 2 pairs): {split_tree}");
+    assert!(split_tree.contains("src/long.rs · L1\""), "clicking wrapped split row 1 must open composer on L1: {split_tree}");
+    vis_split.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+
+    // Restore unified mode for remaining wrapping checks.
+    gpui_shell::policy::set_default(
+        Policy::new()
+            .with_storage_path(staged.0.join("store-wrap-ckpt.json"))
+            .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+            .with_host_module(module(fixture(true, json!({}), updates("current", "current")), calls.clone()))
+            .unwrap(),
+    );
 
     // 2) Checkpoints: same real-layout wrapping proof in a 300px panel.
     let ckpt_setup = format!(r#"
@@ -4011,9 +4099,9 @@ fn files_changes_and_checkpoints_wrap_long_lines_to_narrow_panel_width(cx: &mut 
     let mut vis_ckpt = VisualTestContext::from_window(win_ckpt.into(), cx);
     vis_ckpt.update(|window, cx| window.draw(cx).clear(cx));
     vis_ckpt.run_until_parked();
-    // Header(42) + bisect bar(39) + checkpoints list(86) + file header(24) + hunk(20) = ~211px;
-    // clicking at y=270 is ~59px inside row 1, which ONLY hits L1 if row 1 wrapped!
-    vis_ckpt.simulate_click(point(px(120.), px(270.)), Modifiers::default());
+    // Header(42) + bisect bar(39) + checkpoints list(86) + diff toolbar(30) + file header(24) + hunk(20) = ~241px;
+    // clicking at y=300 is ~59px inside row 1, which ONLY hits L1 if row 1 wrapped!
+    vis_ckpt.simulate_click(point(px(120.), px(300.)), Modifiers::default());
     vis_ckpt.run_until_parked();
     vis_ckpt.update(|window, cx| window.draw(cx).clear(cx));
     let ckpt_tree = vis_ckpt.update(|_, cx| {
@@ -4561,6 +4649,235 @@ fn files_open_request_loads_external_path_and_peek_ctrl_clicks_files(cx: &mut Te
 }
 
 #[gpui::test]
+fn files_switching_between_cached_code_and_markdown_via_open_request_never_errors_in_render(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    {
+        let mut c = calls.borrow_mut();
+        c.files.insert(
+            "/tmp/switch-a.rs".into(),
+            "fn alpha() {}\nfn beta() {}\nfn gamma() {}\n".into(),
+        );
+        c.files.insert(
+            "/tmp/switch-b.md".into(),
+            "# Title\n\nBody paragraph.\n".into(),
+        );
+        c.files.insert(
+            "/tmp/switch-c.js".into(),
+            "export const ok = 42;\n".into(),
+        );
+        c.shared.insert(
+            "files.open_request".into(),
+            json!({ "seq": 1, "path": "/tmp/switch-a.rs", "line": 2, "end_line": 2 }),
+        );
+    }
+
+    let values = fixture(false, json!({}), updates("current", "current"));
+    let policy = Policy::new()
+        .with_storage_path(staged.0.join("store-files-switch.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(module(values, calls.clone()))
+        .unwrap();
+    let rt = ShellRuntime::new_isolated().unwrap();
+    let root = staged.wrapper("mods/files", "");
+    let w = cx.add_window(|_, _| Empty);
+
+    let mut session_slot = None;
+    w.update(cx, |_, window, cx| {
+        let mut session = DescriptionSession::load(rt, root, policy, window, cx).unwrap();
+        let _ = session.describe(window, cx).unwrap();
+        session_slot = Some(session);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let mut session = session_slot.unwrap();
+    let mut tree_a = String::new();
+    w.update(cx, |_, window, cx| {
+        tree_a = session.describe(window, cx).unwrap();
+    })
+    .unwrap();
+    assert!(tree_a.contains("switch-a.rs"), "initial file A missing: {tree_a}");
+
+    // Switch to Markdown file B (releases code EditorState).
+    calls.borrow_mut().shared.insert(
+        "files.open_request".into(),
+        json!({ "seq": 2, "path": "/tmp/switch-b.md" }),
+    );
+    w.update(cx, |_, window, cx| {
+        let _ = session.describe(window, cx).unwrap();
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let mut tree_b = String::new();
+    w.update(cx, |_, window, cx| {
+        tree_b = session.describe(window, cx).unwrap();
+    })
+    .unwrap();
+    assert!(tree_b.contains("switch-b.md"), "file B missing after switch: {tree_b}");
+
+    // Switch BACK to cached Rust file A with a line jump: previously threw
+    // `EditorState.new(...) cannot run during render` inside `render(cx)`.
+    calls.borrow_mut().shared.insert(
+        "files.open_request".into(),
+        json!({ "seq": 3, "path": "/tmp/switch-a.rs", "line": 3, "end_line": 3 }),
+    );
+    w.update(cx, |_, window, cx| {
+        let _ = session.describe(window, cx).unwrap();
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let mut tree_a2 = String::new();
+    w.update(cx, |_, window, cx| {
+        tree_a2 = session.describe(window, cx).unwrap();
+    })
+    .unwrap();
+    assert!(tree_a2.contains("switch-a.rs"), "cached file A missing after switch back: {tree_a2}");
+    assert!(!tree_a2.contains("Loading file"), "cached file A stuck loading: {tree_a2}");
+    assert!(!tree_a2.contains("Preparing editor"), "cached file A editor failed to build: {tree_a2}");
+
+    // Switch to JS file C (different language signature) and back to cached A.
+    calls.borrow_mut().shared.insert(
+        "files.open_request".into(),
+        json!({ "seq": 4, "path": "/tmp/switch-c.js" }),
+    );
+    w.update(cx, |_, window, cx| {
+        let _ = session.describe(window, cx).unwrap();
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let mut tree_c = String::new();
+    w.update(cx, |_, window, cx| {
+        tree_c = session.describe(window, cx).unwrap();
+        window.remove_window();
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(tree_c.contains("switch-c.js"), "file C missing after switch: {tree_c}");
+    assert!(!tree_c.contains("Loading file"), "file C stuck loading: {tree_c}");
+    assert!(!tree_c.contains("Preparing editor"), "file C editor failed to build: {tree_c}");
+}
+
+#[gpui::test]
+fn files_switching_agent_a_to_b_and_back_to_a_restores_open_file_without_hanging_on_loading(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    {
+        let mut c = calls.borrow_mut();
+        c.files.insert("/fixture/agent-a/src/app.rs".into(), "fn from_agent_a() {}\n".into());
+        c.files.insert("/fixture/agent-b/README.md".into(), "# Agent B\n".into());
+    }
+
+    // Dynamic host module so we can switch active space/focused agent between renders.
+    let active_agent = Rc::new(RefCell::new("a"));
+    let mut base = fixture(false, json!({}), updates("current", "current"));
+    let base_mod = module(base.clone(), calls.clone());
+    let _ = base_mod;
+    let a_flag = active_agent.clone();
+    let a_flag2 = active_agent.clone();
+    let a_flag3 = active_agent.clone();
+    let values_ref = Rc::new(RefCell::new(std::mem::take(&mut base)));
+    let make_dyn_module = {
+        let calls = calls.clone();
+        let values_ref = values_ref.clone();
+        move || {
+            let mut m = module(values_ref.borrow().clone(), calls.clone());
+            let f1 = a_flag.clone();
+            m = m.function("spaces", move |_| {
+                let is_a = *f1.borrow() == "a";
+                Ok(to_host(&json!([
+                    { "id": "sa", "name": "Agent A", "folder": "/fixture/agent-a", "machine": null, "active": is_a, "index": 0 },
+                    { "id": "sb", "name": "Agent B", "folder": "/fixture/agent-b", "machine": null, "active": !is_a, "index": 1 }
+                ])))
+            });
+            let f2 = a_flag2.clone();
+            m = m.function("panes", move |_| {
+                let is_a = *f2.borrow() == "a";
+                Ok(to_host(&json!([
+                    { "pane": "pa", "terminal": "ta", "cwd": "/fixture/agent-a", "focused": is_a },
+                    { "pane": "pb", "terminal": "tb", "cwd": "/fixture/agent-b", "focused": !is_a }
+                ])))
+            });
+            let f3 = a_flag3.clone();
+            m = m.function("focused", move |_| {
+                let is_a = *f3.borrow() == "a";
+                Ok(to_host(&if is_a {
+                    json!({ "pane": "pa", "terminal": "ta", "cwd": "/fixture/agent-a", "agent": "ta" })
+                } else {
+                    json!({ "pane": "pb", "terminal": "tb", "cwd": "/fixture/agent-b", "agent": "tb" })
+                }))
+            });
+            m
+        }
+    };
+
+    let policy = Policy::new()
+        .with_storage_path(staged.0.join("store-files-agent-switch.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(make_dyn_module())
+        .unwrap();
+    let rt = ShellRuntime::new_isolated().unwrap();
+    // Open `src/app.rs` in Agent A during init.
+    let root = staged.wrapper(
+        "mods/files",
+        r#"
+            this.show("src/app.rs", cx);
+        "#,
+    );
+    let w = cx.add_window(|_, _| Empty);
+
+    let mut session_slot = None;
+    w.update(cx, |_, window, cx| {
+        let mut session = DescriptionSession::load(rt, root, policy, window, cx).unwrap();
+        let _ = session.describe(window, cx).unwrap();
+        session_slot = Some(session);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    let mut session = session_slot.unwrap();
+    let mut tree_a1 = String::new();
+    w.update(cx, |_, window, cx| {
+        tree_a1 = session.describe(window, cx).unwrap();
+    })
+    .unwrap();
+    assert!(tree_a1.contains("app.rs"), "Agent A initial file missing: {tree_a1}");
+    assert!(!tree_a1.contains("Loading file"), "Agent A initial file stuck loading: {tree_a1}");
+
+    // Switch to Agent B.
+    *active_agent.borrow_mut() = "b";
+    w.update(cx, |_, window, cx| {
+        let _ = session.describe(window, cx).unwrap();
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    // Switch back to Agent A: previously `show(saved.file, cx)` ran inside render() and threw
+    // on `cx.notify()` after setting `loadingFile = true`, leaving "Loading file…" forever.
+    *active_agent.borrow_mut() = "a";
+    w.update(cx, |_, window, cx| {
+        let _ = session.describe(window, cx).unwrap();
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let mut tree_a2 = String::new();
+    w.update(cx, |_, window, cx| {
+        tree_a2 = session.describe(window, cx).unwrap();
+        window.remove_window();
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    assert!(tree_a2.contains("app.rs"), "Agent A restored file missing: {tree_a2}");
+    assert!(!tree_a2.contains("Loading file"), "Agent A restored file stuck on Loading file: {tree_a2}");
+    assert!(!tree_a2.contains("Preparing editor"), "Agent A restored editor failed to build: {tree_a2}");
+}
+
+#[gpui::test]
 fn catchup_briefing_semantic_naming_and_ai_switch_render_cleanly(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);
     let staged = Staged::new();
@@ -4920,12 +5237,24 @@ fn changes_renders_git_branch_status_and_recent_log_without_errors(cx: &mut Test
         this.open = 'src/api.rs';
         this.setLines(['@@ -1,2 +1,3 @@', '-old', '+new', '+more']);
     "#;
-    let tree = describe_with_values(
+    let tree_collapsed = describe_with_values(
         cx,
         &staged,
         "mods/changes",
         fixture(true, json!({}), updates("current", "current")),
         Some(setup),
+    ).unwrap();
+    assert!(tree_collapsed.contains("chg-git-log"), "collapsed recent git log bar must render: {tree_collapsed}");
+    assert!(tree_collapsed.contains("feat(pty): track CLI foreground"), "collapsed recent git log must preview latest commit subject: {tree_collapsed}");
+    assert!(!tree_collapsed.contains("chg-commit-0206eae"), "recent git log should default to collapsed: {tree_collapsed}");
+
+    let expanded_setup = format!("{setup}\nthis.gitLogOpen = true;");
+    let tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/changes",
+        fixture(true, json!({}), updates("current", "current")),
+        Some(&expanded_setup),
     ).unwrap();
     assert!(tree.contains("chg-git-info"), "git info bar must render: {tree}");
     assert!(tree.contains("feat/git-panel"), "branch name must render: {tree}");
@@ -4942,6 +5271,11 @@ fn changes_renders_git_branch_status_and_recent_log_without_errors(cx: &mut Test
     assert!(tree.contains("chg-commit-8962c59"), "first commit row must render: {tree}");
     assert!(tree.contains("chg-commit-0206eae"), "second commit row must render: {tree}");
     assert!(tree.contains("feat(pty): track CLI foreground"), "commit subject must render: {tree}");
+    // Verify chg-git-log renders full-width below changes-split, not inside narrow changes-sidebar.
+    let split_pos = tree.find("changes-split").expect("changes-split");
+    let detail_pos = tree.find("changes-detail").expect("changes-detail");
+    let log_pos = tree.find("chg-git-log").expect("chg-git-log");
+    assert!(log_pos > detail_pos && detail_pos > split_pos, "chg-git-log must render full-width below changes-split: {tree}");
 
     // 2) Commit preview mode + clean working tree + real GPUI draw().
     let preview_setup = r#"
@@ -5003,6 +5337,49 @@ fn changes_renders_git_branch_status_and_recent_log_without_errors(cx: &mut Test
     });
     assert_eq!(err.unwrap(), None, "changes git info + log + commit preview must draw with zero errors");
     visual.update(|window, _| window.remove_window());
+    cx.run_until_parked();
+
+    // Verify external (out-of-project) ACP changed files render cleanly in sidebar + detail pane + split mode.
+    let ext_setup = r#"
+        this.root = '/fixture/repo';
+        this.context = this.viewKey();
+        this.files = [];
+        this.externalFiles = [
+            { path: '/tmp/buildlink-audit-claude/harness.py', displayPath: '/tmp/buildlink-audit-claude/harness.py', on: null, add: 3, del: 1, status: 'M', sourceKind: 'agent-diff', terminal: 'a65', turn: 1 },
+            { path: '/tmp/buildlink-audit-claude/x0_smoke.py', displayPath: '/tmp/buildlink-audit-claude/x0_smoke.py', on: null, add: 15, del: 0, status: 'A', sourceKind: 'file-content', terminal: 'a65', turn: 1 },
+        ];
+        this.selectedExternal = this.externalFiles[0];
+        this.setLines(['@@ -1,1 +1,3 @@', '-old_line()', '+new_line()', '+extra_line()']);
+    "#;
+    let ext_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/changes",
+        fixture(true, json!({}), updates("current", "current")),
+        Some(ext_setup),
+    ).unwrap();
+    assert!(ext_tree.contains("changes-external-section"), "external files sidebar section must render: {ext_tree}");
+    assert!(ext_tree.contains("chg-ext-banner"), "external file preview banner must render: {ext_tree}");
+    assert!(ext_tree.contains("chg-ext-open-file"), "open in files button must render: {ext_tree}");
+    assert!(ext_tree.contains("chg-ext-close"), "external preview back button must render: {ext_tree}");
+    assert!(ext_tree.contains("/tmp/buildlink-audit-claude/harness.py"), "external path must be visible: {ext_tree}");
+
+    let rt_ext = ShellRuntime::new_isolated().unwrap();
+    let ext_wrapped = staged.wrapper("mods/changes", ext_setup);
+    let win_ext = cx.add_window(|window, cx| RootedView(rt_ext.try_load(&ext_wrapped, window, cx).unwrap()));
+    let mut visual_ext = VisualTestContext::from_window(win_ext.into(), cx);
+    visual_ext.update(|window, cx| window.draw(cx).clear(cx));
+    visual_ext.run_until_parked();
+    let ext_err = win_ext.read_with(cx, |r, cx| {
+        r.0.read(cx)
+            .content()
+            .clone()
+            .downcast::<gpui_shell::ScriptView>()
+            .ok()
+            .and_then(|v| v.read(cx).build_error().map(str::to_owned))
+    });
+    assert_eq!(ext_err.unwrap(), None, "changes external file diff must draw with zero errors");
+    visual_ext.update(|window, _| window.remove_window());
     cx.run_until_parked();
 }
 

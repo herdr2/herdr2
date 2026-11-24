@@ -628,6 +628,10 @@ pub struct Task {
     #[serde(default)]
     pub isolation: Isolation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_isolation: Option<Isolation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub isolation_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_sec: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stall_warn_sec: Option<u64>,
@@ -1021,6 +1025,14 @@ pub struct Diagnosis {
     pub last_items: Vec<Item>,
     #[serde(default)]
     pub files_modified: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub declared_files_modified: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub live_dirty_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_tokens: Option<TokenCounts>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_total_tokens: Option<u64>,
     pub git_status: String,
     pub suggestion: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -6,6 +6,8 @@ import {
   buildSelectionRange,
   extractSnippet,
   buildDisplayItems,
+  buildSplitDisplayItems,
+  matchCommentRowIndex,
   resolveTargetCandidates,
   makeDraftScopeKey,
   readScopeDrafts,
@@ -636,9 +638,24 @@ export default class Checkpoints extends View {
     cx.notify();
   }
 
+  diffMode() {
+    try {
+      return shared("diff.viewMode") === "split" ? "split" : "unified";
+    } catch {
+      return "unified";
+    }
+  }
+
+  setDiffMode(mode, cx) {
+    const next = mode === "split" ? "split" : "unified";
+    if (this.diffMode() === next) return;
+    setShared("diff.viewMode", next);
+    cx.notify();
+  }
+
   handleVirtualItemClick(itemKey, cx) {
     if (typeof itemKey !== "string") return;
-    if (itemKey.startsWith("r-")) {
+    if (itemKey.startsWith("r-") || itemKey.startsWith("s-")) {
       const idx = Number(itemKey.slice(2));
       const row = Number.isFinite(idx) ? this.annotatedRows[idx] : null;
       if (row?.commentable) {
@@ -747,6 +764,180 @@ export default class Checkpoints extends View {
           .child(row.number === undefined ? "" : String(row.number)),
       )
       .child(div().flex_1().min_w(0).py(1).line_height("18px").whitespace_normal().child(row.text));
+  }
+
+  renderSplitCell(row, side, t, selectedRange, commentedSet, padRight) {
+    const accent = t.accent ?? "#3b82f6";
+    if (!row) {
+      return h_flex()
+        .flex_1()
+        .min_w(0)
+        .min_h(20)
+        .items_start()
+        .bg(withAlpha(t.raised, "99") ?? t.surface ?? t.background)
+        .child(div().w(3).self_stretch().flex_none())
+        .child(div().w(this.diffNumWidth ?? 30).flex_none().py(1).line_height("18px").child(""))
+        .child(div().w(12).flex_none().py(1).line_height("18px").child(""))
+        .child(div().flex_1().min_w(0).py(1).pr(padRight).line_height("18px").child(" "));
+    }
+
+    const inSel = Boolean(
+      selectedRange && row.file === selectedRange.file && row.rowIndex >= selectedRange.startRowIdx && row.rowIndex <= selectedRange.endRowIdx,
+    );
+    const hasComment = commentedSet.has(row.rowIndex);
+    const isDel = side === "left" && row.kind === "-";
+    const isAdd = side === "right" && row.kind === "+";
+    const cellBg = inSel
+      ? (withAlpha(accent, "24") ?? t.selected)
+      : isAdd
+        ? (t.ansi2 + "18")
+        : isDel
+          ? (t.ansi1 + "18")
+          : null;
+    const lineNum = side === "left"
+      ? (row.oldLine ?? (row.kind === "-" ? row.number : null))
+      : (row.newLine ?? (row.kind === "+" ? row.number : null));
+    const sign = isDel ? "−" : isAdd ? "+" : "";
+    const signColor = isDel ? t.ansi1 : isAdd ? t.ansi2 : t.dim;
+
+    return h_flex()
+      .flex_1()
+      .min_w(0)
+      .min_h(20)
+      .gap(4)
+      .items_start()
+      .when(Boolean(cellBg), (e) => e.bg(cellBg))
+      .child(
+        div()
+          .w(3)
+          .self_stretch()
+          .flex_none()
+          .when(inSel || hasComment, (e) => e.bg(accent)),
+      )
+      .child(
+        div()
+          .w(this.diffNumWidth ?? 30)
+          .flex_none()
+          .py(1)
+          .line_height("18px")
+          .text_right()
+          .text_color(inSel ? t.foreground : t.dim)
+          .child(lineNum == null ? "" : String(lineNum)),
+      )
+      .child(
+        div()
+          .w(12)
+          .flex_none()
+          .py(1)
+          .line_height("18px")
+          .text_center()
+          .text_color(hasComment ? accent : signColor)
+          .child(hasComment ? "●" : sign),
+      )
+      .child(
+        div()
+          .flex_1()
+          .min_w(0)
+          .py(1)
+          .pr(padRight)
+          .line_height("18px")
+          .whitespace_normal()
+          .child(row.text),
+      );
+  }
+
+  renderSplitRow(srow, t, selectedRange, commentedSet) {
+    if (srow.kind === "file") {
+      return h_flex()
+        .w_full()
+        .min_w(0)
+        .px(12)
+        .py(4)
+        .min_h(24)
+        .items_center()
+        .bg(t.raised)
+        .border_y(1)
+        .border_color(t.border)
+        .child(
+          div()
+            .flex_1()
+            .min_w(0)
+            .font_semibold()
+            .text_size(11)
+            .line_height("16px")
+            .text_color(t.foreground)
+            .whitespace_normal()
+            .child(srow.row.text),
+        );
+    }
+    if (srow.kind === "hunk") {
+      return div()
+        .w_full()
+        .min_w(0)
+        .px(12)
+        .py(2)
+        .min_h(20)
+        .line_height("16px")
+        .whitespace_normal()
+        .bg(t.raised)
+        .text_color(t.dim)
+        .child(srow.row.text);
+    }
+    if (srow.kind === "meta") {
+      return div()
+        .w_full()
+        .min_w(0)
+        .px(12)
+        .py(1)
+        .min_h(20)
+        .line_height("18px")
+        .whitespace_normal()
+        .text_color(t.muted)
+        .child(srow.row.text);
+    }
+
+    const accent = t.accent ?? "#3b82f6";
+    const commentable = Boolean(srow.right?.commentable || srow.left?.commentable);
+    return h_flex()
+      .w_full()
+      .min_w(0)
+      .items_stretch()
+      .when(commentable, (e) => e.cursor_pointer().hover((s) => s.bg(withAlpha(accent, "12") ?? t.hover)))
+      .child(this.renderSplitCell(srow.left, "left", t, selectedRange, commentedSet, 6))
+      .child(div().w(1).self_stretch().flex_none().bg(t.border))
+      .child(this.renderSplitCell(srow.right, "right", t, selectedRange, commentedSet, 14));
+  }
+
+  renderDiffModeToggle(t, mode) {
+    const pill = (id, label, active, nextMode) =>
+      div()
+        .id(id)
+        .flex_none()
+        .px(7)
+        .py(2)
+        .rounded(4)
+        .text_size(10.5)
+        .font_medium()
+        .cursor_pointer()
+        .when(active, (e) => e.bg(t.selected ?? t.raised))
+        .text_color(active ? t.foreground : t.muted)
+        .hover((s) => s.bg(t.hover).text_color(t.foreground))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .on_click((_e, cx) => this.setDiffMode(nextMode, cx))
+        .child(label);
+
+    return h_flex()
+      .id("ckpt-diff-mode-toggle")
+      .flex_none()
+      .p(2)
+      .gap(2)
+      .items_center()
+      .rounded(6)
+      .bg(t.background)
+      .border_1()
+      .border_color(t.border)
+      .child(pill("ckpt-diff-mode-unified", tr("Unified", "直接"), mode === "unified", "unified"))
+      .child(pill("ckpt-diff-mode-split", tr("Split", "分栏"), mode === "split", "split"));
   }
 
   renderSavedComment(item, t) {
@@ -1129,13 +1320,16 @@ export default class Checkpoints extends View {
       : 48;
 
     const allDrafts = this.drafts();
-    const { items } = buildDisplayItems(this.annotatedRows, allDrafts, this.composer);
+    const diffMode = this.diffMode();
+    const { items } = diffMode === "split"
+      ? buildSplitDisplayItems(this.annotatedRows, allDrafts, this.composer)
+      : buildDisplayItems(this.annotatedRows, allDrafts, this.composer);
     const commentedSet = new Set();
-    let lastCodeRowIdx = null;
-    for (const item of items) {
-      if (item.type === "code") lastCodeRowIdx = item.row.rowIndex;
-      else if (item.type === "comment" && !item.outdated && lastCodeRowIdx != null) commentedSet.add(lastCodeRowIdx);
+    for (const c of allDrafts) {
+      const anchor = matchCommentRowIndex(this.annotatedRows, c);
+      if (anchor >= 0) commentedSet.add(anchor);
     }
+    const diffListId = diffMode === "split" ? "checkpoints-diff-split" : "checkpoints-diff";
 
     return v_flex().id("checkpoints").size_full().min_h(0).rounded(10).overflow_hidden().bg(t.background).border_1().border_color(t.border).text_color(t.foreground).text_size(13).track_focus(this.handle)
       .on_key_down((e, cx) => {
@@ -1472,22 +1666,65 @@ export default class Checkpoints extends View {
         );
       })
       .child(
+        h_flex()
+          .id("ckpt-diff-toolbar")
+          .h(30)
+          .flex_none()
+          .w_full()
+          .min_w(0)
+          .px(10)
+          .gap(6)
+          .items_center()
+          .bg(t.raised)
+          .border_b(1)
+          .border_color(t.border)
+          .child(
+            div()
+              .flex_1()
+              .min_w(0)
+              .truncate()
+              .text_size(11)
+              .font_medium()
+              .text_color(t.muted)
+              .child(this.selectedTurn != null ? tr(`Turn T${this.selectedTurn} Diff`, `T${this.selectedTurn} 变更详情`) : tr("Diff", "变更详情")),
+          )
+          .child(this.renderDiffModeToggle(t, diffMode)),
+      )
+      .when(diffMode === "split" && this.rows.length > 0, (el) =>
+        el.child(
+          h_flex()
+            .id("ckpt-split-header")
+            .h(22)
+            .flex_none()
+            .w_full()
+            .min_w(0)
+            .items_center()
+            .bg(t.surface ?? t.raised)
+            .border_b(1)
+            .border_color(t.border)
+            .child(div().flex_1().min_w(0).px(10).truncate().text_size(10.5).font_medium().text_color(t.muted).child(tr("Before", "修改前")))
+            .child(div().w(1).h_full().flex_none().bg(t.border))
+            .child(div().flex_1().min_w(0).px(10).truncate().text_size(10.5).font_medium().text_color(t.muted).child(tr("After", "修改后"))),
+        ),
+      )
+      .child(
         div().flex_1().w_full().min_w(0).min_h(0).relative().overflow_hidden().font_family(settings().font_family ?? "JetBrains Mono").text_size(11)
           .on_mouse_down("left", (e) => { this.lastShift = Boolean(e?.modifiers?.shift); })
           .child(
             list(
-              "checkpoints-diff",
+              diffListId,
               items.length,
               (i) => items[i]?.key ?? String(i),
               (i) => {
                 const item = items[i];
                 if (!item) return div().h(0);
                 if (item.type === "comment") return this.renderSavedComment(item, t);
+                if (item.type === "split") return this.renderSplitRow(item.srow, t, this.composer, commentedSet);
                 return this.renderCodeRow(item.row, t, this.composer, commentedSet);
               },
             ).on_item_click((itemKey, cx) => this.handleVirtualItemClick(itemKey, cx)).size_full(),
           )
-          .child(Scrollbar.vertical("checkpoints-diff").viewport_from_layout().absolute().inset_0())
+          .child(Scrollbar.vertical(diffListId).viewport_from_layout().absolute().inset_0())
           .when(!this.checkpoints.length && !this.loading && !this.error, (e) =>
             e.child(div().absolute().top(6).px(12).text_color(t.dim).child(tr("Turn diffs appear after each agent turn completes", "每轮对话完成后将在此显示轮次 diff"))),
           ),

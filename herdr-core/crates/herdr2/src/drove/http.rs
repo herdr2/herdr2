@@ -689,26 +689,28 @@ async fn dispatch_http_inner(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .ok_or_else(|| ApiErr::new(400, "bad_request", "body must be non-empty"))?;
-            let reply = core.drove.store.post_message(super::store::PostMessageInput {
-                run_id: msg.run_id.clone(),
-                kind: MessageType::Reply,
-                from: "coordinator".into(),
-                to: msg.from.clone(),
-                thread_id: Some(msg.id.clone()),
-                task_id: msg.task_id.clone(),
-                attempt_id: msg.attempt_id.clone(),
-                subject: format!("Re: {}", msg.subject),
-                body: Some(reply_body.to_string()),
-                options: None,
-                recommend: None,
-                why: None,
-                raised_by: Some("coordinator".into()),
-                raised_by_worker: None,
-                tag: None,
-                ai_draft: None,
-                needs_action: false,
-            });
-            core.drove.store.mark_handled(&msg.id);
+            let reply = core.drove.store.post_reply_and_mark_handled(
+                &msg.id,
+                super::store::PostMessageInput {
+                    run_id: msg.run_id.clone(),
+                    kind: MessageType::Reply,
+                    from: "coordinator".into(),
+                    to: msg.from.clone(),
+                    thread_id: Some(msg.id.clone()),
+                    task_id: msg.task_id.clone(),
+                    attempt_id: msg.attempt_id.clone(),
+                    subject: format!("Re: {}", msg.subject),
+                    body: Some(reply_body.to_string()),
+                    options: None,
+                    recommend: None,
+                    why: None,
+                    raised_by: Some("coordinator".into()),
+                    raised_by_worker: None,
+                    tag: None,
+                    ai_draft: None,
+                    needs_action: false,
+                },
+            );
             core.drove.message_reply_wake.notify_waiters();
             Ok(json!(reply))
         }
@@ -716,7 +718,8 @@ async fn dispatch_http_inner(
         ("POST", ["api", "tasks", id, "cancel"]) => cancel_task_http(&core, id).await,
         ("POST", ["api", "tasks", id, "send"]) => send_task_http(&core, id, &body).await,
         ("GET", ["api", "tasks", id, "inspect"]) => {
-            let mut diag = super::diagnose::diagnose_task(&core.drove.store, id)
+            let tail = query.get("tail").and_then(|s| s.parse::<usize>().ok()).unwrap_or(30).clamp(1, 200);
+            let mut diag = super::diagnose::diagnose_task_with_tail(&core.drove.store, id, tail)
                 .ok_or_else(|| ApiErr::new(404, "not_found", "Task or attempt not found"))?;
             let want_ai = query.get("ai").is_some_and(|v| v == "1" || v == "true");
             let refresh = query.get("refresh").is_some_and(|v| v == "1" || v == "true");

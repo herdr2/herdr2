@@ -128,8 +128,10 @@ test("Checkpoints mod wires fault-introduction bisect bar and badges", () => {
   expect(source).toContain('"checkpoint", "bisect"');
 });
 
-test("Checkpoints diff wraps long lines and file headers to viewport width", () => {
-  expect(source).toContain('list(\n              "checkpoints-diff"');
+test("Checkpoints diff wraps long lines and file headers to viewport width in both unified and split modes", () => {
+  expect(source).toContain('id("ckpt-diff-mode-toggle")');
+  expect(source).toContain('id("ckpt-split-header")');
+  expect(source).toContain("list(\n              diffListId,");
   expect(source).not.toContain("v_virtual_list");
   expect(source).not.toContain("checkpoints-diff-x");
   expect(source).toContain(".whitespace_normal().child(row.text)");

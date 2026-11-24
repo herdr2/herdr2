@@ -305,15 +305,15 @@ pub fn main() -> i32 {
     let args: Vec<_> = if daemon { vec!["serve".into()] } else { std::env::args_os().skip(1).collect() };
     match args.iter().map(|a| a.to_str()).collect::<Vec<_>>().as_slice() {
         [Some("--help" | "-h" | "help")] => {
-            print!("{HELP}");
+            write_stdout_raw(HELP);
             return 0;
         }
         [Some("--skill")] => {
-            print!("{SKILL}");
+            write_stdout_raw(SKILL);
             return 0;
         }
         [Some("--licenses")] => {
-            print!("{}", include_str!("../THIRD-PARTY-NOTICES"));
+            write_stdout_raw(include_str!("../THIRD-PARTY-NOTICES"));
             return 0;
         }
         _ => {}
@@ -329,7 +329,7 @@ pub fn main() -> i32 {
             if let Some((code, msg)) = checkpoint::worktree_guard_hook(c) {
                 if let Some(m) = msg {
                     if code == 0 {
-                        println!("{m}");
+                        write_stdout_line(&m);
                     } else {
                         eprintln!("{m}");
                     }
@@ -337,7 +337,7 @@ pub fn main() -> i32 {
                 return code;
             }
             if let Some(noop) = checkpoint::fast_noop_hook(c) {
-                println!("{noop}");
+                write_stdout_line(&noop);
                 return 0;
             }
             (cli.cmd, cli.json)
@@ -373,11 +373,34 @@ struct Out {
     human: String,
 }
 
+/// Writes `text` to stdout without panicking on `BrokenPipe` (e.g. `| head -n 20`).
+/// Returns `false` if stdout closed so streaming callers can stop cleanly.
+pub(crate) fn write_stdout_raw(text: &str) -> bool {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    match out.write_all(text.as_bytes()).and_then(|_| out.flush()) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => false,
+        Err(_) => false,
+    }
+}
+
+/// Writes `line` + `\n` to stdout without panicking on `BrokenPipe`.
+pub(crate) fn write_stdout_line(line: &str) -> bool {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    match out.write_all(line.as_bytes()).and_then(|_| out.write_all(b"\n")).and_then(|_| out.flush()) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => false,
+        Err(_) => false,
+    }
+}
+
 fn print(out: &Out, json: bool) {
     if json {
-        println!("{}", out.json);
+        let _ = write_stdout_line(&out.json.to_string());
     } else {
-        println!("{}", out.human);
+        let _ = write_stdout_line(&out.human);
     }
 }
 
@@ -957,7 +980,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
                 human.push_str("\n[h2] older transcript lines omitted (increase --lines or omit for full transcript)");
             }
             if !asked {
-                println!("{human}");
+                write_stdout_line(&human);
                 return Ok(None);
             }
             Out { json: r, human }
@@ -1163,39 +1186,45 @@ fn follow_events(paths: &Paths, params: Value, json: bool) -> Result<(), RpcErro
     use std::io::BufRead;
     let stream = client::connect_or_start(paths)?;
     let snapshot = client::call(&stream, "events.subscribe", params)?;
-    if json {
-        println!("{snapshot}");
+    let ok = if json {
+        write_stdout_line(&snapshot.to_string())
     } else {
-        println!("{}", table(&json!({"agents": snapshot["agents"], "terminals": snapshot["terminals"]})));
+        write_stdout_line(&table(&json!({"agents": snapshot["agents"], "terminals": snapshot["terminals"]})))
+    };
+    if !ok {
+        return Ok(());
     }
     for line in std::io::BufReader::new(&stream).lines() {
         let Ok(line) = line else { break };
         if json {
-            println!("{line}");
+            if !write_stdout_line(&line) {
+                break;
+            }
             continue;
         }
         let msg: Value = serde_json::from_str(&line).unwrap_or_default();
         let p = &msg["params"];
-        match msg["method"].as_str() {
+        let written = match msg["method"].as_str() {
             Some("event") if p["type"] == "doc" => {
                 let name = p["data"]["name"].as_str().unwrap_or("?");
                 let machine = p["machine"].as_str().map(|m| format!("{m}/")).unwrap_or_default();
-                println!("{machine}{name}  doc  version {}", p["data"]["version"]);
+                write_stdout_line(&format!("{machine}{name}  doc  version {}", p["data"]["version"]))
             }
-            Some("event") => println!(
+            Some("event") => write_stdout_line(&format!(
                 "{:<6} {:<10} {}",
                 p["agent"].as_str().or_else(|| p["terminal"].as_str()).unwrap_or("?"),
                 p["type"].as_str().unwrap_or("?"),
                 p["data"]
-            ),
-            Some("missed") => {
-                println!(
-                    "[missed some events; {} agents, {} terminals now]",
-                    p["agents"].as_array().map_or(0, Vec::len),
-                    p["terminals"].as_array().map_or(0, Vec::len)
-                )
-            }
-            _ => {}
+            )),
+            Some("missed") => write_stdout_line(&format!(
+                "[missed some events; {} agents, {} terminals now]",
+                p["agents"].as_array().map_or(0, Vec::len),
+                p["terminals"].as_array().map_or(0, Vec::len)
+            )),
+            _ => true,
+        };
+        if !written {
+            break;
         }
     }
     Ok(())

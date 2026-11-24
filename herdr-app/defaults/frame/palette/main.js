@@ -145,7 +145,7 @@ const NAMED = [
   ["window.close", {}, "Window", "Close window", "quit"],
   ["app.settings", {}, "App", "Settings", "preferences options config look font theme sound"],
   ["app.help", {}, "App", "Keys", "keybindings shortcuts help"],
-  ["app.welcome", {}, "App", "Welcome", "intro start onboarding"],
+  ["app.welcome", {}, "App", "Welcome", "intro start onboarding 欢迎 引导 新手"],
   ["app.reset", {}, "App", "Reset to the default screen", "escape hatch broken restore"],
   ["app.zoom_in", {}, "App", "Zoom in", "bigger font size"],
   ["app.zoom_out", {}, "App", "Zoom out", "smaller font size"],

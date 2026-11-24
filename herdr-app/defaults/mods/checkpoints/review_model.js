@@ -311,6 +311,121 @@ export function buildDisplayItems(annotatedRows, visibleComments, activeComposer
   return { items, sizes };
 }
 
+/**
+ * Converts annotated unified diff rows into side-by-side (before/after) rows.
+ * Consecutive '-' and '+' lines within a hunk are paired index-by-index so
+ * modifications align horizontally, with null slots for pure additions/deletions.
+ */
+export function buildSplitDiffRows(annotatedRows) {
+  const out = [];
+  let i = 0;
+  const n = annotatedRows?.length ?? 0;
+
+  while (i < n) {
+    const row = annotatedRows[i];
+    if (!row) {
+      i += 1;
+      continue;
+    }
+    if (row.isFileHeader) {
+      out.push({ kind: "file", key: `sf-${row.rowIndex}`, row, primaryRowIdx: row.rowIndex });
+      i += 1;
+      continue;
+    }
+    if (row.kind === "@") {
+      out.push({ kind: "hunk", key: `sh-${row.rowIndex}`, row, primaryRowIdx: row.rowIndex });
+      i += 1;
+      continue;
+    }
+    if (row.kind === " ") {
+      out.push({
+        kind: "pair",
+        key: `s-${row.rowIndex}`,
+        left: row,
+        right: row,
+        primaryRowIdx: row.rowIndex,
+      });
+      i += 1;
+      continue;
+    }
+    if (row.kind === "-" || row.kind === "+") {
+      const removed = [];
+      const added = [];
+      while (i < n && annotatedRows[i]?.kind === "-") {
+        removed.push(annotatedRows[i]);
+        i += 1;
+      }
+      while (i < n && annotatedRows[i]?.kind === "+") {
+        added.push(annotatedRows[i]);
+        i += 1;
+      }
+      const count = Math.max(removed.length, added.length);
+      for (let k = 0; k < count; k += 1) {
+        const left = removed[k] ?? null;
+        const right = added[k] ?? null;
+        const primary = right ?? left;
+        out.push({
+          kind: "pair",
+          key: `s-${primary.rowIndex}`,
+          left,
+          right,
+          primaryRowIdx: primary.rowIndex,
+        });
+      }
+      continue;
+    }
+    out.push({ kind: "meta", key: `sm-${row.rowIndex}`, row, primaryRowIdx: row.rowIndex });
+    i += 1;
+  }
+  return out;
+}
+
+/**
+ * Flattens side-by-side split rows and saved inline comments into display-only list items.
+ */
+export function buildSplitDisplayItems(annotatedRows, visibleComments, activeComposer) {
+  const splitRows = buildSplitDiffRows(annotatedRows);
+  const byRow = new Map();
+  const orphaned = [];
+  for (const c of visibleComments ?? []) {
+    const anchor = matchCommentRowIndex(annotatedRows, c);
+    if (anchor >= 0) {
+      if (!byRow.has(anchor)) byRow.set(anchor, []);
+      byRow.get(anchor).push(c);
+    } else {
+      orphaned.push(c);
+    }
+  }
+
+  const items = [];
+  for (const srow of splitRows) {
+    items.push({ type: "split", key: srow.key, srow });
+
+    const seenIds = new Set();
+    const attachIdxList = srow.kind === "pair"
+      ? [srow.left?.rowIndex, srow.right?.rowIndex]
+      : [srow.primaryRowIdx];
+    for (const idx of attachIdxList) {
+      if (idx == null) continue;
+      const attached = byRow.get(idx);
+      if (!attached) continue;
+      for (const comment of attached) {
+        if (seenIds.has(comment.id)) continue;
+        seenIds.add(comment.id);
+        const editing = Boolean(activeComposer?.editingId && activeComposer.editingId === comment.id);
+        items.push({ type: "comment", key: `c-${comment.id}`, comment, outdated: false, editing });
+      }
+    }
+  }
+
+  for (const comment of orphaned) {
+    const editing = Boolean(activeComposer?.editingId && activeComposer.editingId === comment.id);
+    items.push({ type: "comment", key: `c-orphan-${comment.id}`, comment, outdated: true, editing });
+  }
+
+  return { items };
+}
+
 function machineOfAddress(addr) {
   if (typeof addr !== "string") return null;
   const slash = addr.indexOf("/");

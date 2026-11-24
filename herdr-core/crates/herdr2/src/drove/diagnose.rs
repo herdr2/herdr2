@@ -2,11 +2,17 @@
 
 use super::store::Store;
 use super::types::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::process::Command;
 
 /// Inspects a task (or specific attempt id) cleanly without altering workspace state.
 pub fn diagnose_task(store: &Store, id_or_attempt: &str) -> Option<Diagnosis> {
+    diagnose_task_with_tail(store, id_or_attempt, 30)
+}
+
+/// Inspects a task (or specific attempt id) returning up to `tail` coalesced recent activity items.
+pub fn diagnose_task_with_tail(store: &Store, id_or_attempt: &str, tail: usize) -> Option<Diagnosis> {
+    let tail = tail.clamp(1, 200);
     let selected = store.get_attempt(id_or_attempt);
     let task = match &selected {
         Some(a) => store.get_task(&a.task_id)?,
@@ -35,17 +41,31 @@ pub fn diagnose_task(store: &Store, id_or_attempt: &str) -> Option<Diagnosis> {
         None => "workspace unavailable".into(),
     };
 
-    let last_items = match &attempt {
-        Some(a) => store.list_items(&a.worker_id, Some(&a.id), None, 30),
+    let fetch_limit = tail.saturating_mul(4).clamp(60, 400);
+    let raw_items = match &attempt {
+        Some(a) => store.list_items(&a.worker_id, Some(&a.id), None, fetch_limit),
         None => Vec::new(),
     };
+    let last_items = coalesce_inspect_items(raw_items, tail);
 
-    let mut files_set = BTreeSet::new();
+    let mut declared_set = BTreeSet::new();
     if let Some(files) = task.result.as_ref().and_then(|r| r.files_modified.as_ref()) {
         for f in files {
-            files_set.insert(f.clone());
+            if !f.trim().is_empty() {
+                declared_set.insert(f.trim().to_string());
+            }
         }
     }
+    let declared_files_modified: Vec<String> = declared_set.into_iter().collect();
+    let live_dirty_files = parse_porcelain_paths(&git_status);
+    let files_modified = if !declared_files_modified.is_empty() {
+        declared_files_modified.clone()
+    } else {
+        live_dirty_files.clone()
+    };
+
+    let attempt_tokens = attempt.as_ref().map(|a| a.tokens.clone());
+    let worker_total_tokens = worker.as_ref().map(|w| w.totals.tokens);
 
     let failure = attempt.as_ref().and_then(|a| a.failure.clone());
     let suggestion = match failure.as_ref().map(|f| f.kind) {
@@ -86,8 +106,158 @@ pub fn diagnose_task(store: &Store, id_or_attempt: &str) -> Option<Diagnosis> {
         attempt,
         failure,
         last_items,
-        files_modified: files_set.into_iter().collect(),
+        files_modified,
+        declared_files_modified,
+        live_dirty_files,
+        attempt_tokens,
+        worker_total_tokens,
         git_status,
         suggestion,
     })
+}
+
+/// Parses `git status --porcelain` lines into workspace-relative paths (skipping ephemeral caches).
+pub(crate) fn parse_porcelain_paths(porcelain: &str) -> Vec<String> {
+    let mut out = BTreeSet::new();
+    for line in porcelain.lines() {
+        if line.len() < 4 {
+            continue;
+        }
+        let b = line.as_bytes();
+        // Skip error strings like "git status exited ..." or "workspace unavailable".
+        if !matches!(b[0], b' ' | b'M' | b'A' | b'D' | b'R' | b'C' | b'U' | b'?')
+            || !matches!(b[1], b' ' | b'M' | b'A' | b'D' | b'R' | b'C' | b'U' | b'?')
+            || b[2] != b' '
+        {
+            continue;
+        }
+        let raw_path = line[3..].trim();
+        let target = raw_path.rsplit_once(" -> ").map(|(_, dst)| dst).unwrap_or(raw_path);
+        let unquoted = target.trim_matches('"').trim();
+        if unquoted.is_empty() || super::roles::is_ephemeral_cache_path(unquoted.trim_end_matches('/')) {
+            continue;
+        }
+        out.insert(unquoted.to_string());
+    }
+    out.into_iter().collect()
+}
+
+/// Filters empty streaming `tool_call_update` shells and coalesces duplicate updates by `tool.id`,
+/// preserving the earliest non-empty title/kind and latest non-empty status/output.
+pub(crate) fn coalesce_inspect_items(items: Vec<Item>, tail: usize) -> Vec<Item> {
+    let mut out: Vec<Option<Item>> = Vec::with_capacity(items.len());
+    let mut by_tool_id: HashMap<String, usize> = HashMap::new();
+
+    for mut item in items {
+        if item.kind == "tool"
+            && let Some(mut tl) = item.tool.take()
+        {
+            let title_empty = tl.title.as_deref().map(str::trim).unwrap_or("").is_empty();
+            let status_empty = tl.status.as_deref().map(str::trim).unwrap_or("").is_empty();
+            let output_empty = tl.output.as_deref().map(str::trim).unwrap_or("").is_empty();
+            if title_empty && status_empty && output_empty {
+                continue;
+            }
+            if !tl.id.is_empty()
+                && let Some(&prev_idx) = by_tool_id.get(&tl.id)
+                && let Some(prev_item) = out[prev_idx].take()
+            {
+                if let Some(prev_tl) = prev_item.tool {
+                    if title_empty {
+                        tl.title = prev_tl.title;
+                    }
+                    if tl.kind.is_none() {
+                        tl.kind = prev_tl.kind;
+                    }
+                    if status_empty {
+                        tl.status = prev_tl.status;
+                    }
+                    if output_empty {
+                        tl.output = prev_tl.output;
+                    }
+                    if tl.locations.is_none() {
+                        tl.locations = prev_tl.locations;
+                    }
+                    if tl.input.is_none() {
+                        tl.input = prev_tl.input;
+                    }
+                }
+                item.tool = Some(tl);
+                let new_idx = out.len();
+                if let Some(tid) = item.tool.as_ref().map(|t| t.id.clone()) {
+                    by_tool_id.insert(tid, new_idx);
+                }
+                out.push(Some(item));
+                continue;
+            }
+            if title_empty && status_empty {
+                continue;
+            }
+            let tid = tl.id.clone();
+            item.tool = Some(tl);
+            let idx = out.len();
+            if !tid.is_empty() {
+                by_tool_id.insert(tid, idx);
+            }
+            out.push(Some(item));
+        } else {
+            out.push(Some(item));
+        }
+    }
+
+    let mut clean: Vec<Item> = out.into_iter().flatten().collect();
+    if clean.len() > tail {
+        clean.drain(..clean.len() - tail);
+    }
+    clean
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_tool(id: u64, tid: &str, title: &str, status: &str) -> Item {
+        Item {
+            id,
+            worker_id: "wrk_1".into(),
+            attempt_id: Some("att_1".into()),
+            ts: now_iso(),
+            kind: "tool".into(),
+            text: None,
+            tool: Some(ItemTool {
+                id: tid.into(),
+                title: Some(title.into()),
+                kind: None,
+                status: Some(status.into()),
+                locations: None,
+                input: None,
+                output: None,
+            }),
+            usage: None,
+        }
+    }
+
+    #[test]
+    fn coalesce_inspect_items_drops_codex_empty_tool_shells_and_merges_by_id() {
+        let items = vec![
+            mk_tool(1, "exec-1", "pytest tests/unit", "in_progress"),
+            mk_tool(2, "exec-1", "", ""),
+            mk_tool(3, "exec-1", "", ""),
+            mk_tool(4, "exec-1", "", "completed"),
+            mk_tool(5, "exec-2", "", ""),
+        ];
+        let res = coalesce_inspect_items(items, 10);
+        assert_eq!(res.len(), 1);
+        let tl = res[0].tool.as_ref().unwrap();
+        assert_eq!(tl.id, "exec-1");
+        assert_eq!(tl.title.as_deref(), Some("pytest tests/unit"));
+        assert_eq!(tl.status.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn parse_porcelain_paths_extracts_live_dirty_files_and_skips_caches() {
+        let raw = " M src/cli.py\n?? tests/test_mlbb.py\nR  old.py -> new.py\n?? __pycache__/a.pyc\n";
+        assert_eq!(parse_porcelain_paths(raw), vec!["new.py", "src/cli.py", "tests/test_mlbb.py"]);
+        assert!(parse_porcelain_paths("workspace unavailable").is_empty());
+    }
 }

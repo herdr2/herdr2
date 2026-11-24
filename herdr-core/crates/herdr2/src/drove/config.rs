@@ -407,6 +407,8 @@ pub fn validate_config(cfg: &mut DroveConfig) -> Result<(), RpcError> {
         if role.primary.agent.is_empty() {
             return Err(RpcError::invalid_params(format!("role {id}: primary.agent cannot be empty")));
         }
+        role.primary.model = role.primary.model.take().map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
+        role.primary.effort = align_effort_with_model(role.primary.model.as_deref(), role.primary.effort);
         role.primary.strengths = normalize_strengths(&role.primary.strengths);
         role.primary.note = normalize_note(role.primary.note.as_deref(), 400);
         for fb in &mut role.fallbacks {
@@ -414,6 +416,8 @@ pub fn validate_config(cfg: &mut DroveConfig) -> Result<(), RpcError> {
             if fb.agent.is_empty() {
                 return Err(RpcError::invalid_params(format!("role {id}: fallback agent cannot be empty")));
             }
+            fb.model = fb.model.take().map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
+            fb.effort = align_effort_with_model(fb.model.as_deref(), fb.effort);
             fb.strengths = normalize_strengths(&fb.strengths);
             fb.note = normalize_note(fb.note.as_deref(), 400);
         }
@@ -505,6 +509,13 @@ pub fn load_config(paths: &DrovePaths) -> Result<DroveConfig, RpcError> {
             // Ensure all built-in roles exist if missing from older config, preserving user edits.
             for (k, v) in default_roles() {
                 cfg.roles.entry(k).or_insert(v);
+            }
+            // Align effort metadata with any embedded-effort model names (e.g. `gemini-4-neon-medium`).
+            for role in cfg.roles.values_mut() {
+                role.primary.effort = align_effort_with_model(role.primary.model.as_deref(), role.primary.effort);
+                for fb in &mut role.fallbacks {
+                    fb.effort = align_effort_with_model(fb.model.as_deref(), fb.effort);
+                }
             }
             Ok(cfg)
         }
@@ -876,6 +887,60 @@ pub fn supported_efforts_for_model(
     }
 }
 
+/// Extracts a canonical `Effort` level when `model` directly encodes effort in its name
+/// (e.g. `gemini-4-neon-medium`, `gemini-4-hydrogen-high-fast`, `claude-opus-4-6[effort=xhigh]`).
+pub fn extract_embedded_effort(model: &str) -> Option<Effort> {
+    let lower = model.trim().to_ascii_lowercase();
+    if lower.is_empty() || matches!(lower.as_str(), "auto" | "default" | "default[]") {
+        return None;
+    }
+    let parse_level = |raw: &str| match raw.trim() {
+        "low" | "minimal" => Some(Effort::Low),
+        "medium" | "med" => Some(Effort::Medium),
+        "high" => Some(Effort::High),
+        "xhigh" | "extra-high" | "extra_high" | "max" | "ultra" => Some(Effort::Xhigh),
+        _ => None,
+    };
+    let mut slug = lower.as_str();
+    if let Some(bracket_start) = lower.find('[')
+        && lower.ends_with(']')
+    {
+        let inner = &lower[bracket_start + 1..lower.len() - 1];
+        for entry in inner.split(',') {
+            let Some((k, v)) = entry.split_once('=') else { continue };
+            let k = k.trim();
+            if matches!(k, "effort" | "reasoning_effort" | "reasoning" | "thought" | "thought_level" | "thinking")
+                && let Some(eff) = parse_level(v)
+            {
+                return Some(eff);
+            }
+        }
+        slug = lower[..bracket_start].trim();
+    }
+    let slug = slug.strip_suffix("-fast").unwrap_or(slug);
+    for (suf, eff) in [
+        ("-extra-high", Effort::Xhigh),
+        ("-xhigh", Effort::Xhigh),
+        ("-max", Effort::Xhigh),
+        ("-medium", Effort::Medium),
+        ("-med", Effort::Medium),
+        ("-high", Effort::High),
+        ("-minimal", Effort::Low),
+        ("-low", Effort::Low),
+    ] {
+        if slug.ends_with(suf) {
+            return Some(eff);
+        }
+    }
+    None
+}
+
+/// Aligns `effort` with any effort embedded directly in `model` so stored/routed metadata never
+/// contradicts a model variant like `gemini-4-neon-medium` vs `effort: high`.
+pub fn align_effort_with_model(model: Option<&str>, effort: Effort) -> Effort {
+    model.and_then(extract_embedded_effort).unwrap_or(effort)
+}
+
 /// Clamps `effort` to the closest valid effort supported by `(agent, model)`.
 pub fn clamp_effort_for_model(
     agent: &str,
@@ -883,6 +948,9 @@ pub fn clamp_effort_for_model(
     effort: Effort,
     probed_agent: Option<&ProbedAgent>,
 ) -> Effort {
+    if let Some(embedded) = model.and_then(extract_embedded_effort) {
+        return embedded;
+    }
     let allowed = supported_efforts_for_model(agent, model, probed_agent);
     if allowed.contains(&effort) {
         return effort;
@@ -1052,5 +1120,24 @@ mod tests {
             Some("GLM 相关模型在下午 2:00–6:00 额度按两倍计算，应避免使用，除非没有其他 agent 可用。")
         );
         assert_eq!(payload["profile"]["roles"]["coder"]["candidates"][0]["note"].as_str(), Some("首选主力"));
+    }
+
+    #[test]
+    fn aligns_effort_with_embedded_effort_model_names() {
+        assert_eq!(extract_embedded_effort("gemini-4-neon-medium"), Some(Effort::Medium));
+        assert_eq!(extract_embedded_effort("gemini-4-hydrogen-high-fast"), Some(Effort::High));
+        assert_eq!(extract_embedded_effort("claude-opus-4-6[effort=xhigh]"), Some(Effort::Xhigh));
+        assert_eq!(extract_embedded_effort("gpt-5.4"), None);
+        assert_eq!(clamp_effort_for_model("agy", Some("gemini-4-neon-medium"), Effort::High, None), Effort::Medium);
+
+        let mut cfg = DroveConfig::default();
+        cfg.roles.get_mut("writer").unwrap().primary.model = Some("gemini-4-neon-medium".into());
+        cfg.roles.get_mut("writer").unwrap().primary.effort = Effort::High;
+        cfg.roles.get_mut("writer").unwrap().fallbacks[0].model = Some("gemini-4-carbon-low".into());
+        cfg.roles.get_mut("writer").unwrap().fallbacks[0].effort = Effort::High;
+        validate_config(&mut cfg).unwrap();
+
+        assert_eq!(cfg.roles["writer"].primary.effort, Effort::Medium);
+        assert_eq!(cfg.roles["writer"].fallbacks[0].effort, Effort::Low);
     }
 }

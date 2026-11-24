@@ -565,6 +565,14 @@ pub fn set_shared(key: String, value: Value) {
     }
 }
 
+/// Sets an in-memory shared value without writing `shared.json` or broadcasting
+/// a full-app `Request::Refresh` to every mod (callers wake the target mod directly).
+pub fn set_shared_ephemeral(key: String, value: Value) {
+    with_shared(|s| {
+        s.values.insert(key, value);
+    });
+}
+
 fn with_shared<R>(f: impl FnOnce(&mut SharedStore) -> R) -> R {
     SHARED.with_borrow_mut(|slot| f(slot.get_or_insert_with(|| SharedStore::load(app_dir().join("shared.json")))))
 }
@@ -942,6 +950,13 @@ fn strings(v: Option<&HostValue>) -> Vec<String> {
     v.and_then(HostValue::as_array).map(|a| a.iter().filter_map(|s| s.as_str().map(str::to_owned)).collect()).unwrap_or_default()
 }
 
+fn opt_u64(v: Option<&HostValue>, key: &str) -> Option<u64> {
+    match v.and_then(|o| o.get(key)) {
+        Some(HostValue::Number(n)) if n.is_finite() && *n > 0.0 => Some(*n as u64),
+        _ => None,
+    }
+}
+
 fn opt_str(v: Option<&HostValue>, key: &str) -> Option<String> {
     v.and_then(|o| o.get(key)).and_then(HostValue::as_str).map(str::to_owned)
 }
@@ -1114,24 +1129,114 @@ fn known_agents(on: Option<String>, list: Vec<Value>) -> Result<Value, String> {
     ))
 }
 
-/// A text file on another machine: `cat`, or `type` where there is none (Windows).
-fn read_remote(machine: &str, path: &str) -> Result<Option<String>, String> {
-    let (code, out, _) = match run_remote(machine, "cat", &["--".into(), path.into()], None) {
-        Err(e) if e.contains("cannot start") => run_remote(machine, "cmd", &["/d".into(), "/c".into(), "type".into(), path.replace('/', "\\")], None)?,
+fn run_remote_read_raw(machine: &str, path: &str, max_bytes: Option<u64>) -> Result<Option<Vec<u8>>, String> {
+    let posix_res = if let Some(cap) = max_bytes {
+        let take = cap.saturating_add(1).to_string();
+        let script = if let Some(rest) = path.strip_prefix("~/") {
+            let arg = rest.to_owned();
+            run_remote(
+                machine,
+                "sh",
+                &[
+                    "-c".into(),
+                    "p=\"$HOME/$1\"; [ -f \"$p\" ] || exit 3; head -c \"$2\" -- \"$p\"".into(),
+                    "read".into(),
+                    arg,
+                    take,
+                ],
+                None,
+            )
+        } else {
+            run_remote(
+                machine,
+                "sh",
+                &[
+                    "-c".into(),
+                    "[ -f \"$1\" ] || exit 3; head -c \"$2\" -- \"$1\"".into(),
+                    "read".into(),
+                    path.into(),
+                    take,
+                ],
+                None,
+            )
+        };
+        script
+    } else if let Some(rest) = path.strip_prefix("~/") {
+        run_remote(
+            machine,
+            "sh",
+            &["-c".into(), "cat -- \"$HOME/$1\"".into(), "read".into(), rest.into()],
+            None,
+        )
+    } else {
+        run_remote(machine, "cat", &["--".into(), path.into()], None)
+    };
+    let (code, out, _) = match posix_res {
+        Err(e) if e.contains("cannot start") => {
+            if let Some(cap) = max_bytes {
+                let escaped = path.replace('\'', "''");
+                let take = cap.saturating_add(1);
+                let script = format!(
+                    "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); & {{ param($p,$n) if (-not (Test-Path -LiteralPath $p -PathType Leaf)) {{ exit 3 }}; $fs = [IO.File]::OpenRead($p); try {{ $buf = New-Object byte[] ([Math]::Min([int64]$n, $fs.Length)); $got = $fs.Read($buf, 0, $buf.Length); [Convert]::ToBase64String($buf, 0, $got) }} finally {{ $fs.Dispose() }} }} '{escaped}' {take}"
+                );
+                let (c, o, _) = run_remote(
+                    machine,
+                    "powershell",
+                    &["-NoProfile".into(), "-Command".into(), script],
+                    None,
+                )?;
+                if c != 0 {
+                    return Ok(None);
+                }
+                use base64::Engine as _;
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(String::from_utf8_lossy(&o).trim())
+                    .map_err(|err| err.to_string())?;
+                return Ok(Some(decoded));
+            }
+            run_remote(machine, "cmd", &["/d".into(), "/c".into(), "type".into(), path.replace('/', "\\")], None)?
+        }
         r => r?,
     };
     if code != 0 {
         return Ok(None);
     }
+    Ok(Some(out))
+}
+
+/// A text file on another machine: `cat`, or `type` where there is none (Windows).
+fn read_remote(machine: &str, path: &str) -> Result<Option<String>, String> {
+    let Some(out) = run_remote_read_raw(machine, path, None)? else {
+        return Ok(None);
+    };
     if out.len() as u64 > crate::mod_files::LIMIT {
         return Err("Text file exceeds 1 MiB".into());
     }
     Ok(Some(String::from_utf8_lossy(&out).into_owned()))
 }
 
+/// Bounded preview read of a text file on another machine.
+fn read_remote_preview(machine: &str, path: &str, max_bytes: u64) -> Result<Option<String>, String> {
+    let cap = max_bytes.clamp(1, crate::mod_files::LIMIT);
+    let Some(out) = run_remote_read_raw(machine, path, Some(cap))? else {
+        return Ok(None);
+    };
+    Ok(Some(crate::mod_files::decode_preview_bytes(&out, cap as usize)))
+}
+
 fn read_remote_bytes(machine: &str, path: &str, limit: u64) -> Result<Option<Vec<u8>>, String> {
     use base64::Engine as _;
-    match run_remote(machine, "cat", &["--".into(), path.into()], None) {
+    let posix_res = if let Some(rest) = path.strip_prefix("~/") {
+        run_remote(
+            machine,
+            "sh",
+            &["-c".into(), "cat -- \"$HOME/$1\"".into(), "read".into(), rest.into()],
+            None,
+        )
+    } else {
+        run_remote(machine, "cat", &["--".into(), path.into()], None)
+    };
+    match posix_res {
         Ok((code, out, _)) => {
             if code != 0 {
                 return Ok(None);
@@ -1431,9 +1536,12 @@ fn module(inst: Instance, copy: u64) -> HostModule {
         .async_function("readTextFile", |a| {
             let path = a.string(0)?.to_owned();
             let on = opt_str(a.get(1), "on");
-            Ok(crate::mod_files::read_with(move || match on {
-                Some(m) => read_remote(&m, &path),
-                None => crate::mod_files::read(Path::new(&path)),
+            let max_bytes = opt_u64(a.get(1), "maxBytes");
+            Ok(crate::mod_files::read_with(move || match (on, max_bytes) {
+                (Some(m), Some(cap)) => read_remote_preview(&m, &path, cap),
+                (Some(m), None) => read_remote(&m, &path),
+                (None, Some(cap)) => crate::mod_files::read_preview(Path::new(&path), cap),
+                (None, None) => crate::mod_files::read(Path::new(&path)),
             }))
         })
         .async_function("readImageDataUrl", |a| {

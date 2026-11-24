@@ -20740,6 +20740,22 @@ declare module "gpui-base" {
   /** A controlled switch. No styling. */
   export const Switch: ComponentType;
   /** Rich HTML or Markdown text. CSS in HTML is not supported. */
+  export interface TextViewThemeOptions {
+    dark?: boolean;
+    foreground?: string;
+    muted?: string;
+    link?: string;
+    selection?: string;
+    code_background?: string;
+    inline_code_foreground?: string;
+    inline_code_background?: string;
+    border?: string;
+    heading?: string;
+    syntax?: Record<string, string>;
+    base_dir?: string;
+    root_dir?: string;
+    allow_data_images?: boolean;
+  }
   export interface TextViewElement extends NativeElement {
     /** Overrides TextView's default URL opening and reports the resolved URL. */
     on_link_click(handler: (url: string, cx: Context) => void): this;
@@ -20748,7 +20764,7 @@ declare module "gpui-base" {
   }
   export const TextView: {
     html(id: string, html: string): TextViewElement;
-    markdown(id: string, markdown: string): TextViewElement;
+    markdown(id: string, markdown: string, options?: TextViewThemeOptions): TextViewElement;
   };
   /**
    * A tab list. It holds no selection of its own — each `Tab` is told whether
@@ -21522,9 +21538,22 @@ declare module "gpui-base" {
       /** Defaults to false. */
       soft_wrap?: boolean;
       /** Semantic colors: keyword, string, comment, function, type, number,
-       * constant, variable, operator, punctuation, boolean, string.escape.
+       * constant, variable, parameter, property, macro, regexp, tag, attribute,
+       * namespace, operator, punctuation, heading, boolean, string.escape.
        * Values are concrete hex colors; unspecified UI colors follow the theme. */
       syntax?: Record<string, string>;
+      /** Optional editor surface overrides (concrete hex colors). */
+      colors?: {
+        background?: string;
+        foreground?: string;
+        gutter?: string;
+        line_number?: string;
+        active_line?: string;
+        selection?: string;
+        caret?: string;
+        border?: string;
+        invisible?: string;
+      };
     }) => EditorState;
   };
   export const Editor: { new: (state: EditorState) => NativeElement };
@@ -22274,9 +22303,10 @@ declare module "herdr" {
    *  Rejects when it can't start (not installed, no such folder, the machine is unreachable). */
   export function exec(command: string, args?: string[], options?: { cwd?: string; on?: string | null; timeout?: number }): Promise<ExecResult>;
 
-  /** Runs `hc` / `h2` with the given arguments. Add "--json" for machine output. */
-  export function hc(args: string[]): Promise<ExecResult>;
-  export function h2(args: string[]): Promise<ExecResult>;
+  /** Runs `hc` / `h2` with the given arguments. Add "--json" for machine output.
+   *  `timeout`: milliseconds, defaults to 30,000, capped at 600,000 (10 minutes). */
+  export function hc(args: string[], options?: { timeout?: number }): Promise<ExecResult>;
+  export function h2(args: string[], options?: { timeout?: number }): Promise<ExecResult>;
 
   /** The user's home directory. */
   export function home(): string;
@@ -22289,9 +22319,13 @@ declare module "herdr" {
   /** Reads UTF-8 text (up to 1 MiB), or null if absent. Runs off the UI thread.
    *  `on`: from that machine (a space's `machine`). */
   export function readTextFile(path: string, options?: { on?: string | null }): Promise<string | null>;
+  /** Reads an image (up to 8 MiB) as a `data:<mime>;base64,...` URL, or null if absent. Runs off the UI thread.
+   *  `on`: from that machine (a space's `machine`). */
+  export function readImageDataUrl(path: string, options?: { on?: string | null }): Promise<string | null>;
   /** Writes UTF-8 text only if it still matches expected (null creates a new file).
-   * Rejects on a stale snapshot; existing files are replaced atomically. */
-  export function writeTextFile(path: string, text: string, expected: string | null): Promise<null>;
+   * Rejects on a stale snapshot; existing files are replaced atomically.
+   * `on`: on that machine (a space's `machine`). */
+  export function writeTextFile(path: string, text: string, expected: string | null, options?: { on?: string | null }): Promise<null>;
 
   /** The agents people can start from a menu (entries with `run` in programs.json), most picked
    *  first, and whether each is installed: asked of the shell agents start in (on another machine,
@@ -22302,6 +22336,25 @@ declare module "herdr" {
   /** Opens the system's folder picker (this machine). Resolves with the chosen folder, or null
    *  when the person cancels. `prompt`: the confirm button's text (default "Open"). */
   export function pickFolder(options?: { prompt?: string }): Promise<string | null>;
+
+  export interface DraftAttachment {
+    kind: "image" | "resource";
+    /** Absolute local path suitable for `h2 send --image` / `--resource`. */
+    path: string;
+    /** App-home relative path for `image()` thumbnails (present for images). */
+    preview?: string | null;
+    name: string;
+    mimeType: string;
+    bytes: number;
+  }
+  export type DraftAttachmentResult = DraftAttachment | { error: string };
+
+  /** Reads an image or copied file paths from the system clipboard and prepares attachment descriptors. */
+  export function pasteClipboardAttachments(): DraftAttachmentResult[];
+  /** Validates local file paths (e.g. from `.on_drop`) into image/resource attachment descriptors (up to 8, <= 8 MiB each). */
+  export function prepareAttachments(paths: string[]): DraftAttachmentResult[];
+  /** Opens the system's file picker and returns prepared image/resource attachment descriptors. */
+  export function pickAttachments(options?: { prompt?: string; multiple?: boolean }): Promise<DraftAttachmentResult[]>;
 
   /** Plays "done" or "blocked" (the attention sounds, or the files settings.json names), or an MP3
    *  file (absolute, or relative to ~/.config/herdr-app). */
@@ -22314,16 +22367,17 @@ declare module "herdr" {
    * the call returns; terminal.keep/park finish in the background and toast on failure.
    * A rename without a name is asked for;
    * "" gives the space or tab Herdr's automatic name again. The main ones:
-   * Spaces: space.new {name?, folder?, tab?, argv?, task?, machine?, focus?}, space.close {id?}, space.rename {id?, name},
+   * Spaces: space.new {name?, folder?, tab?, argv?, task?, model?, effort?, machine?, focus?}, space.close {id?}, space.rename {id?, name},
    *   space.move {id, index}, space.select {index | id}, space.next, space.prev.
-   * Tabs: tab.new {name?, space?, folder?, argv?, task?, focus?} (argv: an agent, task: its first message)
+   * Tabs: tab.new {name?, space?, folder?, argv?, task?, model?, effort?, focus?} (argv: an agent, task: its first message)
+   *   or {name?, space?, folder?, acp: true, agent, task?, model?, effort?, focus?} (an ACP agent tab)
    *   or {name?, space?, mod, props?, focus?} (a tab whose only pane is a mod),
    *   tab.close {id?}, tab.rename {id?, name}, tab.move {id?, index | by} (by: -1 left, 1 right, wrapping), tab.select {index | id},
    *   tab.next, tab.prev.
    * New spaces and tabs take focus by default. Boolean focus: false keeps the shown
    * space, selected tab and keyboard focus; background tabs are appended in creation order.
    * With no space shown, a new space is shown even with focus: false.
-   * Panes: pane.split {direction: "right" | "down", pane?}, pane.close {pane?}, pane.zoom {pane?},
+   * Panes: pane.split {direction: "right" | "down", pane?}, pane.close {pane?}, pane.detach {pane?}, pane.zoom {pane?},
    *   pane.focus {pane | terminal}, pane.go {direction}, pane.swap {pane?, direction | target}.
    *   Pane menus get target { pane, terminal }.
    * Terminals: terminal.open {argv?, folder?, place?: "tab" | "right" | "down"}, terminal.kill {terminal},
@@ -22382,6 +22436,10 @@ declare module "herdr" {
     changed_at: number | null;
     /** Since when an agent in it has been working, or null. */
     working_since: number | null;
+    /** Active or most recent completed run duration of an agent in it (ms), or null. */
+    work_ms?: number | null;
+    /** Cumulative active execution duration across agents in it (ms). */
+    total_work_ms?: number;
   }
 
   export interface SpaceInfo {
@@ -22448,6 +22506,14 @@ declare module "herdr" {
     program: Program;
     /** The terminal's title. */
     title: string;
+    /** True when mounted as a structured ACP session. */
+    acp?: boolean;
+    /** Epoch ms when the current active working run began, or null. */
+    working_since?: number | null;
+    /** Active or most recent completed run duration (ms), or null. */
+    work_ms?: number | null;
+    /** Cumulative active execution duration across runs (ms). */
+    total_work_ms?: number;
     /** Higher = changed more recently. */
     seq: number;
     /** Pinned with `terminal.pin`, on any Herdr client. */
@@ -22490,8 +22556,16 @@ declare module "herdr" {
     zoomed: boolean;
     /** The app's top-center grip can rearrange this pane. False when zoomed or alone. */
     movable: boolean;
+    /** True when mounted as a structured ACP session. */
+    acp?: boolean;
     /** True when a non-ACP terminal pane is currently displayed in structured ACP-style (`peek`) view. */
     structured?: boolean;
+    /** Epoch ms when the current active working run began, or null. */
+    working_since?: number | null;
+    /** Active or most recent completed run duration (ms), or null. */
+    work_ms?: number | null;
+    /** Cumulative active execution duration across runs (ms). */
+    total_work_ms?: number;
     /** History scroll for a terminal pane's attached view; null for mod panes / alt-screen. Live. */
     scroll?: PaneScroll | null;
   }
@@ -22584,9 +22658,10 @@ declare module "herdr" {
   } | null;
 
   /** Every theme color by name: background (the terminals'), surface, canvas (behind cards),
-   *  chrome (sidebars and bars), popover, raised, hover, selected, border, input, foreground,
-   *  muted, dim, accent, accent_foreground, solid and solid_foreground (a primary button: ink on
-   *  paper, paper on ink), selection, working, blocked, done, idle, unknown, ansi0..ansi15.
+   *  chrome (sidebars and bars), popover, raised, message (user bubble surface), code_bg, glass,
+   *  hover, selected, border, input, foreground, muted, dim, accent, accent_foreground,
+   *  solid and solid_foreground (a primary button: ink on paper, paper on ink), selection,
+   *  working, blocked, done, idle, unknown, ansi0..ansi15.
    *  Light and dark themes name the same colors, so a mod that uses them follows both. */
   export function theme(): Record<string, string>;
 
@@ -22605,43 +22680,14 @@ declare module "herdr" {
    *  (`app.check_updates` starts a look). */
   export function updates(): {
     app: { version: string; ready: string | null; updates: boolean };
-    notes: { version: string; date: string; items: { headline: string; detail: string; fixed: boolean; media: { path: string; width: number; height: number }[] }[]; spotlight: boolean }[];
+    ui?: { version: string; app_version: string; ready: string | null; ready_notes: string | null; applying: boolean; mode: string; error: string | null; last_applied_at: number | null; active_override: boolean };
     core: { version: string | null; managed: string | null; ready: string | null; updating: boolean; error: string | null };
     checked: number | null;
     checks: boolean;
     checking: boolean;
+    releases_url?: string | null;
+    dev_defaults?: string | null;
   };
-
-  /** Record only spotlight versions actually shown expanded, never collapsed headlines. */
-  export function presentUpdateNotes(versions: string[]): null;
-
-  /** Anonymous usage data (one report per day, never terminal content). `enabled`: collecting now;
-   *  `setting`: settings.json's `telemetry`; `off_because`: an env var that turns it off for this run
-   *  (DO_NOT_TRACK, HERDR_TELEMETRY, CI); `sends`: false for a build from source (it never sends).
-   *  `draft`: today's report so far; `queued`: finished days waiting to go, exactly as they'll be
-   *  sent; `last_sent`: the last one the server took (`at`: unix seconds). Null until it starts. */
-  export function telemetry(): {
-    enabled: boolean;
-    setting: boolean;
-    off_because: string | null;
-    sends: boolean;
-    endpoint: string;
-    draft: Record<string, unknown> | null;
-    queued: Record<string, unknown>[];
-    last_sent: { at: number; report: Record<string, unknown> } | null;
-  } | null;
-
-  /** The explicit feedback draft. Sending is restricted to the app-owned feedback frame. */
-  export function feedbackPreview(message: string, email: string, images?: number): { body: import("gpui-kit").HostValue; available: boolean };
-  /** The clipboard's image, kept for the form (`path` for `image()`); null when it holds none. Frame-only. */
-  export function feedbackPasteImage(): { path: string } | { error: string } | null;
-  /** Picks image files (at most 3), each kept like a pasted one. Frame-only. */
-  export function feedbackPickImages(): Promise<({ path: string } | { error: string })[]>;
-  /** Attaches dropped image paths (at most 3), using the picker's conversion and limits. Frame-only. */
-  export function feedbackAttachImages(paths: string[]): ({ path: string } | { error: string })[];
-  /** Drops the form's kept screenshots. Frame-only. */
-  export function feedbackClearImages(): null;
-  export function sendFeedback(body: import("gpui-kit").HostValue, images?: string[]): Promise<string | null>;
 
   /** What the app runs with: the shown layout's look (theme name, fonts, sizes, terminal
    *  padding and opacity, terminal_line_height, terminal_cell_width and terminal_scroll_speed) with the

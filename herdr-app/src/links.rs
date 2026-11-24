@@ -6,12 +6,14 @@ use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-/// Ghostty's default link pattern (`src/config/url.zig`), unchanged.
+/// Ghostty's default link pattern (`src/config/url.zig`), with ASCII word
+/// boundaries (so CJK text adjacent to paths still matches) and Windows drive paths.
 static PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     let schemes = r"https?://|mailto:|ftp://|file:|ssh:|git://|ssh://|tel:|magnet:|ipfs://|ipns://|gemini://|gopher://|news:";
     let ipv6 = r"(?:\[[:0-9a-fA-F]+(?:[:0-9a-fA-F]*)+\](?::[0-9]+)?)";
     let scheme_chars = r"[\w\-.~:/?#@!$&*+,;=%]";
     let path_chars = r"[\w\-.~:\/?#@!$&*+;=%]";
+    let win_path_chars = r"[\w\-.~:\\/?#@!$&*+;=%]";
     let bracketed = r"(?:[\(\[]\w*[\)\]])?";
     let no_trailing_punctuation = r"(?<![,.])";
     let no_trailing_colon = r"(?<!:)";
@@ -19,13 +21,14 @@ static PATTERN: LazyLock<Regex> = LazyLock::new(|| {
     let undotted = r"(?![\w\-.~:\/?#@!$&*+;=%]*\.)";
     let dotted_spaces = r"(?:(?<!:) (?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)[\w\-.~:\/?#@!$&*+;=%]*[\/.])*";
     let any_spaces = r"(?:(?<!:) (?!\w+:\/\/)(?!\.{0,2}\/)(?!~\/)[\w\-.~:\/?#@!$&*+;=%]+)*";
-    let rooted = r"(?:\.\.\/|\.\/|(?<!\w)~\/|(?:[\w][\w\-.]*\/)*(?<!\w)\$[A-Za-z_]\w*\/|\.[\w][\w\-.]*\/|(?<![\w~\/])\/(?!\/))";
+    let rooted = r"(?:\.\.\/|\.\/|(?<![A-Za-z0-9_])~\/|(?:[\w][\w\-.]*\/)*(?<![A-Za-z0-9_])\$[A-Za-z_]\w*\/|\.[\w][\w\-.]*\/|(?<![A-Za-z0-9_~\/])\/(?!\/))";
     let scheme_url = format!("(?:{schemes})(?:{ipv6}|{scheme_chars}+{bracketed})+{no_trailing_punctuation}");
+    let windows_path = format!(r"(?<![A-Za-z0-9_])[A-Za-z]:[\\/]{win_path_chars}+{no_trailing_colon}");
     let rooted_path = format!(
         "{rooted}(?:{dotted}{path_chars}+{dotted_spaces}{no_trailing_colon}|{undotted}{path_chars}+{any_spaces}{no_trailing_colon})"
     );
-    let bare_path = format!(r"{dotted}(?<!\$\d*)(?<!\w)[\w][\w\-.]*\/{path_chars}+{no_trailing_colon}");
-    Regex::new(&format!("{scheme_url}|{rooted_path}|{bare_path}")).expect("link pattern")
+    let bare_path = format!(r"{dotted}(?<!\$\d*)(?<![A-Za-z0-9_])[\w][\w\-.]*\/{path_chars}+{no_trailing_colon}");
+    Regex::new(&format!("{scheme_url}|{windows_path}|{rooted_path}|{bare_path}")).expect("link pattern")
 });
 
 /// The link in `text` that covers byte `at`.
@@ -78,9 +81,23 @@ pub fn resolve(link: &str, cwd: Option<&Path>) -> Option<Target> {
     resolve_with_location(link, cwd).map(|(target, _, _)| target)
 }
 
-/// Parses `#L10-L20`, `#L10`, `:10-20`, `:10:5`, or `:10` suffix into `(base, start_line, end_line)`.
+/// Parses `#L10-L20`, `#L10`, `:L10-L20`, `:L10`, `:10-20`, `:10:5`, `:10`,
+/// `(10)`, or `(10,5)` suffix into `(base, start_line, end_line)`.
 fn split_line_suffix(raw: &str) -> (&str, Option<u32>, Option<u32>) {
-    let bare = raw.strip_suffix('.').unwrap_or(raw);
+    let bare = raw.trim_end_matches(['.', ':', ',', ';']);
+    if let Some(head) = bare.strip_suffix(')')
+        && let Some((path, inner)) = head.rsplit_once('(')
+        && !path.is_empty()
+    {
+        let first = inner.split(',').next().unwrap_or("").trim();
+        if !first.is_empty()
+            && first.bytes().all(|c| c.is_ascii_digit())
+            && let Ok(line) = first.parse::<u32>()
+            && line > 0
+        {
+            return (path, Some(line), None);
+        }
+    }
     if let Some((head, frag)) = bare.rsplit_once('#')
         && let Some(rest) = frag.strip_prefix('L').or_else(|| frag.strip_prefix('l'))
     {
@@ -98,6 +115,21 @@ fn split_line_suffix(raw: &str) -> (&str, Option<u32>, Option<u32>) {
         }
     }
     if let Some((head, tail)) = bare.rsplit_once(':') {
+        // `:L10-L20` or `:L10`
+        if let Some(rest) = tail.strip_prefix('L').or_else(|| tail.strip_prefix('l')) {
+            if let Some((a, b)) = rest.split_once('-') {
+                let b = b.strip_prefix('L').or_else(|| b.strip_prefix('l')).unwrap_or(b);
+                if let (Ok(s), Ok(e)) = (a.parse::<u32>(), b.parse::<u32>())
+                    && s > 0
+                {
+                    return (head, Some(s), Some(e.max(s)));
+                }
+            } else if let Ok(s) = rest.parse::<u32>()
+                && s > 0
+            {
+                return (head, Some(s), None);
+            }
+        }
         // `:10-20`
         if let Some((a, b)) = tail.split_once('-')
             && !a.is_empty()
@@ -129,14 +161,64 @@ fn split_line_suffix(raw: &str) -> (&str, Option<u32>, Option<u32>) {
     (bare, None, None)
 }
 
+fn is_url_scheme(link: &str) -> bool {
+    link.split_once(':').is_some_and(|(s, _)| {
+        s.len() > 1 && s.starts_with(|c: char| c.is_ascii_alphabetic()) && s.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    })
+}
+
+fn local_hostname() -> Option<&'static str> {
+    static HOST: LazyLock<Option<String>> = LazyLock::new(|| {
+        for var in ["HOSTNAME", "COMPUTERNAME"] {
+            if let Ok(v) = std::env::var(var) {
+                let t = v.trim();
+                if !t.is_empty() {
+                    return Some(t.to_owned());
+                }
+            }
+        }
+        #[cfg(unix)]
+        if let Ok(raw) = std::fs::read_to_string("/etc/hostname") {
+            let t = raw.trim();
+            if !t.is_empty() {
+                return Some(t.to_owned());
+            }
+        }
+        None
+    });
+    HOST.as_deref()
+}
+
+fn resolve_local_candidate(full: &Path) -> Option<(Target, Option<u32>, Option<u32>)> {
+    // Windows ignores a trailing period when checking whether a path exists.
+    if !(cfg!(windows) && full.extension().is_some_and(|ext| ext.is_empty())) && full.exists() {
+        return Some((Target::File(full.to_path_buf()), None, None));
+    }
+    // The period ending a sentence, or `:42` / `:42:7` / `#L10-L20` / `(42,7)` naming a place in the file.
+    let full_str = full.to_str()?;
+    let (bare, line, end_line) = split_line_suffix(full_str);
+    if bare.is_empty() {
+        return None;
+    }
+    Path::new(bare)
+        .exists()
+        .then(|| (Target::File(PathBuf::from(bare)), line, end_line))
+}
+
 /// Resolves a terminal link into a target plus optional 1-based `(start_line, end_line)`.
 pub fn resolve_with_location(link: &str, cwd: Option<&Path>) -> Option<(Target, Option<u32>, Option<u32>)> {
-    let scheme = link.split_once(':').is_some_and(|(s, _)| {
-        s.len() > 1 && s.starts_with(|c: char| c.is_ascii_alphabetic()) && s.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
-    });
-    if scheme {
+    match cwd {
+        Some(dir) => resolve_with_roots(link, &[dir]),
+        None => resolve_with_roots(link, &[]),
+    }
+}
+
+/// Resolves a terminal link against an ordered list of candidate base directories
+/// (e.g. terminal `cwd`, git repo root, space folder).
+pub fn resolve_with_roots(link: &str, roots: &[&Path]) -> Option<(Target, Option<u32>, Option<u32>)> {
+    if is_url_scheme(link) {
         // Windows can't open a file URL whose path is percent-encoded, the way programs write them.
-        if let Some((path, line, end_line)) = file_url_path_with_location(link)
+        if let Some((path, line, end_line)) = file_url_path_with_location(link, false)
             && path.exists()
         {
             return Some((Target::File(path), line, end_line));
@@ -144,39 +226,51 @@ pub fn resolve_with_location(link: &str, cwd: Option<&Path>) -> Option<(Target, 
         return Some((Target::Url(link.to_owned()), None, None));
     }
     let home = std::env::home_dir();
-    let expanded = if let Some(rest) = link.strip_prefix("~/") {
-        home?.join(rest)
-    } else if let Some(var) = link.strip_prefix('$') {
+    if let Some(rest) = link.strip_prefix("~/") {
+        let full = home?.join(rest);
+        return resolve_local_candidate(&full);
+    }
+    if let Some(var) = link.strip_prefix('$') {
         let (name, rest) = var.split_once('/').unwrap_or((var, ""));
+        if name == "PWD" {
+            for root in roots {
+                if let Some(found) = resolve_local_candidate(&root.join(rest)) {
+                    return Some(found);
+                }
+            }
+            return None;
+        }
         let base = match name {
-            "PWD" => cwd?.to_path_buf(),
             "HOME" => home?,
             _ => PathBuf::from(std::env::var_os(name)?),
         };
-        base.join(rest)
-    } else {
-        PathBuf::from(link)
-    };
-    let full = if expanded.is_absolute() { expanded } else { cwd?.join(expanded) };
-    // Windows ignores a trailing period when checking whether a path exists.
-    if !(cfg!(windows) && full.extension().is_some_and(|ext| ext.is_empty())) && full.exists() {
-        return Some((Target::File(full), None, None));
+        return resolve_local_candidate(&base.join(rest));
     }
-    // The period ending a sentence, or `:42` / `:42:7` / `#L10-L20` naming a place in the file.
-    let full_str = full.to_str()?;
-    let (bare, line, end_line) = split_line_suffix(full_str);
-    Path::new(bare)
-        .exists()
-        .then(|| (Target::File(PathBuf::from(bare)), line, end_line))
+    let expanded = PathBuf::from(link);
+    if expanded.is_absolute() {
+        return resolve_local_candidate(&expanded);
+    }
+    for root in roots {
+        if let Some(found) = resolve_local_candidate(&root.join(&expanded)) {
+            return Some(found);
+        }
+    }
+    // Git diff paths (`a/src/foo.rs`, `b/src/foo.rs`) when no literal `a/` or `b/` folder exists.
+    if let Some(stripped) = link.strip_prefix("a/").or_else(|| link.strip_prefix("b/")) {
+        let rel = Path::new(stripped);
+        for root in roots {
+            if let Some(found) = resolve_local_candidate(&root.join(rel)) {
+                return Some(found);
+            }
+        }
+    }
+    None
 }
 
 /// Resolves a link printed inside a remote SSH terminal (cannot check local `Path::exists()`).
 pub fn resolve_remote_with_location(link: &str, cwd: Option<&str>) -> Option<(Target, Option<u32>, Option<u32>)> {
-    let scheme = link.split_once(':').is_some_and(|(s, _)| {
-        s.len() > 1 && s.starts_with(|c: char| c.is_ascii_alphabetic()) && s.chars().all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
-    });
-    if scheme {
-        if let Some((path, line, end_line)) = file_url_path_with_location(link) {
+    if is_url_scheme(link) {
+        if let Some((path, line, end_line)) = file_url_path_with_location(link, true) {
             return Some((Target::File(path), line, end_line));
         }
         return Some((Target::Url(link.to_owned()), None, None));
@@ -185,7 +279,11 @@ pub fn resolve_remote_with_location(link: &str, cwd: Option<&str>) -> Option<(Ta
     if bare.is_empty() || bare.starts_with('$') {
         return None;
     }
-    let full = if bare.starts_with('/') || bare.starts_with("~/") {
+    let is_win_abs = bare.len() >= 3
+        && bare.as_bytes()[0].is_ascii_alphabetic()
+        && bare.as_bytes()[1] == b':'
+        && matches!(bare.as_bytes()[2], b'/' | b'\\');
+    let full = if bare.starts_with('/') || bare.starts_with("~/") || is_win_abs {
         bare.to_owned()
     } else if let Some(dir) = cwd.map(str::trim).filter(|s| !s.is_empty()) {
         format!("{}/{}", dir.trim_end_matches('/'), bare.trim_start_matches("./"))
@@ -195,11 +293,313 @@ pub fn resolve_remote_with_location(link: &str, cwd: Option<&str>) -> Option<(Ta
     Some((Target::File(PathBuf::from(full)), line, end_line))
 }
 
+fn is_path_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric()
+        || matches!(
+            c,
+            '-' | '_' | '/' | '\\' | '.' | ':' | '#' | '~' | '@' | '+' | '%' | '$' | '(' | ')' | ','
+        )
+        || (!c.is_ascii() && c.is_alphanumeric())
+}
+
+/// Extracts a path-like token under byte `at` (including single filenames like `Cargo.toml`,
+/// `src/justfile`, `src/main.rs(42,7)`, or Windows `src\main.rs:10`), trimming outer quotes/brackets.
+fn path_token(text: &str, at: usize) -> Option<Range<usize>> {
+    if !text.get(at..)?.chars().next().is_some_and(is_path_token_char) {
+        return None;
+    }
+    let mut start = text[..at]
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !is_path_token_char(*c))
+        .map_or(0, |(i, c)| i + c.len_utf8());
+    let mut end = text[at..]
+        .char_indices()
+        .find(|(_, c)| !is_path_token_char(*c))
+        .map_or(text.len(), |(i, _)| at + i);
+
+    // Strip leading non-path delimiters like `(` or `,` or `:`.
+    while start < end {
+        let ch = text[start..end].chars().next()?;
+        if matches!(ch, '(' | ')' | ',' | ':' | ';') {
+            start += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    // Strip trailing punctuation, while preserving `file(42)` / `file(42,10)`.
+    while start < end {
+        let slice = &text[start..end];
+        let ch = slice.chars().next_back()?;
+        if matches!(ch, ',' | ';' | ':') {
+            end -= ch.len_utf8();
+            continue;
+        }
+        if ch == ')' {
+            let open = slice.matches('(').count();
+            let close = slice.matches(')').count();
+            if close > open || !split_line_suffix(slice).1.is_some() {
+                end -= 1;
+                continue;
+            }
+        }
+        if ch == '(' {
+            end -= 1;
+            continue;
+        }
+        break;
+    }
+    (start <= at && at < end).then_some(start..end)
+}
+
+/// Trims trailing non-ASCII characters (e.g. Chinese text glued onto an ASCII path like `src/app.rs中的函数`
+/// or `src/app.rs:42行`) while keeping `at` inside the range.
+fn trim_trailing_non_ascii(text: &str, range: Range<usize>, at: usize) -> Option<Range<usize>> {
+    let mut end = range.end;
+    while end > range.start {
+        let ch = text[range.start..end].chars().next_back()?;
+        if !ch.is_ascii() {
+            end -= ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    (end < range.end && range.start <= at && at < end).then_some(range.start..end)
+}
+
+/// Trims leading non-ASCII characters (e.g. `查看Cargo.toml` -> `Cargo.toml`) while keeping `at` inside.
+fn trim_leading_non_ascii(text: &str, range: Range<usize>, at: usize) -> Option<Range<usize>> {
+    let mut start = range.start;
+    while start < range.end {
+        let ch = text[start..range.end].chars().next()?;
+        if !ch.is_ascii() {
+            start += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    (start > range.start && start <= at && at < range.end).then_some(start..range.end)
+}
+
+/// Extends a matched file path range to absorb an immediately following `(line)` or `(line,col)` suffix.
+fn extend_paren_location(text: &str, range: Range<usize>) -> Option<(Range<usize>, Option<u32>, Option<u32>)> {
+    let rest = text.get(range.end..)?;
+    if !rest.starts_with('(') {
+        return None;
+    }
+    let close = rest.find(')')?;
+    let extended = range.start..(range.end + close + 1);
+    let (_, line, end_line) = split_line_suffix(&text[extended.clone()]);
+    line.map(|_| (extended, line, end_line))
+}
+
+fn try_resolve_range_local(
+    text: &str,
+    range: Range<usize>,
+    at: usize,
+    roots: &[&Path],
+    joined: bool,
+) -> Option<(Range<usize>, Target, Option<u32>, Option<u32>)> {
+    let slice = &text[range.clone()];
+    if let Some((target, mut line, mut end_line)) = resolve_with_roots(slice, roots)
+        && (!joined || matches!(target, Target::File(_)))
+    {
+        let mut final_range = range;
+        if line.is_none()
+            && matches!(target, Target::File(_))
+            && let Some((ext_range, ext_line, ext_end)) = extend_paren_location(text, final_range.clone())
+        {
+            final_range = ext_range;
+            line = ext_line;
+            end_line = ext_end;
+        }
+        return Some((final_range, target, line, end_line));
+    }
+    // If trailing non-ASCII prose was glued to an ASCII path (e.g. `src/app.rs:42行`), retry trimmed.
+    if let Some(trimmed) = trim_trailing_non_ascii(text, range.clone(), at)
+        && let Some((target, line, end_line)) = resolve_with_roots(&text[trimmed.clone()], roots)
+        && (!joined || matches!(target, Target::File(_)))
+    {
+        return Some((trimmed, target, line, end_line));
+    }
+    // If leading non-ASCII prose was glued (e.g. `查看Cargo.toml`), retry trimmed.
+    if let Some(trimmed) = trim_leading_non_ascii(text, range.clone(), at) {
+        if let Some((target, line, end_line)) = resolve_with_roots(&text[trimmed.clone()], roots)
+            && (!joined || matches!(target, Target::File(_)))
+        {
+            return Some((trimmed, target, line, end_line));
+        }
+        if let Some(both) = trim_trailing_non_ascii(text, trimmed, at)
+            && let Some((target, line, end_line)) = resolve_with_roots(&text[both.clone()], roots)
+            && (!joined || matches!(target, Target::File(_)))
+        {
+            return Some((both, target, line, end_line));
+        }
+    }
+    None
+}
+
+/// Finds and resolves the link under byte `at` for a local terminal.
+/// Handles Ghostty URLs/paths, space-separated paths, CJK-adjacent paths,
+/// Windows paths, single filenames in `roots`, and extensionless relative paths.
+pub fn find_and_resolve_local(
+    text: &str,
+    at: usize,
+    roots: &[&Path],
+    joined: bool,
+) -> Option<(Range<usize>, Target, Option<u32>, Option<u32>)> {
+    if let Some(range) = find(text, at) {
+        if let Some(found) = try_resolve_range_local(text, range.clone(), at, roots, joined) {
+            return Some(found);
+        }
+        // `rooted_path` allows spaces for paths like `/tmp/test folder/file.txt`, which can
+        // gobble adjacent words or a second path (`/tmp/a.rs src/b.rs`, `/tmp/Makefile for`).
+        let matched = &text[range.clone()];
+        if matched.contains(' ') {
+            // Try trimming from the right at each space while keeping `at` covered.
+            let mut end = range.end;
+            while let Some(rel_sp) = text[range.start..end].rfind(' ') {
+                end = range.start + rel_sp;
+                if at >= end {
+                    break;
+                }
+                if let Some(found) = try_resolve_range_local(text, range.start..end, at, roots, joined) {
+                    return Some(found);
+                }
+            }
+            // If `at` was inside a later space-separated word (e.g. `src/b.rs` in `/tmp/a.rs src/b.rs`),
+            // retry finding/resolving starting after the preceding space.
+            if let Some(rel_sp) = text[range.start..at].rfind(' ') {
+                let sub_start = range.start + rel_sp + 1;
+                if sub_start <= at && sub_start < text.len() {
+                    if let Some(sub) = find(&text[sub_start..], at - sub_start) {
+                        let abs_range = (sub_start + sub.start)..(sub_start + sub.end);
+                        if let Some(found) = try_resolve_range_local(text, abs_range, at, roots, joined) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if joined {
+        return None;
+    }
+    let token = path_token(text, at)?;
+    try_resolve_range_local(text, token, at, roots, false)
+}
+
+fn is_known_remote_filename(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "makefile"
+            | "dockerfile"
+            | "cargo.toml"
+            | "cargo.lock"
+            | "package.json"
+            | "package-lock.json"
+            | "tsconfig.json"
+            | "readme.md"
+            | "claude.md"
+            | "agents.md"
+            | "skill.md"
+            | "justfile"
+            | ".gitignore"
+    )
+}
+
+fn looks_like_remote_file_token(raw: &str) -> bool {
+    let (bare, line, _) = split_line_suffix(raw);
+    if bare.is_empty() || bare.contains(' ') || bare.starts_with("//") {
+        return false;
+    }
+    if bare.starts_with('/') || bare.starts_with("~/") || bare.starts_with("./") || bare.starts_with("../") {
+        return bare.len() > 2;
+    }
+    if bare.len() >= 3 && bare.as_bytes()[0].is_ascii_alphabetic() && bare.as_bytes()[1] == b':' && matches!(bare.as_bytes()[2], b'/' | b'\\') {
+        return true;
+    }
+    if let Some((_, last)) = bare.rsplit_once(['/', '\\']) {
+        return !last.is_empty() && (last.contains('.') || is_known_remote_filename(last));
+    }
+    is_known_remote_filename(bare) || (line.is_some() && bare.contains('.'))
+}
+
+/// Finds and resolves the link under byte `at` for a remote SSH/WSL terminal.
+pub fn find_and_resolve_remote(
+    text: &str,
+    at: usize,
+    cwd: Option<&str>,
+    joined: bool,
+) -> Option<(Range<usize>, Target, Option<u32>, Option<u32>)> {
+    if joined {
+        return None;
+    }
+    if let Some(mut range) = find(text, at) {
+        let matched = &text[range.clone()];
+        // Avoid sending space-gobbled prose (e.g. `/srv/Makefile for details`) to remote `cat`.
+        if !is_url_scheme(matched) && matched.contains(' ') {
+            let word_start = text[range.start..at].rfind(' ').map_or(range.start, |i| range.start + i + 1);
+            let word_end = text[at..range.end].find(' ').map_or(range.end, |i| at + i);
+            if word_start <= at && at < word_end && looks_like_remote_file_token(&text[word_start..word_end]) {
+                range = word_start..word_end;
+            }
+        }
+        if !is_url_scheme(&text[range.clone()]) {
+            if let Some(trimmed) = trim_leading_non_ascii(text, range.clone(), at)
+                && !text[trimmed.clone()].starts_with('/')
+                && looks_like_remote_file_token(&text[trimmed.clone()])
+            {
+                range = trimmed;
+            }
+            if let Some(trimmed) = trim_trailing_non_ascii(text, range.clone(), at)
+                && looks_like_remote_file_token(&text[trimmed.clone()])
+            {
+                range = trimmed;
+            }
+        }
+        if let Some((target, mut line, mut end_line)) = resolve_remote_with_location(&text[range.clone()], cwd) {
+            if line.is_none()
+                && matches!(target, Target::File(_))
+                && let Some((ext_range, ext_line, ext_end)) = extend_paren_location(text, range.clone())
+            {
+                range = ext_range;
+                line = ext_line;
+                end_line = ext_end;
+            }
+            return Some((range, target, line, end_line));
+        }
+    }
+    let mut token = path_token(text, at)?;
+    if let Some(trimmed) = trim_leading_non_ascii(text, token.clone(), at) {
+        token = trimmed;
+    }
+    if let Some(trimmed) = trim_trailing_non_ascii(text, token.clone(), at) {
+        token = trimmed;
+    }
+    if !looks_like_remote_file_token(&text[token.clone()]) {
+        return None;
+    }
+    let (target, line, end_line) = resolve_remote_with_location(&text[token.clone()], cwd)?;
+    Some((token, target, line, end_line))
+}
+
 /// The path a `file:` URL names on this computer, percent-decoded, with optional `#L10-L20` / `:10`.
-fn file_url_path_with_location(link: &str) -> Option<(PathBuf, Option<u32>, Option<u32>)> {
+fn file_url_path_with_location(link: &str, allow_any_host: bool) -> Option<(PathBuf, Option<u32>, Option<u32>)> {
     let rest = link.strip_prefix("file://")?;
-    let rest = rest.strip_prefix("localhost").unwrap_or(rest);
-    // Another host's file, or no path.
+    let rest = if rest.starts_with('/') {
+        rest
+    } else if let Some((host, _)) = rest.split_once('/') {
+        let local_ok = host.eq_ignore_ascii_case("localhost")
+            || local_hostname().is_some_and(|h| host.eq_ignore_ascii_case(h));
+        if allow_any_host || local_ok {
+            &rest[host.len()..]
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    };
     if !rest.starts_with('/') {
         return None;
     }
@@ -232,7 +632,7 @@ fn file_url_path_with_location(link: &str) -> Option<(PathBuf, Option<u32>, Opti
         line = l;
         end_line = e;
     }
-    if line.is_none() && !Path::new(&path).exists() {
+    if line.is_none() && (allow_any_host || !Path::new(&path).exists()) {
         let (stripped, l, e) = split_line_suffix(&path);
         if l.is_some() {
             path = stripped.to_owned();
@@ -547,6 +947,102 @@ mod tests {
             resolve_remote_with_location("src/foo.rs:18:2", Some("/srv/repo")),
             Some((Target::File(PathBuf::from("/srv/repo/src/foo.rs")), Some(18), None)),
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn cli_agent_file_links_handle_cjk_bare_files_spaces_roots_and_remote_urls() {
+        let dir = std::env::temp_dir().join(format!("herdr-links-cli-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub/nested")).unwrap();
+        std::fs::create_dir_all(dir.join("scripts")).unwrap();
+        std::fs::create_dir_all(dir.join("test folder")).unwrap();
+        let app_rs = dir.join("sub/app.rs");
+        let cargo_toml = dir.join("Cargo.toml");
+        let extless = dir.join("scripts/install-linux");
+        let spaced = dir.join("test folder/file.txt");
+        let makefile = dir.join("Makefile");
+        std::fs::write(&app_rs, "fn main() {}\n").unwrap();
+        std::fs::write(&cargo_toml, "[package]\n").unwrap();
+        std::fs::write(&extless, "#!/bin/sh\n").unwrap();
+        std::fs::write(&spaced, "ok\n").unwrap();
+        std::fs::write(&makefile, "all:\n").unwrap();
+
+        let roots = [dir.join("sub/nested"), dir.clone()];
+        let root_refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
+
+        // 1. CJK immediately before and after paths (very common in Chinese CLI agent output).
+        let cjk_rel = "请查看sub/app.rs中的改动";
+        let (r, t, l, e) = find_and_resolve_local(cjk_rel, cjk_rel.find("app.rs").unwrap(), &root_refs, false).unwrap();
+        assert_eq!(&cjk_rel[r], "sub/app.rs");
+        assert_eq!((t, l, e), (Target::File(app_rs.clone()), None, None));
+
+        let cjk_line = "修改了sub/app.rs:42行";
+        let (r, t, l, e) = find_and_resolve_local(cjk_line, cjk_line.find("sub/").unwrap(), &root_refs, false).unwrap();
+        assert_eq!(&cjk_line[r], "sub/app.rs:42");
+        assert_eq!((t, l, e), (Target::File(app_rs.clone()), Some(42), None));
+
+        let abs_cjk = format!("打开{}即可", app_rs.to_str().unwrap());
+        let (r, t, _, _) = find_and_resolve_local(&abs_cjk, abs_cjk.find("app.rs").unwrap(), &root_refs, false).unwrap();
+        assert_eq!(&abs_cjk[r], app_rs.to_str().unwrap());
+        assert_eq!(t, Target::File(app_rs.clone()));
+
+        // 2. Single-component filename, extensionless relative path, git diff prefix, parenthesized line.
+        let single = "查看Cargo.toml配置";
+        let (r, t, _, _) = find_and_resolve_local(single, single.find("Cargo").unwrap(), &root_refs, false).unwrap();
+        assert_eq!(&single[r], "Cargo.toml");
+        assert_eq!(t, Target::File(cargo_toml.clone()));
+
+        let no_ext = "Run scripts/install-linux now";
+        let (r, t, _, _) = find_and_resolve_local(no_ext, no_ext.find("scripts").unwrap(), &root_refs, false).unwrap();
+        assert_eq!(&no_ext[r], "scripts/install-linux");
+        assert_eq!(t, Target::File(extless.clone()));
+
+        let diff_line = "+++ b/sub/app.rs";
+        let (_, t, _, _) = find_and_resolve_local(diff_line, diff_line.find("app.rs").unwrap(), &root_refs, false).unwrap();
+        assert_eq!(t, Target::File(app_rs.clone()));
+
+        let parens = "error at sub/app.rs(17,4)";
+        let (_, t, l, _) = find_and_resolve_local(parens, parens.find("app.rs").unwrap(), &root_refs, false).unwrap();
+        assert_eq!((t, l), (Target::File(app_rs.clone()), Some(17)));
+
+        // 3. Rooted paths followed by prose or a second path must not gobble the rest of the line,
+        // while real paths with spaces still resolve.
+        let two_paths = format!("{} sub/app.rs", makefile.to_str().unwrap());
+        let (r1, t1, _, _) = find_and_resolve_local(&two_paths, two_paths.find("Makefile").unwrap(), &root_refs, false).unwrap();
+        assert_eq!(&two_paths[r1], makefile.to_str().unwrap());
+        assert_eq!(t1, Target::File(makefile.clone()));
+        let (r2, t2, _, _) = find_and_resolve_local(&two_paths, two_paths.find("sub/app.rs").unwrap(), &root_refs, false).unwrap();
+        assert_eq!(&two_paths[r2], "sub/app.rs");
+        assert_eq!(t2, Target::File(app_rs.clone()));
+
+        let with_prose = format!("Check {} for details", makefile.to_str().unwrap());
+        let (rp, tp, _, _) = find_and_resolve_local(&with_prose, with_prose.find("Makefile").unwrap(), &root_refs, false).unwrap();
+        assert_eq!(&with_prose[rp], makefile.to_str().unwrap());
+        assert_eq!(tp, Target::File(makefile.clone()));
+
+        let spaced_line = format!("See {} ok", spaced.to_str().unwrap());
+        let (rs, ts, _, _) = find_and_resolve_local(&spaced_line, spaced_line.find("file.txt").unwrap(), &root_refs, false).unwrap();
+        assert_eq!(&spaced_line[rs], spaced.to_str().unwrap());
+        assert_eq!(ts, Target::File(spaced.clone()));
+
+        // 4. Remote SSH/WSL paths: strip space-gobbled prose, trailing CJK, and remote file:// hostnames.
+        let remote_prose = "Check /srv/repo/Makefile for details";
+        let (rr, tr, _, _) = find_and_resolve_remote(remote_prose, remote_prose.find("Makefile").unwrap(), Some("/srv/repo"), false).unwrap();
+        assert_eq!(&remote_prose[rr], "/srv/repo/Makefile");
+        assert_eq!(tr, Target::File(PathBuf::from("/srv/repo/Makefile")));
+
+        let remote_cjk = "修改了src/foo.rs:18行";
+        let (rc, tc, lc, _) = find_and_resolve_remote(remote_cjk, remote_cjk.find("foo.rs").unwrap(), Some("/srv/repo"), false).unwrap();
+        assert_eq!(&remote_cjk[rc], "src/foo.rs:18");
+        assert_eq!((tc, lc), (Target::File(PathBuf::from("/srv/repo/src/foo.rs")), Some(18)));
+
+        let remote_url = "file://dev-box/srv/repo/src/foo.rs#L10-L20";
+        assert_eq!(
+            resolve_remote_with_location(remote_url, Some("/srv/repo")),
+            Some((Target::File(PathBuf::from("/srv/repo/src/foo.rs")), Some(10), Some(20))),
+        );
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

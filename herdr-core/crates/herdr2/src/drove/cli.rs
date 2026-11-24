@@ -66,6 +66,12 @@ pub enum DroveAction {
     },
     /// Read Drove configuration, resolved roles, and AI connection status.
     Settings {
+        /// Return only a specific section (`roles`, `agents`, `ai`, `magpie`, `config`).
+        #[arg(long, value_name = "SECTION")]
+        section: Option<String>,
+        /// Return a compact summary without full probed model lists.
+        #[arg(long)]
+        compact: bool,
         #[arg(long, value_name = "MACHINE")]
         on: Option<String>,
     },
@@ -205,25 +211,46 @@ pub enum DroveAction {
     },
     /// Wait for pending coordinator messages, task failures, or Run completion.
     Wait {
-        #[arg(long)]
+        /// Run ID (positional or via `--run`).
+        #[arg(value_name = "RUN")]
+        run_pos: Option<String>,
+        /// Run ID (equivalent to positional `<RUN>`).
+        #[arg(long = "run", value_name = "RUN", conflicts_with = "run_pos")]
         run: Option<String>,
         #[arg(long, default_value_t = 300)]
         timeout: u64,
         #[arg(long, default_value_t = 0)]
         since_seq: u64,
+        /// Return as soon as any additional task reaches a terminal state (not only full Run settlement).
+        #[arg(long, visible_alias = "on-change")]
+        on_task_done: bool,
+        /// Return full task specs instead of compact task summaries.
+        #[arg(long)]
+        full: bool,
         #[arg(long, value_name = "MACHINE")]
         on: Option<String>,
     },
     /// List unread coordinator inbox messages for a Run.
     Inbox {
-        #[arg(long)]
+        /// Run ID (positional or via `--run`).
+        #[arg(value_name = "RUN")]
+        run_pos: Option<String>,
+        /// Run ID (equivalent to positional `<RUN>`).
+        #[arg(long = "run", value_name = "RUN", conflicts_with = "run_pos")]
         run: Option<String>,
         #[arg(long, value_name = "MACHINE")]
         on: Option<String>,
     },
     /// Inspect a Run, Task, or Message snapshot by ID.
     Show {
+        /// Run ID, Task ID (`tsk_...`), or Message ID (`msg_...`).
         id: Option<String>,
+        /// Run ID (equivalent to positional `<RUN_ID>`).
+        #[arg(long = "run", value_name = "RUN", conflicts_with = "id")]
+        run: Option<String>,
+        /// Include full task spec (`change`, `acceptance`, `constraints`) instead of compact summaries.
+        #[arg(long)]
+        full: bool,
         #[arg(long, value_name = "MACHINE")]
         on: Option<String>,
     },
@@ -256,6 +283,9 @@ pub enum DroveAction {
         target: String,
         #[arg(long)]
         run: Option<String>,
+        /// Number of recent transcript items to return (1..=200, default 30).
+        #[arg(long, default_value_t = 30)]
+        tail: usize,
         #[arg(long, value_name = "MACHINE")]
         on: Option<String>,
     },
@@ -313,6 +343,11 @@ pub enum DroveAction {
     },
     /// Finalize a Run (runs Run-level verify gate if configured).
     Complete {
+        /// Run ID (positional or via `--run`).
+        #[arg(value_name = "RUN")]
+        run_pos: Option<String>,
+        /// Run ID (equivalent to positional `<RUN>`).
+        #[arg(long = "run", value_name = "RUN", conflicts_with = "run_pos")]
         run: Option<String>,
         #[arg(long)]
         summary: Option<String>,
@@ -323,12 +358,22 @@ pub enum DroveAction {
     },
     /// Pause scheduling new tasks in a Run.
     Pause {
+        /// Run ID (positional or via `--run`).
+        #[arg(value_name = "RUN")]
+        run_pos: Option<String>,
+        /// Run ID (equivalent to positional `<RUN>`).
+        #[arg(long = "run", value_name = "RUN", conflicts_with = "run_pos")]
         run: Option<String>,
         #[arg(long, value_name = "MACHINE")]
         on: Option<String>,
     },
     /// Resume a paused Run.
     Resume {
+        /// Run ID (positional or via `--run`).
+        #[arg(value_name = "RUN")]
+        run_pos: Option<String>,
+        /// Run ID (equivalent to positional `<RUN>`).
+        #[arg(long = "run", value_name = "RUN", conflicts_with = "run_pos")]
         run: Option<String>,
         #[arg(long, value_name = "MACHINE")]
         on: Option<String>,
@@ -434,9 +479,9 @@ pub fn main_standalone() -> i32 {
     match execute(&paths, DroveCli { action: cli.cmd }) {
         Ok((val, human)) => {
             if json_mode {
-                println!("{val}");
+                let _ = crate::cli::write_stdout_line(&val.to_string());
             } else {
-                println!("{human}");
+                let _ = crate::cli::write_stdout_line(&human);
             }
             0
         }
@@ -492,39 +537,228 @@ fn proxy_call(
     Ok(resp_body)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResolveMode {
+    Read,
+    Write,
+}
+
+fn current_session_id() -> Option<String> {
+    std::env::var("H2_AGENT_ID")
+        .ok()
+        .or_else(|| std::env::var("H2_TERMINAL_ID").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn sanitize_session_filename(session: &str) -> String {
+    session
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .collect()
+}
+
 fn current_run_file(paths: &Paths) -> PathBuf {
     paths.state.join("drove").join("current_run")
 }
 
-fn save_current_run(paths: &Paths, run_id: &str) {
+fn session_run_file(paths: &Paths, session: &str) -> PathBuf {
+    paths.state.join("drove").join("sessions").join(format!("{}.run", sanitize_session_filename(session)))
+}
+
+fn save_current_run(paths: &Paths, run_id: &str) -> Option<String> {
+    if let Some(session) = current_session_id() {
+        let p = session_run_file(paths, &session);
+        if let Some(dir) = p.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(p, run_id);
+        return Some(session);
+    }
     let p = current_run_file(paths);
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
     let _ = std::fs::write(p, run_id);
+    None
 }
 
-fn resolve_run_id(paths: &Paths, on: Option<&str>, explicit: Option<String>) -> Result<String, RpcError> {
-    if let Some(r) = explicit.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-        return Ok(r);
-    }
-    if on.is_none()
-        && let Ok(text) = std::fs::read_to_string(current_run_file(paths))
+fn normalize_dir_str(raw: &str) -> String {
+    let trimmed = raw.trim().trim_end_matches(['/', '\\']);
+    std::fs::canonicalize(trimmed)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| trimmed.to_string())
+}
+
+fn run_matches_cwd(run: &Value, cwd_norm: &str) -> bool {
+    run["cwd"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .is_some_and(|rcwd| normalize_dir_str(rcwd) == cwd_norm)
+}
+
+fn run_matches_session(run: &Value, session_id: &str) -> bool {
+    run["coordinator"]["hostSession"].as_str().map(str::trim) == Some(session_id)
+}
+
+fn format_ambiguous_runs(runs: &[&Value]) -> String {
+    runs.iter()
+        .take(6)
+        .map(|r| {
+            let id = r["id"].as_str().unwrap_or("?");
+            let cwd = r["cwd"].as_str().unwrap_or("");
+            let folder = cwd.trim_end_matches('/').rsplit('/').next().filter(|s| !s.is_empty()).unwrap_or(cwd);
+            if folder.is_empty() { id.to_string() } else { format!("{id} ({folder})") }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn select_run_from_list(
+    runs: &[Value],
+    session_id: Option<&str>,
+    cwd: Option<&str>,
+    saved_session_run: Option<&str>,
+    saved_global_run: Option<&str>,
+    mode: ResolveMode,
+) -> Result<String, RpcError> {
+    let run_exists = |id: &str| runs.iter().any(|r| r["id"].as_str() == Some(id));
+    let active: Vec<&Value> = runs.iter().filter(|r| r["status"] == "active").collect();
+
+    // 1. Session-scoped `drove use` / `drove plan` binding (isolated per $H2_AGENT_ID / $H2_TERMINAL_ID).
+    if let Some(sid_run) = saved_session_run.map(str::trim).filter(|s| !s.is_empty())
+        && (runs.is_empty() || run_exists(sid_run))
     {
-        let trimmed = text.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
+        return Ok(sid_run.to_string());
+    }
+
+    // 2. Active runs owned by this coordinator session (`run.coordinator.hostSession`).
+    let cwd_norm = cwd.map(str::trim).filter(|s| !s.is_empty()).map(normalize_dir_str);
+    if let Some(sid) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        let owned: Vec<&Value> = active.iter().copied().filter(|r| run_matches_session(r, sid)).collect();
+        if owned.len() == 1 {
+            if let Some(id) = owned[0]["id"].as_str() {
+                return Ok(id.to_string());
+            }
+        } else if owned.len() > 1 {
+            if let Some(ref cn) = cwd_norm {
+                let by_cwd: Vec<&Value> = owned.iter().copied().filter(|r| run_matches_cwd(r, cn)).collect();
+                if by_cwd.len() == 1
+                    && let Some(id) = by_cwd[0]["id"].as_str()
+                {
+                    return Ok(id.to_string());
+                }
+            }
+            if mode == ResolveMode::Write {
+                return Err(RpcError::new(
+                    "ambiguous_run",
+                    format!("multiple active runs belong to session {sid}: {}", format_ambiguous_runs(&owned)),
+                    "pass --run <RUN_ID> or bind one with `h2 drove use <RUN_ID>`",
+                ));
+            }
+            if let Some(id) = owned[0]["id"].as_str() {
+                return Ok(id.to_string());
+            }
         }
     }
-    let list = proxy_call(paths, on, "GET", "/api/runs", "local=1", None)?;
-    if let Some(arr) = list["runs"].as_array() {
-        if let Some(active) = arr.iter().find(|r| r["status"] == "active").or_else(|| arr.first())
-            && let Some(id) = active["id"].as_str()
+
+    // 3. Active runs matching current working directory.
+    if let Some(ref cn) = cwd_norm {
+        let by_cwd: Vec<&Value> = active.iter().copied().filter(|r| run_matches_cwd(r, cn)).collect();
+        if by_cwd.len() == 1 {
+            if let Some(id) = by_cwd[0]["id"].as_str() {
+                return Ok(id.to_string());
+            }
+        } else if by_cwd.len() > 1 {
+            if mode == ResolveMode::Write {
+                return Err(RpcError::new(
+                    "ambiguous_run",
+                    format!("multiple active runs exist in this directory: {}", format_ambiguous_runs(&by_cwd)),
+                    "pass --run <RUN_ID> or bind one with `h2 drove use <RUN_ID>`",
+                ));
+            }
+            if let Some(id) = by_cwd[0]["id"].as_str() {
+                return Ok(id.to_string());
+            }
+        }
+    }
+
+    // 4. Global active runs: allow unambiguous single active run; refuse ambiguous writes.
+    if active.len() == 1
+        && let Some(id) = active[0]["id"].as_str()
+    {
+        return Ok(id.to_string());
+    }
+    if active.len() > 1 {
+        if mode == ResolveMode::Write {
+            return Err(RpcError::new(
+                "ambiguous_run",
+                format!("multiple active runs exist: {}", format_ambiguous_runs(&active)),
+                "pass --run <RUN_ID> or bind one with `h2 drove use <RUN_ID>`",
+            ));
+        }
+        if let Some(gid) = saved_global_run.map(str::trim).filter(|s| !s.is_empty())
+            && active.iter().any(|r| r["id"].as_str() == Some(gid))
         {
+            return Ok(gid.to_string());
+        }
+        if let Some(id) = active[0]["id"].as_str() {
             return Ok(id.to_string());
         }
     }
+
+    // 5. Fallback when no run is currently active.
+    if let Some(gid) = saved_global_run.map(str::trim).filter(|s| !s.is_empty())
+        && (runs.is_empty() || run_exists(gid))
+    {
+        return Ok(gid.to_string());
+    }
+    if let Some(ref cn) = cwd_norm
+        && let Some(matched) = runs.iter().find(|r| run_matches_cwd(r, cn))
+        && let Some(id) = matched["id"].as_str()
+    {
+        return Ok(id.to_string());
+    }
+    if let Some(first) = runs.first()
+        && let Some(id) = first["id"].as_str()
+    {
+        return Ok(id.to_string());
+    }
     Err(RpcError::invalid_params("no run found; pass --run <RUN_ID> or create one with `drove plan`"))
+}
+
+fn resolve_run_id(
+    paths: &Paths,
+    on: Option<&str>,
+    explicit: Option<String>,
+    mode: ResolveMode,
+) -> Result<String, RpcError> {
+    if let Some(r) = explicit.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        return Ok(r);
+    }
+    let session_id = current_session_id();
+    let saved_session_run = if on.is_none() {
+        session_id.as_deref().and_then(|sid| std::fs::read_to_string(session_run_file(paths, sid)).ok())
+    } else {
+        None
+    };
+    let saved_global_run = if on.is_none() && session_id.is_none() {
+        std::fs::read_to_string(current_run_file(paths)).ok()
+    } else {
+        None
+    };
+    let cwd = if on.is_none() { std::env::current_dir().ok().map(|p| p.display().to_string()) } else { None };
+    let list = proxy_call(paths, on, "GET", "/api/runs", "local=1", None)?;
+    let runs = list["runs"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    select_run_from_list(
+        runs,
+        session_id.as_deref(),
+        cwd.as_deref(),
+        saved_session_run.as_deref(),
+        saved_global_run.as_deref(),
+        mode,
+    )
 }
 
 fn resolve_task_id(
@@ -532,11 +766,12 @@ fn resolve_task_id(
     on: Option<&str>,
     run_opt: Option<String>,
     task_id_or_key: &str,
+    mode: ResolveMode,
 ) -> Result<String, RpcError> {
     if task_id_or_key.starts_with("tsk_") || task_id_or_key.starts_with("att_") || task_id_or_key.contains('/') {
         return Ok(task_id_or_key.to_string());
     }
-    let run_id = resolve_run_id(paths, on, run_opt)?;
+    let run_id = resolve_run_id(paths, on, run_opt, mode)?;
     let snap = proxy_call(paths, on, "GET", &format!("/api/runs/{run_id}"), "", None)?;
     if let Some(arr) = snap["tasks"].as_array()
         && let Some(t) =
@@ -686,14 +921,13 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             let out = json!({ "roles": roles_obj, "note": note });
             Ok((out, lines.join("\n")))
         }
-        DroveAction::Settings { on } => {
+        DroveAction::Settings { section, compact, on } => {
             let mut p = json!({});
             if let Some(m) = on {
                 p["on"] = Value::String(m);
             }
             let val = call_core(paths, "drove.settings.get", p)?;
-            let human = serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string());
-            Ok((val, human))
+            format_settings_output(val, section.as_deref(), compact)
         }
         DroveAction::SettingsSet { file, on, consume } => {
             let mut p = read_json_file(&file, consume)?;
@@ -818,8 +1052,13 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             Ok((val, human))
         }
         DroveAction::Use { run_id } => {
-            save_current_run(paths, &run_id);
-            Ok((json!({ "ok": true, "runId": run_id }), format!("using run {run_id}")))
+            let bound_session = save_current_run(paths, &run_id);
+            let scope = bound_session.as_deref().unwrap_or("global");
+            let human = match &bound_session {
+                Some(s) => format!("using run {run_id} (session {s})"),
+                None => format!("using run {run_id}"),
+            };
+            Ok((json!({ "ok": true, "runId": run_id, "scope": scope }), human))
         }
         DroveAction::Plan { file, stdin, objective, cwd, max_concurrency, verify, session, on } => {
             let parsed = read_plan_input(file, stdin)?;
@@ -886,7 +1125,7 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             Ok((out, human))
         }
         DroveAction::Add { run, file, stdin, key, title, change, role, deps, verify, worktree, on } => {
-            let run_id = resolve_run_id(paths, on.as_deref(), run)?;
+            let run_id = resolve_run_id(paths, on.as_deref(), run, ResolveMode::Write)?;
             let mut body = if file.is_some() || stdin {
                 let parsed = read_plan_input(file, stdin)?;
                 if parsed.is_array() {
@@ -976,8 +1215,8 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             }
             let added = proxy_call(paths, on.as_deref(), "POST", &format!("/api/runs/{run_id}/tasks"), "", Some(task))?;
             if wait {
-                let waited = wait_loop(paths, on.as_deref(), &run_id, 600, 0)?;
-                return Ok((waited.clone(), format!("run {run_id} settled={}", waited["settled"])));
+                let waited = wait_loop(paths, on.as_deref(), &run_id, 600, 0, true, false)?;
+                return Ok((waited.clone(), format_wait_human(&run_id, &waited)));
             }
             let mut out = json!({ "run": run, "tasks": added["tasks"] });
             let mut human = format!("started quick run {run_id}");
@@ -987,29 +1226,30 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             }
             Ok((out, human))
         }
-        DroveAction::Wait { run, timeout, since_seq, on } => {
-            let run_id = resolve_run_id(paths, on.as_deref(), run)?;
-            let res = wait_loop(paths, on.as_deref(), &run_id, timeout, since_seq)?;
-            let msgs = res["messages"].as_array().map(|a| a.len()).unwrap_or(0);
-            Ok((res.clone(), format!("run {run_id}: settled={} messages={msgs}", res["settled"])))
+        DroveAction::Wait { run_pos, run, timeout, since_seq, on_task_done, full, on } => {
+            let run_id = resolve_run_id(paths, on.as_deref(), run.or(run_pos), ResolveMode::Read)?;
+            let res = wait_loop(paths, on.as_deref(), &run_id, timeout, since_seq, !full, on_task_done)?;
+            let human = format_wait_human(&run_id, &res);
+            Ok((res, human))
         }
-        DroveAction::Inbox { run, on } => {
-            let run_id = resolve_run_id(paths, on.as_deref(), run)?;
+        DroveAction::Inbox { run_pos, run, on } => {
+            let run_id = resolve_run_id(paths, on.as_deref(), run.or(run_pos), ResolveMode::Read)?;
             let res = proxy_call(paths, on.as_deref(), "GET", &format!("/api/runs/{run_id}/inbox"), "", None)?;
             let n = res["messages"].as_array().map(|a| a.len()).unwrap_or(0);
             Ok((res, format!("{n} pending message(s) in {run_id}")))
         }
-        DroveAction::Show { id, on } => {
-            let target = match id {
+        DroveAction::Show { id, run, full, on } => {
+            let target = match run.or(id) {
                 Some(x) => x,
-                None => resolve_run_id(paths, on.as_deref(), None)?,
+                None => resolve_run_id(paths, on.as_deref(), None, ResolveMode::Read)?,
             };
             let res = if target.starts_with("msg_") {
                 proxy_call(paths, on.as_deref(), "GET", &format!("/api/messages/{target}"), "", None)?
             } else if target.starts_with("tsk_") {
                 proxy_call(paths, on.as_deref(), "GET", &format!("/api/tasks/{target}/inspect"), "", None)?
             } else {
-                proxy_call(paths, on.as_deref(), "GET", &format!("/api/runs/{target}"), "", None)?
+                let raw = proxy_call(paths, on.as_deref(), "GET", &format!("/api/runs/{target}"), "", None)?;
+                if full { raw } else { compact_show_snapshot(raw) }
             };
             let human = serde_json::to_string_pretty(&res).unwrap_or_else(|_| res.to_string());
             Ok((res, human))
@@ -1037,7 +1277,7 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             Ok((res, format!("replied to {message_id}")))
         }
         DroveAction::Send { task, text, interrupt, run, on } => {
-            let tid = resolve_task_id(paths, on.as_deref(), run, &task)?;
+            let tid = resolve_task_id(paths, on.as_deref(), run, &task, ResolveMode::Write)?;
             let res = proxy_call(
                 paths,
                 on.as_deref(),
@@ -1048,9 +1288,10 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             )?;
             Ok((res, format!("sent message to {tid}")))
         }
-        DroveAction::Inspect { target, run, on } => {
-            let tid = resolve_task_id(paths, on.as_deref(), run, &target)?;
-            let res = proxy_call(paths, on.as_deref(), "GET", &format!("/api/tasks/{tid}/inspect"), "", None)?;
+        DroveAction::Inspect { target, run, tail, on } => {
+            let tid = resolve_task_id(paths, on.as_deref(), run, &target, ResolveMode::Read)?;
+            let query = format!("tail={}", tail.clamp(1, 200));
+            let res = proxy_call(paths, on.as_deref(), "GET", &format!("/api/tasks/{tid}/inspect"), &query, None)?;
             let human = serde_json::to_string_pretty(&res).unwrap_or_else(|_| res.to_string());
             Ok((res, human))
         }
@@ -1068,7 +1309,7 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             run,
             on,
         } => {
-            let tid = resolve_task_id(paths, on.as_deref(), run, &task)?;
+            let tid = resolve_task_id(paths, on.as_deref(), run, &task, ResolveMode::Write)?;
             let res = proxy_call(
                 paths,
                 on.as_deref(),
@@ -1090,7 +1331,7 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             Ok((res, format!("retried {tid}")))
         }
         DroveAction::Route { task, role, agent, model, effort, worker, run, on } => {
-            let tid = resolve_task_id(paths, on.as_deref(), run, &task)?;
+            let tid = resolve_task_id(paths, on.as_deref(), run, &task, ResolveMode::Write)?;
             let res = proxy_call(
                 paths,
                 on.as_deref(),
@@ -1120,18 +1361,18 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
                     )?;
                     return Ok((res, format!("cancelled run {tgt}")));
                 }
-                let tid = resolve_task_id(paths, on.as_deref(), run, &tgt)?;
+                let tid = resolve_task_id(paths, on.as_deref(), run, &tgt, ResolveMode::Write)?;
                 let res =
                     proxy_call(paths, on.as_deref(), "POST", &format!("/api/tasks/{tid}/cancel"), "", Some(json!({})))?;
                 return Ok((res, format!("cancelled task {tid}")));
             }
-            let run_id = resolve_run_id(paths, on.as_deref(), run)?;
+            let run_id = resolve_run_id(paths, on.as_deref(), run, ResolveMode::Write)?;
             let res =
                 proxy_call(paths, on.as_deref(), "POST", &format!("/api/runs/{run_id}/cancel"), "", Some(json!({})))?;
             Ok((res, format!("cancelled run {run_id}")))
         }
-        DroveAction::Complete { run, summary, force, on } => {
-            let run_id = resolve_run_id(paths, on.as_deref(), run)?;
+        DroveAction::Complete { run_pos, run, summary, force, on } => {
+            let run_id = resolve_run_id(paths, on.as_deref(), run.or(run_pos), ResolveMode::Write)?;
             let res = proxy_call(
                 paths,
                 on.as_deref(),
@@ -1142,14 +1383,14 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             )?;
             Ok((res, format!("completed run {run_id}")))
         }
-        DroveAction::Pause { run, on } => {
-            let run_id = resolve_run_id(paths, on.as_deref(), run)?;
+        DroveAction::Pause { run_pos, run, on } => {
+            let run_id = resolve_run_id(paths, on.as_deref(), run.or(run_pos), ResolveMode::Write)?;
             let res =
                 proxy_call(paths, on.as_deref(), "POST", &format!("/api/runs/{run_id}/pause"), "", Some(json!({})))?;
             Ok((res, format!("paused {run_id}")))
         }
-        DroveAction::Resume { run, on } => {
-            let run_id = resolve_run_id(paths, on.as_deref(), run)?;
+        DroveAction::Resume { run_pos, run, on } => {
+            let run_id = resolve_run_id(paths, on.as_deref(), run.or(run_pos), ResolveMode::Write)?;
             let res =
                 proxy_call(paths, on.as_deref(), "POST", &format!("/api/runs/{run_id}/resume"), "", Some(json!({})))?;
             Ok((res, format!("resumed {run_id}")))
@@ -1161,19 +1402,208 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
 
 const WAIT_RECONNECT_BUDGET: Duration = Duration::from_secs(15);
 
+fn format_settings_output(val: Value, section: Option<&str>, compact: bool) -> Result<(Value, String), RpcError> {
+    let summarize_agent = |a: &Value| {
+        json!({
+            "id": a["id"],
+            "installed": a["installed"],
+            "defaultModel": a["defaultModel"],
+            "modelCount": a["models"].as_array().map(|m| m.len()).unwrap_or(0),
+            "effortCount": a["efforts"].as_array().map(|e| e.len()).unwrap_or(0),
+        })
+    };
+    let out = if let Some(sec) = section.map(str::trim).filter(|s| !s.is_empty()) {
+        match sec.to_ascii_lowercase().as_str() {
+            "roles" => json!({
+                "roles": val["config"]["roles"],
+                "note": val["config"]["note"],
+            }),
+            "agents" => {
+                let agents = if compact {
+                    Value::Array(
+                        val["probed"]["agents"]
+                            .as_array()
+                            .map(|arr| arr.iter().map(summarize_agent).collect())
+                            .unwrap_or_default(),
+                    )
+                } else {
+                    val["probed"]["agents"].clone()
+                };
+                json!({
+                    "probedAt": val["probed"]["probedAt"],
+                    "fullProbe": val["probed"]["fullProbe"],
+                    "agents": agents,
+                })
+            }
+            "ai" => json!({
+                "ai": val["config"]["ai"],
+                "aiStatus": val["aiStatus"],
+            }),
+            "magpie" => json!({
+                "magpie": val["config"]["magpie"],
+            }),
+            "config" => val["config"].clone(),
+            other => {
+                return Err(RpcError::invalid_params(format!(
+                    "unknown --section {other:?}; expected one of: roles, agents, ai, magpie, config"
+                )));
+            }
+        }
+    } else if compact {
+        let mut roles_compact = serde_json::Map::new();
+        if let Some(map) = val["config"]["roles"].as_object() {
+            for (k, v) in map {
+                roles_compact.insert(
+                    k.clone(),
+                    json!({
+                        "access": v["access"],
+                        "primary": v["primary"],
+                        "fallbackCount": v["fallbacks"].as_array().map(|a| a.len()).unwrap_or(0),
+                    }),
+                );
+            }
+        }
+        let installed_agents: Vec<Value> = val["probed"]["agents"]
+            .as_array()
+            .map(|arr| arr.iter().filter(|a| a["installed"] == true).map(summarize_agent).collect())
+            .unwrap_or_default();
+        json!({
+            "machine": val["machine"],
+            "webPort": val["webPort"],
+            "maxConcurrencyDefault": val["config"]["maxConcurrencyDefault"],
+            "note": val["config"]["note"],
+            "roles": Value::Object(roles_compact),
+            "installedAgents": installed_agents,
+            "aiStatus": {
+                "configured": val["aiStatus"]["configured"],
+                "model": val["aiStatus"]["model"],
+            },
+            "magpieEnabled": val["config"]["magpie"]["enabled"],
+        })
+    } else {
+        val
+    };
+    let human = serde_json::to_string_pretty(&out).unwrap_or_else(|_| out.to_string());
+    Ok((out, human))
+}
+
+fn compact_show_snapshot(mut snap: Value) -> Value {
+    let mut review_verdicts = Vec::new();
+    let mut any_failed = false;
+    if let Some(tasks) = snap.get_mut("tasks").and_then(Value::as_array_mut) {
+        for task in tasks.iter_mut() {
+            if task["status"] == "failed" {
+                any_failed = true;
+            }
+            if let Some(data) = task.get("result").and_then(|r| r.get("data")).and_then(Value::as_object) {
+                let raw_verdict = data
+                    .get("review_status")
+                    .or_else(|| data.get("reviewStatus"))
+                    .or_else(|| data.get("verdict"))
+                    .and_then(Value::as_str);
+                if let Some(v) = raw_verdict {
+                    let norm = v.trim().to_ascii_lowercase();
+                    if matches!(norm.as_str(), "changes_requested" | "request_changes" | "rejected" | "needs_changes") {
+                        review_verdicts.push(json!({
+                            "taskId": task["id"],
+                            "taskKey": task["key"],
+                            "verdict": v,
+                        }));
+                    }
+                }
+            }
+            if let Some(obj) = task.as_object_mut() {
+                // Keep essential run/task status, assign, result, isolation fields while stripping bulky spec text.
+                obj.remove("spec");
+            }
+        }
+    }
+    let pending_msgs = snap["messages"]
+        .as_array()
+        .is_some_and(|arr| arr.iter().any(|m| m["needsAction"] == true && m["handledAt"].is_null()));
+    let needs_attention = pending_msgs || any_failed || !review_verdicts.is_empty();
+    if let Some(obj) = snap.as_object_mut() {
+        obj.insert("needsAttention".into(), Value::Bool(needs_attention));
+        if !review_verdicts.is_empty() {
+            obj.insert("reviewVerdicts".into(), Value::Array(review_verdicts));
+        }
+    }
+    snap
+}
+
+fn format_wait_human(run_id: &str, res: &Value) -> String {
+    let settled = res["settled"].as_bool().unwrap_or(false);
+    let timed_out = res["timedOut"].as_bool().unwrap_or(false);
+    let needs_attention = res["needsAttention"].as_bool().unwrap_or(false);
+    let msgs = res["messages"].as_array().map(|a| a.len()).unwrap_or(0);
+    let mut parts = vec![
+        format!("settled={settled}"),
+        format!("timedOut={timed_out}"),
+        format!("needsAttention={needs_attention}"),
+        format!("messages={msgs}"),
+    ];
+    if let Some(newly) = res["newlyCompleted"].as_array().filter(|a| !a.is_empty()) {
+        let keys: Vec<&str> = newly.iter().filter_map(Value::as_str).collect();
+        parts.push(format!("newlyCompleted=[{}]", keys.join(",")));
+    }
+    if let Some(verdicts) = res["reviewVerdicts"].as_array().filter(|a| !a.is_empty()) {
+        let items: Vec<String> = verdicts
+            .iter()
+            .map(|v| format!("{}:{}", v["taskKey"].as_str().unwrap_or("?"), v["verdict"].as_str().unwrap_or("?")))
+            .collect();
+        parts.push(format!("reviewVerdicts=[{}]", items.join(",")));
+    }
+    format!("run {run_id}: {}", parts.join(" "))
+}
+
 fn wait_loop(
     paths: &Paths,
     on: Option<&str>,
     run_id: &str,
     timeout_sec: u64,
     since_seq: u64,
+    compact: bool,
+    on_task_done: bool,
 ) -> Result<Value, RpcError> {
+    let known_done = if on_task_done {
+        proxy_call(paths, on, "GET", &format!("/api/runs/{run_id}"), "", None)
+            .ok()
+            .and_then(|snap| {
+                snap["tasks"].as_array().map(|arr| {
+                    arr.iter()
+                        .filter(|t| {
+                            t["template"] != true
+                                && matches!(
+                                    t["status"].as_str(),
+                                    Some("succeeded" | "failed" | "skipped" | "cancelled")
+                                )
+                        })
+                        .filter_map(|t| t["id"].as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
+                })
+            })
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
     let deadline = Instant::now() + Duration::from_secs(timeout_sec.max(1));
     let mut disconnected_since: Option<Instant> = None;
     let mut backoff_ms: u64 = 250;
     loop {
         let remain = deadline.saturating_duration_since(Instant::now()).as_secs().clamp(1, 20);
-        let q = format!("timeoutSec={remain}&sinceSeq={since_seq}");
+        let mut q = format!("timeoutSec={remain}&sinceSeq={since_seq}");
+        if compact {
+            q.push_str("&compact=1");
+        }
+        if on_task_done {
+            q.push_str("&onTaskDone=1");
+            if !known_done.is_empty() {
+                q.push_str("&knownDone=");
+                q.push_str(&known_done);
+            }
+        }
         match proxy_call(paths, on, "GET", &format!("/api/runs/{run_id}/wait"), &q, None) {
             Ok(res) => {
                 disconnected_since = None;
@@ -1397,3 +1827,143 @@ fn install_skills(target: Option<PathBuf>) -> Result<(Value, String), RpcError> 
 }
 
 pub(crate) fn _silence_role_target(_t: Option<RoleTarget>) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_run_isolates_sessions_matches_cwd_and_refuses_ambiguous_writes() {
+        let runs = vec![
+            json!({
+                "id": "run_a",
+                "status": "active",
+                "cwd": "/tmp/repo-a",
+                "coordinator": { "hostSession": "t1" }
+            }),
+            json!({
+                "id": "run_b",
+                "status": "active",
+                "cwd": "/tmp/repo-b",
+                "coordinator": { "hostSession": "t2" }
+            }),
+        ];
+
+        // 1. Session-scoped `drove use` takes precedence over global active list.
+        assert_eq!(
+            select_run_from_list(&runs, Some("t1"), Some("/tmp/repo-b"), Some("run_a"), None, ResolveMode::Write)
+                .unwrap(),
+            "run_a"
+        );
+
+        // 2. Host session ownership matches its own Run even when another terminal starts a newer Run.
+        assert_eq!(
+            select_run_from_list(&runs, Some("t2"), Some("/tmp/other"), None, None, ResolveMode::Write).unwrap(),
+            "run_b"
+        );
+
+        // 3. CWD matching resolves unambiguously for an unbound terminal inside `/tmp/repo-b`.
+        assert_eq!(
+            select_run_from_list(&runs, Some("t3"), Some("/tmp/repo-b"), None, None, ResolveMode::Write).unwrap(),
+            "run_b"
+        );
+
+        // 4. Unrelated session + unrelated cwd MUST refuse write operations when multiple runs are active.
+        let err = select_run_from_list(&runs, Some("t9"), Some("/tmp/other"), None, None, ResolveMode::Write)
+            .expect_err("ambiguous multi-run write must be refused");
+        assert_eq!(err.kind, "ambiguous_run");
+        assert!(err.message.contains("run_a") && err.message.contains("run_b"));
+
+        // 5. Read mode falls back cleanly without failing.
+        assert_eq!(
+            select_run_from_list(&runs, Some("t9"), Some("/tmp/other"), None, Some("run_b"), ResolveMode::Read)
+                .unwrap(),
+            "run_b"
+        );
+    }
+
+    #[test]
+    fn cli_accepts_both_run_flag_and_positional_run_id_across_commands() {
+        for args in [
+            vec!["drove", "complete", "--run", "run_1", "--summary", "ok"],
+            vec!["drove", "complete", "run_1", "--summary", "ok"],
+            vec!["drove", "pause", "--run", "run_1"],
+            vec!["drove", "pause", "run_1"],
+            vec!["drove", "resume", "--run", "run_1"],
+            vec!["drove", "resume", "run_1"],
+            vec!["drove", "show", "--run", "run_1", "--full"],
+            vec!["drove", "show", "run_1"],
+            vec!["drove", "wait", "--run", "run_1", "--on-task-done", "--full"],
+            vec!["drove", "wait", "run_1", "--on-change"],
+            vec!["drove", "inbox", "--run", "run_1"],
+            vec!["drove", "inbox", "run_1"],
+            vec!["drove", "inspect", "task1", "--tail", "80"],
+            vec!["drove", "settings", "--section", "roles", "--compact"],
+        ] {
+            let parsed = StandaloneCli::try_parse_from(args.clone())
+                .unwrap_or_else(|e| panic!("failed to parse {args:?}: {e}"));
+            assert!(parsed.cmd.is_some());
+        }
+    }
+
+    #[test]
+    fn settings_section_and_compact_strip_large_model_lists() {
+        let sample = json!({
+            "machine": "local",
+            "webPort": 7799,
+            "config": {
+                "maxConcurrencyDefault": 4,
+                "note": "prefer codex",
+                "roles": {
+                    "coder": {
+                        "access": "writable",
+                        "primary": { "agent": "codex", "model": "gpt-5.4", "effort": "high" },
+                        "fallbacks": [{ "agent": "agy" }]
+                    }
+                },
+                "ai": { "enabled": true },
+                "magpie": { "enabled": false }
+            },
+            "aiStatus": { "configured": true, "model": "gpt-4o-mini" },
+            "probed": {
+                "probedAt": "2026-11-24T00:00:00Z",
+                "fullProbe": true,
+                "agents": [
+                    { "id": "codex", "installed": true, "defaultModel": "gpt-5.4", "models": ["a", "b", "c"], "efforts": ["high"] },
+                    { "id": "gemini", "installed": false, "models": [], "efforts": [] }
+                ]
+            }
+        });
+
+        let (roles, _) = format_settings_output(sample.clone(), Some("roles"), false).unwrap();
+        assert!(roles.get("roles").is_some());
+        assert!(roles.get("probed").is_none());
+
+        let (compact, _) = format_settings_output(sample, None, true).unwrap();
+        assert_eq!(compact["installedAgents"].as_array().unwrap().len(), 1);
+        assert_eq!(compact["installedAgents"][0]["modelCount"], 3);
+        assert!(compact["installedAgents"][0].get("models").is_none());
+    }
+
+    #[test]
+    fn compact_show_strips_spec_and_surfaces_review_verdicts() {
+        let raw = json!({
+            "run": { "id": "run_1", "status": "active" },
+            "tasks": [
+                {
+                    "id": "tsk_rev",
+                    "key": "review",
+                    "status": "succeeded",
+                    "spec": { "change": "very long spec text" },
+                    "result": { "data": { "review_status": "changes_requested" } }
+                }
+            ],
+            "messages": []
+        });
+        let compact = compact_show_snapshot(raw);
+        assert!(compact["tasks"][0].get("spec").is_none());
+        assert_eq!(compact["needsAttention"], true);
+        assert_eq!(compact["reviewVerdicts"][0]["taskKey"], "review");
+        assert_eq!(compact["reviewVerdicts"][0]["verdict"], "changes_requested");
+    }
+}

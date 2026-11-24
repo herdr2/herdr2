@@ -157,10 +157,15 @@ pub async fn tick_once(core: &Arc<Core>) {
                     } else {
                         match cfg.ai.conflict_policy.as_str() {
                             "auto_worktree" if repo_supports_wt => {
+                                let upgrade_reason = format!("auto_worktree: {conflict_reason}");
                                 let _ = core.drove.store.update_task(&task.id, |t| {
                                     t.isolation = Isolation::Worktree;
+                                    t.effective_isolation = Some(Isolation::Worktree);
+                                    t.isolation_reason = Some(upgrade_reason.clone());
                                 });
                                 task.isolation = Isolation::Worktree;
+                                task.effective_isolation = Some(Isolation::Worktree);
+                                task.isolation_reason = Some(upgrade_reason);
                                 core.drove.store.append_daemon_event(super::store::NewDaemonEvent {
                                     run_id: Some(run.id.clone()),
                                     task_id: Some(task.id.clone()),
@@ -246,10 +251,15 @@ pub async fn tick_once(core: &Arc<Core>) {
                         && super::pool::live_untrashed_agent_id(core, w.h2_agent.as_deref()).is_some()
                 });
                 if has_warm_wt {
+                    let reuse_reason = "warm_worktree_reuse: reusing idle worktree worker".to_string();
                     let _ = core.drove.store.update_task(&task.id, |t| {
                         t.isolation = Isolation::Worktree;
+                        t.effective_isolation = Some(Isolation::Worktree);
+                        t.isolation_reason = Some(reuse_reason.clone());
                     });
                     task.isolation = Isolation::Worktree;
+                    task.effective_isolation = Some(Isolation::Worktree);
+                    task.isolation_reason = Some(reuse_reason);
                     decision = route_task_with_preference(
                         &cfg,
                         &task,

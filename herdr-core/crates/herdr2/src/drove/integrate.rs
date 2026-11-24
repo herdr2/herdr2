@@ -327,10 +327,14 @@ fn merge_worktree_blocking(run_cwd: &str, wt_dir: &str, keep_for_reuse: bool) ->
             ));
         }
 
-        let run_apply = |three_way: bool| -> Result<std::process::Output, ApiErr> {
+        // Fast path: apply directly to the working tree (NO `--3way` / `--index`).
+        // 1) Handles dirty pre-existing unstaged files whose working-tree blob still matches the
+        //    worktree's base snapshot (`HEAD`), avoiding false `does not match index` deadlocks.
+        // 2) Never mutates `run_cwd`'s `.git/index`, preserving the user's staged/unstaged state.
+        let run_plain_apply = |check_only: bool| -> Result<std::process::Output, ApiErr> {
             let mut args = vec!["-C", run_cwd, "apply"];
-            if three_way {
-                args.push("--3way");
+            if check_only {
+                args.push("--check");
             }
             args.push("--whitespace=nowarn");
             let mut child = super::bg_std_command("git")
@@ -346,20 +350,26 @@ fn merge_worktree_blocking(run_cwd: &str, wt_dir: &str, keep_for_reuse: bool) ->
             }
             child.wait_with_output().map_err(|e| ApiErr::new(500, "internal", format!("git apply wait: {e}")))
         };
-        let mut apply_out = run_apply(true)?;
-        if !apply_out.status.success() && String::from_utf8_lossy(&apply_out.stderr).contains("does not exist in index")
-        {
-            apply_out = run_apply(false)?;
-        }
-        if !apply_out.status.success() {
-            return Err(ApiErr::new(
-                422,
-                "merge_conflict",
-                format!(
-                    "Merge conflict integrating worktree `{wt_dir}` into `{run_cwd}`: {}",
-                    String::from_utf8_lossy(&apply_out.stderr).trim()
-                ),
-            ));
+
+        let check_out = run_plain_apply(true)?;
+        if check_out.status.success() {
+            let apply_out = run_plain_apply(false)?;
+            if !apply_out.status.success() {
+                return Err(ApiErr::new(
+                    422,
+                    "merge_conflict",
+                    format!(
+                        "Merge conflict integrating worktree `{wt_dir}` into `{run_cwd}`: {}",
+                        String::from_utf8_lossy(&apply_out.stderr).trim()
+                    ),
+                ));
+            }
+        } else {
+            // Fallback for true concurrent edits in `run_cwd`: perform base-blob-aware per-file
+            // 3-way merge (`git merge-file -p`) in memory and commit to working tree only if ALL
+            // files merge cleanly — still never touching `run_cwd`'s `.git/index`.
+            let fallback_err = String::from_utf8_lossy(&check_out.stderr).trim().to_string();
+            merge_worktree_files_three_way(run_cwd, wt_dir, &changed_files, &fallback_err)?;
         }
     }
 
@@ -369,6 +379,148 @@ fn merge_worktree_blocking(run_cwd: &str, wt_dir: &str, keep_for_reuse: bool) ->
         cleanup_worktree_dir(run_cwd, Path::new(wt_dir));
     }
     Ok(changed_files)
+}
+
+/// Base-blob-aware 3-way working-tree merge fallback used only when plain `git apply --check` fails
+/// (i.e. concurrent edits happened in `run_cwd` after the worktree branched). Never touches `run_cwd`'s
+/// `.git/index`, and writes nothing to disk if any file has a real textual/binary conflict.
+fn merge_worktree_files_three_way(
+    run_cwd: &str,
+    wt_dir: &str,
+    changed_files: &[String],
+    apply_err: &str,
+) -> Result<(), ApiErr> {
+    enum PlannedOp {
+        Write { rel: String, bytes: Vec<u8>, executable: bool },
+        Delete { rel: String },
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!("herdr2-3way-{}", super::crypto::rand_id("m")));
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    struct DirGuard(std::path::PathBuf);
+    impl Drop for DirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _guard = DirGuard(tmp_dir.clone());
+
+    let mut ops: Vec<PlannedOp> = Vec::with_capacity(changed_files.len());
+    let mut conflicts: Vec<String> = Vec::new();
+
+    for (idx, rel) in changed_files.iter().enumerate() {
+        let base_bytes = git_show_blob(wt_dir, &format!("HEAD:{rel}"));
+        let wt_path = Path::new(wt_dir).join(rel);
+        let main_path = Path::new(run_cwd).join(rel);
+        let theirs_bytes = std::fs::read(&wt_path).ok();
+        let ours_bytes = std::fs::read(&main_path).ok();
+        let wt_exec = is_executable(&wt_path);
+
+        if ours_bytes == base_bytes {
+            // Main working tree file is byte-identical to the worktree's base snapshot (even if
+            // unstaged relative to `.git/index`): safe to take `theirs` directly.
+            match theirs_bytes {
+                Some(bytes) => ops.push(PlannedOp::Write { rel: rel.clone(), bytes, executable: wt_exec }),
+                None => ops.push(PlannedOp::Delete { rel: rel.clone() }),
+            }
+            continue;
+        }
+        if ours_bytes == theirs_bytes {
+            continue;
+        }
+
+        match (base_bytes, ours_bytes, theirs_bytes) {
+            (Some(base), Some(ours), Some(theirs))
+                if !base.contains(&0) && !ours.contains(&0) && !theirs.contains(&0) =>
+            {
+                let f_ours = tmp_dir.join(format!("ours-{idx}"));
+                let f_base = tmp_dir.join(format!("base-{idx}"));
+                let f_theirs = tmp_dir.join(format!("theirs-{idx}"));
+                if std::fs::write(&f_ours, &ours).is_err()
+                    || std::fs::write(&f_base, &base).is_err()
+                    || std::fs::write(&f_theirs, &theirs).is_err()
+                {
+                    conflicts.push(format!("{rel} (temp file write error)"));
+                    continue;
+                }
+                let out = super::bg_std_command("git")
+                    .args(["merge-file", "-p"])
+                    .arg(&f_ours)
+                    .arg(&f_base)
+                    .arg(&f_theirs)
+                    .output();
+                match out {
+                    Ok(o) if o.status.success() => {
+                        ops.push(PlannedOp::Write { rel: rel.clone(), bytes: o.stdout, executable: wt_exec });
+                    }
+                    _ => conflicts.push(rel.clone()),
+                }
+            }
+            _ => conflicts.push(rel.clone()),
+        }
+    }
+
+    if !conflicts.is_empty() {
+        return Err(ApiErr::new(
+            422,
+            "merge_conflict",
+            format!(
+                "Merge conflict integrating worktree `{wt_dir}` into `{run_cwd}` on [{}]: {apply_err}",
+                conflicts.join(", ")
+            ),
+        ));
+    }
+
+    for op in ops {
+        match op {
+            PlannedOp::Write { rel, bytes, executable } => {
+                let dst = Path::new(run_cwd).join(&rel);
+                if let Some(parent) = dst.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| ApiErr::new(500, "internal", format!("mkdir for {rel}: {e}")))?;
+                }
+                std::fs::write(&dst, bytes)
+                    .map_err(|e| ApiErr::new(500, "internal", format!("write merged {rel}: {e}")))?;
+                #[cfg(unix)]
+                if executable {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(meta) = std::fs::metadata(&dst) {
+                        let mut perm = meta.permissions();
+                        perm.set_mode(perm.mode() | 0o111);
+                        let _ = std::fs::set_permissions(&dst, perm);
+                    }
+                }
+                #[cfg(not(unix))]
+                let _ = executable;
+            }
+            PlannedOp::Delete { rel } => {
+                let dst = Path::new(run_cwd).join(&rel);
+                if dst.exists() {
+                    std::fs::remove_file(&dst)
+                        .map_err(|e| ApiErr::new(500, "internal", format!("remove deleted {rel}: {e}")))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn git_show_blob(cwd: &str, rev_path: &str) -> Option<Vec<u8>> {
+    let out = super::bg_std_command("git").args(["-C", cwd, "show", rev_path]).output().ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
+fn is_executable(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
 }
 
 pub(super) fn reset_worktree_clean(wt_dir: &str) {
@@ -1022,6 +1174,95 @@ mod tests {
         let ok_dirty = check_drove_worktree_ready(cwd).unwrap();
         assert_eq!(ok_dirty.total_dirty, 1);
         assert!(ok_dirty.dirty_warning.is_some());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn merge_worktree_handles_unstaged_dirty_base_and_preserves_index() {
+        let base = std::env::temp_dir().join(format!("herdr2-wt-dirty-merge-{}", super::super::crypto::rand_id("t")));
+        let repo = base.join("repo");
+        let wt_parent = base.join("wts");
+        std::fs::create_dir_all(&repo).unwrap();
+        std::fs::create_dir_all(&wt_parent).unwrap();
+        let cwd = repo.to_str().unwrap();
+
+        let run_git = |args: &[&str]| -> String {
+            let out = super::super::bg_std_command("git")
+                .args(["-C", cwd])
+                .args(args)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@local")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@local")
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).to_string()
+        };
+
+        run_git(&["init", "-q"]);
+        std::fs::write(repo.join("test_unified.py"), "line1\nline2\nline3\n").unwrap();
+        std::fs::write(repo.join("other.py"), "a = 1\n").unwrap();
+        run_git(&["add", "-A"]);
+        run_git(&["commit", "-q", "-m", "init"]);
+
+        // Simulate prior task editing `test_unified.py` in main workspace WITHOUT staging it
+        // (index stays at old blob while working tree has new content).
+        std::fs::write(repo.join("test_unified.py"), "line1\nline2_mlbb\nline3\n").unwrap();
+
+        // Fork worktree from working-tree snapshot (same as prepare_task_worktree).
+        let snap_commit = snapshot_working_tree_commit(cwd, &wt_parent).unwrap();
+        let wt_dir = wt_parent.join("wt1");
+        let wt_str = wt_dir.to_str().unwrap();
+        run_git(&["worktree", "add", "--detach", wt_str, &snap_commit]);
+
+        // Worker edits the already-dirty file and adds a new file.
+        std::fs::write(wt_dir.join("test_unified.py"), "line1\nline2_mlbb\nline3\nline4_unit_test\n").unwrap();
+        std::fs::write(wt_dir.join("new_test.py"), "def test_ok(): pass\n").unwrap();
+
+        // Merge back MUST succeed (no `does not match index` deadlock) AND keep `.git/index` untouched!
+        let merged = merge_worktree_blocking(cwd, wt_str, false).unwrap();
+        assert!(merged.iter().any(|f| f == "test_unified.py"));
+        assert!(merged.iter().any(|f| f == "new_test.py"));
+        assert_eq!(
+            std::fs::read_to_string(repo.join("test_unified.py")).unwrap(),
+            "line1\nline2_mlbb\nline3\nline4_unit_test\n"
+        );
+        let status = run_git(&["status", "--porcelain"]);
+        assert!(status.contains(" M test_unified.py"), "index must remain unstaged: {status:?}");
+        assert!(!status.contains("M  test_unified.py") && !status.contains("MM test_unified.py"), "index polluted: {status:?}");
+        assert!(status.contains("?? new_test.py"), "new file should stay untracked, not staged: {status:?}");
+
+        // Now test non-overlapping concurrent edits in BOTH main working tree and a second worktree.
+        let snap2 = snapshot_working_tree_commit(cwd, &wt_parent).unwrap();
+        let wt2_dir = wt_parent.join("wt2");
+        let wt2_str = wt2_dir.to_str().unwrap();
+        run_git(&["worktree", "add", "--detach", wt2_str, &snap2]);
+
+        // Concurrent edit to top of file in main workspace, bottom of file in worktree.
+        std::fs::write(repo.join("test_unified.py"), "line1_main_concurrent\nline2_mlbb\nline3\nline4_unit_test\n").unwrap();
+        std::fs::write(wt2_dir.join("test_unified.py"), "line1\nline2_mlbb\nline3\nline4_unit_test\nline5_wt2\n").unwrap();
+        let merged2 = merge_worktree_blocking(cwd, wt2_str, false).unwrap();
+        assert_eq!(merged2, vec!["test_unified.py".to_string()]);
+        assert_eq!(
+            std::fs::read_to_string(repo.join("test_unified.py")).unwrap(),
+            "line1_main_concurrent\nline2_mlbb\nline3\nline4_unit_test\nline5_wt2\n"
+        );
+        let status2 = run_git(&["status", "--porcelain"]);
+        assert!(status2.contains(" M test_unified.py") && !status2.contains("MM "), "3-way merge must not touch index: {status2:?}");
+
+        // True overlapping conflict must fail cleanly with 422 without leaving conflict markers in main.
+        let snap3 = snapshot_working_tree_commit(cwd, &wt_parent).unwrap();
+        let wt3_dir = wt_parent.join("wt3");
+        let wt3_str = wt3_dir.to_str().unwrap();
+        run_git(&["worktree", "add", "--detach", wt3_str, &snap3]);
+        std::fs::write(repo.join("other.py"), "a = 200\n").unwrap();
+        std::fs::write(wt3_dir.join("other.py"), "a = 300\n").unwrap();
+        let err = merge_worktree_blocking(cwd, wt3_str, false).unwrap_err();
+        assert_eq!(err.status, 422);
+        assert_eq!(err.code, "merge_conflict");
+        assert_eq!(std::fs::read_to_string(repo.join("other.py")).unwrap(), "a = 200\n");
 
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -310,6 +310,51 @@ pub fn read(path: &Path) -> Result<Option<String>, String> {
     Ok(Some(text))
 }
 
+/// Reads up to `max_bytes` of a text file for previewing, without rejecting
+/// files larger than 1 MiB or containing occasional non-UTF-8 bytes.
+/// If NUL bytes are present, returns `"\0"` so callers detect binary files.
+pub fn read_preview(path: &Path, max_bytes: u64) -> Result<Option<String>, String> {
+    let cap = max_bytes.clamp(1, LIMIT);
+    let file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.to_string()),
+    };
+    if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
+        return Err("Path is not a regular file".into());
+    }
+    let mut bytes = Vec::new();
+    file.take(cap + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| e.to_string())?;
+    Ok(Some(decode_preview_bytes(&bytes, cap as usize)))
+}
+
+pub const TRUNCATED_SENTINEL: &str = "\n\u{fffd}__HERDR_TRUNCATED__";
+
+pub fn decode_preview_bytes(bytes: &[u8], cap: usize) -> String {
+    if bytes.contains(&0) {
+        return "\0".to_owned();
+    }
+    let truncated = bytes.len() > cap;
+    let slice = if truncated { &bytes[..cap] } else { bytes };
+    // Avoid splitting a multi-byte UTF-8 character at the truncation boundary.
+    let valid_slice = if truncated {
+        match std::str::from_utf8(slice) {
+            Ok(s) => return format!("{s}{TRUNCATED_SENTINEL}"),
+            Err(e) if e.error_len().is_none() => &slice[..e.valid_up_to()],
+            Err(_) => slice,
+        }
+    } else {
+        slice
+    };
+    let mut text = String::from_utf8_lossy(valid_slice).into_owned();
+    if truncated {
+        text.push_str(TRUNCATED_SENTINEL);
+    }
+    text
+}
+
 pub fn write(path: &Path, text: &str, expected: Option<&str>) -> Result<(), String> {
     let _guard = WRITES.lock().map_err(|e| e.to_string())?;
     if text.len() as u64 > LIMIT {
@@ -484,6 +529,37 @@ mod tests {
         assert_eq!(prepared[1]["mimeType"], "text/markdown");
         assert_eq!(prepared[1]["name"], "spec.md");
         assert!(prepared[2]["error"].as_str().is_some());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn read_preview_truncates_large_utf8_cleanly_and_flags_binary() {
+        let root = crate::test_tmp().join(format!(
+            "herdr-app-preview-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let small = root.join("small.txt");
+        std::fs::write(&small, "hello world\n").unwrap();
+        assert_eq!(read_preview(&small, 1024).unwrap().as_deref(), Some("hello world\n"));
+
+        // Multi-byte UTF-8 file exceeding cap must truncate cleanly on a char boundary with sentinel.
+        let big = root.join("big.txt");
+        let content = "中文测试行\n".repeat(40);
+        std::fs::write(&big, &content).unwrap();
+        let preview = read_preview(&big, 50).unwrap().unwrap();
+        assert!(preview.ends_with(TRUNCATED_SENTINEL));
+        let body = preview.strip_suffix(TRUNCATED_SENTINEL).unwrap();
+        assert!(body.len() <= 50 && body.starts_with("中文"));
+
+        let bin = root.join("bin.dat");
+        std::fs::write(&bin, b"abc\0def").unwrap();
+        assert_eq!(read_preview(&bin, 1024).unwrap().as_deref(), Some("\0"));
 
         std::fs::remove_dir_all(root).unwrap();
     }

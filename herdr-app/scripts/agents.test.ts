@@ -23,8 +23,9 @@ function harness(pins: string[], globals: Record<string, unknown> = {}) {
     ...Object.values(mergedGlobals),
   );
   const agents = new Agents();
-  agents.init({}, { timer: { every() {} } });
-  return { agents, data, writes };
+  const ticks: { ms: number; fn: Function }[] = [];
+  agents.init({}, { timer: { every(ms: number, fn: Function) { ticks.push({ ms, fn }); } } });
+  return { agents, data, writes, ticks };
 }
 
 test("legacy pins migrate once listed, retaining offline pins until their labels arrive", () => {
@@ -296,7 +297,7 @@ for (const width of [268, 44]) test(`the focused agent's row is marked as select
   });
   const fills = new Map<string, unknown>();
   const walk = (node: any) => {
-    if (node?.id?.startsWith("ag-t")) fills.set(node.id, node.bg);
+    if (typeof node?.id === "string" && /^ag-t\d+$/.test(node.id)) fills.set(node.id, node.bg);
     (node?.children ?? []).forEach(walk);
   };
   walk(agents.render({}).node);
@@ -732,7 +733,7 @@ for (const sort of ["grouped", "priority"]) test(`${sort}: agents and sub-agents
   });
   const rowIds: string[] = [];
   const walk = (node: any) => {
-    if (typeof node?.id === "string" && (node.id.startsWith("ag-") || node.id.startsWith("sub-")) && !node.id.includes("-id-") && !node.id.includes("-rt-") && !node.id.includes("-kind-") && !node.id.includes("-wt-") && !node.id.startsWith("ag-list") && !node.id.startsWith("ag-recycle") && !node.id.startsWith("ag-sort") && !node.id.startsWith("ag-briefing")) {
+    if (typeof node?.id === "string" && (node.id.startsWith("ag-") || node.id.startsWith("sub-")) && !node.id.includes("-id-") && !node.id.includes("-rt-") && !node.id.includes("-kind-") && !node.id.includes("-wt-") && !node.id.includes("-time-") && !node.id.startsWith("ag-list") && !node.id.startsWith("ag-recycle") && !node.id.startsWith("ag-sort") && !node.id.startsWith("ag-briefing")) {
       rowIds.push(node.id);
     }
     (node?.children ?? []).forEach(walk);
@@ -784,7 +785,7 @@ test("zero-click hover tooltip formats status, live micro_summary, and cwd/branc
       branch: "feat/auth",
     },
     { address: "a3", cwd: "/home/dev/repo", turn: 3 },
-    { isZh: true, now: 180000, since: 0 },
+    { isZh: true, now: 181000, since: 1000 },
   );
   const lines = tip.split("\n");
   expect(lines).toHaveLength(3);
@@ -818,6 +819,7 @@ test("catch-up briefing clusters similar permissions and merges Drove downstream
     generatedMs: 2000,
     headline: "核心 schema 失败正阻塞 3 个下游任务；2 个测试审批可一键全批。",
     headlineFromAi: true,
+    counts: { critical: 1, needsYou: 2, readyReview: 1, working: 0 },
     criticalBlockers: [
       { id: "drove_task:t_schema", kind: "drove_blocker", title: "schema: Update OpenRPC", summary: "Blocking 3 downstream", status: "error", blockedDownstreamCount: 3 },
     ],
@@ -1111,4 +1113,79 @@ test("grouped mode orders space groups strictly by spaces() order without splitt
   walk(root);
   expect(headerIds).toEqual(["sp-wsl/sp1", "sp-wsl/sp2"]);
   expect(orders.at(-1)).toEqual(["wsl/a1", "wsl/a2", "wsl/a3"]);
+});
+
+test("sub-agent rows display live and completed execution time and swap to remove on hover", () => {
+  const now = Date.now();
+  const claude = { key: "claude", name: "Claude", agent: true };
+  const list = [
+    { address: "t1", space: "s1", space_name: "Project", tab: "tab1", pane: "p1", status: "idle", title: "Parent", program: claude },
+  ];
+  const terms = [
+    { address: "t1", parent: null, state: "live", status: "idle", program: claude, labels: {} },
+    {
+      address: "a-sub-run",
+      acp: true,
+      parent: "t1",
+      state: "live",
+      status: "working",
+      name: "worker-running",
+      program: claude,
+      working_since: now - 65_000,
+      total_work_ms: 65_000,
+      labels: {},
+    },
+    {
+      address: "a-sub-done",
+      acp: true,
+      parent: "t1",
+      state: "live",
+      status: "idle",
+      name: "worker-done",
+      program: claude,
+      working_since: null,
+      work_ms: 42_000,
+      total_work_ms: 90_000,
+      labels: {},
+    },
+  ];
+  const { agents, ticks } = harness([], {
+    agents: () => list,
+    terminals: () => terms,
+    panes: () => [{ pane: "p1", tab: "tab1", terminal: "t1", program: claude, title: "Parent" }],
+    focused: () => null,
+    spaces: () => [{ id: "s1", name: "Project", tabs: [{ id: "tab1", name: "Parent", named: true }] }],
+    layout: () => ({ id: "sidebar", size: { px: 268 } }),
+    shared: () => "grouped",
+    theme: () => ({}),
+    setAgentOrder: () => {},
+    div: element, v_flex: element, h_flex: element, svg: element, image: element,
+  });
+
+  const collectTexts = (node: any, out = new Map<string, string>()): Map<string, string> => {
+    if (typeof node?.id === "string") {
+      const str = (n: any): string => (typeof n === "string" ? n : (n?.children ?? []).map(str).join(""));
+      out.set(node.id, str(node));
+    }
+    for (const c of node?.children ?? []) collectTexts(c, out);
+    return out;
+  };
+
+  const rendered = agents.render({});
+  const texts = collectTexts(rendered.node);
+  expect(texts.get("sub-time-a-sub-run")).toMatch(/^1:0[5-9]$/);
+  expect(texts.get("sub-time-a-sub-done")).toBe("0:42");
+
+  // Hovering a sub-agent replaces its elapsed time badge with the remove button cleanly.
+  agents.hoveredSub = "a-sub-done";
+  const hoveredTexts = collectTexts(agents.render({}).node);
+  expect(hoveredTexts.has("sub-time-a-sub-done")).toBe(false);
+  expect(hoveredTexts.has("rm-sub-a-sub-done")).toBe(true);
+
+  // 1-second timer notifies when a headless sub-agent is working even if parent agents are idle.
+  let notified = 0;
+  const tick1s = ticks.find((t: any) => t.ms === 1000);
+  expect(tick1s).toBeDefined();
+  tick1s.fn({ notify: () => { notified += 1; } });
+  expect(notified).toBe(1);
 });

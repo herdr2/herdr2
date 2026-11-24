@@ -86,7 +86,10 @@ pub struct DroveRuntime {
     loop_audit_count: Mutex<HashMap<String, u32>>,
     attempt_min_turn: Mutex<HashMap<String, u64>>,
     worker_last_attempt: Mutex<HashMap<String, String>>,
+    worker_prev_attempt: Mutex<HashMap<String, String>>,
     worker_usage_watermark: Mutex<HashMap<String, u64>>,
+    worker_explicit_usage_watermark: Mutex<HashMap<String, (u64, u64, u64)>>,
+    attempt_estimated_output: Mutex<HashMap<String, u64>>,
     conflict_cache: Mutex<HashMap<String, (bool, String)>>,
     run_merge_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -173,7 +176,10 @@ impl DroveRuntime {
             loop_audit_count: Mutex::new(HashMap::new()),
             attempt_min_turn: Mutex::new(HashMap::new()),
             worker_last_attempt: Mutex::new(HashMap::new()),
+            worker_prev_attempt: Mutex::new(HashMap::new()),
             worker_usage_watermark: Mutex::new(HashMap::new()),
+            worker_explicit_usage_watermark: Mutex::new(HashMap::new()),
+            attempt_estimated_output: Mutex::new(HashMap::new()),
             conflict_cache: Mutex::new(HashMap::new()),
             run_merge_locks: Mutex::new(HashMap::new()),
         }))
@@ -205,6 +211,7 @@ impl DroveRuntime {
         self.loop_audit_last_at.lock().unwrap_or_else(|p| p.into_inner()).remove(attempt_id);
         self.loop_audit_count.lock().unwrap_or_else(|p| p.into_inner()).remove(attempt_id);
         self.attempt_min_turn.lock().unwrap_or_else(|p| p.into_inner()).remove(attempt_id);
+        self.attempt_estimated_output.lock().unwrap_or_else(|p| p.into_inner()).remove(attempt_id);
     }
 
     pub fn can_run_loop_audit(&self, attempt_id: &str, cooldown: Duration, max_checks: u32) -> bool {
@@ -231,14 +238,24 @@ impl DroveRuntime {
     }
 
     pub fn set_worker_last_attempt(&self, worker_id: &str, attempt_id: &str) {
-        self.worker_last_attempt
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .insert(worker_id.to_string(), attempt_id.to_string());
+        let mut last = self.worker_last_attempt.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(prev) = last.get(worker_id)
+            && prev != attempt_id
+        {
+            self.worker_prev_attempt
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(worker_id.to_string(), prev.clone());
+        }
+        last.insert(worker_id.to_string(), attempt_id.to_string());
     }
 
     pub fn get_worker_last_attempt(&self, worker_id: &str) -> Option<String> {
         self.worker_last_attempt.lock().unwrap_or_else(|p| p.into_inner()).get(worker_id).cloned()
+    }
+
+    pub fn get_worker_prev_attempt(&self, worker_id: &str) -> Option<String> {
+        self.worker_prev_attempt.lock().unwrap_or_else(|p| p.into_inner()).get(worker_id).cloned()
     }
 
     /// Advances the per-worker cumulative context-usage watermark and returns the positive delta.
@@ -250,9 +267,46 @@ impl DroveRuntime {
         delta
     }
 
+    /// Advances per-worker cumulative explicit `(input, output, cache_read)` watermark and returns
+    /// only the incremental delta since the last update (so reused workers never attribute prior-task
+    /// cumulative session totals to a new attempt).
+    pub fn advance_worker_explicit_usage_watermark(
+        &self,
+        worker_id: &str,
+        new_in: u64,
+        new_out: u64,
+        new_cache: u64,
+    ) -> (u64, u64, u64) {
+        let mut map = self.worker_explicit_usage_watermark.lock().unwrap_or_else(|p| p.into_inner());
+        let (prev_in, prev_out, prev_cache) = map.get(worker_id).copied().unwrap_or((0, 0, 0));
+        let d_in = if new_in >= prev_in { new_in - prev_in } else { new_in };
+        let d_out = if new_out >= prev_out { new_out - prev_out } else { new_out };
+        let d_cache = if new_cache >= prev_cache { new_cache - prev_cache } else { new_cache };
+        map.insert(worker_id.to_string(), (new_in, new_out, new_cache));
+        (d_in, d_out, d_cache)
+    }
+
+    /// Accumulates estimated streamed output tokens (`bytes / 4`) for an attempt while an adapter
+    /// (such as `agy`) only emits coarse context-window totals without split `output` tokens.
+    pub fn add_attempt_estimated_output(&self, attempt_id: &str, delta_tokens: u64) -> u64 {
+        if delta_tokens == 0 {
+            return 0;
+        }
+        let mut map = self.attempt_estimated_output.lock().unwrap_or_else(|p| p.into_inner());
+        let entry = map.entry(attempt_id.to_string()).or_insert(0);
+        *entry = entry.saturating_add(delta_tokens);
+        *entry
+    }
+
+    pub fn clear_attempt_estimated_output(&self, attempt_id: &str) {
+        self.attempt_estimated_output.lock().unwrap_or_else(|p| p.into_inner()).remove(attempt_id);
+    }
+
     pub fn clear_worker_runtime_state(&self, worker_id: &str) {
         self.worker_last_attempt.lock().unwrap_or_else(|p| p.into_inner()).remove(worker_id);
+        self.worker_prev_attempt.lock().unwrap_or_else(|p| p.into_inner()).remove(worker_id);
         self.worker_usage_watermark.lock().unwrap_or_else(|p| p.into_inner()).remove(worker_id);
+        self.worker_explicit_usage_watermark.lock().unwrap_or_else(|p| p.into_inner()).remove(worker_id);
     }
 
     pub fn get_conflict_cached(&self, key: &str) -> Option<(bool, String)> {

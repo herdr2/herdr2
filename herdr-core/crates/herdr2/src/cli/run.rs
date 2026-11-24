@@ -79,7 +79,7 @@ pub(super) fn ran(r: &Value) -> Result<Option<Out>, RpcError> {
     let a = r["address"].as_str().unwrap_or("?");
     if r.get("wait").is_none() {
         let fix = a.split_once('/').map(|(m, _)| format!(": h2 machine update {m}")).unwrap_or_default();
-        println!("[h2] started as {a}, not waited on: that h2 is older{fix}");
+        write_stdout_line(&format!("[h2] started as {a}, not waited on: that h2 is older{fix}"));
         std::process::exit(0);
     }
     let w = &r["wait"];

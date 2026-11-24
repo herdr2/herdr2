@@ -125,7 +125,7 @@ pub(crate) fn menus(layouts: &[String], shown: Option<&str>) -> Vec<Menu> {
         ]),
         Menu::new("Help").items([
             command("Keyboard Shortcuts", "app.help"),
-            command("Welcome to Herdr", "app.welcome"),
+            command("Welcome to Herdr2", "app.welcome"),
         ]),
     ]
 }

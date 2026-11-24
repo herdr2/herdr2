@@ -1,6 +1,6 @@
 //! Role-first task router (`strengths` matching -> `primary` -> `fallbacks`, Magpie quota skip, + warm worker affinity reuse).
 
-use super::config::{default_roles, resolve_role_config};
+use super::config::{align_effort_with_model, default_roles, resolve_role_config};
 use super::magpie::quota_exhausted_reason;
 use super::types::*;
 
@@ -120,6 +120,8 @@ pub fn route_task_with_preference(
             )
         };
 
+    let chosen_effort = align_effort_with_model(chosen_model.as_deref(), chosen_effort);
+
     // Prefer an explicit user-requested worker id if idle and matching cwd/agent;
     // ignore router-populated `assign.worker` so fallback retries can switch agents cleanly.
     let explicit_worker = if is_router_assigned { None } else { assign.and_then(|a| a.worker.as_deref()) };
@@ -190,7 +192,8 @@ pub fn candidate_pool_for_ai(
     let role_cfg = resolve_role_config(cfg, &role_name)?;
     let explicit_model =
         if is_router_assigned { None } else { assign.and_then(|a| a.model.clone()).filter(|s| !s.trim().is_empty()) };
-    let (pool, _, _, _) = build_candidate_pool(&role_cfg, workers, probed, quotas, explicit_model.as_deref());
+    let pool_info = build_candidate_pool(&role_cfg, workers, probed, quotas, explicit_model.as_deref());
+    let pool = pool_info.pool;
     if pool.len() < 2 {
         return None;
     }
@@ -210,13 +213,21 @@ pub fn candidate_pool_for_ai(
     Some((role_name, pool.into_iter().map(|(idx, c)| (idx, c.clone())).collect()))
 }
 
+struct CandidatePool<'a> {
+    pool: Vec<(usize, &'a RoleTarget)>,
+    first_skipped: Option<(String, String)>,
+    all_exhausted: bool,
+    any_installed: bool,
+    primary_skip_reason: Option<String>,
+}
+
 fn build_candidate_pool<'a>(
     role_cfg: &'a RoleConfig,
     workers: &[Worker],
     probed: &ProbeSnapshot,
     quotas: Option<&[QuotaCard]>,
     explicit_model: Option<&str>,
-) -> (Vec<(usize, &'a RoleTarget)>, Option<(String, String)>, bool, bool) {
+) -> CandidatePool<'a> {
     let mut chain = Vec::with_capacity(1 + role_cfg.fallbacks.len());
     chain.push(&role_cfg.primary);
     for fb in &role_cfg.fallbacks {
@@ -238,8 +249,20 @@ fn build_candidate_pool<'a>(
         .collect();
 
     if eligible.is_empty() {
-        return (Vec::new(), None, false, any_installed);
+        return CandidatePool {
+            pool: Vec::new(),
+            first_skipped: None,
+            all_exhausted: false,
+            any_installed,
+            primary_skip_reason: any_installed.then(|| format!("not_installed:{}", role_cfg.primary.agent)),
+        };
     }
+
+    let mut primary_skip_reason: Option<String> = if !eligible.iter().any(|(idx, _)| *idx == 0) {
+        Some(format!("not_installed:{}", role_cfg.primary.agent))
+    } else {
+        None
+    };
 
     let mut first_skipped: Option<(String, String)> = None;
     let mut available: Vec<(usize, &RoleTarget)> = Vec::new();
@@ -248,7 +271,10 @@ fn build_candidate_pool<'a>(
             let eff_model = explicit_model.or(cand.model.as_deref());
             if let Some(q_reason) = quota_exhausted_reason(&cand.agent, eff_model, cards) {
                 if first_skipped.is_none() {
-                    first_skipped = Some((cand.agent.clone(), q_reason));
+                    first_skipped = Some((cand.agent.clone(), q_reason.clone()));
+                }
+                if idx == 0 && primary_skip_reason.is_none() {
+                    primary_skip_reason = Some(format!("quota:{q_reason}"));
                 }
                 continue;
             }
@@ -274,8 +300,15 @@ fn build_candidate_pool<'a>(
             !has_dead || has_healthy
         })
         .collect();
+    if !healthy.is_empty()
+        && base_pool.iter().any(|(idx, _)| *idx == 0)
+        && !healthy.iter().any(|(idx, _)| *idx == 0)
+        && primary_skip_reason.is_none()
+    {
+        primary_skip_reason = Some(format!("unhealthy:{}", role_cfg.primary.agent));
+    }
     let pool = if !healthy.is_empty() { healthy } else { base_pool };
-    (pool, first_skipped, all_exhausted, any_installed)
+    CandidatePool { pool, first_skipped, all_exhausted, any_installed, primary_skip_reason }
 }
 
 /// Bilingual domain synonym groups used to match candidate `strengths` tags against task context.
@@ -800,7 +833,7 @@ fn pick_candidate(
     failures: u32,
     preferred_candidate: Option<(usize, String)>,
 ) -> (String, Option<String>, Option<String>, Effort, bool, String) {
-    let (pool, first_skipped, all_exhausted, any_installed) =
+    let CandidatePool { pool, first_skipped, all_exhausted, any_installed, primary_skip_reason } =
         build_candidate_pool(role_cfg, workers, probed, quotas, explicit_model.as_deref());
 
     if !pool.is_empty() {
@@ -833,16 +866,27 @@ fn pick_candidate(
         } else {
             String::new()
         };
+        let primary_note = if idx > 0 {
+            match primary_skip_reason.as_deref() {
+                Some(why) if !why.starts_with("quota:") => format!(" (primary_skipped={why})"),
+                _ => String::new(),
+            }
+        } else {
+            String::new()
+        };
         let reason = if all_exhausted {
             let why = first_skipped.map(|(_, r)| r).unwrap_or_else(|| "exhausted".into());
-            format!("role={role_name} {kind}={}{match_tag}{retry_tag} (all quotas exhausted: {why})", cand.agent)
+            format!(
+                "role={role_name} {kind}={}{match_tag}{retry_tag}{primary_note} (all quotas exhausted: {why})",
+                cand.agent
+            )
         } else if let Some((skipped_agent, skipped_why)) = &first_skipped {
             format!(
-                "role={role_name} {kind}={}{match_tag}{retry_tag} (skipped {skipped_agent}: {skipped_why})",
+                "role={role_name} {kind}={}{match_tag}{retry_tag}{primary_note} (skipped {skipped_agent}: {skipped_why})",
                 cand.agent
             )
         } else {
-            format!("role={role_name} {prefix}{kind}={}{match_tag}{retry_tag}", cand.agent)
+            format!("role={role_name} {prefix}{kind}={}{match_tag}{retry_tag}{primary_note}", cand.agent)
         };
         return (
             cand.agent.clone(),
@@ -946,6 +990,8 @@ mod tests {
             deps: Vec::new(),
             output_schema: None,
             isolation: Isolation::None,
+            effective_isolation: None,
+            isolation_reason: None,
             timeout_sec: None,
             stall_warn_sec: None,
             stall_kill_sec: None,
@@ -1312,6 +1358,120 @@ mod tests {
         assert!(
             candidate_pool_for_ai(&note_only_cfg, &generic_task, &[], &ProbeSnapshot::default(), None).is_some(),
             "per-candidate note must trigger AI candidate evaluation"
+        );
+    }
+
+    #[test]
+    fn route_aligns_embedded_effort_and_explains_primary_skip_reason() {
+        let mut cfg = DroveConfig::default();
+        cfg.roles.insert(
+            "coder".into(),
+            RoleConfig {
+                label: Some("Coder".into()),
+                summary: None,
+                access: Some(RoleAccessMode::Writable),
+                allowed_paths: Vec::new(),
+                primary: RoleTarget {
+                    agent: "claude".into(),
+                    model: Some("claude-opus-4-6".into()),
+                    effort: Effort::High,
+                    fast: false,
+                    context: None,
+                    strengths: Vec::new(),
+                    note: None,
+                },
+                fallbacks: vec![RoleTarget {
+                    agent: "agy".into(),
+                    model: Some("gemini-4-neon-medium".into()),
+                    effort: Effort::High, // intentionally mismatched with `-medium` suffix
+                    fast: false,
+                    context: None,
+                    strengths: Vec::new(),
+                    note: None,
+                }],
+                prompt: None,
+            },
+        );
+        let probed = ProbeSnapshot {
+            probed_at: now_iso(),
+            full_probe: true,
+            agents: vec![
+                ProbedAgent {
+                    id: "claude".into(),
+                    command: vec!["claude".into()],
+                    installed: false,
+                    path: None,
+                    agent_info: None,
+                    models: Vec::new(),
+                    default_model: None,
+                    efforts: Vec::new(),
+                    default_effort: None,
+                    model_contexts: std::collections::BTreeMap::new(),
+                    model_efforts: std::collections::BTreeMap::new(),
+                    error: None,
+                },
+                ProbedAgent {
+                    id: "agy".into(),
+                    command: vec!["agy".into()],
+                    installed: true,
+                    path: Some("/usr/bin/agy".into()),
+                    agent_info: None,
+                    models: vec!["gemini-4-neon-medium".into()],
+                    default_model: None,
+                    efforts: Vec::new(),
+                    default_effort: None,
+                    model_contexts: std::collections::BTreeMap::new(),
+                    model_efforts: std::collections::BTreeMap::new(),
+                    error: None,
+                },
+            ],
+        };
+
+        let task = sample_task("coder");
+        let dec = route_task_with_quotas(&cfg, &task, "/tmp", &[], &probed, None);
+        assert_eq!(dec.agent, "agy");
+        assert_eq!(dec.model.as_deref(), Some("gemini-4-neon-medium"));
+        assert_eq!(dec.effort, Effort::Medium, "embedded -medium effort must override mismatched config effort");
+        assert!(
+            dec.reason.contains("primary_skipped=not_installed:claude"),
+            "expected explicit primary skip reason, got: {}",
+            dec.reason
+        );
+
+        // When primary is installed but has a Dead worker and no healthy worker, report unhealthy skip.
+        let mut probed_both = probed;
+        probed_both.agents[0].installed = true;
+        let dead_worker = Worker {
+            id: "w_dead".into(),
+            run_id: "r1".into(),
+            agent: "claude".into(),
+            model: Some("claude-opus-4-6".into()),
+            context_window: None,
+            effort: Some(Effort::High),
+            fast: Some(false),
+            session_key: "r1:w_dead".into(),
+            h2_agent: None,
+            cwd: "/tmp".into(),
+            worktree: None,
+            state: WorkerState::Dead,
+            current_attempt_id: None,
+            pid: None,
+            fingerprint: Fingerprint::default(),
+            context: WorkerContext::default(),
+            totals: WorkerTotals::default(),
+            created_at: now_iso(),
+            last_active_at: now_iso(),
+            role: Some("coder".into()),
+            forked_from: None,
+            protocol_gen: Some(1),
+            read_only_dir: None,
+        };
+        let dec2 = route_task_with_quotas(&cfg, &task, "/tmp", &[dead_worker], &probed_both, None);
+        assert_eq!(dec2.agent, "agy");
+        assert!(
+            dec2.reason.contains("primary_skipped=unhealthy:claude"),
+            "expected unhealthy primary skip reason, got: {}",
+            dec2.reason
         );
     }
 }

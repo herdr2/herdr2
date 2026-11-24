@@ -267,6 +267,8 @@ mod tests {
             deps: Vec::new(),
             output_schema: None,
             isolation: Isolation::None,
+            effective_isolation: None,
+            isolation_reason: None,
             timeout_sec: None,
             stall_warn_sec: None,
             stall_kill_sec: None,

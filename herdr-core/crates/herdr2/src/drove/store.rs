@@ -381,6 +381,8 @@ impl Store {
             deps: input.deps,
             output_schema: input.output_schema,
             isolation: input.isolation,
+            effective_isolation: None,
+            isolation_reason: None,
             timeout_sec: input.timeout_sec,
             stall_warn_sec: input.stall_warn_sec,
             stall_kill_sec: input.stall_kill_sec,
@@ -666,6 +668,57 @@ impl Store {
             self.emit_change("messages", Value::String(m.id.clone()), Some(m.run_id.clone()));
         }
         drained
+    }
+
+    /// Atomically posts a reply message and marks the parent question/escalation handled in a single
+    /// lock + state flush, avoiding double serialization/fsync on the coordinator reply path.
+    pub fn post_reply_and_mark_handled(&self, parent_id: &str, input: PostMessageInput) -> Message {
+        let (reply, parent_updated) = {
+            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            g.data.next_msg_seq += 1;
+            let seq = g.data.next_msg_seq;
+            let now = now_iso();
+            let reply = Message {
+                id: crypto::rand_id("msg"),
+                seq,
+                run_id: input.run_id,
+                kind: input.kind,
+                from: input.from,
+                to: input.to,
+                thread_id: input.thread_id,
+                task_id: input.task_id,
+                attempt_id: input.attempt_id,
+                subject: input.subject,
+                body: input.body,
+                options: input.options,
+                recommend: input.recommend,
+                why: input.why,
+                raised_by: input.raised_by,
+                raised_by_worker: input.raised_by_worker,
+                tag: input.tag,
+                ai_draft: input.ai_draft,
+                needs_action: input.needs_action,
+                handled_at: None,
+                created_at: now.clone(),
+            };
+            g.data.messages.push(reply.clone());
+            let parent_updated = if let Some(m) = g.data.messages.iter_mut().find(|m| m.id == parent_id) {
+                if m.handled_at.is_none() {
+                    m.handled_at = Some(now);
+                }
+                Some((m.id.clone(), m.run_id.clone()))
+            } else {
+                None
+            };
+            g.dirty = true;
+            let _ = g.flush_state();
+            (reply, parent_updated)
+        };
+        self.emit_change("messages", Value::String(reply.id.clone()), Some(reply.run_id.clone()));
+        if let Some((pid, rid)) = parent_updated {
+            self.emit_change("messages", Value::String(pid), Some(rid));
+        }
+        reply
     }
 
     pub fn mark_handled(&self, id: &str) -> Option<Message> {

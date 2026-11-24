@@ -5,7 +5,7 @@
 import { View, div, image, svg } from "gpui-kit";
 import { h_flex, v_flex, Popup, TextareaState, Textarea, InputState, Input, TextView, ScrollHandle } from "gpui-base";
 import { agents, terminals, panes, spaces, focused, run, theme, settings, home, props, closeOverlay, openOverlay, checking, h2, shared, setShared, nextCommand, keys, window as appWindow, readImageDataUrl, pasteClipboardAttachments, prepareAttachments, pickAttachments } from "herdr";
-import { buildConversationItems, buildPtySessionBadges, summarizeActivityGroup, toolIconPath, formatTime, shortenPath, normalizeConfigOptions, filterConfigChoices, normalizeInboxItems, parseToolDetail, resolveEffortVisual, resolvePeerAddress, isImageAttachment, formatAttachmentBytes, attachmentDisplayName } from "./acp_model.js";
+import { buildConversationItems, buildPtySessionBadges, summarizeActivityGroup, toolIconPath, formatTime, shortenPath, normalizeConfigOptions, filterConfigChoices, normalizeInboxItems, parseToolDetail, resolveEffortVisual, resolvePeerAddress, isImageAttachment, formatAttachmentBytes, attachmentDisplayName, extractTurnFilePatch, resolveChangedFilePath, isAbsoluteFilePath } from "./acp_model.js";
 
 function shortcutFor(action) {
   if (typeof keys !== "function" || !action) return "";
@@ -82,9 +82,12 @@ function looksLikeFilePath(raw) {
   const parsed = splitFileLineSuffix(raw);
   if (!parsed || !parsed.path) return false;
   const p = parsed.path;
-  if (p.length > 260 || /[\s<>"'`|;&=(){}[\]*?\\]/.test(p)) return false;
+  if (p.length > 260 || /[\s<>"'`|;&=(){}[\]*?]/.test(p)) return false;
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(p)) return false;
   if (p.startsWith("//") || p === "/" || p === "./" || p === "../" || p === "~/") return false;
+  if (/^[A-Za-z]:[\\/]/.test(p)) {
+    return p.length > 3;
+  }
   if (/^(?:\/|~\/|\.\/|\.\.\/)/.test(p)) {
     if (p.startsWith("/")) {
       const segs = p.split("/").filter(Boolean);
@@ -93,8 +96,8 @@ function looksLikeFilePath(raw) {
     }
     return p.length > 2;
   }
-  if (p.includes("/")) {
-    const segs = p.split("/").filter(Boolean);
+  if (p.includes("/") || p.includes("\\")) {
+    const segs = p.split(/[\\/]/).filter(Boolean);
     if (segs.length < 2) return false;
     const last = segs[segs.length - 1];
     return /\.[a-zA-Z0-9]{1,10}$/.test(last) || KNOWN_ROOT_FILE_RE.test(last);
@@ -2609,6 +2612,68 @@ export default class Peek extends View {
       );
   }
 
+  openChangedFileInChanges(item, fileEntry) {
+    const rawPath = String(fileEntry?.path ?? "").trim();
+    if (!rawPath) return;
+    const on = this.activeMachine() ?? null;
+    const cwd = this.term()?.cwd || spaces().find((s) => s.active)?.folder || "";
+    const homeDir = !on && typeof home === "function" ? String(home() ?? "") : "";
+    const absPath = resolveChangedFilePath(rawPath, cwd, homeDir, on) || rawPath;
+    const turn = item?.turn ?? null;
+    const terminal = this.activeTerminal() ?? null;
+    const primaryPatch = extractTurnFilePatch(this.entries, turn, rawPath, cwd, 48000);
+
+    const cardFiles = Array.isArray(item?.changedFiles?.files) ? item.changedFiles.files : [];
+    let siblingBudget = 64000;
+    const siblingFiles = cardFiles.slice(0, 40).map((sf) => {
+      const sfRaw = String(sf?.path ?? "").trim();
+      const sfAbs = resolveChangedFilePath(sfRaw, cwd, homeDir, on) || sfRaw;
+      const isClicked = sfAbs === absPath || sfRaw === rawPath;
+      let patch = "";
+      let isCreateOnly = false;
+      if (isClicked) {
+        patch = primaryPatch.patch;
+        isCreateOnly = primaryPatch.isCreateOnly;
+      } else if (isAbsoluteFilePath(sfRaw) && siblingBudget > 0) {
+        const info = extractTurnFilePatch(this.entries, turn, sfRaw, cwd, Math.min(8000, siblingBudget));
+        patch = info.patch;
+        isCreateOnly = info.isCreateOnly;
+        siblingBudget = Math.max(0, siblingBudget - patch.length);
+      }
+      return {
+        path: sfAbs,
+        displayPath: sfRaw,
+        additions: Number(sf?.additions ?? 0) || 0,
+        deletions: Number(sf?.deletions ?? 0) || 0,
+        ...(patch ? { patch } : {}),
+        ...(isCreateOnly ? { isCreateOnly: true } : {}),
+      };
+    });
+
+    let prevSeq = 0;
+    try { prevSeq = Number(shared("changes.open_request")?.seq ?? 0) || 0; } catch {}
+    const seq = Math.max(Date.now(), prevSeq + 1);
+    if (typeof setShared === "function") {
+      setShared("changes.open_request", {
+        seq,
+        ts: Date.now(),
+        path: absPath,
+        displayPath: rawPath,
+        cwd,
+        on,
+        terminal,
+        turn,
+        additions: Number(fileEntry?.additions ?? 0) || 0,
+        deletions: Number(fileEntry?.deletions ?? 0) || 0,
+        patch: primaryPatch.patch,
+        isCreateOnly: primaryPatch.isCreateOnly,
+        files: siblingFiles,
+      });
+    }
+    run("layout.select", { stack: "panel-body", child: "changes" });
+    run("layout.show", { id: "panel" });
+  }
+
   renderChangedFilesCard(t, item, mono) {
     const cf = item?.changedFiles;
     if (!cf || !Array.isArray(cf.files) || cf.files.length === 0) return null;
@@ -2710,12 +2775,10 @@ export default class Peek extends View {
                   .justify_between()
                   .rounded(6)
                   .cursor_pointer()
+                  .tooltip(f.path)
                   .hover((s) => s.bg(t.hover))
                   .on_mouse_down("left", stopMouse)
-                  .on_click(() => {
-                    run("layout.select", { stack: "panel-body", child: "changes" });
-                    run("layout.show", { id: "panel" });
-                  })
+                  .on_click(() => this.openChangedFileInChanges(item, f))
                   .child(
                     h_flex()
                       .flex_1()

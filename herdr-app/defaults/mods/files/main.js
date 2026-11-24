@@ -1,7 +1,7 @@
 // A side-by-side collapsible file browser for the focused pane's folder, with Typora-style live Markdown editing, image rendering, and IDE-themed code viewing.
 import { View, div, svg, list } from "gpui-kit";
 import { v_flex, h_flex, h_resizable, resizable_panel, Editor, EditorState, Input, InputState, TextareaState, Textarea, Popup, Scrollbar, TextView } from "gpui-base";
-import { spaces, panes, agents, terminals, focused, exec, readTextFile, readImageDataUrl, writeTextFile, watchFolder, theme, settings, window, layout, run, props, shared, setShared, checking, notify } from "herdr";
+import { spaces, panes, agents, terminals, focused, exec, readTextFile, readImageDataUrl, writeTextFile, watchFolder, theme, settings, window, layout, run, props, shared, setShared, nextCommand, checking, notify } from "herdr";
 import { detectFileKind, CODE_THEMES, MD_THEMES, resolveCodeTheme, resolveMdTheme, resolveRelativeFileLink, resolveRelativeAssetPath } from "./themes.js";
 import {
   resolveRepoRelativePath,
@@ -50,7 +50,8 @@ function location() {
   return { cwd: pane?.cwd || f?.cwd || space?.folder, on, space: space?.id };
 }
 const key = () => JSON.stringify(location());
-const PER_FOLDER = 500, TOTAL = 5000, MAX_PREVIEW_CHARS = 400000;
+const PER_FOLDER = 500, TOTAL = 5000, MAX_PREVIEW_CHARS = 400000, PREVIEW_MAX_BYTES = 450000;
+const TRUNCATED_SENTINEL = "\n\uFFFD__HERDR_TRUNCATED__";
 const MAX_FILE_CACHE = 24, MAX_CACHE_TEXT_CHARS = 200000, MAX_CACHE_IMAGE_CHARS = 2000000;
 const MAX_SVG_CACHE = 128;
 const INITIAL_MD_BLOCKS = 32, MD_PUMP_STEP = 48;
@@ -61,8 +62,25 @@ const isMathFenceLang = (lang) => {
   return l === "math" || l === "katex";
 };
 
+function unpackPreviewText(raw) {
+  let text = String(raw ?? "");
+  let truncated = false;
+  if (text.endsWith(TRUNCATED_SENTINEL)) {
+    text = text.slice(0, -TRUNCATED_SENTINEL.length);
+    truncated = true;
+  }
+  if (text.length > MAX_PREVIEW_CHARS) {
+    text = text.slice(0, MAX_PREVIEW_CHARS);
+    truncated = true;
+  }
+  return {
+    bounded: truncated ? text + "\n… (file truncated)" : text,
+    truncated,
+  };
+}
+
 function isAbsolutePath(p) {
-  return typeof p === "string" && /^(\/|[A-Za-z]:[\\/])/.test(p);
+  return typeof p === "string" && /^(\/|~\/|[A-Za-z]:[\\/])/.test(p);
 }
 
 function normalizePathSlashes(p) {
@@ -71,18 +89,23 @@ function normalizePathSlashes(p) {
 
 function resolveDiskPath(path, root) {
   if (!path) return "";
-  if (isAbsolutePath(path)) return path;
+  if (isAbsolutePath(path) || path === "~") return path;
   return root ? `${root.replace(/[\\/]+$/, "")}/${path}` : path;
 }
 
 function relativizeToRoot(targetPath, root) {
   const raw = String(targetPath ?? "").trim();
   if (!raw) return "";
-  if (!isAbsolutePath(raw) || !root) return raw;
+  if (!isAbsolutePath(raw) || raw.startsWith("~/") || !root) return raw;
   const normRoot = normalizePathSlashes(root);
   const normTarget = normalizePathSlashes(raw);
-  if (normTarget.startsWith(`${normRoot}/`)) {
-    return normTarget.slice(normRoot.length + 1);
+  const winDrive = /^[A-Za-z]:\//.test(normRoot) && /^[A-Za-z]:\//.test(normTarget);
+  const prefix = `${normRoot}/`;
+  const matches = winDrive
+    ? normTarget.toLowerCase().startsWith(prefix.toLowerCase())
+    : normTarget.startsWith(prefix);
+  if (matches) {
+    return normTarget.slice(prefix.length);
   }
   return raw;
 }
@@ -220,6 +243,8 @@ export default class Files extends View {
     this.selectedFile = null;
     this.showSeq = 0;
     this.lastHandledOpenSeq = 0;
+    this.pendingOpenTask = false;
+    this.lastExternalOpenAt = 0;
     this.pendingJumpLine = null;
     this.pendingJumpEndLine = null;
     this.fileOnOverride = null;
@@ -278,6 +303,9 @@ export default class Files extends View {
     }
     this.refresh(cx);
     if (typeof initialProps?.file === "string" && initialProps.file) {
+      let currentReqSeq = 0;
+      try { currentReqSeq = Number(shared("files.open_request")?.seq ?? 0) || 0; } catch {}
+      if (currentReqSeq > this.lastHandledOpenSeq) this.lastHandledOpenSeq = currentReqSeq;
       this.openExternalRequest(
         {
           path: initialProps.file,
@@ -289,6 +317,20 @@ export default class Files extends View {
       );
     } else {
       this.consumeOpenRequest(cx);
+    }
+    if (!checking() && typeof nextCommand === "function") {
+      cx.spawn(async cx => {
+        for (;;) {
+          try {
+            const cmd = await nextCommand();
+            if (cmd === "open_request") {
+              this.consumeOpenRequest(cx);
+            }
+          } catch {
+            break;
+          }
+        }
+      });
     }
     cx.timer.every(10000, cx => this.refresh(cx));
     if (!checking()) cx.timer.every(1500, cx => this.pollOpenFile(cx));
@@ -455,15 +497,57 @@ export default class Files extends View {
   }
 
   refresh(cx) {
-    const { cwd, on } = location(), next = key();
+    const loc = location(), { cwd, on, space } = loc, next = key();
     if (next !== this.context?.key) {
-      if (this.context) this.saved.set(this.context.key, { folders: this.folders, file: this.file });
+      const prevContext = this.context;
+      const keepActiveFile =
+        Boolean(this.file) &&
+        prevContext?.space === space &&
+        (this.hasPendingOpenRequest() || (Date.now() - (this.lastExternalOpenAt ?? 0) < 3000));
+      if (this.context) {
+        this.saved.set(this.context.key, {
+          folders: this.folders,
+          file: this.file,
+          fileOnOverride: this.fileOnOverride,
+        });
+      }
       const saved = this.saved.get(next);
-      this.context = { key: next, cwd, on }; this.root = cwd; this.repoRoot = null; this.on = on; this.entries = new Map(); this.folders = new Set(saved?.folders);
-      this.fileCache.clear();
-      this.pending = new Set(); this.marks = {}; this.reviewComposer = null; this.reviewTargetPopupOpen = false; this.reviewError = null; this.show(null); this.watched = null; this.error = null; this.limited = false;
+      this.context = { key: next, cwd, on, space }; this.root = cwd; this.repoRoot = null; this.on = on; this.entries = new Map(); this.folders = new Set(saved?.folders);
+      this.pending = new Set(); this.marks = {}; this.reviewComposer = null; this.reviewTargetPopupOpen = false; this.reviewError = null; this.watched = null; this.error = null; this.limited = false;
       this.loading = false;
-      if (saved?.file) this.show(saved.file, cx);
+      if (keepActiveFile) {
+        // If an async load was in-flight under `prevContext`, its `this.current(prevContext)` check
+        // will drop the result; re-kick it under the new context after render finishes.
+        if (this.loadingFile && this.file) {
+          const reloadPath = this.file;
+          const reloadContext = this.context;
+          const reloadOnOverride = this.fileOnOverride;
+          cx.spawn(async cx => {
+            await Promise.resolve();
+            if (this.current(reloadContext) && this.loadingFile && this.file === reloadPath) {
+              this.fileOnOverride = reloadOnOverride;
+              this.show(reloadPath, cx);
+            }
+          });
+        }
+      } else {
+        this.fileOnOverride = null;
+        this.show(null);
+        if (saved?.file) {
+          const restorePath = saved.file;
+          const restoreOnOverride = saved.fileOnOverride ?? null;
+          const restoreContext = this.context;
+          // Yield past the synchronous `render()` frame so `show()` runs in `ScopePhase::Task`
+          // where `cx.notify()`, `EditorState.new(...)`, and `set_selected_range(...)` are allowed.
+          cx.spawn(async cx => {
+            await Promise.resolve();
+            if (this.current(restoreContext) && !this.file && !this.hasPendingOpenRequest()) {
+              this.fileOnOverride = restoreOnOverride;
+              this.show(restorePath, cx);
+            }
+          });
+        }
+      }
     }
     if (!cwd || this.loading) return;
     const context = this.context;
@@ -672,26 +756,37 @@ export default class Files extends View {
     if (cx) this.pumpMarkdownBlocks(cx);
   }
 
-  cacheGet(path) {
-    const entry = this.fileCache.get(path);
+  cacheKey(path, on = this.activeFileOn(), root = this.root) {
+    return `${on ?? ""}\0${resolveDiskPath(path, root)}`;
+  }
+
+  cacheGet(path, on = this.activeFileOn(), root = this.root) {
+    const ck = this.cacheKey(path, on, root);
+    const entry = this.fileCache.get(ck);
     if (!entry) return null;
-    this.fileCache.delete(path);
-    this.fileCache.set(path, entry);
+    this.fileCache.delete(ck);
+    this.fileCache.set(ck, entry);
     return entry;
   }
 
-  cachePut(path, entry) {
+  cachePut(path, entry, on = this.activeFileOn(), root = this.root) {
     if (!path || !entry) return;
-    this.fileCache.delete(path);
+    const ck = this.cacheKey(path, on, root);
+    this.fileCache.delete(ck);
     while (this.fileCache.size >= MAX_FILE_CACHE) {
       const oldest = this.fileCache.keys().next().value;
       if (oldest === undefined) break;
       this.fileCache.delete(oldest);
     }
-    this.fileCache.set(path, entry);
+    this.fileCache.set(ck, entry);
   }
 
-  cachePutText(path, text, truncated, doc = null, remoteImages = null) {
+  cacheDelete(path, on = this.activeFileOn(), root = this.root) {
+    if (!path) return;
+    this.fileCache.delete(this.cacheKey(path, on, root));
+  }
+
+  cachePutText(path, text, truncated, doc = null, remoteImages = null, on = this.activeFileOn(), root = this.root) {
     if (!path || typeof text !== "string" || text.length > MAX_CACHE_TEXT_CHARS) return;
     this.cachePut(path, {
       kind: "text",
@@ -699,12 +794,12 @@ export default class Files extends View {
       truncated: Boolean(truncated),
       doc,
       remoteImages: remoteImages && remoteImages.size > 0 ? new Map(remoteImages) : null,
-    });
+    }, on, root);
   }
 
-  cachePutImage(path, dataUrl) {
+  cachePutImage(path, dataUrl, on = this.activeFileOn(), root = this.root) {
     if (!path || typeof dataUrl !== "string" || dataUrl.length > MAX_CACHE_IMAGE_CHARS) return;
-    this.cachePut(path, { kind: "image", imageDataUrl: dataUrl });
+    this.cachePut(path, { kind: "image", imageDataUrl: dataUrl }, on, root);
   }
 
   getBlockTable(block) {
@@ -818,14 +913,21 @@ export default class Files extends View {
     const codeTheme = this.activeEditorStyle(kind, theme());
     const sig = editorSignature(kind.language, readonly, softWrap, fontFamily, codeTheme);
     if (this.code && this.editorSig === sig) {
-      if (this.code.value() !== this.liveText) {
-        this.suppressCodeChange = true;
-        try { this.code.set_value(this.liveText); }
-        finally { this.suppressCodeChange = false; }
+      let reused = true;
+      try {
+        if (this.code.value() !== this.liveText) {
+          this.suppressCodeChange = true;
+          try { this.code.set_value(this.liveText); }
+          finally { this.suppressCodeChange = false; }
+        }
+        try { this.code.set_selected_range({ start: 0, end: 0 }); } catch {}
+      } catch {
+        reused = false;
       }
-      try { this.code.set_selected_range({ start: 0, end: 0 }); } catch {}
-      this.applyPendingLineJump();
-      return;
+      if (reused) {
+        this.applyPendingLineJump();
+        return;
+      }
     }
 
     this.code?.release();
@@ -873,6 +975,14 @@ export default class Files extends View {
     return this.fileOnOverride !== null && this.fileOnOverride !== undefined ? this.fileOnOverride : this.on;
   }
 
+  hasPendingOpenRequest() {
+    let req = null;
+    try { req = shared("files.open_request"); } catch {}
+    if (!req || typeof req !== "object") return false;
+    const seq = Number(req.seq ?? 0);
+    return Boolean(seq && seq > this.lastHandledOpenSeq && typeof req.path === "string" && req.path.trim());
+  }
+
   consumeOpenRequest(cx) {
     let req = null;
     try { req = shared("files.open_request"); } catch {}
@@ -888,19 +998,22 @@ export default class Files extends View {
     const rawPath = String(req?.path ?? "").trim();
     if (!rawPath) return;
     const reqOn = req.on ?? null;
+    const prevOn = this.activeFileOn() ?? null;
     const sameMachine = (reqOn ?? null) === (this.on ?? null);
     const targetPath = sameMachine ? relativizeToRoot(rawPath, this.root) : rawPath;
     const line = Number(req.line ?? 0) > 0 ? Number(req.line) : null;
     const endLine = Number(req.end_line ?? 0) > 0 ? Number(req.end_line) : line;
+    this.lastExternalOpenAt = Date.now();
     this.fileOnOverride = sameMachine ? null : reqOn;
     this.pendingJumpLine = line;
     this.pendingJumpEndLine = endLine;
     if (line && detectFileKind(targetPath).isMarkdown && this.mdMode() === "preview") {
       setShared("files.mdMode", "code");
     }
-    if (targetPath === this.file && !this.fileError && !this.loadingFile) {
+    if (targetPath === this.file && prevOn === (reqOn ?? null) && !this.fileError && !this.loadingFile) {
       this.themeMenuOpen = false;
-      if (cx && !isAbsolutePath(targetPath)) this.expandParents(targetPath, cx);
+      if (line && this.reviewMode) this.reviewMode = false;
+      if (cx && this.treeOpen() && !isAbsolutePath(targetPath)) this.expandParents(targetPath, cx);
       if (line) {
         if (!this.code) this.rebuildEditor();
         else this.applyPendingLineJump();
@@ -1304,7 +1417,7 @@ export default class Files extends View {
           if (dataUrl && this.file === path && this.current(context)) {
             this.remoteImages.set(rel, dataUrl);
             this.remoteImageRev++;
-            const cached = this.fileCache.get(path);
+            const cached = this.cacheGet(path, on);
             if (cached && cached.kind === "text") {
               cached.remoteImages = new Map(this.remoteImages);
             }
@@ -1415,7 +1528,7 @@ export default class Files extends View {
           const dataUrl = await readImageDataUrl(diskPath, { on });
           if (this.showSeq !== seq || this.file !== path || !this.current(context)) return;
           if (dataUrl === null) {
-            this.fileCache.delete(path);
+            this.cacheDelete(path, on);
             this.fileError = tr("This file is no longer available", "文件已不存在");
             this.imageDataUrl = null;
             cx.notify();
@@ -1423,29 +1536,28 @@ export default class Files extends View {
           }
           if (dataUrl !== this.imageDataUrl) {
             this.imageDataUrl = dataUrl;
-            this.cachePutImage(path, dataUrl);
+            this.cachePutImage(path, dataUrl, on);
             cx.notify();
           }
           return;
         }
-        const text = await readTextFile(diskPath, { on });
+        const text = await readTextFile(diskPath, { on, maxBytes: PREVIEW_MAX_BYTES });
         if (this.showSeq !== seq || this.file !== path || !this.current(context) || this.dirty || this.isEditingInline()) return;
         if (text === null) {
-          this.fileCache.delete(path);
+          this.cacheDelete(path, on);
           this.fileError = tr("This file is no longer available", "文件已不存在");
           this.code?.release(); this.code = null; this.editorSig = null;
           cx.notify();
           return;
         }
         if (text.includes("\0")) {
-          this.fileCache.delete(path);
+          this.cacheDelete(path, on);
           this.fileError = tr("Binary file · no text preview", "二进制文件 · 无法文本预览");
           this.code?.release(); this.code = null; this.editorSig = null;
           cx.notify();
           return;
         }
-        const truncated = text.length > MAX_PREVIEW_CHARS;
-        const bounded = truncated ? text.slice(0, MAX_PREVIEW_CHARS) + "\n… (file truncated)" : text;
+        const { bounded, truncated } = unpackPreviewText(text);
         if (bounded === this.diskText && !this.fileError) return;
         this.applyLoadedText(path, kind, bounded, truncated, cx);
         cx.notify();
@@ -1466,7 +1578,7 @@ export default class Files extends View {
           const dataUrl = await readImageDataUrl(diskPath, { on });
           if (this.file !== path || !this.current(context)) return;
           if (dataUrl === null) {
-            this.fileCache.delete(path);
+            this.cacheDelete(path, on);
             this.fileError = tr("This file is no longer available", "文件已不存在");
             this.imageDataUrl = null;
             cx.notify();
@@ -1475,23 +1587,22 @@ export default class Files extends View {
           if (dataUrl !== this.imageDataUrl || this.fileError) {
             this.imageDataUrl = dataUrl;
             this.fileError = null;
-            this.cachePutImage(path, dataUrl);
+            this.cachePutImage(path, dataUrl, on);
             cx.notify();
           }
           return;
         }
-        const text = await readTextFile(diskPath, { on });
+        const text = await readTextFile(diskPath, { on, maxBytes: PREVIEW_MAX_BYTES });
         if (this.file !== path || !this.current(context) || this.dirty || this.isEditingInline()) return;
         if (text === null) {
-          this.fileCache.delete(path);
+          this.cacheDelete(path, on);
           this.fileError = tr("This file is no longer available", "文件已不存在");
           this.code?.release(); this.code = null; this.editorSig = null;
           cx.notify();
           return;
         }
         if (text.includes("\0")) return;
-        const truncated = text.length > MAX_PREVIEW_CHARS;
-        const bounded = truncated ? text.slice(0, MAX_PREVIEW_CHARS) + "\n… (file truncated)" : text;
+        const { bounded, truncated } = unpackPreviewText(text);
         if (bounded === this.diskText && !this.fileError) return;
         this.applyLoadedText(path, kind, bounded, truncated, cx, { rebuild: false });
         if (this.code) {
@@ -1524,7 +1635,7 @@ export default class Files extends View {
     }
     if (path === this.file && !this.fileError && !this.loadingFile) {
       this.themeMenuOpen = false;
-      if (cx) this.expandParents(path, cx);
+      if (cx && this.treeOpen()) this.expandParents(path, cx);
       return;
     }
     this.reviewComposer = null;
@@ -1553,13 +1664,14 @@ export default class Files extends View {
         prevLive,
         false,
         detectFileKind(prevPath).isMarkdown ? parseMarkdownBlocks(prevLive) : null,
-        this.remoteImages
+        this.remoteImages,
+        prevOn,
       );
       cx.spawn(async () => {
         try {
           await writeTextFile(prevDiskPath, prevLive, prevExpected, { on: prevOn });
         } catch (e) {
-          this.fileCache.delete(prevPath);
+          this.cacheDelete(prevPath, prevOn);
           notify({ title: tr("Could not save file", "保存文件失败"), body: String(e), level: "error" });
         }
       });
@@ -1575,21 +1687,22 @@ export default class Files extends View {
     this.cancelMdPump();
     this.selectedFile = path;
     this.themeMenuOpen = false;
-    this.expandParents(path, cx);
     const wasShowingFile = Boolean(this.file);
     if (!wasShowingFile && this.treeOpen() && !checking()) this.ensurePanelRoom();
 
+    const on = this.activeFileOn();
     const kind = detectFileKind(path);
-    const cached = this.cacheGet(path);
+    const cached = this.cacheGet(path, on);
     if (cached && ((cached.kind === "image") === kind.isImage)) {
       this.applyCachedEntry(path, kind, cached, cx);
       this.revalidateCachedFile(path, kind, seq, cx);
+      if (this.treeOpen()) this.expandParents(path, cx);
       return;
     }
 
     if (!wasShowingFile) {
       this.resetFileViewState(path, { loading: true });
-      cx.notify();
+      try { cx.notify(); } catch {}
     } else if (!checking()) {
       const waitContext = this.context;
       this.loadingTimer = cx.timer.after(80, cx => {
@@ -1600,7 +1713,7 @@ export default class Files extends View {
       });
     }
 
-    const context = this.context, root = this.root, on = this.activeFileOn();
+    const context = this.context, root = this.root;
     const diskPath = resolveDiskPath(path, root);
     cx.spawn(async cx => {
       try {
@@ -1610,40 +1723,57 @@ export default class Files extends View {
           this.cancelLoadingTimer();
           this.resetFileViewState(path);
           if (dataUrl === null) {
-            this.fileCache.delete(path);
+            this.cacheDelete(path, on);
             this.fileError = tr("This file is no longer available", "文件已不存在");
             return;
           }
           this.imageDataUrl = dataUrl;
-          this.cachePutImage(path, dataUrl);
+          this.cachePutImage(path, dataUrl, on);
+          if (this.treeOpen()) this.expandParents(path, cx);
           return;
         }
-        const text = await readTextFile(diskPath, { on });
+        let text;
+        try {
+          text = await readTextFile(diskPath, { on, maxBytes: PREVIEW_MAX_BYTES });
+        } catch (readErr) {
+          if (this.showSeq === seq && this.current(context)) {
+            this.cancelLoadingTimer();
+            this.resetFileViewState(path);
+            const reason = String(readErr ?? "").trim();
+            this.fileError = reason
+              ? tr(`Cannot preview this file: ${reason}`, `无法预览此文件：${reason}`)
+              : tr("Cannot preview this file (binary, too large, or unreadable)", "无法预览此文件（二进制、过大或不可读）");
+          }
+          return;
+        }
         if (this.showSeq !== seq || !this.current(context)) return;
         this.cancelLoadingTimer();
         if (text === null) {
           this.resetFileViewState(path);
-          this.fileCache.delete(path);
+          this.cacheDelete(path, on);
           this.fileError = tr("This file is no longer available", "文件已不存在");
           return;
         }
         if (text.includes("\0")) {
           this.resetFileViewState(path);
-          this.fileCache.delete(path);
+          this.cacheDelete(path, on);
           this.fileError = tr("Binary file · no text preview", "二进制文件 · 无法文本预览");
           return;
         }
         this.resetFileViewState(path, { keepCode: true });
-        const truncated = text.length > MAX_PREVIEW_CHARS;
-        const bounded = truncated ? text.slice(0, MAX_PREVIEW_CHARS) + "\n… (file truncated)" : text;
+        const { bounded, truncated } = unpackPreviewText(text);
         this.applyLoadedText(path, kind, bounded, truncated, cx);
-      } catch {
+        if (this.treeOpen()) this.expandParents(path, cx);
+      } catch (e) {
         if (this.showSeq === seq && this.current(context)) {
           this.cancelLoadingTimer();
           this.resetFileViewState(path);
+          const detail = String(e ?? "").trim();
           this.fileError = kind.isImage
             ? tr("Cannot preview this image (too large, unsupported format, or unreadable)", "无法预览此图片（过大、格式不支持或不可读）")
-            : tr("Cannot preview this file (binary, too large, or unreadable)", "无法预览此文件（二进制、过大或不可读）");
+            : detail
+              ? tr(`Cannot preview this file: ${detail}`, `无法预览此文件：${detail}`)
+              : tr("Cannot preview this file (binary, too large, or unreadable)", "无法预览此文件（二进制、过大或不可读）");
         }
       } finally {
         if (this.showSeq === seq && this.current(context)) cx.notify();
@@ -2468,7 +2598,14 @@ export default class Files extends View {
       out.push(h_flex().id(`file-${path}`).h(26).flex_none().pl(6 + depth * 15).pr(6).gap(6).items_center().rounded(6).cursor_pointer()
         .bg(selected ? (t.selected ?? t.raised) : "#00000000")
         .hover(s => s.bg(selected ? (t.selected ?? t.raised) : t.hover))
-        .on_click((_e, cx) => entry.dir ? this.toggle(path, cx) : this.show(path, cx))
+        .on_click((_e, cx) => {
+          if (entry.dir) {
+            this.toggle(path, cx);
+          } else {
+            this.fileOnOverride = null;
+            this.show(path, cx);
+          }
+        })
         .child(entry.dir ? svg(`mods/files/chevron-${open ? "down" : "right"}.svg`).size(12).flex_none().text_color(t.dim) : div().w(12).flex_none())
         .child(svg(`mods/files/${entry.dir ? "folder" : "file"}.svg`).size(13).flex_none().text_color(selected ? t.foreground : t.muted))
         .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(selected ? t.foreground : t.muted).child(entry.name))
@@ -3960,7 +4097,14 @@ export default class Files extends View {
 
   render(cx) {
     if (key() !== this.context?.key) this.refresh(cx);
-    this.consumeOpenRequest(cx);
+    if (this.hasPendingOpenRequest() && !this.pendingOpenTask) {
+      this.pendingOpenTask = true;
+      cx.spawn(async cx => {
+        await Promise.resolve();
+        this.pendingOpenTask = false;
+        this.consumeOpenRequest(cx);
+      });
+    }
     this.syncLastReviewResult();
     const t = theme();
     const allDrafts = this.reviewDrafts();
@@ -3978,6 +4122,7 @@ export default class Files extends View {
       if (this.editorSig !== sig && !this.pendingRebuild) {
         this.pendingRebuild = true;
         cx.spawn(async cx => {
+          await Promise.resolve();
           this.pendingRebuild = false;
           this.rebuildEditor();
           cx.notify();
