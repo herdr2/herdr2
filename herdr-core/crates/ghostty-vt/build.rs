@@ -31,7 +31,15 @@ fn main() {
     let mut build = Command::new(&zig);
     // Baseline CPU, never this machine's: hc is copied to other machines
     // (releases, `hc machine add`), whose CPUs may lack this one's features.
-    build.current_dir(&src).args(["build", "-Demit-lib-vt", "-Doptimize=ReleaseFast", "-Dcpu=baseline"]);
+    // Pass an explicit Ghostty version string so vendored `vendor/ghostty` does
+    // not inherit the parent repo's `vX.Y.Z` release tag and panic in Config.zig.
+    build.current_dir(&src).args([
+        "build",
+        "-Demit-lib-vt",
+        "-Doptimize=ReleaseFast",
+        "-Dcpu=baseline",
+        "-Dversion-string=1.3.2-dev",
+    ]);
     if let Some(path) = clean_path {
         build.env("PATH", path);
     }

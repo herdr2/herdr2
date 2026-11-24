@@ -125,12 +125,16 @@ jobs:
           HERDR2_APP_RELEASE: '1'
           HERDR2_DEFAULT_RELEASES_URL: https://github.com/${{ github.repository }}/releases/download/${{ env.OTA_TAG }}
         run: |
+          $ErrorActionPreference = 'Stop'
+
           Push-Location herdr-core
           cargo build --release --locked -p herdr2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Pop-Location
 
           Push-Location herdr-app
           cargo build --release --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Pop-Location
 
           New-Item -ItemType Directory -Force dist\installers, dist\ota, dist\stage-app, dist\stage-core, dist\ota-app-stage\herdr2 | Out-Null
@@ -144,6 +148,7 @@ jobs:
           # Stage OTA app archive
           Copy-Item dist\stage-app\* dist\ota-app-stage\herdr2\
           & "$env:SystemRoot\System32\tar.exe" -czf dist\ota\herdr2-app-windows-x86_64.tar.gz -C dist\ota-app-stage herdr2
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           # Stage core runtime (h2.exe + herdr2-core.exe)
           Copy-Item herdr-core\target\release\herdr2.exe dist\stage-core\herdr2-core.exe
@@ -158,6 +163,7 @@ jobs:
           Copy-Item herdr-core\LICENSE $coreZipStage\LICENSE
           Copy-Item herdr-core\crates\herdr2\THIRD-PARTY-NOTICES $coreZipStage\THIRD-PARTY-NOTICES
           & "$env:SystemRoot\System32\tar.exe" -a -cf dist\ota\herdr2-core-windows-x86_64.zip -C $coreZipStage .
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
           # Build single-file Windows installer (.exe) with Inno Setup
           $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
@@ -169,6 +175,7 @@ jobs:
             "/DCoreStageDir=$(Resolve-Path dist\stage-core)" `
             "/DOutputDir=$(Resolve-Path dist\installers)" `
             herdr-app\distribution\windows\herdr2.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - uses: actions/upload-artifact@v4
         with:
