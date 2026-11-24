@@ -405,6 +405,7 @@ impl Store {
             expanded_from: input.expanded_from,
             review: input.review,
             review_state: None,
+            review_circuit: None,
             candidate_result: None,
             cache: input.cache,
             cached_from: input.cached_from,

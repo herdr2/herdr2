@@ -124,6 +124,22 @@ pub fn build_task_prompt_with_handover(
         sections.push(format!("Retry / coordinator hint:\n{h}"));
     }
 
+    if let Some(rc) = &task.review_circuit
+        && rc.stage == ReviewCircuitStage::PostHandoffReview
+    {
+        let mut lines = vec![format!(
+            "POST-HANDOFF FINAL REVIEW (1/1): This task previously failed {} review round(s) and was taken over directly by the Coordinator.",
+            rc.review_rounds
+        )];
+        lines.push(
+            "Focus strictly on verifying whether the concrete blocking findings from prior rounds are resolved; do NOT expand scope with speculative second-order fault injection or new design preferences.".into(),
+        );
+        for rec in rc.history.iter().rev().take(3).rev() {
+            lines.push(format!("- Prior Round {} ({}): {}", rec.round, rec.verdict, rec.summary));
+        }
+        sections.push(lines.join("\n"));
+    }
+
     if let Some(prior) = prior_handover {
         let model_label = prior.model.as_deref().unwrap_or("default");
         let mut lines =
@@ -298,6 +314,7 @@ mod tests {
             expanded_from: None,
             review: None,
             review_state: None,
+            review_circuit: None,
             candidate_result: None,
             cache: None,
             cached_from: None,

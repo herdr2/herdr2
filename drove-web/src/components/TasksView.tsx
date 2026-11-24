@@ -10,7 +10,7 @@ import {
 } from "../format";
 import { useT } from "../i18n";
 import { taskAttempts } from "../relate";
-import { authorWorkers, reviewBoard, reviewerNumbers, taskRequiresReview } from "../review";
+import { authorWorkers, reviewBoard, reviewCircuitView, reviewerNumbers, taskRequiresReview } from "../review";
 import type { Item, RunSnapshot, Task } from "../types";
 import {
   countTasksByFilter,
@@ -124,6 +124,7 @@ export function TasksView({
             const wNum = latestAuthor ? workerNums.get(latestAuthor.workerId) : undefined;
             const usage = taskUsage(item.id, tAttempts);
             const micro = taskMicroBadges(item, t);
+            const itemCircuit = reviewCircuitView(item, t);
             return (
               <button
                 key={item.id}
@@ -147,6 +148,11 @@ export function TasksView({
                   ) : null}
                   {taskRequiresReview(item, tAttempts) && (
                     <ReviewRequirement required />
+                  )}
+                  {itemCircuit && (
+                    <span className={`circuit-pill circuit-pill--${itemCircuit.tone}`} title={itemCircuit.description}>
+                      {itemCircuit.shortLabel}
+                    </span>
                   )}
                   {micro.map((m) => (
                     <span key={m.kind} className={`micro-badge micro-badge--${m.kind}`} title={m.title}>{m.text}</span>

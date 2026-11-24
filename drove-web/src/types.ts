@@ -65,6 +65,33 @@ export interface ReviewVerdict {
   summary: string;
   findings?: Array<{ severity?: string; file?: string; message: string }>;
 }
+export type ReviewCircuitStage =
+  | "normal"
+  | "handoff_to_coordinator"
+  | "post_handoff_review"
+  | "awaiting_user_decision"
+  | "cleared";
+export interface ReviewRoundRecord {
+  round: number;
+  verdict: string;
+  summary: string;
+  attemptId?: string;
+  keyFindings?: string[];
+  at: string;
+  postHandoff?: boolean;
+}
+export interface ReviewCircuit {
+  stage: ReviewCircuitStage;
+  reviewRounds: number;
+  maxNormalRounds: number;
+  handoffToCoordinator?: boolean;
+  handoffAt?: string;
+  postHandoffReviewUsed?: boolean;
+  awaitingUserDecision?: boolean;
+  trippedAt?: string;
+  userOverrides?: number;
+  history?: ReviewRoundRecord[];
+}
 /** Progress of the adversarial review loop; bound to immutable candidate tree snapshots. */
 export interface ReviewState {
   round: number;
@@ -155,7 +182,7 @@ export interface StallSignal {
   taskIds?: string[];
   messageIds?: string[];
 }
-export type DaemonEventCategory = "ai" | "gate" | "schedule";
+export type DaemonEventCategory = "ai" | "gate" | "schedule" | "review";
 export type DaemonEventKind =
   | "auto_title"
   | "task_enrich"
@@ -167,6 +194,10 @@ export type DaemonEventKind =
   | "ai_probe"
   | "verify_gate"
   | "review_round"
+  | "review_handoff"
+  | "post_handoff_review"
+  | "review_circuit_open"
+  | "review_override"
   | "finalization_gate"
   | "conflict_check"
   | "worktree_integrate";
@@ -342,6 +373,7 @@ export interface Task {
   expandedFrom?: string;
   review?: ReviewSpec;
   reviewState?: ReviewState;
+  reviewCircuit?: ReviewCircuit;
   /** Author output held until verify + review pass; promoted to `result` on integration. */
   candidateResult?: TaskResult;
   cache?: CacheSpec;

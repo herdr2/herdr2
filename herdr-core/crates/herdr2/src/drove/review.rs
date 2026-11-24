@@ -1,19 +1,416 @@
-//! Adversarial read-only reviewer loop (Full Diff -> R1, Delta Diff -> R2..Rn).
+//! Adversarial read-only reviewer loop (Full Diff -> R1, Delta Diff -> R2..Rn)
+//! and persistent three-stage Review Circuit Breaker:
+//!   1. Normal review fails >= max_normal_rounds (default 2) -> `handoff_to_coordinator`
+//!   2. Coordinator fixes directly -> 1 single `post_handoff_review` allowed
+//!   3. Post-handoff review still fails -> hard breaker `awaiting_user_decision` (blocks `retry` without `--user-override`).
 
-use super::MAX_AUTO_RETRIES;
 use super::http::ApiErr;
 use super::notify::notify_coordinator;
-use super::pool::mark_worker_idle;
+use super::pool::{mark_task_failed_and_propagate, mark_worker_idle};
 use super::roles::diff_touched_paths;
-use super::store::NewDaemonEvent;
+use super::store::{NewDaemonEvent, PostMessageInput, Store};
 use super::types::*;
 use crate::api::run::{DroveSpawnSpec, spawn_drove_agent};
 use crate::runtime::Core;
 use crate::transcript::Entry;
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// Default consecutive non-passing review rounds before tripping handoff to Coordinator.
+pub const DEFAULT_MAX_NORMAL_REVIEW_ROUNDS: u32 = 2;
+
+/// Outcome of recording a non-passing review round into the task's `ReviewCircuit`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReviewCircuitOutcome {
+    ContinueNormal,
+    HandoffToCoordinator,
+    AwaitingUserDecision,
+}
+
+/// Returns `true` when this task is a dedicated read-only reviewer task (`role = reviewer`).
+pub fn is_standalone_reviewer_task(task: &Task) -> bool {
+    task.assign
+        .as_ref()
+        .and_then(|a| a.role.as_deref())
+        .map(str::trim)
+        .is_some_and(|r| r.eq_ignore_ascii_case("reviewer"))
+}
+
+/// Extracts a normalized review verdict string from structured task result `data` if present.
+pub fn extract_data_review_verdict(data: Option<&Value>) -> Option<String> {
+    let d = data?;
+    if let Some(v) = d
+        .get("review_status")
+        .or_else(|| d.get("reviewStatus"))
+        .or_else(|| d.get("verdict"))
+        .or_else(|| d.get("decision"))
+        .or_else(|| d.get("status"))
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+    {
+        return Some(v);
+    }
+    if d.get("approved").and_then(Value::as_bool) == Some(false)
+        || d.get("passed").and_then(Value::as_bool) == Some(false)
+        || d.get("pass").and_then(Value::as_bool) == Some(false)
+    {
+        return Some("changes_requested".into());
+    }
+    if d.get("approved").and_then(Value::as_bool) == Some(true)
+        || d.get("passed").and_then(Value::as_bool) == Some(true)
+        || d.get("pass").and_then(Value::as_bool) == Some(true)
+    {
+        return Some("approved".into());
+    }
+    None
+}
+
+/// Returns `Some(verdict)` when structured `data` or `blockers` indicates a non-passing review verdict.
+pub fn is_review_rejection_data(data: Option<&Value>, blockers: Option<&[String]>) -> Option<String> {
+    if let Some(v) = extract_data_review_verdict(data)
+        && matches!(
+            v.as_str(),
+            "changes_requested" | "request_changes" | "rejected" | "reject" | "needs_changes" | "fail" | "failed"
+        )
+    {
+        return Some(v);
+    }
+    if blockers.is_some_and(|b| !b.is_empty()) {
+        return Some("changes_requested".into());
+    }
+    None
+}
+
+/// Returns `true` when structured `data` explicitly indicates an approved/passing review verdict.
+pub fn is_review_approval_data(data: Option<&Value>) -> bool {
+    extract_data_review_verdict(data)
+        .is_some_and(|v| matches!(v.as_str(), "approve" | "approved" | "pass" | "passed" | "ok" | "lgtm"))
+}
+
+/// Extracts up to 5 concise finding lines from `ReviewFinding` slice, `data.findings`/`issues`/`blockers`, or `summary`.
+pub fn extract_key_findings(data: Option<&Value>, findings: Option<&[ReviewFinding]>, summary: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(fs) = findings {
+        for f in fs.iter().take(5) {
+            let sev = f.severity.as_deref().unwrap_or("issue");
+            let file = f.file.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or("*");
+            out.push(format!("[{sev}] {file}: {}", f.message.trim().chars().take(180).collect::<String>()));
+        }
+    }
+    if out.is_empty()
+        && let Some(d) = data
+    {
+        for key in ["findings", "issues", "blockers", "blocking_issues", "blockingIssues"] {
+            if let Some(arr) = d.get(key).and_then(Value::as_array) {
+                for item in arr.iter().take(5) {
+                    if let Some(s) = item.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+                        out.push(s.chars().take(180).collect());
+                    } else if let Some(obj) = item.as_object() {
+                        let sev = obj.get("severity").and_then(Value::as_str).unwrap_or("issue");
+                        let file = obj
+                            .get("file")
+                            .or_else(|| obj.get("path"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("*");
+                        let msg = obj
+                            .get("message")
+                            .or_else(|| obj.get("title"))
+                            .or_else(|| obj.get("summary"))
+                            .or_else(|| obj.get("description"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .trim();
+                        if !msg.is_empty() {
+                            out.push(format!("[{sev}] {file}: {}", msg.chars().take(180).collect::<String>()));
+                        }
+                    }
+                }
+                if !out.is_empty() {
+                    break;
+                }
+            }
+        }
+    }
+    if out.is_empty() && !summary.trim().is_empty() {
+        out.push(summary.trim().chars().take(240).collect());
+    }
+    out
+}
+
+/// Persistently records one non-passing review round on `task.review_circuit` and transitions the circuit stage.
+pub fn record_review_non_pass(
+    store: &Store,
+    task_id: &str,
+    max_normal_rounds: u32,
+    verdict: &str,
+    summary: &str,
+    key_findings: Vec<String>,
+    attempt_id: Option<&str>,
+) -> (Option<Task>, ReviewCircuitOutcome) {
+    let mut outcome = ReviewCircuitOutcome::ContinueNormal;
+    let updated = store.update_task(task_id, |t| {
+        let cap = max_normal_rounds.clamp(1, 5);
+        let circuit = t.review_circuit.get_or_insert_with(|| ReviewCircuit {
+            stage: ReviewCircuitStage::Normal,
+            review_rounds: 0,
+            max_normal_rounds: cap,
+            handoff_to_coordinator: false,
+            handoff_at: None,
+            post_handoff_review_used: false,
+            awaiting_user_decision: false,
+            tripped_at: None,
+            user_overrides: 0,
+            history: Vec::new(),
+        });
+        if circuit.max_normal_rounds == 0 {
+            circuit.max_normal_rounds = cap;
+        }
+        let was_post_handoff =
+            circuit.stage == ReviewCircuitStage::PostHandoffReview || circuit.post_handoff_review_used;
+        circuit.review_rounds = circuit.review_rounds.saturating_add(1);
+        circuit.history.push(ReviewRoundRecord {
+            round: circuit.review_rounds,
+            verdict: verdict.to_string(),
+            summary: summary.trim().chars().take(400).collect(),
+            attempt_id: attempt_id.map(String::from),
+            key_findings: key_findings.clone(),
+            at: now_iso(),
+            post_handoff: was_post_handoff,
+        });
+        if circuit.history.len() > 8 {
+            let drop_n = circuit.history.len() - 8;
+            circuit.history.drain(..drop_n);
+        }
+        if was_post_handoff {
+            circuit.stage = ReviewCircuitStage::AwaitingUserDecision;
+            circuit.handoff_to_coordinator = true;
+            circuit.post_handoff_review_used = true;
+            circuit.awaiting_user_decision = true;
+            circuit.tripped_at = Some(now_iso());
+            outcome = ReviewCircuitOutcome::AwaitingUserDecision;
+        } else if circuit.review_rounds >= circuit.max_normal_rounds {
+            circuit.stage = ReviewCircuitStage::HandoffToCoordinator;
+            circuit.handoff_to_coordinator = true;
+            if circuit.handoff_at.is_none() {
+                circuit.handoff_at = Some(now_iso());
+            }
+            circuit.awaiting_user_decision = false;
+            outcome = ReviewCircuitOutcome::HandoffToCoordinator;
+        } else {
+            circuit.stage = ReviewCircuitStage::Normal;
+            outcome = ReviewCircuitOutcome::ContinueNormal;
+        }
+    });
+    (updated, outcome)
+}
+
+/// Marks a task's review circuit as cleared when a review round passes cleanly.
+pub fn record_review_passed(store: &Store, task_id: &str) {
+    let _ = store.update_task(task_id, |t| {
+        if let Some(rc) = t.review_circuit.as_mut() {
+            rc.stage = ReviewCircuitStage::Cleared;
+            rc.awaiting_user_decision = false;
+        }
+    });
+}
+
+fn format_circuit_history_block(rc: &ReviewCircuit) -> String {
+    if rc.history.is_empty() {
+        return "（无历史审查摘要）".into();
+    }
+    rc.history
+        .iter()
+        .map(|rec| {
+            let phase_tag = if rec.post_handoff { " [主 Agent 接管后终审]" } else { "" };
+            let mut line = format!("Round {}{phase_tag} ({}): {}", rec.round, rec.verdict, rec.summary);
+            if !rec.key_findings.is_empty() {
+                let items = rec
+                    .key_findings
+                    .iter()
+                    .take(3)
+                    .map(|f| format!("  - {f}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                line.push('\n');
+                line.push_str(&items);
+            }
+            line
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Posts a high-priority `Escalation` message, sends a coordinator wakeup notification,
+/// and logs a `DaemonEvent` when the Review Circuit Breaker transitions to handoff or hard stop.
+pub async fn emit_review_circuit_escalation(
+    core: &Arc<Core>,
+    run: &Run,
+    task: &Task,
+    outcome: ReviewCircuitOutcome,
+    attempt_id: Option<&str>,
+    worker_id: Option<&str>,
+) {
+    let Some(rc) = task.review_circuit.as_ref() else {
+        return;
+    };
+    let history_block = format_circuit_history_block(rc);
+    match outcome {
+        ReviewCircuitOutcome::ContinueNormal => {}
+        ReviewCircuitOutcome::HandoffToCoordinator => {
+            let subject = format!(
+                "[Review 熔断转交] 任务 `{}` 连续 {} 轮未通过 — 请主 Agent 亲自接管修复",
+                task.key, rc.review_rounds
+            );
+            let body = format!(
+                "任务 `{}` (`{}`) 的审查已连续未通过 {}/{} 轮，触发 Review 熔断，停止常规 worker 修复-review 循环，现转交主 Agent（Coordinator）亲自接管处理。\n\n\
+                 前几轮关键未通过项汇总：\n{history_block}\n\n\
+                 下一步要求（强制）：\n\
+                 1. 主 Agent 亲自检查代码与分歧项并直接完成修复与本地验证（不要再派常规 worker 反复拉锯，也不要通过 `h2 drove add` 新建重复 review 任务）。\n\
+                 2. 修复完成后，仅允许再执行 **1 次** `h2 drove retry {}` 进行终审复核（post-handoff review 1/1）。\n\
+                 3. 若该次终审复核仍未通过，Drove 将进入硬熔断（等待用户决策），届时必须立即停手向用户汇报并附带你的处理建议。",
+                task.key, task.title, rc.review_rounds, rc.max_normal_rounds, task.key
+            );
+            let msg = core.drove.store.post_message(PostMessageInput {
+                run_id: run.id.clone(),
+                kind: MessageType::Escalation,
+                from: "drove".into(),
+                to: "coordinator".into(),
+                thread_id: None,
+                task_id: Some(task.id.clone()),
+                attempt_id: attempt_id.map(String::from),
+                subject: subject.clone(),
+                body: Some(body.clone()),
+                options: None,
+                recommend: Some(format!(
+                    "主 Agent 亲自接管修复后，仅执行 1 次 `h2 drove retry {}` 终审复核",
+                    task.key
+                )),
+                why: Some(format!(
+                    "连续 {} 轮 review 未通过（上限 {} 轮），已转交主 Agent 接管",
+                    rc.review_rounds, rc.max_normal_rounds
+                )),
+                raised_by: Some("scheduler".into()),
+                raised_by_worker: worker_id.map(String::from),
+                tag: Some("review_handoff".into()),
+                ai_draft: None,
+                needs_action: true,
+            });
+            let line = format!(
+                "[drove] [REVIEW HANDOFF] 任务 `{}` 已连续 {} 轮审查未通过，触发熔断并转交主 Agent 亲自接管修复（完成后仅允许再执行 1 次 `h2 drove retry {}` 终审复核）。查看汇总: `h2 drove show {}`",
+                task.key, rc.review_rounds, task.key, msg.id
+            );
+            notify_coordinator(
+                core,
+                run,
+                "review_handoff",
+                &subject,
+                &line,
+                Some(&task.id),
+                attempt_id,
+                worker_id,
+                Some(&msg.id),
+            )
+            .await;
+            core.drove.store.append_daemon_event(NewDaemonEvent {
+                run_id: Some(run.id.clone()),
+                task_id: Some(task.id.clone()),
+                attempt_id: attempt_id.map(String::from),
+                worker_id: worker_id.map(String::from),
+                message_id: Some(msg.id),
+                category: "review".into(),
+                kind: "review_handoff".into(),
+                status: "warn".into(),
+                title: format!("Review handoff to Coordinator on `{}` (R{}/{})", task.key, rc.review_rounds, rc.max_normal_rounds),
+                detail: Some(history_block),
+                duration_ms: None,
+                tokens: None,
+                cost: None,
+            });
+        }
+        ReviewCircuitOutcome::AwaitingUserDecision => {
+            let subject = format!(
+                "[Review 硬熔断 · 等待用户决策] 任务 `{}` 终审仍未通过（累计 {} 轮）",
+                task.key, rc.review_rounds
+            );
+            let body = format!(
+                "任务 `{}` (`{}`) 在主 Agent 接管后的唯一 1 次终审复核中仍未通过（累计 {} 轮未通过），已触发 **Review 硬熔断（awaiting_user_decision）**。\n\
+                 Drove 已默认拦截后续常规 `h2 drove retry {}`。\n\n\
+                 历轮未通过项与分歧汇总：\n{history_block}\n\n\
+                 强制要求：\n\
+                 1. **立即停止继续重试或新增 review 任务**。\n\
+                 2. **立即向用户汇报**：当前状态、未通过的核心分歧点与实际影响。\n\
+                 3. **必须给出主 Agent 自己的明确处理建议**（例如：接受现状直接收口 / 简化设计规避二阶复杂度 / 定向继续修某项）。\n\
+                 4. 待用户明确拍板后再行动：\n\
+                    - 用户批准定向继续修并再审：`h2 drove retry {} --user-override --override-reason \"<用户决策>\"`\n\
+                    - 用户批准接受现状直接收口：`h2 drove cancel {}` 或 `h2 drove complete --force`",
+                task.key, task.title, rc.review_rounds, task.key, task.key, task.key
+            );
+            let msg = core.drove.store.post_message(PostMessageInput {
+                run_id: run.id.clone(),
+                kind: MessageType::Escalation,
+                from: "drove".into(),
+                to: "coordinator".into(),
+                thread_id: None,
+                task_id: Some(task.id.clone()),
+                attempt_id: attempt_id.map(String::from),
+                subject: subject.clone(),
+                body: Some(body.clone()),
+                options: Some(vec![
+                    "接受现状直接收口".into(),
+                    "简化设计后收口".into(),
+                    "定向修复指定问题并 --user-override 复审".into(),
+                ]),
+                recommend: Some(
+                    "立即向用户说明当前状态、未通过分歧点与影响，并给出主 Agent 自己的处理建议，等待用户拍板".into(),
+                ),
+                why: Some(format!(
+                    "主 Agent 接管后的终审复核仍未通过（累计 {} 轮），触发硬熔断",
+                    rc.review_rounds
+                )),
+                raised_by: Some("scheduler".into()),
+                raised_by_worker: worker_id.map(String::from),
+                tag: Some("review_circuit_open".into()),
+                ai_draft: None,
+                needs_action: true,
+            });
+            let line = format!(
+                "[drove] [REVIEW CIRCUIT OPEN · AWAITING USER DECISION] 任务 `{}` 主 Agent 接管后终审仍未通过（累计 {} 轮），已硬熔断拦截常规 retry。请立即停手向用户说明当前状态、分歧点与影响，并给出你的处理建议由用户拍板。详情: `h2 drove show {}`",
+                task.key, rc.review_rounds, msg.id
+            );
+            notify_coordinator(
+                core,
+                run,
+                "review_circuit_open",
+                &subject,
+                &line,
+                Some(&task.id),
+                attempt_id,
+                worker_id,
+                Some(&msg.id),
+            )
+            .await;
+            core.drove.store.append_daemon_event(NewDaemonEvent {
+                run_id: Some(run.id.clone()),
+                task_id: Some(task.id.clone()),
+                attempt_id: attempt_id.map(String::from),
+                worker_id: worker_id.map(String::from),
+                message_id: Some(msg.id),
+                category: "review".into(),
+                kind: "review_circuit_open".into(),
+                status: "failed".into(),
+                title: format!("Review hard circuit breaker tripped on `{}` ({} rounds)", task.key, rc.review_rounds),
+                detail: Some(history_block),
+                duration_ms: None,
+                tokens: None,
+                cost: None,
+            });
+        }
+    }
+}
 
 /// Runs an adversarial review pass when `task.review` is set.
 /// Returns `Ok(())` on approval or when review is not enabled; returns `Err(422)` on rejection.
@@ -28,7 +425,11 @@ pub(super) async fn run_adversarial_review_gate(
     let Some(spec) = &task.review else {
         return Ok(());
     };
-    let max_rounds = spec.max_rounds.unwrap_or(2).clamp(1, 5);
+    let max_rounds = spec.max_rounds.unwrap_or(DEFAULT_MAX_NORMAL_REVIEW_ROUNDS).clamp(1, 5);
+    let is_post_handoff = task
+        .review_circuit
+        .as_ref()
+        .is_some_and(|rc| rc.stage == ReviewCircuitStage::PostHandoffReview || rc.post_handoff_review_used);
     let round = attempt.review_round.as_ref().map(|r| r.round + 1).unwrap_or(1);
 
     let _ = core.drove.store.update_task(&task.id, |t| t.exec_phase = Some(TaskPhase::Review));
@@ -305,10 +706,15 @@ pub(super) async fn run_adversarial_review_gate(
             .filter(|s| !s.is_empty())
             .map(|c| format!("\nReview criteria:\n{c}\n"))
             .unwrap_or_default();
+        let post_handoff_block = if is_post_handoff {
+            "\nPOST-HANDOFF FINAL REVIEW (1/1): The Coordinator directly took over and fixed prior blocking issues. Focus strictly on whether prior blocking issues are resolved; do NOT expand scope with speculative second-order issues.\n"
+        } else {
+            ""
+        };
         let review_prompt = format!(
             "You are the read-only Drove Reviewer for task `{}` (`{}`).\n\
              Workspace: `{work_cwd}` (READONLY — do NOT modify files).\n\
-             Target: {}\nAcceptance: {}\n{criteria_block}\n\
+             Target: {}\nAcceptance: {}\n{criteria_block}{post_handoff_block}\n\
              {mode_title}:\n```diff\n{patch_preview}\n```\n\n\
              Reply ONLY with a single JSON object (no other prose if possible):\n\
              {{\"verdict\":\"approve\"|\"changes_requested\",\"summary\":\"...\",\"findings\":[{{\"severity\":\"high\"|\"medium\",\"file\":\"...\",\"message\":\"...\"}}]}}",
@@ -470,8 +876,20 @@ pub(super) async fn run_adversarial_review_gate(
     });
 
     if approved {
+        record_review_passed(&core.drove.store, &task.id);
         return Ok(());
     }
+
+    let key_findings = extract_key_findings(None, parsed.findings.as_deref(), &parsed.summary);
+    let (updated_task_opt, circuit_outcome) = record_review_non_pass(
+        &core.drove.store,
+        &task.id,
+        max_rounds,
+        &parsed.verdict,
+        &parsed.summary,
+        key_findings,
+        Some(&attempt.id),
+    );
 
     let findings_txt = parsed
         .findings
@@ -490,38 +908,44 @@ pub(super) async fn run_adversarial_review_gate(
                 .join("\n")
         })
         .unwrap_or_default();
+    let total_rounds = updated_task_opt.as_ref().and_then(|t| t.review_circuit.as_ref()).map_or(round, |rc| rc.review_rounds);
     let reject_msg = if findings_txt.is_empty() {
-        format!("Review round {round}/{max_rounds} requested changes: {}", parsed.summary)
+        format!("Review round {total_rounds}/{max_rounds} requested changes: {}", parsed.summary)
     } else {
-        format!("Review round {round}/{max_rounds} requested changes: {}\n{findings_txt}", parsed.summary)
+        format!("Review round {total_rounds}/{max_rounds} requested changes: {}\n{findings_txt}", parsed.summary)
     };
 
-    if round >= max_rounds {
-        let _ = core.drove.store.update_attempt(&attempt.id, |a| {
-            a.outcome = Some(Outcome::Failed);
-            a.ended_at = Some(now_iso());
-            a.failure = Some(AttemptFailure { kind: FailureKind::ReviewRejected, message: reject_msg.clone() });
-        });
-        mark_worker_idle(core, &author_worker.id);
-        super::fail_or_retry_task(core, &run.id, &task.id, &attempt.id, FailureKind::ReviewRejected, &reject_msg, 0)
+    match circuit_outcome {
+        ReviewCircuitOutcome::HandoffToCoordinator | ReviewCircuitOutcome::AwaitingUserDecision => {
+            let _ = core.drove.store.update_attempt(&attempt.id, |a| {
+                a.outcome = Some(Outcome::Failed);
+                a.ended_at = Some(now_iso());
+                a.failure = Some(AttemptFailure { kind: FailureKind::ReviewRejected, message: reject_msg.clone() });
+            });
+            mark_worker_idle(core, &author_worker.id);
+            let failed_task = mark_task_failed_and_propagate(core, &run.id, &task.id)
+                .or(updated_task_opt)
+                .unwrap_or_else(|| task.clone());
+            emit_review_circuit_escalation(
+                core,
+                run,
+                &failed_task,
+                circuit_outcome,
+                Some(&attempt.id),
+                Some(&author_worker.id),
+            )
             .await;
-        let _ = MAX_AUTO_RETRIES;
-        notify_coordinator(
-            core,
-            run,
-            "review_rejected",
-            &format!("Task `{}` review rejected ({round}/{max_rounds})", task.key),
-            &format!("[drove] Review rejected for `{}`: {}", task.key, parsed.summary),
-            Some(&task.id),
-            Some(&attempt.id),
-            Some(&author_worker.id),
-            None,
-        )
-        .await;
-        return Err(ApiErr::new(422, "review_rejected", reject_msg));
+            let err_code = if circuit_outcome == ReviewCircuitOutcome::AwaitingUserDecision {
+                "review_circuit_open"
+            } else {
+                "review_handoff_to_coordinator"
+            };
+            return Err(ApiErr::new(422, err_code, reject_msg));
+        }
+        ReviewCircuitOutcome::ContinueNormal => {
+            Err(ApiErr::new(422, "review_changes_requested", reject_msg))
+        }
     }
-
-    Err(ApiErr::new(422, "review_changes_requested", reject_msg))
 }
 
 fn build_reviewer_candidates(

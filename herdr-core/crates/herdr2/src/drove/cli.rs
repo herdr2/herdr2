@@ -310,6 +310,12 @@ pub enum DroveAction {
         no_review: bool,
         #[arg(long)]
         fresh: bool,
+        /// Explicit user-approved override to bypass a tripped review hard circuit breaker (`awaiting_user_decision`).
+        #[arg(long)]
+        user_override: bool,
+        /// Optional audit note explaining the user's decision when passing `--user-override`.
+        #[arg(long)]
+        override_reason: Option<String>,
         #[arg(long)]
         run: Option<String>,
         #[arg(long, value_name = "MACHINE")]
@@ -1306,6 +1312,8 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             review_model,
             no_review,
             fresh,
+            user_override,
+            override_reason,
             run,
             on,
         } => {
@@ -1326,9 +1334,19 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
                     "reviewModel": review_model,
                     "noReview": no_review,
                     "fresh": fresh,
+                    "userOverride": user_override,
+                    "overrideReason": override_reason,
                 })),
             )?;
-            Ok((res, format!("retried {tid}")))
+            let stage_note = match res["reviewCircuit"]["stage"].as_str() {
+                Some("post_handoff_review") if user_override => {
+                    let n = res["reviewCircuit"]["userOverrides"].as_u64().unwrap_or(1);
+                    format!(" [user-override #{n} · single review pass]")
+                }
+                Some("post_handoff_review") => " [post-handoff final review 1/1]".into(),
+                _ => String::new(),
+            };
+            Ok((res, format!("retried {tid}{stage_note}")))
         }
         DroveAction::Route { task, role, agent, model, effort, worker, run, on } => {
             let tid = resolve_task_id(paths, on.as_deref(), run, &task, ResolveMode::Write)?;
@@ -1489,11 +1507,31 @@ fn format_settings_output(val: Value, section: Option<&str>, compact: bool) -> R
 
 fn compact_show_snapshot(mut snap: Value) -> Value {
     let mut review_verdicts = Vec::new();
+    let mut review_circuits = Vec::new();
     let mut any_failed = false;
+    let mut any_circuit_attention = false;
     if let Some(tasks) = snap.get_mut("tasks").and_then(Value::as_array_mut) {
         for task in tasks.iter_mut() {
             if task["status"] == "failed" {
                 any_failed = true;
+            }
+            if let Some(rc) = task.get("reviewCircuit").and_then(Value::as_object) {
+                let stage = rc.get("stage").and_then(Value::as_str).unwrap_or("");
+                if matches!(stage, "handoff_to_coordinator" | "post_handoff_review" | "awaiting_user_decision") {
+                    if matches!(stage, "handoff_to_coordinator" | "awaiting_user_decision") {
+                        any_circuit_attention = true;
+                    }
+                    review_circuits.push(json!({
+                        "taskId": task["id"],
+                        "taskKey": task["key"],
+                        "stage": stage,
+                        "reviewRounds": rc.get("reviewRounds").cloned().unwrap_or(json!(0)),
+                        "maxNormalRounds": rc.get("maxNormalRounds").cloned().unwrap_or(json!(2)),
+                        "handoffToCoordinator": rc.get("handoffToCoordinator").cloned().unwrap_or(json!(false)),
+                        "postHandoffReviewUsed": rc.get("postHandoffReviewUsed").cloned().unwrap_or(json!(false)),
+                        "awaitingUserDecision": rc.get("awaitingUserDecision").cloned().unwrap_or(json!(false)),
+                    }));
+                }
             }
             if let Some(data) = task.get("result").and_then(|r| r.get("data")).and_then(Value::as_object) {
                 let raw_verdict = data
@@ -1513,7 +1551,7 @@ fn compact_show_snapshot(mut snap: Value) -> Value {
                 }
             }
             if let Some(obj) = task.as_object_mut() {
-                // Keep essential run/task status, assign, result, isolation fields while stripping bulky spec text.
+                // Keep essential run/task status, assign, result, isolation, reviewCircuit fields while stripping bulky spec text.
                 obj.remove("spec");
             }
         }
@@ -1521,11 +1559,14 @@ fn compact_show_snapshot(mut snap: Value) -> Value {
     let pending_msgs = snap["messages"]
         .as_array()
         .is_some_and(|arr| arr.iter().any(|m| m["needsAction"] == true && m["handledAt"].is_null()));
-    let needs_attention = pending_msgs || any_failed || !review_verdicts.is_empty();
+    let needs_attention = pending_msgs || any_failed || !review_verdicts.is_empty() || any_circuit_attention;
     if let Some(obj) = snap.as_object_mut() {
         obj.insert("needsAttention".into(), Value::Bool(needs_attention));
         if !review_verdicts.is_empty() {
             obj.insert("reviewVerdicts".into(), Value::Array(review_verdicts));
+        }
+        if !review_circuits.is_empty() {
+            obj.insert("reviewCircuits".into(), Value::Array(review_circuits));
         }
     }
     snap
@@ -1552,6 +1593,21 @@ fn format_wait_human(run_id: &str, res: &Value) -> String {
             .map(|v| format!("{}:{}", v["taskKey"].as_str().unwrap_or("?"), v["verdict"].as_str().unwrap_or("?")))
             .collect();
         parts.push(format!("reviewVerdicts=[{}]", items.join(",")));
+    }
+    if let Some(circuits) = res["reviewCircuits"].as_array().filter(|a| !a.is_empty()) {
+        let items: Vec<String> = circuits
+            .iter()
+            .map(|c| {
+                format!(
+                    "{}:{}(r{}/{})",
+                    c["taskKey"].as_str().unwrap_or("?"),
+                    c["stage"].as_str().unwrap_or("?"),
+                    c["reviewRounds"].as_u64().unwrap_or(0),
+                    c["maxNormalRounds"].as_u64().unwrap_or(2),
+                )
+            })
+            .collect();
+        parts.push(format!("reviewCircuits=[{}]", items.join(",")));
     }
     format!("run {run_id}: {}", parts.join(" "))
 }

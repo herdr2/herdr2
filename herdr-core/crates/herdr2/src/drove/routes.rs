@@ -336,9 +336,59 @@ pub(super) async fn worker_done_http(
         // `worker_reported` is an explicit business/review conclusion (e.g., a read-only reviewer
         // reporting blocking defects). Never auto-retry unless the task explicitly opts in via
         // `retryOnWorkerReported: true`, so the task fails immediately and wakes `h2 drove wait`.
-        let allow_retry = !no_retry && task.retry_on_worker_reported == Some(true);
-        let max_r = if allow_retry { super::MAX_AUTO_RETRIES } else { 0 };
-        super::fail_or_retry_task(core, &run.id, &task.id, &att.id, FailureKind::WorkerReported, &reason, max_r).await;
+        if super::review::is_standalone_reviewer_task(&task) {
+            let cap = task
+                .review
+                .as_ref()
+                .and_then(|r| r.max_rounds)
+                .unwrap_or(super::review::DEFAULT_MAX_NORMAL_REVIEW_ROUNDS);
+            let findings = super::review::extract_key_findings(body.get("data"), None, &reason);
+            let (updated_opt, outcome) = super::review::record_review_non_pass(
+                &core.drove.store,
+                &task.id,
+                cap,
+                "changes_requested",
+                &reason,
+                findings,
+                Some(&att.id),
+            );
+            match outcome {
+                super::review::ReviewCircuitOutcome::HandoffToCoordinator
+                | super::review::ReviewCircuitOutcome::AwaitingUserDecision => {
+                    let failed_task = super::pool::mark_task_failed_and_propagate(core, &run.id, &task.id)
+                        .or(updated_opt)
+                        .unwrap_or_else(|| task.clone());
+                    super::review::emit_review_circuit_escalation(
+                        core,
+                        &run,
+                        &failed_task,
+                        outcome,
+                        Some(&att.id),
+                        Some(&worker.id),
+                    )
+                    .await;
+                }
+                super::review::ReviewCircuitOutcome::ContinueNormal => {
+                    let allow_retry = !no_retry && task.retry_on_worker_reported == Some(true);
+                    let max_r = if allow_retry { super::MAX_AUTO_RETRIES } else { 0 };
+                    super::fail_or_retry_task(
+                        core,
+                        &run.id,
+                        &task.id,
+                        &att.id,
+                        FailureKind::WorkerReported,
+                        &reason,
+                        max_r,
+                    )
+                    .await;
+                }
+            }
+        } else {
+            let allow_retry = !no_retry && task.retry_on_worker_reported == Some(true);
+            let max_r = if allow_retry { super::MAX_AUTO_RETRIES } else { 0 };
+            super::fail_or_retry_task(core, &run.id, &task.id, &att.id, FailureKind::WorkerReported, &reason, max_r)
+                .await;
+        }
         if let Some(wt) = worker.worktree.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
             if super::integrate::is_aosp_harness(&run.cwd) {
                 super::integrate::cleanup_worktree_dir(&run.cwd, std::path::Path::new(wt));
@@ -427,11 +477,55 @@ pub(super) async fn worker_done_http(
         a.ended_at = Some(ended);
         a.result = Some(result.clone());
     });
-    let upd_task = core.drove.store.update_task(&refreshed_task.id, |t| {
+    let mut upd_task = core.drove.store.update_task(&refreshed_task.id, |t| {
         t.status = TaskStatus::Succeeded;
         t.exec_phase = None;
         t.result = Some(result.clone());
     });
+    let mut review_escalated = false;
+    if super::review::is_standalone_reviewer_task(&refreshed_task) {
+        if let Some(verdict) =
+            super::review::is_review_rejection_data(result.data.as_ref(), result.blockers.as_deref())
+        {
+            let cap = refreshed_task
+                .review
+                .as_ref()
+                .and_then(|r| r.max_rounds)
+                .unwrap_or(super::review::DEFAULT_MAX_NORMAL_REVIEW_ROUNDS);
+            let findings = super::review::extract_key_findings(result.data.as_ref(), None, &summary);
+            let (rc_task, outcome) = super::review::record_review_non_pass(
+                &core.drove.store,
+                &refreshed_task.id,
+                cap,
+                &verdict,
+                &summary,
+                findings,
+                Some(&refreshed_att.id),
+            );
+            if let Some(t) = rc_task {
+                upd_task = Some(t.clone());
+                if matches!(
+                    outcome,
+                    super::review::ReviewCircuitOutcome::HandoffToCoordinator
+                        | super::review::ReviewCircuitOutcome::AwaitingUserDecision
+                ) {
+                    review_escalated = true;
+                    super::review::emit_review_circuit_escalation(
+                        core,
+                        &run,
+                        &t,
+                        outcome,
+                        Some(&refreshed_att.id),
+                        Some(&worker.id),
+                    )
+                    .await;
+                }
+            }
+        } else if super::review::is_review_approval_data(result.data.as_ref()) {
+            super::review::record_review_passed(&core.drove.store, &refreshed_task.id);
+            upd_task = core.drove.store.get_task(&refreshed_task.id);
+        }
+    }
     super::ai::spawn_handover_compact(
         core.clone(),
         run.id.clone(),
@@ -463,9 +557,11 @@ pub(super) async fn worker_done_http(
     });
     core.drove.wake_scheduler();
 
-    // If all non-template tasks in this run are now terminal, notify coordinator (keeping idle workers warm for reuse).
+    // If all non-template tasks in this run are now terminal (and we didn't just emit a review circuit escalation),
+    // notify coordinator (keeping idle workers warm for reuse).
     let all_tasks = core.drove.store.list_tasks(&run.id);
-    if !all_tasks.is_empty()
+    if !review_escalated
+        && !all_tasks.is_empty()
         && all_tasks.iter().filter(|t| t.template != Some(true)).all(|t| super::scheduler::is_terminal_status(t.status))
     {
         notify_coordinator(
@@ -851,6 +947,37 @@ fn extract_review_verdicts(tasks: &[Task]) -> Vec<Value> {
     out
 }
 
+fn extract_review_circuits(tasks: &[Task]) -> Vec<Value> {
+    let mut out = Vec::new();
+    for t in tasks {
+        if t.template == Some(true) {
+            continue;
+        }
+        let Some(rc) = &t.review_circuit else {
+            continue;
+        };
+        if matches!(
+            rc.stage,
+            ReviewCircuitStage::HandoffToCoordinator
+                | ReviewCircuitStage::PostHandoffReview
+                | ReviewCircuitStage::AwaitingUserDecision
+        ) {
+            out.push(json!({
+                "taskId": t.id,
+                "taskKey": t.key,
+                "stage": rc.stage,
+                "reviewRounds": rc.review_rounds,
+                "maxNormalRounds": rc.max_normal_rounds,
+                "handoffToCoordinator": rc.handoff_to_coordinator,
+                "postHandoffReviewUsed": rc.post_handoff_review_used,
+                "awaitingUserDecision": rc.awaiting_user_decision,
+                "userOverrides": rc.user_overrides,
+            }));
+        }
+    }
+    out
+}
+
 pub(crate) fn compact_task_summary(t: &Task) -> Value {
     let mut obj = json!({
         "id": t.id,
@@ -876,6 +1003,9 @@ pub(crate) fn compact_task_summary(t: &Task) -> Value {
     }
     if let Some(ep) = t.exec_phase {
         obj["execPhase"] = json!(ep);
+    }
+    if let Some(rc) = &t.review_circuit {
+        obj["reviewCircuit"] = json!(rc);
     }
     if let Some(res) = &t.result {
         obj["result"] = json!(res);
@@ -924,7 +1054,7 @@ pub(super) async fn wait_run_http(
             .store
             .list_messages(run_id, None, false, None)
             .into_iter()
-            .filter(|m| m.kind == MessageType::Failed)
+            .filter(|m| matches!(m.kind, MessageType::Failed | MessageType::Escalation))
             .filter_map(|m| m.task_id)
             .collect();
         let has_unreported_failure =
@@ -958,8 +1088,19 @@ pub(super) async fn wait_run_http(
         if should_return || timed_out {
             let counts = core.drove.store.count_tasks_by_run().remove(run_id).unwrap_or_else(empty_task_counts);
             let review_verdicts = extract_review_verdicts(&tasks);
+            let review_circuits = extract_review_circuits(&tasks);
             let any_failed = tasks.iter().any(|t| t.template != Some(true) && t.status == TaskStatus::Failed);
-            let needs_attention = !pending.is_empty() || any_failed || !review_verdicts.is_empty();
+            let any_circuit_attention = tasks.iter().any(|t| {
+                t.template != Some(true)
+                    && t.review_circuit.as_ref().is_some_and(|rc| {
+                        matches!(
+                            rc.stage,
+                            ReviewCircuitStage::HandoffToCoordinator | ReviewCircuitStage::AwaitingUserDecision
+                        )
+                    })
+            });
+            let needs_attention =
+                !pending.is_empty() || any_failed || !review_verdicts.is_empty() || any_circuit_attention;
             let tasks_json: Value = if compact {
                 Value::Array(tasks.iter().map(compact_task_summary).collect())
             } else {
@@ -977,6 +1118,9 @@ pub(super) async fn wait_run_http(
             });
             if !review_verdicts.is_empty() {
                 out["reviewVerdicts"] = Value::Array(review_verdicts);
+            }
+            if !review_circuits.is_empty() {
+                out["reviewCircuits"] = Value::Array(review_circuits);
             }
             if !newly_completed.is_empty() {
                 out["newlyCompleted"] = json!(newly_completed);
@@ -1011,6 +1155,18 @@ pub(super) async fn complete_run_http(core: &Arc<Core>, run_id: &str, body: &Val
             409,
             "tasks_failed",
             "run has failed tasks (retry/cancel them or pass force=true / --force to complete anyway)",
+        ));
+    }
+    let awaiting_user_left = tasks.iter().any(|t| {
+        t.template != Some(true)
+            && !matches!(t.status, TaskStatus::Cancelled | TaskStatus::Skipped)
+            && t.review_circuit.as_ref().is_some_and(|rc| rc.awaiting_user_decision)
+    });
+    if awaiting_user_left && !force {
+        return Err(ApiErr::new(
+            409,
+            "review_circuit_open",
+            "run has task(s) in `awaiting_user_decision` after review circuit breaker tripped; report status, divergence, and your recommendation to the user first, then pass `--force` or cancel the task after user approval",
         ));
     }
 
@@ -1078,11 +1234,160 @@ pub(super) async fn cancel_run_http(core: &Arc<Core>, run_id: &str) -> Result<Va
     Ok(json!({ "ok": true, "run": updated }))
 }
 
-pub(super) fn retry_task_http(core: &Arc<Core>, id: &str, body: &Value) -> Result<Value, ApiErr> {
-    let task = core.drove.store.get_task(id).ok_or_else(|| ApiErr::new(404, "not_found", "Task not found"))?;
+pub(super) async fn retry_task_http(core: &Arc<Core>, id: &str, body: &Value) -> Result<Value, ApiErr> {
+    let mut task = core.drove.store.get_task(id).ok_or_else(|| ApiErr::new(404, "not_found", "Task not found"))?;
     if task.status == TaskStatus::Running {
         return Err(ApiErr::new(409, "invalid_state", "cannot retry a running task"));
     }
+    let user_override = body["userOverride"].as_bool() == Some(true);
+    let override_reason = body["overrideReason"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+    let run_opt = core.drove.store.get_run(&task.run_id);
+
+    // 1. Backfill uncounted completed standalone reviewer attempts: if a `role=reviewer` task
+    //    exited `--outcome done` without structured rejection JSON, yet the Coordinator calls
+    //    `h2 drove retry`, that completed attempt counts as a non-passing review round so it
+    //    cannot bypass the 2-round handoff + 1 post-handoff hard circuit breaker.
+    if super::review::is_standalone_reviewer_task(&task) && task.status == TaskStatus::Succeeded {
+        let attempts = core.drove.store.list_attempts(None, Some(&task.id), None);
+        if let Some(att) = attempts.iter().rev().find(|a| a.outcome == Some(Outcome::Succeeded)) {
+            let already_recorded = task.review_circuit.as_ref().is_some_and(|rc| {
+                rc.stage == ReviewCircuitStage::Cleared
+                    || rc.history.iter().any(|h| h.attempt_id.as_deref() == Some(att.id.as_str()))
+            });
+            if !already_recorded {
+                let summary = att
+                    .result
+                    .as_ref()
+                    .map(|r| r.summary.as_str())
+                    .or_else(|| task.result.as_ref().map(|r| r.summary.as_str()))
+                    .unwrap_or("Review round retried by coordinator");
+                let findings = super::review::extract_key_findings(
+                    att.result.as_ref().and_then(|r| r.data.as_ref()),
+                    None,
+                    summary,
+                );
+                let cap = task
+                    .review
+                    .as_ref()
+                    .and_then(|r| r.max_rounds)
+                    .unwrap_or(super::review::DEFAULT_MAX_NORMAL_REVIEW_ROUNDS);
+                let (updated_opt, outcome) = super::review::record_review_non_pass(
+                    &core.drove.store,
+                    &task.id,
+                    cap,
+                    "retried_unpassed",
+                    summary,
+                    findings,
+                    Some(&att.id),
+                );
+                if let Some(updated_task) = updated_opt {
+                    task = updated_task;
+                    if let Some(ref run) = run_opt
+                        && !matches!(outcome, super::review::ReviewCircuitOutcome::ContinueNormal)
+                    {
+                        super::review::emit_review_circuit_escalation(
+                            core,
+                            run,
+                            &task,
+                            outcome,
+                            Some(&att.id),
+                            Some(&att.worker_id),
+                        )
+                        .await;
+                    }
+                    if !user_override {
+                        match outcome {
+                            super::review::ReviewCircuitOutcome::HandoffToCoordinator => {
+                                return Err(ApiErr::new(
+                                    409,
+                                    "review_handoff_required",
+                                    format!(
+                                        "Task `{}` reached {} non-passing review rounds and has been handed off to Coordinator. Take over and fix directly first, then run `h2 drove retry {}` ONCE for the single post-handoff final review.",
+                                        task.key,
+                                        task.review_circuit.as_ref().map_or(2, |c| c.review_rounds),
+                                        task.key
+                                    ),
+                                ));
+                            }
+                            super::review::ReviewCircuitOutcome::AwaitingUserDecision => {
+                                return Err(ApiErr::new(
+                                    409,
+                                    "review_circuit_open",
+                                    format!(
+                                        "Task `{}` tripped the review hard circuit breaker after {} non-passing review rounds (post-handoff review did not pass). STOP retrying and immediately report current status, divergence, impact, and your recommendation to the user. Only pass `--user-override` after explicit user approval.",
+                                        task.key,
+                                        task.review_circuit.as_ref().map_or(3, |c| c.review_rounds)
+                                    ),
+                                ));
+                            }
+                            super::review::ReviewCircuitOutcome::ContinueNormal => {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2. Enforce three-stage Review Circuit Breaker on `retry`:
+    //    - `HandoffToCoordinator` -> allows ONCE, transitioning to `PostHandoffReview` (1/1).
+    //    - `AwaitingUserDecision` -> blocked with `409 review_circuit_open` unless explicit `userOverride: true`.
+    let mut circuit_transition: Option<&'static str> = None;
+    if let Some(rc) = &task.review_circuit {
+        match rc.stage {
+            ReviewCircuitStage::AwaitingUserDecision => {
+                if !user_override {
+                    return Err(ApiErr::new(
+                        409,
+                        "review_circuit_open",
+                        format!(
+                            "Task `{}` is in `awaiting_user_decision` after {} non-passing review rounds (including the single post-handoff final review). STOP retrying and immediately report current status, unresolved divergence, impact, and your concrete recommendation to the user. Only after explicit user approval may you run `h2 drove retry {} --user-override`.",
+                            task.key, rc.review_rounds, task.key
+                        ),
+                    ));
+                }
+                circuit_transition = Some("user_override");
+            }
+            ReviewCircuitStage::HandoffToCoordinator => {
+                if rc.post_handoff_review_used && !user_override {
+                    return Err(ApiErr::new(
+                        409,
+                        "review_circuit_open",
+                        format!(
+                            "Task `{}` already consumed its single post-handoff final review. Report to the user with your recommendation, or pass `--user-override` after explicit user approval.",
+                            task.key
+                        ),
+                    ));
+                }
+                circuit_transition = Some(if user_override && rc.post_handoff_review_used {
+                    "user_override"
+                } else {
+                    "post_handoff_review"
+                });
+            }
+            ReviewCircuitStage::PostHandoffReview => {
+                let latest_att = core.drove.store.list_attempts(None, Some(&task.id), None).into_iter().last();
+                let is_infra_crash = task.status == TaskStatus::Failed
+                    && latest_att.as_ref().and_then(|a| a.failure.as_ref()).is_some_and(|f| {
+                        !matches!(f.kind, FailureKind::ReviewRejected | FailureKind::WorkerReported)
+                    });
+                if !is_infra_crash && !user_override {
+                    return Err(ApiErr::new(
+                        409,
+                        "review_circuit_open",
+                        format!(
+                            "Task `{}` already used its single post-handoff final review slot. Report current status and your recommendation to the user, or pass `--user-override` after user approval.",
+                            task.key
+                        ),
+                    ));
+                }
+                if user_override {
+                    circuit_transition = Some("user_override");
+                }
+            }
+            ReviewCircuitStage::Normal | ReviewCircuitStage::Cleared => {}
+        }
+    }
+
     if let Some(hint) = body["hint"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
         core.drove.set_task_hint(&task.id, hint.to_string());
     }
@@ -1091,6 +1396,22 @@ pub(super) fn retry_task_http(core: &Arc<Core>, id: &str, body: &Value) -> Resul
         t.failures = 0;
         t.exec_phase = None;
         t.review_state = None;
+        if let Some(rc) = t.review_circuit.as_mut() {
+            match circuit_transition {
+                Some("post_handoff_review") => {
+                    rc.stage = ReviewCircuitStage::PostHandoffReview;
+                    rc.post_handoff_review_used = true;
+                    rc.awaiting_user_decision = false;
+                }
+                Some("user_override") => {
+                    rc.user_overrides = rc.user_overrides.saturating_add(1);
+                    rc.stage = ReviewCircuitStage::PostHandoffReview;
+                    rc.post_handoff_review_used = true;
+                    rc.awaiting_user_decision = false;
+                }
+                _ => {}
+            }
+        }
         if body["noReview"].as_bool() == Some(true) {
             t.review = None;
         } else {
@@ -1148,9 +1469,44 @@ pub(super) fn retry_task_http(core: &Arc<Core>, id: &str, body: &Value) -> Resul
         }
         t.assign = Some(a);
     });
+    if let Some(kind) = circuit_transition {
+        let (event_kind, status, title, detail) = if kind == "user_override" {
+            let n = updated.as_ref().and_then(|t| t.review_circuit.as_ref()).map_or(1, |rc| rc.user_overrides);
+            (
+                "review_override",
+                "warn",
+                format!("User-approved review override #{n} on `{}`", task.key),
+                override_reason.or_else(|| Some("Explicit --user-override after hard circuit breaker".into())),
+            )
+        } else {
+            (
+                "post_handoff_review",
+                "ok",
+                format!("Dispatched single post-handoff final review (1/1) on `{}`", task.key),
+                Some("Coordinator takeover completed; running final verification pass".into()),
+            )
+        };
+        core.drove.store.append_daemon_event(NewDaemonEvent {
+            run_id: Some(task.run_id.clone()),
+            task_id: Some(task.id.clone()),
+            attempt_id: None,
+            worker_id: None,
+            message_id: None,
+            category: "review".into(),
+            kind: event_kind.into(),
+            status: status.into(),
+            title,
+            detail,
+            duration_ms: None,
+            tokens: None,
+            cost: None,
+        });
+    }
     reopen_skipped_dependents(core, &task);
     for m in core.drove.store.list_messages(&task.run_id, Some(true), true, None) {
-        if m.task_id.as_deref() == Some(task.id.as_str()) && m.kind == MessageType::Failed {
+        if m.task_id.as_deref() == Some(task.id.as_str())
+            && matches!(m.kind, MessageType::Failed | MessageType::Escalation)
+        {
             let _ = core.drove.store.mark_handled(&m.id);
         }
     }

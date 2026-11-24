@@ -98,6 +98,27 @@ Roles (`coder`, `tester`, `writer`, `illustrator`, `reviewer`, `researcher`, plu
 
 ---
 
-## 4. SSH Remote Transparency
+## 4. Review 熔断与主 Agent 接管协议（强制规范 / Review Circuit-Breaker）
+
+为避免对抗式 Review 陷入无限打补丁与二阶故障注入的收益递减循环，Drove 对**所有 Review 流程**（含 `task.review` 对抗审查门禁与独立 `role: reviewer` 任务，覆盖自动修复与手动 `h2 drove retry`）强制执行三段式熔断状态机：
+
+1. **连续 2 轮 Review 未通过 → 熔断并转交主 Agent 亲自接管（`handoff_to_coordinator`）**：
+   - 当某个审查任务或被审查节点连续 **2 轮** 未通过时，Drove 立即触发熔断并向 Coordinator 发送高优 `escalation` 通知，汇总前两轮的关键未通过项。
+   - 此时**停止**常规 worker 修复-review 循环，**禁止**通过 `h2 drove add` 新建重复 review 任务绕过熔断，必须由 **主 Agent（Coordinator）亲自阅读代码与分歧点并直接修复、完成本地验证**。
+2. **主 Agent 接管处理完成后 → 仅允许再 Review 1 次（`post_handoff_review`, 1/1）**：
+   - 主 Agent 完成直接修改并确认测试通过后，执行 **1 次** `h2 drove retry <task>` 触发唯一一次终审复核（post-handoff review）。
+3. **终审复核仍不通过 → 硬熔断并立即上报用户（`awaiting_user_decision`）**：
+   - 若这一次复审**仍未通过**，Drove 进入硬熔断状态 `awaiting_user_decision`，默认拦截所有后续 `h2 drove retry`（返回 `409 review_circuit_open`）和无 `--force` 的 `h2 drove complete`。
+   - 主 Agent **必须立即停手向用户汇报**：
+     - 当前状态与历轮 review 的关键未通过项；
+     - 仍未通过的核心分歧点及其实际影响；
+     - **主 Agent 自己的明确处理建议**（例如：接受现状直接收口 / 简化设计规避过度复杂 / 定向继续修某项）。
+   - **必须等待用户明确拍板后再行动**：
+     - 用户批准定向继续修并再审：`h2 drove retry <task> --user-override --override-reason "<用户决策说明>"`（每次 override 仅放行 1 轮受控复审）；
+     - 用户批准接受现状直接收口：`h2 drove cancel <task>` 后 `h2 drove complete`，或直接 `h2 drove complete --force`。
+
+---
+
+## 5. SSH Remote Transparency
 
 Append `--on <machine>` to operate on a connected remote `herdr2` host (`h2 drove plan --on rohan ...`, `h2 drove wait --on rohan ...`). Local `Drove Web` (`127.0.0.1:7799`) automatically aggregates and proxies `<machine>/<run_id>` Runs and streams remote SSE events.

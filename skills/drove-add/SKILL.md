@@ -31,4 +31,5 @@ h2 drove add --file /tmp/more-tasks.yaml
 
 After appending tasks:
 - Run `h2 drove wait` (if not already waiting) to block until the newly added tasks settle or ask questions.
-- Run `h2 drove show` to see current task statuses and warm worker states.
+- Run `h2 drove show` to see current task statuses, review circuit-breaker stages, and warm worker states.
+- **Review Circuit-Breaker Guard**: Do NOT use `h2 drove add` to spawn duplicate `role: reviewer` tasks in order to bypass a tripped `handoff_to_coordinator` or `awaiting_user_decision` review circuit breaker; follow the Coordinator takeover (1 post-handoff review) -> user decision escalation protocol instead.

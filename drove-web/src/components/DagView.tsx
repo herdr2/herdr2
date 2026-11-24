@@ -37,7 +37,7 @@ import {
 } from "../dag-lens";
 import { agentModel, circNum, contextPct, fmtCost, fmtTokens, runToken, shortId, taskMicroBadges, taskToken, taskUsage, workerNumbers, workerToken, type MicroBadge } from "../format";
 import { failureToken, taskFailure } from "../failure";
-import { authorWorkers, isReviewer, parseReviewerNodeId, reviewBoard, reviewerNodeId, reviewerNumbers, type ReviewStanding } from "../review";
+import { authorWorkers, isReviewer, parseReviewerNodeId, reviewBoard, reviewCircuitView, reviewerNodeId, reviewerNumbers, type ReviewCircuitView, type ReviewStanding } from "../review";
 import { resolveRoleMeta, roleDisplayName, type RoleVisualKind } from "../roles";
 import { Estimate } from "./Estimate";
 import { ReviewRequirement } from "./ReviewRequirement";
@@ -193,6 +193,7 @@ type TaskNodeData = {
   hasReviewEdge: boolean;
   reviewRequired: boolean;
   review: { text: string; standing: ReviewStanding } | null;
+  reviewCircuit: { label: string; title: string; tone: ReviewCircuitView["tone"] } | null;
   rel: "up" | "down" | "ran" | "dim" | null;
   lensDim: boolean;
   order: number | null;
@@ -262,6 +263,14 @@ function TaskNode({ id, data }: NodeProps<Node<TaskNodeData>>) {
       </div>
       <div className="gnode__chips">
         <ReviewRequirement required={data.reviewRequired} />
+        {data.reviewCircuit && (
+          <span
+            className={`circuit-pill circuit-pill--${data.reviewCircuit.tone}`}
+            title={data.reviewCircuit.title}
+          >
+            {data.reviewCircuit.label}
+          </span>
+        )}
         {data.badges.map((badge) => (
           <span key={badge.kind} className={`micro-badge micro-badge--${badge.kind}`} title={badge.title}>{badge.text}</span>
         ))}
@@ -1197,6 +1206,7 @@ function Board({
 
     for (const task of snap.tasks) {
       const board = reviewBoard(task, snap.attempts, snap.workers);
+      const circuit = reviewCircuitView(task, t);
       const reviewText = board
         ? board.standing === "approved"
           ? t("review.edge.approved")
@@ -1246,6 +1256,9 @@ function Board({
           coordTakeover: wInfo.coordTakeover,
           reviewRequired: board !== null,
           review: board && reviewText ? { text: reviewText, standing: board.standing } : null,
+          reviewCircuit: circuit
+            ? { label: circuit.shortLabel, title: circuit.description, tone: circuit.tone }
+            : null,
           tokens: fmtTokens(usage.tokens),
           cost: fmtCost(usage.cost),
           tokensEstimated: usage.estimatedTokens,

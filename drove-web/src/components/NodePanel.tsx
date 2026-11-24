@@ -3,7 +3,7 @@ import { stopWorker } from "../api";
 import { COORD_ID } from "./DagView";
 import { branchCaption, branchPhase } from "../branch";
 import { agentModel, attemptTokens, circNum, contextPct, fmtCost, fmtDuration, fmtTokens, jsonPreview, shortId, snapshotEstimated, taskMicroBadges, workerNumbers } from "../format";
-import { authorWorkers, isReviewer, parseReviewerNodeId, reviewBoard, reviewerNumbers, taskRequiresReview, type ReviewBoard as ReviewBoardModel, type ReviewRoundView } from "../review";
+import { authorWorkers, isReviewer, parseReviewerNodeId, reviewBoard, reviewCircuitView, reviewerNumbers, taskRequiresReview, type ReviewBoard as ReviewBoardModel, type ReviewRoundView } from "../review";
 import { resolveRoleMeta, roleDisplayName } from "../roles";
 import {
   MARK_LABEL,
@@ -267,6 +267,7 @@ function TaskPanel({
   const workerNums = workerNumbers(authorWorkers(snap.workers));
   const reviewerNums = reviewerNumbers(snap.workers);
   const board = reviewBoard(task, snap.attempts, snap.workers);
+  const circuit = reviewCircuitView(task, t);
   const badges = taskMicroBadges(task, t);
   const statusBadge = deriveTaskStatusBadge(task, attempts, snap.tasks, t);
   const cause = statusBadge.cause;
@@ -288,6 +289,11 @@ function TaskPanel({
             {statusBadge.label}
           </StatusBadge>
           <ReviewRequirement required={taskRequiresReview(task, attempts)} />
+          {circuit && (
+            <span className={`circuit-pill circuit-pill--${circuit.tone}`} title={circuit.description}>
+              {circuit.shortLabel}
+            </span>
+          )}
           {visibleBadges.map((badge) =>
             badge.kind === "role" && assignedRoleMeta ? (
               <span key={badge.kind} className={`role-badge ${assignedRoleMeta.badgeClass}`} title={badge.title}>
@@ -317,6 +323,30 @@ function TaskPanel({
             {t(`fail.${cause.kind}`)}
             {cause.message ? ` — ${cause.message}` : ""}
           </div>
+        </div>
+      )}
+
+      {circuit && (circuit.tone === "handoff" || circuit.tone === "post_handoff" || circuit.tone === "awaiting") && (
+        <div className={`circuit-banner circuit-banner--${circuit.tone}`}>
+          <div className="circuit-banner__head">
+            <span className="circuit-banner__title">{t("review.circuit.title")} · {circuit.label}</span>
+            <span className="circuit-banner__meta mono">
+              R{circuit.rounds}/{circuit.maxRounds}
+              {circuit.overrides > 0 ? ` · ${t("review.circuit.overrides", { n: circuit.overrides })}` : ""}
+            </span>
+          </div>
+          <p className="circuit-banner__desc">{circuit.description}</p>
+          {circuit.history.length > 0 && (
+            <ul className="circuit-banner__history">
+              {circuit.history.map((rec) => (
+                <li key={`${rec.round}:${rec.at}`}>
+                  <strong className="mono">R{rec.round}{rec.postHandoff ? "*" : ""}</strong>
+                  {" · "}
+                  <span>{rec.summary}</span>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
 

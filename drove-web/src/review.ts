@@ -143,7 +143,100 @@ function toRoundView(
 
 /** Include persisted review history even when an older snapshot lacks its review config. */
 export function taskRequiresReview(task: Task, attempts: readonly Attempt[] = []): boolean {
-  return Boolean(task.review || task.reviewState || attempts.some((attempt) => attempt.taskId === task.id && attempt.kind === "review"));
+  return Boolean(
+    task.review
+      || task.reviewState
+      || task.reviewCircuit
+      || attempts.some((attempt) => attempt.taskId === task.id && attempt.kind === "review"),
+  );
+}
+
+export interface ReviewCircuitView {
+  stage: NonNullable<Task["reviewCircuit"]>["stage"];
+  tone: "normal" | "handoff" | "post_handoff" | "awaiting" | "cleared";
+  rounds: number;
+  maxRounds: number;
+  overrides: number;
+  shortLabel: string;
+  label: string;
+  description: string;
+  history: NonNullable<NonNullable<Task["reviewCircuit"]>["history"]>;
+}
+
+/** Normalized display info for a task's Review Circuit Breaker state. */
+export function reviewCircuitView(
+  task: Task,
+  t: (key: string, vars?: Record<string, string | number>) => string,
+): ReviewCircuitView | null {
+  const rc = task.reviewCircuit;
+  if (!rc) return null;
+  const rounds = rc.reviewRounds ?? 0;
+  const maxRounds = rc.maxNormalRounds || 2;
+  const overrides = rc.userOverrides ?? 0;
+  const history = rc.history ?? [];
+  switch (rc.stage) {
+    case "handoff_to_coordinator":
+      return {
+        stage: rc.stage,
+        tone: "handoff",
+        rounds,
+        maxRounds,
+        overrides,
+        shortLabel: `R${rounds}/${maxRounds} · ${t("review.circuit.handoffShort")}`,
+        label: t("review.circuit.handoff"),
+        description: t("review.circuit.handoffDesc", { rounds, max: maxRounds }),
+        history,
+      };
+    case "post_handoff_review":
+      return {
+        stage: rc.stage,
+        tone: "post_handoff",
+        rounds,
+        maxRounds,
+        overrides,
+        shortLabel: t("review.circuit.postHandoff"),
+        label: t("review.circuit.postHandoff"),
+        description: t("review.circuit.postHandoffDesc", { rounds }),
+        history,
+      };
+    case "awaiting_user_decision":
+      return {
+        stage: rc.stage,
+        tone: "awaiting",
+        rounds,
+        maxRounds,
+        overrides,
+        shortLabel: `R${rounds} · ${t("review.circuit.awaitingShort")}`,
+        label: t("review.circuit.awaiting"),
+        description: t("review.circuit.awaitingDesc", { rounds }),
+        history,
+      };
+    case "cleared":
+      return {
+        stage: rc.stage,
+        tone: "cleared",
+        rounds,
+        maxRounds,
+        overrides,
+        shortLabel: `${t("review.circuit.roundsOver", { rounds })} · ${t("review.circuit.cleared")}`,
+        label: t("review.circuit.cleared"),
+        description: t("review.circuit.cleared"),
+        history,
+      };
+    default:
+      if (rounds <= 0) return null;
+      return {
+        stage: rc.stage,
+        tone: "normal",
+        rounds,
+        maxRounds,
+        overrides,
+        shortLabel: t("review.circuit.rounds", { rounds, max: maxRounds }),
+        label: t("review.circuit.rounds", { rounds, max: maxRounds }),
+        description: t("review.circuit.rounds", { rounds, max: maxRounds }),
+        history,
+      };
+  }
 }
 
 /** Review loop for one task. Absent when the task has no review configured and no review turns. */

@@ -1754,6 +1754,28 @@ fn next_assign_source(task: &Task) -> Option<String> {
     }
 }
 
+/// Marks a task Failed and propagates terminal failure to pending `AllSuccess` dependents
+/// without posting the generic `task_failed` message (used when a dedicated circuit-breaker
+/// escalation message is emitted instead).
+pub fn mark_task_failed_and_propagate(core: &Arc<Core>, run_id: &str, task_id: &str) -> Option<Task> {
+    let updated = core.drove.store.update_task(task_id, |t| {
+        if matches!(t.status, TaskStatus::Cancelled | TaskStatus::Skipped | TaskStatus::Succeeded) {
+            return;
+        }
+        t.failures += 1;
+        t.status = TaskStatus::Failed;
+    });
+    for _ in 0..8 {
+        let before = core.drove.store.list_tasks(run_id);
+        super::scheduler::promote_pending_tasks(core, &before);
+        let after = core.drove.store.list_tasks(run_id);
+        if before.iter().map(|t| t.status).eq(after.iter().map(|t| t.status)) {
+            break;
+        }
+    }
+    updated
+}
+
 /// Runs automatic retry or marks task Failed and notifies coordinator.
 pub async fn handle_task_failure(
     core: &Arc<Core>,

@@ -402,6 +402,64 @@ pub struct ReviewVerdict {
     pub findings: Option<Vec<ReviewFinding>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewCircuitStage {
+    /// Normal review cycle before hitting the circuit-breaker threshold.
+    Normal,
+    /// Review failed >= max_normal_rounds; handed off to the Coordinator (main agent) for direct takeover.
+    HandoffToCoordinator,
+    /// Single post-handoff final review (1/1) is queued or running after Coordinator takeover.
+    PostHandoffReview,
+    /// Post-handoff review still did not pass; hard circuit breaker engaged, awaiting user decision.
+    AwaitingUserDecision,
+    /// Review passed after circuit activity.
+    Cleared,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewRoundRecord {
+    pub round: u32,
+    pub verdict: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub key_findings: Vec<String>,
+    pub at: String,
+    #[serde(default)]
+    pub post_handoff: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ReviewCircuit {
+    pub stage: ReviewCircuitStage,
+    /// Cumulative consecutive non-passing review rounds across auto-repairs and manual `retry`.
+    pub review_rounds: u32,
+    /// Max normal review rounds before handoff to Coordinator (default 2).
+    pub max_normal_rounds: u32,
+    /// Whether the task has been handed off to the Coordinator for direct takeover.
+    #[serde(default)]
+    pub handoff_to_coordinator: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_at: Option<String>,
+    /// Whether the single post-handoff final review slot has been consumed.
+    #[serde(default)]
+    pub post_handoff_review_used: bool,
+    /// Whether the hard circuit breaker is open and awaiting explicit user decision.
+    #[serde(default)]
+    pub awaiting_user_decision: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tripped_at: Option<String>,
+    /// Count of explicit user-approved overrides (`--user-override`) after hard circuit-breaker trip.
+    #[serde(default)]
+    pub user_overrides: u32,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<ReviewRoundRecord>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewState {
@@ -672,6 +730,9 @@ pub struct Task {
     pub review: Option<ReviewSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_state: Option<ReviewState>,
+    /// Persistent review circuit-breaker state across auto-repairs and manual `retry`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_circuit: Option<ReviewCircuit>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidate_result: Option<TaskResult>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

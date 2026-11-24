@@ -68,7 +68,46 @@ pub fn diagnose_task_with_tail(store: &Store, id_or_attempt: &str, tail: usize) 
     let worker_total_tokens = worker.as_ref().map(|w| w.totals.tokens);
 
     let failure = attempt.as_ref().and_then(|a| a.failure.clone());
-    let suggestion = match failure.as_ref().map(|f| f.kind) {
+    let suggestion = if let Some(rc) = &task.review_circuit {
+        match rc.stage {
+            ReviewCircuitStage::HandoffToCoordinator => format!(
+                "Review circuit breaker handed off to Coordinator after {} non-passing review round(s) (limit {}). Coordinator must take over and fix directly, then trigger ONLY ONE post-handoff final review via `h2 drove retry {}`.",
+                rc.review_rounds, rc.max_normal_rounds, task.key
+            ),
+            ReviewCircuitStage::PostHandoffReview => format!(
+                "Single post-handoff final review (1/1) is active after Coordinator takeover (prior non-passing rounds: {}). If this review still fails, Drove will engage the hard circuit breaker and require user decision.",
+                rc.review_rounds
+            ),
+            ReviewCircuitStage::AwaitingUserDecision => format!(
+                "HARD REVIEW CIRCUIT BREAKER OPEN ({} non-passing review rounds, post-handoff review failed): STOP retrying. Immediately report current status, unresolved divergence, impact, and your concrete recommendation to the user. After user approval, either run `h2 drove retry {} --user-override` or close the run with `h2 drove complete --force`.",
+                rc.review_rounds, task.key
+            ),
+            ReviewCircuitStage::Normal | ReviewCircuitStage::Cleared => default_failure_suggestion(failure.as_ref()),
+        }
+    } else {
+        default_failure_suggestion(failure.as_ref())
+    };
+
+    Some(Diagnosis {
+        task,
+        attempts: attempts.clone(),
+        route_reason: attempt.as_ref().map(|a| a.route_reason.clone()),
+        ai: attempt.as_ref().and_then(|a| a.ai_diagnosis.clone()),
+        attempt,
+        failure,
+        last_items,
+        files_modified,
+        declared_files_modified,
+        live_dirty_files,
+        attempt_tokens,
+        worker_total_tokens,
+        git_status,
+        suggestion,
+    })
+}
+
+fn default_failure_suggestion(failure: Option<&AttemptFailure>) -> String {
+    match failure.map(|f| f.kind) {
         Some(FailureKind::AgentError) => {
             "Inspect worker stderr/output; retry with --same-worker or switch agent/model via `drove route`."
         }
@@ -96,24 +135,7 @@ pub fn diagnose_task_with_tail(store: &Store, id_or_attempt: &str, tail: usize) 
         }
         None => "No failure recorded; inspect worker transcript and task spec.",
     }
-    .to_string();
-
-    Some(Diagnosis {
-        task,
-        attempts: attempts.clone(),
-        route_reason: attempt.as_ref().map(|a| a.route_reason.clone()),
-        ai: attempt.as_ref().and_then(|a| a.ai_diagnosis.clone()),
-        attempt,
-        failure,
-        last_items,
-        files_modified,
-        declared_files_modified,
-        live_dirty_files,
-        attempt_tokens,
-        worker_total_tokens,
-        git_status,
-        suggestion,
-    })
+    .to_string()
 }
 
 /// Parses `git status --porcelain` lines into workspace-relative paths (skipping ephemeral caches).
