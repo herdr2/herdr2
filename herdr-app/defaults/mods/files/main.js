@@ -516,6 +516,11 @@ export default class Files extends View {
       this.pending = new Set(); this.marks = {}; this.reviewComposer = null; this.reviewTargetPopupOpen = false; this.reviewError = null; this.watched = null; this.error = null; this.limited = false;
       this.loading = false;
       if (keepActiveFile) {
+        if (prevContext?.cwd && prevContext.cwd !== cwd && this.file && !isAbsolutePath(this.file)) {
+          const rebased = relativizeToRoot(resolveDiskPath(this.file, prevContext.cwd), cwd);
+          this.file = rebased;
+          this.selectedFile = rebased;
+        }
         // If an async load was in-flight under `prevContext`, its `this.current(prevContext)` check
         // will drop the result; re-kick it under the new context after render finishes.
         if (this.loadingFile && this.file) {

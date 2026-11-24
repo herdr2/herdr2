@@ -532,11 +532,13 @@ pub fn find_and_resolve_remote(
     cwd: Option<&str>,
     joined: bool,
 ) -> Option<(Range<usize>, Target, Option<u32>, Option<u32>)> {
-    if joined {
-        return None;
-    }
     if let Some(mut range) = find(text, at) {
         let matched = &text[range.clone()];
+        // On joined hard-wrapped rows, only stitch URLs or space-free remote file paths
+        // so unrelated prose on adjacent rows is never fused into a bogus path.
+        if joined && !is_url_scheme(matched) && (matched.contains(' ') || !looks_like_remote_file_token(matched)) {
+            return None;
+        }
         // Avoid sending space-gobbled prose (e.g. `/srv/Makefile for details`) to remote `cat`.
         if !is_url_scheme(matched) && matched.contains(' ') {
             let word_start = text[range.start..at].rfind(' ').map_or(range.start, |i| range.start + i + 1);
@@ -569,6 +571,9 @@ pub fn find_and_resolve_remote(
             }
             return Some((range, target, line, end_line));
         }
+    }
+    if joined {
+        return None;
     }
     let mut token = path_token(text, at)?;
     if let Some(trimmed) = trim_leading_non_ascii(text, token.clone(), at) {
@@ -1042,6 +1047,12 @@ mod tests {
             resolve_remote_with_location(remote_url, Some("/srv/repo")),
             Some((Target::File(PathBuf::from("/srv/repo/src/foo.rs")), Some(10), Some(20))),
         );
+
+        let wrapped_remote = "/home/user/repo/herdr-app/defaults/mods/files/main.js:42";
+        let (rw, tw, lw, _) =
+            find_and_resolve_remote(wrapped_remote, wrapped_remote.find("main.js").unwrap(), Some("/home/user/repo"), true).unwrap();
+        assert_eq!(&wrapped_remote[rw], wrapped_remote);
+        assert_eq!((tw, lw), (Target::File(PathBuf::from("/home/user/repo/herdr-app/defaults/mods/files/main.js")), Some(42)));
 
         std::fs::remove_dir_all(dir).unwrap();
     }

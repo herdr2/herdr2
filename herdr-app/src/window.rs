@@ -2506,6 +2506,15 @@ impl AppWindow {
         }
     }
 
+    fn refresh_mod_slot(&self, slot: &str, cx: &mut Context<Self>) {
+        if let Some(runtime) = &self.runtime
+            && let Some(copy) = self.copies.get(slot)
+            && let Some(root) = &copy.root
+        {
+            let _ = runtime.refresh(root, cx);
+        }
+    }
+
     /// How a terminal or ACP agent shows (`program` for mods): its agent, else what it runs.
     fn program(&self, addr: &str) -> Value {
         if let Some(p) = self.live.get(addr).or_else(|| self.ended_acp.get(addr)).and_then(|r| r.get("program")).filter(|v| !v.is_null()) {
@@ -9671,7 +9680,10 @@ impl AppWindow {
             trimmed.to_owned()
         };
 
-        self.file_open_seq = self.file_open_seq.wrapping_add(1).max(1);
+        let existing_seq = mods::shared("files.open_request")
+            .and_then(|v| v.get("seq").and_then(Value::as_u64))
+            .unwrap_or(0);
+        self.file_open_seq = self.file_open_seq.max(existing_seq).wrapping_add(1).max(1);
         mods::set_shared_ephemeral(
             "files.open_request".to_string(),
             json!({
@@ -9702,16 +9714,19 @@ impl AppWindow {
             if layout_changed || !files_mounted {
                 self.sync(window, cx);
             }
-            if files_mounted {
-                // Wake the mounted Files mod immediately via its async nextCommand() loop
-                // instead of refreshing every mod in the window or creating EditorState in render().
-                let _ = mods::send_command("files", "open_request");
+            // Wake the mounted Files mod immediately via its async nextCommand() loop.
+            // If no listener accepted it, refresh only the `files` copy so its render()
+            // schedules deferred consumeOpenRequest() without refreshing every mod.
+            if !mods::send_command("files", "open_request") {
+                self.refresh_mod_slot("files", cx);
             }
         } else {
             let already_open = self.overlays.iter().any(|o| o.id == "files-preview")
                 && self.copies.contains_key("overlay:files-preview");
             if already_open {
-                let _ = mods::send_command("files", "open_request");
+                if !mods::send_command("files", "open_request") {
+                    self.refresh_mod_slot("overlay:files-preview", cx);
+                }
             } else {
                 self.open_overlay(
                     "files-preview".to_string(),

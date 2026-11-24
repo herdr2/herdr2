@@ -4761,6 +4761,84 @@ fn files_switching_between_cached_code_and_markdown_via_open_request_never_error
 }
 
 #[gpui::test]
+fn files_wakes_via_next_command_open_request_without_refresh(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+
+    let calls = Rc::new(RefCell::new(Calls::default()));
+    {
+        let mut c = calls.borrow_mut();
+        c.files.insert("/tmp/wake-a.rs".into(), "fn wake_a() {}\n".into());
+        c.files.insert("/tmp/wake-b.py".into(), "def wake_b():\n    return 1\n".into());
+    }
+
+    let (cmd_tx, cmd_rx) = async_channel::unbounded::<String>();
+    let values = fixture(false, json!({}), updates("current", "current"));
+    let host_mod = module(values, calls.clone()).async_function("nextCommand", move |_| {
+        let rx = cmd_rx.clone();
+        Ok(async move {
+            rx.recv()
+                .await
+                .map(HostValue::Str)
+                .map_err(|_| gpui_shell::HostError::new("closed"))
+        })
+    });
+    let policy = Policy::new()
+        .with_storage_path(staged.0.join("store-files-wake.json"))
+        .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+        .with_host_module(host_mod)
+        .unwrap();
+    let rt = ShellRuntime::new_isolated().unwrap();
+    let root = staged.wrapper("mods/files", "");
+    let w = cx.add_window(|_, _| Empty);
+
+    let mut session_slot = None;
+    w.update(cx, |_, window, cx| {
+        let mut session = DescriptionSession::load(rt, root, policy, window, cx).unwrap();
+        let initial = session.describe(window, cx).unwrap();
+        assert!(initial.contains("Select a file"), "expected empty detail pane initially: {initial}");
+        session_slot = Some(session);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    // Deliver open_request ONLY via nextCommand() — no runtime.refresh() before run_until_parked().
+    calls.borrow_mut().shared.insert(
+        "files.open_request".into(),
+        json!({ "seq": 1, "path": "/tmp/wake-a.rs", "line": 1, "end_line": 1 }),
+    );
+    cmd_tx.try_send("open_request".into()).unwrap();
+    cx.run_until_parked();
+
+    let mut session = session_slot.unwrap();
+    let mut tree_a = String::new();
+    w.update(cx, |_, window, cx| {
+        tree_a = session.describe(window, cx).unwrap();
+    })
+    .unwrap();
+    assert!(tree_a.contains("wake-a.rs"), "file A did not open via nextCommand: {tree_a}");
+    assert!(!tree_a.contains("Select a file"), "detail pane stayed empty: {tree_a}");
+
+    // Switch to file B via nextCommand() alone.
+    calls.borrow_mut().shared.insert(
+        "files.open_request".into(),
+        json!({ "seq": 2, "path": "/tmp/wake-b.py", "line": 2, "end_line": 2 }),
+    );
+    cmd_tx.try_send("open_request".into()).unwrap();
+    cx.run_until_parked();
+
+    let mut tree_b = String::new();
+    w.update(cx, |_, window, cx| {
+        tree_b = session.describe(window, cx).unwrap();
+        window.remove_window();
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(tree_b.contains("wake-b.py"), "file B did not open via nextCommand: {tree_b}");
+    assert!(!tree_b.contains("Loading file"), "file B stuck loading: {tree_b}");
+}
+
+#[gpui::test]
 fn files_switching_agent_a_to_b_and_back_to_a_restores_open_file_without_hanging_on_loading(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);
     let staged = Staged::new();

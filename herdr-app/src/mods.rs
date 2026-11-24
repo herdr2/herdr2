@@ -555,7 +555,7 @@ pub fn agent_order(available: Vec<String>) -> Vec<String> {
 }
 
 pub fn shared(key: &str) -> Option<Value> {
-    with_shared(|s| s.values.get(key).cloned())
+    with_shared(|s| s.get(key).cloned())
 }
 
 /// Sets a value every mod can read (persisted in shared.json); mods re-render.
@@ -568,9 +568,7 @@ pub fn set_shared(key: String, value: Value) {
 /// Sets an in-memory shared value without writing `shared.json` or broadcasting
 /// a full-app `Request::Refresh` to every mod (callers wake the target mod directly).
 pub fn set_shared_ephemeral(key: String, value: Value) {
-    with_shared(|s| {
-        s.values.insert(key, value);
-    });
+    with_shared(|s| s.set_ephemeral(key, value));
 }
 
 fn with_shared<R>(f: impl FnOnce(&mut SharedStore) -> R) -> R {
@@ -588,6 +586,7 @@ pub fn finish_shared() {
 
 struct SharedStore {
     values: serde_json::Map<String, Value>,
+    ephemeral: serde_json::Map<String, Value>,
     path: PathBuf,
     writable: bool,
     writer: Option<(std::sync::mpsc::Sender<String>, std::thread::JoinHandle<()>)>,
@@ -596,7 +595,7 @@ struct SharedStore {
 impl SharedStore {
     fn load(path: PathBuf) -> Self {
         let mut writable = true;
-        let values = match std::fs::read(&path) {
+        let mut values = match std::fs::read(&path) {
             Ok(bytes) => match serde_json::from_slice(&bytes) {
                 Ok(values) => values,
                 Err(error) => {
@@ -619,10 +618,23 @@ impl SharedStore {
                 serde_json::Map::new()
             }
         };
-        Self { values, path, writable, writer: None }
+        // Runtime-only request payloads must not survive restarts; stale high `seq`
+        // values from earlier versions would otherwise cause `Files` to drop new opens.
+        values.remove("files.open_request");
+        Self { values, ephemeral: serde_json::Map::new(), path, writable, writer: None }
+    }
+
+    fn get(&self, key: &str) -> Option<&Value> {
+        self.ephemeral.get(key).or_else(|| self.values.get(key))
+    }
+
+    fn set_ephemeral(&mut self, key: String, value: Value) {
+        self.values.remove(&key);
+        self.ephemeral.insert(key, value);
     }
 
     fn set(&mut self, key: String, value: Value) -> bool {
+        self.ephemeral.remove(&key);
         if self.values.get(&key) == Some(&value) {
             return false;
         }
@@ -1767,7 +1779,7 @@ fn module(inst: Instance, copy: u64) -> HostModule {
         .function("props", move |_| Ok(to_host(&props)))
         .function("shared", |a| {
             let k = a.string(0)?;
-            Ok(with_shared(|s| s.values.get(k).map(to_host).unwrap_or(HostValue::Null)))
+            Ok(with_shared(|s| s.get(k).map(to_host).unwrap_or(HostValue::Null)))
         })
         .function("setShared", |a| {
             set_shared(a.string(0)?.to_owned(), from_host(a.value(1)?));
@@ -1830,7 +1842,15 @@ fn capabilities() -> Capabilities {
 /// and its exec and write side effects warn.
 pub fn install_check_policy() {
     CHECKING.with(|c| c.set(true));
-    SHARED.with_borrow_mut(|slot| *slot = Some(SharedStore { values: Default::default(), path: app_dir().join("shared.json"), writable: false, writer: None }));
+    SHARED.with_borrow_mut(|slot| {
+        *slot = Some(SharedStore {
+            values: Default::default(),
+            ephemeral: Default::default(),
+            path: app_dir().join("shared.json"),
+            writable: false,
+            writer: None,
+        });
+    });
     install_policy();
 }
 
@@ -2140,6 +2160,38 @@ mod tests {
         assert_eq!(std::fs::read(&backup).unwrap(), corrupt);
         crate::persist::write_atomic(&path, "{}").unwrap();
         assert_eq!(std::fs::read(backup).unwrap(), corrupt);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn ephemeral_shared_values_never_persist_and_stale_open_request_is_stripped_on_load() {
+        let root = if cfg!(target_os = "linux") { crate::test_tmp() } else { std::env::temp_dir() };
+        let dir = root.join(format!("herdr-shared-ephemeral-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shared.json");
+        std::fs::write(
+            &path,
+            r#"{"kept":true,"files.open_request":{"seq":27,"path":"/tmp/old.rs"}}"#,
+        )
+        .unwrap();
+        let mut store = SharedStore::load(path.clone());
+        assert_eq!(store.get("kept"), Some(&json!(true)));
+        assert_eq!(store.get("files.open_request"), None);
+
+        store.set_ephemeral("files.open_request".into(), json!({"seq": 1, "path": "/tmp/new.rs"}));
+        assert_eq!(
+            store.get("files.open_request"),
+            Some(&json!({"seq": 1, "path": "/tmp/new.rs"}))
+        );
+        // Persisting another key must never serialize ephemeral values back into shared.json.
+        assert!(store.set("other".into(), json!("ok")));
+        store.finish();
+
+        let disk: serde_json::Map<String, Value> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(disk.get("kept"), Some(&json!(true)));
+        assert_eq!(disk.get("other"), Some(&json!("ok")));
+        assert!(!disk.contains_key("files.open_request"));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
