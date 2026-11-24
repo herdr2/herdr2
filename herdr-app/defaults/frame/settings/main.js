@@ -28,6 +28,14 @@ const SECTIONS = () => [
 ];
 
 const DROVE_BUILTIN_ROLES = ["coder", "tester", "writer", "illustrator", "reviewer", "researcher"];
+const DROVE_DEFAULT_ROLE_SUMMARIES_EN = {
+  "核心功能实现、模块重构与 Bug 修复": "Core feature implementation, module refactoring, and bug fixes",
+  "单元/集成测试编写、故障复现与回归验证": "Unit/integration tests, bug reproduction, and regression verification",
+  "技术文档、架构说明与图表撰写": "Technical docs, architecture specs, and diagram writing",
+  "架构图、流程图、时序图、SVG 矢量图与可视化配图绘制": "Architecture, flow & sequence diagrams, SVG vectors, and visual illustrations",
+  "只读异构代码审查、并发安全与架构审计": "Read-only cross-model code review, concurrency safety, and architecture audits",
+  "跨仓源码检索、架构摸底与日志分析": "Cross-repo code search, architecture discovery, and log analysis",
+};
 const DROVE_FALLBACK_AGENTS = ["claude", "codex", "agy", "gemini", "opencode", "qoder", "cursor", "kimi", "dsh"];
 const DROVE_EFFORTS = ["low", "medium", "high", "xhigh"];
 const DROVE_ROLE_STRENGTH_PRESETS = {
@@ -3496,9 +3504,10 @@ export default class Settings extends View {
                   ),
               ),
           )
-          .when(Boolean(role.summary), (el) =>
-            el.child(div().text_size(11.5).text_color(t.dim).child(role.summary)),
-          ),
+          .when(Boolean(role.summary), (el) => {
+            const summaryText = this.tr(DROVE_DEFAULT_ROLE_SUMMARIES_EN[role.summary] ?? role.summary, role.summary);
+            return el.child(div().text_size(11.5).text_color(t.dim).child(summaryText));
+          }),
       )
       .child(
         v_flex()

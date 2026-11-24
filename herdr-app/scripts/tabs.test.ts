@@ -306,6 +306,7 @@ test("pane header maximize button breaks out split pane into a standalone tab vi
     svg: element,
     image: element,
     h_flex: element,
+    v_flex: element,
     InputState: { new: () => ({ on() {}, value: () => "", set_value() {}, set_selected_range() {}, focus() {} }) },
     Input: { new: () => element() },
     panes: () => currentPanes,
@@ -314,6 +315,7 @@ test("pane header maximize button breaks out split pane into a standalone tab vi
     run(command: string, args: Record<string, unknown>) { paneRunCalls.push([command, args]); },
     h2() {},
     openOverlay() {},
+    shared: () => null,
     theme: () => ({}),
     home: () => "/home/me",
     layout: () => null,
@@ -451,6 +453,7 @@ test("tabs and pane headers show agent type (ACP / Terminal) and live/paused exe
     svg: element,
     image: element,
     h_flex: element,
+    v_flex: element,
     InputState: { new: () => ({ on() {}, value: () => "", set_value() {}, set_selected_range() {}, focus() {} }) },
     Input: { new: () => element() },
     panes: () => currentPanes,
@@ -459,6 +462,7 @@ test("tabs and pane headers show agent type (ACP / Terminal) and live/paused exe
     run() {},
     h2() {},
     openOverlay() {},
+    shared: () => null,
     theme: () => ({}),
     home: () => "/home/me",
     layout: () => null,
@@ -470,7 +474,7 @@ test("tabs and pane headers show agent type (ACP / Terminal) and live/paused exe
   )(...Object.values(paneValues));
   const paneView = new PaneCtor();
   let paneTimerCb: ((cx: any) => void) | null = null;
-  paneView.init({}, { timer: { every: (_ms: number, fn: (cx: any) => void) => { paneTimerCb = fn; } } });
+  paneView.init({}, { timer: { every: (ms: number, fn: (cx: any) => void) => { if (ms === 1000) paneTimerCb = fn; } } });
 
   // Lone ACP pane shows ACP badge and live timer (zh-CN).
   const acpPaneTree = paneView.render({});
@@ -602,6 +606,7 @@ test("pane header shows agent ID for manual terminal agents and clickable upstre
     svg: element,
     image: element,
     h_flex: element,
+    v_flex: element,
     InputState: { new: () => ({ on() {}, value: () => "", set_value() {}, set_selected_range() {}, focus() {} }) },
     Input: { new: () => element() },
     panes: () => paneList,
@@ -610,6 +615,7 @@ test("pane header shows agent ID for manual terminal agents and clickable upstre
     run: (cmd: string, args: unknown) => { runCalls.push([cmd, args]); },
     h2() {},
     openOverlay() {},
+    shared: () => null,
     theme: () => ({ accent: "#3b82f6", raised: "#222", border: "#333", hover: "#444", foreground: "#fff", muted: "#aaa", dim: "#777", background: "#111" }),
     home: () => "/home/me",
     layout: () => null,

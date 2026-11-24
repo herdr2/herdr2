@@ -20,9 +20,15 @@ const values: Record<string, any> = {
     disk.raw = text;
   },
 };
-const names = [...source.matchAll(/^import \{([^}]*)\}/gm)].flatMap(m => m[1].split(",").map(n => n.trim()));
+const names = [...source.matchAll(/^import\s*\{([\s\S]*?)\}\s*from\s*["'][^"']+["'];?/gm)]
+  .flatMap(m => m[1].split(",").map(n => n.trim()).filter(Boolean));
 const args = names.map(name => values[name] ?? (() => undefined));
-const Settings = new Function(...names, source.replace(/^import .*;\n/gm, "").replace("export default class Settings", "return class Settings"))(...args);
+const Settings = new Function(
+  ...names,
+  source
+    .replace(/^import\s+[\s\S]*?from\s+["'][^"']+["'];?\s*\n?/gm, "")
+    .replace("export default class Settings", "return class Settings"),
+)(...args);
 
 /** Runs `edit` through the Settings window's change() on `raw`; the toasts it posts. */
 async function change(raw: string | null, edit: (q: Record<string, any>) => void, fail?: string, readFail?: string) {
@@ -167,8 +173,8 @@ test("drove settings uses English Drove title, hides feedback button, and preser
   };
   const chain = view.roleChain(role);
   expect(chain).toEqual([
-    { agent: "codex", model: "gpt-6.1-sol", effort: "high", fast: true },
-    { agent: "claude", model: null, effort: "high" },
+    { agent: "codex", model: "gpt-6.1-sol", effort: "high", fast: true, strengths: [] },
+    { agent: "claude", model: null, effort: "high", strengths: [] },
   ]);
   view.applyRoleChain(role, chain);
   expect(role.primary).toEqual({ agent: "codex", model: "gpt-6.1-sol", effort: "high", fast: true });
@@ -199,7 +205,7 @@ test("cursor context sizing preserves context field and falls back by model fami
     fallbacks: [{ agent: "agy", model: "gemini-4-carbon-high", effort: "high" }],
   };
   const chain = view.roleChain(role);
-  expect(chain[0]).toEqual({ agent: "cursor", model: "grok-4.7", effort: "high", context: "500k" });
+  expect(chain[0]).toEqual({ agent: "cursor", model: "grok-4.7", effort: "high", context: "500k", strengths: [] });
   view.applyRoleChain(role, chain);
   expect(role.primary).toEqual({ agent: "cursor", model: "grok-4.7", effort: "high", context: "500k" });
 });

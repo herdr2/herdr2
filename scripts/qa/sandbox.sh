@@ -288,6 +288,7 @@ PY
   if [[ -z "${VK_ICD_FILENAMES:-}" && -f "/usr/share/vulkan/icd.d/lvp_icd.json" ]]; then
     export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/lvp_icd.json"
   fi
+  export HERDR2_DEV_DEFAULTS="$REPO_ROOT/herdr-app/defaults"
 
   # If already running, skip re-launching.
   if [[ -f "$APP_PID_FILE" ]]; then
@@ -376,6 +377,7 @@ cmd_app() {
   if [[ -z "${VK_ICD_FILENAMES:-}" && -f "/usr/share/vulkan/icd.d/lvp_icd.json" ]]; then
     export VK_ICD_FILENAMES="/usr/share/vulkan/icd.d/lvp_icd.json"
   fi
+  export HERDR2_DEV_DEFAULTS="$REPO_ROOT/herdr-app/defaults"
   exec "$APP_BIN" "$@"
 }
 
