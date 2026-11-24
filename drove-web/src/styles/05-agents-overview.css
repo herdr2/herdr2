@@ -868,6 +868,103 @@
   color: var(--st-failed);
   border-color: color-mix(in srgb, var(--st-failed) 40%, var(--border));
 }
+.circuit-pill {
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 7px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  font-size: 10px;
+  font-weight: 650;
+  line-height: 16px;
+  white-space: nowrap;
+}
+.circuit-pill--normal {
+  background: var(--surface-2);
+  color: var(--text-2);
+  border-color: var(--border-strong);
+}
+.circuit-pill--handoff {
+  background: var(--st-blocked-bg);
+  color: var(--st-blocked);
+  border-color: color-mix(in srgb, var(--st-blocked) 45%, var(--border));
+}
+.circuit-pill--post_handoff {
+  background: var(--role-reviewer-bg);
+  color: var(--role-reviewer);
+  border-color: var(--role-reviewer-border);
+}
+.circuit-pill--awaiting {
+  background: var(--st-failed-bg);
+  color: var(--st-failed);
+  border-color: color-mix(in srgb, var(--st-failed) 55%, var(--border));
+}
+.circuit-pill--cleared {
+  background: var(--st-done-bg);
+  color: var(--st-done);
+  border-color: color-mix(in srgb, var(--st-done) 40%, var(--border));
+}
+.circuit-banner {
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  margin-bottom: 10px;
+}
+.circuit-banner--handoff {
+  background: var(--st-blocked-bg);
+  border-color: color-mix(in srgb, var(--st-blocked) 45%, var(--border));
+}
+.circuit-banner--post_handoff {
+  background: var(--role-reviewer-bg);
+  border-color: var(--role-reviewer-border);
+}
+.circuit-banner--awaiting {
+  background: var(--st-failed-bg);
+  border-color: color-mix(in srgb, var(--st-failed) 50%, var(--border));
+}
+.circuit-banner__head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+.circuit-banner__title {
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--text);
+}
+.circuit-banner--handoff .circuit-banner__title {
+  color: var(--st-blocked);
+}
+.circuit-banner--post_handoff .circuit-banner__title {
+  color: var(--role-reviewer);
+}
+.circuit-banner--awaiting .circuit-banner__title {
+  color: var(--st-failed);
+}
+.circuit-banner__meta {
+  font-size: 11px;
+  color: var(--text-2);
+}
+.circuit-banner__desc {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.45;
+  color: var(--text-2);
+}
+.circuit-banner__history {
+  margin: 8px 0 0;
+  padding-left: 16px;
+  font-size: 11px;
+  line-height: 1.45;
+  color: var(--text-2);
+}
+.circuit-banner__history li + li {
+  margin-top: 3px;
+}
 .gnode__handle--review.react-flow__handle {
   background: var(--role-reviewer);
 }

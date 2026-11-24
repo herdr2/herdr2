@@ -137,7 +137,7 @@ cases:
       - "Open `help` via `app.help` / `mod.open --name help` and verify keybindings from `keys.json` render."
       - "Open `machine-add` via `mod.open --name machine-add`, capture `herdr2 shot`, and dismiss via `overlay.close`."
     oracles:
-      - "`help` groups and filters bindings cleanly; `machine-add` lists hosts parsed from `~/.ssh/config`."
+      - "`help` groups and filters bindings cleanly; `machine-add` lists hosts parsed from `~/.ssh/config`, auto-retries with `--install` on `h2_missing`/`hc_missing`/`incompatible` while blocking duplicate triggers during `installing`, and only falls back to terminal guidance when install or auth cannot complete."
     ai_probe_hints:
       - "Check `help` mod handles `keys.macos.json` vs `keys.json` per platform."
 
@@ -182,11 +182,11 @@ cases:
     preconditions:
       - "Running isolated Herdr2 window."
     steps:
-      - "Toggle `app.palette`, `app.welcome`, and `app.settings --section drove` (plus `look`, `keyboard`, `machines`, `ai`, `alerts`, `updates` sections)."
+      - "Toggle `app.palette`, `app.welcome`, and `app.settings --section drove` (plus `look`, `keyboard`, `machines`, `ai`, `skills`, `alerts`, `updates` sections)."
       - "Capture `herdr2 shot` on each frame screen."
     oracles:
       - "`palette` lists every command with its keybind and supports fuzzy filtering."
-      - "`welcome` renders 4-page onboarding cleanly; `settings` Drove tab shows Roles, AI Assistant, and optional Magpie Quota without exposing raw API keys."
+      - "`welcome` renders 4-page onboarding cleanly; `settings` Drove tab shows Roles, AI Assistant, and optional Magpie Quota without exposing raw API keys; `settings` Skills tab supports switching between local and non-temporary remote SSH machines (`--on <machine>`)."
     ai_probe_hints:
       - "Verify `settings` writes temp secret JSON with `--consume` rather than passing API keys on CLI argv."
 

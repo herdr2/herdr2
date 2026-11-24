@@ -749,19 +749,36 @@ Arguments:
   <TASK>  
 
 Options:
-      --hint <HINT>                  
-      --json                         JSON output even in a terminal
-      --role <ROLE>                  
-      --agent <AGENT>                
-      --model <MODEL>                
-      --effort <EFFORT>              
-      --review-agent <REVIEW_AGENT>  
-      --review-model <REVIEW_MODEL>  
-      --no-review                    
-      --fresh                        
-      --run <RUN>                    
-      --on <MACHINE>                 
-  -h, --help                         Print help
+      --hint <HINT>
+          
+      --json
+          JSON output even in a terminal
+      --role <ROLE>
+          
+      --agent <AGENT>
+          
+      --model <MODEL>
+          
+      --effort <EFFORT>
+          
+      --review-agent <REVIEW_AGENT>
+          
+      --review-model <REVIEW_MODEL>
+          
+      --no-review
+          
+      --fresh
+          
+      --user-override
+          Explicit user-approved override to bypass a tripped review hard circuit breaker (`awaiting_user_decision`)
+      --override-reason <OVERRIDE_REASON>
+          Optional audit note explaining the user's decision when passing `--user-override`
+      --run <RUN>
+          
+      --on <MACHINE>
+          
+  -h, --help
+          Print help
 ```
 
 ## h2 drove roles
@@ -1836,7 +1853,7 @@ Usage: h2 skill [OPTIONS] <COMMAND>
 Commands:
   status      Inspect detected coding agent skill directories and installed Herdr2 skill versions
   install     Install or update bundled Herdr2 companion skills (`herdr2`, `drove`, `drove-add`, `drove-setup`)
-  ai-install  Use built-in Core AI to inspect local coding agents and install Herdr2 skills automatically
+  ai-install  Use built-in Core AI to inspect local or remote coding agents and install Herdr2 skills automatically
   help        Print this message or the help of the given subcommand(s)
 
 Options:
@@ -1847,7 +1864,7 @@ Options:
 ## h2 skill ai-install
 
 ```text
-Use built-in Core AI to inspect local coding agents and install Herdr2 skills automatically
+Use built-in Core AI to inspect local or remote coding agents and install Herdr2 skills automatically
 
 Usage: h2 skill ai-install [OPTIONS]
 
@@ -1856,6 +1873,7 @@ Options:
       --query <TEXT>  Optional hint about a custom agent name or desired skill location
       --lang <LANG>   Preferred explanation language (`zh-CN` or `en`)
       --dry-run       Plan only without writing skill files to disk
+      --on <MACHINE>  Target remote machine (`h2 machine ls`)
   -h, --help          Print help
 ```
 
@@ -1869,9 +1887,11 @@ Usage: h2 skill install [OPTIONS]
 Options:
       --all              Install into all detected agent skill directories
       --json             JSON output even in a terminal
+      --detected-only    Only install into agents actually detected on disk/PATH (do not create fallback dirs)
       --agent <AGENT>    Target a specific known agent ID (antigravity, claude, codex, cursor, opencode, windsurf)
       --target <DIR>     Target a custom skills root directory
       --skills <SKILLS>  Comma-separated subset of skills to install (default: all bundled skills)
+      --on <MACHINE>     Target remote machine (`h2 machine ls`)
   -h, --help             Print help
 ```
 
@@ -1883,8 +1903,9 @@ Inspect detected coding agent skill directories and installed Herdr2 skill versi
 Usage: h2 skill status [OPTIONS]
 
 Options:
-      --json  JSON output even in a terminal
-  -h, --help  Print help
+      --json          JSON output even in a terminal
+      --on <MACHINE>  Target remote machine (`h2 machine ls`)
+  -h, --help          Print help
 ```
 
 ## h2 templates

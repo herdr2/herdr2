@@ -60,12 +60,19 @@ pub(crate) struct SkillCli {
 #[derive(Subcommand)]
 pub(crate) enum SkillAction {
     /// Inspect detected coding agent skill directories and installed Herdr2 skill versions.
-    Status,
+    Status {
+        /// Target remote machine (`h2 machine ls`).
+        #[arg(long, value_name = "MACHINE")]
+        on: Option<String>,
+    },
     /// Install or update bundled Herdr2 companion skills (`herdr2`, `drove`, `drove-add`, `drove-setup`).
     Install {
         /// Install into all detected agent skill directories.
         #[arg(long)]
         all: bool,
+        /// Only install into agents actually detected on disk/PATH (do not create fallback dirs).
+        #[arg(long)]
+        detected_only: bool,
         /// Target a specific known agent ID (antigravity, claude, codex, cursor, opencode, windsurf).
         #[arg(long, value_name = "AGENT")]
         agent: Option<String>,
@@ -75,8 +82,11 @@ pub(crate) enum SkillAction {
         /// Comma-separated subset of skills to install (default: all bundled skills).
         #[arg(long, value_delimiter = ',')]
         skills: Vec<String>,
+        /// Target remote machine (`h2 machine ls`).
+        #[arg(long, value_name = "MACHINE")]
+        on: Option<String>,
     },
-    /// Use built-in Core AI to inspect local coding agents and install Herdr2 skills automatically.
+    /// Use built-in Core AI to inspect local or remote coding agents and install Herdr2 skills automatically.
     AiInstall {
         /// Optional hint about a custom agent name or desired skill location.
         #[arg(long, value_name = "TEXT")]
@@ -87,6 +97,9 @@ pub(crate) enum SkillAction {
         /// Plan only without writing skill files to disk.
         #[arg(long)]
         dry_run: bool,
+        /// Target remote machine (`h2 machine ls`).
+        #[arg(long, value_name = "MACHINE")]
+        on: Option<String>,
     },
 }
 
@@ -467,11 +480,327 @@ fn status_out(home: &Path) -> Out {
     }
 }
 
+fn decode_base64(input: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(input.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u8 = 0;
+    for b in input.bytes() {
+        let val = match b {
+            b'A'..=b'Z' => b - b'A',
+            b'a'..=b'z' => b - b'a' + 26,
+            b'0'..=b'9' => b - b'0' + 52,
+            b'+' => 62,
+            b'/' => 63,
+            b'=' => break,
+            b' ' | b'\n' | b'\r' | b'\t' => continue,
+            _ => return None,
+        };
+        buf = (buf << 6) | u32::from(val);
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push(((buf >> bits) & 0xff) as u8);
+        }
+    }
+    Some(out)
+}
+
+fn decode_exec_field(res: &Value, key: &str) -> String {
+    res.get(key)
+        .and_then(Value::as_str)
+        .and_then(decode_base64)
+        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+        .unwrap_or_default()
+}
+
+fn sh_quote(arg: &str) -> String {
+    if !arg.is_empty() && arg.bytes().all(|b| b.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&b)) {
+        arg.to_string()
+    } else {
+        format!("'{}'", arg.replace('\'', "'\\''"))
+    }
+}
+
+fn remote_skill_exec(paths: &Paths, machine: &str, args: &[String]) -> Result<Value, RpcError> {
+    let quoted: Vec<String> = args.iter().map(|a| sh_quote(a)).collect();
+    let line = format!(
+        "p=$(command -v h2 || command -v herdr2-core || command -v herdr2 || echo \"$HOME/.local/bin/h2\"); \
+         [ -x \"$p\" ] || p=\"$HOME/.local/bin/herdr2\"; \
+         \"$p\" skill {} --json",
+        quoted.join(" ")
+    );
+    let r = call(paths, "machine.exec", json!({ "on": machine, "line": line }))?;
+    let stdout = decode_exec_field(&r, "stdout");
+    let stderr = decode_exec_field(&r, "stderr");
+    let code = r
+        .get("code")
+        .or_else(|| r.get("exit_code"))
+        .and_then(Value::as_i64)
+        .unwrap_or(-1);
+    if code != 0 {
+        let parsed_err = serde_json::from_str::<Value>(stderr.trim())
+            .or_else(|_| serde_json::from_str::<Value>(stdout.trim()))
+            .ok();
+        let msg = parsed_err
+            .as_ref()
+            .and_then(|v| v.pointer("/error/message").and_then(Value::as_str))
+            .map(String::from)
+            .unwrap_or_else(|| {
+                let raw = if !stderr.trim().is_empty() { stderr.trim() } else { stdout.trim() };
+                if raw.is_empty() { format!("remote h2 skill failed on {machine} (exit {code})") } else { raw.to_string() }
+            });
+        return Err(RpcError::new("unavailable", msg, format!("ensure {machine} runs an up-to-date h2 (`h2 machine update {machine}`)")));
+    }
+    serde_json::from_str::<Value>(stdout.trim()).map_err(|e| {
+        RpcError::internal(format!("invalid JSON from remote `h2 skill` on {machine}: {e}"))
+    })
+}
+
+fn validate_remote_target_dir(raw: &str, remote_home: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains("..") || trimmed.contains('\n') || trimmed.contains('\r') {
+        return None;
+    }
+    let home = remote_home.trim().trim_end_matches(['/', '\\']);
+    if home.is_empty() {
+        return None;
+    }
+    let expanded = if let Some(rest) = trimmed.strip_prefix("~/").or_else(|| trimmed.strip_prefix("~\\")) {
+        format!("{home}/{rest}")
+    } else if trimmed == "~" {
+        return None;
+    } else {
+        trimmed.to_string()
+    };
+    if expanded == home {
+        return None;
+    }
+    let sep_ok = expanded.starts_with(&format!("{home}/")) || expanded.starts_with(&format!("{home}\\"));
+    sep_ok.then_some(expanded)
+}
+
+fn run_remote_ai_install(
+    paths: &Paths,
+    machine: &str,
+    query: Option<String>,
+    lang: Option<String>,
+    dry_run: bool,
+) -> Result<Out, RpcError> {
+    let zh = lang.as_deref().unwrap_or("zh-CN").to_ascii_lowercase().starts_with("zh");
+    let status_val = remote_skill_exec(paths, machine, &["status".into()])?;
+    let remote_home = status_val.get("home").and_then(Value::as_str).unwrap_or("").to_string();
+    let detected = status_val.get("agents").cloned().unwrap_or_else(|| json!([]));
+
+    let system_prompt = "You are Herdr2's built-in Skill Installation Assistant for a remote SSH machine. \
+Given the remote machine's home directory, detected coding agent CLIs/config folders, and optional user request, \
+recommend the exact skill root directories on that remote machine (STRICTLY inside the remote user's home directory) where Herdr2's \
+bundled skills (`herdr2`, `drove`, `drove-add`, `drove-setup`) should be installed.\n\
+Return STRICT JSON only: \
+{\"targets\":[{\"agent\":\"claude\",\"path\":\"~/.claude/skills\",\"skills\":[\"herdr2\",\"drove\",\"drove-add\",\"drove-setup\"],\"reason\":\"...\"}],\"summary\":\"...\",\"tips\":[\"...\"]}. \
+Never suggest paths outside the remote home directory or containing '..'.";
+
+    let user_payload = json!({
+        "machine": machine,
+        "remoteHome": remote_home,
+        "language": if zh { "zh-CN" } else { "en" },
+        "bundledSkills": BUNDLED_SKILLS.iter().map(|s| s.id).collect::<Vec<_>>(),
+        "detectedAgents": detected,
+        "userHint": query.as_deref().unwrap_or(""),
+    });
+    let user_prompt = format!(
+        "Analyze this remote machine environment and produce the JSON installation plan (write summary & tips in {}):\n{}",
+        if zh { "Simplified Chinese" } else { "English" },
+        serde_json::to_string_pretty(&user_payload).unwrap_or_default()
+    );
+
+    // Use local Core AI (already configured in Welcome) so the remote server needs no API key.
+    let ai_res = call(
+        paths,
+        "ai.complete",
+        json!({
+            "op": "skill_install",
+            "systemPrompt": system_prompt,
+            "userPrompt": user_prompt,
+            "maxTokens": 1024,
+        }),
+    );
+
+    let mut used_ai = false;
+    let mut ai_model: Option<String> = None;
+    let mut ai_error: Option<String> = None;
+    let mut plan_summary = String::new();
+    let mut plan_tips: Vec<String> = Vec::new();
+    let mut targets: Vec<(String, String, Vec<String>, String)> = Vec::new();
+    let mut seen = BTreeSet::new();
+
+    match ai_res {
+        Ok(val) => {
+            ai_model = val.get("model").and_then(Value::as_str).map(String::from);
+            let content = val.get("content").and_then(Value::as_str).unwrap_or_default();
+            if let Some(json_str) = extract_json_object(content)
+                && let Ok(plan) = serde_json::from_str::<AiInstallPlan>(json_str)
+            {
+                used_ai = true;
+                plan_summary = plan.summary;
+                plan_tips = plan.tips;
+                for t in plan.targets {
+                    if let Some(valid_path) = validate_remote_target_dir(&t.path, &remote_home)
+                        && seen.insert(valid_path.clone())
+                    {
+                        let sks: Vec<String> = select_skills(&t.skills)
+                            .unwrap_or_else(|_| BUNDLED_SKILLS.iter().collect())
+                            .into_iter()
+                            .map(|s| s.id.to_string())
+                            .collect();
+                        let agent_name = if t.agent.trim().is_empty() { "custom".into() } else { t.agent.trim().to_string() };
+                        targets.push((agent_name, valid_path, sks, t.reason));
+                    }
+                }
+            } else {
+                ai_error = Some("AI returned unstructured output; fell back to remote agent detection.".into());
+            }
+        }
+        Err(err) => {
+            ai_error = Some(err.message);
+        }
+    }
+
+    if targets.is_empty() {
+        for a in status_val.get("agents").and_then(Value::as_array).into_iter().flatten() {
+            if a.get("detected").and_then(Value::as_bool) == Some(true)
+                && let Some(dir) = a.get("skillsDir").and_then(Value::as_str)
+                && seen.insert(dir.to_string())
+            {
+                let id = a.get("id").and_then(Value::as_str).unwrap_or("agent").to_string();
+                let name = a.get("name").and_then(Value::as_str).unwrap_or(&id).to_string();
+                targets.push((
+                    id,
+                    dir.to_string(),
+                    BUNDLED_SKILLS.iter().map(|s| s.id.to_string()).collect(),
+                    if zh { format!("检测到远端已安装 {name}") } else { format!("Detected {name} on {machine}") },
+                ));
+            }
+        }
+        if targets.is_empty() && !remote_home.is_empty() {
+            targets.push((
+                "antigravity".into(),
+                format!("{}/.gemini/skills", remote_home.trim_end_matches('/')),
+                BUNDLED_SKILLS.iter().map(|s| s.id.to_string()).collect(),
+                if zh { "默认远程技能目录".into() } else { "Default remote skills directory".into() },
+            ));
+        }
+    }
+
+    let mut applied = Vec::new();
+    let mut total_files = 0usize;
+    let mut latest_status = status_val;
+    for (agent_name, dir, sks, reason) in &targets {
+        if dry_run {
+            applied.push(json!({
+                "agent": agent_name,
+                "target": dir,
+                "skills": sks,
+                "reason": reason,
+                "files": [],
+            }));
+            continue;
+        }
+        let mut args = vec!["install".to_string(), "--target".to_string(), dir.clone()];
+        if !sks.is_empty() {
+            args.push("--skills".to_string());
+            args.push(sks.join(","));
+        }
+        let res = remote_skill_exec(paths, machine, &args)?;
+        total_files += res.get("installedCount").and_then(Value::as_u64).unwrap_or(0) as usize;
+        if let Some(st) = res.get("status") {
+            latest_status = st.clone();
+        }
+        let files = res
+            .pointer("/targets/0/files")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        applied.push(json!({
+            "agent": agent_name,
+            "target": dir,
+            "skills": sks,
+            "reason": reason,
+            "files": files,
+        }));
+    }
+
+    if plan_summary.is_empty() {
+        plan_summary = if zh {
+            format!("已在远程主机 {machine} 的 {} 个目录安装 {} 个 Skill 文件。", applied.len(), total_files)
+        } else {
+            format!("Installed {} skill file(s) across {} target(s) on {machine}.", total_files, applied.len())
+        };
+    }
+
+    Ok(Out {
+        json: json!({
+            "ok": true,
+            "machine": machine,
+            "usedAi": used_ai,
+            "model": ai_model,
+            "aiError": ai_error,
+            "dryRun": dry_run,
+            "summary": plan_summary,
+            "tips": plan_tips,
+            "targets": applied,
+            "installedCount": total_files,
+            "status": latest_status,
+        }),
+        human: plan_summary,
+    })
+}
+
 pub(crate) fn run(paths: &Paths, cli: SkillCli) -> Result<Out, RpcError> {
-    let home = user_home()?;
     match cli.action {
-        SkillAction::Status => Ok(status_out(&home)),
-        SkillAction::Install { all, agent, target, skills } => {
+        SkillAction::Status { on: Some(machine) } => {
+            let val = remote_skill_exec(paths, &machine, &["status".into()])?;
+            let detected = val.pointer("/summary/detectedAgents").and_then(Value::as_u64).unwrap_or(0);
+            let up_to_date = val.pointer("/summary/upToDateAgents").and_then(Value::as_u64).unwrap_or(0);
+            Ok(Out {
+                json: val,
+                human: format!("{machine}: {up_to_date}/{detected} detected agent(s) up to date"),
+            })
+        }
+        SkillAction::Install { all, detected_only, agent, target, skills, on: Some(machine) } => {
+            let mut args = vec!["install".to_string()];
+            if all {
+                args.push("--all".into());
+            }
+            if detected_only {
+                args.push("--detected-only".into());
+            }
+            if let Some(a) = agent {
+                args.push("--agent".into());
+                args.push(a);
+            }
+            if let Some(t) = target {
+                args.push("--target".into());
+                args.push(t.display().to_string());
+            }
+            if !skills.is_empty() {
+                args.push("--skills".into());
+                args.push(skills.join(","));
+            }
+            let val = remote_skill_exec(paths, &machine, &args)?;
+            let count = val.get("installedCount").and_then(Value::as_u64).unwrap_or(0);
+            Ok(Out {
+                json: val,
+                human: format!("installed {count} skill file(s) on {machine}"),
+            })
+        }
+        SkillAction::AiInstall { query, lang, dry_run, on: Some(machine) } => {
+            run_remote_ai_install(paths, &machine, query, lang, dry_run)
+        }
+        SkillAction::Status { on: None } => {
+            let home = user_home()?;
+            Ok(status_out(&home))
+        }
+        SkillAction::Install { all, detected_only, agent, target, skills, on: None } => {
+            let home = user_home()?;
             let selected = select_skills(&skills)?;
             let mut dirs: Vec<(String, PathBuf)> = Vec::new();
             if let Some(dir) = target {
@@ -494,7 +823,7 @@ pub(crate) fn run(paths: &Paths, cli: SkillCli) -> Result<Out, RpcError> {
                         dirs.push((a.id.clone(), PathBuf::from(&a.skills_dir)));
                     }
                 }
-                if dirs.is_empty() {
+                if dirs.is_empty() && !detected_only {
                     if all {
                         dirs.push(("antigravity".into(), join_rel(&home, &[".gemini", "skills"])));
                         dirs.push(("claude".into(), join_rel(&home, &[".claude", "skills"])));
@@ -515,11 +844,16 @@ pub(crate) fn run(paths: &Paths, cli: SkillCli) -> Result<Out, RpcError> {
                     "files": written,
                 }));
             }
-            let summary = dirs
-                .iter()
-                .map(|(label, dir)| format!("{label} ({})", dir.display()))
-                .collect::<Vec<_>>()
-                .join(", ");
+            let summary = if dirs.is_empty() {
+                "no local coding agents detected (skipped fallback due to --detected-only)".to_string()
+            } else {
+                let list = dirs
+                    .iter()
+                    .map(|(label, dir)| format!("{label} ({})", dir.display()))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!("installed {total_files} skill file(s) into {list}")
+            };
             Ok(Out {
                 json: json!({
                     "ok": true,
@@ -528,10 +862,11 @@ pub(crate) fn run(paths: &Paths, cli: SkillCli) -> Result<Out, RpcError> {
                     "targets": results,
                     "status": status_out(&home).json,
                 }),
-                human: format!("installed {} skill file(s) into {summary}", total_files),
+                human: summary,
             })
         }
-        SkillAction::AiInstall { query, lang, dry_run } => {
+        SkillAction::AiInstall { query, lang, dry_run, on: None } => {
+            let home = user_home()?;
             let detected = detect_agents_in(&home);
             let dir_hints = list_home_dot_hints(&home);
             let zh = lang.as_deref().unwrap_or("zh-CN").to_ascii_lowercase().starts_with("zh");
@@ -751,5 +1086,84 @@ mod tests {
         assert_eq!(extract_json_object(fenced), Some("{\"targets\":[],\"summary\":\"ok\"}"));
         let prose = "Here is the plan:\n{\"targets\":[],\"summary\":\"done\"}\nThanks!";
         assert_eq!(extract_json_object(prose), Some("{\"targets\":[],\"summary\":\"done\"}"));
+    }
+
+    #[test]
+    fn validate_remote_target_dir_enforces_remote_home_boundary() {
+        assert_eq!(
+            validate_remote_target_dir("~/.claude/skills", "/home/dev"),
+            Some("/home/dev/.claude/skills".into())
+        );
+        assert_eq!(
+            validate_remote_target_dir("/home/dev/.gemini/skills", "/home/dev/"),
+            Some("/home/dev/.gemini/skills".into())
+        );
+        assert_eq!(
+            validate_remote_target_dir(r"~\.codex\skills", r"C:\Users\dev\"),
+            Some(r"C:\Users\dev/.codex\skills".into())
+        );
+        assert_eq!(
+            validate_remote_target_dir(r"C:\Users\dev\.claude\skills", r"C:\Users\dev"),
+            Some(r"C:\Users\dev\.claude\skills".into())
+        );
+        // Reject sibling prefix collision, traversal, home itself, empty home, and newline injection.
+        assert_eq!(validate_remote_target_dir("/home/dev2/.claude/skills", "/home/dev"), None);
+        assert_eq!(validate_remote_target_dir("/home/dev", "/home/dev"), None);
+        assert_eq!(validate_remote_target_dir("~/../etc/skills", "/home/dev"), None);
+        assert_eq!(validate_remote_target_dir("/etc/skills", "/home/dev"), None);
+        assert_eq!(validate_remote_target_dir("~", "/home/dev"), None);
+        assert_eq!(validate_remote_target_dir("~/.claude/skills", "   "), None);
+        assert_eq!(validate_remote_target_dir("~/.claude/skills\nrm -rf /", "/home/dev"), None);
+    }
+
+    #[test]
+    fn sh_quote_escapes_unsafe_arguments_and_keeps_safe_tokens_plain() {
+        assert_eq!(sh_quote("--detected-only"), "--detected-only");
+        assert_eq!(sh_quote("/home/dev/.claude/skills"), "/home/dev/.claude/skills");
+        assert_eq!(sh_quote("herdr2,drove"), "herdr2,drove");
+        assert_eq!(sh_quote(""), "''");
+        assert_eq!(sh_quote("/home/my user/skills"), "'/home/my user/skills'");
+        assert_eq!(sh_quote("a'b;rm -rf /"), "'a'\\''b;rm -rf /'");
+    }
+
+    #[test]
+    fn decode_base64_and_exec_field_handle_valid_whitespace_and_invalid_inputs() {
+        assert_eq!(decode_base64("aGVsbG8=").as_deref(), Some(b"hello".as_slice()));
+        assert_eq!(decode_base64("aGVs\nbG8=\r\n").as_deref(), Some(b"hello".as_slice()));
+        assert_eq!(decode_base64(""), Some(Vec::new()));
+        assert_eq!(decode_base64("!!!not-b64!!!"), None);
+
+        let res = json!({
+            "stdout": "eyJvayI6dHJ1ZX0=",
+            "stderr": "bad!base64",
+        });
+        assert_eq!(decode_exec_field(&res, "stdout"), "{\"ok\":true}");
+        assert_eq!(decode_exec_field(&res, "stderr"), "");
+        assert_eq!(decode_exec_field(&res, "missing"), "");
+    }
+
+    #[test]
+    fn inspect_skills_dir_reports_partial_and_normalizes_crlf() {
+        let dir = std::env::temp_dir().join(format!("herdr2-skill-partial-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let skills_dir = dir.join("skills");
+
+        // Partial installation (only 2 of 4 skills, with CRLF line endings on one).
+        let subset = select_skills(&["herdr2".into(), "drove".into(), "herdr2".into()]).unwrap();
+        assert_eq!(subset.len(), 2);
+        write_skills_to_dir(&skills_dir, &subset).unwrap();
+        let crlf = SKILL_HERDR2.replace('\n', "\r\n");
+        std::fs::write(skills_dir.join("herdr2/SKILL.md"), crlf).unwrap();
+
+        let (st, inst, out, miss) = inspect_skills_dir(&skills_dir);
+        assert_eq!(st, "partial");
+        assert_eq!(inst, vec!["herdr2", "drove"]);
+        assert!(out.is_empty());
+        assert_eq!(miss, vec!["drove-add", "drove-setup"]);
+
+        // Unknown skill filter fails cleanly.
+        assert!(select_skills(&["nonexistent".into()]).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

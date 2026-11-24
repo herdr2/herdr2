@@ -985,6 +985,13 @@ pub fn addSimd(
             // -fno-autolink also drops UCRT's /alternatename fallback.
             "-D_Avx2WmemEnabledWeakValue=_Avx2WmemEnabled",
             "-fno-autolink",
+            // MSVC 14.52+ (VS 2026 on windows-latest) rejects Clang < 22 unless
+            // _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH is set; Zig 0.16 also
+            // treats unused -nostdinc++ and empty HWY_BEFORE_NAMESPACE() blocks
+            // in src/simd/vt.h as errors under MSVC.
+            "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH",
+            "-Wno-unused-command-line-argument",
+            "-Wno-pragma-clang-attribute",
         });
 
         m.addCSourceFiles(.{

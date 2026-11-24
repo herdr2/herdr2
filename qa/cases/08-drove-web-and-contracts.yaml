@@ -49,6 +49,7 @@ cases:
     oracles:
       - "Zero uncaught console/page errors or broken SVG/CSS assets across all 7 pages."
       - "URL query params (`?page=`, `?task=`, `?worker=`, `?tab=`, `?sel=`) round-trip accurately via `buildWorkbenchHref` / `readWorkbenchLocation`."
+      - "Review Circuit Breaker pills/banners (`ReviewsView` & `TasksView`), `attention` filter, and `buildCoordinatorAttention` accurately surface `handoff_to_coordinator`, `post_handoff_review`, `awaiting_user_decision`, and `cleared` states in both `zh` and `en`."
     ai_probe_hints:
       - "Verify `?tab=gates` legacy alias maps cleanly to `stalls`."
 
@@ -191,7 +192,7 @@ cases:
       - "Repo checkout with `herdr-app/defaults/layouts/*.json`, `defaults/mods/*`, `drove-web/src/types.ts`, and `herdr-core/crates/herdr2/src/drove/types.rs`."
     steps:
       - "Scan all `defaults/layouts/*.json` mod references and verify every referenced mod exists in `defaults/mods/`."
-      - "Compare `drove-web/src/types.ts` union/enum values (`TaskStatus`, `WorkerState`, `MessageType`, `BuiltInWorkerRole`) against `drove/types.rs`."
+      - "Compare `drove-web/src/types.ts` union/enum values (`TaskStatus`, `WorkerState`, `MessageType`, `BuiltInWorkerRole`, `ReviewCircuitStage`, `ReviewCircuit`) against `drove/types.rs`."
     oracles:
       - "Zero dangling mod references in shipped layouts."
       - "Zero enum/field drift between Rust Drove types and TypeScript Drove Web types."

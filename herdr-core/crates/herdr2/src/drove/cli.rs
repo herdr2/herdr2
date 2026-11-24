@@ -1954,6 +1954,7 @@ mod tests {
             vec!["drove", "inbox", "--run", "run_1"],
             vec!["drove", "inbox", "run_1"],
             vec!["drove", "inspect", "task1", "--tail", "80"],
+            vec!["drove", "retry", "final-review", "--user-override", "--override-reason", "user approved"],
             vec!["drove", "settings", "--section", "roles", "--compact"],
         ] {
             let parsed = StandaloneCli::try_parse_from(args.clone())
@@ -2021,5 +2022,49 @@ mod tests {
         assert_eq!(compact["needsAttention"], true);
         assert_eq!(compact["reviewVerdicts"][0]["taskKey"], "review");
         assert_eq!(compact["reviewVerdicts"][0]["verdict"], "changes_requested");
+    }
+
+    #[test]
+    fn compact_show_and_wait_human_surface_review_circuits() {
+        let raw = json!({
+            "run": { "id": "run_1", "status": "active" },
+            "tasks": [
+                {
+                    "id": "tsk_rev",
+                    "key": "final-review",
+                    "status": "succeeded",
+                    "spec": { "change": "long spec" },
+                    "reviewCircuit": {
+                        "stage": "awaiting_user_decision",
+                        "reviewRounds": 3,
+                        "maxNormalRounds": 2,
+                        "handoffToCoordinator": true,
+                        "postHandoffReviewUsed": true,
+                        "awaitingUserDecision": true
+                    }
+                }
+            ],
+            "messages": []
+        });
+        let compact = compact_show_snapshot(raw);
+        assert_eq!(compact["needsAttention"], true);
+        assert_eq!(compact["reviewCircuits"][0]["taskKey"], "final-review");
+        assert_eq!(compact["reviewCircuits"][0]["stage"], "awaiting_user_decision");
+        assert_eq!(compact["reviewCircuits"][0]["reviewRounds"], 3);
+
+        let wait_line = format_wait_human(
+            "run_1",
+            &json!({
+                "settled": true,
+                "timedOut": false,
+                "needsAttention": true,
+                "messages": [],
+                "reviewCircuits": compact["reviewCircuits"]
+            }),
+        );
+        assert!(
+            wait_line.contains("reviewCircuits=[final-review:awaiting_user_decision(r3/2)]"),
+            "unexpected wait line: {wait_line}"
+        );
     }
 }

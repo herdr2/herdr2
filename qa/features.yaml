@@ -232,8 +232,9 @@ features:
       Non-agent command execution (`machine.exec`), atomic file operations (`file.read`,
       `file.write`, `file.edit`), versioned JSON document store (`doc.get`, `doc.set` with 1 MiB
       limit and optimistic conflict checking), `agent.put` isolated staging, SSH machine federation
-      (`machine.add`, `machine.list`, `machine.connect`, `machine.rename`, `machine.rm`), and
-      release self-update (`releases.rs`).
+      (`machine.add`, `machine.list`, `machine.connect`, `machine.rename`, `machine.rm`) with
+      automatic remote companion skill sync (`--detected-only`), local & remote `h2 skill`
+      management (`status`/`install`/`ai-install --on`), and release self-update (`releases.rs`).
     tiers: [L1-core-isolated]
     source_globs:
       - "herdr-core/crates/herdr2/src/exec.rs"
@@ -243,6 +244,7 @@ features:
       - "herdr-core/crates/herdr2/src/machines.rs"
       - "herdr-core/crates/herdr2/src/remote.rs"
       - "herdr-core/crates/herdr2/src/releases.rs"
+      - "herdr-core/crates/herdr2/src/cli/skill.rs"
     covers:
       rpc:
         - machine.exec
@@ -279,6 +281,8 @@ features:
       - "herdr-core/crates/herdr2/src/drove/notify.rs"
       - "herdr-core/crates/herdr2/src/drove/store.rs"
       - "herdr-core/crates/herdr2/src/drove/cli.rs"
+      - "herdr-core/crates/herdr2/src/drove/protocol.rs"
+      - "herdr-core/crates/herdr2/src/drove/diagnose.rs"
     covers:
       rpc:
         - drove.subscribe
@@ -293,8 +297,10 @@ features:
       Drove worker OS process sandboxing (`bwrap` on Linux, `sandbox-exec` on macOS,
       `restricted-token` on Windows) protecting `secrets/` and `drove.json`, `roles.rs`
       `readonly`/`scoped_write` diff violation (`422 role_scope_violation`), `verify.rs` gate &
-      stagnant output hash tracking, serialized Git/AOSP worktree merge-back, and multi-round
-      adversarial `review.rs` (R1 full diff, R2+ delta diff).
+      stagnant output hash tracking, serialized Git/AOSP worktree merge-back, multi-round
+      adversarial `review.rs` (R1 full diff, R2+ delta diff), and three-stage Review Circuit
+      Breaker (`handoff_to_coordinator` -> single `post_handoff_review` 1/1 ->
+      `awaiting_user_decision` hard stop with `--user-override` & `complete --force`).
     tiers: [L1-core-isolated]
     source_globs:
       - "herdr-core/crates/herdr2/src/drove/sandbox.rs"
@@ -605,6 +611,7 @@ features:
     source_globs:
       - "drove-web/src/**/*.ts"
       - "drove-web/src/**/*.tsx"
+      - "drove-web/src/styles/*.css"
       - "herdr-core/crates/herdr2/src/drove/http.rs"
       - "herdr-core/crates/herdr2/src/drove/remote.rs"
     covers:

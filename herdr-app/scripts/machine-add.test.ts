@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 const source = await readFile(new URL("../defaults/mods/machine-add/main.js", import.meta.url), "utf8");
 
-function setup(result: any) {
+function setup(result: any, installResult?: any) {
   const calls: string[][] = [];
   const overlays: unknown[] = [];
   const machines: any[] = [];
@@ -20,13 +20,14 @@ function setup(result: any) {
     openOverlay: (...args: unknown[]) => overlays.push(args),
     exec: async (_cmd: string, _args: string[], options: any) => {
       probes.push(options.on);
-      return { stdout: "Darwin\n/remote/herdr-core\n" };
+      return { stdout: "Darwin\n/remote/h2\n" };
     },
     hc: async (args: string[]) => {
       calls.push(args);
       if (args[1] === "add") {
-        if (result.code === 0) machines.push({ target: args[2], name: args[2] });
-        return result;
+        const res = args.includes("--install") && installResult !== undefined ? installResult : result;
+        if (res.code === 0) machines.push({ target: args[2], name: args[2] });
+        return res;
       }
       return { code: 0, stdout: JSON.stringify({ machines }) };
     },
@@ -50,13 +51,47 @@ function setup(result: any) {
   };
 }
 
-for (const kind of ["hc_missing", "incompatible", "login_needed", "auth_failed", "host_key"]) {
-  test(`${kind} gives terminal instructions without starting a terminal`, async () => {
+for (const kind of ["h2_missing", "hc_missing", "incompatible"]) {
+  test(`${kind} automatically retries with --install and succeeds without terminal guidance`, async () => {
+    const s = setup(
+      { code: 1, stdout: JSON.stringify({ error: { kind, message: "missing h2" } }) },
+      { code: 0, stdout: "{}" },
+    );
+    await s.add();
+    expect(s.calls.some((args) => args[0] === "machine" && args[1] === "add" && args.includes("--install"))).toBe(true);
+    expect(s.view.isAdded("my-host")).toBe(true);
+    expect(s.view.state["my-host"]).toBeUndefined();
+    expect(s.view.pending.size).toBe(0);
+  });
+}
+
+for (const kind of ["login_needed", "auth_failed", "host_key"]) {
+  test(`${kind} does not auto-retry with --install`, async () => {
+    const s = setup(
+      { code: 1, stdout: JSON.stringify({ error: { kind, message: "auth needed" } }) },
+      { code: 0, stdout: "{}" },
+    );
+    await s.add();
+    expect(s.calls.some((args) => args.includes("--install"))).toBe(false);
+    expect(s.view.pending.has("my-host")).toBe(true);
+  });
+}
+
+test("add() ignores duplicate triggers while a host is installing", async () => {
+  const s = setup({ code: 0, stdout: "{}" });
+  s.view.state["my-host"] = "installing";
+  const before = s.calls.length;
+  s.view.add("my-host", { notify() {}, spawn() { throw new Error("should not spawn while installing"); } });
+  expect(s.calls.length).toBe(before);
+});
+
+for (const kind of ["h2_missing", "hc_missing", "incompatible", "login_needed", "auth_failed", "host_key"]) {
+  test(`${kind} gives terminal instructions when automatic add/install cannot complete`, async () => {
     const s = setup({ code: 1, stdout: JSON.stringify({ error: { kind, message: "needs attention" } }) });
     await s.add();
     expect(s.view.state["my-host"]).toContain("Couldn't add my-host here");
-    expect(s.view.state["my-host"]).toContain("`hc machine add my-host`");
-    expect(s.view.state["my-host"]).toContain("`hc machine --help`");
+    expect(s.view.state["my-host"]).toContain("`h2 machine add --install my-host`");
+    expect(s.view.state["my-host"]).toContain("`h2 machine --help`");
     expect(s.view.isAdded("my-host")).toBe(false);
     expect(s.calls.every((args) => args[0] === "machine")).toBe(true);
     expect(s.overlays).toEqual([]);
@@ -67,7 +102,7 @@ for (const message of ["Enter password", "Enter passphrase", "new host key", "Pe
   test(`${message} also gives instructions`, async () => {
     const s = setup({ code: 1, stderr: JSON.stringify({ error: { kind: "other", message } }) });
     await s.add();
-    expect(s.view.state["my-host"]).toContain("`hc machine add my-host`");
+    expect(s.view.state["my-host"]).toContain("`h2 machine add --install my-host`");
   });
 }
 
@@ -78,7 +113,7 @@ for (const [target, quoted] of [
   test(`instructions quote ${target} as one shell argument`, async () => {
     const s = setup({ code: 1, stdout: JSON.stringify({ error: { kind: "host_key" } }) });
     await s.add(target);
-    expect(s.view.state[target]).toContain(`\`hc machine add ${quoted}\``);
+    expect(s.view.state[target]).toContain(`\`h2 machine add --install ${quoted}\``);
     expect(s.calls.find((args) => args[1] === "add")?.[2]).toBe(target);
     const shell = Bun.spawnSync(["sh", "-c", `printf '%s' ${quoted}`]);
     expect(shell.exitCode).toBe(0);
@@ -91,7 +126,7 @@ test("pending guidance clears when another terminal adds the host and checks Mac
   await s.add();
   await s.poll();
   expect(s.view.pending.has("my-host")).toBe(true);
-  expect(s.view.state["my-host"]).toContain("hc machine add my-host");
+  expect(s.view.state["my-host"]).toContain("h2 machine add --install my-host");
   expect(s.probes).toEqual([]);
   s.machines.push({ target: "my-host", name: "remote" });
   await s.poll();
@@ -99,7 +134,7 @@ test("pending guidance clears when another terminal adds the host and checks Mac
   expect(s.view.state["my-host"]).toBeUndefined();
   expect(s.view.pending.size).toBe(0);
   expect(s.view.typed).toBe("");
-  expect(s.view.macs["my-host"]).toEqual({ name: "remote", core: "/remote/herdr-core" });
+  expect(s.view.macs["my-host"]).toEqual({ name: "remote", core: "/remote/h2" });
   expect(s.probes).toEqual(["remote"]);
   const count = s.calls.length;
   await s.poll();

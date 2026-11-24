@@ -246,6 +246,7 @@ cases:
       - "Forward `machine.exec` and `file.read` with `on: 'box-renamed'`, then remove via `machine.rm`."
     oracles:
       - "`machine.add` rejects duplicate host/name (`already_added` / `name_taken`) and missing `h2` (`h2_missing`)."
+      - "`machine add --install` installs `h2`, probes Unix/Windows legacy binary paths cleanly, and runs best-effort `skill install --all --detected-only` (populates detected agent dirs without creating fallback dirs)."
       - "Renamed machine routes `on: 'box-renamed'` calls cleanly; `machine.rm` forgets local alias without killing remote agents."
     ai_probe_hints:
       - "Test `--temp` machine flag to verify `herdr-app` hides temporary sandbox machines from `spaces()`."
@@ -295,3 +296,29 @@ cases:
       - "`h2 update` validates version ordering, refuses unforced downgrade, and swaps binary cleanly with kept-agent resumption."
     ai_probe_hints:
       - "Never overwrite the system-installed `herdr2`; run strictly against a temp sandbox copy."
+
+  - id: TC-CORE-058
+    feature: F09
+    title: 本地与跨机 Companion Skill 管理与 AI 智能安装 (h2 skill status/install/ai-install --detected-only --on)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [machine.exec, ai.complete]
+      cli: ["h2 skill status", "h2 skill install", "h2 skill ai-install"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated local daemon connected to mocked SSH remote daemon `rohan`, plus local mock OpenAI HTTP server configured on local Core AI only."
+    steps:
+      - "Run `h2 skill status --json` and `h2 skill install --all --detected-only` on clean HOME and on HOME containing `.claude`."
+      - "Run `h2 skill status --on rohan` and `h2 skill install --on rohan --all --detected-only` and `--target <dir with spaces> --skills herdr2,drove-setup`."
+      - "Run `h2 skill ai-install --on rohan --dry-run` with mock AI returning both `~/.claude/skills` and traversal/outside-home paths (`~/../etc/skills`, `/etc/herdr2-skills`), then apply and also test unstructured AI output fallback."
+    oracles:
+      - "`--detected-only` never creates fallback `.gemini`/`.claude` directories when no agent is detected."
+      - "Remote `--on <machine>` quotes shell arguments safely and uses local Core AI so remote hosts need no API key."
+      - "`validate_remote_target_dir` strictly rejects `..` traversal, sibling prefix collisions, and paths outside remote home; unstructured AI responses fall back cleanly to detected remote agents."
+    ai_probe_hints:
+      - "Verify CRLF-normalized comparison marks skills `up_to_date` across Windows/Unix line endings."

@@ -5,10 +5,10 @@
 ## Summary
 
 - **Features**: 19
-- **Test Cases**: 89
-- **By Tier**: `L0-static`: 4, `L1-core-isolated`: 56, `L2-app-sandbox`: 23, `L3-web-e2e`: 4, `L4-live-llm`: 2
-- **By Mode**: `ai-exploratory`: 2, `hybrid`: 21, `scripted`: 66
-- **By Priority**: `P0`: 54, `P1`: 27, `P2`: 8
+- **Test Cases**: 90
+- **By Tier**: `L0-static`: 4, `L1-core-isolated`: 57, `L2-app-sandbox`: 23, `L3-web-e2e`: 4, `L4-live-llm`: 2
+- **By Mode**: `ai-exploratory`: 2, `hybrid`: 21, `scripted`: 67
+- **By Priority**: `P0`: 54, `P1`: 28, `P2`: 8
 
 ## Feature Coverage
 
@@ -22,7 +22,7 @@
 | `F06` | `herdr-core` | 交互式 PTY 终端、Holder 与 Ghostty VT 镜像 | L1-core-isolated | 8 | 16 / 0 / 0 / 0 |
 | `F07` | `herdr-core` | 上下文 Handoff、Fork、侧聊与代码评审交付 | L1-core-isolated | 3 | 6 / 0 / 0 / 0 |
 | `F08` | `herdr-core` | 隐藏 Git Ref 检查点、纯增量 Diff 与回滚二分 | L1-core-isolated | 3 | 6 / 0 / 0 / 0 |
-| `F09` | `herdr-core` | 文件、文档、命令执行与跨机 SSH 联邦 | L1-core-isolated | 6 | 15 / 0 / 0 / 0 |
+| `F09` | `herdr-core` | 文件、文档、命令执行与跨机 SSH 联邦 | L1-core-isolated | 7 | 16 / 0 / 0 / 0 |
 | `F10` | `herdr-core` | Drove 单守护进程多智能体 DAG 编排与 Worker 协议 | L1-core-isolated, L4-live-llm | 4 | 1 / 0 / 0 / 0 |
 | `F11` | `herdr-core` | Drove 隔离沙盒、角色权限围栏、Worktree 合并与对抗评审 | L1-core-isolated | 4 | 0 / 0 / 0 / 0 |
 | `F12` | `herdr-core` | 共享 Core AI 运行时、KV-Cache 复用与 Drove 智能配置 | L1-core-isolated, L4-live-llm | 4 | 17 / 0 / 0 / 0 |
@@ -148,9 +148,9 @@ Hidden Git ref checkpoints (`checkpoint.list`, `checkpoint.capture`, `checkpoint
 
 ### F09: 文件、文档、命令执行与跨机 SSH 联邦
 
-Non-agent command execution (`machine.exec`), atomic file operations (`file.read`, `file.write`, `file.edit`), versioned JSON document store (`doc.get`, `doc.set` with 1 MiB limit and optimistic conflict checking), `agent.put` isolated staging, SSH machine federation (`machine.add`, `machine.list`, `machine.connect`, `machine.rename`, `machine.rm`), and release self-update (`releases.rs`).
+Non-agent command execution (`machine.exec`), atomic file operations (`file.read`, `file.write`, `file.edit`), versioned JSON document store (`doc.get`, `doc.set` with 1 MiB limit and optimistic conflict checking), `agent.put` isolated staging, SSH machine federation (`machine.add`, `machine.list`, `machine.connect`, `machine.rename`, `machine.rm`) with automatic remote companion skill sync (`--detected-only`), local & remote `h2 skill` management (`status`/`install`/`ai-install --on`), and release self-update (`releases.rs`).
 
-**Source globs**: `herdr-core/crates/herdr2/src/exec.rs`, `herdr-core/crates/herdr2/src/files.rs`, `herdr-core/crates/herdr2/src/api/doc.rs`, `herdr-core/crates/herdr2/src/put.rs`, `herdr-core/crates/herdr2/src/machines.rs`, `herdr-core/crates/herdr2/src/remote.rs`, `herdr-core/crates/herdr2/src/releases.rs`
+**Source globs**: `herdr-core/crates/herdr2/src/exec.rs`, `herdr-core/crates/herdr2/src/files.rs`, `herdr-core/crates/herdr2/src/api/doc.rs`, `herdr-core/crates/herdr2/src/put.rs`, `herdr-core/crates/herdr2/src/machines.rs`, `herdr-core/crates/herdr2/src/remote.rs`, `herdr-core/crates/herdr2/src/releases.rs`, `herdr-core/crates/herdr2/src/cli/skill.rs`
 
 | ID | Title | Tier | Mode | Priority | Platforms | Covers |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -160,12 +160,13 @@ Non-agent command execution (`machine.exec`), atomic file operations (`file.read
 | `TC-CORE-043` | 跨机 SSH 联邦生命周期：添加、列举、重连、重命名与移除 (machine.add/list/connect/rename/rm) | `L1-core-isolated` | `hybrid` | `P1` | linux, macos, windows | rpc:5 |
 | `TC-CORE-044` | 远程目标路径前缀解析与 Viewer 中继 (Remote machine/addr routing & remote viewer relay) | `L1-core-isolated` | `hybrid` | `P2` | linux, macos, windows | rpc:3 |
 | `TC-CORE-045` | 本地 Release 服务与 h2 update 升级回退检查 (releases.rs & h2 update --from / version guard) | `L1-core-isolated` | `scripted` | `P2` | linux, macos, windows | rpc:1 |
+| `TC-CORE-058` | 本地与跨机 Companion Skill 管理与 AI 智能安装 (h2 skill status/install/ai-install --detected-only --on) | `L1-core-isolated` | `scripted` | `P1` | linux, macos, windows | rpc:2 |
 
 ### F10: Drove 单守护进程多智能体 DAG 编排与 Worker 协议
 
 Native Rust `DroveRuntime` orchestrator: DAG scheduling (`foreach`, `foreachFrom`, `when`, `triggerRule`, `kind: exec`), warm worker pool reuse (`PoolSignal` lock-free sync), silence stall watchdogs, coordinator wakeups, `drove.subscribe` framed event stream, and worker protocol (`context`, `inbox`, `ask`, `note`, `read`, `done`) with token/attempt auth.
 
-**Source globs**: `herdr-core/crates/herdr2/src/drove/mod.rs`, `herdr-core/crates/herdr2/src/drove/scheduler.rs`, `herdr-core/crates/herdr2/src/drove/router.rs`, `herdr-core/crates/herdr2/src/drove/pool.rs`, `herdr-core/crates/herdr2/src/drove/routes.rs`, `herdr-core/crates/herdr2/src/drove/notify.rs`, `herdr-core/crates/herdr2/src/drove/store.rs`, `herdr-core/crates/herdr2/src/drove/cli.rs`
+**Source globs**: `herdr-core/crates/herdr2/src/drove/mod.rs`, `herdr-core/crates/herdr2/src/drove/scheduler.rs`, `herdr-core/crates/herdr2/src/drove/router.rs`, `herdr-core/crates/herdr2/src/drove/pool.rs`, `herdr-core/crates/herdr2/src/drove/routes.rs`, `herdr-core/crates/herdr2/src/drove/notify.rs`, `herdr-core/crates/herdr2/src/drove/store.rs`, `herdr-core/crates/herdr2/src/drove/cli.rs`, `herdr-core/crates/herdr2/src/drove/protocol.rs`, `herdr-core/crates/herdr2/src/drove/diagnose.rs`
 
 | ID | Title | Tier | Mode | Priority | Platforms | Covers |
 | --- | --- | --- | --- | --- | --- | --- |
@@ -176,7 +177,7 @@ Native Rust `DroveRuntime` orchestrator: DAG scheduling (`foreach`, `foreachFrom
 
 ### F11: Drove 隔离沙盒、角色权限围栏、Worktree 合并与对抗评审
 
-Drove worker OS process sandboxing (`bwrap` on Linux, `sandbox-exec` on macOS, `restricted-token` on Windows) protecting `secrets/` and `drove.json`, `roles.rs` `readonly`/`scoped_write` diff violation (`422 role_scope_violation`), `verify.rs` gate & stagnant output hash tracking, serialized Git/AOSP worktree merge-back, and multi-round adversarial `review.rs` (R1 full diff, R2+ delta diff).
+Drove worker OS process sandboxing (`bwrap` on Linux, `sandbox-exec` on macOS, `restricted-token` on Windows) protecting `secrets/` and `drove.json`, `roles.rs` `readonly`/`scoped_write` diff violation (`422 role_scope_violation`), `verify.rs` gate & stagnant output hash tracking, serialized Git/AOSP worktree merge-back, multi-round adversarial `review.rs` (R1 full diff, R2+ delta diff), and three-stage Review Circuit Breaker (`handoff_to_coordinator` -> single `post_handoff_review` 1/1 -> `awaiting_user_decision` hard stop with `--user-override` & `complete --force`).
 
 **Source globs**: `herdr-core/crates/herdr2/src/drove/sandbox.rs`, `herdr-core/crates/herdr2/src/drove/roles.rs`, `herdr-core/crates/herdr2/src/drove/verify.rs`, `herdr-core/crates/herdr2/src/drove/integrate.rs`, `herdr-core/crates/herdr2/src/drove/review.rs`
 
@@ -185,7 +186,7 @@ Drove worker OS process sandboxing (`bwrap` on Linux, `sandbox-exec` on macOS, `
 | `TC-CORE-050` | Drove OS 进程沙盒隔离：secrets 遮蔽与 readonly 挂载保护 (Sandbox isolation for secrets/, drove.json & readonly) | `L1-core-isolated` | `scripted` | `P0` | linux, macos, windows | - |
 | `TC-CORE-051` | 角色权限围栏：readonly 与 scoped_write 越界拦截 (Role scope diff guard 422 role_scope_violation) | `L1-core-isolated` | `scripted` | `P0` | linux, macos, windows | - |
 | `TC-CORE-052` | Verify Gate 门禁、Stagnant 输出哈希与并行 Worktree 合并互斥锁 (Verify gate, stagnant hash & worktree merge mutex) | `L1-core-isolated` | `scripted` | `P0` | linux, macos, windows | - |
-| `TC-CORE-053` | 对抗式多轮 Review：R1 Full Diff 与 R2+ Delta Diff 及 maxRounds 上限 (Adversarial review R1/R2+ & maxRounds) | `L1-core-isolated` | `scripted` | `P0` | linux, macos, windows | - |
+| `TC-CORE-053` | 对抗式多轮 Review 与三段式熔断接管协议 (Adversarial review R1/R2+, circuit breaker & --user-override) | `L1-core-isolated` | `scripted` | `P0` | linux, macos, windows | - |
 
 ### F12: 共享 Core AI 运行时、KV-Cache 复用与 Drove 智能配置
 
@@ -273,7 +274,7 @@ Local control socket `$HERDR2_APP_HOME/herdr2-app.sock` (`control.rs`: `commands
 
 Localhost HTTP/1.1 + SSE server (`127.0.0.1:7799` / `H2_DROVE_PORT`) and React workbench (`drove-web/src/`): 7 pages (`dag`, `coordinator`, `tasks`, `workers`, `reviews`, `daemon`, `agents`), `Host` header & `window.__DROVE_TOKEN__` auth, `405 configured_in_app` enforcement on `PUT /api/agents` & `PUT /api/ai/config`, real-time SSE `/api/events`, `?on=<machine>` / `<machine>/<id>` SSH proxy (`drove.http_proxy`, `drove.web.open`), DAG `normalizeSnapshot` edge resolution, and `?mock=1` deterministic fallback.
 
-**Source globs**: `drove-web/src/**/*.ts`, `drove-web/src/**/*.tsx`, `herdr-core/crates/herdr2/src/drove/http.rs`, `herdr-core/crates/herdr2/src/drove/remote.rs`
+**Source globs**: `drove-web/src/**/*.ts`, `drove-web/src/**/*.tsx`, `drove-web/src/styles/*.css`, `herdr-core/crates/herdr2/src/drove/http.rs`, `herdr-core/crates/herdr2/src/drove/remote.rs`
 
 | ID | Title | Tier | Mode | Priority | Platforms | Covers |
 | --- | --- | --- | --- | --- | --- | --- |

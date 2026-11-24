@@ -818,6 +818,7 @@ mod tests {
             expanded_from: None,
             review: None,
             review_state: None,
+            review_circuit: None,
             candidate_result: None,
             cache: None,
             cached_from: None,

@@ -119,17 +119,28 @@ export default class MachineAdd extends View {
 
   add(target, cx) {
     target = target.trim();
-    if (!target || this.state[target] === "adding") return;
+    if (!target || this.state[target] === "adding" || this.state[target] === "installing") return;
     this.pending.delete(target);
     this.state[target] = "adding";
     cx.notify();
-    cx.spawn(async (cx) => {
-      const r = await hc(["machine", "add", target, "--json"]).catch((e) => ({ code: 1, stderr: String(e), stdout: "" }));
-      let why = null;
+    const parseErr = (r) => {
+      if (r.code === 0) return null;
       try {
-        why = r.code === 0 ? null : (JSON.parse(r.stdout || r.stderr).error ?? { message: (r.stderr || r.stdout).trim() });
+        return JSON.parse(r.stdout || r.stderr).error ?? { message: (r.stderr || r.stdout).trim() };
       } catch {
-        why = { message: (r.stderr || r.stdout || "it didn't answer").trim() };
+        return { message: (r.stderr || r.stdout || "it didn't answer").trim() };
+      }
+    };
+    cx.spawn(async (cx) => {
+      let r = await hc(["machine", "add", target, "--json"]).catch((e) => ({ code: 1, stderr: String(e), stdout: "" }));
+      let why = parseErr(r);
+      // If the remote host is reachable via SSH but lacks h2 (or has an outdated h2),
+      // automatically install h2 core + companion skills on the remote host.
+      if (why && ["h2_missing", "hc_missing", "incompatible"].includes(why.kind)) {
+        this.state[target] = "installing";
+        cx.notify();
+        r = await hc(["machine", "add", target, "--install", "--json"]).catch((e) => ({ code: 1, stderr: String(e), stdout: "" }));
+        why = parseErr(r);
       }
       if (!why) {
         delete this.state[target];
@@ -137,10 +148,10 @@ export default class MachineAdd extends View {
         this.typed = "";
         await this.refresh();
         await this.checkMac(target);
-      } else if (["hc_missing", "incompatible", "login_needed", "auth_failed", "host_key"].includes(why.kind) || /password|passphrase|host key|permission denied|login/i.test(why.message ?? "")) {
+      } else if (["h2_missing", "hc_missing", "incompatible", "login_needed", "auth_failed", "host_key"].includes(why.kind) || /password|passphrase|host key|permission denied|login/i.test(why.message ?? "")) {
         const quoted = shellArg(target);
         this.pending.add(target);
-        this.state[target] = `Couldn't add ${target} here: it needs you to answer something (a password, a new host key, or installing herdr-core there). Run \`hc machine add ${quoted}\` in a terminal. \`hc machine --help\` shows the options.`;
+        this.state[target] = `Couldn't add ${target} here: it needs you to answer something (a password, a new host key, or installing h2 there). Run \`h2 machine add --install ${quoted}\` in a terminal. \`h2 machine --help\` shows the options.`;
       } else this.state[target] = why.message || "it didn't work";
       await this.refresh();
       cx.notify();
@@ -153,9 +164,9 @@ export default class MachineAdd extends View {
   async checkMac(target) {
     const m = this.added.find((x) => x.target === target || x.name === target);
     if (!m) return;
-    const r = await exec("sh", ["-c", 'uname; command -v herdr-core || echo "$HOME/.local/bin/herdr-core"'], { on: m.name }).catch(() => null);
+    const r = await exec("sh", ["-c", 'uname; command -v h2 || command -v herdr2-core || command -v herdr2 || echo "$HOME/.local/bin/h2"'], { on: m.name }).catch(() => null);
     const [os, core] = (r?.stdout ?? "").trim().split("\n");
-    if (os === "Darwin") this.macs[target] = { name: m.name, core: core ?? "~/.local/bin/herdr-core" };
+    if (os === "Darwin") this.macs[target] = { name: m.name, core: core ?? "~/.local/bin/h2" };
   }
 
   logoutCard(t, m) {
@@ -233,7 +244,7 @@ export default class MachineAdd extends View {
 
   message(t, target) {
     const text = String(this.state[target]).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-    const command = `hc machine add ${shellArg(target)}`;
+    const command = `h2 machine add --install ${shellArg(target)}`;
     return v_flex().gap(5)
       .child(div().text_size(12).text_color(t.blocked).child(TextView.html(`ma-message-${target}`, `<span>${text}</span>`).selectable(true)))
       .when(this.pending.has(target), (el) => el.child(h_flex().child(div()
@@ -249,8 +260,8 @@ export default class MachineAdd extends View {
     const machine = this.added.find(m => m.target === target || m.name === target || m.host === target);
     const right = done
       ? h_flex().gap(5).items_center().text_size(12).text_color(t.ansi2).child(svg(I("circle-check")).size(13)).child("Added")
-      : st === "adding"
-        ? h_flex().gap(6).items_center().text_size(12).text_color(t.muted).child(svg(I("spinner")).size(12).text_color(t.working).spin(900)).child("Connecting")
+      : st === "adding" || st === "installing"
+        ? h_flex().gap(6).items_center().text_size(12).text_color(t.muted).child(svg(I("spinner")).size(12).text_color(t.working).spin(900)).child(st === "installing" ? "Installing h2…" : "Connecting")
         : div()
               .id(`ma-add-${target}`)
               .px(10)
@@ -285,7 +296,7 @@ export default class MachineAdd extends View {
           .child(div().flex_1().min_w(0).truncate().text_size(12).text_color(t.dim).child(sub ?? ""))
           .child(right),
       )
-      .when(typeof st === "string" && st !== "adding", (el) => el.child(div().px(35).pb(6).child(this.message(t, target))))
+      .when(typeof st === "string" && st !== "adding" && st !== "installing", (el) => el.child(div().px(35).pb(6).child(this.message(t, target))))
       .when(Boolean(this.macs[target]), (el) => el.child(this.macCard(t, target)))
       .when(machine?.keeps_running_after_logout === false, el => el.child(this.logoutCard(t, machine)));
   }

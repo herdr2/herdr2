@@ -8,6 +8,7 @@ import { COORD_ID, workerNodeId } from "../relate";
 import {
   authorWorkers,
   buildReviewTimeline,
+  reviewCircuitView,
   reviewerNodeId,
   reviewerNumbers,
   reviewedTasks,
@@ -921,6 +922,7 @@ function ReviewDetail({
   const [reviewerId, setReviewerId] = useState<string | null>(cast.reviewers.at(-1)?.id ?? null);
   const reviewer = cast.reviewers.find((worker) => worker.id === reviewerId) ?? cast.reviewers.at(-1);
   const approved = task.reviewState?.approvedTreeSha;
+  const circuit = reviewCircuitView(task, t);
   return (
     <article className="rv-detail">
       <header className="rv-detail__bar">
@@ -930,6 +932,11 @@ function ReviewDetail({
         </div>
         <StandingBadge standing={board.standing} />
         <RoundMark round={board.round} max={board.maxRounds} />
+        {circuit && (
+          <span className={`circuit-pill circuit-pill--${circuit.tone}`} title={circuit.description}>
+            {circuit.shortLabel}
+          </span>
+        )}
         {onOpenTask && (
           <button type="button" className="rv-jump" onClick={() => onOpenTask(task.id)}>
             {t("wb.openInTasks")}
@@ -940,6 +947,29 @@ function ReviewDetail({
         </button>
       </header>
       {outsideFilter && <p className="rv-filter-note">{phrase("该任务不在当前筛选中", "This task is outside the current filter")}</p>}
+      {circuit && (circuit.tone === "handoff" || circuit.tone === "post_handoff" || circuit.tone === "awaiting") && (
+        <div className={`circuit-banner circuit-banner--${circuit.tone}`}>
+          <div className="circuit-banner__head">
+            <span className="circuit-banner__title">{t("review.circuit.title")} · {circuit.label}</span>
+            <span className="circuit-banner__meta mono">
+              R{circuit.rounds}/{circuit.maxRounds}
+              {circuit.overrides > 0 ? ` · ${t("review.circuit.overrides", { n: circuit.overrides })}` : ""}
+            </span>
+          </div>
+          <p className="circuit-banner__desc">{circuit.description}</p>
+          {circuit.history.length > 0 && (
+            <ul className="circuit-banner__history">
+              {circuit.history.map((rec) => (
+                <li key={`${rec.round}:${rec.at}`}>
+                  <strong className="mono">R{rec.round}{rec.postHandoff ? "*" : ""}</strong>
+                  {" · "}
+                  <span>{rec.summary}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
       <div className="rv-role-grid">
         <AuthorCard
           task={task}
@@ -1049,6 +1079,7 @@ function TaskCard({
   const author = cast.author;
   const reviewer = cast.reviewers.at(-1);
   const custom = author ? workerCustomRole(author) : null;
+  const circuit = reviewCircuitView(task, t);
   return (
     <button
       type="button"
@@ -1063,6 +1094,11 @@ function TaskCard({
         <ReviewRequirement required />
         <StandingBadge standing={board.standing} />
         <RoundMark round={board.round} max={board.maxRounds} />
+        {circuit && (
+          <span className={`circuit-pill circuit-pill--${circuit.tone}`} title={circuit.description}>
+            {circuit.shortLabel}
+          </span>
+        )}
       </span>
       <span className="rv-pair">
         <span className="rv-pill rv-pill--author">

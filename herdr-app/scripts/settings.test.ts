@@ -4,10 +4,21 @@ import { readFile } from "node:fs/promises";
 // What a click in the Settings window writes to settings.json, without a window or a core.
 const source = await readFile(new URL("../defaults/frame/settings/main.js", import.meta.url), "utf8");
 // settings.json as the mod sees it through readTextFile / writeTextFile.
-const disk: { raw: string | null; writes: number; fail?: string; readFail?: string; toasts: any[] } = { raw: null, writes: 0, toasts: [] };
+const disk: {
+  raw: string | null;
+  writes: number;
+  fail?: string;
+  readFail?: string;
+  toasts: any[];
+  hcHandler?: (args: string[]) => Promise<any>;
+} = { raw: null, writes: 0, toasts: [] };
 const values: Record<string, any> = {
   View: class {},
   appHome: () => "/home",
+  hc: async (args: string[]) => {
+    if (disk.hcHandler) return await disk.hcHandler(args);
+    return { code: 0, stdout: "{}", stderr: "" };
+  },
   notify: (n: any) => { disk.toasts.push(n); },
   readTextFile: async () => {
     if (disk.readFail) throw new Error(disk.readFail);
@@ -372,4 +383,147 @@ test("aiConfigureDroveRoles awaits in-flight probe instead of running a duplicat
 
   expect(order).toEqual(["drove probe --refresh", "drove roles-ai-config"]);
   expect(view.droveAiConfigResult?.probedRefreshed).toBe(true);
+});
+
+test("skillArgs appends --on <machine> only when a remote machine is selected", () => {
+  const view = new Settings();
+  view.skillMachine = null;
+  expect(view.skillArgs(["skill", "status"])).toEqual(["skill", "status"]);
+  view.skillMachine = "devbox";
+  expect(view.skillArgs(["skill", "status"])).toEqual(["skill", "status", "--on", "devbox"]);
+});
+
+test("loadSkills queries local and remote status via hc and captures structured errors", async () => {
+  const calls: string[][] = [];
+  const view = new Settings();
+  try {
+    disk.hcHandler = async (args) => {
+      calls.push(args);
+      if (args.includes("broken-box")) {
+        return { code: 1, stdout: JSON.stringify({ error: { message: "remote unreachable" } }), stderr: "" };
+      }
+      return {
+        code: 0,
+        stdout: JSON.stringify({ home: args.includes("devbox") ? "/home/dev" : "/home/local", agents: [] }),
+        stderr: "",
+      };
+    };
+
+    await view.loadSkills();
+    expect(calls[0]).toEqual(["skill", "status", "--json"]);
+    expect(view.skillData?.home).toBe("/home/local");
+    expect(view.skillError).toBeNull();
+    expect(view.skillLoading).toBe(false);
+
+    view.skillMachine = "devbox";
+    await view.loadSkills();
+    expect(calls[1]).toEqual(["skill", "status", "--on", "devbox", "--json"]);
+    expect(view.skillData?.home).toBe("/home/dev");
+
+    view.skillMachine = "broken-box";
+    await view.loadSkills();
+    expect(calls[2]).toEqual(["skill", "status", "--on", "broken-box", "--json"]);
+    expect(view.skillError).toBe("remote unreachable");
+    expect(view.skillLoading).toBe(false);
+  } finally {
+    disk.hcHandler = undefined;
+  }
+});
+
+test("installSkills forwards --on, --all/--agent/--target and formats local vs remote summaries", async () => {
+  const calls: string[][] = [];
+  const view = new Settings();
+  view.person = { language: "en" };
+  const runInstall = async (opts: any) => {
+    let task: Promise<void> | null = null;
+    const cx = { notify() {}, spawn(fn: (cx: any) => Promise<void>) { task = fn(cx); } };
+    view.installSkills(opts, cx);
+    await task;
+  };
+  try {
+    disk.hcHandler = async (args) => {
+      calls.push(args);
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          ok: true,
+          installedCount: 4,
+          targets: [{ agent: "claude", target: "/home/dev/.claude/skills", files: ["a", "b", "c", "d"] }],
+          status: { home: "/home/dev", agents: [], summary: { detectedAgents: 1, upToDateAgents: 1 } },
+        }),
+        stderr: "",
+      };
+    };
+
+    // 1. Local --all
+    await runInstall({});
+    expect(calls[0]).toEqual(["skill", "install", "--json", "--all"]);
+    expect(view.skillResult?.ok).toBe(true);
+    expect(view.skillResult?.summary).toBe("Installed 4 skill file(s) across 1 target(s).");
+    expect(view.skillInstalling).toBe(false);
+
+    // 2. Remote --agent (English)
+    view.skillMachine = "gpu-1";
+    await runInstall({ agent: "claude" });
+    expect(calls[1]).toEqual(["skill", "install", "--on", "gpu-1", "--json", "--agent", "claude"]);
+    expect(view.skillResult?.summary).toBe("Installed 4 skill file(s) across 1 target(s) (gpu-1).");
+
+    // 3. Remote --target (Chinese)
+    view.person = { language: "zh-CN" };
+    await runInstall({ target: "/home/dev/.custom/skills" });
+    expect(calls[2]).toEqual(["skill", "install", "--on", "gpu-1", "--json", "--target", "/home/dev/.custom/skills"]);
+    expect(view.skillResult?.summary).toContain("远程主机 gpu-1");
+  } finally {
+    disk.hcHandler = undefined;
+  }
+});
+
+test("aiInstallSkills forwards --on, --lang, and optional --query hint", async () => {
+  const calls: string[][] = [];
+  const view = new Settings();
+  view.person = { language: "zh-CN" };
+  view.skillMachine = "build-srv";
+  view.skillAiHintInput = { value: () => "  install into ~/.codex/skills  " };
+  let task: Promise<void> | null = null;
+  const cx = { notify() {}, spawn(fn: (cx: any) => Promise<void>) { task = fn(cx); } };
+
+  try {
+    disk.hcHandler = async (args) => {
+      calls.push(args);
+      return {
+        code: 0,
+        stdout: JSON.stringify({
+          ok: true,
+          usedAi: true,
+          model: "deepseek-chat",
+          summary: "已在远程主机 build-srv 安装完成。",
+          targets: [{ agent: "codex", target: "/home/dev/.codex/skills", files: ["f1"] }],
+          tips: ["重启远程 Codex 会话"],
+          status: { home: "/home/dev", agents: [] },
+        }),
+        stderr: "",
+      };
+    };
+
+    view.aiInstallSkills(cx);
+    await task;
+    expect(calls[0]).toEqual([
+      "skill",
+      "ai-install",
+      "--lang",
+      "zh-CN",
+      "--on",
+      "build-srv",
+      "--json",
+      "--query",
+      "install into ~/.codex/skills",
+    ]);
+    expect(view.skillResult?.ok).toBe(true);
+    expect(view.skillResult?.usedAi).toBe(true);
+    expect(view.skillResult?.model).toBe("deepseek-chat");
+    expect(view.skillResult?.tips).toEqual(["重启远程 Codex 会话"]);
+    expect(view.skillInstalling).toBe(false);
+  } finally {
+    disk.hcHandler = undefined;
+  }
 });

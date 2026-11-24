@@ -234,10 +234,11 @@ fn is_windows(target: &str) -> bool {
     WINDOWS.lock().unwrap_or_else(|p| p.into_inner()).iter().any(|t| t == target)
 }
 
-/// Where install.ps1 puts h2, from the home folder an ssh session starts in.
+/// Where install.ps1 / Inno Setup puts h2, from the home folder an ssh session starts in.
 /// Not PATH: sessions riding a shared login keep the PATH from before an
 /// install. `.\` reads the same in cmd and PowerShell.
-const WINDOWS_H2: &str = r".\AppData\Local\Programs\herdr2\herdr2.exe";
+const WINDOWS_H2: &str = r".\AppData\Local\Programs\h2\h2.exe";
+const WINDOWS_H2_LEGACY: &str = r".\AppData\Local\Programs\herdr2\herdr2.exe";
 
 /// The pipe to the core there: `herdr2 connect`, found on PATH, else in
 /// ~/.local/bin. On Windows, whose shell may be cmd or PowerShell, one line
@@ -252,12 +253,12 @@ fn pipe(
     let remote = if windows {
         let session = session.map(|s| format!(" --session {s}")).unwrap_or_default();
         format!(
-            "cmd /d /c \"if exist {WINDOWS_H2} ({WINDOWS_H2} connect{session}) else (echo {NOT_HERE} 1>&2 & exit /b 127)\""
+            "cmd /d /c \"if exist {WINDOWS_H2} ({WINDOWS_H2} connect{session}) else if exist {WINDOWS_H2_LEGACY} ({WINDOWS_H2_LEGACY} connect{session}) else (echo {NOT_HERE} 1>&2 & exit /b 127)\""
         )
     } else {
         let session = session.map(|s| format!("H2_SESSION={s} ")).unwrap_or_default();
         format!(
-            "sh -c 'p=$(command -v herdr2) || p=$HOME/.local/bin/herdr2; [ -x \"$p\" ] || {{ echo \"{NOT_HERE}\" >&2; exit 127; }}; {session}exec \"$p\" connect'"
+            "sh -c 'p=$(command -v herdr2) || p=$(command -v h2) || {{ [ -x \"$HOME/.local/bin/herdr2-core\" ] && p=$HOME/.local/bin/herdr2-core; }} || p=$HOME/.local/bin/herdr2; [ -x \"$p\" ] || {{ echo \"{NOT_HERE}\" >&2; exit 127; }}; {session}exec \"$p\" connect'"
         )
     };
     let options = ["BatchMode=yes", "ConnectTimeout=10", "ServerAliveInterval=15", "ServerAliveCountMax=4"];
@@ -519,7 +520,9 @@ pub fn install(paths: &crate::paths::Paths, to: Reach, session: Option<&str>) ->
                 "install h2 there yourself",
             )
         };
-        let m = crate::releases::manifest(Some(version), &scratch.0).map_err(not_released)?;
+        let m = crate::releases::manifest(Some(version), &scratch.0)
+            .or_else(|_| crate::releases::manifest(None, &scratch.0))
+            .map_err(not_released)?;
         crate::releases::download(&m, &there.replace(' ', "-"), &scratch.0, bundle)?
     };
     let (exe, bundled) = install_payload(&bin, &scratch.0)?;
@@ -531,7 +534,9 @@ pub fn install(paths: &crate::paths::Paths, to: Reach, session: Option<&str>) ->
              head -c {n} > \"$t/core.tar\"; [ $(wc -c < \"$t/core.tar\") -eq {n} ]; \
              tar -xf \"$t/core.tar\" -C \"$t\"; b=\"$t/Herdr2.app/Contents/MacOS/herdr2\"; \
              \"$b\" --h2-install-bundle \"$b\" \"$d/herdr2\"; \
-             {session}\"$d/herdr2\" server restart > /dev/null; \"$d/herdr2\" --version"
+             {session}\"$d/herdr2\" server restart > /dev/null; \
+             \"$d/herdr2\" skill install --all --detected-only > /dev/null 2>&1 || true; \
+             \"$d/herdr2\" --version"
         );
         return run_there(paths, to, &format!("sh -c '{script}'"), &exe);
     }
@@ -542,12 +547,15 @@ pub fn install(paths: &crate::paths::Paths, to: Reach, session: Option<&str>) ->
         ""
     };
     // Into a temp file beside the target, checked whole and running, then swapped.
+    // Also best-effort install bundled skills into any detected coding agents on the remote host.
     let script = format!(
         "set -e; d=$HOME/.local/bin; mkdir -p $d; {guard}rm -f $d/.herdr2.new.*; t=$d/.herdr2.new.$$; \
          head -c {n} > $t; [ $(($(wc -c < $t))) -eq {n} ] || {{ rm -f $t; echo \"the copy arrived incomplete\" >&2; exit 3; }}; \
          chmod 755 $t; $t --version > /dev/null || {{ rm -f $t; echo \"this h2 does not run there\" >&2; exit 4; }}; \
          mv -f $t $d/herdr2; command -v h2 > /dev/null 2>&1 || [ -e $d/h2 ] || ln -s herdr2 $d/h2; \
-         {session}$d/herdr2 server restart > /dev/null; $d/herdr2 --version"
+         {session}$d/herdr2 server restart > /dev/null; \
+         $d/herdr2 skill install --all --detected-only > /dev/null 2>&1 || true; \
+         $d/herdr2 --version"
     );
     run_there(paths, to, &format!("sh -c '{script}'"), &exe)
 }
@@ -583,7 +591,9 @@ fn install_payload(bin: &Path, scratch: &Path) -> Result<(Vec<u8>, bool), RpcErr
 fn install_windows(paths: &crate::paths::Paths, target: &str, session: Option<&str>) -> Result<String, RpcError> {
     let scratch = crate::releases::Scratch::new()?;
     let version = env!("CARGO_PKG_VERSION");
-    let m = crate::releases::manifest(Some(version), &scratch.0).map_err(|_| {
+    let m = crate::releases::manifest(Some(version), &scratch.0)
+        .or_else(|_| crate::releases::manifest(None, &scratch.0))
+        .map_err(|_| {
         RpcError::new(
             "install_failed",
             format!("{target} runs Windows, and h2 {version} has no release to download"),
@@ -620,6 +630,7 @@ fn install_windows(paths: &crate::paths::Paths, target: &str, session: Option<&s
         &format!("powershell -NoProfile -ExecutionPolicy Bypass -File h2-install.ps1 h2-install.zip{session}"),
         b"",
     )?;
+    let _ = run_there(paths, to, &format!("{WINDOWS_H2} skill install --all --detected-only"), b"");
     run_there(paths, to, &format!("{WINDOWS_H2} --version"), b"")
 }
 
@@ -672,7 +683,20 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "cmd /d /c \"if exist {WINDOWS_H2} ({WINDOWS_H2} connect --session s1) else (echo {NOT_HERE} 1>&2 & exit /b 127)\""
+                "cmd /d /c \"if exist {WINDOWS_H2} ({WINDOWS_H2} connect --session s1) else if exist {WINDOWS_H2_LEGACY} ({WINDOWS_H2_LEGACY} connect --session s1) else (echo {NOT_HERE} 1>&2 & exit /b 127)\""
+            )
+        );
+    }
+
+    #[test]
+    fn a_unix_box_probes_herdr2_h2_and_local_bin_fallbacks() {
+        let paths = crate::paths::Paths::from_env().unwrap();
+        let cmd = pipe(&paths, Reach { target: "linuxbox", via: false }, Some("dev"), false).unwrap();
+        let line = cmd.as_std().get_args().last().unwrap().to_string_lossy().into_owned();
+        assert_eq!(
+            line,
+            format!(
+                "sh -c 'p=$(command -v herdr2) || p=$(command -v h2) || p=$HOME/.local/bin/herdr2-core || p=$HOME/.local/bin/herdr2; [ -x \"$p\" ] || {{ echo \"{NOT_HERE}\" >&2; exit 127; }}; H2_SESSION=dev exec \"$p\" connect'"
             )
         );
     }

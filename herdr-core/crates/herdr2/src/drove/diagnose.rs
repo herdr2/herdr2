@@ -282,4 +282,110 @@ mod tests {
         assert_eq!(parse_porcelain_paths(raw), vec!["new.py", "src/cli.py", "tests/test_mlbb.py"]);
         assert!(parse_porcelain_paths("workspace unavailable").is_empty());
     }
+
+    #[test]
+    fn diagnose_task_surfaces_stage_specific_review_circuit_suggestions() {
+        let dir = std::env::temp_dir().join(format!("herdr2-diag-cb-{}", super::super::crypto::rand_id("d")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = crate::paths::Paths {
+            state: dir.clone(),
+            config: dir.join("config.toml"),
+            socket: dir.join("core.sock"),
+            holder_socket: dir.join("core.holder.sock"),
+        };
+        let dpaths = super::super::config::DrovePaths::from_paths(&paths);
+        let store = Store::open(&dpaths).unwrap();
+        let run = store.create_run(super::super::store::CreateRunInput {
+            objective: "diag circuit".into(),
+            cwd: dir.display().to_string(),
+            host: "herdr2".into(),
+            host_session: "d1".into(),
+            agent: None,
+            model: None,
+            host_pid: None,
+            session_bound: None,
+            max_concurrency: 1,
+            budget: None,
+            verify: None,
+            goal: None,
+        });
+        let task = store.create_task(super::super::store::CreateTaskInput {
+            run_id: run.id.clone(),
+            key: "review-gate".into(),
+            title: "Review Gate".into(),
+            phase: None,
+            spec: Spec {
+                target: "workspace".into(),
+                change: "review".into(),
+                constraints: None,
+                ownership: None,
+                acceptance: "pass".into(),
+                verify: None,
+            },
+            tags: Vec::new(),
+            files: Vec::new(),
+            deps: Vec::new(),
+            output_schema: None,
+            isolation: Isolation::None,
+            timeout_sec: None,
+            stall_warn_sec: None,
+            stall_kill_sec: None,
+            when: None,
+            assign: None,
+            status: TaskStatus::Failed,
+            result: None,
+            kind: None,
+            trigger_rule: None,
+            context: None,
+            exec: None,
+            foreach_from: None,
+            template: None,
+            expanded_from: None,
+            review: None,
+            cache: None,
+            cached_from: None,
+            retry_on_worker_reported: None,
+        });
+
+        let set_stage = |stage: ReviewCircuitStage, rounds: u32| {
+            store.update_task(&task.id, |t| {
+                t.review_circuit = Some(ReviewCircuit {
+                    stage,
+                    review_rounds: rounds,
+                    max_normal_rounds: 2,
+                    handoff_to_coordinator: stage != ReviewCircuitStage::Normal,
+                    handoff_at: None,
+                    post_handoff_review_used: matches!(
+                        stage,
+                        ReviewCircuitStage::PostHandoffReview | ReviewCircuitStage::AwaitingUserDecision
+                    ),
+                    awaiting_user_decision: stage == ReviewCircuitStage::AwaitingUserDecision,
+                    tripped_at: None,
+                    user_overrides: 0,
+                    history: Vec::new(),
+                });
+            });
+        };
+
+        set_stage(ReviewCircuitStage::HandoffToCoordinator, 2);
+        let d_handoff = diagnose_task(&store, &task.id).unwrap();
+        assert!(d_handoff.suggestion.contains("Coordinator must take over"));
+        assert!(d_handoff.suggestion.contains("h2 drove retry review-gate"));
+
+        set_stage(ReviewCircuitStage::PostHandoffReview, 2);
+        let d_post = diagnose_task(&store, &task.id).unwrap();
+        assert!(d_post.suggestion.contains("Single post-handoff final review (1/1)"));
+
+        set_stage(ReviewCircuitStage::AwaitingUserDecision, 3);
+        let d_hard = diagnose_task(&store, &task.id).unwrap();
+        assert!(d_hard.suggestion.contains("HARD REVIEW CIRCUIT BREAKER OPEN"));
+        assert!(d_hard.suggestion.contains("--user-override"));
+        assert!(d_hard.suggestion.contains("h2 drove complete --force"));
+
+        set_stage(ReviewCircuitStage::Cleared, 3);
+        let d_cleared = diagnose_task(&store, &task.id).unwrap();
+        assert!(d_cleared.suggestion.contains("No failure recorded"));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

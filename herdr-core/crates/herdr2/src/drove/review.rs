@@ -1344,4 +1344,194 @@ mod tests {
         assert_eq!(cands_after_fail[0].agent, "agy");
         assert_eq!(cands_after_fail[1].agent, "codex");
     }
+
+    #[test]
+    fn review_circuit_state_machine_enforces_two_rounds_handoff_then_single_post_handoff_then_hard_stop() {
+        let dir = std::env::temp_dir().join(format!("herdr2-review-cb-{}", super::super::crypto::rand_id("t")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths = crate::paths::Paths {
+            state: dir.clone(),
+            config: dir.join("config.toml"),
+            socket: dir.join("core.sock"),
+            holder_socket: dir.join("core.holder.sock"),
+        };
+        let dpaths = super::super::config::DrovePaths::from_paths(&paths);
+        let store = super::super::store::Store::open(&dpaths).unwrap();
+        let run = store.create_run(super::super::store::CreateRunInput {
+            objective: "test review circuit".into(),
+            cwd: dir.display().to_string(),
+            host: "herdr2".into(),
+            host_session: "t1".into(),
+            agent: None,
+            model: None,
+            host_pid: None,
+            session_bound: None,
+            max_concurrency: 2,
+            budget: None,
+            verify: None,
+            goal: None,
+        });
+        let task = store.create_task(super::super::store::CreateTaskInput {
+            run_id: run.id.clone(),
+            key: "final-review".into(),
+            title: "Final Review".into(),
+            phase: None,
+            spec: Spec {
+                target: "workspace".into(),
+                change: "Review".into(),
+                constraints: None,
+                ownership: None,
+                acceptance: "Approved".into(),
+                verify: None,
+            },
+            tags: Vec::new(),
+            files: Vec::new(),
+            deps: Vec::new(),
+            output_schema: None,
+            isolation: Isolation::None,
+            timeout_sec: None,
+            stall_warn_sec: None,
+            stall_kill_sec: None,
+            when: None,
+            assign: Some(Assign { role: Some("reviewer".into()), ..Default::default() }),
+            status: TaskStatus::Ready,
+            result: None,
+            kind: None,
+            trigger_rule: None,
+            context: None,
+            exec: None,
+            foreach_from: None,
+            template: None,
+            expanded_from: None,
+            review: None,
+            cache: None,
+            cached_from: None,
+            retry_on_worker_reported: None,
+        });
+        assert!(is_standalone_reviewer_task(&task));
+
+        // Round 1 fails -> still Normal (1/2).
+        let (t1, out1) = record_review_non_pass(
+            &store,
+            &task.id,
+            DEFAULT_MAX_NORMAL_REVIEW_ROUNDS,
+            "changes_requested",
+            "R1 issue",
+            vec!["missing timeout".into()],
+            Some("att_1"),
+        );
+        assert_eq!(out1, ReviewCircuitOutcome::ContinueNormal);
+        let rc1 = t1.unwrap().review_circuit.unwrap();
+        assert_eq!(rc1.stage, ReviewCircuitStage::Normal);
+        assert_eq!(rc1.review_rounds, 1);
+        assert!(!rc1.handoff_to_coordinator);
+
+        // Round 2 fails -> trips HandoffToCoordinator (2/2).
+        let (t2, out2) = record_review_non_pass(
+            &store,
+            &task.id,
+            DEFAULT_MAX_NORMAL_REVIEW_ROUNDS,
+            "changes_requested",
+            "R2 issue",
+            vec!["race condition".into()],
+            Some("att_2"),
+        );
+        assert_eq!(out2, ReviewCircuitOutcome::HandoffToCoordinator);
+        let rc2 = t2.unwrap().review_circuit.unwrap();
+        assert_eq!(rc2.stage, ReviewCircuitStage::HandoffToCoordinator);
+        assert_eq!(rc2.review_rounds, 2);
+        assert!(rc2.handoff_to_coordinator);
+        assert!(!rc2.post_handoff_review_used);
+        assert!(!rc2.awaiting_user_decision);
+        assert_eq!(rc2.history.len(), 2);
+
+        // Simulate Coordinator triggering the single post-handoff review.
+        store.update_task(&task.id, |t| {
+            let rc = t.review_circuit.as_mut().unwrap();
+            rc.stage = ReviewCircuitStage::PostHandoffReview;
+            rc.post_handoff_review_used = true;
+        });
+
+        // Round 3 (post-handoff) fails -> trips hard AwaitingUserDecision!
+        let (t3, out3) = record_review_non_pass(
+            &store,
+            &task.id,
+            DEFAULT_MAX_NORMAL_REVIEW_ROUNDS,
+            "rejected",
+            "R3 disagreement",
+            vec!["second-order fault injection".into()],
+            Some("att_3"),
+        );
+        assert_eq!(out3, ReviewCircuitOutcome::AwaitingUserDecision);
+        let rc3 = t3.unwrap().review_circuit.unwrap();
+        assert_eq!(rc3.stage, ReviewCircuitStage::AwaitingUserDecision);
+        assert_eq!(rc3.review_rounds, 3);
+        assert!(rc3.handoff_to_coordinator);
+        assert!(rc3.post_handoff_review_used);
+        assert!(rc3.awaiting_user_decision);
+        assert!(rc3.history.last().unwrap().post_handoff);
+
+        // Approval clears circuit cleanly.
+        record_review_passed(&store, &task.id);
+        let rc4 = store.get_task(&task.id).unwrap().review_circuit.unwrap();
+        assert_eq!(rc4.stage, ReviewCircuitStage::Cleared);
+        assert!(!rc4.awaiting_user_decision);
+
+        // Helper checks for structured verdicts & findings.
+        assert_eq!(
+            is_review_rejection_data(Some(&serde_json::json!({ "review_status": "changes_requested" })), None)
+                .as_deref(),
+            Some("changes_requested")
+        );
+        assert_eq!(
+            is_review_rejection_data(Some(&serde_json::json!({ "verdict": "reject" })), None).as_deref(),
+            Some("reject")
+        );
+        assert_eq!(
+            is_review_rejection_data(Some(&serde_json::json!({ "approved": false })), None).as_deref(),
+            Some("changes_requested")
+        );
+        assert_eq!(
+            is_review_rejection_data(None, Some(&["blocking defect".into()])).as_deref(),
+            Some("changes_requested")
+        );
+        assert!(is_review_approval_data(Some(&serde_json::json!({ "reviewStatus": "approved" }))));
+        assert!(is_review_approval_data(Some(&serde_json::json!({ "verdict": "lgtm" }))));
+        assert!(is_review_approval_data(Some(&serde_json::json!({ "approved": true }))));
+        assert!(!is_review_approval_data(Some(&serde_json::json!({ "approved": false }))));
+
+        let extracted = extract_key_findings(
+            Some(&serde_json::json!({ "findings": [{ "severity": "high", "file": "a.rs", "message": "leak" }] })),
+            None,
+            "fallback",
+        );
+        assert_eq!(extracted, vec!["[high] a.rs: leak"]);
+        assert_eq!(
+            extract_key_findings(
+                Some(&serde_json::json!({ "blockers": ["missing lock", "race on drop"] })),
+                None,
+                "fallback",
+            ),
+            vec!["missing lock", "race on drop"]
+        );
+        assert_eq!(extract_key_findings(None, None, "fallback summary"), vec!["fallback summary"]);
+
+        // History caps at 8 entries even across repeated override failures.
+        for i in 0..8 {
+            let _ = record_review_non_pass(
+                &store,
+                &task.id,
+                DEFAULT_MAX_NORMAL_REVIEW_ROUNDS,
+                "changes_requested",
+                &format!("extra {i}"),
+                Vec::new(),
+                None,
+            );
+        }
+        let capped = store.get_task(&task.id).unwrap().review_circuit.unwrap();
+        assert_eq!(capped.history.len(), 8);
+        assert_eq!(capped.stage, ReviewCircuitStage::AwaitingUserDecision);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

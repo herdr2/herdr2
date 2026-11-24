@@ -329,6 +329,7 @@ ERROR
   'uname -sm') [ -n '{uname}' ] || {{ echo '無法辨識 uname' >&2; exit 1; }}; echo '{uname}'; exit 0;;
   'cmd /d /c "echo herdr2-windows"') echo herdr2-windows; exit 0;;
   powershell\ *) [ -f '{root}/copied' ] || exit 1; touch '{root}/installed'; exit 0;;
+  *'skill install --all --detected-only') touch '{root}/skills_synced'; exit 0;;
   *--version) echo 'herdr2 test'; exit 0;;
 esac
 if [ ! -f '{root}/installed' ]; then
@@ -369,6 +370,7 @@ touch '{root}/copied'
         let added = s.json(&["machine", "add", "windows-msys", "--install"]);
         assert_eq!(added["id"], rohan.json(&["server", "status"])["core"]["id"], "{added}");
         assert!(s.root.join("installed").exists(), "the native installer ran");
+        assert!(s.root.join("skills_synced").exists(), "best-effort detected-only skill install ran on Windows");
         s.json(&["machine", "rm", "windows-msys"]);
     }
 }
@@ -564,4 +566,35 @@ fn adding_says_what_went_wrong_and_saves_nothing() {
     assert_eq!(kind(&["rename", "nope", "x"]), "machine_unknown");
     assert_eq!(kind(&["rm", "nope"]), "machine_unknown");
     assert_eq!(s.json(&["machine", "ls"])["machines"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn machine_add_install_auto_installs_skills_only_for_detected_remote_agents() {
+    // Host 1 has `.claude` marker dir -> `machine add --install` auto-populates `.claude/skills`,
+    // without creating fallback `.gemini/skills`.
+    let mut with_claude = Session::new();
+    with_claude.bin = with_claude.root.join("bin/herdr2");
+    std::fs::create_dir_all(with_claude.root.join(".claude")).unwrap();
+
+    // Host 2 has NO coding agent markers -> `--detected-only` creates NO fallback skill directories.
+    let mut clean_box = Session::new();
+    clean_box.bin = clean_box.root.join("bin/herdr2");
+
+    let mut s = Session::new();
+    s.env.push(fake_ssh(&s, &[("claudebox", &with_claude), ("cleanbox", &clean_box)]));
+
+    s.json(&["machine", "add", "claudebox", "--install"]);
+    with_claude.bin = with_claude.root.join(".local/bin/herdr2");
+    assert!(with_claude.bin.exists());
+    assert!(with_claude.root.join(".claude/skills/herdr2/SKILL.md").exists());
+    assert!(with_claude.root.join(".claude/skills/drove/SKILL.md").exists());
+    assert!(with_claude.root.join(".claude/skills/drove-add/SKILL.md").exists());
+    assert!(with_claude.root.join(".claude/skills/drove-setup/SKILL.md").exists());
+    assert!(!with_claude.root.join(".gemini/skills").exists());
+
+    s.json(&["machine", "add", "cleanbox", "--install"]);
+    clean_box.bin = clean_box.root.join(".local/bin/herdr2");
+    assert!(clean_box.bin.exists());
+    assert!(!clean_box.root.join(".claude/skills").exists());
+    assert!(!clean_box.root.join(".gemini/skills").exists());
 }

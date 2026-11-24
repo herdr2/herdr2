@@ -292,6 +292,7 @@ export default class Settings extends View {
     this.releasesUrlSynced = false;
     this.releasesUrlSavedAt = 0;
     this.skillData = null;
+    this.skillMachine = null; // null = local, else SSH machine name
     this.skillLoading = false;
     this.skillInstalling = null; // null | "all" | "ai" | "custom" | agentId
     this.skillError = null;
@@ -319,7 +320,7 @@ export default class Settings extends View {
           this.maybeAutoProbeDrove(cx);
         }
         if (this.section === "skills") {
-          await Promise.all([this.loadSkills(), this.loadAi()]);
+          await Promise.all([this.loadMachines(), this.loadSkills(), this.loadAi()]);
         }
       }
       cx.notify();
@@ -5245,12 +5246,16 @@ export default class Settings extends View {
 
   // Skills ---------------------------------------------------------------
 
+  skillArgs(base) {
+    return this.skillMachine ? [...base, "--on", this.skillMachine] : base;
+  }
+
   async loadSkills() {
     if (this.skillLoading || (typeof checking === "function" && checking())) return;
     this.skillLoading = true;
     this.skillError = null;
     try {
-      const r = await hc(["skill", "status", "--json"]);
+      const r = await hc([...this.skillArgs(["skill", "status"]), "--json"]);
       let parsed = null;
       try { parsed = JSON.parse(r.stdout || r.stderr); } catch {}
       if (r.code !== 0) {
@@ -5273,7 +5278,8 @@ export default class Settings extends View {
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const args = ["skill", "install", "--json"];
+        const args = this.skillArgs(["skill", "install"]);
+        args.push("--json");
         if (opts?.target) args.push("--target", opts.target);
         else if (opts?.agent) args.push("--agent", opts.agent);
         else args.push("--all");
@@ -5285,12 +5291,13 @@ export default class Settings extends View {
         }
         if (parsed?.status) this.skillData = parsed.status;
         else await this.loadSkills();
+        const hostNote = this.skillMachine ? ` (${this.skillMachine})` : "";
         this.skillResult = {
           ok: true,
           usedAi: false,
           summary: this.tr(
-            `Installed ${parsed?.installedCount ?? 0} skill file(s) across ${(parsed?.targets ?? []).length} target(s).`,
-            `已为 ${(parsed?.targets ?? []).length} 个目标目录安装 ${parsed?.installedCount ?? 0} 个 Skill 文件。`,
+            `Installed ${parsed?.installedCount ?? 0} skill file(s) across ${(parsed?.targets ?? []).length} target(s)${hostNote}.`,
+            `已为${this.skillMachine ? `远程主机 ${this.skillMachine} 的 ` : ""}${(parsed?.targets ?? []).length} 个目标目录安装 ${parsed?.installedCount ?? 0} 个 Skill 文件。`,
           ),
           targets: parsed?.targets ?? [],
           tips: [],
@@ -5313,7 +5320,8 @@ export default class Settings extends View {
     cx.spawn(async (cx) => {
       try {
         const hint = String(this.skillAiHintInput?.value?.() ?? "").trim();
-        const args = ["skill", "ai-install", "--lang", this.lang(), "--json"];
+        const args = this.skillArgs(["skill", "ai-install", "--lang", this.lang()]);
+        args.push("--json");
         if (hint) args.push("--query", hint);
         const r = await hc(args);
         let parsed = null;
@@ -5373,9 +5381,70 @@ export default class Settings extends View {
       return [this.tr("Not installed", "未安装"), t.dim];
     };
 
+    const machines = (this.machineList ?? []).filter((m) => !m.temporary);
+    const machineChip = (id, label, value) => {
+      const on = this.skillMachine === value;
+      return div()
+        .id(`st-skill-m-${id}`)
+        .px(10)
+        .py(4)
+        .rounded(6)
+        .border_1()
+        .border_color(on ? t.accent : t.border)
+        .bg(on ? t.accent : t.raised)
+        .cursor_pointer()
+        .text_size(12.5)
+        .text_color(on ? t.accent_foreground : t.foreground)
+        .on_click((_e, cx) => {
+          this.skillMachine = value;
+          this.skillData = null;
+          this.skillError = null;
+          this.skillResult = null;
+          cx.spawn(async (cx) => {
+            await this.loadSkills();
+            cx.notify();
+          });
+        })
+        .child(label);
+    };
+
     return v_flex()
       .w_full()
       .gap(16)
+      // 0. Target Machine Bar (Local / SSH Remotes)
+      .child(
+        h_flex()
+          .w_full()
+          .px(14)
+          .py(10)
+          .rounded(10)
+          .border_1()
+          .border_color(t.border)
+          .bg(t.surface)
+          .items_center()
+          .justify_between()
+          .gap(10)
+          .flex_wrap()
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .flex_wrap()
+              .child(div().text_size(12).text_color(t.dim).child(this.tr("Target Machine:", "目标主机：")))
+              .child(machineChip("local", this.tr("This computer", "本机"), null))
+              .children(machines.map((m) => machineChip(m.name, m.name, m.name))),
+          )
+          .child(
+            div()
+              .text_size(11.5)
+              .text_color(t.dim)
+              .child(
+                this.skillMachine
+                  ? this.tr(`Managing skills on ${this.skillMachine}`, `正在管理远程主机 ${this.skillMachine} 的 Skills`)
+                  : this.tr("Managing skills on this computer", "正在管理本机的 Skills"),
+              ),
+          ),
+      )
       // 1. Companion Skills Overview & One-Click Install
       .child(
         v_flex()
@@ -5950,6 +6019,7 @@ export default class Settings extends View {
                 cx.notify();
               });
               if (s.id === "skills") cx.spawn(async (cx) => {
+                if (this.machineList === null) await this.loadMachines();
                 await Promise.all([this.loadSkills(), this.loadAi()]);
                 cx.notify();
               });

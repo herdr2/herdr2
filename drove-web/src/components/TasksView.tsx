@@ -187,6 +187,7 @@ export function TasksView({
   const parentTemplate = task.expandedFrom ? snap.tasks.find((item) => item.id === task.expandedFrom) : undefined;
   const branchText = branchCaption(task);
   const board = reviewBoard(task, snap.attempts, snap.workers);
+  const circuit = reviewCircuitView(task, t);
   const needsReview = taskRequiresReview(task, attempts);
 
   const detail = (
@@ -199,6 +200,11 @@ export function TasksView({
               <span className="mono hint">{task.title} · {task.key} · {task.id}</span>
               <StatusBadge token={badge.token} pulse={badge.pulse}>{badge.label}</StatusBadge>
               <ReviewRequirement required={needsReview} />
+              {circuit && (
+                <span className={`circuit-pill circuit-pill--${circuit.tone}`} title={circuit.description}>
+                  {circuit.shortLabel}
+                </span>
+              )}
               {task.kind === "exec" && <span className="micro-badge">EXEC</span>}
               {task.execPhase && <span className="micro-badge">{t(`phase.${task.execPhase}`)}</span>}
               {micro.map((m) => (
@@ -309,6 +315,30 @@ export function TasksView({
             {t(`fail.${badge.cause.kind}`)}
             {badge.cause.message ? ` — ${badge.cause.message}` : ""}
           </div>
+        </div>
+      )}
+
+      {circuit && (circuit.tone === "handoff" || circuit.tone === "post_handoff" || circuit.tone === "awaiting") && (
+        <div className={`circuit-banner circuit-banner--${circuit.tone}`}>
+          <div className="circuit-banner__head">
+            <span className="circuit-banner__title">{t("review.circuit.title")} · {circuit.label}</span>
+            <span className="circuit-banner__meta mono">
+              R{circuit.rounds}/{circuit.maxRounds}
+              {circuit.overrides > 0 ? ` · ${t("review.circuit.overrides", { n: circuit.overrides })}` : ""}
+            </span>
+          </div>
+          <p className="circuit-banner__desc">{circuit.description}</p>
+          {circuit.history.length > 0 && (
+            <ul className="circuit-banner__history">
+              {circuit.history.map((rec) => (
+                <li key={`${rec.round}:${rec.at}`}>
+                  <strong className="mono">R{rec.round}{rec.postHandoff ? "*" : ""}</strong>
+                  {" · "}
+                  <span>{rec.summary}</span>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
 

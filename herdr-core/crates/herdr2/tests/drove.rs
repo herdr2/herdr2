@@ -2951,3 +2951,298 @@ fn drove_worker_reported_failure_does_not_auto_retry_and_wakes_wait() {
     assert!(runs_arr.iter().any(|r| r["id"] == run_id), "missing run_id in `drove runs`: {listed}");
     assert!(runs_arr.iter().any(|r| r["id"] == run2_id), "missing run2_id in `drove runs`: {listed}");
 }
+
+#[test]
+fn drove_review_circuit_breaker_handoff_post_handoff_and_user_override() {
+    let s = drove_session();
+    let _ = wait_web_port(&s);
+    configure_fake_roles(&s);
+
+    let work_dir = s.root.join("review_cb_work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let coord = run_fake(&s, &[]);
+    let counter_file = s.root.join("review_cb_count.txt");
+    let driver_script = s.root.join("review_cb_driver.py");
+    std::fs::write(
+        &driver_script,
+        format!(
+            r#"import os, subprocess, sys
+p = {counter:?}
+n = int(open(p).read().strip()) + 1 if os.path.exists(p) else 1
+open(p, 'w').write(str(n))
+if n == 1:
+    cmd = ["herdr2", "drove", "worker", "done", "--outcome", "failed", "--reason", "R1 blocking bug in auth"]
+elif n == 2:
+    cmd = ["herdr2", "drove", "worker", "done", "--outcome", "failed", "--reason", "R2 blocking race condition"]
+elif n == 3:
+    cmd = ["herdr2", "drove", "worker", "done", "--outcome", "done", "--summary", "R3 residual edge-case disagreement", "--data", '{{"review_status":"changes_requested","findings":["edge-case fault injection"]}}']
+else:
+    cmd = ["herdr2", "drove", "worker", "done", "--outcome", "done", "--summary", "LGTM after user decision", "--data", '{{"review_status":"approved"}}']
+sys.exit(subprocess.call(cmd))
+"#,
+            counter = counter_file.display().to_string()
+        ),
+    )
+    .unwrap();
+
+    let plan_path = s.root.join("review-cb-plan.yaml");
+    std::fs::write(
+        &plan_path,
+        format!(
+            "objective: Review circuit-breaker E2E\n\
+             tasks:\n  \
+               - key: final-review\n    \
+                 title: Final Review\n    \
+                 role: reviewer\n    \
+                 spec:\n      \
+                   target: workspace\n      \
+                   change: \"SH:python3 {}\"\n      \
+                   acceptance: Review approved\n",
+            driver_script.display()
+        ),
+    )
+    .unwrap();
+
+    let out = s
+        .cmd()
+        .env("H2_AGENT_ID", &coord)
+        .args(["--json", "drove", "plan", "--file", plan_path.to_str().unwrap(), "--cwd", work_dir.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "drove plan failed: {}", String::from_utf8_lossy(&out.stderr));
+    let planned: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let run_id = planned["run"]["id"].as_str().unwrap().to_string();
+
+    // Round 1 fails -> still Normal (1/2).
+    let w1 = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "15"]);
+    assert_eq!(w1["needsAttention"], true, "w1: {w1}");
+    let t1 = &w1["tasks"][0];
+    assert_eq!(t1["status"], "failed");
+    assert_eq!(t1["reviewCircuit"]["stage"], "normal");
+    assert_eq!(t1["reviewCircuit"]["reviewRounds"], 1);
+    assert_eq!(t1["reviewCircuit"]["handoffToCoordinator"], false);
+
+    // Retry for Round 2 is allowed cleanly.
+    let r2 = s.json(&["drove", "retry", "final-review", "--run", &run_id, "--hint", "Fixed R1"]);
+    assert_eq!(r2["status"], "ready");
+
+    // Round 2 fails -> trips HandoffToCoordinator (2/2) + posts Escalation message summarizing R1 & R2.
+    let w2 = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "15"]);
+    let t2 = &w2["tasks"][0];
+    assert_eq!(t2["status"], "failed", "w2: {w2}");
+    assert_eq!(t2["reviewCircuit"]["stage"], "handoff_to_coordinator");
+    assert_eq!(t2["reviewCircuit"]["reviewRounds"], 2);
+    assert_eq!(t2["reviewCircuit"]["handoffToCoordinator"], true);
+    assert_eq!(t2["reviewCircuit"]["postHandoffReviewUsed"], false);
+    assert_eq!(t2["reviewCircuit"]["awaitingUserDecision"], false);
+    assert_eq!(w2["reviewCircuits"][0]["stage"], "handoff_to_coordinator");
+    let handoff_msg = w2["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["type"] == "escalation" && m["tag"] == "review_handoff")
+        .unwrap_or_else(|| panic!("expected review_handoff escalation in {w2}"));
+    let handoff_body = handoff_msg["body"].as_str().unwrap_or("");
+    assert!(handoff_body.contains("R1 blocking bug"), "missing R1 summary: {handoff_body}");
+    assert!(handoff_body.contains("R2 blocking race"), "missing R2 summary: {handoff_body}");
+
+    // Inspect & Show surface circuit-breaker state and coordinator takeover suggestion.
+    let inspected = s.json(&["drove", "inspect", "final-review", "--run", &run_id]);
+    assert_eq!(inspected["task"]["reviewCircuit"]["stage"], "handoff_to_coordinator");
+    assert!(
+        inspected["suggestion"].as_str().unwrap_or("").contains("Coordinator must take over"),
+        "unexpected inspect suggestion: {}",
+        inspected["suggestion"]
+    );
+    let shown = s.json(&["drove", "show", &run_id]);
+    assert_eq!(shown["reviewCircuits"][0]["stage"], "handoff_to_coordinator");
+
+    // Coordinator fixes directly -> triggers the SINGLE post-handoff final review (1/1).
+    let r3 = s.json(&["drove", "retry", "final-review", "--run", &run_id, "--hint", "Coordinator direct fix"]);
+    assert_eq!(r3["reviewCircuit"]["stage"], "post_handoff_review");
+    assert_eq!(r3["reviewCircuit"]["postHandoffReviewUsed"], true);
+
+    // Round 3 (post-handoff) returns changes_requested -> trips HARD AwaitingUserDecision!
+    let w3 = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "15"]);
+    let t3 = &w3["tasks"][0];
+    assert_eq!(t3["reviewCircuit"]["stage"], "awaiting_user_decision", "w3: {w3}");
+    assert_eq!(t3["reviewCircuit"]["reviewRounds"], 3);
+    assert_eq!(t3["reviewCircuit"]["awaitingUserDecision"], true);
+    let hard_msg = w3["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["type"] == "escalation" && m["tag"] == "review_circuit_open")
+        .unwrap_or_else(|| panic!("expected review_circuit_open escalation in {w3}"));
+    let hard_body = hard_msg["body"].as_str().unwrap_or("");
+    assert!(hard_body.contains("向用户汇报"), "missing user escalation instruction: {hard_body}");
+    assert!(hard_body.contains("处理建议"), "missing coordinator recommendation instruction: {hard_body}");
+
+    // Standard `h2 drove retry` is now HARD-BLOCKED!
+    let blocked_retry = s
+        .cmd()
+        .args(["--json", "drove", "retry", "final-review", "--run", &run_id, "--hint", "unauthorized retry"])
+        .output()
+        .unwrap();
+    assert!(!blocked_retry.status.success(), "retry without --user-override must fail");
+    let blocked_stderr = String::from_utf8_lossy(&blocked_retry.stderr);
+    assert!(blocked_stderr.contains("review_circuit_open"), "expected review_circuit_open: {blocked_stderr}");
+
+    // Standard `h2 drove complete` without `--force` is also blocked while awaiting user decision!
+    let blocked_complete = s.cmd().args(["--json", "drove", "complete", &run_id]).output().unwrap();
+    assert!(!blocked_complete.status.success(), "complete without --force must fail while awaiting user decision");
+    assert!(
+        String::from_utf8_lossy(&blocked_complete.stderr).contains("review_circuit_open"),
+        "expected review_circuit_open on complete: {}",
+        String::from_utf8_lossy(&blocked_complete.stderr)
+    );
+
+    // After user approves continuing, `--user-override` permits 1 more controlled review pass.
+    let r4 = s.json(&[
+        "drove",
+        "retry",
+        "final-review",
+        "--run",
+        &run_id,
+        "--user-override",
+        "--override-reason",
+        "User approved fixing final edge case",
+    ]);
+    assert_eq!(r4["reviewCircuit"]["stage"], "post_handoff_review");
+    assert_eq!(r4["reviewCircuit"]["userOverrides"], 1);
+    assert_eq!(r4["reviewCircuit"]["awaitingUserDecision"], false);
+
+    // Round 4 approves -> circuit clears and run completes cleanly!
+    let w4 = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "15"]);
+    assert_eq!(w4["settled"], true, "w4: {w4}");
+    assert_eq!(w4["tasks"][0]["reviewCircuit"]["stage"], "cleared", "w4: {w4}");
+    assert_eq!(w4["tasks"][0]["reviewCircuit"]["awaitingUserDecision"], false);
+
+    let done = s.json(&["drove", "complete", &run_id, "--summary", "Approved after user override"]);
+    assert_eq!(done["run"]["status"], "done");
+}
+
+#[test]
+fn drove_adversarial_review_gate_trips_handoff_then_hard_circuit_breaker() {
+    let s = drove_session();
+    let _ = wait_web_port(&s);
+    configure_fake_roles(&s);
+
+    let repo = s.root.join("adv_cb_repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git").arg("-C").arg(&repo).args(args).output().unwrap();
+        assert!(out.status.success(), "git {args:?} failed: {}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init"]);
+    git(&["config", "user.email", "test@drove.local"]);
+    git(&["config", "user.name", "Drove Test"]);
+    std::fs::write(repo.join("out.txt"), "base\n").unwrap();
+    git(&["add", "out.txt"]);
+    git(&["commit", "-m", "init"]);
+
+    // Mock reviewer that always requests changes so we exercise:
+    // R1 -> rework -> R2 -> handoff_to_coordinator -> Coordinator retry (1/1 post-handoff) -> R3 -> awaiting_user_decision -> retry blocked.
+    let rev_script = s.root.join("always_reject_review.py");
+    std::fs::write(
+        &rev_script,
+        "import json\nprint(json.dumps({'verdict': 'changes_requested', 'summary': 'Still needs change', 'findings': [{'severity': 'high', 'file': 'out.txt', 'message': 'Fix contract'}]}))\n",
+    )
+    .unwrap();
+
+    let author_script = s.root.join("author_submit.py");
+    std::fs::write(
+        &author_script,
+        r#"import subprocess, sys
+open('out.txt', 'a').write('edit\n')
+rc = subprocess.call(["herdr2", "drove", "worker", "done", "--outcome", "done", "--summary", "attempt1"])
+if rc != 0:
+    open('out.txt', 'a').write('rework\n')
+    subprocess.call(["herdr2", "drove", "worker", "done", "--outcome", "done", "--summary", "attempt2"])
+sys.exit(0)
+"#,
+    )
+    .unwrap();
+
+    let plan_path = s.root.join("adv-cb-plan.yaml");
+    std::fs::write(
+        &plan_path,
+        format!(
+            "objective: Adversarial review gate circuit breaker\n\
+             tasks:\n  \
+               - key: gated-task\n    \
+                 title: Gated Task\n    \
+                 role: coder\n    \
+                 review:\n      \
+                   maxRounds: 2\n      \
+                   criteria: \"SH:python3 {}\"\n    \
+                 spec:\n      \
+                   target: out.txt\n      \
+                   change: \"SH:python3 {}\"\n      \
+                   acceptance: Review passes\n",
+            rev_script.display(),
+            author_script.display()
+        ),
+    )
+    .unwrap();
+
+    let planned = s.json(&["drove", "plan", "--file", plan_path.to_str().unwrap(), "--cwd", repo.to_str().unwrap()]);
+    let run_id = planned["run"]["id"].as_str().unwrap().to_string();
+
+    // After R1 + R2 fail inside the adversarial review gate -> HandoffToCoordinator.
+    let w1 = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "20"]);
+    let t1 = &w1["tasks"][0];
+    assert_eq!(t1["status"], "failed", "w1: {w1}");
+    assert_eq!(t1["reviewCircuit"]["stage"], "handoff_to_coordinator");
+    assert_eq!(t1["reviewCircuit"]["reviewRounds"], 2);
+    assert_eq!(t1["reviewCircuit"]["handoffToCoordinator"], true);
+
+    // Coordinator fixes directly and runs the SINGLE post-handoff review (1/1).
+    let r2 = s.json(&["drove", "retry", "gated-task", "--run", &run_id, "--hint", "Coordinator fix"]);
+    assert_eq!(r2["reviewCircuit"]["stage"], "post_handoff_review");
+    assert_eq!(r2["reviewCircuit"]["postHandoffReviewUsed"], true);
+
+    // Post-handoff review rejects -> IMMEDIATELY trips hard AwaitingUserDecision on round 3 (only 1 round allowed, not 2!).
+    let w2 = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "20"]);
+    let t2 = &w2["tasks"][0];
+    assert_eq!(t2["status"], "failed", "w2: {w2}");
+    assert_eq!(t2["reviewCircuit"]["stage"], "awaiting_user_decision");
+    assert_eq!(t2["reviewCircuit"]["reviewRounds"], 3);
+    assert_eq!(t2["reviewCircuit"]["awaitingUserDecision"], true);
+
+    // Further retry without `--user-override` is rejected with `review_circuit_open`.
+    let blocked = s.cmd().args(["--json", "drove", "retry", "gated-task", "--run", &run_id]).output().unwrap();
+    assert!(!blocked.status.success());
+    assert!(
+        String::from_utf8_lossy(&blocked.stderr).contains("review_circuit_open"),
+        "expected review_circuit_open: {}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+
+    // Explicit `--user-override` grants ONLY 1 additional pass; another rejection immediately re-trips hard stop.
+    let override_retry = s.json(&[
+        "drove",
+        "retry",
+        "gated-task",
+        "--run",
+        &run_id,
+        "--user-override",
+        "--override-reason",
+        "User asked for one more attempt",
+    ]);
+    assert_eq!(override_retry["reviewCircuit"]["stage"], "post_handoff_review");
+    assert_eq!(override_retry["reviewCircuit"]["userOverrides"], 1);
+    assert_eq!(override_retry["reviewCircuit"]["awaitingUserDecision"], false);
+
+    let w3 = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "20"]);
+    let t3 = &w3["tasks"][0];
+    assert_eq!(t3["status"], "failed", "w3: {w3}");
+    assert_eq!(t3["reviewCircuit"]["stage"], "awaiting_user_decision");
+    assert_eq!(t3["reviewCircuit"]["reviewRounds"], 4);
+    assert_eq!(t3["reviewCircuit"]["userOverrides"], 1);
+    assert_eq!(t3["reviewCircuit"]["awaitingUserDecision"], true);
+
+    // User decides to stop and close the run explicitly via `complete --force`.
+    let forced = s.json(&["drove", "complete", &run_id, "--force", "--summary", "User accepted partial state"]);
+    assert_eq!(forced["run"]["status"], "done");
+}

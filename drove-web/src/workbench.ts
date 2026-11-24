@@ -126,7 +126,12 @@ export function taskMatchesFilter(task: Task, filter: TaskFilter): boolean {
     case "done":
       return task.status === "succeeded" || task.status === "skipped" || task.status === "cancelled";
     case "attention":
-      return task.status === "failed" || task.status === "blocked";
+      return (
+        task.status === "failed"
+        || task.status === "blocked"
+        || task.reviewCircuit?.stage === "handoff_to_coordinator"
+        || task.reviewCircuit?.stage === "awaiting_user_decision"
+      );
   }
 }
 
@@ -317,18 +322,48 @@ export function buildCoordinatorAttention(
 ): CoordinatorAttentionItem[] {
   const items: CoordinatorAttentionItem[] = [];
   for (const task of snap.tasks) {
-    if (task.status !== "failed") continue;
-    const cause = taskFailure(task, snap.attempts);
-    items.push({
-      id: `failed:${task.id}`,
-      kind: "failed",
-      severity: "danger",
-      label: task.title,
-      title: cause ? t(cause.labelKey) : t("overview.failed"),
-      section: "messages",
-      taskId: task.id,
-      messageType: "failed",
-    });
+    if (task.status === "failed") {
+      const cause = taskFailure(task, snap.attempts);
+      items.push({
+        id: `failed:${task.id}`,
+        kind: "failed",
+        severity: "danger",
+        label: task.title,
+        title:
+          task.reviewCircuit?.stage === "awaiting_user_decision"
+            ? t("review.circuit.awaitingShort")
+            : task.reviewCircuit?.stage === "handoff_to_coordinator"
+              ? t("review.circuit.handoffShort")
+              : cause
+                ? t(cause.labelKey)
+                : t("overview.failed"),
+        section: "messages",
+        taskId: task.id,
+        messageType: "failed",
+      });
+    } else if (task.reviewCircuit?.stage === "awaiting_user_decision") {
+      items.push({
+        id: `circuit:${task.id}`,
+        kind: "failed",
+        severity: "danger",
+        label: task.title,
+        title: t("review.circuit.awaitingShort"),
+        section: "messages",
+        taskId: task.id,
+        messageType: "escalation",
+      });
+    } else if (task.reviewCircuit?.stage === "handoff_to_coordinator") {
+      items.push({
+        id: `circuit:${task.id}`,
+        kind: "stall",
+        severity: "warn",
+        label: task.title,
+        title: t("review.circuit.handoffShort"),
+        section: "messages",
+        taskId: task.id,
+        messageType: "escalation",
+      });
+    }
   }
   for (const [index, stall] of (snap.stalls ?? []).entries()) {
     const taskId = stall.taskIds?.find((id) => snap.tasks.some((task) => task.id === id));
