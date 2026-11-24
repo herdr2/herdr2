@@ -231,7 +231,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libasound2-dev pkg-config
+          sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libasound2-dev libfontconfig1-dev libfreetype-dev libclang-dev libx11-dev pkg-config
 
       - name: Build & package herdr-app
         shell: bash

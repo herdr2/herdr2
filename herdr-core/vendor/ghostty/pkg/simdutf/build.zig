@@ -68,7 +68,16 @@ pub fn build(b: *std.Build) !void {
     if (target.result.abi == .msvc) {
         // On MSVC we skip linkLibCpp (see above), so the C++ standard is
         // not set implicitly. simdutf requires C++17, so set it explicitly.
-        try flags.append(b.allocator, "-std=c++17");
+        // MSVC 14.52+ (VS 2026 on windows-latest) rejects Clang < 22 unless
+        // _ALLOW_COMPILER_AND_STL_VERSION_MISMATCH is set; Zig 0.16 also
+        // treats unused -nostdinc++ and non-constexpr array-bounds in
+        // simdutf.cpp as errors under MSVC.
+        try flags.appendSlice(b.allocator, &.{
+            "-std=c++17",
+            "-D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH",
+            "-Wno-unused-command-line-argument",
+            "-Wno-array-bounds",
+        });
     }
 
     if (target.result.os.tag == .freebsd or

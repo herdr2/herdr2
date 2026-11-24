@@ -48,6 +48,10 @@ unsafe extern "C" {
     fn getaudit_addr(info: *mut AuditInfo, size: libc::c_int) -> libc::c_int;
 }
 
+pub fn graphic_session() -> io::Result<Option<u32>> {
+    audit().map(|a| (a.flags & 0x10 != 0).then_some(a.session))
+}
+
 fn audit() -> io::Result<AuditInfo> {
     let mut info = AuditInfo::default();
     if unsafe { getaudit_addr(&mut info, std::mem::size_of::<AuditInfo>() as libc::c_int) } != 0 {
