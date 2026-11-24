@@ -118,7 +118,7 @@ jobs:
         include:
           - os: ubuntu-latest
             target: linux-x86_64
-          - os: macos-15
+          - os: macos-15-intel
             target: macos-aarch64
           - os: windows-latest
             target: windows-x86_64
@@ -150,9 +150,16 @@ jobs:
           HERDR2_DEFAULT_RELEASES_URL: https://github.com/${{ github.repository }}/releases/download/${{ env.OTA_TAG }}
         run: |
           cd herdr-core
-          cargo build --release --locked -p herdr2
+          if [ "${{ matrix.target }}" = "macos-aarch64" ]; then
+            rustup target add aarch64-apple-darwin
+            cargo build --release --locked --target aarch64-apple-darwin -p herdr2
+            CORE_BIN=target/aarch64-apple-darwin/release/herdr2
+          else
+            cargo build --release --locked -p herdr2
+            CORE_BIN=target/release/herdr2
+          fi
           mkdir -p ../dist/core-ota
-          sh scripts/package target/release/herdr2 "../dist/core-ota/herdr2-core-${{ matrix.target }}.tar.gz"
+          sh scripts/package "$CORE_BIN" "../dist/core-ota/herdr2-core-${{ matrix.target }}.tar.gz"
 
       - name: Build & package herdr-core (Windows)
         if: runner.os == 'Windows'
@@ -212,7 +219,7 @@ jobs:
         include:
           - os: ubuntu-latest
             target: linux-x86_64
-          - os: macos-15
+          - os: macos-15-intel
             target: macos-aarch64
           - os: windows-latest
             target: windows-x86_64
@@ -239,7 +246,12 @@ jobs:
           HERDR2_APP_RELEASE: '1'
           HERDR2_DEFAULT_RELEASES_URL: https://github.com/${{ github.repository }}/releases/download/${{ env.OTA_TAG }}
         run: |
-          bash herdr-app/scripts/package
+          if [ "${{ matrix.target }}" = "macos-aarch64" ]; then
+            rustup target add aarch64-apple-darwin
+            bash herdr-app/scripts/package aarch64-apple-darwin
+          else
+            bash herdr-app/scripts/package
+          fi
           mkdir -p dist/app-ota
           cp "herdr-app/dist/herdr2-${{ matrix.target }}.tar.gz" "dist/app-ota/herdr2-app-${{ matrix.target }}.tar.gz"
 

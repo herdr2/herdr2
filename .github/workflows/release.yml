@@ -48,7 +48,7 @@ jobs:
         include:
           - os: ubuntu-latest
             target: linux-x86_64
-          - os: macos-15
+          - os: macos-15-intel
             target: macos-aarch64
           - os: windows-latest
             target: windows-x86_64
@@ -106,15 +106,17 @@ jobs:
           APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
-          (cd herdr-core && cargo build --release --locked -p herdr2)
-          bash herdr-app/scripts/package
+          rustup target add aarch64-apple-darwin
+          (cd herdr-core && cargo build --release --locked --target aarch64-apple-darwin -p herdr2)
+          bash herdr-app/scripts/package aarch64-apple-darwin
           mkdir -p dist/installers dist/ota dist/unpack
           cp herdr-app/dist/herdr2-macos-aarch64.tar.gz dist/ota/herdr2-app-macos-aarch64.tar.gz
-          sh herdr-core/scripts/package herdr-core/target/release/herdr2 dist/ota/herdr2-core-macos-aarch64.tar.gz
+          sh herdr-core/scripts/package herdr-core/target/aarch64-apple-darwin/release/herdr2 dist/ota/herdr2-core-macos-aarch64.tar.gz
           tar -xzf herdr-app/dist/herdr2-macos-aarch64.tar.gz -C dist/unpack
+          file herdr-core/target/aarch64-apple-darwin/release/herdr2 dist/unpack/Herdr2.app/Contents/MacOS/Herdr2
           bash scripts/package-macos-dmg.sh \
             dist/unpack/Herdr2.app \
-            herdr-core/target/release/herdr2 \
+            herdr-core/target/aarch64-apple-darwin/release/herdr2 \
             "dist/installers/Herdr2-${{ needs.prepare.outputs.version }}-macos-aarch64.dmg"
 
       - name: Build herdr-core & herdr-app + Windows Inno Setup Installer
