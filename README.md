@@ -21,6 +21,55 @@ Herdr2 将 **Ghostty 真终端（`t*`）**、**无头结构化 ACP 智能体（`
 
 ---
 
+## 安装方式
+
+### 方式一：通过 `herdr2-install` 一键安装（推荐）
+
+最省心的方式是直接使用仓库内置的 **`herdr2-install`** 安装技能（[skills/herdr2-install/SKILL.md](./skills/herdr2-install/SKILL.md)），交给你常用的 AI 编程助手（Antigravity、Claude Code、Codex、Cursor、OpenCode 等）全自动完成。
+
+只需将下面这段话直接发给你的 AI Agent：
+
+```text
+请阅读 https://raw.githubusercontent.com/herdr2/herdr2/main/skills/herdr2-install/SKILL.md 并按步骤在本机安装和配置 Herdr2。
+```
+
+AI Agent 会自动完成全流程：
+1. **自动识别系统与架构**：适配 macOS（Apple Silicon）、Linux、WSL（自动区分 WSL 内核 `h2` 与 Windows 宿主桌面）及 Windows（x64）；
+2. **下载安装桌面端 + `h2` Core**：从 [GitHub Releases](https://github.com/herdr2/herdr2/releases/latest) 拉取对应平台的官方安装包或一键脚本；
+3. **启动并校验守护进程**：校验 `PATH`、`h2 --version`、`herdr2 --version` 与 `h2 server status`；
+4. **自动注入配套 Skills**：执行 `h2 skill install --all`，将 `herdr2`、`drove`、`drove-add`、`drove-setup` 技能一次性安装到本机已检测到的编码 Agent；
+5. **引导首次启动与 Core AI 配置**：完成后即可启用应用内 OTA 一键热更新。
+
+### 方式二：各平台手动安装
+
+你也可以直接前往 **[GitHub Releases](https://github.com/herdr2/herdr2/releases/latest)** 下载图形化安装包，或在终端运行一键安装命令：
+
+- **macOS（Apple Silicon）** — 安装 `~/Applications/Herdr2.app` 与 `herdr2` / `h2` CLI（也可下载 `.dmg` 拖入应用程序）：
+  ```bash
+  curl -fsSL https://github.com/herdr2/herdr2/releases/download/ota-latest/app-install.sh | sh
+  ```
+- **Linux 桌面（通用免 sudo 一键安装）** — Ubuntu/Debian 也可直接下载 Release 中的 `.deb` 执行 `sudo apt install ./herdr2_<ver>_amd64.deb`：
+  ```bash
+  curl -fsSL https://github.com/herdr2/herdr2/releases/download/ota-latest/app-install.sh | sh
+  ```
+- **Linux 服务器 / WSL（仅安装 `h2` 守护进程与 CLI，无需 GUI）**：
+  ```bash
+  curl -fsSL https://github.com/herdr2/herdr2/releases/download/ota-latest/core-install.sh | sh
+  ```
+- **Windows（PowerShell，无需管理员权限）** — 也可下载 Release 中的 `Herdr2-Setup-<ver>-windows-x86_64.exe` 双击安装：
+  ```powershell
+  irm https://github.com/herdr2/herdr2/releases/download/ota-latest/app-install.ps1 | iex
+  ```
+
+安装完成后，启动核心守护进程并安装配套 Agent Skills：
+
+```bash
+h2 server start && h2 server status
+h2 skill install --all
+```
+
+---
+
 ## 快速导航与文档
 
 ### 用户使用手册（推荐从这里开始）
