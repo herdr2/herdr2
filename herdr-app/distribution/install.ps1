@@ -11,8 +11,10 @@ $ProgressPreference = "SilentlyContinue"
 
 function Fail($why) { throw "herdr2: $why" }
 
-$releases = if ($env:HERDR2_RELEASES_URL) { $env:HERDR2_RELEASES_URL.TrimEnd("/") } elseif ($env:HERDR_RELEASES_URL) { $env:HERDR_RELEASES_URL.TrimEnd("/") } else { "" }
-if (-not $releases) { Fail "set `$env:HERDR2_RELEASES_URL to your release server base URL" }
+$releases = if ($env:HERDR2_RELEASES_URL) { $env:HERDR2_RELEASES_URL.TrimEnd("/") } elseif ($env:HERDR_RELEASES_URL) { $env:HERDR_RELEASES_URL.TrimEnd("/") } else { "https://github.com/herdr2/herdr2/releases/download/ota-latest" }
+$isGhFlat = ($releases -like "*/releases/download/*") -or ($releases -like "*/releases/latest/download")
+$appManifest = if ($isGhFlat) { "$releases/app-latest.json" } else { "$releases/app/latest.json" }
+$coreInstaller = if ($isGhFlat) { "$releases/core-install.ps1" } else { "$releases/core/install.ps1" }
 
 $dir = Join-Path $env:LOCALAPPDATA "Programs\herdr2"
 $arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
@@ -26,7 +28,7 @@ if (-not (Get-Command curl.exe -ErrorAction SilentlyContinue) -or -not (Test-Pat
 $tmp = Join-Path ([IO.Path]::GetTempPath()) "herdr2-install-$PID"
 New-Item -ItemType Directory -Force $tmp | Out-Null
 try {
-    curl.exe -fsSL "$releases/app/latest.json" -o "$tmp\latest.json"
+    curl.exe -fsSL $appManifest -o "$tmp\latest.json"
     if ($LASTEXITCODE) { Fail "cannot reach $releases" }
     $m = Get-Content -Raw "$tmp\latest.json" | ConvertFrom-Json
     $t = $m.targets.$target
@@ -71,7 +73,7 @@ try {
     if (-not (Test-Path $core) -and -not (Get-Command h2 -ErrorAction SilentlyContinue)) {
         try {
             $env:HERDR2_RELEASES_URL = $releases
-            Invoke-RestMethod "$releases/core/install.ps1" | Invoke-Expression
+            Invoke-RestMethod $coreInstaller | Invoke-Expression
         } catch {
             Write-Host "herdr2-core didn't install; Herdr2 will offer it when it opens."
         }

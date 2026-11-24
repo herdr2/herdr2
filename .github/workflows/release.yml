@@ -1,0 +1,254 @@
+name: Herdr2 Release Installers (macOS / Linux / Windows)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (e.g. v0.2.0; defaults to Cargo.toml version)'
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  OTA_TAG: ota-latest
+  CARGO_TERM_COLOR: always
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: |
+          CARGO_VER=$(sed -n 's/^version = "\(.*\)"/\1/p' herdr-app/Cargo.toml | head -n 1)
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ inputs.tag }}" ]; then
+            TAG="${{ inputs.tag }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF_NAME}"
+          else
+            TAG="v${CARGO_VER}"
+          fi
+          VER="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VER" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: macos-14
+            target: macos-aarch64
+          - os: windows-latest
+            target: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux desktop & packaging deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libasound2-dev pkg-config dpkg-dev
+
+      - name: Build drove-web bundle
+        working-directory: drove-web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build herdr-core & herdr-app (Linux)
+        if: runner.os == 'Linux'
+        env:
+          H2_REQUIRE_WEB_BUNDLE: '1'
+          HERDR2_APP_RELEASE: '1'
+          HERDR2_DEFAULT_RELEASES_URL: https://github.com/${{ github.repository }}/releases/download/${{ env.OTA_TAG }}
+        run: |
+          (cd herdr-core && cargo build --release --locked -p herdr2)
+          bash herdr-app/scripts/package
+          mkdir -p dist/installers dist/ota
+          cp herdr-app/dist/herdr2-linux-x86_64.tar.gz dist/ota/herdr2-app-linux-x86_64.tar.gz
+          sh herdr-core/scripts/package herdr-core/target/release/herdr2 dist/ota/herdr2-core-linux-x86_64.tar.gz
+          bash scripts/package-linux-installer.sh \
+            herdr-app/target/release/herdr2 \
+            herdr-core/target/release/herdr2 \
+            "${{ needs.prepare.outputs.version }}" \
+            x86_64 \
+            dist/installers
+
+      - name: Build herdr-core & herdr-app + macOS DMG
+        if: runner.os == 'macOS'
+        env:
+          H2_REQUIRE_WEB_BUNDLE: '1'
+          HERDR2_APP_RELEASE: '1'
+          HERDR2_DEFAULT_RELEASES_URL: https://github.com/${{ github.repository }}/releases/download/${{ env.OTA_TAG }}
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          (cd herdr-core && cargo build --release --locked -p herdr2)
+          bash herdr-app/scripts/package
+          mkdir -p dist/installers dist/ota dist/unpack
+          cp herdr-app/dist/herdr2-macos-aarch64.tar.gz dist/ota/herdr2-app-macos-aarch64.tar.gz
+          sh herdr-core/scripts/package herdr-core/target/release/herdr2 dist/ota/herdr2-core-macos-aarch64.tar.gz
+          tar -xzf herdr-app/dist/herdr2-macos-aarch64.tar.gz -C dist/unpack
+          bash scripts/package-macos-dmg.sh \
+            dist/unpack/Herdr2.app \
+            herdr-core/target/release/herdr2 \
+            "dist/installers/Herdr2-${{ needs.prepare.outputs.version }}-macos-aarch64.dmg"
+
+      - name: Build herdr-core & herdr-app + Windows Inno Setup Installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          H2_REQUIRE_WEB_BUNDLE: '1'
+          HERDR2_APP_RELEASE: '1'
+          HERDR2_DEFAULT_RELEASES_URL: https://github.com/${{ github.repository }}/releases/download/${{ env.OTA_TAG }}
+        run: |
+          Push-Location herdr-core
+          cargo build --release --locked -p herdr2
+          Pop-Location
+
+          Push-Location herdr-app
+          cargo build --release --locked
+          Pop-Location
+
+          New-Item -ItemType Directory -Force dist\installers, dist\ota, dist\stage-app, dist\stage-core, dist\ota-app-stage\herdr2 | Out-Null
+
+          # Stage desktop app
+          Copy-Item herdr-app\target\release\herdr2.exe dist\stage-app\herdr2.exe
+          Copy-Item herdr-app\assets\icons\herdr-ui-icon-clean.svg dist\stage-app\herdr2.svg
+          Copy-Item herdr-app\LICENSE dist\stage-app\LICENSE
+          Copy-Item herdr-app\THIRD-PARTY-NOTICES dist\stage-app\THIRD-PARTY-NOTICES
+
+          # Stage OTA app archive
+          Copy-Item dist\stage-app\* dist\ota-app-stage\herdr2\
+          & "$env:SystemRoot\System32\tar.exe" -czf dist\ota\herdr2-app-windows-x86_64.tar.gz -C dist\ota-app-stage herdr2
+
+          # Stage core runtime (h2.exe + herdr2-core.exe)
+          Copy-Item herdr-core\target\release\herdr2.exe dist\stage-core\herdr2-core.exe
+          Copy-Item herdr-core\target\release\herdr2.exe dist\stage-core\h2.exe
+          Copy-Item herdr-core\LICENSE dist\stage-core\LICENSE
+          Copy-Item herdr-core\crates\herdr2\THIRD-PARTY-NOTICES dist\stage-core\THIRD-PARTY-NOTICES
+
+          # Stage OTA core zip
+          $coreZipStage = "dist\ota-core-stage"
+          New-Item -ItemType Directory -Force $coreZipStage | Out-Null
+          Copy-Item herdr-core\target\release\herdr2.exe $coreZipStage\herdr2.exe
+          Copy-Item herdr-core\LICENSE $coreZipStage\LICENSE
+          Copy-Item herdr-core\crates\herdr2\THIRD-PARTY-NOTICES $coreZipStage\THIRD-PARTY-NOTICES
+          & "$env:SystemRoot\System32\tar.exe" -a -cf dist\ota\herdr2-core-windows-x86_64.zip -C $coreZipStage .
+
+          # Build single-file Windows installer (.exe) with Inno Setup
+          $iscc = (Get-Command iscc.exe -ErrorAction SilentlyContinue).Source
+          if (-not $iscc) { $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" }
+          if (-not (Test-Path $iscc)) { choco install innosetup -y; $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" }
+          & $iscc `
+            "/DMyAppVersion=${{ needs.prepare.outputs.version }}" `
+            "/DAppStageDir=$(Resolve-Path dist\stage-app)" `
+            "/DCoreStageDir=$(Resolve-Path dist\stage-core)" `
+            "/DOutputDir=$(Resolve-Path dist\installers)" `
+            herdr-app\distribution\windows\herdr2.iss
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            dist/installers/*
+            dist/ota/*
+
+  publish:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist/all
+
+      - name: Generate SHA256SUMS, OTA manifests & publish GitHub Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VER="${{ needs.prepare.outputs.version }}"
+          TAG="${{ needs.prepare.outputs.tag }}"
+          OTA_URL="https://github.com/${{ github.repository }}/releases/download/${OTA_TAG}"
+
+          mkdir -p dist/release-assets dist/ota-assets
+          cp dist/all/installers/* dist/release-assets/
+          cp dist/all/ota/* dist/ota-assets/
+
+          # Generate OTA manifests (app + core + ui)
+          python3 scripts/release.py manifest \
+            --github-release \
+            --dir dist/ota-assets \
+            --base-url "$OTA_URL" \
+            --app-version "$VER" \
+            --core-version "$VER" \
+            --notes "Herdr2 $TAG"
+          python3 scripts/release.py ui \
+            --github-release \
+            --version "${VER}-ui.0" \
+            --base-url "$OTA_URL" \
+            --out dist/ota-assets \
+            --notes "Herdr2 UI $TAG"
+
+          # Copy install skill into release assets for easy one-click download
+          cp skills/herdr2-install/SKILL.md dist/release-assets/herdr2-install-SKILL.md
+
+          (cd dist/release-assets && sha256sum * > SHA256SUMS.txt)
+
+          # Publish versioned release with user-facing single installers
+          NOTES=$(cat <<EOF
+          ## Herdr2 $TAG
+
+          ### Direct Download Installers (includes Desktop App + \`h2\` Core)
+          - **Windows (x64)**: \`Herdr2-Setup-${VER}-windows-x86_64.exe\` — double-click to install App + \`h2\` CLI
+          - **macOS (Apple Silicon)**: \`Herdr2-${VER}-macos-aarch64.dmg\` — open and drag \`Herdr2.app\` to Applications
+          - **Linux (Ubuntu/Debian)**: \`herdr2_${VER}_amd64.deb\` — run \`sudo apt install ./herdr2_${VER}_amd64.deb\`
+          - **Linux (Generic x64)**: \`herdr2-${VER}-linux-x86_64.tar.gz\` — extract and run \`./install.sh\`
+
+          ### Install via Your AI Agent
+          Give your agent the install skill:
+          \`https://raw.githubusercontent.com/${{ github.repository }}/main/skills/herdr2-install/SKILL.md\`
+
+          ### Install Companion Skills After Setup
+          \`\`\`sh
+          h2 skill install --all
+          \`\`\`
+          EOF
+          )
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/release-assets/* --clobber
+          else
+            gh release create "$TAG" dist/release-assets/* --title "Herdr2 $TAG" --notes "$NOTES"
+          fi
+
+          # Sync rolling OTA channel
+          if ! gh release view "$OTA_TAG" >/dev/null 2>&1; then
+            gh release create "$OTA_TAG" --title "Herdr2 OTA Channel (Rolling)" --notes "Rolling OTA hot-update channel." --prerelease
+          fi
+          gh release upload "$OTA_TAG" dist/ota-assets/* --clobber

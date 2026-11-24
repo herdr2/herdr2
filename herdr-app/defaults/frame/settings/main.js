@@ -23,6 +23,7 @@ const SECTIONS = () => [
   { id: "machines", title: "Machines", zh: "主机", icon: "server" },
   { id: "ai", title: "AI", zh: "AI 助手", icon: "sparkles" },
   { id: "drove", title: "Drove", zh: "Drove", icon: "layers" },
+  { id: "skills", title: "Skills", zh: "Skills", icon: "sparkles" },
   { id: "alerts", title: "Alerts", zh: "提醒", icon: "bell" },
   { id: "updates", title: "Updates", zh: "更新", icon: "refresh" },
 ];
@@ -287,9 +288,16 @@ export default class Settings extends View {
     this.keysFilter = "";
     this.keysFilterInput = InputState.new({ placeholder: this.tr("Search shortcuts or actions…", "搜索快捷键或操作…") });
     this.keysFilterInput.on("change", (_e, cx) => { this.keysFilter = this.keysFilterInput.value(); cx.notify(); });
-    this.releasesUrlInput = InputState.new({ placeholder: "https://releases.example.com" });
+    this.releasesUrlInput = InputState.new({ placeholder: "https://github.com/herdr2/herdr2/releases/download/ota-latest" });
     this.releasesUrlSynced = false;
     this.releasesUrlSavedAt = 0;
+    this.skillData = null;
+    this.skillLoading = false;
+    this.skillInstalling = null; // null | "all" | "ai" | "custom" | agentId
+    this.skillError = null;
+    this.skillResult = null;
+    this.skillCustomDirInput = InputState.new({ placeholder: this.tr("~/.claude/skills or /custom/skills/dir", "~/.claude/skills 或自定义技能目录") });
+    this.skillAiHintInput = InputState.new({ placeholder: this.tr("Optional: specify an agent or custom directory (leave blank to auto-detect all)…", "可选：输入想适配的 Agent 名称或特殊路径（留空则自动全面识别）…") });
     this.recordingTarget = null;
     this.lastRecordedSeq = Number(shared("settings.recorded_shortcut")?.seq ?? 0);
     this.keysNotice = null;
@@ -309,6 +317,9 @@ export default class Settings extends View {
           await this.loadMachines();
           await this.loadDrove();
           this.maybeAutoProbeDrove(cx);
+        }
+        if (this.section === "skills") {
+          await Promise.all([this.loadSkills(), this.loadAi()]);
         }
       }
       cx.notify();
@@ -5232,6 +5243,442 @@ export default class Settings extends View {
       );
   }
 
+  // Skills ---------------------------------------------------------------
+
+  async loadSkills() {
+    if (this.skillLoading || (typeof checking === "function" && checking())) return;
+    this.skillLoading = true;
+    this.skillError = null;
+    try {
+      const r = await hc(["skill", "status", "--json"]);
+      let parsed = null;
+      try { parsed = JSON.parse(r.stdout || r.stderr); } catch {}
+      if (r.code !== 0) {
+        throw new Error(parsed?.error?.message || (r.stderr || r.stdout || "Failed to inspect skills.").trim());
+      }
+      this.skillData = parsed;
+    } catch (e) {
+      this.skillError = String(e?.message ?? e);
+    } finally {
+      this.skillLoading = false;
+    }
+  }
+
+  installSkills(opts, cx) {
+    if (this.skillInstalling) return;
+    const tag = opts?.target ? "custom" : opts?.agent ? opts.agent : "all";
+    this.skillInstalling = tag;
+    this.skillError = null;
+    this.skillResult = null;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const args = ["skill", "install", "--json"];
+        if (opts?.target) args.push("--target", opts.target);
+        else if (opts?.agent) args.push("--agent", opts.agent);
+        else args.push("--all");
+        const r = await hc(args);
+        let parsed = null;
+        try { parsed = JSON.parse(r.stdout || r.stderr); } catch {}
+        if (r.code !== 0) {
+          throw new Error(parsed?.error?.message || (r.stderr || r.stdout || "Skill installation failed.").trim());
+        }
+        if (parsed?.status) this.skillData = parsed.status;
+        else await this.loadSkills();
+        this.skillResult = {
+          ok: true,
+          usedAi: false,
+          summary: this.tr(
+            `Installed ${parsed?.installedCount ?? 0} skill file(s) across ${(parsed?.targets ?? []).length} target(s).`,
+            `已为 ${(parsed?.targets ?? []).length} 个目标目录安装 ${parsed?.installedCount ?? 0} 个 Skill 文件。`,
+          ),
+          targets: parsed?.targets ?? [],
+          tips: [],
+        };
+      } catch (e) {
+        this.skillError = String(e?.message ?? e);
+      } finally {
+        this.skillInstalling = false;
+        cx.notify();
+      }
+    });
+  }
+
+  aiInstallSkills(cx) {
+    if (this.skillInstalling) return;
+    this.skillInstalling = "ai";
+    this.skillError = null;
+    this.skillResult = null;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const hint = String(this.skillAiHintInput?.value?.() ?? "").trim();
+        const args = ["skill", "ai-install", "--lang", this.lang(), "--json"];
+        if (hint) args.push("--query", hint);
+        const r = await hc(args);
+        let parsed = null;
+        try { parsed = JSON.parse(r.stdout || r.stderr); } catch {}
+        if (r.code !== 0) {
+          throw new Error(parsed?.error?.message || (r.stderr || r.stdout || "AI skill installation failed.").trim());
+        }
+        if (parsed?.status) this.skillData = parsed.status;
+        else await this.loadSkills();
+        this.skillResult = {
+          ok: true,
+          usedAi: Boolean(parsed?.usedAi),
+          model: parsed?.model ?? null,
+          aiError: parsed?.aiError ?? null,
+          summary: parsed?.summary || this.tr("Companion skills installed.", "配套 Skill 已安装完成。"),
+          targets: parsed?.targets ?? [],
+          tips: Array.isArray(parsed?.tips) ? parsed.tips : [],
+        };
+      } catch (e) {
+        this.skillError = String(e?.message ?? e);
+      } finally {
+        this.skillInstalling = false;
+        cx.notify();
+      }
+    });
+  }
+
+  skills(t, cx) {
+    const data = this.skillData ?? {};
+    const bundled = Array.isArray(data.bundledSkills) ? data.bundledSkills : [
+      { id: "herdr2", summaryEn: "Core h2 CLI orchestration & ACP sub-agents", summaryZh: "核心 h2 CLI 编排与无头 ACP 子智能体" },
+      { id: "drove", summaryEn: "Multi-agent DAG orchestration", summaryZh: "Drove 多智能体 DAG 编排" },
+      { id: "drove-add", summaryEn: "Append tasks to active Drove Runs", summaryZh: "向 Drove Run 追加新任务" },
+      { id: "drove-setup", summaryEn: "Configure Drove roles & AI", summaryZh: "配置 Drove 角色与 AI" },
+    ];
+    const agents = Array.isArray(data.agents) ? data.agents : [];
+    const aiReady = Boolean(this.aiStatus?.configured);
+    const busy = Boolean(this.skillInstalling);
+    const primaryBtn = (id, label, onClick, disabled = false) =>
+      div()
+        .id(id)
+        .px(12)
+        .py(6)
+        .rounded(7)
+        .text_size(12.5)
+        .font_semibold()
+        .bg(t.accent)
+        .text_color(t.accent_foreground)
+        .when(disabled, (el) => el.opacity(0.55))
+        .when(!disabled, (el) => el.cursor_pointer().hover((s) => s.opacity(0.9)).on_click(onClick))
+        .child(label);
+
+    const statusBadge = (st) => {
+      if (st === "up_to_date") return [this.tr("Up to date", "已是最新"), t.ansi2];
+      if (st === "outdated") return [this.tr("Update available", "有新版可更新"), t.working];
+      if (st === "partial") return [this.tr("Partial", "部分已安装"), t.working];
+      return [this.tr("Not installed", "未安装"), t.dim];
+    };
+
+    return v_flex()
+      .w_full()
+      .gap(16)
+      // 1. Companion Skills Overview & One-Click Install
+      .child(
+        v_flex()
+          .w_full()
+          .gap(10)
+          .p(14)
+          .rounded(10)
+          .border_1()
+          .border_color(t.border)
+          .bg(t.surface)
+          .child(
+            h_flex()
+              .items_center()
+              .justify_between()
+              .gap(10)
+              .child(
+                v_flex()
+                  .gap(2)
+                  .child(div().text_size(14).font_semibold().text_color(t.foreground).child(this.tr("Herdr2 Companion Skills", "Herdr2 配套 Skill 一键安装")))
+                  .child(
+                    div()
+                      .text_size(12.2)
+                      .text_color(t.dim)
+                      .child(
+                        this.tr(
+                          "Install bundled `herdr2` + `drove` skills so your coding agents know how to orchestrate `h2` CLI, ACP sub-agents, and Drove DAGs.",
+                          "一键安装内置的 `herdr2` 与 `drove` 配套 Skill，让本机各类编程 Agent 自动掌握 `h2` CLI、无头子智能体编排与 Drove DAG 协作。",
+                        ),
+                      ),
+                  ),
+              )
+              .child(
+                h_flex()
+                  .gap(8)
+                  .flex_none()
+                  .items_center()
+                  .child(
+                    this.button(
+                      t,
+                      "st-skill-refresh",
+                      this.skillLoading ? this.tr("Scanning…", "扫描中…") : this.tr("Rescan", "重新扫描"),
+                      (_e, cx) => { cx.spawn(async (cx) => { await this.loadSkills(); cx.notify(); }); },
+                    ),
+                  )
+                  .child(
+                    primaryBtn(
+                      "st-skill-install-all",
+                      this.skillInstalling === "all"
+                        ? this.tr("Installing…", "安装中…")
+                        : this.tr("Install to All Detected", "一键安装到已检测 Agent"),
+                      (_e, cx) => this.installSkills({ all: true }, cx),
+                      busy,
+                    ),
+                  ),
+              ),
+          )
+          .child(
+            h_flex()
+              .gap(6)
+              .flex_wrap()
+              .children(
+                bundled.map((sk) =>
+                  div()
+                    .px(8)
+                    .py(3)
+                    .rounded(6)
+                    .border_1()
+                    .border_color(t.border)
+                    .bg(t.background)
+                    .text_size(11.5)
+                    .text_color(t.foreground)
+                    .tooltip(this.tr(sk.summaryEn || "", sk.summaryZh || ""))
+                    .child(sk.id),
+                ),
+              ),
+          ),
+      )
+      .when(Boolean(this.skillError), (el) =>
+        el.child(div().px(12).py(8).rounded(8).border_1().border_color(t.blocked).bg(t.surface).text_size(12.5).text_color(t.blocked).child(this.skillError)),
+      )
+      .when(Boolean(this.skillResult), (el) =>
+        el.child(
+          v_flex()
+            .gap(6)
+            .p(12)
+            .rounded(9)
+            .border_1()
+            .border_color(t.ansi2)
+            .bg(t.ansi2 + "14")
+            .child(
+              h_flex()
+                .items_center()
+                .justify_between()
+                .gap(8)
+                .child(div().text_size(12.8).font_semibold().text_color(t.ansi2).child(this.skillResult.summary))
+                .when(Boolean(this.skillResult.usedAi && this.skillResult.model), (b) =>
+                  b.child(div().text_size(11).text_color(t.dim).child(`AI · ${this.skillResult.model}`)),
+                ),
+            )
+            .when(Boolean(this.skillResult.aiError), (b) =>
+              b.child(div().text_size(11.8).text_color(t.working).child(this.skillResult.aiError)),
+            )
+            .children(
+              (this.skillResult.targets ?? []).map((item) =>
+                div()
+                  .text_size(11.8)
+                  .text_color(t.foreground)
+                  .child(`• ${item.agent}: ${item.target}${item.reason ? ` — ${item.reason}` : ""}`),
+              ),
+            )
+            .children(
+              (this.skillResult.tips ?? []).map((tip) =>
+                div().text_size(11.5).text_color(t.muted).child(`→ ${tip}`),
+              ),
+            ),
+        ),
+      )
+      // 2. AI-Assisted Skill Installer Card
+      .child(
+        v_flex()
+          .w_full()
+          .gap(8)
+          .child(this.heading(t, this.tr("AI Skill Installation Assistant", "✨ 自带 AI 智能安装助手")))
+          .child(
+            v_flex()
+              .w_full()
+              .gap(10)
+              .p(14)
+              .rounded(10)
+              .border_1()
+              .border_color(t.accent)
+              .bg(t.surface)
+              .child(
+                div()
+                  .text_size(12.5)
+                  .line_height("18px")
+                  .text_color(t.muted)
+                  .child(
+                    this.tr(
+                      "Use Herdr2's built-in Core AI to inspect local CLIs, config directories, and non-standard agent tools, then automatically install and verify all Herdr2 skills.",
+                      "调用 Herdr2 内置核心 AI 能力，自动扫描本机编程 CLI、配置目录及非标准工具，智能规划目标路径并完成全套 Skill 安装与校验。",
+                    ),
+                  ),
+              )
+              .child(
+                h_flex()
+                  .gap(8)
+                  .items_center()
+                  .child(
+                    div()
+                      .flex_1()
+                      .px(8)
+                      .py(3)
+                      .rounded(6)
+                      .border_1()
+                      .border_color(t.border)
+                      .bg(t.background)
+                      .child(Input.new(this.skillAiHintInput).h(26).text_size(12.5).text_color(t.foreground)),
+                  )
+                  .child(
+                    aiReady
+                      ? primaryBtn(
+                          "st-skill-ai-install",
+                          this.skillInstalling === "ai"
+                            ? this.tr("AI Installing…", "AI 分析安装中…")
+                            : this.tr("✨ AI Auto-Install", "✨ AI 智能安装"),
+                          (_e, cx) => this.aiInstallSkills(cx),
+                          busy,
+                        )
+                      : this.button(
+                          t,
+                          "st-skill-goto-ai",
+                          this.tr("Configure AI first…", "先配置 AI 助手…"),
+                          (_e, cx) => {
+                            this.section = "ai";
+                            cx.spawn(async (cx) => { await this.loadAi(); cx.notify(); });
+                            cx.notify();
+                          },
+                        ),
+                  ),
+              ),
+          ),
+      )
+      // 3. Detected Local Agent Targets
+      .child(
+        v_flex()
+          .w_full()
+          .gap(6)
+          .child(this.heading(t, this.tr("Local Coding Agents", "本机编程 Agent 检测列表")))
+          .child(
+            v_flex()
+              .w_full()
+              .rounded(10)
+              .border_1()
+              .border_color(t.border)
+              .bg(t.surface)
+              .overflow_hidden()
+              .children(
+                agents.map((a, idx) => {
+                  const [stLabel, stColor] = statusBadge(a.status);
+                  const actLabel =
+                    this.skillInstalling === a.id
+                      ? this.tr("Installing…", "安装中…")
+                      : a.status === "up_to_date"
+                        ? this.tr("Reinstall", "重装")
+                        : a.status === "outdated" || a.status === "partial"
+                          ? this.tr("Update", "更新")
+                          : this.tr("Install", "安装");
+                  return h_flex()
+                    .w_full()
+                    .px(14)
+                    .py(10)
+                    .gap(12)
+                    .items_center()
+                    .when(idx > 0, (el) => el.border_t(1).border_color(t.border))
+                    .child(div().w(7).h(7).flex_none().rounded(4).bg(a.detected ? t.ansi2 : t.dim))
+                    .child(
+                      v_flex()
+                        .flex_1()
+                        .min_w(0)
+                        .gap(2)
+                        .child(
+                          h_flex()
+                            .gap(8)
+                            .items_center()
+                            .child(div().text_size(13).font_semibold().text_color(t.foreground).child(a.name))
+                            .when(a.detected, (el) =>
+                              el.child(
+                                div()
+                                  .px(6)
+                                  .py(1)
+                                  .rounded(4)
+                                  .bg(t.ansi2 + "1c")
+                                  .text_size(10.5)
+                                  .text_color(t.ansi2)
+                                  .child(this.tr("Detected", "已检测到")),
+                              ),
+                            )
+                            .child(
+                              div()
+                                .px(6)
+                                .py(1)
+                                .rounded(4)
+                                .bg(t.background)
+                                .border_1()
+                                .border_color(t.border)
+                                .text_size(10.5)
+                                .text_color(stColor)
+                                .child(stLabel),
+                            ),
+                        )
+                        .child(div().truncate().text_size(11.5).text_color(t.dim).child(a.skillsDir)),
+                    )
+                    .child(
+                      this.button(t, `st-skill-inst-${a.id}`, actLabel, (_e, cx) => {
+                        if (!busy) this.installSkills({ agent: a.id }, cx);
+                      }),
+                    );
+                }),
+              ),
+          ),
+      )
+      // 4. Custom Directory Install
+      .child(
+        v_flex()
+          .w_full()
+          .gap(8)
+          .child(this.heading(t, this.tr("Custom Skills Directory", "安装到自定义目录")))
+          .child(
+            h_flex()
+              .gap(8)
+              .items_center()
+              .child(
+                div()
+                  .flex_1()
+                  .px(8)
+                  .py(3)
+                  .rounded(6)
+                  .border_1()
+                  .border_color(t.border)
+                  .bg(t.background)
+                  .child(Input.new(this.skillCustomDirInput).h(26).text_size(12.5).text_color(t.foreground)),
+              )
+              .child(
+                this.button(
+                  t,
+                  "st-skill-install-custom",
+                  this.skillInstalling === "custom" ? this.tr("Installing…", "安装中…") : this.tr("Install Here", "安装到此目录"),
+                  (_e, cx) => {
+                    const dir = String(this.skillCustomDirInput?.value?.() ?? "").trim();
+                    if (!dir) {
+                      this.skillError = this.tr("Please enter a target directory path.", "请先输入目标目录路径。");
+                      cx.notify();
+                      return;
+                    }
+                    this.installSkills({ target: dir }, cx);
+                  },
+                ),
+              ),
+          ),
+      );
+  }
+
   // Alerts ---------------------------------------------------------------
 
   alerts(t) {
@@ -5413,6 +5860,17 @@ export default class Settings extends View {
                   .child(Input.new(this.releasesUrlInput).h(26).text_size(13).text_color(t.foreground)),
               )
               .child(
+                this.button(t, "st-gh-releases-url", this.tr("GitHub OTA", "使用 GitHub 热更源"), (_e, cx) => {
+                  const ghUrl = "https://github.com/herdr2/herdr2/releases/download/ota-latest";
+                  this.releasesUrlInput.set_value(ghUrl);
+                  this.change((p) => { p.releases_url = ghUrl; }, cx);
+                  this.releasesUrlSavedAt = Date.now();
+                  this.asked = Date.now();
+                  run("app.check_updates");
+                  cx.notify();
+                }),
+              )
+              .child(
                 this.button(t, "st-save-releases-url", savedNotice ? this.tr("\u2713 Saved", "✓ 已保存") : this.tr("Save & Check", "保存并检查"), (_e, cx) => {
                   const val = this.releasesUrlInput.value().trim().replace(/\/+$/, "");
                   this.change((p) => {
@@ -5491,6 +5949,10 @@ export default class Settings extends View {
                 this.maybeAutoProbeDrove(cx);
                 cx.notify();
               });
+              if (s.id === "skills") cx.spawn(async (cx) => {
+                await Promise.all([this.loadSkills(), this.loadAi()]);
+                cx.notify();
+              });
               cx.notify();
             })
             .child(svg(I(s.icon)).size(15).text_color(on ? t.accent : t.dim))
@@ -5566,6 +6028,8 @@ export default class Settings extends View {
                         ? this.ai(t, cx)
                       : this.section === "drove"
                         ? this.drove(t, cx)
+                      : this.section === "skills"
+                        ? this.skills(t, cx)
                       : this.section === "alerts"
                         ? this.alerts(t)
                       : this.section === "updates"

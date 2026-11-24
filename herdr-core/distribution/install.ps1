@@ -1,10 +1,10 @@
-# Installs herdr2 (h2) on Windows, or updates it from a self-hosted release server:
+# Installs herdr2 core (`h2`) on Windows, or updates it from GitHub Releases / a self-hosted server:
 #
-#   $env:HERDR2_RELEASES_URL="https://your-host"; irm "$env:HERDR2_RELEASES_URL/core/install.ps1" | iex
+#   irm https://github.com/herdr2/herdr2/releases/download/ota-latest/core-install.ps1 | iex
 #
-# Into %LOCALAPPDATA%\Programs\herdr2 (herdr2.exe), added to your PATH, with
-# h2.exe hardlinked beside it if no `h2` exists. No admin needed.
-# H2_VERSION=0.2.0 picks a version; HERDR2_RELEASES_URL is required unless a local zip is passed;
+# Into %LOCALAPPDATA%\Programs\h2 (herdr2-core.exe + h2.exe), added to your PATH,
+# completely separate from the Herdr2 desktop app in %LOCALAPPDATA%\Programs\herdr2. No admin needed.
+# H2_VERSION=0.2.0 picks a version; HERDR2_RELEASES_URL overrides the release base URL;
 # H2_INSTALL_DIR installs elsewhere.
 
 & {
@@ -15,9 +15,8 @@ $ProgressPreference = "SilentlyContinue"
 
 function Fail($why) { throw "h2: $why" }
 
-$releases = if ($env:HERDR2_RELEASES_URL) { $env:HERDR2_RELEASES_URL.TrimEnd("/") } else { "" }
-if (-not $zip -and -not $releases) { Fail "set `$env:HERDR2_RELEASES_URL to your release server base URL" }
-$dir = if ($env:H2_INSTALL_DIR) { $env:H2_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "Programs\herdr2" }
+$releases = if ($env:HERDR2_RELEASES_URL) { $env:HERDR2_RELEASES_URL.TrimEnd("/") } else { "https://github.com/herdr2/herdr2/releases/download/ota-latest" }
+$dir = if ($env:H2_INSTALL_DIR) { $env:H2_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA "Programs\h2" }
 $arch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
 if ($arch -ne "AMD64") { Fail "no build for $arch Windows yet (x64 only)" }
 $target = "windows-x86_64"
@@ -32,14 +31,19 @@ try {
   if ($zip) {
     Copy-Item $zip "$tmp\h2.zip"
   } else {
-    $manifest = if ($env:H2_VERSION) { "$releases/core/$($env:H2_VERSION)/manifest.json" } else { "$releases/core/latest.json" }
+    $isGhFlat = ($releases -like "*/releases/download/*") -or ($releases -like "*/releases/latest/download")
+    $manifest = if ($isGhFlat) {
+        if ($env:H2_VERSION) { "$releases/core-$($env:H2_VERSION)-manifest.json" } else { "$releases/core-latest.json" }
+    } else {
+        if ($env:H2_VERSION) { "$releases/core/$($env:H2_VERSION)/manifest.json" } else { "$releases/core/latest.json" }
+    }
     curl.exe -fsSL $manifest -o "$tmp\manifest.json"
     if ($LASTEXITCODE) { Fail "cannot reach $manifest" }
     $m = Get-Content -Raw "$tmp\manifest.json" | ConvertFrom-Json
     $t = $m.targets.$target
     if (-not $t.url -or -not $t.sha256) { Fail "no build for $target in $manifest" }
 
-    $src = if (Test-Path (Join-Path $dir "herdr2.exe")) { "update" } else { "install" }
+    $src = if ((Test-Path (Join-Path $dir "h2.exe")) -or (Test-Path (Join-Path $dir "herdr2-core.exe"))) { "update" } else { "install" }
     $plain = $t.url.StartsWith("$releases/", [StringComparison]::Ordinal) -and $t.url.IndexOfAny([char[]]"?#") -lt 0
     $download = if ($plain) { "$($t.url)?src=$src" } else { $t.url }
     curl.exe -fsSL $download -o "$tmp\h2.zip"
@@ -51,23 +55,33 @@ try {
     New-Item -ItemType Directory -Force "$tmp\h2" | Out-Null
     & $tar -xf "$tmp\h2.zip" -C "$tmp\h2"
     $new = "$tmp\h2\herdr2.exe"
+    if (-not (Test-Path $new) -and (Test-Path "$tmp\h2\h2.exe")) { $new = "$tmp\h2\h2.exe" }
     if ($LASTEXITCODE -or -not (Test-Path $new)) { Fail "the download holds no complete h2" }
     $version = (& $new --version) -replace "^h2 ", ""
     if ($LASTEXITCODE) { Fail "the downloaded h2 does not run on this machine" }
 
     New-Item -ItemType Directory -Force $dir | Out-Null
-    $exe = Join-Path $dir "herdr2.exe"
+    $exe = Join-Path $dir "herdr2-core.exe"
+    $h2Exe = Join-Path $dir "h2.exe"
     if (Test-Path $exe) {
         & $exe update --from $new | Out-Null
         if ($LASTEXITCODE) { Fail "updating $exe failed (see above)" }
         Write-Host "h2 updated to $version."
+    } elseif (Test-Path $h2Exe) {
+        & $h2Exe update --from $new | Out-Null
+        if ($LASTEXITCODE) { Fail "updating $h2Exe failed (see above)" }
+        Copy-Item -Force $h2Exe $exe
+        Write-Host "h2 updated to $version."
     } else {
-        Copy-Item -Force "$tmp\h2\herdr2.exe" $dir
+        Copy-Item -Force $new $exe
         Write-Host "h2 $version installed into $dir."
     }
     Copy-Item -Recurse -Force "$tmp\h2\THIRD-PARTY-NOTICES" $dir -ErrorAction SilentlyContinue
-    if (-not (Get-Command h2 -ErrorAction SilentlyContinue) -and -not (Test-Path (Join-Path $dir "h2.exe"))) {
-        New-Item -ItemType HardLink -Path (Join-Path $dir "h2.exe") -Target $exe | Out-Null
+    if (Test-Path $h2Exe) { Remove-Item -Force $h2Exe -ErrorAction SilentlyContinue }
+    try {
+        New-Item -ItemType HardLink -Path $h2Exe -Target $exe | Out-Null
+    } catch {
+        Copy-Item -Force $exe $h2Exe
     }
 
     $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment", $true)
@@ -82,7 +96,7 @@ try {
     }
     $key.Close()
     if (($env:Path -split ";") -notcontains $dir) { $env:Path += ";$dir" }
-    Write-Host "Agents: h2 --skill. People: h2 --help."
+    Write-Host "Skills: h2 skill install --all. Agents: h2 --skill. People: h2 --help."
 } finally {
     Remove-Item -Recurse -Force $tmp -ErrorAction SilentlyContinue
     if ($zip) { Remove-Item -Force $zip, $PSCommandPath -ErrorAction SilentlyContinue }

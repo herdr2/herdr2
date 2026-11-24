@@ -18,6 +18,7 @@ mod machine;
 mod output;
 mod run;
 mod server;
+mod skill;
 mod update;
 use file::*;
 use machine::*;
@@ -230,6 +231,8 @@ enum Cmd {
     Mcp,
     /// Manage multi-agent Drove orchestration (`drove status`, `drove web`, `drove settings`, ...).
     Drove(crate::drove::cli::DroveCli),
+    /// Detect coding agents and install/update bundled Herdr2 companion skills (`status`, `install`, `ai-install`).
+    Skill(skill::SkillCli),
     /// Inspect or configure the shared Core AI assistant (`ai status`, `ai settings-set`, `ai test`).
     Ai {
         #[command(subcommand)]
@@ -542,6 +545,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             let (json, human) = crate::drove::cli::execute(&paths, p)?;
             Out { json, human }
         }
+        Cmd::Skill(p) => skill::run(&paths, p)?,
         Cmd::Ai { action } => match action {
             AiCmd::Status { on } => {
                 let mut params = json!({});

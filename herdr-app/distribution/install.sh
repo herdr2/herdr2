@@ -7,8 +7,7 @@
 # a launcher entry and icon. macOS: Herdr2.app into ~/Applications.
 set -eu
 
-releases=${HERDR2_RELEASES_URL:-${HERDR_RELEASES_URL:-}}
-[ -n "$releases" ] || { printf 'herdr2: set HERDR2_RELEASES_URL to your release server base URL\n' >&2; exit 1; }
+releases=${HERDR2_RELEASES_URL:-${HERDR_RELEASES_URL:-https://github.com/herdr2/herdr2/releases/download/ota-latest}}
 releases=${releases%/}
 bin="$HOME/.local/bin"
 
@@ -47,7 +46,18 @@ sha256() {
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
-curl -fsSL "$releases/app/latest.json" -o "$tmp/latest.json" || fail "cannot reach $releases"
+case "$releases" in
+  */releases/download/* | */releases/latest/download)
+    app_manifest="$releases/app-latest.json"
+    core_installer="$releases/core-install.sh"
+    ;;
+  *)
+    app_manifest="$releases/app/latest.json"
+    core_installer="$releases/core/install.sh"
+    ;;
+esac
+
+curl -fsSL "$app_manifest" -o "$tmp/latest.json" || fail "cannot reach $releases"
 entry=$(tr -d '\n ' < "$tmp/latest.json" | sed -n "s/.*\"$target\":{\([^}]*\)}.*/\1/p")
 url=$(printf '%s' "$entry" | sed -n 's/.*"url":"\([^"]*\)".*/\1/p')
 want=$(printf '%s' "$entry" | sed -n 's/.*"sha256":"\([^"]*\)".*/\1/p')
@@ -68,6 +78,11 @@ if [ "$os" = linux ]; then
   mv "$tmp/herdr2" "$home.new"
   rm -rf "$home"
   mv "$home.new" "$home"
+  # Preserve an existing h2 core binary at $bin/herdr2 as $bin/herdr2-core before symlinking the desktop app.
+  if [ -f "$bin/herdr2" ] && [ ! -L "$bin/herdr2" ] && "$bin/herdr2" --version 2>/dev/null | grep -q '^h2 '; then
+    mv -f "$bin/herdr2" "$bin/herdr2-core"
+    ln -sfn herdr2-core "$bin/h2"
+  fi
   ln -sfn "$home/herdr2" "$bin/herdr2"
   mkdir -p "$data/applications" "$data/icons/hicolor/scalable/apps"
   cp "$home/herdr2.svg" "$data/icons/hicolor/scalable/apps/herdr2.svg"
@@ -113,7 +128,7 @@ else
 fi
 
 if [ ! -e "$bin/h2" ] && ! command -v h2 >/dev/null 2>&1; then
-  curl -fsSL "$releases/core/install.sh" | H2_INSTALL_DIR="$bin" HERDR2_RELEASES_URL="$releases" sh || say "herdr2-core didn't install; Herdr2 will offer it when it opens."
+  curl -fsSL "$core_installer" | H2_INSTALL_DIR="$bin" HERDR2_RELEASES_URL="$releases" sh || say "herdr2-core didn't install; Herdr2 will offer it when it opens."
 fi
 
 say "Herdr2 is installed. Open it from your apps, or run: herdr2"

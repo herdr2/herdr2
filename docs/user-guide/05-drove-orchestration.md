@@ -8,17 +8,7 @@
 
 Drove 运行在 `h2` 单守护进程内，通过**任务有向无环图（DAG）**管理完整交付生命周期：
 
-```mermaid
-flowchart LR
-    C["架构师 · 编排者<br/>拆解任务 DAG + 分配角色"] --> W1["程序员 coder (可写)<br/>独立 Worktree 编码"]
-    C --> W2["调研员 researcher (只读)<br/>源码摸底与依赖分析"]
-    W1 --> V["Verify 自动门禁<br/>编译 / 单测 / Lint"]
-    W2 --> W1
-    V -->|通过| R["独立审查员 reviewer (只读)<br/>异构模型安全与架构审计"]
-    V -->|失败| W1
-    R -->|打回返工| W1
-    R -->|审批通过| M["自动合并 Worktree<br/>交付主分支"]
-```
+![Drove 多智能体 DAG 编排与门禁闭环](./images/diagram-drove-dag-workflow.svg)
 
 四大核心保障：
 1. **角色权限护栏（Guardrails）**：每个内置角色拥有独立的写权限等级（`writable` 可写、`scoped_write` 受限写、`readonly` 只读），并在操作系统层结合沙盒（Linux `bwrap` / macOS `sandbox-exec` / Windows Restricted Token）强约束防越界。

@@ -10,28 +10,7 @@
 
 Herdr2 将整个系统拆分为两个解耦组件：
 
-```mermaid
-flowchart TB
-    subgraph Client["前端视图层（可随时关闭、热更新或重启）"]
-        APP["Herdr2 桌面窗口<br/>GPUI 原生渲染 + Ghostty 终端引擎"]
-        CLI["h2 命令行客户端<br/>脚本 / 自动化 / 远程控制"]
-        WEB["Drove Web 面板<br/>只读 DAG 可视化工作台"]
-    end
-
-    subgraph Core["后台守护层（持久运行，窗口关闭不中断）"]
-        DAEMON["h2 server 守护进程"]
-        PTY["交互式终端平面 (t1, t2...)<br/>真 PTY / Shell / TUI CLI"]
-        ACP["无头智能体平面 (a1, a2...)<br/>ACP v1 NDJSON / 串行 Inbox / 权限仲裁"]
-        DROVE["Drove 编排与快照引擎<br/>DAG 调度 / 隐藏 Git Ref / Core AI"]
-    end
-
-    APP <-->|Unix Socket JSON-RPC| DAEMON
-    CLI <-->|Unix Socket JSON-RPC| DAEMON
-    WEB <-->|HTTP + SSE| DROVE
-    DAEMON --- PTY
-    DAEMON --- ACP
-    DAEMON --- DROVE
-```
+![Herdr2 双平面解耦架构](./images/diagram-dual-plane-architecture.svg)
 
 带来的直接好处：
 1. **永不掉线**：误关窗口、升级 Herdr2 桌面版、甚至合上笔记本断开 SSH，你的本地或远程终端与 Agent 都在 `h2` 后台继续干活。

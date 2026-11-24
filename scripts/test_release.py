@@ -160,6 +160,48 @@ class ReleaseScriptTests(unittest.TestCase):
             self.assertTrue((app_dir / "themes" / "my-custom.json").is_file())
             self.assertTrue((app_dir / "icons" / "my-logo.svg").is_file())
 
+    def test_github_release_flat_ui_and_binary_manifests(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            defaults = root / "defaults"
+            (defaults / "mods" / "tabs").mkdir(parents=True)
+            (defaults / "mods" / "tabs" / "main.js").write_text("export default {}\n", encoding="utf-8")
+
+            out = root / "gh-ota"
+            base = "https://github.com/herdr2/herdr2/releases/download/ota-latest"
+            ui_m = release.pack_ui_bundle(
+                defaults_dir=defaults,
+                out_root=out,
+                version="0.2.0-ui.42",
+                base_url=base,
+                app_version_min="0.2.0",
+                app_version_max=None,
+                host_api_generation=1,
+                notes="GitHub push OTA",
+                github_release=True,
+            )
+            self.assertEqual(ui_m["url"], f"{base}/herdr2-ui-bundle.tar.gz")
+            self.assertTrue((out / "ui-latest.json").is_file())
+            self.assertTrue((out / "herdr2-ui-bundle.tar.gz").is_file())
+
+            (out / "herdr2-app-linux-x86_64.tar.gz").write_bytes(b"app-linux")
+            (out / "herdr2-core-windows-x86_64.zip").write_bytes(b"core-win")
+            written = release.write_binary_manifests(
+                out,
+                base_url=base,
+                app_version="0.2.0",
+                core_version="0.2.0",
+                core_generation=1,
+                github_release=True,
+            )
+            self.assertEqual(written["app"]["targets"]["linux-x86_64"]["url"], f"{base}/herdr2-app-linux-x86_64.tar.gz")
+            self.assertEqual(written["core"]["targets"]["windows-x86_64"]["url"], f"{base}/herdr2-core-windows-x86_64.zip")
+            self.assertTrue((out / "app-latest.json").is_file())
+            self.assertTrue((out / "core-latest.json").is_file())
+            self.assertTrue((out / "core-0.2.0-manifest.json").is_file())
+            self.assertTrue((out / "app-install.sh").is_file())
+            self.assertTrue((out / "core-install.ps1").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

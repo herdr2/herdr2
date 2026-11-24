@@ -1,6 +1,6 @@
 import { View, div, svg, image } from "gpui-kit";
 import { h_flex, ScrollHandle } from "gpui-base";
-import { spaces, panes, terminals, agents, focused, run, openOverlay, theme, window, shared, layout, settings, keys } from "herdr";
+import { spaces, panes, terminals, agents, focused, run, openOverlay, theme, window, shared, layout, settings, keys, updates } from "herdr";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
@@ -903,6 +903,72 @@ export default class Tabs extends View {
           showMergeBadge: Boolean(this.drag?.moving && this.drag.mergeTarget),
         }))
       : null;
+    const updateState = typeof updates === "function" ? updates() : null;
+    const renderUpdateButton = () => {
+      if (!updateState) return null;
+      const ui = updateState.ui ?? {};
+      const app = updateState.app ?? {};
+      const core = updateState.core ?? {};
+      const busy = Boolean(ui.applying || core.updating);
+      let label = null;
+      let tip = "";
+      let action = null;
+      if (ui.applying) {
+        label = tr("Updating…", "更新中…");
+        tip = tr("Applying UI hot-update live without restarting…", "正在免重启热更新 UI，终端保持运行…");
+      } else if (core.updating) {
+        label = tr("Updating…", "更新中…");
+        tip = tr("Updating h2 core without interrupting terminals…", "正在热更新 h2 Core，终端保持运行…");
+      } else if (ui.ready) {
+        label = tr("Update", "更新");
+        tip = tr(
+          `UI hot-update v${ui.ready} is ready. Click to apply live without restarting.`,
+          `热更新包 v${ui.ready} 已就绪，点击立即免重启热部署（不中断终端）。`,
+        );
+        action = "app.apply_ui_update";
+      } else if (core.ready && !core.managed) {
+        label = tr("Update Core", "更新");
+        tip = tr(
+          `h2 Core v${core.ready} is ready. Click to hot-update without interrupting terminals.`,
+          `h2 Core v${core.ready} 已就绪，点击立即热更新（不中断终端）。`,
+        );
+        action = "app.update_core";
+      } else if (app.ready) {
+        label = tr("Update", "更新");
+        tip = tr(
+          `Herdr2 v${app.ready} is ready. Click to restart and apply (terminals stay alive in h2).`,
+          `Herdr2 v${app.ready} 已就绪，点击重启更新（终端在后台保持运行）。`,
+        );
+        action = "app.update";
+      }
+      if (!label) return null;
+      const accent = t.accent ?? "#3b82f6";
+      return h_flex()
+        .id("top-update-btn")
+        .h(26)
+        .px(10)
+        .gap(5)
+        .flex_none()
+        .items_center()
+        .rounded(6)
+        .bg(accent)
+        .text_color(t.accent_foreground ?? "#ffffff")
+        .text_size(12)
+        .font_semibold()
+        .when(Boolean(tip), (el) => el.tooltip(tip))
+        .when(busy, (el) => el.opacity(0.85))
+        .when(!busy && Boolean(action), (el) =>
+          el
+            .cursor_pointer()
+            .hover((s) => s.opacity(0.9))
+            .on_mouse_down("left", stop)
+            .on_click(() => run(action)),
+        )
+        .when(busy, (el) => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().spin(900)))
+        .when(!busy, (el) => el.child(svg("frame/settings/refresh.svg").size(12).flex_none()))
+        .child(label);
+    };
+    const updateBtn = renderUpdateButton();
     return h_flex().relative().size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
       .on_mouse_move((e, cx) => this.handleDragMove(e, space, shown, cx))
       .on_mouse_up("left", (_e, cx) => this.finishDrag(space, shown, cx))
@@ -929,6 +995,7 @@ export default class Tabs extends View {
       .when(enabled.includes("changes"), el => el.child(panelButton("changes", tr("Changes", "变更"), "mods/changes/changes.svg")))
       .when(enabled.includes("checkpoints"), el => el.child(panelButton("checkpoints", tr("Checkpoints", "快照"), "mods/checkpoints/checkpoints.svg")))
       .when(enabled.includes("side-chat") && hasSideChats, el => el.child(panelButton("side-chat", tr("Side Chat", "旁路"), "mods/peek/messages-square.svg")))
+      .when(Boolean(updateBtn), el => el.child(updateBtn))
       .when(w?.buttons, el => el.child(button("minimize", w.platform === "windows" ? svg("mods/tabs/win-min.svg").size(16) : "−", () => run("window.minimize")))
         .child(button("maximize", w.platform === "windows" ? svg(`mods/tabs/${w.maximized ? "win-restore" : "win-max"}.svg`).size(16) : "□", () => run("window.maximize")))
         .child(button("close-window", w.platform === "windows" ? svg("mods/tabs/win-close.svg").size(16) : svg("mods/pane/close.svg").size(13), () => run("window.close"))))

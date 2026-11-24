@@ -71,12 +71,25 @@ fn curl(url: &str, to: &Path) -> Result<(), RpcError> {
     }
 }
 
+fn is_github_release_base(base: &str) -> bool {
+    base.contains("/releases/download/") || base.ends_with("/releases/latest/download")
+}
+
 /// The latest release's list, or one version's.
+/// Supports both hierarchical static servers (`core/latest.json`) and flat GitHub Releases
+/// asset URLs (`core-latest.json`).
 pub fn manifest(version: Option<&str>, scratch: &Path) -> Result<Manifest, RpcError> {
     let base = base()?;
-    let url = match version {
-        Some(v) => format!("{base}/core/{v}/manifest.json"),
-        None => format!("{base}/core/latest.json"),
+    let url = if is_github_release_base(&base) {
+        match version {
+            Some(v) => format!("{base}/core-{v}-manifest.json"),
+            None => format!("{base}/core-latest.json"),
+        }
+    } else {
+        match version {
+            Some(v) => format!("{base}/core/{v}/manifest.json"),
+            None => format!("{base}/core/latest.json"),
+        }
     };
     let file = scratch.join("manifest.json");
     curl(&url, &file)?;

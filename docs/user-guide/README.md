@@ -47,13 +47,6 @@
 
 ## 推荐上手顺序
 
-```mermaid
-flowchart LR
-    A["01 快速上手<br/>认识双平面与主界面"] --> B["02 工作区与终端<br/>分栏 + 文件/变更面板"]
-    B --> C["03 ACP 智能体<br/>结构化对话 + 权限审批"]
-    C --> D["04 接力/快照/AI<br/>防翻车与跨模型接棒"]
-    D --> E["05 Drove 编排<br/>多角色并行 DAG 交付"]
-    E --> F["06 远程与定制<br/>SSH 多机 + Mods/QA"]
-```
+![Herdr2 推荐学习与上手路线](./images/diagram-learning-roadmap.svg)
 
 准备好了吗？让我们从 **[第 01 篇：快速上手与界面导览](./01-getting-started.md)** 开始。

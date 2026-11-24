@@ -234,7 +234,7 @@ pub(crate) fn is_newer_ui_version(candidate: &str, current: &str) -> bool {
 /// Checks `<releases>/ui/latest.json`, verifies compatibility & sha256, and stages the bundle.
 /// Returns `Ok(Some(version))` when a newer compatible UI bundle is staged and ready to apply.
 pub fn check_from(app_dir: &Path, releases: &str) -> Result<Option<String>, String> {
-    let url = format!("{}/ui/latest.json", releases.trim_end_matches('/'));
+    let url = crate::update::feed_url(releases, "ui");
     let text = crate::update::curl_text(&url)?;
     let manifest: UiManifest = serde_json::from_str(&text).map_err(|e| format!("ui/latest.json: {e}"))?;
     let running_app = env!("CARGO_PKG_VERSION");

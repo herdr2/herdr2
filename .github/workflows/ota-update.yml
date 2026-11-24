@@ -1,0 +1,276 @@
+name: Herdr2 OTA Hot-Update
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - 'herdr-app/defaults/**'
+      - 'herdr-app/src/**'
+      - 'herdr-app/crates/**'
+      - 'herdr-app/Cargo.*'
+      - 'herdr-core/**'
+      - 'drove-web/**'
+  workflow_dispatch:
+    inputs:
+      build_ui:
+        description: 'Build & publish no-restart OTA UI bundle'
+        type: boolean
+        default: true
+      build_core:
+        description: 'Build & publish h2 core OTA archives'
+        type: boolean
+        default: false
+      build_app:
+        description: 'Build & publish Herdr2 app OTA archives'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: herdr2-ota-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  OTA_TAG: ota-latest
+  CARGO_TERM_COLOR: always
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      ui: ${{ steps.changes.outputs.ui }}
+      core: ${{ steps.changes.outputs.core }}
+      app: ${{ steps.changes.outputs.app }}
+      app_version: ${{ steps.ver.outputs.app_version }}
+      core_version: ${{ steps.ver.outputs.core_version }}
+      ui_version: ${{ steps.ver.outputs.ui_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Read versions
+        id: ver
+        run: |
+          APP_VER=$(sed -n 's/^version = "\(.*\)"/\1/p' herdr-app/Cargo.toml | head -n 1)
+          CORE_VER=$(sed -n 's/^version = "\(.*\)"/\1/p' herdr-core/crates/herdr2/Cargo.toml | head -n 1)
+          echo "app_version=$APP_VER" >> "$GITHUB_OUTPUT"
+          echo "core_version=$CORE_VER" >> "$GITHUB_OUTPUT"
+          echo "ui_version=${APP_VER}-ui.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+
+      - name: Detect changed channels
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "ui=${{ inputs.build_ui }}" >> "$GITHUB_OUTPUT"
+            echo "core=${{ inputs.build_core }}" >> "$GITHUB_OUTPUT"
+            echo "app=${{ inputs.build_app }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git diff-tree --no-commit-id --name-only -r HEAD)
+          UI=false; CORE=false; APP=false
+          echo "$CHANGED" | grep -q '^herdr-app/defaults/' && UI=true || true
+          echo "$CHANGED" | grep -Eq '^(herdr-core/|drove-web/)' && CORE=true || true
+          echo "$CHANGED" | grep -Eq '^herdr-app/(src/|crates/|Cargo\.)' && APP=true || true
+          echo "ui=$UI" >> "$GITHUB_OUTPUT"
+          echo "core=$CORE" >> "$GITHUB_OUTPUT"
+          echo "app=$APP" >> "$GITHUB_OUTPUT"
+
+  publish-ui-ota:
+    needs: detect
+    if: needs.detect.outputs.ui == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pack UI OTA hot-update bundle
+        run: |
+          BASE_URL="https://github.com/${{ github.repository }}/releases/download/${OTA_TAG}"
+          SHORT_SHA="${GITHUB_SHA::7}"
+          NOTES="Hot-update UI (${SHORT_SHA}): $(git log -1 --pretty=%s)"
+          python3 scripts/release.py ui \
+            --github-release \
+            --version "${{ needs.detect.outputs.ui_version }}" \
+            --base-url "$BASE_URL" \
+            --out dist/ota-ui \
+            --notes "$NOTES"
+
+      - name: Upload UI OTA bundle to rolling GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! gh release view "$OTA_TAG" >/dev/null 2>&1; then
+            gh release create "$OTA_TAG" --title "Herdr2 OTA Channel (Rolling)" --notes "Rolling OTA hot-update channel for Herdr2 UI, Core, and App." --prerelease
+          fi
+          gh release upload "$OTA_TAG" \
+            dist/ota-ui/herdr2-ui-bundle.tar.gz \
+            dist/ota-ui/ui-latest.json \
+            --clobber
+
+  build-core-ota:
+    needs: detect
+    if: needs.detect.outputs.core == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: macos-14
+            target: macos-aarch64
+          - os: windows-latest
+            target: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Build drove-web
+        working-directory: drove-web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build & package herdr-core (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          H2_REQUIRE_WEB_BUNDLE: '1'
+          HERDR2_DEFAULT_RELEASES_URL: https://github.com/${{ github.repository }}/releases/download/${{ env.OTA_TAG }}
+        run: |
+          cd herdr-core
+          cargo build --release --locked -p herdr2
+          mkdir -p ../dist/core-ota
+          sh scripts/package target/release/herdr2 "../dist/core-ota/herdr2-core-${{ matrix.target }}.tar.gz"
+
+      - name: Build & package herdr-core (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          H2_REQUIRE_WEB_BUNDLE: '1'
+          HERDR2_DEFAULT_RELEASES_URL: https://github.com/${{ github.repository }}/releases/download/${{ env.OTA_TAG }}
+        run: |
+          cd herdr-core
+          cargo build --release --locked -p herdr2
+          New-Item -ItemType Directory -Force ..\dist\core-ota | Out-Null
+          $stage = "target\pkg-core"
+          New-Item -ItemType Directory -Force $stage | Out-Null
+          Copy-Item target\release\herdr2.exe $stage\herdr2.exe
+          Copy-Item LICENSE $stage\LICENSE
+          Copy-Item crates\herdr2\THIRD-PARTY-NOTICES $stage\THIRD-PARTY-NOTICES
+          & "$env:SystemRoot\System32\tar.exe" -a -cf "..\dist\core-ota\herdr2-core-windows-x86_64.zip" -C $stage .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: core-ota-${{ matrix.target }}
+          path: dist/core-ota/*
+
+  publish-core-ota:
+    needs: [detect, build-core-ota]
+    if: needs.detect.outputs.core == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: core-ota-*
+          merge-multiple: true
+          path: dist/ota-core
+
+      - name: Generate core-latest.json & publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BASE_URL="https://github.com/${{ github.repository }}/releases/download/${OTA_TAG}"
+          python3 scripts/release.py manifest \
+            --github-release \
+            --dir dist/ota-core \
+            --base-url "$BASE_URL" \
+            --core-version "${{ needs.detect.outputs.core_version }}"
+          if ! gh release view "$OTA_TAG" >/dev/null 2>&1; then
+            gh release create "$OTA_TAG" --title "Herdr2 OTA Channel (Rolling)" --notes "Rolling OTA hot-update channel." --prerelease
+          fi
+          gh release upload "$OTA_TAG" dist/ota-core/* --clobber
+
+  build-app-ota:
+    needs: detect
+    if: needs.detect.outputs.app == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x86_64
+          - os: macos-14
+            target: macos-aarch64
+          - os: windows-latest
+            target: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install Linux desktop deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libasound2-dev pkg-config
+
+      - name: Build & package herdr-app
+        shell: bash
+        env:
+          HERDR2_APP_RELEASE: '1'
+          HERDR2_DEFAULT_RELEASES_URL: https://github.com/${{ github.repository }}/releases/download/${{ env.OTA_TAG }}
+        run: |
+          bash herdr-app/scripts/package
+          mkdir -p dist/app-ota
+          cp "herdr-app/dist/herdr2-${{ matrix.target }}.tar.gz" "dist/app-ota/herdr2-app-${{ matrix.target }}.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: app-ota-${{ matrix.target }}
+          path: dist/app-ota/*
+
+  publish-app-ota:
+    needs: [detect, build-app-ota]
+    if: needs.detect.outputs.app == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: app-ota-*
+          merge-multiple: true
+          path: dist/ota-app
+
+      - name: Generate app-latest.json & publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BASE_URL="https://github.com/${{ github.repository }}/releases/download/${OTA_TAG}"
+          python3 scripts/release.py manifest \
+            --github-release \
+            --dir dist/ota-app \
+            --base-url "$BASE_URL" \
+            --app-version "${{ needs.detect.outputs.app_version }}"
+          if ! gh release view "$OTA_TAG" >/dev/null 2>&1; then
+            gh release create "$OTA_TAG" --title "Herdr2 OTA Channel (Rolling)" --notes "Rolling OTA hot-update channel." --prerelease
+          fi
+          gh release upload "$OTA_TAG" dist/ota-app/* --clobber

@@ -20,11 +20,27 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const EVERY: Duration = Duration::from_secs(60 * 60);
+const EVERY: Duration = Duration::from_secs(15 * 60);
 /// After a failed check or download (offline, a damaged file).
-const RETRY: Duration = Duration::from_secs(30 * 60);
+const RETRY: Duration = Duration::from_secs(10 * 60);
 /// Wait briefly after startup so initial UI rendering stays snappy.
 const INITIAL_DELAY: Duration = Duration::from_secs(12);
+
+pub(crate) fn is_github_release_base(base: &str) -> bool {
+    let trimmed = base.trim_end_matches('/');
+    trimmed.contains("/releases/download/") || trimmed.ends_with("/releases/latest/download")
+}
+
+/// Resolves a channel manifest URL for either a standard hierarchical release server
+/// (`<base>/<channel>/latest.json`) or a flat GitHub Releases tag (`<base>/<channel>-latest.json`).
+pub(crate) fn feed_url(base: &str, channel: &str) -> String {
+    let trimmed = base.trim_end_matches('/');
+    if is_github_release_base(trimmed) {
+        format!("{trimmed}/{channel}-latest.json")
+    } else {
+        format!("{trimmed}/{channel}/latest.json")
+    }
+}
 
 /// Where this app is installed: the folder (Linux) or bundle (macOS) an
 /// update replaces. Read once: after a swap this process's own file is gone.
@@ -342,7 +358,7 @@ struct CoreRelease {
 }
 
 fn latest_core_from(base_url: &str) -> Result<CoreRelease, String> {
-    let text = curl_text(&format!("{base_url}/core/latest.json"))?;
+    let text = curl_text(&feed_url(base_url, "core"))?;
     serde_json::from_str(&text).map_err(|e| format!("core/latest.json: {e}"))
 }
 
@@ -390,10 +406,10 @@ fn check(root: &Path) -> Result<Option<String>, String> {
 }
 
 fn check_from(root: &Path, releases: &str) -> Result<Option<String>, String> {
-    let path = "app/latest.json";
-    let text = curl_text(&format!("{releases}/{path}"))?;
-    let manifest: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("{path}: {e}"))?;
-    let version = manifest["version"].as_str().ok_or(format!("{path}: no version"))?;
+    let url = feed_url(releases, "app");
+    let text = curl_text(&url)?;
+    let manifest: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("app/latest.json: {e}"))?;
+    let version = manifest["version"].as_str().ok_or("app/latest.json: no version".to_owned())?;
     if !newer(version, env!("CARGO_PKG_VERSION")) {
         return Ok(None);
     }
@@ -1100,6 +1116,22 @@ mod tests {
             Some("https://def.test")
         );
         assert_eq!(resolve_releases_url(None, None, None), None);
+    }
+
+    #[test]
+    fn feed_url_maps_github_releases_flat_and_standard_servers_hierarchical() {
+        assert_eq!(
+            feed_url("https://github.com/herdr2/herdr2/releases/download/ota-latest", "ui"),
+            "https://github.com/herdr2/herdr2/releases/download/ota-latest/ui-latest.json"
+        );
+        assert_eq!(
+            feed_url("https://github.com/herdr2/herdr2/releases/latest/download/", "app"),
+            "https://github.com/herdr2/herdr2/releases/latest/download/app-latest.json"
+        );
+        assert_eq!(
+            feed_url("https://releases.example.com/", "core"),
+            "https://releases.example.com/core/latest.json"
+        );
     }
 
     #[test]

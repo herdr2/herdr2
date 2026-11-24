@@ -2,7 +2,7 @@
 // Designed after original Herdr: 4 focused, calm pages that each fit in one screen without scrolling.
 
 import { View, div, svg, image } from "gpui-kit";
-import { v_flex, h_flex } from "gpui-base";
+import { v_flex, h_flex, InputState, Input } from "gpui-base";
 import {
   spaces,
   run,
@@ -26,6 +26,8 @@ import {
 } from "herdr";
 import {
   PAGES,
+  AI_PAGE,
+  DEEPSEEK_PRESET,
   LANGUAGES,
   APPEARANCES,
   PANELS,
@@ -36,6 +38,8 @@ import {
   boundShortcut,
   normalizeMachines,
   summarizeAiStatus,
+  isAiGateSatisfied,
+  canAccessPage,
   agentCustomizePrompt,
   fmtVersion,
   findLayoutNode,
@@ -59,6 +63,26 @@ export default class Welcome extends View {
     this.page = 1;
     this.machines = [];
     this.aiStatus = null;
+    this.aiTestResult = null;
+    this.aiBusy = false;
+    this.aiError = null;
+    this.aiGateHint = null;
+    this.aiProvider = "deepseek";
+    this.aiUrlInput = typeof InputState?.new === "function"
+      ? InputState.new({ placeholder: DEEPSEEK_PRESET.baseUrl })
+      : null;
+    this.aiKeyInput = typeof InputState?.new === "function"
+      ? InputState.new({ placeholder: "sk-..." })
+      : null;
+    this.aiKeyInput?.set_masked?.(true);
+    this.aiModelInput = typeof InputState?.new === "function"
+      ? InputState.new({ placeholder: DEEPSEEK_PRESET.model })
+      : null;
+    this.aiUrlInput?.set_value?.(DEEPSEEK_PRESET.baseUrl);
+    this.aiModelInput?.set_value?.(DEEPSEEK_PRESET.model);
+    this.skillStatus = null;
+    this.skillInstalling = false;
+    this.skillMessage = null;
     this.copied = null;
     this.appearance = null;
     this.languageOverride = null;
@@ -75,17 +99,169 @@ export default class Welcome extends View {
         this.appearance = JSON.parse(raw ?? "{}").appearance ?? null;
       } catch {}
       if (!isChecking()) {
-        await Promise.all([this.loadMachines(), this.loadAiStatus()]);
+        await Promise.all([this.loadMachines(), this.loadAiStatus(), this.loadSkillStatus()]);
+        // If an existing AI endpoint is already saved, silently verify connectivity once.
+        if (this.aiStatus?.configured && !this.aiTestResult) {
+          await this.verifyExistingAi();
+        }
       }
       cx.notify();
     });
-    // Live-refresh AI status and paired machines while on Page 3.
-    cx.timer.every(3000, (cx) => {
-      if (isChecking() || this.page !== 3) return;
+    // Live-refresh paired machines while on Page 3.
+    cx.timer.every(5000, (cx) => {
+      if (isChecking() || this.page !== 3 || this.aiBusy) return;
       cx.spawn(async (cx) => {
-        await Promise.all([this.loadMachines(), this.loadAiStatus()]);
+        await this.loadMachines();
         cx.notify();
       });
+    });
+  }
+
+  aiGateBypassed() {
+    return (
+      isChecking() ||
+      Boolean(typeof appWindow === "function" && appWindow()?.skip_ai_gate) ||
+      Boolean(typeof shared === "function" && shared("qa.skip_ai_gate"))
+    );
+  }
+
+  aiReady() {
+    return isAiGateSatisfied(this.aiStatus, this.aiTestResult, this.aiGateBypassed());
+  }
+
+  async loadSkillStatus() {
+    const r = await callCore(["skill", "status", "--json"]);
+    if (r?.code === 0 && r.stdout) {
+      try {
+        this.skillStatus = JSON.parse(r.stdout);
+      } catch {}
+    }
+  }
+
+  installSkillsNow(cx) {
+    if (this.skillInstalling) return;
+    this.skillInstalling = true;
+    this.skillMessage = null;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const r = await callCore(["skill", "install", "--all", "--json"]);
+        if (r?.code === 0 && r.stdout) {
+          const parsed = JSON.parse(r.stdout);
+          if (parsed?.status) this.skillStatus = parsed.status;
+          this.skillMessage = {
+            ok: true,
+            text: this.tr(
+              `Installed ${parsed?.installedCount ?? 0} skill files cleanly.`,
+              `已成功安装 ${parsed?.installedCount ?? 0} 个配套 Skill 文件。`,
+            ),
+          };
+        } else {
+          this.skillMessage = {
+            ok: false,
+            text: (r?.stderr || r?.stdout || this.tr("Skill installation failed", "Skill 安装失败")).trim(),
+          };
+        }
+      } catch (e) {
+        this.skillMessage = { ok: false, text: String(e?.message ?? e) };
+      } finally {
+        this.skillInstalling = false;
+        cx.notify();
+      }
+    });
+  }
+
+  applyDeepSeekPreset(model, cx) {
+    this.aiProvider = "deepseek";
+    this.aiUrlInput?.set_value?.(DEEPSEEK_PRESET.baseUrl);
+    this.aiModelInput?.set_value?.(model || DEEPSEEK_PRESET.model);
+    this.aiError = null;
+    this.aiGateHint = null;
+    cx.notify();
+  }
+
+  async writeAiTempReq(payload) {
+    const reqPath = `${appHome()}/.welcome-ai-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.json`;
+    await writeTextFile(reqPath, JSON.stringify(payload), null);
+    return reqPath;
+  }
+
+  async verifyExistingAi() {
+    try {
+      const r = await callCore(["ai", "test", "--json"]);
+      if (r?.code === 0 && r.stdout) {
+        const parsed = JSON.parse(r.stdout);
+        if (parsed?.ok) {
+          this.aiTestResult = parsed;
+        }
+      }
+    } catch {}
+  }
+
+  saveAndTestAi(cx) {
+    if (this.aiBusy) return;
+    const baseUrl = String(this.aiUrlInput?.value?.() ?? "").trim() || DEEPSEEK_PRESET.baseUrl;
+    const apiKey = String(this.aiKeyInput?.value?.() ?? "").trim();
+    const model = String(this.aiModelInput?.value?.() ?? "").trim() || DEEPSEEK_PRESET.model;
+    if (!apiKey && !this.aiStatus?.configured) {
+      this.aiError = this.tr(
+        "Please enter your API Key (DeepSeek official API key recommended).",
+        "请先填写 API Key（推荐使用 DeepSeek 官方 API Key）。",
+      );
+      cx.notify();
+      return;
+    }
+    this.aiBusy = true;
+    this.aiError = null;
+    this.aiGateHint = null;
+    this.aiTestResult = null;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const testPayload = { baseUrl, model };
+        if (apiKey) testPayload.apiKey = apiKey;
+        const testFile = await this.writeAiTempReq(testPayload);
+        const testRes = await callCore(["ai", "test", "--file", testFile, "--consume", "--json"]);
+        let parsedTest = null;
+        try {
+          parsedTest = JSON.parse(testRes?.stdout || testRes?.stderr || "{}");
+        } catch {}
+        if (testRes?.code !== 0 || !parsedTest?.ok) {
+          this.aiTestResult = { ok: false };
+          this.aiError =
+            parsedTest?.error?.message ||
+            parsedTest?.error ||
+            parsedTest?.message ||
+            (testRes?.stderr || testRes?.stdout || this.tr("Connection test failed", "连通性测试失败")).trim();
+          return;
+        }
+
+        const savePayload = { enabled: true, baseUrl, model };
+        if (apiKey) savePayload.apiKey = apiKey;
+        const saveFile = await this.writeAiTempReq(savePayload);
+        const saveRes = await callCore(["ai", "settings-set", "--file", saveFile, "--consume", "--json"]);
+        let parsedSave = null;
+        try {
+          parsedSave = JSON.parse(saveRes?.stdout || saveRes?.stderr || "{}");
+        } catch {}
+        if (saveRes?.code !== 0) {
+          this.aiError =
+            parsedSave?.error?.message ||
+            parsedSave?.message ||
+            (saveRes?.stderr || saveRes?.stdout || this.tr("Failed to save AI settings", "保存 AI 配置失败")).trim();
+          return;
+        }
+        this.aiStatus = summarizeAiStatus(parsedSave) ?? { configured: true, enabled: true, model, baseUrl };
+        this.aiTestResult = parsedTest;
+        this.aiKeyInput?.set_value?.("");
+        this.aiError = null;
+        this.aiGateHint = null;
+      } catch (e) {
+        this.aiError = String(e?.message ?? e);
+      } finally {
+        this.aiBusy = false;
+        cx.notify();
+      }
     });
   }
 
@@ -114,15 +290,35 @@ export default class Welcome extends View {
   async loadAiStatus() {
     const r = await callCore(["ai", "status", "--json"]);
     this.aiStatus = r?.code === 0 ? summarizeAiStatus(r.stdout) : null;
+    if (this.aiStatus?.baseUrl) {
+      this.aiUrlInput?.set_value?.(this.aiStatus.baseUrl);
+      this.aiProvider = this.aiStatus.baseUrl.includes("deepseek") ? "deepseek" : "custom";
+    }
+    if (this.aiStatus?.model) {
+      this.aiModelInput?.set_value?.(this.aiStatus.model);
+    }
   }
 
-  done(outcome) {
+  done(outcome, cx = null) {
+    if (!this.aiReady()) {
+      this.page = AI_PAGE;
+      this.aiGateHint = this.tr(
+        "Core AI setup is required: enter your API key (DeepSeek Official API recommended) and pass the connectivity test first.",
+        "首次使用需先配置核心 AI 助手：请填写 API Key（推荐 DeepSeek 官方 API）并点击「保存并测试连通性」通过验证。",
+      );
+      cx?.notify?.();
+      return;
+    }
     setShared("frame.welcomed", outcome);
     closeOverlay(props().overlay);
   }
 
-  start() {
-    this.done("finished");
+  start(cx = null) {
+    if (!this.aiReady()) {
+      this.done("finished", cx);
+      return;
+    }
+    this.done("finished", cx);
     if (spaces().length === 0) run("space.new");
   }
 
@@ -204,10 +400,28 @@ export default class Welcome extends View {
   }
 
   go(page, cx) {
-    this.page = clampPage(page);
-    if (!isChecking() && this.page === 3) {
+    const requested = clampPage(page);
+    const allowed = canAccessPage(requested, this.page, this.aiReady());
+    if (requested > allowed) {
+      this.page = allowed;
+      this.aiGateHint = this.tr(
+        "Complete and test Core AI connectivity first to unlock the next step.",
+        "请先填写 API Key 并测试连通通过后再进入下一步。",
+      );
+      cx.notify();
+      return;
+    }
+    this.aiGateHint = null;
+    this.page = allowed;
+    if (!isChecking() && this.page === AI_PAGE) {
       cx.spawn(async (cx) => {
         await Promise.all([this.loadMachines(), this.loadAiStatus()]);
+        cx.notify();
+      });
+    }
+    if (!isChecking() && this.page === 4) {
+      cx.spawn(async (cx) => {
+        await this.loadSkillStatus();
         cx.notify();
       });
     }
@@ -590,35 +804,60 @@ export default class Welcome extends View {
 
   pageThree(t) {
     const ai = this.aiStatus;
+    const aiVerified = this.aiTestResult?.ok === true && Boolean(ai?.configured);
     const aiOn = Boolean(ai?.configured);
-    const aiBadge = aiOn
-      ? this.tr(ai.model ? `Configured · ${ai.model}` : "Configured", ai.model ? `已配置 · ${ai.model}` : "已配置")
-      : this.tr("Not configured", "未配置");
+    const latency = this.aiTestResult?.latencyMs ?? this.aiTestResult?.latency_ms ?? null;
+    const aiBadge = aiVerified
+      ? this.tr(
+          `Verified · ${ai?.model || DEEPSEEK_PRESET.model}${latency ? ` (${latency}ms)` : ""}`,
+          `已验证连通 · ${ai?.model || DEEPSEEK_PRESET.model}${latency ? ` (${latency}ms)` : ""}`,
+        )
+      : aiOn
+        ? this.tr("Saved · click Test to verify", "已保存 · 请点击测试验证连通")
+        : this.tr("Required", "必填");
     const coreVer = typeof updates === "function" ? fmtVersion(updates()?.core?.version) : "";
     const localNote = coreVer ? `h2 ${coreVer}` : this.tr("here", "本机");
-    const shownMachines = this.machines.slice(0, 3);
+    const shownMachines = this.machines.slice(0, 2);
     const hiddenCount = Math.max(0, this.machines.length - shownMachines.length);
+    const currentModel = String(this.aiModelInput?.value?.() ?? "").trim() || DEEPSEEK_PRESET.model;
+    const presetChip = (id, label, active, onClick) =>
+      div()
+        .id(id)
+        .px(8)
+        .py(3)
+        .rounded(6)
+        .cursor_pointer()
+        .text_size(11.5)
+        .font_medium()
+        .border_1()
+        .border_color(active ? t.accent : t.border)
+        .bg(active ? t.accent + "1f" : t.background)
+        .text_color(active ? t.accent : t.muted)
+        .hover((s) => s.bg(t.hover).text_color(t.foreground))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .on_click(onClick)
+        .child(label);
 
     return v_flex()
-      .gap(14)
+      .gap(11)
       .child(
         this.title(
           t,
           this.tr("Core AI & other machines", "核心 AI 助手与远程主机"),
           this.tr(
-            "Both are optional—set them up now or anytime later in Settings.",
-            "两项均为可选配置，现在跳过也可以随时在「设置」中开启。",
+            "Core AI is required to power smart status detection, Prompt Polish, Context Handoff, and Drove. DeepSeek Official API is strongly recommended.",
+            "首次启动需配置核心 AI 能力（驱动智能状态识别、提示词润色、上下文接力与 Skill 智能安装），推荐使用 DeepSeek 官方 API。",
           ),
         ),
       )
-      // Core AI compact card
+      // Mandatory Core AI inline setup card (DeepSeek Official API recommended)
       .child(
         v_flex()
-          .gap(8)
+          .gap(9)
           .p(12)
           .rounded(11)
           .border_1()
-          .border_color(aiOn ? t.ansi2 : t.border)
+          .border_color(aiVerified ? t.ansi2 : t.accent)
           .bg(t.raised)
           .child(
             h_flex()
@@ -627,7 +866,7 @@ export default class Welcome extends View {
               .gap(8)
               .child(
                 h_flex()
-                  .gap(8)
+                  .gap(7)
                   .items_center()
                   .child(svg(S("sparkles")).size(15).text_color(t.accent))
                   .child(div().text_size(13.2).font_semibold().text_color(t.foreground).child(this.tr("Core AI Assistant", "核心 AI 助手")))
@@ -636,31 +875,183 @@ export default class Welcome extends View {
                       .px(6)
                       .py(1)
                       .rounded(5)
-                      .bg(aiOn ? t.ansi2 + "20" : t.background)
+                      .bg(aiVerified ? t.ansi2 + "22" : t.accent + "20")
                       .border_1()
-                      .border_color(aiOn ? t.ansi2 : t.border)
+                      .border_color(aiVerified ? t.ansi2 : t.accent)
                       .text_size(11)
-                      .text_color(aiOn ? t.ansi2 : t.dim)
+                      .font_medium()
+                      .text_color(aiVerified ? t.ansi2 : t.accent)
                       .child(aiBadge),
                   ),
               )
               .child(
                 this.smallButton(
                   t,
-                  "w-open-ai-settings",
-                  aiOn ? this.tr("Manage", "管理") : this.tr("Configure AI…", "去配置…"),
-                  () => run("app.settings", { section: "ai" }),
-                  !aiOn,
+                  "w-copy-deepseek-portal",
+                  this.copied === "w-copy-deepseek-portal"
+                    ? this.tr("Portal URL Copied", "已复制获取地址")
+                    : this.tr("Get DeepSeek Key", "获取 DeepSeek Key"),
+                  (_e, cx) => {
+                    cx.write_to_clipboard(DEEPSEEK_PRESET.portalUrl);
+                    this.copied = "w-copy-deepseek-portal";
+                    cx.notify();
+                  },
                 ),
               ),
           )
+          // Provider & DeepSeek quick preset bar
           .child(
-            this.para(
-              t,
-              this.tr(
-                "Connect one OpenAI-compatible endpoint to power Prompt Polish, Context Handoff, Catch-up Briefing, Semantic Titles, and Drove.",
-                "配置一个 OpenAI 兼容接口，即可解锁提示词润色、上下文接力、待办简报、语义标题与 Drove 多智能体编排。",
+            h_flex()
+              .gap(6)
+              .items_center()
+              .flex_wrap()
+              .child(
+                presetChip(
+                  "w-ai-preset-deepseek",
+                  this.tr("DeepSeek Official (Recommended)", "DeepSeek 官方（推荐）"),
+                  this.aiProvider === "deepseek" && currentModel === "deepseek-chat",
+                  (_e, cx) => this.applyDeepSeekPreset("deepseek-chat", cx),
+                ),
+              )
+              .child(
+                presetChip(
+                  "w-ai-preset-reasoner",
+                  "deepseek-reasoner",
+                  this.aiProvider === "deepseek" && currentModel === "deepseek-reasoner",
+                  (_e, cx) => this.applyDeepSeekPreset("deepseek-reasoner", cx),
+                ),
+              )
+              .child(
+                presetChip(
+                  "w-ai-preset-custom",
+                  this.tr("Custom OpenAI API", "自定义 OpenAI 兼容"),
+                  this.aiProvider === "custom",
+                  (_e, cx) => {
+                    this.aiProvider = "custom";
+                    cx.notify();
+                  },
+                ),
               ),
+          )
+          // Inline inputs: Service URL + Model + API Key
+          .when(Boolean(this.aiUrlInput && this.aiKeyInput && this.aiModelInput), (el) =>
+            el
+              .child(
+                h_flex()
+                  .gap(8)
+                  .items_start()
+                  .child(
+                    v_flex()
+                      .flex_1()
+                      .min_w(0)
+                      .gap(3)
+                      .child(div().text_size(11.5).text_color(t.muted).child(this.tr("Service URL", "服务地址 (Base URL)")))
+                      .child(
+                        div()
+                          .px(8)
+                          .py(2)
+                          .rounded(7)
+                          .border_1()
+                          .border_color(t.input)
+                          .bg(t.background)
+                          .child(Input.new(this.aiUrlInput).h(25).text_size(12.2).text_color(t.foreground)),
+                      ),
+                  )
+                  .child(
+                    v_flex()
+                      .w(170)
+                      .flex_none()
+                      .gap(3)
+                      .child(div().text_size(11.5).text_color(t.muted).child(this.tr("Model", "模型")))
+                      .child(
+                        div()
+                          .px(8)
+                          .py(2)
+                          .rounded(7)
+                          .border_1()
+                          .border_color(t.input)
+                          .bg(t.background)
+                          .child(Input.new(this.aiModelInput).h(25).text_size(12.2).text_color(t.foreground)),
+                      ),
+                  ),
+              )
+              .child(
+                h_flex()
+                  .gap(8)
+                  .items_end()
+                  .child(
+                    v_flex()
+                      .flex_1()
+                      .min_w(0)
+                      .gap(3)
+                      .child(
+                        div()
+                          .text_size(11.5)
+                          .text_color(t.muted)
+                          .child(
+                            aiOn
+                              ? this.tr("API Key (leave blank to test saved key, or paste new key)", "API Key（留空将测试已保存的 Key，或粘贴新 Key）")
+                              : this.tr("API Key (stored locally with 0600 permissions)", "API Key（本地 0600 权限加密存储，不上传）"),
+                          ),
+                      )
+                      .child(
+                        div()
+                          .px(8)
+                          .py(2)
+                          .rounded(7)
+                          .border_1()
+                          .border_color(t.input)
+                          .bg(t.background)
+                          .child(Input.new(this.aiKeyInput).h(25).text_size(12.2).text_color(t.foreground)),
+                      ),
+                  )
+                  .child(
+                    this.button(
+                      t,
+                      "w-ai-save-test",
+                      this.aiBusy
+                        ? this.tr("Testing…", "测试中…")
+                        : aiVerified
+                          ? this.tr("Re-test", "重新测试")
+                          : this.tr("Save & Test", "保存并测试连通"),
+                      "primary",
+                      (_e, cx) => this.saveAndTestAi(cx),
+                    ),
+                  ),
+              ),
+          )
+          .when(Boolean(this.aiError || this.aiGateHint), (el) =>
+            el.child(
+              div()
+                .px(9)
+                .py(6)
+                .rounded(7)
+                .bg(t.blocked + "18")
+                .border_1()
+                .border_color(t.blocked)
+                .text_size(11.8)
+                .line_height("17px")
+                .text_color(t.blocked)
+                .child(this.aiError || this.aiGateHint),
+            ),
+          )
+          .when(aiVerified && !this.aiError, (el) =>
+            el.child(
+              div()
+                .px(9)
+                .py(6)
+                .rounded(7)
+                .bg(t.ansi2 + "18")
+                .border_1()
+                .border_color(t.ansi2)
+                .text_size(11.8)
+                .text_color(t.ansi2)
+                .child(
+                  this.tr(
+                    "Connection verified! You can now proceed to the next step.",
+                    "✓ 连通性测试已通过！可以点击右下角「下一步」继续。",
+                  ),
+                ),
             ),
           ),
       )
@@ -711,12 +1102,12 @@ export default class Welcome extends View {
           .child(
             h_flex()
               .id("w-add-machine")
-              .h(38)
+              .h(36)
               .px(12)
               .gap(9)
               .items_center()
               .cursor_pointer()
-              .text_size(12.8)
+              .text_size(12.5)
               .font_medium()
               .text_color(t.accent)
               .hover((s) => s.bg(t.hover))
@@ -724,18 +1115,6 @@ export default class Welcome extends View {
               .on_click(() => run("mod.open", { name: "machine-add" }))
               .child(svg(W("plus")).size(14))
               .child(this.tr("Add a machine (SSH / WSL)", "添加远程主机 / WSL")),
-          ),
-      )
-      .child(
-        div()
-          .text_size(12)
-          .line_height("18px")
-          .text_color(t.dim)
-          .child(
-            this.tr(
-              "Installed coding CLIs (Claude Code, Codex, Gemini, ZCode…) appear automatically in the top + menu.",
-              "本机已安装的编程 CLI（Claude Code、Codex、Gemini、ZCode 等）会自动出现在顶部 + 新建菜单中。",
-            ),
           ),
       );
   }
@@ -819,6 +1198,49 @@ export default class Welcome extends View {
       )
       .child(
         v_flex()
+          .gap(7)
+          .p(11)
+          .rounded(10)
+          .border_1()
+          .border_color(this.skillMessage?.ok ? t.ansi2 : t.border)
+          .bg(t.raised)
+          .child(
+            h_flex()
+              .items_center()
+              .justify_between()
+              .gap(8)
+              .child(
+                h_flex()
+                  .gap(7)
+                  .items_center()
+                  .child(svg(S("sparkles")).size(14).text_color(t.accent))
+                  .child(div().text_size(13).font_semibold().text_color(t.foreground).child(this.tr("Install Companion Skills", "一键安装配套 Skill"))),
+              )
+              .child(
+                this.smallButton(
+                  t,
+                  "w-install-skills",
+                  this.skillInstalling
+                    ? this.tr("Installing…", "安装中…")
+                    : this.tr("Install Skills Now", "一键安装到本机 Agent"),
+                  (_e, cx) => this.installSkillsNow(cx),
+                  !this.skillMessage?.ok,
+                ),
+              ),
+          )
+          .child(
+            this.para(
+              t,
+              this.skillMessage?.text
+                || this.tr(
+                  "Install `herdr2` + `drove` skills into your detected coding agents (Antigravity, Claude Code, Codex, Cursor…) so they can orchestrate `h2` automatically. You can also use AI-assisted install anytime in Settings → Skills.",
+                  "自动为本机检测到的编程 Agent（Antigravity、Claude Code、Codex、Cursor 等）安装 `herdr2` 与 `drove` 配套 Skill，解锁无头子 Agent 编排；也可随时在「设置 → Skills」用 AI 智能安装。",
+                ),
+            ),
+          ),
+      )
+      .child(
+        v_flex()
           .gap(8)
           .p(12)
           .rounded(10)
@@ -873,10 +1295,10 @@ export default class Welcome extends View {
       .on_key_down((e, cx) => {
         const k = e.key;
         const m = e.modifiers;
-        if (k === "escape") return this.done("skipped");
+        if (k === "escape") return this.done("skipped", cx);
         if (m.control || m.alt || m.platform) return;
         if (k === "enter" || k === "right") {
-          if (this.page === PAGES) return k === "enter" ? this.start() : undefined;
+          if (this.page === PAGES) return k === "enter" ? this.start(cx) : undefined;
           this.go(this.page + 1, cx);
         } else if (k === "left") {
           this.go(this.page - 1, cx);
@@ -918,21 +1340,23 @@ export default class Welcome extends View {
               .child(langNow === "zh-CN" ? "EN" : "中文"),
           )
           .child(div().text_size(11.5).text_color(t.dim).child(this.tr("Drag to move", "拖动移动")))
-          .child(
-            div()
-              .id("w-close")
-              .w(26)
-              .h(26)
-              .rounded(7)
-              .flex()
-              .items_center()
-              .justify_center()
-              .text_color(t.muted)
-              .cursor_pointer()
-              .hover((s) => s.bg(t.hover).text_color(t.foreground))
-              .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
-              .on_click(() => this.done("skipped"))
-              .child(svg(W("x")).size(14)),
+          .when(this.aiReady(), (el) =>
+            el.child(
+              div()
+                .id("w-close")
+                .w(26)
+                .h(26)
+                .rounded(7)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_color(t.muted)
+                .cursor_pointer()
+                .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                .on_click((_e, cx) => this.done("skipped", cx))
+                .child(svg(W("x")).size(14)),
+            ),
           ),
       )
       // Single-screen body (fits cleanly without vertical scrolling)
@@ -978,8 +1402,10 @@ export default class Welcome extends View {
               ? this.button(
                   t,
                   "w-next",
-                  this.tr("Next", "下一步"),
-                  "primary",
+                  this.page === AI_PAGE && !this.aiReady()
+                    ? this.tr("Verify AI to continue", "验证 AI 后继续")
+                    : this.tr("Next", "下一步"),
+                  this.page === AI_PAGE && !this.aiReady() ? "outline" : "primary",
                   (_e, cx) => this.go(this.page + 1, cx),
                   I("arrow-right"),
                 )
@@ -988,7 +1414,7 @@ export default class Welcome extends View {
                   "w-start",
                   noSpaces ? this.tr("Start working", "开始使用") : this.tr("Done", "完成"),
                   "primary",
-                  () => this.start(),
+                  (_e, cx) => this.start(cx),
                   I("arrow-right"),
                 ),
           ),

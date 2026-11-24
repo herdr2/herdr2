@@ -2,6 +2,31 @@
 
 export const PAGES = 4;
 
+export const DEEPSEEK_PRESET = {
+  id: "deepseek",
+  nameEn: "DeepSeek Official (Recommended)",
+  nameZh: "DeepSeek 官方 API（推荐）",
+  baseUrl: "https://api.deepseek.com/v1",
+  model: "deepseek-chat",
+  models: ["deepseek-chat", "deepseek-reasoner"],
+  portalUrl: "https://platform.deepseek.com/api_keys",
+};
+
+export const AI_PAGE = 3;
+
+export function isAiGateSatisfied(aiStatus, aiTestResult, bypassed = false) {
+  if (bypassed) return true;
+  if (aiTestResult?.ok === true && Boolean(aiStatus?.configured)) return true;
+  return false;
+}
+
+export function canAccessPage(targetPage, currentPage, aiReady) {
+  const clamped = clampPage(targetPage);
+  if (aiReady) return clamped;
+  if (clamped > AI_PAGE) return AI_PAGE;
+  return clamped;
+}
+
 export const LANGUAGES = [
   ["en", "English"],
   ["zh-CN", "简体中文"],

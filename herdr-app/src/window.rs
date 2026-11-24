@@ -10897,7 +10897,21 @@ impl AppWindow {
         None
     }
 
+    fn layout_has_mod(node: &crate::layout::Node, mod_name: &str) -> bool {
+        match &node.kind {
+            crate::layout::Kind::Block { content: crate::layout::Content::Mod { name, .. } } => name == mod_name,
+            crate::layout::Kind::Row { children }
+            | crate::layout::Kind::Column { children }
+            | crate::layout::Kind::Stack { children, .. } => children.iter().any(|c| Self::layout_has_mod(c, mod_name)),
+            _ => false,
+        }
+    }
+
     fn render_update_pill(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // Layouts containing the `tabs` mod render the primary top-right Update button inline.
+        if Self::layout_has_mod(&self.chrome, "tabs") {
+            return None;
+        }
         let key = self.update_ready.as_ref()?;
         if self.update_dismissed.as_deref() == Some(key.as_str()) {
             return None;

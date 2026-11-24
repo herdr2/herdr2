@@ -2,6 +2,8 @@ import { expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import {
   PAGES,
+  AI_PAGE,
+  DEEPSEEK_PRESET,
   PANELS,
   SHORTCUT_HIGHLIGHTS,
   resolveLang,
@@ -11,6 +13,8 @@ import {
   boundShortcut,
   normalizeMachines,
   summarizeAiStatus,
+  isAiGateSatisfied,
+  canAccessPage,
   agentCustomizePrompt,
   fmtVersion,
   findLayoutNode,
@@ -177,4 +181,24 @@ test("Welcome view persists appearance, switches language, toggles panels, and r
   expect(source).not.toContain("hc machine login");
   expect(source).not.toContain("~/.config/herdr-app");
   expect(source).not.toContain("Scrollbar.vertical");
+});
+
+test("Welcome enforces DeepSeek/AI connectivity gate unless verified or bypassed", () => {
+  expect(DEEPSEEK_PRESET.baseUrl).toBe("https://api.deepseek.com/v1");
+  expect(DEEPSEEK_PRESET.model).toBe("deepseek-chat");
+  expect(AI_PAGE).toBe(3);
+
+  // Unverified AI blocks proceeding past AI_PAGE
+  expect(isAiGateSatisfied(null, null, false)).toBe(false);
+  expect(isAiGateSatisfied({ configured: true }, null, false)).toBe(false);
+  expect(isAiGateSatisfied({ configured: true }, { ok: false }, false)).toBe(false);
+  expect(canAccessPage(4, 3, false)).toBe(3);
+  expect(canAccessPage(2, 1, false)).toBe(2);
+
+  // Verified AI unlocks Page 4 and completion
+  expect(isAiGateSatisfied({ configured: true }, { ok: true }, false)).toBe(true);
+  expect(canAccessPage(4, 3, true)).toBe(4);
+
+  // QA bypass flag unlocks when explicitly set
+  expect(isAiGateSatisfied(null, null, true)).toBe(true);
 });

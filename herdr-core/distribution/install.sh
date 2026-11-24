@@ -7,8 +7,7 @@
 # H2_VERSION=0.2.0 picks a version; HERDR2_RELEASES_URL is required.
 set -eu
 
-releases=${HERDR2_RELEASES_URL:-}
-[ -n "$releases" ] || { printf 'h2: set HERDR2_RELEASES_URL to your release server base URL\n' >&2; exit 1; }
+releases=${HERDR2_RELEASES_URL:-https://github.com/herdr2/herdr2/releases/download/ota-latest}
 releases=${releases%/}
 bin=${H2_INSTALL_DIR:-$HOME/.local/bin}
 
@@ -38,8 +37,16 @@ sha256() {
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp" "$bin/herdr2.staged"' EXIT
 
-manifest="$releases/core/latest.json"
-[ -n "${H2_VERSION:-}" ] && manifest="$releases/core/$H2_VERSION/manifest.json"
+case "$releases" in
+  */releases/download/* | */releases/latest/download)
+    manifest="$releases/core-latest.json"
+    [ -n "${H2_VERSION:-}" ] && manifest="$releases/core-$H2_VERSION-manifest.json"
+    ;;
+  *)
+    manifest="$releases/core/latest.json"
+    [ -n "${H2_VERSION:-}" ] && manifest="$releases/core/$H2_VERSION/manifest.json"
+    ;;
+esac
 curl -fsSL "$manifest" -o "$tmp/manifest.json" || fail "cannot reach $manifest"
 flat=$(tr -d '\n ' < "$tmp/manifest.json")
 entry=$(printf '%s' "$flat" | sed -n "s/.*\"$target\":{\([^}]*\)}.*/\1/p")
@@ -70,16 +77,30 @@ if [ "${H2_BUNDLE_ONLY:-0}" = 1 ] && [ ! -x "$tmp/Herdr2.app/Contents/MacOS/herd
 fi
 mkdir -p "$bin"
 
+is_core_bin() {
+  [ -x "$1" ] && "$1" --version 2>/dev/null | grep -q '^h2 '
+}
+
+# Avoid colliding with the desktop app symlink/binary at `$bin/herdr2`.
+# If `$bin/herdr2` already exists and is NOT h2 core (e.g. Herdr2 desktop app),
+# install core into `$bin/herdr2-core` and point `$bin/h2` at it.
+core_dest="$bin/herdr2"
+link_target="herdr2"
+if [ -e "$bin/herdr2" ] && ! is_core_bin "$bin/herdr2"; then
+  core_dest="$bin/herdr2-core"
+  link_target="herdr2-core"
+fi
+
 bundle=0
 if [ "$os" = macos ] && [ "$(id -u)" != 0 ]; then
   case "$bin" in "$HOME"/*) bundle=1 ;; esac
 fi
 if [ "$bundle" = 1 ] && [ -x "$tmp/Herdr2.app/Contents/MacOS/herdr2" ]; then
   action=installed
-  [ ! -x "$bin/herdr2" ] || action=updated
+  [ ! -x "$core_dest" ] || action=updated
   bundled="$tmp/Herdr2.app/Contents/MacOS/herdr2"
   if [ "$action" = updated ]; then
-    installed=$("$bin/herdr2" --version)
+    installed=$("$core_dest" --version)
     candidate=$("$bundled" --version)
     awk -v old="$installed" -v new="$candidate" 'BEGIN {
       sub(/^h2 /, "", old); sub(/^h2 /, "", new)
@@ -87,26 +108,26 @@ if [ "$bundle" = 1 ] && [ -x "$tmp/Herdr2.app/Contents/MacOS/herdr2" ]; then
       for (i=1; i<=3; i++) { if (a[i]+0 > b[i]+0) exit 1; if (a[i]+0 < b[i]+0) exit 0 }
     }' || fail "$candidate is older than $installed; use h2 update --from with --force to downgrade"
   fi
-  "$bundled" --h2-install-bundle "$bundled" "$bin/herdr2" || fail "installing Herdr2.app failed"
+  "$bundled" --h2-install-bundle "$bundled" "$core_dest" || fail "installing Herdr2.app failed"
   if [ "$action" = updated ]; then
-    "$bin/herdr2" server restart >/dev/null || fail "restarting the core failed"
+    "$core_dest" server restart >/dev/null || fail "restarting the core failed"
   fi
   say "h2 $version $action as Herdr2.app."
-elif [ -x "$bin/herdr2" ]; then
-  "$bin/herdr2" update --from "$core" >/dev/null || fail "updating $bin/herdr2 failed (see above)"
+elif is_core_bin "$core_dest"; then
+  "$core_dest" update --from "$core" >/dev/null || fail "updating $core_dest failed (see above)"
   say "h2 updated to $version."
 else
-  cp "$core" "$bin/herdr2.new"
-  chmod 755 "$bin/herdr2.new"
-  mv -f "$bin/herdr2.new" "$bin/herdr2"
-  say "h2 $version installed into $bin/herdr2."
+  cp "$core" "$core_dest.new"
+  chmod 755 "$core_dest.new"
+  mv -f "$core_dest.new" "$core_dest"
+  say "h2 $version installed into $core_dest."
 fi
-if ! command -v h2 >/dev/null 2>&1 && [ ! -e "$bin/h2" ]; then
-  ln -s herdr2 "$bin/h2"
+if [ ! -e "$bin/h2" ] || [ -L "$bin/h2" ]; then
+  ln -sfn "$link_target" "$bin/h2"
 fi
 
 case ":$PATH:" in
   *":$bin:"*) ;;
   *) say "Add $bin to your PATH to use h2." ;;
 esac
-say "Agents: h2 --skill. People: h2 --help."
+say "Skills: h2 skill install --all. Agents: h2 --skill. People: h2 --help."

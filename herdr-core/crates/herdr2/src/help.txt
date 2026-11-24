@@ -50,6 +50,8 @@ More
                               manage remote machines over SSH or `--via`
   connect                     JSON-RPC API over stdin/stdout
   drove status|web|probe|...  manage Drove DAG orchestration and Web UI
+  skill status|install|ai-install
+                              detect coding agents and install bundled Herdr2 skills
   ai status|settings-set|test manage shared Core AI assistant & cache stats
   schema                      print OpenRPC 1.3.2 JSON Schema
 

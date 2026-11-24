@@ -332,10 +332,16 @@ def pack_ui_bundle(
     app_version_max: str | None,
     host_api_generation: int,
     notes: str | None = None,
+    github_release: bool = False,
 ) -> dict[str, Any]:
-    ver_dir = out_root / "ui" / version
-    ver_dir.mkdir(parents=True, exist_ok=True)
-    archive_path = ver_dir / "herdr2-ui-bundle.tar.gz"
+    if github_release:
+        ver_dir = out_root
+        ver_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = ver_dir / "herdr2-ui-bundle.tar.gz"
+    else:
+        ver_dir = out_root / "ui" / version
+        ver_dir.mkdir(parents=True, exist_ok=True)
+        archive_path = ver_dir / "herdr2-ui-bundle.tar.gz"
 
     bundle_meta = {
         "version": version,
@@ -367,11 +373,12 @@ def pack_ui_bundle(
 
     digest = sha256_file(archive_path)
     base = base_url.rstrip("/")
+    url = f"{base}/{archive_path.name}" if github_release else f"{base}/ui/{version}/{archive_path.name}"
     manifest: dict[str, Any] = {
         "version": version,
         "app_version_min": app_version_min,
         "host_api_generation": host_api_generation,
-        "url": f"{base}/ui/{version}/{archive_path.name}",
+        "url": url,
         "sha256": digest,
         "notes": notes or f"Herdr2 UI {version}",
     }
@@ -379,8 +386,11 @@ def pack_ui_bundle(
         manifest["app_version_max"] = app_version_max
 
     text = json.dumps(manifest, indent=2, ensure_ascii=False) + "\n"
-    (ver_dir / "manifest.json").write_text(text, encoding="utf-8")
-    (out_root / "ui" / "latest.json").write_text(text, encoding="utf-8")
+    if github_release:
+        (out_root / "ui-latest.json").write_text(text, encoding="utf-8")
+    else:
+        (ver_dir / "manifest.json").write_text(text, encoding="utf-8")
+        (out_root / "ui" / "latest.json").write_text(text, encoding="utf-8")
     return manifest
 
 
@@ -391,20 +401,33 @@ def write_binary_manifests(
     core_version: str | None = None,
     core_generation: int | None = None,
     notes: str | None = None,
+    github_release: bool = False,
 ) -> dict[str, Any]:
     base = base_url.rstrip("/")
     written: dict[str, Any] = {}
 
     if app_version:
-        app_dir = out_root / "app" / app_version
+        app_dir = out_root if github_release else (out_root / "app" / app_version)
         targets: dict[str, dict[str, str]] = {}
         if app_dir.is_dir():
-            for archive in sorted(
-                [*app_dir.glob("herdr2-*.tar.gz"), *app_dir.glob("herdr2-*.zip")]
-            ):
-                target = archive.name.removeprefix("herdr2-").removesuffix(".tar.gz").removesuffix(".zip")
+            patterns = ("herdr2-app-*.tar.gz", "herdr2-app-*.zip") if github_release else ("herdr2-*.tar.gz", "herdr2-*.zip")
+            archives = [p for pat in patterns for p in sorted(app_dir.glob(pat))]
+            if github_release and not archives:
+                archives = [
+                    p
+                    for pat in ("herdr2-*.tar.gz", "herdr2-*.zip")
+                    for p in sorted(app_dir.glob(pat))
+                    if not p.name.startswith("herdr2-core-") and not p.name.startswith("herdr2-ui-")
+                ]
+            for archive in archives:
+                target = (
+                    archive.name.removeprefix("herdr2-app-")
+                    .removeprefix("herdr2-")
+                    .removesuffix(".tar.gz")
+                    .removesuffix(".zip")
+                )
                 targets[target] = {
-                    "url": f"{base}/app/{app_version}/{archive.name}",
+                    "url": f"{base}/{archive.name}" if github_release else f"{base}/app/{app_version}/{archive.name}",
                     "sha256": sha256_file(archive),
                 }
         if targets:
@@ -414,24 +437,35 @@ def write_binary_manifests(
                 "targets": targets,
             }
             text = json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
-            (app_dir / "manifest.json").write_text(text, encoding="utf-8")
-            (out_root / "app" / "latest.json").write_text(text, encoding="utf-8")
-            for inst in ("install.sh", "install.ps1"):
-                src = APP_DIR / "distribution" / inst
-                if src.is_file():
-                    shutil.copy2(src, out_root / "app" / inst)
+            if github_release:
+                (out_root / "app-latest.json").write_text(text, encoding="utf-8")
+                for inst in ("install.sh", "install.ps1"):
+                    src = APP_DIR / "distribution" / inst
+                    if src.is_file():
+                        shutil.copy2(src, out_root / f"app-{inst}")
+            else:
+                (app_dir / "manifest.json").write_text(text, encoding="utf-8")
+                (out_root / "app" / "latest.json").write_text(text, encoding="utf-8")
+                for inst in ("install.sh", "install.ps1"):
+                    src = APP_DIR / "distribution" / inst
+                    if src.is_file():
+                        shutil.copy2(src, out_root / "app" / inst)
             written["app"] = doc
 
     if core_version:
-        core_dir = out_root / "core" / core_version
+        core_dir = out_root if github_release else (out_root / "core" / core_version)
         targets = {}
         if core_dir.is_dir():
-            for archive in sorted(
-                [*core_dir.glob("herdr2-*.tar.gz"), *core_dir.glob("herdr2-*.zip")]
-            ):
-                target = archive.name.removeprefix("herdr2-").removesuffix(".tar.gz").removesuffix(".zip")
+            patterns = ("herdr2-core-*.tar.gz", "herdr2-core-*.zip") if github_release else ("herdr2-*.tar.gz", "herdr2-*.zip")
+            for archive in [p for pat in patterns for p in sorted(core_dir.glob(pat))]:
+                target = (
+                    archive.name.removeprefix("herdr2-core-")
+                    .removeprefix("herdr2-")
+                    .removesuffix(".tar.gz")
+                    .removesuffix(".zip")
+                )
                 targets[target] = {
-                    "url": f"{base}/core/{core_version}/{archive.name}",
+                    "url": f"{base}/{archive.name}" if github_release else f"{base}/core/{core_version}/{archive.name}",
                     "sha256": sha256_file(archive),
                 }
         if targets:
@@ -442,12 +476,20 @@ def write_binary_manifests(
                 "targets": targets,
             }
             text = json.dumps(doc, indent=2, ensure_ascii=False) + "\n"
-            (core_dir / "manifest.json").write_text(text, encoding="utf-8")
-            (out_root / "core" / "latest.json").write_text(text, encoding="utf-8")
-            for inst in ("install.sh", "install.ps1"):
-                src = CORE_DIR / "distribution" / inst
-                if src.is_file():
-                    shutil.copy2(src, out_root / "core" / inst)
+            if github_release:
+                (out_root / "core-latest.json").write_text(text, encoding="utf-8")
+                (out_root / f"core-{core_version}-manifest.json").write_text(text, encoding="utf-8")
+                for inst in ("install.sh", "install.ps1"):
+                    src = CORE_DIR / "distribution" / inst
+                    if src.is_file():
+                        shutil.copy2(src, out_root / f"core-{inst}")
+            else:
+                (core_dir / "manifest.json").write_text(text, encoding="utf-8")
+                (out_root / "core" / "latest.json").write_text(text, encoding="utf-8")
+                for inst in ("install.sh", "install.ps1"):
+                    src = CORE_DIR / "distribution" / inst
+                    if src.is_file():
+                        shutil.copy2(src, out_root / "core" / inst)
             written["core"] = doc
 
     return written
@@ -479,6 +521,7 @@ def main(argv: list[str] | None = None) -> int:
     p_ui.add_argument("--app-max", default=None, help="Optional maximum compatible app version")
     p_ui.add_argument("--generation", type=int, default=None, help="Host API generation (default: from mods.rs)")
     p_ui.add_argument("--notes", default=None, help="Release notes summary")
+    p_ui.add_argument("--github-release", action="store_true", help="Write flat GitHub Releases assets (ui-latest.json + herdr2-ui-bundle.tar.gz)")
 
     p_man = sub.add_parser("manifest", help="Generate app/latest.json and core/latest.json")
     p_man.add_argument("--dir", required=True, type=pathlib.Path, help="Release root directory")
@@ -487,6 +530,7 @@ def main(argv: list[str] | None = None) -> int:
     p_man.add_argument("--core-version", default=None)
     p_man.add_argument("--core-generation", type=int, default=None)
     p_man.add_argument("--notes", default=None)
+    p_man.add_argument("--github-release", action="store_true", help="Write flat GitHub Releases manifests (app-latest.json, core-latest.json, *-install.*)")
 
     p_srv = sub.add_parser("serve", help="Run local static HTTP server for update testing")
     p_srv.add_argument("--dir", required=True, type=pathlib.Path)
@@ -504,7 +548,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "ui":
         app_min = args.app_min or read_app_version()
         gen = args.generation if args.generation is not None else read_ui_host_api_generation()
-        m = pack_ui_bundle(args.defaults, args.out, args.version, args.base_url, app_min, args.app_max, gen, args.notes)
+        m = pack_ui_bundle(
+            args.defaults,
+            args.out,
+            args.version,
+            args.base_url,
+            app_min,
+            args.app_max,
+            gen,
+            args.notes,
+            github_release=args.github_release,
+        )
         print(json.dumps(m, indent=2, ensure_ascii=False))
         return 0
 
@@ -517,6 +571,7 @@ def main(argv: list[str] | None = None) -> int:
             core_version=args.core_version or core_ver,
             core_generation=args.core_generation if args.core_generation is not None else core_gen,
             notes=args.notes,
+            github_release=args.github_release,
         )
         print(json.dumps(res, indent=2, ensure_ascii=False))
         return 0

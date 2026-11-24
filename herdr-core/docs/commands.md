@@ -60,6 +60,8 @@ More
                               manage remote machines over SSH or `--via`
   connect                     JSON-RPC API over stdin/stdout
   drove status|web|probe|...  manage Drove DAG orchestration and Web UI
+  skill status|install|ai-install
+                              detect coding agents and install bundled Herdr2 skills
   ai status|settings-set|test manage shared Core AI assistant & cache stats
   schema                      print OpenRPC 1.3.2 JSON Schema
 
@@ -82,6 +84,7 @@ Commands:
   status             Show shared Core AI assistant status, configuration, and KV-cache metrics
   settings-set       Update shared Core AI assistant settings from a JSON file
   test               Test the shared Core AI assistant URL and API key
+  probe-prompt-mode  Clear prior prompt-cache detection records, set prompt mode to auto, and re-detect shared-prefix vs compact mode
   handoff-recommend  Recommend a complementary target provider, handoff mode, and note for an upstream session
   briefing           Aggregate local & remote agents and Drove runs into a priority catch-up briefing
   summarize-agent    Generate or refresh a concise semantic title and progress micro-summary for an agent or terminal
@@ -161,6 +164,19 @@ Options:
       --lang <LANG>        Preferred language (`zh-CN` / `en`)
       --on <ON>            Target remote machine (`h2 machine ls`)
   -h, --help               Print help
+```
+
+## h2 ai probe-prompt-mode
+
+```text
+Clear prior prompt-cache detection records, set prompt mode to auto, and re-detect shared-prefix vs compact mode
+
+Usage: h2 ai probe-prompt-mode [OPTIONS]
+
+Options:
+      --json          JSON output even in a terminal
+      --on <MACHINE>  Target remote machine (`h2 machine ls`)
+  -h, --help          Print help
 ```
 
 ## h2 ai settings-set
@@ -418,11 +434,13 @@ Usage: h2 drove [OPTIONS] [COMMAND]
 Commands:
   status           Show Drove web server, configured roles, AI status, and active runs
   web              Print or open the Drove Web UI URL in the browser
+  runs             List Drove runs (read-only) [alias: ls]
+  roles            Show configured Drove roles, models, and routing policy (read-only)
   settings         Read Drove configuration, resolved roles, and AI connection status
   settings-set     Update Drove configuration from a JSON file (removes temp file if requested)
   probe            Probe installed ACP agents and discover their live model & effort options
   ai-test          Test the lightweight AI assistant URL and API key
-  roles-ai-config  Use the configured AI assistant model to auto-configure Drove roles, models, and candidate strengths
+  roles-ai-config  Use the configured AI assistant model to auto-configure Drove roles, models, candidate strengths, and routing notes
   magpie-test      Test the optional Magpie quota gateway
   use              Set the active default Run ID for subsequent CLI commands
   plan             Create a Drove Run from a YAML/JSON plan file or stdin and launch its DAG
@@ -531,10 +549,11 @@ Finalize a Run (runs Run-level verify gate if configured)
 Usage: h2 drove complete [OPTIONS] [RUN]
 
 Arguments:
-  [RUN]  
+  [RUN]  Run ID (positional or via `--run`)
 
 Options:
       --json               JSON output even in a terminal
+      --run <RUN>          Run ID (equivalent to positional `<RUN>`)
       --summary <SUMMARY>  
       --force              
       --on <MACHINE>       
@@ -546,11 +565,14 @@ Options:
 ```text
 List unread coordinator inbox messages for a Run
 
-Usage: h2 drove inbox [OPTIONS]
+Usage: h2 drove inbox [OPTIONS] [RUN]
+
+Arguments:
+  [RUN]  Run ID (positional or via `--run`)
 
 Options:
       --json          JSON output even in a terminal
-      --run <RUN>     
+      --run <RUN>     Run ID (equivalent to positional `<RUN>`)
       --on <MACHINE>  
   -h, --help          Print help
 ```
@@ -568,6 +590,7 @@ Arguments:
 Options:
       --json          JSON output even in a terminal
       --run <RUN>     
+      --tail <TAIL>   Number of recent transcript items to return (1..=200, default 30) [default: 30]
       --on <MACHINE>  
   -h, --help          Print help
 ```
@@ -607,10 +630,11 @@ Pause scheduling new tasks in a Run
 Usage: h2 drove pause [OPTIONS] [RUN]
 
 Arguments:
-  [RUN]  
+  [RUN]  Run ID (positional or via `--run`)
 
 Options:
       --json          JSON output even in a terminal
+      --run <RUN>     Run ID (equivalent to positional `<RUN>`)
       --on <MACHINE>  
   -h, --help          Print help
 ```
@@ -705,10 +729,11 @@ Resume a paused Run
 Usage: h2 drove resume [OPTIONS] [RUN]
 
 Arguments:
-  [RUN]  
+  [RUN]  Run ID (positional or via `--run`)
 
 Options:
       --json          JSON output even in a terminal
+      --run <RUN>     Run ID (equivalent to positional `<RUN>`)
       --on <MACHINE>  
   -h, --help          Print help
 ```
@@ -739,18 +764,32 @@ Options:
   -h, --help                         Print help
 ```
 
+## h2 drove roles
+
+```text
+Show configured Drove roles, models, and routing policy (read-only)
+
+Usage: h2 drove roles [OPTIONS]
+
+Options:
+      --json          JSON output even in a terminal
+      --on <MACHINE>  Target remote machine (`h2 machine ls`)
+  -h, --help          Print help
+```
+
 ## h2 drove roles-ai-config
 
 ```text
-Use the configured AI assistant model to auto-configure Drove roles, models, and candidate strengths
+Use the configured AI assistant model to auto-configure Drove roles, models, candidate strengths, and routing notes
 
 Usage: h2 drove roles-ai-config [OPTIONS]
 
 Options:
       --file <FILE>                
       --json                       JSON output even in a terminal
-      --mode <MODE>                Configuration scope: `models`, `strengths`, or `all`
+      --mode <MODE>                Configuration scope: `models`, `strengths`, `notes`, or `all`
       --instruction <INSTRUCTION>  Optional preference instruction for how roles should be assigned
+      --apply                      Explicitly confirm applying the AI-generated role configuration to drove.json
       --dry-run                    Preview without saving to drove.json
       --language <LANGUAGE>        Preferred language for strength tags and rationale (e.g. zh-CN or en)
       --on <MACHINE>               
@@ -780,6 +819,20 @@ Options:
   -h, --help             Print help
 ```
 
+## h2 drove runs
+
+```text
+List Drove runs (read-only)
+
+Usage: h2 drove runs [OPTIONS]
+
+Options:
+      --json          JSON output even in a terminal
+      --trash         List trashed runs instead of active/completed runs
+      --on <MACHINE>  Target remote machine (`h2 machine ls`)
+  -h, --help          Print help
+```
+
 ## h2 drove send
 
 ```text
@@ -807,9 +860,11 @@ Read Drove configuration, resolved roles, and AI connection status
 Usage: h2 drove settings [OPTIONS]
 
 Options:
-      --json          JSON output even in a terminal
-      --on <MACHINE>  
-  -h, --help          Print help
+      --json               JSON output even in a terminal
+      --section <SECTION>  Return only a specific section (`roles`, `agents`, `ai`, `magpie`, `config`)
+      --compact            Return a compact summary without full probed model lists
+      --on <MACHINE>       
+  -h, --help               Print help
 ```
 
 ## h2 drove settings-set
@@ -835,10 +890,12 @@ Inspect a Run, Task, or Message snapshot by ID
 Usage: h2 drove show [OPTIONS] [ID]
 
 Arguments:
-  [ID]  
+  [ID]  Run ID, Task ID (`tsk_...`), or Message ID (`msg_...`)
 
 Options:
       --json          JSON output even in a terminal
+      --run <RUN>     Run ID (equivalent to positional `<RUN_ID>`)
+      --full          Include full task spec (`change`, `acceptance`, `constraints`) instead of compact summaries
       --on <MACHINE>  
   -h, --help          Print help
 ```
@@ -876,13 +933,18 @@ Options:
 ```text
 Wait for pending coordinator messages, task failures, or Run completion
 
-Usage: h2 drove wait [OPTIONS]
+Usage: h2 drove wait [OPTIONS] [RUN]
+
+Arguments:
+  [RUN]  Run ID (positional or via `--run`)
 
 Options:
       --json                   JSON output even in a terminal
-      --run <RUN>              
+      --run <RUN>              Run ID (equivalent to positional `<RUN>`)
       --timeout <TIMEOUT>      [default: 300]
       --since-seq <SINCE_SEQ>  [default: 0]
+      --on-task-done           Return as soon as any additional task reaches a terminal state (not only full Run settlement) [alias: --on-change]
+      --full                   Return full task specs instead of compact task summaries
       --on <MACHINE>           
   -h, --help                   Print help
 ```
@@ -939,6 +1001,7 @@ Options:
       --recommend <RECOMMEND>  
       --why <WHY>              
       --timeout <TIMEOUT>      [default: 300]
+      --attempt <ATTEMPT>      Optional explicit attempt ID (defaults to worker's live active attempt)
   -h, --help                   Print help
 ```
 
@@ -969,6 +1032,7 @@ Options:
       --data <DATA>        
       --files <FILES>      
       --no-retry           
+      --attempt <ATTEMPT>  Optional explicit attempt ID (defaults to worker's live active attempt)
   -h, --help               Print help
 ```
 
@@ -980,8 +1044,9 @@ Drain unread notes sent to this worker attempt
 Usage: h2 drove worker inbox [OPTIONS]
 
 Options:
-      --json  JSON output even in a terminal
-  -h, --help  Print help
+      --attempt <ATTEMPT>  Optional explicit attempt ID (defaults to worker's live active attempt)
+      --json               JSON output even in a terminal
+  -h, --help               Print help
 ```
 
 ## h2 drove worker note
@@ -997,6 +1062,7 @@ Arguments:
 Options:
       --json               JSON output even in a terminal
       --subject <SUBJECT>  
+      --attempt <ATTEMPT>  Optional explicit attempt ID (defaults to worker's live active attempt)
   -h, --help               Print help
 ```
 
@@ -1011,11 +1077,12 @@ Arguments:
   <TARGET>  
 
 Options:
-      --json             JSON output even in a terminal
-      --offset <OFFSET>  [default: 0]
-      --limit <LIMIT>    [default: 65536]
-      --grep <GREP>      
-  -h, --help             Print help
+      --json               JSON output even in a terminal
+      --offset <OFFSET>    [default: 0]
+      --limit <LIMIT>      [default: 65536]
+      --grep <GREP>        
+      --attempt <ATTEMPT>  Optional explicit attempt ID (defaults to worker's live active attempt)
+  -h, --help               Print help
 ```
 
 ## h2 events
@@ -1165,9 +1232,10 @@ Options:
           Lineage kind (`handoff`, `fork`, or `side-chat`)
 
           Possible values:
-          - handoff:   Continue the same line of work in a new or different agent/provider
-          - fork:      Branch off to explore or re-implement independently from a turn/state
-          - side-chat: Open a temporary side-channel discussion without replacing the main session
+          - handoff:      Continue the same line of work in a new or different agent/provider
+          - fork:         Branch off to explore or re-implement independently from a turn/state
+          - side-chat:    Open a temporary side-channel discussion without replacing the main session
+          - send-context: Forward recent session context directly into another currently live session
           
           [default: handoff]
 
@@ -1752,6 +1820,67 @@ Options:
 
 ```text
 Usage: h2 server stop [OPTIONS]
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h2 skill
+
+```text
+Detect coding agents and install/update bundled Herdr2 companion skills (`status`, `install`, `ai-install`)
+
+Usage: h2 skill [OPTIONS] <COMMAND>
+
+Commands:
+  status      Inspect detected coding agent skill directories and installed Herdr2 skill versions
+  install     Install or update bundled Herdr2 companion skills (`herdr2`, `drove`, `drove-add`, `drove-setup`)
+  ai-install  Use built-in Core AI to inspect local coding agents and install Herdr2 skills automatically
+  help        Print this message or the help of the given subcommand(s)
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h2 skill ai-install
+
+```text
+Use built-in Core AI to inspect local coding agents and install Herdr2 skills automatically
+
+Usage: h2 skill ai-install [OPTIONS]
+
+Options:
+      --json          JSON output even in a terminal
+      --query <TEXT>  Optional hint about a custom agent name or desired skill location
+      --lang <LANG>   Preferred explanation language (`zh-CN` or `en`)
+      --dry-run       Plan only without writing skill files to disk
+  -h, --help          Print help
+```
+
+## h2 skill install
+
+```text
+Install or update bundled Herdr2 companion skills (`herdr2`, `drove`, `drove-add`, `drove-setup`)
+
+Usage: h2 skill install [OPTIONS]
+
+Options:
+      --all              Install into all detected agent skill directories
+      --json             JSON output even in a terminal
+      --agent <AGENT>    Target a specific known agent ID (antigravity, claude, codex, cursor, opencode, windsurf)
+      --target <DIR>     Target a custom skills root directory
+      --skills <SKILLS>  Comma-separated subset of skills to install (default: all bundled skills)
+  -h, --help             Print help
+```
+
+## h2 skill status
+
+```text
+Inspect detected coding agent skill directories and installed Herdr2 skill versions
+
+Usage: h2 skill status [OPTIONS]
 
 Options:
       --json  JSON output even in a terminal

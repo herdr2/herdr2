@@ -144,13 +144,29 @@ fn dirs_on(path: &std::ffi::OsStr) -> impl Iterator<Item = PathBuf> + '_ {
     std::env::split_paths(path)
 }
 
-/// Where herdr2 core (`h2`) gets installed: ~/.local/bin, Windows Programs/h2, Homebrew, mise, Nix, cargo.
+/// Where herdr2 core (`h2`) gets installed: bundled alongside this app, ~/.local/bin, Windows Programs/h2, Homebrew, mise, Nix, cargo.
 fn usual_dirs(home: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    // Single-package installers may bundle `h2` inside or beside the desktop app.
+    if let Ok(exe) = std::env::current_exe().and_then(|p| p.canonicalize())
+        && let Some(exe_dir) = exe.parent()
+    {
+        if cfg!(target_os = "macos")
+            && let Some(contents) = exe_dir.parent()
+        {
+            dirs.push(contents.join("Helpers"));
+        }
+        dirs.push(exe_dir.to_path_buf());
+        if let Some(parent) = exe_dir.parent() {
+            dirs.push(parent.join("h2"));
+        }
+    }
     if cfg!(windows) {
         let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| home.join("AppData/Local"));
-        return vec![local.join("Programs/h2"), local.join("Programs/herdr2"), home.join(".cargo/bin")];
+        dirs.extend([local.join("Programs/h2"), local.join("Programs/herdr2"), home.join(".cargo/bin")]);
+        return dirs;
     }
-    let mut dirs = vec![
+    dirs.extend([
         home.join(".local/bin"),
         PathBuf::from("/opt/homebrew/bin"),
         PathBuf::from("/usr/local/bin"),
@@ -158,7 +174,7 @@ fn usual_dirs(home: &Path) -> Vec<PathBuf> {
         home.join(".nix-profile/bin"),
         PathBuf::from("/run/current-system/sw/bin"),
         home.join(".cargo/bin"),
-    ];
+    ]);
     if cfg!(target_os = "macos") {
         dirs.push(home.join(".local/share/herdr2/current/Contents/MacOS"));
         dirs.push(home.join(".local/share/herdr2/Herdr2 Core.app/Contents/MacOS"));
@@ -210,13 +226,16 @@ fn login_path_answer(out: &str) -> Option<std::ffi::OsString> {
 pub fn install() -> Result<PathBuf, String> {
     let releases = crate::update::releases()
         .ok_or_else(|| "automatic core install is disabled (configure releases_url or build h2 from source)".to_owned())?;
+    let is_gh_flat = crate::update::is_github_release_base(&releases);
     let mut cmd = if cfg!(windows) {
+        let script_url = if is_gh_flat { format!("{releases}/core-install.ps1") } else { format!("{releases}/core/install.ps1") };
         let mut c = crate::spawn::command("powershell");
-        c.args(["-NoProfile", "-Command", &format!("irm {releases}/core/install.ps1 | iex")]);
+        c.args(["-NoProfile", "-Command", &format!("irm {script_url} | iex")]);
         c
     } else {
+        let script_url = if is_gh_flat { format!("{releases}/core-install.sh") } else { format!("{releases}/core/install.sh") };
         let mut c = crate::spawn::command("sh");
-        c.args(["-c", &format!("curl -fsSL {releases}/core/install.sh | sh")]);
+        c.args(["-c", &format!("curl -fsSL {script_url} | sh")]);
         c
     };
     cmd.env("HERDR2_RELEASES_URL", &releases);

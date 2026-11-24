@@ -87,6 +87,7 @@ impl AppWindow {
         } else {
             !cfg!(target_os = "macos") && matches!(window.window_decorations(), Decorations::Client { .. })
         };
+        let skip_ai_gate = std::env::var("HERDR2_SKIP_AI_GATE").ok().as_deref() == Some("1");
         json!({
             "platform": platform,
             "titlebar": if self.titlebar() == Titlebar::Layout { "none" } else { "system" },
@@ -94,6 +95,7 @@ impl AppWindow {
             "maximized": window.is_maximized(),
             "fullscreen": window.is_fullscreen(),
             "active": self.window_active,
+            "skip_ai_gate": skip_ai_gate,
         })
     }
 
