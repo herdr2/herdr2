@@ -50,6 +50,8 @@ jobs:
             target: linux-x86_64
           - os: macos-15-intel
             target: macos-aarch64
+          - os: macos-15-intel
+            target: macos-x86_64
           - os: windows-latest
             target: windows-x86_64
     runs-on: ${{ matrix.os }}
@@ -106,18 +108,26 @@ jobs:
           APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
-          rustup target add aarch64-apple-darwin
-          (cd herdr-core && cargo build --release --locked --target aarch64-apple-darwin -p herdr2)
-          bash herdr-app/scripts/package aarch64-apple-darwin
+          TARGET="${{ matrix.target }}"
+          if [ "$TARGET" = "macos-aarch64" ]; then
+            rustup target add aarch64-apple-darwin
+            (cd herdr-core && cargo build --release --locked --target aarch64-apple-darwin -p herdr2)
+            CORE_BIN="herdr-core/target/aarch64-apple-darwin/release/herdr2"
+            bash herdr-app/scripts/package aarch64-apple-darwin
+          else
+            (cd herdr-core && cargo build --release --locked -p herdr2)
+            CORE_BIN="herdr-core/target/release/herdr2"
+            bash herdr-app/scripts/package
+          fi
           mkdir -p dist/installers dist/ota dist/unpack
-          cp herdr-app/dist/herdr2-macos-aarch64.tar.gz dist/ota/herdr2-app-macos-aarch64.tar.gz
-          sh herdr-core/scripts/package herdr-core/target/aarch64-apple-darwin/release/herdr2 dist/ota/herdr2-core-macos-aarch64.tar.gz
-          tar -xzf herdr-app/dist/herdr2-macos-aarch64.tar.gz -C dist/unpack
-          file herdr-core/target/aarch64-apple-darwin/release/herdr2 dist/unpack/Herdr2.app/Contents/MacOS/Herdr2
+          cp "herdr-app/dist/herdr2-${TARGET}.tar.gz" "dist/ota/herdr2-app-${TARGET}.tar.gz"
+          sh herdr-core/scripts/package "$CORE_BIN" "dist/ota/herdr2-core-${TARGET}.tar.gz"
+          tar -xzf "herdr-app/dist/herdr2-${TARGET}.tar.gz" -C dist/unpack
+          file "$CORE_BIN" dist/unpack/Herdr2.app/Contents/MacOS/Herdr2
           bash scripts/package-macos-dmg.sh \
             dist/unpack/Herdr2.app \
-            herdr-core/target/aarch64-apple-darwin/release/herdr2 \
-            "dist/installers/Herdr2-${{ needs.prepare.outputs.version }}-macos-aarch64.dmg"
+            "$CORE_BIN" \
+            "dist/installers/Herdr2-${{ needs.prepare.outputs.version }}-${TARGET}.dmg"
 
       - name: Build herdr-core & herdr-app + Windows Inno Setup Installer
         if: runner.os == 'Windows'
@@ -236,6 +246,7 @@ jobs:
           ### Direct Download Installers (includes Desktop App + \`h2\` Core)
           - **Windows (x64)**: \`Herdr2-Setup-${VER}-windows-x86_64.exe\` — double-click to install App + \`h2\` CLI
           - **macOS (Apple Silicon)**: \`Herdr2-${VER}-macos-aarch64.dmg\` — open and drag \`Herdr2.app\` to Applications
+          - **macOS (Intel)**: \`Herdr2-${VER}-macos-x86_64.dmg\` — open and drag \`Herdr2.app\` to Applications
           - **Linux (Ubuntu/Debian)**: \`herdr2_${VER}_amd64.deb\` — run \`sudo apt install ./herdr2_${VER}_amd64.deb\`
           - **Linux (Generic x64)**: \`herdr2-${VER}-linux-x86_64.tar.gz\` — extract and run \`./install.sh\`
 

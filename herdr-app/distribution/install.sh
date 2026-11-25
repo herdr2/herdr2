@@ -32,8 +32,6 @@ if [ "$os" = macos ] && [ "$arch" = x86_64 ]; then
   if [ "$(sysctl -n hw.optional.arm64 2>/dev/null || true)" = 1 ] ||
      [ "$(sysctl -n sysctl.proc_translated 2>/dev/null || true)" = 1 ]; then
     arch=aarch64
-  else
-    fail "Intel Macs aren't supported; build from source instead."
   fi
 fi
 target="$os-$arch"

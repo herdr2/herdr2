@@ -125,6 +125,8 @@ jobs:
             target: linux-x86_64
           - os: macos-15-intel
             target: macos-aarch64
+          - os: macos-15-intel
+            target: macos-x86_64
           - os: windows-latest
             target: windows-x86_64
     runs-on: ${{ matrix.os }}
@@ -226,6 +228,8 @@ jobs:
             target: linux-x86_64
           - os: macos-15-intel
             target: macos-aarch64
+          - os: macos-15-intel
+            target: macos-x86_64
           - os: windows-latest
             target: windows-x86_64
     runs-on: ${{ matrix.os }}

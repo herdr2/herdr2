@@ -38,13 +38,13 @@ class DistributionTests(unittest.TestCase):
             capture_output=True, text=True, check=False,
         )
 
-    def test_intel_mac_installer_stops_before_download(self):
+    def test_intel_mac_installer_tries_x86_64_download(self):
         for arch in ("x86_64", "amd64"):
             with self.subTest(arch=arch):
                 result = self.run_script("distribution/install.sh", "Darwin", arch)
                 self.assertEqual(result.returncode, 1)
-                self.assertIn("Intel Macs aren't supported; build from source", result.stderr)
-                self.assertNotIn("unexpected download", result.stderr)
+                self.assertIn("unexpected download", result.stderr)
+                self.assertNotIn("Intel Macs", result.stderr)
 
     def test_windows_shells_are_pointed_at_the_powershell_installer(self):
         for os_name in ("MINGW64_NT-10.0-26300", "MSYS_NT-10.0-26300", "CYGWIN_NT-10.0-26300"):
@@ -211,16 +211,16 @@ printf 'dev PATH added' >> "$3"''')
         self.assertEqual(len(calls), 2)
         self.assertTrue(calls[1].startswith("--verify --deep --strict "))
 
-    def test_intel_mac_package_stops_before_build(self):
+    def test_intel_mac_package_tries_build(self):
         for args in ((), ("x86_64-apple-darwin",)):
             with self.subTest(args=args):
                 result = self.run_script("scripts/package", "Darwin", "x86_64", *args)
-                self.assertEqual(result.returncode, 1)
-                self.assertIn("Intel Macs aren't supported; build from source", result.stderr)
-                self.assertNotIn("unexpected build", result.stderr)
+                self.assertEqual(result.returncode, 97)
+                self.assertIn("unexpected build", result.stderr)
+                self.assertNotIn("Intel Macs", result.stderr)
 
     def test_supported_installers_still_try_download(self):
-        for os_name, arch in (("Darwin", "arm64"), ("Linux", "x86_64"), ("Linux", "aarch64")):
+        for os_name, arch in (("Darwin", "arm64"), ("Darwin", "x86_64"), ("Linux", "x86_64"), ("Linux", "aarch64")):
             with self.subTest(os=os_name, arch=arch):
                 result = self.run_script("distribution/install.sh", os_name, arch)
                 self.assertEqual(result.returncode, 1)
@@ -275,7 +275,7 @@ printf 'dev PATH added' >> "$3"''')
             notice.write_bytes(original)
 
     def test_supported_packages_still_try_build(self):
-        for os_name, arch in (("Darwin", "arm64"), ("Linux", "x86_64"), ("Linux", "aarch64")):
+        for os_name, arch in (("Darwin", "arm64"), ("Darwin", "x86_64"), ("Linux", "x86_64"), ("Linux", "aarch64")):
             with self.subTest(os=os_name, arch=arch):
                 result = self.run_script("scripts/package", os_name, arch)
                 self.assertEqual(result.returncode, 97)

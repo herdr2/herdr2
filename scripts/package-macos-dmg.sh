@@ -40,12 +40,24 @@ ln -s /Applications "$STAGE/Applications"
 
 mkdir -p "$(dirname "$OUT_DMG")"
 rm -f "$OUT_DMG"
-hdiutil create \
-  -volname "Herdr2" \
-  -srcfolder "$STAGE" \
-  -ov \
-  -format UDZO \
-  "$OUT_DMG"
+# macOS Spotlight indexing can transiently cause `hdiutil create` to fail with "Resource busy".
+for attempt in 1 2 3 4 5; do
+  if hdiutil create \
+    -volname "Herdr2" \
+    -srcfolder "$STAGE" \
+    -ov \
+    -format UDZO \
+    "$OUT_DMG"; then
+    break
+  fi
+  if [[ "$attempt" -eq 5 ]]; then
+    echo "package-macos-dmg: hdiutil create failed after 5 attempts" >&2
+    exit 1
+  fi
+  echo "package-macos-dmg: hdiutil create attempt $attempt failed; retrying in 5s..." >&2
+  rm -f "$OUT_DMG"
+  sleep 5
+done
 
 if [[ -n "${APPLE_CERTIFICATE_P12:-}" && -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]]; then
   "$ROOT/herdr-app/scripts/mac-sign" "$OUT_DMG"

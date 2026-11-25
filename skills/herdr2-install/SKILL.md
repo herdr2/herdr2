@@ -10,7 +10,7 @@ Follow these exact steps to install **Herdr2** (desktop app + `h2` core daemon +
 ## Step 1: Detect Platform & Architecture
 
 Run a quick platform check first:
-- **macOS**: `uname -s` is `Darwin`, `uname -m` is `arm64` (Apple Silicon).
+- **macOS**: `uname -s` is `Darwin`, `uname -m` is `arm64` (Apple Silicon) or `x86_64` (Intel Mac).
 - **Linux / WSL**: `uname -s` is `Linux`, `uname -m` is `x86_64` (check if `/proc/version` mentions `Microsoft` for WSL — in WSL, install Linux `h2` core inside WSL AND optionally install the Windows desktop app on the Windows host).
 - **Windows (PowerShell)**: `$env:OS -eq "Windows_NT"`, x64 (`AMD64`).
 
@@ -20,12 +20,12 @@ Default repository: `herdr2/herdr2`
 - Latest full release page: `https://github.com/herdr2/herdr2/releases/latest`
 - Rolling OTA channel: `https://github.com/herdr2/herdr2/releases/download/ota-latest`
 
-### Option A — macOS (Apple Silicon)
+### Option A — macOS (Apple Silicon & Intel)
 
-Download the latest `.dmg` (contains `Herdr2.app` with bundled `h2` core) or run the one-line installer:
+Download the latest `.dmg` (`macos-aarch64` for Apple Silicon or `macos-x86_64` for Intel Mac, each containing `Herdr2.app` with bundled `h2` core) or run the one-line installer:
 
 ```bash
-# Recommended: direct one-line installer (installs ~/Applications/Herdr2.app + ~/.local/bin/herdr2 + h2)
+# Recommended: direct one-line installer (auto-detects Apple Silicon / Intel; installs ~/Applications/Herdr2.app + ~/.local/bin/herdr2 + h2)
 curl -fsSL https://github.com/herdr2/herdr2/releases/download/ota-latest/app-install.sh | sh
 ```
 
@@ -33,8 +33,9 @@ Or if installing from the `.dmg` asset on GitHub Releases:
 ```bash
 TAG=$(curl -fsSL https://api.github.com/repos/herdr2/herdr2/releases/latest | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n 1)
 VER=${TAG#v}
-DMG="/tmp/Herdr2-${VER}-macos-aarch64.dmg"
-curl -fsSL "https://github.com/herdr2/herdr2/releases/download/${TAG}/Herdr2-${VER}-macos-aarch64.dmg" -o "$DMG"
+ARCH=$([ "$(uname -m)" = "arm64" ] && echo aarch64 || echo x86_64)
+DMG="/tmp/Herdr2-${VER}-macos-${ARCH}.dmg"
+curl -fsSL "https://github.com/herdr2/herdr2/releases/download/${TAG}/Herdr2-${VER}-macos-${ARCH}.dmg" -o "$DMG"
 MOUNT=$(hdiutil attach "$DMG" -nobrowse | awk '/\/Volumes\//{print $NF; exit}')
 mkdir -p "$HOME/Applications" "$HOME/.local/bin"
 rm -rf "$HOME/Applications/Herdr2.app"
