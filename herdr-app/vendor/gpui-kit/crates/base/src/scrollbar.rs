@@ -1208,8 +1208,13 @@ impl ThumbGeometry {
         min_length: Pixels,
     ) -> Self {
         let track = (container - margin_end).max(px(0.));
-        let logical_length = (container / content * container).max(min_length).min(track);
-        let inset = inset.clamp(px(0.), logical_length / 2.);
+        // HERDR: on short scrollbars (e.g. a narrow sidebar section), cap the
+        // minimum thumb length to half the track so dragging always has travel.
+        let min_length = min_length.min(track * 0.5);
+        let logical_length = (container / content * container)
+            .max(min_length)
+            .min(track);
+        let inset = inset.clamp(px(0.), (logical_length - px(4.)).max(px(0.)) / 2.);
         Self {
             origin,
             inset,
@@ -2605,7 +2610,7 @@ mod tests {
 
     #[test]
     fn full_track_thumb_does_not_reset_the_scroll_offset() {
-        let geometry = ThumbGeometry::new(px(20.), px(40.), px(500.), px(0.), px(4.), px(64.));
+        let geometry = ThumbGeometry::new(px(20.), px(40.), px(40.), px(0.), px(4.), px(64.));
         let offset = point(px(0.), px(-100.));
         assert_eq!(
             geometry.drag_offset(
@@ -2616,6 +2621,26 @@ mod tests {
             ),
             offset
         );
+    }
+
+    #[test]
+    fn short_track_clamps_min_thumb_length_so_dragging_scrolls() {
+        for track in [px(48.), px(28.), px(16.)] {
+            let geometry = ThumbGeometry::new(px(20.), track, px(500.), px(0.), px(4.), px(48.));
+            assert!(geometry.travel > px(0.), "track {track:?} must leave thumb travel");
+            assert!(geometry.length > px(0.), "track {track:?} must keep a visible thumb");
+            let moved = geometry.drag_offset(
+                Axis::Vertical,
+                point(px(0.), px(20.) + track),
+                point(px(0.), px(2.)),
+                point(px(0.), px(0.)),
+            );
+            assert!(
+                moved.y < px(-400.),
+                "dragging down on track {track:?} must scroll toward the bottom, got {:?}",
+                moved.y
+            );
+        }
     }
 
     #[gpui::test]

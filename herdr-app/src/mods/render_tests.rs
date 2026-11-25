@@ -5931,3 +5931,259 @@ fn polish_shortcut_conflict_dialog_and_settings_sync(cx: &mut TestAppContext) {
     .unwrap();
     assert!(peek_tree.contains("Ctrl+Alt+R"), "peek polish tooltip must show reassigned shortcut: {peek_tree}");
 }
+
+#[gpui::test]
+fn agents_sidebar_scrolls_when_vertically_narrow(cx: &mut TestAppContext) {
+    use gpui::VisualTestContext;
+    use std::ops::Deref;
+
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let program = json!({
+        "key": "claude",
+        "name": "Claude",
+        "icon": null,
+        "tint": true,
+        "tile": "#d97757",
+        "color": "#ffffff",
+        "shell": false,
+        "agent": true
+    });
+    let many_agents: Vec<Value> = (1..=12)
+        .map(|i| {
+            json!({
+                "address": format!("a{i}"),
+                "agent": "claude",
+                "acp": true,
+                "pane": format!("p{i}"),
+                "space": "s1",
+                "space_name": "Local",
+                "tab": format!("tab{i}"),
+                "tab_index": i,
+                "tab_name": format!("Agent {i}"),
+                "status": "idle",
+                "app": "claude-code",
+                "program": program,
+                "title": format!("Agent {i}"),
+                "seq": i,
+                "focused": i == 1
+            })
+        })
+        .collect();
+    let many_terms: Vec<Value> = (1..=12)
+        .map(|i| {
+            json!({
+                "address": format!("a{i}"),
+                "acp": true,
+                "agent": "claude",
+                "name": format!("Agent {i}"),
+                "title": format!("Agent {i}"),
+                "argv": ["claude-agent-acp"],
+                "parent": null,
+                "labels": {},
+                "state": "live",
+                "status": "idle",
+                "program": program,
+                "cwd": "/fixture/project"
+            })
+        })
+        .collect();
+    let many_panes: Vec<Value> = (1..=12)
+        .map(|i| {
+            json!({
+                "pane": format!("p{i}"),
+                "terminal": format!("a{i}"),
+                "tab": format!("tab{i}"),
+                "space": "s1",
+                "focused": i == 1
+            })
+        })
+        .collect();
+
+    for (height, label) in [(90.0_f32, "min-90"), (120.0_f32, "narrow-120"), (70.0_f32, "very-narrow-70")] {
+        let mut vals = fixture(true, json!({}), updates("current", "current"));
+        vals.insert("agents".into(), Value::Array(many_agents.clone()));
+        vals.insert("terminals".into(), Value::Array(many_terms.clone()));
+        vals.insert("panes".into(), Value::Array(many_panes.clone()));
+        vals.insert("checking".into(), json!(false));
+
+        let calls = Rc::new(RefCell::new(Calls::default()));
+        gpui_shell::policy::set_default(
+            Policy::new()
+                .with_storage_path(staged.0.join(format!("store-ag-scroll-{label}.json")))
+                .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+                .with_host_module(module(vals, calls.clone()))
+                .unwrap(),
+        );
+        let runtime = ShellRuntime::new_isolated().unwrap();
+        let mod_dir = staged.0.join("mods/agents");
+
+        struct NarrowAgentsBox {
+            root: gpui::Entity<gpui_shell::ShellRoot>,
+            height: f32,
+        }
+        impl gpui::Render for NarrowAgentsBox {
+            fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl gpui::IntoElement {
+                use gpui::{ParentElement as _, Styled as _};
+                gpui::div()
+                    .w(gpui::px(268.))
+                    .h(gpui::px(self.height))
+                    .relative()
+                    .overflow_hidden()
+                    .flex()
+                    .child(gpui::div().size_full().child(self.root.clone()))
+            }
+        }
+
+        let window = cx.add_window(|window, cx| {
+            let root = runtime.try_load(&mod_dir, window, cx).unwrap();
+            NarrowAgentsBox { root, height }
+        });
+        let mut visual = VisualTestContext::from_window(*window.deref(), cx);
+        for _ in 0..3 {
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+            visual.run_until_parked();
+        }
+
+        // 1) Mouse wheel scrolling down inside ag-list (header is 41px, border 1px -> list starts at y=42).
+        let wheel_pt = gpui::point(gpui::px(120.), gpui::px(height - 14.0));
+        visual.simulate_mouse_move(wheel_pt, None, Default::default());
+        for _ in 0..5 {
+            visual.simulate_event(gpui::ScrollWheelEvent {
+                position: wheel_pt,
+                delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-200.))),
+                ..Default::default()
+            });
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+            visual.run_until_parked();
+        }
+        visual.simulate_click(wheel_pt, Default::default());
+        visual.run_until_parked();
+        let after_wheel = calls.borrow().shared.get("agents.selected").and_then(Value::as_str).unwrap_or("").to_owned();
+        assert_eq!(after_wheel, "a12", "[{label}] wheel-scrolling down must reach the bottom agent a12");
+
+        // Reset scroll to top via positive wheel, then nudge past the 30px group header
+        // so we can confirm top items (a1/a2) are reachable without clicking the fold header.
+        for _ in 0..5 {
+            visual.simulate_event(gpui::ScrollWheelEvent {
+                position: wheel_pt,
+                delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(200.))),
+                ..Default::default()
+            });
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+            visual.run_until_parked();
+        }
+        visual.simulate_event(gpui::ScrollWheelEvent {
+            position: wheel_pt,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(-40.))),
+            ..Default::default()
+        });
+        for _ in 0..2 {
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+            visual.run_until_parked();
+        }
+        calls.borrow_mut().shared.remove("agents.selected");
+        visual.simulate_click(wheel_pt, Default::default());
+        visual.run_until_parked();
+        let after_reset = calls.borrow().shared.get("agents.selected").and_then(Value::as_str).unwrap_or("").to_owned();
+        assert!(
+            matches!(after_reset.as_str(), "a1" | "a2" | "a3"),
+            "[{label}] wheel-scrolling back up must return to top agents, got {after_reset:?}"
+        );
+        // Return all the way to offset 0 before testing scrollbar thumb drag.
+        visual.simulate_event(gpui::ScrollWheelEvent {
+            position: wheel_pt,
+            delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(200.))),
+            ..Default::default()
+        });
+        visual.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+        });
+        visual.run_until_parked();
+        calls.borrow_mut().shared.remove("agents.selected");
+
+        // 2) Scrollbar thumb drag from top of ag-list scrollbar (x=260, y=47) to bottom (x=260, y=height-2).
+        let thumb_start = gpui::point(gpui::px(260.), gpui::px(47.));
+        let thumb_end = gpui::point(gpui::px(260.), gpui::px(height - 2.0));
+        visual.simulate_mouse_move(thumb_start, None, Default::default());
+        visual.simulate_mouse_down(thumb_start, gpui::MouseButton::Left, Default::default());
+        visual.simulate_mouse_move(thumb_end, gpui::MouseButton::Left, Default::default());
+        visual.simulate_mouse_up(thumb_end, gpui::MouseButton::Left, Default::default());
+        for _ in 0..3 {
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+            visual.run_until_parked();
+        }
+        // Moving pointer off the scrollbar and onto a row (which triggers hover re-renders)
+        // must keep the scrolled position instead of snapping back to top.
+        visual.simulate_mouse_move(wheel_pt, None, Default::default());
+        visual.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+        });
+        visual.run_until_parked();
+        visual.simulate_click(wheel_pt, Default::default());
+        visual.run_until_parked();
+        let after_thumb = calls.borrow().shared.get("agents.selected").and_then(Value::as_str).unwrap_or("").to_owned();
+        assert!(
+            matches!(after_thumb.as_str(), "a11" | "a12"),
+            "[{label}] dragging scrollbar thumb down on narrow agents panel must scroll to bottom (a11/a12), got {after_thumb:?}"
+        );
+
+        // 3) Return to top and verify clicking the lower scrollbar track jumps downward too.
+        for _ in 0..5 {
+            visual.simulate_event(gpui::ScrollWheelEvent {
+                position: wheel_pt,
+                delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.), gpui::px(200.))),
+                ..Default::default()
+            });
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+            visual.run_until_parked();
+        }
+        calls.borrow_mut().shared.remove("agents.selected");
+        visual.simulate_mouse_move(thumb_end, None, Default::default());
+        visual.simulate_click(thumb_end, Default::default());
+        for _ in 0..3 {
+            visual.update(|window, cx| {
+                window.simulate_next_frame(cx);
+                window.draw(cx).clear(cx);
+            });
+            visual.run_until_parked();
+        }
+        visual.simulate_mouse_move(wheel_pt, None, Default::default());
+        visual.update(|window, cx| {
+            window.simulate_next_frame(cx);
+            window.draw(cx).clear(cx);
+        });
+        visual.run_until_parked();
+        visual.simulate_click(wheel_pt, Default::default());
+        visual.run_until_parked();
+        let after_track = calls.borrow().shared.get("agents.selected").and_then(Value::as_str).unwrap_or("").to_owned();
+        assert!(
+            matches!(after_track.as_str(), "a10" | "a11" | "a12"),
+            "[{label}] clicking bottom of scrollbar track on narrow agents panel must jump near bottom, got {after_track:?}"
+        );
+
+        visual.update(|window, _| window.remove_window());
+        gpui_shell::policy::set_default(Policy::new());
+        cx.run_until_parked();
+    }
+}

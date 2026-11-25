@@ -10871,14 +10871,15 @@ impl AppWindow {
         let total = la + lb;
         // Squeezed and zero-size siblings cannot both keep the drag minimum.
         if total <= 48.0 { return; }
-        let mut new_a = (p - start).clamp(24.0, total - 24.0);
-        if let Some(min) = a.min {
-            new_a = new_a.max(min);
-        }
-        if let Some(max) = a.max {
-            new_a = new_a.min(max);
-        }
-        let new_a = new_a.min(total - 24.0);
+        let min_a = a.min.unwrap_or(24.0).max(24.0);
+        let max_a_from_b = total - b.min.unwrap_or(24.0).max(24.0);
+        let max_a = a.max.map_or(max_a_from_b, |m| m.min(max_a_from_b)).clamp(24.0, total - 24.0);
+        let min_a = b.max.map_or(min_a, |m| min_a.max(total - m)).clamp(24.0, total - 24.0);
+        let new_a = if min_a <= max_a {
+            (p - start).clamp(min_a, max_a)
+        } else {
+            (p - start).clamp(24.0, total - 24.0)
+        };
         let (a_id, b_id) = (a.id.clone(), b.id.clone());
         let (sa, sb) = (a.size, b.size);
         let Some(parent) = self.find_node_mut(&container) else { return };

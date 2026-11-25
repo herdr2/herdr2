@@ -827,7 +827,7 @@ export default class Spaces extends View {
       this.revealedAt = this.activeAt;
       if (this.activeAt >= 0) this.scroll.scroll_to_item(this.activeAt);
     }
-    return v_flex().relative().size_full().min_h(0).bg(t.chrome).text_size(13)
+    return v_flex().id("spaces-sidebar").relative().size_full().min_h(0).bg(t.chrome).text_size(13)
       .when(Boolean(this.listFocus), (el) => el.track_focus(this.listFocus))
       .on_mouse_move((e, cx) => this.handleDragMove(e, cx))
       .on_mouse_up("left", (_e, cx) => {

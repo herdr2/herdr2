@@ -1189,3 +1189,76 @@ test("sub-agent rows display live and completed execution time and swap to remov
   tick1s.fn({ notify: () => { notified += 1; } });
   expect(notified).toBe(1);
 });
+
+test("agents scroll container and group wrappers stay non-shrinking for narrow heights", () => {
+  const claude = { key: "claude", name: "Claude", agent: true };
+  const list = Array.from({ length: 5 }, (_, i) => ({
+    address: `a${i + 1}`,
+    acp: true,
+    pane: `p${i + 1}`,
+    tab: `tab${i + 1}`,
+    space: "s1",
+    space_name: "Project",
+    program: claude,
+    title: `Task ${i + 1}`,
+    status: "idle",
+    seq: i + 1,
+  }));
+  const recordEl = () => {
+    const node: any = { id: "", calls: new Set<string>(), args: {} as Record<string, any[]>, children: [] as any[] };
+    const el: any = new Proxy(node, {
+      get: (_, method: string) => {
+        if (method === "node") return node;
+        return (...args: any[]) => {
+          node.calls.add(method);
+          node.args[method] = args;
+          if (method === "id") node.id = args[0];
+          if (method === "child") node.children.push(args[0]?.node ?? args[0]);
+          if (method === "children") node.children.push(...args[0].map((c: any) => c?.node ?? c));
+          if (method === "when" && args[0]) args[1](el);
+          return el;
+        };
+      },
+    });
+    return el;
+  };
+  const findById = (n: any, id: string): any => {
+    if (!n || typeof n !== "object") return null;
+    if (n.id === id) return n;
+    for (const c of n.children ?? []) {
+      const hit = findById(c, id);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  const { agents } = harness([], {
+    agents: () => list,
+    terminals: () => list.map((a) => ({ ...a, state: "live" })),
+    panes: () => list.map((a) => ({ pane: a.pane, tab: a.tab, terminal: a.address, program: claude, title: a.title })),
+    focused: () => null,
+    spaces: () => [{ id: "s1", name: "Project", tabs: list.map((a) => ({ id: a.tab, name: a.title, named: true })) }],
+    layout: () => ({ id: "sidebar", size: { px: 268 } }),
+    shared: () => "priority",
+    theme: () => ({}),
+    setAgentOrder: () => {},
+    div: recordEl, v_flex: recordEl, h_flex: recordEl, svg: recordEl, image: recordEl,
+  });
+
+  const tree = agents.render({}).node;
+  expect(tree.id).toBe("agents-sidebar");
+  const agList = findById(tree, "ag-list");
+  expect(agList).not.toBeNull();
+  expect(agList.calls.has("flex_1")).toBe(true);
+  expect(agList.calls.has("min_h")).toBe(true);
+  expect(agList.args.min_h).toEqual([0]);
+  expect(agList.calls.has("overflow_y_scrollbar")).toBe(true);
+  expect(agList.calls.has("pb")).toBe(true);
+
+  const groupBody = findById(tree, "agent-group-body-sec-1");
+  expect(groupBody).not.toBeNull();
+  expect(groupBody.calls.has("flex_none")).toBe(true);
+
+  const unit = findById(tree, "agent-unit-a1");
+  expect(unit).not.toBeNull();
+  expect(unit.calls.has("flex_none")).toBe(true);
+});

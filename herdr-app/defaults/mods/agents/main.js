@@ -2453,6 +2453,7 @@ export default class Agents extends View {
         const visibleSubs = this.folded.has(a.address) ? [] : subs;
         return v_flex()
           .id(`agent-unit-${a.address}`)
+          .flex_none()
           .relative()
           .top(shift)
           .spring("top", { response: snap ? 0 : 165, damping: 0.86, epsilon: 0.25 })
@@ -2491,6 +2492,7 @@ export default class Agents extends View {
 
       return v_flex()
         .id(`agent-group-body-${g.id}`)
+        .flex_none()
         .relative()
         .children(units)
         .when(Boolean(floatCard), (el) => el.child(floatCard));
@@ -2510,6 +2512,7 @@ export default class Agents extends View {
     const briefingHot = awayChangedCount > 0 || list.some((a) => rankOf(a) >= RANK.blocked);
 
     return v_flex()
+      .id("agents-sidebar")
       .relative()
       .size_full()
       .min_h(0)
@@ -2627,10 +2630,11 @@ export default class Agents extends View {
             ),
         ),
       )
-      .child(v_flex().id("ag-list").flex_1().min_h(0).px(collapsed ? 0 : 8).overflow_y_scrollbar().mode("always").children(rows))
+      .child(v_flex().id("ag-list").flex_1().min_h(0).px(collapsed ? 0 : 8).pb(8).overflow_y_scrollbar().mode("always").children(rows))
       .when(collapsed, (el) =>
         el.child(
           v_flex()
+            .flex_none()
             .items_center()
             .gap(4)
             .pb(4)
