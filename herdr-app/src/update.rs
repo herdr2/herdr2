@@ -16,11 +16,11 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const EVERY: Duration = Duration::from_secs(15 * 60);
+const EVERY: Duration = Duration::from_secs(60 * 60);
 /// After a failed check or download (offline, a damaged file).
 const RETRY: Duration = Duration::from_secs(10 * 60);
 /// Wait briefly after startup so initial UI rendering stays snappy.
@@ -104,10 +104,39 @@ pub fn releases() -> Option<String> {
     resolve_releases_url(env_url, settings_url, option_env!("HERDR2_DEFAULT_RELEASES_URL"))
 }
 
+#[derive(Clone, Debug)]
+struct AppAvailable {
+    version: String,
+    url: String,
+    sha256: String,
+    notes: Option<String>,
+}
+
 static READY: Mutex<Option<String>> = Mutex::new(None);
+static APP_AVAILABLE: Mutex<Option<AppAvailable>> = Mutex::new(None);
+static APP_UPDATING: AtomicBool = AtomicBool::new(false);
+static APP_ERROR: Mutex<Option<String>> = Mutex::new(None);
+static CHECK_SEQ: AtomicU64 = AtomicU64::new(0);
+static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
 pub fn ready() -> Option<String> {
-    READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    READY
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+        .or_else(|| {
+            APP_AVAILABLE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .as_ref()
+                .map(|a| a.version.clone())
+        })
+}
+
+pub fn is_updating() -> bool {
+    APP_UPDATING.load(Ordering::Relaxed)
+        || crate::ui_update::is_applying()
+        || CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).updating
 }
 
 /// The core the app runs, from its `server.status`, and a newer release waiting.
@@ -117,11 +146,12 @@ pub struct CoreInfo {
     /// A package manager that owns it (homebrew, nix, mise): never updated by the app.
     pub managed: Option<String>,
     pub ready: Option<String>,
+    pub notes: Option<String>,
     pub updating: bool,
     pub error: Option<String>,
 }
 
-static CORE: Mutex<CoreInfo> = Mutex::new(CoreInfo { version: None, managed: None, ready: None, updating: false, error: None });
+static CORE: Mutex<CoreInfo> = Mutex::new(CoreInfo { version: None, managed: None, ready: None, notes: None, updating: false, error: None });
 /// When the last check succeeded (unix seconds); a failed check clears it.
 static CHECKED: Mutex<Option<u64>> = Mutex::new(None);
 /// "Check now" wakes the checker early.
@@ -183,18 +213,89 @@ fn checks_ui() -> bool {
         && crate::ui_update::mode() != "off"
 }
 
-/// For the settings screen / mods: reports current versions, staged updates, and UI bundle state.
+/// For the settings screen / mods: reports current versions, available updates, and progress.
 pub fn status() -> serde_json::Value {
     let app_checks = checks_app().is_some();
     let any_checks = app_checks || checks_core() || checks_ui();
+    let app_staged = READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let app_avail = APP_AVAILABLE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let app_ready = app_staged.clone().or_else(|| app_avail.as_ref().map(|a| a.version.clone()));
+    let app_notes = app_avail.as_ref().and_then(|a| a.notes.clone());
+    let app_updating = APP_UPDATING.load(Ordering::Relaxed);
+    let app_error = APP_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let ui = crate::ui_update::info();
+    let core_info = core();
+    let updating = app_updating || ui.applying || core_info.updating;
+
+    let mut items: Vec<serde_json::Value> = Vec::new();
+    if let Some(ver) = &app_ready {
+        items.push(serde_json::json!({
+            "kind": "app",
+            "current": env!("CARGO_PKG_VERSION"),
+            "next": ver,
+            "notes": app_notes,
+        }));
+    }
+    if app_ready.is_none() && let Some(ver) = &ui.ready {
+        items.push(serde_json::json!({
+            "kind": "ui",
+            "current": ui.version,
+            "next": ver,
+            "notes": ui.ready_notes,
+        }));
+    }
+    if core_info.managed.is_none() && let Some(ver) = &core_info.ready {
+        items.push(serde_json::json!({
+            "kind": "core",
+            "current": core_info.version,
+            "next": ver,
+            "notes": core_info.notes,
+        }));
+    }
+    let available = if let Some(ver) = &app_ready {
+        Some(serde_json::json!({
+            "kind": "app",
+            "version": ver,
+            "notes": app_notes,
+            "restart": true,
+            "items": items,
+        }))
+    } else if let Some(ver) = &ui.ready {
+        Some(serde_json::json!({
+            "kind": "ui",
+            "version": ver,
+            "notes": ui.ready_notes,
+            "restart": false,
+            "items": items,
+        }))
+    } else if core_info.managed.is_none() && let Some(ver) = &core_info.ready {
+        Some(serde_json::json!({
+            "kind": "core",
+            "version": ver,
+            "notes": core_info.notes,
+            "restart": false,
+            "items": items,
+        }))
+    } else {
+        None
+    };
+
     serde_json::json!({
         "app": {
             "version": env!("CARGO_PKG_VERSION"),
-            "ready": ready(),
+            "ready": app_ready,
+            "staged": app_staged.is_some(),
+            "notes": app_notes,
+            "updating": app_updating,
+            "error": app_error,
             "updates": app_checks,
         },
-        "ui": crate::ui_update::info(),
-        "core": core(),
+        "ui": ui,
+        "core": core_info,
+        "updating": updating,
+        "available": available,
+        "check_seq": CHECK_SEQ.load(Ordering::Relaxed),
+        "last_error": LAST_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone(),
         "checked": *CHECKED.lock().unwrap_or_else(std::sync::PoisonError::into_inner),
         "checks": any_checks,
         "checking": CHECKING.load(Ordering::Relaxed),
@@ -204,12 +305,17 @@ pub fn status() -> serde_json::Value {
 }
 
 pub fn check_now() {
+    CHECKING.store(true, Ordering::SeqCst);
+    *LAST_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    {
+        let mut woken = WAKE.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *woken = true;
+        WAKE.1.notify_all();
+    }
     if !RUNNING.load(Ordering::Relaxed) {
         start();
     }
-    let mut woken = WAKE.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    *woken = true;
-    WAKE.1.notify_all();
+    crate::mods::request(crate::mods::Request::Refresh);
 }
 
 fn sleep(d: Duration) {
@@ -256,22 +362,39 @@ fn check_cycle_succeeded(app_err: Option<&str>, ui_ok: bool, core_err: Option<&s
 
 fn run_one_check() -> bool {
     let Some(base_url) = releases() else {
+        *LAST_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
+            Some("No update URL configured".into());
+        CHECKING.store(false, Ordering::SeqCst);
+        CHECK_SEQ.fetch_add(1, Ordering::SeqCst);
+        crate::mods::request(crate::mods::Request::Refresh);
         return true;
     };
-    CHECKING.store(true, Ordering::Relaxed);
+    CHECKING.store(true, Ordering::SeqCst);
+    *LAST_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    crate::mods::request(crate::mods::Request::Refresh);
+
     let mut any_attempted = false;
     let mut app_err: Option<String> = None;
     let mut ui_ok = false;
+    let mut ui_err: Option<String> = None;
     let mut core_err: Option<String> = None;
 
-    // 1. App binary update (installed bundles / release installs)
-    let mut app_update_ready = false;
+    // 1. App binary update metadata check (fast; download starts only when user clicks Update)
+    let mut app_has_update = false;
     if let Some(install_root) = checks_app() {
         any_attempted = true;
-        match check_from(&install_root, &base_url) {
-            Ok(ver) => {
-                app_update_ready = ver.is_some();
-                *READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = ver;
+        match check_app_manifest_from(&install_root, &base_url) {
+            Ok(avail) => {
+                app_has_update = avail.is_some();
+                if let Some(ref a) = avail
+                    && staged_version(&install_root).as_deref() == Some(a.version.as_str())
+                {
+                    *READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(a.version.clone());
+                } else if avail.is_none() {
+                    *READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                }
+                *APP_AVAILABLE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = avail;
+                *APP_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             }
             Err(e) => {
                 if is_missing_feed_err(&e) {
@@ -284,28 +407,22 @@ fn run_one_check() -> bool {
         }
     }
 
-    // 2. UI bundle hot-update (skip if a full app binary update is already ready)
-    if !app_update_ready && checks_ui() {
+    // 2. UI bundle hot-update metadata check (skip if a full app binary update is available)
+    if !app_has_update && checks_ui() {
         any_attempted = true;
         let app_dir = crate::mods::app_dir();
-        match crate::ui_update::check_from(&app_dir, &base_url) {
-            Ok(Some(_ver)) => {
-                ui_ok = true;
-                if crate::ui_update::mode() == "auto" {
-                    crate::mods::request(crate::mods::Request::ApplyUiBundle);
-                }
-            }
-            Ok(None) => {
+        match crate::ui_update::check_manifest_from(&app_dir, &base_url) {
+            Ok(_) => {
                 ui_ok = true;
             }
             Err(e) => {
-                // UI feed is optional on servers that only host app/core manifests.
                 tracing::debug!("ui bundle check skipped/failed: {e}");
+                ui_err = Some(e);
             }
         }
     }
 
-    // 3. Core update check
+    // 3. Core update metadata check
     if checks_core() {
         any_attempted = true;
         if let Err(e) = check_core_from(&base_url) {
@@ -319,7 +436,12 @@ fn run_one_check() -> bool {
     }
 
     let all_ok = check_cycle_succeeded(app_err.as_deref(), ui_ok, core_err.as_deref());
-    CHECKING.store(false, Ordering::Relaxed);
+    let first_err = if all_ok {
+        None
+    } else {
+        app_err.or(core_err).or(ui_err)
+    };
+    *LAST_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = first_err;
     if any_attempted {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -327,6 +449,9 @@ fn run_one_check() -> bool {
             .unwrap_or(0);
         *CHECKED.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = checked_at(all_ok, now);
     }
+    CHECKING.store(false, Ordering::SeqCst);
+    CHECK_SEQ.fetch_add(1, Ordering::SeqCst);
+    crate::mods::request(crate::mods::Request::Refresh);
     all_ok
 }
 
@@ -346,8 +471,14 @@ fn check_core_from(base_url: &str) -> Result<(), String> {
     let Some(have) = have else { return Ok(()) };
     let latest = latest_core_from(base_url)?;
     let same = latest.generation == Some(crate::hc::GENERATION);
-    CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ready =
-        (same && newer(&latest.version, &have)).then_some(latest.version);
+    let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if same && newer(&latest.version, &have) {
+        c.ready = Some(latest.version);
+        c.notes = latest.notes;
+    } else {
+        c.ready = None;
+        c.notes = None;
+    }
     Ok(())
 }
 
@@ -355,6 +486,8 @@ fn check_core_from(base_url: &str) -> Result<(), String> {
 struct CoreRelease {
     version: String,
     generation: Option<u64>,
+    #[serde(default)]
+    notes: Option<String>,
 }
 
 fn latest_core_from(base_url: &str) -> Result<CoreRelease, String> {
@@ -381,31 +514,139 @@ pub fn update_core() {
     c.updating = true;
     c.error = None;
     drop(c);
+    crate::mods::request(crate::mods::Request::Refresh);
     let _ = std::thread::Builder::new().name("herdr2-core-update".into()).spawn(|| {
         let res = crate::core_bin::update();
         let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         c.updating = false;
         match res {
             Ok(now) => {
-                c.version = Some(strip_core_prefix(&now).to_owned());
+                let ver = strip_core_prefix(&now).to_owned();
+                c.version = Some(ver.clone());
                 c.ready = None;
+                c.notes = None;
                 c.error = None;
+                drop(c);
+                crate::mods::request(crate::mods::Request::UpdateToast {
+                    title: format!("herdr2-core updated to v{ver}"),
+                    body: "Running terminals stayed alive.".into(),
+                    level: "info".into(),
+                });
             }
             Err(e) => {
-                c.error = Some(e);
+                c.error = Some(e.clone());
+                drop(c);
+                crate::mods::request(crate::mods::Request::UpdateToast {
+                    title: "Core update failed".into(),
+                    body: e,
+                    level: "error".into(),
+                });
+            }
+        }
+        crate::mods::request(crate::mods::Request::Refresh);
+    });
+}
+
+/// Downloads and applies the available UI bundle in the background without restarting.
+pub fn start_ui_update() {
+    if crate::ui_update::is_applying() {
+        return;
+    }
+    crate::ui_update::set_applying(true);
+    crate::mods::request(crate::mods::Request::Refresh);
+    let _ = std::thread::Builder::new().name("herdr2-ui-update".into()).spawn(|| {
+        let app_dir = crate::mods::app_dir();
+        match crate::ui_update::download_and_stage_available(&app_dir) {
+            Ok(_) => {
+                crate::mods::request(crate::mods::Request::ApplyUiBundle);
+            }
+            Err(e) => {
+                crate::ui_update::set_error(Some(e.clone()));
+                crate::mods::request(crate::mods::Request::UpdateToast {
+                    title: "UI update failed".into(),
+                    body: e,
+                    level: "error".into(),
+                });
+                crate::mods::request(crate::mods::Request::Refresh);
             }
         }
     });
 }
 
-/// Downloads the latest release if it's newer. Ok(Some): a version is ready.
-#[allow(dead_code)]
-fn check(root: &Path) -> Result<Option<String>, String> {
-    let base_url = releases().ok_or_else(|| "HERDR2_RELEASES_URL not configured".to_owned())?;
-    check_from(root, &base_url)
+/// Unified one-click background updater: downloads, verifies, and applies whichever
+/// update channel (App, UI bundle, or Core) is available, keeping UI responsive with a spinner.
+pub fn start_update() {
+    if is_updating() {
+        return;
+    }
+    // 1. App update (staged or available)
+    if let Some(install_root) = checks_app() {
+        let already_staged = staged_version(&install_root).filter(|v| newer(v, env!("CARGO_PKG_VERSION")));
+        let avail = APP_AVAILABLE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+        if already_staged.is_some() || avail.is_some() {
+            APP_UPDATING.store(true, Ordering::SeqCst);
+            *APP_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+            crate::mods::request(crate::mods::Request::Refresh);
+            let _ = std::thread::Builder::new().name("herdr2-app-update".into()).spawn(move || {
+                let stage_res = if let Some(ver) = already_staged {
+                    *READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ver.clone());
+                    Ok(ver)
+                } else if let Some(a) = avail {
+                    download_and_stage_app(&install_root, &a)
+                } else {
+                    Err("no app update available".into())
+                };
+                match stage_res {
+                    Ok(_) => {
+                        // Also update h2 core in lockstep if a non-managed core update is waiting.
+                        let should_update_core = {
+                            let c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            c.managed.is_none() && c.ready.is_some() && !c.updating
+                        };
+                        if should_update_core {
+                            if let Ok(now) = crate::core_bin::update() {
+                                let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                c.version = Some(strip_core_prefix(&now).to_owned());
+                                c.ready = None;
+                                c.notes = None;
+                                c.error = None;
+                            }
+                        }
+                        crate::mods::request(crate::mods::Request::ApplyAppUpdate);
+                    }
+                    Err(e) => {
+                        APP_UPDATING.store(false, Ordering::SeqCst);
+                        *APP_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e.clone());
+                        crate::mods::request(crate::mods::Request::UpdateToast {
+                            title: "Update failed".into(),
+                            body: e,
+                            level: "error".into(),
+                        });
+                        crate::mods::request(crate::mods::Request::Refresh);
+                    }
+                }
+            });
+            return;
+        }
+    }
+    // 2. UI bundle hot-update
+    if crate::ui_update::ready().is_some() {
+        start_ui_update();
+        return;
+    }
+    // 3. Core update
+    let c = core();
+    if c.managed.is_none() && c.ready.is_some() {
+        update_core();
+    }
 }
 
-fn check_from(root: &Path, releases: &str) -> Result<Option<String>, String> {
+pub fn clear_app_updating() {
+    APP_UPDATING.store(false, Ordering::SeqCst);
+}
+
+/// Checks `app/latest.json` metadata only (no tarball download yet).
+fn check_app_manifest_from(root: &Path, releases: &str) -> Result<Option<AppAvailable>, String> {
     let url = feed_url(releases, "app");
     let text = curl_text(&url)?;
     let manifest: serde_json::Value = serde_json::from_str(&text).map_err(|e| format!("app/latest.json: {e}"))?;
@@ -413,19 +654,39 @@ fn check_from(root: &Path, releases: &str) -> Result<Option<String>, String> {
     if !newer(version, env!("CARGO_PKG_VERSION")) {
         return Ok(None);
     }
-    let staged = beside(root, ".new");
+    let notes = manifest["notes"].as_str().map(str::to_owned);
     if staged_version(root).as_deref() == Some(version) {
-        return Ok(Some(version.to_owned()));
+        return Ok(Some(AppAvailable {
+            version: version.to_owned(),
+            url: String::new(),
+            sha256: String::new(),
+            notes,
+        }));
     }
     let entry = &manifest["targets"][target()];
-    let (Some(url), Some(sha)) = (entry["url"].as_str(), entry["sha256"].as_str()) else {
+    let (Some(dl_url), Some(sha)) = (entry["url"].as_str(), entry["sha256"].as_str()) else {
         return Ok(None);
     };
+    Ok(Some(AppAvailable {
+        version: version.to_owned(),
+        url: dl_url.to_owned(),
+        sha256: sha.to_owned(),
+        notes,
+    }))
+}
+
+fn download_and_stage_app(root: &Path, avail: &AppAvailable) -> Result<String, String> {
+    let version = avail.version.as_str();
+    let staged = beside(root, ".new");
+    if staged_version(root).as_deref() == Some(version) {
+        *READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(version.to_owned());
+        return Ok(version.to_owned());
+    }
     tracing::info!("downloading Herdr {version}");
     let work = beside(root, ".download");
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
-    let result = unpack(url, sha, &work).and_then(|unpacked| {
+    let result = unpack(&avail.url, &avail.sha256, &work).and_then(|unpacked| {
         if version_of(&unpacked).as_deref() != Some(version) {
             return Err(format!("the download doesn't run as {version}"));
         }
@@ -436,7 +697,25 @@ fn check_from(root: &Path, releases: &str) -> Result<Option<String>, String> {
         std::fs::write(beside(root, ".new.json"), serde_json::json!({ "version": version }).to_string()).map_err(|e| e.to_string())
     });
     let _ = std::fs::remove_dir_all(&work);
-    result.map(|()| Some(version.to_owned()))
+    result.map(|()| {
+        *READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(version.to_owned());
+        version.to_owned()
+    })
+}
+
+/// Checks & downloads the latest release if it's newer. Ok(Some): a version is ready.
+#[allow(dead_code)]
+fn check(root: &Path) -> Result<Option<String>, String> {
+    let base_url = releases().ok_or_else(|| "HERDR2_RELEASES_URL not configured".to_owned())?;
+    check_from(root, &base_url)
+}
+
+#[allow(dead_code)]
+fn check_from(root: &Path, releases: &str) -> Result<Option<String>, String> {
+    let Some(avail) = check_app_manifest_from(root, releases)? else {
+        return Ok(None);
+    };
+    download_and_stage_app(root, &avail).map(Some)
 }
 
 /// Downloads, checks and unpacks a release into `work`; returns the app inside.
@@ -1081,7 +1360,7 @@ mod tests {
 
     #[test]
     fn after_app_update_targets_latest_only_in_our_generation() {
-        let release = |version: &str, generation| CoreRelease { version: version.into(), generation };
+        let release = |version: &str, generation| CoreRelease { version: version.into(), generation, notes: None };
         let latest = release("0.1.13", Some(1));
         assert_eq!(after_update_target("0.1.12", Some(&latest), 1, "0.1.11"), Some("0.1.13"));
         for have in ["0.1.13", "0.1.14"] {
@@ -1144,5 +1423,14 @@ mod tests {
         assert!(!check_cycle_succeeded(Some(missing_http), false, Some(missing_file)));
         assert!(!check_cycle_succeeded(Some(net_err), true, None));
         assert!(check_cycle_succeeded(None, false, None));
+    }
+
+    #[test]
+    fn auto_update_checks_every_hour_and_status_exposes_check_seq_and_updating() {
+        assert_eq!(EVERY, Duration::from_secs(60 * 60));
+        let st = status();
+        assert!(st.get("check_seq").and_then(|v| v.as_u64()).is_some());
+        assert!(st.get("updating").and_then(|v| v.as_bool()).is_some());
+        assert!(st.get("available").is_some());
     }
 }

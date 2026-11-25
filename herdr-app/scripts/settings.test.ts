@@ -527,3 +527,101 @@ test("aiInstallSkills forwards --on, --lang, and optional --query hint", async (
     disk.hcHandler = undefined;
   }
 });
+
+test("buildUpdateModal handles available updates, up-to-date, and check errors", () => {
+  const view = new Settings();
+  const avail = view.buildUpdateModal({
+    app: { version: "2.0.3", ready: "2.0.4", notes: "Herdr2 v2.0.4" },
+    core: { version: "2.0.3", ready: "2.0.4" },
+    available: {
+      kind: "app",
+      version: "2.0.4",
+      notes: "Herdr2 v2.0.4",
+      restart: true,
+      items: [
+        { kind: "app", current: "2.0.3", next: "2.0.4", notes: "Herdr2 v2.0.4" },
+        { kind: "core", current: "2.0.3", next: "2.0.4" },
+      ],
+    },
+  });
+  expect(avail.kind).toBe("available");
+  expect(avail.version).toBe("2.0.4");
+  expect(avail.restart).toBe(true);
+  expect(avail.items.length).toBe(2);
+
+  const upToDate = view.buildUpdateModal({
+    app: { version: "2.0.3", ready: null },
+    ui: { version: "2.0.3", ready: null },
+    core: { version: "2.0.3", ready: null },
+    available: null,
+    last_error: null,
+  });
+  expect(upToDate).toEqual({
+    kind: "up_to_date",
+    appVersion: "2.0.3",
+    coreVersion: "2.0.3",
+  });
+
+  const failed = view.buildUpdateModal({
+    app: { version: "2.0.3", ready: null },
+    available: null,
+    last_error: "curl: (7) Failed to connect",
+    releases_url: "https://example.invalid",
+  });
+  expect(failed).toEqual({
+    kind: "error",
+    message: "curl: (7) Failed to connect",
+    missingUrl: false,
+  });
+});
+
+test("triggerUpdateCheck persists edited releases_url and opens modal when check_seq advances", async () => {
+  const ran: string[] = [];
+  let currentUpdates: any = {
+    app: { version: "2.0.3", ready: null },
+    ui: { version: "2.0.3", ready: null },
+    core: { version: "2.0.3", ready: null },
+    available: null,
+    checking: false,
+    check_seq: 1,
+    last_error: null,
+  };
+  const customValues = {
+    ...values,
+    run: (cmd: string) => { ran.push(cmd); },
+    updates: () => currentUpdates,
+  };
+  const customArgs = names.map((name) => customValues[name] ?? (() => undefined));
+  const CustomSettings = new Function(
+    ...names,
+    source
+      .replace(/^import\s+[\s\S]*?from\s+["'][^"']+["'];?\s*\n?/gm, "")
+      .replace("export default class Settings", "return class Settings"),
+  )(...customArgs);
+
+  Object.assign(disk, { raw: "{}", writes: 0, fail: undefined, readFail: undefined, toasts: [] });
+  const view = new CustomSettings();
+  view.person = {};
+  view.releasesUrlInput = { value: () => "https://github.com/herdr2/herdr2/releases/download/ota-latest/" };
+
+  let task: Promise<void> | null = null;
+  const cx = { notify() {}, spawn(fn: (c: any) => Promise<void>) { task = fn(cx); } };
+  view.triggerUpdateCheck(cx);
+  expect(view.waitingUpdateCheck).toBe(true);
+  await task;
+  expect(JSON.parse(disk.raw!)).toEqual({
+    releases_url: "https://github.com/herdr2/herdr2/releases/download/ota-latest",
+  });
+  expect(ran).toEqual(["app.check_updates"]);
+
+  // Still checking -> modal stays closed
+  currentUpdates = { ...currentUpdates, checking: true };
+  view.syncUpdateCheck(cx);
+  expect(view.updateModal).toBeNull();
+
+  // Check finishes with no update -> opens "up_to_date" modal
+  currentUpdates = { ...currentUpdates, checking: false, check_seq: 2 };
+  view.syncUpdateCheck(cx);
+  expect(view.waitingUpdateCheck).toBe(false);
+  expect(view.updateModal?.kind).toBe("up_to_date");
+});

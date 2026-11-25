@@ -920,40 +920,42 @@ export default class Tabs extends View {
       const ui = updateState.ui ?? {};
       const app = updateState.app ?? {};
       const core = updateState.core ?? {};
-      const busy = Boolean(ui.applying || core.updating);
-      let label = null;
-      let tip = "";
-      let action = null;
-      if (ui.applying) {
-        label = tr("Updating…", "更新中…");
-        tip = tr("Applying UI hot-update live without restarting…", "正在免重启热更新 UI，终端保持运行…");
-      } else if (core.updating) {
-        label = tr("Updating…", "更新中…");
-        tip = tr("Updating h2 core without interrupting terminals…", "正在热更新 h2 Core，终端保持运行…");
-      } else if (ui.ready) {
-        label = tr("Update", "更新");
-        tip = tr(
-          `UI hot-update v${ui.ready} is ready. Click to apply live without restarting.`,
-          `热更新包 v${ui.ready} 已就绪，点击立即免重启热部署（不中断终端）。`,
-        );
-        action = "app.apply_ui_update";
-      } else if (core.ready && !core.managed) {
-        label = tr("Update Core", "更新");
-        tip = tr(
-          `h2 Core v${core.ready} is ready. Click to hot-update without interrupting terminals.`,
-          `h2 Core v${core.ready} 已就绪，点击立即热更新（不中断终端）。`,
-        );
-        action = "app.update_core";
-      } else if (app.ready) {
-        label = tr("Update", "更新");
-        tip = tr(
-          `Herdr2 v${app.ready} is ready. Click to restart and apply (terminals stay alive in h2).`,
-          `Herdr2 v${app.ready} 已就绪，点击重启更新（终端在后台保持运行）。`,
-        );
-        action = "app.update";
-      }
-      if (!label) return null;
+      const avail = updateState.available ?? null;
+      const busy = Boolean(updateState.updating || app.updating || ui.applying || core.updating);
+      const hasUpdate = Boolean(avail || app.ready || ui.ready || (core.ready && !core.managed));
+      if (!busy && !hasUpdate) return null;
       const accent = t.accent ?? "#3b82f6";
+      if (busy) {
+        const busyTip = tr("Updating in background…", "正在后台更新中…");
+        return h_flex()
+          .id("top-update-btn")
+          .size(26)
+          .flex_none()
+          .items_center()
+          .justify_center()
+          .rounded(6)
+          .bg(t.raised ?? t.surface ?? "#27272a")
+          .border_1()
+          .border_color(t.border)
+          .text_color(accent)
+          .tooltip(busyTip)
+          .child(svg("mods/workspace-chrome/spinner.svg").size(14).flex_none().spin(900));
+      }
+      const nextVer = avail?.version ?? app.ready ?? ui.ready ?? core.ready ?? "";
+      const tip = app.ready
+        ? tr(
+            `Herdr2 v${nextVer} is available. Click to download and update in background.`,
+            `发现新版本 v${nextVer}，点击后后台自动更新。`,
+          )
+        : ui.ready
+          ? tr(
+              `UI hot-update v${nextVer} is available. Click to update live without restarting.`,
+              `发现 UI 热更新 v${nextVer}，点击后后台自动免重启更新。`,
+            )
+          : tr(
+              `h2 Core v${nextVer} is available. Click to update in background.`,
+              `发现 Core 更新 v${nextVer}，点击后后台自动更新。`,
+            );
       return h_flex()
         .id("top-update-btn")
         .h(26)
@@ -966,18 +968,13 @@ export default class Tabs extends View {
         .text_color(t.accent_foreground ?? "#ffffff")
         .text_size(12)
         .font_semibold()
-        .when(Boolean(tip), (el) => el.tooltip(tip))
-        .when(busy, (el) => el.opacity(0.85))
-        .when(!busy && Boolean(action), (el) =>
-          el
-            .cursor_pointer()
-            .hover((s) => s.opacity(0.9))
-            .on_mouse_down("left", stop)
-            .on_click(() => run(action)),
-        )
-        .when(busy, (el) => el.child(svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().spin(900)))
-        .when(!busy, (el) => el.child(svg("frame/settings/refresh.svg").size(12).flex_none()))
-        .child(label);
+        .tooltip(tip)
+        .cursor_pointer()
+        .hover((s) => s.opacity(0.9))
+        .on_mouse_down("left", stop)
+        .on_click(() => run("app.update"))
+        .child(svg("frame/settings/refresh.svg").size(12).flex_none())
+        .child(tr("Update", "更新"));
     };
     const updateBtn = renderUpdateButton();
     return h_flex().relative().size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)

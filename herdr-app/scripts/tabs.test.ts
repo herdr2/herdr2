@@ -858,3 +858,72 @@ test("newly added tabs are moved to the tail and Chrome-style vertical hairlines
   view.render();
   expect(runCalls).toEqual([]);
 });
+
+test("top-right update button triggers app.update and turns into a compact spinner icon while updating", () => {
+  const runCalls: Array<[string, any]> = [];
+  let updateState: any = {
+    app: { version: "2.0.3", ready: null, updating: false },
+    ui: { version: "2.0.3", ready: null, applying: false },
+    core: { version: "2.0.3", ready: null, updating: false },
+    available: null,
+    updating: false,
+  };
+  const customValues = {
+    ...values,
+    spaces: () => [{ id: "s1", active: true, tabs: [{ id: "t1", name: "Tab", named: true, active: true }] }],
+    panes: () => [],
+    settings: () => ({ zoom: 1, language: "zh-CN" }),
+    updates: () => updateState,
+    run: (cmd: string, args: any) => runCalls.push([cmd, args]),
+  };
+  const view = new (new Function(
+    ...Object.keys(customValues),
+    source.replace(/^import .*;\n/gm, "").replace("export default class Tabs", "return class Tabs"),
+  )(...Object.values(customValues)))();
+  view.init();
+  const findById = (node: any, id: string): any => {
+    if (!node) return null;
+    if (node.calls?.id?.[0] === id) return node;
+    for (const ch of node.nodes ?? []) {
+      const hit = findById(ch, id);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  const collectTexts = (node: any): string[] => {
+    if (!node) return [];
+    const out: string[] = [];
+    for (const ch of node.nodes ?? []) {
+      if (typeof ch === "string") out.push(ch);
+      else out.push(...collectTexts(ch));
+    }
+    return out;
+  };
+
+  // 1) Up to date: button is hidden
+  expect(findById(view.render(), "top-update-btn")).toBeNull();
+
+  // 2) Update available: shows Update button and triggers app.update on click
+  updateState = {
+    ...updateState,
+    app: { version: "2.0.3", ready: "2.0.4", updating: false },
+    available: { kind: "app", version: "2.0.4" },
+  };
+  const btn = findById(view.render(), "top-update-btn");
+  expect(btn).not.toBeNull();
+  expect(collectTexts(btn)).toEqual(["更新"]);
+  btn.calls.on_click[0]({}, { stop_propagation() {} });
+  expect(runCalls).toEqual([["app.update", undefined]]);
+
+  // 3) Updating in background: turns into compact spinner icon with no label or click handler
+  updateState = {
+    ...updateState,
+    app: { version: "2.0.3", ready: "2.0.4", updating: true },
+    updating: true,
+  };
+  const spinnerBtn = findById(view.render(), "top-update-btn");
+  expect(spinnerBtn).not.toBeNull();
+  expect(collectTexts(spinnerBtn)).toEqual([]);
+  expect(spinnerBtn.calls.on_click).toBeUndefined();
+  expect(spinnerBtn.nodes[0]?.calls?.spin?.[0]).toBe(900);
+});

@@ -290,7 +290,15 @@ export default class Settings extends View {
     this.keysFilterInput.on("change", (_e, cx) => { this.keysFilter = this.keysFilterInput.value(); cx.notify(); });
     this.releasesUrlInput = InputState.new({ placeholder: "https://github.com/herdr2/herdr2/releases/download/ota-latest" });
     this.releasesUrlSynced = false;
-    this.releasesUrlSavedAt = 0;
+    this.releasesUrlInput.on("blur", (_e, cx) => {
+      this.saveReleasesUrl(cx);
+    });
+    this.releasesUrlInput.on("submit", (_e, cx) => {
+      this.triggerUpdateCheck(cx);
+    });
+    this.waitingUpdateCheck = false;
+    this.pendingUpdateCheckSeq = 0;
+    this.updateModal = null;
     this.skillData = null;
     this.skillMachine = null; // null = local, else SSH machine name
     this.skillLoading = false;
@@ -5773,191 +5781,360 @@ export default class Settings extends View {
 
   // Updates --------------------------------------------------------------
 
-  updates(t, cx) {
-    const u = updates();
-    const ui = u.ui ?? {};
-    const c = u.core ?? {};
-    const at = (secs) => {
-      const d = new Date(secs * 1000);
-      return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  saveReleasesUrl(cx) {
+    const val = (this.releasesUrlInput?.value?.() ?? "").trim().replace(/\/+$/, "");
+    const cur = (this.person?.releases_url ?? "").trim().replace(/\/+$/, "");
+    if (val === cur) return;
+    this.change((p) => {
+      if (val) p.releases_url = val;
+      else delete p.releases_url;
+    }, cx);
+  }
+
+  triggerUpdateCheck(cx) {
+    if (this.waitingUpdateCheck) return;
+    const val = (this.releasesUrlInput?.value?.() ?? "").trim().replace(/\/+$/, "");
+    const cur = (this.person?.releases_url ?? "").trim().replace(/\/+$/, "");
+    const u = typeof updates === "function" ? updates() : {};
+    this.pendingUpdateCheckSeq = Number(u?.check_seq ?? 0);
+    this.waitingUpdateCheck = true;
+    this.updateModal = null;
+    cx?.notify?.();
+    const startCheck = () => {
+      run("app.check_updates");
     };
-    const checked = u.checked ? this.tr(` Checked at ${at(u.checked)}.`, ` 上次检查：${at(u.checked)}。`) : "";
-    const result = u.checking ? this.tr("Checking\u2026", "检查中…") : u.checked
-      ? this.tr(`Up to date.${checked}`, `已是最新版本。${checked}`)
-      : u.checks
-        ? this.tr("Ready to check. Click Check now to query the release server.", "就绪，点击「立即检查」查询更新源。")
-        : this.tr("Configure a releases URL below to enable updates.", "请在下方配置更新源地址以开启自动检查。");
-    const asked = this.asked && Date.now() - this.asked < 3000;
-    const check = (id) =>
-      !u.checks
-        ? null
-        : u.checking && this.asked
-          ? div().px(12).py(5).text_size(13).text_color(t.dim).child(this.tr("Checking\u2026", "检查中…"))
-          : asked && u.checked && !u.checking
-            ? div().px(12).py(5).text_size(13).text_color(t.ansi2).child(this.tr("\u2713 Up to date", "✓ 已是最新"))
-            : this.button(t, id, this.tr("Check now", "立即检查"), (_e, cx) => {
-                this.asked = Date.now();
-                run("app.check_updates");
-                cx.notify();
-              });
-    const primary = (id, label, f) =>
-      div().id(id).px(12).py(5).rounded(7).cursor_pointer().bg(t.accent).text_color(t.accent_foreground).text_size(13).font_semibold().hover((s) => s.opacity(0.9)).on_click(f).child(label);
+    if (val !== cur) {
+      cx.spawn(async (spawnCx) => {
+        const failed = await this.save((p) => {
+          if (val) p.releases_url = val;
+          else delete p.releases_url;
+        });
+        if (failed) {
+          this.waitingUpdateCheck = false;
+          notify({ ...failed, level: "error" });
+          spawnCx.notify();
+          return;
+        }
+        startCheck();
+        spawnCx.notify();
+      });
+    } else {
+      startCheck();
+    }
+  }
 
-    const uiMode = this.person.ui_hot_update ?? ui.mode ?? "prompt";
-    const uiCard = u.dev_defaults
-      ? [
-          this.tr(`Dev live-reload active: ${u.dev_defaults}`, `开发源码直连热重载已开启：${u.dev_defaults}`),
-          this.button(t, "st-reload-mods", this.tr("Reload mods", "重载 Mods"), () => run("app.reload_mods")),
-        ]
-      : ui.applying
-        ? [this.tr("Applying UI hot-update\u2026 terminals stay running.", "正在免重启热更新 UI… 终端不会中断。"), null]
-        : ui.error
-          ? [this.tr(`Last UI update failed: ${ui.error}`, `上次 UI 热更新失败：${ui.error}`), check("st-check-ui")]
-          : ui.ready
-            ? [
-                this.tr(`${ui.ready} is ready. Applies live in ~200ms without restarting.`, `${ui.ready} 已就绪，约 200ms 免重启热生效，不中断终端。`),
-                primary("st-ui-apply", this.tr("Hot-update UI", "立即热更新 UI"), () => run("app.apply_ui_update")),
-              ]
-            : [
-                ui.active_override
-                  ? this.tr(`Hot-updated bundle active (base app ${fmtVer(ui.app_version)}).${checked}`, `当前运行热更新 UI 包（底座 ${fmtVer(ui.app_version)}）。${checked}`)
-                  : result,
-                check("st-check-ui"),
-              ];
+  buildUpdateModal(u) {
+    const app = u?.app ?? {};
+    const ui = u?.ui ?? {};
+    const core = u?.core ?? {};
+    const avail = u?.available ?? null;
+    const items = Array.isArray(avail?.items) ? avail.items : [];
+    const fallbackItems = [];
+    if (items.length === 0) {
+      if (app.ready) fallbackItems.push({ kind: "app", current: app.version, next: app.ready, notes: app.notes });
+      else if (ui.ready) fallbackItems.push({ kind: "ui", current: ui.version, next: ui.ready, notes: ui.ready_notes });
+      if (core.ready && !core.managed) fallbackItems.push({ kind: "core", current: core.version, next: core.ready, notes: core.notes });
+    }
+    const list = items.length > 0 ? items : fallbackItems;
+    const nextVersion = avail?.version ?? list[0]?.next ?? null;
+    if (nextVersion) {
+      return {
+        kind: "available",
+        version: nextVersion,
+        notes: avail?.notes ?? list[0]?.notes ?? null,
+        restart: Boolean(avail?.restart ?? Boolean(app.ready)),
+        items: list,
+      };
+    }
+    if (u?.last_error) {
+      return {
+        kind: "error",
+        message: String(u.last_error),
+        missingUrl: !u?.releases_url,
+      };
+    }
+    return {
+      kind: "up_to_date",
+      appVersion: app.version ?? "",
+      coreVersion: core.version ?? "",
+    };
+  }
 
-    const app = !u.app.updates
-      ? [
-          u.releases_url
-            ? this.tr("Source / portable binary: app self-swap applies only to installed packages.", "源码/便携运行模式：App 二进制替换仅对正式安装目录生效。")
-            : this.tr("No releases URL configured. Configure one below or build from source.", "未配置更新源地址：可在下方填写更新源或通过源码更新。"),
-          this.button(t, "st-app-restart", this.tr("Restart window", "热重启窗口"), () => run("app.restart")),
-        ]
-      : u.app.ready
-        ? [this.tr(`${u.app.ready} is ready. Restart to switch now; it also switches when you quit.`, `${u.app.ready} 已就绪，重启后立即生效。`), primary("st-app-update", this.tr("Restart to update", "重启更新"), () => run("app.update"))]
-        : [result, check("st-check-app")];
+  syncUpdateCheck(cx) {
+    if (!this.waitingUpdateCheck) return;
+    const u = typeof updates === "function" ? updates() : null;
+    if (!u) return;
+    const seq = Number(u.check_seq ?? 0);
+    if (!u.checking && seq > this.pendingUpdateCheckSeq) {
+      this.waitingUpdateCheck = false;
+      this.updateModal = this.buildUpdateModal(u);
+    }
+  }
 
-    const core = c.managed
-      ? [this.tr(`Managed by ${c.managed}: update it there.${c.ready ? ` ${c.ready} is available.` : ""}`, `由 ${c.managed} 托管：请通过包管理器更新。${c.ready ? ` 已有新版本 ${c.ready}。` : ""}`), u.checks ? check("st-check-core") : null]
-      : c.updating
-        ? [this.tr("Updating\u2026 your terminals keep running.", "更新中… 终端会话不会中断。"), null]
-        : c.error
-          ? [this.tr(`The update failed: ${c.error}`, `更新失败：${c.error}`), primary("st-core-retry", this.tr("Try again", "重试"), () => run("app.update_core"))]
-          : c.ready
-            ? [this.tr(`${c.ready} is ready. Your terminals keep running through it.`, `${c.ready} 已就绪，更新过程不会中断现有终端。`), primary("st-core-update", this.tr("Update herdr2-core", "更新 herdr2-core"), () => run("app.update_core"))]
-            : u.checks
-              ? [result, check("st-check-core")]
-              : [this.tr("Not checked: configure a releases URL below to check core updates.", "未检查：配置更新源地址后可一键热升级 herdr2-core。"), null];
-
-    const modeOptions = [
-      ["prompt", this.tr("Prompt", "提示后应用")],
-      ["auto", this.tr("Auto", "静默自动")],
-      ["off", this.tr("Off", "关闭")],
-    ];
-    const savedNotice = this.releasesUrlSavedAt && Date.now() - this.releasesUrlSavedAt < 3000;
-
-    return v_flex()
-      .w_full()
-      .child(this.heading(t, this.tr("UI Hot-Update (No Restart)", "UI 热更新（免重启）")))
-      .child(this.row(t, `UI ${fmtVer(ui.version || u.app.version)}`.trim(), uiCard[0], uiCard[1] ?? div()))
-      .child(
-        this.row(
-          t,
-          this.tr("UI hot-update mode", "UI 热更新策略"),
-          this.tr("Choose whether verified UI bundles prompt in the corner or apply live automatically.", "选择校验通过的 UI 资源包是弹出胶囊确认，还是自动热生效。"),
-          h_flex()
-            .gap(4)
-            .children(
-              modeOptions.map(([val, label]) => {
-                const active = uiMode === val;
-                return div()
-                  .id(`st-ui-mode-${val}`)
-                  .px(10)
-                  .py(5)
-                  .rounded(6)
-                  .cursor_pointer()
-                  .text_size(12.5)
-                  .border_1()
-                  .border_color(active ? t.accent : t.border)
-                  .bg(active ? t.accent : t.surface)
-                  .text_color(active ? t.accent_foreground : t.foreground)
-                  .on_click((_e, cx) => {
-                    this.change((p) => {
-                      if (val === "prompt") delete p.ui_hot_update;
-                      else p.ui_hot_update = val;
-                    }, cx);
-                  })
-                  .child(label);
-              }),
+  renderUpdateModal(t, cx) {
+    const m = this.updateModal;
+    if (!m) return null;
+    const closeModal = (_e, c) => {
+      this.updateModal = null;
+      this.handle.focus();
+      c.stop_propagation();
+      c.notify();
+    };
+    let title = "";
+    let badge = null;
+    const lines = [];
+    if (m.kind === "available") {
+      title = this.tr("Update Available", "发现新版本");
+      badge = `v${String(m.version).replace(/^v/i, "")}`;
+      for (const item of m.items ?? []) {
+        const label = item.kind === "app"
+          ? "Herdr2"
+          : item.kind === "ui"
+            ? this.tr("UI Bundle", "UI 热更新包")
+            : "herdr2-core";
+        const from = item.current ? `v${String(item.current).replace(/^v/i, "")} → ` : "";
+        const to = `v${String(item.next).replace(/^v/i, "")}`;
+        lines.push(`${label}：${from}${to}`);
+      }
+      if (m.notes) lines.push(String(m.notes));
+      lines.push(
+        m.restart
+          ? this.tr(
+              "Downloading runs in the background; Herdr2 will restart once ready while terminals stay alive.",
+              "点击更新后将在后台下载并在就绪后自动重启切换，现有终端会话不会中断。",
+            )
+          : this.tr(
+              "Applies live in the background without restarting Herdr2 or interrupting terminals.",
+              "点击更新后将在后台自动免重启生效，不会中断现有终端会话。",
             ),
-        ),
-      )
-      .child(div().h(18))
-      .child(this.heading(t, "Herdr2"))
-      .child(this.row(t, `Herdr2 ${fmtVer(u.app.version)}`.trim(), app[0], app[1] ?? div()))
-      .child(div().h(18))
-      .child(this.heading(t, "herdr2-core"))
-      .child(this.row(t, `herdr2-core ${fmtVer(c.version)}`.trim(), core[0], core[1] ?? div()))
-      .child(div().h(18))
-      .child(this.heading(t, this.tr("Release Server", "更新源配置")))
+      );
+    } else if (m.kind === "error") {
+      title = this.tr("Update Check Failed", "检查更新失败");
+      lines.push(
+        m.missingUrl
+          ? this.tr("Please enter a valid update URL first.", "请先填写有效的更新地址。")
+          : m.message,
+      );
+    } else {
+      title = this.tr("Already Up to Date", "已是最新版本");
+      const cur = [
+        m.appVersion ? `Herdr2 ${fmtVer(m.appVersion)}` : null,
+        m.coreVersion ? `Core ${fmtVer(m.coreVersion)}` : null,
+      ].filter(Boolean).join(" · ");
+      lines.push(
+        cur
+          ? this.tr(`You are running the latest version (${cur}).`, `当前已是最新版本（${cur}）。`)
+          : this.tr("You are already running the latest version.", "当前已是最新版本。"),
+      );
+    }
+
+    const actions = h_flex()
+      .w_full()
+      .justify_end()
+      .gap(8)
+      .pt(6);
+    if (m.kind === "available") {
+      actions
+        .child(this.button(t, "st-update-modal-cancel", this.tr("Later", "暂不更新"), closeModal))
+        .child(
+          div()
+            .id("st-update-modal-confirm")
+            .px(14)
+            .py(6)
+            .rounded(7)
+            .cursor_pointer()
+            .bg(t.accent)
+            .text_color(t.accent_foreground)
+            .text_size(13)
+            .font_semibold()
+            .hover((s) => s.opacity(0.9))
+            .on_click((_e, c) => {
+              this.updateModal = null;
+              this.handle.focus();
+              run("app.update");
+              c.stop_propagation();
+              c.notify();
+            })
+            .child(this.tr("Update Now", "立即更新")),
+        );
+    } else {
+      actions.child(
+        div()
+          .id("st-update-modal-ok")
+          .px(14)
+          .py(6)
+          .rounded(7)
+          .cursor_pointer()
+          .bg(t.accent)
+          .text_color(t.accent_foreground)
+          .text_size(13)
+          .font_semibold()
+          .hover((s) => s.opacity(0.9))
+          .on_click(closeModal)
+          .child(this.tr("OK", "知道了")),
+      );
+    }
+
+    return div()
+      .id("st-update-modal-backdrop")
+      .absolute()
+      .inset_0()
+      .flex()
+      .items_center()
+      .justify_center()
+      .bg("#00000073")
+      .on_click(closeModal)
       .child(
         v_flex()
-          .gap(8)
-          .pt(6)
+          .id("st-update-modal")
+          .w(420)
+          .p(20)
+          .gap(12)
+          .rounded(12)
+          .bg(t.surface)
+          .border_1()
+          .border_color(t.border)
+          .shadow_lg()
+          .on_click((_e, c) => c.stop_propagation())
           .child(
-            div()
-              .text_size(12.5)
-              .text_color(t.dim)
-              .child(
-                this.tr(
-                  "Base URL serving app/latest.json, ui/latest.json, and core/latest.json (HERDR2_RELEASES_URL env overrides this).",
-                  "提供 app/latest.json、ui/latest.json、core/latest.json 的静态服务地址（环境变量 HERDR2_RELEASES_URL 优先级更高）。",
+            h_flex()
+              .items_center()
+              .gap(8)
+              .child(div().text_size(15).font_semibold().text_color(t.foreground).child(title))
+              .when(Boolean(badge), (el) =>
+                el.child(
+                  div()
+                    .px(7)
+                    .py(2)
+                    .rounded(5)
+                    .bg(t.raised)
+                    .border_1()
+                    .border_color(t.border)
+                    .text_size(12)
+                    .font_semibold()
+                    .text_color(t.accent)
+                    .child(badge),
                 ),
               ),
           )
           .child(
-            h_flex()
-              .gap(8)
-              .items_center()
+            v_flex()
+              .gap(6)
+              .children(
+                lines.map((line) =>
+                  div().text_size(13).line_height("19px").text_color(t.muted).child(line),
+                ),
+              ),
+          )
+          .child(actions),
+      );
+  }
+
+  updates(t, cx) {
+    const u = updates();
+    const c = u.core ?? {};
+    const busyChecking = Boolean(this.waitingUpdateCheck || u.checking);
+    const busyUpdating = Boolean(u.updating || u.app?.updating || u.ui?.applying || c.updating);
+    const verSummary = [
+      u.app?.version ? `Herdr2 ${fmtVer(u.app.version)}` : null,
+      c.version ? `Core ${fmtVer(c.version)}` : null,
+    ].filter(Boolean).join(" · ");
+    const at = (secs) => {
+      const d = new Date(secs * 1000);
+      return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+    };
+    const subLine = u.checked
+      ? `${verSummary} · ${this.tr(`Last checked ${at(u.checked)}`, `上次检查 ${at(u.checked)}`)}`
+      : verSummary;
+
+    const checkBtn = busyChecking
+      ? h_flex()
+          .id("st-check-updates")
+          .px(14)
+          .py(6)
+          .gap(6)
+          .items_center()
+          .rounded(7)
+          .bg(t.raised)
+          .border_1()
+          .border_color(t.border)
+          .text_size(13)
+          .text_color(t.dim)
+          .child(svg("mods/workspace-chrome/spinner.svg").size(13).flex_none().spin(900))
+          .child(this.tr("Checking…", "检查中…"))
+      : busyUpdating
+        ? h_flex()
+            .id("st-check-updates")
+            .px(14)
+            .py(6)
+            .gap(6)
+            .items_center()
+            .rounded(7)
+            .bg(t.raised)
+            .border_1()
+            .border_color(t.border)
+            .text_size(13)
+            .text_color(t.accent)
+            .child(svg("mods/workspace-chrome/spinner.svg").size(13).flex_none().spin(900))
+            .child(this.tr("Updating…", "更新中…"))
+        : h_flex()
+            .id("st-check-updates")
+            .px(14)
+            .py(6)
+            .gap(6)
+            .items_center()
+            .rounded(7)
+            .cursor_pointer()
+            .bg(t.accent)
+            .text_color(t.accent_foreground)
+            .text_size(13)
+            .font_semibold()
+            .hover((s) => s.opacity(0.9))
+            .on_click((_e, c) => this.triggerUpdateCheck(c))
+            .child(this.tr("Check for Updates", "检查更新"));
+
+    return v_flex()
+      .w_full()
+      .gap(16)
+      .child(this.heading(t, this.tr("Updates", "更新")))
+      .child(
+        this.row(
+          t,
+          this.tr("Version", "当前版本"),
+          subLine || this.tr("Ready to check for updates.", "点击右侧按钮检查更新。"),
+          checkBtn,
+        ),
+      )
+      .child(
+        v_flex()
+          .gap(8)
+          .pt(4)
+          .child(div().text_size(13.5).font_semibold().text_color(t.foreground).child(this.tr("Update URL", "更新地址")))
+          .child(
+            div()
+              .id("st-releases-url")
+              .w_full()
+              .px(10)
+              .py(4)
+              .rounded(7)
+              .border_1()
+              .border_color(t.border)
+              .bg(t.background)
+              .child(Input.new(this.releasesUrlInput).h(26).text_size(13).text_color(t.foreground)),
+          )
+          .child(
+            div()
+              .text_size(12.5)
+              .line_height("18px")
+              .text_color(t.dim)
               .child(
-                div()
-                  .flex_1()
-                  .px(8)
-                  .py(3)
-                  .rounded(6)
-                  .border_1()
-                  .border_color(t.border)
-                  .bg(t.background)
-                  .child(Input.new(this.releasesUrlInput).h(26).text_size(13).text_color(t.foreground)),
-              )
-              .child(
-                this.button(t, "st-gh-releases-url", this.tr("GitHub OTA", "使用 GitHub 热更源"), (_e, cx) => {
-                  const ghUrl = "https://github.com/herdr2/herdr2/releases/download/ota-latest";
-                  this.releasesUrlInput.set_value(ghUrl);
-                  this.change((p) => { p.releases_url = ghUrl; }, cx);
-                  this.releasesUrlSavedAt = Date.now();
-                  this.asked = Date.now();
-                  run("app.check_updates");
-                  cx.notify();
-                }),
-              )
-              .child(
-                this.button(t, "st-save-releases-url", savedNotice ? this.tr("\u2713 Saved", "✓ 已保存") : this.tr("Save & Check", "保存并检查"), (_e, cx) => {
-                  const val = this.releasesUrlInput.value().trim().replace(/\/+$/, "");
-                  this.change((p) => {
-                    if (val) p.releases_url = val;
-                    else delete p.releases_url;
-                  }, cx);
-                  this.releasesUrlSavedAt = Date.now();
-                  if (val) {
-                    this.asked = Date.now();
-                    run("app.check_updates");
-                  }
-                  cx.notify();
-                }),
+                this.tr(
+                  "Leave blank to use the built-in GitHub OTA feed. Herdr2 checks automatically every hour and shows an Update button in the top-right corner when a new version is available.",
+                  "留空则使用内置 GitHub 热更源。Herdr2 每小时自动拉取一次更新，发现新版本时会在右上角显示更新按钮。",
+                ),
               ),
           ),
-      )
-      .child(div().pt(12).text_size(12.5).line_height("18px").text_color(t.dim).child(this.tr("Herdr2 checks for App, UI bundle, and Core updates every hour. herdr2-core runs your terminals, so they keep running through UI and Core updates.", "Herdr2 每小时检查一次桌面端、UI 资源包与 Core 更新；UI 与 Core 热更新全程不中断现有终端会话。")));
+      );
   }
 
   // ----------------------------------------------------------------------
@@ -6011,6 +6188,7 @@ export default class Settings extends View {
   render(cx) {
     this.syncRecordedShortcut(cx);
     this.syncExternalKeysChange(cx);
+    this.syncUpdateCheck(cx);
     const t = theme();
     const nav = v_flex()
       .flex_none()
@@ -6065,9 +6243,11 @@ export default class Settings extends View {
       );
     return h_flex()
       .id("settings")
+      .relative()
       .track_focus(this.handle)
-      .when(Boolean(this.picking), (el) => el.on_action("overlay.close", (_e, cx) => {
-        this.picking = null;
+      .when(Boolean(this.picking || this.updateModal), (el) => el.on_action("overlay.close", (_e, cx) => {
+        if (this.updateModal) this.updateModal = null;
+        else this.picking = null;
         this.handle.focus();
         cx.stop_propagation();
         cx.notify();
@@ -6094,7 +6274,8 @@ export default class Settings extends View {
           return;
         }
         if (k === "escape") {
-          if (this.picking) this.picking = null;
+          if (this.updateModal) this.updateModal = null;
+          else if (this.picking) this.picking = null;
           else return this.close();
           this.handle.focus();
         } else return;
@@ -6143,6 +6324,7 @@ export default class Settings extends View {
               ),
           )
           .child(Scrollbar.vertical("st-body").mode("always").absolute().inset_0()),
-      );
+      )
+      .when(Boolean(this.updateModal), (el) => el.child(this.renderUpdateModal(t, cx)));
   }
 }

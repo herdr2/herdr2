@@ -80,6 +80,7 @@ pub struct AppliedUi {
 struct State {
     ready: Option<String>,
     ready_notes: Option<String>,
+    available: Option<UiManifest>,
     applying: bool,
     error: Option<String>,
 }
@@ -87,6 +88,7 @@ struct State {
 static STATE: Mutex<State> = Mutex::new(State {
     ready: None,
     ready_notes: None,
+    available: None,
     applying: false,
     error: None,
 });
@@ -146,6 +148,10 @@ pub fn info() -> UiBundleInfo {
 
 pub fn ready() -> Option<String> {
     STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).ready.clone()
+}
+
+pub fn is_applying() -> bool {
+    STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).applying
 }
 
 pub fn set_applying(applying: bool) {
@@ -231,9 +237,9 @@ pub(crate) fn is_newer_ui_version(candidate: &str, current: &str) -> bool {
     }
 }
 
-/// Checks `<releases>/ui/latest.json`, verifies compatibility & sha256, and stages the bundle.
-/// Returns `Ok(Some(version))` when a newer compatible UI bundle is staged and ready to apply.
-pub fn check_from(app_dir: &Path, releases: &str) -> Result<Option<String>, String> {
+/// Checks `<releases>/ui/latest.json` metadata only (no tarball download yet).
+/// Records an available compatible update so the user can choose to install it.
+pub fn check_manifest_from(app_dir: &Path, releases: &str) -> Result<Option<UiManifest>, String> {
     let url = crate::update::feed_url(releases, "ui");
     let text = crate::update::curl_text(&url)?;
     let manifest: UiManifest = serde_json::from_str(&text).map_err(|e| format!("ui/latest.json: {e}"))?;
@@ -248,6 +254,10 @@ pub fn check_from(app_dir: &Path, releases: &str) -> Result<Option<String>, Stri
             running_app,
             crate::mods::UI_HOST_API_GENERATION
         );
+        let mut st = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.ready = None;
+        st.ready_notes = None;
+        st.available = None;
         return Ok(None);
     }
     let current = current_version(app_dir);
@@ -255,21 +265,32 @@ pub fn check_from(app_dir: &Path, releases: &str) -> Result<Option<String>, Stri
         let mut st = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         st.ready = None;
         st.ready_notes = None;
+        st.available = None;
         return Ok(None);
     }
     if failed_versions(app_dir).contains(&manifest.version) {
         tracing::info!("ui_update: skipping previously failed UI bundle {}", manifest.version);
+        let mut st = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        st.ready = None;
+        st.ready_notes = None;
+        st.available = None;
         return Ok(None);
     }
+    let mut st = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    st.ready = Some(manifest.version.clone());
+    st.ready_notes = manifest.notes.clone();
+    st.available = Some(manifest.clone());
+    st.error = None;
+    Ok(Some(manifest))
+}
+
+/// Downloads, verifies sha256, validates, and stages the given UI manifest into `.ui-stage/`.
+pub fn stage_manifest(app_dir: &Path, manifest: &UiManifest) -> Result<String, String> {
     if let Some(staged) = staged_receipt(app_dir)
         && staged.version == manifest.version
         && staged.sha256.eq_ignore_ascii_case(&manifest.sha256)
     {
-        let mut st = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        st.ready = Some(manifest.version.clone());
-        st.ready_notes = manifest.notes.clone();
-        st.error = None;
-        return Ok(Some(manifest.version));
+        return Ok(manifest.version.clone());
     }
 
     tracing::info!("ui_update: downloading UI bundle {}", manifest.version);
@@ -304,12 +325,42 @@ pub fn check_from(app_dir: &Path, releases: &str) -> Result<Option<String>, Stri
     })();
     let _ = std::fs::remove_dir_all(&work);
     stage_result?;
+    Ok(manifest.version.clone())
+}
 
-    let mut st = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    st.ready = Some(manifest.version.clone());
-    st.ready_notes = manifest.notes.clone();
-    st.error = None;
-    Ok(Some(manifest.version))
+/// Downloads and stages the currently available UI bundle (if not already staged).
+pub fn download_and_stage_available(app_dir: &Path) -> Result<String, String> {
+    if let Some(staged) = staged_receipt(app_dir) {
+        let avail = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).available.clone();
+        match avail {
+            None => return Ok(staged.version),
+            Some(m) if m.version == staged.version && m.sha256.eq_ignore_ascii_case(&staged.sha256) => {
+                return Ok(staged.version);
+            }
+            _ => {}
+        }
+    }
+    let manifest = STATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .available
+        .clone()
+        .ok_or_else(|| "no UI update available".to_owned())?;
+    stage_manifest(app_dir, &manifest)
+}
+
+pub fn has_staged(app_dir: &Path) -> bool {
+    staged_receipt(app_dir).is_some()
+}
+
+/// Checks `<releases>/ui/latest.json`, verifies compatibility & sha256, and stages the bundle.
+/// Returns `Ok(Some(version))` when a newer compatible UI bundle is staged and ready to apply.
+pub fn check_from(app_dir: &Path, releases: &str) -> Result<Option<String>, String> {
+    let Some(manifest) = check_manifest_from(app_dir, releases)? else {
+        return Ok(None);
+    };
+    let ver = stage_manifest(app_dir, &manifest)?;
+    Ok(Some(ver))
 }
 
 fn validate_unpacked_tree(root: &Path) -> Result<(), String> {
@@ -457,6 +508,7 @@ pub fn apply_staged(app_dir: &Path) -> Result<AppliedUi, String> {
     let mut st = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     st.ready = None;
     st.ready_notes = None;
+    st.available = None;
     st.applying = false;
     st.error = None;
     Ok(AppliedUi {
@@ -495,6 +547,7 @@ pub fn rollback(app_dir: &Path, failed_version: &str, reason: &str) -> Result<()
     let mut st = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     st.ready = None;
     st.ready_notes = None;
+    st.available = None;
     st.applying = false;
     st.error = Some(format!("UI update {failed_version} rolled back: {reason}"));
     Ok(())

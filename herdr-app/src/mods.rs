@@ -516,6 +516,10 @@ pub enum Request {
     ReloadMods,
     /// Apply a staged OTA UI bundle live (without restarting the window).
     ApplyUiBundle,
+    /// Apply a staged Herdr2 app update and relaunch.
+    ApplyAppUpdate,
+    /// Show an update status toast notification from a background worker.
+    UpdateToast { title: String, body: String, level: String },
     /// From `herdr-app do` / `herdr-app status` (control.rs); answer on `reply`.
     Control { cmd: Value, reply: std::sync::mpsc::Sender<Value> },
 }

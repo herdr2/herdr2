@@ -1395,7 +1395,10 @@ fn settings_sections_and_updates(cx: &mut TestAppContext) {
     let mut p = props();
     p["section"] = json!("updates");
     let up = describe(cx, &staged, "frame/settings", true, p, updates("ready", "ready"), None).unwrap();
-    assert!(up.contains("st-save-releases-url") && up.contains("st-app-update"), "updates section should render self-hosted release server controls: {up}");
+    assert!(
+        up.contains("st-check-updates") && up.contains("st-releases-url") && !up.contains("st-ui-mode-auto") && !up.contains("st-gh-releases-url"),
+        "updates section should render only simplified check button and URL input: {up}"
+    );
     let mut p = props();
     p["section"] = json!("privacy");
     let fallback = describe(cx, &staged, "frame/settings", true, p, updates("current", "current"), None).unwrap();

@@ -9439,34 +9439,38 @@ impl AppWindow {
             }
             "app.check_updates" => {
                 crate::update::check_now();
+                self.update_ready = Self::update_label();
+                self.update_status = crate::update::status().to_string();
+                self.refresh_mods(cx);
+                cx.notify();
                 return;
             }
             "app.apply_ui_update" => {
-                self.apply_ui_bundle_live(window, cx);
+                if crate::ui_update::has_staged(&mods::app_dir()) {
+                    self.apply_ui_bundle_live(window, cx);
+                } else {
+                    crate::update::start_ui_update();
+                    self.update_ready = Self::update_label();
+                    self.update_status = crate::update::status().to_string();
+                    self.refresh_mods(cx);
+                    cx.notify();
+                }
                 return;
             }
             "app.update" => {
-                let deadline = std::time::Instant::now() + Duration::from_millis(250);
-                self.drain_documents(window, cx);
-                self.close_mods_now(deadline, window, cx);
-                crate::place::save(window, cx);
-                mods::finish_shared();
-                match crate::update::apply() {
-                    Ok(true) => {
-                        crate::update::relaunch();
-                        cx.quit();
-                    }
-                    Ok(false) => {
-                        self.fail("no staged app update ready");
-                    }
-                    Err(e) => {
-                        self.fail(format!("cannot apply update: {e}"));
-                    }
-                }
+                crate::update::start_update();
+                self.update_ready = Self::update_label();
+                self.update_status = crate::update::status().to_string();
+                self.refresh_mods(cx);
+                cx.notify();
                 return;
             }
             "app.update_core" => {
                 crate::update::update_core();
+                self.update_ready = Self::update_label();
+                self.update_status = crate::update::status().to_string();
+                self.refresh_mods(cx);
+                cx.notify();
                 return;
             }
             "app.theme" => {
@@ -10093,7 +10097,12 @@ impl AppWindow {
             Request::CloseOverlay { id } => self.close_overlay(&id, window, cx),
             Request::SetWindowTitle(title) => window.set_window_title(title.as_deref().unwrap_or("Herdr2")),
             Request::SetBadge(text) => crate::badge::set(text.as_deref()),
-            Request::Refresh => self.refresh_mods(cx),
+            Request::Refresh => {
+                self.update_ready = Self::update_label();
+                self.update_status = crate::update::status().to_string();
+                self.refresh_mods(cx);
+                cx.notify();
+            }
             Request::ReloadMods => {
                 self.folders = mods::scan().into_iter().map(|f| (f.id.clone(), f)).collect();
                 self.reload_config(window, cx);
@@ -10101,6 +10110,17 @@ impl AppWindow {
                 self.restart_mods(window, cx);
             }
             Request::ApplyUiBundle => self.apply_ui_bundle_live(window, cx),
+            Request::ApplyAppUpdate => self.apply_app_update_now(window, cx),
+            Request::UpdateToast { title, body, level } => {
+                let note = json!({
+                    "title": title,
+                    "body": body,
+                    "level": level,
+                    "timeout": if level == "error" { 8000 } else { 5000 },
+                });
+                self.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": note }), window, cx);
+                cx.notify();
+            }
             Request::Control { cmd, reply } => {
                 let _ = reply.send(self.control(cmd, window, cx));
             }
@@ -11057,7 +11077,32 @@ impl AppWindow {
         cx.notify();
     }
 
+    fn apply_app_update_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let deadline = std::time::Instant::now() + Duration::from_millis(250);
+        self.drain_documents(window, cx);
+        self.close_mods_now(deadline, window, cx);
+        crate::place::save(window, cx);
+        mods::finish_shared();
+        match crate::update::apply() {
+            Ok(true) => {
+                crate::update::relaunch();
+                cx.quit();
+            }
+            Ok(false) => {
+                crate::update::clear_app_updating();
+                self.fail("no staged app update ready");
+            }
+            Err(e) => {
+                crate::update::clear_app_updating();
+                self.fail(format!("cannot apply update: {e}"));
+            }
+        }
+    }
+
     fn update_label() -> Option<String> {
+        if crate::update::is_updating() {
+            return Some("updating".into());
+        }
         if let Some(ver) = crate::update::ready() {
             return Some(format!("app:{ver}"));
         }
@@ -11091,20 +11136,44 @@ impl AppWindow {
             return None;
         }
         let zh = self.person.language == settings::Language::ZhCn;
+        if key == "updating" {
+            return Some(
+                div()
+                    .absolute()
+                    .right(settings::z(16.0))
+                    .bottom(settings::z(16.0))
+                    .h(settings::z(UPDATE_PILL_HEIGHT))
+                    .px(settings::z(12.0))
+                    .rounded(settings::z(17.0))
+                    .bg(c("accent"))
+                    .text_color(c("accent_foreground"))
+                    .shadow_lg()
+                    .flex()
+                    .items_center()
+                    .occlude()
+                    .child(
+                        div()
+                            .text_size(settings::z(12.5))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(if zh { "正在更新…" } else { "Updating…" }),
+                    )
+                    .into_any_element(),
+            );
+        }
         let (label, action): (String, &'static str) = if let Some(ver) = key.strip_prefix("app:") {
             (
-                if zh { format!("重启更新 v{ver}") } else { format!("Restart to update v{ver}") },
+                if zh { format!("更新 v{ver}") } else { format!("Update v{ver}") },
                 "app.update",
             )
         } else if let Some(ver) = key.strip_prefix("ui:") {
             (
-                if zh { format!("热更新 UI v{ver}（免重启）") } else { format!("Hot-update UI v{ver}") },
-                "app.apply_ui_update",
+                if zh { format!("更新 v{ver}") } else { format!("Update v{ver}") },
+                "app.update",
             )
         } else if let Some(ver) = key.strip_prefix("core:") {
             (
-                if zh { format!("更新 Core v{ver}") } else { format!("Update Core v{ver}") },
-                "app.update_core",
+                if zh { format!("更新 v{ver}") } else { format!("Update v{ver}") },
+                "app.update",
             )
         } else {
             return None;
