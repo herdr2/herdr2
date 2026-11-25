@@ -6,7 +6,6 @@
 
 ## 1. 什么是无头 ACP 智能体？
 
-在普通终端里运行 AI 编程 CLI 时，输出往往混杂着旋转动画、ANSI 控制符与不可解析的确认弹窗。
 
 Herdr2 引入了 **ACP（Agent Client Protocol v1）无头运行时**：
 - **纯结构化 NDJSON 通信**：`h2` 通过标准输入/输出直接与 Agent 交换结构化 JSON-RPC 消息（文本块、工具调用卡片、图片/文件附件、配置选项、权限请求），**不分配 PTY，不注入任何 `TERM*` 环境变量**，彻底杜绝终端控制符污染。
@@ -162,4 +161,4 @@ Herdr2 内置了标准 MCP 服务器 **`h2 mcp`**。当 `inject_mcp = true`（�
 
 ---
 
-**上一篇**：[← 02. 工作区、终端与代码面板](./02-workspaces-and-terminals.md) ｜ **下一篇**：[04. 上下文接力、快照回滚与全局 AI 助手 →](./04-handoff-checkpoints-and-ai.md)
+**上一篇**：[← 02. 工作区、终端与代码面板](./02-workspaces-and-terminals.md) ｜ **下一篇**：[04. 全局 Core AI、润色输入、接力与快照 →](./04-handoff-checkpoints-and-ai.md)

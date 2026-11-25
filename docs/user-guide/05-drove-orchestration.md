@@ -113,4 +113,4 @@ Drove 内置了一套轻量、零侵入的只读 Web 监控面板（默认监听
 
 ---
 
-**上一篇**：[← 04. 上下文接力、快照回滚与全局 AI 助手](./04-handoff-checkpoints-and-ai.md) ｜ **下一篇**：[06. 远程主机、深度定制与自动化自检 →](./06-remote-customization-and-qa.md)
+**上一篇**：[← 04. 全局 Core AI、润色输入、接力与快照](./04-handoff-checkpoints-and-ai.md) ｜ **下一篇**：[06. 远程主机、深度定制与自动化自检 →](./06-remote-customization-and-qa.md)

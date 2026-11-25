@@ -38,6 +38,7 @@ Herdr2 将日常研发上下文划分为清晰的三层结构：
 | 缩放/还原当前窗格 | `Ctrl+Shift+Z` | `pane.zoom` |
 | 关闭当前窗格 | `Ctrl+Shift+X` | `pane.close` |
 | 终端内搜索 / 复制 / 粘贴 | `Ctrl+Shift+F` / `Ctrl+Shift+C` / `Ctrl+Shift+V` | `terminal.search` / `copy` / `paste` |
+| AI 润色输入 / 反悔恢复原稿 | `Ctrl+Alt+P` / `Ctrl+Alt+U`（macOS 用 `Cmd`） | `prompt.polish` / `prompt.polish_undo` |
 | 折叠/展开左侧边栏 | `Ctrl+Shift+B` | `layout.toggle` (`sidebar`) |
 | 命令面板 / 设置 / 快捷键帮助 | `Ctrl+Shift+P` / `Ctrl+,` / `Ctrl+Shift+/` | `app.palette` / `app.settings` / `app.help` |
 
