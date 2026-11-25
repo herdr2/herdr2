@@ -279,7 +279,7 @@ export default class Menu extends View {
     const it = items(props(), this.git)[i];
     if (!it) return;
     closeOverlay(props()?.overlay);
-    if (it[1] === "worktree") openOverlay({ mod: "worktree", kind: "dialog", ...(it[2].action === "open" ? { width: 560, height: 480 } : { width: 440, height: 260 }), props: it[2] });
+    if (it[1] === "worktree") openOverlay({ mod: "worktree", kind: "dialog", ...(it[2].action === "open" ? { width: 560, height: 480 } : it[2].action === "remove" ? { width: 460 } : { width: 440, height: 260 }), props: it[2] });
     else if (it[1] === "acp.config") Promise.resolve(h2(["config", "--json", it[2].terminal, "--id", it[2].id, "--value", String(it[2].value)])).catch(() => {});
     else run(it[1], it[2]);
   }

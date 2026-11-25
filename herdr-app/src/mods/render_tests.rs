@@ -1578,6 +1578,27 @@ fn local_state_and_overlay_initial_descriptions(cx: &mut TestAppContext) {
         p.as_object_mut().unwrap().extend(patch.as_object().unwrap().clone());
         describe(cx, &staged, entry, true, p, updates("current", "current"), None).unwrap();
     }
+    let mut wt_remove_props = props();
+    wt_remove_props
+        .as_object_mut()
+        .unwrap()
+        .extend(json!({"space":"s1","action":"remove"}).as_object().unwrap().clone());
+    let wt_remove_tree = describe(
+        cx,
+        &staged,
+        "mods/worktree",
+        true,
+        wt_remove_props,
+        updates("current", "current"),
+        Some(
+            "this.repo = { top: '/home/u/.herdr/worktrees/repo/feat-demo', main: '/home/u/repo', name: 'repo', linked: true }; this.branch = 'feat/demo'; this.branchUnmerged = true; this.deleteBranch = true;",
+        ),
+    )
+    .unwrap();
+    assert!(
+        wt_remove_tree.contains("Also delete local branch") && wt_remove_tree.contains("feat/demo") && wt_remove_tree.contains("Unmerged"),
+        "worktree remove dialog must render branch deletion toggle: {wt_remove_tree}"
+    );
     eprintln!("18 local-state/overlay cases, each twice: {:?}", start.elapsed());
 }
 

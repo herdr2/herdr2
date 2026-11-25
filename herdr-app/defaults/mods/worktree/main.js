@@ -151,6 +151,12 @@ async function submodules(top, on) {
   return { mods, unpushed };
 }
 
+function withAlpha(color, alphaHex) {
+  if (typeof color !== "string") return null;
+  const c = color.trim();
+  return /^#[0-9a-fA-F]{6}$/.test(c) ? `${c}${alphaHex}` : null;
+}
+
 // The repo a folder belongs to: its main checkout and name, and whether
 // the folder is itself a linked worktree. null outside git.
 async function repoOf(folder, on) {
@@ -159,6 +165,28 @@ async function repoOf(folder, on) {
   if (!top.ok || !common.ok) return null;
   const main = common.out.endsWith("/.git") ? common.out.slice(0, -5) : common.out;
   return { top: top.out, main, name: main.split("/").pop(), linked: main !== top.out };
+}
+
+// Local branch currently checked out in a worktree (if it exists as a ref), else null.
+async function currentBranch(repo, on) {
+  const head = await git(repo.top, ["symbolic-ref", "--quiet", "--short", "HEAD"], on);
+  if (!head.ok || !head.out) return null;
+  const exists = await git(repo.main, ["show-ref", "--verify", "--quiet", `refs/heads/${head.out}`], on);
+  return exists.ok ? head.out : null;
+}
+
+// True when `branch` has commits not yet merged into the main checkout's HEAD or its upstream.
+async function isBranchUnmerged(repoMain, branch, on) {
+  if (!branch) return false;
+  const ref = `refs/heads/${branch}`;
+  const inHead = await git(repoMain, ["merge-base", "--is-ancestor", ref, "HEAD"], on);
+  if (inHead.ok) return false;
+  const upstream = await git(repoMain, ["rev-parse", "--verify", "--quiet", `${branch}@{upstream}`], on);
+  if (upstream.ok && upstream.out) {
+    const inUpstream = await git(repoMain, ["merge-base", "--is-ancestor", ref, upstream.out], on);
+    if (inUpstream.ok) return false;
+  }
+  return true;
 }
 
 export default class Worktree extends View {
@@ -184,6 +212,10 @@ export default class Worktree extends View {
     this.repo = undefined; // undefined: looking, null: not in git
     this.dirty = false;
     this.unpushed = [];
+    this.branch = null;
+    this.deleteBranch = Boolean(props()?.deleteBranch);
+    this.branchUnmerged = false;
+    this.worktreeRemoved = false;
     cx.spawn(async (cx) => {
       try {
         if (this.on) {
@@ -200,6 +232,11 @@ export default class Worktree extends View {
         if (repo && props().action === "remove") {
           this.dirty = (await git(repo.top, ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain"], this.on)).out !== "";
           this.unpushed = (await submodules(repo.top, this.on)).unpushed;
+          if (repo.linked) {
+            this.branch = await currentBranch(repo, this.on);
+            if (this.branch) this.branchUnmerged = await isBranchUnmerged(repo.main, this.branch, this.on);
+            else this.deleteBranch = false;
+          }
         }
         if (repo && this.opening) this.list = await checkouts(repo, this.on);
         this.repo = repo;
@@ -223,8 +260,16 @@ export default class Worktree extends View {
     closeOverlay(props().overlay);
   }
 
+  toggleDeleteBranch(cx) {
+    if (this.busy || !this.repo?.linked || !this.branch) return;
+    this.deleteBranch = !this.deleteBranch;
+    this.error = "";
+    cx?.notify?.();
+  }
+
   go(cx) {
     if (this.busy || !this.repo) return;
+    if (props()?.action === "remove" && !this.repo.linked) return;
     cx.spawn(async (cx) => this.work(cx));
   }
 
@@ -251,6 +296,7 @@ export default class Worktree extends View {
 
   async work(cx) {
     if (this.busy || !this.repo) return;
+    if (props()?.action === "remove" && !this.repo.linked) return;
     this.busy = true;
     this.error = "";
     cx.notify();
@@ -290,21 +336,64 @@ export default class Worktree extends View {
 
   async remove() {
     const s = this.space();
-    const status = await git(this.repo.top, ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain"], this.on);
-    if (!status.ok) return status.err || "git status failed.";
-    // git refuses a worktree with submodules unless forced, because their
-    // history goes with it. The popup already showed what's at risk; only
-    // risk that appeared since it opened gets one more warning.
-    const { mods, unpushed } = await submodules(this.repo.top, this.on);
-    const changed = (status.out && !this.dirty) || unpushed.some((name) => !this.unpushed.includes(name));
-    this.dirty ||= status.out !== "";
-    this.unpushed = [...new Set([...this.unpushed, ...unpushed])];
-    if (changed) return "It changed since this opened. Enter again removes it anyway.";
-    // Terminals first: a shell sitting in the folder keeps it busy on Windows.
-    run("space.close", { id: s.id, confirmed: true });
-    const force = this.dirty || mods.length > 0;
-    const r = await git(this.repo.main, ["worktree", "remove", ...(force ? ["--force"] : []), this.repo.top], this.on, 600_000);
-    return r.ok ? "" : r.err || "git worktree remove failed.";
+    if (!this.worktreeRemoved) {
+      const status = await git(this.repo.top, ["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain"], this.on);
+      if (!status.ok) return status.err || tr("git status failed.", "git status 执行失败。");
+      // git refuses a worktree with submodules unless forced, because their
+      // history goes with it. The popup already showed what's at risk; only
+      // risk that appeared since it opened gets one more warning.
+      const { mods, unpushed } = await submodules(this.repo.top, this.on);
+      let changed = (status.out && !this.dirty) || unpushed.some((name) => !this.unpushed.includes(name));
+      this.dirty ||= status.out !== "";
+      this.unpushed = [...new Set([...this.unpushed, ...unpushed])];
+      const liveBranch = await currentBranch(this.repo, this.on);
+      if (liveBranch !== this.branch) {
+        const hadDelete = this.deleteBranch;
+        this.branch = liveBranch;
+        if (!this.branch) {
+          this.deleteBranch = false;
+          this.branchUnmerged = false;
+        } else {
+          this.branchUnmerged = await isBranchUnmerged(this.repo.main, this.branch, this.on);
+        }
+        if (hadDelete || liveBranch) changed = true;
+      } else if (this.deleteBranch && this.branch) {
+        const unmergedNow = await isBranchUnmerged(this.repo.main, this.branch, this.on);
+        if (unmergedNow && !this.branchUnmerged) {
+          this.branchUnmerged = true;
+          changed = true;
+        }
+      }
+      if (changed) {
+        return tr(
+          "It changed since this opened. Confirm again to remove it anyway.",
+          "打开后工作树状态已变化，请再次确认以继续移除。",
+        );
+      }
+      // Terminals first: a shell sitting in the folder keeps it busy on Windows.
+      if (s?.id) run("space.close", { id: s.id, confirmed: true });
+      const force = this.dirty || mods.length > 0;
+      const r = await git(this.repo.main, ["worktree", "remove", ...(force ? ["--force"] : []), this.repo.top], this.on, 600_000);
+      if (!r.ok) return r.err || tr("git worktree remove failed.", "git worktree remove 执行失败。");
+      this.worktreeRemoved = true;
+    }
+    if (this.deleteBranch && this.branch) {
+      const flag = this.branchUnmerged ? "-D" : "-d";
+      const del = await git(this.repo.main, ["branch", flag, "--", this.branch], this.on);
+      if (!del.ok) {
+        if (!this.branchUnmerged && /not fully merged/i.test(del.err)) {
+          this.branchUnmerged = true;
+          return tr(
+            `Worktree removed, but branch "${this.branch}" is not fully merged. Confirm again to force-delete it, or press Esc to keep it.`,
+            `工作树已移除，但分支「${this.branch}」尚未完全合并。再次确认将强制删除该分支，或按 Esc 保留。`,
+          );
+        }
+        return del.err
+          ? tr(`Worktree removed, but failed to delete branch "${this.branch}": ${del.err}`, `工作树已移除，但删除分支「${this.branch}」失败：${del.err}`)
+          : tr(`Worktree removed, but failed to delete branch "${this.branch}".`, `工作树已移除，但删除分支「${this.branch}」失败。`);
+      }
+    }
+    return "";
   }
 
   key(e, cx) {
@@ -317,7 +406,16 @@ export default class Worktree extends View {
       cx.stop_propagation();
       return cx.notify();
     }
-    if (e.key === "enter" && props()?.action === "remove") return this.go(cx);
+    if (props()?.action === "remove") {
+      if (e.key === "enter") {
+        cx.stop_propagation();
+        return this.go(cx);
+      }
+      if ((e.key === "space" || e.key === " ") && !this.busy && this.repo?.linked && this.branch) {
+        cx.stop_propagation();
+        return this.toggleDeleteBranch(cx);
+      }
+    }
   }
 
   renderOpen(t) {
@@ -386,24 +484,285 @@ export default class Worktree extends View {
       .child(h_flex().justify_end().text_size(11).text_color(t.dim).child("\u2191\u2193 choose \u00b7 \u21b5 open \u00b7 esc close"));
   }
 
-  render(cx) {
-    const t = theme();
-    if (this.opening) return this.renderOpen(t);
-    const remove = props()?.action === "remove";
+  renderRemove(t) {
     const s = this.space();
     const r = this.repo;
-    const title = remove ? `Remove worktree ${s?.name ?? ""}?` : `New worktree${r ? ` of ${r.name}` : ""}`;
+    const userHome = this.userHome ?? "";
+    const blocked = !r || !r.linked;
+    const dangerBg = t.danger ?? t.blocked ?? "#dc2626";
+    const accentBg = t.accent ?? t.solid ?? "#2563eb";
+    const toggleAccent = this.branchUnmerged ? dangerBg : accentBg;
+    const title = s?.name
+      ? tr(`Remove worktree ${s.name}?`, `移除工作树「${s.name}」？`)
+      : tr("Remove worktree?", "移除工作树？");
     const detail =
       r === undefined
         ? "…"
         : r === null
-          ? `${this.folder ? tilde(this.folder, this.userHome) : "This folder"} is not in a git repository.`
-          : remove
-            ? !r.linked
-              ? "This is the repository's main checkout, not a worktree."
-              : `Closes the space and deletes ${tilde(r.top, this.userHome)}. The branch stays.`
-            : `A new space on a checkout in ${tilde(this.root, this.userHome)}/${r.name}/. A branch that exists is checked out; a new one starts from here.`;
-    const blocked = !r || (remove && !r.linked);
+          ? tr(
+              `${this.folder ? tilde(this.folder, userHome) : "This folder"} is not in a git repository.`,
+              `${this.folder ? tilde(this.folder, userHome) : "该目录"} 不在 Git 仓库中。`,
+            )
+          : !r.linked
+            ? tr("This is the repository's main checkout, not a worktree.", "这是仓库的主检出目录，不是工作树。")
+            : this.worktreeRemoved
+              ? tr(`Worktree ${tilde(r.top, userHome)} has already been removed.`, `工作树 ${tilde(r.top, userHome)} 已移除。`)
+              : this.branch
+                ? this.deleteBranch
+                  ? tr(
+                      `Closes the space, deletes ${tilde(r.top, userHome)}, and deletes local branch "${this.branch}".`,
+                      `关闭工作区、删除 ${tilde(r.top, userHome)}，并同步删除本地分支「${this.branch}」。`,
+                    )
+                  : tr(
+                      `Closes the space and deletes ${tilde(r.top, userHome)}. Local branch "${this.branch}" will be kept.`,
+                      `关闭工作区并删除 ${tilde(r.top, userHome)}，本地分支「${this.branch}」将被保留。`,
+                    )
+                : tr(
+                    `Closes the space and deletes ${tilde(r.top, userHome)}. HEAD is detached, so no local branch is affected.`,
+                    `关闭工作区并删除 ${tilde(r.top, userHome)}（当前处于游离 HEAD，无关联本地分支）。`,
+                  );
+
+    const confirmLabel = this.worktreeRemoved
+      ? this.deleteBranch && this.branch
+        ? this.branchUnmerged
+          ? tr("Force delete branch", "强制删除分支")
+          : tr("Delete branch", "删除分支")
+        : tr("Done", "完成")
+      : this.deleteBranch && this.branch
+        ? tr("Remove & delete branch", "移除并删除分支")
+        : tr("Remove worktree", "移除工作树");
+
+    const cancelLabel = blocked || (this.worktreeRemoved && !this.deleteBranch)
+      ? tr("Close", "关闭")
+      : tr("Cancel", "取消");
+
+    const button = (id, label, bg, fg, borderColor, onClick) =>
+      h_flex()
+        .id(id)
+        .h(32)
+        .px(14)
+        .items_center()
+        .rounded(8)
+        .border_1()
+        .border_color(borderColor)
+        .bg(bg)
+        .text_size(12)
+        .text_color(fg)
+        .cursor_pointer()
+        .hover((st) => st.opacity(0.88))
+        .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+        .on_click(onClick)
+        .child(label);
+
+    return v_flex()
+      .id("worktree")
+      .track_focus(this.handle)
+      .on_key_down((e, cx) => this.key(e, cx))
+      .w_full()
+      .min_w(0)
+      .p(18)
+      .gap(12)
+      .rounded(8)
+      .bg(t.popover)
+      .text_size(13)
+      .child(
+        h_flex()
+          .w_full()
+          .min_w(0)
+          .items_center()
+          .gap(8)
+          .child(div().flex_1().min_w(0).text_size(15).font_semibold().text_color(t.foreground).child(title))
+          .child(div().flex_none().text_size(11).text_color(t.dim).child("Esc")),
+      )
+      .child(div().w_full().min_w(0).whitespace_normal().line_height("20px").text_color(t.muted).child(detail))
+      .when(!this.worktreeRemoved && this.dirty, (el) =>
+        el.child(
+          div()
+            .w_full()
+            .min_w(0)
+            .whitespace_normal()
+            .text_color(t.blocked)
+            .child(tr("It has uncommitted changes: they will be lost.", "工作树存在未提交的修改，移除后将会丢失。")),
+        ),
+      )
+      .when(!this.worktreeRemoved && this.unpushed.length > 0, (el) =>
+        el.child(
+          div()
+            .w_full()
+            .min_w(0)
+            .whitespace_normal()
+            .text_color(t.blocked)
+            .child(
+              tr(
+                `Submodule ${this.unpushed.join(", ")} has commits that aren't pushed anywhere: they will be lost.`,
+                `子模块 ${this.unpushed.join(", ")} 存在未推送的提交，移除后将会丢失。`,
+              ),
+            ),
+        ),
+      )
+      .when(!blocked && Boolean(this.branch), (el) =>
+        el.child(
+          h_flex()
+            .id("wt-delete-branch")
+            .w_full()
+            .min_w(0)
+            .px(10)
+            .py(8)
+            .gap(10)
+            .items_start()
+            .rounded(8)
+            .border_1()
+            .border_color(this.deleteBranch ? toggleAccent : t.border)
+            .bg(this.deleteBranch ? (withAlpha(toggleAccent, "14") ?? t.raised) : t.raised)
+            .cursor_pointer()
+            .hover((st) => st.bg(t.hover))
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_click((_e, cx) => {
+              cx.stop_propagation();
+              this.toggleDeleteBranch(cx);
+            })
+            .child(
+              div()
+                .mt(1)
+                .w(15)
+                .h(15)
+                .flex_none()
+                .rounded(4)
+                .border_1()
+                .border_color(this.deleteBranch ? toggleAccent : (t.input ?? t.border))
+                .bg(this.deleteBranch ? toggleAccent : t.background)
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_size(10)
+                .font_bold()
+                .text_color("#ffffff")
+                .child(this.deleteBranch ? "✓" : ""),
+            )
+            .child(
+              v_flex()
+                .flex_1()
+                .min_w(0)
+                .gap(3)
+                .child(
+                  h_flex()
+                    .w_full()
+                    .min_w(0)
+                    .items_center()
+                    .flex_wrap()
+                    .gap(6)
+                    .child(
+                      div()
+                        .min_w(0)
+                        .whitespace_normal()
+                        .text_size(12.5)
+                        .font_semibold()
+                        .text_color(t.foreground)
+                        .child(tr(`Also delete local branch "${this.branch}"`, `同步删除本地分支「${this.branch}」`)),
+                    )
+                    .when(this.branchUnmerged, (badgeEl) =>
+                      badgeEl.child(
+                        div()
+                          .flex_none()
+                          .px(5)
+                          .py(1)
+                          .rounded(4)
+                          .bg("#f59e0b22")
+                          .border_1()
+                          .border_color("#f59e0b55")
+                          .text_size(10)
+                          .font_semibold()
+                          .text_color("#f59e0b")
+                          .child(tr("Unmerged", "未合并")),
+                      ),
+                    ),
+                )
+                .child(
+                  div()
+                    .w_full()
+                    .min_w(0)
+                    .whitespace_normal()
+                    .line_height("16px")
+                    .text_size(11)
+                    .text_color(this.branchUnmerged && this.deleteBranch ? t.blocked : t.muted)
+                    .child(
+                      this.branchUnmerged
+                        ? tr(
+                            "Has unmerged commits — checking this will force-delete (-D) and lose unmerged branch history.",
+                            "包含未合并提交 — 勾选后将强制删除（-D），未合并分支历史可能丢失。",
+                          )
+                        : tr(
+                            "Deletes the local branch after removing the worktree (remote branches are not affected).",
+                            "移除工作树后同步删除本地分支（不影响远程分支）。",
+                          ),
+                    ),
+                ),
+            ),
+        ),
+      )
+      .when(Boolean(this.error), (el) =>
+        el.child(div().w_full().min_w(0).whitespace_normal().text_color(t.blocked).child(this.error)),
+      )
+      .child(
+        h_flex()
+          .w_full()
+          .items_center()
+          .justify_between()
+          .flex_wrap()
+          .gap(8)
+          .pt(2)
+          .child(
+            h_flex()
+              .items_center()
+              .gap(6)
+              .text_size(11)
+              .text_color(t.dim)
+              .when(this.busy, (el) => el.child(div().frames(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], 90)))
+              .child(
+                this.busy
+                  ? tr("Working…", "处理中…")
+                  : blocked
+                    ? tr("Esc close", "Esc 关闭")
+                    : this.branch
+                      ? tr("Space toggle branch · ↵ confirm", "空格 切换删分支 · ↵ 确认")
+                      : tr("↵ remove · Esc cancel", "↵ 移除 · Esc 取消"),
+              ),
+          )
+          .child(
+            h_flex()
+              .items_center()
+              .gap(8)
+              .child(
+                button("wt-cancel", cancelLabel, t.raised, t.foreground, t.input ?? t.border, (_e, cx) => {
+                  cx.stop_propagation();
+                  this.close();
+                }),
+              )
+              .when(!blocked && !this.busy, (el) =>
+                el.child(
+                  button("wt-confirm", confirmLabel, dangerBg, "#ffffff", dangerBg, (_e, cx) => {
+                    cx.stop_propagation();
+                    this.go(cx);
+                  }),
+                ),
+              ),
+          ),
+      );
+  }
+
+  render(cx) {
+    const t = theme();
+    if (this.opening) return this.renderOpen(t);
+    if (props()?.action === "remove") return this.renderRemove(t);
+    const r = this.repo;
+    const title = `New worktree${r ? ` of ${r.name}` : ""}`;
+    const detail =
+      r === undefined
+        ? "…"
+        : r === null
+          ? `${this.folder ? tilde(this.folder, this.userHome ?? "") : "This folder"} is not in a git repository.`
+          : `A new space on a checkout in ${tilde(this.root, this.userHome ?? "")}/${r.name}/. A branch that exists is checked out; a new one starts from here.`;
+    const blocked = !r;
     return v_flex()
       .id("worktree")
       .track_focus(this.handle)
@@ -415,9 +774,7 @@ export default class Worktree extends View {
       .text_size(13)
       .child(div().font_semibold().text_color(t.foreground).child(title))
       .child(div().text_color(t.muted).child(detail))
-      .when(remove && this.dirty, (el) => el.child(div().text_color(t.blocked).child("It has uncommitted changes: they will be lost.")))
-      .when(remove && this.unpushed.length > 0, (el) => el.child(div().text_color(t.blocked).child(`Submodule ${this.unpushed.join(", ")} has commits that aren't pushed anywhere: they will be lost.`)))
-      .when(!remove && !blocked, (el) =>
+      .when(!blocked, (el) =>
         el.child(
           h_flex()
             .gap(6)
@@ -469,7 +826,7 @@ export default class Worktree extends View {
           .text_color(t.dim)
           .gap(6)
           .when(this.busy, (el) => el.child(div().frames(["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"], 90)))
-          .child(this.busy ? "working…" : blocked ? "esc close" : remove ? "↵ remove · esc cancel" : "↵ create · esc cancel"),
+          .child(this.busy ? "working…" : blocked ? "esc close" : "↵ create · esc cancel"),
       );
   }
 }
