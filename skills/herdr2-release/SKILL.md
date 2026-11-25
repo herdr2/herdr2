@@ -108,7 +108,8 @@ git push github refs/tags/vX.Y.Z
      --jq '.jobs[] | {name, status, conclusion, started_at, completed_at, id, current_step: [.steps[] | select(.status=="in_progress") | .name]}'
    ```
 3. **Known CI Characteristics & Recovery Playbook**:
-   - **Expected durations**: `ubuntu-latest` ~20–22m, `windows-latest` ~22–28m, `macos-15-intel` (cross-compiling `--target aarch64-apple-darwin` to avoid GitHub `macos-latest`/`macos-15` arm64 pool 15-minute capacity timeouts) ~35–65m depending on Intel host load.
+   - **Expected durations**: `ubuntu-24.04` ~20–22m, `windows-latest` ~22–28m, `macos-15-intel` (cross-compiling `--target aarch64-apple-darwin` to avoid GitHub `macos-latest`/`macos-15` arm64 pool 15-minute capacity timeouts) ~35–65m depending on Intel host load.
+   - **Linux GLIBC compatibility**: Keep Linux build jobs pinned to `ubuntu-24.04` (glibc 2.39). Do NOT use `ubuntu-latest` for Linux builds — GitHub migrated `ubuntu-latest` to Ubuntu 26.04 (glibc 2.43), which produces `herdr2` binaries that fail on Ubuntu 24.04 LTS with `GLIBC_2.43 not found`.
    - **Do NOT cancel `Build herdr-core & herdr-app + macOS DMG` early**: slow Intel hosts can legitimately take 50–65 minutes to compile both Rust release workspaces + Zig Ghostty + GPUI + QuickJS JIT.
    - **Hung `mlugg/setup-zig@v2`**: If step `Run mlugg/setup-zig@v2` stays `in_progress` for >10 minutes, the Zig mirror download has stalled. Cancel the run (`gh run cancel <run-id> --repo herdr2/herdr2`), wait ~20–30s for `status: completed`, then run:
      ```bash
