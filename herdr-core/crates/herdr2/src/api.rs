@@ -271,6 +271,9 @@ methods! { Ctx<'_>;
     "ai.settings.set" => ai_settings_set, crate::ai::AiSettingsSetParams => crate::ai::AiStatus,
         "Update global Core AI Assistant settings, Core-level switches, and 0600 API key secret.",
         errors ["invalid_params", "machine_unknown", "unavailable"];
+    "ai.models" => ai_models, crate::ai::AiModelsParams => crate::ai::AiModelsResult,
+        "Fetch available model IDs from an OpenAI-compatible AI endpoint (/models) without running a chat completion.",
+        errors ["invalid_params", "machine_unknown", "unavailable"];
     "ai.test" => ai_test, crate::ai::AiTestParams => crate::ai::AiTestResult,
         "Test OpenAI-compatible AI endpoint connectivity and refresh discovered models.",
         errors ["invalid_params", "machine_unknown", "unavailable"];
@@ -1466,6 +1469,10 @@ async fn ai_settings_set(core: Ctx<'_>, p: crate::ai::AiSettingsSetParams) -> Re
     Ok(st)
 }
 
+async fn ai_models(core: Ctx<'_>, p: crate::ai::AiModelsParams) -> Result<crate::ai::AiModelsResult, RpcError> {
+    core.ai.list_models(p.base_url, p.api_key).await
+}
+
 async fn ai_test(core: Ctx<'_>, p: crate::ai::AiTestParams) -> Result<crate::ai::AiTestResult, RpcError> {
     core.ai.test_connection(p.base_url, p.api_key, p.model).await
 }
@@ -1691,7 +1698,19 @@ async fn ai_summarize_agent(
             Ok(result)
         }
         TargetKey::Terminal(id) => {
-            let (addr, program, status, turn, existing, orig_started_ms, live_title, snap, screen_fallback) = {
+            let (
+                addr,
+                program,
+                status,
+                raw_turn,
+                turn,
+                existing,
+                orig_started_ms,
+                live_title,
+                has_sent_prompts,
+                snap,
+                screen_fallback,
+            ) = {
                 let mut st = core.lock();
                 let t = st
                     .pty_reg
@@ -1727,9 +1746,23 @@ async fn ai_summarize_agent(
                     .map(|s| s.state.clone())
                     .or_else(|| p.status.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned))
                     .unwrap_or_else(|| "idle".into());
-                let turn = t.turn.max(1);
+                let raw_turn = t.turn;
+                let turn = raw_turn.max(1);
                 let existing = t.semantic_title.clone();
-                (addr, program, status, turn, existing, orig_started_ms, live_title, snap, screen_fallback)
+                let has_sent_prompts = !snap.sent_prompts.is_empty();
+                (
+                    addr,
+                    program,
+                    status,
+                    raw_turn,
+                    turn,
+                    existing,
+                    orig_started_ms,
+                    live_title,
+                    has_sent_prompts,
+                    snap,
+                    screen_fallback,
+                )
             };
             let (entries, _) = blocking(move || Ok(crate::pty_transcript::extract_transcript(&snap))).await?;
             let det = if !entries.is_empty() {
@@ -1754,6 +1787,20 @@ async fn ai_summarize_agent(
                     Some(&program),
                 )
             };
+            if entries.is_empty()
+                && raw_turn == 0
+                && !has_sent_prompts
+                && status == "idle"
+                && det.semantic_title.is_none()
+            {
+                return Ok(crate::ai::AgentDigestResult {
+                    address: addr,
+                    semantic_title: None,
+                    micro_summary: None,
+                    used_ai: false,
+                    from_cache: false,
+                });
+            }
             let result = if p.include_ai {
                 crate::ai::refine_agent_digest(
                     &core.ai,

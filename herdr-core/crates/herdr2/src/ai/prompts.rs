@@ -45,7 +45,7 @@ State taxonomy:
 Rules:
 - Distinguish actual prompts at the bottom from code snippets or documentation quoted earlier in the screen.
 - Keep `summary` under 20 characters (Chinese) or 40 characters (English), describing specifically what is awaited or failed; set null when `idle`/`done`.
-- Optionally include `semantic_title` (<= 12 Chinese chars or <= 24 English chars, short task name) and `micro_summary` (<= 42 Chinese chars or <= 90 English chars, 1-sentence current progress) when clearly visible from the screen; else null.
+- Optionally include `semantic_title` (<= 12 zh / <= 24 en chars) and `micro_summary` (<= 42 zh / <= 90 en chars) for an active task; null when `idle` on a welcome screen or "Recent activity" list.
 Output JSON: {"state":"working|blocked|done|error|idle","kind":"permission|question|auth|null","confidence":0.0,"summary":"...|null","semantic_title":"...|null","micro_summary":"...|null"}
 
 [OP: notes_digest]
@@ -138,7 +138,7 @@ Output JSON: {"suspect_turn":4,"confidence":0.0,"reason":"evidence-backed explan
 Purpose: Synthesize a concise semantic title reflecting the TRUE UNDERLYING INTENT of the user's recent few conversation turns, plus a one-sentence real-time progress micro-summary.
 Input fields: `program`, `status`, `recent_user_turns` (chronological recent user messages, oldest to newest), `recent_steps`, `existing_title`.
 Rules:
-- `semantic_title`: <= 12 Chinese chars or <= 24 English chars; distill the user's true goal/intent across the recent turns (especially the latest substantive turns), NOT a raw literal snippet, process name, file path, or trivial meta-command (such as "continue", "ok", "build & install", "run tests") when those merely advance the preceding task. When recent turns move to a new goal/topic, update `semantic_title` to match the new intent instead of clinging to `existing_title`.
+- `semantic_title`: <= 12 zh / <= 24 en chars; distill recent turns' true intent (not raw snippets, process/path/CLI launch args, or meta-commands like "continue"/"run tests"); update when topic shifts. Return `null` for both fields if `recent_user_turns` is empty and `recent_steps` only show a welcome screen or past sessions.
 - `micro_summary`: <= 42 Chinese chars or <= 90 English chars; factual current stage, latest result, or blocker based on `recent_steps`.
 Output JSON: {"semantic_title":"...","micro_summary":"..."}
 

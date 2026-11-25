@@ -17,8 +17,8 @@ use std::time::UNIX_EPOCH;
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_ENTRIES: usize = 2000;
 const MAX_BYTES: usize = 2 << 20;
-const MTIME_SLACK_MS: u64 = 15_000;
-const START_SLACK_MS: u64 = 10_000;
+const MTIME_SLACK_MS: u64 = 3_000;
+const START_SLACK_MS: u64 = 2_000;
 
 #[derive(Clone, Debug, Default)]
 pub struct PtySnapshot {
@@ -59,7 +59,16 @@ impl Provider {
     }
 }
 
-fn agy_cid_from_path(path: &Path) -> Option<String> {
+pub(crate) fn is_valid_agy_cid(raw: &str) -> bool {
+    let s = raw.trim();
+    !s.is_empty()
+        && !matches!(s, "transcript" | "transcript_full" | "logs" | ".system_generated")
+        && !s.contains('/')
+        && !s.contains('\\')
+        && !s.contains("..")
+}
+
+pub(crate) fn agy_cid_from_path(path: &Path) -> Option<String> {
     let logs = path.parent()?;
     if logs.file_name().and_then(|s| s.to_str()) != Some("logs") {
         return None;
@@ -72,7 +81,7 @@ fn agy_cid_from_path(path: &Path) -> Option<String> {
         .and_then(|p| p.file_name())
         .and_then(|s| s.to_str())
         .map(str::trim)
-        .filter(|s| !s.is_empty())
+        .filter(|s| is_valid_agy_cid(s))
         .map(str::to_string)
 }
 
@@ -156,6 +165,61 @@ pub fn snapshot_from_terminal(t: &Terminal, sent_prompts: Option<&Vec<(u64, u64,
     }
 }
 
+fn explicit_cli_session_id_from_argv(argv: &[String], agent_hint: Option<&str>) -> Option<String> {
+    let mut i = 0;
+    while i < argv.len() {
+        let arg = argv[i].as_str();
+        for flag in ["--conversation", "--session-id", "--resume", "-r"] {
+            if arg == flag {
+                if let Some(val) = argv.get(i + 1).map(String::as_str).map(str::trim)
+                    && !val.is_empty()
+                    && !val.starts_with('-')
+                    && (agent_hint != Some("agy") || is_valid_agy_cid(val))
+                {
+                    return Some(val.to_string());
+                }
+            } else if let Some(val) = arg.strip_prefix(&format!("{flag}=")).map(str::trim)
+                && !val.is_empty()
+                && !val.starts_with('-')
+                && (agent_hint != Some("agy") || is_valid_agy_cid(val))
+            {
+                return Some(val.to_string());
+            }
+        }
+        i += 1;
+    }
+    if agent_hint == Some("codex")
+        && let Some(pos) = argv.iter().position(|a| a == "resume")
+        && let Some(val) = argv.get(pos + 1).map(String::as_str).map(str::trim)
+        && !val.is_empty()
+        && !val.starts_with('-')
+    {
+        return Some(val.to_string());
+    }
+    None
+}
+
+fn terminal_known_session_id(t: &Terminal, hint: Option<&str>) -> Option<String> {
+    if let Some(fg) = &t.foreground
+        && let Some(sid) = explicit_cli_session_id_from_argv(&fg.argv, hint)
+    {
+        return Some(sid);
+    }
+    if let Some(saved) = &t.saved_cli
+        && let Some(sid) = saved.session_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        && (hint != Some("agy") || is_valid_agy_cid(sid))
+    {
+        return Some(sid.to_string());
+    }
+    if hint == Some("agy")
+        && let Some(pid) = t.foreground.as_ref().and_then(|f| u32::try_from(f.pid).ok())
+        && let ProcAgyProbe::Locked(cid) = probe_agy_proc(pid)
+    {
+        return Some(cid);
+    }
+    None
+}
+
 /// Populates `pinned_session_id` and `excluded_session_ids` so ACP agents (e.g. side-chat /
 /// handoff / fork agents running in the same cwd) and other terminals never hijack this PTY
 /// terminal's discovered session JSONL.
@@ -172,20 +236,47 @@ pub fn populate_session_affinity(
             snap.excluded_session_ids.insert(sid.to_string());
         }
     }
+    let is_agy = snap.agent_hint.as_deref() == Some("agy");
     let own_tc = core.target_checkpoints(st, target_addr);
-    if let Some(sid) = own_tc.cli_session_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    if let Some(sid) = own_tc
+        .cli_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && (!is_agy || is_valid_agy_cid(s)))
         && !acp_sids.contains(sid)
     {
         snap.pinned_session_id = Some(sid.to_string());
+    }
+    if snap.pinned_session_id.is_none()
+        && let Some(target) = st.pty_reg.terminals.values().find(|t| t.address == target_addr)
+        && let Some(sid) = terminal_known_session_id(target, snap.agent_hint.as_deref())
+        && !acp_sids.contains(&sid)
+    {
+        snap.pinned_session_id = Some(sid);
     }
     for (addr, tc) in &st.checkpoints {
         if addr == target_addr {
             continue;
         }
-        if let Some(sid) = tc.cli_session_id.as_deref().map(str::trim).filter(|s| !s.is_empty())
+        if let Some(sid) = tc
+            .cli_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && (!is_agy || is_valid_agy_cid(s)))
             && snap.pinned_session_id.as_deref() != Some(sid)
         {
             snap.excluded_session_ids.insert(sid.to_string());
+        }
+    }
+    for other in st.pty_reg.terminals.values() {
+        if other.address == target_addr || !other.is_live() {
+            continue;
+        }
+        let other_hint = detect_agent_hint(other);
+        if let Some(sid) = terminal_known_session_id(other, other_hint.as_deref())
+            && snap.pinned_session_id.as_deref() != Some(sid.as_str())
+        {
+            snap.excluded_session_ids.insert(sid);
         }
     }
 }
@@ -224,8 +315,13 @@ fn extract_transcript_with_home(
         return (Vec::new(), None);
     }
     let allow_older_fallback = snap.resumed || snap.turn > 0;
-    let min_mtime = if snap.resumed { 0 } else { snap.started_ms.saturating_sub(MTIME_SLACK_MS) };
     let fg_started_ms = snap.fg_pid.and_then(proc_started_ms);
+    let effective_start = if snap.resumed {
+        0
+    } else {
+        fg_started_ms.map_or(snap.started_ms, |f| snap.started_ms.max(f))
+    };
+    let min_mtime = if snap.resumed { 0 } else { effective_start.saturating_sub(MTIME_SLACK_MS) };
     let providers = ordered_providers(snap.agent_hint.as_deref());
 
     for provider in providers {
@@ -245,7 +341,22 @@ fn extract_transcript_with_home(
             Provider::Gemini => discover_gemini_or_qwen(home, ".gemini", Provider::Gemini, &norm_cwd, min_mtime),
             Provider::Qwen => discover_qwen(home, &norm_cwd, min_mtime),
             Provider::Pi => discover_pi(home, &norm_cwd, min_mtime),
-            Provider::Agy => discover_agy(home, min_mtime, snap.fg_pid),
+            Provider::Agy => {
+                if let Some(cid) = snap.pinned_session_id.as_deref().filter(|s| is_valid_agy_cid(s)) {
+                    let logs = home.join(".gemini/antigravity-cli/brain").join(cid).join(".system_generated/logs");
+                    match pick_agy_log_file(&logs) {
+                        Some(path) => vec![Candidate {
+                            mtime_ms: mtime_ms(&path),
+                            first_ts_ms: agy_first_ts(&path),
+                            path,
+                            provider: Provider::Agy,
+                        }],
+                        None => Vec::new(),
+                    }
+                } else {
+                    discover_agy(home, min_mtime, snap.fg_pid)
+                }
+            }
         };
         if !snap.excluded_session_ids.is_empty() {
             candidates.retain(|c| {
@@ -258,8 +369,11 @@ fn extract_transcript_with_home(
                 .position(|c| candidate_session_id(c).as_deref() == Some(wanted))
                 .map(|idx| candidates.remove(idx))
         });
-        let picked = pinned_hit
-            .or_else(|| pick_best_candidate(candidates, snap.started_ms, fg_started_ms, allow_older_fallback));
+        let picked = if snap.pinned_session_id.is_some() {
+            pinned_hit
+        } else {
+            pick_best_candidate(candidates, effective_start, fg_started_ms, allow_older_fallback)
+        };
         if let Some(best) = picked {
             let (entries, mut meta) = match best.provider {
                 Provider::Claude => parse_claude_jsonl(&best.path),
@@ -425,12 +539,25 @@ fn pick_best_candidate(
     if candidates.is_empty() {
         return None;
     }
-    let start_floor = started_ms.saturating_sub(START_SLACK_MS);
+    let effective_start = if allow_older_fallback {
+        started_ms
+    } else {
+        fg_started_ms.map_or(started_ms, |f| started_ms.max(f))
+    };
+    let start_floor = effective_start.saturating_sub(START_SLACK_MS);
     let fg_floor = fg_started_ms.map(|ms| ms.saturating_sub(START_SLACK_MS));
     let mut after_start: Vec<Candidate> = Vec::new();
     let mut older: Vec<Candidate> = Vec::new();
     for c in candidates {
-        if c.first_ts_ms == 0 || c.first_ts_ms >= start_floor {
+        let qualifies = if start_floor == 0 {
+            true
+        } else if c.first_ts_ms > 0 {
+            c.first_ts_ms >= start_floor
+        } else {
+            // Never let a timestamp-less old session bypass start_floor for a brand-new 0-turn CLI.
+            allow_older_fallback
+        };
+        if qualifies {
             after_start.push(c);
         } else {
             older.push(c);
@@ -438,8 +565,8 @@ fn pick_best_candidate(
     }
     if !after_start.is_empty() {
         after_start.sort_by(|a, b| {
-            let a_fg = fg_floor.is_some_and(|f| a.first_ts_ms == 0 || a.first_ts_ms >= f);
-            let b_fg = fg_floor.is_some_and(|f| b.first_ts_ms == 0 || b.first_ts_ms >= f);
+            let a_fg = fg_floor.is_some_and(|f| a.first_ts_ms > 0 && a.first_ts_ms >= f);
+            let b_fg = fg_floor.is_some_and(|f| b.first_ts_ms > 0 && b.first_ts_ms >= f);
             b_fg.cmp(&a_fg).then_with(|| b.mtime_ms.cmp(&a.mtime_ms)).then_with(|| b.first_ts_ms.cmp(&a.first_ts_ms))
         });
         after_start.into_iter().next()
@@ -839,10 +966,21 @@ fn agy_first_ts(path: &Path) -> u64 {
         .unwrap_or(0)
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) enum ProcAgyProbe {
+    /// Process (or its direct child) holds an open `presence/<uuid>.lock`.
+    Locked(String),
+    /// Process is a live `agy` process whose `/proc/<pid>/fd` was inspected and has no lock yet
+    /// (i.e. brand-new idle session before Turn 1 — must never fall back to global brain scan).
+    IdleNoLock,
+    /// Platform or PID does not support authoritative `/proc/<pid>/fd` inspection.
+    Unavailable,
+}
+
 #[cfg(target_os = "linux")]
-fn find_agy_brain_from_proc(fg_pid: u32, home: &Path) -> Option<PathBuf> {
-    let fd_dir = PathBuf::from(format!("/proc/{fg_pid}/fd"));
-    let entries = fs::read_dir(fd_dir).ok()?;
+fn scan_proc_fd_for_agy_lock(pid: u32) -> Option<Option<String>> {
+    let entries = fs::read_dir(PathBuf::from(format!("/proc/{pid}/fd"))).ok()?;
     for entry in entries.flatten() {
         let Ok(target) = fs::read_link(entry.path()) else {
             continue;
@@ -851,32 +989,86 @@ fn find_agy_brain_from_proc(fg_pid: u32, home: &Path) -> Option<PathBuf> {
         if !target_str.contains("/antigravity-cli/presence/") || !target_str.ends_with(".lock") {
             continue;
         }
-        let Some(uuid) = target.file_stem().and_then(|s| s.to_str()).filter(|s| !s.is_empty()) else {
-            continue;
-        };
-        let logs = home.join(".gemini/antigravity-cli/brain").join(uuid).join(".system_generated/logs");
-        if let Some(log) = pick_agy_log_file(&logs) {
-            return Some(log);
+        if let Some(uuid) = target.file_stem().and_then(|s| s.to_str()).filter(|s| is_valid_agy_cid(s)) {
+            return Some(Some(uuid.to_string()));
         }
     }
-    None
+    Some(None)
+}
+
+#[cfg(target_os = "linux")]
+fn proc_looks_like_agy(pid: u32) -> bool {
+    if let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) {
+        let lower = comm.trim().to_ascii_lowercase();
+        let clean = lower.strip_suffix(".real").unwrap_or(&lower);
+        if matches!(clean, "agy" | "antigravity" | "antigravity-cli") {
+            return true;
+        }
+    }
+    if let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) {
+        for part in cmdline.split(|b| *b == 0).filter(|p| !p.is_empty()) {
+            let s = String::from_utf8_lossy(part);
+            if hint_from_words(std::iter::once(s.as_ref())) == Some("agy") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn probe_agy_proc(fg_pid: u32) -> ProcAgyProbe {
+    let Some(direct) = scan_proc_fd_for_agy_lock(fg_pid) else {
+        return ProcAgyProbe::Unavailable;
+    };
+    if let Some(uuid) = direct {
+        return ProcAgyProbe::Locked(uuid);
+    }
+    let mut child_is_agy = false;
+    if let Ok(children_raw) = fs::read_to_string(format!("/proc/{fg_pid}/task/{fg_pid}/children")) {
+        for tok in children_raw.split_whitespace() {
+            let Ok(cpid) = tok.parse::<u32>() else { continue };
+            if let Some(Some(uuid)) = scan_proc_fd_for_agy_lock(cpid) {
+                return ProcAgyProbe::Locked(uuid);
+            }
+            if proc_looks_like_agy(cpid) {
+                child_is_agy = true;
+            }
+        }
+    }
+    if proc_looks_like_agy(fg_pid) || child_is_agy {
+        ProcAgyProbe::IdleNoLock
+    } else {
+        ProcAgyProbe::Unavailable
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn find_agy_brain_from_proc(_fg_pid: u32, _home: &Path) -> Option<PathBuf> {
-    None
+pub(crate) fn probe_agy_proc(_fg_pid: u32) -> ProcAgyProbe {
+    ProcAgyProbe::Unavailable
 }
 
 fn discover_agy(home: &Path, min_mtime: u64, fg_pid: Option<u32>) -> Vec<Candidate> {
-    if let Some(pid) = fg_pid
-        && let Some(path) = find_agy_brain_from_proc(pid, home)
-    {
-        return vec![Candidate {
-            mtime_ms: mtime_ms(&path),
-            first_ts_ms: agy_first_ts(&path),
-            path,
-            provider: Provider::Agy,
-        }];
+    if let Some(pid) = fg_pid {
+        match probe_agy_proc(pid) {
+            ProcAgyProbe::Locked(uuid) => {
+                let logs = home.join(".gemini/antigravity-cli/brain").join(&uuid).join(".system_generated/logs");
+                return match pick_agy_log_file(&logs) {
+                    Some(path) => vec![Candidate {
+                        mtime_ms: mtime_ms(&path),
+                        first_ts_ms: agy_first_ts(&path),
+                        path,
+                        provider: Provider::Agy,
+                    }],
+                    None => Vec::new(),
+                };
+            }
+            ProcAgyProbe::IdleNoLock => {
+                // Live agy process has not opened a conversation lock yet; never hijack another session.
+                return Vec::new();
+            }
+            ProcAgyProbe::Unavailable => {}
+        }
     }
     let brain = home.join(".gemini/antigravity-cli/brain");
     if !brain.is_dir() {
@@ -2516,7 +2708,7 @@ pub(crate) fn discover_cli_transcript(
         // A clean non-resumed CLI session can only own transcripts created once that foreground
         // CLI process started (2s slack for filesystem/clock jitter), never a previous session.
         let strict_floor = fg_ms.saturating_sub(2_000);
-        candidates.retain(|c| c.first_ts_ms == 0 || c.first_ts_ms >= strict_floor);
+        candidates.retain(|c| c.first_ts_ms > 0 && c.first_ts_ms >= strict_floor);
     }
     pick_best_candidate(candidates, effective_start, fg_started, allow_older_fallback).map(|c| c.path)
 }
@@ -3110,6 +3302,74 @@ mod tests {
         let entries = extract_entries_with_home(&resumed, &root, Some(&root), None);
         assert_eq!(entries.len(), 2);
         assert!(matches!(&entries[0], Entry::User { text, .. } if text == "Old task"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn fresh_cli_ignores_timestampless_old_session_and_missing_pinned_session() {
+        let root = tmp_dir("fresh-cli-no-hijack");
+        let project = "/tmp/fresh-no-hijack/repo";
+        let proj_dir = root.join("projects").join(claude_slug(project));
+        fs::create_dir_all(&proj_dir).unwrap();
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+
+        // A session JSONL with NO timestamp field in its header (`first_ts_ms == 0`) must never
+        // be stolen by a brand-new 0-turn CLI agent.
+        let no_ts_session = proj_dir.join("old-no-ts.jsonl");
+        fs::write(
+            &no_ts_session,
+            serde_json::json!({
+                "type": "user",
+                "cwd": project,
+                "message": { "role": "user", "content": "Previous agent task" }
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let fresh = PtySnapshot {
+            cwd: project.to_string(),
+            started_ms: now_ms,
+            agent_hint: Some("claude".into()),
+            turn: 0,
+            resumed: false,
+            fg_pid: None,
+            ..Default::default()
+        };
+        assert!(
+            extract_entries_with_home(&fresh, &root, Some(&root), None).is_empty(),
+            "fresh 0-turn CLI must not hijack timestamp-less session"
+        );
+
+        // A session with an explicit pinned_session_id whose file hasn't been written yet must not
+        // fall back to a different session file.
+        let other_recent = proj_dir.join("other-recent.jsonl");
+        fs::write(
+            &other_recent,
+            serde_json::json!({
+                "type": "user",
+                "cwd": project,
+                "timestamp": (now_ms + 500).to_string(),
+                "message": { "role": "user", "content": "Concurrent other agent" }
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        let pinned_unwritten = PtySnapshot {
+            pinned_session_id: Some("brand-new-pinned-uuid".into()),
+            ..fresh
+        };
+        assert!(
+            extract_entries_with_home(&pinned_unwritten, &root, Some(&root), None).is_empty(),
+            "missing pinned session must not fall back to another session"
+        );
+
+        assert!(is_valid_agy_cid("a6ebbc27-5c43-4353-bb78-651a0223bf01"));
+        assert!(!is_valid_agy_cid("transcript_full"));
+        assert!(!is_valid_agy_cid("transcript"));
+        assert!(!is_valid_agy_cid("logs"));
         fs::remove_dir_all(root).ok();
     }
 

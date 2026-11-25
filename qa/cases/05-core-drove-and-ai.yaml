@@ -235,8 +235,8 @@ cases:
     priority: P0
     platforms: [linux, macos, windows]
     covers:
-      rpc: [ai.status, ai.settings.set, ai.test, ai.probe_prompt_mode, ai.complete]
-      cli: ["h2 ai status", "h2 ai settings-set", "h2 ai test", "h2 ai probe-prompt-mode"]
+      rpc: [ai.status, ai.settings.set, ai.models, ai.test, ai.probe_prompt_mode, ai.complete]
+      cli: ["h2 ai status", "h2 ai settings-set", "h2 ai models", "h2 ai test", "h2 ai probe-prompt-mode"]
       app_commands: []
       mods: []
       frames: []

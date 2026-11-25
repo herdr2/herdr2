@@ -659,8 +659,10 @@ impl Core {
             .or_else(|| t.argv.first().cloned())
             .unwrap_or_else(|| "terminal".into());
         let status = t.status.as_ref().map(|s| s.state.clone()).unwrap_or_else(|| "idle".into());
-        let turn = t.turn.max(1);
+        let raw_turn = t.turn;
+        let turn = raw_turn.max(1);
         let existing = t.semantic_title.clone();
+        let has_sent_prompts = !snap.sent_prompts.is_empty();
 
         rt_handle.spawn(async move {
             let Ok((entries, _)) =
@@ -689,6 +691,14 @@ impl Core {
                     Some(&program),
                 )
             };
+            if entries.is_empty()
+                && raw_turn == 0
+                && !has_sent_prompts
+                && status == "idle"
+                && det.semantic_title.is_none()
+            {
+                return;
+            }
             if det.task_hint.is_empty() && det.recent_steps.is_empty() && det.semantic_title.is_none() {
                 return;
             }

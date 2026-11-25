@@ -246,7 +246,9 @@ export default class Confirm extends View {
           .gap(8)
           .pt(2)
           .text_size(12)
-          .child(button("no", cancelLabel, t.raised, t.foreground, t.input ?? t.border, (_e, cx) => this.cancel(cx)))
+          .when(!cur.hideCancel, (el) =>
+            el.child(button("no", cancelLabel, t.raised, t.foreground, t.input ?? t.border, (_e, cx) => this.cancel(cx))),
+          )
           .when(Boolean(sec?.label), (el) =>
             el.child(
               button(

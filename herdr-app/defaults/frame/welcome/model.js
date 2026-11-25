@@ -4,15 +4,62 @@ export const PAGES = 4;
 
 export const DEEPSEEK_PRESET = {
   id: "deepseek",
-  nameEn: "DeepSeek Official (Recommended)",
-  nameZh: "DeepSeek 官方 API（推荐）",
+  nameEn: "DeepSeek Official",
+  nameZh: "DeepSeek 官方",
   baseUrl: "https://api.deepseek.com/v1",
-  model: "deepseek-chat",
-  models: ["deepseek-chat", "deepseek-reasoner"],
   portalUrl: "https://platform.deepseek.com/api_keys",
 };
 
+export const AI_PROVIDERS = [
+  { id: "deepseek", en: "DeepSeek Official", zh: "DeepSeek 官方" },
+  { id: "custom", en: "Custom OpenAI-compatible", zh: "自定义 OpenAI 格式" },
+];
+
 export const AI_PAGE = 3;
+
+export function normalizeUrl(url) {
+  return String(url ?? "").trim().replace(/\/+$/, "");
+}
+
+export function normalizeFetchedModels(rawStdout) {
+  if (!rawStdout) return { ok: false, models: [], error: null, latencyMs: 0 };
+  try {
+    const parsed = typeof rawStdout === "string" ? JSON.parse(rawStdout) : rawStdout;
+    if (!parsed || typeof parsed !== "object") {
+      return { ok: false, models: [], error: null, latencyMs: 0 };
+    }
+    const rawList = Array.isArray(parsed.models)
+      ? parsed.models
+      : Array.isArray(parsed.availableModels)
+        ? parsed.availableModels
+        : [];
+    const seen = new Set();
+    const models = [];
+    for (const item of rawList) {
+      const id = String(item ?? "").trim();
+      if (id && !seen.has(id)) {
+        seen.add(id);
+        models.push(id);
+      }
+    }
+    const err =
+      typeof parsed.error === "string"
+        ? parsed.error
+        : typeof parsed.error?.message === "string"
+          ? parsed.error.message
+          : typeof parsed.message === "string"
+            ? parsed.message
+            : null;
+    return {
+      ok: Boolean(parsed.ok) && models.length > 0,
+      models,
+      error: err,
+      latencyMs: Number(parsed.latencyMs ?? parsed.latency_ms ?? 0) || 0,
+    };
+  } catch {
+    return { ok: false, models: [], error: null, latencyMs: 0 };
+  }
+}
 
 export function isAiGateSatisfied(aiStatus, aiTestResult, bypassed = false) {
   if (bypassed) return true;
@@ -157,11 +204,16 @@ export function summarizeAiStatus(rawStdout) {
   try {
     const parsed = typeof rawStdout === "string" ? JSON.parse(rawStdout) : rawStdout;
     if (!parsed || typeof parsed !== "object") return null;
+    const availableModels = Array.isArray(parsed.availableModels)
+      ? parsed.availableModels.map((m) => String(m ?? "").trim()).filter(Boolean)
+      : [];
     return {
       configured: Boolean(parsed.configured),
       enabled: parsed.enabled !== false,
       model: typeof parsed.model === "string" ? parsed.model.trim() : "",
       baseUrl: typeof parsed.baseUrl === "string" ? parsed.baseUrl.trim() : "",
+      keyMasked: typeof parsed.keyMasked === "string" && parsed.keyMasked.trim() ? parsed.keyMasked.trim() : null,
+      availableModels,
     };
   } catch {
     return null;

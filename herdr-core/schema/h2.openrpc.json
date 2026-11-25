@@ -518,6 +518,40 @@
         ],
         "type": "object"
       },
+      "AiModelsResult": {
+        "properties": {
+          "baseUrl": {
+            "type": "string"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "latencyMs": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "models": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "baseUrl",
+          "latencyMs"
+        ],
+        "type": "object"
+      },
       "AiOpMetrics": {
         "properties": {
           "calls": {
@@ -5990,7 +6024,7 @@
       "name": "Apache-2.0"
     },
     "title": "herdr2",
-    "version": "0.2.0"
+    "version": "2.0.1"
   },
   "methods": [
     {
@@ -11781,6 +11815,72 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/AiStatus"
+        }
+      }
+    },
+    {
+      "description": "Fetch available model IDs from an OpenAI-compatible AI endpoint (/models) without running a chat completion.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "ai.models",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "name": "apiKey",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "baseUrl",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "name": "on",
+          "required": false,
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/AiModelsResult"
         }
       }
     },

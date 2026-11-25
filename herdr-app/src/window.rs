@@ -787,6 +787,12 @@ pub struct AppWindow {
     polish_seq: u64,
     polish_progress: Option<PolishProgress>,
     polish_undo: HashMap<String, PolishUndo>,
+    /// Occupied `prompt.polish` chord already warned about when no fallback was available.
+    polish_conflict_notified: Option<String>,
+    /// Monotonic counter for `keys.reassigned` notifications sent to mods (e.g. Settings).
+    keys_reassigned_seq: u64,
+    /// Deferred conflict dialog captured during startup before layout/theme initialization.
+    pending_polish_conflict: Option<crate::keys::PolishShortcutResolution>,
     /// Per-terminal throttle timestamp for semantic status arbitration.
     ai_last_attempt: HashMap<String, Instant>,
     /// Agent/terminal addresses currently awaiting an in-flight `ai.summarize_agent` RPC.
@@ -936,6 +942,9 @@ impl AppWindow {
             polish_seq: 0,
             polish_progress: None,
             polish_undo: HashMap::new(),
+            polish_conflict_notified: None,
+            keys_reassigned_seq: 0,
+            pending_polish_conflict: None,
             ai_last_attempt: HashMap::new(),
             ai_digest_inflight: HashSet::new(),
             ai_digest_attempted: HashMap::new(),
@@ -1022,6 +1031,9 @@ impl AppWindow {
         crate::macos::refresh_menus(cx);
         w.apply_look(window, cx);
         w.show_layout_notes(window, cx);
+        if let Some(conflict) = w.pending_polish_conflict.take() {
+            w.show_polish_shortcut_conflict_dialog(conflict, window, cx);
+        }
         if let (Some(n), false) = (&name, gone.is_empty()) {
             let note = json!({ "title": format!("{n} needs mods that aren't here"), "body": format!("Showing Herdr instead. Missing: {}. Your {n} layout file is still there.", gone.join(", ")), "level": "info", "timeout": 12000 });
             w.open_overlay(mods::new_overlay_id(), json!({ "kind": "toast", "notification": note }), window, cx);
@@ -1345,19 +1357,29 @@ impl AppWindow {
         }
         let k_time = mtime(&crate::keys::path());
         if k_time.is_none() || k_time != self.watched.keys {
+            let initial_keys = self.watched.keys.is_none();
+            let mut installed_ok = false;
             match crate::keys::load() {
                 Ok(bindings) => {
                     crate::keys::install(bindings, cx);
                     let _ = std::fs::remove_file(file("keys.error"));
+                    self.polish_conflict_notified = None;
+                    installed_ok = true;
                 }
                 Err(e) => {
                     self.report("keys", &e);
-                    if self.watched.keys.is_none() {
+                    if initial_keys {
                         crate::keys::install(vec![], cx);
                     }
                 }
             }
             self.watched.keys = mtime(&crate::keys::path());
+            if installed_ok {
+                self.check_polish_shortcut_conflict(initial_keys, window, cx);
+                if !initial_keys {
+                    self.refresh_mods(cx);
+                }
+            }
         }
         let p_time = mtime(&crate::programs::path());
         if p_time != self.watched.programs {
@@ -1370,6 +1392,146 @@ impl AppWindow {
             self.watched.programs = p_time;
             self.publish(cx);
         }
+    }
+
+    /// Probes whether the configured `prompt.polish` shortcut is currently hijacked
+    /// as a system-wide global hotkey by another app. If so, automatically rewrites
+    /// `keys.json` to an unoccupied fallback chord, refreshes UI tooltips/settings,
+    /// and notifies the user with a message dialog.
+    fn check_polish_shortcut_conflict(&mut self, defer_dialog: bool, window: &mut Window, cx: &mut Context<Self>) {
+        match crate::keys::resolve_polish_conflict(&crate::keys::path()) {
+            Ok(None) => {
+                self.polish_conflict_notified = None;
+            }
+            Ok(Some(res)) => {
+                match &res {
+                    crate::keys::PolishShortcutResolution::Reassigned { from, to } => {
+                        tracing::warn!(
+                            "polish shortcut {from:?} is occupied by another app as a system global hotkey; reassigned to {to:?}"
+                        );
+                        match crate::keys::load() {
+                            Ok(bindings) => {
+                                crate::keys::install(bindings, cx);
+                                let _ = std::fs::remove_file(file("keys.error"));
+                            }
+                            Err(e) => self.report("keys", &e),
+                        }
+                        self.watched.keys = mtime(&crate::keys::path());
+                        self.polish_conflict_notified = None;
+                        self.keys_reassigned_seq = self.keys_reassigned_seq.wrapping_add(1).max(1);
+                        mods::set_shared_ephemeral(
+                            "keys.reassigned".into(),
+                            json!({
+                                "seq": self.keys_reassigned_seq,
+                                "action": crate::keys::POLISH_ACTION,
+                                "from": from,
+                                "to": to,
+                            }),
+                        );
+                        self.refresh_mods(cx);
+                        if defer_dialog {
+                            self.pending_polish_conflict = Some(res);
+                        } else {
+                            self.show_polish_shortcut_conflict_dialog(res, window, cx);
+                        }
+                    }
+                    crate::keys::PolishShortcutResolution::OccupiedNoFallback { from } => {
+                        if self.polish_conflict_notified.as_deref() == Some(from.as_str()) {
+                            return;
+                        }
+                        tracing::warn!(
+                            "polish shortcut {from:?} is occupied by another app as a system global hotkey, and no fallback chord is free"
+                        );
+                        self.polish_conflict_notified = Some(from.clone());
+                        self.keys_reassigned_seq = self.keys_reassigned_seq.wrapping_add(1).max(1);
+                        mods::set_shared_ephemeral(
+                            "keys.reassigned".into(),
+                            json!({
+                                "seq": self.keys_reassigned_seq,
+                                "action": crate::keys::POLISH_ACTION,
+                                "from": from,
+                                "to": Value::Null,
+                            }),
+                        );
+                        self.refresh_mods(cx);
+                        if defer_dialog {
+                            self.pending_polish_conflict = Some(res);
+                        } else {
+                            self.show_polish_shortcut_conflict_dialog(res, window, cx);
+                        }
+                    }
+                }
+            }
+            Err(e) => tracing::warn!("polish shortcut conflict check failed: {e}"),
+        }
+    }
+
+    fn show_polish_shortcut_conflict_dialog(
+        &mut self,
+        resolution: crate::keys::PolishShortcutResolution,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let is_zh = self.person.language == settings::Language::ZhCn;
+        let is_mac = cfg!(target_os = "macos");
+        let (title, detail) = match resolution {
+            crate::keys::PolishShortcutResolution::Reassigned { from, to } => {
+                let from_disp = crate::keys::format_chord_display(&from, is_mac);
+                let to_disp = crate::keys::format_chord_display(&to, is_mac);
+                if is_zh {
+                    (
+                        "润色快捷键已被其他软件占用".to_owned(),
+                        format!(
+                            "检测到全局热键 {from_disp} 已被系统中的其他软件占用，按键无法送达 Herdr2。\n已自动将「AI 润色提示词」快捷键切换为 {to_disp}，并同步更新了配置文件（keys.json）与界面提示。\n如需改为其他组合键，可点击下方按钮打开快捷键设置。"
+                        ),
+                    )
+                } else {
+                    (
+                        "Polish shortcut occupied by another app".to_owned(),
+                        format!(
+                            "Global hotkey {from_disp} is already registered by another app, so keypresses cannot reach Herdr2.\nAutomatically switched \"AI Polish prompt\" to {to_disp} and synced keys.json and UI hints.\nYou can change it anytime in Keyboard Shortcuts."
+                        ),
+                    )
+                }
+            }
+            crate::keys::PolishShortcutResolution::OccupiedNoFallback { from } => {
+                let from_disp = crate::keys::format_chord_display(&from, is_mac);
+                if is_zh {
+                    (
+                        "润色快捷键已被其他软件占用".to_owned(),
+                        format!(
+                            "检测到全局热键 {from_disp} 已被系统中的其他软件占用，按键无法送达 Herdr2，且所有默认备选快捷键也均被占用。\n请点击下方按钮打开快捷键设置，手动绑定一个未冲突的组合键。"
+                        ),
+                    )
+                } else {
+                    (
+                        "Polish shortcut occupied by another app".to_owned(),
+                        format!(
+                            "Global hotkey {from_disp} is already registered by another app and all default fallback chords are also unavailable.\nOpen Keyboard Shortcuts below to assign a free key combination."
+                        ),
+                    )
+                }
+            }
+        };
+        if self.overlays.iter().any(|o| o.id == "polish-shortcut-conflict") {
+            self.close_overlay("polish-shortcut-conflict", window, cx);
+        }
+        let spec = json!({
+            "mod": "confirm",
+            "kind": "dialog",
+            "width": 460,
+            "props": {
+                "title": title,
+                "detail": detail,
+                "hideCancel": true,
+                "confirmLabel": if is_zh { "知道了" } else { "Got it" },
+                "secondary": {
+                    "label": if is_zh { "打开快捷键设置" } else { "Shortcut Settings" },
+                    "command": { "name": "app.settings", "args": { "section": "keyboard" } },
+                },
+            },
+        });
+        self.open_overlay("polish-shortcut-conflict".into(), spec, window, cx);
     }
 
     /// Makes `name` the shown layout (its file, or its default if missing or
@@ -3691,8 +3853,7 @@ impl AppWindow {
                         return;
                     }
                     let accepted = val.get("accepted").and_then(Value::as_bool) == Some(true);
-                    let semantic_title = val.get("semanticTitle").and_then(Value::as_str).unwrap_or("").trim().to_owned();
-                    let micro_summary = val.get("microSummary").and_then(Value::as_str).unwrap_or("").trim().to_owned();
+                    let turn = rec.get("turn").and_then(Value::as_u64).unwrap_or(0);
                     let (mapped_state, kind, summary) = if accepted {
                         let raw_state = val.get("state").and_then(Value::as_str).unwrap_or("idle");
                         let mapped = match raw_state {
@@ -3705,6 +3866,17 @@ impl AppWindow {
                         (mapped, k, s)
                     } else {
                         ("idle", String::new(), String::new())
+                    };
+                    let allow_digest = accepted && !(mapped_state == "idle" && turn == 0 && typed_at.is_none());
+                    let semantic_title = if allow_digest {
+                        val.get("semanticTitle").and_then(Value::as_str).unwrap_or("").trim().to_owned()
+                    } else {
+                        String::new()
+                    };
+                    let micro_summary = if allow_digest {
+                        val.get("microSummary").and_then(Value::as_str).unwrap_or("").trim().to_owned()
+                    } else {
+                        String::new()
                     };
                     let verdict = AiTerminalVerdict {
                         screen_hash,
@@ -10126,6 +10298,7 @@ impl AppWindow {
                     }
                     self.away_statuses.clear();
                 }
+                self.check_polish_shortcut_conflict(false, window, cx);
                 self.sync(window, cx);
             } else {
                 self.blurred_at = Some(now);

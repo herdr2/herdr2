@@ -49,6 +49,18 @@ pub struct AiTestResult {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct AiModelsResult {
+    pub ok: bool,
+    pub base_url: String,
+    #[serde(default)]
+    pub models: Vec<String>,
+    pub latency_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 /// Remembered optional-field compatibility & KV-cache effectiveness per `(base_url, model)`
 /// so repeated requests skip 400/422 probe roundtrips and avoid paying full price for
 /// uncached large shared prefixes on gateways without prompt caching.
@@ -178,6 +190,13 @@ fn extract_host(base: &str) -> &str {
 pub fn is_known_strict_cloud_url(base: &str) -> bool {
     let host = extract_host(base);
     STRICT_CLOUD_HOSTS.iter().any(|h| host.eq_ignore_ascii_case(h))
+}
+
+/// Returns true when an endpoint URL may operate without an API key (e.g. local Magpie proxy
+/// or custom self-hosted OpenAI-compatible gateway that isn't a known strict cloud API host).
+pub fn allows_keyless_url(base: &str) -> bool {
+    let trimmed = base.trim();
+    !trimmed.is_empty() && !is_known_strict_cloud_url(trimmed)
 }
 
 pub fn is_anthropic_compat_url(base: &str) -> bool {
@@ -563,21 +582,62 @@ pub fn first_model_id(body: &str) -> Option<String> {
     all_model_ids(body).into_iter().next()
 }
 
-pub async fn fetch_ai_models(base_url: &str, api_key: Option<&str>) -> Vec<String> {
-    let Ok(base) = validate_http_url(base_url, "ai.baseUrl") else {
-        return Vec::new();
+pub async fn fetch_ai_models_detailed(base_url: &str, api_key: Option<&str>) -> AiModelsResult {
+    let started = Instant::now();
+    let base = match validate_http_url(base_url, "ai.baseUrl") {
+        Ok(u) => u,
+        Err(e) => {
+            return AiModelsResult {
+                ok: false,
+                base_url: base_url.to_string(),
+                models: Vec::new(),
+                latency_ms: started.elapsed().as_millis() as u64,
+                error: Some(e.message),
+            };
+        }
     };
+    let mut last_err = String::new();
     for url in models_endpoints(&base) {
-        if let Ok((st, body)) = curl_json_timeout("GET", &url, api_key, None, AI_MODELS_TIMEOUT).await
-            && (200..300).contains(&st)
-        {
-            let ids = all_model_ids(&body);
-            if !ids.is_empty() {
-                return ids;
+        match curl_json_timeout("GET", &url, api_key, None, AI_MODELS_TIMEOUT).await {
+            Ok((st, body)) if (200..300).contains(&st) => {
+                let ids = all_model_ids(&body);
+                if !ids.is_empty() {
+                    return AiModelsResult {
+                        ok: true,
+                        base_url: base,
+                        models: ids,
+                        latency_ms: started.elapsed().as_millis() as u64,
+                        error: None,
+                    };
+                }
+                last_err = "endpoint returned no models".into();
+            }
+            Ok((status, body)) => {
+                let msg = serde_json::from_str::<Value>(&body)
+                    .ok()
+                    .and_then(|v| v["error"]["message"].as_str().or_else(|| v["message"].as_str()).map(String::from))
+                    .unwrap_or_else(|| format!("HTTP {status}"));
+                last_err = format!("HTTP {status}: {msg}");
+                if status == 401 || status == 403 {
+                    break;
+                }
+            }
+            Err(e) => {
+                last_err = e;
             }
         }
     }
-    Vec::new()
+    AiModelsResult {
+        ok: false,
+        base_url: base,
+        models: Vec::new(),
+        latency_ms: started.elapsed().as_millis() as u64,
+        error: Some(if last_err.is_empty() { "failed to fetch models from /models".into() } else { last_err }),
+    }
+}
+
+pub async fn fetch_ai_models(base_url: &str, api_key: Option<&str>) -> Vec<String> {
+    fetch_ai_models_detailed(base_url, api_key).await.models
 }
 
 /// Tests any OpenAI-compatible HTTP endpoint using `Service URL` + `API Key`.

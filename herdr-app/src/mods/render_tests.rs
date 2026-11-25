@@ -1512,6 +1512,14 @@ fn local_state_and_overlay_initial_descriptions(cx: &mut TestAppContext) {
         ][page - 1];
         assert!(tree.contains(expected), "welcome page {page}: {tree}");
         assert!(tree.contains("Welcome to Herdr2"), "welcome header on page {page}: {tree}");
+        if page == 3 {
+            assert!(tree.contains("DeepSeek Official"), "welcome page 3 DeepSeek provider: {tree}");
+            assert!(tree.contains("Custom OpenAI-compatible"), "welcome page 3 Custom OpenAI provider: {tree}");
+            assert!(tree.contains("Fetch Models"), "welcome page 3 Fetch Models button: {tree}");
+            assert!(tree.contains("Skip"), "welcome page 3 Skip button: {tree}");
+            assert!(!tree.contains("deepseek-reasoner"), "welcome page 3 must not hardcode deepseek-reasoner chip: {tree}");
+            assert!(!tree.contains("deepseek-chat"), "welcome page 3 must not default model to deepseek-chat: {tree}");
+        }
     }
     let zh_tree = describe(
         cx,
@@ -5273,6 +5281,67 @@ fn exited_cli_agent_hides_task_summary_timer_and_badges_in_tabs_and_pane_header(
 }
 
 #[gpui::test]
+fn fresh_cli_agent_tab_ignores_launch_command_osc_title(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let agy_prog = json!({
+        "key": "antigravity",
+        "name": "Antigravity",
+        "icon": "icons/antigravity.svg",
+        "tint": false,
+        "shell": false,
+        "agent": true
+    });
+    let mut values = fixture(true, json!({"pane":"p1","terminal":"t1"}), updates("current", "current"));
+    values.insert("spaces".into(), json!([{
+        "id": "s1",
+        "name": "Local",
+        "folder": "/fixture/project",
+        "active": true,
+        "tabs": [{
+            "id": "tab1",
+            "name": "Antigravity",
+            "named": true,
+            "active": true,
+            "status": "idle",
+            "zoomed": false
+        }]
+    }]));
+    values.insert("panes".into(), json!([{
+        "pane": "p1",
+        "terminal": "t1",
+        "tab": "tab1",
+        "title": "agy --dangerously-skip-permissions",
+        "cwd": "/fixture/project",
+        "branch": "main",
+        "status": "idle",
+        "program": agy_prog,
+        "focused": true,
+        "zoomed": false
+    }]));
+    values.insert("terminals".into(), json!([{
+        "address": "t1",
+        "name": null,
+        "title": "agy --dangerously-skip-permissions",
+        "argv": ["agy", "--dangerously-skip-permissions"],
+        "parent": null,
+        "labels": {},
+        "state": "live",
+        "status": "idle",
+        "turn": 0,
+        "program": agy_prog,
+        "cwd": "/fixture/project"
+    }]));
+
+    let tabs_tree = describe_with_values(cx, &staged, "mods/tabs", values, None).unwrap();
+    assert!(tabs_tree.contains("Antigravity"), "fresh CLI tab should display program name: {tabs_tree}");
+    assert!(
+        !tabs_tree.contains("agy --dangerously-skip-permissions"),
+        "fresh CLI tab must not display raw shell preexec launch command: {tabs_tree}"
+    );
+}
+
+#[gpui::test]
 fn changes_renders_git_branch_status_and_recent_log_without_errors(cx: &mut TestAppContext) {
     use gpui::VisualTestContext;
     cx.update(gpui_shell::init);
@@ -5802,4 +5871,63 @@ fn send_context_button_and_dialog_support_cli_and_acp_targets(cx: &mut TestAppCo
     assert!(dlg_tree.contains("ho-turns-custom"), "send-context dialog must render Custom turn option: {dlg_tree}");
     assert!(!dlg_tree.contains("ho-turns-8"), "send-context dialog must not render 8-turn preset: {dlg_tree}");
     assert!(!dlg_tree.contains("ho-turns-15"), "send-context dialog must not render 15-turn preset: {dlg_tree}");
+}
+
+#[gpui::test]
+fn polish_shortcut_conflict_dialog_and_settings_sync(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+
+    // 1) Confirm dialog with hideCancel omits the Cancel button and shows primary + secondary actions.
+    let mut values = fixture(
+        true,
+        json!({
+            "overlay": "polish-shortcut-conflict",
+            "title": "润色快捷键已被其他软件占用",
+            "detail": "检测到全局热键 Ctrl+Alt+P 已被系统中的其他软件占用。\n已自动切换为 Ctrl+Alt+R。",
+            "hideCancel": true,
+            "confirmLabel": "知道了",
+            "secondary": {
+                "label": "打开快捷键设置",
+                "command": { "name": "app.settings", "args": { "section": "keyboard" } }
+            }
+        }),
+        updates("current", "current"),
+    );
+    let dlg = describe_with_values(cx, &staged, "mods/confirm", values.clone(), None).unwrap();
+    assert!(dlg.contains("yes"), "conflict dialog must show confirm button: {dlg}");
+    assert!(dlg.contains("secondary"), "conflict dialog must show settings button: {dlg}");
+    assert!(!dlg.contains("\"id\":\"no\"") && !dlg.contains("#no"), "hideCancel must omit cancel button: {dlg}");
+
+    // 2) Settings keyboard section reflects updated keys() binding for prompt.polish.
+    let mut st_props = props();
+    st_props["section"] = json!("keyboard");
+    values = fixture(true, st_props, updates("current", "current"));
+    values.insert("window".into(), json!({ "platform": "windows" }));
+    values.insert(
+        "keys".into(),
+        json!([
+            { "section": "global", "keys": "ctrl-alt-r", "action": "prompt.polish" },
+            { "section": "global", "keys": "ctrl-alt-u", "action": "prompt.polish_undo" }
+        ]),
+    );
+    let st = describe_with_values(cx, &staged, "frame/settings", values.clone(), None).unwrap();
+    assert!(st.contains("st-key-global-prompt.polish"), "settings must show polish row: {st}");
+    assert!(st.contains("Ctrl + Alt + R"), "settings must show reassigned polish chord: {st}");
+
+    // 3) Peek & pane tooltips also display the reassigned shortcut from keys().
+    let mut peek_values = fixture(true, json!({ "terminal": "a1", "acp": true, "tab": true }), updates("current", "current"));
+    peek_values.insert("keys".into(), json!([
+        { "section": "global", "keys": "ctrl-alt-r", "action": "prompt.polish" },
+        { "section": "global", "keys": "ctrl-alt-u", "action": "prompt.polish_undo" }
+    ]));
+    let peek_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/peek",
+        peek_values,
+        Some("this.input.set_value('测试提示词');"),
+    )
+    .unwrap();
+    assert!(peek_tree.contains("Ctrl+Alt+R"), "peek polish tooltip must show reassigned shortcut: {peek_tree}");
 }

@@ -275,6 +275,13 @@ impl Core {
         let prev_was_cli = prev_fg.as_ref().is_some_and(is_cli_foreground);
         let exited_to_shell_from_cli =
             now_is_shell_root && (cleared_checkpoints || prev_was_cli || (at_shell && has_agent_task_state));
+        let entered_fresh_cli_from_shell_or_other = !now_is_shell_root
+            && now.as_ref().is_some_and(|fg| {
+                let pid_changed = prev_fg.as_ref().is_some_and(|p| p.pid != fg.pid);
+                is_cli_foreground(fg)
+                    && !crate::pty_transcript::argv_has_resume(&fg.argv)
+                    && pid_changed
+            });
         let started_clean_cli_any = !now_is_shell_root
             && now.as_ref().is_some_and(|fg| {
                 is_cli_foreground(fg)
@@ -345,6 +352,9 @@ impl Core {
                 t.title.clear();
                 title_cleared = true;
             }
+        }
+        if !respawning && (started_clean_cli_any || entered_fresh_cli_from_shell_or_other) {
+            t.program_started_ms = Some(crate::runtime::now_ms());
         }
         if status_meta_cleared && change.is_none() {
             change = Some(crate::status::Change { status: true, ..Default::default() });
@@ -905,6 +915,22 @@ mod tests {
             let t = &st.pty_reg.terminals[&id];
             assert_eq!(t.semantic_title, None);
             assert_eq!(t.title, "~/Project/herdr2", "shell's fresh title must be preserved");
+        }
+
+        // 4. Starting a fresh non-resumed CLI inside an older shell advances `program_started_ms`
+        // so transcript discovery does not inherit sessions created while the shell was idle earlier.
+        {
+            let mut st = core.lock();
+            st.pty_reg.terminals.get_mut(&id).unwrap().program_started_ms = Some(1_000);
+            let fresh_agy = Foreground {
+                pid: 456,
+                name: "agy.real".into(),
+                argv: vec!["/home/u/.local/bin/agy.real".into(), "--dangerously-skip-permissions".into()],
+                cwd: root.to_string_lossy().to_string(),
+            };
+            core.apply_foreground_update(&mut st, id, Some(fresh_agy));
+            let started = st.pty_reg.terminals[&id].program_started_ms.unwrap_or(0);
+            assert!(started > 1_000, "fresh CLI start must advance program_started_ms, got {started}");
         }
 
         drop(core);

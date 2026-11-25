@@ -117,4 +117,4 @@ h2 kill t1
 
 ---
 
-**上一篇**：[← 01. 快速上手与界面导览](./01-getting-started.md) ｜ **下一篇**：[03. 无头 ACP 智能体与权限控制 →](./03-headless-acp-agents.md)
+**上一篇**：[← 01. 安装、快速上手与界面导览](./01-getting-started.md) ｜ **下一篇**：[03. 无头 ACP 智能体与权限控制 →](./03-headless-acp-agents.md)

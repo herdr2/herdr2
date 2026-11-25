@@ -1043,6 +1043,7 @@ pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Va
             | "drove.web.open"
             | "ai.status"
             | "ai.settings.set"
+            | "ai.models"
             | "ai.test"
             | "ai.probe_prompt_mode"
             | "ai.complete"

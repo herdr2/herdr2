@@ -2,7 +2,7 @@
 // Designed after original Herdr: 4 focused, calm pages that each fit in one screen without scrolling.
 
 import { View, div, svg, image } from "gpui-kit";
-import { v_flex, h_flex, InputState, Input } from "gpui-base";
+import { v_flex, h_flex, InputState, Input, Popup } from "gpui-base";
 import {
   spaces,
   run,
@@ -27,6 +27,7 @@ import {
 import {
   PAGES,
   AI_PAGE,
+  AI_PROVIDERS,
   DEEPSEEK_PRESET,
   LANGUAGES,
   APPEARANCES,
@@ -38,6 +39,8 @@ import {
   boundShortcut,
   normalizeMachines,
   summarizeAiStatus,
+  normalizeUrl,
+  normalizeFetchedModels,
   isAiGateSatisfied,
   canAccessPage,
   agentCustomizePrompt,
@@ -67,19 +70,21 @@ export default class Welcome extends View {
     this.aiBusy = false;
     this.aiError = null;
     this.aiGateHint = null;
+    this.aiSkipped = false;
     this.aiProvider = "deepseek";
+    this.aiSelectedModel = "";
+    this.aiModels = [];
+    this.aiModelsLoading = false;
+    this.aiModelsHint = null;
+    this.aiModelMenuOpen = false;
     this.aiUrlInput = typeof InputState?.new === "function"
       ? InputState.new({ placeholder: DEEPSEEK_PRESET.baseUrl })
       : null;
     this.aiKeyInput = typeof InputState?.new === "function"
-      ? InputState.new({ placeholder: "sk-..." })
+      ? InputState.new({ placeholder: "sk-... (optional)" })
       : null;
     this.aiKeyInput?.set_masked?.(true);
-    this.aiModelInput = typeof InputState?.new === "function"
-      ? InputState.new({ placeholder: DEEPSEEK_PRESET.model })
-      : null;
     this.aiUrlInput?.set_value?.(DEEPSEEK_PRESET.baseUrl);
-    this.aiModelInput?.set_value?.(DEEPSEEK_PRESET.model);
     this.skillStatus = null;
     this.skillInstalling = false;
     this.skillMessage = null;
@@ -120,6 +125,7 @@ export default class Welcome extends View {
   aiGateBypassed() {
     return (
       isChecking() ||
+      Boolean(this.aiSkipped) ||
       Boolean(typeof appWindow === "function" && appWindow()?.skip_ai_gate) ||
       Boolean(typeof shared === "function" && shared("qa.skip_ai_gate"))
     );
@@ -127,6 +133,14 @@ export default class Welcome extends View {
 
   aiReady() {
     return isAiGateSatisfied(this.aiStatus, this.aiTestResult, this.aiGateBypassed());
+  }
+
+  skipAi(cx) {
+    this.aiSkipped = true;
+    this.aiError = null;
+    this.aiGateHint = null;
+    this.aiModelMenuOpen = false;
+    this.go(AI_PAGE + 1, cx);
   }
 
   async loadSkillStatus() {
@@ -171,12 +185,34 @@ export default class Welcome extends View {
     });
   }
 
-  applyDeepSeekPreset(model, cx) {
-    this.aiProvider = "deepseek";
-    this.aiUrlInput?.set_value?.(DEEPSEEK_PRESET.baseUrl);
-    this.aiModelInput?.set_value?.(model || DEEPSEEK_PRESET.model);
+  selectAiProvider(provider, cx) {
+    const next = provider === "custom" ? "custom" : "deepseek";
+    const changed = this.aiProvider !== next;
+    this.aiProvider = next;
+    this.aiModelMenuOpen = false;
     this.aiError = null;
     this.aiGateHint = null;
+    this.aiModelsHint = null;
+    if (next === "deepseek") {
+      this.aiUrlInput?.set_value?.(DEEPSEEK_PRESET.baseUrl);
+    } else if (normalizeUrl(this.aiUrlInput?.value?.()) === normalizeUrl(DEEPSEEK_PRESET.baseUrl)) {
+      this.aiUrlInput?.set_value?.("");
+    }
+    if (changed) {
+      this.aiModels = [];
+      this.aiSelectedModel = "";
+      this.aiTestResult = null;
+    }
+    cx.notify();
+  }
+
+  selectAiModel(model, cx) {
+    this.aiSelectedModel = String(model ?? "").trim();
+    this.aiModelMenuOpen = false;
+    this.aiError = null;
+    this.aiGateHint = null;
+    this.aiModelsHint = null;
+    this.aiTestResult = null;
     cx.notify();
   }
 
@@ -193,20 +229,76 @@ export default class Welcome extends View {
         const parsed = JSON.parse(r.stdout);
         if (parsed?.ok) {
           this.aiTestResult = parsed;
+          if (Array.isArray(parsed.availableModels) && parsed.availableModels.length > 0) {
+            this.aiModels = parsed.availableModels;
+          }
         }
       }
     } catch {}
   }
 
-  saveAndTestAi(cx) {
-    if (this.aiBusy) return;
-    const baseUrl = String(this.aiUrlInput?.value?.() ?? "").trim() || DEEPSEEK_PRESET.baseUrl;
+  fetchAiModels(cx) {
+    if (this.aiModelsLoading || this.aiBusy) return;
+    const baseUrl = String(this.aiUrlInput?.value?.() ?? "").trim();
     const apiKey = String(this.aiKeyInput?.value?.() ?? "").trim();
-    const model = String(this.aiModelInput?.value?.() ?? "").trim() || DEEPSEEK_PRESET.model;
-    if (!apiKey && !this.aiStatus?.configured) {
+    if (!baseUrl) {
+      this.aiError = this.tr("Please enter Service URL first.", "请先填写服务地址（Base URL）。");
+      cx.notify();
+      return;
+    }
+    this.aiModelsLoading = true;
+    this.aiError = null;
+    this.aiGateHint = null;
+    this.aiModelsHint = null;
+    this.aiModelMenuOpen = false;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const payload = { baseUrl };
+        if (apiKey) payload.apiKey = apiKey;
+        const reqFile = await this.writeAiTempReq(payload);
+        const res = await callCore(["ai", "models", "--file", reqFile, "--consume", "--json"]);
+        const parsed = normalizeFetchedModels(res?.stdout || res?.stderr || "");
+        if (res?.code !== 0 || !parsed.ok) {
+          this.aiError =
+            parsed.error ||
+            (res?.stderr || res?.stdout || this.tr("Failed to fetch models from server", "从服务端获取模型失败")).trim();
+          return;
+        }
+        this.aiModels = parsed.models;
+        if (this.aiSelectedModel && !this.aiModels.includes(this.aiSelectedModel)) {
+          this.aiSelectedModel = "";
+        }
+        this.aiModelsHint = this.tr(
+          `Loaded ${parsed.models.length} model(s). Pick one from the dropdown.`,
+          `已获取 ${parsed.models.length} 个模型，请从下拉菜单选择。`,
+        );
+        if (!this.aiSelectedModel) {
+          this.aiModelMenuOpen = true;
+        }
+      } catch (e) {
+        this.aiError = String(e?.message ?? e);
+      } finally {
+        this.aiModelsLoading = false;
+        cx.notify();
+      }
+    });
+  }
+
+  saveAndTestAi(cx) {
+    if (this.aiBusy || this.aiModelsLoading) return;
+    const baseUrl = String(this.aiUrlInput?.value?.() ?? "").trim();
+    const apiKey = String(this.aiKeyInput?.value?.() ?? "").trim();
+    const model = String(this.aiSelectedModel ?? "").trim();
+    if (!baseUrl) {
+      this.aiError = this.tr("Please enter Service URL first.", "请先填写服务地址（Base URL）。");
+      cx.notify();
+      return;
+    }
+    if (!model) {
       this.aiError = this.tr(
-        "Please enter your API Key (DeepSeek official API key recommended).",
-        "请先填写 API Key（推荐使用 DeepSeek 官方 API Key）。",
+        "Please fetch models and select one from the dropdown first.",
+        "请先点击「获取模型」并从下拉菜单选择一个模型。",
       );
       cx.notify();
       return;
@@ -214,6 +306,8 @@ export default class Welcome extends View {
     this.aiBusy = true;
     this.aiError = null;
     this.aiGateHint = null;
+    this.aiModelsHint = null;
+    this.aiModelMenuOpen = false;
     this.aiTestResult = null;
     cx.notify();
     cx.spawn(async (cx) => {
@@ -226,6 +320,10 @@ export default class Welcome extends View {
         try {
           parsedTest = JSON.parse(testRes?.stdout || testRes?.stderr || "{}");
         } catch {}
+        if (Array.isArray(parsedTest?.availableModels) && parsedTest.availableModels.length > 0) {
+          const merged = new Set([...this.aiModels, ...parsedTest.availableModels]);
+          this.aiModels = [...merged];
+        }
         if (testRes?.code !== 0 || !parsedTest?.ok) {
           this.aiTestResult = { ok: false };
           this.aiError =
@@ -237,7 +335,14 @@ export default class Welcome extends View {
         }
 
         const savePayload = { enabled: true, baseUrl, model };
-        if (apiKey) savePayload.apiKey = apiKey;
+        if (apiKey) {
+          savePayload.apiKey = apiKey;
+        } else if (
+          this.aiStatus?.keyMasked &&
+          normalizeUrl(baseUrl) !== normalizeUrl(this.aiStatus?.baseUrl)
+        ) {
+          savePayload.clearKey = true;
+        }
         const saveFile = await this.writeAiTempReq(savePayload);
         const saveRes = await callCore(["ai", "settings-set", "--file", saveFile, "--consume", "--json"]);
         let parsedSave = null;
@@ -251,7 +356,17 @@ export default class Welcome extends View {
             (saveRes?.stderr || saveRes?.stdout || this.tr("Failed to save AI settings", "保存 AI 配置失败")).trim();
           return;
         }
-        this.aiStatus = summarizeAiStatus(parsedSave) ?? { configured: true, enabled: true, model, baseUrl };
+        this.aiStatus = summarizeAiStatus(parsedSave) ?? {
+          configured: true,
+          enabled: true,
+          model,
+          baseUrl,
+          keyMasked: null,
+          availableModels: this.aiModels,
+        };
+        if (this.aiStatus.availableModels?.length > 0) {
+          this.aiModels = this.aiStatus.availableModels;
+        }
         this.aiTestResult = parsedTest;
         this.aiKeyInput?.set_value?.("");
         this.aiError = null;
@@ -295,7 +410,10 @@ export default class Welcome extends View {
       this.aiProvider = this.aiStatus.baseUrl.includes("deepseek") ? "deepseek" : "custom";
     }
     if (this.aiStatus?.model) {
-      this.aiModelInput?.set_value?.(this.aiStatus.model);
+      this.aiSelectedModel = this.aiStatus.model;
+    }
+    if (Array.isArray(this.aiStatus?.availableModels) && this.aiStatus.availableModels.length > 0) {
+      this.aiModels = this.aiStatus.availableModels;
     }
   }
 
@@ -303,8 +421,8 @@ export default class Welcome extends View {
     if (!this.aiReady()) {
       this.page = AI_PAGE;
       this.aiGateHint = this.tr(
-        "Core AI setup is required: enter your API key (DeepSeek Official API recommended) and pass the connectivity test first.",
-        "首次使用需先配置核心 AI 助手：请填写 API Key（推荐 DeepSeek 官方 API）并点击「保存并测试连通性」通过验证。",
+        "Configure & test Core AI first, or click Skip in the bottom bar.",
+        "请先配置并测试 Core AI 连通性，或点击右下角「跳过」暂不配置。",
       );
       cx?.notify?.();
       return;
@@ -405,13 +523,14 @@ export default class Welcome extends View {
     if (requested > allowed) {
       this.page = allowed;
       this.aiGateHint = this.tr(
-        "Complete and test Core AI connectivity first to unlock the next step.",
-        "请先填写 API Key 并测试连通通过后再进入下一步。",
+        "Complete and test Core AI connectivity first, or click Skip to continue.",
+        "请先完成 Core AI 连通性测试，或点击右下角「跳过」继续。",
       );
       cx.notify();
       return;
     }
     this.aiGateHint = null;
+    this.aiModelMenuOpen = false;
     this.page = allowed;
     if (!isChecking() && this.page === AI_PAGE) {
       cx.spawn(async (cx) => {
@@ -802,32 +921,154 @@ export default class Welcome extends View {
       .child(div().w(7).h(7).rounded(4).bg(ok ? t.ansi2 : t.dim));
   }
 
+  modelDropdown(t) {
+    const open = Boolean(this.aiModelMenuOpen);
+    const models = Array.isArray(this.aiModels) ? this.aiModels : [];
+    const selected = String(this.aiSelectedModel ?? "").trim();
+    const label = selected
+      ? selected
+      : models.length > 0
+        ? this.tr("Select a model…", "请从下拉菜单选择模型…")
+        : this.tr("Click Fetch Models first", "请先点击「获取模型」");
+    const rowH = 28;
+    const listH = models.length === 0 ? 42 : Math.min(models.length * rowH + 8, 176);
+
+    const trigger = h_flex()
+      .id("w-ai-model-trigger")
+      .w_full()
+      .h(32)
+      .px(10)
+      .gap(8)
+      .items_center()
+      .justify_between()
+      .rounded(7)
+      .border_1()
+      .border_color(open ? t.accent : t.input)
+      .bg(t.background)
+      .cursor_pointer()
+      .hover((s) => s.border_color(open ? t.accent : t.ring))
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click((_e, cx) => {
+        this.aiModelMenuOpen = !open;
+        cx.notify();
+      })
+      .child(
+        div()
+          .flex_1()
+          .min_w(0)
+          .truncate()
+          .text_size(12.2)
+          .text_color(selected ? t.foreground : models.length > 0 ? t.muted : t.dim)
+          .child(label),
+      )
+      .child(div().flex_none().text_size(10.5).text_color(t.dim).child("▾"));
+
+    if (typeof Popup?.new !== "function") {
+      return trigger;
+    }
+
+    return Popup.new("w-ai-model-popup", trigger)
+      .anchor("bottom_left")
+      .flex()
+      .flex_1()
+      .min_w(0)
+      .when(open, (el) =>
+        el.content(
+          v_flex()
+            .id("w-ai-model-menu")
+            .w(340)
+            .rounded(8)
+            .border_1()
+            .border_color(t.border)
+            .bg(t.popover)
+            .shadow_md()
+            .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+            .on_mouse_down_out((_e, cx) => {
+              this.aiModelMenuOpen = false;
+              cx.notify();
+            })
+            .on_scroll_wheel((_e, cx) => cx.stop_propagation())
+            .child(
+              div()
+                .id("w-ai-model-list")
+                .h(listH)
+                .p(4)
+                .overflow_y_scrollbar()
+                .when(models.length === 0, (list) =>
+                  list.child(
+                    div()
+                      .px(9)
+                      .py(8)
+                      .text_size(11.8)
+                      .text_color(t.dim)
+                      .child(this.tr("No models loaded yet. Click Fetch Models.", "暂无模型，请先点击「获取模型」。")),
+                  ),
+                )
+                .children(
+                  models.map((m, idx) => {
+                    const active = m === selected;
+                    return h_flex()
+                      .id(`w-ai-model-opt-${idx}`)
+                      .w_full()
+                      .h(rowH)
+                      .flex_none()
+                      .px(9)
+                      .gap(8)
+                      .rounded(6)
+                      .items_center()
+                      .justify_between()
+                      .cursor_pointer()
+                      .bg(active ? t.accent + "1a" : "#00000000")
+                      .hover((s) => s.bg(t.hover))
+                      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                      .on_click((_e, cx) => this.selectAiModel(m, cx))
+                      .child(
+                        div()
+                          .flex_1()
+                          .min_w(0)
+                          .truncate()
+                          .text_size(12.2)
+                          .text_color(active ? t.accent : t.foreground)
+                          .when(active, (x) => x.font_medium())
+                          .child(m),
+                      )
+                      .when(active, (row) => row.child(svg(I("check")).size(12).flex_none().text_color(t.accent)));
+                  }),
+                ),
+            ),
+        ),
+      );
+  }
+
   pageThree(t) {
     const ai = this.aiStatus;
     const aiVerified = this.aiTestResult?.ok === true && Boolean(ai?.configured);
     const aiOn = Boolean(ai?.configured);
     const latency = this.aiTestResult?.latencyMs ?? this.aiTestResult?.latency_ms ?? null;
+    const verifiedModel = ai?.model || this.aiSelectedModel || "";
     const aiBadge = aiVerified
       ? this.tr(
-          `Verified · ${ai?.model || DEEPSEEK_PRESET.model}${latency ? ` (${latency}ms)` : ""}`,
-          `已验证连通 · ${ai?.model || DEEPSEEK_PRESET.model}${latency ? ` (${latency}ms)` : ""}`,
+          `Verified${verifiedModel ? ` · ${verifiedModel}` : ""}${latency ? ` (${latency}ms)` : ""}`,
+          `已验证连通${verifiedModel ? ` · ${verifiedModel}` : ""}${latency ? ` (${latency}ms)` : ""}`,
         )
       : aiOn
-        ? this.tr("Saved · click Test to verify", "已保存 · 请点击测试验证连通")
-        : this.tr("Required", "必填");
+        ? this.tr("Saved · click Test to verify", "已保存 · 点击测试验证连通")
+        : this.tr("Not configured", "未配置");
     const coreVer = typeof updates === "function" ? fmtVersion(updates()?.core?.version) : "";
     const localNote = coreVer ? `h2 ${coreVer}` : this.tr("here", "本机");
     const shownMachines = this.machines.slice(0, 2);
     const hiddenCount = Math.max(0, this.machines.length - shownMachines.length);
-    const currentModel = String(this.aiModelInput?.value?.() ?? "").trim() || DEEPSEEK_PRESET.model;
+    const sameSavedUrl =
+      Boolean(ai?.baseUrl) &&
+      normalizeUrl(this.aiUrlInput?.value?.()) === normalizeUrl(ai?.baseUrl);
     const presetChip = (id, label, active, onClick) =>
       div()
         .id(id)
-        .px(8)
-        .py(3)
+        .px(9)
+        .py(3.5)
         .rounded(6)
         .cursor_pointer()
-        .text_size(11.5)
+        .text_size(11.8)
         .font_medium()
         .border_1()
         .border_color(active ? t.accent : t.border)
@@ -845,12 +1086,12 @@ export default class Welcome extends View {
           t,
           this.tr("Core AI & other machines", "核心 AI 助手与远程主机"),
           this.tr(
-            "Core AI is required to power smart status detection, Prompt Polish, Context Handoff, and Drove. DeepSeek Official API is strongly recommended.",
-            "首次启动需配置核心 AI 能力（驱动智能状态识别、提示词润色、上下文接力与 Skill 智能安装），推荐使用 DeepSeek 官方 API。",
+            "Configure Core AI for smart status detection, Prompt Polish, and Context Handoff (DeepSeek Official or any OpenAI-compatible gateway such as local Magpie).",
+            "配置核心 AI 以启用智能状态识别、提示词润色与上下文接力（支持 DeepSeek 官方或自定义 OpenAI 格式中转，如本机 Magpie）。",
           ),
         ),
       )
-      // Mandatory Core AI inline setup card (DeepSeek Official API recommended)
+      // Core AI inline setup card
       .child(
         v_flex()
           .gap(9)
@@ -884,57 +1125,42 @@ export default class Welcome extends View {
                       .child(aiBadge),
                   ),
               )
-              .child(
-                this.smallButton(
-                  t,
-                  "w-copy-deepseek-portal",
-                  this.copied === "w-copy-deepseek-portal"
-                    ? this.tr("Portal URL Copied", "已复制获取地址")
-                    : this.tr("Get DeepSeek Key", "获取 DeepSeek Key"),
-                  (_e, cx) => {
-                    cx.write_to_clipboard(DEEPSEEK_PRESET.portalUrl);
-                    this.copied = "w-copy-deepseek-portal";
-                    cx.notify();
-                  },
+              .when(this.aiProvider === "deepseek", (el) =>
+                el.child(
+                  this.smallButton(
+                    t,
+                    "w-copy-deepseek-portal",
+                    this.copied === "w-copy-deepseek-portal"
+                      ? this.tr("Portal URL Copied", "已复制获取地址")
+                      : this.tr("Get DeepSeek Key", "获取 DeepSeek Key"),
+                    (_e, cx) => {
+                      cx.write_to_clipboard(DEEPSEEK_PRESET.portalUrl);
+                      this.copied = "w-copy-deepseek-portal";
+                      cx.notify();
+                    },
+                  ),
                 ),
               ),
           )
-          // Provider & DeepSeek quick preset bar
+          // Provider bar: DeepSeek Official or Custom OpenAI-compatible only
           .child(
             h_flex()
               .gap(6)
               .items_center()
               .flex_wrap()
-              .child(
-                presetChip(
-                  "w-ai-preset-deepseek",
-                  this.tr("DeepSeek Official (Recommended)", "DeepSeek 官方（推荐）"),
-                  this.aiProvider === "deepseek" && currentModel === "deepseek-chat",
-                  (_e, cx) => this.applyDeepSeekPreset("deepseek-chat", cx),
-                ),
-              )
-              .child(
-                presetChip(
-                  "w-ai-preset-reasoner",
-                  "deepseek-reasoner",
-                  this.aiProvider === "deepseek" && currentModel === "deepseek-reasoner",
-                  (_e, cx) => this.applyDeepSeekPreset("deepseek-reasoner", cx),
-                ),
-              )
-              .child(
-                presetChip(
-                  "w-ai-preset-custom",
-                  this.tr("Custom OpenAI API", "自定义 OpenAI 兼容"),
-                  this.aiProvider === "custom",
-                  (_e, cx) => {
-                    this.aiProvider = "custom";
-                    cx.notify();
-                  },
+              .children(
+                AI_PROVIDERS.map((p) =>
+                  presetChip(
+                    `w-ai-preset-${p.id}`,
+                    this.tr(p.en, p.zh),
+                    this.aiProvider === p.id,
+                    (_e, cx) => this.selectAiProvider(p.id, cx),
+                  ),
                 ),
               ),
           )
-          // Inline inputs: Service URL + Model + API Key
-          .when(Boolean(this.aiUrlInput && this.aiKeyInput && this.aiModelInput), (el) =>
+          // Inline inputs: Row 1 (Service URL + optional API Key), Row 2 (Model dropdown + Fetch Models + Save & Test)
+          .when(Boolean(this.aiUrlInput && this.aiKeyInput), (el) =>
             el
               .child(
                 h_flex()
@@ -945,7 +1171,16 @@ export default class Welcome extends View {
                       .flex_1()
                       .min_w(0)
                       .gap(3)
-                      .child(div().text_size(11.5).text_color(t.muted).child(this.tr("Service URL", "服务地址 (Base URL)")))
+                      .child(
+                        div()
+                          .text_size(11.5)
+                          .text_color(t.muted)
+                          .child(
+                            this.aiProvider === "custom"
+                              ? this.tr("Service URL (e.g. http://127.0.0.1:8080/v1)", "服务地址（如 http://127.0.0.1:8080/v1）")
+                              : this.tr("Service URL (Base URL)", "服务地址 (Base URL)"),
+                          ),
+                      )
                       .child(
                         div()
                           .px(8)
@@ -959,10 +1194,19 @@ export default class Welcome extends View {
                   )
                   .child(
                     v_flex()
-                      .w(170)
-                      .flex_none()
+                      .flex_1()
+                      .min_w(0)
                       .gap(3)
-                      .child(div().text_size(11.5).text_color(t.muted).child(this.tr("Model", "模型")))
+                      .child(
+                        div()
+                          .text_size(11.5)
+                          .text_color(t.muted)
+                          .child(
+                            sameSavedUrl && ai?.keyMasked
+                              ? this.tr(`API Key (optional · saved ${ai.keyMasked})`, `API Key（选填 · 已保存 ${ai.keyMasked}）`)
+                              : this.tr("API Key (optional, leave blank for keyless proxy)", "API Key（选填，本机中转无需填写）"),
+                          ),
+                      )
                       .child(
                         div()
                           .px(8)
@@ -971,7 +1215,7 @@ export default class Welcome extends View {
                           .border_1()
                           .border_color(t.input)
                           .bg(t.background)
-                          .child(Input.new(this.aiModelInput).h(25).text_size(12.2).text_color(t.foreground)),
+                          .child(Input.new(this.aiKeyInput).h(25).text_size(12.2).text_color(t.foreground)),
                       ),
                   ),
               )
@@ -985,25 +1229,30 @@ export default class Welcome extends View {
                       .min_w(0)
                       .gap(3)
                       .child(
-                        div()
-                          .text_size(11.5)
-                          .text_color(t.muted)
-                          .child(
-                            aiOn
-                              ? this.tr("API Key (leave blank to test saved key, or paste new key)", "API Key（留空将测试已保存的 Key，或粘贴新 Key）")
-                              : this.tr("API Key (stored locally with 0600 permissions)", "API Key（本地 0600 权限加密存储，不上传）"),
+                        h_flex()
+                          .items_center()
+                          .justify_between()
+                          .gap(6)
+                          .child(div().text_size(11.5).text_color(t.muted).child(this.tr("Model", "模型")))
+                          .when(this.aiModels.length > 0, (mEl) =>
+                            mEl.child(
+                              div()
+                                .text_size(11)
+                                .text_color(t.dim)
+                                .child(this.tr(`${this.aiModels.length} available`, `共 ${this.aiModels.length} 个可选`)),
+                            ),
                           ),
                       )
-                      .child(
-                        div()
-                          .px(8)
-                          .py(2)
-                          .rounded(7)
-                          .border_1()
-                          .border_color(t.input)
-                          .bg(t.background)
-                          .child(Input.new(this.aiKeyInput).h(25).text_size(12.2).text_color(t.foreground)),
-                      ),
+                      .child(this.modelDropdown(t)),
+                  )
+                  .child(
+                    this.button(
+                      t,
+                      "w-ai-fetch-models",
+                      this.aiModelsLoading ? this.tr("Fetching…", "获取中…") : this.tr("Fetch Models", "获取模型"),
+                      "outline",
+                      (_e, cx) => this.fetchAiModels(cx),
+                    ),
                   )
                   .child(
                     this.button(
@@ -1013,7 +1262,7 @@ export default class Welcome extends View {
                         ? this.tr("Testing…", "测试中…")
                         : aiVerified
                           ? this.tr("Re-test", "重新测试")
-                          : this.tr("Save & Test", "保存并测试连通"),
+                          : this.tr("Save & Test", "保存并测试"),
                       "primary",
                       (_e, cx) => this.saveAndTestAi(cx),
                     ),
@@ -1033,6 +1282,20 @@ export default class Welcome extends View {
                 .line_height("17px")
                 .text_color(t.blocked)
                 .child(this.aiError || this.aiGateHint),
+            ),
+          )
+          .when(Boolean(this.aiModelsHint && !this.aiError && !this.aiGateHint && !aiVerified), (el) =>
+            el.child(
+              div()
+                .px(9)
+                .py(5)
+                .rounded(7)
+                .bg(t.accent + "14")
+                .border_1()
+                .border_color(t.accent)
+                .text_size(11.5)
+                .text_color(t.accent)
+                .child(this.aiModelsHint),
             ),
           )
           .when(aiVerified && !this.aiError, (el) =>
@@ -1267,6 +1530,7 @@ export default class Welcome extends View {
     const t = theme();
     const langNow = this.lang();
     const noSpaces = spaces().length === 0;
+    const aiVerified = this.aiTestResult?.ok === true && Boolean(this.aiStatus?.configured);
     const pages = [this.pageOne, this.pageTwo, this.pageThree, this.pageFour];
 
     const dots = h_flex()
@@ -1295,7 +1559,15 @@ export default class Welcome extends View {
       .on_key_down((e, cx) => {
         const k = e.key;
         const m = e.modifiers;
-        if (k === "escape") return this.done("skipped", cx);
+        if (k === "escape") {
+          if (this.aiModelMenuOpen) {
+            this.aiModelMenuOpen = false;
+            cx.notify();
+            cx.stop_propagation();
+            return;
+          }
+          return this.done("skipped", cx);
+        }
         if (m.control || m.alt || m.platform) return;
         if (k === "enter" || k === "right") {
           if (this.page === PAGES) return k === "enter" ? this.start(cx) : undefined;
@@ -1384,6 +1656,23 @@ export default class Welcome extends View {
           .child(div().flex_1())
           .when(this.page > 1, (el) =>
             el.child(this.button(t, "w-back", this.tr("Back", "上一步"), "ghost", (_e, cx) => this.go(this.page - 1, cx))),
+          )
+          .when(this.page === AI_PAGE && !aiVerified && !this.aiSkipped, (el) =>
+            el.child(
+              h_flex()
+                .id("w-ai-skip")
+                .h(26)
+                .px(9)
+                .items_center()
+                .rounded(6)
+                .cursor_pointer()
+                .text_size(11.8)
+                .text_color(t.dim)
+                .hover((s) => s.text_color(t.foreground).bg(t.hover))
+                .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+                .on_click((_e, cx) => this.skipAi(cx))
+                .child(this.tr("Skip", "跳过")),
+            ),
           )
           .when(this.page === PAGES && noSpaces && typeof pickFolder === "function", (el) =>
             el.child(

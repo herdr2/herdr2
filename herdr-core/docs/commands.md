@@ -83,6 +83,7 @@ Usage: h2 ai [OPTIONS] <COMMAND>
 Commands:
   status             Show shared Core AI assistant status, configuration, and KV-cache metrics
   settings-set       Update shared Core AI assistant settings from a JSON file
+  models             Fetch available models from an OpenAI-compatible AI endpoint (/models)
   test               Test the shared Core AI assistant URL and API key
   probe-prompt-mode  Clear prior prompt-cache detection records, set prompt mode to auto, and re-detect shared-prefix vs compact mode
   handoff-recommend  Recommend a complementary target provider, handoff mode, and note for an upstream session
@@ -144,6 +145,22 @@ Options:
       --json                   JSON output even in a terminal
       --lang <LANG>            Caller UI language (`zh` / `en`)
   -h, --help                   Print help
+```
+
+## h2 ai models
+
+```text
+Fetch available models from an OpenAI-compatible AI endpoint (/models)
+
+Usage: h2 ai models [OPTIONS]
+
+Options:
+      --file <FILE>   
+      --json          JSON output even in a terminal
+      --url <URL>     
+      --on <MACHINE>  Target remote machine (`h2 machine ls`)
+      --consume       Delete `--file` right after reading it
+  -h, --help          Print help
 ```
 
 ## h2 ai polish-prompt

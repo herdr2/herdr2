@@ -46,7 +46,7 @@ AI Agent 会自动完成全流程：
 
 完整的分主题图文教程见 **[docs/user-guide/README.md](./docs/user-guide/README.md)**（所有流程均经沙盒实操复现并附真实界面截图与矢量图）：
 
-1. [01. 快速上手与界面导览](./docs/user-guide/01-getting-started.md) — 双平面架构、欢迎向导、主界面 5 大区域、命令面板
+1. [01. 安装、快速上手与界面导览](./docs/user-guide/01-getting-started.md) — 多平台安装与校验、双平面架构、欢迎向导、主界面 5 大区域、命令面板
 2. [02. 工作区、终端与代码面板](./docs/user-guide/02-workspaces-and-terminals.md) — 工作区/标签页/分栏、快捷键、文件与 Git 变更面板、闪念清单
 3. [03. 无头 ACP 智能体与权限控制](./docs/user-guide/03-headless-acp-agents.md) — 14 种预设、结构化对话、Inbox/`--steer`、行内审批与内置 MCP
 4. [04. 上下文接力、快照回滚与全局 AI 助手](./docs/user-guide/04-handoff-checkpoints-and-ai.md) — Handoff / Fork / 旁路、隐藏 Git Ref 快照、全局 Core AI

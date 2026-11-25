@@ -416,6 +416,43 @@ pub fn build_deterministic_acp_digest(
     DeterministicDigest { semantic_title, micro_summary, initial_task_hint, task_hint, recent_user_turns, recent_steps }
 }
 
+fn is_auto_program_label(lower: &str) -> bool {
+    matches!(
+        lower,
+        "terminal" | "shell" | "zsh" | "bash" | "sh" | "fish" | "nu" | "nushell" | "dash"
+            | "pwsh" | "powershell" | "powershell 7" | "windows powershell" | "cmd"
+            | "claude" | "claude code" | "claude-code" | "codex" | "gemini" | "gemini-cli"
+            | "antigravity" | "agy" | "agy.real" | "opencode" | "cursor" | "cursor-agent"
+            | "pi" | "omp" | "oh-my-pi" | "kimi" | "kimi-code" | "qwen" | "qwen-code"
+            | "kiro" | "kiro-cli" | "qoder" | "qodercli" | "copilot" | "github-copilot"
+            | "amp" | "grok" | "hermes" | "goose" | "crush" | "dsh" | "dsh-tui"
+            | "zcode" | "zcode-cli" | "glm" | "agent"
+    )
+}
+
+fn is_launch_command_title(lower: &str, program: Option<&str>) -> bool {
+    let mut parts = lower.split_whitespace();
+    let Some(first) = parts.next() else {
+        return false;
+    };
+    let Some(second) = parts.next() else {
+        return false;
+    };
+    if !second.starts_with('-') {
+        return false;
+    }
+    let base = first.rsplit(['/', '\\']).next().unwrap_or(first);
+    let stem = base.strip_suffix(".exe").unwrap_or(base);
+    let clean = stem.strip_suffix(".real").unwrap_or(stem);
+    if is_auto_program_label(clean) {
+        return true;
+    }
+    program
+        .map(|p| p.trim().to_ascii_lowercase())
+        .filter(|p| !p.is_empty())
+        .is_some_and(|p| clean == p || clean == p.strip_suffix(".real").unwrap_or(&p))
+}
+
 fn clean_telling_osc_title(raw: Option<&str>, program: Option<&str>) -> Option<String> {
     let raw = raw?.trim();
     if raw.is_empty() {
@@ -441,16 +478,11 @@ fn clean_telling_osc_title(raw: Option<&str>, program: Option<&str>) -> Option<S
     }
     let lower = cleaned.to_ascii_lowercase();
     if let Some(p) = program.map(|s| s.trim().to_ascii_lowercase()).filter(|s| !s.is_empty())
-        && lower == p
+        && (lower == p || lower == p.strip_suffix(".real").unwrap_or(&p))
     {
         return None;
     }
-    if matches!(
-        lower.as_str(),
-        "terminal" | "shell" | "zsh" | "bash" | "sh" | "fish" | "pwsh" | "powershell" | "cmd"
-            | "claude" | "claude code" | "codex" | "gemini" | "antigravity" | "agy"
-            | "opencode" | "cursor" | "cursor-agent" | "pi" | "kimi" | "qwen" | "zcode" | "zcode-cli"
-    ) {
+    if is_auto_program_label(&lower) || is_launch_command_title(&lower, program) {
         return None;
     }
     clean_bounded(Some(cleaned), 24)
@@ -1583,6 +1615,24 @@ mod tests {
             Some("claude"),
         );
         assert_eq!(d_prog.semantic_title.as_deref(), Some("旧任务"));
+
+        // Shell preexec launch command lines must not be mistaken for a telling task title.
+        let d_launch = build_deterministic_screen_digest_with_title(
+            "Welcome to Antigravity",
+            None,
+            Some("agy --dangerously-skip-permissions"),
+            Some("agy.real"),
+        );
+        assert_eq!(d_launch.semantic_title, None);
+        assert!(d_launch.task_hint.is_empty());
+
+        let d_claude_launch = build_deterministic_screen_digest_with_title(
+            "Welcome back!",
+            None,
+            Some("claude --dangerously-skip-permissions"),
+            Some("claude"),
+        );
+        assert_eq!(d_claude_launch.semantic_title, None);
     }
 
     #[test]

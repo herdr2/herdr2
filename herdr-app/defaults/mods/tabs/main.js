@@ -116,6 +116,17 @@ function isAutoTabName(tab, prog, lead = null) {
   return isAutoName(tab.name, prog, lead);
 }
 
+function isLaunchCommandTitle(live, prog, lead = null) {
+  const parts = String(live ?? "").trim().toLowerCase().split(/\s+/);
+  if (parts.length < 2 || !parts[1].startsWith("-")) return false;
+  const base = parts[0].split(/[\\/]/).pop() ?? parts[0];
+  const cleanCmd = base.replace(/\.exe$/i, "").replace(/\.real$/i, "");
+  if (AUTO_TAB_NAMES.has(cleanCmd)) return true;
+  if (prog && cleanCmd === String(prog).trim().toLowerCase()) return true;
+  if (lead?.program?.key && cleanCmd === String(lead.program.key).trim().toLowerCase()) return true;
+  return false;
+}
+
 // A tab Herdr named (unnamed, or after a default shell/agent program) follows its agent's
 // semantic title or live title, as the agents list does; a name the person gave stays.
 function label(tab, lead, rec = null) {
@@ -131,7 +142,7 @@ function label(tab, lead, rec = null) {
     const live = clean(raw);
     // clean() would strip a path's leading ~ or /: test the title with only its status glyph gone.
     const path = /^[~/]|^[A-Za-z]:\\/.test((raw ?? "").replace(/^[^\p{L}\p{N}~/]+/u, ""));
-    const telling = live && live !== lead.terminal && live !== prog && !path && !live.includes("@") && live.toLowerCase() !== lead.program?.key;
+    const telling = live && live !== lead.terminal && live !== prog && !path && !live.includes("@") && live.toLowerCase() !== lead.program?.key && !isLaunchCommandTitle(live, prog, lead);
     if (auto && telling) return live;
   }
   if (auto) {
@@ -151,7 +162,7 @@ function paneDisplayName(p) {
   if (p?.program?.agent) {
     const live = clean(p.title);
     const path = /^[~/]|^[A-Za-z]:\\/.test((p.title ?? "").replace(/^[^\p{L}\p{N}~/]+/u, ""));
-    const telling = live && live !== p.terminal && live !== p.program.name && !path && !live.includes("@") && live.toLowerCase() !== p.program.key;
+    const telling = live && live !== p.terminal && live !== p.program.name && !path && !live.includes("@") && live.toLowerCase() !== p.program.key && !isLaunchCommandTitle(live, p.program.name, p);
     return telling ? live : p.program.name;
   }
   return p?.program?.shell && p.program?.name

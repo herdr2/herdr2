@@ -23,7 +23,7 @@ pub use briefing::{
     BatchPermissionGroup, BriefingAgentInput, BriefingCounts, BriefingDroveInput, BriefingItem, BriefingParams,
     BriefingSnapshot, BriefingTerminalInput, build_deterministic_briefing, enhance_briefing_headline,
 };
-pub use client::AiTestResult;
+pub use client::{AiModelsResult, AiTestResult, allows_keyless_url};
 pub use config::{
     AiCoreConfig, AiPaths, format_ms_iso, is_loopback_http_url, mask_key, normalize_ai_language,
     normalize_prompt_mode, now_iso, now_ms_u64, parse_ai_token_size, parse_iso_ms, prompt_lang_code,
@@ -45,9 +45,9 @@ use crate::rpc::RpcError;
 use cache::AiResultCache;
 use client::{
     EndpointCapabilities, KV_CACHE_DEGRADE_THRESHOLD, build_chat_payload_candidates, chat_endpoints,
-    curl_json_timeout, effective_max_tokens, extract_json_object, fetch_ai_models, first_model_id,
-    http_json_request, models_endpoints, parse_usage_tokens, record_winning_variant, refine_capabilities_from_error,
-    should_retry_without_optional_fields, test_ai_connection, truncate_for_context,
+    curl_json_timeout, effective_max_tokens, extract_json_object, fetch_ai_models, fetch_ai_models_detailed,
+    first_model_id, http_json_request, models_endpoints, parse_usage_tokens, record_winning_variant,
+    refine_capabilities_from_error, should_retry_without_optional_fields, test_ai_connection, truncate_for_context,
 };
 use compact::{fingerprint_hex, fnv1a_64, redact_secrets, strip_and_dedup_lines};
 use config::{
@@ -361,6 +361,17 @@ pub struct AiProbePromptModeResult {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
+pub struct AiModelsParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
 pub struct AiTestParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on: Option<String>,
@@ -477,7 +488,7 @@ impl AiRuntime {
             return false;
         }
         let (key, _) = read_ai_key(&self.paths);
-        key.is_some() || is_loopback_http_url(&cfg.base_url)
+        key.is_some() || allows_keyless_url(&cfg.base_url)
     }
 
     pub fn notes_digest_enabled(&self) -> bool {
@@ -660,7 +671,7 @@ impl AiRuntime {
         let cir = self.circuit.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let has_key = key.is_some();
         let is_local = is_loopback_http_url(&cfg.base_url);
-        let configured = cfg.enabled && !cfg.base_url.trim().is_empty() && (has_key || is_local);
+        let configured = cfg.enabled && !cfg.base_url.trim().is_empty() && (has_key || allows_keyless_url(&cfg.base_url));
         let key_source = if has_key {
             src.to_string()
         } else if is_local && !cfg.base_url.trim().is_empty() {
@@ -894,6 +905,30 @@ impl AiRuntime {
         Ok(self.status_refresh_models().await)
     }
 
+    pub async fn list_models(
+        &self,
+        url_override: Option<String>,
+        key_override: Option<String>,
+    ) -> Result<AiModelsResult, RpcError> {
+        let cfg = self.config_snapshot();
+        let base_url = url_override.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| cfg.base_url.clone());
+        if base_url.trim().is_empty() {
+            return Err(RpcError::invalid_params("AI Service URL is empty"));
+        }
+        let saved_norm = cfg.base_url.trim().trim_end_matches('/');
+        let target_norm = base_url.trim().trim_end_matches('/');
+        let same_as_saved = !saved_norm.is_empty() && target_norm == saved_norm;
+        let (stored_key, _) = read_ai_key(&self.paths);
+        let key = key_override
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| if same_as_saved { stored_key } else { None });
+        let res = fetch_ai_models_detailed(&base_url, key.as_deref()).await;
+        if res.ok && !res.models.is_empty() && same_as_saved {
+            self.update_models(&res.base_url, res.models.clone());
+        }
+        Ok(res)
+    }
+
     pub async fn test_connection(
         &self,
         url_override: Option<String>,
@@ -901,12 +936,17 @@ impl AiRuntime {
         model_override: Option<String>,
     ) -> Result<AiTestResult, RpcError> {
         let cfg = self.config_snapshot();
-        let base_url = url_override.filter(|s| !s.trim().is_empty()).unwrap_or(cfg.base_url);
+        let base_url = url_override.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| cfg.base_url.clone());
         if base_url.trim().is_empty() {
             return Err(RpcError::invalid_params("AI Service URL is empty"));
         }
+        let saved_norm = cfg.base_url.trim().trim_end_matches('/');
+        let target_norm = base_url.trim().trim_end_matches('/');
+        let same_as_saved = !saved_norm.is_empty() && target_norm == saved_norm;
         let (stored_key, _) = read_ai_key(&self.paths);
-        let key = key_override.filter(|s| !s.trim().is_empty()).or(stored_key);
+        let key = key_override
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| if same_as_saved { stored_key } else { None });
         let model = model_override
             .filter(|s| !s.trim().is_empty())
             .or_else(|| (!cfg.model.trim().is_empty()).then_some(cfg.model));
@@ -968,8 +1008,7 @@ impl AiRuntime {
 
         let base = cfg.base_url.trim().trim_end_matches('/').to_string();
         let (key, _) = read_ai_key(&self.paths);
-        let is_local = is_loopback_http_url(&base);
-        if !cfg.enabled || base.is_empty() || (key.is_none() && !is_local) {
+        if !cfg.enabled || base.is_empty() || (key.is_none() && !allows_keyless_url(&base)) {
             return Ok(AiProbePromptModeResult {
                 ok: true,
                 detected_mode: "pending".into(),
@@ -1231,7 +1270,7 @@ impl AiRuntime {
 
         let (stored_key, _) = read_ai_key(&self.paths);
         let key = req.key_override.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(String::from).or(stored_key);
-        if key.is_none() && !is_loopback_http_url(&base) {
+        if key.is_none() && !allows_keyless_url(&base) {
             return Err("AI API key is not configured".into());
         }
 
@@ -2314,6 +2353,82 @@ mod tests {
         assert!(!probe2.status.usage.prompt_cache_auto_degraded);
         assert_eq!(probe2.status.usage.prompt_cache_detected_mode.as_deref(), Some("shared_prefix"));
         assert_eq!(probe2.status.usage.effective_prompt_mode.as_deref(), Some("shared_prefix"));
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn list_models_works_keyless_and_does_not_leak_other_provider_key() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let saw_auth = Arc::new(Mutex::new(Vec::<bool>::new()));
+        let saw_auth_srv = saw_auth.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let Ok(mut conn) = stream else { break };
+                let mut buf = [0u8; 4096];
+                let n = conn.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                saw_auth_srv.lock().unwrap().push(req.contains("authorization: bearer"));
+                let body = r#"{"data":[{"id":"magpie-a"},{"id":"magpie-b"}]}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = conn.write_all(resp.as_bytes());
+            }
+        });
+
+        let tmp = crate::test_tmp().join(format!("ai-models-keyless-{}", crate::platform::random_hex()));
+        let paths = Paths {
+            socket: tmp.join("core.sock"),
+            holder_socket: tmp.join("holder.sock"),
+            state: tmp.join("state"),
+            config: tmp.join("config/config.toml"),
+        };
+        let rt = AiRuntime::open(&paths).unwrap();
+
+        // Save DeepSeek with a key first.
+        rt.update_settings(AiSettingsSetParams {
+            enabled: Some(true),
+            base_url: Some("https://api.deepseek.com/v1".into()),
+            api_key: Some("sk-deepseek-secret".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // Querying a different local Magpie URL without apiKey must succeed and NOT send DeepSeek's key.
+        let local_url = format!("http://127.0.0.1:{port}/v1");
+        let res = rt.list_models(Some(local_url.clone()), None).await.unwrap();
+        assert!(res.ok, "expected ok: {res:?}");
+        assert_eq!(res.models, vec!["magpie-a", "magpie-b"]);
+        assert_eq!(*saw_auth.lock().unwrap(), vec![false]);
+
+        // Strict cloud hosts still require a key, whereas custom/local gateways allow keyless operation.
+        assert!(!allows_keyless_url("https://api.deepseek.com/v1"));
+        assert!(!allows_keyless_url("https://api.openai.com/v1"));
+        assert!(allows_keyless_url(&local_url));
+        assert!(allows_keyless_url("http://192.168.1.50:8080/v1"));
+
+        // Saving custom keyless gateway clears old key and marks configured=true.
+        let st = rt
+            .update_settings(AiSettingsSetParams {
+                enabled: Some(true),
+                base_url: Some(local_url),
+                model: Some("magpie-b".into()),
+                clear_key: Some(true),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert!(st.configured);
+        assert_eq!(st.model, "magpie-b");
+        assert_eq!(st.key_masked, None);
 
         let _ = std::fs::remove_dir_all(tmp);
     }

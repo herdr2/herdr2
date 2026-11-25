@@ -62,6 +62,19 @@ enum AiCmd {
         #[arg(long)]
         consume: bool,
     },
+    /// Fetch available models from an OpenAI-compatible AI endpoint (/models).
+    Models {
+        #[arg(long, value_name = "FILE")]
+        file: Option<std::path::PathBuf>,
+        #[arg(long, value_name = "URL")]
+        url: Option<String>,
+        /// Target remote machine (`h2 machine ls`).
+        #[arg(long, value_name = "MACHINE")]
+        on: Option<String>,
+        /// Delete `--file` right after reading it.
+        #[arg(long)]
+        consume: bool,
+    },
     /// Test the shared Core AI assistant URL and API key.
     Test {
         #[arg(long, value_name = "FILE")]
@@ -578,6 +591,36 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
                 }
                 let r = call("ai.settings.set", params)?;
                 Out { json: r, human: "AI settings saved".into() }
+            }
+            AiCmd::Models { file, url, on, consume } => {
+                let mut params = if let Some(path) = file {
+                    let text = std::fs::read_to_string(&path)
+                        .map_err(|e| RpcError::new("usage", format!("cannot read {}: {e}", path.display()), ""))?;
+                    if consume {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    serde_json::from_str::<Value>(&text)
+                        .map_err(|e| RpcError::new("usage", format!("invalid JSON in {}: {e}", path.display()), ""))?
+                } else {
+                    json!({})
+                };
+                if let Some(obj) = params.as_object_mut() {
+                    if let Some(u) = url {
+                        obj.insert("baseUrl".into(), json!(u));
+                    }
+                    if let Some(o) = on {
+                        obj.insert("on".into(), json!(o));
+                    }
+                }
+                let r = call("ai.models", params)?;
+                let ok = r["ok"].as_bool().unwrap_or(false);
+                let human = if ok {
+                    let count = r["models"].as_array().map_or(0, Vec::len);
+                    format!("AI models ({}ms): {count} found", r["latencyMs"].as_u64().unwrap_or(0))
+                } else {
+                    format!("AI models failed: {}", r["error"].as_str().unwrap_or("unknown error"))
+                };
+                Out { json: r, human }
             }
             AiCmd::Test { file, url, model, on, consume } => {
                 let mut params = if let Some(path) = file {
@@ -1374,6 +1417,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("drove web", "drove.web.open"),
     ("ai status", "ai.status"),
     ("ai settings-set", "ai.settings.set"),
+    ("ai models", "ai.models"),
     ("ai test", "ai.test"),
     ("ai probe-prompt-mode", "ai.probe_prompt_mode"),
     ("ai handoff-recommend", "ai.handoff_recommend"),

@@ -319,8 +319,8 @@ features:
     name: 共享 Core AI 运行时、KV-Cache 复用与 Drove 智能配置
     description: >
       Shared `Core.ai` runtime with immutable >1024-token prefix, `AiSessionPool`, TTL cache,
-      input compaction, circuit breaker, all 11 `ai.*` RPCs (`ai.status`, `ai.settings.set`,
-      `ai.test`, `ai.probe_prompt_mode`, `ai.complete`, `ai.classify_terminal_state`,
+      input compaction, circuit breaker, all 12 `ai.*` RPCs (`ai.status`, `ai.settings.set`,
+      `ai.models`, `ai.test`, `ai.probe_prompt_mode`, `ai.complete`, `ai.classify_terminal_state`,
       `ai.handoff_recommend`, `ai.briefing`, `ai.summarize_agent`, `ai.commit_message`,
       `ai.polish_prompt`), and Drove config/probe RPCs (`drove.settings.get`/`set`, `drove.probe`,
       `drove.ai.test`, `drove.roles.ai_configure`, `drove.magpie.test`) with `0600` secret storage.
@@ -341,6 +341,7 @@ features:
         - drove.magpie.test
         - ai.status
         - ai.settings.set
+        - ai.models
         - ai.test
         - ai.probe_prompt_mode
         - ai.complete

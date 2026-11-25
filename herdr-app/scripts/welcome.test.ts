@@ -3,6 +3,7 @@ import { readFile } from "node:fs/promises";
 import {
   PAGES,
   AI_PAGE,
+  AI_PROVIDERS,
   DEEPSEEK_PRESET,
   PANELS,
   SHORTCUT_HIGHLIGHTS,
@@ -13,6 +14,7 @@ import {
   boundShortcut,
   normalizeMachines,
   summarizeAiStatus,
+  normalizeFetchedModels,
   isAiGateSatisfied,
   canAccessPage,
   agentCustomizePrompt,
@@ -73,18 +75,22 @@ test("normalizeMachines filters out temporary sandboxes and handles malformed ou
   expect(normalizeMachines("not-json")).toEqual([]);
 });
 
-test("summarizeAiStatus extracts configured flag, model, and baseUrl", () => {
+test("summarizeAiStatus extracts configured flag, model, baseUrl, keyMasked, and availableModels", () => {
   const stdout = JSON.stringify({
     configured: true,
     enabled: true,
     model: " gpt-5.4 ",
     baseUrl: "https://api.example.com/v1",
+    keyMasked: "sk-1***90",
+    availableModels: ["gpt-5.4", "deepseek-chat"],
   });
   expect(summarizeAiStatus(stdout)).toEqual({
     configured: true,
     enabled: true,
     model: "gpt-5.4",
     baseUrl: "https://api.example.com/v1",
+    keyMasked: "sk-1***90",
+    availableModels: ["gpt-5.4", "deepseek-chat"],
   });
   expect(summarizeAiStatus("bad")).toBeNull();
 });
@@ -183,12 +189,13 @@ test("Welcome view persists appearance, switches language, toggles panels, and r
   expect(source).not.toContain("Scrollbar.vertical");
 });
 
-test("Welcome enforces DeepSeek/AI connectivity gate unless verified or bypassed", () => {
+test("Welcome AI config: two providers only, no default model, fetch models, optional key, and skip", async () => {
   expect(DEEPSEEK_PRESET.baseUrl).toBe("https://api.deepseek.com/v1");
-  expect(DEEPSEEK_PRESET.model).toBe("deepseek-chat");
+  expect((DEEPSEEK_PRESET as any).model).toBeUndefined();
+  expect(AI_PROVIDERS.map((p) => p.id)).toEqual(["deepseek", "custom"]);
   expect(AI_PAGE).toBe(3);
 
-  // Unverified AI blocks proceeding past AI_PAGE
+  // Unverified AI blocks proceeding past AI_PAGE unless skipped/bypassed
   expect(isAiGateSatisfied(null, null, false)).toBe(false);
   expect(isAiGateSatisfied({ configured: true }, null, false)).toBe(false);
   expect(isAiGateSatisfied({ configured: true }, { ok: false }, false)).toBe(false);
@@ -199,6 +206,146 @@ test("Welcome enforces DeepSeek/AI connectivity gate unless verified or bypassed
   expect(isAiGateSatisfied({ configured: true }, { ok: true }, false)).toBe(true);
   expect(canAccessPage(4, 3, true)).toBe(4);
 
-  // QA bypass flag unlocks when explicitly set
+  // Skip / bypass flag unlocks when explicitly set
   expect(isAiGateSatisfied(null, null, true)).toBe(true);
+
+  // normalizeFetchedModels deduplicates and extracts errors cleanly
+  expect(normalizeFetchedModels(JSON.stringify({ ok: true, models: ["gpt-5.4", " gpt-5.4 ", "claude-sonnet"] }))).toEqual({
+    ok: true,
+    models: ["gpt-5.4", "claude-sonnet"],
+    error: null,
+    latencyMs: 0,
+  });
+  expect(normalizeFetchedModels(JSON.stringify({ ok: false, error: "HTTP 401: Unauthorized" }))).toEqual({
+    ok: false,
+    models: [],
+    error: "HTTP 401: Unauthorized",
+    latencyMs: 0,
+  });
+
+  // Behavioral test: keyless local Magpie flow + skip flow
+  const source = await readFile(new URL("../defaults/frame/welcome/main.js", import.meta.url), "utf8");
+  const modelMod = await import("../defaults/frame/welcome/model.js");
+
+  const makeInput = () => {
+    let val = "";
+    return {
+      value: () => val,
+      set_value: (v: string) => { val = v; },
+      set_masked: () => {},
+    };
+  };
+
+  const writtenFiles: Record<string, string> = {};
+  const coreCalls: { args: string[]; payload: any }[] = [];
+  const env: Record<string, any> = {
+    View: class {},
+    div: () => ({}),
+    svg: () => ({}),
+    image: () => ({}),
+    v_flex: () => ({}),
+    h_flex: () => ({}),
+    InputState: { new: () => makeInput() },
+    Input: { new: () => ({}) },
+    Popup: { new: () => ({}) },
+    ...modelMod,
+    spaces: () => [],
+    run: () => {},
+    theme: () => ({}),
+    props: () => ({ overlay: "ov-welcome" }),
+    closeOverlay: () => {},
+    shared: () => undefined,
+    setShared: () => {},
+    h2: async (args: string[]) => {
+      const fileIdx = args.indexOf("--file");
+      const payload = fileIdx >= 0 ? JSON.parse(writtenFiles[args[fileIdx + 1]] ?? "{}") : null;
+      coreCalls.push({ args, payload });
+      if (args[0] === "ai" && args[1] === "models") {
+        return { code: 0, stdout: JSON.stringify({ ok: true, models: ["magpie-model-a", "magpie-model-b"], latencyMs: 12 }) };
+      }
+      if (args[0] === "ai" && args[1] === "test") {
+        return { code: 0, stdout: JSON.stringify({ ok: true, discoveredModel: payload.model, availableModels: ["magpie-model-a", "magpie-model-b"], latencyMs: 25 }) };
+      }
+      if (args[0] === "ai" && args[1] === "settings-set") {
+        return { code: 0, stdout: JSON.stringify({ configured: true, enabled: true, baseUrl: payload.baseUrl, model: payload.model, availableModels: ["magpie-model-a", "magpie-model-b"] }) };
+      }
+      return { code: 0, stdout: "{}" };
+    },
+    hc: async () => ({ code: 0, stdout: "{}" }),
+    appHome: () => "/home/.config/herdr2-app",
+    readTextFile: async () => "{}",
+    writeTextFile: async (p: string, text: string) => { writtenFiles[p] = text; },
+    settings: () => ({ language: "en", zoom: 1 }),
+    layout: () => ({ id: "root", children: [] }),
+    keys: () => [],
+    updates: () => ({ app: { version: "0.3.0" }, core: { version: "0.3.0" } }),
+    appWindow: () => ({ platform: "linux" }),
+    pickFolder: async () => null,
+    checking: () => false,
+  };
+
+  const body = source
+    .replace(/^import[\s\S]*?from\s+["'][^"']+["'];\s*\n/gm, "")
+    .replace("export default class Welcome", "return class Welcome");
+  const Welcome = new Function(...Object.keys(env), body)(...Object.values(env));
+
+  const cx = {
+    notify: () => {},
+    focus_handle: () => ({ focus: () => {} }),
+    timer: { after: () => {}, every: () => {} },
+    spawn: (fn: (cx: any) => Promise<void>) => { void fn({ notify: () => {} }); },
+  };
+
+  // Scenario A: Local keyless Magpie flow
+  const view = new Welcome();
+  view.init({}, cx);
+  await new Promise((r) => setTimeout(r, 10));
+  expect(view.aiSelectedModel).toBe("");
+  expect(view.aiReady()).toBe(false);
+
+  // Switch to Custom OpenAI-compatible clears DeepSeek URL and keeps model empty
+  view.selectAiProvider("custom", cx);
+  expect(view.aiUrlInput.value()).toBe("");
+  expect(view.aiSelectedModel).toBe("");
+
+  // Enter local Magpie URL without API key
+  view.aiUrlInput.set_value("http://127.0.0.1:8080/v1");
+  expect(view.aiKeyInput.value()).toBe("");
+
+  // Saving without selecting a model fails with model selection prompt (NOT API key prompt)
+  view.saveAndTestAi(cx);
+  expect(view.aiError).toContain("model");
+  expect(view.aiError.toLowerCase()).not.toContain("key");
+
+  // Fetch models without API key succeeds and opens dropdown with no default preselected
+  view.fetchAiModels(cx);
+  await new Promise((r) => setTimeout(r, 15));
+  expect(view.aiModels).toEqual(["magpie-model-a", "magpie-model-b"]);
+  expect(view.aiSelectedModel).toBe("");
+  expect(view.aiModelMenuOpen).toBe(true);
+  const modelsCall = coreCalls.find((c) => c.args[1] === "models");
+  expect(modelsCall?.payload).toEqual({ baseUrl: "http://127.0.0.1:8080/v1" });
+
+  // User picks a model from dropdown and saves/tests with empty API key
+  view.selectAiModel("magpie-model-b", cx);
+  expect(view.aiSelectedModel).toBe("magpie-model-b");
+  expect(view.aiModelMenuOpen).toBe(false);
+
+  view.saveAndTestAi(cx);
+  await new Promise((r) => setTimeout(r, 15));
+  expect(view.aiError).toBeNull();
+  expect(view.aiReady()).toBe(true);
+  const saveCall = coreCalls.find((c) => c.args[1] === "settings-set");
+  expect(saveCall?.payload).toEqual({ enabled: true, baseUrl: "http://127.0.0.1:8080/v1", model: "magpie-model-b" });
+
+  // Scenario B: Skip button unlocks Page 4 directly without configuring AI
+  const view2 = new Welcome();
+  view2.init({}, cx);
+  await new Promise((r) => setTimeout(r, 10));
+  view2.page = AI_PAGE;
+  expect(view2.aiReady()).toBe(false);
+  view2.skipAi(cx);
+  expect(view2.aiSkipped).toBe(true);
+  expect(view2.aiReady()).toBe(true);
+  expect(view2.page).toBe(4);
 });

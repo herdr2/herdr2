@@ -631,14 +631,11 @@ pub(crate) fn session_id_from_transcript(cli_kind: &str, path: &Path) -> Option<
             (!stem.is_empty()).then(|| stem.to_string())
         }
         "agy" => {
-            let stem = path.file_stem()?.to_string_lossy().trim().to_string();
-            if !stem.is_empty() && stem != "transcript" {
-                return Some(stem);
+            if let Some(cid) = crate::pty_transcript::agy_cid_from_path(path) {
+                return Some(cid);
             }
-            path.parent()
-                .and_then(|p| p.file_name())
-                .map(|s| s.to_string_lossy().trim().to_string())
-                .filter(|s| !s.is_empty())
+            let stem = path.file_stem()?.to_string_lossy().trim().to_string();
+            crate::pty_transcript::is_valid_agy_cid(&stem).then_some(stem)
         }
         _ => None,
     }
@@ -1080,13 +1077,16 @@ pub fn extract_saved_cli_from_argv(
         return None;
     }
 
-    let sid = session_id.filter(|s| !s.trim().is_empty()).or_else(|| match kind {
-        PtyCliKind::Claude => extract_flag_value(&cli_argv, &["--session-id", "--resume", "-r"]),
-        PtyCliKind::Codex => extract_codex_resume_id(&cli_argv),
-        PtyCliKind::Agy => extract_flag_value(&cli_argv, &["--conversation", "--resume", "-r"]),
-        PtyCliKind::Zcode => extract_flag_value(&cli_argv, &["--resume"]),
-        PtyCliKind::Generic => None,
-    });
+    let sid = session_id
+        .filter(|s| !s.trim().is_empty() && (kind != PtyCliKind::Agy || crate::pty_transcript::is_valid_agy_cid(s)))
+        .or_else(|| match kind {
+            PtyCliKind::Claude => extract_flag_value(&cli_argv, &["--session-id", "--resume", "-r"]),
+            PtyCliKind::Codex => extract_codex_resume_id(&cli_argv),
+            PtyCliKind::Agy => extract_flag_value(&cli_argv, &["--conversation", "--resume", "-r"])
+                .filter(|s| crate::pty_transcript::is_valid_agy_cid(s)),
+            PtyCliKind::Zcode => extract_flag_value(&cli_argv, &["--resume"]),
+            PtyCliKind::Generic => None,
+        });
 
     Some(crate::terminals::SavedCliResume {
         kind: kind.as_str().to_string(),
@@ -1117,7 +1117,9 @@ pub fn verify_cli_session_exists(
     sid: Option<&str>,
     transcript_path: Option<&str>,
 ) -> Option<String> {
-    let clean_sid = sid.map(str::trim).filter(|s| !s.is_empty());
+    let clean_sid = sid
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && (kind != PtyCliKind::Agy || crate::pty_transcript::is_valid_agy_cid(s)));
     if let Some(tp) = transcript_path.map(str::trim).filter(|s| !s.is_empty()) {
         let p = Path::new(tp);
         if non_empty_file(p) {
@@ -1231,7 +1233,9 @@ pub async fn discover_and_bind_cli_session(core: &Arc<Core>, id: u32) {
         let Some(ref saved) = t.saved_cli else {
             return;
         };
-        if saved.session_id.is_some() && saved.transcript_path.is_some() {
+        if saved.session_id.as_deref().is_some_and(|s| saved.kind != "agy" || crate::pty_transcript::is_valid_agy_cid(s))
+            && saved.transcript_path.is_some()
+        {
             return;
         }
         let cwd = t
@@ -1247,11 +1251,21 @@ pub async fn discover_and_bind_cli_session(core: &Arc<Core>, id: u32) {
         let mut excluded = std::collections::HashSet::new();
         for (other_id, other) in &st.pty_reg.terminals {
             if *other_id != id && other.is_live() {
-                if let Some(s) = other.saved_cli.as_ref().and_then(|c| c.session_id.as_deref()) {
+                if let Some(s) = other.saved_cli.as_ref().and_then(|c| c.session_id.as_deref())
+                    && (saved.kind != "agy" || crate::pty_transcript::is_valid_agy_cid(s))
+                {
                     excluded.insert(s.to_string());
                 }
-                if let Some(s) = st.checkpoints.get(&other.address).and_then(|c| c.cli_session_id.as_deref()) {
+                if let Some(s) = st.checkpoints.get(&other.address).and_then(|c| c.cli_session_id.as_deref())
+                    && (saved.kind != "agy" || crate::pty_transcript::is_valid_agy_cid(s))
+                {
                     excluded.insert(s.to_string());
+                }
+                if saved.kind == "agy"
+                    && let Some(opid) = other.foreground.as_ref().and_then(|f| u32::try_from(f.pid).ok())
+                    && let crate::pty_transcript::ProcAgyProbe::Locked(cid) = crate::pty_transcript::probe_agy_proc(opid)
+                {
+                    excluded.insert(cid);
                 }
             }
         }
@@ -1301,7 +1315,8 @@ pub async fn discover_and_bind_cli_session(core: &Arc<Core>, id: u32) {
         return;
     }
     let mut changed = false;
-    if saved.session_id.is_none() {
+    let needs_sid_update = saved.session_id.as_deref().is_none_or(|s| kind_str == "agy" && !crate::pty_transcript::is_valid_agy_cid(s));
+    if needs_sid_update {
         saved.session_id = Some(sid.clone());
         changed = true;
     }
@@ -1312,9 +1327,9 @@ pub async fn discover_and_bind_cli_session(core: &Arc<Core>, id: u32) {
     if changed {
         let mut tc = core.target_checkpoints(&mut st, &addr);
         if tc.cli_kind.is_none() || tc.cli_kind.as_deref() == Some("generic") {
-            tc.cli_kind = Some(kind_str);
+            tc.cli_kind = Some(kind_str.clone());
         }
-        if tc.cli_session_id.is_none() {
+        if tc.cli_session_id.as_deref().is_none_or(|s| kind_str == "agy" && !crate::pty_transcript::is_valid_agy_cid(s)) {
             tc.cli_session_id = Some(sid);
         }
         if tc.cli_transcript_path.is_none() {
@@ -3550,5 +3565,28 @@ mod tests {
         );
         assert_eq!(by_hand[0], "/bin/zsh");
         assert!(by_hand.windows(3).any(|w| w == ["zcode", "--resume", sid]), "{by_hand:?}");
+    }
+
+    #[test]
+    fn agy_session_id_extraction_returns_brain_uuid_and_rejects_transcript_full() {
+        let cid = "4309fd8c-e5e1-4860-b9cf-ea8fa38f3fa7";
+        let full = PathBuf::from(format!(
+            "/home/u/.gemini/antigravity-cli/brain/{cid}/.system_generated/logs/transcript_full.jsonl"
+        ));
+        let compact = PathBuf::from(format!(
+            "/home/u/.gemini/antigravity-cli/brain/{cid}/.system_generated/logs/transcript.jsonl"
+        ));
+        assert_eq!(session_id_from_transcript("agy", &full).as_deref(), Some(cid));
+        assert_eq!(session_id_from_transcript("agy", &compact).as_deref(), Some(cid));
+
+        let bogus_argv = vec![
+            "/home/u/.local/bin/agy.real".to_string(),
+            "--dangerously-skip-permissions".to_string(),
+            "--conversation".to_string(),
+            "transcript_full".to_string(),
+        ];
+        let saved = extract_saved_cli_from_argv(&bogus_argv, None, None, None).expect("agy saved");
+        assert_eq!(saved.kind, "agy");
+        assert_eq!(saved.session_id, None, "bogus transcript_full must not be captured as agy session_id");
     }
 }

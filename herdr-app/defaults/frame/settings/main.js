@@ -301,6 +301,7 @@ export default class Settings extends View {
     this.skillAiHintInput = InputState.new({ placeholder: this.tr("Optional: specify an agent or custom directory (leave blank to auto-detect all)…", "可选：输入想适配的 Agent 名称或特殊路径（留空则自动全面识别）…") });
     this.recordingTarget = null;
     this.lastRecordedSeq = Number(shared("settings.recorded_shortcut")?.seq ?? 0);
+    this.lastKeysReassignedSeq = Number(shared("keys.reassigned")?.seq ?? 0);
     this.keysNotice = null;
     this.keysError = null;
     this.handle = cx.focus_handle();
@@ -5975,8 +5976,41 @@ export default class Settings extends View {
     }
   }
 
+  syncExternalKeysChange(cx) {
+    const evt = shared("keys.reassigned");
+    const seq = Number(evt?.seq ?? 0);
+    if (seq <= this.lastKeysReassignedSeq) return;
+    this.lastKeysReassignedSeq = seq;
+    const isMac = this.isMacPlatform();
+    const list = typeof keys === "function" ? keys() : [];
+    this.keysDoc = parseKeysDoc(null, list, isMac);
+    this.keysRaw = null;
+    if (evt?.from && evt?.to) {
+      const fromLabel = formatChord(String(evt.from), isMac);
+      const toLabel = formatChord(String(evt.to), isMac);
+      this.keysNotice = this.tr(
+        `${fromLabel} is occupied by another app as a global hotkey — switched "${findActionLabel(String(evt.action ?? "prompt.polish"), false)}" to ${toLabel}.`,
+        `检测到 ${fromLabel} 已被其他软件占用为全局热键，已自动将「${findActionLabel(String(evt.action ?? "prompt.polish"), true)}」切换为 ${toLabel}。`,
+      );
+      this.keysError = null;
+    } else if (evt?.from) {
+      const fromLabel = formatChord(String(evt.from), isMac);
+      this.keysError = this.tr(
+        `${fromLabel} is occupied by another app as a global hotkey. Click the shortcut badge below to assign a free key combination.`,
+        `检测到 ${fromLabel} 已被其他软件占用为全局热键，请点击下方快捷键徽章重新绑定未占用的组合键。`,
+      );
+    }
+    if (!(typeof checking === "function" && checking())) {
+      cx.spawn(async (reloadCx) => {
+        await this.loadKeys();
+        reloadCx.notify();
+      });
+    }
+  }
+
   render(cx) {
     this.syncRecordedShortcut(cx);
+    this.syncExternalKeysChange(cx);
     const t = theme();
     const nav = v_flex()
       .flex_none()

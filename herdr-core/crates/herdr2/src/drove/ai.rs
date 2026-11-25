@@ -841,7 +841,7 @@ pub async fn configure_roles_with_ai(
     }
     let (stored_key, _) = core.ai.read_key();
     let has_key = params.api_key.as_deref().map(str::trim).is_some_and(|s| !s.is_empty()) || stored_key.is_some();
-    if !has_key && !crate::ai::is_loopback_http_url(raw_base) {
+    if !has_key && !crate::ai::allows_keyless_url(raw_base) {
         return fail("请先在「AI 设置」中配置 API Key".into(), false);
     }
 

@@ -69,6 +69,17 @@ function isAutoSubAgentName(rawName, { address, programName, programKey } = {}) 
   return false;
 }
 
+function isLaunchCommandTitle(live, { programName, programKey } = {}) {
+  const parts = String(live ?? "").trim().toLowerCase().split(/\s+/);
+  if (parts.length < 2 || !parts[1].startsWith("-")) return false;
+  const base = parts[0].split(/[\\/]/).pop() ?? parts[0];
+  const cleanCmd = base.replace(/\.exe$/i, "").replace(/\.real$/i, "");
+  if (AUTO_TAB_NAMES.has(cleanCmd)) return true;
+  if (programName && cleanCmd === String(programName).trim().toLowerCase()) return true;
+  if (programKey && cleanCmd === String(programKey).trim().toLowerCase()) return true;
+  return false;
+}
+
 export function isTellingTitle(rawTitle, { address, programName, programKey } = {}) {
   const live = cleanTitle(rawTitle);
   if (!live) return false;
@@ -79,6 +90,7 @@ export function isTellingTitle(rawTitle, { address, programName, programKey } = 
   if (programName && lower === String(programName).trim().toLowerCase()) return false;
   if (isPathLike(rawTitle) || live.includes("@")) return false;
   if (programKey && lower === String(programKey).trim().toLowerCase()) return false;
+  if (isLaunchCommandTitle(live, { programName, programKey })) return false;
   return true;
 }
 
