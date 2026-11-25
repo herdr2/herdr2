@@ -52,6 +52,21 @@ struct FramedSub {
     task: tokio::task::AbortHandle,
 }
 
+struct FullProbeGuard<'a> {
+    rt: &'a DroveRuntime,
+    notify: Arc<Notify>,
+}
+
+impl Drop for FullProbeGuard<'_> {
+    fn drop(&mut self) {
+        let mut slot = self.rt.full_probe_inflight.lock().unwrap_or_else(|p| p.into_inner());
+        if slot.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &self.notify)) {
+            *slot = None;
+        }
+        self.notify.notify_waiters();
+    }
+}
+
 /// Live runtime state for Drove inside a single `herdr2` daemon.
 pub struct DroveRuntime {
     pub paths: DrovePaths,
@@ -72,6 +87,7 @@ pub struct DroveRuntime {
     core: Mutex<Weak<Core>>,
     probe_cache: Mutex<Option<ProbeSnapshot>>,
     probe_is_full: AtomicBool,
+    full_probe_inflight: Mutex<Option<Arc<Notify>>>,
     agent_models_cache: Mutex<BTreeMap<String, CachedAgentModels>>,
     subs: Mutex<Vec<FramedSub>>,
     worker_tokens: Mutex<HashMap<String, String>>,
@@ -162,6 +178,7 @@ impl DroveRuntime {
             core: Mutex::new(Weak::new()),
             probe_cache: Mutex::new(disk_cache.probe),
             probe_is_full: AtomicBool::new(probe_is_full),
+            full_probe_inflight: Mutex::new(None),
             agent_models_cache: Mutex::new(agent_models_cache),
             subs: Mutex::new(Vec::new()),
             worker_tokens: Mutex::new(HashMap::new()),
@@ -389,7 +406,7 @@ impl DroveRuntime {
                     if a.model_efforts.is_empty() && !saved.model_efforts.is_empty() {
                         a.model_efforts = saved.model_efforts.clone();
                     }
-                } else if a.installed && !a.models.is_empty() {
+                } else if a.installed && a.error.is_none() && !a.models.is_empty() {
                     map.insert(
                         a.id.clone(),
                         CachedAgentModels {
@@ -751,15 +768,51 @@ impl DroveRuntime {
     }
 
     pub async fn rpc_probe(&self, refresh: bool) -> Result<ProbeSnapshot, RpcError> {
-        if !refresh
-            && self.probe_is_full.load(Ordering::SeqCst)
-            && let Some(cached) = self.probe_cache.lock().unwrap_or_else(|p| p.into_inner()).clone()
-        {
-            return Ok(cached);
+        if !refresh {
+            if self.probe_is_full.load(Ordering::SeqCst)
+                && let Some(cached) = self.probe_cache.lock().unwrap_or_else(|p| p.into_inner()).clone()
+            {
+                return Ok(cached);
+            }
+            let core = self.core().ok_or_else(|| RpcError::internal("core unavailable"))?;
+            let snap = probe::probe_agents(&core, true).await;
+            return Ok(self.apply_and_persist_probe(snap, false));
         }
+
+        // Singleflight deduplication: if a background pre-warm or another Settings click already
+        // started a full ACP probe, join it and return the freshly populated snapshot instead of
+        // spawning duplicate ACP agent handshakes in parallel.
+        let _guard = loop {
+            let waiter = {
+                let mut slot = self.full_probe_inflight.lock().unwrap_or_else(|p| p.into_inner());
+                if let Some(existing) = slot.as_ref().cloned() {
+                    let fut = existing.notified_owned();
+                    Some(fut)
+                } else {
+                    let notify = Arc::new(Notify::new());
+                    *slot = Some(notify.clone());
+                    break FullProbeGuard { rt: self, notify };
+                }
+            };
+            if let Some(fut) = waiter {
+                tokio::pin!(fut);
+                fut.as_mut().enable();
+                // Re-check after enabling to eliminate any wakeup lost between lock release and enable.
+                let still_inflight = self.full_probe_inflight.lock().unwrap_or_else(|p| p.into_inner()).is_some();
+                if still_inflight {
+                    fut.await;
+                }
+                if self.probe_is_full.load(Ordering::SeqCst)
+                    && let Some(cached) = self.probe_cache.lock().unwrap_or_else(|p| p.into_inner()).clone()
+                {
+                    return Ok(cached);
+                }
+            }
+        };
+
         let core = self.core().ok_or_else(|| RpcError::internal("core unavailable"))?;
-        let snap = probe::probe_agents(&core, !refresh).await;
-        Ok(self.apply_and_persist_probe(snap, refresh))
+        let snap = probe::probe_agents(&core, false).await;
+        Ok(self.apply_and_persist_probe(snap, true))
     }
 
     pub async fn rpc_ai_test(
@@ -1064,6 +1117,54 @@ mod tests {
         assert_eq!(merged.agents[0].models, vec!["claude-opus-4-6", "claude-sonnet-4-6"]);
         assert_eq!(merged.agents[0].default_model.as_deref(), Some("claude-sonnet-4-6"));
         assert_eq!(merged.agents[0].agent_info.as_deref(), Some("claude-code-acp 0.1"));
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn full_probe_singleflight_joins_inflight_warm_probe_without_duplicate_spawn() {
+        let tmp = crate::test_tmp().join(format!("drove-singleflight-{}", crate::platform::random_hex()));
+        let paths = test_paths(&tmp);
+        paths.create_dirs().unwrap();
+
+        let ai = AiRuntime::open(&paths).unwrap();
+        let rt = DroveRuntime::open(&paths, ai).unwrap();
+
+        // Simulate an in-flight background full probe holding the singleflight slot.
+        let notify = Arc::new(Notify::new());
+        *rt.full_probe_inflight.lock().unwrap() = Some(notify.clone());
+
+        let rt_waiter = rt.clone();
+        let waiter = tokio::spawn(async move { rt_waiter.rpc_probe(true).await });
+        tokio::task::yield_now().await;
+
+        let completed = ProbeSnapshot {
+            probed_at: now_iso(),
+            full_probe: true,
+            agents: vec![ProbedAgent {
+                id: "codex".into(),
+                command: vec!["codex-acp".into()],
+                installed: true,
+                path: Some("/usr/bin/codex-acp".into()),
+                agent_info: Some("codex 1.0".into()),
+                models: vec!["gpt-5.4".into()],
+                default_model: Some("gpt-5.4".into()),
+                efforts: vec!["low".into(), "medium".into(), "high".into()],
+                default_effort: Some("high".into()),
+                model_contexts: BTreeMap::new(),
+                model_efforts: BTreeMap::new(),
+                error: None,
+            }],
+        };
+        rt.apply_and_persist_probe(completed, true);
+        *rt.full_probe_inflight.lock().unwrap() = None;
+        notify.notify_waiters();
+
+        // Waiter must wake and return the cached full snapshot without needing `core` attached.
+        let joined = waiter.await.unwrap().expect("waiter should reuse completed full probe");
+        assert!(joined.full_probe);
+        assert_eq!(joined.agents.len(), 1);
+        assert_eq!(joined.agents[0].models, vec!["gpt-5.4"]);
 
         let _ = std::fs::remove_dir_all(tmp);
     }

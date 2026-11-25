@@ -364,14 +364,12 @@ export async function fetchDaemonHealth(): Promise<DaemonHealth> {
 
 export async function fetchAiStatus(): Promise<DaemonAiStatus> {
   if (isMock()) return mockAiStatus();
-  const machine = await targetMachine();
-  return get<DaemonAiStatus>(withMachine("/api/ai/status", machine));
+  return get<DaemonAiStatus>("/api/ai/status");
 }
 
 export async function testAiConnection(): Promise<DaemonAiProbeResult> {
   if (isMock()) return mockTestAiConnection();
-  const machine = await targetMachine();
-  return (await send("POST", withMachine("/api/ai/test", machine))) as DaemonAiProbeResult;
+  return (await send("POST", "/api/ai/test")) as DaemonAiProbeResult;
 }
 
 export async function saveAiConfig(patch: DaemonAiConfigPatch): Promise<DaemonAiStatus> {
@@ -382,8 +380,7 @@ export async function saveAiConfig(patch: DaemonAiConfigPatch): Promise<DaemonAi
 export async function syncAiLanguage(lang: "zh" | "en"): Promise<void> {
   if (isMock()) return;
   try {
-    const machine = await targetMachine();
-    await send("PUT", withMachine("/api/ai/language", machine), {
+    await send("PUT", "/api/ai/language", {
       language: lang === "zh" ? "zh-CN" : "en",
     });
   } catch {

@@ -407,16 +407,17 @@ async fn dispatch_http_inner(
         // When the local machine has no Drove config yet (`drove.json` missing) and a connected remote
         // machine exists (e.g. Windows desktop app connected to WSL), proxy global Drove status/settings
         // queries when `?on=` was not explicitly supplied.
-        let global_drove_endpoint = (method == "GET"
-            && matches!(segs.as_slice(), ["api", "ai", "status"] | ["api", "agents"]))
+        let global_ai_endpoint = (method == "GET" && segs.as_slice() == ["api", "ai", "status"])
             || (method == "POST" && segs.as_slice() == ["api", "ai", "test"])
-            || (method == "PUT" && segs.as_slice() == ["api", "ai", "language"])
+            || (method == "PUT" && segs.as_slice() == ["api", "ai", "language"]);
+        let global_drove_endpoint = (method == "GET" && segs.as_slice() == ["api", "agents"])
             || (method == "GET"
                 && segs.as_slice() == ["api", "daemon", "events"]
                 && query.get("runId").is_none()
                 && query.get("run").is_none());
-        if global_drove_endpoint
-            && !core.drove.paths.config_file.exists()
+        let should_proxy_global = (global_drove_endpoint && !core.drove.paths.config_file.exists())
+            || (global_ai_endpoint && !core.ai.is_configured() && !core.drove.paths.config_file.exists());
+        if should_proxy_global
             && let Some(m) = connected_machines(core).into_iter().next()
         {
             return proxy_to_machine(core, &m.name, &req).await;
@@ -463,11 +464,13 @@ async fn dispatch_http_inner(
                 .or_else(|| body["lang"].as_str())
                 .ok_or_else(|| ApiErr::new(400, "bad_request", "language must be a string"))?
                 .to_string();
-            core.ai
-                .update_settings(crate::ai::AiSettingsSetParams { language: Some(lang), ..Default::default() })
-                .await
-                .map_err(rpc_to_api)?;
+            let patch = crate::ai::AiSettingsSetParams { language: Some(lang), ..Default::default() };
+            core.ai.update_settings(patch.clone()).await.map_err(rpc_to_api)?;
             core.drove.sync_ai_from_core();
+            if !internal_admin {
+                let repl = core.ai.sync_params_after_update(&patch);
+                crate::remote::broadcast_ai_settings(core, repl).await;
+            }
             Ok(json!(core.drove.ai_status()))
         }
         ("POST", ["api", "ai", "test"]) => {

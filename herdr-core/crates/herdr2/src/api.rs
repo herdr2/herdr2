@@ -1407,7 +1407,28 @@ async fn drove_settings_set(
     core: Ctx<'_>,
     p: crate::drove::types::DroveSettingsSetParams,
 ) -> Result<crate::drove::types::DroveSettingsResult, RpcError> {
-    core.drove.rpc_settings_set(p).await
+    let touched_core_ai = p.api_key.is_some()
+        || p.clear_ai_key == Some(true)
+        || p.ai.as_ref().is_some_and(|a| {
+            a.enabled.is_some()
+                || a.base_url.is_some()
+                || a.model.is_some()
+                || a.effort.is_some()
+                || a.context_window.is_some()
+                || a.max_tokens.is_some()
+                || a.language.is_some()
+                || a.api_key.is_some()
+                || a.clear_key == Some(true)
+        });
+    let res = core.drove.rpc_settings_set(p).await?;
+    if touched_core_ai && !from_afar(core) {
+        let repl = core.ai.sync_params_after_update(&crate::ai::AiSettingsSetParams {
+            enabled: Some(res.ai_status.enabled),
+            ..Default::default()
+        });
+        crate::remote::broadcast_ai_settings(core, repl).await;
+    }
+    Ok(res)
 }
 
 async fn drove_probe(core: Ctx<'_>, p: DroveProbeParams) -> Result<crate::drove::types::ProbeSnapshot, RpcError> {
@@ -1464,8 +1485,13 @@ async fn ai_status(core: Ctx<'_>, _: crate::ai::AiOnParams) -> Result<crate::ai:
 }
 
 async fn ai_settings_set(core: Ctx<'_>, p: crate::ai::AiSettingsSetParams) -> Result<crate::ai::AiStatus, RpcError> {
+    let sync_patch = p.clone();
     let st = core.ai.update_settings(p).await?;
     core.drove.sync_ai_from_core();
+    if !from_afar(core) {
+        let repl = core.ai.sync_params_after_update(&sync_patch);
+        crate::remote::broadcast_ai_settings(core, repl).await;
+    }
     Ok(st)
 }
 
@@ -1480,6 +1506,15 @@ async fn ai_test(core: Ctx<'_>, p: crate::ai::AiTestParams) -> Result<crate::ai:
 async fn ai_probe_prompt_mode(core: Ctx<'_>, _: crate::ai::AiOnParams) -> Result<crate::ai::AiProbePromptModeResult, RpcError> {
     let res = core.ai.probe_prompt_mode().await?;
     core.drove.sync_ai_from_core();
+    if !from_afar(core) {
+        let patch = crate::ai::AiSettingsSetParams {
+            prompt_mode: Some("auto".into()),
+            reset_prompt_cache_detection: Some(true),
+            ..Default::default()
+        };
+        let repl = core.ai.sync_params_after_update(&patch);
+        crate::remote::broadcast_ai_settings(core, repl).await;
+    }
     Ok(res)
 }
 

@@ -13,8 +13,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-const ACP_PROBE_TIMEOUT: Duration = Duration::from_secs(35);
-const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+const ACP_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn env_ignore_case<'a>(env: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
     env.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.as_str()).filter(|s| !s.is_empty())
@@ -81,6 +81,9 @@ pub async fn refresh_installed_status(core: &Core, snap: &mut ProbeSnapshot) -> 
                     snap.full_probe = false;
                     changed = true;
                 }
+            } else if was_installed && !now_installed && existing.error.is_some() {
+                existing.error = None;
+                changed = true;
             }
         } else {
             let (models, default_model) = discover_local_models(&id, now_installed, &base_env);
@@ -119,7 +122,7 @@ pub async fn probe_agents(core: &Core, skip_acp_handshake: bool) -> ProbeSnapsho
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()).display().to_string();
 
     let probe_scope = crate::sweep::token();
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(6));
     let mut handles = Vec::new();
     for (id, argv) in targets {
         let resolved = resolve_acp_command_in_env(Some(&id), &argv, &base_env);
@@ -183,9 +186,14 @@ async fn probe_one_acp(
     let (local_models, local_default) = discover_local_models(&id, true, &env);
     if matches!(id.as_str(), "agy" | "antigravity") {
         // `agy acp` takes ~29s to boot CCPA + MCP servers on session/new; `agy models` returns the live catalog in ~5s.
-        let (cli_models, cli_ver) =
-            tokio::join!(probe_cli_models(&id, &env, &cwd), probe_cli_version(&exe_path, &env, &cwd),);
-        let models = merge_model_lists(&[cli_models, local_models]);
+        let (cli_probe, cli_ver) =
+            tokio::join!(probe_cli_models(&id, &env, &cwd), probe_cli_version(&exe_path, &env, &cwd));
+        let (agent_info, ver_err) = match cli_ver {
+            Ok(ver) => (ver.map(|v| format!("Antigravity CLI {v}")), None),
+            Err(err) => (None, Some(err)),
+        };
+        let error = cli_probe.error.or(ver_err);
+        let models = merge_model_lists(&[cli_probe.models, local_models]);
         let model_efforts = infer_model_efforts_from_variants(&models);
         let default_model = local_default.or_else(|| models.first().cloned());
         return ProbedAgent {
@@ -193,14 +201,14 @@ async fn probe_one_acp(
             command: argv,
             installed: true,
             path: Some(exe_path),
-            agent_info: cli_ver.map(|v| format!("Antigravity CLI {v}")),
+            agent_info,
             models,
             default_model,
             efforts: default_efforts(),
             default_effort: Some("medium".into()),
             model_contexts: BTreeMap::new(),
             model_efforts,
-            error: None,
+            error,
         };
     }
 
@@ -221,7 +229,7 @@ async fn probe_one_acp(
         mcp_exe: "herdr2".into(),
         socket: String::new(),
     };
-    let (res, cli_models) =
+    let (res, cli_probe) =
         tokio::join!(tokio::time::timeout(ACP_PROBE_TIMEOUT, spawn_session(spec)), probe_cli_models(&id, &env, &cwd));
 
     match res {
@@ -322,7 +330,7 @@ async fn probe_one_acp(
             started.transport.kill();
             let _ = tokio::time::timeout(Duration::from_secs(1), started.waiter.wait()).await;
 
-            let models = merge_model_lists(&[acp_models, cli_models, local_models]);
+            let models = merge_model_lists(&[acp_models, cli_probe.models, local_models]);
             let default_model =
                 acp_default.filter(|s| !s.trim().is_empty()).or(local_default).or_else(|| models.first().cloned());
             if !default_model_contexts.is_empty()
@@ -351,8 +359,11 @@ async fn probe_one_acp(
             }
         }
         Ok(Err(err)) => {
-            let err_opt = if cli_models.is_empty() { Some(err.message) } else { None };
-            let models = merge_model_lists(&[cli_models, local_models]);
+            // Always surface ACP spawn/handshake failures even when CLI or local model catalogs
+            // are still available, so broken/unauthenticated agents are never misreported as healthy.
+            let err_msg = sanitize_probe_error(&err.message);
+            let err_opt = Some(if err_msg.is_empty() { "ACP probe failed".to_string() } else { err_msg });
+            let models = merge_model_lists(&[cli_probe.models, local_models]);
             let model_efforts = infer_model_efforts_from_variants(&models);
             let default_model = local_default.or_else(|| models.first().cloned());
             ProbedAgent {
@@ -371,12 +382,12 @@ async fn probe_one_acp(
             }
         }
         Err(_) => {
-            let err_opt = if cli_models.is_empty() {
-                Some(format!("ACP probe timed out after {}s", ACP_PROBE_TIMEOUT.as_secs()))
-            } else {
-                None
-            };
-            let models = merge_model_lists(&[cli_models, local_models]);
+            let base = format!("ACP probe timed out after {}s", ACP_PROBE_TIMEOUT.as_secs());
+            let err_opt = Some(match cli_probe.error {
+                Some(cli_err) if !cli_err.is_empty() => format!("{base} ({cli_err})"),
+                _ => base,
+            });
+            let models = merge_model_lists(&[cli_probe.models, local_models]);
             let model_efforts = infer_model_efforts_from_variants(&models);
             let default_model = local_default.or_else(|| models.first().cloned());
             ProbedAgent {
@@ -423,17 +434,77 @@ fn infer_model_efforts_from_variants(models: &[String]) -> BTreeMap<String, Vec<
     map
 }
 
-async fn probe_cli_version(program: &str, env: &BTreeMap<String, String>, cwd: &str) -> Option<String> {
+#[derive(Debug, Default)]
+struct CliModelsProbe {
+    models: Vec<String>,
+    error: Option<String>,
+}
+
+fn sanitize_probe_error(raw: &str) -> String {
+    let cleaned = strip_ansi(raw);
+    let mut lines: Vec<&str> = Vec::new();
+    for part in cleaned.split(['\n', '\r']) {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.chars().next().is_some_and(|c| ('\u{2800}'..='\u{28FF}').contains(&c)) {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.starts_with("fetching ") || lower.starts_with("loading ") {
+            continue;
+        }
+        lines.push(trimmed);
+    }
+    let joined = lines.join("\n");
+    const MAX_LEN: usize = 600;
+    if joined.chars().count() <= MAX_LEN {
+        joined
+    } else {
+        let prefix: String = joined.chars().take(MAX_LEN).collect();
+        format!("{}…", prefix.trim_end())
+    }
+}
+
+fn extract_cli_output_snippet(stderr: &[u8], stdout: &[u8]) -> Option<String> {
+    for bytes in [stderr, stdout] {
+        let raw = String::from_utf8_lossy(bytes);
+        let cleaned = sanitize_probe_error(&raw);
+        if !cleaned.is_empty() {
+            return Some(cleaned);
+        }
+    }
+    None
+}
+
+fn summarize_cli_failure(cmd_label: &str, status: std::process::ExitStatus, stderr: &[u8], stdout: &[u8]) -> String {
+    let status_desc = match status.code() {
+        Some(code) => format!("exited with code {code}"),
+        None => "terminated by signal".to_string(),
+    };
+    match extract_cli_output_snippet(stderr, stdout) {
+        Some(detail) => format!("`{cmd_label}` {status_desc}\nstderr:\n{detail}"),
+        None => format!("`{cmd_label}` {status_desc}"),
+    }
+}
+
+async fn probe_cli_version(program: &str, env: &BTreeMap<String, String>, cwd: &str) -> Result<Option<String>, String> {
     let argv = vec![program.to_string(), "--version".to_string()];
-    let mut cmd = crate::platform::agent_command(&argv, env, cwd).ok()?;
+    let mut cmd = crate::platform::agent_command(&argv, env, cwd)
+        .map_err(|e| format!("failed to prepare `{program} --version`: {e}"))?;
     cmd.stdin(std::process::Stdio::null());
-    let out = tokio::time::timeout(CLI_PROBE_TIMEOUT, cmd.output()).await.ok()?.ok()?;
+    let out = match tokio::time::timeout(CLI_PROBE_TIMEOUT, cmd.output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return Err(format!("failed to run `{program} --version`: {e}")),
+        Err(_) => return Err(format!("`{program} --version` timed out after {}s", CLI_PROBE_TIMEOUT.as_secs())),
+    };
     if !out.status.success() {
-        return None;
+        return Err(summarize_cli_failure(&format!("{program} --version"), out.status, &out.stderr, &out.stdout));
     }
     let text = String::from_utf8_lossy(&out.stdout);
     let line = strip_ansi(&text).lines().next().unwrap_or("").trim().to_string();
-    (!line.is_empty()).then_some(line)
+    Ok((!line.is_empty()).then_some(line))
 }
 
 fn push_unique(dest: &mut Vec<String>, item: &str) {
@@ -457,25 +528,45 @@ fn default_efforts() -> Vec<String> {
     vec!["low".into(), "medium".into(), "high".into(), "xhigh".into()]
 }
 
-async fn probe_cli_models(agent_id: &str, env: &BTreeMap<String, String>, cwd: &str) -> Vec<String> {
+async fn probe_cli_models(agent_id: &str, env: &BTreeMap<String, String>, cwd: &str) -> CliModelsProbe {
     let cli_argv: Vec<String> = match agent_id {
         "agy" | "antigravity" => vec!["agy".into(), "models".into()],
         "cursor" | "cursor-agent" => vec!["cursor-agent".into(), "--list-models".into()],
         "opencode" => vec!["opencode".into(), "models".into()],
-        _ => return Vec::new(),
+        _ => return CliModelsProbe::default(),
     };
-    let Ok(mut cmd) = crate::platform::agent_command(&cli_argv, env, cwd) else {
-        return Vec::new();
+    let label = cli_argv.join(" ");
+    let mut cmd = match crate::platform::agent_command(&cli_argv, env, cwd) {
+        Ok(c) => c,
+        Err(e) => return CliModelsProbe { models: Vec::new(), error: Some(format!("failed to prepare `{label}`: {e}")) },
     };
     cmd.stdin(std::process::Stdio::null());
-    let Ok(Ok(out)) = tokio::time::timeout(CLI_PROBE_TIMEOUT, cmd.output()).await else {
-        return Vec::new();
+    let out = match tokio::time::timeout(CLI_PROBE_TIMEOUT, cmd.output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => return CliModelsProbe { models: Vec::new(), error: Some(format!("failed to run `{label}`: {e}")) },
+        Err(_) => {
+            return CliModelsProbe {
+                models: Vec::new(),
+                error: Some(format!("`{label}` timed out after {}s", CLI_PROBE_TIMEOUT.as_secs())),
+            };
+        }
     };
     if !out.status.success() {
-        return Vec::new();
+        return CliModelsProbe {
+            models: Vec::new(),
+            error: Some(summarize_cli_failure(&label, out.status, &out.stderr, &out.stdout)),
+        };
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    parse_cli_models(agent_id, &text)
+    let models = parse_cli_models(agent_id, &text);
+    if models.is_empty() && matches!(agent_id, "agy" | "antigravity") {
+        let error = match extract_cli_output_snippet(&out.stderr, &out.stdout) {
+            Some(detail) => format!("`{label}` returned no models\nstderr:\n{detail}"),
+            None => format!("`{label}` returned no models"),
+        };
+        return CliModelsProbe { models, error: Some(error) };
+    }
+    CliModelsProbe { models, error: None }
 }
 
 fn strip_ansi(s: &str) -> String {
@@ -1167,6 +1258,68 @@ mod tests {
         for expected in ["GLM-5.3-Flash", "GLM-5.3", "GLM-5.4", "GLM-5.2", "GLM-5-Turbo"] {
             assert!(models.contains(&expected.to_string()), "missing {expected} in {models:?}");
         }
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn sanitize_probe_error_strips_ansi_and_spinner_noise() {
+        let raw = "\r\x1b[2K⠋ Fetching available models...\r\x1b[31mError: authentication expired\x1b[0m\n\nPlease run login again";
+        assert_eq!(sanitize_probe_error(raw), "Error: authentication expired\nPlease run login again");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_one_acp_reports_error_when_agent_exits_nonzero_even_with_local_models() {
+        let tmp = crate::test_tmp().join(format!("drove-probe-err-{}", crate::platform::random_hex()));
+        std::fs::create_dir_all(tmp.join(".claude")).unwrap();
+        std::fs::write(tmp.join(".claude/settings.json"), r#"{"model":"claude-opus-4-6"}"#).unwrap();
+
+        let mut env = BTreeMap::new();
+        env.insert("HOME".into(), tmp.display().to_string());
+        let probed = probe_one_acp(
+            "claude".into(),
+            vec!["/bin/sh".into(), "-c".into(), "echo 'Error: Not logged in (401)' >&2; exit 1".into()],
+            "/bin/sh".into(),
+            env,
+            tmp.display().to_string(),
+        )
+        .await;
+
+        assert!(probed.installed);
+        assert!(probed.models.contains(&"claude-opus-4-6".to_string()));
+        let err = probed.error.as_deref().expect("expected non-empty probe error");
+        assert!(err.contains("Not logged in (401)"), "unexpected error: {err}");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_cli_models_reports_error_on_nonzero_agy_exit() {
+        let tmp = crate::test_tmp().join(format!("drove-agy-err-{}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let fake_agy = tmp.join("agy");
+        std::fs::write(&fake_agy, "#!/bin/sh\necho 'Auth token invalid' >&2\nexit 2\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_agy, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut env = BTreeMap::new();
+        env.insert("PATH".into(), format!("{}:/usr/bin:/bin", tmp.display()));
+        env.insert("HOME".into(), tmp.display().to_string());
+
+        let probed = probe_one_acp(
+            "agy".into(),
+            vec![fake_agy.display().to_string(), "acp".into()],
+            fake_agy.display().to_string(),
+            env,
+            tmp.display().to_string(),
+        )
+        .await;
+
+        assert!(probed.installed);
+        let err = probed.error.as_deref().expect("expected agy probe error");
+        assert!(err.contains("Auth token invalid"), "unexpected agy error: {err}");
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

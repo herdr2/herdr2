@@ -82,21 +82,34 @@ if [ "$os" = linux ]; then
     ln -sfn herdr2-core "$bin/h2"
   fi
   ln -sfn "$home/herdr2" "$bin/herdr2"
-  mkdir -p "$data/applications" "$data/icons/hicolor/scalable/apps"
+  mkdir -p \
+    "$data/applications" \
+    "$data/icons/hicolor/scalable/apps" \
+    "$data/icons/hicolor/256x256/apps" \
+    "$data/icons/hicolor/512x512/apps"
   cp "$home/herdr2.svg" "$data/icons/hicolor/scalable/apps/herdr2.svg"
+  desktop_icon="$data/icons/hicolor/scalable/apps/herdr2.svg"
+  if [ -f "$home/herdr2.png" ]; then
+    cp "$home/herdr2.png" "$data/icons/hicolor/256x256/apps/herdr2.png"
+    cp "$home/herdr2.png" "$data/icons/hicolor/512x512/apps/herdr2.png"
+    desktop_icon="$data/icons/hicolor/256x256/apps/herdr2.png"
+  fi
   cat > "$data/applications/herdr2.desktop" <<EOF
 [Desktop Entry]
+Version=1.0
 Type=Application
 Name=Herdr2
 Comment=Terminals and coding agents that keep running
 Exec=$bin/herdr2
-Icon=herdr2
+Icon=$desktop_icon
 Terminal=false
+StartupNotify=true
 Categories=Development;
 StartupWMClass=herdr2
 EOF
   command -v update-desktop-database >/dev/null 2>&1 && update-desktop-database "$data/applications" 2>/dev/null || true
-  [ -f "$data/icons/hicolor/icon-theme.cache" ] && gtk-update-icon-cache -f -t "$data/icons/hicolor" >/dev/null 2>&1 || true
+  touch "$data/icons/hicolor" "$data/applications/herdr2.desktop" 2>/dev/null || true
+  command -v gtk-update-icon-cache >/dev/null 2>&1 && gtk-update-icon-cache -f -t "$data/icons/hicolor" >/dev/null 2>&1 || true
   command -v dbus-send >/dev/null 2>&1 &&
     dbus-send --session --type=signal /KIconLoader org.kde.KIconLoader.iconChanged int32:0 2>/dev/null || true
 else

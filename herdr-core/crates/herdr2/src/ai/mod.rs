@@ -343,6 +343,30 @@ pub struct AiSettingsSetParams {
     pub redact_secrets: Option<bool>,
 }
 
+impl AiSettingsSetParams {
+    /// True when this patch only updates `language` and touches no endpoint, key, model, or switch.
+    pub fn is_language_only(&self) -> bool {
+        self.language.is_some()
+            && self.enabled.is_none()
+            && self.base_url.is_none()
+            && self.model.is_none()
+            && self.effort.is_none()
+            && self.context_window.is_none()
+            && self.max_tokens.is_none()
+            && self.api_key.is_none()
+            && self.clear_key.is_none()
+            && self.pty_status_arbitration.is_none()
+            && self.notes_digest.is_none()
+            && self.prompt_cache_enabled.is_none()
+            && self.prompt_mode.is_none()
+            && self.reset_prompt_cache_detection.is_none()
+            && self.handoff_distill.is_none()
+            && self.checkpoint_labeling.is_none()
+            && self.semantic_summary.is_none()
+            && self.redact_secrets.is_none()
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct AiProbePromptModeResult {
@@ -825,16 +849,20 @@ impl AiRuntime {
             next.redact_secrets = b;
         }
 
+        let (prev_key, _) = read_ai_key(&self.paths);
         let mut key_changed = false;
         if params.clear_key == Some(true) {
             clear_ai_key(&self.paths).map_err(|e| RpcError::internal(format!("clear key: {e}")))?;
-            key_changed = true;
-        } else if let Some(key) = params.api_key.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+            key_changed = prev_key.is_some();
+        } else if let Some(key) = params.api_key.map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+            && prev_key.as_deref() != Some(key.as_str())
+        {
             write_ai_key(&self.paths, &key)?;
             key_changed = true;
         }
 
-        let url_changed = next.base_url.trim() != prev.base_url.trim();
+        let url_changed =
+            next.base_url.trim().trim_end_matches('/') != prev.base_url.trim().trim_end_matches('/');
         let model_changed = next.model.trim() != prev.model.trim();
         // When the user switches model (without explicitly pinning a prompt mode in the same call),
         // reset prompt_mode to "auto" so the runtime re-detects KV-cache support for the new model.
@@ -852,7 +880,7 @@ impl AiRuntime {
         let cfg_changed = next.enabled != prev.enabled
             || url_changed
             || model_changed
-            || next.effort.trim() != prev.effort.trim()
+            || next.effort.trim().to_ascii_lowercase() != prev.effort.trim().to_ascii_lowercase()
             || next.context_window != prev.context_window
             || next.max_tokens != prev.max_tokens
             || next.language != prev.language
@@ -903,6 +931,65 @@ impl AiRuntime {
             self.result_cache.clear();
         }
         Ok(self.status_refresh_models().await)
+    }
+
+    fn full_replication_params(&self, reset_detection: Option<bool>) -> AiSettingsSetParams {
+        let cfg = self.config_snapshot();
+        let (key, _) = read_ai_key(&self.paths);
+        let eff_lang = cfg
+            .language
+            .clone()
+            .or_else(|| read_app_settings_language(&self.paths.app_settings_file))
+            .unwrap_or_default();
+        AiSettingsSetParams {
+            on: None,
+            enabled: Some(cfg.enabled),
+            base_url: Some(cfg.base_url.clone()),
+            model: Some(cfg.model.clone()),
+            effort: Some(cfg.effort.clone()),
+            context_window: Some(cfg.context_window.clone().unwrap_or_default()),
+            max_tokens: Some(cfg.max_tokens.unwrap_or(0)),
+            language: Some(eff_lang),
+            api_key: key.clone(),
+            clear_key: if key.is_none() { Some(true) } else { None },
+            pty_status_arbitration: Some(cfg.pty_status_arbitration),
+            notes_digest: Some(cfg.notes_digest),
+            prompt_cache_enabled: Some(cfg.prompt_cache_enabled),
+            prompt_mode: Some(cfg.resolved_prompt_mode().to_string()),
+            reset_prompt_cache_detection: reset_detection,
+            handoff_distill: Some(cfg.handoff_distill),
+            checkpoint_labeling: Some(cfg.checkpoint_labeling),
+            semantic_summary: Some(cfg.semantic_summary),
+            redact_secrets: Some(cfg.redact_secrets),
+        }
+    }
+
+    /// Builds the replication payload to push when a remote machine connects so all machines
+    /// share this core's single AI configuration. Never overwrites a legacy remote config when
+    /// local has neither a base URL nor an API key yet.
+    pub fn sync_params_for_connect(&self) -> Option<AiSettingsSetParams> {
+        let cfg = self.config_snapshot();
+        let (key, _) = read_ai_key(&self.paths);
+        if !cfg.base_url.trim().is_empty() || key.is_some() {
+            return Some(self.full_replication_params(None));
+        }
+        let lang = cfg.language.or_else(|| read_app_settings_language(&self.paths.app_settings_file));
+        lang.map(|language| AiSettingsSetParams { language: Some(language), ..Default::default() })
+    }
+
+    /// Builds the replication payload to broadcast to connected remote machines after a local edit.
+    pub fn sync_params_after_update(&self, patch: &AiSettingsSetParams) -> AiSettingsSetParams {
+        let cfg = self.config_snapshot();
+        let (key, _) = read_ai_key(&self.paths);
+        if !cfg.base_url.trim().is_empty() || key.is_some() {
+            return self.full_replication_params(patch.reset_prompt_cache_detection);
+        }
+        if patch.base_url.is_some() || patch.clear_key == Some(true) {
+            return self.full_replication_params(patch.reset_prompt_cache_detection);
+        }
+        let mut forwarded = patch.clone();
+        forwarded.on = None;
+        forwarded
     }
 
     pub async fn list_models(
@@ -2429,6 +2516,74 @@ mod tests {
         assert!(st.configured);
         assert_eq!(st.model, "magpie-b");
         assert_eq!(st.key_masked, None);
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn replication_params_and_idempotent_update_preserve_caches() {
+        let tmp = crate::test_tmp().join(format!("ai-repl-{}", crate::platform::random_hex()));
+        let paths = Paths {
+            socket: tmp.join("core.sock"),
+            holder_socket: tmp.join("holder.sock"),
+            state: tmp.join("state"),
+            config: tmp.join("config/config.toml"),
+        };
+        let rt = AiRuntime::open(&paths).unwrap();
+
+        // 1. Fresh unconfigured runtime emits no connect sync payload (does not wipe legacy remote).
+        assert!(rt.sync_params_for_connect().is_none());
+
+        // 2. Language-only update on unconfigured local only replicates language, not empty endpoint/clearKey.
+        let lang_patch = AiSettingsSetParams { language: Some("zh-CN".into()), ..Default::default() };
+        rt.update_settings(lang_patch.clone()).await.unwrap();
+        let after_lang = rt.sync_params_after_update(&lang_patch);
+        assert_eq!(after_lang.language.as_deref(), Some("zh-CN"));
+        assert!(after_lang.base_url.is_none());
+        assert!(after_lang.clear_key.is_none());
+        let connect_lang = rt.sync_params_for_connect().expect("language-only connect sync");
+        assert_eq!(connect_lang.language.as_deref(), Some("zh-CN"));
+        assert!(connect_lang.base_url.is_none());
+        assert!(connect_lang.clear_key.is_none());
+
+        // 3. Full configuration replicates every field including API key.
+        let full_patch = AiSettingsSetParams {
+            enabled: Some(true),
+            base_url: Some("https://api.example.com/v1".into()),
+            model: Some("deepseek-chat".into()),
+            effort: Some("medium".into()),
+            context_window: Some("64k".into()),
+            max_tokens: Some(2048),
+            api_key: Some("sk-shared-secret-1234".into()),
+            pty_status_arbitration: Some(false),
+            prompt_mode: Some("compact".into()),
+            ..Default::default()
+        };
+        rt.update_settings(full_patch.clone()).await.unwrap();
+        rt.update_models("https://api.example.com/v1", vec!["deepseek-chat".into(), "deepseek-reasoner".into()]);
+
+        let repl = rt.sync_params_for_connect().expect("full connect sync");
+        assert_eq!(repl.base_url.as_deref(), Some("https://api.example.com/v1"));
+        assert_eq!(repl.model.as_deref(), Some("deepseek-chat"));
+        assert_eq!(repl.effort.as_deref(), Some("medium"));
+        assert_eq!(repl.context_window.as_deref(), Some("64k"));
+        assert_eq!(repl.max_tokens, Some(2048));
+        assert_eq!(repl.language.as_deref(), Some("zh-CN"));
+        assert_eq!(repl.api_key.as_deref(), Some("sk-shared-secret-1234"));
+        assert_eq!(repl.clear_key, None);
+        assert_eq!(repl.pty_status_arbitration, Some(false));
+        assert_eq!(repl.prompt_mode.as_deref(), Some("compact"));
+
+        // 4. Applying the exact same replication payload again is idempotent (preserves cached models).
+        rt.update_settings(repl).await.unwrap();
+        assert_eq!(rt.cached_models(), vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()]);
+
+        // 5. Clearing key propagates clearKey=true.
+        let clear_patch = AiSettingsSetParams { clear_key: Some(true), ..Default::default() };
+        rt.update_settings(clear_patch.clone()).await.unwrap();
+        let repl_after_clear = rt.sync_params_after_update(&clear_patch);
+        assert_eq!(repl_after_clear.api_key, None);
+        assert_eq!(repl_after_clear.clear_key, Some(true));
 
         let _ = std::fs::remove_dir_all(tmp);
     }

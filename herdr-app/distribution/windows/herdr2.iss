@@ -7,7 +7,7 @@
 ;   iscc /DMyAppVersion=0.2.0 /DAppStageDir=dist\stage-app /DCoreStageDir=dist\stage-core /DOutputDir=dist\installers herdr-app\distribution\windows\herdr2.iss
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.0.6"
+  #define MyAppVersion "2.0.7"
 #endif
 #ifndef AppStageDir
   #define AppStageDir "..\..\dist\stage-app"
@@ -40,6 +40,7 @@ Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
 ChangesEnvironment=yes
+SetupIconFile=..\..\assets\icons\herdr-app.ico
 UninstallDisplayIcon={app}\herdr2.exe
 
 [Languages]

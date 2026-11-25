@@ -66,6 +66,7 @@ if [[ $os == linux || $os == windows ]]; then
   mkdir -p "$dir"
   if [[ $os == windows ]]; then cp "$bin/herdr2.exe" "$dir/"; else cp "$bin/herdr2" "$dir/"; fi
   cp assets/icons/herdr-ui-icon-clean.svg "$dir/herdr2.svg"
+  [[ -f assets/icons/herdr-ui-icon-clean.png ]] && cp assets/icons/herdr-ui-icon-clean.png "$dir/herdr2.png"
   cp LICENSE THIRD-PARTY-NOTICES "$dir/"
   notices_path=herdr2/THIRD-PARTY-NOTICES
   tar -czf "$out" -C "$work" herdr2

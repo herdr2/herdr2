@@ -363,6 +363,49 @@ async fn supervise(core: Arc<Core>, id: String) {
     }
 }
 
+async fn sync_ai_to_machine(core: Arc<Core>, m: Machine, line: Arc<Line>) {
+    let Some(mut params) = core.ai.sync_params_for_connect() else { return };
+    params.on = None;
+    let Ok(val) = serde_json::to_value(params) else { return };
+    let _ = line.call(&m.name, "ai.settings.set", val, Duration::from_secs(10)).await;
+}
+
+/// Replicates shared Core AI settings to every currently connected remote machine in parallel.
+/// Awaits completion up to a short cap so immediate follow-up calls on remote machines observe
+/// the updated config, while slow remotes finish syncing in the background.
+pub async fn broadcast_ai_settings(core: &Arc<Core>, mut params: crate::ai::AiSettingsSetParams) {
+    params.on = None;
+    let Ok(val) = serde_json::to_value(params) else { return };
+    let targets: Vec<(String, Arc<Line>)> = {
+        let st = core.lock();
+        st.machines
+            .iter()
+            .filter_map(|m| match st.lines.get(&m.id) {
+                Some(LineState::Connected(line)) => Some((m.name.clone(), line.clone())),
+                _ => None,
+            })
+            .collect()
+    };
+    if targets.is_empty() {
+        return;
+    }
+    let handles: Vec<_> = targets
+        .into_iter()
+        .map(|(name, line)| {
+            let payload = val.clone();
+            tokio::spawn(async move {
+                let _ = line.call(&name, "ai.settings.set", payload, Duration::from_secs(10)).await;
+            })
+        })
+        .collect();
+    let _ = tokio::time::timeout(Duration::from_secs(2), async {
+        for h in handles {
+            let _ = h.await;
+        }
+    })
+    .await;
+}
+
 async fn refresh_status(core: &Arc<Core>, m: &Machine, line: &Arc<Line>) {
     loop {
         if let Ok(status) = line.call(&m.name, "server.status", json!({}), Duration::from_secs(2)).await {
@@ -388,6 +431,7 @@ async fn hold(core: &Arc<Core>, m: &Machine, mut d: crate::machines::Dialed) {
     }
     core.changed.notify_waiters();
     tokio::spawn(reattach(core.clone(), m.clone(), line.clone()));
+    tokio::spawn(sync_ai_to_machine(core.clone(), m.clone(), line.clone()));
     let refresh = refresh_status(core, m, &line);
     tokio::pin!(refresh);
     // Everything that happens there, to keep its mirror here and tell subscribers.
@@ -1188,6 +1232,14 @@ fn deadline_for(core: &Core, method: &str, params: &Value) -> Duration {
     if method == "checkpoint.rollback" {
         // Rollback may respawn a fresh ACP/PTY session and restore workspace git trees over SSH.
         return config.machine_timeout() + Duration::from_secs(60);
+    }
+    if matches!(method, "drove.probe" | "drove.roles.ai_configure") {
+        // Probing installed ACP agents spawns multiple cold-start handshakes (up to 60s each)
+        // and AI role configuration may probe + run a reasoning completion.
+        return config.machine_timeout() + Duration::from_secs(180);
+    }
+    if method == "drove.settings.get" {
+        return config.machine_timeout() + Duration::from_secs(30);
     }
     let waits = matches!(method, "agent.wait" | "terminal.wait")
         || (params["wait"] == true && matches!(method, "agent.run" | "agent.send" | "terminal.run" | "terminal.send"));

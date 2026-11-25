@@ -957,7 +957,13 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
                     let id = a["id"].as_str().unwrap_or("?");
                     let inst = a["installed"].as_bool().unwrap_or(false);
                     let models = a["models"].as_array().map(|m| m.len()).unwrap_or(0);
-                    lines.push(format!("{id:<14} installed={inst:<5} models={models}"));
+                    let err = a["error"].as_str().map(str::trim).filter(|s| !s.is_empty());
+                    if let Some(e) = err {
+                        let summary = e.lines().next().unwrap_or(e);
+                        lines.push(format!("{id:<14} installed={inst:<5} models={models:<3} error={summary}"));
+                    } else {
+                        lines.push(format!("{id:<14} installed={inst:<5} models={models}"));
+                    }
                 }
             }
             Ok((val, lines.join("\n")))

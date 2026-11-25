@@ -881,6 +881,9 @@ pub async fn configure_roles_with_ai(
             if !a.model_efforts.is_empty() {
                 obj["modelEfforts"] = json!(a.model_efforts);
             }
+            if let Some(err) = a.error.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                obj["error"] = json!(err);
+            }
             obj
         })
         .collect();
@@ -1003,7 +1006,7 @@ pub async fn configure_roles_with_ai(
             "You are a pure JSON configuration architect for Drove (a multi-agent software engineering orchestrator). \
              Configure ONLY the `agent`, `model`, `effort`, `fast`, and `context` of 1 to 3 complementary `candidates` for every role in `roles`.\n\
              Rules:\n\
-             1. ONLY choose `agent` values from `availableAgents[].id`.\n\
+             1. ONLY choose `agent` values from `availableAgents[].id`, and avoid agents with a non-empty `error` field whenever healthy agents without `error` are available.\n\
              2. For each candidate's `model`, ONLY choose an exact string from that agent's `models` array, or `null` to use the agent's default.\n\
              3. `effort` must be supported by that model (`low`, `medium`, `high`, or `xhigh` ONLY for models supporting extra-high reasoning).\n\
              4. `fast` may be `true` ONLY for `codex` (otherwise `false`). `context` may be set ONLY for `cursor`/`cursor-agent` (otherwise `null`).\n\
@@ -1078,7 +1081,7 @@ pub async fn configure_roles_with_ai(
             "You are a pure JSON configuration architect for Drove (a multi-agent software engineering orchestrator). \
              Configure every role in `roles` with 1 to 3 complementary `candidates` (`agent` + `model` + `effort` + `fast` + `context` + `strengths` + `note`), AND a top-level global routing `note` for AI sub-agent selection.\n\
              Rules:\n\
-             1. ONLY choose `agent` values from `availableAgents[].id`.\n\
+             1. ONLY choose `agent` values from `availableAgents[].id`, and avoid agents with a non-empty `error` field whenever healthy agents without `error` are available.\n\
              2. For each candidate's `model`, ONLY choose an exact string from that agent's `models` array, or `null` to use the agent's default.\n\
              3. `effort` must be supported by that model (`low`, `medium`, `high`, or `xhigh` ONLY for models supporting extra-high reasoning).\n\
              4. `fast` may be `true` ONLY for `codex` (otherwise `false`). `context` may be set ONLY for `cursor`/`cursor-agent` (otherwise `null`).\n\

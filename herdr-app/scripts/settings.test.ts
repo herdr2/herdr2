@@ -625,3 +625,143 @@ test("triggerUpdateCheck persists edited releases_url and opens modal when check
   expect(view.waitingUpdateCheck).toBe(false);
   expect(view.updateModal?.kind).toBe("up_to_date");
 });
+
+test("AI settings are global across all machines and never forward --on even when droveMachine is remote", async () => {
+  expect(source).not.toContain("st-ai-m-");
+
+  const calls: string[][] = [];
+  const writtenFiles: Record<string, string> = {};
+  const customValues = {
+    ...values,
+    hc: async (args: string[]) => {
+      calls.push(args);
+      if (args[0] === "ai" && args[1] === "probe-prompt-mode") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ ok: true, detectedMode: "shared_prefix", status: { baseUrl: "https://api.example.com/v1", configured: true } }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "ai" && args[1] === "test") {
+        return { code: 0, stdout: JSON.stringify({ ok: true, latencyMs: 12, availableModels: ["m1"] }), stderr: "" };
+      }
+      return {
+        code: 0,
+        stdout: JSON.stringify({ baseUrl: "https://api.example.com/v1", model: "m1", configured: true }),
+        stderr: "",
+      };
+    },
+    writeTextFile: async (path: string, text: string) => {
+      writtenFiles[path] = text;
+    },
+  };
+  const customArgs = names.map((name) => customValues[name] ?? (() => undefined));
+  const CustomSettings = new Function(
+    ...names,
+    source
+      .replace(/^import\s+[\s\S]*?from\s+["'][^"']+["'];?\s*\n?/gm, "")
+      .replace("export default class Settings", "return class Settings"),
+  )(...customArgs);
+
+  const view = new CustomSettings();
+  view.droveMachine = "wsl";
+  let urlVal = "";
+  let keyVal = "";
+  let magpieVal = "";
+  view.droveUrlInput = { value: () => urlVal, set_value: (v: string) => { urlVal = v; } };
+  view.droveKeyInput = { value: () => keyVal, set_value: (v: string) => { keyVal = v; } };
+  view.droveMagpieUrlInput = { value: () => magpieVal, set_value: (v: string) => { magpieVal = v; } };
+
+  await view.loadAi();
+  expect(calls[0]).toEqual(["ai", "status", "--json"]);
+  expect(urlVal).toBe("https://api.example.com/v1");
+
+  // Switching/loading Drove on a remote machine must not overwrite global AI inputs.
+  view.syncDroveInputs({ config: { ai: { baseUrl: "http://other.invalid" }, magpie: { gatewayUrl: "http://127.0.0.1:3425" } } });
+  expect(urlVal).toBe("https://api.example.com/v1");
+  expect(magpieVal).toBe("http://127.0.0.1:3425");
+
+  const pending: Promise<void>[] = [];
+  const cx = { notify() {}, spawn(fn: (c: any) => Promise<void>) { pending.push(fn(cx)); } };
+  view.saveAiPatch({ effort: "high" }, cx);
+  await Promise.all(pending.splice(0));
+  expect(calls[1].slice(0, 3)).toEqual(["ai", "settings-set", "--file"]);
+  expect(calls[1]).not.toContain("--on");
+
+  view.testCoreAi(cx);
+  await Promise.all(pending.splice(0));
+  expect(calls[2].slice(0, 3)).toEqual(["ai", "test", "--file"]);
+  expect(calls[2]).not.toContain("--on");
+
+  await view.runPromptModeRedetect(cx, false);
+  expect(calls[3]).toEqual(["ai", "probe-prompt-mode", "--json"]);
+});
+
+test("runDroveProbe passes an extended 180s timeout to hc so cold-start ACP probes do not time out at 30s", async () => {
+  const recorded: Array<{ args: string[]; opts: any }> = [];
+  const customValues = {
+    ...values,
+    hc: async (args: string[], opts?: any) => {
+      recorded.push({ args, opts });
+      return {
+        code: 0,
+        stdout: JSON.stringify({ fullProbe: true, agents: [{ id: "claude", installed: true, models: ["claude-opus-4-6"] }] }),
+        stderr: "",
+      };
+    },
+  };
+  const customArgs = names.map((name) => customValues[name] ?? (() => undefined));
+  const CustomSettings = new Function(
+    ...names,
+    source
+      .replace(/^import\s+[\s\S]*?from\s+["'][^"']+["'];?\s*\n?/gm, "")
+      .replace("export default class Settings", "return class Settings"),
+  )(...customArgs);
+
+  const view = new CustomSettings();
+  view.droveMachine = "gpu-box";
+  view.droveData = { config: {}, agents: { fullProbe: false, agents: [] } };
+  const ok = await view.runDroveProbe({ notify() {} });
+  expect(ok).toBe(true);
+  expect(recorded).toEqual([
+    {
+      args: ["drove", "probe", "--refresh", "--on", "gpu-box", "--json"],
+      opts: { timeout: 180000 },
+    },
+  ]);
+});
+
+test("droveProbeSummary separates healthy and errored installed agents and formats stderr details", () => {
+  const view = new Settings();
+  view.droveData = {
+    config: {},
+    agents: {
+      fullProbe: true,
+      agents: [
+        { id: "claude", installed: true, models: ["claude-opus-4-6"], error: null },
+        {
+          id: "codex",
+          installed: true,
+          models: ["gpt-5.4"],
+          error: "ACP initialize failed: process exited\nstderr:\nError: Unauthorized (401)",
+        },
+        { id: "agy", installed: true, models: [], error: "`agy models` exited with code 1\nstderr:\nPlease login first" },
+        { id: "gemini", installed: false, models: [], error: null },
+      ],
+    },
+  };
+
+  const summary = view.droveProbeSummary();
+  expect(summary.installed.map((a: any) => a.id)).toEqual(["claude", "codex", "agy"]);
+  expect(summary.ready.map((a: any) => a.id)).toEqual(["claude"]);
+  expect(summary.errored.map((a: any) => a.id)).toEqual(["codex", "agy"]);
+  expect(summary.missing.map((a: any) => a.id)).toEqual(["gemini"]);
+
+  expect(view.formatAgentProbeError(summary.errored[0].error)).toBe(
+    "ACP initialize failed: process exited · Error: Unauthorized (401)",
+  );
+  expect(view.formatAgentProbeError(summary.errored[1].error)).toBe(
+    "`agy models` exited with code 1 · Please login first",
+  );
+  expect(view.formatAgentProbeError("ACP probe timed out after 60s")).toBe("ACP probe timed out after 60s");
+});

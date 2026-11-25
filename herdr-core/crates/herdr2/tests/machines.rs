@@ -598,3 +598,103 @@ fn machine_add_install_auto_installs_skills_only_for_detected_remote_agents() {
     assert!(!clean_box.root.join(".claude/skills").exists());
     assert!(!clean_box.root.join(".gemini/skills").exists());
 }
+
+#[test]
+fn ai_config_is_shared_and_auto_synced_across_all_connected_machines() {
+    let rohan = Session::new();
+    let gondor = Session::new();
+    let mut hub = Session::new();
+    hub.env.push(fake_ssh(&hub, &[("rohan", &rohan), ("gondor", &gondor)]));
+
+    // Connect rohan first while hub has no AI config yet.
+    hub.json(&["machine", "add", "rohan"]);
+    wait_until("rohan connected", || {
+        hub.json(&["machine", "ls"])["machines"]
+            .as_array()
+            .is_some_and(|ms| ms.iter().any(|m| m["name"] == "rohan" && m["state"] == "connected"))
+    });
+
+    // 1. Saving AI settings on hub broadcasts to already-connected rohan.
+    let patch_file = hub.root.join("ai-shared.json");
+    std::fs::write(
+        &patch_file,
+        serde_json::to_vec(&json!({
+            "enabled": true,
+            "baseUrl": "https://api.example.com/v1",
+            "model": "deepseek-chat",
+            "effort": "medium",
+            "contextWindow": "64k",
+            "maxTokens": 2048,
+            "language": "zh-CN",
+            "apiKey": "sk-shared-1234567890",
+            "ptyStatusArbitration": false,
+            "promptMode": "compact"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let hub_st = hub.json(&["ai", "settings-set", "--file", patch_file.to_str().unwrap(), "--consume"]);
+    assert_eq!(hub_st["configured"], true);
+    assert_eq!(hub_st["baseUrl"], "https://api.example.com/v1");
+
+    let rohan_st = rohan.json(&["ai", "status"]);
+    assert_eq!(rohan_st["configured"], true, "rohan should receive broadcast: {rohan_st}");
+    assert_eq!(rohan_st["baseUrl"], "https://api.example.com/v1");
+    assert_eq!(rohan_st["model"], "deepseek-chat");
+    assert_eq!(rohan_st["effort"], "medium");
+    assert_eq!(rohan_st["contextWindow"], "64k");
+    assert_eq!(rohan_st["maxTokens"], 2048);
+    assert_eq!(rohan_st["language"], "zh-CN");
+    assert_eq!(rohan_st["keyMasked"], hub_st["keyMasked"]);
+    assert_eq!(rohan_st["switches"]["ptyStatusArbitration"], false);
+    assert_eq!(rohan_st["switches"]["promptMode"], "compact");
+
+    // 2. Adding a brand-new machine (gondor) automatically pushes hub's AI config on connect.
+    hub.json(&["machine", "add", "gondor"]);
+    wait_until("gondor receives synced AI config on connect", || {
+        let st = gondor.json(&["ai", "status"]);
+        st["configured"] == true
+            && st["baseUrl"] == "https://api.example.com/v1"
+            && st["model"] == "deepseek-chat"
+            && st["keyMasked"] == hub_st["keyMasked"]
+    });
+    let gondor_st = gondor.json(&["ai", "status"]);
+    assert_eq!(gondor_st["switches"]["ptyStatusArbitration"], false);
+    assert_eq!(gondor_st["switches"]["promptMode"], "compact");
+
+    // 3. Clearing the API key on hub propagates to all connected machines.
+    let clear_file = hub.root.join("ai-clear.json");
+    std::fs::write(&clear_file, serde_json::to_vec(&json!({ "clearKey": true })).unwrap()).unwrap();
+    hub.json(&["ai", "settings-set", "--file", clear_file.to_str().unwrap(), "--consume"]);
+    assert!(rohan.json(&["ai", "status"])["keyMasked"].is_null());
+    assert!(gondor.json(&["ai", "status"])["keyMasked"].is_null());
+
+    // 4. An unconfigured hub connecting to a legacy pre-configured remote must NOT wipe its config.
+    let legacy = Session::new();
+    let legacy_patch = legacy.root.join("legacy-ai.json");
+    std::fs::write(
+        &legacy_patch,
+        serde_json::to_vec(&json!({
+            "enabled": true,
+            "baseUrl": "https://legacy.example.com/v1",
+            "apiKey": "sk-legacy-9999999999"
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    legacy.json(&["ai", "settings-set", "--file", legacy_patch.to_str().unwrap(), "--consume"]);
+
+    let mut fresh_hub = Session::new();
+    fresh_hub.env.push(fake_ssh(&fresh_hub, &[("legacy", &legacy)]));
+    fresh_hub.json(&["machine", "add", "legacy"]);
+    wait_until("fresh_hub connected to legacy", || {
+        fresh_hub.json(&["machine", "ls"])["machines"]
+            .as_array()
+            .is_some_and(|ms| ms.iter().any(|m| m["name"] == "legacy" && m["state"] == "connected"))
+    });
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    let legacy_after = legacy.json(&["ai", "status"]);
+    assert_eq!(legacy_after["configured"], true, "unconfigured hub must not wipe legacy remote: {legacy_after}");
+    assert_eq!(legacy_after["baseUrl"], "https://legacy.example.com/v1");
+    assert!(!legacy_after["keyMasked"].is_null());
+}

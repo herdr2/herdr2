@@ -806,6 +806,8 @@ pub struct AppWindow {
     ai_unavailable_until: Option<Instant>,
     /// Last interface language pushed to each connected core (`""` = local, else remote machine name).
     synced_ai_language: HashMap<String, settings::Language>,
+    /// Machines whose Drove agent/model cache has already been checked (and pre-warmed if missing) this session.
+    warmed_drove_probe: HashSet<String>,
     /// Monotonic counter for `files.open` requests routed to the Files panel.
     file_open_seq: u64,
     listed_once: bool,
@@ -951,6 +953,7 @@ impl AppWindow {
             last_agent_titles: HashMap::new(),
             ai_unavailable_until: None,
             synced_ai_language: HashMap::new(),
+            warmed_drove_probe: HashSet::new(),
             file_open_seq: 0,
             listed_once: false,
             cwds: HashMap::new(),
@@ -1208,6 +1211,7 @@ impl AppWindow {
         }));
         Self::note_core(&w.core);
         w.sync_ai_language();
+        w.warm_drove_probe();
         w.sync(window, cx);
         w.restore_focus(window, cx);
         // The first time the app opens: the frame's welcome (it sets
@@ -1245,34 +1249,89 @@ impl AppWindow {
         });
     }
 
-    /// Pushes the user's configured interface language to the local core and every connected
-    /// remote machine so Core AI & Drove internal AI hooks follow the user's language setting.
+    /// Pushes the user's configured interface language to the local core, which automatically
+    /// replicates the shared AI configuration to every connected remote machine.
     fn sync_ai_language(&mut self) {
         let lang = self.person.language;
+        if self.synced_ai_language.get("").copied() == Some(lang) {
+            return;
+        }
+        self.synced_ai_language.insert(String::new(), lang);
+        let lang_str = if lang == settings::Language::ZhCn { "zh-CN" } else { "en" };
+        let core = self.core.clone();
+        std::thread::spawn(move || {
+            let _ = core.call("ai.settings.set", json!({ "language": lang_str }));
+        });
+    }
+
+    /// Returns true when a `drove.probe` snapshot has no full probe cache yet, or has installed
+    /// agents without any discovered models cached.
+    fn probe_snapshot_needs_full_refresh(snap: &Value) -> bool {
+        if snap.get("fullProbe").and_then(Value::as_bool) != Some(true) {
+            return true;
+        }
+        let Some(agents) = snap.get("agents").and_then(Value::as_array) else {
+            return true;
+        };
+        let installed: Vec<&Value> =
+            agents.iter().filter(|a| a.get("installed").and_then(Value::as_bool) == Some(true)).collect();
+        if installed.is_empty() {
+            return false;
+        }
+        !installed.iter().any(|a| a.get("models").and_then(Value::as_array).is_some_and(|m| !m.is_empty()))
+    }
+
+    /// Pre-warms Drove agent & model probe caches in the background right after the app starts
+    /// (and whenever a remote machine connects) when no cached full probe exists yet, so opening
+    /// Settings -> Drove displays agents and models immediately.
+    fn warm_drove_probe(&mut self) {
+        if cfg!(test) || std::env::var_os("HERDR2_NO_AUTO_PROBE").is_some() {
+            return;
+        }
         let targets: Vec<String> = self
             .documents
             .iter()
             .filter(|(_, slot)| slot.connected)
             .map(|(m, _)| m.clone())
-            .filter(|m| self.synced_ai_language.get(m).copied() != Some(lang))
+            .filter(|m| !self.warmed_drove_probe.contains(m))
             .collect();
         if targets.is_empty() {
             return;
         }
         for m in &targets {
-            self.synced_ai_language.insert(m.clone(), lang);
+            self.warmed_drove_probe.insert(m.clone());
         }
-        let lang_str = if lang == settings::Language::ZhCn { "zh-CN" } else { "en" };
-        let core = self.core.clone();
-        std::thread::spawn(move || {
-            for m in targets {
-                let mut params = json!({ "language": lang_str });
+        for m in targets {
+            let core = self.core.clone();
+            std::thread::spawn(move || {
+                // Defer briefly so initial window paint and terminal hydration stay completely snappy.
+                std::thread::sleep(Duration::from_millis(1500));
+                let mut quick_params = json!({ "refresh": false });
                 if !m.is_empty() {
-                    params["on"] = json!(m);
+                    quick_params["on"] = json!(&m);
                 }
-                let _ = core.call("ai.settings.set", params);
-            }
-        });
+                let Ok(snap) = core.call_timeout("drove.probe", quick_params, Duration::from_secs(15)) else {
+                    return;
+                };
+                if !Self::probe_snapshot_needs_full_refresh(&snap) {
+                    return;
+                }
+                tracing::info!(
+                    "drove: warming uncached agent/model probe in background ({})",
+                    if m.is_empty() { "local" } else { m.as_str() }
+                );
+                let mut full_params = json!({ "refresh": true });
+                if !m.is_empty() {
+                    full_params["on"] = json!(&m);
+                }
+                if let Err(err) = core.call_timeout("drove.probe", full_params, Duration::from_secs(210)) {
+                    tracing::debug!(
+                        "drove: background probe warm-up skipped/failed ({}): {err}",
+                        if m.is_empty() { "local" } else { m.as_str() }
+                    );
+                }
+            });
+        }
     }
 
     fn reconnected(&mut self, core: Arc<Core>, cx: &mut Context<Self>) {
@@ -1280,6 +1339,7 @@ impl AppWindow {
         self.core_generation += 1;
         self.ended_acp.clear();
         self.synced_ai_language.clear();
+        self.warmed_drove_probe.clear();
         self.documents_watching = false;
         for (machine, slot) in &mut self.documents {
             slot.available = false;
@@ -1291,6 +1351,7 @@ impl AppWindow {
         Self::note_core(&core);
         self.core = core.clone();
         self.sync_ai_language();
+        self.warm_drove_probe();
         self.publish(cx);
         for t in self.terms.values() {
             t.view.update(cx, |v, cx| v.reattach(core.clone(), cx));
@@ -3257,6 +3318,7 @@ impl AppWindow {
                 self.documents.get(m).is_some_and(|slot| slot.connected)
             });
             self.sync_ai_language();
+            self.warm_drove_probe();
             let before = self.model.spaces.len();
             self.model.spaces.retain(|s| s.machine.as_deref().is_none_or(|m| states.contains_key(m)));
             changed |= before != self.model.spaces.len();
@@ -15074,5 +15136,28 @@ export default class SystemToast extends View {
                 super::TerminalChange::Park => panic!("expected TerminalChange::Keep, got Park"),
             }
         });
+    }
+
+    #[test]
+    fn drove_probe_warm_check_only_refreshes_when_cache_is_missing_or_empty() {
+        assert!(super::AppWindow::probe_snapshot_needs_full_refresh(&serde_json::json!({
+            "fullProbe": false,
+            "agents": [{ "id": "claude", "installed": true, "models": [] }]
+        })));
+        assert!(super::AppWindow::probe_snapshot_needs_full_refresh(&serde_json::json!({
+            "fullProbe": true,
+            "agents": [{ "id": "claude", "installed": true, "models": [] }]
+        })));
+        assert!(!super::AppWindow::probe_snapshot_needs_full_refresh(&serde_json::json!({
+            "fullProbe": true,
+            "agents": [
+                { "id": "claude", "installed": true, "models": ["claude-opus-4-6"] },
+                { "id": "codex", "installed": false, "models": [] }
+            ]
+        })));
+        assert!(!super::AppWindow::probe_snapshot_needs_full_refresh(&serde_json::json!({
+            "fullProbe": true,
+            "agents": [{ "id": "claude", "installed": false, "models": [] }]
+        })));
     }
 }

@@ -320,12 +320,10 @@ export default class Settings extends View {
         if (this.section === "keyboard") await this.loadKeys();
         if (this.section === "machines") await this.loadMachines();
         if (this.section === "ai") {
-          await this.loadMachines();
-          await this.loadAi();
+          await Promise.all([this.loadMachines(), this.loadAi()]);
         }
         if (this.section === "drove") {
-          await this.loadMachines();
-          await this.loadDrove();
+          await Promise.all([this.loadMachines(), this.loadAi(), this.loadDrove()]);
           this.maybeAutoProbeDrove(cx);
         }
         if (this.section === "skills") {
@@ -1550,9 +1548,10 @@ export default class Settings extends View {
     return this.droveMachine ? [...base, "--on", this.droveMachine] : base;
   }
 
-  async droveHcJson(args) {
+  async droveHcJson(args, opts) {
     if (typeof checking === "function" && checking()) return null;
-    const r = await hc([...this.droveArgs(args), "--json"]);
+    const cmd = [...this.droveArgs(args), "--json"];
+    const r = opts ? await hc(cmd, opts) : await hc(cmd);
     let parsed = null;
     try { parsed = JSON.parse(r.stdout || r.stderr); } catch {}
     if (r.code !== 0) {
@@ -1561,19 +1560,34 @@ export default class Settings extends View {
     return parsed;
   }
 
-  async droveCallWithJsonFile(args, payload) {
+  async droveCallWithJsonFile(args, payload, opts) {
     if (typeof checking === "function" && checking()) return null;
     const reqPath = `${appHome()}/.drove-req-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.json`;
     await writeTextFile(reqPath, JSON.stringify(payload), null);
-    return this.droveHcJson([...args, "--file", reqPath, "--consume"]);
+    return this.droveHcJson([...args, "--file", reqPath, "--consume"], opts);
+  }
+
+  async aiHcJson(args) {
+    if (typeof checking === "function" && checking()) return null;
+    const r = await hc([...args, "--json"]);
+    let parsed = null;
+    try { parsed = JSON.parse(r.stdout || r.stderr); } catch {}
+    if (r.code !== 0) {
+      throw new Error(parsed?.error?.message || parsed?.message || (r.stderr || r.stdout || "AI command failed.").trim());
+    }
+    return parsed;
+  }
+
+  async aiCallWithJsonFile(args, payload) {
+    if (typeof checking === "function" && checking()) return null;
+    const reqPath = `${appHome()}/.ai-req-${Date.now()}-${Math.random().toString(36).slice(2, 7)}.json`;
+    await writeTextFile(reqPath, JSON.stringify(payload), null);
+    return this.aiHcJson([...args, "--file", reqPath, "--consume"]);
   }
 
   syncDroveInputs(data) {
     const cfg = data?.config ?? {};
-    this.droveUrlInput.set_value(cfg.ai?.baseUrl ?? "");
     this.droveMagpieUrlInput.set_value(cfg.magpie?.gatewayUrl ?? "");
-    this.droveKeyInput.set_value("");
-    this.droveKeyDirty = false;
   }
 
   syncAiInputs(status) {
@@ -1587,7 +1601,7 @@ export default class Settings extends View {
     this.aiLoading = true;
     this.aiError = null;
     try {
-      const data = await this.droveHcJson(["ai", "status"]);
+      const data = await this.aiHcJson(["ai", "status"]);
       this.aiStatus = data;
       this.syncAiInputs(data);
     } catch (e) {
@@ -1604,14 +1618,18 @@ export default class Settings extends View {
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const next = await this.droveCallWithJsonFile(["ai", "settings-set"], patch);
+        const next = await this.aiCallWithJsonFile(["ai", "settings-set"], patch);
         if (next) {
           this.aiStatus = next;
           if (syncInputs) this.syncAiInputs(next);
           if (patch && ("promptMode" in patch || "promptCacheEnabled" in patch || "model" in patch || "baseUrl" in patch)) {
             this.aiPromptProbeResult = null;
           }
-          this.droveData = null;
+          if (this.section === "drove") {
+            await this.loadDrove();
+          } else {
+            this.droveData = null;
+          }
         }
       } catch (e) {
         this.aiError = String(e?.message ?? e);
@@ -1634,7 +1652,7 @@ export default class Settings extends View {
     cx.spawn(async (cx) => {
       let shouldProbe = false;
       try {
-        const next = await this.droveCallWithJsonFile(["ai", "settings-set"], {
+        const next = await this.aiCallWithJsonFile(["ai", "settings-set"], {
           model: nextModel,
           promptMode: "auto",
         });
@@ -1670,7 +1688,7 @@ export default class Settings extends View {
     this.aiPromptProbeResult = null;
     cx.notify();
     try {
-      const res = await this.droveHcJson(["ai", "probe-prompt-mode"]);
+      const res = await this.aiHcJson(["ai", "probe-prompt-mode"]);
       if (res) {
         if (res.status) {
           this.aiStatus = res.status;
@@ -1703,7 +1721,7 @@ export default class Settings extends View {
         const payload = {};
         if (baseUrl) payload.baseUrl = baseUrl;
         if (apiKey) payload.apiKey = apiKey;
-        const res = await this.droveCallWithJsonFile(["ai", "test"], payload);
+        const res = await this.aiCallWithJsonFile(["ai", "test"], payload);
         this.aiTestResult = res;
         this.droveTestResult = res;
         if (res?.ok && this.aiStatus && Array.isArray(res.availableModels) && res.availableModels.length > 0) {
@@ -1723,7 +1741,7 @@ export default class Settings extends View {
     this.droveLoading = true;
     this.droveError = null;
     try {
-      const data = await this.droveHcJson(["drove", "settings"]);
+      const data = await this.droveHcJson(["drove", "settings"], { timeout: 60000 });
       this.droveData = data;
       this.syncDroveInputs(data);
     } catch (e) {
@@ -1764,7 +1782,7 @@ export default class Settings extends View {
     cx?.notify?.();
     const task = (async () => {
       try {
-        const snap = await this.droveHcJson(["drove", "probe", "--refresh"]);
+        const snap = await this.droveHcJson(["drove", "probe", "--refresh"], { timeout: 180000 });
         if (this.droveMachine !== targetMachine) return false;
         if (snap && this.droveData) this.droveData = { ...this.droveData, agents: snap };
         else await this.loadDrove();
@@ -1857,13 +1875,13 @@ export default class Settings extends View {
         const instruction = (this.droveAiRolePromptInput?.value?.() ?? "").trim();
         const baseUrl = (this.droveUrlInput?.value?.() ?? "").trim();
         const apiKey = (this.droveKeyInput?.value?.() ?? "").trim();
-        const model = (this.droveData?.config?.ai?.model ?? "").trim();
+        const model = (this.aiStatus?.model ?? this.droveData?.config?.ai?.model ?? "").trim();
         const payload = { mode: effMode, apply: true, language: this.lang() };
         if (instruction) payload.instruction = instruction;
         if (baseUrl) payload.baseUrl = baseUrl;
         if (apiKey) payload.apiKey = apiKey;
         if (model) payload.model = model;
-        const res = await this.droveCallWithJsonFile(["drove", "roles-ai-config"], payload);
+        const res = await this.droveCallWithJsonFile(["drove", "roles-ai-config"], payload, { timeout: 180000 });
         this.droveAiConfigResult = res
           ? { ...res, mode: effMode, probedRefreshed: Boolean(res.probedRefreshed || refreshedBeforeAi) }
           : res;
@@ -1902,7 +1920,7 @@ export default class Settings extends View {
         const draft = (this.droveCandNoteInput?.value?.() ?? "").trim();
         const baseUrl = (this.droveUrlInput?.value?.() ?? "").trim();
         const apiKey = (this.droveKeyInput?.value?.() ?? "").trim();
-        const model = (this.droveData?.config?.ai?.model ?? "").trim();
+        const model = (this.aiStatus?.model ?? this.droveData?.config?.ai?.model ?? "").trim();
         const payload = {
           mode: "notes",
           noteScope: "candidate",
@@ -1915,7 +1933,7 @@ export default class Settings extends View {
         if (baseUrl) payload.baseUrl = baseUrl;
         if (apiKey) payload.apiKey = apiKey;
         if (model) payload.model = model;
-        const res = await this.droveCallWithJsonFile(["drove", "roles-ai-config"], payload);
+        const res = await this.droveCallWithJsonFile(["drove", "roles-ai-config"], payload, { timeout: 180000 });
         if (res?.ok && res?.note) {
           const generated = String(res.note).trim();
           if (this.picking === `drove-note:${roleId}-c${candIdx}`) {
@@ -1962,7 +1980,7 @@ export default class Settings extends View {
         const hint = (this.droveStrengthInput?.value?.() ?? "").trim();
         const baseUrl = (this.droveUrlInput?.value?.() ?? "").trim();
         const apiKey = (this.droveKeyInput?.value?.() ?? "").trim();
-        const model = (this.droveData?.config?.ai?.model ?? "").trim();
+        const model = (this.aiStatus?.model ?? this.droveData?.config?.ai?.model ?? "").trim();
         const payload = {
           mode: "strengths",
           targetRole: roleId,
@@ -1974,7 +1992,7 @@ export default class Settings extends View {
         if (baseUrl) payload.baseUrl = baseUrl;
         if (apiKey) payload.apiKey = apiKey;
         if (model) payload.model = model;
-        const res = await this.droveCallWithJsonFile(["drove", "roles-ai-config"], payload);
+        const res = await this.droveCallWithJsonFile(["drove", "roles-ai-config"], payload, { timeout: 180000 });
         if (res?.ok && Array.isArray(res?.strengths) && res.strengths.length > 0) {
           if (prevRoles) {
             this.droveRolesBackup = { roles: prevRoles, note: prevNote, mode: "strengths", at: Date.now() };
@@ -2055,6 +2073,36 @@ export default class Settings extends View {
     const probed = this.droveData?.agents?.agents ?? [];
     if (probed.length > 0) return probed;
     return DROVE_FALLBACK_AGENTS.map((id) => ({ id, name: id, installed: false, models: [], efforts: [] }));
+  }
+
+  agentProbeError(agent) {
+    const raw = String(agent?.error ?? "").trim();
+    return raw || null;
+  }
+
+  formatAgentProbeError(raw) {
+    const text = String(raw ?? "").trim();
+    if (!text) return "";
+    const lines = text
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter(Boolean);
+    if (lines.length === 0) return "";
+    const headline = lines[0];
+    const stderrIdx = lines.findIndex((l) => l.toLowerCase() === "stderr:");
+    const stderrLine = stderrIdx >= 0 ? lines.slice(stderrIdx + 1).find(Boolean) : null;
+    let combined = stderrLine && !headline.includes(stderrLine) ? `${headline} · ${stderrLine}` : headline;
+    if (combined.length > 160) combined = `${combined.slice(0, 159).trimEnd()}…`;
+    return combined;
+  }
+
+  droveProbeSummary() {
+    const agents = this.probedAgents();
+    const installed = agents.filter((a) => Boolean(a.installed));
+    const errored = installed.filter((a) => this.agentProbeError(a) !== null);
+    const ready = installed.filter((a) => this.agentProbeError(a) === null);
+    const missing = agents.filter((a) => !a.installed);
+    return { total: agents.length, installed, ready, errored, missing };
   }
 
   probedModelsFor(agentId) {
@@ -2188,12 +2236,13 @@ export default class Settings extends View {
       .px(9)
       .rounded(7)
       .border_1()
-      .border_color(open ? t.accent : t.border)
+      .border_color(open ? t.accent : (o.borderColor ?? t.border))
       .bg(t.raised)
       .cursor_pointer()
       .items_center()
       .justify_between()
       .gap(6)
+      .when(Boolean(o.tooltip), (el) => el.tooltip(o.tooltip))
       .hover((s) => s.bg(t.hover))
       .on_click((_e, cx) => {
         this.picking = open ? null : key;
@@ -2215,8 +2264,8 @@ export default class Settings extends View {
           .gap(6)
           .items_center()
           .when(Boolean(o.icon), (el) => el.child(this.agentIconEl(t, o.icon, 13)))
-          .when(o.dot !== undefined, (el) =>
-            el.child(div().w(5).h(5).rounded(3).flex_none().bg(o.dot ? t.ansi2 : t.dim)),
+          .when(o.dot !== undefined || o.dotColor !== undefined, (el) =>
+            el.child(div().w(5).h(5).rounded(3).flex_none().bg(o.dotColor ?? (o.dot ? t.ansi2 : t.dim))),
           )
           .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(t.foreground).child(label)),
       )
@@ -2295,12 +2344,13 @@ export default class Settings extends View {
                         this.handle.focus();
                         onSelect(it.value, cx);
                       })
+                      .when(Boolean(it.tooltip), (row) => row.tooltip(it.tooltip))
                       .when(Boolean(it.icon), (row) => row.child(this.agentIconEl(t, it.icon, 13)))
-                      .when(it.dot !== undefined, (row) =>
-                        row.child(div().w(6).h(6).rounded(3).flex_none().bg(it.dot ? t.ansi2 : t.dim)),
+                      .when(it.dot !== undefined || it.dotColor !== undefined, (row) =>
+                        row.child(div().w(6).h(6).rounded(3).flex_none().bg(it.dotColor ?? (it.dot ? t.ansi2 : t.dim))),
                       )
                       .child(div().flex_1().min_w(0).truncate().text_size(12.5).text_color(it.active ? t.foreground : t.muted).child(it.label))
-                      .when(Boolean(it.meta), (row) => row.child(div().flex_none().text_size(11).text_color(t.dim).child(it.meta))),
+                      .when(Boolean(it.meta), (row) => row.child(div().flex_none().text_size(11).text_color(it.metaColor ?? t.dim).child(it.meta))),
                   ),
                 ),
             ),
@@ -3143,14 +3193,27 @@ export default class Settings extends View {
     const candidateRow = (target, idx) => {
       const isPrimary = idx === 0;
       const curAgentInfo = probed.find((a) => a.id === target.agent);
-      const agentItems = probed.map((a) => ({
-        value: a.id,
-        label: a.name && a.name !== a.id ? `${a.id} · ${a.name}` : a.id,
-        icon: a.id,
-        dot: Boolean(a.installed),
-        meta: !a.installed ? this.tr("missing", "未安装") : a.models?.length ? `${a.models.length} ${this.tr("models", "模型")}` : "✓",
-        active: target.agent === a.id,
-      }));
+      const curAgentErr = this.agentProbeError(curAgentInfo);
+      const agentItems = probed.map((a) => {
+        const err = this.agentProbeError(a);
+        return {
+          value: a.id,
+          label: a.name && a.name !== a.id ? `${a.id} · ${a.name}` : a.id,
+          icon: a.id,
+          dot: Boolean(a.installed),
+          dotColor: !a.installed ? t.dim : err ? t.blocked : t.ansi2,
+          meta: !a.installed
+            ? this.tr("missing", "未安装")
+            : err
+              ? this.tr("error", "异常")
+              : a.models?.length
+                ? `${a.models.length} ${this.tr("models", "模型")}`
+                : "✓",
+          metaColor: err ? t.blocked : t.dim,
+          tooltip: err ? this.formatAgentProbeError(err) : undefined,
+          active: target.agent === a.id,
+        };
+      });
       const models = this.probedModelsFor(target.agent);
       const modelItems = [
         { value: null, label: this.tr("Auto (agent default)", "自动（Agent 默认）"), active: !target.model },
@@ -3252,7 +3315,15 @@ export default class Settings extends View {
               );
               commitChain(next, cx);
             },
-            { width: 118, popupWidth: 280, icon: target.agent, dot: curAgentInfo ? Boolean(curAgentInfo.installed) : undefined },
+            {
+              width: 118,
+              popupWidth: 280,
+              icon: target.agent,
+              dot: curAgentInfo ? Boolean(curAgentInfo.installed) : undefined,
+              dotColor: !curAgentInfo ? undefined : !curAgentInfo.installed ? t.dim : curAgentErr ? t.blocked : t.ansi2,
+              borderColor: curAgentErr ? t.blocked : undefined,
+              tooltip: curAgentErr ? this.formatAgentProbeError(curAgentErr) : undefined,
+            },
             cx,
           ),
         )
@@ -3646,33 +3717,7 @@ export default class Settings extends View {
         active: true,
       });
     }
-    const machineChip = (id, label, value) => {
-      const on = this.droveMachine === value;
-      return div()
-        .id(`st-ai-m-${id}`)
-        .px(10)
-        .py(4)
-        .rounded(6)
-        .border_1()
-        .border_color(on ? t.accent : t.border)
-        .bg(on ? t.accent : t.raised)
-        .cursor_pointer()
-        .text_size(12.5)
-        .text_color(on ? t.accent_foreground : t.foreground)
-        .on_click((_e, cx) => {
-          this.droveMachine = value;
-          this.aiStatus = null;
-          this.aiTestResult = null;
-          this.aiPromptProbeResult = null;
-          this.droveData = null;
-          this.picking = null;
-          cx.spawn(async (cx) => {
-            await this.loadAi();
-            cx.notify();
-          });
-        })
-        .child(label);
-    };
+    const remoteCount = machines.length;
     const totalCalls = Number(usage.totalCalls ?? 0);
     const localHits = Number(usage.localCacheHits ?? 0);
     const sessionsReused = Number(usage.sessionsReused ?? 0);
@@ -3713,7 +3758,7 @@ export default class Settings extends View {
     return v_flex()
       .w_full()
       .gap(16)
-      // 0. Target Machine Bar
+      // 0. Global Shared Status Bar
       .child(
         h_flex()
           .w_full()
@@ -3729,32 +3774,38 @@ export default class Settings extends View {
           .flex_wrap()
           .child(
             h_flex()
-              .gap(6)
-              .items_center()
-              .flex_wrap()
-              .child(div().text_size(12).text_color(t.dim).child(this.tr("Machine:", "目标主机：")))
-              .child(machineChip("local", this.tr("This computer", "本机"), null))
-              .children(machines.map((m) => machineChip(m.name, m.name, m.name))),
-          )
-          .child(
-            h_flex()
               .gap(8)
               .items_center()
+              .flex_wrap()
+              .child(div().w(7).h(7).flex_none().rounded(4).bg(st.configured ? t.ansi2 : t.dim))
               .child(
                 div()
-                  .px(7)
-                  .py(3)
-                  .rounded(5)
-                  .bg(t.background)
-                  .border_1()
-                  .border_color(t.border)
-                  .text_size(11)
-                  .text_color(st.configured ? t.ansi2 : t.dim)
+                  .text_size(12.5)
+                  .font_medium()
+                  .text_color(t.foreground)
                   .child(st.configured ? this.tr("Connected", "已配置") : this.tr("Not configured", "未配置")),
               )
-              .child(this.button(t, "st-ai-refresh", this.aiLoading ? this.tr("Refreshing…", "刷新中…") : this.tr("Refresh", "刷新"), (_e, cx) => {
-                cx.spawn(async (cx) => { await this.loadAi(); cx.notify(); });
-              })),
+              .child(
+                div()
+                  .text_size(12)
+                  .text_color(t.dim)
+                  .child(
+                    remoteCount > 0
+                      ? this.tr(
+                          `Shared across this computer and ${remoteCount} remote machine(s) — synced automatically`,
+                          `所有主机共用一套配置（自动同步至本机及 ${remoteCount} 台远程主机）`,
+                        )
+                      : this.tr(
+                          "Shared across all machines — synced automatically",
+                          "所有主机共用一套配置，修改后自动同步",
+                        ),
+                  ),
+              ),
+          )
+          .child(
+            this.button(t, "st-ai-refresh", this.aiLoading ? this.tr("Refreshing…", "刷新中…") : this.tr("Refresh", "刷新"), (_e, cx) => {
+              cx.spawn(async (cx) => { await this.loadAi(); cx.notify(); });
+            }),
           ),
       )
       .when(Boolean(this.aiError), (el) =>
@@ -4359,9 +4410,10 @@ export default class Settings extends View {
         .child(label);
     };
     const magpieOn = Boolean(cfg.magpie?.enabled);
-    const aiOn = cfg.ai?.enabled !== false;
+    const sharedAi = this.aiStatus ?? aiStatus;
+    const aiOn = sharedAi.enabled !== false && cfg.ai?.enabled !== false;
     const aiModels = this.aiAvailableModels();
-    const currentAiModel = (cfg.ai?.model ?? "").trim();
+    const currentAiModel = (sharedAi.model ?? cfg.ai?.model ?? "").trim();
     const aiModelItems = [
       { value: "", label: this.tr("Auto (first available model)", "自动选择（首个可用模型）"), active: !currentAiModel },
       ...aiModels.map((m) => ({ value: m, label: m, active: currentAiModel === m })),
@@ -4429,8 +4481,10 @@ export default class Settings extends View {
     const questionLabel = questionOptions.find((o) => o.active)?.label ?? questionMode;
     const loopLabel = loopOptions.find((o) => o.active)?.label ?? loopDetect;
 
-    const probedList = this.probedAgents();
-    const installedCount = probedList.filter((a) => a.installed).length;
+    const probeSummary = this.droveProbeSummary();
+    const installedCount = probeSummary.installed.length;
+    const readyCount = probeSummary.ready.length;
+    const errorAgents = probeSummary.errored;
 
     return v_flex()
       .w_full()
@@ -4473,7 +4527,27 @@ export default class Settings extends View {
                     .border_color(t.border)
                     .text_size(11)
                     .text_color(t.muted)
-                    .child(this.tr(`${installedCount} agents ready`, `${installedCount} 个 Agent 可用`)),
+                    .child(this.tr(`${readyCount} agents ready`, `${readyCount} 个 Agent 可用`)),
+                ),
+              )
+              .when(errorAgents.length > 0, (el) =>
+                el.child(
+                  div()
+                    .id("st-dr-probe-err-badge")
+                    .px(7)
+                    .py(3)
+                    .rounded(5)
+                    .bg(t.background)
+                    .border_1()
+                    .border_color(t.blocked)
+                    .text_size(11)
+                    .text_color(t.blocked)
+                    .child(
+                      this.tr(
+                        `${errorAgents.length} error${errorAgents.length > 1 ? "s" : ""}`,
+                        `${errorAgents.length} 个异常`,
+                      ),
+                    ),
                 ),
               )
               .child(this.button(t, "st-dr-probe", this.droveProbing ? this.tr("Refreshing…", "检测中…") : this.tr("Refresh Agents", "刷新检测"), (_e, cx) => this.probeDroveAgents(cx)))
@@ -4494,6 +4568,55 @@ export default class Settings extends View {
             .text_size(12)
             .text_color(t.blocked)
             .child(this.droveError),
+        ),
+      )
+      .when(errorAgents.length > 0, (el) =>
+        el.child(
+          v_flex()
+            .id("st-dr-agent-errors")
+            .w_full()
+            .px(12)
+            .py(10)
+            .gap(6)
+            .rounded(8)
+            .border_1()
+            .border_color(t.blocked)
+            .bg(t.surface)
+            .child(
+              div()
+                .text_size(12)
+                .font_semibold()
+                .text_color(t.blocked)
+                .child(
+                  this.tr(
+                    `Detected ${errorAgents.length} agent probe error${errorAgents.length > 1 ? "s" : ""}`,
+                    `刷新检测到 ${errorAgents.length} 个 Agent 异常`,
+                  ),
+                ),
+            )
+            .children(
+              errorAgents.map((a) => {
+                const rawErr = this.agentProbeError(a) ?? "";
+                const shortErr = this.formatAgentProbeError(rawErr);
+                return h_flex()
+                  .id(`st-dr-agent-err-${a.id}`)
+                  .w_full()
+                  .gap(8)
+                  .items_center()
+                  .tooltip(rawErr)
+                  .child(
+                    h_flex()
+                      .w(104)
+                      .flex_none()
+                      .gap(6)
+                      .items_center()
+                      .child(this.agentIconEl(t, a.id, 13))
+                      .child(div().w(6).h(6).rounded(3).flex_none().bg(t.blocked))
+                      .child(div().truncate().text_size(12).font_semibold().text_color(t.foreground).child(a.id)),
+                  )
+                  .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.muted).child(shortErr));
+              }),
+            ),
         ),
       )
       .when(this.droveLoading && !data, (el) =>
@@ -4713,7 +4836,7 @@ export default class Settings extends View {
             const isAllMode = mode === "all";
             const isStrengthsMode = mode === "strengths";
             const isNotesMode = mode === "notes";
-            const aiReady = Boolean((this.droveUrlInput.value().trim() || cfg.ai?.baseUrl?.trim()));
+            const aiReady = Boolean(sharedAi.configured || aiStatus.configured || this.droveUrlInput.value().trim() || cfg.ai?.baseUrl?.trim());
             const activeAiModelLabel = currentAiModel || aiStatus.model || aiModels[0] || this.tr("Auto-detect from endpoint", "自动从服务端获取");
             const hasCache = this.hasCachedAgentModels();
             const promptPlaceholder = isAllMode
@@ -4772,7 +4895,7 @@ export default class Settings extends View {
                         .child(
                           aiReady
                             ? this.tr(`Assistant model: ${activeAiModelLabel}`, `智能辅助模型：${activeAiModelLabel}`)
-                            : this.tr("Configure Service URL in AI Assistant below first", "请先在下方「智能辅助模型」配置服务地址"),
+                            : this.tr("Configure AI Assistant in Settings → AI first", "请先在「设置 → AI 助手」中配置服务地址"),
                         ),
                     ),
                 )
@@ -5004,26 +5127,26 @@ export default class Settings extends View {
               .child(
                 this.droveCardRow(
                   t,
-                  aiStatus.configured
+                  (sharedAi.configured || aiStatus.configured)
                     ? this.tr(
                         `Ready · ${currentAiModel || aiModels[0] || "Auto"}`,
                         `已就绪 · ${currentAiModel || aiModels[0] || "自动模型"}`,
                       )
                     : this.tr("AI Assistant not configured", "尚未配置全局 AI 助手"),
-                  aiStatus.configured
+                  (sharedAi.configured || aiStatus.configured)
                     ? this.tr(
-                        `Shared across Core & Drove (${cfg.ai?.baseUrl || aiStatus.baseUrl || "local"}). Edit endpoint, API key, cache & core switches in Settings → AI.`,
-                        `由 Core 与 Drove 共享（${cfg.ai?.baseUrl || aiStatus.baseUrl || "本地"}）。前往「设置 → AI 助手」管理接口地址、Key 与缓存统计。`,
+                        `Shared across all machines & Drove (${sharedAi.baseUrl || cfg.ai?.baseUrl || aiStatus.baseUrl || "local"}). Edit endpoint, API key, cache & core switches in Settings → AI.`,
+                        `所有主机与 Drove 共用一套配置（${sharedAi.baseUrl || cfg.ai?.baseUrl || aiStatus.baseUrl || "本地"}）。前往「设置 → AI 助手」管理接口地址、Key 与缓存统计。`,
                       )
                     : this.tr(
-                        "Configure an OpenAI-compatible helper once in Settings → AI to unlock role auto-config, semantic conflict/loop checks, and PTY state arbitration.",
-                        "在「设置 → AI 助手」中配置一次轻量 OpenAI 兼容模型，即可同时启用 Drove 编排辅助、死循环/冲突分析与终端状态仲裁。",
+                        "Configure an OpenAI-compatible helper once in Settings → AI — shared automatically across all machines for Drove orchestration, conflict/loop checks, and PTY state arbitration.",
+                        "在「设置 → AI 助手」中配置一次轻量 OpenAI 兼容模型，所有主机自动共用，同时启用 Drove 编排辅助、死循环/冲突分析与终端状态仲裁。",
                       ),
                   h_flex()
                     .gap(8)
                     .items_center()
                     .child(
-                      this.toggle(t, "st-dr-ai-on", aiOn, (_e, cx) => this.saveDrovePatch({ ai: { enabled: !aiOn } }, cx)),
+                      this.toggle(t, "st-dr-ai-on", aiOn, (_e, cx) => this.saveAiPatch({ enabled: !aiOn }, cx)),
                     )
                     .child(
                       this.button(t, "st-dr-open-ai", this.tr("Open AI Settings →", "前往 AI 设置 →"), (_e, cx) => {
@@ -6226,7 +6349,7 @@ export default class Settings extends View {
               });
               if (s.id === "drove") cx.spawn(async (cx) => {
                 if (this.machineList === null) await this.loadMachines();
-                await this.loadDrove();
+                await Promise.all([this.loadDrove(), this.aiStatus ? Promise.resolve() : this.loadAi()]);
                 this.maybeAutoProbeDrove(cx);
                 cx.notify();
               });
