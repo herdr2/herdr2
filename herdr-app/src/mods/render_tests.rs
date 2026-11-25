@@ -719,6 +719,7 @@ fn module(mut values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> Hos
                     if first == "git"
                         && [
                             json!(["rev-parse", "--show-toplevel"]),
+                            json!(["rev-parse", "--show-toplevel", "--show-prefix"]),
                             json!(["rev-parse", "--path-format=absolute", "--git-common-dir"]),
                             json!(["status", "--porcelain=v2", "--branch"]),
                             json!(["--no-optional-locks", "-c", "core.fsmonitor=false", "status", "--porcelain=v2", "--branch"]),
@@ -5531,6 +5532,39 @@ fn changes_renders_git_branch_status_and_recent_log_without_errors(cx: &mut Test
     assert_eq!(ext_err.unwrap(), None, "changes external file diff must draw with zero errors");
     visual_ext.update(|window, _| window.remove_window());
     cx.run_until_parked();
+
+    // Verify in-project preview (e.g. already-committed or gitignored file inside repo) never renders as External.
+    let in_proj_setup = r#"
+        this.root = '/fixture/repo';
+        this.context = this.viewKey();
+        this.files = [];
+        this.externalFiles = [];
+        this.selectedExternal = {
+            path: '/fixture/repo/src/committed.rs',
+            displayPath: 'src/committed.rs',
+            relPath: 'src/committed.rs',
+            inProject: true,
+            on: null,
+            add: 2,
+            del: 1,
+            status: 'M',
+            sourceKind: 'agent-diff',
+            terminal: 'a65',
+            turn: 1,
+        };
+        this.setLines(['@@ -1,1 +1,2 @@', '-old_line()', '+new_line()', '+extra_line()']);
+    "#;
+    let in_proj_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/changes",
+        fixture(true, json!({}), updates("current", "current")),
+        Some(in_proj_setup),
+    ).unwrap();
+    assert!(!in_proj_tree.contains("changes-external-section"), "in-project preview must not show external section: {in_proj_tree}");
+    assert!(in_proj_tree.contains("chg-ext-banner"), "in-project preview banner must render: {in_proj_tree}");
+    assert!(in_proj_tree.contains("In project"), "in-project preview must be labeled In project: {in_proj_tree}");
+    assert!(in_proj_tree.contains("src/committed.rs"), "in-project preview must show relative path: {in_proj_tree}");
 }
 
 #[gpui::test]

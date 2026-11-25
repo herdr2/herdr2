@@ -15,7 +15,10 @@ import {
   writeScopeDrafts,
   isAbsolutePath,
   parentDirectory,
+  pathsEqual,
+  deriveLogicalRepoRoot,
   resolvePathAgainstRoot,
+  resolvePathAgainstProject,
   parseToolPatchLines,
 } from "../defaults/mods/changes/review_model.js";
 import {
@@ -247,6 +250,93 @@ test("resolvePathAgainstRoot and parentDirectory classify in-repo vs external fi
     inside: true,
     relPath: "src/agent.py",
     absPath: "/work/buildlink/src/agent.py",
+  });
+  // Escaping relative paths must be classified as outside the repo.
+  expect(resolvePathAgainstRoot("../other/a.py", "/work/buildlink")).toEqual({
+    inside: false,
+    relPath: null,
+    absPath: "/work/other/a.py",
+  });
+  // Lexical ., .., and duplicate slashes normalize cleanly.
+  expect(resolvePathAgainstRoot("/work/buildlink/./src//sub/../agent.py", "/work/buildlink/")).toEqual({
+    inside: true,
+    relPath: "src/agent.py",
+    absPath: "/work/buildlink/src/agent.py",
+  });
+  // Windows drive-letter casing, \\?\ UNC prefixes, and Git Bash /c/... paths match case-insensitively.
+  expect(resolvePathAgainstRoot("c:\\work\\buildlink\\src\\agent.py", "C:/Work/Buildlink")).toEqual({
+    inside: true,
+    relPath: "src/agent.py",
+    absPath: "c:/work/buildlink/src/agent.py",
+  });
+  expect(resolvePathAgainstRoot("\\\\?\\C:\\work\\buildlink\\src\\agent.py", "C:/work/buildlink")).toEqual({
+    inside: true,
+    relPath: "src/agent.py",
+    absPath: "C:/work/buildlink/src/agent.py",
+  });
+  expect(resolvePathAgainstRoot("/c/work/buildlink/src/agent.py", "C:/work/buildlink")).toEqual({
+    inside: true,
+    relPath: "src/agent.py",
+    absPath: "C:/work/buildlink/src/agent.py",
+  });
+  expect(pathsEqual("c:\\Work\\Proj\\", "C:/work/proj")).toBe(true);
+  expect(pathsEqual("/tmp/a", "/tmp/b")).toBe(false);
+});
+
+test("deriveLogicalRepoRoot and resolvePathAgainstProject handle symlinks, subdir cwd checkpoints, and non-git workspaces", () => {
+  // Symlinked workspace root (e.g. macOS /tmp -> /private/tmp or Linux ~/Work -> /mnt/data/Work).
+  expect(deriveLogicalRepoRoot("/tmp/demo", "")).toBe("/tmp/demo");
+  expect(deriveLogicalRepoRoot("/home/u/Work/herdr2/herdr-app", "herdr-app/")).toBe("/home/u/Work/herdr2");
+
+  const symlinked = resolvePathAgainstProject(
+    { path: "/home/u/Work/herdr2/herdr-core/src/lib.rs" },
+    { repoRoot: "/mnt/data/Work/herdr2", logicalRoot: "/home/u/Work/herdr2" },
+  );
+  expect(symlinked).toEqual({
+    inside: true,
+    inRepo: true,
+    relPath: "herdr-core/src/lib.rs",
+    absPath: "/mnt/data/Work/herdr2/herdr-core/src/lib.rs",
+  });
+
+  // Checkpoint relative path when agent cwd is a subdirectory (avoids /repo/herdr-app/herdr-app/... doubling).
+  const subdirCkpt = resolvePathAgainstProject(
+    {
+      path: "/work/herdr2/herdr-app/herdr-app/src/window.rs",
+      displayPath: "herdr-app/src/window.rs",
+      fromCheckpoint: true,
+    },
+    { repoRoot: "/work/herdr2", logicalRoot: "/work/herdr2" },
+  );
+  expect(subdirCkpt).toEqual({
+    inside: true,
+    inRepo: true,
+    relPath: "herdr-app/src/window.rs",
+    absPath: "/work/herdr2/herdr-app/src/window.rs",
+  });
+
+  // Non-Git project workspace: files under projectFolder are in-project, not external.
+  expect(
+    resolvePathAgainstProject(
+      { path: "/work/notes/draft.md" },
+      { repoRoot: null, logicalRoot: null, projectFolder: "/work/notes" },
+    ),
+  ).toEqual({
+    inside: true,
+    inRepo: false,
+    relPath: "draft.md",
+    absPath: "/work/notes/draft.md",
+  });
+  expect(
+    resolvePathAgainstProject(
+      { path: "/tmp/outside.md" },
+      { repoRoot: null, logicalRoot: null, projectFolder: "/work/notes" },
+    ),
+  ).toEqual({
+    inside: false,
+    inRepo: false,
+    relPath: null,
+    absPath: "/tmp/outside.md",
   });
 });
 

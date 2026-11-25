@@ -717,11 +717,22 @@ export function resolveChangedFilePath(rawPath, cwd = "", homeDir = "", on = nul
 function normalizeRelativeFilePath(rawPath, cwd = "") {
   let p = String(rawPath ?? "").trim().replace(/^['"]|['"]$/g, "");
   if (!p || p === "/dev/null") return "";
+  p = p.replace(/\\/g, "/");
+  if (/^\/\/\?\/[A-Za-z]:\//.test(p)) p = p.slice(4);
   if (p.startsWith("a/") || p.startsWith("b/")) p = p.slice(2);
   if (cwd) {
-    const cleanCwd = String(cwd).replace(/[\\/]+$/, "");
-    if (cleanCwd && (p.startsWith(`${cleanCwd}/`) || p.startsWith(`${cleanCwd}\\`))) {
-      p = p.slice(cleanCwd.length + 1);
+    let cleanCwd = String(cwd).trim().replace(/\\/g, "/");
+    if (/^\/\/\?\/[A-Za-z]:\//.test(cleanCwd)) cleanCwd = cleanCwd.slice(4);
+    cleanCwd = cleanCwd.replace(/\/+$/, "");
+    if (cleanCwd) {
+      const prefix = `${cleanCwd}/`;
+      const winDrive = /^[A-Za-z]:\//.test(cleanCwd) && /^[A-Za-z]:\//.test(p);
+      const matches = winDrive
+        ? p.toLowerCase().startsWith(prefix.toLowerCase())
+        : p.startsWith(prefix);
+      if (matches) {
+        p = p.slice(prefix.length);
+      }
     }
   }
   if (p.startsWith("./")) p = p.slice(2);
@@ -1355,11 +1366,31 @@ export function buildConversationItems(entries, fallbackText = "", agentWorking 
     const summary = extractTurnChangedFiles(steps, cwd);
     if (summary.files.length > 0) changedByTurn.set(turn, summary);
   }
+  const normCwdForMerge = cwd ? normalizeLexicalPath(cwd) : "";
+  const isSameRepoPathAsCheckpoint = (absPath, existingPaths) => {
+    const normAbs = normalizeLexicalPath(absPath);
+    if (existingPaths.has(normAbs)) return true;
+    if (!normCwdForMerge) return false;
+    const winMode = /^[A-Za-z]:\//.test(normCwdForMerge) && /^[A-Za-z]:\//.test(normAbs);
+    const cmpCwd = winMode ? normCwdForMerge.toLowerCase() : normCwdForMerge;
+    const cmpAbs = winMode ? normAbs.toLowerCase() : normAbs;
+    for (const rel of existingPaths) {
+      if (!rel || isAbsoluteFilePath(rel)) continue;
+      const cmpRel = winMode ? rel.toLowerCase() : rel;
+      const suffix = `/${cmpRel}`;
+      if (!cmpAbs.endsWith(suffix)) continue;
+      const candidateRoot = cmpAbs.slice(0, cmpAbs.length - suffix.length);
+      if (candidateRoot && (cmpCwd === candidateRoot || cmpCwd.startsWith(`${candidateRoot}/`))) {
+        return true;
+      }
+    }
+    return false;
+  };
   for (const [turn, ckptSummary] of checkpointStatsByTurn.entries()) {
     const toolSummary = changedByTurn.get(turn);
     const existingPaths = new Set(ckptSummary.files.map((f) => f.path));
     const extraExternal = toolSummary
-      ? toolSummary.files.filter((f) => isAbsoluteFilePath(f.path) && !existingPaths.has(f.path))
+      ? toolSummary.files.filter((f) => isAbsoluteFilePath(f.path) && !isSameRepoPathAsCheckpoint(f.path, existingPaths))
       : [];
     if (extraExternal.length > 0) {
       const mergedFiles = [...ckptSummary.files, ...extraExternal];

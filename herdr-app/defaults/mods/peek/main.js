@@ -2623,6 +2623,7 @@ export default class Peek extends View {
     const terminal = this.activeTerminal() ?? null;
     const primaryPatch = extractTurnFilePatch(this.entries, turn, rawPath, cwd, 48000);
 
+    const fromCheckpoint = Boolean(item?.changedFiles?.fromCheckpoint);
     const cardFiles = Array.isArray(item?.changedFiles?.files) ? item.changedFiles.files : [];
     let siblingBudget = 64000;
     const siblingFiles = cardFiles.slice(0, 40).map((sf) => {
@@ -2643,6 +2644,7 @@ export default class Peek extends View {
       return {
         path: sfAbs,
         displayPath: sfRaw,
+        ...(fromCheckpoint && !isAbsoluteFilePath(sfRaw) ? { fromCheckpoint: true } : {}),
         additions: Number(sf?.additions ?? 0) || 0,
         deletions: Number(sf?.deletions ?? 0) || 0,
         ...(patch ? { patch } : {}),
@@ -2659,6 +2661,7 @@ export default class Peek extends View {
         ts: Date.now(),
         path: absPath,
         displayPath: rawPath,
+        fromCheckpoint: fromCheckpoint && !isAbsoluteFilePath(rawPath),
         cwd,
         on,
         terminal,

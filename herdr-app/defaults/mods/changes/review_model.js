@@ -12,12 +12,84 @@ export function withAlpha(hex, alphaHex) {
   return hex;
 }
 
+function stripWinExtendedPrefix(p) {
+  if (p.startsWith("//?/UNC/")) return `//${p.slice(8)}`;
+  if (/^\/\/\?\/[A-Za-z]:\//.test(p)) return p.slice(4);
+  return p;
+}
+
+function normalizeLexical(raw) {
+  const s = stripWinExtendedPrefix(String(raw ?? "").trim().replace(/\\/g, "/"));
+  if (!s) return "";
+
+  const winDrive = s.match(/^([A-Za-z]:)(?:\/(.*))?$/);
+  if (winDrive) {
+    const drive = winDrive[1];
+    const parts = (winDrive[2] ?? "").split("/");
+    const out = [];
+    for (const seg of parts) {
+      if (!seg || seg === ".") continue;
+      if (seg === "..") {
+        if (out.length > 0) out.pop();
+      } else {
+        out.push(seg);
+      }
+    }
+    return out.length ? `${drive}/${out.join("/")}` : `${drive}/`;
+  }
+
+  const unc = s.startsWith("//");
+  const tilde = s === "~" || s.startsWith("~/");
+  const leadingSlash = !unc && s.startsWith("/");
+  const body = unc ? s.slice(2) : tilde ? s.slice(2) : leadingSlash ? s.slice(1) : s;
+  const parts = body.split("/");
+  const out = [];
+  for (const seg of parts) {
+    if (!seg || seg === ".") continue;
+    if (seg === "..") {
+      if (out.length > 0 && out[out.length - 1] !== "..") out.pop();
+      else if (!leadingSlash && !unc && !tilde) out.push("..");
+    } else {
+      out.push(seg);
+    }
+  }
+  if (unc) return `//${out.join("/")}`;
+  if (tilde) return out.length ? `~/${out.join("/")}` : "~";
+  if (leadingSlash) return `/${out.join("/")}`;
+  return out.join("/");
+}
+
+function isWindowsDrivePath(p) {
+  return /^[A-Za-z]:\//.test(p);
+}
+
+function maybeMsysToWindowsDrive(p, otherIsWin) {
+  if (!otherIsWin) return p;
+  const m = p.match(/^\/([A-Za-z])(?:\/(.*))?$/);
+  if (!m) return p;
+  const drive = `${m[1].toUpperCase()}:`;
+  return m[2] ? `${drive}/${m[2]}` : `${drive}/`;
+}
+
 export function normalizePath(p) {
-  return typeof p === "string" ? p.replace(/\\/g, "/").replace(/\/+$/, "") : "";
+  if (typeof p !== "string") return "";
+  const lex = normalizeLexical(p);
+  if (!lex || lex === "/" || /^[A-Za-z]:\/$/.test(lex)) return lex;
+  return lex.replace(/\/+$/, "");
+}
+
+export function pathsEqual(a, b) {
+  const na = normalizePath(a);
+  const nb = normalizePath(b);
+  if (!na || !nb) return false;
+  const winMode = isWindowsDrivePath(na) || isWindowsDrivePath(nb);
+  const ca = maybeMsysToWindowsDrive(na, winMode);
+  const cb = maybeMsysToWindowsDrive(nb, winMode);
+  return winMode ? ca.toLowerCase() === cb.toLowerCase() : ca === cb;
 }
 
 export function isAbsolutePath(p) {
-  return typeof p === "string" && /^(\/|~\/|[A-Za-z]:[\\/])/.test(p.trim());
+  return typeof p === "string" && /^(\/|~\/|[A-Za-z]:[\\/]|\\\\[?\\])/.test(p.trim());
 }
 
 export function parentDirectory(filePath) {
@@ -31,34 +103,136 @@ export function parentDirectory(filePath) {
 }
 
 /**
+ * Computes the logical repository root matching `cwd` when `cwd` (or one of its
+ * ancestors) traverses a symlink or points to a subdirectory of the Git repo.
+ * `prefix` is the output of `git rev-parse --show-prefix` (e.g. `""` or `"sub/dir/"`).
+ */
+export function deriveLogicalRepoRoot(cwd, prefix = "") {
+  const normCwd = normalizePath(cwd);
+  if (!normCwd) return null;
+  const cleanPrefix = normalizePath(String(prefix ?? "").trim());
+  if (!cleanPrefix || cleanPrefix === ".") return normCwd;
+  const suffix = `/${cleanPrefix}`;
+  const winMode = isWindowsDrivePath(normCwd);
+  const matches = winMode
+    ? normCwd.toLowerCase().endsWith(suffix.toLowerCase())
+    : normCwd.endsWith(suffix);
+  if (!matches) return null;
+  const root = normCwd.slice(0, normCwd.length - suffix.length);
+  return root || "/";
+}
+
+/**
  * Resolves a raw file path against a Git repository root.
  * Returns `{ inside, relPath, absPath }` where `inside` is true only when the path
- * is located beneath `repoRoot` (or was already a relative repo path).
+ * is located beneath `repoRoot` (or was a non-escaping relative repo path).
  */
 export function resolvePathAgainstRoot(rawPath, repoRoot) {
   const raw = String(rawPath ?? "").trim();
   if (!raw) return { inside: false, relPath: null, absPath: "" };
   const normRoot = normalizePath(repoRoot);
   if (!isAbsolutePath(raw)) {
-    const cleanRel = raw.replace(/\\/g, "/").replace(/^\.\//, "");
+    const cleanRel = normalizePath(raw);
+    if (!cleanRel || cleanRel === "." || cleanRel === ".." || cleanRel.startsWith("../")) {
+      if (!normRoot) return { inside: false, relPath: null, absPath: cleanRel };
+      const joined = normalizePath(`${normRoot}/${cleanRel}`);
+      return resolvePathAgainstRoot(joined, normRoot);
+    }
+    const rootPrefix = normRoot === "/" ? "" : normRoot.replace(/\/+$/, "");
     return {
       inside: Boolean(normRoot),
       relPath: cleanRel,
-      absPath: normRoot ? `${normRoot}/${cleanRel}` : cleanRel,
+      absPath: normRoot ? `${rootPrefix}/${cleanRel}` : cleanRel,
     };
   }
-  const normTarget = normalizePath(raw);
-  if (normRoot && normTarget.startsWith(`${normRoot}/`)) {
+  const normTargetRaw = normalizePath(raw);
+  if (!normRoot) {
+    return {
+      inside: false,
+      relPath: null,
+      absPath: normTargetRaw,
+    };
+  }
+  const winMode = isWindowsDrivePath(normRoot) || isWindowsDrivePath(normTargetRaw);
+  const cmpRoot = maybeMsysToWindowsDrive(normRoot, winMode);
+  const cmpTarget = maybeMsysToWindowsDrive(normTargetRaw, winMode);
+  const rootPrefix = cmpRoot === "/" ? "/" : `${cmpRoot.replace(/\/+$/, "")}/`;
+  const matches = winMode
+    ? cmpTarget.toLowerCase().startsWith(rootPrefix.toLowerCase())
+    : cmpTarget.startsWith(rootPrefix);
+  if (matches && cmpTarget.length > rootPrefix.length) {
     return {
       inside: true,
-      relPath: normTarget.slice(normRoot.length + 1),
-      absPath: normTarget,
+      relPath: cmpTarget.slice(rootPrefix.length),
+      absPath: cmpTarget,
     };
   }
   return {
     inside: false,
     relPath: null,
-    absPath: normTarget,
+    absPath: cmpTarget,
+  };
+}
+
+/**
+ * Classifies a file open request against the current project (canonical Git root,
+ * symlink-aware logical Git root, or non-Git workspace folder).
+ */
+export function resolvePathAgainstProject(
+  { path: rawPath = "", displayPath = "", fromCheckpoint = false } = {},
+  { repoRoot = null, logicalRoot = null, projectFolder = null } = {},
+) {
+  const raw = String(rawPath ?? "").trim();
+  const disp = String(displayPath ?? "").trim();
+  if (!raw && !disp) {
+    return { inside: false, inRepo: false, relPath: null, absPath: "" };
+  }
+
+  if (repoRoot) {
+    // Checkpoint file entries are always Git-repo-root relative; resolve displayPath
+    // directly against repoRoot so a subdirectory cwd never doubles the prefix.
+    if (fromCheckpoint && disp && !isAbsolutePath(disp)) {
+      const viaDisp = resolvePathAgainstRoot(disp, repoRoot);
+      if (viaDisp.inside && viaDisp.relPath) {
+        return { inside: true, inRepo: true, relPath: viaDisp.relPath, absPath: viaDisp.absPath };
+      }
+    }
+
+    const viaRoot = resolvePathAgainstRoot(raw || disp, repoRoot);
+    if (viaRoot.inside && viaRoot.relPath) {
+      return { inside: true, inRepo: true, relPath: viaRoot.relPath, absPath: viaRoot.absPath };
+    }
+
+    if (logicalRoot && !pathsEqual(logicalRoot, repoRoot)) {
+      const viaLogical = resolvePathAgainstRoot(raw || disp, logicalRoot);
+      if (viaLogical.inside && viaLogical.relPath) {
+        const normRepo = normalizePath(repoRoot);
+        const repoPrefix = normRepo === "/" ? "" : normRepo.replace(/\/+$/, "");
+        return {
+          inside: true,
+          inRepo: true,
+          relPath: viaLogical.relPath,
+          absPath: `${repoPrefix}/${viaLogical.relPath}`,
+        };
+      }
+    }
+
+    return { inside: false, inRepo: false, relPath: null, absPath: viaRoot.absPath };
+  }
+
+  if (projectFolder) {
+    const viaFolder = resolvePathAgainstRoot(raw || disp, projectFolder);
+    if (viaFolder.inside && viaFolder.relPath) {
+      return { inside: true, inRepo: false, relPath: viaFolder.relPath, absPath: viaFolder.absPath };
+    }
+    return { inside: false, inRepo: false, relPath: null, absPath: viaFolder.absPath };
+  }
+
+  return {
+    inside: false,
+    inRepo: false,
+    relPath: null,
+    absPath: normalizePath(raw || disp),
   };
 }
 

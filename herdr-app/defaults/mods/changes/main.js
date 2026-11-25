@@ -14,9 +14,13 @@ import {
   writeScopeDrafts,
   formatLineTag,
   withAlpha,
+  normalizePath,
+  pathsEqual,
   isAbsolutePath,
   parentDirectory,
+  deriveLogicalRepoRoot,
   resolvePathAgainstRoot,
+  resolvePathAgainstProject,
   parseToolPatchLines,
 } from "./review_model.js";
 import {
@@ -32,7 +36,12 @@ const tr = (en, zh) => (isZh() ? zh : en);
 function location() {
   const space = spaces().find((s) => s.active), f = focused();
   const pane = f?.pane ? panes().find((p) => p.pane === f.pane) : null;
-  const on = f?.pane === null ? (f.terminal?.includes("/") ? f.terminal.split("/")[0] : null) : space?.machine ?? null;
+  if (f?.agent) {
+    const agentRec = terminals().find((t) => t.address === f.agent) ?? null;
+    const on = f.agent.includes("/") ? f.agent.split("/")[0] : null;
+    return { cwd: f.cwd || agentRec?.cwd || pane?.cwd || space?.folder, on };
+  }
+  const on = f?.pane === null ? (f.terminal?.includes("/") ? f.terminal.split("/")[0] : null) : (space?.machine || null);
   return { cwd: pane?.cwd || f?.cwd || space?.folder, on };
 }
 const key = () => JSON.stringify(location());
@@ -110,6 +119,9 @@ export default class Changes extends View {
     this.gitLogOpen = false;
     this.selectedCommit = null;
     this.commitLoading = false;
+    this.root = null;
+    this.logicalRoot = null;
+    this.cwd = null;
     this.externalFiles = [];
     this.selectedExternal = null;
     this.externalLoading = false;
@@ -175,53 +187,125 @@ export default class Changes extends View {
     if (!seq || seq <= this.lastHandledOpenSeq) return;
     if (typeof req.path !== "string" || !req.path.trim()) return;
     this.lastHandledOpenSeq = seq;
-    if (this.loading) {
+    if (this.loading || this.busy) {
       this.pendingOpenRequest = req;
       return;
     }
     this.applyOpenRequest(req, cx);
   }
 
-  applyOpenRequest(req, cx) {
-    const reqOn = req?.on ?? null;
-    const rawPath = this.expandLocalPath(req?.path ?? "", reqOn);
-    if (!rawPath) return;
+  resolveInCurrentProject(entry, reqOn, reqFromCheckpoint = false) {
+    const loc = location();
+    const currentOn = (this.on !== undefined ? this.on : loc.on) || null;
+    const sameMachine = (reqOn || null) === currentOn;
+    const ep = this.expandLocalPath(entry?.path ?? "", reqOn);
+    const disp = String(entry?.displayPath ?? "").trim();
+    if (!ep && !disp) {
+      return { sameMachine, inside: false, inRepo: false, relPath: null, absPath: "" };
+    }
+    if (!sameMachine) {
+      return { sameMachine: false, inside: false, inRepo: false, relPath: null, absPath: normalizePath(ep || disp) };
+    }
 
-    const sameMachine = (reqOn ?? null) === (this.on ?? null);
-    if (sameMachine && this.root) {
-      const resolved = resolvePathAgainstRoot(rawPath, this.root);
-      if (resolved.inside && resolved.relPath && this.files.some((f) => f.path === resolved.relPath)) {
-        this.selectedCommit = null;
-        this.commitLoading = false;
-        this.selectedExternal = null;
-        this.externalLoading = false;
-        this.open = resolved.relPath;
-        this.closed = false;
-        this.composer = null;
-        this.anchorRowIdx = null;
-        this.note = null;
-        this.setLines([]);
-        const context = this.context;
-        cx.spawn(async (cx) => {
-          try { await this.load(resolved.relPath, context); }
-          catch (e) { if (this.viewKey() === context && this.open === resolved.relPath) this.note = `Cannot preview this diff (too large or unreadable): ${e}`; }
-          cx.notify();
-        });
-        cx.notify();
-        return;
+    const fromCheckpoint = Boolean(entry?.fromCheckpoint ?? reqFromCheckpoint);
+    const projectFolder = this.cwd || loc.cwd || null;
+    let res = resolvePathAgainstProject(
+      { path: ep, displayPath: disp, fromCheckpoint },
+      { repoRoot: this.root, logicalRoot: this.logicalRoot, projectFolder },
+    );
+
+    // Fallback for relative displayPath matching an existing working-tree entry
+    // (e.g. when agent cwd is a subdirectory of the Git repository).
+    if (this.root && disp && !isAbsolutePath(disp)) {
+      const cleanDisp = normalizePath(disp);
+      if (cleanDisp && !cleanDisp.startsWith("..") && this.files.some((f) => f.path === cleanDisp)) {
+        if (!res.inside || !this.files.some((f) => f.path === res.relPath)) {
+          const normRoot = normalizePath(this.root);
+          const rootPrefix = normRoot === "/" ? "" : normRoot.replace(/\/+$/, "");
+          res = { inside: true, inRepo: true, relPath: cleanDisp, absPath: `${rootPrefix}/${cleanDisp}` };
+        }
       }
     }
 
+    return { sameMachine: true, ...res };
+  }
+
+  openInRepoFile(relPath, cx) {
+    this.selectedCommit = null;
+    this.commitLoading = false;
+    this.selectedExternal = null;
+    this.externalLoading = false;
+    this.open = relPath;
+    this.closed = false;
+    this.composer = null;
+    this.anchorRowIdx = null;
+    this.note = null;
+    this.setLines([]);
+    const context = this.context;
+    cx.spawn(async (cx) => {
+      try { await this.load(relPath, context); }
+      catch (e) { if (this.viewKey() === context && this.open === relPath) this.note = `Cannot preview this diff (too large or unreadable): ${e}`; }
+      cx.notify();
+    });
+    cx.notify();
+  }
+
+  applyOpenRequest(req, cx) {
+    const reqOn = req?.on || null;
+    const rawPath = this.expandLocalPath(req?.path ?? "", reqOn);
+    if (!rawPath) return;
+
+    const primaryRes = this.resolveInCurrentProject(
+      { path: rawPath, displayPath: req?.displayPath, fromCheckpoint: req?.fromCheckpoint },
+      reqOn,
+      Boolean(req?.fromCheckpoint),
+    );
+
+    if (primaryRes.sameMachine && primaryRes.inside) {
+      if (primaryRes.inRepo && primaryRes.relPath && this.files.some((f) => f.path === primaryRes.relPath)) {
+        this.openInRepoFile(primaryRes.relPath, cx);
+        return;
+      }
+      // `this.files` may be stale (e.g. remote machine without watchFolder, or before the
+      // 10s poll / watcher fired). Refresh once before deciding there is no uncommitted diff.
+      if (primaryRes.inRepo && !req?._refreshed && !this.busy) {
+        this.pendingOpenRequest = { ...req, _refreshed: true };
+        this.refresh(cx);
+        if (this.loading) return;
+        this.pendingOpenRequest = null;
+      }
+      // Still inside the current project (e.g. already committed, gitignored, clean, or
+      // non-Git workspace): preview it as an in-project file without adding it to `externalFiles`.
+      const inProjectTarget = {
+        path: primaryRes.absPath || rawPath,
+        displayPath: primaryRes.relPath || String(req?.displayPath || rawPath),
+        relPath: primaryRes.relPath || null,
+        inProject: true,
+        on: reqOn,
+        add: Number(req?.additions ?? 0) || 0,
+        del: Number(req?.deletions ?? 0) || 0,
+        status: (Number(req?.deletions ?? 0) || 0) > 0 ? "M" : "A",
+        patch: typeof req?.patch === "string" ? req.patch : "",
+        isCreateOnly: Boolean(req?.isCreateOnly),
+        sourceKind: null,
+        extRoot: primaryRes.inRepo ? this.root : null,
+        terminal: req?.terminal ?? null,
+        turn: req?.turn ?? null,
+        _refreshed: Boolean(req?._refreshed),
+      };
+      this.pickExternal(inProjectTarget, cx);
+      return;
+    }
+
     const prevByPath = new Map((this.externalFiles ?? []).map((f) => [f.path, f]));
-    const inRepoSet = sameMachine && this.root ? new Set(this.files.map((f) => f.path)) : new Set();
     const nextList = [];
     const seen = new Set();
     const pushExt = (entry, isPrimary = false) => {
       const ep = this.expandLocalPath(entry?.path ?? "", reqOn);
       if (!ep || seen.has(ep)) return null;
-      if (!isPrimary && sameMachine && this.root) {
-        const res = resolvePathAgainstRoot(ep, this.root);
-        if (res.inside && res.relPath && inRepoSet.has(res.relPath)) return null;
+      if (!isPrimary) {
+        const res = this.resolveInCurrentProject(entry, reqOn, Boolean(req?.fromCheckpoint));
+        if (res.sameMachine && res.inside) return null;
       }
       seen.add(ep);
       const prev = prevByPath.get(ep);
@@ -230,6 +314,8 @@ export default class Changes extends View {
       const item = {
         path: ep,
         displayPath: String(entry?.displayPath || prev?.displayPath || ep),
+        relPath: null,
+        inProject: false,
         on: reqOn,
         add,
         del,
@@ -310,6 +396,8 @@ export default class Changes extends View {
       this.context = context;
       if (folderChanged) {
         this.root = null;
+        this.logicalRoot = null;
+        this.cwd = null;
         this.files = [];
         this.open = null;
         this.gitBranch = null;
@@ -339,10 +427,13 @@ export default class Changes extends View {
     this.loading = true;
     cx.spawn(async (cx) => {
       try {
-        const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd, on });
+        const top = await exec("git", ["rev-parse", "--show-toplevel", "--show-prefix"], { cwd, on });
         if (this.viewKey() !== context) return;
         if (top.code !== 0) {
           this.root = null;
+          this.logicalRoot = null;
+          this.cwd = cwd;
+          this.on = on;
           this.files = [];
           this.gitBranch = null;
           this.gitStatus = null;
@@ -357,7 +448,9 @@ export default class Changes extends View {
           this.error = "Not a git repository";
           return;
         }
-        const root = top.stdout.trim(), git = (args) => exec("git", [...READ, ...args], { cwd: root, on });
+        const [topRootLine = "", topPrefixLine = ""] = String(top.stdout ?? "").replace(/\r\n/g, "\n").split("\n");
+        const root = topRootLine.trim(), git = (args) => exec("git", [...READ, ...args], { cwd: root, on });
+        const logicalRoot = deriveLogicalRepoRoot(cwd, topPrefixLine.trim());
         const [statusRes, logRes, stashRes] = await Promise.all([
           git(["status", "--porcelain=v2", "--branch", "-z", "--no-renames", "--untracked-files=all"]),
           git(["log", "-n", "8", "--format=%H%x1f%h%x1f%s%x1f%an%x1f%ar%x1f%D%x1e"]).catch(() => ({ code: 1, stdout: "", stderr: "" })),
@@ -387,6 +480,8 @@ export default class Changes extends View {
         const files = parsed.files.map((f) => ({ ...f, ...(stats[f.path] ?? { add: 0, del: 0 }) }));
         if (this.viewKey() !== context) return;
         this.root = root;
+        this.logicalRoot = logicalRoot;
+        this.cwd = cwd;
         this.on = on;
         this.hasHead = hasHead;
         this.gitBranch = parsed.branch;
@@ -397,6 +492,23 @@ export default class Changes extends View {
         this.limited = parsed.limited;
         this.error = null;
         this.watch(root, cx);
+        // Reconcile any external list entries that actually belong to the current repository.
+        if (Array.isArray(this.externalFiles) && this.externalFiles.length > 0) {
+          this.externalFiles = this.externalFiles.filter((ext) => {
+            const res = this.resolveInCurrentProject(ext, ext?.on || null, false);
+            return !(res.sameMachine && res.inside);
+          });
+        }
+        if (this.selectedExternal) {
+          const selRes = this.resolveInCurrentProject(this.selectedExternal, this.selectedExternal.on || null, false);
+          const promotedRel = selRes.sameMachine && selRes.inside && selRes.inRepo ? selRes.relPath : (this.selectedExternal.inProject ? this.selectedExternal.relPath : null);
+          if (promotedRel && files.some((f) => f.path === promotedRel)) {
+            this.selectedExternal = null;
+            this.externalLoading = false;
+            this.open = promotedRel;
+            this.closed = false;
+          }
+        }
         if (!this.selectedCommit && !this.selectedExternal) {
           if (this.open && !files.some((f) => f.path === this.open)) { this.open = null; this.composer = null; this.anchorRowIdx = null; this.setLines([]); }
           // The first file's diff shows until you pick another.
@@ -409,7 +521,7 @@ export default class Changes extends View {
       } catch (e) { if (this.viewKey() === context) this.error = String(e); }
       finally {
         this.loading = false;
-        if (this.pendingOpenRequest) {
+        if (this.pendingOpenRequest && !this.busy) {
           const pending = this.pendingOpenRequest;
           this.pendingOpenRequest = null;
           this.applyOpenRequest(pending, cx);
@@ -463,13 +575,40 @@ export default class Changes extends View {
     const extPath = ext.path;
     let lines = null;
 
-    // 1) If the external file lives inside another Git repository, load its real Git diff/status.
+    // 1) If the file lives inside a Git repository, load its real Git diff/status
+    //    and re-check whether it actually belongs to the current project (e.g. via symlink).
     const dir = parentDirectory(extPath);
     if (dir) {
-      const top = await exec("git", ["rev-parse", "--show-toplevel"], { cwd: dir, on: extOn }).catch(() => ({ code: 1, stdout: "", stderr: "" }));
+      const top = await exec("git", ["rev-parse", "--show-toplevel", "--show-prefix"], { cwd: dir, on: extOn }).catch(() => ({ code: 1, stdout: "", stderr: "" }));
       if (top?.code === 0 && top.stdout?.trim()) {
-        const extRoot = top.stdout.trim();
-        const rel = resolvePathAgainstRoot(extPath, extRoot).relPath;
+        const [extRootLine = "", prefixLine = ""] = String(top.stdout).replace(/\r\n/g, "\n").split("\n");
+        const extRoot = extRootLine.trim();
+        const prefix = prefixLine.trim();
+        const baseName = normalizePath(extPath).split("/").pop() || "";
+        const rel = prefix ? `${prefix}${baseName}` : (resolvePathAgainstRoot(extPath, extRoot).relPath || baseName);
+
+        if (this.root && (extOn || null) === (this.on || null) && pathsEqual(extRoot, this.root) && rel) {
+          // Confirmed inside the current Git repository (e.g. traversed a symlink):
+          // never keep it in the external list, and promote to in-repo view when dirty.
+          this.externalFiles = (this.externalFiles ?? []).filter((f) => f.path !== extPath);
+          ext.inProject = true;
+          ext.relPath = rel;
+          ext.extRoot = extRoot;
+          if (this.files.some((f) => f.path === rel)) {
+            if (this.viewKey() === context && this.selectedExternal?.path === extPath) {
+              this.selectedExternal = null;
+              this.externalLoading = false;
+              this.open = rel;
+              this.closed = false;
+              await this.load(rel, context);
+            }
+            return;
+          }
+          if (!ext._refreshed) {
+            ext._needsRefresh = true;
+          }
+        }
+
         if (rel) {
           const extGit = (args) => exec("git", [...READ, ...args], { cwd: extRoot, on: extOn });
           const stRes = await extGit(["status", "--porcelain=v2", "--branch", "-z", "--no-renames", "--untracked-files=all", "--", rel]).catch(() => ({ code: 1, stdout: "", stderr: "" }));
@@ -516,7 +655,11 @@ export default class Changes extends View {
       }
     }
 
-    // 2) For non-Git external files (or already-committed external files) with real recorded edits, show the agent's recorded diff.
+    const unreadableMsg = ext.inProject
+      ? tr("Cannot preview this file (deleted, binary, too large, or unreadable)", "无法预览该文件（已删除、二进制、过大或不可读）")
+      : tr("Cannot preview this external file (deleted, binary, too large, or unreadable)", "无法预览该项目外文件（已删除、二进制、过大或不可读）");
+
+    // 2) For non-Git or already-committed files with real recorded edits, show the agent's recorded diff.
     if (!lines && ext.patch && !ext.isCreateOnly) {
       const patchLines = parseToolPatchLines(ext.patch);
       if (patchLines.length > 0) {
@@ -544,12 +687,10 @@ export default class Changes extends View {
         }
       } else if (ext.patch) {
         const patchLines = parseToolPatchLines(ext.patch);
-        lines = patchLines.length > 0
-          ? patchLines
-          : [tr("Cannot preview this external file (deleted, binary, too large, or unreadable)", "无法预览该项目外文件（已删除、二进制、过大或不可读）")];
+        lines = patchLines.length > 0 ? patchLines : [unreadableMsg];
         ext.sourceKind = "agent-diff";
       } else {
-        lines = [tr("Cannot preview this external file (deleted, binary, too large, or unreadable)", "无法预览该项目外文件（已删除、二进制、过大或不可读）")];
+        lines = [unreadableMsg];
       }
     }
 
@@ -604,10 +745,15 @@ export default class Changes extends View {
         await this.loadExternal(ext, context);
       } catch (e) {
         if (this.viewKey() === context && this.selectedExternal?.path === ext.path) {
-          this.setLines([tr(`Cannot load external diff: ${e}`, `无法加载项目外变更：${e}`)]);
+          this.setLines([ext.inProject ? tr(`Cannot load diff: ${e}`, `无法加载变更：${e}`) : tr(`Cannot load external diff: ${e}`, `无法加载项目外变更：${e}`)]);
         }
       } finally {
         if (this.selectedExternal?.path === ext.path) this.externalLoading = false;
+        if (ext._needsRefresh) {
+          ext._needsRefresh = false;
+          ext._refreshed = true;
+          this.refresh(cx);
+        }
         cx.notify();
       }
     });
@@ -823,7 +969,7 @@ export default class Changes extends View {
       ...(c.snippet ? { snippet: c.snippet } : {}),
       body: c.body,
     }));
-    const repoRoot = this.selectedExternal ? (this.selectedExternal.extRoot || null) : this.root;
+    const repoRoot = this.selectedExternal ? (this.selectedExternal.extRoot || (this.selectedExternal.inProject ? this.root : null)) : this.root;
     run("agent.send_review", {
       request_id: reqId,
       target: chosen.address,
@@ -1769,7 +1915,9 @@ export default class Changes extends View {
   renderExternalBanner(t, diffMode) {
     const ext = this.selectedExternal;
     if (!ext) return null;
-    const badgeColor = t.blocked ?? "#f59e0b";
+    const isInProject = Boolean(ext.inProject);
+    const badgeColor = isInProject ? (t.accent ?? "#3b82f6") : (t.blocked ?? "#f59e0b");
+    const displayTitle = isInProject ? (ext.relPath || ext.displayPath || ext.path) : ext.path;
     const sourceLabel = ext.sourceKind === "git-diff"
       ? tr("Git diff", "Git 差异")
       : ext.sourceKind === "git-untracked"
@@ -1801,7 +1949,7 @@ export default class Changes extends View {
           .text_size(10)
           .font_semibold()
           .text_color(badgeColor)
-          .child(tr("External", "项目外")),
+          .child(isInProject ? tr("In project", "项目内") : tr("External", "项目外")),
       )
       .child(
         div()
@@ -1812,7 +1960,7 @@ export default class Changes extends View {
           .font_medium()
           .text_color(t.foreground)
           .tooltip(ext.path)
-          .child(ext.path),
+          .child(displayTitle),
       )
       .when(Boolean(sourceLabel), (e) =>
         e.child(
@@ -2340,7 +2488,7 @@ export default class Changes extends View {
           )
           .child(Scrollbar.vertical(diffListId).viewport_from_layout().absolute().inset_0())
           .when(this.commitLoading, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(tr("Loading commit diff…", "正在加载提交差异…"))))
-          .when(this.externalLoading, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(tr("Loading external diff…", "正在加载项目外变更…"))))
+          .when(this.externalLoading, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(this.selectedExternal?.inProject ? tr("Loading diff…", "正在加载变更…") : tr("Loading external diff…", "正在加载项目外变更…"))))
           .when(!this.selectedCommit && !this.selectedExternal && !this.open && this.files.length > 0, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(tr("Select a file to view its changes", "选择一个文件以查看变更详情"))))
           .when(!this.selectedCommit && !this.selectedExternal && !this.open && !this.files.length && this.gitLog.length > 0, (e) => e.child(div().absolute().top(6).px(12).text_color(t.dim).child(tr("Select a commit below to inspect its diff", "点击下方最近提交可查看历史变更详情")))),
       )

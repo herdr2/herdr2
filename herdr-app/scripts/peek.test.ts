@@ -943,4 +943,64 @@ describe("external changed file helpers", () => {
     expect(reply.changedFiles.totalAdditions).toBe(7);
     expect(reply.changedFiles.totalDeletions).toBe(1);
   });
+
+  test("buildConversationItems does not misclassify Windows or subdir-cwd in-repo files as external", () => {
+    // 1) Windows mixed-slash / drive-case tool path matches cwd and becomes relative (not duplicated as external).
+    const winItems = buildConversationItems(
+      [
+        { kind: "user", turn: 1, text: "Edit file", ts_ms: 10 },
+        {
+          kind: "tool_call",
+          turn: 1,
+          id: "e1",
+          tool_kind: "edit",
+          status: "completed",
+          title: "Edit c:/Work/Proj/src/main.rs",
+          detail: "--- c:/Work/Proj/src/main.rs\n+++ c:/Work/Proj/src/main.rs\n- old\n+ new",
+          ts_ms: 15,
+        },
+        { kind: "assistant", turn: 1, text: "Done.", ts_ms: 20 },
+        {
+          kind: "checkpoint",
+          turn: 1,
+          files: [{ path: "src/main.rs", added: 1, deleted: 1 }],
+          ts_ms: 25,
+        },
+      ],
+      "",
+      false,
+      { cwd: "C:\\Work\\Proj" },
+    );
+    const winReply = winItems.find((i: any) => i.kind === "assistant") as any;
+    expect(winReply.changedFiles.files).toEqual([{ path: "src/main.rs", additions: 1, deletions: 1 }]);
+
+    // 2) Subdirectory cwd editing a sibling folder inside the same repo does not duplicate checkpoint path as external.
+    const subItems = buildConversationItems(
+      [
+        { kind: "user", turn: 1, text: "Edit core", ts_ms: 10 },
+        {
+          kind: "tool_call",
+          turn: 1,
+          id: "e2",
+          tool_kind: "edit",
+          status: "completed",
+          title: "Edit /work/herdr2/herdr-core/src/lib.rs",
+          detail: "--- /work/herdr2/herdr-core/src/lib.rs\n+++ /work/herdr2/herdr-core/src/lib.rs\n- a\n+ b",
+          ts_ms: 15,
+        },
+        { kind: "assistant", turn: 1, text: "Done.", ts_ms: 20 },
+        {
+          kind: "checkpoint",
+          turn: 1,
+          files: [{ path: "herdr-core/src/lib.rs", added: 1, deleted: 1 }],
+          ts_ms: 25,
+        },
+      ],
+      "",
+      false,
+      { cwd: "/work/herdr2/herdr-app" },
+    );
+    const subReply = subItems.find((i: any) => i.kind === "assistant") as any;
+    expect(subReply.changedFiles.files).toEqual([{ path: "herdr-core/src/lib.rs", additions: 1, deletions: 1 }]);
+  });
 });
