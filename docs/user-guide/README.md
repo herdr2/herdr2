@@ -31,7 +31,7 @@
 | **02** | [工作区、终端与代码面板](./02-workspaces-and-terminals.md) | 工作区/标签页/分栏、常用快捷键、Ghostty 真终端与 `h2` 托管、文件/变更/快照三面板、闪念清单 | 日常开发用户 |
 | **03** | [无头 ACP 智能体与权限控制](./03-headless-acp-agents.md) | 14 种内置 Agent 预设、桌面与 CLI 启动、结构化对话视图、串行收件箱与 `--steer`、权限审批、运行时切模型、内置 MCP 与子智能体树 | AI 编码主力用户 |
 | **04** | [全局 Core AI、润色输入、接力与快照](./04-handoff-checkpoints-and-ai.md) | **全局 Core AI 必配指南**、**重点功能：AI 润色输入（原生 CLI 原地润色 / 撤销 / 上下文感知）**、接力 / 分叉 / 旁路 / **发送上下文**、隐藏 Git Ref 快照与故障定位 | 所有用户（强烈推荐） |
-| **05** | [Drove 多智能体 DAG 编排](./05-drove-orchestration.md) | 角色与故障顺延配置、权限护栏与 Worktree 合并、从 `h2 drove` 启动到监控、Drove Web 可视化编排画布与任务详情工作台 | 复杂任务与多 Agent 协作 |
+| **05** | [Drove 多智能体 DAG 编排](./05-drove-orchestration.md) | 桌面端角色一键配置、**先 Plan 再 `/drove` 编排**、`/drove-add` 热追加任务、Review 熔断机制、Drove Web 实时编排画布 | 复杂任务与多 Agent 协作 |
 | **06** | [远程主机、深度定制与自动化自检](./06-remote-customization-and-qa.md) | SSH 远程主机多机合一、外观/主题/三套内置布局、Layouts 与 Mods 热重载定制、基于隔离沙盒的 AI 自动化 QA 测试 | 高级用户与贡献者 |
 
 ---

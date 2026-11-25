@@ -50,7 +50,7 @@ AI Agent 会自动完成全流程：
 2. [02. 工作区、终端与代码面板](./docs/user-guide/02-workspaces-and-terminals.md) — 工作区/标签页/分栏、快捷键、文件与 Git 变更面板、闪念清单
 3. [03. 无头 ACP 智能体与权限控制](./docs/user-guide/03-headless-acp-agents.md) — 14 种预设、结构化对话、Inbox/`--steer`、行内审批与内置 MCP
 4. [04. 全局 Core AI、润色输入、接力与快照](./docs/user-guide/04-handoff-checkpoints-and-ai.md) — **必配 Core AI 中枢**、**AI 润色输入（含原生 CLI 原地润色）**、Handoff / Fork / 旁路、隐藏 Git Ref 快照
-5. [05. Drove 多智能体 DAG 编排](./docs/user-guide/05-drove-orchestration.md) — 角色护栏与顺延、`h2 drove` CLI、Drove Web 实时编排画布
+5. [05. Drove 多智能体 DAG 编排](./docs/user-guide/05-drove-orchestration.md) — 桌面角色一键配置、先 Plan 再 `/drove` 编排、`/drove-add` 追单、Drove Web 实时画布
 6. [06. 远程主机、深度定制与自动化自检](./docs/user-guide/06-remote-customization-and-qa.md) — SSH 多机管理、Layouts/Mods 热定制、隔离沙盒 QA 框架
 
 ### 架构与参考文档
