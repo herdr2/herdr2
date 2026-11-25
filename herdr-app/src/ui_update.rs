@@ -209,10 +209,16 @@ fn staged_receipt(app_dir: &Path) -> Option<StagedReceipt> {
 
 /// Compares UI bundle versions where `-ui.<n>` (or `+ui.<n>`) is a post-release
 /// UI revision on top of the base app version (so `0.2.0-ui.1 > 0.2.0` and
-/// `0.2.0-ui.10 > 0.2.0-ui.2`), while other versions follow standard SemVer.
+/// `0.2.0-ui.10 > 0.2.0-ui.2`), while `-ui.0` and `-hot-sync` represent the
+/// baseline UI shipped with that base version (not newer than the base version).
 pub(crate) fn is_newer_ui_version(candidate: &str, current: &str) -> bool {
     fn split_ui_rev(v: &str) -> (&str, Option<u64>) {
         let trimmed = v.trim().trim_start_matches('v');
+        if let Some(base) = trimmed.strip_suffix("-hot-sync")
+            && !base.is_empty()
+        {
+            return (base, Some(0));
+        }
         for sep in ["-ui.", "+ui."] {
             if let Some((base, rev)) = trimmed.rsplit_once(sep)
                 && !base.is_empty()
@@ -231,7 +237,7 @@ pub(crate) fn is_newer_ui_version(candidate: &str, current: &str) -> bool {
     }
     match (ra, rb) {
         (Some(a), Some(b)) => a > b,
-        (Some(_), None) => true,
+        (Some(a), None) => a > 0,
         (None, Some(_)) => false,
         (None, None) => crate::update::newer(candidate, current),
     }
@@ -680,6 +686,10 @@ mod tests {
         assert!(is_newer_ui_version("0.2.0+ui.1", "0.2.0"));
         assert!(is_newer_ui_version("0.2.1", "0.2.0-ui.9"));
         assert!(is_newer_ui_version("0.2.1", "0.2.0"));
+        assert!(is_newer_ui_version("2.0.4-ui.1", "2.0.4-hot-sync"));
+        assert!(!is_newer_ui_version("2.0.4-ui.0", "2.0.4"));
+        assert!(!is_newer_ui_version("2.0.4-ui.0", "2.0.4-hot-sync"));
+        assert!(!is_newer_ui_version("2.0.4", "2.0.4-ui.0"));
         assert!(!is_newer_ui_version("0.2.0", "0.2.0-ui.1"));
         assert!(!is_newer_ui_version("0.2.0-ui.1", "0.2.0-ui.1"));
         assert!(!is_newer_ui_version("0.2.0-rc.1", "0.2.0"));

@@ -57,9 +57,22 @@ fn unavailable(why: String) -> RpcError {
     RpcError::new("unavailable", why, "check your connection or HERDR2_RELEASES_URL")
 }
 
+fn curl_program() -> PathBuf {
+    match std::env::var_os("SystemRoot") {
+        Some(root) if cfg!(windows) => Path::new(&root).join(r"System32\curl.exe"),
+        _ => "curl".into(),
+    }
+}
+
 fn curl(url: &str, to: &Path) -> Result<(), RpcError> {
     // Quiet: our error says what failed, and piped stderr is one JSON error.
-    let ok = Command::new("curl")
+    let mut cmd = Command::new(curl_program());
+    // Windows System32 curl.exe uses Schannel, which fails with CRYPT_E_REVOCATION_OFFLINE
+    // when firewalls/proxies block CRL/OCSP endpoints (still verifies TLS certs & hostnames).
+    if cfg!(windows) {
+        cmd.arg("--ssl-no-revoke");
+    }
+    let ok = cmd
         .args(["-fsL", "--retry", "2", "--connect-timeout", "10", "-o"])
         .arg(to)
         .arg(url)

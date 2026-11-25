@@ -738,7 +738,7 @@ fn unpack(url: &str, sha: &str, work: &Path) -> Result<PathBuf, String> {
 }
 
 pub(crate) fn download_file(url: &str, dest: &Path) -> Result<(), String> {
-    run(crate::spawn::command(system("curl")).args(["-fsSL", "--max-time", "600", "-o"]).arg(dest).arg(url))
+    run(curl_command().args(["-fsSL", "--max-time", "600", "-o"]).arg(dest).arg(url))
 }
 
 pub(crate) fn unpack_archive(archive: &Path, dest: &Path) -> Result<(), String> {
@@ -786,10 +786,61 @@ pub(crate) fn sha256(bytes: &[u8]) -> String {
     sha2::Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
+fn curl_command() -> Command {
+    let mut cmd = crate::spawn::command(system("curl"));
+    // Windows System32 curl.exe uses Schannel, which fails with CRYPT_E_REVOCATION_OFFLINE
+    // when firewalls/proxies block CRL/OCSP endpoints (still verifies TLS certs & hostnames).
+    if cfg!(windows) {
+        cmd.arg("--ssl-no-revoke");
+    }
+    cmd
+}
+
+#[cfg(windows)]
+fn decode_process_output(bytes: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_owned();
+    }
+    const CP_ACP: u32 = 0;
+    unsafe extern "system" {
+        fn MultiByteToWideChar(
+            code_page: u32,
+            flags: u32,
+            multi_byte_str: *const u8,
+            cb_multi_byte: i32,
+            wide_char_str: *mut u16,
+            cch_wide_char: i32,
+        ) -> i32;
+    }
+    let Ok(len) = i32::try_from(bytes.len()) else {
+        return String::from_utf8_lossy(bytes).into_owned();
+    };
+    if len == 0 {
+        return String::new();
+    }
+    // SAFETY: valid slice pointer/len passed to query required UTF-16 buffer length.
+    let needed = unsafe { MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0) };
+    if needed <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut wide = vec![0u16; needed as usize];
+    // SAFETY: `wide` has length `needed` matching the preceding query.
+    let written = unsafe { MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), needed) };
+    if written <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    String::from_utf16_lossy(&wide[..written as usize])
+}
+
+#[cfg(not(windows))]
+fn decode_process_output(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
 pub(crate) fn curl_text(url: &str) -> Result<String, String> {
-    let out = crate::spawn::command(system("curl")).args(["-fsSL", "--max-time", "30", url]).stdin(Stdio::null()).output().map_err(|e| format!("curl: {e}"))?;
+    let out = curl_command().args(["-fsSL", "--max-time", "30", url]).stdin(Stdio::null()).output().map_err(|e| format!("curl: {e}"))?;
     if !out.status.success() {
-        return Err(format!("{url}: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        return Err(format!("{url}: {}", decode_process_output(&out.stderr).trim()));
     }
     String::from_utf8(out.stdout).map_err(|e| e.to_string())
 }
@@ -799,7 +850,7 @@ fn run(cmd: &mut Command) -> Result<(), String> {
     if out.status.success() {
         Ok(())
     } else {
-        Err(format!("{:?}: {}", cmd.get_program(), String::from_utf8_lossy(&out.stderr).trim()))
+        Err(format!("{:?}: {}", cmd.get_program(), decode_process_output(&out.stderr).trim()))
     }
 }
 
@@ -1432,5 +1483,18 @@ mod tests {
         assert!(st.get("check_seq").and_then(|v| v.as_u64()).is_some());
         assert!(st.get("updating").and_then(|v| v.as_bool()).is_some());
         assert!(st.get("available").is_some());
+    }
+
+    #[test]
+    fn curl_command_and_output_decoding_handle_platform_behavior() {
+        let cmd = curl_command();
+        let args: Vec<_> = cmd.get_args().collect();
+        if cfg!(windows) {
+            assert!(args.iter().any(|a| *a == "--ssl-no-revoke"));
+        } else {
+            assert!(!args.iter().any(|a| *a == "--ssl-no-revoke"));
+        }
+        assert_eq!(decode_process_output("检查更新失败".as_bytes()), "检查更新失败");
+        assert_eq!(decode_process_output(b""), "");
     }
 }

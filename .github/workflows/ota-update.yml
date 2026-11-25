@@ -56,9 +56,14 @@ jobs:
         run: |
           APP_VER=$(sed -n 's/^version = "\(.*\)"/\1/p' herdr-app/Cargo.toml | head -n 1)
           CORE_VER=$(sed -n 's/^version = "\(.*\)"/\1/p' herdr-core/crates/herdr2/Cargo.toml | head -n 1)
+          PREV_APP_VER=$(git show HEAD~1:herdr-app/Cargo.toml 2>/dev/null | sed -n 's/^version = "\(.*\)"/\1/p' | head -n 1 || true)
           echo "app_version=$APP_VER" >> "$GITHUB_OUTPUT"
           echo "core_version=$CORE_VER" >> "$GITHUB_OUTPUT"
-          echo "ui_version=${APP_VER}-ui.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          if [ -n "$PREV_APP_VER" ] && [ "$PREV_APP_VER" != "$APP_VER" ]; then
+            echo "ui_version=${APP_VER}-ui.0" >> "$GITHUB_OUTPUT"
+          else
+            echo "ui_version=${APP_VER}-ui.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Detect changed channels
         id: changes
