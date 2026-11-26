@@ -252,6 +252,7 @@ fn headless() {
         gpui_platform::current_headless_renderer,
     );
     markdown_selection_pixels(&mut cx);
+    nested_overflow_hidden_clipped_below_scroll_viewport_pixels(&mut cx);
     let mut model_slot = None;
     let capture_window = cx
         .open_window(size(px(64.), px(48.)), |window, cx| {
@@ -337,6 +338,104 @@ fn markdown_selection_pixels(cx: &mut HeadlessAppContext) {
         assert!(selected_glyphs >= unselected_glyphs * 9 / 10,
             "selection must be behind glyphs");
     }).unwrap();
+}
+
+/// Regression test for Settings → Drove scrolling: an `overflow_hidden` card
+/// scrolled below an `overflow_y_scroll` dialog at a fractional device-pixel y
+/// coordinate must not leak a 1px horizontal line below the dialog.
+#[cfg(not(windows))]
+fn nested_overflow_hidden_clipped_below_scroll_viewport_pixels(cx: &mut HeadlessAppContext) {
+    struct DialogScrollScene {
+        scroll: ScrollHandle,
+    }
+
+    impl Render for DialogScrollScene {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            // Black backdrop surrounding a centered dialog (y = 20..120), with
+            // tall `overflow_hidden` cards (matching droveRoleCard) extending
+            // below the dialog into y = 120..240.
+            div()
+                .size_full()
+                .bg(rgb(0x000000))
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(20.))
+                        .top(px(20.))
+                        .w(px(200.))
+                        .h(px(100.))
+                        .bg(rgb(0x202020))
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .id("scroll-body")
+                                .size_full()
+                                .overflow_y_scroll()
+                                .track_scroll(&self.scroll)
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(10.))
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .h(px(110.))
+                                                .flex_shrink_0()
+                                                .bg(rgb(0x303030)),
+                                        )
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .h(px(80.))
+                                                .flex_shrink_0()
+                                                .border_1()
+                                                .border_color(rgb(0x606060))
+                                                .rounded(px(8.))
+                                                .bg(rgb(0x404040))
+                                                .overflow_hidden()
+                                                .child(
+                                                    div()
+                                                        .w_full()
+                                                        .h(px(40.))
+                                                        .bg(rgb(0xffffff)),
+                                                ),
+                                        ),
+                                ),
+                        ),
+                )
+        }
+    }
+
+    let scroll = ScrollHandle::new();
+    let window = cx
+        .open_window(size(px(240.), px(240.)), |_, cx| {
+            let scroll = scroll.clone();
+            cx.new(|_| DialogScrollScene { scroll })
+        })
+        .unwrap();
+
+    cx.update_window(window.into(), |_, window, cx| {
+        let _ = window.draw(cx);
+        let scale = window.scale_factor();
+        // Scroll by fractional offsets so the off-screen card's top border lands
+        // strictly between device pixels (e.g. .25/.35/.75 logical px at 2x).
+        for offset in [-0.25_f32, -5.35, -12.75] {
+            scroll.set_offset(point(px(0.), px(offset)));
+            let _ = window.draw(cx);
+            let image = window.render_to_image().unwrap();
+            let below_dialog_y = (122. * scale).ceil() as u32;
+            let leaked = (below_dialog_y..image.height())
+                .flat_map(|y| (0..image.width()).map(move |x| (x, y)))
+                .find(|&(x, y)| image.get_pixel(x, y).0 != [0, 0, 0, 255]);
+            assert_eq!(
+                leaked, None,
+                "leaked pixel below dialog at scroll offset {offset}: {:?}",
+                leaked.map(|(x, y)| (x, y, image.get_pixel(x, y).0))
+            );
+        }
+    })
+    .unwrap();
 }
 
 fn native() {

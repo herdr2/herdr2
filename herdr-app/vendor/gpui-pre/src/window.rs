@@ -3213,10 +3213,26 @@ impl Window {
     #[inline]
     fn cover_bounds(&self, bounds: Bounds<Pixels>) -> Bounds<ScaledPixels> {
         let scale_factor = self.scale_factor();
-        let left = floor_to_device_pixel(bounds.left().0, scale_factor);
-        let top = floor_to_device_pixel(bounds.top().0, scale_factor);
-        let right = ceil_to_device_pixel(bounds.right().0, scale_factor).max(left);
-        let bottom = ceil_to_device_pixel(bounds.bottom().0, scale_factor).max(top);
+        // HERDR: preserve zero-extent axes instead of expanding a collapsed edge
+        // `[x, x]` at a fractional coordinate into `[floor(x), ceil(x)]` (1dp),
+        // which turned an empty intersected content mask below a scroll viewport
+        // into a 1px strip leaking outside the parent clip.
+        let (left, right) = if bounds.size.width <= Pixels::ZERO {
+            let x = round_to_device_pixel(bounds.left().0, scale_factor);
+            (x, x)
+        } else {
+            let left = floor_to_device_pixel(bounds.left().0, scale_factor);
+            let right = ceil_to_device_pixel(bounds.right().0, scale_factor).max(left);
+            (left, right)
+        };
+        let (top, bottom) = if bounds.size.height <= Pixels::ZERO {
+            let y = round_to_device_pixel(bounds.top().0, scale_factor);
+            (y, y)
+        } else {
+            let top = floor_to_device_pixel(bounds.top().0, scale_factor);
+            let bottom = ceil_to_device_pixel(bounds.bottom().0, scale_factor).max(top);
+            (top, bottom)
+        };
         Bounds::from_corners(
             point(ScaledPixels(left), ScaledPixels(top)),
             point(ScaledPixels(right), ScaledPixels(bottom)),

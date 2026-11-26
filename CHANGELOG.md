@@ -1,5 +1,21 @@
 # Changelog
 
+## v2.0.15
+
+#### 中文
+
+**问题修复**
+- **修复设置页 Drove 等滚动视图下方出现跟随滚动的 1px 白色横线**：修复 GPUI `Window::cover_bounds` 在处理空裁剪遮罩时对小数设备像素坐标同时执行 `floor` 与 `ceil` 导致零高度遮罩被扩展成 1dp 可见条带的问题，并在文本绘制阶段跳过空 `content_mask`；彻底消除 `overflow_hidden` 圆角卡片滚出弹窗视口后在设置页下方泄漏横线的视觉异常，同时新增 GPU 像素级回归测试。
+- **修复 Windows 下 Drove 探测继承 WSL UNC 目录导致异常与 ACP 报错信息不全**：`drove.probe` 现优先选择本地非 UNC 的主目录/临时目录作为无头探测工作目录，避免 Windows `.cmd` 包装器与 ACP 适配器在 `\\wsl.localhost\...` 路径下启动失败；同时扩展 ACP JSON-RPC 错误解析以提取 `details` / `error` / `reason` 及结构化错误字段，并精简设置页探测异常卡片（移除冗余 AI 诊断流程，保留直接用 Agent 修复入口）。
+
+---
+
+#### English
+
+**Bug Fixes**
+- **Fixed 1px White Horizontal Line Leaking Below Settings → Drove While Scrolling**: Fixed GPUI's `Window::cover_bounds` expanding collapsed zero-height/zero-width intersected content masks at fractional device-pixel coordinates into a 1dp visible strip via `floor`/`ceil`, and skipped empty `content_mask` regions during text line painting. Nested `overflow_hidden` cards scrolled past modal/scroll viewports no longer bleed outside the clip, verified with a GPU pixel readback regression test.
+- **Fixed Windows UNC Probe CWD & Enriched ACP Error Details**: Selected a stable local non-UNC home/temp working directory for headless `drove.probe` runs so Windows `.cmd` shims and ACP adapters no longer fail when `herdr2 serve` starts from a `\\wsl.localhost\...` share; expanded ACP JSON-RPC error formatting to surface `details` / `error` / `reason` and structured payloads; and streamlined Drove probe error cards by removing the redundant AI diagnose flow in favor of direct **Fix with Agent**.
+
 ## v2.0.14
 
 #### 中文

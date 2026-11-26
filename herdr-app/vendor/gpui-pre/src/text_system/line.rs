@@ -747,7 +747,11 @@ fn paint_line(
                 };
 
                 let content_mask = window.content_mask();
-                if max_glyph_bounds.intersects(&content_mask.bounds) {
+                // HERDR: `Bounds::intersects` treats a zero-extent collapsed mask whose
+                // origin lies inside `max_glyph_bounds` as intersecting; skip empty masks.
+                if !content_mask.bounds.is_empty()
+                    && max_glyph_bounds.intersects(&content_mask.bounds)
+                {
                     let vertical_offset = point(px(0.0), glyph.position.y);
                     if glyph.is_emoji {
                         window.paint_emoji_with_color(
