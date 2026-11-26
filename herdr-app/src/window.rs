@@ -205,11 +205,55 @@ fn ensure_git_bash_rcfile() -> Option<String> {
     Some(path.to_string_lossy().replace('\\', "/"))
 }
 
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn find_powershell_with(
+    path_os: Option<&std::ffi::OsStr>,
+    system_root: Option<&str>,
+) -> Option<String> {
+    if let Some(found) = find_exe_in_path(path_os, "powershell.exe") {
+        return Some(found);
+    }
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(root) = system_root.map(str::trim).filter(|s| !s.is_empty()) {
+        let root = std::path::Path::new(root);
+        candidates.push(root.join("System32").join("WindowsPowerShell").join("v1.0").join("powershell.exe"));
+        candidates.push(root.join("SysWOW64").join("WindowsPowerShell").join("v1.0").join("powershell.exe"));
+    }
+    candidates
+        .into_iter()
+        .find(|cand| is_executable_file(cand))
+        .map(|cand| cand.to_string_lossy().into_owned())
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn find_cmd_with(
+    path_os: Option<&std::ffi::OsStr>,
+    comspec: Option<&str>,
+    system_root: Option<&str>,
+) -> Option<String> {
+    if let Some(cs) = comspec.map(str::trim).filter(|s| !s.is_empty())
+        && is_executable_file(std::path::Path::new(cs))
+    {
+        return Some(cs.to_owned());
+    }
+    if let Some(found) = find_exe_in_path(path_os, "cmd.exe") {
+        return Some(found);
+    }
+    if let Some(root) = system_root.map(str::trim).filter(|s| !s.is_empty()) {
+        let cand = std::path::Path::new(root).join("System32").join("cmd.exe");
+        if is_executable_file(&cand) {
+            return Some(cand.to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
 fn find_git_bash_with(
     path_os: Option<&std::ffi::OsStr>,
     program_files: Option<&str>,
     program_files_x86: Option<&str>,
     local_app_data: Option<&str>,
+    user_profile: Option<&str>,
 ) -> Option<String> {
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
     for base in [program_files, program_files_x86].into_iter().flatten() {
@@ -217,21 +261,198 @@ fn find_git_bash_with(
         candidates.push(std::path::Path::new(base).join("Git").join("usr").join("bin").join("bash.exe"));
     }
     if let Some(local) = local_app_data {
-        candidates.push(std::path::Path::new(local).join("Programs").join("Git").join("bin").join("bash.exe"));
+        let git = std::path::Path::new(local).join("Programs").join("Git");
+        candidates.push(git.join("bin").join("bash.exe"));
+        candidates.push(git.join("usr").join("bin").join("bash.exe"));
+    }
+    if let Some(profile) = user_profile {
+        let scoop_git = std::path::Path::new(profile).join("scoop").join("apps").join("git").join("current");
+        candidates.push(scoop_git.join("bin").join("bash.exe"));
+        candidates.push(scoop_git.join("usr").join("bin").join("bash.exe"));
     }
     if let Some(cand) = candidates.into_iter().find(|p| is_executable_file(p)) {
         return Some(cand.to_string_lossy().into_owned());
     }
+    // Git for Windows often only adds `<GitDir>\cmd` (containing `git.exe`) to PATH.
+    if let Some(git_exe) = find_exe_in_path(path_os, "git.exe")
+        && let Some(git_root) = std::path::Path::new(&git_exe).parent().and_then(|p| p.parent())
+    {
+        for rel in [
+            git_root.join("bin").join("bash.exe"),
+            git_root.join("usr").join("bin").join("bash.exe"),
+        ] {
+            if is_executable_file(&rel) {
+                return Some(rel.to_string_lossy().into_owned());
+            }
+        }
+    }
     if let Some(path) = path_os {
         for dir in std::env::split_paths(path) {
             let cand = dir.join("bash.exe");
-            let lower = dir.to_string_lossy().to_ascii_lowercase();
-            if is_executable_file(&cand) && !lower.ends_with("\\system32") && !lower.ends_with("/system32") {
+            let lower = dir.to_string_lossy().trim_end_matches(['\\', '/']).to_ascii_lowercase();
+            let is_system_wsl_dir = lower.ends_with("\\system32")
+                || lower.ends_with("/system32")
+                || lower.ends_with("\\syswow64")
+                || lower.ends_with("/syswow64");
+            if is_executable_file(&cand) && !is_system_wsl_dir {
                 return Some(cand.to_string_lossy().into_owned());
             }
         }
     }
     None
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+pub(crate) fn installed_windows_shells_with(
+    path_os: Option<&std::ffi::OsStr>,
+    program_files: Option<&str>,
+    program_files_x86: Option<&str>,
+    local_app_data: Option<&str>,
+    user_profile: Option<&str>,
+    comspec: Option<&str>,
+    system_root: Option<&str>,
+) -> Vec<&'static str> {
+    let mut shells = Vec::with_capacity(4);
+    if find_powershell_with(path_os, system_root).is_some() {
+        shells.push("powershell");
+    }
+    if find_pwsh_with(path_os, program_files, program_files_x86, local_app_data, user_profile).is_some() {
+        shells.push("pwsh");
+    }
+    if find_git_bash_with(path_os, program_files, program_files_x86, local_app_data, user_profile).is_some() {
+        shells.push("git-bash");
+    }
+    if find_cmd_with(path_os, comspec, system_root).is_some() {
+        shells.push("cmd");
+    }
+    shells
+}
+
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn merge_path_lists(primary: Option<&std::ffi::OsStr>, fallback: Option<&std::ffi::OsStr>) -> Option<std::ffi::OsString> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut push_from = |raw: Option<&std::ffi::OsStr>| {
+        let Some(raw) = raw else { return };
+        for dir in std::env::split_paths(raw) {
+            if dir.as_os_str().is_empty() {
+                continue;
+            }
+            let key = dir.to_string_lossy().trim_end_matches(['\\', '/']).to_ascii_lowercase();
+            if !dirs.iter().any(|d| d.to_string_lossy().trim_end_matches(['\\', '/']).to_ascii_lowercase() == key) {
+                dirs.push(dir);
+            }
+        }
+    };
+    push_from(primary);
+    push_from(fallback);
+    if dirs.is_empty() {
+        return None;
+    }
+    std::env::join_paths(dirs).ok()
+}
+
+/// Reads the live Windows System + User `PATH` from the registry (merged with the current
+/// process `PATH`) so tools installed to custom directories after Herdr started are found
+/// immediately without restarting the app.
+#[cfg(windows)]
+fn windows_live_path() -> Option<std::ffi::OsString> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::ptr::null_mut;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Security::{TOKEN_DUPLICATE, TOKEN_QUERY};
+    use windows_sys::Win32::System::Environment::{
+        CreateEnvironmentBlock, DestroyEnvironmentBlock, ExpandEnvironmentStringsForUserW,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    let proc_path = std::env::var_os("PATH");
+    let live: Option<std::ffi::OsString> = unsafe {
+        let mut token = null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE, &mut token) == 0 {
+            return proc_path;
+        }
+        let token = OwnedHandle::from_raw_handle(token.cast());
+        let mut block = null_mut();
+        if CreateEnvironmentBlock(&mut block, token.as_raw_handle() as HANDLE, 0) == 0 {
+            return proc_path;
+        }
+        let mut found = None;
+        let mut at = block.cast::<u16>();
+        while *at != 0 {
+            let len = (0..).take_while(|&i| *at.add(i) != 0).count();
+            let entry = String::from_utf16_lossy(std::slice::from_raw_parts(at, len));
+            if let Some((k, v)) = entry.split_once('=')
+                && k.eq_ignore_ascii_case("PATH")
+            {
+                found = Some(v.to_owned());
+                break;
+            }
+            at = at.add(len + 1);
+        }
+        DestroyEnvironmentBlock(block);
+        found.map(|raw| {
+            if raw.contains('%') {
+                let source: Vec<u16> = raw.encode_utf16().chain(Some(0)).collect();
+                let mut expanded = vec![0u16; 32768];
+                if ExpandEnvironmentStringsForUserW(
+                    token.as_raw_handle() as HANDLE,
+                    source.as_ptr(),
+                    expanded.as_mut_ptr(),
+                    expanded.len() as u32,
+                ) != 0
+                {
+                    let len = expanded.iter().position(|&c| c == 0).unwrap_or(expanded.len());
+                    return std::ffi::OsString::from(String::from_utf16_lossy(&expanded[..len]));
+                }
+            }
+            std::ffi::OsString::from(raw)
+        })
+    };
+    merge_path_lists(live.as_deref(), proc_path.as_deref()).or(proc_path)
+}
+
+#[cfg(not(windows))]
+fn windows_live_path() -> Option<std::ffi::OsString> {
+    std::env::var_os("PATH")
+}
+
+pub(crate) fn installed_windows_shells_cached(force_refresh: bool) -> Vec<&'static str> {
+    #[cfg(not(windows))]
+    {
+        let _ = force_refresh;
+        Vec::new()
+    }
+    #[cfg(windows)]
+    {
+        static CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<&'static str>)>> = std::sync::Mutex::new(None);
+        if !force_refresh
+            && let Ok(guard) = CACHE.lock()
+            && let Some((at, list)) = guard.as_ref()
+            && at.elapsed() < std::time::Duration::from_secs(30)
+        {
+            return list.clone();
+        }
+        let path_os = windows_live_path();
+        let pf = std::env::var("ProgramFiles").ok();
+        let pfx86 = std::env::var("ProgramFiles(x86)").ok();
+        let local = std::env::var("LOCALAPPDATA").ok();
+        let profile = std::env::var("USERPROFILE").ok();
+        let comspec = std::env::var("COMSPEC").ok();
+        let sysroot = std::env::var("SystemRoot").ok().or_else(|| std::env::var("WINDIR").ok());
+        let list = installed_windows_shells_with(
+            path_os.as_deref(),
+            pf.as_deref(),
+            pfx86.as_deref(),
+            local.as_deref(),
+            profile.as_deref(),
+            comspec.as_deref(),
+            sysroot.as_deref(),
+        );
+        if let Ok(mut guard) = CACHE.lock() {
+            *guard = Some((std::time::Instant::now(), list.clone()));
+        }
+        list
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,7 +492,7 @@ fn resolve_windows_shell_exe_with(
         ),
         "git-bash" | "gitbash" | "bash" => (
             WindowsShellKind::GitBash,
-            find_git_bash_with(path_os, program_files, program_files_x86, local_app_data)
+            find_git_bash_with(path_os, program_files, program_files_x86, local_app_data, profile.as_deref())
                 .unwrap_or_else(|| "bash.exe".into()),
         ),
         "cmd" => (
@@ -322,7 +543,7 @@ pub(crate) fn resolve_windows_shell_argv_with_rc(
                 .unwrap_or_else(|| "pwsh.exe".into()),
         )),
         "git-bash" | "gitbash" | "bash" => {
-            let exe = find_git_bash_with(path_os, program_files, program_files_x86, local_app_data)
+            let exe = find_git_bash_with(path_os, program_files, program_files_x86, local_app_data, profile.as_deref())
                 .unwrap_or_else(|| "bash.exe".into());
             match git_bash_rcfile.filter(|s| !s.is_empty()) {
                 Some(rc) => Some(vec![exe, "--rcfile".into(), rc.to_owned(), "-i".into()]),
@@ -447,7 +668,7 @@ pub(crate) fn wrap_windows_command_with(
 
 #[cfg_attr(not(windows), allow(dead_code))]
 fn wrap_windows_command(choice: &str, cmd: Vec<String>, stay: bool) -> Vec<String> {
-    let path_os = std::env::var_os("PATH");
+    let path_os = windows_live_path();
     let pf = std::env::var("ProgramFiles").ok();
     let pfx86 = std::env::var("ProgramFiles(x86)").ok();
     let local = std::env::var("LOCALAPPDATA").ok();
@@ -466,7 +687,7 @@ fn wrap_windows_command(choice: &str, cmd: Vec<String>, stay: bool) -> Vec<Strin
 
 #[cfg_attr(not(windows), allow(dead_code))]
 fn resolve_windows_shell_exe(choice: &str) -> String {
-    let path_os = std::env::var_os("PATH");
+    let path_os = windows_live_path();
     let pf = std::env::var("ProgramFiles").ok();
     let pfx86 = std::env::var("ProgramFiles(x86)").ok();
     let local = std::env::var("LOCALAPPDATA").ok();
@@ -483,7 +704,7 @@ fn resolve_windows_shell_exe(choice: &str) -> String {
 }
 
 fn resolve_windows_shell_argv(choice: &str) -> Option<Vec<String>> {
-    let path_os = std::env::var_os("PATH");
+    let path_os = windows_live_path();
     let pf = std::env::var("ProgramFiles").ok();
     let pfx86 = std::env::var("ProgramFiles(x86)").ok();
     let local = std::env::var("LOCALAPPDATA").ok();
@@ -503,7 +724,7 @@ fn resolve_windows_shell_argv(choice: &str) -> Option<Vec<String>> {
 
 pub fn shell() -> String {
     if cfg!(windows) {
-        let path_os = std::env::var_os("PATH");
+        let path_os = windows_live_path();
         let pf = std::env::var("ProgramFiles").ok();
         let pfx86 = std::env::var("ProgramFiles(x86)").ok();
         let local = std::env::var("LOCALAPPDATA").ok();
@@ -10360,6 +10581,10 @@ impl AppWindow {
             props = json!({});
         }
         props["overlay"] = json!(id);
+        if cfg!(windows) && name == "new-menu" {
+            let _ = installed_windows_shells_cached(true);
+            mods::publish_window(self.window_json(window));
+        }
         let num = |k: &str, d: f32| spec.get(k).and_then(Value::as_f64).map_or(d, |v| v as f32);
         let resizable = kind == OverlayKind::Window && spec.get("resizable").and_then(Value::as_bool).unwrap_or(false);
         let min_size = size(num("min_width", 320.0), num("min_height", 240.0));
@@ -11813,6 +12038,9 @@ impl AppWindow {
         if core.managed.is_none() && !core.updating && let Some(ver) = core.ready {
             return Some(format!("core:{ver}"));
         }
+        if let Some(ver) = crate::update::remote_ready() {
+            return Some(format!("remote:{ver}"));
+        }
         None
     }
 
@@ -11871,6 +12099,11 @@ impl AppWindow {
                 "app.update",
             )
         } else if let Some(ver) = key.strip_prefix("core:") {
+            (
+                if zh { format!("更新 v{ver}") } else { format!("Update v{ver}") },
+                "app.update",
+            )
+        } else if let Some(ver) = key.strip_prefix("remote:") {
             (
                 if zh { format!("更新 v{ver}") } else { format!("Update v{ver}") },
                 "app.update",
@@ -15215,6 +15448,70 @@ export default class SystemToast extends View {
         let cmd_split = super::wrap_windows_command_with("cmd", cli.clone(), false, None, None, None, None, Some("C:\\Windows\\System32\\cmd.exe"));
         assert_eq!(&cmd_split[..4], ["C:\\Windows\\System32\\cmd.exe", "/d", "/s", "/c"]);
         assert_eq!(super::AppWindow::unwrap_shell_agent_argv(cmd_split), cli);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn installed_windows_shells_with_reports_only_installed_shells() {
+        let dir = std::env::temp_dir().join(format!("herdr-win-installed-shells-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let win_root = dir.join("Windows");
+        let sys32 = win_root.join("System32");
+        let ps_dir = sys32.join("WindowsPowerShell").join("v1.0");
+        std::fs::create_dir_all(&ps_dir).unwrap();
+        let ps_exe = ps_dir.join("powershell.exe");
+        let cmd_exe = sys32.join("cmd.exe");
+        std::fs::write(&ps_exe, b"").unwrap();
+        std::fs::write(&cmd_exe, b"").unwrap();
+        // WSL shim under System32\bash.exe (even with a trailing slash on PATH) must not count as Git Bash.
+        std::fs::write(sys32.join("bash.exe"), b"").unwrap();
+
+        let sys32_trailing = format!("{}/", sys32.display());
+        let base_path = std::env::join_paths([std::path::PathBuf::from(&sys32_trailing)]).unwrap();
+        let win_root_str = win_root.to_str().unwrap();
+        let cmd_str = cmd_exe.to_str().unwrap();
+
+        // Empty environment reports no shells.
+        assert_eq!(
+            super::installed_windows_shells_with(None, None, None, None, None, None, None),
+            Vec::<&str>::new()
+        );
+
+        // Stock Windows machine (only Windows PowerShell + CMD, plus System32 WSL bash.exe).
+        assert_eq!(
+            super::installed_windows_shells_with(Some(&base_path), None, None, None, None, Some(cmd_str), Some(win_root_str)),
+            vec!["powershell", "cmd"]
+        );
+
+        // Installing PowerShell 7 under ProgramFiles adds "pwsh".
+        let pf = dir.join("ProgramFiles");
+        let pwsh_dir = pf.join("PowerShell").join("7");
+        std::fs::create_dir_all(&pwsh_dir).unwrap();
+        std::fs::write(pwsh_dir.join("pwsh.exe"), b"").unwrap();
+        let pf_str = pf.to_str().unwrap();
+        assert_eq!(
+            super::installed_windows_shells_with(Some(&base_path), Some(pf_str), None, None, None, Some(cmd_str), Some(win_root_str)),
+            vec!["powershell", "pwsh", "cmd"]
+        );
+
+        // Installing Git for Windows in a custom folder where only `<GitDir>\cmd` (git.exe) is on PATH adds "git-bash".
+        let custom_git = dir.join("Tools").join("Git");
+        std::fs::create_dir_all(custom_git.join("cmd")).unwrap();
+        std::fs::create_dir_all(custom_git.join("bin")).unwrap();
+        std::fs::write(custom_git.join("cmd").join("git.exe"), b"").unwrap();
+        std::fs::write(custom_git.join("bin").join("bash.exe"), b"").unwrap();
+        let path_with_git = std::env::join_paths([std::path::PathBuf::from(&sys32_trailing), custom_git.join("cmd")]).unwrap();
+        assert_eq!(
+            super::installed_windows_shells_with(Some(&path_with_git), Some(pf_str), None, None, None, Some(cmd_str), Some(win_root_str)),
+            vec!["powershell", "pwsh", "git-bash", "cmd"]
+        );
+
+        let merged = super::merge_path_lists(Some(&path_with_git), Some(&base_path)).unwrap();
+        assert_eq!(
+            super::installed_windows_shells_with(Some(&merged), Some(pf_str), None, None, None, Some(cmd_str), Some(win_root_str)),
+            vec!["powershell", "pwsh", "git-bash", "cmd"]
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

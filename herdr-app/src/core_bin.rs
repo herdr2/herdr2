@@ -279,6 +279,104 @@ pub fn update() -> Result<String, String> {
     update_to(None)
 }
 
+/// A configured SSH remote machine reported by `h2 machine ls --json`.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RemoteMachine {
+    pub name: String,
+    pub target: String,
+    pub version: Option<String>,
+    pub state: String,
+    pub why: Option<String>,
+    pub temporary: bool,
+}
+
+fn parse_machines_json(raw: &[u8]) -> Result<Vec<RemoteMachine>, String> {
+    let val: serde_json::Value = serde_json::from_slice(raw).map_err(|e| format!("invalid machine list JSON: {e}"))?;
+    let arr = val.get("machines").and_then(|v| v.as_array()).ok_or_else(|| "machine list missing `machines` array".to_owned())?;
+    let mut out = Vec::new();
+    for m in arr {
+        let temporary = m.get("temporary").and_then(|v| v.as_bool()).unwrap_or(false);
+        if temporary {
+            continue;
+        }
+        let Some(name) = m.get("name").and_then(|v| v.as_str()).map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let target = m.get("target").and_then(|v| v.as_str()).unwrap_or_default().to_owned();
+        let version = m
+            .get("version")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .map(|v| {
+                v.strip_prefix("h2 ")
+                    .or_else(|| v.strip_prefix("herdr2 "))
+                    .or_else(|| v.strip_prefix("hc "))
+                    .unwrap_or(v)
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_owned()
+            })
+            .filter(|v| !v.is_empty());
+        let state = m.get("state").and_then(|v| v.as_str()).unwrap_or("unreachable").to_owned();
+        let why = m.get("why").and_then(|v| v.as_str()).map(str::to_owned).filter(|s| !s.is_empty());
+        out.push(RemoteMachine { name: name.to_owned(), target, version, state, why, temporary });
+    }
+    Ok(out)
+}
+
+/// Lists all non-temporary SSH remote machines configured in local `h2`.
+pub fn list_machines() -> Result<Vec<RemoteMachine>, String> {
+    let out = crate::spawn::command(path())
+        .args(["machine", "ls", "--json"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot run h2 machine ls: {e}"))?;
+    if !out.status.success() {
+        let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap_or_default();
+        let msg = err
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| String::from_utf8_lossy(&out.stderr).trim().to_owned());
+        return Err(if msg.is_empty() { "h2 machine ls failed".into() } else { msg });
+    }
+    parse_machines_json(&out.stdout)
+}
+
+/// Updates `herdr2-core` on a single SSH remote machine (`h2 machine update <name> --json`).
+pub fn update_machine(name: &str) -> Result<String, String> {
+    let mut cmd = crate::spawn::command(path());
+    if let Some(releases) = crate::update::releases() {
+        cmd.env("HERDR2_RELEASES_URL", releases);
+    }
+    cmd.args(["machine", "update", name, "--json"]);
+    let out = cmd
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot run h2 machine update {name}: {e}"))?;
+    let reply: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_default();
+    if out.status.success() {
+        let ver = reply
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("the latest")
+            .to_owned();
+        return Ok(ver);
+    }
+    let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap_or_default();
+    let message = err.pointer("/error/message").and_then(|v| v.as_str()).map(str::to_owned);
+    let hint = err.pointer("/error/hint").and_then(|v| v.as_str()).map(|h| format!(" ({h})")).unwrap_or_default();
+    Err(message.map(|m| m + &hint).unwrap_or_else(|| {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+        if stderr.is_empty() {
+            format!("h2 machine update {name} failed")
+        } else {
+            stderr
+        }
+    }))
+}
+
 /// `h2 update --version X`: at least X (a newer core stays).
 pub fn update_to(at_least: Option<&str>) -> Result<String, String> {
     let Some(releases) = crate::update::releases() else {
@@ -296,6 +394,8 @@ pub fn update_to(at_least: Option<&str>) -> Result<String, String> {
     };
     let mut cmd = crate::spawn::command(path());
     cmd.env("HERDR2_RELEASES_URL", &releases);
+    // The desktop app drives per-machine remote sync itself for live UI status and avoids double updates.
+    cmd.env("H2_UPDATE_NO_MACHINES", "1");
     cmd.args(["update", "--json"]);
     if let Some(v) = at_least {
         cmd.args(["--version", v]);
@@ -601,5 +701,45 @@ mod tests {
         let root = bin_dirs("empty", &[("core", &["herdr2-core", "h2"])]);
         let path = path_for_core(std::ffi::OsStr::new(""), &core_in(&root, "core"), &hc_names());
         assert_eq!(path, Some(root.join("core").into_os_string()));
+    }
+
+    #[test]
+    fn parse_machines_json_filters_temporary_and_normalizes_versions() {
+        let raw = serde_json::json!({
+            "machines": [
+                {
+                    "name": "linux-dev",
+                    "target": "dev@10.0.0.5",
+                    "version": "h2 2.0.10 (abc 2026-11-26)",
+                    "state": "connected",
+                    "temporary": false
+                },
+                {
+                    "name": "offline-box",
+                    "target": "dev@10.0.0.6",
+                    "version": "2.0.9",
+                    "state": "unreachable",
+                    "why": "connection refused",
+                    "temporary": false
+                },
+                {
+                    "name": "temp-sandbox",
+                    "target": "dev@10.0.0.7",
+                    "version": "2.0.9",
+                    "state": "connected",
+                    "temporary": true
+                }
+            ]
+        })
+        .to_string();
+        let parsed = parse_machines_json(raw.as_bytes()).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].name, "linux-dev");
+        assert_eq!(parsed[0].version.as_deref(), Some("2.0.10"));
+        assert_eq!(parsed[0].state, "connected");
+        assert_eq!(parsed[1].name, "offline-box");
+        assert_eq!(parsed[1].version.as_deref(), Some("2.0.9"));
+        assert_eq!(parsed[1].state, "unreachable");
+        assert_eq!(parsed[1].why.as_deref(), Some("connection refused"));
     }
 }

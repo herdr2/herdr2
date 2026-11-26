@@ -355,6 +355,37 @@ impl DroveRuntime {
         self.probe_cache.lock().unwrap_or_else(|p| p.into_inner()).clone().unwrap_or_default()
     }
 
+    /// Clears a stale cached probe error for `agent_id` once a real ACP session for that agent
+    /// completes its handshake successfully, preventing transient probe timeouts from lingering.
+    pub fn clear_probe_error_for_agent(&self, agent_id: &str) {
+        let lower = agent_id.trim().to_ascii_lowercase();
+        let canonical = match lower.as_str() {
+            "antigravity" => "agy",
+            "cursor-agent" => "cursor",
+            other => other,
+        };
+        if canonical.is_empty() {
+            return;
+        }
+        let cleared = {
+            let mut guard = self.probe_cache.lock().unwrap_or_else(|p| p.into_inner());
+            let Some(snap) = guard.as_mut() else {
+                return;
+            };
+            let mut changed = false;
+            for agent in &mut snap.agents {
+                if agent.id.eq_ignore_ascii_case(canonical) && agent.error.is_some() {
+                    agent.error = None;
+                    changed = true;
+                }
+            }
+            changed
+        };
+        if cleared {
+            self.persist_models_cache();
+        }
+    }
+
     fn persist_models_cache(&self) {
         let probe = self.probe_cache.lock().unwrap_or_else(|p| p.into_inner()).clone();
         let agent_models = self.agent_models_cache.lock().unwrap_or_else(|p| p.into_inner()).clone();
@@ -1163,6 +1194,73 @@ mod tests {
         assert!(joined.full_probe);
         assert_eq!(joined.agents.len(), 1);
         assert_eq!(joined.agents[0].models, vec!["gpt-5.4"]);
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn clear_probe_error_for_agent_clears_stale_error_and_persists() {
+        let tmp = crate::test_tmp().join(format!("drove-clear-probe-err-{}", crate::platform::random_hex()));
+        let paths = test_paths(&tmp);
+        paths.create_dirs().unwrap();
+
+        let ai = AiRuntime::open(&paths).unwrap();
+        let rt = DroveRuntime::open(&paths, ai).unwrap();
+        let snap = ProbeSnapshot {
+            probed_at: now_iso(),
+            full_probe: true,
+            agents: vec![
+                ProbedAgent {
+                    id: "cursor".into(),
+                    command: vec!["cursor-agent".into(), "acp".into()],
+                    installed: true,
+                    path: Some("/usr/local/bin/cursor-agent".into()),
+                    agent_info: None,
+                    models: vec!["auto".into()],
+                    default_model: Some("auto".into()),
+                    efforts: vec!["medium".into()],
+                    default_effort: Some("medium".into()),
+                    model_contexts: BTreeMap::new(),
+                    model_efforts: BTreeMap::new(),
+                    error: Some("ACP probe timed out after 45s".into()),
+                },
+                ProbedAgent {
+                    id: "codex".into(),
+                    command: vec!["codex-acp".into()],
+                    installed: true,
+                    path: Some("/usr/local/bin/codex-acp".into()),
+                    agent_info: None,
+                    models: vec![],
+                    default_model: None,
+                    efforts: vec!["medium".into()],
+                    default_effort: Some("medium".into()),
+                    model_contexts: BTreeMap::new(),
+                    model_efforts: BTreeMap::new(),
+                    error: Some("auth required".into()),
+                },
+            ],
+        };
+        rt.apply_and_persist_probe(snap, true);
+
+        // Alias `cursor-agent` maps to canonical `cursor` and clears only its error.
+        rt.clear_probe_error_for_agent("cursor-agent");
+        let cached = rt.cached_probe();
+        assert!(cached.agents.iter().find(|a| a.id == "cursor").unwrap().error.is_none());
+        assert_eq!(
+            cached.agents.iter().find(|a| a.id == "codex").unwrap().error.as_deref(),
+            Some("auth required")
+        );
+        drop(rt);
+
+        // Reloading from disk reflects the cleared error.
+        let ai2 = AiRuntime::open(&paths).unwrap();
+        let rt2 = DroveRuntime::open(&paths, ai2).unwrap();
+        let reloaded = rt2.cached_probe();
+        assert!(reloaded.agents.iter().find(|a| a.id == "cursor").unwrap().error.is_none());
+        assert_eq!(
+            reloaded.agents.iter().find(|a| a.id == "codex").unwrap().error.as_deref(),
+            Some("auth required")
+        );
 
         let _ = std::fs::remove_dir_all(tmp);
     }

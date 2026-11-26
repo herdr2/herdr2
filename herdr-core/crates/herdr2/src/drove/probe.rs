@@ -11,10 +11,60 @@ use crate::runtime::Core;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-const ACP_PROBE_TIMEOUT: Duration = Duration::from_secs(60);
+const ACP_PROBE_CONCURRENCY: usize = 4;
+const ACP_PROBE_RETRY_CONCURRENCY: usize = 2;
+const ACP_PROBE_TIMEOUT: Duration = Duration::from_secs(45);
+const ACP_PROBE_RETRY_TIMEOUT: Duration = Duration::from_secs(45);
+const ACP_PROBE_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+const ACP_PROBE_TOTAL_BUDGET: Duration = Duration::from_secs(135);
+const ACP_PROBE_MAX_RETRY_AGENTS: usize = 3;
 const CLI_PROBE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Copy, Debug)]
+struct ProbePolicy {
+    concurrency: usize,
+    retry_concurrency: usize,
+    initial_timeout: Duration,
+    retry_timeout: Duration,
+    retry_backoff: Duration,
+    total_budget: Duration,
+    max_retry_agents: usize,
+}
+
+impl Default for ProbePolicy {
+    fn default() -> Self {
+        Self {
+            concurrency: ACP_PROBE_CONCURRENCY,
+            retry_concurrency: ACP_PROBE_RETRY_CONCURRENCY,
+            initial_timeout: ACP_PROBE_TIMEOUT,
+            retry_timeout: ACP_PROBE_RETRY_TIMEOUT,
+            retry_backoff: ACP_PROBE_RETRY_BACKOFF,
+            total_budget: ACP_PROBE_TOTAL_BUDGET,
+            max_retry_agents: ACP_PROBE_MAX_RETRY_AGENTS,
+        }
+    }
+}
+
+struct AcpProbeTarget {
+    id: String,
+    argv: Vec<String>,
+    exe_path: String,
+    env: BTreeMap<String, String>,
+    cwd: String,
+}
+
+struct TimedOutAttempt {
+    target: AcpProbeTarget,
+    detail: Option<String>,
+    timeout: Duration,
+}
+
+enum ProbeAttemptOutcome {
+    Done(ProbedAgent),
+    TimedOut(TimedOutAttempt),
+}
 
 fn env_ignore_case<'a>(env: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
     env.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.as_str()).filter(|s| !s.is_empty())
@@ -122,8 +172,8 @@ pub async fn probe_agents(core: &Core, skip_acp_handshake: bool) -> ProbeSnapsho
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()).display().to_string();
 
     let probe_scope = crate::sweep::token();
-    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(6));
-    let mut handles = Vec::new();
+    let mut quick_handles = Vec::new();
+    let mut acp_targets = Vec::new();
     for (id, argv) in targets {
         let resolved = resolve_acp_command_in_env(Some(&id), &argv, &base_env);
         let mut env = base_env.clone();
@@ -133,7 +183,7 @@ pub async fn probe_agents(core: &Core, skip_acp_handshake: bool) -> ProbeSnapsho
                 Some((p, cmd)) => (Some(p), cmd),
                 None => (None, argv),
             };
-            handles.push(tokio::spawn(async move {
+            quick_handles.push(tokio::spawn(async move {
                 let (models, default_model) = discover_local_models(&id, installed, &env);
                 ProbedAgent {
                     id,
@@ -154,17 +204,17 @@ pub async fn probe_agents(core: &Core, skip_acp_handshake: bool) -> ProbeSnapsho
         }
         let (exe_path, effective_argv) = resolved.unwrap();
         env.insert(crate::sweep::VAR.into(), probe_scope.clone());
-        let path_str = exe_path.display().to_string();
-        let probe_cwd = cwd.clone();
-        let permit_sem = sem.clone();
-        handles.push(tokio::spawn(async move {
-            let _permit = permit_sem.acquire_owned().await;
-            probe_one_acp(id, effective_argv, path_str, env, probe_cwd).await
-        }));
+        acp_targets.push(AcpProbeTarget {
+            id,
+            argv: effective_argv,
+            exe_path: exe_path.display().to_string(),
+            env,
+            cwd: cwd.clone(),
+        });
     }
 
-    let mut agents = Vec::with_capacity(handles.len());
-    for h in handles {
+    let mut agents = probe_acp_targets_with_policy(acp_targets, ProbePolicy::default()).await;
+    for h in quick_handles {
         if let Ok(item) = h.await {
             agents.push(item);
         }
@@ -176,6 +226,131 @@ pub async fn probe_agents(core: &Core, skip_acp_handshake: bool) -> ProbeSnapsho
     ProbeSnapshot { probed_at: now_iso(), full_probe: !skip_acp_handshake, agents }
 }
 
+/// Runs ACP probes in two phases:
+/// 1) Bounded concurrent wave (`policy.concurrency`, default 4) where each agent runs its ACP
+///    handshake before any CLI model probe (preventing self-contention on compile caches/state).
+/// 2) If only a small number of agents timed out (likely cold-start or transient network contention)
+///    and total budget permits, retries those timed-out agents once at lower concurrency
+///    (`policy.retry_concurrency`, default 2) after Phase 1 agents have exited.
+async fn probe_acp_targets_with_policy(targets: Vec<AcpProbeTarget>, policy: ProbePolicy) -> Vec<ProbedAgent> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let started = Instant::now();
+    let sem = std::sync::Arc::new(tokio::sync::Semaphore::new(policy.concurrency.max(1)));
+    let mut handles = Vec::with_capacity(targets.len());
+    for target in targets {
+        let permit_sem = sem.clone();
+        handles.push(tokio::spawn(async move {
+            let _permit = permit_sem.acquire_owned().await;
+            probe_one_acp_attempt(target, policy.initial_timeout).await
+        }));
+    }
+
+    let mut agents = Vec::with_capacity(handles.len());
+    let mut timed_out = Vec::new();
+    for h in handles {
+        match h.await {
+            Ok(ProbeAttemptOutcome::Done(agent)) => agents.push(agent),
+            Ok(ProbeAttemptOutcome::TimedOut(attempt)) => timed_out.push(attempt),
+            Err(_) => {}
+        }
+    }
+
+    if timed_out.is_empty() {
+        return agents;
+    }
+
+    let can_retry = timed_out.len() <= policy.max_retry_agents
+        && started.elapsed().saturating_add(policy.retry_backoff).saturating_add(policy.retry_timeout)
+            <= policy.total_budget;
+
+    if can_retry {
+        if !policy.retry_backoff.is_zero() {
+            tokio::time::sleep(policy.retry_backoff).await;
+        }
+        let retry_sem = std::sync::Arc::new(tokio::sync::Semaphore::new(policy.retry_concurrency.max(1)));
+        let mut retry_handles = Vec::with_capacity(timed_out.len());
+        for attempt in timed_out {
+            let permit_sem = retry_sem.clone();
+            retry_handles.push(tokio::spawn(async move {
+                let _permit = permit_sem.acquire_owned().await;
+                match probe_one_acp_attempt(attempt.target, policy.retry_timeout).await {
+                    ProbeAttemptOutcome::Done(agent) => agent,
+                    ProbeAttemptOutcome::TimedOut(final_attempt) => finalize_timed_out_probe(final_attempt, true).await,
+                }
+            }));
+        }
+        for h in retry_handles {
+            if let Ok(agent) = h.await {
+                agents.push(agent);
+            }
+        }
+    } else {
+        for attempt in timed_out {
+            agents.push(finalize_timed_out_probe(attempt, false).await);
+        }
+    }
+
+    agents
+}
+
+fn is_handshake_timeout_error(msg: &str) -> bool {
+    msg.to_ascii_lowercase().contains("timed out waiting for acp response")
+}
+
+fn format_timeout_error(
+    timeout: Duration,
+    retried: bool,
+    acp_detail: Option<&str>,
+    cli_error: Option<&str>,
+) -> String {
+    let secs = timeout.as_secs();
+    let header = if retried {
+        format!("ACP probe timed out after {secs}s (retried once)")
+    } else {
+        format!("ACP probe timed out after {secs}s")
+    };
+    let mut parts = vec![header];
+    if let Some(detail) = acp_detail.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(detail.to_string());
+    }
+    if let Some(cli_err) = cli_error.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(format!("CLI fallback error: {cli_err}"));
+    }
+    sanitize_probe_error(&parts.join("\n"))
+}
+
+async fn finalize_timed_out_probe(attempt: TimedOutAttempt, retried: bool) -> ProbedAgent {
+    let AcpProbeTarget { id, argv, exe_path, env, cwd } = attempt.target;
+    let (local_models, local_default) = discover_local_models(&id, true, &env);
+    let cli_probe = probe_cli_models(&id, &env, &cwd).await;
+    let err_msg = format_timeout_error(
+        attempt.timeout,
+        retried,
+        attempt.detail.as_deref(),
+        cli_probe.error.as_deref(),
+    );
+    let models = merge_model_lists(&[cli_probe.models, local_models]);
+    let model_efforts = infer_model_efforts_from_variants(&models);
+    let default_model = local_default.or_else(|| models.first().cloned());
+    ProbedAgent {
+        id,
+        command: argv,
+        installed: true,
+        path: Some(exe_path),
+        agent_info: None,
+        models,
+        default_model,
+        efforts: default_efforts(),
+        default_effort: Some("medium".into()),
+        model_contexts: BTreeMap::new(),
+        model_efforts,
+        error: Some(err_msg),
+    }
+}
+
+#[cfg(test)]
 async fn probe_one_acp(
     id: String,
     argv: Vec<String>,
@@ -183,6 +358,15 @@ async fn probe_one_acp(
     env: BTreeMap<String, String>,
     cwd: String,
 ) -> ProbedAgent {
+    let target = AcpProbeTarget { id, argv, exe_path, env, cwd };
+    match probe_one_acp_attempt(target, ACP_PROBE_TIMEOUT).await {
+        ProbeAttemptOutcome::Done(agent) => agent,
+        ProbeAttemptOutcome::TimedOut(attempt) => finalize_timed_out_probe(attempt, false).await,
+    }
+}
+
+async fn probe_one_acp_attempt(target: AcpProbeTarget, timeout: Duration) -> ProbeAttemptOutcome {
+    let AcpProbeTarget { id, argv, exe_path, env, cwd } = target;
     let (local_models, local_default) = discover_local_models(&id, true, &env);
     if matches!(id.as_str(), "agy" | "antigravity") {
         // `agy acp` takes ~29s to boot CCPA + MCP servers on session/new; `agy models` returns the live catalog in ~5s.
@@ -196,7 +380,7 @@ async fn probe_one_acp(
         let models = merge_model_lists(&[cli_probe.models, local_models]);
         let model_efforts = infer_model_efforts_from_variants(&models);
         let default_model = local_default.or_else(|| models.first().cloned());
-        return ProbedAgent {
+        return ProbeAttemptOutcome::Done(ProbedAgent {
             id,
             command: argv,
             installed: true,
@@ -209,7 +393,7 @@ async fn probe_one_acp(
             model_contexts: BTreeMap::new(),
             model_efforts,
             error,
-        };
+        });
     }
 
     let spec = SpawnSpec {
@@ -228,9 +412,12 @@ async fn probe_one_acp(
         inject_mcp: false,
         mcp_exe: "herdr2".into(),
         socket: String::new(),
+        handshake_timeout: Some(timeout),
     };
-    let (res, cli_probe) =
-        tokio::join!(tokio::time::timeout(ACP_PROBE_TIMEOUT, spawn_session(spec)), probe_cli_models(&id, &env, &cwd));
+    // Keep a small outer safety margin so inner `setup_session` timeouts fire first and preserve
+    // the exact stalled phase (`initialize` vs `session/new`) and child stderr.
+    let outer_timeout = timeout.saturating_add(Duration::from_secs(5));
+    let res = tokio::time::timeout(outer_timeout, spawn_session(spec)).await;
 
     match res {
         Ok(Ok(started)) => {
@@ -330,6 +517,11 @@ async fn probe_one_acp(
             started.transport.kill();
             let _ = tokio::time::timeout(Duration::from_secs(1), started.waiter.wait()).await;
 
+            // Run CLI model catalog discovery AFTER the ACP child has exited so agents like
+            // `cursor-agent` never launch two Node processes concurrently competing on compile
+            // cache (`NODE_COMPILE_CACHE`), state files, and proxy connections.
+            let cli_probe = probe_cli_models(&id, &env, &cwd).await;
+
             let models = merge_model_lists(&[acp_models, cli_probe.models, local_models]);
             let default_model =
                 acp_default.filter(|s| !s.trim().is_empty()).or(local_default).or_else(|| models.first().cloned());
@@ -343,7 +535,7 @@ async fn probe_one_acp(
                 model_efforts.entry(k).or_insert(v);
             }
 
-            ProbedAgent {
+            ProbeAttemptOutcome::Done(ProbedAgent {
                 id,
                 command: argv,
                 installed: true,
@@ -356,17 +548,26 @@ async fn probe_one_acp(
                 model_contexts,
                 model_efforts,
                 error: None,
-            }
+            })
+        }
+        Ok(Err(err)) if is_handshake_timeout_error(&err.message) => {
+            let detail = sanitize_probe_error(&err.message);
+            ProbeAttemptOutcome::TimedOut(TimedOutAttempt {
+                target: AcpProbeTarget { id, argv, exe_path, env, cwd },
+                detail: (!detail.is_empty()).then_some(detail),
+                timeout,
+            })
         }
         Ok(Err(err)) => {
             // Always surface ACP spawn/handshake failures even when CLI or local model catalogs
             // are still available, so broken/unauthenticated agents are never misreported as healthy.
+            let cli_probe = probe_cli_models(&id, &env, &cwd).await;
             let err_msg = sanitize_probe_error(&err.message);
             let err_opt = Some(if err_msg.is_empty() { "ACP probe failed".to_string() } else { err_msg });
             let models = merge_model_lists(&[cli_probe.models, local_models]);
             let model_efforts = infer_model_efforts_from_variants(&models);
             let default_model = local_default.or_else(|| models.first().cloned());
-            ProbedAgent {
+            ProbeAttemptOutcome::Done(ProbedAgent {
                 id,
                 command: argv,
                 installed: true,
@@ -379,32 +580,13 @@ async fn probe_one_acp(
                 model_contexts: BTreeMap::new(),
                 model_efforts,
                 error: err_opt,
-            }
+            })
         }
-        Err(_) => {
-            let base = format!("ACP probe timed out after {}s", ACP_PROBE_TIMEOUT.as_secs());
-            let err_opt = Some(match cli_probe.error {
-                Some(cli_err) if !cli_err.is_empty() => format!("{base} ({cli_err})"),
-                _ => base,
-            });
-            let models = merge_model_lists(&[cli_probe.models, local_models]);
-            let model_efforts = infer_model_efforts_from_variants(&models);
-            let default_model = local_default.or_else(|| models.first().cloned());
-            ProbedAgent {
-                id,
-                command: argv,
-                installed: true,
-                path: Some(exe_path),
-                agent_info: None,
-                models,
-                default_model,
-                efforts: default_efforts(),
-                default_effort: Some("medium".into()),
-                model_contexts: BTreeMap::new(),
-                model_efforts,
-                error: err_opt,
-            }
-        }
+        Err(_) => ProbeAttemptOutcome::TimedOut(TimedOutAttempt {
+            target: AcpProbeTarget { id, argv, exe_path, env, cwd },
+            detail: None,
+            timeout,
+        }),
     }
 }
 
@@ -1320,6 +1502,225 @@ mod tests {
         assert!(probed.installed);
         let err = probed.error.as_deref().expect("expected agy probe error");
         assert!(err.contains("Auth token invalid"), "unexpected agy error: {err}");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(unix)]
+    fn write_exec_script(path: &Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_acp_targets_retries_once_on_timeout_and_recovers() {
+        let tmp = crate::test_tmp().join(format!("drove-probe-retry-ok-{}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let marker = tmp.join("attempts");
+        let fake_agent = tmp.join("fake-acp");
+        write_exec_script(
+            &fake_agent,
+            &format!(
+                r#"#!/bin/sh
+MARKER="{marker}"
+if [ ! -f "$MARKER" ]; then
+  echo 1 > "$MARKER"
+  sleep 5
+  exit 0
+fi
+echo 2 >> "$MARKER"
+while IFS= read -r line; do
+  case "$line" in
+    *'"initialize"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":1,"result":{{"protocolVersion":1,"agentInfo":{{"name":"FakeCursor","version":"1.2.3"}},"agentCapabilities":{{}}}}}}'
+      ;;
+    *'"session/new"'*)
+      printf '%s\n' '{{"jsonrpc":"2.0","id":2,"result":{{"sessionId":"s-1","configOptions":[{{"id":"model","category":"model","currentValue":"m-fast","options":[{{"value":"m-fast"}}]}}]}}}}'
+      ;;
+  esac
+done
+"#,
+                marker = marker.display()
+            ),
+        );
+
+        let mut env = BTreeMap::new();
+        env.insert("HOME".into(), tmp.display().to_string());
+        let policy = ProbePolicy {
+            concurrency: 2,
+            retry_concurrency: 1,
+            initial_timeout: Duration::from_millis(300),
+            retry_timeout: Duration::from_secs(3),
+            retry_backoff: Duration::from_millis(20),
+            total_budget: Duration::from_secs(10),
+            max_retry_agents: 3,
+        };
+        let results = probe_acp_targets_with_policy(
+            vec![AcpProbeTarget {
+                id: "custom-slow".into(),
+                argv: vec![fake_agent.display().to_string()],
+                exe_path: fake_agent.display().to_string(),
+                env,
+                cwd: tmp.display().to_string(),
+            }],
+            policy,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        let a = &results[0];
+        assert!(a.error.is_none(), "expected recovery on retry, got: {:?}", a.error);
+        assert_eq!(a.agent_info.as_deref(), Some("FakeCursor 1.2.3"));
+        assert!(a.models.contains(&"m-fast".to_string()));
+        let attempts = std::fs::read_to_string(&marker).unwrap().lines().count();
+        assert_eq!(attempts, 2);
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_acp_targets_does_not_retry_non_timeout_errors() {
+        let tmp = crate::test_tmp().join(format!("drove-probe-no-retry-{}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let marker = tmp.join("attempts");
+        let fake_agent = tmp.join("fake-err");
+        write_exec_script(
+            &fake_agent,
+            &format!(
+                "#!/bin/sh\necho x >> \"{}\"\necho 'Error: unauthorized' >&2\nexit 1\n",
+                marker.display()
+            ),
+        );
+
+        let mut env = BTreeMap::new();
+        env.insert("HOME".into(), tmp.display().to_string());
+        let policy = ProbePolicy {
+            concurrency: 2,
+            retry_concurrency: 1,
+            initial_timeout: Duration::from_secs(2),
+            retry_timeout: Duration::from_secs(2),
+            retry_backoff: Duration::from_millis(10),
+            total_budget: Duration::from_secs(10),
+            max_retry_agents: 3,
+        };
+        let results = probe_acp_targets_with_policy(
+            vec![AcpProbeTarget {
+                id: "custom-err".into(),
+                argv: vec![fake_agent.display().to_string()],
+                exe_path: fake_agent.display().to_string(),
+                env,
+                cwd: tmp.display().to_string(),
+            }],
+            policy,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        let err = results[0].error.as_deref().expect("expected error");
+        assert!(err.contains("unauthorized"), "unexpected error: {err}");
+        let attempts = std::fs::read_to_string(&marker).unwrap().lines().count();
+        assert_eq!(attempts, 1, "non-timeout errors must not be retried");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_acp_targets_timeout_preserves_phase_and_stderr() {
+        let tmp = crate::test_tmp().join(format!("drove-probe-timeout-stderr-{}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let fake_agent = tmp.join("fake-hang-session");
+        write_exec_script(
+            &fake_agent,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"initialize"'*)
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+      ;;
+    *'"session/new"'*)
+      echo 'proxy handshake stalled on connect' >&2
+      sleep 5
+      ;;
+  esac
+done
+"#,
+        );
+
+        let mut env = BTreeMap::new();
+        env.insert("HOME".into(), tmp.display().to_string());
+        let policy = ProbePolicy {
+            concurrency: 2,
+            retry_concurrency: 1,
+            initial_timeout: Duration::from_millis(350),
+            retry_timeout: Duration::from_millis(350),
+            retry_backoff: Duration::from_millis(20),
+            total_budget: Duration::from_secs(10),
+            max_retry_agents: 3,
+        };
+        let results = probe_acp_targets_with_policy(
+            vec![AcpProbeTarget {
+                id: "custom-hang".into(),
+                argv: vec![fake_agent.display().to_string()],
+                exe_path: fake_agent.display().to_string(),
+                env,
+                cwd: tmp.display().to_string(),
+            }],
+            policy,
+        )
+        .await;
+
+        assert_eq!(results.len(), 1);
+        let err = results[0].error.as_deref().expect("expected timeout error");
+        assert!(err.contains("ACP probe timed out"), "missing timeout prefix: {err}");
+        assert!(err.contains("retried once"), "missing retry marker: {err}");
+        assert!(err.contains("ACP session/new failed"), "missing stalled phase: {err}");
+        assert!(err.contains("proxy handshake stalled on connect"), "missing child stderr: {err}");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_acp_targets_skips_retry_when_too_many_agents_time_out() {
+        let tmp = crate::test_tmp().join(format!("drove-probe-systemic-{}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let marker = tmp.join("attempts");
+        let fake_agent = tmp.join("fake-hang");
+        write_exec_script(
+            &fake_agent,
+            &format!("#!/bin/sh\necho x >> \"{}\"\nsleep 5\n", marker.display()),
+        );
+
+        let mut env = BTreeMap::new();
+        env.insert("HOME".into(), tmp.display().to_string());
+        let policy = ProbePolicy {
+            concurrency: 4,
+            retry_concurrency: 2,
+            initial_timeout: Duration::from_millis(250),
+            retry_timeout: Duration::from_millis(250),
+            retry_backoff: Duration::from_millis(10),
+            total_budget: Duration::from_secs(10),
+            max_retry_agents: 2,
+        };
+        let targets = (0..3)
+            .map(|i| AcpProbeTarget {
+                id: format!("hang-{i}"),
+                argv: vec![fake_agent.display().to_string()],
+                exe_path: fake_agent.display().to_string(),
+                env: env.clone(),
+                cwd: tmp.display().to_string(),
+            })
+            .collect();
+        let results = probe_acp_targets_with_policy(targets, policy).await;
+
+        assert_eq!(results.len(), 3);
+        for a in &results {
+            let err = a.error.as_deref().expect("expected timeout error");
+            assert!(err.contains("ACP probe timed out"), "unexpected error: {err}");
+            assert!(!err.contains("retried once"), "systemic outage should skip retry: {err}");
+        }
+        let attempts = std::fs::read_to_string(&marker).unwrap().lines().count();
+        assert_eq!(attempts, 3, "expected exactly 1 attempt per agent when systemic outage skips retry");
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

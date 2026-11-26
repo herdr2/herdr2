@@ -82,8 +82,15 @@ export default class NewMenu extends View {
     const t = theme();
     const space = spaces().find(s => s.active);
     const acpMode = (shared(MODE_KEY) ?? "terminal") === "acp";
-    const showWinShells = window()?.platform === "windows" && !space?.machine;
-    const winShells = showWinShells ? WIN_SHELLS() : [];
+    const winInfo = window();
+    const isWinLocal = winInfo?.platform === "windows" && !space?.machine;
+    const installedWinShells = Array.isArray(winInfo?.shells)
+      ? new Set(winInfo.shells.map((s) => String(s).trim().toLowerCase()))
+      : null;
+    const winShells = isWinLocal
+      ? (installedWinShells ? WIN_SHELLS().filter((sh) => installedWinShells.has(sh.id)) : WIN_SHELLS())
+      : [];
+    const showWinShells = winShells.length > 0;
     const rawShell = String(this.selectedShell ?? (typeof settings === "function" ? settings()?.shell : undefined) ?? "auto").trim().toLowerCase();
     const activeShell = rawShell === "windows-powershell"
       ? "powershell"

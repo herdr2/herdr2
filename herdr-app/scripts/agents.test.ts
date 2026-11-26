@@ -162,6 +162,39 @@ test("a failed agent check keeps cached launchable agents and shows an error ins
   }
 });
 
+test("new-menu on Windows only shows locally installed shells reported by window().shells", async () => {
+  const menuSource = (await readFile(new URL("../defaults/mods/new-menu/main.js", import.meta.url), "utf8"))
+    .replace(/^import .*;\n/gm, "").replace("export default class NewMenu", "class NewMenu");
+  const renderWith = (winInfo: Record<string, unknown>, shellSetting = "auto") => {
+    const globals = {
+      View: class {}, spaces: () => [{ id: "s1", active: true, machine: null }], shared: () => null, setShared: () => {},
+      knownAgents: async () => [],
+      theme: () => ({}), props: () => ({}), keys: () => [], settings: () => ({ shell: shellSetting }), window: () => winInfo, panes: () => [],
+      div: element, svg: element, image: element, h_flex: element, v_flex: element,
+    };
+    const NewMenu = new Function(...Object.keys(globals), `${menuSource}; return NewMenu;`)(...Object.values(globals));
+    const menu = new NewMenu();
+    menu.agents = [];
+    menu.handle = {};
+    return textOf(menu.render().node);
+  };
+
+  const subset = renderWith({ platform: "windows", shells: ["powershell", "cmd"] }, "pwsh");
+  expect(subset).toContain("PowerShell");
+  expect(subset).toContain("CMD");
+  expect(subset).not.toContain("PowerShell 7");
+  expect(subset).not.toContain("Git Bash");
+
+  const withGitBash = renderWith({ platform: "windows", shells: ["powershell", "git-bash", "cmd"] }, "git-bash");
+  expect(withGitBash).toContain("Terminal · Git Bash");
+  expect(withGitBash).toContain("Git Bash");
+  expect(withGitBash).not.toContain("PowerShell 7");
+
+  const none = renderWith({ platform: "windows", shells: [] }, "powershell");
+  expect(none).not.toContain("PowerShell");
+  expect(none).not.toContain("CMD");
+});
+
 for (const sort of ["priority", "grouped"]) test(`${sort} render reads panes once and refreshes labels on the next render`, () => {
   const list = Array.from({ length: 64 }, (_, i) => ({
     address: `t${i}`, pane: `p${i}`, tab: `tab${i}`, space: "s1", space_name: "Project",
@@ -367,10 +400,14 @@ for (const sort of ["priority", "grouped"]) test(`${sort}: headless ACP sub-agen
   expect(texts.get("sub-a7")).toContain("sub-reviewer");
   expect(texts.get("sub-a7")).toContain("ACP");
   expect(texts.get("ag-wsl/a6")).toContain("ACP");
-  expect(texts.get("ag-wsl/a6")).toContain("wsl");
   if (sort === "priority") {
+    expect(texts.get("ag-wsl/a6")).toContain("wsl");
     // Blocked ACP child a7 promotes idle parent t1 ahead of done/working peers.
     expect(orders.at(-1)?.[0]).toBe("t1");
+  } else {
+    // Grouped mode shows the machine name in the device header above, not on each row.
+    expect(texts.get("dev-wsl")).toContain("wsl");
+    expect(texts.get("ag-wsl/a6")).not.toContain("wsl");
   }
   clicks.get("sub-a7")!();
   clicks.get("ag-wsl/a6")!();
@@ -1324,6 +1361,13 @@ test("grouped mode separates workspaces under per-device headers and folds per d
   expect(collectIds(findById(root, "dev-body-local"), "sp-")).toEqual(["sp-s1", "sp-s2"]);
   expect(collectIds(findById(root, "dev-body-cloud"), "sp-")).toEqual(["sp-cloud/sp1"]);
   expect(collectIds(findById(root, "dev-body-wsl"), "sp-")).toEqual(["sp-wsl/sp1", "sp-headless:wsl"]);
+
+  // Grouped rows rely on the device header above and omit redundant per-row machine names.
+  expect(findById(root, "dev-tag-wsl/a1")).toBeNull();
+  expect(findById(root, "dev-tag-cloud/a2")).toBeNull();
+  expect(textOf(findById(root, "ag-wsl/a1"))).not.toContain("wsl");
+  expect(textOf(findById(root, "ag-cloud/a2"))).not.toContain("cloud");
+  expect(textOf(findById(root, "ag-wsl/a3"))).not.toContain("wsl");
 
   // Agent navigation order matches visual device -> space -> agent order.
   expect(orders.at(-1)).toEqual(["t1", "t2", "cloud/a2", "wsl/a1", "wsl/a3"]);

@@ -144,6 +144,7 @@ const LANGUAGES = [
 const DEFAULT_FONT = "JetBrains Mono";
 const DEFAULT_UI_FONT = "Geist";
 const fmtVer = (v) => (v ? `v${String(v).replace(/^v/i, "")}` : "");
+const alpha = (hex, a) => (typeof hex === "string" && /^#[0-9a-fA-F]{6}$/.test(hex) ? hex + a : null);
 
 export default class Settings extends View {
   lang() {
@@ -200,6 +201,12 @@ export default class Settings extends View {
     this.droveProbeAiDiagnosing = false;
     this.droveProbeAiResult = null;
     this.droveProbeAgentLaunching = false;
+    this.droveProbeFixOpen = false;
+    this.droveProbeFixAgent = null;
+    this.droveProbeFixModel = null;
+    this.droveProbeFixEffort = null;
+    this.droveFixKnownAgents = {};
+    this.droveFixKnownLoading = false;
     this.droveAiTesting = false;
     this.droveMagpieTesting = false;
     this.droveError = null;
@@ -302,6 +309,7 @@ export default class Settings extends View {
     this.waitingUpdateCheck = false;
     this.pendingUpdateCheckSeq = 0;
     this.updateModal = null;
+    this.aiUpdateLaunching = false;
     this.skillData = null;
     this.skillMachine = null; // null = local, else SSH machine name
     this.skillLoading = false;
@@ -321,7 +329,7 @@ export default class Settings extends View {
       await this.load();
       if (!(typeof checking === "function" && checking())) {
         if (this.section === "keyboard") await this.loadKeys();
-        if (this.section === "machines") await this.loadMachines();
+        if (this.section === "machines" || this.section === "updates") await this.loadMachines();
         if (this.section === "ai") {
           await Promise.all([this.loadMachines(), this.loadAi()]);
         }
@@ -336,7 +344,7 @@ export default class Settings extends View {
       cx.notify();
     });
     cx.timer.every(3000, (cx) => {
-      if (this.section !== "machines") return;
+      if (this.section !== "machines" && this.section !== "updates") return;
       cx.spawn(async (cx) => {
         await this.loadMachines();
         cx.notify();
@@ -2016,69 +2024,345 @@ export default class Settings extends View {
     return all.find((s) => (s.machine ?? null) === targetMachine) ?? null;
   }
 
-  async resolveFixAgentLaunch(targetMachine, readyAgents) {
+  canonicalFixAgentId(raw) {
+    const id = String(raw ?? "").trim().toLowerCase();
+    if (!id) return "";
+    if (id === "antigravity") return "agy";
+    if (id === "cursor-agent") return "cursor";
+    if (id === "dsh-tui") return "dsh";
+    return id;
+  }
+
+  fixAgentFallbackArgv(agentId) {
+    const id = this.canonicalFixAgentId(agentId);
     const cliFallback = {
       claude: ["claude", "--dangerously-skip-permissions"],
       agy: ["agy", "--dangerously-skip-permissions"],
-      antigravity: ["agy", "--dangerously-skip-permissions"],
       codex: ["codex", "--no-daemon", "--dangerously-bypass-approvals-and-sandbox"],
       cursor: ["cursor-agent", "--yolo", "--trust"],
-      "cursor-agent": ["cursor-agent", "--yolo", "--trust"],
       opencode: ["opencode", "--auto"],
       gemini: ["gemini", "--yolo"],
       kimi: ["kimi", "--auto"],
       hermes: ["hermes", "--yolo", "--accept-hooks"],
       zcode: ["zcode", "--mode", "yolo"],
       dsh: ["dsh-tui"],
+      copilot: ["copilot"],
+      qoder: ["qodercli"],
     };
-    const prefOrder = ["claude", "antigravity", "agy", "codex", "cursor", "opencode", "gemini", "hermes", "zcode", "kimi", "dsh"];
-    const readyKeys = new Set(
-      (readyAgents ?? []).flatMap((a) => (a.id === "agy" ? ["agy", "antigravity"] : [a.id])),
-    );
+    return cliFallback[id] ? [...cliFallback[id]] : null;
+  }
+
+  normalizeFixAgentArgv(agentId, argv) {
+    if (!Array.isArray(argv) || argv.length === 0) return null;
+    const id = this.canonicalFixAgentId(agentId);
+    if (id === "cursor" && argv[0] === "agent") {
+      return ["cursor-agent", ...argv.slice(1)];
+    }
+    return [...argv];
+  }
+
+  droveFixAgentOptions() {
+    const prefOrder = [
+      "claude",
+      "agy",
+      "codex",
+      "cursor",
+      "opencode",
+      "gemini",
+      "hermes",
+      "zcode",
+      "kimi",
+      "copilot",
+      "qoder",
+      "dsh",
+    ];
+    const machineKey = this.droveMachine ?? "__local__";
+    const knownList = Array.isArray(this.droveFixKnownAgents?.[machineKey])
+      ? this.droveFixKnownAgents[machineKey]
+      : [];
+    const byId = new Map();
+
+    for (const a of this.probedAgents()) {
+      const id = this.canonicalFixAgentId(a?.id);
+      if (!id) continue;
+      const argv = this.fixAgentFallbackArgv(id);
+      const err = this.agentProbeError(a);
+      const models = this.probedModelsFor(a.id);
+      const prev = byId.get(id);
+      if (!prev) {
+        byId.set(id, {
+          id,
+          name: a.name && a.name !== a.id ? a.name : id,
+          installed: Boolean(a.installed),
+          probeError: err,
+          models,
+          argv,
+        });
+      } else {
+        if (a.installed) prev.installed = true;
+        if (!prev.probeError && err) prev.probeError = err;
+        if (prev.models.length === 0 && models.length > 0) prev.models = models;
+        if (!prev.argv && argv) prev.argv = argv;
+      }
+    }
+
+    for (const p of knownList) {
+      const id = this.canonicalFixAgentId(p?.key);
+      if (!id) continue;
+      const runArgv = this.normalizeFixAgentArgv(id, p?.run);
+      const prev = byId.get(id);
+      if (prev) {
+        if (p?.name) prev.name = p.name;
+        if (p?.installed) prev.installed = true;
+        if (runArgv) prev.argv = runArgv;
+      } else if (runArgv) {
+        byId.set(id, {
+          id,
+          name: p?.name || id,
+          installed: Boolean(p?.installed),
+          probeError: null,
+          models: this.probedModelsFor(id),
+          argv: runArgv,
+        });
+      }
+    }
+
+    const rank = (id) => {
+      const i = prefOrder.indexOf(id);
+      return i === -1 ? 99 : i;
+    };
+    const group = (item) => {
+      if (item.installed && !item.probeError) return 0;
+      if (item.installed) return 1;
+      return 2;
+    };
+
+    return [...byId.values()]
+      .filter((item) => Array.isArray(item.argv) && item.argv.length > 0)
+      .map((item) => ({ ...item, ready: Boolean(item.installed && !item.probeError) }))
+      .sort((a, b) => {
+        const ga = group(a);
+        const gb = group(b);
+        if (ga !== gb) return ga - gb;
+        const ra = rank(a.id);
+        const rb = rank(b.id);
+        if (ra !== rb) return ra - rb;
+        return a.id.localeCompare(b.id);
+      });
+  }
+
+  droveFixEffortDisabledReason(agentId, modelId) {
+    const id = this.canonicalFixAgentId(agentId);
+    const cleanModel = String(modelId ?? "").trim();
+    if (id === "zcode") {
+      return this.tr(
+        "ZCode does not accept startup --model/--effort flags; switch inside its TUI",
+        "ZCode 不支持通过启动参数指定模型或思考强度，需进入后在 TUI 内切换",
+      );
+    }
+    if ((id === "agy" || id === "cursor") && cleanModel && this.modelHasEmbeddedEffort(cleanModel)) {
+      return this.tr(
+        "Selected model already includes reasoning effort",
+        "当前所选模型已自带思考强度，不可单独选择",
+      );
+    }
+    if (id === "cursor" && !cleanModel) {
+      return this.tr(
+        "Select a Cursor model first to apply custom reasoning effort",
+        "Cursor 需先选择具体模型才能指定自定义思考强度",
+      );
+    }
+    return null;
+  }
+
+  ensureDroveFixSelection() {
+    const options = this.droveFixAgentOptions();
+    const curId = this.canonicalFixAgentId(this.droveProbeFixAgent);
+    let chosen = curId ? options.find((o) => o.id === curId) : null;
+    if (!chosen) {
+      chosen = options.find((o) => o.ready) ?? options.find((o) => o.installed) ?? options[0] ?? null;
+      this.droveProbeFixAgent = chosen?.id ?? null;
+      this.droveProbeFixModel = null;
+    } else if (this.droveProbeFixAgent !== chosen.id) {
+      this.droveProbeFixAgent = chosen.id;
+    }
+    const agent = chosen?.id ?? null;
+    const model = String(this.droveProbeFixModel ?? "").trim() || null;
+    const disabledReason = agent ? this.droveFixEffortDisabledReason(agent, model) : null;
+    if (agent && this.droveProbeFixEffort && !disabledReason) {
+      this.droveProbeFixEffort = this.clampEffortFor(agent, model, this.droveProbeFixEffort);
+    }
+    return {
+      agent,
+      model,
+      effort: this.droveProbeFixEffort ?? null,
+      disabledReason,
+      option: chosen,
+      options,
+    };
+  }
+
+  setDroveProbeFixAgent(agentId, cx) {
+    const next = this.canonicalFixAgentId(agentId);
+    if (!next) return;
+    this.droveProbeFixAgent = next;
+    this.droveProbeFixModel = null;
+    if (this.droveProbeFixEffort && !this.droveFixEffortDisabledReason(next, null)) {
+      this.droveProbeFixEffort = this.clampEffortFor(next, null, this.droveProbeFixEffort);
+    }
+    cx?.notify?.();
+  }
+
+  setDroveProbeFixModel(modelId, cx) {
+    const next = String(modelId ?? "").trim() || null;
+    this.droveProbeFixModel = next;
+    const agent = this.canonicalFixAgentId(this.droveProbeFixAgent);
+    if (agent && this.droveProbeFixEffort && !this.droveFixEffortDisabledReason(agent, next)) {
+      this.droveProbeFixEffort = this.clampEffortFor(agent, next, this.droveProbeFixEffort);
+    }
+    cx?.notify?.();
+  }
+
+  setDroveProbeFixEffort(effort, cx) {
+    const raw = String(effort ?? "").trim().toLowerCase();
+    if (!raw || raw === "auto" || raw === "default") {
+      this.droveProbeFixEffort = null;
+    } else {
+      const agent = this.canonicalFixAgentId(this.droveProbeFixAgent);
+      this.droveProbeFixEffort = agent
+        ? this.clampEffortFor(agent, this.droveProbeFixModel, raw)
+        : raw;
+    }
+    cx?.notify?.();
+  }
+
+  loadDroveFixKnownAgents(cx) {
+    if (typeof knownAgents !== "function" || (typeof checking === "function" && checking())) return;
+    const targetMachine = this.droveMachine ?? null;
+    const machineKey = targetMachine ?? "__local__";
+    if (this.droveFixKnownLoading) return;
+    this.droveFixKnownLoading = true;
+    cx?.notify?.();
+    cx.spawn(async (spawnCx) => {
+      try {
+        const list = await knownAgents(targetMachine ? { on: targetMachine } : {});
+        if (Array.isArray(list)) {
+          this.droveFixKnownAgents = { ...(this.droveFixKnownAgents ?? {}), [machineKey]: list };
+          if ((this.droveMachine ?? null) === targetMachine) {
+            this.ensureDroveFixSelection();
+          }
+        }
+      } catch {}
+      finally {
+        this.droveFixKnownLoading = false;
+        spawnCx?.notify?.();
+      }
+    });
+  }
+
+  toggleDroveProbeFixPanel(cx) {
+    this.droveProbeFixOpen = !this.droveProbeFixOpen;
+    if (this.droveProbeFixOpen) {
+      this.ensureDroveFixSelection();
+      const machineKey = this.droveMachine ?? "__local__";
+      if (!Array.isArray(this.droveFixKnownAgents?.[machineKey])) {
+        this.loadDroveFixKnownAgents(cx);
+      }
+    } else if (typeof this.picking === "string" && this.picking.startsWith("drove:probe-fix-")) {
+      this.picking = null;
+      this.droveModelSubmit = null;
+    }
+    cx?.notify?.();
+  }
+
+  async resolveFixAgentLaunch(targetMachine, readyAgents, preferredAgentId = null) {
+    const prefOrder = ["claude", "agy", "codex", "cursor", "opencode", "gemini", "hermes", "zcode", "kimi", "copilot", "qoder", "dsh"];
+    const want = this.canonicalFixAgentId(preferredAgentId);
+    const machineKey = targetMachine ?? "__local__";
+    let knownList = null;
 
     if (typeof knownAgents === "function") {
       try {
         const list = await knownAgents(targetMachine ? { on: targetMachine } : {});
-        const installed = (list ?? []).filter((p) => p?.installed && Array.isArray(p.run) && p.run.length > 0);
-        const rank = (p) => {
-          const i = prefOrder.indexOf(p.key);
-          return i === -1 ? 99 : i;
-        };
-        const sorted = [...installed].sort((a, b) => rank(a) - rank(b));
-        const picked = sorted.find((p) => readyKeys.has(p.key)) ?? sorted[0];
-        if (picked) {
-          return { name: picked.name || picked.key, argv: picked.run };
+        if (Array.isArray(list)) {
+          knownList = list;
+          this.droveFixKnownAgents = { ...(this.droveFixKnownAgents ?? {}), [machineKey]: list };
         }
       } catch {}
     }
 
+    if (want) {
+      if (Array.isArray(knownList)) {
+        const matched = knownList.find(
+          (p) => this.canonicalFixAgentId(p?.key) === want && Array.isArray(p?.run) && p.run.length > 0,
+        );
+        if (matched?.installed) {
+          const argv = this.normalizeFixAgentArgv(want, matched.run);
+          if (argv) return { id: want, name: matched.name || want, argv };
+        }
+        const opt = this.droveFixAgentOptions().find((o) => o.id === want);
+        if (opt?.argv) {
+          return { id: want, name: matched?.name || opt.name || want, argv: opt.argv };
+        }
+      }
+      const opt = this.droveFixAgentOptions().find((o) => o.id === want);
+      if (opt?.argv) return { id: want, name: opt.name || want, argv: opt.argv };
+      const fallbackArgv = this.fixAgentFallbackArgv(want);
+      if (fallbackArgv) return { id: want, name: want, argv: fallbackArgv };
+      return null;
+    }
+
+    const readyKeys = new Set(
+      (readyAgents ?? []).map((a) => this.canonicalFixAgentId(a?.id)).filter(Boolean),
+    );
+
+    if (Array.isArray(knownList)) {
+      const installed = knownList.filter((p) => p?.installed && Array.isArray(p.run) && p.run.length > 0);
+      const rank = (p) => {
+        const i = prefOrder.indexOf(this.canonicalFixAgentId(p.key));
+        return i === -1 ? 99 : i;
+      };
+      const sorted = [...installed].sort((a, b) => rank(a) - rank(b));
+      const picked = sorted.find((p) => readyKeys.has(this.canonicalFixAgentId(p.key))) ?? sorted[0];
+      if (picked) {
+        const id = this.canonicalFixAgentId(picked.key);
+        const argv = this.normalizeFixAgentArgv(id, picked.run) ?? picked.run;
+        return { id, name: picked.name || id || picked.key, argv };
+      }
+    }
+
     const candidates = [
-      ...(readyAgents ?? []).map((a) => a.id),
-      ...this.droveProbeSummary().installed.map((a) => a.id),
-    ];
+      ...(readyAgents ?? []).map((a) => this.canonicalFixAgentId(a?.id)),
+      ...this.droveProbeSummary().installed.map((a) => this.canonicalFixAgentId(a?.id)),
+    ].filter(Boolean);
     for (const id of prefOrder) {
-      if (candidates.includes(id) && cliFallback[id]) {
-        return { name: id, argv: cliFallback[id] };
+      const argv = this.fixAgentFallbackArgv(id);
+      if (candidates.includes(id) && argv) {
+        return { id, name: id, argv };
       }
     }
     for (const id of candidates) {
-      if (cliFallback[id]) {
-        return { name: id, argv: cliFallback[id] };
+      const argv = this.fixAgentFallbackArgv(id);
+      if (argv) {
+        return { id, name: id, argv };
       }
     }
     return null;
   }
 
-  launchAgentToFixDroveProbeErrors(cx) {
+  launchAgentToFixDroveProbeErrors(cx, override = null) {
     if (this.droveProbeAgentLaunching) return;
     const summary = this.droveProbeSummary();
     if (summary.errored.length === 0) return;
     const targetMachine = this.droveMachine ?? null;
+    const selectedAgent = override?.agent !== undefined ? override.agent : this.droveProbeFixAgent;
+    const selectedModel = override?.model !== undefined ? override.model : this.droveProbeFixModel;
+    const selectedEffort = override?.effort !== undefined ? override.effort : this.droveProbeFixEffort;
     this.droveProbeAgentLaunching = true;
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const picked = await this.resolveFixAgentLaunch(targetMachine, summary.ready);
+        const picked = await this.resolveFixAgentLaunch(targetMachine, summary.ready, selectedAgent);
         if (!picked) {
           notify({
             title: this.tr("No available CLI agent found", "未找到可启动的 CLI Agent"),
@@ -2090,19 +2374,32 @@ export default class Settings extends View {
           });
           return;
         }
+        const pickedId = this.canonicalFixAgentId(picked.id || selectedAgent || picked.name);
+        const cleanModel = pickedId === "zcode" ? null : (String(selectedModel ?? "").trim() || null);
+        const effortDisabled = Boolean(this.droveFixEffortDisabledReason(pickedId, cleanModel));
+        const cleanEffort = !effortDisabled && selectedEffort
+          ? this.clampEffortFor(pickedId, cleanModel, selectedEffort)
+          : null;
         const prompt = this.buildDroveProbeFixPrompt(summary.errored, this.droveProbeAiResult);
         const tabName = this.tr("Fix Drove Agents", "排查 Drove 异常");
         const targetSpace = this.targetSpaceForDroveMachine();
+        const launchArgs = { name: tabName, argv: picked.argv, task: prompt };
+        if (cleanModel) launchArgs.model = cleanModel;
+        if (cleanEffort) launchArgs.effort = cleanEffort;
         if (targetSpace) {
-          run("tab.new", { space: targetSpace.id, name: tabName, argv: picked.argv, task: prompt });
+          run("tab.new", { space: targetSpace.id, ...launchArgs });
         } else {
-          const args = { name: tabName, tab: tabName, argv: picked.argv, task: prompt };
+          const args = { ...launchArgs, tab: tabName };
           if (targetMachine) args.machine = targetMachine;
           run("space.new", args);
         }
+        this.droveProbeFixOpen = false;
         this.close();
+        const metaParts = [cleanModel, cleanEffort ? this.effortLabel(cleanEffort) : null].filter(Boolean);
+        const metaEn = metaParts.length > 0 ? ` (${metaParts.join(" · ")})` : "";
+        const metaZh = metaParts.length > 0 ? `（${metaParts.join(" · ")}）` : "";
         notify({
-          title: this.tr(`Launched ${picked.name} to troubleshoot`, `已启动 ${picked.name} 协助排查`),
+          title: this.tr(`Launched ${picked.name}${metaEn} to troubleshoot`, `已启动 ${picked.name}${metaZh} 协助排查`),
           body: this.tr(
             "After fixing, return to Settings -> Drove and click Refresh Agents.",
             "处理完成后，返回「设置 → Drove」点击「刷新检测」即可验证。",
@@ -4762,6 +5059,10 @@ export default class Settings extends View {
           this.droveMagpieResult = null;
           this.droveProbeAiResult = null;
           this.droveProbeAiDiagnosing = false;
+          this.droveProbeFixOpen = false;
+          this.droveProbeFixAgent = null;
+          this.droveProbeFixModel = null;
+          this.droveProbeFixEffort = null;
           cx.spawn(async (cx) => {
             await this.loadDrove();
             this.maybeAutoProbeDrove(cx);
@@ -5006,39 +5307,49 @@ export default class Settings extends View {
                         ),
                     )
                     .child(
-                      h_flex()
-                        .id("st-dr-probe-agent-fix-btn")
-                        .px(9)
-                        .py(4)
-                        .gap(5)
-                        .rounded(6)
-                        .border_1()
-                        .border_color(t.border)
-                        .bg(t.raised)
-                        .items_center()
-                        .text_size(11.5)
-                        .text_color(t.foreground)
-                        .when(this.droveProbeAgentLaunching, (b) => b.opacity(0.6))
-                        .when(!this.droveProbeAgentLaunching, (b) =>
-                          b
-                            .cursor_pointer()
-                            .hover((s) => s.bg(t.hover))
-                            .on_click((_e, cx) => this.launchAgentToFixDroveProbeErrors(cx)),
-                        )
-                        .tooltip(
-                          this.tr(
-                            "Launch an interactive AI coding agent in a workspace tab with full error context to investigate and fix these issues",
-                            "在工作区标签页启动一个可交互的 AI Agent，带入完整异常上下文直接协助排查与修复",
-                          ),
-                        )
-                        .when(this.droveProbeAgentLaunching, (b) =>
-                          b.child(svg("mods/workspace-chrome/spinner.svg").size(11).text_color(t.foreground).spin(900)),
-                        )
-                        .child(
-                          this.droveProbeAgentLaunching
-                            ? this.tr("Launching…", "启动中…")
-                            : this.tr("Fix with Agent", "用 Agent 自动处理"),
-                        ),
+                      (() => {
+                        const fixOpen = Boolean(this.droveProbeFixOpen);
+                        return h_flex()
+                          .id("st-dr-probe-agent-fix-btn")
+                          .px(9)
+                          .py(4)
+                          .gap(5)
+                          .rounded(6)
+                          .border_1()
+                          .border_color(fixOpen ? t.accent : t.border)
+                          .bg(fixOpen ? t.accent : t.raised)
+                          .items_center()
+                          .text_size(11.5)
+                          .when(fixOpen, (b) => b.font_semibold())
+                          .text_color(fixOpen ? t.accent_foreground : t.foreground)
+                          .when(this.droveProbeAgentLaunching, (b) => b.opacity(0.6))
+                          .when(!this.droveProbeAgentLaunching, (b) =>
+                            b
+                              .cursor_pointer()
+                              .when(!fixOpen, (b2) => b2.hover((s) => s.bg(t.hover)))
+                              .when(fixOpen, (b2) => b2.hover((s) => s.opacity(0.92)))
+                              .on_click((_e, cx) => this.toggleDroveProbeFixPanel(cx)),
+                          )
+                          .tooltip(
+                            this.tr(
+                              "Choose an AI coding agent, model, and reasoning effort to launch in a workspace tab with full error context",
+                              "选择要启动的 Agent 类型、模型与思考强度，在工作区标签页带入完整异常上下文协助排查与修复",
+                            ),
+                          )
+                          .when(this.droveProbeAgentLaunching, (b) =>
+                            b.child(
+                              svg("mods/workspace-chrome/spinner.svg")
+                                .size(11)
+                                .text_color(fixOpen ? t.accent_foreground : t.foreground)
+                                .spin(900),
+                            ),
+                          )
+                          .child(
+                            this.droveProbeAgentLaunching
+                              ? this.tr("Launching…", "启动中…")
+                              : this.tr("Fix with Agent", "用 Agent 自动处理"),
+                          );
+                      })(),
                     ),
                 ),
             )
@@ -5065,6 +5376,275 @@ export default class Settings extends View {
                   .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.muted).child(shortErr));
               }),
             )
+            .when(Boolean(this.droveProbeFixOpen), (box) => {
+              const sel = this.ensureDroveFixSelection();
+              const curAgent = sel.agent ?? "";
+              const curOpt = sel.option;
+              const curModel = sel.model;
+              const curEffort = sel.effort;
+              const effortDisabledReason = sel.disabledReason;
+              const disableEffort = Boolean(effortDisabledReason);
+              const isZcode = curAgent === "zcode";
+              const agentItems = sel.options.map((o) => ({
+                value: o.id,
+                label: o.name && o.name !== o.id ? `${o.name} (${o.id})` : o.id,
+                icon: o.id,
+                dot: Boolean(o.installed),
+                dotColor: !o.installed ? t.dim : o.probeError ? t.working : t.ansi2,
+                meta: !o.installed
+                  ? this.tr("missing", "未安装")
+                  : o.probeError
+                    ? this.tr("ACP err · CLI", "ACP 异常 · CLI")
+                    : o.models.length > 0
+                      ? `${o.models.length} ${this.tr("models", "模型")}`
+                      : "✓",
+                metaColor: o.probeError ? t.working : t.dim,
+                tooltip: o.probeError ? this.formatAgentProbeError(o.probeError) : undefined,
+                active: curAgent === o.id,
+              }));
+              const models = curOpt?.models?.length ? curOpt.models : (curAgent ? this.probedModelsFor(curAgent) : []);
+              const modelItems = [
+                { value: null, label: this.tr("Auto (agent default)", "自动（Agent 默认）"), active: !curModel },
+                ...models.map((m) => ({
+                  value: m.id,
+                  label: m.label,
+                  active: curModel === m.id,
+                })),
+              ];
+              if (curModel && !models.some((m) => m.id === curModel)) {
+                modelItems.splice(1, 0, {
+                  value: curModel,
+                  label: curModel,
+                  meta: this.tr("custom", "自定义"),
+                  active: true,
+                });
+              }
+              const efforts = curAgent ? this.supportedEffortsFor(curAgent, curModel) : ["low", "medium", "high"];
+              const effortChoices = [null, ...efforts];
+              const canLaunch = Boolean(curOpt && !this.droveProbeAgentLaunching);
+              const footerHint = isZcode
+                ? this.tr(
+                    "Note: ZCode ignores startup --model/--effort flags; select model inside its TUI.",
+                    "提示：ZCode 不支持启动参数传入模型与思考强度，进入后需在 TUI 内切换。",
+                  )
+                : curAgent === "cursor" && !curModel
+                  ? this.tr(
+                      "Tip: Select a specific Cursor model to apply custom reasoning effort.",
+                      "提示：Cursor 需先指定具体模型才能生效自定义思考强度。",
+                    )
+                  : curOpt?.probeError
+                    ? this.tr(
+                        "ACP probe errored for this agent, but its interactive CLI can still run in your terminal.",
+                        "该 Agent 的 ACP 探测有异常，但在交互式终端中仍可直接启动排查。",
+                      )
+                    : this.droveProbeAiResult?.ok
+                      ? this.tr(
+                          "Will launch in a workspace tab and attach the AI diagnosis context above.",
+                          "将在工作区标签页启动并自动附带上方 AI 诊断结论。",
+                        )
+                      : this.tr(
+                          "Will launch an interactive agent in a workspace tab with full error context.",
+                          "将在目标主机工作区标签页启动交互式 Agent 并带入完整异常上下文。",
+                        );
+              return box.child(
+                v_flex()
+                  .id("st-dr-probe-fix-panel")
+                  .w_full()
+                  .mt(2)
+                  .px(10)
+                  .py(9)
+                  .gap(8)
+                  .rounded(7)
+                  .border_1()
+                  .border_color(t.accent)
+                  .bg(t.background)
+                  .child(
+                    h_flex()
+                      .w_full()
+                      .items_center()
+                      .justify_between()
+                      .gap(8)
+                      .child(
+                        div()
+                          .text_size(11.8)
+                          .font_semibold()
+                          .text_color(t.foreground)
+                          .child(
+                            this.tr(
+                              "Fix with Agent · Choose Agent, Model & Reasoning Effort",
+                              "用 Agent 自动处理 · 选择 Agent 类型、模型与思考强度",
+                            ),
+                          ),
+                      )
+                      .child(
+                        div()
+                          .id("st-dr-probe-fix-close")
+                          .px(6)
+                          .py(1)
+                          .rounded(4)
+                          .cursor_pointer()
+                          .text_size(12)
+                          .text_color(t.dim)
+                          .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                          .on_click((_e, cx) => this.toggleDroveProbeFixPanel(cx))
+                          .child("×"),
+                      ),
+                  )
+                  .child(
+                    h_flex()
+                      .w_full()
+                      .gap(6)
+                      .items_center()
+                      .flex_wrap()
+                      .child(
+                        this.drovePicker(
+                          t,
+                          "probe-fix-agent",
+                          curOpt ? (curOpt.name || curOpt.id) : this.tr("Select agent…", "选择 Agent…"),
+                          agentItems,
+                          (agent, cx) => this.setDroveProbeFixAgent(agent, cx),
+                          {
+                            width: 148,
+                            popupWidth: 290,
+                            icon: curAgent || undefined,
+                            dot: curOpt ? Boolean(curOpt.installed) : undefined,
+                            dotColor: !curOpt ? undefined : !curOpt.installed ? t.dim : curOpt.probeError ? t.working : t.ansi2,
+                            tooltip: this.tr("Choose which CLI agent to launch", "选择用于自动排查与修复的 Agent 类型"),
+                          },
+                          cx,
+                        ),
+                      )
+                      .child(
+                        this.drovePicker(
+                          t,
+                          "probe-fix-model",
+                          curModel || this.tr("Auto (default)", "自动（默认）"),
+                          modelItems,
+                          (model, cx) => this.setDroveProbeFixModel(model, cx),
+                          {
+                            flex1: true,
+                            width: 150,
+                            popupWidth: 360,
+                            allowCustom: true,
+                            tooltip: isZcode
+                              ? effortDisabledReason
+                              : this.tr("Choose model or type a custom model ID", "选择模型或输入自定义模型 ID"),
+                          },
+                          cx,
+                        ),
+                      )
+                      .child(
+                        h_flex()
+                          .id("st-dr-probe-fix-eff-group")
+                          .w(effortChoices.length >= 5 ? 196 : 164)
+                          .min_w(effortChoices.length >= 5 ? 196 : 164)
+                          .h(28)
+                          .flex_none()
+                          .p(2)
+                          .gap(1)
+                          .items_center()
+                          .rounded(7)
+                          .border_1()
+                          .border_color(t.border)
+                          .bg(t.surface)
+                          .when(disableEffort, (el) => el.opacity(0.35).tooltip(effortDisabledReason))
+                          .when(!disableEffort, (el) =>
+                            el.tooltip(this.tr("Reasoning effort level", "选择模型思考强度")),
+                          )
+                          .children(
+                            effortChoices.map((eff) => {
+                              const effKey = eff ?? "auto";
+                              const active = !disableEffort && (eff === null ? !curEffort : curEffort === eff);
+                              const label = eff === null ? this.tr("Auto", "默认") : this.effortLabel(eff);
+                              return div()
+                                .id(`st-dr-probe-fix-eff-${effKey}`)
+                                .flex_1()
+                                .min_w(0)
+                                .h(22)
+                                .px(3)
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded(5)
+                                .bg(active ? t.accent : "#00000000")
+                                .text_size(11)
+                                .when(active, (el) => el.font_semibold())
+                                .text_color(disableEffort ? t.dim : (active ? t.accent_foreground : t.muted))
+                                .when(!disableEffort, (el) =>
+                                  el
+                                    .cursor_pointer()
+                                    .when(!active, (el2) => el2.hover((s) => s.bg(t.hover).text_color(t.foreground)))
+                                    .on_click((_e, cx) => this.setDroveProbeFixEffort(eff, cx)),
+                                )
+                                .child(label);
+                            }),
+                          ),
+                      ),
+                  )
+                  .child(
+                    h_flex()
+                      .w_full()
+                      .items_center()
+                      .justify_between()
+                      .gap(8)
+                      .flex_wrap()
+                      .child(
+                        div()
+                          .flex_1()
+                          .min_w(0)
+                          .text_size(11)
+                          .line_height("15px")
+                          .text_color(t.dim)
+                          .child(footerHint),
+                      )
+                      .child(
+                        h_flex()
+                          .gap(6)
+                          .items_center()
+                          .child(
+                            this.button(t, "st-dr-probe-fix-cancel", this.tr("Cancel", "取消"), (_e, cx) =>
+                              this.toggleDroveProbeFixPanel(cx),
+                            ),
+                          )
+                          .child(
+                            h_flex()
+                              .id("st-dr-probe-fix-launch")
+                              .px(11)
+                              .py(4)
+                              .gap(5)
+                              .rounded(6)
+                              .border_1()
+                              .border_color(t.accent)
+                              .bg(t.accent)
+                              .items_center()
+                              .text_size(11.5)
+                              .font_semibold()
+                              .text_color(t.accent_foreground)
+                              .when(!canLaunch, (b) => b.opacity(0.55))
+                              .when(canLaunch, (b) =>
+                                b
+                                  .cursor_pointer()
+                                  .hover((s) => s.opacity(0.9))
+                                  .on_click((_e, cx) => this.launchAgentToFixDroveProbeErrors(cx)),
+                              )
+                              .when(this.droveProbeAgentLaunching, (b) =>
+                                b.child(
+                                  svg("mods/workspace-chrome/spinner.svg")
+                                    .size(11)
+                                    .text_color(t.accent_foreground)
+                                    .spin(900),
+                                ),
+                              )
+                              .child(
+                                this.droveProbeAgentLaunching
+                                  ? this.tr("Launching…", "启动中…")
+                                  : this.tr("Start Agent", "启动 Agent 处理"),
+                              ),
+                          ),
+                      ),
+                  ),
+              );
+            })
             .when(Boolean(diagRes), (box) =>
               box.child(
                 v_flex()
@@ -6620,6 +7200,185 @@ export default class Settings extends View {
     }
   }
 
+  cleanCoreVersion(v) {
+    if (!v) return "";
+    return String(v).trim().replace(/^(?:h2|herdr2|hc)\s+/i, "").split(/\s+/)[0] ?? "";
+  }
+
+  updateRemoteMachines(u) {
+    const core = u?.core ?? {};
+    const targetCore = this.cleanCoreVersion(core.ready || core.version || "");
+    const statusList = Array.isArray(u?.machines) ? u.machines : [];
+    const liveList = Array.isArray(this.machineList) ? this.machineList : [];
+    const byName = new Map();
+    for (const m of liveList) {
+      if (m && !m.temporary && m.name) byName.set(m.name, { live: m, status: null });
+    }
+    for (const m of statusList) {
+      if (!m || !m.name) continue;
+      const prev = byName.get(m.name);
+      if (prev) prev.status = m;
+      else byName.set(m.name, { live: null, status: m });
+    }
+    const out = [];
+    for (const { live, status } of byName.values()) {
+      const name = status?.name ?? live?.name ?? "";
+      const target = status?.target ?? live?.target ?? "";
+      const version = this.cleanCoreVersion(status?.version ?? live?.version ?? "");
+      const rawState = String(status?.raw_state ?? live?.state ?? status?.state ?? "unreachable");
+      const why = status?.why ?? live?.why ?? null;
+      const unreachable = Boolean(status?.unreachable ?? (rawState === "unreachable" || rawState === "needs_login"));
+      const outdated = rawState === "needs_update"
+        || Boolean(status?.ready)
+        || (Boolean(targetCore) && (!version || this.olderCore(version, targetCore)));
+      const needsUpdate = Boolean(status?.needs_update || outdated || unreachable);
+      const state = needsUpdate ? "needs_update" : (rawState === "connected" ? "connected" : rawState);
+      const ready = status?.ready || (outdated && targetCore ? targetCore : null);
+      out.push({
+        name,
+        target,
+        version: version || null,
+        state,
+        rawState,
+        why,
+        ready,
+        needsUpdate,
+        unreachable,
+        updating: Boolean(status?.updating),
+        error: status?.error ?? null,
+      });
+    }
+    return out;
+  }
+
+  localWorkspaceSpace() {
+    const all = typeof spaces === "function" ? (spaces() ?? []) : [];
+    const active = all.find((s) => s.active && (s.machine ?? null) === null);
+    if (active) return active;
+    return all.find((s) => (s.machine ?? null) === null) ?? null;
+  }
+
+  buildAiUpdatePrompt(u, extraError = null) {
+    const app = u?.app ?? {};
+    const core = u?.core ?? {};
+    const ui = u?.ui ?? {};
+    const platform = (typeof window === "function" ? window()?.platform : null) || "unknown";
+    const releasesUrl = u?.releases_url || "https://github.com/herdr2/herdr2/releases/download/ota-latest";
+    const remoteMachines = this.updateRemoteMachines(u);
+    const errors = [
+      extraError ? `Manual update/check error: ${extraError}` : null,
+      app.error ? `App update error: ${app.error}` : null,
+      ui.error ? `UI bundle error: ${ui.error}` : null,
+      core.error ? `Core update error: ${core.error}` : null,
+      u?.last_error && u.last_error !== extraError ? `Last check error: ${u.last_error}` : null,
+      ...remoteMachines
+        .filter((m) => m.error || m.unreachable)
+        .map((m) => `Remote ${m.name} (${m.target}) [${m.state}]: ${m.error || m.why || m.rawState}`),
+    ].filter(Boolean);
+
+    const remoteSummaryLines = remoteMachines.map((m) => {
+      const ver = m.version ? fmtVer(m.version) : "unknown";
+      const next = m.ready ? ` -> ${fmtVer(m.ready)}` : "";
+      const note = m.unreachable ? ` (unreachable: ${m.why || m.rawState})` : "";
+      return `- ${m.name} (${m.target}): herdr2-core ${ver}${next} [${m.state}]${note}`;
+    });
+
+    if (this.lang() === "zh-CN") {
+      return [
+        "手动更新 Herdr2 失败或需要通过本机 AI 从 GitHub 获取最新版本，请你协助完成下载与更新：",
+        "",
+        "当前环境信息：",
+        `- 本机平台：${platform}`,
+        `- 本机 Herdr2：${app.version ? fmtVer(app.version) : "未知"}${app.ready ? `（检测到新版本 ${fmtVer(app.ready)}）` : ""}`,
+        `- 本机 herdr2-core：${core.version ? fmtVer(core.version) : "未知"}${core.ready ? `（检测到新版本 ${fmtVer(core.ready)}）` : ""}${core.managed ? `（包管理器托管：${core.managed}）` : ""}`,
+        `- 配置更新源：${releasesUrl}`,
+        "- GitHub 官方发布页：https://github.com/herdr2/herdr2/releases （OTA 滚动标签：ota-latest）",
+        ...(remoteSummaryLines.length > 0 ? ["", "已配置的 SSH 远程主机：", ...remoteSummaryLines] : []),
+        ...(errors.length > 0 ? ["", "失败/异常上下文：", ...errors.map((e) => `- ${e}`)] : []),
+        "",
+        "请按以下步骤安全执行：",
+        "1. 若上方有报错（如网络代理、TLS/证书、权限、GitHub 访问受限等），先排查原因并选择可用方式（如检查环境变量代理、`gh release`、GitHub API 或 `curl`）查询 https://github.com/herdr2/herdr2/releases 上的最新版本与 `ota-latest` 清单（`app-latest.json`、`core-latest.json`）。",
+        "2. 检查本机 `herdr2` 与 `herdr2-core`（`h2`）当前的安装路径与安装方式（如 Linux `.deb` `/opt/herdr2` 或 `~/.local/share/herdr2`、`~/.local/bin/h2`；macOS `Herdr2.app` / Homebrew；Windows `%LOCALAPPDATA%\\Programs\\herdr2` 与 `h2`）。",
+        "3. 从 GitHub Releases 下载与本机系统/架构匹配的最新安装包或二进制并校验 SHA-256，更新本机 `herdr2` 和 `herdr2-core`（注意尽量通过 `h2 update --from <file>` 或 `h2 server restart` 保持现有终端会话存活；如需管理员密码/提权请清晰提示或引导）。",
+        ...(remoteSummaryLines.length > 0
+          ? ["4. 本机 `herdr2-core` 更新完成后，对可达的 SSH 远程主机执行 `h2 machine update <主机名>` 同步更新，并报告不可达主机的 `needs_update` 原因。"]
+          : []),
+        `${remoteSummaryLines.length > 0 ? "5" : "4"}. 最后运行 \`herdr2 --version\`、\`h2 --version\`、\`h2 server status\`${remoteSummaryLines.length > 0 ? " 与 `h2 machine ls`" : ""} 验证更新结果，并说明是否需要重启 Herdr2 桌面窗口。`,
+      ].join("\n");
+    }
+
+    return [
+      "Manual Herdr2 update failed or I want local AI assistance to download and install the latest release from GitHub:",
+      "",
+      "Current environment:",
+      `- Platform: ${platform}`,
+      `- Local Herdr2: ${app.version ? fmtVer(app.version) : "unknown"}${app.ready ? ` (available: ${fmtVer(app.ready)})` : ""}`,
+      `- Local herdr2-core: ${core.version ? fmtVer(core.version) : "unknown"}${core.ready ? ` (available: ${fmtVer(core.ready)})` : ""}${core.managed ? ` (managed by ${core.managed})` : ""}`,
+      `- Configured releases URL: ${releasesUrl}`,
+      "- Official GitHub Releases: https://github.com/herdr2/herdr2/releases (rolling OTA tag: ota-latest)",
+      ...(remoteSummaryLines.length > 0 ? ["", "Configured SSH remote hosts:", ...remoteSummaryLines] : []),
+      ...(errors.length > 0 ? ["", "Failure / error context:", ...errors.map((e) => `- ${e}`)] : []),
+      "",
+      "Please follow these steps:",
+      "1. If there are errors above (proxy, TLS, permissions, GitHub connectivity), diagnose them and fetch the latest release metadata from https://github.com/herdr2/herdr2/releases (including `ota-latest` manifests `app-latest.json` / `core-latest.json`, GitHub API, or `gh release`).",
+      "2. Inspect how `herdr2` and `herdr2-core` (`h2`) are currently installed on this machine (e.g. `/opt/herdr2` `.deb` vs `~/.local/share/herdr2` & `~/.local/bin/h2`, macOS `Herdr2.app`/Homebrew, Windows `%LOCALAPPDATA%\\Programs\\herdr2` & `h2`).",
+      "3. Download the matching OS/architecture release from GitHub, verify SHA-256, and update both local `herdr2` and `herdr2-core` (keep running terminals alive via `h2 update --from <file>` / `h2 server restart`; prompt clearly if elevation/sudo is needed).",
+      ...(remoteSummaryLines.length > 0
+        ? ["4. After local `herdr2-core` is updated, sync reachable SSH remote hosts via `h2 machine update <name>` and report any unreachable `needs_update` hosts."]
+        : []),
+      `${remoteSummaryLines.length > 0 ? "5" : "4"}. Verify with \`herdr2 --version\`, \`h2 --version\`, \`h2 server status\`${remoteSummaryLines.length > 0 ? ", and `h2 machine ls`" : ""}, and let me know if restarting the Herdr2 window is needed.`,
+    ].join("\n");
+  }
+
+  launchAiUpdate(cx, extraError = null) {
+    if (this.aiUpdateLaunching) return;
+    const u = typeof updates === "function" ? updates() : {};
+    this.updateModal = null;
+    this.aiUpdateLaunching = true;
+    cx?.notify?.();
+    cx.spawn(async (spawnCx) => {
+      try {
+        const picked = await this.resolveFixAgentLaunch(null, []);
+        if (!picked) {
+          notify({
+            title: this.tr("No local CLI AI agent found", "未找到本机可用的 AI Agent"),
+            body: this.tr(
+              "Install at least one local CLI agent (e.g. claude, agy, codex, gemini, opencode) to use AI Update.",
+              "请先在本机安装至少一个可用的 CLI AI Agent（如 claude、agy、codex、gemini、opencode）后再使用 AI 更新。",
+            ),
+            level: "error",
+          });
+          return;
+        }
+        const prompt = this.buildAiUpdatePrompt(u, extraError);
+        const tabName = this.tr("AI Update Herdr2", "AI 更新 Herdr2");
+        const localSpace = this.localWorkspaceSpace();
+        if (localSpace) {
+          run("tab.new", { space: localSpace.id, name: tabName, argv: picked.argv, task: prompt });
+        } else {
+          run("space.new", { name: tabName, tab: tabName, argv: picked.argv, task: prompt });
+        }
+        this.close();
+        notify({
+          title: this.tr(`Launched ${picked.name} for AI Update`, `已启动 ${picked.name} 执行 AI 更新`),
+          body: this.tr(
+            "Downloading and updating Herdr2 / herdr2-core from GitHub in a local workspace tab.",
+            "正在本机工作区标签页中从 GitHub 获取并更新最新版本。",
+          ),
+        });
+      } catch (e) {
+        notify({
+          title: this.tr("Failed to start AI Update", "启动 AI 更新失败"),
+          body: String(e?.message ?? e),
+          level: "error",
+        });
+      } finally {
+        this.aiUpdateLaunching = false;
+        spawnCx.notify();
+      }
+    });
+  }
+
   buildUpdateModal(u) {
     const app = u?.app ?? {};
     const ui = u?.ui ?? {};
@@ -6631,13 +7390,26 @@ export default class Settings extends View {
       if (app.ready) fallbackItems.push({ kind: "app", current: app.version, next: app.ready, notes: app.notes });
       else if (ui.ready) fallbackItems.push({ kind: "ui", current: ui.version, next: ui.ready, notes: ui.ready_notes });
       if (core.ready && !core.managed) fallbackItems.push({ kind: "core", current: core.version, next: core.ready, notes: core.notes });
+      for (const m of this.updateRemoteMachines(u)) {
+        if (m.ready || m.rawState === "needs_update") {
+          fallbackItems.push({
+            kind: "remote",
+            machine: m.name,
+            target: m.target,
+            current: m.version,
+            next: m.ready ?? (core.ready || core.version || null),
+            state: m.state,
+            unreachable: m.unreachable,
+          });
+        }
+      }
     }
     const list = items.length > 0 ? items : fallbackItems;
     const nextVersion = avail?.version ?? list[0]?.next ?? null;
-    if (nextVersion) {
+    if (nextVersion || list.length > 0) {
       return {
         kind: "available",
-        version: nextVersion,
+        version: nextVersion ?? (core.ready || core.version || app.version || ""),
         notes: avail?.notes ?? list[0]?.notes ?? null,
         restart: Boolean(avail?.restart ?? Boolean(app.ready)),
         needsElevation: Boolean(avail?.needs_elevation ?? app.needs_elevation),
@@ -6683,8 +7455,15 @@ export default class Settings extends View {
     const lines = [];
     if (m.kind === "available") {
       title = this.tr("Update Available", "发现新版本");
-      badge = `v${String(m.version).replace(/^v/i, "")}`;
+      badge = m.version ? `v${String(m.version).replace(/^v/i, "")}` : null;
       for (const item of m.items ?? []) {
+        if (item.kind === "remote") {
+          const from = item.current ? `${fmtVer(item.current)} → ` : "";
+          const to = item.next ? fmtVer(item.next) : "needs_update";
+          const suffix = item.unreachable ? this.tr(" (unreachable · needs_update)", "（不可达 · needs_update）") : "";
+          lines.push(`${this.tr("Remote", "远程主机")} ${item.machine} (herdr2-core)：${from}${to}${suffix}`);
+          continue;
+        }
         const label = item.kind === "app"
           ? "Herdr2"
           : item.kind === "ui"
@@ -6706,12 +7485,12 @@ export default class Settings extends View {
       lines.push(
         m.restart
           ? this.tr(
-              "Downloading runs in the background; Herdr2 will restart once ready while terminals stay alive.",
-              "点击更新后将在后台下载并在就绪后自动重启切换，现有终端会话不会中断。",
+              "Downloading runs in the background; local Herdr2 / herdr2-core and all SSH remote hosts will sync automatically while terminals stay alive.",
+              "点击更新后将在后台自动更新本机（herdr2 与 herdr2-core）并同步所有 SSH 远程主机的 herdr2-core，就绪后自动重启切换，现有终端会话不会中断。",
             )
           : this.tr(
-              "Applies live in the background without restarting Herdr2 or interrupting terminals.",
-              "点击更新后将在后台自动免重启生效，不会中断现有终端会话。",
+              "Applies live in the background and syncs all SSH remote hosts without restarting Herdr2 or interrupting terminals.",
+              "点击更新后将在后台自动免重启生效，并同步更新所有 SSH 远程主机的 herdr2-core，不会中断现有终端会话。",
             ),
       );
     } else if (m.kind === "error") {
@@ -6743,6 +7522,17 @@ export default class Settings extends View {
       actions
         .child(this.button(t, "st-update-modal-cancel", this.tr("Later", "暂不更新"), closeModal))
         .child(
+          this.button(
+            t,
+            "st-update-modal-ai",
+            this.tr("✨ AI Update", "✨ AI 更新"),
+            (_e, c) => {
+              c.stop_propagation();
+              this.launchAiUpdate(c);
+            },
+          ),
+        )
+        .child(
           div()
             .id("st-update-modal-confirm")
             .px(14)
@@ -6762,6 +7552,27 @@ export default class Settings extends View {
               c.notify();
             })
             .child(this.tr("Update Now", "立即更新")),
+        );
+    } else if (m.kind === "error") {
+      actions
+        .child(this.button(t, "st-update-modal-ok", this.tr("Close", "关闭"), closeModal))
+        .child(
+          div()
+            .id("st-update-modal-ai")
+            .px(14)
+            .py(6)
+            .rounded(7)
+            .cursor_pointer()
+            .bg(t.accent)
+            .text_color(t.accent_foreground)
+            .text_size(13)
+            .font_semibold()
+            .hover((s) => s.opacity(0.9))
+            .on_click((_e, c) => {
+              c.stop_propagation();
+              this.launchAiUpdate(c, m.message);
+            })
+            .child(this.tr("✨ AI Update from GitHub", "✨ AI 从 GitHub 更新")),
         );
     } else {
       actions.child(
@@ -6839,8 +7650,10 @@ export default class Settings extends View {
   updates(t, cx) {
     const u = updates();
     const c = u.core ?? {};
+    const remoteMachines = this.updateRemoteMachines(u);
+    const anyRemoteUpdating = remoteMachines.some((m) => m.updating);
     const busyChecking = Boolean(this.waitingUpdateCheck || u.checking);
-    const busyUpdating = Boolean(u.updating || u.app?.updating || u.ui?.applying || c.updating);
+    const busyUpdating = Boolean(u.updating || u.app?.updating || u.ui?.applying || c.updating || anyRemoteUpdating);
     const verSummary = [
       u.app?.version ? `Herdr2 ${fmtVer(u.app.version)}` : null,
       c.version ? `Core ${fmtVer(c.version)}` : null,
@@ -6899,7 +7712,199 @@ export default class Settings extends View {
             .on_click((_e, c) => this.triggerUpdateCheck(c))
             .child(this.tr("Check for Updates", "检查更新"));
 
-    const updateErr = u.app?.error || u.ui?.error || (!c.managed ? c.error : null);
+    const updateErr = u.app?.error || u.ui?.error || (!c.managed ? c.error : null) || u.last_error;
+
+    const aiUpdateBtn = h_flex()
+      .id("st-ai-update")
+      .px(12)
+      .py(6)
+      .gap(5)
+      .items_center()
+      .rounded(7)
+      .border_1()
+      .border_color(t.border)
+      .bg(t.raised)
+      .text_size(13)
+      .text_color(t.foreground)
+      .tooltip(
+        this.tr(
+          "If manual update fails, launch a local AI coding agent to download and install the latest release from GitHub",
+          "手动更新失败时，调用本机 AI Agent 直接从 GitHub 下载并更新到最新版本",
+        ),
+      )
+      .when(this.aiUpdateLaunching, (el) => el.opacity(0.6))
+      .when(!this.aiUpdateLaunching, (el) =>
+        el
+          .cursor_pointer()
+          .hover((s) => s.bg(t.hover))
+          .on_click((_e, c) => this.launchAiUpdate(c, updateErr)),
+      )
+      .child(
+        this.aiUpdateLaunching
+          ? svg("mods/workspace-chrome/spinner.svg").size(13).flex_none().spin(900)
+          : svg(I("sparkles")).size(13).flex_none().text_color(t.accent),
+      )
+      .child(this.aiUpdateLaunching ? this.tr("Launching AI…", "启动 AI 中…") : this.tr("AI Update", "AI 更新"));
+
+    const headerActions = h_flex()
+      .gap(8)
+      .items_center()
+      .child(aiUpdateBtn)
+      .child(checkBtn);
+
+    const statusBadge = (id, label, color) =>
+      div()
+        .id(id)
+        .px(7)
+        .py(2)
+        .rounded(5)
+        .bg(alpha(color, "1f") ?? t.raised)
+        .border_1()
+        .border_color(alpha(color, "55") ?? t.border)
+        .text_size(11.5)
+        .font_semibold()
+        .text_color(color)
+        .child(label);
+
+    const localNeedsUpdate = Boolean(u.app?.ready || u.ui?.ready || (c.ready && !c.managed));
+    const localUpdating = Boolean(u.app?.updating || u.ui?.applying || c.updating);
+    const localDetailParts = [
+      u.app?.version
+        ? `Herdr2 ${fmtVer(u.app.version)}${u.app.ready ? ` → ${fmtVer(u.app.ready)}` : ""}`
+        : null,
+      c.version
+        ? `herdr2-core ${fmtVer(c.version)}${c.ready && !c.managed ? ` → ${fmtVer(c.ready)}` : ""}${c.managed ? ` (${c.managed})` : ""}`
+        : `herdr2-core ${this.tr("unknown", "版本未知")}`,
+    ].filter(Boolean).join(" · ");
+
+    const localHostRow = h_flex()
+      .id("st-update-host-local")
+      .w_full()
+      .px(12)
+      .py(10)
+      .gap(10)
+      .items_center()
+      .when(remoteMachines.length > 0, (el) => el.border_b(1).border_color(t.border))
+      .child(
+        localUpdating
+          ? svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)
+          : div().w(7).h(7).flex_none().rounded(4).bg(localNeedsUpdate ? t.working : t.ansi2),
+      )
+      .child(
+        v_flex()
+          .flex_1()
+          .min_w(0)
+          .gap(2)
+          .child(div().text_size(13.5).font_semibold().text_color(t.foreground).child(this.tr("This computer", "本机")))
+          .child(div().text_size(12).text_color(t.dim).child(localDetailParts)),
+      )
+      .child(
+        div()
+          .flex_none()
+          .child(
+            localUpdating
+              ? statusBadge("st-update-status-local", this.tr("Updating…", "更新中…"), t.accent)
+              : localNeedsUpdate
+                ? statusBadge("st-update-status-local", "needs_update", t.working)
+                : statusBadge("st-update-status-local", this.tr("Up to date", "最新"), t.ansi2),
+          ),
+      );
+
+    const renderRemoteRow = (m, idx) => {
+      const isLast = idx === remoteMachines.length - 1;
+      const verText = m.version
+        ? `herdr2-core ${fmtVer(m.version)}${m.ready ? ` → ${fmtVer(m.ready)}` : ""}`
+        : `herdr2-core ${this.tr("version unknown", "版本未知")}`;
+      const detailParts = [m.target || null, verText];
+      if (m.unreachable) {
+        detailParts.push(
+          m.rawState === "needs_login"
+            ? this.tr("SSH login required", "需要 SSH 登录认证")
+            : this.tr("unreachable", "不可达"),
+        );
+      }
+      const dotColor = m.needsUpdate ? t.blocked : m.state === "connected" ? t.ansi2 : t.working;
+      const badgeEl = m.updating
+        ? statusBadge(`st-update-status-${m.name}`, this.tr("Updating…", "更新中…"), t.accent)
+        : m.needsUpdate
+          ? statusBadge(`st-update-status-${m.name}`, "needs_update", t.blocked)
+          : m.state === "connected"
+            ? statusBadge(`st-update-status-${m.name}`, this.tr("Up to date", "最新"), t.ansi2)
+            : statusBadge(`st-update-status-${m.name}`, m.state, t.working);
+      const errDetail = m.error || (m.unreachable && m.why ? m.why : null);
+      return v_flex()
+        .id(`st-update-host-${m.name}`)
+        .w_full()
+        .px(12)
+        .py(10)
+        .gap(4)
+        .when(!isLast, (el) => el.border_b(1).border_color(t.border))
+        .child(
+          h_flex()
+            .w_full()
+            .gap(10)
+            .items_center()
+            .child(
+              m.updating
+                ? svg("mods/workspace-chrome/spinner.svg").size(12).flex_none().text_color(t.working).spin(900)
+                : div().w(7).h(7).flex_none().rounded(4).bg(dotColor),
+            )
+            .child(
+              v_flex()
+                .flex_1()
+                .min_w(0)
+                .gap(2)
+                .child(div().text_size(13.5).font_semibold().text_color(t.foreground).child(m.name))
+                .child(div().text_size(12).text_color(t.dim).child(detailParts.filter(Boolean).join(" · "))),
+            )
+            .child(div().flex_none().child(badgeEl)),
+        )
+        .when(Boolean(errDetail), (el) =>
+          el.child(
+            div()
+              .pl(17)
+              .text_size(11.5)
+              .line_height("16px")
+              .text_color(t.blocked)
+              .child(String(errDetail)),
+          ),
+        );
+    };
+
+    const hostsSection = v_flex()
+      .id("st-update-hosts")
+      .w_full()
+      .gap(8)
+      .child(
+        div()
+          .text_size(13.5)
+          .font_semibold()
+          .text_color(t.foreground)
+          .child(this.tr("Hosts & Versions", "本机与远程主机版本")),
+      )
+      .child(
+        v_flex()
+          .w_full()
+          .rounded(8)
+          .border_1()
+          .border_color(t.border)
+          .bg(t.background)
+          .child(localHostRow)
+          .children(remoteMachines.map(renderRemoteRow)),
+      )
+      .when(remoteMachines.length === 0, (el) =>
+        el.child(
+          div()
+            .text_size(12)
+            .text_color(t.dim)
+            .child(
+              this.tr(
+                "No SSH remote hosts configured. Any added SSH hosts will appear here and sync automatically on update.",
+                "暂未配置 SSH 远程主机。添加 SSH 主机后将在此展示版本，并在点击更新时自动同步更新。",
+              ),
+            ),
+        ),
+      );
 
     return v_flex()
       .w_full()
@@ -6910,25 +7915,53 @@ export default class Settings extends View {
           t,
           this.tr("Version", "当前版本"),
           subLine || this.tr("Ready to check for updates.", "点击右侧按钮检查更新。"),
-          checkBtn,
+          headerActions,
         ),
       )
       .when(Boolean(updateErr), (el) =>
         el.child(
-          div()
+          h_flex()
             .id("st-update-error")
-            .px(10)
-            .py(8)
+            .w_full()
+            .px(12)
+            .py(10)
+            .gap(12)
+            .items_center()
             .rounded(7)
             .bg(alpha(t.blocked ?? "#ef4444", "1a") ?? t.raised)
             .border_1()
             .border_color(alpha(t.blocked ?? "#ef4444", "55") ?? t.border)
-            .text_size(12.5)
-            .line_height("18px")
-            .text_color(t.blocked ?? "#ef4444")
-            .child(String(updateErr)),
+            .child(
+              div()
+                .flex_1()
+                .min_w(0)
+                .text_size(12.5)
+                .line_height("18px")
+                .text_color(t.blocked ?? "#ef4444")
+                .child(String(updateErr)),
+            )
+            .child(
+              h_flex()
+                .id("st-ai-update-retry")
+                .flex_none()
+                .px(10)
+                .py(5)
+                .gap(5)
+                .items_center()
+                .rounded(6)
+                .bg(t.accent)
+                .text_color(t.accent_foreground)
+                .text_size(12)
+                .font_semibold()
+                .cursor_pointer()
+                .hover((s) => s.opacity(0.9))
+                .on_click((_e, c) => this.launchAiUpdate(c, updateErr))
+                .child(svg(I("sparkles")).size(12).flex_none())
+                .child(this.tr("AI Update via GitHub", "用 AI 从 GitHub 更新")),
+            ),
         ),
       )
+      .child(hostsSection)
       .child(
         v_flex()
           .gap(8)
@@ -6953,8 +7986,8 @@ export default class Settings extends View {
               .text_color(t.dim)
               .child(
                 this.tr(
-                  "Leave blank to use the built-in GitHub OTA feed. Herdr2 checks automatically every hour and shows an Update button in the top-right corner when a new version is available.",
-                  "留空则使用内置 GitHub 热更源。Herdr2 每小时自动拉取一次更新，发现新版本时会在右上角显示更新按钮。",
+                  "Leave blank to use the built-in GitHub OTA feed. Herdr2 checks automatically every hour and shows an Update button in the top-right corner to sync this computer and all SSH remote hosts together.",
+                  "留空则使用内置 GitHub 热更源。Herdr2 每小时自动检查一次更新，发现新版本或远程主机需同步时会在右上角显示更新按钮，一键同步更新本机与所有 SSH 远程主机。",
                 ),
               ),
           ),
@@ -7042,7 +8075,7 @@ export default class Settings extends View {
               this.machineEdit = null;
               this.handle.focus();
               if (s.id === "keyboard") cx.spawn(async (cx) => { await this.loadKeys(); cx.notify(); });
-              if (s.id === "machines") cx.spawn(async (cx) => { await this.loadMachines(); cx.notify(); });
+              if (s.id === "machines" || s.id === "updates") cx.spawn(async (cx) => { await this.loadMachines(); cx.notify(); });
               if (s.id === "ai") cx.spawn(async (cx) => {
                 if (this.machineList === null) await this.loadMachines();
                 await this.loadAi();

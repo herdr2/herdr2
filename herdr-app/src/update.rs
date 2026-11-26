@@ -191,6 +191,7 @@ pub fn is_updating() -> bool {
     APP_UPDATING.load(Ordering::Relaxed)
         || crate::ui_update::is_applying()
         || CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).updating
+        || MACHINES_UPDATING.load(Ordering::Relaxed)
 }
 
 /// The core the app runs, from its `server.status`, and a newer release waiting.
@@ -205,7 +206,35 @@ pub struct CoreInfo {
     pub error: Option<String>,
 }
 
+/// Status of one configured SSH remote machine's `herdr2-core` for auto-sync updates.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize)]
+pub struct RemoteMachineUpdateInfo {
+    pub name: String,
+    pub target: String,
+    pub version: Option<String>,
+    /// Normalized display status (`needs_update` when unreachable or outdated, else `connected`/`connecting`).
+    pub state: String,
+    /// Raw connection state reported by `h2 machine ls`.
+    pub raw_state: String,
+    pub why: Option<String>,
+    pub ready: Option<String>,
+    pub needs_update: bool,
+    pub unreachable: bool,
+    pub updating: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RemoteSyncSummary {
+    updated: Vec<(String, String)>,
+    failed: Vec<(String, String)>,
+}
+
 static CORE: Mutex<CoreInfo> = Mutex::new(CoreInfo { version: None, managed: None, ready: None, notes: None, updating: false, error: None });
+static MACHINES: Mutex<Vec<RemoteMachineUpdateInfo>> = Mutex::new(Vec::new());
+static MACHINES_UPDATING: AtomicBool = AtomicBool::new(false);
+#[cfg(not(test))]
+static MACHINES_INIT_REFRESH: AtomicBool = AtomicBool::new(false);
 /// When the last check succeeded (unix seconds); a failed check clears it.
 static CHECKED: Mutex<Option<u64>> = Mutex::new(None);
 /// "Check now" wakes the checker early.
@@ -215,12 +244,120 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 static CHECKING: AtomicBool = AtomicBool::new(false);
 
 pub fn core() -> CoreInfo {
-    CORE.lock().unwrap().clone()
+    CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
+pub fn machines() -> Vec<RemoteMachineUpdateInfo> {
+    MACHINES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+}
+
+fn target_core_version() -> Option<String> {
+    let c = core();
+    c.ready.or(c.version)
+}
+
+fn clean_core_version(v: &str) -> &str {
+    strip_core_prefix(v).split_whitespace().next().unwrap_or("")
+}
+
+fn classify_remote_machine(
+    m: &crate::core_bin::RemoteMachine,
+    target_core: Option<&str>,
+    prev: Option<&RemoteMachineUpdateInfo>,
+) -> RemoteMachineUpdateInfo {
+    let raw_state = m.state.clone();
+    let unreachable = matches!(raw_state.as_str(), "unreachable" | "needs_login");
+    let version = m
+        .version
+        .as_deref()
+        .map(clean_core_version)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let target_clean = target_core.map(clean_core_version).filter(|s| !s.is_empty());
+    let outdated = raw_state == "needs_update"
+        || match (version.as_deref(), target_clean) {
+            (Some(cur), Some(tgt)) => newer(tgt, cur),
+            (None, Some(_)) => true,
+            _ => false,
+        };
+    let needs_update = outdated || unreachable;
+    let state = if needs_update {
+        "needs_update".to_owned()
+    } else if raw_state == "connected" {
+        "connected".to_owned()
+    } else {
+        raw_state.clone()
+    };
+    let ready = if outdated { target_clean.map(str::to_owned) } else { None };
+    let updating = prev.is_some_and(|p| p.updating);
+    let error = if needs_update { prev.and_then(|p| p.error.clone()) } else { None };
+    RemoteMachineUpdateInfo {
+        name: m.name.clone(),
+        target: m.target.clone(),
+        version,
+        state,
+        raw_state,
+        why: m.why.clone(),
+        ready,
+        needs_update,
+        unreachable,
+        updating,
+        error,
+    }
+}
+
+fn remote_ready_from(machines: &[RemoteMachineUpdateInfo], target_core: Option<&str>) -> Option<String> {
+    machines
+        .iter()
+        .find(|m| !m.updating && (m.ready.is_some() || m.raw_state == "needs_update"))
+        .and_then(|m| m.ready.clone().or_else(|| target_core.map(str::to_owned)))
+}
+
+pub fn remote_ready() -> Option<String> {
+    let list = machines();
+    let target = target_core_version();
+    remote_ready_from(&list, target.as_deref())
+}
+
+fn has_pending_remote_updates() -> bool {
+    machines().iter().any(|m| !m.updating && (m.ready.is_some() || m.raw_state == "needs_update"))
+}
+
+fn reclassify_machines() {
+    let target = target_core_version();
+    let mut guard = MACHINES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    for m in guard.iter_mut() {
+        let raw = crate::core_bin::RemoteMachine {
+            name: m.name.clone(),
+            target: m.target.clone(),
+            version: m.version.clone(),
+            state: m.raw_state.clone(),
+            why: m.why.clone(),
+            temporary: false,
+        };
+        *m = classify_remote_machine(&raw, target.as_deref(), Some(m));
+    }
+}
+
+pub fn refresh_machines() {
+    let Ok(raw_list) = crate::core_bin::list_machines() else {
+        return;
+    };
+    let target = target_core_version();
+    let mut guard = MACHINES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let prev = std::mem::take(&mut *guard);
+    *guard = raw_list
+        .iter()
+        .map(|m| {
+            let old = prev.iter().find(|p| p.name == m.name);
+            classify_remote_machine(m, target.as_deref(), old)
+        })
+        .collect();
 }
 
 /// What the connected core says about itself (on connect and every reconnect).
 pub fn set_core(version: Option<String>, managed: Option<String>) {
-    let mut c = CORE.lock().unwrap();
+    let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if let (Some(have), Some(ready)) = (&version, &c.ready)
         && !newer(ready, have)
     {
@@ -230,6 +367,15 @@ pub fn set_core(version: Option<String>, managed: Option<String>) {
     c.managed = managed;
     if c.managed.is_some() {
         c.error = None;
+    }
+    drop(c);
+    reclassify_machines();
+    #[cfg(not(test))]
+    if !MACHINES_INIT_REFRESH.swap(true, Ordering::SeqCst) {
+        let _ = std::thread::Builder::new().name("herdr2-machines-init".into()).spawn(|| {
+            refresh_machines();
+            crate::mods::request(crate::mods::Request::Refresh);
+        });
     }
 }
 
@@ -281,10 +427,14 @@ pub fn status() -> serde_json::Value {
     let app_error = APP_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     let ui = crate::ui_update::info();
     let core_info = core();
-    let updating = app_updating || ui.applying || core_info.updating;
+    let machines_snapshot = machines();
+    let machines_updating = MACHINES_UPDATING.load(Ordering::Relaxed) || machines_snapshot.iter().any(|m| m.updating);
+    let updating = app_updating || ui.applying || core_info.updating || machines_updating;
     let core_updates_with_app = app_ready.is_some()
         && install_root.as_deref().is_some_and(has_bundled_core)
         && matches!(core_info.managed.as_deref(), None | Some("system package manager"));
+    let target_core = core_info.ready.clone().or_else(|| core_info.version.clone());
+    let remote_ready_ver = remote_ready_from(&machines_snapshot, target_core.as_deref());
 
     let mut items: Vec<serde_json::Value> = Vec::new();
     if let Some(ver) = &app_ready {
@@ -311,6 +461,20 @@ pub fn status() -> serde_json::Value {
             "notes": core_info.notes,
         }));
     }
+    for m in &machines_snapshot {
+        if m.ready.is_some() || m.raw_state == "needs_update" {
+            items.push(serde_json::json!({
+                "kind": "remote",
+                "machine": m.name,
+                "target": m.target,
+                "current": m.version,
+                "next": m.ready.clone().or_else(|| target_core.clone()),
+                "state": m.state,
+                "raw_state": m.raw_state,
+                "unreachable": m.unreachable,
+            }));
+        }
+    }
     let available = if let Some(ver) = &app_ready {
         Some(serde_json::json!({
             "kind": "app",
@@ -336,6 +500,14 @@ pub fn status() -> serde_json::Value {
             "restart": false,
             "items": items,
         }))
+    } else if let Some(ver) = &remote_ready_ver {
+        Some(serde_json::json!({
+            "kind": "remote",
+            "version": ver,
+            "notes": serde_json::Value::Null,
+            "restart": false,
+            "items": items,
+        }))
     } else {
         None
     };
@@ -353,6 +525,7 @@ pub fn status() -> serde_json::Value {
         },
         "ui": ui,
         "core": core_info,
+        "machines": machines_snapshot,
         "updating": updating,
         "available": available,
         "check_seq": CHECK_SEQ.load(Ordering::Relaxed),
@@ -496,6 +669,9 @@ fn run_one_check() -> bool {
         }
     }
 
+    // 4. Refresh SSH remote machines' versions & update status
+    refresh_machines();
+
     let all_ok = check_cycle_succeeded(app_err.as_deref(), ui_ok, core_err.as_deref());
     let first_err = if all_ok {
         None
@@ -540,6 +716,8 @@ fn check_core_from(base_url: &str) -> Result<(), String> {
         c.ready = None;
         c.notes = None;
     }
+    drop(c);
+    reclassify_machines();
     Ok(())
 }
 
@@ -568,7 +746,172 @@ fn after_update_target<'a>(have: &str, latest: Option<&'a CoreRelease>, generati
     })
 }
 
-/// Upgrades `h2` in the background (keeping running terminals alive).
+fn sync_remote_machines_blocking(force: bool) -> RemoteSyncSummary {
+    refresh_machines();
+    let targets: Vec<String> = {
+        let guard = MACHINES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        guard
+            .iter()
+            .filter(|m| force || m.needs_update)
+            .map(|m| m.name.clone())
+            .collect()
+    };
+    if targets.is_empty() {
+        return RemoteSyncSummary::default();
+    }
+
+    MACHINES_UPDATING.store(true, Ordering::SeqCst);
+    {
+        let mut guard = MACHINES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for m in guard.iter_mut() {
+            if targets.iter().any(|t| t == &m.name) {
+                m.updating = true;
+                m.error = None;
+            }
+        }
+    }
+    crate::mods::request(crate::mods::Request::Refresh);
+
+    let results: Vec<(String, Result<String, String>)> = std::thread::scope(|scope| {
+        let handles: Vec<_> = targets
+            .iter()
+            .map(|name| {
+                let name = name.clone();
+                scope.spawn(move || {
+                    let res = crate::core_bin::update_machine(&name);
+                    {
+                        let mut guard = MACHINES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        if let Some(m) = guard.iter_mut().find(|m| m.name == name) {
+                            m.updating = false;
+                            match &res {
+                                Ok(now) => {
+                                    let ver = clean_core_version(now).to_owned();
+                                    if !ver.is_empty() {
+                                        m.version = Some(ver);
+                                    }
+                                    m.state = "connected".into();
+                                    m.raw_state = "connected".into();
+                                    m.why = None;
+                                    m.ready = None;
+                                    m.needs_update = false;
+                                    m.unreachable = false;
+                                    m.error = None;
+                                }
+                                Err(err) => {
+                                    m.state = "needs_update".into();
+                                    m.needs_update = true;
+                                    m.error = Some(err.clone());
+                                }
+                            }
+                        }
+                    }
+                    crate::mods::request(crate::mods::Request::Refresh);
+                    (name, res)
+                })
+            })
+            .collect();
+        handles.into_iter().filter_map(|h| h.join().ok()).collect()
+    });
+
+    let mut summary = RemoteSyncSummary::default();
+    for (name, res) in results {
+        match res {
+            Ok(now) => {
+                let ver = clean_core_version(&now).to_owned();
+                summary.updated.push((name, ver));
+            }
+            Err(err) => {
+                tracing::warn!("update: remote machine {name} core sync failed: {err}");
+                summary.failed.push((name, err));
+            }
+        }
+    }
+
+    MACHINES_UPDATING.store(false, Ordering::SeqCst);
+    refresh_machines();
+    // Preserve fresh sync errors on failed machines so Settings -> Updates can surface them.
+    if !summary.failed.is_empty() {
+        let mut guard = MACHINES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (name, err) in &summary.failed {
+            if let Some(m) = guard.iter_mut().find(|m| &m.name == name) {
+                m.state = "needs_update".into();
+                m.needs_update = true;
+                m.error = Some(err.clone());
+            }
+        }
+    }
+    crate::mods::request(crate::mods::Request::Refresh);
+    summary
+}
+
+fn format_remote_sync_toast(summary: &RemoteSyncSummary, local: Option<(&str, &str)>) -> Option<(String, String, String)> {
+    let ok_list = summary
+        .updated
+        .iter()
+        .map(|(n, v)| if v.is_empty() { n.clone() } else { format!("{n} (v{v})") })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let fail_list = summary
+        .failed
+        .iter()
+        .map(|(n, e)| format!("{n}: {e}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    if let Some((title, base_body)) = local {
+        let mut parts = vec![base_body.to_owned()];
+        if !ok_list.is_empty() {
+            parts.push(format!("Synced remote: {ok_list}."));
+        }
+        if !fail_list.is_empty() {
+            parts.push(format!("Remote needs_update: {fail_list}."));
+        }
+        let level = if summary.failed.is_empty() { "info" } else { "error" };
+        return Some((title.to_owned(), parts.join(" "), level.to_owned()));
+    }
+
+    if summary.updated.is_empty() && summary.failed.is_empty() {
+        return None;
+    }
+    if summary.failed.is_empty() {
+        Some((
+            "Remote herdr2-core updated".into(),
+            format!("Synced {ok_list}. Running terminals stayed alive."),
+            "info".into(),
+        ))
+    } else if summary.updated.is_empty() {
+        Some((
+            "Remote core sync failed".into(),
+            format!("needs_update: {fail_list}"),
+            "error".into(),
+        ))
+    } else {
+        Some((
+            "Remote core sync partially completed".into(),
+            format!("Synced: {ok_list}. Failed (needs_update): {fail_list}"),
+            "error".into(),
+        ))
+    }
+}
+
+fn emit_remote_sync_toast(summary: &RemoteSyncSummary, local: Option<(&str, &str)>) {
+    if let Some((title, body, level)) = format_remote_sync_toast(summary, local) {
+        crate::mods::request(crate::mods::Request::UpdateToast { title, body, level });
+    }
+}
+
+/// Syncs outdated / needs_update SSH remote machines in the background.
+pub fn update_remotes() {
+    if MACHINES_UPDATING.load(Ordering::Relaxed) {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("herdr2-remote-update".into()).spawn(|| {
+        let summary = sync_remote_machines_blocking(false);
+        emit_remote_sync_toast(&summary, None);
+    });
+}
+
+/// Upgrades local `h2` and all SSH remote machines' `herdr2-core` in the background (keeping running terminals alive).
 pub fn update_core() {
     let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if c.managed.is_some() || c.updating {
@@ -584,17 +927,18 @@ pub fn update_core() {
         c.updating = false;
         match res {
             Ok(now) => {
-                let ver = strip_core_prefix(&now).to_owned();
+                let ver = clean_core_version(&now).to_owned();
                 c.version = Some(ver.clone());
                 c.ready = None;
                 c.notes = None;
                 c.error = None;
                 drop(c);
-                crate::mods::request(crate::mods::Request::UpdateToast {
-                    title: format!("herdr2-core updated to v{ver}"),
-                    body: "Running terminals stayed alive.".into(),
-                    level: "info".into(),
-                });
+                reclassify_machines();
+                let remote_summary = sync_remote_machines_blocking(false);
+                emit_remote_sync_toast(
+                    &remote_summary,
+                    Some((&format!("herdr2-core updated to v{ver}"), "Running terminals stayed alive.")),
+                );
             }
             Err(e) => {
                 c.error = Some(e.clone());
@@ -637,7 +981,8 @@ pub fn start_ui_update() {
 }
 
 /// Unified one-click background updater: downloads, verifies, and applies whichever
-/// update channel (App, UI bundle, or Core) is available, keeping UI responsive with a spinner.
+/// update channel (App, UI bundle, local Core, and all SSH remote Cores) is available,
+/// keeping UI responsive with a spinner.
 pub fn start_update() {
     if is_updating() {
         return;
@@ -668,11 +1013,11 @@ pub fn start_update() {
                 };
                 match stage_res {
                     Ok((_, already_swapped, bundled_core_ver)) => {
+                        let active_in_root = crate::core_bin::path()
+                            .canonicalize()
+                            .ok()
+                            .is_some_and(|p| p.starts_with(&install_root));
                         if let Some(new_core_ver) = bundled_core_ver {
-                            let active_in_root = crate::core_bin::path()
-                                .canonicalize()
-                                .ok()
-                                .is_some_and(|p| p.starts_with(&install_root));
                             if active_in_root {
                                 match crate::core_bin::restart() {
                                     Ok(()) => {
@@ -696,10 +1041,20 @@ pub fn start_update() {
                         if should_update_core {
                             if let Ok(now) = crate::core_bin::update() {
                                 let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                c.version = Some(strip_core_prefix(&now).to_owned());
+                                c.version = Some(clean_core_version(&now).to_owned());
                                 c.ready = None;
                                 c.notes = None;
                                 c.error = None;
+                            }
+                        }
+                        reclassify_machines();
+                        // Sync all SSH remote machines now when local core is already swapped on disk.
+                        // (If local core is bundled inside `install_root` and waiting for post-restart swap,
+                        // `after_update()` will restart the new bundled core and sync all remotes on startup.)
+                        if already_swapped || !active_in_root {
+                            let remote_summary = sync_remote_machines_blocking(false);
+                            if !remote_summary.failed.is_empty() {
+                                emit_remote_sync_toast(&remote_summary, None);
                             }
                         }
                         if already_swapped {
@@ -722,15 +1077,26 @@ pub fn start_update() {
             return;
         }
     }
-    // 2. UI bundle hot-update
+    // 2. UI bundle hot-update (also sync local core / SSH remotes if waiting)
     if crate::ui_update::ready().is_some() {
         start_ui_update();
+        let c = core();
+        if c.managed.is_none() && c.ready.is_some() {
+            update_core();
+        } else if has_pending_remote_updates() {
+            update_remotes();
+        }
         return;
     }
-    // 3. Core update
+    // 3. Local Core update (automatically syncs all SSH remotes afterward)
     let c = core();
     if c.managed.is_none() && c.ready.is_some() {
         update_core();
+        return;
+    }
+    // 4. Remote-only SSH core sync
+    if has_pending_remote_updates() {
+        update_remotes();
     }
 }
 
@@ -1626,7 +1992,7 @@ fn marker() -> PathBuf {
     crate::mods::app_dir().join(".updated")
 }
 
-/// Runs once after an app binary swap: brings `h2` core up to date in the same generation.
+/// Runs once after an app binary swap: brings local `h2` core and all SSH remote machines up to date.
 pub fn after_update(connected: std::sync::Arc<crate::hc::Core>) {
     let mark = marker();
     if !mark.is_file() {
@@ -1638,34 +2004,65 @@ pub fn after_update(connected: std::sync::Arc<crate::hc::Core>) {
     }
     let _ = std::thread::Builder::new().name("herdr2-after-update".into()).spawn(move || {
         let status = connected.call("server.status", serde_json::json!({})).map_err(|e| format!("{e:#}"));
-        if after_update_managed(status) {
-            return;
-        }
-        let have = core().version.unwrap_or_default();
-        let latest = releases().and_then(|base| latest_core_from(&base).ok());
-        let Some(target) = after_update_target(&have, latest.as_ref(), crate::hc::GENERATION, crate::hc::core_min()) else {
-            return;
-        };
-        let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if c.updating {
-            return;
-        }
-        c.updating = true;
-        c.error = None;
-        drop(c);
-        let res = crate::core_bin::update_to(Some(target));
-        let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        c.updating = false;
-        match res {
-            Ok(now) => {
-                c.version = Some(strip_core_prefix(&now).to_owned());
-                c.ready = None;
-                c.error = None;
+        let managed = after_update_managed(status);
+
+        // If a bundled `herdr2-core` inside the install folder was just swapped on disk,
+        // restart the local daemon so it runs the new version before syncing remotes.
+        let active_in_root = root().is_some_and(|r| {
+            crate::core_bin::path()
+                .canonicalize()
+                .ok()
+                .is_some_and(|p| p.starts_with(&r))
+        });
+        if active_in_root
+            && let Some(disk_ver) = crate::core_bin::version(&crate::core_bin::path())
+        {
+            let disk_clean = clean_core_version(&disk_ver).to_owned();
+            let running = core().version.unwrap_or_default();
+            if !disk_clean.is_empty() && newer(&disk_clean, &running) {
+                match crate::core_bin::restart() {
+                    Ok(()) => {
+                        let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        c.version = Some(disk_clean);
+                        c.ready = None;
+                        c.error = None;
+                    }
+                    Err(e) => {
+                        tracing::warn!("update: post-swap bundled core restart failed: {e}");
+                    }
+                }
             }
-            Err(e) => {
-                c.error = Some(e);
+        }
+
+        if !managed {
+            let have = core().version.unwrap_or_default();
+            let latest = releases().and_then(|base| latest_core_from(&base).ok());
+            if let Some(target) = after_update_target(&have, latest.as_ref(), crate::hc::GENERATION, crate::hc::core_min()) {
+                let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                if !c.updating {
+                    c.updating = true;
+                    c.error = None;
+                    drop(c);
+                    let res = crate::core_bin::update_to(Some(target));
+                    let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    c.updating = false;
+                    match res {
+                        Ok(now) => {
+                            c.version = Some(clean_core_version(&now).to_owned());
+                            c.ready = None;
+                            c.error = None;
+                        }
+                        Err(e) => {
+                            c.error = Some(e);
+                        }
+                    }
+                }
             }
         }
+
+        reclassify_machines();
+        let remote_summary = sync_remote_machines_blocking(false);
+        emit_remote_sync_toast(&remote_summary, None);
     });
 }
 
@@ -2236,5 +2633,75 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join("herdr2.svg")).unwrap(), "new-svg");
 
         let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn classify_remote_machine_marks_outdated_and_unreachable_as_needs_update() {
+        let mk = |name: &str, version: Option<&str>, state: &str, why: Option<&str>| crate::core_bin::RemoteMachine {
+            name: name.into(),
+            target: format!("dev@{name}"),
+            version: version.map(str::to_owned),
+            state: state.into(),
+            why: why.map(str::to_owned),
+            temporary: false,
+        };
+
+        // 1. Connected & current -> connected, not needs_update
+        let current = classify_remote_machine(&mk("box-ok", Some("2.0.15"), "connected", None), Some("2.0.15"), None);
+        assert_eq!(current.state, "connected");
+        assert!(!current.needs_update);
+        assert!(!current.unreachable);
+        assert_eq!(current.ready, None);
+
+        // 2. Connected & older -> needs_update with ready target
+        let outdated = classify_remote_machine(&mk("box-old", Some("2.0.12"), "connected", None), Some("2.0.15"), None);
+        assert_eq!(outdated.state, "needs_update");
+        assert!(outdated.needs_update);
+        assert!(!outdated.unreachable);
+        assert_eq!(outdated.ready.as_deref(), Some("2.0.15"));
+
+        // 3. Unreachable -> annotated as needs_update even if last seen version matches
+        let offline = classify_remote_machine(
+            &mk("box-down", Some("2.0.15"), "unreachable", Some("ssh timed out")),
+            Some("2.0.15"),
+            None,
+        );
+        assert_eq!(offline.state, "needs_update");
+        assert_eq!(offline.raw_state, "unreachable");
+        assert!(offline.needs_update);
+        assert!(offline.unreachable);
+        assert_eq!(offline.ready, None);
+        assert_eq!(offline.why.as_deref(), Some("ssh timed out"));
+
+        // 4. Unreachable & older -> needs_update + ready target
+        let offline_old = classify_remote_machine(&mk("box-down-old", Some("2.0.10"), "needs_login", None), Some("2.0.15"), None);
+        assert_eq!(offline_old.state, "needs_update");
+        assert!(offline_old.needs_update);
+        assert!(offline_old.unreachable);
+        assert_eq!(offline_old.ready.as_deref(), Some("2.0.15"));
+
+        // 5. Protocol mismatch (`needs_update`) -> needs_update
+        let mismatch = classify_remote_machine(&mk("box-proto", Some("2.0.15"), "needs_update", None), Some("2.0.15"), None);
+        assert_eq!(mismatch.state, "needs_update");
+        assert!(mismatch.needs_update);
+        assert_eq!(mismatch.ready.as_deref(), Some("2.0.15"));
+
+        // remote_ready_from triggers when an outdated or protocol-mismatched remote exists, not on current unreachable-only
+        assert_eq!(remote_ready_from(&[current.clone(), offline.clone()], Some("2.0.15")), None);
+        assert_eq!(remote_ready_from(&[current, outdated.clone()], Some("2.0.15")).as_deref(), Some("2.0.15"));
+
+        // Toast formatting summarizes both local + remote sync results cleanly.
+        let summary = RemoteSyncSummary {
+            updated: vec![("box-old".into(), "2.0.15".into())],
+            failed: vec![("box-down".into(), "ssh timed out".into())],
+        };
+        let (title, body, level) = format_remote_sync_toast(
+            &summary,
+            Some(("herdr2-core updated to v2.0.15", "Running terminals stayed alive.")),
+        )
+        .unwrap();
+        assert_eq!(title, "herdr2-core updated to v2.0.15");
+        assert!(body.contains("box-old (v2.0.15)") && body.contains("box-down: ssh timed out"), "{body}");
+        assert_eq!(level, "error");
     }
 }

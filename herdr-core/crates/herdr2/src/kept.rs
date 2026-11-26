@@ -290,56 +290,64 @@ impl Core {
                         inject_mcp,
                         mcp_exe,
                         socket: core.paths.socket.display().to_string(),
+                        handshake_timeout: None,
                     };
 
                     match acp::spawn_session(spec).await {
                         Ok(started) => {
-                            let mut st = core.lock();
-                            st.recovering.remove(&id);
-                            if !st.reg.agents.get(&id).is_some_and(Agent::is_live)
-                                || st.stopping
-                                || st.killing.contains(&id)
-                            {
-                                started.transport.kill();
-                                return;
+                            let cleared_preset = {
+                                let mut st = core.lock();
+                                st.recovering.remove(&id);
+                                if !st.reg.agents.get(&id).is_some_and(Agent::is_live)
+                                    || st.stopping
+                                    || st.killing.contains(&id)
+                                {
+                                    started.transport.kill();
+                                    return;
+                                }
+                                let agent_info = started.agent_info.clone();
+                                let acp_sid = started.session_id.clone();
+                                let can_load = started.can_load_session;
+                                let prompt_caps = started.prompt_capabilities;
+                                let config_options = started.config_options.clone();
+                                let available_commands = started.available_commands.clone();
+                                let context_usage = started.context_usage;
+                                let handle = acp::spawn_actor(core.clone(), id, started);
+                                let pid = handle.transport.pid();
+                                st.sessions.insert(id, handle);
+                                let preset = st.reg.agents.get(&id).and_then(|a| a.agent.clone());
+                                if let Some(a) = st.reg.agents.get_mut(&id) {
+                                    a.pid = pid;
+                                    a.acp_session_id = Some(acp_sid);
+                                    a.can_load_session = can_load;
+                                    a.prompt_capabilities = Some(prompt_caps);
+                                    a.config_options = config_options;
+                                    if !available_commands.is_empty() {
+                                        a.available_commands = available_commands;
+                                    }
+                                    if let Some(usage) = context_usage {
+                                        a.context_usage = Some(usage);
+                                    }
+                                    acp::sync_config_to_agent(a);
+                                    if agent_info.is_some() {
+                                        a.agent_info = agent_info;
+                                    }
+                                    a.reason = None;
+                                    a.pending_permission = None;
+                                    a.program_started_ms = Some(now_ms());
+                                    a.reported = true;
+                                }
+                                core.apply_status(&mut st, id, &StatusReport::root("idle"));
+                                let public = serde_json::to_value(crate::agents::Public(st.reg.agents[&id].clone()))
+                                    .unwrap_or_default();
+                                core.emit(&mut st, "restarted", id, public);
+                                core.save(&st);
+                                core.changed.notify_waiters();
+                                preset
+                            };
+                            if let Some(ref preset) = cleared_preset {
+                                core.drove.clear_probe_error_for_agent(preset);
                             }
-                            let agent_info = started.agent_info.clone();
-                            let acp_sid = started.session_id.clone();
-                            let can_load = started.can_load_session;
-                            let prompt_caps = started.prompt_capabilities;
-                            let config_options = started.config_options.clone();
-                            let available_commands = started.available_commands.clone();
-                            let context_usage = started.context_usage;
-                            let handle = acp::spawn_actor(core.clone(), id, started);
-                            let pid = handle.transport.pid();
-                            st.sessions.insert(id, handle);
-                            if let Some(a) = st.reg.agents.get_mut(&id) {
-                                a.pid = pid;
-                                a.acp_session_id = Some(acp_sid);
-                                a.can_load_session = can_load;
-                                a.prompt_capabilities = Some(prompt_caps);
-                                a.config_options = config_options;
-                                if !available_commands.is_empty() {
-                                    a.available_commands = available_commands;
-                                }
-                                if let Some(usage) = context_usage {
-                                    a.context_usage = Some(usage);
-                                }
-                                acp::sync_config_to_agent(a);
-                                if agent_info.is_some() {
-                                    a.agent_info = agent_info;
-                                }
-                                a.reason = None;
-                                a.pending_permission = None;
-                                a.program_started_ms = Some(now_ms());
-                                a.reported = true;
-                            }
-                            core.apply_status(&mut st, id, &StatusReport::root("idle"));
-                            let public = serde_json::to_value(crate::agents::Public(st.reg.agents[&id].clone()))
-                                .unwrap_or_default();
-                            core.emit(&mut st, "restarted", id, public);
-                            core.save(&st);
-                            core.changed.notify_waiters();
                         }
                         Err(err) => {
                             let _ =

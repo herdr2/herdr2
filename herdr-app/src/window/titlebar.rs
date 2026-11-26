@@ -88,7 +88,7 @@ impl AppWindow {
             !cfg!(target_os = "macos") && matches!(window.window_decorations(), Decorations::Client { .. })
         };
         let skip_ai_gate = std::env::var("HERDR2_SKIP_AI_GATE").ok().as_deref() == Some("1");
-        json!({
+        let mut info = json!({
             "platform": platform,
             "titlebar": if self.titlebar() == Titlebar::Layout { "none" } else { "system" },
             "buttons": buttons,
@@ -96,7 +96,11 @@ impl AppWindow {
             "fullscreen": window.is_fullscreen(),
             "active": self.window_active,
             "skip_ai_gate": skip_ai_gate,
-        })
+        });
+        if cfg!(windows) {
+            info["shells"] = json!(installed_windows_shells_cached(false));
+        }
+        info
     }
 
     /// Makes a node move the window when dragged and maximize it on a double-click.

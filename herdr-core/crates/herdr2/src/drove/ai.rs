@@ -1737,7 +1737,7 @@ pub async fn diagnose_probe_errors_with_ai(
         "You are an expert troubleshooting assistant for Herdr2 Drove ACP agent probing.\n\
          Important Herdr2 architecture context:\n\
          - In Herdr2 workspaces, CLI agents launch inside an interactive login shell (loading ~/.zshrc / ~/.bashrc, proxy vars, NVM/PATH) using interactive TUI CLIs (`claude`, `codex`, `cursor-agent`, `agy`, etc.).\n\
-         - Drove agent probing runs directly inside the headless `herdr2 serve` daemon using `program_env()` (which does NOT source interactive shell rc files), invoking headless ACP adapters (`claude-agent-acp`, `codex-acp`, `cursor-agent acp`, `zcode-acp-server`, `agy models`) with a 60s handshake timeout (`initialize` + `session/new`, 6 concurrent probes).\n\
+         - Drove agent probing runs directly inside the headless `herdr2 serve` daemon using `program_env()` (which does NOT source interactive shell rc files), invoking headless ACP adapters (`claude-agent-acp`, `codex-acp`, `cursor-agent acp`, `zcode-acp-server`, `agy models`) with a 45s handshake timeout and 1 automatic low-concurrency retry on timeout (`initialize` + `session/new`, 4 concurrent probes).\n\
          - If `remoteSnapshot` is true, the errors happened on remote machine `targetMachine`; infer its environment from the reported `path`/`command`/`error` rather than assuming a local OS.\n\
          - Common root causes:\n\
            1) `env_proxy`: daemon lacks proxy/API env vars set only in ~/.zshrc or ~/.bashrc -> timeouts or network errors even though workspace CLI works.\n\

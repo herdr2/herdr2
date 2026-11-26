@@ -920,13 +920,18 @@ export default class Tabs extends View {
       const ui = updateState.ui ?? {};
       const app = updateState.app ?? {};
       const core = updateState.core ?? {};
+      const machines = Array.isArray(updateState.machines) ? updateState.machines : [];
+      const remoteUpdating = machines.some((m) => m?.updating);
+      const remotePending = machines.filter((m) => m && (m.ready || m.raw_state === "needs_update"));
       const avail = updateState.available ?? null;
-      const busy = Boolean(updateState.updating || app.updating || ui.applying || core.updating);
-      const hasUpdate = Boolean(avail || app.ready || ui.ready || (core.ready && !core.managed));
+      const busy = Boolean(updateState.updating || app.updating || ui.applying || core.updating || remoteUpdating);
+      const hasUpdate = Boolean(avail || app.ready || ui.ready || (core.ready && !core.managed) || remotePending.length > 0);
       if (!busy && !hasUpdate) return null;
       const accent = t.accent ?? "#3b82f6";
       if (busy) {
-        const busyTip = tr("Updating in background…", "正在后台更新中…");
+        const busyTip = remoteUpdating
+          ? tr("Syncing local and SSH remote updates…", "正在后台同步更新本机与远程主机…")
+          : tr("Updating in background…", "正在后台更新中…");
         return h_flex()
           .id("top-update-btn")
           .size(26)
@@ -941,21 +946,37 @@ export default class Tabs extends View {
           .tooltip(busyTip)
           .child(svg("mods/workspace-chrome/spinner.svg").size(14).flex_none().spin(900));
       }
-      const nextVer = avail?.version ?? app.ready ?? ui.ready ?? core.ready ?? "";
+      const nextVer = avail?.version ?? app.ready ?? ui.ready ?? core.ready ?? remotePending[0]?.ready ?? core.version ?? "";
+      const hasRemotes = machines.length > 0;
       const tip = app.ready
-        ? tr(
-            `Herdr2 v${nextVer} is available. Click to download and update in background.`,
-            `发现新版本 v${nextVer}，点击后后台自动更新。`,
-          )
+        ? (hasRemotes
+            ? tr(
+                `Herdr2 v${nextVer} is available. Click to update this computer and all SSH remote hosts in background.`,
+                `发现新版本 v${nextVer}，点击后后台自动同步更新本机与所有 SSH 远程主机。`,
+              )
+            : tr(
+                `Herdr2 v${nextVer} is available. Click to download and update in background.`,
+                `发现新版本 v${nextVer}，点击后后台自动更新。`,
+              ))
         : ui.ready
           ? tr(
               `UI hot-update v${nextVer} is available. Click to update live without restarting.`,
               `发现 UI 热更新 v${nextVer}，点击后后台自动免重启更新。`,
             )
-          : tr(
-              `h2 Core v${nextVer} is available. Click to update in background.`,
-              `发现 Core 更新 v${nextVer}，点击后后台自动更新。`,
-            );
+          : (core.ready && !core.managed)
+            ? (hasRemotes
+                ? tr(
+                    `h2 Core v${nextVer} is available. Click to update local and all SSH remote hosts in background.`,
+                    `发现 Core 更新 v${nextVer}，点击后后台自动同步更新本机与所有 SSH 远程主机。`,
+                  )
+                : tr(
+                    `h2 Core v${nextVer} is available. Click to update in background.`,
+                    `发现 Core 更新 v${nextVer}，点击后后台自动更新。`,
+                  ))
+            : tr(
+                `${remotePending.length} SSH remote host(s) need herdr2-core update${nextVer ? ` (v${nextVer})` : ""}. Click to sync in background.`,
+                `检测到 ${remotePending.length} 台 SSH 远程主机需要更新 herdr2-core${nextVer ? `（v${nextVer}）` : ""}，点击后后台自动同步更新。`,
+              );
       return h_flex()
         .id("top-update-btn")
         .h(26)

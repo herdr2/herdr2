@@ -1422,10 +1422,26 @@ fn settings_sections_and_updates(cx: &mut TestAppContext) {
     }
     let mut p = props();
     p["section"] = json!("updates");
-    let up = describe(cx, &staged, "frame/settings", true, p, updates("ready", "ready"), None).unwrap();
+    let mut up_state = updates("ready", "ready");
+    up_state["last_error"] = json!("curl: (7) Failed to connect");
+    up_state["machines"] = json!([
+        {"name":"linux-ok","target":"dev@10.0.0.1","version":"0.1.6","state":"connected","raw_state":"connected","why":null,"ready":null,"needs_update":false,"unreachable":false,"updating":false,"error":null},
+        {"name":"linux-down","target":"dev@10.0.0.2","version":"0.1.4","state":"needs_update","raw_state":"unreachable","why":"ssh timed out","ready":"0.1.6","needs_update":true,"unreachable":true,"updating":false,"error":null}
+    ]);
+    let up = describe(cx, &staged, "frame/settings", true, p, up_state, None).unwrap();
     assert!(
-        up.contains("st-check-updates") && up.contains("st-releases-url") && !up.contains("st-ui-mode-auto") && !up.contains("st-gh-releases-url"),
-        "updates section should render only simplified check button and URL input: {up}"
+        up.contains("st-check-updates")
+            && up.contains("st-ai-update")
+            && up.contains("st-ai-update-retry")
+            && up.contains("st-releases-url")
+            && up.contains("st-update-hosts")
+            && up.contains("st-update-host-local")
+            && up.contains("st-update-host-linux-ok")
+            && up.contains("st-update-host-linux-down")
+            && up.contains("needs_update")
+            && !up.contains("st-ui-mode-auto")
+            && !up.contains("st-gh-releases-url"),
+        "updates section should render check button, AI update buttons, URL input, and local/remote host versions with needs_update: {up}"
     );
     let mut p = props();
     p["section"] = json!("privacy");
@@ -2675,9 +2691,9 @@ fn split_pane_names_merged_tabs_and_windows_shells(cx: &mut TestAppContext) {
     assert!(tabs_tree.contains("tab-merged-tab1"), "merged tab badge element missing: {tabs_tree}");
     assert!(tabs_tree.contains("◫ 2"), "merged tab badge label missing: {tabs_tree}");
 
-    // 4. New Menu omits dangerously-skip-permissions toggle and shows Windows shell choices on Windows.
+    // 4. New Menu omits dangerously-skip-permissions toggle and shows only installed Windows shells on Windows.
     let mut nm_values = fixture(true, json!({}), updates("current", "current"));
-    nm_values.insert("window".into(), json!({"platform":"windows","titlebar":"none","buttons":true,"maximized":false,"fullscreen":false,"active":true}));
+    nm_values.insert("window".into(), json!({"platform":"windows","titlebar":"none","buttons":true,"maximized":false,"fullscreen":false,"active":true,"shells":["powershell","pwsh","git-bash","cmd"]}));
     let nm_calls = Rc::new(RefCell::new(Calls::default()));
     nm_calls.borrow_mut().shared.insert("new-menu.agent-mode".into(), json!("acp"));
     let nm_policy = Policy::new()
@@ -2704,7 +2720,7 @@ fn split_pane_names_merged_tabs_and_windows_shells(cx: &mut TestAppContext) {
     assert!(!nm_tree.contains("dangerously-skip-permissions"), "dangerously-skip-permissions should be hidden: {nm_tree}");
     assert!(!nm_tree.contains("nm-shell-wsl"), "WSL shell option should be removed on Windows: {nm_tree}");
     assert!(!nm_tree.contains("WSL"), "WSL label should be removed on Windows: {nm_tree}");
-    for expected in ["nm-win-shells", "nm-shell-powershell", "nm-shell-git-bash", "PowerShell", "Git Bash", "CMD"] {
+    for expected in ["nm-win-shells", "nm-shell-powershell", "nm-shell-pwsh", "nm-shell-git-bash", "nm-shell-cmd", "PowerShell", "PowerShell 7", "Git Bash", "CMD"] {
         assert!(nm_tree.contains(expected), "Windows shell picker in new-menu missing {expected}: {nm_tree}");
     }
     assert!(
@@ -2717,6 +2733,23 @@ fn split_pane_names_merged_tabs_and_windows_shells(cx: &mut TestAppContext) {
         "ACP launch should dispatch tab.new with acp: true so workspace jumps to the new tab: {:?}",
         nm_calls.borrow().effects
     );
+
+    // 4a. New Menu filters Windows shell chips to only those installed on the local machine.
+    let mut nm_subset_values = fixture(true, json!({}), updates("current", "current"));
+    nm_subset_values.insert("window".into(), json!({"platform":"windows","titlebar":"none","buttons":true,"maximized":false,"fullscreen":false,"active":true,"shells":["powershell","cmd"]}));
+    nm_subset_values.insert("settings".into(), json!({"shell":"pwsh"}));
+    let nm_subset_tree = describe_with_values(cx, &staged, "mods/new-menu", nm_subset_values, None).unwrap();
+    for expected in ["nm-win-shells", "nm-shell-powershell", "nm-shell-cmd", "PowerShell", "CMD"] {
+        assert!(nm_subset_tree.contains(expected), "Installed Windows shells missing {expected}: {nm_subset_tree}");
+    }
+    for hidden in ["nm-shell-pwsh", "PowerShell 7", "nm-shell-git-bash", "Git Bash"] {
+        assert!(!nm_subset_tree.contains(hidden), "Uninstalled Windows shell {hidden} should be hidden: {nm_subset_tree}");
+    }
+
+    let mut nm_empty_shells_values = fixture(true, json!({}), updates("current", "current"));
+    nm_empty_shells_values.insert("window".into(), json!({"platform":"windows","titlebar":"none","buttons":true,"maximized":false,"fullscreen":false,"active":true,"shells":[]}));
+    let nm_empty_shells_tree = describe_with_values(cx, &staged, "mods/new-menu", nm_empty_shells_values, None).unwrap();
+    assert!(!nm_empty_shells_tree.contains("nm-win-shells"), "Empty installed Windows shells list should hide chip row: {nm_empty_shells_tree}");
 
     // 4b. Antigravity (`agy`) is enabled in ACP mode and launches `agent: "agy"`.
     let agy_calls = Rc::new(RefCell::new(Calls::default()));
@@ -2834,6 +2867,43 @@ fn split_pane_names_merged_tabs_and_windows_shells(cx: &mut TestAppContext) {
     assert!(probe_err_tree.contains("st-dr-probe-ai-result"), "AI diagnosis card should render: {probe_err_tree}");
     assert!(probe_err_tree.contains("st-dr-probe-ai-item-cursor"), "Per-agent AI diagnosis item should render: {probe_err_tree}");
     assert!(probe_err_tree.contains("st-dr-probe-ai-run-cursor"), "Run in Terminal button should render for safe commandArgv: {probe_err_tree}");
+    let probe_fix_tree = describe(
+        cx,
+        &staged,
+        "frame/settings",
+        true,
+        json!({ "section": "drove" }),
+        updates("current", "current"),
+        Some("this.droveProbeFixOpen = true; this.droveProbeFixAgent = 'codex'; this.droveProbeFixModel = 'gpt-5.4'; this.droveProbeFixEffort = 'xhigh'; this.droveData = { config: { roles: { coder: { label: 'Coder', access: 'writable', primary: { agent: 'claude', model: 'opus', effort: 'high' }, fallbacks: [] } }, ai: { enabled: true } }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'claude', installed: true, models: ['claude-opus-4-6'] }, { id: 'codex', installed: true, models: ['gpt-5.4'] }, { id: 'cursor', installed: true, models: [], error: 'ACP probe timed out after 60s' }] } };"),
+    )
+    .unwrap();
+    assert!(probe_fix_tree.contains("st-dr-probe-fix-panel"), "Fix-with-Agent selector panel should render when open: {probe_fix_tree}");
+    assert!(probe_fix_tree.contains("st-drp-probe-fix-agent"), "Fix panel should render agent type picker: {probe_fix_tree}");
+    assert!(probe_fix_tree.contains("st-drp-probe-fix-model"), "Fix panel should render model picker: {probe_fix_tree}");
+    assert!(probe_fix_tree.contains("st-dr-probe-fix-eff-group"), "Fix panel should render reasoning effort group: {probe_fix_tree}");
+    assert!(probe_fix_tree.contains("st-dr-probe-fix-eff-auto"), "Fix panel should render Auto effort pill: {probe_fix_tree}");
+    assert!(probe_fix_tree.contains("st-dr-probe-fix-eff-xhigh"), "4-level model (gpt-5.4) should render xhigh effort pill: {probe_fix_tree}");
+    assert!(probe_fix_tree.contains("st-dr-probe-fix-launch"), "Fix panel should render Start Agent button: {probe_fix_tree}");
+    let probe_fix_embedded_tree = describe(
+        cx,
+        &staged,
+        "frame/settings",
+        true,
+        json!({ "section": "drove" }),
+        updates("current", "current"),
+        Some("this.droveProbeFixOpen = true; this.droveProbeFixAgent = 'agy'; this.droveProbeFixModel = 'gemini-4-carbon-high'; this.droveProbeFixEffort = 'high'; this.droveData = { config: { roles: { coder: { label: 'Coder', access: 'writable', primary: { agent: 'claude', model: 'opus', effort: 'high' }, fallbacks: [] } }, ai: { enabled: true } }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'agy', installed: true, models: ['gemini-4-carbon-high'] }, { id: 'cursor', installed: true, models: [], error: 'ACP probe timed out after 60s' }] } };"),
+    )
+    .unwrap();
+    let fix_eff_group = probe_fix_embedded_tree
+        .lines()
+        .find(|l| l.contains("st-dr-probe-fix-eff-group"))
+        .unwrap();
+    assert!(fix_eff_group.contains("0.35"), "Embedded-effort model should dim fix panel effort group: {fix_eff_group}");
+    let fix_eff_high = probe_fix_embedded_tree
+        .lines()
+        .find(|l| l.contains("st-dr-probe-fix-eff-high"))
+        .unwrap();
+    assert!(!fix_eff_high.contains("on_click"), "Embedded-effort model should disable clicking effort pills: {fix_eff_high}");
     assert!(aligned_tree.contains("st-dr-eff-reviewer-0-high"), "3-level model (claude-sonnet-4-5) should show High effort: {aligned_tree}");
     assert!(!aligned_tree.contains("st-dr-eff-reviewer-0-xhigh"), "3-level model (claude-sonnet-4-5) must NOT show xhigh effort: {aligned_tree}");
     assert!(aligned_tree.contains("st-dr-eff-reviewer-1-xhigh"), "4-level model (gpt-5.4) should show xhigh effort: {aligned_tree}");

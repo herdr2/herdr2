@@ -182,14 +182,20 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         inject_mcp,
         mcp_exe,
         socket: core.paths.socket.display().to_string(),
+        handshake_timeout: None,
     };
+    let clear_probe_agent = resolved.preset.clone();
 
     if async_mode {
         let core_bg = core.core.clone();
         let caller_bg = caller.clone();
+        let clear_probe_agent_bg = clear_probe_agent.clone();
         tokio::spawn(async move {
             match acp::spawn_session(spec).await {
                 Ok(started) => {
+                    if let Some(ref preset) = clear_probe_agent_bg {
+                        core_bg.drove.clear_probe_error_for_agent(preset);
+                    }
                     {
                         let mut st = core_bg.lock();
                         st.recovering.remove(&id);
@@ -285,7 +291,12 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
     }
 
     let started = match acp::spawn_session(spec).await {
-        Ok(started) => started,
+        Ok(started) => {
+            if let Some(ref preset) = clear_probe_agent {
+                core.drove.clear_probe_error_for_agent(preset);
+            }
+            started
+        }
         Err(err) => {
             let mut st = core.lock();
             st.recovering.remove(&id);
@@ -608,10 +619,14 @@ pub(crate) async fn spawn_drove_agent(core: &Arc<Core>, req: DroveSpawnSpec) -> 
         inject_mcp: false,
         mcp_exe,
         socket: core.paths.socket.display().to_string(),
+        handshake_timeout: None,
     };
 
     let started = match acp::spawn_session(spec).await {
-        Ok(started) => started,
+        Ok(started) => {
+            core.drove.clear_probe_error_for_agent(&req.agent);
+            started
+        }
         Err(err) => {
             let mut st = core.lock();
             st.recovering.remove(&id);

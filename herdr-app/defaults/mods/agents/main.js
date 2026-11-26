@@ -2083,7 +2083,7 @@ export default class Agents extends View {
       const more = detail.get(a.address);
       const rowTerm = all.find((x) => x.address === a.address);
       const isSideChat = String(rowTerm?.lineage?.kind || "").toLowerCase().replace("_", "-") === "side-chat";
-      // An agent on another machine (`vps/t7`) says which.
+      // Device name for rows not nested under a device section header (priority / pinned).
       const machine = machineOf(a, spaceById);
       if (collapsed) {
         return h_flex()
@@ -2422,7 +2422,6 @@ export default class Agents extends View {
               .child(machine ?? tr("Local", "本机")),
           ),
         )
-        .when(!full && Boolean(machine), el => el.child(div().flex_none().text_size(10).text_color(t.dim).child(machine)))
         .when(subs.length > 0, el => el.child(fold(a, subs, isFloating)))
         .when(showHoverActions, el => el.child(pin).child(remove))
         .when(!showHoverActions, el =>

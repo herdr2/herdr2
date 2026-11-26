@@ -343,6 +343,8 @@ export function window(): {
   maximized: boolean;
   fullscreen: boolean;
   active: boolean;
+  /** Installed local shell IDs on Windows (e.g. "powershell", "pwsh", "git-bash", "cmd"). */
+  shells?: string[];
 };
 
 /** Sets the OS window's title, which window switchers, taskbars and time trackers read. The last
@@ -392,6 +394,9 @@ export function updates(): {
   app: { version: string; ready: string | null; updates: boolean; needs_elevation?: boolean };
   ui?: { version: string; app_version: string; ready: string | null; ready_notes: string | null; applying: boolean; mode: string; error: string | null; last_applied_at: number | null; active_override: boolean };
   core: { version: string | null; managed: string | null; ready: string | null; updating: boolean; error: string | null };
+  machines?: { name: string; target: string; version: string | null; state: string; raw_state: string; why: string | null; ready: string | null; needs_update: boolean; unreachable: boolean; updating: boolean; error: string | null }[];
+  updating?: boolean;
+  available?: { kind: string; version: string; notes: string | null; restart: boolean; needs_elevation?: boolean; items?: Record<string, unknown>[] } | null;
   checked: number | null;
   checks: boolean;
   checking: boolean;

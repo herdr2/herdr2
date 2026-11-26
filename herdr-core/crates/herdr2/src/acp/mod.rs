@@ -99,6 +99,9 @@ pub struct SpawnSpec {
     pub inject_mcp: bool,
     pub mcp_exe: String,
     pub socket: String,
+    /// Optional total deadline for `initialize` + `session/new` (or `session/load`).
+    /// When `None`, each handshake RPC uses the default `HANDSHAKE_TIMEOUT` (90s).
+    pub handshake_timeout: Option<Duration>,
 }
 
 pub struct StartedSession {
@@ -701,8 +704,20 @@ async fn setup_session(
     spec: &SpawnSpec,
     inbound_rx: &mut mpsc::UnboundedReceiver<Inbound>,
 ) -> Result<SetupOk, RpcError> {
+    let deadline = spec.handshake_timeout.map(|d| std::time::Instant::now() + d);
+    let step_timeout = |context: &str| -> Result<Duration, RpcError> {
+        let Some(end) = deadline else {
+            return Ok(HANDSHAKE_TIMEOUT);
+        };
+        match end.checked_duration_since(std::time::Instant::now()) {
+            Some(rem) if !rem.is_zero() => Ok(rem),
+            _ => Err(CallError::Timeout.into_rpc_error(context, &transport.recent_stderr())),
+        }
+    };
+
+    let init_timeout = step_timeout("ACP initialize failed")?;
     let raw_init = transport
-        .request("initialize", &InitializeParams::herdr2(), HANDSHAKE_TIMEOUT)
+        .request("initialize", &InitializeParams::herdr2(), init_timeout)
         .await
         .map_err(|e| e.into_rpc_error("ACP initialize failed", &transport.recent_stderr()))?;
     let init: InitializeResult = serde_json::from_value(raw_init).unwrap_or_default();
@@ -742,6 +757,7 @@ async fn setup_session(
             inject_mcp: base.inject_mcp,
             mcp_exe: base.mcp_exe.clone(),
             socket: base.socket.clone(),
+            handshake_timeout: base.handshake_timeout,
         };
         if let Some(ctx) = base.fallback_handoff_context.as_deref().filter(|s| !s.trim().is_empty()) {
             merged.system_prompt = Some(match merged.system_prompt.take() {
@@ -755,7 +771,8 @@ async fn setup_session(
     let (session_id, mut config_options, mut available_commands, context_usage, resumed_session) =
         match (spec.resume_session_id.as_deref(), can_load_session) {
             (Some(prev_id), true) => {
-                match load_session(transport, prev_id, spec, server.as_ref()).await {
+                let load_timeout = step_timeout("ACP session/load failed")?;
+                match load_session(transport, prev_id, spec, server.as_ref(), load_timeout).await {
                     Ok((mut opts, mut cmds)) => {
                         let mut usage = None;
                         // Drain historical session/update notifications replayed by session/load
@@ -776,14 +793,17 @@ async fn setup_session(
                     }
                     Err(_) => {
                         let fallback_spec = new_with_fallback(spec);
-                        let (sid, opts, cmds) = new_session(transport, &fallback_spec, server.as_ref()).await?;
+                        let new_timeout = step_timeout("ACP session/new failed")?;
+                        let (sid, opts, cmds) =
+                            new_session(transport, &fallback_spec, server.as_ref(), new_timeout).await?;
                         (sid, opts, cmds, None, false)
                     }
                 }
             }
             _ => {
                 let fallback_spec = new_with_fallback(spec);
-                let (sid, opts, cmds) = new_session(transport, &fallback_spec, server.as_ref()).await?;
+                let new_timeout = step_timeout("ACP session/new failed")?;
+                let (sid, opts, cmds) = new_session(transport, &fallback_spec, server.as_ref(), new_timeout).await?;
                 (sid, opts, cmds, None, false)
             }
         };
@@ -935,13 +955,14 @@ async fn new_session(
     transport: &Transport,
     spec: &SpawnSpec,
     mcp: Option<&StdioMcpServer>,
+    timeout: Duration,
 ) -> Result<(String, Vec<AcpConfigOption>, Vec<AcpAvailableCommand>), RpcError> {
     let meta = build_session_meta(spec, true);
 
     for tagged in [true, false] {
         let mcp_servers = mcp.map(|m| m.to_value(tagged)).into_iter().collect();
         let params = SessionNewParams { cwd: spec.cwd.clone(), mcp_servers, meta: meta.clone() };
-        match transport.request("session/new", &params, HANDSHAKE_TIMEOUT).await {
+        match transport.request("session/new", &params, timeout).await {
             Ok(val) => {
                 let config_options = parse_session_config(&val);
                 let available_commands = parse_available_commands(&val);
@@ -961,13 +982,14 @@ async fn load_session(
     session_id: &str,
     spec: &SpawnSpec,
     mcp: Option<&StdioMcpServer>,
+    timeout: Duration,
 ) -> Result<(Vec<AcpConfigOption>, Vec<AcpAvailableCommand>), CallError> {
     let meta = build_session_meta(spec, false);
     for tagged in [true, false] {
         let mcp_servers = mcp.map(|m| m.to_value(tagged)).into_iter().collect();
         let params =
             SessionLoadParams { session_id: session_id.into(), cwd: spec.cwd.clone(), mcp_servers, meta: meta.clone() };
-        match transport.request("session/load", &params, HANDSHAKE_TIMEOUT).await {
+        match transport.request("session/load", &params, timeout).await {
             Ok(val) => return Ok((parse_session_config(&val), parse_available_commands(&val))),
             Err(e) if tagged && e.is_invalid_params() && mcp.is_some() => continue,
             Err(e) => return Err(e),
@@ -1397,6 +1419,7 @@ pub async fn rollback_acp_agent(
         inject_mcp,
         mcp_exe,
         socket: core.paths.socket.display().to_string(),
+        handshake_timeout: None,
     };
     let started = spawn_session(spec).await?;
 

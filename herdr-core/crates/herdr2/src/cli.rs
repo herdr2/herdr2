@@ -1145,6 +1145,9 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
         }
         Cmd::Server { action: ServerCmd::Stop } => stop(&paths)?,
         Cmd::Update { from: None, version, force } => {
+            let dest = std::env::current_exe()
+                .and_then(|e| e.canonicalize())
+                .map_err(|e| RpcError::internal(e.to_string()))?;
             let this = format!("h2 {}", env!("CARGO_PKG_VERSION"));
             if let Some(v) = &version
                 && !force
@@ -1152,7 +1155,9 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
                 && !crate::platform::needs_bundle_update()
             {
                 let human = format!("{this} is already {v} or newer");
-                return Ok(Some(up_to_date(&paths, v, human)?));
+                let mut out = up_to_date(&paths, v, human)?;
+                attach_machine_sync(&paths, &dest, &mut out, force);
+                return Ok(Some(out));
             }
             let scratch = crate::releases::Scratch::new()?;
             let requested = version
@@ -1171,7 +1176,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
                     "update the apps that use h2 first, then h2 update --force",
                 ));
             }
-            if version.is_none()
+            let mut out = if version.is_none()
                 && !force
                 && !older(&this, &format!("h2 {}", m.version))
                 && !crate::platform::needs_bundle_update()
@@ -1188,9 +1193,18 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
                 let mut out = update(&paths, &file, force)?;
                 out.json["release"] = m.version.into();
                 out
-            }
+            };
+            attach_machine_sync(&paths, &dest, &mut out, force);
+            out
         }
-        Cmd::Update { from: Some(from), force, .. } => update(&paths, &from, force)?,
+        Cmd::Update { from: Some(from), force, .. } => {
+            let dest = std::env::current_exe()
+                .and_then(|e| e.canonicalize())
+                .map_err(|e| RpcError::internal(e.to_string()))?;
+            let mut out = update(&paths, &from, force)?;
+            attach_machine_sync(&paths, &dest, &mut out, force);
+            out
+        }
         Cmd::Machine { action } => machine(&paths, action, call)?,
         Cmd::File { action } => match file(action, asked, call)? {
             Some(out) => out,

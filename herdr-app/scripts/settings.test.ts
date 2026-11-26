@@ -960,3 +960,241 @@ test("launchAgentToFixDroveProbeErrors and runProbeFixCommandInTerminal target t
   expect(closed).toBe(2);
   expect(toasts.length).toBe(2);
 });
+
+test("updateRemoteMachines merges live machine list and update status, marking unreachable or outdated as needs_update", () => {
+  const view = new Settings();
+  view.machineList = [
+    { name: "linux-ok", target: "dev@10.0.0.1", version: "2.0.15", state: "connected", temporary: false },
+    { name: "linux-old", target: "dev@10.0.0.2", version: "2.0.12", state: "connected", temporary: false },
+    { name: "linux-down", target: "dev@10.0.0.3", version: "2.0.15", state: "unreachable", why: "ssh timed out", temporary: false },
+    { name: "ephemeral", target: "dev@10.0.0.9", version: "2.0.10", state: "connected", temporary: true },
+  ];
+
+  const rows = view.updateRemoteMachines({
+    core: { version: "2.0.15", ready: null },
+    machines: [
+      {
+        name: "linux-old",
+        target: "dev@10.0.0.2",
+        version: "2.0.12",
+        state: "needs_update",
+        raw_state: "connected",
+        ready: "2.0.15",
+        needs_update: true,
+        unreachable: false,
+        updating: true,
+        error: null,
+      },
+    ],
+  });
+
+  expect(rows.map((r: any) => r.name)).toEqual(["linux-ok", "linux-old", "linux-down"]);
+  expect(rows[0]).toMatchObject({ name: "linux-ok", version: "2.0.15", state: "connected", needsUpdate: false, unreachable: false });
+  expect(rows[1]).toMatchObject({ name: "linux-old", version: "2.0.12", state: "needs_update", ready: "2.0.15", needsUpdate: true, updating: true });
+  expect(rows[2]).toMatchObject({ name: "linux-down", version: "2.0.15", state: "needs_update", rawState: "unreachable", needsUpdate: true, unreachable: true, why: "ssh timed out" });
+
+  // Remote-only update opens available modal listing the outdated SSH remote host.
+  const modal = view.buildUpdateModal({
+    app: { version: "2.0.15", ready: null },
+    ui: { version: "2.0.15", ready: null },
+    core: { version: "2.0.15", ready: null },
+    available: null,
+  });
+  expect(modal.kind).toBe("available");
+  expect(modal.restart).toBe(false);
+  expect(modal.items).toEqual([
+    expect.objectContaining({ kind: "remote", machine: "linux-old", current: "2.0.12", next: "2.0.15", state: "needs_update" }),
+  ]);
+});
+
+test("launchAiUpdate invokes a local CLI AI agent with GitHub release and failure context", async () => {
+  const ran: Array<{ cmd: string; args: any }> = [];
+  const toasts: any[] = [];
+  let closed = 0;
+  let currentSpaces: any[] = [
+    { id: "sp-remote", machine: "linux-box", active: true },
+    { id: "sp-local", machine: null, active: false },
+  ];
+  const currentUpdates: any = {
+    app: { version: "2.0.12", ready: "2.0.13", error: "curl: (7) Failed to connect" },
+    core: { version: "2.0.12", ready: "2.0.13", error: null, managed: null },
+    machines: [
+      {
+        name: "linux-box",
+        target: "dev@10.0.0.5",
+        version: "2.0.11",
+        state: "needs_update",
+        raw_state: "unreachable",
+        why: "ssh timed out",
+        ready: "2.0.13",
+        needs_update: true,
+        unreachable: true,
+      },
+    ],
+    releases_url: "https://github.com/herdr2/herdr2/releases/download/ota-latest",
+    last_error: "curl: (7) Failed to connect",
+  };
+  let agentList: any[] = [
+    { key: "claude", name: "Claude Code", installed: true, run: ["claude", "--dangerously-skip-permissions"] },
+  ];
+  const customValues = {
+    ...values,
+    spaces: () => currentSpaces,
+    updates: () => currentUpdates,
+    window: () => ({ platform: "linux" }),
+    knownAgents: async () => agentList,
+    run: (cmd: string, args: any) => { ran.push({ cmd, args }); },
+    notify: (n: any) => { toasts.push(n); },
+  };
+  const customArgs = names.map((name) => customValues[name] ?? (() => undefined));
+  const CustomSettings = new Function(
+    ...names,
+    source
+      .replace(/^import\s+[\s\S]*?from\s+["'][^"']+["'];?\s*\n?/gm, "")
+      .replace("export default class Settings", "return class Settings"),
+  )(...customArgs);
+
+  const view = new CustomSettings();
+  view.person = { language: "zh-CN" };
+  view.close = () => { closed++; };
+
+  let task: Promise<void> | null = null;
+  const cx = { notify() {}, spawn(fn: (c: any) => Promise<void>) { task = fn(cx); } };
+  view.launchAiUpdate(cx, "curl: (7) Failed to connect");
+  await task;
+
+  expect(ran.length).toBe(1);
+  expect(ran[0].cmd).toBe("tab.new");
+  expect(ran[0].args.space).toBe("sp-local");
+  expect(ran[0].args.argv).toEqual(["claude", "--dangerously-skip-permissions"]);
+  expect(ran[0].args.task).toContain("https://github.com/herdr2/herdr2/releases");
+  expect(ran[0].args.task).toContain("curl: (7) Failed to connect");
+  expect(ran[0].args.task).toContain("linux-box");
+  expect(ran[0].args.task).toContain("h2 machine update");
+  expect(closed).toBe(1);
+  expect(view.aiUpdateLaunching).toBe(false);
+
+  // When no local space exists, opens a new local space.
+  currentSpaces = [{ id: "sp-remote", machine: "linux-box", active: true }];
+  view.launchAiUpdate(cx);
+  await task;
+  expect(ran[1].cmd).toBe("space.new");
+  expect(ran[1].args.machine).toBeUndefined();
+
+  // When no local CLI agent is installed, notifies with a helpful error and does not close settings.
+  agentList = [];
+  const prevClosed = closed;
+  view.launchAiUpdate(cx);
+  await task;
+  expect(closed).toBe(prevClosed);
+  expect(toasts.at(-1)?.level).toBe("error");
+});
+
+test("drove probe fix panel lets user select agent type, model, and effort and launches with chosen options", async () => {
+  const ran: Array<{ cmd: string; args: any }> = [];
+  const toasts: any[] = [];
+  let closed = 0;
+  const knownCalls: any[] = [];
+  const currentSpaces: any[] = [
+    { id: "sp-local", machine: null, active: true },
+    { id: "sp-wsl", machine: "ubuntu-wsl", active: false },
+  ];
+  const customValues = {
+    ...values,
+    run: (cmd: string, args: any) => { ran.push({ cmd, args }); },
+    notify: (n: any) => { toasts.push(n); },
+    spaces: () => currentSpaces,
+    knownAgents: async (opts: any) => {
+      knownCalls.push(opts);
+      return [
+        { key: "claude", name: "Claude Code", installed: true, run: ["claude", "--dangerously-skip-permissions"] },
+        { key: "codex", name: "Codex", installed: true, run: ["codex", "--no-daemon", "--dangerously-bypass-approvals-and-sandbox"] },
+        { key: "antigravity", name: "Antigravity", installed: true, run: ["agy", "--dangerously-skip-permissions"] },
+        { key: "cursor", name: "Cursor", installed: true, run: ["agent", "--yolo", "--trust"] },
+      ];
+    },
+  };
+  const customArgs = names.map((name) => customValues[name] ?? (() => undefined));
+  const CustomSettings = new Function(
+    ...names,
+    source
+      .replace(/^import\s+[\s\S]*?from\s+["'][^"']+["'];?\s*\n?/gm, "")
+      .replace("export default class Settings", "return class Settings"),
+  )(...customArgs);
+
+  const view = new CustomSettings();
+  view.person = { language: "zh-CN" };
+  view.close = () => { closed++; };
+  view.droveMachine = "ubuntu-wsl";
+  view.droveData = {
+    agents: {
+      fullProbe: true,
+      agents: [
+        { id: "claude", installed: true, models: ["claude-opus-4-6", "claude-sonnet-4-5"], error: null },
+        { id: "codex", installed: true, models: ["gpt-5.4"], error: null },
+        { id: "agy", installed: true, models: ["gemini-4-carbon-high", "gemini-4-neon"], error: null },
+        { id: "cursor", installed: true, models: ["gpt-5.4", "grok-4.7-high"], error: "ACP probe timed out after 60s" },
+      ],
+    },
+  };
+
+  let task: Promise<void> | null = null;
+  const cx = { notify() {}, spawn(fn: (c: any) => Promise<void>) { task = fn(cx); } };
+
+  // Opening the fix panel loads knownAgents for the target machine and deduplicates aliases (antigravity -> agy).
+  view.toggleDroveProbeFixPanel(cx);
+  await task;
+  expect(view.droveProbeFixOpen).toBe(true);
+  expect(knownCalls[0]).toEqual({ on: "ubuntu-wsl" });
+  const opts = view.droveFixAgentOptions();
+  expect(opts.filter((o: any) => o.id === "agy").length).toBe(1);
+  expect(opts.find((o: any) => o.id === "agy")?.name).toBe("Antigravity");
+  expect(opts.find((o: any) => o.id === "cursor")?.argv).toEqual(["cursor-agent", "--yolo", "--trust"]);
+  expect(view.droveProbeFixAgent).toBe("claude");
+
+  // Selecting codex + gpt-5.4 + xhigh launches codex with model and effort passed to tab.new.
+  view.setDroveProbeFixAgent("codex", cx);
+  view.setDroveProbeFixModel("gpt-5.4", cx);
+  view.setDroveProbeFixEffort("xhigh", cx);
+  view.launchAgentToFixDroveProbeErrors(cx);
+  await task;
+  expect(ran[0].cmd).toBe("tab.new");
+  expect(ran[0].args.space).toBe("sp-wsl");
+  expect(ran[0].args.argv).toEqual(["codex", "--no-daemon", "--dangerously-bypass-approvals-and-sandbox"]);
+  expect(ran[0].args.model).toBe("gpt-5.4");
+  expect(ran[0].args.effort).toBe("xhigh");
+  expect(view.droveProbeFixOpen).toBe(false);
+  expect(closed).toBe(1);
+  expect(toasts[0].title).toContain("Codex");
+  expect(toasts[0].title).toContain("gpt-5.4");
+
+  // Switching to claude-sonnet-4-5 clamps xhigh down to high.
+  view.setDroveProbeFixAgent("claude", cx);
+  view.setDroveProbeFixEffort("xhigh", cx);
+  expect(view.droveProbeFixEffort).toBe("xhigh");
+  view.setDroveProbeFixModel("claude-sonnet-4-5", cx);
+  expect(view.droveProbeFixEffort).toBe("high");
+
+  // Embedded-effort agy model disables separate effort flag and omits effort from tab.new args.
+  view.setDroveProbeFixAgent("antigravity", cx);
+  expect(view.droveProbeFixAgent).toBe("agy");
+  view.setDroveProbeFixModel("gemini-4-carbon-high", cx);
+  expect(view.droveFixEffortDisabledReason("agy", "gemini-4-carbon-high")).toBeTruthy();
+  view.launchAgentToFixDroveProbeErrors(cx);
+  await task;
+  expect(ran[1].args.argv).toEqual(["agy", "--dangerously-skip-permissions"]);
+  expect(ran[1].args.model).toBe("gemini-4-carbon-high");
+  expect(ran[1].args.effort).toBeUndefined();
+
+  // Cursor with base model passes normalized cursor-agent argv + model + effort; without model disables effort.
+  view.setDroveProbeFixAgent("cursor", cx);
+  expect(view.droveFixEffortDisabledReason("cursor", null)).toBeTruthy();
+  view.setDroveProbeFixModel("gpt-5.4", cx);
+  expect(view.droveFixEffortDisabledReason("cursor", "gpt-5.4")).toBeNull();
+  view.setDroveProbeFixEffort("medium", cx);
+  view.launchAgentToFixDroveProbeErrors(cx);
+  await task;
+  expect(ran[2].args.argv).toEqual(["cursor-agent", "--yolo", "--trust"]);
+  expect(ran[2].args.model).toBe("gpt-5.4");
+  expect(ran[2].args.effort).toBe("medium");
+});

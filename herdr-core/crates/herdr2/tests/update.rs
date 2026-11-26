@@ -169,3 +169,77 @@ fn update_from_a_file_swaps_h2_and_keeps_kept_agents_running() {
         "no leftovers"
     );
 }
+
+#[test]
+fn update_automatically_syncs_ssh_remotes_and_marks_unreachable_needs_update() {
+    let remote = Session::new();
+    let mut local = Session::new();
+    let dir = local.root.join("bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(BIN, dir.join("herdr2")).unwrap();
+    std::os::unix::fs::symlink("herdr2", dir.join("h2")).unwrap();
+    local.bin = dir.join("h2");
+
+    local.env.push(fake_ssh(&local, &[("linuxbox", &remote)]));
+    let added = local.json(&["machine", "add", "dev@linuxbox"]);
+    assert_eq!(added["name"], "linuxbox");
+
+    // Add an older unreachable remote in machines.json alongside the connected linuxbox.
+    let machines_path = local.root.join("state/herdr2/test/machines.json");
+    let mut saved: Vec<Value> = serde_json::from_slice(&std::fs::read(&machines_path).unwrap()).unwrap();
+    saved.push(json!({
+        "name": "offlinebox",
+        "target": "dev@offlinebox",
+        "via": false,
+        "temporary": false,
+        "session": null,
+        "id": "offline-core-id",
+        "host": "offlinebox",
+        "version": "0.0.1"
+    }));
+    std::fs::write(&machines_path, serde_json::to_vec_pretty(&saved).unwrap()).unwrap();
+    local.h2(&["server", "restart"]);
+    wait_until("linuxbox reconnects", || {
+        local.json(&["machine", "ls"])["machines"]
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|m| m["name"] == "linuxbox" && m["state"] == "connected"))
+    });
+
+    // When H2_UPDATE_NO_MACHINES=1 is set, h2 update skips remote sync cleanly.
+    let skipped_out = local
+        .cmd()
+        .env("H2_UPDATE_NO_MACHINES", "1")
+        .args(["--json", "update", "--from", BIN])
+        .output()
+        .unwrap();
+    assert!(skipped_out.status.success(), "{}", String::from_utf8_lossy(&skipped_out.stderr));
+    let skipped_json: Value = serde_json::from_slice(&skipped_out.stdout).unwrap();
+    assert!(skipped_json.get("machines").is_none(), "expected no remote sync when skipped: {skipped_json}");
+
+    // Without --force: already-current connected linuxbox is kept as-is while outdated unreachable offlinebox is marked needs_update.
+    let out = local.cmd().args(["--json", "update", "--from", BIN]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let synced: Value = serde_json::from_slice(&out.stdout).unwrap();
+    let machines = synced["machines"].as_array().expect("machines sync report");
+    let ok_box = machines.iter().find(|m| m["name"] == "linuxbox").expect("linuxbox entry");
+    assert_eq!(ok_box["ok"], true, "{synced}");
+    assert_eq!(ok_box["updated"], false, "{synced}");
+    assert!(matches!(ok_box["state"].as_str(), Some("connected" | "connecting")), "{synced}");
+    let bad_box = machines.iter().find(|m| m["name"] == "offlinebox").expect("offlinebox entry");
+    assert_eq!(bad_box["ok"], false, "{synced}");
+    assert_eq!(bad_box["state"], "needs_update", "{synced}");
+
+    // With --force: reachable linuxbox is pushed the new binary over SSH while offlinebox still reports needs_update without aborting.
+    let forced_out = local.cmd().args(["--json", "update", "--from", BIN, "--force"]).output().unwrap();
+    assert!(forced_out.status.success(), "{}", String::from_utf8_lossy(&forced_out.stderr));
+    let forced: Value = serde_json::from_slice(&forced_out.stdout).unwrap();
+    let f_machines = forced["machines"].as_array().expect("forced machines sync report");
+    let f_ok = f_machines.iter().find(|m| m["name"] == "linuxbox").expect("linuxbox entry");
+    assert_eq!(f_ok["ok"], true, "{forced}");
+    assert_eq!(f_ok["updated"], true, "{forced}");
+    assert_eq!(f_ok["state"], "connected", "{forced}");
+    let f_bad = f_machines.iter().find(|m| m["name"] == "offlinebox").expect("offlinebox entry");
+    assert_eq!(f_bad["ok"], false, "{forced}");
+    assert_eq!(f_bad["state"], "needs_update", "{forced}");
+    assert!(remote.root.join(".local/bin/herdr2").is_file(), "remote binary was synced");
+}
