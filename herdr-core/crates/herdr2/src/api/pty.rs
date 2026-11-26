@@ -545,6 +545,9 @@ async fn start_pty(
             env.entry("COLORFGBG".into()).or_insert_with(|| if dark { "15;0".into() } else { "0;15".into() });
         }
         let mut argv = p.argv;
+        if cfg!(windows) {
+            inject_windows_cmd_prompt_osc(&argv, &mut env);
+        }
         let prep = crate::pty_adapters::prepare_pty_launch(core, id, &mut argv, &mut env);
         let initial_saved_cli =
             crate::pty_adapters::extract_saved_cli_from_argv(&argv, None, prep.session_id.clone(), None);
@@ -613,6 +616,27 @@ async fn start_pty(
             Err(RpcError::new("spawn_failed", error, "check the program name and cwd"))
         }
     }
+}
+
+/// Ensures interactive Windows `cmd.exe` terminals emit OSC 9;9 (`$E]9;9;$P$E\`)
+/// before every prompt so Herdr tracks `cd` changes immediately even if PEB reads lag or fail.
+fn inject_windows_cmd_prompt_osc(argv: &[String], env: &mut BTreeMap<String, String>) {
+    let Some(program) = argv.first() else { return };
+    let base = program.rsplit(['/', '\\']).next().unwrap_or(program).to_ascii_lowercase();
+    if base != "cmd" && base != "cmd.exe" {
+        return;
+    }
+    if argv.iter().skip(1).any(|a| a.eq_ignore_ascii_case("/c")) {
+        return;
+    }
+    let existing_key = env.keys().find(|k| k.eq_ignore_ascii_case("PROMPT")).cloned();
+    let existing_val = existing_key.as_ref().and_then(|k| env.get(k)).cloned();
+    if existing_val.as_deref().is_some_and(|v| v.contains("]9;9;") || v.contains("]7;")) {
+        return;
+    }
+    let base_prompt = existing_val.filter(|v| !v.is_empty()).unwrap_or_else(|| "$P$G".into());
+    let key = existing_key.unwrap_or_else(|| "PROMPT".into());
+    env.insert(key, format!("$E]9;9;$P$E\\{base_prompt}"));
 }
 
 /// Per-program runtime fields, shared by initial PTY runs and replacement shells.

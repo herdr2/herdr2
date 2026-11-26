@@ -57,12 +57,11 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
 
     let is_claude = presets::is_claude_agent(resolved.preset.as_deref(), &resolved.argv);
     let default_claude_skip = is_claude && mode.is_none() && explicit_permissions.is_none();
-    let mode = mode
-        .map(|m| acp::normalize_mode_value(&m, is_claude, &[]))
-        .or_else(|| default_claude_skip.then(|| "bypassPermissions".to_string()));
+    let explicit_mode = mode.map(|m| acp::normalize_mode_value(&m, is_claude, &[]));
+    let mode = explicit_mode.clone().or_else(|| default_claude_skip.then(|| "bypassPermissions".to_string()));
     let skip_perms = p.dangerously_skip_permissions
         || default_claude_skip
-        || mode.as_deref().is_some_and(crate::permissions::is_bypass_mode_id);
+        || explicit_mode.as_deref().is_some_and(crate::permissions::is_bypass_mode_id);
     if skip_perms {
         presets::ensure_agy_skip_permissions(&mut resolved.argv);
     }
@@ -155,7 +154,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         (id, address, env, created)
     };
 
-    let spec_skip = p.dangerously_skip_permissions && mode.is_none();
+    let spec_skip = (p.dangerously_skip_permissions || default_claude_skip) && explicit_mode.is_none();
     let mcp_exe = crate::client::exe_path().map(|exe| exe.display().to_string()).unwrap_or_else(|| "herdr2".into());
     let mut config_overrides = BTreeMap::new();
     let is_agy = presets::is_agy_agent(resolved.preset.as_deref(), &resolved.argv);
@@ -177,7 +176,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         system_prompt,
         fallback_handoff_context: None,
         model,
-        mode,
+        mode: explicit_mode,
         dangerously_skip_permissions: spec_skip,
         config_overrides,
         inject_mcp,

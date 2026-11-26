@@ -979,15 +979,32 @@ fn batch_line(script: &Path, args: &[String]) -> io::Result<String> {
     Ok(format!("cmd.exe /e:ON /v:OFF /d /c {}", batch_tail(script, args)?))
 }
 
+/// Returns true for normal files and Windows Store / MSIX App Execution Aliases
+/// (`IO_REPARSE_TAG_APPEXECLINK` under `%LOCALAPPDATA%\Microsoft\WindowsApps`),
+/// where `Path::is_file()` fails with `ERROR_CANT_ACCESS_FILE` (1920) even though
+/// `CreateProcessW` executes them normally.
+pub(super) fn is_executable_file(path: &Path) -> bool {
+    if path.is_file() {
+        return true;
+    }
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    std::fs::symlink_metadata(path).is_ok_and(|meta| {
+        let attrs = meta.file_attributes();
+        (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0
+    })
+}
+
 fn resolve(program: &str, path: &str, exts: &str) -> Option<PathBuf> {
     let with_exts = |base: PathBuf| -> Option<PathBuf> {
-        if base.extension().is_some() && base.is_file() {
+        if base.extension().is_some() && is_executable_file(&base) {
             return Some(base);
         }
         exts.split(';')
             .filter(|e| !e.is_empty())
             .map(|e| PathBuf::from(format!("{}{e}", base.display())))
-            .find(|p| p.is_file())
+            .find(|p| is_executable_file(p))
     };
     let p = Path::new(program);
     if p.components().count() > 1 || p.is_absolute() {
@@ -1188,6 +1205,24 @@ pub fn wait(child: &mut Process) -> io::Result<(Option<i32>, Option<i32>)> {
 
 // --- Agent subprocesses ----------------------------------------------------
 
+fn cmd_exe_program(env: &BTreeMap<String, String>) -> PathBuf {
+    if let Some((_, comspec)) = env.iter().find(|(k, _)| k.eq_ignore_ascii_case("COMSPEC"))
+        && !comspec.trim().is_empty()
+        && Path::new(comspec.trim()).is_file()
+    {
+        return PathBuf::from(comspec.trim());
+    }
+    if let Some((_, root)) = env.iter().find(|(k, _)| k.eq_ignore_ascii_case("SystemRoot"))
+        && !root.trim().is_empty()
+    {
+        let sys_cmd = Path::new(root.trim()).join(r"System32\cmd.exe");
+        if sys_cmd.is_file() {
+            return sys_cmd;
+        }
+    }
+    PathBuf::from("cmd.exe")
+}
+
 /// Prepares a headless ACP agent command with `.cmd`/`.bat` shim support and piped stdio.
 pub fn agent_command(
     argv: &[String],
@@ -1204,7 +1239,7 @@ pub fn agent_command(
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("{program}: not found on PATH")))?;
     let ext = found.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
     let mut cmd = if ext == "cmd" || ext == "bat" {
-        let mut c = tokio::process::Command::new("cmd.exe");
+        let mut c = tokio::process::Command::new(cmd_exe_program(env));
         c.args(["/e:ON", "/v:OFF", "/d", "/c"]).raw_arg(batch_tail(&found, &argv[1..])?);
         c
     } else if super::is_shell_line(argv) {
@@ -1228,7 +1263,29 @@ pub fn agent_command(
 }
 
 /// Lifetime job guard holding everything an ACP agent spawned.
-pub struct AgentGuard(OwnedHandle);
+pub struct AgentGuard(Option<OwnedHandle>);
+
+/// Spawns an ACP agent suspended, assigns it to a kill-on-close Job Object before any child
+/// processes can escape or exit, and resumes execution. Falls back to an unguarded handle when
+/// an outer restricted job forbids nested job assignment (matching `spawn_pty`).
+pub fn spawn_agent(
+    argv: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: &str,
+) -> io::Result<(tokio::process::Child, AgentGuard)> {
+    let mut cmd = agent_command(argv, env, cwd)?;
+    cmd.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
+    let mut child = cmd.spawn()?;
+    let guard = attach_agent_guard(&child).unwrap_or(AgentGuard(None));
+    if let Some(pid) = child.id()
+        && unsafe { super::windows_exec::resume(pid) } == 0
+    {
+        guard.terminate();
+        let _ = child.start_kill();
+        return Err(io::Error::other("agent threads could not be resumed"));
+    }
+    Ok((child, guard))
+}
 
 pub fn attach_agent_guard(child: &tokio::process::Child) -> io::Result<AgentGuard> {
     let Some(process) = child.raw_handle() else {
@@ -1249,17 +1306,29 @@ pub fn attach_agent_guard(child: &tokio::process::Child) -> io::Result<AgentGuar
             size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
         ))?;
         check(AssignProcessToJobObject(job.as_raw_handle() as HANDLE, process as HANDLE))?;
-        Ok(AgentGuard(job))
+        Ok(AgentGuard(Some(job)))
     }
 }
 
 impl AgentGuard {
     pub fn terminate(&self) {
-        unsafe { TerminateJobObject(self.0.as_raw_handle() as HANDLE, 1) };
+        if let Some(ref job) = self.0 {
+            unsafe { TerminateJobObject(job.as_raw_handle() as HANDLE, 1) };
+        }
     }
 }
 
-pub fn signal_agent(_pid: u32, _signal: i32) {}
+pub fn signal_agent(pid: u32, signal: i32) {
+    if signal == super::signal::KILL || signal == super::signal::TERM {
+        unsafe {
+            let handle = OpenProcess(PROCESS_TERMINATE, 0, pid);
+            if !handle.is_null() {
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            }
+        }
+    }
+}
 
 /// A .cmd/.bat (how npm installs agents) runs through cmd, which reads
 /// `& | < > ^ %` itself: each argument is quoted, `"` doubled and `%`

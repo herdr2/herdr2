@@ -47,9 +47,15 @@ function find(node, id) {
 // The sidebar's rail goes by its width, not a flag: dragging its edge narrows it too.
 const narrow = () => (find(layout(), "sidebar")?.size?.px ?? Infinity) < 160;
 
-// Where a space is now: its first terminal's live folder, else where it was made.
+// Where a space is now: its active tab's focused terminal folder, else its first terminal's, else where it was made.
 // `ps`: panes(), read once by the caller (each read copies every pane).
 function place(s, ps) {
+  const activeTab = (s.tabs ?? []).find((c) => c.active)?.id;
+  if (activeTab) {
+    const active = ps.find((p) => p.tab === activeTab && p.focused && p.cwd)
+      ?? ps.find((p) => p.tab === activeTab && p.cwd);
+    if (active?.cwd) return active.cwd;
+  }
   const tabs = new Set((s.tabs ?? []).map((c) => c.id));
   return ps.find((p) => tabs.has(p.tab) && p.cwd)?.cwd || s.folder;
 }

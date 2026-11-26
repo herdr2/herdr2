@@ -120,7 +120,8 @@ pub async fn spawn_session(mut spec: SpawnSpec) -> Result<StartedSession, RpcErr
     if spec.dangerously_skip_permissions {
         presets::ensure_agy_skip_permissions(&mut spec.argv);
     }
-    presets::check_claude_acp_readiness(&spec.argv, &spec.env)?;
+    presets::check_claude_acp_readiness(&spec.argv, &spec.env, Some(&spec.cwd))?;
+    presets::apply_claude_env_quirks(&spec.argv, &mut spec.env);
     presets::apply_cursor_env_quirks(&spec.argv, &mut spec.env);
     presets::apply_codex_env_quirks(&spec.argv, &mut spec.env);
     let (transport, waiter, mut inbound_rx) = Transport::spawn(&spec.argv, &spec.env, &spec.cwd)?;
@@ -803,7 +804,10 @@ async fn setup_session(
         }
     } else if spec.dangerously_skip_permissions
         && !spec.config_overrides.contains_key("mode")
-        && let Some((wire_mode, src)) = bypass_mode_for_options(&config_options)
+        && let Some((wire_mode, src)) = bypass_mode_for_options(&config_options).or_else(|| {
+            (presets::is_claude_agent(None, &spec.argv) && config_options.is_empty())
+                .then(|| ("bypassPermissions".into(), None))
+        })
     {
         let val = json!(wire_mode);
         if let Ok(maybe_fresh) = apply_config_option(transport, &session_id, "mode", &val, src.as_deref()).await {

@@ -1328,6 +1328,471 @@ fn parse_effort(raw: Option<&str>, fallback: Effort) -> Effort {
     }
 }
 
+fn companion_cli_name(agent_id: &str) -> &'static str {
+    match agent_id {
+        "agy" | "antigravity" => "agy",
+        "claude" => "claude",
+        "codex" => "codex",
+        "cursor" | "cursor-agent" => "cursor-agent",
+        "gemini" => "gemini",
+        "opencode" => "opencode",
+        "copilot" => "copilot",
+        "dsh" => "dsh-tui",
+        "kimi" => "kimi",
+        "qwen" => "qwen",
+        "pi" => "pi",
+        "hermes" => "hermes",
+        "zcode" => "zcode",
+        "glm" => "glm-acp-agent",
+        _ => "",
+    }
+}
+
+fn normalize_probe_diag_category(raw: Option<&str>) -> String {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("env_proxy" | "proxy" | "env" | "environment") => "env_proxy".into(),
+        Some("auth_required" | "auth" | "login" | "unauthorized") => "auth_required".into(),
+        Some("missing_adapter" | "adapter" | "install" | "missing_binary") => "missing_adapter".into(),
+        Some("timeout" | "network_timeout" | "slow") => "timeout".into(),
+        Some("config" | "config_error" | "misconfigured") => "config".into(),
+        Some("false_positive" | "workspace_ok" | "cli_only") => "false_positive".into(),
+        _ => "unknown".into(),
+    }
+}
+
+pub(crate) fn parse_safe_terminal_command_argv(raw: &str) -> Option<Vec<String>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.len() > 240 {
+        return None;
+    }
+    if trimmed.contains(['\n', '\r', ';', '|', '&', '>', '<', '`']) || trimmed.contains("$(") {
+        return None;
+    }
+    let argv = crate::acp::presets::split_words(trimmed).ok()?;
+    let first = argv.first()?.trim();
+    if first.is_empty() || first.starts_with('-') || first.contains('=') {
+        return None;
+    }
+    Some(argv)
+}
+
+fn match_expected_probe_agent<'a>(raw_id: &str, expected_agents: &'a [String]) -> Option<&'a str> {
+    if expected_agents.is_empty() {
+        return None;
+    }
+    let trimmed = raw_id.trim();
+    if let Some(exact) = expected_agents.iter().find(|e| e.eq_ignore_ascii_case(trimmed)) {
+        return Some(exact.as_str());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let canonical = match lower.as_str() {
+        "cursor-agent" => "cursor",
+        "antigravity" => "agy",
+        "claude-code" | "claude-agent-acp" => "claude",
+        "codex-acp" => "codex",
+        "zcode-acp-server" => "zcode",
+        "dsh-tui" => "dsh",
+        other => other,
+    };
+    expected_agents.iter().find(|e| e.eq_ignore_ascii_case(canonical)).map(String::as_str)
+}
+
+pub(crate) fn parse_probe_ai_diagnosis(
+    raw: &str,
+    expected_agents: &[String],
+    prefer_zh: bool,
+) -> Result<(Option<String>, Vec<DroveProbeDiagnosisItem>), String> {
+    let parsed = extract_json_object(raw).ok_or_else(|| {
+        if prefer_zh {
+            format!("AI 未返回有效的 JSON 诊断结果: {}", raw.chars().take(160).collect::<String>())
+        } else {
+            format!("AI did not return valid JSON diagnosis: {}", raw.chars().take(160).collect::<String>())
+        }
+    })?;
+    let summary = parsed
+        .get("summary")
+        .or_else(|| parsed.get("overview"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.chars().take(500).collect::<String>());
+
+    let mut by_agent: BTreeMap<String, DroveProbeDiagnosisItem> = BTreeMap::new();
+    if let Some(arr) = parsed.get("items").or_else(|| parsed.get("agents")).and_then(Value::as_array) {
+        for entry in arr {
+            let Some(raw_agent_id) = entry
+                .get("agent")
+                .or_else(|| entry.get("id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                continue;
+            };
+            let agent_id = if !expected_agents.is_empty() {
+                let Some(matched) = match_expected_probe_agent(raw_agent_id, expected_agents) else {
+                    continue;
+                };
+                matched
+            } else {
+                raw_agent_id
+            };
+            let cause = entry
+                .get("cause")
+                .or_else(|| entry.get("reason"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.chars().take(320).collect::<String>())
+                .unwrap_or_default();
+            let fix = entry
+                .get("fix")
+                .or_else(|| entry.get("action"))
+                .or_else(|| entry.get("suggestion"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.chars().take(420).collect::<String>())
+                .unwrap_or_default();
+            if cause.is_empty() && fix.is_empty() {
+                continue;
+            }
+            let command = entry
+                .get("command")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.chars().take(240).collect::<String>());
+            let command_argv = command.as_deref().and_then(parse_safe_terminal_command_argv);
+            let category = normalize_probe_diag_category(entry.get("category").and_then(Value::as_str));
+            let likely_false_positive = entry
+                .get("likelyFalsePositive")
+                .or_else(|| entry.get("likely_false_positive"))
+                .and_then(Value::as_bool)
+                .unwrap_or(category == "false_positive" || category == "env_proxy");
+            let final_cause = if cause.is_empty() { fix.clone() } else { cause };
+            let final_fix = if fix.is_empty() { final_cause.clone() } else { fix };
+            by_agent.entry(agent_id.to_string()).or_insert(DroveProbeDiagnosisItem {
+                agent: agent_id.to_string(),
+                category,
+                likely_false_positive,
+                cause: final_cause,
+                fix: final_fix,
+                command,
+                command_argv,
+            });
+        }
+    }
+
+    let mut items = Vec::with_capacity(expected_agents.len());
+    for id in expected_agents {
+        if let Some(item) = by_agent.remove(id) {
+            items.push(item);
+        }
+    }
+    for (_, extra) in by_agent {
+        items.push(extra);
+    }
+    if summary.is_none() && items.is_empty() {
+        return Err(if prefer_zh {
+            "AI 未返回可用的异常诊断条目".into()
+        } else {
+            "AI returned no actionable diagnosis items".into()
+        });
+    }
+    Ok((summary, items))
+}
+
+/// Uses the configured Core AI assistant to diagnose Drove ACP probe errors, distinguish workspace-CLI
+/// false positives (e.g. daemon missing shell proxy/env or ACP auth quirks) from real setup issues,
+/// and propose actionable remediation steps/commands.
+pub async fn diagnose_probe_errors_with_ai(
+    core: &Arc<Core>,
+    params: DroveProbeAiDiagnoseParams,
+) -> DroveProbeAiDiagnoseResult {
+    let started = Instant::now();
+    let prefer_zh = match params.language.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(l) => crate::ai::prompt_lang_code(l) == "zh",
+        None => drove_ai_lang(core, None) == "zh",
+    };
+    let fail = |msg: String| DroveProbeAiDiagnoseResult {
+        ok: false,
+        model_used: None,
+        latency_ms: started.elapsed().as_millis() as u64,
+        summary: None,
+        items: Vec::new(),
+        error: Some(msg),
+    };
+
+    let filter_set: HashSet<String> = params
+        .agents
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let target_machine = params.target_machine.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let supplied_errored: Vec<DroveProbeErrorInput> = params
+        .errored_agents
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|a| {
+            !a.id.trim().is_empty()
+                && !a.error.trim().is_empty()
+                && (filter_set.is_empty() || filter_set.contains(a.id.trim()))
+        })
+        .collect();
+
+    let use_remote_snapshot = target_machine.is_some() && !supplied_errored.is_empty();
+    let probed = if use_remote_snapshot { ProbeSnapshot::default() } else { core.drove.cached_probe() };
+    let local_errored: Vec<&ProbedAgent> = if use_remote_snapshot {
+        Vec::new()
+    } else {
+        probed
+            .agents
+            .iter()
+            .filter(|a| {
+                a.installed
+                    && a.error.as_deref().map(str::trim).is_some_and(|s| !s.is_empty())
+                    && (filter_set.is_empty() || filter_set.contains(&a.id))
+            })
+            .collect()
+    };
+
+    if local_errored.is_empty() && supplied_errored.is_empty() {
+        return DroveProbeAiDiagnoseResult {
+            ok: true,
+            model_used: None,
+            latency_ms: started.elapsed().as_millis() as u64,
+            summary: Some(if prefer_zh {
+                "当前未检测到需要处理的 Agent 异常。".into()
+            } else {
+                "No errored agents currently detected.".into()
+            }),
+            items: Vec::new(),
+            error: None,
+        };
+    }
+
+    let ai_cfg = core.ai.config_snapshot();
+    let raw_base =
+        params.base_url.as_deref().map(str::trim).filter(|s| !s.is_empty()).unwrap_or(ai_cfg.base_url.trim());
+    if raw_base.is_empty() {
+        return fail(if prefer_zh {
+            "请先在「AI 助手」设置中配置远端服务地址（Service URL）".into()
+        } else {
+            "Configure the AI Assistant Service URL in Settings -> AI first".into()
+        });
+    }
+    let (stored_key, _) = core.ai.read_key();
+    let has_key = params.api_key.as_deref().map(str::trim).is_some_and(|s| !s.is_empty()) || stored_key.is_some();
+    if !has_key && !crate::ai::allows_keyless_url(raw_base) {
+        return fail(if prefer_zh {
+            "请先在「AI 助手」设置中配置 API Key".into()
+        } else {
+            "Configure the AI Assistant API Key in Settings -> AI first".into()
+        });
+    }
+
+    let is_npx_cmd = |cmd: &[String]| {
+        cmd.first().is_some_and(|c| {
+            let lower = c.rsplit(['/', '\\']).next().unwrap_or(c).to_ascii_lowercase();
+            lower == "npx" || lower.starts_with("npx.")
+        })
+    };
+
+    let (expected_ids, input_json) = if use_remote_snapshot {
+        let healthy_agents: Vec<String> = params
+            .healthy_agents
+            .unwrap_or_default()
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let expected_ids: Vec<String> = supplied_errored.iter().map(|a| a.id.trim().to_string()).collect();
+        let errored_payload: Vec<Value> = supplied_errored
+            .iter()
+            .map(|a| {
+                json!({
+                    "id": a.id.trim(),
+                    "command": a.command,
+                    "path": a.path,
+                    "modelsCount": a.models_count,
+                    "usesNpxFallback": is_npx_cmd(&a.command),
+                    "error": a.error.trim(),
+                })
+            })
+            .collect();
+        let payload = json!({
+            "targetMachine": target_machine,
+            "remoteSnapshot": true,
+            "healthyAgents": healthy_agents,
+            "erroredAgents": errored_payload,
+        })
+        .to_string();
+        (expected_ids, payload)
+    } else {
+        let base_env = crate::platform::program_env().await;
+        let daemon_proxy_configured = base_env.iter().any(|(k, v)| {
+            !v.trim().is_empty()
+                && (k.eq_ignore_ascii_case("HTTP_PROXY")
+                    || k.eq_ignore_ascii_case("HTTPS_PROXY")
+                    || k.eq_ignore_ascii_case("ALL_PROXY"))
+        });
+        let path_override =
+            base_env.iter().find(|(k, _)| k.eq_ignore_ascii_case("PATH")).map(|(_, v)| v.as_str());
+        let pathext_override =
+            base_env.iter().find(|(k, _)| k.eq_ignore_ascii_case("PATHEXT")).map(|(_, v)| v.as_str());
+        let daemon_cwd = std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_default();
+
+        let healthy_agents: Vec<String> = if !local_errored.is_empty() {
+            probed
+                .agents
+                .iter()
+                .filter(|a| a.installed && a.error.as_deref().map(str::trim).is_none_or(str::is_empty))
+                .map(|a| a.id.clone())
+                .collect()
+        } else {
+            params
+                .healthy_agents
+                .unwrap_or_default()
+                .into_iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+
+        let (expected_ids, errored_payload): (Vec<String>, Vec<Value>) = if !local_errored.is_empty() {
+            let ids = local_errored.iter().map(|a| a.id.clone()).collect();
+            let items = local_errored
+                .iter()
+                .map(|a| {
+                    let cli_bin = companion_cli_name(&a.id);
+                    let has_cli = !cli_bin.is_empty()
+                        && crate::acp::presets::resolve_non_shim_binary_in_path(
+                            cli_bin,
+                            path_override,
+                            pathext_override,
+                        )
+                        .is_some();
+                    json!({
+                        "id": a.id,
+                        "command": a.command,
+                        "path": a.path,
+                        "modelsCount": a.models.len(),
+                        "hasCompanionCliOnDaemonPath": has_cli,
+                        "usesNpxFallback": is_npx_cmd(&a.command),
+                        "error": a.error,
+                    })
+                })
+                .collect();
+            (ids, items)
+        } else {
+            let ids = supplied_errored.iter().map(|a| a.id.trim().to_string()).collect();
+            let items = supplied_errored
+                .iter()
+                .map(|a| {
+                    let id = a.id.trim();
+                    let cli_bin = companion_cli_name(id);
+                    let has_cli = !cli_bin.is_empty()
+                        && crate::acp::presets::resolve_non_shim_binary_in_path(
+                            cli_bin,
+                            path_override,
+                            pathext_override,
+                        )
+                        .is_some();
+                    json!({
+                        "id": id,
+                        "command": a.command,
+                        "path": a.path,
+                        "modelsCount": a.models_count,
+                        "hasCompanionCliOnDaemonPath": has_cli,
+                        "usesNpxFallback": is_npx_cmd(&a.command),
+                        "error": a.error.trim(),
+                    })
+                })
+                .collect();
+            (ids, items)
+        };
+
+        let payload = json!({
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "daemonCwd": daemon_cwd,
+            "daemonProxyConfigured": daemon_proxy_configured,
+            "healthyAgents": healthy_agents,
+            "erroredAgents": errored_payload,
+        })
+        .to_string();
+        (expected_ids, payload)
+    };
+
+    let lang_rule = if prefer_zh {
+        "Write `summary`, `cause`, and `fix` in concise, practical Simplified Chinese."
+    } else {
+        "Write `summary`, `cause`, and `fix` in concise, practical English."
+    };
+
+    let system_prompt = format!(
+        "You are an expert troubleshooting assistant for Herdr2 Drove ACP agent probing.\n\
+         Important Herdr2 architecture context:\n\
+         - In Herdr2 workspaces, CLI agents launch inside an interactive login shell (loading ~/.zshrc / ~/.bashrc, proxy vars, NVM/PATH) using interactive TUI CLIs (`claude`, `codex`, `cursor-agent`, `agy`, etc.).\n\
+         - Drove agent probing runs directly inside the headless `herdr2 serve` daemon using `program_env()` (which does NOT source interactive shell rc files), invoking headless ACP adapters (`claude-agent-acp`, `codex-acp`, `cursor-agent acp`, `zcode-acp-server`, `agy models`) with a 60s handshake timeout (`initialize` + `session/new`, 6 concurrent probes).\n\
+         - If `remoteSnapshot` is true, the errors happened on remote machine `targetMachine`; infer its environment from the reported `path`/`command`/`error` rather than assuming a local OS.\n\
+         - Common root causes:\n\
+           1) `env_proxy`: daemon lacks proxy/API env vars set only in ~/.zshrc or ~/.bashrc -> timeouts or network errors even though workspace CLI works.\n\
+           2) `auth_required`: ACP adapter requires separate CLI login/onboarding (`claude`, `cursor-agent login`, `agy login`, etc.) or `authenticate()`.\n\
+           3) `missing_adapter`: only companion CLI is installed and `npx -y @agentclientprotocol/...` fallback timed out or failed.\n\
+           4) `timeout`: cold-start / concurrent probe contention or slow network (re-probing or setting proxy fixes it).\n\
+           5) `config`: invalid custom `[agents]` entry in `config.toml` or bad daemon cwd.\n\
+           6) `false_positive`: workspace CLI works fine and only headless ACP probe check failed due to transient or adapter-specific limitation.\n\
+         Rules:\n\
+         1. Return ONE diagnosis item for EVERY agent in `erroredAgents` using its exact `id`.\n\
+         2. `category` MUST be one of: `env_proxy`, `auth_required`, `missing_adapter`, `timeout`, `config`, `false_positive`, `unknown`.\n\
+         3. Set `likelyFalsePositive` to `true` when the agent likely works in workspace interactive terminals and the issue is specific to headless daemon/ACP probing.\n\
+         4. `command` is OPTIONAL: provide a single safe, non-destructive shell command ONLY when directly helpful (e.g. `cursor-agent login`, `claude`, `h2 server restart`, `npm i -g @agentclientprotocol/claude-agent-acp`). Do NOT use pipes, `&&`, `;`, or redirections in `command`.\n\
+         5. {lang_rule}\n\
+         6. Output ONLY valid JSON matching:\n\
+         {{\"summary\":\"1-2 sentences\",\"items\":[{{\"agent\":\"<id>\",\"category\":\"env_proxy\",\"likelyFalsePositive\":true,\"cause\":\"...\",\"fix\":\"...\",\"command\":\"...\"|null}}]}}"
+    );
+
+    let resp = match core
+        .ai
+        .complete(AiCompleteRequest {
+            op: "probe_diagnose".into(),
+            tier: AiTaskTier::Standard,
+            mode: AiConversationMode::CustomSystem(system_prompt),
+            user_prompt: format!(
+                "Analyze these Drove agent probe errors and return ONLY the JSON diagnosis:\n<input>\n{input_json}\n</input>"
+            ),
+            max_tokens: 1536,
+            timeout: Duration::from_secs(90),
+            url_override: params.base_url,
+            key_override: params.api_key,
+            model_override: params.model,
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => return fail(e),
+    };
+
+    let (summary, items) = match parse_probe_ai_diagnosis(&resp.content, &expected_ids, prefer_zh) {
+        Ok(v) => v,
+        Err(e) => return fail(e),
+    };
+
+    DroveProbeAiDiagnoseResult {
+        ok: true,
+        model_used: Some(resp.model),
+        latency_ms: started.elapsed().as_millis() as u64,
+        summary,
+        items,
+        error: None,
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn parse_and_sanitize_ai_roles(
     raw: &str,
@@ -1795,5 +2260,79 @@ mod tests {
         .unwrap();
         assert_eq!(cand_str, vec!["复杂架构", "后端重构"]);
         assert_eq!(cand_str_why.as_deref(), Some("已按模型特长配置"));
+    }
+
+    #[test]
+    fn parse_safe_terminal_command_argv_filters_shell_metachars_and_parses_simple_commands() {
+        assert_eq!(
+            parse_safe_terminal_command_argv("cursor-agent login"),
+            Some(vec!["cursor-agent".into(), "login".into()])
+        );
+        assert_eq!(
+            parse_safe_terminal_command_argv(r#"npm i -g "@agentclientprotocol/claude-agent-acp""#),
+            Some(vec!["npm".into(), "i".into(), "-g".into(), "@agentclientprotocol/claude-agent-acp".into()])
+        );
+        assert_eq!(parse_safe_terminal_command_argv("cursor-agent login && h2 drove probe"), None);
+        assert_eq!(parse_safe_terminal_command_argv("echo hi | cat"), None);
+        assert_eq!(parse_safe_terminal_command_argv("FOO=bar claude"), None);
+        assert_eq!(parse_safe_terminal_command_argv("$(rm -rf /)"), None);
+    }
+
+    #[test]
+    fn parse_probe_ai_diagnosis_normalizes_categories_order_and_commands() {
+        let raw = r#"{
+          "summary": "守护进程缺少代理变量且 Cursor 未登录 ACP。",
+          "items": [
+            {
+              "agent": "cursor",
+              "category": "auth",
+              "likelyFalsePositive": false,
+              "cause": "Cursor ACP 需要先登录",
+              "fix": "在终端执行登录命令后刷新检测",
+              "command": "cursor-agent login"
+            },
+            {
+              "agent": "claude",
+              "category": "proxy",
+              "cause": "herdr2 serve 缺少 shell 代理环境变量",
+              "fix": "在系统环境配置代理并重启服务",
+              "command": "export HTTP_PROXY=http://127.0.0.1:7890 && h2 server restart"
+            },
+            {
+              "agent": "unknown-extra",
+              "category": "timeout",
+              "cause": "should be filtered out",
+              "fix": "ignore"
+            }
+          ]
+        }"#;
+        let expected = vec!["claude".to_string(), "cursor".to_string()];
+        let (summary, items) = parse_probe_ai_diagnosis(raw, &expected, true).unwrap();
+        assert_eq!(summary.as_deref(), Some("守护进程缺少代理变量且 Cursor 未登录 ACP。"));
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].agent, "claude");
+        assert_eq!(items[0].category, "env_proxy");
+        assert!(items[0].likely_false_positive);
+        assert!(items[0].command.is_some());
+        assert_eq!(items[0].command_argv, None, "chained shell command must not become direct argv");
+        assert_eq!(items[1].agent, "cursor");
+        assert_eq!(items[1].category, "auth_required");
+        assert!(!items[1].likely_false_positive);
+        assert_eq!(items[1].command_argv, Some(vec!["cursor-agent".into(), "login".into()]));
+
+        // Case-insensitive and alias matching (e.g. "Cursor-Agent" -> "cursor", "Antigravity" -> "agy").
+        let alias_raw = r#"{
+          "summary": "别名测试",
+          "items": [
+            { "agent": "Cursor-Agent", "category": "timeout", "cause": "c1", "fix": "f1" },
+            { "agent": "Antigravity", "category": "auth", "cause": "c2", "fix": "f2" }
+          ]
+        }"#;
+        let expected_alias = vec!["cursor".to_string(), "agy".to_string()];
+        let (_, alias_items) = parse_probe_ai_diagnosis(alias_raw, &expected_alias, true).unwrap();
+        assert_eq!(alias_items.len(), 2);
+        assert_eq!(alias_items[0].agent, "cursor");
+        assert_eq!(alias_items[1].agent, "agy");
+        assert!(crate::ai::prompts::op_expects_json("probe_diagnose"));
     }
 }

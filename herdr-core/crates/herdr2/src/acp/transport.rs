@@ -126,14 +126,7 @@ impl Transport {
         env: &BTreeMap<String, String>,
         cwd: &str,
     ) -> Result<(Self, ChildWaiter, mpsc::UnboundedReceiver<Inbound>), RpcError> {
-        let mut cmd = platform::agent_command(argv, env, cwd).map_err(|e| {
-            RpcError::new(
-                "spawn_failed",
-                format!("cannot prepare {}: {e}", argv.first().map_or("", String::as_str)),
-                "",
-            )
-        })?;
-        let mut child = cmd.spawn().map_err(|e| {
+        let (mut child, guard) = platform::spawn_agent(argv, env, cwd).map_err(|e| {
             let program = argv.first().map_or("", String::as_str);
             let msg = if !std::path::Path::new(cwd).is_dir() {
                 format!("cannot start {program}: missing working directory {cwd}: {e}")
@@ -142,13 +135,6 @@ impl Transport {
             };
             RpcError::new("spawn_failed", msg, "")
         })?;
-        let guard = match platform::attach_agent_guard(&child) {
-            Ok(g) => g,
-            Err(e) => {
-                let _ = child.start_kill();
-                return Err(RpcError::new("spawn_failed", format!("cannot contain agent: {e}"), ""));
-            }
-        };
         let pid = child.id();
         let mut stdin = child.stdin.take().expect("piped stdin");
         let stdout = child.stdout.take().expect("piped stdout");
@@ -182,12 +168,13 @@ impl Transport {
         let tx_out = inbound_tx.clone();
         let stdout_task = tokio::spawn(async move {
             let mut reader = BufReader::new(stdout);
-            let mut line = String::new();
+            let mut buf = Vec::new();
             loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {
+                        let line = platform::decode_process_output(&buf);
                         let trimmed = line.trim();
                         if trimmed.is_empty() {
                             continue;
@@ -205,12 +192,13 @@ impl Transport {
         let inner_err = inner.clone();
         let stderr_task = tokio::spawn(async move {
             let mut reader = BufReader::new(stderr.take(4 << 20));
-            let mut line = String::new();
+            let mut buf = Vec::new();
             loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf).await {
                     Ok(0) | Err(_) => break,
                     Ok(_) => {
+                        let line = platform::decode_process_output(&buf);
                         let mut clean = line.trim_end_matches(['\r', '\n']).to_string();
                         if clean.len() > MAX_STDERR_LINE_BYTES {
                             let mut end = MAX_STDERR_LINE_BYTES;

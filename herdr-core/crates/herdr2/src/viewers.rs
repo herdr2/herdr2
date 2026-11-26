@@ -190,6 +190,7 @@ impl Core {
         }
         let reports = screen.take_status_reports();
         let title = screen.take_title_changed().then(|| screen.title());
+        let pwd = screen.take_pwd_changed().then(|| screen.pwd());
         let full_screen = screen.alt_screen();
         // Before any repaint below, so it carries the mode this output just set.
         if let Some(on) = win32_input
@@ -255,6 +256,11 @@ impl Core {
             if track_cli_title {
                 self.spawn_pty_digest_ai_locked(st, id, std::time::Duration::from_secs(4), None);
             }
+        }
+        if let Some(pwd) = pwd
+            && let Some(dir) = crate::foreground::parse_osc7_cwd(&pwd, &crate::platform::hostname(), cfg!(windows))
+        {
+            self.apply_osc7_cwd(st, id, dir, cfg!(windows));
         }
     }
 

@@ -839,7 +839,7 @@ fn preserve_or_update_bundled_core(
     work: &Path,
     releases_base: Option<&str>,
 ) -> Result<Option<String>, String> {
-    for asset in ["herdr2.png", "herdr2-512.png"] {
+    for asset in ["herdr2.png", "herdr2-512.png", "herdr2.ico"] {
         let src = root.join(asset);
         let dst = unpacked.join(asset);
         if src.is_file() && !dst.exists() {

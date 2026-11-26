@@ -300,3 +300,20 @@ fn a_replay_of_a_full_screen_program_keeps_what_it_hid_then_its_last_frame() {
         "{text:?}"
     );
 }
+
+#[test]
+fn osc7_updates_pwd_and_fires_change_hook() {
+    let mut t = Terminal::new(80, 24, 0);
+    assert!(!t.take_pwd_changed());
+    assert!(t.pwd().is_empty());
+    t.write(b"\x1b]7;file:///D:/Work/my%20repo\x1b\\");
+    assert!(t.take_pwd_changed());
+    assert!(!t.take_pwd_changed());
+    assert_eq!(t.pwd(), "file:///D:/Work/my%20repo");
+    t.write(b"\x1b]7;file://HOST/C:/Users/me\x07");
+    assert!(t.take_pwd_changed());
+    assert_eq!(t.pwd(), "file://HOST/C:/Users/me");
+    t.write(b"\x1b]9;9;D:\\Work\\herdr2\x1b\\");
+    assert!(t.take_pwd_changed());
+    assert_eq!(t.pwd(), r"D:\Work\herdr2");
+}

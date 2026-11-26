@@ -193,6 +193,7 @@ pub fn op_expects_json(op: &str) -> bool {
             | "commit_message"
             | "polish_prompt"
             | "roles_configure"
+            | "probe_diagnose"
     )
 }
 

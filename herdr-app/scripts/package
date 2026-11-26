@@ -64,7 +64,12 @@ out="dist/herdr2-$target.tar.gz"
 if [[ $os == linux || $os == windows ]]; then
   dir="$work/herdr2"
   mkdir -p "$dir"
-  if [[ $os == windows ]]; then cp "$bin/herdr2.exe" "$dir/"; else cp "$bin/herdr2" "$dir/"; fi
+  if [[ $os == windows ]]; then
+    cp "$bin/herdr2.exe" "$dir/"
+    [[ -f assets/icons/herdr-app.ico ]] && cp assets/icons/herdr-app.ico "$dir/herdr2.ico"
+  else
+    cp "$bin/herdr2" "$dir/"
+  fi
   cp assets/icons/herdr-ui-icon-clean.svg "$dir/herdr2.svg"
   [[ -f assets/icons/herdr-ui-icon-clean.png ]] && cp assets/icons/herdr-ui-icon-clean.png "$dir/herdr2.png"
   cp LICENSE THIRD-PARTY-NOTICES "$dir/"

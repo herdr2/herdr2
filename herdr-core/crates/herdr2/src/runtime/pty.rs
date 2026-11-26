@@ -304,6 +304,11 @@ impl Core {
             let rec = st.pty_reg.terminals.get_mut(&id).expect("live id");
             screen.set_xtversion(&rec.identity);
             rec.title = screen.title();
+            let pwd = screen.pwd();
+            if let Some(dir) = crate::foreground::parse_osc7_cwd(&pwd, &crate::platform::hostname(), cfg!(windows)) {
+                rec.reported_cwd = Some(dir.clone());
+                rec.last_cwd = Some(dir);
+            }
             if let Some(on) = relay.win32_input {
                 rec.win32_input = on;
             }

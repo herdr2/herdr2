@@ -7,7 +7,7 @@
 ;   iscc /DMyAppVersion=0.2.0 /DAppStageDir=dist\stage-app /DCoreStageDir=dist\stage-core /DOutputDir=dist\installers herdr-app\distribution\windows\herdr2.iss
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.0.11"
+  #define MyAppVersion "2.0.12"
 #endif
 #ifndef AppStageDir
   #define AppStageDir "..\..\dist\stage-app"
@@ -54,6 +54,7 @@ Name: "addpath"; Description: "Add herdr2 and h2 CLI to user PATH (recommended)"
 ; Desktop app
 Source: "{#AppStageDir}\herdr2.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#AppStageDir}\herdr2.svg"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#AppStageDir}\herdr2.ico"; DestDir: "{app}"; Flags: ignoreversion skipifsourcedoesntexist
 Source: "{#AppStageDir}\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "{#AppStageDir}\THIRD-PARTY-NOTICES"; DestDir: "{app}"; Flags: ignoreversion
 

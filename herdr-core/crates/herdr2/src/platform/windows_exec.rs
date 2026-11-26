@@ -86,13 +86,46 @@ mod via_tests {
     }
 }
 
+/// Locates PowerShell 7 (`pwsh.exe`) on `PATH` or standard Windows installation folders
+/// (MSI, preview, Microsoft Store App Execution Alias, Scoop, dotnet tools).
+fn find_pwsh() -> Option<String> {
+    use std::path::{Path, PathBuf};
+    if let Some(path) = std::env::var_os("PATH")
+        && let Some(exe) = std::env::split_paths(&path)
+            .map(|dir| dir.join("pwsh.exe"))
+            .find(|exe| super::windows::is_executable_file(exe))
+    {
+        return Some(exe.to_string_lossy().into_owned());
+    }
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for env_key in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(base) = std::env::var_os(env_key) {
+            let root = Path::new(&base).join("PowerShell");
+            candidates.push(root.join("7").join("pwsh.exe"));
+            candidates.push(root.join("7-preview").join("pwsh.exe"));
+        }
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        let local = Path::new(&local);
+        candidates.push(local.join("Microsoft").join("WindowsApps").join("pwsh.exe"));
+        candidates.push(local.join("Programs").join("PowerShell").join("7").join("pwsh.exe"));
+    }
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        let profile = Path::new(&profile);
+        candidates.push(profile.join(".dotnet").join("tools").join("pwsh.exe"));
+        candidates.push(profile.join("scoop").join("shims").join("pwsh.exe"));
+    }
+    candidates
+        .into_iter()
+        .find(|exe| super::windows::is_executable_file(exe))
+        .map(|exe| exe.to_string_lossy().into_owned())
+}
+
 /// This machine's own shell: PowerShell 7 if installed, else Windows PowerShell.
 /// PowerShell's `cd` never tells Windows, so h2 couldn't see its folder: each
 /// prompt does, after the person's own prompt ran (it reads `$?`).
 pub fn own_shell() -> Vec<String> {
-    let exe = std::env::var_os("PATH")
-        .and_then(|path| std::env::split_paths(&path).map(|dir| dir.join("pwsh.exe")).find(|exe| exe.is_file()))
-        .map_or_else(|| "powershell.exe".into(), |exe| exe.to_string_lossy().into_owned());
+    let exe = find_pwsh().unwrap_or_else(|| "powershell.exe".into());
     let hook = "$global:__h2_prompt = $function:prompt; function global:prompt { $p = & $global:__h2_prompt; \
                 $l = $ExecutionContext.SessionState.Path.CurrentLocation; \
                 if ($l.Provider.Name -eq 'FileSystem') { try { [Environment]::CurrentDirectory = $l.ProviderPath } catch {} }; $p }";
@@ -203,7 +236,7 @@ unsafe fn join_job(process: HANDLE) -> Option<OwnedHandle> {
 
 /// Resumes the threads of a process started suspended (std keeps its main
 /// thread's handle to itself); returns how many.
-unsafe fn resume(pid: u32) -> usize {
+pub(super) unsafe fn resume(pid: u32) -> usize {
     let mut resumed = 0;
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);

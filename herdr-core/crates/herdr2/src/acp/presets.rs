@@ -143,11 +143,13 @@ fn has_claude_non_interactive_auth_in_map<'a>(mut entries: impl Iterator<Item = 
         }
         if k.eq_ignore_ascii_case("ANTHROPIC_API_KEY")
             || k.eq_ignore_ascii_case("ANTHROPIC_AUTH_TOKEN")
+            || k.eq_ignore_ascii_case("ANTHROPIC_BASE_URL")
             || k.eq_ignore_ascii_case("CLAUDE_CODE_OAUTH_TOKEN")
             || k.eq_ignore_ascii_case("ANTHROPIC_FOUNDRY_API_KEY")
             || k.eq_ignore_ascii_case("ANTHROPIC_BEDROCK_BASE_URL")
             || k.eq_ignore_ascii_case("ANTHROPIC_VERTEX_BASE_URL")
             || k.eq_ignore_ascii_case("ANTHROPIC_CUSTOM_HEADERS")
+            || k.eq_ignore_ascii_case("AWS_BEARER_TOKEN_BEDROCK")
         {
             return true;
         }
@@ -197,33 +199,117 @@ fn credentials_file_has_claude_auth(path: &Path) -> bool {
     })
 }
 
+fn claude_home_candidates(env: &BTreeMap<String, String>) -> Vec<std::path::PathBuf> {
+    let mut homes = Vec::new();
+    let mut push_unique = |raw: Option<String>| {
+        let Some(s) = raw else { return };
+        let trimmed = s.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        let pb = std::path::PathBuf::from(trimmed);
+        if !homes.contains(&pb) {
+            homes.push(pb);
+        }
+    };
+    // On Windows, Node.js `os.homedir()` and Claude Code prefer `USERPROFILE` over `HOME`
+    // (which Git Bash / MSYS2 may set to a POSIX path like `/c/Users/...` or a separate folder).
+    if cfg!(windows) {
+        push_unique(env_or_process_ignore_case(env, "USERPROFILE"));
+        if let (Some(drive), Some(path)) =
+            (env_or_process_ignore_case(env, "HOMEDRIVE"), env_or_process_ignore_case(env, "HOMEPATH"))
+        {
+            push_unique(Some(format!("{drive}{path}")));
+        }
+        push_unique(env_or_process_ignore_case(env, "HOME"));
+    } else {
+        push_unique(env_or_process_ignore_case(env, "HOME"));
+        push_unique(env_or_process_ignore_case(env, "USERPROFILE"));
+    }
+    homes
+}
+
+fn managed_claude_settings_paths() -> Vec<std::path::PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        vec![std::path::PathBuf::from("/Library/Application Support/ClaudeCode/managed-settings.json")]
+    }
+    #[cfg(windows)]
+    {
+        let mut out = Vec::new();
+        for key in ["ProgramFiles", "ProgramData"] {
+            if let Ok(base) = std::env::var(key)
+                && !base.trim().is_empty()
+            {
+                let p = std::path::PathBuf::from(base).join("ClaudeCode").join("managed-settings.json");
+                if !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+        for fallback in [
+            r"C:\Program Files\ClaudeCode\managed-settings.json",
+            r"C:\ProgramData\ClaudeCode\managed-settings.json",
+        ] {
+            let p = std::path::PathBuf::from(fallback);
+            if !out.contains(&p) {
+                out.push(p);
+            }
+        }
+        out
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    {
+        vec![std::path::PathBuf::from("/etc/claude-code/managed-settings.json")]
+    }
+}
+
 /// Checks whether Claude Code has completed first-time CLI onboarding & authentication before
 /// spawning `claude-agent-acp`. On a fresh install where `claude` has never been run to choose
 /// a theme and log in (and no API key / gateway / cloud provider env is configured), spawning
 /// `claude-agent-acp` hangs during handshake or turn startup instead of guiding the user.
-pub fn check_claude_acp_readiness(argv: &[String], env: &BTreeMap<String, String>) -> Result<(), RpcError> {
+pub fn check_claude_acp_readiness(
+    argv: &[String],
+    env: &BTreeMap<String, String>,
+    cwd: Option<&str>,
+) -> Result<(), RpcError> {
     if !is_claude_agent(None, argv) {
         return Ok(());
     }
-    let home = env_or_process_ignore_case(env, "HOME")
-        .or_else(|| env_or_process_ignore_case(env, "USERPROFILE"))
-        .map(std::path::PathBuf::from);
-    let Some(home) = home else {
+    let homes = claude_home_candidates(env);
+    if homes.is_empty() {
         return Ok(());
-    };
+    }
     let config_dir = env_or_process_ignore_case(env, "CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from);
     let process_env: Vec<(String, String)> = std::env::vars().collect();
     if has_claude_non_interactive_auth_in_map(process_env.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
         return Ok(());
     }
-    check_claude_acp_readiness_in(argv, env, &home, config_dir.as_deref())
+    for managed in managed_claude_settings_paths() {
+        if settings_file_has_claude_auth(&managed) {
+            return Ok(());
+        }
+    }
+    let cwd_path = cwd.map(str::trim).filter(|s| !s.is_empty()).map(Path::new);
+    check_claude_acp_readiness_in_homes(argv, env, &homes, config_dir.as_deref(), cwd_path)
 }
 
+#[cfg(test)]
 fn check_claude_acp_readiness_in(
     argv: &[String],
     env: &BTreeMap<String, String>,
     home: &Path,
     config_dir_override: Option<&Path>,
+) -> Result<(), RpcError> {
+    check_claude_acp_readiness_in_homes(argv, env, &[home.to_path_buf()], config_dir_override, None)
+}
+
+fn check_claude_acp_readiness_in_homes(
+    argv: &[String],
+    env: &BTreeMap<String, String>,
+    homes: &[std::path::PathBuf],
+    config_dir_override: Option<&Path>,
+    cwd: Option<&Path>,
 ) -> Result<(), RpcError> {
     if !is_claude_agent(None, argv) {
         return Ok(());
@@ -231,21 +317,46 @@ fn check_claude_acp_readiness_in(
     if has_claude_non_interactive_auth_in_map(env.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
         return Ok(());
     }
-    let claude_dir = config_dir_override.map(Path::to_path_buf).unwrap_or_else(|| home.join(".claude"));
-    for name in ["settings.json", "settings.local.json"] {
-        if settings_file_has_claude_auth(&claude_dir.join(name)) {
+
+    let mut claude_dirs = Vec::new();
+    if let Some(dir) = config_dir_override {
+        claude_dirs.push(dir.to_path_buf());
+    }
+    for home in homes {
+        let dir = home.join(".claude");
+        if !claude_dirs.contains(&dir) {
+            claude_dirs.push(dir);
+        }
+    }
+    if let Some(project) = cwd {
+        let proj_dir = project.join(".claude");
+        for name in ["settings.json", "settings.local.json"] {
+            if settings_file_has_claude_auth(&proj_dir.join(name)) {
+                return Ok(());
+            }
+        }
+    }
+    for claude_dir in &claude_dirs {
+        for name in ["settings.json", "settings.local.json"] {
+            if settings_file_has_claude_auth(&claude_dir.join(name)) {
+                return Ok(());
+            }
+        }
+        if credentials_file_has_claude_auth(&claude_dir.join(".credentials.json")) {
             return Ok(());
         }
     }
-    if credentials_file_has_claude_auth(&claude_dir.join(".credentials.json")) {
-        return Ok(());
-    }
 
     let mut state_candidates = Vec::new();
-    if config_dir_override.is_some() {
-        state_candidates.push(claude_dir.join(".claude.json"));
+    if let Some(dir) = config_dir_override {
+        state_candidates.push(dir.join(".claude.json"));
     }
-    state_candidates.push(home.join(".claude.json"));
+    for home in homes {
+        let p = home.join(".claude.json");
+        if !state_candidates.contains(&p) {
+            state_candidates.push(p);
+        }
+    }
 
     let mut has_completed_onboarding = false;
     let mut has_account = false;
@@ -287,6 +398,84 @@ fn check_claude_acp_readiness_in(
         ));
     }
     Ok(())
+}
+
+/// Ensures Windows Claude ACP sessions can locate Git Bash (`CLAUDE_CODE_GIT_BASH_PATH`) even when
+/// Git for Windows only placed `Git\cmd` (not `Git\bin`) on `PATH`.
+pub fn apply_claude_env_quirks(argv: &[String], env: &mut BTreeMap<String, String>) {
+    if !is_claude_agent(None, argv) || !cfg!(windows) {
+        return;
+    }
+    if env_ignore_case(env, "CLAUDE_CODE_GIT_BASH_PATH").is_some() {
+        return;
+    }
+    if let Some(bash) = find_windows_git_bash_in(
+        env_ignore_case(env, "PATH"),
+        env_ignore_case(env, "ProgramFiles"),
+        env_ignore_case(env, "ProgramFiles(x86)"),
+        env_ignore_case(env, "LOCALAPPDATA"),
+        env_ignore_case(env, "USERPROFILE"),
+    ) {
+        env.insert("CLAUDE_CODE_GIT_BASH_PATH".into(), bash.display().to_string());
+    }
+}
+
+fn is_windows_wsl_bash_shim(path: &Path) -> bool {
+    let lower = path.to_string_lossy().replace('/', "\\").to_ascii_lowercase();
+    lower.contains("\\windows\\system32\\")
+        || lower.contains("\\windows\\syswow64\\")
+        || lower.contains("\\windowsapps\\")
+}
+
+fn find_windows_git_bash_in(
+    path_env: Option<&str>,
+    program_files: Option<&str>,
+    program_files_x86: Option<&str>,
+    local_app_data: Option<&str>,
+    user_profile: Option<&str>,
+) -> Option<std::path::PathBuf> {
+    let mut candidates = Vec::new();
+    for base in [program_files, program_files_x86].into_iter().flatten() {
+        let base = Path::new(base);
+        candidates.push(base.join("Git").join("bin").join("bash.exe"));
+        candidates.push(base.join("Git").join("usr").join("bin").join("bash.exe"));
+    }
+    if let Some(local) = local_app_data {
+        let local = Path::new(local);
+        candidates.push(local.join("Programs").join("Git").join("bin").join("bash.exe"));
+        candidates.push(local.join("Programs").join("Git").join("usr").join("bin").join("bash.exe"));
+    }
+    if let Some(profile) = user_profile {
+        let profile = Path::new(profile);
+        candidates.push(profile.join("scoop").join("apps").join("git").join("current").join("bin").join("bash.exe"));
+        candidates
+            .push(profile.join("scoop").join("apps").join("git").join("current").join("usr").join("bin").join("bash.exe"));
+    }
+    for cand in candidates {
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    if let Some(path) = path_env {
+        for dir in std::env::split_paths(path) {
+            let bash = dir.join("bash.exe");
+            if bash.is_file() && !is_windows_wsl_bash_shim(&bash) {
+                return Some(bash);
+            }
+            let git = dir.join("git.exe");
+            if git.is_file()
+                && let Some(git_root) = dir.parent()
+            {
+                for rel in [Path::new("bin").join("bash.exe"), Path::new("usr").join("bin").join("bash.exe")] {
+                    let sib = git_root.join(rel);
+                    if sib.is_file() {
+                        return Some(sib);
+                    }
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Points `@agentclientprotocol/codex-acp` at the user's installed `codex` CLI (`CODEX_PATH`) when
@@ -635,10 +824,21 @@ pub fn split_words(raw: &str) -> Result<Vec<String>, RpcError> {
 }
 
 fn candidate_files_in_dir(dir: &Path, program: &str, pathext_override: Option<&str>) -> Vec<std::path::PathBuf> {
-    let mut cands = vec![dir.join(program)];
-    if cfg!(windows) && Path::new(program).extension().is_none() {
+    candidate_files_in_dir_for_platform(dir, program, pathext_override, cfg!(windows))
+}
+
+fn candidate_files_in_dir_for_platform(
+    dir: &Path,
+    program: &str,
+    pathext_override: Option<&str>,
+    is_windows: bool,
+) -> Vec<std::path::PathBuf> {
+    if is_windows && Path::new(program).extension().is_none() {
+        // On Windows, npm/npx and Git Bash place extensionless POSIX shell scripts alongside `.cmd`/`.exe`
+        // shims. Only consider `PATHEXT` executables so we never resolve an unrunnable POSIX shim first.
         let pathext = pathext_override.map(String::from).or_else(|| std::env::var("PATHEXT").ok());
         let exts = pathext.as_deref().filter(|s| !s.trim().is_empty()).unwrap_or(".COM;.EXE;.BAT;.CMD");
+        let mut cands = Vec::new();
         for ext in exts.split(';').map(str::trim).filter(|e| !e.is_empty()) {
             cands.push(dir.join(format!("{program}{ext}")));
             let lower = ext.to_ascii_lowercase();
@@ -646,8 +846,9 @@ fn candidate_files_in_dir(dir: &Path, program: &str, pathext_override: Option<&s
                 cands.push(dir.join(format!("{program}{lower}")));
             }
         }
+        return cands;
     }
-    cands
+    vec![dir.join(program)]
 }
 
 fn check_not_ide_shim(program: &str) -> Result<(), RpcError> {
@@ -1143,6 +1344,72 @@ mod tests {
         )
         .unwrap();
         assert!(check_claude_acp_readiness_in(&argv, &empty_env, &root, None).is_ok());
+
+        // 8. Multi-home fallback (e.g. Windows where HOME is a POSIX path like /c/Users/...
+        //    while USERPROFILE holds .claude/.credentials.json) still passes.
+        let fake_posix_home = root.join("nonexistent-posix-home");
+        assert!(
+            check_claude_acp_readiness_in_homes(&argv, &empty_env, &[fake_posix_home.clone(), root.clone()], None, None)
+                .is_ok()
+        );
+
+        // 9. Project-local .claude/settings.local.json with ANTHROPIC_BASE_URL passes.
+        let empty_home = root.join("empty-home");
+        let project_dir = root.join("project");
+        std::fs::create_dir_all(project_dir.join(".claude")).unwrap();
+        std::fs::write(
+            project_dir.join(".claude/settings.local.json"),
+            r#"{"env":{"ANTHROPIC_BASE_URL":"http://127.0.0.1:4000"}}"#,
+        )
+        .unwrap();
+        assert!(
+            check_claude_acp_readiness_in_homes(&argv, &empty_env, &[empty_home], None, Some(&project_dir)).is_ok()
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn windows_candidate_resolution_skips_extensionless_posix_shims_and_finds_git_bash() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr2-win-claude-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_nanos()
+        ));
+        let npm_dir = root.join("npm");
+        std::fs::create_dir_all(&npm_dir).unwrap();
+        std::fs::write(npm_dir.join("claude-agent-acp"), "#!/bin/sh\n").unwrap();
+        std::fs::write(npm_dir.join("claude-agent-acp.cmd"), "@echo off\r\n").unwrap();
+
+        let win_cands =
+            candidate_files_in_dir_for_platform(&npm_dir, "claude-agent-acp", Some(".EXE;.CMD"), true);
+        assert!(
+            !win_cands.contains(&npm_dir.join("claude-agent-acp")),
+            "Windows resolution must not pick extensionless POSIX shim: {win_cands:?}"
+        );
+        let picked = win_cands.into_iter().find(|p| p.is_file()).expect("should resolve .cmd");
+        assert_eq!(picked, npm_dir.join("claude-agent-acp.cmd"));
+
+        // Git Bash discovery: skips System32 WSL shim and finds Git\bin\bash.exe relative to git.exe on PATH.
+        let fake_sys32 = root.join("Windows/System32");
+        let git_cmd = root.join("CustomGit/cmd");
+        let git_bin = root.join("CustomGit/bin");
+        std::fs::create_dir_all(&fake_sys32).unwrap();
+        std::fs::create_dir_all(&git_cmd).unwrap();
+        std::fs::create_dir_all(&git_bin).unwrap();
+        std::fs::write(fake_sys32.join("bash.exe"), b"").unwrap();
+        std::fs::write(git_cmd.join("git.exe"), b"").unwrap();
+        let expected_bash = git_bin.join("bash.exe");
+        std::fs::write(&expected_bash, b"").unwrap();
+
+        let joined_path = std::env::join_paths([&fake_sys32, &git_cmd]).unwrap();
+        let found = find_windows_git_bash_in(
+            Some(&joined_path.to_string_lossy()),
+            None,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(found.as_deref(), Some(expected_bash.as_path()));
 
         let _ = std::fs::remove_dir_all(&root);
     }

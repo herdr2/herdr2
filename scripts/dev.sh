@@ -323,6 +323,11 @@ PY
           fi
           cp "$WIN_APP_BUILT" "$WIN_APP_DIR/$bin_exe"
         done
+        [[ -f "$ROOT/herdr-app/assets/icons/herdr-app.ico" ]] && cp "$ROOT/herdr-app/assets/icons/herdr-app.ico" "$WIN_APP_DIR/herdr2.ico"
+        [[ -f "$ROOT/herdr-app/assets/icons/herdr-ui-icon-clean.svg" ]] && cp "$ROOT/herdr-app/assets/icons/herdr-ui-icon-clean.svg" "$WIN_APP_DIR/herdr2.svg"
+        if [[ -x "/mnt/c/Windows/System32/ie4uinit.exe" ]]; then
+          timeout 5 /mnt/c/Windows/System32/ie4uinit.exe -show </dev/null >/dev/null 2>&1 || true
+        fi
         local BUILT_SHA INSTALLED_SHA
         BUILT_SHA="$(sha256sum "$WIN_APP_BUILT" | awk '{print $1}')"
         INSTALLED_SHA="$(sha256sum "$WIN_APP_DIR/herdr2.exe" | awk '{print $1}')"

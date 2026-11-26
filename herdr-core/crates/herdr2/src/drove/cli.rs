@@ -93,6 +93,22 @@ pub enum DroveAction {
         #[arg(long)]
         refresh: bool,
     },
+    /// Use the configured AI assistant model to diagnose Drove ACP agent probe errors and suggest fixes.
+    ProbeAiDiagnose {
+        #[arg(long, value_name = "FILE")]
+        file: Option<PathBuf>,
+        /// Optional comma-separated list of agent IDs to diagnose (defaults to all errored agents).
+        #[arg(long, value_delimiter = ',')]
+        agents: Vec<String>,
+        /// Preferred output language (e.g. zh-CN or en).
+        #[arg(long)]
+        language: Option<String>,
+        #[arg(long, value_name = "MACHINE")]
+        on: Option<String>,
+        /// Delete `--file` right after reading it.
+        #[arg(long)]
+        consume: bool,
+    },
     /// Test the lightweight AI assistant URL and API key.
     AiTest {
         #[arg(long, value_name = "FILE")]
@@ -509,7 +525,17 @@ fn print_err(err: &RpcError, json_mode: bool) -> i32 {
 
 fn call_core(paths: &Paths, method: &str, params: Value) -> Result<Value, RpcError> {
     let stream = client::connect_or_start(paths)?;
-    client::call(&stream, method, params).map_err(|e| client::explain_closed(paths, e))
+    match client::call(&stream, method, params.clone()) {
+        Ok(val) => Ok(val),
+        Err(err) if err.kind == "unknown_method" && crate::api::METHOD_NAMES.contains(&method) => {
+            // If an older local background daemon is running without newer RPC methods, restart it once and retry.
+            let _ = client::call(&stream, "server.restart", json!({}));
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            let stream = client::connect_or_start(paths)?;
+            client::call(&stream, method, params).map_err(|e| client::explain_closed(paths, e))
+        }
+        Err(err) => Err(client::explain_closed(paths, err)),
+    }
 }
 
 fn proxy_call(
@@ -967,6 +993,42 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
                 }
             }
             Ok((val, lines.join("\n")))
+        }
+        DroveAction::ProbeAiDiagnose { file, agents, language, on, consume } => {
+            let mut p = match file {
+                Some(f) => read_json_file(&f, consume)?,
+                None => json!({}),
+            };
+            if !agents.is_empty() {
+                p["agents"] = json!(agents);
+            }
+            if let Some(lang) = language {
+                p["language"] = Value::String(lang);
+            }
+            if let Some(m) = on {
+                p["on"] = Value::String(m);
+            }
+            let val = call_core(paths, "drove.probe.ai_diagnose", p)?;
+            let ok = val["ok"].as_bool().unwrap_or(false);
+            let human = if ok {
+                let mut lines = Vec::new();
+                if let Some(s) = val["summary"].as_str().filter(|s| !s.trim().is_empty()) {
+                    lines.push(s.to_string());
+                }
+                if let Some(items) = val["items"].as_array() {
+                    for it in items {
+                        let ag = it["agent"].as_str().unwrap_or("?");
+                        let cat = it["category"].as_str().unwrap_or("unknown");
+                        let fix = it["fix"].as_str().unwrap_or("");
+                        let cmd = it["command"].as_str().map(|c| format!(" [cmd: {c}]")).unwrap_or_default();
+                        lines.push(format!("  - {ag} ({cat}): {fix}{cmd}"));
+                    }
+                }
+                lines.join("\n")
+            } else {
+                format!("AI probe diagnose failed: {}", val["error"].as_str().unwrap_or("unknown"))
+            };
+            Ok((val, human))
         }
         DroveAction::AiTest { file, url, model, on, consume } => {
             let mut p = match file {

@@ -25,7 +25,7 @@
 | `F09` | `herdr-core` | 文件、文档、命令执行与跨机 SSH 联邦 | L1-core-isolated | 7 | 16 / 0 / 0 / 0 |
 | `F10` | `herdr-core` | Drove 单守护进程多智能体 DAG 编排与 Worker 协议 | L1-core-isolated, L4-live-llm | 4 | 1 / 0 / 0 / 0 |
 | `F11` | `herdr-core` | Drove 隔离沙盒、角色权限围栏、Worktree 合并与对抗评审 | L1-core-isolated | 4 | 0 / 0 / 0 / 0 |
-| `F12` | `herdr-core` | 共享 Core AI 运行时、KV-Cache 复用与 Drove 智能配置 | L1-core-isolated, L4-live-llm | 4 | 18 / 0 / 0 / 0 |
+| `F12` | `herdr-core` | 共享 Core AI 运行时、KV-Cache 复用与 Drove 智能配置 | L1-core-isolated, L4-live-llm | 4 | 19 / 0 / 0 / 0 |
 | `F13` | `herdr-app` | 桌面工作区模型、布局引擎与 Core 文档同步 | L2-app-sandbox | 5 | 2 / 36 / 10 / 0 |
 | `F14` | `herdr-app` | Ghostty-sys GPU 终端渲染、输入选择与程序探测 | L2-app-sandbox | 4 | 4 / 20 / 3 / 0 |
 | `F15` | `herdr-app` | 双通道 Agents 侧栏、非 7501 状态推断与回收站闭环 | L2-app-sandbox, L4-live-llm | 4 | 6 / 16 / 5 / 0 |
@@ -198,7 +198,7 @@ Shared `Core.ai` runtime with immutable >1024-token prefix, `AiSessionPool`, TTL
 | --- | --- | --- | --- | --- | --- | --- |
 | `TC-CORE-054` | Drove 配置管理、--consume 密钥清除、Probe 与 Magpie 测试 (drove.settings.get/set, probe, ai.test, magpie.test) | `L1-core-isolated` | `scripted` | `P0` | linux, macos, windows | rpc:5 |
 | `TC-CORE-055` | Core AI 运行时配置、KV-Cache >1024 Prefix 与熔断器 (ai.status, ai.settings.set, ai.test, ai.probe_prompt_mode, ai.complete) | `L1-core-isolated` | `scripted` | `P0` | linux, macos, windows | rpc:6 |
-| `TC-CORE-056` | Core AI 与 Drove 智能辅助 RPC 全集验证 (classify_terminal_state, handoff_recommend, briefing, summarize, commit_message, polish, roles.ai_configure) | `L1-core-isolated` | `scripted` | `P0` | linux, macos, windows | rpc:7 |
+| `TC-CORE-056` | Core AI 与 Drove 智能辅助 RPC 全集验证 (classify_terminal_state, handoff_recommend, briefing, summarize, commit_message, polish, roles.ai_configure, probe.ai_diagnose) | `L1-core-isolated` | `scripted` | `P0` | linux, macos, windows | rpc:8 |
 | `TC-CORE-057` | L4 实模验证：Drove Quick 与 AI Briefing 真实模型链路 (Live LLM Drove quick + ai.briefing) | `L4-live-llm` | `ai-exploratory` | `P2` | linux, macos, windows | rpc:2 |
 
 ### F13: 桌面工作区模型、布局引擎与 Core 文档同步

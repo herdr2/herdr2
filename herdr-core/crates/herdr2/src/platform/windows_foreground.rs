@@ -25,6 +25,9 @@ pub(super) fn in_front(job: HANDLE, root: u32) -> u32 {
 
 /// A known shell root's newest child, console hosts aside (Windows starts
 /// them for console programs; they are never what a person is using).
+/// Walks through nested wrapper shells (e.g. Git for Windows `Git\bin\bash.exe`
+/// spawning `Git\usr\bin\bash.exe`) so programs started inside Git Bash are
+/// detected, while returning `None` (root) when idle at the wrapper's inner shell.
 fn newest_child(root: u32, procs: &[Proc]) -> Option<u32> {
     let shell = |name: &str| {
         let name = name.to_ascii_lowercase();
@@ -47,15 +50,26 @@ fn newest_child(root: u32, procs: &[Proc]) -> Option<u32> {
                 | "ion"
         )
     };
-    if !procs.iter().any(|p| p.pid == root && shell(&p.name)) {
+    let root_proc = procs.iter().find(|p| p.pid == root && shell(&p.name))?;
+    let host = |name: &str| ["conhost.exe", "OpenConsole.exe"].iter().any(|h| name.eq_ignore_ascii_case(h));
+    let mut cur = root_proc;
+    for _ in 0..16 {
+        let Some(next) = procs
+            .iter()
+            .filter(|p| p.parent == cur.pid && p.pid != cur.pid && p.pid != root && !host(&p.name))
+            .max_by_key(|p| p.started)
+        else {
+            break;
+        };
+        cur = next;
+        if !shell(&cur.name) {
+            return Some(cur.pid);
+        }
+    }
+    if cur.pid == root || cur.name.eq_ignore_ascii_case(&root_proc.name) {
         return None;
     }
-    let host = |name: &str| ["conhost.exe", "OpenConsole.exe"].iter().any(|h| name.eq_ignore_ascii_case(h));
-    procs
-        .iter()
-        .filter(|p| p.parent == root && p.pid != root && !host(&p.name))
-        .max_by_key(|p| p.started)
-        .map(|p| p.pid)
+    Some(cur.pid)
 }
 
 /// The job's live processes: a few per terminal, so read one by one (a
@@ -140,5 +154,22 @@ mod tests {
         for shell in ["cmd.exe", "PwSh.EXE", "powershell.exe", "nu.exe", "bash", "sh.exe"] {
             assert_eq!(newest_child(10, &[p(10, 1, shell), p(11, 10, "node.exe")]), Some(11), "{shell}");
         }
+    }
+
+    #[test]
+    fn git_bash_wrapper_walks_to_inner_program_and_returns_root_when_idle() {
+        let p = |pid, parent, started, name: &str| Proc { pid, parent, started, name: name.into() };
+        // Idle `Git\bin\bash.exe` -> `Git\usr\bin\bash.exe` keeps root so `is_at_shell_root` stays true.
+        assert_eq!(newest_child(10, &[p(10, 1, 1, "bash.exe"), p(11, 10, 2, "bash.exe")]), None);
+        // Active program inside `Git\usr\bin\bash.exe` is detected across the wrapper hop.
+        assert_eq!(
+            newest_child(10, &[p(10, 1, 1, "bash.exe"), p(11, 10, 2, "bash.exe"), p(12, 11, 3, "claude.exe")]),
+            Some(12),
+        );
+        // Switching to a different shell (e.g. PowerShell inside Git Bash) reports that shell.
+        assert_eq!(
+            newest_child(10, &[p(10, 1, 1, "bash.exe"), p(11, 10, 2, "bash.exe"), p(12, 11, 3, "powershell.exe")]),
+            Some(12),
+        );
     }
 }

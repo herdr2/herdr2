@@ -253,6 +253,9 @@ methods! { Ctx<'_>;
     "drove.roles.ai_configure" => drove_roles_ai_configure, crate::drove::types::DroveRolesAiConfigureParams => crate::drove::types::DroveRolesAiConfigureResult,
         "Use the configured AI assistant model to automatically configure Drove roles, models, candidate strengths, and routing notes.",
         errors ["invalid_params", "machine_unknown", "unavailable"];
+    "drove.probe.ai_diagnose" => drove_probe_ai_diagnose, crate::drove::types::DroveProbeAiDiagnoseParams => crate::drove::types::DroveProbeAiDiagnoseResult,
+        "Use the configured AI assistant model to diagnose Drove ACP agent probe errors and suggest actionable fixes.",
+        errors ["invalid_params", "machine_unknown", "unavailable"];
     "drove.magpie.test" => drove_magpie_test, DroveMagpieTestParams => crate::drove::magpie::MagpieTestResult,
         "Test optional Magpie quota gateway connectivity.",
         errors ["invalid_params", "machine_unknown", "unavailable"];
@@ -1492,6 +1495,13 @@ async fn drove_roles_ai_configure(
     p: crate::drove::types::DroveRolesAiConfigureParams,
 ) -> Result<crate::drove::types::DroveRolesAiConfigureResult, RpcError> {
     core.drove.rpc_roles_ai_configure(p).await
+}
+
+async fn drove_probe_ai_diagnose(
+    core: Ctx<'_>,
+    p: crate::drove::types::DroveProbeAiDiagnoseParams,
+) -> Result<crate::drove::types::DroveProbeAiDiagnoseResult, RpcError> {
+    core.drove.rpc_probe_ai_diagnose(p).await
 }
 
 async fn drove_magpie_test(

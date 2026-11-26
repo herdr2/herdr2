@@ -323,15 +323,26 @@ impl Model {
     }
 
     /// Adds a space at the end and selects it.
-    /// What a space is called: its name, else its first terminal's checkout
-    /// (a worktree's own folder; outside git its folder), as Herdr names workspaces.
+    /// What a space is called: its name, else its active tab's live folder
+    /// (falling back to the space's first terminal or initial folder), as Herdr names workspaces.
     pub fn space_name(&self, p: &Space, home: &str) -> String {
         if !p.name.is_empty() {
             return p.name.clone();
         }
-        let first = p.tabs.iter().flat_map(|c| c.root.terminals()).next();
-        let folder = first
-            .and_then(|n| n.terminal().and_then(|a| self.folder_info.get(a)).map(|f| f.top.clone()).or_else(|| self.pane_folders.get(&n.id).cloned()))
+        let folder_of = |n: &Node| {
+            n.terminal()
+                .and_then(|a| self.folder_info.get(a))
+                .map(|f| f.top.clone())
+                .or_else(|| self.pane_folders.get(&n.id).cloned())
+        };
+        let active_folder = p.active_tab().and_then(|c| {
+            let focused = c.focused_pane().and_then(|id| c.root.find(&id)).filter(|n| n.terminal().is_some());
+            focused
+                .and_then(folder_of)
+                .or_else(|| c.root.terminals().into_iter().find_map(folder_of))
+        });
+        let folder = active_folder
+            .or_else(|| p.tabs.iter().flat_map(|c| c.root.terminals()).find_map(folder_of))
             .unwrap_or_else(|| p.folder.clone());
         folder_name(&folder, home)
     }
@@ -1018,6 +1029,12 @@ mod tests {
         assert_eq!(m.space_name(&p, "/home/me"), "notes");
         m.folder_info.insert("t1".into(), FolderInfo { top: "/src/herdr".into(), branch: Some("main".into()) });
         assert_eq!(m.space_name(&p, "/home/me"), "herdr");
+        // When the active tab (`c3`/`t3`) has its own live folder (e.g. a Git Bash or CMD tab cd'd elsewhere),
+        // unnamed space name follows the active tab's folder.
+        m.pane_folders.insert("x3".into(), "/src/cmd-proj".into());
+        assert_eq!(m.space_name(&p, "/home/me"), "cmd-proj");
+        m.folder_info.insert("t3".into(), FolderInfo { top: "/src/gitbash-repo".into(), branch: Some("dev".into()) });
+        assert_eq!(m.space_name(&p, "/home/me"), "gitbash-repo");
         let names: Vec<String> = p.tabs.iter().map(|c| Model::tab_name(&p, c)).collect();
         assert_eq!(names.iter().map(String::as_str).collect::<Vec<_>>(), ["1", "review", "3"]);
         m.space_mut("p1").unwrap().name = "api".into();

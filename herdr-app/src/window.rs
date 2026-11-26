@@ -101,12 +101,108 @@ fn mtime(p: &std::path::Path) -> Option<SystemTime> {
 
 const WIN_PS_HOOK: &str = "$global:__h2_prompt = $function:prompt; function global:prompt { $p = & $global:__h2_prompt; $l = $ExecutionContext.SessionState.Path.CurrentLocation; if ($l.Provider.Name -eq 'FileSystem') { try { [Environment]::CurrentDirectory = $l.ProviderPath } catch {} }; $p }";
 
+const WIN_GIT_BASH_OSC7_RC: &str = concat!(
+    "# Herdr2 Git Bash init: preserve login profile loading and report CWD via OSC 7.\n",
+    "export CHERE_INVOKING=1\n",
+    "[ -r /etc/profile ] && . /etc/profile\n",
+    "if [ -r \"${HOME}/.bash_profile\" ]; then\n",
+    "  . \"${HOME}/.bash_profile\"\n",
+    "elif [ -r \"${HOME}/.bash_login\" ]; then\n",
+    "  . \"${HOME}/.bash_login\"\n",
+    "elif [ -r \"${HOME}/.profile\" ]; then\n",
+    "  . \"${HOME}/.profile\"\n",
+    "elif [ -r \"${HOME}/.bashrc\" ]; then\n",
+    "  . \"${HOME}/.bashrc\"\n",
+    "fi\n",
+    "__h2_osc7() {\n",
+    "  local __ec=$?\n",
+    "  local __p\n",
+    "  __p=\"$(pwd -W 2>/dev/null || pwd)\"\n",
+    "  __p=\"${__p//%/%25}\"\n",
+    "  __p=\"${__p//#/%23}\"\n",
+    "  __p=\"${__p//\\?/%3F}\"\n",
+    "  __p=\"${__p// /%20}\"\n",
+    "  printf '\\033]7;file:///%s\\033\\\\' \"$__p\"\n",
+    "  return $__ec\n",
+    "}\n",
+    "if [[ \"$(declare -p PROMPT_COMMAND 2>/dev/null)\" == \"declare -a\"* ]]; then\n",
+    "  PROMPT_COMMAND=(__h2_osc7 \"${PROMPT_COMMAND[@]}\")\n",
+    "elif [[ -n \"${PROMPT_COMMAND:-}\" ]]; then\n",
+    "  PROMPT_COMMAND=$'__h2_osc7\\n'\"${PROMPT_COMMAND}\"\n",
+    "else\n",
+    "  PROMPT_COMMAND=\"__h2_osc7\"\n",
+    "fi\n",
+);
+
+fn is_executable_file(path: &std::path::Path) -> bool {
+    if path.is_file() {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        // Microsoft Store / MSIX App Execution Aliases (`%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe`)
+        // are reparse points where `is_file()` returns false with ERROR_CANT_ACCESS_FILE (1920),
+        // even though `CreateProcessW` executes them normally.
+        const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            let attrs = meta.file_attributes();
+            return (attrs & FILE_ATTRIBUTE_DIRECTORY) == 0 && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+        }
+    }
+    false
+}
+
 fn find_exe_in_path(path_os: Option<&std::ffi::OsStr>, exe: &str) -> Option<String> {
     let path = path_os?;
     std::env::split_paths(path)
         .map(|dir| dir.join(exe))
-        .find(|cand| cand.is_file())
+        .find(|cand| is_executable_file(cand))
         .map(|cand| cand.to_string_lossy().into_owned())
+}
+
+fn find_pwsh_with(
+    path_os: Option<&std::ffi::OsStr>,
+    program_files: Option<&str>,
+    program_files_x86: Option<&str>,
+    local_app_data: Option<&str>,
+    user_profile: Option<&str>,
+) -> Option<String> {
+    if let Some(found) = find_exe_in_path(path_os, "pwsh.exe") {
+        return Some(found);
+    }
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    for base in [program_files, program_files_x86].into_iter().flatten() {
+        let ps = std::path::Path::new(base).join("PowerShell");
+        candidates.push(ps.join("7").join("pwsh.exe"));
+        candidates.push(ps.join("7-preview").join("pwsh.exe"));
+    }
+    if let Some(local) = local_app_data {
+        let local = std::path::Path::new(local);
+        candidates.push(local.join("Microsoft").join("WindowsApps").join("pwsh.exe"));
+        candidates.push(local.join("Programs").join("PowerShell").join("7").join("pwsh.exe"));
+    }
+    if let Some(profile) = user_profile {
+        let profile = std::path::Path::new(profile);
+        candidates.push(profile.join(".dotnet").join("tools").join("pwsh.exe"));
+        candidates.push(profile.join("scoop").join("shims").join("pwsh.exe"));
+    }
+    candidates
+        .into_iter()
+        .find(|cand| is_executable_file(cand))
+        .map(|cand| cand.to_string_lossy().into_owned())
+}
+
+fn ensure_git_bash_rcfile() -> Option<String> {
+    let dir = mods::app_dir().join("shell");
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("git-bash-init.sh");
+    let up_to_date = std::fs::read_to_string(&path).ok().as_deref() == Some(WIN_GIT_BASH_OSC7_RC);
+    if !up_to_date {
+        std::fs::write(&path, WIN_GIT_BASH_OSC7_RC).ok()?;
+    }
+    Some(path.to_string_lossy().replace('\\', "/"))
 }
 
 fn find_git_bash_with(
@@ -123,14 +219,14 @@ fn find_git_bash_with(
     if let Some(local) = local_app_data {
         candidates.push(std::path::Path::new(local).join("Programs").join("Git").join("bin").join("bash.exe"));
     }
-    if let Some(cand) = candidates.into_iter().find(|p| p.is_file()) {
+    if let Some(cand) = candidates.into_iter().find(|p| is_executable_file(p)) {
         return Some(cand.to_string_lossy().into_owned());
     }
     if let Some(path) = path_os {
         for dir in std::env::split_paths(path) {
             let cand = dir.join("bash.exe");
             let lower = dir.to_string_lossy().to_ascii_lowercase();
-            if cand.is_file() && !lower.ends_with("\\system32") && !lower.ends_with("/system32") {
+            if is_executable_file(&cand) && !lower.ends_with("\\system32") && !lower.ends_with("/system32") {
                 return Some(cand.to_string_lossy().into_owned());
             }
         }
@@ -159,16 +255,19 @@ fn resolve_windows_shell_exe_with(
     local_app_data: Option<&str>,
     comspec: Option<&str>,
 ) -> (WindowsShellKind, String) {
+    let profile = std::env::var("USERPROFILE").ok();
     let c = choice.trim();
     match c.to_ascii_lowercase().as_str() {
         "" | "auto" | "wsl" => (
             WindowsShellKind::PowerShell,
-            find_exe_in_path(path_os, "pwsh.exe").unwrap_or_else(|| "powershell.exe".into()),
+            find_pwsh_with(path_os, program_files, program_files_x86, local_app_data, profile.as_deref())
+                .unwrap_or_else(|| "powershell.exe".into()),
         ),
         "powershell" | "windows-powershell" => (WindowsShellKind::PowerShell, "powershell.exe".into()),
         "pwsh" | "powershell7" => (
             WindowsShellKind::PowerShell,
-            find_exe_in_path(path_os, "pwsh.exe").unwrap_or_else(|| "pwsh.exe".into()),
+            find_pwsh_with(path_os, program_files, program_files_x86, local_app_data, profile.as_deref())
+                .unwrap_or_else(|| "pwsh.exe".into()),
         ),
         "git-bash" | "gitbash" | "bash" => (
             WindowsShellKind::GitBash,
@@ -191,6 +290,7 @@ fn resolve_windows_shell_exe_with(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn resolve_windows_shell_argv_with(
     choice: &str,
     path_os: Option<&std::ffi::OsStr>,
@@ -199,23 +299,96 @@ pub(crate) fn resolve_windows_shell_argv_with(
     local_app_data: Option<&str>,
     comspec: Option<&str>,
 ) -> Option<Vec<String>> {
+    resolve_windows_shell_argv_with_rc(choice, path_os, program_files, program_files_x86, local_app_data, comspec, None)
+}
+
+pub(crate) fn resolve_windows_shell_argv_with_rc(
+    choice: &str,
+    path_os: Option<&std::ffi::OsStr>,
+    program_files: Option<&str>,
+    program_files_x86: Option<&str>,
+    local_app_data: Option<&str>,
+    comspec: Option<&str>,
+    git_bash_rcfile: Option<&str>,
+) -> Option<Vec<String>> {
+    let profile = std::env::var("USERPROFILE").ok();
     let ps_argv = |exe: String| vec![exe, "-NoExit".into(), "-Command".into(), WIN_PS_HOOK.into()];
     let c = choice.trim();
     match c.to_ascii_lowercase().as_str() {
         "" | "auto" | "wsl" => None,
         "powershell" | "windows-powershell" => Some(ps_argv("powershell.exe".into())),
         "pwsh" | "powershell7" => Some(ps_argv(
-            find_exe_in_path(path_os, "pwsh.exe").unwrap_or_else(|| "pwsh.exe".into()),
+            find_pwsh_with(path_os, program_files, program_files_x86, local_app_data, profile.as_deref())
+                .unwrap_or_else(|| "pwsh.exe".into()),
         )),
         "git-bash" | "gitbash" | "bash" => {
             let exe = find_git_bash_with(path_os, program_files, program_files_x86, local_app_data)
                 .unwrap_or_else(|| "bash.exe".into());
-            Some(vec![exe, "--login".into(), "-i".into()])
+            match git_bash_rcfile.filter(|s| !s.is_empty()) {
+                Some(rc) => Some(vec![exe, "--rcfile".into(), rc.to_owned(), "-i".into()]),
+                None => Some(vec![exe, "--login".into(), "-i".into()]),
+            }
         }
         "cmd" => Some(vec![comspec.filter(|s| !s.is_empty()).unwrap_or("cmd.exe").into()]),
         _ => Some(vec![c.to_owned()]),
     }
 }
+
+const WIN_GIT_BASH_PROFILE_LOAD: &str = concat!(
+    "__h2_pwd=$PWD; ",
+    "[ -r /etc/profile ] && . /etc/profile >/dev/null 2>&1; ",
+    "exec() { ",
+    "case \"${1##*/}\" in ",
+    "zsh|zsh.exe|bash|bash.exe|fish|fish.exe|sh|sh.exe|dash|ksh|tmux|tmux.exe|screen|pwsh|pwsh.exe|powershell|powershell.exe|nu|nu.exe) return 0 ;; ",
+    "esac; ",
+    "builtin exec \"$@\"; ",
+    "}; ",
+    "if [ -r ~/.bash_profile ]; then . ~/.bash_profile >/dev/null 2>&1; ",
+    "elif [ -r ~/.bash_login ]; then . ~/.bash_login >/dev/null 2>&1; ",
+    "elif [ -r ~/.profile ]; then . ~/.profile >/dev/null 2>&1; ",
+    "elif [ -r ~/.bashrc ]; then . ~/.bashrc >/dev/null 2>&1; ",
+    "fi; ",
+    "unset -f exec; ",
+    "cd \"$__h2_pwd\" 2>/dev/null || true; ",
+    "unset __h2_pwd; ",
+);
+
+const WIN_POSIX_RUN_STAY: &str = concat!(
+    "__h2_p=$1; shift; ",
+    "__h2_b=$(command -v -- \"$__h2_p\" 2>/dev/null); ",
+    "if [ -n \"${MSYS_NO_PATHCONV:-}\" ] && case \"$__h2_b\" in /*) true ;; *) false ;; esac && ! command -v -- \"$__h2_p.exe\" >/dev/null 2>&1 && command -v -- \"$__h2_p.cmd\" >/dev/null 2>&1; then ",
+    "\"$__h2_p.cmd\" \"$@\"; ",
+    "elif [ -n \"$__h2_b\" ]; then ",
+    "\"$__h2_p\" \"$@\"; ",
+    "elif command -v -- \"$__h2_p.cmd\" >/dev/null 2>&1; then ",
+    "\"$__h2_p.cmd\" \"$@\"; ",
+    "elif command -v -- \"$__h2_p.bat\" >/dev/null 2>&1; then ",
+    "\"$__h2_p.bat\" \"$@\"; ",
+    "elif __h2_ps1=$(command -v -- \"$__h2_p.ps1\" 2>/dev/null); then ",
+    "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"$(cygpath -w \"$__h2_ps1\" 2>/dev/null || printf %s \"$__h2_ps1\")\" \"$@\"; ",
+    "else ",
+    "\"$__h2_p\" \"$@\"; ",
+    "fi; ",
+    "exec \"$0\" -li",
+);
+
+const WIN_POSIX_RUN_EXEC: &str = concat!(
+    "__h2_p=$1; shift; ",
+    "__h2_b=$(command -v -- \"$__h2_p\" 2>/dev/null); ",
+    "if [ -n \"${MSYS_NO_PATHCONV:-}\" ] && case \"$__h2_b\" in /*) true ;; *) false ;; esac && ! command -v -- \"$__h2_p.exe\" >/dev/null 2>&1 && command -v -- \"$__h2_p.cmd\" >/dev/null 2>&1; then ",
+    "unset HERDR_LAUNCH; exec \"$__h2_p.cmd\" \"$@\"; ",
+    "elif [ -n \"$__h2_b\" ]; then ",
+    "unset HERDR_LAUNCH; exec \"$__h2_p\" \"$@\"; ",
+    "elif command -v -- \"$__h2_p.cmd\" >/dev/null 2>&1; then ",
+    "unset HERDR_LAUNCH; exec \"$__h2_p.cmd\" \"$@\"; ",
+    "elif command -v -- \"$__h2_p.bat\" >/dev/null 2>&1; then ",
+    "unset HERDR_LAUNCH; exec \"$__h2_p.bat\" \"$@\"; ",
+    "elif __h2_ps1=$(command -v -- \"$__h2_p.ps1\" 2>/dev/null); then ",
+    "unset HERDR_LAUNCH; exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"$(cygpath -w \"$__h2_ps1\" 2>/dev/null || printf %s \"$__h2_ps1\")\" \"$@\"; ",
+    "else ",
+    "printf '\\033]2;%s\\007cannot start \"%s\": No such file or directory\\n' \"$HERDR_LAUNCH\" \"$__h2_p\" >&2; exit 127; ",
+    "fi",
+);
 
 pub(crate) fn wrap_windows_command_with(
     choice: &str,
@@ -239,14 +412,23 @@ pub(crate) fn wrap_windows_command_with(
             argv
         }
         WindowsShellKind::GitBash => {
-            let fish = windows_exe_stem(&exe) == "fish";
-            let script = match (fish, stay) {
-                (true, true) => "command $argv[2..]; exec $argv[1] -li",
-                (false, true) => "\"$@\"; exec \"$0\" -li",
-                (true, false) => crate::remote_shell::FISH_EXEC,
-                (false, false) => crate::remote_shell::POSIX_EXEC,
+            let stem = windows_exe_stem(&exe);
+            if stem == "fish" {
+                let script = if stay { "command $argv[2..]; exec $argv[1] -li" } else { crate::remote_shell::FISH_EXEC };
+                let mut argv = vec![exe.clone(), "-lic".into(), script.into(), exe];
+                argv.extend(cmd);
+                return argv;
+            }
+            // Start non-interactive `-c` so `~/.bashrc` hooks (e.g. `if [ -t 1 ]; then exec zsh; fi`)
+            // cannot replace the shell before the CLI command runs, while still loading profiles
+            // safely and resolving Windows `.cmd`/`.bat`/`.ps1` shims that POSIX PATH lookup skips.
+            let run_body = if stay { WIN_POSIX_RUN_STAY } else { WIN_POSIX_RUN_EXEC };
+            let script = if stem == "bash" {
+                format!("{WIN_GIT_BASH_PROFILE_LOAD}{run_body}")
+            } else {
+                format!("[ -r /etc/profile ] && . /etc/profile >/dev/null 2>&1; {run_body}")
             };
-            let mut argv = vec![exe.clone(), "-lic".into(), script.into(), exe];
+            let mut argv = vec![exe.clone(), "-c".into(), script, exe];
             argv.extend(cmd);
             argv
         }
@@ -306,25 +488,44 @@ fn resolve_windows_shell_argv(choice: &str) -> Option<Vec<String>> {
     let pfx86 = std::env::var("ProgramFiles(x86)").ok();
     let local = std::env::var("LOCALAPPDATA").ok();
     let comspec = std::env::var("COMSPEC").ok();
-    resolve_windows_shell_argv_with(
+    let is_git_bash = matches!(choice.trim().to_ascii_lowercase().as_str(), "git-bash" | "gitbash" | "bash");
+    let rc = is_git_bash.then(ensure_git_bash_rcfile).flatten();
+    resolve_windows_shell_argv_with_rc(
         choice,
         path_os.as_deref(),
         pf.as_deref(),
         pfx86.as_deref(),
         local.as_deref(),
         comspec.as_deref(),
+        rc.as_deref(),
     )
 }
 
 pub fn shell() -> String {
     if cfg!(windows) {
-        let path = std::env::var_os("PATH").unwrap_or_default();
-        return std::env::split_paths(&path)
-            .map(|dir| dir.join("pwsh.exe"))
-            .find(|exe| exe.is_file())
-            .map_or_else(|| "powershell.exe".into(), |exe| exe.to_string_lossy().into_owned());
+        let path_os = std::env::var_os("PATH");
+        let pf = std::env::var("ProgramFiles").ok();
+        let pfx86 = std::env::var("ProgramFiles(x86)").ok();
+        let local = std::env::var("LOCALAPPDATA").ok();
+        let profile = std::env::var("USERPROFILE").ok();
+        return find_pwsh_with(path_os.as_deref(), pf.as_deref(), pfx86.as_deref(), local.as_deref(), profile.as_deref())
+            .unwrap_or_else(|| "powershell.exe".into());
     }
     std::env::var("SHELL").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "/bin/sh".into())
+}
+
+fn format_terminal_spawn_error(argv: &[String], on: Option<&str>, raw_error: &str, is_zh: bool) -> String {
+    let is_pwsh = on.is_none()
+        && argv.first().is_some_and(|exe| windows_exe_stem(exe) == "pwsh")
+        && raw_error.to_ascii_lowercase().contains("not found");
+    if is_pwsh {
+        return if is_zh {
+            "未检测到 PowerShell 7 (pwsh.exe)。Windows 默认仅自带 Windows PowerShell 5.1，PowerShell 7 需单独安装（可运行 `winget install Microsoft.PowerShell`），或在新建菜单/设置中改选 PowerShell 或自动。".into()
+        } else {
+            "PowerShell 7 (pwsh.exe) is not installed. Windows only includes Windows PowerShell 5.1 by default; install PowerShell 7 (`winget install Microsoft.PowerShell`) or switch the terminal shell to PowerShell / Auto.".into()
+        };
+    }
+    format!("cannot start a terminal: {raw_error}")
 }
 
 fn cli_model_has_embedded_effort(model: &str) -> bool {
@@ -682,7 +883,14 @@ fn acp_launch_failure_toast_spec(record: &Value, error_msg: Option<&str>, is_zh:
             raw_err.to_string()
         }
     } else if !raw_err.is_empty() {
-        raw_err.lines().next().unwrap_or(raw_err).trim().to_string()
+        let head = raw_err.lines().next().unwrap_or(raw_err).trim();
+        let stderr_detail = raw_err
+            .split_once("\nstderr:\n")
+            .and_then(|(_, rest)| rest.lines().map(str::trim).find(|l| !l.is_empty()));
+        match stderr_detail {
+            Some(detail) if !head.contains(detail) => format!("{head}\n{detail}"),
+            _ => head.to_string(),
+        }
     } else if is_zh {
         "ACP 进程未能完成初始化，请检查该工具是否已安装并可用。".to_string()
     } else {
@@ -5684,6 +5892,7 @@ impl AppWindow {
             use std::hash::{BuildHasher, Hasher};
             labels["herdr.launch"] = format!("herdr-launch-{:016x}", std::collections::hash_map::RandomState::new().build_hasher().finish()).into();
         }
+        let is_zh = self.person.language == settings::Language::ZhCn;
         let (addr, cwd) = run_following_folder(cwd, follow, on, |cwd| match self.core.run(argv.clone(), cwd.clone(), labels.clone(), on, size, crate::terminal::initial_display(window)) {
             // A start on a machine without `sh` (Windows): in its PowerShell, or as given.
             Err(e) if on.is_some() && argv.first().map(String::as_str) == Some("sh") && format!("{e:#}").contains("not found") => {
@@ -5692,7 +5901,7 @@ impl AppWindow {
             }
             r => r,
         })
-        .map_err(|e| format!("cannot start a terminal: {e:#}"))?;
+        .map_err(|e| format_terminal_spawn_error(&argv, on, &format!("{e:#}"), is_zh))?;
         self.born.borrow_mut().insert(addr.clone(), Instant::now());
         // Follow the launch folder until the first live folder report arrives.
         if !cwd.is_empty() {
@@ -14921,8 +15130,49 @@ export default class SystemToast extends View {
         assert_eq!(pwsh[0], pwsh_dir.join("pwsh.exe").to_string_lossy());
         assert_eq!(pwsh[1], "-NoExit");
 
+        // PowerShell 7 installed in Program Files\PowerShell\7 or WindowsApps is found even when not on PATH.
+        let pf_pwsh_dir = pf.join("PowerShell").join("7");
+        let _ = std::fs::create_dir_all(&pf_pwsh_dir);
+        let pf_pwsh = pf_pwsh_dir.join("pwsh.exe");
+        std::fs::write(&pf_pwsh, b"").unwrap();
+        let pwsh_pf = super::resolve_windows_shell_argv_with("pwsh", None, Some(pf_str), None, None, None).unwrap();
+        assert_eq!(pwsh_pf[0], pf_pwsh.to_string_lossy());
+
+        let local_dir = dir.join("LocalAppData");
+        let winapps_dir = local_dir.join("Microsoft").join("WindowsApps");
+        let _ = std::fs::create_dir_all(&winapps_dir);
+        let store_pwsh = winapps_dir.join("pwsh.exe");
+        std::fs::write(&store_pwsh, b"").unwrap();
+        let pwsh_store = super::resolve_windows_shell_argv_with("pwsh", None, None, None, local_dir.to_str(), None).unwrap();
+        assert_eq!(pwsh_store[0], store_pwsh.to_string_lossy());
+
         let gb = super::resolve_windows_shell_argv_with("git-bash", Some(&path_joined), Some(pf_str), None, None, None).unwrap();
         assert_eq!(gb, vec![git_bash.to_string_lossy().into_owned(), "--login".into(), "-i".into()]);
+
+        let gb_rc = super::resolve_windows_shell_argv_with_rc(
+            "git-bash",
+            Some(&path_joined),
+            Some(pf_str),
+            None,
+            None,
+            None,
+            Some("C:/Users/me/AppData/Roaming/herdr2/shell/git-bash-init.sh"),
+        )
+        .unwrap();
+        assert_eq!(
+            gb_rc,
+            vec![
+                git_bash.to_string_lossy().into_owned(),
+                "--rcfile".into(),
+                "C:/Users/me/AppData/Roaming/herdr2/shell/git-bash-init.sh".into(),
+                "-i".into(),
+            ]
+        );
+
+        let zh_err = super::format_terminal_spawn_error(&["pwsh.exe".into()], None, "pwsh.exe: not found on PATH", true);
+        assert!(zh_err.contains("PowerShell 7") && zh_err.contains("winget install Microsoft.PowerShell"));
+        let en_err = super::format_terminal_spawn_error(&["pwsh.exe".into()], None, "pwsh.exe: not found on PATH", false);
+        assert!(en_err.contains("PowerShell 7") && en_err.contains("winget install Microsoft.PowerShell"));
 
         let gb_path = super::resolve_windows_shell_argv_with("git-bash", Some(&path_joined), None, None, None, None).unwrap();
         // Should skip System32\bash.exe shim when ProgramFiles has nothing.
@@ -14952,8 +15202,8 @@ export default class SystemToast extends View {
 
         let gb_cli = super::wrap_windows_command_with("git-bash", cli.clone(), true, Some(&path_joined), Some(pf_str), None, None, None);
         assert_eq!(gb_cli[0], git_bash.to_string_lossy());
-        assert_eq!(gb_cli[1], "-lic");
-        assert_eq!(gb_cli[2], "\"$@\"; exec \"$0\" -li");
+        assert_eq!(gb_cli[1], "-c");
+        assert!(gb_cli[2].contains("/etc/profile") && gb_cli[2].contains("exec \"$0\" -li"));
         assert_eq!(gb_cli[3], git_bash.to_string_lossy());
         assert_eq!(&gb_cli[4..], cli.as_slice());
         assert_eq!(super::AppWindow::unwrap_shell_agent_argv(gb_cli), cli);

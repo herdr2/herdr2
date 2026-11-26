@@ -38,6 +38,7 @@ mod ffi {
     pub const OPT_WRITE_PTY: i32 = 1;
     pub const OPT_XTVERSION: i32 = 4;
     pub const OPT_TITLE_CHANGED: i32 = 5;
+    pub const OPT_PWD_CHANGED: i32 = 25;
     pub const OPT_PROGRAM_STATUS: i32 = 46;
     pub const OPT_SIZE: i32 = 6;
     pub const OPT_COLOR_SCHEME: i32 = 7;
@@ -53,6 +54,7 @@ mod ffi {
     pub const DATA_ACTIVE_SCREEN: i32 = 6;
     pub const DATA_SCROLLBAR: i32 = 9;
     pub const DATA_TITLE: i32 = 12;
+    pub const DATA_PWD: i32 = 13;
     pub const DATA_COLOR_FOREGROUND_DEFAULT: i32 = 22;
     pub const DATA_COLOR_BACKGROUND_DEFAULT: i32 = 23;
     pub const DATA_COLOR_CURSOR_DEFAULT: i32 = 24;
@@ -301,6 +303,7 @@ struct Hooks {
     responses: Vec<u8>,
     statuses: Vec<StatusReport>,
     title_changed: bool,
+    pwd_changed: bool,
     xtversion: String,
     cell: (u32, u32),
     dark: bool,
@@ -344,6 +347,10 @@ extern "C" fn on_program_status(_: ffi::Terminal, ud: *mut c_void, r: *const ffi
 
 extern "C" fn on_title_changed(_: ffi::Terminal, ud: *mut c_void) {
     unsafe { (*ud.cast::<Hooks>()).title_changed = true };
+}
+
+extern "C" fn on_pwd_changed(_: ffi::Terminal, ud: *mut c_void) {
+    unsafe { (*ud.cast::<Hooks>()).pwd_changed = true };
 }
 
 extern "C" fn on_xtversion(_: ffi::Terminal, ud: *mut c_void) -> ffi::Str {
@@ -399,6 +406,7 @@ impl Terminal {
             responses: Vec::new(),
             statuses: Vec::new(),
             title_changed: false,
+            pwd_changed: false,
             xtversion: String::new(),
             cell: DEFAULT_CELL,
             dark: true,
@@ -421,6 +429,7 @@ impl Terminal {
             set(ffi::OPT_DEVICE_ATTRIBUTES, on_device_attributes as *const c_void);
             set(ffi::OPT_PROGRAM_STATUS, on_program_status as *const c_void);
             set(ffi::OPT_TITLE_CHANGED, on_title_changed as *const c_void);
+            set(ffi::OPT_PWD_CHANGED, on_pwd_changed as *const c_void);
         }
         let mut term = term;
         term.set_display(Some(DEFAULT_FG), Some(DEFAULT_BG), Some(DEFAULT_FG), None);
@@ -463,6 +472,11 @@ impl Terminal {
     /// Whether the title changed since the last call.
     pub fn take_title_changed(&mut self) -> bool {
         std::mem::take(&mut self.hooks.title_changed)
+    }
+
+    /// Whether the working directory (OSC 7) changed since the last call.
+    pub fn take_pwd_changed(&mut self) -> bool {
+        std::mem::take(&mut self.hooks.pwd_changed)
     }
 
     /// The bytes a key press sends, given the modes the program set (cursor
@@ -624,6 +638,16 @@ impl Terminal {
     pub fn title(&self) -> String {
         let mut s = ffi::Str { ptr: ptr::null(), len: 0 };
         let rc = unsafe { ffi::ghostty_terminal_get(self.raw, ffi::DATA_TITLE, (&raw mut s).cast()) };
+        if rc != ffi::SUCCESS || s.ptr.is_null() {
+            return String::new();
+        }
+        String::from_utf8_lossy(unsafe { std::slice::from_raw_parts(s.ptr, s.len) }).into_owned()
+    }
+
+    /// The latest working directory reported via OSC 7 (raw URI string, or empty if unset).
+    pub fn pwd(&self) -> String {
+        let mut s = ffi::Str { ptr: ptr::null(), len: 0 };
+        let rc = unsafe { ffi::ghostty_terminal_get(self.raw, ffi::DATA_PWD, (&raw mut s).cast()) };
         if rc != ffi::SUCCESS || s.ptr.is_null() {
             return String::new();
         }

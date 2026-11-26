@@ -800,6 +800,17 @@ pub fn agent_command(
 /// Lifetime guard for an agent subprocess tree (a Windows job object on Windows).
 pub struct AgentGuard;
 
+pub fn spawn_agent(
+    argv: &[String],
+    env: &std::collections::BTreeMap<String, String>,
+    cwd: &str,
+) -> io::Result<(tokio::process::Child, AgentGuard)> {
+    let mut cmd = agent_command(argv, env, cwd)?;
+    let child = cmd.spawn()?;
+    Ok((child, AgentGuard))
+}
+
+#[allow(dead_code)]
 pub fn attach_agent_guard(_child: &tokio::process::Child) -> io::Result<AgentGuard> {
     Ok(AgentGuard)
 }

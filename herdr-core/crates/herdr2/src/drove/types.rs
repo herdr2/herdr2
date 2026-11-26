@@ -1575,3 +1575,81 @@ pub struct DroveRolesAiConfigureResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DroveProbeErrorInput {
+    pub id: String,
+    #[serde(default)]
+    pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(default)]
+    pub models_count: usize,
+    pub error: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DroveProbeAiDiagnoseParams {
+    #[serde(default)]
+    pub on: Option<String>,
+    /// Optional subset of errored agent IDs to diagnose (defaults to all installed agents with probe errors).
+    #[serde(default)]
+    pub agents: Option<Vec<String>>,
+    /// Optional target machine label when diagnosing a remote host's probe snapshot via local AI.
+    #[serde(default)]
+    pub target_machine: Option<String>,
+    /// Optional explicit errored agent snapshots (used when diagnosing a remote/older daemon locally or when cache is cold).
+    #[serde(default)]
+    pub errored_agents: Option<Vec<DroveProbeErrorInput>>,
+    /// Optional list of healthy installed agent IDs from the same probe snapshot.
+    #[serde(default)]
+    pub healthy_agents: Option<Vec<String>>,
+    /// Preferred output language ("zh-CN" | "en").
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Optional unsaved AI Assistant endpoint override.
+    #[serde(default)]
+    pub base_url: Option<String>,
+    /// Optional unsaved AI Assistant API key override.
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Optional unsaved AI Assistant model override.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DroveProbeDiagnosisItem {
+    pub agent: String,
+    /// Root-cause category: `"env_proxy"`, `"auth_required"`, `"missing_adapter"`, `"timeout"`, `"config"`, `"false_positive"`, or `"unknown"`.
+    pub category: String,
+    /// True when the agent likely works in interactive workspace terminals and the failure stems from headless daemon/ACP environment differences.
+    #[serde(default)]
+    pub likely_false_positive: bool,
+    pub cause: String,
+    pub fix: String,
+    /// Optional single command the user can run to diagnose or resolve the issue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Pre-split single-program argv safe to launch directly in a Herdr2 terminal tab when `command` has no shell chaining operators.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command_argv: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct DroveProbeAiDiagnoseResult {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_used: Option<String>,
+    pub latency_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<DroveProbeDiagnosisItem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}

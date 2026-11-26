@@ -154,6 +154,7 @@ jobs:
           # Stage desktop app
           Copy-Item herdr-app\target\release\herdr2.exe dist\stage-app\herdr2.exe
           Copy-Item herdr-app\assets\icons\herdr-ui-icon-clean.svg dist\stage-app\herdr2.svg
+          Copy-Item herdr-app\assets\icons\herdr-app.ico dist\stage-app\herdr2.ico
           Copy-Item herdr-app\LICENSE dist\stage-app\LICENSE
           Copy-Item herdr-app\THIRD-PARTY-NOTICES dist\stage-app\THIRD-PARTY-NOTICES
 

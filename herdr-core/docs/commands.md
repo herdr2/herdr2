@@ -449,36 +449,37 @@ Manage multi-agent Drove orchestration (`drove status`, `drove web`, `drove sett
 Usage: h2 drove [OPTIONS] [COMMAND]
 
 Commands:
-  status           Show Drove web server, configured roles, AI status, and active runs
-  web              Print or open the Drove Web UI URL in the browser
-  runs             List Drove runs (read-only) [alias: ls]
-  roles            Show configured Drove roles, models, and routing policy (read-only)
-  settings         Read Drove configuration, resolved roles, and AI connection status
-  settings-set     Update Drove configuration from a JSON file (removes temp file if requested)
-  probe            Probe installed ACP agents and discover their live model & effort options
-  ai-test          Test the lightweight AI assistant URL and API key
-  roles-ai-config  Use the configured AI assistant model to auto-configure Drove roles, models, candidate strengths, and routing notes
-  magpie-test      Test the optional Magpie quota gateway
-  use              Set the active default Run ID for subsequent CLI commands
-  plan             Create a Drove Run from a YAML/JSON plan file or stdin and launch its DAG
-  add              Append one or more tasks to an existing Run
-  quick            Quickly launch a single-task Run from the command line
-  wait             Wait for pending coordinator messages, task failures, or Run completion
-  inbox            List unread coordinator inbox messages for a Run
-  show             Inspect a Run, Task, or Message snapshot by ID
-  ack              Acknowledge a coordinator inbox message
-  reply            Reply to a worker question or escalation message
-  send             Send guidance to a running task worker (or interrupt current turn)
-  inspect          Inspect structured diagnostics and recent items for a task or attempt
-  retry            Retry a task with optional hint or new role/agent/model
-  route            Override role/agent/model/effort assignment on a pending or ready task
-  cancel           Cancel a specific task (by ID/key) or an entire Run
-  complete         Finalize a Run (runs Run-level verify gate if configured)
-  pause            Pause scheduling new tasks in a Run
-  resume           Resume a paused Run
-  worker           Worker protocol subcommands invoked by spawned worker ACP sessions
-  install          Install Drove agent skills (`drove`, `drove-add`, `drove-setup`)
-  help             Print this message or the help of the given subcommand(s)
+  status             Show Drove web server, configured roles, AI status, and active runs
+  web                Print or open the Drove Web UI URL in the browser
+  runs               List Drove runs (read-only) [alias: ls]
+  roles              Show configured Drove roles, models, and routing policy (read-only)
+  settings           Read Drove configuration, resolved roles, and AI connection status
+  settings-set       Update Drove configuration from a JSON file (removes temp file if requested)
+  probe              Probe installed ACP agents and discover their live model & effort options
+  probe-ai-diagnose  Use the configured AI assistant model to diagnose Drove ACP agent probe errors and suggest fixes
+  ai-test            Test the lightweight AI assistant URL and API key
+  roles-ai-config    Use the configured AI assistant model to auto-configure Drove roles, models, candidate strengths, and routing notes
+  magpie-test        Test the optional Magpie quota gateway
+  use                Set the active default Run ID for subsequent CLI commands
+  plan               Create a Drove Run from a YAML/JSON plan file or stdin and launch its DAG
+  add                Append one or more tasks to an existing Run
+  quick              Quickly launch a single-task Run from the command line
+  wait               Wait for pending coordinator messages, task failures, or Run completion
+  inbox              List unread coordinator inbox messages for a Run
+  show               Inspect a Run, Task, or Message snapshot by ID
+  ack                Acknowledge a coordinator inbox message
+  reply              Reply to a worker question or escalation message
+  send               Send guidance to a running task worker (or interrupt current turn)
+  inspect            Inspect structured diagnostics and recent items for a task or attempt
+  retry              Retry a task with optional hint or new role/agent/model
+  route              Override role/agent/model/effort assignment on a pending or ready task
+  cancel             Cancel a specific task (by ID/key) or an entire Run
+  complete           Finalize a Run (runs Run-level verify gate if configured)
+  pause              Pause scheduling new tasks in a Run
+  resume             Resume a paused Run
+  worker             Worker protocol subcommands invoked by spawned worker ACP sessions
+  install            Install Drove agent skills (`drove`, `drove-add`, `drove-setup`)
+  help               Print this message or the help of the given subcommand(s)
 
 Options:
       --json  JSON output even in a terminal
@@ -698,6 +699,23 @@ Options:
       --on <MACHINE>  
       --refresh       Run live ACP initialize+session/new probing instead of quick cache/PATH scan
   -h, --help          Print help
+```
+
+## h2 drove probe-ai-diagnose
+
+```text
+Use the configured AI assistant model to diagnose Drove ACP agent probe errors and suggest fixes
+
+Usage: h2 drove probe-ai-diagnose [OPTIONS]
+
+Options:
+      --file <FILE>          
+      --json                 JSON output even in a terminal
+      --agents <AGENTS>      Optional comma-separated list of agent IDs to diagnose (defaults to all errored agents)
+      --language <LANGUAGE>  Preferred output language (e.g. zh-CN or en)
+      --on <MACHINE>         
+      --consume              Delete `--file` right after reading it
+  -h, --help                 Print help
 ```
 
 ## h2 drove quick

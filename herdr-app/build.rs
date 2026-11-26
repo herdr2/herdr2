@@ -46,9 +46,68 @@ fn main() {
     embed(&base, "defaults/frame", "FRAME_MODS", "frame_mods.rs");
 
     // Windows takes the window, taskbar and Start menu icon from the program file.
-    #[cfg(windows)]
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         println!("cargo:rerun-if-changed=assets/icons/herdr-app.ico");
-        winresource::WindowsResource::new().set_icon("assets/icons/herdr-app.ico").compile().expect("cannot embed the icon");
+        #[cfg(windows)]
+        {
+            winresource::WindowsResource::new()
+                .set_icon("assets/icons/herdr-app.ico")
+                .compile()
+                .expect("cannot embed the icon");
+        }
+        #[cfg(not(windows))]
+        {
+            embed_windows_icon_cross(&base);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn embed_windows_icon_cross(base: &Path) {
+    use std::process::Command;
+
+    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
+    let ico = base.join("assets/icons/herdr-app.ico");
+    let rc_path = out_dir.join("herdr-app-icon.rc");
+    let res_path = out_dir.join("herdr-app-icon.res");
+
+    let ico_escaped = ico.to_string_lossy().replace('\\', "/");
+    std::fs::write(&rc_path, format!("1 ICON \"{ico_escaped}\"\n"))
+        .expect("cannot write Windows icon resource script");
+
+    // Emit a raw Win32 `.res` file so lld-link / link.exe merges our icon cleanly with
+    // any manifest `.res` contributed by dependencies (passing a pre-converted `.obj`
+    // conflicts with lld-link's internal `.res` merge).
+    let built_with_llvm = Command::new("llvm-rc")
+        .arg("/fo")
+        .arg(&res_path)
+        .arg(&rc_path)
+        .status()
+        .is_ok_and(|s| s.success());
+
+    let built = built_with_llvm || {
+        let arch = std::env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| "x86_64".into());
+        let windres_candidates = if arch == "x86" {
+            ["i686-w64-mingw32-windres", "windres"]
+        } else {
+            ["x86_64-w64-mingw32-windres", "windres"]
+        };
+        windres_candidates.into_iter().any(|tool| {
+            Command::new(tool)
+                .args(["-O", "res", "-i"])
+                .arg(&rc_path)
+                .arg("-o")
+                .arg(&res_path)
+                .status()
+                .is_ok_and(|s| s.success())
+        })
+    };
+
+    if built && res_path.is_file() {
+        println!("cargo:rustc-link-arg-bin=herdr2={}", res_path.display());
+    } else {
+        println!(
+            "cargo:warning=could not compile Windows icon resource on cross-build (install llvm-rc or mingw-w64 windres)"
+        );
     }
 }

@@ -429,7 +429,98 @@ pub async fn program_env() -> std::collections::BTreeMap<String, String> {
     drop_unreachable_displays(&mut env);
     #[cfg(unix)]
     augment_user_path_env(&mut env);
+    #[cfg(windows)]
+    augment_windows_user_path_env(&mut env);
     env
+}
+
+/// Decodes raw child stdout/stderr bytes as UTF-8, falling back to the Windows active ANSI code page
+/// (`CP_ACP`, e.g. GBK/CP936 on Chinese Windows) before lossy UTF-8 so `cmd.exe` / tool diagnostics
+/// neither truncate nor abort ACP readers.
+#[cfg(windows)]
+pub fn decode_process_output(bytes: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_owned();
+    }
+    const CP_ACP: u32 = 0;
+    unsafe extern "system" {
+        fn MultiByteToWideChar(
+            code_page: u32,
+            flags: u32,
+            multi_byte_str: *const u8,
+            cb_multi_byte: i32,
+            wide_char_str: *mut u16,
+            cch_wide_char: i32,
+        ) -> i32;
+    }
+    let Ok(len) = i32::try_from(bytes.len()) else {
+        return String::from_utf8_lossy(bytes).into_owned();
+    };
+    if len == 0 {
+        return String::new();
+    }
+    let needed = unsafe { MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0) };
+    if needed <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let mut wide = vec![0u16; needed as usize];
+    let written = unsafe { MultiByteToWideChar(CP_ACP, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), needed) };
+    if written <= 0 {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    String::from_utf16_lossy(&wide[..written as usize])
+}
+
+#[cfg(not(windows))]
+pub fn decode_process_output(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Appends common Windows user CLI install directories (`%USERPROFILE%\.local\bin`, `%APPDATA%\npm`,
+/// Scoop/Volta/Bun/Cargo) when they exist on disk and are missing from `PATH`.
+#[cfg(windows)]
+pub(crate) fn augment_windows_user_path_env(env: &mut std::collections::BTreeMap<String, String>) {
+    let get_ci = |key: &str| -> Option<std::path::PathBuf> {
+        env.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v.trim())
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os(key).filter(|s| !s.is_empty()).map(std::path::PathBuf::from))
+    };
+    let path_key = env.keys().find(|k| k.eq_ignore_ascii_case("PATH")).cloned().unwrap_or_else(|| "PATH".into());
+    let mut dirs: Vec<std::path::PathBuf> =
+        env.get(&path_key).map(|v| std::env::split_paths(v).collect()).unwrap_or_default();
+
+    let mut extras: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(profile) = get_ci("USERPROFILE") {
+        extras.push(profile.join(r".local\bin"));
+        extras.push(profile.join(r".bun\bin"));
+        extras.push(profile.join(r".cargo\bin"));
+        extras.push(profile.join(r"scoop\shims"));
+    }
+    if let Some(appdata) = get_ci("APPDATA") {
+        extras.push(appdata.join("npm"));
+    }
+    if let Some(local) = get_ci("LOCALAPPDATA") {
+        extras.push(local.join(r"Volta\bin"));
+        extras.push(local.join("pnpm"));
+    }
+
+    let mut changed = false;
+    for ex in extras {
+        if ex.is_dir() && !dirs.iter().any(|d| d.as_os_str().eq_ignore_ascii_case(ex.as_os_str())) {
+            dirs.push(ex);
+            changed = true;
+        }
+    }
+    if changed
+        && let Ok(joined) = std::env::join_paths(&dirs)
+        && let Some(s) = joined.to_str()
+        && !s.is_empty()
+    {
+        env.insert(path_key, s.to_string());
+    }
 }
 
 /// Ensures direct PTY/ACP children launched by a systemd/GUI/WSL daemon inherit common user tool

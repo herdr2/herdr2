@@ -2,7 +2,7 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, InputState, Input, TextareaState, Textarea, Popup } from "gpui-base";
-import { hc, run, theme, themes, fonts, updates, settings, layouts, layout, spaces, keys, shared, setShared, appHome, readTextFile, writeTextFile, playSound, props, closeOverlay, notify, window, checking } from "herdr";
+import { hc, run, theme, themes, fonts, updates, settings, layouts, layout, spaces, keys, shared, setShared, appHome, readTextFile, writeTextFile, playSound, props, closeOverlay, notify, window, checking, knownAgents } from "herdr";
 import {
   SHORTCUT_GROUPS,
   defaultChordFor,
@@ -197,6 +197,9 @@ export default class Settings extends View {
     this.droveProbing = false;
     this.droveProbePromise = null;
     this.droveAutoProbed = {};
+    this.droveProbeAiDiagnosing = false;
+    this.droveProbeAiResult = null;
+    this.droveProbeAgentLaunching = false;
     this.droveAiTesting = false;
     this.droveMagpieTesting = false;
     this.droveError = null;
@@ -1550,8 +1553,10 @@ export default class Settings extends View {
 
   async droveHcJson(args, opts) {
     if (typeof checking === "function" && checking()) return null;
-    const cmd = [...this.droveArgs(args), "--json"];
-    const r = opts ? await hc(cmd, opts) : await hc(cmd);
+    const localOnly = Boolean(opts?.local);
+    const cmd = [...(localOnly ? args : this.droveArgs(args)), "--json"];
+    const hcOpts = opts && "timeout" in opts ? { timeout: opts.timeout } : undefined;
+    const r = hcOpts ? await hc(cmd, hcOpts) : await hc(cmd);
     let parsed = null;
     try { parsed = JSON.parse(r.stdout || r.stderr); } catch {}
     if (r.code !== 0) {
@@ -1789,6 +1794,7 @@ export default class Settings extends View {
     const key = targetMachine ?? "__local__";
     this.droveProbing = true;
     this.droveError = null;
+    this.droveProbeAiResult = null;
     cx?.notify?.();
     const task = (async () => {
       try {
@@ -1817,6 +1823,320 @@ export default class Settings extends View {
     if (this.droveProbing || this.droveProbePromise) return;
     cx.spawn(async (cx) => {
       await this.runDroveProbe(cx);
+    });
+  }
+
+  probeDiagCategoryLabel(category) {
+    switch (String(category ?? "").toLowerCase()) {
+      case "env_proxy":
+        return this.tr("Env / Proxy", "环境 / 代理差异");
+      case "auth_required":
+        return this.tr("Auth Required", "需登录鉴权");
+      case "missing_adapter":
+        return this.tr("Missing Adapter", "缺 ACP 适配器");
+      case "timeout":
+        return this.tr("Timeout", "探测超时");
+      case "config":
+        return this.tr("Config", "配置异常");
+      case "false_positive":
+        return this.tr("Likely False Positive", "可能是误报");
+      default:
+        return this.tr("Needs Check", "待排查");
+    }
+  }
+
+  aiDiagnoseDroveProbeErrors(cx) {
+    if (this.droveProbeAiDiagnosing || this.droveProbing) return;
+    const targetMachine = this.droveMachine ?? null;
+    const summary = this.droveProbeSummary();
+    const errored = summary.errored;
+    if (errored.length === 0) return;
+    this.droveProbeAiDiagnosing = true;
+    this.droveProbeAiResult = null;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const erroredSnapshots = errored.map((a) => ({
+          id: a.id,
+          command: Array.isArray(a.command) ? a.command : [],
+          path: a.path ?? null,
+          modelsCount: Array.isArray(a.models) ? a.models.length : 0,
+          error: this.agentProbeError(a) ?? "",
+        }));
+        const healthyAgents = summary.ready.map((a) => a.id);
+        const localBaseUrl = (this.droveUrlInput?.value?.() ?? "").trim();
+        const localApiKey = (this.droveKeyInput?.value?.() ?? "").trim();
+        const localModel = (
+          this.aiStatus?.model ??
+          (!targetMachine ? this.droveData?.config?.ai?.model : "") ??
+          ""
+        ).trim();
+        const buildLocalPayload = () => {
+          const payload = {
+            agents: errored.map((a) => a.id),
+            erroredAgents: erroredSnapshots,
+            healthyAgents,
+            language: this.lang(),
+          };
+          if (targetMachine) payload.targetMachine = targetMachine;
+          if (localBaseUrl) payload.baseUrl = localBaseUrl;
+          if (localApiKey) payload.apiKey = localApiKey;
+          if (localModel) payload.model = localModel;
+          return payload;
+        };
+
+        let res = null;
+        if (!targetMachine) {
+          res = await this.droveCallWithJsonFile(["drove", "probe-ai-diagnose"], buildLocalPayload(), { timeout: 120000 });
+        } else {
+          const remoteAiConfigured = Boolean(
+            this.droveData?.aiStatus?.configured || this.droveData?.config?.ai?.baseUrl?.trim(),
+          );
+          let remoteErr = null;
+          if (remoteAiConfigured) {
+            try {
+              // Never forward local-machine AI URL/key/model overrides to a remote host.
+              const remotePayload = {
+                agents: errored.map((a) => a.id),
+                language: this.lang(),
+              };
+              const remoteRes = await this.droveCallWithJsonFile(
+                ["drove", "probe-ai-diagnose"],
+                remotePayload,
+                { timeout: 120000 },
+              );
+              if (remoteRes?.ok) {
+                res = remoteRes;
+              } else {
+                remoteErr = remoteRes?.error || null;
+              }
+            } catch (e) {
+              remoteErr = String(e?.message ?? e);
+            }
+          }
+          if (!res) {
+            // Fall back to local AI Assistant with the remote probe snapshot (handles older remote h2
+            // without `drove.probe.ai_diagnose` and remotes without their own AI credentials).
+            try {
+              const localRes = await this.droveCallWithJsonFile(
+                ["drove", "probe-ai-diagnose"],
+                buildLocalPayload(),
+                { timeout: 120000, local: true },
+              );
+              if (localRes?.ok || !remoteErr) {
+                res = localRes;
+              } else {
+                res = {
+                  ok: false,
+                  error: localRes?.error || remoteErr,
+                };
+              }
+            } catch (e) {
+              const localErr = String(e?.message ?? e);
+              res = { ok: false, error: remoteErr && !localBaseUrl ? `${remoteErr} (${localErr})` : localErr };
+            }
+          }
+        }
+        if ((this.droveMachine ?? null) !== targetMachine) return;
+        this.droveProbeAiResult = res ?? {
+          ok: false,
+          error: this.tr("AI diagnosis returned no result.", "AI 诊断未返回结果。"),
+        };
+      } catch (e) {
+        if ((this.droveMachine ?? null) === targetMachine) {
+          this.droveProbeAiResult = { ok: false, error: String(e?.message ?? e) };
+        }
+      } finally {
+        this.droveProbeAiDiagnosing = false;
+        cx.notify();
+      }
+    });
+  }
+
+  buildDroveProbeFixPrompt(errorAgents, diagResult = null) {
+    const machineLabel = this.droveMachine || this.tr("this computer (local)", "本机（local）");
+    const errLines = errorAgents.map((a) => {
+      const cmd = Array.isArray(a.command) && a.command.length > 0 ? a.command.join(" ") : a.id;
+      const err = String(a.error ?? "").trim();
+      return `- agent: ${a.id}\n  command: ${cmd}\n  path: ${a.path ?? "(unknown)"}\n  error: ${err}`;
+    });
+    const diagBlock = diagResult?.ok
+      ? [
+          "",
+          this.tr("Preliminary AI diagnosis:", "AI 初步诊断结论："),
+          diagResult.summary ? `- ${diagResult.summary}` : null,
+          ...(Array.isArray(diagResult.items)
+            ? diagResult.items.map(
+                (it) =>
+                  `- ${it.agent} [${it.category}]: ${it.cause} -> ${it.fix}${it.command ? ` (cmd: ${it.command})` : ""}`,
+              )
+            : []),
+        ]
+          .filter(Boolean)
+          .join("\n")
+      : "";
+
+    if (this.lang() === "zh-CN") {
+      return [
+        `请帮我排查并处理 Herdr2 Drove 在目标主机「${machineLabel}」上检测到的 ACP Agent 异常：`,
+        "",
+        ...errLines,
+        diagBlock,
+        "",
+        "请按以下步骤处理：",
+        "1. 检查守护进程 `herdr2 serve` 与当前交互式 Shell 的环境差异（尤其是 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY、PATH、认证凭据、以及 ACP 适配器是否已安装）。",
+        "2. 区分哪些是“工作区 CLI 正常但守护进程无头 ACP 探测环境缺失”导致的假阳性，哪些是需要登录或安装适配器的真实问题。",
+        "3. 对可以安全自动修复的问题直接协助处理；对需要我手动交互登录（如 `claude`、`cursor-agent login`）或重启服务的步骤，给出清晰指令并等待确认。",
+        "4. 修复完成后执行 `h2 drove probe --refresh` 验证异常是否已消除。",
+      ]
+        .filter((line) => line !== undefined)
+        .join("\n");
+    }
+    return [
+      `Please help diagnose and fix the Herdr2 Drove ACP agent probe errors on "${machineLabel}":`,
+      "",
+      ...errLines,
+      diagBlock,
+      "",
+      "Please follow these steps:",
+      "1. Compare the `herdr2 serve` daemon environment against the interactive shell (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY, PATH, auth state, and installed ACP adapters).",
+      "2. Distinguish workspace-CLI vs headless-ACP false positives from genuine missing-adapter or login issues.",
+      "3. Apply safe fixes directly; for interactive logins (e.g. `claude`, `cursor-agent login`) or daemon restarts, explain clearly and guide me through them.",
+      "4. Verify the result with `h2 drove probe --refresh`.",
+    ]
+      .filter((line) => line !== undefined)
+      .join("\n");
+  }
+
+  targetSpaceForDroveMachine() {
+    const targetMachine = this.droveMachine ?? null;
+    const all = typeof spaces === "function" ? (spaces() ?? []) : [];
+    const active = all.find((s) => s.active && (s.machine ?? null) === targetMachine);
+    if (active) return active;
+    return all.find((s) => (s.machine ?? null) === targetMachine) ?? null;
+  }
+
+  async resolveFixAgentLaunch(targetMachine, readyAgents) {
+    const cliFallback = {
+      claude: ["claude", "--dangerously-skip-permissions"],
+      agy: ["agy", "--dangerously-skip-permissions"],
+      antigravity: ["agy", "--dangerously-skip-permissions"],
+      codex: ["codex", "--no-daemon", "--dangerously-bypass-approvals-and-sandbox"],
+      cursor: ["cursor-agent", "--yolo", "--trust"],
+      "cursor-agent": ["cursor-agent", "--yolo", "--trust"],
+      opencode: ["opencode", "--auto"],
+      gemini: ["gemini", "--yolo"],
+      kimi: ["kimi", "--auto"],
+      hermes: ["hermes", "--yolo", "--accept-hooks"],
+      zcode: ["zcode", "--mode", "yolo"],
+      dsh: ["dsh-tui"],
+    };
+    const prefOrder = ["claude", "antigravity", "agy", "codex", "cursor", "opencode", "gemini", "hermes", "zcode", "kimi", "dsh"];
+    const readyKeys = new Set(
+      (readyAgents ?? []).flatMap((a) => (a.id === "agy" ? ["agy", "antigravity"] : [a.id])),
+    );
+
+    if (typeof knownAgents === "function") {
+      try {
+        const list = await knownAgents(targetMachine ? { on: targetMachine } : {});
+        const installed = (list ?? []).filter((p) => p?.installed && Array.isArray(p.run) && p.run.length > 0);
+        const rank = (p) => {
+          const i = prefOrder.indexOf(p.key);
+          return i === -1 ? 99 : i;
+        };
+        const sorted = [...installed].sort((a, b) => rank(a) - rank(b));
+        const picked = sorted.find((p) => readyKeys.has(p.key)) ?? sorted[0];
+        if (picked) {
+          return { name: picked.name || picked.key, argv: picked.run };
+        }
+      } catch {}
+    }
+
+    const candidates = [
+      ...(readyAgents ?? []).map((a) => a.id),
+      ...this.droveProbeSummary().installed.map((a) => a.id),
+    ];
+    for (const id of prefOrder) {
+      if (candidates.includes(id) && cliFallback[id]) {
+        return { name: id, argv: cliFallback[id] };
+      }
+    }
+    for (const id of candidates) {
+      if (cliFallback[id]) {
+        return { name: id, argv: cliFallback[id] };
+      }
+    }
+    return null;
+  }
+
+  launchAgentToFixDroveProbeErrors(cx) {
+    if (this.droveProbeAgentLaunching) return;
+    const summary = this.droveProbeSummary();
+    if (summary.errored.length === 0) return;
+    const targetMachine = this.droveMachine ?? null;
+    this.droveProbeAgentLaunching = true;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const picked = await this.resolveFixAgentLaunch(targetMachine, summary.ready);
+        if (!picked) {
+          notify({
+            title: this.tr("No available CLI agent found", "未找到可启动的 CLI Agent"),
+            body: this.tr(
+              "Install or configure at least one agent (e.g. claude, agy, codex) on this machine first.",
+              "请先在该主机安装至少一个可用的 CLI Agent（如 claude、agy、codex）。",
+            ),
+            level: "error",
+          });
+          return;
+        }
+        const prompt = this.buildDroveProbeFixPrompt(summary.errored, this.droveProbeAiResult);
+        const tabName = this.tr("Fix Drove Agents", "排查 Drove 异常");
+        const targetSpace = this.targetSpaceForDroveMachine();
+        if (targetSpace) {
+          run("tab.new", { space: targetSpace.id, name: tabName, argv: picked.argv, task: prompt });
+        } else {
+          const args = { name: tabName, tab: tabName, argv: picked.argv, task: prompt };
+          if (targetMachine) args.machine = targetMachine;
+          run("space.new", args);
+        }
+        this.close();
+        notify({
+          title: this.tr(`Launched ${picked.name} to troubleshoot`, `已启动 ${picked.name} 协助排查`),
+          body: this.tr(
+            "After fixing, return to Settings -> Drove and click Refresh Agents.",
+            "处理完成后，返回「设置 → Drove」点击「刷新检测」即可验证。",
+          ),
+        });
+      } catch (e) {
+        notify({
+          title: this.tr("Failed to launch AI agent", "启动 Agent 协助失败"),
+          body: String(e?.message ?? e),
+          level: "error",
+        });
+      } finally {
+        this.droveProbeAgentLaunching = false;
+        cx.notify();
+      }
+    });
+  }
+
+  runProbeFixCommandInTerminal(commandArgv, label) {
+    if (!Array.isArray(commandArgv) || commandArgv.length === 0) return;
+    const targetMachine = this.droveMachine ?? null;
+    const tabName = label || this.tr("Fix Agent", "修复 Agent");
+    const targetSpace = this.targetSpaceForDroveMachine();
+    if (targetSpace) {
+      run("tab.new", { space: targetSpace.id, name: tabName, argv: commandArgv });
+    } else {
+      const args = { name: tabName, tab: tabName, argv: commandArgv };
+      if (targetMachine) args.machine = targetMachine;
+      run("space.new", args);
+    }
+    this.close();
+    notify({
+      title: this.tr("Opened terminal to run fix command", "已在终端运行修复命令"),
+      body: commandArgv.join(" "),
     });
   }
 
@@ -4440,6 +4760,8 @@ export default class Settings extends View {
           this.droveRolesBackup = null;
           this.droveAiConfigMode = null;
           this.droveMagpieResult = null;
+          this.droveProbeAiResult = null;
+          this.droveProbeAiDiagnosing = false;
           cx.spawn(async (cx) => {
             await this.loadDrove();
             this.maybeAutoProbeDrove(cx);
@@ -4609,28 +4931,115 @@ export default class Settings extends View {
             .child(this.droveError),
         ),
       )
-      .when(errorAgents.length > 0, (el) =>
-        el.child(
+      .when(errorAgents.length > 0, (el) => {
+        const diagRes = this.droveProbeAiResult;
+        const diagItems = Array.isArray(diagRes?.items) ? diagRes.items : [];
+        return el.child(
           v_flex()
             .id("st-dr-agent-errors")
             .w_full()
             .px(12)
             .py(10)
-            .gap(6)
+            .gap(8)
             .rounded(8)
             .border_1()
             .border_color(t.blocked)
             .bg(t.surface)
             .child(
-              div()
-                .text_size(12)
-                .font_semibold()
-                .text_color(t.blocked)
+              h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap(8)
+                .flex_wrap()
                 .child(
-                  this.tr(
-                    `Detected ${errorAgents.length} agent probe error${errorAgents.length > 1 ? "s" : ""}`,
-                    `刷新检测到 ${errorAgents.length} 个 Agent 异常`,
-                  ),
+                  div()
+                    .text_size(12)
+                    .font_semibold()
+                    .text_color(t.blocked)
+                    .child(
+                      this.tr(
+                        `Detected ${errorAgents.length} agent probe error${errorAgents.length > 1 ? "s" : ""}`,
+                        `刷新检测到 ${errorAgents.length} 个 Agent 异常`,
+                      ),
+                    ),
+                )
+                .child(
+                  h_flex()
+                    .gap(6)
+                    .items_center()
+                    .flex_wrap()
+                    .child(
+                      h_flex()
+                        .id("st-dr-probe-ai-btn")
+                        .px(9)
+                        .py(4)
+                        .gap(5)
+                        .rounded(6)
+                        .border_1()
+                        .border_color(t.accent)
+                        .bg(t.accent)
+                        .items_center()
+                        .text_size(11.5)
+                        .font_semibold()
+                        .text_color(t.accent_foreground)
+                        .when(this.droveProbeAiDiagnosing || this.droveProbing, (b) => b.opacity(0.6))
+                        .when(!this.droveProbeAiDiagnosing && !this.droveProbing, (b) =>
+                          b
+                            .cursor_pointer()
+                            .hover((s) => s.opacity(0.9))
+                            .on_click((_e, cx) => this.aiDiagnoseDroveProbeErrors(cx)),
+                        )
+                        .tooltip(
+                          this.tr(
+                            "Use the AI Assistant to analyze probe errors, identify workspace-vs-ACP false positives, and suggest fix commands",
+                            "调用 AI 助手分析检测异常原因、区分工作区可用但无头探测失败的误报，并给出修复命令",
+                          ),
+                        )
+                        .when(this.droveProbeAiDiagnosing, (b) =>
+                          b.child(svg("mods/workspace-chrome/spinner.svg").size(11).text_color(t.accent_foreground).spin(900)),
+                        )
+                        .child(
+                          this.droveProbeAiDiagnosing
+                            ? this.tr("AI Diagnosing…", "AI 诊断中…")
+                            : this.tr("✨ AI Diagnose", "✨ AI 协助诊断"),
+                        ),
+                    )
+                    .child(
+                      h_flex()
+                        .id("st-dr-probe-agent-fix-btn")
+                        .px(9)
+                        .py(4)
+                        .gap(5)
+                        .rounded(6)
+                        .border_1()
+                        .border_color(t.border)
+                        .bg(t.raised)
+                        .items_center()
+                        .text_size(11.5)
+                        .text_color(t.foreground)
+                        .when(this.droveProbeAgentLaunching, (b) => b.opacity(0.6))
+                        .when(!this.droveProbeAgentLaunching, (b) =>
+                          b
+                            .cursor_pointer()
+                            .hover((s) => s.bg(t.hover))
+                            .on_click((_e, cx) => this.launchAgentToFixDroveProbeErrors(cx)),
+                        )
+                        .tooltip(
+                          this.tr(
+                            "Launch an interactive AI coding agent in a workspace tab with full error context to investigate and fix these issues",
+                            "在工作区标签页启动一个可交互的 AI Agent，带入完整异常上下文直接协助排查与修复",
+                          ),
+                        )
+                        .when(this.droveProbeAgentLaunching, (b) =>
+                          b.child(svg("mods/workspace-chrome/spinner.svg").size(11).text_color(t.foreground).spin(900)),
+                        )
+                        .child(
+                          this.droveProbeAgentLaunching
+                            ? this.tr("Launching…", "启动中…")
+                            : this.tr("Fix with Agent", "用 Agent 自动处理"),
+                        ),
+                    ),
                 ),
             )
             .children(
@@ -4655,9 +5064,235 @@ export default class Settings extends View {
                   )
                   .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.muted).child(shortErr));
               }),
+            )
+            .when(Boolean(diagRes), (box) =>
+              box.child(
+                v_flex()
+                  .id("st-dr-probe-ai-result")
+                  .w_full()
+                  .mt(2)
+                  .px(10)
+                  .py(9)
+                  .gap(7)
+                  .rounded(7)
+                  .border_1()
+                  .border_color(diagRes?.ok ? t.border : t.blocked)
+                  .bg(t.background)
+                  .child(
+                    h_flex()
+                      .w_full()
+                      .items_center()
+                      .justify_between()
+                      .gap(8)
+                      .child(
+                        h_flex()
+                          .gap(6)
+                          .items_center()
+                          .child(
+                            div()
+                              .text_size(11.8)
+                              .font_semibold()
+                              .text_color(diagRes?.ok ? t.foreground : t.blocked)
+                              .child(
+                                diagRes?.ok
+                                  ? this.tr("AI Diagnosis & Remediation", "AI 诊断与处理建议")
+                                  : this.tr("AI Diagnosis Unavailable", "AI 诊断未能完成"),
+                              ),
+                          )
+                          .when(Boolean(diagRes?.ok && diagRes?.modelUsed), (row) =>
+                            row.child(
+                              div()
+                                .text_size(10.5)
+                                .text_color(t.dim)
+                                .child(
+                                  `${diagRes.modelUsed}${diagRes.latencyMs ? ` · ${diagRes.latencyMs}ms` : ""}`,
+                                ),
+                            ),
+                          ),
+                      )
+                      .child(
+                        div()
+                          .id("st-dr-probe-ai-close")
+                          .px(6)
+                          .py(1)
+                          .rounded(4)
+                          .cursor_pointer()
+                          .text_size(12)
+                          .text_color(t.dim)
+                          .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                          .on_click((_e, cx) => {
+                            this.droveProbeAiResult = null;
+                            cx.notify();
+                          })
+                          .child("×"),
+                      ),
+                  )
+                  .when(!diagRes?.ok, (card) =>
+                    card.child(
+                      h_flex()
+                        .w_full()
+                        .items_center()
+                        .justify_between()
+                        .gap(8)
+                        .flex_wrap()
+                        .child(
+                          div()
+                            .flex_1()
+                            .min_w(0)
+                            .text_size(11.5)
+                            .line_height("16px")
+                            .text_color(t.muted)
+                            .child(String(diagRes?.error ?? this.tr("AI request failed.", "AI 请求失败。"))),
+                        )
+                        .child(
+                          div()
+                            .id("st-dr-probe-ai-goto-settings")
+                            .px(8)
+                            .py(3)
+                            .rounded(5)
+                            .border_1()
+                            .border_color(t.border)
+                            .bg(t.raised)
+                            .cursor_pointer()
+                            .text_size(11)
+                            .text_color(t.foreground)
+                            .hover((s) => s.bg(t.hover))
+                            .on_click((_e, cx) => {
+                              this.section = "ai";
+                              cx.spawn(async (cx) => {
+                                await this.loadAi();
+                                cx.notify();
+                              });
+                              cx.notify();
+                            })
+                            .child(this.tr("Open AI Settings", "前往 AI 助手设置")),
+                        ),
+                    ),
+                  )
+                  .when(Boolean(diagRes?.ok && diagRes?.summary), (card) =>
+                    card.child(
+                      div()
+                        .text_size(11.8)
+                        .line_height("17px")
+                        .text_color(t.foreground)
+                        .child(String(diagRes.summary)),
+                    ),
+                  )
+                  .children(
+                    diagItems.map((it) =>
+                      v_flex()
+                        .id(`st-dr-probe-ai-item-${it.agent}`)
+                        .w_full()
+                        .px(9)
+                        .py(7)
+                        .gap(4)
+                        .rounded(6)
+                        .border_1()
+                        .border_color(t.border)
+                        .bg(t.surface)
+                        .child(
+                          h_flex()
+                            .w_full()
+                            .items_center()
+                            .gap(6)
+                            .flex_wrap()
+                            .child(this.agentIconEl(t, it.agent, 12))
+                            .child(div().text_size(11.8).font_semibold().text_color(t.foreground).child(it.agent))
+                            .child(
+                              div()
+                                .px(6)
+                                .py(1)
+                                .rounded(4)
+                                .bg(t.background)
+                                .border_1()
+                                .border_color(t.border)
+                                .text_size(10.5)
+                                .text_color(t.muted)
+                                .child(this.probeDiagCategoryLabel(it.category)),
+                            )
+                            .when(Boolean(it.likelyFalsePositive), (row) =>
+                              row.child(
+                                div()
+                                  .px(6)
+                                  .py(1)
+                                  .rounded(4)
+                                  .bg(t.background)
+                                  .border_1()
+                                  .border_color(t.working)
+                                  .text_size(10.5)
+                                  .text_color(t.working)
+                                  .child(this.tr("Workspace CLI likely OK", "工作区 CLI 可能可用")),
+                              ),
+                            ),
+                        )
+                        .child(
+                          div()
+                            .text_size(11.5)
+                            .line_height("16px")
+                            .text_color(t.muted)
+                            .child(`${this.tr("Cause: ", "原因：")}${it.cause}`),
+                        )
+                        .child(
+                          div()
+                            .text_size(11.5)
+                            .line_height("16px")
+                            .text_color(t.foreground)
+                            .child(`${this.tr("Fix: ", "建议：")}${it.fix}`),
+                        )
+                        .when(Boolean(it.command), (card) =>
+                          card.child(
+                            h_flex()
+                              .w_full()
+                              .mt(2)
+                              .px(8)
+                              .py(4)
+                              .gap(8)
+                              .rounded(5)
+                              .bg(t.background)
+                              .border_1()
+                              .border_color(t.border)
+                              .items_center()
+                              .justify_between()
+                              .child(
+                                div()
+                                  .flex_1()
+                                  .min_w(0)
+                                  .truncate()
+                                  .text_size(11)
+                                  .text_color(t.foreground)
+                                  .child(String(it.command)),
+                              )
+                              .when(Array.isArray(it.commandArgv) && it.commandArgv.length > 0, (row) =>
+                                row.child(
+                                  div()
+                                    .id(`st-dr-probe-ai-run-${it.agent}`)
+                                    .px(8)
+                                    .py(2)
+                                    .rounded(4)
+                                    .border_1()
+                                    .border_color(t.border)
+                                    .bg(t.raised)
+                                    .cursor_pointer()
+                                    .text_size(10.8)
+                                    .text_color(t.foreground)
+                                    .hover((s) => s.bg(t.hover))
+                                    .on_click(() =>
+                                      this.runProbeFixCommandInTerminal(
+                                        it.commandArgv,
+                                        this.tr(`Fix ${it.agent}`, `修复 ${it.agent}`),
+                                      ),
+                                    )
+                                    .child(this.tr("Run in Terminal", "终端运行")),
+                                ),
+                              ),
+                          ),
+                        ),
+                    ),
+                  ),
+              ),
             ),
-        ),
-      )
+        );
+      })
       .when(this.droveLoading && !data, (el) =>
         el.child(h_flex().py(10).gap(8).items_center().child(svg("mods/workspace-chrome/spinner.svg").size(12).text_color(t.working).spin(900)).child(div().text_size(12.5).text_color(t.dim).child(this.tr("Loading Drove configuration…", "正在读取 Drove 配置…")))),
       )

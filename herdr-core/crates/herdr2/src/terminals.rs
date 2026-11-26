@@ -38,6 +38,12 @@ pub struct Terminal {
     pub keep: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_cwd: Option<String>,
+    /// Latest working directory reported by the shell via OSC 7 / OSC 9;9 (private).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reported_cwd: Option<String>,
+    /// Last raw OS-sampled cwd from `foreground::about` (private, used to reconcile PEB vs OSC on Windows).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_os_cwd: Option<String>,
     /// Only caller overrides, never the inherited core environment.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub restart_env: BTreeMap<String, String>,
@@ -305,6 +311,8 @@ impl Registry {
                 cwd: new.cwd,
                 keep: new.keep,
                 last_cwd: None,
+                reported_cwd: None,
+                last_os_cwd: None,
                 restart_env: BTreeMap::new(),
                 restart_after_ms: 0,
                 restart_delay_ms: 0,
@@ -468,6 +476,8 @@ const PRIVATE: &[&str] = &[
     "win32_input",
     "afar",
     "last_cwd",
+    "reported_cwd",
+    "last_os_cwd",
     "restart_env",
     "restart_after_ms",
     "restart_delay_ms",

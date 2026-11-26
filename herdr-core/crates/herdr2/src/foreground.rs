@@ -140,14 +140,150 @@ pub fn procargs(pid: i32) -> Option<(Vec<String>, Vec<u8>)> {
     Some((argv, rest.to_vec()))
 }
 
+/// Shells on Windows (Git Bash / MSYS2 / Cygwin) whose `cd` updates their internal
+/// POSIX cwd without calling Win32 `SetCurrentDirectoryW`, leaving PEB `CurrentDirectory`
+/// frozen at startup. For these shells, OSC 7 `reported_cwd` is authoritative.
+pub(crate) fn is_windows_posix_shell(name: &str) -> bool {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name).to_ascii_lowercase();
+    let stem = base.strip_suffix(".exe").unwrap_or(&base);
+    matches!(stem, "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "tcsh" | "csh" | "ash" | "mintty")
+}
+
+/// Any interactive shell on Windows (POSIX/MSYS, CMD, PowerShell, nushell) whose
+/// OSC 7 / OSC 9;9 working-directory reports should update `foreground.cwd` immediately.
+pub(crate) fn is_windows_shell(name: &str) -> bool {
+    if is_windows_posix_shell(name) {
+        return true;
+    }
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name).to_ascii_lowercase();
+    let stem = base.strip_suffix(".exe").unwrap_or(&base);
+    matches!(stem, "cmd" | "powershell" | "pwsh" | "nu")
+}
+
+/// Parses an OSC 7 `file://[host]/path` URI or an OSC 9;9 plain Windows path
+/// (e.g. `D:\Work\proj` from `cmd.exe` `PROMPT=$E]9;9;$P$E\$P$G`) into a local OS directory path.
+/// Ignores OSC 7 URIs targeting a different host (e.g. an SSH session inside a local PTY).
+pub(crate) fn parse_osc7_cwd(raw: &str, local_host: &str, windows: bool) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return None;
+    }
+    // OSC 9;9 on Windows sends a plain drive path (`D:\Work\proj` or `D:/Work/proj`) without `file://`.
+    if windows && (trimmed.len() < 7 || !trimmed[..7].eq_ignore_ascii_case("file://")) {
+        let bytes = trimmed.as_bytes();
+        if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            let drive = (bytes[0] as char).to_ascii_uppercase();
+            let tail = trimmed[2..].replace('/', "\\");
+            let mut out = if tail.is_empty() { format!("{drive}:\\") } else { format!("{drive}:{tail}") };
+            while out.len() > 3 && out.ends_with('\\') {
+                out.pop();
+            }
+            return Some(out);
+        }
+        return None;
+    }
+    if trimmed.len() < 7 || !trimmed[..7].eq_ignore_ascii_case("file://") {
+        return None;
+    }
+    let rest = &trimmed[7..];
+    let slash = rest.find('/')?;
+    let host = &rest[..slash];
+    if !host.is_empty()
+        && !host.eq_ignore_ascii_case("localhost")
+        && !local_host.is_empty()
+        && !host.eq_ignore_ascii_case(local_host)
+    {
+        return None;
+    }
+    let raw_path = &rest[slash..];
+    let decoded = percent_decode_utf8(raw_path)?;
+    if decoded.is_empty() || decoded.contains('\0') {
+        return None;
+    }
+    if windows {
+        let bytes = decoded.as_bytes();
+        // `file:///D:/Work/repo` -> `/D:/Work/repo` -> `D:\Work\repo`
+        if bytes.len() >= 3 && bytes[0] == b'/' && bytes[1].is_ascii_alphabetic() && bytes[2] == b':' {
+            let drive = (bytes[1] as char).to_ascii_uppercase();
+            let tail = decoded[3..].replace('/', "\\");
+            let mut out = if tail.is_empty() { format!("{drive}:\\") } else { format!("{drive}:{tail}") };
+            while out.len() > 3 && out.ends_with('\\') {
+                out.pop();
+            }
+            return Some(out);
+        }
+        // MSYS2/Git Bash POSIX drive path: `/d/Work/repo` or `/d` -> `D:\Work\repo` or `D:\`
+        if bytes.len() >= 2
+            && bytes[0] == b'/'
+            && bytes[1].is_ascii_alphabetic()
+            && (bytes.len() == 2 || bytes[2] == b'/')
+        {
+            let drive = (bytes[1] as char).to_ascii_uppercase();
+            let tail = if bytes.len() == 2 { "\\".to_string() } else { decoded[2..].replace('/', "\\") };
+            let mut out = format!("{drive}:{tail}");
+            while out.len() > 3 && out.ends_with('\\') {
+                out.pop();
+            }
+            return Some(out);
+        }
+        return None;
+    }
+    if !decoded.starts_with('/') {
+        return None;
+    }
+    let mut out = decoded;
+    while out.len() > 1 && out.ends_with('/') {
+        out.pop();
+    }
+    Some(out)
+}
+
+fn percent_decode_utf8(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(hi), Some(lo)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+        {
+            out.push((hi << 4) | lo);
+            i += 3;
+            continue;
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_val(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 pub(crate) fn is_shell_root(root: &Foreground) -> bool {
     // Command and script wrappers can share their foreground group with a live agent.
-    if root.argv.iter().skip(1).any(|arg| {
-        (!arg.starts_with('-') && !arg.starts_with('+'))
+    let mut skip_next = false;
+    for arg in root.argv.iter().skip(1) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if matches!(arg.as_str(), "--rcfile" | "--init-file") {
+            skip_next = true;
+            continue;
+        }
+        if (!arg.starts_with('-') && !arg.starts_with('+'))
             || matches!(arg.split('=').next(), Some("--command" | "--commands"))
             || (arg.starts_with('-') && !arg.starts_with("--") && arg[1..].contains('c'))
-    }) {
-        return false;
+        {
+            return false;
+        }
     }
     let program =
         if root.name.is_empty() { root.argv.first().map(String::as_str).unwrap_or_default() } else { &root.name };
@@ -186,30 +322,144 @@ pub(crate) fn is_cli_foreground(fg: &Foreground) -> bool {
 }
 
 impl Core {
+    /// Records an OSC 7 / OSC 9;9 working directory update and immediately propagates it to
+    /// `foreground.cwd` for Windows shells (Git Bash / MSYS2 / Cygwin / CMD / PowerShell),
+    /// synthesizing a shell foreground record if `foreground::about` has not populated one yet.
+    pub(crate) fn apply_osc7_cwd(&self, st: &mut crate::runtime::State, id: u32, dir: String, windows: bool) {
+        let mut emit_fg = None;
+        let mut changed = false;
+        if let Some(t) = st.pty_reg.terminals.get_mut(&id).filter(|t| t.is_live()) {
+            if t.reported_cwd.as_deref() != Some(dir.as_str()) {
+                t.reported_cwd = Some(dir.clone());
+                changed = true;
+            }
+            if t.last_cwd.as_deref() != Some(dir.as_str()) {
+                t.last_cwd = Some(dir.clone());
+                changed = true;
+            }
+            if windows {
+                if let Some(fg) = t.foreground.as_mut() {
+                    if is_windows_shell(&fg.name) && fg.cwd != dir {
+                        fg.cwd = dir;
+                        emit_fg = Some(fg.clone());
+                        changed = true;
+                    }
+                } else if let Some(pid) = t.pid {
+                    let name = t
+                        .argv
+                        .first()
+                        .map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p).to_string())
+                        .unwrap_or_default();
+                    if is_windows_shell(&name) {
+                        let synth = Foreground { pid: pid as i32, name, argv: t.argv.clone(), cwd: dir };
+                        t.foreground = Some(synth.clone());
+                        emit_fg = Some(synth);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if changed {
+            self.save_pty_soon();
+        }
+        if let Some(fg) = emit_fg {
+            self.emit_pty(st, "foreground", id, serde_json::to_value(&fg).unwrap_or_default());
+        }
+    }
+
     /// Applies one foreground sample for terminal `id`, resetting agent status, task digest, timing,
     /// and stale CLI checkpoints when a CLI exits back to its shell or a fresh non-resumed CLI starts
     /// in the same terminal.
     pub(crate) fn apply_foreground_update(&self, st: &mut crate::runtime::State, id: u32, now: Option<Foreground>) {
-        let Some((t_pid, t_addr, t_cwd, prev_fg, has_status_or_records, has_agent_task_state, t_title)) =
-            st.pty_reg.terminals.get(&id).filter(|t| t.is_live()).map(|t| {
-                let cwd = t.last_cwd.clone().unwrap_or_else(|| t.cwd.clone());
-                let has_status = t.status.is_some() || !t.records.is_empty();
-                let has_task_state = has_status
-                    || t.semantic_title.is_some()
-                    || t.micro_summary.is_some()
-                    || t.reported
-                    || t.turn > 0
-                    || t.working_since.is_some()
-                    || t.work_ms.is_some()
-                    || t.total_work_ms > 0
-                    || t.status_ms.is_some()
-                    || t.labels.contains_key("herdr.status")
-                    || st.pty_prompts.contains_key(&id);
-                (t.pid, t.address.clone(), cwd, t.foreground.clone(), has_status, has_task_state, t.title.clone())
-            })
+        self.apply_foreground_update_for_platform(st, id, now, cfg!(windows));
+    }
+
+    pub(crate) fn apply_foreground_update_for_platform(
+        &self,
+        st: &mut crate::runtime::State,
+        id: u32,
+        mut now: Option<Foreground>,
+        windows: bool,
+    ) {
+        let Some((
+            t_pid,
+            t_addr,
+            t_cwd,
+            t_argv,
+            prev_fg,
+            has_status_or_records,
+            has_agent_task_state,
+            t_title,
+            reported_cwd,
+            prev_os_cwd,
+        )) = st.pty_reg.terminals.get(&id).filter(|t| t.is_live()).map(|t| {
+            let cwd = t.last_cwd.clone().unwrap_or_else(|| t.cwd.clone());
+            let has_status = t.status.is_some() || !t.records.is_empty();
+            let has_task_state = has_status
+                || t.semantic_title.is_some()
+                || t.micro_summary.is_some()
+                || t.reported
+                || t.turn > 0
+                || t.working_since.is_some()
+                || t.work_ms.is_some()
+                || t.total_work_ms > 0
+                || t.status_ms.is_some()
+                || t.labels.contains_key("herdr.status")
+                || st.pty_prompts.contains_key(&id);
+            (
+                t.pid,
+                t.address.clone(),
+                cwd,
+                t.argv.clone(),
+                t.foreground.clone(),
+                has_status,
+                has_task_state,
+                t.title.clone(),
+                t.reported_cwd.clone(),
+                t.last_os_cwd.clone(),
+            )
+        })
         else {
             return;
         };
+
+        let mut next_os_cwd = prev_os_cwd.clone();
+        let mut next_reported_cwd = reported_cwd.clone();
+        if windows {
+            match now.as_mut() {
+                Some(fg) => {
+                    let raw_os_cwd = fg.cwd.clone();
+                    if let Some(rcwd) = reported_cwd.as_deref() {
+                        if is_windows_posix_shell(&fg.name) {
+                            fg.cwd = rcwd.to_owned();
+                        } else if is_windows_shell(&fg.name) {
+                            let os_moved = prev_os_cwd.as_deref().is_some_and(|p| p != raw_os_cwd);
+                            if os_moved {
+                                next_reported_cwd = Some(raw_os_cwd.clone());
+                            } else {
+                                fg.cwd = rcwd.to_owned();
+                            }
+                        }
+                    }
+                    next_os_cwd = Some(raw_os_cwd);
+                }
+                None => {
+                    if let (Some(pid), Some(rcwd)) = (t_pid, reported_cwd.as_deref()) {
+                        let name = t_argv
+                            .first()
+                            .map(|p| p.rsplit(['/', '\\']).next().unwrap_or(p).to_string())
+                            .unwrap_or_default();
+                        if is_windows_shell(&name) {
+                            now = Some(Foreground { pid: pid as i32, name, argv: t_argv, cwd: rcwd.to_owned() });
+                        }
+                    }
+                }
+            }
+            if let Some(t) = st.pty_reg.terminals.get_mut(&id) {
+                t.last_os_cwd = next_os_cwd;
+                t.reported_cwd = next_reported_cwd;
+            }
+        }
 
         let now_is_shell_root = now.as_ref().is_some_and(|n| Some(n.pid as u32) == t_pid && is_shell_root(n));
         let prev_was_shell_root = prev_fg.as_ref().is_some_and(|p| Some(p.pid as u32) == t_pid && is_shell_root(p));
@@ -951,5 +1201,116 @@ mod tests {
             cwd: r"D:\Users\zhihao.zou".into(),
         };
         assert!(is_cli_foreground(&fg));
+    }
+
+    #[test]
+    fn osc7_cwd_parsing_and_windows_git_bash_sync() {
+        use crate::paths::Paths;
+        use crate::terminals::NewTerminal;
+
+        // Windows drive paths (`pwd -W`, MSYS `/d/...`, and CMD OSC 9;9), percent-encoding, UTF-8, and host filtering.
+        assert_eq!(parse_osc7_cwd("file:///D:/Work/herdr2", "my-pc", true).as_deref(), Some(r"D:\Work\herdr2"));
+        assert_eq!(parse_osc7_cwd(r"D:\Work\herdr2\", "my-pc", true).as_deref(), Some(r"D:\Work\herdr2"));
+        assert_eq!(parse_osc7_cwd(r"C:\", "my-pc", true).as_deref(), Some(r"C:\"));
+        assert_eq!(
+            parse_osc7_cwd("file://MY-PC/d:/Work/my%20repo/%E9%A1%B9%E7%9B%AE/", "my-pc", true).as_deref(),
+            Some(r"D:\Work\my repo\项目")
+        );
+        assert_eq!(parse_osc7_cwd("file:///d/Work/herdr2/", "my-pc", true).as_deref(), Some(r"D:\Work\herdr2"));
+        assert_eq!(parse_osc7_cwd("file:///c:/", "my-pc", true).as_deref(), Some(r"C:\"));
+        assert_eq!(parse_osc7_cwd("file://remote-box/D:/Work/herdr2", "my-pc", true), None);
+        assert_eq!(parse_osc7_cwd("file://localhost/home/me/my%20app/", "my-pc", false).as_deref(), Some("/home/me/my app"));
+
+        // `bash --rcfile <path> -i` stays recognized as an interactive shell root.
+        let rc_bash = Foreground {
+            pid: 10,
+            name: "bash.exe".into(),
+            argv: vec![
+                r"C:\Program Files\Git\bin\bash.exe".into(),
+                "--rcfile".into(),
+                "C:/Users/me/AppData/Roaming/herdr2/shell/git-bash-init.sh".into(),
+                "-i".into(),
+            ],
+            cwd: r"C:\Users\me".into(),
+        };
+        assert!(is_shell_root(&rc_bash));
+        assert!(is_windows_posix_shell(&rc_bash.name));
+
+        // On Windows, OSC 7 overrides Git Bash's frozen PEB cwd immediately and across subsequent polls,
+        // without overriding native Win32 child processes (e.g. PowerShell or Claude).
+        let root =
+            crate::test_tmp().join(format!("h2-fg-osc7-{}-{}", std::process::id(), crate::platform::random_hex()));
+        let paths = Paths {
+            socket: root.join("core.sock"),
+            holder_socket: root.join("holder.sock"),
+            state: root.clone(),
+            config: root.join("config.toml"),
+        };
+        paths.create_dirs().unwrap();
+        let core = Core::start(paths, crate::api::CoreInfo { id: "here".into(), name: "here".into() }).unwrap();
+        let id = {
+            let mut st = core.lock();
+            let id = st
+                .pty_reg
+                .create(
+                    NewTerminal {
+                        argv: rc_bash.argv.clone(),
+                        cwd: r"C:\Users\me".into(),
+                        cols: 80,
+                        rows: 24,
+                        ..Default::default()
+                    },
+                    1,
+                )
+                .unwrap();
+            st.pty_reg.terminals.get_mut(&id).unwrap().pid = Some(10);
+            id
+        };
+        {
+            let mut st = core.lock();
+            core.apply_foreground_update_for_platform(&mut st, id, Some(rc_bash.clone()), true);
+            assert_eq!(st.pty_reg.terminals[&id].foreground.as_ref().unwrap().cwd, r"C:\Users\me");
+
+            // User runs `cd /d/Work/herdr2` in Git Bash -> OSC 7 updates live foreground cwd immediately.
+            core.apply_osc7_cwd(&mut st, id, r"D:\Work\herdr2".into(), true);
+            assert_eq!(st.pty_reg.terminals[&id].foreground.as_ref().unwrap().cwd, r"D:\Work\herdr2");
+            assert_eq!(st.pty_reg.terminals[&id].last_cwd.as_deref(), Some(r"D:\Work\herdr2"));
+
+            // Next 500ms PEB poll still reads frozen `C:\Users\me` from bash.exe, but OSC 7 keeps `D:\Work\herdr2`.
+            core.apply_foreground_update_for_platform(&mut st, id, Some(rc_bash.clone()), true);
+            assert_eq!(st.pty_reg.terminals[&id].foreground.as_ref().unwrap().cwd, r"D:\Work\herdr2");
+
+            // Native Win32 child (e.g. PowerShell) keeps its own live PEB cwd.
+            let ps = Foreground {
+                pid: 20,
+                name: "powershell.exe".into(),
+                argv: vec!["powershell.exe".into()],
+                cwd: r"E:\Other".into(),
+            };
+            core.apply_foreground_update_for_platform(&mut st, id, Some(ps), true);
+            assert_eq!(st.pty_reg.terminals[&id].foreground.as_ref().unwrap().cwd, r"E:\Other");
+
+            // Windows CMD terminal synthesizes and retains OSC 9;9 cwd even if PEB read returns None.
+            let cmd_id = st
+                .pty_reg
+                .create(
+                    NewTerminal {
+                        argv: vec![r"C:\Windows\System32\cmd.exe".into()],
+                        cwd: r"C:\Users\me".into(),
+                        cols: 80,
+                        rows: 24,
+                        ..Default::default()
+                    },
+                    2,
+                )
+                .unwrap();
+            st.pty_reg.terminals.get_mut(&cmd_id).unwrap().pid = Some(30);
+            core.apply_osc7_cwd(&mut st, cmd_id, r"D:\Projects\demo".into(), true);
+            assert_eq!(st.pty_reg.terminals[&cmd_id].foreground.as_ref().unwrap().cwd, r"D:\Projects\demo");
+            core.apply_foreground_update_for_platform(&mut st, cmd_id, None, true);
+            assert_eq!(st.pty_reg.terminals[&cmd_id].foreground.as_ref().unwrap().cwd, r"D:\Projects\demo");
+        }
+        drop(core);
+        let _ = std::fs::remove_dir_all(root);
     }
 }

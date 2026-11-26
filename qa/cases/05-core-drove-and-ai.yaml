@@ -254,14 +254,14 @@ cases:
 
   - id: TC-CORE-056
     feature: F12
-    title: Core AI 与 Drove 智能辅助 RPC 全集验证 (classify_terminal_state, handoff_recommend, briefing, summarize, commit_message, polish, roles.ai_configure)
+    title: Core AI 与 Drove 智能辅助 RPC 全集验证 (classify_terminal_state, handoff_recommend, briefing, summarize, commit_message, polish, roles.ai_configure, probe.ai_diagnose)
     tier: L1-core-isolated
     mode: scripted
     priority: P0
     platforms: [linux, macos, windows]
     covers:
-      rpc: [ai.classify_terminal_state, ai.handoff_recommend, ai.briefing, ai.summarize_agent, ai.commit_message, ai.polish_prompt, drove.roles.ai_configure]
-      cli: ["h2 ai handoff-recommend", "h2 ai briefing", "h2 ai summarize-agent", "h2 ai commit-message", "h2 ai polish-prompt", "h2 drove roles-ai-config"]
+      rpc: [ai.classify_terminal_state, ai.handoff_recommend, ai.briefing, ai.summarize_agent, ai.commit_message, ai.polish_prompt, drove.roles.ai_configure, drove.probe.ai_diagnose]
+      cli: ["h2 ai handoff-recommend", "h2 ai briefing", "h2 ai summarize-agent", "h2 ai commit-message", "h2 ai polish-prompt", "h2 drove roles-ai-config", "h2 drove probe-ai-diagnose"]
       app_commands: []
       mods: []
       frames: []
@@ -270,9 +270,9 @@ cases:
     steps:
       - "Invoke `ai.classify_terminal_state` on `t1` screen tail."
       - "Invoke `ai.handoff_recommend` (`source: 'a1'`), `ai.briefing` (both AI and `--no-ai`), `ai.summarize_agent` (`a1` with/without `--no-ai`), `ai.commit_message`, and `ai.polish_prompt`."
-      - "Invoke `drove.roles.ai_configure` with `dry_run: true`, then `apply: true`."
+      - "Invoke `drove.roles.ai_configure` with `dry_run: true`, then `apply: true`, and `drove.probe.ai_diagnose` with an errored agent snapshot."
     oracles:
-      - "All 6 `ai.*` helper RPCs and `drove.roles.ai_configure` return schema-valid responses."
+      - "All 6 `ai.*` helper RPCs, `drove.roles.ai_configure`, and `drove.probe.ai_diagnose` return schema-valid responses."
       - "`--no-ai` deterministic fallback works offline without hitting mock server; `dry_run: true` leaves `drove.json` untouched."
     ai_probe_hints:
       - "Test `ai.polish_prompt` with `kind: 'cli'` vs `kind: 'acp'` and non-empty `context`."
