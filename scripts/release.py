@@ -777,25 +777,25 @@ def build_github_release_notes(
     if changes_md:
         changes_block = changes_md.strip()
         if resolved_prev and "full changelog" not in changes_block.lower():
-            changes_block += f"\n\n**Full Changelog**: https://github.com/{repo}/compare/{resolved_prev}...{tag}"
-        parts.append(f"### What's Changed\n\n{changes_block}")
+            changes_block += f"\n\n**Full Changelog / 完整变更对比**: https://github.com/{repo}/compare/{resolved_prev}...{tag}"
+        parts.append(f"### What's Changed / 更新内容\n\n{changes_block}")
     elif resolved_prev:
         parts.append(
-            f"### What's Changed\n\n**Full Changelog**: https://github.com/{repo}/compare/{resolved_prev}...{tag}"
+            f"### What's Changed / 更新内容\n\n**Full Changelog / 完整变更对比**: https://github.com/{repo}/compare/{resolved_prev}...{tag}"
         )
 
-    installers = f"""### Direct Download Installers (includes Desktop App + `h2` Core)
-- **Windows (x64)**: `Herdr2-Setup-{ver}-windows-x86_64.exe` — double-click to install App + `h2` CLI
-- **macOS (Apple Silicon)**: `Herdr2-{ver}-macos-aarch64.dmg` — open and drag `Herdr2.app` to Applications
-- **macOS (Intel)**: `Herdr2-{ver}-macos-x86_64.dmg` — open and drag `Herdr2.app` to Applications
+    installers = f"""### Direct Download Installers / 直接下载安装包（包含桌面端 App + `h2` Core）
+- **Windows (x64)**: `Herdr2-Setup-{ver}-windows-x86_64.exe` — double-click to install App + `h2` CLI / 双击安装桌面端与 `h2` CLI
+- **macOS (Apple Silicon)**: `Herdr2-{ver}-macos-aarch64.dmg` — open and drag `Herdr2.app` to Applications / 打开并拖入应用程序目录
+- **macOS (Intel)**: `Herdr2-{ver}-macos-x86_64.dmg` — open and drag `Herdr2.app` to Applications / 打开并拖入应用程序目录
 - **Linux (Ubuntu/Debian)**: `herdr2_{ver}_amd64.deb` — run `sudo apt install ./herdr2_{ver}_amd64.deb`
-- **Linux (Generic x64)**: `herdr2-{ver}-linux-x86_64.tar.gz` — extract and run `./install.sh`
+- **Linux (Generic x64)**: `herdr2-{ver}-linux-x86_64.tar.gz` — extract and run `./install.sh` / 解压后执行 `./install.sh`
 
-### Install via Your AI Agent
-Give your agent the install skill:
+### Install via Your AI Agent / 通过 AI Agent 一键安装
+Give your agent the install skill / 将以下安装 Skill 链接发给你的 Agent：
 `https://raw.githubusercontent.com/{repo}/main/skills/herdr2-install/SKILL.md`
 
-### Install Companion Skills After Setup
+### Install Companion Skills After Setup / 安装后部署配套 Skills
 ```sh
 h2 skill install --all
 ```"""

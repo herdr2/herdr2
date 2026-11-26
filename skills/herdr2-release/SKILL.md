@@ -31,7 +31,8 @@ Use this skill whenever the user wants to **publish a new version of Herdr2** (f
 2. Check if target tag `vX.Y.Z` already exists on `github` or locally:
    - If `vX.Y.Z` exists on `github` as a real released Herdr2 version, bump to the next semver version instead of overwriting unless the user explicitly asks to re-tag.
    - If `vX.Y.Z` only exists locally from legacy upstream tags (not on `github`), replace the local tag (`git tag -f -a vX.Y.Z -m "Herdr2 vX.Y.Z"`) after confirming `git ls-remote --tags github` has no conflicting `vX.Y.Z`.
-3. Update `version = "X.Y.Z"` in ALL versioned files:
+3. Update `version = "X.Y.Z"` in ALL versioned files and write **bilingual (Chinese + English) release notes** in `CHANGELOG.md` clearly listing both **New Features / 新增功能** and **Bug Fixes / 问题修复**:
+   - `CHANGELOG.md` (`## vX.Y.Z` with `### 中文` (`#### 新增功能 (New Features)`, `#### 问题修复 (Bug Fixes)`) and `### English` (`#### New Features`, `#### Bug Fixes`) sections)
    - `herdr-app/Cargo.toml`
    - `herdr-core/crates/herdr2/Cargo.toml`
    - `herdr-app/distribution/windows/herdr2.iss` (`#define MyAppVersion "X.Y.Z"` default)
