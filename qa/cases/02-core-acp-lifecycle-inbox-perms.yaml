@@ -351,3 +351,28 @@ cases:
       - "Live ACP session reaches `idle`, produces coherent assistant response, and exits cleanly on `kill`."
     ai_probe_hints:
       - "Skip automatically when no live LLM credentials/preset are configured in CI/sandbox."
+
+  - id: TC-CORE-024
+    feature: F02
+    title: 托管 ACP 适配器状态查询、按需安装与更新 (adapter.status, adapter.install & adapter.update)
+    tier: L1-core-isolated
+    mode: scripted
+    priority: P1
+    platforms: [linux, macos, windows]
+    covers:
+      rpc: [adapter.status, adapter.install, adapter.update]
+      cli: ["h2 adapter status", "h2 adapter install", "h2 adapter update"]
+      app_commands: []
+      mods: []
+      frames: []
+    preconditions:
+      - "Isolated `herdr2` daemon with `acp_registry_url` pointed at a local mock registry HTTP server serving test adapter archives and SHA-256 digests."
+    steps:
+      - "Call `adapter.status` (`h2 adapter status --json`) to inspect managed adapter presets, companion CLI detection, and install sources."
+      - "Call `adapter.install` (`h2 adapter install --detected` / specific preset) and verify isolated installation under `<data>/herdr2/adapters/`."
+      - "Bump mock registry version and call `adapter.update` (`h2 adapter update --json`)."
+    oracles:
+      - "`adapter.status` reports structured installation source (`managed` / `path` / `missing`), version, and companion CLI status."
+      - "`adapter.install` and `adapter.update` verify archive SHA-256 digests and install/update managed adapters cleanly without modifying system PATH."
+    ai_probe_hints:
+      - "Verify `--on <machine>` routes `adapter.status`, `adapter.install`, and `adapter.update` to the target remote machine."

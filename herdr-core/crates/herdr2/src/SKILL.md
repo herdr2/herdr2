@@ -105,6 +105,7 @@ Use the `h2` CLI directly together with your host's shell / background command r
 - `h2 file read|write|edit [--on box] <path>`: read lines (`--offset`/`--limit`), atomically write stdin, or exact-match replace (`--old`/`--new`).
 - `h2 machine add|ls|login|update|rename|rm`: orchestrate agents across SSH or custom `--via` hosts (`box/a7` addresses).
 - `h2 server start|stop|status|restart`, `h2 update`, `h2 connect`, `h2 schema`: manage daemon, self-updates, stdio JSON-RPC bridge, and OpenRPC schema.
+- `h2 adapter status|install|update [--all|--detected] [--on <machine>]`: inspect, auto-install, or update managed ACP adapters (`claude`, `codex`, `pi`, `glm`) from the official ACP Registry into `~/.local/share/herdr2/adapters/`.
 - `h2 checkpoint ls|snap|diff|rollback <target>`: inspect hidden Git ref snapshots (`refs/herdr2/checkpoints/<session>/<addr>/<turn>`), view pure authored turn diffs (`--from`/`--to`), or roll back conversation + files (`--to <turn> [--no-files] [--confirm]`).
 
 ## Persistence, recovery, and safety rules

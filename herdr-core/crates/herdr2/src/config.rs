@@ -46,6 +46,11 @@ pub struct Config {
     pub inject_mcp: Option<bool>,
     /// Base URL for `h2 update` release manifests (`<url>/core/latest.json`). `HERDR2_RELEASES_URL` wins.
     pub releases_url: Option<String>,
+    /// Automatically download and install missing managed ACP adapters into Herdr2's isolated
+    /// adapters directory when a companion CLI (`claude`, `codex`, `pi`) is installed or launched (default true).
+    pub auto_install_adapters: Option<bool>,
+    /// Override the official ACP Registry index URL (`HERDR2_ACP_REGISTRY_URL` wins).
+    pub acp_registry_url: Option<String>,
     /// Custom ACP agent preset commands overriding or extending built-in presets.
     #[serde(default)]
     pub agents: BTreeMap<String, Vec<String>>,
@@ -90,6 +95,10 @@ impl Config {
 
     pub fn restore_cli_sessions(&self) -> bool {
         self.restore_cli_sessions.unwrap_or(true)
+    }
+
+    pub fn auto_install_adapters(&self) -> bool {
+        self.auto_install_adapters.unwrap_or(true)
     }
 
     pub fn validate(&self) -> Result<(), RpcError> {
@@ -161,6 +170,8 @@ mod tests {
 default_permissions = "approve-all"
 inject_mcp = false
 wait_timeout = 42.5
+auto_install_adapters = false
+acp_registry_url = "https://mirror.example/registry.json"
 
 [agents]
 claude = ["my-claude-acp", "--flag"]
@@ -170,6 +181,9 @@ claude = ["my-claude-acp", "--flag"]
         cfg.validate().unwrap();
         assert_eq!(cfg.default_permissions, Some(PermissionMode::ApproveAll));
         assert_eq!(cfg.inject_mcp, Some(false));
+        assert!(!cfg.auto_install_adapters());
+        assert_eq!(cfg.acp_registry_url.as_deref(), Some("https://mirror.example/registry.json"));
+        assert!(Config::default().auto_install_adapters());
         assert_eq!(cfg.agents["claude"], ["my-claude-acp", "--flag"]);
     }
 

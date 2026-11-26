@@ -1,5 +1,31 @@
 # Changelog
 
+## v2.0.16
+
+#### 中文
+
+**新增功能**
+- **托管式 ACP 适配器注册表与自动安装 (`h2 adapter status|install|update`)**：新增 `AdapterManager`、`adapter.status` / `adapter.install` / `adapter.update` RPC 与 `h2 adapter` CLI（支持 `config.toml` 配置 `auto_install_adapters` 与 `acp_registry_url`）；从官方 ACP Registry 下载独立二进制（校验 SHA-256）隔离安装至 `~/.local/share/herdr2/adapters/`（Windows 为 `%LOCALAPPDATA%\herdr2\adapters\`），不可达时自动回退隔离 `npm install --prefix`，检测到配套 CLI（`claude`、`codex`、`pi`、`glm`）支持后台自动安装，并在设置页 Drove 面板新增一键安装/更新适配器状态栏。
+- **ACP 与 PTY 提问/待确认状态智能识别与区分**：结合确定性规则与 Core AI 仲裁（`status.rs`、`ai/terminal_state.rs`、`terminal.rs`），自动识别 ACP 回合结束或静默 PTY 终端输出中向用户提问、给出选项或等待确认工具调用的场景，准确标记为 `blocked`（「待确认 / Needs you」），并在 Peek 视图中与权限审批（「待审批 / Needs approval」）清晰区分。
+
+**问题修复**
+- **修复 Changes / Checkpoints Diff 视图删除行前缀显示误导性 `+` 号**：Diff 视图现按标准 Git 风格清晰展示删除行 `-` 与新增行 `+`，不再在行号槽位显示易混淆的 `+` 评论提示符号。
+- **修复非 OSC 7501 PTY 终端跳过「已完成 (done)」状态的问题**：修复 `turn == 0` 且带 `herdr.seen="0"` 标签的 PTY 终端在任务结束后直接从 `working` 跳到 `idle` 的问题，确保在用户查看前始终保持 `done` 状态并支持 AI 快速完成补标（`mark_unseen`）。
+- **修复后台刷新误将未读「已完成」状态清为空闲**：窗口后台状态同步改用 `sync_without_marking_seen`，仅在用户主动切换、点击或聚焦对应 Agent 时才将 `done` 标记为已读（`idle`）。
+
+---
+
+#### English
+
+**New Features**
+- **Managed ACP Adapter Registry & Auto-Installer (`h2 adapter status|install|update`)**: Added `AdapterManager`, `adapter.status` / `adapter.install` / `adapter.update` RPCs, the `h2 adapter` CLI, and `auto_install_adapters` / `acp_registry_url` settings in `config.toml`. Downloads SHA-256 verified standalone binaries from the official ACP Registry into isolated `~/.local/share/herdr2/adapters/` (`%LOCALAPPDATA%\herdr2\adapters\` on Windows) with isolated `npm install --prefix` fallback, supports background auto-install for detected companion CLIs (`claude`, `codex`, `pi`, `glm`), and adds a one-click **Managed ACP Adapters** bar in Settings → Drove.
+- **Smarter ACP & PTY User-Question / Confirmation Detection**: Added deterministic + Core AI-assisted arbitration (`status.rs`, `ai/terminal_state.rs`, `terminal.rs`) to detect when a completed ACP turn or quiet PTY screen stops to ask a question, present choices, or await a question tool, surfacing it as `blocked` (`Needs you`) distinct from permission approvals (`Needs approval`) in Peek.
+
+**Bug Fixes**
+- **Fixed Misleading `+` Gutter Marker on Removed Lines in Changes / Checkpoints Diffs**: Diff views now render standard git-style `-` for removed lines and `+` for added lines without a misleading `+` comment-gutter marker.
+- **Fixed Non-7501 PTY Terminals Skipping `done` Status**: Fixed PTY terminals with `turn == 0` and `herdr.seen="0"` jumping directly from `working` to `idle` upon completion, keeping them in `done` until viewed and supporting AI-detected fast completion via `mark_unseen`.
+- **Fixed Background UI Syncs Prematurely Clearing Unread `done` Status**: Background window syncs now use `sync_without_marking_seen` so `done` only clears to `idle` when the user actively views or interacts with the agent.
+
 ## v2.0.15
 
 #### 中文

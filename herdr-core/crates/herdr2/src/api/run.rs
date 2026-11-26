@@ -79,6 +79,10 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
     }
     let base_env = crate::platform::program_env().await;
     let env = child_env(base_env, p.env.clone());
+    let async_mode = p.async_start && !p.wait;
+    if !async_mode {
+        core.adapters.ensure_for_launch(core, resolved.preset.as_deref(), &resolved.argv, &env).await;
+    }
     if let Some((_, effective_argv)) =
         presets::resolve_acp_command_in_env(resolved.preset.as_deref(), &resolved.argv, &env)
     {
@@ -100,7 +104,6 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         _ => None,
     };
 
-    let async_mode = p.async_start && !p.wait;
     let (id, address, env, created_async) = {
         let mut st = core.lock();
         not_stopping(&st)?;
@@ -191,6 +194,20 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         let caller_bg = caller.clone();
         let clear_probe_agent_bg = clear_probe_agent.clone();
         tokio::spawn(async move {
+            let mut spec = spec;
+            core_bg
+                .adapters
+                .ensure_for_launch(&core_bg, clear_probe_agent_bg.as_deref(), &spec.argv, &spec.env)
+                .await;
+            if let Some((_, effective_argv)) =
+                presets::resolve_acp_command_in_env(clear_probe_agent_bg.as_deref(), &spec.argv, &spec.env)
+            {
+                spec.argv = effective_argv;
+                let mut st = core_bg.lock();
+                if let Some(a) = st.reg.agents.get_mut(&id) {
+                    a.argv = spec.argv.clone();
+                }
+            }
             match acp::spawn_session(spec).await {
                 Ok(started) => {
                     if let Some(ref preset) = clear_probe_agent_bg {
@@ -529,6 +546,7 @@ pub(crate) async fn spawn_drove_agent(core: &Arc<Core>, req: DroveSpawnSpec) -> 
         });
         env.insert(path_key, combined);
     }
+    core.adapters.ensure_for_launch(core, resolved.preset.as_deref(), &resolved.argv, &env).await;
     if let Some((_, effective_argv)) =
         presets::resolve_acp_command_in_env(resolved.preset.as_deref(), &resolved.argv, &env)
     {

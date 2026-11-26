@@ -62,6 +62,8 @@ More
   drove status|web|probe|...  manage Drove DAG orchestration and Web UI
   skill status|install|ai-install
                               detect coding agents and install bundled Herdr2 skills
+  adapter status|install|update
+                              inspect, auto-install, or update managed ACP adapters
   ai status|settings-set|test manage shared Core AI assistant & cache stats
   schema                      print OpenRPC 1.3.2 JSON Schema
 
@@ -71,6 +73,73 @@ Options: --json (default when piped except read/file read/exec), -V --version, -
 Per command: h2 <command> --help
 Settings: ~/.config/herdr2/config.toml (default_permissions, inject_mcp, [agents]).
 Agent manual: h2 --skill
+```
+
+## h2 adapter
+
+```text
+Inspect, install, or update managed ACP adapters (`status`, `install`, `update`)
+
+Usage: h2 adapter [OPTIONS] <COMMAND>
+
+Commands:
+  status   Inspect managed ACP adapters, companion CLIs, installation source, and versions
+  install  Download and install missing managed ACP adapters from the official ACP Registry
+  update   Refresh the official ACP Registry and update managed ACP adapters to the latest version
+  help     Print this message or the help of the given subcommand(s)
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
+## h2 adapter install
+
+```text
+Download and install missing managed ACP adapters from the official ACP Registry
+
+Usage: h2 adapter install [OPTIONS] [PRESETS]...
+
+Arguments:
+  [PRESETS]...  Specific preset(s) to install (`claude`, `codex`, `pi`, `glm`)
+
+Options:
+      --all           Install all managed ACP adapters
+      --json          JSON output even in a terminal
+      --detected      Only install adapters for companion CLIs detected on PATH
+      --force         Force re-install even if already installed
+      --on <MACHINE>  Target remote machine (`h2 machine ls`)
+  -h, --help          Print help
+```
+
+## h2 adapter status
+
+```text
+Inspect managed ACP adapters, companion CLIs, installation source, and versions
+
+Usage: h2 adapter status [OPTIONS]
+
+Options:
+      --json          JSON output even in a terminal
+      --on <MACHINE>  Target remote machine (`h2 machine ls`)
+  -h, --help          Print help
+```
+
+## h2 adapter update
+
+```text
+Refresh the official ACP Registry and update managed ACP adapters to the latest version
+
+Usage: h2 adapter update [OPTIONS] [PRESETS]...
+
+Arguments:
+  [PRESETS]...  Specific preset(s) to update (`claude`, `codex`, `pi`, `glm`)
+
+Options:
+      --all           Update all managed ACP adapters
+      --json          JSON output even in a terminal
+      --on <MACHINE>  Target remote machine (`h2 machine ls`)
+  -h, --help          Print help
 ```
 
 ## h2 ai

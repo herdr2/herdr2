@@ -197,6 +197,8 @@ export default class Settings extends View {
     this.droveSaving = false;
     this.droveProbing = false;
     this.droveProbePromise = null;
+    this.adapterStatus = null;
+    this.adapterBusy = false;
     this.droveAutoProbed = {};
     this.droveProbeAgentLaunching = false;
     this.droveProbeFixOpen = false;
@@ -1795,6 +1797,9 @@ export default class Settings extends View {
       const data = await this.droveHcJson(["drove", "settings"], { timeout: 60000 });
       this.droveData = data;
       this.syncDroveInputs(data);
+      try {
+        this.adapterStatus = await this.droveHcJson(["adapter", "status"], { timeout: 15000 });
+      } catch {}
     } catch (e) {
       this.droveError = String(e?.message ?? e);
     } finally {
@@ -1837,6 +1842,9 @@ export default class Settings extends View {
         if (this.droveMachine !== targetMachine) return false;
         if (snap && this.droveData) this.droveData = { ...this.droveData, agents: snap };
         else await this.loadDrove();
+        try {
+          this.adapterStatus = await this.droveHcJson(["adapter", "status"], { timeout: 15000 });
+        } catch {}
         this.droveAutoProbed = { ...(this.droveAutoProbed ?? {}), [key]: true };
         return true;
       } catch (e) {
@@ -1861,6 +1869,48 @@ export default class Settings extends View {
     });
   }
 
+  runAdapterAction(cx, mode) {
+    if (this.adapterBusy || (typeof checking === "function" && checking())) return;
+    const targetMachine = this.droveMachine;
+    this.adapterBusy = true;
+    this.droveError = null;
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
+        const args = mode === "update" ? ["adapter", "update"] : ["adapter", "install", "--detected"];
+        const res = await this.droveHcJson(args, { timeout: 240000 });
+        if (this.droveMachine !== targetMachine) return;
+        const results = Array.isArray(res?.results) ? res.results : [];
+        const failed = results.filter((r) => r.action === "failed");
+        const changed = results.filter((r) => r.action === "installed" || r.action === "updated");
+        if (failed.length > 0) {
+          notify({
+            title: this.tr("ACP adapter install partially failed", "ACP 适配器部分安装失败"),
+            body: failed.map((f) => `${f.preset_id}: ${f.error || "failed"}`).join("; "),
+            level: "warning",
+          });
+        } else if (changed.length > 0) {
+          notify({
+            title: this.tr("ACP adapters ready", "ACP 适配器已就绪"),
+            body: changed.map((c) => `${c.preset_id}${c.version ? ` v${c.version}` : ""}`).join(", "),
+            level: "success",
+          });
+        }
+        try {
+          this.adapterStatus = await this.droveHcJson(["adapter", "status"], { timeout: 15000 });
+        } catch {}
+        await this.runDroveProbe(cx);
+      } catch (e) {
+        if (this.droveMachine === targetMachine) {
+          this.droveError = String(e?.message ?? e);
+        }
+      } finally {
+        this.adapterBusy = false;
+        cx.notify();
+      }
+    });
+  }
+
   buildDroveProbeFixPrompt(errorAgents) {
     const machineLabel = this.droveMachine || this.tr("this computer (local)", "本机（local）");
     const errLines = errorAgents.map((a) => {
@@ -1871,27 +1921,43 @@ export default class Settings extends View {
 
     if (this.lang() === "zh-CN") {
       return [
-        `请帮我排查并处理 Herdr2 Drove 在目标主机「${machineLabel}」上检测到的 ACP Agent 异常：`,
+        `请帮我排查 Herdr2 Drove 在目标主机「${machineLabel}」上检测到的 ACP Agent 异常：`,
         "",
         ...errLines,
         "",
-        "请按以下步骤处理：",
-        "1. 检查守护进程 `herdr2 serve` 与当前交互式 Shell 的环境差异（尤其是 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY、PATH、认证凭据、以及 ACP 适配器是否已安装）。",
-        "2. 区分哪些是“工作区 CLI 正常但守护进程无头 ACP 探测环境缺失”导致的假阳性，哪些是需要登录或安装适配器的真实问题。",
-        "3. 对可以安全自动修复的问题直接协助处理；对需要我手动交互登录（如 `claude`、`cursor-agent login`）或重启服务的步骤，给出清晰指令并等待确认。",
-        "4. 修复完成后执行 `h2 drove probe --refresh` 验证异常是否已消除。",
+        "【重要约束】不要直接开始修复！在我明确确认修复方案前，禁止执行任何修改配置/文件、安装/升级软件、登录或重启服务等变更操作，仅允许进行只读排查。",
+        "",
+        "请严格按以下阶段推进：",
+        "1. **只读排查与解读错误原因**：",
+        "   - 对比守护进程 `herdr2 serve` 与当前交互式 Shell 的环境差异（尤其是 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY、PATH、认证凭据、以及 ACP 适配器是否已安装）。",
+        "   - 区分哪些是“工作区 CLI 正常但守护进程无头 ACP 探测环境缺失”导致的假阳性，哪些是需要登录、修配置或安装适配器的真实问题。",
+        "   - 逐项向我清楚解读每个异常 Agent 的报错含义与根本原因。",
+        "2. **制定修复方案并等待确认**：",
+        "   - 针对每个问题给出具体、可执行的修复方案（说明拟执行的命令、会改动的配置或文件、是否需要我手动交互登录如 `claude` / `cursor-agent login` 或重启服务，以及潜在影响）。",
+        "   - 输出错误原因解读与修复方案后立即停下，等待我明确确认（或指定只修复其中部分问题），切勿直接开始修复。",
+        "3. **用户确认后再开始修复与验证**：",
+        "   - 收到我的确认后，再按确认的方案逐步执行修复；需要我手动交互的步骤给出清晰指引。",
+        "   - 修复完成后执行 `h2 drove probe --refresh` 验证异常是否已消除。",
       ].join("\n");
     }
     return [
-      `Please help diagnose and fix the Herdr2 Drove ACP agent probe errors on "${machineLabel}":`,
+      `Please help investigate the Herdr2 Drove ACP agent probe errors on "${machineLabel}":`,
       "",
       ...errLines,
       "",
-      "Please follow these steps:",
-      "1. Compare the `herdr2 serve` daemon environment against the interactive shell (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY, PATH, auth state, and installed ACP adapters).",
-      "2. Distinguish workspace-CLI vs headless-ACP false positives from genuine missing-adapter or login issues.",
-      "3. Apply safe fixes directly; for interactive logins (e.g. `claude`, `cursor-agent login`) or daemon restarts, explain clearly and guide me through them.",
-      "4. Verify the result with `h2 drove probe --refresh`.",
+      "[IMPORTANT] Do NOT start fixing directly! Until I explicitly confirm the fix plan, only perform read-only diagnostics—do not modify files or configs, install/upgrade packages, run logins, or restart services.",
+      "",
+      "Please follow these phases strictly:",
+      "1. **Read-only diagnosis & explain root causes**:",
+      "   - Compare the `herdr2 serve` daemon environment against the interactive shell (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY, PATH, auth state, and installed ACP adapters).",
+      "   - Distinguish workspace-CLI vs headless-ACP false positives from genuine missing-adapter, config, or login issues.",
+      "   - Clearly explain what each error means and its root cause.",
+      "2. **Propose a fix plan & wait for confirmation**:",
+      "   - Draft a concrete, actionable fix plan for each issue (commands to run, files/configs to change, any manual interactive login steps such as `claude` / `cursor-agent login` or daemon restarts, and potential impact).",
+      "   - Stop after presenting the root-cause explanation and fix plan, and wait for my explicit confirmation before making any changes.",
+      "3. **Start fixing only after confirmation & verify**:",
+      "   - Once I confirm (all or selected items), execute the approved plan step by step and guide me through any interactive steps.",
+      "   - After fixing, run `h2 drove probe --refresh` to verify the errors are resolved.",
     ].join("\n");
   }
 
@@ -4946,6 +5012,7 @@ export default class Settings extends View {
           this.droveMachine = value;
           this.droveData = null;
           this.droveProbePromise = null;
+          this.adapterStatus = null;
           this.picking = null;
           this.droveModelSubmit = null;
           this.droveStrengthSubmit = null;
@@ -5042,6 +5109,11 @@ export default class Settings extends View {
     const installedCount = probeSummary.installed.length;
     const readyCount = probeSummary.ready.length;
     const errorAgents = probeSummary.errored;
+    const adapterList = Array.isArray(this.adapterStatus?.adapters) ? this.adapterStatus.adapters : [];
+    const installingAdapters = adapterList.filter((a) => a.state === "installing");
+    const missingDetectedAdapters = adapterList.filter((a) => a.companion_installed && !a.installed && a.state !== "installing");
+    const managedAdapters = adapterList.filter((a) => a.source === "managed");
+    const showAdapterBar = installingAdapters.length > 0 || missingDetectedAdapters.length > 0 || managedAdapters.length > 0;
 
     return v_flex()
       .w_full()
@@ -5112,6 +5184,78 @@ export default class Settings extends View {
                 if (!(typeof checking === "function" && checking())) hc(this.droveArgs(["drove", "web"]));
               })),
           ),
+      )
+      .when(showAdapterBar, (el) =>
+        el.child(
+          h_flex()
+            .id("st-dr-adapters-bar")
+            .w_full()
+            .px(12)
+            .py(8)
+            .gap(10)
+            .rounded(8)
+            .border_1()
+            .border_color(t.border)
+            .bg(t.surface)
+            .items_center()
+            .justify_between()
+            .flex_wrap()
+            .child(
+              h_flex()
+                .gap(8)
+                .items_center()
+                .flex_wrap()
+                .when(installingAdapters.length > 0 || this.adapterBusy, (row) =>
+                  row.child(svg("mods/workspace-chrome/spinner.svg").size(12).text_color(t.accent).spin(900)),
+                )
+                .child(
+                  div()
+                    .text_size(12)
+                    .text_color(t.foreground)
+                    .child(
+                      installingAdapters.length > 0
+                        ? this.tr(
+                            `Installing managed ACP adapters: ${installingAdapters.map((a) => a.preset_id).join(", ")}…`,
+                            `正在后台自动安装 ACP 适配器：${installingAdapters.map((a) => a.preset_id).join("、")}…`,
+                          )
+                        : missingDetectedAdapters.length > 0
+                          ? this.tr(
+                              `Detected CLIs missing ACP adapters: ${missingDetectedAdapters.map((a) => a.preset_id).join(", ")}`,
+                              `检测到已安装 CLI 但缺少 ACP 适配器：${missingDetectedAdapters.map((a) => a.preset_id).join("、")}`,
+                            )
+                          : this.tr(
+                              `Managed ACP adapters: ${managedAdapters.map((a) => `${a.preset_id}${a.version ? ` v${a.version}` : ""}`).join(", ")}`,
+                              `托管 ACP 适配器：${managedAdapters.map((a) => `${a.preset_id}${a.version ? ` v${a.version}` : ""}`).join("、")}`,
+                            ),
+                    ),
+                ),
+            )
+            .child(
+              h_flex()
+                .gap(6)
+                .items_center()
+                .when(missingDetectedAdapters.length > 0, (row) =>
+                  row.child(
+                    this.button(
+                      t,
+                      "st-dr-adapter-install",
+                      this.adapterBusy ? this.tr("Installing…", "安装中…") : this.tr("Install Missing Adapters", "一键安装缺失适配器"),
+                      (_e, cx) => this.runAdapterAction(cx, "install"),
+                    ),
+                  ),
+                )
+                .when(managedAdapters.length > 0, (row) =>
+                  row.child(
+                    this.button(
+                      t,
+                      "st-dr-adapter-update",
+                      this.adapterBusy ? this.tr("Updating…", "更新中…") : this.tr("Update Adapters", "更新适配器"),
+                      (_e, cx) => this.runAdapterAction(cx, "update"),
+                    ),
+                  ),
+                ),
+            ),
+        ),
       )
       .when(Boolean(this.droveError), (el) =>
         el.child(
@@ -5189,8 +5333,8 @@ export default class Settings extends View {
                           )
                           .tooltip(
                             this.tr(
-                              "Choose an AI coding agent, model, and reasoning effort to launch in a workspace tab with full error context",
-                              "选择要启动的 Agent 类型、模型与思考强度，在工作区标签页带入完整异常上下文协助排查与修复",
+                              "Choose an AI coding agent, model, and reasoning effort to explain error causes, propose a fix plan, and repair after your confirmation",
+                              "选择要启动的 Agent 类型、模型与思考强度，在工作区标签页先解读错误原因并制定修复方案，待你确认后再开始修复",
                             ),
                           )
                           .when(this.droveProbeAgentLaunching, (b) =>
@@ -5204,7 +5348,7 @@ export default class Settings extends View {
                           .child(
                             this.droveProbeAgentLaunching
                               ? this.tr("Launching…", "启动中…")
-                              : this.tr("Fix with Agent", "用 Agent 自动处理"),
+                              : this.tr("Fix with Agent", "用 Agent 排查处理"),
                           );
                       })(),
                     ),
@@ -5295,8 +5439,8 @@ export default class Settings extends View {
                         "该 Agent 的 ACP 探测有异常，但在交互式终端中仍可直接启动排查。",
                       )
                     : this.tr(
-                        "Will launch an interactive agent in a workspace tab with full error context.",
-                        "将在目标主机工作区标签页启动交互式 Agent 并带入完整异常上下文。",
+                        "Will launch an interactive agent to explain error causes and propose a fix plan first, and wait for your confirmation before making changes.",
+                        "将在目标主机工作区标签页启动交互式 Agent，先解读错误原因并制定修复方案，待你确认后再开始修复。",
                       );
               return box.child(
                 v_flex()
@@ -5324,7 +5468,7 @@ export default class Settings extends View {
                           .child(
                             this.tr(
                               "Fix with Agent · Choose Agent, Model & Reasoning Effort",
-                              "用 Agent 自动处理 · 选择 Agent 类型、模型与思考强度",
+                              "用 Agent 排查处理 · 选择 Agent 类型、模型与思考强度",
                             ),
                           ),
                       )
@@ -5361,7 +5505,7 @@ export default class Settings extends View {
                             icon: curAgent || undefined,
                             dot: curOpt ? Boolean(curOpt.installed) : undefined,
                             dotColor: !curOpt ? undefined : !curOpt.installed ? t.dim : curOpt.probeError ? t.working : t.ansi2,
-                            tooltip: this.tr("Choose which CLI agent to launch", "选择用于自动排查与修复的 Agent 类型"),
+                            tooltip: this.tr("Choose which CLI agent to launch", "选择用于排查分析与修复的 Agent 类型"),
                           },
                           cx,
                         ),

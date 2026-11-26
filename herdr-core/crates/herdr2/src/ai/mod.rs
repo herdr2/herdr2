@@ -38,7 +38,9 @@ pub use digest::{
 pub use handoff_ai::{
     HandoffRecommendParams, HandoffRecommendResult, distill_merge_back, distill_omitted_turns, recommend_handoff,
 };
-pub use terminal_state::{ClassifyTerminalStateParams, ClassifyTerminalStateResult, classify_terminal_state};
+pub use terminal_state::{
+    ClassifyTerminalStateParams, ClassifyTerminalStateResult, classify_acp_turn_state, classify_terminal_state,
+};
 
 use crate::paths::Paths;
 use crate::rpc::RpcError;
@@ -3087,6 +3089,70 @@ mod tests {
         assert!(reqs[1].2["system"].is_string());
         assert!(reqs[2].2["system"].is_string());
         assert!(reqs[2].1.to_ascii_lowercase().contains("authorization: bearer sk-claude-secret"));
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn classify_acp_turn_state_arbitrates_subtle_questions_and_caches() {
+        let tmp = std::env::temp_dir().join(format!("herdr2-ai-acp-state-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let paths = Paths {
+            socket: tmp.join("core.sock"),
+            holder_socket: tmp.join("holder.sock"),
+            state: tmp.join("state"),
+            config: tmp.join("config/config.toml"),
+        };
+        paths.create_dirs().unwrap();
+
+        let (url, _captured) = spawn_mock_openai(vec![
+            (
+                200,
+                r#"{"choices":[{"message":{"content":"{\"state\":\"blocked\",\"kind\":\"question\",\"confidence\":0.92,\"summary\":\"等待用户拍板方案\"}"}}]}"#.into(),
+            ),
+            (
+                200,
+                r#"{"choices":[{"message":{"content":"{\"state\":\"done\",\"kind\":null,\"confidence\":0.95,\"summary\":null}"}}]}"#.into(),
+            ),
+        ])
+        .await;
+
+        let rt = AiRuntime::open(&paths).unwrap();
+        rt.update_settings(AiSettingsSetParams {
+            enabled: Some(true),
+            base_url: Some(url),
+            model: Some("test-nano".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        // Subtle Chinese prompt without '?' -> AI identifies blocked(question).
+        let r1 = classify_acp_turn_state(
+            &rt,
+            "claude",
+            "目前有方案一和方案二，各自利弊如上，先等你拍板后再开始改代码。",
+            Some("zh"),
+        )
+        .await;
+        assert!(r1.used_ai && r1.accepted && !r1.from_cache);
+        assert_eq!(r1.state.as_deref(), Some("blocked"));
+        assert_eq!(r1.kind.as_deref(), Some("question"));
+
+        // Repeated identical message hits local 0-token cache.
+        let r1_cached = classify_acp_turn_state(
+            &rt,
+            "claude",
+            "目前有方案一和方案二，各自利弊如上，先等你拍板后再开始改代码。",
+            Some("zh"),
+        )
+        .await;
+        assert!(r1_cached.used_ai && r1_cached.accepted && r1_cached.from_cache);
+
+        // Rhetorical question in a completed summary -> AI corrects to done.
+        let r2 = classify_acp_turn_state(&rt, "claude", "为什么之前会超时？因为锁未释放，现已彻底修复并通过测试。", Some("zh")).await;
+        assert!(r2.used_ai && r2.accepted && !r2.from_cache);
+        assert_eq!(r2.state.as_deref(), Some("done"));
 
         let _ = std::fs::remove_dir_all(tmp);
     }

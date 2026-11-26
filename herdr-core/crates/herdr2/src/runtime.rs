@@ -77,6 +77,7 @@ pub struct Core {
     pub(crate) image_due: Notify,
     pub ai: Arc<crate::ai::AiRuntime>,
     pub drove: Arc<crate::drove::DroveRuntime>,
+    pub adapters: Arc<crate::acp::adapters::AdapterManager>,
     registry_writer: RegistryWriter,
     pty_registry_writer: RegistryWriter,
     self_ref: std::sync::OnceLock<std::sync::Weak<Core>>,
@@ -219,6 +220,7 @@ impl Core {
             image_due: Notify::new(),
             ai,
             drove,
+            adapters: Arc::new(crate::acp::adapters::AdapterManager::new()),
             self_ref: std::sync::OnceLock::new(),
         });
         let _ = core.self_ref.set(Arc::downgrade(&core));
@@ -573,6 +575,110 @@ impl Core {
             if refined.used_ai {
                 let mut st = core.lock();
                 core.apply_digest(&mut st, id, refined.semantic_title, refined.micro_summary, false);
+            }
+        });
+    }
+
+    /// Spawns a background Core AI arbitration pass after an ACP turn ends to verify or refine
+    /// whether the assistant's final response is `done`/`idle` vs `blocked` (question/choice).
+    pub fn spawn_acp_status_ai(&self, id: u32, turn_num: u64) {
+        let Some(core) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
+            return;
+        };
+        let cfg = self.ai.config_snapshot();
+        if !cfg.enabled || !cfg.pty_status_arbitration || cfg.base_url.trim().is_empty() || self.ai.is_circuit_open() {
+            return;
+        }
+        let snapshot = {
+            let st = self.lock();
+            let Some(a) = st.reg.agents.get(&id).filter(|a| a.is_live()) else {
+                return;
+            };
+            if a.labels.contains_key("drove.worker")
+                || a.pending_permission.is_some()
+                || a.turn != turn_num
+                || a.status.as_ref().is_some_and(|s| matches!(s.state.as_str(), "working" | "error"))
+            {
+                return;
+            }
+            let entries = st.transcripts.get(&id).map(|t| t.entries()).unwrap_or(&[]);
+            if crate::status::acp_turn_has_pending_question_tool(entries, turn_num) {
+                return;
+            }
+            let assistant_text = crate::status::acp_turn_assistant_text(entries, turn_num);
+            if assistant_text.trim().is_empty() {
+                return;
+            }
+            let is_zh = crate::ai::digest::entries_prefer_zh(entries);
+            let program = a.agent.clone().unwrap_or_else(|| "acp".into());
+            (program, assistant_text, is_zh)
+        };
+        tokio::spawn(async move {
+            let (program, assistant_text, is_zh) = snapshot;
+            let verdict = crate::ai::classify_acp_turn_state(
+                &core.ai,
+                &program,
+                &assistant_text,
+                Some(if is_zh { "zh" } else { "en" }),
+            )
+            .await;
+            if !verdict.used_ai || !verdict.accepted {
+                return;
+            }
+            let Some(ai_state) = verdict.state.as_deref() else {
+                return;
+            };
+            let mut st = core.lock();
+            let Some(a) = st.reg.agents.get(&id).filter(|a| a.is_live()) else {
+                return;
+            };
+            if a.turn != turn_num
+                || a.pending_permission.is_some()
+                || a.status.as_ref().is_some_and(|s| matches!(s.state.as_str(), "working" | "error"))
+            {
+                return;
+            }
+            let cur_state = a.status.as_ref().map(|s| s.state.as_str()).unwrap_or("idle");
+            let cur_msg = a.status.as_ref().map(|s| s.msg.as_str()).unwrap_or("");
+            match ai_state {
+                "blocked" => {
+                    let kind = match verdict.kind.as_deref() {
+                        Some("permission") => Some("permission"),
+                        Some("auth") => Some("auth"),
+                        _ => Some("question"),
+                    };
+                    let msg = verdict.summary.unwrap_or_default();
+                    if cur_state != "blocked" || (!msg.is_empty() && cur_msg != msg) {
+                        core.apply_status(
+                            &mut st,
+                            id,
+                            &crate::status::StatusReport {
+                                state: "blocked",
+                                kind,
+                                message: msg,
+                                ..crate::status::StatusReport::root("blocked")
+                            },
+                        );
+                    }
+                }
+                "done" | "idle" => {
+                    if cur_state == "blocked" {
+                        core.apply_status(&mut st, id, &crate::status::StatusReport::root("idle"));
+                    }
+                }
+                "error" => {
+                    let msg = verdict.summary.unwrap_or_default();
+                    core.apply_status(
+                        &mut st,
+                        id,
+                        &crate::status::StatusReport {
+                            state: "error",
+                            message: msg,
+                            ..crate::status::StatusReport::root("error")
+                        },
+                    );
+                }
+                _ => {}
             }
         });
     }

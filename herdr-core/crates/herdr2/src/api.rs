@@ -319,6 +319,15 @@ methods! { Ctx<'_>;
     "checkpoint.hook" => checkpoint_hook, CheckpointHookParams => CheckpointHookResult,
         "Internal lifecycle hook callback invoked by instrumented terminal CLIs (Claude, Codex, Agy).",
         errors ["not_found", "invalid_params"];
+    "adapter.status" => adapter_status, AdapterStatusParams => crate::acp::adapters::AdapterStatusResult,
+        "Inspect managed ACP adapter availability, installation source, version, and background install state.",
+        errors ["machine_unknown", "unavailable"];
+    "adapter.install" => adapter_install, AdapterInstallParams => crate::acp::adapters::AdapterInstallResult,
+        "Download and install missing managed ACP adapters from the official ACP Registry (standalone binary or isolated npm prefix).",
+        errors ["invalid_params", "machine_unknown", "unavailable", "config"];
+    "adapter.update" => adapter_update, AdapterUpdateParams => crate::acp::adapters::AdapterInstallResult,
+        "Refresh the official ACP Registry index and update managed ACP adapters to the latest version.",
+        errors ["invalid_params", "machine_unknown", "unavailable", "config"];
     "rpc.discover" => rpc_discover, Empty => serde_json::Value,
         "The whole API as an OpenRPC document: every method with its params, result and errors in JSON Schema.",
         errors [];
@@ -2288,4 +2297,25 @@ async fn checkpoint_hook(core: Ctx<'_>, p: CheckpointHookParams) -> Result<Check
     .await;
     let inject_steps = val.get("injectSteps").and_then(|v| v.as_array()).cloned().unwrap_or_default();
     Ok(CheckpointHookResult { inject_steps })
+}
+
+async fn adapter_status(
+    core: Ctx<'_>,
+    _: AdapterStatusParams,
+) -> Result<crate::acp::adapters::AdapterStatusResult, RpcError> {
+    Ok(core.adapters.status(core).await)
+}
+
+async fn adapter_install(
+    core: Ctx<'_>,
+    p: AdapterInstallParams,
+) -> Result<crate::acp::adapters::AdapterInstallResult, RpcError> {
+    core.adapters.install_many(core, &p.presets, p.all, p.detected, p.force, false).await
+}
+
+async fn adapter_update(
+    core: Ctx<'_>,
+    p: AdapterUpdateParams,
+) -> Result<crate::acp::adapters::AdapterInstallResult, RpcError> {
+    core.adapters.install_many(core, &p.presets, p.all, false, true, true).await
 }

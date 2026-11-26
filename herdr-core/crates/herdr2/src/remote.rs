@@ -1086,6 +1086,9 @@ pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Va
             | "drove.magpie.test"
             | "drove.http_proxy"
             | "drove.web.open"
+            | "adapter.status"
+            | "adapter.install"
+            | "adapter.update"
             | "ai.status"
             | "ai.settings.set"
             | "ai.models"
@@ -1234,9 +1237,9 @@ fn deadline_for(core: &Core, method: &str, params: &Value) -> Duration {
         // Rollback may respawn a fresh ACP/PTY session and restore workspace git trees over SSH.
         return config.machine_timeout() + Duration::from_secs(60);
     }
-    if matches!(method, "drove.probe" | "drove.roles.ai_configure") {
-        // Probing installed ACP agents spawns multiple cold-start handshakes (up to 60s each)
-        // and AI role configuration may probe + run a reasoning completion.
+    if matches!(method, "drove.probe" | "drove.roles.ai_configure" | "adapter.install" | "adapter.update") {
+        // Probing installed ACP agents spawns multiple cold-start handshakes (up to 60s each),
+        // AI role configuration may probe + run a reasoning completion, and adapter installs download packages.
         return config.machine_timeout() + Duration::from_secs(180);
     }
     if method == "drove.settings.get" {

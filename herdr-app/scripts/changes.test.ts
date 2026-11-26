@@ -474,3 +474,9 @@ test("resolveChangesLocation never pairs a local Windows cwd with a remote Linux
   });
   expect(remoteSpace).toEqual({ cwd: "/remote/project", on: "remote" });
 });
+
+test("Changes diff renders git-style '-' for removed lines and '+' for added lines without a misleading '+' comment gutter", () => {
+  expect(source).toContain('const sign = isDel ? "-" : isAdd ? "+" : "";');
+  expect(source).toContain(".text_color(signColor)\n          .child(sign)");
+  expect(source).not.toContain('row.commentable ? (hasComment ? "●" : "+") : ""');
+});

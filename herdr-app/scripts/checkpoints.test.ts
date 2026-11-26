@@ -136,3 +136,9 @@ test("Checkpoints diff wraps long lines and file headers to viewport width in bo
   expect(source).not.toContain("checkpoints-diff-x");
   expect(source).toContain(".whitespace_normal().child(row.text)");
 });
+
+test("Checkpoints diff renders git-style '-' for removed lines and '+' for added lines without a misleading '+' comment gutter", () => {
+  expect(source).toContain('const sign = isDel ? "-" : isAdd ? "+" : "";');
+  expect(source).toContain(".text_color(signColor)\n          .child(sign)");
+  expect(source).not.toContain('row.commentable ? (hasComment ? "●" : "+") : ""');
+});

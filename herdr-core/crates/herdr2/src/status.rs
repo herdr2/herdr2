@@ -298,6 +298,350 @@ pub fn reset_terminal(t: &mut Terminal) -> Change {
     reset_target(t)
 }
 
+/// Concatenates all assistant text chunks emitted during `turn_num`.
+pub fn acp_turn_assistant_text(entries: &[crate::transcript::Entry], turn_num: u64) -> String {
+    use crate::transcript::Entry;
+    let mut chunks: Vec<&str> = Vec::new();
+    for e in entries {
+        if e.turn() == Some(turn_num)
+            && let Entry::Assistant { text, .. } = e
+            && !text.is_empty()
+        {
+            chunks.push(text.as_str());
+        }
+    }
+    chunks.concat()
+}
+
+/// Returns true if `turn_num` still has an explicitly pending interactive question tool call.
+pub fn acp_turn_has_pending_question_tool(entries: &[crate::transcript::Entry], turn_num: u64) -> bool {
+    use crate::transcript::Entry;
+    entries.iter().any(|e| {
+        e.turn() == Some(turn_num)
+            && matches!(
+                e,
+                Entry::ToolCall { title, tool_kind, status, .. }
+                    if (is_question_tool_name(&title.to_ascii_lowercase())
+                        || is_question_tool_name(&tool_kind.as_deref().unwrap_or("").to_ascii_lowercase()))
+                        && matches!(status.to_ascii_lowercase().as_str(), "pending" | "in_progress" | "waiting")
+            )
+    })
+}
+
+/// Detects whether a finished ACP turn stopped to ask the user a question or ask the user to choose.
+/// Returns a concise summary string (for `Status.msg`) when user input/confirmation is required.
+pub fn detect_acp_turn_needs_user_input(entries: &[crate::transcript::Entry], turn_num: u64) -> Option<String> {
+    use crate::transcript::Entry;
+
+    let mut assistant_chunks: Vec<&str> = Vec::new();
+    let mut last_question_tool: Option<(String, bool)> = None;
+    let mut saw_work_after_question_tool = false;
+
+    for e in entries {
+        if e.turn() != Some(turn_num) {
+            continue;
+        }
+        match e {
+            Entry::Assistant { text, .. } => {
+                if !text.is_empty() {
+                    assistant_chunks.push(text.as_str());
+                }
+            }
+            Entry::ToolCall { title, tool_kind, status, .. } => {
+                let low_title = title.to_ascii_lowercase();
+                let low_kind = tool_kind.as_deref().unwrap_or("").to_ascii_lowercase();
+                let is_q_tool = is_question_tool_name(&low_title) || is_question_tool_name(&low_kind);
+                if is_q_tool {
+                    let pending = matches!(status.to_ascii_lowercase().as_str(), "pending" | "in_progress" | "waiting");
+                    last_question_tool = Some((title.clone(), pending));
+                    saw_work_after_question_tool = false;
+                } else if last_question_tool.is_some() {
+                    saw_work_after_question_tool = true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let combined = assistant_chunks.concat();
+    if let Some(summary) = detect_text_needs_user_input(&combined) {
+        return Some(summary);
+    }
+
+    if let Some((title, pending)) = last_question_tool
+        && (pending || (!saw_work_after_question_tool && combined.trim().is_empty()))
+    {
+        return Some(compact_question_summary(&title));
+    }
+
+    None
+}
+
+fn is_question_tool_name(name: &str) -> bool {
+    name.contains("ask_question")
+        || name.contains("ask_user_question")
+        || name.contains("askuserquestion")
+        || name.contains("request_user_input")
+        || name.contains("ask_user")
+        || name.contains("prompt_user")
+}
+
+/// Detects whether an agent's final response text stopped to ask the user a question or request a choice.
+pub fn detect_text_needs_user_input(text: &str) -> Option<String> {
+    let cleaned = strip_fenced_code_blocks(text);
+    let lines: Vec<&str> = cleaned
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !is_decorative_line(l))
+        .collect();
+    if lines.is_empty() {
+        return None;
+    }
+
+    let tail_start = lines.len().saturating_sub(14);
+    let tail = &lines[tail_start..];
+    let last = *tail.last()?;
+
+    // 1. Last non-empty line is a direct question or explicit choice/confirmation request.
+    if !is_polite_signoff(last) && (line_ends_with_question(last) || has_explicit_decision_request(last)) {
+        return Some(compact_question_summary(last));
+    }
+
+    // 2. Question within the last 3 lines followed only by brief hints/options/parentheticals.
+    let recent_start = tail.len().saturating_sub(3);
+    for idx in (recent_start..tail.len().saturating_sub(1)).rev() {
+        let line = tail[idx];
+        if !is_polite_signoff(line)
+            && (line_ends_with_question(line) || has_explicit_decision_request(line))
+            && tail[idx + 1..].iter().all(|after| is_option_list_line(after) || is_short_choice_hint(after))
+        {
+            return Some(compact_question_summary(line));
+        }
+    }
+
+    // 3. Trailing option list (>= 2 choices) preceded or followed by a question/choice prompt.
+    let opt_count = tail.iter().filter(|l| is_option_list_line(l)).count();
+    if opt_count >= 2 {
+        for &line in tail.iter().rev() {
+            if is_option_list_line(line) || is_polite_signoff(line) {
+                continue;
+            }
+            if line_ends_with_question(line) || has_explicit_decision_request(line) || has_choice_intro_cue(line) {
+                return Some(compact_question_summary(line));
+            }
+        }
+    }
+
+    None
+}
+
+fn strip_fenced_code_blocks(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut in_fence = false;
+    let mut fence_char = '`';
+    for line in text.lines() {
+        let t = line.trim_start();
+        if !in_fence {
+            if t.starts_with("```") {
+                in_fence = true;
+                fence_char = '`';
+                continue;
+            } else if t.starts_with("~~~") {
+                in_fence = true;
+                fence_char = '~';
+                continue;
+            }
+            out.push_str(line);
+            out.push('\n');
+        } else if (fence_char == '`' && t.starts_with("```")) || (fence_char == '~' && t.starts_with("~~~")) {
+            in_fence = false;
+        }
+    }
+    out
+}
+
+fn is_decorative_line(line: &str) -> bool {
+    let t = line.trim();
+    !t.is_empty() && t.chars().all(|c| matches!(c, '-' | '=' | '*' | '_' | '─' | '━' | '═' | ' '))
+}
+
+fn is_polite_signoff(line: &str) -> bool {
+    let low = line.to_ascii_lowercase();
+    const ZH_SIGNOFFS: &[&str] = &[
+        "还有什么需要",
+        "还有其他需要",
+        "还需要我做什么",
+        "还有什么可以帮",
+        "还有其他问题吗",
+        "还有什么问题吗",
+        "有其他问题吗",
+        "有其他需要吗",
+        "有什么其他需要",
+        "随时告诉我",
+        "随时联系我",
+        "欢迎随时",
+    ];
+    if ZH_SIGNOFFS.iter().any(|p| line.contains(p)) {
+        return true;
+    }
+    const EN_SIGNOFFS: &[&str] = &[
+        "anything else",
+        "any other questions",
+        "how else can i help",
+        "can i help you with anything",
+        "let me know if you need anything",
+        "let me know if you'd like anything else",
+        "feel free to ask",
+        "feel free to let me know",
+        "happy to help",
+    ];
+    EN_SIGNOFFS.iter().any(|p| low.contains(p))
+}
+
+fn line_ends_with_question(line: &str) -> bool {
+    let trimmed = line
+        .trim()
+        .trim_end_matches(|c: char| matches!(c, '*' | '_' | '`' | '"' | '\'' | '”' | '’' | ')' | '）' | ']' | '】' | '>'))
+        .trim();
+    if !(trimmed.ends_with('?') || trimmed.ends_with('？')) {
+        return false;
+    }
+    let last_token = trimmed.split_whitespace().last().unwrap_or("");
+    if last_token.contains("://") {
+        return false;
+    }
+    // Reject bare "?" or markdown heading/placeholder with no words.
+    trimmed.chars().filter(|c| !c.is_whitespace() && !matches!(c, '?' | '？' | '-' | '*' | '#')).count() >= 2
+}
+
+fn has_explicit_decision_request(line: &str) -> bool {
+    let low = line.to_ascii_lowercase();
+    const ZH_CUES: &[&str] = &[
+        "请选择",
+        "请确认",
+        "请先确认",
+        "请先选择",
+        "请你选择",
+        "请你确认",
+        "请告知",
+        "请告诉我",
+        "请回复",
+        "请决定",
+        "请指定",
+        "请提供",
+        "请补充",
+        "等你确认",
+        "等你决定",
+        "等你回复",
+        "等你选择",
+        "等待你确认",
+        "等待你的确认",
+        "等待你选择",
+        "等待你的选择",
+        "告诉我你的选择",
+        "你更倾向",
+        "您更倾向",
+        "你希望",
+        "您希望",
+        "回复数字",
+        "回复编号",
+        "输入编号",
+    ];
+    if ZH_CUES.iter().any(|p| line.contains(p)) {
+        return true;
+    }
+    const EN_CUES: &[&str] = &[
+        "please choose",
+        "please select",
+        "please confirm",
+        "please let me know",
+        "please specify",
+        "please clarify",
+        "please provide",
+        "please decide",
+        "please reply",
+        "choose an option",
+        "select an option",
+        "pick an option",
+        "pick one",
+        "reply with",
+        "let me know which",
+        "let me know how you'd like",
+        "let me know how you would like",
+        "let me know if you want me to",
+        "let me know if you'd like me to",
+        "tell me which",
+        "waiting for your confirmation",
+        "waiting for your input",
+        "waiting for your decision",
+        "before i proceed",
+        "before proceeding",
+    ];
+    EN_CUES.iter().any(|p| low.contains(p))
+}
+
+fn has_choice_intro_cue(line: &str) -> bool {
+    let low = line.to_ascii_lowercase();
+    line.contains("方案")
+        || line.contains("选项")
+        || line.contains("选择")
+        || line.contains("确认")
+        || line.contains("决定")
+        || low.contains("option")
+        || low.contains("approach")
+        || low.contains("choose")
+        || low.contains("prefer")
+        || low.contains("proceed")
+}
+
+fn is_option_list_line(line: &str) -> bool {
+    let t = line.trim_start_matches(|c: char| matches!(c, '-' | '*' | '•' | '❯' | '›' | '>' | ' '));
+    let t = t.trim_start_matches(|c: char| matches!(c, '*' | '_' | '`'));
+    let low = t.to_ascii_lowercase();
+    let bytes = t.as_bytes();
+    let numbered = bytes.len() >= 2
+        && bytes[0].is_ascii_digit()
+        && matches!(bytes[1], b'.' | b')' | b':')
+        || (bytes.len() >= 3 && bytes[0].is_ascii_digit() && t[1..].starts_with('、'));
+    let lettered = bytes.len() >= 2
+        && matches!(bytes[0], b'A'..=b'F' | b'a'..=b'f')
+        && (matches!(bytes[1], b'.' | b')' | b':') || t[1..].starts_with('：') || t[1..].starts_with('、'));
+    let named = t.starts_with("方案")
+        || t.starts_with("选项")
+        || low.starts_with("option ")
+        || low.starts_with("approach ")
+        || low.starts_with("choice ");
+    numbered || lettered || named
+}
+
+fn is_short_choice_hint(line: &str) -> bool {
+    let t = line.trim();
+    let low = t.to_ascii_lowercase();
+    t.chars().count() <= 48
+        && ((t.starts_with('(') && t.ends_with(')'))
+            || (t.starts_with('（') && t.ends_with('）'))
+            || t.contains("推荐")
+            || t.contains("默认")
+            || t.contains("回复")
+            || low.contains("recommended")
+            || low.contains("default")
+            || low.contains("reply"))
+}
+
+fn compact_question_summary(raw: &str) -> String {
+    let clean: String = raw
+        .trim()
+        .trim_start_matches(|c: char| matches!(c, '#' | '>' | '-' | '*' | '•' | ' '))
+        .replace("**", "")
+        .replace('`', "")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut chars = clean.chars();
+    let head: String = chars.by_ref().take(48).collect();
+    if chars.next().is_some() { format!("{head}…") } else { head }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,5 +755,79 @@ mod tests {
         assert!(second_run >= 1_500);
         assert_eq!(a.total_work_ms, first_run + second_run);
         assert_eq!(a.working_since, None);
+    }
+
+    #[test]
+    fn detects_questions_and_choices_in_assistant_output() {
+        assert!(detect_text_needs_user_input("我已经修好了这个 bug，并运行了全部单测，全部通过。").is_none());
+        assert!(detect_text_needs_user_input("修改已完成！如果你还有其他问题，随时告诉我。").is_none());
+        assert!(detect_text_needs_user_input("All tests pass. Let me know if you need anything else!").is_none());
+        assert!(detect_text_needs_user_input("改完了，还有什么需要帮忙的吗？").is_none());
+        assert!(detect_text_needs_user_input("修复了如下代码：\n```ts\nconst x = ok ? 1 : 2;\n```\n已验证通过。").is_none());
+        assert!(detect_text_needs_user_input("检查了 https://example.com/api?v=1 并更新为 v2。").is_none());
+
+        assert!(detect_text_needs_user_input("请问应该修改全局配置还是仅修改当前项目？").is_some());
+        assert!(detect_text_needs_user_input(
+            "这里有两种实现方式，你更倾向哪种方案？\n1. 方案 A：仅修改前端\n2. 方案 B：前后端联动修改"
+        )
+        .is_some());
+        assert!(detect_text_needs_user_input("请选择要部署的目标环境：\n- 方案 A：staging\n- 方案 B：production").is_some());
+        assert!(detect_text_needs_user_input(
+            "Before I proceed, should I migrate existing database rows or only apply this to new records?"
+        )
+        .is_some());
+        assert!(detect_text_needs_user_input(
+            "Which option would you prefer?\n1. Keep legacy API\n2. Break and clean up\n(Recommended: 1)"
+        )
+        .is_some());
+        assert!(detect_text_needs_user_input("Please confirm which branch to target (main or release/2.0).").is_some());
+    }
+
+    #[test]
+    fn detects_question_tool_call_in_acp_turn() {
+        use crate::transcript::Entry;
+
+        let pending_q = vec![Entry::ToolCall {
+            turn: 1,
+            id: "tc1".into(),
+            title: "AskUserQuestion: Choose auth mode".into(),
+            tool_kind: Some("ask_question".into()),
+            status: "pending".into(),
+            detail: None,
+            attachments: vec![],
+            ts_ms: 1,
+        }];
+        assert!(detect_acp_turn_needs_user_input(&pending_q, 1).is_some());
+
+        // Completed question tool followed by actual work + final summary is NOT blocked.
+        let answered_and_done = vec![
+            Entry::ToolCall {
+                turn: 1,
+                id: "tc1".into(),
+                title: "AskUserQuestion".into(),
+                tool_kind: Some("ask_question".into()),
+                status: "completed".into(),
+                detail: None,
+                attachments: vec![],
+                ts_ms: 1,
+            },
+            Entry::ToolCall {
+                turn: 1,
+                id: "tc2".into(),
+                title: "edit_file".into(),
+                tool_kind: Some("edit".into()),
+                status: "completed".into(),
+                detail: None,
+                attachments: vec![],
+                ts_ms: 2,
+            },
+            Entry::Assistant {
+                turn: 1,
+                text: "已完成全部修改并通过测试。".into(),
+                attachments: vec![],
+                ts_ms: 3,
+            },
+        ];
+        assert!(detect_acp_turn_needs_user_input(&answered_and_done, 1).is_none());
     }
 }

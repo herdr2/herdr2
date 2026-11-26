@@ -823,7 +823,7 @@ pub fn split_words(raw: &str) -> Result<Vec<String>, RpcError> {
     Ok(words)
 }
 
-fn candidate_files_in_dir(dir: &Path, program: &str, pathext_override: Option<&str>) -> Vec<std::path::PathBuf> {
+pub(crate) fn candidate_files_in_dir(dir: &Path, program: &str, pathext_override: Option<&str>) -> Vec<std::path::PathBuf> {
     candidate_files_in_dir_for_platform(dir, program, pathext_override, cfg!(windows))
 }
 
@@ -954,7 +954,7 @@ fn npx_cache_roots(env: &BTreeMap<String, String>) -> Vec<std::path::PathBuf> {
     roots
 }
 
-fn resolve_in_npx_cache(
+pub(crate) fn resolve_in_npx_cache(
     program: &str,
     env: &BTreeMap<String, String>,
     pathext_override: Option<&str>,
@@ -998,7 +998,7 @@ fn companion_npx_adapter(preset_id: Option<&str>, program: &str) -> Option<(&'st
     }
 }
 
-/// Resolves an ACP agent command against `env` (`PATH`, cached `_npx` adapters, and companion CLI + `npx` fallback).
+/// Resolves an ACP agent command against `env` (`PATH`, Herdr2 managed adapters, cached `_npx` adapters, and companion CLI + `npx` fallback).
 /// Returns `(resolved_executable_path, effective_argv)` when the agent is available to run.
 pub(crate) fn resolve_acp_command_in_env(
     preset_id: Option<&str>,
@@ -1011,6 +1011,13 @@ pub(crate) fn resolve_acp_command_in_env(
 
     if let Some(found) = resolve_non_shim_binary_in_path(first, path_override, pathext_override) {
         return Some((found, argv.to_vec()));
+    }
+
+    if let Some(managed) = crate::acp::adapters::resolve_managed_binary_in_env(preset_id, first, env) {
+        let mut effective = Vec::with_capacity(argv.len());
+        effective.push(managed.display().to_string());
+        effective.extend(argv[1..].iter().cloned());
+        return Some((managed, effective));
     }
 
     if let Some(cached) = resolve_in_npx_cache(first, env, pathext_override) {
@@ -1216,6 +1223,7 @@ mod tests {
         let env = BTreeMap::from([
             ("HOME".into(), root.display().to_string()),
             ("PATH".into(), bin_dir.display().to_string()),
+            ("HERDR2_ADAPTERS_DIR".into(), root.join("empty-adapters").display().to_string()),
         ]);
 
         let (resolved_path, resolved_argv) =
@@ -1223,6 +1231,33 @@ mod tests {
         assert_eq!(resolved_path, claude_acp);
         assert_eq!(resolved_argv, vec![claude_acp.display().to_string()]);
         assert!(is_claude_agent(None, &resolved_argv));
+
+        // Managed adapter directory beats _npx cache, while PATH binary beats managed adapter.
+        let managed_dir = root.join("managed-adapters");
+        let managed_claude_dir = managed_dir.join("claude/pkg");
+        std::fs::create_dir_all(&managed_claude_dir).unwrap();
+        let managed_claude_exe =
+            managed_claude_dir.join(if cfg!(windows) { "claude-agent-acp.exe" } else { "claude-agent-acp" });
+        std::fs::write(&managed_claude_exe, "#!/bin/sh\n").unwrap();
+        std::fs::write(
+            managed_dir.join("claude/meta.json"),
+            serde_json::json!({
+                "preset_id": "claude",
+                "registry_id": "claude-acp",
+                "version": "0.112.0",
+                "method": "binary",
+                "executable": format!("pkg/{}", managed_claude_exe.file_name().unwrap().to_string_lossy()),
+                "installed_at_ms": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut managed_env = env.clone();
+        managed_env.insert("HERDR2_ADAPTERS_DIR".into(), managed_dir.display().to_string());
+        let (managed_path, managed_argv) =
+            resolve_acp_command_in_env(Some("claude"), &["claude-agent-acp".into()], &managed_env).unwrap();
+        assert_eq!(managed_path, managed_claude_exe);
+        assert_eq!(managed_argv, vec![managed_claude_exe.display().to_string()]);
 
         let (codex_path, codex_argv) = resolve_acp_command_in_env(Some("codex"), &["codex-acp".into()], &env).unwrap();
         assert_eq!(codex_path, npx_cli);

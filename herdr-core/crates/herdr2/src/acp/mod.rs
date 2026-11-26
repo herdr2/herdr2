@@ -1,5 +1,6 @@
 //! ACP session lifecycle: handshake, serial prompt inbox queue, updates, and permissions.
 
+pub mod adapters;
 pub mod commands;
 pub mod media;
 pub mod presets;
@@ -1602,7 +1603,28 @@ fn finish_turn(core: &Core, id: u32, turn_num: u64, res: Result<Value, CallError
         Ok(val) => {
             turn_usage_detail = proto::extract_prompt_result_usage(&val);
             let _parsed: SessionPromptResult = serde_json::from_value(val).unwrap_or_default();
-            core.apply_status(&mut st, id, &StatusReport::root("idle"));
+            let is_drove_worker = st.reg.agents.get(&id).is_some_and(|a| a.labels.contains_key("drove.worker"));
+            let question_summary = if is_drove_worker {
+                None
+            } else {
+                st.transcripts
+                    .get(&id)
+                    .and_then(|t| crate::status::detect_acp_turn_needs_user_input(t.entries(), turn_num))
+            };
+            if let Some(msg) = question_summary {
+                core.apply_status(
+                    &mut st,
+                    id,
+                    &StatusReport {
+                        state: "blocked",
+                        kind: Some("question"),
+                        message: msg,
+                        ..StatusReport::root("blocked")
+                    },
+                );
+            } else {
+                core.apply_status(&mut st, id, &StatusReport::root("idle"));
+            }
         }
         Err(err) => {
             let msg = match err {
@@ -1624,6 +1646,7 @@ fn finish_turn(core: &Core, id: u32, turn_num: u64, res: Result<Value, CallError
             );
         }
     }
+    let arbitrate_status = turn_err.is_none();
     if let Some(a) = st.reg.agents.get(&id)
         && let Some(wid) = a.labels.get("drove.worker")
     {
@@ -1639,6 +1662,9 @@ fn finish_turn(core: &Core, id: u32, turn_num: u64, res: Result<Value, CallError
     core.refresh_agent_digest_deterministic(&mut st, id, true);
     drop(st);
     core.spawn_agent_digest_ai(id, Duration::from_secs(3));
+    if arbitrate_status {
+        core.spawn_acp_status_ai(id, turn_num);
+    }
 }
 
 fn handle_update(core: &Core, id: u32, turn_num: u64, params: &Value) {

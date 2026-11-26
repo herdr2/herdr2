@@ -12,6 +12,7 @@ use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use std::io::{IsTerminal, Read};
 
+mod adapter;
 mod checkpoint;
 mod file;
 mod machine;
@@ -246,6 +247,8 @@ enum Cmd {
     Drove(crate::drove::cli::DroveCli),
     /// Detect coding agents and install/update bundled Herdr2 companion skills (`status`, `install`, `ai-install`).
     Skill(skill::SkillCli),
+    /// Inspect, install, or update managed ACP adapters (`status`, `install`, `update`).
+    Adapter(adapter::AdapterCli),
     /// Inspect or configure the shared Core AI assistant (`ai status`, `ai settings-set`, `ai test`).
     Ai {
         #[command(subcommand)]
@@ -559,6 +562,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             Out { json, human }
         }
         Cmd::Skill(p) => skill::run(&paths, p)?,
+        Cmd::Adapter(p) => adapter::run(&paths, p)?,
         Cmd::Ai { action } => match action {
             AiCmd::Status { on } => {
                 let mut params = json!({});
@@ -1446,6 +1450,9 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("checkpoint diff", "checkpoint.diff"),
     ("checkpoint rollback", "checkpoint.rollback"),
     ("checkpoint bisect", "checkpoint.bisect"),
+    ("adapter status", "adapter.status"),
+    ("adapter install", "adapter.install"),
+    ("adapter update", "adapter.update"),
 ];
 /// Client/app methods not mapped 1:1 from a separate top-level CLI subcommand.
 pub const API_ONLY: &[&str] = &[

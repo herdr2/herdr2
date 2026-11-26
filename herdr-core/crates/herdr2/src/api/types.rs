@@ -1535,3 +1535,42 @@ pub struct ReviewResult {
     pub turn: u64,
     pub inbox_len: usize,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AdapterStatusParams {
+    /// Target remote machine (`h2 machine ls`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AdapterInstallParams {
+    /// Specific adapter preset(s) to install (`claude`, `codex`, `pi`, `glm`).
+    #[serde(default)]
+    pub presets: Vec<String>,
+    /// Install all managed ACP adapters.
+    #[serde(default)]
+    pub all: bool,
+    /// Install adapters for companion CLIs detected on PATH.
+    #[serde(default)]
+    pub detected: bool,
+    /// Force re-download even if already installed.
+    #[serde(default)]
+    pub force: bool,
+    /// Target remote machine (`h2 machine ls`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AdapterUpdateParams {
+    /// Specific adapter preset(s) to update (default: all managed or detected adapters).
+    #[serde(default)]
+    pub presets: Vec<String>,
+    /// Update all managed ACP adapters.
+    #[serde(default)]
+    pub all: bool,
+    /// Target remote machine (`h2 machine ls`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+}

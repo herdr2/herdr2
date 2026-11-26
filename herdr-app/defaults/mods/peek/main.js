@@ -179,7 +179,7 @@ function parseClickableFileLink(rawUrl) {
 const statusWords = () => ({
   starting: tr("Starting…", "启动中…"),
   working: tr("Working", "运行中"),
-  blocked: tr("Needs approval", "待审批"),
+  blocked: tr("Needs you", "待确认"),
   done: tr("Finished", "已完成"),
   ended: tr("Ended", "已结束"),
   idle: tr("Idle", "空闲"),
@@ -1900,7 +1900,10 @@ export default class Peek extends View {
   statusPill(t, st) {
     const spinning = st === "working" || st === "starting";
     const color = t[st] ?? (st === "starting" ? (t.working ?? t.accent) : t.dim);
-    const label = statusWords()[st] ?? st ?? tr("Offline", "离线");
+    const hasPerm = Boolean(this.term()?.pending_permission);
+    const label = st === "blocked" && hasPerm
+      ? tr("Needs approval", "待审批")
+      : (statusWords()[st] ?? st ?? tr("Offline", "离线"));
     return h_flex()
       .h(24)
       .px(9)

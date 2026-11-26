@@ -334,7 +334,7 @@ test("aiConfigureDroveRoles probes agents & models before calling roles-ai-confi
   view.aiConfigureDroveRoles("all", cx);
   await spawned;
 
-  expect(order).toEqual(["drove probe --refresh", "drove roles-ai-config:all"]);
+  expect(order).toEqual(["drove probe --refresh", "adapter status", "drove roles-ai-config:all"]);
   expect(view.droveAiConfigResult?.ok).toBe(true);
   expect(view.droveAiConfigResult?.probedRefreshed).toBe(true);
   expect(view.droveAiConfiguring).toBe(false);
@@ -382,7 +382,7 @@ test("aiConfigureDroveRoles awaits in-flight probe instead of running a duplicat
   releaseProbe();
   await Promise.all(pending);
 
-  expect(order).toEqual(["drove probe --refresh", "drove roles-ai-config"]);
+  expect(order).toEqual(["drove probe --refresh", "adapter status", "drove roles-ai-config"]);
   expect(view.droveAiConfigResult?.probedRefreshed).toBe(true);
 });
 
@@ -742,6 +742,10 @@ test("runDroveProbe passes an extended 180s timeout to hc so cold-start ACP prob
     {
       args: ["drove", "probe", "--refresh", "--on", "gpu-box", "--json"],
       opts: { timeout: 180000 },
+    },
+    {
+      args: ["adapter", "status", "--on", "gpu-box", "--json"],
+      opts: { timeout: 15000 },
     },
   ]);
 });
@@ -1121,6 +1125,40 @@ test("drove probe fix panel lets user select agent type, model, and effort and l
   expect(ran[2].args.argv).toEqual(["cursor-agent", "--yolo", "--trust"]);
   expect(ran[2].args.model).toBe("gpt-5.4");
   expect(ran[2].args.effort).toBe("medium");
+});
+
+test("buildDroveProbeFixPrompt instructs agent to explain causes, propose a fix plan, and wait for confirmation before fixing", () => {
+  const view = new Settings();
+  view.droveMachine = "ubuntu-wsl";
+  const errored = [
+    {
+      id: "cursor",
+      command: ["cursor-agent", "acp"],
+      path: "/usr/local/bin/cursor-agent",
+      error: "ACP probe timed out after 45s",
+    },
+  ];
+
+  view.person = { language: "zh-CN" };
+  const zhPrompt = view.buildDroveProbeFixPrompt(errored);
+  expect(zhPrompt).toContain("ubuntu-wsl");
+  expect(zhPrompt).toContain("cursor");
+  expect(zhPrompt).toContain("ACP probe timed out after 45s");
+  expect(zhPrompt).toContain("不要直接开始修复");
+  expect(zhPrompt).toContain("解读错误原因");
+  expect(zhPrompt).toContain("制定修复方案");
+  expect(zhPrompt).toContain("确认后再开始修复");
+  expect(zhPrompt).not.toContain("直接协助处理");
+
+  view.person = { language: "en" };
+  const enPrompt = view.buildDroveProbeFixPrompt(errored);
+  expect(enPrompt).toContain("ubuntu-wsl");
+  expect(enPrompt).toContain("cursor");
+  expect(enPrompt).toContain("Do NOT start fixing directly");
+  expect(enPrompt).toContain("explain root causes");
+  expect(enPrompt).toContain("Propose a fix plan & wait for confirmation");
+  expect(enPrompt).toContain("Start fixing only after confirmation");
+  expect(enPrompt).not.toContain("Apply safe fixes directly");
 });
 
 test("AI update panel lets user choose local agent, model, and effort and guards prompt against mid-update interruption", async () => {

@@ -851,6 +851,18 @@ impl Model {
         changed
     }
 
+    /// Marks a finished non-busy agent as unseen so it surfaces as `"done"` until viewed.
+    pub fn mark_unseen(&mut self, address: &str) -> bool {
+        if let Some(a) = self.agents.get_mut(address)
+            && a.seen
+            && !matches!(a.word.as_deref(), Some("working" | "blocked" | "error") | None)
+        {
+            a.seen = false;
+            return true;
+        }
+        false
+    }
+
     /// Core's turn and the shared seen turn for an agent; true when either changed.
     pub fn set_turn(&mut self, address: &str, turn: u64, seen_turn: Option<u64>) -> bool {
         let Some(a) = self.agents.get_mut(address) else { return false };
@@ -874,7 +886,7 @@ impl Model {
         Some(match a.word.as_deref()? {
             "working" => "working",
             "blocked" | "error" => "blocked",
-            _ if a.seen_turn.map_or(!a.seen, |s| a.turn > s) => "done",
+            _ if a.seen_turn.filter(|_| a.turn > 0).map_or(!a.seen, |s| a.turn > s) => "done",
             _ => "idle",
         })
     }
@@ -1387,6 +1399,29 @@ mod tests {
         m.set_word("t1", Some("idle".into()), None, false);
         m.set_turn("t1", 5, None);
         assert_eq!(m.status("t1"), Some("done"));
+    }
+
+    #[test]
+    fn non_7501_pty_with_zero_turn_and_seen_zero_label_becomes_done_until_seen() {
+        let mut m = model_with_one();
+        // Spawned PTY terminals start with herdr.seen="0" while core turn stays 0 for non-7501 CLIs.
+        m.set_word("t1", Some("working".into()), Some("claude".into()), false);
+        m.set_turn("t1", 0, Some(0));
+        assert_eq!(m.status("t1"), Some("working"));
+
+        // Finishing a task transitions to "done" instead of skipping straight to "idle".
+        m.set_word("t1", Some("idle".into()), None, false);
+        m.set_turn("t1", 0, Some(0));
+        assert_eq!(m.status("t1"), Some("done"));
+
+        // Viewing the agent transitions "done" -> "idle".
+        assert!(m.mark_seen(&["t1".into()]));
+        assert_eq!(m.status("t1"), Some("idle"));
+
+        // AI detecting a fast completion marks an idle agent unseen -> "done" until viewed.
+        assert!(m.mark_unseen("t1"));
+        assert_eq!(m.status("t1"), Some("done"));
+        assert!(!m.mark_unseen("t1"));
     }
 
     #[test]

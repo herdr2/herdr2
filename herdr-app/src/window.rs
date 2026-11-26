@@ -1969,7 +1969,7 @@ impl AppWindow {
                         Some(v) => this.terminals_listed(v, window, cx),
                         None => this.tend_terminals(false, window, cx),
                     }
-                    if changed { this.sync(window, cx); }
+                    if changed { this.sync_without_marking_seen(window, cx); }
                     this.fit_hidden_tabs(window, cx);
                     this.flush_documents(refresh, window, cx);
                 }).is_err() { break; }
@@ -2508,7 +2508,7 @@ impl AppWindow {
                 self.write_state(&state);
                 let _ = std::fs::remove_file(file("layout.error"));
                 self.apply_look(window, cx);
-                self.sync(window, cx);
+                self.sync_without_marking_seen(window, cx);
             }
             Err(e) => {
                 self.written_layout = text;
@@ -3070,7 +3070,7 @@ impl AppWindow {
         self.model.pane_of(addr).and_then(|p| self.terms.get(&p)).or_else(|| self.terms.get(block).filter(|t| t.address == addr))
     }
 
-    /// What's on screen now, for done-vs-seen.
+    /// What's on screen now, for alerts and visibility checks.
     fn visible_addresses(&self) -> Vec<String> {
         let (terms, _) = self.visible();
         // A swapped-in terminal is drawn instead of its pane's own.
@@ -3085,8 +3085,19 @@ impl AppWindow {
             for block in tab.shown().visible_blocks() {
                 if let Some(addr) = block.acp_terminal() {
                     out.push(addr.to_owned());
+                } else if !covered.contains(block.id.as_str())
+                    && let Some(addr) = block.terminal()
+                    && self.is_structured_terminal(addr)
+                {
+                    out.push(addr.to_owned());
                 }
             }
+        }
+        if self.chrome.visible_blocks().iter().any(|b| b.id == "side-chat")
+            && let Some(addr) = mods::shared("side-chat.active").and_then(|v| v.as_str().map(str::to_owned))
+            && !addr.is_empty()
+        {
+            out.push(addr);
         }
         if self.overlays.iter().any(|o| o.id == "terminal-peek")
             && let Some(addr) = &self.peeked_agent
@@ -3094,6 +3105,80 @@ impl AppWindow {
             out.push(addr.clone());
         }
         out
+    }
+
+    /// The specific agent(s) the user is actively viewing/focusing right now.
+    /// Used when user navigation or interaction clears `"done"` -> `"idle"`.
+    fn viewed_addresses(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.overlays.iter().any(|o| o.id == "terminal-peek") {
+            if let Some(addr) = &self.peeked_agent {
+                out.push(addr.clone());
+            }
+            return out;
+        }
+        if let Some(focused) = self.focused_pane.as_deref()
+            && let Some(addr) = terminal_block(&self.chrome, Some(focused)).and_then(|n| n.terminal())
+        {
+            out.push(addr.to_owned());
+            return out;
+        }
+        if self.shows_agent() {
+            out.extend(self.shown_agent());
+            return out;
+        }
+        if self.shows_tab()
+            && let Some(pane) = self.focused_pane.as_deref().or(self.model.focused_pane().as_deref())
+        {
+            if let Some(swapped) = self.swapped.get(pane) {
+                out.push(swapped.clone());
+            } else if let Some(addr) = self.model.any_address_of(pane) {
+                out.push(addr);
+            }
+        }
+        out
+    }
+
+    /// Resolves the agent address currently drawn under a window-space pointer position.
+    fn agent_address_at(&self, pos: Point<Pixels>) -> Option<String> {
+        let bounds = self.bounds.borrow();
+        if self.overlays.iter().any(|o| o.id == "terminal-peek") {
+            if let Some(addr) = &self.peeked_agent {
+                return Some(addr.clone());
+            }
+        }
+        if self.chrome.visible_blocks().iter().any(|b| b.id == "side-chat")
+            && bounds.get("side-chat").is_some_and(|b| b.contains(&pos))
+            && let Some(addr) = mods::shared("side-chat.active").and_then(|v| v.as_str().map(str::to_owned))
+            && !addr.is_empty()
+        {
+            return Some(addr);
+        }
+        if self.shows_tab()
+            && let Some(tab) = self.model.active_tab()
+        {
+            for block in tab.shown().visible_blocks() {
+                if bounds.get(&block.id).is_some_and(|b| b.contains(&pos)) {
+                    if let Some(swapped) = self.swapped.get(&block.id) {
+                        return Some(swapped.clone());
+                    }
+                    if let Some(addr) = block.any_terminal() {
+                        return Some(addr.to_owned());
+                    }
+                }
+            }
+        }
+        for block in self.chrome.visible_blocks() {
+            if bounds.get(&block.id).is_some_and(|b| b.contains(&pos)) {
+                if let Some(addr) = block.terminal() {
+                    return Some(addr.to_owned());
+                }
+                if matches!(block.content(), Some(Content::Agent { .. })) {
+                    return self.shown_agent();
+                }
+            }
+        }
+        None
     }
 
     /// Makes `addr` the shown agent; a pane showing it also becomes the focused pane.
@@ -3118,8 +3203,18 @@ impl AppWindow {
         cur
     }
 
-    /// Creates what's visible, drops what isn't, publishes state, saves, focuses.
+    /// Creates what's visible, drops what isn't, publishes state, saves, focuses,
+    /// and marks the actively viewed agent(s) as seen.
     fn sync(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_inner(window, cx, true);
+    }
+
+    /// Same as `sync`, without clearing `"done"` -> `"idle"` on background updates.
+    fn sync_without_marking_seen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.sync_inner(window, cx, false);
+    }
+
+    fn sync_inner(&mut self, window: &mut Window, cx: &mut Context<Self>, mark_viewed_seen: bool) {
         let had_structured_focus = self.focused_pane.as_deref().is_some_and(|p| self.copies.contains_key(&format!("{p}#peek")));
         self.model.order_spaces();
         self.sync_side_chat_panel();
@@ -3298,50 +3393,50 @@ impl AppWindow {
         } else if revealed {
             self.refocus_pane(window, cx);
         }
-        if self.window_active {
-            let visible = self.visible_addresses();
-            self.model.mark_seen(&visible);
+        if mark_viewed_seen && self.window_active {
+            let viewed = self.viewed_addresses();
+            self.acknowledge_seen(&viewed, cx);
         }
-        self.share_seen(cx);
         self.publish(cx);
         self.save();
         cx.notify();
     }
 
-    /// Shares what the person looks at as `herdr.seen` (docs/labels.md): an
-    /// agent on screen in the active window, once per turn while it stays
-    /// there, so a phone marking it unread isn't undone by a screen nobody
-    /// watches. Only ever raises it. True when a status changed.
-    fn share_seen(&mut self, cx: &mut Context<Self>) -> bool {
-        let looking: HashSet<String> = if self.window_active { self.visible_addresses().into_iter().collect() } else { HashSet::new() };
-        self.looked.retain(|a, _| looking.contains(a));
-        let mut changed = false;
-        for addr in looking {
-            let Some(a) = self.model.agents.get(&addr) else { continue };
-            let turn = a.turn;
-            if a.word.is_none() || !self.live.contains_key(&addr) || self.looked.get(&addr) == Some(&turn) {
+    /// Marks the given agent address(es) as viewed by the user (`"done"` -> `"idle"`)
+    /// and shares `herdr.seen=<turn>` with core (docs/labels.md) for core-tracked turns.
+    fn acknowledge_seen(&mut self, addresses: &[String], cx: &mut Context<Self>) -> bool {
+        let mut changed = self.model.mark_seen(addresses);
+        let mut uniq: HashSet<&str> = HashSet::new();
+        for addr in addresses {
+            if !uniq.insert(addr.as_str()) {
                 continue;
             }
-            self.looked.insert(addr.clone(), turn);
+            let Some(a) = self.model.agents.get(addr) else { continue };
+            let turn = a.turn;
+            if a.word.is_none() || !self.live.contains_key(addr) || turn == 0 {
+                continue;
+            }
             if a.seen_turn.is_some_and(|s| s >= turn) {
                 continue;
             }
+            self.looked.insert(addr.clone(), turn);
             // Shown as seen now, not after the core's round trip.
-            changed |= self.model.set_turn(&addr, turn, Some(turn));
+            changed |= self.model.set_turn(addr, turn, Some(turn));
             self.written_seen.insert(addr.clone(), turn);
             let core = self.core.clone();
+            let addr_owned = addr.clone();
             cx.spawn(async move |this, cx| {
-                let (method, params) = if is_acp_addr(&addr) {
-                    ("agent.label", json!({ "agent": addr, "labels": { "herdr.seen": turn.to_string() } }))
+                let (method, params) = if is_acp_addr(&addr_owned) {
+                    ("agent.label", json!({ "agent": addr_owned, "labels": { "herdr.seen": turn.to_string() } }))
                 } else {
-                    ("terminal.label", json!({ "terminal": addr, "labels": { "herdr.seen": turn.to_string() } }))
+                    ("terminal.label", json!({ "terminal": addr_owned, "labels": { "herdr.seen": turn.to_string() } }))
                 };
                 let Err(e) = cx.background_executor().spawn(async move { core.call(method, params) }).await else { return };
-                tracing::warn!("seen label for {addr}: {e:#}");
+                tracing::warn!("seen label for {addr_owned}: {e:#}");
                 let _ = this.update(cx, |this, _| {
-                    if this.written_seen.get(&addr) == Some(&turn) {
-                        this.written_seen.remove(&addr);
-                        this.looked.remove(&addr);
+                    if this.written_seen.get(&addr_owned) == Some(&turn) {
+                        this.written_seen.remove(&addr_owned);
+                        this.looked.remove(&addr_owned);
                     }
                 });
             })
@@ -4542,6 +4637,8 @@ impl AppWindow {
             typed_at: Option<Instant>,
             tail_lines: Vec<String>,
             next_rechecks: u8,
+            fallback_state: &'static str,
+            is_reported: bool,
         }
         let mut updates: Vec<(String, Value, Value, Value, Option<String>, Option<String>)> = Vec::new();
         let mut clear_verdicts: Vec<String> = Vec::new();
@@ -4553,21 +4650,103 @@ impl AppWindow {
                 Some(entry) => entry.status.is_some(),
                 None => rec.pointer("/labels/herdr.status").and_then(Value::as_str).is_some_and(|s| !s.is_empty()),
             };
-            if rec.get("acp").and_then(Value::as_bool) == Some(true)
-                || rec.get("reported").and_then(Value::as_bool) == Some(true)
-                || manually_held
-            {
+            if rec.get("acp").and_then(Value::as_bool) == Some(true) || manually_held {
                 if self.ai_terminal_states.contains_key(addr) {
                     clear_verdicts.push(addr.clone());
                 }
                 continue;
             }
             let is_agent = rec.pointer("/program/agent").and_then(Value::as_bool) == Some(true);
+            let is_reported = rec.get("reported").and_then(Value::as_bool) == Some(true);
+            if is_reported {
+                let core_state = rec.pointer("/report/state").and_then(Value::as_str);
+                if !is_agent || !matches!(core_state, Some("idle" | "done")) {
+                    if self.ai_terminal_states.contains_key(addr) {
+                        clear_verdicts.push(addr.clone());
+                    }
+                    continue;
+                }
+                let base_state: &'static str = if core_state == Some("done") { "done" } else { "idle" };
+                let raw_title = rec.get("raw_title").and_then(Value::as_str).unwrap_or_default();
+                let view = self.best_terminal_view(addr, cx);
+                let conf = view.as_ref().map_or(crate::terminal::QuietBlockConfidence::None, |v| v.read(cx).quiet_blocked_confidence(now));
+                let (want, want_summary, want_kind, cached_sem_title, cached_micro) = if conf == crate::terminal::QuietBlockConfidence::ExplicitPrompt {
+                    if self.ai_terminal_states.contains_key(addr) {
+                        clear_verdicts.push(addr.clone());
+                    }
+                    (Value::String("blocked".into()), Value::Null, Value::Null, None, None)
+                } else if let Some(view) = view {
+                    let det_default: &'static str = if conf == crate::terminal::QuietBlockConfidence::AmbiguousText {
+                        "blocked"
+                    } else {
+                        base_state
+                    };
+                    let v = view.read(cx);
+                    let output_at = v.last_output_at();
+                    let typed_at = v.last_typed_at();
+                    let cached = self.ai_terminal_states.get(addr).filter(|c| c.output_at == output_at && c.typed_at == typed_at);
+                    if cached.is_none() && self.ai_terminal_states.contains_key(addr) {
+                        clear_verdicts.push(addr.clone());
+                    }
+                    let (eff_state, eff_summary, eff_kind, eff_sem_title, eff_micro, need_ai) = match cached {
+                        Some(c) => {
+                            let st = if c.state == "blocked" { "blocked" } else { base_state };
+                            let sum = if c.summary.is_empty() { Value::Null } else { Value::String(c.summary.clone()) };
+                            let kind = if c.kind.is_empty() { Value::Null } else { Value::String(c.kind.clone()) };
+                            let sem = (!c.semantic_title.is_empty()).then(|| c.semantic_title.clone());
+                            let ms = (!c.micro_summary.is_empty()).then(|| c.micro_summary.clone());
+                            (st, sum, kind, sem, ms, false)
+                        }
+                        None => (det_default, Value::Null, Value::Null, None, None, true),
+                    };
+                    if need_ai
+                        && can_ai
+                        && !self.ai_inflight.contains(addr)
+                        && self.ai_inflight.len() + jobs.len() < 2
+                        && self.ai_last_attempt.get(addr).is_none_or(|t| now.saturating_duration_since(*t) >= Duration::from_secs(5))
+                        && output_at.is_some_and(|t| now.saturating_duration_since(t) >= Duration::from_secs(2))
+                        && typed_at.is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(1500))
+                    {
+                        let (screen_hash, tail_lines) = v.tail_snapshot_for_arbitration(20);
+                        if !tail_lines.is_empty() {
+                            jobs.push(ArbitrationJob {
+                                addr: addr.clone(),
+                                program: rec.pointer("/program/key").and_then(Value::as_str).map(str::to_owned),
+                                raw_title: raw_title.to_owned(),
+                                screen_hash,
+                                output_at,
+                                typed_at,
+                                tail_lines,
+                                next_rechecks: 0,
+                                fallback_state: det_default,
+                                is_reported: true,
+                            });
+                        }
+                    }
+                    (Value::String(eff_state.to_owned()), eff_summary, eff_kind, eff_sem_title, eff_micro)
+                } else {
+                    (Value::String(base_state.to_owned()), Value::Null, Value::Null, None, None)
+                };
+                let cur_status = rec.get("status").unwrap_or(&Value::Null);
+                let cur_summary = rec.get("ai_status_summary").unwrap_or(&Value::Null);
+                let cur_kind = rec.get("ai_status_kind").unwrap_or(&Value::Null);
+                let has_core_sem = rec.get("semantic_title").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty());
+                let has_core_micro = rec.get("micro_summary").and_then(Value::as_str).is_some_and(|s| !s.trim().is_empty());
+                let fill_sem = (!has_core_sem).then_some(cached_sem_title).flatten();
+                let fill_micro = (!has_core_micro).then_some(cached_micro).flatten();
+                if cur_status != &want || cur_summary != &want_summary || cur_kind != &want_kind || fill_sem.is_some() || fill_micro.is_some() {
+                    updates.push((addr.clone(), want, want_summary, want_kind, fill_sem, fill_micro));
+                }
+                continue;
+            }
             let (want, want_summary, want_kind, cached_sem_title, cached_micro) = if is_agent {
                 let raw_title = rec.get("raw_title").and_then(Value::as_str).unwrap_or_default();
                 let view = self.best_terminal_view(addr, cx);
-                let det = view.as_ref().map(|v| v.read(cx).inferred_agent_state(raw_title, now)).unwrap_or("idle");
-                if det != "idle" {
+                let (det, needs_ai) = view
+                    .as_ref()
+                    .map(|v| v.read(cx).inferred_agent_state_with_confidence(raw_title, now))
+                    .unwrap_or(("idle", false));
+                if !needs_ai {
                     if self.ai_terminal_states.contains_key(addr) {
                         clear_verdicts.push(addr.clone());
                     }
@@ -4591,7 +4770,7 @@ impl AppWindow {
                             let ms = (!c.micro_summary.is_empty()).then(|| c.micro_summary.clone());
                             (c.state, sum, kind, st, ms, recheck, c.working_rechecks.saturating_add(1))
                         }
-                        None => ("idle", Value::Null, Value::Null, None, None, true, 0),
+                        None => (det, Value::Null, Value::Null, None, None, true, 0),
                     };
                     if need_recheck
                         && can_ai
@@ -4601,7 +4780,7 @@ impl AppWindow {
                         && output_at.is_some_and(|t| now.saturating_duration_since(t) >= Duration::from_secs(2))
                         && typed_at.is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(1500))
                     {
-                        let (screen_hash, tail_lines) = v.tail_snapshot_for_arbitration(15);
+                        let (screen_hash, tail_lines) = v.tail_snapshot_for_arbitration(20);
                         if !tail_lines.is_empty()
                             && cached.is_none_or(|c| c.screen_hash != screen_hash || c.state == "working")
                         {
@@ -4614,12 +4793,14 @@ impl AppWindow {
                                 typed_at,
                                 tail_lines,
                                 next_rechecks,
+                                fallback_state: det,
+                                is_reported: false,
                             });
                         }
                     }
                     (Value::String(eff_state.to_owned()), eff_summary, eff_kind, eff_sem_title, eff_micro)
                 } else {
-                    (Value::String("idle".into()), Value::Null, Value::Null, None, None)
+                    (Value::String(det.to_owned()), Value::Null, Value::Null, None, None)
                 }
             } else {
                 if self.ai_terminal_states.contains_key(addr) {
@@ -4671,6 +4852,8 @@ impl AppWindow {
             let output_at = job.output_at;
             let typed_at = job.typed_at;
             let next_rechecks = job.next_rechecks;
+            let fallback_state = job.fallback_state;
+            let job_reported = job.is_reported;
             cx.spawn(async move |this, cx| {
                 let res = cx.background_executor().spawn(async move { core.classify_terminal_state(params) }).await;
                 let _ = this.update(cx, |this, cx| {
@@ -4693,26 +4876,37 @@ impl AppWindow {
                     let Some(rec) = this.live.get(&addr) else {
                         return;
                     };
-                    if rec.get("reported").and_then(Value::as_bool) == Some(true)
+                    let rec_reported = rec.get("reported").and_then(Value::as_bool) == Some(true);
+                    let core_state = rec.pointer("/report/state").and_then(Value::as_str);
+                    if rec.get("acp").and_then(Value::as_bool) == Some(true)
                         || rec.get("manual_status").and_then(Value::as_str).is_some_and(|s| !s.is_empty())
                         || rec.pointer("/program/agent").and_then(Value::as_bool) != Some(true)
+                        || (rec_reported && !matches!(core_state, Some("idle" | "done")))
                     {
                         return;
                     }
                     let accepted = val.get("accepted").and_then(Value::as_bool) == Some(true);
                     let turn = rec.get("turn").and_then(Value::as_u64).unwrap_or(0);
+                    let raw_state = val.get("state").and_then(Value::as_str).unwrap_or("idle");
                     let (mapped_state, kind, summary) = if accepted {
-                        let raw_state = val.get("state").and_then(Value::as_str).unwrap_or("idle");
-                        let mapped = match raw_state {
-                            "working" => "working",
-                            "blocked" | "error" => "blocked",
-                            _ => "idle",
+                        let mapped = if rec_reported || job_reported {
+                            match raw_state {
+                                "blocked" | "error" => "blocked",
+                                _ if core_state == Some("done") => "done",
+                                _ => "idle",
+                            }
+                        } else {
+                            match raw_state {
+                                "working" => "working",
+                                "blocked" | "error" => "blocked",
+                                _ => "idle",
+                            }
                         };
                         let k = val.get("kind").and_then(Value::as_str).unwrap_or(raw_state).to_owned();
                         let s = val.get("summary").and_then(Value::as_str).unwrap_or("").trim().to_owned();
                         (mapped, k, s)
                     } else {
-                        ("idle", String::new(), String::new())
+                        (fallback_state, String::new(), String::new())
                     };
                     let allow_digest = accepted && !(mapped_state == "idle" && turn == 0 && typed_at.is_none());
                     let semantic_title = if allow_digest {
@@ -4760,8 +4954,10 @@ impl AppWindow {
                         .get(&addr)
                         .and_then(|r| r.pointer("/program/key").and_then(Value::as_str))
                         .map(str::to_owned);
-                    let looking = this.visible_addresses().iter().any(|x| x == &addr) && this.window_active;
-                    this.model.set_word(&addr, Some(mapped_state.to_owned()), app, looking);
+                    let word_changed = this.model.set_word(&addr, Some(mapped_state.to_owned()), app, false);
+                    if !word_changed && !rec_reported && accepted && raw_state == "done" && allow_digest {
+                        this.model.mark_unseen(&addr);
+                    }
                     mods::publish_terminals(this.ordered_live_values());
                     this.publish(cx);
                     this.refresh_snapshot_mods(cx);
@@ -5689,10 +5885,17 @@ impl AppWindow {
             if let Some(alert) = self.model.alert_for(&addr, child, prev.as_deref(), word.as_deref(), looking) {
                 alerts.push((addr.clone(), alert, looking));
             }
-            changed |= self.model.set_word(&addr, word, app, looking);
+            // A finished task always transitions to "done" first; explicit user viewing/interaction clears it to "idle".
+            changed |= self.model.set_word(&addr, word, app, false);
             let turn = rec.get("turn").and_then(Value::as_u64).unwrap_or(0);
+            let reported = rec.get("reported").and_then(Value::as_bool) == Some(true);
             let label = rec.pointer("/labels/herdr.seen").and_then(Value::as_str).and_then(|s| s.parse::<u64>().ok());
-            changed |= self.model.set_turn(&addr, turn, label.max(self.written_seen.get(&addr).copied()));
+            let seen_turn = if is_acp || reported {
+                label.max(self.written_seen.get(&addr).copied())
+            } else {
+                None
+            };
+            changed |= self.model.set_turn(&addr, turn, seen_turn);
             let core_ws = rec.get("working_since").and_then(Value::as_u64);
             let core_work_ms = rec.get("work_ms").and_then(Value::as_u64);
             let core_total_ms = rec.get("total_work_ms").and_then(Value::as_u64);
@@ -5720,7 +5923,6 @@ impl AppWindow {
             mods::publish_terminals(self.ordered_live_values());
         }
         self.written_seen.retain(|a, _| self.live.contains_key(a));
-        changed |= self.share_seen(cx);
         // Changes already made before Herdr started aren't news.
         if self.listed_once {
             for (addr, alert, looking) in alerts {
@@ -5744,7 +5946,7 @@ impl AppWindow {
             })
         });
         if changed {
-            self.sync(window, cx);
+            self.sync_without_marking_seen(window, cx);
         } else if listed || republished {
             self.publish(cx);
             if republished {
@@ -8979,6 +9181,7 @@ impl AppWindow {
                     if !self.overlays.iter().any(|o| o.kind.modal_keys()) && let Some(f) = self.pane_focus(&id, cx) {
                         f.focus(window, cx);
                     }
+                    self.acknowledge_seen(&[terminal.to_owned()], cx);
                     self.publish(cx);
                     cx.notify();
                     return;
@@ -10471,7 +10674,26 @@ impl AppWindow {
                 return;
             }
         }
-        self.sync(window, cx);
+        let marks_viewed = matches!(
+            name,
+            "space.select"
+                | "space.next"
+                | "space.prev"
+                | "tab.select"
+                | "tab.next"
+                | "tab.prev"
+                | "pane.focus"
+                | "pane.go"
+                | "agent.focus"
+                | "agent.next"
+                | "agent.prev"
+                | "terminal.peek"
+        );
+        if marks_viewed {
+            self.sync(window, cx);
+        } else {
+            self.sync_without_marking_seen(window, cx);
+        }
     }
 
     fn find_node_mut(&mut self, id: &str) -> Option<&mut Node> {
@@ -10730,6 +10952,7 @@ impl AppWindow {
         {
             self.dispatch("agent.focus", &json!({ "terminal": p_addr }), false, window, cx);
         }
+        self.acknowledge_seen(&[address.to_owned()], cx);
         mods::set_shared("side-chat.active".to_string(), json!(address));
         let has_side_block = self.chrome.find("side-chat").is_some();
         if has_side_block {
@@ -10953,6 +11176,7 @@ impl AppWindow {
                 return;
             }
             self.peeked_agent = Some(address.to_owned());
+            self.acknowledge_seen(&[address.to_owned()], cx);
             self.open_overlay("terminal-peek".into(), json!({
                 "kind": "dialog",
                 "frame": "none",
@@ -10964,6 +11188,7 @@ impl AppWindow {
             self.publish(cx);
             return;
         }
+        self.acknowledge_seen(&[address.to_owned()], cx);
         self.open_overlay("terminal-peek".into(), json!({
             "kind": "dialog",
             "width": 0.8,
@@ -11281,7 +11506,7 @@ impl AppWindow {
                     self.away_statuses.clear();
                 }
                 self.check_polish_shortcut_conflict(false, window, cx);
-                self.sync(window, cx);
+                self.sync_without_marking_seen(window, cx);
             } else {
                 self.blurred_at = Some(now);
                 self.away_statuses.clear();
@@ -11453,7 +11678,7 @@ impl AppWindow {
             }
             self.copies.insert(slot, copy);
         }
-        self.sync(window, cx);
+        self.sync_without_marking_seen(window, cx);
         self.restarting_mods = false;
         if self.copies.values().any(|c| c.error.is_some()) {
             self.load_recovery = Some(Instant::now());
@@ -11495,7 +11720,7 @@ impl AppWindow {
             }
         }
         if !retry.is_empty() || added || removed {
-            self.sync(window, cx);
+            self.sync_without_marking_seen(window, cx);
         }
     }
 
@@ -12889,8 +13114,36 @@ impl Render for AppWindow {
                     }
                 }
             }))
-            .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _, _| {
+            .capture_key_down(cx.listener(|this, _ev: &KeyDownEvent, _, cx| {
+                if !this.window_active || this.overlays.iter().any(|o| o.kind.modal_keys() || o.kind == OverlayKind::Popup) {
+                    return;
+                }
+                let viewed = this.viewed_addresses();
+                let done_addrs: Vec<String> = viewed
+                    .into_iter()
+                    .filter(|addr| this.model.status(addr) == Some("done"))
+                    .collect();
+                if !done_addrs.is_empty() && this.acknowledge_seen(&done_addrs, cx) {
+                    this.publish(cx);
+                    this.refresh_snapshot_mods(cx);
+                    cx.notify();
+                }
+            }))
+            .capture_any_mouse_down(cx.listener(|this, ev: &MouseDownEvent, _, cx| {
                 this.pointer = ev.position;
+                let blocking_overlay = this
+                    .overlays
+                    .iter()
+                    .any(|o| (o.kind.modal_keys() || o.kind == OverlayKind::Popup) && o.id != "terminal-peek");
+                if !blocking_overlay
+                    && let Some(addr) = this.agent_address_at(ev.position)
+                    && this.model.status(&addr) == Some("done")
+                    && this.acknowledge_seen(&[addr], cx)
+                {
+                    this.publish(cx);
+                    this.refresh_snapshot_mods(cx);
+                    cx.notify();
+                }
                 if ev.button == MouseButton::Left
                     && !this.overlays.iter().any(|o| o.kind.modal_keys() || o.kind == OverlayKind::Popup)
                 {

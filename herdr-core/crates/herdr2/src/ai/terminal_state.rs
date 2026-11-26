@@ -102,14 +102,14 @@ pub async fn classify_terminal_state(
         .tail_lines
         .iter()
         .rev()
-        .take(15)
+        .take(20)
         .cloned()
         .collect::<Vec<_>>()
         .into_iter()
         .rev()
         .collect::<Vec<_>>()
         .join("\n");
-    let compact_tail = strip_and_dedup_lines(&raw_joined, 15, 200, 1800);
+    let compact_tail = strip_and_dedup_lines(&raw_joined, 20, 200, 2200);
     if compact_tail.trim().is_empty() && params.raw_title.trim().is_empty() {
         return ClassifyTerminalStateResult::default();
     }
@@ -124,6 +124,66 @@ pub async fn classify_terminal_state(
     let payload = json!({
         "program": prog,
         "raw_title": strip_and_dedup_lines(&params.raw_title, 1, 120, 120),
+        "tail": compact_tail,
+    });
+    let user_prompt = format_op_user_message("pty_status", lang, &payload);
+
+    let Some(resp) = ai
+        .complete_bg(AiCompleteRequest {
+            op: "pty_status".into(),
+            tier: AiTaskTier::Nano,
+            mode: AiConversationMode::StatelessSharedPrefix,
+            user_prompt,
+            max_tokens: 112,
+            timeout: CLASSIFY_TIMEOUT,
+            cache_key: Some(cache_key),
+            cache_ttl: Some(LOCAL_CACHE_TTL),
+            prompt_cache_bucket: Some("pty".into()),
+            ..Default::default()
+        })
+        .await
+    else {
+        return ClassifyTerminalStateResult { used_ai: false, ..Default::default() };
+    };
+
+    let verdict = parse_verdict(&resp.content, resp.from_local_cache);
+    if !resp.from_local_cache {
+        if verdict.state.is_none() && verdict.confidence.is_none() {
+            ai.record_parse_error("pty_status");
+        } else if !verdict.accepted {
+            ai.record_low_conf_reject("pty_status");
+        }
+    }
+    verdict
+}
+
+/// Classifies the final assistant response of a completed ACP turn using the shared Core AI runtime
+/// (`op = "pty_status"`, `AiTaskTier::Nano`, KV-cache shared prefix) to accurately arbitrate
+/// whether the agent finished (`done`/`idle`) or stopped awaiting user input/choice (`blocked`).
+pub async fn classify_acp_turn_state(
+    ai: &AiRuntime,
+    program: &str,
+    assistant_text: &str,
+    language: Option<&str>,
+) -> ClassifyTerminalStateResult {
+    let cfg = ai.config_snapshot();
+    if !cfg.enabled || !cfg.pty_status_arbitration || cfg.base_url.trim().is_empty() || ai.is_circuit_open() {
+        return ClassifyTerminalStateResult::default();
+    }
+
+    let compact_tail = strip_and_dedup_lines(assistant_text, 18, 220, 2000);
+    if compact_tail.trim().is_empty() {
+        return ClassifyTerminalStateResult::default();
+    }
+
+    let lang = if language.is_some_and(|l| l.to_ascii_lowercase().starts_with("zh")) { "zh" } else { "en" };
+    let prog = program.trim().to_ascii_lowercase();
+    let norm_tail = normalize_for_fingerprint(&compact_tail);
+    let cache_key = format!("acp_turn_status:{lang}:{prog}:{}", fingerprint_hex(&[&norm_tail]));
+
+    let payload = json!({
+        "program": prog,
+        "raw_title": "ACP turn finished: decide if final assistant reply completed the task (done) or stopped asking the user a question/choice/confirmation (blocked)",
         "tail": compact_tail,
     });
     let user_prompt = format_op_user_message("pty_status", lang, &payload);

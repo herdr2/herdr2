@@ -718,11 +718,15 @@ export default class Checkpoints extends View {
     );
     const hasComment = commentedSet.has(row.rowIndex);
     const accent = t.accent ?? "#3b82f6";
+    const isDel = row.kind === "-";
+    const isAdd = row.kind === "+";
+    const sign = isDel ? "-" : isAdd ? "+" : "";
+    const signColor = isDel ? t.ansi1 : isAdd ? t.ansi2 : t.dim;
     const rowBg = inSel
       ? (withAlpha(accent, "24") ?? t.selected)
-      : row.kind === "+"
+      : isAdd
         ? (t.ansi2 + "18")
-        : row.kind === "-"
+        : isDel
           ? (t.ansi1 + "18")
           : null;
 
@@ -731,7 +735,7 @@ export default class Checkpoints extends View {
       .min_w(0)
       .min_h(20)
       .pr(14)
-      .gap(6)
+      .gap(4)
       .items_start()
       .when(Boolean(rowBg), (e) => e.bg(rowBg))
       .when(row.commentable, (e) => e.cursor_pointer().hover((s) => s.bg(withAlpha(accent, "18") ?? t.hover)))
@@ -744,14 +748,14 @@ export default class Checkpoints extends View {
       )
       .child(
         div()
-          .w(14)
+          .w(10)
           .flex_none()
           .py(1)
           .line_height("18px")
           .text_center()
-          .text_size(11)
-          .text_color(inSel || hasComment ? accent : t.dim)
-          .child(row.commentable ? (hasComment ? "●" : "+") : ""),
+          .text_size(10)
+          .text_color(accent)
+          .child(hasComment ? "●" : ""),
       )
       .child(
         div()
@@ -762,6 +766,16 @@ export default class Checkpoints extends View {
           .text_right()
           .text_color(inSel ? t.foreground : t.dim)
           .child(row.number === undefined ? "" : String(row.number)),
+      )
+      .child(
+        div()
+          .w(12)
+          .flex_none()
+          .py(1)
+          .line_height("18px")
+          .text_center()
+          .text_color(signColor)
+          .child(sign),
       )
       .child(div().flex_1().min_w(0).py(1).line_height("18px").whitespace_normal().child(row.text));
   }
@@ -797,7 +811,7 @@ export default class Checkpoints extends View {
     const lineNum = side === "left"
       ? (row.oldLine ?? (row.kind === "-" ? row.number : null))
       : (row.newLine ?? (row.kind === "+" ? row.number : null));
-    const sign = isDel ? "−" : isAdd ? "+" : "";
+    const sign = isDel ? "-" : isAdd ? "+" : "";
     const signColor = isDel ? t.ansi1 : isAdd ? t.ansi2 : t.dim;
 
     return h_flex()
@@ -831,8 +845,8 @@ export default class Checkpoints extends View {
           .py(1)
           .line_height("18px")
           .text_center()
-          .text_color(hasComment ? accent : signColor)
-          .child(hasComment ? "●" : sign),
+          .text_color(hasComment && !sign ? accent : signColor)
+          .child(hasComment && !sign ? "●" : sign),
       )
       .child(
         div()

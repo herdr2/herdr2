@@ -121,6 +121,157 @@
         ],
         "type": "object"
       },
+      "AdapterInstallItemResult": {
+        "properties": {
+          "action": {
+            "description": "Outcome: `installed`, `updated`, `already_ready`, `skipped`, or `failed`.",
+            "type": "string"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "method": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "preset_id": {
+            "type": "string"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "preset_id",
+          "action"
+        ],
+        "type": "object"
+      },
+      "AdapterInstallResult": {
+        "properties": {
+          "adapters_dir": {
+            "type": "string"
+          },
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/AdapterInstallItemResult"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "adapters_dir",
+          "results"
+        ],
+        "type": "object"
+      },
+      "AdapterStatusItem": {
+        "properties": {
+          "binary_name": {
+            "type": "string"
+          },
+          "companion_cli": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "companion_installed": {
+            "type": "boolean"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "installed": {
+            "type": "boolean"
+          },
+          "method": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "preset_id": {
+            "type": "string"
+          },
+          "registry_id": {
+            "type": "string"
+          },
+          "source": {
+            "description": "Where the resolved adapter comes from: `config`, `path`, `managed`, `npx_cache`, `npx_fallback`, or `missing`.",
+            "type": "string"
+          },
+          "state": {
+            "description": "Lifecycle state: `ready`, `installing`, `missing`, or `error`.",
+            "type": "string"
+          },
+          "version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "preset_id",
+          "registry_id",
+          "binary_name",
+          "companion_installed",
+          "installed",
+          "source",
+          "state"
+        ],
+        "type": "object"
+      },
+      "AdapterStatusResult": {
+        "properties": {
+          "adapters": {
+            "items": {
+              "$ref": "#/components/schemas/AdapterStatusItem"
+            },
+            "type": "array"
+          },
+          "adapters_dir": {
+            "type": "string"
+          },
+          "auto_install": {
+            "type": "boolean"
+          },
+          "registry_url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "adapters_dir",
+          "auto_install",
+          "registry_url",
+          "adapters"
+        ],
+        "type": "object"
+      },
       "Agent": {
         "properties": {
           "address": {
@@ -6121,7 +6272,7 @@
       "name": "Apache-2.0"
     },
     "title": "herdr2",
-    "version": "2.0.15"
+    "version": "2.0.16"
   },
   "methods": [
     {
@@ -13209,6 +13360,223 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/CheckpointHookResult"
+        }
+      }
+    },
+    {
+      "description": "Inspect managed ACP adapter availability, installation source, version, and background install state.",
+      "errors": [
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        }
+      ],
+      "name": "adapter.status",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Target remote machine (`h2 machine ls`).",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "Target remote machine (`h2 machine ls`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/AdapterStatusResult"
+        }
+      }
+    },
+    {
+      "description": "Download and install missing managed ACP adapters from the official ACP Registry (standalone binary or isolated npm prefix).",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "config"
+          },
+          "message": "config"
+        }
+      ],
+      "name": "adapter.install",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Install all managed ACP adapters.",
+          "name": "all",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Install all managed ACP adapters.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Install adapters for companion CLIs detected on PATH.",
+          "name": "detected",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Install adapters for companion CLIs detected on PATH.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Force re-download even if already installed.",
+          "name": "force",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Force re-download even if already installed.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Target remote machine (`h2 machine ls`).",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "Target remote machine (`h2 machine ls`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Specific adapter preset(s) to install (`claude`, `codex`, `pi`, `glm`).",
+          "name": "presets",
+          "required": false,
+          "schema": {
+            "default": [],
+            "description": "Specific adapter preset(s) to install (`claude`, `codex`, `pi`, `glm`).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/AdapterInstallResult"
+        }
+      }
+    },
+    {
+      "description": "Refresh the official ACP Registry index and update managed ACP adapters to the latest version.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "config"
+          },
+          "message": "config"
+        }
+      ],
+      "name": "adapter.update",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Update all managed ACP adapters.",
+          "name": "all",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Update all managed ACP adapters.",
+            "type": "boolean"
+          }
+        },
+        {
+          "description": "Target remote machine (`h2 machine ls`).",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "Target remote machine (`h2 machine ls`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Specific adapter preset(s) to update (default: all managed or detected adapters).",
+          "name": "presets",
+          "required": false,
+          "schema": {
+            "default": [],
+            "description": "Specific adapter preset(s) to update (default: all managed or detected adapters).",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/AdapterInstallResult"
         }
       }
     },

@@ -1225,13 +1225,23 @@ impl TerminalView {
 
     /// Best-effort execution state for an interactive CLI agent that did not emit OSC 7501.
     pub fn inferred_agent_state(&self, fallback_raw_title: &str, now: Instant) -> &'static str {
+        self.inferred_agent_state_with_confidence(fallback_raw_title, now).0
+    }
+
+    /// Returns `(state, needs_ai_verification)`.
+    /// `needs_ai_verification` is true when deterministic rules saw a quiet `"idle"` screen
+    /// or an ambiguous conversational-text `"blocked"` cue (as opposed to an explicit title/UI prompt).
+    pub fn inferred_agent_state_with_confidence(&self, fallback_raw_title: &str, now: Instant) -> (&'static str, bool) {
         let raw_title = if !self.raw_title.is_empty() && self.raw_title != self.address {
             self.raw_title.as_str()
         } else {
             fallback_raw_title
         };
         let active_output = self.has_active_output(now);
-        let quiet_ready = !active_output && self.last_output_at.is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(1000));
+        let answered_since_output = matches!((self.last_output_at, self.last_typed_at()), (Some(out), Some(typed)) if typed > out);
+        let quiet_ready = !active_output
+            && !answered_since_output
+            && self.last_output_at.is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(1000));
         let title_spinning = self.last_title_change_at.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(3000));
         // Claude Code parks its idle OSC title at `✳ <Session Name>`; strip the static glyph when quiet so it returns to idle.
         let effective_title = if !active_output && !title_spinning && raw_title.trim_start().starts_with('\u{2733}') {
@@ -1242,13 +1252,37 @@ impl TerminalView {
         // Short-circuit before touching the grid when title alone already decides.
         let title_prelim = infer_pty_agent_state(effective_title.as_ref(), false, false, &[]);
         if title_prelim != "idle" {
-            return title_prelim;
+            return (title_prelim, false);
         }
         if !active_output && !quiet_ready {
-            return "idle";
+            return ("idle", false);
         }
-        let tail = self.grid.borrow().vt.tail_lines(8);
-        infer_pty_agent_state(effective_title.as_ref(), active_output, quiet_ready, &tail)
+        let tail = self.grid.borrow().vt.tail_lines(if active_output { 8 } else { 20 });
+        if active_output {
+            let st = infer_pty_agent_state(effective_title.as_ref(), true, false, &tail);
+            return (st, false);
+        }
+        match classify_quiet_tail_confirmation(&tail) {
+            QuietBlockConfidence::ExplicitPrompt => ("blocked", false),
+            QuietBlockConfidence::AmbiguousText => ("blocked", true),
+            QuietBlockConfidence::None => ("idle", true),
+        }
+    }
+
+    /// Confidence tier of a quiet PTY screen showing a confirmation prompt, choice menu, or question
+    /// (also used for OSC 7501 `idle`/`done` terminals to decide deterministic vs AI-assisted arbitration).
+    pub(crate) fn quiet_blocked_confidence(&self, now: Instant) -> QuietBlockConfidence {
+        if self.has_active_output(now) {
+            return QuietBlockConfidence::None;
+        }
+        if matches!((self.last_output_at, self.last_typed_at()), (Some(out), Some(typed)) if typed > out) {
+            return QuietBlockConfidence::None;
+        }
+        if self.last_output_at.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(1000)) {
+            return QuietBlockConfidence::None;
+        }
+        let tail = self.grid.borrow().vt.tail_lines(20);
+        classify_quiet_tail_confirmation(&tail)
     }
 
     #[cfg(test)]
@@ -2275,25 +2309,286 @@ pub(crate) fn infer_pty_agent_state(raw_title: &str, active_output: bool, quiet_
         }
         return "working";
     }
-    if quiet_ready
-        && tail_lines.iter().any(|line| {
-            let l = line.to_ascii_lowercase();
-            l.contains("(y/n)")
-                || l.contains("[y/n]")
-                || l.contains("(yes/no)")
-                || l.contains("do you want to proceed")
-                || l.contains("do you want to allow")
-                || l.contains("allow once")
-                || l.contains("allow always")
-                || l.contains("yes, allow")
-                || l.contains("needs your approval")
-                || l.contains("waiting for approval")
-                || l.contains("approve this")
-        })
-    {
+    if quiet_ready && tail_needs_user_confirmation(tail_lines) {
         return "blocked";
     }
     "idle"
+}
+
+fn is_tui_chrome_or_footer_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return true;
+    }
+    let low = t.to_ascii_lowercase();
+    // Pure box-drawing borders / separators / empty prompt boxes.
+    if t.chars().all(|c| matches!(c, '─' | '━' | '═' | '╭' | '╮' | '╰' | '╯' | '│' | '┃' | '┌' | '┐' | '└' | '┘' | '-' | '=' | '*' | '_' | ' ')) {
+        return true;
+    }
+    // Boxed prompt input lines (e.g. ZCode / Claude Code input box).
+    if t.starts_with("╭─") || t.starts_with("╰─") || (t.starts_with('│') && t.ends_with('│')) {
+        return true;
+    }
+    // Bare or placeholder CLI input prompts.
+    let prompt_rest = t
+        .strip_prefix('❯')
+        .or_else(|| t.strip_prefix('›'))
+        .or_else(|| t.strip_prefix('>'))
+        .map(str::trim);
+    if let Some(rest) = prompt_rest {
+        if rest.is_empty()
+            || rest.to_ascii_lowercase().starts_with("try \"")
+            || rest.to_ascii_lowercase().starts_with("type a prompt")
+            || rest.to_ascii_lowercase().starts_with("ready for your next prompt")
+            || rest.to_ascii_lowercase().starts_with("ask anything")
+            || rest.starts_with("输入")
+        {
+            return true;
+        }
+    }
+    // Common CLI footer / shortcut hints (notably Claude Code's `? for shortcuts`).
+    if low.contains("? for shortcuts")
+        || low.contains("for shortcuts")
+        || low.contains("shift+tab")
+        || low.contains("ctrl+c to exit")
+        || low.contains("ctrl+d to exit")
+        || low.contains("type a prompt")
+        || low.contains("bypass permissions")
+        || low.contains("auto-accept")
+        || low.contains("context left")
+        || low.contains("tokens left")
+        || (low.contains("account:") && low.contains('|'))
+    {
+        return true;
+    }
+    false
+}
+
+fn is_polite_pty_signoff(line: &str) -> bool {
+    let low = line.to_ascii_lowercase();
+    const ZH_SIGNOFFS: &[&str] = &[
+        "还有什么需要",
+        "还有其他需要",
+        "还需要我做什么",
+        "还有什么可以帮",
+        "还有其他问题吗",
+        "还有什么问题吗",
+        "有其他问题吗",
+        "有其他需要吗",
+        "随时告诉我",
+        "随时联系我",
+    ];
+    if ZH_SIGNOFFS.iter().any(|p| line.contains(p)) {
+        return true;
+    }
+    const EN_SIGNOFFS: &[&str] = &[
+        "anything else",
+        "any other questions",
+        "how else can i help",
+        "can i help you with anything",
+        "let me know if you need anything",
+        "feel free to ask",
+        "happy to help",
+    ];
+    EN_SIGNOFFS.iter().any(|p| low.contains(p))
+}
+
+fn pty_line_ends_with_question(line: &str) -> bool {
+    let trimmed = line
+        .trim()
+        .trim_end_matches(|c: char| matches!(c, '*' | '_' | '`' | '"' | '\'' | '”' | '’' | ')' | '）' | ']' | '】' | '>'))
+        .trim();
+    if !(trimmed.ends_with('?') || trimmed.ends_with('？')) {
+        return false;
+    }
+    let last_token = trimmed.split_whitespace().last().unwrap_or("");
+    if last_token.contains("://") {
+        return false;
+    }
+    trimmed.chars().filter(|c| !c.is_whitespace() && !matches!(c, '?' | '？' | '-' | '*' | '#')).count() >= 2
+}
+
+fn pty_has_decision_request(line: &str) -> bool {
+    let low = line.to_ascii_lowercase();
+    const ZH_CUES: &[&str] = &[
+        "请选择",
+        "请确认",
+        "请先确认",
+        "请先选择",
+        "请你选择",
+        "请你确认",
+        "请告知",
+        "请告诉我",
+        "请回复",
+        "请决定",
+        "请指定",
+        "请提供",
+        "等你确认",
+        "等你决定",
+        "等你回复",
+        "等你选择",
+        "等待你确认",
+        "等待你的确认",
+        "等待你选择",
+        "等待你的选择",
+        "告诉我你的选择",
+        "你更倾向",
+        "您更倾向",
+        "你希望",
+        "您希望",
+        "回复数字",
+        "回复编号",
+        "输入编号",
+    ];
+    if ZH_CUES.iter().any(|p| line.contains(p)) {
+        return true;
+    }
+    const EN_CUES: &[&str] = &[
+        "please choose",
+        "please select",
+        "please confirm",
+        "please let me know",
+        "please specify",
+        "please clarify",
+        "please provide",
+        "please decide",
+        "please reply",
+        "choose an option",
+        "select an option",
+        "pick an option",
+        "pick one",
+        "reply with",
+        "let me know which",
+        "let me know how you'd like",
+        "let me know how you would like",
+        "let me know if you want me to",
+        "let me know if you'd like me to",
+        "tell me which",
+        "waiting for your confirmation",
+        "waiting for your input",
+        "waiting for your decision",
+        "before i proceed",
+        "before proceeding",
+    ];
+    EN_CUES.iter().any(|p| low.contains(p))
+}
+
+fn pty_is_option_line(line: &str) -> bool {
+    let t = line.trim_start_matches(|c: char| matches!(c, '-' | '*' | '•' | '❯' | '›' | '>' | '●' | '○' | '◉' | ' '));
+    let t = t.trim_start_matches(|c: char| matches!(c, '*' | '_' | '`'));
+    let low = t.to_ascii_lowercase();
+    let bytes = t.as_bytes();
+    let numbered = (bytes.len() >= 2 && bytes[0].is_ascii_digit() && matches!(bytes[1], b'.' | b')' | b':'))
+        || (bytes.len() >= 3 && bytes[0].is_ascii_digit() && t[1..].starts_with('、'));
+    let lettered = bytes.len() >= 2
+        && matches!(bytes[0], b'A'..=b'F' | b'a'..=b'f')
+        && (matches!(bytes[1], b'.' | b')' | b':') || t[1..].starts_with('：') || t[1..].starts_with('、'));
+    let named = t.starts_with("方案")
+        || t.starts_with("选项")
+        || low.starts_with("option ")
+        || low.starts_with("approach ")
+        || low.starts_with("choice ");
+    numbered || lettered || named
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum QuietBlockConfidence {
+    None,
+    /// Conversational question or choice phrase detected in assistant text; AI may confirm or correct.
+    AmbiguousText,
+    /// Explicit permission prompt or interactive selection picker UI; deterministically blocked.
+    ExplicitPrompt,
+}
+
+/// Classifies whether a quiet PTY screen tail needs user confirmation/choice and at what confidence tier.
+pub(crate) fn classify_quiet_tail_confirmation(tail_lines: &[String]) -> QuietBlockConfidence {
+    // 1. Direct tool permission & interactive picker UI cues (checked on raw tail).
+    let has_direct_ui_prompt = tail_lines.iter().any(|line| {
+        let l = line.to_ascii_lowercase();
+        l.contains("(y/n)")
+            || l.contains("[y/n]")
+            || l.contains("(yes/no)")
+            || l.contains("do you want to proceed")
+            || l.contains("do you want to allow")
+            || l.contains("allow once")
+            || l.contains("allow always")
+            || l.contains("yes, allow")
+            || l.contains("needs your approval")
+            || l.contains("waiting for approval")
+            || l.contains("approve this")
+            || l.contains("enter to select")
+            || l.contains("↑/↓ to navigate")
+            || l.contains("use arrow keys")
+            || l.contains("space to select")
+            || l.contains("select an option")
+            || line.contains("是否允许")
+            || line.contains("允许本次")
+            || line.contains("总是允许")
+            || line.contains("等待批准")
+            || line.contains("需要你的批准")
+            || line.contains("按回车确认")
+            || line.contains("按回车选择")
+            || line.contains("上下键选择")
+            || line.contains("方向键选择")
+    });
+    if has_direct_ui_prompt {
+        return QuietBlockConfidence::ExplicitPrompt;
+    }
+
+    // 2. Interactive numbered choice picker with cursor marker (e.g. `❯ 1. ...` + `2. ...`).
+    let has_cursor_numbered = tail_lines.iter().any(|line| {
+        let t = line.trim_start();
+        let after = t
+            .strip_prefix('❯')
+            .or_else(|| t.strip_prefix('›'))
+            .or_else(|| t.strip_prefix('●'))
+            .or_else(|| t.strip_prefix('◉'))
+            .map(str::trim_start);
+        after.is_some_and(|rest| {
+            let b = rest.as_bytes();
+            b.len() >= 2 && b[0].is_ascii_digit() && matches!(b[1], b'.' | b')')
+        })
+    });
+    let numbered_count = tail_lines.iter().filter(|l| pty_is_option_line(l)).count();
+    if has_cursor_numbered && numbered_count >= 2 {
+        return QuietBlockConfidence::ExplicitPrompt;
+    }
+
+    // 3. Conversational tail above TUI chrome/input box: question or choice request.
+    let content: Vec<&str> = tail_lines
+        .iter()
+        .map(String::as_str)
+        .filter(|l| !is_tui_chrome_or_footer_line(l))
+        .map(str::trim)
+        .collect();
+    let Some(&last) = content.last() else {
+        return QuietBlockConfidence::None;
+    };
+    if !is_polite_pty_signoff(last) && (pty_line_ends_with_question(last) || pty_has_decision_request(last)) {
+        return QuietBlockConfidence::AmbiguousText;
+    }
+    // Question or choice prompt paired with >= 2 option lines in the content tail.
+    let content_opts = content.iter().filter(|l| pty_is_option_line(l)).count();
+    if content_opts >= 2
+        && content.iter().rev().take(12).any(|&line| {
+            !pty_is_option_line(line)
+                && !is_polite_pty_signoff(line)
+                && (pty_line_ends_with_question(line)
+                    || pty_has_decision_request(line)
+                    || line.contains("方案")
+                    || line.contains("选项")
+                    || line.contains("选择"))
+        })
+    {
+        return QuietBlockConfidence::AmbiguousText;
+    }
+    QuietBlockConfidence::None
+}
+
+/// Detects permission prompts, interactive selection menus, and assistant questions/choices
+/// on a quiet PTY screen tail.
+pub(crate) fn tail_needs_user_confirmation(tail_lines: &[String]) -> bool {
+    classify_quiet_tail_confirmation(tail_lines) != QuietBlockConfidence::None
 }
 
 /// A live macOS screenshot thumbnail, dropped before it saved.
@@ -6057,6 +6352,54 @@ mod tests {
             "Do you want to allow this tool? (y/n)".to_owned(),
         ];
         assert_eq!(super::infer_pty_agent_state("", false, true, &blocked), "blocked");
+
+        // 6. Agent asks a question or asks the user to choose above the CLI prompt box -> blocked.
+        let question_above_footer = vec![
+            "这里有两种实现方式，你更倾向哪种方案？".to_owned(),
+            "1. 方案 A：仅修改前端".to_owned(),
+            "2. 方案 B：前后端联动修改".to_owned(),
+            "────────────────────────────────────────".to_owned(),
+            "❯ Try \"fix typecheck errors\"".to_owned(),
+            "  ? for shortcuts".to_owned(),
+        ];
+        assert_eq!(super::infer_pty_agent_state("", false, true, &question_above_footer), "blocked");
+
+        // 7. Interactive picker menu with cursor -> blocked.
+        let picker_menu = vec![
+            "Which database driver should we use?".to_owned(),
+            "❯ 1. PostgreSQL".to_owned(),
+            "  2. SQLite".to_owned(),
+            "Enter to select · ↑/↓ to navigate".to_owned(),
+        ];
+        assert_eq!(super::infer_pty_agent_state("", false, true, &picker_menu), "blocked");
+
+        // 8. Completed task summary with Claude Code `? for shortcuts` footer -> idle (not blocked!).
+        let completed_with_footer = vec![
+            "已完成修改并通过全部单元测试。".to_owned(),
+            "────────────────────────────────────────".to_owned(),
+            "❯ ".to_owned(),
+            "  ? for shortcuts".to_owned(),
+        ];
+        assert_eq!(super::infer_pty_agent_state("", false, true, &completed_with_footer), "idle");
+
+        // 9. Completed task with polite sign-off question -> idle (not blocked!).
+        let polite_signoff = vec![
+            "所有改动已完成并验证通过，还有什么需要帮忙的吗？".to_owned(),
+            "❯ ".to_owned(),
+        ];
+        assert_eq!(super::infer_pty_agent_state("", false, true, &polite_signoff), "idle");
+
+        // 10. Confidence tiers: explicit UI/picker prompts vs ambiguous conversational questions.
+        assert_eq!(super::classify_quiet_tail_confirmation(&blocked), super::QuietBlockConfidence::ExplicitPrompt);
+        assert_eq!(super::classify_quiet_tail_confirmation(&picker_menu), super::QuietBlockConfidence::ExplicitPrompt);
+        assert_eq!(
+            super::classify_quiet_tail_confirmation(&question_above_footer),
+            super::QuietBlockConfidence::AmbiguousText
+        );
+        assert_eq!(
+            super::classify_quiet_tail_confirmation(&completed_with_footer),
+            super::QuietBlockConfidence::None
+        );
     }
 
     #[gpui::test]
