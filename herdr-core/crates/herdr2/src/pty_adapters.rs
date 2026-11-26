@@ -507,6 +507,42 @@ pub fn ensure_claude_hooks_file(hooks_dir: &Path, h2_exe: &str) -> Result<PathBu
     Ok(path)
 }
 
+/// Normalizes a Windows executable path for Codex's TOML `-c notify=[...]` override.
+/// Forward slashes avoid `\\` escaping inside quoted strings, which MSYS2/Git Bash collapses
+/// into single backslashes (invalid TOML escapes) when parsing Windows command lines.
+fn normalize_codex_notify_exe(h2_exe: &str) -> String {
+    let trimmed = if let Some(rest) = h2_exe.strip_prefix(r"\\?\UNC\") {
+        return format!("//{}", rest.replace('\\', "/"));
+    } else if let Some(rest) = h2_exe.strip_prefix(r"\\?\") {
+        rest
+    } else {
+        h2_exe
+    };
+    let looks_windows_path = cfg!(windows)
+        || (trimmed.len() >= 3
+            && trimmed.as_bytes()[0].is_ascii_alphabetic()
+            && trimmed.as_bytes()[1] == b':'
+            && trimmed.as_bytes()[2] == b'\\')
+        || trimmed.starts_with(r"\\");
+    if looks_windows_path { trimmed.replace('\\', "/") } else { trimmed.to_string() }
+}
+
+/// Formats Codex's `-c notify=[...]` TOML array override.
+/// Uses single-quoted TOML literal strings when safe (no `'`) so Windows PowerShell 5.1's
+/// native-command double-quote stripping and `cmd.exe` batch shims cannot corrupt the array,
+/// falling back to JSON double-quoted strings otherwise.
+fn codex_notify_override(h2_exe: &str) -> String {
+    let exe = normalize_codex_notify_exe(h2_exe);
+    let parts = [exe.as_str(), "checkpoint", "hook", "--source", "codex-notify"];
+    if parts.iter().all(|p| !p.contains(['\'', '\r', '\n'])) {
+        let items = parts.iter().map(|p| format!("'{p}'")).collect::<Vec<_>>().join(",");
+        format!("notify=[{items}]")
+    } else {
+        let arr = serde_json::to_string(&parts).unwrap_or_default();
+        format!("notify={arr}")
+    }
+}
+
 /// Result of launch-time CLI instrumentation for a PTY terminal.
 #[derive(Clone, Debug)]
 pub struct PreparedPtyLaunch {
@@ -563,16 +599,8 @@ pub fn prepare_pty_launch(
             let has_notify = cmd_slice.windows(2).any(|w| w[0] == "-c" && w[1].starts_with("notify="))
                 || cmd_slice.iter().any(|a| a.starts_with("-cnotify=") || a.contains("notify=["));
             if !has_notify && can_append_flags {
-                let notify_arr = serde_json::to_string(&vec![
-                    h2_exe,
-                    "checkpoint".into(),
-                    "hook".into(),
-                    "--source".into(),
-                    "codex-notify".into(),
-                ])
-                .unwrap_or_default();
                 argv.push("-c".into());
-                argv.push(format!("notify={notify_arr}"));
+                argv.push(codex_notify_override(&h2_exe));
             }
         }
         PtyCliKind::Agy => {
@@ -974,16 +1002,8 @@ fn build_direct_cli_argv(
             if !out.iter().any(|a| a == "--no-daemon") {
                 out.push("--no-daemon".into());
             }
-            let notify_arr = serde_json::to_string(&vec![
-                h2_exe.to_string(),
-                "checkpoint".into(),
-                "hook".into(),
-                "--source".into(),
-                "codex-notify".into(),
-            ])
-            .unwrap_or_default();
             out.push("-c".into());
-            out.push(format!("notify={notify_arr}"));
+            out.push(codex_notify_override(h2_exe));
             out
         }
         PtyCliKind::Agy => {
@@ -3603,5 +3623,43 @@ mod tests {
         let saved = extract_saved_cli_from_argv(&bogus_argv, None, None, None).expect("agy saved");
         assert_eq!(saved.kind, "agy");
         assert_eq!(saved.session_id, None, "bogus transcript_full must not be captured as agy session_id");
+    }
+
+    #[test]
+    fn codex_notify_override_normalizes_windows_paths_for_git_bash_and_powershell() {
+        assert_eq!(
+            codex_notify_override(r"D:\Users\alice\AppData\Local\Programs\h2\h2.exe"),
+            "notify=['D:/Users/alice/AppData/Local/Programs/h2/h2.exe','checkpoint','hook','--source','codex-notify']"
+        );
+        assert_eq!(
+            codex_notify_override(r"\\?\C:\Program Files\Herdr2\h2.exe"),
+            "notify=['C:/Program Files/Herdr2/h2.exe','checkpoint','hook','--source','codex-notify']"
+        );
+        assert_eq!(
+            codex_notify_override(r"\\?\UNC\fileserver\share\h2.exe"),
+            "notify=['//fileserver/share/h2.exe','checkpoint','hook','--source','codex-notify']"
+        );
+        // Paths containing single quotes fall back to JSON double-quoted strings with forward slashes (no `\\`).
+        let apos = codex_notify_override(r"C:\Users\O'Brien\h2.exe");
+        assert_eq!(
+            apos,
+            "notify=[\"C:/Users/O'Brien/h2.exe\",\"checkpoint\",\"hook\",\"--source\",\"codex-notify\"]"
+        );
+        assert!(!apos.contains('\\'), "Windows codex notify must not emit backslashes: {apos}");
+
+        let dir = crate::test_tmp().join(format!("h2-codex-win-notify-{}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rebuilt = build_rollback_argv(
+            PtyCliKind::Codex,
+            &["codex".into(), "--no-daemon".into()],
+            &dir,
+            r"D:\Users\alice\AppData\Local\Programs\h2\h2.exe",
+            0,
+            None,
+        );
+        let notify = rebuilt.iter().find(|a| a.starts_with("notify=")).expect("notify arg");
+        assert!(!notify.contains('\\'), "rollback codex notify must not contain backslashes: {notify}");
+        assert!(notify.contains("D:/Users/alice/AppData/Local/Programs/h2/h2.exe"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

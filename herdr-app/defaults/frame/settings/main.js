@@ -2,7 +2,7 @@
 
 import { View, div, svg, image } from "gpui-kit";
 import { v_flex, h_flex, Scrollbar, InputState, Input, TextareaState, Textarea, Popup } from "gpui-base";
-import { hc, run, theme, themes, fonts, updates, settings, layouts, layout, spaces, keys, shared, setShared, appHome, readTextFile, writeTextFile, playSound, props, closeOverlay, notify, window, checking, knownAgents } from "herdr";
+import { hc, run, theme, themes, fonts, updates, settings, layouts, layout, spaces, keys, shared, setShared, home, appHome, readTextFile, writeTextFile, playSound, props, closeOverlay, notify, window, checking, knownAgents } from "herdr";
 import {
   SHORTCUT_GROUPS,
   defaultChordFor,
@@ -310,6 +310,13 @@ export default class Settings extends View {
     this.pendingUpdateCheckSeq = 0;
     this.updateModal = null;
     this.aiUpdateLaunching = false;
+    this.aiUpdateOpen = false;
+    this.aiUpdateAgent = null;
+    this.aiUpdateModel = null;
+    this.aiUpdateEffort = null;
+    this.aiUpdateExtraError = null;
+    this.aiUpdateLocalProbed = null;
+    this.aiUpdateCatalogLoading = false;
     this.skillData = null;
     this.skillMachine = null; // null = local, else SSH machine name
     this.skillLoading = false;
@@ -854,15 +861,22 @@ export default class Settings extends View {
               .when(Boolean(sizeKey), (el) => el.child(this.stepper(t, `st-${sizeKey}`, `${Math.round(sizeNow)}`, (_e, cx) => size(sizeKey, sizeNow, -1, cx), (_e, cx) => size(sizeKey, sizeNow, 1, cx)))),
           ),
         );
-    const isWin = window()?.platform === "windows";
+    const winInfo = typeof window === "function" ? window() : null;
+    const isWin = winInfo?.platform === "windows";
+    const installedWinShells = isWin && Array.isArray(winInfo?.shells)
+      ? new Set(winInfo.shells.map((sh) => String(sh).trim().toLowerCase()).filter(Boolean))
+      : null;
+    const allWinShellChoices = [
+      { value: "auto", label: this.tr("Auto (pwsh / PowerShell)", "自动（pwsh / PowerShell）"), meta: "default" },
+      { value: "powershell", label: "Windows PowerShell", meta: "powershell.exe" },
+      { value: "pwsh", label: "PowerShell 7 (pwsh)", meta: "pwsh.exe" },
+      { value: "git-bash", label: "Git Bash", meta: "bash.exe" },
+      { value: "cmd", label: this.tr("Command Prompt (cmd)", "命令提示符 (cmd)"), meta: "cmd.exe" },
+    ];
     const shellChoices = isWin
-      ? [
-          { value: "auto", label: this.tr("Auto (pwsh / PowerShell)", "自动（pwsh / PowerShell）"), meta: "default" },
-          { value: "powershell", label: "Windows PowerShell", meta: "powershell.exe" },
-          { value: "pwsh", label: "PowerShell 7 (pwsh)", meta: "pwsh.exe" },
-          { value: "git-bash", label: "Git Bash", meta: "bash.exe" },
-          { value: "cmd", label: this.tr("Command Prompt (cmd)", "命令提示符 (cmd)"), meta: "cmd.exe" },
-        ]
+      ? allWinShellChoices.filter(
+          (opt) => opt.value === "auto" || !installedWinShells || installedWinShells.size === 0 || installedWinShells.has(opt.value),
+        )
       : [
           { value: "auto", label: this.tr("Auto ($SHELL)", "自动（系统 $SHELL）"), meta: "default" },
           { value: "zsh", label: "zsh", meta: "zsh" },
@@ -872,8 +886,24 @@ export default class Settings extends View {
         ];
     const rawShell = String(p.shell ?? s.shell ?? "auto").trim() || "auto";
     const currentShell = isWin && rawShell.toLowerCase() === "wsl" ? "auto" : rawShell;
-    const shellItems = shellChoices.map((opt) => ({ ...opt, active: opt.value === currentShell }));
-    const currentShellLabel = shellChoices.find((opt) => opt.value === currentShell)?.label ?? currentShell;
+    const canonicalWinShell = isWin
+      ? (currentShell.toLowerCase() === "powershell7" ? "pwsh" : currentShell.toLowerCase() === "gitbash" || currentShell.toLowerCase() === "bash" ? "git-bash" : currentShell.toLowerCase())
+      : currentShell;
+    const missingWinShell = Boolean(
+      isWin &&
+      installedWinShells &&
+      installedWinShells.size > 0 &&
+      canonicalWinShell !== "auto" &&
+      ["powershell", "pwsh", "git-bash", "cmd"].includes(canonicalWinShell) &&
+      !installedWinShells.has(canonicalWinShell),
+    );
+    const shellItems = shellChoices.map((opt) => ({ ...opt, active: opt.value === (missingWinShell ? "auto" : canonicalWinShell) }));
+    const matchedShellLabel = allWinShellChoices.find((opt) => opt.value === canonicalWinShell)?.label
+      ?? shellChoices.find((opt) => opt.value === currentShell)?.label
+      ?? currentShell;
+    const currentShellLabel = missingWinShell
+      ? `${matchedShellLabel} · ${this.tr("missing (auto)", "未安装 · 自动回退")}`
+      : matchedShellLabel;
     return v_flex()
       .w_full()
       .child(this.heading(t, this.tr("Language", "语言")))
@@ -2024,6 +2054,12 @@ export default class Settings extends View {
     return all.find((s) => (s.machine ?? null) === targetMachine) ?? null;
   }
 
+  defaultHomeFolderForMachine(targetMachine = null) {
+    if (targetMachine) return "";
+    const localHome = typeof home === "function" ? String(home() ?? "").trim() : "";
+    return localHome || "~";
+  }
+
   canonicalFixAgentId(raw) {
     const id = String(raw ?? "").trim().toLowerCase();
     if (!id) return "";
@@ -2061,7 +2097,7 @@ export default class Settings extends View {
     return [...argv];
   }
 
-  droveFixAgentOptions() {
+  agentOptionsFrom(probedList, machineKey) {
     const prefOrder = [
       "claude",
       "agy",
@@ -2076,18 +2112,17 @@ export default class Settings extends View {
       "qoder",
       "dsh",
     ];
-    const machineKey = this.droveMachine ?? "__local__";
     const knownList = Array.isArray(this.droveFixKnownAgents?.[machineKey])
       ? this.droveFixKnownAgents[machineKey]
       : [];
     const byId = new Map();
 
-    for (const a of this.probedAgents()) {
+    for (const a of probedList ?? []) {
       const id = this.canonicalFixAgentId(a?.id);
       if (!id) continue;
       const argv = this.fixAgentFallbackArgv(id);
       const err = this.agentProbeError(a);
-      const models = this.probedModelsFor(a.id);
+      const models = this.probedModelsFromList(probedList, a.id);
       const prev = byId.get(id);
       if (!prev) {
         byId.set(id, {
@@ -2121,7 +2156,7 @@ export default class Settings extends View {
           name: p?.name || id,
           installed: Boolean(p?.installed),
           probeError: null,
-          models: this.probedModelsFor(id),
+          models: this.probedModelsFromList(probedList, id),
           argv: runArgv,
         });
       }
@@ -2149,6 +2184,25 @@ export default class Settings extends View {
         if (ra !== rb) return ra - rb;
         return a.id.localeCompare(b.id);
       });
+  }
+
+  droveFixAgentOptions() {
+    const machineKey = this.droveMachine ?? "__local__";
+    return this.agentOptionsFrom(this.probedAgents(), machineKey);
+  }
+
+  localProbedAgents() {
+    if (Array.isArray(this.aiUpdateLocalProbed) && this.aiUpdateLocalProbed.length > 0) {
+      return this.aiUpdateLocalProbed;
+    }
+    if ((this.droveMachine ?? null) === null && Array.isArray(this.droveData?.agents?.agents) && this.droveData.agents.agents.length > 0) {
+      return this.droveData.agents.agents;
+    }
+    return DROVE_FALLBACK_AGENTS.map((id) => ({ id, name: id, installed: false, models: [], efforts: [] }));
+  }
+
+  aiUpdateAgentOptions() {
+    return this.agentOptionsFrom(this.localProbedAgents(), "__local__");
   }
 
   droveFixEffortDisabledReason(agentId, modelId) {
@@ -2292,6 +2346,7 @@ export default class Settings extends View {
     }
 
     if (want) {
+      const opts = targetMachine === null ? this.aiUpdateAgentOptions() : this.droveFixAgentOptions();
       if (Array.isArray(knownList)) {
         const matched = knownList.find(
           (p) => this.canonicalFixAgentId(p?.key) === want && Array.isArray(p?.run) && p.run.length > 0,
@@ -2300,12 +2355,12 @@ export default class Settings extends View {
           const argv = this.normalizeFixAgentArgv(want, matched.run);
           if (argv) return { id: want, name: matched.name || want, argv };
         }
-        const opt = this.droveFixAgentOptions().find((o) => o.id === want);
+        const opt = opts.find((o) => o.id === want);
         if (opt?.argv) {
           return { id: want, name: matched?.name || opt.name || want, argv: opt.argv };
         }
       }
-      const opt = this.droveFixAgentOptions().find((o) => o.id === want);
+      const opt = opts.find((o) => o.id === want);
       if (opt?.argv) return { id: want, name: opt.name || want, argv: opt.argv };
       const fallbackArgv = this.fixAgentFallbackArgv(want);
       if (fallbackArgv) return { id: want, name: want, argv: fallbackArgv };
@@ -2383,7 +2438,12 @@ export default class Settings extends View {
         const prompt = this.buildDroveProbeFixPrompt(summary.errored, this.droveProbeAiResult);
         const tabName = this.tr("Fix Drove Agents", "排查 Drove 异常");
         const targetSpace = this.targetSpaceForDroveMachine();
-        const launchArgs = { name: tabName, argv: picked.argv, task: prompt };
+        const launchArgs = {
+          name: tabName,
+          folder: this.defaultHomeFolderForMachine(targetMachine),
+          argv: picked.argv,
+          task: prompt,
+        };
         if (cleanModel) launchArgs.model = cleanModel;
         if (cleanEffort) launchArgs.effort = cleanEffort;
         if (targetSpace) {
@@ -2422,11 +2482,12 @@ export default class Settings extends View {
     if (!Array.isArray(commandArgv) || commandArgv.length === 0) return;
     const targetMachine = this.droveMachine ?? null;
     const tabName = label || this.tr("Fix Agent", "修复 Agent");
+    const folder = this.defaultHomeFolderForMachine(targetMachine);
     const targetSpace = this.targetSpaceForDroveMachine();
     if (targetSpace) {
-      run("tab.new", { space: targetSpace.id, name: tabName, argv: commandArgv });
+      run("tab.new", { space: targetSpace.id, name: tabName, folder, argv: commandArgv });
     } else {
-      const args = { name: tabName, tab: tabName, argv: commandArgv };
+      const args = { name: tabName, tab: tabName, folder, argv: commandArgv };
       if (targetMachine) args.machine = targetMachine;
       run("space.new", args);
     }
@@ -2732,8 +2793,9 @@ export default class Settings extends View {
     return { total: agents.length, installed, ready, errored, missing };
   }
 
-  probedModelsFor(agentId) {
-    const a = this.probedAgents().find((x) => x.id === agentId);
+  probedModelsFromList(agentsList, agentId) {
+    const canon = this.canonicalFixAgentId(agentId);
+    const a = (agentsList ?? []).find((x) => x?.id === agentId || this.canonicalFixAgentId(x?.id) === canon);
     const out = [];
     const seen = new Set();
     for (const raw of a?.models ?? []) {
@@ -2744,6 +2806,10 @@ export default class Settings extends View {
       out.push({ id, label: name && name !== id ? `${id} · ${name}` : id });
     }
     return out;
+  }
+
+  probedModelsFor(agentId) {
+    return this.probedModelsFromList(this.probedAgents(), agentId);
   }
 
   aiAvailableModels() {
@@ -3107,10 +3173,12 @@ export default class Settings extends View {
     return DROVE_EFFORTS.filter((e) => set.has(e));
   }
 
-  supportedEffortsFor(agentId, modelId) {
+  supportedEffortsFor(agentId, modelId, probedList = null) {
     const three = ["low", "medium", "high"];
     const four = ["low", "medium", "high", "xhigh"];
-    const probed = this.probedAgents().find((a) => a.id === agentId);
+    const agents = Array.isArray(probedList) ? probedList : this.probedAgents();
+    const canon = this.canonicalFixAgentId(agentId);
+    const probed = agents.find((a) => a?.id === agentId || this.canonicalFixAgentId(a?.id) === canon);
     const rawModel = String(modelId ?? "").trim();
     const base = this.normalizeCursorBaseModel(rawModel).toLowerCase();
 
@@ -3183,8 +3251,8 @@ export default class Settings extends View {
       : three;
   }
 
-  clampEffortFor(agentId, modelId, effort) {
-    const allowed = this.supportedEffortsFor(agentId, modelId);
+  clampEffortFor(agentId, modelId, effort, probedList = null) {
+    const allowed = this.supportedEffortsFor(agentId, modelId, probedList);
     const cur = effort ?? "high";
     if (allowed.includes(cur)) return cur;
     if (cur === "xhigh" && allowed.includes("high")) return "high";
@@ -7296,14 +7364,19 @@ export default class Settings extends View {
         ...(remoteSummaryLines.length > 0 ? ["", "已配置的 SSH 远程主机：", ...remoteSummaryLines] : []),
         ...(errors.length > 0 ? ["", "失败/异常上下文：", ...errors.map((e) => `- ${e}`)] : []),
         "",
+        "重要防中断规则（务必遵守）：",
+        "- 你当前运行在 `herdr2-core` 的独立 PTY holder 进程内：更新 `herdr2-core` 时必须使用 `h2 update --from <file>` 或 `h2 server restart`（会移交 holder，保持当前终端和你不中断）；严禁执行 `h2 server stop`、`pkill -f herdr2`、`killall herdr2` 或 `taskkill /IM herdr2*`（会误杀 `herdr2-core` / holder 导致当前更新中途终止）。",
+        "- 更新过程中不要中途重启或强杀 `herdr2` 桌面窗口；在 Windows 上优先下载压缩包并原地改名替换（如将正在运行的 `herdr2.exe` 改名为 `herdr2.exe.old` 再放入新文件，或写入 `.new` + `.new.json` 供重启切换），避免静默运行会强制关闭进程的 `.exe` 安装向导。",
+        "- 请先完整做完下载校验、更新本机 `herdr2-core`、同步 SSH 远程主机、替换本机 `herdr2` 文件以及版本验证，直到全部完成后再告知我重启 Herdr2 桌面窗口（不要在中间步骤重启窗口）。",
+        "",
         "请按以下步骤安全执行：",
         "1. 若上方有报错（如网络代理、TLS/证书、权限、GitHub 访问受限等），先排查原因并选择可用方式（如检查环境变量代理、`gh release`、GitHub API 或 `curl`）查询 https://github.com/herdr2/herdr2/releases 上的最新版本与 `ota-latest` 清单（`app-latest.json`、`core-latest.json`）。",
-        "2. 检查本机 `herdr2` 与 `herdr2-core`（`h2`）当前的安装路径与安装方式（如 Linux `.deb` `/opt/herdr2` 或 `~/.local/share/herdr2`、`~/.local/bin/h2`；macOS `Herdr2.app` / Homebrew；Windows `%LOCALAPPDATA%\\Programs\\herdr2` 与 `h2`）。",
-        "3. 从 GitHub Releases 下载与本机系统/架构匹配的最新安装包或二进制并校验 SHA-256，更新本机 `herdr2` 和 `herdr2-core`（注意尽量通过 `h2 update --from <file>` 或 `h2 server restart` 保持现有终端会话存活；如需管理员密码/提权请清晰提示或引导）。",
+        "2. 检查本机 `herdr2` 与 `herdr2-core`（`h2`）当前的安装路径与安装方式（如 Linux `.deb` `/opt/herdr2` 或 `~/.local/share/herdr2`、`~/.local/bin/h2`；macOS `Herdr2.app` / Homebrew；Windows `%LOCALAPPDATA%\\Programs\\herdr2` 与 `%LOCALAPPDATA%\\Programs\\h2`）。",
+        "3. 从 GitHub Releases 下载与本机系统/架构匹配的最新压缩包/安装包并校验 SHA-256；先用 `h2 update --from <file>`（或 `h2 server restart`）无中断更新本机 `herdr2-core`，再在磁盘上安全替换/安装 `herdr2` 桌面端文件（如需管理员密码/sudo 请清晰提示或引导）。",
         ...(remoteSummaryLines.length > 0
           ? ["4. 本机 `herdr2-core` 更新完成后，对可达的 SSH 远程主机执行 `h2 machine update <主机名>` 同步更新，并报告不可达主机的 `needs_update` 原因。"]
           : []),
-        `${remoteSummaryLines.length > 0 ? "5" : "4"}. 最后运行 \`herdr2 --version\`、\`h2 --version\`、\`h2 server status\`${remoteSummaryLines.length > 0 ? " 与 `h2 machine ls`" : ""} 验证更新结果，并说明是否需要重启 Herdr2 桌面窗口。`,
+        `${remoteSummaryLines.length > 0 ? "5" : "4"}. 最后运行 \`herdr2 --version\`、\`h2 --version\`、\`h2 server status\`${remoteSummaryLines.length > 0 ? " 与 `h2 machine ls`" : ""} 验证更新结果；全部验证通过后再提示我重启 Herdr2 桌面窗口以加载新版本界面。`,
       ].join("\n");
     }
 
@@ -7319,26 +7392,164 @@ export default class Settings extends View {
       ...(remoteSummaryLines.length > 0 ? ["", "Configured SSH remote hosts:", ...remoteSummaryLines] : []),
       ...(errors.length > 0 ? ["", "Failure / error context:", ...errors.map((e) => `- ${e}`)] : []),
       "",
+      "CRITICAL — do not interrupt this session mid-update:",
+      "- You are running inside a detached `herdr2-core` PTY holder: always update `herdr2-core` with `h2 update --from <file>` or `h2 server restart` (which hands over live holders without killing you). NEVER run `h2 server stop`, `pkill -f herdr2`, `killall herdr2`, or `taskkill /IM herdr2*` (which can kill `herdr2-core` / its holder and abort this session halfway).",
+      "- Do NOT restart or kill the `herdr2` desktop GUI mid-update. On Windows, prefer updating from the release archive by renaming `herdr2.exe` -> `herdr2.exe.old` in place (or staging `.new` + `.new.json`) rather than running an interactive `.exe` installer that force-closes running Herdr2 processes.",
+      "- Finish all download, verification, local `herdr2-core` update, SSH remote sync, local `herdr2` file replacement, and version checks BEFORE asking me to restart the Herdr2 window.",
+      "",
       "Please follow these steps:",
       "1. If there are errors above (proxy, TLS, permissions, GitHub connectivity), diagnose them and fetch the latest release metadata from https://github.com/herdr2/herdr2/releases (including `ota-latest` manifests `app-latest.json` / `core-latest.json`, GitHub API, or `gh release`).",
-      "2. Inspect how `herdr2` and `herdr2-core` (`h2`) are currently installed on this machine (e.g. `/opt/herdr2` `.deb` vs `~/.local/share/herdr2` & `~/.local/bin/h2`, macOS `Herdr2.app`/Homebrew, Windows `%LOCALAPPDATA%\\Programs\\herdr2` & `h2`).",
-      "3. Download the matching OS/architecture release from GitHub, verify SHA-256, and update both local `herdr2` and `herdr2-core` (keep running terminals alive via `h2 update --from <file>` / `h2 server restart`; prompt clearly if elevation/sudo is needed).",
+      "2. Inspect how `herdr2` and `herdr2-core` (`h2`) are currently installed on this machine (e.g. `/opt/herdr2` `.deb` vs `~/.local/share/herdr2` & `~/.local/bin/h2`, macOS `Herdr2.app`/Homebrew, Windows `%LOCALAPPDATA%\\Programs\\herdr2` & `%LOCALAPPDATA%\\Programs\\h2`).",
+      "3. Download the matching OS/architecture release from GitHub, verify SHA-256, update local `herdr2-core` safely via `h2 update --from <file>` / `h2 server restart`, and update local `herdr2` files on disk without restarting the GUI mid-update (prompt clearly if elevation/sudo is needed).",
       ...(remoteSummaryLines.length > 0
         ? ["4. After local `herdr2-core` is updated, sync reachable SSH remote hosts via `h2 machine update <name>` and report any unreachable `needs_update` hosts."]
         : []),
-      `${remoteSummaryLines.length > 0 ? "5" : "4"}. Verify with \`herdr2 --version\`, \`h2 --version\`, \`h2 server status\`${remoteSummaryLines.length > 0 ? ", and `h2 machine ls`" : ""}, and let me know if restarting the Herdr2 window is needed.`,
+      `${remoteSummaryLines.length > 0 ? "5" : "4"}. Verify with \`herdr2 --version\`, \`h2 --version\`, \`h2 server status\`${remoteSummaryLines.length > 0 ? ", and `h2 machine ls`" : ""}, and only after everything succeeds, let me know to restart the Herdr2 window.`,
     ].join("\n");
   }
 
-  launchAiUpdate(cx, extraError = null) {
+  ensureAiUpdateSelection() {
+    const options = this.aiUpdateAgentOptions();
+    const localProbed = this.localProbedAgents();
+    const curId = this.canonicalFixAgentId(this.aiUpdateAgent);
+    let chosen = curId ? options.find((o) => o.id === curId) : null;
+    if (!chosen) {
+      chosen = options.find((o) => o.ready) ?? options.find((o) => o.installed) ?? options[0] ?? null;
+      this.aiUpdateAgent = chosen?.id ?? null;
+      this.aiUpdateModel = null;
+    } else if (this.aiUpdateAgent !== chosen.id) {
+      this.aiUpdateAgent = chosen.id;
+    }
+    const agent = chosen?.id ?? null;
+    const model = String(this.aiUpdateModel ?? "").trim() || null;
+    const disabledReason = agent ? this.droveFixEffortDisabledReason(agent, model) : null;
+    if (agent && this.aiUpdateEffort && !disabledReason) {
+      this.aiUpdateEffort = this.clampEffortFor(agent, model, this.aiUpdateEffort, localProbed);
+    }
+    return {
+      agent,
+      model,
+      effort: this.aiUpdateEffort ?? null,
+      disabledReason,
+      option: chosen,
+      options,
+      localProbed,
+    };
+  }
+
+  setAiUpdateAgent(agentId, cx) {
+    const next = this.canonicalFixAgentId(agentId);
+    if (!next) return;
+    this.aiUpdateAgent = next;
+    this.aiUpdateModel = null;
+    if (this.aiUpdateEffort && !this.droveFixEffortDisabledReason(next, null)) {
+      this.aiUpdateEffort = this.clampEffortFor(next, null, this.aiUpdateEffort, this.localProbedAgents());
+    }
+    cx?.notify?.();
+  }
+
+  setAiUpdateModel(modelId, cx) {
+    const next = String(modelId ?? "").trim() || null;
+    this.aiUpdateModel = next;
+    const agent = this.canonicalFixAgentId(this.aiUpdateAgent);
+    if (agent && this.aiUpdateEffort && !this.droveFixEffortDisabledReason(agent, next)) {
+      this.aiUpdateEffort = this.clampEffortFor(agent, next, this.aiUpdateEffort, this.localProbedAgents());
+    }
+    cx?.notify?.();
+  }
+
+  setAiUpdateEffort(effort, cx) {
+    const raw = String(effort ?? "").trim().toLowerCase();
+    if (!raw || raw === "auto" || raw === "default") {
+      this.aiUpdateEffort = null;
+    } else {
+      const agent = this.canonicalFixAgentId(this.aiUpdateAgent);
+      this.aiUpdateEffort = agent
+        ? this.clampEffortFor(agent, this.aiUpdateModel, raw, this.localProbedAgents())
+        : raw;
+    }
+    cx?.notify?.();
+  }
+
+  loadAiUpdateCatalog(cx) {
+    if ((typeof checking === "function" && checking()) || this.aiUpdateCatalogLoading) return;
+    const needKnown = typeof knownAgents === "function" && !Array.isArray(this.droveFixKnownAgents?.["__local__"]);
+    const hasLocalProbed =
+      (Array.isArray(this.aiUpdateLocalProbed) && this.aiUpdateLocalProbed.length > 0) ||
+      ((this.droveMachine ?? null) === null && Array.isArray(this.droveData?.agents?.agents) && this.droveData.agents.agents.length > 0);
+    const needProbed = !hasLocalProbed && typeof hc === "function";
+    if (!needKnown && !needProbed) return;
+    this.aiUpdateCatalogLoading = true;
+    cx?.notify?.();
+    cx.spawn(async (spawnCx) => {
+      try {
+        await Promise.all([
+          needKnown
+            ? (async () => {
+                try {
+                  const list = await knownAgents({});
+                  if (Array.isArray(list)) {
+                    this.droveFixKnownAgents = { ...(this.droveFixKnownAgents ?? {}), __local__: list };
+                  }
+                } catch {}
+              })()
+            : Promise.resolve(),
+          needProbed
+            ? (async () => {
+                try {
+                  const snap = await this.droveHcJson(["drove", "probe"], { local: true, timeout: 15000 });
+                  if (Array.isArray(snap?.agents) && snap.agents.length > 0) {
+                    this.aiUpdateLocalProbed = snap.agents;
+                  }
+                } catch {}
+              })()
+            : Promise.resolve(),
+        ]);
+        this.ensureAiUpdateSelection();
+      } finally {
+        this.aiUpdateCatalogLoading = false;
+        spawnCx?.notify?.();
+      }
+    });
+  }
+
+  openAiUpdatePanel(cx, extraError = null) {
+    this.updateModal = null;
+    this.aiUpdateOpen = true;
+    if (extraError !== undefined) {
+      this.aiUpdateExtraError = extraError || null;
+    }
+    this.ensureAiUpdateSelection();
+    this.loadAiUpdateCatalog(cx);
+    cx?.notify?.();
+  }
+
+  toggleAiUpdatePanel(cx, extraError = null) {
+    if (this.aiUpdateOpen) {
+      this.aiUpdateOpen = false;
+      if (typeof this.picking === "string" && this.picking.startsWith("drove:ai-update-")) {
+        this.picking = null;
+        this.droveModelSubmit = null;
+      }
+      cx?.notify?.();
+      return;
+    }
+    this.openAiUpdatePanel(cx, extraError);
+  }
+
+  launchAiUpdate(cx, extraError = null, override = null) {
     if (this.aiUpdateLaunching) return;
     const u = typeof updates === "function" ? updates() : {};
+    const effectiveError = extraError !== null && extraError !== undefined ? extraError : this.aiUpdateExtraError;
+    const selectedAgent = override?.agent !== undefined ? override.agent : this.aiUpdateAgent;
+    const selectedModel = override?.model !== undefined ? override.model : this.aiUpdateModel;
+    const selectedEffort = override?.effort !== undefined ? override.effort : this.aiUpdateEffort;
     this.updateModal = null;
     this.aiUpdateLaunching = true;
     cx?.notify?.();
     cx.spawn(async (spawnCx) => {
       try {
-        const picked = await this.resolveFixAgentLaunch(null, []);
+        const picked = await this.resolveFixAgentLaunch(null, [], selectedAgent);
         if (!picked) {
           notify({
             title: this.tr("No local CLI AI agent found", "未找到本机可用的 AI Agent"),
@@ -7350,20 +7561,39 @@ export default class Settings extends View {
           });
           return;
         }
-        const prompt = this.buildAiUpdatePrompt(u, extraError);
+        const pickedId = this.canonicalFixAgentId(picked.id || selectedAgent || picked.name);
+        const cleanModel = pickedId === "zcode" ? null : (String(selectedModel ?? "").trim() || null);
+        const effortDisabled = Boolean(this.droveFixEffortDisabledReason(pickedId, cleanModel));
+        const cleanEffort = !effortDisabled && selectedEffort
+          ? this.clampEffortFor(pickedId, cleanModel, selectedEffort, this.localProbedAgents())
+          : null;
+        const prompt = this.buildAiUpdatePrompt(u, effectiveError);
         const tabName = this.tr("AI Update Herdr2", "AI 更新 Herdr2");
         const localSpace = this.localWorkspaceSpace();
+        const launchArgs = {
+          name: tabName,
+          folder: this.defaultHomeFolderForMachine(null),
+          argv: picked.argv,
+          task: prompt,
+        };
+        if (cleanModel) launchArgs.model = cleanModel;
+        if (cleanEffort) launchArgs.effort = cleanEffort;
         if (localSpace) {
-          run("tab.new", { space: localSpace.id, name: tabName, argv: picked.argv, task: prompt });
+          run("tab.new", { space: localSpace.id, ...launchArgs });
         } else {
-          run("space.new", { name: tabName, tab: tabName, argv: picked.argv, task: prompt });
+          run("space.new", { ...launchArgs, tab: tabName });
         }
+        this.aiUpdateOpen = false;
+        this.aiUpdateExtraError = null;
         this.close();
+        const metaParts = [cleanModel, cleanEffort ? this.effortLabel(cleanEffort) : null].filter(Boolean);
+        const metaEn = metaParts.length > 0 ? ` (${metaParts.join(" · ")})` : "";
+        const metaZh = metaParts.length > 0 ? `（${metaParts.join(" · ")}）` : "";
         notify({
-          title: this.tr(`Launched ${picked.name} for AI Update`, `已启动 ${picked.name} 执行 AI 更新`),
+          title: this.tr(`Launched ${picked.name}${metaEn} for AI Update`, `已启动 ${picked.name}${metaZh} 执行 AI 更新`),
           body: this.tr(
-            "Downloading and updating Herdr2 / herdr2-core from GitHub in a local workspace tab.",
-            "正在本机工作区标签页中从 GitHub 获取并更新最新版本。",
+            "Downloading and updating Herdr2 / herdr2-core from GitHub in a persistent local workspace tab.",
+            "正在本机持久化终端标签页中从 GitHub 获取并更新最新版本。",
           ),
         });
       } catch (e) {
@@ -7528,7 +7758,7 @@ export default class Settings extends View {
             this.tr("✨ AI Update", "✨ AI 更新"),
             (_e, c) => {
               c.stop_propagation();
-              this.launchAiUpdate(c);
+              this.openAiUpdatePanel(c, null);
             },
           ),
         )
@@ -7570,7 +7800,7 @@ export default class Settings extends View {
             .hover((s) => s.opacity(0.9))
             .on_click((_e, c) => {
               c.stop_propagation();
-              this.launchAiUpdate(c, m.message);
+              this.openAiUpdatePanel(c, m.message);
             })
             .child(this.tr("✨ AI Update from GitHub", "✨ AI 从 GitHub 更新")),
         );
@@ -7713,6 +7943,7 @@ export default class Settings extends View {
             .child(this.tr("Check for Updates", "检查更新"));
 
     const updateErr = u.app?.error || u.ui?.error || (!c.managed ? c.error : null) || u.last_error;
+    const aiPanelOpen = Boolean(this.aiUpdateOpen);
 
     const aiUpdateBtn = h_flex()
       .id("st-ai-update")
@@ -7722,29 +7953,299 @@ export default class Settings extends View {
       .items_center()
       .rounded(7)
       .border_1()
-      .border_color(t.border)
-      .bg(t.raised)
+      .border_color(aiPanelOpen ? t.accent : t.border)
+      .bg(aiPanelOpen ? t.accent : t.raised)
       .text_size(13)
-      .text_color(t.foreground)
+      .when(aiPanelOpen, (el) => el.font_semibold())
+      .text_color(aiPanelOpen ? t.accent_foreground : t.foreground)
       .tooltip(
         this.tr(
-          "If manual update fails, launch a local AI coding agent to download and install the latest release from GitHub",
-          "手动更新失败时，调用本机 AI Agent 直接从 GitHub 下载并更新到最新版本",
+          "Choose a local AI agent, model, and reasoning effort to download and install the latest release from GitHub",
+          "选择本机 AI Agent 类型、模型与思考强度，从 GitHub 获取并更新到最新版本",
         ),
       )
       .when(this.aiUpdateLaunching, (el) => el.opacity(0.6))
       .when(!this.aiUpdateLaunching, (el) =>
         el
           .cursor_pointer()
-          .hover((s) => s.bg(t.hover))
-          .on_click((_e, c) => this.launchAiUpdate(c, updateErr)),
+          .when(!aiPanelOpen, (el2) => el2.hover((s) => s.bg(t.hover)))
+          .when(aiPanelOpen, (el2) => el2.hover((s) => s.opacity(0.92)))
+          .on_click((_e, c) => this.toggleAiUpdatePanel(c, updateErr)),
       )
       .child(
         this.aiUpdateLaunching
-          ? svg("mods/workspace-chrome/spinner.svg").size(13).flex_none().spin(900)
-          : svg(I("sparkles")).size(13).flex_none().text_color(t.accent),
+          ? svg("mods/workspace-chrome/spinner.svg")
+              .size(13)
+              .flex_none()
+              .text_color(aiPanelOpen ? t.accent_foreground : t.foreground)
+              .spin(900)
+          : svg(I("sparkles")).size(13).flex_none().text_color(aiPanelOpen ? t.accent_foreground : t.accent),
       )
       .child(this.aiUpdateLaunching ? this.tr("Launching AI…", "启动 AI 中…") : this.tr("AI Update", "AI 更新"));
+
+    const renderAiUpdatePanel = () => {
+      const sel = this.ensureAiUpdateSelection();
+      const curAgent = sel.agent ?? "";
+      const curOpt = sel.option;
+      const curModel = sel.model;
+      const curEffort = sel.effort;
+      const effortDisabledReason = sel.disabledReason;
+      const disableEffort = Boolean(effortDisabledReason);
+      const isZcode = curAgent === "zcode";
+      const agentItems = sel.options.map((o) => ({
+        value: o.id,
+        label: o.name && o.name !== o.id ? `${o.name} (${o.id})` : o.id,
+        icon: o.id,
+        dot: Boolean(o.installed),
+        dotColor: !o.installed ? t.dim : o.probeError ? t.working : t.ansi2,
+        meta: !o.installed
+          ? this.tr("missing", "未安装")
+          : o.probeError
+            ? this.tr("ACP err · CLI", "ACP 异常 · CLI")
+            : o.models.length > 0
+              ? `${o.models.length} ${this.tr("models", "模型")}`
+              : "✓",
+        metaColor: o.probeError ? t.working : t.dim,
+        tooltip: o.probeError ? this.formatAgentProbeError(o.probeError) : undefined,
+        active: curAgent === o.id,
+      }));
+      const models = curOpt?.models?.length
+        ? curOpt.models
+        : (curAgent ? this.probedModelsFromList(sel.localProbed, curAgent) : []);
+      const modelItems = [
+        { value: null, label: this.tr("Auto (agent default)", "自动（Agent 默认）"), active: !curModel },
+        ...models.map((m) => ({
+          value: m.id,
+          label: m.label,
+          active: curModel === m.id,
+        })),
+      ];
+      if (curModel && !models.some((m) => m.id === curModel)) {
+        modelItems.splice(1, 0, {
+          value: curModel,
+          label: curModel,
+          meta: this.tr("custom", "自定义"),
+          active: true,
+        });
+      }
+      const efforts = curAgent ? this.supportedEffortsFor(curAgent, curModel, sel.localProbed) : ["low", "medium", "high"];
+      const effortChoices = [null, ...efforts];
+      const canLaunch = Boolean(curOpt && !this.aiUpdateLaunching);
+      const footerHint = isZcode
+        ? this.tr(
+            "Note: ZCode ignores startup --model/--effort flags; select model inside its TUI.",
+            "提示：ZCode 不支持启动参数传入模型与思考强度，进入后需在 TUI 内切换。",
+          )
+        : curAgent === "cursor" && !curModel
+          ? this.tr(
+              "Tip: Select a specific Cursor model to apply custom reasoning effort.",
+              "提示：Cursor 需先指定具体模型才能生效自定义思考强度。",
+            )
+          : this.tr(
+              "Runs in a persistent local PTY tab (survives GUI / h2 server restart); updates files & remotes first and only asks to restart Herdr2 at the end.",
+              "在本机持久化 PTY 标签页中运行（不因桌面端或 h2 server restart 中断）；完成全部更新与校验后才提示重启窗口。",
+            );
+
+      return v_flex()
+        .id("st-ai-update-panel")
+        .w_full()
+        .px(12)
+        .py(10)
+        .gap(8)
+        .rounded(8)
+        .border_1()
+        .border_color(t.accent)
+        .bg(t.background)
+        .child(
+          h_flex()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap(8)
+            .child(
+              h_flex()
+                .gap(6)
+                .items_center()
+                .child(svg(I("sparkles")).size(13).flex_none().text_color(t.accent))
+                .child(
+                  div()
+                    .text_size(12.5)
+                    .font_semibold()
+                    .text_color(t.foreground)
+                    .child(
+                      this.tr(
+                        "AI Update · Choose Agent, Model & Reasoning Effort",
+                        "AI 更新 · 选择 Agent 类型、模型与思考强度",
+                      ),
+                    ),
+                ),
+            )
+            .child(
+              div()
+                .id("st-ai-update-close")
+                .px(6)
+                .py(1)
+                .rounded(4)
+                .cursor_pointer()
+                .text_size(12)
+                .text_color(t.dim)
+                .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                .on_click((_e, c) => this.toggleAiUpdatePanel(c))
+                .child("×"),
+            ),
+        )
+        .child(
+          h_flex()
+            .w_full()
+            .gap(6)
+            .items_center()
+            .flex_wrap()
+            .child(
+              this.drovePicker(
+                t,
+                "ai-update-agent",
+                curOpt ? (curOpt.name || curOpt.id) : this.tr("Select agent…", "选择 Agent…"),
+                agentItems,
+                (agent, c) => this.setAiUpdateAgent(agent, c),
+                {
+                  width: 148,
+                  popupWidth: 290,
+                  icon: curAgent || undefined,
+                  dot: curOpt ? Boolean(curOpt.installed) : undefined,
+                  dotColor: !curOpt ? undefined : !curOpt.installed ? t.dim : curOpt.probeError ? t.working : t.ansi2,
+                  tooltip: this.tr("Choose which local CLI agent to launch for AI Update", "选择用于执行 AI 更新的本机 Agent 类型"),
+                },
+                cx,
+              ),
+            )
+            .child(
+              this.drovePicker(
+                t,
+                "ai-update-model",
+                curModel || this.tr("Auto (default)", "自动（默认）"),
+                modelItems,
+                (model, c) => this.setAiUpdateModel(model, c),
+                {
+                  flex1: true,
+                  width: 150,
+                  popupWidth: 360,
+                  allowCustom: true,
+                  tooltip: isZcode
+                    ? effortDisabledReason
+                    : this.tr("Choose model or type a custom model ID", "选择模型或输入自定义模型 ID"),
+                },
+                cx,
+              ),
+            )
+            .child(
+              h_flex()
+                .id("st-ai-update-eff-group")
+                .w(effortChoices.length >= 5 ? 196 : 164)
+                .min_w(effortChoices.length >= 5 ? 196 : 164)
+                .h(28)
+                .flex_none()
+                .p(2)
+                .gap(1)
+                .items_center()
+                .rounded(7)
+                .border_1()
+                .border_color(t.border)
+                .bg(t.surface)
+                .when(disableEffort, (el) => el.opacity(0.35).tooltip(effortDisabledReason))
+                .when(!disableEffort, (el) => el.tooltip(this.tr("Reasoning effort level", "选择模型思考强度")))
+                .children(
+                  effortChoices.map((eff) => {
+                    const effKey = eff ?? "auto";
+                    const active = !disableEffort && (eff === null ? !curEffort : curEffort === eff);
+                    const label = eff === null ? this.tr("Auto", "默认") : this.effortLabel(eff);
+                    return div()
+                      .id(`st-ai-update-eff-${effKey}`)
+                      .flex_1()
+                      .min_w(0)
+                      .h(22)
+                      .px(3)
+                      .flex()
+                      .items_center()
+                      .justify_center()
+                      .rounded(5)
+                      .bg(active ? t.accent : "#00000000")
+                      .text_size(11)
+                      .when(active, (el) => el.font_semibold())
+                      .text_color(disableEffort ? t.dim : (active ? t.accent_foreground : t.muted))
+                      .when(!disableEffort, (el) =>
+                        el
+                          .cursor_pointer()
+                          .when(!active, (el2) => el2.hover((s) => s.bg(t.hover).text_color(t.foreground)))
+                          .on_click((_e, c) => this.setAiUpdateEffort(eff, c)),
+                      )
+                      .child(label);
+                  }),
+                ),
+            ),
+        )
+        .child(
+          h_flex()
+            .w_full()
+            .items_center()
+            .justify_between()
+            .gap(8)
+            .flex_wrap()
+            .child(
+              div()
+                .flex_1()
+                .min_w(0)
+                .text_size(11.5)
+                .line_height("16px")
+                .text_color(t.dim)
+                .child(footerHint),
+            )
+            .child(
+              h_flex()
+                .gap(6)
+                .items_center()
+                .child(
+                  this.button(t, "st-ai-update-cancel", this.tr("Cancel", "取消"), (_e, c) =>
+                    this.toggleAiUpdatePanel(c),
+                  ),
+                )
+                .child(
+                  h_flex()
+                    .id("st-ai-update-launch")
+                    .px(12)
+                    .py(5)
+                    .gap(5)
+                    .rounded(6)
+                    .border_1()
+                    .border_color(t.accent)
+                    .bg(t.accent)
+                    .items_center()
+                    .text_size(12)
+                    .font_semibold()
+                    .text_color(t.accent_foreground)
+                    .when(!canLaunch, (b) => b.opacity(0.55))
+                    .when(canLaunch, (b) =>
+                      b
+                        .cursor_pointer()
+                        .hover((s) => s.opacity(0.9))
+                        .on_click((_e, c) => this.launchAiUpdate(c, this.aiUpdateExtraError ?? updateErr)),
+                    )
+                    .when(this.aiUpdateLaunching, (b) =>
+                      b.child(
+                        svg("mods/workspace-chrome/spinner.svg")
+                          .size(11)
+                          .text_color(t.accent_foreground)
+                          .spin(900),
+                      ),
+                    )
+                    .child(
+                      this.aiUpdateLaunching
+                        ? this.tr("Launching…", "启动中…")
+                        : this.tr("Start AI Update", "启动 AI 更新"),
+                    ),
+                ),
+            ),
+        );
+    };
 
     const headerActions = h_flex()
       .gap(8)
@@ -7955,12 +8456,13 @@ export default class Settings extends View {
                 .font_semibold()
                 .cursor_pointer()
                 .hover((s) => s.opacity(0.9))
-                .on_click((_e, c) => this.launchAiUpdate(c, updateErr))
+                .on_click((_e, c) => this.openAiUpdatePanel(c, updateErr))
                 .child(svg(I("sparkles")).size(12).flex_none())
                 .child(this.tr("AI Update via GitHub", "用 AI 从 GitHub 更新")),
             ),
         ),
       )
+      .when(aiPanelOpen, (el) => el.child(renderAiUpdatePanel()))
       .child(hostsSection)
       .child(
         v_flex()

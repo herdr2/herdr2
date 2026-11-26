@@ -14,6 +14,7 @@ const disk: {
 } = { raw: null, writes: 0, toasts: [] };
 const values: Record<string, any> = {
   View: class {},
+  home: () => "/home/tester",
   appHome: () => "/home",
   hc: async (args: string[]) => {
     if (disk.hcHandler) return await disk.hcHandler(args);
@@ -945,20 +946,29 @@ test("launchAgentToFixDroveProbeErrors and runProbeFixCommandInTerminal target t
 
   expect(ran[0].cmd).toBe("tab.new");
   expect(ran[0].args.space).toBe("sp-wsl");
+  expect(ran[0].args.folder).toBe("");
   expect(ran[0].args.argv).toEqual(["claude", "--dangerously-skip-permissions"]);
   expect(ran[0].args.task).toContain("cursor");
   expect(ran[0].args.task).toContain("代理环境变量缺失");
   expect(closed).toBe(1);
 
-  // When no space exists on the target machine, create a new space on that machine.
+  // When no space exists on the target machine, create a new space on that machine in its home directory.
   currentSpaces = [{ id: "sp-local", machine: null, active: true }];
   view.runProbeFixCommandInTerminal(["cursor-agent", "login"], "修复 cursor");
   expect(ran[1]).toEqual({
     cmd: "space.new",
-    args: { name: "修复 cursor", tab: "修复 cursor", argv: ["cursor-agent", "login"], machine: "ubuntu-wsl" },
+    args: { name: "修复 cursor", tab: "修复 cursor", folder: "", argv: ["cursor-agent", "login"], machine: "ubuntu-wsl" },
   });
   expect(closed).toBe(2);
   expect(toasts.length).toBe(2);
+
+  // On local machine, fix agent defaults working directory to local home().
+  view.droveMachine = null;
+  view.launchAgentToFixDroveProbeErrors(cx);
+  await task;
+  expect(ran[2].cmd).toBe("tab.new");
+  expect(ran[2].args.space).toBe("sp-local");
+  expect(ran[2].args.folder).toBe("/home/tester");
 });
 
 test("updateRemoteMachines merges live machine list and update status, marking unreachable or outdated as needs_update", () => {
@@ -1197,4 +1207,136 @@ test("drove probe fix panel lets user select agent type, model, and effort and l
   expect(ran[2].args.argv).toEqual(["cursor-agent", "--yolo", "--trust"]);
   expect(ran[2].args.model).toBe("gpt-5.4");
   expect(ran[2].args.effort).toBe("medium");
+});
+
+test("AI update panel lets user choose local agent, model, and effort and guards prompt against mid-update interruption", async () => {
+  const ran: Array<{ cmd: string; args: any }> = [];
+  const toasts: any[] = [];
+  const knownCalls: any[] = [];
+  const hcCalls: string[][] = [];
+  let closed = 0;
+  const currentSpaces: any[] = [
+    { id: "sp-remote", machine: "ubuntu-wsl", active: true },
+    { id: "sp-local", machine: null, active: false },
+  ];
+  const currentUpdates: any = {
+    app: { version: "2.0.13", ready: "2.0.14", error: null },
+    core: { version: "2.0.13", ready: "2.0.14", error: null, managed: null },
+    machines: [],
+    releases_url: "https://github.com/herdr2/herdr2/releases/download/ota-latest",
+    last_error: null,
+  };
+  const customValues = {
+    ...values,
+    run: (cmd: string, args: any) => { ran.push({ cmd, args }); },
+    notify: (n: any) => { toasts.push(n); },
+    spaces: () => currentSpaces,
+    updates: () => currentUpdates,
+    window: () => ({ platform: "linux" }),
+    knownAgents: async (opts: any) => {
+      knownCalls.push(opts);
+      return [
+        { key: "claude", name: "Claude Code", installed: true, run: ["claude", "--dangerously-skip-permissions"] },
+        { key: "codex", name: "Codex", installed: true, run: ["codex", "--no-daemon", "--dangerously-bypass-approvals-and-sandbox"] },
+        { key: "antigravity", name: "Antigravity", installed: true, run: ["agy", "--dangerously-skip-permissions"] },
+        { key: "cursor", name: "Cursor", installed: true, run: ["agent", "--yolo", "--trust"] },
+      ];
+    },
+    hc: async (args: string[]) => {
+      hcCalls.push(args);
+      if (args[0] === "drove" && args[1] === "probe") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            fullProbe: true,
+            agents: [
+              { id: "claude", installed: true, models: ["claude-opus-4-6", "claude-sonnet-4-5"], error: null },
+              { id: "codex", installed: true, models: ["gpt-5.4"], error: null },
+              { id: "agy", installed: true, models: ["gemini-4-carbon-high", "gemini-4-neon"], error: null },
+              { id: "cursor", installed: true, models: ["gpt-5.4"], error: null },
+            ],
+          }),
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: "{}", stderr: "" };
+    },
+  };
+  const customArgs = names.map((name) => customValues[name] ?? (() => undefined));
+  const CustomSettings = new Function(
+    ...names,
+    source
+      .replace(/^import\s+[\s\S]*?from\s+["'][^"']+["'];?\s*\n?/gm, "")
+      .replace("export default class Settings", "return class Settings"),
+  )(...customArgs);
+
+  const view = new CustomSettings();
+  view.person = { language: "zh-CN" };
+  view.close = () => { closed++; };
+  // Even if Drove tab is currently pointed at a remote machine, AI Update must inspect local agents/models only.
+  view.droveMachine = "ubuntu-wsl";
+  view.droveData = {
+    agents: {
+      fullProbe: true,
+      agents: [{ id: "codex", installed: true, models: ["remote-only-model"], error: null }],
+    },
+  };
+  view.updateModal = { kind: "error", message: "TLS handshake failed" };
+
+  let task: Promise<void> | null = null;
+  const cx = { notify() {}, spawn(fn: (c: any) => Promise<void>) { task = fn(cx); } };
+
+  view.openAiUpdatePanel(cx, "TLS handshake failed");
+  await task;
+
+  expect(view.aiUpdateOpen).toBe(true);
+  expect(view.updateModal).toBeNull();
+  expect(view.aiUpdateExtraError).toBe("TLS handshake failed");
+  expect(knownCalls[0]).toEqual({});
+  expect(hcCalls[0]).toEqual(["drove", "probe", "--json"]);
+  expect(hcCalls[0]).not.toContain("--on");
+
+  const opts = view.aiUpdateAgentOptions();
+  expect(opts.filter((o: any) => o.id === "agy").length).toBe(1);
+  expect(opts.find((o: any) => o.id === "codex")?.models.map((m: any) => m.id)).toEqual(["gpt-5.4"]);
+  expect(view.aiUpdateAgent).toBe("claude");
+
+  // Choose codex + gpt-5.4 + xhigh and launch AI update.
+  view.setAiUpdateAgent("codex", cx);
+  view.setAiUpdateModel("gpt-5.4", cx);
+  view.setAiUpdateEffort("xhigh", cx);
+  view.launchAiUpdate(cx);
+  await task;
+
+  expect(ran[0].cmd).toBe("tab.new");
+  expect(ran[0].args.space).toBe("sp-local");
+  expect(ran[0].args.folder).toBe("/home/tester");
+  expect(ran[0].args.argv).toEqual(["codex", "--no-daemon", "--dangerously-bypass-approvals-and-sandbox"]);
+  expect(ran[0].args.model).toBe("gpt-5.4");
+  expect(ran[0].args.effort).toBe("xhigh");
+  expect(ran[0].args.task).toContain("TLS handshake failed");
+  expect(ran[0].args.task).toContain("PTY holder");
+  expect(ran[0].args.task).toContain("h2 server stop");
+  expect(view.aiUpdateOpen).toBe(false);
+  expect(closed).toBe(1);
+  expect(toasts[0].title).toContain("Codex");
+  expect(toasts[0].title).toContain("gpt-5.4");
+
+  // Embedded-effort agy model omits separate effort flag on launch.
+  view.setAiUpdateAgent("antigravity", cx);
+  expect(view.aiUpdateAgent).toBe("agy");
+  view.setAiUpdateModel("gemini-4-carbon-high", cx);
+  view.setAiUpdateEffort("high", cx);
+  view.launchAiUpdate(cx);
+  await task;
+  expect(ran[1].args.argv).toEqual(["agy", "--dangerously-skip-permissions"]);
+  expect(ran[1].args.model).toBe("gemini-4-carbon-high");
+  expect(ran[1].args.effort).toBeUndefined();
+
+  // Switching to claude-sonnet-4-5 clamps xhigh down to high.
+  view.setAiUpdateAgent("claude", cx);
+  view.setAiUpdateEffort("xhigh", cx);
+  expect(view.aiUpdateEffort).toBe("xhigh");
+  view.setAiUpdateModel("claude-sonnet-4-5", cx);
+  expect(view.aiUpdateEffort).toBe("high");
 });

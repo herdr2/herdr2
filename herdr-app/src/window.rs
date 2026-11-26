@@ -463,6 +463,30 @@ enum WindowsShellKind {
     Custom,
 }
 
+fn canonical_windows_shell_id(choice: &str) -> Option<&'static str> {
+    match choice.trim().to_ascii_lowercase().as_str() {
+        "powershell" | "windows-powershell" => Some("powershell"),
+        "pwsh" | "powershell7" => Some("pwsh"),
+        "git-bash" | "gitbash" | "bash" => Some("git-bash"),
+        "cmd" => Some("cmd"),
+        _ => None,
+    }
+}
+
+/// Falls back from a saved default Windows shell (e.g. `pwsh` or `git-bash`) to `"auto"`
+/// when that shell is not installed on the current machine, preventing workspace/tab creation failures.
+fn effective_windows_shell_with(choice: &str, installed: &[&str]) -> String {
+    let trimmed = choice.trim();
+    if let Some(id) = canonical_windows_shell_id(trimmed)
+        && !installed.is_empty()
+        && !installed.contains(&id)
+    {
+        tracing::warn!(shell = trimmed, "configured default Windows shell is not installed; falling back to auto");
+        return "auto".to_owned();
+    }
+    trimmed.to_owned()
+}
+
 fn windows_exe_stem(exe: &str) -> String {
     let base = exe.rsplit(['/', '\\']).next().unwrap_or(exe).trim_start_matches('-').to_ascii_lowercase();
     base.strip_suffix(".exe").unwrap_or(&base).to_owned()
@@ -6147,12 +6171,23 @@ impl AppWindow {
     }
 
     /// Resolves the configured local shell choice (`shell_override` wins over `settings.shell`).
+    /// When using saved settings on Windows, gracefully falls back to `"auto"` if the configured
+    /// shell (such as PowerShell 7 `pwsh` or `git-bash`) is not installed in the current environment.
     fn effective_local_shell(shell_override: Option<&str>) -> String {
-        shell_override
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| settings::get().shell.trim().to_owned())
+        if let Some(explicit) = shell_override.map(str::trim).filter(|v| !v.is_empty()) {
+            return explicit.to_owned();
+        }
+        let configured = settings::get().shell.trim().to_owned();
+        if cfg!(windows)
+            && let Some(id) = canonical_windows_shell_id(&configured)
+        {
+            let cached = installed_windows_shells_cached(false);
+            if !cached.is_empty() && !cached.contains(&id) {
+                let fresh = installed_windows_shells_cached(true);
+                return effective_windows_shell_with(&configured, &fresh);
+            }
+        }
+        configured
     }
 
     /// An agent with its first message, in a shell that stays when the agent exits
@@ -6274,7 +6309,9 @@ impl AppWindow {
         let here = || self.model.focused_pane().and_then(|p| self.model.address_of(&p))
             .filter(|a| a.split_once('/').map(|(m, _)| m) == on)
             .and_then(|a| self.cwds.get(&a).cloned());
-        let folder = folder.or_else(here).unwrap_or_else(|| if on.is_some() { String::new() } else { home() });
+        let folder = normalize_requested_folder(folder, on)
+            .or_else(here)
+            .unwrap_or_else(|| if on.is_some() { String::new() } else { home() });
         let (space, ctx, pane) = (self.model.fresh_id_on("sp", on), self.model.fresh_id_on("tb", on), self.model.fresh_id_on("p", on));
         let size = self.initial_size(&Tab::new(&ctx, "", &pane, "").root, &pane, window);
         let argv = Self::agent_argv(argv.clone(), task, shell.as_deref(), on)
@@ -6297,8 +6334,8 @@ impl AppWindow {
             return Err(format!("no space {space:?}"));
         }
         let follow = folder.is_none();
-        let folder = folder.unwrap_or_else(|| self.folder_for(&space));
         let on = self.machine_of(&space);
+        let folder = normalize_requested_folder(folder, on.as_deref()).unwrap_or_else(|| self.folder_for(&space));
         let (ctx, pane) = (self.model.fresh_id_on("tb", on.as_deref()), self.model.fresh_id_on("p", on.as_deref()));
         let size = self.initial_size(&Tab::new(&ctx, "", &pane, "").root, &pane, window);
         let argv = Self::agent_argv(argv.clone(), task, shell.as_deref(), on.as_deref())
@@ -6317,7 +6354,7 @@ impl AppWindow {
         }
         let create_space = space.is_none() && self.model.active_space().is_none();
         let (space_id, space_folder, on) = if create_space {
-            let folder = folder.unwrap_or_else(home);
+            let folder = normalize_requested_folder(folder, None).unwrap_or_else(home);
             (self.model.fresh_id("sp"), folder, None)
         } else {
             let sp = space
@@ -6327,7 +6364,7 @@ impl AppWindow {
                 return Err(format!("no space {sp:?}"));
             }
             let on = self.machine_of(&sp);
-            let folder = folder.unwrap_or_else(|| self.folder_for(&sp));
+            let folder = normalize_requested_folder(folder, on.as_deref()).unwrap_or_else(|| self.folder_for(&sp));
             (sp, folder, on)
         };
         self.require_document(on.as_deref())?;
@@ -12362,6 +12399,19 @@ fn home() -> String {
     mods::home().to_string_lossy().into_owned()
 }
 
+/// Expands explicit home-directory requests (`"~"` or `""`) to the local user's home
+/// or an empty string for remote SSH hosts (telling the remote core to start in its `$HOME`).
+fn normalize_requested_folder(folder: Option<String>, on: Option<&str>) -> Option<String> {
+    folder.map(|f| {
+        let trimmed = f.trim();
+        if trimmed.is_empty() || trimmed == "~" {
+            if on.is_some() { String::new() } else { home() }
+        } else {
+            f
+        }
+    })
+}
+
 fn mod_overlay(dir: &std::path::Path) -> Value {
     let meta: Value = std::fs::read_to_string(dir.join("mod.json")).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
     meta.get("overlay").cloned().filter(Value::is_object).unwrap_or_else(|| json!({}))
@@ -13018,6 +13068,16 @@ mod tests {
             // Recency cannot select a pane outside the requested direction.
             assert_eq!(super::nearest(other, out, split(), &history), None);
         }
+    }
+
+    #[test]
+    fn normalize_requested_folder_expands_home_for_local_and_remote() {
+        assert_eq!(super::normalize_requested_folder(None, None), None);
+        assert_eq!(super::normalize_requested_folder(Some("~".into()), None), Some(super::home()));
+        assert_eq!(super::normalize_requested_folder(Some("".into()), None), Some(super::home()));
+        assert_eq!(super::normalize_requested_folder(Some("~".into()), Some("wsl")), Some(String::new()));
+        assert_eq!(super::normalize_requested_folder(Some("".into()), Some("wsl")), Some(String::new()));
+        assert_eq!(super::normalize_requested_folder(Some("/tmp/proj".into()), Some("wsl")), Some("/tmp/proj".into()));
     }
 
     #[test]
@@ -15448,6 +15508,15 @@ export default class SystemToast extends View {
         let cmd_split = super::wrap_windows_command_with("cmd", cli.clone(), false, None, None, None, None, Some("C:\\Windows\\System32\\cmd.exe"));
         assert_eq!(&cmd_split[..4], ["C:\\Windows\\System32\\cmd.exe", "/d", "/s", "/c"]);
         assert_eq!(super::AppWindow::unwrap_shell_agent_argv(cmd_split), cli);
+
+        // Stale configured default Windows shell falls back to "auto" when not installed.
+        assert_eq!(super::effective_windows_shell_with("pwsh", &["powershell", "cmd"]), "auto");
+        assert_eq!(super::effective_windows_shell_with("powershell7", &["powershell", "cmd"]), "auto");
+        assert_eq!(super::effective_windows_shell_with("git-bash", &["powershell", "cmd"]), "auto");
+        assert_eq!(super::effective_windows_shell_with("pwsh", &["powershell", "pwsh", "cmd"]), "pwsh");
+        assert_eq!(super::effective_windows_shell_with("powershell", &["powershell", "cmd"]), "powershell");
+        assert_eq!(super::effective_windows_shell_with("auto", &["powershell", "cmd"]), "auto");
+        assert_eq!(super::effective_windows_shell_with("pwsh", &[]), "pwsh");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

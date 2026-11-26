@@ -51,7 +51,8 @@ pub(super) async fn terminal_run(core: Ctx<'_>, mut p: TerminalRunParams) -> Res
             p.env.insert(pager.into(), "cat".into());
         }
     }
-    let started = start_pty(core, p, template).await?;
+    let afar = from_afar(core);
+    let started = start_pty(core, p, template, afar).await?;
     let id = started.id();
     let first_message = match first.filter(|text| !text.is_empty()) {
         Some(text) => Some(core.pty_first_message(id, quiet_ready, &text, caller.as_deref()).await),
@@ -455,6 +456,7 @@ async fn start_pty(
     core: &Arc<Core>,
     p: TerminalRunParams,
     template: Option<crate::templates::Template>,
+    afar: bool,
 ) -> Result<Terminal, RpcError> {
     not_stopping(&core.lock())?;
     core.ensure_holder().await.map_err(|e| {
@@ -470,7 +472,7 @@ async fn start_pty(
         Some(_) => return Err(RpcError::invalid_params("size.cols and size.rows must be at least 1")),
         None => settings.headless()?,
     };
-    let from_afar = p.caller.as_deref().is_some_and(|c| c.contains('/'));
+    let from_afar = afar || p.caller.as_deref().is_some_and(|c| c.contains('/'));
     let cwd = crate::exec::folder(p.cwd.as_deref(), from_afar);
     let env = pty_child_env(crate::platform::program_env().await, p.env.clone());
     let identity = format!(

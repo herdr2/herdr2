@@ -1014,8 +1014,10 @@ fn resolve(program: &str, path: &str, exts: &str) -> Option<PathBuf> {
 }
 
 /// One argument as Windows' command line parsing reads it back.
+/// Also wraps arguments containing `'` so MSYS2/Git Bash's `build_argv` does not
+/// strip or reinterpret unquoted single quotes (e.g. TOML literal arrays in `-c notify=[...]`).
 pub(crate) fn quote(arg: &str) -> String {
-    if !arg.is_empty() && !arg.contains([' ', '\t', '"']) {
+    if !arg.is_empty() && !arg.contains([' ', '\t', '"', '\'']) {
         return arg.into();
     }
     let mut out = String::from("\"");
@@ -1505,5 +1507,20 @@ pub mod console {
             }
             Some(buf[..got as usize].to_vec())
         }
+    }
+}
+
+#[cfg(test)]
+mod quote_tests {
+    use super::*;
+
+    #[test]
+    fn quote_wraps_single_quoted_args_for_msys2_and_roundtrips_via_win32() {
+        let notify = "notify=['D:/Users/alice/h2.exe','checkpoint','hook','--source','codex-notify']";
+        let quoted = quote(notify);
+        assert_eq!(quoted, format!("\"{notify}\""));
+        let line: Vec<u16> = format!("bash.exe -c {quoted}").encode_utf16().collect();
+        let parsed = super::super::windows_exec::split_command_line(line).unwrap();
+        assert_eq!(parsed, ["bash.exe", "-c", notify]);
     }
 }

@@ -115,15 +115,27 @@ pub fn sweep_leftovers(state: &Path) {
     });
 }
 
+fn user_home_dir() -> Option<String> {
+    std::env::var("HOME")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| std::env::home_dir().map(|p| p.display().to_string()).filter(|s| !s.is_empty()))
+}
+
 /// The folder `cwd` names: from this machine's home for a caller from afar,
 /// else from the core's folder; that start when none is given.
 /// Use HOME, not the core's cwd: the underlying home directory may have been replaced.
 pub fn folder(cwd: Option<&str>, from_afar: bool) -> String {
-    let start = match (from_afar, std::env::var("HOME")) {
-        (true, Ok(home)) => home,
+    let start = match (from_afar, user_home_dir()) {
+        (true, Some(home)) => home,
         _ => std::env::current_dir().map(|d| d.display().to_string()).unwrap_or_else(|_| "/".into()),
     };
-    match cwd {
+    match cwd.map(str::trim).filter(|s| !s.is_empty()) {
+        Some("~") => user_home_dir().unwrap_or(start),
+        Some(rest) if rest.starts_with("~/") || (cfg!(windows) && rest.starts_with("~\\")) => {
+            let base = user_home_dir().unwrap_or(start);
+            Path::new(&base).join(&rest[2..]).display().to_string()
+        }
         Some(cwd) => Path::new(&start).join(cwd).display().to_string(),
         None => start,
     }
@@ -328,5 +340,18 @@ impl Drop for Tree {
             self.group.end();
             std::thread::spawn(ender);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_expands_tilde_to_user_home() {
+        let home = user_home_dir().expect("home dir available");
+        assert_eq!(folder(Some("~"), false), home);
+        assert_eq!(folder(Some("~/sub"), false), Path::new(&home).join("sub").display().to_string());
+        assert_eq!(folder(None, true), home);
     }
 }
