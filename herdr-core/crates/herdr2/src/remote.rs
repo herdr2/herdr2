@@ -1081,7 +1081,6 @@ pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Va
             | "drove.settings.get"
             | "drove.settings.set"
             | "drove.probe"
-            | "drove.probe.ai_diagnose"
             | "drove.ai.test"
             | "drove.roles.ai_configure"
             | "drove.magpie.test"
@@ -1235,7 +1234,7 @@ fn deadline_for(core: &Core, method: &str, params: &Value) -> Duration {
         // Rollback may respawn a fresh ACP/PTY session and restore workspace git trees over SSH.
         return config.machine_timeout() + Duration::from_secs(60);
     }
-    if matches!(method, "drove.probe" | "drove.probe.ai_diagnose" | "drove.roles.ai_configure") {
+    if matches!(method, "drove.probe" | "drove.roles.ai_configure") {
         // Probing installed ACP agents spawns multiple cold-start handshakes (up to 60s each)
         // and AI role configuration may probe + run a reasoning completion.
         return config.machine_timeout() + Duration::from_secs(180);

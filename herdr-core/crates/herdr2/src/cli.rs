@@ -1427,7 +1427,6 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("drove settings", "drove.settings.get"),
     ("drove settings-set", "drove.settings.set"),
     ("drove probe", "drove.probe"),
-    ("drove probe-ai-diagnose", "drove.probe.ai_diagnose"),
     ("drove ai-test", "drove.ai.test"),
     ("drove roles-ai-config", "drove.roles.ai_configure"),
     ("drove magpie-test", "drove.magpie.test"),

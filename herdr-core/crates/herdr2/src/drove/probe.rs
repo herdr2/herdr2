@@ -70,6 +70,40 @@ fn env_ignore_case<'a>(env: &'a BTreeMap<String, String>, key: &str) -> Option<&
     env.iter().find(|(k, _)| k.eq_ignore_ascii_case(key)).map(|(_, v)| v.as_str()).filter(|s| !s.is_empty())
 }
 
+fn is_unc_path(path: &Path) -> bool {
+    let raw = path.to_string_lossy();
+    raw.starts_with(r"\\") || raw.starts_with("//")
+}
+
+/// Picks a stable, local, non-UNC working directory for headless ACP/CLI agent probing.
+/// Inheriting `herdr2 serve`'s arbitrary `current_dir()` breaks Windows `.CMD` shims and
+/// ACP adapters (e.g. `claude-agent-acp`) whenever the daemon started inside a WSL UNC share
+/// (`\\wsl.localhost\...`), a read-only system directory, or a removed folder.
+fn probe_working_dir(env: &BTreeMap<String, String>) -> String {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    let home_keys: &[&str] = if cfg!(windows) { &["USERPROFILE", "HOME"] } else { &["HOME", "USERPROFILE"] };
+    for key in home_keys {
+        if let Some(val) = env_ignore_case(env, key) {
+            candidates.push(PathBuf::from(val.trim()));
+        }
+        if let Ok(val) = std::env::var(key)
+            && !val.trim().is_empty()
+        {
+            candidates.push(PathBuf::from(val.trim()));
+        }
+    }
+    candidates.push(std::env::temp_dir());
+    if let Ok(cur) = std::env::current_dir() {
+        candidates.push(cur);
+    }
+    for cand in candidates {
+        if !cand.as_os_str().is_empty() && !is_unc_path(&cand) && cand.is_dir() {
+            return cand.display().to_string();
+        }
+    }
+    std::env::temp_dir().display().to_string()
+}
+
 fn collect_probe_targets(core: &Core) -> Vec<(String, Vec<String>)> {
     let settings = core.settings();
     let mut seen_cmds: BTreeSet<Vec<String>> = BTreeSet::new();
@@ -169,7 +203,7 @@ pub async fn refresh_installed_status(core: &Core, snap: &mut ProbeSnapshot) -> 
 pub async fn probe_agents(core: &Core, skip_acp_handshake: bool) -> ProbeSnapshot {
     let targets = collect_probe_targets(core);
     let base_env = crate::platform::program_env().await;
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()).display().to_string();
+    let cwd = probe_working_dir(&base_env);
 
     let probe_scope = crate::sweep::token();
     let mut quick_handles = Vec::new();
@@ -1721,6 +1755,30 @@ done
         }
         let attempts = std::fs::read_to_string(&marker).unwrap().lines().count();
         assert_eq!(attempts, 3, "expected exactly 1 attempt per agent when systemic outage skips retry");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn probe_working_dir_skips_unc_paths_and_prefers_local_home() {
+        assert!(is_unc_path(Path::new(r"\\wsl.localhost\Ubuntu2404\home\dev\repo")));
+        assert!(is_unc_path(Path::new("//server/share/dir")));
+        assert!(!is_unc_path(Path::new(r"D:\Users\dev")));
+        assert!(!is_unc_path(Path::new("/home/dev")));
+
+        let tmp = crate::test_tmp().join(format!("drove-probe-cwd-{}", crate::platform::random_hex()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let mut env = BTreeMap::new();
+        env.insert("HOME".into(), tmp.display().to_string());
+        env.insert("USERPROFILE".into(), tmp.display().to_string());
+        assert_eq!(probe_working_dir(&env), tmp.display().to_string());
+
+        let mut unc_env = BTreeMap::new();
+        unc_env.insert("HOME".into(), r"\\wsl.localhost\Ubuntu2404\home\dev".into());
+        unc_env.insert("USERPROFILE".into(), r"\\wsl.localhost\Ubuntu2404\home\dev".into());
+        let picked = probe_working_dir(&unc_env);
+        assert!(!is_unc_path(Path::new(&picked)), "must never return UNC path: {picked}");
+        assert!(Path::new(&picked).is_dir(), "must return existing dir: {picked}");
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

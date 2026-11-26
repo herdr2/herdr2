@@ -38,8 +38,30 @@ impl CallError {
                 let detail = e
                     .data
                     .as_ref()
-                    .and_then(|d| d.as_str().or_else(|| d.get("message").and_then(Value::as_str)))
-                    .map(str::trim)
+                    .and_then(|d| {
+                        d.as_str()
+                            .or_else(|| d.get("message").and_then(Value::as_str))
+                            .or_else(|| d.get("details").and_then(Value::as_str))
+                            .or_else(|| d.get("error").and_then(Value::as_str))
+                            .or_else(|| d.get("reason").and_then(Value::as_str))
+                            .map(str::to_string)
+                            .or_else(|| {
+                                let is_non_empty_obj = d.as_object().is_some_and(|m| !m.is_empty());
+                                if is_non_empty_obj {
+                                    serde_json::to_string(d).ok().map(|s| {
+                                        if s.chars().count() <= 320 {
+                                            s
+                                        } else {
+                                            let prefix: String = s.chars().take(320).collect();
+                                            format!("{prefix}…")
+                                        }
+                                    })
+                                } else {
+                                    None
+                                }
+                            })
+                    })
+                    .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case(&e.message));
                 match detail {
                     Some(d) => format!("{context}: {}: {d} (code {})", e.message, e.code),
@@ -363,5 +385,21 @@ fn fail_all_pending(inner: &Inner) {
     let mut guard = inner.pending.lock().unwrap_or_else(|p| p.into_inner());
     for (_, tx) in guard.drain() {
         let _ = tx.send(Err(JsonRpcError { code: -32000, message: "agent stdio closed".into(), data: None }));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rpc_error_extracts_sdk_details_field() {
+        let err = CallError::Rpc(JsonRpcError {
+            code: -32603,
+            message: "Internal error".into(),
+            data: Some(json!({ "details": "spawn ENOENT in UNC cwd" })),
+        })
+        .into_rpc_error("ACP session/new failed", "");
+        assert_eq!(err.message, "ACP session/new failed: Internal error: spawn ENOENT in UNC cwd (code -32603)");
     }
 }

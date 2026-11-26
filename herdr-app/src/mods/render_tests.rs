@@ -2858,15 +2858,12 @@ fn split_pane_names_merged_tabs_and_windows_shells(cx: &mut TestAppContext) {
         true,
         json!({ "section": "drove" }),
         updates("current", "current"),
-        Some("this.droveData = { config: { roles: { coder: { label: 'Coder', access: 'writable', primary: { agent: 'claude', model: 'opus', effort: 'high' }, fallbacks: [] } }, ai: { enabled: true } }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'claude', installed: true, models: ['opus'] }, { id: 'cursor', installed: true, models: [], error: 'ACP probe timed out after 60s' }] } }; this.droveProbeAiResult = { ok: true, modelUsed: 'deepseek-chat', latencyMs: 210, summary: 'Daemon is missing shell proxy env.', items: [{ agent: 'cursor', category: 'env_proxy', likelyFalsePositive: true, cause: 'No HTTP_PROXY in daemon', fix: 'Sign in or set proxy', command: 'cursor-agent login', commandArgv: ['cursor-agent', 'login'] }] };"),
+        Some("this.droveData = { config: { roles: { coder: { label: 'Coder', access: 'writable', primary: { agent: 'claude', model: 'opus', effort: 'high' }, fallbacks: [] } }, ai: { enabled: true } }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'claude', installed: true, models: ['opus'] }, { id: 'cursor', installed: true, models: [], error: 'ACP probe timed out after 60s' }] } };"),
     )
     .unwrap();
     assert!(probe_err_tree.contains("st-dr-agent-errors"), "Probe error card should render: {probe_err_tree}");
-    assert!(probe_err_tree.contains("st-dr-probe-ai-btn"), "Probe error card should render AI Diagnose button: {probe_err_tree}");
+    assert!(!probe_err_tree.contains("st-dr-probe-ai-btn"), "AI Diagnose button should be removed: {probe_err_tree}");
     assert!(probe_err_tree.contains("st-dr-probe-agent-fix-btn"), "Probe error card should render Fix with Agent button: {probe_err_tree}");
-    assert!(probe_err_tree.contains("st-dr-probe-ai-result"), "AI diagnosis card should render: {probe_err_tree}");
-    assert!(probe_err_tree.contains("st-dr-probe-ai-item-cursor"), "Per-agent AI diagnosis item should render: {probe_err_tree}");
-    assert!(probe_err_tree.contains("st-dr-probe-ai-run-cursor"), "Run in Terminal button should render for safe commandArgv: {probe_err_tree}");
     let probe_fix_tree = describe(
         cx,
         &staged,

@@ -872,14 +872,6 @@ impl DroveRuntime {
         Ok(ai::configure_roles_with_ai(&core, params).await)
     }
 
-    pub async fn rpc_probe_ai_diagnose(
-        &self,
-        params: DroveProbeAiDiagnoseParams,
-    ) -> Result<DroveProbeAiDiagnoseResult, RpcError> {
-        let core = self.core().ok_or_else(|| RpcError::internal("core unavailable"))?;
-        Ok(ai::diagnose_probe_errors_with_ai(&core, params).await)
-    }
-
     pub async fn rpc_http_proxy(&self, req: HttpProxyRequest) -> Result<HttpProxyResponse, RpcError> {
         let core = self.core().ok_or_else(|| RpcError::internal("core unavailable"))?;
         Ok(http::dispatch_http(&core, req, true).await)

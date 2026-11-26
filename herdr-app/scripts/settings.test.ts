@@ -814,88 +814,7 @@ test("ai protocol is auto-detected without manual selector and synced on connect
   expect(view.aiStatus?.availableModels).toEqual(["claude-sonnet-4-6"]);
 });
 
-test("aiDiagnoseDroveProbeErrors uses remote AI without local overrides and falls back to local AI on older remote h2", async () => {
-  const calls: Array<{ args: string[]; payload: any; opts: any }> = [];
-  const view = new Settings();
-  view.person = { language: "zh-CN" };
-  view.droveMachine = "ubuntu-wsl";
-  view.aiStatus = { configured: true, model: "local-deepseek" };
-  view.droveData = {
-    aiStatus: { configured: true },
-    config: { ai: { model: "remote-model", baseUrl: "http://127.0.0.1:3425/v1" } },
-    agents: {
-      fullProbe: true,
-      agents: [
-        { id: "claude", installed: true, models: ["opus"], error: null },
-        { id: "cursor", installed: true, command: ["cursor-agent", "acp"], path: "/home/u/.local/bin/cursor-agent", models: [], error: "ACP probe timed out after 60s" },
-      ],
-    },
-  };
-  view.droveUrlInput = { value: () => "https://api.deepseek.com/v1" };
-  view.droveKeyInput = { value: () => "" };
-  view.droveCallWithJsonFile = async (args: string[], payload: any, opts: any) => {
-    calls.push({ args, payload, opts });
-    if (!opts?.local) {
-      throw new Error("ubuntu-wsl's h2 is older and has no drove.probe.ai_diagnose");
-    }
-    return {
-      ok: true,
-      modelUsed: "local-deepseek",
-      latencyMs: 320,
-      summary: "守护进程缺少代理导致 Cursor 探测超时。",
-      items: [
-        {
-          agent: "cursor",
-          category: "env_proxy",
-          likelyFalsePositive: true,
-          cause: "daemon 缺少代理变量",
-          fix: "登录并检查代理后重启",
-          command: "cursor-agent login",
-          commandArgv: ["cursor-agent", "login"],
-        },
-      ],
-    };
-  };
-
-  let task: Promise<void> | null = null;
-  const cx = { notify() {}, spawn(fn: (c: any) => Promise<void>) { task = fn(cx); } };
-  view.aiDiagnoseDroveProbeErrors(cx);
-  await task;
-
-  expect(calls.length).toBe(2);
-  // 1st attempt: remote daemon without forwarding local URL/model/key overrides.
-  expect(calls[0].args).toEqual(["drove", "probe-ai-diagnose"]);
-  expect(calls[0].opts?.local).toBeUndefined();
-  expect(calls[0].payload).toEqual({
-    agents: ["cursor"],
-    language: "zh-CN",
-  });
-  // 2nd attempt: local AI fallback with full remote probe snapshot + local overrides.
-  expect(calls[1].args).toEqual(["drove", "probe-ai-diagnose"]);
-  expect(calls[1].opts?.local).toBe(true);
-  expect(calls[1].payload).toEqual({
-    agents: ["cursor"],
-    targetMachine: "ubuntu-wsl",
-    erroredAgents: [
-      {
-        id: "cursor",
-        command: ["cursor-agent", "acp"],
-        path: "/home/u/.local/bin/cursor-agent",
-        modelsCount: 0,
-        error: "ACP probe timed out after 60s",
-      },
-    ],
-    healthyAgents: ["claude"],
-    language: "zh-CN",
-    baseUrl: "https://api.deepseek.com/v1",
-    model: "local-deepseek",
-  });
-  expect(view.droveProbeAiDiagnosing).toBe(false);
-  expect(view.droveProbeAiResult?.ok).toBe(true);
-  expect(view.droveProbeAiResult?.items?.[0]?.agent).toBe("cursor");
-});
-
-test("launchAgentToFixDroveProbeErrors and runProbeFixCommandInTerminal target the selected machine space", async () => {
+test("launchAgentToFixDroveProbeErrors targets the selected machine space and creates one when missing", async () => {
   const ran: Array<{ cmd: string; args: any }> = [];
   const toasts: any[] = [];
   let closed = 0;
@@ -933,11 +852,6 @@ test("launchAgentToFixDroveProbeErrors and runProbeFixCommandInTerminal target t
       ],
     },
   };
-  view.droveProbeAiResult = {
-    ok: true,
-    summary: "代理环境变量缺失",
-    items: [{ agent: "cursor", category: "env_proxy", cause: "no proxy", fix: "set proxy", command: "cursor-agent login" }],
-  };
 
   let task: Promise<void> | null = null;
   const cx = { notify() {}, spawn(fn: (c: any) => Promise<void>) { task = fn(cx); } };
@@ -949,16 +863,16 @@ test("launchAgentToFixDroveProbeErrors and runProbeFixCommandInTerminal target t
   expect(ran[0].args.folder).toBe("");
   expect(ran[0].args.argv).toEqual(["claude", "--dangerously-skip-permissions"]);
   expect(ran[0].args.task).toContain("cursor");
-  expect(ran[0].args.task).toContain("代理环境变量缺失");
   expect(closed).toBe(1);
 
   // When no space exists on the target machine, create a new space on that machine in its home directory.
   currentSpaces = [{ id: "sp-local", machine: null, active: true }];
-  view.runProbeFixCommandInTerminal(["cursor-agent", "login"], "修复 cursor");
-  expect(ran[1]).toEqual({
-    cmd: "space.new",
-    args: { name: "修复 cursor", tab: "修复 cursor", folder: "", argv: ["cursor-agent", "login"], machine: "ubuntu-wsl" },
-  });
+  view.launchAgentToFixDroveProbeErrors(cx);
+  await task;
+  expect(ran[1].cmd).toBe("space.new");
+  expect(ran[1].args.machine).toBe("ubuntu-wsl");
+  expect(ran[1].args.folder).toBe("");
+  expect(ran[1].args.argv).toEqual(["claude", "--dangerously-skip-permissions"]);
   expect(closed).toBe(2);
   expect(toasts.length).toBe(2);
 
