@@ -23,7 +23,7 @@ pub use briefing::{
     BatchPermissionGroup, BriefingAgentInput, BriefingCounts, BriefingDroveInput, BriefingItem, BriefingParams,
     BriefingSnapshot, BriefingTerminalInput, build_deterministic_briefing, enhance_briefing_headline,
 };
-pub use client::{AiModelsResult, AiTestResult, allows_keyless_url};
+pub use client::{AiModelsResult, AiProtocol, AiTestResult, allows_keyless_url};
 pub use config::{
     AiCoreConfig, AiPaths, format_ms_iso, is_loopback_http_url, mask_key, normalize_ai_language,
     normalize_prompt_mode, now_iso, now_ms_u64, parse_ai_token_size, parse_iso_ms, prompt_lang_code,
@@ -44,10 +44,12 @@ use crate::paths::Paths;
 use crate::rpc::RpcError;
 use cache::AiResultCache;
 use client::{
-    EndpointCapabilities, KV_CACHE_DEGRADE_THRESHOLD, build_chat_payload_candidates, chat_endpoints,
-    curl_json_timeout, effective_max_tokens, extract_json_object, fetch_ai_models, fetch_ai_models_detailed,
-    first_model_id, http_json_request, models_endpoints, parse_usage_tokens, record_winning_variant,
-    refine_capabilities_from_error, should_retry_without_optional_fields, test_ai_connection, truncate_for_context,
+    EndpointCapabilities, HttpAuthStyle, KV_CACHE_DEGRADE_THRESHOLD, anthropic_messages_endpoints,
+    build_anthropic_payload_candidates, build_chat_payload_candidates, chat_endpoints, effective_max_tokens,
+    extract_json_object, extract_response_content, fetch_ai_models, fetch_ai_models_detailed,
+    http_json_request_with_auth, is_valid_protocol_response, parse_usage_tokens, protocol_probe_order,
+    record_winning_variant_for_protocol, refine_capabilities_from_error_for_protocol,
+    should_retry_without_optional_fields, test_ai_connection_detailed, truncate_for_context,
 };
 use compact::{fingerprint_hex, fnv1a_64, redact_secrets, strip_and_dedup_lines};
 use config::{
@@ -273,6 +275,8 @@ pub struct AiStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_masked: Option<String>,
     pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<AiProtocol>,
     pub model: String,
     pub effort: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -689,6 +693,56 @@ impl AiRuntime {
         self.preferred_prompt_lang()
     }
 
+    fn resolve_remembered_protocol(&self, base: &str, model: &str) -> Option<(AiProtocol, bool)> {
+        let norm_base = base.trim().trim_end_matches('/');
+        if norm_base.is_empty() {
+            return None;
+        }
+        let map = self.endpoint_caps.lock().unwrap_or_else(|p| p.into_inner());
+        let clean_model = model.trim();
+        if !clean_model.is_empty()
+            && let Some(caps) = map.get(&format!("{norm_base}|{clean_model}"))
+            && let Some(proto) = caps.protocol
+        {
+            return Some((proto, caps.anthropic_bearer_auth));
+        }
+        if let Some(caps) = map.get(norm_base)
+            && let Some(proto) = caps.protocol
+        {
+            return Some((proto, caps.anthropic_bearer_auth));
+        }
+        let prefix = format!("{norm_base}|");
+        map.iter()
+            .find(|(k, v)| k.starts_with(&prefix) && v.protocol.is_some())
+            .and_then(|(_, v)| v.protocol.map(|p| (p, v.anthropic_bearer_auth)))
+    }
+
+    fn remember_endpoint_protocol(
+        &self,
+        base: &str,
+        model: Option<&str>,
+        protocol: AiProtocol,
+        anthropic_bearer_auth: bool,
+    ) {
+        let norm_base = base.trim().trim_end_matches('/');
+        if norm_base.is_empty() {
+            return;
+        }
+        let mut map = self.endpoint_caps.lock().unwrap_or_else(|p| p.into_inner());
+        let base_entry =
+            map.entry(norm_base.to_string()).or_insert_with(|| EndpointCapabilities::default_for_url(norm_base));
+        base_entry.protocol = Some(protocol);
+        base_entry.anthropic_bearer_auth = anthropic_bearer_auth;
+        if let Some(m) = model.map(str::trim).filter(|s| !s.is_empty()) {
+            let entry = map
+                .entry(format!("{norm_base}|{m}"))
+                .or_insert_with(|| EndpointCapabilities::default_for_url(norm_base));
+            entry.protocol = Some(protocol);
+            entry.anthropic_bearer_auth = anthropic_bearer_auth;
+        }
+        save_endpoint_caps(&self.paths, &map);
+    }
+
     pub fn status(&self) -> AiStatus {
         let cfg = self.config_snapshot();
         let (key, src) = read_ai_key(&self.paths);
@@ -727,6 +781,9 @@ impl AiRuntime {
         } else {
             None
         };
+        let protocol = active_caps
+            .and_then(|c| c.protocol)
+            .or_else(|| self.resolve_remembered_protocol(active_base, &active_model).map(|(p, _)| p));
         let small_ctx = cfg.context_window.as_deref().and_then(parse_ai_token_size).is_some_and(|c| c <= 4096);
         let caps_degraded = active_caps.is_some_and(|c| !c.prompt_cache_effective);
         usage.prompt_cache_auto_degraded = resolved_prompt_mode == "auto" && caps_degraded;
@@ -750,6 +807,7 @@ impl AiRuntime {
             config_path: self.paths.config_file.display().to_string(),
             key_masked: key.as_deref().map(mask_key),
             base_url: cfg.base_url,
+            protocol,
             model: cfg.model,
             effort: cfg.effort,
             context_window: cfg.context_window,
@@ -786,9 +844,14 @@ impl AiRuntime {
             };
             if need_fetch {
                 let (key, _) = read_ai_key(&self.paths);
-                let discovered = fetch_ai_models(cfg_url, key.as_deref()).await;
-                if !discovered.is_empty() {
-                    self.update_models(cfg_url, discovered);
+                let res = fetch_ai_models_detailed(cfg_url, key.as_deref()).await;
+                if res.ok && !res.models.is_empty() {
+                    self.update_models(&res.base_url, res.models);
+                    if res.protocol == Some(AiProtocol::Anthropic)
+                        && self.resolve_remembered_protocol(&res.base_url, &cfg.model).is_none()
+                    {
+                        self.remember_endpoint_protocol(&res.base_url, None, AiProtocol::Anthropic, false);
+                    }
                 }
             }
         }
@@ -1036,14 +1099,14 @@ impl AiRuntime {
             .or_else(|| if same_as_saved { stored_key } else { None });
         let model = model_override
             .filter(|s| !s.trim().is_empty())
-            .or_else(|| (!cfg.model.trim().is_empty()).then_some(cfg.model));
-        let res = test_ai_connection(&base_url, key.as_deref(), model.as_deref()).await;
+            .or_else(|| (same_as_saved && !cfg.model.trim().is_empty()).then_some(cfg.model));
+        let (res, used_bearer) = test_ai_connection_detailed(&base_url, key.as_deref(), model.as_deref()).await;
         let mut merged = Vec::new();
         if let Some(m) = &res.discovered_model {
             merged.push(m.clone());
         }
         merged.extend(res.available_models.clone());
-        if !merged.is_empty() {
+        if !merged.is_empty() && (same_as_saved || saved_norm.is_empty()) {
             self.update_models(&base_url, merged);
         }
         {
@@ -1060,6 +1123,16 @@ impl AiRuntime {
             }
         }
         if res.ok {
+            if let Some(proto) = res.protocol
+                && (same_as_saved || saved_norm.is_empty())
+            {
+                self.remember_endpoint_protocol(
+                    &res.base_url,
+                    res.discovered_model.as_deref().or(model.as_deref()),
+                    proto,
+                    used_bearer,
+                );
+            }
             let mut caps_map = self.endpoint_caps.lock().unwrap_or_else(|p| p.into_inner());
             for c in caps_map.values_mut() {
                 c.reset_prompt_cache_detection();
@@ -1373,17 +1446,10 @@ impl AiRuntime {
         {
             model = first;
         }
-        if model.is_empty() {
-            for url in models_endpoints(&base) {
-                if let Ok((st, body)) =
-                    curl_json_timeout("GET", &url, key.as_deref(), None, client::AI_MODELS_TIMEOUT).await
-                    && (200..300).contains(&st)
-                    && let Some(m) = first_model_id(&body)
-                {
-                    model = m;
-                    break;
-                }
-            }
+        if model.is_empty()
+            && let Some(m) = fetch_ai_models(&base, key.as_deref()).await.into_iter().next()
+        {
+            model = m;
         }
         if model.is_empty() {
             if let Some(g) = probe_guard.as_mut() {
@@ -1403,6 +1469,15 @@ impl AiRuntime {
             .copied()
             .unwrap_or_else(|| EndpointCapabilities::default_for_url(&base));
         let mut caps = initial_caps;
+        let remembered_proto = if let Some(p) = caps.protocol {
+            Some(p)
+        } else if let Some((p, bearer)) = self.resolve_remembered_protocol(&base, &model) {
+            caps.protocol = Some(p);
+            caps.anthropic_bearer_auth = bearer;
+            Some(p)
+        } else {
+            None
+        };
 
         let prompt_mode = cfg.resolved_prompt_mode();
         let ctx_tokens = cfg.context_window.as_deref().and_then(parse_ai_token_size);
@@ -1508,158 +1583,292 @@ impl AiRuntime {
 
         let prompt_cache_key = enable_session_cache.then_some(cache_bucket.as_deref()).flatten();
         let expect_json = op_expects_json(&req.op);
-        let candidates = build_chat_payload_candidates(
-            &model,
-            &messages,
-            eff_max_tokens,
-            effective_effort,
-            ctx_tokens,
-            temperature,
-            prompt_cache_key,
-            expect_json,
-            caps,
-        );
+        let protocols = protocol_probe_order(&base, key.as_deref(), remembered_proto);
+        let has_key = key.as_deref().map(str::trim).is_some_and(|s| !s.is_empty());
 
-        let mut last_err = String::from("AI endpoint did not respond");
-        for url in chat_endpoints(&base) {
-            let mut resp = Err("no payload candidates".into());
-            let mut winning_variant = None;
-            let mut fell_back = false;
-            for (idx, variant) in candidates.iter().enumerate() {
-                if idx > 0
-                    && ((variant.used_num_ctx && !caps.supports_num_ctx)
-                        || (variant.used_cache_key && !caps.supports_prompt_cache_key)
-                        || (variant.used_cache_control && !caps.supports_cache_control)
-                        || (variant.used_json_object && !caps.supports_json_object)
-                        || (variant.used_enable_thinking && !caps.supports_enable_thinking)
-                        || (variant.used_effort.is_some() && !caps.supports_reasoning_effort)
-                        || (variant.used_effort.as_deref() == Some("none") && !caps.supports_effort_none)
-                        || (variant.used_temperature && !caps.supports_temperature))
-                {
-                    continue;
+        #[derive(Clone)]
+        struct AttemptError {
+            status: Option<u16>,
+            retry_after_secs: Option<u64>,
+            message: String,
+            is_parse_error: bool,
+        }
+
+        let mut protocol_errors: Vec<AttemptError> = Vec::new();
+
+        for (proto_idx, proto) in protocols.into_iter().enumerate() {
+            let endpoints = match proto {
+                AiProtocol::Openai => chat_endpoints(&base),
+                AiProtocol::Anthropic => anthropic_messages_endpoints(&base),
+            };
+            let candidates = match proto {
+                AiProtocol::Openai => build_chat_payload_candidates(
+                    &model,
+                    &messages,
+                    eff_max_tokens,
+                    effective_effort,
+                    ctx_tokens,
+                    temperature,
+                    prompt_cache_key,
+                    expect_json,
+                    caps,
+                ),
+                AiProtocol::Anthropic => build_anthropic_payload_candidates(
+                    &model,
+                    &messages,
+                    eff_max_tokens,
+                    temperature,
+                    prompt_cache_key,
+                    caps,
+                ),
+            };
+            let auth_styles: Vec<HttpAuthStyle> = match proto {
+                AiProtocol::Openai => vec![HttpAuthStyle::Bearer],
+                AiProtocol::Anthropic => {
+                    if !has_key {
+                        vec![HttpAuthStyle::AnthropicApiKey]
+                    } else if caps.anthropic_bearer_auth {
+                        vec![HttpAuthStyle::AnthropicBearer, HttpAuthStyle::AnthropicApiKey]
+                    } else {
+                        vec![HttpAuthStyle::AnthropicApiKey, HttpAuthStyle::AnthropicBearer]
+                    }
                 }
-                resp = http_json_request("POST", &url, key.as_deref(), Some(&variant.body), req.timeout).await;
-                let has_next = idx + 1 < candidates.len();
-                if let Ok(ref http_resp) = resp {
-                    if (200..300).contains(&http_resp.status) {
-                        winning_variant = Some(variant);
+            };
+
+            let mut proto_err: Option<AttemptError> = None;
+            let mut should_try_other_protocol = false;
+
+            for url in endpoints {
+                let mut resp: Result<client::HttpJsonResponse, String> = Err("no payload candidates".into());
+                let mut winning_variant = None;
+                let mut winning_style = auth_styles[0];
+                let mut fell_back = false;
+
+                for (idx, variant) in candidates.iter().enumerate() {
+                    if idx > 0 {
+                        let skip = match proto {
+                            AiProtocol::Openai => {
+                                (variant.used_num_ctx && !caps.supports_num_ctx)
+                                    || (variant.used_cache_key && !caps.supports_prompt_cache_key)
+                                    || (variant.used_cache_control && !caps.supports_cache_control)
+                                    || (variant.used_json_object && !caps.supports_json_object)
+                                    || (variant.used_enable_thinking && !caps.supports_enable_thinking)
+                                    || (variant.used_effort.is_some() && !caps.supports_reasoning_effort)
+                                    || (variant.used_effort.as_deref() == Some("none") && !caps.supports_effort_none)
+                                    || (variant.used_temperature && !caps.supports_temperature)
+                            }
+                            AiProtocol::Anthropic => {
+                                (variant.used_cache_control && !caps.supports_anthropic_cache_control)
+                                    || (variant.used_temperature && !caps.supports_temperature)
+                            }
+                        };
+                        if skip {
+                            continue;
+                        }
+                    }
+
+                    let mut used_style = auth_styles[0];
+                    for (s_idx, style) in auth_styles.iter().enumerate() {
+                        used_style = *style;
+                        resp = http_json_request_with_auth(
+                            "POST",
+                            &url,
+                            key.as_deref(),
+                            *style,
+                            Some(&variant.body),
+                            req.timeout,
+                        )
+                        .await;
+                        if let Ok(ref http_resp) = resp
+                            && (http_resp.status == 401 || http_resp.status == 403)
+                            && s_idx + 1 < auth_styles.len()
+                        {
+                            continue;
+                        }
                         break;
                     }
-                    if has_next && should_retry_without_optional_fields(http_resp.status, &http_resp.body) {
-                        refine_capabilities_from_error(&mut caps, variant, &http_resp.body);
-                        fell_back = true;
-                        continue;
-                    }
-                }
-                break;
-            }
-            if let Some(win) = winning_variant
-                && fell_back
-            {
-                record_winning_variant(&mut caps, win);
-            }
 
-            match resp {
-                Ok(http_resp) if (200..300).contains(&http_resp.status) => {
-                    let latency_ms = started.elapsed().as_millis() as u64;
-                    let parsed: Value = match serde_json::from_str(&http_resp.body) {
-                        Ok(v) => v,
-                        Err(e) => {
+                    let has_next = idx + 1 < candidates.len();
+                    if let Ok(ref http_resp) = resp {
+                        if (200..300).contains(&http_resp.status) {
+                            winning_variant = Some(variant);
+                            winning_style = used_style;
+                            break;
+                        }
+                        if has_next && should_retry_without_optional_fields(http_resp.status, &http_resp.body) {
+                            refine_capabilities_from_error_for_protocol(&mut caps, proto, variant, &http_resp.body);
+                            fell_back = true;
+                            continue;
+                        }
+                    }
+                    break;
+                }
+
+                if let Some(win) = winning_variant
+                    && fell_back
+                {
+                    record_winning_variant_for_protocol(&mut caps, proto, win);
+                }
+
+                match resp {
+                    Ok(http_resp) if (200..300).contains(&http_resp.status) => {
+                        let latency_ms = started.elapsed().as_millis() as u64;
+                        let parsed: Value = match serde_json::from_str(&http_resp.body) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                proto_err = Some(AttemptError {
+                                    status: Some(http_resp.status),
+                                    retry_after_secs: None,
+                                    message: format!("failed to parse AI JSON response: {e}"),
+                                    is_parse_error: true,
+                                });
+                                should_try_other_protocol = proto_idx == 0;
+                                break;
+                            }
+                        };
+                        if !is_valid_protocol_response(&parsed, proto) {
+                            proto_err = Some(AttemptError {
+                                status: Some(http_resp.status),
+                                retry_after_secs: None,
+                                message: format!("unexpected AI response shape for {proto} protocol"),
+                                is_parse_error: true,
+                            });
+                            should_try_other_protocol = proto_idx == 0;
+                            break;
+                        }
+
+                        caps.protocol = Some(proto);
+                        if proto == AiProtocol::Anthropic {
+                            caps.anthropic_bearer_auth = winning_style == HttpAuthStyle::AnthropicBearer;
+                        }
+                        let (in_tok, out_tok, cache_tok) = parse_usage_tokens(&parsed);
+                        let usage =
+                            AiUsage { input_tokens: in_tok, output_tokens: out_tok, cached_input_tokens: cache_tok };
+                        if prompt_mode == "auto"
+                            && used_canonical_prefix
+                            && matches!(req.mode, AiConversationMode::StatelessSharedPrefix)
+                        {
+                            caps.record_shared_prefix_usage(in_tok, cache_tok);
+                        }
+                        if caps != initial_caps {
+                            let mut map = self.endpoint_caps.lock().unwrap_or_else(|p| p.into_inner());
+                            map.insert(cap_key.clone(), caps);
+                            let base_entry = map
+                                .entry(base.clone())
+                                .or_insert_with(|| EndpointCapabilities::default_for_url(&base));
+                            base_entry.protocol = Some(proto);
+                            base_entry.anthropic_bearer_auth = caps.anthropic_bearer_auth;
+                            save_endpoint_caps(&self.paths, &map);
+                        }
+
+                        let (raw_content, finish_reason) = extract_response_content(&parsed, proto);
+                        if raw_content.is_empty() || raw_content.contains("<tool_use") || raw_content.contains("DSML") {
+                            let reason = if raw_content.is_empty() {
+                                if finish_reason == "length" {
+                                    "empty assistant content (finish_reason=length)"
+                                } else {
+                                    "empty assistant content"
+                                }
+                            } else {
+                                "unexpected tool-call markup in content"
+                            };
                             if let Some(g) = probe_guard.as_mut() {
                                 g.settle();
                             }
-                            // Transport succeeded; malformed JSON is a content error, not a global outage.
+                            // Content-only errors must NOT trip the global circuit breaker.
                             self.record_success();
-                            self.record_parse_error(&req.op);
                             self.record_op_failure(&req.op);
-                            return Err(format!("failed to parse AI JSON response: {e}"));
+                            return Err(reason.into());
                         }
-                    };
-                    let (in_tok, out_tok, cache_tok) = parse_usage_tokens(&parsed);
-                    let usage =
-                        AiUsage { input_tokens: in_tok, output_tokens: out_tok, cached_input_tokens: cache_tok };
-                    if prompt_mode == "auto"
-                        && used_canonical_prefix
-                        && matches!(req.mode, AiConversationMode::StatelessSharedPrefix)
-                    {
-                        caps.record_shared_prefix_usage(in_tok, cache_tok);
-                    }
-                    if caps != initial_caps {
-                        let mut map = self.endpoint_caps.lock().unwrap_or_else(|p| p.into_inner());
-                        map.insert(cap_key.clone(), caps);
-                        save_endpoint_caps(&self.paths, &map);
-                    }
 
-                    let raw_content = parsed["choices"][0]["message"]["content"].as_str().map(str::trim).unwrap_or("");
-                    if raw_content.is_empty() || raw_content.contains("<tool_use") || raw_content.contains("DSML") {
-                        let finish_reason = parsed["choices"][0]["finish_reason"].as_str().unwrap_or("");
-                        let reason = if raw_content.is_empty() {
-                            if finish_reason == "length" {
-                                "empty assistant content (finish_reason=length)"
-                            } else {
-                                "empty assistant content"
-                            }
-                        } else {
-                            "unexpected tool-call markup in content"
-                        };
                         if let Some(g) = probe_guard.as_mut() {
                             g.settle();
                         }
-                        // Content-only errors must NOT trip the global circuit breaker.
                         self.record_success();
-                        self.record_op_failure(&req.op);
-                        return Err(reason.into());
+                        self.record_network_usage(&req.op, &usage, session_reused, latency_ms);
+                        if let Some(st) = session_guard.as_deref_mut() {
+                            st.commit_turn(system_hash, &model, fresh_base, bounded_user, raw_content.clone());
+                        }
+                        if let (Some(ck), Some(ttl)) = (req.cache_key, req.cache_ttl) {
+                            self.result_cache.put(ck, raw_content.clone(), ttl);
+                        }
+                        return Ok(AiCompleteResponse {
+                            content: raw_content,
+                            model,
+                            latency_ms,
+                            usage,
+                            from_local_cache: false,
+                            session_reused,
+                        });
                     }
-
-                    if let Some(g) = probe_guard.as_mut() {
-                        g.settle();
+                    Ok(http_resp) => {
+                        let status = http_resp.status;
+                        let snippet: String = http_resp.body.chars().take(160).collect();
+                        let msg = format!("HTTP {status}: {snippet}");
+                        proto_err = Some(AttemptError {
+                            status: Some(status),
+                            retry_after_secs: http_resp.retry_after_secs,
+                            message: msg,
+                            is_parse_error: false,
+                        });
+                        if status == 401 || status == 403 || status == 429 {
+                            should_try_other_protocol = proto_idx == 0 && remembered_proto.is_none() && status != 429;
+                            break;
+                        }
+                        if matches!(status, 404 | 405 | 501) || (remembered_proto.is_none() && proto_idx == 0) {
+                            should_try_other_protocol = proto_idx == 0;
+                        }
                     }
-                    self.record_success();
-                    self.record_network_usage(&req.op, &usage, session_reused, latency_ms);
-                    if let Some(st) = session_guard.as_deref_mut() {
-                        st.commit_turn(system_hash, &model, fresh_base, bounded_user, raw_content.to_string());
+                    Err(e) => {
+                        proto_err = Some(AttemptError {
+                            status: None,
+                            retry_after_secs: None,
+                            message: e,
+                            is_parse_error: false,
+                        });
                     }
-                    if let (Some(ck), Some(ttl)) = (req.cache_key, req.cache_ttl) {
-                        self.result_cache.put(ck, raw_content.to_string(), ttl);
-                    }
-                    return Ok(AiCompleteResponse {
-                        content: raw_content.to_string(),
-                        model,
-                        latency_ms,
-                        usage,
-                        from_local_cache: false,
-                        session_reused,
-                    });
-                }
-                Ok(http_resp) => {
-                    let status = http_resp.status;
-                    let snippet: String = http_resp.body.chars().take(160).collect();
-                    last_err = format!("HTTP {status}: {snippet}");
-                    if let Some(g) = probe_guard.as_mut() {
-                        g.settle();
-                    }
-                    self.record_op_failure(&req.op);
-                    if status == 401 || status == 403 {
-                        self.record_auth_failure(&last_err);
-                        return Err(last_err);
-                    }
-                    if status == 429 {
-                        self.record_rate_limit(http_resp.retry_after_secs, &last_err);
-                        return Err(last_err);
-                    }
-                    self.record_failure(&last_err);
-                }
-                Err(e) => {
-                    last_err = e;
-                    if let Some(g) = probe_guard.as_mut() {
-                        g.settle();
-                    }
-                    self.record_op_failure(&req.op);
-                    self.record_failure(&last_err);
                 }
             }
+
+            if let Some(err) = proto_err {
+                protocol_errors.push(err);
+            }
+            if !should_try_other_protocol {
+                break;
+            }
         }
-        Err(last_err)
+
+        let chosen_err = match (protocol_errors.first(), protocol_errors.get(1)) {
+            (Some(p), Some(s)) => {
+                let p_missing = matches!(p.status, Some(404 | 405 | 501));
+                let s_missing = matches!(s.status, Some(404 | 405 | 501));
+                if p_missing && !s_missing { s.clone() } else { p.clone() }
+            }
+            (Some(p), None) => p.clone(),
+            _ => AttemptError {
+                status: None,
+                retry_after_secs: None,
+                message: "AI endpoint did not respond".into(),
+                is_parse_error: false,
+            },
+        };
+
+        if let Some(g) = probe_guard.as_mut() {
+            g.settle();
+        }
+        if chosen_err.is_parse_error {
+            self.record_success();
+            self.record_parse_error(&req.op);
+            self.record_op_failure(&req.op);
+        } else {
+            self.record_op_failure(&req.op);
+            match chosen_err.status {
+                Some(401 | 403) => self.record_auth_failure(&chosen_err.message),
+                Some(429) => self.record_rate_limit(chosen_err.retry_after_secs, &chosen_err.message),
+                _ => self.record_failure(&chosen_err.message),
+            }
+        }
+        Err(chosen_err.message)
     }
 
     /// Out-of-lock async summary for failed/non-zero-exited child agents delivered via `<h2>` notes.
@@ -2584,6 +2793,300 @@ mod tests {
         let repl_after_clear = rt.sync_params_after_update(&clear_patch);
         assert_eq!(repl_after_clear.api_key, None);
         assert_eq!(repl_after_clear.clear_key, Some(true));
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    async fn spawn_mock_anthropic(
+        require_bearer: bool,
+        responses: Vec<(u16, String)>,
+    ) -> (String, Arc<Mutex<Vec<(String, String, serde_json::Value)>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let cap_clone = captured.clone();
+        let queue = Arc::new(Mutex::new(std::collections::VecDeque::from(responses)));
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let cap = cap_clone.clone();
+                let q = queue.clone();
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut tmp = [0u8; 4096];
+                    let mut header_end = None;
+                    let mut content_len = 0usize;
+                    while let Ok(n) = sock.read(&mut tmp).await {
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if header_end.is_none()
+                            && let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                        {
+                            header_end = Some(pos + 4);
+                            let head = String::from_utf8_lossy(&buf[..pos]);
+                            for line in head.lines() {
+                                if let Some((k, v)) = line.split_once(':')
+                                    && k.trim().eq_ignore_ascii_case("content-length")
+                                {
+                                    content_len = v.trim().parse().unwrap_or(0);
+                                }
+                            }
+                        }
+                        if let Some(he) = header_end
+                            && buf.len() >= he + content_len
+                        {
+                            break;
+                        }
+                    }
+                    let head = String::from_utf8_lossy(&buf[..header_end.unwrap_or(buf.len())]).into_owned();
+                    let head_lower = head.to_ascii_lowercase();
+                    let req_line = head.lines().next().unwrap_or("").to_string();
+                    let has_version = head_lower.contains("anthropic-version: 2023-06-01");
+                    let has_x_api_key = head_lower.contains("x-api-key: sk-claude-secret");
+                    let has_bearer = head_lower.contains("authorization: bearer sk-claude-secret");
+                    let auth_ok = if require_bearer { has_bearer } else { has_x_api_key };
+
+                    let write_resp = |status: u16, body: &str| {
+                        let status_text = match status {
+                            200 => "OK",
+                            401 => "Unauthorized",
+                            404 => "Not Found",
+                            _ => "Bad Request",
+                        };
+                        format!(
+                            "HTTP/1.1 {status} {status_text}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                    };
+
+                    if req_line.contains("/chat/completions") {
+                        let http = write_resp(404, r#"{"error":{"message":"not an openai endpoint"}}"#);
+                        let _ = sock.write_all(http.as_bytes()).await;
+                        return;
+                    }
+                    if !has_version || !auth_ok {
+                        let http = write_resp(401, r#"{"type":"error","error":{"message":"missing anthropic auth"}}"#);
+                        let _ = sock.write_all(http.as_bytes()).await;
+                        return;
+                    }
+                    if req_line.starts_with("GET ") && req_line.contains("/models") {
+                        let body = r#"{"data":[{"id":"claude-sonnet-4-6","type":"model"},{"id":"claude-haiku-4-5","type":"model"}]}"#;
+                        let http = write_resp(200, body);
+                        let _ = sock.write_all(http.as_bytes()).await;
+                        return;
+                    }
+                    if req_line.starts_with("POST ") && req_line.contains("/messages") {
+                        let body_val = header_end
+                            .and_then(|he| {
+                                serde_json::from_slice::<serde_json::Value>(&buf[he..buf.len().min(he + content_len)])
+                                    .ok()
+                            })
+                            .unwrap_or(Value::Null);
+                        cap.lock().unwrap().push((req_line, head, body_val));
+                        let (status, resp_body) = q.lock().unwrap().pop_front().unwrap_or_else(|| {
+                            (
+                                200,
+                                r#"{"id":"msg_1","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"text","text":"{\"ok\":true}"}],"stop_reason":"end_turn","usage":{"input_tokens":20,"cache_creation_input_tokens":1400,"cache_read_input_tokens":0,"output_tokens":12}}"#
+                                    .into(),
+                            )
+                        });
+                        let http = write_resp(status, &resp_body);
+                        let _ = sock.write_all(http.as_bytes()).await;
+                        return;
+                    }
+                    let http = write_resp(404, r#"{"error":{"message":"unknown path"}}"#);
+                    let _ = sock.write_all(http.as_bytes()).await;
+                });
+            }
+        });
+        // Intentionally neutral URL with no "anthropic" or "claude" hint to prove full auto-detection.
+        (format!("http://127.0.0.1:{}/v1", addr.port()), captured)
+    }
+
+    #[tokio::test]
+    async fn auto_detects_claude_protocol_persists_memory_and_tracks_cache_usage() {
+        let tmp = crate::test_tmp().join(format!("ai-claude-auto-{}", crate::platform::random_hex()));
+        let paths = Paths {
+            socket: tmp.join("core.sock"),
+            holder_socket: tmp.join("holder.sock"),
+            state: tmp.join("state"),
+            config: tmp.join("config/config.toml"),
+        };
+        paths.create_dirs().unwrap();
+
+        let (url, captured) = spawn_mock_anthropic(
+            false,
+            vec![
+                // 1. Test connection probe
+                (
+                    200,
+                    r#"{"id":"msg_test","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"text","text":"OK"}],"stop_reason":"end_turn","usage":{"input_tokens":8,"output_tokens":2}}"#
+                        .into(),
+                ),
+                // 2. First real completion (writes cache)
+                (
+                    200,
+                    r#"{"id":"msg_2","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"thinking","thinking":"hmm"},{"type":"text","text":"{\"headline\":\"all healthy\"}"}],"stop_reason":"end_turn","usage":{"input_tokens":40,"cache_creation_input_tokens":1500,"cache_read_input_tokens":0,"output_tokens":16}}"#
+                        .into(),
+                ),
+                // 3. Second real completion (hits cache)
+                (
+                    200,
+                    r#"{"id":"msg_3","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"text","text":"{\"headline\":\"cached hit\"}"}],"stop_reason":"end_turn","usage":{"input_tokens":40,"cache_creation_input_tokens":0,"cache_read_input_tokens":1500,"output_tokens":14}}"#
+                        .into(),
+                ),
+            ],
+        )
+        .await;
+
+        let rt = AiRuntime::open(&paths).unwrap();
+        let saved = rt
+            .update_settings(AiSettingsSetParams {
+                enabled: Some(true),
+                base_url: Some(url.clone()),
+                api_key: Some("sk-claude-secret".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(saved.available_models, vec!["claude-sonnet-4-6", "claude-haiku-4-5"]);
+        assert_eq!(saved.protocol, Some(AiProtocol::Anthropic));
+
+        // Explicit test_connection verifies Claude protocol and reports it.
+        let test_res = rt.test_connection(None, None, None).await.unwrap();
+        assert!(test_res.ok, "test failed: {test_res:?}");
+        assert_eq!(test_res.protocol, Some(AiProtocol::Anthropic));
+        assert_eq!(test_res.discovered_model.as_deref(), Some("claude-sonnet-4-6"));
+        assert_eq!(rt.status().protocol, Some(AiProtocol::Anthropic));
+
+        // Completions go straight to POST /v1/messages with top-level system + cache_control.
+        let c1 = rt
+            .complete_fg(AiCompleteRequest {
+                op: "catchup_briefing".into(),
+                tier: AiTaskTier::Nano,
+                mode: AiConversationMode::StatelessSharedPrefix,
+                user_prompt: "brief 1".into(),
+                max_tokens: 128,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(c1.content, r#"{"headline":"all healthy"}"#);
+        assert_eq!(c1.usage.input_tokens, 1540);
+        assert_eq!(c1.usage.cached_input_tokens, 0);
+
+        let c2 = rt
+            .complete_fg(AiCompleteRequest {
+                op: "catchup_briefing".into(),
+                tier: AiTaskTier::Nano,
+                mode: AiConversationMode::StatelessSharedPrefix,
+                user_prompt: "brief 2".into(),
+                max_tokens: 128,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(c2.content, r#"{"headline":"cached hit"}"#);
+        assert_eq!(c2.usage.input_tokens, 1540);
+        assert_eq!(c2.usage.cached_input_tokens, 1500);
+
+        let st = rt.status();
+        assert_eq!(st.protocol, Some(AiProtocol::Anthropic));
+        assert_eq!(st.usage.prompt_cache_detected_mode.as_deref(), Some("shared_prefix"));
+        assert!(!st.circuit_open);
+        assert_eq!(st.usage.op_metrics.get("catchup_briefing").map(|m| m.failures), Some(0));
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 3);
+        assert!(reqs[1].0.contains("/v1/messages"));
+        assert_eq!(reqs[1].2["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(reqs[1].2.get("prompt_cache_key").is_none());
+
+        // Persisted protocol survives restart.
+        let rt2 = AiRuntime::open(&paths).unwrap();
+        assert_eq!(rt2.status().protocol, Some(AiProtocol::Anthropic));
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn claude_complete_auto_falls_back_from_openai_and_supports_bearer_proxies_and_cache_control_fallback() {
+        let tmp = crate::test_tmp().join(format!("ai-claude-bearer-{}", crate::platform::random_hex()));
+        let paths = Paths {
+            socket: tmp.join("core.sock"),
+            holder_socket: tmp.join("holder.sock"),
+            state: tmp.join("state"),
+            config: tmp.join("config/config.toml"),
+        };
+        paths.create_dirs().unwrap();
+
+        let (url, captured) = spawn_mock_anthropic(
+            true, // Proxy requires Authorization: Bearer + anthropic-version
+            vec![
+                // Reject cache_control on first attempt -> runtime falls back to plain string system and remembers.
+                (400, r#"{"type":"error","error":{"message":"unsupported field cache_control"}}"#.into()),
+                (
+                    200,
+                    r#"{"id":"msg_b1","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"text","text":"{\"ok\":true}"}],"stop_reason":"end_turn","usage":{"input_tokens":80,"output_tokens":10}}"#
+                        .into(),
+                ),
+                (
+                    200,
+                    r#"{"id":"msg_b2","type":"message","role":"assistant","model":"claude-sonnet-4-6","content":[{"type":"text","text":"{\"ok\":true}"}],"stop_reason":"end_turn","usage":{"input_tokens":80,"output_tokens":10}}"#
+                        .into(),
+                ),
+            ],
+        )
+        .await;
+
+        let rt = AiRuntime::open(&paths).unwrap();
+        rt.update_settings(AiSettingsSetParams {
+            enabled: Some(true),
+            base_url: Some(url),
+            model: Some("claude-sonnet-4-6".into()),
+            api_key: Some("sk-claude-secret".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let r1 = rt
+            .complete_fg(AiCompleteRequest {
+                op: "custom".into(),
+                tier: AiTaskTier::Fast,
+                mode: AiConversationMode::StatelessSharedPrefix,
+                user_prompt: "ping 1".into(),
+                max_tokens: 64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(r1.content, r#"{"ok":true}"#);
+        assert_eq!(rt.status().protocol, Some(AiProtocol::Anthropic));
+
+        // Second call remembers both Anthropic protocol, Bearer auth, and cache_control=false!
+        let r2 = rt
+            .complete_fg(AiCompleteRequest {
+                op: "custom".into(),
+                tier: AiTaskTier::Fast,
+                mode: AiConversationMode::StatelessSharedPrefix,
+                user_prompt: "ping 2".into(),
+                max_tokens: 64,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(r2.content, r#"{"ok":true}"#);
+
+        let reqs = captured.lock().unwrap();
+        assert_eq!(reqs.len(), 3);
+        assert!(reqs[0].2["system"].is_array());
+        assert!(reqs[1].2["system"].is_string());
+        assert!(reqs[2].2["system"].is_string());
+        assert!(reqs[2].1.to_ascii_lowercase().contains("authorization: bearer sk-claude-secret"));
 
         let _ = std::fs::remove_dir_all(tmp);
     }

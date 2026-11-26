@@ -1,5 +1,6 @@
 //! ACP session lifecycle: handshake, serial prompt inbox queue, updates, and permissions.
 
+pub mod commands;
 pub mod media;
 pub mod presets;
 pub mod proto;
@@ -12,11 +13,11 @@ use crate::runtime::{Core, Exit};
 use crate::status::StatusReport;
 use crate::transcript::{Attachment, Entry};
 use proto::{
-    AcpConfigChoice, AcpConfigOption, AcpContextUsage, EnvVar, InitializeParams, InitializeResult, ParsedUpdate,
-    PromptCapabilities, SessionCancelParams, SessionLoadParams, SessionNewParams, SessionNewResult,
-    SessionPromptParams, SessionPromptResult, SessionSetConfigOptionParams, SessionSetModeParams,
-    SessionSetModelParams, StdioMcpServer, parse_request_permission, parse_session_config, parse_session_update,
-    permission_cancelled, permission_selected,
+    AcpAvailableCommand, AcpConfigChoice, AcpConfigOption, AcpContextUsage, EnvVar, InitializeParams,
+    InitializeResult, ParsedUpdate, PromptCapabilities, SessionCancelParams, SessionLoadParams, SessionNewParams,
+    SessionNewResult, SessionPromptParams, SessionPromptResult, SessionSetConfigOptionParams, SessionSetModeParams,
+    SessionSetModelParams, StdioMcpServer, parse_available_commands, parse_request_permission, parse_session_config,
+    parse_session_update, permission_cancelled, permission_selected,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -110,6 +111,7 @@ pub struct StartedSession {
     pub resumed_session: bool,
     pub prompt_capabilities: PromptCapabilities,
     pub config_options: Vec<AcpConfigOption>,
+    pub available_commands: Vec<AcpAvailableCommand>,
     pub context_usage: Option<AcpContextUsage>,
 }
 
@@ -118,6 +120,7 @@ pub async fn spawn_session(mut spec: SpawnSpec) -> Result<StartedSession, RpcErr
     if spec.dangerously_skip_permissions {
         presets::ensure_agy_skip_permissions(&mut spec.argv);
     }
+    presets::check_claude_acp_readiness(&spec.argv, &spec.env)?;
     presets::apply_cursor_env_quirks(&spec.argv, &mut spec.env);
     presets::apply_codex_env_quirks(&spec.argv, &mut spec.env);
     let (transport, waiter, mut inbound_rx) = Transport::spawn(&spec.argv, &spec.env, &spec.cwd)?;
@@ -141,6 +144,7 @@ pub async fn spawn_session(mut spec: SpawnSpec) -> Result<StartedSession, RpcErr
         resumed_session: init_res.resumed_session,
         prompt_capabilities: init_res.prompt_capabilities,
         config_options: init_res.config_options,
+        available_commands: init_res.available_commands,
         context_usage: init_res.context_usage,
     })
 }
@@ -152,6 +156,7 @@ struct SetupOk {
     resumed_session: bool,
     prompt_capabilities: PromptCapabilities,
     config_options: Vec<AcpConfigOption>,
+    available_commands: Vec<AcpAvailableCommand>,
     context_usage: Option<AcpContextUsage>,
 }
 
@@ -746,11 +751,11 @@ async fn setup_session(
         merged
     };
 
-    let (session_id, mut config_options, context_usage, resumed_session) =
+    let (session_id, mut config_options, mut available_commands, context_usage, resumed_session) =
         match (spec.resume_session_id.as_deref(), can_load_session) {
             (Some(prev_id), true) => {
                 match load_session(transport, prev_id, spec, server.as_ref()).await {
-                    Ok(mut opts) => {
+                    Ok((mut opts, mut cmds)) => {
                         let mut usage = None;
                         // Drain historical session/update notifications replayed by session/load
                         // before returning so run_actor does not append old turns onto the next turn.
@@ -760,24 +765,25 @@ async fn setup_session(
                             {
                                 match parsed {
                                     ParsedUpdate::ConfigOptions(fresh) => opts = fresh,
+                                    ParsedUpdate::AvailableCommands(fresh) => cmds = fresh,
                                     ParsedUpdate::Usage(u) => usage = Some(u),
                                     _ => {}
                                 }
                             }
                         }
-                        (prev_id.to_string(), opts, usage, true)
+                        (prev_id.to_string(), opts, cmds, usage, true)
                     }
                     Err(_) => {
                         let fallback_spec = new_with_fallback(spec);
-                        let (sid, opts) = new_session(transport, &fallback_spec, server.as_ref()).await?;
-                        (sid, opts, None, false)
+                        let (sid, opts, cmds) = new_session(transport, &fallback_spec, server.as_ref()).await?;
+                        (sid, opts, cmds, None, false)
                     }
                 }
             }
             _ => {
                 let fallback_spec = new_with_fallback(spec);
-                let (sid, opts) = new_session(transport, &fallback_spec, server.as_ref()).await?;
-                (sid, opts, None, false)
+                let (sid, opts, cmds) = new_session(transport, &fallback_spec, server.as_ref()).await?;
+                (sid, opts, cmds, None, false)
             }
         };
 
@@ -870,6 +876,19 @@ async fn setup_session(
         }
     }
 
+    // Capture any immediate available_commands_update emitted during session setup.
+    while let Ok(msg) = inbound_rx.try_recv() {
+        if let Inbound::Update(params) = msg
+            && let Some((_, parsed)) = parse_session_update(&params)
+        {
+            match parsed {
+                ParsedUpdate::AvailableCommands(fresh) => available_commands = fresh,
+                ParsedUpdate::ConfigOptions(fresh) => config_options = fresh,
+                _ => {}
+            }
+        }
+    }
+
     Ok(SetupOk {
         session_id,
         agent_info,
@@ -877,6 +896,7 @@ async fn setup_session(
         resumed_session,
         prompt_capabilities,
         config_options,
+        available_commands,
         context_usage,
     })
 }
@@ -911,7 +931,7 @@ async fn new_session(
     transport: &Transport,
     spec: &SpawnSpec,
     mcp: Option<&StdioMcpServer>,
-) -> Result<(String, Vec<AcpConfigOption>), RpcError> {
+) -> Result<(String, Vec<AcpConfigOption>, Vec<AcpAvailableCommand>), RpcError> {
     let meta = build_session_meta(spec, true);
 
     for tagged in [true, false] {
@@ -920,9 +940,10 @@ async fn new_session(
         match transport.request("session/new", &params, HANDSHAKE_TIMEOUT).await {
             Ok(val) => {
                 let config_options = parse_session_config(&val);
+                let available_commands = parse_available_commands(&val);
                 let parsed: SessionNewResult = serde_json::from_value(val)
                     .map_err(|e| RpcError::new("spawn_failed", format!("invalid session/new result: {e}"), ""))?;
-                return Ok((parsed.session_id, config_options));
+                return Ok((parsed.session_id, config_options, available_commands));
             }
             Err(e) if tagged && e.is_invalid_params() && mcp.is_some() => continue,
             Err(e) => return Err(e.into_rpc_error("ACP session/new failed", &transport.recent_stderr())),
@@ -936,14 +957,14 @@ async fn load_session(
     session_id: &str,
     spec: &SpawnSpec,
     mcp: Option<&StdioMcpServer>,
-) -> Result<Vec<AcpConfigOption>, CallError> {
+) -> Result<(Vec<AcpConfigOption>, Vec<AcpAvailableCommand>), CallError> {
     let meta = build_session_meta(spec, false);
     for tagged in [true, false] {
         let mcp_servers = mcp.map(|m| m.to_value(tagged)).into_iter().collect();
         let params =
             SessionLoadParams { session_id: session_id.into(), cwd: spec.cwd.clone(), mcp_servers, meta: meta.clone() };
         match transport.request("session/load", &params, HANDSHAKE_TIMEOUT).await {
-            Ok(val) => return Ok(parse_session_config(&val)),
+            Ok(val) => return Ok((parse_session_config(&val), parse_available_commands(&val))),
             Err(e) if tagged && e.is_invalid_params() && mcp.is_some() => continue,
             Err(e) => return Err(e),
         }
@@ -1412,6 +1433,7 @@ pub async fn rollback_acp_agent(
         let prompt_caps = started.prompt_capabilities;
         let agent_info = started.agent_info.clone();
         let config_options = started.config_options.clone();
+        let available_commands = started.available_commands.clone();
         let context_usage = started.context_usage.clone();
 
         let new_handle = spawn_actor(Arc::clone(core), id, started);
@@ -1448,6 +1470,9 @@ pub async fn rollback_acp_agent(
             a.can_load_session = can_load;
             a.prompt_capabilities = Some(prompt_caps);
             a.config_options = config_options;
+            if !available_commands.is_empty() {
+                a.available_commands = available_commands;
+            }
             if let Some(info) = agent_info {
                 a.agent_info = Some(info);
             }
@@ -1622,6 +1647,18 @@ fn handle_update(core: &Core, id: u32, turn_num: u64, params: &Value) {
                 let data = config_event_data(a);
                 core.emit(&mut st, "config", id, data);
                 core.save(&st);
+            }
+            return;
+        }
+        ParsedUpdate::AvailableCommands(cmds) => {
+            let mut st = core.lock();
+            if let Some(a) = st.reg.agents.get_mut(&id) {
+                if a.available_commands != cmds {
+                    a.available_commands = cmds;
+                    let data = json!({ "available_commands": a.available_commands });
+                    core.emit(&mut st, "commands", id, data);
+                    core.save_soon();
+                }
             }
             return;
         }

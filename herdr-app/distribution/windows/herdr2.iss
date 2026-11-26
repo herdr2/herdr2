@@ -7,7 +7,7 @@
 ;   iscc /DMyAppVersion=0.2.0 /DAppStageDir=dist\stage-app /DCoreStageDir=dist\stage-core /DOutputDir=dist\installers herdr-app\distribution\windows\herdr2.iss
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.0.9"
+  #define MyAppVersion "2.0.10"
 #endif
 #ifndef AppStageDir
   #define AppStageDir "..\..\dist\stage-app"
@@ -64,8 +64,8 @@ Source: "{#CoreStageDir}\THIRD-PARTY-NOTICES"; DestDir: "{localappdata}\Programs
 Source: "{#CoreStageDir}\conpty\*"; DestDir: "{localappdata}\Programs\h2\conpty"; Flags: ignoreversion recursesubdirs createallsubdirs skipifsourcedoesntexist
 
 [Icons]
-Name: "{autoprograms}\Herdr2"; Filename: "{app}\herdr2.exe"; WorkingDir: "{%USERPROFILE}"
-Name: "{autodesktop}\Herdr2"; Filename: "{app}\herdr2.exe"; WorkingDir: "{%USERPROFILE}"; Tasks: desktopicon
+Name: "{autoprograms}\Herdr2"; Filename: "{app}\herdr2.exe"; WorkingDir: "{%USERPROFILE}"; IconFilename: "{app}\herdr2.exe"; IconIndex: 0
+Name: "{autodesktop}\Herdr2"; Filename: "{app}\herdr2.exe"; WorkingDir: "{%USERPROFILE}"; IconFilename: "{app}\herdr2.exe"; IconIndex: 0; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\herdr2.exe"; Description: "Launch Herdr2 now"; Flags: nowait postinstall skipifsilent

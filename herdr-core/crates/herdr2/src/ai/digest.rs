@@ -757,7 +757,7 @@ fn sample_untracked_files(cwd: &str, untracked_paths: &[String]) -> String {
 }
 
 fn run_git_ro(cwd: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new("git")
+    let out = crate::platform::bg_command("git")
         .arg("--no-optional-locks")
         .arg("-c")
         .arg("core.fsmonitor=false")

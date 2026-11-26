@@ -120,6 +120,32 @@ pub fn is_shell_line(argv: &[String]) -> bool {
     argv.len() == 5 && is_cmd(&argv[0]) && argv[1..4] == ["/d", "/s", "/c"]
 }
 
+/// Formats raw `cmd.exe /d /s /c`, `/d /s /k`, or `/d /k` tails without MSVC
+/// backslash-escaping inner quotes (which `cmd.exe` does not understand).
+pub fn cmd_raw_tail(argv: &[String]) -> Option<String> {
+    let program = argv.first()?;
+    let name = std::path::Path::new(program).file_name().and_then(|f| f.to_str()).unwrap_or_default();
+    if !(name.eq_ignore_ascii_case("cmd.exe") || name.eq_ignore_ascii_case("cmd")) {
+        return None;
+    }
+    if argv.len() == 5
+        && argv[1].eq_ignore_ascii_case("/d")
+        && argv[2].eq_ignore_ascii_case("/s")
+        && (argv[3].eq_ignore_ascii_case("/c") || argv[3].eq_ignore_ascii_case("/k"))
+    {
+        let mode = if argv[3].eq_ignore_ascii_case("/k") { "/k" } else { "/c" };
+        return Some(format!("/d /s {mode} \"{}\"", argv[4]));
+    }
+    if argv.len() == 4 && argv[1].eq_ignore_ascii_case("/d") && argv[2].eq_ignore_ascii_case("/k") {
+        let mut raw = argv[3].trim();
+        if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') && raw[1..raw.len() - 1].contains('"') {
+            raw = &raw[1..raw.len() - 1];
+        }
+        return Some(format!("/d /s /k \"{raw}\""));
+    }
+    None
+}
+
 /// Returns once the child exited (a job holds what it started, so reaping
 /// it early is safe).
 pub async fn exited(child: &mut tokio::process::Child) {

@@ -256,6 +256,14 @@ export function DaemonView({
                   <span className="panel-field__key">{t("daemon.endpoint")}</span>
                   <span className="panel-field__val mono">{aiStatus.baseUrl}</span>
                 </div>
+                {aiStatus.protocol && (
+                  <div className="panel-field">
+                    <span className="panel-field__key">{t("daemon.protocol")}</span>
+                    <span className="panel-field__val mono">
+                      {aiStatus.protocol === "anthropic" ? "Claude (Anthropic)" : "OpenAI"}
+                    </span>
+                  </div>
+                )}
                 <div className="panel-field">
                   <span className="panel-field__key">{t("daemon.keySource")}</span>
                   <span className="panel-field__val mono" title={aiStatus.keyFilePath}>{aiStatus.keySource}</span>

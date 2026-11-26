@@ -1,6 +1,6 @@
 //! Structured transcript extraction for terminal-hosted coding agents (Claude Code,
-//! Codex CLI, Gemini CLI, Qwen Code, Pi / oh-my-pi, and Antigravity CLI) plus
-//! optimistic merging of prompts sent via `h2 send`.
+//! Codex CLI, Cursor CLI, Gemini CLI, Qwen Code, Pi / oh-my-pi, and Antigravity CLI)
+//! plus optimistic merging of prompts sent via `h2 send`.
 
 use crate::acp::proto::AcpContextUsage;
 use crate::api::ReadSessionMeta;
@@ -40,6 +40,7 @@ pub struct PtySnapshot {
 enum Provider {
     Claude,
     Codex,
+    Cursor,
     Gemini,
     Qwen,
     Pi,
@@ -51,6 +52,7 @@ impl Provider {
         match self {
             Provider::Claude => "claude",
             Provider::Codex => "codex",
+            Provider::Cursor => "cursor",
             Provider::Gemini => "gemini",
             Provider::Qwen => "qwen",
             Provider::Pi => "pi",
@@ -109,7 +111,7 @@ struct Candidate {
 
 fn candidate_session_id(c: &Candidate) -> Option<String> {
     match c.provider {
-        Provider::Claude | Provider::Qwen => c
+        Provider::Claude | Provider::Cursor | Provider::Qwen => c
             .path
             .file_stem()
             .and_then(|s| s.to_str())
@@ -338,6 +340,11 @@ fn extract_transcript_with_home(
                 &norm_cwd,
                 if snap.pinned_session_id.is_some() { 0 } else { min_mtime },
             ),
+            Provider::Cursor => discover_cursor(
+                home,
+                &norm_cwd,
+                if snap.pinned_session_id.is_some() { 0 } else { min_mtime },
+            ),
             Provider::Gemini => discover_gemini_or_qwen(home, ".gemini", Provider::Gemini, &norm_cwd, min_mtime),
             Provider::Qwen => discover_qwen(home, &norm_cwd, min_mtime),
             Provider::Pi => discover_pi(home, &norm_cwd, min_mtime),
@@ -378,6 +385,7 @@ fn extract_transcript_with_home(
             let (entries, mut meta) = match best.provider {
                 Provider::Claude => parse_claude_jsonl(&best.path),
                 Provider::Codex => parse_codex_jsonl(&best.path),
+                Provider::Cursor => parse_cursor_jsonl(&best.path),
                 Provider::Gemini => parse_gemini_json(&best.path),
                 Provider::Qwen => {
                     if best.path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
@@ -406,6 +414,7 @@ fn ordered_providers(hint: Option<&str>) -> Vec<Provider> {
     match hint {
         Some("claude") => vec![Provider::Claude],
         Some("codex") => vec![Provider::Codex],
+        Some("cursor") => vec![Provider::Cursor],
         Some("gemini") => vec![Provider::Gemini],
         Some("qwen") => vec![Provider::Qwen],
         Some("pi") => vec![Provider::Pi],
@@ -424,6 +433,9 @@ fn hint_from_label(raw: &str) -> Option<&'static str> {
     }
     if lower == "codex" {
         return Some("codex");
+    }
+    if lower == "cursor" || lower == "cursor-agent" || lower == "cursor agent" {
+        return Some("cursor");
     }
     if lower == "gemini" || lower == "gemini-cli" {
         return Some("gemini");
@@ -466,14 +478,78 @@ fn detect_agent_hint(t: &Terminal) -> Option<String> {
     None
 }
 
+fn strip_known_token_ext(s: &str) -> &str {
+    for ext in [".exe", ".cmd", ".bat", ".ps1", ".js", ".mjs", ".cjs", ".ts", ".py", ".rb"] {
+        if let Some(prefix) = s.strip_suffix(ext) {
+            return prefix;
+        }
+    }
+    s
+}
+
+fn hint_from_single_word(raw: &str) -> Option<&'static str> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || trimmed.starts_with('-') {
+        return None;
+    }
+    let base = trimmed.rsplit(['/', '\\']).next().unwrap_or(trimmed).to_ascii_lowercase();
+    let stem = strip_known_token_ext(&base);
+    let clean = stem.strip_suffix(".real").unwrap_or(stem);
+    if let Some(h) = hint_from_label(clean) {
+        return Some(h);
+    }
+    // Check bundled versioned runtime paths (e.g. `...\cursor-agent\versions\<ver>\node.exe`,
+    // `...\cursor-agent\versions\<ver>\index.js`, `/home/u/.local/share/claude/versions/2.1.325`)
+    // and `node_modules` package layouts.
+    if trimmed.contains('/') || trimmed.contains('\\') {
+        let segs: Vec<&str> = trimmed.split(['/', '\\']).filter(|s| !s.is_empty()).collect();
+        for i in (1..segs.len().saturating_sub(1)).rev() {
+            if segs[i].eq_ignore_ascii_case("versions") && segs.len().saturating_sub(i) <= 4 {
+                let pkg = segs[i - 1].to_ascii_lowercase();
+                if let Some(h) = hint_from_label(&pkg) {
+                    return Some(h);
+                }
+            }
+        }
+        if let Some(nm_idx) = segs.iter().rposition(|s| s.eq_ignore_ascii_case("node_modules")) {
+            for seg in segs[nm_idx + 1..segs.len().saturating_sub(1)].iter().rev() {
+                if seg.starts_with('@') {
+                    continue;
+                }
+                let pkg = seg.to_ascii_lowercase();
+                if let Some(h) = hint_from_label(&pkg) {
+                    return Some(h);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn first_powershell_command_token(raw: &str) -> Option<&str> {
+    let rest = raw.trim_start().strip_prefix('&')?.trim_start();
+    if let Some(after) = rest.strip_prefix('\'') {
+        let end = after.find('\'')?;
+        Some(&after[..end])
+    } else if let Some(after) = rest.strip_prefix('"') {
+        let end = after.find('"')?;
+        Some(&after[..end])
+    } else {
+        rest.split_whitespace().next()
+    }
+}
+
 pub(crate) fn hint_from_words<'a>(words: impl Iterator<Item = &'a str>) -> Option<&'static str> {
     for raw in words {
         if raw.starts_with('-') {
             continue;
         }
-        let stem = Path::new(raw).file_stem().and_then(|s| s.to_str()).unwrap_or(raw).to_ascii_lowercase();
-        let clean = stem.strip_suffix(".real").unwrap_or(stem.as_str());
-        if let Some(h) = hint_from_label(clean) {
+        if let Some(h) = hint_from_single_word(raw) {
+            return Some(h);
+        }
+        if let Some(ps_cmd) = first_powershell_command_token(raw)
+            && let Some(h) = hint_from_single_word(ps_cmd)
+        {
             return Some(h);
         }
     }
@@ -514,6 +590,14 @@ fn cwd_matches(a: &str, b: &str) -> bool {
 fn mtime_ms(path: &Path) -> u64 {
     fs::metadata(path)
         .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+fn created_ms(path: &Path) -> u64 {
+    fs::metadata(path)
+        .and_then(|m| m.created())
         .ok()
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |d| d.as_millis() as u64)
@@ -2701,6 +2785,7 @@ pub(crate) fn discover_cli_transcript(
     let mut candidates = match kind {
         "claude" => discover_claude(&home, None, cwd, scan_min_mtime),
         "codex" => discover_codex(&home, None, cwd, scan_min_mtime),
+        "cursor" => discover_cursor(&home, cwd, scan_min_mtime),
         "agy" => discover_agy(&home, scan_min_mtime, fg_pid),
         _ => return None,
     };
@@ -2717,9 +2802,537 @@ pub(crate) fn parse_cli_transcript(kind: &str, path: &Path) -> Vec<Entry> {
     match kind {
         "claude" => parse_claude_jsonl(path).0,
         "codex" => parse_codex_jsonl(path).0,
+        "cursor" => parse_cursor_jsonl(path).0,
         "agy" => parse_agy_jsonl(path).0,
         _ => Vec::new(),
     }
+}
+
+fn cursor_project_slug(cwd: &str) -> String {
+    let mut out = String::with_capacity(cwd.len());
+    let mut prev_dash = true;
+    for ch in cwd.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            prev_dash = false;
+        } else if !prev_dash {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+fn discover_cursor(home: &Path, cwd: &str, min_mtime: u64) -> Vec<Candidate> {
+    let projects_dir = home.join(".cursor").join("projects");
+    if !projects_dir.is_dir() {
+        return Vec::new();
+    }
+    let slug = cursor_project_slug(cwd);
+    if slug.is_empty() {
+        return Vec::new();
+    }
+    let direct_dir = projects_dir.join(&slug);
+    let slug_dir = if direct_dir.is_dir() {
+        Some(direct_dir)
+    } else {
+        // On Windows, drive letter casing can differ (`d-Users-...` vs `D-Users-...`).
+        fs::read_dir(&projects_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .find(|p| {
+                p.is_dir()
+                    && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.eq_ignore_ascii_case(&slug))
+            })
+    };
+    let Some(slug_dir) = slug_dir else {
+        return Vec::new();
+    };
+    let transcripts_dir = slug_dir.join("agent-transcripts");
+    let Ok(entries) = fs::read_dir(&transcripts_dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let jsonl = if path.is_dir() {
+            let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let nested = path.join(format!("{name}.jsonl"));
+            if nested.is_file() {
+                nested
+            } else {
+                let Some(found) = fs::read_dir(&path)
+                    .ok()
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|e| e.path())
+                    .find(|p| p.is_file() && p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+                else {
+                    continue;
+                };
+                found
+            }
+        } else if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+            path
+        } else {
+            continue;
+        };
+        let mt = mtime_ms(&jsonl);
+        if mt > 0 && mt < min_mtime {
+            continue;
+        }
+        let first_ts = cursor_first_ts_ms(&jsonl, mt);
+        out.push(Candidate { path: jsonl, provider: Provider::Cursor, mtime_ms: mt, first_ts_ms: first_ts });
+    }
+    out
+}
+
+fn cursor_first_ts_ms(path: &Path, mtime: u64) -> u64 {
+    // Prefer exact filesystem creation time (NTFS/APFS/ext4 statx) because Cursor's inline
+    // `<timestamp>` tag has minute granularity (`11:19 AM`), which can precede `started_ms` by up to 59s.
+    let ctime = created_ms(path);
+    if ctime > 0 {
+        return ctime;
+    }
+    if let Ok(file) = File::open(path) {
+        for line in BufReader::new(file).lines().take(8).flatten() {
+            let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+                continue;
+            };
+            if let Some(ts) = extract_cursor_message_ts_ms(&v) {
+                // Minute-granular timestamp: clamp upper bound to mtime if written within the same minute.
+                return if mtime >= ts { mtime.min(ts.saturating_add(59_999)) } else { ts };
+            }
+        }
+    }
+    0
+}
+
+fn extract_cursor_message_ts_ms(v: &Value) -> Option<u64> {
+    if let Some(ts) = v.get("timestamp").and_then(Value::as_str).map(parse_ts_ms).filter(|&t| t > 0) {
+        return Some(ts);
+    }
+    let content = v.pointer("/message/content")?;
+    match content {
+        Value::String(s) => parse_cursor_timestamp_tag(s),
+        Value::Array(blocks) => blocks.iter().find_map(|b| {
+            b.get("text").and_then(Value::as_str).and_then(parse_cursor_timestamp_tag)
+        }),
+        _ => None,
+    }
+}
+
+/// Parses Cursor's inline `<timestamp>Thursday, Nov 26, 2026, 11:19 AM (UTC+8)</timestamp>` into UTC ms.
+fn parse_cursor_timestamp_tag(raw: &str) -> Option<u64> {
+    let start = raw.find("<timestamp>")?;
+    let after = &raw[start + "<timestamp>".len()..];
+    let end = after.find("</timestamp>")?;
+    parse_cursor_human_ts(&after[..end])
+}
+
+fn parse_cursor_human_ts(raw: &str) -> Option<u64> {
+    let mut s = raw.trim();
+    if s.is_empty() {
+        return None;
+    }
+    let mut tz_offset_secs: i64 = 0;
+    if let Some(open) = s.rfind('(')
+        && let Some(inside) = s[open + 1..].strip_suffix(')')
+    {
+        let tz = inside.trim();
+        if let Some(rest) = tz.strip_prefix("UTC").or_else(|| tz.strip_prefix("GMT")) {
+            let rest = rest.trim();
+            if !rest.is_empty() && (rest.starts_with('+') || rest.starts_with('-')) {
+                let sign = if rest.starts_with('+') { 1i64 } else { -1i64 };
+                let off = &rest[1..];
+                let (hh, mm) = if let Some((h, m)) = off.split_once(':') {
+                    (h.parse::<i64>().ok()?, m.parse::<i64>().ok()?)
+                } else {
+                    (off.parse::<i64>().ok()?, 0)
+                };
+                tz_offset_secs = sign * (hh * 3600 + mm * 60);
+            }
+        }
+        s = s[..open].trim();
+    }
+    // Strip optional leading weekday (`Thursday, `).
+    let parts: Vec<&str> = s.split(',').map(str::trim).filter(|p| !p.is_empty()).collect();
+    let (month_day, year_str, time_str) = match parts.as_slice() {
+        [_, md, yr, tm] => (*md, *yr, *tm),
+        [md, yr, tm] => (*md, *yr, *tm),
+        _ => return None,
+    };
+    let mut md_it = month_day.split_whitespace();
+    let mon_str = md_it.next()?;
+    let day: u32 = md_it.next()?.parse().ok()?;
+    let month: u32 = match mon_str.to_ascii_lowercase().as_str() {
+        "jan" | "january" => 1,
+        "feb" | "february" => 2,
+        "mar" | "march" => 3,
+        "apr" | "april" => 4,
+        "may" => 5,
+        "jun" | "june" => 6,
+        "jul" | "july" => 7,
+        "aug" | "august" => 8,
+        "sep" | "sept" | "september" => 9,
+        "oct" | "october" => 10,
+        "nov" | "november" => 11,
+        "dec" | "december" => 12,
+        _ => return None,
+    };
+    let year: i64 = year_str.parse().ok()?;
+    let mut tm_it = time_str.split_whitespace();
+    let clock = tm_it.next()?;
+    let ampm = tm_it.next().map(|a| a.to_ascii_uppercase());
+    let mut clock_it = clock.split(':');
+    let mut hour: i64 = clock_it.next()?.parse().ok()?;
+    let min: i64 = clock_it.next()?.parse().ok()?;
+    let sec: i64 = clock_it.next().and_then(|x| x.parse().ok()).unwrap_or(0);
+    if let Some(mer) = ampm.as_deref() {
+        match mer {
+            "AM" => {
+                if hour == 12 {
+                    hour = 0;
+                }
+            }
+            "PM" => {
+                if hour < 12 {
+                    hour += 12;
+                }
+            }
+            _ => {}
+        }
+    }
+    let days = days_from_civil(year, month, day)?;
+    let secs = days * 86_400 + hour * 3600 + min * 60 + sec - tz_offset_secs;
+    (secs >= 0).then_some((secs as u64) * 1000)
+}
+
+fn clean_cursor_user_text(raw: &str) -> String {
+    let mut s = raw.to_string();
+    while let Some(start) = s.find("<timestamp>") {
+        let after_start = start + "<timestamp>".len();
+        if let Some(rel_end) = s[after_start..].find("</timestamp>") {
+            let end = after_start + rel_end + "</timestamp>".len();
+            s.replace_range(start..end, "");
+        } else {
+            break;
+        }
+    }
+    if let Some(start) = s.find("<user_query>") {
+        let after = &s[start + "<user_query>".len()..];
+        let inner = if let Some(end) = after.find("</user_query>") { &after[..end] } else { after };
+        return strip_system_reminders(inner);
+    }
+    strip_system_reminders(&s)
+}
+
+fn summarize_cursor_tool(name: &str, input: &Value) -> (Option<String>, String) {
+    let str_field = |k: &str| input.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+    match name {
+        "Shell" | "Bash" | "RunCommand" => {
+            let title = str_field("command").or_else(|| str_field("description")).unwrap_or(name);
+            (Some("execute".into()), title.to_string())
+        }
+        "AwaitShell" => {
+            let title = match str_field("shell_id") {
+                Some(id) => format!("AwaitShell {id}"),
+                None => "AwaitShell".to_string(),
+            };
+            (Some("execute".into()), title)
+        }
+        "Read" | "ReadFile" => {
+            let path = str_field("path").or_else(|| str_field("file_path"));
+            let title = match path {
+                Some(p) => format!("Read {p}"),
+                None => "Read".to_string(),
+            };
+            (Some("read".into()), title)
+        }
+        "ReadLints" => {
+            let first_path = input
+                .get("paths")
+                .and_then(Value::as_array)
+                .and_then(|arr| arr.first())
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let title = match first_path {
+                Some(p) => format!("ReadLints {p}"),
+                None => "ReadLints".to_string(),
+            };
+            (Some("read".into()), title)
+        }
+        "Write" | "StrReplace" | "Edit" | "EditFile" | "ApplyPatch" | "Delete" => {
+            let path = str_field("path").or_else(|| str_field("file_path"));
+            let title = match path {
+                Some(p) => format!("{name} {p}"),
+                None => name.to_string(),
+            };
+            (Some("edit".into()), title)
+        }
+        "Glob" | "Grep" | "SemanticSearch" | "WebSearch" | "WebFetch" => {
+            let q = str_field("glob_pattern")
+                .or_else(|| str_field("pattern"))
+                .or_else(|| str_field("query"))
+                .or_else(|| str_field("search_term"))
+                .or_else(|| str_field("url"));
+            let title = match q {
+                Some(q) => format!("{name} {q}"),
+                None => name.to_string(),
+            };
+            (Some("search".into()), title)
+        }
+        _ => (None, name.to_string()),
+    }
+}
+
+fn cursor_tool_detail(name: &str, input: &Value) -> Option<String> {
+    match name {
+        "StrReplace" | "Edit" | "EditFile" => {
+            let path = input
+                .get("path")
+                .or_else(|| input.get("file_path"))
+                .and_then(Value::as_str)
+                .unwrap_or("file");
+            let old_t = input.get("old_string").and_then(Value::as_str).unwrap_or("");
+            let new_t = input.get("new_string").and_then(Value::as_str).unwrap_or("");
+            if old_t.is_empty() && new_t.is_empty() {
+                return None;
+            }
+            let mut diff = format!("--- {path}\n+++ {path}");
+            for line in old_t.lines().take(25) {
+                diff.push_str("\n- ");
+                diff.push_str(line);
+            }
+            for line in new_t.lines().take(25) {
+                diff.push_str("\n+ ");
+                diff.push_str(line);
+            }
+            cap_tool_detail(&diff)
+        }
+        "Write" => input
+            .get("contents")
+            .or_else(|| input.get("content"))
+            .and_then(Value::as_str)
+            .and_then(cap_tool_detail),
+        "ApplyPatch" => input
+            .as_str()
+            .or_else(|| input.get("patch").and_then(Value::as_str))
+            .and_then(cap_tool_detail),
+        "Shell" | "Bash" | "RunCommand" => {
+            let cmd = input.get("command").and_then(Value::as_str)?.trim();
+            if cmd.contains('\n') || cmd.len() > 120 { cap_tool_detail(cmd) } else { None }
+        }
+        _ => None,
+    }
+}
+
+fn complete_open_tools(entries: &mut [Entry], open_tools: &mut Vec<usize>, new_status: &str) {
+    for idx in open_tools.drain(..) {
+        if let Some(Entry::ToolCall { status, .. }) = entries.get_mut(idx)
+            && status == "in_progress"
+        {
+            *status = new_status.to_string();
+        }
+    }
+}
+
+fn parse_cursor_jsonl(path: &Path) -> (Vec<Entry>, ReadSessionMeta) {
+    let lines = read_bounded_lines(path);
+    let mut entries: Vec<Entry> = Vec::new();
+    let mut meta = ReadSessionMeta::default();
+    let mut open_tools: Vec<usize> = Vec::new();
+    let mut turn: u64 = 0;
+    let mut tool_seq: usize = 0;
+    let mut last_ts_ms: u64 = created_ms(path);
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(v) = serde_json::from_str::<Value>(trimmed) else {
+            continue;
+        };
+        if v.get("type").and_then(Value::as_str) == Some("turn_ended") {
+            let status_str = v.get("status").and_then(Value::as_str).unwrap_or("success");
+            let is_err = matches!(status_str, "error" | "failed");
+            complete_open_tools(&mut entries, &mut open_tools, if is_err { "failed" } else { "completed" });
+            if is_err
+                && let Some(err_msg) = v
+                    .get("error")
+                    .and_then(|e| e.as_str().or_else(|| e.get("message").and_then(Value::as_str)))
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+            {
+                entries.push(Entry::Error { turn, message: err_msg.to_string(), ts_ms: last_ts_ms });
+            }
+            continue;
+        }
+        let role = v.get("role").and_then(Value::as_str);
+        match role {
+            Some("user") => {
+                complete_open_tools(&mut entries, &mut open_tools, "completed");
+                if let Some(ts) = extract_cursor_message_ts_ms(&v) {
+                    last_ts_ms = ts;
+                }
+                let Some(content) = v.pointer("/message/content") else {
+                    continue;
+                };
+                let mut text_parts = Vec::new();
+                match content {
+                    Value::String(s) => {
+                        let clean = clean_cursor_user_text(s);
+                        if !clean.is_empty() {
+                            text_parts.push(clean);
+                        }
+                    }
+                    Value::Array(blocks) => {
+                        for block in blocks {
+                            if block.get("type").and_then(Value::as_str) == Some("text")
+                                && let Some(raw) = block.get("text").and_then(Value::as_str)
+                            {
+                                let clean = clean_cursor_user_text(raw);
+                                if !clean.is_empty() {
+                                    text_parts.push(clean);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                if !text_parts.is_empty() {
+                    turn += 1;
+                    entries.push(Entry::User {
+                        turn,
+                        from: None,
+                        text: text_parts.join("\n\n"),
+                        attachments: vec![],
+                        ts_ms: last_ts_ms,
+                    });
+                }
+            }
+            Some("assistant") => {
+                // Each subsequent assistant message implies tools from the prior message finished.
+                complete_open_tools(&mut entries, &mut open_tools, "completed");
+                if let Some(m) = v.pointer("/message/model").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                    meta.model = Some(m.to_string());
+                }
+                let Some(content) = v.pointer("/message/content") else {
+                    continue;
+                };
+                match content {
+                    Value::String(s) => {
+                        let clean = s.trim();
+                        if !clean.is_empty() {
+                            entries.push(Entry::Assistant {
+                                turn,
+                                text: clean.to_string(),
+                                attachments: vec![],
+                                ts_ms: last_ts_ms,
+                            });
+                        }
+                    }
+                    Value::Array(blocks) => {
+                        for block in blocks {
+                            match block.get("type").and_then(Value::as_str) {
+                                Some("thinking") => {
+                                    if let Some(text) = block
+                                        .get("thinking")
+                                        .or_else(|| block.get("text"))
+                                        .and_then(Value::as_str)
+                                    {
+                                        let clean = text.trim();
+                                        if !clean.is_empty() {
+                                            entries.push(Entry::Thought {
+                                                turn,
+                                                text: clean.to_string(),
+                                                ts_ms: last_ts_ms,
+                                            });
+                                        }
+                                    }
+                                }
+                                Some("tool_use") => {
+                                    let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+                                    let input = block.get("input").unwrap_or(&Value::Null);
+                                    if matches!(name, "TodoWrite" | "CreatePlan")
+                                        && let Some(todos) = input.get("todos").and_then(Value::as_array)
+                                    {
+                                        let items = format_todos(todos);
+                                        if !items.is_empty() {
+                                            entries.push(Entry::Plan { turn, items, ts_ms: last_ts_ms });
+                                            continue;
+                                        }
+                                    }
+                                    tool_seq += 1;
+                                    let id = block
+                                        .get("id")
+                                        .and_then(Value::as_str)
+                                        .filter(|s| !s.is_empty())
+                                        .map(str::to_string)
+                                        .unwrap_or_else(|| format!("cursor-tool-{turn}-{tool_seq}"));
+                                    let (tool_kind, title) = summarize_cursor_tool(name, input);
+                                    let detail = cursor_tool_detail(name, input);
+                                    let idx = entries.len();
+                                    entries.push(Entry::ToolCall {
+                                        turn,
+                                        id,
+                                        title,
+                                        tool_kind,
+                                        status: "in_progress".to_string(),
+                                        detail,
+                                        attachments: vec![],
+                                        ts_ms: last_ts_ms,
+                                    });
+                                    open_tools.push(idx);
+                                }
+                                Some("text") => {
+                                    if let Some(text) = block.get("text").and_then(Value::as_str) {
+                                        let clean = text.trim();
+                                        if !clean.is_empty() {
+                                            entries.push(Entry::Assistant {
+                                                turn,
+                                                text: clean.to_string(),
+                                                attachments: vec![],
+                                                ts_ms: last_ts_ms,
+                                            });
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !entries.is_empty() || !meta.is_empty() {
+        if meta.session_id.is_none()
+            && let Some(stem) = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+        {
+            meta.session_id = Some(stem.to_string());
+        }
+        meta.provider.get_or_insert_with(|| "cursor".to_string());
+    }
+    (entries, meta)
 }
 
 /// Parses RFC3339 / ISO-8601 timestamps or numeric epoch milliseconds into UTC ms.
@@ -3587,6 +4200,110 @@ mod tests {
         assert!(
             matches!(&agy_entries[2], Entry::Plan { items, .. } if items == &vec!["Step one".to_string(), "Step two".to_string()])
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn cursor_hint_and_structured_transcript_discovery_and_parsing_work() {
+        assert_eq!(
+            hint_from_words(
+                [
+                    "node.exe",
+                    r"D:\Users\zhihao.zou\AppData\Local\cursor-agent\versions\2026.10.22-27dcf5f\node.exe",
+                    r"D:\Users\zhihao.zou\AppData\Local\cursor-agent\versions\2026.10.22-27dcf5f\index.js",
+                    "--yolo",
+                    "--trust",
+                ]
+                .into_iter()
+            ),
+            Some("cursor")
+        );
+        assert_eq!(
+            hint_from_words(
+                [
+                    "powershell.exe",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-NoExit",
+                    "-Command",
+                    "& 'cursor-agent' '--yolo' '--trust'",
+                ]
+                .into_iter()
+            ),
+            Some("cursor")
+        );
+        assert_eq!(cursor_project_slug(r"D:\Users\zhihao.zou"), "D-Users-zhihao-zou");
+        assert_eq!(cursor_project_slug("/home/u/Work/co_agent"), "home-u-Work-co-agent");
+        assert!(parse_cursor_human_ts("Thursday, Nov 26, 2026, 11:19 AM (UTC+8)").is_some());
+
+        let root = tmp_dir("cursor-transcript");
+        let sid = "c28c6c39-c785-4904-b150-e5b421191e0a";
+        let tx_dir = root.join(".cursor/projects/D-Users-zhihao-zou/agent-transcripts").join(sid);
+        fs::create_dir_all(&tx_dir).unwrap();
+        let tx_path = tx_dir.join(format!("{sid}.jsonl"));
+        let lines = [
+            serde_json::json!({
+                "role": "user",
+                "message": {
+                    "content": [{
+                        "type": "text",
+                        "text": "<timestamp>Thursday, Nov 26, 2026, 11:19 AM (UTC+8)</timestamp>\n<user_query>\n检查构建脚本并修改端口\n</user_query>"
+                    }]
+                }
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "message": {
+                    "content": [
+                        { "type": "tool_use", "name": "Read", "input": { "path": "src/main.rs" } },
+                        { "type": "tool_use", "name": "StrReplace", "input": { "path": "src/main.rs", "old_string": "8080", "new_string": "9090" } },
+                        { "type": "tool_use", "name": "Shell", "input": { "command": "cargo test", "description": "Run tests" } }
+                    ]
+                }
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "message": {
+                    "content": [{ "type": "text", "text": "已将端口更新为 9090 并通过测试。" }]
+                }
+            }),
+            serde_json::json!({ "type": "turn_ended", "status": "success" }),
+        ];
+        fs::write(&tx_path, lines.iter().map(|l| l.to_string()).collect::<Vec<_>>().join("\n")).unwrap();
+
+        let now_ms = mtime_ms(&tx_path);
+        let snap = PtySnapshot {
+            cwd: r"d:\Users\zhihao.zou".into(),
+            started_ms: now_ms.saturating_sub(1_000),
+            agent_hint: Some("cursor".into()),
+            sent_prompts: Vec::new(),
+            turn: 0,
+            resumed: false,
+            fg_pid: None,
+            ..Default::default()
+        };
+        let (entries, meta) = extract_transcript_with_home(&snap, &root, None, None);
+        let meta = meta.expect("cursor session meta");
+        assert_eq!(meta.provider.as_deref(), Some("cursor"));
+        assert_eq!(meta.session_id.as_deref(), Some(sid));
+        assert_eq!(entries.len(), 5);
+        assert!(matches!(&entries[0], Entry::User { turn: 1, text, .. } if text == "检查构建脚本并修改端口"));
+        assert!(matches!(
+            &entries[1],
+            Entry::ToolCall { title, tool_kind, status, .. }
+            if title == "Read src/main.rs" && tool_kind.as_deref() == Some("read") && status == "completed"
+        ));
+        assert!(matches!(
+            &entries[2],
+            Entry::ToolCall { title, tool_kind, status, detail: Some(d), .. }
+            if title == "StrReplace src/main.rs" && tool_kind.as_deref() == Some("edit") && status == "completed" && d.contains("- 8080") && d.contains("+ 9090")
+        ));
+        assert!(matches!(
+            &entries[3],
+            Entry::ToolCall { title, tool_kind, status, .. }
+            if title == "cargo test" && tool_kind.as_deref() == Some("execute") && status == "completed"
+        ));
+        assert!(matches!(&entries[4], Entry::Assistant { turn: 1, text, .. } if text == "已将端口更新为 9090 并通过测试。"));
         fs::remove_dir_all(root).ok();
     }
 }

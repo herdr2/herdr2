@@ -582,6 +582,7 @@ features:
         - app.update_core
         - app.theme
         - app.language
+        - app.shell
         - app.zoom_in
         - app.zoom_out
         - app.zoom_reset

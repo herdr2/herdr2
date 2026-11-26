@@ -24,6 +24,16 @@ import {
   resolveEffortVisual,
   normalizeInboxItems,
   resolvePeerAddress,
+  extractTranscriptPromptHistory,
+  mergePromptHistory,
+  historyCursorOffset,
+  stepPromptHistory,
+  resolveAcpAuthErrorAction,
+  isCodexAgentRecord,
+  normalizeAvailableCommands,
+  detectComposerTrigger,
+  buildCompletionItems,
+  applyComposerCompletion,
 } from "../defaults/mods/peek/acp_model.js";
 
 describe("parseUserEnvelope", () => {
@@ -1002,5 +1012,236 @@ describe("external changed file helpers", () => {
     );
     const subReply = subItems.find((i: any) => i.kind === "assistant") as any;
     expect(subReply.changedFiles.files).toEqual([{ path: "herdr-core/src/lib.rs", additions: 1, deletions: 1 }]);
+  });
+});
+
+describe("prompt history helpers", () => {
+  test("extractTranscriptPromptHistory keeps human prompts, skips delegated/empty handoffs, and collapses consecutive duplicates", () => {
+    const entries = [
+      { kind: "user", turn: 1, text: "First prompt", ts_ms: 10 },
+      { kind: "assistant", turn: 1, text: "Ok", ts_ms: 20 },
+      // Resumed replay artifact before authoritative turn 2 entry should be skipped.
+      { kind: "user", turn: 2, text: "Replay noise", ts_ms: 25 },
+      { kind: "user", turn: 2, from: "d915/ppid:1234", text: "Second prompt", ts_ms: 30 },
+      { kind: "user", turn: 3, from: "t8", text: `<h2 from="t8">Delegated task from peer</h2>`, ts_ms: 40 },
+      { kind: "user", turn: 4, text: `<herdr2-handoff kind="handoff" from="t1">ctx</herdr2-handoff>`, ts_ms: 50 },
+      { kind: "user", turn: 5, text: `<herdr2-handoff kind="handoff" from="t1">ctx</herdr2-handoff>\nContinue refactor`, ts_ms: 60 },
+      { kind: "user", turn: 6, text: "Continue refactor", ts_ms: 70 },
+      { kind: "user", turn: 7, text: "First prompt", ts_ms: 80 },
+    ];
+    expect(extractTranscriptPromptHistory(entries)).toEqual([
+      "First prompt",
+      "Second prompt",
+      "Continue refactor",
+      "First prompt",
+    ]);
+  });
+
+  test("mergePromptHistory reconciles transcript and local prompts without duplicates", () => {
+    expect(mergePromptHistory(["A", "B", "C"], ["B", "C", "D"])).toEqual(["A", "B", "C", "D"]);
+    expect(mergePromptHistory(["A", "B", "C"], ["A", "B"])).toEqual(["A", "B", "C"]);
+    expect(mergePromptHistory(["A", "B", "C"], ["A", "B", "D"])).toEqual(["A", "B", "C", "D"]);
+    expect(mergePromptHistory(["A"], ["A", "B", "C"])).toEqual(["A", "B", "C"]);
+    expect(mergePromptHistory([], ["X", "X", "Y"])).toEqual(["X", "Y"]);
+    expect(mergePromptHistory(["1", "2", "3", "4"], ["5"], 3)).toEqual(["3", "4", "5"]);
+
+    // With baseLen anchors, re-sending an earlier prompt before transcript reload preserves order and never drops pending items.
+    expect(
+      mergePromptHistory(
+        ["A", "B", "C"],
+        [
+          { text: "D", baseLen: 3 },
+          { text: "C", baseLen: 3 },
+        ],
+      ),
+    ).toEqual(["A", "B", "C", "D", "C"]);
+    expect(
+      mergePromptHistory(
+        ["A", "B", "C", "D", "C"],
+        [
+          { text: "D", baseLen: 3 },
+          { text: "C", baseLen: 3 },
+        ],
+      ),
+    ).toEqual(["A", "B", "C", "D", "C"]);
+    expect(
+      mergePromptHistory(["A", "B", "C"], [{ text: "A", baseLen: 3 }]),
+    ).toEqual(["A", "B", "C", "A"]);
+  });
+
+  test("stepPromptHistory matches CLI Up/Down semantics including draft preservation and cursor placement", () => {
+    const history = ["first", "line 1\nline 2", "最新提示词"];
+
+    // Down when not browsing is a no-op.
+    const idleDown = stepPromptHistory({ index: -1, draft: "" }, history, "unsent draft", 1);
+    expect(idleDown.handled).toBe(false);
+
+    // First Up saves draft and recalls newest single-line prompt with cursor at end.
+    const u1 = stepPromptHistory({ index: -1, draft: "" }, history, "unsent draft", -1);
+    expect(u1).toEqual({
+      handled: true,
+      changed: true,
+      index: 2,
+      draft: "unsent draft",
+      text: "最新提示词",
+      cursor: "最新提示词".length,
+    });
+
+    // Second Up recalls multi-line prompt with cursor at 0 so a third Up never gets trapped.
+    const u2 = stepPromptHistory(u1, history, u1.text, -1);
+    expect(u2).toEqual({
+      handled: true,
+      changed: true,
+      index: 1,
+      draft: "unsent draft",
+      text: "line 1\nline 2",
+      cursor: 0,
+    });
+
+    // Third Up recalls oldest prompt.
+    const u3 = stepPromptHistory(u2, history, u2.text, -1);
+    expect(u3).toEqual({
+      handled: true,
+      changed: true,
+      index: 0,
+      draft: "unsent draft",
+      text: "first",
+      cursor: 5,
+    });
+
+    // Fourth Up clamps at oldest without wrapping.
+    const u4 = stepPromptHistory(u3, history, u3.text, -1);
+    expect(u4).toEqual({
+      handled: true,
+      changed: false,
+      index: 0,
+      draft: "unsent draft",
+      text: "first",
+      cursor: null,
+    });
+
+    // Down into multi-line prompt places cursor at end so subsequent Down moves forward immediately.
+    const d1 = stepPromptHistory(u4, history, u4.text, 1);
+    expect(d1).toEqual({
+      handled: true,
+      changed: true,
+      index: 1,
+      draft: "unsent draft",
+      text: "line 1\nline 2",
+      cursor: "line 1\nline 2".length,
+    });
+
+    const d2 = stepPromptHistory(d1, history, d1.text, 1);
+    expect(d2.index).toBe(2);
+    expect(d2.text).toBe("最新提示词");
+
+    // Down past newest restores saved draft and exits history mode.
+    const d3 = stepPromptHistory(d2, history, d2.text, 1);
+    expect(d3).toEqual({
+      handled: true,
+      changed: true,
+      index: -1,
+      draft: "",
+      text: "unsent draft",
+      cursor: "unsent draft".length,
+    });
+
+    expect(historyCursorOffset("hello", -1)).toBe(5);
+    expect(historyCursorOffset("a\nb", -1)).toBe(0);
+    expect(historyCursorOffset("a\nb", 1)).toBe(3);
+  });
+});
+
+describe("resolveAcpAuthErrorAction", () => {
+  test("returns interactive Claude CLI setup action for Claude login / onboarding errors", () => {
+    const act = resolveAcpAuthErrorAction(
+      { agent: "claude", cwd: "D:\\Users\\u" },
+      "Not logged in · Please run /login",
+      false,
+    );
+    expect(act?.titleZh).toBe("Claude 需要先在 CLI 中完成登录");
+    expect(act?.argv).toEqual(["claude"]);
+    expect(act?.tabName).toBe("Claude CLI");
+  });
+
+  test("omits local terminal launch button for remote agents and ignores non-auth errors", () => {
+    const remote = resolveAcpAuthErrorAction(
+      { agent: "claude" },
+      "Authentication required: Claude CLI onboarding is incomplete",
+      true,
+    );
+    expect(remote?.argv).toBeNull();
+    expect(resolveAcpAuthErrorAction({ agent: "claude" }, "Network connection reset", false)).toBeNull();
+  });
+});
+
+describe("composer command and mention completions", () => {
+  test("detects /, $, and @ triggers accurately without false positives", () => {
+    expect(detectComposerTrigger("/")).toEqual({ trigger: "/", query: "", start: 0, end: 1, atPromptStart: true });
+    expect(detectComposerTrigger("/comp")).toEqual({ trigger: "/", query: "comp", start: 0, end: 5, atPromptStart: true });
+    expect(detectComposerTrigger("  /dr")).toEqual({ trigger: "/", query: "dr", start: 2, end: 5, atPromptStart: true });
+    // After space, slash command token ends so user can type arguments or send
+    expect(detectComposerTrigger("/compact focus on api")).toBeNull();
+    // Path in the middle of prose should not open slash popup
+    expect(detectComposerTrigger("read /etc/hosts")).toBeNull();
+    // Email address should not open @ popup
+    expect(detectComposerTrigger("mail dev@example.com")).toBeNull();
+    // @ and $ trigger at prompt start or after whitespace
+    expect(detectComposerTrigger("@")).toEqual({ trigger: "@", query: "", start: 0, end: 1, atPromptStart: true });
+    expect(detectComposerTrigger("inspect @src/ma")).toEqual({ trigger: "@", query: "src/ma", start: 8, end: 15, atPromptStart: false });
+    expect(detectComposerTrigger("run $dro")).toEqual({ trigger: "$", query: "dro", start: 4, end: 8, atPromptStart: false });
+    // Respects explicit cursor offset before trailing text
+    expect(detectComposerTrigger("/co extra", 3)).toEqual({ trigger: "/", query: "co", start: 0, end: 3, atPromptStart: true });
+  });
+
+  test("identifies Codex records and builds ranked completions for /, $, and @", () => {
+    expect(isCodexAgentRecord({ agent: "codex" })).toBe(true);
+    expect(isCodexAgentRecord({ argv: ["codex-acp"] })).toBe(true);
+    expect(isCodexAgentRecord({ program: { key: "claude", name: "Claude Code" } })).toBe(false);
+
+    const commands = normalizeAvailableCommands([
+      { name: "plan", description: "Turn plan mode on." },
+      { name: "compact", description: "Summarize conversation", input_hint: "[instructions]" },
+      { name: "$drove", description: "Multi-agent DAG orchestration" },
+      { name: "mcp:herdr2:ls", description: "List running agents" },
+    ]);
+    const files = ["README.md", "src/main.rs", "src/acp/proto.rs"];
+
+    // Slash lists commands first, then skills, then mcp
+    const slashAll = buildCompletionItems(detectComposerTrigger("/"), { commands, files, isCodex: true });
+    expect(slashAll.map((i) => i.label)).toEqual(["/plan", "/compact", "$drove", "/mcp:herdr2:ls"]);
+
+    // Slash query matches $drove skill cleanly and inserts $drove (not /$drove)
+    const slashDrove = buildCompletionItems(detectComposerTrigger("/dr"), { commands, files, isCodex: true });
+    expect(slashDrove[0].label).toBe("$drove");
+    expect(slashDrove[0].insertText).toBe("$drove ");
+
+    // $ lists skills only
+    const dollarItems = buildCompletionItems(detectComposerTrigger("$"), { commands, files, isCodex: true });
+    expect(dollarItems.map((i) => i.label)).toEqual(["$drove"]);
+
+    // Codex @ at prompt start surfaces commands, skills, and workspace files
+    const codexAtStart = buildCompletionItems(detectComposerTrigger("@"), { commands, files, isCodex: true });
+    expect(codexAtStart.some((i) => i.label === "/plan")).toBe(true);
+    expect(codexAtStart.some((i) => i.label === "$drove")).toBe(true);
+    expect(codexAtStart.some((i) => i.label === "@README.md")).toBe(true);
+
+    // Non-Codex @ surfaces workspace files ranked by basename match
+    const claudeAt = buildCompletionItems(detectComposerTrigger("check @proto"), { commands, files, isCodex: false });
+    expect(claudeAt.map((i) => i.label)).toEqual(["@src/acp/proto.rs"]);
+  });
+
+  test("applies completion cleanly without duplicating trailing spaces", () => {
+    const trig = detectComposerTrigger("/co");
+    expect(applyComposerCompletion("/co", trig, { insertText: "/compact " })).toEqual({
+      text: "/compact ",
+      cursor: 9,
+    });
+
+    const midTrig = detectComposerTrigger("check @pro please", 10);
+    expect(applyComposerCompletion("check @pro please", midTrig, { insertText: "@src/acp/proto.rs " })).toEqual({
+      text: "check @src/acp/proto.rs please",
+      cursor: 24,
+    });
   });
 });

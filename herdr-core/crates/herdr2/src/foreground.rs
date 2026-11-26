@@ -936,4 +936,20 @@ mod tests {
         drop(core);
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[test]
+    fn recognizes_windows_bundled_cursor_agent_as_cli_foreground() {
+        let fg = Foreground {
+            pid: 64740,
+            name: "node.exe".into(),
+            argv: vec![
+                r"D:\Users\zhihao.zou\AppData\Local\cursor-agent\versions\2026.10.22-27dcf5f\node.exe".into(),
+                r"D:\Users\zhihao.zou\AppData\Local\cursor-agent\versions\2026.10.22-27dcf5f\index.js".into(),
+                "--yolo".into(),
+                "--trust".into(),
+            ],
+            cwd: r"D:\Users\zhihao.zou".into(),
+        };
+        assert!(is_cli_foreground(&fg));
+    }
 }

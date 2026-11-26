@@ -231,6 +231,7 @@ impl EventLines {
             "size" => set(&["cols", "rows"]),
             "foreground" => t["foreground"] = data.clone(),
             "config" if is_agent => set(&["model", "mode", "permission_mode", "config_options"]),
+            "commands" if is_agent => set(&["available_commands"]),
             "usage" if is_agent => t["context_usage"] = data.clone(),
             "transcript" if is_agent => {
                 let next = t["transcript_seq"].as_u64().unwrap_or(0) + 1;

@@ -259,12 +259,13 @@ fn configure_process_tree(command: &mut Command) {
 #[cfg(windows)]
 fn configure_process_tree(command: &mut Command) {
     use std::os::windows::process::CommandExt as _;
-    use windows::Win32::System::Threading::CREATE_SUSPENDED;
+    use windows::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
 
     // Assignment to a Job Object is not an atomic option on `Command`. Keep
     // the primary thread suspended so the process cannot create a descendant
     // in the interval between `spawn` and `AssignProcessToJobObject`.
-    command.creation_flags(CREATE_SUSPENDED.0);
+    // Also suppress console window creation when spawned from a GUI host.
+    command.creation_flags((CREATE_SUSPENDED | CREATE_NO_WINDOW).0);
 }
 
 #[cfg(not(any(unix, windows)))]

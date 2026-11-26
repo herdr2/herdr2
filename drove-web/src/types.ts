@@ -225,6 +225,7 @@ export interface DaemonAiStatus {
   keySource: string;
   keyFilePath: string;
   baseUrl: string;
+  protocol?: "openai" | "anthropic";
   model: string;
   effort?: string;
   contextWindow?: string;
@@ -254,6 +255,7 @@ export interface DaemonAiProbeResult {
   ok: boolean;
   latencyMs: number;
   model: string;
+  protocol?: "openai" | "anthropic";
   reply?: string;
   error?: string;
 }

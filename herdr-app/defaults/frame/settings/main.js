@@ -908,7 +908,7 @@ export default class Settings extends View {
         this.row(
           t,
           this.tr("Default terminal shell", "默认终端类型"),
-          this.tr("Which shell local terminal tabs and splits open with.", "本地新建终端标签页或分栏时默认使用的终端程序。"),
+          this.tr("Fixed shell used for local terminals, splits, and CLI agents.", "本地新建终端、分栏以及启动 CLI 智能体时固定使用的终端类型。"),
           this.drovePicker(
             t,
             "term-shell",
@@ -1625,6 +1625,9 @@ export default class Settings extends View {
           if (patch && ("promptMode" in patch || "promptCacheEnabled" in patch || "model" in patch || "baseUrl" in patch)) {
             this.aiPromptProbeResult = null;
           }
+          if (patch && ("baseUrl" in patch || "apiKey" in patch || "clearKey" in patch)) {
+            this.aiTestResult = null;
+          }
           if (this.section === "drove") {
             await this.loadDrove();
           } else {
@@ -1724,8 +1727,15 @@ export default class Settings extends View {
         const res = await this.aiCallWithJsonFile(["ai", "test"], payload);
         this.aiTestResult = res;
         this.droveTestResult = res;
-        if (res?.ok && this.aiStatus && Array.isArray(res.availableModels) && res.availableModels.length > 0) {
-          this.aiStatus = { ...this.aiStatus, availableModels: res.availableModels };
+        if (res?.ok && this.aiStatus) {
+          const patchStatus = { ...this.aiStatus };
+          if (Array.isArray(res.availableModels) && res.availableModels.length > 0) {
+            patchStatus.availableModels = res.availableModels;
+          }
+          if (res.protocol) {
+            patchStatus.protocol = res.protocol;
+          }
+          this.aiStatus = patchStatus;
         }
       } catch (e) {
         this.aiTestResult = { ok: false, error: String(e?.message ?? e) };
@@ -2181,6 +2191,13 @@ export default class Settings extends View {
       case "high": return this.tr("High", "高");
       default: return eff;
     }
+  }
+
+  aiProtocolLabel(proto) {
+    const clean = String(proto ?? "").trim().toLowerCase();
+    if (clean === "anthropic" || clean === "claude") return "Claude";
+    if (clean === "openai") return "OpenAI";
+    return null;
   }
 
   aiPromptModeLabel(mode) {
@@ -3664,6 +3681,9 @@ export default class Settings extends View {
     const switches = st.switches ?? {};
     const usage = st.usage ?? {};
     const aiOn = st.enabled !== false;
+    const detectedProtocol = this.aiProtocolLabel(
+      (this.aiTestResult?.ok ? this.aiTestResult.protocol : null) ?? st.protocol,
+    );
     const ptyArb = switches.ptyStatusArbitration !== false;
     const notesDigest = switches.notesDigest !== false;
     const promptCache = switches.promptCacheEnabled !== false;
@@ -3829,7 +3849,7 @@ export default class Settings extends View {
                 this.droveCardRow(
                   t,
                   this.tr("Enable Core AI assistant", "启用全局 AI 助手"),
-                  this.tr("Shared lightweight OpenAI-compatible runtime used by PTY status arbitration, parent note digests, and Drove orchestration.", "全局共享的轻量 OpenAI 兼容接口，同时服务于终端状态仲裁、子 Agent 摘要与 Drove 编排。"),
+                  this.tr("Shared lightweight AI runtime (auto-detects OpenAI & Claude protocols) used by PTY status arbitration, parent note digests, and Drove orchestration.", "全局共享的轻量 AI 运行时（自动识别 OpenAI 与 Claude 协议），同时服务于终端状态仲裁、子 Agent 摘要与 Drove 编排。"),
                   this.toggle(t, "st-ai-on", aiOn, (_e, cx) => this.saveAiPatch({ enabled: !aiOn }, cx)),
                   true,
                 ),
@@ -3848,7 +3868,25 @@ export default class Settings extends View {
                       .flex_1()
                       .min_w(0)
                       .gap(4)
-                      .child(div().text_size(12).text_color(t.foreground).child(this.tr("Service URL", "远端服务地址")))
+                      .child(
+                        h_flex()
+                          .justify_between()
+                          .items_center()
+                          .gap(6)
+                          .child(div().text_size(12).text_color(t.foreground).child(this.tr("Service URL", "远端服务地址")))
+                          .child(
+                            div()
+                              .id("st-ai-protocol-badge")
+                              .truncate()
+                              .text_size(11)
+                              .text_color(detectedProtocol ? t.accent : t.dim)
+                              .child(
+                                detectedProtocol
+                                  ? this.tr(`Auto: ${detectedProtocol}`, `自动识别：${detectedProtocol}`)
+                                  : this.tr("Auto: OpenAI / Claude", "自动识别 OpenAI / Claude"),
+                              ),
+                          ),
+                      )
                       .child(div().px(8).py(2).rounded(7).border_1().border_color(t.border).bg(t.background).child(Input.new(this.droveUrlInput).h(26).text_size(12.5).text_color(t.foreground))),
                   )
                   .child(
@@ -4013,13 +4051,14 @@ export default class Settings extends View {
                   .when(Boolean(this.aiTestResult), (el) => {
                     const trRes = this.aiTestResult;
                     const n = (trRes.availableModels ?? []).length;
+                    const protoTag = this.aiProtocolLabel(trRes.protocol);
                     return el.child(
                       div()
                         .text_size(12)
                         .text_color(trRes.ok ? t.ansi2 : t.blocked)
                         .child(
                           trRes.ok
-                            ? `✓ OK (${trRes.latencyMs ?? 0}ms) · ${trRes.discoveredModel ?? ""}${n > 0 ? ` · ${n} ${this.tr("models", "个模型")}` : ""}`
+                            ? `✓ OK (${trRes.latencyMs ?? 0}ms)${protoTag ? ` · ${protoTag}` : ""} · ${trRes.discoveredModel ?? ""}${n > 0 ? ` · ${n} ${this.tr("models", "个模型")}` : ""}`
                             : `✗ ${trRes.error ?? "Failed"}${n > 0 ? ` (${n} ${this.tr("models listed", "个模型可选")})` : ""}`,
                         ),
                     );
@@ -5966,6 +6005,7 @@ export default class Settings extends View {
         version: nextVersion,
         notes: avail?.notes ?? list[0]?.notes ?? null,
         restart: Boolean(avail?.restart ?? Boolean(app.ready)),
+        needsElevation: Boolean(avail?.needs_elevation ?? app.needs_elevation),
         items: list,
       };
     }
@@ -6020,6 +6060,14 @@ export default class Settings extends View {
         lines.push(`${label}：${from}${to}`);
       }
       if (m.notes) lines.push(String(m.notes));
+      if (m.needsElevation) {
+        lines.push(
+          this.tr(
+            "Installed in a system directory — your administrator password will be requested to apply the update.",
+            "当前安装在系统目录中，更新时将弹出系统管理员密码验证框以完成替换。",
+          ),
+        );
+      }
       lines.push(
         m.restart
           ? this.tr(
@@ -6216,6 +6264,8 @@ export default class Settings extends View {
             .on_click((_e, c) => this.triggerUpdateCheck(c))
             .child(this.tr("Check for Updates", "检查更新"));
 
+    const updateErr = u.app?.error || u.ui?.error || (!c.managed ? c.error : null);
+
     return v_flex()
       .w_full()
       .gap(16)
@@ -6226,6 +6276,22 @@ export default class Settings extends View {
           this.tr("Version", "当前版本"),
           subLine || this.tr("Ready to check for updates.", "点击右侧按钮检查更新。"),
           checkBtn,
+        ),
+      )
+      .when(Boolean(updateErr), (el) =>
+        el.child(
+          div()
+            .id("st-update-error")
+            .px(10)
+            .py(8)
+            .rounded(7)
+            .bg(alpha(t.blocked ?? "#ef4444", "1a") ?? t.raised)
+            .border_1()
+            .border_color(alpha(t.blocked ?? "#ef4444", "55") ?? t.border)
+            .text_size(12.5)
+            .line_height("18px")
+            .text_color(t.blocked ?? "#ef4444")
+            .child(String(updateErr)),
         ),
       )
       .child(

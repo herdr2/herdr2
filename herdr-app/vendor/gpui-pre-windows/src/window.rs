@@ -568,6 +568,10 @@ impl WindowsWindow {
         let hwnd = creation_result?;
         let this = this.unwrap();
 
+        // HERDR: explicitly assign both large (taskbar/Alt-Tab) and small (titlebar/switcher) icons
+        // on the window HWND so the running window never falls back to a blank icon after in-app updates.
+        apply_window_icons(hwnd, icon);
+
         register_drag_drop(&this)?;
         set_non_rude_hwnd(hwnd, true);
         configure_dwm_dark_mode(hwnd, appearance);
@@ -1418,19 +1422,60 @@ enum WindowOpenState {
 
 const WINDOW_CLASS_NAME: PCWSTR = w!("Zed::Window");
 
+fn load_small_icon(fallback: HICON) -> HICON {
+    let module = get_module_handle();
+    let cx = unsafe { GetSystemMetrics(SM_CXSMICON) };
+    let cy = unsafe { GetSystemMetrics(SM_CYSMICON) };
+    unsafe { LoadImageW(Some(module.into()), PCWSTR(1 as _), IMAGE_ICON, cx, cy, LR_SHARED) }
+        .ok()
+        .map(|handle| HICON(handle.0))
+        .filter(|icon| !icon.is_invalid())
+        .unwrap_or(fallback)
+}
+
+fn apply_window_icons(hwnd: HWND, big_icon: HICON) {
+    if big_icon.is_invalid() {
+        return;
+    }
+    let small_icon = load_small_icon(big_icon);
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_SETICON,
+            Some(WPARAM(ICON_BIG as usize)),
+            Some(LPARAM(big_icon.0 as isize)),
+        );
+        SendMessageW(
+            hwnd,
+            WM_SETICON,
+            Some(WPARAM(ICON_SMALL as usize)),
+            Some(LPARAM(small_icon.0 as isize)),
+        );
+    }
+}
+
 fn register_window_class(icon_handle: HICON) {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        let wc = WNDCLASSW {
+        // HERDR: register WNDCLASSEXW with both hIcon and hIconSm so taskbar and titlebar icons
+        // resolve directly from the executable's embedded icon resource.
+        let small_icon = if icon_handle.is_invalid() {
+            icon_handle
+        } else {
+            load_small_icon(icon_handle)
+        };
+        let wc = WNDCLASSEXW {
+            cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
             lpfnWndProc: Some(window_procedure),
             hIcon: icon_handle,
+            hIconSm: small_icon,
             lpszClassName: PCWSTR(WINDOW_CLASS_NAME.as_ptr()),
             style: CS_HREDRAW | CS_VREDRAW,
             hInstance: get_module_handle().into(),
             hbrBackground: unsafe { CreateSolidBrush(COLORREF(0x00000000)) },
             ..Default::default()
         };
-        unsafe { RegisterClassW(&wc) };
+        unsafe { RegisterClassExW(&wc) };
     });
 }
 

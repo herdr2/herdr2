@@ -4,8 +4,8 @@
 
 import { View, div, image, svg } from "gpui-kit";
 import { h_flex, v_flex, Popup, TextareaState, Textarea, InputState, Input, TextView, ScrollHandle } from "gpui-base";
-import { agents, terminals, panes, spaces, focused, run, theme, settings, home, props, closeOverlay, openOverlay, checking, h2, shared, setShared, nextCommand, keys, window as appWindow, readImageDataUrl, pasteClipboardAttachments, prepareAttachments, pickAttachments } from "herdr";
-import { buildConversationItems, buildPtySessionBadges, summarizeActivityGroup, toolIconPath, formatTime, shortenPath, normalizeConfigOptions, filterConfigChoices, normalizeInboxItems, parseToolDetail, resolveEffortVisual, resolvePeerAddress, isImageAttachment, formatAttachmentBytes, attachmentDisplayName, extractTurnFilePatch, resolveChangedFilePath, isAbsoluteFilePath } from "./acp_model.js";
+import { agents, terminals, panes, spaces, focused, run, theme, settings, home, props, closeOverlay, openOverlay, checking, h2, exec, shared, setShared, nextCommand, keys, window as appWindow, readImageDataUrl, pasteClipboardAttachments, prepareAttachments, pickAttachments } from "herdr";
+import { buildConversationItems, buildPtySessionBadges, summarizeActivityGroup, toolIconPath, formatTime, shortenPath, normalizeConfigOptions, filterConfigChoices, normalizeInboxItems, parseToolDetail, resolveEffortVisual, resolvePeerAddress, isImageAttachment, formatAttachmentBytes, attachmentDisplayName, extractTurnFilePatch, resolveChangedFilePath, isAbsoluteFilePath, extractTranscriptPromptHistory, mergePromptHistory, stepPromptHistory, isCodexAgentRecord, normalizeAvailableCommands, detectComposerTrigger, buildCompletionItems, applyComposerCompletion, resolveAcpAuthErrorAction } from "./acp_model.js";
 
 function shortcutFor(action) {
   if (typeof keys !== "function" || !action) return "";
@@ -271,6 +271,12 @@ export default class Peek extends View {
     this.fallbackText = "";
     this.readHow = null;
     this.sessionMeta = null;
+    this.readAvailableCommands = [];
+    this.completionIdx = 0;
+    this.completionScroll = 0;
+    this.completionDismissedKey = null;
+    this.completionLastQueryKey = null;
+    this.workspaceFilesCache = new Map();
     this.loadedOnce = false;
     this.error = null;
     this.busyAction = false;
@@ -371,6 +377,11 @@ export default class Peek extends View {
     this.polishUndoText = null;
     this.polishSummary = null;
     this.polishApplied = false;
+    this.historyIndex = -1;
+    this.historyDraft = "";
+    this.historySnapshot = null;
+    this._applyingHistory = false;
+    this.localHistoryByTerminal = {};
     this.draftAttachments = [];
     this.attachmentImages = new Map();
     this.expandedMedia = {};
@@ -387,6 +398,7 @@ export default class Peek extends View {
     });
     this.input.on("change", (_e, cx) => {
       if (this.polishApplied) this.polishApplied = false;
+      if (!this._applyingHistory) this.resetPromptHistoryNav();
       this.writeSavedDraft(this.loadedTerminal || this.activeTerminal(), this.input?.value?.() ?? "");
       cx.notify();
     });
@@ -395,6 +407,16 @@ export default class Peek extends View {
     });
     this.input.on("submit", (e, cx) => {
       if (e?.shift) return;
+      if (!e?.secondary) {
+        const comp = this.activeCompletionState(this.term(), cx);
+        if (comp && comp.items.length > 0) {
+          const item = comp.items[this.completionIdx] ?? comp.items[0];
+          if (item) {
+            this.acceptCompletion(comp.triggerState, item, cx);
+            return;
+          }
+        }
+      }
       const steer = Boolean(e?.secondary) && this.status() === "working";
       const trimmed = (this.input.value() ?? "").trim();
       const hasAttachments = Array.isArray(this.draftAttachments) && this.draftAttachments.length > 0;
@@ -703,6 +725,7 @@ export default class Peek extends View {
           this.fallbackText = parsed.text || "";
           this.readHow = parsed.how || null;
           this.sessionMeta = parsed.session_meta ?? null;
+          this.readAvailableCommands = Array.isArray(parsed.available_commands) ? parsed.available_commands : [];
           this.loadedOnce = true;
           this.error = null;
           // Precompute conversation items & linkify inside the async task (500ms budget)
@@ -1051,7 +1074,9 @@ export default class Peek extends View {
     const text = (this.input?.value?.() ?? "").trim();
     const attachments = Array.isArray(this.draftAttachments) ? [...this.draftAttachments] : [];
     if (!terminal || (!text && attachments.length === 0) || checking() || this.busyAction) return;
-    this.input.set_value("");
+    if (text) this.recordPromptHistory(terminal, text);
+    this.resetPromptHistoryNav();
+    this.applyComposerText("", 0);
     this.writeSavedDraft(terminal, "");
     this.draftAttachments = [];
     this.polishUndoText = null;
@@ -1076,7 +1101,8 @@ export default class Peek extends View {
     this.polishUndoText = null;
     this.polishSummary = null;
     this.polishApplied = false;
-    this.input?.set_value?.(orig);
+    this.resetPromptHistoryNav();
+    this.applyComposerText(orig, orig.length);
     const terminal = this.activeTerminal();
     if (terminal) this.writeSavedDraft(terminal, orig);
     this.input?.focus?.();
@@ -1116,7 +1142,8 @@ export default class Peek extends View {
           this.polishUndoText = raw;
           this.polishSummary = parsed?.summary ? String(parsed.summary).trim() : null;
           this.polishApplied = true;
-          this.input?.set_value?.(polished);
+          this.resetPromptHistoryNav();
+          this.applyComposerText(polished, polished.length);
           this.input?.focus?.();
         } else {
           const reason = String(parsed?.fallbackReason ?? "");
@@ -1282,8 +1309,320 @@ export default class Peek extends View {
     if (!this.input?.set_value) return;
     const saved = this.readSavedDraft(addr);
     if ((this.input.value?.() ?? "") !== saved) {
-      this.input.set_value(saved);
+      this.applyComposerText(saved, saved.length);
     }
+  }
+
+  historyStorageKey(addr) {
+    return addr ? `herdr2.peek.history.v1:${addr}` : null;
+  }
+
+  readSavedHistory(addr) {
+    if (!addr) return [];
+    const mem = this.localHistoryByTerminal?.[addr];
+    if (Array.isArray(mem)) return mem;
+    if (checking() || typeof localStorage === "undefined") return [];
+    const key = this.historyStorageKey(addr);
+    if (!key) return [];
+    try {
+      const raw = localStorage.getItem(key);
+      if (!raw) return [];
+      const parsed = JSON.parse(raw);
+      const list = Array.isArray(parsed)
+        ? parsed
+            .map((x) => {
+              if (typeof x === "string") {
+                const text = x.replace(/\r\n/g, "\n").trim();
+                return text ? { text, baseLen: null } : null;
+              }
+              if (x && typeof x === "object") {
+                const text = String(x.text ?? "").replace(/\r\n/g, "\n").trim();
+                if (!text) return null;
+                const baseLen = Number.isInteger(x.baseLen) && x.baseLen >= 0 ? x.baseLen : null;
+                return { text, baseLen };
+              }
+              return null;
+            })
+            .filter(Boolean)
+        : [];
+      if (!this.localHistoryByTerminal) this.localHistoryByTerminal = {};
+      this.localHistoryByTerminal[addr] = list;
+      return list;
+    } catch {
+      return [];
+    }
+  }
+
+  writeSavedHistory(addr, list) {
+    if (!addr) return;
+    const MAX_ITEMS = 100;
+    const MAX_BYTES = 64 * 1024;
+    const trimmed = (Array.isArray(list) ? list : [])
+      .map((x) => {
+        if (typeof x === "string") {
+          const text = x.replace(/\r\n/g, "\n").trim();
+          return text ? { text, baseLen: null } : null;
+        }
+        if (x && typeof x === "object") {
+          const text = String(x.text ?? "").replace(/\r\n/g, "\n").trim();
+          if (!text) return null;
+          const baseLen = Number.isInteger(x.baseLen) && x.baseLen >= 0 ? x.baseLen : null;
+          return { text, baseLen };
+        }
+        return null;
+      })
+      .filter(Boolean)
+      .slice(-MAX_ITEMS);
+    if (!this.localHistoryByTerminal) this.localHistoryByTerminal = {};
+    this.localHistoryByTerminal[addr] = trimmed;
+    if (checking() || typeof localStorage === "undefined") return;
+    const key = this.historyStorageKey(addr);
+    if (!key) return;
+    try {
+      if (trimmed.length === 0) {
+        localStorage.removeItem(key);
+        return;
+      }
+      const bounded = [...trimmed];
+      let serialized = JSON.stringify(bounded);
+      while (bounded.length > 1 && serialized.length > MAX_BYTES) {
+        bounded.shift();
+        serialized = JSON.stringify(bounded);
+      }
+      if (serialized.length <= MAX_BYTES) {
+        localStorage.setItem(key, serialized);
+      }
+    } catch {}
+  }
+
+  recordPromptHistory(addr, text) {
+    const clean = String(text ?? "").replace(/\r\n/g, "\n").trim();
+    if (!addr || !clean) return;
+    const prev = this.readSavedHistory(addr);
+    const baseLen = extractTranscriptPromptHistory(this.entries).length;
+    if (prev.length > 0 && prev[prev.length - 1]?.text === clean) return;
+    this.writeSavedHistory(addr, [...prev, { text: clean, baseLen }]);
+  }
+
+  promptHistoryFor(addr = this.activeTerminal()) {
+    const fromTranscript = extractTranscriptPromptHistory(this.entries);
+    const fromLocal = this.readSavedHistory(addr);
+    return mergePromptHistory(fromTranscript, fromLocal, 100);
+  }
+
+  resetPromptHistoryNav() {
+    this.historyIndex = -1;
+    this.historyDraft = "";
+    this.historySnapshot = null;
+  }
+
+  applyComposerText(text, cursorOffset = null) {
+    if (!this.input?.set_value) return;
+    const next = String(text ?? "");
+    this._applyingHistory = true;
+    try {
+      this.input.set_value(next);
+      if (typeof this.input.set_selected_range === "function") {
+        const pos = Number.isFinite(cursorOffset)
+          ? Math.max(0, Math.min(next.length, Math.floor(cursorOffset)))
+          : next.length;
+        this.input.set_selected_range({ start: pos, end: pos });
+      }
+    } finally {
+      this._applyingHistory = false;
+    }
+  }
+
+  navigatePromptHistory(direction, cx) {
+    if (!this.input?.value || !this.input?.set_value) return false;
+    const terminal = this.loadedTerminal || this.activeTerminal();
+    const list = this.historyIndex === -1
+      ? this.promptHistoryFor(terminal)
+      : (Array.isArray(this.historySnapshot) ? this.historySnapshot : this.promptHistoryFor(terminal));
+    if (!list.length) return false;
+
+    const currentText = this.input.value() ?? "";
+    const step = stepPromptHistory(
+      { index: this.historyIndex, draft: this.historyDraft },
+      list,
+      currentText,
+      direction,
+    );
+    if (!step.handled) return false;
+
+    this.historyIndex = step.index;
+    this.historyDraft = step.draft;
+    this.historySnapshot = step.index === -1 ? null : list;
+
+    if (step.changed) {
+      this.polishUndoText = null;
+      this.polishSummary = null;
+      this.polishApplied = false;
+      this.applyComposerText(step.text, step.cursor);
+      this.writeSavedDraft(terminal, step.text);
+      (cx ?? this.cx)?.notify?.();
+    } else if (step.cursor != null && typeof this.input.set_selected_range === "function") {
+      const pos = Math.max(0, Math.min(step.text.length, Math.floor(step.cursor)));
+      this.input.set_selected_range({ start: pos, end: pos });
+    }
+    return true;
+  }
+
+  availableCommandsFor(k = this.term()) {
+    if (!this.isPtyMode()) {
+      if (Array.isArray(k?.available_commands) && k.available_commands.length > 0) {
+        return normalizeAvailableCommands(k.available_commands);
+      }
+      if (Array.isArray(this.agentDetail?.available_commands) && this.agentDetail.available_commands.length > 0) {
+        return normalizeAvailableCommands(this.agentDetail.available_commands);
+      }
+    }
+    if (Array.isArray(this.readAvailableCommands) && this.readAvailableCommands.length > 0) {
+      return normalizeAvailableCommands(this.readAvailableCommands);
+    }
+    return [];
+  }
+
+  ensureWorkspaceFiles(k, cx) {
+    const cwd = k?.last_cwd || k?.cwd || "";
+    if (!cwd || checking() || typeof exec !== "function") return { files: [], loading: false };
+    const on = this.activeMachine();
+    const cacheKey = `${on ?? "local"}:${cwd}`;
+    const existing = this.workspaceFilesCache.get(cacheKey);
+    const now = Date.now();
+    if (existing && (existing.loading || now - existing.fetchedAt < 15000)) {
+      return { files: existing.files, loading: existing.loading };
+    }
+    const entry = { files: existing?.files ?? [], fetchedAt: existing?.fetchedAt ?? 0, loading: true };
+    this.workspaceFilesCache.set(cacheKey, entry);
+    const notifyCx = cx ?? this.cx;
+    const isWinLocal = !on && typeof appWindow === "function" && appWindow()?.platform === "windows";
+    const runFetch = async (taskCx) => {
+      let files = [];
+      try {
+        let res = await exec("git", ["ls-files", "--cached", "--others", "--exclude-standard"], { cwd, on, timeout: 4000 });
+        if (res?.code === 0 && typeof res.stdout === "string") {
+          files = res.stdout.split(/\r?\n/).map((s) => s.trim()).filter(Boolean).slice(0, 1500);
+        } else if (isWinLocal) {
+          res = await exec("powershell", [
+            "-NoProfile",
+            "-Command",
+            "Get-ChildItem -File -Recurse -Depth 4 -ErrorAction SilentlyContinue | Where-Object { $_.FullName -notmatch '(\\\\|/)(\\.git|node_modules|target|dist|build|\\.next|__pycache__)(\\\\|/|$)' } | Select-Object -First 1500 | ForEach-Object { [System.IO.Path]::GetRelativePath((Get-Location).Path, $_.FullName) }",
+          ], { cwd, timeout: 4000 });
+          if (res?.code === 0 && typeof res.stdout === "string") {
+            files = res.stdout.split(/\r?\n/).map((s) => s.trim().replace(/\\/g, "/")).filter(Boolean).slice(0, 1500);
+          }
+        } else {
+          res = await exec("sh", [
+            "-c",
+            "find . -maxdepth 4 \\( -name .git -o -name node_modules -o -name target -o -name dist -o -name build -o -name .next -o -name __pycache__ \\) -prune -o -type f -print 2>/dev/null | head -n 1500",
+          ], { cwd, on, timeout: 4000 });
+          if (res?.code === 0 && typeof res.stdout === "string") {
+            files = res.stdout.split(/\r?\n/).map((s) => s.trim().replace(/^\.\//, "")).filter(Boolean).slice(0, 1500);
+          }
+        }
+      } catch {}
+      this.workspaceFilesCache.set(cacheKey, { files, fetchedAt: Date.now(), loading: false });
+      try { (taskCx ?? notifyCx)?.notify?.(); } catch {}
+    };
+    if (notifyCx?.spawn) {
+      notifyCx.spawn(runFetch);
+    } else {
+      Promise.resolve().then(() => runFetch(notifyCx));
+    }
+    return { files: entry.files, loading: true };
+  }
+
+  activeCompletionState(k = this.term(), cx = null) {
+    const st = this.status();
+    if (st === "ended" || k?.state === "finished") return null;
+    if (this.openConfigId || this.configFilterFocused || this.inboxEditFocused) return null;
+    if (!this.inputFocused) return null;
+    const text = this.input?.value?.() ?? "";
+    const sel = typeof this.input?.selected_range === "function" ? this.input.selected_range() : null;
+    if (sel && sel.start !== sel.end) return null;
+    const cursor = sel ? sel.start : text.length;
+    const triggerState = detectComposerTrigger(text, cursor);
+    if (!triggerState) {
+      this.completionDismissedKey = null;
+      this.completionLastQueryKey = null;
+      return null;
+    }
+    const dismissKey = `${triggerState.trigger}:${triggerState.start}`;
+    if (this.completionDismissedKey === dismissKey) return null;
+
+    const queryKey = `${triggerState.trigger}:${triggerState.start}:${triggerState.query}`;
+    if (queryKey !== this.completionLastQueryKey) {
+      this.completionLastQueryKey = queryKey;
+      this.completionIdx = 0;
+      this.completionScroll = 0;
+    }
+
+    const isCodex = isCodexAgentRecord(k) || isCodexAgentRecord(this.agentDetail);
+    const commands = this.availableCommandsFor(k);
+    let files = [];
+    let loadingFiles = false;
+    if (triggerState.trigger === "@") {
+      const ws = this.ensureWorkspaceFiles(k, cx);
+      files = ws.files;
+      loadingFiles = ws.loading;
+    }
+    const items = buildCompletionItems(triggerState, { commands, files, isCodex, maxItems: 50 });
+    if (items.length === 0 && !loadingFiles) return null;
+    if (this.completionIdx >= items.length) this.completionIdx = Math.max(0, items.length - 1);
+    return { triggerState, items, loadingFiles, isCodex };
+  }
+
+  acceptCompletion(triggerState, item, cx) {
+    if (!triggerState || !item) return;
+    const text = this.input?.value?.() ?? "";
+    const { text: nextText, cursor } = applyComposerCompletion(text, triggerState, item);
+    this.completionDismissedKey = null;
+    this.completionLastQueryKey = null;
+    this.completionIdx = 0;
+    this.completionScroll = 0;
+    this.resetPromptHistoryNav();
+    this.applyComposerText(nextText, cursor);
+    const terminal = this.loadedTerminal || this.activeTerminal();
+    if (terminal) this.writeSavedDraft(terminal, nextText);
+    this.input?.focus?.();
+    (cx ?? this.cx)?.notify?.();
+  }
+
+  handleComposerKeyDown(e, cx) {
+    if (this.openConfigId || this.configFilterFocused || this.inboxEditFocused) return false;
+    const key = e?.key;
+    const noMods = !e?.modifiers?.shift && !e?.modifiers?.control && !e?.modifiers?.alt && !e?.modifiers?.platform;
+
+    const comp = this.activeCompletionState(this.term(), cx);
+    if (comp) {
+      if (key === "escape" && noMods) {
+        this.completionDismissedKey = `${comp.triggerState.trigger}:${comp.triggerState.start}`;
+        (cx ?? this.cx)?.notify?.();
+        return true;
+      }
+      if (comp.items.length > 0 && noMods) {
+        if (key === "up") {
+          this.completionIdx = (this.completionIdx - 1 + comp.items.length) % comp.items.length;
+          (cx ?? this.cx)?.notify?.();
+          return true;
+        }
+        if (key === "down") {
+          this.completionIdx = (this.completionIdx + 1) % comp.items.length;
+          (cx ?? this.cx)?.notify?.();
+          return true;
+        }
+        if (key === "tab" || key === "enter") {
+          const item = comp.items[this.completionIdx] ?? comp.items[0];
+          if (item) this.acceptCompletion(comp.triggerState, item, cx);
+          return true;
+        }
+      }
+    }
+
+    if (key !== "up" && key !== "down") return false;
+    if (!noMods) return false;
+    return this.navigatePromptHistory(key === "up" ? -1 : 1, cx);
   }
 
   pausedInboxItemsFor(k = this.term()) {
@@ -1318,7 +1657,8 @@ export default class Peek extends View {
       .join("\n\n");
     const existing = (this.input?.value?.() ?? "").trim();
     const next = existing && joined ? `${existing}\n\n${joined}` : (joined || existing);
-    this.input?.set_value?.(next);
+    this.resetPromptHistoryNav();
+    this.applyComposerText(next, next.length);
     this.writeSavedDraft(terminal, next);
     this.input?.focus?.();
     await this.clearPausedInbox(cx);
@@ -3505,6 +3845,13 @@ export default class Peek extends View {
   }
 
   renderErrorItem(t, item) {
+    const rec = this.term();
+    const isRemote = typeof this.addr === "string" && this.addr.includes("/");
+    const authAction = resolveAcpAuthErrorAction(rec, item.message, isRemote);
+    const accent = authAction ? (t.working ?? "#f59e0b") : (t.blocked ?? "#ef4444");
+    const title = authAction ? tr(authAction.titleEn, authAction.titleZh) : tr("Agent error", "智能体错误");
+    const hint = authAction ? tr(authAction.hintEn, authAction.hintZh) : null;
+    const btnLabel = authAction?.argv ? tr(authAction.buttonEn, authAction.buttonZh) : null;
     return h_flex()
       .id(`acp-row-${item.id}`)
       .w_full()
@@ -3516,17 +3863,55 @@ export default class Peek extends View {
       .gap(10)
       .items_start()
       .rounded(12)
-      .bg(withAlpha(t.blocked ?? "#ef4444", "12"))
+      .bg(withAlpha(accent, "12"))
       .border_1()
-      .border_color(withAlpha(t.blocked ?? "#ef4444", "44"))
-      .child(svg(ICONS.circleAlert).size(15).mt(2).flex_none().text_color(t.blocked ?? "#ef4444"))
+      .border_color(withAlpha(accent, "44"))
+      .child(svg(ICONS.circleAlert).size(15).mt(2).flex_none().text_color(accent))
       .child(
         v_flex()
           .flex_1()
           .min_w(0)
-          .gap(2)
-          .child(div().text_size(12).font_semibold().text_color(t.blocked ?? "#ef4444").child(tr("Agent error", "智能体错误")))
-          .child(div().text_size(13).line_height("19px").text_color(t.foreground).whitespace_normal().child(item.message)),
+          .gap(4)
+          .child(div().text_size(12).font_semibold().text_color(accent).child(title))
+          .when(Boolean(hint), (el) =>
+            el.child(div().text_size(13).line_height("19px").text_color(t.foreground).whitespace_normal().child(hint)),
+          )
+          .child(
+            div()
+              .text_size(hint ? 11.5 : 13)
+              .line_height(hint ? "17px" : "19px")
+              .text_color(hint ? t.muted : t.foreground)
+              .whitespace_normal()
+              .child(item.message),
+          )
+          .when(Boolean(btnLabel), (el) =>
+            el.child(
+              h_flex()
+                .pt(2)
+                .child(
+                  div()
+                    .id(`acp-auth-login-${item.id}`)
+                    .px(10)
+                    .py(5)
+                    .rounded(7)
+                    .bg(t.background)
+                    .border_1()
+                    .border_color(t.border)
+                    .text_size(12)
+                    .font_medium()
+                    .text_color(t.foreground)
+                    .cursor_pointer()
+                    .hover((s) => s.bg(t.raised))
+                    .on_click((_e, cx) => {
+                      const args = { argv: authAction.argv, name: authAction.tabName, focus: true };
+                      if (rec?.cwd) args.folder = rec.cwd;
+                      run("tab.new", args);
+                      cx.notify();
+                    })
+                    .child(btnLabel),
+                ),
+            ),
+          ),
       );
   }
 
@@ -4787,12 +5172,216 @@ export default class Peek extends View {
       );
   }
 
+  renderCompletionPopup(t, comp, mono = "JetBrains Mono") {
+    if (!comp) return null;
+    const { triggerState, items, loadingFiles, isCodex } = comp;
+    const ROW_H = 34;
+    const MAX_LIST_H = 238;
+    const totalH = items.length * ROW_H;
+    const listH = items.length > 0 ? Math.min(totalH, MAX_LIST_H) : 34;
+    const fixed = totalH > MAX_LIST_H;
+    const maxScroll = Math.max(0, totalH - MAX_LIST_H);
+    const activeIdx = Math.max(0, Math.min(this.completionIdx || 0, Math.max(0, items.length - 1)));
+    if (items.length > 0 && fixed) {
+      const selTop = activeIdx * ROW_H;
+      const selBottom = selTop + ROW_H;
+      if (selTop < this.completionScroll) this.completionScroll = selTop;
+      if (selBottom > this.completionScroll + MAX_LIST_H) this.completionScroll = selBottom - MAX_LIST_H;
+      this.completionScroll = Math.max(0, Math.min(this.completionScroll, maxScroll));
+    } else {
+      this.completionScroll = 0;
+    }
+
+    const accentSolid = t.accent ?? t.solid ?? "#2563eb";
+    const headerTitle = triggerState.trigger === "/"
+      ? tr("Commands & Skills", "命令与技能")
+      : triggerState.trigger === "$"
+        ? tr("Skills", "技能")
+        : isCodex
+          ? tr("Commands, Skills & Files", "命令、技能与文件")
+          : tr("Workspace Files", "工作区文件");
+
+    const badgeMeta = (kind) => {
+      if (kind === "skill") return { label: tr("Skill", "技能"), color: "#a855f7" };
+      if (kind === "mcp") return { label: "MCP", color: "#14b8a6" };
+      if (kind === "file") return { label: tr("File", "文件"), color: t.muted };
+      return { label: tr("Cmd", "命令"), color: accentSolid };
+    };
+    const rowIcon = (kind) => {
+      if (kind === "skill") return ICONS.sparkles;
+      if (kind === "mcp") return ICONS.wrench;
+      if (kind === "file") return ICONS.fileText;
+      return ICONS.terminal;
+    };
+
+    const rows = [];
+    items.forEach((item, idx) => {
+      const top = idx * ROW_H;
+      if (fixed && (top + ROW_H <= this.completionScroll || top >= this.completionScroll + MAX_LIST_H)) return;
+      const active = idx === activeIdx;
+      const badge = badgeMeta(item.kind);
+      const baseRow = fixed
+        ? h_flex().absolute().left(0).right(0).top(top - this.completionScroll).h(ROW_H)
+        : h_flex().flex_none().w_full().h(ROW_H);
+      rows.push(
+        baseRow
+          .id(`acp-comp-row-${idx}`)
+          .px(10)
+          .gap(8)
+          .items_center()
+          .rounded(8)
+          .cursor_pointer()
+          .when(active, (el) => el.bg(t.selected ?? t.hover))
+          .hover((s) => s.bg(t.hover))
+          .on_hover((on, cx) => {
+            if (on && this.completionIdx !== idx) {
+              this.completionIdx = idx;
+              cx.notify();
+            }
+          })
+          .on_mouse_down("left", stopMouse)
+          .on_click((_e, cx) => {
+            cx.stop_propagation();
+            this.acceptCompletion(triggerState, item, cx);
+          })
+          .child(svg(rowIcon(item.kind)).size(12.5).flex_none().text_color(active ? badge.color : t.dim))
+          .child(
+            div()
+              .flex_none()
+              .max_w(260)
+              .truncate()
+              .font_family(mono)
+              .text_size(12)
+              .font_semibold()
+              .text_color(active ? t.foreground : t.foreground)
+              .child(item.label),
+          )
+          .when(Boolean(item.hint), (el) =>
+            el.child(
+              div()
+                .flex_none()
+                .max_w(140)
+                .truncate()
+                .font_family(mono)
+                .text_size(11)
+                .text_color(t.dim)
+                .child(item.hint),
+            ),
+          )
+          .child(
+            div()
+              .flex_1()
+              .min_w(0)
+              .truncate()
+              .text_size(11.5)
+              .text_color(t.muted)
+              .child(item.description || ""),
+          )
+          .child(
+            div()
+              .flex_none()
+              .px(5)
+              .py(1)
+              .rounded(4)
+              .bg(item.kind === "file" ? t.raised : (withAlpha(badge.color, "18") ?? t.raised))
+              .text_size(10)
+              .font_medium()
+              .text_color(badge.color)
+              .child(badge.label),
+          ),
+      );
+    });
+
+    if (items.length === 0 && loadingFiles) {
+      rows.push(
+        h_flex()
+          .flex_none()
+          .w_full()
+          .h(34)
+          .px(10)
+          .gap(8)
+          .items_center()
+          .text_size(12)
+          .text_color(t.muted)
+          .child(svg(ICONS.spinner).size(12).spin(900).text_color(t.dim))
+          .child(tr("Indexing workspace files…", "正在索引工作区文件…")),
+      );
+    }
+
+    return v_flex()
+      .id("acp-completion-popup")
+      .w_full()
+      .max_w(LANE_MAX_W)
+      .mb(6)
+      .p(6)
+      .gap(4)
+      .rounded(12)
+      .border_1()
+      .border_color(t.border)
+      .bg(t.popover ?? t.surface)
+      .shadow_xl()
+      .on_mouse_down("left", stopMouse)
+      .on_scroll_wheel((e, cx) => {
+        cx.stop_propagation();
+        if (!fixed) return;
+        this.completionScroll = Math.max(0, Math.min(this.completionScroll - (e.delta?.y ?? 0), maxScroll));
+        cx.notify();
+      })
+      .child(
+        h_flex()
+          .w_full()
+          .px(6)
+          .py(2)
+          .items_center()
+          .justify_between()
+          .gap(8)
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .child(
+                div()
+                  .px(5)
+                  .py(0.5)
+                  .rounded(4)
+                  .bg(withAlpha(accentSolid, "1a") ?? t.raised)
+                  .font_family(mono)
+                  .text_size(10.5)
+                  .font_semibold()
+                  .text_color(accentSolid)
+                  .child(triggerState.trigger),
+              )
+              .child(div().text_size(11).font_semibold().text_color(t.muted).child(headerTitle))
+              .when(loadingFiles && items.length > 0, (el) =>
+                el.child(svg(ICONS.spinner).size(10.5).spin(900).text_color(t.dim)),
+              ),
+          )
+          .child(
+            div()
+              .text_size(10.5)
+              .text_color(t.dim)
+              .child(tr("↑↓ navigate · Tab / Enter select · Esc close", "↑↓ 选择 · Tab / Enter 补全 · Esc 关闭")),
+          ),
+      )
+      .child(
+        div()
+          .id("acp-completion-list")
+          .relative()
+          .w_full()
+          .h(listH)
+          .overflow_hidden()
+          .children(fixed ? rows : [v_flex().w_full().children(rows)]),
+      );
+  }
+
   renderComposer(t, k, st, shortCwd, isTab = false, mono = "JetBrains Mono", inboxItems = []) {
     const queued = inboxItems.length > 0 ? inboxItems.length : (k?.inbox_len ?? 0);
     const ended = st === "ended" || k?.state === "finished";
     const pausedItems = !ended && !this.isPtyMode() ? this.pausedInboxItemsFor(k) : [];
     const pausedPanel = pausedItems.length > 0 ? this.renderPausedInboxBanner(t, pausedItems) : null;
     const queuePanel = !ended && inboxItems.length > 0 ? this.renderInboxQueue(t, inboxItems, mono) : null;
+    const compState = !ended ? this.activeCompletionState(k, this.cx) : null;
+    const completionPopup = compState ? this.renderCompletionPopup(t, compState, mono) : null;
     const working = st === "working" && !ended;
     const hasText = Boolean((this.input?.value?.() ?? "").trim());
     const hasAttachments = Array.isArray(this.draftAttachments) && this.draftAttachments.length > 0;
@@ -4822,6 +5411,7 @@ export default class Peek extends View {
       .bg(withAlpha(t.canvas ?? t.background, isDark ? "dc" : "e8"))
       .when(Boolean(pausedPanel), (el) => el.child(pausedPanel))
       .when(Boolean(queuePanel), (el) => el.child(queuePanel))
+      .when(Boolean(completionPopup), (el) => el.child(completionPopup))
       .child(
         v_flex()
           .id("acp-composer-card")
@@ -4921,6 +5511,11 @@ export default class Peek extends View {
               .on_click((_e, cx) => {
                 if (this.openConfigId) this.closeConfigPopover(cx);
                 this.input?.focus?.();
+              })
+              .on_key_down((e, cx) => {
+                if (this.handleComposerKeyDown(e, cx)) {
+                  cx.stop_propagation();
+                }
               })
               .child(
                 Textarea.new(this.input)
@@ -5172,6 +5767,7 @@ export default class Peek extends View {
         this.writeSavedDraft(this.loadedTerminal, this.input?.value?.() ?? "");
       }
       this.loadedTerminal = terminal;
+      this.resetPromptHistoryNav();
       this.restoreDraftFor(terminal);
       this.polishUndoText = null;
       this.polishSummary = null;
@@ -5181,6 +5777,11 @@ export default class Peek extends View {
       this.fallbackText = "";
       this.readHow = null;
       this.sessionMeta = null;
+      this.readAvailableCommands = [];
+      this.completionIdx = 0;
+      this.completionScroll = 0;
+      this.completionDismissedKey = null;
+      this.completionLastQueryKey = null;
       this.agentDetail = null;
       this.lastDetailTerminal = "";
       this.loadedOnce = false;

@@ -92,6 +92,26 @@ test("summarizeAiStatus extracts configured flag, model, baseUrl, keyMasked, and
     keyMasked: "sk-1***90",
     availableModels: ["gpt-5.4", "deepseek-chat"],
   });
+  expect(
+    summarizeAiStatus(
+      JSON.stringify({
+        configured: true,
+        enabled: true,
+        model: "claude-sonnet-4-6",
+        baseUrl: "https://api.anthropic.com",
+        protocol: "anthropic",
+        availableModels: ["claude-sonnet-4-6"],
+      }),
+    ),
+  ).toEqual({
+    configured: true,
+    enabled: true,
+    model: "claude-sonnet-4-6",
+    baseUrl: "https://api.anthropic.com",
+    keyMasked: null,
+    availableModels: ["claude-sonnet-4-6"],
+    protocol: "anthropic",
+  });
   expect(summarizeAiStatus("bad")).toBeNull();
 });
 

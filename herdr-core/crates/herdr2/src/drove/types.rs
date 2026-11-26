@@ -1397,6 +1397,8 @@ pub struct DaemonAiStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_masked: Option<String>,
     pub base_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<crate::ai::AiProtocol>,
     pub model: String,
     pub effort: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

@@ -207,6 +207,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
                         let can_load = started.can_load_session;
                         let prompt_caps = started.prompt_capabilities;
                         let config_options = started.config_options.clone();
+                        let available_commands = started.available_commands.clone();
                         let context_usage = started.context_usage;
                         let handle = acp::spawn_actor(core_bg.clone(), id, started);
                         let pid = handle.transport.pid();
@@ -218,6 +219,9 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
                         a.can_load_session = can_load;
                         a.prompt_capabilities = Some(prompt_caps);
                         a.config_options = config_options;
+                        if !available_commands.is_empty() {
+                            a.available_commands = available_commands;
+                        }
                         if let Some(usage) = context_usage {
                             a.context_usage = Some(usage);
                         }
@@ -304,6 +308,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         let can_load = started.can_load_session;
         let prompt_caps = started.prompt_capabilities;
         let config_options = started.config_options.clone();
+        let available_commands = started.available_commands.clone();
         let handle = acp::spawn_actor(core.core.clone(), id, started);
         let pid = handle.transport.pid();
         st.sessions.insert(id, handle);
@@ -313,6 +318,9 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         a.can_load_session = can_load;
         a.prompt_capabilities = Some(prompt_caps);
         a.config_options = config_options;
+        if !available_commands.is_empty() {
+            a.available_commands = available_commands;
+        }
         acp::sync_config_to_agent(a);
         if agent_info.is_some() {
             a.agent_info = agent_info;
@@ -626,6 +634,7 @@ pub(crate) async fn spawn_drove_agent(core: &Arc<Core>, req: DroveSpawnSpec) -> 
         let can_load = started.can_load_session;
         let prompt_caps = started.prompt_capabilities;
         let config_options = started.config_options.clone();
+        let available_commands = started.available_commands.clone();
         let handle = acp::spawn_actor(core.clone(), id, started);
         let pid = handle.transport.pid();
         st.sessions.insert(id, handle);
@@ -635,6 +644,9 @@ pub(crate) async fn spawn_drove_agent(core: &Arc<Core>, req: DroveSpawnSpec) -> 
         a.can_load_session = can_load;
         a.prompt_capabilities = Some(prompt_caps);
         a.config_options = config_options;
+        if !available_commands.is_empty() {
+            a.available_commands = available_commands;
+        }
         acp::sync_config_to_agent(a);
         if agent_info.is_some() {
             a.agent_info = agent_info;

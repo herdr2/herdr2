@@ -1780,3 +1780,645 @@ export function resolvePeerAddress(rawAddr, currentTerminal = "") {
   const slash = cur.lastIndexOf("/");
   return slash > 0 ? `${cur.slice(0, slash + 1)}${raw}` : raw;
 }
+
+function collapseConsecutivePrompts(list) {
+  const out = [];
+  for (const item of Array.isArray(list) ? list : []) {
+    const clean = String(item ?? "").replace(/\r\n/g, "\n").trim();
+    if (!clean) continue;
+    if (out.length === 0 || out[out.length - 1] !== clean) {
+      out.push(clean);
+    }
+  }
+  return out;
+}
+
+/**
+ * Extracts chronological human user prompts from structured transcript entries,
+ * skipping delegated peer messages, replay artifacts, and empty handoff envelopes.
+ */
+export function extractTranscriptPromptHistory(entries) {
+  const list = Array.isArray(entries) ? entries : [];
+  if (list.length === 0) return [];
+
+  const firstAuthoritativeByTurn = new Map();
+  list.forEach((entry, idx) => {
+    const turn = entry?.turn ?? 0;
+    if (
+      turn > 1 &&
+      entry?.kind === "user" &&
+      entry?.from != null &&
+      !firstAuthoritativeByTurn.has(turn)
+    ) {
+      firstAuthoritativeByTurn.set(turn, idx);
+    }
+  });
+
+  const prompts = [];
+  list.forEach((entry, idx) => {
+    if (!entry || entry.kind !== "user") return;
+    const cutoff = firstAuthoritativeByTurn.get(entry.turn ?? 0);
+    if (cutoff !== undefined && idx < cutoff) return;
+    const env = parseUserEnvelope(entry.text, entry.from ?? null);
+    if (env.from) return;
+    const body = String(env.body ?? "").trim();
+    if (!body) return;
+    prompts.push(body);
+  });
+
+  return collapseConsecutivePrompts(prompts);
+}
+
+function findLastSubarrayEnd(haystack, needle) {
+  if (needle.length === 0 || needle.length > haystack.length) return -1;
+  for (let start = haystack.length - needle.length; start >= 0; start--) {
+    let ok = true;
+    for (let j = 0; j < needle.length; j++) {
+      if (haystack[start + j] !== needle[j]) {
+        ok = false;
+        break;
+      }
+    }
+    if (ok) return start + needle.length;
+  }
+  return -1;
+}
+
+function normalizeLocalPromptEntry(item) {
+  if (typeof item === "string") {
+    const text = item.replace(/\r\n/g, "\n").trim();
+    return text ? { text, baseLen: null } : null;
+  }
+  if (item && typeof item === "object") {
+    const text = String(item.text ?? "").replace(/\r\n/g, "\n").trim();
+    if (!text) return null;
+    const rawLen = item.baseLen;
+    const baseLen = Number.isInteger(rawLen) && rawLen >= 0 ? rawLen : null;
+    return { text, baseLen };
+  }
+  return null;
+}
+
+/**
+ * Merges transcript-derived user prompts with locally sent composer prompts
+ * without duplicating overlapping entries, keeping newest `maxItems` entries.
+ *
+ * Local items may be plain strings or `{ text, baseLen }` records where `baseLen`
+ * is the transcript prompt count observed at send time (allowing exact matching
+ * even when an earlier prompt is re-sent before the transcript reloads).
+ */
+export function mergePromptHistory(transcriptPrompts, localPrompts, maxItems = 100) {
+  const base = collapseConsecutivePrompts(transcriptPrompts);
+  const rawLocal = (Array.isArray(localPrompts) ? localPrompts : [])
+    .map(normalizeLocalPromptEntry)
+    .filter(Boolean);
+  const local = [];
+  for (const item of rawLocal) {
+    if (local.length === 0 || local[local.length - 1].text !== item.text) {
+      local.push(item);
+    }
+  }
+  const limit = Number.isFinite(maxItems) && maxItems > 0 ? Math.floor(maxItems) : 100;
+
+  if (base.length === 0) return local.map((x) => x.text).slice(-limit);
+  if (local.length === 0) return base.slice(-limit);
+
+  const hasBaseLen = local.some((x) => x.baseLen != null);
+  let merged;
+  if (hasBaseLen) {
+    let cursor = 0;
+    const pending = [];
+    for (const item of local) {
+      const start = item.baseLen != null ? Math.max(cursor, item.baseLen) : cursor;
+      let found = -1;
+      for (let i = start; i < base.length; i++) {
+        if (base[i] === item.text) {
+          found = i;
+          break;
+        }
+      }
+      if (found >= 0) {
+        cursor = found + 1;
+      } else {
+        pending.push(item.text);
+      }
+    }
+    merged = [...base, ...pending];
+  } else {
+    const localTexts = local.map((x) => x.text);
+    // Prefer the longest suffix of `base` matching a prefix of `local`.
+    let suffixOverlap = 0;
+    const maxOverlap = Math.min(base.length, localTexts.length);
+    for (let k = maxOverlap; k >= 1; k--) {
+      let match = true;
+      for (let j = 0; j < k; j++) {
+        if (base[base.length - k + j] !== localTexts[j]) {
+          match = false;
+          break;
+        }
+      }
+      if (match) {
+        suffixOverlap = k;
+        break;
+      }
+    }
+    if (suffixOverlap > 0) {
+      merged = [...base, ...localTexts.slice(suffixOverlap)];
+    } else if (localTexts.length >= 2 && findLastSubarrayEnd(base, localTexts) >= 0) {
+      merged = base;
+    } else {
+      let matchedPrefix = 0;
+      for (let len = localTexts.length; len >= 2; len--) {
+        if (findLastSubarrayEnd(base, localTexts.slice(0, len)) >= 0) {
+          matchedPrefix = len;
+          break;
+        }
+      }
+      if (matchedPrefix > 0) {
+        merged = [...base, ...localTexts.slice(matchedPrefix)];
+      } else {
+        merged = [...base, ...localTexts];
+      }
+    }
+  }
+
+  return collapseConsecutivePrompts(merged).slice(-limit);
+}
+
+/**
+ * Computes the UTF-16 cursor offset after recalling a prompt from history:
+ * - Single-line prompts always place the cursor at the end (matching CLI shells).
+ * - Multi-line prompts place the cursor at 0 when stepping Up (so pressing Up again
+ *   never gets trapped inside a multi-line entry) and at the end when stepping Down.
+ */
+export function historyCursorOffset(text, direction) {
+  const s = String(text ?? "");
+  if (direction < 0 && s.includes("\n")) return 0;
+  return s.length;
+}
+
+/**
+ * Pure CLI-style Up/Down prompt history state transition.
+ * `state.index === -1` means live draft editing; `0..history.length-1` indexes oldest..newest.
+ */
+export function stepPromptHistory(state, history, currentText, direction) {
+  const list = Array.isArray(history) ? history : [];
+  const curText = String(currentText ?? "");
+  const prevDraft = typeof state?.draft === "string" ? state.draft : "";
+  let idx = Number.isInteger(state?.index) ? state.index : -1;
+
+  if (list.length === 0) {
+    return { handled: false, changed: false, index: -1, draft: prevDraft, text: curText, cursor: null };
+  }
+  if (idx >= list.length) idx = list.length - 1;
+  if (idx < -1) idx = -1;
+
+  if (direction < 0) {
+    if (idx === -1) {
+      const nextIdx = list.length - 1;
+      const nextText = list[nextIdx];
+      return {
+        handled: true,
+        changed: nextText !== curText,
+        index: nextIdx,
+        draft: curText,
+        text: nextText,
+        cursor: historyCursorOffset(nextText, -1),
+      };
+    }
+    if (idx > 0) {
+      const nextIdx = idx - 1;
+      const nextText = list[nextIdx];
+      return {
+        handled: true,
+        changed: nextText !== curText,
+        index: nextIdx,
+        draft: prevDraft,
+        text: nextText,
+        cursor: historyCursorOffset(nextText, -1),
+      };
+    }
+    return {
+      handled: true,
+      changed: false,
+      index: 0,
+      draft: prevDraft,
+      text: curText,
+      cursor: null,
+    };
+  }
+
+  if (direction > 0) {
+    if (idx === -1) {
+      return { handled: false, changed: false, index: -1, draft: prevDraft, text: curText, cursor: null };
+    }
+    if (idx < list.length - 1) {
+      const nextIdx = idx + 1;
+      const nextText = list[nextIdx];
+      return {
+        handled: true,
+        changed: nextText !== curText,
+        index: nextIdx,
+        draft: prevDraft,
+        text: nextText,
+        cursor: historyCursorOffset(nextText, 1),
+      };
+    }
+    return {
+      handled: true,
+      changed: prevDraft !== curText,
+      index: -1,
+      draft: "",
+      text: prevDraft,
+      cursor: prevDraft.length,
+    };
+  }
+
+  return { handled: false, changed: false, index: idx, draft: prevDraft, text: curText, cursor: null };
+}
+
+/**
+ * Returns true when an ACP or PTY terminal record belongs to Codex / codex-acp.
+ */
+export function isCodexAgentRecord(record) {
+  if (!record || typeof record !== "object") return false;
+  const fields = [
+    record.agent,
+    record.program?.key,
+    record.program?.name,
+    record.report?.app,
+    record.agent_info,
+  ];
+  if (fields.some((f) => String(f ?? "").toLowerCase().includes("codex"))) return true;
+  if (Array.isArray(record.argv) && record.argv.some((a) => String(a ?? "").toLowerCase().includes("codex"))) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Normalizes ACP `available_commands` / core-discovered CLI commands & skills into a clean list.
+ */
+export function normalizeAvailableCommands(rawCommands) {
+  if (!Array.isArray(rawCommands) || rawCommands.length === 0) return [];
+  const seen = new Set();
+  const out = [];
+  for (const raw of rawCommands) {
+    if (!raw || typeof raw !== "object") continue;
+    const rawName = String(raw.name ?? "").trim();
+    if (!rawName) continue;
+    const name = rawName.startsWith("/") ? rawName.slice(1) : rawName;
+    if (!name) continue;
+    const key = name.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const bareName = name.startsWith("$") ? name.slice(1) : name;
+    const description = String(raw.description ?? "").trim();
+    const rawHint = raw.input_hint ?? raw.inputHint ?? raw.input?.hint ?? null;
+    const inputHint = rawHint != null && String(rawHint).trim() ? String(rawHint).trim() : null;
+    const rawSource = String(raw.source ?? "").trim().toLowerCase();
+    const source = rawSource === "skill" || rawSource === "mcp" || rawSource === "command"
+      ? rawSource
+      : (name.startsWith("$") ? "skill" : (name.startsWith("mcp:") || name.endsWith(" (MCP)")) ? "mcp" : "command");
+    out.push({ name, bareName, description, inputHint, source });
+  }
+  return out;
+}
+
+/**
+ * Detects an active composer autocomplete trigger right before `cursorOffset`:
+ * - `/` at the start of the prompt (slash commands & skills)
+ * - `$` at start of prompt or after whitespace (skills)
+ * - `@` at start of prompt or after whitespace (workspace files, plus skills/commands in Codex)
+ */
+export function detectComposerTrigger(text, cursorOffset = null) {
+  const full = String(text ?? "");
+  const cursor = Number.isFinite(cursorOffset)
+    ? Math.max(0, Math.min(full.length, Math.floor(cursorOffset)))
+    : full.length;
+  const before = full.slice(0, cursor);
+  if (!before) return null;
+
+  const slashMatch = /^(\s*)(\/([^\s]*))$/.exec(before);
+  if (slashMatch) {
+    const start = slashMatch[1].length;
+    return {
+      trigger: "/",
+      query: slashMatch[3] ?? "",
+      start,
+      end: cursor,
+      atPromptStart: true,
+    };
+  }
+
+  const mentionMatch = /(?:^|[\s])([@$]([^\s]*))$/.exec(before);
+  if (mentionMatch) {
+    const token = mentionMatch[1];
+    const trigger = token[0];
+    const query = mentionMatch[2] ?? "";
+    const start = before.length - token.length;
+    const atPromptStart = before.slice(0, start).trim().length === 0;
+    return {
+      trigger,
+      query,
+      start,
+      end: cursor,
+      atPromptStart,
+    };
+  }
+
+  return null;
+}
+
+function fuzzyScore(query, target) {
+  const q = String(query ?? "").toLowerCase();
+  const t = String(target ?? "").toLowerCase();
+  if (!q) return 0;
+  if (!t) return null;
+  if (t === q) return 1000;
+  if (t.startsWith(q)) return 600 - (t.length - q.length) * 0.2;
+  const subIdx = t.indexOf(q);
+  if (subIdx >= 0) {
+    const boundary = subIdx === 0 || /[\s/:._\-]/.test(t[subIdx - 1]);
+    return (boundary ? 420 : 280) - subIdx * 0.5 - t.length * 0.05;
+  }
+  let score = 0;
+  let at = 0;
+  let run = 0;
+  for (let i = 0; i < q.length; i++) {
+    const idx = t.indexOf(q[i], at);
+    if (idx < 0) return null;
+    const boundary = idx === 0 || /[\s/:._\-]/.test(t[idx - 1]);
+    run = idx === at && i > 0 ? run + 1 : 0;
+    score += 4 + (boundary ? 14 : 0) + run * 6 - Math.min(idx - at, 12) * 0.4;
+    at = idx + 1;
+  }
+  return score - t.length * 0.05;
+}
+
+/**
+ * Builds ranked composer autocomplete items for `/`, `$`, or `@` triggers.
+ */
+export function buildCompletionItems(triggerState, opts = {}) {
+  if (!triggerState || !triggerState.trigger) return [];
+  const commands = normalizeAvailableCommands(opts.commands);
+  const files = Array.isArray(opts.files) ? opts.files : [];
+  const isCodex = Boolean(opts.isCodex);
+  const maxItems = Number.isFinite(opts.maxItems) ? Math.max(1, opts.maxItems) : 40;
+  const q = String(triggerState.query ?? "").trim();
+  const trigger = triggerState.trigger;
+
+  const candidates = [];
+
+  if (trigger === "/") {
+    const sourceRank = { command: 0, skill: 1, mcp: 2 };
+    commands.forEach((c, idx) => {
+      const isDollar = c.name.startsWith("$");
+      const label = isDollar ? c.name : `/${c.name}`;
+      const insertText = `${label} `;
+      if (!q) {
+        candidates.push({
+          id: `cmd:${c.name}`,
+          label,
+          insertText,
+          description: c.description,
+          hint: c.inputHint,
+          kind: c.source,
+          _score: -(sourceRank[c.source] ?? 3) * 10000 - idx,
+        });
+        return;
+      }
+      const nameScore = fuzzyScore(q, c.bareName) ?? fuzzyScore(q, c.name);
+      const descScore = c.description ? fuzzyScore(q, c.description) : null;
+      const best = nameScore != null ? nameScore + 200 : (descScore != null ? descScore * 0.4 : null);
+      if (best != null) {
+        candidates.push({
+          id: `cmd:${c.name}`,
+          label,
+          insertText,
+          description: c.description,
+          hint: c.inputHint,
+          kind: c.source,
+          _score: best - (sourceRank[c.source] ?? 3) * 15,
+        });
+      }
+    });
+  } else if (trigger === "$") {
+    const skills = commands.filter((c) => c.source === "skill" || c.name.startsWith("$"));
+    skills.forEach((c, idx) => {
+      const label = `$${c.bareName}`;
+      const insertText = `${label} `;
+      if (!q) {
+        candidates.push({
+          id: `skill:${c.bareName}`,
+          label,
+          insertText,
+          description: c.description,
+          hint: c.inputHint,
+          kind: "skill",
+          _score: -idx,
+        });
+        return;
+      }
+      const nameScore = fuzzyScore(q, c.bareName);
+      const descScore = c.description ? fuzzyScore(q, c.description) : null;
+      const best = nameScore != null ? nameScore + 200 : (descScore != null ? descScore * 0.4 : null);
+      if (best != null) {
+        candidates.push({
+          id: `skill:${c.bareName}`,
+          label,
+          insertText,
+          description: c.description,
+          hint: c.inputHint,
+          kind: "skill",
+          _score: best,
+        });
+      }
+    });
+  } else if (trigger === "@") {
+    if (isCodex) {
+      commands.forEach((c, idx) => {
+        const isSkill = c.source === "skill" || c.name.startsWith("$");
+        if (!isSkill && !triggerState.atPromptStart) return;
+        const label = isSkill ? `$${c.bareName}` : `/${c.bareName}`;
+        const insertText = `${label} `;
+        const tierBoost = isSkill ? 20 : 10;
+        if (!q) {
+          candidates.push({
+            id: `codex-${c.source}:${c.name}`,
+            label,
+            insertText,
+            description: c.description,
+            hint: c.inputHint,
+            kind: isSkill ? "skill" : c.source,
+            _score: (isSkill ? 5000 : 8000) - idx,
+          });
+          return;
+        }
+        const nameScore = fuzzyScore(q, c.bareName) ?? fuzzyScore(q, c.name);
+        const descScore = c.description ? fuzzyScore(q, c.description) : null;
+        const best = nameScore != null ? nameScore + 220 + tierBoost : (descScore != null ? descScore * 0.35 : null);
+        if (best != null) {
+          candidates.push({
+            id: `codex-${c.source}:${c.name}`,
+            label,
+            insertText,
+            description: c.description,
+            hint: c.inputHint,
+            kind: isSkill ? "skill" : c.source,
+            _score: best,
+          });
+        }
+      });
+    }
+
+    const seenFiles = new Set();
+    files.forEach((rawPath, idx) => {
+      const rel = String(rawPath ?? "").trim().replace(/\\/g, "/").replace(/^\.\//, "");
+      if (!rel || seenFiles.has(rel)) return;
+      seenFiles.add(rel);
+      const slash = rel.lastIndexOf("/");
+      const base = slash >= 0 ? rel.slice(slash + 1) : rel;
+      const dir = slash >= 0 ? rel.slice(0, slash) : "";
+      const label = `@${rel}`;
+      const insertText = `${label} `;
+      if (!q) {
+        candidates.push({
+          id: `file:${rel}`,
+          label,
+          insertText,
+          description: dir,
+          hint: null,
+          kind: "file",
+          _score: -idx,
+        });
+        return;
+      }
+      const baseScore = fuzzyScore(q, base);
+      const pathScore = fuzzyScore(q, rel);
+      const best = baseScore != null && pathScore != null
+        ? Math.max(baseScore + 140, pathScore + 90)
+        : baseScore != null
+          ? baseScore + 140
+          : pathScore != null
+            ? pathScore + 90
+            : null;
+      if (best != null) {
+        candidates.push({
+          id: `file:${rel}`,
+          label,
+          insertText,
+          description: dir,
+          hint: null,
+          kind: "file",
+          _score: best,
+        });
+      }
+    });
+  }
+
+  candidates.sort((a, b) => b._score - a._score);
+  return candidates.slice(0, maxItems).map(({ _score, ...rest }) => rest);
+}
+
+/**
+ * Replaces the active trigger token span with the selected completion item and returns the next text & caret.
+ */
+export function applyComposerCompletion(text, triggerState, item) {
+  const full = String(text ?? "");
+  if (!triggerState || !item?.insertText) {
+    return { text: full, cursor: full.length };
+  }
+  const start = Math.max(0, Math.min(full.length, Number(triggerState.start) || 0));
+  const end = Math.max(start, Math.min(full.length, Number(triggerState.end) || start));
+  const prefix = full.slice(0, start);
+  const suffix = full.slice(end);
+  let insert = String(item.insertText);
+  if (insert.endsWith(" ") && /^\s/.test(suffix)) {
+    insert = insert.slice(0, -1);
+    const next = `${prefix}${insert}${suffix}`;
+    return { text: next, cursor: prefix.length + insert.length + 1 };
+  }
+  const next = `${prefix}${insert}${suffix}`;
+  return { text: next, cursor: prefix.length + insert.length };
+}
+
+/**
+ * Detects an ACP authentication / onboarding error and returns a terminal login action
+ * (e.g. opening `claude` CLI for first-time theme setup & login, or `cursor-agent login`).
+ */
+export function resolveAcpAuthErrorAction(record, message, isRemote = false) {
+  const raw = String(message ?? "").trim();
+  if (!raw) return null;
+  const lower = raw.toLowerCase();
+  const isAuth =
+    lower.includes("authentication required") ||
+    lower.includes("auth_required") ||
+    lower.includes("cursor_login") ||
+    lower.includes("agent login") ||
+    lower.includes("cursor-agent login") ||
+    lower.includes("onboarding is incomplete") ||
+    lower.includes("please run /login") ||
+    lower.includes("not logged in") ||
+    lower.includes("login required") ||
+    lower.includes("please log in") ||
+    lower.includes("please login") ||
+    lower.includes("sign in required") ||
+    lower.includes("session expired") ||
+    lower.includes("unauthenticated") ||
+    lower.includes("unauthorized") ||
+    (lower.includes("-32000") && (lower.includes("auth") || lower.includes("login")));
+  if (!isAuth) return null;
+
+  const key = String(record?.agent || record?.program?.key || "").trim().toLowerCase();
+  const isClaude = key === "claude" || key === "claude-code" || lower.includes("claude");
+  const isCursor = !isClaude && (key === "cursor" || key === "cursor-agent" || lower.includes("cursor"));
+  const isCodex = !isClaude && !isCursor && (key === "codex" || lower.includes("codex"));
+
+  if (isClaude) {
+    return {
+      titleEn: "Claude CLI login required",
+      titleZh: "Claude 需要先在 CLI 中完成登录",
+      hintEn: "First-time Claude setup requires choosing a theme and signing in inside Claude CLI before using ACP.",
+      hintZh: "首次启动需先在 Claude CLI 中选择主题并完成登录（或运行 /login），完成后再在 ACP 中重试。",
+      buttonEn: "Open Claude CLI",
+      buttonZh: "打开 Claude CLI",
+      argv: isRemote ? null : ["claude"],
+      tabName: "Claude CLI",
+    };
+  }
+  if (isCursor) {
+    return {
+      titleEn: "Cursor login required",
+      titleZh: "Cursor 需要先登录",
+      hintEn: "Run `cursor-agent login` in a terminal to sign in, then retry ACP.",
+      hintZh: "请先在终端运行 `cursor-agent login` 完成登录后重试。",
+      buttonEn: "Open Login Terminal",
+      buttonZh: "打开终端登录",
+      argv: isRemote ? null : ["cursor-agent", "login"],
+      tabName: "Cursor Login",
+    };
+  }
+  if (isCodex) {
+    return {
+      titleEn: "Codex login required",
+      titleZh: "Codex 需要先登录",
+      hintEn: "Run `codex login` in a terminal to sign in, then retry ACP.",
+      hintZh: "请先在终端运行 `codex login` 完成登录后重试。",
+      buttonEn: "Open Login Terminal",
+      buttonZh: "打开终端登录",
+      argv: isRemote ? null : ["codex", "login"],
+      tabName: "Codex Login",
+    };
+  }
+  return {
+    titleEn: "Authentication required",
+    titleZh: "需要先完成登录",
+    hintEn: "Sign in via the agent's CLI in a terminal, then retry.",
+    hintZh: "请先在终端中通过对应 CLI 完成登录认证后再重试。",
+    buttonEn: null,
+    buttonZh: null,
+    argv: null,
+    tabName: null,
+  };
+}

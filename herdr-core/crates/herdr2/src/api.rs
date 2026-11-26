@@ -434,6 +434,7 @@ async fn templates_list(core: Ctx<'_>, _: Empty) -> Result<TemplatesResult, RpcE
 fn compact_list_entry(mut v: serde_json::Value) -> serde_json::Value {
     if let Some(obj) = v.as_object_mut() {
         obj.remove("config_options");
+        obj.remove("available_commands");
     }
     v
 }
@@ -600,23 +601,43 @@ async fn agent_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError
                 let spec = WaitSpec { output: None, timeout: Some(timeout), after_turn: None };
                 let _ = watched(core, p.caller.clone(), TargetKey::Terminal(id), spec).await;
             }
-            let snap = ((!p.last && p.lines.is_none()) || range_requested)
-                .then(|| {
-                    let mut st = core.lock();
-                    let mut snap = st
-                        .pty_reg
-                        .terminals
-                        .get(&id)
-                        .map(|t| crate::pty_transcript::snapshot_from_terminal(t, st.pty_prompts.get(&id)))?;
+            let (snap, term_cmd_ctx) = if (!p.last && p.lines.is_none()) || range_requested {
+                let mut st = core.lock();
+                let term_cmd_ctx = (!range_requested).then(|| {
+                    st.pty_reg.terminals.get(&id).map(|t| {
+                        let cwd = t.last_cwd.clone().filter(|s| !s.is_empty()).unwrap_or_else(|| t.cwd.clone());
+                        let app_hint = t.status.as_ref().map(|s| s.app.clone()).filter(|s| !s.is_empty());
+                        (t.argv.clone(), cwd, app_hint)
+                    })
+                }).flatten();
+                let mut snap = st
+                    .pty_reg
+                    .terminals
+                    .get(&id)
+                    .map(|t| crate::pty_transcript::snapshot_from_terminal(t, st.pty_prompts.get(&id)));
+                if let Some(ref mut s) = snap {
                     let addr = crate::terminals::address(id);
-                    crate::pty_transcript::populate_session_affinity(&mut snap, &addr, core, &mut st);
-                    Some(snap)
-                })
-                .flatten();
-            let (entries, session_meta) = if let Some(snap) = snap {
-                blocking(move || Ok(crate::pty_transcript::extract_transcript(&snap))).await?
+                    crate::pty_transcript::populate_session_affinity(s, &addr, core, &mut st);
+                }
+                (snap, term_cmd_ctx)
             } else {
-                (Vec::new(), None)
+                (None, None)
+            };
+            let (entries, session_meta, available_commands) = if snap.is_some() || term_cmd_ctx.is_some() {
+                blocking(move || {
+                    let (entries, session_meta) =
+                        snap.map(|s| crate::pty_transcript::extract_transcript(&s)).unwrap_or_else(|| (Vec::new(), None));
+                    let cmds = term_cmd_ctx
+                        .map(|(argv, cwd, app_hint)| {
+                            let kind = crate::acp::commands::detect_agent_kind(None, &argv, app_hint.as_deref());
+                            crate::acp::commands::discover_commands(&kind, &cwd)
+                        })
+                        .unwrap_or_default();
+                    Ok((entries, session_meta, cmds))
+                })
+                .await?
+            } else {
+                (Vec::new(), None, Vec::new())
             };
             if range_requested {
                 let sliced = crate::transcript::slice_turn_range(&entries, p.from_turn, p.to_turn);
@@ -628,6 +649,7 @@ async fn agent_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError
                     why: None,
                     entries: sliced,
                     session_meta,
+                    available_commands: Vec::new(),
                 });
             }
             let lines = match p.lines {
@@ -643,7 +665,7 @@ async fn agent_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError
             };
             let r = terminal_read(core, TerminalReadParams { terminal: term_addr, caller: p.caller, lines }).await?;
             let how = if !entries.is_empty() { "transcript".into() } else { r.how };
-            Ok(ReadResult { text: r.text, complete: r.complete, how, why: r.why, entries, session_meta })
+            Ok(ReadResult { text: r.text, complete: r.complete, how, why: r.why, entries, session_meta, available_commands })
         }
         TargetKey::Agent(id) => {
             let timeout = if p.wait { Some(wait_timeout(core, p.timeout)?) } else { None };
@@ -665,12 +687,38 @@ async fn agent_read(core: Ctx<'_>, p: ReadParams) -> Result<ReadResult, RpcError
                     why: None,
                     entries: sliced,
                     session_meta: None,
+                    available_commands: Vec::new(),
                 });
             }
             let (text, complete, how) = core.read_transcript(id, p.lines, p.last)?;
             let entries = if !p.last && p.lines.is_none() { core.read_transcript_entries(id)? } else { Vec::new() };
+            let available_commands = if !p.last && p.lines.is_none() {
+                let cmd_ctx = core.lock().reg.agents.get(&id).map(|a| {
+                    (a.available_commands.clone(), a.agent.clone(), a.argv.clone(), a.cwd.clone())
+                });
+                match cmd_ctx {
+                    Some((live, _, _, _)) if !live.is_empty() => crate::acp::commands::normalize_command_sources(&live),
+                    Some((live, preset, argv, cwd)) => {
+                        blocking(move || {
+                            Ok(crate::acp::commands::resolve_acp_commands(&live, preset.as_deref(), &argv, &cwd))
+                        })
+                        .await?
+                    }
+                    None => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            };
             core.flush_saved().await?;
-            Ok(ReadResult { text, complete, how: how.into(), why: None, entries, session_meta: None })
+            Ok(ReadResult {
+                text,
+                complete,
+                how: how.into(),
+                why: None,
+                entries,
+                session_meta: None,
+                available_commands,
+            })
         }
     }
 }

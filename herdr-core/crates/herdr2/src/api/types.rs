@@ -459,6 +459,9 @@ pub struct ReadResult {
     /// Model/mode/context usage metadata inferred from CLI agent session logs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_meta: Option<ReadSessionMeta>,
+    /// Slash commands & skills available in this ACP or CLI session (for interactive composer hints).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_commands: Vec<crate::acp::proto::AcpAvailableCommand>,
 }
 
 #[derive(clap::Args, Serialize, Deserialize, JsonSchema, Default)]
@@ -1403,6 +1406,10 @@ pub struct HandoffParams {
     #[arg(skip)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub language: Option<String>,
+    /// Preferred wrapper shell executable for newly spawned PTY CLI targets (e.g. `powershell.exe`, `pwsh.exe`, `bash.exe`, `cmd.exe`).
+    #[arg(skip)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell: Option<String>,
     /// Build and return the handoff markdown package without creating or sending to a target (used for cross-machine delivery).
     #[arg(skip)]
     #[serde(default)]

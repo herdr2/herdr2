@@ -547,7 +547,21 @@ test("buildUpdateModal handles available updates, up-to-date, and check errors",
   expect(avail.kind).toBe("available");
   expect(avail.version).toBe("2.0.4");
   expect(avail.restart).toBe(true);
+  expect(avail.needsElevation).toBe(false);
   expect(avail.items.length).toBe(2);
+
+  const elevated = view.buildUpdateModal({
+    app: { version: "2.0.3", ready: "2.0.4", needs_elevation: true },
+    available: {
+      kind: "app",
+      version: "2.0.4",
+      restart: true,
+      needs_elevation: true,
+      items: [{ kind: "app", current: "2.0.3", next: "2.0.4" }],
+    },
+  });
+  expect(elevated.kind).toBe("available");
+  expect(elevated.needsElevation).toBe(true);
 
   const upToDate = view.buildUpdateModal({
     app: { version: "2.0.3", ready: null },
@@ -764,4 +778,37 @@ test("droveProbeSummary separates healthy and errored installed agents and forma
     "`agy models` exited with code 1 · Please login first",
   );
   expect(view.formatAgentProbeError("ACP probe timed out after 60s")).toBe("ACP probe timed out after 60s");
+});
+
+test("ai protocol is auto-detected without manual selector and synced on connection test", async () => {
+  const view = new Settings();
+  expect(view.aiProtocolLabel("anthropic")).toBe("Claude");
+  expect(view.aiProtocolLabel("claude")).toBe("Claude");
+  expect(view.aiProtocolLabel("openai")).toBe("OpenAI");
+  expect(view.aiProtocolLabel(null)).toBeNull();
+  expect(view.aiProtocolLabel("")).toBeNull();
+
+  // Settings UI displays auto-detected protocol badge without any manual protocol picker.
+  expect(source).toContain("st-ai-protocol-badge");
+  expect(source).not.toContain("st-ai-protocol-select");
+
+  view.aiStatus = { baseUrl: "https://relay.example.com/v1", configured: true, availableModels: [] };
+  view.droveUrlInput = { value: () => "https://relay.example.com/v1" };
+  view.droveKeyInput = { value: () => "" };
+  view.aiCallWithJsonFile = async () => ({
+    ok: true,
+    protocol: "anthropic",
+    discoveredModel: "claude-sonnet-4-6",
+    availableModels: ["claude-sonnet-4-6"],
+    latencyMs: 95,
+  });
+
+  let task: Promise<void> | null = null;
+  const cx = { notify() {}, spawn(fn: (cx: any) => Promise<void>) { task = fn(cx); } };
+  view.testCoreAi(cx);
+  await task;
+
+  expect(view.aiTestResult?.protocol).toBe("anthropic");
+  expect(view.aiStatus?.protocol).toBe("anthropic");
+  expect(view.aiStatus?.availableModels).toEqual(["claude-sonnet-4-6"]);
 });

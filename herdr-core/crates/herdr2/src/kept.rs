@@ -308,6 +308,7 @@ impl Core {
                             let can_load = started.can_load_session;
                             let prompt_caps = started.prompt_capabilities;
                             let config_options = started.config_options.clone();
+                            let available_commands = started.available_commands.clone();
                             let context_usage = started.context_usage;
                             let handle = acp::spawn_actor(core.clone(), id, started);
                             let pid = handle.transport.pid();
@@ -318,6 +319,9 @@ impl Core {
                                 a.can_load_session = can_load;
                                 a.prompt_capabilities = Some(prompt_caps);
                                 a.config_options = config_options;
+                                if !available_commands.is_empty() {
+                                    a.available_commands = available_commands;
+                                }
                                 if let Some(usage) = context_usage {
                                     a.context_usage = Some(usage);
                                 }

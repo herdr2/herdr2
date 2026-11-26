@@ -32,6 +32,7 @@ no_load_cap = "--no-load-cap" in sys.argv
 no_image_cap = "--no-image-cap" in sys.argv
 reject_image = "--reject-image" in sys.argv
 hang_init = "--hang-init" in sys.argv
+emit_commands = "--emit-commands" in sys.argv
 
 TINY_PNG_B64 = "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAAEUlEQVR4nGMUMgn7z8DAwAAACQ0BnfdmzRUAAAAASUVORK5CYII="
 
@@ -445,6 +446,21 @@ def worker() -> None:
                 session_id = f"sess-{os.getpid()}-{int(time.time() * 1000)}"
                 was_loaded = False
                 reply_ok(rpc_id, {"sessionId": session_id, "configOptions": current_config_options()})
+                if emit_commands:
+                    notify(
+                        "session/update",
+                        {
+                            "sessionId": session_id,
+                            "update": {
+                                "sessionUpdate": "available_commands_update",
+                                "availableCommands": [
+                                    {"name": "plan", "description": "Turn plan mode on.", "input": None},
+                                    {"name": "compact", "description": "Compact context.", "input": {"hint": "[focus]"}},
+                                    {"name": "$drove", "description": "Run drove DAG.", "input": None},
+                                ],
+                            },
+                        },
+                    )
             elif method == "session/load":
                 if reject_load:
                     reply_err(rpc_id, -32000, "load rejected")

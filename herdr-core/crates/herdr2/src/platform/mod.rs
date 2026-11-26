@@ -257,6 +257,31 @@ pub(crate) fn environment_key_eq(key: &std::ffi::OsStr, name: &str) -> bool {
     if cfg!(windows) { key.eq_ignore_ascii_case(std::ffi::OsStr::new(name)) } else { key == name }
 }
 
+/// Starts a background `std::process::Command` without popping up a console window on Windows.
+pub fn bg_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = std::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
+/// Starts a background `tokio::process::Command` without popping up a console window on Windows.
+pub fn bg_tokio_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
+    #[allow(unused_mut)]
+    let mut cmd = tokio::process::Command::new(program);
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd
+}
+
 /// Application settings survive a restart; session paths and lifecycle marks do not move.
 pub(crate) fn restored_environment(
     saved: impl IntoIterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
@@ -525,3 +550,85 @@ pub mod signal {
 #[cfg(test)]
 #[path = "environment_tests.rs"]
 mod environment_tests;
+
+#[cfg(test)]
+mod no_window_audit {
+    use std::path::Path;
+
+    fn collect_rs_files(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                collect_rs_files(&p, out);
+            } else if p.extension().is_some_and(|e| e == "rs") {
+                out.push(p);
+            }
+        }
+    }
+
+    /// Guard against introducing raw `Command::new(...)` calls in Windows-reachable
+    /// production code without `CREATE_NO_WINDOW` (which flashes console windows
+    /// when invoked from the background daemon on Windows).
+    #[test]
+    fn windows_production_spawns_use_no_window_helpers() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = Vec::new();
+        collect_rs_files(&src, &mut files);
+        // Explicitly allowlisted files:
+        // - bg_command / bg_tokio_command definitions (platform/mod.rs)
+        // - Windows-specific modules that set CREATE_NO_WINDOW directly (platform/windows*.rs)
+        // - Unix/macOS/Linux-only modules (platform/unix.rs, platform/systemd.rs, platform/macos_*.rs, platform/linux_*.rs)
+        // - client.rs (builds Command passed to platform::spawn_detached, which uses CREATE_NO_WINDOW)
+        // - exec.rs (calls platform::exec_group, which sets CREATE_NO_WINDOW | CREATE_SUSPENDED)
+        // - machines.rs (`ssh()` helper sets CREATE_NO_WINDOW in `Reach::command`)
+        // - restart.rs (builds an unused dummy Command for arg inspection; never spawned)
+        // - releases.rs (Unix-only sha256sum/shasum helper)
+        // - drove/sandbox.rs (Linux bwrap & macOS sandbox-exec probes gated by cfg!)
+        let allowlisted = [
+            "platform/mod.rs",
+            "platform/windows.rs",
+            "platform/windows_exec.rs",
+            "platform/unix.rs",
+            "platform/systemd.rs",
+            "platform/linux_login.rs",
+            "platform/macos_appkit.rs",
+            "platform/macos_bundle.rs",
+            "platform/macos_launchd.rs",
+            "platform/macos_responsibility.rs",
+            "platform/macos_session.rs",
+            "platform/macos_shutdown.rs",
+            "client.rs",
+            "exec.rs",
+            "machines.rs",
+            "restart.rs",
+            "releases.rs",
+            "drove/sandbox.rs",
+        ];
+        let mut offenders = Vec::new();
+        for file in files {
+            let rel = file.strip_prefix(&src).unwrap().to_string_lossy().replace('\\', "/");
+            if rel.ends_with("_tests.rs") || rel.ends_with("/tests.rs") || allowlisted.contains(&rel.as_str()) {
+                continue;
+            }
+            let text = std::fs::read_to_string(&file).unwrap();
+            let prod = text
+                .split("#[cfg(test)]")
+                .next()
+                .unwrap_or(&text)
+                .split("#[cfg(all(test,")
+                .next()
+                .unwrap_or(&text);
+            for (idx, line) in prod.lines().enumerate() {
+                if line.contains("Command::new(") {
+                    offenders.push(format!("{rel}:{}: {}", idx + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "Found raw Command::new(...) in production core code; use crate::platform::bg_command / bg_tokio_command so Windows does not flash console windows:\n{}",
+            offenders.join("\n")
+        );
+    }
+}

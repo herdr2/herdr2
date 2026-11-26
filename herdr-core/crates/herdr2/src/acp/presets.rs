@@ -125,6 +125,170 @@ pub fn apply_cursor_env_quirks(argv: &[String], env: &mut BTreeMap<String, Strin
     }
 }
 
+fn env_or_process_ignore_case(env: &BTreeMap<String, String>, key: &str) -> Option<String> {
+    if let Some(val) = env_ignore_case(env, key).map(str::trim).filter(|s| !s.is_empty()) {
+        return Some(val.to_string());
+    }
+    std::env::vars()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| v.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn has_claude_non_interactive_auth_in_map<'a>(mut entries: impl Iterator<Item = (&'a str, &'a str)>) -> bool {
+    entries.any(|(k, v)| {
+        let val = v.trim();
+        if val.is_empty() {
+            return false;
+        }
+        if k.eq_ignore_ascii_case("ANTHROPIC_API_KEY")
+            || k.eq_ignore_ascii_case("ANTHROPIC_AUTH_TOKEN")
+            || k.eq_ignore_ascii_case("CLAUDE_CODE_OAUTH_TOKEN")
+            || k.eq_ignore_ascii_case("ANTHROPIC_FOUNDRY_API_KEY")
+            || k.eq_ignore_ascii_case("ANTHROPIC_BEDROCK_BASE_URL")
+            || k.eq_ignore_ascii_case("ANTHROPIC_VERTEX_BASE_URL")
+            || k.eq_ignore_ascii_case("ANTHROPIC_CUSTOM_HEADERS")
+        {
+            return true;
+        }
+        if (k.eq_ignore_ascii_case("CLAUDE_CODE_USE_BEDROCK")
+            || k.eq_ignore_ascii_case("CLAUDE_CODE_USE_VERTEX")
+            || k.eq_ignore_ascii_case("CLAUDE_CODE_USE_FOUNDRY"))
+            && matches!(val.to_ascii_lowercase().as_str(), "1" | "true" | "yes")
+        {
+            return true;
+        }
+        false
+    })
+}
+
+fn settings_file_has_claude_auth(path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    if v.get("apiKeyHelper").and_then(serde_json::Value::as_str).is_some_and(|s| !s.trim().is_empty()) {
+        return true;
+    }
+    if let Some(env_obj) = v.get("env").and_then(serde_json::Value::as_object) {
+        let iter = env_obj.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.as_str(), s)));
+        if has_claude_non_interactive_auth_in_map(iter) {
+            return true;
+        }
+    }
+    false
+}
+
+fn credentials_file_has_claude_auth(path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    v.as_object().is_some_and(|obj| {
+        obj.values().any(|entry| match entry {
+            serde_json::Value::Object(m) => !m.is_empty(),
+            serde_json::Value::String(s) => !s.trim().is_empty(),
+            _ => false,
+        })
+    })
+}
+
+/// Checks whether Claude Code has completed first-time CLI onboarding & authentication before
+/// spawning `claude-agent-acp`. On a fresh install where `claude` has never been run to choose
+/// a theme and log in (and no API key / gateway / cloud provider env is configured), spawning
+/// `claude-agent-acp` hangs during handshake or turn startup instead of guiding the user.
+pub fn check_claude_acp_readiness(argv: &[String], env: &BTreeMap<String, String>) -> Result<(), RpcError> {
+    if !is_claude_agent(None, argv) {
+        return Ok(());
+    }
+    let home = env_or_process_ignore_case(env, "HOME")
+        .or_else(|| env_or_process_ignore_case(env, "USERPROFILE"))
+        .map(std::path::PathBuf::from);
+    let Some(home) = home else {
+        return Ok(());
+    };
+    let config_dir = env_or_process_ignore_case(env, "CLAUDE_CONFIG_DIR").map(std::path::PathBuf::from);
+    let process_env: Vec<(String, String)> = std::env::vars().collect();
+    if has_claude_non_interactive_auth_in_map(process_env.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
+        return Ok(());
+    }
+    check_claude_acp_readiness_in(argv, env, &home, config_dir.as_deref())
+}
+
+fn check_claude_acp_readiness_in(
+    argv: &[String],
+    env: &BTreeMap<String, String>,
+    home: &Path,
+    config_dir_override: Option<&Path>,
+) -> Result<(), RpcError> {
+    if !is_claude_agent(None, argv) {
+        return Ok(());
+    }
+    if has_claude_non_interactive_auth_in_map(env.iter().map(|(k, v)| (k.as_str(), v.as_str()))) {
+        return Ok(());
+    }
+    let claude_dir = config_dir_override.map(Path::to_path_buf).unwrap_or_else(|| home.join(".claude"));
+    for name in ["settings.json", "settings.local.json"] {
+        if settings_file_has_claude_auth(&claude_dir.join(name)) {
+            return Ok(());
+        }
+    }
+    if credentials_file_has_claude_auth(&claude_dir.join(".credentials.json")) {
+        return Ok(());
+    }
+
+    let mut state_candidates = Vec::new();
+    if config_dir_override.is_some() {
+        state_candidates.push(claude_dir.join(".claude.json"));
+    }
+    state_candidates.push(home.join(".claude.json"));
+
+    let mut has_completed_onboarding = false;
+    let mut has_account = false;
+    for path in state_candidates {
+        let Ok(raw) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        if v.get("hasCompletedOnboarding").and_then(serde_json::Value::as_bool) == Some(true) {
+            has_completed_onboarding = true;
+        }
+        if v.get("oauthAccount").and_then(serde_json::Value::as_object).is_some_and(|m| !m.is_empty())
+            || v.get("primaryApiKey").and_then(serde_json::Value::as_str).is_some_and(|s| !s.trim().is_empty())
+            || v.pointer("/customApiKeyResponses/approved")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|arr| !arr.is_empty())
+        {
+            has_account = true;
+        }
+        if has_completed_onboarding && has_account {
+            return Ok(());
+        }
+    }
+
+    if !has_completed_onboarding {
+        return Err(RpcError::new(
+            "auth_required",
+            "Authentication required: Claude CLI onboarding is incomplete. Please run 'claude' in a terminal to choose a theme and sign in first.",
+            "Run `claude` in a terminal to complete first-time setup and login, then retry ACP mode.",
+        ));
+    }
+    if !has_account {
+        return Err(RpcError::new(
+            "auth_required",
+            "Authentication required: Claude CLI is not logged in. Please run 'claude' in a terminal to sign in first.",
+            "Run `claude` in a terminal to sign in, then retry ACP mode.",
+        ));
+    }
+    Ok(())
+}
+
 /// Points `@agentclientprotocol/codex-acp` at the user's installed `codex` CLI (`CODEX_PATH`) when
 /// available on `PATH`, instead of letting an older cached `codex-acp` package fall back to its
 /// stale bundled `@openai/codex` binary (which may miss newer models or `openai_base_url` routing).
@@ -917,6 +1081,68 @@ mod tests {
         let wrapper_text = std::fs::read_to_string(wrapper_path).unwrap();
         assert!(wrapper_text.contains("model_catalog_json="), "unexpected wrapper: {wrapper_text}");
         assert!(wrapper_text.contains(&codex_cli.display().to_string()), "unexpected wrapper: {wrapper_text}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn claude_acp_readiness_detects_missing_onboarding_and_allows_authenticated_setups() {
+        let root = std::env::temp_dir().join(format!(
+            "herdr2-claude-ready-{}",
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let argv = vec!["claude-agent-acp".into()];
+        let empty_env = BTreeMap::new();
+
+        // 1. Brand-new home with no .claude.json or env credentials -> onboarding error.
+        let err = check_claude_acp_readiness_in(&argv, &empty_env, &root, None).unwrap_err();
+        assert!(err.message.contains("onboarding is incomplete"), "unexpected error: {}", err.message);
+
+        // 2. Non-claude agent is never blocked.
+        assert!(check_claude_acp_readiness_in(&["codex-acp".into()], &empty_env, &root, None).is_ok());
+
+        // 3. Env API key / auth token / Bedrock bypasses CLI onboarding check.
+        let mut api_env = BTreeMap::new();
+        api_env.insert("ANTHROPIC_API_KEY".into(), "sk-ant-test".into());
+        assert!(check_claude_acp_readiness_in(&argv, &api_env, &root, None).is_ok());
+
+        let mut bedrock_env = BTreeMap::new();
+        bedrock_env.insert("CLAUDE_CODE_USE_BEDROCK".into(), "1".into());
+        assert!(check_claude_acp_readiness_in(&argv, &bedrock_env, &root, None).is_ok());
+
+        // 4. settings.json with ANTHROPIC_AUTH_TOKEN (custom gateway / Magpie) passes.
+        let claude_dir = root.join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::write(
+            claude_dir.join("settings.json"),
+            r#"{"env":{"ANTHROPIC_AUTH_TOKEN":"tok-123"}}"#,
+        )
+        .unwrap();
+        assert!(check_claude_acp_readiness_in(&argv, &empty_env, &root, None).is_ok());
+        std::fs::remove_file(claude_dir.join("settings.json")).unwrap();
+
+        // 5. Completed onboarding without oauthAccount or credentials -> login required error.
+        std::fs::write(root.join(".claude.json"), r#"{"hasCompletedOnboarding":true}"#).unwrap();
+        let err2 = check_claude_acp_readiness_in(&argv, &empty_env, &root, None).unwrap_err();
+        assert!(err2.message.contains("not logged in"), "unexpected error: {}", err2.message);
+
+        // 6. Completed onboarding + oauthAccount -> passes.
+        std::fs::write(
+            root.join(".claude.json"),
+            r#"{"hasCompletedOnboarding":true,"oauthAccount":{"emailAddress":"u@example.com"}}"#,
+        )
+        .unwrap();
+        assert!(check_claude_acp_readiness_in(&argv, &empty_env, &root, None).is_ok());
+
+        // 7. .credentials.json with oauth payload -> passes even without .claude.json.
+        std::fs::remove_file(root.join(".claude.json")).unwrap();
+        std::fs::write(
+            claude_dir.join(".credentials.json"),
+            r#"{"claudeAiOauth":{"accessToken":"tok"}}"#,
+        )
+        .unwrap();
+        assert!(check_claude_acp_readiness_in(&argv, &empty_env, &root, None).is_ok());
 
         let _ = std::fs::remove_dir_all(&root);
     }

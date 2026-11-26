@@ -714,6 +714,72 @@ pub fn extract_prompt_result_usage(val: &Value) -> Option<AcpUsageDetail> {
     extract_usage_from_obj(val).or_else(|| val.get("_meta").and_then(extract_usage_from_obj))
 }
 
+#[derive(Serialize, Deserialize, JsonSchema, Clone, Debug, PartialEq, Eq)]
+pub struct AcpAvailableCommand {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_hint: Option<String>,
+    /// Optional categorization (`"command"`, `"skill"`, `"mcp"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
+/// Parses ACP `availableCommands` arrays from `available_commands_update` (or `session/new`).
+pub fn parse_available_commands(val: &Value) -> Vec<AcpAvailableCommand> {
+    let Some(arr) = val
+        .get("availableCommands")
+        .or_else(|| val.get("available_commands"))
+        .and_then(Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for item in arr {
+        let Some(raw_name) = item.get("name").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let name = raw_name.strip_prefix('/').unwrap_or(raw_name).to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let description = item
+            .get("description")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .unwrap_or_default()
+            .to_string();
+        let input_hint = item
+            .pointer("/input/hint")
+            .or_else(|| item.get("inputHint"))
+            .or_else(|| item.get("input_hint"))
+            .or_else(|| item.get("argumentHint"))
+            .and_then(|v| {
+                if let Some(s) = v.as_str() {
+                    let t = s.trim();
+                    (!t.is_empty()).then(|| t.to_string())
+                } else if let Some(parts) = v.as_array() {
+                    let joined: Vec<&str> = parts.iter().filter_map(Value::as_str).map(str::trim).filter(|s| !s.is_empty()).collect();
+                    (!joined.is_empty()).then(|| joined.join(" "))
+                } else {
+                    None
+                }
+            });
+        let source = item.get("source").and_then(Value::as_str).map(String::from).or_else(|| {
+            if name.starts_with('$') {
+                Some("skill".into())
+            } else if name.starts_with("mcp:") || name.ends_with(" (MCP)") {
+                Some("mcp".into())
+            } else {
+                Some("command".into())
+            }
+        });
+        out.push(AcpAvailableCommand { name, description, input_hint, source });
+    }
+    out
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ParsedUpdate {
     AssistantChunk(String),
@@ -730,6 +796,7 @@ pub enum ParsedUpdate {
     },
     Plan(Vec<String>),
     ConfigOptions(Vec<AcpConfigOption>),
+    AvailableCommands(Vec<AcpAvailableCommand>),
     CurrentMode(String),
     Usage(AcpContextUsage),
     Other,
@@ -787,6 +854,7 @@ pub fn parse_session_update(params: &Value) -> Option<(String, ParsedUpdate)> {
             ParsedUpdate::Plan(items)
         }
         "config_option_update" => ParsedUpdate::ConfigOptions(parse_session_config(update)),
+        "available_commands_update" => ParsedUpdate::AvailableCommands(parse_available_commands(update)),
         "current_mode_update" => update
             .get("currentModeId")
             .and_then(Value::as_str)
@@ -1347,5 +1415,69 @@ mod tests {
         .unwrap();
         let caps = init.agent_capabilities.unwrap().prompt_capabilities;
         assert!(caps.image && !caps.audio && caps.embedded_context);
+    }
+
+    #[test]
+    fn parses_available_commands_update_for_claude_and_codex() {
+        let upd = json!({
+            "sessionId": "s1",
+            "update": {
+                "sessionUpdate": "available_commands_update",
+                "availableCommands": [
+                    {
+                        "name": "compact",
+                        "description": "Summarize conversation to save context",
+                        "input": { "hint": "[instructions]" }
+                    },
+                    {
+                        "name": "$drove",
+                        "description": "Multi-agent DAG planning",
+                        "input": null
+                    },
+                    {
+                        "name": "mcp:herdr2:ls",
+                        "description": "List agents"
+                    },
+                    {
+                        "name": "/review",
+                        "description": "Review changes",
+                        "argumentHint": ["<branch>"]
+                    }
+                ]
+            }
+        });
+        let parsed = parse_session_update(&upd);
+        assert_eq!(
+            parsed,
+            Some((
+                "s1".into(),
+                ParsedUpdate::AvailableCommands(vec![
+                    AcpAvailableCommand {
+                        name: "compact".into(),
+                        description: "Summarize conversation to save context".into(),
+                        input_hint: Some("[instructions]".into()),
+                        source: Some("command".into()),
+                    },
+                    AcpAvailableCommand {
+                        name: "$drove".into(),
+                        description: "Multi-agent DAG planning".into(),
+                        input_hint: None,
+                        source: Some("skill".into()),
+                    },
+                    AcpAvailableCommand {
+                        name: "mcp:herdr2:ls".into(),
+                        description: "List agents".into(),
+                        input_hint: None,
+                        source: Some("mcp".into()),
+                    },
+                    AcpAvailableCommand {
+                        name: "review".into(),
+                        description: "Review changes".into(),
+                        input_hint: Some("<branch>".into()),
+                        source: Some("command".into()),
+                    },
+                ])
+            ))
+        );
     }
 }

@@ -4,7 +4,7 @@ use super::*;
 
 /// What a binary says it is (`h2 0.2.0`), if it is a working h2.
 pub(super) fn version_of(path: &std::path::Path) -> Option<String> {
-    let out = std::process::Command::new(path).arg("--version").stdin(std::process::Stdio::null()).output().ok()?;
+    let out = crate::platform::bg_command(path).arg("--version").stdin(std::process::Stdio::null()).output().ok()?;
     let v = String::from_utf8_lossy(&out.stdout).trim().to_string();
     (out.status.success() && v.starts_with("h2 ")).then_some(v)
 }

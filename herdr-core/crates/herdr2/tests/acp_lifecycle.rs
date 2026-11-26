@@ -242,3 +242,34 @@ fn agent_send_resets_manual_status_on_sender_and_receiver() {
     assert!(after_a1["labels"].get("herdr.status").is_none(), "sender manual status was not reset: {after_a1}");
     assert!(after_a2["labels"].get("herdr.status").is_none(), "receiver manual status was not reset: {after_a2}");
 }
+
+#[test]
+fn acp_available_commands_update_populates_get_read_and_omits_from_list() {
+    let s = Session::new();
+    let spec = format!("{} --emit-commands", fake_acp_spec());
+    let agent = s.json(&["run", "--bg", "--agent", &spec])["address"].as_str().unwrap().to_owned();
+
+    wait_until("available_commands populated on agent.get", || {
+        get(&s, &agent)["available_commands"].as_array().is_some_and(|a| a.len() == 3)
+    });
+
+    let rec = get(&s, &agent);
+    let cmds = rec["available_commands"].as_array().unwrap();
+    assert_eq!(cmds[0]["name"], "plan");
+    assert_eq!(cmds[0]["source"], "command");
+    assert_eq!(cmds[1]["name"], "compact");
+    assert_eq!(cmds[1]["input_hint"], "[focus]");
+    assert_eq!(cmds[2]["name"], "$drove");
+    assert_eq!(cmds[2]["source"], "skill");
+
+    // `agent.read` returns normalized available_commands too.
+    let read = s.json(&["read", "--json", &agent]);
+    let read_cmds = read["available_commands"].as_array().expect("read available_commands");
+    assert_eq!(read_cmds.len(), 3);
+    assert_eq!(read_cmds[2]["name"], "$drove");
+
+    // `agent.list` stays compact without available_commands.
+    let list = s.json(&["ls"]);
+    let entry = list["agents"].as_array().unwrap().iter().find(|a| a["address"] == agent).unwrap();
+    assert!(entry.get("available_commands").is_none(), "agent.list should omit available_commands: {entry}");
+}

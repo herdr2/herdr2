@@ -731,6 +731,7 @@ fn apply(record: &mut Value, kind: &str, data: &Value) {
         "labels" => set(record, &["labels"]),
         "keep" => set(record, &["keep"]),
         "config" => set(record, &["model", "mode", "permission_mode", "config_options"]),
+        "commands" => set(record, &["available_commands"]),
         "usage" => record["context_usage"] = data.clone(),
         _ => {}
     }

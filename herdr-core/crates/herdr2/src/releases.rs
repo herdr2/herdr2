@@ -8,6 +8,7 @@ use crate::rpc::RpcError;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::process::Command;
 
 #[derive(Deserialize)]
@@ -66,7 +67,7 @@ fn curl_program() -> PathBuf {
 
 fn curl(url: &str, to: &Path) -> Result<(), RpcError> {
     // Quiet: our error says what failed, and piped stderr is one JSON error.
-    let mut cmd = Command::new(curl_program());
+    let mut cmd = crate::platform::bg_command(curl_program());
     // Windows System32 curl.exe uses Schannel, which fails with CRYPT_E_REVOCATION_OFFLINE
     // when firewalls/proxies block CRL/OCSP endpoints (still verifies TLS certs & hostnames).
     if cfg!(windows) {
@@ -136,8 +137,13 @@ fn sha256(file: &Path) -> Option<String> {
 pub fn download(m: &Manifest, target: &str, scratch: &Path, bundle: bool) -> Result<PathBuf, RpcError> {
     let tar = fetch(m, target, scratch)?;
     let exe = if target.starts_with("windows") { "herdr2.exe" } else { "herdr2" };
-    let ok =
-        Command::new(tar_program()).arg("-xf").arg(&tar).arg("-C").arg(scratch).status().is_ok_and(|s| s.success());
+    let ok = crate::platform::bg_command(tar_program())
+        .arg("-xf")
+        .arg(&tar)
+        .arg("-C")
+        .arg(scratch)
+        .status()
+        .is_ok_and(|s| s.success());
     // Root executable remains in macOS archives for old updaters. New ones
     // carry the entire signed bundle through installation instead.
     let bundled = scratch.join("Herdr2.app/Contents/MacOS/herdr2");

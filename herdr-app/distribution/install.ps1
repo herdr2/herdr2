@@ -53,6 +53,7 @@ try {
     $menu = Join-Path ([Environment]::GetFolderPath("Programs")) "Herdr2.lnk"
     $link = (New-Object -ComObject WScript.Shell).CreateShortcut($menu)
     $link.TargetPath = $exe
+    $link.IconLocation = "$exe,0"
     $link.WorkingDirectory = $env:USERPROFILE
     $link.Description = "Terminals and coding agents that keep running"
     $link.Save()

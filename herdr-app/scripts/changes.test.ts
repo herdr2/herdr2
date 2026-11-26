@@ -20,6 +20,7 @@ import {
   resolvePathAgainstRoot,
   resolvePathAgainstProject,
   parseToolPatchLines,
+  resolveChangesLocation,
 } from "../defaults/mods/changes/review_model.js";
 import {
   parseGitStatusV2,
@@ -398,4 +399,78 @@ test("parseToolPatchLines normalizes hunkless ACP proto.rs diffs, unified diffs,
   expect(source).toContain('shared("changes.open_request")');
   expect(source).toContain('id("changes-external-section")');
   expect(source).toContain('id("chg-ext-banner")');
+});
+
+test("resolveChangesLocation never pairs a local Windows cwd with a remote Linux agent's machine", () => {
+  // Exact regression: local Windows ACP/shell pane focused while an unrelated remote Linux CLI agent
+  // is reported in `focused().agent` (from `shown_agent()`).
+  const localWinLoc = resolveChangesLocation({
+    space: { id: "sp1", folder: "D:\\Users\\zhihao.zou", machine: null, active: true },
+    focused: {
+      space: "sp1",
+      tab: "tb1",
+      pane: "p1",
+      terminal: "a1",
+      shown: null,
+      agent: "linux/t2",
+      cwd: "D:\\Users\\zhihao.zou",
+    },
+    panes: [{ pane: "p1", terminal: "a1", cwd: "D:\\Users\\zhihao.zou" }],
+    terminals: [
+      { address: "a1", cwd: "D:\\Users\\zhihao.zou" },
+      { address: "linux/t2", cwd: "/home/zzh0838/proj" },
+    ],
+  });
+  expect(localWinLoc).toEqual({ cwd: "D:\\Users\\zhihao.zou", on: null });
+
+  // Floating peek/agent block on remote Linux machine must not fall back to local Windows space.folder.
+  const peekRemote = resolveChangesLocation({
+    space: { id: "sp1", folder: "D:\\Users\\zhihao.zou", machine: null, active: true },
+    focused: {
+      space: "sp1",
+      tab: "tb1",
+      pane: null,
+      terminal: "linux/t2",
+      shown: null,
+      agent: "linux/t2",
+      cwd: null,
+    },
+    panes: [{ pane: "p1", terminal: "a1", cwd: "D:\\Users\\zhihao.zou" }],
+    terminals: [{ address: "linux/t2", cwd: "/home/zzh0838/proj" }],
+  });
+  expect(peekRemote).toEqual({ cwd: "/home/zzh0838/proj", on: "linux" });
+
+  // Swapped-in remote terminal inside a local pane uses the swapped terminal's machine and cwd.
+  const swappedRemote = resolveChangesLocation({
+    space: { id: "sp1", folder: "D:\\Users\\zhihao.zou", machine: null, active: true },
+    focused: {
+      space: "sp1",
+      tab: "tb1",
+      pane: "p1",
+      terminal: "t1",
+      shown: "linux/t2",
+      agent: "linux/t2",
+      cwd: "D:\\Users\\zhihao.zou",
+    },
+    panes: [{ pane: "p1", terminal: "t1", cwd: "D:\\Users\\zhihao.zou" }],
+    terminals: [{ address: "linux/t2", cwd: "/home/zzh0838/proj" }],
+  });
+  expect(swappedRemote).toEqual({ cwd: "/home/zzh0838/proj", on: "linux" });
+
+  // Remote space preserves space.machine even when pane terminal id has no slash prefix.
+  const remoteSpace = resolveChangesLocation({
+    space: { id: "sp2", folder: "/remote/project", machine: "remote", active: true },
+    focused: {
+      space: "sp2",
+      tab: "tb2",
+      pane: "p2",
+      terminal: "t2",
+      shown: null,
+      agent: "t2",
+      cwd: "/remote/project",
+    },
+    panes: [{ pane: "p2", terminal: "t2", cwd: "/remote/project" }],
+    terminals: [],
+  });
+  expect(remoteSpace).toEqual({ cwd: "/remote/project", on: "remote" });
 });

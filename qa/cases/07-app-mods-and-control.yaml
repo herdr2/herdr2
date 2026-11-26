@@ -200,7 +200,7 @@ cases:
     covers:
       rpc: [drove.settings.set]
       cli: ["herdr2 do", "herdr2 shot"]
-      app_commands: [app.theme, app.language, app.zoom_in, app.zoom_out, app.zoom_reset]
+      app_commands: [app.theme, app.language, app.shell, app.zoom_in, app.zoom_out, app.zoom_reset]
       mods: []
       frames: [settings]
     preconditions:

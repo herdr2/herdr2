@@ -565,7 +565,7 @@ fn install_payload(bin: &Path, scratch: &Path) -> Result<(Vec<u8>, bool), RpcErr
     let path = if bundled {
         let root = bin.parent().unwrap().parent().unwrap().parent().unwrap();
         let archive = scratch.join("core-bundle.tar");
-        let status = std::process::Command::new("tar")
+        let status = crate::platform::bg_command("tar")
             .arg("-cf")
             .arg(&archive)
             .arg("-C")
@@ -605,7 +605,7 @@ fn install_windows(paths: &crate::paths::Paths, target: &str, session: Option<&s
     std::fs::write(&script, include_str!("../../../distribution/install.ps1"))
         .map_err(|e| RpcError::internal(e.to_string()))?;
     std::fs::copy(&zip, scratch.0.join("h2-install.zip")).map_err(|e| RpcError::internal(e.to_string()))?;
-    let mut scp = std::process::Command::new("scp");
+    let mut scp = crate::platform::bg_command("scp");
     scp.arg("-q");
     #[cfg(unix)]
     scp.arg("-o")
@@ -696,7 +696,7 @@ mod tests {
         assert_eq!(
             line,
             format!(
-                "sh -c 'p=$(command -v herdr2) || p=$(command -v h2) || p=$HOME/.local/bin/herdr2-core || p=$HOME/.local/bin/herdr2; [ -x \"$p\" ] || {{ echo \"{NOT_HERE}\" >&2; exit 127; }}; H2_SESSION=dev exec \"$p\" connect'"
+                "sh -c 'p=$(command -v herdr2) || p=$(command -v h2) || {{ [ -x \"$HOME/.local/bin/herdr2-core\" ] && p=$HOME/.local/bin/herdr2-core; }} || p=$HOME/.local/bin/herdr2; [ -x \"$p\" ] || {{ echo \"{NOT_HERE}\" >&2; exit 127; }}; H2_SESSION=dev exec \"$p\" connect'"
             )
         );
     }

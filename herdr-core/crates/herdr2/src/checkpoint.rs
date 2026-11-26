@@ -225,7 +225,7 @@ fn run_git_bytes(
     env: &[(&str, &str)],
     stdin_bytes: Option<&[u8]>,
 ) -> Result<Vec<u8>, String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::platform::bg_command("git");
     apply_safe_git_flags(&mut cmd);
     cmd.args(args).current_dir(cwd).stdout(Stdio::piped()).stderr(Stdio::piped());
     if stdin_bytes.is_some() {
@@ -271,7 +271,7 @@ pub fn probe_repo(cwd: &Path) -> Option<RepoInfo> {
     if !cwd.exists() {
         return None;
     }
-    let out = Command::new("git")
+    let out = crate::platform::bg_command("git")
         .args([
             "-C",
             &cwd.to_string_lossy(),

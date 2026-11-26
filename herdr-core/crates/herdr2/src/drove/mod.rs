@@ -594,6 +594,7 @@ impl DroveRuntime {
             key_file_path: st.key_file_path,
             key_masked: st.key_masked,
             base_url: st.base_url,
+            protocol: st.protocol,
             model: st.model,
             effort: st.effort,
             context_window: st.context_window,
@@ -995,22 +996,11 @@ fn percent_encode_param(s: &str) -> String {
 }
 
 pub(crate) fn bg_std_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
-    #[allow(unused_mut)]
-    let mut cmd = std::process::Command::new(program);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    }
-    cmd
+    crate::platform::bg_command(program)
 }
 
 pub(crate) fn bg_tokio_command(program: impl AsRef<std::ffi::OsStr>) -> tokio::process::Command {
-    #[allow(unused_mut)]
-    let mut cmd = tokio::process::Command::new(program);
-    #[cfg(windows)]
-    cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
-    cmd
+    crate::platform::bg_tokio_command(program)
 }
 
 fn launch_browser(url: &str) -> io::Result<()> {
@@ -1019,7 +1009,7 @@ fn launch_browser(url: &str) -> io::Result<()> {
     }
     #[cfg(target_os = "macos")]
     let mut cmd = {
-        let mut c = std::process::Command::new("open");
+        let mut c = bg_std_command("open");
         c.arg(url);
         c
     };
@@ -1031,7 +1021,7 @@ fn launch_browser(url: &str) -> io::Result<()> {
     };
     #[cfg(all(unix, not(target_os = "macos")))]
     let mut cmd = {
-        let mut c = std::process::Command::new("xdg-open");
+        let mut c = bg_std_command("xdg-open");
         c.arg(url);
         c
     };

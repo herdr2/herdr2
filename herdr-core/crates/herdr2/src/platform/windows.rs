@@ -625,7 +625,10 @@ pub fn spawn_detached(cmd: Command, log: File) -> io::Result<()> {
         si.StartupInfo.hStdOutput = handles[0];
         si.StartupInfo.hStdError = handles[1];
         let mut pi: PROCESS_INFORMATION = zeroed();
-        let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | DETACHED_PROCESS;
+        // Use CREATE_NO_WINDOW (not DETACHED_PROCESS): still detached from the caller's
+        // console and invisible (GetConsoleWindow() == 0), while giving any descendant
+        // console tool a hidden console to inherit instead of flashing a visible window.
+        let flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
         let mut start = |flags| {
             CreateProcessW(
                 null(),
@@ -759,7 +762,7 @@ unsafe extern "system" fn shutdown_wndproc(hwnd: HWND, msg: u32, wparam: WPARAM,
 }
 
 /// Registers both a console control handler (for console-attached runs) and a hidden
-/// top-level message window (required for `DETACHED_PROCESS` daemons to receive
+/// top-level message window (ensuring headless background daemons receive
 /// `WM_QUERYENDSESSION` / `WM_ENDSESSION` on Windows shutdown and logoff).
 pub fn monitor_shutdown() {
     let _ = SHUTDOWN_NOTIFY.get_or_init(tokio::sync::Notify::new);
@@ -960,8 +963,8 @@ pub(crate) fn command_line(argv: &[String], env: &BTreeMap<String, String>) -> i
     if ext == "cmd" || ext == "bat" {
         return batch_line(&found, &argv[1..]).map(|l| wide(l.as_ref()));
     }
-    if super::is_shell_line(argv) {
-        return Ok(wide(format!("{} /d /s /c \"{}\"", quote(&found.display().to_string()), argv[4]).as_ref()));
+    if let Some(tail) = super::cmd_raw_tail(argv) {
+        return Ok(wide(format!("{} {tail}", quote(&found.display().to_string())).as_ref()));
     }
     let line: Vec<String> =
         std::iter::once(found.display().to_string()).chain(argv[1..].iter().cloned()).map(|a| quote(&a)).collect();

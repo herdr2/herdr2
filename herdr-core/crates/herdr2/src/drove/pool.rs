@@ -1553,7 +1553,7 @@ async fn build_attempt_handover(
         (!pkg.markdown.trim().is_empty()).then_some(pkg.markdown)
     });
 
-    let git_status = tokio::process::Command::new("git")
+    let git_status = super::bg_tokio_command("git")
         .args(["-C", effective_cwd, "status", "--short", "--untracked-files=normal"])
         .output()
         .await

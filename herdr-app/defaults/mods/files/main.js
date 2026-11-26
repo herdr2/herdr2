@@ -44,10 +44,29 @@ const tr = (en, zh) => (isZh() ? zh : en);
 const stopMouse = (e, cx) => { e?.stopPropagation?.(); cx?.stop_propagation?.(); };
 
 function location() {
-  const space = spaces().find(s => s.active), f = focused();
+  const space = spaces().find(s => s.active) ?? null, f = focused();
   const pane = f?.pane ? panes().find(p => p.pane === f.pane) : null;
-  const on = f?.pane === null ? (f.terminal?.includes("/") ? f.terminal.split("/")[0] : null) : space?.machine ?? null;
-  return { cwd: pane?.cwd || f?.cwd || space?.folder, on, space: space?.id };
+  const spaceMachine = space?.machine || null;
+  const machineOf = (addr) => {
+    const s = String(addr ?? "");
+    const i = s.indexOf("/");
+    return i > 0 ? s.slice(0, i) : null;
+  };
+  if (f && f.pane === null) {
+    const addr = f.terminal || f.agent || null;
+    const on = addr ? machineOf(addr) : spaceMachine;
+    const rec = addr ? terminals().find(t => t.address === addr) : null;
+    const fallbackFolder = space && spaceMachine === on ? space.folder : null;
+    return { cwd: f.cwd || rec?.cwd || fallbackFolder || null, on, space: space?.id };
+  }
+  const swapped = Boolean(f?.shown && f.shown !== pane?.terminal);
+  const addr = (swapped ? f.shown : null) || f?.terminal || pane?.terminal || null;
+  const on = swapped ? machineOf(f.shown) : ((addr && machineOf(addr)) || spaceMachine);
+  const rec = addr ? terminals().find(t => t.address === addr) : null;
+  const paneMachine = pane?.terminal ? (machineOf(pane.terminal) || spaceMachine) : spaceMachine;
+  const paneCwd = !swapped && paneMachine === on ? pane?.cwd : null;
+  const fallbackFolder = space && spaceMachine === on ? space.folder : null;
+  return { cwd: paneCwd || rec?.cwd || (!swapped ? f?.cwd : null) || fallbackFolder || null, on, space: space?.id };
 }
 const key = () => JSON.stringify(location());
 const PER_FOLDER = 500, TOTAL = 5000, MAX_PREVIEW_CHARS = 400000, PREVIEW_MAX_BYTES = 450000;

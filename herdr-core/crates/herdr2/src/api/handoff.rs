@@ -692,12 +692,18 @@ async fn handoff_to_new_pty(
     distilled: bool,
 ) -> Result<HandoffResult, RpcError> {
     let preset = p.preset.clone().or_else(|| src.provider.clone()).unwrap_or_else(|| "claude".into());
-    let base_argv = if !p.argv.is_empty() {
+    let preferred_shell = p.shell.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let raw_base_argv = if !p.argv.is_empty() {
         p.argv.clone()
     } else if !src.is_agent && p.preset.is_none() && !src.argv.is_empty() {
         src.argv.clone()
     } else {
         default_pty_argv(&preset)
+    };
+    let base_argv = if preferred_shell.is_some() {
+        crate::pty_adapters::unwrap_shell_cli_argv(&raw_base_argv)
+    } else {
+        raw_base_argv
     };
 
     let target_cli_kind = PtyCliKind::from_str_name(&preset.to_ascii_lowercase());
@@ -778,6 +784,11 @@ async fn handoff_to_new_pty(
             }
             _ => {}
         }
+    }
+
+    if let Some(sh) = preferred_shell {
+        let inner = crate::pty_adapters::unwrap_shell_cli_argv(&spawn_argv);
+        spawn_argv = crate::pty_adapters::wrap_cli_in_shell(sh, inner);
     }
 
     let inherited_display = p.display.clone().or_else(|| {

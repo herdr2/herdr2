@@ -83,7 +83,7 @@ Usage: h2 ai [OPTIONS] <COMMAND>
 Commands:
   status             Show shared Core AI assistant status, configuration, and KV-cache metrics
   settings-set       Update shared Core AI assistant settings from a JSON file
-  models             Fetch available models from an OpenAI-compatible AI endpoint (/models)
+  models             Fetch available models from an AI endpoint (/models, OpenAI or Claude protocol)
   test               Test the shared Core AI assistant URL and API key
   probe-prompt-mode  Clear prior prompt-cache detection records, set prompt mode to auto, and re-detect shared-prefix vs compact mode
   handoff-recommend  Recommend a complementary target provider, handoff mode, and note for an upstream session
@@ -150,7 +150,7 @@ Options:
 ## h2 ai models
 
 ```text
-Fetch available models from an OpenAI-compatible AI endpoint (/models)
+Fetch available models from an AI endpoint (/models, OpenAI or Claude protocol)
 
 Usage: h2 ai models [OPTIONS]
 

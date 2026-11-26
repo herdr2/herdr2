@@ -1045,11 +1045,13 @@ export default class Welcome extends View {
     const aiVerified = this.aiTestResult?.ok === true && Boolean(ai?.configured);
     const aiOn = Boolean(ai?.configured);
     const latency = this.aiTestResult?.latencyMs ?? this.aiTestResult?.latency_ms ?? null;
+    const rawProto = String(this.aiTestResult?.protocol ?? ai?.protocol ?? "").trim().toLowerCase();
+    const protoLabel = rawProto === "anthropic" || rawProto === "claude" ? "Claude" : rawProto === "openai" ? "OpenAI" : "";
     const verifiedModel = ai?.model || this.aiSelectedModel || "";
     const aiBadge = aiVerified
       ? this.tr(
-          `Verified${verifiedModel ? ` · ${verifiedModel}` : ""}${latency ? ` (${latency}ms)` : ""}`,
-          `已验证连通${verifiedModel ? ` · ${verifiedModel}` : ""}${latency ? ` (${latency}ms)` : ""}`,
+          `Verified${protoLabel ? ` · ${protoLabel}` : ""}${verifiedModel ? ` · ${verifiedModel}` : ""}${latency ? ` (${latency}ms)` : ""}`,
+          `已验证连通${protoLabel ? ` · ${protoLabel}` : ""}${verifiedModel ? ` · ${verifiedModel}` : ""}${latency ? ` (${latency}ms)` : ""}`,
         )
       : aiOn
         ? this.tr("Saved · click Test to verify", "已保存 · 点击测试验证连通")
@@ -1086,8 +1088,8 @@ export default class Welcome extends View {
           t,
           this.tr("Core AI & other machines", "核心 AI 助手与远程主机"),
           this.tr(
-            "Configure Core AI for smart status detection, Prompt Polish, and Context Handoff (DeepSeek Official or any OpenAI-compatible gateway such as local Magpie).",
-            "配置核心 AI 以启用智能状态识别、提示词润色与上下文接力（支持 DeepSeek 官方或自定义 OpenAI 格式中转，如本机 Magpie）。",
+            "Configure Core AI for smart status detection, Prompt Polish, and Context Handoff (DeepSeek Official or any OpenAI / Claude endpoint — protocol auto-detected).",
+            "配置核心 AI 以启用智能状态识别、提示词润色与上下文接力（支持 DeepSeek 官方或自定义 OpenAI / Claude 协议，自动识别无需手动选择）。",
           ),
         ),
       )

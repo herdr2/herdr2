@@ -303,7 +303,22 @@ fn extract_wrapper_shell(argv: &[String]) -> Option<String> {
     is_shell_stem(&exe_stem(sh)).then(|| sh.clone())
 }
 
-fn wrap_cli_in_shell(shell: &str, cli_argv: Vec<String>) -> Vec<String> {
+pub(crate) fn unwrap_shell_cli_argv(argv: &[String]) -> Vec<String> {
+    if let Some((_, ps_cli)) = extract_powershell_cli_argv(argv) {
+        return ps_cli;
+    }
+    if let Some((_, cmd_cli)) = extract_cmd_cli_argv(argv) {
+        return cmd_cli;
+    }
+    if let Some(cmd_idx) = pty_command_offset(argv)
+        && cmd_idx > 0
+    {
+        return argv[cmd_idx..].to_vec();
+    }
+    argv.to_vec()
+}
+
+pub(crate) fn wrap_cli_in_shell(shell: &str, cli_argv: Vec<String>) -> Vec<String> {
     let stem = exe_stem(shell);
     if stem == "fish" {
         let mut out =

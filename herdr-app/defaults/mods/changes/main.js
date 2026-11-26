@@ -22,6 +22,7 @@ import {
   resolvePathAgainstRoot,
   resolvePathAgainstProject,
   parseToolPatchLines,
+  resolveChangesLocation,
 } from "./review_model.js";
 import {
   parseGitStatusV2,
@@ -34,15 +35,13 @@ const isZh = () => typeof settings === "function" && String(settings()?.language
 const tr = (en, zh) => (isZh() ? zh : en);
 
 function location() {
-  const space = spaces().find((s) => s.active), f = focused();
-  const pane = f?.pane ? panes().find((p) => p.pane === f.pane) : null;
-  if (f?.agent) {
-    const agentRec = terminals().find((t) => t.address === f.agent) ?? null;
-    const on = f.agent.includes("/") ? f.agent.split("/")[0] : null;
-    return { cwd: f.cwd || agentRec?.cwd || pane?.cwd || space?.folder, on };
-  }
-  const on = f?.pane === null ? (f.terminal?.includes("/") ? f.terminal.split("/")[0] : null) : (space?.machine || null);
-  return { cwd: pane?.cwd || f?.cwd || space?.folder, on };
+  const space = spaces().find((s) => s.active) ?? null;
+  return resolveChangesLocation({
+    space,
+    focused: focused(),
+    panes: panes(),
+    terminals: terminals(),
+  });
 }
 const key = () => JSON.stringify(location());
 // Reads write nothing under .git (no index refresh or lock, no fsmonitor cookie):

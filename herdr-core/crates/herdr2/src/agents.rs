@@ -66,6 +66,9 @@ pub struct Agent {
     /// Live session configuration options (model, reasoning effort, fast mode, session mode) advertised by the ACP agent.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub config_options: Vec<crate::acp::proto::AcpConfigOption>,
+    /// Live slash commands / skills advertised by the ACP agent via `available_commands_update`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_commands: Vec<crate::acp::proto::AcpAvailableCommand>,
     /// User-applied session configuration overrides preserved across `--keep` reloads.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub config_overrides: BTreeMap<String, serde_json::Value>,
@@ -342,6 +345,7 @@ impl Registry {
                 model: new.model,
                 mode: new.mode,
                 config_options: Vec::new(),
+                available_commands: Vec::new(),
                 config_overrides: BTreeMap::new(),
                 context_usage: None,
                 inject_mcp: new.inject_mcp,

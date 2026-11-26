@@ -49,8 +49,23 @@ fn root() -> Option<PathBuf> {
     ROOT.get_or_init(find_root).clone()
 }
 
+/// Strips Win32 verbatim prefixes (`\\?\` and `\\?\UNC\`) returned by `Path::canonicalize()`
+/// on Windows. Windows Shell APIs (Taskbar, `Start-Process`, `SHChangeNotify`, shortcut
+/// matching) do not normalize `\\?\` paths and fall back to blank/generic icons when given one.
+fn strip_windows_verbatim_prefix(path: &Path) -> PathBuf {
+    let raw = path.to_string_lossy();
+    if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        PathBuf::from(format!(r"\\{unc}"))
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        PathBuf::from(rest)
+    } else {
+        path.to_path_buf()
+    }
+}
+
 fn find_root() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?.canonicalize().ok()?;
+    let exe = if cfg!(windows) { strip_windows_verbatim_prefix(&exe) } else { exe };
     let dir = exe.parent()?;
     if cfg!(target_os = "macos") {
         // Herdr2.app/Contents/MacOS/Herdr2
@@ -115,9 +130,48 @@ struct AppAvailable {
 static READY: Mutex<Option<String>> = Mutex::new(None);
 static APP_AVAILABLE: Mutex<Option<AppAvailable>> = Mutex::new(None);
 static APP_UPDATING: AtomicBool = AtomicBool::new(false);
+static ELEVATED_APPLIED: AtomicBool = AtomicBool::new(false);
 static APP_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static CHECK_SEQ: AtomicU64 = AtomicU64::new(0);
 static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+fn dir_writable(dir: &Path) -> bool {
+    let probe = dir.join(format!(
+        ".herdr2-write-probe-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    match std::fs::OpenOptions::new().write(true).create_new(true).open(&probe) {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// True on Linux when the install folder or its parent isn't writable by the current
+/// user (for example a `.deb` package installed into root-owned `/opt/herdr2`).
+fn needs_elevation_for(root: &Path) -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    let parent_writable = root.parent().is_some_and(dir_writable);
+    let root_writable = dir_writable(root);
+    !(parent_writable && root_writable)
+}
+
+fn needs_elevation() -> bool {
+    static NEEDS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *NEEDS.get_or_init(|| root().is_some_and(|r| needs_elevation_for(&r)))
+}
+
+fn has_bundled_core(root: &Path) -> bool {
+    root.join("herdr2-core").is_file()
+}
 
 pub fn ready() -> Option<String> {
     READY
@@ -215,7 +269,9 @@ fn checks_ui() -> bool {
 
 /// For the settings screen / mods: reports current versions, available updates, and progress.
 pub fn status() -> serde_json::Value {
-    let app_checks = checks_app().is_some();
+    let install_root = checks_app();
+    let app_checks = install_root.is_some();
+    let app_needs_elevation = app_checks && needs_elevation();
     let any_checks = app_checks || checks_core() || checks_ui();
     let app_staged = READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
     let app_avail = APP_AVAILABLE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
@@ -226,6 +282,9 @@ pub fn status() -> serde_json::Value {
     let ui = crate::ui_update::info();
     let core_info = core();
     let updating = app_updating || ui.applying || core_info.updating;
+    let core_updates_with_app = app_ready.is_some()
+        && install_root.as_deref().is_some_and(has_bundled_core)
+        && matches!(core_info.managed.as_deref(), None | Some("system package manager"));
 
     let mut items: Vec<serde_json::Value> = Vec::new();
     if let Some(ver) = &app_ready {
@@ -244,7 +303,7 @@ pub fn status() -> serde_json::Value {
             "notes": ui.ready_notes,
         }));
     }
-    if core_info.managed.is_none() && let Some(ver) = &core_info.ready {
+    if (core_info.managed.is_none() || core_updates_with_app) && let Some(ver) = &core_info.ready {
         items.push(serde_json::json!({
             "kind": "core",
             "current": core_info.version,
@@ -258,6 +317,7 @@ pub fn status() -> serde_json::Value {
             "version": ver,
             "notes": app_notes,
             "restart": true,
+            "needs_elevation": app_needs_elevation,
             "items": items,
         }))
     } else if let Some(ver) = &ui.ready {
@@ -289,6 +349,7 @@ pub fn status() -> serde_json::Value {
             "updating": app_updating,
             "error": app_error,
             "updates": app_checks,
+            "needs_elevation": app_needs_elevation,
         },
         "ui": ui,
         "core": core_info,
@@ -488,6 +549,8 @@ struct CoreRelease {
     generation: Option<u64>,
     #[serde(default)]
     notes: Option<String>,
+    #[serde(default)]
+    targets: serde_json::Value,
 }
 
 fn latest_core_from(base_url: &str) -> Result<CoreRelease, String> {
@@ -588,17 +651,44 @@ pub fn start_update() {
             *APP_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
             crate::mods::request(crate::mods::Request::Refresh);
             let _ = std::thread::Builder::new().name("herdr2-app-update".into()).spawn(move || {
-                let stage_res = if let Some(ver) = already_staged {
+                let elevated = needs_elevation_for(&install_root);
+                let stage_res: Result<(String, bool, Option<String>), String> = if elevated {
+                    match avail {
+                        Some(a) => download_and_apply_elevated_linux(&install_root, &a)
+                            .map(|core_ver| (a.version, true, core_ver)),
+                        None => Err("no app update available".into()),
+                    }
+                } else if let Some(ver) = already_staged {
                     *READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ver.clone());
-                    Ok(ver)
+                    Ok((ver, false, None))
                 } else if let Some(a) = avail {
-                    download_and_stage_app(&install_root, &a)
+                    download_and_stage_app(&install_root, &a).map(|v| (v, false, None))
                 } else {
                     Err("no app update available".into())
                 };
                 match stage_res {
-                    Ok(_) => {
-                        // Also update h2 core in lockstep if a non-managed core update is waiting.
+                    Ok((_, already_swapped, bundled_core_ver)) => {
+                        if let Some(new_core_ver) = bundled_core_ver {
+                            let active_in_root = crate::core_bin::path()
+                                .canonicalize()
+                                .ok()
+                                .is_some_and(|p| p.starts_with(&install_root));
+                            if active_in_root {
+                                match crate::core_bin::restart() {
+                                    Ok(()) => {
+                                        let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                                        c.version = Some(new_core_ver);
+                                        c.ready = None;
+                                        c.notes = None;
+                                        c.error = None;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!("update: core restart after elevated swap failed: {e}");
+                                    }
+                                }
+                            }
+                        }
+                        // Also update external h2 core in lockstep if a non-managed core update is waiting.
                         let should_update_core = {
                             let c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             c.managed.is_none() && c.ready.is_some() && !c.updating
@@ -611,6 +701,9 @@ pub fn start_update() {
                                 c.notes = None;
                                 c.error = None;
                             }
+                        }
+                        if already_swapped {
+                            ELEVATED_APPLIED.store(true, Ordering::SeqCst);
                         }
                         crate::mods::request(crate::mods::Request::ApplyAppUpdate);
                     }
@@ -675,6 +768,279 @@ fn check_app_manifest_from(root: &Path, releases: &str) -> Result<Option<AppAvai
     }))
 }
 
+fn copy_executable(src: &Path, dst: &Path) -> Result<(), String> {
+    std::fs::copy(src, dst).map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dst, std::fs::Permissions::from_mode(0o755));
+    }
+    Ok(())
+}
+
+/// Downloads and verifies the latest same-generation `h2` core binary into `work/core-dl`
+/// when it is newer than `current_ver`. Returns `Ok(None)` if already current or absent.
+fn download_verified_core(
+    releases_base: &str,
+    work: &Path,
+    current_ver: Option<&str>,
+) -> Result<Option<(PathBuf, String)>, String> {
+    let latest = latest_core_from(releases_base)?;
+    if latest.generation != Some(crate::hc::GENERATION) {
+        return Ok(None);
+    }
+    if let Some(have) = current_ver
+        && !newer(&latest.version, have)
+    {
+        return Ok(None);
+    }
+    let entry = &latest.targets[target()];
+    let (Some(dl_url), Some(sha)) = (entry["url"].as_str(), entry["sha256"].as_str()) else {
+        return Ok(None);
+    };
+    let core_work = work.join("core-dl");
+    let _ = std::fs::remove_dir_all(&core_work);
+    std::fs::create_dir_all(&core_work).map_err(|e| format!("{}: {e}", core_work.display()))?;
+    let ext = if dl_url.ends_with(".zip") { "zip" } else { "tar.gz" };
+    let archive = core_work.join(format!("core.{ext}"));
+    download_file(dl_url, &archive)?;
+    let bytes = std::fs::read(&archive).map_err(|e| e.to_string())?;
+    if sha256(&bytes) != sha.to_ascii_lowercase() {
+        return Err("core download checksum mismatch".into());
+    }
+    let unpacked = core_work.join("unpacked");
+    std::fs::create_dir_all(&unpacked).map_err(|e| e.to_string())?;
+    unpack_archive(&archive, &unpacked)?;
+    let bin = unpacked.join(format!("herdr2{}", std::env::consts::EXE_SUFFIX));
+    if !bin.is_file() {
+        return Err("core download archive holds no herdr2 binary".into());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755));
+    }
+    let reported = crate::core_bin::version(&bin)
+        .ok_or_else(|| format!("downloaded core binary does not run as h2 {}", latest.version))?;
+    let reported_ver = strip_core_prefix(&reported).split_whitespace().next().unwrap_or("");
+    if reported_ver != latest.version {
+        return Err(format!("downloaded core reported {reported}, expected {}", latest.version));
+    }
+    Ok(Some((bin, latest.version)))
+}
+
+/// Preserves bundled files (`herdr2-core`, `h2`, extra PNG icons) when replacing an install folder
+/// (for example Debian/Ubuntu `.deb` installs in `/opt/herdr2` where `/usr/bin/h2` symlinks to
+/// `/opt/herdr2/herdr2-core`). If a newer same-generation core release is available from
+/// `releases_base`, upgrades the bundled core binary in lockstep; otherwise copies the existing one.
+fn preserve_or_update_bundled_core(
+    root: &Path,
+    unpacked: &Path,
+    work: &Path,
+    releases_base: Option<&str>,
+) -> Result<Option<String>, String> {
+    for asset in ["herdr2.png", "herdr2-512.png"] {
+        let src = root.join(asset);
+        let dst = unpacked.join(asset);
+        if src.is_file() && !dst.exists() {
+            let _ = std::fs::copy(&src, &dst);
+        }
+    }
+
+    let existing_core = root.join("herdr2-core");
+    let existing_h2 = root.join("h2");
+    let has_core = existing_core.is_file();
+    let has_h2 = existing_h2.is_file();
+    if !has_core && !has_h2 {
+        return Ok(None);
+    }
+
+    let current_ver = (if has_core {
+        crate::core_bin::version(&existing_core)
+    } else {
+        crate::core_bin::version(&existing_h2)
+    })
+    .map(|v| strip_core_prefix(&v).split_whitespace().next().unwrap_or("").to_owned())
+    .filter(|v| !v.is_empty())
+    .or_else(|| core().version);
+
+    if let Some(base) = releases_base {
+        match download_verified_core(base, work, current_ver.as_deref()) {
+            Ok(Some((new_bin, new_ver))) => {
+                if has_core {
+                    copy_executable(&new_bin, &unpacked.join("herdr2-core"))?;
+                }
+                if has_h2 && !unpacked.join("h2").exists() {
+                    copy_executable(&new_bin, &unpacked.join("h2"))?;
+                }
+                return Ok(Some(new_ver));
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!("update: could not download bundled core update ({e}); preserving existing core");
+            }
+        }
+    }
+
+    if has_core && !unpacked.join("herdr2-core").exists() {
+        copy_executable(&existing_core, &unpacked.join("herdr2-core"))?;
+    }
+    if has_h2 && !unpacked.join("h2").exists() {
+        copy_executable(&existing_h2, &unpacked.join("h2"))?;
+    }
+    Ok(None)
+}
+
+#[cfg(unix)]
+struct TempWorkDir(PathBuf);
+
+#[cfg(unix)]
+impl TempWorkDir {
+    fn new(prefix: &str) -> Result<Self, String> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("{}: {e}", dir.display()))?;
+        Ok(Self(dir))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(unix)]
+impl Drop for TempWorkDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(unix)]
+const ELEVATED_SWAP_SCRIPT: &str = r#"#!/bin/sh
+set -eu
+src="$1"
+dst="$2"
+if [ -z "$dst" ] || [ "$dst" = "/" ]; then
+  echo "refusing unsafe install path: $dst" >&2
+  exit 1
+fi
+new="${dst}.new"
+old="${dst}.old"
+rm -rf "$new" "$old"
+mkdir -p "$new"
+cp -a "$src/." "$new/"
+chown -R --reference="$dst" "$new" 2>/dev/null || chown -R 0:0 "$new"
+chmod 755 "$new"
+if [ -f "$new/herdr2" ]; then chmod 755 "$new/herdr2"; fi
+if [ -f "$new/herdr2-core" ]; then chmod 755 "$new/herdr2-core"; fi
+if [ -f "$new/h2" ]; then chmod 755 "$new/h2"; fi
+mv "$dst" "$old"
+if ! mv "$new" "$dst"; then
+  mv "$old" "$dst" || true
+  rm -rf "$new"
+  exit 1
+fi
+rm -rf "$old"
+"#;
+
+#[cfg(unix)]
+fn run_elevated_swap_with(
+    elevator: &Path,
+    extra_args: &[&str],
+    work: &Path,
+    unpacked: &Path,
+    install_root: &Path,
+    version: &str,
+) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    let script_path = work.join("apply-update.sh");
+    std::fs::write(&script_path, ELEVATED_SWAP_SCRIPT)
+        .map_err(|e| format!("{}: {e}", script_path.display()))?;
+    std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("{}: {e}", script_path.display()))?;
+
+    let out = Command::new(elevator)
+        .args(extra_args)
+        .arg("/bin/sh")
+        .arg(&script_path)
+        .arg(unpacked)
+        .arg(install_root)
+        .stdin(Stdio::null())
+        .output();
+
+    match out {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let code = output.status.code();
+            let stderr = decode_process_output(&output.stderr).trim().to_owned();
+            let detail = if stderr.is_empty() {
+                decode_process_output(&output.stdout).trim().to_owned()
+            } else {
+                stderr
+            };
+            match code {
+                Some(126) => Err("Administrator authentication was cancelled; update aborted.".into()),
+                Some(127) => {
+                    let suffix = if detail.is_empty() { String::new() } else { format!(" ({detail})") };
+                    Err(format!(
+                        "Administrator privileges are required to update {}{suffix}. Install the new .deb with `sudo apt install ./herdr2_{version}_amd64.deb` or switch to ~/.local via app-install.sh.",
+                        install_root.display()
+                    ))
+                }
+                _ => Err(if detail.is_empty() {
+                    format!("Elevated update failed for {} (exit code {:?})", install_root.display(), code)
+                } else {
+                    format!("Elevated update failed for {}: {detail}", install_root.display())
+                }),
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
+            "Administrator privileges are required to update {}, but pkexec is not installed. Install the new .deb with `sudo apt install ./herdr2_{version}_amd64.deb` or switch to ~/.local via app-install.sh.",
+            install_root.display()
+        )),
+        Err(e) => Err(format!("Cannot launch {}: {e}", elevator.display())),
+    }
+}
+
+#[cfg(unix)]
+fn download_and_apply_elevated_linux(root: &Path, avail: &AppAvailable) -> Result<Option<String>, String> {
+    let version = avail.version.as_str();
+    tracing::info!("downloading Herdr {version} for elevated swap into {}", root.display());
+    let work = TempWorkDir::new("herdr2-app-update")?;
+    let unpacked = unpack(&avail.url, &avail.sha256, work.path())?;
+    if version_of(&unpacked).as_deref() != Some(version) {
+        return Err(format!("the download doesn't run as {version}"));
+    }
+    let releases_base = releases();
+    let updated_core_ver = preserve_or_update_bundled_core(root, &unpacked, work.path(), releases_base.as_deref())?;
+    run_elevated_swap_with(
+        Path::new("pkexec"),
+        &["--disable-internal-agent"],
+        work.path(),
+        &unpacked,
+        root,
+        version,
+    )?;
+    *READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    *APP_AVAILABLE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    let _ = std::fs::write(marker(), "");
+    Ok(updated_core_ver)
+}
+
+#[cfg(not(unix))]
+fn download_and_apply_elevated_linux(_root: &Path, _avail: &AppAvailable) -> Result<Option<String>, String> {
+    Err("elevated update is only supported on Linux".into())
+}
+
 fn download_and_stage_app(root: &Path, avail: &AppAvailable) -> Result<String, String> {
     let version = avail.version.as_str();
     let staged = beside(root, ".new");
@@ -686,10 +1052,12 @@ fn download_and_stage_app(root: &Path, avail: &AppAvailable) -> Result<String, S
     let work = beside(root, ".download");
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
+    let releases_base = releases();
     let result = unpack(&avail.url, &avail.sha256, &work).and_then(|unpacked| {
         if version_of(&unpacked).as_deref() != Some(version) {
             return Err(format!("the download doesn't run as {version}"));
         }
+        let _ = preserve_or_update_bundled_core(root, &unpacked, &work, releases_base.as_deref())?;
         let _ = std::fs::remove_file(beside(root, ".new.json"));
         let _ = std::fs::remove_dir_all(&staged);
         std::fs::rename(&unpacked, &staged).map_err(|e| format!("{}: {e}", staged.display()))?;
@@ -921,7 +1289,10 @@ pub fn leave_install_folder() {
         return;
     }
     let (Some(root), Ok(cwd)) = (root(), std::env::current_dir()) else { return };
-    if cwd.canonicalize().is_ok_and(|cwd| cwd.starts_with(&root))
+    if cwd
+        .canonicalize()
+        .map(|p| strip_windows_verbatim_prefix(&p))
+        .is_ok_and(|cwd| cwd.starts_with(&root))
         && let Some(home) = std::env::home_dir()
         && let Err(e) = std::env::set_current_dir(&home)
     {
@@ -933,18 +1304,22 @@ pub fn leave_install_folder() {
 /// from previous updates (Windows cannot delete the previous executable until it exits).
 pub fn cleanup_old() {
     let Some(root) = root() else { return };
+    let mut cleaned = false;
     let old = beside(&root, ".old");
-    if old.exists() {
-        let _ = std::fs::remove_dir_all(&old);
+    if old.exists() && std::fs::remove_dir_all(&old).is_ok() {
+        cleaned = true;
     }
     if let Ok(entries) = std::fs::read_dir(&root) {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if name.contains(".old-") && entry.file_type().is_ok_and(|ft| ft.is_file()) {
-                let _ = std::fs::remove_file(entry.path());
+            if name.contains(".old-") && entry.file_type().is_ok_and(|ft| ft.is_file()) && std::fs::remove_file(entry.path()).is_ok() {
+                cleaned = true;
             }
         }
+    }
+    if cleaned {
+        notify_shell_icon_refresh(&root);
     }
 }
 
@@ -966,6 +1341,9 @@ pub fn apply_on_startup() -> bool {
 
 /// Swaps a staged update into place; returns `Ok(true)` if swapped.
 pub fn apply() -> std::io::Result<bool> {
+    if ELEVATED_APPLIED.swap(false, Ordering::SeqCst) {
+        return Ok(true);
+    }
     let Some(root) = checks_app() else { return Ok(false) };
     let Some(version) = staged_version(&root) else { return Ok(false) };
     if !newer(&version, env!("CARGO_PKG_VERSION")) {
@@ -980,14 +1358,23 @@ pub fn apply() -> std::io::Result<bool> {
 /// Prefers the canonical install executable (`<root>/herdr2.exe`) when installed so an
 /// in-place rename swap (`herdr2.exe` -> `herdr2.exe.old-*`) always relaunches the new binary.
 #[cfg(windows)]
+fn windows_relaunch_script(pid: u32, exe: &Path) -> String {
+    let exe_str = strip_windows_verbatim_prefix(exe).to_string_lossy().replace('\'', "''");
+    let work_dir = std::env::home_dir()
+        .map(|h| strip_windows_verbatim_prefix(&h))
+        .map(|h| format!(" -WorkingDirectory '{}'", h.to_string_lossy().replace('\'', "''")))
+        .unwrap_or_default();
+    format!("Wait-Process -Id {pid} -ErrorAction SilentlyContinue; Start-Process -FilePath '{exe_str}'{work_dir}")
+}
+
+#[cfg(windows)]
 pub fn relaunch_current() -> bool {
     let exe = root()
         .map(|r| exe_in(&r))
         .filter(|p| p.is_file())
         .or_else(|| std::env::current_exe().ok());
     let Some(exe) = exe else { return false };
-    let exe = exe.to_string_lossy().replace('\'', "''");
-    let script = format!("Wait-Process -Id {} -ErrorAction SilentlyContinue; Start-Process '{exe}'", std::process::id());
+    let script = windows_relaunch_script(std::process::id(), &exe);
     crate::spawn::command("powershell")
         .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .stdin(Stdio::null())
@@ -1015,8 +1402,140 @@ pub fn relaunch_current() -> bool {
         .is_ok()
 }
 
+/// Replaces files inside `root` in-place from `staged`, renaming the active executable
+/// (`herdr2.exe` -> `herdr2.exe.old-<pid>-<ts>`) so the install directory itself stays intact.
+/// Preserves installer-owned files (such as Inno Setup's `unins000.exe`/`unins000.dat`) and
+/// avoids momentarily removing `%LOCALAPPDATA%\Programs\herdr2` while Windows Explorer resolves icons.
+fn swap_files_in_place(root: &Path, staged: &Path, exe_name: &str) -> std::io::Result<()> {
+    let staged_exe = staged.join(exe_name);
+    if !staged_exe.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("staged executable missing: {}", staged_exe.display()),
+        ));
+    }
+    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let suffix = format!(".old-{}-{stamp}", std::process::id());
+    let cur_exe = root.join(exe_name);
+    let backup_exe = root.join(format!("{exe_name}{suffix}"));
+
+    let moved_cur = if cur_exe.exists() {
+        std::fs::rename(&cur_exe, &backup_exe)?;
+        true
+    } else {
+        false
+    };
+    if let Err(e) = std::fs::rename(&staged_exe, &cur_exe) {
+        if moved_cur {
+            let _ = std::fs::rename(&backup_exe, &cur_exe);
+        }
+        return Err(e);
+    }
+
+    for entry in std::fs::read_dir(staged)? {
+        let entry = entry?;
+        let fname = entry.file_name();
+        if fname.to_string_lossy().eq_ignore_ascii_case(exe_name) {
+            continue;
+        }
+        let src = entry.path();
+        let dst = root.join(&fname);
+        if dst.exists() {
+            let removed = if dst.is_dir() {
+                std::fs::remove_dir_all(&dst).is_ok()
+            } else {
+                std::fs::remove_file(&dst).is_ok()
+            };
+            if !removed {
+                let fallback_old = root.join(format!("{}{suffix}", fname.to_string_lossy()));
+                let _ = std::fs::rename(&dst, &fallback_old);
+            }
+        }
+        if std::fs::rename(&src, &dst).is_err() && src.is_file() {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+
+    // Bump executable mtime so Explorer's icon cache does not reuse a stale entry for the path.
+    if let Ok(file) = std::fs::OpenOptions::new().write(true).open(&cur_exe) {
+        let _ = file.set_modified(SystemTime::now());
+    }
+    let _ = std::fs::remove_dir_all(staged);
+    Ok(())
+}
+
+#[cfg(windows)]
+fn notify_shell_icon_refresh(root: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::{
+        SHCNE_ASSOCCHANGED, SHCNE_UPDATEDIR, SHCNE_UPDATEITEM, SHCNF_FLUSHNOWAIT, SHCNF_IDLIST, SHCNF_PATHW,
+        SHChangeNotify,
+    };
+
+    let to_wide = |p: &Path| -> Vec<u16> {
+        strip_windows_verbatim_prefix(p).as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    };
+    let notify_item = |p: &Path| {
+        let w = to_wide(p);
+        unsafe {
+            SHChangeNotify(SHCNE_UPDATEITEM as i32, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, w.as_ptr().cast(), std::ptr::null());
+        }
+    };
+
+    notify_item(&exe_in(root));
+    let dir_w = to_wide(root);
+    unsafe {
+        SHChangeNotify(SHCNE_UPDATEDIR as i32, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, dir_w.as_ptr().cast(), std::ptr::null());
+    }
+
+    let mut shortcuts = Vec::new();
+    if let Some(appdata) = std::env::var_os("APPDATA").map(PathBuf::from) {
+        shortcuts.push(appdata.join(r"Microsoft\Windows\Start Menu\Programs\Herdr2.lnk"));
+        shortcuts.push(appdata.join(r"Microsoft\Internet Explorer\Quick Launch\User Pinned\TaskBar\Herdr2.lnk"));
+    }
+    if let Some(profile) = std::env::var_os("USERPROFILE").map(PathBuf::from) {
+        shortcuts.push(profile.join(r"Desktop\Herdr2.lnk"));
+    }
+    if let Some(public) = std::env::var_os("PUBLIC").map(PathBuf::from) {
+        shortcuts.push(public.join(r"Desktop\Herdr2.lnk"));
+    }
+    for lnk in shortcuts {
+        if lnk.is_file() {
+            notify_item(&lnk);
+        }
+    }
+
+    unsafe {
+        SHChangeNotify(SHCNE_ASSOCCHANGED as i32, SHCNF_IDLIST | SHCNF_FLUSHNOWAIT, std::ptr::null(), std::ptr::null());
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn notify_shell_icon_refresh(root: &Path) {
+    let _ = Command::new("/usr/bin/touch").arg(root).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    let _ = Command::new("/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister")
+        .args(["-f"])
+        .arg(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
+fn notify_shell_icon_refresh(_root: &Path) {}
+
 fn swap(root: &Path) -> std::io::Result<()> {
     let staged = beside(root, ".new");
+    if cfg!(windows) {
+        let exe_name = format!("herdr2{}", std::env::consts::EXE_SUFFIX);
+        swap_files_in_place(root, &staged, &exe_name)?;
+        let _ = std::fs::remove_file(beside(root, ".new.json"));
+        *READY.lock().unwrap() = None;
+        let _ = std::fs::write(marker(), "");
+        notify_shell_icon_refresh(root);
+        return Ok(());
+    }
     let old = beside(root, ".old");
     let _ = std::fs::remove_dir_all(&old);
     if let Err(e) = std::fs::rename(root, &old) {
@@ -1033,6 +1552,7 @@ fn swap(root: &Path) -> std::io::Result<()> {
     let _ = std::fs::remove_file(beside(root, ".new.json"));
     *READY.lock().unwrap() = None;
     let _ = std::fs::write(marker(), "");
+    notify_shell_icon_refresh(root);
     Ok(())
 }
 
@@ -1044,8 +1564,7 @@ pub fn relaunch() {
 #[cfg(windows)]
 fn relaunch_expected(expected: Option<&str>) -> bool {
     let Some(root) = root() else { return false };
-    let exe = exe_in(&root).to_string_lossy().replace('\'', "''");
-    let script = format!("Wait-Process -Id {} -ErrorAction SilentlyContinue; Start-Process '{exe}'", std::process::id());
+    let script = windows_relaunch_script(std::process::id(), &exe_in(&root));
     let mut command = crate::spawn::command("powershell");
     if let Some(expected) = expected {
         command.env("HERDR2_APP_UPDATE_EXPECTED", expected);
@@ -1411,7 +1930,12 @@ mod tests {
 
     #[test]
     fn after_app_update_targets_latest_only_in_our_generation() {
-        let release = |version: &str, generation| CoreRelease { version: version.into(), generation, notes: None };
+        let release = |version: &str, generation| CoreRelease {
+            version: version.into(),
+            generation,
+            notes: None,
+            targets: serde_json::Value::Null,
+        };
         let latest = release("0.1.13", Some(1));
         assert_eq!(after_update_target("0.1.12", Some(&latest), 1, "0.1.11"), Some("0.1.13"));
         for have in ["0.1.13", "0.1.14"] {
@@ -1496,5 +2020,221 @@ mod tests {
         }
         assert_eq!(decode_process_output("检查更新失败".as_bytes()), "检查更新失败");
         assert_eq!(decode_process_output(b""), "");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn needs_elevation_detects_read_only_install_root_on_linux() {
+        use std::os::unix::fs::PermissionsExt;
+        // Skip permission-denial checks if tests run as root (root bypasses DAC write checks).
+        if Command::new("id").arg("-u").output().ok().is_some_and(|o| o.stdout == b"0\n") {
+            return;
+        }
+        let work = TempWorkDir::new("herdr2-test-elev-perm").unwrap();
+        let parent = work.path().join("opt");
+        let root = parent.join("herdr2");
+        std::fs::create_dir_all(&root).unwrap();
+        assert!(!needs_elevation_for(&root));
+
+        // Read-only install root (e.g. root-owned ~/.local/share/herdr2) requires elevation.
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(needs_elevation_for(&root));
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Read-only parent (e.g. /opt owned by root) requires elevation.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o555)).unwrap();
+        assert!(needs_elevation_for(&root));
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn elevated_swap_replaces_root_and_preserves_or_upgrades_bundled_core() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = TempWorkDir::new("herdr2-test-elev-swap").unwrap();
+        let root = work.path().join("opt/herdr2");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("herdr2"), "#!/bin/sh\necho herdr2 2.0.8\n").unwrap();
+        std::fs::write(root.join("herdr2-core"), "#!/bin/sh\necho h2 2.0.8\n").unwrap();
+        std::fs::write(root.join("herdr2.svg"), "<svg/>").unwrap();
+        std::fs::write(root.join("herdr2.png"), "png-old").unwrap();
+        std::fs::set_permissions(root.join("herdr2"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(root.join("herdr2-core"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Case 1: no core feed -> preserves existing herdr2-core & png during elevated swap.
+        let unpacked1 = work.path().join("unpacked1/herdr2");
+        std::fs::create_dir_all(&unpacked1).unwrap();
+        std::fs::write(unpacked1.join("herdr2"), "#!/bin/sh\necho herdr2 2.0.9\n").unwrap();
+        std::fs::write(unpacked1.join("herdr2.svg"), "<svg>new</svg>").unwrap();
+        std::fs::set_permissions(unpacked1.join("herdr2"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let upgraded1 = preserve_or_update_bundled_core(&root, &unpacked1, work.path(), None).unwrap();
+        assert_eq!(upgraded1, None);
+        assert!(unpacked1.join("herdr2-core").is_file());
+        assert_eq!(std::fs::read_to_string(unpacked1.join("herdr2.png")).unwrap(), "png-old");
+
+        let swap_work1 = TempWorkDir::new("herdr2-test-swap1").unwrap();
+        run_elevated_swap_with(
+            Path::new("/usr/bin/env"),
+            &[],
+            swap_work1.path(),
+            &unpacked1,
+            &root,
+            "2.0.9",
+        )
+        .unwrap();
+        assert_eq!(version_of(&root).as_deref(), Some("2.0.9"));
+        assert_eq!(crate::core_bin::version(&root.join("herdr2-core")).as_deref(), Some("h2 2.0.8"));
+        assert!(!beside(&root, ".old").exists());
+        assert!(!beside(&root, ".new").exists());
+
+        // Case 2: newer core release available -> upgrades bundled herdr2-core in lockstep.
+        let server = work.path().join("server");
+        let core_pkg_src = work.path().join("core-pkg-src");
+        std::fs::create_dir_all(server.join("core")).unwrap();
+        std::fs::create_dir_all(&core_pkg_src).unwrap();
+        std::fs::write(core_pkg_src.join("herdr2"), "#!/bin/sh\necho h2 2.0.10\n").unwrap();
+        std::fs::set_permissions(core_pkg_src.join("herdr2"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let core_tar = server.join("core/herdr2-core.tar.gz");
+        assert!(Command::new("tar").args(["-czf"]).arg(&core_tar).arg("-C").arg(&core_pkg_src).arg("herdr2").status().unwrap().success());
+        let core_sha = sha256(&std::fs::read(&core_tar).unwrap());
+        let core_manifest = serde_json::json!({
+            "version": "2.0.10",
+            "generation": crate::hc::GENERATION,
+            "targets": {
+                target(): {
+                    "url": format!("file://{}", core_tar.display()),
+                    "sha256": core_sha
+                }
+            }
+        });
+        std::fs::write(server.join("core/latest.json"), core_manifest.to_string()).unwrap();
+
+        let unpacked2 = work.path().join("unpacked2/herdr2");
+        std::fs::create_dir_all(&unpacked2).unwrap();
+        std::fs::write(unpacked2.join("herdr2"), "#!/bin/sh\necho herdr2 2.0.10\n").unwrap();
+        std::fs::write(unpacked2.join("herdr2.svg"), "<svg>new2</svg>").unwrap();
+        std::fs::set_permissions(unpacked2.join("herdr2"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let base_url = format!("file://{}", server.display());
+        let upgraded2 = preserve_or_update_bundled_core(&root, &unpacked2, work.path(), Some(&base_url)).unwrap();
+        assert_eq!(upgraded2.as_deref(), Some("2.0.10"));
+
+        let swap_work2 = TempWorkDir::new("herdr2-test-swap2").unwrap();
+        run_elevated_swap_with(
+            Path::new("/usr/bin/env"),
+            &[],
+            swap_work2.path(),
+            &unpacked2,
+            &root,
+            "2.0.10",
+        )
+        .unwrap();
+        assert_eq!(version_of(&root).as_deref(), Some("2.0.10"));
+        assert_eq!(crate::core_bin::version(&root.join("herdr2-core")).as_deref(), Some("h2 2.0.10"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn elevated_swap_maps_pkexec_exit_codes_and_missing_binary() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = TempWorkDir::new("herdr2-test-pkexec-err").unwrap();
+        let unpacked = work.path().join("herdr2");
+        let root = work.path().join("dst/herdr2");
+        std::fs::create_dir_all(&unpacked).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+
+        let mk_stub = |name: &str, body: &str| {
+            let p = work.path().join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+
+        let cancelled = mk_stub("stub-126", "exit 126");
+        let err = run_elevated_swap_with(&cancelled, &[], work.path(), &unpacked, &root, "2.0.10").unwrap_err();
+        assert!(err.contains("cancelled"), "{err}");
+
+        let unauth = mk_stub("stub-127", "echo 'No authentication agent found' >&2; exit 127");
+        let err = run_elevated_swap_with(&unauth, &[], work.path(), &unpacked, &root, "2.0.10").unwrap_err();
+        assert!(err.contains("No authentication agent found") && err.contains("herdr2_2.0.10_amd64.deb"), "{err}");
+
+        let failed = mk_stub("stub-1", "echo 'disk full' >&2; exit 1");
+        let err = run_elevated_swap_with(&failed, &[], work.path(), &unpacked, &root, "2.0.10").unwrap_err();
+        assert!(err.contains("disk full"), "{err}");
+
+        let missing = work.path().join("does-not-exist-pkexec");
+        let err = run_elevated_swap_with(&missing, &[], work.path(), &unpacked, &root, "2.0.10").unwrap_err();
+        assert!(err.contains("pkexec is not installed"), "{err}");
+    }
+
+    #[test]
+    fn strip_windows_verbatim_prefix_handles_drive_and_unc_paths() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new(r"\\?\C:\Users\alice\AppData\Local\Programs\herdr2")),
+            PathBuf::from(r"C:\Users\alice\AppData\Local\Programs\herdr2")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new(r"\\?\UNC\server\share\herdr2")),
+            PathBuf::from(r"\\server\share\herdr2")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new(r"C:\Users\alice\herdr2")),
+            PathBuf::from(r"C:\Users\alice\herdr2")
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(Path::new("/opt/herdr2")),
+            PathBuf::from("/opt/herdr2")
+        );
+    }
+
+    #[test]
+    fn windows_in_place_swap_replaces_files_and_preserves_uninstaller() {
+        let work = std::env::temp_dir().join(format!(
+            "herdr2-win-inplace-{}-{}",
+            std::process::id(),
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let root = work.join("herdr2");
+        let staged = work.join("herdr2.new");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&staged).unwrap();
+
+        std::fs::write(root.join("herdr2.exe"), "old-exe").unwrap();
+        std::fs::write(root.join("herdr2.svg"), "old-svg").unwrap();
+        std::fs::write(root.join("unins000.exe"), "inno-uninstaller").unwrap();
+        std::fs::write(root.join("unins000.dat"), "inno-data").unwrap();
+
+        std::fs::write(staged.join("herdr2.exe"), "new-exe").unwrap();
+        std::fs::write(staged.join("herdr2.svg"), "new-svg").unwrap();
+        std::fs::write(staged.join("LICENSE"), "apache-2.0").unwrap();
+
+        swap_files_in_place(&root, &staged, "herdr2.exe").unwrap();
+
+        assert_eq!(std::fs::read_to_string(root.join("herdr2.exe")).unwrap(), "new-exe");
+        assert_eq!(std::fs::read_to_string(root.join("herdr2.svg")).unwrap(), "new-svg");
+        assert_eq!(std::fs::read_to_string(root.join("LICENSE")).unwrap(), "apache-2.0");
+        assert_eq!(std::fs::read_to_string(root.join("unins000.exe")).unwrap(), "inno-uninstaller");
+        assert_eq!(std::fs::read_to_string(root.join("unins000.dat")).unwrap(), "inno-data");
+        assert!(!staged.exists());
+
+        let old_backups: Vec<_> = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().starts_with("herdr2.exe.old-"))
+            .collect();
+        assert_eq!(old_backups.len(), 1);
+        assert_eq!(std::fs::read_to_string(old_backups[0].path()).unwrap(), "old-exe");
+
+        // Missing staged executable leaves the existing installation untouched.
+        let bad_stage = work.join("herdr2.bad");
+        std::fs::create_dir_all(&bad_stage).unwrap();
+        std::fs::write(bad_stage.join("herdr2.svg"), "corrupt").unwrap();
+        let err = swap_files_in_place(&root, &bad_stage, "herdr2.exe").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(std::fs::read_to_string(root.join("herdr2.exe")).unwrap(), "new-exe");
+        assert_eq!(std::fs::read_to_string(root.join("herdr2.svg")).unwrap(), "new-svg");
+
+        let _ = std::fs::remove_dir_all(&work);
     }
 }

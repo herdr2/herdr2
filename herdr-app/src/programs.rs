@@ -271,7 +271,7 @@ fn powershell_quote(word: &str) -> String {
 }
 
 /// The words back from `powershell_line`.
-fn powershell_words(line: &str) -> Option<Vec<String>> {
+pub(crate) fn powershell_words(line: &str) -> Option<Vec<String>> {
     let mut chars = line.strip_prefix("& ")?.chars().peekable();
     let mut words = Vec::new();
     while let Some(c) = chars.next() {
@@ -295,6 +295,96 @@ fn powershell_words(line: &str) -> Option<Vec<String>> {
         words.push(w);
     }
     Some(words)
+}
+
+/// Formats `cmd` into a command line suitable for `cmd.exe /d /s /k "<line>"` or `/c "<line>"`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub fn cmd_line(cmd: &[String]) -> String {
+    cmd.iter().map(|w| cmd_quote(w)).collect::<Vec<_>>().join(" ")
+}
+
+fn cmd_quote(word: &str) -> String {
+    if word.is_empty() {
+        return "\"\"".into();
+    }
+    let needs_quote = word.chars().any(|c| {
+        c.is_whitespace() || matches!(c, '"' | '&' | '|' | '<' | '>' | '^' | '(' | ')' | '%' | '!')
+    });
+    if !needs_quote {
+        return word.to_owned();
+    }
+    let mut out = String::from("\"");
+    let mut slashes = 0usize;
+    for ch in word.chars() {
+        match ch {
+            '\\' => slashes += 1,
+            '"' => {
+                out.push_str(&"\\".repeat(slashes * 2 + 1));
+                out.push('"');
+                slashes = 0;
+            }
+            c => {
+                out.push_str(&"\\".repeat(slashes));
+                out.push(c);
+                slashes = 0;
+            }
+        }
+    }
+    out.push_str(&"\\".repeat(slashes * 2));
+    out.push('"');
+    out
+}
+
+/// The words back from a `cmd.exe /k` or `/c` command string.
+pub(crate) fn cmd_words(line: &str) -> Option<Vec<String>> {
+    let mut raw = line.trim();
+    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') && raw[1..raw.len() - 1].contains('"') {
+        raw = &raw[1..raw.len() - 1];
+    }
+    let mut chars = raw.chars().peekable();
+    let mut words = Vec::new();
+    while let Some(&c) = chars.peek() {
+        if c.is_whitespace() {
+            chars.next();
+            continue;
+        }
+        let mut word = String::new();
+        let mut in_quotes = false;
+        while let Some(ch) = chars.next() {
+            if in_quotes {
+                if ch == '\\' {
+                    let mut slashes = 1usize;
+                    while chars.peek() == Some(&'\\') {
+                        chars.next();
+                        slashes += 1;
+                    }
+                    if chars.peek() == Some(&'"') {
+                        chars.next();
+                        word.push_str(&"\\".repeat(slashes / 2));
+                        if slashes % 2 == 1 {
+                            word.push('"');
+                        } else {
+                            in_quotes = false;
+                        }
+                    } else {
+                        word.push_str(&"\\".repeat(slashes));
+                    }
+                } else if ch == '"' {
+                    in_quotes = false;
+                } else {
+                    word.push(ch);
+                }
+            } else if ch == '"' {
+                in_quotes = true;
+            } else if ch.is_whitespace() {
+                break;
+            } else {
+                word.push(ch);
+            }
+        }
+        words.push(word);
+    }
+    (!words.is_empty()).then_some(words)
 }
 
 fn find<'a>(t: &'a Table, name: &str) -> Option<(&'a str, &'a Entry)> {
@@ -351,6 +441,16 @@ fn find_agent_in_path<'a>(t: &'a Table, path: &str) -> Option<(&'a str, &'a Entr
     {
         return Some(hit);
     }
+    // Bundled versioned runtimes such as `<home>\AppData\Local\cursor-agent\versions\<ver>\index.js`
+    // or `...\cursor-agent\versions\<ver>\node.exe`.
+    for i in (1..segs.len().saturating_sub(1)).rev() {
+        if segs[i].eq_ignore_ascii_case("versions")
+            && segs.len().saturating_sub(i) <= 4
+            && let Some(hit) = find_agent_segment(t, segs[i - 1])
+        {
+            return Some(hit);
+        }
+    }
     let last_stem = [".js", ".mjs", ".cjs", ".ts", ".py", ".rb"].iter().find_map(|ext| last.strip_suffix(ext)).unwrap_or(last);
     let generic_entry = matches!(last_stem.to_ascii_lowercase().as_str(), "cli" | "index" | "main" | "run" | "bin");
     for (i, seg) in segs[..segs.len().saturating_sub(1)].iter().enumerate().rev() {
@@ -383,14 +483,31 @@ fn resolve(t: &Table, app: Option<&str>, argv: &[String]) -> Value {
     {
         return resolve(t, None, &argv[4..]);
     }
-    // On Windows: `pwsh [-NoLogo] [-ExecutionPolicy Bypass] -NoExit -Command "& 'codex' ..."`.
-    if argv.len() >= 4
+    // On Windows: `pwsh [-NoLogo] [-ExecutionPolicy Bypass] [-NoExit] -Command "& 'codex' ..."`.
+    if argv.len() >= 3
         && t.shells.iter().any(|s| s == base(&argv[0]))
-        && argv[1..argv.len() - 2].iter().any(|a| a.eq_ignore_ascii_case("-NoExit"))
+        && matches!(base(&argv[0]), "pwsh" | "powershell")
         && argv[argv.len() - 2].eq_ignore_ascii_case("-Command")
         && let Some(words) = powershell_words(&argv[argv.len() - 1])
     {
         return resolve(t, None, &words);
+    }
+    // On Windows: `cmd.exe [/d] [/s] /k|/c "claude --dangerously-skip-permissions"`.
+    if argv.len() >= 3
+        && base(&argv[0]).eq_ignore_ascii_case("cmd")
+        && let Some(pos) = argv[1..].iter().position(|a| a.eq_ignore_ascii_case("/k") || a.eq_ignore_ascii_case("/c"))
+    {
+        let rest = &argv[pos + 2..];
+        let words = if rest.len() == 1 {
+            cmd_words(&rest[0])
+        } else if !rest.is_empty() {
+            Some(rest.to_vec())
+        } else {
+            None
+        };
+        if let Some(words) = words {
+            return resolve(t, None, &words);
+        }
     }
     let Some(first) = argv.first().map(|a| base(a)) else {
         return shown("shell", t.programs.get("shell").unwrap_or(&Entry::default()), None, true, false);
@@ -409,6 +526,13 @@ fn resolve(t: &Table, app: Option<&str>, argv: &[String]) -> Value {
             {
                 return shown(key, e, None, false, true);
             }
+        }
+        // Bundled interpreters shipped inside an agent's own version directory
+        // (e.g. `...\cursor-agent\versions\<ver>\node.exe`).
+        if (argv[0].contains('/') || argv[0].contains('\\'))
+            && let Some((key, e)) = find_agent_in_path(t, &argv[0])
+        {
+            return shown(key, e, None, false, true);
         }
     }
     if let Some((key, e)) = find_with_real(t, first) {
@@ -467,6 +591,25 @@ mod tests {
         let line = powershell_line(&words);
         assert_eq!(line, "& 'pi' 'it''s \u{2019}\u{2019}fine\u{2019}\u{2019}' '' 'a  b'");
         assert_eq!(powershell_words(&line), Some(words));
+    }
+
+    #[test]
+    fn cmd_words_round_trip_and_resolve_windows_wrapped_agents() {
+        let words: Vec<String> = ["claude", "--dangerously-skip-permissions", "fix \"bug\" & test", "C:\\work\\dir\\", ""].map(String::from).to_vec();
+        let line = cmd_line(&words);
+        assert_eq!(cmd_words(&line), Some(words.clone()));
+
+        assert_eq!(key(None, &["C:\\Windows\\System32\\cmd.exe", "/d", "/s", "/k", &line]), "claude");
+        assert_eq!(key(None, &["cmd.exe", "/d", "/s", "/c", "codex --no-daemon"]), "codex");
+        assert_eq!(key(None, &["C:\\Windows\\System32\\cmd.exe"]), "shell");
+        assert_eq!(
+            key(None, &["C:\\Program Files\\Git\\bin\\bash.exe", "-lic", "\"$@\"; exec \"$0\" -li", "C:\\Program Files\\Git\\bin\\bash.exe", "claude", "--dangerously-skip-permissions"]),
+            "claude"
+        );
+        assert_eq!(
+            key(None, &["pwsh.exe", "-ExecutionPolicy", "Bypass", "-Command", "& 'codex' '--no-daemon'"]),
+            "codex"
+        );
     }
 
     #[test]
@@ -556,8 +699,39 @@ mod tests {
         assert_eq!(key(None, &["node", "/usr/lib/node_modules/@google/gemini-cli/bundle/gemini.js"]), "gemini");
         assert_eq!(key(None, &["/home/u/.local/share/claude/versions/2.1.325"]), "claude");
         assert!(is_agent(&["/home/u/.local/share/claude/versions/2.1.325"]));
+        assert_eq!(
+            key(
+                None,
+                &[
+                    r"D:\Users\u\AppData\Local\cursor-agent\versions\2026.10.22-27dcf5f\node.exe",
+                    r"D:\Users\u\AppData\Local\cursor-agent\versions\2026.10.22-27dcf5f\index.js",
+                    "--yolo",
+                    "--trust",
+                ],
+            ),
+            "cursor"
+        );
+        assert!(is_agent(&[
+            r"D:\Users\u\AppData\Local\cursor-agent\versions\2026.10.22-27dcf5f\node.exe",
+            r"D:\Users\u\AppData\Local\cursor-agent\versions\2026.10.22-27dcf5f\index.js",
+            "--yolo",
+            "--trust",
+        ]));
+        assert_eq!(
+            key(None, &[r"D:\Users\u\AppData\Local\cursor-agent\versions\2026.10.22-27dcf5f\node.exe"]),
+            "cursor"
+        );
+        assert!(is_agent(&[
+            "powershell.exe",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-NoExit",
+            "-Command",
+            "& 'cursor-agent' '--yolo' '--trust'",
+        ]));
         assert_eq!(key(None, &[r"C:\Users\u\AppData\Roaming\npm\codex.cmd"]), "codex");
         assert_eq!(key(None, &["node", "/home/pi/server.js"]), "node");
+        assert_eq!(key(None, &["/home/pi/bin/node", "server.js"]), "node");
         assert_eq!(
             key(None, &["powershell.exe", "-ExecutionPolicy", "Bypass", "-NoExit", "-Command", "& 'claude' '--dangerously-skip-permissions'"]),
             "claude"

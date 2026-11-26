@@ -62,7 +62,7 @@ enum AiCmd {
         #[arg(long)]
         consume: bool,
     },
-    /// Fetch available models from an OpenAI-compatible AI endpoint (/models).
+    /// Fetch available models from an AI endpoint (/models, OpenAI or Claude protocol).
     Models {
         #[arg(long, value_name = "FILE")]
         file: Option<std::path::PathBuf>,
@@ -566,8 +566,9 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
                     params["on"] = json!(m);
                 }
                 let r = call("ai.status", params)?;
+                let proto = r["protocol"].as_str().map(|p| format!(", protocol: {p}")).unwrap_or_default();
                 let human = format!(
-                    "AI {}: {} (model: {}, cache hit: {:.0}%, local hits: {})",
+                    "AI {}: {} (model: {}{proto}, cache hit: {:.0}%, local hits: {})",
                     if r["configured"].as_bool().unwrap_or(false) { "ready" } else { "unconfigured" },
                     r["baseUrl"].as_str().filter(|s| !s.is_empty()).unwrap_or("-"),
                     r["model"].as_str().filter(|s| !s.is_empty()).unwrap_or("auto"),
@@ -648,8 +649,9 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
                 let r = call("ai.test", params)?;
                 let ok = r["ok"].as_bool().unwrap_or(false);
                 let human = if ok {
+                    let proto = r["protocol"].as_str().map(|p| format!(" protocol={p}")).unwrap_or_default();
                     format!(
-                        "AI OK ({}ms) model={}",
+                        "AI OK ({}ms) model={}{proto}",
                         r["latencyMs"].as_u64().unwrap_or(0),
                         r["discoveredModel"].as_str().unwrap_or("-")
                     )

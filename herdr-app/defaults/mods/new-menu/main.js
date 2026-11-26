@@ -84,6 +84,15 @@ export default class NewMenu extends View {
     const acpMode = (shared(MODE_KEY) ?? "terminal") === "acp";
     const showWinShells = window()?.platform === "windows" && !space?.machine;
     const winShells = showWinShells ? WIN_SHELLS() : [];
+    const rawShell = String(this.selectedShell ?? (typeof settings === "function" ? settings()?.shell : undefined) ?? "auto").trim().toLowerCase();
+    const activeShell = rawShell === "windows-powershell"
+      ? "powershell"
+      : rawShell === "powershell7"
+        ? "pwsh"
+        : (rawShell === "gitbash" || rawShell === "bash")
+          ? "git-bash"
+          : rawShell;
+    const activeShellLabel = winShells.find((sh) => sh.id === activeShell)?.label ?? "";
     const installed = this.agents.filter(a => a.installed);
     const choices = this.failed ? installed : [...installed, ...this.agents.filter(a => !a.installed).slice(0, 2)];
     const modeChip = (id, label, active) => div()
@@ -113,7 +122,13 @@ export default class NewMenu extends View {
         if (!agent) return;
         this.launchAgent(agent, space, acpMode);
       })
-      .child(this.row("terminal", svg("icons/shell.svg").size(14), tr("Terminal", "终端"), () => run("tab.new", { space: space?.id }), shortcut("tab.new")))
+      .child(this.row(
+        "terminal",
+        svg("icons/shell.svg").size(14),
+        activeShellLabel ? `${tr("Terminal", "终端")} · ${activeShellLabel}` : tr("Terminal", "终端"),
+        () => run("tab.new", { space: space?.id }),
+        shortcut("tab.new"),
+      ))
       .when(showWinShells, (el) => el.child(
         h_flex()
           .id("nm-win-shells")
@@ -123,27 +138,30 @@ export default class NewMenu extends View {
           .gap(4)
           .flex_wrap()
           .items_center()
-          .children(winShells.map((sh) =>
-            div()
+          .children(winShells.map((sh) => {
+            const active = activeShell === sh.id;
+            return div()
               .id(`nm-shell-${sh.id}`)
               .px(6)
               .py(2)
               .rounded(5)
-              .bg(t.raised)
+              .bg(active ? t.selected : t.raised)
               .border_1()
-              .border_color(t.border)
+              .border_color(active ? (t.accent ?? t.border) : t.border)
               .text_size(10.5)
-              .text_color(t.muted)
+              .when(active, (el) => el.font_medium())
+              .text_color(active ? t.foreground : t.muted)
               .cursor_pointer()
               .hover((s) => s.bg(t.selected).text_color(t.foreground))
               .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
               .on_click((_e, cx) => {
                 cx.stop_propagation();
-                closeOverlay(props().overlay);
-                run("tab.new", { space: space?.id, shell: sh.id, name: sh.label });
+                this.selectedShell = sh.id;
+                run("app.shell", { shell: sh.id });
+                cx.notify();
               })
-              .child(sh.label),
-          )),
+              .child(sh.label);
+          })),
       ))
       .child(
         h_flex()

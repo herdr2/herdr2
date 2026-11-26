@@ -30,7 +30,7 @@
 | `F14` | `herdr-app` | Ghostty-sys GPU 终端渲染、输入选择与程序探测 | L2-app-sandbox | 4 | 4 / 20 / 3 / 0 |
 | `F15` | `herdr-app` | 双通道 Agents 侧栏、非 7501 状态推断与回收站闭环 | L2-app-sandbox, L4-live-llm | 4 | 6 / 16 / 5 / 0 |
 | `F16` | `herdr-app` | 25 个内置 JS Mods、3 个 Frame 屏幕与热重载沙盒 | L0-static, L2-app-sandbox | 6 | 2 / 6 / 25 / 3 |
-| `F17` | `herdr-app` | 桌面控制套接字、自检截图、设置与热更新链路 | L2-app-sandbox | 5 | 3 / 20 / 0 / 3 |
+| `F17` | `herdr-app` | 桌面控制套接字、自检截图、设置与热更新链路 | L2-app-sandbox | 5 | 3 / 21 / 0 / 3 |
 | `F18` | `drove-web` | Drove Web 只读可观测工作台与 HTTP/SSE 联邦 | L1-core-isolated, L3-web-e2e | 6 | 3 / 0 / 0 / 0 |
 | `F19` | `cross-cutting` | 跨仓协议契约、OpenRPC/App Commands/Defaults 一致性与双版本隔离 | L0-static | 3 | 3 / 0 / 0 / 0 |
 
@@ -266,7 +266,7 @@ Local control socket `$HERDR2_APP_HOME/herdr2-app.sock` (`control.rs`: `commands
 | --- | --- | --- | --- | --- | --- | --- |
 | `TC-APP-020` | 本地控制套接字、单实例唤醒与畸形参数校验 (herdr2-app.sock ls/status/commands/do/shot & raise_running) | `L2-app-sandbox` | `scripted` | `P0` | linux, macos, windows | - |
 | `TC-APP-021` | Frame 原生屏幕：Command Palette、Welcome 与 Settings Drove 面板 (palette, welcome, settings frames) | `L2-app-sandbox` | `hybrid` | `P0` | linux, macos, windows | rpc:1, app:3, frames:3 |
-| `TC-APP-022` | 主题切换、界面语言与缩放比例控制 (app.theme, app.language, app.zoom_in/out/reset) | `L2-app-sandbox` | `hybrid` | `P1` | linux, macos, windows | rpc:1, app:5, frames:1 |
+| `TC-APP-022` | 主题切换、界面语言与缩放比例控制 (app.theme, app.language, app.zoom_in/out/reset) | `L2-app-sandbox` | `hybrid` | `P1` | linux, macos, windows | rpc:1, app:6, frames:1 |
 | `TC-APP-023` | 窗口管理与平台应用生命周期命令 (window.minimize/maximize/close & app.quit/hide/hide_others/show_all) | `L2-app-sandbox` | `scripted` | `P1` | linux, macos, windows | app:7 |
 | `TC-APP-024` | 窗口无损重启与 App/UI/Core 三通道更新链路 (app.restart, app.check_updates, app.apply_ui_update, app.update, app.update_core) | `L2-app-sandbox` | `hybrid` | `P1` | linux, macos, windows | rpc:1, app:5, frames:1 |
 

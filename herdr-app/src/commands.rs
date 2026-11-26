@@ -161,6 +161,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("app.update_core", &[], "Update h2 core in the background without interrupting terminals."),
     cmd("app.theme", &[req("name")], "Use a theme (a preset or themes/<name>.json)."),
     cmd("app.language", &[req("language")], "Set the interface language (\"en\" or \"zh-CN\")."),
+    cmd("app.shell", &[req("shell")], "Set the default local terminal shell (\"auto\", \"powershell\", \"pwsh\", \"git-bash\", \"cmd\", or a custom executable path) used for both terminals and CLI agents."),
     cmd("app.zoom_in", &[], "Make everything bigger."),
     cmd("app.zoom_out", &[], "Make everything smaller."),
     cmd("app.zoom_reset", &[], "Back to normal size."),

@@ -535,6 +535,33 @@ fn module(mut values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> Hos
                         "stderr": ""
                     }))
                 }
+                "hc" | "h2" if first == json!(["read", "--json", "a_hist"]) || first == json!(["read", "--json", "t_hist"]) => {
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "complete": true,
+                            "entries": [
+                                {"kind":"user","turn":1,"text":"first prompt","ts_ms":1700000000000i64},
+                                {"kind":"assistant","turn":1,"text":"Done 1","ts_ms":1700000001000i64},
+                                {"kind":"user","turn":2,"text":"multi line one\nmulti line two","ts_ms":1700000002000i64},
+                                {"kind":"assistant","turn":2,"text":"Done 2","ts_ms":1700000003000i64},
+                                {"kind":"user","turn":3,"text":"latest prompt","ts_ms":1700000004000i64},
+                                {"kind":"assistant","turn":3,"text":"Done 3","ts_ms":1700000005000i64}
+                            ]
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
+                }
+                "hc" | "h2" if first == json!(["get", "--json", "a_hist"]) => {
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "address": "a_hist",
+                            "config_options": []
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
+                }
                 "hc" | "h2" if first == json!(["read", "--json", "a1"]) => {
                     Some(json!({
                         "code": 0,
@@ -1350,7 +1377,7 @@ fn machine_add_needing_input_keeps_the_picker_and_shows_instructions(cx: &mut Te
         let tree = session.describe(window, cx).unwrap();
         assert!(tree.contains("machine-add"), "{tree}");
         assert!(tree.contains("ma-message-host"), "{tree}");
-        assert!(tree.contains("hc machine add host"), "{tree}");
+        assert!(tree.contains("h2 machine add --install host"), "{tree}");
         window.remove_window();
     }).unwrap();
     let calls = calls.borrow();
@@ -1518,7 +1545,7 @@ fn local_state_and_overlay_initial_descriptions(cx: &mut TestAppContext) {
         assert!(tree.contains("Welcome to Herdr2"), "welcome header on page {page}: {tree}");
         if page == 3 {
             assert!(tree.contains("DeepSeek Official"), "welcome page 3 DeepSeek provider: {tree}");
-            assert!(tree.contains("Custom OpenAI-compatible"), "welcome page 3 Custom OpenAI provider: {tree}");
+            assert!(tree.contains("Custom (OpenAI / Claude)"), "welcome page 3 Custom OpenAI/Claude provider: {tree}");
             assert!(tree.contains("Fetch Models"), "welcome page 3 Fetch Models button: {tree}");
             assert!(tree.contains("Skip"), "welcome page 3 Skip button: {tree}");
             assert!(!tree.contains("deepseek-reasoner"), "welcome page 3 must not hardcode deepseek-reasoner chip: {tree}");
@@ -6244,4 +6271,276 @@ fn agents_sidebar_scrolls_when_vertically_narrow(cx: &mut TestAppContext) {
         gpui_shell::policy::set_default(Policy::new());
         cx.run_until_parked();
     }
+}
+
+#[gpui::test]
+fn peek_composer_up_down_recalls_prompt_history_in_acp_and_pty_chat(cx: &mut TestAppContext) {
+    use gpui::VisualTestContext;
+    use std::ops::Deref;
+
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+    let program = json!({
+        "key": "claude",
+        "name": "Claude Code",
+        "icon": null,
+        "tint": false,
+        "tile": "#1c1d21",
+        "color": "#ffffff",
+        "shell": false,
+        "agent": true
+    });
+
+    for (label, addr, is_pty) in [("acp", "a_hist", false), ("pty_chat", "t_hist", true)] {
+        let mut values = fixture(
+            true,
+            json!({"terminal": addr, "acp": true, "pty": is_pty, "tab": true, "pane": "p1"}),
+            updates("current", "current"),
+        );
+        values.insert("terminals".into(), json!([{
+            "address": addr,
+            "acp": !is_pty,
+            "agent": "claude",
+            "name": "Claude",
+            "title": "Claude",
+            "argv": if is_pty { json!(["claude"]) } else { json!(["claude-agent-acp"]) },
+            "parent": null,
+            "labels": if is_pty { json!({"herdr.view": "peek"}) } else { json!({}) },
+            "state": "live",
+            "status": "idle",
+            "turn": 3,
+            "transcript_seq": 3,
+            "program": program,
+            "cwd": "/fixture/project"
+        }]));
+        values.insert("agents".into(), json!([{
+            "address": addr,
+            "acp": !is_pty,
+            "pane": "p1",
+            "space": "s1",
+            "space_name": "Local",
+            "tab": "tab1",
+            "tab_index": 1,
+            "tab_name": "Claude",
+            "status": "idle",
+            "app": "claude-code",
+            "program": program,
+            "title": "Claude",
+            "seq": 3,
+            "focused": true
+        }]));
+        values.insert("panes".into(), json!([{
+            "pane": "p1",
+            "acp": !is_pty,
+            "structured": is_pty,
+            "mod": "peek",
+            "terminal": addr,
+            "tab": "tab1",
+            "title": "Claude",
+            "cwd": "/fixture/project",
+            "status": "idle",
+            "program": program,
+            "focused": true,
+            "zoomed": false,
+            "movable": false
+        }]));
+
+        let calls = Rc::new(RefCell::new(Calls::default()));
+        gpui_shell::policy::set_default(
+            Policy::new()
+                .with_storage_path(staged.0.join(format!("store-hist-{label}.json")))
+                .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+                .with_host_module(module(values, calls.clone()))
+                .unwrap(),
+        );
+        let wrapper = staged.wrapper("mods/peek", "this.input?.focus?.();");
+        let runtime = ShellRuntime::new_isolated().unwrap();
+        let window = cx.add_window(|window, cx| RootedView(runtime.try_load(&wrapper, window, cx).unwrap()));
+        let mut visual = VisualTestContext::from_window(*window.deref(), cx);
+        let pump = |v: &mut VisualTestContext| {
+            v.update(|window, cx| window.draw(cx).clear(cx));
+            v.run_until_parked();
+        };
+        pump(&mut visual);
+        pump(&mut visual);
+
+        // 1) Type an unsent draft, press Up 3x across single-line & multi-line entries,
+        //    then Down 3x to restore the exact draft and submit it.
+        visual.simulate_input("draft msg");
+        pump(&mut visual);
+        visual.simulate_keystrokes("up");
+        pump(&mut visual);
+        visual.simulate_keystrokes("up");
+        pump(&mut visual);
+        visual.simulate_keystrokes("up");
+        pump(&mut visual);
+        visual.simulate_keystrokes("down");
+        pump(&mut visual);
+        visual.simulate_keystrokes("down");
+        pump(&mut visual);
+        visual.simulate_keystrokes("down");
+        pump(&mut visual);
+        visual.simulate_keystrokes("enter");
+        pump(&mut visual);
+
+        // 2) Immediately press Up to recall the just-sent prompt ("draft msg"), then Up again
+        //    to recall "latest prompt", and submit it.
+        visual.simulate_keystrokes("up");
+        pump(&mut visual);
+        visual.simulate_keystrokes("up");
+        pump(&mut visual);
+        visual.simulate_keystrokes("enter");
+        pump(&mut visual);
+
+        // 3) History is now ["first prompt", "multi line one\nmulti line two", "latest prompt", "draft msg", "latest prompt"].
+        //    Press Up 5x from empty input to reach "first prompt" (skipping past the multi-line entry
+        //    with one Up press per history item), then submit.
+        for _ in 0..5 {
+            visual.simulate_keystrokes("up");
+            pump(&mut visual);
+        }
+        visual.simulate_keystrokes("enter");
+        pump(&mut visual);
+
+        // 4) Inside a multi-line draft, pressing Up from line 2 moves the caret to line 1
+        //    instead of replacing the draft with history.
+        visual.simulate_input("aaa");
+        visual.simulate_keystrokes("shift-enter");
+        visual.simulate_input("bbb");
+        pump(&mut visual);
+        visual.simulate_keystrokes("up");
+        pump(&mut visual);
+        visual.simulate_input("X");
+        pump(&mut visual);
+        visual.simulate_keystrokes("down");
+        pump(&mut visual);
+        visual.simulate_keystrokes("enter");
+        pump(&mut visual);
+
+        let sent: Vec<String> = calls
+            .borrow()
+            .effects
+            .iter()
+            .filter(|(k, _)| k == "h2.send")
+            .filter_map(|(_, args)| {
+                args.first()
+                    .and_then(Value::as_array)
+                    .and_then(|arr| arr.last())
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect();
+        assert_eq!(
+            sent,
+            vec![
+                "draft msg".to_owned(),
+                "latest prompt".to_owned(),
+                "first prompt".to_owned(),
+                "aaaX\nbbb".to_owned(),
+            ],
+            "[{label}] unexpected sent prompts sequence"
+        );
+
+        visual.update(|window, _| window.remove_window());
+        gpui_shell::policy::set_default(Policy::new());
+        cx.run_until_parked();
+    }
+}
+
+#[gpui::test]
+fn acp_and_pty_peek_render_slash_and_codex_at_command_completion_popups(cx: &mut TestAppContext) {
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+
+    // 1. ACP Claude agent typing `/` shows live available_commands popup.
+    let claude_prog = json!({"key":"claude", "name":"Claude Code", "icon":null, "tint":false, "tile":"#1c1d21", "color":"#ffffff", "shell":false, "agent":true});
+    let mut claude_values = fixture(true, json!({"terminal":"a1","acp":true,"tab":true,"pane":"p2"}), updates("current", "current"));
+    claude_values.insert("terminals".into(), json!([
+        {
+            "address":"a1","acp":true,"agent":"claude","name":"Claude","title":"Claude",
+            "argv":["claude-agent-acp"],"parent":null,"labels":{},"state":"live","status":"idle",
+            "turn":1,"transcript_seq":1,"config_options":[],
+            "available_commands":[
+                {"name":"compact","description":"Compact conversation","input_hint":"[instructions]","source":"command"},
+                {"name":"drove","description":"Multi-agent DAG planning","source":"skill"}
+            ],
+            "report":{"app":"claude-code"},"program":claude_prog,"cwd":"/fixture/project"
+        }
+    ]));
+    claude_values.insert("agents".into(), json!([
+        {"address":"a1","agent":"claude","acp":true,"pane":"p2","space":"s1","space_name":"Local","tab":"tab1","tab_index":1,"tab_name":"Claude","status":"idle","app":"claude-code","program":claude_prog,"title":"Claude","seq":1,"focused":true}
+    ]));
+    let claude_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/peek",
+        claude_values,
+        Some("this.inputFocused = true; this.input.set_value('/'); this.input.set_selected_range({start:1,end:1});"),
+    ).unwrap();
+    assert!(claude_tree.contains("acp-completion-popup"), "slash completion popup missing: {claude_tree}");
+    assert!(claude_tree.contains("/compact"), "slash command /compact missing: {claude_tree}");
+    assert!(claude_tree.contains("/drove"), "skill /drove missing: {claude_tree}");
+
+    // 2. ACP Codex agent typing `@` surfaces Codex commands, $skills, and workspace files.
+    let codex_prog = json!({"key":"codex", "name":"Codex", "icon":null, "tint":false, "tile":"#1c1d21", "color":"#ffffff", "shell":false, "agent":true});
+    let mut codex_values = fixture(true, json!({"terminal":"a1","acp":true,"tab":true,"pane":"p2"}), updates("current", "current"));
+    codex_values.insert("terminals".into(), json!([
+        {
+            "address":"a1","acp":true,"agent":"codex","name":"Codex","title":"Codex",
+            "argv":["codex-acp"],"parent":null,"labels":{},"state":"live","status":"idle",
+            "turn":1,"transcript_seq":1,"config_options":[],
+            "available_commands":[
+                {"name":"plan","description":"Turn plan mode on.","source":"command"},
+                {"name":"$drove","description":"Multi-agent DAG planning","source":"skill"}
+            ],
+            "report":{"app":"codex"},"program":codex_prog,"cwd":"/fixture/project"
+        }
+    ]));
+    codex_values.insert("agents".into(), json!([
+        {"address":"a1","agent":"codex","acp":true,"pane":"p2","space":"s1","space_name":"Local","tab":"tab1","tab_index":1,"tab_name":"Codex","status":"idle","app":"codex","program":codex_prog,"title":"Codex","seq":1,"focused":true}
+    ]));
+    let codex_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/peek",
+        codex_values,
+        Some("this.workspaceFilesCache.set('local:/fixture/project', {files:['README.md','src/main.rs'], fetchedAt: Date.now(), loading: false}); this.inputFocused = true; this.input.set_value('@'); this.input.set_selected_range({start:1,end:1});"),
+    ).unwrap();
+    assert!(codex_tree.contains("acp-completion-popup"), "codex @ completion popup missing: {codex_tree}");
+    assert!(codex_tree.contains("/plan"), "codex /plan missing on @ trigger: {codex_tree}");
+    assert!(codex_tree.contains("$drove"), "codex $drove skill missing on @ trigger: {codex_tree}");
+    assert!(codex_tree.contains("@README.md"), "codex @README.md file missing on @ trigger: {codex_tree}");
+
+    // 3. PTY CLI agent in structured chat view (`pty: true`) typing `/co` renders discovered commands and accepts cleanly.
+    let mut pty_values = fixture(true, json!({"terminal":"t1","acp":true,"pty":true,"tab":true,"pane":"p2"}), updates("current", "current"));
+    pty_values.insert("terminals".into(), json!([
+        {
+            "address":"t1","acp":false,"name":"Claude CLI","title":"Claude CLI",
+            "argv":["claude"],"parent":null,"labels":{},"state":"live","status":"idle",
+            "turn":1,"report":{"app":"claude-code"},"program":claude_prog,"cwd":"/fixture/project"
+        }
+    ]));
+    pty_values.insert("agents".into(), json!([
+        {"address":"t1","acp":false,"pane":"p2","space":"s1","space_name":"Local","tab":"tab1","tab_index":1,"tab_name":"Claude CLI","status":"idle","app":"claude-code","program":claude_prog,"title":"Claude CLI","seq":1,"focused":true}
+    ]));
+    let pty_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/peek",
+        pty_values.clone(),
+        Some("this.readAvailableCommands = [{name:'compact',description:'Compact context',source:'command'},{name:'review',description:'Review diff',source:'command'}]; this.inputFocused = true; this.input.set_value('/co'); this.input.set_selected_range({start:3,end:3});"),
+    ).unwrap();
+    assert!(pty_tree.contains("acp-completion-popup"), "PTY chat view slash popup missing: {pty_tree}");
+    assert!(pty_tree.contains("/compact"), "PTY chat view /compact missing: {pty_tree}");
+    assert!(!pty_tree.contains("/review"), "non-matching /review should be filtered out: {pty_tree}");
+
+    // Accepting the completion replaces `/co` with `/compact ` and closes the popup.
+    let accepted_tree = describe_with_values(
+        cx,
+        &staged,
+        "mods/peek",
+        pty_values,
+        Some("this.readAvailableCommands = [{name:'compact',description:'Compact context',source:'command'}]; this.inputFocused = true; this.input.set_value('/co'); this.input.set_selected_range({start:3,end:3}); this.handleComposerKeyDown({key:'tab',modifiers:{}}, cx);"),
+    ).unwrap();
+    assert!(!accepted_tree.contains("acp-completion-popup"), "popup should close after accepting completion: {accepted_tree}");
 }

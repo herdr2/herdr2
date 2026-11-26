@@ -729,7 +729,7 @@ export function buildSplitDisplayItems(annotatedRows, visibleComments, activeCom
   return { items };
 }
 
-function machineOfAddress(addr) {
+export function machineOfAddress(addr) {
   if (typeof addr !== "string") return null;
   const slash = addr.indexOf("/");
   return slash > 0 ? addr.slice(0, slash) : null;
@@ -827,6 +827,44 @@ export function resolveTargetCandidates({
 
 export function makeDraftScopeKey(machine, scope) {
   return `${machine || "local"}::${normalizePath(scope || "")}`;
+}
+
+/**
+ * Resolves `{ cwd, on }` for the Changes panel without ever pairing a cwd from
+ * one machine (e.g. a local Windows folder `D:\Users\...`) with a remote `on`
+ * machine (e.g. an unrelated Linux CLI agent reported in `focused().agent`).
+ */
+export function resolveChangesLocation({ space = null, focused = null, panes = [], terminals = [] } = {}) {
+  const f = focused ?? null;
+  const pane = f?.pane ? (panes ?? []).find((p) => p?.pane === f.pane) ?? null : null;
+  const spaceMachine = space?.machine || null;
+  const findTerm = (addr) => (addr ? (terminals ?? []).find((t) => t?.address === addr) ?? null : null);
+
+  if (f && f.pane === null) {
+    const addr = f.terminal || f.agent || null;
+    const on = addr ? machineOfAddress(addr) : spaceMachine;
+    const rec = findTerm(addr);
+    const fallbackFolder = space && spaceMachine === on ? space.folder : null;
+    return { cwd: f.cwd || rec?.cwd || fallbackFolder || null, on };
+  }
+
+  if (f?.pane) {
+    const swapped = Boolean(f.shown && f.shown !== pane?.terminal);
+    const addr = (swapped ? f.shown : null) || f.terminal || pane?.terminal || null;
+    const on = swapped ? machineOfAddress(f.shown) : ((addr && machineOfAddress(addr)) || spaceMachine);
+    const rec = findTerm(addr);
+    const paneMachine = pane?.terminal ? (machineOfAddress(pane.terminal) || spaceMachine) : spaceMachine;
+    const paneCwd = !swapped && paneMachine === on ? pane?.cwd : null;
+    const agentMachine = f.agent ? (machineOfAddress(f.agent) || spaceMachine) : null;
+    const focusedCwdMatches = !swapped && (!f.agent || f.agent === addr || agentMachine === on);
+    const fallbackFolder = space && spaceMachine === on ? space.folder : null;
+    return {
+      cwd: paneCwd || rec?.cwd || (focusedCwdMatches ? f.cwd : null) || fallbackFolder || null,
+      on,
+    };
+  }
+
+  return { cwd: space?.folder || null, on: spaceMachine };
 }
 
 export function readScopeDrafts(sharedStore, scopeKey) {

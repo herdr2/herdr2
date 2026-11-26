@@ -3,7 +3,6 @@
 use super::store::Store;
 use super::types::*;
 use std::collections::{BTreeSet, HashMap};
-use std::process::Command;
 
 /// Inspects a task (or specific attempt id) cleanly without altering workspace state.
 pub fn diagnose_task(store: &Store, id_or_attempt: &str) -> Option<Diagnosis> {
@@ -33,7 +32,7 @@ pub fn diagnose_task_with_tail(store: &Store, id_or_attempt: &str, tail: usize) 
     let git_cwd = worker.as_ref().and_then(|w| w.worktree.as_ref().or(Some(&w.cwd))).or(run_cwd.as_ref());
 
     let git_status = match git_cwd {
-        Some(dir) => match Command::new("git").args(["status", "--porcelain"]).current_dir(dir).output() {
+        Some(dir) => match super::bg_std_command("git").args(["status", "--porcelain"]).current_dir(dir).output() {
             Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim_end().to_string(),
             Ok(o) => format!("git status exited {:?}: {}", o.status.code(), String::from_utf8_lossy(&o.stderr).trim()),
             Err(e) => format!("unable to run git status: {e}"),

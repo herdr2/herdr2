@@ -138,6 +138,59 @@ fn find_git_bash_with(
     None
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsShellKind {
+    PowerShell,
+    GitBash,
+    Cmd,
+    Custom,
+}
+
+fn windows_exe_stem(exe: &str) -> String {
+    let base = exe.rsplit(['/', '\\']).next().unwrap_or(exe).trim_start_matches('-').to_ascii_lowercase();
+    base.strip_suffix(".exe").unwrap_or(&base).to_owned()
+}
+
+fn resolve_windows_shell_exe_with(
+    choice: &str,
+    path_os: Option<&std::ffi::OsStr>,
+    program_files: Option<&str>,
+    program_files_x86: Option<&str>,
+    local_app_data: Option<&str>,
+    comspec: Option<&str>,
+) -> (WindowsShellKind, String) {
+    let c = choice.trim();
+    match c.to_ascii_lowercase().as_str() {
+        "" | "auto" | "wsl" => (
+            WindowsShellKind::PowerShell,
+            find_exe_in_path(path_os, "pwsh.exe").unwrap_or_else(|| "powershell.exe".into()),
+        ),
+        "powershell" | "windows-powershell" => (WindowsShellKind::PowerShell, "powershell.exe".into()),
+        "pwsh" | "powershell7" => (
+            WindowsShellKind::PowerShell,
+            find_exe_in_path(path_os, "pwsh.exe").unwrap_or_else(|| "pwsh.exe".into()),
+        ),
+        "git-bash" | "gitbash" | "bash" => (
+            WindowsShellKind::GitBash,
+            find_git_bash_with(path_os, program_files, program_files_x86, local_app_data)
+                .unwrap_or_else(|| "bash.exe".into()),
+        ),
+        "cmd" => (
+            WindowsShellKind::Cmd,
+            comspec.filter(|s| !s.is_empty()).unwrap_or("cmd.exe").into(),
+        ),
+        _ => {
+            let kind = match windows_exe_stem(c).as_str() {
+                "pwsh" | "powershell" => WindowsShellKind::PowerShell,
+                "bash" | "sh" | "zsh" | "dash" | "ksh" | "fish" => WindowsShellKind::GitBash,
+                "cmd" => WindowsShellKind::Cmd,
+                _ => WindowsShellKind::Custom,
+            };
+            (kind, c.to_owned())
+        }
+    }
+}
+
 pub(crate) fn resolve_windows_shell_argv_with(
     choice: &str,
     path_os: Option<&std::ffi::OsStr>,
@@ -162,6 +215,89 @@ pub(crate) fn resolve_windows_shell_argv_with(
         "cmd" => Some(vec![comspec.filter(|s| !s.is_empty()).unwrap_or("cmd.exe").into()]),
         _ => Some(vec![c.to_owned()]),
     }
+}
+
+pub(crate) fn wrap_windows_command_with(
+    choice: &str,
+    cmd: Vec<String>,
+    stay: bool,
+    path_os: Option<&std::ffi::OsStr>,
+    program_files: Option<&str>,
+    program_files_x86: Option<&str>,
+    local_app_data: Option<&str>,
+    comspec: Option<&str>,
+) -> Vec<String> {
+    let (kind, exe) = resolve_windows_shell_exe_with(choice, path_os, program_files, program_files_x86, local_app_data, comspec);
+    match kind {
+        WindowsShellKind::PowerShell => {
+            let mut argv = vec![exe, "-ExecutionPolicy".into(), "Bypass".into()];
+            if stay {
+                argv.push("-NoExit".into());
+            }
+            argv.push("-Command".into());
+            argv.push(crate::programs::powershell_line(&cmd));
+            argv
+        }
+        WindowsShellKind::GitBash => {
+            let fish = windows_exe_stem(&exe) == "fish";
+            let script = match (fish, stay) {
+                (true, true) => "command $argv[2..]; exec $argv[1] -li",
+                (false, true) => "\"$@\"; exec \"$0\" -li",
+                (true, false) => crate::remote_shell::FISH_EXEC,
+                (false, false) => crate::remote_shell::POSIX_EXEC,
+            };
+            let mut argv = vec![exe.clone(), "-lic".into(), script.into(), exe];
+            argv.extend(cmd);
+            argv
+        }
+        WindowsShellKind::Cmd => {
+            vec![
+                exe,
+                "/d".into(),
+                "/s".into(),
+                if stay { "/k" } else { "/c" }.into(),
+                crate::programs::cmd_line(&cmd),
+            ]
+        }
+        WindowsShellKind::Custom => cmd,
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn wrap_windows_command(choice: &str, cmd: Vec<String>, stay: bool) -> Vec<String> {
+    let path_os = std::env::var_os("PATH");
+    let pf = std::env::var("ProgramFiles").ok();
+    let pfx86 = std::env::var("ProgramFiles(x86)").ok();
+    let local = std::env::var("LOCALAPPDATA").ok();
+    let comspec = std::env::var("COMSPEC").ok();
+    wrap_windows_command_with(
+        choice,
+        cmd,
+        stay,
+        path_os.as_deref(),
+        pf.as_deref(),
+        pfx86.as_deref(),
+        local.as_deref(),
+        comspec.as_deref(),
+    )
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn resolve_windows_shell_exe(choice: &str) -> String {
+    let path_os = std::env::var_os("PATH");
+    let pf = std::env::var("ProgramFiles").ok();
+    let pfx86 = std::env::var("ProgramFiles(x86)").ok();
+    let local = std::env::var("LOCALAPPDATA").ok();
+    let comspec = std::env::var("COMSPEC").ok();
+    resolve_windows_shell_exe_with(
+        choice,
+        path_os.as_deref(),
+        pf.as_deref(),
+        pfx86.as_deref(),
+        local.as_deref(),
+        comspec.as_deref(),
+    )
+    .1
 }
 
 fn resolve_windows_shell_argv(choice: &str) -> Option<Vec<String>> {
@@ -366,6 +502,202 @@ fn launch_failure(record: &Value, output: impl FnOnce() -> String) -> Option<Str
     let lines = output.lines().filter(|l| !l.trim().is_empty()).collect::<Vec<_>>();
     let tail = lines[lines.len().saturating_sub(5)..].join("\n");
     Some(if tail.is_empty() { format!("Exit code {code}") } else { format!("Exit code {code}\n{tail}") })
+}
+
+fn acp_login_command(agent_key: &str) -> Option<&'static [&'static str]> {
+    match agent_key.trim().to_ascii_lowercase().as_str() {
+        "cursor" | "cursor-agent" => Some(&["cursor-agent", "login"]),
+        // Interactive `claude` handles both first-time onboarding (theme selection + login) and `/login`.
+        "claude" | "claude-code" => Some(&["claude"]),
+        "codex" => Some(&["codex", "login"]),
+        "copilot" | "github-copilot" => Some(&["copilot", "login"]),
+        "kimi" | "kimi-code" => Some(&["kimi", "login"]),
+        "gemini" | "gemini-cli" => Some(&["gemini"]),
+        "qwen" | "qwen-code" => Some(&["qwen"]),
+        _ => None,
+    }
+}
+
+fn acp_agent_identity(record: &Value) -> (String, String) {
+    let raw = record
+        .get("agent")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            record
+                .get("argv")
+                .and_then(Value::as_array)
+                .and_then(|a| a.first())
+                .and_then(Value::as_str)
+                .map(|s| s.rsplit(['/', '\\']).next().unwrap_or(s).trim())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("agent");
+    let lower = raw.to_ascii_lowercase();
+    let display = match lower.as_str() {
+        "cursor" | "cursor-agent" => "Cursor".to_string(),
+        "claude" | "claude-code" => "Claude".to_string(),
+        "codex" => "Codex".to_string(),
+        "gemini" | "gemini-cli" => "Gemini".to_string(),
+        "copilot" | "github-copilot" => "Copilot".to_string(),
+        "kimi" | "kimi-code" => "Kimi".to_string(),
+        "qwen" | "qwen-code" => "Qwen".to_string(),
+        "opencode" => "OpenCode".to_string(),
+        "agy" | "antigravity" => "Antigravity".to_string(),
+        _ => {
+            let mut chars = raw.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => "Agent".to_string(),
+            }
+        }
+    };
+    (lower, display)
+}
+
+fn is_acp_auth_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("authentication required")
+        || lower.contains("auth_required")
+        || lower.contains("cursor_login")
+        || lower.contains("agent login")
+        || lower.contains("cursor-agent login")
+        || lower.contains("onboarding is incomplete")
+        || lower.contains("please run /login")
+        || lower.contains("not logged in")
+        || lower.contains("login required")
+        || lower.contains("please log in")
+        || lower.contains("please login")
+        || lower.contains("sign in required")
+        || lower.contains("session expired")
+        || lower.contains("unauthenticated")
+        || lower.contains("unauthorized")
+        || (lower.contains("-32000") && (lower.contains("auth") || lower.contains("login")))
+}
+
+fn extract_acp_error_message(read: &Value) -> Option<String> {
+    if let Some(entries) = read.get("entries").and_then(Value::as_array) {
+        for entry in entries.iter().rev() {
+            if entry.get("kind").and_then(Value::as_str) == Some("error")
+                && let Some(msg) = entry.get("message").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+            {
+                return Some(msg.to_string());
+            }
+        }
+    }
+    read.get("text")
+        .and_then(Value::as_str)
+        .and_then(|t| t.lines().rev().map(str::trim).find(|l| !l.is_empty()))
+        .map(str::to_string)
+}
+
+fn acp_launch_failure_toast_spec(record: &Value, error_msg: Option<&str>, is_zh: bool, is_remote: bool) -> Value {
+    let (agent_key, display_name) = acp_agent_identity(record);
+    let raw_err = error_msg.map(str::trim).filter(|s| !s.is_empty()).unwrap_or_default();
+    if is_acp_auth_error(raw_err) {
+        let login_cmd = acp_login_command(&agent_key);
+        let cmd_text = login_cmd.map(|c| c.join(" "));
+        let is_claude = matches!(agent_key.as_str(), "claude" | "claude-code");
+        let is_claude_onboarding = is_claude && raw_err.to_ascii_lowercase().contains("onboarding");
+        let title = if is_claude {
+            if is_zh {
+                "Claude 需要先在 CLI 中完成登录".to_string()
+            } else if is_claude_onboarding {
+                "Claude CLI setup & login required".to_string()
+            } else {
+                "Claude CLI login required".to_string()
+            }
+        } else if is_zh {
+            format!("{display_name} 需要先登录")
+        } else {
+            format!("{display_name} login required")
+        };
+        let body = if is_claude_onboarding {
+            if is_zh {
+                "首次启动需先在 Claude CLI 中选择主题并完成登录，完成后再使用 ACP 模式。".to_string()
+            } else {
+                "First-time setup requires choosing a theme and signing in via Claude CLI before using ACP.".to_string()
+            }
+        } else if is_claude {
+            if is_zh {
+                "Claude 尚未登录，请先打开 Claude CLI 完成登录（或运行 /login）后再试。".to_string()
+            } else {
+                "Not logged in. Open Claude CLI to sign in, then try ACP mode again.".to_string()
+            }
+        } else {
+            match (&cmd_text, is_zh) {
+                (Some(cmd), true) => format!("尚未完成登录认证，请先运行 `{cmd}` 完成登录后重试。"),
+                (Some(cmd), false) => format!("Authentication required. Run `{cmd}` to sign in, then try again."),
+                (None, true) => format!("尚未完成登录认证，请先完成 {display_name} 登录后再启动。"),
+                (None, false) => format!("Authentication required. Sign in to {display_name}, then try again."),
+            }
+        };
+        let mut note = json!({
+            "title": title,
+            "body": body,
+            "level": "warning",
+            "timeout": 15000,
+        });
+        if let Some(cmd) = login_cmd
+            && !is_remote
+        {
+            let tab_name = if is_claude { "Claude CLI".to_string() } else { format!("{display_name} Login") };
+            let mut args = json!({
+                "argv": cmd,
+                "name": tab_name,
+                "focus": true,
+            });
+            if let Some(cwd) = record.get("cwd").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                args["folder"] = json!(cwd);
+            }
+            let cmd_display = cmd.join(" ");
+            note["actionLabel"] = json!(if is_claude {
+                if is_zh { "打开 Claude CLI" } else { "Open Claude CLI" }
+            } else if is_zh {
+                "打开终端登录"
+            } else {
+                "Sign in"
+            });
+            note["actionTooltip"] = json!(if is_zh {
+                format!("打开终端运行 {cmd_display}")
+            } else {
+                format!("Open terminal to run {cmd_display}")
+            });
+            note["buttonAction"] = json!({ "name": "tab.new", "args": args });
+        }
+        return json!({ "kind": "toast", "width": 460, "notification": note });
+    }
+
+    let title = if is_zh {
+        format!("{display_name} ACP 启动失败")
+    } else {
+        format!("{display_name} failed to start")
+    };
+    let lower = raw_err.to_ascii_lowercase();
+    let body = if lower.contains("timed out") {
+        if is_zh {
+            format!("启动超时：{raw_err}")
+        } else {
+            raw_err.to_string()
+        }
+    } else if !raw_err.is_empty() {
+        raw_err.lines().next().unwrap_or(raw_err).trim().to_string()
+    } else if is_zh {
+        "ACP 进程未能完成初始化，请检查该工具是否已安装并可用。".to_string()
+    } else {
+        "ACP process failed to initialize. Check that the tool is installed and signed in.".to_string()
+    };
+    json!({
+        "kind": "toast",
+        "width": 440,
+        "notification": {
+            "title": title,
+            "body": body,
+            "level": "error",
+            "timeout": 10000,
+        }
+    })
 }
 
 /// The shipped layouts (defaults/layouts): `main` is Herdr's window (spaces
@@ -5252,6 +5584,27 @@ impl AppWindow {
         }
         let core = self.core.clone();
         let address = address.to_owned();
+        if is_acp_addr(&address) {
+            let is_zh = self.person.language == settings::Language::ZhCn;
+            let is_remote = address.contains('/');
+            cx.spawn_in(window, async move |this, cx| {
+                let spec = cx.background_executor().spawn(async move {
+                    let record = core.call("agent.get", json!({"agent": address})).ok()?;
+                    if record["reason"].as_str() != Some("spawn_failed") {
+                        return None;
+                    }
+                    let read = core.call("agent.read", json!({"agent": address})).unwrap_or(Value::Null);
+                    let err_msg = extract_acp_error_message(&read);
+                    Some(acp_launch_failure_toast_spec(&record, err_msg.as_deref(), is_zh, is_remote))
+                }).await;
+                if let Some(spec) = spec {
+                    let _ = this.update_in(cx, |this, window, cx| {
+                        this.open_overlay(mods::new_overlay_id(), spec, window, cx);
+                    });
+                }
+            }).detach();
+            return;
+        }
         cx.spawn_in(window, async move |this, cx| {
             let failure = cx.background_executor().spawn(async move {
                 let record = core.call("terminal.get", json!({"terminal": address})).ok()?;
@@ -5265,6 +5618,24 @@ impl AppWindow {
                     this.open_overlay(mods::new_overlay_id(), json!({"kind":"toast", "notification":{"title":"Terminal failed to start", "body":body, "level":"error"}}), window, cx);
                 });
             }
+        }).detach();
+    }
+
+    fn notify_acp_launch_failure(&mut self, address: &str, record: Value, window: &mut Window, cx: &mut Context<Self>) {
+        self.born.borrow_mut().remove(address);
+        let core = self.core.clone();
+        let address = address.to_owned();
+        let is_zh = self.person.language == settings::Language::ZhCn;
+        let is_remote = address.contains('/');
+        cx.spawn_in(window, async move |this, cx| {
+            let spec = cx.background_executor().spawn(async move {
+                let read = core.call("agent.read", json!({"agent": address})).unwrap_or(Value::Null);
+                let err_msg = extract_acp_error_message(&read);
+                acp_launch_failure_toast_spec(&record, err_msg.as_deref(), is_zh, is_remote)
+            }).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                this.open_overlay(mods::new_overlay_id(), spec, window, cx);
+            });
         }).detach();
     }
 
@@ -5345,27 +5716,28 @@ impl AppWindow {
         ]
     }
 
+    /// Resolves the configured local shell choice (`shell_override` wins over `settings.shell`).
+    fn effective_local_shell(shell_override: Option<&str>) -> String {
+        shell_override
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| settings::get().shell.trim().to_owned())
+    }
+
     /// An agent with its first message, in a shell that stays when the agent exits
     /// (on another machine: that machine's shell).
-    fn agent_argv(argv: Option<Vec<String>>, task: Option<&str>, on: Option<&str>) -> Option<Vec<String>> {
+    fn agent_argv(argv: Option<Vec<String>>, task: Option<&str>, shell_override: Option<&str>, on: Option<&str>) -> Option<Vec<String>> {
         argv.filter(|a| !a.is_empty()).map(|cmd| {
             let cmd = append_cli_agent_task(cmd, task);
             if on.is_some() {
                 return crate::remote_shell::launch(cmd);
             }
-            let sh = shell();
+            let choice = Self::effective_local_shell(shell_override);
             if cfg!(windows) {
-                // PowerShell has no `-ic`: run it, then stay. `-ExecutionPolicy Bypass`
-                // allows npm/Cursor `.ps1` shims even when system policy is Restricted.
-                return vec![
-                    sh,
-                    "-ExecutionPolicy".into(),
-                    "Bypass".into(),
-                    "-NoExit".into(),
-                    "-Command".into(),
-                    crate::programs::powershell_line(&cmd),
-                ];
+                return wrap_windows_command(&choice, cmd, true);
             }
+            let sh = if choice.is_empty() || choice.eq_ignore_ascii_case("auto") { shell() } else { choice };
             // macOS terminal sessions load login profiles (including Homebrew's PATH).
             unix_agent_argv(sh, cmd, cfg!(target_os = "macos"), true)
         })
@@ -5373,14 +5745,19 @@ impl AppWindow {
 
     /// A split's program, in your shell (for your PATH) that then becomes it: the
     /// pane ends with it, keeping its exit code. Elsewhere (PowerShell, nushell) as given.
-    fn split_argv(cmd: Vec<String>, on: Option<&str>) -> Vec<String> {
+    fn split_argv(cmd: Vec<String>, shell_override: Option<&str>, on: Option<&str>) -> Vec<String> {
         if on.is_some() {
             return crate::remote_shell::exec(cmd);
         }
+        let choice = Self::effective_local_shell(shell_override);
         if cfg!(windows) {
-            return cmd;
+            if choice.is_empty() || choice.eq_ignore_ascii_case("auto") || choice.eq_ignore_ascii_case("wsl") {
+                return cmd;
+            }
+            return wrap_windows_command(&choice, cmd, false);
         }
-        unix_agent_argv(shell(), cmd, cfg!(target_os = "macos"), false)
+        let sh = if choice.is_empty() || choice.eq_ignore_ascii_case("auto") { shell() } else { choice };
+        unix_agent_argv(sh, cmd, cfg!(target_os = "macos"), false)
     }
 
     /// Resolves local interactive shell argv from an explicit `shell` override or user settings.
@@ -5388,18 +5765,14 @@ impl AppWindow {
         if on.is_some() {
             return None;
         }
-        let s = settings::get();
-        let choice = shell_override
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| s.shell.trim());
+        let choice = Self::effective_local_shell(shell_override);
         if choice.is_empty() || choice.eq_ignore_ascii_case("auto") {
             return None;
         }
         if cfg!(windows) {
-            return resolve_windows_shell_argv(choice);
+            return resolve_windows_shell_argv(&choice);
         }
-        Some(vec![choice.to_owned()])
+        Some(vec![choice])
     }
 
     fn is_auto_tab_name_for_addr(tab_name: &str, rec: Option<&Value>, addr: &str) -> bool {
@@ -5474,7 +5847,7 @@ impl AppWindow {
         let folder = folder.or_else(here).unwrap_or_else(|| if on.is_some() { String::new() } else { home() });
         let (space, ctx, pane) = (self.model.fresh_id_on("sp", on), self.model.fresh_id_on("tb", on), self.model.fresh_id_on("p", on));
         let size = self.initial_size(&Tab::new(&ctx, "", &pane, "").root, &pane, window);
-        let argv = Self::agent_argv(argv.clone(), task, on)
+        let argv = Self::agent_argv(argv.clone(), task, shell.as_deref(), on)
             .or(argv)
             .or_else(|| Self::resolve_local_shell_argv(shell.as_deref(), on));
         let (addr, folder) = self.spawn(argv, true, folder, follow, &space, &ctx, on, size, window)?;
@@ -5498,7 +5871,7 @@ impl AppWindow {
         let on = self.machine_of(&space);
         let (ctx, pane) = (self.model.fresh_id_on("tb", on.as_deref()), self.model.fresh_id_on("p", on.as_deref()));
         let size = self.initial_size(&Tab::new(&ctx, "", &pane, "").root, &pane, window);
-        let argv = Self::agent_argv(argv.clone(), task, on.as_deref())
+        let argv = Self::agent_argv(argv.clone(), task, shell.as_deref(), on.as_deref())
             .or(argv)
             .or_else(|| Self::resolve_local_shell_argv(shell.as_deref(), on.as_deref()));
         let (addr, _) = self.spawn(argv, true, folder, follow, &space, &ctx, on.as_deref(), size, window)?;
@@ -5647,7 +6020,7 @@ impl AppWindow {
             .and_then(|_| self.initial_size(&root, &new, window));
         let argv = argv
             .filter(|a| !a.is_empty())
-            .map(|a| Self::split_argv(a, on.as_deref()))
+            .map(|a| Self::split_argv(a, shell.as_deref(), on.as_deref()))
             .or_else(|| Self::resolve_local_shell_argv(shell.as_deref(), on.as_deref()));
         let (addr, _) = self.spawn(argv, false, cwd, follow, &space, &ctx, on.as_deref(), size, window)?;
         self.model.split(&target, axis, &new, &addr);
@@ -5703,14 +6076,21 @@ impl AppWindow {
                 }
             } else if self.model.any_address_of(&pane).as_deref() == Some(&addr) {
                 if is_acp_addr(&addr) && self.model.acp_pane_of(&addr).as_deref() == Some(pane.as_str()) {
+                    let user_closing = self.closing_terminals.contains_key(&addr);
+                    let is_spawn_failed = result.as_ref().is_ok_and(|v| v["reason"].as_str() == Some("spawn_failed"));
                     let close = match &result {
-                        Ok(v) => self.closing_terminals.contains_key(&addr)
-                            || v["reason"].as_str() == Some("spawn_failed"),
+                        Ok(_) => user_closing || is_spawn_failed,
                         Err(e) => crate::hc::error_kind(e) == Some("not_found"),
                     };
                     if close {
                         self.ended_acp.remove(&addr);
-                        self.notify_launch_failure(&addr, window, cx);
+                        if is_spawn_failed && !user_closing {
+                            if let Ok(record) = result {
+                                self.notify_acp_launch_failure(&addr, record, window, cx);
+                            }
+                        } else {
+                            self.notify_launch_failure(&addr, window, cx);
+                        }
                         self.model.remove_pane(&pane);
                         changed = true;
                     } else if let Ok(v) = result
@@ -5721,13 +6101,22 @@ impl AppWindow {
                     }
                     continue;
                 }
-                let closed = match result {
+                let user_closing = self.closing_terminals.contains_key(&addr);
+                let is_acp_spawn_failed = is_acp_addr(&addr)
+                    && result.as_ref().is_ok_and(|v| v["reason"].as_str() == Some("spawn_failed"));
+                let closed = match &result {
                     Ok(v) => matches!(v["reason"].as_str(), Some("exited" | "killed"))
                         || (is_acp_addr(&addr) && v["state"] == "finished"),
-                    Err(e) => crate::hc::error_kind(&e) == Some("not_found"),
+                    Err(e) => crate::hc::error_kind(e) == Some("not_found"),
                 };
                 if closed {
-                    self.notify_launch_failure(&addr, window, cx);
+                    if is_acp_spawn_failed && !user_closing {
+                        if let Ok(record) = result {
+                            self.notify_acp_launch_failure(&addr, record, window, cx);
+                        }
+                    } else {
+                        self.notify_launch_failure(&addr, window, cx);
+                    }
                     self.model.remove_pane(&pane);
                     changed = true;
                 }
@@ -7151,17 +7540,39 @@ impl AppWindow {
 
     fn unwrap_shell_agent_argv(argv: Vec<String>) -> Vec<String> {
         if argv.len() > 4 {
-            let sh = argv[0].rsplit(['/', '\\']).next().unwrap_or(&argv[0]).trim_start_matches('-');
-            let is_posix_shell = matches!(sh, "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh");
+            let sh = windows_exe_stem(&argv[0]);
+            let is_posix_shell = matches!(sh.as_str(), "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh");
             if is_posix_shell
                 && argv[1].starts_with('-')
                 && argv[1].ends_with('c')
                 && (argv[3] == argv[0]
-                    || argv[3].rsplit(['/', '\\']).next() == Some(sh)
+                    || windows_exe_stem(&argv[3]) == sh
                     || argv[2].contains("\"$@\"")
                     || argv[2].contains("$argv"))
             {
                 return argv[4..].to_vec();
+            }
+        }
+        if argv.len() >= 3 {
+            let sh = windows_exe_stem(&argv[0]);
+            if matches!(sh.as_str(), "pwsh" | "powershell")
+                && argv[argv.len() - 2].eq_ignore_ascii_case("-Command")
+                && let Some(words) = crate::programs::powershell_words(&argv[argv.len() - 1])
+                && !words.is_empty()
+            {
+                return words;
+            }
+            if sh == "cmd"
+                && let Some(pos) = argv[1..].iter().position(|a| a.eq_ignore_ascii_case("/k") || a.eq_ignore_ascii_case("/c"))
+            {
+                let rest = &argv[pos + 2..];
+                if rest.len() == 1 {
+                    if let Some(words) = crate::programs::cmd_words(&rest[0]) {
+                        return words;
+                    }
+                } else if !rest.is_empty() {
+                    return rest.to_vec();
+                }
             }
         }
         argv
@@ -8636,6 +9047,15 @@ impl AppWindow {
                     }
                     params["mode"] = json!(m);
                 }
+                // For local PTY handoff/fork, honor the user's configured default shell.
+                if !source.contains('/') {
+                    let choice = Self::effective_local_shell(None);
+                    if cfg!(windows) {
+                        params["shell"] = json!(resolve_windows_shell_exe(&choice));
+                    } else if !choice.is_empty() && !choice.eq_ignore_ascii_case("auto") {
+                        params["shell"] = json!(choice);
+                    }
+                }
                 if let Some(prompt) = Self::owned(a, "prompt").filter(|s| !s.is_empty()) { params["prompt"] = json!(prompt); }
                 if let Some(note) = Self::owned(a, "note").filter(|s| !s.is_empty()) { params["note"] = json!(note); }
                 if let Some(rt) = a.get("recent_turns").and_then(Value::as_u64) { params["recent_turns"] = json!(rt); }
@@ -9557,6 +9977,15 @@ impl AppWindow {
                     return self.fail(format!("app.language language is \"en\" or \"zh-CN\", not {raw:?}"));
                 };
                 self.write_person(|p| p.language = lang, window, cx);
+            }
+            "app.shell" => {
+                let raw = Self::arg(a, "shell").unwrap_or_default().trim();
+                let next = if raw.is_empty() || raw.eq_ignore_ascii_case("auto") || (cfg!(windows) && raw.eq_ignore_ascii_case("wsl")) {
+                    None
+                } else {
+                    Some(raw.to_owned())
+                };
+                self.write_person(|p| p.shell = next, window, cx);
             }
             "app.zoom_in" | "app.zoom_out" | "app.zoom_reset" => {
                 let zoom = settings::next_zoom(match name {
@@ -12726,6 +13155,64 @@ mod tests {
         assert!(super::launch_failure(&serde_json::Value::Null, String::new).is_none());
     }
 
+    #[test]
+    fn acp_launch_failure_notifies_user_when_login_is_required() {
+        let cursor_rec = serde_json::json!({
+            "agent": "cursor",
+            "reason": "spawn_failed",
+            "cwd": r"D:\Users\zhihao.zou",
+        });
+        let auth_err = "ACP session/new failed: Authentication required: Authentication required. Please run 'agent login' first, then call authenticate() with methodId 'cursor_login'. (code -32000)";
+
+        let zh = super::acp_launch_failure_toast_spec(&cursor_rec, Some(auth_err), true, false);
+        assert_eq!(zh["notification"]["title"], "Cursor 需要先登录");
+        assert_eq!(zh["notification"]["level"], "warning");
+        assert!(zh["notification"]["body"].as_str().unwrap().contains("cursor-agent login"));
+        assert_eq!(zh["notification"]["actionLabel"], "打开终端登录");
+        assert_eq!(zh["notification"]["buttonAction"]["name"], "tab.new");
+        assert_eq!(zh["notification"]["buttonAction"]["args"]["argv"], serde_json::json!(["cursor-agent", "login"]));
+        assert_eq!(zh["notification"]["buttonAction"]["args"]["folder"], r"D:\Users\zhihao.zou");
+
+        let en = super::acp_launch_failure_toast_spec(&cursor_rec, Some(auth_err), false, false);
+        assert_eq!(en["notification"]["title"], "Cursor login required");
+        assert_eq!(en["notification"]["actionLabel"], "Sign in");
+
+        let remote = super::acp_launch_failure_toast_spec(&cursor_rec, Some(auth_err), true, true);
+        assert!(remote["notification"].get("buttonAction").is_none());
+
+        let generic = super::acp_launch_failure_toast_spec(
+            &serde_json::json!({"agent": "codex", "reason": "spawn_failed"}),
+            Some("ACP handshake timed out after 90s"),
+            true,
+            false,
+        );
+        assert_eq!(generic["notification"]["title"], "Codex ACP 启动失败");
+        assert_eq!(generic["notification"]["level"], "error");
+        assert!(generic["notification"]["body"].as_str().unwrap().contains("timed out"));
+
+        let read = serde_json::json!({
+            "entries": [
+                { "kind": "error", "turn": 0, "message": auth_err }
+            ]
+        });
+        assert_eq!(super::extract_acp_error_message(&read).as_deref(), Some(auth_err));
+
+        let claude_rec = serde_json::json!({
+            "agent": "claude",
+            "reason": "spawn_failed",
+            "cwd": r"D:\Users\zhihao.zou",
+        });
+        let claude_onboarding_err = "Authentication required: Claude CLI onboarding is incomplete. Please run 'claude' in a terminal to choose a theme and sign in first.";
+        let claude_zh = super::acp_launch_failure_toast_spec(&claude_rec, Some(claude_onboarding_err), true, false);
+        assert_eq!(claude_zh["notification"]["title"], "Claude 需要先在 CLI 中完成登录");
+        assert!(claude_zh["notification"]["body"].as_str().unwrap().contains("选择主题并完成登录"));
+        assert_eq!(claude_zh["notification"]["actionLabel"], "打开 Claude CLI");
+        assert_eq!(claude_zh["notification"]["buttonAction"]["args"]["argv"], serde_json::json!(["claude"]));
+        let claude_en = super::acp_launch_failure_toast_spec(&claude_rec, Some(claude_onboarding_err), false, false);
+        assert_eq!(claude_en["notification"]["title"], "Claude CLI setup & login required");
+        assert_eq!(claude_en["notification"]["actionLabel"], "Open Claude CLI");
+    }
+
     /// The split wrapper's own "cannot start" comes after the person's shell config, so a
     /// slow config can't hide it. Its program's own exits keep the 2 s rule, even an exit 127
     /// that prints the same words: only the wrapper knows its launch token.
@@ -14446,6 +14933,38 @@ export default class SystemToast extends View {
 
         let wsl = super::resolve_windows_shell_argv_with("wsl", None, None, None, None, None);
         assert_eq!(wsl, None);
+
+        let cli = vec!["claude".to_owned(), "--dangerously-skip-permissions".to_owned(), "fix bug".to_owned()];
+
+        let auto_cli = super::wrap_windows_command_with("auto", cli.clone(), true, Some(&path_joined), Some(pf_str), None, None, None);
+        assert_eq!(auto_cli[0], pwsh_dir.join("pwsh.exe").to_string_lossy());
+        assert_eq!(&auto_cli[1..5], ["-ExecutionPolicy", "Bypass", "-NoExit", "-Command"]);
+        assert_eq!(super::AppWindow::unwrap_shell_agent_argv(auto_cli), cli);
+
+        let ps_cli = super::wrap_windows_command_with("powershell", cli.clone(), true, Some(&path_joined), Some(pf_str), None, None, None);
+        assert_eq!(ps_cli[0], "powershell.exe");
+        assert_eq!(&ps_cli[1..5], ["-ExecutionPolicy", "Bypass", "-NoExit", "-Command"]);
+        assert_eq!(super::AppWindow::unwrap_shell_agent_argv(ps_cli), cli);
+
+        let ps_split = super::wrap_windows_command_with("powershell", cli.clone(), false, Some(&path_joined), Some(pf_str), None, None, None);
+        assert_eq!(ps_split[0], "powershell.exe");
+        assert_eq!(&ps_split[1..4], ["-ExecutionPolicy", "Bypass", "-Command"]);
+
+        let gb_cli = super::wrap_windows_command_with("git-bash", cli.clone(), true, Some(&path_joined), Some(pf_str), None, None, None);
+        assert_eq!(gb_cli[0], git_bash.to_string_lossy());
+        assert_eq!(gb_cli[1], "-lic");
+        assert_eq!(gb_cli[2], "\"$@\"; exec \"$0\" -li");
+        assert_eq!(gb_cli[3], git_bash.to_string_lossy());
+        assert_eq!(&gb_cli[4..], cli.as_slice());
+        assert_eq!(super::AppWindow::unwrap_shell_agent_argv(gb_cli), cli);
+
+        let cmd_cli = super::wrap_windows_command_with("cmd", cli.clone(), true, None, None, None, None, Some("C:\\Windows\\System32\\cmd.exe"));
+        assert_eq!(&cmd_cli[..4], ["C:\\Windows\\System32\\cmd.exe", "/d", "/s", "/k"]);
+        assert_eq!(super::AppWindow::unwrap_shell_agent_argv(cmd_cli), cli);
+
+        let cmd_split = super::wrap_windows_command_with("cmd", cli.clone(), false, None, None, None, None, Some("C:\\Windows\\System32\\cmd.exe"));
+        assert_eq!(&cmd_split[..4], ["C:\\Windows\\System32\\cmd.exe", "/d", "/s", "/c"]);
+        assert_eq!(super::AppWindow::unwrap_shell_agent_argv(cmd_split), cli);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

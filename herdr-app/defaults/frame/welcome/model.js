@@ -12,7 +12,7 @@ export const DEEPSEEK_PRESET = {
 
 export const AI_PROVIDERS = [
   { id: "deepseek", en: "DeepSeek Official", zh: "DeepSeek 官方" },
-  { id: "custom", en: "Custom OpenAI-compatible", zh: "自定义 OpenAI 格式" },
+  { id: "custom", en: "Custom (OpenAI / Claude)", zh: "自定义（OpenAI / Claude）" },
 ];
 
 export const AI_PAGE = 3;
@@ -207,6 +207,7 @@ export function summarizeAiStatus(rawStdout) {
     const availableModels = Array.isArray(parsed.availableModels)
       ? parsed.availableModels.map((m) => String(m ?? "").trim()).filter(Boolean)
       : [];
+    const protocol = typeof parsed.protocol === "string" && parsed.protocol.trim() ? parsed.protocol.trim() : null;
     return {
       configured: Boolean(parsed.configured),
       enabled: parsed.enabled !== false,
@@ -214,6 +215,7 @@ export function summarizeAiStatus(rawStdout) {
       baseUrl: typeof parsed.baseUrl === "string" ? parsed.baseUrl.trim() : "",
       keyMasked: typeof parsed.keyMasked === "string" && parsed.keyMasked.trim() ? parsed.keyMasked.trim() : null,
       availableModels,
+      ...(protocol ? { protocol } : {}),
     };
   } catch {
     return null;

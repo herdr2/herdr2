@@ -15,7 +15,6 @@ use crate::runtime::Core;
 use crate::transcript::Entry;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1165,17 +1164,17 @@ const DIFF_CACHE_EXCLUDES: [&str; 6] = [
 ];
 
 fn capture_candidate_patch(work_cwd: &str, baseline: &super::roles::DirtyBaseline) -> String {
-    if Command::new("git")
+    if super::bg_std_command("git")
         .args(["-C", work_cwd, "rev-parse", "--is-inside-work-tree"])
         .output()
         .is_ok_and(|o| o.status.success())
     {
-        let mut add_cmd = Command::new("git");
+        let mut add_cmd = super::bg_std_command("git");
         add_cmd.args(["-C", work_cwd, "add", "-N", "--", "."]);
         add_cmd.args(DIFF_CACHE_EXCLUDES);
         let _ = add_cmd.output();
 
-        let mut diff_cmd = Command::new("git");
+        let mut diff_cmd = super::bg_std_command("git");
         diff_cmd.args(["-C", work_cwd, "diff", "HEAD", "--", "."]);
         diff_cmd.args(DIFF_CACHE_EXCLUDES);
         if let Ok(out) = diff_cmd.output()
@@ -1196,20 +1195,20 @@ fn capture_candidate_patch(work_cwd: &str, baseline: &super::roles::DirtyBaselin
 }
 
 fn git_tree_sha(work_cwd: &str) -> Option<String> {
-    let git_dir_out = Command::new("git").args(["-C", work_cwd, "rev-parse", "--git-dir"]).output().ok()?;
+    let git_dir_out = super::bg_std_command("git").args(["-C", work_cwd, "rev-parse", "--git-dir"]).output().ok()?;
     if !git_dir_out.status.success() {
         return None;
     }
     let idx_path = std::env::temp_dir().join(format!("drove-idx-{}", super::crypto::rand_id("t")));
     let _ = std::fs::remove_file(&idx_path);
     let idx_str = idx_path.display().to_string();
-    let _ = Command::new("git").args(["-C", work_cwd, "read-tree", "HEAD"]).env("GIT_INDEX_FILE", &idx_str).output();
-    let mut add_cmd = Command::new("git");
+    let _ = super::bg_std_command("git").args(["-C", work_cwd, "read-tree", "HEAD"]).env("GIT_INDEX_FILE", &idx_str).output();
+    let mut add_cmd = super::bg_std_command("git");
     add_cmd.args(["-C", work_cwd, "add", "-A", "--", "."]);
     add_cmd.args(DIFF_CACHE_EXCLUDES);
     add_cmd.env("GIT_INDEX_FILE", &idx_str);
     let _ = add_cmd.output();
-    let out = Command::new("git").args(["-C", work_cwd, "write-tree"]).env("GIT_INDEX_FILE", &idx_str).output().ok();
+    let out = super::bg_std_command("git").args(["-C", work_cwd, "write-tree"]).env("GIT_INDEX_FILE", &idx_str).output().ok();
     let _ = std::fs::remove_file(&idx_path);
     out.filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
@@ -1217,7 +1216,7 @@ fn git_tree_sha(work_cwd: &str) -> Option<String> {
 }
 
 fn git_diff_trees(work_cwd: &str, a: &str, b: &str) -> Option<String> {
-    let mut diff_cmd = Command::new("git");
+    let mut diff_cmd = super::bg_std_command("git");
     diff_cmd.args(["-C", work_cwd, "diff", a, b, "--", "."]);
     diff_cmd.args(DIFF_CACHE_EXCLUDES);
     let out = diff_cmd.output().ok()?;
