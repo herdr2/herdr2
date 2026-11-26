@@ -18,7 +18,19 @@ pub fn command(program: impl AsRef<OsStr>) -> Command {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
+
+    fn collect_rs_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs_files(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
 
     /// Guard against introducing raw `Command::new(...)` calls in Windows-reachable
     /// app production code without going through `crate::spawn::command(...)`.
@@ -34,14 +46,12 @@ mod tests {
             "macos_check.rs",
             "update.rs",
         ];
+        let mut files = Vec::new();
+        collect_rs_files(&src, &mut files);
         let mut offenders = Vec::new();
-        for entry in std::fs::read_dir(&src).unwrap().flatten() {
-            let path = entry.path();
-            if path.extension().is_none_or(|e| e != "rs") {
-                continue;
-            }
-            let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            if allowlisted.contains(&name.as_str()) {
+        for path in files {
+            let rel = path.strip_prefix(&src).unwrap().to_string_lossy().replace('\\', "/");
+            if rel.ends_with("_tests.rs") || rel.ends_with("/tests.rs") || allowlisted.contains(&rel.as_str()) {
                 continue;
             }
             let text = std::fs::read_to_string(&path).unwrap();
@@ -54,7 +64,7 @@ mod tests {
                 .unwrap_or(&text);
             for (idx, line) in prod.lines().enumerate() {
                 if line.contains("Command::new(") {
-                    offenders.push(format!("{name}:{}: {}", idx + 1, line.trim()));
+                    offenders.push(format!("{rel}:{}: {}", idx + 1, line.trim()));
                 }
             }
         }

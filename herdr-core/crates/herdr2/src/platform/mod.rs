@@ -396,6 +396,19 @@ pub(crate) fn strip_agy_wrapper_env(
     }
 }
 
+/// Suppresses child-process auto-updaters known to spawn detached console windows on Windows
+/// without `CREATE_NO_WINDOW` (which visibly flash a Windows Terminal / conhost window every
+/// ~15 minutes during background probes, ACP runs, or interactive sessions).
+///
+/// Respects any value explicitly configured by the user (case-insensitive).
+#[allow(dead_code)]
+pub(crate) fn suppress_windows_console_flash_env(env: &mut std::collections::BTreeMap<String, String>) {
+    const KEY: &str = "AGY_CLI_DISABLE_AUTO_UPDATE";
+    if !env.keys().any(|k| k.eq_ignore_ascii_case(KEY)) {
+        env.insert(KEY.into(), "true".into());
+    }
+}
+
 /// The core's environment as programs get it: never an ssh login's marks,
 /// and on Linux the login session as the user manager has it now.
 pub async fn program_env() -> std::collections::BTreeMap<String, String> {
@@ -430,7 +443,10 @@ pub async fn program_env() -> std::collections::BTreeMap<String, String> {
     #[cfg(unix)]
     augment_user_path_env(&mut env);
     #[cfg(windows)]
-    augment_windows_user_path_env(&mut env);
+    {
+        augment_windows_user_path_env(&mut env);
+        suppress_windows_console_flash_env(&mut env);
+    }
     env
 }
 
@@ -720,6 +736,31 @@ mod no_window_audit {
             offenders.is_empty(),
             "Found raw Command::new(...) in production core code; use crate::platform::bg_command / bg_tokio_command so Windows does not flash console windows:\n{}",
             offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn windows_console_flash_env_disables_agy_auto_update_unless_overridden() {
+        let mut env = std::collections::BTreeMap::new();
+        super::suppress_windows_console_flash_env(&mut env);
+        assert_eq!(env.get("AGY_CLI_DISABLE_AUTO_UPDATE").map(String::as_str), Some("true"));
+
+        // Explicit user override (even in different case on Windows) must be preserved.
+        let mut custom = std::collections::BTreeMap::new();
+        custom.insert("agy_cli_disable_auto_update".into(), "false".into());
+        super::suppress_windows_console_flash_env(&mut custom);
+        assert_eq!(custom.len(), 1);
+        assert_eq!(custom.get("agy_cli_disable_auto_update").map(String::as_str), Some("false"));
+    }
+
+    #[test]
+    fn windows_browser_launch_does_not_use_cmd_start() {
+        let drove = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/drove/mod.rs");
+        let text = std::fs::read_to_string(&drove).unwrap();
+        let prod = text.split("#[cfg(test)]").next().unwrap_or(&text);
+        assert!(
+            !prod.contains(r#"["/C", "start""#) && !prod.contains(r#"["/c", "start""#),
+            "drove/mod.rs must use ShellExecuteW instead of `cmd /C start` on Windows so no terminal flashes"
         );
     }
 }

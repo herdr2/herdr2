@@ -1046,29 +1046,53 @@ fn launch_browser(url: &str) -> io::Result<()> {
     if !url.starts_with("http://127.0.0.1:") {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "refusing non-localhost browser URL"));
     }
-    #[cfg(target_os = "macos")]
-    let mut cmd = {
-        let mut c = bg_std_command("open");
-        c.arg(url);
-        c
-    };
     #[cfg(target_os = "windows")]
-    let mut cmd = {
-        let mut c = bg_std_command("cmd");
-        c.args(["/C", "start", "", url]);
-        c
-    };
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let mut cmd = {
-        let mut c = bg_std_command("xdg-open");
-        c.arg(url);
-        c
-    };
-    cmd.stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    Ok(())
+    {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+        let mut wide: Vec<u16> = OsStr::new(url).encode_wide().collect();
+        if wide.contains(&0) {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "URL contains NUL"));
+        }
+        wide.push(0);
+        // Use ShellExecuteW directly instead of `cmd /C start "" <url>` so Windows 11 never
+        // flashes a transient Windows Terminal / conhost window.
+        let result = unsafe {
+            ShellExecuteW(
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                wide.as_ptr(),
+                std::ptr::null(),
+                std::ptr::null(),
+                SW_SHOWNORMAL,
+            )
+        } as isize;
+        if result <= 32 {
+            return Err(io::Error::other(format!("ShellExecuteW failed with code {result}")));
+        }
+        return Ok(());
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        #[cfg(target_os = "macos")]
+        let mut cmd = {
+            let mut c = bg_std_command("open");
+            c.arg(url);
+            c
+        };
+        #[cfg(all(unix, not(target_os = "macos")))]
+        let mut cmd = {
+            let mut c = bg_std_command("xdg-open");
+            c.arg(url);
+            c
+        };
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

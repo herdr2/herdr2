@@ -1261,6 +1261,9 @@ pub fn agent_command(
         .stderr(Stdio::piped())
         .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .kill_on_drop(true);
+    if !env.keys().any(|k| k.eq_ignore_ascii_case("AGY_CLI_DISABLE_AUTO_UPDATE")) {
+        cmd.env("AGY_CLI_DISABLE_AUTO_UPDATE", "true");
+    }
     Ok(cmd)
 }
 
