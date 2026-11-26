@@ -6,6 +6,7 @@ Subcommands:
             no-restart OTA UI bundle + ui/latest.json.
   manifest  Generate app/latest.json and/or core/latest.json from packaged
             archives under <dir>/{app,core}/<version>/.
+  notes     Generate GitHub Release notes (with changelog) and OTA summary.
   serve     Run a local HTTP server over <dir> for end-to-end upgrade testing.
 """
 from __future__ import annotations
@@ -22,6 +23,7 @@ import pathlib
 import re
 import shutil
 import socketserver
+import subprocess
 import sys
 import tarfile
 import time
@@ -495,6 +497,312 @@ def write_binary_manifests(
     return written
 
 
+_SEMVER_TAG_RE = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:-(.+))?$")
+_CONVENTIONAL_RE = re.compile(r"^([a-zA-Z]+)(?:\(([^)]+)\))?(!)?:\s*(.+)$")
+_TRIVIAL_RELEASE_SUBJECT_RE = re.compile(
+    r"^(?:chore|build|ci)(?:\(release\))?:\s*(?:release|bump(?:\s+version)?(?:\s+to)?)\s+v?\d+\.\d+\.\d+.*$",
+    re.IGNORECASE,
+)
+
+_COMMIT_CATEGORIES: list[tuple[str, tuple[str, ...]]] = [
+    ("Features", ("feat",)),
+    ("Bug Fixes", ("fix",)),
+    ("Performance", ("perf",)),
+    ("Refactoring", ("refactor",)),
+    ("Documentation", ("docs",)),
+    ("Other Changes", ()),
+]
+
+
+def _run_git(repo_root: pathlib.Path, args: list[str]) -> str | None:
+    try:
+        proc = subprocess.run(
+            ["git", *args],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return proc.stdout
+
+
+def _parse_semver_key(tag: str) -> tuple[int, int, int, int, str] | None:
+    m = _SEMVER_TAG_RE.match(tag.strip())
+    if not m:
+        return None
+    major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    pre = m.group(4)
+    # Stable release (pre is None) sorts higher than prerelease of same tuple.
+    return (major, minor, patch, 1 if pre is None else 0, pre or "")
+
+
+def extract_changelog_section(changelog_path: pathlib.Path, version: str) -> str | None:
+    """Extract the markdown body for `## vX.Y.Z` / `## [X.Y.Z]` from CHANGELOG.md."""
+    if not changelog_path.is_file():
+        return None
+    ver = version.strip().lstrip("v")
+    if not ver:
+        return None
+    heading_re = re.compile(
+        rf"^##\s+\[?v?{re.escape(ver)}\]?(?:\s*(?:[-–—(].*)?)?$",
+        re.IGNORECASE,
+    )
+    lines = changelog_path.read_text(encoding="utf-8").splitlines()
+    start_idx: int | None = None
+    for idx, line in enumerate(lines):
+        if heading_re.match(line.strip()):
+            start_idx = idx + 1
+            break
+    if start_idx is None:
+        return None
+    body_lines: list[str] = []
+    for line in lines[start_idx:]:
+        if re.match(r"^##\s+", line):
+            break
+        body_lines.append(line)
+    body = "\n".join(body_lines).strip()
+    return body or None
+
+
+def extract_tag_annotation(repo_root: pathlib.Path, tag: str) -> str | None:
+    """Return detailed annotated tag message if it carries release notes beyond a generic title."""
+    out = _run_git(repo_root, ["tag", "-l", "--format=%(contents)", tag])
+    if out is None:
+        return None
+    text = out.strip()
+    if not text:
+        return None
+    ver = tag.strip().lstrip("v")
+    lines = [ln.rstrip() for ln in text.splitlines()]
+    first = lines[0].strip()
+    generic_first = re.fullmatch(
+        rf"(?:herdr2\s+)?(?:release\s+)?v?{re.escape(ver)}",
+        first,
+        re.IGNORECASE,
+    )
+    if len(lines) == 1 and generic_first:
+        return None
+    if generic_first:
+        rest = "\n".join(lines[1:]).strip()
+        return rest or None
+    return text
+
+
+def find_previous_release_tag(
+    repo_root: pathlib.Path,
+    current_tag: str,
+    current_ref: str | None = None,
+) -> str | None:
+    """Find the most recent semver release tag strictly before `current_tag`."""
+    ref = current_ref or current_tag
+    if _run_git(repo_root, ["rev-parse", "--verify", f"{ref}^{{commit}}"]) is None:
+        ref = "HEAD"
+
+    # Prefer direct ancestry first so branch history stays accurate.
+    parent_exists = _run_git(repo_root, ["rev-parse", "--verify", f"{ref}^"]) is not None
+    if parent_exists:
+        described = _run_git(
+            repo_root,
+            ["describe", "--tags", "--abbrev=0", "--match", "v[0-9]*", f"{ref}^"],
+        )
+        if described:
+            cand = described.strip()
+            if cand and cand != current_tag:
+                return cand
+
+    # Fallback: pick the highest semver tag strictly lower than current_tag.
+    raw_tags = _run_git(repo_root, ["tag", "-l", "v[0-9]*"])
+    if not raw_tags:
+        return None
+    cur_key = _parse_semver_key(current_tag)
+    candidates: list[tuple[tuple[int, int, int, int, str], str]] = []
+    for raw in raw_tags.splitlines():
+        t = raw.strip()
+        if not t or t == current_tag:
+            continue
+        k = _parse_semver_key(t)
+        if k is None:
+            continue
+        if cur_key is None or k < cur_key:
+            candidates.append((k, t))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    return candidates[0][1]
+
+
+def collect_git_changelog(
+    repo_root: pathlib.Path,
+    current_ref: str,
+    prev_tag: str | None,
+) -> str:
+    """Build categorized markdown bullet points from git commits in prev_tag..current_ref."""
+    ref = current_ref
+    if _run_git(repo_root, ["rev-parse", "--verify", f"{ref}^{{commit}}"]) is None:
+        ref = "HEAD"
+    rev_args = [f"{prev_tag}..{ref}"] if prev_tag else ["-n", "20", ref]
+    raw = _run_git(
+        repo_root,
+        ["log", "--no-merges", "--format=%H%x1f%s%x1f%b%x1e", *rev_args],
+    )
+    if not raw or not raw.strip():
+        return ""
+
+    commits: list[tuple[str, str, str]] = []
+    for record in raw.split("\x1e"):
+        record = record.strip()
+        if not record:
+            continue
+        parts = record.split("\x1f", 2)
+        if len(parts) < 2:
+            continue
+        sha = parts[0].strip()
+        subject = parts[1].strip()
+        body = parts[2].strip() if len(parts) > 2 else ""
+        if sha and subject:
+            commits.append((sha, subject, body))
+
+    if not commits:
+        return ""
+
+    non_trivial = [c for c in commits if not _TRIVIAL_RELEASE_SUBJECT_RE.match(c[1])]
+    selected = non_trivial if non_trivial else commits
+
+    buckets: dict[str, list[str]] = {label: [] for label, _ in _COMMIT_CATEGORIES}
+    for sha, subject, body in selected:
+        short_sha = sha[:7]
+        m = _CONVENTIONAL_RE.match(subject)
+        category = "Other Changes"
+        entry = f"- {subject} (`{short_sha}`)"
+        if m:
+            ctype = m.group(1).lower()
+            scope = m.group(2)
+            breaking = bool(m.group(3))
+            desc = m.group(4).strip()
+            for label, prefixes in _COMMIT_CATEGORIES:
+                if ctype in prefixes:
+                    category = label
+                    break
+            prefix = f"**{scope}**: " if scope else ""
+            if breaking:
+                prefix = f"**BREAKING** {prefix}"
+            entry = f"- {prefix}{desc} (`{short_sha}`)"
+
+        # If this release consists of a single squashed commit whose body has bullets,
+        # surface those details beneath the headline so users still see every change.
+        if len(selected) == 1 and body:
+            body_bullets = [
+                ln.strip()
+                for ln in body.splitlines()
+                if re.match(r"^[-*]\s+\S", ln.strip())
+            ]
+            if body_bullets:
+                entry = entry + "\n" + "\n".join(f"  {b}" for b in body_bullets)
+
+        buckets[category].append(entry)
+
+    sections: list[str] = []
+    non_empty_cats = [label for label, _ in _COMMIT_CATEGORIES if buckets[label]]
+    if len(non_empty_cats) == 1 and non_empty_cats[0] == "Other Changes":
+        return "\n".join(buckets["Other Changes"])
+
+    for label in non_empty_cats:
+        sections.append(f"#### {label}\n" + "\n".join(buckets[label]))
+    return "\n\n".join(sections)
+
+
+def summarize_changes_for_ota(changes_md: str, fallback: str, max_items: int = 3, max_chars: int = 240) -> str:
+    """Create a concise plain-text summary suitable for OTA manifest `notes`."""
+    if not changes_md.strip():
+        return fallback
+    items: list[str] = []
+    for raw_line in changes_md.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line.lower().startswith("**full changelog**"):
+            continue
+        if re.match(r"^[-*]\s+", line):
+            clean = re.sub(r"^[-*]\s+", "", line)
+            clean = re.sub(r"\s*\(`[0-9a-f]{7,40}`\)$", "", clean)
+            clean = re.sub(r"\*\*([^*]+)\*\*", r"\1", clean)
+            clean = re.sub(r"`([^`]+)`", r"\1", clean)
+            clean = clean.strip()
+            if clean:
+                items.append(clean)
+        elif not items:
+            clean = re.sub(r"\*\*([^*]+)\*\*", r"\1", line)
+            clean = re.sub(r"`([^`]+)`", r"\1", clean).strip()
+            if clean:
+                items.append(clean)
+        if len(items) >= max_items:
+            break
+    if not items:
+        return fallback
+    summary = "; ".join(items)
+    if len(summary) > max_chars:
+        summary = summary[: max_chars - 1].rstrip(" ;,.") + "…"
+    return summary
+
+
+def build_github_release_notes(
+    tag: str,
+    version: str,
+    repo: str,
+    repo_root: pathlib.Path = REPO_ROOT,
+    changelog_path: pathlib.Path | None = None,
+    prev_tag: str | None = None,
+    current_ref: str | None = None,
+) -> tuple[str, str]:
+    """Build full GitHub Release Markdown notes and a concise OTA notes summary.
+
+    Change list resolution priority:
+      1. Curated section in CHANGELOG.md matching `version` / `tag`.
+      2. Detailed annotated git tag body on `tag`.
+      3. Categorized git commits between `prev_tag` and `current_ref` (or `tag`).
+    """
+    ver = version.strip().lstrip("v")
+    cl_path = changelog_path if changelog_path is not None else (repo_root / "CHANGELOG.md")
+    resolved_prev = prev_tag if prev_tag is not None else find_previous_release_tag(repo_root, tag, current_ref)
+
+    changes_md = extract_changelog_section(cl_path, ver)
+    if not changes_md:
+        changes_md = extract_tag_annotation(repo_root, tag)
+    if not changes_md:
+        changes_md = collect_git_changelog(repo_root, current_ref or tag, resolved_prev)
+
+    ota_summary = summarize_changes_for_ota(changes_md or "", fallback=f"Herdr2 {tag}")
+
+    parts: list[str] = [f"## Herdr2 {tag}"]
+    if changes_md:
+        changes_block = changes_md.strip()
+        if resolved_prev and "full changelog" not in changes_block.lower():
+            changes_block += f"\n\n**Full Changelog**: https://github.com/{repo}/compare/{resolved_prev}...{tag}"
+        parts.append(f"### What's Changed\n\n{changes_block}")
+    elif resolved_prev:
+        parts.append(
+            f"### What's Changed\n\n**Full Changelog**: https://github.com/{repo}/compare/{resolved_prev}...{tag}"
+        )
+
+    installers = f"""### Direct Download Installers (includes Desktop App + `h2` Core)
+- **Windows (x64)**: `Herdr2-Setup-{ver}-windows-x86_64.exe` — double-click to install App + `h2` CLI
+- **macOS (Apple Silicon)**: `Herdr2-{ver}-macos-aarch64.dmg` — open and drag `Herdr2.app` to Applications
+- **macOS (Intel)**: `Herdr2-{ver}-macos-x86_64.dmg` — open and drag `Herdr2.app` to Applications
+- **Linux (Ubuntu/Debian)**: `herdr2_{ver}_amd64.deb` — run `sudo apt install ./herdr2_{ver}_amd64.deb`
+- **Linux (Generic x64)**: `herdr2-{ver}-linux-x86_64.tar.gz` — extract and run `./install.sh`
+
+### Install via Your AI Agent
+Give your agent the install skill:
+`https://raw.githubusercontent.com/{repo}/main/skills/herdr2-install/SKILL.md`
+
+### Install Companion Skills After Setup
+```sh
+h2 skill install --all
+```"""
+    parts.append(installers)
+    return "\n\n".join(parts) + "\n", ota_summary
+
+
 def serve_dir(directory: pathlib.Path, host: str, port: int) -> None:
     directory.mkdir(parents=True, exist_ok=True)
     handler = functools.partial(http.server.SimpleHTTPRequestHandler, directory=str(directory))
@@ -544,6 +852,17 @@ def main(argv: list[str] | None = None) -> int:
     p_sync.add_argument("--no-receipt", action="store_true", help="Do not write/update ui-bundle.json active override receipt")
     p_sync.add_argument("--app-version", default=None, help="Override app_version written into ui-bundle.json")
 
+    p_notes = sub.add_parser("notes", help="Generate GitHub Release notes (with changelog) and concise OTA summary")
+    p_notes.add_argument("--tag", required=True, help="Release tag, e.g. v2.0.11")
+    p_notes.add_argument("--version", default=None, help="Semver version (default: tag without leading v)")
+    p_notes.add_argument("--repo", default="herdr2/herdr2", help="GitHub owner/repo slug")
+    p_notes.add_argument("--repo-root", type=pathlib.Path, default=REPO_ROOT, help="Git repository root")
+    p_notes.add_argument("--changelog", type=pathlib.Path, default=None, help="Optional CHANGELOG.md path")
+    p_notes.add_argument("--prev-tag", default=None, help="Override previous release tag")
+    p_notes.add_argument("--ref", default=None, help="Override git ref for commit log (defaults to --tag or HEAD)")
+    p_notes.add_argument("--out", type=pathlib.Path, default=None, help="Write full GitHub Release notes Markdown to file")
+    p_notes.add_argument("--ota-summary-out", type=pathlib.Path, default=None, help="Write concise OTA notes summary to file")
+
     args = parser.parse_args(argv)
     if args.cmd == "ui":
         app_min = args.app_min or read_app_version()
@@ -589,6 +908,27 @@ def main(argv: list[str] | None = None) -> int:
             app_version=args.app_version,
         )
         print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0
+
+    if args.cmd == "notes":
+        ver = args.version or args.tag.lstrip("v")
+        full_notes, ota_summary = build_github_release_notes(
+            tag=args.tag,
+            version=ver,
+            repo=args.repo,
+            repo_root=args.repo_root,
+            changelog_path=args.changelog,
+            prev_tag=args.prev_tag,
+            current_ref=args.ref,
+        )
+        if args.out is not None:
+            args.out.parent.mkdir(parents=True, exist_ok=True)
+            args.out.write_text(full_notes, encoding="utf-8")
+        else:
+            sys.stdout.write(full_notes)
+        if args.ota_summary_out is not None:
+            args.ota_summary_out.parent.mkdir(parents=True, exist_ok=True)
+            args.ota_summary_out.write_text(ota_summary + "\n", encoding="utf-8")
         return 0
 
     return 1

@@ -1,5 +1,6 @@
 import json
 import pathlib
+import subprocess
 import tarfile
 import tempfile
 import unittest
@@ -201,6 +202,131 @@ class ReleaseScriptTests(unittest.TestCase):
             self.assertTrue((out / "core-0.2.0-manifest.json").is_file())
             self.assertTrue((out / "app-install.sh").is_file())
             self.assertTrue((out / "core-install.ps1").is_file())
+
+    def _init_git_repo(self, root: pathlib.Path) -> None:
+        def git(*args: str) -> None:
+            subprocess.run(["git", *args], cwd=str(root), check=True, capture_output=True, text=True)
+
+        git("init", "-b", "main")
+        git("config", "user.name", "Test User")
+        git("config", "user.email", "test@example.com")
+        (root / "README.md").write_text("init\n", encoding="utf-8")
+        git("add", "README.md")
+        git("commit", "-m", "chore: initial commit")
+        git("tag", "-a", "v2.0.8", "-m", "Herdr2 v2.0.8")
+
+    def test_release_notes_from_git_commits_and_fallback_priority(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            self._init_git_repo(root)
+
+            def git(*args: str) -> None:
+                subprocess.run(["git", *args], cwd=str(root), check=True, capture_output=True, text=True)
+
+            (root / "a.txt").write_text("a\n", encoding="utf-8")
+            git("add", "a.txt")
+            git("commit", "-m", "feat(ai): support Anthropic/OpenAI protocol auto-detection")
+
+            (root / "b.txt").write_text("b\n", encoding="utf-8")
+            git("add", "b.txt")
+            git("commit", "-m", "fix(win): avoid curl revocation check failure")
+
+            (root / "ver.txt").write_text("2.0.9\n", encoding="utf-8")
+            git("add", "ver.txt")
+            git("commit", "-m", "chore(release): release v2.0.9")
+            git("tag", "-a", "v2.0.9", "-m", "Herdr2 v2.0.9")
+
+            # Priority 3: no CHANGELOG.md and generic tag annotation -> categorized git commits
+            notes_md, ota_summary = release.build_github_release_notes(
+                tag="v2.0.9",
+                version="2.0.9",
+                repo="herdr2/herdr2",
+                repo_root=root,
+            )
+            self.assertIn("### What's Changed", notes_md)
+            self.assertIn("#### Features", notes_md)
+            self.assertIn("**ai**: support Anthropic/OpenAI protocol auto-detection", notes_md)
+            self.assertIn("#### Bug Fixes", notes_md)
+            self.assertIn("**win**: avoid curl revocation check failure", notes_md)
+            self.assertNotIn("chore(release): release v2.0.9", notes_md)
+            self.assertIn("https://github.com/herdr2/herdr2/compare/v2.0.8...v2.0.9", notes_md)
+            self.assertIn("Herdr2-Setup-2.0.9-windows-x86_64.exe", notes_md)
+            self.assertIn("ai: support Anthropic/OpenAI protocol auto-detection", ota_summary)
+
+            # Priority 2: detailed annotated tag body overrides raw commit log
+            git("tag", "-f", "-a", "v2.0.9", "-m", "Herdr2 v2.0.9\n\n- Highlight 1 from tag\n- Highlight 2 from tag")
+            tag_notes, tag_ota = release.build_github_release_notes(
+                tag="v2.0.9",
+                version="2.0.9",
+                repo="herdr2/herdr2",
+                repo_root=root,
+            )
+            self.assertIn("- Highlight 1 from tag", tag_notes)
+            self.assertIn("Highlight 1 from tag; Highlight 2 from tag", tag_ota)
+
+            # Priority 1: CHANGELOG.md entry overrides both tag body and git log
+            (root / "CHANGELOG.md").write_text(
+                "# Changelog\n\n"
+                "## [v2.0.9] - 2026-11-26\n\n"
+                "- **AI**: Curated changelog highlight\n"
+                "- **Windows**: Fixed updater prompt\n\n"
+                "## v2.0.8\n\n"
+                "- Older release\n",
+                encoding="utf-8",
+            )
+            cl_notes, cl_ota = release.build_github_release_notes(
+                tag="v2.0.9",
+                version="2.0.9",
+                repo="herdr2/herdr2",
+                repo_root=root,
+            )
+            self.assertIn("- **AI**: Curated changelog highlight", cl_notes)
+            self.assertNotIn("Highlight 1 from tag", cl_notes)
+            self.assertNotIn("Older release", cl_notes)
+            self.assertIn("AI: Curated changelog highlight; Windows: Fixed updater prompt", cl_ota)
+
+    def test_release_notes_cli_and_single_squashed_commit_bullets(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = pathlib.Path(td)
+            self._init_git_repo(root)
+
+            def git(*args: str) -> None:
+                subprocess.run(["git", *args], cwd=str(root), check=True, capture_output=True, text=True)
+
+            (root / "c.txt").write_text("c\n", encoding="utf-8")
+            git("add", "c.txt")
+            git(
+                "commit",
+                "-m",
+                "feat(release): ship v2.0.9 improvements",
+                "-m",
+                "- Added slash commands\n- Fixed default shell selector",
+            )
+            git("tag", "-a", "v2.0.9", "-m", "Herdr2 v2.0.9")
+
+            out_md = root / "dist" / "notes.md"
+            out_ota = root / "dist" / "ota.txt"
+            rc = release.main([
+                "notes",
+                "--tag",
+                "v2.0.9",
+                "--version",
+                "2.0.9",
+                "--repo",
+                "herdr2/herdr2",
+                "--repo-root",
+                str(root),
+                "--out",
+                str(out_md),
+                "--ota-summary-out",
+                str(out_ota),
+            ])
+            self.assertEqual(rc, 0)
+            content = out_md.read_text(encoding="utf-8")
+            self.assertIn("ship v2.0.9 improvements", content)
+            self.assertIn("- Added slash commands", content)
+            self.assertIn("- Fixed default shell selector", content)
+            self.assertTrue(out_ota.read_text(encoding="utf-8").strip())
 
 
 if __name__ == "__main__":

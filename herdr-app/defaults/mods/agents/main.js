@@ -2,7 +2,7 @@
 
 import { View, div, image, svg } from "gpui-kit";
 import { v_flex, h_flex, InputState, Input, Popup } from "gpui-base";
-import { agents, terminals, panes, focused, spaces, run, h2, checking, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, notify, props, window, layout, settings, keys } from "herdr";
+import { agents, terminals, panes, focused, spaces, machines, run, h2, checking, theme, shared, setShared, setAgentOrder, openOverlay, closeOverlay, notify, props, window, layout, settings, keys } from "herdr";
 import { resolveSemanticLabel, resolveSubAgentLabel, buildHoverTooltip, buildLocalFallbackBriefing, mergeBriefingSnapshots } from "./briefing_model.js";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
@@ -38,6 +38,34 @@ function shortAgentId(addr) {
   const idx = s.lastIndexOf("/");
   return idx >= 0 ? s.slice(idx + 1) : s;
 }
+
+// Same space avatar palette as mods/spaces so workspace dots match across both sidebar lists.
+const SPACE_MARK = { ansi6: "#22a99a", ansi3: "#e3814f", ansi4: "#5b8def", ansi5: "#8b7cf6", ansi2: "#3fae6a", ansi1: "#d9649a" };
+
+function machineOf(a, spaceById) {
+  const sp = a?.space ? spaceById?.get(a.space) : null;
+  if (typeof sp?.machine === "string" && sp.machine.trim()) return sp.machine.trim();
+  if (typeof a?.machine === "string" && a.machine.trim()) return a.machine.trim();
+  if (typeof a?.space === "string") {
+    if (a.space.startsWith("headless:")) {
+      const mc = a.space.slice("headless:".length).trim();
+      return mc && mc !== "local" ? mc : null;
+    }
+    if (a.space.includes("/")) {
+      const mc = a.space.split("/")[0].trim();
+      if (mc) return mc;
+    }
+  }
+  if (typeof a?.address === "string" && a.address.includes("/")) {
+    const mc = a.address.split("/")[0].trim();
+    if (mc) return mc;
+  }
+  return null;
+}
+
+const deviceKeyOf = (m) => (m ? `remote:${m}` : "local");
+const deviceLabelOf = (m) => m ?? tr("This computer", "本机");
+const STATUS_BY_RANK = { 4: "blocked", 3: "done", 2: "working", 1: "idle" };
 
 function lineageBadgeInfo(rec) {
   const kind = String(rec?.lineage?.kind || "").toLowerCase();
@@ -1930,6 +1958,16 @@ export default class Agents extends View {
         return byAppearance(x, y);
       };
     };
+    const allSpaces = spaces();
+    const spaceById = new Map(allSpaces.map((s) => [s.id, s]));
+    const allMachines = typeof machines === "function" ? (machines() ?? []) : [];
+    const machineStatusByName = new Map(allMachines.map((m) => [m?.name ?? null, m?.layout]));
+    const rawSpaceColors = typeof shared === "function" ? shared("space.colors") : null;
+    const spaceColors = rawSpaceColors && typeof rawSpaceColors === "object" && !Array.isArray(rawSpaceColors) ? rawSpaceColors : {};
+    const hasRemote =
+      list.some((a) => machineOf(a, spaceById) !== null) ||
+      allSpaces.some((s) => (typeof s.machine === "string" && s.machine.trim().length > 0) || (typeof s.id === "string" && s.id.includes("/"))) ||
+      allMachines.some((m) => typeof m?.name === "string" && m.name.trim().length > 0);
     const pinned = list.filter((a) => a.pinned).sort(orderComparator("pinned"));
     let rest = list.filter((a) => !a.pinned);
     if (byPriority) {
@@ -1940,27 +1978,41 @@ export default class Agents extends View {
         return orderComparator(`sec-${rx}`)(x, y);
       });
     } else {
-      // Group by space in canonical spaces() order, keeping agents within each space in custom or appearance order (oldest first).
-      const spaceRank = new Map(spaces().map((s, idx) => [s.id, idx]));
-      const bySpace = new Map();
+      // Group by device (local first, then remote alphabetically) and by space in canonical spaces() order,
+      // keeping agents within each space in custom or appearance order (oldest first).
+      const spaceRank = new Map(allSpaces.map((s, idx) => [s.id, idx]));
+      const byDevice = new Map();
       for (const a of rest) {
+        const m = hasRemote ? machineOf(a, spaceById) : null;
+        if (!byDevice.has(m)) byDevice.set(m, new Map());
+        const bySpace = byDevice.get(m);
         if (!bySpace.has(a.space)) bySpace.set(a.space, []);
         bySpace.get(a.space).push(a);
       }
-      const orderedSpaceIds = [...bySpace.keys()].sort((a, b) => {
-        const ra = spaceRank.has(a) ? spaceRank.get(a) : Number.POSITIVE_INFINITY;
-        const rb = spaceRank.has(b) ? spaceRank.get(b) : Number.POSITIVE_INFINITY;
-        return ra - rb;
+      const orderedDevices = [...byDevice.keys()].sort((a, b) => {
+        if (a === b) return 0;
+        if (a === null) return -1;
+        if (b === null) return 1;
+        return a < b ? -1 : 1;
       });
       rest = [];
-      for (const spaceId of orderedSpaceIds) {
-        const members = bySpace.get(spaceId);
-        members.sort(orderComparator(`sp-${spaceId}`));
-        rest.push(...members);
+      for (const dev of orderedDevices) {
+        const bySpace = byDevice.get(dev);
+        const orderedSpaceIds = [...bySpace.keys()].sort((a, b) => {
+          const ra = spaceRank.has(a) ? spaceRank.get(a) : Number.POSITIVE_INFINITY;
+          const rb = spaceRank.has(b) ? spaceRank.get(b) : Number.POSITIVE_INFINITY;
+          return ra - rb;
+        });
+        for (const spaceId of orderedSpaceIds) {
+          const members = bySpace.get(spaceId);
+          members.sort(orderComparator(`sp-${spaceId}`));
+          rest.push(...members);
+        }
       }
     }
     list = [...pinned, ...rest];
     setAgentOrder(list.map((a) => a.address));
+    const listIndexOf = new Map(list.map((a, idx) => [a.address, idx]));
 
     const subsByAddr = new Map(list.map((a) => [a.address, collapsed ? [] : this.tree(all, a.address)]));
     const subCountOf = (a) => (this.folded.has(a.address) ? 0 : (subsByAddr.get(a.address)?.length ?? 0));
@@ -2007,7 +2059,7 @@ export default class Agents extends View {
     // agent's own title, never an automatic tab number unless two rows would
     // otherwise read the same.
     const leads = leadPanes(allPanes);
-    const tabs = new Map(spaces().flatMap(s => s.tabs).map(tab => [tab.id, tab]));
+    const tabs = new Map(allSpaces.flatMap(s => s.tabs ?? []).map(tab => [tab.id, tab]));
     const labels = new Map(list.map(a => {
       const rec = allByAddr.get(a.address);
       const tab = tabs.get(a.tab);
@@ -2032,7 +2084,7 @@ export default class Agents extends View {
       const rowTerm = all.find((x) => x.address === a.address);
       const isSideChat = String(rowTerm?.lineage?.kind || "").toLowerCase().replace("_", "-") === "side-chat";
       // An agent on another machine (`vps/t7`) says which.
-      const machine = a.address.includes("/") ? a.address.split("/")[0] : null;
+      const machine = machineOf(a, spaceById);
       if (collapsed) {
         return h_flex()
           .id(`ag-${a.address}`)
@@ -2350,7 +2402,27 @@ export default class Agents extends View {
             .text_color(t.dim)
             .child(a.acp ? "ACP" : "CLI"),
         )
-        .when(Boolean(machine), el => el.child(div().text_size(10).text_color(t.dim).child(machine)))
+        .when(full && hasRemote, (el) =>
+          el.child(
+            h_flex()
+              .id(isFloating ? `float-dev-${a.address}` : `dev-tag-${a.address}`)
+              .flex_none()
+              .px(4)
+              .py(1)
+              .gap(3)
+              .rounded(4)
+              .items_center()
+              .bg(t.raised)
+              .border_1()
+              .border_color(t.border)
+              .text_size(9.5)
+              .text_color(t.dim)
+              .when(!isFloating, (tipEl) => tipEl.tooltip(tr(`Device: ${deviceLabelOf(machine)}`, `设备：${deviceLabelOf(machine)}`)))
+              .child(svg(`mods/workspace-chrome/${machine ? "server" : "monitor"}.svg`).size(9.5).flex_none().text_color(machine ? (t.accent ?? t.dim) : t.dim))
+              .child(machine ?? tr("Local", "本机")),
+          ),
+        )
+        .when(!full && Boolean(machine), el => el.child(div().flex_none().text_size(10).text_color(t.dim).child(machine)))
         .when(subs.length > 0, el => el.child(fold(a, subs, isFloating)))
         .when(showHoverActions, el => el.child(pin).child(remove))
         .when(!showHoverActions, el =>
@@ -2380,25 +2452,29 @@ export default class Agents extends View {
         })());
     };
 
-    // Groups in list order: spaces (grouped) or priority sections. Agents of a
-    // space are next to each other in agents(), so neighbours make a group.
-    const groups = pinned.length ? [{ id: "pinned", label: tr("Pinned", "已置顶"), status: null, members: pinned }] : [];
+    // Groups in list order: spaces (grouped, nested under devices when remote devices exist)
+    // or priority sections. Agents of a space are next to each other in `rest`, so neighbours make a group.
+    const groups = pinned.length ? [{ id: "pinned", spaceId: null, machine: null, label: tr("Pinned", "已置顶"), status: null, members: pinned }] : [];
     for (const a of rest) {
       const r = rankOf(a) || RANK.idle;
+      const m = !byPriority && hasRemote ? machineOf(a, spaceById) : null;
       const id = byPriority ? `sec-${r}` : `sp-${a.space}`;
-      if (groups.at(-1)?.id === id) groups.at(-1).members.push(a);
-      else groups.push({ id, label: byPriority ? sectionLabel(r) : a.space_name || "", status: byPriority ? SECTION_STATUS[r] : null, members: [a] });
+      if (groups.at(-1)?.id === id && groups.at(-1)?.machine === m) groups.at(-1).members.push(a);
+      else groups.push({ id, spaceId: byPriority ? null : a.space, machine: m, label: byPriority ? sectionLabel(r) : a.space_name || "", status: byPriority ? SECTION_STATUS[r] : null, members: [a] });
     }
 
     // A group's header; it folds the group. Folded, it says how many and the most urgent state.
-    const header = (g) => {
+    const header = (g, inDevice = false) => {
       const open = !this.folded.has(g.id);
       const top = g.members.reduce((m, a) => ((RANK[a.status] ?? 0) > (RANK[m] ?? 0) ? a.status : m), null);
+      const isSpaceGroup = !byPriority && g.id !== "pinned";
+      const rawColor = isSpaceGroup && g.spaceId ? spaceColors[g.spaceId] : null;
+      const dotColor = typeof rawColor === "string" ? (rawColor.startsWith("#") ? rawColor : (SPACE_MARK[rawColor] ?? t[rawColor] ?? t.dim)) : null;
       return h_flex()
         .id(g.id)
-        .px(8)
-        .pt(8)
-        .h(30)
+        .px(inDevice ? 6 : 8)
+        .pt(inDevice ? 6 : 8)
+        .h(inDevice ? 26 : 30)
         .flex_none()
         .gap(6)
         .items_center()
@@ -2410,6 +2486,8 @@ export default class Agents extends View {
           open ? this.folded.add(g.id) : this.folded.delete(g.id);
           cx.notify();
         })
+        .when(isSpaceGroup && Boolean(dotColor), (el) => el.child(div().size(7).rounded(2).flex_none().bg(dotColor)))
+        .when(isSpaceGroup && !dotColor, (el) => el.child(svg("mods/workspace-chrome/folder.svg").size(11).flex_none().text_color(t.dim)))
         .child(div().truncate().text_color(t[g.status] ?? t.dim).child(g.label))
         .when(byPriority || !open, (el) => el.child(div().text_color(t.dim).child(String(g.members.length))))
         .child(div().flex_1())
@@ -2498,9 +2576,152 @@ export default class Agents extends View {
         .when(Boolean(floatCard), (el) => el.child(floatCard));
     };
 
+    const showDeviceSections = !byPriority && hasRemote;
+    const pinnedGroup = groups.find((g) => g.id === "pinned") ?? null;
+    const nonPinnedGroups = groups.filter((g) => g.id !== "pinned");
+    const deviceSections = [];
+    if (showDeviceSections) {
+      for (const g of nonPinnedGroups) {
+        const last = deviceSections.at(-1);
+        if (last && last.machine === g.machine) {
+          last.spaces.push(g);
+        } else {
+          deviceSections.push({
+            machine: g.machine,
+            slug: g.machine ?? "local",
+            foldId: `dev:${deviceKeyOf(g.machine)}`,
+            label: deviceLabelOf(g.machine),
+            spaces: [g],
+          });
+        }
+      }
+      for (const sec of deviceSections) {
+        const members = sec.spaces.flatMap((g) => g.members);
+        sec.agentCount = members.length;
+        const topRank = members.reduce((best, a) => Math.max(best, rankOf(a) || 0), 0);
+        sec.topStatus = STATUS_BY_RANK[topRank] ?? null;
+      }
+    }
+
+    const renderDeviceSection = (sec, secIdx) => {
+      const open = !this.folded.has(sec.foldId);
+      const isRemote = Boolean(sec.machine);
+      const layoutState = machineStatusByName.get(sec.machine ?? null);
+      const connected = !isRemote || layoutState !== "unavailable";
+      const iconPath = `mods/workspace-chrome/${isRemote ? "server" : "monitor"}.svg`;
+      const showDivider = secIdx > 0 || Boolean(pinnedGroup);
+      const devHeader = h_flex()
+        .id(`dev-${sec.slug}`)
+        .h(26)
+        .px(8)
+        .gap(6)
+        .flex_none()
+        .rounded(6)
+        .items_center()
+        .bg(t.raised)
+        .border_1()
+        .border_color(t.border)
+        .cursor_pointer()
+        .hover((s) => s.bg(t.hover))
+        .tooltip(
+          tr(
+            `Device: ${sec.label} (${sec.spaces.length} spaces, ${sec.agentCount} agents)`,
+            `设备：${sec.label}（${sec.spaces.length} 个工作区，${sec.agentCount} 个智能体）`,
+          ),
+        )
+        .on_click((_e, cx) => {
+          open ? this.folded.add(sec.foldId) : this.folded.delete(sec.foldId);
+          cx.notify();
+        })
+        .child(svg(iconPath).size(12.5).flex_none().text_color(isRemote ? (t.accent ?? t.muted) : t.muted))
+        .child(div().flex_1().min_w(0).truncate().text_size(11.5).font_semibold().text_color(t.foreground).child(sec.label))
+        .when(!open && sec.topStatus && sec.topStatus !== "idle", (el) =>
+          el.child(this.status(t, { status: sec.topStatus }, true)),
+        )
+        .child(div().flex_none().text_size(10.5).text_color(t.dim).child(String(sec.agentCount)))
+        .child(div().size(6).rounded(3).flex_none().bg(connected ? (t.ansi2 ?? "#3fae6a") : t.dim))
+        .child(svg(`mods/workspace-chrome/chevron-${open ? "down" : "right"}.svg`).size(11).flex_none().text_color(t.dim));
+
+      const spaceChildren = open
+        ? sec.spaces.flatMap((g) => (this.folded.has(g.id) ? [header(g, true)] : [header(g, true), renderGroupBody(g)]))
+        : [];
+
+      return v_flex()
+        .id(`dev-section-${sec.slug}`)
+        .flex_none()
+        .when(showDivider, (el) => el.mt(8).pt(8).border_t(1).border_color(t.border))
+        .when(!showDivider, (el) => el.mt(4))
+        .child(devHeader)
+        .when(open, (el) =>
+          el.child(
+            v_flex()
+              .id(`dev-body-${sec.slug}`)
+              .flex_none()
+              .mt(2)
+              .ml(7)
+              .pl(6)
+              .border_l(1)
+              .border_color(t.border)
+              .children(spaceChildren),
+          ),
+        );
+    };
+
+    const renderCollapsedDeviceSections = () => {
+      const out = [];
+      if (pinnedGroup) {
+        for (const a of pinnedGroup.members) out.push(...withKids(a, listIndexOf.get(a.address) ?? 0));
+      }
+      deviceSections.forEach((sec, secIdx) => {
+        const open = !this.folded.has(sec.foldId);
+        const isRemote = Boolean(sec.machine);
+        const layoutState = machineStatusByName.get(sec.machine ?? null);
+        const connected = !isRemote || layoutState !== "unavailable";
+        const iconPath = `mods/workspace-chrome/${isRemote ? "server" : "monitor"}.svg`;
+        out.push(
+          h_flex()
+            .id(`dev-${sec.slug}`)
+            .h(22)
+            .mx(6)
+            .when(secIdx > 0 || Boolean(pinnedGroup), (el) => el.mt(4))
+            .rounded(5)
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .hover((s) => s.bg(t.hover))
+            .tooltip(tr(`Device: ${sec.label} (${sec.agentCount})`, `设备：${sec.label}（${sec.agentCount}）`))
+            .on_click((_e, cx) => {
+              open ? this.folded.add(sec.foldId) : this.folded.delete(sec.foldId);
+              cx.notify();
+            })
+            .child(
+              div()
+                .relative()
+                .flex_none()
+                .child(svg(iconPath).size(12).flex_none().text_color(isRemote ? (t.accent ?? t.dim) : t.dim))
+                .when(isRemote, (el) =>
+                  el.child(div().absolute().right(-3).bottom(-2).size(5).rounded(3).border_1().border_color(t.chrome).bg(connected ? (t.ansi2 ?? "#3fae6a") : t.dim)),
+                ),
+            ),
+        );
+        if (open) {
+          for (const g of sec.spaces) {
+            for (const a of g.members) out.push(...withKids(a, listIndexOf.get(a.address) ?? 0));
+          }
+        }
+      });
+      return out;
+    };
+
     const rows = collapsed
-      ? list.flatMap(withKids)
-      : groups.flatMap((g) => (this.folded.has(g.id) ? [header(g)] : [header(g), renderGroupBody(g)]));
+      ? (showDeviceSections ? renderCollapsedDeviceSections() : list.flatMap(withKids))
+      : showDeviceSections
+        ? [
+            ...(pinnedGroup ? (this.folded.has(pinnedGroup.id) ? [header(pinnedGroup)] : [header(pinnedGroup), renderGroupBody(pinnedGroup)]) : []),
+            ...deviceSections.map(renderDeviceSection),
+          ]
+        : groups.flatMap((g) => (this.folded.has(g.id) ? [header(g)] : [header(g), renderGroupBody(g)]));
 
     const awayBanner = typeof shared === "function" ? shared("briefing.away") : null;
     const awayChangedCount = Number(awayBanner?.changed_count ?? 0) || 0;

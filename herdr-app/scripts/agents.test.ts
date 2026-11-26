@@ -1262,3 +1262,142 @@ test("agents scroll container and group wrappers stay non-shrinking for narrow h
   expect(unit).not.toBeNull();
   expect(unit.calls.has("flex_none")).toBe(true);
 });
+
+test("grouped mode separates workspaces under per-device headers and folds per device", () => {
+  const claude = { key: "claude", name: "Claude", agent: true };
+  const list = [
+    { address: "wsl/a1", acp: true, pane: "p-w1", tab: "tb-w1", space: "wsl/sp1", space_name: "herdr2", program: claude, title: "WSL core", status: "blocked", seq: 1 },
+    { address: "t1", pane: "p-l1", tab: "tb-l1", space: "s1", space_name: "herdr2", program: claude, title: "Local UI", status: "working", seq: 2 },
+    { address: "cloud/a2", acp: true, pane: "p-c1", tab: "tb-c1", space: "cloud/sp1", space_name: "api", program: claude, title: "Cloud API", status: "idle", seq: 3 },
+    { address: "wsl/a3", acp: true, pane: null, tab: null, space: "headless:wsl", space_name: "sandbox", program: claude, title: "Headless WSL", status: "idle", seq: 4 },
+    { address: "t2", pane: "p-l2", tab: "tb-l2", space: "s2", space_name: "notes", program: claude, title: "Local Notes", status: "idle", seq: 5 },
+  ];
+  const spaceRows = [
+    { id: "s1", name: "herdr2", machine: null, tabs: [{ id: "tb-l1", name: "Local UI", named: true }] },
+    { id: "wsl/sp1", name: "herdr2", machine: "wsl", tabs: [{ id: "tb-w1", name: "WSL core", named: true }] },
+    { id: "s2", name: "notes", machine: null, tabs: [{ id: "tb-l2", name: "Local Notes", named: true }] },
+    { id: "cloud/sp1", name: "api", machine: "cloud", tabs: [{ id: "tb-c1", name: "Cloud API", named: true }] },
+  ];
+  const orders: string[][] = [];
+  const { agents } = harness([], {
+    agents: () => list,
+    terminals: () => list.map((a) => ({ ...a, state: "live", labels: {} })),
+    panes: () => list.filter((a) => a.pane).map((a) => ({ pane: a.pane, tab: a.tab, terminal: a.address, program: claude, title: a.title })),
+    focused: () => null,
+    spaces: () => spaceRows,
+    machines: () => [
+      { name: null, layout: "ready" },
+      { name: "cloud", layout: "ready" },
+      { name: "wsl", layout: "ready" },
+    ],
+    settings: () => ({ language: "zh-CN" }),
+    layout: () => ({ id: "sidebar", size: { px: 268 } }),
+    shared: (k: string) => (k === "agents.sort" ? "grouped" : k === "space.colors" ? { s1: "ansi4", "wsl/sp1": "ansi6" } : undefined),
+    theme: () => ({ raised: "#222", border: "#333", hover: "#444", foreground: "#fff", muted: "#aaa", dim: "#888", accent: "#3b82f6", ansi2: "#3fae6a", blocked: "#f59e0b" }),
+    setAgentOrder: (o: string[]) => orders.push(o),
+    div: element, v_flex: element, h_flex: element, svg: element, image: element,
+  });
+
+  const findById = (n: any, id: string): any => {
+    if (!n || typeof n !== "object") return null;
+    if (n.id === id) return n;
+    for (const c of n.children ?? []) {
+      const hit = findById(c, id);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  const collectIds = (n: any, prefix: string, out: string[] = []): string[] => {
+    if (typeof n?.id === "string" && n.id.startsWith(prefix)) out.push(n.id);
+    for (const c of n?.children ?? []) collectIds(c, prefix, out);
+    return out;
+  };
+
+  const root = agents.render({}).node;
+  // Local first, then remote devices sorted alphabetically (cloud, wsl).
+  expect(collectIds(root, "dev-section-")).toEqual(["dev-section-local", "dev-section-cloud", "dev-section-wsl"]);
+  expect(textOf(findById(root, "dev-local"))).toContain("本机");
+  expect(textOf(findById(root, "dev-cloud"))).toContain("cloud");
+  expect(textOf(findById(root, "dev-wsl"))).toContain("wsl");
+
+  // Same-named "herdr2" workspaces are cleanly placed under their own device bodies.
+  expect(collectIds(findById(root, "dev-body-local"), "sp-")).toEqual(["sp-s1", "sp-s2"]);
+  expect(collectIds(findById(root, "dev-body-cloud"), "sp-")).toEqual(["sp-cloud/sp1"]);
+  expect(collectIds(findById(root, "dev-body-wsl"), "sp-")).toEqual(["sp-wsl/sp1", "sp-headless:wsl"]);
+
+  // Agent navigation order matches visual device -> space -> agent order.
+  expect(orders.at(-1)).toEqual(["t1", "t2", "cloud/a2", "wsl/a1", "wsl/a3"]);
+
+  // Clicking a device header folds all spaces under that device and surfaces urgent status.
+  const cx = { notify() {} };
+  findById(root, "dev-wsl").click({}, cx);
+  const foldedRoot = agents.render({}).node;
+  expect(findById(foldedRoot, "dev-body-wsl")).toBeNull();
+  expect(textOf(findById(foldedRoot, "dev-wsl"))).toContain("!");
+  expect(findById(foldedRoot, "dev-body-local")).not.toBeNull();
+
+  // Clicking again unfolds it.
+  findById(foldedRoot, "dev-wsl").click({}, cx);
+  expect(findById(agents.render({}).node, "dev-body-wsl")).not.toBeNull();
+});
+
+test("single-machine local setup omits device headers while priority mode tags devices when remote exists", () => {
+  const claude = { key: "claude", name: "Claude", agent: true };
+  const findById = (n: any, id: string): any => {
+    if (!n || typeof n !== "object") return null;
+    if (n.id === id) return n;
+    for (const c of n.children ?? []) {
+      const hit = findById(c, id);
+      if (hit) return hit;
+    }
+    return null;
+  };
+
+  // 1) Local-only setup: no dev-* headers in grouped mode.
+  const localOnly = harness([], {
+    agents: () => [{ address: "t1", pane: "p1", tab: "tb1", space: "s1", space_name: "herdr2", program: claude, title: "Work", status: "idle", seq: 1 }],
+    terminals: () => [{ address: "t1", state: "live", labels: {} }],
+    panes: () => [{ pane: "p1", tab: "tb1", terminal: "t1", program: claude, title: "Work" }],
+    focused: () => null,
+    spaces: () => [{ id: "s1", name: "herdr2", machine: null, tabs: [{ id: "tb1", name: "Work", named: true }] }],
+    machines: () => [{ name: null, layout: "ready" }],
+    layout: () => ({ id: "sidebar", size: { px: 268 } }),
+    shared: () => "grouped",
+    theme: () => ({}),
+    setAgentOrder() {},
+    div: element, v_flex: element, h_flex: element, svg: element, image: element,
+  });
+  const localRoot = localOnly.agents.render({}).node;
+  expect(findById(localRoot, "dev-local")).toBeNull();
+  expect(findById(localRoot, "sp-s1")).not.toBeNull();
+
+  // 2) Multi-device priority mode: both local and remote rows show explicit device badges.
+  const multiPriority = harness([], {
+    agents: () => [
+      { address: "t1", pane: "p1", tab: "tb1", space: "s1", space_name: "herdr2", program: claude, title: "Local", status: "working", seq: 1 },
+      { address: "wsl/a1", acp: true, pane: "p2", tab: "tb2", space: "wsl/s1", space_name: "herdr2", program: claude, title: "Remote", status: "working", seq: 2 },
+    ],
+    terminals: () => [
+      { address: "t1", state: "live", labels: {} },
+      { address: "wsl/a1", acp: true, state: "live", labels: {} },
+    ],
+    panes: () => [
+      { pane: "p1", tab: "tb1", terminal: "t1", program: claude, title: "Local" },
+      { pane: "p2", tab: "tb2", terminal: "wsl/a1", program: claude, title: "Remote" },
+    ],
+    focused: () => null,
+    spaces: () => [
+      { id: "s1", name: "herdr2", machine: null, tabs: [{ id: "tb1", name: "Local", named: true }] },
+      { id: "wsl/s1", name: "herdr2", machine: "wsl", tabs: [{ id: "tb2", name: "Remote", named: true }] },
+    ],
+    settings: () => ({ language: "zh-CN" }),
+    layout: () => ({ id: "sidebar", size: { px: 268 } }),
+    shared: () => "priority",
+    theme: () => ({}),
+    setAgentOrder() {},
+    div: element, v_flex: element, h_flex: element, svg: element, image: element,
+  });
+  const prioRoot = multiPriority.agents.render({}).node;
+  expect(textOf(findById(prioRoot, "dev-tag-t1"))).toContain("本机");
+  expect(textOf(findById(prioRoot, "dev-tag-wsl/a1"))).toContain("wsl");
+});

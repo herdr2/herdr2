@@ -201,6 +201,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/download-artifact@v4
         with:
           pattern: release-*
@@ -219,6 +221,17 @@ jobs:
           cp dist/all/installers/* dist/release-assets/
           cp dist/all/ota/* dist/ota-assets/
 
+          # Build versioned GitHub Release notes (CHANGELOG.md -> tag annotation -> git log)
+          # and a concise OTA summary for in-app update dialogs.
+          python3 scripts/release.py notes \
+            --tag "$TAG" \
+            --version "$VER" \
+            --repo "${{ github.repository }}" \
+            --out dist/release-notes.md \
+            --ota-summary-out dist/ota-notes.txt
+          OTA_NOTES=$(tr -d '\r\n' < dist/ota-notes.txt)
+          [ -n "$OTA_NOTES" ] || OTA_NOTES="Herdr2 $TAG"
+
           # Generate OTA manifests (app + core + ui)
           python3 scripts/release.py manifest \
             --github-release \
@@ -226,45 +239,25 @@ jobs:
             --base-url "$OTA_URL" \
             --app-version "$VER" \
             --core-version "$VER" \
-            --notes "Herdr2 $TAG"
+            --notes "$OTA_NOTES"
           python3 scripts/release.py ui \
             --github-release \
             --version "${VER}-ui.0" \
             --base-url "$OTA_URL" \
             --out dist/ota-assets \
-            --notes "Herdr2 UI $TAG"
+            --notes "$OTA_NOTES"
 
           # Copy install skill into release assets for easy one-click download
           cp skills/herdr2-install/SKILL.md dist/release-assets/herdr2-install-SKILL.md
 
           (cd dist/release-assets && sha256sum * > SHA256SUMS.txt)
 
-          # Publish versioned release with user-facing single installers
-          NOTES=$(cat <<EOF
-          ## Herdr2 $TAG
-
-          ### Direct Download Installers (includes Desktop App + \`h2\` Core)
-          - **Windows (x64)**: \`Herdr2-Setup-${VER}-windows-x86_64.exe\` — double-click to install App + \`h2\` CLI
-          - **macOS (Apple Silicon)**: \`Herdr2-${VER}-macos-aarch64.dmg\` — open and drag \`Herdr2.app\` to Applications
-          - **macOS (Intel)**: \`Herdr2-${VER}-macos-x86_64.dmg\` — open and drag \`Herdr2.app\` to Applications
-          - **Linux (Ubuntu/Debian)**: \`herdr2_${VER}_amd64.deb\` — run \`sudo apt install ./herdr2_${VER}_amd64.deb\`
-          - **Linux (Generic x64)**: \`herdr2-${VER}-linux-x86_64.tar.gz\` — extract and run \`./install.sh\`
-
-          ### Install via Your AI Agent
-          Give your agent the install skill:
-          \`https://raw.githubusercontent.com/${{ github.repository }}/main/skills/herdr2-install/SKILL.md\`
-
-          ### Install Companion Skills After Setup
-          \`\`\`sh
-          h2 skill install --all
-          \`\`\`
-          EOF
-          )
-
+          # Publish versioned release with changelog + user-facing single installers
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/release-assets/* --clobber
+            gh release edit "$TAG" --title "Herdr2 $TAG" --notes-file dist/release-notes.md
           else
-            gh release create "$TAG" dist/release-assets/* --title "Herdr2 $TAG" --notes "$NOTES"
+            gh release create "$TAG" dist/release-assets/* --title "Herdr2 $TAG" --notes-file dist/release-notes.md
           fi
 
           # Sync rolling OTA channel
