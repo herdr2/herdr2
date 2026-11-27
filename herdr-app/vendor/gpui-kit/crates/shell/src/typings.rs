@@ -3204,6 +3204,10 @@ const BASE: &str = r#"  /** A row. */
     set_auto_grow(min_rows: number, max_rows: number): void;
     /** Wraps long lines instead of scrolling sideways. Default is on. */
     set_soft_wrap(wrap: boolean): void;
+    /** HERDR: Treats plain Enter as submit without inserting a newline; Shift+Enter still inserts a newline. */
+    set_submit_on_enter(submit: boolean): void;
+    /** HERDR: Intercepts completion-conflicting keys (`tab`, `enter`, `up`, `down`, `escape`) before built-in editing. Return `true` to consume. */
+    set_before_key(handler: ((event: { key: string; modifiers: { shift: boolean; control: boolean; alt: boolean; platform: boolean; secondary?: boolean } }, cx: Context) => boolean) | null): boolean;
     /** Moves the keyboard onto the textarea. */
     focus(): void;
     release(): boolean;

@@ -56,6 +56,7 @@ pub fn detect_agent_kind(preset: Option<&str>, argv: &[String], app_hint: Option
             "hermes" | "hermes-acp" => return "hermes".into(),
             "glm" | "glm-acp-agent" => return "glm".into(),
             "zcode" | "zcode-cli" | "zcode-acp-server" => return "zcode".into(),
+            "trae" | "traecli" | "traex" | "trae-cli" => return "trae".into(),
             "dsh" => return "dsh".into(),
             _ => {}
         }
@@ -95,6 +96,8 @@ fn normalize_kind_token(raw: &str) -> String {
         "hermes".into()
     } else if lower.contains("zcode") {
         "zcode".into()
+    } else if lower.contains("trae") {
+        "trae".into()
     } else if lower.contains("glm") {
         "glm".into()
     } else if lower == "dsh" {

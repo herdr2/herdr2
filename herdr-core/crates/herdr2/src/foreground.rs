@@ -316,7 +316,7 @@ pub(crate) fn is_cli_foreground(fg: &Foreground) -> bool {
         let clean = stem.strip_suffix(".real").unwrap_or(stem);
         matches!(
             clean,
-            "cursor-agent" | "opencode" | "kimi" | "copilot" | "hermes" | "zcode" | "zcode-cli" | "qoder" | "dsh"
+            "cursor-agent" | "opencode" | "kimi" | "copilot" | "hermes" | "zcode" | "zcode-cli" | "trae" | "traecli" | "traex" | "trae-cli" | "qoder" | "dsh"
         )
     })
 }

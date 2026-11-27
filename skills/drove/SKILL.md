@@ -34,8 +34,11 @@ When invoked, you act as the **Coordinator** for a single Drove Run inside `herd
     - key: impl
       title: Implement storage engine
       role: coder
+      forkFrom: coordinator     # optional: inherit distilled/native context from coordinator or upstream task key
+      channels: [storage-api]   # optional: subscribe to Run-scoped shared contract board (#contract:<seq>)
       isolation: worktree
       review:
+        mode: hybrid            # static (default) | breaker (throwaway adversarial test worktree) | hybrid
         maxRounds: 2
       spec:
         target: src/storage.rs
@@ -47,6 +50,7 @@ When invoked, you act as the **Coordinator** for a single Drove Run inside `herd
       title: Add integration tests
       role: tester
       deps: [impl]
+      channels: [storage-api]
       spec:
         target: tests/storage_test.rs
         change: Write regression tests covering concurrent reads/writes.
@@ -68,10 +72,15 @@ Roles (`coder`, `tester`, `writer`, `illustrator`, `reviewer`, `researcher`, plu
 
 - Assign tasks by `role:` in YAML or `--role` in CLI; add concise `tags:` (e.g. `[前端UI]`, `[后端架构]`, `[快速修复]`) or clear `title`/`files` so the Drove router automatically picks the candidate whose configured `strengths` and `note` best fit the task and current local time (with AI routing evaluation, Magpie quota skipping, and `#1 -> #2 -> #3` retry rotation).
 - You can inspect all roles, candidate models, their `strengths`, and global/per-candidate `note` at any time via `h2 drove settings`; if you ever choose or override `--agent`/`--model` manually when spawning sub-agents, always read `config.note` and each candidate's `note` first and follow those constraints (e.g., avoiding double-quota models during restricted hours unless no alternative is available).
-- Access guardrails are enforced automatically on `drove worker done`:
-  - `readonly` (`reviewer`, `researcher`): zero workspace edits permitted (OS sandbox: Linux `bwrap --ro-bind` / macOS `sandbox-exec` / Windows `restricted-token` + diff check).
-  - `scoped_write` (`tester`, `writer`, `illustrator`): edits restricted to configured `allowedPaths` globs (`422 role_scope_violation` if exceeded).
+- Access guardrails are enforced in **two layers** (pre-tool ACP permission interception / `h2 drove worker guard-hook` before disk writes, plus post-turn baseline diff verification on completion):
+  - `readonly` (`reviewer`, `researcher`): zero workspace edits permitted (ACP pre-tool auto-deny + OS sandbox: Linux `bwrap --ro-bind` / macOS `sandbox-exec` / Windows `restricted-token` + diff check).
+  - `scoped_write` (`tester`, `writer`, `illustrator`): edits restricted to configured `allowedPaths` globs (auto-denied before write and verified on completion with `422 role_scope_violation` if exceeded).
   - `writable` (`coder`): workspace edits permitted.
+- **Minimal Strong-Schema Worker MCP & `#ref` Pointers**:
+  - Every spawned ACP worker automatically receives a lightweight `drove` MCP server (`h2 mcp --profile drove-worker`) exposing only 3 tools: `drove_finish` (with the task's `outputSchema` dynamically embedded into `data`), `drove_ask`, and `drove_context` (supporting `target: "@task:<key>#data"` + `json_path` slicing and `#contract:<seq>` reads/publishes). CLI `h2 drove worker` remains available as a 100% compatible fallback.
+  - Upstream `result.data` payloads larger than `512 B` are collapsed into `@task:<key>#data` pointers with JSON shape summaries so fan-in tasks stay lean.
+- **In-Place Model Failover**:
+  - On 429/rate-limit/quota errors, Drove automatically switches a healthy live worker session (`< 75%` context) to the next fallback model on the **same ACP adapter** in place without losing uncommitted worktree edits or session history. You can also switch a running worker's model manually via `h2 drove route <task> --model <model> --in-place`.
 - **Worktree Preflight Guard**: Before starting a Run that uses `--worktree` / `isolation: worktree` or concurrent writable tasks under `conflictPolicy=auto_worktree`, Drove verifies the workspace is ready for Git worktrees. If it returns `worktree_not_ready` (e.g., not a Git repo, no initial commit yet, in-progress merge/rebase, lock file, or nested unborn `.git`), immediately show the user the reported reason and fix command and wait for them to resolve it before retrying.
 
 ---
@@ -85,10 +94,13 @@ Roles (`coder`, `tester`, `writer`, `illustrator`, `reviewer`, `researcher`, plu
    h2 drove reply <msg_id> "Use port 8080"
    h2 drove ack <msg_id>
    ```
-3. Inspect failures or intervene cleanly:
+3. Inspect failures, dynamically reshape pending tasks, or intervene cleanly:
    ```bash
    h2 drove inspect <task_key_or_id>
    h2 drove send <task_key_or_id> "Check edge case X" [--interrupt]
+   h2 drove edit <task_key_or_id> [--change "..."] [--deps a,b | --clear-deps] [--worktree]
+   h2 drove route <task_key_or_id> --model <model> --in-place
+   h2 drove cancel <task_key_or_id> [--skip-ok]
    h2 drove retry <task_key_or_id> --hint "Fix test assertion" [--role tester] [--fresh]
    ```
 4. Finalize the Run (runs Run-level `verify` + `goal.autoRepair` if enabled; healthy workers stay warm `idle` until the Coordinator closes or the Run is deleted in Drove Web):

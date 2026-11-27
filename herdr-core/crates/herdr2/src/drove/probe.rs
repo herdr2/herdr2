@@ -444,6 +444,7 @@ async fn probe_one_acp_attempt(target: AcpProbeTarget, timeout: Duration) -> Pro
         dangerously_skip_permissions: false,
         config_overrides: BTreeMap::new(),
         inject_mcp: false,
+        mcp_profile: None,
         mcp_exe: "herdr2".into(),
         socket: String::new(),
         handshake_timeout: Some(timeout),

@@ -70,3 +70,20 @@ test("palette scrolls past group titles with small movements", () => {
     expect(view.scroll).toBe(view.maxScroll);
   }
 });
+
+test("palette exposes Toggle left sidebar wired to layout.toggle:sidebar", () => {
+  const entries = new Function(
+    ...Object.keys(values),
+    "commands", "layouts", "settings",
+    `${source.replace(/^import .*;\n/gm, "").replace("export default class Palette", "class Palette")}; return entries;`,
+  )(
+    ...Object.values(values),
+    () => [{ name: "layout.toggle", args: [{ name: "id", required: true }], about: "Hide or show a layout node." }],
+    () => [],
+    () => ({ language: "zh-CN" }),
+  );
+  const list = entries();
+  const sidebarEntry = list.find((e: any) => e.name === "layout.toggle" && e.args?.id === "sidebar");
+  expect(sidebarEntry).toBeDefined();
+  expect(sidebarEntry.title).toBe("切换左侧边栏");
+});

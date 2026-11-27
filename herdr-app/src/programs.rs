@@ -62,7 +62,7 @@ impl Entry {
 }
 
 /// The agents people pick most, first in menus; the rest follow by name.
-const AGENTS_FIRST: &[&str] = &["claude", "codex", "antigravity", "pi", "opencode", "cursor", "copilot", "amp", "gemini", "grok", "kimi", "qwen", "hermes", "glm", "zcode"];
+const AGENTS_FIRST: &[&str] = &["claude", "codex", "antigravity", "pi", "opencode", "cursor", "copilot", "amp", "gemini", "grok", "kimi", "qwen", "hermes", "glm", "zcode", "trae"];
 
 /// Every agent the table can start (entries with `run`), most picked first:
 /// `{ key, name, icon, tint, tile, color, run }`.

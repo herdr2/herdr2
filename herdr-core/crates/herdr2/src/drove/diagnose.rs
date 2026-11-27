@@ -344,6 +344,9 @@ mod tests {
             cache: None,
             cached_from: None,
             retry_on_worker_reported: None,
+            fork_from: None,
+            fork_mode: None,
+            channels: Vec::new(),
         });
 
         let set_stage = |stage: ReviewCircuitStage, rounds: u32| {

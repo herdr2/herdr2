@@ -469,7 +469,7 @@ fn normalize_preset(raw: &str) -> Option<String> {
     if low.contains("antigravity") || low == "agy" {
         return Some("agy".into());
     }
-    for key in ["claude", "codex", "gemini", "cursor", "opencode", "qwen", "kimi", "copilot", "hermes", "glm", "zcode", "pi"] {
+    for key in ["claude", "codex", "gemini", "cursor", "opencode", "qwen", "kimi", "copilot", "hermes", "glm", "zcode", "trae", "pi"] {
         if low.contains(key) {
             return Some(key.into());
         }

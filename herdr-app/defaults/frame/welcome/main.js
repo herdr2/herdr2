@@ -23,10 +23,13 @@ import {
   window as appWindow,
   pickFolder,
   checking,
+  knownAgents,
 } from "herdr";
 import {
   PAGES,
   AI_PAGE,
+  AGENTS_PAGE,
+  ACP_PERMISSIONS,
   AI_PROVIDERS,
   DEEPSEEK_PRESET,
   LANGUAGES,
@@ -46,6 +49,10 @@ import {
   agentCustomizePrompt,
   fmtVersion,
   findLayoutNode,
+  normalizeAdapterStatus,
+  normalizeAgentProbe,
+  summarizeDetectedAgents,
+  formatShortProbeError,
 } from "./model.js";
 
 const I = (name) => `frame/welcome/${name}.svg`;
@@ -88,6 +95,15 @@ export default class Welcome extends View {
     this.skillStatus = null;
     this.skillInstalling = false;
     this.skillMessage = null;
+    this.knownAgentsList = [];
+    this.agentProbe = null;
+    this.adapterStatus = null;
+    this.agentsProbing = false;
+    this.agentsAutoProbed = false;
+    this.adapterBusy = false;
+    this.acpConfigSaving = false;
+    this.agentsError = null;
+    this.agentsNotice = null;
     this.copied = null;
     this.appearance = null;
     this.languageOverride = null;
@@ -104,7 +120,7 @@ export default class Welcome extends View {
         this.appearance = JSON.parse(raw ?? "{}").appearance ?? null;
       } catch {}
       if (!isChecking()) {
-        await Promise.all([this.loadMachines(), this.loadAiStatus(), this.loadSkillStatus()]);
+        await Promise.all([this.loadMachines(), this.loadAiStatus(), this.loadAgentsQuick(), this.loadSkillStatus()]);
         // If an existing AI endpoint is already saved, silently verify connectivity once.
         if (this.aiStatus?.configured && !this.aiTestResult) {
           await this.verifyExistingAi();
@@ -150,6 +166,162 @@ export default class Welcome extends View {
         this.skillStatus = JSON.parse(r.stdout);
       } catch {}
     }
+  }
+
+  async loadAgentsQuick() {
+    const [knownRes, adapterRes, probeRes] = await Promise.all([
+      typeof knownAgents === "function" ? knownAgents({}).catch(() => null) : Promise.resolve(null),
+      callCore(["adapter", "status", "--json"]),
+      callCore(["drove", "probe", "--json"]),
+    ]);
+    if (Array.isArray(knownRes)) {
+      this.knownAgentsList = knownRes;
+    }
+    if (adapterRes?.code === 0 && adapterRes.stdout) {
+      this.adapterStatus = normalizeAdapterStatus(adapterRes.stdout) ?? this.adapterStatus;
+    }
+    if (probeRes?.code === 0 && probeRes.stdout) {
+      this.agentProbe = normalizeAgentProbe(probeRes.stdout) ?? this.agentProbe;
+    }
+  }
+
+  async runAgentsProbe(cx) {
+    if (this.agentsProbing || isChecking()) return;
+    this.agentsProbing = true;
+    this.agentsError = null;
+    this.agentsNotice = null;
+    cx?.notify?.();
+    try {
+      const [knownRes, probeRes] = await Promise.all([
+        typeof knownAgents === "function" ? knownAgents({}).catch(() => null) : Promise.resolve(null),
+        callCore(["drove", "probe", "--refresh", "--json"]),
+      ]);
+      if (Array.isArray(knownRes)) {
+        this.knownAgentsList = knownRes;
+      }
+      if (probeRes?.code === 0 && probeRes.stdout) {
+        this.agentProbe = normalizeAgentProbe(probeRes.stdout) ?? this.agentProbe;
+      } else if (probeRes && probeRes.code !== 0) {
+        this.agentsError = (probeRes.stderr || probeRes.stdout || this.tr("Agent detection failed", "Agent 检测失败")).trim();
+      }
+      const adapterRes = await callCore(["adapter", "status", "--json"]);
+      if (adapterRes?.code === 0 && adapterRes.stdout) {
+        this.adapterStatus = normalizeAdapterStatus(adapterRes.stdout) ?? this.adapterStatus;
+      }
+      this.agentsAutoProbed = true;
+    } catch (e) {
+      this.agentsError = String(e?.message ?? e);
+    } finally {
+      this.agentsProbing = false;
+      cx?.notify?.();
+    }
+  }
+
+  refreshAgentsProbe(cx) {
+    if (this.agentsProbing || isChecking()) return;
+    cx.spawn(async (asyncCx) => {
+      await this.runAgentsProbe(asyncCx);
+    });
+  }
+
+  installAdapters(cx, mode = "detected", presetId = null) {
+    if (this.adapterBusy || isChecking()) return;
+    this.adapterBusy = presetId ? `${mode}:${presetId}` : mode;
+    this.agentsError = null;
+    this.agentsNotice = null;
+    cx?.notify?.();
+    cx.spawn(async (cx) => {
+      try {
+        let args;
+        if (mode === "update") {
+          args = presetId ? ["adapter", "update", presetId, "--json"] : ["adapter", "update", "--json"];
+        } else if (mode === "all") {
+          args = ["adapter", "install", "--all", "--json"];
+        } else {
+          args = presetId ? ["adapter", "install", presetId, "--json"] : ["adapter", "install", "--detected", "--json"];
+        }
+        const r = await callCore(args);
+        let parsed = null;
+        try {
+          parsed = JSON.parse(r?.stdout || r?.stderr || "{}");
+        } catch {}
+        if (!r || r.code !== 0) {
+          this.agentsError =
+            parsed?.error?.message ||
+            parsed?.message ||
+            (r?.stderr || r?.stdout || this.tr("ACP adapter installation failed", "ACP 适配器安装失败")).trim();
+        } else {
+          const results = Array.isArray(parsed?.results) ? parsed.results : [];
+          const failed = results.filter((x) => x.action === "failed");
+          const changed = results.filter((x) => x.action === "installed" || x.action === "updated");
+          if (failed.length > 0) {
+            this.agentsError = failed.map((f) => `${f.preset_id}: ${f.error || "failed"}`).join("; ");
+          } else if (changed.length > 0) {
+            this.agentsNotice = this.tr(
+              `ACP adapters ready: ${changed.map((c) => `${c.preset_id}${c.version ? ` v${c.version}` : ""}`).join(", ")}`,
+              `ACP 适配器已就绪：${changed.map((c) => `${c.preset_id}${c.version ? ` v${c.version}` : ""}`).join("、")}`,
+            );
+          }
+        }
+        const [adapterRes, probeRes] = await Promise.all([
+          callCore(["adapter", "status", "--json"]),
+          callCore(["drove", "probe", "--refresh", "--json"]),
+        ]);
+        if (adapterRes?.code === 0 && adapterRes.stdout) {
+          this.adapterStatus = normalizeAdapterStatus(adapterRes.stdout) ?? this.adapterStatus;
+        }
+        if (probeRes?.code === 0 && probeRes.stdout) {
+          this.agentProbe = normalizeAgentProbe(probeRes.stdout) ?? this.agentProbe;
+        }
+      } catch (e) {
+        this.agentsError = String(e?.message ?? e);
+      } finally {
+        this.adapterBusy = false;
+        cx?.notify?.();
+      }
+    });
+  }
+
+  saveAcpConfig(patch, cx) {
+    if (this.acpConfigSaving || isChecking()) return;
+    const args = ["adapter", "config"];
+    if ("autoInstall" in patch) {
+      args.push("--auto-install", patch.autoInstall ? "true" : "false");
+    }
+    if ("defaultPermissions" in patch && patch.defaultPermissions) {
+      args.push("--default-permissions", String(patch.defaultPermissions));
+    }
+    if ("injectMcp" in patch) {
+      args.push("--inject-mcp", patch.injectMcp ? "true" : "false");
+    }
+    if (args.length <= 2) return;
+    args.push("--json");
+    this.acpConfigSaving = true;
+    this.agentsError = null;
+    cx?.notify?.();
+    cx.spawn(async (cx) => {
+      try {
+        const r = await callCore(args);
+        let parsed = null;
+        try {
+          parsed = JSON.parse(r?.stdout || r?.stderr || "{}");
+        } catch {}
+        if (!r || r.code !== 0) {
+          this.agentsError =
+            parsed?.error?.message ||
+            parsed?.message ||
+            (r?.stderr || r?.stdout || this.tr("Failed to save ACP configuration", "保存 ACP 配置失败")).trim();
+        } else {
+          const next = normalizeAdapterStatus(parsed);
+          if (next) this.adapterStatus = next;
+        }
+      } catch (e) {
+        this.agentsError = String(e?.message ?? e);
+      } finally {
+        this.acpConfigSaving = false;
+        cx?.notify?.();
+      }
+    });
   }
 
   installSkillsNow(cx) {
@@ -538,7 +710,17 @@ export default class Welcome extends View {
         cx.notify();
       });
     }
-    if (!isChecking() && this.page === 4) {
+    if (!isChecking() && this.page === AGENTS_PAGE) {
+      cx.spawn(async (asyncCx) => {
+        await this.loadAgentsQuick();
+        asyncCx.notify();
+        if (!this.agentsAutoProbed && !this.agentProbe?.fullProbe) {
+          this.agentsAutoProbed = true;
+          await this.runAgentsProbe(asyncCx);
+        }
+      });
+    }
+    if (!isChecking() && this.page === PAGES) {
       cx.spawn(async (cx) => {
         await this.loadSkillStatus();
         cx.notify();
@@ -1384,9 +1566,338 @@ export default class Welcome extends View {
       );
   }
 
-  // Page 4: Shortcuts, h2 CLI & Ready to Go ----------------------------
+  // Page 4: Agents & ACP Detection / Configuration ---------------------
 
-  pageFour(t) {
+  toggleSwitch(t, id, on, onClick) {
+    return div()
+      .id(id)
+      .flex_none()
+      .w(34)
+      .h(20)
+      .rounded(10)
+      .p(2)
+      .bg(on ? t.accent : t.input)
+      .cursor_pointer()
+      .flex()
+      .when(on, (el) => el.justify_end())
+      .on_mouse_down("left", (_e, cx) => cx.stop_propagation())
+      .on_click(onClick)
+      .child(div().w(16).h(16).rounded(8).bg(on ? t.accent_foreground : t.muted));
+  }
+
+  pageFourAgents(t) {
+    const summary = summarizeDetectedAgents(this.knownAgentsList, this.agentProbe, this.adapterStatus);
+    const displayRows = summary.rows.filter((r) => r.anyInstalled || Boolean(r.adapter));
+    const shownRows = displayRows.slice(0, 8);
+    const hiddenRowsCount = Math.max(0, displayRows.length - shownRows.length);
+
+    const autoInstall = this.adapterStatus?.autoInstall !== false;
+    const injectMcp = this.adapterStatus?.injectMcp !== false;
+    const currentPerm = this.adapterStatus?.defaultPermissions || "approve-reads";
+    const permItems = ACP_PERMISSIONS.map((p) => [p.id, this.tr(p.en, p.zh)]);
+
+    const pill = (text, color, border = t.border, bg = t.background) =>
+      div()
+        .px(6)
+        .py(1)
+        .rounded(5)
+        .bg(bg)
+        .border_1()
+        .border_color(border)
+        .text_size(10.8)
+        .font_medium()
+        .text_color(color)
+        .child(text);
+
+    return v_flex()
+      .id("w-agents-page")
+      .gap(11)
+      .child(
+        this.title(
+          t,
+          this.tr("Detect agents & configure ACP", "检测智能体与配置 ACP"),
+          this.tr(
+            "Check installed coding CLIs, prepare managed ACP adapters, and set default ACP behavior. Refine anytime in Settings → Agents & ACP.",
+            "检测本机已安装的编程 Agent，一键准备托管 ACP 适配器并配置默认 ACP 策略；之后可随时在「设置 → 智能体与 ACP」调整。",
+          ),
+        ),
+      )
+      // Card 1: Agents & Managed ACP Adapters detection
+      .child(
+        v_flex()
+          .id("w-agents-card")
+          .gap(8)
+          .p(12)
+          .rounded(11)
+          .border_1()
+          .border_color(summary.acpErrorCount > 0 ? t.blocked : t.border)
+          .bg(t.raised)
+          .child(
+            h_flex()
+              .items_center()
+              .justify_between()
+              .gap(8)
+              .flex_wrap()
+              .child(
+                h_flex()
+                  .gap(7)
+                  .items_center()
+                  .flex_wrap()
+                  .child(svg(I("bot")).size(15).text_color(t.accent))
+                  .child(div().text_size(13).font_semibold().text_color(t.foreground).child(this.tr("Agents & ACP Detection", "Agent 与 ACP 检测")))
+                  .when(this.agentsProbing, (el) =>
+                    el.child(pill(this.tr("Detecting…", "检测中…"), t.accent, t.accent, t.accent + "18")),
+                  )
+                  .when(!this.agentsProbing && summary.cliCount > 0, (el) =>
+                    el.child(pill(`${summary.cliCount} CLI`, t.muted)),
+                  )
+                  .when(!this.agentsProbing && summary.acpReadyCount > 0, (el) =>
+                    el.child(pill(this.tr(`${summary.acpReadyCount} ACP ready`, `${summary.acpReadyCount} ACP 就绪`), t.ansi2, t.ansi2, t.ansi2 + "18")),
+                  )
+                  .when(!this.agentsProbing && summary.acpErrorCount > 0, (el) =>
+                    el.child(pill(this.tr(`${summary.acpErrorCount} error`, `${summary.acpErrorCount} 异常`), t.blocked, t.blocked, t.blocked + "18")),
+                  ),
+              )
+              .child(
+                h_flex()
+                  .gap(6)
+                  .items_center()
+                  .when(summary.missingAdapters.length > 0, (el) =>
+                    el.child(
+                      this.smallButton(
+                        t,
+                        "w-agents-install-missing",
+                        this.adapterBusy === "detected"
+                          ? this.tr("Installing…", "安装中…")
+                          : this.tr(`Install Missing (${summary.missingAdapters.length})`, `安装缺失适配器 (${summary.missingAdapters.length})`),
+                        (_e, cx) => this.installAdapters(cx, "detected"),
+                        true,
+                      ),
+                    ),
+                  )
+                  .child(
+                    this.smallButton(
+                      t,
+                      "w-agents-refresh",
+                      this.agentsProbing ? this.tr("Detecting…", "检测中…") : this.tr("Re-detect", "重新检测"),
+                      (_e, cx) => this.refreshAgentsProbe(cx),
+                    ),
+                  ),
+              ),
+          )
+          .child(
+            v_flex()
+              .id("w-agents-list")
+              .rounded(8)
+              .border_1()
+              .border_color(t.border)
+              .bg(t.background)
+              .overflow_hidden()
+              .when(shownRows.length === 0, (el) =>
+                el.child(
+                  div()
+                    .px(11)
+                    .py(10)
+                    .text_size(12)
+                    .line_height("18px")
+                    .text_color(t.muted)
+                    .child(
+                      this.tr(
+                        "No coding agents detected yet. Install Claude Code, Codex, Antigravity, Cursor, Gemini, OpenCode, or Pi on PATH, then click Re-detect.",
+                        "暂未检测到已安装的编程 Agent。安装 Claude Code、Codex、Antigravity、Cursor、Gemini、OpenCode 或 Pi 后点击「重新检测」。",
+                      ),
+                    ),
+                ),
+              )
+              .children(
+                shownRows.map((r, idx) => {
+                  const dotColor = r.acpReady
+                    ? t.ansi2
+                    : r.acpError
+                      ? t.blocked
+                      : r.adapterMissing || r.cliInstalled
+                        ? t.working
+                        : t.dim;
+                  const statusText = r.adapterInstalling || this.adapterBusy === `detected:${r.id}`
+                    ? this.tr("Installing adapter…", "正在安装适配器…")
+                    : r.acpReady
+                      ? (r.modelsCount > 0
+                          ? this.tr(`ACP Ready · ${r.modelsCount} models`, `ACP 就绪 · ${r.modelsCount} 模型`)
+                          : this.tr("ACP Ready", "ACP 就绪"))
+                      : r.acpError
+                        ? this.tr("ACP Error", "ACP 异常")
+                        : r.adapterMissing
+                          ? this.tr("Missing ACP Adapter", "缺少 ACP 适配器")
+                          : r.cliInstalled
+                            ? this.tr("CLI Ready", "CLI 可用")
+                            : this.tr("Not Installed", "未安装");
+                  const statusColor = r.acpReady
+                    ? t.ansi2
+                    : r.acpError
+                      ? t.blocked
+                      : r.adapterMissing
+                        ? t.working
+                        : r.cliInstalled
+                          ? t.foreground
+                          : t.dim;
+                  const showInstallBtn = Boolean(
+                    r.adapter && !r.adapter.installed && !r.adapterInstalling && (r.adapter.companion_installed || !r.adapter.companion_cli),
+                  );
+                  return h_flex()
+                    .id(`w-agent-row-${r.id}`)
+                    .px(11)
+                    .py(7)
+                    .gap(8)
+                    .items_center()
+                    .when(idx > 0, (el) => el.border_t(1).border_color(t.border))
+                    .child(div().w(7).h(7).rounded(4).flex_none().bg(dotColor))
+                    .child(
+                      v_flex()
+                        .flex_1()
+                        .min_w(0)
+                        .gap(1)
+                        .child(
+                          h_flex()
+                            .gap(6)
+                            .items_center()
+                            .child(div().text_size(12.4).font_medium().text_color(r.anyInstalled ? t.foreground : t.muted).child(r.name))
+                            .when(r.cliInstalled, (el) => el.child(div().text_size(10.5).text_color(t.dim).child("CLI"))),
+                        )
+                        .when(Boolean(r.acpError), (el) =>
+                          el.child(
+                            div()
+                              .truncate()
+                              .text_size(11)
+                              .text_color(t.blocked)
+                              .child(formatShortProbeError(r.acpError)),
+                          ),
+                        ),
+                    )
+                    .child(div().flex_none().text_size(11.3).text_color(statusColor).child(statusText))
+                    .when(showInstallBtn, (el) =>
+                      el.child(
+                        this.smallButton(
+                          t,
+                          `w-agent-inst-${r.id}`,
+                          this.adapterBusy === `detected:${r.id}` ? this.tr("Installing…", "安装中…") : this.tr("Install", "安装"),
+                          (_e, cx) => this.installAdapters(cx, "detected", r.id),
+                          Boolean(r.adapterMissing),
+                        ),
+                      ),
+                    );
+                }),
+              )
+              .when(hiddenRowsCount > 0, (el) =>
+                el.child(
+                  div()
+                    .px(11)
+                    .py(6)
+                    .border_t(1)
+                    .border_color(t.border)
+                    .text_size(11.2)
+                    .text_color(t.dim)
+                    .child(this.tr(`+${hiddenRowsCount} more in Settings → Agents & ACP`, `其余 ${hiddenRowsCount} 项可在「设置 → 智能体与 ACP」查看`)),
+                ),
+              ),
+          )
+          .when(Boolean(this.agentsError), (el) =>
+            el.child(
+              div()
+                .px(9)
+                .py(6)
+                .rounded(7)
+                .bg(t.blocked + "18")
+                .border_1()
+                .border_color(t.blocked)
+                .text_size(11.5)
+                .line_height("16px")
+                .text_color(t.blocked)
+                .child(this.agentsError),
+            ),
+          )
+          .when(Boolean(this.agentsNotice && !this.agentsError), (el) =>
+            el.child(
+              div()
+                .px(9)
+                .py(6)
+                .rounded(7)
+                .bg(t.ansi2 + "18")
+                .border_1()
+                .border_color(t.ansi2)
+                .text_size(11.5)
+                .text_color(t.ansi2)
+                .child(this.agentsNotice),
+            ),
+          ),
+      )
+      // Card 2: ACP Detection & Runtime Configuration
+      .child(
+        v_flex()
+          .id("w-acp-config-card")
+          .gap(9)
+          .p(12)
+          .rounded(11)
+          .border_1()
+          .border_color(t.border)
+          .bg(t.raised)
+          .child(div().text_size(13).font_semibold().text_color(t.foreground).child(this.tr("ACP Configuration", "ACP 运行与检测配置")))
+          .child(
+            h_flex()
+              .items_center()
+              .justify_between()
+              .gap(12)
+              .child(
+                v_flex()
+                  .flex_1()
+                  .min_w(0)
+                  .gap(1)
+                  .child(div().text_size(12.4).font_medium().text_color(t.foreground).child(this.tr("Auto-install managed ACP adapters", "自动安装托管 ACP 适配器")))
+                  .child(div().text_size(11.2).text_color(t.muted).child(this.tr("Download missing adapters into an isolated directory automatically.", "检测到 CLI 或启动会话时自动在隔离目录安装缺失适配器。"))),
+              )
+              .child(
+                this.toggleSwitch(t, "w-acp-auto-install", autoInstall, (_e, cx) =>
+                  this.saveAcpConfig({ autoInstall: !autoInstall }, cx),
+                ),
+              ),
+          )
+          .child(
+            h_flex()
+              .items_center()
+              .justify_between()
+              .gap(10)
+              .flex_wrap()
+              .child(div().text_size(12.4).font_medium().text_color(t.foreground).child(this.tr("Default ACP permissions", "默认 ACP 权限策略")))
+              .child(
+                this.segment(t, "acp-perm", permItems, currentPerm, (val, cx) =>
+                  this.saveAcpConfig({ defaultPermissions: val }, cx),
+                ),
+              ),
+          )
+          .child(
+            h_flex()
+              .items_center()
+              .justify_between()
+              .gap(12)
+              .child(
+                v_flex()
+                  .flex_1()
+                  .min_w(0)
+                  .gap(1)
+                  .child(div().text_size(12.4).font_medium().text_color(t.foreground).child(this.tr("Auto-inject herdr2 MCP server", "自动注入 herdr2 MCP 工具")))
+                  .child(div().text_size(11.2).text_color(t.muted).child(this.tr("Expose `h2 mcp` to headless ACP sessions for agent orchestration.", "向无头 ACP 会话自动注入内置 `h2 mcp`，支持子 Agent 编排。"))),
+              )
+              .child(
+                this.toggleSwitch(t, "w-acp-inject-mcp", injectMcp, (_e, cx) =>
+                  this.saveAcpConfig({ injectMcp: !injectMcp }, cx),
+                ),
+              ),
+          ),
+      );
+  }
+
+  // Page 5: Shortcuts, h2 CLI & Ready to Go ----------------------------
+
+  pageFive(t) {
     const mac = this.isMac();
     const keyList = typeof keys === "function" ? keys() : [];
     const pal = boundShortcut(keyList, "app.palette", mac, mac ? "cmd-shift-p" : "ctrl-shift-p");
@@ -1533,7 +2044,7 @@ export default class Welcome extends View {
     const langNow = this.lang();
     const noSpaces = spaces().length === 0;
     const aiVerified = this.aiTestResult?.ok === true && Boolean(this.aiStatus?.configured);
-    const pages = [this.pageOne, this.pageTwo, this.pageThree, this.pageFour];
+    const pages = [this.pageOne, this.pageTwo, this.pageThree, this.pageFourAgents, this.pageFive];
 
     const dots = h_flex()
       .gap(6)

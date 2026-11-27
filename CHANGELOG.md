@@ -1,5 +1,47 @@
 # Changelog
 
+## v2.0.17
+
+#### 中文
+
+**新增功能**
+- **Drove 编排引擎七项核心升级**：
+  - **极简强 Schema Worker MCP (`h2 mcp --profile drove-worker`)**：为 Drove Worker 自动注入仅含 `drove_finish`、`drove_ask`、`drove_context` 的轻量 MCP 服务，动态嵌入任务 `outputSchema` 并保留 CLI 兜底。
+  - **双层角色权限护栏**：`readonly` / `scoped_write` Worker 新增毫秒级 Pre-Tool 事前拦截（`decide_drove_worker_permission` + 零 RPC 的 `h2 drove worker check-path` / `guard-hook`）与事后基线复核，不阻塞在人工审批。
+  - **热上下文分叉 (`forkFrom`) 与原地会话切模容灾 (`h2 drove route --in-place`)**：支持从协调器或上游任务热分叉上下文（同家族原生 JSONL 分叉 + 跨厂商自动提炼）；遇到 429/限流/配额耗尽时可在同适配器内原地热切模型，保留 Worktree 改动与已读上下文。
+  - **`#ref` 指针按需读取与共享契约板**：大体积上游 `result.data` 自动折叠为 `@task:<key>#data` 指针与摘要，新增 `#contract:<seq>` 频道契约发布/订阅与 `jsonPath` 局部切片读取。
+  - **对抗式破坏性证伪审查 (`review.mode: breaker | hybrid`)**：在临时隔离 Worktree 中锁定生产代码只读、仅允许编写破坏性测试，经 Daemon 独立重跑 `verifyCmd` 复现失败才触发打回，支持 `keepRegressionTests` 保留回归测试。
+  - **可溯源态势简报与 Drove Web 顶部简报栏 (`RunBriefing`)**：3 秒防抖自动刷新全局进度与阻塞风险，带确定性引用校验器剥离无据断言，Web UI 顶部提供可点击跳转的引用徽章。
+  - **动态改图与无级联取消**：新增 `h2 drove edit`（`PATCH /api/tasks/<id>`，含 DAG 环检测）与 `h2 drove cancel <task> --skip-ok`（剥离下游依赖而不触发级联跳过）。
+- **TRAE CLI 预设、桌面端 Agents 设置与自定义适配器配置**：新增 `trae`（TRAE CLI）预设与图标、设置页独立 `agents` 分区、`adapter.config.set` RPC/CLI 以及多项输入/菜单/工作区体验优化。
+
+**问题修复**
+- **Drove 调度、存储与并发集成十项可靠性修复**：
+  - 完成门禁阶段豁免 `TurnFinished` / Stall 误杀，落地 `task.timeout_sec` 墙钟超时熔断并先结算 `FailureKind::Timeout` 再停机以支持自动重试；剔除 `worker ask` 挂起与只读独立 Reviewer 避免卡死并发槽位。
+  - `state.json` 改为 200ms 防抖合并落盘并为非活跃 Worker 内存 Transcript 增加 LRU 淘汰；引入隔离临时 `GIT_INDEX_FILE` 快照避免污染主仓索引；Worktree 基线漂移无冲突合入后自动复跑 `verify` 并在语义冲突时回滚刷新；新增 Reviewer 并发限流与只读防篡改校验、Warm Worker 上下文膨胀自动退役与 `RunBudget` 预算熔断恢复，并修复流式估算输出 Token 统计为 0 的缺陷。
+- **修复 macOS 应用包内置 `h2` 与 OTA 升级同步**：macOS 打包与 OTA 流程现统一将 `h2` 嵌入 `Herdr2.app/Contents/Helpers/h2` 并独立签名，应用内 OTA 升级自动保留/同步更新内置 `h2` 避免断链。
+
+---
+
+#### English
+
+**New Features**
+- **Seven Major Drove Orchestration Upgrades**:
+  - **Minimal Schema-Driven Worker MCP (`h2 mcp --profile drove-worker`)**: Automatically injects a lightweight 3-tool MCP (`drove_finish`, `drove_ask`, `drove_context`) with dynamic task `outputSchema` embedding while keeping CLI fallback intact.
+  - **Two-Layer Role Permission Guardrails**: Enforces millisecond-level pre-tool permission filtering (`decide_drove_worker_permission` plus zero-RPC `h2 drove worker check-path` / `guard-hook`) for `readonly` / `scoped_write` workers alongside post-hoc baseline verification.
+  - **Hot Context Forking (`forkFrom`) & In-Place Model Failover (`h2 drove route --in-place`)**: Forks warm context from the coordinator or upstream tasks (native JSONL fork or cross-provider distilled handoff) and hot-swaps models in-place on 429/quota exhaustion without losing worktree edits or context.
+  - **`#ref` On-Demand Data Pointers & Shared Contract Board**: Collapses oversized upstream `result.data` into `@task:<key>#data` pointers with `jsonPath` slicing and adds `#contract:<seq>` pub/sub contract channels.
+  - **Adversarial Falsification Review (`review.mode: breaker | hybrid`)**: Runs breaker reviews in a temporary isolated worktree (production code read-only, tests writable) and only rejects when the daemon independently reproduces a non-zero `verifyCmd` exit, with optional `keepRegressionTests`.
+  - **Grounded RunBriefing & Drove Web Overview Bar**: Debounced AI status briefings with deterministic citation verification (stripping ungrounded claims) rendered in the Drove Web UI overview bar with clickable jump badges.
+  - **Live DAG Editing & Non-Cascading Cancel**: Added `h2 drove edit` (`PATCH /api/tasks/<id>` with cycle detection) and `h2 drove cancel <task> --skip-ok`.
+- **TRAE CLI Preset, Settings Agents Section & Adapter Configuration**: Added the `trae` (TRAE CLI) preset and icon, dedicated `agents` Settings section, `adapter.config.set` RPC/CLI, and QuickJS input/menu/workspace UX improvements.
+
+**Bug Fixes**
+- **Ten Drove Reliability, Storage & Concurrency Fixes**:
+  - Exempted synchronous completion gates from premature `TurnFinished`/stall kills, enforced `task.timeout_sec` wall-clock timeouts (recording `FailureKind::Timeout` before stopping so auto-retry works), and excluded `worker ask` waiters and standalone reviewers from `max_concurrency` slot counts.
+  - Added 200ms debounced `state.json` flushing with LRU worker transcript eviction, isolated temporary `GIT_INDEX_FILE` snapshots, post-merge semantic `verify` with automatic rollback/refresh on diverged worktrees, per-run reviewer concurrency limits with read-only tamper checks, warm-worker context bloat retirement, `RunBudget` soft/hard circuit breakers, and fixed streaming output token estimation.
+- **Fixed macOS Bundled `h2` Packaging & OTA Preservation**: Embedded and signed `Herdr2.app/Contents/Helpers/h2` across macOS release and OTA packages and preserved/upgraded bundled `h2` cleanly during in-app macOS OTA swaps.
+
 ## v2.0.16
 
 #### 中文

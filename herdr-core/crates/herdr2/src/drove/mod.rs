@@ -95,8 +95,12 @@ pub struct DroveRuntime {
     task_hints: Mutex<HashMap<String, String>>,
     attempt_baselines: Mutex<HashMap<String, roles::DirtyBaseline>>,
     active_asks: Mutex<HashSet<String>>,
+    active_dones: Mutex<HashSet<String>>,
     reminded_attempts: Mutex<HashSet<String>>,
     stall_warned: Mutex<HashSet<String>>,
+    budget_warned: Mutex<HashSet<String>>,
+    budget_ack_watermark: Mutex<HashMap<String, (u64, u64)>>,
+    reviewer_semaphores: Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
     loop_audit_watermark: Mutex<HashMap<String, u64>>,
     loop_audit_last_at: Mutex<HashMap<String, Instant>>,
     loop_audit_count: Mutex<HashMap<String, u32>>,
@@ -108,6 +112,8 @@ pub struct DroveRuntime {
     attempt_estimated_output: Mutex<HashMap<String, u64>>,
     conflict_cache: Mutex<HashMap<String, (bool, String)>>,
     run_merge_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    narrator_last_at: Mutex<HashMap<String, Instant>>,
+    narrator_inflight: Mutex<HashSet<String>>,
 }
 
 impl DroveRuntime {
@@ -157,6 +163,7 @@ impl DroveRuntime {
                 }
             }
         }
+        let persisted_worker_tokens = config::load_worker_tokens(&dpaths);
         let probe_is_full = disk_cache.probe.as_ref().is_some_and(|p| p.full_probe);
         let (pool_tx, pool_rx) = mpsc::unbounded_channel();
         Ok(Arc::new(Self {
@@ -181,13 +188,17 @@ impl DroveRuntime {
             full_probe_inflight: Mutex::new(None),
             agent_models_cache: Mutex::new(agent_models_cache),
             subs: Mutex::new(Vec::new()),
-            worker_tokens: Mutex::new(HashMap::new()),
+            worker_tokens: Mutex::new(persisted_worker_tokens),
             reserved_tasks: Mutex::new(HashSet::new()),
             task_hints: Mutex::new(HashMap::new()),
             attempt_baselines: Mutex::new(HashMap::new()),
             active_asks: Mutex::new(HashSet::new()),
+            active_dones: Mutex::new(HashSet::new()),
             reminded_attempts: Mutex::new(HashSet::new()),
             stall_warned: Mutex::new(HashSet::new()),
+            budget_warned: Mutex::new(HashSet::new()),
+            budget_ack_watermark: Mutex::new(HashMap::new()),
+            reviewer_semaphores: Mutex::new(HashMap::new()),
             loop_audit_watermark: Mutex::new(HashMap::new()),
             loop_audit_last_at: Mutex::new(HashMap::new()),
             loop_audit_count: Mutex::new(HashMap::new()),
@@ -199,7 +210,33 @@ impl DroveRuntime {
             attempt_estimated_output: Mutex::new(HashMap::new()),
             conflict_cache: Mutex::new(HashMap::new()),
             run_merge_locks: Mutex::new(HashMap::new()),
+            narrator_last_at: Mutex::new(HashMap::new()),
+            narrator_inflight: Mutex::new(HashSet::new()),
         }))
+    }
+
+    /// Acquires single-flight Run narrator slot; returns remaining debounce sleep before snapshotting.
+    pub fn enter_narrator(&self, run_id: &str, min_interval: Duration) -> Option<Duration> {
+        {
+            let mut inflight = self.narrator_inflight.lock().unwrap_or_else(|p| p.into_inner());
+            if !inflight.insert(run_id.to_string()) {
+                return None;
+            }
+        }
+        let last = self.narrator_last_at.lock().unwrap_or_else(|p| p.into_inner()).get(run_id).copied();
+        let delay = match last {
+            Some(ts) => min_interval.saturating_sub(ts.elapsed()),
+            None => Duration::ZERO,
+        };
+        Some(delay)
+    }
+
+    pub fn leave_narrator(&self, run_id: &str) {
+        self.narrator_last_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(run_id.to_string(), Instant::now());
+        self.narrator_inflight.lock().unwrap_or_else(|p| p.into_inner()).remove(run_id);
     }
 
     /// Refreshes mirrored AI connection fields in `DroveConfig` after `ai.settings.set`.
@@ -227,7 +264,6 @@ impl DroveRuntime {
         self.loop_audit_watermark.lock().unwrap_or_else(|p| p.into_inner()).remove(attempt_id);
         self.loop_audit_last_at.lock().unwrap_or_else(|p| p.into_inner()).remove(attempt_id);
         self.loop_audit_count.lock().unwrap_or_else(|p| p.into_inner()).remove(attempt_id);
-        self.attempt_min_turn.lock().unwrap_or_else(|p| p.into_inner()).remove(attempt_id);
         self.attempt_estimated_output.lock().unwrap_or_else(|p| p.into_inner()).remove(attempt_id);
     }
 
@@ -306,10 +342,10 @@ impl DroveRuntime {
     /// Accumulates estimated streamed output tokens (`bytes / 4`) for an attempt while an adapter
     /// (such as `agy`) only emits coarse context-window totals without split `output` tokens.
     pub fn add_attempt_estimated_output(&self, attempt_id: &str, delta_tokens: u64) -> u64 {
-        if delta_tokens == 0 {
-            return 0;
-        }
         let mut map = self.attempt_estimated_output.lock().unwrap_or_else(|p| p.into_inner());
+        if delta_tokens == 0 {
+            return map.get(attempt_id).copied().unwrap_or(0);
+        }
         let entry = map.entry(attempt_id.to_string()).or_insert(0);
         *entry = entry.saturating_add(delta_tokens);
         *entry
@@ -467,7 +503,12 @@ impl DroveRuntime {
 
     pub fn register_worker_token(&self, worker_id: &str) -> String {
         let tok = crypto::rand_secret();
-        self.worker_tokens.lock().unwrap_or_else(|p| p.into_inner()).insert(worker_id.to_string(), tok.clone());
+        let snap = {
+            let mut map = self.worker_tokens.lock().unwrap_or_else(|p| p.into_inner());
+            map.insert(worker_id.to_string(), tok.clone());
+            map.clone()
+        };
+        config::save_worker_tokens(&self.paths, &snap);
         tok
     }
 
@@ -481,7 +522,13 @@ impl DroveRuntime {
     }
 
     pub fn remove_worker_token(&self, worker_id: &str) {
-        self.worker_tokens.lock().unwrap_or_else(|p| p.into_inner()).remove(worker_id);
+        let maybe_snap = {
+            let mut map = self.worker_tokens.lock().unwrap_or_else(|p| p.into_inner());
+            map.remove(worker_id).map(|_| map.clone())
+        };
+        if let Some(snap) = maybe_snap {
+            config::save_worker_tokens(&self.paths, &snap);
+        }
     }
 
     pub fn try_reserve_task(&self, task_id: &str) -> bool {
@@ -518,6 +565,56 @@ impl DroveRuntime {
 
     pub fn has_active_ask(&self, attempt_id: &str) -> bool {
         self.active_asks.lock().unwrap_or_else(|p| p.into_inner()).contains(attempt_id)
+    }
+
+    /// Marks `attempt_id` as actively executing `worker done` gates (`verify` / `review` / `merge`).
+    /// Returns `false` when another `worker done` call for the same attempt is already in flight.
+    pub fn enter_done(&self, attempt_id: &str) -> bool {
+        self.active_dones.lock().unwrap_or_else(|p| p.into_inner()).insert(attempt_id.to_string())
+    }
+
+    pub fn leave_done(&self, attempt_id: &str) {
+        self.active_dones.lock().unwrap_or_else(|p| p.into_inner()).remove(attempt_id);
+    }
+
+    pub fn has_active_done(&self, attempt_id: &str) -> bool {
+        self.active_dones.lock().unwrap_or_else(|p| p.into_inner()).contains(attempt_id)
+    }
+
+    /// Returns `true` the first time this Run crosses its soft (80%) budget warning threshold.
+    pub fn mark_budget_warned(&self, run_id: &str) -> bool {
+        self.budget_warned.lock().unwrap_or_else(|p| p.into_inner()).insert(run_id.to_string())
+    }
+
+    pub fn clear_budget_state(&self, run_id: &str) {
+        self.budget_warned.lock().unwrap_or_else(|p| p.into_inner()).remove(run_id);
+        self.budget_ack_watermark.lock().unwrap_or_else(|p| p.into_inner()).remove(run_id);
+    }
+
+    /// Records the current `(tokens, cost)` watermark when a user explicitly resumes a `budget_exceeded` Run
+    /// without raising the cap, preventing an immediate re-pause until additional tokens/cost are spent.
+    pub fn ack_budget_pause(&self, run_id: &str, used_tokens: u64, used_cost: f64) {
+        let micros = (used_cost.max(0.0) * 1_000_000.0).round() as u64;
+        self.budget_ack_watermark
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(run_id.to_string(), (used_tokens, micros));
+    }
+
+    pub fn is_budget_already_acked(&self, run_id: &str, used_tokens: u64, used_cost: f64) -> bool {
+        let micros = (used_cost.max(0.0) * 1_000_000.0).round() as u64;
+        self.budget_ack_watermark
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(run_id)
+            .is_some_and(|&(ack_tok, ack_cost)| used_tokens <= ack_tok && micros <= ack_cost)
+    }
+
+    /// Returns a per-Run semaphore capping concurrent adversarial reviewer spawns to `limit.clamp(1, 4)`.
+    pub fn reviewer_semaphore(&self, run_id: &str, limit: usize) -> Arc<tokio::sync::Semaphore> {
+        let permits = limit.clamp(1, 4);
+        let mut map = self.reviewer_semaphores.lock().unwrap_or_else(|p| p.into_inner());
+        map.entry(run_id.to_string()).or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(permits))).clone()
     }
 
     /// Returns `true` if already reminded before, else records reminder and returns `false`.
@@ -573,6 +670,7 @@ impl DroveRuntime {
     }
 
     pub fn shutdown(&self) {
+        let _ = self.store.flush_now();
         self.http_stop.notify_waiters();
         let subs: Vec<FramedSub> = self.subs.lock().unwrap_or_else(|p| p.into_inner()).drain(..).collect();
         for s in subs {
@@ -644,6 +742,7 @@ impl DroveRuntime {
                 conflict_policy: cfg.ai.conflict_policy.clone(),
                 question_mode: cfg.ai.question_mode.clone(),
                 loop_detect: cfg.ai.loop_detect.clone(),
+                run_narrator: cfg.ai.run_narrator,
             },
         }
     }
@@ -757,6 +856,9 @@ impl DroveRuntime {
             if let Some(b) = ai.task_enrich {
                 next.ai.task_enrich = b;
             }
+            if let Some(b) = ai.run_narrator {
+                next.ai.run_narrator = b;
+            }
             if let Some(s) = ai.question_mode {
                 next.ai.question_mode = s;
             }
@@ -765,6 +867,9 @@ impl DroveRuntime {
             }
             if let Some(s) = ai.loop_detect {
                 next.ai.loop_detect = s;
+            }
+            if let Some(b) = ai.run_narrator {
+                next.ai.run_narrator = b;
             }
             patch_api_key = ai.api_key;
             patch_clear = ai.clear_key.unwrap_or(false);
@@ -961,9 +1066,10 @@ impl DroveRuntime {
     }
 }
 
-/// Starts the background Drove HTTP/SSE service, pool signal loop, and DAG scheduler.
+/// Starts the background Drove HTTP/SSE service, store flush loop, pool signal loop, and DAG scheduler.
 pub fn start_background(core: &Arc<Core>) {
     core.drove.attach_core(core);
+    tokio::spawn(store::run_flush_loop(core.drove.store.clone(), core.drove.http_stop.clone()));
     tokio::spawn(http::serve_http(core.clone()));
     if let Some(rx) = core.drove.take_pool_rx() {
         tokio::spawn(pool::run_signal_loop(core.clone(), rx));

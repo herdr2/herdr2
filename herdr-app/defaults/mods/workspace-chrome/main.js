@@ -42,13 +42,27 @@ function find(node, id) {
 // The sidebar's rail goes by its width, not a flag: dragging its edge narrows it too.
 const narrow = () => (find(layout(), "sidebar")?.size?.px ?? Infinity) < 160;
 
-// To the rail (on macOS wide enough for the traffic lights), or back to the width it had.
+// Hide the sidebar completely (matching the layout.toggle:sidebar shortcut),
+// or restore full width if a saved/dragged layout left it in the narrow rail.
 function toggleSidebar() {
-  const width = find(layout(), "sidebar")?.size?.px;
-  if (!narrow()) setShared("sidebar.width", width);
-  // Mods edited before the rail went by width still read the flag.
-  setShared("sidebar.collapsed", !narrow());
-  run("layout.resize", { id: "sidebar", px: narrow() ? (shared("sidebar.width") ?? 268) : window()?.platform === "macos" ? 76 : 44 });
+  const sidebar = find(layout(), "sidebar");
+  if (sidebar?.hidden) {
+    if (narrow()) {
+      setShared("sidebar.collapsed", false);
+      run("layout.resize", { id: "sidebar", px: shared("sidebar.width") ?? 268 });
+    }
+    run("layout.show", { id: "sidebar" });
+    return;
+  }
+  if (narrow()) {
+    setShared("sidebar.collapsed", false);
+    run("layout.resize", { id: "sidebar", px: shared("sidebar.width") ?? 268 });
+    return;
+  }
+  const width = sidebar?.size?.px;
+  if (typeof width === "number" && width >= 160) setShared("sidebar.width", width);
+  setShared("sidebar.collapsed", false);
+  run("layout.toggle", { id: "sidebar" });
 }
 
 export default class WorkspaceChrome extends View {
@@ -78,6 +92,6 @@ export default class WorkspaceChrome extends View {
       .when(!collapsed, el => el.child(h_flex().flex_1().gap(8).items_center().child(image("frame/welcome/herdr.png").size(20).rounded(5)).child(div().font_semibold().text_color(t.foreground).child("Herdr2"))))
       .when(!collapsed, el => el.child(this.button("search", svg("mods/workspace-chrome/search.svg").size(15), () => run("mod.open", { name: "picker" }), withShortcut(tr("Quick switcher", "快速切换"), "mod.open:picker"))))
       // On the macOS rail the traffic lights fill the row; the agents list's » unfolds it.
-      .when(!(collapsed && window()?.platform === "macos"), el => el.child(this.button("sidebar-toggle", svg("mods/workspace-chrome/sidebar.svg").size(15), toggleSidebar, withShortcut(tr("Toggle sidebar", "切换侧边栏"), "layout.toggle:sidebar"))));
+      .when(!(collapsed && window()?.platform === "macos"), el => el.child(this.button("sidebar-toggle", svg("mods/workspace-chrome/sidebar.svg").size(15), toggleSidebar, withShortcut(collapsed ? tr("Expand sidebar", "展开侧边栏") : tr("Hide sidebar", "收起侧边栏"), "layout.toggle:sidebar"))));
   }
 }

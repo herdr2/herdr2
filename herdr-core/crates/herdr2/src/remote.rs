@@ -1089,6 +1089,7 @@ pub fn route(core: &Core, method: &str, params: &Value) -> Result<Option<(To, Va
             | "adapter.status"
             | "adapter.install"
             | "adapter.update"
+            | "adapter.config.set"
             | "ai.status"
             | "ai.settings.set"
             | "ai.models"

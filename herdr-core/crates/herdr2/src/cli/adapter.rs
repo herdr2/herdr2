@@ -48,6 +48,27 @@ pub(crate) enum AdapterAction {
         #[arg(long, value_name = "MACHINE")]
         on: Option<String>,
     },
+    /// Update ACP detection & runtime configuration in config.toml.
+    Config {
+        /// Automatically install missing managed ACP adapters (`true` or `false`).
+        #[arg(long, value_name = "BOOL")]
+        auto_install: Option<bool>,
+        /// Custom ACP Registry index URL.
+        #[arg(long, value_name = "URL")]
+        registry_url: Option<String>,
+        /// Reset `acp_registry_url` back to the official ACP Registry default.
+        #[arg(long)]
+        clear_registry_url: bool,
+        /// Default ACP permission policy (`approve-reads`, `approve-all`, `ask`, `deny-all`).
+        #[arg(long, value_name = "MODE")]
+        default_permissions: Option<crate::permissions::PermissionMode>,
+        /// Auto-inject the built-in `herdr2` MCP server into ACP sessions (`true` or `false`).
+        #[arg(long, value_name = "BOOL")]
+        inject_mcp: Option<bool>,
+        /// Target remote machine (`h2 machine ls`).
+        #[arg(long, value_name = "MACHINE")]
+        on: Option<String>,
+    },
 }
 
 pub(crate) fn run(paths: &Paths, cli: AdapterCli) -> Result<Out, RpcError> {
@@ -85,6 +106,29 @@ pub(crate) fn run(paths: &Paths, cli: AdapterCli) -> Result<Out, RpcError> {
             }
             let r = call(paths, "adapter.update", params)?;
             let human = format_install(&r);
+            Ok(Out { json: r, human })
+        }
+        AdapterAction::Config { auto_install, registry_url, clear_registry_url, default_permissions, inject_mcp, on } => {
+            let mut params = json!({});
+            if let Some(v) = auto_install {
+                params["auto_install_adapters"] = json!(v);
+            }
+            if clear_registry_url {
+                params["acp_registry_url"] = json!("");
+            } else if let Some(u) = registry_url {
+                params["acp_registry_url"] = json!(u);
+            }
+            if let Some(mode) = default_permissions {
+                params["default_permissions"] = json!(mode);
+            }
+            if let Some(v) = inject_mcp {
+                params["inject_mcp"] = json!(v);
+            }
+            if let Some(m) = on {
+                params["on"] = json!(m);
+            }
+            let r = call(paths, "adapter.config.set", params)?;
+            let human = format_status(&r);
             Ok(Out { json: r, human })
         }
     }

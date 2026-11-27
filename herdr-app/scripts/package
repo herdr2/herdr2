@@ -9,7 +9,9 @@
 # otherwise ad hoc.
 # Windows (native or Linux cargo-xwin cross-compile): `herdr2/` holding
 # `herdr2.exe` and `herdr2.svg`.
-# Optional env: HERDR2_DEFAULT_RELEASES_URL bakes a default release server URL.
+# Optional env:
+#   HERDR2_DEFAULT_RELEASES_URL bakes a default release server URL.
+#   HERDR2_CORE_BIN             on macOS, embeds `h2` at Herdr2.app/Contents/Helpers/h2.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -101,8 +103,18 @@ else
     <key>NSHighResolutionCapable</key><true/>
     <key>LSEnvironment</key><dict/></dict></plist>
 PLIST
+  if [[ -n ${HERDR2_CORE_BIN:-} ]]; then
+    [[ -x $HERDR2_CORE_BIN ]] || { echo "package: HERDR2_CORE_BIN is not executable: $HERDR2_CORE_BIN" >&2; exit 1; }
+    mkdir -p "$app/Contents/Helpers"
+    cp "$HERDR2_CORE_BIN" "$app/Contents/Helpers/h2"
+    chmod 755 "$app/Contents/Helpers/h2"
+    scripts/mac-sign "$app/Contents/Helpers/h2"
+  fi
   scripts/mac-sign "$app"
   tar -czf "$out" -C "$work" Herdr2.app
+  if [[ -n ${HERDR2_CORE_BIN:-} ]]; then
+    tar -tzf "$out" | grep -qx "Herdr2.app/Contents/Helpers/h2"
+  fi
 fi
 tar -xOf "$out" "$notices_path" | cmp - THIRD-PARTY-NOTICES
 license_path="${notices_path%/*}/LICENSE"

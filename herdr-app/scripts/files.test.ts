@@ -722,3 +722,131 @@ test("Files source code editor and line-review list wrap lines to panel width", 
   expect(source).not.toContain("files-review-x");
   expect(source).toContain(".whitespace_normal().child(row.text)");
 });
+
+test("Files formats absolute paths across POSIX and Windows roots and opens path context menu on right-click", async () => {
+  const helperSource = source.slice(
+    source.indexOf("function isAbsolutePath("),
+    source.indexOf("\nfunction relativizeToRoot("),
+  );
+  const formatAbsolutePath = new Function(`${helperSource}; return formatAbsolutePath;`)() as (root: string, rel: string) => string;
+
+  expect(formatAbsolutePath("/home/user/repo", "src/main.rs")).toBe("/home/user/repo/src/main.rs");
+  expect(formatAbsolutePath("/home/user/repo/", "src/nested")).toBe("/home/user/repo/src/nested");
+  expect(formatAbsolutePath("/", "etc/hosts")).toBe("/etc/hosts");
+  expect(formatAbsolutePath("/home/user/repo", "")).toBe("/home/user/repo");
+  expect(formatAbsolutePath("C:\\work\\repo", "src/main.rs")).toBe("C:\\work\\repo\\src\\main.rs");
+  expect(formatAbsolutePath("C:\\", "Users/me")).toBe("C:\\Users\\me");
+  expect(formatAbsolutePath("C:/work/repo", "src/main.rs")).toBe("C:/work/repo/src/main.rs");
+
+  // Exercise menu mod with tab: "file"
+  const menuSource = await readFile(new URL("../defaults/mods/menu/main.js", import.meta.url), "utf8");
+  class Element {
+    nodes: any[] = [];
+    calls: Record<string, any[]> = {};
+    constructor() {
+      const proxy: Element = new Proxy(this, {
+        get: (target, key: string) => key in target ? (target as any)[key] : (...args: any[]) => {
+          if (key === "child") target.nodes.push(args[0]);
+          else if (key === "children") target.nodes.push(...args[0]);
+          else if (key === "when") { if (args[0]) args[1](proxy); }
+          else target.calls[key] = args;
+          return proxy;
+        },
+      });
+      return proxy;
+    }
+  }
+  const el = () => new Element();
+  const findById = (node: any, id: string): any => {
+    if (!node || typeof node !== "object") return null;
+    if (node.calls?.id?.[0] === id) return node;
+    for (const ch of node.nodes ?? []) {
+      const hit = findById(ch, id);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  const collectTexts = (node: any): string[] => {
+    if (!node) return [];
+    if (typeof node === "string") return [node];
+    return (node.nodes ?? []).flatMap((ch: any) => collectTexts(ch));
+  };
+
+  let currentProps: any = {
+    overlay: "ov-file",
+    tab: "file",
+    target: { absolutePath: "/home/user/repo/src/main.rs", relativePath: "src/main.rs", dir: false },
+  };
+  let currentLang = "zh-CN";
+  const closedOverlays: string[] = [];
+  const notifications: any[] = [];
+  const copied: string[] = [];
+  const menuValues = {
+    View: class {},
+    div: el,
+    svg: el,
+    v_flex: el,
+    h_flex: el,
+    run() {},
+    props: () => currentProps,
+    closeOverlay: (id: string) => closedOverlays.push(id),
+    openOverlay() {},
+    theme: () => ({}),
+    keys: () => [],
+    terminals: () => [],
+    spaces: () => [],
+    panes: () => [],
+    exec: async () => ({ code: 1, stdout: "", stderr: "" }),
+    settings: () => ({ language: currentLang }),
+    h2: async () => ({ code: 0, stdout: "", stderr: "" }),
+    notify: (n: any) => notifications.push(n),
+  };
+  const Menu = new Function(
+    ...Object.keys(menuValues),
+    menuSource.replace(/^import .*;\n/gm, "").replace("export default class Menu", "return class Menu"),
+  )(...Object.values(menuValues));
+
+  const view = new Menu();
+  view.init({}, { focus_handle: () => ({ focus() {} }), spawn() {} });
+  const treeZh = view.render();
+  const mi0 = findById(treeZh, "mi-0");
+  const mi1 = findById(treeZh, "mi-1");
+  expect(collectTexts(mi0)).toContain("复制绝对路径");
+  expect(collectTexts(mi1)).toContain("复制相对路径");
+
+  // Click copy absolute path
+  mi0.calls.on_click[0]({}, { write_to_clipboard: (t: string) => copied.push(t) });
+  expect(closedOverlays).toEqual(["ov-file"]);
+  expect(copied).toEqual(["/home/user/repo/src/main.rs"]);
+  expect(notifications).toEqual([{ title: "已复制绝对路径", body: "/home/user/repo/src/main.rs", level: "info" }]);
+
+  // Click copy relative path for a folder in English
+  copied.length = 0;
+  notifications.length = 0;
+  currentLang = "en";
+  currentProps = {
+    overlay: "ov-dir",
+    tab: "file",
+    target: { absolutePath: "/home/user/repo/src/utils", relativePath: "src/utils", dir: true },
+  };
+  const treeEn = view.render();
+  expect(collectTexts(findById(treeEn, "mi-0"))).toContain("Copy absolute path");
+  expect(collectTexts(findById(treeEn, "mi-1"))).toContain("Copy relative path");
+  findById(treeEn, "mi-1").calls.on_click[0]({}, { write_to_clipboard: (t: string) => copied.push(t) });
+  expect(copied).toEqual(["src/utils"]);
+  expect(notifications).toEqual([{ title: "Copied relative path", body: "src/utils", level: "info" }]);
+
+  // Root folder header (empty relativePath): only absolute path item is shown
+  currentProps = {
+    overlay: "ov-root",
+    tab: "file",
+    target: { absolutePath: "/home/user/repo", relativePath: "", dir: true },
+  };
+  const treeRoot = view.render();
+  expect(findById(treeRoot, "mi-0")).not.toBeNull();
+  expect(findById(treeRoot, "mi-1")).toBeNull();
+
+  // Verify files/main.js wires right-click on both file/folder rows and root header
+  expect(source).toContain('on_mouse_down("right", (e, cx) => {\n          stopMouse(e, cx);\n          this.openPathMenu(path, entry.dir);');
+  expect(source).toContain('this.openPathMenu("", true);');
+});

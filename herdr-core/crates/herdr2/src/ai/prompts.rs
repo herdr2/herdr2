@@ -163,12 +163,19 @@ Output JSON: {"message":"type(scope): concise summary"}
 Purpose: Rewrite a developer's rough draft prompt into a clearer, more structured, unambiguous prompt for a coding agent (ACP or CLI) while strictly preserving original intent, constraints, file paths, symbols, and commands.
 Input fields: `prompt`, `agent_kind` (`acp`|`cli`), `context` (optional metadata: agent/cli, task, progress, cwd), `recent_turns` (optional recent conversation excerpts), `recent_steps` (optional recent tool actions/errors/approvals), `screen_tail` (optional recent terminal screen lines).
 Rules:
-- Match the language of `prompt` (use `lang` only if ambiguous). Never translate code identifiers, file paths, commands, or error strings.
+- ALWAYS rewrite `prompt` itself; NEVER answer questions about `screen_tail`, terminal metrics, or status bars, and NEVER reply conversationally outside JSON.
+- Match the language of `prompt` strictly (e.g., Chinese draft -> Chinese `polished`; use `lang` only if ambiguous). Never translate code identifiers, file paths, commands, or error strings.
+- Preserve any leading slash command (such as `/grill-me`, `/plan`, `/compact`, `/review`) verbatim at the beginning of `polished`.
 - Clarify vague phrasing, remove redundancy, and organize multi-step requirements into concise sentences or short bullets when helpful; keep simple single-step requests brief without bloating.
-- Use `context`, `recent_turns`, `recent_steps`, and `screen_tail` ONLY to resolve ambiguous references (such as "it", "that error", "the second option", "that file") and align file paths/terminology with the active session; never inject unrelated history or invent requirements the user did not ask for.
+- Use `context`, `recent_turns`, `recent_steps`, and `screen_tail` ONLY to resolve ambiguous references (such as "it", "that error", "the second option", "that file") and align file paths/terminology with the active session; ignore TUI footers/telemetry and never inject unrelated history or invent requirements the user did not ask for.
 - When `agent_kind` is `"cli"`, keep the layout compact and avoid unnecessary blank lines (`\n\n`) so the prompt remains concise and directly editable in a CLI input box.
 - Never invent new requirements or change user constraints.
-Output JSON: {"polished":"rewritten prompt ready to send","summary":"<=30 char brief note of improvements"}"#;
+Output JSON: {"polished":"rewritten prompt ready to send","summary":"<=30 char brief note of improvements"}
+
+[OP: run_briefing]
+Purpose: Grounded situational briefing for a Drove Run from `tasks`, `pending_messages`, `failed_attempts`, `contracts`, `events`.
+Rules: Every item in `threads`/`attention`/`risks` MUST cite >=1 real entity from `<input>` (`refs`: `[{"kind":"task|attempt|message|event|contract","target":"exact id/key","label":"short key"}]`); never invent ungrounded claims. `headline` <=50 zh/<=100 en chars; `runningSummary` <=120 zh/<=240 en chars or `null`; match `lang`.
+Output JSON: {"headline":"...","runningSummary":null,"threads":[{"id":"t1","title":"...","state":"running|blocked|done|failed","now":"...","refs":[...]}],"attention":[{"id":"a1","kind":"question|failure|circuit|stall","severity":"high|medium","title":"...","why":"...","refs":[...]}],"risks":[{"id":"r1","text":"...","refs":[...]}]}"#;
 
 /// Returns true when the built-in control-plane `op` contract expects a single JSON object response.
 pub fn op_expects_json(op: &str) -> bool {
@@ -193,6 +200,7 @@ pub fn op_expects_json(op: &str) -> bool {
             | "commit_message"
             | "polish_prompt"
             | "roles_configure"
+            | "run_briefing"
     )
 }
 
@@ -260,7 +268,10 @@ pub fn compact_system_for_op(op: &str) -> &'static str {
             "Pure text JSON commit message writer (no tools). Write a single-line conventional commit message (<=72 chars): {\"message\":\"type(scope): summary\"}. Reply JSON only."
         }
         "polish_prompt" => {
-            "Pure text JSON prompt editor (no tools). Rewrite the coding prompt for clarity and structure while keeping exact intent, constraints, paths, and original language; use supplied session context/recent_turns/screen_tail only to disambiguate references without inventing requirements. Reply JSON only: {\"polished\":\"...\",\"summary\":\"<=30 chars\"}."
+            "Pure text JSON prompt editor (no tools). Rewrite ONLY `prompt` for clarity and structure while strictly preserving its intent, leading slash commands (e.g. /grill-me), constraints, paths, and original language; use session context/screen_tail only to disambiguate references, ignore TUI status/metrics footers, and never reply conversationally. Reply JSON only: {\"polished\":\"...\",\"summary\":\"<=30 chars\"}."
+        }
+        "run_briefing" => {
+            "Pure text JSON situational narrator (no tools). Summarize Drove Run state into {\"headline\":\"...\",\"runningSummary\":null,\"threads\":[],\"attention\":[],\"risks\":[]} citing ONLY real task/attempt/message/event/contract IDs from input in `refs`."
         }
         _ => "You are a pure text assistant with NO tools or shell access. Never emit tool tags or shell commands.",
     }
@@ -314,7 +325,7 @@ mod tests {
     fn shared_system_prompt_crosses_1024_token_cache_threshold_and_is_static() {
         let est = estimate_tokens(HERDR2_CONTROL_PLANE_SYSTEM);
         assert!(est >= 1024, "expected >= 1024 tokens for KV-cache activation, got {est}");
-        assert!(est <= 3600, "shared system prompt should stay compact, got {est}");
+        assert!(est <= 4096, "shared system prompt should stay compact, got {est}");
         for op in [
             "pty_status",
             "notes_digest",
@@ -337,6 +348,7 @@ mod tests {
             "catchup_briefing",
             "commit_message",
             "polish_prompt",
+            "run_briefing",
         ] {
             assert!(HERDR2_CONTROL_PLANE_SYSTEM.contains(&format!("[OP: {op}]")), "missing {op}");
         }

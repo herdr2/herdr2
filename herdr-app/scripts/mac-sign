@@ -5,7 +5,11 @@ set -euo pipefail
 
 app=${1:?usage: mac-sign app-or-dmg}
 if [[ $app != *.dmg && -z ${APPLE_CERTIFICATE_P12:-} && -z ${APPLE_CERTIFICATE_PASSWORD:-} ]]; then
-  codesign --force --sign - "$app"
+  if [[ -d $app && $app == *.app ]]; then
+    codesign --force --deep --sign - "$app"
+  else
+    codesign --force --sign - "$app"
+  fi
   exit 0
 fi
 : "${APPLE_CERTIFICATE_P12:?missing certificate}"
@@ -39,8 +43,11 @@ identity=$(security find-identity -v -p codesigning "$keychain" | awk '/"Develop
 [[ -n $identity ]] || { echo 'mac-sign: no Developer ID Application identity found' >&2; exit 1; }
 if [[ $app == *.dmg ]]; then
   codesign --force --timestamp --keychain "$keychain" --sign "$identity" "$app"
-else
+elif [[ -d $app && $app == *.app ]]; then
   # QuickJS uses MAP_JIT; hardened runtime otherwise blocks hot mod code.
   codesign --force --options runtime --timestamp --entitlements "$(dirname "$0")/macos-entitlements.plist" --keychain "$keychain" --sign "$identity" "$app"
+else
+  # Embedded helper binaries (e.g. Contents/Helpers/h2) do not need JIT entitlements.
+  codesign --force --options runtime --timestamp --keychain "$keychain" --sign "$identity" "$app"
 fi
 codesign --verify --deep --strict "$app"

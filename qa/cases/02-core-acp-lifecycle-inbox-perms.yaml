@@ -360,8 +360,8 @@ cases:
     priority: P1
     platforms: [linux, macos, windows]
     covers:
-      rpc: [adapter.status, adapter.install, adapter.update]
-      cli: ["h2 adapter status", "h2 adapter install", "h2 adapter update"]
+      rpc: [adapter.status, adapter.install, adapter.update, adapter.config.set]
+      cli: ["h2 adapter status", "h2 adapter install", "h2 adapter update", "h2 adapter config-set"]
       app_commands: []
       mods: []
       frames: []

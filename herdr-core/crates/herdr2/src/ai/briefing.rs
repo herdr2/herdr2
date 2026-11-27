@@ -823,6 +823,9 @@ mod tests {
             cache: None,
             cached_from: None,
             retry_on_worker_reported: None,
+            fork_from: None,
+            fork_mode: None,
+            channels: Vec::new(),
         }
     }
 
@@ -921,6 +924,7 @@ mod tests {
             trashed_at: None,
             status_before_trash: None,
             ai_usage: None,
+            briefing: None,
             machine: None,
             created_at: String::new(),
             updated_at: String::new(),

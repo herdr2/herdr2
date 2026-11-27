@@ -432,11 +432,13 @@ pub(super) async fn run_adversarial_review_gate(
     let round = attempt.review_round.as_ref().map(|r| r.round + 1).unwrap_or(1);
 
     let _ = core.drove.store.update_task(&task.id, |t| t.exec_phase = Some(TaskPhase::Review));
+    let _rev_permit =
+        core.drove.reviewer_semaphore(&run.id, run.max_concurrency as usize).acquire_owned().await.ok();
 
     // 1. Capture candidate patch (`<artifact>.patch`) and tree SHA.
+    let author_baseline = core.drove.get_attempt_baseline(&attempt.id).unwrap_or_default();
     let tree_sha = git_tree_sha(work_cwd);
-    let patch_text =
-        capture_candidate_patch(work_cwd, &core.drove.get_attempt_baseline(&attempt.id).unwrap_or_default());
+    let patch_text = capture_candidate_patch(work_cwd, &author_baseline);
     let artifact_id = format!("review-{}-r{round}", attempt.id);
     let _ = core.drove.store.write_artifact(&run.id, &format!("{artifact_id}.patch"), patch_text.as_bytes());
 
@@ -454,6 +456,31 @@ pub(super) async fn run_adversarial_review_gate(
     } else {
         None
     };
+
+    let mode = spec.mode.unwrap_or(ReviewMode::Static);
+    if matches!(mode, ReviewMode::Breaker | ReviewMode::Hybrid) {
+        let breaker_ran = run_adversarial_breaker_pass(
+            core,
+            run,
+            task,
+            author_worker,
+            attempt,
+            spec,
+            work_cwd,
+            &patch_text,
+            tree_sha.clone(),
+            &artifact_id,
+            delta_artifact_id.clone(),
+            round,
+            max_rounds,
+            is_post_handoff,
+        )
+        .await?;
+        if mode == ReviewMode::Breaker && breaker_ran {
+            record_review_passed(&core.drove.store, &task.id);
+            return Ok(());
+        }
+    }
 
     // 2. Build ordered reviewer candidate chain (supporting fallback + differentAgent + quota filtering + warm reuse).
     let cfg = core.drove.config_snapshot();
@@ -673,7 +700,11 @@ pub(super) async fn run_adversarial_review_gate(
                     effort: Some(rev_effort.as_str().to_string()),
                     fast: Some(rev_fast),
                     access: RoleAccessMode::Readonly,
+                    allowed_paths: Vec::new(),
                     isolate_secrets: true,
+                    resume_session_id: None,
+                    fallback_handoff_context: None,
+                    lineage: None,
                 },
             )
             .await
@@ -696,7 +727,13 @@ pub(super) async fn run_adversarial_review_gate(
         };
         let _ = reused_worker;
 
-        let patch_preview: String = patch_text.chars().take(16_000).collect();
+        const MAX_INLINE_REVIEW_PATCH_CHARS: usize = 48_000;
+        let mut patch_preview: String = patch_text.chars().take(MAX_INLINE_REVIEW_PATCH_CHARS).collect();
+        if patch_text.chars().count() > MAX_INLINE_REVIEW_PATCH_CHARS {
+            patch_preview.push_str(&format!(
+                "\n... [diff truncated at {MAX_INLINE_REVIEW_PATCH_CHARS} chars; inspect full files under `{work_cwd}` or run `h2 drove worker read review`]"
+            ));
+        }
         let mode_title = if round == 1 { "Full Diff (Round 1)" } else { "Delta Diff" };
         let criteria_block = spec
             .criteria
@@ -710,15 +747,27 @@ pub(super) async fn run_adversarial_review_gate(
         } else {
             ""
         };
+        let cwd_disambiguation = if work_cwd != run.cwd {
+            format!(
+                "IMPORTANT PATH RULE: Candidate changes live in isolated worktree `{work_cwd}` (your process cwd is base repo `{}`). When reading files or searching symbols, ALWAYS pass absolute paths under `{work_cwd}/...` — NEVER relative paths (which would read unmerged stale files in `{}`).\n",
+                run.cwd, run.cwd
+            )
+        } else {
+            String::new()
+        };
         let review_prompt = format!(
             "You are the read-only Drove Reviewer for task `{}` (`{}`).\n\
-             Workspace: `{work_cwd}` (READONLY — do NOT modify files).\n\
-             Target: {}\nAcceptance: {}\n{criteria_block}{post_handoff_block}\n\
+             Candidate workspace: `{work_cwd}` (READONLY — do NOT modify, create, or delete any files).\n\
+             {cwd_disambiguation}Target: {}\nAcceptance: {}\n{criteria_block}{post_handoff_block}\n\
              {mode_title}:\n```diff\n{patch_preview}\n```\n\n\
              Reply ONLY with a single JSON object (no other prose if possible):\n\
              {{\"verdict\":\"approve\"|\"changes_requested\",\"summary\":\"...\",\"findings\":[{{\"severity\":\"high\"|\"medium\",\"file\":\"...\",\"message\":\"...\"}}]}}",
             task.key, task.title, task.spec.target, task.spec.acceptance
         );
+
+        let rev_work_baseline = super::roles::capture_dirty_baseline(work_cwd);
+        let rev_main_baseline =
+            (work_cwd != run.cwd).then(|| super::roles::capture_dirty_baseline(&run.cwd));
 
         let prev_turn = core.lock().reg.agents.get(&spawn_agent_id).map(|a| a.turn).unwrap_or(0);
         let prev_entry_len = core.read_transcript_entries(spawn_agent_id).map(|v| v.len()).unwrap_or(0);
@@ -754,6 +803,24 @@ pub(super) async fn run_adversarial_review_gate(
             tokio::pin!(notified);
             notified.as_mut().enable();
             let _ = tokio::time::timeout(Duration::from_millis(400), notified).await;
+        }
+
+        // Guard against rogue file writes in unsandboxed environments (e.g. Windows job-object or container without bwrap).
+        let mut rogue_touched = diff_touched_paths(work_cwd, &rev_work_baseline);
+        if let Some(ref main_base) = rev_main_baseline {
+            for rel in diff_touched_paths(&run.cwd, main_base) {
+                rogue_touched.push(format!("(base) {rel}"));
+            }
+        }
+        if !rogue_touched.is_empty() {
+            let err_msg = format!(
+                "Reviewer `{rev_agent}` violated read-only guardrail by modifying: {}",
+                rogue_touched.join(", ")
+            );
+            mark_reviewer_attempt_failed(core, run, task, &rev_worker_id, &rev_att_id, &rev_agent, &err_msg);
+            core.kill(&[spawn_agent_id]).await;
+            last_agent_err = err_msg;
+            continue;
         }
 
         // Collect output before closing or idling reviewer session.
@@ -945,6 +1012,606 @@ pub(super) async fn run_adversarial_review_gate(
             Err(ApiErr::new(422, "review_changes_requested", reject_msg))
         }
     }
+}
+
+struct BreakerWorktreeGuard {
+    run_cwd: String,
+    wt_dir: std::path::PathBuf,
+}
+
+impl Drop for BreakerWorktreeGuard {
+    fn drop(&mut self) {
+        super::integrate::cleanup_worktree_dir(&self.run_cwd, &self.wt_dir);
+    }
+}
+
+pub(crate) fn default_breaker_test_globs() -> Vec<String> {
+    vec![
+        "tests/**".into(),
+        "**/tests/**".into(),
+        "test/**".into(),
+        "**/test/**".into(),
+        "**/*_test.*".into(),
+        "**/*_tests.*".into(),
+        "**/*.test.*".into(),
+        "**/*.spec.*".into(),
+    ]
+}
+
+fn resolve_breaker_verify_cmd(spec: &ReviewSpec, task: &Task) -> Option<(String, u64)> {
+    if let Some(cmd) = spec.verify_cmd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        return Some((cmd.to_string(), 180));
+    }
+    match task.spec.verify.as_ref()? {
+        VerifySpec::Cmd(s) => {
+            let trimmed = s.trim();
+            (!trimmed.is_empty()).then(|| (trimmed.to_string(), 180))
+        }
+        VerifySpec::Obj(o) => {
+            let trimmed = o.cmd.trim();
+            (!trimmed.is_empty()).then(|| (trimmed.to_string(), o.timeout_sec.unwrap_or(180).clamp(10, 600)))
+        }
+    }
+}
+
+/// Parses a structured Breaker verdict (`pass` / `broken` / `approve` / `changes_requested`).
+pub fn try_parse_breaker_verdict(raw: &str) -> Option<ReviewVerdict> {
+    let is_valid = |v: &ReviewVerdict| {
+        matches!(
+            v.verdict.trim().to_ascii_lowercase().as_str(),
+            "pass" | "passed" | "approve" | "approved" | "broken" | "fail" | "failed" | "changes_requested" | "reject" | "rejected"
+        ) && v.summary != "..."
+    };
+    if let Ok(v) = serde_json::from_str::<ReviewVerdict>(raw.trim())
+        && is_valid(&v)
+    {
+        return Some(v);
+    }
+    for (idx, _) in raw.match_indices('{') {
+        let mut de = serde_json::Deserializer::from_str(&raw[idx..]).into_iter::<ReviewVerdict>();
+        if let Some(Ok(v)) = de.next()
+            && is_valid(&v)
+        {
+            return Some(v);
+        }
+    }
+    None
+}
+
+fn is_breaker_broken_claim(verdict: &str) -> bool {
+    matches!(
+        verdict.trim().to_ascii_lowercase().as_str(),
+        "broken" | "fail" | "failed" | "changes_requested" | "reject" | "rejected"
+    )
+}
+
+/// Runs an Antigravity `/boost`-inspired adversarial `Breaker` pass inside a throwaway Git worktree:
+/// - Production code is locked read-only (`RoleAccessMode::ScopedWrite` restricted to `test_paths`).
+/// - The Breaker writes edge-case/concurrency tests and runs `verify_cmd`.
+/// - Candidate rejection occurs ONLY if the Breaker claims a defect AND the daemon independently
+///   reproduces a non-zero exit from `verify_cmd` without any out-of-scope file modifications.
+/// Returns `Ok(true)` if the Breaker pass ran and candidate survived, `Ok(false)` if skipped/fallback,
+/// or `Err(422)` if empirically falsified.
+#[allow(clippy::too_many_arguments)]
+async fn run_adversarial_breaker_pass(
+    core: &Arc<Core>,
+    run: &Run,
+    task: &Task,
+    author_worker: &Worker,
+    attempt: &Attempt,
+    spec: &ReviewSpec,
+    work_cwd: &str,
+    patch_text: &str,
+    tree_sha: Option<String>,
+    artifact_id: &str,
+    delta_artifact_id: Option<String>,
+    round: u32,
+    max_rounds: u32,
+    is_post_handoff: bool,
+) -> Result<bool, ApiErr> {
+    let Some((verify_cmd, verify_timeout)) = resolve_breaker_verify_cmd(spec, task) else {
+        return Ok(false);
+    };
+    let brk_cwd = match super::integrate::create_breaker_worktree(
+        core,
+        run,
+        work_cwd,
+        &format!("{}-r{round}", attempt.id),
+    )
+    .await
+    {
+        Ok(dir) => dir,
+        Err(reason) => {
+            core.drove.store.append_daemon_event(NewDaemonEvent {
+                run_id: Some(run.id.clone()),
+                task_id: Some(task.id.clone()),
+                attempt_id: Some(attempt.id.clone()),
+                worker_id: None,
+                message_id: None,
+                category: "review".into(),
+                kind: "breaker_fallback".into(),
+                status: "warn".into(),
+                title: format!("Breaker worktree unavailable on `{}`, falling back", task.key),
+                detail: Some(reason),
+                duration_ms: None,
+                tokens: None,
+                cost: None,
+            });
+            return Ok(false);
+        }
+    };
+    let _brk_guard = BreakerWorktreeGuard {
+        run_cwd: run.cwd.clone(),
+        wt_dir: std::path::PathBuf::from(&brk_cwd),
+    };
+
+    let allowed_paths = spec
+        .test_paths
+        .clone()
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(default_breaker_test_globs);
+    let scope_cfg = RoleConfig {
+        label: Some("Breaker".into()),
+        summary: None,
+        access: Some(RoleAccessMode::ScopedWrite),
+        allowed_paths: allowed_paths.clone(),
+        primary: RoleTarget {
+            agent: "codex".into(),
+            model: None,
+            effort: Effort::High,
+            fast: false,
+            context: None,
+            strengths: Vec::new(),
+            note: None,
+        },
+        fallbacks: Vec::new(),
+        prompt: None,
+    };
+
+    let cfg = core.drove.config_snapshot();
+    let role_cfg = super::config::resolve_role_config(&cfg, "reviewer")
+        .unwrap_or_else(|| super::config::default_roles().remove("reviewer").unwrap());
+    let quotas = if cfg.magpie.enabled { core.drove.magpie.fetch_if_enabled(&cfg.magpie, false).await.0 } else { None };
+    let run_workers = core.drove.store.list_workers(Some(&run.id));
+    let run_attempts = core.drove.store.list_attempts(Some(&run.id), None, None);
+    let candidates =
+        build_reviewer_candidates(&role_cfg, spec, &attempt.agent, quotas.as_deref(), &run_workers, &run_attempts);
+    if candidates.is_empty() {
+        return Ok(false);
+    }
+
+    const MAX_INLINE_BREAKER_PATCH_CHARS: usize = 36_000;
+    let mut patch_preview: String = patch_text.chars().take(MAX_INLINE_BREAKER_PATCH_CHARS).collect();
+    if patch_text.chars().count() > MAX_INLINE_BREAKER_PATCH_CHARS {
+        patch_preview.push_str(&format!(
+            "\n... [diff truncated at {MAX_INLINE_BREAKER_PATCH_CHARS} chars; inspect full files in `{brk_cwd}`]"
+        ));
+    }
+    let criteria_block = spec
+        .criteria
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|c| format!("\nReview criteria:\n{c}\n"))
+        .unwrap_or_default();
+    let post_handoff_block = if is_post_handoff {
+        "\nPOST-HANDOFF FINAL CHECK (1/1): Focus strictly on verifying whether prior blocking defects are truly fixed; do NOT invent speculative out-of-spec requirements.\n"
+    } else {
+        ""
+    };
+
+    let mut chosen: Option<(String, ReviewVerdict, Vec<String>)> = None;
+    for (cand_idx, cand) in candidates.iter().enumerate() {
+        // Ensure clean throwaway tree before each breaker candidate attempt.
+        if cand_idx > 0 {
+            super::integrate::reset_worktree_clean(&brk_cwd);
+        }
+        let brk_baseline = super::roles::capture_dirty_baseline(&brk_cwd);
+        let main_baseline = super::roles::capture_dirty_baseline(&run.cwd);
+
+        let port = core.drove.web_port.load(std::sync::atomic::Ordering::SeqCst);
+        let brk_worker_id = super::crypto::rand_id("wrk");
+        let brk_att_id = super::crypto::rand_id("att");
+        let brk_tok = core.drove.register_worker_token(&brk_worker_id);
+        let display = format!("breaker · {}", task.key);
+
+        let mut labels = BTreeMap::new();
+        labels.insert("drove.run".into(), run.id.clone());
+        labels.insert("drove.worker".into(), brk_worker_id.clone());
+        labels.insert("drove.role".into(), "reviewer".into());
+        labels.insert("drove.task".into(), task.key.clone());
+        labels.insert("drove.display".into(), display.clone());
+
+        let mut extra_env = BTreeMap::new();
+        super::pool::inject_drove_path_env(&mut extra_env);
+        extra_env.insert("H2_DROVE_URL".into(), format!("http://127.0.0.1:{port}"));
+        extra_env.insert("H2_DROVE_WORKER_TOKEN".into(), brk_tok.clone());
+        extra_env.insert("H2_DROVE_WORKER_TICKET".into(), brk_tok);
+        extra_env.insert("H2_DROVE_WORKER_ID".into(), brk_worker_id.clone());
+        extra_env.insert("H2_DROVE_RUN_ID".into(), run.id.clone());
+        extra_env.insert("H2_DROVE_ATTEMPT_ID".into(), brk_att_id.clone());
+
+        core.drove.store.insert_worker(Worker {
+            id: brk_worker_id.clone(),
+            run_id: run.id.clone(),
+            agent: cand.agent.clone(),
+            model: cand.model.clone(),
+            context_window: cand.context.clone(),
+            effort: Some(cand.effort),
+            fast: (cand.fast || cand.agent == "codex").then_some(cand.fast),
+            session_key: format!("{}:{brk_worker_id}", run.id),
+            h2_agent: None,
+            cwd: brk_cwd.clone(),
+            worktree: Some(brk_cwd.clone()),
+            state: WorkerState::Starting,
+            current_attempt_id: Some(brk_att_id.clone()),
+            pid: None,
+            fingerprint: Fingerprint::default(),
+            context: WorkerContext::default(),
+            totals: WorkerTotals { tokens: 0, cost: 0.0, attempts: 1, estimated: None },
+            created_at: now_iso(),
+            last_active_at: now_iso(),
+            role: Some("reviewer".into()),
+            forked_from: None,
+            protocol_gen: Some(1),
+            read_only_dir: Some(work_cwd.to_string()),
+        });
+        core.drove.store.insert_attempt(Attempt {
+            id: brk_att_id.clone(),
+            task_id: task.id.clone(),
+            run_id: run.id.clone(),
+            worker_id: brk_worker_id.clone(),
+            agent: cand.agent.clone(),
+            model: cand.model.clone(),
+            effort: Some(cand.effort),
+            fast: cand.fast.then_some(true),
+            route_reason: format!("breaker round={round}"),
+            reused: false,
+            retry_of: None,
+            hint: None,
+            started_at: now_iso(),
+            ended_at: None,
+            awaiting_late_done: None,
+            tokens: TokenCounts::default(),
+            cost: None,
+            estimated: None,
+            outcome: None,
+            failure: None,
+            result: None,
+            kind: Some("review".into()),
+            review_round: None,
+            verifying: None,
+            verify_rejections: None,
+            stagnant_rejections: None,
+            last_verify_hash: None,
+            last_tree_sha: None,
+            verify_log_artifact_id: None,
+            verify_ai_digest: None,
+            ai_diagnosis: None,
+            spinning_detected_at: None,
+        });
+        core.drove.set_worker_last_attempt(&brk_worker_id, &brk_att_id);
+
+        let spawn = match spawn_drove_agent(
+            core,
+            DroveSpawnSpec {
+                agent: cand.agent.clone(),
+                cwd: brk_cwd.clone(),
+                parent: resolve_local_parent_addr(core, &run.coordinator.host_session),
+                title: display,
+                labels,
+                env: extra_env,
+                model: cand.model.clone(),
+                context: cand.context.clone(),
+                effort: Some(cand.effort.as_str().to_string()),
+                fast: Some(cand.fast),
+                access: RoleAccessMode::ScopedWrite,
+                allowed_paths: allowed_paths.clone(),
+                isolate_secrets: true,
+                resume_session_id: None,
+                fallback_handoff_context: None,
+                lineage: None,
+            },
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                let err_msg = format!("Failed spawning breaker `{}`: {}", cand.agent, e.message);
+                mark_reviewer_attempt_failed(core, run, task, &brk_worker_id, &brk_att_id, &cand.agent, &err_msg);
+                continue;
+            }
+        };
+
+        let _ = core.drove.store.update_worker(&brk_worker_id, |w| {
+            w.state = WorkerState::Busy;
+            w.h2_agent = Some(spawn.address.clone());
+            w.pid = spawn.pid;
+        });
+
+        let breaker_prompt = format!(
+            "You are the adversarial Drove Breaker for task `{}` (`{}`).\n\
+             Throwaway sandbox worktree: `{brk_cwd}`\n\
+             ALLOWED TEST WRITE GLOBS: `{}` (ALL production source files are strictly READONLY; never modify production files).\n\
+             Verification command: `{verify_cmd}`\n\
+             Target: {}\nAcceptance: {}\n{criteria_block}{post_handoff_block}\n\
+             Candidate Diff:\n```diff\n{patch_preview}\n```\n\n\
+             Your mission: Try to FALSIFY the candidate implementation using realistic boundary, empty/malformed input, state-transition, or concurrency tests that strictly conform to the task Spec & Acceptance.\n\
+             1. Write or extend test(s) ONLY inside the allowed test globs above.\n\
+             2. Run `{verify_cmd}` to verify whether your test compiles and exposes a real defect.\n\
+             3. If your own test has a syntax/import mistake, fix or revert your test — never report `broken` unless `{verify_cmd}` fails due to a genuine defect in the candidate code.\n\
+             Reply ONLY with a single JSON object:\n\
+             {{\"verdict\":\"pass\"|\"broken\",\"summary\":\"...\",\"findings\":[{{\"severity\":\"high\"|\"medium\",\"file\":\"...\",\"message\":\"...\"}}]}}",
+            task.key,
+            task.title,
+            allowed_paths.join(", "),
+            task.spec.target,
+            task.spec.acceptance,
+        );
+
+        let prev_turn = core.lock().reg.agents.get(&spawn.agent_id).map(|a| a.turn).unwrap_or(0);
+        let prev_entry_len = core.read_transcript_entries(spawn.agent_id).map(|v| v.len()).unwrap_or(0);
+        if let Err(e) = core.send(spawn.agent_id, &breaker_prompt, false, None, Some("drove")).await {
+            let err_msg = format!("Breaker `{}` send failed: {}", cand.agent, e.message);
+            core.kill(&[spawn.agent_id]).await;
+            mark_reviewer_attempt_failed(core, run, task, &brk_worker_id, &brk_att_id, &cand.agent, &err_msg);
+            continue;
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(240);
+        let mut timed_out = false;
+        loop {
+            let done = {
+                let st = core.lock();
+                match st.reg.agents.get(&spawn.agent_id) {
+                    None => true,
+                    Some(a) => {
+                        !a.is_live() || (a.turn > prev_turn && a.status.as_ref().is_none_or(|s| s.state != "working"))
+                    }
+                }
+            };
+            if done {
+                break;
+            }
+            if Instant::now() >= deadline {
+                timed_out = true;
+                break;
+            }
+            let notified = core.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let _ = tokio::time::timeout(Duration::from_millis(400), notified).await;
+        }
+
+        let (assistant_text, transcript_err) = collect_reviewer_turn_output(core, spawn.agent_id, prev_entry_len);
+        // Close throwaway breaker session before its temporary worktree directory is removed.
+        core.kill(&[spawn.agent_id]).await;
+        let _ = core.drove.store.update_worker(&brk_worker_id, |w| {
+            w.state = WorkerState::Closed;
+            w.current_attempt_id = None;
+            w.worktree = None;
+            w.last_active_at = now_iso();
+        });
+
+        let touched: Vec<String> = diff_touched_paths(&brk_cwd, &brk_baseline)
+            .into_iter()
+            .filter(|p| !super::roles::is_ephemeral_cache_path(p))
+            .collect();
+        let mut violations = super::roles::find_scope_violations(&scope_cfg, &touched);
+        for rel in diff_touched_paths(&run.cwd, &main_baseline) {
+            violations.push(format!("(base) {rel}"));
+        }
+        if !violations.is_empty() {
+            let err_msg = format!(
+                "Breaker `{}` violated test-only scope by modifying: {}",
+                cand.agent,
+                violations.join(", ")
+            );
+            mark_reviewer_attempt_failed(core, run, task, &brk_worker_id, &brk_att_id, &cand.agent, &err_msg);
+            continue;
+        }
+
+        let structured = try_parse_breaker_verdict(&assistant_text);
+        if structured.is_none()
+            && (timed_out
+                || transcript_err.is_some()
+                || looks_like_provider_error(&assistant_text).is_some()
+                || assistant_text.trim().is_empty())
+        {
+            let err_msg = transcript_err
+                .or_else(|| looks_like_provider_error(&assistant_text))
+                .unwrap_or_else(|| {
+                    if timed_out {
+                        "Breaker timed out after 240s".into()
+                    } else {
+                        "Breaker produced empty output".into()
+                    }
+                });
+            mark_reviewer_attempt_failed(core, run, task, &brk_worker_id, &brk_att_id, &cand.agent, &err_msg);
+            continue;
+        }
+
+        let parsed = structured.unwrap_or(ReviewVerdict {
+            verdict: "pass".into(),
+            summary: assistant_text.trim().chars().take(280).collect(),
+            findings: None,
+        });
+        let _ = core.drove.store.update_attempt(&brk_att_id, |a| {
+            a.outcome = Some(Outcome::Succeeded);
+            a.failure = None;
+            a.ended_at = Some(now_iso());
+            a.result = Some(TaskResult {
+                summary: parsed.summary.clone(),
+                compact_summary: None,
+                data: serde_json::to_value(&parsed).ok(),
+                files_modified: (!touched.is_empty()).then(|| touched.clone()),
+                blockers: None,
+                output_file_hashes: None,
+            });
+        });
+        chosen = Some((brk_worker_id, parsed, touched));
+        break;
+    }
+
+    let Some((brk_worker_id, parsed, touched)) = chosen else {
+        return Ok(false);
+    };
+
+    // Daemon-side empirical falsification check: run `verify_cmd` independently in `brk_cwd`.
+    if !touched.is_empty() {
+        let brk_patch = capture_candidate_patch(&brk_cwd, &super::roles::capture_dirty_baseline(work_cwd));
+        let brk_art_id = format!("breaker-{}-r{round}", attempt.id);
+        let _ = core.drove.store.write_artifact(&run.id, &format!("{brk_art_id}.patch"), brk_patch.as_bytes());
+
+        let vres = super::verify::run_verify_command(&brk_cwd, &verify_cmd, verify_timeout).await;
+        if !vres.success && is_breaker_broken_claim(&parsed.verdict) {
+            let out_tail: String =
+                vres.combined_output.chars().rev().take(1800).collect::<String>().chars().rev().collect();
+            let summary = format!("Breaker falsified candidate via `{verify_cmd}`: {}", parsed.summary);
+            let round_info = AttemptReview {
+                round,
+                max_rounds: Some(max_rounds),
+                base_tree_sha: None,
+                tree_sha: tree_sha.clone(),
+                patch_artifact_id: Some(artifact_id.to_string()),
+                delta_patch_artifact_id: delta_artifact_id,
+                verdict: Some("changes_requested".into()),
+                summary: Some(summary.clone()),
+                findings: parsed.findings.clone(),
+            };
+            let _ = core.drove.store.update_attempt(&attempt.id, |a| a.review_round = Some(round_info));
+            let _ = core.drove.store.update_task(&task.id, |t| {
+                t.review_state = Some(ReviewState {
+                    round,
+                    reviewer_worker_id: Some(brk_worker_id.clone()),
+                    base_tree_sha: None,
+                    last_reviewed_tree_sha: tree_sha.clone(),
+                    current_tree_sha: tree_sha.clone(),
+                    approved_tree_sha: None,
+                    patch_artifact_id: Some(brk_art_id.clone()),
+                    findings: parsed.findings.clone(),
+                    last_summary: Some(summary.clone()),
+                });
+                t.exec_phase = Some(TaskPhase::Rework);
+            });
+            core.drove.store.append_daemon_event(NewDaemonEvent {
+                run_id: Some(run.id.clone()),
+                task_id: Some(task.id.clone()),
+                attempt_id: Some(attempt.id.clone()),
+                worker_id: Some(brk_worker_id),
+                message_id: None,
+                category: "review".into(),
+                kind: format!("breaker_r{round}"),
+                status: "changes_requested".into(),
+                title: format!("Breaker R{round} falsified `{}`", task.key),
+                detail: Some(summary.clone()),
+                duration_ms: None,
+                tokens: None,
+                cost: None,
+            });
+
+            let key_findings = extract_key_findings(None, parsed.findings.as_deref(), &summary);
+            let (updated_task_opt, circuit_outcome) = record_review_non_pass(
+                &core.drove.store,
+                &task.id,
+                max_rounds,
+                "changes_requested",
+                &summary,
+                key_findings,
+                Some(&attempt.id),
+            );
+            let total_rounds = updated_task_opt
+                .as_ref()
+                .and_then(|t| t.review_circuit.as_ref())
+                .map_or(round, |rc| rc.review_rounds);
+            let reject_msg = format!(
+                "Breaker round {total_rounds}/{max_rounds} reproduced a defect in [{}] (`{verify_cmd}` failed; artifact `{brk_art_id}.patch`):\n{}\n\n--- Failure Output ---\n{out_tail}",
+                touched.join(", "),
+                parsed.summary
+            );
+
+            return match circuit_outcome {
+                ReviewCircuitOutcome::HandoffToCoordinator | ReviewCircuitOutcome::AwaitingUserDecision => {
+                    let _ = core.drove.store.update_attempt(&attempt.id, |a| {
+                        a.outcome = Some(Outcome::Failed);
+                        a.ended_at = Some(now_iso());
+                        a.failure = Some(AttemptFailure { kind: FailureKind::ReviewRejected, message: reject_msg.clone() });
+                    });
+                    mark_worker_idle(core, &author_worker.id);
+                    let failed_task = mark_task_failed_and_propagate(core, &run.id, &task.id)
+                        .or(updated_task_opt)
+                        .unwrap_or_else(|| task.clone());
+                    emit_review_circuit_escalation(
+                        core,
+                        run,
+                        &failed_task,
+                        circuit_outcome,
+                        Some(&attempt.id),
+                        Some(&author_worker.id),
+                    )
+                    .await;
+                    let err_code = if circuit_outcome == ReviewCircuitOutcome::AwaitingUserDecision {
+                        "review_circuit_open"
+                    } else {
+                        "review_handoff_to_coordinator"
+                    };
+                    Err(ApiErr::new(422, err_code, reject_msg))
+                }
+                ReviewCircuitOutcome::ContinueNormal => {
+                    Err(ApiErr::new(422, "review_changes_requested", reject_msg))
+                }
+            };
+        }
+
+        if vres.success && spec.keep_regression_tests == Some(true) {
+            super::integrate::copy_breaker_tests_into_candidate(&brk_cwd, work_cwd, &touched);
+        }
+    }
+
+    if spec.mode == Some(ReviewMode::Breaker) {
+        let pass_summary = format!("Breaker R{round} passed (`{verify_cmd}`): {}", parsed.summary);
+        let round_info = AttemptReview {
+            round,
+            max_rounds: Some(max_rounds),
+            base_tree_sha: None,
+            tree_sha: tree_sha.clone(),
+            patch_artifact_id: Some(artifact_id.to_string()),
+            delta_patch_artifact_id: delta_artifact_id,
+            verdict: Some("approved".into()),
+            summary: Some(pass_summary.clone()),
+            findings: None,
+        };
+        let _ = core.drove.store.update_attempt(&attempt.id, |a| a.review_round = Some(round_info));
+        let _ = core.drove.store.update_task(&task.id, |t| {
+            t.review_state = Some(ReviewState {
+                round,
+                reviewer_worker_id: Some(brk_worker_id.clone()),
+                base_tree_sha: None,
+                last_reviewed_tree_sha: tree_sha.clone(),
+                current_tree_sha: tree_sha.clone(),
+                approved_tree_sha: tree_sha.clone(),
+                patch_artifact_id: Some(artifact_id.to_string()),
+                findings: None,
+                last_summary: Some(pass_summary.clone()),
+            });
+        });
+        core.drove.store.append_daemon_event(NewDaemonEvent {
+            run_id: Some(run.id.clone()),
+            task_id: Some(task.id.clone()),
+            attempt_id: Some(attempt.id.clone()),
+            worker_id: Some(brk_worker_id),
+            message_id: None,
+            category: "review".into(),
+            kind: format!("breaker_r{round}"),
+            status: "ok".into(),
+            title: format!("Breaker R{round} on `{}`: pass", task.key),
+            detail: Some(parsed.summary),
+            duration_ms: None,
+            tokens: None,
+            cost: None,
+        });
+    }
+    Ok(true)
 }
 
 fn build_reviewer_candidates(
@@ -1154,33 +1821,27 @@ pub fn parse_review_verdict(raw: &str) -> ReviewVerdict {
     }
 }
 
-const DIFF_CACHE_EXCLUDES: [&str; 6] = [
-    ":(exclude)**/__pycache__/**",
-    ":(exclude)**/*.pyc",
-    ":(exclude)**/*.pyo",
-    ":(exclude)**/.pytest_cache/**",
-    ":(exclude)**/.mypy_cache/**",
-    ":(exclude)**/.ruff_cache/**",
-];
-
 fn capture_candidate_patch(work_cwd: &str, baseline: &super::roles::DirtyBaseline) -> String {
-    if super::bg_std_command("git")
-        .args(["-C", work_cwd, "rev-parse", "--is-inside-work-tree"])
-        .output()
-        .is_ok_and(|o| o.status.success())
-    {
-        let mut add_cmd = super::bg_std_command("git");
-        add_cmd.args(["-C", work_cwd, "add", "-N", "--", "."]);
-        add_cmd.args(DIFF_CACHE_EXCLUDES);
-        let _ = add_cmd.output();
-
-        let mut diff_cmd = super::bg_std_command("git");
-        diff_cmd.args(["-C", work_cwd, "diff", "HEAD", "--", "."]);
-        diff_cmd.args(DIFF_CACHE_EXCLUDES);
-        if let Ok(out) = diff_cmd.output()
-            && out.status.success()
-        {
-            return String::from_utf8_lossy(&out.stdout).to_string();
+    if let Some(cur_tree) = git_tree_sha(work_cwd) {
+        let base_tree = baseline.tree_sha.clone().or_else(|| {
+            super::bg_std_command("git")
+                .args(["-C", work_cwd, "rev-parse", "--verify", "HEAD^{tree}"])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+        });
+        if let Some(base_t) = base_tree {
+            if base_t == cur_tree {
+                return "No workspace changes\n".into();
+            }
+            if let Some(diff) = git_diff_trees(work_cwd, &base_t, &cur_tree) {
+                if diff.trim().is_empty() {
+                    return "No workspace changes\n".into();
+                }
+                return diff;
+            }
         }
     }
     let touched: Vec<String> = diff_touched_paths(work_cwd, baseline)
@@ -1195,30 +1856,13 @@ fn capture_candidate_patch(work_cwd: &str, baseline: &super::roles::DirtyBaselin
 }
 
 fn git_tree_sha(work_cwd: &str) -> Option<String> {
-    let git_dir_out = super::bg_std_command("git").args(["-C", work_cwd, "rev-parse", "--git-dir"]).output().ok()?;
-    if !git_dir_out.status.success() {
-        return None;
-    }
-    let idx_path = std::env::temp_dir().join(format!("drove-idx-{}", super::crypto::rand_id("t")));
-    let _ = std::fs::remove_file(&idx_path);
-    let idx_str = idx_path.display().to_string();
-    let _ = super::bg_std_command("git").args(["-C", work_cwd, "read-tree", "HEAD"]).env("GIT_INDEX_FILE", &idx_str).output();
-    let mut add_cmd = super::bg_std_command("git");
-    add_cmd.args(["-C", work_cwd, "add", "-A", "--", "."]);
-    add_cmd.args(DIFF_CACHE_EXCLUDES);
-    add_cmd.env("GIT_INDEX_FILE", &idx_str);
-    let _ = add_cmd.output();
-    let out = super::bg_std_command("git").args(["-C", work_cwd, "write-tree"]).env("GIT_INDEX_FILE", &idx_str).output().ok();
-    let _ = std::fs::remove_file(&idx_path);
-    out.filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
+    super::roles::compute_git_working_tree_sha(work_cwd)
 }
 
 fn git_diff_trees(work_cwd: &str, a: &str, b: &str) -> Option<String> {
     let mut diff_cmd = super::bg_std_command("git");
     diff_cmd.args(["-C", work_cwd, "diff", a, b, "--", "."]);
-    diff_cmd.args(DIFF_CACHE_EXCLUDES);
+    diff_cmd.args(super::roles::DIFF_CACHE_EXCLUDES);
     let out = diff_cmd.output().ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).to_string())
 }
@@ -1277,13 +1921,9 @@ mod tests {
             prompt: None,
         };
         let spec = ReviewSpec {
-            agent: None,
-            model: None,
-            effort: None,
-            fast: None,
             different_agent: Some(true),
-            criteria: None,
             max_rounds: Some(1),
+            ..Default::default()
         };
         let cands = build_reviewer_candidates(&cfg, &spec, "codex", None, &[], &[]);
         assert_eq!(cands.len(), 2);
@@ -1326,15 +1966,7 @@ mod tests {
         };
         let cands_after_fail = build_reviewer_candidates(
             &cfg,
-            &ReviewSpec {
-                agent: None,
-                model: None,
-                effort: None,
-                fast: None,
-                different_agent: None,
-                criteria: None,
-                max_rounds: Some(1),
-            },
+            &ReviewSpec { max_rounds: Some(1), ..Default::default() },
             "claude",
             None,
             &[],
@@ -1406,6 +2038,9 @@ mod tests {
             cache: None,
             cached_from: None,
             retry_on_worker_reported: None,
+            fork_from: None,
+            fork_mode: None,
+            channels: Vec::new(),
         });
         assert!(is_standalone_reviewer_task(&task));
 
@@ -1532,5 +2167,106 @@ mod tests {
         assert_eq!(capped.stage, ReviewCircuitStage::AwaitingUserDecision);
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn candidate_patch_excludes_preexisting_dirty_files_and_preserves_git_index() {
+        let dir = std::env::temp_dir().join(format!("herdr2-patch-iso-{}", super::super::crypto::rand_id("t")));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cwd = dir.to_str().unwrap();
+        for args in [
+            &["init"][..],
+            &["config", "user.email", "t@drove.local"][..],
+            &["config", "user.name", "Drove"][..],
+        ] {
+            assert!(super::super::bg_std_command("git").arg("-C").arg(&dir).args(args).output().unwrap().status.success());
+        }
+        std::fs::write(dir.join("committed.txt"), "base\n").unwrap();
+        std::fs::write(dir.join("user_dirty.txt"), "clean\n").unwrap();
+        assert!(
+            super::super::bg_std_command("git")
+                .args(["-C", cwd, "add", "."])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        assert!(
+            super::super::bg_std_command("git")
+                .args(["-C", cwd, "commit", "-m", "init"])
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+
+        // User has pre-existing unstaged + untracked changes BEFORE the task starts (`isolation: none`).
+        std::fs::write(dir.join("user_dirty.txt"), "user-uncommitted-edit\n").unwrap();
+        std::fs::write(dir.join("user_untracked.txt"), "user-scratch\n").unwrap();
+        let index_before = std::fs::read(dir.join(".git/index")).unwrap();
+
+        let baseline = super::super::roles::capture_dirty_baseline(cwd);
+        assert!(baseline.tree_sha.is_some());
+
+        // Task author modifies `committed.txt` and creates `task_new.txt`.
+        std::fs::write(dir.join("committed.txt"), "author-updated\n").unwrap();
+        std::fs::write(dir.join("task_new.txt"), "author-new\n").unwrap();
+
+        let patch = capture_candidate_patch(cwd, &baseline);
+        let index_after = std::fs::read(dir.join(".git/index")).unwrap();
+
+        assert_eq!(index_before, index_after, "capture_candidate_patch must never mutate .git/index");
+        assert!(patch.contains("committed.txt") && patch.contains("+author-updated"), "missing author edit: {patch}");
+        assert!(patch.contains("task_new.txt") && patch.contains("+author-new"), "missing author new file: {patch}");
+        assert!(!patch.contains("user_dirty.txt"), "leaked pre-existing unstaged file into review patch: {patch}");
+        assert!(!patch.contains("user_untracked.txt"), "leaked pre-existing untracked file into review patch: {patch}");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn breaker_verdict_parser_and_scope_globs_enforce_test_only_mutations() {
+        let broken = try_parse_breaker_verdict(
+            r#"Found race condition: {"verdict":"broken","summary":"panics on empty slice","findings":[{"severity":"high","file":"tests/edge_test.rs","message":"panicked at index 0"}]}"#,
+        )
+        .expect("should parse broken verdict");
+        assert!(is_breaker_broken_claim(&broken.verdict));
+        assert_eq!(broken.summary, "panics on empty slice");
+
+        let passed = try_parse_breaker_verdict(r#"{"verdict":"pass","summary":"All boundary tests green"}"#)
+            .expect("should parse pass verdict");
+        assert!(!is_breaker_broken_claim(&passed.verdict));
+
+        let scope_cfg = RoleConfig {
+            label: None,
+            summary: None,
+            access: Some(RoleAccessMode::ScopedWrite),
+            allowed_paths: default_breaker_test_globs(),
+            primary: RoleTarget {
+                agent: "codex".into(),
+                model: None,
+                effort: Effort::High,
+                fast: false,
+                context: None,
+                strengths: Vec::new(),
+                note: None,
+            },
+            fallbacks: Vec::new(),
+            prompt: None,
+        };
+        assert!(
+            super::super::roles::find_scope_violations(
+                &scope_cfg,
+                &["tests/auth_edge.rs".into(), "crates/api/src/foo_test.rs".into()]
+            )
+            .is_empty()
+        );
+        assert_eq!(
+            super::super::roles::find_scope_violations(
+                &scope_cfg,
+                &["tests/auth_edge.rs".into(), "src/auth.rs".into()]
+            ),
+            vec!["src/auth.rs".to_string()]
+        );
     }
 }

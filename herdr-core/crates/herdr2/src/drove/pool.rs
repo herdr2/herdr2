@@ -1,7 +1,7 @@
 //! Native `herdr2` headless ACP worker pool lifecycle (`a*` sessions, warm reuse, transcripts, kill sync).
 
 use super::notify::notify_coordinator;
-use super::protocol::{PriorAttemptHandover, build_task_prompt_with_handover};
+use super::protocol::{PriorAttemptHandover, build_task_prompt_with_context};
 use super::router::RouteDecision;
 use super::store::NewDaemonEvent;
 use super::types::*;
@@ -195,11 +195,20 @@ async fn handle_signal(core: &Arc<Core>, pending: &mut HashMap<String, PendingTe
             if attempt.outcome.is_some() || attempt.ended_at.is_some() {
                 return;
             }
-            // Don't prematurely fail if a blocking `drove worker ask` is currently open.
-            if core.drove.has_active_ask(&attempt_id) {
+            // Don't prematurely remind or fail if a blocking `drove worker ask` or synchronous
+            // `drove worker done` gate (`verify` / `review` / `merge`) is currently in flight.
+            if core.drove.has_active_ask(&attempt_id) || core.drove.has_active_done(&attempt_id) {
+                return;
+            }
+            if core.drove.store.get_task(&attempt.task_id).is_some_and(|t| {
+                matches!(t.exec_phase, Some(TaskPhase::Verifying | TaskPhase::Review | TaskPhase::Integrating))
+            }) {
                 return;
             }
             if let Some(err_msg) = error {
+                if try_in_place_model_failover(core, &worker, &attempt, &err_msg).await {
+                    return;
+                }
                 finish_unsettled_attempt(core, &worker, &attempt, FailureKind::AgentError, err_msg, true).await;
                 return;
             }
@@ -213,6 +222,9 @@ async fn handle_signal(core: &Arc<Core>, pending: &mut HashMap<String, PendingTe
                 .collect::<Vec<_>>()
                 .join("");
             if let Some(prov_err) = super::review::looks_like_provider_error(&recent_assistant) {
+                if try_in_place_model_failover(core, &worker, &attempt, &prov_err).await {
+                    return;
+                }
                 finish_unsettled_attempt(core, &worker, &attempt, FailureKind::AgentError, prov_err, false).await;
                 let _ = stop_worker(core, &worker_id).await;
                 let _ = core.drove.store.update_worker(&worker_id, |w| {
@@ -222,9 +234,9 @@ async fn handle_signal(core: &Arc<Core>, pending: &mut HashMap<String, PendingTe
             }
             if !core.drove.mark_attempt_reminded(&attempt_id) {
                 let msg = format!(
-                    "You ended your turn without calling `h2 drove worker done`. \
-                     If you finished task `{}`, run `h2 drove worker done --outcome done --summary \"...\"` \
-                     (or `--outcome failed --reason \"...\"`).",
+                    "You ended your turn without calling `drove_finish` (or `h2 drove worker done`). \
+                     If you finished task `{}`, call the `drove_finish` MCP tool with `outcome: \"done\"` and `summary` \
+                     (or `h2 drove worker done --outcome done --summary \"...\"`).",
                     attempt.task_id
                 );
                 let _ = core.send(agent_id, &msg, false, None, Some("drove")).await;
@@ -678,13 +690,15 @@ pub async fn dispatch_agent_task(
             });
         });
 
-        let prompt = build_task_prompt_with_handover(
+        let contracts = load_task_contracts(core, &run.id, task);
+        let prompt = build_task_prompt_with_context(
             run,
             task,
             &attempt,
             &decision.role,
             &decision.role_config,
             &dep_tasks,
+            &contracts,
             hint.as_deref(),
             prior_handover.as_ref(),
         );
@@ -699,6 +713,26 @@ pub async fn dispatch_agent_task(
             return Err(err_msg);
         }
         return Ok(attempt);
+    }
+
+    // Retire any idle non-reviewer workers of the same role/agent whose context window exceeded
+    // the warm-reuse ceiling so bloated idle ACP processes don't accumulate across long runs.
+    let bloated_idle: Vec<String> = core
+        .drove
+        .store
+        .list_workers(Some(&run.id))
+        .into_iter()
+        .filter(|w| {
+            w.state == WorkerState::Idle
+                && w.read_only_dir.is_none()
+                && w.agent == decision.agent
+                && w.role.as_deref().unwrap_or("coder") == decision.role
+                && super::router::is_worker_context_bloated(w)
+        })
+        .map(|w| w.id)
+        .collect();
+    for bloated_id in bloated_idle {
+        let _ = stop_worker(core, &bloated_id).await;
     }
 
     // Spawn a brand-new `herdr2` headless ACP `a*` worker.
@@ -725,6 +759,14 @@ pub async fn dispatch_agent_task(
     extra_env.insert("H2_DROVE_ATTEMPT_ID".into(), attempt_id.clone());
     extra_env.insert("H2_DROVE_BIN_DIR".into(), core.drove.paths.state_dir.join("bin").display().to_string());
 
+    let fork_ctx = if prior_handover.is_none() {
+        resolve_task_fork_context(core, run, task, &decision.agent, &effective_cwd).await
+    } else {
+        None
+    };
+    let effective_forked_from =
+        fork_ctx.as_ref().map(|f| f.source_address.clone()).or_else(|| forked_from_agent.clone());
+
     let now = now_iso();
     let mut fp = Fingerprint::default();
     update_fingerprint(&mut fp, task);
@@ -749,7 +791,7 @@ pub async fn dispatch_agent_task(
         created_at: now.clone(),
         last_active_at: now,
         role: Some(decision.role.clone()),
-        forked_from: forked_from_agent.clone(),
+        forked_from: effective_forked_from.clone(),
         protocol_gen: Some(1),
         read_only_dir: None,
     };
@@ -772,7 +814,7 @@ pub async fn dispatch_agent_task(
             reason: Some(decision.reason.clone()),
             source: preserved_source.clone(),
             role: Some(decision.role.clone()),
-            fork: forked_from_agent.clone(),
+            fork: effective_forked_from.clone(),
         });
     });
 
@@ -791,7 +833,11 @@ pub async fn dispatch_agent_task(
             effort: Some(decision.effort.as_str().to_string()),
             fast: Some(decision.fast),
             access,
+            allowed_paths: decision.role_config.allowed_paths.clone(),
             isolate_secrets: true,
+            resume_session_id: fork_ctx.as_ref().and_then(|f| f.resume_session_id.clone()),
+            fallback_handoff_context: None,
+            lineage: fork_ctx.as_ref().map(|f| f.lineage.clone()),
         },
     )
     .await;
@@ -835,13 +881,40 @@ pub async fn dispatch_agent_task(
         cost: None,
     });
 
-    let prompt = build_task_prompt_with_handover(
+    if let Some(ref fctx) = fork_ctx {
+        if !spawned.resumed_session && !fctx.wrapped_envelope.trim().is_empty() {
+            let mut st = core.lock();
+            let mut tc = core.target_checkpoints(&mut st, &spawned.address);
+            tc.pending_handoff = Some(fctx.wrapped_envelope.clone());
+            core.save_target_checkpoints(&mut st, tc);
+            core.record_transcript(
+                &mut st,
+                spawned.agent_id,
+                Entry::Handoff {
+                    turn: 0,
+                    handoff_kind: "fork".into(),
+                    from_address: fctx.source_address.clone(),
+                    from_provider: fctx.source_provider.clone(),
+                    from_session_id: fctx.source_session_id.clone(),
+                    from_turns: fctx.turns_label.clone(),
+                    artifact_path: None,
+                    context_markdown: (!fctx.markdown.trim().is_empty()).then(|| fctx.markdown.clone()),
+                    ts_ms: crate::runtime::now_ms(),
+                },
+            );
+            core.save(&st);
+        }
+    }
+
+    let contracts = load_task_contracts(core, &run.id, task);
+    let prompt = build_task_prompt_with_context(
         run,
         task,
         &attempt,
         &decision.role,
         &decision.role_config,
         &dep_tasks,
+        &contracts,
         hint.as_deref(),
         prior_handover.as_ref(),
     );
@@ -989,7 +1062,10 @@ pub async fn reconcile_startup_workers(core: &Arc<Core>) {
         }
     }
     for att in core.drove.store.list_attempts(None, None, None) {
-        if att.outcome.is_none() && att.ended_at.is_none() && !core.drove.has_worker_token(&att.worker_id) {
+        let worker_live = core.drove.store.get_worker(&att.worker_id).is_some_and(|w| {
+            matches!(w.state, WorkerState::Busy | WorkerState::Starting) && core.drove.has_worker_token(&w.id)
+        });
+        if att.outcome.is_none() && att.ended_at.is_none() && !worker_live {
             let _ = core.drove.store.update_attempt(&att.id, |a| {
                 a.outcome = Some(Outcome::Failed);
                 a.ended_at = Some(now_iso());
@@ -999,6 +1075,50 @@ pub async fn reconcile_startup_workers(core: &Arc<Core>) {
                 });
             });
         }
+    }
+
+    // Recover orphan `TaskStatus::Running` tasks whose in-flight attempts ended across a daemon restart
+    // so they never remain permanently stuck in `Running` (neither scheduled nor retryable).
+    let mut recovered_any = false;
+    for run in core.drove.store.list_runs() {
+        for task in core.drove.store.list_tasks(&run.id) {
+            if task.status != TaskStatus::Running || task.template == Some(true) {
+                continue;
+            }
+            let has_open_att = core.drove.store.list_attempts(None, Some(&task.id), None).iter().any(|a| {
+                a.outcome.is_none()
+                    && a.ended_at.is_none()
+                    && core.drove.store.get_worker(&a.worker_id).is_some_and(|w| {
+                        matches!(w.state, WorkerState::Busy | WorkerState::Starting)
+                            && core.drove.has_worker_token(&w.id)
+                    })
+            });
+            if !has_open_att {
+                recovered_any = true;
+                let _ = core.drove.store.update_task(&task.id, |t| {
+                    t.status = TaskStatus::Ready;
+                    t.exec_phase = None;
+                });
+                core.drove.store.append_daemon_event(NewDaemonEvent {
+                    run_id: Some(run.id.clone()),
+                    task_id: Some(task.id.clone()),
+                    attempt_id: None,
+                    worker_id: None,
+                    message_id: None,
+                    category: "schedule".into(),
+                    kind: "startup_task_recovered".into(),
+                    status: "warn".into(),
+                    title: format!("Recovered interrupted task `{}` to ready after restart", task.key),
+                    detail: None,
+                    duration_ms: None,
+                    tokens: None,
+                    cost: None,
+                });
+            }
+        }
+    }
+    if recovered_any {
+        core.drove.wake_scheduler();
     }
 }
 
@@ -1441,6 +1561,302 @@ pub async fn send_to_task_worker(core: &Arc<Core>, task: &Task, text: &str, inte
     Ok(json!({ "ok": true, "workerId": worker.id, "agent": worker.h2_agent, "interrupted": interrupt }))
 }
 
+fn load_task_contracts(core: &Core, run_id: &str, task: &Task) -> Vec<ContractPost> {
+    if task.channels.is_empty() {
+        core.drove.store.list_contracts(run_id, Some(&["main".into()]))
+    } else {
+        core.drove.store.list_contracts(run_id, Some(&task.channels))
+    }
+}
+
+async fn resolve_task_fork_context(
+    core: &Arc<Core>,
+    run: &Run,
+    task: &Task,
+    target_agent: &str,
+    effective_cwd: &str,
+) -> Option<crate::api::handoff::DroveForkContext> {
+    let raw_fork = task.fork_from.as_deref()?.trim();
+    if raw_fork.is_empty() {
+        return None;
+    }
+    let source_addr = if raw_fork.eq_ignore_ascii_case("coordinator") {
+        run.coordinator.host_session.clone()
+    } else {
+        let up_task = core.drove.store.find_task_in_run(&run.id, raw_fork)?;
+        let attempts = core.drove.store.list_attempts(Some(&run.id), Some(&up_task.id), None);
+        let src_att = attempts
+            .iter()
+            .rev()
+            .find(|a| a.outcome == Some(Outcome::Succeeded))
+            .or_else(|| attempts.last())?;
+        core.drove.store.get_worker(&src_att.worker_id)?.h2_agent?
+    };
+    crate::api::handoff::build_drove_fork_context(
+        core,
+        &source_addr,
+        target_agent,
+        &run.cwd,
+        effective_cwd,
+        task.fork_mode.as_deref(),
+    )
+    .await
+}
+
+/// Returns `true` when `msg` indicates an upstream model rate-limit, quota, or capacity failure
+/// eligible for an in-place model switch on the existing live ACP worker session.
+pub fn is_recoverable_model_or_quota_error(msg: &str) -> bool {
+    let low = msg.to_ascii_lowercase();
+    low.contains("429")
+        || low.contains("rate limit")
+        || low.contains("rate_limit")
+        || low.contains("too many requests")
+        || low.contains("quota")
+        || low.contains("insufficient_quota")
+        || low.contains("resource_exhausted")
+        || low.contains("overloaded")
+        || low.contains("529")
+        || low.contains("model_not_available")
+        || low.contains("model_not_found")
+        || low.contains("out of capacity")
+}
+
+pub(crate) fn same_acp_adapter_family(a: &str, b: &str) -> bool {
+    let canon = |s: &str| match s.trim().to_ascii_lowercase().as_str() {
+        "antigravity" | "antigravity-cli" => "agy".to_string(),
+        "cursor-agent" => "cursor".to_string(),
+        "claude-code" => "claude".to_string(),
+        "gemini-cli" => "gemini".to_string(),
+        other => other.to_string(),
+    };
+    canon(a) == canon(b)
+}
+
+/// Attempts an Antigravity `/swarm`-style in-place model switch on `worker`'s live ACP session
+/// when a 429/quota/capacity error occurs and a healthy fallback model exists on the SAME adapter.
+async fn try_in_place_model_failover(
+    core: &Arc<Core>,
+    worker: &Worker,
+    attempt: &Attempt,
+    err_msg: &str,
+) -> bool {
+    if !is_recoverable_model_or_quota_error(err_msg) {
+        return false;
+    }
+    let Some(aid) = live_untrashed_agent_id(core, worker.h2_agent.as_deref()) else {
+        return false;
+    };
+    if worker.context.size > 0 && worker.context.used.saturating_mul(100) / worker.context.size >= 75 {
+        return false;
+    }
+    let Some(task) = core.drove.store.get_task(&attempt.task_id) else {
+        return false;
+    };
+    let cfg = core.drove.config_snapshot();
+    let role_name = worker.role.as_deref().unwrap_or("coder");
+    let Some(role_cfg) = super::config::resolve_role_config(&cfg, role_name) else {
+        return false;
+    };
+    let quotas = if cfg.magpie.enabled { core.drove.magpie.fetch_if_enabled(&cfg.magpie, false).await.0 } else { None };
+    let prior_attempts = core.drove.store.list_attempts(Some(&attempt.run_id), Some(&task.id), None);
+
+    let next_cand = std::iter::once(&role_cfg.primary)
+        .chain(role_cfg.fallbacks.iter())
+        .find(|cand| {
+            same_acp_adapter_family(&cand.agent, &worker.agent)
+                && cand.model.as_deref().is_some_and(|m| !m.trim().is_empty())
+                && cand.model != attempt.model
+                && !prior_attempts.iter().any(|pa| {
+                    same_acp_adapter_family(&pa.agent, &cand.agent) && pa.model == cand.model
+                })
+                && super::magpie::quota_exhausted_reason(
+                    &cand.agent,
+                    cand.model.as_deref(),
+                    quotas.as_deref().unwrap_or(&[]),
+                )
+                .is_none()
+        })
+        .cloned();
+    let Some(cand) = next_cand else {
+        return false;
+    };
+    let Some(next_model) = cand.model.clone() else {
+        return false;
+    };
+
+    // 1. Settle the quota-hit attempt WITHOUT resetting worktree or touching task status.
+    let ended_at = now_iso();
+    let _ = core.drove.store.update_attempt(&attempt.id, |a| {
+        if a.outcome.is_none() {
+            a.outcome = Some(Outcome::Failed);
+            a.ended_at = Some(ended_at);
+            a.failure = Some(AttemptFailure {
+                kind: FailureKind::QuotaExhausted,
+                message: format!("Switched in-place to `{next_model}` after: {err_msg}"),
+            });
+        }
+    });
+    core.drove.clear_loop_watermark(&attempt.id);
+
+    // 2. Switch model + reasoning effort in-place on the live ACP session.
+    apply_warm_config(core, aid, "model", json!(&next_model)).await;
+    let is_agy = matches!(worker.agent.as_str(), "agy" | "antigravity");
+    let is_cursor = matches!(worker.agent.as_str(), "cursor" | "cursor-agent");
+    let cursor_has_effort = is_cursor && acp::model_has_embedded_effort(&next_model);
+    if !is_agy && !cursor_has_effort {
+        apply_warm_config(core, aid, "reasoning_effort", json!(cand.effort.as_str())).await;
+    }
+
+    // 3. Create successor attempt inheriting the original attempt's dirty baseline so all touched
+    //    files from before + after the switch are validated and merged together on `drove_finish`.
+    let next_att_id = super::crypto::rand_id("att");
+    if let Some(orig_base) = core.drove.get_attempt_baseline(&attempt.id) {
+        core.drove.record_attempt_baseline(&next_att_id, orig_base);
+    }
+    let min_turn = {
+        let st = core.lock();
+        let base = st.reg.agents.get(&aid).map_or(0, |a| {
+            let in_flight = u64::from(a.status.as_ref().is_some_and(|s| s.state == "working"));
+            a.turn + in_flight
+        });
+        let queued = st.inboxes.get(&aid).map_or(0, |q| q.len() as u64);
+        base + queued + 1
+    };
+    core.drove.set_attempt_min_turn(&next_att_id, min_turn);
+    core.drove.set_worker_last_attempt(&worker.id, &next_att_id);
+
+    let route_reason = format!("in_place_model_switch -> {next_model}");
+    let next_attempt = Attempt {
+        id: next_att_id.clone(),
+        task_id: task.id.clone(),
+        run_id: attempt.run_id.clone(),
+        worker_id: worker.id.clone(),
+        agent: worker.agent.clone(),
+        model: Some(next_model.clone()),
+        effort: Some(cand.effort),
+        fast: cand.fast.then_some(true),
+        route_reason: route_reason.clone(),
+        reused: true,
+        retry_of: Some(attempt.id.clone()),
+        hint: attempt.hint.clone(),
+        started_at: now_iso(),
+        ended_at: None,
+        awaiting_late_done: None,
+        tokens: TokenCounts::default(),
+        cost: None,
+        estimated: None,
+        outcome: None,
+        failure: None,
+        result: None,
+        kind: Some("author".into()),
+        review_round: attempt.review_round.clone(),
+        verifying: None,
+        verify_rejections: attempt.verify_rejections,
+        stagnant_rejections: attempt.stagnant_rejections,
+        last_verify_hash: attempt.last_verify_hash.clone(),
+        last_tree_sha: attempt.last_tree_sha.clone(),
+        verify_log_artifact_id: None,
+        verify_ai_digest: None,
+        ai_diagnosis: None,
+        spinning_detected_at: None,
+    };
+    core.drove.store.insert_attempt(next_attempt);
+
+    let _ = core.drove.store.update_worker(&worker.id, |w| {
+        w.state = WorkerState::Busy;
+        w.current_attempt_id = Some(next_att_id.clone());
+        w.model = Some(next_model.clone());
+        w.effort = Some(cand.effort);
+        w.totals.attempts += 1;
+        w.last_active_at = now_iso();
+    });
+    let _ = core.drove.store.update_task(&task.id, |t| {
+        let mut a = t.assign.clone().unwrap_or_default();
+        a.model = Some(next_model.clone());
+        a.effort = Some(cand.effort);
+        a.reason = Some(route_reason.clone());
+        t.assign = Some(a);
+    });
+    core.drove.store.append_daemon_event(NewDaemonEvent {
+        run_id: Some(attempt.run_id.clone()),
+        task_id: Some(task.id.clone()),
+        attempt_id: Some(next_att_id.clone()),
+        worker_id: Some(worker.id.clone()),
+        message_id: None,
+        category: "worker".into(),
+        kind: "in_place_model_switch".into(),
+        status: "ok".into(),
+        title: format!("Switched `{}` in-place to `{next_model}`", worker.id),
+        detail: Some(err_msg.chars().take(180).collect()),
+        duration_ms: None,
+        tokens: None,
+        cost: None,
+    });
+
+    let cont_prompt = format!(
+        "[drove in-place failover] Your previous model encountered a rate-limit/quota error ({err_msg}) and has been switched in-place to `{next_model}` on this exact session and workspace (`{}`). \
+         All your uncommitted edits and prior tool history are preserved. Continue task `{}` from where you left off without repeating completed file reads, and call `drove_finish` when complete.",
+        next_att_id, task.key
+    );
+    core.send(aid, &cont_prompt, false, None, Some("drove")).await.is_ok()
+}
+
+/// Switches a running worker's model/effort in place without restarting its active attempt (`h2 drove route --in-place`).
+pub(super) async fn switch_running_task_model_in_place(
+    core: &Arc<Core>,
+    task: &Task,
+    model: Option<String>,
+    effort: Option<Effort>,
+) -> Result<Value, String> {
+    let attempts = core.drove.store.list_attempts(None, Some(&task.id), None);
+    let active = attempts
+        .iter()
+        .rev()
+        .find(|a| a.outcome.is_none() && a.ended_at.is_none())
+        .ok_or_else(|| "Task has no active attempt".to_string())?;
+    let worker = core.drove.store.get_worker(&active.worker_id).ok_or_else(|| "Worker not found".to_string())?;
+    let aid = live_untrashed_agent_id(core, worker.h2_agent.as_deref())
+        .ok_or_else(|| "Worker ACP session is no longer live".to_string())?;
+
+    if let Some(ref m) = model {
+        apply_warm_config(core, aid, "model", json!(m)).await;
+    }
+    if let Some(eff) = effort {
+        let is_agy = matches!(worker.agent.as_str(), "agy" | "antigravity");
+        if !is_agy {
+            apply_warm_config(core, aid, "reasoning_effort", json!(eff.as_str())).await;
+        }
+    }
+    let _ = core.drove.store.update_worker(&worker.id, |w| {
+        if let Some(ref m) = model {
+            w.model = Some(m.clone());
+        }
+        if let Some(eff) = effort {
+            w.effort = Some(eff);
+        }
+    });
+    let _ = core.drove.store.update_attempt(&active.id, |a| {
+        if let Some(ref m) = model {
+            a.model = Some(m.clone());
+        }
+        if let Some(eff) = effort {
+            a.effort = Some(eff);
+        }
+    });
+    let updated = core.drove.store.update_task(&task.id, |t| {
+        let mut a = t.assign.clone().unwrap_or_default();
+        if let Some(ref m) = model {
+            a.model = Some(m.clone());
+        }
+        if let Some(eff) = effort {
+            a.effort = Some(eff);
+        }
+        a.source = Some("user_in_place".into());
+        t.assign = Some(a);
+    });
+    Ok(json!(updated))
+}
+
 pub(super) async fn apply_warm_config(core: &Arc<Core>, aid: u32, cfg_id: &str, val: Value) {
     let (sid, effective_id, wire_val_initial, src, tr, opts_snapshot) = {
         let st = core.lock();
@@ -1773,6 +2189,7 @@ pub fn mark_task_failed_and_propagate(core: &Arc<Core>, run_id: &str, task_id: &
             break;
         }
     }
+    super::ai::spawn_run_narrator(core.clone(), run_id.to_string());
     updated
 }
 
@@ -1864,6 +2281,7 @@ pub async fn handle_task_failure(
             None,
         )
         .await;
+        super::ai::spawn_run_narrator(core.clone(), run.id.clone());
     }
 }
 
@@ -2004,5 +2422,12 @@ mod tests {
         assert_eq!(drove.add_attempt_estimated_output("att_2", 80), 200);
         drove.clear_loop_watermark("att_2");
         assert_eq!(drove.add_attempt_estimated_output("att_2", 10), 10);
+
+        assert!(is_recoverable_model_or_quota_error("HTTP 429 Too Many Requests: rate_limit_error"));
+        assert!(is_recoverable_model_or_quota_error("RESOURCE_EXHAUSTED: quota exceeded"));
+        assert!(!is_recoverable_model_or_quota_error("syntax error in Cargo.toml"));
+        assert!(same_acp_adapter_family("antigravity", "agy"));
+        assert!(same_acp_adapter_family("cursor-agent", "cursor"));
+        assert!(!same_acp_adapter_family("claude", "codex"));
     }
 }

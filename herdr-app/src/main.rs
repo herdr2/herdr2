@@ -175,11 +175,23 @@ fn main() {
         eprintln!("herdr2: cannot write {}: {e}", mods::app_dir().display());
     }
 
-    gpui_platform::application()
+    let app = gpui_platform::application()
         // Mods run programs already; the user's own links (dotfiles, Nix) may point out.
         .with_assets(gpui_shell::AppAssets::new(mods::app_dir()).following_links())
-        .with_http_client(gpui_shell::http_client(concat!("herdr2/", env!("CARGO_PKG_VERSION"))))
-        .run(move |cx| {
+        .with_http_client(gpui_shell::http_client(concat!("herdr2/", env!("CARGO_PKG_VERSION"))));
+    #[cfg(target_os = "macos")]
+    app.on_reopen(|cx| {
+        let windows = cx.windows();
+        if windows.is_empty() {
+            cx.quit();
+            return;
+        }
+        cx.activate(true);
+        for w in windows {
+            let _ = w.update(cx, |_, window, _| window.activate_window());
+        }
+    });
+    app.run(move |cx| {
             let fonts = settings::BUNDLED_FONTS.iter().map(|f| std::borrow::Cow::Borrowed(*f)).collect();
             if let Err(e) = cx.text_system().add_fonts(fonts) {
                 tracing::warn!("bundled fonts not loaded: {e:#}");
@@ -187,6 +199,15 @@ fn main() {
             settings::note_fonts(cx.text_system().all_font_names());
             settings::load_home_fonts(cx);
             mods::init(cx);
+            // Never stay alive as a windowless background process holding `herdr2-app.sock`
+            // (closing the Setup window on macOS would otherwise leave 0 windows open; the main
+            // window intercepts its red close button to hide instead of closing).
+            cx.on_window_closed(|cx, _window_id| {
+                if cx.windows().is_empty() {
+                    cx.quit();
+                }
+            })
+            .detach();
             // Not restarted for it: the update goes in when the app quits.
             cx.on_app_quit(|cx| {
                 let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
@@ -201,6 +222,7 @@ fn main() {
                     }
                 }
                 mods::finish_shared();
+                control::cleanup();
                 if let Err(e) = update::apply() {
                     tracing::warn!("update: apply on quit failed: {e}");
                 }

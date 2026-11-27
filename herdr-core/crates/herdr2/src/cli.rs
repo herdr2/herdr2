@@ -242,7 +242,11 @@ enum Cmd {
     /// Templates you can run by name (~/.config/herdr2/templates).
     Templates,
     /// Run the built-in stdio MCP server (`h2 mcp`).
-    Mcp,
+    Mcp {
+        /// Tool surface profile (`default` or `drove-worker`).
+        #[arg(long, value_name = "PROFILE")]
+        profile: Option<String>,
+    },
     /// Manage multi-agent Drove orchestration (`drove status`, `drove web`, `drove settings`, ...).
     Drove(crate::drove::cli::DroveCli),
     /// Detect coding agents and install/update bundled Herdr2 companion skills (`status`, `install`, `ai-install`).
@@ -510,7 +514,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             Cmd::Serve
                 | Cmd::Hold { .. }
                 | Cmd::Connect { .. }
-                | Cmd::Mcp
+                | Cmd::Mcp { .. }
                 | Cmd::Checkpoint(checkpoint::CheckpointCli { sub: checkpoint::CheckpointSub::Hook { .. } })
         )
     ) {
@@ -553,8 +557,8 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             let r = call("terminal.keys", to(&p))?;
             Out { json: r, human: "keys sent".into() }
         }
-        Cmd::Mcp => {
-            crate::mcp::serve_stdio()?;
+        Cmd::Mcp { profile } => {
+            crate::mcp::serve_stdio_profile(profile.as_deref())?;
             return Ok(None);
         }
         Cmd::Drove(p) => {
@@ -1453,6 +1457,7 @@ pub const COMMANDS: &[(&str, &str)] = &[
     ("adapter status", "adapter.status"),
     ("adapter install", "adapter.install"),
     ("adapter update", "adapter.update"),
+    ("adapter config", "adapter.config.set"),
 ];
 /// Client/app methods not mapped 1:1 from a separate top-level CLI subcommand.
 pub const API_ONLY: &[&str] = &[

@@ -239,9 +239,20 @@ jobs:
           submodules: recursive
 
       - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        if: runner.os == 'macOS'
+        with:
+          node-version: '22'
       - uses: mlugg/setup-zig@v2
         with:
           version: 0.16.0
+
+      - name: Build drove-web (macOS bundled h2)
+        if: runner.os == 'macOS'
+        working-directory: drove-web
+        run: |
+          npm ci
+          npm run build
 
       - name: Install Linux desktop deps
         if: runner.os == 'Linux'
@@ -252,17 +263,27 @@ jobs:
       - name: Build & package herdr-app
         shell: bash
         env:
+          H2_REQUIRE_WEB_BUNDLE: '1'
           HERDR2_APP_RELEASE: '1'
           HERDR2_DEFAULT_RELEASES_URL: https://github.com/${{ github.repository }}/releases/download/${{ env.OTA_TAG }}
+          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
           if [ "${{ matrix.target }}" = "macos-aarch64" ]; then
             rustup target add aarch64-apple-darwin
-            bash herdr-app/scripts/package aarch64-apple-darwin
+            (cd herdr-core && cargo build --release --locked --target aarch64-apple-darwin -p herdr2)
+            HERDR2_CORE_BIN="$PWD/herdr-core/target/aarch64-apple-darwin/release/herdr2" bash herdr-app/scripts/package aarch64-apple-darwin
+          elif [ "${{ matrix.target }}" = "macos-x86_64" ]; then
+            (cd herdr-core && cargo build --release --locked -p herdr2)
+            HERDR2_CORE_BIN="$PWD/herdr-core/target/release/herdr2" bash herdr-app/scripts/package
           else
             bash herdr-app/scripts/package
           fi
           mkdir -p dist/app-ota
           cp "herdr-app/dist/herdr2-${{ matrix.target }}.tar.gz" "dist/app-ota/herdr2-app-${{ matrix.target }}.tar.gz"
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            tar -tzf "dist/app-ota/herdr2-app-${{ matrix.target }}.tar.gz" | grep -qx "Herdr2.app/Contents/Helpers/h2"
+          fi
 
       - uses: actions/upload-artifact@v4
         with:

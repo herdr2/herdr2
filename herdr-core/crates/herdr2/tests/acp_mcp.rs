@@ -14,7 +14,7 @@ fn mcp_call(s: &Session, a: &str, tool: &str, args: Value) -> String {
     let prompt = format!("MCP_CALL:{tool}:{}", serde_json::to_string(&args).unwrap());
     s.json(&["send", "--wait", a, &prompt]);
     let hist = s.json(&["read", "--lines", "200", a])["text"].as_str().unwrap().to_owned();
-    let idx = hist.rfind("MCP_RESULT:").or_else(|| hist.rfind("MCP_ERROR:")).unwrap_or(0);
+    let idx = hist.rfind("MCP_RESULT:").into_iter().chain(hist.rfind("MCP_ERROR:")).max().unwrap_or(0);
     hist[idx..].to_owned()
 }
 

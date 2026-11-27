@@ -1,6 +1,6 @@
 // Pure catalog, formatting, and state helpers for the first-run Herdr2 welcome wizard.
 
-export const PAGES = 4;
+export const PAGES = 5;
 
 export const DEEPSEEK_PRESET = {
   id: "deepseek",
@@ -16,6 +16,14 @@ export const AI_PROVIDERS = [
 ];
 
 export const AI_PAGE = 3;
+export const AGENTS_PAGE = 4;
+
+export const ACP_PERMISSIONS = [
+  { id: "approve-reads", en: "Approve Reads", zh: "批准只读" },
+  { id: "approve-all", en: "Approve All", zh: "全部批准" },
+  { id: "ask", en: "Ask", zh: "每次询问" },
+  { id: "deny-all", en: "Deny All", zh: "全部拒绝" },
+];
 
 export function normalizeUrl(url) {
   return String(url ?? "").trim().replace(/\/+$/, "");
@@ -242,4 +250,191 @@ export function findLayoutNode(node, id) {
     if (f) return f;
   }
   return null;
+}
+
+export function canonicalAgentId(raw) {
+  const id = String(raw ?? "").trim().toLowerCase();
+  if (!id) return "";
+  if (id === "antigravity") return "agy";
+  if (id === "cursor-agent") return "cursor";
+  if (id === "dsh-tui") return "dsh";
+  return id;
+}
+
+export function formatShortProbeError(raw) {
+  const text = String(raw ?? "").trim();
+  if (!text) return "";
+  const lines = text
+    .split(/\r?\n/)
+    .map((l) => l.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return "";
+  const headline = lines[0];
+  const stderrIdx = lines.findIndex((l) => l.toLowerCase() === "stderr:");
+  const stderrLine = stderrIdx >= 0 ? lines.slice(stderrIdx + 1).find(Boolean) : null;
+  let combined = stderrLine && !headline.includes(stderrLine) ? `${headline} · ${stderrLine}` : headline;
+  if (combined.length > 120) combined = `${combined.slice(0, 119).trimEnd()}…`;
+  return combined;
+}
+
+export function normalizeAdapterStatus(rawStdout) {
+  if (!rawStdout) return null;
+  try {
+    const parsed = typeof rawStdout === "string" ? JSON.parse(rawStdout) : rawStdout;
+    if (!parsed || typeof parsed !== "object") return null;
+    const adapters = Array.isArray(parsed.adapters) ? parsed.adapters : [];
+    return {
+      adaptersDir: String(parsed.adapters_dir ?? ""),
+      autoInstall: parsed.auto_install !== false,
+      registryUrl: String(parsed.registry_url ?? ""),
+      customRegistryUrl: typeof parsed.custom_registry_url === "string" && parsed.custom_registry_url.trim()
+        ? parsed.custom_registry_url.trim()
+        : null,
+      defaultPermissions: String(parsed.default_permissions || "approve-reads").trim() || "approve-reads",
+      injectMcp: parsed.inject_mcp !== false,
+      configPath: String(parsed.config_path ?? ""),
+      adapters,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function normalizeAgentProbe(rawStdout) {
+  if (!rawStdout) return null;
+  try {
+    const parsed = typeof rawStdout === "string" ? JSON.parse(rawStdout) : rawStdout;
+    if (!parsed || typeof parsed !== "object") return null;
+    const agents = Array.isArray(parsed.agents) ? parsed.agents : [];
+    return {
+      fullProbe: Boolean(parsed.fullProbe ?? parsed.full_probe),
+      agents,
+    };
+  } catch {
+    return null;
+  }
+}
+
+const AGENT_DISPLAY_NAMES = {
+  claude: "Claude Code",
+  codex: "Codex",
+  agy: "Antigravity",
+  cursor: "Cursor",
+  gemini: "Gemini CLI",
+  opencode: "OpenCode",
+  pi: "Pi",
+  kimi: "Kimi",
+  copilot: "GitHub Copilot",
+  hermes: "Hermes",
+  zcode: "ZCode",
+  trae: "TRAE CLI",
+  qwen: "Qwen Code",
+  qoder: "Qoder",
+  glm: "GLM",
+  dsh: "DSH",
+  kiro: "Kiro",
+  amp: "Amp",
+  grok: "Grok",
+};
+
+const AGENT_PREF_ORDER = [
+  "claude", "codex", "agy", "cursor", "gemini", "opencode", "pi",
+  "kimi", "copilot", "hermes", "zcode", "trae", "qwen", "glm", "dsh", "qoder", "kiro", "amp", "grok",
+];
+
+export function summarizeDetectedAgents(knownList, probeSnap, adapterStatus) {
+  const byId = new Map();
+  const ensure = (rawId) => {
+    const id = canonicalAgentId(rawId);
+    if (!id) return null;
+    let rec = byId.get(id);
+    if (!rec) {
+      rec = {
+        id,
+        name: AGENT_DISPLAY_NAMES[id] ?? id,
+        cliInstalled: false,
+        acpSupported: false,
+        acpInstalled: false,
+        acpError: null,
+        modelsCount: 0,
+        adapter: null,
+      };
+      byId.set(id, rec);
+    }
+    return rec;
+  };
+
+  for (const p of Array.isArray(knownList) ? knownList : []) {
+    const rec = ensure(p?.key);
+    if (!rec) continue;
+    if (p?.name) rec.name = p.name;
+    if (p?.installed) rec.cliInstalled = true;
+  }
+
+  for (const a of Array.isArray(probeSnap?.agents) ? probeSnap.agents : []) {
+    const rec = ensure(a?.id);
+    if (!rec) continue;
+    rec.acpSupported = true;
+    if (a?.installed) rec.acpInstalled = true;
+    const err = String(a?.error ?? "").trim();
+    if (err) rec.acpError = err;
+    const count = Array.isArray(a?.models) ? a.models.length : 0;
+    if (count > rec.modelsCount) rec.modelsCount = count;
+  }
+
+  const adapters = Array.isArray(adapterStatus?.adapters) ? adapterStatus.adapters : [];
+  for (const ad of adapters) {
+    const rec = ensure(ad?.preset_id);
+    if (!rec) continue;
+    rec.acpSupported = true;
+    rec.adapter = ad;
+    if (ad?.companion_installed) rec.cliInstalled = true;
+    if (ad?.installed) rec.acpInstalled = true;
+  }
+
+  const rank = (id) => {
+    const i = AGENT_PREF_ORDER.indexOf(id);
+    return i === -1 ? 99 : i;
+  };
+  const group = (r) => {
+    if (r.acpReady) return 0;
+    if (r.acpError) return 1;
+    if (r.adapterMissing) return 2;
+    if (r.cliInstalled || r.acpInstalled || r.adapterInstalling) return 3;
+    if (r.adapter) return 4;
+    return 5;
+  };
+
+  const rows = [...byId.values()]
+    .map((r) => {
+      const adapterInstalling = r.adapter?.state === "installing";
+      const adapterMissing = Boolean(r.adapter && r.adapter.companion_installed && !r.adapter.installed && !adapterInstalling);
+      const acpReady = Boolean(r.acpInstalled && !r.acpError);
+      const anyInstalled = Boolean(r.cliInstalled || r.acpInstalled || adapterInstalling);
+      return { ...r, adapterInstalling, adapterMissing, acpReady, anyInstalled };
+    })
+    .sort((a, b) => {
+      const ga = group(a);
+      const gb = group(b);
+      if (ga !== gb) return ga - gb;
+      const ra = rank(a.id);
+      const rb = rank(b.id);
+      if (ra !== rb) return ra - rb;
+      return a.id.localeCompare(b.id);
+    });
+
+  const missingAdapters = adapters.filter((a) => a.companion_installed && !a.installed && a.state !== "installing");
+  const installingAdapters = adapters.filter((a) => a.state === "installing");
+  const managedAdapters = adapters.filter((a) => a.source === "managed");
+
+  return {
+    rows,
+    installedRows: rows.filter((r) => r.anyInstalled),
+    cliCount: rows.filter((r) => r.cliInstalled).length,
+    acpReadyCount: rows.filter((r) => r.acpReady).length,
+    acpErrorCount: rows.filter((r) => r.acpInstalled && Boolean(r.acpError)).length,
+    missingAdapters,
+    installingAdapters,
+    managedAdapters,
+  };
 }

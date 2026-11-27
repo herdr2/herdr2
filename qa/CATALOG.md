@@ -15,7 +15,7 @@
 | Feature | Subsystem | Name | Tiers | Cases | Covers (RPC / App / Mods / Frames) |
 | --- | --- | --- | --- | ---: | --- |
 | `F01` | `herdr-core` | 守护进程、双平面与协议隔离 | L0-static, L1-core-isolated | 8 | 7 / 0 / 0 / 0 |
-| `F02` | `herdr-core` | 无头 ACP 会话生命周期与能力协商 | L1-core-isolated, L4-live-llm | 9 | 15 / 0 / 0 / 0 |
+| `F02` | `herdr-core` | 无头 ACP 会话生命周期与能力协商 | L1-core-isolated, L4-live-llm | 9 | 16 / 0 / 0 / 0 |
 | `F03` | `herdr-core` | ACP 串行收件箱、抢占与等待机制 | L1-core-isolated, L4-live-llm | 3 | 12 / 0 / 0 / 0 |
 | `F04` | `herdr-core` | ACP 权限仲裁与结构化 Transcript | L1-core-isolated | 3 | 6 / 0 / 0 / 0 |
 | `F05` | `herdr-core` | 内置 stdio MCP 与混合父子编排 | L1-core-isolated | 2 | 5 / 0 / 0 / 0 |
@@ -69,7 +69,7 @@ Headless ACP agent lifecycle (`agent.run`, `templates.list`, `agent.list`, `agen
 | `TC-CORE-015` | ACP 握手超时、stderr 诊断缓冲与孤儿守卫 (ACP handshake diagnostics & AgentGuard) | `L1-core-isolated` | `scripted` | `P1` | linux, macos, windows | rpc:1 |
 | `TC-CORE-016` | ACP 重名冲突与错误入参负向校验 (agent.run name_taken & negative param validation) | `L1-core-isolated` | `scripted` | `P1` | linux, macos, windows | rpc:2 |
 | `TC-CORE-023` | L4 实模验证：启动真实 ACP 编码 Agent 执行只读任务 (Live LLM ACP run & read --last) | `L4-live-llm` | `ai-exploratory` | `P2` | linux, macos, windows | rpc:4 |
-| `TC-CORE-024` | 托管 ACP 适配器状态查询、按需安装与更新 (adapter.status, adapter.install & adapter.update) | `L1-core-isolated` | `scripted` | `P1` | linux, macos, windows | rpc:3 |
+| `TC-CORE-024` | 托管 ACP 适配器状态查询、按需安装与更新 (adapter.status, adapter.install & adapter.update) | `L1-core-isolated` | `scripted` | `P1` | linux, macos, windows | rpc:4 |
 
 ### F03: ACP 串行收件箱、抢占与等待机制
 

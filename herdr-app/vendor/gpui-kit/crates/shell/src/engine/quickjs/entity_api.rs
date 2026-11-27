@@ -10,9 +10,12 @@
 //! `Object<'js>` cannot unify the two elided lifetimes, so the handle object
 //! itself is assembled in the JS prelude, exactly as element objects are.
 
-use std::rc::Weak;
+use std::{
+    cell::RefCell,
+    rc::{Rc, Weak},
+};
 
-use gpui::ScrollStrategy;
+use gpui::{ScrollStrategy, Subscription};
 use gpui_base::NumberStep;
 use gpui_base::VirtualListScrollHandle;
 use gpui_base::input::{InputBaseState, InputModeKind};
@@ -398,6 +401,79 @@ pub fn install(ctx: &Ctx<'_>, module: &Object<'_>, runtime: Weak<ShellRuntime>) 
                     state.update(cx, |state, cx| state.set_soft_wrap(wrap, window, cx));
                 })
                 .ok_or_else(|| needs_call(&ctx, "set_soft_wrap()"))
+            },
+        ),
+    )?;
+
+    // HERDR: let chat-style textareas submit on Enter without inserting a newline.
+    let submit_enter_runtime = runtime.clone();
+    globals.set(
+        "__textarea_set_submit_on_enter",
+        Func::from(
+            move |ctx: Ctx<'_>, handle: EntityHandle, submit: bool| -> JsResult<()> {
+                let state = live_textarea(&ctx, &submit_enter_runtime, handle)?;
+                scope::with_current_app(|cx| {
+                    state.update(cx, |state, cx| state.set_submit_on_enter(submit, cx));
+                })
+                .ok_or_else(|| needs_call(&ctx, "set_submit_on_enter()"))
+            },
+        ),
+    )?;
+
+    // HERDR: allow scripts with completion popups to intercept Tab/Enter/Up/Down/Escape
+    // synchronously before built-in textarea actions or outer Root::Tab focus traversal.
+    let before_key_runtime = runtime.clone();
+    globals.set(
+        "__textarea_set_before_key",
+        Func::from(
+            move |ctx: Ctx<'_>, handle: EntityHandle, handler: Option<Handler>| -> JsResult<bool> {
+                let store = alive(&ctx, &before_key_runtime)?;
+                let (callback, cleanup) = match handler {
+                    Some(handler) => {
+                        let slot = Rc::new(RefCell::new(Some(handler.0)));
+                        let dispatch = before_key_runtime.clone();
+                        let owner = InputCallbackOwner {
+                            policy: scope::policy(),
+                            application: scope::current_application_generation(),
+                            view: scope::current_view().map(|view| view.downgrade()),
+                        };
+                        let call_slot = Rc::clone(&slot);
+                        let callback: Rc<
+                            dyn Fn(
+                                &gpui_base::input::InputBeforeKeyEvent,
+                                &mut gpui::Window,
+                                &mut gpui::App,
+                            ) -> bool,
+                        > = Rc::new(move |event, window, cx| {
+                            let Some(runtime) = dispatch.upgrade() else {
+                                return false;
+                            };
+                            let saved = call_slot.borrow().clone();
+                            let Some(saved) = saved else {
+                                return false;
+                            };
+                            runtime.dispatch_input_before_key(&saved, &owner, event, window, cx)
+                        });
+                        let cleanup = Subscription::new(move || {
+                            slot.borrow_mut().take();
+                        });
+                        (Some(callback), Some(cleanup))
+                    }
+                    None => (None, None),
+                };
+                let ok = scope::with_current_app(|cx| {
+                    store
+                        .entities()
+                        .set_textarea_before_key(handle, cx, callback, cleanup)
+                })
+                .ok_or_else(|| needs_call(&ctx, "set_before_key()"))?;
+                if !ok {
+                    return Err(Exception::throw_type(
+                        &ctx,
+                        "this textarea state has been released",
+                    ));
+                }
+                Ok(true)
             },
         ),
     )?;

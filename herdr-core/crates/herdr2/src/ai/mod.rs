@@ -1327,6 +1327,12 @@ impl AiRuntime {
         })
     }
 
+    /// Removes one entry from the local response cache (e.g. when a caller rejects a malformed or
+    /// drifted model reply so subsequent retries do not replay the bad response).
+    pub fn invalidate_cached(&self, cache_key: &str) {
+        self.result_cache.remove(cache_key);
+    }
+
     /// Coalesces concurrent requests sharing the same `cache_key` (singleflight).
     /// Returns `Ok(guard)` when this caller owns execution, or `Err(cached_resp)` if an
     /// in-flight leader populated the cache while we waited.

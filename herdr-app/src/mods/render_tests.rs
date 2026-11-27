@@ -651,6 +651,18 @@ fn module(mut values: BTreeMap<String, Value>, calls: Rc<RefCell<Calls>>) -> Hos
                         "stderr": ""
                     }))
                 }
+                "hc" | "h2" if first.as_array().is_some_and(|arr| arr.first().and_then(Value::as_str) == Some("ai") && arr.get(1).and_then(Value::as_str) == Some("polish-prompt")) => {
+                    calls.borrow_mut().effects.push(("h2.polish".into(), vec![first.clone()]));
+                    Some(json!({
+                        "code": 0,
+                        "stdout": serde_json::to_string(&json!({
+                            "usedAi": true,
+                            "polished": "Polished prompt with clear constraints",
+                            "summary": "Clarified intent and constraints"
+                        })).unwrap(),
+                        "stderr": ""
+                    }))
+                }
                 "hc" | "h2" if first.as_array().is_some_and(|arr| arr.first().and_then(Value::as_str) == Some("send") && arr.get(1).and_then(Value::as_str) == Some("--json")) => {
                     calls.borrow_mut().effects.push(("h2.send".into(), vec![first.clone()]));
                     Some(json!({"code":0,"stdout":"{\"status\":\"working\",\"turn\":2,\"started\":true,\"inbox_len\":0}","stderr":""}))
@@ -1540,7 +1552,7 @@ fn local_state_and_overlay_initial_descriptions(cx: &mut TestAppContext) {
     cx.update(gpui_shell::init);
     let start = Instant::now();
     let staged = Staged::new();
-    for page in 1..=4 {
+    for page in 1..=5 {
         let tree = describe(
             cx,
             &staged,
@@ -1555,6 +1567,7 @@ fn local_state_and_overlay_initial_descriptions(cx: &mut TestAppContext) {
             "Terminals and agents that stay alive in the background",
             "Choose your panels",
             "Core AI & other machines",
+            "Detect agents & configure ACP",
             "Make it yours & h2 CLI",
         ][page - 1];
         assert!(tree.contains(expected), "welcome page {page}: {tree}");
@@ -1566,6 +1579,13 @@ fn local_state_and_overlay_initial_descriptions(cx: &mut TestAppContext) {
             assert!(tree.contains("Skip"), "welcome page 3 Skip button: {tree}");
             assert!(!tree.contains("deepseek-reasoner"), "welcome page 3 must not hardcode deepseek-reasoner chip: {tree}");
             assert!(!tree.contains("deepseek-chat"), "welcome page 3 must not default model to deepseek-chat: {tree}");
+        }
+        if page == 4 {
+            assert!(tree.contains("w-agents-card"), "welcome page 4 Agents & ACP detection card: {tree}");
+            assert!(tree.contains("w-acp-config-card"), "welcome page 4 ACP configuration card: {tree}");
+            assert!(tree.contains("Auto-install managed ACP adapters"), "welcome page 4 auto-install option: {tree}");
+            assert!(tree.contains("Default ACP permissions"), "welcome page 4 default permissions option: {tree}");
+            assert!(tree.contains("Auto-inject herdr2 MCP server"), "welcome page 4 inject-mcp option: {tree}");
         }
     }
     let zh_tree = describe(
@@ -2191,6 +2211,27 @@ fn brand_and_panel_buttons_render_by_default(cx: &mut TestAppContext) {
         !calls.borrow().shared.contains_key("workspace.panels"),
         "welcome panels step must not reset workspace.panels to []"
     );
+
+    let welcome_agents_root = staged.wrapper(
+        "frame/welcome",
+        "this.page = 4; this.aiSkipped = true; this.knownAgentsList = [{ key: 'claude', name: 'Claude Code', installed: true }, { key: 'codex', name: 'Codex', installed: true }]; this.adapterStatus = { autoInstall: true, defaultPermissions: 'approve-reads', injectMcp: true, adapters: [{ preset_id: 'claude', binary_name: 'claude-agent-acp', companion_cli: 'claude', companion_installed: true, installed: true, source: 'managed', state: 'ready', version: '0.9.0' }, { preset_id: 'codex', binary_name: 'codex-acp', companion_cli: 'codex', companion_installed: true, installed: false, source: 'missing', state: 'missing' }] }; this.agentProbe = { fullProbe: true, agents: [{ id: 'claude', installed: true, models: ['claude-opus-4-6'] }] };",
+    );
+    let welcome_agents_window = cx.add_window(|_, _| Empty);
+    let welcome_agents_runtime = ShellRuntime::new_isolated().unwrap();
+    let welcome_agents_policy = Policy::new()
+        .with_host_module(module(fixture(true, props(), updates("current", "current")), calls.clone()))
+        .unwrap();
+    let welcome_agents = welcome_agents_window.update(cx, |_, window, cx| {
+        let mut session = DescriptionSession::load(welcome_agents_runtime, welcome_agents_root, welcome_agents_policy, window, cx).unwrap();
+        let tree = session.describe(window, cx).unwrap();
+        window.remove_window();
+        tree
+    }).unwrap();
+    assert!(welcome_agents.contains("w-agents-page"), "Welcome page 4 must render Agents & ACP setup: {welcome_agents}");
+    assert!(welcome_agents.contains("w-agents-install-missing"), "Welcome page 4 must offer installing missing adapters: {welcome_agents}");
+    assert!(welcome_agents.contains("w-acp-config-card"), "Welcome page 4 must render ACP configuration card: {welcome_agents}");
+    assert!(welcome_agents.contains("w-acp-auto-install"), "Welcome page 4 must render auto-install toggle: {welcome_agents}");
+    assert!(welcome_agents.contains("w-acp-inject-mcp"), "Welcome page 4 must render inject-mcp toggle: {welcome_agents}");
 
     let settings = describe(cx, &staged, "frame/settings", true, json!({"section":"look"}), updates("current", "current"), None).unwrap();
     assert!(settings.contains("st-panel-files"), "Files panel toggle missing in Settings Look: {settings}");
@@ -2851,7 +2892,7 @@ fn split_pane_names_merged_tabs_and_windows_shells(cx: &mut TestAppContext) {
     )
     .unwrap();
     assert!(str_popup_tree.contains("st-dr-str-ai-reviewer-c0"), "Candidate strengths popup should render AI Configure button: {str_popup_tree}");
-    let probe_err_tree = describe(
+    let drove_notice_tree = describe(
         cx,
         &staged,
         "frame/settings",
@@ -2861,7 +2902,26 @@ fn split_pane_names_merged_tabs_and_windows_shells(cx: &mut TestAppContext) {
         Some("this.droveData = { config: { roles: { coder: { label: 'Coder', access: 'writable', primary: { agent: 'claude', model: 'opus', effort: 'high' }, fallbacks: [] } }, ai: { enabled: true } }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'claude', installed: true, models: ['opus'] }, { id: 'cursor', installed: true, models: [], error: 'ACP probe timed out after 60s' }] } };"),
     )
     .unwrap();
-    assert!(probe_err_tree.contains("st-dr-agent-errors"), "Probe error card should render: {probe_err_tree}");
+    assert!(drove_notice_tree.contains("st-s-agents"), "Settings sidebar should render dedicated Agents & ACP section: {drove_notice_tree}");
+    assert!(drove_notice_tree.contains("st-dr-goto-agents"), "Drove top bar should link to Agents & ACP section: {drove_notice_tree}");
+    assert!(drove_notice_tree.contains("st-dr-agents-notice"), "Drove should show concise notice linking to Agents & ACP on probe errors: {drove_notice_tree}");
+    assert!(!drove_notice_tree.contains("st-dr-agent-errors"), "Full probe error card belongs in dedicated Agents & ACP section: {drove_notice_tree}");
+
+    let probe_err_tree = describe(
+        cx,
+        &staged,
+        "frame/settings",
+        true,
+        json!({ "section": "agents" }),
+        updates("current", "current"),
+        Some("this.droveData = { config: { roles: { coder: { label: 'Coder', access: 'writable', primary: { agent: 'claude', model: 'opus', effort: 'high' }, fallbacks: [] } }, ai: { enabled: true } }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'claude', installed: true, models: ['opus'] }, { id: 'cursor', installed: true, models: [], error: 'ACP probe timed out after 60s' }] } }; this.adapterStatus = { adapters_dir: '/home/.local/share/herdr2/adapters', auto_install: true, default_permissions: 'approve-reads', inject_mcp: true, adapters: [{ preset_id: 'claude', binary_name: 'claude-agent-acp', companion_cli: 'claude', companion_installed: true, installed: true, source: 'managed', state: 'ready', version: '0.9.0' }] };"),
+    )
+    .unwrap();
+    assert!(probe_err_tree.contains("st-agents-page"), "Agents & ACP page should render: {probe_err_tree}");
+    assert!(probe_err_tree.contains("st-ag-adapters-card"), "Managed ACP adapters card should render: {probe_err_tree}");
+    assert!(probe_err_tree.contains("st-ag-list-card"), "Detected agents list card should render: {probe_err_tree}");
+    assert!(probe_err_tree.contains("st-ag-config-card"), "ACP configuration card should render: {probe_err_tree}");
+    assert!(probe_err_tree.contains("st-dr-agent-errors"), "Probe error card should render in Agents & ACP: {probe_err_tree}");
     assert!(!probe_err_tree.contains("st-dr-probe-ai-btn"), "AI Diagnose button should be removed: {probe_err_tree}");
     assert!(probe_err_tree.contains("st-dr-probe-agent-fix-btn"), "Probe error card should render Fix with Agent button: {probe_err_tree}");
     let probe_fix_tree = describe(
@@ -2869,7 +2929,7 @@ fn split_pane_names_merged_tabs_and_windows_shells(cx: &mut TestAppContext) {
         &staged,
         "frame/settings",
         true,
-        json!({ "section": "drove" }),
+        json!({ "section": "agents" }),
         updates("current", "current"),
         Some("this.droveProbeFixOpen = true; this.droveProbeFixAgent = 'codex'; this.droveProbeFixModel = 'gpt-5.4'; this.droveProbeFixEffort = 'xhigh'; this.droveData = { config: { roles: { coder: { label: 'Coder', access: 'writable', primary: { agent: 'claude', model: 'opus', effort: 'high' }, fallbacks: [] } }, ai: { enabled: true } }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'claude', installed: true, models: ['claude-opus-4-6'] }, { id: 'codex', installed: true, models: ['gpt-5.4'] }, { id: 'cursor', installed: true, models: [], error: 'ACP probe timed out after 60s' }] } };"),
     )
@@ -2886,7 +2946,7 @@ fn split_pane_names_merged_tabs_and_windows_shells(cx: &mut TestAppContext) {
         &staged,
         "frame/settings",
         true,
-        json!({ "section": "drove" }),
+        json!({ "section": "agents" }),
         updates("current", "current"),
         Some("this.droveProbeFixOpen = true; this.droveProbeFixAgent = 'agy'; this.droveProbeFixModel = 'gemini-4-carbon-high'; this.droveProbeFixEffort = 'high'; this.droveData = { config: { roles: { coder: { label: 'Coder', access: 'writable', primary: { agent: 'claude', model: 'opus', effort: 'high' }, fallbacks: [] } }, ai: { enabled: true } }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'agy', installed: true, models: ['gemini-4-carbon-high'] }, { id: 'cursor', installed: true, models: [], error: 'ACP probe timed out after 60s' }] } };"),
     )
@@ -6626,4 +6686,305 @@ fn acp_and_pty_peek_render_slash_and_codex_at_command_completion_popups(cx: &mut
         Some("this.readAvailableCommands = [{name:'compact',description:'Compact context',source:'command'}]; this.inputFocused = true; this.input.set_value('/co'); this.input.set_selected_range({start:3,end:3}); this.handleComposerKeyDown({key:'tab',modifiers:{}}, cx);"),
     ).unwrap();
     assert!(!accepted_tree.contains("acp-completion-popup"), "popup should close after accepting completion: {accepted_tree}");
+}
+
+#[gpui::test]
+fn ai_polish_button_stops_spinning_after_result_arrives(cx: &mut TestAppContext) {
+    use gpui::VisualTestContext;
+    use std::ops::Deref as _;
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+
+    // Helper: mounts a mod in a real VisualTestContext where `startPolish*` runs from a
+    // call-scoped `cx` (same `ContextBinding::Call` lifetime as `on_click`), awaits async `h2`,
+    // and verifies the view re-renders with the polished text and WITHOUT a lingering spinner.
+    let assert_polish_finishes = |cx: &mut TestAppContext,
+                                  entry: &str,
+                                  values: BTreeMap<String, Value>,
+                                  setup: &str,
+                                  expected_banner_id: &str| {
+        let calls = Rc::new(RefCell::new(Calls::default()));
+        static NEXT_POLISH_STORE: AtomicU64 = AtomicU64::new(0);
+        gpui_shell::policy::set_default(
+            Policy::new()
+                .with_storage_path(staged.0.join(format!(
+                    "store-polish-spin-{}.json",
+                    NEXT_POLISH_STORE.fetch_add(1, Ordering::Relaxed)
+                )))
+                .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+                .with_host_module(module(values, calls.clone()))
+                .unwrap(),
+        );
+        let runtime = ShellRuntime::new_isolated().unwrap();
+        let root = staged.wrapper(entry, setup);
+        let win = cx.add_window(|window, cx| RootedView(runtime.try_load(&root, window, cx).unwrap()));
+        let view: gpui::Entity<gpui_shell::ScriptView> = win
+            .read_with(cx, |root, cx| root.0.read(cx).content().clone().downcast().unwrap())
+            .unwrap();
+        let mut visual = VisualTestContext::from_window(*win.deref(), cx);
+        visual.update(|window, cx| {
+            window.activate_window();
+            window.draw(cx).clear(cx);
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+        let tree = visual.update(|_, cx| {
+            view.read(cx)
+                .snapshot()
+                .map(gpui_shell::RenderSnapshot::debug_tree)
+                .unwrap_or_default()
+        });
+        assert!(
+            calls.borrow().effects.iter().any(|(name, _)| name == "h2.polish"),
+            "{entry}: expected h2 ai polish-prompt call, got {:?}",
+            calls.borrow().effects
+        );
+        assert!(
+            tree.contains(expected_banner_id),
+            "{entry}: expected post-polish banner `{expected_banner_id}` after async polish completed: {tree}"
+        );
+        assert!(
+            !tree.contains("spinner.svg") && !tree.contains("Polishing…") && !tree.contains("润色中…"),
+            "{entry}: AI polish button stayed stuck spinning after result arrived: {tree}"
+        );
+        visual.update(|window, _| window.remove_window());
+        cx.run_until_parked();
+    };
+
+    // 1) Flash Note compose window (`#fn-polish` -> `startPolishIdea(cx)`)
+    let fn_values = fixture(true, json!({ "mode": "compose" }), updates("current", "current"));
+    assert_polish_finishes(
+        cx,
+        "mods/flash-note",
+        fn_values,
+        "this.entryStates[0].input.set_value('fix login bug'); this.startPolishIdea(cx);",
+        "fn-polish-banner",
+    );
+
+    // 2) Prompt polish modal (`#pm-polish-run` -> `startPolish(cx)`)
+    let pm_values = fixture(
+        true,
+        json!({ "mode": "polish", "value": "fix login bug", "terminal": "t1", "agentKind": "cli", "overlay": "ov-pm" }),
+        updates("current", "current"),
+    );
+    assert_polish_finishes(
+        cx,
+        "mods/prompt",
+        pm_values,
+        "this.startPolish(cx);",
+        "pm-polish-banner",
+    );
+
+    // 3) Peek ACP composer (`#acp-polish` -> `startPolishPrompt(cx)`)
+    let mut peek_values = fixture(true, json!({ "terminal": "a1", "acp": true }), updates("current", "current"));
+    peek_values.insert(
+        "terminals".into(),
+        json!([{ "address": "a1", "acp": true, "state": "live", "cwd": "/fixture/project", "status": "idle" }]),
+    );
+    assert_polish_finishes(
+        cx,
+        "mods/peek",
+        peek_values,
+        "this.input.set_value('fix login bug'); this.startPolishPrompt(cx);",
+        "acp-polish-banner",
+    );
+}
+
+#[gpui::test]
+fn acp_completion_tab_and_enter_complete_without_sending(cx: &mut TestAppContext) {
+    use gpui::VisualTestContext;
+    use std::ops::Deref as _;
+    cx.update(gpui_shell::init);
+    let staged = Staged::new();
+
+    let codex_prog = json!({
+        "key":"codex","name":"Codex","icon":null,"tint":true,"tile":"#112233",
+        "color":"#10a37f","shell":false,"agent":true
+    });
+
+    let make_values = || {
+        let mut values = fixture(
+            true,
+            json!({ "terminal": "a1", "acp": true, "tab": true, "pane": "p2" }),
+            updates("current", "current"),
+        );
+        values.insert("terminals".into(), json!([
+            {
+                "address": "a1", "acp": true, "name": "Codex", "title": "Codex",
+                "argv": ["codex-acp"], "parent": null, "labels": {}, "state": "live", "status": "idle",
+                "turn": 1,
+                "available_commands": [
+                    { "name": "compact", "description": "Compact context", "source": "command" },
+                    { "name": "plan", "description": "Plan mode", "source": "command" },
+                    { "name": "$drove", "description": "Multi-agent orchestration", "source": "skill" }
+                ],
+                "report": { "app": "codex" }, "program": codex_prog, "cwd": "/fixture/project"
+            }
+        ]));
+        values.insert("agents".into(), json!([
+            {
+                "address": "a1", "agent": "codex", "acp": true, "pane": "p2", "space": "s1",
+                "space_name": "Local", "tab": "tab1", "tab_index": 1, "tab_name": "Codex",
+                "status": "idle", "app": "codex", "program": codex_prog, "title": "Codex",
+                "seq": 1, "focused": true
+            }
+        ]));
+        values
+    };
+
+    let run_scenario = |cx: &mut TestAppContext, setup: &str, keystrokes: &str| {
+        static NEXT_STORE: AtomicU64 = AtomicU64::new(0);
+        let calls = Rc::new(RefCell::new(Calls::default()));
+        gpui_shell::policy::set_default(
+            Policy::new()
+                .with_storage_path(staged.0.join(format!(
+                    "store-acp-comp-{}.json",
+                    NEXT_STORE.fetch_add(1, Ordering::Relaxed)
+                )))
+                .with_capabilities(Capabilities::new().storage(true).read_roots([staged.0.clone()]))
+                .with_host_module(module(make_values(), calls.clone()))
+                .unwrap(),
+        );
+        let runtime = ShellRuntime::new_isolated().unwrap();
+        let dir = staged.0.clone();
+        // Wrap Peek so we also render the exact live textarea value and focus flag
+        // into a probe node for assertions without bypassing real GPUI keystroke dispatch.
+        std::fs::write(
+            dir.join("main.js"),
+            format!(
+                "import {{ div }} from 'gpui-kit'; \
+                 import {{ v_flex }} from 'gpui-base'; \
+                 import Real from './mods/peek/main.js'; \
+                 export default class Scenario extends Real {{ \
+                   init(props, cx) {{ super.init(props, cx); {setup} cx.spawn(async () => {{ this.input?.focus?.(); }}); }} \
+                   render(cx) {{ \
+                     const el = super.render(cx); \
+                     return v_flex().size_full().child(el).child(div().id('probe').child(`VALUE=[[${{this.input?.value?.() ?? ''}}]] FOCUSED=${{this.inputFocused}}`)); \
+                   }} \
+                 }}"
+            ),
+        )
+        .unwrap();
+        let win = cx.add_window(|window, cx| RootedView(runtime.try_load(&dir, window, cx).unwrap()));
+        let view: gpui::Entity<gpui_shell::ScriptView> = win
+            .read_with(cx, |root, cx| root.0.read(cx).content().clone().downcast().unwrap())
+            .unwrap();
+        let mut visual = VisualTestContext::from_window(*win.deref(), cx);
+        visual.update(|window, cx| {
+            window.activate_window();
+            window.draw(cx).clear(cx);
+        });
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+
+        let before_tree = visual.update(|_, cx| {
+            view.read(cx)
+                .snapshot()
+                .map(gpui_shell::RenderSnapshot::debug_tree)
+                .unwrap_or_default()
+        });
+        assert!(
+            before_tree.contains("acp-completion-popup"),
+            "expected completion popup before keystrokes `{keystrokes}`: {before_tree}"
+        );
+
+        visual.simulate_keystrokes(keystrokes);
+        visual.run_until_parked();
+        visual.update(|window, cx| window.draw(cx).clear(cx));
+
+        let after_tree = visual.update(|_, cx| {
+            view.read(cx)
+                .snapshot()
+                .map(gpui_shell::RenderSnapshot::debug_tree)
+                .unwrap_or_default()
+        });
+        let sends: Vec<Value> = calls
+            .borrow()
+            .effects
+            .iter()
+            .filter(|(k, _)| k == "h2.send")
+            .flat_map(|(_, args)| args.clone())
+            .collect();
+        visual.update(|window, _| window.remove_window());
+        cx.run_until_parked();
+        (after_tree, sends)
+    };
+
+    // 1) Slash trigger + real Tab keystroke: completes `/compact `, keeps focus, does NOT indent or send.
+    let (tree, sends) = run_scenario(
+        cx,
+        "this.input.set_value('/co'); this.input.set_selected_range({start:3,end:3}); this.input.focus();",
+        "tab",
+    );
+    assert!(tree.contains("VALUE=[[/compact ]]"), "Tab should complete `/co` to `/compact `: {tree}");
+    assert!(tree.contains("FOCUSED=true"), "Tab completion must keep focus in textarea: {tree}");
+    assert!(!tree.contains("acp-completion-popup"), "popup should close after Tab completion: {tree}");
+    assert!(sends.is_empty(), "Tab completion must not send prompt: {sends:?}");
+
+    // 2) Slash trigger + real Enter keystroke: completes `/compact ` without inserting newline or sending.
+    let (tree, sends) = run_scenario(
+        cx,
+        "this.input.set_value('/co'); this.input.set_selected_range({start:3,end:3}); this.input.focus();",
+        "enter",
+    );
+    assert!(tree.contains("VALUE=[[/compact ]]"), "Enter should complete `/co` to `/compact ` without newline: {tree}");
+    assert!(!tree.contains("acp-completion-popup"), "popup should close after Enter completion: {tree}");
+    assert!(sends.is_empty(), "Enter while completion popup is open must NOT send prompt: {sends:?}");
+
+    // 3) Slash trigger + Enter (completes) + second Enter (sends completed command cleanly).
+    let (_tree, sends) = run_scenario(
+        cx,
+        "this.input.set_value('/co'); this.input.set_selected_range({start:3,end:3}); this.input.focus();",
+        "enter enter",
+    );
+    assert_eq!(sends.len(), 1, "second Enter after completion closes should send once: {sends:?}");
+    assert!(
+        sends[0].to_string().contains("/compact"),
+        "second Enter should send completed `/compact`: {sends:?}"
+    );
+
+    // 4) Dollar skill trigger + real Tab keystroke.
+    let (tree, sends) = run_scenario(
+        cx,
+        "this.input.set_value('use $dr'); this.input.set_selected_range({start:7,end:7}); this.input.focus();",
+        "tab",
+    );
+    assert!(tree.contains("VALUE=[[use $drove ]]"), "Tab should complete `$dr` to `$drove `: {tree}");
+    assert!(sends.is_empty(), "Tab on $ trigger must not send: {sends:?}");
+
+    // 5) Multiline @ trigger + real Down + Enter: Down navigates popup (not cursor line) and Enter accepts 2nd item.
+    let (tree, sends) = run_scenario(
+        cx,
+        "this.workspaceFilesCache.set('local:/fixture/project', {files:['README.md','src/main.rs'], fetchedAt: Date.now(), loading: false}); \
+         this.input.set_value('check\\n@\\nplease'); \
+         this.input.set_selected_range({start:7,end:7}); \
+         this.input.focus();",
+        "down enter",
+    );
+    // With Codex @ not at prompt start, skills ($drove) come first, then files (README.md is index 1!).
+    // Suffix starts with `\n`, so `applyComposerCompletion` cleanly avoids adding a trailing space before `\n`.
+    assert!(
+        tree.contains(r"VALUE=[[check\n@README.md\nplease]]"),
+        "Down should select 2nd item (@README.md after $drove) and Enter should insert it without moving cursor off line: {tree}"
+    );
+    assert!(sends.is_empty(), "Down + Enter on @ trigger must not send: {sends:?}");
+
+    // 6) Escape dismisses completion popup without altering text or sending.
+    let (tree, sends) = run_scenario(
+        cx,
+        "this.input.set_value('/co'); this.input.set_selected_range({start:3,end:3}); this.input.focus();",
+        "escape",
+    );
+    assert!(tree.contains("VALUE=[[/co]]"), "Escape should keep text unchanged: {tree}");
+    assert!(!tree.contains("acp-completion-popup"), "Escape should dismiss popup: {tree}");
+    assert!(sends.is_empty(), "Escape must not send: {sends:?}");
+
+    // 7) Shift+Enter still inserts a newline without accepting completion or sending.
+    let (tree, sends) = run_scenario(
+        cx,
+        "this.input.set_value('/co'); this.input.set_selected_range({start:3,end:3}); this.input.focus();",
+        "shift-enter",
+    );
+    assert!(tree.contains(r"VALUE=[[/co\n]]"), "Shift+Enter should insert a newline: {tree}");
+    assert!(sends.is_empty(), "Shift+Enter must not send: {sends:?}");
 }

@@ -209,6 +209,7 @@ pub fn default_pty_argv(preset: &str) -> Vec<String> {
             vec!["cursor-agent".into(), "--yolo".into(), "--trust".into()]
         }
         "zcode" | "zcode-cli" => vec!["zcode".into(), "--mode".into(), "yolo".into()],
+        "trae" | "traecli" | "traex" | "trae-cli" => vec!["traecli".into()],
         "goose" => vec!["goose".into()],
         other if !other.is_empty() => vec![other.to_string()],
         _ => Vec::new(),

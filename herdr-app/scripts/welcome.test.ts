@@ -3,6 +3,8 @@ import { readFile } from "node:fs/promises";
 import {
   PAGES,
   AI_PAGE,
+  AGENTS_PAGE,
+  ACP_PERMISSIONS,
   AI_PROVIDERS,
   DEEPSEEK_PRESET,
   PANELS,
@@ -20,19 +22,27 @@ import {
   agentCustomizePrompt,
   fmtVersion,
   findLayoutNode,
+  normalizeAdapterStatus,
+  normalizeAgentProbe,
+  summarizeDetectedAgents,
+  formatShortProbeError,
 } from "../defaults/frame/welcome/model.js";
 
-test("welcome uses 4 compact pages with 6 core shortcuts", () => {
-  expect(PAGES).toBe(4);
+test("welcome uses 5 compact pages including Agents & ACP setup with 6 core shortcuts", () => {
+  expect(PAGES).toBe(5);
+  expect(AI_PAGE).toBe(3);
+  expect(AGENTS_PAGE).toBe(4);
+  expect(ACP_PERMISSIONS.map((p) => p.id)).toEqual(["approve-reads", "approve-all", "ask", "deny-all"]);
   expect(PANELS.length).toBe(3);
   expect(SHORTCUT_HIGHLIGHTS.length).toBe(6);
 });
 
-test("clampPage bounds page indices to 1..4", () => {
+test("clampPage bounds page indices to 1..5", () => {
   expect(clampPage(0)).toBe(1);
   expect(clampPage(-3)).toBe(1);
   expect(clampPage(3)).toBe(3);
-  expect(clampPage(99)).toBe(4);
+  expect(clampPage(4)).toBe(4);
+  expect(clampPage(99)).toBe(5);
   expect(clampPage("abc")).toBe(1);
 });
 
@@ -358,14 +368,163 @@ test("Welcome AI config: two providers only, no default model, fetch models, opt
   const saveCall = coreCalls.find((c) => c.args[1] === "settings-set");
   expect(saveCall?.payload).toEqual({ enabled: true, baseUrl: "http://127.0.0.1:8080/v1", model: "magpie-model-b" });
 
-  // Scenario B: Skip button unlocks Page 4 directly without configuring AI
+  // Scenario B: Skip button unlocks Page 4 (Agents & ACP) directly without configuring AI
   const view2 = new Welcome();
   view2.init({}, cx);
   await new Promise((r) => setTimeout(r, 10));
   view2.page = AI_PAGE;
   expect(view2.aiReady()).toBe(false);
   view2.skipAi(cx);
+  await new Promise((r) => setTimeout(r, 10));
   expect(view2.aiSkipped).toBe(true);
   expect(view2.aiReady()).toBe(true);
-  expect(view2.page).toBe(4);
+  expect(view2.page).toBe(AGENTS_PAGE);
+});
+
+test("Welcome Agents & ACP step summarizes detected agents, installs adapters, and persists ACP config", async () => {
+  const adapterStatus = normalizeAdapterStatus(
+    JSON.stringify({
+      adapters_dir: "/home/.local/share/herdr2/adapters",
+      auto_install: true,
+      registry_url: "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json",
+      default_permissions: "approve-reads",
+      inject_mcp: true,
+      adapters: [
+        { preset_id: "claude", binary_name: "claude-agent-acp", companion_cli: "claude", companion_installed: true, installed: true, source: "managed", state: "ready", version: "0.9.0" },
+        { preset_id: "codex", binary_name: "codex-acp", companion_cli: "codex", companion_installed: true, installed: false, source: "missing", state: "missing" },
+      ],
+    }),
+  );
+  const probe = normalizeAgentProbe(
+    JSON.stringify({
+      fullProbe: true,
+      agents: [
+        { id: "claude", installed: true, models: ["claude-opus-4-6", "claude-sonnet-4-6"] },
+        { id: "cursor", installed: true, models: [], error: "ACP initialize failed\nstderr:\nPlease login" },
+      ],
+    }),
+  );
+  const known = [
+    { key: "claude", name: "Claude Code", installed: true },
+    { key: "codex", name: "Codex", installed: true },
+    { key: "antigravity", name: "Antigravity", installed: true },
+  ];
+  const summary = summarizeDetectedAgents(known, probe, adapterStatus);
+  expect(summary.cliCount).toBe(3);
+  expect(summary.acpReadyCount).toBe(1);
+  expect(summary.acpErrorCount).toBe(1);
+  expect(summary.missingAdapters.map((a: any) => a.preset_id)).toEqual(["codex"]);
+  expect(summary.rows.find((r: any) => r.id === "agy")?.name).toBe("Antigravity");
+  expect(formatShortProbeError("ACP initialize failed\nstderr:\nPlease login")).toBe("ACP initialize failed · Please login");
+
+  const source = await readFile(new URL("../defaults/frame/welcome/main.js", import.meta.url), "utf8");
+  const modelMod = await import("../defaults/frame/welcome/model.js");
+  const h2Calls: string[][] = [];
+  const env: Record<string, any> = {
+    View: class {},
+    div: () => ({}),
+    svg: () => ({}),
+    image: () => ({}),
+    v_flex: () => ({}),
+    h_flex: () => ({}),
+    InputState: { new: () => ({ value: () => "", set_value: () => {}, set_masked: () => {} }) },
+    Input: { new: () => ({}) },
+    Popup: { new: () => ({}) },
+    ...modelMod,
+    spaces: () => [],
+    run: () => {},
+    theme: () => ({}),
+    props: () => ({ overlay: "ov-welcome" }),
+    closeOverlay: () => {},
+    shared: () => undefined,
+    setShared: () => {},
+    knownAgents: async () => known,
+    h2: async (args: string[]) => {
+      h2Calls.push(args);
+      if (args[0] === "adapter" && args[1] === "status") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            auto_install: true,
+            default_permissions: "approve-reads",
+            inject_mcp: true,
+            adapters: [
+              { preset_id: "codex", binary_name: "codex-acp", companion_cli: "codex", companion_installed: true, installed: false, source: "missing", state: "missing" },
+            ],
+          }),
+        };
+      }
+      if (args[0] === "adapter" && args[1] === "install") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ results: [{ preset_id: "codex", action: "installed", version: "0.4.1" }] }),
+        };
+      }
+      if (args[0] === "adapter" && args[1] === "config") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            auto_install: false,
+            default_permissions: "approve-all",
+            inject_mcp: false,
+            adapters: [],
+          }),
+        };
+      }
+      if (args[0] === "drove" && args[1] === "probe") {
+        return { code: 0, stdout: JSON.stringify({ fullProbe: true, agents: [{ id: "codex", installed: true, models: ["gpt-5.4"] }] }) };
+      }
+      return { code: 0, stdout: "{}" };
+    },
+    hc: async () => ({ code: 0, stdout: "{}" }),
+    appHome: () => "/home/.config/herdr2-app",
+    readTextFile: async () => "{}",
+    writeTextFile: async () => {},
+    settings: () => ({ language: "en", zoom: 1 }),
+    layout: () => ({ id: "root", children: [] }),
+    keys: () => [],
+    updates: () => ({}),
+    appWindow: () => ({ platform: "linux" }),
+    pickFolder: async () => null,
+    checking: () => false,
+  };
+
+  const body = source
+    .replace(/^import[\s\S]*?from\s+["'][^"']+["'];\s*\n/gm, "")
+    .replace("export default class Welcome", "return class Welcome");
+  const Welcome = new Function(...Object.keys(env), body)(...Object.values(env));
+  const pending: Promise<void>[] = [];
+  const cx = {
+    notify: () => {},
+    focus_handle: () => ({ focus: () => {} }),
+    timer: { after: () => {}, every: () => {} },
+    spawn: (fn: (c: any) => Promise<void>) => { pending.push(fn({ notify: () => {} })); },
+  };
+
+  const view = new Welcome();
+  view.init({}, cx);
+  await Promise.all(pending.splice(0));
+
+  view.installAdapters(cx, "detected", "codex");
+  await Promise.all(pending.splice(0));
+  expect(h2Calls).toContainEqual(["adapter", "install", "codex", "--json"]);
+  expect(view.agentsNotice).toContain("codex");
+  expect(view.adapterBusy).toBe(false);
+
+  view.saveAcpConfig({ autoInstall: false, defaultPermissions: "approve-all", injectMcp: false }, cx);
+  await Promise.all(pending.splice(0));
+  expect(h2Calls).toContainEqual([
+    "adapter",
+    "config",
+    "--auto-install",
+    "false",
+    "--default-permissions",
+    "approve-all",
+    "--inject-mcp",
+    "false",
+    "--json",
+  ]);
+  expect(view.adapterStatus?.autoInstall).toBe(false);
+  expect(view.adapterStatus?.defaultPermissions).toBe("approve-all");
+  expect(view.adapterStatus?.injectMcp).toBe(false);
 });

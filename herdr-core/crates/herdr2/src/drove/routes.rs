@@ -24,6 +24,17 @@ impl Drop for AskGuard {
     }
 }
 
+struct DoneGuard {
+    drove: Arc<DroveRuntime>,
+    attempt_id: String,
+}
+
+impl Drop for DoneGuard {
+    fn drop(&mut self) {
+        self.drove.leave_done(&self.attempt_id);
+    }
+}
+
 pub(super) fn header<'a>(headers: &'a BTreeMap<String, String>, k1: &str, k2: &str) -> Option<&'a str> {
     headers.get(k1).or_else(|| headers.get(k2)).map(String::as_str)
 }
@@ -125,11 +136,20 @@ pub(super) fn worker_context_http(
     let att_id =
         worker.current_attempt_id.ok_or_else(|| ApiErr::new(409, "stale_attempt", "worker has no active attempt"))?;
     let att = drove.store.get_attempt(&att_id).ok_or_else(|| ApiErr::new(409, "stale_attempt", "attempt missing"))?;
+    let task = drove.store.get_task(&att.task_id);
+    let role_name = worker.role.as_deref().unwrap_or("coder");
+    let cfg = drove.config_snapshot();
+    let role_cfg = super::config::resolve_role_config(&cfg, role_name);
     Ok(json!({
         "workerId": worker.id,
         "currentAttempt": att.id,
         "taskId": att.task_id,
         "runId": att.run_id,
+        "role": role_name,
+        "roleAccess": role_cfg.as_ref().and_then(|r| r.access).unwrap_or(RoleAccessMode::Writable),
+        "allowedPaths": role_cfg.as_ref().map(|r| r.allowed_paths.clone()).unwrap_or_default(),
+        "outputSchema": task.as_ref().and_then(|t| t.output_schema.clone()),
+        "channels": task.as_ref().map(|t| t.channels.clone()).unwrap_or_default(),
     }))
 }
 
@@ -182,6 +202,7 @@ pub(super) async fn worker_ask_http(
         question.clone(),
         msg.options.clone(),
     );
+    super::ai::spawn_run_narrator(core.clone(), att.run_id.clone());
     let tkey = task.as_ref().map(|t| t.key.as_str()).unwrap_or(&att.task_id);
     notify_coordinator(
         core,
@@ -260,10 +281,36 @@ pub(super) fn worker_read_http(
     body: &Value,
 ) -> Result<Value, ApiErr> {
     let att = authenticate_worker(drove, headers, body)?;
-    let target = body["target"].as_str().map(str::trim).unwrap_or("");
+    let raw_target = body["target"].as_str().map(str::trim).unwrap_or("");
+    let target = raw_target
+        .strip_prefix("@task:")
+        .or_else(|| raw_target.strip_prefix("task:"))
+        .map(|s| s.split('#').next().unwrap_or(s))
+        .unwrap_or(raw_target);
     let offset = body["offset"].as_u64().unwrap_or(0) as usize;
     let limit = body["limit"].as_u64().unwrap_or(65536).clamp(1, 262144) as usize;
     let grep = body["grep"].as_str();
+    let json_path = body["jsonPath"].as_str().or_else(|| body["path"].as_str()).map(str::trim).filter(|s| !s.is_empty());
+
+    if target.starts_with("#contract:")
+        || target.starts_with("contract:")
+        || (target.starts_with('#') && target[1..].chars().all(|c| c.is_ascii_digit()))
+    {
+        let contract = drove
+            .store
+            .get_contract(&att.run_id, target)
+            .ok_or_else(|| ApiErr::new(404, "not_found", format!("contract {target:?} not found")))?;
+        if let Some(jp) = json_path {
+            let sliced = contract
+                .payload
+                .as_ref()
+                .and_then(|p| select_json_path(p, jp))
+                .cloned()
+                .unwrap_or(Value::Null);
+            return Ok(json!({ "contract": contract.key, "seq": contract.seq, "channel": contract.channel, "path": jp, "value": sliced }));
+        }
+        return Ok(json!({ "contract": contract }));
+    }
 
     if target == "verify" || target.starts_with("verify-") {
         let art = if target == "verify" {
@@ -294,9 +341,127 @@ pub(super) fn worker_read_http(
         return Ok(slice);
     }
     if let Some(dep) = drove.store.find_task_in_run(&att.run_id, target) {
+        if let Some(jp) = json_path {
+            let sliced = dep
+                .result
+                .as_ref()
+                .and_then(|r| r.data.as_ref())
+                .and_then(|d| select_json_path(d, jp))
+                .cloned()
+                .unwrap_or(Value::Null);
+            return Ok(json!({ "task": dep.key, "status": dep.status, "path": jp, "value": sliced }));
+        }
         return Ok(json!({ "task": dep.key, "status": dep.status, "result": dep.result }));
     }
-    Err(ApiErr::new(404, "not_found", format!("unknown read target {target:?}")))
+    Err(ApiErr::new(404, "not_found", format!("unknown read target {raw_target:?}")))
+}
+
+fn select_json_path<'a>(root: &'a Value, raw_path: &str) -> Option<&'a Value> {
+    let clean = raw_path.trim().strip_prefix("data.").unwrap_or(raw_path.trim());
+    let mut cur = root;
+    for seg in clean.split('.').filter(|s| !s.is_empty()) {
+        cur = match cur {
+            Value::Object(map) => map.get(seg)?,
+            Value::Array(arr) => {
+                let idx: usize = seg.parse().ok()?;
+                arr.get(idx)?
+            }
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
+pub(super) fn worker_contract_http(
+    drove: &DroveRuntime,
+    headers: &BTreeMap<String, String>,
+    body: &Value,
+) -> Result<Value, ApiErr> {
+    let att = authenticate_worker(drove, headers, body)?;
+    let action = body["action"].as_str().map(str::trim).unwrap_or("list");
+    match action {
+        "publish" => {
+            let key = body["key"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| ApiErr::new(400, "bad_request", "contract key must be non-empty"))?;
+            let summary = body["summary"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| ApiErr::new(400, "bad_request", "contract summary must be non-empty"))?
+                .to_string();
+            let channel = body["channel"].as_str().map(str::trim).filter(|s| !s.is_empty()).unwrap_or("main");
+            let payload = body.get("payload").filter(|v| !v.is_null()).cloned();
+            let author_task = drove
+                .store
+                .get_task(&att.task_id)
+                .map(|t| t.key)
+                .unwrap_or_else(|| att.task_id.clone());
+            let post = drove.store.publish_contract(
+                &att.run_id,
+                channel,
+                key,
+                &author_task,
+                Some(att.worker_id.clone()),
+                summary,
+                payload,
+            );
+            Ok(json!({ "ok": true, "contract": post }))
+        }
+        "list" => {
+            let explicit_ch = body["channel"].as_str().map(str::trim).filter(|s| !s.is_empty());
+            let list = if let Some(ch) = explicit_ch {
+                drove.store.list_contracts(&att.run_id, Some(&[ch.to_string()]))
+            } else {
+                let task_channels = drove.store.get_task(&att.task_id).map(|t| t.channels).unwrap_or_default();
+                if task_channels.is_empty() {
+                    drove.store.list_contracts(&att.run_id, None)
+                } else {
+                    drove.store.list_contracts(&att.run_id, Some(&task_channels))
+                }
+            };
+            Ok(json!({ "contracts": list }))
+        }
+        other => Err(ApiErr::new(400, "bad_request", format!("unknown contract action {other:?}"))),
+    }
+}
+
+fn settle_attempt_done_runtime(core: &Arc<Core>, worker_id: &str, attempt_id: &str) {
+    let est_out = core.drove.add_attempt_estimated_output(attempt_id, 0);
+    if est_out > 0 {
+        let mut updated_tokens = false;
+        let _ = core.drove.store.update_attempt(attempt_id, |a| {
+            let was_est = a.estimated.as_ref().and_then(|e| e.tokens) == Some(true);
+            let had_exact = (a.tokens.input > 0 || a.tokens.output > 0 || a.tokens.cache_read > 0) && !was_est;
+            if !had_exact && est_out > a.tokens.output {
+                a.tokens.output = est_out;
+                a.estimated.get_or_insert_with(UsageEstimate::default).tokens = Some(true);
+                updated_tokens = true;
+            }
+        });
+        if updated_tokens {
+            let attempts = core.drove.store.list_attempts(None, None, Some(worker_id));
+            let toks: u64 =
+                attempts.iter().map(|a| a.tokens.input + a.tokens.output + a.tokens.cache_read).sum();
+            let any_est_tok = attempts.iter().any(|a| a.estimated.as_ref().and_then(|e| e.tokens) == Some(true));
+            let any_est_cost = attempts.iter().any(|a| a.estimated.as_ref().and_then(|e| e.cost) == Some(true));
+            let _ = core.drove.store.update_worker(worker_id, |w| {
+                w.totals.tokens = toks;
+                w.totals.estimated = if any_est_tok || any_est_cost {
+                    Some(UsageEstimate {
+                        tokens: any_est_tok.then_some(true),
+                        cost: any_est_cost.then_some(true),
+                    })
+                } else {
+                    None
+                };
+            });
+        }
+    }
+    core.drove.clear_loop_watermark(attempt_id);
+    core.ai.evict_session(&format!("drove:loop:{attempt_id}"));
 }
 
 pub(super) async fn worker_done_http(
@@ -305,8 +470,14 @@ pub(super) async fn worker_done_http(
     body: &Value,
 ) -> Result<Value, ApiErr> {
     let att = authenticate_worker(&core.drove, headers, body)?;
-    core.drove.clear_loop_watermark(&att.id);
-    core.ai.evict_session(&format!("drove:loop:{}", att.id));
+    if !core.drove.enter_done(&att.id) {
+        return Err(ApiErr::new(
+            409,
+            "in_progress",
+            format!("Completion gates are already running for attempt `{}`", att.id),
+        ));
+    }
+    let _done_guard = DoneGuard { drove: core.drove.clone(), attempt_id: att.id.clone() };
     let run = core.drove.store.get_run(&att.run_id).ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
     let task =
         core.drove.store.get_task(&att.task_id).ok_or_else(|| ApiErr::new(404, "not_found", "Task not found"))?;
@@ -326,6 +497,7 @@ pub(super) async fn worker_done_http(
             .filter(|s| !s.is_empty())
             .unwrap_or("Worker reported failure")
             .to_string();
+        settle_attempt_done_runtime(core, &worker.id, &att.id);
         let ended = now_iso();
         let upd_att = core.drove.store.update_attempt(&att.id, |a| {
             a.outcome = Some(Outcome::Failed);
@@ -402,6 +574,7 @@ pub(super) async fn worker_done_http(
             }
         }
         mark_worker_idle(core, &worker.id);
+        super::ai::spawn_run_narrator(core.clone(), run.id.clone());
         core.drove.wake_scheduler();
         return Ok(json!({ "ok": true, "attempt": upd_att, "task": core.drove.store.get_task(&task.id) }));
     }
@@ -456,11 +629,28 @@ pub(super) async fn worker_done_http(
     // M3 Gate 2: Adversarial read-only Review loop
     super::review::run_adversarial_review_gate(core, &run, &refreshed_task, &worker, &refreshed_att, work_cwd).await?;
 
-    // M3 Gate 3: Worktree serialized merge-back & warm retention
+    // M3 Gate 3: Worktree serialized merge-back (+ post-merge verify on diverged base) & warm retention
     let keep_wt = worker.worktree.is_some() && !super::integrate::is_aosp_harness(&run.cwd);
-    let merged_files =
-        super::integrate::merge_and_finalize_worktree(core, &run, worker.worktree.as_deref(), keep_wt).await?;
-    let merged_or_touched = if !merged_files.is_empty() { Some(merged_files) } else { files_modified };
+    if worker.worktree.is_some() {
+        let _ = core.drove.store.update_task(&refreshed_task.id, |t| t.exec_phase = Some(TaskPhase::Integrating));
+    }
+    let merge_res = super::integrate::merge_and_finalize_worktree(
+        core,
+        &run,
+        &refreshed_task,
+        worker.worktree.as_deref(),
+        keep_wt,
+    )
+    .await;
+    let merge_out = match merge_res {
+        Ok(m) => m,
+        Err(err) => {
+            let _ = core.drove.store.update_task(&refreshed_task.id, |t| t.exec_phase = Some(TaskPhase::Rework));
+            return Err(err);
+        }
+    };
+    let merged_or_touched =
+        if !merge_out.changed_files.is_empty() { Some(merge_out.changed_files) } else { files_modified };
 
     let result = TaskResult {
         summary: summary.clone(),
@@ -471,6 +661,7 @@ pub(super) async fn worker_done_http(
         output_file_hashes: None,
     };
 
+    settle_attempt_done_runtime(core, &worker.id, &refreshed_att.id);
     let ended = now_iso();
     let upd_att = core.drove.store.update_attempt(&refreshed_att.id, |a| {
         a.outcome = Some(Outcome::Succeeded);
@@ -533,6 +724,7 @@ pub(super) async fn worker_done_http(
         refreshed_att.id.clone(),
         summary.clone(),
     );
+    super::ai::spawn_run_narrator(core.clone(), run.id.clone());
     if !keep_wt && worker.worktree.is_some() {
         let _ = core.drove.store.update_worker(&worker.id, |w| {
             w.worktree = None;
@@ -883,6 +1075,26 @@ fn create_one_task(core: &Arc<Core>, run_id: &str, raw: &Value) -> Result<Task, 
         assign = Some(a);
     }
 
+    let fork_from = raw["forkFrom"]
+        .as_str()
+        .or_else(|| raw["fork"].as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let fork_mode = raw["forkMode"]
+        .as_str()
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| matches!(s.as_str(), "auto" | "native" | "package"));
+    let channels: Vec<String> = raw["channels"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(|s| s.trim().trim_start_matches('#').to_string()))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
     let initial_status = if is_template || !deps.is_empty() { TaskStatus::Pending } else { TaskStatus::Ready };
 
     let task = core.drove.store.create_task(super::store::CreateTaskInput {
@@ -914,6 +1126,9 @@ fn create_one_task(core: &Arc<Core>, run_id: &str, raw: &Value) -> Result<Task, 
         cache: raw.get("cache").cloned(),
         cached_from: None,
         retry_on_worker_reported: raw["retryOnWorkerReported"].as_bool(),
+        fork_from,
+        fork_mode,
+        channels,
     });
     Ok(task)
 }
@@ -1215,6 +1430,7 @@ pub(super) async fn complete_run_http(core: &Arc<Core>, run_id: &str, body: &Val
         ai_draft: None,
         needs_action: false,
     });
+    super::ai::spawn_run_narrator(core.clone(), run.id.clone());
     Ok(json!({ "ok": true, "run": updated }))
 }
 
@@ -1234,9 +1450,23 @@ pub(super) async fn cancel_run_http(core: &Arc<Core>, run_id: &str) -> Result<Va
     Ok(json!({ "ok": true, "run": updated }))
 }
 
+fn has_live_running_attempt(core: &Core, task: &Task) -> bool {
+    core.drove.store.list_attempts(None, Some(&task.id), None).iter().any(|a| {
+        if a.outcome.is_some() || a.ended_at.is_some() {
+            return false;
+        }
+        if a.worker_id == "exec" {
+            return true;
+        }
+        core.drove.store.get_worker(&a.worker_id).is_some_and(|w| {
+            matches!(w.state, WorkerState::Busy | WorkerState::Starting) && core.drove.has_worker_token(&w.id)
+        })
+    })
+}
+
 pub(super) async fn retry_task_http(core: &Arc<Core>, id: &str, body: &Value) -> Result<Value, ApiErr> {
     let mut task = core.drove.store.get_task(id).ok_or_else(|| ApiErr::new(404, "not_found", "Task not found"))?;
-    if task.status == TaskStatus::Running {
+    if task.status == TaskStatus::Running && has_live_running_attempt(core, &task) {
         return Err(ApiErr::new(409, "invalid_state", "cannot retry a running task"));
     }
     let user_override = body["userOverride"].as_bool() == Some(true);
@@ -1418,15 +1648,7 @@ pub(super) async fn retry_task_http(core: &Arc<Core>, id: &str, body: &Value) ->
             let rev_agent = body["reviewAgent"].as_str().map(str::trim).filter(|s| !s.is_empty());
             let rev_model = body["reviewModel"].as_str().map(str::trim).filter(|s| !s.is_empty());
             if rev_agent.is_some() || rev_model.is_some() {
-                let rev = t.review.get_or_insert_with(|| ReviewSpec {
-                    agent: None,
-                    model: None,
-                    effort: None,
-                    fast: None,
-                    different_agent: None,
-                    criteria: None,
-                    max_rounds: Some(2),
-                });
+                let rev = t.review.get_or_insert_with(|| ReviewSpec { max_rounds: Some(2), ..Default::default() });
                 if let Some(ra) = rev_agent {
                     rev.agent = Some(ra.to_string());
                 }
@@ -1555,8 +1777,230 @@ fn reopen_skipped_dependents(core: &Arc<Core>, root: &Task) {
     }
 }
 
-pub(super) async fn cancel_task_http(core: &Arc<Core>, id: &str) -> Result<Value, ApiErr> {
+pub(super) async fn edit_task_http(core: &Arc<Core>, id: &str, body: &Value) -> Result<Value, ApiErr> {
     let task = core.drove.store.get_task(id).ok_or_else(|| ApiErr::new(404, "not_found", "Task not found"))?;
+    if task.status == TaskStatus::Running && has_live_running_attempt(core, &task) {
+        return Err(ApiErr::new(409, "task_running", "cannot edit a task while an attempt is actively running"));
+    }
+    if task.status == TaskStatus::Succeeded {
+        return Err(ApiErr::new(409, "invalid_state", "cannot edit an already succeeded task (use retry or add)"));
+    }
+    let obj = body.as_object().ok_or_else(|| ApiErr::new(400, "bad_request", "patch body must be a JSON object"))?;
+
+    // Validate potential dependency cycles before mutating stored deps.
+    if let Some(deps_val) = obj.get("deps") {
+        let raw_deps: Vec<String> = deps_val
+            .as_array()
+            .ok_or_else(|| ApiErr::new(400, "invalid_field", "`deps` must be an array of task keys or IDs"))?
+            .iter()
+            .filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from))
+            .collect();
+        let all_tasks = core.drove.store.list_tasks(&task.run_id);
+        let mut resolved_new_deps = Vec::new();
+        for dep in &raw_deps {
+            if dep == &task.id || dep == &task.key {
+                return Err(ApiErr::new(422, "dependency_cycle", format!("task `{}` cannot depend on itself", task.key)));
+            }
+            if let Some(target) = all_tasks.iter().find(|c| &c.id == dep || &c.key == dep) {
+                resolved_new_deps.push(target.id.clone());
+            } else {
+                let matched_children: Vec<String> = all_tasks
+                    .iter()
+                    .filter(|c| c.key.strip_prefix(dep.as_str()).is_some_and(|r| r.starts_with('#')))
+                    .map(|c| c.id.clone())
+                    .collect();
+                if matched_children.is_empty() {
+                    return Err(ApiErr::new(400, "unknown_dep", format!("unknown dependency task {dep:?}")));
+                }
+                resolved_new_deps.extend(matched_children);
+            }
+        }
+        if has_dep_cycle(&all_tasks, &task.id, &resolved_new_deps) {
+            return Err(ApiErr::new(
+                422,
+                "dependency_cycle",
+                format!("updating `deps` on `{}` would introduce a cycle in the Run DAG", task.key),
+            ));
+        }
+    }
+
+    // Run worktree preflight if switching task isolation to `worktree`.
+    if obj.get("isolation").and_then(Value::as_str).is_some_and(|s| s.eq_ignore_ascii_case("worktree"))
+        && let Some(run) = core.drove.store.get_run(&task.run_id)
+    {
+        let cwd_check = run.cwd;
+        let check = tokio::task::spawn_blocking(move || super::integrate::check_drove_worktree_ready(&cwd_check))
+            .await
+            .map_err(|e| ApiErr::new(500, "internal", format!("preflight join error: {e}")))?;
+        if let Err(blocker) = check {
+            return Err(ApiErr::new(
+                422,
+                "worktree_not_ready",
+                format!("{} | 建议处理：{}", blocker.message, blocker.fix_hint),
+            ));
+        }
+    }
+
+    let mut deps_changed = false;
+    let updated = core
+        .drove
+        .store
+        .update_task(&task.id, |t| {
+            if let Some(title) = obj.get("title").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                t.title = title.to_string();
+            }
+            if let Some(phase_val) = obj.get("phase") {
+                t.phase = phase_val.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+            }
+            if let Some(spec_obj) = obj.get("spec").and_then(Value::as_object) {
+                if let Some(v) = spec_obj.get("target").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+                {
+                    t.spec.target = v.to_string();
+                }
+                if let Some(v) = spec_obj.get("change").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+                {
+                    t.spec.change = v.to_string();
+                }
+                if let Some(v) =
+                    spec_obj.get("acceptance").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty())
+                {
+                    t.spec.acceptance = v.to_string();
+                }
+                if let Some(c) = spec_obj.get("constraints") {
+                    t.spec.constraints = c.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+                }
+                if let Some(o) = spec_obj.get("ownership") {
+                    t.spec.ownership = o.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+                }
+                if let Some(ver) = spec_obj.get("verify") {
+                    t.spec.verify = if ver.is_null() { None } else { serde_json::from_value(ver.clone()).ok() };
+                }
+            }
+            // Also accept top-level shorthand fields (`target`, `change`, `acceptance`, `constraints`, `ownership`, `verify`).
+            for (k, setter) in [
+                ("target", 0u8),
+                ("change", 1u8),
+                ("acceptance", 2u8),
+            ] {
+                if let Some(v) = obj.get(k).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                    match setter {
+                        0 => t.spec.target = v.to_string(),
+                        1 => t.spec.change = v.to_string(),
+                        _ => t.spec.acceptance = v.to_string(),
+                    }
+                }
+            }
+            if let Some(c) = obj.get("constraints") {
+                t.spec.constraints = c.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+            }
+            if let Some(o) = obj.get("ownership") {
+                t.spec.ownership = o.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+            }
+            if let Some(ver) = obj.get("verify") {
+                t.spec.verify = if ver.is_null() { None } else { serde_json::from_value(ver.clone()).ok() };
+            }
+            if let Some(files) = obj.get("files").and_then(Value::as_array) {
+                t.files = files.iter().filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from)).collect();
+            }
+            if let Some(tags) = obj.get("tags").and_then(Value::as_array) {
+                t.tags = tags.iter().filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from)).collect();
+            }
+            if let Some(deps) = obj.get("deps").and_then(Value::as_array) {
+                t.deps = deps.iter().filter_map(|v| v.as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from)).collect();
+                deps_changed = true;
+            }
+            if let Some(iso_val) = obj.get("isolation")
+                && let Ok(iso) = serde_json::from_value::<Isolation>(iso_val.clone())
+            {
+                t.isolation = iso;
+                t.effective_isolation = None;
+                t.isolation_reason = None;
+            }
+            if let Some(ts) = obj.get("timeoutSec") {
+                t.timeout_sec = ts.as_u64();
+            }
+            if let Some(sw) = obj.get("stallWarnSec") {
+                t.stall_warn_sec = sw.as_u64();
+            }
+            if let Some(sk) = obj.get("stallKillSec") {
+                t.stall_kill_sec = sk.as_u64();
+            }
+            if let Some(tr) = obj.get("triggerRule") {
+                t.trigger_rule = if tr.is_null() { None } else { serde_json::from_value(tr.clone()).ok() };
+            }
+            if let Some(wh) = obj.get("when") {
+                t.when = if wh.is_null() { None } else { serde_json::from_value(wh.clone()).ok() };
+            }
+            if obj.get("noReview").and_then(Value::as_bool) == Some(true) {
+                t.review = None;
+            } else if let Some(rv) = obj.get("review") {
+                t.review = if rv.is_null() { None } else { serde_json::from_value(rv.clone()).ok() };
+            }
+            if let Some(os) = obj.get("outputSchema") {
+                t.output_schema = if os.is_null() { None } else { Some(os.clone()) };
+            }
+            if let Some(role) = obj.get("role").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                let mut a = t.assign.clone().unwrap_or_default();
+                a.role = Some(role.to_string());
+                if a.source.as_deref() == Some("router") {
+                    a.agent = None;
+                    a.model = None;
+                    a.effort = None;
+                    a.worker = None;
+                    a.source = None;
+                }
+                t.assign = Some(a);
+            }
+            if deps_changed && matches!(t.status, TaskStatus::Ready | TaskStatus::Skipped | TaskStatus::Blocked) && t.template != Some(true) {
+                t.status = if t.deps.is_empty() { TaskStatus::Ready } else { TaskStatus::Pending };
+            }
+        })
+        .ok_or_else(|| ApiErr::new(404, "not_found", "Task not found"))?;
+
+    if deps_changed {
+        normalize_run_task_deps(core, &updated.run_id);
+        let all = core.drove.store.list_tasks(&updated.run_id);
+        super::scheduler::promote_pending_tasks(core, &all);
+    }
+    let refreshed = core.drove.store.get_task(&updated.id).unwrap_or(updated);
+    core.drove.wake_scheduler();
+    Ok(json!(refreshed))
+}
+
+fn has_dep_cycle(tasks: &[Task], edited_id: &str, new_deps: &[String]) -> bool {
+    let mut adj: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for t in tasks {
+        if t.id == edited_id {
+            adj.insert(t.id.as_str(), new_deps.iter().map(String::as_str).collect());
+        } else {
+            let resolved: Vec<&str> = t
+                .deps
+                .iter()
+                .filter_map(|d| tasks.iter().find(|c| &c.id == d || &c.key == d).map(|c| c.id.as_str()))
+                .collect();
+            adj.insert(t.id.as_str(), resolved);
+        }
+    }
+    // Check if `edited_id` is reachable from any node in `new_deps`.
+    let mut stack: Vec<&str> = new_deps.iter().map(String::as_str).collect();
+    let mut visited = BTreeSet::new();
+    while let Some(cur) = stack.pop() {
+        if cur == edited_id {
+            return true;
+        }
+        if !visited.insert(cur) {
+            continue;
+        }
+        if let Some(nexts) = adj.get(cur) {
+            stack.extend(nexts.iter().copied());
+        }
+    }
+    false
+}
+
+pub(super) async fn cancel_task_http(core: &Arc<Core>, id: &str, body: &Value) -> Result<Value, ApiErr> {
+    let task = core.drove.store.get_task(id).ok_or_else(|| ApiErr::new(404, "not_found", "Task not found"))?;
+    let skip_ok = body["skipOk"].as_bool() == Some(true);
     let active_atts: Vec<Attempt> = core
         .drove
         .store
@@ -1574,6 +2018,24 @@ pub(super) async fn cancel_task_http(core: &Arc<Core>, id: &str) -> Result<Value
             a.failure =
                 Some(AttemptFailure { kind: FailureKind::Cancelled, message: "Cancelled by coordinator".into() });
         });
+    }
+    if skip_ok {
+        // Detach this cancelled task from downstream `Pending` tasks' `deps` so replacing/dropping an
+        // unneeded step does not cascade-skip the rest of the pipeline.
+        let run_tasks = core.drove.store.list_tasks(&task.run_id);
+        for other in run_tasks {
+            if other.id != task.id
+                && matches!(other.status, TaskStatus::Pending | TaskStatus::Skipped)
+                && other.deps.iter().any(|d| d == &task.id || d == &task.key)
+            {
+                let _ = core.drove.store.update_task(&other.id, |upd| {
+                    upd.deps.retain(|d| d != &task.id && d != &task.key);
+                    if upd.status == TaskStatus::Skipped {
+                        upd.status = TaskStatus::Pending;
+                    }
+                });
+            }
+        }
     }
     let updated = core.drove.store.update_task(&task.id, |t| t.status = TaskStatus::Cancelled);
     core.drove.wake_scheduler();

@@ -62,6 +62,7 @@ pub struct Setup {
     need: Need,
     state: State,
     requests: Option<async_channel::Receiver<Request>>,
+    _control_task: Option<Task<()>>,
     icon: Arc<Image>,
 }
 
@@ -73,21 +74,65 @@ pub fn open(need: Need, requests: async_channel::Receiver<Request>, cx: &mut App
         ..Default::default()
     };
     let icon = Arc::new(Image::from_bytes(ImageFormat::Png, ICON.to_vec()));
-    cx.open_window(options, |_, cx| cx.new(|_| Setup { need, state: State::Ready, requests: Some(requests), icon }))
+    cx.open_window(options, |window, cx| cx.new(|cx| Setup::new(need, requests, icon, window, cx)))
         .expect("cannot open the Herdr2 window");
     cx.activate(true);
 }
 
 impl Setup {
-    /// Connects to the core; if it serves this app, closes this window and
-    /// opens the main one, else says what's still needed.
+    fn new(
+        need: Need,
+        requests: async_channel::Receiver<Request>,
+        icon: Arc<Image>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let control_rx = requests.clone();
+        // Keep serving local control requests (especially single-instance `raise`) while the setup
+        // screen is up so clicking the app icon brings Setup to the front instead of hanging.
+        let control_task = cx.spawn_in(window, async move |_this, cx| {
+            while let Ok(req) = control_rx.recv().await {
+                if let Request::Control { cmd, reply } = req {
+                    let res = cx.update(|window, cx| {
+                        if cmd.get("raise").is_some() {
+                            cx.activate(true);
+                            window.activate_window();
+                            serde_json::json!({ "ok": true })
+                        } else if cmd.get("status").is_some() {
+                            serde_json::json!({ "setup": true })
+                        } else {
+                            serde_json::json!({ "error": "Herdr2 is waiting for h2 setup" })
+                        }
+                    });
+                    match res {
+                        Ok(val) => {
+                            let _ = reply.send(val);
+                        }
+                        Err(_) => {
+                            let _ = reply.send(serde_json::json!({ "error": "no window", "no_window": true }));
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        Self { need, state: State::Ready, requests: Some(requests), _control_task: Some(control_task), icon }
+    }
+
+    /// Connects to the core; if it serves this app, opens the main window and
+    /// closes this one, else says what's still needed.
     fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match Core::connect() {
             Ok(core) => match crate::hc::check(&core.hello) {
                 Ok(()) => {
                     let Some(requests) = self.requests.take() else { return };
-                    window.remove_window();
+                    // Stop reading from `requests` before handing it to `AppWindow`, and open the
+                    // main window before removing Setup so `cx.windows()` never drops to zero.
+                    self._control_task = None;
+                    crate::update::start();
+                    crate::update::after_update(core.clone());
                     crate::open_main(core, requests, cx);
+                    window.remove_window();
                     return;
                 }
                 Err(m) => {

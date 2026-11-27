@@ -645,6 +645,85 @@
   background: var(--surface);
   border-bottom: 1px solid var(--border);
 }
+.overview--with-briefing {
+  flex-wrap: wrap;
+  row-gap: 6px;
+}
+.overview__briefing {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1 0 100%;
+  min-width: 0;
+  padding-top: 5px;
+  border-top: 1px dashed var(--border-subtle, var(--border));
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+.overview__briefing-badge {
+  flex: none;
+  padding: 1px 7px;
+  border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--accent) 36%, var(--border));
+  background: var(--accent-soft);
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+.overview__briefing-headline {
+  flex: none;
+  max-width: 38%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+  color: var(--text);
+}
+.overview__briefing-items {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  overflow-x: auto;
+}
+.overview__briefing-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.overview__briefing-chip--high,
+.overview__briefing-chip--failed {
+  border-color: color-mix(in srgb, var(--st-failed) 40%, var(--border));
+  background: var(--st-failed-bg);
+  color: var(--st-failed);
+}
+.overview__briefing-chip--blocked {
+  border-color: color-mix(in srgb, var(--st-blocked) 40%, var(--border));
+  background: var(--st-blocked-bg);
+  color: var(--st-blocked);
+}
+.overview__briefing-ref {
+  padding: 0 3px;
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.overview__briefing-ref:hover {
+  text-decoration: underline;
+}
 .overview__phases,
 .overview__todos {
   display: flex;

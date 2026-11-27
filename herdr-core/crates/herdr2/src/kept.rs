@@ -288,6 +288,7 @@ impl Core {
                         dangerously_skip_permissions,
                         config_overrides,
                         inject_mcp,
+                        mcp_profile: None,
                         mcp_exe,
                         socket: core.paths.socket.display().to_string(),
                         handshake_timeout: None,

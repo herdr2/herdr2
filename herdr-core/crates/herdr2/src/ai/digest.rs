@@ -426,7 +426,7 @@ fn is_auto_program_label(lower: &str) -> bool {
             | "pi" | "omp" | "oh-my-pi" | "kimi" | "kimi-code" | "qwen" | "qwen-code"
             | "kiro" | "kiro-cli" | "qoder" | "qodercli" | "copilot" | "github-copilot"
             | "amp" | "grok" | "hermes" | "goose" | "crush" | "dsh" | "dsh-tui"
-            | "zcode" | "zcode-cli" | "glm" | "agent"
+            | "zcode" | "zcode-cli" | "trae" | "traecli" | "traex" | "trae-cli" | "glm" | "agent"
     )
 }
 
@@ -1055,9 +1055,127 @@ pub struct PolishContextInput<'a> {
     pub draft_prompt: &'a str,
 }
 
+fn is_polish_ui_chrome_line(line: &str) -> bool {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+
+    // Pure box-drawing, divider, border, or empty prompt chrome lines.
+    if trimmed.chars().all(|c| {
+        c.is_whitespace()
+            || matches!(
+                c,
+                '─' | '━' | '═' | '┄' | '┅' | '┈' | '┉' | '-' | '_' | '=' | '·' | '•' | '│' | '┃' | '║'
+                    | '|' | '┌' | '┐' | '└' | '┘' | '╭' | '╮' | '╰' | '╯' | '├' | '┤' | '┬' | '┴' | '┼'
+                    | '>' | '❯' | '›' | '$' | '%' | '?'
+            )
+    }) {
+        return true;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+
+    // TUI throughput / latency telemetry bars (e.g. pi: `> TPS 177.0 tok/s | ~ TTFT 1.4s | elapsed 10m19s | ↑2.4M | ↓24k`).
+    if lower.contains("tok/s") || lower.contains("token/s") || lower.contains("tokens/s") {
+        return true;
+    }
+    if lower.contains("ttft")
+        && (lower.contains("tps")
+            || lower.contains("elapsed")
+            || lower.contains('|')
+            || lower.contains('~')
+            || lower.contains("ms")
+            || lower.contains("s "))
+    {
+        return true;
+    }
+    if lower.contains("tps")
+        && (lower.contains('|') || lower.contains("elapsed") || lower.contains("ttft") || lower.contains("↑"))
+    {
+        return true;
+    }
+
+    // Token / cost counter footers carrying paired in/out arrows (`↑2.4M ... ↓24k`).
+    if trimmed.contains('↑') && trimmed.contains('↓') {
+        return true;
+    }
+
+    // Progress meters (`[##----] 9.8% · 98k/1.0M` or Unicode block bars `████░░ 42%`).
+    if trimmed.chars().any(|c| matches!(c, '█' | '▓' | '▒' | '░'))
+        && (trimmed.contains('%') || trimmed.contains('/'))
+    {
+        return true;
+    }
+    if let (Some(open), Some(close)) = (trimmed.find('['), trimmed.find(']'))
+        && close > open + 2
+        && trimmed[close..].contains('%')
+        && trimmed[open + 1..close]
+            .chars()
+            .all(|c| matches!(c, '#' | '=' | '-' | '─' | '━' | '█' | '░' | '·' | '.' | ' '))
+    {
+        return true;
+    }
+
+    // Agent TUI shortcut / mode status footers.
+    if lower.contains("? for shortcuts")
+        || lower.contains("esc to interrupt")
+        || lower.contains("ctrl+c to cancel")
+        || (lower.contains("shift+tab") && (lower.contains("cycle") || lower.contains("mode") || lower.contains("accept")))
+        || lower.contains("bypass permissions on")
+        || lower.contains("auto-accept edits on")
+    {
+        return true;
+    }
+
+    false
+}
+
+fn leading_slash_command(text: &str) -> Option<&str> {
+    let first = text.trim().split_whitespace().next()?;
+    let rest = first.strip_prefix('/')?;
+    if rest.is_empty() || rest.contains('/') {
+        return None;
+    }
+    if rest.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':')) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+fn contains_token(haystack: &str, token: &str) -> bool {
+    haystack.split_whitespace().any(|w| {
+        let cleaned = w.trim_matches(|c: char| matches!(c, '`' | '"' | '\'' | ',' | '.' | ';' | ':' | '(' | ')' | '[' | ']'));
+        cleaned == token
+    })
+}
+
+fn detect_polish_drift(draft: &str, polished: &str) -> bool {
+    if let Some(cmd) = leading_slash_command(draft)
+        && !contains_token(polished, cmd)
+    {
+        return true;
+    }
+    if has_cjk(draft) && !has_cjk(polished) {
+        let lower = draft.to_ascii_lowercase();
+        let asks_english = draft.contains("英文")
+            || draft.contains("英语")
+            || draft.contains("翻译")
+            || lower.contains("english")
+            || lower.contains("translate");
+        if !asks_english {
+            return true;
+        }
+    }
+    false
+}
+
 fn clean_polish_screen_tail(raw_screen: &str, draft_prompt: &str, has_transcript: bool) -> Option<String> {
     let (max_lines, max_chars) = if has_transcript { (8, 420) } else { (16, 900) };
-    let cleaned = strip_and_dedup_lines(raw_screen, max_lines + 4, 140, max_chars + 240);
+    // Pull a wider tail before filtering out TUI status/metrics chrome so genuine lines above
+    // a multi-line footer are preserved instead of being crowded out.
+    let cleaned = strip_and_dedup_lines(raw_screen, max_lines * 3 + 8, 160, max_chars * 3 + 320);
     if cleaned.is_empty() {
         return None;
     }
@@ -1073,7 +1191,7 @@ fn clean_polish_screen_tail(raw_screen: &str, draft_prompt: &str, has_transcript
         .filter(|l| l.chars().count() >= 4)
         .collect();
 
-    let mut lines: Vec<&str> = cleaned.lines().collect();
+    let mut lines: Vec<&str> = cleaned.lines().filter(|l| !is_polish_ui_chrome_line(l)).collect();
     // Drop trailing lines that merely echo the user's current unsent prompt inside the CLI input box.
     while let Some(&last) = lines.last() {
         let stripped = last.trim_start_matches(['>', '❯', '›', '$', '%', '?', '•', '·', ' ']).trim();
@@ -1312,7 +1430,7 @@ pub async fn polish_prompt(
             user_prompt,
             max_tokens: 1024,
             timeout: Duration::from_secs(20),
-            cache_key: Some(cache_key),
+            cache_key: Some(cache_key.clone()),
             cache_ttl: Some(Duration::from_secs(300)),
             prompt_cache_bucket: Some("cp".into()),
             ..Default::default()
@@ -1346,6 +1464,16 @@ pub async fn polish_prompt(
     if let Some(v) = extract_json_object(&resp.content)
         && let Some(polished) = v["polished"].as_str().and_then(|s| clean_multiline_prompt(s, 4500))
     {
+        if detect_polish_drift(trimmed, &polished) {
+            ai.invalidate_cached(&cache_key);
+            return Ok(PolishPromptResult {
+                polished: trimmed.to_string(),
+                summary: None,
+                used_ai: false,
+                from_cache: false,
+                fallback_reason: Some("ai_context_drift".to_string()),
+            });
+        }
         let summary = clean_bounded(v["summary"].as_str(), 60);
         return Ok(PolishPromptResult {
             polished,
@@ -1356,25 +1484,19 @@ pub async fn polish_prompt(
         });
     }
 
+    // Strict JSON contract: never overwrite the user's draft with raw conversational text, and
+    // evict the invalid reply from cache so retries do not replay it.
+    ai.invalidate_cached(&cache_key);
     if !resp.from_local_cache {
         ai.record_parse_error("polish_prompt");
     }
-    if let Some(polished) = clean_multiline_prompt(&resp.content, 4500) {
-        return Ok(PolishPromptResult {
-            polished,
-            summary: None,
-            used_ai: true,
-            from_cache: resp.from_local_cache,
-            fallback_reason: None,
-        });
-    }
-
+    let reason = if resp.content.trim().is_empty() { "ai_empty_response" } else { "ai_invalid_response" };
     Ok(PolishPromptResult {
         polished: trimmed.to_string(),
         summary: None,
         used_ai: false,
         from_cache: false,
-        fallback_reason: Some("ai_empty_response".to_string()),
+        fallback_reason: Some(reason.to_string()),
     })
 }
 
@@ -1771,5 +1893,187 @@ expected `&PolishSessionContext`, found `Option<&str>`\n\
         assert!(total_chars <= 1200, "recent_turns exceeded budget: {total_chars}");
         // Must keep the latest turn at the end in chronological order.
         assert!(ctx.recent_turns.last().unwrap().contains("Turn 14 assistant reply"));
+    }
+
+    #[test]
+    fn polish_screen_tail_filters_tui_metrics_progress_and_border_chrome() {
+        let raw_screen = "\
+error[E0308]: mismatched types in src/api.rs:1835\n\
+expected `&PolishSessionContext`, found `Option<&str>`\n\
+──────────────────────────────────────────────\n\
+> TPS 177.0 tok/s | ~ TTFT 1.4s | elapsed 10m19s | ↑2.4M (U 54k + R 2.3M) | ↓24k\n\
+[##--------] 9.8% · 98k/1.0M\n\
+████████░░ 80% 800k/1.0M\n\
+? for shortcuts · shift+tab to cycle mode · esc to interrupt\n\
+❯ /grill-me 同步到overlay目录\n";
+
+        let ctx = build_polish_session_context(PolishContextInput {
+            screen_text: Some(raw_screen),
+            draft_prompt: "/grill-me 同步到overlay目录",
+            ..Default::default()
+        });
+        let tail = ctx.screen_tail.as_deref().expect("real compiler error lines should remain");
+        assert!(tail.contains("error[E0308]: mismatched types"), "tail={tail}");
+        assert!(!tail.contains("TPS 177.0"), "metrics footer must be stripped: {tail}");
+        assert!(!tail.contains("TTFT"), "TTFT footer must be stripped: {tail}");
+        assert!(!tail.contains("↑2.4M"), "token arrows must be stripped: {tail}");
+        assert!(!tail.contains("[##--------]"), "progress meter must be stripped: {tail}");
+        assert!(!tail.contains("████████"), "block meter must be stripped: {tail}");
+        assert!(!tail.contains("? for shortcuts"), "keyhint footer must be stripped: {tail}");
+        assert!(!tail.contains("────"), "rule divider must be stripped: {tail}");
+        assert!(!tail.contains("/grill-me 同步到overlay目录"), "draft echo must be stripped: {tail}");
+
+        // Pure chrome screen produces None so no noisy screen_tail is sent at all.
+        let chrome_only = "\
+──────────────────────\n\
+> TPS 177.0 tok/s | ~ TTFT 1.4s | ↑2.4M | ↓24k\n\
+[##----] 9.8% · 98k/1.0M\n\
+❯ \n";
+        let ctx_empty = build_polish_session_context(PolishContextInput {
+            screen_text: Some(chrome_only),
+            draft_prompt: "/grill-me 同步到overlay目录",
+            ..Default::default()
+        });
+        assert_eq!(ctx_empty.screen_tail, None);
+    }
+
+    #[test]
+    fn polish_drift_guard_catches_dropped_slash_command_and_language_flip_without_false_positives() {
+        // Dropped slash command + language flip (exact Issue #4 failure mode).
+        assert!(detect_polish_drift(
+            "/grill-me 同步到overlay目录",
+            "What do these runtime metrics from the completed overlay-sync pi session indicate: TPS 177.0 tok/s?",
+        ));
+        // Dropped leading slash command even when staying in Chinese.
+        assert!(detect_polish_drift(
+            "/grill-me 同步到overlay目录",
+            "请详细审查并确认将当前改动同步到 overlay 目录的方案。",
+        ));
+        // Preserved leading slash command in Chinese passes.
+        assert!(!detect_polish_drift(
+            "/grill-me 同步到overlay目录",
+            "/grill-me 请先和我对齐将当前改动同步到 overlay 目录的具体方案与关键决策。",
+        ));
+        // Legitimate Chinese rewrite resolving references without shared long tokens passes.
+        assert!(!detect_polish_drift(
+            "把上面这个类型错误修一下并跑单测",
+            "请修复 CarAudioZone.java 中 validateVolumeGroups() 附近的编译类型错误，然后运行相关单元测试。",
+        ));
+        // Unrelated English flip on Chinese draft is caught.
+        assert!(detect_polish_drift(
+            "帮我把这个问题修一下",
+            "Please explain what these session metrics mean.",
+        ));
+        // Explicit translation request to English is allowed.
+        assert!(!detect_polish_drift(
+            "把下面这段报错翻译成英文",
+            "Translate the following error message into English.",
+        ));
+        // Unix file path is NOT treated as a slash command.
+        assert_eq!(leading_slash_command("/home/user/repo 检查这个目录"), None);
+        assert_eq!(leading_slash_command("/grill-me 同步"), Some("/grill-me"));
+    }
+
+    #[tokio::test]
+    async fn polish_prompt_rejects_non_json_and_drifted_replies_without_caching_them() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let calls_srv = calls.clone();
+
+        let srv = tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else { break };
+                let mut buf = vec![0u8; 16384];
+                let nread = sock.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..nread]);
+                let first_line = req.lines().next().unwrap_or("");
+                let body = if first_line.starts_with("GET ") && first_line.contains("/models") {
+                    serde_json::json!({ "data": [{ "id": "test-model" }] }).to_string()
+                } else {
+                    let n = calls_srv.fetch_add(1, Ordering::SeqCst);
+                    let content = match n {
+                        // 1st call: conversational non-JSON reply about TUI metrics.
+                        0 => "What do these runtime metrics indicate: TPS 177.0 tok/s, TTFT 1.4s?",
+                        // 2nd call: JSON reply that drifted away from `/grill-me` and flipped to English.
+                        1 => r#"{"polished":"Explain the overlay-sync runtime metrics.","summary":"clarified"}"#,
+                        // 3rd call: valid JSON reply preserving command and language.
+                        _ => r#"{"polished":"/grill-me 请先和我对齐同步到 overlay 目录的实现方案。","summary":"补充目标与范围"}"#,
+                    };
+                    serde_json::json!({
+                        "id": format!("chatcmpl-{n}"),
+                        "model": "test-model",
+                        "choices": [{"index": 0, "message": {"role": "assistant", "content": content}, "finish_reason": "stop"}],
+                        "usage": {"prompt_tokens": 100, "completion_tokens": 20}
+                    })
+                    .to_string()
+                };
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = sock.write_all(resp.as_bytes()).await;
+            }
+        });
+
+        let root = std::env::temp_dir().join(format!(
+            "herdr2-polish-strict-{}-{}",
+            std::process::id(),
+            crate::platform::random_hex()
+        ));
+        let paths = crate::paths::Paths {
+            socket: root.join("s.sock"),
+            holder_socket: root.join("h.sock"),
+            state: root.join("state"),
+            config: root.join("config/config.toml"),
+        };
+        let rt = AiRuntime::open(&paths).unwrap();
+        rt.update_settings(crate::ai::AiSettingsSetParams {
+            enabled: Some(true),
+            base_url: Some(format!("http://{addr}/v1")),
+            api_key: Some("sk-test".into()),
+            model: Some("test-model".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+        let draft = "/grill-me 同步到overlay目录";
+        let ctx = PolishSessionContext::default();
+
+        // 1st call: non-JSON must NOT overwrite draft and must NOT stick in cache.
+        let r1 = polish_prompt(&rt, draft, Some("cli"), &ctx, Some("zh-CN")).await.unwrap();
+        assert!(!r1.used_ai);
+        assert!(!r1.from_cache);
+        assert_eq!(r1.polished, draft);
+        assert_eq!(r1.fallback_reason.as_deref(), Some("ai_invalid_response"));
+
+        // 2nd call: hits server again (proving invalid reply wasn't cached); drifted JSON is rejected and evicted.
+        let r2 = polish_prompt(&rt, draft, Some("cli"), &ctx, Some("zh-CN")).await.unwrap();
+        assert!(!r2.used_ai);
+        assert!(!r2.from_cache);
+        assert_eq!(r2.polished, draft);
+        assert_eq!(r2.fallback_reason.as_deref(), Some("ai_context_drift"));
+
+        // 3rd call: hits server again and succeeds; 4th call hits cache.
+        let r3 = polish_prompt(&rt, draft, Some("cli"), &ctx, Some("zh-CN")).await.unwrap();
+        assert!(r3.used_ai);
+        assert!(!r3.from_cache);
+        assert_eq!(r3.fallback_reason, None);
+        assert!(r3.polished.starts_with("/grill-me"));
+
+        let r4 = polish_prompt(&rt, draft, Some("cli"), &ctx, Some("zh-CN")).await.unwrap();
+        assert!(r4.used_ai);
+        assert!(r4.from_cache);
+        assert_eq!(r4.polished, r3.polished);
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        srv.abort();
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

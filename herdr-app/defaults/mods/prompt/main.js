@@ -8,6 +8,48 @@ const isZh = () => typeof settings === "function" && String(settings()?.language
 const tr = (en, zh) => (isZh() ? zh : en);
 const PURPLE = "#a855f7";
 
+function polishFallbackMessage(reason) {
+  switch (String(reason ?? "")) {
+    case "ai_not_configured":
+      return tr(
+        "Core AI is not configured. Enable it in Settings → AI Assistant first.",
+        "Core AI 尚未配置，请先在「设置 → AI 助手」中启用后再使用润色功能。",
+      );
+    case "ai_circuit_open":
+      return tr(
+        "Core AI is temporarily cooling down after recent failures.",
+        "Core AI 暂时熔断冷却中，请稍后重试。",
+      );
+    case "ai_context_drift":
+      return tr(
+        "AI reply drifted from your draft (original input preserved). Please retry.",
+        "AI 润色结果偏离了原始输入，已保留原草稿，请重试。",
+      );
+    case "ai_invalid_response":
+      return tr(
+        "AI returned an invalid non-JSON reply (original input preserved). Please retry.",
+        "AI 返回了非规范格式内容，已保留原草稿，请重试。",
+      );
+    case "ai_timeout":
+      return tr(
+        "AI polish timed out (original input preserved). Please retry.",
+        "AI 润色请求超时，已保留原草稿，请重试。",
+      );
+    case "ai_rate_limited":
+      return tr(
+        "Core AI is rate-limited right now. Please retry shortly.",
+        "Core AI 当前触发限流，请稍后重试。",
+      );
+    case "ai_auth_error":
+      return tr(
+        "Core AI authentication failed. Check your API key in Settings → AI Assistant.",
+        "Core AI 鉴权失败，请检查「设置 → AI 助手」中的 API Key。",
+      );
+    default:
+      return tr("AI polish returned no changes. Please retry.", "AI 润色暂未返回有效结果，请重试。");
+  }
+}
+
 function shortcutFor(action) {
   if (typeof keys !== "function" || !action) return "";
   const list = keys();
@@ -68,7 +110,7 @@ export default class Prompt extends View {
       this.textarea.on("submit", (e, c) => {
         if (e?.shift) return;
         if (e?.secondary || e?.modifiers?.control || e?.modifiers?.platform) {
-          this.sendPolished(c);
+          this.startSendPolished(c);
         }
       });
       this.inputFocused = true;
@@ -118,6 +160,17 @@ export default class Prompt extends View {
     cx.notify();
   }
 
+  startPolish(cx) {
+    if (this.polishing || this.sending || checking()) return;
+    if (typeof cx?.spawn === "function") {
+      cx.spawn(async (taskCx) => {
+        await this.polish(taskCx);
+      });
+    } else {
+      this.polish(cx);
+    }
+  }
+
   async polish(cx) {
     const raw = String(this.textarea?.value?.() ?? this.text ?? "").trim();
     if (!raw || this.polishing || this.sending || checking()) return;
@@ -127,7 +180,7 @@ export default class Prompt extends View {
     const machine = terminal && terminal.includes("/") ? terminal.split("/")[0] : null;
     this.polishing = true;
     this.error = null;
-    cx.notify();
+    try { cx?.notify?.(); } catch {}
     try {
       const args = [
         "ai",
@@ -147,18 +200,14 @@ export default class Prompt extends View {
         const parsed = JSON.parse(res.stdout);
         const polished = String(parsed?.polished ?? "").trim();
         if (parsed?.usedAi && polished) {
+          this.polishing = false;
           this.polishUndoText = raw;
           this.polishSummary = parsed?.summary ? String(parsed.summary).trim() : null;
           this.text = polished;
           this.textarea?.set_value?.(polished);
           this.textarea?.focus?.();
         } else {
-          const reason = String(parsed?.fallbackReason ?? "");
-          this.error = reason === "ai_not_configured"
-            ? tr("Core AI is not configured. Enable it in Settings → AI Assistant first.", "Core AI 尚未配置，请先在「设置 → AI 助手」中启用后再使用润色功能。")
-            : reason === "ai_circuit_open"
-              ? tr("Core AI is temporarily cooling down after recent failures.", "Core AI 暂时熔断冷却中，请稍后重试。")
-              : tr("AI polish returned no changes. Please retry.", "AI 润色暂未返回有效结果，请重试。");
+          this.error = polishFallbackMessage(parsed?.fallbackReason);
         }
       } else {
         let msg = String(res?.stderr || res?.stdout || "").trim();
@@ -172,7 +221,18 @@ export default class Prompt extends View {
       this.error = tr(`AI prompt polish failed: ${e?.message ?? e}`, `AI 提示词润色失败：${e?.message ?? e}`);
     } finally {
       this.polishing = false;
-      cx.notify();
+      try { cx?.notify?.(); } catch {}
+    }
+  }
+
+  startSendPolished(cx) {
+    if (this.sending || this.polishing || checking()) return;
+    if (typeof cx?.spawn === "function") {
+      cx.spawn(async (taskCx) => {
+        await this.sendPolished(taskCx);
+      });
+    } else {
+      this.sendPolished(cx);
     }
   }
 
@@ -183,7 +243,7 @@ export default class Prompt extends View {
     if (!terminal || !text || this.sending || this.polishing || checking()) return;
     this.sending = true;
     this.error = null;
-    cx.notify();
+    try { cx?.notify?.(); } catch {}
     try {
       const res = await h2(["send", "--json", terminal, text]);
       if (res?.code === 0) {
@@ -200,7 +260,7 @@ export default class Prompt extends View {
       this.error = String(e?.message ?? e);
     } finally {
       this.sending = false;
-      cx.notify();
+      try { cx?.notify?.(); } catch {}
     }
   }
 
@@ -378,7 +438,7 @@ export default class Prompt extends View {
               .text_color(canPolish || this.polishing ? PURPLE : t.dim)
               .when(canPolish, (b) => b.cursor_pointer().hover((s) => s.bg(withAlpha(PURPLE, "30"))))
               .tooltip(withShortcut(tr("Polish prompt with Core AI for clarity", "使用 Core AI 润色提示词，让表达更清晰"), "prompt.polish"))
-              .on_click((_e, cx) => this.polish(cx))
+              .on_click((_e, cx) => this.startPolish(cx))
               .child(
                 this.polishing
                   ? svg("mods/workspace-chrome/spinner.svg").size(12).spin(900).text_color(PURPLE)
@@ -398,7 +458,7 @@ export default class Prompt extends View {
               .text_size(12)
               .font_medium()
               .text_color(canSend ? t.solid_foreground : t.dim)
-              .when(canSend, (b) => b.cursor_pointer().hover((s) => s.opacity(0.9)).on_click((_e, cx) => this.sendPolished(cx)))
+              .when(canSend, (b) => b.cursor_pointer().hover((s) => s.opacity(0.9)).on_click((_e, cx) => this.startSendPolished(cx)))
               .child(svg("mods/peek/arrow-up.svg").size(12))
               .child(this.sending ? tr("Sending…", "发送中…") : tr("Send", "发送")),
           ),

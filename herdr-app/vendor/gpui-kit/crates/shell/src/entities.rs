@@ -28,8 +28,8 @@ use gpui::{App, AppContext as _, Entity, EntityId, FocusHandle, Subscription, Wi
 use gpui_base::VirtualListScrollHandle;
 use gpui_base::dock::{DockArea, DockEvent};
 use gpui_base::input::{
-    EditorState, InputBaseState, InputEditorStyle, InputEvent, InputModeKind, InputState,
-    TextareaState,
+    EditorState, InputBaseState, InputBeforeKeyEvent, InputEditorStyle, InputEvent, InputModeKind,
+    InputState, TextareaState,
 };
 use gpui_base::slider::{SliderEvent, SliderScale, SliderState, SliderValue};
 use gpui_base::{CalendarEvent, CalendarState, OtpEvent, OtpState};
@@ -880,6 +880,29 @@ impl EntityStore {
             }
             _ => false,
         }
+    }
+
+    // HERDR: Install or clear a synchronous before-key interceptor on a textarea.
+    // The cleanup subscription owns the JS function slot's lifetime so the
+    // `Persistent` drops with `EntityStore` before the QuickJS VM shuts down.
+    pub fn set_textarea_before_key(
+        &mut self,
+        handle: EntityHandle,
+        cx: &mut App,
+        handler: Option<Rc<dyn Fn(&InputBeforeKeyEvent, &mut Window, &mut App) -> bool>>,
+        cleanup: Option<Subscription>,
+    ) -> bool {
+        let state = match self.record(handle) {
+            Some(Record::Textarea { state, .. }) => state.clone(),
+            _ => return false,
+        };
+        state.update(cx, |state, _| state.set_before_key_handler(handler));
+        if let Some(sub) = cleanup {
+            if let Some(Record::Textarea { subscriptions, .. }) = self.record_mut(handle) {
+                subscriptions.push(sub);
+            }
+        }
+        true
     }
 
     /// Subscribes to one slider event for as long as the handle lives.

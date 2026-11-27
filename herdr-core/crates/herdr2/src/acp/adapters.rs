@@ -129,6 +129,14 @@ pub struct AdapterStatusResult {
     pub adapters_dir: String,
     pub auto_install: bool,
     pub registry_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_registry_url: Option<String>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub default_permissions: String,
+    #[serde(default)]
+    pub inject_mcp: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub config_path: String,
     pub adapters: Vec<AdapterStatusItem>,
 }
 
@@ -246,7 +254,9 @@ impl AdapterManager {
     pub async fn status(&self, core: &Core) -> AdapterStatusResult {
         let cfg = crate::config::load(&core.paths.config).unwrap_or_default();
         let env = crate::platform::program_env().await;
-        self.status_in_env(&cfg, &env)
+        let mut res = self.status_in_env(&cfg, &env);
+        res.config_path = core.paths.config.display().to_string();
+        res
     }
 
     pub fn status_in_env(&self, cfg: &crate::config::Config, env: &BTreeMap<String, String>) -> AdapterStatusResult {
@@ -318,6 +328,15 @@ impl AdapterManager {
             adapters_dir: adapters_dir.display().to_string(),
             auto_install: cfg.auto_install_adapters(),
             registry_url,
+            custom_registry_url: cfg
+                .acp_registry_url
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from),
+            default_permissions: cfg.default_permissions.unwrap_or_default().as_str().into(),
+            inject_mcp: cfg.inject_mcp.unwrap_or(true),
+            config_path: String::new(),
             adapters: items,
         }
     }

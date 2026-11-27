@@ -247,27 +247,242 @@ fn snapshot_working_tree_commit(run_cwd: &str, wt_parent: &Path) -> Result<Strin
     Ok(String::from_utf8_lossy(&commit_out.stdout).trim().to_string())
 }
 
-/// Serializes merging worktree changes back into `run.cwd`, optionally keeping the reset worktree for warm reuse.
+/// Outcome of merging an isolated worktree back into `run.cwd`.
+#[derive(Clone, Debug, Default)]
+pub(super) struct MergeOutcome {
+    pub changed_files: Vec<String>,
+    /// `true` when `run.cwd`'s working tree had advanced since this worktree branched (e.g. a sibling
+    /// parallel worktree merged while this task was running), indicating post-merge semantic `verify`
+    /// should re-run on the combined `run.cwd` tree if `task.spec.verify` is configured.
+    pub base_diverged: bool,
+}
+
+#[derive(Clone)]
+struct FileBackup {
+    rel: String,
+    bytes: Option<Vec<u8>>,
+    executable: bool,
+}
+
+fn capture_file_backups(run_cwd: &str, files: &[String]) -> Vec<FileBackup> {
+    files
+        .iter()
+        .map(|rel| {
+            let p = Path::new(run_cwd).join(rel);
+            let bytes = std::fs::read(&p).ok();
+            let executable = bytes.is_some() && is_executable(&p);
+            FileBackup { rel: rel.clone(), bytes, executable }
+        })
+        .collect()
+}
+
+fn restore_file_backups(run_cwd: &str, backups: &[FileBackup]) {
+    for b in backups {
+        let p = Path::new(run_cwd).join(&b.rel);
+        match &b.bytes {
+            Some(bytes) => {
+                if let Some(parent) = p.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&p, bytes);
+                #[cfg(unix)]
+                if b.executable {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(meta) = std::fs::metadata(&p) {
+                        let mut perm = meta.permissions();
+                        perm.set_mode(perm.mode() | 0o111);
+                        let _ = std::fs::set_permissions(&p, perm);
+                    }
+                }
+            }
+            None => {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+}
+
+/// Serializes merging worktree changes back into `run.cwd` (and re-verifying on `run.cwd` when a
+/// concurrent sibling task merged after this worktree branched), optionally keeping the reset worktree for warm reuse.
 pub(super) async fn merge_and_finalize_worktree(
     core: &Arc<Core>,
     run: &Run,
+    task: &Task,
     worktree_dir: Option<&str>,
     keep_for_reuse: bool,
-) -> Result<Vec<String>, ApiErr> {
+) -> Result<MergeOutcome, ApiErr> {
     let Some(wt) = worktree_dir.map(str::trim).filter(|s| !s.is_empty()) else {
-        return Ok(Vec::new());
+        return Ok(MergeOutcome::default());
     };
     let lock = core.drove.run_merge_lock(&run.id);
     let _guard = lock.lock().await;
     let run_cwd = run.cwd.clone();
     let wt_str = wt.to_string();
+    let post_verify_cmd = task.spec.verify.as_ref().and_then(|v| {
+        let (cmd, timeout) = match v {
+            VerifySpec::Cmd(s) => (s.trim().to_string(), 300u64),
+            VerifySpec::Obj(o) => (o.cmd.trim().to_string(), o.timeout_sec.unwrap_or(300)),
+        };
+        (!cmd.is_empty()).then_some((cmd, timeout))
+    });
 
-    tokio::task::spawn_blocking(move || merge_worktree_blocking(&run_cwd, &wt_str, keep_for_reuse))
-        .await
-        .map_err(|e| ApiErr::new(500, "internal", e.to_string()))?
+    let (outcome, backups, wt_patch) = tokio::task::spawn_blocking({
+        let run_cwd = run_cwd.clone();
+        let wt_str = wt_str.clone();
+        move || merge_worktree_stage_one(&run_cwd, &wt_str)
+    })
+    .await
+    .map_err(|e| ApiErr::new(500, "internal", e.to_string()))??;
+
+    // When another concurrent worktree merged into `run_cwd` after this worktree branched (`base_diverged`),
+    // re-run `task.spec.verify` against the combined `run_cwd` before finalizing so cross-worktree
+    // signature/semantic breakages are caught immediately instead of silently corrupting `run_cwd`.
+    if outcome.base_diverged
+        && !outcome.changed_files.is_empty()
+        && let Some((cmd_str, timeout_sec)) = post_verify_cmd
+    {
+        let vres = super::verify::run_verify_command(&run_cwd, &cmd_str, timeout_sec).await;
+        if !vres.success {
+            let run_cwd_rb = run_cwd.clone();
+            let wt_rb = wt_str.clone();
+            let files_rb = outcome.changed_files.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                restore_file_backups(&run_cwd_rb, &backups);
+                refresh_worktree_with_latest_main(&run_cwd_rb, &wt_rb, &files_rb, &wt_patch);
+            })
+            .await;
+            let tail: String = vres.combined_output.chars().rev().take(1600).collect::<String>().chars().rev().collect();
+            core.drove.store.append_daemon_event(super::store::NewDaemonEvent {
+                run_id: Some(run.id.clone()),
+                task_id: Some(task.id.clone()),
+                attempt_id: None,
+                worker_id: None,
+                message_id: None,
+                category: "verify".into(),
+                kind: "post_merge_verify".into(),
+                status: "failed".into(),
+                title: format!("Post-merge verify failed on `{}` after concurrent worktree updates", task.key),
+                detail: Some(tail.clone()),
+                duration_ms: None,
+                tokens: None,
+                cost: None,
+            });
+            return Err(ApiErr::new(
+                422,
+                "post_merge_verify_failed",
+                format!(
+                    "Post-merge verification failed after combining with concurrent workspace changes (`{cmd_str}`). \
+                     Your worktree has been refreshed onto the latest workspace state — fix the integration issue and re-run `drove worker done`:\n{tail}"
+                ),
+            ));
+        }
+    }
+
+    tokio::task::spawn_blocking(move || {
+        if !is_aosp_harness(&run_cwd) {
+            if keep_for_reuse {
+                reset_worktree_clean(&wt_str);
+            } else {
+                cleanup_worktree_dir(&run_cwd, Path::new(&wt_str));
+            }
+        }
+    })
+    .await
+    .map_err(|e| ApiErr::new(500, "internal", e.to_string()))?;
+
+    Ok(outcome)
 }
 
-fn merge_worktree_blocking(run_cwd: &str, wt_dir: &str, keep_for_reuse: bool) -> Result<Vec<String>, ApiErr> {
+fn refresh_worktree_with_latest_main(run_cwd: &str, wt_dir: &str, changed_files: &[String], wt_patch: &[u8]) {
+    let wt_parent = Path::new(wt_dir).parent().unwrap_or_else(|| Path::new(run_cwd));
+    let Ok(new_base) = snapshot_working_tree_commit(run_cwd, wt_parent) else {
+        return;
+    };
+    let their_blobs: Vec<(String, Option<Vec<u8>>, bool)> = changed_files
+        .iter()
+        .map(|rel| {
+            let p = Path::new(wt_dir).join(rel);
+            let bytes = std::fs::read(&p).ok();
+            let exec = bytes.is_some() && is_executable(&p);
+            (rel.clone(), bytes, exec)
+        })
+        .collect();
+    let old_base_blobs: Vec<(String, Option<Vec<u8>>)> =
+        changed_files.iter().map(|rel| (rel.clone(), git_show_blob(wt_dir, &format!("HEAD:{rel}")))).collect();
+
+    if !reset_worktree_to_commit(wt_dir, &new_base) {
+        return;
+    }
+    if !wt_patch.is_empty() {
+        let mut child = match super::bg_std_command("git")
+            .args(["-C", wt_dir, "apply", "--whitespace=nowarn"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            let _ = stdin.write_all(wt_patch);
+        }
+        if child.wait().is_ok_and(|s| s.success()) {
+            return;
+        }
+    }
+    // Best-effort 3-way replay of author edits onto the refreshed worktree base.
+    let tmp_dir = std::env::temp_dir().join(format!("herdr2-wt-replay-{}", super::crypto::rand_id("r")));
+    let _ = std::fs::create_dir_all(&tmp_dir);
+    for (idx, (rel, theirs_opt, exec)) in their_blobs.into_iter().enumerate() {
+        let dst = Path::new(wt_dir).join(&rel);
+        let ours_opt = std::fs::read(&dst).ok();
+        let base_opt = old_base_blobs.get(idx).and_then(|(_, b)| b.clone());
+        match (base_opt, ours_opt, theirs_opt) {
+            (_, _, None) => {
+                let _ = std::fs::remove_file(&dst);
+            }
+            (Some(base), Some(ours), Some(theirs))
+                if ours != base && !base.contains(&0) && !ours.contains(&0) && !theirs.contains(&0) =>
+            {
+                let f_o = tmp_dir.join(format!("o-{idx}"));
+                let f_b = tmp_dir.join(format!("b-{idx}"));
+                let f_t = tmp_dir.join(format!("t-{idx}"));
+                if std::fs::write(&f_o, &ours).is_ok()
+                    && std::fs::write(&f_b, &base).is_ok()
+                    && std::fs::write(&f_t, &theirs).is_ok()
+                    && let Ok(out) = super::bg_std_command("git")
+                        .args(["merge-file", "-p"])
+                        .arg(&f_o)
+                        .arg(&f_b)
+                        .arg(&f_t)
+                        .output()
+                {
+                    let _ = std::fs::write(&dst, out.stdout);
+                }
+            }
+            (_, _, Some(theirs)) => {
+                if let Some(parent) = dst.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&dst, theirs);
+                #[cfg(unix)]
+                if exec {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(meta) = std::fs::metadata(&dst) {
+                        let mut perm = meta.permissions();
+                        perm.set_mode(perm.mode() | 0o111);
+                        let _ = std::fs::set_permissions(&dst, perm);
+                    }
+                }
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+}
+
+fn merge_worktree_stage_one(run_cwd: &str, wt_dir: &str) -> Result<(MergeOutcome, Vec<FileBackup>, Vec<u8>), ApiErr> {
     if is_aosp_harness(run_cwd) {
         let bin = Path::new(run_cwd).join("bin/harness");
         let merge_out = super::bg_std_command(&bin)
@@ -283,8 +498,15 @@ fn merge_worktree_blocking(run_cwd: &str, wt_dir: &str, keep_for_reuse: bool) ->
             ));
         }
         let _ = super::bg_std_command(bin).args(["worktree", "remove", wt_dir]).current_dir(run_cwd).output();
-        return Ok(Vec::new());
+        return Ok((MergeOutcome::default(), Vec::new(), Vec::new()));
     }
+
+    let wt_base_tree = git_stdout_trimmed(wt_dir, &["rev-parse", "--verify", "HEAD^{tree}"], None).ok();
+    let pre_main_tree = super::roles::compute_git_working_tree_sha(run_cwd);
+    let base_diverged = match (&wt_base_tree, &pre_main_tree) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    };
 
     // Purge untracked ephemeral caches (e.g. __pycache__, .pyc) before `git add -A` so
     // verify gates don't bundle binary caches into the merge-back patch.
@@ -314,7 +536,11 @@ fn merge_worktree_blocking(run_cwd: &str, wt_dir: &str, keep_for_reuse: bool) ->
         .filter(|s| !s.is_empty())
         .collect();
 
+    let mut backups = Vec::new();
+    let mut patch_bytes = Vec::new();
+
     if !changed_files.is_empty() {
+        backups = capture_file_backups(run_cwd, &changed_files);
         let patch_out = super::bg_std_command("git")
             .args(["-C", wt_dir, "diff", "--cached", "--binary", "HEAD"])
             .output()
@@ -326,6 +552,7 @@ fn merge_worktree_blocking(run_cwd: &str, wt_dir: &str, keep_for_reuse: bool) ->
                 format!("git diff failed: {}", String::from_utf8_lossy(&patch_out.stderr).trim()),
             ));
         }
+        patch_bytes = patch_out.stdout.clone();
 
         // Fast path: apply directly to the working tree (NO `--3way` / `--index`).
         // 1) Handles dirty pre-existing unstaged files whose working-tree blob still matches the
@@ -373,12 +600,19 @@ fn merge_worktree_blocking(run_cwd: &str, wt_dir: &str, keep_for_reuse: bool) ->
         }
     }
 
-    if keep_for_reuse {
-        reset_worktree_clean(wt_dir);
-    } else {
-        cleanup_worktree_dir(run_cwd, Path::new(wt_dir));
+    Ok((MergeOutcome { changed_files, base_diverged }, backups, patch_bytes))
+}
+
+fn merge_worktree_blocking(run_cwd: &str, wt_dir: &str, keep_for_reuse: bool) -> Result<Vec<String>, ApiErr> {
+    let (outcome, _, _) = merge_worktree_stage_one(run_cwd, wt_dir)?;
+    if !is_aosp_harness(run_cwd) {
+        if keep_for_reuse {
+            reset_worktree_clean(wt_dir);
+        } else {
+            cleanup_worktree_dir(run_cwd, Path::new(wt_dir));
+        }
     }
-    Ok(changed_files)
+    Ok(outcome.changed_files)
 }
 
 /// Base-blob-aware 3-way working-tree merge fallback used only when plain `git apply --check` fails
@@ -546,6 +780,100 @@ pub(crate) fn cleanup_worktree_dir(run_cwd: &str, wt_dir: &Path) {
         let _ = std::fs::remove_dir_all(wt_dir);
     }
     let _ = super::bg_std_command("git").args(["-C", run_cwd, "worktree", "prune"]).output();
+}
+
+/// Creates a detached throwaway Git worktree cloned from `source_cwd`'s exact working tree
+/// (including uncommitted candidate edits) so an adversarial `Breaker` reviewer can write and
+/// execute falsifying tests without touching `source_cwd` or `run.cwd`.
+pub(super) async fn create_breaker_worktree(
+    core: &Arc<Core>,
+    run: &Run,
+    source_cwd: &str,
+    tag: &str,
+) -> Result<String, String> {
+    if is_aosp_harness(&run.cwd) || !is_git_repo(source_cwd) {
+        return Err(format!("breaker worktree requires a standard Git repository ({source_cwd})"));
+    }
+    let run_cwd = run.cwd.clone();
+    let src_cwd = source_cwd.to_string();
+    let safe_tag: String = tag
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let wt_dir = core
+        .drove
+        .paths
+        .state_dir
+        .join("worktrees")
+        .join(&run.id)
+        .join(format!("breaker-{safe_tag}-{}", super::crypto::rand_id("brk")));
+    if let Some(parent) = wt_dir.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir breaker worktree parent: {e}"))?;
+    }
+    let wt_parent = wt_dir.parent().map(Path::to_path_buf).unwrap_or_else(|| std::path::PathBuf::from(&run_cwd));
+
+    let lock = core.drove.run_merge_lock(&run.id);
+    let _guard = lock.lock().await;
+
+    tokio::task::spawn_blocking(move || {
+        let head_ok = super::bg_std_command("git")
+            .args(["-C", &src_cwd, "rev-parse", "--verify", "HEAD"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !head_ok {
+            return Err("git repository has no HEAD commit yet for breaker worktree".into());
+        }
+        let snap_commit = snapshot_working_tree_commit(&src_cwd, &wt_parent)?;
+        let wt_str = wt_dir.display().to_string();
+        let _ = git_cmd(&run_cwd).args(["worktree", "prune"]).output();
+        let out = git_cmd(&run_cwd)
+            .args(["worktree", "add", "--detach", &wt_str, &snap_commit])
+            .output()
+            .map_err(|e| format!("spawn git worktree add (breaker): {e}"))?;
+        if !out.status.success() {
+            return Err(format!(
+                "git worktree add (breaker) failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ));
+        }
+        Ok(wt_str)
+    })
+    .await
+    .map_err(|e| format!("breaker worktree join error: {e}"))?
+}
+
+/// Copies passing regression test edits from `brk_cwd` into `candidate_cwd` when
+/// `review.keepRegressionTests` is enabled, without mutating `.git/index`.
+pub(super) fn copy_breaker_tests_into_candidate(
+    brk_cwd: &str,
+    candidate_cwd: &str,
+    touched_rel_paths: &[String],
+) {
+    for rel in touched_rel_paths {
+        if super::roles::is_ephemeral_cache_path(rel) {
+            continue;
+        }
+        let src = Path::new(brk_cwd).join(rel);
+        let dst = Path::new(candidate_cwd).join(rel);
+        if let Ok(bytes) = std::fs::read(&src) {
+            if let Some(parent) = dst.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::write(&dst, bytes).is_ok() {
+                #[cfg(unix)]
+                if is_executable(&src) {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(meta) = std::fs::metadata(&dst) {
+                        let mut perm = meta.permissions();
+                        perm.set_mode(perm.mode() | 0o111);
+                        let _ = std::fs::set_permissions(&dst, perm);
+                    }
+                }
+            }
+        } else if dst.exists() {
+            let _ = std::fs::remove_file(&dst);
+        }
+    }
 }
 
 /// Permanently removes a forked session's worktree directory AND deletes its dedicated Git branch.

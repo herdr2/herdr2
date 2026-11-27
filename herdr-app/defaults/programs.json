@@ -19,6 +19,7 @@
     "kiro": {"name":"Kiro","icon":"icons/kiro.svg","run":["kiro-cli","chat","--trust-all-tools"],"match":["kiro-cli"],"tint":false,"tile":"#1c1d21","color":"#ffffff"},
     "hermes": {"name":"Hermes","icon":"icons/hermes.svg","run":["hermes","--yolo","--accept-hooks"],"tint":true,"tile":"#1c1d21","color":"#ffffff"},
     "zcode": {"name":"ZCode","icon":"icons/zcode.svg","run":["zcode","--mode","yolo"],"match":["zcode-cli"],"tint":true,"tile":"#1c1d21","color":"#ffffff"},
+    "trae": {"name":"TRAE CLI","icon":"icons/trae.svg","run":["traecli"],"match":["traecli","traex","trae-cli"],"tint":true,"tile":"#1c1d21","color":"#ffffff"},
     "mastracode": {"name":"Mastra Code","icon":"icons/mastracode.svg","tint":true,"tile":"#1c1d21","color":"#ffffff"},
     "qoder": {"name":"Qoder","icon":"icons/qoder.svg","run":["qodercli","--dangerously-skip-permissions"],"match":["qodercli"],"tint":true,"tile":"#1c1d21","color":"#ffffff"},
     "muse": {"name":"Muse","icon":"icons/muse.svg","tint":true,"tile":"#1c1d21","color":"#ffffff"},

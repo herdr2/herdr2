@@ -7,14 +7,17 @@
 //!   writes to `<state>/drove`, `drove.json`, and `ai.json` (re-allowing writable worktrees under
 //!   `<state>/drove/worktrees`), denies writes to `<cwd>` for `RoleAccessMode::Readonly`, and denies
 //!   all reads and writes to `<state>/drove/secrets` and `<state>/secrets`.
-//! - **Windows (`restricted-token`)**: wraps worker execution through `herdr2 __drove-sandbox -- <argv>`,
-//!   spawning the child under a Win32 Restricted Token (`CreateRestrictedToken` with
-//!   `DISABLE_MAX_PRIVILEGE` + `NT AUTHORITY\RESTRICTED` `S-1-5-12` in `SidsToRestrict`) via
-//!   `CreateProcessAsUserW` and a `KILL_ON_JOB_CLOSE` Job Object, paired with idempotent NTFS Deny
-//!   ACEs for `S-1-5-12` blocking read/write on `<state>/drove/secrets` and `<state>/secrets` and
-//!   blocking write on `<state>/drove`, `drove.json`, and `ai.json` (while protecting
-//!   `<state>/drove/worktrees` from inheriting the write-deny ACE). User repository ACLs are never
-//!   mutated; `Readonly` workspace edits on Windows continue to be guarded by `roles.rs` diff checks.
+//! - **Windows (`job-object`, optional `restricted-token`)**: wraps worker execution through
+//!   `herdr2 __drove-sandbox -- <argv>`, spawning the child with a privilege-stripped token
+//!   (`CreateRestrictedToken` with `DISABLE_MAX_PRIVILEGE` and **no** `SidsToRestrict`) via
+//!   `CreateProcessAsUserW` and a `KILL_ON_JOB_CLOSE` Job Object. Omitting `SidsToRestrict` is
+//!   essential on Windows because any restricting SID breaks Win32 Schannel
+//!   `AcquireCredentialsHandle` (`SEC_E_NO_CREDENTIALS` / `0x8009030E`), which prevents cloud ACP
+//!   agents, `curl.exe`, `.NET`, and `git` from establishing outbound HTTPS/TLS connections.
+//!   Workspace `Readonly`/`ScopedWrite` isolation on Windows is enforced by `roles.rs` diff checks.
+//!   Callers can override sandboxing via `H2_DROVE_SANDBOX=off|auto|job-object|restricted-token`
+//!   (where `restricted-token` opts into `S-1-5-12` restricting SIDs + NTFS deny ACEs for offline
+//!   or OpenSSL-only workers).
 
 use super::config::DrovePaths;
 use super::types::RoleAccessMode;
@@ -23,10 +26,33 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
-/// Internal hidden subcommand used on Windows to launch a worker under a Restricted Token.
+/// Internal hidden subcommand used on Windows to launch a worker inside the Windows sandbox wrapper.
 pub const WINDOWS_SANDBOX_SUBCOMMAND: &str = "__drove-sandbox";
+const WINDOWS_RESTRICTED_TOKEN_FLAG: &str = "--restricted-token";
 
 const MACOS_SANDBOX_EXEC_PATH: &str = "/usr/bin/sandbox-exec";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SandboxPreference {
+    Auto,
+    Off,
+    WindowsJobObject,
+    WindowsRestrictedToken,
+}
+
+fn parse_sandbox_preference(raw: Option<&str>) -> SandboxPreference {
+    match raw.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+        Some("off" | "none" | "0" | "false" | "disabled") => SandboxPreference::Off,
+        Some("job-object" | "job" | "job_object") => SandboxPreference::WindowsJobObject,
+        Some("restricted-token" | "restricted" | "restricted_token") => SandboxPreference::WindowsRestrictedToken,
+        _ => SandboxPreference::Auto,
+    }
+}
+
+fn sandbox_preference() -> SandboxPreference {
+    let raw = std::env::var("H2_DROVE_SANDBOX").ok();
+    parse_sandbox_preference(raw.as_deref())
+}
 
 static BWRAP_USABLE: OnceLock<bool> = OnceLock::new();
 static MACOS_SANDBOX_USABLE: OnceLock<bool> = OnceLock::new();
@@ -86,14 +112,22 @@ pub fn sandbox_available() -> bool {
 }
 
 /// Returns the active process sandbox backend name for this host (`"bwrap"`, `"sandbox-exec"`,
-/// `"restricted-token"`, or `"none"`).
+/// `"job-object"`, `"restricted-token"`, or `"none"`).
 pub fn sandbox_backend() -> &'static str {
+    let pref = sandbox_preference();
+    if pref == SandboxPreference::Off {
+        return "none";
+    }
     if cfg!(target_os = "linux") && bwrap_available() {
         "bwrap"
     } else if cfg!(target_os = "macos") && macos_sandbox_available() {
         "sandbox-exec"
     } else if cfg!(windows) && windows_sandbox_available() {
-        "restricted-token"
+        if pref == SandboxPreference::WindowsRestrictedToken {
+            "restricted-token"
+        } else {
+            "job-object"
+        }
     } else {
         "none"
     }
@@ -109,7 +143,8 @@ pub fn wrap_worker_argv(
     access: RoleAccessMode,
     isolate_secrets: bool,
 ) -> (Vec<String>, &'static str) {
-    if argv.is_empty() || !isolate_secrets {
+    let pref = sandbox_preference();
+    if argv.is_empty() || !isolate_secrets || pref == SandboxPreference::Off {
         return (argv.to_vec(), "none");
     }
 
@@ -143,15 +178,18 @@ pub fn wrap_worker_argv(
         if !windows_sandbox_available() {
             return (argv.to_vec(), "none");
         }
-        let _ = paths.ensure_dirs();
-        if win_sandbox::ensure_sandbox_acls(paths).is_err() {
-            return (argv.to_vec(), "none");
+        let use_restricted = pref == SandboxPreference::WindowsRestrictedToken;
+        if use_restricted {
+            let _ = paths.ensure_dirs();
+            if win_sandbox::ensure_sandbox_acls(paths).is_err() {
+                return (argv.to_vec(), "none");
+            }
         }
         let Some(exe) = crate::client::exe_path().or_else(|| std::env::current_exe().ok()) else {
             return (argv.to_vec(), "none");
         };
-        if let Some(wrapped) = build_windows_sandbox_argv(&exe, argv) {
-            return (wrapped, "restricted-token");
+        if let Some(wrapped) = build_windows_sandbox_argv(&exe, argv, use_restricted) {
+            return (wrapped, if use_restricted { "restricted-token" } else { "job-object" });
         }
         (argv.to_vec(), "none")
     }
@@ -382,7 +420,7 @@ fn build_macos_sandbox_argv(
 }
 
 #[cfg_attr(not(any(windows, test)), allow(dead_code))]
-fn build_windows_sandbox_argv(exe: &Path, argv: &[String]) -> Option<Vec<String>> {
+fn build_windows_sandbox_argv(exe: &Path, argv: &[String], use_restricted_token: bool) -> Option<Vec<String>> {
     if argv.is_empty() {
         return None;
     }
@@ -390,9 +428,12 @@ fn build_windows_sandbox_argv(exe: &Path, argv: &[String]) -> Option<Vec<String>
     if exe_str.is_empty() {
         return None;
     }
-    let mut out = Vec::with_capacity(argv.len() + 3);
+    let mut out = Vec::with_capacity(argv.len() + if use_restricted_token { 4 } else { 3 });
     out.push(exe_str.to_string());
     out.push(WINDOWS_SANDBOX_SUBCOMMAND.to_string());
+    if use_restricted_token {
+        out.push(WINDOWS_RESTRICTED_TOKEN_FLAG.to_string());
+    }
     out.push("--".to_string());
     out.extend(argv.iter().cloned());
     Some(out)
@@ -466,12 +507,49 @@ mod win_sandbox {
         Ok(buf)
     }
 
-    /// Creates a restricted primary token derived from the current process token:
+    /// Creates a privilege-stripped primary token (`DISABLE_MAX_PRIVILEGE`, no `SidsToRestrict`)
+    /// so Windows Schannel TLS (`AcquireCredentialsHandle`) remains fully functional for cloud
+    /// ACP agents, `curl.exe`, `.NET`, and `git`, while removing dangerous privileges and pairing
+    /// with a `KILL_ON_JOB_CLOSE` Job Object.
+    fn create_worker_job_token() -> io::Result<OwnedHandle> {
+        unsafe {
+            let mut raw_token: HANDLE = null_mut();
+            if OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_DUPLICATE | TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY,
+                &mut raw_token,
+            ) == 0
+            {
+                return Err(io::Error::last_os_error());
+            }
+            let token = OwnedHandle::from_raw_handle(raw_token as RawHandle);
+            let h_token = token.as_raw_handle() as HANDLE;
+
+            let mut new_token: HANDLE = null_mut();
+            let ok = CreateRestrictedToken(
+                h_token,
+                DISABLE_MAX_PRIVILEGE,
+                0,
+                null(),
+                0,
+                null(),
+                0,
+                null(),
+                &mut new_token,
+            );
+            if ok == 0 || new_token.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(OwnedHandle::from_raw_handle(new_token as RawHandle))
+        }
+    }
+
+    /// Creates a restricted primary token derived from the current process token (opt-in via
+    /// `H2_DROVE_SANDBOX=restricted-token`):
     /// - Strips privileges via `DISABLE_MAX_PRIVILEGE` (keeps `SeChangeNotifyPrivilege`).
     /// - Sets `SidsToRestrict` to `[TokenUser, ...enabled non-deny/non-integrity groups..., S-1-5-12]`.
-    ///   Normal paths remain accessible via `TokenUser` + enabled groups, while any NTFS object
-    ///   carrying an explicit `DENY(S-1-5-12)` ACE is rejected by the kernel in Pass 2 of
-    ///   `SeAccessCheck` for this worker and all of its descendant processes.
+    ///   Note: Win32 Schannel `AcquireCredentialsHandle` fails with `SEC_E_NO_CREDENTIALS`
+    ///   (`0x8009030E`) under any `SidsToRestrict` token, so this mode is opt-in only.
     fn create_worker_restricted_token() -> io::Result<OwnedHandle> {
         unsafe {
             let mut raw_token: HANDLE = null_mut();
@@ -800,7 +878,7 @@ mod win_sandbox {
         let Some(exe) = crate::client::exe_path().or_else(|| std::env::current_exe().ok()) else {
             return false;
         };
-        let Ok(token) = create_worker_restricted_token() else {
+        let Ok(token) = create_worker_job_token() else {
             return false;
         };
         let line_str = format!(
@@ -850,16 +928,26 @@ mod win_sandbox {
         if args.first().and_then(|a| a.to_str()) == Some(PROBE_CHILD_ARG) {
             return 0;
         }
-        let inner_os = match args.iter().position(|a| a == "--") {
-            Some(sep) => &args[sep + 1..],
-            None => args,
+        let mut use_restricted_token = false;
+        let mut rest = args;
+        while let Some(first) = rest.first().and_then(|a| a.to_str()) {
+            if first == super::WINDOWS_RESTRICTED_TOKEN_FLAG {
+                use_restricted_token = true;
+                rest = &rest[1..];
+            } else {
+                break;
+            }
+        }
+        let inner_os = match rest.iter().position(|a| a == "--") {
+            Some(sep) => &rest[sep + 1..],
+            None => rest,
         };
         if inner_os.is_empty() {
             eprintln!("error: missing command after --");
             return 1;
         }
         let inner_argv: Vec<String> = inner_os.iter().map(|a| a.to_string_lossy().into_owned()).collect();
-        match spawn_restricted_and_wait(&inner_argv) {
+        match spawn_sandboxed_and_wait(&inner_argv, use_restricted_token) {
             Ok(code) => code,
             Err(err) => {
                 eprintln!("error: windows drove sandbox launch failed: {err}");
@@ -868,10 +956,14 @@ mod win_sandbox {
         }
     }
 
-    fn spawn_restricted_and_wait(inner_argv: &[String]) -> io::Result<i32> {
+    fn spawn_sandboxed_and_wait(inner_argv: &[String], use_restricted_token: bool) -> io::Result<i32> {
         let env: BTreeMap<String, String> = crate::platform::utf8_vars().collect();
         let mut cmd_line = crate::platform::command_line(inner_argv, &env)?;
-        let token = create_worker_restricted_token()?;
+        let token = if use_restricted_token {
+            create_worker_restricted_token()?
+        } else {
+            create_worker_job_token()?
+        };
 
         unsafe {
             let h_in = GetStdHandle(STD_INPUT_HANDLE);
@@ -1089,11 +1181,34 @@ mod tests {
     fn windows_sandbox_argv_uses_internal_subcommand_and_separator() {
         let exe = Path::new(r"C:\Users\dev\bin\herdr2.exe");
         let argv = vec!["codex-acp".into(), "--stdio".into()];
-        let wrapped = build_windows_sandbox_argv(exe, &argv).unwrap();
+        let wrapped = build_windows_sandbox_argv(exe, &argv, false).unwrap();
         assert_eq!(
             wrapped,
             vec![r"C:\Users\dev\bin\herdr2.exe", WINDOWS_SANDBOX_SUBCOMMAND, "--", "codex-acp", "--stdio",]
         );
+        let restricted = build_windows_sandbox_argv(exe, &argv, true).unwrap();
+        assert_eq!(
+            restricted,
+            vec![
+                r"C:\Users\dev\bin\herdr2.exe",
+                WINDOWS_SANDBOX_SUBCOMMAND,
+                WINDOWS_RESTRICTED_TOKEN_FLAG,
+                "--",
+                "codex-acp",
+                "--stdio",
+            ]
+        );
+    }
+
+    #[test]
+    fn sandbox_preference_parses_off_job_object_and_restricted_token() {
+        assert_eq!(parse_sandbox_preference(None), SandboxPreference::Auto);
+        assert_eq!(parse_sandbox_preference(Some("auto")), SandboxPreference::Auto);
+        assert_eq!(parse_sandbox_preference(Some("off")), SandboxPreference::Off);
+        assert_eq!(parse_sandbox_preference(Some("none")), SandboxPreference::Off);
+        assert_eq!(parse_sandbox_preference(Some("false")), SandboxPreference::Off);
+        assert_eq!(parse_sandbox_preference(Some("job-object")), SandboxPreference::WindowsJobObject);
+        assert_eq!(parse_sandbox_preference(Some("restricted-token")), SandboxPreference::WindowsRestrictedToken);
     }
 
     #[test]

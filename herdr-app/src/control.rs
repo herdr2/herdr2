@@ -10,10 +10,20 @@ use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(windows)]
 use uds_windows::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+static SERVING: AtomicBool = AtomicBool::new(false);
 
 fn socket() -> PathBuf {
     mods::app_dir().join("herdr2-app.sock")
+}
+
+/// Removes the local control socket if this process owns it.
+pub fn cleanup() {
+    if SERVING.swap(false, Ordering::SeqCst) {
+        let _ = std::fs::remove_file(socket());
+    }
 }
 
 /// Serves the socket for this window. A live socket means another window owns this home.
@@ -28,11 +38,17 @@ pub fn listen(tx: async_channel::Sender<Request>) {
         Ok(l) => l,
         Err(e) => return tracing::warn!("cannot serve {}: {e}", path.display()),
     };
+    SERVING.store(true, Ordering::SeqCst);
     let _ = std::thread::Builder::new().name("herdr2-app-control".into()).spawn(move || {
         for stream in listener.incoming().flatten() {
+            if tx.is_closed() {
+                let _ = (&stream).write_all(b"{\"error\":\"no window\",\"no_window\":true}\n");
+                break;
+            }
             let tx = tx.clone();
             std::thread::spawn(move || serve(stream, tx));
         }
+        cleanup();
     });
 }
 
@@ -45,8 +61,12 @@ fn serve(stream: UnixStream, tx: async_channel::Sender<Request>) {
         Ok(cmd) => {
             let timeout = Duration::from_secs(if cmd.get("shot").is_some() { 30 } else { 5 });
             let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-            let _ = tx.send_blocking(Request::Control { cmd, reply: reply_tx });
-            reply_rx.recv_timeout(timeout).unwrap_or_else(|_| json!({ "error": "the window did not answer" }))
+            if tx.send_blocking(Request::Control { cmd, reply: reply_tx }).is_err() {
+                cleanup();
+                json!({ "error": "no window", "no_window": true })
+            } else {
+                reply_rx.recv_timeout(timeout).unwrap_or_else(|_| json!({ "error": "the window did not answer" }))
+            }
         }
         Err(e) => json!({ "error": format!("bad request: {e}") }),
     };
@@ -55,7 +75,8 @@ fn serve(stream: UnixStream, tx: async_channel::Sender<Request>) {
 
 /// One Herdr per home: a second launch brings the running window to the
 /// front and quits. True when one is running (even one too busy to answer:
-/// a second window would ring every alert twice).
+/// a second window would ring every alert twice), unless the existing process
+/// explicitly reports it has no window left.
 pub fn raise_running() -> bool {
     raise_running_at(&socket())
 }
@@ -63,8 +84,14 @@ pub fn raise_running() -> bool {
 fn raise_running_at(path: &std::path::Path) -> bool {
     let Ok(mut stream) = UnixStream::connect(path) else { return false };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let mut line = String::new();
     if stream.write_all(format!("{}\n", json!({ "raise": true })).as_bytes()).is_ok() {
-        let _ = BufReader::new(&stream).read_line(&mut String::new());
+        let _ = BufReader::new(&stream).read_line(&mut line);
+    }
+    if let Ok(reply) = serde_json::from_str::<Value>(&line)
+        && reply.get("no_window").and_then(Value::as_bool) == Some(true)
+    {
+        return false;
     }
     true
 }
@@ -202,6 +229,24 @@ mod tests {
         });
         assert!(raise_running_at(&path));
         assert_eq!(asked.join().unwrap(), json!({ "raise": true }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn raise_running_ignores_windowless_peer_and_closed_receiver_reports_no_window() {
+        let dir = std::env::temp_dir().join(format!("herdr2-app-nowin-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("herdr2-app.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (tx, rx) = async_channel::unbounded();
+        drop(rx); // Simulate a windowless process whose receiver is gone.
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            serve(stream, tx);
+        });
+        assert!(!raise_running_at(&path));
+        server.join().unwrap();
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

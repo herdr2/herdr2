@@ -1,7 +1,7 @@
 // A side-by-side collapsible file browser for the focused pane's folder, with Typora-style live Markdown editing, image rendering, and IDE-themed code viewing.
 import { View, div, svg, list } from "gpui-kit";
 import { v_flex, h_flex, h_resizable, resizable_panel, Editor, EditorState, Input, InputState, TextareaState, Textarea, Popup, Scrollbar, TextView } from "gpui-base";
-import { spaces, panes, agents, terminals, focused, exec, readTextFile, readImageDataUrl, writeTextFile, watchFolder, theme, settings, window, layout, run, props, shared, setShared, nextCommand, checking, notify } from "herdr";
+import { spaces, panes, agents, terminals, focused, exec, readTextFile, readImageDataUrl, writeTextFile, watchFolder, theme, settings, window, layout, run, props, shared, setShared, nextCommand, checking, notify, openOverlay } from "herdr";
 import { detectFileKind, CODE_THEMES, MD_THEMES, resolveCodeTheme, resolveMdTheme, resolveRelativeFileLink, resolveRelativeAssetPath } from "./themes.js";
 import {
   resolveRepoRelativePath,
@@ -110,6 +110,20 @@ function resolveDiskPath(path, root) {
   if (!path) return "";
   if (isAbsolutePath(path) || path === "~") return path;
   return root ? `${root.replace(/[\\/]+$/, "")}/${path}` : path;
+}
+
+function formatAbsolutePath(root, relPath) {
+  const r = String(root ?? "");
+  const p = String(relPath ?? "").replace(/^[/\\]+/, "");
+  if (!p) return r;
+  if (isAbsolutePath(p) || p === "~") return p;
+  if (!r) return p;
+  const useBackslash = r.includes("\\") && !r.includes("/");
+  const sep = useBackslash ? "\\" : "/";
+  const rel = useBackslash ? p.replace(/\//g, "\\") : p;
+  if (r === "/" || r === "\\") return `${r}${rel}`;
+  if (/^[A-Za-z]:[\\/]$/.test(r)) return `${r}${rel}`;
+  return `${r.replace(/[\\/]+$/, "")}${sep}${rel}`;
 }
 
 function relativizeToRoot(targetPath, root) {
@@ -2609,6 +2623,21 @@ export default class Files extends View {
       );
   }
 
+  openPathMenu(relPath, isDir = false) {
+    const absolutePath = formatAbsolutePath(this.root, relPath);
+    const relativePath = String(relPath ?? "").replace(/^[/\\]+/, "");
+    if (!absolutePath && !relativePath) return;
+    openOverlay({
+      mod: "menu",
+      kind: "popup",
+      width: 210,
+      props: {
+        tab: "file",
+        target: { absolutePath, relativePath, dir: Boolean(isDir) },
+      },
+    });
+  }
+
   rows(prefix, depth, out, t, commentCountByPath = null) {
     if (out.length >= TOTAL || depth > 40) return out;
     const accent = t.accent ?? "#3b82f6";
@@ -2622,6 +2651,10 @@ export default class Files extends View {
       out.push(h_flex().id(`file-${path}`).h(26).flex_none().pl(6 + depth * 15).pr(6).gap(6).items_center().rounded(6).cursor_pointer()
         .bg(selected ? (t.selected ?? t.raised) : "#00000000")
         .hover(s => s.bg(selected ? (t.selected ?? t.raised) : t.hover))
+        .on_mouse_down("right", (e, cx) => {
+          stopMouse(e, cx);
+          this.openPathMenu(path, entry.dir);
+        })
         .on_click((_e, cx) => {
           if (entry.dir) {
             this.toggle(path, cx);
@@ -4175,7 +4208,11 @@ export default class Files extends View {
           .border_b(1)
           .border_color(t.border)
           .child(
-            h_flex().gap(6).items_center().min_w(0).flex_1()
+            h_flex().id("files-root-header").gap(6).items_center().min_w(0).flex_1()
+              .when(Boolean(this.root), el => el.on_mouse_down("right", (e, cx) => {
+                stopMouse(e, cx);
+                this.openPathMenu("", true);
+              }))
               .child(svg("mods/files/folder.svg").size(13).flex_none().text_color(t.muted))
               .child(div().min_w(0).truncate().font_semibold().text_size(12).text_color(t.foreground).child(rootName))
           )

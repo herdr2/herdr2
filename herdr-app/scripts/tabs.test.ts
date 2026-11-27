@@ -927,3 +927,69 @@ test("top-right update button triggers app.update and turns into a compact spinn
   expect(spinnerBtn.calls.on_click).toBeUndefined();
   expect(spinnerBtn.nodes[0]?.calls?.spin?.[0]).toBe(900);
 });
+
+test("tab bar renders a reopen button on the left only when the sidebar is hidden", () => {
+  const runCalls: unknown[][] = [];
+  let currentLayout: any = {
+    id: "root",
+    traffic_lights: [12, 16],
+    children: [{ id: "sidebar", hidden: false, size: { px: 268 } }],
+  };
+  let currentShared: Record<string, unknown> = { "sidebar.width": 300 };
+  const customValues = {
+    ...values,
+    spaces: () => [{ id: "s1", active: true, tabs: [{ id: "t1", name: "Tab", named: true, active: true }] }],
+    panes: () => [],
+    window: () => ({ platform: "linux", titlebar: "none", fullscreen: false, buttons: true }),
+    settings: () => ({ zoom: 1, language: "zh-CN" }),
+    keys: () => [{ section: "global", action: "layout.toggle:sidebar", keys: "ctrl-shift-b" }],
+    layout: () => currentLayout,
+    shared: (k: string) => currentShared[k],
+    run: (cmd: string, args: any) => runCalls.push([cmd, args]),
+  };
+  const view = new (new Function(
+    ...Object.keys(customValues),
+    source.replace(/^import .*;\n/gm, "").replace("export default class Tabs", "return class Tabs"),
+  )(...Object.values(customValues)))();
+  view.init();
+  const findById = (node: any, id: string): any => {
+    if (!node) return null;
+    if (node.calls?.id?.[0] === id) return node;
+    for (const ch of node.nodes ?? []) {
+      const hit = findById(ch, id);
+      if (hit) return hit;
+    }
+    return null;
+  };
+
+  // Visible sidebar: tab bar does not render a duplicate toggle button
+  expect(findById(view.render(), "sidebar-toggle")).toBeNull();
+
+  // Hidden sidebar: tab bar renders the reopen button before tab-scroll
+  currentLayout = {
+    id: "root",
+    traffic_lights: [12, 16],
+    children: [{ id: "sidebar", hidden: true, size: { px: 268 } }],
+  };
+  const hiddenTree = view.render() as any;
+  const btn = findById(hiddenTree, "sidebar-toggle");
+  expect(btn).not.toBeNull();
+  expect(hiddenTree.nodes[0]).toBe(btn);
+  expect(btn.calls.tooltip?.[0]).toBe("展开侧边栏 (Ctrl+Shift+B)");
+  btn.calls.on_click[0]({}, { stop_propagation() {} });
+  expect(runCalls).toEqual([["layout.show", { id: "sidebar" }]]);
+
+  // Hidden narrow rail: reopening restores full width before showing
+  runCalls.length = 0;
+  currentLayout = {
+    id: "root",
+    traffic_lights: [12, 16],
+    children: [{ id: "sidebar", hidden: true, size: { px: 44 } }],
+  };
+  const narrowBtn = findById(view.render(), "sidebar-toggle");
+  narrowBtn.calls.on_click[0]({}, { stop_propagation() {} });
+  expect(runCalls).toEqual([
+    ["layout.resize", { id: "sidebar", px: 300 }],
+    ["layout.show", { id: "sidebar" }],
+  ]);
+});

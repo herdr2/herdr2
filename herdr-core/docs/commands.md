@@ -68,10 +68,10 @@ More
   schema                      print OpenRPC 1.3.2 JSON Schema
 
 <a> / <t> is an agent (`a1`), terminal (`t1`), remote (`machine/a7`), or unique name.
-Built-in `--agent` presets: agy, claude, codex, cursor, dsh, gemini, opencode, copilot, kimi, qwen, pi, hermes, glm, zcode.
+Built-in `--agent` presets: agy, claude, codex, cursor, dsh, gemini, opencode, copilot, kimi, qwen, pi, hermes, glm, zcode, trae.
 Options: --json (default when piped except read/file read/exec), -V --version, --licenses.
 Per command: h2 <command> --help
-Settings: ~/.config/herdr2/config.toml (default_permissions, inject_mcp, [agents]).
+Settings: ~/.config/herdr2/config.toml (Windows: %APPDATA%\herdr2\config.toml) (default_permissions, inject_mcp, [agents]).
 Agent manual: h2 --skill
 ```
 
@@ -86,11 +86,30 @@ Commands:
   status   Inspect managed ACP adapters, companion CLIs, installation source, and versions
   install  Download and install missing managed ACP adapters from the official ACP Registry
   update   Refresh the official ACP Registry and update managed ACP adapters to the latest version
+  config   Update ACP detection & runtime configuration in config.toml
   help     Print this message or the help of the given subcommand(s)
 
 Options:
       --json  JSON output even in a terminal
   -h, --help  Print help
+```
+
+## h2 adapter config
+
+```text
+Update ACP detection & runtime configuration in config.toml
+
+Usage: h2 adapter config [OPTIONS]
+
+Options:
+      --auto-install <BOOL>         Automatically install missing managed ACP adapters (`true` or `false`) [possible values: true, false]
+      --json                        JSON output even in a terminal
+      --registry-url <URL>          Custom ACP Registry index URL
+      --clear-registry-url          Reset `acp_registry_url` back to the official ACP Registry default
+      --default-permissions <MODE>  Default ACP permission policy (`approve-reads`, `approve-all`, `ask`, `deny-all`) [possible values: approve-all, approve-reads, deny-all, ask]
+      --inject-mcp <BOOL>           Auto-inject the built-in `herdr2` MCP server into ACP sessions (`true` or `false`) [possible values: true, false]
+      --on <MACHINE>                Target remote machine (`h2 machine ls`)
+  -h, --help                        Print help
 ```
 
 ## h2 adapter install
@@ -540,7 +559,8 @@ Commands:
   send             Send guidance to a running task worker (or interrupt current turn)
   inspect          Inspect structured diagnostics and recent items for a task or attempt
   retry            Retry a task with optional hint or new role/agent/model
-  route            Override role/agent/model/effort assignment on a pending or ready task
+  route            Override role/agent/model/effort assignment on a pending/ready task (or switch a running worker's model in place with `--in-place`)
+  edit             Edit an unstarted (`pending`/`ready`/`skipped`/`failed`) task's spec, dependencies, isolation, or timeouts in place
   cancel           Cancel a specific task (by ID/key) or an entire Run
   complete         Finalize a Run (runs Run-level verify gate if configured)
   pause            Pause scheduling new tasks in a Run
@@ -578,19 +598,21 @@ Append one or more tasks to an existing Run
 Usage: h2 drove add [OPTIONS]
 
 Options:
-      --json             JSON output even in a terminal
-      --run <RUN>        Run ID (defaults to `drove use` or latest active run)
-      --file <FILE>      
-      --stdin            
-      --key <KEY>        
-      --title <TITLE>    
-      --change <CHANGE>  
-      --role <ROLE>      
-      --deps <DEPS>      
-      --verify <VERIFY>  
-      --worktree         
-      --on <MACHINE>     
-  -h, --help             Print help
+      --json                 JSON output even in a terminal
+      --run <RUN>            Run ID (defaults to `drove use` or latest active run)
+      --file <FILE>          
+      --stdin                
+      --key <KEY>            
+      --title <TITLE>        
+      --change <CHANGE>      
+      --role <ROLE>          
+      --deps <DEPS>          
+      --verify <VERIFY>      
+      --worktree             
+      --fork-from <SOURCE>   Warm-fork initial context from `coordinator` or an upstream `<task_key>`
+      --channels <CHANNELS>  Subscribe this task to shared contract channels (comma-separated)
+      --on <MACHINE>         
+  -h, --help                 Print help
 ```
 
 ## h2 drove ai-test
@@ -622,6 +644,7 @@ Arguments:
 
 Options:
       --json          JSON output even in a terminal
+      --skip-ok       Detach this cancelled task from downstream pending tasks so downstream tasks are not cascade-skipped
       --run <RUN>     
       --on <MACHINE>  
   -h, --help          Print help
@@ -644,6 +667,39 @@ Options:
       --force              
       --on <MACHINE>       
   -h, --help               Print help
+```
+
+## h2 drove edit
+
+```text
+Edit an unstarted (`pending`/`ready`/`skipped`/`failed`) task's spec, dependencies, isolation, or timeouts in place
+
+Usage: h2 drove edit [OPTIONS] <TASK>
+
+Arguments:
+  <TASK>  
+
+Options:
+      --file <FILE>                
+      --json                       JSON output even in a terminal
+      --stdin                      
+      --title <TITLE>              
+      --target <TARGET>            
+      --change <CHANGE>            
+      --acceptance <ACCEPTANCE>    
+      --constraints <CONSTRAINTS>  
+      --ownership <OWNERSHIP>      
+      --verify <VERIFY>            
+      --deps <DEPS>                
+      --clear-deps                 
+      --role <ROLE>                
+      --worktree                   
+      --no-worktree                
+      --timeout <TIMEOUT>          
+      --no-review                  
+      --run <RUN>                  
+      --on <MACHINE>               
+  -h, --help                       Print help
 ```
 
 ## h2 drove inbox
@@ -780,14 +836,15 @@ Arguments:
   <PROMPT>  
 
 Options:
-      --json             JSON output even in a terminal
-      --role <ROLE>      [default: coder]
-      --cwd <CWD>        
-      --verify <VERIFY>  
-      --worktree         
-      --wait             
-      --on <MACHINE>     
-  -h, --help             Print help
+      --json                JSON output even in a terminal
+      --role <ROLE>         [default: coder]
+      --cwd <CWD>           
+      --verify <VERIFY>     
+      --worktree            
+      --fork-from <SOURCE>  Warm-fork initial context from `coordinator`
+      --wait                
+      --on <MACHINE>        
+  -h, --help                Print help
 ```
 
 ## h2 drove reply
@@ -903,7 +960,7 @@ Options:
 ## h2 drove route
 
 ```text
-Override role/agent/model/effort assignment on a pending or ready task
+Override role/agent/model/effort assignment on a pending/ready task (or switch a running worker's model in place with `--in-place`)
 
 Usage: h2 drove route [OPTIONS] <TASK>
 
@@ -917,6 +974,7 @@ Options:
       --model <MODEL>    
       --effort <EFFORT>  
       --worker <WORKER>  
+      --in-place         Switch the live worker's model/effort in place without restarting a running attempt
       --run <RUN>        
       --on <MACHINE>     
   -h, --help             Print help
@@ -1075,13 +1133,16 @@ Worker protocol subcommands invoked by spawned worker ACP sessions
 Usage: h2 drove worker [OPTIONS] <COMMAND>
 
 Commands:
-  context  Print current worker & active attempt context from the daemon
-  inbox    Drain unread notes sent to this worker attempt
-  ask      Ask the coordinator a blocking question and print the reply
-  note     Post a non-blocking progress note to the coordinator
-  read     Read a dependency task result, verify log, or review patch slice
-  done     Submit task attempt completion or explicit failure to the Drove daemon gates
-  help     Print this message or the help of the given subcommand(s)
+  context     Print current worker & active attempt context from the daemon
+  inbox       Drain unread notes sent to this worker attempt
+  ask         Ask the coordinator a blocking question and print the reply
+  note        Post a non-blocking progress note to the coordinator
+  read        Read a dependency task result, `#contract:<seq>`, verify log, or review patch slice
+  contract    Publish or list shared interface contracts on a Run channel
+  check-path  Fast zero-RPC check whether target file paths satisfy the worker role's `allowedPaths`
+  guard-hook  Fast zero-RPC PreToolUse hook reading tool JSON from stdin and exiting 2 on out-of-scope edits
+  done        Submit task attempt completion or explicit failure to the Drove daemon gates
+  help        Print this message or the help of the given subcommand(s)
 
 Options:
       --json  JSON output even in a terminal
@@ -1108,6 +1169,21 @@ Options:
   -h, --help                   Print help
 ```
 
+## h2 drove worker check-path
+
+```text
+Fast zero-RPC check whether target file paths satisfy the worker role's `allowedPaths`
+
+Usage: h2 drove worker check-path [OPTIONS] <PATHS>...
+
+Arguments:
+  <PATHS>...  
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
+```
+
 ## h2 drove worker context
 
 ```text
@@ -1118,6 +1194,24 @@ Usage: h2 drove worker context [OPTIONS]
 Options:
       --json  JSON output even in a terminal
   -h, --help  Print help
+```
+
+## h2 drove worker contract
+
+```text
+Publish or list shared interface contracts on a Run channel
+
+Usage: h2 drove worker contract [OPTIONS]
+
+Options:
+      --json               JSON output even in a terminal
+      --publish            Publish a contract entry (omit to list contracts)
+      --channel <CHANNEL>  [default: main]
+      --key <KEY>          
+      --summary <SUMMARY>  
+      --data <DATA>        
+      --attempt <ATTEMPT>  
+  -h, --help               Print help
 ```
 
 ## h2 drove worker done
@@ -1137,6 +1231,18 @@ Options:
       --no-retry           
       --attempt <ATTEMPT>  Optional explicit attempt ID (defaults to worker's live active attempt)
   -h, --help               Print help
+```
+
+## h2 drove worker guard-hook
+
+```text
+Fast zero-RPC PreToolUse hook reading tool JSON from stdin and exiting 2 on out-of-scope edits
+
+Usage: h2 drove worker guard-hook [OPTIONS]
+
+Options:
+      --json  JSON output even in a terminal
+  -h, --help  Print help
 ```
 
 ## h2 drove worker inbox
@@ -1172,7 +1278,7 @@ Options:
 ## h2 drove worker read
 
 ```text
-Read a dependency task result, verify log, or review patch slice
+Read a dependency task result, `#contract:<seq>`, verify log, or review patch slice
 
 Usage: h2 drove worker read [OPTIONS] <TARGET>
 
@@ -1184,6 +1290,7 @@ Options:
       --offset <OFFSET>    [default: 0]
       --limit <LIMIT>      [default: 65536]
       --grep <GREP>        
+      --path <JSON_PATH>   Optional JSON dot-path selector (e.g. `items.0.path`) when reading structured task/contract data
       --attempt <ATTEMPT>  Optional explicit attempt ID (defaults to worker's live active attempt)
   -h, --help               Print help
 ```
@@ -1739,8 +1846,9 @@ Run the built-in stdio MCP server (`h2 mcp`)
 Usage: h2 mcp [OPTIONS]
 
 Options:
-      --json  JSON output even in a terminal
-  -h, --help  Print help
+      --json               JSON output even in a terminal
+      --profile <PROFILE>  Tool surface profile (`default` or `drove-worker`)
+  -h, --help               Print help
 ```
 
 ## h2 put

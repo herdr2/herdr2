@@ -183,6 +183,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
         dangerously_skip_permissions: spec_skip,
         config_overrides,
         inject_mcp,
+        mcp_profile: None,
         mcp_exe,
         socket: core.paths.socket.display().to_string(),
         handshake_timeout: None,
@@ -510,7 +511,11 @@ pub(crate) struct DroveSpawnSpec {
     pub effort: Option<String>,
     pub fast: Option<bool>,
     pub access: crate::drove::types::RoleAccessMode,
+    pub allowed_paths: Vec<String>,
     pub isolate_secrets: bool,
+    pub resume_session_id: Option<String>,
+    pub fallback_handoff_context: Option<String>,
+    pub lineage: Option<crate::handoff::Lineage>,
 }
 
 pub(crate) struct DroveSpawnResult {
@@ -518,6 +523,7 @@ pub(crate) struct DroveSpawnResult {
     pub address: String,
     pub pid: Option<u32>,
     pub sandbox_mode: &'static str,
+    pub resumed_session: bool,
 }
 
 /// Spawns a native `herdr2` headless ACP `a*` worker for Drove (without an initial prompt yet)
@@ -560,7 +566,34 @@ pub(crate) async fn spawn_drove_agent(core: &Arc<Core>, req: DroveSpawnSpec) -> 
         req.access,
         req.isolate_secrets,
     );
-    presets::ensure_agy_skip_permissions(&mut wrapped_argv);
+    let skip_permissions = req.access == crate::drove::types::RoleAccessMode::Writable;
+    if skip_permissions {
+        presets::ensure_agy_skip_permissions(&mut wrapped_argv);
+    }
+    let access_str = match req.access {
+        crate::drove::types::RoleAccessMode::Readonly => "readonly",
+        crate::drove::types::RoleAccessMode::ScopedWrite => "scoped_write",
+        crate::drove::types::RoleAccessMode::Writable => "writable",
+    };
+    env.insert("H2_DROVE_ACCESS".into(), access_str.into());
+    env.insert("H2_DROVE_WORK_CWD".into(), req.cwd.clone());
+    let allowed_json = if req.allowed_paths.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&req.allowed_paths).ok()
+    };
+    if let Some(ref aj) = allowed_json {
+        env.insert("H2_DROVE_ALLOWED_PATHS".into(), aj.clone());
+    }
+    let mut labels = req.labels;
+    labels.insert("drove.access".into(), access_str.into());
+    if let Some(aj) = allowed_json {
+        labels.insert("drove.allowed_paths".into(), aj);
+    }
+    let perm_mode = match req.access {
+        crate::drove::types::RoleAccessMode::Readonly => crate::permissions::PermissionMode::ApproveReads,
+        _ => crate::permissions::PermissionMode::ApproveAll,
+    };
 
     let mut overrides = BTreeMap::new();
     let is_agy = matches!(req.agent.as_str(), "agy" | "antigravity");
@@ -597,7 +630,7 @@ pub(crate) async fn spawn_drove_agent(core: &Arc<Core>, req: DroveSpawnSpec) -> 
             rm: false,
             keep: false,
             name: None,
-            labels: req.labels.clone(),
+            labels,
             argv: wrapped_argv.clone(),
             cwd: req.cwd.clone(),
             agent: resolved.preset.clone(),
@@ -605,8 +638,8 @@ pub(crate) async fn spawn_drove_agent(core: &Arc<Core>, req: DroveSpawnSpec) -> 
             model: req.model.clone(),
             mode: None,
             inject_mcp: false,
-            permission_mode: crate::permissions::PermissionMode::ApproveAll,
-            lineage: None,
+            permission_mode: perm_mode,
+            lineage: req.lineage.clone(),
         };
         let id = st.reg.create(new, now_ms())?;
         st.recovering.insert(id);
@@ -620,21 +653,24 @@ pub(crate) async fn spawn_drove_agent(core: &Arc<Core>, req: DroveSpawnSpec) -> 
         (id, addr, env)
     };
 
+    let mcp_profile = env.contains_key("H2_DROVE_WORKER_TOKEN").then(|| "drove-worker".to_string());
     let mcp_exe = crate::client::exe_path().map(|exe| exe.display().to_string()).unwrap_or_else(|| "herdr2".into());
+    let can_load_fork = req.resume_session_id.is_some();
     let spec = SpawnSpec {
         address: address.clone(),
         argv: wrapped_argv,
         env,
         cwd: req.cwd,
-        resume_session_id: None,
-        can_load_session: false,
+        resume_session_id: req.resume_session_id,
+        can_load_session: can_load_fork,
         system_prompt: None,
-        fallback_handoff_context: None,
+        fallback_handoff_context: req.fallback_handoff_context,
         model: req.model,
         mode: None,
-        dangerously_skip_permissions: true,
+        dangerously_skip_permissions: skip_permissions,
         config_overrides: overrides,
         inject_mcp: false,
+        mcp_profile,
         mcp_exe,
         socket: core.paths.socket.display().to_string(),
         handshake_timeout: None,
@@ -653,6 +689,7 @@ pub(crate) async fn spawn_drove_agent(core: &Arc<Core>, req: DroveSpawnSpec) -> 
         }
     };
 
+    let resumed_session = started.resumed_session;
     let pid = {
         let mut st = core.lock();
         st.recovering.remove(&id);
@@ -707,7 +744,7 @@ pub(crate) async fn spawn_drove_agent(core: &Arc<Core>, req: DroveSpawnSpec) -> 
         )
         .await;
     });
-    Ok(DroveSpawnResult { agent_id: id, address, pid, sandbox_mode })
+    Ok(DroveSpawnResult { agent_id: id, address, pid, sandbox_mode, resumed_session })
 }
 
 /// Updates a live agent's `title` and `labels` and broadcasts `title` + `labels` events to subscribers.

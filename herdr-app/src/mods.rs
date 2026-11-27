@@ -622,9 +622,11 @@ impl SharedStore {
                 serde_json::Map::new()
             }
         };
-        // Runtime-only request payloads must not survive restarts; stale high `seq`
-        // values from earlier versions would otherwise cause `Files` to drop new opens.
+        // Runtime-only request/progress payloads must not survive restarts; stale
+        // values from an interrupted session would otherwise linger across launches.
         values.remove("files.open_request");
+        values.remove("polish.active");
+        values.remove("polish.state");
         Self { values, ephemeral: serde_json::Map::new(), path, writable, writer: None }
     }
 
@@ -1121,11 +1123,32 @@ fn run_remote_with_limit(machine: &str, command: &str, args: &[String], cwd: Opt
     Ok((code, bytes("stdout")?, bytes("stderr")?))
 }
 
+fn alternate_agent_commands(key: &str) -> &'static [&'static str] {
+    match key {
+        "trae" => &["traex", "trae-cli"],
+        _ => &[],
+    }
+}
+
 /// The agents a machine can start (`knownAgents()`), asked at most once a minute.
 fn known_agents(on: Option<String>, list: Vec<Value>) -> Result<Value, String> {
     type InstalledCache = std::collections::HashMap<Option<String>, (std::time::Instant, Vec<String>, Vec<String>)>;
     static SEEN: std::sync::Mutex<Option<InstalledCache>> = std::sync::Mutex::new(None);
-    let commands: Vec<String> = list.iter().filter_map(|a| a["run"][0].as_str().map(str::to_owned)).collect();
+    let mut commands: Vec<String> = Vec::new();
+    for a in &list {
+        if let Some(cmd) = a["run"][0].as_str()
+            && !commands.iter().any(|c| c == cmd)
+        {
+            commands.push(cmd.to_owned());
+        }
+        if let Some(key) = a["key"].as_str() {
+            for alt in alternate_agent_commands(key) {
+                if !commands.iter().any(|c| c == alt) {
+                    commands.push((*alt).to_owned());
+                }
+            }
+        }
+    }
     let cached = SEEN.lock().ok().and_then(|s| s.as_ref()?.get(&on).filter(|(at, checked, _)| at.elapsed().as_secs() < 60 && checked == &commands).map(|(_, _, v)| v.clone()));
     let have = if let Some(cached) = cached { cached } else {
         let found = crate::programs::installed(&commands, on.as_deref())?;
@@ -1138,7 +1161,19 @@ fn known_agents(on: Option<String>, list: Vec<Value>) -> Result<Value, String> {
         list.into_iter()
             .map(|mut a| {
                 let run = a["run"][0].as_str().unwrap_or_default().to_owned();
-                a["installed"] = json!(have.contains(&run));
+                let mut is_installed = have.contains(&run);
+                if !is_installed
+                    && let Some(key) = a["key"].as_str()
+                    && let Some(alt) = alternate_agent_commands(key).iter().find(|alt| have.iter().any(|h| h == *alt))
+                {
+                    is_installed = true;
+                    if let Some(arr) = a["run"].as_array_mut()
+                        && !arr.is_empty()
+                    {
+                        arr[0] = json!(alt);
+                    }
+                }
+                a["installed"] = json!(is_installed);
                 a
             })
             .collect(),
@@ -2104,6 +2139,12 @@ mod tests {
         assert_eq!(next[0]["installed"], true);
         assert_eq!(next[1]["key"], "claude-alt");
         assert_eq!(next[1]["installed"], true);
+    }
+
+    #[test]
+    fn trae_alternate_binaries_include_traex_and_trae_cli() {
+        assert_eq!(alternate_agent_commands("trae"), &["traex", "trae-cli"]);
+        assert!(alternate_agent_commands("claude").is_empty());
     }
 
     #[test]

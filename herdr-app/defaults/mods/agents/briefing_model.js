@@ -19,7 +19,7 @@ const AUTO_TAB_NAMES = new Set([
   "kiro", "kiro-cli", "qoder", "qodercli", "copilot", "github-copilot", "amp", "grok",
   "hermes", "goose", "crush", "omp", "oh-my-pi", "dsh", "dsh-tui", "deepseek", "deepseek harness",
   "mastra code", "mastracode", "command code", "command-code", "prime", "prime-agent",
-  "empryo", "muse", "ollama", "zcode", "zcode-cli", "glm", "agent",
+  "empryo", "muse", "ollama", "zcode", "zcode-cli", "trae", "traecli", "traex", "trae-cli", "trae cli", "glm", "agent",
 ]);
 
 function shortAddress(address) {

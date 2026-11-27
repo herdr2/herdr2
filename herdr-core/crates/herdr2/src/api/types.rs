@@ -1574,3 +1574,22 @@ pub struct AdapterUpdateParams {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on: Option<String>,
 }
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+pub struct AdapterConfigSetParams {
+    /// Enable or disable background/on-demand auto-installation of managed ACP adapters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_install_adapters: Option<bool>,
+    /// Custom ACP Registry index URL (pass empty string to reset to default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acp_registry_url: Option<String>,
+    /// Default ACP permission policy (`approve-reads`, `approve-all`, `ask`, `deny-all`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_permissions: Option<crate::permissions::PermissionMode>,
+    /// Auto-inject the built-in `herdr2` MCP server into ACP sessions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject_mcp: Option<bool>,
+    /// Target remote machine (`h2 machine ls`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on: Option<String>,
+}

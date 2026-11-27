@@ -315,6 +315,9 @@ export default class Peek extends View {
       placeholder: tr("Edit queued message…", "修改队列中的消息…"),
     });
     this.inboxEditInput.set_auto_grow(2, 6);
+    if (typeof this.inboxEditInput.set_submit_on_enter === "function") {
+      this.inboxEditInput.set_submit_on_enter(true);
+    }
     this.inboxEditInput.on("focus", (_e, cx) => {
       this.inboxEditFocused = true;
       if (this.openConfigId) this.closeConfigPopover(cx);
@@ -387,6 +390,12 @@ export default class Peek extends View {
     this.expandedMedia = {};
     this.expandedResourceText = {};
     this.input.set_auto_grow(2, 8);
+    if (typeof this.input.set_submit_on_enter === "function") {
+      this.input.set_submit_on_enter(true);
+    }
+    if (typeof this.input.set_before_key === "function") {
+      this.input.set_before_key((e, cx) => this.handleCompletionKeyDown(e, cx));
+    }
     this.input.on("focus", (_e, cx) => {
       this.inputFocused = true;
       if (this.openConfigId) this.closeConfigPopover(cx);
@@ -413,6 +422,7 @@ export default class Peek extends View {
           const item = comp.items[this.completionIdx] ?? comp.items[0];
           if (item) {
             this.acceptCompletion(comp.triggerState, item, cx);
+            cx?.stop_propagation?.();
             return;
           }
         }
@@ -422,9 +432,11 @@ export default class Peek extends View {
       const hasAttachments = Array.isArray(this.draftAttachments) && this.draftAttachments.length > 0;
       if (!trimmed && !hasAttachments) {
         this.input.set_value("");
+        cx?.stop_propagation?.();
         cx.notify();
         return;
       }
+      cx?.stop_propagation?.();
       this.sendPrompt(steer);
     });
     this.handle = cx.focus_handle();
@@ -1109,6 +1121,17 @@ export default class Peek extends View {
     (cx ?? this.cx)?.notify?.();
   }
 
+  startPolishPrompt(cx) {
+    if (checking() || this.polishingPrompt || this.busyAction) return;
+    if (typeof cx?.spawn === "function") {
+      cx.spawn(async (taskCx) => {
+        await this.polishPrompt(taskCx);
+      });
+    } else {
+      this.polishPrompt(cx);
+    }
+  }
+
   async polishPrompt(cx) {
     const terminal = this.activeTerminal();
     const st = this.status();
@@ -1119,7 +1142,7 @@ export default class Peek extends View {
     const machine = terminal && terminal.includes("/") ? terminal.split("/")[0] : null;
     this.polishingPrompt = true;
     this.error = null;
-    (cx ?? this.cx)?.notify?.();
+    try { (cx ?? this.cx)?.notify?.(); } catch {}
     try {
       const args = [
         "ai",
@@ -1139,6 +1162,7 @@ export default class Peek extends View {
         const parsed = JSON.parse(res.stdout);
         const polished = String(parsed?.polished ?? "").trim();
         if (parsed?.usedAi && polished) {
+          this.polishingPrompt = false;
           this.polishUndoText = raw;
           this.polishSummary = parsed?.summary ? String(parsed.summary).trim() : null;
           this.polishApplied = true;
@@ -1165,7 +1189,7 @@ export default class Peek extends View {
       this.error = tr(`AI prompt polish failed: ${e?.message ?? e}`, `AI 提示词润色失败：${e?.message ?? e}`);
     } finally {
       this.polishingPrompt = false;
-      (cx ?? this.cx)?.notify?.();
+      try { (cx ?? this.cx)?.notify?.(); } catch {}
     }
   }
 
@@ -1589,37 +1613,44 @@ export default class Peek extends View {
     (cx ?? this.cx)?.notify?.();
   }
 
-  handleComposerKeyDown(e, cx) {
+  handleCompletionKeyDown(e, cx) {
     if (this.openConfigId || this.configFilterFocused || this.inboxEditFocused) return false;
     const key = e?.key;
     const noMods = !e?.modifiers?.shift && !e?.modifiers?.control && !e?.modifiers?.alt && !e?.modifiers?.platform;
+    if (!noMods) return false;
 
     const comp = this.activeCompletionState(this.term(), cx);
-    if (comp) {
-      if (key === "escape" && noMods) {
-        this.completionDismissedKey = `${comp.triggerState.trigger}:${comp.triggerState.start}`;
+    if (!comp) return false;
+    if (key === "escape") {
+      this.completionDismissedKey = `${comp.triggerState.trigger}:${comp.triggerState.start}`;
+      (cx ?? this.cx)?.notify?.();
+      return true;
+    }
+    if (comp.items.length > 0) {
+      if (key === "up") {
+        this.completionIdx = (this.completionIdx - 1 + comp.items.length) % comp.items.length;
         (cx ?? this.cx)?.notify?.();
         return true;
       }
-      if (comp.items.length > 0 && noMods) {
-        if (key === "up") {
-          this.completionIdx = (this.completionIdx - 1 + comp.items.length) % comp.items.length;
-          (cx ?? this.cx)?.notify?.();
-          return true;
-        }
-        if (key === "down") {
-          this.completionIdx = (this.completionIdx + 1) % comp.items.length;
-          (cx ?? this.cx)?.notify?.();
-          return true;
-        }
-        if (key === "tab" || key === "enter") {
-          const item = comp.items[this.completionIdx] ?? comp.items[0];
-          if (item) this.acceptCompletion(comp.triggerState, item, cx);
-          return true;
-        }
+      if (key === "down") {
+        this.completionIdx = (this.completionIdx + 1) % comp.items.length;
+        (cx ?? this.cx)?.notify?.();
+        return true;
+      }
+      if (key === "tab" || key === "enter") {
+        const item = comp.items[this.completionIdx] ?? comp.items[0];
+        if (item) this.acceptCompletion(comp.triggerState, item, cx);
+        return true;
       }
     }
+    return false;
+  }
 
+  handleComposerKeyDown(e, cx) {
+    if (this.handleCompletionKeyDown(e, cx)) return true;
+    if (this.openConfigId || this.configFilterFocused || this.inboxEditFocused) return false;
+    const key = e?.key;
+    const noMods = !e?.modifiers?.shift && !e?.modifiers?.control && !e?.modifiers?.alt && !e?.modifiers?.platform;
     if (key !== "up" && key !== "down") return false;
     if (!noMods) return false;
     return this.navigatePromptHistory(key === "up" ? -1 : 1, cx);
@@ -5622,7 +5653,7 @@ export default class Peek extends View {
                         .when(canPolish, (b) =>
                           b.on_click((_e, cx) => {
                             if (this.openConfigId) this.closeConfigPopover(cx);
-                            this.polishPrompt(cx);
+                            this.startPolishPrompt(cx);
                           }),
                         )
                         .child(

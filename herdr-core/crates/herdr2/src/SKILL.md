@@ -10,7 +10,7 @@
 
 ## Launch an ACP agent
 
-Built-in presets for `--agent` (or positional first argument): `claude`, `codex`, `gemini`, `opencode`, `copilot`, `cursor`, `kimi`, `qwen`, `pi`. Custom command lines work via `--agent "python3 my_acp.py"` or positional argv `h2 run -- python3 my_acp.py`.
+Built-in presets for `--agent` (or positional first argument): `claude`, `codex`, `gemini`, `opencode`, `copilot`, `cursor`, `kimi`, `qwen`, `pi`, `trae`. Custom command lines work via `--agent "python3 my_acp.py"` or positional argv `h2 run -- python3 my_acp.py`.
 
 ```sh
 # Check reusable Markdown templates in ~/.config/herdr2/templates/*.md
@@ -110,7 +110,7 @@ Use the `h2` CLI directly together with your host's shell / background command r
 
 ## Persistence, recovery, and safety rules
 
-- State lives in `~/.local/state/herdr2/<session>/` (`agents.json`, `transcripts/<addr>.jsonl`), config in `~/.config/herdr2/config.toml`, runtime sockets in `$XDG_RUNTIME_DIR/herdr2/<session>.sock`.
+- State lives in `~/.local/state/herdr2/<session>/` (`agents.json`, `transcripts/<addr>.jsonl`), config in `~/.config/herdr2/config.toml` (Windows: `%APPDATA%\herdr2\config.toml`), runtime sockets in `$XDG_RUNTIME_DIR/herdr2/<session>.sock`.
 - Side-by-side coexistence: `herdr2`/`h2` uses completely separate binaries, env vars (`H2_*`), sockets, and state paths from legacy `herdr-core`/`hc`.
 - Never call `h2 server stop` or `h2 server restart` on a shared session unless requested; tests must use a dedicated `H2_SESSION` and scratch XDG paths.
 - `h2 drove status|web|probe` manages native Drove role-based multi-agent orchestration (Workers appear as `a*` sub-agents).

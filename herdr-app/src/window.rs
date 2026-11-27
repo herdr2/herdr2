@@ -5077,6 +5077,9 @@ impl AppWindow {
         if self.polish_inflight.contains(&addr) {
             return;
         }
+        if self.polish_progress.is_some() {
+            self.cancel_polish(window, cx);
+        }
         let (raw_draft, typed_at_before, focus_handle) = {
             let v = view.read(cx);
             (v.cli_input_draft(), v.last_typed_at(), v.focus_handle().clone())
@@ -5174,8 +5177,8 @@ impl AppWindow {
                         } else {
                             None
                         };
-                        Self::publish_polish_state(None, 0);
                         if let Some(ov_id) = closed_overlay {
+                            Self::publish_polish_state(None, 0);
                             this.close_overlay(&ov_id, window, cx);
                         }
                         cx.notify();
@@ -5285,8 +5288,8 @@ impl AppWindow {
                     } else {
                         None
                     };
-                    Self::publish_polish_state(None, 0);
                     if let Some(ov_id) = closed_overlay {
+                        Self::publish_polish_state(None, 0);
                         this.close_overlay(&ov_id, window, cx);
                     }
                     let enter_at_after = if let Some(view) = this.best_terminal_view(&addr, cx) {
@@ -6471,7 +6474,7 @@ impl AppWindow {
                 | "kiro" | "kiro-cli" | "qoder" | "qodercli" | "copilot" | "github-copilot" | "amp" | "grok"
                 | "hermes" | "goose" | "crush" | "omp" | "oh-my-pi" | "dsh" | "dsh-tui" | "deepseek"
                 | "deepseek harness" | "mastra code" | "mastracode" | "command code" | "command-code"
-                | "prime" | "prime-agent" | "empryo" | "muse" | "ollama" | "zcode" | "zcode-cli" | "glm" | "agent"
+                | "prime" | "prime-agent" | "empryo" | "muse" | "ollama" | "zcode" | "zcode-cli" | "trae" | "traecli" | "traex" | "trae-cli" | "trae cli" | "glm" | "agent"
         )
     }
 
@@ -8202,6 +8205,7 @@ impl AppWindow {
             "kiro-cli" => "kiro",
             "antigravity-cli" | "agy" | "agy.real" => "antigravity",
             "zcode-cli" => "zcode",
+            "traecli" | "traex" | "trae-cli" => "trae",
             "oh-my-pi" => "omp",
             other => other,
         }
@@ -8413,7 +8417,7 @@ impl AppWindow {
         if is_acp {
             let is_builtin = matches!(
                 prog_key.as_str(),
-                "claude" | "codex" | "gemini" | "opencode" | "cursor" | "kimi" | "qwen" | "kiro" | "goose" | "zcode"
+                "claude" | "codex" | "gemini" | "opencode" | "cursor" | "kimi" | "qwen" | "kiro" | "goose" | "zcode" | "trae"
             );
             let mut params = json!({ "keep": true });
             if is_builtin {
@@ -10353,6 +10357,11 @@ impl AppWindow {
                     "layout.show" => false,
                     _ => true,
                 };
+                if id == "sidebar" && !n.hidden {
+                    if matches!(n.size, Some(Span::Px { px }) if px < 160.0) {
+                        n.size = Some(Span::Px { px: 268.0 });
+                    }
+                }
                 if id == "panel" {
                     self.side_panel_auto_hidden = false;
                 }
@@ -10583,6 +10592,7 @@ impl AppWindow {
                 crate::place::save(window, cx);
                 mods::finish_shared();
                 if crate::update::relaunch_current() {
+                    crate::control::cleanup();
                     cx.quit();
                 } else {
                     self.fail("cannot relaunch herdr2 executable");
@@ -12272,6 +12282,7 @@ impl AppWindow {
         mods::finish_shared();
         match crate::update::apply() {
             Ok(true) => {
+                crate::control::cleanup();
                 crate::update::relaunch();
                 cx.quit();
             }

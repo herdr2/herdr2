@@ -57,6 +57,13 @@ impl AiResultCache {
         map.insert(key, Entry { value, expires_at: now + ttl, last_hit_at: now });
     }
 
+    pub fn remove(&self, key: &str) {
+        if key.is_empty() {
+            return;
+        }
+        self.entries.lock().unwrap_or_else(|p| p.into_inner()).remove(key);
+    }
+
     pub fn clear(&self) {
         self.entries.lock().unwrap_or_else(|p| p.into_inner()).clear();
     }

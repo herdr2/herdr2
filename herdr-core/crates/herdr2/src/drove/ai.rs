@@ -1544,6 +1544,393 @@ pub(crate) fn parse_and_sanitize_ai_roles_with_note(
     Ok((out, global_note, rationale))
 }
 
+struct NarratorGuard {
+    drove: Arc<super::DroveRuntime>,
+    run_id: String,
+}
+
+impl Drop for NarratorGuard {
+    fn drop(&mut self) {
+        self.drove.leave_narrator(&self.run_id);
+    }
+}
+
+fn verify_one_briefing_ref(
+    raw_ref: &Value,
+    tasks: &[Task],
+    attempts: &[Attempt],
+    messages: &[Message],
+    events: &[DaemonEvent],
+    contracts: &[ContractPost],
+) -> Option<BriefingRef> {
+    let kind = raw_ref.get("kind").and_then(Value::as_str)?.trim().to_ascii_lowercase();
+    let raw_target = raw_ref.get("target").and_then(Value::as_str)?.trim();
+    if raw_target.is_empty() {
+        return None;
+    }
+    match kind.as_str() {
+        "task" => {
+            let clean = raw_target
+                .strip_prefix("@task:")
+                .or_else(|| raw_target.strip_prefix("task:"))
+                .map(|s| s.split('#').next().unwrap_or(s))
+                .unwrap_or(raw_target);
+            let task = tasks.iter().find(|t| t.id == clean || t.key == clean)?;
+            Some(BriefingRef { kind: "task".into(), target: task.id.clone(), label: task.key.clone() })
+        }
+        "attempt" => {
+            let clean = raw_target.strip_prefix("attempt:").unwrap_or(raw_target);
+            let att = attempts.iter().find(|a| a.id == clean)?;
+            let label = tasks
+                .iter()
+                .find(|t| t.id == att.task_id)
+                .map(|t| format!("{}#{}", t.key, &att.id[..att.id.len().min(8)]))
+                .unwrap_or_else(|| att.id.clone());
+            Some(BriefingRef { kind: "attempt".into(), target: att.id.clone(), label })
+        }
+        "message" => {
+            let clean = raw_target.strip_prefix("msg#").or_else(|| raw_target.strip_prefix('#')).unwrap_or(raw_target);
+            let msg = messages
+                .iter()
+                .find(|m| m.id == clean || clean.parse::<u64>().is_ok_and(|seq| m.seq == seq))?;
+            Some(BriefingRef {
+                kind: "message".into(),
+                target: msg.id.clone(),
+                label: format!("msg#{}", msg.seq),
+            })
+        }
+        "event" => {
+            let clean = raw_target.strip_prefix("ev#").or_else(|| raw_target.strip_prefix('#')).unwrap_or(raw_target);
+            let id: u64 = clean.parse().ok()?;
+            let ev = events.iter().find(|e| e.id == id)?;
+            Some(BriefingRef {
+                kind: "event".into(),
+                target: ev.id.to_string(),
+                label: format!("ev#{}", ev.id),
+            })
+        }
+        "contract" => {
+            let clean = raw_target
+                .strip_prefix("#contract:")
+                .or_else(|| raw_target.strip_prefix("contract:"))
+                .or_else(|| raw_target.strip_prefix('#'))
+                .unwrap_or(raw_target);
+            let c = contracts
+                .iter()
+                .rev()
+                .find(|c| c.key == clean || clean.parse::<u64>().is_ok_and(|seq| c.seq == seq))?;
+            Some(BriefingRef {
+                kind: "contract".into(),
+                target: format!("#contract:{}", c.seq),
+                label: format!("#{}", c.key),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn verify_briefing_refs(
+    raw_refs: Option<&Value>,
+    tasks: &[Task],
+    attempts: &[Attempt],
+    messages: &[Message],
+    events: &[DaemonEvent],
+    contracts: &[ContractPost],
+) -> Vec<BriefingRef> {
+    let Some(arr) = raw_refs.and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut out: Vec<BriefingRef> = Vec::new();
+    for item in arr {
+        if let Some(verified) = verify_one_briefing_ref(item, tasks, attempts, messages, events, contracts)
+            && !out.iter().any(|existing| existing.kind == verified.kind && existing.target == verified.target)
+        {
+            out.push(verified);
+            if out.len() >= 4 {
+                break;
+            }
+        }
+    }
+    out
+}
+
+/// Deterministically verifies every citation in a raw LLM `run_briefing` JSON response against
+/// live `Store` entities. Strips hallucinated references and drops any `thread`, `attention`,
+/// or `risk` item that lacks at least one verified entity reference.
+pub fn sanitize_and_verify_run_briefing(
+    raw_text: &str,
+    as_of_event_id: u64,
+    tasks: &[Task],
+    attempts: &[Attempt],
+    messages: &[Message],
+    events: &[DaemonEvent],
+    contracts: &[ContractPost],
+) -> Option<RunBriefing> {
+    let val = extract_json_object(raw_text)?;
+    let headline: String = val
+        .get("headline")
+        .and_then(Value::as_str)?
+        .trim()
+        .chars()
+        .take(160)
+        .collect();
+    if headline.is_empty() {
+        return None;
+    }
+    let running_summary = val
+        .get("runningSummary")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && *s != "null")
+        .map(|s| s.chars().take(320).collect::<String>());
+
+    let mut threads = Vec::new();
+    if let Some(arr) = val.get("threads").and_then(Value::as_array) {
+        for (idx, item) in arr.iter().enumerate() {
+            let refs = verify_briefing_refs(item.get("refs"), tasks, attempts, messages, events, contracts);
+            if refs.is_empty() {
+                continue;
+            }
+            let title: String = item.get("title").and_then(Value::as_str).unwrap_or("").trim().chars().take(80).collect();
+            let now: String = item.get("now").and_then(Value::as_str).unwrap_or("").trim().chars().take(160).collect();
+            if title.is_empty() || now.is_empty() {
+                continue;
+            }
+            let state = item
+                .get("state")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| matches!(s.as_str(), "running" | "blocked" | "done" | "failed" | "pending"))
+                .unwrap_or_else(|| "running".into());
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .unwrap_or_else(|| format!("th_{}", idx + 1));
+            threads.push(BriefingThread { id, title, state, now, refs });
+            if threads.len() >= 6 {
+                break;
+            }
+        }
+    }
+
+    let mut attention = Vec::new();
+    if let Some(arr) = val.get("attention").and_then(Value::as_array) {
+        for (idx, item) in arr.iter().enumerate() {
+            let refs = verify_briefing_refs(item.get("refs"), tasks, attempts, messages, events, contracts);
+            if refs.is_empty() {
+                continue;
+            }
+            let title: String = item.get("title").and_then(Value::as_str).unwrap_or("").trim().chars().take(90).collect();
+            let why: String = item.get("why").and_then(Value::as_str).unwrap_or("").trim().chars().take(180).collect();
+            if title.is_empty() {
+                continue;
+            }
+            let kind = item
+                .get("kind")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_ascii_lowercase())
+                .unwrap_or_else(|| "attention".into());
+            let severity = item
+                .get("severity")
+                .and_then(Value::as_str)
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| matches!(s.as_str(), "high" | "medium" | "low"))
+                .unwrap_or_else(|| "medium".into());
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .unwrap_or_else(|| format!("att_{}", idx + 1));
+            attention.push(BriefingAlert {
+                id,
+                kind,
+                severity,
+                title,
+                why: (!why.is_empty()).then_some(why),
+                refs,
+            });
+            if attention.len() >= 5 {
+                break;
+            }
+        }
+    }
+
+    let mut risks = Vec::new();
+    if let Some(arr) = val.get("risks").and_then(Value::as_array) {
+        for (idx, item) in arr.iter().enumerate() {
+            let refs = verify_briefing_refs(item.get("refs"), tasks, attempts, messages, events, contracts);
+            if refs.is_empty() {
+                continue;
+            }
+            let text: String = item.get("text").and_then(Value::as_str).unwrap_or("").trim().chars().take(180).collect();
+            if text.is_empty() {
+                continue;
+            }
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .unwrap_or_else(|| format!("rsk_{}", idx + 1));
+            risks.push(BriefingNote { id, text, refs });
+            if risks.len() >= 4 {
+                break;
+            }
+        }
+    }
+
+    Some(RunBriefing {
+        version: 1,
+        updated_at: now_iso(),
+        as_of_event_id,
+        headline,
+        running_summary,
+        threads,
+        attention,
+        risks,
+    })
+}
+
+/// Event-driven, debounced (3s per-Run singleflight) narrator generating `Run.briefing` via Core AI.
+pub fn spawn_run_narrator(core: Arc<Core>, run_id: String) {
+    let cfg = core.drove.config_snapshot();
+    if !cfg.ai.enabled || !cfg.ai.run_narrator || !core.ai.is_configured() {
+        return;
+    }
+    let Some(delay) = core.drove.enter_narrator(&run_id, Duration::from_secs(3)) else {
+        return;
+    };
+    tokio::spawn(async move {
+        let _guard = NarratorGuard { drove: core.drove.clone(), run_id: run_id.clone() };
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        let Some(run) = core.drove.store.get_run(&run_id) else { return };
+        if run.trashed_at.is_some() {
+            return;
+        }
+        let tasks = core.drove.store.list_tasks(&run_id);
+        if tasks.is_empty() {
+            return;
+        }
+        let attempts = core.drove.store.list_attempts(Some(&run_id), None, None);
+        let messages = core.drove.store.list_messages(&run_id, None, true, None);
+        let (events, _) = core.drove.store.list_daemon_events(Some(&run_id), None, None, None, 20);
+        let contracts = core.drove.store.list_contracts(&run_id, None);
+        let as_of_event_id = events.iter().map(|e| e.id).max().unwrap_or(0);
+
+        let compact_tasks: Vec<Value> = tasks
+            .iter()
+            .filter(|t| t.template != Some(true))
+            .take(32)
+            .map(|t| {
+                json!({
+                    "id": t.id,
+                    "key": t.key,
+                    "title": t.title,
+                    "phase": t.phase,
+                    "status": t.status,
+                    "exec_phase": t.exec_phase,
+                    "review_stage": t.review_circuit.as_ref().map(|rc| rc.stage),
+                    "summary": t.result.as_ref().and_then(|r| r.compact_summary.as_deref().or(Some(r.summary.as_str()))).map(|s| s.chars().take(120).collect::<String>()),
+                })
+            })
+            .collect();
+        let pending_msgs: Vec<Value> = messages
+            .iter()
+            .filter(|m| m.needs_action && m.handled_at.is_none())
+            .take(8)
+            .map(|m| {
+                json!({
+                    "id": m.id,
+                    "seq": m.seq,
+                    "type": m.kind,
+                    "task_id": m.task_id,
+                    "subject": m.subject,
+                })
+            })
+            .collect();
+        let failed_attempts: Vec<Value> = attempts
+            .iter()
+            .rev()
+            .filter(|a| a.outcome == Some(Outcome::Failed))
+            .take(6)
+            .map(|a| {
+                json!({
+                    "id": a.id,
+                    "task_id": a.task_id,
+                    "failure": a.failure.as_ref().map(|f| format!("{:?}: {}", f.kind, f.message.chars().take(100).collect::<String>())),
+                })
+            })
+            .collect();
+        let recent_contracts: Vec<Value> = contracts
+            .iter()
+            .rev()
+            .take(8)
+            .map(|c| json!({ "seq": c.seq, "channel": c.channel, "key": c.key, "summary": c.summary }))
+            .collect();
+        let recent_events: Vec<Value> = events
+            .iter()
+            .take(10)
+            .map(|e| json!({ "id": e.id, "kind": e.kind, "status": e.status, "title": e.title }))
+            .collect();
+
+        let lang = drove_ai_lang(&core, None);
+        let payload = json!({
+            "run_status": run.status,
+            "previous_summary": run.briefing.as_ref().and_then(|b| b.running_summary.clone()),
+            "tasks": compact_tasks,
+            "pending_messages": pending_msgs,
+            "failed_attempts": failed_attempts,
+            "contracts": recent_contracts,
+            "events": recent_events,
+        });
+        let user_prompt = format_op_user_message("run_briefing", lang, &payload);
+        let seed = build_run_seed_context(&core, &run_id);
+        let Some(raw) = drove_complete(
+            &core,
+            &run_id,
+            "run_briefing",
+            AiTaskTier::Fast,
+            run_seeded_mode(seed),
+            user_prompt,
+            600,
+            Duration::from_secs(15),
+            None,
+            None,
+        )
+        .await
+        else {
+            return;
+        };
+
+        let latest_tasks = core.drove.store.list_tasks(&run_id);
+        let latest_atts = core.drove.store.list_attempts(Some(&run_id), None, None);
+        let latest_msgs = core.drove.store.list_messages(&run_id, None, true, None);
+        let (latest_evs, _) = core.drove.store.list_daemon_events(Some(&run_id), None, None, None, 30);
+        let latest_contracts = core.drove.store.list_contracts(&run_id, None);
+        if let Some(verified) = sanitize_and_verify_run_briefing(
+            &raw,
+            as_of_event_id,
+            &latest_tasks,
+            &latest_atts,
+            &latest_msgs,
+            &latest_evs,
+            &latest_contracts,
+        ) {
+            let _ = core.drove.store.update_run(&run_id, |r| {
+                r.briefing = Some(verified.clone());
+            });
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1694,6 +2081,9 @@ mod tests {
             cache: None,
             cached_from: None,
             retry_on_worker_reported: None,
+            fork_from: None,
+            fork_mode: None,
+            channels: Vec::new(),
         };
         let pool = vec![
             (
@@ -1795,5 +2185,155 @@ mod tests {
         .unwrap();
         assert_eq!(cand_str, vec!["复杂架构", "后端重构"]);
         assert_eq!(cand_str_why.as_deref(), Some("已按模型特长配置"));
+    }
+
+    #[test]
+    fn sanitize_and_verify_run_briefing_enforces_real_citations_and_strips_hallucinations() {
+        let task = Task {
+            id: "tsk_real1".into(),
+            run_id: "run_1".into(),
+            key: "auth-api".into(),
+            title: "Build auth API".into(),
+            phase: Some("Backend".into()),
+            spec: Spec {
+                target: "src/auth.rs".into(),
+                change: "Implement JWT".into(),
+                constraints: None,
+                ownership: None,
+                acceptance: "Tests pass".into(),
+                verify: None,
+            },
+            tags: Vec::new(),
+            files: Vec::new(),
+            deps: Vec::new(),
+            output_schema: None,
+            isolation: Isolation::None,
+            effective_isolation: None,
+            isolation_reason: None,
+            timeout_sec: None,
+            stall_warn_sec: None,
+            stall_kill_sec: None,
+            when: None,
+            assign: None,
+            status: TaskStatus::Running,
+            result: None,
+            failures: 0,
+            created_at: now_iso(),
+            updated_at: now_iso(),
+            kind: None,
+            exec_phase: None,
+            execution_version: None,
+            trigger_rule: None,
+            context: None,
+            exec: None,
+            foreach_from: None,
+            template: None,
+            expansion_state: None,
+            expanded_from: None,
+            review: None,
+            review_state: None,
+            review_circuit: None,
+            candidate_result: None,
+            cache: None,
+            cached_from: None,
+            retry_on_worker_reported: None,
+            fork_from: None,
+            fork_mode: None,
+            channels: Vec::new(),
+        };
+        let msg = Message {
+            id: "msg_q1".into(),
+            seq: 3,
+            run_id: "run_1".into(),
+            kind: MessageType::Question,
+            from: "worker:wrk_1".into(),
+            to: "coordinator".into(),
+            thread_id: None,
+            task_id: Some("tsk_real1".into()),
+            attempt_id: None,
+            subject: "Token TTL?".into(),
+            body: None,
+            options: None,
+            recommend: None,
+            why: None,
+            raised_by: None,
+            raised_by_worker: None,
+            tag: None,
+            ai_draft: None,
+            needs_action: true,
+            handled_at: None,
+            created_at: now_iso(),
+        };
+        let contract = ContractPost {
+            seq: 1,
+            run_id: "run_1".into(),
+            channel: "api".into(),
+            key: "jwt-claims".into(),
+            author_task: "auth-api".into(),
+            worker_id: Some("wrk_1".into()),
+            summary: "sub + exp + aud".into(),
+            payload: None,
+            created_at: now_iso(),
+        };
+
+        let raw = r#"```json
+        {
+          "headline": "后端鉴权进行中，1 个问题待主控确认",
+          "runningSummary": "已发布 jwt-claims 契约，auth-api 正在等待 TTL 决策。",
+          "threads": [
+            {
+              "id": "th_valid",
+              "title": "JWT 鉴权实现",
+              "state": "blocked",
+              "now": "等待 Token TTL 回复",
+              "refs": [
+                { "kind": "task", "target": "auth-api", "label": "auth-api" },
+                { "kind": "contract", "target": "jwt-claims", "label": "jwt-claims" },
+                { "kind": "task", "target": "ghost-task", "label": "ghost" }
+              ]
+            },
+            {
+              "id": "th_hallucinated",
+              "title": "不存在的前端线程",
+              "state": "running",
+              "now": "完全虚构",
+              "refs": [
+                { "kind": "task", "target": "nonexistent_id", "label": "fake" }
+              ]
+            }
+          ],
+          "attention": [
+            {
+              "id": "att_q",
+              "kind": "question",
+              "severity": "high",
+              "title": "auth-api 询问 Token TTL",
+              "why": "阻塞鉴权中间件签发逻辑",
+              "refs": [{ "kind": "message", "target": "3", "label": "msg#3" }]
+            }
+          ],
+          "risks": [
+            {
+              "id": "rsk_ungrounded",
+              "text": "没有引用的风险必须被丢弃",
+              "refs": []
+            }
+          ]
+        }
+        ```"#;
+
+        let verified =
+            sanitize_and_verify_run_briefing(raw, 42, &[task], &[], &[msg], &[], &[contract]).expect("valid briefing");
+        assert_eq!(verified.as_of_event_id, 42);
+        assert_eq!(verified.headline, "后端鉴权进行中，1 个问题待主控确认");
+        // Hallucinated thread and ungrounded risk are deterministically dropped.
+        assert_eq!(verified.threads.len(), 1);
+        assert_eq!(verified.threads[0].refs.len(), 2);
+        assert_eq!(verified.threads[0].refs[0].target, "tsk_real1");
+        assert_eq!(verified.threads[0].refs[0].label, "auth-api");
+        assert_eq!(verified.threads[0].refs[1].target, "#contract:1");
+        assert_eq!(verified.attention.len(), 1);
+        assert_eq!(verified.attention[0].refs[0].target, "msg_q1");
+        assert!(verified.risks.is_empty());
     }
 }

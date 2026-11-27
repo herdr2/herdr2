@@ -40,7 +40,7 @@ pub const IDENTITY_VARS: &[&str] = &[
 ];
 
 mod doc;
-mod handoff;
+pub(crate) mod handoff;
 mod pty;
 mod review;
 pub(crate) mod run;
@@ -327,6 +327,9 @@ methods! { Ctx<'_>;
         errors ["invalid_params", "machine_unknown", "unavailable", "config"];
     "adapter.update" => adapter_update, AdapterUpdateParams => crate::acp::adapters::AdapterInstallResult,
         "Refresh the official ACP Registry index and update managed ACP adapters to the latest version.",
+        errors ["invalid_params", "machine_unknown", "unavailable", "config"];
+    "adapter.config.set" => adapter_config_set, AdapterConfigSetParams => crate::acp::adapters::AdapterStatusResult,
+        "Update ACP adapter and runtime defaults (auto_install_adapters, acp_registry_url, default_permissions, inject_mcp) in config.toml.",
         errors ["invalid_params", "machine_unknown", "unavailable", "config"];
     "rpc.discover" => rpc_discover, Empty => serde_json::Value,
         "The whole API as an OpenRPC document: every method with its params, result and errors in JSON Schema.",
@@ -2318,4 +2321,21 @@ async fn adapter_update(
     p: AdapterUpdateParams,
 ) -> Result<crate::acp::adapters::AdapterInstallResult, RpcError> {
     core.adapters.install_many(core, &p.presets, p.all, false, true, true).await
+}
+
+async fn adapter_config_set(
+    core: Ctx<'_>,
+    p: AdapterConfigSetParams,
+) -> Result<crate::acp::adapters::AdapterStatusResult, RpcError> {
+    let patch = crate::config::AcpConfigPatch {
+        auto_install_adapters: p.auto_install_adapters,
+        acp_registry_url: p.acp_registry_url.map(|u| {
+            let trimmed = u.trim().to_string();
+            if trimmed.is_empty() { None } else { Some(trimmed) }
+        }),
+        default_permissions: p.default_permissions,
+        inject_mcp: p.inject_mcp,
+    };
+    let _ = crate::config::update_acp_config(&core.paths.config, &patch)?;
+    Ok(core.adapters.status(core).await)
 }

@@ -58,8 +58,8 @@ More
   schema                      print OpenRPC 1.3.2 JSON Schema
 
 <a> / <t> is an agent (`a1`), terminal (`t1`), remote (`machine/a7`), or unique name.
-Built-in `--agent` presets: agy, claude, codex, cursor, dsh, gemini, opencode, copilot, kimi, qwen, pi, hermes, glm, zcode.
+Built-in `--agent` presets: agy, claude, codex, cursor, dsh, gemini, opencode, copilot, kimi, qwen, pi, hermes, glm, zcode, trae.
 Options: --json (default when piped except read/file read/exec), -V --version, --licenses.
 Per command: h2 <command> --help
-Settings: ~/.config/herdr2/config.toml (default_permissions, inject_mcp, [agents]).
+Settings: ~/.config/herdr2/config.toml (Windows: %APPDATA%\herdr2\config.toml) (default_permissions, inject_mcp, [agents]).
 Agent manual: h2 --skill

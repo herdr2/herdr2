@@ -538,6 +538,11 @@ pub struct InputBaseState<M: InputModeKind> {
             ) -> bool,
         >,
     >,
+    /// HERDR: Optional synchronous interceptor run before completion-conflicting
+    /// built-in actions (`tab`, `shift-tab`, `enter`, `up`, `down`, `escape`).
+    pub(super) before_key_handler: Option<
+        Rc<dyn Fn(&InputBeforeKeyEvent, &mut Window, &mut App) -> bool>,
+    >,
 
     /// A flag to indicate if we have a pending update to the text.
     ///
@@ -871,6 +876,7 @@ impl<M: InputModeKind> InputBaseState<M> {
             enable_context_menu: true,
             completion_inserting: false,
             overlay_action_handler: None,
+            before_key_handler: None,
             silent_replace_text: false,
             emit_events: true,
             _subscriptions,
@@ -1257,6 +1263,17 @@ impl<M: InputModeKind> InputBaseState<M> {
     pub fn set_submit_on_enter(&mut self, submit: bool, cx: &mut Context<Self>) {
         self.submit_on_enter = submit;
         cx.notify();
+    }
+
+    /// HERDR: Register a synchronous key interceptor run before the input's
+    /// built-in completion-conflicting actions (`tab`, `shift-tab`, `enter`,
+    /// `up`, `down`, `escape`). Returning `true` consumes the action without
+    /// editing text or letting outer `Tab` bindings steal focus.
+    pub fn set_before_key_handler(
+        &mut self,
+        handler: Option<Rc<dyn Fn(&InputBeforeKeyEvent, &mut Window, &mut App) -> bool>>,
+    ) {
+        self.before_key_handler = handler;
     }
 
     /// Set whether to show whitespace characters.
@@ -4590,6 +4607,30 @@ impl<M: InputModeKind> EntityInputHandler for InputBaseState<M> {
     }
 }
 
+/// HERDR: Action-level key metadata passed to [`InputBaseState::set_before_key_handler`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InputBeforeKeyEvent {
+    pub key: &'static str,
+    pub shift: bool,
+    pub secondary: bool,
+}
+
+fn run_before_key<M: InputModeKind>(
+    entity: &Entity<InputBaseState<M>>,
+    event: InputBeforeKeyEvent,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    let handler = {
+        let state = entity.read(cx);
+        if state.ime_marked_range.is_some() {
+            return false;
+        }
+        state.before_key_handler.clone()
+    };
+    handler.is_some_and(|handler| handler(&event, window, cx))
+}
+
 impl<M: InputModeKind> Focusable for InputBaseState<M> {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -4635,17 +4676,93 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
                     .on_action(window.listener_for(&entity, InputBaseState::delete_to_end_of_line))
                     .on_action(window.listener_for(&entity, InputBaseState::delete_previous_word))
                     .on_action(window.listener_for(&entity, InputBaseState::delete_next_word))
-                    .on_action(window.listener_for(&entity, InputBaseState::enter))
-                    .on_action(window.listener_for(&entity, InputBaseState::escape))
+                    .on_action({
+                        let entity = entity.clone();
+                        move |action: &Enter, window, cx| {
+                            if run_before_key(
+                                &entity,
+                                InputBeforeKeyEvent {
+                                    key: "enter",
+                                    shift: action.shift,
+                                    secondary: action.secondary,
+                                },
+                                window,
+                                cx,
+                            ) {
+                                cx.stop_propagation();
+                                return;
+                            }
+                            entity.update(cx, |state, cx| state.enter(action, window, cx));
+                        }
+                    })
+                    .on_action({
+                        let entity = entity.clone();
+                        move |action: &Escape, window, cx| {
+                            if run_before_key(
+                                &entity,
+                                InputBeforeKeyEvent {
+                                    key: "escape",
+                                    shift: false,
+                                    secondary: false,
+                                },
+                                window,
+                                cx,
+                            ) {
+                                cx.stop_propagation();
+                                return;
+                            }
+                            entity.update(cx, |state, cx| state.escape(action, window, cx));
+                        }
+                    })
                     .on_action(window.listener_for(&entity, InputBaseState::paste))
                     .on_action(window.listener_for(&entity, InputBaseState::cut))
                     .on_action(window.listener_for(&entity, InputBaseState::undo))
                     .on_action(window.listener_for(&entity, InputBaseState::redo))
                     .when(self.is_multi_line(), |this| {
-                        this.on_action(window.listener_for(&entity, InputBaseState::indent_inline))
-                            .on_action(window.listener_for(&entity, InputBaseState::outdent_inline))
-                            .on_action(window.listener_for(&entity, InputBaseState::indent_block))
-                            .on_action(window.listener_for(&entity, InputBaseState::outdent_block))
+                        this.on_action({
+                            let entity = entity.clone();
+                            move |action: &IndentInline, window, cx| {
+                                if run_before_key(
+                                    &entity,
+                                    InputBeforeKeyEvent {
+                                        key: "tab",
+                                        shift: false,
+                                        secondary: false,
+                                    },
+                                    window,
+                                    cx,
+                                ) {
+                                    cx.stop_propagation();
+                                    return;
+                                }
+                                entity.update(cx, |state, cx| {
+                                    state.indent_inline(action, window, cx)
+                                });
+                            }
+                        })
+                        .on_action({
+                            let entity = entity.clone();
+                            move |action: &OutdentInline, window, cx| {
+                                if run_before_key(
+                                    &entity,
+                                    InputBeforeKeyEvent {
+                                        key: "tab",
+                                        shift: true,
+                                        secondary: false,
+                                    },
+                                    window,
+                                    cx,
+                                ) {
+                                    cx.stop_propagation();
+                                    return;
+                                }
+                                entity.update(cx, |state, cx| {
+                                    state.outdent_inline(action, window, cx)
+                                });
+                            }
+                        })
+                        .on_action(window.listener_for(&entity, InputBaseState::indent_block))
+                        .on_action(window.listener_for(&entity, InputBaseState::outdent_block))
                     })
             })
             .on_action(window.listener_for(&entity, InputBaseState::left))
@@ -4653,8 +4770,44 @@ impl<M: InputModeKind> Render for InputBaseState<M> {
             .on_action(window.listener_for(&entity, InputBaseState::select_left))
             .on_action(window.listener_for(&entity, InputBaseState::select_right))
             .when(self.is_multi_line(), |this| {
-                this.on_action(window.listener_for(&entity, InputBaseState::up))
-                    .on_action(window.listener_for(&entity, InputBaseState::down))
+                this.on_action({
+                    let entity = entity.clone();
+                    move |action: &MoveUp, window, cx| {
+                        if run_before_key(
+                            &entity,
+                            InputBeforeKeyEvent {
+                                key: "up",
+                                shift: false,
+                                secondary: false,
+                            },
+                            window,
+                            cx,
+                        ) {
+                            cx.stop_propagation();
+                            return;
+                        }
+                        entity.update(cx, |state, cx| state.up(action, window, cx));
+                    }
+                })
+                .on_action({
+                    let entity = entity.clone();
+                    move |action: &MoveDown, window, cx| {
+                        if run_before_key(
+                            &entity,
+                            InputBeforeKeyEvent {
+                                key: "down",
+                                shift: false,
+                                secondary: false,
+                            },
+                            window,
+                            cx,
+                        ) {
+                            cx.stop_propagation();
+                            return;
+                        }
+                        entity.update(cx, |state, cx| state.down(action, window, cx));
+                    }
+                })
                     .on_action(window.listener_for(&entity, InputBaseState::select_up))
                     .on_action(window.listener_for(&entity, InputBaseState::select_down))
                     .on_action(window.listener_for(&entity, InputBaseState::page_up))

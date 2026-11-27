@@ -334,7 +334,10 @@ fn authorize_request(
 ) -> Result<(), ApiErr> {
     let segs: Vec<&str> = segments.iter().map(String::as_str).collect();
     let is_worker_post = method == "POST"
-        && matches!(segs.as_slice(), ["api", "worker", "context" | "ask" | "note" | "done" | "inbox" | "read"]);
+        && matches!(
+            segs.as_slice(),
+            ["api", "worker", "context" | "ask" | "note" | "done" | "inbox" | "read" | "contract"]
+        );
 
     if header(headers, "x-drove-worker-token", "x-co-worker-token").is_some() {
         if !is_worker_post {
@@ -718,7 +721,8 @@ async fn dispatch_http_inner(
             Ok(json!(reply))
         }
         ("POST", ["api", "tasks", id, "retry"]) => retry_task_http(&core, id, &body).await,
-        ("POST", ["api", "tasks", id, "cancel"]) => cancel_task_http(&core, id).await,
+        ("PATCH", ["api", "tasks", id]) => edit_task_http(&core, id, &body).await,
+        ("POST", ["api", "tasks", id, "cancel"]) => cancel_task_http(&core, id, &body).await,
         ("POST", ["api", "tasks", id, "send"]) => send_task_http(&core, id, &body).await,
         ("GET", ["api", "tasks", id, "inspect"]) => {
             let tail = query.get("tail").and_then(|s| s.parse::<usize>().ok()).unwrap_or(30).clamp(1, 200);
@@ -741,13 +745,22 @@ async fn dispatch_http_inner(
         ("POST", ["api", "worker", "ask"]) => worker_ask_http(&core, &req.headers, &body).await,
         ("POST", ["api", "worker", "note"]) => worker_note_http(&core.drove, &req.headers, &body),
         ("POST", ["api", "worker", "read"]) => worker_read_http(&core.drove, &req.headers, &body),
+        ("POST", ["api", "worker", "contract"]) => worker_contract_http(&core.drove, &req.headers, &body),
         ("POST", ["api", "worker", "done"]) => worker_done_http(&core, &req.headers, &body).await,
         ("PUT", ["api", "tasks", id, "assign"]) => {
             let task = core.drove.store.get_task(id).ok_or_else(|| ApiErr::new(404, "not_found", "Task not found"))?;
+            if body["inPlace"].as_bool() == Some(true) && task.status == TaskStatus::Running {
+                let model = body["model"].as_str().map(str::trim).filter(|s| !s.is_empty()).map(String::from);
+                let effort: Option<Effort> =
+                    body.get("effort").filter(|v| !v.is_null()).and_then(|v| serde_json::from_value(v.clone()).ok());
+                return super::pool::switch_running_task_model_in_place(core, &task, model, effort)
+                    .await
+                    .map_err(|msg| ApiErr::new(409, "in_place_switch_failed", msg));
+            }
             if !matches!(task.status, TaskStatus::Pending | TaskStatus::Ready)
                 || !core.drove.store.list_attempts(None, Some(&task.id), None).is_empty()
             {
-                return Err(ApiErr::new(409, "invalid_state", "task has already started"));
+                return Err(ApiErr::new(409, "invalid_state", "task has already started (pass --in-place to switch a running worker's model)"));
             }
             let mut assign: Assign =
                 serde_json::from_value(body).map_err(|e| ApiErr::new(400, "invalid_field", e.to_string()))?;
@@ -836,12 +849,18 @@ fn patch_run_http(
 ) -> Result<Value, ApiErr> {
     let run = drove.store.get_run(id).ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
     let obj = body.as_object().ok_or_else(|| ApiErr::new(400, "bad_request", "body must be an object"))?;
-    if !internal_admin && (obj.contains_key("verify") || obj.contains_key("goal")) {
+    if !internal_admin
+        && (obj.contains_key("verify")
+            || obj.contains_key("goal")
+            || obj.contains_key("budget")
+            || obj.contains_key("maxConcurrency"))
+    {
         let sec = header(headers, "x-drove-coordinator-secret", "x-co-coordinator-secret").unwrap_or("");
         if !crypto::secure_eq(sec, &drove.coordinator_secret) {
             return Err(ApiErr::new(401, "unauthorized", "missing coordinator secret"));
         }
     }
+    let mut budget_updated = false;
     let updated = drove.store.update_run(&run.id, |r| {
         if let Some(name_val) = obj.get("name") {
             if let Some(s) = name_val.as_str() {
@@ -865,7 +884,24 @@ fn patch_run_http(
                 r.goal = Some(parsed);
             }
         }
+        if let Some(b) = obj.get("budget") {
+            budget_updated = true;
+            if b.is_null() {
+                r.budget = None;
+            } else if let Ok(parsed) = serde_json::from_value(b.clone()) {
+                r.budget = Some(parsed);
+            }
+        }
+        if let Some(mc) = obj.get("maxConcurrency").and_then(Value::as_u64)
+            && (1..=16).contains(&mc)
+        {
+            r.max_concurrency = mc as u32;
+        }
     });
+    if budget_updated {
+        drove.clear_budget_state(&run.id);
+    }
+    drove.wake_scheduler();
     Ok(json!(updated))
 }
 
@@ -960,10 +996,20 @@ fn resume_run_http(drove: &DroveRuntime, id: &str) -> Result<Value, ApiErr> {
     if run.trashed_at.is_some() || run.status != RunStatus::Paused {
         return Err(ApiErr::new(409, "invalid_state", "Run is not paused"));
     }
+    if run.pause_reason.as_deref() == Some("budget_exceeded") {
+        let (toks, cost) = super::scheduler::compute_run_usage(&drove.store, &run);
+        drove.ack_budget_pause(&run.id, toks, cost);
+        for msg in drove.store.list_messages(&run.id, Some(true), true, None) {
+            if msg.kind == MessageType::Budget {
+                let _ = drove.store.mark_handled(&msg.id);
+            }
+        }
+    }
     let updated = drove.store.update_run(id, |r| {
         r.status = RunStatus::Active;
         r.pause_reason = None;
     });
+    drove.wake_scheduler();
     Ok(json!(updated))
 }
 
@@ -1266,6 +1312,7 @@ async fn build_snapshot(core: &Arc<Core>, id: &str) -> Result<Value, ApiErr> {
     let attempt_cost: f64 = attempts.iter().map(|a| a.cost.unwrap_or(0.0)).sum();
     let ai_tokens = run.ai_usage.as_ref().map(|u| u.input_tokens + u.output_tokens).unwrap_or(0);
     let ai_cost = run.ai_usage.as_ref().map(|u| u.cost).unwrap_or(0.0);
+    let contracts = core.drove.store.list_contracts(id, None);
     let snap = RunSnapshot {
         run,
         tasks,
@@ -1282,6 +1329,7 @@ async fn build_snapshot(core: &Arc<Core>, id: &str) -> Result<Value, ApiErr> {
             ai_cost: (ai_cost > 0.0).then_some(ai_cost),
         },
         stalls: Some(Vec::new()),
+        contracts: (!contracts.is_empty()).then_some(contracts),
     };
     Ok(json!(snap))
 }

@@ -21,6 +21,7 @@ pub const BUILTIN_PRESETS: &[(&str, &[&str])] = &[
     ("hermes", &["hermes-acp"]),
     ("glm", &["glm-acp-agent"]),
     ("zcode", &["zcode-acp-server"]),
+    ("trae", &["traecli", "--acp"]),
 ];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -986,6 +987,14 @@ pub(crate) fn resolve_in_npx_cache(
     best.map(|(_, path)| path)
 }
 
+fn fallback_acp_binaries(preset_id: Option<&str>, program: &str) -> &'static [&'static str] {
+    let base = program.rsplit(['/', '\\']).next().unwrap_or(program).to_ascii_lowercase();
+    match (preset_id, base.as_str()) {
+        (Some("trae"), "traecli") | (_, "traecli") => &["traex", "trae-cli"],
+        _ => &[],
+    }
+}
+
 fn companion_npx_adapter(preset_id: Option<&str>, program: &str) -> Option<(&'static str, &'static str)> {
     let base = program.rsplit(['/', '\\']).next().unwrap_or(program).to_ascii_lowercase();
     match (preset_id, base.as_str()) {
@@ -1011,6 +1020,15 @@ pub(crate) fn resolve_acp_command_in_env(
 
     if let Some(found) = resolve_non_shim_binary_in_path(first, path_override, pathext_override) {
         return Some((found, argv.to_vec()));
+    }
+
+    for alt in fallback_acp_binaries(preset_id, first) {
+        if let Some(found) = resolve_non_shim_binary_in_path(alt, path_override, pathext_override) {
+            let mut effective = Vec::with_capacity(argv.len());
+            effective.push(found.display().to_string());
+            effective.extend(argv[1..].iter().cloned());
+            return Some((found, effective));
+        }
     }
 
     if let Some(managed) = crate::acp::adapters::resolve_managed_binary_in_env(preset_id, first, env) {
@@ -1076,6 +1094,11 @@ mod tests {
         let g = resolve(Some("gemini"), &[], Some("hi".into()), &BTreeMap::new()).unwrap();
         assert_eq!(g.argv, ["gemini", "--acp"]);
         assert_eq!(g.prompt.as_deref(), Some("hi"));
+
+        let t = resolve(Some("trae"), &[], None, &BTreeMap::new()).unwrap();
+        assert_eq!(t.preset.as_deref(), Some("trae"));
+        assert_eq!(t.argv, ["traecli", "--acp"]);
+        assert_eq!(fallback_acp_binaries(Some("trae"), "traecli"), &["traex", "trae-cli"]);
     }
 
     #[test]

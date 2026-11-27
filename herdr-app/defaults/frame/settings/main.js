@@ -22,6 +22,7 @@ const SECTIONS = () => [
   { id: "keyboard", title: "Shortcuts", zh: "快捷键", icon: "keyboard" },
   { id: "machines", title: "Machines", zh: "主机", icon: "server" },
   { id: "ai", title: "AI", zh: "AI 助手", icon: "sparkles" },
+  { id: "agents", title: "Agents & ACP", zh: "智能体与 ACP", icon: "bot" },
   { id: "drove", title: "Drove", zh: "Drove", icon: "layers" },
   { id: "skills", title: "Skills", zh: "Skills", icon: "sparkles" },
   { id: "alerts", title: "Alerts", zh: "提醒", icon: "bell" },
@@ -112,6 +113,7 @@ const DROVE_AGENT_ICONS = {
   hermes: { path: "icons/hermes.svg", tint: true },
   pi: { path: "icons/pi.svg", tint: true },
   zcode: { path: "icons/zcode.svg", tint: true },
+  trae: { path: "icons/trae.svg", tint: true },
   glm: { path: "icons/agent.svg", tint: true },
 };
 
@@ -199,6 +201,12 @@ export default class Settings extends View {
     this.droveProbePromise = null;
     this.adapterStatus = null;
     this.adapterBusy = false;
+    this.adapterConfigSaving = false;
+    this.adapterError = null;
+    this.agentShowMissing = false;
+    this.adapterRegistryUrlInput = InputState.new({
+      placeholder: "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json",
+    });
     this.droveAutoProbed = {};
     this.droveProbeAgentLaunching = false;
     this.droveProbeFixOpen = false;
@@ -339,6 +347,11 @@ export default class Settings extends View {
         if (this.section === "machines" || this.section === "updates") await this.loadMachines();
         if (this.section === "ai") {
           await Promise.all([this.loadMachines(), this.loadAi()]);
+        }
+        if (this.section === "agents") {
+          await Promise.all([this.loadMachines(), this.loadDrove()]);
+          this.loadDroveFixKnownAgents(cx);
+          this.maybeAutoProbeDrove(cx);
         }
         if (this.section === "drove") {
           await Promise.all([this.loadMachines(), this.loadAi(), this.loadDrove()]);
@@ -1789,16 +1802,23 @@ export default class Settings extends View {
     });
   }
 
+  syncAdapterInputs(status) {
+    if (!this.adapterRegistryUrlInput) return;
+    this.adapterRegistryUrlInput.set_value(status?.custom_registry_url ?? "");
+  }
+
   async loadDrove() {
     if (this.droveLoading || (typeof checking === "function" && checking())) return;
     this.droveLoading = true;
     this.droveError = null;
+    this.adapterError = null;
     try {
       const data = await this.droveHcJson(["drove", "settings"], { timeout: 60000 });
       this.droveData = data;
       this.syncDroveInputs(data);
       try {
         this.adapterStatus = await this.droveHcJson(["adapter", "status"], { timeout: 15000 });
+        this.syncAdapterInputs(this.adapterStatus);
       } catch {}
     } catch (e) {
       this.droveError = String(e?.message ?? e);
@@ -1844,6 +1864,7 @@ export default class Settings extends View {
         else await this.loadDrove();
         try {
           this.adapterStatus = await this.droveHcJson(["adapter", "status"], { timeout: 15000 });
+          this.syncAdapterInputs(this.adapterStatus);
         } catch {}
         this.droveAutoProbed = { ...(this.droveAutoProbed ?? {}), [key]: true };
         return true;
@@ -1869,15 +1890,119 @@ export default class Settings extends View {
     });
   }
 
-  runAdapterAction(cx, mode) {
+  refreshAgentsDetection(cx) {
+    this.loadDroveFixKnownAgents(cx);
+    this.probeDroveAgents(cx);
+  }
+
+  selectTargetMachine(value, cx) {
+    this.droveMachine = value;
+    this.droveData = null;
+    this.droveProbePromise = null;
+    this.adapterStatus = null;
+    this.adapterError = null;
+    this.picking = null;
+    this.droveModelSubmit = null;
+    this.droveStrengthSubmit = null;
+    this.droveTestResult = null;
+    this.droveAiConfigResult = null;
+    this.droveRolesBackup = null;
+    this.droveAiConfigMode = null;
+    this.droveMagpieResult = null;
+    this.droveProbeFixOpen = false;
+    this.droveProbeFixAgent = null;
+    this.droveProbeFixModel = null;
+    this.droveProbeFixEffort = null;
+    this.syncAdapterInputs(null);
+    cx.spawn(async (cx) => {
+      await this.loadDrove();
+      if (this.section === "agents") {
+        this.loadDroveFixKnownAgents(cx);
+      }
+      this.maybeAutoProbeDrove(cx);
+      cx.notify();
+    });
+  }
+
+  openAgentsSection(cx) {
+    if (this.recordingTarget) this.cancelRecordingShortcut(null);
+    this.section = "agents";
+    this.picking = null;
+    this.machineEdit = null;
+    this.handle?.focus?.();
+    cx.spawn(async (cx) => {
+      if (this.machineList === null) await this.loadMachines();
+      if (!this.droveData || !this.adapterStatus) await this.loadDrove();
+      this.loadDroveFixKnownAgents(cx);
+      this.maybeAutoProbeDrove(cx);
+      cx.notify();
+    });
+    cx.notify();
+  }
+
+  saveAcpConfig(patch, cx) {
+    if (this.adapterConfigSaving || (typeof checking === "function" && checking())) return;
+    const targetMachine = this.droveMachine;
+    const args = ["adapter", "config"];
+    if ("autoInstall" in patch) {
+      args.push("--auto-install", patch.autoInstall ? "true" : "false");
+    }
+    if ("registryUrl" in patch) {
+      const trimmed = String(patch.registryUrl ?? "").trim();
+      if (trimmed) args.push("--registry-url", trimmed);
+      else args.push("--clear-registry-url");
+    }
+    if ("defaultPermissions" in patch && patch.defaultPermissions) {
+      args.push("--default-permissions", String(patch.defaultPermissions));
+    }
+    if ("injectMcp" in patch) {
+      args.push("--inject-mcp", patch.injectMcp ? "true" : "false");
+    }
+    if (args.length <= 2) return;
+    this.adapterConfigSaving = true;
+    this.adapterError = null;
+    cx?.notify?.();
+    cx.spawn(async (cx) => {
+      try {
+        const res = await this.droveHcJson(args, { timeout: 20000 });
+        if (this.droveMachine !== targetMachine) return;
+        if (res) {
+          this.adapterStatus = res;
+          this.syncAdapterInputs(res);
+        }
+      } catch (e) {
+        if (this.droveMachine === targetMachine) {
+          this.adapterError = String(e?.message ?? e);
+          notify({
+            title: this.tr("ACP configuration not saved", "ACP 配置保存失败"),
+            body: this.adapterError,
+            level: "error",
+          });
+        }
+      } finally {
+        this.adapterConfigSaving = false;
+        cx?.notify?.();
+      }
+    });
+  }
+
+  runAdapterAction(cx, mode, presetId = null) {
     if (this.adapterBusy || (typeof checking === "function" && checking())) return;
     const targetMachine = this.droveMachine;
-    this.adapterBusy = true;
+    this.adapterBusy = presetId ? `${mode}:${presetId}` : mode;
     this.droveError = null;
+    this.adapterError = null;
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const args = mode === "update" ? ["adapter", "update"] : ["adapter", "install", "--detected"];
+        let args;
+        if (mode === "update") {
+          args = presetId ? ["adapter", "update", presetId] : ["adapter", "update"];
+        } else if (mode === "install-all") {
+          args = ["adapter", "install", "--all"];
+        } else {
+          args = presetId ? ["adapter", "install", presetId] : ["adapter", "install", "--detected"];
+        }
         const res = await this.droveHcJson(args, { timeout: 240000 });
         if (this.droveMachine !== targetMachine) return;
         const results = Array.isArray(res?.results) ? res.results : [];
@@ -1898,11 +2023,12 @@ export default class Settings extends View {
         }
         try {
           this.adapterStatus = await this.droveHcJson(["adapter", "status"], { timeout: 15000 });
+          this.syncAdapterInputs(this.adapterStatus);
         } catch {}
         await this.runDroveProbe(cx);
       } catch (e) {
         if (this.droveMachine === targetMachine) {
-          this.droveError = String(e?.message ?? e);
+          this.adapterError = String(e?.message ?? e);
         }
       } finally {
         this.adapterBusy = false;
@@ -2376,8 +2502,8 @@ export default class Settings extends View {
         notify({
           title: this.tr(`Launched ${picked.name}${metaEn} to troubleshoot`, `已启动 ${picked.name}${metaZh} 协助排查`),
           body: this.tr(
-            "After fixing, return to Settings -> Drove and click Refresh Agents.",
-            "处理完成后，返回「设置 → Drove」点击「刷新检测」即可验证。",
+            "After fixing, return to Settings -> Agents & ACP and click Refresh Detection.",
+            "处理完成后，返回「设置 → 智能体与 ACP」点击「刷新检测」即可验证。",
           ),
         });
       } catch (e) {
@@ -4983,6 +5109,1182 @@ export default class Settings extends View {
       );
   }
 
+  detectedAgentRows() {
+    const machineKey = this.droveMachine ?? "__local__";
+    const knownList = Array.isArray(this.droveFixKnownAgents?.[machineKey])
+      ? this.droveFixKnownAgents[machineKey]
+      : [];
+    const probedList = Array.isArray(this.droveData?.agents?.agents)
+      ? this.droveData.agents.agents
+      : [];
+    const adapterList = Array.isArray(this.adapterStatus?.adapters)
+      ? this.adapterStatus.adapters
+      : [];
+    const displayNames = {
+      claude: "Claude Code",
+      codex: "Codex",
+      agy: "Antigravity",
+      cursor: "Cursor",
+      gemini: "Gemini CLI",
+      opencode: "OpenCode",
+      pi: "Pi",
+      kimi: "Kimi",
+      copilot: "GitHub Copilot",
+      hermes: "Hermes",
+      zcode: "ZCode",
+      trae: "TRAE CLI",
+      qwen: "Qwen Code",
+      qoder: "Qoder",
+      glm: "GLM",
+      dsh: "DSH",
+      kiro: "Kiro",
+      amp: "Amp",
+      grok: "Grok",
+    };
+    const prefOrder = [
+      "claude", "codex", "agy", "cursor", "gemini", "opencode", "pi",
+      "kimi", "copilot", "hermes", "zcode", "trae", "qwen", "glm", "dsh", "qoder", "kiro", "amp", "grok",
+    ];
+    const byId = new Map();
+    const ensure = (rawId) => {
+      const id = this.canonicalFixAgentId(rawId);
+      if (!id) return null;
+      let rec = byId.get(id);
+      if (!rec) {
+        rec = {
+          id,
+          name: displayNames[id] ?? id,
+          cliInstalled: false,
+          cliRun: null,
+          acpSupported: false,
+          acpInstalled: false,
+          acpError: null,
+          models: [],
+          command: null,
+          path: null,
+          adapter: null,
+        };
+        byId.set(id, rec);
+      }
+      return rec;
+    };
+
+    for (const p of knownList) {
+      const rec = ensure(p?.key);
+      if (!rec) continue;
+      if (p?.name) rec.name = p.name;
+      if (p?.installed) rec.cliInstalled = true;
+      if (Array.isArray(p?.run) && p.run.length > 0) rec.cliRun = p.run;
+    }
+
+    for (const a of probedList) {
+      const rec = ensure(a?.id);
+      if (!rec) continue;
+      rec.acpSupported = true;
+      if (a?.installed) rec.acpInstalled = true;
+      const err = this.agentProbeError(a);
+      if (err) rec.acpError = err;
+      const models = this.probedModelsFromList(probedList, a.id);
+      if (models.length > rec.models.length) rec.models = models;
+      if (Array.isArray(a?.command) && a.command.length > 0) rec.command = a.command;
+      if (a?.path) rec.path = a.path;
+    }
+
+    for (const ad of adapterList) {
+      const rec = ensure(ad?.preset_id);
+      if (!rec) continue;
+      rec.acpSupported = true;
+      rec.adapter = ad;
+      if (ad?.companion_installed) rec.cliInstalled = true;
+      if (ad?.installed) rec.acpInstalled = true;
+      if (!rec.path && ad?.path) rec.path = ad.path;
+    }
+
+    const rank = (id) => {
+      const i = prefOrder.indexOf(id);
+      return i === -1 ? 99 : i;
+    };
+    const group = (r) => {
+      if (r.acpReady) return 0;
+      if (r.acpError) return 1;
+      if (r.adapterMissing) return 2;
+      if (r.cliInstalled || r.acpInstalled) return 3;
+      return 4;
+    };
+
+    return [...byId.values()]
+      .map((r) => {
+        const adapterMissing = Boolean(r.adapter && r.adapter.companion_installed && !r.adapter.installed && r.adapter.state !== "installing");
+        const acpReady = Boolean(r.acpInstalled && !r.acpError);
+        const anyInstalled = Boolean(r.cliInstalled || r.acpInstalled || r.adapter?.state === "installing");
+        return { ...r, adapterMissing, acpReady, anyInstalled };
+      })
+      .sort((a, b) => {
+        const ga = group(a);
+        const gb = group(b);
+        if (ga !== gb) return ga - gb;
+        const ra = rank(a.id);
+        const rb = rank(b.id);
+        if (ra !== rb) return ra - rb;
+        return a.id.localeCompare(b.id);
+      });
+  }
+
+  renderProbeErrorCard(t, cx, errorAgents) {
+    return v_flex()
+      .id("st-dr-agent-errors")
+      .w_full()
+      .px(12)
+      .py(10)
+      .gap(8)
+      .rounded(8)
+      .border_1()
+      .border_color(t.blocked)
+      .bg(t.surface)
+      .child(
+        h_flex()
+          .w_full()
+          .items_center()
+          .justify_between()
+          .gap(8)
+          .flex_wrap()
+          .child(
+            div()
+              .text_size(12)
+              .font_semibold()
+              .text_color(t.blocked)
+              .child(
+                this.tr(
+                  `Detected ${errorAgents.length} agent probe error${errorAgents.length > 1 ? "s" : ""}`,
+                  `刷新检测到 ${errorAgents.length} 个 Agent 异常`,
+                ),
+              ),
+          )
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .flex_wrap()
+              .child(
+                (() => {
+                  const fixOpen = Boolean(this.droveProbeFixOpen);
+                  return h_flex()
+                    .id("st-dr-probe-agent-fix-btn")
+                    .px(9)
+                    .py(4)
+                    .gap(5)
+                    .rounded(6)
+                    .border_1()
+                    .border_color(fixOpen ? t.accent : t.border)
+                    .bg(fixOpen ? t.accent : t.raised)
+                    .items_center()
+                    .text_size(11.5)
+                    .when(fixOpen, (b) => b.font_semibold())
+                    .text_color(fixOpen ? t.accent_foreground : t.foreground)
+                    .when(this.droveProbeAgentLaunching, (b) => b.opacity(0.6))
+                    .when(!this.droveProbeAgentLaunching, (b) =>
+                      b
+                        .cursor_pointer()
+                        .when(!fixOpen, (b2) => b2.hover((s) => s.bg(t.hover)))
+                        .when(fixOpen, (b2) => b2.hover((s) => s.opacity(0.92)))
+                        .on_click((_e, cx) => this.toggleDroveProbeFixPanel(cx)),
+                    )
+                    .tooltip(
+                      this.tr(
+                        "Choose an AI coding agent, model, and reasoning effort to explain error causes, propose a fix plan, and repair after your confirmation",
+                        "选择要启动的 Agent 类型、模型与思考强度，在工作区标签页先解读错误原因并制定修复方案，待你确认后再开始修复",
+                      ),
+                    )
+                    .when(this.droveProbeAgentLaunching, (b) =>
+                      b.child(
+                        svg("mods/workspace-chrome/spinner.svg")
+                          .size(11)
+                          .text_color(fixOpen ? t.accent_foreground : t.foreground)
+                          .spin(900),
+                      ),
+                    )
+                    .child(
+                      this.droveProbeAgentLaunching
+                        ? this.tr("Launching…", "启动中…")
+                        : this.tr("Fix with Agent", "用 Agent 排查处理"),
+                    );
+                })(),
+              ),
+          ),
+      )
+      .children(
+        errorAgents.map((a) => {
+          const rawErr = this.agentProbeError(a) ?? "";
+          const shortErr = this.formatAgentProbeError(rawErr);
+          return h_flex()
+            .id(`st-dr-agent-err-${a.id}`)
+            .w_full()
+            .gap(8)
+            .items_center()
+            .tooltip(rawErr)
+            .child(
+              h_flex()
+                .w(104)
+                .flex_none()
+                .gap(6)
+                .items_center()
+                .child(this.agentIconEl(t, a.id, 13))
+                .child(div().w(6).h(6).rounded(3).flex_none().bg(t.blocked))
+                .child(div().truncate().text_size(12).font_semibold().text_color(t.foreground).child(a.id)),
+            )
+            .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.muted).child(shortErr));
+        }),
+      )
+      .when(Boolean(this.droveProbeFixOpen), (box) => {
+        const sel = this.ensureDroveFixSelection();
+        const curAgent = sel.agent ?? "";
+        const curOpt = sel.option;
+        const curModel = sel.model;
+        const curEffort = sel.effort;
+        const effortDisabledReason = sel.disabledReason;
+        const disableEffort = Boolean(effortDisabledReason);
+        const isZcode = curAgent === "zcode";
+        const agentItems = sel.options.map((o) => ({
+          value: o.id,
+          label: o.name && o.name !== o.id ? `${o.name} (${o.id})` : o.id,
+          icon: o.id,
+          dot: Boolean(o.installed),
+          dotColor: !o.installed ? t.dim : o.probeError ? t.working : t.ansi2,
+          meta: !o.installed
+            ? this.tr("missing", "未安装")
+            : o.probeError
+              ? this.tr("ACP err · CLI", "ACP 异常 · CLI")
+              : o.models.length > 0
+                ? `${o.models.length} ${this.tr("models", "模型")}`
+                : "✓",
+          metaColor: o.probeError ? t.working : t.dim,
+          tooltip: o.probeError ? this.formatAgentProbeError(o.probeError) : undefined,
+          active: curAgent === o.id,
+        }));
+        const models = curOpt?.models?.length ? curOpt.models : (curAgent ? this.probedModelsFor(curAgent) : []);
+        const modelItems = [
+          { value: null, label: this.tr("Auto (agent default)", "自动（Agent 默认）"), active: !curModel },
+          ...models.map((m) => ({
+            value: m.id,
+            label: m.label,
+            active: curModel === m.id,
+          })),
+        ];
+        if (curModel && !models.some((m) => m.id === curModel)) {
+          modelItems.splice(1, 0, {
+            value: curModel,
+            label: curModel,
+            meta: this.tr("custom", "自定义"),
+            active: true,
+          });
+        }
+        const efforts = curAgent ? this.supportedEffortsFor(curAgent, curModel) : ["low", "medium", "high"];
+        const effortChoices = [null, ...efforts];
+        const canLaunch = Boolean(curOpt && !this.droveProbeAgentLaunching);
+        const footerHint = isZcode
+          ? this.tr(
+              "Note: ZCode ignores startup --model/--effort flags; select model inside its TUI.",
+              "提示：ZCode 不支持启动参数传入模型与思考强度，进入后需在 TUI 内切换。",
+            )
+          : curAgent === "cursor" && !curModel
+            ? this.tr(
+                "Tip: Select a specific Cursor model to apply custom reasoning effort.",
+                "提示：Cursor 需先指定具体模型才能生效自定义思考强度。",
+              )
+            : curOpt?.probeError
+              ? this.tr(
+                  "ACP probe errored for this agent, but its interactive CLI can still run in your terminal.",
+                  "该 Agent 的 ACP 探测有异常，但在交互式终端中仍可直接启动排查。",
+                )
+              : this.tr(
+                  "Will launch an interactive agent to explain error causes and propose a fix plan first, and wait for your confirmation before making changes.",
+                  "将在目标主机工作区标签页启动交互式 Agent，先解读错误原因并制定修复方案，待你确认后再开始修复。",
+                );
+        return box.child(
+          v_flex()
+            .id("st-dr-probe-fix-panel")
+            .w_full()
+            .mt(2)
+            .px(10)
+            .py(9)
+            .gap(8)
+            .rounded(7)
+            .border_1()
+            .border_color(t.accent)
+            .bg(t.background)
+            .child(
+              h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap(8)
+                .child(
+                  div()
+                    .text_size(11.8)
+                    .font_semibold()
+                    .text_color(t.foreground)
+                    .child(
+                      this.tr(
+                        "Fix with Agent · Choose Agent, Model & Reasoning Effort",
+                        "用 Agent 排查处理 · 选择 Agent 类型、模型与思考强度",
+                      ),
+                    ),
+                )
+                .child(
+                  div()
+                    .id("st-dr-probe-fix-close")
+                    .px(6)
+                    .py(1)
+                    .rounded(4)
+                    .cursor_pointer()
+                    .text_size(12)
+                    .text_color(t.dim)
+                    .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                    .on_click((_e, cx) => this.toggleDroveProbeFixPanel(cx))
+                    .child("×"),
+                ),
+            )
+            .child(
+              h_flex()
+                .w_full()
+                .gap(6)
+                .items_center()
+                .flex_wrap()
+                .child(
+                  this.drovePicker(
+                    t,
+                    "probe-fix-agent",
+                    curOpt ? (curOpt.name || curOpt.id) : this.tr("Select agent…", "选择 Agent…"),
+                    agentItems,
+                    (agent, cx) => this.setDroveProbeFixAgent(agent, cx),
+                    {
+                      width: 148,
+                      popupWidth: 290,
+                      icon: curAgent || undefined,
+                      dot: curOpt ? Boolean(curOpt.installed) : undefined,
+                      dotColor: !curOpt ? undefined : !curOpt.installed ? t.dim : curOpt.probeError ? t.working : t.ansi2,
+                      tooltip: this.tr("Choose which CLI agent to launch", "选择用于排查分析与修复的 Agent 类型"),
+                    },
+                    cx,
+                  ),
+                )
+                .child(
+                  this.drovePicker(
+                    t,
+                    "probe-fix-model",
+                    curModel || this.tr("Auto (default)", "自动（默认）"),
+                    modelItems,
+                    (model, cx) => this.setDroveProbeFixModel(model, cx),
+                    {
+                      flex1: true,
+                      width: 150,
+                      popupWidth: 360,
+                      allowCustom: true,
+                      tooltip: isZcode
+                        ? effortDisabledReason
+                        : this.tr("Choose model or type a custom model ID", "选择模型或输入自定义模型 ID"),
+                    },
+                    cx,
+                  ),
+                )
+                .child(
+                  h_flex()
+                    .id("st-dr-probe-fix-eff-group")
+                    .w(effortChoices.length >= 5 ? 196 : 164)
+                    .min_w(effortChoices.length >= 5 ? 196 : 164)
+                    .h(28)
+                    .flex_none()
+                    .p(2)
+                    .gap(1)
+                    .items_center()
+                    .rounded(7)
+                    .border_1()
+                    .border_color(t.border)
+                    .bg(t.surface)
+                    .when(disableEffort, (el) => el.opacity(0.35).tooltip(effortDisabledReason))
+                    .when(!disableEffort, (el) =>
+                      el.tooltip(this.tr("Reasoning effort level", "选择模型思考强度")),
+                    )
+                    .children(
+                      effortChoices.map((eff) => {
+                        const effKey = eff ?? "auto";
+                        const active = !disableEffort && (eff === null ? !curEffort : curEffort === eff);
+                        const label = eff === null ? this.tr("Auto", "默认") : this.effortLabel(eff);
+                        return div()
+                          .id(`st-dr-probe-fix-eff-${effKey}`)
+                          .flex_1()
+                          .min_w(0)
+                          .h(22)
+                          .px(3)
+                          .flex()
+                          .items_center()
+                          .justify_center()
+                          .rounded(5)
+                          .bg(active ? t.accent : "#00000000")
+                          .text_size(11)
+                          .when(active, (el) => el.font_semibold())
+                          .text_color(disableEffort ? t.dim : (active ? t.accent_foreground : t.muted))
+                          .when(!disableEffort, (el) =>
+                            el
+                              .cursor_pointer()
+                              .when(!active, (el2) => el2.hover((s) => s.bg(t.hover).text_color(t.foreground)))
+                              .on_click((_e, cx) => this.setDroveProbeFixEffort(eff, cx)),
+                          )
+                          .child(label);
+                      }),
+                    ),
+                ),
+            )
+            .child(
+              h_flex()
+                .w_full()
+                .items_center()
+                .justify_between()
+                .gap(8)
+                .flex_wrap()
+                .child(
+                  div()
+                    .flex_1()
+                    .min_w(0)
+                    .text_size(11)
+                    .line_height("15px")
+                    .text_color(t.dim)
+                    .child(footerHint),
+                )
+                .child(
+                  h_flex()
+                    .gap(6)
+                    .items_center()
+                    .child(
+                      this.button(t, "st-dr-probe-fix-cancel", this.tr("Cancel", "取消"), (_e, cx) =>
+                        this.toggleDroveProbeFixPanel(cx),
+                      ),
+                    )
+                    .child(
+                      h_flex()
+                        .id("st-dr-probe-fix-launch")
+                        .px(11)
+                        .py(4)
+                        .gap(5)
+                        .rounded(6)
+                        .border_1()
+                        .border_color(t.accent)
+                        .bg(t.accent)
+                        .items_center()
+                        .text_size(11.5)
+                        .font_semibold()
+                        .text_color(t.accent_foreground)
+                        .when(!canLaunch, (b) => b.opacity(0.55))
+                        .when(canLaunch, (b) =>
+                          b
+                            .cursor_pointer()
+                            .hover((s) => s.opacity(0.9))
+                            .on_click((_e, cx) => this.launchAgentToFixDroveProbeErrors(cx)),
+                        )
+                        .when(this.droveProbeAgentLaunching, (b) =>
+                          b.child(
+                            svg("mods/workspace-chrome/spinner.svg")
+                              .size(11)
+                              .text_color(t.accent_foreground)
+                              .spin(900),
+                          ),
+                        )
+                        .child(
+                          this.droveProbeAgentLaunching
+                            ? this.tr("Launching…", "启动中…")
+                            : this.tr("Start Agent", "启动 Agent 处理"),
+                        ),
+                    ),
+                ),
+            ),
+        );
+      });
+  }
+
+  agents(t, cx) {
+    const machines = (this.machineList ?? []).filter((m) => !m.temporary);
+    const machineChip = (id, label, value) => {
+      const on = this.droveMachine === value;
+      return div()
+        .id(`st-ag-m-${id}`)
+        .px(10)
+        .py(4)
+        .rounded(6)
+        .border_1()
+        .border_color(on ? t.accent : t.border)
+        .bg(on ? t.accent : t.raised)
+        .cursor_pointer()
+        .text_size(12.5)
+        .text_color(on ? t.accent_foreground : t.foreground)
+        .on_click((_e, cx) => this.selectTargetMachine(value, cx))
+        .child(label);
+    };
+
+    const probeSummary = this.droveProbeSummary();
+    const errorAgents = probeSummary.errored;
+    const rows = this.detectedAgentRows();
+    const installedRows = rows.filter((r) => r.anyInstalled);
+    const missingRows = rows.filter((r) => !r.anyInstalled);
+    const cliCount = rows.filter((r) => r.cliInstalled).length;
+    const acpReadyCount = rows.filter((r) => r.acpReady).length;
+    const visibleRows = this.agentShowMissing ? rows : (installedRows.length > 0 ? installedRows : rows);
+
+    const adapterList = Array.isArray(this.adapterStatus?.adapters) ? this.adapterStatus.adapters : [];
+    const installingAdapters = adapterList.filter((a) => a.state === "installing");
+    const missingDetectedAdapters = adapterList.filter((a) => a.companion_installed && !a.installed && a.state !== "installing");
+    const anyMissingAdapters = adapterList.filter((a) => !a.installed && a.state !== "installing");
+    const managedAdapters = adapterList.filter((a) => a.source === "managed");
+    const readyAdaptersCount = adapterList.filter((a) => a.installed).length;
+
+    const autoInstall = this.adapterStatus?.auto_install !== false;
+    const injectMcp = this.adapterStatus?.inject_mcp !== false;
+    const currentPerms = String(this.adapterStatus?.default_permissions || "approve-reads").trim() || "approve-reads";
+    const permOptions = [
+      { value: "approve-reads", label: this.tr("Approve Reads (Default)", "仅自动批准只读（默认）") },
+      { value: "approve-all", label: this.tr("Approve All", "全部自动批准") },
+      { value: "ask", label: this.tr("Ask Every Time", "每次询问") },
+      { value: "deny-all", label: this.tr("Deny All", "全部拒绝") },
+    ].map((o) => ({ ...o, active: o.value === currentPerms }));
+    const permLabel = permOptions.find((o) => o.active)?.label ?? currentPerms;
+
+    const defaultAgent = String(this.person?.default_agent ?? "").trim();
+    const defaultAgentItems = [
+      { value: "", label: this.tr("Auto (use chosen / last agent)", "自动（按启动时选择）"), active: !defaultAgent },
+      ...rows
+        .filter((r) => r.acpSupported)
+        .map((r) => ({
+          value: r.id,
+          label: r.name && r.name !== r.id ? `${r.name} (${r.id})` : r.id,
+          icon: r.id,
+          dot: r.anyInstalled,
+          dotColor: r.acpReady ? t.ansi2 : r.acpError ? t.blocked : r.cliInstalled ? t.working : t.dim,
+          meta: r.acpReady ? this.tr("ACP ready", "ACP 就绪") : r.cliInstalled ? "CLI" : this.tr("missing", "未安装"),
+          active: defaultAgent === r.id,
+        })),
+    ];
+    if (defaultAgent && !defaultAgentItems.some((it) => it.value === defaultAgent)) {
+      defaultAgentItems.splice(1, 0, { value: defaultAgent, label: defaultAgent, meta: this.tr("custom", "自定义"), active: true });
+    }
+    const defaultAgentLabel = defaultAgentItems.find((it) => it.active)?.label ?? defaultAgent;
+
+    const adapterSourceLabel = (a) => {
+      const ver = a.version ? ` v${a.version}` : "";
+      if (a.state === "installing" || this.adapterBusy === `install:${a.preset_id}` || this.adapterBusy === `update:${a.preset_id}`) {
+        return [this.tr("Installing…", "安装中…"), t.accent];
+      }
+      if (a.installed) {
+        if (a.source === "managed") return [this.tr(`Managed${ver}`, `托管${ver}`), t.ansi2];
+        if (a.source === "config") return [this.tr("Config", "自定义配置"), t.ansi2];
+        if (a.source === "path") return ["PATH", t.ansi2];
+        if (a.source === "npx_cache") return ["npx cache", t.ansi2];
+        return [this.tr("Ready", "就绪"), t.ansi2];
+      }
+      if (a.state === "error" || a.error) return [this.tr("Error", "异常"), t.blocked];
+      if (a.companion_installed) return [this.tr("Missing Adapter", "缺少适配器"), t.working];
+      return [this.tr("Not Installed", "未安装"), t.dim];
+    };
+
+    const pill = (text, color, bg = t.background, border = t.border) =>
+      div()
+        .px(6)
+        .py(1.5)
+        .rounded(4)
+        .bg(bg)
+        .border_1()
+        .border_color(border)
+        .text_size(10.8)
+        .text_color(color)
+        .child(text);
+
+    return v_flex()
+      .id("st-agents-page")
+      .w_full()
+      .gap(16)
+      // 0. Top Environment Bar
+      .child(
+        h_flex()
+          .id("st-ag-env-bar")
+          .w_full()
+          .px(14)
+          .py(10)
+          .rounded(10)
+          .border_1()
+          .border_color(t.border)
+          .bg(t.surface)
+          .items_center()
+          .justify_between()
+          .gap(10)
+          .flex_wrap()
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .flex_wrap()
+              .child(div().text_size(12).text_color(t.dim).child(this.tr("Machine:", "目标主机：")))
+              .child(machineChip("local", this.tr("This computer", "本机"), null))
+              .children(machines.map((m) => machineChip(m.name, m.name, m.name))),
+          )
+          .child(
+            h_flex()
+              .gap(8)
+              .items_center()
+              .flex_wrap()
+              .when(cliCount > 0, (el) =>
+                el.child(pill(this.tr(`${cliCount} CLI`, `${cliCount} 个 CLI`), t.muted)),
+              )
+              .when(acpReadyCount > 0, (el) =>
+                el.child(pill(this.tr(`${acpReadyCount} ACP ready`, `${acpReadyCount} 个 ACP 就绪`), t.ansi2, alpha(t.ansi2, "16") ?? t.background, alpha(t.ansi2, "44") ?? t.border)),
+              )
+              .when(errorAgents.length > 0, (el) =>
+                el.child(
+                  div()
+                    .id("st-dr-probe-err-badge")
+                    .px(7)
+                    .py(3)
+                    .rounded(5)
+                    .bg(t.background)
+                    .border_1()
+                    .border_color(t.blocked)
+                    .text_size(11)
+                    .text_color(t.blocked)
+                    .child(this.tr(`${errorAgents.length} error${errorAgents.length > 1 ? "s" : ""}`, `${errorAgents.length} 个异常`)),
+                ),
+              )
+              .child(
+                this.button(
+                  t,
+                  "st-ag-probe",
+                  this.droveProbing ? this.tr("Detecting…", "检测中…") : this.tr("Refresh Detection", "刷新检测"),
+                  (_e, cx) => this.refreshAgentsDetection(cx),
+                ),
+              ),
+          ),
+      )
+      .when(Boolean(this.droveError || this.adapterError), (el) =>
+        el.child(
+          div()
+            .px(12)
+            .py(8)
+            .rounded(8)
+            .border_1()
+            .border_color(t.blocked)
+            .bg(t.surface)
+            .text_size(12)
+            .text_color(t.blocked)
+            .child(this.adapterError || this.droveError),
+        ),
+      )
+      .when(errorAgents.length > 0, (el) => el.child(this.renderProbeErrorCard(t, cx, errorAgents)))
+      // 1. Managed ACP Adapters
+      .child(
+        v_flex()
+          .id("st-ag-adapters-card")
+          .w_full()
+          .gap(8)
+          .child(
+            h_flex()
+              .w_full()
+              .items_center()
+              .justify_between()
+              .gap(8)
+              .flex_wrap()
+              .child(
+                v_flex()
+                  .gap(2)
+                  .child(
+                    h_flex()
+                      .gap(8)
+                      .items_center()
+                      .child(this.heading(t, this.tr("Managed ACP Adapters", "托管 ACP 适配器")))
+                      .when(adapterList.length > 0, (el) =>
+                        el.child(pill(`${readyAdaptersCount}/${adapterList.length} ${this.tr("ready", "就绪")}`, readyAdaptersCount === adapterList.length ? t.ansi2 : t.muted)),
+                      ),
+                  )
+                  .child(
+                    div()
+                      .text_size(12)
+                      .text_color(t.dim)
+                      .child(
+                        this.adapterStatus?.adapters_dir
+                          ? this.tr(
+                              `Isolated ACP adapters stored in ${this.adapterStatus.adapters_dir} (no global npm changes).`,
+                              `独立隔离安装在 ${this.adapterStatus.adapters_dir}，不污染全局 npm 环境。`,
+                            )
+                          : this.tr(
+                              "Isolated ACP adapters downloaded from the official ACP Registry for headless Claude, Codex, Pi, and GLM sessions.",
+                              "从官方 ACP Registry 隔离下载，用于无头 ACP 模式运行 Claude、Codex、Pi 与 GLM。",
+                            ),
+                      ),
+                  ),
+              )
+              .child(
+                h_flex()
+                  .gap(6)
+                  .items_center()
+                  .flex_wrap()
+                  .when(missingDetectedAdapters.length > 0, (el) =>
+                    el.child(
+                      this.button(
+                        t,
+                        "st-dr-adapter-install",
+                        this.adapterBusy === "install" ? this.tr("Installing…", "安装中…") : this.tr("Install Missing", "一键安装缺失适配器"),
+                        (_e, cx) => this.runAdapterAction(cx, "install"),
+                      ),
+                    ),
+                  )
+                  .when(anyMissingAdapters.length > 0, (el) =>
+                    el.child(
+                      this.button(
+                        t,
+                        "st-ag-adapter-install-all",
+                        this.adapterBusy === "install-all" ? this.tr("Installing…", "安装中…") : this.tr("Install All", "全部安装"),
+                        (_e, cx) => this.runAdapterAction(cx, "install-all"),
+                      ),
+                    ),
+                  )
+                  .when(managedAdapters.length > 0, (el) =>
+                    el.child(
+                      this.button(
+                        t,
+                        "st-dr-adapter-update",
+                        this.adapterBusy === "update" ? this.tr("Updating…", "更新中…") : this.tr("Update All", "更新适配器"),
+                        (_e, cx) => this.runAdapterAction(cx, "update"),
+                      ),
+                    ),
+                  ),
+              ),
+          )
+          .child(
+            v_flex()
+              .w_full()
+              .rounded(10)
+              .border_1()
+              .border_color(t.border)
+              .bg(t.surface)
+              .overflow_hidden()
+              .when(adapterList.length === 0, (el) =>
+                el.child(
+                  h_flex()
+                    .px(14)
+                    .py(12)
+                    .gap(8)
+                    .items_center()
+                    .when(this.droveLoading, (row) => row.child(svg("mods/workspace-chrome/spinner.svg").size(12).text_color(t.accent).spin(900)))
+                    .child(
+                      div()
+                        .text_size(12)
+                        .text_color(t.dim)
+                        .child(
+                          this.droveLoading
+                            ? this.tr("Loading managed ACP adapter status…", "正在检测托管 ACP 适配器状态…")
+                            : this.tr("No managed adapter status available yet. Click Refresh Detection.", "暂未获取到托管适配器状态，请点击「刷新检测」。"),
+                        ),
+                    ),
+                ),
+              )
+              .children(
+                adapterList.map((a, idx) => {
+                  const [stText, stColor] = adapterSourceLabel(a);
+                  const isBusyItem = this.adapterBusy === `install:${a.preset_id}` || this.adapterBusy === `update:${a.preset_id}` || a.state === "installing";
+                  const actMode = a.installed && a.source === "managed" ? "update" : "install";
+                  const actLabel = isBusyItem
+                    ? this.tr("Working…", "处理中…")
+                    : a.installed
+                      ? (a.source === "managed" ? this.tr("Update", "更新") : this.tr("Reinstall", "重装"))
+                      : this.tr("Install", "安装");
+                  const cliTag = a.companion_cli
+                    ? (a.companion_installed
+                        ? this.tr(`CLI: ${a.companion_cli} ✓`, `CLI: ${a.companion_cli} ✓`)
+                        : this.tr(`CLI: ${a.companion_cli} missing`, `未装 ${a.companion_cli}`))
+                    : this.tr("Standalone", "独立适配器");
+                  return h_flex()
+                    .id(`st-ag-adapter-${a.preset_id}`)
+                    .w_full()
+                    .px(14)
+                    .py(10)
+                    .gap(12)
+                    .items_center()
+                    .when(idx > 0, (el) => el.border_t(1).border_color(t.border))
+                    .child(this.agentIconEl(t, a.preset_id, 16))
+                    .child(
+                      v_flex()
+                        .flex_1()
+                        .min_w(0)
+                        .gap(3)
+                        .child(
+                          h_flex()
+                            .gap(7)
+                            .items_center()
+                            .flex_wrap()
+                            .child(div().text_size(13).font_semibold().text_color(t.foreground).child(a.preset_id))
+                            .child(div().text_size(11.5).text_color(t.dim).child(a.binary_name))
+                            .child(pill(cliTag, a.companion_installed ? t.muted : t.dim))
+                            .child(
+                              h_flex()
+                                .gap(4)
+                                .items_center()
+                                .px(6)
+                                .py(1.5)
+                                .rounded(4)
+                                .bg(alpha(stColor, "18") ?? t.background)
+                                .border_1()
+                                .border_color(alpha(stColor, "44") ?? t.border)
+                                .when(isBusyItem, (b) => b.child(svg("mods/workspace-chrome/spinner.svg").size(10).text_color(stColor).spin(900)))
+                                .child(div().text_size(10.8).text_color(stColor).child(stText)),
+                            ),
+                        )
+                        .when(Boolean(a.error || a.path), (el) =>
+                          el.child(
+                            div()
+                              .truncate()
+                              .text_size(11.2)
+                              .text_color(a.error ? t.blocked : t.dim)
+                              .tooltip(a.error || a.path)
+                              .child(a.error ? this.formatAgentProbeError(a.error) : a.path),
+                          ),
+                        ),
+                    )
+                    .child(
+                      this.button(
+                        t,
+                        `st-ag-adapter-act-${a.preset_id}`,
+                        actLabel,
+                        (_e, cx) => {
+                          if (!this.adapterBusy && a.state !== "installing") {
+                            this.runAdapterAction(cx, actMode, a.preset_id);
+                          }
+                        },
+                      ),
+                    );
+                }),
+              ),
+          ),
+      )
+      // 2. Detected Agents (CLI & ACP)
+      .child(
+        v_flex()
+          .id("st-ag-list-card")
+          .w_full()
+          .gap(8)
+          .child(
+            h_flex()
+              .w_full()
+              .items_center()
+              .justify_between()
+              .gap(8)
+              .flex_wrap()
+              .child(
+                v_flex()
+                  .gap(2)
+                  .child(this.heading(t, this.tr("Detected Agents (CLI & ACP)", "Agent 与 ACP 检测列表")))
+                  .child(
+                    div()
+                      .text_size(12)
+                      .text_color(t.dim)
+                      .child(
+                        this.tr(
+                          "Combined detection of interactive CLI agents and headless ACP presets with discovered models.",
+                          "汇总检测交互式 CLI Agent 与无头 ACP 预设的可用状态与模型列表。",
+                        ),
+                      ),
+                  ),
+              )
+              .when(missingRows.length > 0 && installedRows.length > 0, (el) =>
+                el.child(
+                  this.button(
+                    t,
+                    "st-ag-toggle-missing",
+                    this.agentShowMissing
+                      ? this.tr("Hide Not Installed", "隐藏未安装")
+                      : this.tr(`Show Not Installed (${missingRows.length})`, `显示未安装 (${missingRows.length})`),
+                    (_e, cx) => {
+                      this.agentShowMissing = !this.agentShowMissing;
+                      cx.notify();
+                    },
+                  ),
+                ),
+              ),
+          )
+          .child(
+            v_flex()
+              .w_full()
+              .rounded(10)
+              .border_1()
+              .border_color(t.border)
+              .bg(t.surface)
+              .overflow_hidden()
+              .when(visibleRows.length === 0, (el) =>
+                el.child(
+                  div()
+                    .px(14)
+                    .py(12)
+                    .text_size(12)
+                    .text_color(t.dim)
+                    .child(this.tr("No agents detected yet. Click Refresh Detection.", "尚未检测到任何 Agent，点击「刷新检测」扫描环境。")),
+                ),
+              )
+              .children(
+                visibleRows.map((r, idx) => {
+                  const cmdText = Array.isArray(r.command) && r.command.length > 0
+                    ? r.command.join(" ")
+                    : Array.isArray(r.cliRun) && r.cliRun.length > 0
+                      ? r.cliRun[0]
+                      : "";
+                  const subText = r.acpError
+                    ? this.formatAgentProbeError(r.acpError)
+                    : r.path || cmdText || "";
+                  const modelsTooltip = r.models.length > 0 ? r.models.map((m) => m.id).join(", ") : undefined;
+                  return h_flex()
+                    .id(`st-ag-row-${r.id}`)
+                    .w_full()
+                    .px(14)
+                    .py(9)
+                    .gap(12)
+                    .items_center()
+                    .when(idx > 0, (el) => el.border_t(1).border_color(t.border))
+                    .child(this.agentIconEl(t, r.id, 16))
+                    .child(
+                      v_flex()
+                        .flex_1()
+                        .min_w(0)
+                        .gap(2)
+                        .child(
+                          h_flex()
+                            .gap(7)
+                            .items_center()
+                            .flex_wrap()
+                            .child(div().text_size(13).font_semibold().text_color(r.anyInstalled ? t.foreground : t.muted).child(r.name))
+                            .when(r.name.toLowerCase() !== r.id.toLowerCase(), (el) =>
+                              el.child(div().text_size(11.2).text_color(t.dim).child(r.id)),
+                            )
+                            .when(r.cliInstalled, (el) =>
+                              el.child(pill("CLI ✓", t.ansi2, alpha(t.ansi2, "16") ?? t.background, alpha(t.ansi2, "40") ?? t.border)),
+                            )
+                            .when(r.acpReady, (el) =>
+                              el.child(
+                                pill(
+                                  r.models.length > 0
+                                    ? this.tr(`ACP Ready · ${r.models.length} models`, `ACP 就绪 · ${r.models.length} 模型`)
+                                    : this.tr("ACP Ready", "ACP 就绪"),
+                                  t.ansi2,
+                                  alpha(t.ansi2, "16") ?? t.background,
+                                  alpha(t.ansi2, "40") ?? t.border,
+                                ).when(Boolean(modelsTooltip), (p) => p.tooltip(modelsTooltip)),
+                              ),
+                            )
+                            .when(Boolean(r.acpError), (el) =>
+                              el.child(
+                                pill(this.tr("ACP Error", "ACP 异常"), t.blocked, alpha(t.blocked, "18") ?? t.background, alpha(t.blocked, "55") ?? t.border)
+                                  .tooltip(r.acpError),
+                              ),
+                            )
+                            .when(r.adapterMissing && !r.acpError, (el) =>
+                              el.child(pill(this.tr("ACP Adapter Missing", "缺少 ACP 适配器"), t.working, alpha(t.working, "18") ?? t.background, alpha(t.working, "55") ?? t.border)),
+                            )
+                            .when(!r.acpSupported && r.cliInstalled, (el) =>
+                              el.child(pill(this.tr("CLI Only", "仅 CLI"), t.dim)),
+                            )
+                            .when(!r.anyInstalled, (el) =>
+                              el.child(pill(this.tr("Not Installed", "未安装"), t.dim)),
+                            ),
+                        )
+                        .when(Boolean(subText), (el) =>
+                          el.child(
+                            div()
+                              .truncate()
+                              .text_size(11.2)
+                              .text_color(r.acpError ? t.blocked : t.dim)
+                              .tooltip(r.acpError || r.path || cmdText)
+                              .child(subText),
+                          ),
+                        ),
+                    )
+                    .when(r.adapterMissing, (el) =>
+                      el.child(
+                        this.button(
+                          t,
+                          `st-ag-row-inst-${r.id}`,
+                          this.adapterBusy === `install:${r.id}` ? this.tr("Installing…", "安装中…") : this.tr("Install Adapter", "安装适配器"),
+                          (_e, cx) => this.runAdapterAction(cx, "install", r.id),
+                        ),
+                      ),
+                    );
+                }),
+              ),
+          ),
+      )
+      // 3. ACP Detection & Runtime Configuration
+      .child(
+        v_flex()
+          .id("st-ag-config-card")
+          .w_full()
+          .gap(8)
+          .child(
+            v_flex()
+              .gap(2)
+              .child(this.heading(t, this.tr("ACP Configuration", "ACP 检测与运行配置")))
+              .child(
+                div()
+                  .text_size(12)
+                  .text_color(t.dim)
+                  .child(
+                    this.adapterStatus?.config_path
+                      ? this.tr(
+                          `Saved to ${this.adapterStatus.config_path} on the selected machine.`,
+                          `保存至所选主机的 ${this.adapterStatus.config_path}。`,
+                        )
+                      : this.tr(
+                          "Controls managed ACP adapter auto-installation, default ACP permissions, MCP injection, and registry mirror.",
+                          "配置托管 ACP 适配器自动安装、默认 ACP 权限策略、MCP 工具注入与注册表源。",
+                        ),
+                  ),
+              ),
+          )
+          .child(
+            v_flex()
+              .w_full()
+              .rounded(10)
+              .border_1()
+              .border_color(t.border)
+              .bg(t.surface)
+              .child(
+                this.droveCardRow(
+                  t,
+                  this.tr("Auto-install Managed ACP Adapters", "自动安装托管 ACP 适配器"),
+                  this.tr(
+                    "Automatically download missing ACP adapters (claude, codex, pi) when their companion CLI is detected or launched.",
+                    "检测到对应 CLI 或启动无头会话时，自动在隔离目录安装缺失的 ACP 适配器。",
+                  ),
+                  this.toggle(t, "st-ag-cfg-auto-install", autoInstall, (_e, cx) =>
+                    this.saveAcpConfig({ autoInstall: !autoInstall }, cx),
+                  ),
+                  true,
+                ),
+              )
+              .child(
+                this.droveCardRow(
+                  t,
+                  this.tr("Default ACP Permissions", "默认 ACP 权限策略"),
+                  this.tr(
+                    "Permission mode used for new headless ACP sessions unless overridden per session or template.",
+                    "新建无头 ACP 会话的默认权限模式（可被单会话或模板覆盖）。",
+                  ),
+                  this.drovePicker(
+                    t,
+                    "ag-cfg-perms",
+                    permLabel,
+                    permOptions,
+                    (val, cx) => this.saveAcpConfig({ defaultPermissions: val }, cx),
+                    { width: 220, popupWidth: 260, anchor: "bottom_right" },
+                    cx,
+                  ),
+                ),
+              )
+              .child(
+                this.droveCardRow(
+                  t,
+                  this.tr("Auto-inject herdr2 MCP Server", "自动注入 herdr2 MCP 工具"),
+                  this.tr(
+                    "Inject the built-in `h2 mcp` server into headless ACP agents so they can orchestrate child agents and terminals.",
+                    "向无头 ACP 智能体自动注入内置 `h2 mcp` 服务，启用子智能体与终端编排能力。",
+                  ),
+                  this.toggle(t, "st-ag-cfg-inject-mcp", injectMcp, (_e, cx) =>
+                    this.saveAcpConfig({ injectMcp: !injectMcp }, cx),
+                  ),
+                ),
+              )
+              .when(this.droveMachine === null, (el) =>
+                el.child(
+                  this.droveCardRow(
+                    t,
+                    this.tr("Default Agent", "默认智能体"),
+                    this.tr(
+                      "Preferred local ACP agent preset stored in settings.json when starting a new pane without explicit command.",
+                      "本机 settings.json 中保存的默认智能体预设。",
+                    ),
+                    this.drovePicker(
+                      t,
+                      "ag-cfg-default-agent",
+                      defaultAgentLabel,
+                      defaultAgentItems,
+                      (val, cx) => {
+                        this.change((q) => {
+                          if (!val) delete q.default_agent;
+                          else q.default_agent = val;
+                        }, cx);
+                      },
+                      { width: 220, popupWidth: 280, anchor: "bottom_right" },
+                      cx,
+                    ),
+                  ),
+                ),
+              )
+              .child(
+                v_flex()
+                  .w_full()
+                  .px(14)
+                  .py(11)
+                  .gap(7)
+                  .border_t(1)
+                  .border_color(t.border)
+                  .child(
+                    v_flex()
+                      .gap(2)
+                      .child(div().text_size(13).text_color(t.foreground).child(this.tr("ACP Registry URL", "ACP 注册表地址（镜像源）")))
+                      .child(
+                        div()
+                          .text_size(11.8)
+                          .text_color(t.dim)
+                          .child(
+                            this.tr(
+                              "Optional override for the official ACP Registry index JSON. Leave blank to use the default CDN.",
+                              "可选覆盖官方 ACP Registry 索引地址（支持自定义镜像）；留空则使用官方默认源。",
+                            ),
+                          ),
+                      ),
+                  )
+                  .child(
+                    h_flex()
+                      .w_full()
+                      .gap(8)
+                      .items_center()
+                      .child(
+                        div()
+                          .id("st-ag-cfg-registry-url")
+                          .flex_1()
+                          .min_w(0)
+                          .px(8)
+                          .py(3)
+                          .rounded(6)
+                          .border_1()
+                          .border_color(t.border)
+                          .bg(t.background)
+                          .child(Input.new(this.adapterRegistryUrlInput).h(26).text_size(12.2).text_color(t.foreground)),
+                      )
+                      .child(
+                        this.button(
+                          t,
+                          "st-ag-cfg-reg-save",
+                          this.adapterConfigSaving ? this.tr("Saving…", "保存中…") : this.tr("Save", "保存"),
+                          (_e, cx) => this.saveAcpConfig({ registryUrl: this.adapterRegistryUrlInput?.value?.() ?? "" }, cx),
+                        ),
+                      )
+                      .when(Boolean(this.adapterStatus?.custom_registry_url), (el) =>
+                        el.child(
+                          this.button(
+                            t,
+                            "st-ag-cfg-reg-reset",
+                            this.tr("Reset", "恢复默认"),
+                            (_e, cx) => this.saveAcpConfig({ registryUrl: "" }, cx),
+                          ),
+                        ),
+                      ),
+                  ),
+              ),
+          ),
+      );
+  }
+
   drove(t, cx) {
     const machines = (this.machineList ?? []).filter((m) => !m.temporary);
     const data = this.droveData;
@@ -5008,29 +6310,7 @@ export default class Settings extends View {
         .cursor_pointer()
         .text_size(12.5)
         .text_color(on ? t.accent_foreground : t.foreground)
-        .on_click((_e, cx) => {
-          this.droveMachine = value;
-          this.droveData = null;
-          this.droveProbePromise = null;
-          this.adapterStatus = null;
-          this.picking = null;
-          this.droveModelSubmit = null;
-          this.droveStrengthSubmit = null;
-          this.droveTestResult = null;
-          this.droveAiConfigResult = null;
-          this.droveRolesBackup = null;
-          this.droveAiConfigMode = null;
-          this.droveMagpieResult = null;
-          this.droveProbeFixOpen = false;
-          this.droveProbeFixAgent = null;
-          this.droveProbeFixModel = null;
-          this.droveProbeFixEffort = null;
-          cx.spawn(async (cx) => {
-            await this.loadDrove();
-            this.maybeAutoProbeDrove(cx);
-            cx.notify();
-          });
-        })
+        .on_click((_e, cx) => this.selectTargetMachine(value, cx))
         .child(label);
     };
     const magpieOn = Boolean(cfg.magpie?.enabled);
@@ -5110,10 +6390,8 @@ export default class Settings extends View {
     const readyCount = probeSummary.ready.length;
     const errorAgents = probeSummary.errored;
     const adapterList = Array.isArray(this.adapterStatus?.adapters) ? this.adapterStatus.adapters : [];
-    const installingAdapters = adapterList.filter((a) => a.state === "installing");
     const missingDetectedAdapters = adapterList.filter((a) => a.companion_installed && !a.installed && a.state !== "installing");
-    const managedAdapters = adapterList.filter((a) => a.source === "managed");
-    const showAdapterBar = installingAdapters.length > 0 || missingDetectedAdapters.length > 0 || managedAdapters.length > 0;
+    const hasAgentIssues = errorAgents.length > 0 || missingDetectedAdapters.length > 0;
 
     return v_flex()
       .w_full()
@@ -5159,101 +6437,50 @@ export default class Settings extends View {
                     .child(this.tr(`${readyCount} agents ready`, `${readyCount} 个 Agent 可用`)),
                 ),
               )
-              .when(errorAgents.length > 0, (el) =>
-                el.child(
-                  div()
-                    .id("st-dr-probe-err-badge")
-                    .px(7)
-                    .py(3)
-                    .rounded(5)
-                    .bg(t.background)
-                    .border_1()
-                    .border_color(t.blocked)
-                    .text_size(11)
-                    .text_color(t.blocked)
-                    .child(
-                      this.tr(
-                        `${errorAgents.length} error${errorAgents.length > 1 ? "s" : ""}`,
-                        `${errorAgents.length} 个异常`,
-                      ),
-                    ),
-                ),
-              )
-              .child(this.button(t, "st-dr-probe", this.droveProbing ? this.tr("Refreshing…", "检测中…") : this.tr("Refresh Agents", "刷新检测"), (_e, cx) => this.probeDroveAgents(cx)))
+              .child(this.button(t, "st-dr-goto-agents", this.tr("Agents & ACP", "智能体与 ACP"), (_e, cx) => this.openAgentsSection(cx)))
               .child(this.button(t, "st-dr-web", this.tr("Open Drove Web", "打开 Drove 网页"), () => {
                 if (!(typeof checking === "function" && checking())) hc(this.droveArgs(["drove", "web"]));
               })),
           ),
       )
-      .when(showAdapterBar, (el) =>
+      .when(hasAgentIssues, (el) =>
         el.child(
           h_flex()
-            .id("st-dr-adapters-bar")
+            .id("st-dr-agents-notice")
             .w_full()
             .px(12)
             .py(8)
             .gap(10)
             .rounded(8)
             .border_1()
-            .border_color(t.border)
+            .border_color(errorAgents.length > 0 ? t.blocked : t.working)
             .bg(t.surface)
             .items_center()
             .justify_between()
             .flex_wrap()
             .child(
-              h_flex()
-                .gap(8)
-                .items_center()
-                .flex_wrap()
-                .when(installingAdapters.length > 0 || this.adapterBusy, (row) =>
-                  row.child(svg("mods/workspace-chrome/spinner.svg").size(12).text_color(t.accent).spin(900)),
-                )
+              div()
+                .text_size(12)
+                .text_color(errorAgents.length > 0 ? t.blocked : t.working)
                 .child(
-                  div()
-                    .text_size(12)
-                    .text_color(t.foreground)
-                    .child(
-                      installingAdapters.length > 0
-                        ? this.tr(
-                            `Installing managed ACP adapters: ${installingAdapters.map((a) => a.preset_id).join(", ")}…`,
-                            `正在后台自动安装 ACP 适配器：${installingAdapters.map((a) => a.preset_id).join("、")}…`,
-                          )
-                        : missingDetectedAdapters.length > 0
-                          ? this.tr(
-                              `Detected CLIs missing ACP adapters: ${missingDetectedAdapters.map((a) => a.preset_id).join(", ")}`,
-                              `检测到已安装 CLI 但缺少 ACP 适配器：${missingDetectedAdapters.map((a) => a.preset_id).join("、")}`,
-                            )
-                          : this.tr(
-                              `Managed ACP adapters: ${managedAdapters.map((a) => `${a.preset_id}${a.version ? ` v${a.version}` : ""}`).join(", ")}`,
-                              `托管 ACP 适配器：${managedAdapters.map((a) => `${a.preset_id}${a.version ? ` v${a.version}` : ""}`).join("、")}`,
-                            ),
-                    ),
+                  errorAgents.length > 0
+                    ? this.tr(
+                        `Detected ${errorAgents.length} ACP agent probe error${errorAgents.length > 1 ? "s" : ""}. Inspect or fix in Settings → Agents & ACP.`,
+                        `检测到 ${errorAgents.length} 个 ACP Agent 探测异常，请前往「智能体与 ACP」排查处理。`,
+                      )
+                    : this.tr(
+                        `${missingDetectedAdapters.length} detected CLI${missingDetectedAdapters.length > 1 ? "s are" : " is"} missing managed ACP adapters.`,
+                        `检测到 ${missingDetectedAdapters.length} 个 CLI 缺少托管 ACP 适配器，可在「智能体与 ACP」一键安装。`,
+                      ),
                 ),
             )
             .child(
-              h_flex()
-                .gap(6)
-                .items_center()
-                .when(missingDetectedAdapters.length > 0, (row) =>
-                  row.child(
-                    this.button(
-                      t,
-                      "st-dr-adapter-install",
-                      this.adapterBusy ? this.tr("Installing…", "安装中…") : this.tr("Install Missing Adapters", "一键安装缺失适配器"),
-                      (_e, cx) => this.runAdapterAction(cx, "install"),
-                    ),
-                  ),
-                )
-                .when(managedAdapters.length > 0, (row) =>
-                  row.child(
-                    this.button(
-                      t,
-                      "st-dr-adapter-update",
-                      this.adapterBusy ? this.tr("Updating…", "更新中…") : this.tr("Update Adapters", "更新适配器"),
-                      (_e, cx) => this.runAdapterAction(cx, "update"),
-                    ),
-                  ),
-                ),
+              this.button(
+                t,
+                "st-dr-notice-goto-agents",
+                this.tr("Open Agents & ACP", "前往智能体与 ACP"),
+                (_e, cx) => this.openAgentsSection(cx),
+              ),
             ),
         ),
       )
@@ -5271,378 +6498,6 @@ export default class Settings extends View {
             .child(this.droveError),
         ),
       )
-      .when(errorAgents.length > 0, (el) => {
-        return el.child(
-          v_flex()
-            .id("st-dr-agent-errors")
-            .w_full()
-            .px(12)
-            .py(10)
-            .gap(8)
-            .rounded(8)
-            .border_1()
-            .border_color(t.blocked)
-            .bg(t.surface)
-            .child(
-              h_flex()
-                .w_full()
-                .items_center()
-                .justify_between()
-                .gap(8)
-                .flex_wrap()
-                .child(
-                  div()
-                    .text_size(12)
-                    .font_semibold()
-                    .text_color(t.blocked)
-                    .child(
-                      this.tr(
-                        `Detected ${errorAgents.length} agent probe error${errorAgents.length > 1 ? "s" : ""}`,
-                        `刷新检测到 ${errorAgents.length} 个 Agent 异常`,
-                      ),
-                    ),
-                )
-                .child(
-                  h_flex()
-                    .gap(6)
-                    .items_center()
-                    .flex_wrap()
-                    .child(
-                      (() => {
-                        const fixOpen = Boolean(this.droveProbeFixOpen);
-                        return h_flex()
-                          .id("st-dr-probe-agent-fix-btn")
-                          .px(9)
-                          .py(4)
-                          .gap(5)
-                          .rounded(6)
-                          .border_1()
-                          .border_color(fixOpen ? t.accent : t.border)
-                          .bg(fixOpen ? t.accent : t.raised)
-                          .items_center()
-                          .text_size(11.5)
-                          .when(fixOpen, (b) => b.font_semibold())
-                          .text_color(fixOpen ? t.accent_foreground : t.foreground)
-                          .when(this.droveProbeAgentLaunching, (b) => b.opacity(0.6))
-                          .when(!this.droveProbeAgentLaunching, (b) =>
-                            b
-                              .cursor_pointer()
-                              .when(!fixOpen, (b2) => b2.hover((s) => s.bg(t.hover)))
-                              .when(fixOpen, (b2) => b2.hover((s) => s.opacity(0.92)))
-                              .on_click((_e, cx) => this.toggleDroveProbeFixPanel(cx)),
-                          )
-                          .tooltip(
-                            this.tr(
-                              "Choose an AI coding agent, model, and reasoning effort to explain error causes, propose a fix plan, and repair after your confirmation",
-                              "选择要启动的 Agent 类型、模型与思考强度，在工作区标签页先解读错误原因并制定修复方案，待你确认后再开始修复",
-                            ),
-                          )
-                          .when(this.droveProbeAgentLaunching, (b) =>
-                            b.child(
-                              svg("mods/workspace-chrome/spinner.svg")
-                                .size(11)
-                                .text_color(fixOpen ? t.accent_foreground : t.foreground)
-                                .spin(900),
-                            ),
-                          )
-                          .child(
-                            this.droveProbeAgentLaunching
-                              ? this.tr("Launching…", "启动中…")
-                              : this.tr("Fix with Agent", "用 Agent 排查处理"),
-                          );
-                      })(),
-                    ),
-                ),
-            )
-            .children(
-              errorAgents.map((a) => {
-                const rawErr = this.agentProbeError(a) ?? "";
-                const shortErr = this.formatAgentProbeError(rawErr);
-                return h_flex()
-                  .id(`st-dr-agent-err-${a.id}`)
-                  .w_full()
-                  .gap(8)
-                  .items_center()
-                  .tooltip(rawErr)
-                  .child(
-                    h_flex()
-                      .w(104)
-                      .flex_none()
-                      .gap(6)
-                      .items_center()
-                      .child(this.agentIconEl(t, a.id, 13))
-                      .child(div().w(6).h(6).rounded(3).flex_none().bg(t.blocked))
-                      .child(div().truncate().text_size(12).font_semibold().text_color(t.foreground).child(a.id)),
-                  )
-                  .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.muted).child(shortErr));
-              }),
-            )
-            .when(Boolean(this.droveProbeFixOpen), (box) => {
-              const sel = this.ensureDroveFixSelection();
-              const curAgent = sel.agent ?? "";
-              const curOpt = sel.option;
-              const curModel = sel.model;
-              const curEffort = sel.effort;
-              const effortDisabledReason = sel.disabledReason;
-              const disableEffort = Boolean(effortDisabledReason);
-              const isZcode = curAgent === "zcode";
-              const agentItems = sel.options.map((o) => ({
-                value: o.id,
-                label: o.name && o.name !== o.id ? `${o.name} (${o.id})` : o.id,
-                icon: o.id,
-                dot: Boolean(o.installed),
-                dotColor: !o.installed ? t.dim : o.probeError ? t.working : t.ansi2,
-                meta: !o.installed
-                  ? this.tr("missing", "未安装")
-                  : o.probeError
-                    ? this.tr("ACP err · CLI", "ACP 异常 · CLI")
-                    : o.models.length > 0
-                      ? `${o.models.length} ${this.tr("models", "模型")}`
-                      : "✓",
-                metaColor: o.probeError ? t.working : t.dim,
-                tooltip: o.probeError ? this.formatAgentProbeError(o.probeError) : undefined,
-                active: curAgent === o.id,
-              }));
-              const models = curOpt?.models?.length ? curOpt.models : (curAgent ? this.probedModelsFor(curAgent) : []);
-              const modelItems = [
-                { value: null, label: this.tr("Auto (agent default)", "自动（Agent 默认）"), active: !curModel },
-                ...models.map((m) => ({
-                  value: m.id,
-                  label: m.label,
-                  active: curModel === m.id,
-                })),
-              ];
-              if (curModel && !models.some((m) => m.id === curModel)) {
-                modelItems.splice(1, 0, {
-                  value: curModel,
-                  label: curModel,
-                  meta: this.tr("custom", "自定义"),
-                  active: true,
-                });
-              }
-              const efforts = curAgent ? this.supportedEffortsFor(curAgent, curModel) : ["low", "medium", "high"];
-              const effortChoices = [null, ...efforts];
-              const canLaunch = Boolean(curOpt && !this.droveProbeAgentLaunching);
-              const footerHint = isZcode
-                ? this.tr(
-                    "Note: ZCode ignores startup --model/--effort flags; select model inside its TUI.",
-                    "提示：ZCode 不支持启动参数传入模型与思考强度，进入后需在 TUI 内切换。",
-                  )
-                : curAgent === "cursor" && !curModel
-                  ? this.tr(
-                      "Tip: Select a specific Cursor model to apply custom reasoning effort.",
-                      "提示：Cursor 需先指定具体模型才能生效自定义思考强度。",
-                    )
-                  : curOpt?.probeError
-                    ? this.tr(
-                        "ACP probe errored for this agent, but its interactive CLI can still run in your terminal.",
-                        "该 Agent 的 ACP 探测有异常，但在交互式终端中仍可直接启动排查。",
-                      )
-                    : this.tr(
-                        "Will launch an interactive agent to explain error causes and propose a fix plan first, and wait for your confirmation before making changes.",
-                        "将在目标主机工作区标签页启动交互式 Agent，先解读错误原因并制定修复方案，待你确认后再开始修复。",
-                      );
-              return box.child(
-                v_flex()
-                  .id("st-dr-probe-fix-panel")
-                  .w_full()
-                  .mt(2)
-                  .px(10)
-                  .py(9)
-                  .gap(8)
-                  .rounded(7)
-                  .border_1()
-                  .border_color(t.accent)
-                  .bg(t.background)
-                  .child(
-                    h_flex()
-                      .w_full()
-                      .items_center()
-                      .justify_between()
-                      .gap(8)
-                      .child(
-                        div()
-                          .text_size(11.8)
-                          .font_semibold()
-                          .text_color(t.foreground)
-                          .child(
-                            this.tr(
-                              "Fix with Agent · Choose Agent, Model & Reasoning Effort",
-                              "用 Agent 排查处理 · 选择 Agent 类型、模型与思考强度",
-                            ),
-                          ),
-                      )
-                      .child(
-                        div()
-                          .id("st-dr-probe-fix-close")
-                          .px(6)
-                          .py(1)
-                          .rounded(4)
-                          .cursor_pointer()
-                          .text_size(12)
-                          .text_color(t.dim)
-                          .hover((s) => s.bg(t.hover).text_color(t.foreground))
-                          .on_click((_e, cx) => this.toggleDroveProbeFixPanel(cx))
-                          .child("×"),
-                      ),
-                  )
-                  .child(
-                    h_flex()
-                      .w_full()
-                      .gap(6)
-                      .items_center()
-                      .flex_wrap()
-                      .child(
-                        this.drovePicker(
-                          t,
-                          "probe-fix-agent",
-                          curOpt ? (curOpt.name || curOpt.id) : this.tr("Select agent…", "选择 Agent…"),
-                          agentItems,
-                          (agent, cx) => this.setDroveProbeFixAgent(agent, cx),
-                          {
-                            width: 148,
-                            popupWidth: 290,
-                            icon: curAgent || undefined,
-                            dot: curOpt ? Boolean(curOpt.installed) : undefined,
-                            dotColor: !curOpt ? undefined : !curOpt.installed ? t.dim : curOpt.probeError ? t.working : t.ansi2,
-                            tooltip: this.tr("Choose which CLI agent to launch", "选择用于排查分析与修复的 Agent 类型"),
-                          },
-                          cx,
-                        ),
-                      )
-                      .child(
-                        this.drovePicker(
-                          t,
-                          "probe-fix-model",
-                          curModel || this.tr("Auto (default)", "自动（默认）"),
-                          modelItems,
-                          (model, cx) => this.setDroveProbeFixModel(model, cx),
-                          {
-                            flex1: true,
-                            width: 150,
-                            popupWidth: 360,
-                            allowCustom: true,
-                            tooltip: isZcode
-                              ? effortDisabledReason
-                              : this.tr("Choose model or type a custom model ID", "选择模型或输入自定义模型 ID"),
-                          },
-                          cx,
-                        ),
-                      )
-                      .child(
-                        h_flex()
-                          .id("st-dr-probe-fix-eff-group")
-                          .w(effortChoices.length >= 5 ? 196 : 164)
-                          .min_w(effortChoices.length >= 5 ? 196 : 164)
-                          .h(28)
-                          .flex_none()
-                          .p(2)
-                          .gap(1)
-                          .items_center()
-                          .rounded(7)
-                          .border_1()
-                          .border_color(t.border)
-                          .bg(t.surface)
-                          .when(disableEffort, (el) => el.opacity(0.35).tooltip(effortDisabledReason))
-                          .when(!disableEffort, (el) =>
-                            el.tooltip(this.tr("Reasoning effort level", "选择模型思考强度")),
-                          )
-                          .children(
-                            effortChoices.map((eff) => {
-                              const effKey = eff ?? "auto";
-                              const active = !disableEffort && (eff === null ? !curEffort : curEffort === eff);
-                              const label = eff === null ? this.tr("Auto", "默认") : this.effortLabel(eff);
-                              return div()
-                                .id(`st-dr-probe-fix-eff-${effKey}`)
-                                .flex_1()
-                                .min_w(0)
-                                .h(22)
-                                .px(3)
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded(5)
-                                .bg(active ? t.accent : "#00000000")
-                                .text_size(11)
-                                .when(active, (el) => el.font_semibold())
-                                .text_color(disableEffort ? t.dim : (active ? t.accent_foreground : t.muted))
-                                .when(!disableEffort, (el) =>
-                                  el
-                                    .cursor_pointer()
-                                    .when(!active, (el2) => el2.hover((s) => s.bg(t.hover).text_color(t.foreground)))
-                                    .on_click((_e, cx) => this.setDroveProbeFixEffort(eff, cx)),
-                                )
-                                .child(label);
-                            }),
-                          ),
-                      ),
-                  )
-                  .child(
-                    h_flex()
-                      .w_full()
-                      .items_center()
-                      .justify_between()
-                      .gap(8)
-                      .flex_wrap()
-                      .child(
-                        div()
-                          .flex_1()
-                          .min_w(0)
-                          .text_size(11)
-                          .line_height("15px")
-                          .text_color(t.dim)
-                          .child(footerHint),
-                      )
-                      .child(
-                        h_flex()
-                          .gap(6)
-                          .items_center()
-                          .child(
-                            this.button(t, "st-dr-probe-fix-cancel", this.tr("Cancel", "取消"), (_e, cx) =>
-                              this.toggleDroveProbeFixPanel(cx),
-                            ),
-                          )
-                          .child(
-                            h_flex()
-                              .id("st-dr-probe-fix-launch")
-                              .px(11)
-                              .py(4)
-                              .gap(5)
-                              .rounded(6)
-                              .border_1()
-                              .border_color(t.accent)
-                              .bg(t.accent)
-                              .items_center()
-                              .text_size(11.5)
-                              .font_semibold()
-                              .text_color(t.accent_foreground)
-                              .when(!canLaunch, (b) => b.opacity(0.55))
-                              .when(canLaunch, (b) =>
-                                b
-                                  .cursor_pointer()
-                                  .hover((s) => s.opacity(0.9))
-                                  .on_click((_e, cx) => this.launchAgentToFixDroveProbeErrors(cx)),
-                              )
-                              .when(this.droveProbeAgentLaunching, (b) =>
-                                b.child(
-                                  svg("mods/workspace-chrome/spinner.svg")
-                                    .size(11)
-                                    .text_color(t.accent_foreground)
-                                    .spin(900),
-                                ),
-                              )
-                              .child(
-                                this.droveProbeAgentLaunching
-                                  ? this.tr("Launching…", "启动中…")
-                                  : this.tr("Start Agent", "启动 Agent 处理"),
-                              ),
-                          ),
-                      ),
-                  ),
-              );
-            }),
-        );
-      })
       .when(this.droveLoading && !data, (el) =>
         el.child(h_flex().py(10).gap(8).items_center().child(svg("mods/workspace-chrome/spinner.svg").size(12).text_color(t.working).spin(900)).child(div().text_size(12.5).text_color(t.dim).child(this.tr("Loading Drove configuration…", "正在读取 Drove 配置…")))),
       )
@@ -8285,6 +9140,13 @@ export default class Settings extends View {
                 await this.loadAi();
                 cx.notify();
               });
+              if (s.id === "agents") cx.spawn(async (cx) => {
+                if (this.machineList === null) await this.loadMachines();
+                await this.loadDrove();
+                this.loadDroveFixKnownAgents(cx);
+                this.maybeAutoProbeDrove(cx);
+                cx.notify();
+              });
               if (s.id === "drove") cx.spawn(async (cx) => {
                 if (this.machineList === null) await this.loadMachines();
                 await Promise.all([this.loadDrove(), this.aiStatus ? Promise.resolve() : this.loadAi()]);
@@ -8372,6 +9234,8 @@ export default class Settings extends View {
                         ? this.machines(t)
                       : this.section === "ai"
                         ? this.ai(t, cx)
+                      : this.section === "agents"
+                        ? this.agents(t, cx)
                       : this.section === "drove"
                         ? this.drove(t, cx)
                       : this.section === "skills"

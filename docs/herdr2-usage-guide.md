@@ -265,7 +265,7 @@ h2 send gpu/trainer "检查显存"
 
 ## 6. 配置文件参考
 
-### 6.1 Core 运行时配置 `~/.config/herdr2/config.toml`
+### 6.1 Core 运行时配置 `~/.config/herdr2/config.toml`（Windows: `%APPDATA%\herdr2\config.toml`）
 
 ```toml
 # ACP 子 Agent 默认权限策略: approve-reads (默认) | approve-all | deny-all | ask

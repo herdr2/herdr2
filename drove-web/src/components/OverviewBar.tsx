@@ -4,7 +4,23 @@ import { taskFailure, type FailureBucket } from "../failure";
 import { useT } from "../i18n";
 import { taskRequiresReview } from "../review";
 import { ReviewRequirement } from "./ReviewRequirement";
-import type { RunSnapshot, Task } from "../types";
+import type { BriefingRef, RunSnapshot, Task } from "../types";
+
+function resolveBriefingRefOpenId(ref: BriefingRef, snap: RunSnapshot): string {
+  if (ref.kind === "task") {
+    const found = snap.tasks.find((task) => task.id === ref.target || task.key === ref.target);
+    if (found) return found.id;
+  }
+  if (ref.kind === "attempt") {
+    const att = snap.attempts.find((a) => a.id === ref.target);
+    if (att) return att.taskId;
+  }
+  if (ref.kind === "message") {
+    const msg = (snap.messages ?? snap.pendingMessages).find((m) => m.id === ref.target);
+    if (msg?.taskId) return msg.taskId;
+  }
+  return COORD_ID;
+}
 
 const RANK = { failed: 0, stall: 1, question: 2, budget: 3 } as const;
 type TodoKind = keyof typeof RANK;
@@ -112,9 +128,11 @@ export const OverviewBar = memo(function OverviewBar({
 
   const fin = snap.run.finalization;
   const showFinal = fin != null && fin.state !== "idle";
+  const briefing = snap.run.briefing;
+  const hasBriefing = Boolean(briefing?.headline?.trim());
 
   return (
-    <section className="overview" aria-label={t("overview.title")}>
+    <section className={`overview${hasBriefing ? " overview--with-briefing" : ""}`} aria-label={t("overview.title")}>
       <div className="overview__phases">
         <ReviewRequirement required count={reviewCount} />
         <ReviewRequirement required={false} count={snap.tasks.length - reviewCount} />
@@ -166,6 +184,48 @@ export const OverviewBar = memo(function OverviewBar({
           </button>
         ))}
       </div>
+      {hasBriefing && briefing && (
+        <div className="overview__briefing">
+          <span className="overview__briefing-badge">{t("overview.briefingLabel")}</span>
+          <span className="overview__briefing-headline" title={briefing.runningSummary || briefing.headline}>
+            {briefing.headline}
+          </span>
+          <div className="overview__briefing-items">
+            {briefing.attention.slice(0, 2).map((alert) => (
+              <span key={alert.id} className={`overview__briefing-chip overview__briefing-chip--${alert.severity}`} title={alert.why || alert.title}>
+                <span>{alert.title}</span>
+                {alert.refs.map((ref) => (
+                  <button
+                    key={`${ref.kind}:${ref.target}`}
+                    type="button"
+                    className="overview__briefing-ref"
+                    title={t("overview.briefingJump", { label: ref.label })}
+                    onClick={() => onOpen(resolveBriefingRefOpenId(ref, snap))}
+                  >
+                    [{ref.label}]
+                  </button>
+                ))}
+              </span>
+            ))}
+            {briefing.threads.slice(0, 3).map((th) => (
+              <span key={th.id} className={`overview__briefing-chip overview__briefing-chip--${th.state}`} title={th.now}>
+                <span>{th.title}: {th.now}</span>
+                {th.refs.slice(0, 2).map((ref) => (
+                  <button
+                    key={`${ref.kind}:${ref.target}`}
+                    type="button"
+                    className="overview__briefing-ref"
+                    title={t("overview.briefingJump", { label: ref.label })}
+                    onClick={() => onOpen(resolveBriefingRefOpenId(ref, snap))}
+                  >
+                    [{ref.label}]
+                  </button>
+                ))}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
     </section>
   );
 });

@@ -170,7 +170,7 @@ fn needs_elevation() -> bool {
 }
 
 fn has_bundled_core(root: &Path) -> bool {
-    root.join("herdr2-core").is_file()
+    root.join("herdr2-core").is_file() || root.join("Contents/Helpers/h2").is_file()
 }
 
 pub fn ready() -> Option<String> {
@@ -1034,7 +1034,11 @@ pub fn start_update() {
                             }
                         }
                         // Also update external h2 core in lockstep if a non-managed core update is waiting.
-                        let should_update_core = {
+                        // Skip when the active core is bundled inside `install_root` and waiting for
+                        // post-restart swap (`after_update()` restarts the swapped bundled core on startup).
+                        let should_update_core = if active_in_root && !already_swapped {
+                            false
+                        } else {
                             let c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                             c.managed.is_none() && c.ready.is_some() && !c.updating
                         };
@@ -1195,15 +1199,26 @@ fn download_verified_core(
     Ok(Some((bin, latest.version)))
 }
 
-/// Preserves bundled files (`herdr2-core`, `h2`, extra PNG icons) when replacing an install folder
-/// (for example Debian/Ubuntu `.deb` installs in `/opt/herdr2` where `/usr/bin/h2` symlinks to
-/// `/opt/herdr2/herdr2-core`). If a newer same-generation core release is available from
-/// `releases_base`, upgrades the bundled core binary in lockstep; otherwise copies the existing one.
+/// Preserves bundled files (`Contents/Helpers/h2` on macOS, `herdr2-core`/`h2` and extra PNG icons
+/// on Linux) when replacing an install folder or `.app` bundle. If a newer same-generation core
+/// release is available from `releases_base`, upgrades the bundled core binary in lockstep;
+/// otherwise copies the existing one so symlinks (such as `~/.local/bin/h2` or `/usr/bin/h2`) and
+/// the desktop app never lose their embedded `h2`.
 fn preserve_or_update_bundled_core(
     root: &Path,
     unpacked: &Path,
     work: &Path,
     releases_base: Option<&str>,
+) -> Result<Option<String>, String> {
+    preserve_or_update_bundled_core_inner(root, unpacked, work, releases_base, cfg!(target_os = "macos"))
+}
+
+fn preserve_or_update_bundled_core_inner(
+    root: &Path,
+    unpacked: &Path,
+    work: &Path,
+    releases_base: Option<&str>,
+    resign_macos: bool,
 ) -> Result<Option<String>, String> {
     for asset in ["herdr2.png", "herdr2-512.png", "herdr2.ico"] {
         let src = root.join(asset);
@@ -1211,6 +1226,58 @@ fn preserve_or_update_bundled_core(
         if src.is_file() && !dst.exists() {
             let _ = std::fs::copy(&src, &dst);
         }
+    }
+
+    // macOS `.app` bundle layout: `Herdr2.app/Contents/Helpers/h2`.
+    let existing_helper = root.join("Contents/Helpers/h2");
+    let unpacked_helper = unpacked.join("Contents/Helpers/h2");
+    if unpacked_helper.is_file() {
+        // The downloaded OTA bundle already ships a signed `Contents/Helpers/h2`: never mutate it
+        // (which would invalidate a Developer ID signature).
+        let old_ver = existing_helper
+            .is_file()
+            .then(|| crate::core_bin::version(&existing_helper))
+            .flatten()
+            .map(|v| strip_core_prefix(&v).split_whitespace().next().unwrap_or("").to_owned())
+            .filter(|v| !v.is_empty());
+        let new_ver = crate::core_bin::version(&unpacked_helper)
+            .map(|v| strip_core_prefix(&v).split_whitespace().next().unwrap_or("").to_owned())
+            .filter(|v| !v.is_empty());
+        return Ok(match (new_ver, old_ver) {
+            (Some(new_v), Some(old_v)) if newer(&new_v, &old_v) => Some(new_v),
+            (Some(new_v), None) => Some(new_v),
+            _ => None,
+        });
+    }
+    if existing_helper.is_file() {
+        let current_ver = crate::core_bin::version(&existing_helper)
+            .map(|v| strip_core_prefix(&v).split_whitespace().next().unwrap_or("").to_owned())
+            .filter(|v| !v.is_empty())
+            .or_else(|| core().version);
+        if let Some(parent) = unpacked_helper.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
+        }
+        let mut upgraded = None;
+        if let Some(base) = releases_base {
+            match download_verified_core(base, work, current_ver.as_deref()) {
+                Ok(Some((new_bin, new_ver))) => {
+                    copy_executable(&new_bin, &unpacked_helper)?;
+                    upgraded = Some(new_ver);
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!("update: could not download bundled macOS helper core ({e}); preserving existing h2");
+                }
+            }
+        }
+        if !unpacked_helper.is_file() {
+            copy_executable(&existing_helper, &unpacked_helper)?;
+        }
+        if resign_macos {
+            run(Command::new("/usr/bin/codesign").args(["--force", "--sign", "-"]).arg(&unpacked_helper))?;
+            run(Command::new("/usr/bin/codesign").args(["--force", "--deep", "--sign", "-"]).arg(unpacked))?;
+        }
+        return Ok(upgraded);
     }
 
     let existing_core = root.join("herdr2-core");
@@ -1489,7 +1556,11 @@ fn prepare_macos_bundle(app: &Path, signature: &std::process::Output) -> Result<
         let path = format!("{home}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin");
         let plist = app.join("Contents/Info.plist");
         run(Command::new("/usr/libexec/PlistBuddy").arg("-c").arg(format!("Add :LSEnvironment:PATH string {path}")).arg(&plist))?;
-        run(Command::new("/usr/bin/codesign").args(["--force", "--sign", "-"]).arg(app))?;
+        let helper = app.join("Contents/Helpers/h2");
+        if helper.is_file() {
+            run(Command::new("/usr/bin/codesign").args(["--force", "--sign", "-"]).arg(&helper))?;
+        }
+        run(Command::new("/usr/bin/codesign").args(["--force", "--deep", "--sign", "-"]).arg(app))?;
     }
     Ok(())
 }
@@ -2703,5 +2774,72 @@ mod tests {
         assert_eq!(title, "herdr2-core updated to v2.0.15");
         assert!(body.contains("box-old (v2.0.15)") && body.contains("box-down: ssh timed out"), "{body}");
         assert_eq!(level, "error");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn macos_bundle_preserves_or_upgrades_helpers_h2_and_keeps_packaged_helper() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = TempWorkDir::new("herdr2-test-macos-helper").unwrap();
+        let root = work.path().join("Applications/Herdr2.app");
+        std::fs::create_dir_all(root.join("Contents/Helpers")).unwrap();
+        std::fs::write(root.join("Contents/Helpers/h2"), "#!/bin/sh\necho h2 2.0.15\n").unwrap();
+        std::fs::set_permissions(root.join("Contents/Helpers/h2"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(has_bundled_core(&root));
+
+        // Case 1: OTA bundle omits Contents/Helpers/h2 and no core feed -> preserves existing helper.
+        let unpacked1 = work.path().join("unpacked1/Herdr2.app");
+        std::fs::create_dir_all(unpacked1.join("Contents/MacOS")).unwrap();
+        let upgraded1 = preserve_or_update_bundled_core_inner(&root, &unpacked1, work.path(), None, false).unwrap();
+        assert_eq!(upgraded1, None);
+        assert_eq!(
+            crate::core_bin::version(&unpacked1.join("Contents/Helpers/h2")).as_deref(),
+            Some("h2 2.0.15")
+        );
+
+        // Case 2: OTA bundle omits Contents/Helpers/h2 and newer core feed exists -> upgrades helper.
+        let server = work.path().join("server");
+        let core_pkg_src = work.path().join("core-pkg-src");
+        std::fs::create_dir_all(server.join("core")).unwrap();
+        std::fs::create_dir_all(&core_pkg_src).unwrap();
+        std::fs::write(core_pkg_src.join("herdr2"), "#!/bin/sh\necho h2 2.0.16\n").unwrap();
+        std::fs::set_permissions(core_pkg_src.join("herdr2"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let core_tar = server.join("core/herdr2-core.tar.gz");
+        assert!(Command::new("tar").args(["-czf"]).arg(&core_tar).arg("-C").arg(&core_pkg_src).arg("herdr2").status().unwrap().success());
+        let core_sha = sha256(&std::fs::read(&core_tar).unwrap());
+        let core_manifest = serde_json::json!({
+            "version": "2.0.16",
+            "generation": crate::hc::GENERATION,
+            "targets": {
+                target(): {
+                    "url": format!("file://{}", core_tar.display()),
+                    "sha256": core_sha
+                }
+            }
+        });
+        std::fs::write(server.join("core/latest.json"), core_manifest.to_string()).unwrap();
+
+        let unpacked2 = work.path().join("unpacked2/Herdr2.app");
+        std::fs::create_dir_all(unpacked2.join("Contents/MacOS")).unwrap();
+        let base_url = format!("file://{}", server.display());
+        let upgraded2 = preserve_or_update_bundled_core_inner(&root, &unpacked2, work.path(), Some(&base_url), false).unwrap();
+        assert_eq!(upgraded2.as_deref(), Some("2.0.16"));
+        assert_eq!(
+            crate::core_bin::version(&unpacked2.join("Contents/Helpers/h2")).as_deref(),
+            Some("h2 2.0.16")
+        );
+
+        // Case 3: OTA bundle already ships Contents/Helpers/h2 -> leave it untouched (signature-safe).
+        let unpacked3 = work.path().join("unpacked3/Herdr2.app");
+        std::fs::create_dir_all(unpacked3.join("Contents/Helpers")).unwrap();
+        let packaged_body = "#!/bin/sh\n# packaged-marker\necho h2 2.0.17\n";
+        std::fs::write(unpacked3.join("Contents/Helpers/h2"), packaged_body).unwrap();
+        std::fs::set_permissions(unpacked3.join("Contents/Helpers/h2"), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let upgraded3 = preserve_or_update_bundled_core_inner(&root, &unpacked3, work.path(), Some(&base_url), false).unwrap();
+        assert_eq!(upgraded3.as_deref(), Some("2.0.17"));
+        assert_eq!(
+            std::fs::read_to_string(unpacked3.join("Contents/Helpers/h2")).unwrap(),
+            packaged_body
+        );
     }
 }

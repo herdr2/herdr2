@@ -3943,6 +3943,73 @@ impl ShellRuntime {
         scheduler::drain_runtime_jobs(self, window, cx);
     }
 
+    // HERDR: Synchronously dispatches an input action-level key event to a
+    // textarea's `set_before_key` handler. Returns `true` when the script
+    // consumed the key so built-in editing / outer Tab traversal is skipped.
+    pub(super) fn dispatch_input_before_key(
+        self: &Rc<Self>,
+        handler: &Persistent<Function<'static>>,
+        owner: &InputCallbackOwner,
+        event: &gpui_base::input::InputBeforeKeyEvent,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
+        if owner
+            .application
+            .as_ref()
+            .is_some_and(|application| !application.is_active())
+        {
+            tracing::debug!("input before_key callback belongs to a retired application");
+            return false;
+        }
+        let view = owner.view.as_ref().and_then(WeakEntity::upgrade);
+        let (_guard, generation) = scope::enter_with_application(
+            self,
+            window,
+            cx,
+            ScopePhase::Event,
+            view,
+            owner.policy.clone(),
+            owner.application.clone(),
+        );
+
+        let result = self.with_js(|ctx| {
+            let handler = handler.clone().restore(ctx)?;
+            let payload = Object::new(ctx.clone())?;
+            payload.set("key", event.key)?;
+            let modifiers = Object::new(ctx.clone())?;
+            modifiers.set("shift", event.shift)?;
+            #[cfg(target_os = "macos")]
+            {
+                modifiers.set("control", false)?;
+                modifiers.set("platform", event.secondary)?;
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                modifiers.set("control", event.secondary)?;
+                modifiers.set("platform", false)?;
+            }
+            modifiers.set("alt", false)?;
+            modifiers.set("secondary", event.secondary)?;
+            payload.set("modifiers", modifiers)?;
+            let value: rquickjs::Value = handler.call((
+                payload,
+                context_object(ctx, ContextBinding::Call(generation))?,
+            ))?;
+            Ok(value.as_bool().unwrap_or(false))
+        });
+
+        let handled = match result {
+            Ok(flag) => flag,
+            Err(error) => {
+                tracing::error!("error in input before_key handler: {error}");
+                false
+            }
+        };
+        scheduler::drain_runtime_jobs(self, window, cx);
+        handled
+    }
+
     /// Delivers a slider event to a long-lived script subscription.
     ///
     /// The value is the whole payload rather than a field of an object,
@@ -6309,6 +6376,10 @@ globalThis.__gpui = (() => {
         oneBased(max_rows, "set_auto_grow(min_rows, max_rows) max_rows"),
       ),
     set_soft_wrap: (wrap) => __textarea_set_soft_wrap(handle, Boolean(wrap)),
+    // HERDR: treat plain Enter as submit (no newline), keeping Shift+Enter for newlines.
+    set_submit_on_enter: (submit) => __textarea_set_submit_on_enter(handle, Boolean(submit)),
+    // HERDR: intercept completion-conflicting keys (Tab/Enter/Up/Down/Escape) before built-in editing.
+    set_before_key: (handler) => __textarea_set_before_key(handle, handler ?? null),
     focus: () => __textarea_focus(handle),
     release: () => __textarea_release(handle),
   });

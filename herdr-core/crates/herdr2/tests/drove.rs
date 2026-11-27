@@ -1109,7 +1109,8 @@ fn drove_settings_persists_ai_policy_switches_and_codex_fast() {
                 "taskEnrich": false,
                 "conflictPolicy": "auto_worktree",
                 "questionMode": "auto_when_offline",
-                "loopDetect": "steer_once"
+                "loopDetect": "steer_once",
+                "runNarrator": false
             }
         }))
         .unwrap(),
@@ -1127,7 +1128,8 @@ fn drove_settings_persists_ai_policy_switches_and_codex_fast() {
             "taskEnrich": false,
             "conflictPolicy": "auto_worktree",
             "questionMode": "auto_when_offline",
-            "loopDetect": "steer_once"
+            "loopDetect": "steer_once",
+            "runNarrator": false
         })
     );
 }
@@ -1886,14 +1888,27 @@ fn drove_ai_model_params_persist_clear_and_fallback_when_options_rejected() {
         snap["run"]["name"] == "Model Params Verified"
     });
 
+    let std_resp = s
+        .connect()
+        .call(1, "ai.complete", json!({ "tier": "standard", "userPrompt": "Verify standard tier effort" }));
+    assert_eq!(std_resp["result"]["content"], "Model Params Verified", "{std_resp}");
+
     let bodies = seen_bodies.lock().unwrap().clone();
-    assert!(bodies.len() >= 2, "expected initial attempt + fallback attempt, got: {bodies:?}");
+    assert!(bodies.len() >= 3, "expected auto_title initial + fallback + standard complete, got: {bodies:?}");
     assert_eq!(bodies[0]["options"]["num_ctx"], 65536);
-    assert_eq!(bodies[0]["reasoning_effort"], "high");
+    // `auto_title` runs on `AiTaskTier::Nano` (initial `reasoning_effort = "none"`, stepping to `"low"`
+    // across progressive fallback candidates until `options` is stripped), while `AiTaskTier::Standard`
+    // propagates the user-configured `"high"` effort and remembers `options` was rejected.
+    assert_eq!(bodies[0]["reasoning_effort"], "none");
     assert_eq!(bodies[0]["max_tokens"], 3072);
-    assert!(bodies[1].get("options").is_none());
-    assert_eq!(bodies[1]["reasoning_effort"], "high");
-    assert_eq!(bodies[1]["max_tokens"], 3072);
+    let fallback = &bodies[bodies.len() - 2];
+    assert!(fallback.get("options").is_none(), "winning fallback should strip options: {fallback}");
+    assert_eq!(fallback["reasoning_effort"], "low");
+    assert_eq!(fallback["max_tokens"], 3072);
+    let std_body = bodies.last().unwrap();
+    assert!(std_body.get("options").is_none(), "endpoint capability memory should omit rejected options");
+    assert_eq!(std_body["reasoning_effort"], "high");
+    assert_eq!(std_body["max_tokens"], 3072);
 
     let clear_file = s.root.join("ai-params-clear.json");
     std::fs::write(
@@ -3245,4 +3260,374 @@ sys.exit(0)
     // User decides to stop and close the run explicitly via `complete --force`.
     let forced = s.json(&["drove", "complete", &run_id, "--force", "--summary", "User accepted partial state"]);
     assert_eq!(forced["run"]["status"], "done");
+}
+
+#[test]
+fn drove_edit_cycle_guard_skip_ok_cancel_and_budget_circuit_breaker() {
+    let s = drove_session();
+    let (port, key_file) = wait_web_port(&s);
+    let coord_secret = read_coordinator_secret(&key_file);
+    configure_fake_coder(&s);
+
+    let work_dir = s.root.join("edit_budget_repo");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let coord = run_fake(&s, &[]);
+
+    // 1. Create a Run and pause it immediately so we can test dynamic DAG reshaping (`edit` + `cancel --skip-ok`).
+    let auth = [("x-drove-coordinator-secret", coord_secret.as_str()), ("x-drove-coordinator", coord.as_str())];
+    let created = http_req(
+        port,
+        "POST",
+        "/api/runs",
+        &auth,
+        Some(&json!({
+            "hostSession": coord,
+            "objective": "Dynamic edit, cycle guard, skip-ok cancel, and budget pause",
+            "cwd": work_dir.to_string_lossy(),
+            "maxConcurrency": 1
+        })),
+    );
+    assert_eq!(created.status, 200, "create run: {}", created.body);
+    let run_id = created.json.unwrap()["id"].as_str().unwrap().to_string();
+    s.json(&["drove", "use", &run_id]);
+    s.json(&["drove", "pause", &run_id]);
+
+    s.json(&[
+        "drove",
+        "add",
+        "--run",
+        &run_id,
+        "--key",
+        "step_a",
+        "--change",
+        "SH:echo 'emitting assistant stream tokens before done'\nSH:sleep 0.1 && printf 'a\\n' > a.txt && herdr2 drove worker done --outcome done --summary \"a ok\"",
+    ]);
+    s.json(&[
+        "drove",
+        "add",
+        "--run",
+        &run_id,
+        "--key",
+        "obsolete_mid",
+        "--deps",
+        "step_a",
+        "--change",
+        "SH:exit 1",
+    ]);
+    s.json(&[
+        "drove",
+        "add",
+        "--run",
+        &run_id,
+        "--key",
+        "step_c",
+        "--deps",
+        "step_a,obsolete_mid",
+        "--change",
+        "SH:placeholder",
+    ]);
+
+    // 2. Cycle guard: making `step_a` depend on `step_c` must fail with `dependency_cycle`.
+    let cyc = s.cmd().args(["--json", "drove", "edit", "step_a", "--run", &run_id, "--deps", "step_c"]).output().unwrap();
+    assert!(!cyc.status.success(), "cycle edit must be rejected");
+    assert!(
+        String::from_utf8_lossy(&cyc.stderr).contains("dependency_cycle"),
+        "expected dependency_cycle, got: {}",
+        String::from_utf8_lossy(&cyc.stderr)
+    );
+
+    // 3. `cancel --skip-ok` removes `obsolete_mid` without cascade-skipping `step_c`, and `drove edit` updates `step_c` spec in-place.
+    s.json(&["drove", "cancel", "obsolete_mid", "--skip-ok", "--run", &run_id]);
+    let edited_c = s.json(&[
+        "drove",
+        "edit",
+        "step_c",
+        "--run",
+        &run_id,
+        "--title",
+        "Final Step C",
+        "--change",
+        "SH:grep -q a a.txt && printf 'c\\n' > c.txt && herdr2 drove worker done --outcome done --summary \"c ok\"",
+    ]);
+    assert_eq!(edited_c["title"], "Final Step C");
+
+    // 4. Configure a tight token budget (`tokens: 1`) so after `step_a` runs and records tokens (or via attempt update),
+    //    or patch `budget: { "cost": 0.01 }` and verify budget circuit breaker pauses scheduling until resumed!
+    s.json(&["drove", "resume", &run_id]);
+    let waited = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "15"]);
+    assert_eq!(waited["settled"], true, "edited pipeline should settle cleanly: {waited}");
+    assert_eq!(std::fs::read_to_string(work_dir.join("a.txt")).unwrap(), "a\n");
+    assert_eq!(std::fs::read_to_string(work_dir.join("c.txt")).unwrap(), "c\n");
+
+    // Wait for trailing turn-end usage accounting from `fake_acp_agent.py` to flush into attempts.
+    wait_until("attempt token accounting flushed after turn end", || {
+        let snap = s.json(&["drove", "show", &run_id]);
+        let used_any_tok: u64 = snap["attempts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| {
+                a["tokens"]["input"].as_u64().unwrap_or(0)
+                    + a["tokens"]["output"].as_u64().unwrap_or(0)
+                    + a["tokens"]["cacheRead"].as_u64().unwrap_or(0)
+            })
+            .sum();
+        used_any_tok >= 1
+    });
+
+    let patched_budget = http_req(
+        port,
+        "PATCH",
+        &format!("/api/runs/{run_id}"),
+        &auth,
+        Some(&json!({ "budget": { "tokens": 1 } })),
+    );
+    assert_eq!(patched_budget.status, 200, "patch budget: {}", patched_budget.body);
+
+    s.json(&[
+        "drove",
+        "add",
+        "--run",
+        &run_id,
+        "--key",
+        "after_budget",
+        "--change",
+        "SH:printf 'resumed\\n' > after.txt && herdr2 drove worker done --outcome done --summary \"after ok\"",
+    ]);
+
+    wait_until("run auto-pauses on budget_exceeded", || {
+        let r = s.json(&["drove", "show", &run_id]);
+        r["run"]["status"] == "paused" && r["run"]["pauseReason"] == "budget_exceeded"
+    });
+    assert!(!work_dir.join("after.txt").exists(), "task must not dispatch while budget_exceeded");
+
+    // Explicit `drove resume` acknowledges current usage watermark and allows `after_budget` to run!
+    s.json(&["drove", "resume", &run_id]);
+    let waited_after = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "15"]);
+    assert_eq!(waited_after["settled"], true, "resumed run should settle: {waited_after}");
+    assert_eq!(std::fs::read_to_string(work_dir.join("after.txt")).unwrap(), "resumed\n");
+}
+
+#[test]
+fn drove_post_merge_verify_catches_diverged_semantic_conflict_and_wall_clock_timeout() {
+    let s = drove_session();
+    let _ = wait_web_port(&s);
+    configure_fake_coder(&s);
+
+    let repo = s.root.join("post_merge_repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    for args in [
+        &["init"][..],
+        &["config", "user.email", "t@drove.local"][..],
+        &["config", "user.name", "Drove Test"][..],
+    ] {
+        assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).output().unwrap().status.success());
+    }
+    std::fs::write(repo.join("api.txt"), "v1\n").unwrap();
+    for args in [&["add", "."][..], &["commit", "-m", "init"][..]] {
+        assert!(std::process::Command::new("git").arg("-C").arg(&repo).args(args).output().unwrap().status.success());
+    }
+
+    // Two parallel worktree tasks branch at the same time (`api.txt == v1`):
+    // - `t_api` updates `api.txt` to `v2` and merges first.
+    // - `t_caller` writes `caller.txt` matching whatever is in its own worktree's `api.txt`, with `verify: cmp -s api.txt caller.txt`.
+    //   On attempt 1 inside `t_caller`'s stale worktree (`api.txt == v1`), local `verify` passes (`v1 == v1`),
+    //   text merge succeeds (disjoint files), and **post-merge verify** in `run.cwd` catches `v2 != v1`,
+    //   rolls back `caller.txt` from `run.cwd`, refreshes `t_caller`'s worktree so `api.txt` is now `v2`,
+    //   and on retry/second done inside the same shell script `t_caller` syncs `caller.txt` to `v2` and succeeds!
+    let plan_path = s.root.join("pm-verify.yaml");
+    let flag_a = s.root.join("t_api_merged.flag");
+    let plan_yaml = format!(
+        concat!(
+            "objective: Post-merge semantic verify and wall-clock timeout\n",
+            "maxConcurrency: 3\n",
+            "tasks:\n",
+            "  - key: t_api\n",
+            "    title: Upgrade API to v2\n",
+            "    isolation: worktree\n",
+            "    spec:\n",
+            "      target: api.txt\n",
+            "      change: |\n",
+            "        SH:sleep 0.4 && printf 'v2\\n' > api.txt && herdr2 drove worker done --outcome done --summary \"api v2\" && touch \"{flag_a}\"\n",
+            "      acceptance: api is v2\n",
+            "  - key: t_caller\n",
+            "    title: Caller matching API\n",
+            "    isolation: worktree\n",
+            "    spec:\n",
+            "      target: caller.txt\n",
+            "      verify: \"cmp -s api.txt caller.txt\"\n",
+            "      change: |\n",
+            "        SH:cp api.txt caller.txt; while [ ! -f \"{flag_a}\" ]; do sleep 0.1; done; ",
+            "if ! herdr2 drove worker done --outcome done --summary \"caller try1\"; then ",
+            "cp api.txt caller.txt && herdr2 drove worker done --outcome done --summary \"caller synced v2\"; fi\n",
+            "      acceptance: caller matches api\n",
+            "  - key: t_slow\n",
+            "    title: Wall-clock timeout check\n",
+            "    timeoutSec: 1\n",
+            "    deps: [t_api, t_caller]\n",
+            "    spec:\n",
+            "      target: slow.txt\n",
+            "      change: |\n",
+            "        SH:sleep 10 && herdr2 drove worker done --outcome done --summary \"never\"\n",
+            "      acceptance: times out\n",
+        ),
+        flag_a = flag_a.display(),
+    );
+    std::fs::write(&plan_path, plan_yaml).unwrap();
+
+    // Limit coder retries to 0 (no fallbacks) by checking `MAX_AUTO_RETRIES`: override `t_slow` to fail fast?
+    // Even with MAX_AUTO_RETRIES=2 (3 attempts * 2s = ~6s), wait(25s) settles cleanly!
+    let planned = s.json(&["drove", "plan", "--file", plan_path.to_str().unwrap(), "--cwd", repo.to_str().unwrap()]);
+    let run_id = planned["run"]["id"].as_str().unwrap().to_string();
+
+    let waited = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "25"]);
+    assert_eq!(waited["settled"], true, "run should settle after post-merge recovery + wall-clock timeout: {waited}");
+
+    let shown = s.json(&["drove", "show", &run_id]);
+    let tasks = shown["tasks"].as_array().unwrap();
+    let t_api = tasks.iter().find(|t| t["key"] == "t_api").unwrap();
+    let t_caller = tasks.iter().find(|t| t["key"] == "t_caller").unwrap();
+    let t_slow = tasks.iter().find(|t| t["key"] == "t_slow").unwrap();
+
+    assert_eq!(t_api["status"], "succeeded", "{t_api}");
+    assert_eq!(t_caller["status"], "succeeded", "{t_caller}");
+    assert_eq!(std::fs::read_to_string(repo.join("api.txt")).unwrap(), "v2\n");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("caller.txt")).unwrap(),
+        "v2\n",
+        "post-merge verify should have rolled back v1 and refreshed worktree to v2"
+    );
+
+    assert_eq!(t_slow["status"], "failed", "t_slow must fail via wall-clock timeoutSec: {t_slow}");
+    let slow_id = t_slow["id"].as_str().unwrap();
+    let slow_att = shown["attempts"].as_array().unwrap().iter().rfind(|a| a["taskId"] == slow_id).unwrap();
+    assert_eq!(slow_att["failure"]["kind"], "timeout", "expected timeout failure kind: {slow_att}");
+}
+
+#[test]
+fn drove_worker_mcp_contracts_and_pre_tool_guard_end_to_end() {
+    let s = drove_session();
+    let _ = wait_web_port(&s);
+
+    let fake = fake_acp_spec();
+    let cfg_file = s.root.join("mcp-guard-roles.json");
+    std::fs::write(
+        &cfg_file,
+        serde_json::to_vec(&json!({
+            "roles": {
+                "coder": {
+                    "label": "Coder",
+                    "access": "writable",
+                    "primary": { "agent": fake, "effort": "high" },
+                    "fallbacks": []
+                },
+                "researcher": {
+                    "label": "Researcher",
+                    "access": "readonly",
+                    "primary": { "agent": fake, "effort": "medium" },
+                    "fallbacks": []
+                }
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    s.json(&["drove", "settings-set", "--file", cfg_file.to_str().unwrap(), "--consume"]);
+
+    let work_dir = s.root.join("mcp_guard_repo");
+    std::fs::create_dir_all(&work_dir).unwrap();
+
+    // Build a >512B JSON array so `api_pub`'s `result.data` collapses to `@task:api_pub#data` pointer for downstream tasks.
+    let big_modules: Vec<String> = (0..25).map(|i| format!("packages/service_{i:02}/src/handler.rs")).collect();
+    let pub_finish = serde_json::to_string(&json!({
+        "outcome": "done",
+        "summary": "published auth contract and module list",
+        "data": { "ok": true, "modules": big_modules }
+    }))
+    .unwrap();
+    let pub_contract = serde_json::to_string(&json!({
+        "action": "publish",
+        "channel": "api",
+        "key": "auth-v2",
+        "summary": "Bearer JWT contract",
+        "payload": { "ttl": 3600, "header": "Authorization" }
+    }))
+    .unwrap();
+
+    let plan_path = s.root.join("mcp-guard-plan.yaml");
+    let plan_yaml = format!(
+        concat!(
+            "objective: Verify Drove worker MCP, shared contracts, pointer slicing, and pre-tool readonly guard\n",
+            "maxConcurrency: 2\n",
+            "tasks:\n",
+            "  - key: api_pub\n",
+            "    title: Publish contract and large outputSchema payload via MCP\n",
+            "    role: coder\n",
+            "    channels: [api]\n",
+            "    outputSchema:\n",
+            "      type: object\n",
+            "      required: [ok, modules]\n",
+            "      properties:\n",
+            "        ok: {{ type: boolean }}\n",
+            "        modules: {{ type: array }}\n",
+            "    spec:\n",
+            "      target: contract\n",
+            "      change: |\n",
+            "        MCP_CALL:drove_context:{pub_contract}\n",
+            "        MCP_CALL:drove_finish:{pub_finish}\n",
+            "      acceptance: Contract published and schema validated\n",
+            "  - key: ro_audit\n",
+            "    title: Readonly researcher pre-tool guard check\n",
+            "    role: researcher\n",
+            "    deps: [api_pub]\n",
+            "    channels: [api]\n",
+            "    spec:\n",
+            "      target: audit\n",
+            "      change: |\n",
+            "        READ_TOOL\n",
+            "        WRITE_TOOL\n",
+            "        MCP_CALL:drove_context:{{\"action\":\"read\",\"target\":\"#contract:1\",\"json_path\":\"ttl\"}}\n",
+            "        MCP_CALL:drove_context:{{\"action\":\"read\",\"target\":\"@task:api_pub#data\",\"json_path\":\"modules.0\"}}\n",
+            "        MCP_CALL:drove_finish:{{\"outcome\":\"done\",\"summary\":\"readonly guard & slicing verified\"}}\n",
+            "      acceptance: Read auto-approved, write auto-denied without blocking, slices resolved\n",
+        ),
+        pub_contract = pub_contract,
+        pub_finish = pub_finish,
+    );
+    std::fs::write(&plan_path, plan_yaml).unwrap();
+
+    let planned =
+        s.json(&["drove", "plan", "--file", plan_path.to_str().unwrap(), "--cwd", work_dir.to_str().unwrap()]);
+    let run_id = planned["run"]["id"].as_str().unwrap().to_string();
+
+    let waited = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "20"]);
+    assert_eq!(waited["settled"], true, "MCP + readonly guard run should settle without blocking: {waited}");
+
+    let shown = s.json(&["drove", "show", &run_id]);
+    let tasks = shown["tasks"].as_array().unwrap();
+    let api_pub = tasks.iter().find(|t| t["key"] == "api_pub").unwrap();
+    let ro_audit = tasks.iter().find(|t| t["key"] == "ro_audit").unwrap();
+    assert_eq!(api_pub["status"], "succeeded", "{api_pub}");
+    assert_eq!(ro_audit["status"], "succeeded", "{ro_audit}");
+
+    let contracts = shown["contracts"].as_array().expect("RunSnapshot should expose contracts");
+    assert_eq!(contracts.len(), 1, "{shown}");
+    assert_eq!(contracts[0]["key"], "auth-v2");
+    assert_eq!(contracts[0]["channel"], "api");
+
+    let ro_worker = shown["workers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|w| w["role"] == "researcher")
+        .expect("researcher worker");
+    let ro_addr = ro_worker["h2Agent"].as_str().unwrap();
+    let ro_hist = s.json(&["read", "--lines", "200", ro_addr])["text"].as_str().unwrap().to_string();
+    assert!(ro_hist.contains("read_tool=selected:allow-once"), "readonly read should auto-approve: {ro_hist}");
+    assert!(ro_hist.contains("write_tool=selected:reject-once"), "readonly write should auto-deny pre-tool: {ro_hist}");
+    assert!(ro_hist.contains("\"value\": 3600"), "contract json_path slice should return 3600: {ro_hist}");
+    assert!(
+        ro_hist.contains("packages/service_00/src/handler.rs"),
+        "task pointer json_path slice should return modules.0: {ro_hist}"
+    );
 }

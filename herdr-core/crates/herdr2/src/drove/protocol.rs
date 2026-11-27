@@ -14,6 +14,12 @@ pub struct PriorAttemptHandover {
     pub git_status: Option<String>,
 }
 
+/// Maximum bytes of a single upstream `result.data` JSON inlined directly into a downstream prompt
+/// before collapsing to a `@task:<key>#data` pointer.
+pub const INLINE_DEP_DATA_MAX_BYTES: usize = 512;
+/// Maximum cumulative bytes of upstream `result.data` inlined across all dependencies in fan-in tasks.
+pub const INLINE_TOTAL_DEP_MAX_BYTES: usize = 2048;
+
 /// Builds the full task prompt delivered to an ACP worker for `attempt`.
 pub fn build_task_prompt(
     run: &Run,
@@ -24,11 +30,10 @@ pub fn build_task_prompt(
     dep_tasks: &[Task],
     hint: Option<&str>,
 ) -> String {
-    build_task_prompt_with_handover(run, task, attempt, role_name, role_cfg, dep_tasks, hint, None)
+    build_task_prompt_with_context(run, task, attempt, role_name, role_cfg, dep_tasks, &[], hint, None)
 }
 
-/// Builds the full task prompt delivered to an ACP worker for `attempt`, optionally embedding
-/// structured context from a failed prior attempt so fallback/retry workers avoid repeating mistakes.
+/// Builds the full task prompt with optional failed prior-attempt handover.
 #[allow(clippy::too_many_arguments)]
 pub fn build_task_prompt_with_handover(
     run: &Run,
@@ -37,6 +42,24 @@ pub fn build_task_prompt_with_handover(
     role_name: &str,
     role_cfg: &RoleConfig,
     dep_tasks: &[Task],
+    hint: Option<&str>,
+    prior_handover: Option<&PriorAttemptHandover>,
+) -> String {
+    build_task_prompt_with_context(run, task, attempt, role_name, role_cfg, dep_tasks, &[], hint, prior_handover)
+}
+
+/// Builds the full task prompt delivered to an ACP worker for `attempt`, applying Pointer-First
+/// `#ref` compaction for large upstream payloads, shared channel contract index headers, and
+/// strong-schema `drove_finish` MCP tool instructions.
+#[allow(clippy::too_many_arguments)]
+pub fn build_task_prompt_with_context(
+    run: &Run,
+    task: &Task,
+    attempt: &Attempt,
+    role_name: &str,
+    role_cfg: &RoleConfig,
+    dep_tasks: &[Task],
+    contracts: &[ContractPost],
     hint: Option<&str>,
     prior_handover: Option<&PriorAttemptHandover>,
 ) -> String {
@@ -54,14 +77,22 @@ pub fn build_task_prompt_with_handover(
 
     let access_note = match role_cfg.access.unwrap_or(RoleAccessMode::Writable) {
         RoleAccessMode::Readonly => {
-            "Access mode: READONLY. Do NOT create, modify, or delete any tracked or untracked workspace files."
+            "Access mode: READONLY. Write/edit tools are blocked at runtime; do NOT create, modify, or delete any workspace files."
+                .to_string()
         }
         RoleAccessMode::ScopedWrite => {
-            "Access mode: SCOPED_WRITE. Only edit files matching the configured allowedPaths."
+            if role_cfg.allowed_paths.is_empty() {
+                "Access mode: SCOPED_WRITE. Only edit files matching the configured allowedPaths.".to_string()
+            } else {
+                format!(
+                    "Access mode: SCOPED_WRITE (enforced pre-tool). Allowed paths: [{}]. Edits outside these globs are blocked immediately.",
+                    role_cfg.allowed_paths.join(", ")
+                )
+            }
         }
-        RoleAccessMode::Writable => "Access mode: WRITABLE. Workspace edits are permitted within task ownership.",
+        RoleAccessMode::Writable => "Access mode: WRITABLE. Workspace edits are permitted within task ownership.".into(),
     };
-    sections.push(access_note.to_string());
+    sections.push(access_note);
 
     let mut spec_lines = vec![
         format!("- Target: {}", task.spec.target),
@@ -85,6 +116,7 @@ pub fn build_task_prompt_with_handover(
 
     if !dep_tasks.is_empty() {
         let mut dep_lines = Vec::new();
+        let mut inlined_bytes = 0usize;
         for d in dep_tasks {
             if let Some(res) = &d.result {
                 let summary_txt =
@@ -96,12 +128,45 @@ pub fn build_task_prompt_with_handover(
                     dep_lines.push(format!("  filesModified: {}", files.join(", ")));
                 }
                 if let Some(data) = &res.data {
-                    dep_lines.push(format!("  data: {}", serde_json::to_string(data).unwrap_or_default()));
+                    let serialized = serde_json::to_string(data).unwrap_or_default();
+                    if serialized.len() <= INLINE_DEP_DATA_MAX_BYTES
+                        && inlined_bytes + serialized.len() <= INLINE_TOTAL_DEP_MAX_BYTES
+                    {
+                        inlined_bytes += serialized.len();
+                        dep_lines.push(format!("  data: {serialized}"));
+                    } else {
+                        let shape = describe_json_shape(data);
+                        dep_lines.push(format!(
+                            "  dataRef: `@task:{}#data` ({} B, {shape}) -> read on demand via `drove_context` (`action: \"read\", target: \"task:{}\"` or `json_path`)",
+                            d.key,
+                            serialized.len(),
+                            d.key
+                        ));
+                    }
                 }
             }
         }
         if !dep_lines.is_empty() {
             sections.push(format!("Upstream handovers:\n{}", dep_lines.join("\n")));
+        }
+    }
+
+    if !contracts.is_empty() || !task.channels.is_empty() {
+        let mut c_lines = Vec::new();
+        if !task.channels.is_empty() {
+            c_lines.push(format!(
+                "Subscribed channels: [main, {}] (publish shared interface contracts via `drove_context` `action: \"publish\"`)",
+                task.channels.join(", ")
+            ));
+        }
+        for c in contracts.iter().rev().take(16).rev() {
+            c_lines.push(format!(
+                "- `#contract:{}` [{}] `{}` (by `{}`): {} -> read payload via `drove_context(action=\"read\", target=\"#contract:{}\")`",
+                c.seq, c.channel, c.key, c.author_task, c.summary, c.seq
+            ));
+        }
+        if !c_lines.is_empty() {
+            sections.push(format!("Shared contract board (pointer index):\n{}", c_lines.join("\n")));
         }
     }
 
@@ -164,18 +229,25 @@ pub fn build_task_prompt_with_handover(
     } else {
         "[--data '{\"key\": \"val\"}']"
     };
+    let mcp_data_note = if task.output_schema.as_ref().is_some_and(|s| !s.is_null()) {
+        " and `data` matching `outputSchema` (REQUIRED)"
+    } else {
+        ""
+    };
     let protocol_instr = format!(
         "Completion protocol (REQUIRED):\n\
-         When you finish, or if you need coordinator input, use the `h2 drove worker` CLI (or `drove worker`):\n\
+         Prefer the injected `drove` MCP tools (strong JSON schema, no shell escaping needed):\n\
+         - Finish task: call `drove_finish` with `outcome: \"done\"`, `summary: \"...\"`{mcp_data_note} (or `outcome: \"failed\"`, `reason: \"...\"`)\n\
+         - Ask coordinator (blocks until reply): call `drove_ask` with `question` (and optional `options`)\n\
+         - Read `#ref` pointers / publish shared contracts / post notes: call `drove_context` (`action: \"read\" | \"publish\" | \"list\" | \"note\" | \"inbox\"`)\n\
+         CLI fallback (if MCP tools are unavailable in your adapter):\n\
          - Report completion: `h2 drove worker done --outcome done --summary \"...\" {data_flag}`\n\
          - Report failure: `h2 drove worker done --outcome failed --reason \"...\"`\n\
-         - Ask coordinator (blocks until reply): `h2 drove worker ask \"Question?\" [--options \"A,B\"]`\n\
-         - Send progress note: `h2 drove worker note \"...\"`\n\
-         - Read inbox messages: `h2 drove worker inbox`\n\
-         Worker env vars (`H2_DROVE_URL`, `H2_DROVE_WORKER_TOKEN`, `H2_DROVE_WORKER_ID`) are pre-set for you. Current `attemptId`: `{}`.\n\
-         `h2 drove worker ...` automatically resolves your active attempt (you may also pass `--attempt {}` explicitly if needed; note that `$H2_DROVE_ATTEMPT_ID` may reflect an earlier attempt when a worker is reused).\n\
-         NEVER call `drove worker done` until all changes and checks for this attempt are complete.",
-        attempt.id, attempt.id
+         - Ask coordinator: `h2 drove worker ask \"Question?\" [--options \"A,B\"]`\n\
+         - Read pointer/contract: `h2 drove worker read <target> [--path <json.path>]`\n\
+         Current `attemptId`: `{}` (`h2 drove worker` and `drove_*` MCP tools resolve your active attempt automatically).\n\
+         NEVER call `drove_finish` / `drove worker done` until all changes and local checks for this attempt are complete.",
+        attempt.id
     );
     sections.push(protocol_instr);
     sections.join("\n\n")
@@ -208,6 +280,27 @@ pub fn when_matches(when: Option<&TaskWhen>, run_tasks: &[Task]) -> bool {
         }
     }
     true
+}
+
+fn describe_json_shape(val: &Value) -> String {
+    match val {
+        Value::Object(map) => {
+            let keys: Vec<String> = map
+                .iter()
+                .take(6)
+                .map(|(k, v)| match v {
+                    Value::Array(a) => format!("{k}[{}]", a.len()),
+                    Value::Object(m) => format!("{k}{{{}}}", m.len()),
+                    _ => k.clone(),
+                })
+                .collect();
+            let suffix = if map.len() > 6 { ", ..." } else { "" };
+            format!("object keys=[{}{suffix}]", keys.join(", "))
+        }
+        Value::Array(arr) => format!("array len={}", arr.len()),
+        Value::String(s) => format!("string len={}", s.len()),
+        other => format!("json {}", other),
+    }
 }
 
 fn extract_when_value<'a>(task: &'a Task, path: Option<&str>) -> Option<&'a Value> {
@@ -260,6 +353,7 @@ mod tests {
             trashed_at: None,
             status_before_trash: None,
             ai_usage: None,
+            briefing: None,
             machine: None,
             created_at: "2026-01-01T00:00:00Z".into(),
             updated_at: "2026-01-01T00:00:00Z".into(),
@@ -319,6 +413,9 @@ mod tests {
             cache: None,
             cached_from: None,
             retry_on_worker_reported: None,
+            fork_from: None,
+            fork_mode: None,
+            channels: Vec::new(),
         };
         let mut task = dep.clone();
         task.id = "tsk_2".into();
@@ -406,5 +503,49 @@ mod tests {
         assert!(retry_prompt.contains("Failure reason: AgentError: timed out"), "{retry_prompt}");
         assert!(retry_prompt.contains("```text\n M src/lib.rs\n```"), "{retry_prompt}");
         assert!(retry_prompt.contains("Tried patching auth.rs"), "{retry_prompt}");
+        assert!(retry_prompt.contains("drove_finish"), "{retry_prompt}");
+
+        // Large upstream `data` (> 512B) collapses to `@task:<key>#data` pointer; contracts render as `#contract:<seq>` headers.
+        let mut big_dep = task.clone();
+        big_dep.key = "scan".into();
+        big_dep.status = TaskStatus::Succeeded;
+        let big_items: Vec<String> = (0..40).map(|i| format!("packages/module_{i}/src/index.ts")).collect();
+        big_dep.result = Some(TaskResult {
+            summary: "Scanned modules".into(),
+            compact_summary: Some("Found 40 target modules".into()),
+            data: Some(json!({ "modules": big_items, "meta": { "version": 1 } })),
+            files_modified: None,
+            blockers: None,
+            output_file_hashes: None,
+        });
+        let mut consumer = task.clone();
+        consumer.channels = vec!["api-v2".into()];
+        let contracts = vec![ContractPost {
+            seq: 3,
+            run_id: "run_1".into(),
+            channel: "api-v2".into(),
+            key: "jwt-claims".into(),
+            author_task: "auth-backend".into(),
+            worker_id: Some("wrk_1".into()),
+            summary: "JWT claims {sub, exp, role}".into(),
+            payload: Some(json!({ "very_large_secret_schema": "not_inlined_into_prompt" })),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }];
+        let ptr_prompt = build_task_prompt_with_context(
+            &run,
+            &consumer,
+            &attempt,
+            "coder",
+            &role_cfg,
+            &[big_dep],
+            &contracts,
+            None,
+            None,
+        );
+        assert!(ptr_prompt.contains("@task:scan#data"), "{ptr_prompt}");
+        assert!(ptr_prompt.contains("modules[40]"), "{ptr_prompt}");
+        assert!(!ptr_prompt.contains("packages/module_39/src/index.ts"), "{ptr_prompt}");
+        assert!(ptr_prompt.contains("`#contract:3` [api-v2] `jwt-claims`"), "{ptr_prompt}");
+        assert!(!ptr_prompt.contains("not_inlined_into_prompt"), "{ptr_prompt}");
     }
 }

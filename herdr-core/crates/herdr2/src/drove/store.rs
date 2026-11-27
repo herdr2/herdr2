@@ -6,7 +6,7 @@ use super::types::*;
 use crate::paths::write_atomic;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -15,8 +15,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Notify, broadcast};
 
 const MAX_DAEMON_EVENTS: usize = 5000;
+const MAX_CACHED_WORKER_ITEMS: usize = 24;
 const WORKER_HEARTBEAT_EMIT_INTERVAL: Duration = Duration::from_secs(10);
-const ITEM_STATE_FLUSH_INTERVAL: Duration = Duration::from_secs(5);
+const DEBOUNCED_STATE_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
 
 /// Event broadcast on every state or item mutation for SSE and long-poll waiters.
 #[derive(Clone, Debug)]
@@ -32,6 +33,8 @@ struct PersistedState {
     next_event_id: u64,
     next_item_id: u64,
     #[serde(default)]
+    next_contract_seq: u64,
+    #[serde(default)]
     runs: BTreeMap<String, Run>,
     #[serde(default)]
     tasks: BTreeMap<String, Task>,
@@ -42,18 +45,20 @@ struct PersistedState {
     #[serde(default)]
     messages: Vec<Message>,
     #[serde(default)]
+    contracts: Vec<ContractPost>,
+    #[serde(default)]
     daemon_events: Vec<DaemonEvent>,
 }
 
 struct StoreInner {
     data: PersistedState,
     items: HashMap<String, Vec<Item>>,
+    items_lru: VecDeque<String>,
     state_file: PathBuf,
     items_dir: PathBuf,
     artifacts_dir: PathBuf,
     dirty: bool,
     last_worker_touch_emit: HashMap<String, Instant>,
-    last_item_state_flush: Option<Instant>,
 }
 
 impl StoreInner {
@@ -79,6 +84,26 @@ impl StoreInner {
         Ok(())
     }
 
+    fn touch_items_lru(&mut self, worker_id: &str) {
+        self.items_lru.retain(|id| id != worker_id);
+        self.items_lru.push_back(worker_id.to_string());
+        while self.items.len() > MAX_CACHED_WORKER_ITEMS {
+            let Some(pos) = self.items_lru.iter().position(|wid| {
+                wid != worker_id
+                    && !self
+                        .data
+                        .workers
+                        .get(wid)
+                        .is_some_and(|w| matches!(w.state, WorkerState::Busy | WorkerState::Starting))
+            }) else {
+                break;
+            };
+            if let Some(evict_id) = self.items_lru.remove(pos) {
+                self.items.remove(&evict_id);
+            }
+        }
+    }
+
     fn load_worker_items(&mut self, worker_id: &str) -> &[Item] {
         if !self.items.contains_key(worker_id) {
             let path = self.items_dir.join(format!("{worker_id}.jsonl"));
@@ -95,6 +120,7 @@ impl StoreInner {
             }
             self.items.insert(worker_id.to_string(), loaded);
         }
+        self.touch_items_lru(worker_id);
         self.items.get(worker_id).map(Vec::as_slice).unwrap_or(&[])
     }
 }
@@ -143,6 +169,9 @@ pub struct CreateTaskInput {
     pub cache: Option<Value>,
     pub cached_from: Option<String>,
     pub retry_on_worker_reported: Option<bool>,
+    pub fork_from: Option<String>,
+    pub fork_mode: Option<String>,
+    pub channels: Vec<String>,
 }
 
 pub struct PostMessageInput {
@@ -185,7 +214,39 @@ pub struct NewDaemonEvent {
 pub struct Store {
     inner: Mutex<StoreInner>,
     events: broadcast::Sender<StoreEvent>,
+    flush_notify: Arc<Notify>,
     pub changed: Arc<Notify>,
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        if let Ok(mut g) = self.inner.lock() {
+            let _ = g.flush_state();
+        }
+    }
+}
+
+/// Coalesces bursty non-structural state updates (streaming token counters, heartbeats, `ok` events)
+/// into bounded atomic `state.json` disk writes without serializing on every streaming delta.
+pub async fn run_flush_loop(store: Arc<Store>, stop: Arc<Notify>) {
+    loop {
+        tokio::select! {
+            _ = store.flush_notify.notified() => {}
+            _ = stop.notified() => {
+                let _ = store.flush_now();
+                break;
+            }
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(DEBOUNCED_STATE_FLUSH_INTERVAL) => {
+                let _ = store.flush_now();
+            }
+            _ = stop.notified() => {
+                let _ = store.flush_now();
+                break;
+            }
+        }
+    }
 }
 
 impl Store {
@@ -197,16 +258,23 @@ impl Store {
             inner: Mutex::new(StoreInner {
                 data,
                 items: HashMap::new(),
+                items_lru: VecDeque::new(),
                 state_file: paths.state_file.clone(),
                 items_dir: paths.items_dir.clone(),
                 artifacts_dir: paths.artifacts_dir.clone(),
                 dirty: false,
                 last_worker_touch_emit: HashMap::new(),
-                last_item_state_flush: None,
             }),
             events,
+            flush_notify: Arc::new(Notify::new()),
             changed: Arc::new(Notify::new()),
         }))
+    }
+
+    /// Synchronously flushes any pending `dirty` state mutations to `state.json`.
+    pub fn flush_now(&self) -> io::Result<()> {
+        let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.flush_state()
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<StoreEvent> {
@@ -259,6 +327,7 @@ impl Store {
             trashed_at: None,
             status_before_trash: None,
             ai_usage: None,
+            briefing: None,
             machine: None,
             created_at: now.clone(),
             updated_at: now,
@@ -318,9 +387,11 @@ impl Store {
             worker_ids = g.data.workers.values().filter(|w| w.run_id == id).map(|w| w.id.clone()).collect();
             g.data.workers.retain(|_, w| w.run_id != id);
             g.data.messages.retain(|m| m.run_id != id);
+            g.data.contracts.retain(|c| c.run_id != id);
             g.data.daemon_events.retain(|e| e.run_id.as_deref() != Some(id));
             for wid in &worker_ids {
                 g.items.remove(wid);
+                g.items_lru.retain(|id| id != wid);
                 let _ = std::fs::remove_file(g.items_dir.join(format!("{wid}.jsonl")));
             }
             artifacts_path = g.artifacts_dir.join(id);
@@ -410,6 +481,9 @@ impl Store {
             cache: input.cache,
             cached_from: input.cached_from,
             retry_on_worker_reported: input.retry_on_worker_reported,
+            fork_from: input.fork_from,
+            fork_mode: input.fork_mode,
+            channels: input.channels,
         };
         {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
@@ -473,18 +547,28 @@ impl Store {
     }
 
     pub fn update_worker(&self, id: &str, f: impl FnOnce(&mut Worker)) -> Option<Worker> {
-        let updated = {
+        let (updated, structural) = {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let worker = g.data.workers.get_mut(id)?;
+            let prev_state = worker.state;
+            let prev_att = worker.current_attempt_id.clone();
+            let prev_wt = worker.worktree.clone();
             let prev_fork = worker.forked_from.clone();
             f(worker);
             sanitize_worker_forked_from(worker, prev_fork.as_deref());
             worker.last_active_at = now_iso();
+            let structural =
+                worker.state != prev_state || worker.current_attempt_id != prev_att || worker.worktree != prev_wt;
             let cloned = worker.clone();
             g.dirty = true;
-            let _ = g.flush_state();
-            cloned
+            if structural {
+                let _ = g.flush_state();
+            }
+            (cloned, structural)
         };
+        if !structural {
+            self.flush_notify.notify_one();
+        }
         self.emit_change("workers", Value::String(updated.id.clone()), Some(updated.run_id.clone()));
         Some(updated)
     }
@@ -508,13 +592,13 @@ impl Store {
                 .is_none_or(|prev| now.saturating_duration_since(*prev) >= WORKER_HEARTBEAT_EMIT_INTERVAL);
             if should_emit {
                 g.last_worker_touch_emit.insert(id.to_string(), now);
-                let _ = g.flush_state();
                 Some(run_id)
             } else {
                 None
             }
         };
         if let Some(run_id) = emit_run_id {
+            self.flush_notify.notify_one();
             self.emit_change("workers", Value::String(id.to_string()), Some(run_id));
         }
     }
@@ -555,15 +639,29 @@ impl Store {
     }
 
     pub fn update_attempt(&self, id: &str, f: impl FnOnce(&mut Attempt)) -> Option<Attempt> {
-        let updated = {
+        let (updated, structural) = {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             let attempt = g.data.attempts.get_mut(id)?;
+            let prev_outcome = attempt.outcome;
+            let prev_ended = attempt.ended_at.clone();
+            let prev_verify_rej = attempt.verify_rejections;
+            let prev_review = attempt.review_round.as_ref().map(|r| r.round);
             f(attempt);
+            let structural = attempt.outcome != prev_outcome
+                || attempt.ended_at != prev_ended
+                || attempt.verify_rejections != prev_verify_rej
+                || attempt.review_round.as_ref().map(|r| r.round) != prev_review
+                || attempt.ai_diagnosis.is_some();
             let cloned = attempt.clone();
             g.dirty = true;
-            let _ = g.flush_state();
-            cloned
+            if structural {
+                let _ = g.flush_state();
+            }
+            (cloned, structural)
         };
+        if !structural {
+            self.flush_notify.notify_one();
+        }
         self.emit_change("attempts", Value::String(updated.id.clone()), Some(updated.run_id.clone()));
         Some(updated)
     }
@@ -780,17 +878,12 @@ impl Store {
             };
             let _ = g.load_worker_items(worker_id);
             g.items.entry(worker_id.to_string()).or_default().push(item.clone());
+            g.touch_items_lru(worker_id);
             let _ = g.append_item_disk(worker_id, &item);
             g.dirty = true;
-            let now = Instant::now();
-            if g.last_item_state_flush
-                .is_none_or(|prev| now.saturating_duration_since(prev) >= ITEM_STATE_FLUSH_INTERVAL)
-            {
-                g.last_item_state_flush = Some(now);
-                let _ = g.flush_state();
-            }
             (item, run_id)
         };
+        self.flush_notify.notify_one();
         let _ = self.events.send(StoreEvent::Item { run_id, item: item.clone() });
         item
     }
@@ -815,7 +908,88 @@ impl Store {
 
     // --- Daemon Events ------------------------------------------------------
 
+    pub fn publish_contract(
+        &self,
+        run_id: &str,
+        channel: &str,
+        key: &str,
+        author_task: &str,
+        worker_id: Option<String>,
+        summary: String,
+        payload: Option<Value>,
+    ) -> ContractPost {
+        let norm_channel = {
+            let trimmed = channel.trim();
+            if trimmed.is_empty() { "main".to_string() } else { trimmed.trim_start_matches('#').to_string() }
+        };
+        let norm_key = key.trim().to_string();
+        let post = {
+            let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            g.data.next_contract_seq += 1;
+            let seq = g.data.next_contract_seq;
+            let post = ContractPost {
+                seq,
+                run_id: run_id.to_string(),
+                channel: norm_channel,
+                key: norm_key,
+                author_task: author_task.to_string(),
+                worker_id,
+                summary,
+                payload,
+                created_at: now_iso(),
+            };
+            g.data.contracts.push(post.clone());
+            g.dirty = true;
+            let _ = g.flush_state();
+            post
+        };
+        self.emit_change("contracts", Value::Number(post.seq.into()), Some(run_id.to_string()));
+        post
+    }
+
+    pub fn list_contracts(&self, run_id: &str, channels: Option<&[String]>) -> Vec<ContractPost> {
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        g.data
+            .contracts
+            .iter()
+            .filter(|c| c.run_id == run_id)
+            .filter(|c| match channels {
+                None => true,
+                Some(allowed) => {
+                    c.channel == "main"
+                        || allowed.iter().any(|ch| ch == "*" || ch.trim_start_matches('#') == c.channel)
+                }
+            })
+            .cloned()
+            .collect()
+    }
+
+    pub fn get_contract(&self, run_id: &str, selector: &str) -> Option<ContractPost> {
+        let clean = selector
+            .trim()
+            .trim_start_matches('#')
+            .strip_prefix("contract:")
+            .unwrap_or_else(|| selector.trim().trim_start_matches('#'));
+        let g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Ok(seq) = clean.parse::<u64>() {
+            return g.data.contracts.iter().find(|c| c.run_id == run_id && c.seq == seq).cloned();
+        }
+        if let Some((ch, k)) = clean.split_once(':') {
+            let ch_norm = ch.trim().trim_start_matches('#');
+            let k_norm = k.trim();
+            return g
+                .data
+                .contracts
+                .iter()
+                .rev()
+                .find(|c| c.run_id == run_id && c.channel == ch_norm && c.key == k_norm)
+                .cloned();
+        }
+        g.data.contracts.iter().rev().find(|c| c.run_id == run_id && c.key == clean).cloned()
+    }
+
     pub fn append_daemon_event(&self, ev: NewDaemonEvent) -> DaemonEvent {
+        let immediate = ev.status != "ok";
         let event = {
             let mut g = self.inner.lock().unwrap_or_else(|p| p.into_inner());
             g.data.next_event_id += 1;
@@ -843,9 +1017,14 @@ impl Store {
                 g.data.daemon_events.drain(..excess);
             }
             g.dirty = true;
-            let _ = g.flush_state();
+            if immediate {
+                let _ = g.flush_state();
+            }
             event
         };
+        if !immediate {
+            self.flush_notify.notify_one();
+        }
         let _ = self.events.send(StoreEvent::Change(ChangeEvent {
             table: "daemon_events".into(),
             id: Value::Number(event.id.into()),
@@ -1160,5 +1339,82 @@ mod tests {
             upd.forked_from = Some("a5q".into());
         });
         assert_eq!(updated.unwrap().forked_from.as_deref(), Some("a5p"));
+    }
+
+    #[test]
+    fn items_lru_evicts_cold_idle_workers_and_reloads_transparently() {
+        let store = temp_store();
+        store.insert_worker(Worker {
+            id: "wrk_busy".into(),
+            run_id: "run_1".into(),
+            agent: "codex".into(),
+            model: None,
+            context_window: None,
+            effort: None,
+            fast: None,
+            session_key: "run_1:wrk_busy".into(),
+            h2_agent: Some("a1".into()),
+            cwd: "/tmp".into(),
+            worktree: None,
+            state: WorkerState::Busy,
+            current_attempt_id: Some("att_b".into()),
+            pid: None,
+            fingerprint: Fingerprint::default(),
+            context: WorkerContext::default(),
+            totals: WorkerTotals::default(),
+            created_at: now_iso(),
+            last_active_at: now_iso(),
+            role: Some("coder".into()),
+            forked_from: None,
+            protocol_gen: Some(1),
+            read_only_dir: None,
+        });
+        store.append_item("wrk_busy", Some("att_b".into()), "assistant", Some("busy-live".into()), None, None);
+
+        for i in 0..30 {
+            let wid = format!("wrk_idle_{i}");
+            store.insert_worker(Worker {
+                id: wid.clone(),
+                run_id: "run_1".into(),
+                agent: "codex".into(),
+                model: None,
+                context_window: None,
+                effort: None,
+                fast: None,
+                session_key: format!("run_1:{wid}"),
+                h2_agent: None,
+                cwd: "/tmp".into(),
+                worktree: None,
+                state: WorkerState::Idle,
+                current_attempt_id: None,
+                pid: None,
+                fingerprint: Fingerprint::default(),
+                context: WorkerContext::default(),
+                totals: WorkerTotals::default(),
+                created_at: now_iso(),
+                last_active_at: now_iso(),
+                role: Some("coder".into()),
+                forked_from: None,
+                protocol_gen: Some(1),
+                read_only_dir: None,
+            });
+            store.append_item(&wid, None, "assistant", Some(format!("msg-{i}")), None, None);
+        }
+
+        {
+            let g = store.inner.lock().unwrap();
+            assert!(
+                g.items.len() <= MAX_CACHED_WORKER_ITEMS,
+                "in-memory items cache exceeded cap: {}",
+                g.items.len()
+            );
+            assert!(g.items.contains_key("wrk_busy"), "busy worker must remain pinned in memory cache");
+            assert!(!g.items.contains_key("wrk_idle_0"), "oldest idle worker should have been evicted from RAM");
+        }
+
+        // Reading evicted worker transparently reloads from JSONL on disk.
+        let reloaded = store.list_items("wrk_idle_0", None, None, 10);
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(reloaded[0].text.as_deref(), Some("msg-0"));
     }
 }

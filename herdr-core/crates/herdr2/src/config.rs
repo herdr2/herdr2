@@ -123,7 +123,12 @@ impl Config {
 }
 
 fn invalid(message: String) -> RpcError {
-    RpcError::new("config", message, "fix ~/.config/herdr2/config.toml")
+    let hint = if cfg!(windows) {
+        r"fix %APPDATA%\herdr2\config.toml"
+    } else {
+        "fix ~/.config/herdr2/config.toml"
+    };
+    RpcError::new("config", message, hint)
 }
 
 pub fn load(path: &Path) -> Result<Config, RpcError> {
@@ -145,6 +150,156 @@ pub fn delivery(path: &Path) -> Config {
         });
         Config::default()
     })
+}
+
+/// Partial update to ACP-related keys in `~/.config/herdr2/config.toml`.
+#[derive(Clone, Debug, Default)]
+pub struct AcpConfigPatch {
+    pub auto_install_adapters: Option<bool>,
+    /// `Some(Some(url))` sets `acp_registry_url`; `Some(None)` clears it back to default.
+    pub acp_registry_url: Option<Option<String>>,
+    pub default_permissions: Option<PermissionMode>,
+    pub inject_mcp: Option<bool>,
+}
+
+fn format_toml_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn upsert_top_level_toml_key(content: &str, key: &str, formatted_value: Option<&str>) -> String {
+    let mut lines: Vec<String> = if content.is_empty() {
+        Vec::new()
+    } else {
+        content.lines().map(str::to_string).collect()
+    };
+
+    // Find the first `[table]` header; top-level keys must live above it.
+    let first_table_idx = lines
+        .iter()
+        .position(|line| {
+            let t = line.trim_start();
+            t.starts_with('[') && !t.starts_with("[[") || t.starts_with("[[")
+        })
+        .unwrap_or(lines.len());
+
+    let mut matched_indices = Vec::new();
+    for (idx, line) in lines.iter().enumerate().take(first_table_idx) {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix(key) {
+            let rest = rest.trim_start();
+            if rest.starts_with('=') {
+                matched_indices.push(idx);
+            }
+        }
+    }
+
+    match formatted_value {
+        Some(val) => {
+            let assignment = format!("{key} = {val}");
+            if let Some(&first) = matched_indices.first() {
+                lines[first] = assignment;
+                for &dup in matched_indices.iter().skip(1).rev() {
+                    lines.remove(dup);
+                }
+            } else {
+                // Insert right before any trailing blank lines preceding the first table.
+                let mut insert_at = first_table_idx;
+                while insert_at > 0 && lines[insert_at - 1].trim().is_empty() {
+                    insert_at -= 1;
+                }
+                lines.insert(insert_at, assignment);
+                if insert_at + 1 < lines.len() && lines[insert_at + 1].trim_start().starts_with('[') {
+                    lines.insert(insert_at + 1, String::new());
+                }
+            }
+        }
+        None => {
+            for &idx in matched_indices.iter().rev() {
+                lines.remove(idx);
+            }
+        }
+    }
+
+    if lines.is_empty() {
+        String::new()
+    } else {
+        let mut out = lines.join("\n");
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out
+    }
+}
+
+/// Applies an ACP config patch to `config.toml` while preserving comments and other sections.
+pub fn update_acp_config(path: &Path, patch: &AcpConfigPatch) -> Result<Config, RpcError> {
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(invalid(format!("{}: {e}", path.display()))),
+    };
+    if !existing.is_empty() {
+        // Never overwrite a broken config.toml.
+        let _: Config = toml::from_str(&existing).map_err(|e| invalid(format!("{}: {e}", path.display())))?;
+    }
+
+    let mut next = existing;
+    if let Some(auto) = patch.auto_install_adapters {
+        let val = if auto { "true" } else { "false" };
+        next = upsert_top_level_toml_key(&next, "auto_install_adapters", Some(val));
+    }
+    if let Some(reg) = &patch.acp_registry_url {
+        match reg.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(url) => {
+                if !url.starts_with("http://") && !url.starts_with("https://") {
+                    return Err(RpcError::invalid_params("acp_registry_url must start with http:// or https://"));
+                }
+                let formatted = format_toml_string(url);
+                next = upsert_top_level_toml_key(&next, "acp_registry_url", Some(&formatted));
+            }
+            None => {
+                next = upsert_top_level_toml_key(&next, "acp_registry_url", None);
+            }
+        }
+    }
+    if let Some(perms) = patch.default_permissions {
+        let formatted = format_toml_string(perms.as_str());
+        next = upsert_top_level_toml_key(&next, "default_permissions", Some(&formatted));
+    }
+    if let Some(inject) = patch.inject_mcp {
+        let val = if inject { "true" } else { "false" };
+        next = upsert_top_level_toml_key(&next, "inject_mcp", Some(val));
+    }
+
+    let parsed: Config = toml::from_str(&next).map_err(|e| invalid(format!("{}: {e}", path.display())))?;
+    parsed.validate()?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| invalid(format!("{}: {e}", parent.display())))?;
+    }
+    let tmp = path.with_extension(format!("toml.tmp.{}", std::process::id()));
+    std::fs::write(&tmp, next.as_bytes()).map_err(|e| invalid(format!("{}: {e}", tmp.display())))?;
+    std::fs::rename(&tmp, path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        invalid(format!("{}: {e}", path.display()))
+    })?;
+    Ok(parsed)
 }
 
 /// A detach chord: the control byte it sends, and its key code for the
@@ -213,5 +368,53 @@ claude = ["my-claude-acp", "--flag"]
         for bad in ["alt+x", "ctrl+", "ctrl+ab", "ctrl+1", "x"] {
             assert_eq!(key(bad).unwrap_err().kind, "config", "{bad}");
         }
+    }
+
+    #[test]
+    fn update_acp_config_inserts_before_tables_preserves_comments_and_clears_registry() {
+        let dir = std::env::temp_dir().join(format!("herdr2-cfg-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            "# user comment\nshell = [\"zsh\"]\n\n[agents]\nclaude = [\"my-claude-acp\"]\n",
+        )
+        .unwrap();
+
+        let cfg = update_acp_config(
+            &path,
+            &AcpConfigPatch {
+                auto_install_adapters: Some(false),
+                acp_registry_url: Some(Some("https://mirror.example/registry.json".into())),
+                default_permissions: Some(PermissionMode::ApproveAll),
+                inject_mcp: Some(false),
+            },
+        )
+        .unwrap();
+        assert!(!cfg.auto_install_adapters());
+        assert_eq!(cfg.acp_registry_url.as_deref(), Some("https://mirror.example/registry.json"));
+        assert_eq!(cfg.default_permissions, Some(PermissionMode::ApproveAll));
+        assert_eq!(cfg.inject_mcp, Some(false));
+        assert_eq!(cfg.agents["claude"], ["my-claude-acp"]);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# user comment"));
+
+        let cfg2 = update_acp_config(
+            &path,
+            &AcpConfigPatch {
+                auto_install_adapters: Some(true),
+                acp_registry_url: Some(None),
+                default_permissions: Some(PermissionMode::Ask),
+                inject_mcp: Some(true),
+            },
+        )
+        .unwrap();
+        assert!(cfg2.auto_install_adapters());
+        assert_eq!(cfg2.acp_registry_url, None);
+        assert_eq!(cfg2.default_permissions, Some(PermissionMode::Ask));
+        assert_eq!(cfg2.inject_mcp, Some(true));
+        assert_eq!(cfg2.agents["claude"], ["my-claude-acp"]);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -98,6 +98,7 @@ pub struct SpawnSpec {
     pub dangerously_skip_permissions: bool,
     pub config_overrides: BTreeMap<String, Value>,
     pub inject_mcp: bool,
+    pub mcp_profile: Option<String>,
     pub mcp_exe: String,
     pub socket: String,
     /// Optional total deadline for `initialize` + `session/new` (or `session/load`).
@@ -726,7 +727,30 @@ async fn setup_session(
     let can_load_session = init.agent_capabilities.as_ref().is_some_and(|c| c.load_session);
     let prompt_capabilities = init.agent_capabilities.as_ref().map(|c| c.prompt_capabilities).unwrap_or_default();
 
-    let server = if spec.inject_mcp {
+    let server = if spec.mcp_profile.as_deref() == Some("drove-worker") {
+        let mut env = vec![
+            EnvVar { name: "H2_AGENT_ID".into(), value: spec.address.clone() },
+            EnvVar { name: "H2_AGENT_SOCKET".into(), value: spec.socket.clone() },
+            EnvVar { name: "H2_MCP_PROFILE".into(), value: "drove-worker".into() },
+        ];
+        if let Ok(sess) = std::env::var("H2_SESSION")
+            && !sess.is_empty()
+        {
+            env.push(EnvVar { name: "H2_SESSION".into(), value: sess });
+        }
+        for k in ["H2_DROVE_URL", "H2_DROVE_WORKER_TOKEN", "H2_DROVE_WORKER_TICKET", "H2_DROVE_WORKER_ID", "H2_DROVE_RUN_ID"]
+        {
+            if let Some(v) = spec.env.get(k).filter(|s| !s.is_empty()) {
+                env.push(EnvVar { name: k.into(), value: v.clone() });
+            }
+        }
+        Some(StdioMcpServer {
+            name: "drove".into(),
+            command: spec.mcp_exe.clone(),
+            args: vec!["mcp".into(), "--profile".into(), "drove-worker".into()],
+            env,
+        })
+    } else if spec.inject_mcp {
         let mut env = vec![
             EnvVar { name: "H2_AGENT_ID".into(), value: spec.address.clone() },
             EnvVar { name: "H2_AGENT_SOCKET".into(), value: spec.socket.clone() },
@@ -756,6 +780,7 @@ async fn setup_session(
             dangerously_skip_permissions: base.dangerously_skip_permissions,
             config_overrides: base.config_overrides.clone(),
             inject_mcp: base.inject_mcp,
+            mcp_profile: base.mcp_profile.clone(),
             mcp_exe: base.mcp_exe.clone(),
             socket: base.socket.clone(),
             handshake_timeout: base.handshake_timeout,
@@ -1286,8 +1311,9 @@ pub async fn rollback_acp_agent(
         system_prompt,
         model,
         mode,
-        overrides,
+        config_overrides,
         inject_mcp,
+        mcp_profile,
         skip_perms,
         current_turn,
         target_ref,
@@ -1328,6 +1354,7 @@ pub async fn rollback_acp_agent(
         }
         let target_ref = tc.checkpoints.iter().find(|c| c.turn == to_turn).map(|c| c.ref_name.clone());
         let skip_perms = a.permission_mode == permissions::PermissionMode::ApproveAll;
+        let mcp_profile = a.labels.contains_key("drove.worker").then(|| "drove-worker".to_string());
         (
             a.address,
             a.cwd,
@@ -1338,6 +1365,7 @@ pub async fn rollback_acp_agent(
             a.mode,
             a.config_overrides,
             a.inject_mcp,
+            mcp_profile,
             skip_perms,
             a.turn,
             target_ref,
@@ -1416,8 +1444,9 @@ pub async fn rollback_acp_agent(
         model,
         mode,
         dangerously_skip_permissions: skip_perms,
-        config_overrides: overrides,
+        config_overrides,
         inject_mcp,
+        mcp_profile,
         mcp_exe,
         socket: core.paths.socket.display().to_string(),
         handshake_timeout: None,
@@ -1556,6 +1585,7 @@ fn pop_next_prompt(core: &Core, id: u32) -> Option<QueuedPrompt> {
     }
     if prompt.is_some() {
         core.sync_inbox(&mut st, id, true);
+        core.apply_status(&mut st, id, &StatusReport::root("working"));
         core.save_soon();
     }
     prompt
@@ -1772,15 +1802,95 @@ fn handle_update(core: &Core, id: u32, turn_num: u64, params: &Value) {
     record_entry(core, id, entry);
 }
 
+fn decide_drove_worker_permission(
+    agent: &crate::agents::Agent,
+    parsed: &proto::ParsedPermission,
+    raw_params: &Value,
+) -> Option<(Decision, Option<String>)> {
+    let access_raw = agent.labels.get("drove.access")?.as_str();
+    let title_low = parsed.title.to_ascii_lowercase();
+    let is_drove_mcp = title_low.contains("drove_finish")
+        || title_low.contains("drove_ask")
+        || title_low.contains("drove_context")
+        || title_low.contains("drove worker");
+    if is_drove_mcp {
+        let dec = permissions::pick_approve(&parsed.options, None).map_or(Decision::AutoCancel, Decision::AutoSelect);
+        return Some((dec, None));
+    }
+
+    match access_raw {
+        "readonly" => {
+            if permissions::is_read_only_kind(parsed.kind.as_deref()) {
+                let dec =
+                    permissions::pick_approve(&parsed.options, None).map_or(Decision::AutoCancel, Decision::AutoSelect);
+                Some((dec, None))
+            } else {
+                let dec =
+                    permissions::pick_deny(&parsed.options, None).map_or(Decision::AutoCancel, Decision::AutoSelect);
+                Some((
+                    dec,
+                    Some(format!(
+                        "Blocked by Drove readonly guardrail on `{}` ({:?})",
+                        parsed.title, parsed.kind
+                    )),
+                ))
+            }
+        }
+        "scoped_write" => {
+            let is_write_kind = parsed
+                .kind
+                .as_deref()
+                .is_some_and(|k| matches!(k.trim().to_ascii_lowercase().as_str(), "edit" | "write" | "modify" | "delete"));
+            let target_paths = crate::drove::roles::extract_tool_target_paths(raw_params);
+            if is_write_kind || !target_paths.is_empty() {
+                let allowed: Vec<String> = agent
+                    .labels
+                    .get("drove.allowed_paths")
+                    .and_then(|s| serde_json::from_str::<Vec<String>>(s).ok())
+                    .unwrap_or_default();
+                if let Err(reason) = crate::drove::roles::check_pre_tool_paths(
+                    &agent.cwd,
+                    crate::drove::types::RoleAccessMode::ScopedWrite,
+                    &allowed,
+                    &target_paths,
+                ) {
+                    let dec = permissions::pick_deny(&parsed.options, None)
+                        .map_or(Decision::AutoCancel, Decision::AutoSelect);
+                    return Some((dec, Some(reason)));
+                }
+            }
+            let dec =
+                permissions::pick_approve(&parsed.options, None).map_or(Decision::AutoCancel, Decision::AutoSelect);
+            Some((dec, None))
+        }
+        _ => None,
+    }
+}
+
 fn handle_permission(core: &Core, transport: &Transport, id: u32, turn_num: u64, rpc_id: Value, params: &Value) {
     let Some(parsed) = parse_request_permission(params) else {
         transport.reply_error(rpc_id, -32602, "invalid session/request_permission params");
         return;
     };
     let mut st = core.lock();
-    let mode = st.reg.agents.get(&id).map(|a| a.permission_mode).unwrap_or_default();
-    let decision = permissions::decide(mode, parsed.kind.as_deref(), &parsed.options);
+    let (decision, guard_note, worker_id_opt) = if let Some(a) = st.reg.agents.get(&id) {
+        let wid = a.labels.get("drove.worker").cloned();
+        if let Some((dec, note)) = decide_drove_worker_permission(a, &parsed, params) {
+            (dec, note, wid)
+        } else {
+            (permissions::decide(a.permission_mode, parsed.kind.as_deref(), &parsed.options), None, wid)
+        }
+    } else {
+        (permissions::decide(permissions::PermissionMode::default(), parsed.kind.as_deref(), &parsed.options), None, None)
+    };
     let ts_ms = crate::runtime::now_ms();
+
+    if let (Some(note), Some(wid)) = (&guard_note, worker_id_opt) {
+        let _ = core.drove.pool_tx.send(crate::drove::pool::PoolSignal::Transcript {
+            worker_id: wid,
+            entry: Entry::Error { turn: turn_num, message: note.clone(), ts_ms },
+        });
+    }
 
     match decision {
         Decision::AutoSelect(opt_id) => {

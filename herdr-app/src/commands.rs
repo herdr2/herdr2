@@ -151,7 +151,7 @@ pub const COMMANDS: &[Command] = &[
     cmd("app.help", &[], "Toggle the keys dialog."),
     cmd("app.welcome", &[], "Show the welcome again."),
     cmd("app.palette", &[], "Toggle the command palette: every command by name, with its key; calling again closes it."),
-    cmd("app.settings", &[opt("section")], "Open the settings (section: look, keyboard, machines, ai, drove, alerts, updates)."),
+    cmd("app.settings", &[opt("section")], "Open the settings (section: look, keyboard, machines, ai, agents, drove, skills, alerts, updates)."),
     cmd("app.reset", &[], "The escape hatch: set the shown layout and keys aside, back to the default screen."),
     cmd("app.reload_mods", &[], "Hot-reload all UI mods in a fresh script VM without restarting the window or terminals."),
     cmd("app.restart", &[], "Restart the Herdr2 window cleanly (terminals stay alive in h2 core)."),

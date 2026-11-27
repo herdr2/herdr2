@@ -129,9 +129,10 @@ def request_permission(tool_id: str, title: str, kind: str) -> dict:
 
 
 def call_mcp(tool_name: str, args: dict) -> str:
-    srv = next((s for s in mcp_servers if s.get("name") == "herdr2"), None)
+    want = "drove" if tool_name.startswith("drove_") else "herdr2"
+    srv = next((s for s in mcp_servers if s.get("name") == want), None) or (mcp_servers[0] if mcp_servers else None)
     if not srv:
-        raise RuntimeError("herdr2 MCP server not injected")
+        raise RuntimeError(f"{want} MCP server not injected")
     env = os.environ.copy()
     for item in srv.get("env", []):
         env[item["name"]] = item["value"]

@@ -1292,3 +1292,139 @@ test("AI update panel lets user choose local agent, model, and effort and guards
   view.setAiUpdateModel("claude-sonnet-4-5", cx);
   expect(view.aiUpdateEffort).toBe("high");
 });
+
+test("Agents & ACP dedicated settings page merges CLI/ACP detection, manages adapters, and persists ACP config", async () => {
+  expect(source).toContain('{ id: "agents", title: "Agents & ACP", zh: "智能体与 ACP", icon: "bot" }');
+
+  const hcCalls: string[][] = [];
+  const customValues = {
+    ...values,
+    hc: async (args: string[]) => {
+      hcCalls.push(args);
+      if (args[0] === "adapter" && args[1] === "config") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            adapters_dir: "/home/.local/share/herdr2/adapters",
+            auto_install: false,
+            registry_url: "https://mirror.example/registry.json",
+            custom_registry_url: "https://mirror.example/registry.json",
+            default_permissions: "approve-all",
+            inject_mcp: false,
+            config_path: "/home/.config/herdr2/config.toml",
+            adapters: [],
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "adapter" && args[1] === "install") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ results: [{ preset_id: "codex", action: "installed", version: "0.4.2" }] }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "adapter" && args[1] === "status") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            adapters_dir: "/home/.local/share/herdr2/adapters",
+            auto_install: true,
+            default_permissions: "approve-reads",
+            inject_mcp: true,
+            adapters: [
+              { preset_id: "codex", binary_name: "codex-acp", companion_cli: "codex", companion_installed: true, installed: true, source: "managed", state: "ready", version: "0.4.2" },
+            ],
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "drove" && args[1] === "probe") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({ fullProbe: true, agents: [{ id: "codex", installed: true, models: ["gpt-5.4"] }] }),
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: "{}", stderr: "" };
+    },
+  };
+  const customArgs = names.map((name) => customValues[name] ?? (() => undefined));
+  const CustomSettings = new Function(
+    ...names,
+    source
+      .replace(/^import\s+[\s\S]*?from\s+["'][^"']+["'];?\s*\n?/gm, "")
+      .replace("export default class Settings", "return class Settings"),
+  )(...customArgs);
+
+  const view = new CustomSettings();
+  let regVal = "";
+  view.adapterRegistryUrlInput = { value: () => regVal, set_value: (v: string) => { regVal = v; } };
+  view.droveMachine = "gpu-box";
+  view.droveFixKnownAgents = {
+    "gpu-box": [
+      { key: "claude", name: "Claude Code", installed: true, run: ["claude"] },
+      { key: "antigravity", name: "Antigravity", installed: true, run: ["agy"] },
+      { key: "qoder", name: "Qoder", installed: true, run: ["qodercli"] },
+    ],
+  };
+  view.droveData = {
+    agents: {
+      fullProbe: true,
+      agents: [
+        { id: "claude", installed: true, models: ["claude-opus-4-6"], error: null },
+        { id: "cursor", installed: true, models: [], error: "ACP probe timed out" },
+      ],
+    },
+  };
+  view.adapterStatus = {
+    adapters_dir: "/home/.local/share/herdr2/adapters",
+    auto_install: true,
+    default_permissions: "approve-reads",
+    inject_mcp: true,
+    adapters: [
+      { preset_id: "claude", binary_name: "claude-agent-acp", companion_cli: "claude", companion_installed: true, installed: true, source: "managed", state: "ready", version: "0.9.0" },
+      { preset_id: "codex", binary_name: "codex-acp", companion_cli: "codex", companion_installed: true, installed: false, source: "missing", state: "missing" },
+    ],
+  };
+
+  const rows = view.detectedAgentRows();
+  expect(rows[0]).toMatchObject({ id: "claude", cliInstalled: true, acpReady: true });
+  expect(rows.find((r: any) => r.id === "cursor")).toMatchObject({ acpError: "ACP probe timed out" });
+  expect(rows.find((r: any) => r.id === "codex")).toMatchObject({ cliInstalled: true, adapterMissing: true });
+  expect(rows.find((r: any) => r.id === "agy")).toMatchObject({ name: "Antigravity", cliInstalled: true });
+  expect(rows.find((r: any) => r.id === "qoder")).toMatchObject({ cliInstalled: true, acpSupported: false });
+
+  const pending: Promise<void>[] = [];
+  const cx = { notify() {}, spawn(fn: (c: any) => Promise<void>) { pending.push(fn(cx)); } };
+
+  view.saveAcpConfig(
+    { autoInstall: false, registryUrl: "https://mirror.example/registry.json", defaultPermissions: "approve-all", injectMcp: false },
+    cx,
+  );
+  await Promise.all(pending.splice(0));
+  expect(hcCalls[0]).toEqual([
+    "adapter",
+    "config",
+    "--auto-install",
+    "false",
+    "--registry-url",
+    "https://mirror.example/registry.json",
+    "--default-permissions",
+    "approve-all",
+    "--inject-mcp",
+    "false",
+    "--on",
+    "gpu-box",
+    "--json",
+  ]);
+  expect(regVal).toBe("https://mirror.example/registry.json");
+  expect(view.adapterStatus?.auto_install).toBe(false);
+  expect(view.adapterStatus?.default_permissions).toBe("approve-all");
+  expect(view.adapterStatus?.inject_mcp).toBe(false);
+
+  view.runAdapterAction(cx, "install", "codex");
+  await Promise.all(pending.splice(0));
+  expect(hcCalls[1]).toEqual(["adapter", "install", "codex", "--on", "gpu-box", "--json"]);
+  expect(view.adapterBusy).toBe(false);
+});

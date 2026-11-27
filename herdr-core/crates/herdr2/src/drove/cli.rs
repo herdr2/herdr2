@@ -190,6 +190,12 @@ pub enum DroveAction {
         verify: Option<String>,
         #[arg(long)]
         worktree: bool,
+        /// Warm-fork initial context from `coordinator` or an upstream `<task_key>`.
+        #[arg(long, value_name = "SOURCE")]
+        fork_from: Option<String>,
+        /// Subscribe this task to shared contract channels (comma-separated).
+        #[arg(long, value_delimiter = ',', value_name = "CHANNELS")]
+        channels: Vec<String>,
         #[arg(long, value_name = "MACHINE")]
         on: Option<String>,
     },
@@ -204,6 +210,9 @@ pub enum DroveAction {
         verify: Option<String>,
         #[arg(long)]
         worktree: bool,
+        /// Warm-fork initial context from `coordinator`.
+        #[arg(long, value_name = "SOURCE")]
+        fork_from: Option<String>,
         #[arg(long)]
         wait: bool,
         #[arg(long, value_name = "MACHINE")]
@@ -321,7 +330,7 @@ pub enum DroveAction {
         #[arg(long, value_name = "MACHINE")]
         on: Option<String>,
     },
-    /// Override role/agent/model/effort assignment on a pending or ready task.
+    /// Override role/agent/model/effort assignment on a pending/ready task (or switch a running worker's model in place with `--in-place`).
     Route {
         task: String,
         #[arg(long)]
@@ -334,6 +343,49 @@ pub enum DroveAction {
         effort: Option<String>,
         #[arg(long)]
         worker: Option<String>,
+        /// Switch the live worker's model/effort in place without restarting a running attempt.
+        #[arg(long)]
+        in_place: bool,
+        #[arg(long)]
+        run: Option<String>,
+        #[arg(long, value_name = "MACHINE")]
+        on: Option<String>,
+    },
+    /// Edit an unstarted (`pending`/`ready`/`skipped`/`failed`) task's spec, dependencies, isolation, or timeouts in place.
+    Edit {
+        task: String,
+        #[arg(long, value_name = "FILE")]
+        file: Option<PathBuf>,
+        #[arg(long)]
+        stdin: bool,
+        #[arg(long)]
+        title: Option<String>,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long)]
+        change: Option<String>,
+        #[arg(long)]
+        acceptance: Option<String>,
+        #[arg(long)]
+        constraints: Option<String>,
+        #[arg(long)]
+        ownership: Option<String>,
+        #[arg(long)]
+        verify: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        deps: Option<Vec<String>>,
+        #[arg(long, conflicts_with = "deps")]
+        clear_deps: bool,
+        #[arg(long)]
+        role: Option<String>,
+        #[arg(long, conflicts_with = "no_worktree")]
+        worktree: bool,
+        #[arg(long, conflicts_with = "worktree")]
+        no_worktree: bool,
+        #[arg(long)]
+        timeout: Option<u64>,
+        #[arg(long)]
+        no_review: bool,
         #[arg(long)]
         run: Option<String>,
         #[arg(long, value_name = "MACHINE")]
@@ -342,6 +394,9 @@ pub enum DroveAction {
     /// Cancel a specific task (by ID/key) or an entire Run.
     Cancel {
         target: Option<String>,
+        /// Detach this cancelled task from downstream pending tasks so downstream tasks are not cascade-skipped.
+        #[arg(long)]
+        skip_ok: bool,
         #[arg(long)]
         run: Option<String>,
         #[arg(long, value_name = "MACHINE")]
@@ -430,7 +485,7 @@ pub enum WorkerAction {
         #[arg(long)]
         attempt: Option<String>,
     },
-    /// Read a dependency task result, verify log, or review patch slice.
+    /// Read a dependency task result, `#contract:<seq>`, verify log, or review patch slice.
     Read {
         target: String,
         #[arg(long, default_value_t = 0)]
@@ -439,10 +494,36 @@ pub enum WorkerAction {
         limit: usize,
         #[arg(long)]
         grep: Option<String>,
+        /// Optional JSON dot-path selector (e.g. `items.0.path`) when reading structured task/contract data.
+        #[arg(long, value_name = "JSON_PATH")]
+        path: Option<String>,
         /// Optional explicit attempt ID (defaults to worker's live active attempt).
         #[arg(long)]
         attempt: Option<String>,
     },
+    /// Publish or list shared interface contracts on a Run channel.
+    Contract {
+        /// Publish a contract entry (omit to list contracts).
+        #[arg(long)]
+        publish: bool,
+        #[arg(long, default_value = "main")]
+        channel: String,
+        #[arg(long)]
+        key: Option<String>,
+        #[arg(long)]
+        summary: Option<String>,
+        #[arg(long)]
+        data: Option<String>,
+        #[arg(long)]
+        attempt: Option<String>,
+    },
+    /// Fast zero-RPC check whether target file paths satisfy the worker role's `allowedPaths`.
+    CheckPath {
+        #[arg(required = true)]
+        paths: Vec<String>,
+    },
+    /// Fast zero-RPC PreToolUse hook reading tool JSON from stdin and exiting 2 on out-of-scope edits.
+    GuardHook,
     /// Submit task attempt completion or explicit failure to the Drove daemon gates.
     Done {
         #[arg(long, default_value = "done")]
@@ -1146,7 +1227,7 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             }
             Ok((out, human))
         }
-        DroveAction::Add { run, file, stdin, key, title, change, role, deps, verify, worktree, on } => {
+        DroveAction::Add { run, file, stdin, key, title, change, role, deps, verify, worktree, fork_from, channels, on } => {
             let run_id = resolve_run_id(paths, on.as_deref(), run, ResolveMode::Write)?;
             let mut body = if file.is_some() || stdin {
                 let parsed = read_plan_input(file, stdin)?;
@@ -1175,6 +1256,12 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
                 if let Some(r) = role {
                     t["assign"] = json!({ "role": r });
                 }
+                if let Some(fk) = fork_from {
+                    t["forkFrom"] = Value::String(fk);
+                }
+                if !channels.is_empty() {
+                    t["channels"] = json!(channels);
+                }
                 json!({ "tasks": [t] })
             };
             if let Some(obj) = body.as_object_mut()
@@ -1190,24 +1277,26 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             }
             Ok((res, human))
         }
-        DroveAction::Quick { prompt, role, cwd, verify, worktree, wait, on } => {
+        DroveAction::Quick { prompt, role, cwd, verify, worktree, fork_from, wait, on } => {
             let cwd_resolved = cwd.unwrap_or_else(|| {
                 std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".into())
             });
-            let task = json!({
-                "tasks": [{
-                    "key": "task",
-                    "title": prompt.chars().take(60).collect::<String>(),
-                    "spec": {
-                        "target": "workspace",
-                        "change": prompt,
-                        "acceptance": "Complete task cleanly",
-                        "verify": verify,
-                    },
-                    "assign": { "role": role },
-                    "isolation": if worktree { "worktree" } else { "none" },
-                }]
+            let mut one_task = json!({
+                "key": "task",
+                "title": prompt.chars().take(60).collect::<String>(),
+                "spec": {
+                    "target": "workspace",
+                    "change": prompt,
+                    "acceptance": "Complete task cleanly",
+                    "verify": verify,
+                },
+                "assign": { "role": role },
+                "isolation": if worktree { "worktree" } else { "none" },
             });
+            if let Some(fk) = fork_from {
+                one_task["forkFrom"] = Value::String(fk);
+            }
+            let task = json!({ "tasks": [one_task] });
             let preflight = proxy_call(
                 paths,
                 on.as_deref(),
@@ -1364,7 +1453,7 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             };
             Ok((res, format!("retried {tid}{stage_note}")))
         }
-        DroveAction::Route { task, role, agent, model, effort, worker, run, on } => {
+        DroveAction::Route { task, role, agent, model, effort, worker, in_place, run, on } => {
             let tid = resolve_task_id(paths, on.as_deref(), run, &task, ResolveMode::Write)?;
             let res = proxy_call(
                 paths,
@@ -1378,11 +1467,86 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
                     "model": model,
                     "effort": effort,
                     "worker": worker,
+                    "inPlace": in_place,
                 })),
             )?;
-            Ok((res, format!("updated assignment on {tid}")))
+            let label = if in_place { "switched live worker model in place on" } else { "updated assignment on" };
+            Ok((res, format!("{label} {tid}")))
         }
-        DroveAction::Cancel { target, run, on } => {
+        DroveAction::Edit {
+            task,
+            file,
+            stdin,
+            title,
+            target,
+            change,
+            acceptance,
+            constraints,
+            ownership,
+            verify,
+            deps,
+            clear_deps,
+            role,
+            worktree,
+            no_worktree,
+            timeout,
+            no_review,
+            run,
+            on,
+        } => {
+            let tid = resolve_task_id(paths, on.as_deref(), run, &task, ResolveMode::Write)?;
+            let mut patch = if file.is_some() || stdin {
+                read_plan_input(file, stdin)?
+            } else {
+                json!({})
+            };
+            let obj = patch
+                .as_object_mut()
+                .ok_or_else(|| RpcError::invalid_params("edit patch must be a JSON/YAML object"))?;
+            if let Some(t) = title {
+                obj.insert("title".into(), Value::String(t));
+            }
+            if let Some(t) = target {
+                obj.insert("target".into(), Value::String(t));
+            }
+            if let Some(c) = change {
+                obj.insert("change".into(), Value::String(c));
+            }
+            if let Some(a) = acceptance {
+                obj.insert("acceptance".into(), Value::String(a));
+            }
+            if let Some(c) = constraints {
+                obj.insert("constraints".into(), Value::String(c));
+            }
+            if let Some(o) = ownership {
+                obj.insert("ownership".into(), Value::String(o));
+            }
+            if let Some(v) = verify {
+                obj.insert("verify".into(), if v.trim().is_empty() { Value::Null } else { Value::String(v) });
+            }
+            if clear_deps {
+                obj.insert("deps".into(), json!([]));
+            } else if let Some(d) = deps {
+                obj.insert("deps".into(), json!(d));
+            }
+            if let Some(r) = role {
+                obj.insert("role".into(), Value::String(r));
+            }
+            if worktree {
+                obj.insert("isolation".into(), Value::String("worktree".into()));
+            } else if no_worktree {
+                obj.insert("isolation".into(), Value::String("none".into()));
+            }
+            if let Some(sec) = timeout {
+                obj.insert("timeoutSec".into(), json!(sec));
+            }
+            if no_review {
+                obj.insert("noReview".into(), Value::Bool(true));
+            }
+            let res = proxy_call(paths, on.as_deref(), "PATCH", &format!("/api/tasks/{tid}"), "", Some(patch))?;
+            Ok((res, format!("edited task {tid}")))
+        }
+        DroveAction::Cancel { target, skip_ok, run, on } => {
             if let Some(tgt) = target {
                 if tgt.starts_with("run_") {
                     let res = proxy_call(
@@ -1396,8 +1560,14 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
                     return Ok((res, format!("cancelled run {tgt}")));
                 }
                 let tid = resolve_task_id(paths, on.as_deref(), run, &tgt, ResolveMode::Write)?;
-                let res =
-                    proxy_call(paths, on.as_deref(), "POST", &format!("/api/tasks/{tid}/cancel"), "", Some(json!({})))?;
+                let res = proxy_call(
+                    paths,
+                    on.as_deref(),
+                    "POST",
+                    &format!("/api/tasks/{tid}/cancel"),
+                    "",
+                    Some(json!({ "skipOk": skip_ok })),
+                )?;
                 return Ok((res, format!("cancelled task {tid}")));
             }
             let run_id = resolve_run_id(paths, on.as_deref(), run, ResolveMode::Write)?;
@@ -1576,8 +1746,12 @@ fn compact_show_snapshot(mut snap: Value) -> Value {
         .as_array()
         .is_some_and(|arr| arr.iter().any(|m| m["needsAction"] == true && m["handledAt"].is_null()));
     let needs_attention = pending_msgs || any_failed || !review_verdicts.is_empty() || any_circuit_attention;
+    let briefing_headline = snap["run"]["briefing"]["headline"].as_str().map(String::from);
     if let Some(obj) = snap.as_object_mut() {
         obj.insert("needsAttention".into(), Value::Bool(needs_attention));
+        if let Some(hl) = briefing_headline {
+            obj.insert("briefingHeadline".into(), Value::String(hl));
+        }
         if !review_verdicts.is_empty() {
             obj.insert("reviewVerdicts".into(), Value::Array(review_verdicts));
         }
@@ -1624,6 +1798,9 @@ fn format_wait_human(run_id: &str, res: &Value) -> String {
             })
             .collect();
         parts.push(format!("reviewCircuits=[{}]", items.join(",")));
+    }
+    if let Some(hl) = res["run"]["briefing"]["headline"].as_str().filter(|s| !s.is_empty()) {
+        parts.push(format!("headline={hl:?}"));
     }
     format!("run {run_id}: {}", parts.join(" "))
 }
@@ -1704,6 +1881,11 @@ fn wait_loop(
 }
 
 fn execute_worker_action(action: WorkerAction) -> Result<(Value, String), RpcError> {
+    match action {
+        WorkerAction::CheckPath { paths } => return execute_worker_check_path(&paths),
+        WorkerAction::GuardHook => return execute_worker_guard_hook(),
+        _ => {}
+    }
     let url = std::env::var("H2_DROVE_URL")
         .map_err(|_| RpcError::invalid_params("H2_DROVE_URL is not set (must be run inside a Drove worker)"))?;
     let tok = std::env::var("H2_DROVE_WORKER_TOKEN")
@@ -1787,7 +1969,7 @@ fn execute_worker_action(action: WorkerAction) -> Result<(Value, String), RpcErr
             let val = worker_http_post(&url, &tok, "/api/worker/note", &body)?;
             Ok((val, "note recorded".into()))
         }
-        WorkerAction::Read { target, offset, limit, grep, attempt } => {
+        WorkerAction::Read { target, offset, limit, grep, path, attempt } => {
             let (att_id, explicit) = resolve_attempt(attempt)?;
             let mut body = json!({
                 "target": target,
@@ -1795,10 +1977,41 @@ fn execute_worker_action(action: WorkerAction) -> Result<(Value, String), RpcErr
                 "limit": limit,
                 "grep": grep,
             });
+            if let Some(jp) = path {
+                body["jsonPath"] = Value::String(jp);
+            }
             attach_worker_meta(&mut body, att_id, explicit);
             let val = worker_http_post(&url, &tok, "/api/worker/read", &body)?;
             Ok((val.clone(), serde_json::to_string_pretty(&val).unwrap_or_default()))
         }
+        WorkerAction::Contract { publish, channel, key, summary, data, attempt } => {
+            let (att_id, explicit) = resolve_attempt(attempt)?;
+            let mut body = if publish {
+                let parsed_payload = match data {
+                    Some(raw) if !raw.trim().is_empty() => Some(
+                        serde_json::from_str::<Value>(&raw)
+                            .map_err(|e| RpcError::invalid_params(format!("--data is not valid JSON: {e}")))?,
+                    ),
+                    _ => None,
+                };
+                json!({
+                    "action": "publish",
+                    "channel": channel,
+                    "key": key,
+                    "summary": summary,
+                    "payload": parsed_payload,
+                })
+            } else {
+                json!({
+                    "action": "list",
+                    "channel": (!channel.trim().is_empty() && channel != "main").then_some(channel),
+                })
+            };
+            attach_worker_meta(&mut body, att_id, explicit);
+            let val = worker_http_post(&url, &tok, "/api/worker/contract", &body)?;
+            Ok((val.clone(), serde_json::to_string_pretty(&val).unwrap_or_default()))
+        }
+        WorkerAction::CheckPath { .. } | WorkerAction::GuardHook => unreachable!(),
         WorkerAction::Done { outcome, summary, reason, data, files, no_retry, attempt } => {
             let (att_id, explicit) = resolve_attempt(attempt)?;
             let parsed_data = match data {
@@ -1829,6 +2042,68 @@ fn execute_worker_action(action: WorkerAction) -> Result<(Value, String), RpcErr
             Ok((val, "reported worker result".into()))
         }
     }
+}
+
+fn worker_env_guard_spec() -> (String, super::types::RoleAccessMode, Vec<String>) {
+    let cwd = std::env::var("H2_DROVE_WORK_CWD")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .or_else(|| std::env::current_dir().ok().map(|p| p.display().to_string()))
+        .unwrap_or_else(|| ".".into());
+    let access = match std::env::var("H2_DROVE_ACCESS").unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+        "readonly" => super::types::RoleAccessMode::Readonly,
+        "scoped_write" => super::types::RoleAccessMode::ScopedWrite,
+        _ => super::types::RoleAccessMode::Writable,
+    };
+    let allowed: Vec<String> = std::env::var("H2_DROVE_ALLOWED_PATHS")
+        .ok()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok())
+        .unwrap_or_default();
+    (cwd, access, allowed)
+}
+
+fn execute_worker_check_path(paths: &[String]) -> Result<(Value, String), RpcError> {
+    let (cwd, access, allowed) = worker_env_guard_spec();
+    match super::roles::check_pre_tool_paths(&cwd, access, &allowed, paths) {
+        Ok(()) => Ok((json!({ "ok": true, "access": access }), "allowed".into())),
+        Err(reason) => Err(RpcError::new("role_scope_violation", reason, "")),
+    }
+}
+
+fn execute_worker_guard_hook() -> Result<(Value, String), RpcError> {
+    let (cwd, access, allowed) = worker_env_guard_spec();
+    if access == super::types::RoleAccessMode::Writable {
+        return Ok((json!({}), "{}".into()));
+    }
+    let mut raw = String::new();
+    let _ = std::io::stdin().read_to_string(&mut raw);
+    let payload: Value = serde_json::from_str(raw.trim()).unwrap_or_else(|_| json!({}));
+    let tool_name = payload["tool_name"]
+        .as_str()
+        .or_else(|| payload["toolName"].as_str())
+        .or_else(|| payload["name"].as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let is_write_tool = matches!(
+        tool_name.as_str(),
+        "edit"
+            | "write"
+            | "multiedit"
+            | "notebookedit"
+            | "edit_file"
+            | "write_file"
+            | "create_file"
+            | "delete_file"
+            | "replace_in_file"
+    );
+    let targets = super::roles::extract_tool_target_paths(&payload);
+    if (is_write_tool || !targets.is_empty())
+        && let Err(reason) = super::roles::check_pre_tool_paths(&cwd, access, &allowed, &targets)
+    {
+        eprintln!("{reason}");
+        std::process::exit(2);
+    }
+    Ok((json!({}), "{}".into()))
 }
 
 fn worker_http_post(base_url: &str, token: &str, path: &str, body: &Value) -> Result<Value, RpcError> {

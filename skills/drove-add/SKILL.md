@@ -15,12 +15,14 @@ h2 drove add \
   --key fix-lint \
   --title "Fix clippy warnings" \
   --role coder \
+  --fork-from coordinator \
+  --channels api \
   --change "Resolve clippy warnings in src/drove/" \
   --deps impl \
   --verify "cargo clippy --all-targets"
 ```
 
-Pass `--worktree` to isolate the task in a detached Git / AOSP harness worktree merged back automatically on completion. If Drove returns `worktree_not_ready`, report the blocker reason and fix hint to the user before retrying.
+Pass `--worktree` to isolate the task in a detached Git / AOSP harness worktree merged back automatically on completion, `--fork-from <coordinator|task_key>` to warm-fork conversation context, and `--channels <c1,c2>` to subscribe the task to shared `#contract:<seq>` entries. If Drove returns `worktree_not_ready`, report the blocker reason and fix hint to the user before retrying.
 
 ## Batch Tasks (YAML/JSON)
 

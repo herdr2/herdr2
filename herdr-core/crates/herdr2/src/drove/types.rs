@@ -364,9 +364,20 @@ pub struct ForeachFrom {
     pub path: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewMode {
+    #[default]
+    Static,
+    Breaker,
+    Hybrid,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ReviewMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -381,6 +392,15 @@ pub struct ReviewSpec {
     pub criteria: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_rounds: Option<u32>,
+    /// Allowed test file globs writable by the adversarial Breaker worker (`tests/**`, `**/*_test.*`, ...).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub test_paths: Option<Vec<String>>,
+    /// Verification command run inside the throwaway Breaker worktree (defaults to `task.spec.verify`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verify_cmd: Option<String>,
+    /// Keep passing regression tests authored by the Breaker worker when merging back (default false).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_regression_tests: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -589,6 +609,86 @@ pub struct AiUsage {
     pub cost: f64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BriefingRef {
+    /// Entity kind (`"task"`, `"attempt"`, `"message"`, `"event"`, or `"contract"`).
+    pub kind: String,
+    /// Verified entity identifier (`tsk_...`/key, `att_...`, `msg_...`, event id, or contract seq).
+    pub target: String,
+    /// Compact clickable badge label (`"impl"`, `"#msg_2"`, `"ev#42"`, `"#c1"`).
+    pub label: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BriefingThread {
+    pub id: String,
+    pub title: String,
+    /// `"blocked"` | `"active"` | `"queued"` | `"done"` | `"failed"`.
+    pub state: String,
+    pub now: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<BriefingRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BriefingAlert {
+    pub id: String,
+    /// `"decision"` | `"circuit"` | `"failure"` | `"review"` | `"stall"` | `"budget"`.
+    pub kind: String,
+    /// `"high"` | `"medium"` | `"low"`.
+    pub severity: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub why: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<BriefingRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct BriefingNote {
+    pub id: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub refs: Vec<BriefingRef>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RunBriefing {
+    pub version: u32,
+    pub as_of_event_id: u64,
+    pub updated_at: String,
+    pub headline: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub running_summary: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub threads: Vec<BriefingThread>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attention: Vec<BriefingAlert>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub risks: Vec<BriefingNote>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ContractPost {
+    pub seq: u64,
+    pub run_id: String,
+    pub channel: String,
+    pub key: String,
+    pub author_task: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_id: Option<String>,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
+    pub created_at: String,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct Run {
@@ -620,6 +720,8 @@ pub struct Run {
     pub status_before_trash: Option<RunStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ai_usage: Option<AiUsage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub briefing: Option<RunBriefing>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub machine: Option<String>,
     pub created_at: String,
@@ -743,6 +845,15 @@ pub struct Task {
     /// Defaults to `false` so reviewer/business conclusions immediately fail and wake the coordinator.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_on_worker_reported: Option<bool>,
+    /// Optional warm-context fork source (`"coordinator"` or upstream `<task_key>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_from: Option<String>,
+    /// Fork delivery strategy (`"auto"`, `"native"`, or `"package"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_mode: Option<String>,
+    /// Subscribed shared contract channels (`main` is always visible).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub channels: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1127,6 +1238,8 @@ pub struct RunSnapshot {
     pub stats: RunStats,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stalls: Option<Vec<StallSignal>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contracts: Option<Vec<ContractPost>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -1263,6 +1376,8 @@ pub struct AiSettings {
     pub conflict_policy: String,
     #[serde(default = "default_loop_detect")]
     pub loop_detect: String,
+    #[serde(default = "default_true")]
+    pub run_narrator: bool,
 }
 
 fn default_true() -> bool {
@@ -1298,6 +1413,7 @@ impl Default for AiSettings {
             question_mode: default_question_mode(),
             conflict_policy: default_conflict_policy(),
             loop_detect: default_loop_detect(),
+            run_narrator: true,
         }
     }
 }
@@ -1385,6 +1501,8 @@ pub struct AiSwitches {
     pub conflict_policy: String,
     pub question_mode: String,
     pub loop_detect: String,
+    #[serde(default = "default_true")]
+    pub run_narrator: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1449,6 +1567,8 @@ pub struct DroveAiPatch {
     pub conflict_policy: Option<String>,
     #[serde(default)]
     pub loop_detect: Option<String>,
+    #[serde(default)]
+    pub run_narrator: Option<bool>,
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]

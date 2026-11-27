@@ -558,6 +558,17 @@ export default class FlashNote extends View {
     cx.notify();
   }
 
+  startPolishIdea(cx, entryIndex = null) {
+    if (this.polishing || this.busy || checking()) return;
+    if (typeof cx?.spawn === "function") {
+      cx.spawn(async (taskCx) => {
+        await this.polishIdea(taskCx, entryIndex);
+      });
+    } else {
+      this.polishIdea(cx, entryIndex);
+    }
+  }
+
   async polishIdea(cx, entryIndex = null) {
     let entry = entryIndex !== null ? this.entryStates?.[entryIndex] : this.activeEntry();
     if (!entry || !String(entry.input?.value?.() ?? "").trim()) {
@@ -571,7 +582,7 @@ export default class FlashNote extends View {
       : (this.newRuntimeMode === "cli" ? "cli" : "acp");
     this.polishing = true;
     this.error = null;
-    cx.notify();
+    try { cx?.notify?.(); } catch {}
     try {
       const args = [
         "ai",
@@ -608,6 +619,7 @@ export default class FlashNote extends View {
         const polished = String(parsed?.polished ?? "").trim();
         if (parsed?.usedAi && polished) {
           const summary = parsed?.summary ? String(parsed.summary).trim() : null;
+          this.polishing = false;
           if (entry) {
             const idx = this.entryStates.indexOf(entry);
             if (idx >= 0) this.activeEntryIndex = idx;
@@ -632,7 +644,7 @@ export default class FlashNote extends View {
       this.error = tr(`AI polish failed: ${e?.message ?? e}`, `AI 润色失败：${e?.message ?? e}`);
     } finally {
       this.polishing = false;
-      cx.notify();
+      try { cx?.notify?.(); } catch {}
     }
   }
 
@@ -3122,7 +3134,7 @@ export default class FlashNote extends View {
               .text_size(11.5)
               .font_medium()
               .text_color(canPolish || this.polishing ? purple : t.dim)
-              .when(canPolish, (e) => e.cursor_pointer().hover((s) => s.bg(withAlpha(purple, "2c"))).on_click((_e, cx) => this.polishIdea(cx)))
+              .when(canPolish, (e) => e.cursor_pointer().hover((s) => s.bg(withAlpha(purple, "2c"))).on_click((_e, cx) => this.startPolishIdea(cx)))
               .tooltip(withShortcut(tr("Polish prompt with Core AI for clarity", "使用 Core AI 润色提示词，让表达更清晰"), "prompt.polish"))
               .child(
                 this.polishing

@@ -62,6 +62,29 @@ impl DrovePaths {
         crate::platform::private_dir(&self.artifacts_dir)?;
         Ok(())
     }
+
+    pub fn worker_tokens_file(&self) -> PathBuf {
+        self.secrets_dir.join("worker-tokens.json")
+    }
+}
+
+pub fn load_worker_tokens(paths: &DrovePaths) -> std::collections::HashMap<String, String> {
+    let file = paths.worker_tokens_file();
+    std::fs::read_to_string(file)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_worker_tokens(paths: &DrovePaths, tokens: &std::collections::HashMap<String, String>) {
+    let file = paths.worker_tokens_file();
+    if tokens.is_empty() {
+        let _ = std::fs::remove_file(file);
+        return;
+    }
+    if let Ok(json_text) = serde_json::to_string(tokens) {
+        let _ = write_secret_file(&file, &format!("{json_text}\n"));
+    }
 }
 
 pub const BUILTIN_ROLE_IDS: [&str; 6] = ["coder", "tester", "writer", "illustrator", "reviewer", "researcher"];

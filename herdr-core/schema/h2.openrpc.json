@@ -260,6 +260,22 @@
           "auto_install": {
             "type": "boolean"
           },
+          "config_path": {
+            "type": "string"
+          },
+          "custom_registry_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "default_permissions": {
+            "type": "string"
+          },
+          "inject_mcp": {
+            "default": false,
+            "type": "boolean"
+          },
           "registry_url": {
             "type": "string"
           }
@@ -908,6 +924,10 @@
             "default": "draft",
             "type": "string"
           },
+          "runNarrator": {
+            "default": true,
+            "type": "boolean"
+          },
           "taskEnrich": {
             "default": true,
             "type": "boolean"
@@ -1047,6 +1067,10 @@
           },
           "questionMode": {
             "type": "string"
+          },
+          "runNarrator": {
+            "default": true,
+            "type": "boolean"
           },
           "taskEnrich": {
             "type": "boolean"
@@ -2515,6 +2539,13 @@
               "null"
             ]
           },
+          "runNarrator": {
+            "default": null,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "taskEnrich": {
             "default": null,
             "type": [
@@ -2546,6 +2577,7 @@
               "loopDetect": "off",
               "model": "",
               "questionMode": "draft",
+              "runNarrator": true,
               "taskEnrich": true,
               "verifyDigest": true
             }
@@ -6272,7 +6304,7 @@
       "name": "Apache-2.0"
     },
     "title": "herdr2",
-    "version": "2.0.16"
+    "version": "2.0.17"
   },
   "methods": [
     {
@@ -13577,6 +13609,113 @@
         "name": "result",
         "schema": {
           "$ref": "#/components/schemas/AdapterInstallResult"
+        }
+      }
+    },
+    {
+      "description": "Update ACP adapter and runtime defaults (auto_install_adapters, acp_registry_url, default_permissions, inject_mcp) in config.toml.",
+      "errors": [
+        {
+          "code": -32602,
+          "data": {
+            "kind": "invalid_params"
+          },
+          "message": "invalid_params"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "machine_unknown"
+          },
+          "message": "machine_unknown"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "unavailable"
+          },
+          "message": "unavailable"
+        },
+        {
+          "code": -32000,
+          "data": {
+            "kind": "config"
+          },
+          "message": "config"
+        }
+      ],
+      "name": "adapter.config.set",
+      "paramStructure": "by-name",
+      "params": [
+        {
+          "description": "Custom ACP Registry index URL (pass empty string to reset to default).",
+          "name": "acp_registry_url",
+          "required": false,
+          "schema": {
+            "description": "Custom ACP Registry index URL (pass empty string to reset to default).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Enable or disable background/on-demand auto-installation of managed ACP adapters.",
+          "name": "auto_install_adapters",
+          "required": false,
+          "schema": {
+            "description": "Enable or disable background/on-demand auto-installation of managed ACP adapters.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Default ACP permission policy (`approve-reads`, `approve-all`, `ask`, `deny-all`).",
+          "name": "default_permissions",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/PermissionMode"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Default ACP permission policy (`approve-reads`, `approve-all`, `ask`, `deny-all`)."
+          }
+        },
+        {
+          "description": "Auto-inject the built-in `herdr2` MCP server into ACP sessions.",
+          "name": "inject_mcp",
+          "required": false,
+          "schema": {
+            "description": "Auto-inject the built-in `herdr2` MCP server into ACP sessions.",
+            "type": [
+              "boolean",
+              "null"
+            ]
+          }
+        },
+        {
+          "description": "Target remote machine (`h2 machine ls`).",
+          "name": "on",
+          "required": false,
+          "schema": {
+            "description": "Target remote machine (`h2 machine ls`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      ],
+      "result": {
+        "name": "result",
+        "schema": {
+          "$ref": "#/components/schemas/AdapterStatusResult"
         }
       }
     },

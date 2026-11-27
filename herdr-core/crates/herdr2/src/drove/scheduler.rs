@@ -68,9 +68,14 @@ pub async fn tick_once(core: &Arc<Core>) {
         promote_pending_tasks(core, &tasks);
         tasks = core.drove.store.list_tasks(&run.id);
 
-        // 3. Check silence / stall / timeout watchdog for Running tasks.
+        // 3. Check wall-clock timeouts and silence / stall watchdog for Running tasks.
         check_running_timeouts_and_stalls(core, &run, &tasks).await;
         tasks = core.drove.store.list_tasks(&run.id);
+
+        // 3b. Enforce Run token / cost budget before dispatching additional Ready tasks.
+        if check_run_budget(core, &run).await {
+            continue;
+        }
 
         if !tasks.is_empty() && tasks.iter().filter(|t| t.template != Some(true)).all(|t| is_terminal_status(t.status))
         {
@@ -78,8 +83,17 @@ pub async fn tick_once(core: &Arc<Core>) {
         }
 
         // 4. Recompute concurrency & dispatch Ready tasks (`exec` or `agent`).
+        // Exclude workers parked in `drove worker ask` (waiting on human/coordinator reply) and
+        // read-only adversarial reviewers so waiting questions never starve independent ready tasks.
         let workers = core.drove.store.list_workers(Some(&run.id));
-        let busy_agents = workers.iter().filter(|w| w.state == WorkerState::Busy).count() as u32;
+        let busy_agents = workers
+            .iter()
+            .filter(|w| {
+                w.state == WorkerState::Busy
+                    && w.read_only_dir.is_none()
+                    && !w.current_attempt_id.as_deref().is_some_and(|aid| core.drove.has_active_ask(aid))
+            })
+            .count() as u32;
         let running_execs =
             tasks.iter().filter(|t| t.status == TaskStatus::Running && t.kind.as_deref() == Some("exec")).count()
                 as u32;
@@ -245,6 +259,7 @@ pub async fn tick_once(core: &Arc<Core>) {
                         && w.agent == decision.agent
                         && w.role.as_deref().unwrap_or("coder") == decision.role
                         && explicit_worker.is_none_or(|eid| w.id == eid)
+                        && super::router::is_worker_healthy_for_warm_reuse(w, &task)
                         && w.worktree
                             .as_deref()
                             .is_some_and(|p| !p.trim().is_empty() && std::path::Path::new(p).is_dir())
@@ -414,6 +429,9 @@ fn expand_foreach_from(core: &Arc<Core>, run: &Run, tasks: &[Task]) {
                 cache: tpl.cache.clone(),
                 cached_from: None,
                 retry_on_worker_reported: tpl.retry_on_worker_reported,
+                fork_from: tpl.fork_from.clone(),
+                fork_mode: tpl.fork_mode.clone(),
+                channels: tpl.channels.clone(),
             });
         }
         let _ = core.drove.store.update_task(&tpl.id, |t| {
@@ -513,6 +531,149 @@ pub(super) fn promote_pending_tasks(core: &Arc<Core>, tasks: &[Task]) {
     }
 }
 
+/// Sums total cumulative `(tokens, cost_usd)` across all attempts and control-plane AI calls of `run`.
+pub fn compute_run_usage(store: &super::store::Store, run: &Run) -> (u64, f64) {
+    let mut total_tokens = 0u64;
+    let mut total_cost = 0.0f64;
+    for att in store.list_attempts(Some(&run.id), None, None) {
+        total_tokens =
+            total_tokens.saturating_add(att.tokens.input + att.tokens.output + att.tokens.cache_read);
+        if let Some(c) = att.cost.filter(|c| c.is_finite() && *c > 0.0) {
+            total_cost += c;
+        }
+    }
+    if let Some(ai) = &run.ai_usage {
+        total_tokens = total_tokens.saturating_add(ai.input_tokens + ai.output_tokens + ai.cache_hit_tokens);
+        if ai.cost.is_finite() && ai.cost > 0.0 {
+            total_cost += ai.cost;
+        }
+    }
+    (total_tokens, total_cost)
+}
+
+async fn check_run_budget(core: &Arc<Core>, run: &Run) -> bool {
+    let Some(budget) = &run.budget else {
+        return false;
+    };
+    let tok_cap = budget.tokens.filter(|&t| t > 0);
+    let cost_cap = budget.cost.filter(|&c| c.is_finite() && c > 0.0);
+    if tok_cap.is_none() && cost_cap.is_none() {
+        return false;
+    }
+
+    let (used_tokens, used_cost) = compute_run_usage(&core.drove.store, run);
+    let tok_exceeded = tok_cap.is_some_and(|cap| used_tokens >= cap);
+    let cost_exceeded = cost_cap.is_some_and(|cap| used_cost >= cap);
+
+    if (tok_exceeded || cost_exceeded) && !core.drove.is_budget_already_acked(&run.id, used_tokens, used_cost) {
+        let reason_detail = match (tok_cap, cost_cap) {
+            (Some(tc), _) if tok_exceeded => format!("tokens {used_tokens}/{tc}"),
+            (_, Some(cc)) => format!("cost ${used_cost:.4}/${cc:.4}"),
+            _ => format!("tokens={used_tokens}, cost=${used_cost:.4}"),
+        };
+        let subject = format!("Run budget exceeded ({reason_detail}) — scheduling paused");
+        let body = format!(
+            "Run `{}` reached its configured budget ({reason_detail}) and has been paused before dispatching new tasks.\n\
+             Resume execution via `h2 drove resume {}` or raise `budget` via `PATCH /api/runs/{}`.",
+            run.id, run.id, run.id
+        );
+        let msg = core.drove.store.post_message(super::store::PostMessageInput {
+            run_id: run.id.clone(),
+            kind: MessageType::Budget,
+            from: "drove".into(),
+            to: "coordinator".into(),
+            thread_id: None,
+            task_id: None,
+            attempt_id: None,
+            subject: subject.clone(),
+            body: Some(body),
+            options: Some(vec!["Raise budget and resume".into(), "Resume anyway".into(), "Cancel remaining tasks".into()]),
+            recommend: Some(format!("Inspect usage or run `h2 drove resume {}`", run.id)),
+            why: Some(format!("Configured Run budget exceeded ({reason_detail})")),
+            raised_by: Some("scheduler".into()),
+            raised_by_worker: None,
+            tag: Some("budget_exceeded".into()),
+            ai_draft: None,
+            needs_action: true,
+        });
+        let _ = core.drove.store.update_run(&run.id, |r| {
+            if r.status == RunStatus::Active {
+                r.status = RunStatus::Paused;
+                r.pause_reason = Some("budget_exceeded".into());
+            }
+        });
+        core.drove.store.append_daemon_event(super::store::NewDaemonEvent {
+            run_id: Some(run.id.clone()),
+            task_id: None,
+            attempt_id: None,
+            worker_id: None,
+            message_id: Some(msg.id.clone()),
+            category: "schedule".into(),
+            kind: "budget_exceeded".into(),
+            status: "warn".into(),
+            title: subject.clone(),
+            detail: Some(reason_detail.clone()),
+            duration_ms: None,
+            tokens: None,
+            cost: None,
+        });
+        notify_coordinator(
+            core,
+            run,
+            "budget_exceeded",
+            &subject,
+            &format!("[drove] [BUDGET EXCEEDED] Run `{}` paused ({reason_detail}). Resume: `h2 drove resume {}`", run.id, run.id),
+            None,
+            None,
+            None,
+            Some(&msg.id),
+        )
+        .await;
+        return true;
+    }
+
+    let tok_warn = tok_cap.is_some_and(|cap| used_tokens.saturating_mul(100) >= cap.saturating_mul(80));
+    let cost_warn = cost_cap.is_some_and(|cap| used_cost >= cap * 0.80);
+    if (tok_warn || cost_warn) && core.drove.mark_budget_warned(&run.id) {
+        let detail = format!("tokens={used_tokens}, cost=${used_cost:.4}");
+        let _ = core.drove.store.post_message(super::store::PostMessageInput {
+            run_id: run.id.clone(),
+            kind: MessageType::Budget,
+            from: "drove".into(),
+            to: "coordinator".into(),
+            thread_id: None,
+            task_id: None,
+            attempt_id: None,
+            subject: format!("Run `{}` reached 80% of budget ({detail})", run.id),
+            body: None,
+            options: None,
+            recommend: None,
+            why: Some("80% soft budget threshold".into()),
+            raised_by: Some("scheduler".into()),
+            raised_by_worker: None,
+            tag: Some("budget_warn".into()),
+            ai_draft: None,
+            needs_action: false,
+        });
+        core.drove.store.append_daemon_event(super::store::NewDaemonEvent {
+            run_id: Some(run.id.clone()),
+            task_id: None,
+            attempt_id: None,
+            worker_id: None,
+            message_id: None,
+            category: "schedule".into(),
+            kind: "budget_warn".into(),
+            status: "warn".into(),
+            title: format!("Run `{}` crossed 80% budget warning", run.id),
+            detail: Some(detail),
+            duration_ms: None,
+            tokens: None,
+            cost: None,
+        });
+    }
+    false
+}
+
 async fn check_running_timeouts_and_stalls(core: &Arc<Core>, run: &Run, tasks: &[Task]) {
     let now_ms = super::now_ms_u64();
     for task in tasks {
@@ -524,19 +685,62 @@ async fn check_running_timeouts_and_stalls(core: &Arc<Core>, run: &Run, tasks: &
         else {
             continue;
         };
+        if att.worker_id == "exec" {
+            continue;
+        }
         let Some(worker) = core.drove.store.get_worker(&att.worker_id) else {
             continue;
         };
         if core.drove.has_active_ask(&att.id) {
             continue;
         }
+        let in_completion_gate = core.drove.has_active_done(&att.id)
+            || matches!(task.exec_phase, Some(TaskPhase::Verifying | TaskPhase::Review | TaskPhase::Integrating));
+
+        // 1. Enforce wall-clock `task.timeout_sec` on agent tasks (when not inside synchronous completion gates,
+        // which enforce their own bounded `verify` and `review` timeouts).
+        if !in_completion_gate
+            && let Some(timeout_sec) = task.timeout_sec
+            && let Some(started_ms) = parse_iso_ms(&att.started_at)
+        {
+            let elapsed_sec = now_ms.saturating_sub(started_ms) / 1000;
+            if elapsed_sec >= timeout_sec {
+                // Settle attempt BEFORE `stop_worker` so `stop_worker` does not mark the task Cancelled.
+                let _ = core.drove.store.update_attempt(&att.id, |a| {
+                    a.outcome = Some(Outcome::Failed);
+                    a.ended_at = Some(now_iso());
+                    a.failure = Some(AttemptFailure {
+                        kind: FailureKind::Timeout,
+                        message: format!("Killed after {elapsed_sec}s wall-clock timeout (limit {timeout_sec}s)"),
+                    });
+                });
+                let _ = super::pool::stop_worker(core, &worker.id).await;
+                super::fail_or_retry_task(
+                    core,
+                    &run.id,
+                    &task.id,
+                    &att.id,
+                    FailureKind::Timeout,
+                    &format!("Task wall-clock timeout {timeout_sec}s exceeded"),
+                    super::MAX_AUTO_RETRIES,
+                )
+                .await;
+                continue;
+            }
+        }
+
+        // 2. Skip silence stall checks while `drove worker done` is actively running verify/review/merge gates.
+        if in_completion_gate {
+            continue;
+        }
+
         let last_ms = parse_iso_ms(&worker.last_active_at).or_else(|| parse_iso_ms(&att.started_at)).unwrap_or(now_ms);
         let idle_sec = now_ms.saturating_sub(last_ms) / 1000;
 
         if let Some(kill_sec) = task.stall_kill_sec
             && idle_sec >= kill_sec
         {
-            let _ = super::pool::stop_worker(core, &worker.id).await;
+            // Settle attempt BEFORE `stop_worker` so `stop_worker` does not mark the task Cancelled.
             let _ = core.drove.store.update_attempt(&att.id, |a| {
                 a.outcome = Some(Outcome::Failed);
                 a.ended_at = Some(now_iso());
@@ -545,6 +749,7 @@ async fn check_running_timeouts_and_stalls(core: &Arc<Core>, run: &Run, tasks: &
                     message: format!("Killed after {idle_sec}s inactivity"),
                 });
             });
+            let _ = super::pool::stop_worker(core, &worker.id).await;
             super::fail_or_retry_task(
                 core,
                 &run.id,

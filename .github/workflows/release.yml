@@ -113,17 +113,18 @@ jobs:
             rustup target add aarch64-apple-darwin
             (cd herdr-core && cargo build --release --locked --target aarch64-apple-darwin -p herdr2)
             CORE_BIN="herdr-core/target/aarch64-apple-darwin/release/herdr2"
-            bash herdr-app/scripts/package aarch64-apple-darwin
+            HERDR2_CORE_BIN="$PWD/$CORE_BIN" bash herdr-app/scripts/package aarch64-apple-darwin
           else
             (cd herdr-core && cargo build --release --locked -p herdr2)
             CORE_BIN="herdr-core/target/release/herdr2"
-            bash herdr-app/scripts/package
+            HERDR2_CORE_BIN="$PWD/$CORE_BIN" bash herdr-app/scripts/package
           fi
           mkdir -p dist/installers dist/ota dist/unpack
           cp "herdr-app/dist/herdr2-${TARGET}.tar.gz" "dist/ota/herdr2-app-${TARGET}.tar.gz"
+          tar -tzf "dist/ota/herdr2-app-${TARGET}.tar.gz" | grep -qx "Herdr2.app/Contents/Helpers/h2"
           sh herdr-core/scripts/package "$CORE_BIN" "dist/ota/herdr2-core-${TARGET}.tar.gz"
           tar -xzf "herdr-app/dist/herdr2-${TARGET}.tar.gz" -C dist/unpack
-          file "$CORE_BIN" dist/unpack/Herdr2.app/Contents/MacOS/Herdr2
+          file "$CORE_BIN" dist/unpack/Herdr2.app/Contents/MacOS/Herdr2 dist/unpack/Herdr2.app/Contents/Helpers/h2
           bash scripts/package-macos-dmg.sh \
             dist/unpack/Herdr2.app \
             "$CORE_BIN" \

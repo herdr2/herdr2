@@ -248,6 +248,173 @@ pub(super) async fn ai_handoff_recommend(
     .await)
 }
 
+pub(crate) struct DroveForkContext {
+    pub source_address: String,
+    pub source_provider: Option<String>,
+    pub source_session_id: Option<String>,
+    pub turns_label: Option<String>,
+    pub markdown: String,
+    pub wrapped_envelope: String,
+    pub resume_session_id: Option<String>,
+    pub lineage: Lineage,
+}
+
+/// Builds a warm context fork package (and optional same-provider native JSONL fork UUID)
+/// from `source` (`t*` or `a*`) for a Drove worker targeting `target_agent` inside `effective_cwd`.
+pub(crate) async fn build_drove_fork_context(
+    core: &Arc<Core>,
+    source: &str,
+    target_agent: &str,
+    origin_cwd: &str,
+    effective_cwd: &str,
+    fork_mode: Option<&str>,
+) -> Option<DroveForkContext> {
+    let local_source = match source.rsplit_once('/') {
+        Some((_, r)) => r.trim(),
+        None => source.trim(),
+    };
+    if local_source.is_empty() {
+        return None;
+    }
+    let src = collect_source(core, local_source).await.ok()?;
+    if src.entries.is_empty() && src.session_id.is_none() {
+        return None;
+    }
+
+    let is_zh = core.ai.preferred_prompt_lang() == "zh";
+    let wt_origin = (origin_cwd.trim_end_matches(['/', '\\']) != effective_cwd.trim_end_matches(['/', '\\']))
+        .then_some(origin_cwd.to_string());
+    let src_addr = src.address.clone();
+    let src_prov = src.provider.clone();
+    let src_sid = src.session_id.clone();
+    let src_model = src.model.clone();
+    let entries = src.entries.clone();
+    let eff_cwd = effective_cwd.to_string();
+    let wt_orig_clone = wt_origin.clone();
+
+    let mut pkg = blocking(move || {
+        Ok(build_handoff_package(&HandoffBuildInput {
+            kind: LineageKind::Fork,
+            source_address: &src_addr,
+            source_provider: src_prov.as_deref(),
+            source_session_id: src_sid.as_deref(),
+            source_model: src_model.as_deref(),
+            cwd: (!eff_cwd.is_empty()).then_some(eff_cwd.as_str()),
+            entries: &entries,
+            from_turn: None,
+            to_turn: None,
+            max_bytes: 16 * 1024,
+            note: None,
+            is_zh,
+            worktree_origin: wt_orig_clone.as_deref(),
+            omitted_summary: None,
+        }))
+    })
+    .await
+    .ok()?;
+
+    if !pkg.omitted_turns.is_empty()
+        && core.ai.handoff_distill_enabled()
+        && let Some(summary) =
+            crate::ai::distill_omitted_turns(&core.ai, &src.address, &src.entries, &pkg.omitted_turns, is_zh).await
+    {
+        let src_addr2 = src.address.clone();
+        let src_prov2 = src.provider.clone();
+        let src_sid2 = src.session_id.clone();
+        let src_model2 = src.model.clone();
+        let entries2 = src.entries.clone();
+        let eff_cwd2 = effective_cwd.to_string();
+        let wt_orig2 = wt_origin.clone();
+        if let Ok(distilled_pkg) = blocking(move || {
+            Ok(build_handoff_package(&HandoffBuildInput {
+                kind: LineageKind::Fork,
+                source_address: &src_addr2,
+                source_provider: src_prov2.as_deref(),
+                source_session_id: src_sid2.as_deref(),
+                source_model: src_model2.as_deref(),
+                cwd: (!eff_cwd2.is_empty()).then_some(eff_cwd2.as_str()),
+                entries: &entries2,
+                from_turn: None,
+                to_turn: None,
+                max_bytes: 16 * 1024,
+                note: None,
+                is_zh,
+                worktree_origin: wt_orig2.as_deref(),
+                omitted_summary: Some(&summary),
+            }))
+        })
+        .await
+        {
+            pkg = distilled_pkg;
+        }
+    }
+
+    if pkg.markdown.trim().is_empty() && src.session_id.is_none() {
+        return None;
+    }
+
+    let mode = fork_mode.unwrap_or("auto");
+    let target_cli = PtyCliKind::from_str_name(&target_agent.trim().to_ascii_lowercase());
+    let mut resume_session_id = None;
+    if mode != "package"
+        && wt_origin.is_none()
+        && matches!(target_cli, PtyCliKind::Claude | PtyCliKind::Codex)
+        && src.provider.as_deref() == Some(target_cli.as_str())
+        && let Some(ref sid) = src.session_id
+    {
+        let src_cwd = src.cwd.clone();
+        let sid_owned = sid.clone();
+        let to_turn = pkg.total_turns.max(1);
+        let fork_uuid = crate::checkpoint::random_uuid_v4();
+        let fork_uuid_bg = fork_uuid.clone();
+        let ok = tokio::task::spawn_blocking(move || -> bool {
+            let file = match target_cli {
+                PtyCliKind::Claude => find_claude_session_file(&src_cwd, &sid_owned),
+                PtyCliKind::Codex => find_codex_rollout_by_sid(&src_cwd, &sid_owned),
+                _ => None,
+            };
+            let Some(src_file) = file else { return false };
+            match target_cli {
+                PtyCliKind::Claude => fork_claude_jsonl(&src_file, to_turn, &fork_uuid_bg).is_ok(),
+                PtyCliKind::Codex => fork_codex_jsonl(&src_file, to_turn, &fork_uuid_bg).is_ok(),
+                _ => false,
+            }
+        })
+        .await
+        .unwrap_or(false);
+        if ok {
+            resume_session_id = Some(fork_uuid);
+        }
+    }
+
+    let turns_label = (!pkg.included_turns.is_empty()).then(|| format_turn_ranges(&pkg.included_turns));
+    let wrapped_envelope = wrap_handoff_envelope(LineageKind::Fork, &src.address, &pkg.markdown);
+    let lineage = Lineage {
+        kind: LineageKind::Fork,
+        parent: src.address.clone(),
+        parent_provider: src.provider.clone(),
+        parent_session_id: src.session_id.clone(),
+        from_turn: pkg.included_turns.first().copied(),
+        to_turn: pkg.included_turns.last().copied(),
+        artifact_path: None,
+        worktree_path: wt_origin.as_ref().map(|_| effective_cwd.to_string()),
+        worktree_origin: wt_origin,
+        worktree_branch: None,
+        worktree_merged: false,
+    };
+
+    Some(DroveForkContext {
+        source_address: src.address,
+        source_provider: src.provider,
+        source_session_id: src.session_id,
+        turns_label,
+        markdown: pkg.markdown,
+        wrapped_envelope,
+        resume_session_id,
+        lineage,
+    })
+}
+
 async fn collect_source(core: &Arc<Core>, source: &str) -> Result<SourceSnapshot, RpcError> {
     match resolve_any(core, source)? {
         TargetKey::Agent(id) => {

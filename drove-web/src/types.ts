@@ -51,7 +51,9 @@ export interface ForeachFrom {
   task: string;
   path?: string;
 }
+export type ReviewMode = "static" | "breaker" | "hybrid";
 export interface ReviewSpec {
+  mode?: ReviewMode;
   agent?: string;
   model?: string;
   effort?: Effort;
@@ -59,6 +61,55 @@ export interface ReviewSpec {
   criteria?: string;
   /** Default 2, allowed 1..5. */
   maxRounds?: number;
+  testPaths?: string[];
+  verifyCmd?: string;
+  keepRegressionTests?: boolean;
+}
+export interface BriefingRef {
+  kind: "task" | "attempt" | "message" | "event" | "contract" | string;
+  target: string;
+  label: string;
+}
+export interface BriefingThread {
+  id: string;
+  title: string;
+  state: string;
+  now: string;
+  refs: BriefingRef[];
+}
+export interface BriefingAlert {
+  id: string;
+  kind: string;
+  severity: string;
+  title: string;
+  why?: string;
+  refs: BriefingRef[];
+}
+export interface BriefingNote {
+  id: string;
+  text: string;
+  refs: BriefingRef[];
+}
+export interface RunBriefing {
+  version?: number;
+  updatedAt: string;
+  asOfEventId: number;
+  headline: string;
+  runningSummary?: string;
+  threads: BriefingThread[];
+  attention: BriefingAlert[];
+  risks: BriefingNote[];
+}
+export interface ContractPost {
+  seq: number;
+  runId: string;
+  channel: string;
+  key: string;
+  authorTask: string;
+  workerId?: string;
+  summary: string;
+  payload?: unknown;
+  createdAt: string;
 }
 export interface ReviewVerdict {
   verdict: "approved" | "changes_requested";
@@ -146,6 +197,7 @@ export interface AiConfig {
   handoverCompact?: boolean;
   autoTitle?: boolean;
   taskEnrich?: boolean;
+  runNarrator?: boolean;
   conflictPolicy?: AiConflictPolicy;
   questionMode?: AiQuestionMode;
   loopDetect?: AiLoopDetectMode;
@@ -191,6 +243,7 @@ export type DaemonEventKind =
   | "question_triage"
   | "loop_detect"
   | "deep_diagnose"
+  | "run_briefing"
   | "ai_probe"
   | "verify_gate"
   | "review_round"
@@ -273,6 +326,7 @@ export interface DaemonAiConfigPatch {
   handoverCompact?: boolean;
   autoTitle?: boolean;
   taskEnrich?: boolean;
+  runNarrator?: boolean;
   conflictPolicy?: AiConflictPolicy;
   questionMode?: AiQuestionMode;
   loopDetect?: AiLoopDetectMode;
@@ -330,6 +384,8 @@ export interface Run {
   statusBeforeTrash?: "active" | "paused" | "done" | "archived";
   /** Cumulative daemon-side AI token & cost usage for this Run. */
   aiUsage?: AiUsage;
+  /** Grounded live situational briefing synthesized by Core AI. */
+  briefing?: RunBriefing;
   /** Remote SSH machine name when federated onto local Drove Web. */
   machine?: string;
   createdAt: string;
@@ -380,6 +436,9 @@ export interface Task {
   candidateResult?: TaskResult;
   cache?: CacheSpec;
   cachedFrom?: string;
+  forkFrom?: string;
+  forkMode?: string;
+  channels?: string[];
 }
 /** True when the corresponding figure was estimated rather than reported by the adapter. */
 export interface UsageEstimate { tokens?: boolean; cost?: boolean }
@@ -592,6 +651,8 @@ export interface RunSnapshot {
   pendingMessages: Message[]; messages?: Message[]; stats: { tokens: number; cost: number; workerTokens?: number; workerCost?: number; aiTokens?: number; aiCost?: number };
   /** Stall signals computed by the daemon for the overview bar. */
   stalls?: StallSignal[];
+  /** Shared contract board entries for this Run. */
+  contracts?: ContractPost[];
 }
 
 /** One message as a hop on the canvas: which node sent it, which received it. */

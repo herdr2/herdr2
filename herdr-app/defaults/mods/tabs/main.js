@@ -998,10 +998,24 @@ export default class Tabs extends View {
         .child(tr("Update", "更新"));
     };
     const updateBtn = renderUpdateButton();
+    const sidebarHidden = Boolean(sidebar?.hidden);
+    const openSidebar = () => {
+      if (typeof sidebar?.size?.px === "number" && sidebar.size.px < 160) {
+        run("layout.resize", { id: "sidebar", px: shared("sidebar.width") ?? 268 });
+      }
+      run("layout.show", { id: "sidebar" });
+    };
     return h_flex().relative().size_full().min_w(0).px(10).pl(lightsPadding).gap(3).items_center().bg(t.chrome).border_b(1).border_color(t.border)
       .on_mouse_move((e, cx) => this.handleDragMove(e, space, shown, cx))
       .on_mouse_up("left", (_e, cx) => this.finishDrag(space, shown, cx))
       .on_scroll_wheel(e => this.wheel(e))
+      .when(sidebarHidden, el => el.child(
+        div().id("sidebar-toggle").size(26).flex_none().flex().items_center().justify_center().rounded(6).text_color(t.muted).hover(s => s.bg(t.hover).text_color(t.foreground))
+          .tooltip(withShortcut(tr("Show sidebar", "展开侧边栏"), "layout.toggle:sidebar"))
+          .on_mouse_down("left", stop)
+          .on_click(openSidebar)
+          .child(svg("mods/workspace-chrome/sidebar.svg").size(15)),
+      ))
       .child(h_flex().id("tab-scroll").relative().flex_1().min_w(0).h_full().items_center().gap(TAB_GAP).overflow_x_scrollbar().track_scroll(this.scroll)
         .on_size_change((size, cx) => {
           const z = zoomScale();

@@ -1,11 +1,11 @@
 // Context menus (Herdr's items). Opened as a popup with
-// props { tab: "pane" | "tab" | "space" | "global", target }.
+// props { tab: "pane" | "tab" | "space" | "agent" | "file" | "global", target }.
 // ↑/↓ move, Enter runs, Esc closes. An item is [label, command, args];
 // a command "worktree" opens the worktree dialog instead.
 
 import { View, div, svg } from "gpui-kit";
 import { v_flex, h_flex } from "gpui-base";
-import { run, props, closeOverlay, openOverlay, theme, keys, terminals, spaces, panes, exec, settings, h2 } from "herdr";
+import { run, props, closeOverlay, openOverlay, theme, keys, terminals, spaces, panes, exec, settings, h2, notify } from "herdr";
 
 const isZh = () => typeof settings === "function" && String(settings()?.language ?? "en").toLowerCase().startsWith("zh");
 const tr = (en, zh) => (isZh() ? zh : en);
@@ -203,6 +203,14 @@ function items(p, git) {
         ...(git === "linked" ? [[tr("Remove worktree", "移除工作树"), "worktree", { space: tg.id, action: "remove" }]] : []),
         [tr("Close", "关闭"), "space.close", { id: tg.id }],
       ];
+    case "file": {
+      const abs = String(tg.absolutePath ?? "").trim();
+      const rel = String(tg.relativePath ?? "").trim();
+      return [
+        ...(abs ? [[tr("Copy absolute path", "复制绝对路径"), "clipboard.copy", { text: abs, notice: tr("Copied absolute path", "已复制绝对路径") }]] : []),
+        ...(rel ? [[tr("Copy relative path", "复制相对路径"), "clipboard.copy", { text: rel, notice: tr("Copied relative path", "已复制相对路径") }]] : []),
+      ];
+    }
     default:
       return [
         [tr("New space", "新建工作区"), "space.new", {}],
@@ -218,6 +226,9 @@ function items(p, git) {
 }
 
 function menuIcon(command, args) {
+  if (command === "clipboard.copy") {
+    return "mods/peek/copy.svg";
+  }
   if (command === "agent.trash") {
     return "mods/workspace-chrome/archive.svg";
   }
@@ -281,6 +292,15 @@ export default class Menu extends View {
     closeOverlay(props()?.overlay);
     if (it[1] === "worktree") openOverlay({ mod: "worktree", kind: "dialog", ...(it[2].action === "open" ? { width: 560, height: 480 } : it[2].action === "remove" ? { width: 460 } : { width: 440, height: 260 }), props: it[2] });
     else if (it[1] === "acp.config") Promise.resolve(h2(["config", "--json", it[2].terminal, "--id", it[2].id, "--value", String(it[2].value)])).catch(() => {});
+    else if (it[1] === "clipboard.copy") {
+      const text = String(it[2]?.text ?? "");
+      if (text) {
+        try { cx?.write_to_clipboard?.(text); } catch {}
+        if (typeof notify === "function") {
+          notify({ title: it[2]?.notice || tr("Copied", "已复制"), body: text, level: "info" });
+        }
+      }
+    }
     else run(it[1], it[2]);
   }
 

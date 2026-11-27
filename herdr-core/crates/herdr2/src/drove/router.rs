@@ -908,6 +908,33 @@ fn pick_candidate(
     )
 }
 
+/// Context window utilization percentage ceiling above which an idle warm worker is retired
+/// instead of reused for new tasks, preventing context rot and runaway input-token billing.
+pub const WARM_CONTEXT_MAX_PCT: u64 = 65;
+
+/// Maximum prior attempts an idle worker will serve before retiring when the incoming task has
+/// explicit `files`/`tags` with zero domain overlap against the worker's history.
+pub const WARM_UNRELATED_ATTEMPTS_CAP: u32 = 4;
+
+pub fn is_worker_context_bloated(w: &Worker) -> bool {
+    w.context.size > 0 && w.context.used.saturating_mul(100) >= w.context.size.saturating_mul(WARM_CONTEXT_MAX_PCT)
+}
+
+pub fn is_worker_healthy_for_warm_reuse(w: &Worker, task: &Task) -> bool {
+    if is_worker_context_bloated(w) {
+        return false;
+    }
+    if w.totals.attempts >= WARM_UNRELATED_ATTEMPTS_CAP && (!task.files.is_empty() || !task.tags.is_empty()) {
+        let shares_dep = task.deps.iter().any(|d| w.fingerprint.task_ids.contains(d));
+        let shares_file = task.files.iter().any(|f| w.fingerprint.files.contains(f));
+        let shares_tag = task.tags.iter().any(|t| w.fingerprint.tags.contains(t));
+        if !shares_dep && !shares_file && !shares_tag {
+            return false;
+        }
+    }
+    true
+}
+
 fn worker_matches_isolation(w: &Worker, task: &Task, effective_cwd: &str) -> bool {
     if task.isolation == Isolation::Worktree {
         w.worktree.as_deref().is_some_and(|p| !p.trim().is_empty() && std::path::Path::new(p).is_dir())
@@ -924,6 +951,8 @@ fn find_warm_worker(
     effective_cwd: &str,
     task: &Task,
 ) -> Option<Worker> {
+    let wants_coord_fork = task.fork_from.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("coordinator"))
+        && task.failures == 0;
     let mut idle: Vec<&Worker> = workers
         .iter()
         .filter(|w| {
@@ -932,15 +961,22 @@ fn find_warm_worker(
                 && w.agent == agent
                 && w.role.as_deref().unwrap_or("coder") == role_name
                 && worker_matches_isolation(w, task, effective_cwd)
+                && is_worker_healthy_for_warm_reuse(w, task)
+                && (!wants_coord_fork || w.forked_from.is_some())
                 && w.h2_agent.is_some()
         })
         .collect();
     if idle.is_empty() {
         return None;
     }
-    // Score affinity by overlapping model, deps, files, and tags.
+    // Score affinity by fork source, overlapping model, deps, files, and tags.
     idle.sort_by_key(|w| {
         let mut score: i64 = 0;
+        if let Some(fk) = task.fork_from.as_deref().filter(|s| !s.eq_ignore_ascii_case("coordinator"))
+            && (w.id == fk || w.fingerprint.task_ids.iter().any(|tid| tid == fk))
+        {
+            score += 40;
+        }
         if let Some(m) = model
             && w.model.as_deref() == Some(m)
         {
@@ -1019,6 +1055,9 @@ mod tests {
             cache: None,
             cached_from: None,
             retry_on_worker_reported: None,
+            fork_from: None,
+            fork_mode: None,
+            channels: Vec::new(),
         }
     }
 
@@ -1474,5 +1513,51 @@ mod tests {
             "expected unhealthy primary skip reason, got: {}",
             dec2.reason
         );
+    }
+
+    #[test]
+    fn warm_reuse_skips_context_bloated_and_unrelated_high_attempt_workers() {
+        let mut task = sample_task("coder");
+        task.files = vec!["src/auth.rs".into()];
+        task.tags = vec!["auth".into()];
+
+        let mk_worker = |id: &str, used: u64, size: u64, attempts: u32, files: Vec<String>| Worker {
+            id: id.into(),
+            run_id: "r1".into(),
+            agent: "codex".into(),
+            model: Some("gpt-5.4".into()),
+            context_window: None,
+            effort: Some(Effort::High),
+            fast: Some(false),
+            session_key: format!("r1:{id}"),
+            h2_agent: Some("a1".into()),
+            cwd: "/tmp".into(),
+            worktree: None,
+            state: WorkerState::Idle,
+            current_attempt_id: None,
+            pid: None,
+            fingerprint: Fingerprint { files, tags: Vec::new(), task_ids: Vec::new() },
+            context: WorkerContext { used, size },
+            totals: WorkerTotals { tokens: used, cost: 0.0, attempts, estimated: None },
+            created_at: now_iso(),
+            last_active_at: now_iso(),
+            role: Some("coder".into()),
+            forked_from: None,
+            protocol_gen: Some(1),
+            read_only_dir: None,
+        };
+
+        // 1. Context >= 65% full -> skipped to prevent context rot.
+        let bloated = mk_worker("w_bloat", 70_000, 100_000, 2, vec!["src/auth.rs".into()]);
+        assert!(find_warm_worker(&[bloated], "coder", "codex", Some("gpt-5.4"), "/tmp", &task).is_none());
+
+        // 2. >= 4 attempts with completely disjoint files/tags -> skipped.
+        let unrelated = mk_worker("w_unrel", 20_000, 100_000, 4, vec!["ui/button.tsx".into()]);
+        assert!(find_warm_worker(&[unrelated], "coder", "codex", Some("gpt-5.4"), "/tmp", &task).is_none());
+
+        // 3. >= 4 attempts WITH overlapping file domain and healthy context -> reused!
+        let affine = mk_worker("w_affine", 30_000, 100_000, 5, vec!["src/auth.rs".into()]);
+        let picked = find_warm_worker(&[affine], "coder", "codex", Some("gpt-5.4"), "/tmp", &task);
+        assert_eq!(picked.unwrap().id, "w_affine");
     }
 }

@@ -242,6 +242,9 @@ pub(super) async fn run_level_verify_gate(
             cache: None,
             cached_from: None,
             retry_on_worker_reported: None,
+            fork_from: None,
+            fork_mode: None,
+            channels: Vec::new(),
         });
         let _ = core.drove.store.update_run(&run.id, |r| {
             r.status = RunStatus::Active;
