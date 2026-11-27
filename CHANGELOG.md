@@ -1,5 +1,31 @@
 # Changelog
 
+## v2.0.18
+
+#### 中文
+
+**新增功能**
+- **设置页「智能体 (Agents)」全生命周期管理升级**：
+  - 新增分类筛选视图（**全部 / 已安装 / 未安装 / 需处理**），统一展示每个智能体的 CLI 安装状态、ACP 协议状态（隔离托管 / CLI 内置 / 自定义 `config.toml` / 不支持）、可用模型数以及安装/探测异常状态。
+  - 新增 **一键安装 CLI**（在所选本机或远程主机终端执行官方安装命令）、**AI 安装**（针对无静态单行命令的智能体由已装 AI 协助安装）、逐行 **一键安装 / 更新 / 重装 ACP 适配器** 以及按单个异常智能体聚焦排查的 **AI 处理异常** 入口。
+- **`knownAgents({ on, refresh: true })` 强制实时刷新**：新增 `refresh` 参数支持跳过 60 秒安装缓存，在新装 CLI 或修复环境后立即识别最新状态。
+
+**问题修复**
+- **优化异常排查与状态刷新体验**：支持针对单个异常智能体聚焦启动 AI 排查，并确保点击刷新或完成安装后立即同步最新 CLI 与 ACP 适配器状态。
+
+---
+
+#### English
+
+**New Features**
+- **Settings → Agents Full-Lifecycle Management Overhaul**:
+  - Added filter tabs (**All / Installed / Not Installed / Action Needed**) showing live CLI availability, ACP status (`Managed` / `Built-in` / `Custom config.toml` / `Not supported`), model counts, and install/probe error states for every agent.
+  - Added one-click **Install CLI** (runs the official installer in a terminal on the selected local or SSH remote host), **AI Install** (launches an installed AI agent when no static one-liner exists), per-agent **Install / Update / Reinstall ACP** actions, and focused single-agent **Fix with AI** troubleshooting.
+- **Force-Refresh for `knownAgents({ on, refresh: true })`**: Added an optional `refresh` flag in `herdr-app` (`mods.rs` / `herdr.d.ts`) to bypass the 60-second installation cache and detect newly installed CLIs immediately.
+
+**Bug Fixes**
+- **Improved Agent Troubleshooting & Refresh Reliability**: Added single-agent focus mode for AI troubleshooting and ensured manual refresh / post-install checks immediately reflect newly installed CLIs and ACP adapters.
+
 ## v2.0.17
 
 #### 中文

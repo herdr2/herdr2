@@ -344,6 +344,9 @@ impl Model {
         let folder = active_folder
             .or_else(|| p.tabs.iter().flat_map(|c| c.root.terminals()).find_map(folder_of))
             .unwrap_or_else(|| p.folder.clone());
+        if p.machine.is_some() && is_remote_home_folder(&folder) {
+            return "~".into();
+        }
         folder_name(&folder, home)
     }
 
@@ -934,6 +937,26 @@ impl Model {
 
 pub fn pane(id: &str, address: &str) -> Node {
     Node::block(id, Content::Terminal { terminal: address.to_owned() })
+}
+
+/// Recognizes a remote machine's home directory (`~`, `/root`, `/home/<user>`,
+/// `/Users/<user>`, or `<drive>:\Users\<user>`) when local `home()` comes from another host/OS.
+pub fn is_remote_home_folder(path: &str) -> bool {
+    let p = path.trim().trim_end_matches(['/', '\\']);
+    if p.is_empty() || p == "~" || p == "/root" {
+        return true;
+    }
+    if let Some(rest) = p.strip_prefix("/home/").or_else(|| p.strip_prefix("/Users/")) {
+        return !rest.is_empty() && !rest.contains('/') && !rest.contains('\\');
+    }
+    let bytes = p.as_bytes();
+    if bytes.len() > 8 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let after_drive = p[2..].replace('\\', "/");
+        if let Some(rest) = after_drive.strip_prefix("/Users/").or_else(|| after_drive.strip_prefix("/users/")) {
+            return !rest.is_empty() && !rest.contains('/');
+        }
+    }
+    false
 }
 
 /// A folder as a name: its last part, `~` for the home folder (`/` and `\` both).

@@ -2914,16 +2914,24 @@ fn split_pane_names_merged_tabs_and_windows_shells(cx: &mut TestAppContext) {
         true,
         json!({ "section": "agents" }),
         updates("current", "current"),
-        Some("this.droveData = { config: { roles: { coder: { label: 'Coder', access: 'writable', primary: { agent: 'claude', model: 'opus', effort: 'high' }, fallbacks: [] } }, ai: { enabled: true } }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'claude', installed: true, models: ['opus'] }, { id: 'cursor', installed: true, models: [], error: 'ACP probe timed out after 60s' }] } }; this.adapterStatus = { adapters_dir: '/home/.local/share/herdr2/adapters', auto_install: true, default_permissions: 'approve-reads', inject_mcp: true, adapters: [{ preset_id: 'claude', binary_name: 'claude-agent-acp', companion_cli: 'claude', companion_installed: true, installed: true, source: 'managed', state: 'ready', version: '0.9.0' }] };"),
+        Some("this.droveData = { config: { roles: { coder: { label: 'Coder', access: 'writable', primary: { agent: 'claude', model: 'opus', effort: 'high' }, fallbacks: [] } }, ai: { enabled: true } }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'claude', installed: true, models: ['opus'] }, { id: 'cursor', installed: true, models: [], error: 'ACP probe timed out after 60s' }] } }; this.adapterStatus = { adapters_dir: '/home/.local/share/herdr2/adapters', auto_install: true, default_permissions: 'approve-reads', inject_mcp: true, adapters: [{ preset_id: 'claude', binary_name: 'claude-agent-acp', companion_cli: 'claude', companion_installed: true, installed: true, source: 'managed', state: 'ready', version: '0.9.0' }, { preset_id: 'codex', binary_name: 'codex-acp', companion_cli: 'codex', companion_installed: true, installed: false, source: 'npx_fallback', state: 'missing' }] };"),
     )
     .unwrap();
     assert!(probe_err_tree.contains("st-agents-page"), "Agents & ACP page should render: {probe_err_tree}");
-    assert!(probe_err_tree.contains("st-ag-adapters-card"), "Managed ACP adapters card should render: {probe_err_tree}");
-    assert!(probe_err_tree.contains("st-ag-list-card"), "Detected agents list card should render: {probe_err_tree}");
+    assert!(!probe_err_tree.contains("st-ag-adapters-card"), "Duplicate managed ACP adapters card should be unified into st-ag-list-card: {probe_err_tree}");
+    assert!(probe_err_tree.contains("st-ag-list-card"), "Unified supported agents & ACP card should render: {probe_err_tree}");
+    assert!(probe_err_tree.contains("st-ag-table-header"), "Unified agents table header should render: {probe_err_tree}");
+    assert!(probe_err_tree.contains("st-ag-filter-bar"), "Agent filter tabs should render: {probe_err_tree}");
+    assert!(probe_err_tree.contains("st-ag-row-claude"), "Installed agent row should render: {probe_err_tree}");
+    assert!(probe_err_tree.contains("st-ag-row-codex"), "Missing-ACP agent row should render: {probe_err_tree}");
+    assert!(probe_err_tree.contains("st-ag-row-inst-codex"), "Missing managed ACP adapter row should expose one-click install button: {probe_err_tree}");
+    assert!(probe_err_tree.contains("st-ag-row-gemini"), "Uninstalled supported agent should be shown by default: {probe_err_tree}");
+    assert!(probe_err_tree.contains("st-ag-row-cli-gemini"), "Uninstalled supported agent should expose one-click CLI install button: {probe_err_tree}");
+    assert!(probe_err_tree.contains("st-ag-row-ai-cursor"), "Errored agent row should expose direct AI fix button: {probe_err_tree}");
     assert!(probe_err_tree.contains("st-ag-config-card"), "ACP configuration card should render: {probe_err_tree}");
     assert!(probe_err_tree.contains("st-dr-agent-errors"), "Probe error card should render in Agents & ACP: {probe_err_tree}");
     assert!(!probe_err_tree.contains("st-dr-probe-ai-btn"), "AI Diagnose button should be removed: {probe_err_tree}");
-    assert!(probe_err_tree.contains("st-dr-probe-agent-fix-btn"), "Probe error card should render Fix with Agent button: {probe_err_tree}");
+    assert!(probe_err_tree.contains("st-dr-probe-agent-fix-btn"), "Probe error card should render Fix with AI button: {probe_err_tree}");
     let probe_fix_tree = describe(
         cx,
         &staged,

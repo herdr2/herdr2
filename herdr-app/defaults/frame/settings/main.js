@@ -115,7 +115,231 @@ const DROVE_AGENT_ICONS = {
   zcode: { path: "icons/zcode.svg", tint: true },
   trae: { path: "icons/trae.svg", tint: true },
   glm: { path: "icons/agent.svg", tint: true },
+  qwen: { path: "icons/agent.svg", tint: true },
+  kiro: { path: "icons/kiro.svg", tint: false },
+  amp: { path: "icons/amp.svg", tint: false },
+  grok: { path: "icons/grok.svg", tint: true },
+  goose: { path: "icons/goose.svg", tint: true },
+  crush: { path: "icons/crush.svg", tint: false },
+  omp: { path: "icons/omp.svg", tint: true },
+  pig: { path: "icons/pig.svg", tint: false },
+  empryo: { path: "icons/empryo.svg", tint: false },
 };
+
+// Canonical catalog of all Herdr2-supported CLI & ACP agents so the Agents & ACP
+// settings page always displays every supported agent with accurate CLI / ACP capabilities
+// and one-click install metadata.
+const SUPPORTED_AGENTS_CATALOG = [
+  {
+    id: "claude",
+    name: "Claude Code",
+    cli: "claude",
+    acpMode: "managed",
+    acpCommand: "claude-agent-acp",
+    install: {
+      argv: ["npm", "install", "-g", "@anthropic-ai/claude-code"],
+      display: "npm install -g @anthropic-ai/claude-code",
+    },
+  },
+  {
+    id: "codex",
+    name: "Codex",
+    cli: "codex",
+    acpMode: "managed",
+    acpCommand: "codex-acp",
+    install: {
+      argv: ["npm", "install", "-g", "@openai/codex"],
+      display: "npm install -g @openai/codex",
+    },
+  },
+  {
+    id: "agy",
+    name: "Antigravity",
+    cli: "agy",
+    acpMode: "builtin",
+    acpCommand: "agy acp",
+  },
+  {
+    id: "cursor",
+    name: "Cursor",
+    cli: "cursor-agent",
+    acpMode: "builtin",
+    acpCommand: "cursor-agent acp",
+    install: {
+      argv: ["sh", "-c", "curl https://cursor.com/install -fsS | bash"],
+      winArgv: ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "irm 'https://cursor.com/install?win32=true' | iex"],
+      display: "curl https://cursor.com/install -fsS | bash",
+    },
+  },
+  {
+    id: "gemini",
+    name: "Gemini CLI",
+    cli: "gemini",
+    acpMode: "builtin",
+    acpCommand: "gemini --acp",
+    install: {
+      argv: ["npm", "install", "-g", "@google/gemini-cli"],
+      display: "npm install -g @google/gemini-cli",
+    },
+  },
+  {
+    id: "opencode",
+    name: "OpenCode",
+    cli: "opencode",
+    acpMode: "builtin",
+    acpCommand: "opencode acp",
+    install: {
+      argv: ["npm", "install", "-g", "opencode-ai"],
+      display: "npm install -g opencode-ai",
+    },
+  },
+  {
+    id: "pi",
+    name: "Pi",
+    cli: "pi",
+    acpMode: "managed",
+    acpCommand: "pi-acp",
+    install: {
+      argv: ["npm", "install", "-g", "@mariozechner/pi-coding-agent"],
+      display: "npm install -g @mariozechner/pi-coding-agent",
+    },
+  },
+  {
+    id: "kimi",
+    name: "Kimi",
+    cli: "kimi",
+    acpMode: "builtin",
+    acpCommand: "kimi acp",
+    install: {
+      argv: ["uv", "tool", "install", "kimi-cli"],
+      display: "uv tool install kimi-cli",
+    },
+  },
+  {
+    id: "copilot",
+    name: "GitHub Copilot",
+    cli: "copilot",
+    acpMode: "builtin",
+    acpCommand: "copilot --acp --stdio",
+    install: {
+      argv: ["npm", "install", "-g", "@github/copilot"],
+      display: "npm install -g @github/copilot",
+    },
+  },
+  {
+    id: "qwen",
+    name: "Qwen Code",
+    cli: "qwen",
+    acpMode: "builtin",
+    acpCommand: "qwen --acp",
+    install: {
+      argv: ["npm", "install", "-g", "@qwen-code/qwen-code"],
+      display: "npm install -g @qwen-code/qwen-code",
+    },
+  },
+  {
+    id: "hermes",
+    name: "Hermes",
+    cli: "hermes",
+    acpMode: "separate",
+    acpCommand: "hermes-acp",
+  },
+  {
+    id: "zcode",
+    name: "ZCode",
+    cli: "zcode",
+    acpMode: "separate",
+    acpCommand: "zcode-acp-server",
+  },
+  {
+    id: "trae",
+    name: "TRAE CLI",
+    cli: "traecli",
+    acpMode: "builtin",
+    acpCommand: "traecli --acp",
+  },
+  {
+    id: "glm",
+    name: "GLM",
+    cli: null,
+    standaloneAcp: true,
+    acpMode: "managed",
+    acpCommand: "glm-acp-agent",
+  },
+  {
+    id: "dsh",
+    name: "DeepSeek Harness",
+    cli: "dsh-tui",
+    acpMode: "builtin",
+    acpCommand: "dsh --profile acp",
+  },
+  {
+    id: "qoder",
+    name: "Qoder",
+    cli: "qodercli",
+    acpMode: "none",
+  },
+  {
+    id: "kiro",
+    name: "Kiro",
+    cli: "kiro-cli",
+    acpMode: "none",
+  },
+  {
+    id: "amp",
+    name: "Amp",
+    cli: "amp",
+    acpMode: "none",
+    install: {
+      argv: ["npm", "install", "-g", "@sourcegraph/amp"],
+      display: "npm install -g @sourcegraph/amp",
+    },
+  },
+  {
+    id: "grok",
+    name: "Grok",
+    cli: "grok",
+    acpMode: "none",
+  },
+  {
+    id: "goose",
+    name: "goose",
+    cli: "goose",
+    acpMode: "none",
+  },
+  {
+    id: "crush",
+    name: "Crush",
+    cli: "crush",
+    acpMode: "none",
+    install: {
+      argv: ["npm", "install", "-g", "@charmland/crush"],
+      display: "npm install -g @charmland/crush",
+    },
+  },
+  {
+    id: "omp",
+    name: "oh-my-pi",
+    cli: "omp",
+    acpMode: "none",
+    install: {
+      argv: ["npm", "install", "-g", "@oh-my-pi/pi-coding-agent"],
+      display: "npm install -g @oh-my-pi/pi-coding-agent",
+    },
+  },
+  {
+    id: "pig",
+    name: "PiG",
+    cli: "pig",
+    acpMode: "none",
+  },
+  {
+    id: "empryo",
+    name: "Empryo",
+    cli: "empryo",
+    acpMode: "none",
+  },
+];
 
 const LOOKS = { main: "Herdr2", terminals: "Terminals", win98: "Herdr 98" };
 const PANELS = [
@@ -203,13 +427,14 @@ export default class Settings extends View {
     this.adapterBusy = false;
     this.adapterConfigSaving = false;
     this.adapterError = null;
-    this.agentShowMissing = false;
+    this.agentFilter = "all"; // "all" | "installed" | "missing" | "issues"
     this.adapterRegistryUrlInput = InputState.new({
       placeholder: "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json",
     });
     this.droveAutoProbed = {};
     this.droveProbeAgentLaunching = false;
     this.droveProbeFixOpen = false;
+    this.droveProbeFixFocusId = null;
     this.droveProbeFixAgent = null;
     this.droveProbeFixModel = null;
     this.droveProbeFixEffort = null;
@@ -1861,7 +2086,10 @@ export default class Settings extends View {
         const snap = await this.droveHcJson(["drove", "probe", "--refresh"], { timeout: 180000 });
         if (this.droveMachine !== targetMachine) return false;
         if (snap && this.droveData) this.droveData = { ...this.droveData, agents: snap };
-        else await this.loadDrove();
+        else {
+          await this.loadDrove();
+          if (snap && this.droveData) this.droveData = { ...this.droveData, agents: snap };
+        }
         try {
           this.adapterStatus = await this.droveHcJson(["adapter", "status"], { timeout: 15000 });
           this.syncAdapterInputs(this.adapterStatus);
@@ -1891,7 +2119,7 @@ export default class Settings extends View {
   }
 
   refreshAgentsDetection(cx) {
-    this.loadDroveFixKnownAgents(cx);
+    this.loadDroveFixKnownAgents(cx, true);
     this.probeDroveAgents(cx);
   }
 
@@ -1910,6 +2138,7 @@ export default class Settings extends View {
     this.droveAiConfigMode = null;
     this.droveMagpieResult = null;
     this.droveProbeFixOpen = false;
+    this.droveProbeFixFocusId = null;
     this.droveProbeFixAgent = null;
     this.droveProbeFixModel = null;
     this.droveProbeFixEffort = null;
@@ -2042,12 +2271,17 @@ export default class Settings extends View {
     const errLines = errorAgents.map((a) => {
       const cmd = Array.isArray(a.command) && a.command.length > 0 ? a.command.join(" ") : a.id;
       const err = String(a.error ?? "").trim();
-      return `- agent: ${a.id}\n  command: ${cmd}\n  path: ${a.path ?? "(unknown)"}\n  error: ${err}`;
+      const kind = a.issueKind === "adapter"
+        ? "managed_acp_adapter_install"
+        : a.issueKind === "env"
+          ? "environment_detection"
+          : "acp_probe";
+      return `- agent: ${a.id}\n  kind: ${kind}\n  command: ${cmd}\n  path: ${a.path ?? "(unknown)"}\n  error: ${err}`;
     });
 
     if (this.lang() === "zh-CN") {
       return [
-        `请帮我排查 Herdr2 Drove 在目标主机「${machineLabel}」上检测到的 ACP Agent 异常：`,
+        `请帮我排查 Herdr2 在目标主机「${machineLabel}」上检测到的智能体与 ACP 异常：`,
         "",
         ...errLines,
         "",
@@ -2055,19 +2289,19 @@ export default class Settings extends View {
         "",
         "请严格按以下阶段推进：",
         "1. **只读排查与解读错误原因**：",
-        "   - 对比守护进程 `herdr2 serve` 与当前交互式 Shell 的环境差异（尤其是 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY、PATH、认证凭据、以及 ACP 适配器是否已安装）。",
-        "   - 区分哪些是“工作区 CLI 正常但守护进程无头 ACP 探测环境缺失”导致的假阳性，哪些是需要登录、修配置或安装适配器的真实问题。",
+        "   - 对比守护进程 `herdr2 serve` 与当前交互式 Shell 的环境差异（尤其是 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY、PATH、Node/npm、认证凭据、以及 ACP 适配器是否已安装）。",
+        "   - 区分哪些是“工作区 CLI 正常但守护进程无头 ACP 探测环境缺失”导致的假阳性，哪些是需要登录、修配置、设代理镜像或安装适配器的真实问题。",
         "   - 逐项向我清楚解读每个异常 Agent 的报错含义与根本原因。",
         "2. **制定修复方案并等待确认**：",
         "   - 针对每个问题给出具体、可执行的修复方案（说明拟执行的命令、会改动的配置或文件、是否需要我手动交互登录如 `claude` / `cursor-agent login` 或重启服务，以及潜在影响）。",
         "   - 输出错误原因解读与修复方案后立即停下，等待我明确确认（或指定只修复其中部分问题），切勿直接开始修复。",
         "3. **用户确认后再开始修复与验证**：",
         "   - 收到我的确认后，再按确认的方案逐步执行修复；需要我手动交互的步骤给出清晰指引。",
-        "   - 修复完成后执行 `h2 drove probe --refresh` 验证异常是否已消除。",
+        "   - 修复完成后执行 `h2 adapter status` 与 `h2 drove probe --refresh` 验证异常是否已消除。",
       ].join("\n");
     }
     return [
-      `Please help investigate the Herdr2 Drove ACP agent probe errors on "${machineLabel}":`,
+      `Please help investigate the Herdr2 Agents & ACP errors on "${machineLabel}":`,
       "",
       ...errLines,
       "",
@@ -2075,16 +2309,133 @@ export default class Settings extends View {
       "",
       "Please follow these phases strictly:",
       "1. **Read-only diagnosis & explain root causes**:",
-      "   - Compare the `herdr2 serve` daemon environment against the interactive shell (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY, PATH, auth state, and installed ACP adapters).",
-      "   - Distinguish workspace-CLI vs headless-ACP false positives from genuine missing-adapter, config, or login issues.",
+      "   - Compare the `herdr2 serve` daemon environment against the interactive shell (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY, PATH, Node/npm, auth state, and installed ACP adapters).",
+      "   - Distinguish workspace-CLI vs headless-ACP false positives from genuine missing-adapter, network/mirror, config, or login issues.",
       "   - Clearly explain what each error means and its root cause.",
       "2. **Propose a fix plan & wait for confirmation**:",
       "   - Draft a concrete, actionable fix plan for each issue (commands to run, files/configs to change, any manual interactive login steps such as `claude` / `cursor-agent login` or daemon restarts, and potential impact).",
       "   - Stop after presenting the root-cause explanation and fix plan, and wait for my explicit confirmation before making any changes.",
       "3. **Start fixing only after confirmation & verify**:",
       "   - Once I confirm (all or selected items), execute the approved plan step by step and guide me through any interactive steps.",
-      "   - After fixing, run `h2 drove probe --refresh` to verify the errors are resolved.",
+      "   - After fixing, run `h2 adapter status` and `h2 drove probe --refresh` to verify the errors are resolved.",
     ].join("\n");
+  }
+
+  buildAgentInstallPrompt(row) {
+    const machineLabel = this.droveMachine || this.tr("this computer (local)", "本机（local）");
+    const needSeparateAcp = Boolean(row.cliInstalled && row.acpMode === "separate" && !row.acpInstalled);
+    if (this.lang() === "zh-CN") {
+      return [
+        needSeparateAcp
+          ? `请帮我在目标主机「${machineLabel}」上安装并配置 ${row.name}（${row.id}）对应的 ACP 组件（${row.acpCommand || row.id}）。`
+          : `请帮我在目标主机「${machineLabel}」上安装 ${row.name}（${row.id}${row.cli ? `，CLI 命令：${row.cli}` : ""}${row.acpCommand ? `，ACP 命令：${row.acpCommand}` : ""}）。`,
+        "",
+        "请按以下步骤处理：",
+        "1. 先检查当前操作系统、包管理器（npm / uv / brew / curl / winget 等）与 PATH/代理环境。",
+        "2. 给出最适合本机环境的官方安装方案并说明将执行的命令；在我确认后执行安装。",
+        "3. 如需登录或配置 API Key，请给出清晰指引；安装完成后运行 `h2 drove probe --refresh` 验证。",
+      ].join("\n");
+    }
+    return [
+      needSeparateAcp
+        ? `Please help install and configure the ACP component (${row.acpCommand || row.id}) for ${row.name} (${row.id}) on "${machineLabel}".`
+        : `Please help install ${row.name} (${row.id}${row.cli ? `, CLI: ${row.cli}` : ""}${row.acpCommand ? `, ACP: ${row.acpCommand}` : ""}) on "${machineLabel}".`,
+      "",
+      "Please follow these steps:",
+      "1. Check the OS, available package managers (npm / uv / brew / curl / winget), PATH, and proxy environment first.",
+      "2. Propose the cleanest official installation command for this machine and run it once I confirm.",
+      "3. Guide me through any required login or API key setup, then verify with `h2 drove probe --refresh`.",
+    ].join("\n");
+  }
+
+  installAgentCli(row, cx) {
+    if (!row?.install || (typeof checking === "function" && checking())) return;
+    const targetMachine = this.droveMachine ?? null;
+    const isLocalWindows = targetMachine === null && typeof window === "function" && String(window()?.platform ?? "").toLowerCase() === "windows";
+    const argv = isLocalWindows && Array.isArray(row.install.winArgv) && row.install.winArgv.length > 0
+      ? [...row.install.winArgv]
+      : [...row.install.argv];
+    const tabName = this.tr(`Install ${row.name}`, `安装 ${row.name}`);
+    const targetSpace = this.targetSpaceForDroveMachine();
+    const launchArgs = {
+      name: tabName,
+      folder: this.defaultHomeFolderForMachine(targetMachine),
+      argv,
+    };
+    if (targetSpace) {
+      run("tab.new", { space: targetSpace.id, ...launchArgs });
+    } else {
+      const args = { ...launchArgs, tab: tabName };
+      if (targetMachine) args.machine = targetMachine;
+      run("space.new", args);
+    }
+    this.close();
+    const machineText = targetMachine || this.tr("this computer", "本机");
+    notify({
+      title: this.tr(`Installing ${row.name} in terminal`, `已在终端启动 ${row.name} 安装`),
+      body: this.tr(
+        `Running \`${row.install.display}\` on ${machineText}. Once finished, return to Settings → Agents & ACP and click Detect Environment.`,
+        `正在「${machineText}」执行 \`${row.install.display}\`。安装完成后，返回「设置 → 智能体与 ACP」点击「一键检测环境」即可更新状态。`,
+      ),
+    });
+    cx?.notify?.();
+  }
+
+  launchAgentToInstall(row, cx) {
+    if (!row || this.droveProbeAgentLaunching || (typeof checking === "function" && checking())) return;
+    const targetMachine = this.droveMachine ?? null;
+    const summary = this.droveProbeSummary();
+    this.droveProbeAgentLaunching = true;
+    cx?.notify?.();
+    cx.spawn(async (cx) => {
+      try {
+        const picked = await this.resolveFixAgentLaunch(targetMachine, summary.ready, null);
+        if (!picked) {
+          notify({
+            title: this.tr("No installed AI agent available", "当前主机未检测到可用的 AI Agent"),
+            body: this.tr(
+              "Install one CLI agent first (for example Claude Code, Codex, or Gemini CLI using the Install button) to enable AI-assisted setup.",
+              "请先使用「一键安装」安装至少一个 CLI Agent（如 Claude Code、Codex 或 Gemini CLI），之后即可由 AI 协助安装其他智能体。",
+            ),
+            level: "error",
+          });
+          return;
+        }
+        const prompt = this.buildAgentInstallPrompt(row);
+        const tabName = this.tr(`Install ${row.name}`, `AI 安装 ${row.name}`);
+        const targetSpace = this.targetSpaceForDroveMachine();
+        const launchArgs = {
+          name: tabName,
+          folder: this.defaultHomeFolderForMachine(targetMachine),
+          argv: picked.argv,
+          task: prompt,
+        };
+        if (targetSpace) {
+          run("tab.new", { space: targetSpace.id, ...launchArgs });
+        } else {
+          const args = { ...launchArgs, tab: tabName };
+          if (targetMachine) args.machine = targetMachine;
+          run("space.new", args);
+        }
+        this.close();
+        notify({
+          title: this.tr(`Launched ${picked.name} to install ${row.name}`, `已启动 ${picked.name} 协助安装 ${row.name}`),
+          body: this.tr(
+            "After installation finishes, return to Settings → Agents & ACP and click Detect Environment.",
+            "安装完成后，返回「设置 → 智能体与 ACP」点击「一键检测环境」即可更新状态。",
+          ),
+        });
+      } catch (e) {
+        notify({
+          title: this.tr("Failed to launch AI agent", "启动 AI 协助失败"),
+          body: String(e?.message ?? e),
+          level: "error",
+        });
+      } finally {
+        this.droveProbeAgentLaunching = false;
+        cx.notify();
+      }
+    });
   }
 
   targetSpaceForDroveMachine() {
@@ -2331,16 +2682,19 @@ export default class Settings extends View {
     cx?.notify?.();
   }
 
-  loadDroveFixKnownAgents(cx) {
+  loadDroveFixKnownAgents(cx, forceRefresh = false) {
     if (typeof knownAgents !== "function" || (typeof checking === "function" && checking())) return;
     const targetMachine = this.droveMachine ?? null;
     const machineKey = targetMachine ?? "__local__";
-    if (this.droveFixKnownLoading) return;
+    if (this.droveFixKnownLoading && !forceRefresh) return;
     this.droveFixKnownLoading = true;
     cx?.notify?.();
     cx.spawn(async (spawnCx) => {
       try {
-        const list = await knownAgents(targetMachine ? { on: targetMachine } : {});
+        const opts = {};
+        if (targetMachine) opts.on = targetMachine;
+        if (forceRefresh) opts.refresh = true;
+        const list = await knownAgents(opts);
         if (Array.isArray(list)) {
           this.droveFixKnownAgents = { ...(this.droveFixKnownAgents ?? {}), [machineKey]: list };
           if ((this.droveMachine ?? null) === targetMachine) {
@@ -2358,14 +2712,29 @@ export default class Settings extends View {
   toggleDroveProbeFixPanel(cx) {
     this.droveProbeFixOpen = !this.droveProbeFixOpen;
     if (this.droveProbeFixOpen) {
+      this.droveProbeFixFocusId = null;
       this.ensureDroveFixSelection();
       const machineKey = this.droveMachine ?? "__local__";
       if (!Array.isArray(this.droveFixKnownAgents?.[machineKey])) {
         this.loadDroveFixKnownAgents(cx);
       }
-    } else if (typeof this.picking === "string" && this.picking.startsWith("drove:probe-fix-")) {
-      this.picking = null;
-      this.droveModelSubmit = null;
+    } else {
+      this.droveProbeFixFocusId = null;
+      if (typeof this.picking === "string" && this.picking.startsWith("drove:probe-fix-")) {
+        this.picking = null;
+        this.droveModelSubmit = null;
+      }
+    }
+    cx?.notify?.();
+  }
+
+  openAgentAiFix(cx, agentId = null) {
+    this.droveProbeFixFocusId = agentId ? this.canonicalFixAgentId(agentId) : null;
+    this.droveProbeFixOpen = true;
+    this.ensureDroveFixSelection();
+    const machineKey = this.droveMachine ?? "__local__";
+    if (!Array.isArray(this.droveFixKnownAgents?.[machineKey])) {
+      this.loadDroveFixKnownAgents(cx);
     }
     cx?.notify?.();
   }
@@ -2446,10 +2815,59 @@ export default class Settings extends View {
     return null;
   }
 
+  agentIssues(rows = null) {
+    const list = Array.isArray(rows) ? rows : this.detectedAgentRows();
+    const out = [];
+    const seen = new Set();
+    for (const r of list) {
+      if (r.acpError || r.adapterError) {
+        const combined = [r.acpError, r.adapterError && r.adapterError !== r.acpError ? r.adapterError : null]
+          .filter(Boolean)
+          .join("\n");
+        out.push({
+          id: r.id,
+          name: r.name,
+          command: Array.isArray(r.command) && r.command.length > 0 ? r.command : (r.acpCommand ? r.acpCommand.split(" ") : [r.id]),
+          path: r.path ?? r.adapter?.path ?? null,
+          error: combined,
+          issueKind: r.adapterError && !r.acpError ? "adapter" : "probe",
+        });
+        seen.add(r.id);
+      }
+    }
+    const topErr = String(this.adapterError || this.droveError || "").trim();
+    if (topErr && !out.some((it) => String(it.error ?? "").includes(topErr))) {
+      out.push({
+        id: "environment",
+        name: this.tr("Environment / ACP", "环境与 ACP 检测"),
+        command: ["h2", "drove", "probe", "--refresh"],
+        path: null,
+        error: topErr,
+        issueKind: "env",
+      });
+    }
+    return out;
+  }
+
+  formatProbeTimestamp(iso) {
+    const raw = String(iso ?? "").trim();
+    if (!raw) return null;
+    const d = new Date(raw);
+    if (Number.isNaN(d.getTime())) return null;
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
   launchAgentToFixDroveProbeErrors(cx, override = null) {
     if (this.droveProbeAgentLaunching) return;
     const summary = this.droveProbeSummary();
-    if (summary.errored.length === 0) return;
+    const allIssues = this.agentIssues();
+    const focusId = this.droveProbeFixFocusId ? this.canonicalFixAgentId(this.droveProbeFixFocusId) : null;
+    const targetIssues = focusId
+      ? allIssues.filter((it) => this.canonicalFixAgentId(it.id) === focusId)
+      : allIssues;
+    const effectiveIssues = targetIssues.length > 0 ? targetIssues : summary.errored;
+    if (effectiveIssues.length === 0) return;
     const targetMachine = this.droveMachine ?? null;
     const selectedAgent = override?.agent !== undefined ? override.agent : this.droveProbeFixAgent;
     const selectedModel = override?.model !== undefined ? override.model : this.droveProbeFixModel;
@@ -2476,8 +2894,8 @@ export default class Settings extends View {
         const cleanEffort = !effortDisabled && selectedEffort
           ? this.clampEffortFor(pickedId, cleanModel, selectedEffort)
           : null;
-        const prompt = this.buildDroveProbeFixPrompt(summary.errored);
-        const tabName = this.tr("Fix Drove Agents", "排查 Drove 异常");
+        const prompt = this.buildDroveProbeFixPrompt(effectiveIssues);
+        const tabName = this.tr("Fix Agent / ACP Issues", "AI 排查智能体异常");
         const targetSpace = this.targetSpaceForDroveMachine();
         const launchArgs = {
           name: tabName,
@@ -2495,6 +2913,7 @@ export default class Settings extends View {
           run("space.new", args);
         }
         this.droveProbeFixOpen = false;
+        this.droveProbeFixFocusId = null;
         this.close();
         const metaParts = [cleanModel, cleanEffort ? this.effortLabel(cleanEffort) : null].filter(Boolean);
         const metaEn = metaParts.length > 0 ? ` (${metaParts.join(" · ")})` : "";
@@ -2502,8 +2921,8 @@ export default class Settings extends View {
         notify({
           title: this.tr(`Launched ${picked.name}${metaEn} to troubleshoot`, `已启动 ${picked.name}${metaZh} 协助排查`),
           body: this.tr(
-            "After fixing, return to Settings -> Agents & ACP and click Refresh Detection.",
-            "处理完成后，返回「设置 → 智能体与 ACP」点击「刷新检测」即可验证。",
+            "After fixing, return to Settings → Agents & ACP and click Detect Environment.",
+            "处理完成后，返回「设置 → 智能体与 ACP」点击「一键检测环境」即可验证。",
           ),
         });
       } catch (e) {
@@ -5120,32 +5539,31 @@ export default class Settings extends View {
     const adapterList = Array.isArray(this.adapterStatus?.adapters)
       ? this.adapterStatus.adapters
       : [];
-    const displayNames = {
-      claude: "Claude Code",
-      codex: "Codex",
-      agy: "Antigravity",
-      cursor: "Cursor",
-      gemini: "Gemini CLI",
-      opencode: "OpenCode",
-      pi: "Pi",
-      kimi: "Kimi",
-      copilot: "GitHub Copilot",
-      hermes: "Hermes",
-      zcode: "ZCode",
-      trae: "TRAE CLI",
-      qwen: "Qwen Code",
-      qoder: "Qoder",
-      glm: "GLM",
-      dsh: "DSH",
-      kiro: "Kiro",
-      amp: "Amp",
-      grok: "Grok",
-    };
-    const prefOrder = [
-      "claude", "codex", "agy", "cursor", "gemini", "opencode", "pi",
-      "kimi", "copilot", "hermes", "zcode", "trae", "qwen", "glm", "dsh", "qoder", "kiro", "amp", "grok",
-    ];
+
+    const catalogIndex = new Map();
     const byId = new Map();
+    SUPPORTED_AGENTS_CATALOG.forEach((spec, idx) => {
+      catalogIndex.set(spec.id, idx);
+      byId.set(spec.id, {
+        id: spec.id,
+        name: spec.name,
+        cli: spec.cli ?? null,
+        standaloneAcp: Boolean(spec.standaloneAcp),
+        acpMode: spec.acpMode ?? "none",
+        acpCommand: spec.acpCommand ?? null,
+        install: spec.install ?? null,
+        cliInstalled: false,
+        cliRun: null,
+        acpSupported: spec.acpMode !== "none",
+        acpInstalled: false,
+        acpError: null,
+        models: [],
+        command: null,
+        path: null,
+        adapter: null,
+      });
+    });
+
     const ensure = (rawId) => {
       const id = this.canonicalFixAgentId(rawId);
       if (!id) return null;
@@ -5153,7 +5571,12 @@ export default class Settings extends View {
       if (!rec) {
         rec = {
           id,
-          name: displayNames[id] ?? id,
+          name: id,
+          cli: id,
+          standaloneAcp: false,
+          acpMode: "none",
+          acpCommand: null,
+          install: null,
           cliInstalled: false,
           cliRun: null,
           acpSupported: false,
@@ -5174,13 +5597,17 @@ export default class Settings extends View {
       if (!rec) continue;
       if (p?.name) rec.name = p.name;
       if (p?.installed) rec.cliInstalled = true;
-      if (Array.isArray(p?.run) && p.run.length > 0) rec.cliRun = p.run;
+      if (Array.isArray(p?.run) && p.run.length > 0) {
+        rec.cliRun = p.run;
+        if (!rec.cli) rec.cli = p.run[0];
+      }
     }
 
     for (const a of probedList) {
       const rec = ensure(a?.id);
       if (!rec) continue;
       rec.acpSupported = true;
+      if (rec.acpMode === "none") rec.acpMode = "separate";
       if (a?.installed) rec.acpInstalled = true;
       const err = this.agentProbeError(a);
       if (err) rec.acpError = err;
@@ -5194,30 +5621,65 @@ export default class Settings extends View {
       const rec = ensure(ad?.preset_id);
       if (!rec) continue;
       rec.acpSupported = true;
+      rec.acpMode = "managed";
       rec.adapter = ad;
+      if (ad?.binary_name) rec.acpCommand = ad.binary_name;
+      if (ad?.companion_cli && !rec.cli) rec.cli = ad.companion_cli;
+      if (!ad?.companion_cli) rec.standaloneAcp = true;
       if (ad?.companion_installed) rec.cliInstalled = true;
-      if (ad?.installed) rec.acpInstalled = true;
-      if (!rec.path && ad?.path) rec.path = ad.path;
+      // Managed adapter status is authoritative for whether the adapter itself is installed
+      // (avoid treating an `npx_fallback` probe as an installed ACP adapter).
+      rec.acpInstalled = Boolean(ad?.installed);
+      if (ad?.path) rec.path = ad.path;
     }
 
-    const rank = (id) => {
-      const i = prefOrder.indexOf(id);
-      return i === -1 ? 99 : i;
-    };
+    const rank = (id) => (catalogIndex.has(id) ? catalogIndex.get(id) : 999);
     const group = (r) => {
-      if (r.acpReady) return 0;
-      if (r.acpError) return 1;
+      if (r.acpReady && r.anyInstalled) return 0;
+      if (r.hasError) return 1;
       if (r.adapterMissing) return 2;
-      if (r.cliInstalled || r.acpInstalled) return 3;
-      return 4;
+      if (r.anyInstalled) return 3;
+      if (r.acpSupported) return 4;
+      return 5;
     };
 
     return [...byId.values()]
       .map((r) => {
-        const adapterMissing = Boolean(r.adapter && r.adapter.companion_installed && !r.adapter.installed && r.adapter.state !== "installing");
-        const acpReady = Boolean(r.acpInstalled && !r.acpError);
-        const anyInstalled = Boolean(r.cliInstalled || r.acpInstalled || r.adapter?.state === "installing");
-        return { ...r, adapterMissing, acpReady, anyInstalled };
+        const adapterInstalling = Boolean(
+          r.adapter?.state === "installing" ||
+            this.adapterBusy === `install:${r.id}` ||
+            this.adapterBusy === `update:${r.id}`,
+        );
+        const adapterError = String(r.adapter?.error ?? "").trim() || null;
+        // Built-in ACP comes bundled with the CLI binary itself.
+        const effectiveAcpInstalled = r.acpMode === "builtin"
+          ? Boolean(r.acpInstalled || r.cliInstalled)
+          : Boolean(r.acpInstalled);
+        const adapterMissing = Boolean(
+          r.acpMode === "managed" &&
+            (r.cliInstalled || r.adapter?.companion_installed) &&
+            !effectiveAcpInstalled &&
+            !adapterInstalling,
+        );
+        const adapterNotInstalled = Boolean(
+          r.acpMode === "managed" && !effectiveAcpInstalled && !adapterInstalling,
+        );
+        const acpReady = Boolean(effectiveAcpInstalled && !r.acpError && !adapterError);
+        const hasError = Boolean(r.acpError || adapterError);
+        const needsAction = Boolean(hasError || adapterMissing);
+        const anyInstalled = Boolean(r.cliInstalled || effectiveAcpInstalled || adapterInstalling);
+        return {
+          ...r,
+          acpInstalled: effectiveAcpInstalled,
+          adapterInstalling,
+          adapterError,
+          adapterMissing,
+          adapterNotInstalled,
+          acpReady,
+          hasError,
+          needsAction,
+          anyInstalled,
+        };
       })
       .sort((a, b) => {
         const ga = group(a);
@@ -5231,6 +5693,8 @@ export default class Settings extends View {
   }
 
   renderProbeErrorCard(t, cx, errorAgents) {
+    const focusId = this.droveProbeFixFocusId ? this.canonicalFixAgentId(this.droveProbeFixFocusId) : null;
+    const focusedTarget = focusId ? errorAgents.find((a) => this.canonicalFixAgentId(a.id) === focusId) : null;
     return v_flex()
       .id("st-dr-agent-errors")
       .w_full()
@@ -5249,14 +5713,51 @@ export default class Settings extends View {
           .gap(8)
           .flex_wrap()
           .child(
-            div()
-              .text_size(12)
-              .font_semibold()
-              .text_color(t.blocked)
+            h_flex()
+              .gap(8)
+              .items_center()
+              .flex_wrap()
               .child(
-                this.tr(
-                  `Detected ${errorAgents.length} agent probe error${errorAgents.length > 1 ? "s" : ""}`,
-                  `刷新检测到 ${errorAgents.length} 个 Agent 异常`,
+                div()
+                  .text_size(12)
+                  .font_semibold()
+                  .text_color(t.blocked)
+                  .child(
+                    this.tr(
+                      `Detected ${errorAgents.length} Agent / ACP issue${errorAgents.length > 1 ? "s" : ""}`,
+                      `检测到 ${errorAgents.length} 项智能体 / ACP 异常`,
+                    ),
+                  ),
+              )
+              .when(Boolean(focusedTarget), (el) =>
+                el.child(
+                  h_flex()
+                    .gap(5)
+                    .items_center()
+                    .px(6)
+                    .py(1.5)
+                    .rounded(4)
+                    .bg(t.background)
+                    .border_1()
+                    .border_color(t.border)
+                    .child(
+                      div()
+                        .text_size(10.8)
+                        .text_color(t.muted)
+                        .child(this.tr(`Focus: ${focusedTarget.name || focusedTarget.id}`, `聚焦排查：${focusedTarget.name || focusedTarget.id}`)),
+                    )
+                    .child(
+                      div()
+                        .id("st-dr-probe-fix-clear-focus")
+                        .cursor_pointer()
+                        .text_size(10.8)
+                        .text_color(t.accent)
+                        .on_click((_e, c) => {
+                          this.droveProbeFixFocusId = null;
+                          c.notify();
+                        })
+                        .child(this.tr("All", "全部")),
+                    ),
                 ),
               ),
           )
@@ -5292,7 +5793,7 @@ export default class Settings extends View {
                     .tooltip(
                       this.tr(
                         "Choose an AI coding agent, model, and reasoning effort to explain error causes, propose a fix plan, and repair after your confirmation",
-                        "选择要启动的 Agent 类型、模型与思考强度，在工作区标签页先解读错误原因并制定修复方案，待你确认后再开始修复",
+                        "选择要启动的 AI Agent、模型与思考强度，在工作区先解读错误原因并制定修复方案，待你确认后再开始修复",
                       ),
                     )
                     .when(this.droveProbeAgentLaunching, (b) =>
@@ -5303,10 +5804,17 @@ export default class Settings extends View {
                           .spin(900),
                       ),
                     )
+                    .when(!this.droveProbeAgentLaunching, (b) =>
+                      b.child(
+                        svg(I("sparkles"))
+                          .size(11.5)
+                          .text_color(fixOpen ? t.accent_foreground : t.accent),
+                      ),
+                    )
                     .child(
                       this.droveProbeAgentLaunching
                         ? this.tr("Launching…", "启动中…")
-                        : this.tr("Fix with Agent", "用 Agent 排查处理"),
+                        : this.tr("Fix with AI", "AI 处理异常"),
                     );
                 })(),
               ),
@@ -5316,6 +5824,11 @@ export default class Settings extends View {
         errorAgents.map((a) => {
           const rawErr = this.agentProbeError(a) ?? "";
           const shortErr = this.formatAgentProbeError(rawErr);
+          const kindLabel = a.issueKind === "adapter"
+            ? this.tr("Adapter", "适配器")
+            : a.issueKind === "env"
+              ? this.tr("Env", "环境")
+              : "ACP";
           return h_flex()
             .id(`st-dr-agent-err-${a.id}`)
             .w_full()
@@ -5324,13 +5837,26 @@ export default class Settings extends View {
             .tooltip(rawErr)
             .child(
               h_flex()
-                .w(104)
+                .w(122)
                 .flex_none()
                 .gap(6)
                 .items_center()
                 .child(this.agentIconEl(t, a.id, 13))
                 .child(div().w(6).h(6).rounded(3).flex_none().bg(t.blocked))
-                .child(div().truncate().text_size(12).font_semibold().text_color(t.foreground).child(a.id)),
+                .child(div().truncate().text_size(12).font_semibold().text_color(t.foreground).child(a.name || a.id)),
+            )
+            .child(
+              div()
+                .flex_none()
+                .px(5)
+                .py(1)
+                .rounded(4)
+                .bg(t.background)
+                .border_1()
+                .border_color(alpha(t.blocked, "44") ?? t.border)
+                .text_size(10)
+                .text_color(t.blocked)
+                .child(kindLabel),
             )
             .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.muted).child(shortErr));
         }),
@@ -5620,21 +6146,31 @@ export default class Settings extends View {
         .child(label);
     };
 
-    const probeSummary = this.droveProbeSummary();
-    const errorAgents = probeSummary.errored;
     const rows = this.detectedAgentRows();
+    const issues = this.agentIssues(rows);
     const installedRows = rows.filter((r) => r.anyInstalled);
     const missingRows = rows.filter((r) => !r.anyInstalled);
-    const cliCount = rows.filter((r) => r.cliInstalled).length;
+    const needsActionRows = rows.filter((r) => r.needsAction);
     const acpReadyCount = rows.filter((r) => r.acpReady).length;
-    const visibleRows = this.agentShowMissing ? rows : (installedRows.length > 0 ? installedRows : rows);
+    const missingAdapterRows = rows.filter((r) => r.adapterMissing);
+    const anyMissingAdapterRows = rows.filter((r) => r.adapterNotInstalled);
+    const managedInstalledRows = rows.filter((r) => r.adapter?.source === "managed");
 
-    const adapterList = Array.isArray(this.adapterStatus?.adapters) ? this.adapterStatus.adapters : [];
-    const installingAdapters = adapterList.filter((a) => a.state === "installing");
-    const missingDetectedAdapters = adapterList.filter((a) => a.companion_installed && !a.installed && a.state !== "installing");
-    const anyMissingAdapters = adapterList.filter((a) => !a.installed && a.state !== "installing");
-    const managedAdapters = adapterList.filter((a) => a.source === "managed");
-    const readyAdaptersCount = adapterList.filter((a) => a.installed).length;
+    const activeFilter =
+      this.agentFilter === "issues" && needsActionRows.length === 0
+        ? "all"
+        : (this.agentFilter || "all");
+    const visibleRows =
+      activeFilter === "installed"
+        ? installedRows
+        : activeFilter === "missing"
+          ? missingRows
+          : activeFilter === "issues"
+            ? needsActionRows
+            : rows;
+
+    const detecting = Boolean(this.droveProbing || this.droveFixKnownLoading);
+    const probedTime = this.formatProbeTimestamp(this.droveData?.agents?.probedAt ?? this.droveData?.agents?.probed_at);
 
     const autoInstall = this.adapterStatus?.auto_install !== false;
     const injectMcp = this.adapterStatus?.inject_mcp !== false;
@@ -5657,8 +6193,8 @@ export default class Settings extends View {
           label: r.name && r.name !== r.id ? `${r.name} (${r.id})` : r.id,
           icon: r.id,
           dot: r.anyInstalled,
-          dotColor: r.acpReady ? t.ansi2 : r.acpError ? t.blocked : r.cliInstalled ? t.working : t.dim,
-          meta: r.acpReady ? this.tr("ACP ready", "ACP 就绪") : r.cliInstalled ? "CLI" : this.tr("missing", "未安装"),
+          dotColor: r.acpReady ? t.ansi2 : r.hasError ? t.blocked : r.cliInstalled ? t.working : t.dim,
+          meta: r.acpReady ? this.tr("ACP ready", "ACP 就绪") : r.cliInstalled ? "CLI" : this.tr("not installed", "未安装"),
           active: defaultAgent === r.id,
         })),
     ];
@@ -5666,23 +6202,6 @@ export default class Settings extends View {
       defaultAgentItems.splice(1, 0, { value: defaultAgent, label: defaultAgent, meta: this.tr("custom", "自定义"), active: true });
     }
     const defaultAgentLabel = defaultAgentItems.find((it) => it.active)?.label ?? defaultAgent;
-
-    const adapterSourceLabel = (a) => {
-      const ver = a.version ? ` v${a.version}` : "";
-      if (a.state === "installing" || this.adapterBusy === `install:${a.preset_id}` || this.adapterBusy === `update:${a.preset_id}`) {
-        return [this.tr("Installing…", "安装中…"), t.accent];
-      }
-      if (a.installed) {
-        if (a.source === "managed") return [this.tr(`Managed${ver}`, `托管${ver}`), t.ansi2];
-        if (a.source === "config") return [this.tr("Config", "自定义配置"), t.ansi2];
-        if (a.source === "path") return ["PATH", t.ansi2];
-        if (a.source === "npx_cache") return ["npx cache", t.ansi2];
-        return [this.tr("Ready", "就绪"), t.ansi2];
-      }
-      if (a.state === "error" || a.error) return [this.tr("Error", "异常"), t.blocked];
-      if (a.companion_installed) return [this.tr("Missing Adapter", "缺少适配器"), t.working];
-      return [this.tr("Not Installed", "未安装"), t.dim];
-    };
 
     const pill = (text, color, bg = t.background, border = t.border) =>
       div()
@@ -5696,91 +6215,385 @@ export default class Settings extends View {
         .text_color(color)
         .child(text);
 
+    const actionBtn = (id, label, onClick, opts = {}) => {
+      const { primary = false, danger = false, busy = false, disabled = false, icon = null, tooltip = null } = opts;
+      const bg = primary ? t.accent : danger ? (alpha(t.blocked, "14") ?? t.raised) : t.raised;
+      const border = primary ? t.accent : danger ? (alpha(t.blocked, "55") ?? t.blocked) : t.border;
+      const fg = primary ? t.accent_foreground : danger ? t.blocked : t.foreground;
+      return h_flex()
+        .id(id)
+        .px(8)
+        .py(3.5)
+        .gap(4)
+        .rounded(6)
+        .border_1()
+        .border_color(border)
+        .bg(bg)
+        .items_center()
+        .text_size(11.5)
+        .when(primary || danger, (el) => el.font_semibold())
+        .text_color(fg)
+        .when(busy || disabled, (el) => el.opacity(0.6))
+        .when(!busy && !disabled, (el) =>
+          el
+            .cursor_pointer()
+            .hover((s) => (primary ? s.opacity(0.9) : s.bg(t.hover)))
+            .on_click(onClick),
+        )
+        .when(Boolean(tooltip), (el) => el.tooltip(tooltip))
+        .when(busy, (el) => el.child(svg("mods/workspace-chrome/spinner.svg").size(10).text_color(fg).spin(900)))
+        .when(!busy && Boolean(icon), (el) => el.child(svg(I(icon)).size(11).text_color(primary ? fg : danger ? t.blocked : t.accent)))
+        .child(label);
+    };
+
+    const filterTabs = [
+      { id: "all", label: this.tr(`All (${rows.length})`, `全部 (${rows.length})`) },
+      { id: "installed", label: this.tr(`Installed (${installedRows.length})`, `已安装 (${installedRows.length})`) },
+      { id: "missing", label: this.tr(`Not Installed (${missingRows.length})`, `未安装 (${missingRows.length})`) },
+    ];
+    if (needsActionRows.length > 0) {
+      filterTabs.push({
+        id: "issues",
+        label: this.tr(`Action Needed (${needsActionRows.length})`, `需处理 (${needsActionRows.length})`),
+        warn: true,
+      });
+    }
+
+    const acpStatusBadge = (r) => {
+      if (!r.acpSupported) {
+        return div()
+          .text_size(11.5)
+          .text_color(t.dim)
+          .tooltip(this.tr("Interactive CLI agent only (no ACP protocol preset)", "仅支持终端交互 CLI，暂不支持 ACP 协议"))
+          .child(this.tr("Not supported", "不支持"));
+      }
+      if (r.adapterInstalling) {
+        return h_flex()
+          .gap(4)
+          .items_center()
+          .px(6)
+          .py(1.5)
+          .rounded(4)
+          .bg(alpha(t.accent, "18") ?? t.background)
+          .border_1()
+          .border_color(alpha(t.accent, "44") ?? t.border)
+          .child(svg("mods/workspace-chrome/spinner.svg").size(10).text_color(t.accent).spin(900))
+          .child(div().text_size(10.8).text_color(t.accent).child(this.tr("Installing…", "安装中…")));
+      }
+      if (r.adapterError) {
+        return pill(
+          this.tr("Install Error", "安装失败"),
+          t.blocked,
+          alpha(t.blocked, "18") ?? t.background,
+          alpha(t.blocked, "55") ?? t.border,
+        ).tooltip(r.adapterError);
+      }
+      if (r.acpError) {
+        return pill(
+          this.tr("ACP Error", "探测异常"),
+          t.blocked,
+          alpha(t.blocked, "18") ?? t.background,
+          alpha(t.blocked, "55") ?? t.border,
+        ).tooltip(r.acpError);
+      }
+      if (r.acpMode === "managed") {
+        if (r.acpInstalled) {
+          const ver = r.adapter?.version ? ` v${r.adapter.version}` : "";
+          const srcHint = r.adapter?.source === "managed"
+            ? this.tr("Herdr2 managed adapter", "Herdr2 隔离托管适配器")
+            : r.adapter?.source === "path"
+              ? "PATH"
+              : r.adapter?.source === "config"
+                ? this.tr("Custom config.toml", "自定义 config.toml")
+                : r.adapter?.source === "npx_cache"
+                  ? "npx cache"
+                  : "";
+          const tip = [srcHint, r.path].filter(Boolean).join(" · ");
+          return pill(
+            this.tr(`Installed${ver}`, `已安装${ver}`),
+            t.ansi2,
+            alpha(t.ansi2, "16") ?? t.background,
+            alpha(t.ansi2, "44") ?? t.border,
+          ).when(Boolean(tip), (el) => el.tooltip(tip));
+        }
+        const isWarn = Boolean(r.cliInstalled);
+        return pill(
+          this.tr("Not Installed", "未安装"),
+          isWarn ? t.working : t.dim,
+          isWarn ? (alpha(t.working, "16") ?? t.background) : t.background,
+          isWarn ? (alpha(t.working, "50") ?? t.border) : t.border,
+        ).tooltip(
+          isWarn
+            ? this.tr(
+                `CLI detected, but managed ACP adapter (${r.acpCommand}) is not installed. Click Install ACP.`,
+                `已检测到 CLI，但托管 ACP 适配器（${r.acpCommand}）未安装，点击右侧可一键安装。`,
+              )
+            : this.tr(
+                `Managed ACP adapter (${r.acpCommand}) can be installed with one click.`,
+                `托管 ACP 适配器（${r.acpCommand}），支持一键隔离安装。`,
+              ),
+        );
+      }
+      if (r.acpMode === "builtin") {
+        if (r.acpReady) {
+          return pill(
+            this.tr("Installed · Built-in", "已安装 · 内置"),
+            t.ansi2,
+            alpha(t.ansi2, "16") ?? t.background,
+            alpha(t.ansi2, "44") ?? t.border,
+          ).tooltip(this.tr(`Built-in ACP command: ${r.acpCommand}`, `随 CLI 内置 ACP 命令：${r.acpCommand}`));
+        }
+        return pill(this.tr("Not Installed", "未安装"), t.dim).tooltip(
+          this.tr(
+            `Built into ${r.cli || r.id} (${r.acpCommand}). Install the Agent CLI to enable ACP.`,
+            `随 ${r.cli || r.id} 内置（${r.acpCommand}），安装 Agent CLI 后即可自动启用。`,
+          ),
+        );
+      }
+      // Separate non-managed ACP server (e.g. hermes-acp, zcode-acp-server, custom config.toml)
+      if (r.acpReady) {
+        const tip = r.path || r.acpCommand || "";
+        return pill(
+          this.tr("Installed", "已安装"),
+          t.ansi2,
+          alpha(t.ansi2, "16") ?? t.background,
+          alpha(t.ansi2, "44") ?? t.border,
+        ).when(Boolean(tip), (el) => el.tooltip(tip));
+      }
+      const sepTip = r.acpCommand ? this.tr(`Requires ACP binary: ${r.acpCommand}`, `需安装 ACP 组件：${r.acpCommand}`) : "";
+      return pill(
+        this.tr("Not Installed", "未安装"),
+        r.cliInstalled ? t.working : t.dim,
+        r.cliInstalled ? (alpha(t.working, "14") ?? t.background) : t.background,
+        r.cliInstalled ? (alpha(t.working, "44") ?? t.border) : t.border,
+      ).when(Boolean(sepTip), (el) => el.tooltip(sepTip));
+    };
+
+    const rowSubline = (r) => {
+      if (r.acpError || r.adapterError) {
+        return { text: this.formatAgentProbeError(r.acpError || r.adapterError), color: t.blocked, tooltip: r.acpError || r.adapterError };
+      }
+      const parts = [];
+      if (r.models.length > 0) {
+        parts.push(this.tr(`${r.models.length} models`, `${r.models.length} 个模型`));
+      }
+      if (r.acpMode === "managed" && r.adapter?.source && r.acpInstalled) {
+        const srcMap = {
+          managed: this.tr("Managed", "隔离托管"),
+          path: "PATH",
+          config: this.tr("Config", "自定义配置"),
+          npx_cache: "npx cache",
+        };
+        parts.push(srcMap[r.adapter.source] ?? r.adapter.source);
+      }
+      if (r.path) {
+        parts.push(r.path);
+      } else if (r.acpCommand) {
+        parts.push(r.acpCommand);
+      } else if (r.cli) {
+        parts.push(r.cli);
+      }
+      const modelsTooltip = r.models.length > 0 ? r.models.map((m) => m.id).join(", ") : undefined;
+      return {
+        text: parts.join(" · "),
+        color: t.dim,
+        tooltip: modelsTooltip || r.path || r.install?.display || undefined,
+      };
+    };
+
+    const rowActions = (r) => {
+      const isBusyThis = Boolean(
+        r.adapterInstalling ||
+          this.adapterBusy === `install:${r.id}` ||
+          this.adapterBusy === `update:${r.id}`,
+      );
+      const btns = [];
+
+      // 1. Always offer direct AI troubleshooting when this row has any error.
+      if (r.hasError) {
+        btns.push(
+          actionBtn(
+            `st-ag-row-ai-${r.id}`,
+            this.tr("Fix with AI", "AI 处理"),
+            (_e, cx) => this.openAgentAiFix(cx, r.id),
+            {
+              danger: true,
+              icon: "sparkles",
+              tooltip: this.tr(`Use AI to diagnose and fix ${r.name}`, `启动 AI 排查并处理 ${r.name} 的异常`),
+            },
+          ),
+        );
+        if (r.acpMode === "managed") {
+          btns.push(
+            actionBtn(
+              `st-ag-adapter-act-${r.id}`,
+              isBusyThis ? this.tr("Working…", "处理中…") : this.tr("Reinstall", "重装"),
+              (_e, cx) => {
+                if (!this.adapterBusy && !r.adapterInstalling) this.runAdapterAction(cx, "install", r.id);
+              },
+              { busy: isBusyThis, disabled: Boolean(this.adapterBusy) },
+            ),
+          );
+        }
+        return btns;
+      }
+
+      // 2. Managed ACP adapter rows (claude, codex, pi, glm).
+      if (r.acpMode === "managed") {
+        if (!r.acpInstalled) {
+          if (!r.cliInstalled && !r.standaloneAcp && r.install) {
+            btns.push(
+              actionBtn(
+                `st-ag-row-cli-${r.id}`,
+                this.tr("Install CLI", "装 CLI"),
+                (_e, cx) => this.installAgentCli(r, cx),
+                { tooltip: r.install.display },
+              ),
+            );
+          }
+          btns.push(
+            actionBtn(
+              `st-ag-row-inst-${r.id}`,
+              isBusyThis
+                ? this.tr("Installing…", "安装中…")
+                : r.cliInstalled
+                  ? this.tr("Install ACP", "一键安装 ACP")
+                  : this.tr("Install ACP", "装 ACP"),
+              (_e, cx) => {
+                if (!this.adapterBusy && !r.adapterInstalling) this.runAdapterAction(cx, "install", r.id);
+              },
+              {
+                primary: Boolean(r.cliInstalled),
+                busy: isBusyThis,
+                disabled: Boolean(this.adapterBusy),
+                tooltip: this.tr(`One-click install managed ACP adapter (${r.acpCommand})`, `一键隔离安装托管 ACP 适配器（${r.acpCommand}）`),
+              },
+            ),
+          );
+          return btns;
+        }
+        // Managed ACP is already installed.
+        if (!r.cliInstalled && !r.standaloneAcp && r.install) {
+          btns.push(
+            actionBtn(
+              `st-ag-row-cli-${r.id}`,
+              this.tr("Install CLI", "安装 CLI"),
+              (_e, cx) => this.installAgentCli(r, cx),
+              { tooltip: r.install.display },
+            ),
+          );
+        }
+        if (r.adapter?.source === "managed") {
+          btns.push(
+            actionBtn(
+              `st-ag-adapter-act-${r.id}`,
+              isBusyThis ? this.tr("Updating…", "更新中…") : this.tr("Update ACP", "更新 ACP"),
+              (_e, cx) => {
+                if (!this.adapterBusy && !r.adapterInstalling) this.runAdapterAction(cx, "update", r.id);
+              },
+              { busy: isBusyThis, disabled: Boolean(this.adapterBusy) },
+            ),
+          );
+        }
+        return btns;
+      }
+
+      // 3. Built-in ACP / separate ACP / CLI-only rows.
+      if (!r.cliInstalled) {
+        if (r.install) {
+          btns.push(
+            actionBtn(
+              `st-ag-row-cli-${r.id}`,
+              this.tr("Install", "一键安装"),
+              (_e, cx) => this.installAgentCli(r, cx),
+              { tooltip: this.tr(`Run in terminal: ${r.install.display}`, `在终端执行：${r.install.display}`) },
+            ),
+          );
+        } else {
+          btns.push(
+            actionBtn(
+              `st-ag-row-ai-inst-${r.id}`,
+              this.tr("AI Install", "AI 安装"),
+              (_e, cx) => this.launchAgentToInstall(r, cx),
+              {
+                icon: "sparkles",
+                disabled: this.droveProbeAgentLaunching,
+                tooltip: this.tr(`Let AI help install ${r.name} on the selected machine`, `让 AI 根据本机环境协助安装 ${r.name}`),
+              },
+            ),
+          );
+        }
+        return btns;
+      }
+
+      if (r.acpMode === "separate" && !r.acpInstalled) {
+        btns.push(
+          actionBtn(
+            `st-ag-row-ai-inst-${r.id}`,
+            this.tr("AI Install ACP", "AI 装 ACP"),
+            (_e, cx) => this.launchAgentToInstall(r, cx),
+            {
+              icon: "sparkles",
+              disabled: this.droveProbeAgentLaunching,
+              tooltip: this.tr(`Let AI install ${r.acpCommand}`, `让 AI 协助安装 ${r.acpCommand}`),
+            },
+          ),
+        );
+      }
+      return btns;
+    };
+
     return v_flex()
       .id("st-agents-page")
       .w_full()
       .gap(16)
-      // 0. Top Environment Bar
+      // 0. Top Machine & Environment Detection Bar
       .child(
-        h_flex()
+        v_flex()
           .id("st-ag-env-bar")
           .w_full()
           .px(14)
-          .py(10)
+          .py(11)
+          .gap(9)
           .rounded(10)
           .border_1()
           .border_color(t.border)
           .bg(t.surface)
-          .items_center()
-          .justify_between()
-          .gap(10)
-          .flex_wrap()
           .child(
             h_flex()
-              .gap(6)
+              .w_full()
               .items_center()
+              .justify_between()
+              .gap(10)
               .flex_wrap()
-              .child(div().text_size(12).text_color(t.dim).child(this.tr("Machine:", "目标主机：")))
-              .child(machineChip("local", this.tr("This computer", "本机"), null))
-              .children(machines.map((m) => machineChip(m.name, m.name, m.name))),
-          )
-          .child(
-            h_flex()
-              .gap(8)
-              .items_center()
-              .flex_wrap()
-              .when(cliCount > 0, (el) =>
-                el.child(pill(this.tr(`${cliCount} CLI`, `${cliCount} 个 CLI`), t.muted)),
-              )
-              .when(acpReadyCount > 0, (el) =>
-                el.child(pill(this.tr(`${acpReadyCount} ACP ready`, `${acpReadyCount} 个 ACP 就绪`), t.ansi2, alpha(t.ansi2, "16") ?? t.background, alpha(t.ansi2, "44") ?? t.border)),
-              )
-              .when(errorAgents.length > 0, (el) =>
-                el.child(
-                  div()
-                    .id("st-dr-probe-err-badge")
-                    .px(7)
-                    .py(3)
-                    .rounded(5)
-                    .bg(t.background)
-                    .border_1()
-                    .border_color(t.blocked)
-                    .text_size(11)
-                    .text_color(t.blocked)
-                    .child(this.tr(`${errorAgents.length} error${errorAgents.length > 1 ? "s" : ""}`, `${errorAgents.length} 个异常`)),
-                ),
+              .child(
+                h_flex()
+                  .gap(6)
+                  .items_center()
+                  .flex_wrap()
+                  .child(div().text_size(12).text_color(t.dim).child(this.tr("Machine:", "目标主机：")))
+                  .child(machineChip("local", this.tr("This computer", "本机"), null))
+                  .children(machines.map((m) => machineChip(m.name, m.name, m.name))),
               )
               .child(
-                this.button(
-                  t,
+                actionBtn(
                   "st-ag-probe",
-                  this.droveProbing ? this.tr("Detecting…", "检测中…") : this.tr("Refresh Detection", "刷新检测"),
+                  detecting
+                    ? this.tr("Detecting Environment…", "检测机器环境中…")
+                    : this.tr("Detect Environment", "一键检测环境"),
                   (_e, cx) => this.refreshAgentsDetection(cx),
+                  {
+                    primary: true,
+                    busy: detecting,
+                    icon: "refresh",
+                    tooltip: this.tr(
+                      "Re-scan installed CLI agents, ACP adapters, and live model catalogs on the selected machine",
+                      "重新扫描目标主机的 CLI Agent、ACP 适配器状态与可用模型信息",
+                    ),
+                  },
                 ),
               ),
-          ),
-      )
-      .when(Boolean(this.droveError || this.adapterError), (el) =>
-        el.child(
-          div()
-            .px(12)
-            .py(8)
-            .rounded(8)
-            .border_1()
-            .border_color(t.blocked)
-            .bg(t.surface)
-            .text_size(12)
-            .text_color(t.blocked)
-            .child(this.adapterError || this.droveError),
-        ),
-      )
-      .when(errorAgents.length > 0, (el) => el.child(this.renderProbeErrorCard(t, cx, errorAgents)))
-      // 1. Managed ACP Adapters
-      .child(
-        v_flex()
-          .id("st-ag-adapters-card")
-          .w_full()
-          .gap(8)
+          )
           .child(
             h_flex()
               .w_full()
@@ -5789,178 +6602,67 @@ export default class Settings extends View {
               .gap(8)
               .flex_wrap()
               .child(
-                v_flex()
-                  .gap(2)
-                  .child(
-                    h_flex()
-                      .gap(8)
-                      .items_center()
-                      .child(this.heading(t, this.tr("Managed ACP Adapters", "托管 ACP 适配器")))
-                      .when(adapterList.length > 0, (el) =>
-                        el.child(pill(`${readyAdaptersCount}/${adapterList.length} ${this.tr("ready", "就绪")}`, readyAdaptersCount === adapterList.length ? t.ansi2 : t.muted)),
-                      ),
-                  )
-                  .child(
-                    div()
-                      .text_size(12)
-                      .text_color(t.dim)
-                      .child(
-                        this.adapterStatus?.adapters_dir
-                          ? this.tr(
-                              `Isolated ACP adapters stored in ${this.adapterStatus.adapters_dir} (no global npm changes).`,
-                              `独立隔离安装在 ${this.adapterStatus.adapters_dir}，不污染全局 npm 环境。`,
-                            )
-                          : this.tr(
-                              "Isolated ACP adapters downloaded from the official ACP Registry for headless Claude, Codex, Pi, and GLM sessions.",
-                              "从官方 ACP Registry 隔离下载，用于无头 ACP 模式运行 Claude、Codex、Pi 与 GLM。",
-                            ),
-                      ),
-                  ),
-              )
-              .child(
                 h_flex()
                   .gap(6)
                   .items_center()
                   .flex_wrap()
-                  .when(missingDetectedAdapters.length > 0, (el) =>
+                  .child(
+                    pill(
+                      this.tr(`Agents ${installedRows.length}/${rows.length}`, `已装 Agent ${installedRows.length}/${rows.length}`),
+                      installedRows.length > 0 ? t.foreground : t.dim,
+                    ),
+                  )
+                  .child(
+                    pill(
+                      this.tr(`ACP Ready ${acpReadyCount}`, `ACP 就绪 ${acpReadyCount}`),
+                      acpReadyCount > 0 ? t.ansi2 : t.dim,
+                      acpReadyCount > 0 ? (alpha(t.ansi2, "16") ?? t.background) : t.background,
+                      acpReadyCount > 0 ? (alpha(t.ansi2, "44") ?? t.border) : t.border,
+                    ),
+                  )
+                  .when(missingAdapterRows.length > 0, (el) =>
                     el.child(
-                      this.button(
-                        t,
-                        "st-dr-adapter-install",
-                        this.adapterBusy === "install" ? this.tr("Installing…", "安装中…") : this.tr("Install Missing", "一键安装缺失适配器"),
-                        (_e, cx) => this.runAdapterAction(cx, "install"),
+                      pill(
+                        this.tr(`${missingAdapterRows.length} ACP Missing`, `缺 ${missingAdapterRows.length} 个 ACP 适配器`),
+                        t.working,
+                        alpha(t.working, "16") ?? t.background,
+                        alpha(t.working, "48") ?? t.border,
                       ),
                     ),
                   )
-                  .when(anyMissingAdapters.length > 0, (el) =>
+                  .when(issues.length > 0, (el) =>
                     el.child(
-                      this.button(
-                        t,
-                        "st-ag-adapter-install-all",
-                        this.adapterBusy === "install-all" ? this.tr("Installing…", "安装中…") : this.tr("Install All", "全部安装"),
-                        (_e, cx) => this.runAdapterAction(cx, "install-all"),
-                      ),
-                    ),
-                  )
-                  .when(managedAdapters.length > 0, (el) =>
-                    el.child(
-                      this.button(
-                        t,
-                        "st-dr-adapter-update",
-                        this.adapterBusy === "update" ? this.tr("Updating…", "更新中…") : this.tr("Update All", "更新适配器"),
-                        (_e, cx) => this.runAdapterAction(cx, "update"),
-                      ),
+                      div()
+                        .id("st-dr-probe-err-badge")
+                        .px(7)
+                        .py(1.5)
+                        .rounded(4)
+                        .bg(alpha(t.blocked, "14") ?? t.background)
+                        .border_1()
+                        .border_color(alpha(t.blocked, "55") ?? t.blocked)
+                        .text_size(10.8)
+                        .text_color(t.blocked)
+                        .child(this.tr(`${issues.length} issue${issues.length > 1 ? "s" : ""}`, `${issues.length} 项异常`)),
                     ),
                   ),
-              ),
-          )
-          .child(
-            v_flex()
-              .w_full()
-              .rounded(10)
-              .border_1()
-              .border_color(t.border)
-              .bg(t.surface)
-              .overflow_hidden()
-              .when(adapterList.length === 0, (el) =>
-                el.child(
-                  h_flex()
-                    .px(14)
-                    .py(12)
-                    .gap(8)
-                    .items_center()
-                    .when(this.droveLoading, (row) => row.child(svg("mods/workspace-chrome/spinner.svg").size(12).text_color(t.accent).spin(900)))
-                    .child(
-                      div()
-                        .text_size(12)
-                        .text_color(t.dim)
-                        .child(
-                          this.droveLoading
-                            ? this.tr("Loading managed ACP adapter status…", "正在检测托管 ACP 适配器状态…")
-                            : this.tr("No managed adapter status available yet. Click Refresh Detection.", "暂未获取到托管适配器状态，请点击「刷新检测」。"),
-                        ),
-                    ),
-                ),
               )
-              .children(
-                adapterList.map((a, idx) => {
-                  const [stText, stColor] = adapterSourceLabel(a);
-                  const isBusyItem = this.adapterBusy === `install:${a.preset_id}` || this.adapterBusy === `update:${a.preset_id}` || a.state === "installing";
-                  const actMode = a.installed && a.source === "managed" ? "update" : "install";
-                  const actLabel = isBusyItem
-                    ? this.tr("Working…", "处理中…")
-                    : a.installed
-                      ? (a.source === "managed" ? this.tr("Update", "更新") : this.tr("Reinstall", "重装"))
-                      : this.tr("Install", "安装");
-                  const cliTag = a.companion_cli
-                    ? (a.companion_installed
-                        ? this.tr(`CLI: ${a.companion_cli} ✓`, `CLI: ${a.companion_cli} ✓`)
-                        : this.tr(`CLI: ${a.companion_cli} missing`, `未装 ${a.companion_cli}`))
-                    : this.tr("Standalone", "独立适配器");
-                  return h_flex()
-                    .id(`st-ag-adapter-${a.preset_id}`)
-                    .w_full()
-                    .px(14)
-                    .py(10)
-                    .gap(12)
-                    .items_center()
-                    .when(idx > 0, (el) => el.border_t(1).border_color(t.border))
-                    .child(this.agentIconEl(t, a.preset_id, 16))
-                    .child(
-                      v_flex()
-                        .flex_1()
-                        .min_w(0)
-                        .gap(3)
-                        .child(
-                          h_flex()
-                            .gap(7)
-                            .items_center()
-                            .flex_wrap()
-                            .child(div().text_size(13).font_semibold().text_color(t.foreground).child(a.preset_id))
-                            .child(div().text_size(11.5).text_color(t.dim).child(a.binary_name))
-                            .child(pill(cliTag, a.companion_installed ? t.muted : t.dim))
-                            .child(
-                              h_flex()
-                                .gap(4)
-                                .items_center()
-                                .px(6)
-                                .py(1.5)
-                                .rounded(4)
-                                .bg(alpha(stColor, "18") ?? t.background)
-                                .border_1()
-                                .border_color(alpha(stColor, "44") ?? t.border)
-                                .when(isBusyItem, (b) => b.child(svg("mods/workspace-chrome/spinner.svg").size(10).text_color(stColor).spin(900)))
-                                .child(div().text_size(10.8).text_color(stColor).child(stText)),
-                            ),
-                        )
-                        .when(Boolean(a.error || a.path), (el) =>
-                          el.child(
-                            div()
-                              .truncate()
-                              .text_size(11.2)
-                              .text_color(a.error ? t.blocked : t.dim)
-                              .tooltip(a.error || a.path)
-                              .child(a.error ? this.formatAgentProbeError(a.error) : a.path),
-                          ),
-                        ),
-                    )
-                    .child(
-                      this.button(
-                        t,
-                        `st-ag-adapter-act-${a.preset_id}`,
-                        actLabel,
-                        (_e, cx) => {
-                          if (!this.adapterBusy && a.state !== "installing") {
-                            this.runAdapterAction(cx, actMode, a.preset_id);
-                          }
-                        },
-                      ),
-                    );
-                }),
+              .child(
+                div()
+                  .text_size(11.2)
+                  .text_color(t.dim)
+                  .child(
+                    detecting
+                      ? this.tr("Scanning CLI & ACP environment…", "正在检测本机 Agent 与 ACP 信息…")
+                      : probedTime
+                        ? this.tr(`Last detected ${probedTime}`, `上次检测 ${probedTime}`)
+                        : this.tr("Click Detect Environment to refresh", "点击「一键检测环境」更新信息"),
+                  ),
               ),
           ),
       )
-      // 2. Detected Agents (CLI & ACP)
+      // 1. Unified Anomaly & AI Troubleshoot Card (probe errors, adapter install errors, env errors)
+      .when(issues.length > 0, (el) => el.child(this.renderProbeErrorCard(t, cx, issues)))
+      // 2. Unified Supported Agents & ACP Matrix
       .child(
         v_flex()
           .id("st-ag-list-card")
@@ -5976,35 +6678,104 @@ export default class Settings extends View {
               .child(
                 v_flex()
                   .gap(2)
-                  .child(this.heading(t, this.tr("Detected Agents (CLI & ACP)", "Agent 与 ACP 检测列表")))
+                  .child(this.heading(t, this.tr("Supported Agents & ACP", "支持的智能体与 ACP")))
                   .child(
                     div()
                       .text_size(12)
                       .text_color(t.dim)
                       .child(
                         this.tr(
-                          "Combined detection of interactive CLI agents and headless ACP presets with discovered models.",
-                          "汇总检测交互式 CLI Agent 与无头 ACP 预设的可用状态与模型列表。",
+                          "All supported agents with Agent CLI status, ACP protocol/adapter status, and one-click install.",
+                          "统一查看所有支持的智能体：Agent CLI 是否安装、ACP 是否就绪，并支持一键安装与更新。",
                         ),
                       ),
                   ),
               )
-              .when(missingRows.length > 0 && installedRows.length > 0, (el) =>
-                el.child(
-                  this.button(
-                    t,
-                    "st-ag-toggle-missing",
-                    this.agentShowMissing
-                      ? this.tr("Hide Not Installed", "隐藏未安装")
-                      : this.tr(`Show Not Installed (${missingRows.length})`, `显示未安装 (${missingRows.length})`),
-                    (_e, cx) => {
-                      this.agentShowMissing = !this.agentShowMissing;
-                      cx.notify();
-                    },
+              .child(
+                h_flex()
+                  .gap(6)
+                  .items_center()
+                  .flex_wrap()
+                  .when(missingAdapterRows.length > 0, (el) =>
+                    el.child(
+                      actionBtn(
+                        "st-dr-adapter-install",
+                        this.adapterBusy === "install"
+                          ? this.tr("Installing…", "安装中…")
+                          : this.tr(`Install Missing ACP (${missingAdapterRows.length})`, `一键安装缺失 ACP (${missingAdapterRows.length})`),
+                        (_e, cx) => this.runAdapterAction(cx, "install"),
+                        {
+                          primary: true,
+                          busy: this.adapterBusy === "install",
+                          disabled: Boolean(this.adapterBusy),
+                        },
+                      ),
+                    ),
+                  )
+                  .when(missingAdapterRows.length === 0 && anyMissingAdapterRows.length > 0, (el) =>
+                    el.child(
+                      actionBtn(
+                        "st-ag-adapter-install-all",
+                        this.adapterBusy === "install-all"
+                          ? this.tr("Installing…", "安装中…")
+                          : this.tr("Install All ACP Adapters", "一键安装全部 ACP"),
+                        (_e, cx) => this.runAdapterAction(cx, "install-all"),
+                        {
+                          busy: this.adapterBusy === "install-all",
+                          disabled: Boolean(this.adapterBusy),
+                        },
+                      ),
+                    ),
+                  )
+                  .when(managedInstalledRows.length > 0, (el) =>
+                    el.child(
+                      actionBtn(
+                        "st-dr-adapter-update",
+                        this.adapterBusy === "update"
+                          ? this.tr("Updating…", "更新中…")
+                          : this.tr("Update ACP", "更新全部 ACP"),
+                        (_e, cx) => this.runAdapterAction(cx, "update"),
+                        {
+                          busy: this.adapterBusy === "update",
+                          disabled: Boolean(this.adapterBusy),
+                        },
+                      ),
+                    ),
                   ),
-                ),
               ),
           )
+          // Filter Tabs
+          .child(
+            h_flex()
+              .id("st-ag-filter-bar")
+              .gap(5)
+              .items_center()
+              .flex_wrap()
+              .children(
+                filterTabs.map((tab) => {
+                  const on = activeFilter === tab.id;
+                  return div()
+                    .id(`st-ag-filter-${tab.id}`)
+                    .px(9)
+                    .py(3.5)
+                    .rounded(6)
+                    .border_1()
+                    .border_color(on ? t.accent : tab.warn ? (alpha(t.working, "48") ?? t.border) : t.border)
+                    .bg(on ? (alpha(t.accent, "18") ?? t.raised) : t.surface)
+                    .cursor_pointer()
+                    .text_size(11.5)
+                    .when(on, (el) => el.font_semibold())
+                    .text_color(on ? t.accent : tab.warn ? t.working : t.muted)
+                    .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                    .on_click((_e, c) => {
+                      this.agentFilter = tab.id;
+                      c.notify();
+                    })
+                    .child(tab.label);
+                }),
+              ),
+          )
+          // Unified Table Card
           .child(
             v_flex()
               .w_full()
@@ -6013,101 +6784,133 @@ export default class Settings extends View {
               .border_color(t.border)
               .bg(t.surface)
               .overflow_hidden()
+              // Table Header
+              .child(
+                h_flex()
+                  .id("st-ag-table-header")
+                  .w_full()
+                  .px(14)
+                  .py(7)
+                  .gap(10)
+                  .items_center()
+                  .bg(t.background)
+                  .border_b(1)
+                  .border_color(t.border)
+                  .child(div().flex_1().min_w(0).text_size(11).font_semibold().text_color(t.dim).child(this.tr("AGENT", "智能体")))
+                  .child(div().w(86).flex_none().text_size(11).font_semibold().text_color(t.dim).child(this.tr("AGENT CLI", "Agent 状态")))
+                  .child(div().w(140).flex_none().text_size(11).font_semibold().text_color(t.dim).child(this.tr("ACP STATUS", "ACP 状态")))
+                  .child(div().w(166).flex_none().flex().justify_end().text_size(11).font_semibold().text_color(t.dim).child(this.tr("ACTIONS", "操作"))),
+              )
               .when(visibleRows.length === 0, (el) =>
                 el.child(
                   div()
                     .px(14)
-                    .py(12)
+                    .py(14)
                     .text_size(12)
                     .text_color(t.dim)
-                    .child(this.tr("No agents detected yet. Click Refresh Detection.", "尚未检测到任何 Agent，点击「刷新检测」扫描环境。")),
+                    .child(this.tr("No agents match this filter.", "当前筛选条件下没有智能体。")),
                 ),
               )
               .children(
                 visibleRows.map((r, idx) => {
-                  const cmdText = Array.isArray(r.command) && r.command.length > 0
-                    ? r.command.join(" ")
-                    : Array.isArray(r.cliRun) && r.cliRun.length > 0
-                      ? r.cliRun[0]
-                      : "";
-                  const subText = r.acpError
-                    ? this.formatAgentProbeError(r.acpError)
-                    : r.path || cmdText || "";
-                  const modelsTooltip = r.models.length > 0 ? r.models.map((m) => m.id).join(", ") : undefined;
+                  const sub = rowSubline(r);
+                  const btns = rowActions(r);
                   return h_flex()
                     .id(`st-ag-row-${r.id}`)
                     .w_full()
                     .px(14)
                     .py(9)
-                    .gap(12)
+                    .gap(10)
                     .items_center()
                     .when(idx > 0, (el) => el.border_t(1).border_color(t.border))
-                    .child(this.agentIconEl(t, r.id, 16))
+                    // Col 1: Agent identity & details
                     .child(
-                      v_flex()
+                      h_flex()
                         .flex_1()
                         .min_w(0)
-                        .gap(2)
+                        .gap(10)
+                        .items_center()
+                        .child(this.agentIconEl(t, r.id, 17))
                         .child(
-                          h_flex()
-                            .gap(7)
-                            .items_center()
-                            .flex_wrap()
-                            .child(div().text_size(13).font_semibold().text_color(r.anyInstalled ? t.foreground : t.muted).child(r.name))
-                            .when(r.name.toLowerCase() !== r.id.toLowerCase(), (el) =>
-                              el.child(div().text_size(11.2).text_color(t.dim).child(r.id)),
+                          v_flex()
+                            .flex_1()
+                            .min_w(0)
+                            .gap(2)
+                            .child(
+                              h_flex()
+                                .gap(6)
+                                .items_center()
+                                .child(
+                                  div()
+                                    .truncate()
+                                    .text_size(13)
+                                    .font_semibold()
+                                    .text_color(r.anyInstalled ? t.foreground : t.muted)
+                                    .child(r.name),
+                                )
+                                .when(r.name.toLowerCase() !== r.id.toLowerCase(), (el) =>
+                                  el.child(div().flex_none().text_size(11).text_color(t.dim).child(r.id)),
+                                ),
                             )
-                            .when(r.cliInstalled, (el) =>
-                              el.child(pill("CLI ✓", t.ansi2, alpha(t.ansi2, "16") ?? t.background, alpha(t.ansi2, "40") ?? t.border)),
-                            )
-                            .when(r.acpReady, (el) =>
+                            .when(Boolean(sub.text), (el) =>
                               el.child(
-                                pill(
-                                  r.models.length > 0
-                                    ? this.tr(`ACP Ready · ${r.models.length} models`, `ACP 就绪 · ${r.models.length} 模型`)
-                                    : this.tr("ACP Ready", "ACP 就绪"),
-                                  t.ansi2,
-                                  alpha(t.ansi2, "16") ?? t.background,
-                                  alpha(t.ansi2, "40") ?? t.border,
-                                ).when(Boolean(modelsTooltip), (p) => p.tooltip(modelsTooltip)),
+                                div()
+                                  .truncate()
+                                  .text_size(11.2)
+                                  .text_color(sub.color)
+                                  .when(Boolean(sub.tooltip), (d) => d.tooltip(sub.tooltip))
+                                  .child(sub.text),
                               ),
-                            )
-                            .when(Boolean(r.acpError), (el) =>
-                              el.child(
-                                pill(this.tr("ACP Error", "ACP 异常"), t.blocked, alpha(t.blocked, "18") ?? t.background, alpha(t.blocked, "55") ?? t.border)
-                                  .tooltip(r.acpError),
-                              ),
-                            )
-                            .when(r.adapterMissing && !r.acpError, (el) =>
-                              el.child(pill(this.tr("ACP Adapter Missing", "缺少 ACP 适配器"), t.working, alpha(t.working, "18") ?? t.background, alpha(t.working, "55") ?? t.border)),
-                            )
-                            .when(!r.acpSupported && r.cliInstalled, (el) =>
-                              el.child(pill(this.tr("CLI Only", "仅 CLI"), t.dim)),
-                            )
-                            .when(!r.anyInstalled, (el) =>
-                              el.child(pill(this.tr("Not Installed", "未安装"), t.dim)),
                             ),
-                        )
-                        .when(Boolean(subText), (el) =>
-                          el.child(
-                            div()
-                              .truncate()
-                              .text_size(11.2)
-                              .text_color(r.acpError ? t.blocked : t.dim)
-                              .tooltip(r.acpError || r.path || cmdText)
-                              .child(subText),
-                          ),
                         ),
                     )
-                    .when(r.adapterMissing, (el) =>
-                      el.child(
-                        this.button(
-                          t,
-                          `st-ag-row-inst-${r.id}`,
-                          this.adapterBusy === `install:${r.id}` ? this.tr("Installing…", "安装中…") : this.tr("Install Adapter", "安装适配器"),
-                          (_e, cx) => this.runAdapterAction(cx, "install", r.id),
+                    // Col 2: Agent CLI installed status
+                    .child(
+                      h_flex()
+                        .w(86)
+                        .flex_none()
+                        .items_center()
+                        .child(
+                          r.standaloneAcp
+                            ? pill(this.tr("ACP Only", "仅 ACP"), t.dim)
+                            : r.cliInstalled
+                              ? h_flex()
+                                  .gap(5)
+                                  .items_center()
+                                  .child(div().w(6).h(6).rounded(3).bg(t.ansi2))
+                                  .child(div().text_size(11.5).text_color(t.ansi2).child(this.tr("Installed", "已安装")))
+                              : h_flex()
+                                  .gap(5)
+                                  .items_center()
+                                  .child(div().w(6).h(6).rounded(3).bg(t.dim))
+                                  .child(div().text_size(11.5).text_color(t.dim).child(this.tr("Missing", "未安装"))),
                         ),
-                      ),
+                    )
+                    // Col 3: ACP status
+                    .child(
+                      h_flex()
+                        .w(140)
+                        .flex_none()
+                        .items_center()
+                        .child(acpStatusBadge(r)),
+                    )
+                    // Col 4: One-click Actions / AI Fix
+                    .child(
+                      h_flex()
+                        .w(166)
+                        .flex_none()
+                        .gap(6)
+                        .items_center()
+                        .justify_end()
+                        .when(btns.length > 0, (el) => el.children(btns))
+                        .when(btns.length === 0, (el) =>
+                          el.child(
+                            div()
+                              .text_size(11.5)
+                              .text_color(r.anyInstalled ? t.ansi2 : t.dim)
+                              .child(r.anyInstalled ? this.tr("✓ Ready", "✓ 已就绪") : "—"),
+                          ),
+                        ),
                     );
                 }),
               ),
@@ -6122,7 +6925,7 @@ export default class Settings extends View {
           .child(
             v_flex()
               .gap(2)
-              .child(this.heading(t, this.tr("ACP Configuration", "ACP 检测与运行配置")))
+              .child(this.heading(t, this.tr("ACP Configuration", "ACP 运行配置")))
               .child(
                 div()
                   .text_size(12)
@@ -6130,8 +6933,8 @@ export default class Settings extends View {
                   .child(
                     this.adapterStatus?.config_path
                       ? this.tr(
-                          `Saved to ${this.adapterStatus.config_path} on the selected machine.`,
-                          `保存至所选主机的 ${this.adapterStatus.config_path}。`,
+                          `Saved to ${this.adapterStatus.config_path}${this.adapterStatus?.adapters_dir ? ` · Managed adapters: ${this.adapterStatus.adapters_dir}` : ""}`,
+                          `配置保存至 ${this.adapterStatus.config_path}${this.adapterStatus?.adapters_dir ? ` · 托管适配器目录：${this.adapterStatus.adapters_dir}` : ""}`,
                         )
                       : this.tr(
                           "Controls managed ACP adapter auto-installation, default ACP permissions, MCP injection, and registry mirror.",

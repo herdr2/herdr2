@@ -1428,3 +1428,128 @@ test("Agents & ACP dedicated settings page merges CLI/ACP detection, manages ada
   expect(hcCalls[1]).toEqual(["adapter", "install", "codex", "--on", "gpu-box", "--json"]);
   expect(view.adapterBusy).toBe(false);
 });
+
+test("Agents & ACP lists all supported agents, distinguishes npx fallback from installed ACP, force-refreshes detection, supports one-click install, and routes adapter errors to AI fix", async () => {
+  const ran: Array<{ cmd: string; args: any }> = [];
+  const toasts: any[] = [];
+  const knownCalls: any[] = [];
+  const hcCalls: string[][] = [];
+  let closed = 0;
+  const currentSpaces: any[] = [
+    { id: "sp-local", machine: null, active: true },
+    { id: "sp-remote", machine: "devbox", active: false },
+  ];
+  const customValues = {
+    ...values,
+    run: (cmd: string, args: any) => { ran.push({ cmd, args }); },
+    notify: (n: any) => { toasts.push(n); },
+    spaces: () => currentSpaces,
+    window: () => ({ platform: "linux" }),
+    knownAgents: async (opts: any) => {
+      knownCalls.push(opts);
+      return [
+        { key: "claude", name: "Claude Code", installed: true, run: ["claude", "--dangerously-skip-permissions"] },
+        { key: "codex", name: "Codex", installed: true, run: ["codex"] },
+      ];
+    },
+    hc: async (args: string[]) => {
+      hcCalls.push(args);
+      if (args[0] === "drove" && args[1] === "probe") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            fullProbe: true,
+            probedAt: "2026-11-27T04:30:00Z",
+            agents: [
+              { id: "claude", installed: true, models: ["claude-opus-4-6"] },
+              { id: "codex", installed: true, models: ["gpt-5.4"] },
+            ],
+          }),
+          stderr: "",
+        };
+      }
+      if (args[0] === "adapter" && args[1] === "status") {
+        return {
+          code: 0,
+          stdout: JSON.stringify({
+            adapters_dir: "/home/.local/share/herdr2/adapters",
+            auto_install: true,
+            adapters: [
+              { preset_id: "claude", binary_name: "claude-agent-acp", companion_cli: "claude", companion_installed: true, installed: true, source: "managed", state: "ready", version: "0.9.0" },
+              { preset_id: "codex", binary_name: "codex-acp", companion_cli: "codex", companion_installed: true, installed: false, source: "npx_fallback", state: "missing" },
+              { preset_id: "pi", binary_name: "pi-acp", companion_cli: "pi", companion_installed: false, installed: false, source: "missing", state: "error", error: "curl: (7) Failed to connect" },
+            ],
+          }),
+          stderr: "",
+        };
+      }
+      return { code: 0, stdout: "{}", stderr: "" };
+    },
+  };
+  const customArgs = names.map((name) => customValues[name] ?? (() => undefined));
+  const CustomSettings = new Function(
+    ...names,
+    source
+      .replace(/^import\s+[\s\S]*?from\s+["'][^"']+["'];?\s*\n?/gm, "")
+      .replace("export default class Settings", "return class Settings"),
+  )(...customArgs);
+
+  const view = new CustomSettings();
+  view.person = { language: "zh-CN" };
+  view.close = () => { closed++; };
+  view.droveMachine = null;
+  view.droveData = { config: {}, agents: { fullProbe: false, agents: [] } };
+
+  const pending: Promise<void>[] = [];
+  const cx = { notify() {}, spawn(fn: (c: any) => Promise<void>) { pending.push(fn(cx)); } };
+
+  // 1. One-click environment detection force-refreshes knownAgents + runs drove probe --refresh + adapter status.
+  view.refreshAgentsDetection(cx);
+  await Promise.all(pending.splice(0));
+  expect(knownCalls[0]).toEqual({ refresh: true });
+  expect(hcCalls[0]).toEqual(["drove", "probe", "--refresh", "--json"]);
+  expect(hcCalls[1]).toEqual(["adapter", "status", "--json"]);
+
+  // 2. All supported agents are included by default, and codex with npx_fallback is NOT marked as installed ACP.
+  const rows = view.detectedAgentRows();
+  expect(rows.length).toBeGreaterThanOrEqual(20);
+  expect(rows.find((r: any) => r.id === "claude")).toMatchObject({ cliInstalled: true, acpInstalled: true, acpReady: true });
+  expect(rows.find((r: any) => r.id === "codex")).toMatchObject({ cliInstalled: true, acpInstalled: false, adapterMissing: true, acpReady: false });
+  expect(rows.find((r: any) => r.id === "gemini")).toMatchObject({ cliInstalled: false, acpMode: "builtin", acpInstalled: false });
+  expect(rows.find((r: any) => r.id === "glm")).toMatchObject({ standaloneAcp: true, acpMode: "managed" });
+
+  // 3. Adapter install error is surfaced in agentIssues() and can be focused for AI troubleshooting.
+  const issues = view.agentIssues(rows);
+  expect(issues.map((it: any) => it.id)).toContain("pi");
+  expect(issues.find((it: any) => it.id === "pi")?.issueKind).toBe("adapter");
+
+  view.openAgentAiFix(cx, "pi");
+  expect(view.droveProbeFixOpen).toBe(true);
+  expect(view.droveProbeFixFocusId).toBe("pi");
+  view.launchAgentToFixDroveProbeErrors(cx);
+  await Promise.all(pending.splice(0));
+  expect(ran[0].cmd).toBe("tab.new");
+  expect(ran[0].args.space).toBe("sp-local");
+  expect(ran[0].args.task).toContain("pi");
+  expect(ran[0].args.task).toContain("curl: (7) Failed to connect");
+  expect(closed).toBe(1);
+
+  // 4. One-click CLI install launches the official install command on the selected machine.
+  const geminiRow = rows.find((r: any) => r.id === "gemini");
+  view.droveMachine = "devbox";
+  view.installAgentCli(geminiRow, cx);
+  expect(ran[1].cmd).toBe("tab.new");
+  expect(ran[1].args.space).toBe("sp-remote");
+  expect(ran[1].args.argv).toEqual(["npm", "install", "-g", "@google/gemini-cli"]);
+  expect(closed).toBe(2);
+
+  // 5. AI-assisted install launches an installed agent when no static one-liner exists (e.g. agy).
+  const agyRow = rows.find((r: any) => r.id === "agy");
+  view.launchAgentToInstall(agyRow, cx);
+  await Promise.all(pending.splice(0));
+  expect(ran[2].cmd).toBe("tab.new");
+  expect(ran[2].args.space).toBe("sp-remote");
+  expect(ran[2].args.task).toContain("Antigravity");
+  expect(closed).toBe(3);
+  expect(toasts.length).toBeGreaterThanOrEqual(3);
+});

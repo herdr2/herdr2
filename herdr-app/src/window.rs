@@ -821,6 +821,51 @@ fn detect_cli_agent_key(cmd: &[String]) -> String {
     key
 }
 
+fn format_cursor_cli_model(model: &str, effort: Option<&str>) -> String {
+    let trimmed = model.trim();
+    // Strip ACP-style bracket overrides (`grok-4.7[effort=high,fast=true]`) into hyphenated CLI slugs
+    // because `cursor-agent --model` rejects bracket syntax on non-parameterized models.
+    let mut base = trimmed.to_owned();
+    let mut bracket_effort: Option<String> = None;
+    let mut bracket_fast = false;
+    if let Some(b) = trimmed.find('[')
+        && trimmed.ends_with(']')
+    {
+        base = trimmed[..b].trim().to_owned();
+        for entry in trimmed[b + 1..trimmed.len() - 1].split(',') {
+            if let Some((k, v)) = entry.split_once('=') {
+                let k = k.trim().to_ascii_lowercase();
+                let v = v.trim();
+                if matches!(k.as_str(), "effort" | "reasoning_effort" | "reasoning" | "thought_level" | "thinking")
+                    && !v.is_empty()
+                    && !matches!(v.to_ascii_lowercase().as_str(), "auto" | "default")
+                {
+                    bracket_effort = Some(v.to_ascii_lowercase());
+                } else if k == "fast" && matches!(v.to_ascii_lowercase().as_str(), "true" | "1" | "yes") {
+                    bracket_fast = true;
+                }
+            }
+        }
+    }
+    if bracket_fast && !base.to_ascii_lowercase().ends_with("-fast") {
+        base.push_str("-fast");
+    }
+    let eff = effort
+        .map(str::trim)
+        .filter(|e| !e.is_empty() && !matches!(e.to_ascii_lowercase().as_str(), "auto" | "default"))
+        .map(str::to_ascii_lowercase)
+        .or(bracket_effort);
+    if let Some(eff) = eff
+        && !cli_model_has_embedded_effort(&base)
+    {
+        if let Some(stem) = base.strip_suffix("-fast") {
+            return format!("{stem}-{eff}-fast");
+        }
+        return format!("{base}-{eff}");
+    }
+    base
+}
+
 fn apply_cli_agent_flags(mut cmd: Vec<String>, model: Option<&str>, effort: Option<&str>) -> Vec<String> {
     if cmd.is_empty() {
         return cmd;
@@ -838,9 +883,10 @@ fn apply_cli_agent_flags(mut cmd: Vec<String>, model: Option<&str>, effort: Opti
         let accepts_model_flag = key != "zcode";
         let has_model = cmd.iter().any(|a| a == "--model" || a.starts_with("--model=") || a == "-m");
         if accepts_model_flag && !has_model {
-            let effective_model = match (key.as_str(), clean_effort) {
-                ("cursor", Some(eff)) if !cli_model_has_embedded_effort(m) => format!("{m}[effort={eff}]"),
-                _ => m.to_owned(),
+            let effective_model = if key == "cursor" {
+                format_cursor_cli_model(m, clean_effort)
+            } else {
+                m.to_owned()
             };
             cmd.push("--model".into());
             cmd.push(effective_model);
@@ -13805,16 +13851,37 @@ mod tests {
             vec!["codex", "--no-daemon", "--model", "gpt-5.4", "-c", "model_reasoning_effort=xhigh", "refactor parser"]
         );
 
-        // Cursor parameterizes `[effort=...]` onto `--model` rather than passing an unknown `--effort` flag.
+        // Cursor CLI expects hyphenated effort slugs (`--model gpt-5.4-high` / `grok-4.7-high-fast`)
+        // rather than ACP bracket overrides (`grok-4.7[effort=high]`) or an unknown `--effort` flag.
         let cursor = super::build_cli_agent_argv(
             vec!["cursor-agent".into(), "--yolo".into(), "--trust".into()],
-            Some("gpt-5.4"),
+            Some("grok-4.7"),
             Some("high"),
             Some("audit types"),
         );
         assert_eq!(
             cursor,
-            vec!["cursor-agent", "--yolo", "--trust", "--model", "gpt-5.4[effort=high]", "audit types"]
+            vec!["cursor-agent", "--yolo", "--trust", "--model", "grok-4.7-high", "audit types"]
+        );
+        let cursor_fast = super::build_cli_agent_argv(
+            vec!["cursor-agent".into(), "--yolo".into(), "--trust".into()],
+            Some("grok-4.7-fast"),
+            Some("xhigh"),
+            None,
+        );
+        assert_eq!(
+            cursor_fast,
+            vec!["cursor-agent", "--yolo", "--trust", "--model", "grok-4.7-xhigh-fast"]
+        );
+        let cursor_bracket = super::build_cli_agent_argv(
+            vec!["cursor-agent".into(), "--yolo".into(), "--trust".into()],
+            Some("grok-4.7[effort=high]"),
+            None,
+            None,
+        );
+        assert_eq!(
+            cursor_bracket,
+            vec!["cursor-agent", "--yolo", "--trust", "--model", "grok-4.7-high"]
         );
 
         // ZCode rejects `--model` / `--effort` and reads a bare first word as a subcommand, not a message.

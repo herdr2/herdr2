@@ -979,6 +979,13 @@ fn opt_str(v: Option<&HostValue>, key: &str) -> Option<String> {
     v.and_then(|o| o.get(key)).and_then(HostValue::as_str).map(str::to_owned)
 }
 
+fn opt_bool(v: Option<&HostValue>, key: &str) -> Option<bool> {
+    match v.and_then(|o| o.get(key)) {
+        Some(HostValue::Bool(b)) => Some(*b),
+        _ => None,
+    }
+}
+
 #[cfg_attr(test, allow(dead_code))]
 static LIVE_CORE: std::sync::Mutex<Option<std::sync::Weak<crate::hc::Core>>> = std::sync::Mutex::new(None);
 
@@ -1130,8 +1137,8 @@ fn alternate_agent_commands(key: &str) -> &'static [&'static str] {
     }
 }
 
-/// The agents a machine can start (`knownAgents()`), asked at most once a minute.
-fn known_agents(on: Option<String>, list: Vec<Value>) -> Result<Value, String> {
+/// The agents a machine can start (`knownAgents()`), asked at most once a minute unless `refresh` is true.
+fn known_agents(on: Option<String>, list: Vec<Value>, refresh: bool) -> Result<Value, String> {
     type InstalledCache = std::collections::HashMap<Option<String>, (std::time::Instant, Vec<String>, Vec<String>)>;
     static SEEN: std::sync::Mutex<Option<InstalledCache>> = std::sync::Mutex::new(None);
     let mut commands: Vec<String> = Vec::new();
@@ -1149,7 +1156,11 @@ fn known_agents(on: Option<String>, list: Vec<Value>) -> Result<Value, String> {
             }
         }
     }
-    let cached = SEEN.lock().ok().and_then(|s| s.as_ref()?.get(&on).filter(|(at, checked, _)| at.elapsed().as_secs() < 60 && checked == &commands).map(|(_, _, v)| v.clone()));
+    let cached = if refresh {
+        None
+    } else {
+        SEEN.lock().ok().and_then(|s| s.as_ref()?.get(&on).filter(|(at, checked, _)| at.elapsed().as_secs() < 60 && checked == &commands).map(|(_, _, v)| v.clone()))
+    };
     let have = if let Some(cached) = cached { cached } else {
         let found = crate::programs::installed(&commands, on.as_deref())?;
         if let Ok(mut s) = SEEN.lock() {
@@ -1632,11 +1643,12 @@ fn module(inst: Instance, copy: u64) -> HostModule {
         .function("updates", |_| Ok(to_host(&crate::update::status())))
         .async_function("knownAgents", |a| {
             let on = opt_str(a.get(0), "on");
+            let refresh = opt_bool(a.get(0), "refresh").unwrap_or(false);
             // The table is loaded on the window thread; workers have only defaults.
             let list = crate::programs::startable();
             let (tx, rx) = async_channel::bounded(1);
             std::thread::spawn(move || {
-                let _ = tx.send_blocking(known_agents(on, list));
+                let _ = tx.send_blocking(known_agents(on, list, refresh));
             });
             Ok(async move {
                 let agents = rx.recv().await.map_err(|_| HostError::new("the agent check was lost"))?.map_err(HostError::new)?;
@@ -2130,15 +2142,19 @@ mod tests {
     #[test]
     fn known_agents_uses_snapshot_and_refreshes_changed_commands() {
         let snapshot = vec![json!({"key": "claude", "run": ["herdr_issue57_not_installed"]})];
-        let first = std::thread::spawn(move || known_agents(None, snapshot)).join().unwrap().unwrap();
+        let first = std::thread::spawn(move || known_agents(None, snapshot, false)).join().unwrap().unwrap();
         assert_eq!(first[0]["run"], json!(["herdr_issue57_not_installed"]));
         assert_eq!(first[0]["installed"], false);
         let snapshot = vec![json!({"key": "claude", "run": ["printf"]}), json!({"key": "claude-alt", "run": ["printf"]})];
-        let next = std::thread::spawn(move || known_agents(None, snapshot)).join().unwrap().unwrap();
+        let next = std::thread::spawn(move || known_agents(None, snapshot, false)).join().unwrap().unwrap();
         assert_eq!(next.as_array().unwrap().len(), 2);
         assert_eq!(next[0]["installed"], true);
         assert_eq!(next[1]["key"], "claude-alt");
         assert_eq!(next[1]["installed"], true);
+        // Explicit `refresh: true` bypasses the 60s cache cleanly.
+        let refreshed_snapshot = vec![json!({"key": "claude", "run": ["printf"]})];
+        let refreshed = std::thread::spawn(move || known_agents(None, refreshed_snapshot, true)).join().unwrap().unwrap();
+        assert_eq!(refreshed[0]["installed"], true);
     }
 
     #[test]
