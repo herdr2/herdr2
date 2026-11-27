@@ -73,7 +73,7 @@ pub(crate) enum SkillAction {
         /// Only install into agents actually detected on disk/PATH (do not create fallback dirs).
         #[arg(long)]
         detected_only: bool,
-        /// Target a specific known agent ID (antigravity, claude, codex, cursor, opencode, windsurf).
+        /// Target a specific known agent ID (e.g. claude, codex, agy, cursor, gemini, opencode, hermes, zcode, trae, qoder, ...).
         #[arg(long, value_name = "AGENT")]
         agent: Option<String>,
         /// Target a custom skills root directory.
@@ -95,7 +95,7 @@ pub(crate) enum SkillAction {
     /// Use built-in Core AI to inspect local or remote coding agents and install Herdr2 skills automatically.
     AiInstall {
         /// Optional hint about a custom agent name or desired skill location.
-        #[arg(long, value_name = "TEXT")]
+        #[arg(long, value_name = "TEXT", allow_hyphen_values = true)]
         query: Option<String>,
         /// Preferred explanation language (`zh-CN` or `en`).
         #[arg(long, value_name = "LANG")]
@@ -111,56 +111,228 @@ pub(crate) enum SkillAction {
 
 struct KnownAgentSpec {
     id: &'static str,
+    aliases: &'static [&'static str],
     name: &'static str,
     bins: &'static [&'static str],
-    marker_rel: &'static [&'static str],
+    markers: &'static [&'static [&'static str]],
     skills_rel: &'static [&'static str],
+    shared_skills_dir: bool,
 }
 
 const KNOWN_AGENTS: &[KnownAgentSpec] = &[
     KnownAgentSpec {
-        id: "antigravity",
-        name: "Antigravity / Gemini",
-        bins: &["agy", "gemini"],
-        marker_rel: &[".gemini"],
-        skills_rel: &[".gemini", "skills"],
-    },
-    KnownAgentSpec {
         id: "claude",
+        aliases: &[],
         name: "Claude Code",
         bins: &["claude"],
-        marker_rel: &[".claude"],
+        markers: &[&[".claude"]],
         skills_rel: &[".claude", "skills"],
+        shared_skills_dir: false,
     },
     KnownAgentSpec {
         id: "codex",
+        aliases: &[],
         name: "Codex",
         bins: &["codex"],
-        marker_rel: &[".codex"],
+        markers: &[&[".codex"]],
         skills_rel: &[".codex", "skills"],
+        shared_skills_dir: false,
+    },
+    KnownAgentSpec {
+        id: "agy",
+        aliases: &["antigravity"],
+        name: "Antigravity",
+        bins: &["agy"],
+        markers: &[&[".gemini", "antigravity"], &[".gemini", "antigravity-cli"]],
+        skills_rel: &[".gemini", "skills"],
+        shared_skills_dir: true,
     },
     KnownAgentSpec {
         id: "cursor",
+        aliases: &[],
         name: "Cursor",
-        bins: &["cursor", "cursor-agent"],
-        marker_rel: &[".cursor"],
+        bins: &["cursor-agent", "cursor"],
+        markers: &[&[".cursor"]],
         skills_rel: &[".cursor", "skills"],
+        shared_skills_dir: false,
+    },
+    KnownAgentSpec {
+        id: "gemini",
+        aliases: &[],
+        name: "Gemini CLI",
+        bins: &["gemini"],
+        markers: &[],
+        skills_rel: &[".gemini", "skills"],
+        shared_skills_dir: true,
     },
     KnownAgentSpec {
         id: "opencode",
+        aliases: &[],
         name: "OpenCode",
         bins: &["opencode"],
-        marker_rel: &[".config", "opencode"],
+        markers: &[&[".config", "opencode"], &[".opencode"]],
         skills_rel: &[".config", "opencode", "skills"],
+        shared_skills_dir: false,
+    },
+    KnownAgentSpec {
+        id: "pi",
+        aliases: &[],
+        name: "Pi",
+        bins: &["pi"],
+        markers: &[&[".pi", "agent"], &[".pi"]],
+        skills_rel: &[".pi", "agent", "skills"],
+        shared_skills_dir: false,
+    },
+    KnownAgentSpec {
+        id: "kimi",
+        aliases: &[],
+        name: "Kimi",
+        bins: &["kimi"],
+        markers: &[&[".kimi-code"], &[".kimi"]],
+        skills_rel: &[".kimi-code", "skills"],
+        shared_skills_dir: false,
+    },
+    KnownAgentSpec {
+        id: "copilot",
+        aliases: &[],
+        name: "GitHub Copilot",
+        bins: &["copilot"],
+        markers: &[&[".copilot"]],
+        skills_rel: &[".copilot", "skills"],
+        shared_skills_dir: false,
+    },
+    KnownAgentSpec {
+        id: "qwen",
+        aliases: &[],
+        name: "Qwen Code",
+        bins: &["qwen"],
+        markers: &[&[".qwen"]],
+        skills_rel: &[".qwen", "skills"],
+        shared_skills_dir: false,
+    },
+    KnownAgentSpec {
+        id: "hermes",
+        aliases: &[],
+        name: "Hermes",
+        bins: &["hermes", "hermes-acp"],
+        markers: &[&[".hermes"]],
+        skills_rel: &[".hermes", "skills"],
+        shared_skills_dir: false,
+    },
+    KnownAgentSpec {
+        id: "zcode",
+        aliases: &[],
+        name: "ZCode",
+        bins: &["zcode", "zcode-acp-server"],
+        markers: &[&[".zcode"], &[".config", "ZCode"], &[".config", "zcode-acp"]],
+        skills_rel: &[".zcode", "skills"],
+        shared_skills_dir: false,
+    },
+    KnownAgentSpec {
+        id: "trae",
+        aliases: &[],
+        name: "TRAE CLI",
+        bins: &["traecli", "traex", "trae-cli"],
+        markers: &[&[".trae"], &[".trae-cn"]],
+        skills_rel: &[".trae", "skills"],
+        shared_skills_dir: false,
+    },
+    KnownAgentSpec {
+        id: "glm",
+        aliases: &[],
+        name: "GLM",
+        bins: &["glm-acp-agent"],
+        markers: &[&[".config", "glm-acp-agent"]],
+        skills_rel: &[".agents", "skills"],
+        shared_skills_dir: true,
+    },
+    KnownAgentSpec {
+        id: "dsh",
+        aliases: &[],
+        name: "DeepSeek Harness",
+        bins: &["dsh", "dsh-tui"],
+        markers: &[&[".dsh"], &[".dsh-tui"]],
+        skills_rel: &[".dsh", "skills"],
+        shared_skills_dir: false,
+    },
+    KnownAgentSpec {
+        id: "qoder",
+        aliases: &[],
+        name: "Qoder",
+        bins: &["qodercli", "qoder"],
+        markers: &[&[".qoder"], &[".qoder-cn"]],
+        skills_rel: &[".qoder", "skills"],
+        shared_skills_dir: false,
+    },
+    KnownAgentSpec {
+        id: "kiro",
+        aliases: &[],
+        name: "Kiro",
+        bins: &["kiro-cli", "kiro"],
+        markers: &[&[".kiro"]],
+        skills_rel: &[".kiro", "skills"],
+        shared_skills_dir: false,
+    },
+    KnownAgentSpec {
+        id: "amp",
+        aliases: &[],
+        name: "Amp",
+        bins: &["amp"],
+        markers: &[&[".config", "amp"], &[".amp"]],
+        skills_rel: &[".config", "amp", "skills"],
+        shared_skills_dir: false,
+    },
+    KnownAgentSpec {
+        id: "grok",
+        aliases: &[],
+        name: "Grok",
+        bins: &["grok"],
+        markers: &[&[".grok"]],
+        skills_rel: &[".grok", "skills"],
+        shared_skills_dir: false,
+    },
+    KnownAgentSpec {
+        id: "goose",
+        aliases: &[],
+        name: "goose",
+        bins: &["goose"],
+        markers: &[&[".config", "goose"]],
+        skills_rel: &[".config", "goose", "skills"],
+        shared_skills_dir: false,
+    },
+    KnownAgentSpec {
+        id: "crush",
+        aliases: &[],
+        name: "Crush",
+        bins: &["crush"],
+        markers: &[&[".config", "crush"]],
+        skills_rel: &[".config", "crush", "skills"],
+        shared_skills_dir: false,
+    },
+    KnownAgentSpec {
+        id: "omp",
+        aliases: &[],
+        name: "oh-my-pi",
+        bins: &["omp"],
+        markers: &[&[".omp"]],
+        skills_rel: &[".omp", "skills"],
+        shared_skills_dir: false,
     },
     KnownAgentSpec {
         id: "windsurf",
+        aliases: &[],
         name: "Windsurf",
         bins: &["windsurf"],
-        marker_rel: &[".codeium", "windsurf"],
+        markers: &[&[".codeium", "windsurf"]],
         skills_rel: &[".codeium", "windsurf", "skills"],
+        shared_skills_dir: false,
     },
 ];
+
+fn lookup_known_agent(id_or_alias: &str) -> Option<&'static KnownAgentSpec> {
+    let low = id_or_alias.trim().to_ascii_lowercase();
+    KNOWN_AGENTS.iter().find(|a| a.id == low || a.aliases.contains(&low.as_str()))
+}
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -168,6 +340,7 @@ struct AgentSkillStatus {
     id: String,
     name: String,
     detected: bool,
+    cli_detected: bool,
     detected_by: Vec<String>,
     skills_dir: String,
     status: String,
@@ -201,10 +374,48 @@ fn join_rel(base: &Path, parts: &[&str]) -> PathBuf {
     p
 }
 
-fn has_command_on_path(bin: &str) -> bool {
-    let Some(path_var) = std::env::var_os("PATH") else {
-        return false;
-    };
+fn user_bin_search_dirs(home: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let path_var = std::env::var_os("HERDR2_SKILL_DETECT_PATH").or_else(|| std::env::var_os("PATH"));
+    if let Some(path_var) = path_var {
+        dirs.extend(std::env::split_paths(&path_var).filter(|p| !p.as_os_str().is_empty()));
+    }
+    for rel in [
+        &[".local", "bin"][..],
+        &["bin"][..],
+        &[".opencode", "bin"][..],
+        &[".kimi-code", "bin"][..],
+        &[".grok", "bin"][..],
+        &[".bun", "bin"][..],
+        &[".cargo", "bin"][..],
+        &[".qoder", "entry"][..],
+        &[".gemini", "antigravity-cli", "bin"][..],
+        &[".local", "share", "pnpm"][..],
+    ] {
+        let p = join_rel(home, rel);
+        if p.is_dir() && !dirs.contains(&p) {
+            dirs.push(p);
+        }
+    }
+    let nvm_versions = join_rel(home, &[".nvm", "versions", "node"]);
+    if let Ok(entries) = std::fs::read_dir(&nvm_versions) {
+        let mut node_bins: Vec<PathBuf> = entries
+            .flatten()
+            .map(|e| e.path().join("bin"))
+            .filter(|p| p.is_dir())
+            .collect();
+        node_bins.sort();
+        node_bins.reverse();
+        for p in node_bins {
+            if !dirs.contains(&p) {
+                dirs.push(p);
+            }
+        }
+    }
+    dirs
+}
+
+fn has_command_in_dirs(bin: &str, dirs: &[PathBuf]) -> bool {
     let exts: Vec<String> = if cfg!(windows) {
         std::env::var("PATHEXT")
             .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD;.PS1".into())
@@ -215,7 +426,7 @@ fn has_command_on_path(bin: &str) -> bool {
     } else {
         vec![String::new()]
     };
-    for dir in std::env::split_paths(&path_var) {
+    for dir in dirs {
         for ext in &exts {
             let cand = dir.join(format!("{bin}{ext}"));
             if cand.is_file() {
@@ -260,25 +471,36 @@ fn inspect_skills_dir(dir: &Path) -> (String, Vec<String>, Vec<String>, Vec<Stri
 }
 
 fn detect_agents_in(home: &Path) -> Vec<AgentSkillStatus> {
+    let search_dirs = user_bin_search_dirs(home);
     KNOWN_AGENTS
         .iter()
         .map(|spec| {
-            let marker = join_rel(home, spec.marker_rel);
             let skills_dir = join_rel(home, spec.skills_rel);
             let mut detected_by = Vec::new();
-            if marker.exists() {
-                detected_by.push(format!("dir:{}", marker.display()));
-            }
+            let mut cli_detected = false;
             for bin in spec.bins {
-                if has_command_on_path(bin) {
+                if has_command_in_dirs(bin, &search_dirs) {
+                    cli_detected = true;
                     detected_by.push(format!("cli:{bin}"));
                 }
             }
+            for marker_rel in spec.markers {
+                let marker = join_rel(home, marker_rel);
+                if marker.exists() {
+                    detected_by.push(format!("dir:{}", marker.display()));
+                }
+            }
             let (status, installed_skills, outdated_skills, missing_skills) = inspect_skills_dir(&skills_dir);
+            let detected = if spec.shared_skills_dir {
+                !detected_by.is_empty()
+            } else {
+                !detected_by.is_empty() || !installed_skills.is_empty() || !outdated_skills.is_empty()
+            };
             AgentSkillStatus {
                 id: spec.id.to_string(),
                 name: spec.name.to_string(),
-                detected: !detected_by.is_empty() || !installed_skills.is_empty() || !outdated_skills.is_empty(),
+                detected,
+                cli_detected,
                 detected_by,
                 skills_dir: skills_dir.display().to_string(),
                 status,
@@ -472,15 +694,17 @@ fn sync_installed_in(paths: &Paths, home: &Path) -> Result<Out, RpcError> {
 }
 
 fn expand_home_path(raw: &str, home: &Path) -> Option<PathBuf> {
-    let trimmed = raw.trim();
+    let trimmed = raw.trim().trim_matches('"').trim_matches('\'');
     if trimmed.is_empty() {
         return None;
     }
-    if trimmed == "~" {
+    if trimmed == "~" || trimmed == "$HOME" || trimmed == "${HOME}" || trimmed.eq_ignore_ascii_case("%USERPROFILE%") {
         return Some(home.to_path_buf());
     }
-    if let Some(rest) = trimmed.strip_prefix("~/").or_else(|| trimmed.strip_prefix("~\\")) {
-        return Some(home.join(rest));
+    for prefix in ["~/", "~\\", "$HOME/", "$HOME\\", "${HOME}/", "${HOME}\\", "%USERPROFILE%/", "%USERPROFILE%\\"] {
+        if let Some(rest) = trimmed.strip_prefix(prefix) {
+            return Some(home.join(rest));
+        }
     }
     Some(PathBuf::from(trimmed))
 }
@@ -495,34 +719,52 @@ fn validate_ai_target_dir(raw: &str, home: &Path) -> Option<PathBuf> {
         return None;
     }
     let home_norm = home.canonicalize().unwrap_or_else(|_| home.to_path_buf());
-    if !path.starts_with(home) && !path.starts_with(&home_norm) {
-        return None;
-    }
-    if path == home || path == home_norm {
-        return None;
-    }
-    Some(path)
+    let path_str = path.to_string_lossy().replace('\\', "/");
+    let home_str = home.to_string_lossy().replace('\\', "/");
+    let home_norm_str = home_norm.to_string_lossy().replace('\\', "/");
+    let home_trim = home_str.trim_end_matches('/');
+    let home_norm_trim = home_norm_str.trim_end_matches('/');
+    let path_trim = path_str.trim_end_matches('/');
+    let in_home = if cfg!(windows) {
+        let p_low = path_trim.to_ascii_lowercase();
+        let h_low = home_trim.to_ascii_lowercase();
+        let hn_low = home_norm_trim.to_ascii_lowercase();
+        (p_low.starts_with(&format!("{h_low}/")) || p_low.starts_with(&format!("{hn_low}/")))
+            && p_low != h_low
+            && p_low != hn_low
+    } else {
+        (path.starts_with(home) || path.starts_with(&home_norm)) && path != home && path != home_norm
+    };
+    in_home.then_some(path)
+}
+
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    T: Default + Deserialize<'de>,
+    D: serde::Deserializer<'de>,
+{
+    Ok(Option::deserialize(deserializer)?.unwrap_or_default())
 }
 
 #[derive(Deserialize)]
 struct AiInstallPlan {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     targets: Vec<AiInstallTarget>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     summary: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     tips: Vec<String>,
 }
 
 #[derive(Deserialize)]
 struct AiInstallTarget {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     agent: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     path: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     skills: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     reason: String,
 }
 
@@ -556,12 +798,22 @@ fn list_home_dot_hints(home: &Path) -> Vec<String> {
                         | ".kiro"
                         | ".hermes"
                         | ".zcode"
+                        | ".trae"
+                        | ".trae-cn"
+                        | ".qoder"
+                        | ".qoder-cn"
+                        | ".dsh"
+                        | ".dsh-tui"
+                        | ".grok"
                         | ".amp"
                         | ".copilot"
                         | ".qwen"
                         | ".kimi"
+                        | ".kimi-code"
                         | ".pi"
+                        | ".omp"
                         | ".opencode"
+                        | ".agents"
                 )
             {
                 hints.push(format!("~/{name}"));
@@ -575,7 +827,20 @@ fn list_home_dot_hints(home: &Path) -> Vec<String> {
             if entry.file_type().is_ok_and(|ft| ft.is_dir())
                 && matches!(
                     name.as_str(),
-                    "opencode" | "claude" | "codex" | "cursor" | "windsurf" | "kiro" | "hermes" | "amp" | "goose"
+                    "opencode"
+                        | "claude"
+                        | "codex"
+                        | "cursor"
+                        | "windsurf"
+                        | "kiro"
+                        | "hermes"
+                        | "amp"
+                        | "goose"
+                        | "crush"
+                        | "agents"
+                        | "ZCode"
+                        | "zcode-acp"
+                        | "glm-acp-agent"
                 )
             {
                 hints.push(format!("~/.config/{name}"));
@@ -589,6 +854,7 @@ fn list_home_dot_hints(home: &Path) -> Vec<String> {
 
 fn status_out(home: &Path) -> Out {
     let agents = detect_agents_in(home);
+    let home_config_dirs = list_home_dot_hints(home);
     let bundled: Vec<Value> = BUNDLED_SKILLS
         .iter()
         .map(|s| {
@@ -612,6 +878,7 @@ fn status_out(home: &Path) -> Out {
     Out {
         json: json!({
             "home": home.display().to_string(),
+            "homeConfigDirs": home_config_dirs,
             "bundledSkills": bundled,
             "agents": agents,
             "summary": {
@@ -704,7 +971,7 @@ fn remote_skill_exec(paths: &Paths, machine: &str, args: &[String]) -> Result<Va
 }
 
 fn validate_remote_target_dir(raw: &str, remote_home: &str) -> Option<String> {
-    let trimmed = raw.trim();
+    let trimmed = raw.trim().trim_matches('"').trim_matches('\'');
     if trimmed.is_empty() || trimmed.contains("..") || trimmed.contains('\n') || trimmed.contains('\r') {
         return None;
     }
@@ -712,18 +979,31 @@ fn validate_remote_target_dir(raw: &str, remote_home: &str) -> Option<String> {
     if home.is_empty() {
         return None;
     }
-    let expanded = if let Some(rest) = trimmed.strip_prefix("~/").or_else(|| trimmed.strip_prefix("~\\")) {
-        format!("{home}/{rest}")
-    } else if trimmed == "~" {
+    let expanded = if trimmed == "~"
+        || trimmed == "$HOME"
+        || trimmed == "${HOME}"
+        || trimmed.eq_ignore_ascii_case("%USERPROFILE%")
+    {
         return None;
+    } else if let Some(rest) = ["~/", "~\\", "$HOME/", "$HOME\\", "${HOME}/", "${HOME}\\", "%USERPROFILE%/", "%USERPROFILE%\\"]
+        .iter()
+        .find_map(|p| trimmed.strip_prefix(p))
+    {
+        format!("{home}/{}", rest.trim_end_matches(['/', '\\']))
     } else {
-        trimmed.to_string()
+        trimmed.trim_end_matches(['/', '\\']).to_string()
     };
-    if expanded == home {
-        return None;
-    }
-    let sep_ok = expanded.starts_with(&format!("{home}/")) || expanded.starts_with(&format!("{home}\\"));
-    sep_ok.then_some(expanded)
+    let norm_home = home.replace('\\', "/");
+    let norm_exp = expanded.replace('\\', "/");
+    let is_win_home = norm_home.as_bytes().get(1) == Some(&b':');
+    let in_home = if is_win_home {
+        let nh = norm_home.to_ascii_lowercase();
+        let ne = norm_exp.to_ascii_lowercase();
+        ne != nh && ne.starts_with(&format!("{nh}/"))
+    } else {
+        norm_exp != norm_home && norm_exp.starts_with(&format!("{norm_home}/"))
+    };
+    in_home.then_some(expanded)
 }
 
 fn run_remote_ai_install(
@@ -737,11 +1017,14 @@ fn run_remote_ai_install(
     let status_val = remote_skill_exec(paths, machine, &["status".into()])?;
     let remote_home = status_val.get("home").and_then(Value::as_str).unwrap_or("").to_string();
     let detected = status_val.get("agents").cloned().unwrap_or_else(|| json!([]));
+    let home_config_dirs = status_val.get("homeConfigDirs").cloned().unwrap_or_else(|| json!([]));
+    let user_hint = query.as_deref().unwrap_or("").trim();
 
     let system_prompt = "You are Herdr2's built-in Skill Installation Assistant for a remote SSH machine. \
 Given the remote machine's home directory, detected coding agent CLIs/config folders, and optional user request, \
 recommend the exact skill root directories on that remote machine (STRICTLY inside the remote user's home directory) where Herdr2's \
 bundled skills (`herdr2`, `drove`, `drove-add`, `drove-setup`) should be installed.\n\
+If `userHint` specifies particular agents, paths, exclusions, or skill subsets, follow `userHint` strictly.\n\
 Return STRICT JSON only: \
 {\"targets\":[{\"agent\":\"claude\",\"path\":\"~/.claude/skills\",\"skills\":[\"herdr2\",\"drove\",\"drove-add\",\"drove-setup\"],\"reason\":\"...\"}],\"summary\":\"...\",\"tips\":[\"...\"]}. \
 Never suggest paths outside the remote home directory or containing '..'.";
@@ -752,7 +1035,8 @@ Never suggest paths outside the remote home directory or containing '..'.";
         "language": if zh { "zh-CN" } else { "en" },
         "bundledSkills": BUNDLED_SKILLS.iter().map(|s| s.id).collect::<Vec<_>>(),
         "detectedAgents": detected,
-        "userHint": query.as_deref().unwrap_or(""),
+        "homeConfigDirs": home_config_dirs,
+        "userHint": user_hint,
     });
     let user_prompt = format!(
         "Analyze this remote machine environment and produce the JSON installation plan (write summary & tips in {}):\n{}",
@@ -768,7 +1052,8 @@ Never suggest paths outside the remote home directory or containing '..'.";
             "op": "skill_install",
             "systemPrompt": system_prompt,
             "userPrompt": user_prompt,
-            "maxTokens": 1024,
+            "maxTokens": 2048,
+            "timeoutSecs": 60,
         }),
     );
 
@@ -812,7 +1097,7 @@ Never suggest paths outside the remote home directory or containing '..'.";
         }
     }
 
-    if targets.is_empty() {
+    if targets.is_empty() && !(used_ai && !user_hint.is_empty()) {
         for a in status_val.get("agents").and_then(Value::as_array).into_iter().flatten() {
             if a.get("detected").and_then(Value::as_bool) == Some(true)
                 && let Some(dir) = a.get("skillsDir").and_then(Value::as_str)
@@ -830,7 +1115,7 @@ Never suggest paths outside the remote home directory or containing '..'.";
         }
         if targets.is_empty() && !remote_home.is_empty() {
             targets.push((
-                "antigravity".into(),
+                "agy".into(),
                 format!("{}/.gemini/skills", remote_home.trim_end_matches('/')),
                 BUNDLED_SKILLS.iter().map(|s| s.id.to_string()).collect(),
                 if zh { "默认远程技能目录".into() } else { "Default remote skills directory".into() },
@@ -839,6 +1124,7 @@ Never suggest paths outside the remote home directory or containing '..'.";
     }
 
     let mut applied = Vec::new();
+    let mut write_errors: Vec<String> = Vec::new();
     let mut total_files = 0usize;
     let mut latest_status = status_val;
     for (agent_name, dir, sks, reason) in &targets {
@@ -857,22 +1143,38 @@ Never suggest paths outside the remote home directory or containing '..'.";
             args.push("--skills".to_string());
             args.push(sks.join(","));
         }
-        let res = remote_skill_exec(paths, machine, &args)?;
-        total_files += res.get("installedCount").and_then(Value::as_u64).unwrap_or(0) as usize;
-        if let Some(st) = res.get("status") {
-            latest_status = st.clone();
+        match remote_skill_exec(paths, machine, &args) {
+            Ok(res) => {
+                total_files += res.get("installedCount").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if let Some(st) = res.get("status") {
+                    latest_status = st.clone();
+                }
+                let files = res
+                    .pointer("/targets/0/files")
+                    .cloned()
+                    .unwrap_or_else(|| json!([]));
+                applied.push(json!({
+                    "agent": agent_name,
+                    "target": dir,
+                    "skills": sks,
+                    "reason": reason,
+                    "files": files,
+                }));
+            }
+            Err(err) => {
+                write_errors.push(format!("{agent_name} ({dir}): {}", err.message));
+            }
         }
-        let files = res
-            .pointer("/targets/0/files")
-            .cloned()
-            .unwrap_or_else(|| json!([]));
-        applied.push(json!({
-            "agent": agent_name,
-            "target": dir,
-            "skills": sks,
-            "reason": reason,
-            "files": files,
-        }));
+    }
+    if applied.is_empty() && !write_errors.is_empty() {
+        return Err(RpcError::internal(write_errors.join("; ")));
+    }
+    if !write_errors.is_empty() {
+        let joined = write_errors.join("; ");
+        ai_error = Some(match ai_error {
+            Some(prev) => format!("{prev}; {joined}"),
+            None => joined,
+        });
     }
 
     if plan_summary.is_empty() {
@@ -968,8 +1270,7 @@ pub(super) fn run(paths: &Paths, cli: SkillCli) -> Result<Out, RpcError> {
                 let resolved = expand_home_path(&dir.to_string_lossy(), &home).unwrap_or(dir);
                 dirs.push(("custom".into(), resolved));
             } else if let Some(agent_id) = agent {
-                let low = agent_id.trim().to_ascii_lowercase();
-                let Some(spec) = KNOWN_AGENTS.iter().find(|a| a.id == low) else {
+                let Some(spec) = lookup_known_agent(&agent_id) else {
                     let valid: Vec<_> = KNOWN_AGENTS.iter().map(|a| a.id).collect();
                     return Err(RpcError::invalid_params(format!(
                         "unknown agent {agent_id:?}; known: {} (or use --target <DIR>)",
@@ -979,17 +1280,22 @@ pub(super) fn run(paths: &Paths, cli: SkillCli) -> Result<Out, RpcError> {
                 dirs.push((spec.id.to_string(), join_rel(&home, spec.skills_rel)));
             } else {
                 let detected = detect_agents_in(&home);
+                let mut seen_dirs = BTreeSet::new();
                 for a in &detected {
                     if a.detected {
-                        dirs.push((a.id.clone(), PathBuf::from(&a.skills_dir)));
+                        let p = PathBuf::from(&a.skills_dir);
+                        let key = p.canonicalize().unwrap_or_else(|_| p.clone());
+                        if seen_dirs.insert(key) {
+                            dirs.push((a.id.clone(), p));
+                        }
                     }
                 }
                 if dirs.is_empty() && !detected_only {
                     if all {
-                        dirs.push(("antigravity".into(), join_rel(&home, &[".gemini", "skills"])));
+                        dirs.push(("agy".into(), join_rel(&home, &[".gemini", "skills"])));
                         dirs.push(("claude".into(), join_rel(&home, &[".claude", "skills"])));
                     } else {
-                        dirs.push(("antigravity".into(), join_rel(&home, &[".gemini", "skills"])));
+                        dirs.push(("agy".into(), join_rel(&home, &[".gemini", "skills"])));
                     }
                 }
             }
@@ -1032,10 +1338,12 @@ pub(super) fn run(paths: &Paths, cli: SkillCli) -> Result<Out, RpcError> {
             let detected = detect_agents_in(&home);
             let dir_hints = list_home_dot_hints(&home);
             let zh = lang.as_deref().unwrap_or("zh-CN").to_ascii_lowercase().starts_with("zh");
+            let user_hint = query.as_deref().unwrap_or("").trim();
             let system_prompt = "You are Herdr2's built-in Skill Installation Assistant. \
 Given the user's OS, home directory, detected coding agent CLIs/config folders, and optional user request, \
 recommend the exact local skill root directories (STRICTLY inside the user's home directory) where Herdr2's \
 bundled skills (`herdr2`, `drove`, `drove-add`, `drove-setup`) should be installed.\n\
+If `userHint` specifies particular agents, paths, exclusions, or skill subsets, follow `userHint` strictly.\n\
 Return STRICT JSON only (no markdown fences needed): \
 {\"targets\":[{\"agent\":\"claude\",\"path\":\"~/.claude/skills\",\"skills\":[\"herdr2\",\"drove\",\"drove-add\",\"drove-setup\"],\"reason\":\"...\"}],\"summary\":\"...\",\"tips\":[\"...\"]}. \
 Never suggest paths outside the user's home directory or containing '..'.";
@@ -1048,7 +1356,7 @@ Never suggest paths outside the user's home directory or containing '..'.";
                 "bundledSkills": BUNDLED_SKILLS.iter().map(|s| s.id).collect::<Vec<_>>(),
                 "detectedAgents": detected,
                 "homeConfigDirs": dir_hints,
-                "userHint": query.as_deref().unwrap_or(""),
+                "userHint": user_hint,
             });
             let user_prompt = format!(
                 "Analyze this local environment and produce the JSON installation plan (write summary & tips in {}):\n{}",
@@ -1063,7 +1371,8 @@ Never suggest paths outside the user's home directory or containing '..'.";
                     "op": "skill_install",
                     "systemPrompt": system_prompt,
                     "userPrompt": user_prompt,
-                    "maxTokens": 1024,
+                    "maxTokens": 2048,
+                    "timeoutSecs": 60,
                 }),
             );
 
@@ -1108,13 +1417,13 @@ Never suggest paths outside the user's home directory or containing '..'.";
                 }
             }
 
-            // Always ensure detected agents (or default ~/.gemini/skills) are covered if AI returned empty targets.
-            if resolved_targets.is_empty() {
+            // Cover detected agents only when AI was unavailable or no specific userHint asked to skip/filter.
+            if resolved_targets.is_empty() && !(used_ai && !user_hint.is_empty()) {
                 let fallback_agents: Vec<_> = detected.iter().filter(|a| a.detected).collect();
                 if fallback_agents.is_empty() {
                     let dir = join_rel(&home, &[".gemini", "skills"]);
                     resolved_targets.push((
-                        "antigravity".into(),
+                        "agy".into(),
                         dir,
                         BUNDLED_SKILLS.iter().collect(),
                         if zh { "默认技能目录".into() } else { "Default skills directory".into() },
@@ -1122,38 +1431,65 @@ Never suggest paths outside the user's home directory or containing '..'.";
                 } else {
                     for a in fallback_agents {
                         let dir = PathBuf::from(&a.skills_dir);
-                        resolved_targets.push((
-                            a.id.clone(),
-                            dir,
-                            BUNDLED_SKILLS.iter().collect(),
-                            if zh {
-                                format!("检测到本地已安装 {}", a.name)
-                            } else {
-                                format!("Detected local {}", a.name)
-                            },
-                        ));
+                        let key = dir.display().to_string();
+                        if seen_paths.insert(key) {
+                            resolved_targets.push((
+                                a.id.clone(),
+                                dir,
+                                BUNDLED_SKILLS.iter().collect(),
+                                if zh {
+                                    format!("检测到本地已安装 {}", a.name)
+                                } else {
+                                    format!("Detected local {}", a.name)
+                                },
+                            ));
+                        }
                     }
                 }
             }
 
             let mut applied = Vec::new();
+            let mut write_errors: Vec<String> = Vec::new();
             let mut total_files = 0usize;
             for (agent_name, dir, sks, reason) in &resolved_targets {
-                let files = if dry_run {
-                    sks.iter().map(|s| dir.join(s.id).join("SKILL.md").display().to_string()).collect()
-                } else {
-                    let w = write_skills_to_dir(dir, sks)?;
-                    record_installed_target(paths, dir);
-                    total_files += w.len();
-                    w
-                };
-                applied.push(json!({
-                    "agent": agent_name,
-                    "target": dir.display().to_string(),
-                    "skills": sks.iter().map(|s| s.id).collect::<Vec<_>>(),
-                    "reason": reason,
-                    "files": files,
-                }));
+                if dry_run {
+                    let files: Vec<String> =
+                        sks.iter().map(|s| dir.join(s.id).join("SKILL.md").display().to_string()).collect();
+                    applied.push(json!({
+                        "agent": agent_name,
+                        "target": dir.display().to_string(),
+                        "skills": sks.iter().map(|s| s.id).collect::<Vec<_>>(),
+                        "reason": reason,
+                        "files": files,
+                    }));
+                    continue;
+                }
+                match write_skills_to_dir(dir, sks) {
+                    Ok(w) => {
+                        record_installed_target(paths, dir);
+                        total_files += w.len();
+                        applied.push(json!({
+                            "agent": agent_name,
+                            "target": dir.display().to_string(),
+                            "skills": sks.iter().map(|s| s.id).collect::<Vec<_>>(),
+                            "reason": reason,
+                            "files": w,
+                        }));
+                    }
+                    Err(err) => {
+                        write_errors.push(format!("{agent_name} ({}): {}", dir.display(), err.message));
+                    }
+                }
+            }
+            if applied.is_empty() && !write_errors.is_empty() {
+                return Err(RpcError::internal(write_errors.join("; ")));
+            }
+            if !write_errors.is_empty() {
+                let joined = write_errors.join("; ");
+                ai_error = Some(match ai_error {
+                    Some(prev) => format!("{prev}; {joined}"),
+                    None => joined,
+                });
             }
 
             if plan_summary.is_empty() {
@@ -1328,5 +1664,55 @@ mod tests {
         assert!(select_skills(&["nonexistent".into()]).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn known_agents_align_with_supported_agents_and_preserve_antigravity_alias() {
+        for id in [
+            "claude", "codex", "agy", "cursor", "gemini", "opencode", "pi", "kimi", "copilot", "qwen",
+            "hermes", "zcode", "trae", "glm", "dsh", "qoder", "kiro", "amp", "grok", "goose", "crush", "omp", "windsurf",
+        ] {
+            assert!(lookup_known_agent(id).is_some(), "missing known agent {id}");
+        }
+        assert_eq!(lookup_known_agent("antigravity").map(|a| a.id), Some("agy"));
+    }
+
+    #[test]
+    fn ai_install_plan_tolerates_null_fields_and_env_home_paths() {
+        let raw = r#"{"targets":[{"agent":null,"path":"$HOME/.hermes/skills","skills":null,"reason":null}],"summary":null,"tips":null}"#;
+        let plan: AiInstallPlan = serde_json::from_str(raw).expect("null-safe parse");
+        assert_eq!(plan.targets.len(), 1);
+        assert_eq!(plan.targets[0].path, "$HOME/.hermes/skills");
+        assert!(plan.targets[0].skills.is_empty());
+
+        let home = PathBuf::from(if cfg!(windows) { r"C:\Users\tester" } else { "/home/tester" });
+        assert_eq!(validate_ai_target_dir("$HOME/.hermes/skills", &home), Some(home.join(".hermes/skills")));
+        assert_eq!(validate_ai_target_dir("${HOME}/.qoder/skills", &home), Some(home.join(".qoder/skills")));
+        assert_eq!(
+            validate_remote_target_dir("$HOME/.trae/skills/", "/home/dev"),
+            Some("/home/dev/.trae/skills".into())
+        );
+        assert_eq!(
+            validate_remote_target_dir("C:/Users/dev/.claude/skills", r"C:\Users\dev"),
+            Some("C:/Users/dev/.claude/skills".into())
+        );
+    }
+
+    #[test]
+    fn cli_parses_ai_install_query_starting_with_hyphen() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Wrap {
+            #[command(flatten)]
+            skill: SkillCli,
+        }
+        let parsed = Wrap::try_parse_from(["h2", "ai-install", "--lang", "zh-CN", "--query", "- 只安装到 hermes 和 qoder"])
+            .expect("hyphen-prefixed query should parse");
+        match parsed.skill.action {
+            SkillAction::AiInstall { query, .. } => {
+                assert_eq!(query.as_deref(), Some("- 只安装到 hermes 和 qoder"));
+            }
+            _ => panic!("expected AiInstall"),
+        }
     }
 }

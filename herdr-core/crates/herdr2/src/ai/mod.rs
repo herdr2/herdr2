@@ -429,6 +429,8 @@ pub struct AiCompleteParams {
     pub session_key: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_secs: Option<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
@@ -1999,6 +2001,7 @@ impl AiRuntime {
         } else {
             AiConversationMode::StatelessSharedPrefix
         };
+        let timeout_secs = p.timeout_secs.unwrap_or(30).clamp(5, 120);
         let res = self
             .complete(AiCompleteRequest {
                 op,
@@ -2006,7 +2009,7 @@ impl AiRuntime {
                 mode,
                 user_prompt: p.user_prompt,
                 max_tokens: p.max_tokens.unwrap_or(512).clamp(32, 4096),
-                timeout: Duration::from_secs(20),
+                timeout: Duration::from_secs(timeout_secs),
                 ..Default::default()
             })
             .await

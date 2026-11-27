@@ -1,5 +1,35 @@
 # Changelog
 
+## v2.0.21
+
+#### 中文
+
+**新增功能**
+- **设置页「Skills」与「智能体与 ACP」全面对齐**：
+  - 后端 `skill status` / 安装逻辑扩展覆盖全部已支持智能体（`claude`、`codex`、`agy`、`gemini`、`cursor`、`opencode`、`kimi`、`hermes`、`zcode`、`glm`、`dsh`、`qoder`、`grok`、`trae` 等），准确区分已安装 CLI 与仅存在配置目录并补充常见 CLI 安装路径扫描；共享目录（如 `agy`/`gemini` 的 `~/.gemini/skills`、`glm` 的 `~/.agents/skills`）不再误判未安装的 Agent，批量安装自动按目录去重。
+  - 前端 Skills 页面接入与「智能体与 ACP」一致的图标、名称和排序（已装 CLI → 仅配置目录 → 未安装），新增 **已检测到 (N) / 全部 (M)** 筛选栏（默认聚焦已检测到），并在切换至 Skills 时同步参考同主机 Agent 检测结果。
+- **`ai.complete` 支持可配置 `timeoutSecs`**：新增 `timeoutSecs` 参数（默认 30s、上限 120s）并同步更新 OpenRPC Schema。
+
+**问题修复**
+- **彻底修复「AI 智能安装 Skill 输入具体要求后报错」的多个根因**：
+  - 解除前端 30s 与后端 20s 过短超时限制：前端 `aiInstallSkills` 超时提升至 120s（`status`/`install` 提升至 60s）并补齐成功/失败 Toast；后端 `skill ai-install` 调整为 `timeoutSecs: 60`、`maxTokens: 2048`，防止 Agent 列表变多后规划 JSON 被 1024 token 截断。
+  - 提升参数解析与 AI 规划鲁棒性：`--query` 启用 `allow_hyphen_values = true` 避免 `-` 开头的需求触发 CLI 参数报错（前端同步清理换行符）；兼容模型输出中的 `null` 字段、`$HOME` / `${HOME}` / `%USERPROFILE%` 及 Windows 混合斜杠路径；远端 `status` 补全 `homeConfigDirs`；当用户输入显式筛选/排除要求时不再静默回退覆盖无关 Agent，且单目录写入失败不会中断其余目录安装。
+
+---
+
+#### English
+
+**New Features**
+- **Settings → Skills Aligned with Agents & ACP**:
+  - Expanded backend `skill status` / installer detection across all supported agents (`claude`, `codex`, `agy`, `gemini`, `cursor`, `opencode`, `kimi`, `hermes`, `zcode`, `glm`, `dsh`, `qoder`, `grok`, `trae`, etc.), distinguishing installed CLIs from config-only directories while scanning common user CLI bin paths; avoided false positives on shared skill directories (e.g., `~/.gemini/skills`, `~/.agents/skills`) and deduplicated batch installs by physical directory.
+  - Aligned the Settings → Skills UI icons, display names, and sorting (installed CLI → config-only → not installed) with **Agents & ACP**, added **Detected (N) / All (M)** filter tabs (defaulting to detected), and synchronized host detection state when entering Skills.
+- **Configurable `timeoutSecs` for `ai.complete`**: Added an optional `timeoutSecs` parameter (default 30s, max 120s) and updated the OpenRPC schema.
+
+**Bug Fixes**
+- **Fixed Errors When Providing Custom Requirements to AI Skill Install**:
+  - Raised tight timeouts and token caps: increased frontend `aiInstallSkills` timeout to 120s (`status`/`install` to 60s) with explicit success/failure toasts, and updated `skill ai-install` to request `timeoutSecs: 60` and `maxTokens: 2048` so larger agent lists no longer truncate JSON plans.
+  - Hardened CLI argument parsing and AI plan execution: enabled `allow_hyphen_values = true` on `--query` (handling `-`-prefixed instructions and sanitizing newlines), handled `null` fields and `$HOME`/`${HOME}`/`%USERPROFILE%`/mixed Windows slashes in AI outputs, returned full `homeConfigDirs` from remote hosts, respected explicit user filtering/exclusion without silently falling back to unrelated agents, and isolated per-directory write failures so other targets still succeed.
+
 ## v2.0.20
 
 #### 中文

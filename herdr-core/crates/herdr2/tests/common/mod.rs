@@ -73,6 +73,7 @@ impl Session {
             .env("HOME", &self.root)
             .env("H2_SESSION", "test")
             .env("HERDR2_AUTO_INSTALL_ADAPTERS", "0")
+            .env("HERDR2_SKILL_DETECT_PATH", "")
             .env("XDG_RUNTIME_DIR", self.root.join("run"))
             .env("XDG_STATE_HOME", self.root.join("state"))
             .env("XDG_CONFIG_HOME", self.root.join("config"))
@@ -216,7 +217,7 @@ pub fn fake_ssh(local: &Session, hosts: &[(&str, &Session)]) -> (String, String)
         let r = s.root.display();
         let bin_dir = format!("{r}/fakebin:{}", s.bin.parent().unwrap().display());
         cases.push_str(&format!(
-            "  *{host}*) exec env -i HOME={r} PATH={bin_dir}:/usr/bin:/bin H2_SESSION=test \
+            "  *{host}*) exec env -i HOME={r} PATH={bin_dir}:/usr/bin:/bin H2_SESSION=test HERDR2_SKILL_DETECT_PATH= \
              XDG_RUNTIME_DIR={r}/run XDG_STATE_HOME={r}/state XDG_CONFIG_HOME={r}/config sh -c \"$*\" ;;\n"
         ));
     }

@@ -561,6 +561,7 @@ export default class Settings extends View {
     this.skillInstalling = null; // null | "all" | "ai" | "custom" | agentId
     this.skillError = null;
     this.skillResult = null;
+    this.skillAgentFilter = "detected"; // "detected" | "all"
     this.skillCustomDirInput = InputState.new({ placeholder: this.tr("~/.claude/skills or /custom/skills/dir", "~/.claude/skills 或自定义技能目录") });
     this.skillAiHintInput = InputState.new({ placeholder: this.tr("Optional: specify an agent or custom directory (leave blank to auto-detect all)…", "可选：输入想适配的 Agent 名称或特殊路径（留空则自动全面识别）…") });
     this.recordingTarget = null;
@@ -588,7 +589,7 @@ export default class Settings extends View {
           this.maybeAutoProbeDrove(cx);
         }
         if (this.section === "skills") {
-          await Promise.all([this.loadMachines(), this.loadSkills(), this.loadAi()]);
+          await Promise.all([this.loadMachines(), this.loadSkills(), this.loadAi(), this.droveData ? Promise.resolve() : this.loadDrove()]);
         }
       }
       cx.notify();
@@ -9138,7 +9139,7 @@ export default class Settings extends View {
     this.skillLoading = true;
     this.skillError = null;
     try {
-      const r = await hc([...this.skillArgs(["skill", "status"]), "--json"]);
+      const r = await hc([...this.skillArgs(["skill", "status"]), "--json"], { timeout: 60000 });
       let parsed = null;
       try { parsed = JSON.parse(r.stdout || r.stderr); } catch {}
       if (r.code !== 0) {
@@ -9166,7 +9167,7 @@ export default class Settings extends View {
         if (opts?.target) args.push("--target", opts.target);
         else if (opts?.agent) args.push("--agent", opts.agent);
         else args.push("--all");
-        const r = await hc(args);
+        const r = await hc(args, { timeout: 60000 });
         let parsed = null;
         try { parsed = JSON.parse(r.stdout || r.stderr); } catch {}
         if (r.code !== 0) {
@@ -9187,6 +9188,11 @@ export default class Settings extends View {
         };
       } catch (e) {
         this.skillError = String(e?.message ?? e);
+        notify({
+          title: this.tr("Skill installation failed", "Skill 安装失败"),
+          body: this.skillError,
+          level: "error",
+        });
       } finally {
         this.skillInstalling = false;
         cx.notify();
@@ -9202,11 +9208,11 @@ export default class Settings extends View {
     cx.notify();
     cx.spawn(async (cx) => {
       try {
-        const hint = String(this.skillAiHintInput?.value?.() ?? "").trim();
+        const hint = String(this.skillAiHintInput?.value?.() ?? "").replace(/\r?\n/g, " ").trim();
         const args = this.skillArgs(["skill", "ai-install", "--lang", this.lang()]);
         args.push("--json");
         if (hint) args.push("--query", hint);
-        const r = await hc(args);
+        const r = await hc(args, { timeout: 120000 });
         let parsed = null;
         try { parsed = JSON.parse(r.stdout || r.stderr); } catch {}
         if (r.code !== 0) {
@@ -9223,8 +9229,20 @@ export default class Settings extends View {
           targets: parsed?.targets ?? [],
           tips: Array.isArray(parsed?.tips) ? parsed.tips : [],
         };
+        notify({
+          title: parsed?.aiError
+            ? this.tr("Skill installation completed with warnings", "Skill 安装已完成（含提示）")
+            : this.tr("AI Skill installation completed", "AI Skill 安装完成"),
+          body: this.skillResult.summary,
+          level: parsed?.aiError ? "warning" : "success",
+        });
       } catch (e) {
         this.skillError = String(e?.message ?? e);
+        notify({
+          title: this.tr("AI Skill installation failed", "AI Skill 安装失败"),
+          body: this.skillError,
+          level: "error",
+        });
       } finally {
         this.skillInstalling = false;
         cx.notify();
@@ -9240,7 +9258,50 @@ export default class Settings extends View {
       { id: "drove-add", summaryEn: "Append tasks to active Drove Runs", summaryZh: "向 Drove Run 追加新任务" },
       { id: "drove-setup", summaryEn: "Configure Drove roles & AI", summaryZh: "配置 Drove 角色与 AI" },
     ];
-    const agents = Array.isArray(data.agents) ? data.agents : [];
+    const rawAgents = Array.isArray(data.agents) ? data.agents : [];
+    // Cross-reference Agents & ACP detection when targeting the same machine so detected agents stay aligned.
+    const sameMachine = (this.skillMachine ?? null) === (this.droveMachine ?? null);
+    const acpRowsById = new Map();
+    if (sameMachine) {
+      for (const r of this.detectedAgentRows()) {
+        acpRowsById.set(r.id, r);
+      }
+    }
+    const catalogOrder = new Map(SUPPORTED_AGENTS_CATALOG.map((c, idx) => [c.id, idx]));
+    const agents = rawAgents
+      .map((a) => {
+        const canonicalId = a.id === "antigravity" ? "agy" : a.id;
+        const acpRow = acpRowsById.get(canonicalId);
+        const cliDetected = Boolean(
+          a.cliDetected ||
+            (Array.isArray(a.detectedBy) && a.detectedBy.some((d) => String(d).startsWith("cli:"))) ||
+            acpRow?.cliInstalled ||
+            acpRow?.anyInstalled,
+        );
+        const detected = Boolean(a.detected || cliDetected);
+        return {
+          ...a,
+          canonicalId,
+          name: acpRow?.name || a.name,
+          cliDetected,
+          detected,
+        };
+      })
+      .sort((a, b) => {
+        const rank = (x) => (x.cliDetected ? 0 : x.detected ? 1 : 2);
+        const d = rank(a) - rank(b);
+        if (d !== 0) return d;
+        const oa = catalogOrder.has(a.canonicalId) ? catalogOrder.get(a.canonicalId) : 999;
+        const ob = catalogOrder.has(b.canonicalId) ? catalogOrder.get(b.canonicalId) : 999;
+        if (oa !== ob) return oa - ob;
+        return String(a.name).localeCompare(String(b.name));
+      });
+    const detectedAgents = agents.filter((a) => a.detected);
+    const activeSkillFilter =
+      this.skillAgentFilter === "detected" && detectedAgents.length === 0
+        ? "all"
+        : (this.skillAgentFilter || "detected");
+    const visibleAgents = activeSkillFilter === "detected" ? detectedAgents : agents;
     const aiReady = Boolean(this.aiStatus?.configured);
     const busy = Boolean(this.skillInstalling);
     const primaryBtn = (id, label, onClick, disabled = false) =>
@@ -9515,8 +9576,48 @@ export default class Settings extends View {
       .child(
         v_flex()
           .w_full()
-          .gap(6)
-          .child(this.heading(t, this.tr("Local Coding Agents", "本机编程 Agent 检测列表")))
+          .gap(8)
+          .child(
+            h_flex()
+              .w_full()
+              .items_center()
+              .justify_between()
+              .gap(8)
+              .flex_wrap()
+              .child(this.heading(t, this.tr("Coding Agents & Skill Directories", "智能体 Skill 目录列表")))
+              .child(
+                h_flex()
+                  .id("st-skill-filter-bar")
+                  .gap(5)
+                  .items_center()
+                  .children(
+                    [
+                      { id: "detected", label: this.tr(`Detected (${detectedAgents.length})`, `已检测到 (${detectedAgents.length})`) },
+                      { id: "all", label: this.tr(`All (${agents.length})`, `全部 (${agents.length})`) },
+                    ].map((tab) => {
+                      const on = activeSkillFilter === tab.id;
+                      return div()
+                        .id(`st-skill-filter-${tab.id}`)
+                        .px(9)
+                        .py(3)
+                        .rounded(6)
+                        .border_1()
+                        .border_color(on ? t.accent : t.border)
+                        .bg(on ? (alpha(t.accent, "18") ?? t.raised) : t.surface)
+                        .cursor_pointer()
+                        .text_size(11.5)
+                        .when(on, (el) => el.font_semibold())
+                        .text_color(on ? t.accent : t.muted)
+                        .hover((s) => s.bg(t.hover).text_color(t.foreground))
+                        .on_click((_e, c) => {
+                          this.skillAgentFilter = tab.id;
+                          c.notify();
+                        })
+                        .child(tab.label);
+                    }),
+                  ),
+              ),
+          )
           .child(
             v_flex()
               .w_full()
@@ -9526,7 +9627,7 @@ export default class Settings extends View {
               .bg(t.surface)
               .overflow_hidden()
               .children(
-                agents.map((a, idx) => {
+                visibleAgents.map((a, idx) => {
                   const [stLabel, stColor] = statusBadge(a.status);
                   const actLabel =
                     this.skillInstalling === a.id
@@ -9537,13 +9638,14 @@ export default class Settings extends View {
                           ? this.tr("Update", "更新")
                           : this.tr("Install", "安装");
                   return h_flex()
+                    .id(`st-skill-row-${a.id}`)
                     .w_full()
                     .px(14)
                     .py(10)
                     .gap(12)
                     .items_center()
                     .when(idx > 0, (el) => el.border_t(1).border_color(t.border))
-                    .child(div().w(7).h(7).flex_none().rounded(4).bg(a.detected ? t.ansi2 : t.dim))
+                    .child(this.agentIconEl(t, a.canonicalId || a.id, 17))
                     .child(
                       v_flex()
                         .flex_1()
@@ -9551,10 +9653,11 @@ export default class Settings extends View {
                         .gap(2)
                         .child(
                           h_flex()
-                            .gap(8)
+                            .gap(7)
                             .items_center()
-                            .child(div().text_size(13).font_semibold().text_color(t.foreground).child(a.name))
-                            .when(a.detected, (el) =>
+                            .flex_wrap()
+                            .child(div().text_size(13).font_semibold().text_color(a.detected ? t.foreground : t.muted).child(a.name))
+                            .when(a.cliDetected, (el) =>
                               el.child(
                                 div()
                                   .px(6)
@@ -9563,7 +9666,21 @@ export default class Settings extends View {
                                   .bg(t.ansi2 + "1c")
                                   .text_size(10.5)
                                   .text_color(t.ansi2)
-                                  .child(this.tr("Detected", "已检测到")),
+                                  .child(this.tr("Detected", "已安装")),
+                              ),
+                            )
+                            .when(!a.cliDetected && a.detected, (el) =>
+                              el.child(
+                                div()
+                                  .px(6)
+                                  .py(1)
+                                  .rounded(4)
+                                  .bg(t.background)
+                                  .border_1()
+                                  .border_color(t.border)
+                                  .text_size(10.5)
+                                  .text_color(t.muted)
+                                  .child(this.tr("Config Dir", "仅配置目录")),
                               ),
                             )
                             .child(
@@ -11031,7 +11148,7 @@ export default class Settings extends View {
               });
               if (s.id === "skills") cx.spawn(async (cx) => {
                 if (this.machineList === null) await this.loadMachines();
-                await Promise.all([this.loadSkills(), this.loadAi()]);
+                await Promise.all([this.loadSkills(), this.loadAi(), this.droveData ? Promise.resolve() : this.loadDrove()]);
                 cx.notify();
               });
               cx.notify();

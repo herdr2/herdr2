@@ -2961,6 +2961,19 @@ fn split_pane_names_merged_tabs_and_windows_shells(cx: &mut TestAppContext) {
     assert!(adapter_update_fail_tree.contains("Update Failed"), "Failed adapter update should surface Update Failed badge: {adapter_update_fail_tree}");
     assert!(adapter_update_fail_tree.contains("Retry Update"), "Failed adapter update should surface Retry Update button: {adapter_update_fail_tree}");
     assert!(adapter_update_fail_tree.contains("download timed out"), "Failed adapter update should surface inline failure detail: {adapter_update_fail_tree}");
+    let skills_aligned_tree = describe(
+        cx,
+        &staged,
+        "frame/settings",
+        true,
+        json!({ "section": "skills" }),
+        updates("current", "current"),
+        Some("this.aiStatus = { configured: true }; this.skillData = { home: '/home/dev', agents: [{ id: 'claude', name: 'Claude Code', detected: true, cliDetected: true, detectedBy: ['cli:claude'], skillsDir: '/home/dev/.claude/skills', status: 'up_to_date' }, { id: 'hermes', name: 'Hermes', detected: true, cliDetected: true, detectedBy: ['cli:hermes'], skillsDir: '/home/dev/.hermes/skills', status: 'not_installed' }, { id: 'qoder', name: 'Qoder', detected: false, cliDetected: false, detectedBy: [], skillsDir: '/home/dev/.qoder/skills', status: 'not_installed' }] };"),
+    )
+    .unwrap();
+    assert!(skills_aligned_tree.contains("st-skill-filter-bar"), "Skills page should render detected/all filter bar: {skills_aligned_tree}");
+    assert!(skills_aligned_tree.contains("st-skill-row-hermes"), "Skills page should show aligned newly supported detected agent (hermes): {skills_aligned_tree}");
+    assert!(!skills_aligned_tree.contains("st-skill-row-qoder"), "Default Detected filter should hide undetected agents: {skills_aligned_tree}");
     assert!(probe_err_tree.contains("st-dr-agent-errors"), "Probe error card should render in Agents & ACP: {probe_err_tree}");
     assert!(!probe_err_tree.contains("st-dr-probe-ai-btn"), "AI Diagnose button should be removed: {probe_err_tree}");
     assert!(probe_err_tree.contains("st-dr-probe-agent-fix-btn"), "Probe error card should render Fix with AI button: {probe_err_tree}");

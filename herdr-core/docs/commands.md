@@ -2084,7 +2084,7 @@ Options:
       --all              Install into all detected agent skill directories
       --json             JSON output even in a terminal
       --detected-only    Only install into agents actually detected on disk/PATH (do not create fallback dirs)
-      --agent <AGENT>    Target a specific known agent ID (antigravity, claude, codex, cursor, opencode, windsurf)
+      --agent <AGENT>    Target a specific known agent ID (e.g. claude, codex, agy, cursor, gemini, opencode, hermes, zcode, trae, qoder, ...)
       --target <DIR>     Target a custom skills root directory
       --skills <SKILLS>  Comma-separated subset of skills to install (default: all bundled skills)
       --on <MACHINE>     Target remote machine (`h2 machine ls`)

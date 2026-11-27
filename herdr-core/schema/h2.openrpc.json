@@ -6328,7 +6328,7 @@
       "name": "Apache-2.0"
     },
     "title": "herdr2",
-    "version": "2.0.20"
+    "version": "2.0.21"
   },
   "methods": [
     {
@@ -12413,6 +12413,18 @@
               {
                 "type": "null"
               }
+            ]
+          }
+        },
+        {
+          "name": "timeoutSecs",
+          "required": false,
+          "schema": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
             ]
           }
         },
