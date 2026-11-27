@@ -2304,9 +2304,9 @@ async fn checkpoint_hook(core: Ctx<'_>, p: CheckpointHookParams) -> Result<Check
 
 async fn adapter_status(
     core: Ctx<'_>,
-    _: AdapterStatusParams,
+    p: AdapterStatusParams,
 ) -> Result<crate::acp::adapters::AdapterStatusResult, RpcError> {
-    Ok(core.adapters.status(core).await)
+    Ok(core.adapters.status_with_refresh(core, p.refresh).await)
 }
 
 async fn adapter_install(
@@ -2320,7 +2320,7 @@ async fn adapter_update(
     core: Ctx<'_>,
     p: AdapterUpdateParams,
 ) -> Result<crate::acp::adapters::AdapterInstallResult, RpcError> {
-    core.adapters.install_many(core, &p.presets, p.all, false, true, true).await
+    core.adapters.install_many(core, &p.presets, p.all, false, false, true).await
 }
 
 async fn adapter_config_set(

@@ -125,6 +125,7 @@ fi
 if [ ! -e "$bin/h2" ] || [ -L "$bin/h2" ]; then
   ln -sfn "$link_target" "$bin/h2"
 fi
+"$core_dest" skill sync >/dev/null 2>&1 || true
 
 case ":$PATH:" in
   *":$bin:"*) ;;

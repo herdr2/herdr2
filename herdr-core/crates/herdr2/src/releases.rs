@@ -74,7 +74,7 @@ fn curl(url: &str, to: &Path) -> Result<(), RpcError> {
         cmd.arg("--ssl-no-revoke");
     }
     let ok = cmd
-        .args(["-fsL", "--retry", "2", "--connect-timeout", "10", "-o"])
+        .args(["-fsL", "-H", "Cache-Control: no-cache", "--retry", "2", "--connect-timeout", "10", "-o"])
         .arg(to)
         .arg(url)
         .stderr(std::process::Stdio::null())
@@ -89,26 +89,48 @@ fn is_github_release_base(base: &str) -> bool {
     base.contains("/releases/download/") || base.ends_with("/releases/latest/download")
 }
 
+fn fetch_manifest_url(url: &str, scratch: &Path) -> Result<Manifest, RpcError> {
+    let file = scratch.join("manifest.json");
+    curl(url, &file)?;
+    let bytes = std::fs::read(&file).map_err(|e| unavailable(e.to_string()))?;
+    serde_json::from_slice(&bytes).map_err(|e| unavailable(format!("{url} is not a release list: {e}")))
+}
+
+fn manifest_from_base(base: &str, version: Option<&str>, scratch: &Path) -> Result<Manifest, RpcError> {
+    if is_github_release_base(base) {
+        // Flat rolling GitHub Release tags (`ota-latest`) keep only one unversioned archive per
+        // target (`herdr2-core-<target>.tar.gz`), so older `core-<v>-manifest.json` files on that
+        // same tag point at overwritten rolling archives and would fail SHA-256 verification.
+        // Always consult `core-latest.json` first; only fall back to `core-<v>-manifest.json`
+        // when `core-latest.json` itself is absent (e.g. a static versioned release tag).
+        let latest_url = format!("{base}/core-latest.json");
+        match version {
+            None => fetch_manifest_url(&latest_url, scratch),
+            Some(v) => match fetch_manifest_url(&latest_url, scratch) {
+                Ok(m) if m.version == v => Ok(m),
+                Ok(m) => Err(unavailable(format!("{base} currently serves h2 {}, not {v}", m.version))),
+                Err(_) => fetch_manifest_url(&format!("{base}/core-{v}-manifest.json"), scratch),
+            },
+        }
+    } else {
+        let url = match version {
+            Some(v) => format!("{base}/core/{v}/manifest.json"),
+            None => format!("{base}/core/latest.json"),
+        };
+        fetch_manifest_url(&url, scratch)
+    }
+}
+
 /// The latest release's list, or one version's.
 /// Supports both hierarchical static servers (`core/latest.json`) and flat GitHub Releases
 /// asset URLs (`core-latest.json`).
 pub fn manifest(version: Option<&str>, scratch: &Path) -> Result<Manifest, RpcError> {
     let base = base()?;
-    let url = if is_github_release_base(&base) {
-        match version {
-            Some(v) => format!("{base}/core-{v}-manifest.json"),
-            None => format!("{base}/core-latest.json"),
-        }
-    } else {
-        match version {
-            Some(v) => format!("{base}/core/{v}/manifest.json"),
-            None => format!("{base}/core/latest.json"),
-        }
-    };
-    let file = scratch.join("manifest.json");
-    curl(&url, &file)?;
-    let bytes = std::fs::read(&file).map_err(|e| unavailable(e.to_string()))?;
-    serde_json::from_slice(&bytes).map_err(|e| unavailable(format!("{url} is not a release list: {e}")))
+    manifest_from_base(&base, version, scratch)
+}
+
+pub fn is_checksum_mismatch(err: &RpcError) -> bool {
+    err.message.contains("checksum mismatch")
 }
 
 /// Windows' own tar opens zips; Git Bash's GNU tar, often first on PATH there, can't.
@@ -165,7 +187,7 @@ pub fn fetch(m: &Manifest, target: &str, scratch: &Path) -> Result<PathBuf, RpcE
     let archive = if target.starts_with("windows") { "zip" } else { "tar.gz" };
     let file = scratch.join(format!("herdr2-{target}.{archive}"));
     curl(&t.url, &file)?;
-    if sha256(&file).as_deref() != Some(t.sha256.as_str()) {
+    if !sha256(&file).as_deref().is_some_and(|got| got.eq_ignore_ascii_case(&t.sha256)) {
         return Err(RpcError::new(
             "refused",
             format!("the download of h2 {} for {target} is damaged (checksum mismatch)", m.version),
@@ -219,5 +241,38 @@ mod tests {
         );
         assert_eq!(resolve_base(None, None, Some("https://def.example/")).unwrap(), "https://def.example");
         assert!(resolve_base(None, None, None).is_err());
+    }
+
+    #[test]
+    fn github_flat_release_base_ignores_stale_versioned_core_manifests() {
+        let scratch = Scratch::new().unwrap();
+        let ota_dir = scratch.0.join("releases/download/ota-latest");
+        std::fs::create_dir_all(&ota_dir).unwrap();
+
+        // Simulate `ota-latest` holding an outdated `core-2.0.18-manifest.json` whose rolling archive
+        // was overwritten when `2.0.19` published `core-latest.json`.
+        std::fs::write(
+            ota_dir.join("core-2.0.18-manifest.json"),
+            r#"{"version":"2.0.18","generation":1,"targets":{"linux-x86_64":{"url":"file:///old","sha256":"deadbeef"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            ota_dir.join("core-latest.json"),
+            r#"{"version":"2.0.19","generation":1,"targets":{"linux-x86_64":{"url":"file:///new","sha256":"cafebabe"}}}"#,
+        )
+        .unwrap();
+
+        let base = format!("file://{}", ota_dir.display());
+        let latest = manifest_from_base(&base, None, &scratch.0).unwrap();
+        assert_eq!(latest.version, "2.0.19");
+        assert_eq!(latest.targets["linux-x86_64"].sha256, "cafebabe");
+
+        let exact_current = manifest_from_base(&base, Some("2.0.19"), &scratch.0).unwrap();
+        assert_eq!(exact_current.version, "2.0.19");
+
+        // Requesting superseded 2.0.18 on rolling ota-latest must fail fast so callers fall back
+        // to `manifest(None)` rather than downloading 2.0.19's archive against 2.0.18's SHA-256.
+        let stale = manifest_from_base(&base, Some("2.0.18"), &scratch.0);
+        assert!(stale.is_err());
     }
 }

@@ -16,6 +16,9 @@ pub(crate) struct AdapterCli {
 pub(crate) enum AdapterAction {
     /// Inspect managed ACP adapters, companion CLIs, installation source, and versions.
     Status {
+        /// Refresh the official ACP Registry index before reporting latest versions.
+        #[arg(long)]
+        refresh: bool,
         /// Target remote machine (`h2 machine ls`).
         #[arg(long, value_name = "MACHINE")]
         on: Option<String>,
@@ -73,8 +76,11 @@ pub(crate) enum AdapterAction {
 
 pub(crate) fn run(paths: &Paths, cli: AdapterCli) -> Result<Out, RpcError> {
     match cli.action {
-        AdapterAction::Status { on } => {
+        AdapterAction::Status { refresh, on } => {
             let mut params = json!({});
+            if refresh {
+                params["refresh"] = json!(true);
+            }
             if let Some(m) = on {
                 params["on"] = json!(m);
             }
@@ -143,7 +149,13 @@ fn format_status(r: &Value) -> String {
             let preset = item["preset_id"].as_str().unwrap_or("?");
             let state = item["state"].as_str().unwrap_or("?");
             let source = item["source"].as_str().unwrap_or("?");
-            let ver = item["version"].as_str().map(|v| format!(" v{v}")).unwrap_or_default();
+            let ver = match (item["version"].as_str(), item["latest_version"].as_str()) {
+                (Some(v), Some(latest)) if v.trim().trim_start_matches(['v', 'V']) != latest.trim().trim_start_matches(['v', 'V']) => {
+                    format!(" v{v} -> v{latest}")
+                }
+                (Some(v), _) => format!(" v{v}"),
+                _ => String::new(),
+            };
             let cli = match (item["companion_cli"].as_str(), item["companion_installed"].as_bool()) {
                 (Some(c), Some(true)) => format!("cli:{c}=ok"),
                 (Some(c), _) => format!("cli:{c}=missing"),

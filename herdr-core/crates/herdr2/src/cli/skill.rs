@@ -86,6 +86,12 @@ pub(crate) enum SkillAction {
         #[arg(long, value_name = "MACHINE")]
         on: Option<String>,
     },
+    /// Update all already-installed bundled Herdr2 skills to this h2 build's version.
+    Sync {
+        /// Target remote machine (`h2 machine ls`).
+        #[arg(long, value_name = "MACHINE")]
+        on: Option<String>,
+    },
     /// Use built-in Core AI to inspect local or remote coding agents and install Herdr2 skills automatically.
     AiInstall {
         /// Optional hint about a custom agent name or desired skill location.
@@ -312,6 +318,56 @@ fn select_skills(filter: &[String]) -> Result<Vec<&'static BundledSkill>, RpcErr
     Ok(out)
 }
 
+const EXTRA_SKILL_DIRS: &[(&str, &[&str])] = &[
+    ("agents", &[".agents", "skills"]),
+    ("opencode", &[".opencode", "skills"]),
+];
+
+fn skill_targets_file(paths: &Paths) -> Option<PathBuf> {
+    paths.config.parent().map(|dir| dir.join("skill_targets.json"))
+}
+
+fn load_recorded_targets(paths: &Paths) -> Vec<PathBuf> {
+    let Some(file) = skill_targets_file(paths) else {
+        return Vec::new();
+    };
+    let Ok(bytes) = std::fs::read(&file) else {
+        return Vec::new();
+    };
+    serde_json::from_slice::<Vec<String>>(&bytes)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+pub(crate) fn record_installed_target(paths: &Paths, dir: &Path) {
+    let Some(file) = skill_targets_file(paths) else {
+        return;
+    };
+    let canonical = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+    let rendered = canonical.display().to_string();
+    if rendered.trim().is_empty() {
+        return;
+    }
+    let mut existing: Vec<String> = std::fs::read(&file)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default();
+    if existing.iter().any(|p| p == &rendered) {
+        return;
+    }
+    existing.push(rendered);
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec_pretty(&existing) {
+        let _ = crate::paths::write_atomic(&file, &bytes);
+    }
+}
+
 fn write_skills_to_dir(base: &Path, skills: &[&BundledSkill]) -> Result<Vec<String>, RpcError> {
     let mut written = Vec::new();
     for sk in skills {
@@ -322,6 +378,97 @@ fn write_skills_to_dir(base: &Path, skills: &[&BundledSkill]) -> Result<Vec<Stri
         written.push(path.display().to_string());
     }
     Ok(written)
+}
+
+fn sync_installed_in(paths: &Paths, home: &Path) -> Result<Out, RpcError> {
+    let mut candidates: Vec<(String, PathBuf)> = Vec::new();
+    let mut seen: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut push_candidate = |label: String, dir: PathBuf| {
+        if !dir.is_dir() {
+            return;
+        }
+        let key = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        if seen.insert(key) {
+            candidates.push((label, dir));
+        }
+    };
+
+    for spec in KNOWN_AGENTS {
+        push_candidate(spec.id.to_string(), join_rel(home, spec.skills_rel));
+    }
+    for (label, rel) in EXTRA_SKILL_DIRS {
+        push_candidate((*label).to_string(), join_rel(home, rel));
+    }
+    for raw in load_recorded_targets(paths) {
+        let resolved = expand_home_path(&raw.to_string_lossy(), home).unwrap_or(raw);
+        push_candidate("custom".to_string(), resolved);
+    }
+
+    let mut targets = Vec::new();
+    let mut total_updated = 0usize;
+    let mut total_up_to_date = 0usize;
+
+    for (label, dir) in &candidates {
+        let mut updated_skills = Vec::new();
+        let mut files = Vec::new();
+        for sk in BUNDLED_SKILLS {
+            let path = dir.join(sk.id).join("SKILL.md");
+            if !path.is_file() {
+                continue;
+            }
+            let current = std::fs::read_to_string(&path).ok();
+            if current
+                .as_deref()
+                .is_some_and(|raw| normalize_newlines(raw) == normalize_newlines(sk.content))
+            {
+                total_up_to_date += 1;
+                continue;
+            }
+            std::fs::write(&path, sk.content)
+                .map_err(|e| RpcError::internal(format!("write {}: {e}", path.display())))?;
+            total_updated += 1;
+            updated_skills.push(sk.id.to_string());
+            files.push(path.display().to_string());
+        }
+        if !updated_skills.is_empty() {
+            targets.push(json!({
+                "agent": label,
+                "target": dir.display().to_string(),
+                "updatedSkills": updated_skills,
+                "files": files,
+            }));
+        }
+    }
+
+    let human = if total_updated == 0 {
+        if total_up_to_date == 0 {
+            "no installed Herdr2 skills found to update".to_string()
+        } else {
+            format!("all {total_up_to_date} installed skill file(s) are already up to date")
+        }
+    } else {
+        let list = targets
+            .iter()
+            .map(|t| {
+                let agent = t["agent"].as_str().unwrap_or("custom");
+                let target = t["target"].as_str().unwrap_or("");
+                format!("{agent} ({target})")
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("updated {total_updated} installed skill file(s) in {list}")
+    };
+
+    Ok(Out {
+        json: json!({
+            "ok": true,
+            "updatedCount": total_updated,
+            "upToDateCount": total_up_to_date,
+            "targets": targets,
+            "status": status_out(home).json,
+        }),
+        human,
+    })
 }
 
 fn expand_home_path(raw: &str, home: &Path) -> Option<PathBuf> {
@@ -754,7 +901,7 @@ Never suggest paths outside the remote home directory or containing '..'.";
     })
 }
 
-pub(crate) fn run(paths: &Paths, cli: SkillCli) -> Result<Out, RpcError> {
+pub(super) fn run(paths: &Paths, cli: SkillCli) -> Result<Out, RpcError> {
     match cli.action {
         SkillAction::Status { on: Some(machine) } => {
             let val = remote_skill_exec(paths, &machine, &["status".into()])?;
@@ -792,12 +939,26 @@ pub(crate) fn run(paths: &Paths, cli: SkillCli) -> Result<Out, RpcError> {
                 human: format!("installed {count} skill file(s) on {machine}"),
             })
         }
+        SkillAction::Sync { on: Some(machine) } => {
+            let val = remote_skill_exec(paths, &machine, &["sync".into()])?;
+            let count = val.get("updatedCount").and_then(Value::as_u64).unwrap_or(0);
+            let human = if count == 0 {
+                format!("installed skills on {machine} are already up to date")
+            } else {
+                format!("updated {count} installed skill file(s) on {machine}")
+            };
+            Ok(Out { json: val, human })
+        }
         SkillAction::AiInstall { query, lang, dry_run, on: Some(machine) } => {
             run_remote_ai_install(paths, &machine, query, lang, dry_run)
         }
         SkillAction::Status { on: None } => {
             let home = user_home()?;
             Ok(status_out(&home))
+        }
+        SkillAction::Sync { on: None } => {
+            let home = user_home()?;
+            sync_installed_in(paths, &home)
         }
         SkillAction::Install { all, detected_only, agent, target, skills, on: None } => {
             let home = user_home()?;
@@ -837,6 +998,7 @@ pub(crate) fn run(paths: &Paths, cli: SkillCli) -> Result<Out, RpcError> {
             let mut total_files = 0usize;
             for (label, dir) in &dirs {
                 let written = write_skills_to_dir(dir, &selected)?;
+                record_installed_target(paths, dir);
                 total_files += written.len();
                 results.push(json!({
                     "agent": label,
@@ -981,6 +1143,7 @@ Never suggest paths outside the user's home directory or containing '..'.";
                     sks.iter().map(|s| dir.join(s.id).join("SKILL.md").display().to_string()).collect()
                 } else {
                     let w = write_skills_to_dir(dir, sks)?;
+                    record_installed_target(paths, dir);
                     total_files += w.len();
                     w
                 };

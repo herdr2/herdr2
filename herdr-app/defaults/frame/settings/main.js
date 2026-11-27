@@ -427,6 +427,7 @@ export default class Settings extends View {
     this.adapterBusy = false;
     this.adapterConfigSaving = false;
     this.adapterError = null;
+    this.adapterActionFeedback = {};
     this.agentFilter = "all"; // "all" | "installed" | "missing" | "issues"
     this.adapterRegistryUrlInput = InputState.new({
       placeholder: "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json",
@@ -2095,7 +2096,7 @@ export default class Settings extends View {
           if (snap && this.droveData) this.droveData = { ...this.droveData, agents: snap };
         }
         try {
-          this.adapterStatus = await this.droveHcJson(["adapter", "status"], { timeout: 15000 });
+          this.adapterStatus = await this.droveHcJson(["adapter", "status", "--refresh"], { timeout: 30000 });
           this.syncAdapterInputs(this.adapterStatus);
         } catch {}
         this.droveAutoProbed = { ...(this.droveAutoProbed ?? {}), [key]: true };
@@ -2133,6 +2134,7 @@ export default class Settings extends View {
     this.droveProbePromise = null;
     this.adapterStatus = null;
     this.adapterError = null;
+    this.adapterActionFeedback = {};
     this.picking = null;
     this.droveModelSubmit = null;
     this.droveStrengthSubmit = null;
@@ -2223,49 +2225,201 @@ export default class Settings extends View {
     });
   }
 
-  runAdapterAction(cx, mode, presetId = null) {
+  checkAdapterUpdates(cx) {
     if (this.adapterBusy || (typeof checking === "function" && checking())) return;
     const targetMachine = this.droveMachine;
-    this.adapterBusy = presetId ? `${mode}:${presetId}` : mode;
-    this.droveError = null;
+    this.adapterBusy = "check";
     this.adapterError = null;
     cx.notify();
     cx.spawn(async (cx) => {
       try {
+        const res = await this.droveHcJson(["adapter", "status", "--refresh"], { timeout: 30000 });
+        if (this.droveMachine !== targetMachine) return;
+        if (res) {
+          this.adapterStatus = res;
+          this.syncAdapterInputs(res);
+        }
+        if (res?.registry_error) {
+          this.adapterError = String(res.registry_error);
+          notify({
+            title: this.tr("Failed to check ACP updates", "检查 ACP 更新失败"),
+            body: this.adapterError,
+            level: "error",
+          });
+          return;
+        }
+        const adapters = Array.isArray(res?.adapters) ? res.adapters : [];
+        const managed = adapters.filter((a) => a?.source === "managed" && a?.installed);
+        const updatable = managed.filter((a) => Boolean(a.update_available));
+        const now = Date.now();
+        const nextFeedback = { ...(this.adapterActionFeedback ?? {}) };
+        if (updatable.length > 0) {
+          for (const item of updatable) {
+            delete nextFeedback[item.preset_id];
+          }
+          this.adapterActionFeedback = nextFeedback;
+          const summary = updatable
+            .map((u) => `${u.preset_id}${u.version ? ` v${u.version}` : ""} → v${u.latest_version}`)
+            .join(", ");
+          notify({
+            title: this.tr(
+              `${updatable.length} ACP adapter update${updatable.length > 1 ? "s" : ""} available`,
+              `发现 ${updatable.length} 个 ACP 适配器可更新`,
+            ),
+            body: summary,
+            level: "info",
+          });
+        } else {
+          for (const item of managed) {
+            nextFeedback[item.preset_id] = {
+              action: "up_to_date",
+              version: item.version ?? null,
+              error: null,
+              at: now,
+            };
+          }
+          this.adapterActionFeedback = nextFeedback;
+          notify({
+            title: this.tr("ACP adapters are up to date", "ACP 适配器已是最新版本"),
+            body: managed.length > 0
+              ? managed.map((m) => `${m.preset_id}${m.version ? ` v${m.version}` : ""}`).join(", ")
+              : this.tr("No managed ACP adapters installed yet.", "当前尚未安装托管 ACP 适配器。"),
+            level: "info",
+          });
+        }
+      } catch (e) {
+        if (this.droveMachine === targetMachine) {
+          this.adapterError = String(e?.message ?? e);
+          notify({
+            title: this.tr("Failed to check ACP updates", "检查 ACP 更新失败"),
+            body: this.adapterError,
+            level: "error",
+          });
+        }
+      } finally {
+        this.adapterBusy = false;
+        cx.notify();
+      }
+    });
+  }
+
+  runAdapterAction(cx, mode, presetId = null) {
+    if (this.adapterBusy || (typeof checking === "function" && checking())) return;
+    const targetMachine = this.droveMachine;
+    const isUpdate = mode === "update";
+    this.adapterBusy = presetId ? `${mode}:${presetId}` : mode;
+    this.droveError = null;
+    this.adapterError = null;
+    if (presetId) {
+      const nextFeedback = { ...(this.adapterActionFeedback ?? {}) };
+      delete nextFeedback[presetId];
+      this.adapterActionFeedback = nextFeedback;
+    } else {
+      this.adapterActionFeedback = {};
+    }
+    cx.notify();
+    cx.spawn(async (cx) => {
+      try {
         let args;
-        if (mode === "update") {
+        if (isUpdate) {
           args = presetId ? ["adapter", "update", presetId] : ["adapter", "update"];
+        } else if (mode === "reinstall") {
+          args = presetId ? ["adapter", "install", presetId, "--force"] : ["adapter", "install", "--detected", "--force"];
         } else if (mode === "install-all") {
           args = ["adapter", "install", "--all"];
         } else {
           args = presetId ? ["adapter", "install", presetId] : ["adapter", "install", "--detected"];
         }
-        const res = await this.droveHcJson(args, { timeout: 240000 });
+        const res = await this.droveHcJson(args, { timeout: 600000 });
         if (this.droveMachine !== targetMachine) return;
         const results = Array.isArray(res?.results) ? res.results : [];
+        const now = Date.now();
+        const nextFeedback = { ...(this.adapterActionFeedback ?? {}) };
+        for (const item of results) {
+          if (!item?.preset_id) continue;
+          nextFeedback[item.preset_id] = {
+            action: item.action,
+            version: item.version ?? null,
+            error: item.error ?? null,
+            at: now,
+          };
+        }
+        this.adapterActionFeedback = nextFeedback;
+
         const failed = results.filter((r) => r.action === "failed");
         const changed = results.filter((r) => r.action === "installed" || r.action === "updated");
+        const upToDate = results.filter((r) => r.action === "up_to_date" || r.action === "already_ready");
         if (failed.length > 0) {
+          const partial = changed.length > 0 || upToDate.length > 0;
           notify({
-            title: this.tr("ACP adapter install partially failed", "ACP 适配器部分安装失败"),
+            title: isUpdate
+              ? partial
+                ? this.tr("ACP adapter update partially failed", "ACP 适配器部分更新失败")
+                : this.tr("ACP adapter update failed", "ACP 适配器更新失败")
+              : partial
+                ? this.tr("ACP adapter install partially failed", "ACP 适配器部分安装失败")
+                : this.tr("ACP adapter install failed", "ACP 适配器安装失败"),
             body: failed.map((f) => `${f.preset_id}: ${f.error || "failed"}`).join("; "),
-            level: "warning",
+            level: partial ? "warning" : "error",
           });
         } else if (changed.length > 0) {
+          const changedSummary = changed.map((c) => `${c.preset_id}${c.version ? ` v${c.version}` : ""}`).join(", ");
+          const extraUpToDate =
+            upToDate.length > 0
+              ? this.tr(
+                  ` (${upToDate.map((u) => u.preset_id).join(", ")} already up to date)`,
+                  `（${upToDate.map((u) => u.preset_id).join("、")} 已是最新）`,
+                )
+              : "";
           notify({
-            title: this.tr("ACP adapters ready", "ACP 适配器已就绪"),
-            body: changed.map((c) => `${c.preset_id}${c.version ? ` v${c.version}` : ""}`).join(", "),
+            title: isUpdate
+              ? this.tr("ACP adapters updated", "ACP 适配器已更新")
+              : this.tr("ACP adapters ready", "ACP 适配器已就绪"),
+            body: `${changedSummary}${extraUpToDate}`,
             level: "success",
+          });
+        } else if (upToDate.length > 0) {
+          notify({
+            title: this.tr("ACP adapters already up to date", "ACP 适配器已是最新版本"),
+            body: upToDate.map((u) => `${u.preset_id}${u.version ? ` v${u.version}` : ""}`).join(", "),
+            level: "info",
+          });
+        } else {
+          notify({
+            title: isUpdate
+              ? this.tr("No managed ACP adapters to update", "没有需要更新的托管 ACP 适配器")
+              : this.tr("No ACP adapters needed installation", "没有需要安装的 ACP 适配器"),
+            level: "info",
           });
         }
         try {
           this.adapterStatus = await this.droveHcJson(["adapter", "status"], { timeout: 15000 });
           this.syncAdapterInputs(this.adapterStatus);
         } catch {}
-        await this.runDroveProbe(cx);
+        if (changed.length > 0) {
+          await this.runDroveProbe(cx);
+        }
       } catch (e) {
         if (this.droveMachine === targetMachine) {
           this.adapterError = String(e?.message ?? e);
+          if (presetId) {
+            this.adapterActionFeedback = {
+              ...(this.adapterActionFeedback ?? {}),
+              [presetId]: {
+                action: "failed",
+                version: null,
+                error: this.adapterError,
+                at: Date.now(),
+              },
+            };
+          }
+          notify({
+            title: isUpdate
+              ? this.tr("ACP adapter update failed", "ACP 适配器更新失败")
+              : this.tr("ACP adapter install failed", "ACP 适配器安装失败"),
+            body: this.adapterError,
+            level: "error",
+          });
         }
       } finally {
         this.adapterBusy = false;
@@ -6049,10 +6203,32 @@ export default class Settings extends View {
 
     return [...byId.values()]
       .map((r) => {
+        const adapterFeedback = this.adapterActionFeedback?.[r.id] ?? null;
+        const normVer = (v) => String(v ?? "").trim().replace(/^v/i, "").toLowerCase();
+        const adapterHasUpdate = Boolean(
+          r.adapter?.source === "managed" &&
+            r.adapter?.installed &&
+            (r.adapter?.update_available === true ||
+              (r.adapter?.version &&
+                r.adapter?.latest_version &&
+                normVer(r.adapter.version) !== normVer(r.adapter.latest_version))),
+        );
+        const adapterUpToDate = Boolean(
+          r.adapter?.source === "managed" &&
+            r.adapter?.installed &&
+            r.adapter?.version &&
+            r.adapter?.latest_version &&
+            !adapterHasUpdate,
+        );
+        const adapterUpdating = Boolean(
+          this.adapterBusy === `update:${r.id}` ||
+            (this.adapterBusy === "update" && r.adapter?.source === "managed" && adapterHasUpdate),
+        );
         const adapterInstalling = Boolean(
           r.adapter?.state === "installing" ||
             this.adapterBusy === `install:${r.id}` ||
-            this.adapterBusy === `update:${r.id}`,
+            this.adapterBusy === `reinstall:${r.id}` ||
+            adapterUpdating,
         );
         const adapterError = String(r.adapter?.error ?? "").trim() || null;
         // Built-in ACP comes bundled with the CLI binary itself.
@@ -6078,6 +6254,10 @@ export default class Settings extends View {
           acpInstalled: effectiveAcpInstalled,
           acpAuthRequired,
           adapterInstalling,
+          adapterUpdating,
+          adapterFeedback,
+          adapterHasUpdate,
+          adapterUpToDate,
           adapterError,
           adapterMissing,
           adapterNotInstalled,
@@ -6848,6 +7028,7 @@ export default class Settings extends View {
     const missingAdapterRows = rows.filter((r) => r.adapterMissing);
     const anyMissingAdapterRows = rows.filter((r) => r.adapterNotInstalled);
     const managedInstalledRows = rows.filter((r) => r.adapter?.source === "managed");
+    const updatableAdapterRows = rows.filter((r) => r.adapterHasUpdate);
 
     const activeFilter =
       this.agentFilter === "issues" && needsActionRows.length === 0
@@ -6971,7 +7152,12 @@ export default class Settings extends View {
           .border_1()
           .border_color(alpha(t.accent, "44") ?? t.border)
           .child(svg("mods/workspace-chrome/spinner.svg").size(10).text_color(t.accent).spin(900))
-          .child(div().text_size(10.8).text_color(t.accent).child(this.tr("Installing…", "安装中…")));
+          .child(
+            div()
+              .text_size(10.8)
+              .text_color(t.accent)
+              .child(r.adapterUpdating ? this.tr("Updating…", "更新中…") : this.tr("Installing…", "安装中…")),
+          );
       }
       if (r.adapterError) {
         return pill(
@@ -6999,6 +7185,7 @@ export default class Settings extends View {
       }
       if (r.acpMode === "managed") {
         if (r.acpInstalled) {
+          const fb = r.adapterFeedback;
           const ver = r.adapter?.version ? ` v${r.adapter.version}` : "";
           const srcHint = r.adapter?.source === "managed"
             ? this.tr("Herdr2 managed adapter", "Herdr2 隔离托管适配器")
@@ -7010,6 +7197,45 @@ export default class Settings extends View {
                   ? "npx cache"
                   : "";
           const tip = [srcHint, r.path].filter(Boolean).join(" · ");
+          if (fb?.action === "failed") {
+            return pill(
+              this.tr("Update Failed", "更新失败"),
+              t.blocked,
+              alpha(t.blocked, "18") ?? t.background,
+              alpha(t.blocked, "55") ?? t.border,
+            ).tooltip(fb.error || this.tr("Adapter update failed", "适配器更新失败"));
+          }
+          if (r.adapterHasUpdate) {
+            const latestVer = ` v${r.adapter.latest_version}`;
+            const upTip = this.tr(
+              `Installed v${r.adapter.version}, latest v${r.adapter.latest_version} available`,
+              `当前 v${r.adapter.version}，可更新至 v${r.adapter.latest_version}`,
+            );
+            return pill(
+              this.tr(`Update${latestVer}`, `可更新${latestVer}`),
+              t.working,
+              alpha(t.working, "16") ?? t.background,
+              alpha(t.working, "50") ?? t.border,
+            ).tooltip(upTip);
+          }
+          if (fb?.action === "updated") {
+            const nextVer = fb.version ? ` v${fb.version}` : ver;
+            return pill(
+              this.tr(`Updated${nextVer}`, `已更新${nextVer}`),
+              t.ansi2,
+              alpha(t.ansi2, "16") ?? t.background,
+              alpha(t.ansi2, "44") ?? t.border,
+            ).when(Boolean(tip), (el) => el.tooltip(tip));
+          }
+          if (fb?.action === "up_to_date" || r.adapterUpToDate) {
+            const curVer = fb?.version ? ` v${fb.version}` : ver;
+            return pill(
+              this.tr(`Up to date${curVer}`, `已是最新${curVer}`),
+              t.ansi2,
+              alpha(t.ansi2, "16") ?? t.background,
+              alpha(t.ansi2, "44") ?? t.border,
+            ).when(Boolean(tip), (el) => el.tooltip(tip));
+          }
           return pill(
             this.tr(`Installed${ver}`, `已安装${ver}`),
             t.ansi2,
@@ -7085,6 +7311,13 @@ export default class Settings extends View {
           tooltip: this.stripAcpAuthRawNoise(r.acpError || r.adapterError),
         };
       }
+      if (r.adapterFeedback?.action === "failed" && r.adapterFeedback.error) {
+        return {
+          text: this.tr(`Update failed: ${r.adapterFeedback.error}`, `更新失败：${r.adapterFeedback.error}`),
+          color: t.blocked,
+          tooltip: r.adapterFeedback.error,
+        };
+      }
       const parts = [];
       if (r.models.length > 0) {
         parts.push(this.tr(`${r.models.length} models`, `${r.models.length} 个模型`));
@@ -7116,7 +7349,9 @@ export default class Settings extends View {
     const rowActions = (r) => {
       const isBusyThis = Boolean(
         r.adapterInstalling ||
+          r.adapterUpdating ||
           this.adapterBusy === `install:${r.id}` ||
+          this.adapterBusy === `reinstall:${r.id}` ||
           this.adapterBusy === `update:${r.id}`,
       );
       const btns = [];
@@ -7172,7 +7407,7 @@ export default class Settings extends View {
               `st-ag-adapter-act-${r.id}`,
               isBusyThis ? this.tr("Working…", "处理中…") : this.tr("Reinstall", "重装"),
               (_e, cx) => {
-                if (!this.adapterBusy && !r.adapterInstalling) this.runAdapterAction(cx, "install", r.id);
+                if (!this.adapterBusy && !r.adapterInstalling) this.runAdapterAction(cx, "reinstall", r.id);
               },
               { busy: isBusyThis, disabled: Boolean(this.adapterBusy) },
             ),
@@ -7227,16 +7462,38 @@ export default class Settings extends View {
           );
         }
         if (r.adapter?.source === "managed") {
-          btns.push(
-            actionBtn(
-              `st-ag-adapter-act-${r.id}`,
-              isBusyThis ? this.tr("Updating…", "更新中…") : this.tr("Update ACP", "更新 ACP"),
-              (_e, cx) => {
-                if (!this.adapterBusy && !r.adapterInstalling) this.runAdapterAction(cx, "update", r.id);
-              },
-              { busy: isBusyThis, disabled: Boolean(this.adapterBusy) },
-            ),
-          );
+          const fb = r.adapterFeedback;
+          // Only show a per-row Update button when an update is actually available, in progress, or failed;
+          // when already up to date, stay quiet so users aren't misled into thinking an update is pending.
+          if (isBusyThis || fb?.action === "failed" || r.adapterHasUpdate) {
+            const updateLabel = isBusyThis
+              ? this.tr("Updating…", "更新中…")
+              : fb?.action === "failed"
+                ? this.tr("Retry Update", "重试更新")
+                : this.tr(`Update v${r.adapter.latest_version}`, `更新至 v${r.adapter.latest_version}`);
+            const updateTip = fb?.action === "failed"
+              ? fb.error || this.tr("Retry ACP adapter update", "重试更新 ACP 适配器")
+              : this.tr(
+                  `Update managed ACP adapter from v${r.adapter.version} to v${r.adapter.latest_version}`,
+                  `将托管 ACP 适配器从 v${r.adapter.version} 更新至 v${r.adapter.latest_version}`,
+                );
+            btns.push(
+              actionBtn(
+                `st-ag-adapter-act-${r.id}`,
+                updateLabel,
+                (_e, cx) => {
+                  if (!this.adapterBusy && !r.adapterInstalling) this.runAdapterAction(cx, "update", r.id);
+                },
+                {
+                  primary: Boolean(r.adapterHasUpdate && fb?.action !== "failed"),
+                  danger: fb?.action === "failed",
+                  busy: isBusyThis,
+                  disabled: Boolean(this.adapterBusy),
+                  tooltip: updateTip,
+                },
+              ),
+            );
+          }
         }
         return btns;
       }
@@ -7383,6 +7640,19 @@ export default class Settings extends View {
                       ),
                     ),
                   )
+                  .when(updatableAdapterRows.length > 0, (el) =>
+                    el.child(
+                      pill(
+                        this.tr(
+                          `${updatableAdapterRows.length} ACP Update${updatableAdapterRows.length > 1 ? "s" : ""}`,
+                          `${updatableAdapterRows.length} 个 ACP 可更新`,
+                        ),
+                        t.accent,
+                        alpha(t.accent, "16") ?? t.background,
+                        alpha(t.accent, "48") ?? t.border,
+                      ),
+                    ),
+                  )
                   .when(issues.length > 0, (el) =>
                     el.child(
                       div()
@@ -7455,12 +7725,16 @@ export default class Settings extends View {
                         "st-dr-adapter-install",
                         this.adapterBusy === "install"
                           ? this.tr("Installing…", "安装中…")
-                          : this.tr(`Install Missing ACP (${missingAdapterRows.length})`, `一键安装缺失 ACP (${missingAdapterRows.length})`),
+                          : this.tr(`Install Missing ACP (${missingAdapterRows.length})`, `安装缺失 ACP (${missingAdapterRows.length})`),
                         (_e, cx) => this.runAdapterAction(cx, "install"),
                         {
                           primary: true,
                           busy: this.adapterBusy === "install",
                           disabled: Boolean(this.adapterBusy),
+                          tooltip: this.tr(
+                            `Install managed ACP adapters for detected CLIs: ${missingAdapterRows.map((r) => r.acpCommand || r.id).join(", ")}`,
+                            `为已检测到的 CLI 安装缺失的托管 ACP 适配器：${missingAdapterRows.map((r) => r.acpCommand || r.id).join("、")}`,
+                          ),
                         },
                       ),
                     ),
@@ -7470,27 +7744,55 @@ export default class Settings extends View {
                       actionBtn(
                         "st-ag-adapter-install-all",
                         this.adapterBusy === "install-all"
-                          ? this.tr("Installing…", "安装中…")
-                          : this.tr("Install All ACP Adapters", "一键安装全部 ACP"),
+                          ? this.tr("Downloading…", "下载中…")
+                          : this.tr(`Download Other ACP (${anyMissingAdapterRows.length})`, `按需下载其余 ACP (${anyMissingAdapterRows.length})`),
                         (_e, cx) => this.runAdapterAction(cx, "install-all"),
                         {
                           busy: this.adapterBusy === "install-all",
                           disabled: Boolean(this.adapterBusy),
+                          tooltip: this.tr(
+                            `Optional: pre-download remaining managed ACP adapters (${anyMissingAdapterRows.map((r) => r.acpCommand || r.id).join(", ")}). Not required unless you use them.`,
+                            `可选：预先下载尚未安装的其余托管 ACP 适配器（${anyMissingAdapterRows.map((r) => r.acpCommand || r.id).join("、")}），未使用的智能体无需提前下载。`,
+                          ),
                         },
                       ),
                     ),
                   )
-                  .when(managedInstalledRows.length > 0, (el) =>
+                  .when(updatableAdapterRows.length > 0, (el) =>
                     el.child(
                       actionBtn(
                         "st-dr-adapter-update",
                         this.adapterBusy === "update"
                           ? this.tr("Updating…", "更新中…")
-                          : this.tr("Update ACP", "更新全部 ACP"),
+                          : this.tr(`Update Available ACP (${updatableAdapterRows.length})`, `更新可用 ACP (${updatableAdapterRows.length})`),
                         (_e, cx) => this.runAdapterAction(cx, "update"),
                         {
+                          primary: true,
                           busy: this.adapterBusy === "update",
                           disabled: Boolean(this.adapterBusy),
+                          tooltip: updatableAdapterRows
+                            .map((u) => `${u.name} v${u.adapter?.version ?? "?"} → v${u.adapter?.latest_version ?? "?"}`)
+                            .join(" · "),
+                        },
+                      ),
+                    ),
+                  )
+                  .when(updatableAdapterRows.length === 0 && managedInstalledRows.length > 0, (el) =>
+                    el.child(
+                      actionBtn(
+                        "st-dr-adapter-check",
+                        this.adapterBusy === "check"
+                          ? this.tr("Checking…", "检查更新中…")
+                          : this.tr("Check ACP Updates", "检查 ACP 更新"),
+                        (_e, cx) => this.checkAdapterUpdates(cx),
+                        {
+                          icon: "refresh",
+                          busy: this.adapterBusy === "check",
+                          disabled: Boolean(this.adapterBusy),
+                          tooltip: this.tr(
+                            "Check official ACP Registry for newer managed adapter versions without re-downloading up-to-date adapters",
+                            "检查官方 ACP Registry 是否有托管适配器新版本（仅拉取版本清单，不会重复下载已是最新的适配器）",
+                          ),
                         },
                       ),
                     ),
@@ -9499,9 +9801,9 @@ export default class Settings extends View {
         "请按以下步骤安全执行：",
         "1. 若上方有报错（如网络代理、TLS/证书、权限、GitHub 访问受限等），先排查原因并选择可用方式（如检查环境变量代理、`gh release`、GitHub API 或 `curl`）查询 https://github.com/herdr2/herdr2/releases 上的最新版本与 `ota-latest` 清单（`app-latest.json`、`core-latest.json`）。",
         "2. 检查本机 `herdr2` 与 `herdr2-core`（`h2`）当前的安装路径与安装方式（如 Linux `.deb` `/opt/herdr2` 或 `~/.local/share/herdr2`、`~/.local/bin/h2`；macOS `Herdr2.app` / Homebrew；Windows `%LOCALAPPDATA%\\Programs\\herdr2` 与 `%LOCALAPPDATA%\\Programs\\h2`）。",
-        "3. 从 GitHub Releases 下载与本机系统/架构匹配的最新压缩包/安装包并校验 SHA-256；先用 `h2 update --from <file>`（或 `h2 server restart`）无中断更新本机 `herdr2-core`，再在磁盘上安全替换/安装 `herdr2` 桌面端文件（如需管理员密码/sudo 请清晰提示或引导）。",
+        "3. 从 GitHub Releases 下载与本机系统/架构匹配的最新压缩包/安装包并校验 SHA-256；先用 `h2 update --from <file>`（或 `h2 server restart`）无中断更新本机 `herdr2-core`，并运行 `h2 skill sync` 同步更新本机已安装的配套 Skill，再在磁盘上安全替换/安装 `herdr2` 桌面端文件（如需管理员密码/sudo 请清晰提示或引导）。",
         ...(remoteSummaryLines.length > 0
-          ? ["4. 本机 `herdr2-core` 更新完成后，对可达的 SSH 远程主机执行 `h2 machine update <主机名>` 同步更新，并报告不可达主机的 `needs_update` 原因。"]
+          ? ["4. 本机 `herdr2-core` 更新完成后，对可达的 SSH 远程主机执行 `h2 machine update <主机名>` 同步更新（会同步刷新远端已安装的配套 Skill），并报告不可达主机的 `needs_update` 原因。"]
           : []),
         `${remoteSummaryLines.length > 0 ? "5" : "4"}. 最后运行 \`herdr2 --version\`、\`h2 --version\`、\`h2 server status\`${remoteSummaryLines.length > 0 ? " 与 `h2 machine ls`" : ""} 验证更新结果；全部验证通过后再提示我重启 Herdr2 桌面窗口以加载新版本界面。`,
       ].join("\n");
@@ -9527,9 +9829,9 @@ export default class Settings extends View {
       "Please follow these steps:",
       "1. If there are errors above (proxy, TLS, permissions, GitHub connectivity), diagnose them and fetch the latest release metadata from https://github.com/herdr2/herdr2/releases (including `ota-latest` manifests `app-latest.json` / `core-latest.json`, GitHub API, or `gh release`).",
       "2. Inspect how `herdr2` and `herdr2-core` (`h2`) are currently installed on this machine (e.g. `/opt/herdr2` `.deb` vs `~/.local/share/herdr2` & `~/.local/bin/h2`, macOS `Herdr2.app`/Homebrew, Windows `%LOCALAPPDATA%\\Programs\\herdr2` & `%LOCALAPPDATA%\\Programs\\h2`).",
-      "3. Download the matching OS/architecture release from GitHub, verify SHA-256, update local `herdr2-core` safely via `h2 update --from <file>` / `h2 server restart`, and update local `herdr2` files on disk without restarting the GUI mid-update (prompt clearly if elevation/sudo is needed).",
+      "3. Download the matching OS/architecture release from GitHub, verify SHA-256, update local `herdr2-core` safely via `h2 update --from <file>` / `h2 server restart`, run `h2 skill sync` to refresh already-installed companion skills, and update local `herdr2` files on disk without restarting the GUI mid-update (prompt clearly if elevation/sudo is needed).",
       ...(remoteSummaryLines.length > 0
-        ? ["4. After local `herdr2-core` is updated, sync reachable SSH remote hosts via `h2 machine update <name>` and report any unreachable `needs_update` hosts."]
+        ? ["4. After local `herdr2-core` is updated, sync reachable SSH remote hosts via `h2 machine update <name>` (which also refreshes already-installed remote skills) and report any unreachable `needs_update` hosts."]
         : []),
       `${remoteSummaryLines.length > 0 ? "5" : "4"}. Verify with \`herdr2 --version\`, \`h2 --version\`, \`h2 server status\`${remoteSummaryLines.length > 0 ? ", and `h2 machine ls`" : ""}, and only after everything succeeds, let me know to restart the Herdr2 window.`,
     ].join("\n");
@@ -9846,12 +10148,12 @@ export default class Settings extends View {
       lines.push(
         m.restart
           ? this.tr(
-              "Downloading runs in the background; local Herdr2 / herdr2-core and all SSH remote hosts will sync automatically while terminals stay alive.",
-              "点击更新后将在后台自动更新本机（herdr2 与 herdr2-core）并同步所有 SSH 远程主机的 herdr2-core，就绪后自动重启切换，现有终端会话不会中断。",
+              "Downloading runs in the background; local Herdr2 / herdr2-core, already-installed skills, and all SSH remote hosts will sync automatically while terminals stay alive.",
+              "点击更新后将在后台自动更新本机（herdr2 与 herdr2-core）、同步已安装的 Skill 与所有 SSH 远程主机的 herdr2-core，就绪后自动重启切换，现有终端会话不会中断。",
             )
           : this.tr(
-              "Applies live in the background and syncs all SSH remote hosts without restarting Herdr2 or interrupting terminals.",
-              "点击更新后将在后台自动免重启生效，并同步更新所有 SSH 远程主机的 herdr2-core，不会中断现有终端会话。",
+              "Applies live in the background and syncs already-installed skills and all SSH remote hosts without restarting Herdr2 or interrupting terminals.",
+              "点击更新后将在后台自动免重启生效，并同步更新已安装的 Skill 与所有 SSH 远程主机的 herdr2-core，不会中断现有终端会话。",
             ),
       );
     } else if (m.kind === "error") {

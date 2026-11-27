@@ -1,5 +1,43 @@
 # Changelog
 
+## v2.0.20
+
+#### 中文
+
+**新增功能**
+- **更新操作自动同步已安装 Skill (`h2 skill sync`)**：
+  - 新增 `h2 skill sync` 命令（支持 `--on <MACHINE>` 远程同步）及自定义安装目录持久化记录（`skill_targets.json`），仅原地更新已存在且内容发生变化的内置 Skill，不创建未安装 Agent 目录、不补写未安装子集，重复执行完全幂等。
+  - `h2 update`、`h2 machine update` / `machine add --install`、桌面端全渠道更新（Core、App、UI 热更新、外部安装包升级重启、SSH 远端同步）以及 `install.sh` / `install.ps1` 安装脚本现均自动同步已安装 Skill，无需手动进入设置页更新。
+- **托管 ACP 适配器版本检测与设置页交互重设计**：
+  - `adapter.status` 新增 `--refresh` 参数（轻量拉取 ~75 KB Registry 清单并返回 `latest_version` / `update_available`）；`adapter.update` 先比对本地 `meta.json` 版本号，已是最新时直接返回 `up_to_date`，避免重复下载 ~235 MB 大包或将健康独立二进制误降级为 npm。
+  - 「设置 → 智能体与 ACP」彻底拆分「检查 ACP 更新」与「发现新版本才展示更新按钮」：单行按实际状态区分绿色 **已是最新** / 橙色 **可更新**（仅此时出现主按钮 **更新至 vX.Y.Z**）/ 红色 **更新失败 + 重试更新**；顶部批量按钮区分 **检查 ACP 更新**、**更新可用 ACP (N)**、**安装缺失 ACP (N)** 与 **按需下载其余 ACP (N)**，所有结果均提供清晰 Toast 反馈。
+
+**问题修复**
+- **彻底修复右上角按钮点击更新报 `checksum mismatch`**：
+  - 桌面端触发更新（`start_update` / `start_ui_update`）在下载前强制拉取带 `Cache-Control: no-cache` 的实时 `*-latest.json` 清单，若遇远端滚动发布导致校验不匹配则自动等待 1 秒重拉清单并重试一次（覆盖 App、内置 Core 与 UI Bundle）。
+  - `h2 update` 与 `h2 machine update` 在 GitHub 扁平滚动 Release（`ota-latest`）上始终以 `core-latest.json` 为准，避免读取已被新归档覆盖的历史 `core-<v>-manifest.json` 并在校验不匹配时自动重试。
+  - CI 发布工作流新增共享 `herdr2-ota-publish` 并发串行锁，正式版 Tag 提交自动跳过重复的 `ota-update.yml` 发布，并将 `gh release upload` 调整为先上传压缩包与安装脚本、最后上传 `*-latest.json` 清单，消除发布窗口期的半更新竞态。
+- **对齐 ACP 适配器前端超时并修复错误行重装参数**：前端 `adapter.install` / `adapter.update` 超时由 240s 提升至 600s，并修复异常行点击「重装」未传递 `--force` 的问题。
+
+---
+
+#### English
+
+**New Features**
+- **Automatic Skill Sync During Updates (`h2 skill sync`)**:
+  - Added `h2 skill sync` (with `--on <MACHINE>` remote support) and persistent custom target tracking (`skill_targets.json`) to idempotently update only already-installed bundled Skills whose contents changed, without creating directories for uninstalled agents or adding uninstalled subsets.
+  - Wired automatic Skill sync into `h2 update`, `h2 machine update` / `machine add --install`, all desktop app update channels (Core, App, UI hot-update, post-installer relaunch, SSH remote sync), and `install.sh` / `install.ps1` installers so users no longer need to update Skills manually in Settings.
+- **ACP Adapter Version Checking & Settings UI Redesign**:
+  - Added `adapter.status --refresh` to fetch the lightweight ~75 KB Registry manifest (`latest_version`, `update_available`) without downloading archives, and updated `adapter.update` to compare local `meta.json` versions first—returning `up_to_date` when current instead of re-downloading ~235 MB packages or downgrading healthy standalone binaries to npm.
+  - Redesigned **Settings → Agents & ACP** to separate **Check ACP Updates** from actual upgrade actions: rows now show **Up to date** (no misleading update button), **Update available** (with **Update to vX.Y.Z**), or **Update failed** (inline error + **Retry**); top batch actions distinguish **Check ACP Updates**, **Update Available ACP (N)**, **Install Missing ACP (N)**, and optional **Download Remaining ACP (N)** with clear toast feedback.
+
+**Bug Fixes**
+- **Fixed `checksum mismatch` When Updating from the Top-Right Update Button**:
+  - Forced desktop updates (`start_update` / `start_ui_update`) to fetch fresh `*-latest.json` manifests with `Cache-Control: no-cache` before downloading, with an automatic 1-second refresh-and-retry on transient rolling-release checksum mismatches across App, bundled Core, and UI Bundle downloads.
+  - Fixed `h2 update` and `h2 machine update` on flat rolling GitHub `ota-latest` releases to always resolve from `core-latest.json` (preventing stale historical `core-<v>-manifest.json` hashes from mismatching rolled archives) and retry once on transient checksum mismatches.
+  - Added a shared `herdr2-ota-publish` CI concurrency lock across `ota-update.yml` and `release.yml`, skipped duplicate `ota-update.yml` runs on version-tagged release commits, and ordered `gh release upload` to publish archives and scripts before `*-latest.json` manifests.
+- **Aligned ACP Adapter UI Timeouts & Reinstall Flag**: Raised frontend `adapter.install` / `adapter.update` timeouts from 240s to 600s and fixed missing `--force` when clicking **Reinstall** on failed adapter rows.
+
 ## v2.0.19
 
 #### 中文

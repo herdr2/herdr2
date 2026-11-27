@@ -201,6 +201,9 @@ jobs:
   publish:
     needs: [prepare, build]
     runs-on: ubuntu-latest
+    concurrency:
+      group: herdr2-ota-publish
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
         with:
@@ -262,8 +265,20 @@ jobs:
             gh release create "$TAG" dist/release-assets/* --title "Herdr2 $TAG" --notes-file dist/release-notes.md
           fi
 
-          # Sync rolling OTA channel
+          # Sync rolling OTA channel (upload archives & install scripts BEFORE *-latest.json manifests
+          # so clients polling during publish never read a new SHA-256 while the archive is still uploading)
           if ! gh release view "$OTA_TAG" >/dev/null 2>&1; then
             gh release create "$OTA_TAG" --title "Herdr2 OTA Channel (Rolling)" --notes "Rolling OTA hot-update channel." --prerelease
           fi
-          gh release upload "$OTA_TAG" dist/ota-assets/* --clobber
+          shopt -s nullglob
+          gh release upload "$OTA_TAG" \
+            dist/ota-assets/herdr2-* \
+            dist/ota-assets/app-install.* \
+            dist/ota-assets/core-install.* \
+            dist/ota-assets/core-*-manifest.json \
+            --clobber
+          gh release upload "$OTA_TAG" \
+            dist/ota-assets/app-latest.json \
+            dist/ota-assets/core-latest.json \
+            dist/ota-assets/ui-latest.json \
+            --clobber

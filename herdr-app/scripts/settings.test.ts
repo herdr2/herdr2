@@ -334,7 +334,7 @@ test("aiConfigureDroveRoles probes agents & models before calling roles-ai-confi
   view.aiConfigureDroveRoles("all", cx);
   await spawned;
 
-  expect(order).toEqual(["drove probe --refresh", "adapter status", "drove roles-ai-config:all"]);
+  expect(order).toEqual(["drove probe --refresh", "adapter status --refresh", "drove roles-ai-config:all"]);
   expect(view.droveAiConfigResult?.ok).toBe(true);
   expect(view.droveAiConfigResult?.probedRefreshed).toBe(true);
   expect(view.droveAiConfiguring).toBe(false);
@@ -382,7 +382,7 @@ test("aiConfigureDroveRoles awaits in-flight probe instead of running a duplicat
   releaseProbe();
   await Promise.all(pending);
 
-  expect(order).toEqual(["drove probe --refresh", "adapter status", "drove roles-ai-config"]);
+  expect(order).toEqual(["drove probe --refresh", "adapter status --refresh", "drove roles-ai-config"]);
   expect(view.droveAiConfigResult?.probedRefreshed).toBe(true);
 });
 
@@ -744,8 +744,8 @@ test("runDroveProbe passes an extended 180s timeout to hc so cold-start ACP prob
       opts: { timeout: 180000 },
     },
     {
-      args: ["adapter", "status", "--on", "gpu-box", "--json"],
-      opts: { timeout: 15000 },
+      args: ["adapter", "status", "--refresh", "--on", "gpu-box", "--json"],
+      opts: { timeout: 30000 },
     },
   ]);
 });
@@ -1539,7 +1539,7 @@ test("Agents & ACP lists all supported agents, distinguishes npx fallback from i
   await Promise.all(pending.splice(0));
   expect(knownCalls[0]).toEqual({ refresh: true });
   expect(hcCalls[0]).toEqual(["drove", "probe", "--refresh", "--json"]);
-  expect(hcCalls[1]).toEqual(["adapter", "status", "--json"]);
+  expect(hcCalls[1]).toEqual(["adapter", "status", "--refresh", "--json"]);
 
   // 2. All supported agents are included by default, and codex with npx_fallback is NOT marked as installed ACP.
   const rows = view.detectedAgentRows();

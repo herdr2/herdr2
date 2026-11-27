@@ -271,6 +271,45 @@ pub fn restart() -> Result<(), String> {
     Err(if msg.is_empty() { "h2 server restart failed".into() } else { msg })
 }
 
+/// Summary returned by `h2 skill sync --json`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SkillSyncSummary {
+    pub updated_count: usize,
+    pub targets: Vec<String>,
+}
+
+fn parse_skill_sync_json(raw: &[u8]) -> Result<SkillSyncSummary, String> {
+    let val: serde_json::Value = serde_json::from_slice(raw).map_err(|e| format!("invalid skill sync JSON: {e}"))?;
+    let updated_count = val.get("updatedCount").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+    let targets = val
+        .get("targets")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|t| t.get("agent").and_then(|v| v.as_str()).map(str::to_owned))
+        .collect();
+    Ok(SkillSyncSummary { updated_count, targets })
+}
+
+/// Updates all already-installed bundled Herdr2 companion skills via `h2 skill sync --json`.
+pub fn sync_skills() -> Result<SkillSyncSummary, String> {
+    let out = crate::spawn::command(path())
+        .args(["skill", "sync", "--json"])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("cannot run h2 skill sync: {e}"))?;
+    if !out.status.success() {
+        let err: serde_json::Value = serde_json::from_slice(&out.stderr).unwrap_or_default();
+        let msg = err
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+            .unwrap_or_else(|| String::from_utf8_lossy(&out.stderr).trim().to_owned());
+        return Err(if msg.is_empty() { "h2 skill sync failed".into() } else { msg });
+    }
+    parse_skill_sync_json(&out.stdout)
+}
+
 /// Updates the core to its latest release (`hc update`: same generation only,
 /// terminals kept). Ok: the version it runs now. Err: what it said, e.g.
 /// "belongs to Homebrew: brew upgrade herdr-core".
@@ -741,5 +780,22 @@ mod tests {
         assert_eq!(parsed[1].version.as_deref(), Some("2.0.9"));
         assert_eq!(parsed[1].state, "unreachable");
         assert_eq!(parsed[1].why.as_deref(), Some("connection refused"));
+    }
+
+    #[test]
+    fn parse_skill_sync_json_extracts_count_and_targets() {
+        let raw = serde_json::json!({
+            "ok": true,
+            "updatedCount": 3,
+            "upToDateCount": 1,
+            "targets": [
+                { "agent": "claude", "target": "/home/u/.claude/skills", "updatedSkills": ["herdr2", "drove"] },
+                { "agent": "custom", "target": "/home/u/custom", "updatedSkills": ["drove-add"] }
+            ]
+        })
+        .to_string();
+        let parsed = parse_skill_sync_json(raw.as_bytes()).unwrap();
+        assert_eq!(parsed.updated_count, 3);
+        assert_eq!(parsed.targets, vec!["claude".to_owned(), "custom".to_owned()]);
     }
 }

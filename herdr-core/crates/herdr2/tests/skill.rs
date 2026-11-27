@@ -274,4 +274,65 @@ mod skill_cli {
         assert!(rohan.root.join(".claude/skills/drove-setup/SKILL.md").exists());
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
+
+    #[test]
+    fn skill_sync_updates_only_already_installed_skills_locally_and_remotely() {
+        let mut s = Session::new();
+        s.env.push(isolated_path_env());
+
+        // 1. Detected agent (.cursor) with NO installed skills must remain untouched by `skill sync`.
+        std::fs::create_dir_all(s.root.join(".cursor")).unwrap();
+        let sync0 = s.json(&["skill", "sync"]);
+        assert_eq!(sync0["ok"], true);
+        assert_eq!(sync0["updatedCount"], 0);
+        assert_eq!(sync0["upToDateCount"], 0);
+        assert!(!s.root.join(".cursor/skills").exists());
+
+        // 2. Install subset into known agent (.claude) and custom dir, plus manual stale skill in ~/.agents/skills.
+        std::fs::create_dir_all(s.root.join(".claude")).unwrap();
+        s.json(&["skill", "install", "--agent", "claude", "--skills", "herdr2,drove"]);
+        let custom_dir = s.root.join("my-custom-skills");
+        s.json(&["skill", "install", "--target", custom_dir.to_str().unwrap(), "--skills", "drove-setup"]);
+        std::fs::create_dir_all(s.root.join(".agents/skills/herdr2")).unwrap();
+
+        // Make one skill stale in each installed location.
+        std::fs::write(s.root.join(".claude/skills/herdr2/SKILL.md"), "stale claude herdr2").unwrap();
+        std::fs::write(custom_dir.join("drove-setup/SKILL.md"), "stale custom drove-setup").unwrap();
+        std::fs::write(s.root.join(".agents/skills/herdr2/SKILL.md"), "stale agents herdr2").unwrap();
+
+        // 3. `skill sync` refreshes only stale already-installed skills and does NOT create missing skills/agents.
+        let sync1 = s.json(&["skill", "sync"]);
+        assert_eq!(sync1["ok"], true, "sync1: {sync1}");
+        assert_eq!(sync1["updatedCount"], 3, "sync1: {sync1}");
+        assert_eq!(sync1["upToDateCount"], 1, "drove in .claude was already up to date: {sync1}");
+        assert!(std::fs::read_to_string(s.root.join(".claude/skills/herdr2/SKILL.md")).unwrap().contains("name: herdr2"));
+        assert!(std::fs::read_to_string(custom_dir.join("drove-setup/SKILL.md")).unwrap().contains("name: drove-setup"));
+        assert!(std::fs::read_to_string(s.root.join(".agents/skills/herdr2/SKILL.md")).unwrap().contains("name: herdr2"));
+        // Uninstalled skills & agents remain untouched.
+        assert!(!s.root.join(".claude/skills/drove-add/SKILL.md").exists());
+        assert!(!custom_dir.join("herdr2/SKILL.md").exists());
+        assert!(!s.root.join(".cursor/skills").exists());
+
+        // 4. Second sync is an idempotent no-op.
+        let sync2 = s.json(&["skill", "sync"]);
+        assert_eq!(sync2["updatedCount"], 0, "sync2: {sync2}");
+        assert_eq!(sync2["upToDateCount"], 4, "sync2: {sync2}");
+
+        // 5. Remote `h2 skill sync --on <machine>` refreshes stale installed skills on the remote machine.
+        let rohan = Session::new();
+        let mut hub = Session::new();
+        hub.env.push(fake_ssh(&hub, &[("rohan", &rohan)]));
+        hub.json(&["machine", "add", "rohan"]);
+        wait_until("rohan connected", || hub.json(&["machine", "ls"])["machines"][0]["state"] == "connected");
+        std::fs::create_dir_all(rohan.root.join(".codex/skills/herdr2")).unwrap();
+        std::fs::write(rohan.root.join(".codex/skills/herdr2/SKILL.md"), "stale remote herdr2").unwrap();
+        std::fs::create_dir_all(rohan.root.join(".cursor")).unwrap();
+
+        let rsync = hub.json(&["skill", "sync", "--on", "rohan"]);
+        assert_eq!(rsync["ok"], true, "rsync: {rsync}");
+        assert_eq!(rsync["updatedCount"], 1, "rsync: {rsync}");
+        assert!(std::fs::read_to_string(rohan.root.join(".codex/skills/herdr2/SKILL.md")).unwrap().contains("name: herdr2"));
+        assert!(!rohan.root.join(".codex/skills/drove/SKILL.md").exists());
+        assert!(!rohan.root.join(".cursor/skills").exists());
+    }
 }

@@ -190,6 +190,39 @@ pub(super) fn sync_remote_machines(
     })
 }
 
+/// Runs `<bin> skill sync --json` using the updated binary on disk so all already-installed
+/// bundled skills are refreshed to the new build's content without installing new agents.
+pub(super) fn attach_skill_sync(bin: &std::path::Path, out: &mut Out) {
+    let Ok(output) = crate::platform::bg_command(bin)
+        .args(["--json", "skill", "sync"])
+        .stdin(std::process::Stdio::null())
+        .output()
+    else {
+        return;
+    };
+    if !output.status.success() {
+        return;
+    }
+    let Ok(reply) = serde_json::from_slice::<Value>(&output.stdout) else {
+        return;
+    };
+    let updated_count = reply["updatedCount"].as_u64().unwrap_or(0);
+    if updated_count > 0 {
+        let targets: Vec<&str> = reply["targets"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t["agent"].as_str())
+            .collect();
+        if targets.is_empty() {
+            out.human.push_str(&format!("; synced {updated_count} installed skill(s)"));
+        } else {
+            out.human.push_str(&format!("; synced {updated_count} installed skill(s) ({})", targets.join(", ")));
+        }
+    }
+    out.json["skills"] = reply;
+}
+
 /// Attaches remote SSH machine sync results to `h2 update`'s output.
 pub(super) fn attach_machine_sync(paths: &Paths, bin: &std::path::Path, out: &mut Out, force: bool) {
     let target = out.json["now"].as_str().unwrap_or(env!("CARGO_PKG_VERSION"));

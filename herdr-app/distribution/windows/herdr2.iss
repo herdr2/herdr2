@@ -7,7 +7,7 @@
 ;   iscc /DMyAppVersion=0.2.0 /DAppStageDir=dist\stage-app /DCoreStageDir=dist\stage-core /DOutputDir=dist\installers herdr-app\distribution\windows\herdr2.iss
 
 #ifndef MyAppVersion
-  #define MyAppVersion "2.0.19"
+  #define MyAppVersion "2.0.20"
 #endif
 #ifndef AppStageDir
   #define AppStageDir "..\..\dist\stage-app"

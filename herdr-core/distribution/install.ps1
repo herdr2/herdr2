@@ -83,6 +83,7 @@ try {
     } catch {
         Copy-Item -Force $exe $h2Exe
     }
+    try { & $exe skill sync 2>$null | Out-Null } catch {}
 
     $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey("Environment", $true)
     $raw = [string]$key.GetValue("Path", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)

@@ -151,6 +151,11 @@ fn main() {
                     {
                         drop(core);
                         let _ = core_bin::restart();
+                        let _ = std::thread::Builder::new()
+                            .name("herdr2-skill-sync".into())
+                            .spawn(|| {
+                                let _ = core_bin::sync_skills();
+                            });
                         match hc::Core::connect() {
                             Ok(restarted) => hc::check(&restarted.hello).map(|()| restarted).map_err(setup::Need::Fix),
                             Err(e) => {

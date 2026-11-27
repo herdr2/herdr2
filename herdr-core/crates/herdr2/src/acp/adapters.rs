@@ -126,6 +126,10 @@ pub struct AdapterStatusItem {
     pub path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_version: Option<String>,
+    #[serde(default)]
+    pub update_available: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -143,6 +147,10 @@ pub struct AdapterStatusResult {
     pub registry_url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub custom_registry_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_checked_at_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_error: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub default_permissions: String,
     #[serde(default = "default_true")]
@@ -159,6 +167,8 @@ impl Default for AdapterStatusResult {
             auto_install: true,
             registry_url: String::new(),
             custom_registry_url: None,
+            registry_checked_at_ms: None,
+            registry_error: None,
             default_permissions: String::new(),
             inject_mcp: true,
             config_path: String::new(),
@@ -170,7 +180,7 @@ impl Default for AdapterStatusResult {
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AdapterInstallItemResult {
     pub preset_id: String,
-    /// Outcome: `installed`, `updated`, `already_ready`, `skipped`, or `failed`.
+    /// Outcome: `installed`, `updated`, `up_to_date`, `already_ready`, `skipped`, or `failed`.
     pub action: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub method: Option<String>,
@@ -274,21 +284,52 @@ impl AdapterManager {
 
         let adapters_dir = adapters_root_in_env(env);
         let registry_url = resolve_registry_url(env, &cfg);
-        let _ = self.install_locked(spec, &adapters_dir, &registry_url, env, false).await;
+        let _ = self.install_locked(spec, &adapters_dir, &registry_url, env, false, None).await;
     }
 
     /// Collects current availability, installation source, and in-flight state for all managed adapters.
     pub async fn status(&self, core: &Core) -> AdapterStatusResult {
+        self.status_with_refresh(core, false).await
+    }
+
+    /// Collects managed adapter status, optionally refreshing the official ACP Registry index first.
+    pub async fn status_with_refresh(&self, core: &Core, refresh_registry: bool) -> AdapterStatusResult {
         let cfg = crate::config::load(&core.paths.config).unwrap_or_default();
         let env = crate::platform::program_env().await;
-        let mut res = self.status_in_env(&cfg, &env);
+        let (registry, registry_error) = if refresh_registry {
+            let dir = adapters_root_in_env(&env);
+            let url = resolve_registry_url(&env, &cfg);
+            let env_cloned = env.clone();
+            let (idx, _fresh, err) = tokio::task::spawn_blocking(move || {
+                fetch_registry_index(&dir, &url, &env_cloned, true)
+            })
+            .await
+            .unwrap_or_else(|e| (None, false, Some(format!("registry refresh task failed: {e}"))));
+            (idx, err)
+        } else {
+            (None, None)
+        };
+        let mut res = self.status_in_env_with_registry(&cfg, &env, registry.as_ref(), registry_error);
         res.config_path = core.paths.config.display().to_string();
         res
     }
 
     pub fn status_in_env(&self, cfg: &crate::config::Config, env: &BTreeMap<String, String>) -> AdapterStatusResult {
+        self.status_in_env_with_registry(cfg, env, None, None)
+    }
+
+    fn status_in_env_with_registry(
+        &self,
+        cfg: &crate::config::Config,
+        env: &BTreeMap<String, String>,
+        preloaded_registry: Option<&RegistryIndex>,
+        registry_error: Option<String>,
+    ) -> AdapterStatusResult {
         let adapters_dir = adapters_root_in_env(env);
         let registry_url = resolve_registry_url(env, cfg);
+        let cached_registry = if preloaded_registry.is_some() { None } else { read_cached_registry(&adapters_dir) };
+        let registry = preloaded_registry.or(cached_registry.as_ref());
+        let registry_checked_at_ms = cached_registry_mtime_ms(&adapters_dir);
         let path_override = env_ignore_case(env, "PATH");
         let pathext_override = env_ignore_case(env, "PATHEXT");
         let npx_available = resolve_non_shim_binary_in_path("npx", path_override, pathext_override).is_some();
@@ -299,6 +340,12 @@ impl AdapterManager {
                 .companion_cli
                 .is_some_and(|cli| resolve_non_shim_binary_in_path(cli, path_override, pathext_override).is_some());
             let live = self.live_state(spec.preset_id);
+            let latest_version = registry
+                .and_then(|idx| idx.agents.iter().find(|a| a.id == spec.registry_id))
+                .and_then(|a| a.version.as_deref())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from);
 
             let (installed, source, path, version, method) = if let Some(custom) = cfg.agents.get(spec.preset_id)
                 && let Some(exe) = custom.first()
@@ -335,6 +382,12 @@ impl AdapterManager {
                 "missing".to_string()
             };
 
+            let update_available = source == "managed"
+                && installed
+                && version.is_some()
+                && latest_version.is_some()
+                && !versions_match(version.as_deref(), latest_version.as_deref());
+
             items.push(AdapterStatusItem {
                 preset_id: spec.preset_id.into(),
                 registry_id: spec.registry_id.into(),
@@ -346,6 +399,8 @@ impl AdapterManager {
                 state,
                 path,
                 version,
+                latest_version,
+                update_available,
                 method,
                 // Keep already-working adapters clean in status; failed manual updates still surface
                 // their detailed error in the `adapter.update` / `adapter.install` RPC response.
@@ -363,6 +418,8 @@ impl AdapterManager {
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(String::from),
+            registry_checked_at_ms,
+            registry_error,
             default_permissions: cfg.default_permissions.unwrap_or_default().as_str().into(),
             inject_mcp: cfg.inject_mcp(),
             config_path: String::new(),
@@ -424,42 +481,118 @@ impl AdapterManager {
                 .collect()
         };
 
+        // Refresh the official ACP Registry once per `adapter.update` batch so we can compare
+        // installed versions before re-downloading large binary archives (~235MB).
+        let (preloaded_registry, registry_is_fresh, registry_err) = if refresh_registry && !selected.is_empty() {
+            let dir = adapters_dir.clone();
+            let url = registry_url.clone();
+            let env_cloned = env.clone();
+            let (idx, fresh, err) = tokio::task::spawn_blocking(move || {
+                fetch_registry_index(&dir, &url, &env_cloned, true)
+            })
+            .await
+            .unwrap_or_else(|e| (None, false, Some(format!("registry refresh task failed: {e}"))));
+            (idx.map(Arc::new), fresh, err)
+        } else {
+            (None, false, None)
+        };
+
         let mut results = Vec::with_capacity(selected.len());
         let mut any_changed = false;
         for spec in selected {
             let lock = self.lock_for(spec.preset_id);
             let _guard = lock.lock().await;
 
+            let existing_managed = resolve_managed_with_meta(&adapters_dir, spec, pathext_override);
             if !force {
-                if let Some(found) = resolve_non_shim_binary_in_path(spec.binary_name, path_override, pathext_override)
-                {
-                    results.push(AdapterInstallItemResult {
-                        preset_id: spec.preset_id.into(),
-                        action: "already_ready".into(),
-                        method: Some("path".into()),
-                        version: None,
-                        path: Some(found.display().to_string()),
-                        error: None,
-                    });
-                    continue;
-                }
-                if !refresh_registry
-                    && let Some((found, meta)) = resolve_managed_with_meta(&adapters_dir, spec, pathext_override)
-                {
-                    results.push(AdapterInstallItemResult {
-                        preset_id: spec.preset_id.into(),
-                        action: "already_ready".into(),
-                        method: meta.as_ref().map(|m| m.method.clone()),
-                        version: meta.as_ref().and_then(|m| m.version.clone()),
-                        path: Some(found.display().to_string()),
-                        error: None,
-                    });
-                    continue;
+                if refresh_registry {
+                    if let Some((found, meta)) = &existing_managed {
+                        if !registry_is_fresh {
+                            let err_msg = registry_err
+                                .clone()
+                                .unwrap_or_else(|| format!("cannot refresh ACP registry ({registry_url})"));
+                            self.set_installing(spec.preset_id, false, Some(err_msg.clone()));
+                            results.push(AdapterInstallItemResult {
+                                preset_id: spec.preset_id.into(),
+                                action: "failed".into(),
+                                method: None,
+                                version: meta.as_ref().and_then(|m| m.version.clone()),
+                                path: Some(found.display().to_string()),
+                                error: Some(err_msg),
+                            });
+                            continue;
+                        }
+                        let reg_ver = preloaded_registry
+                            .as_ref()
+                            .and_then(|idx| idx.agents.iter().find(|a| a.id == spec.registry_id))
+                            .and_then(|a| a.version.as_deref());
+                        if versions_match(meta.as_ref().and_then(|m| m.version.as_deref()), reg_ver) {
+                            results.push(AdapterInstallItemResult {
+                                preset_id: spec.preset_id.into(),
+                                action: "up_to_date".into(),
+                                method: meta.as_ref().map(|m| m.method.clone()),
+                                version: meta
+                                    .as_ref()
+                                    .and_then(|m| m.version.clone())
+                                    .or_else(|| reg_ver.map(String::from)),
+                                path: Some(found.display().to_string()),
+                                error: None,
+                            });
+                            continue;
+                        }
+                    } else if let Some(found) =
+                        resolve_non_shim_binary_in_path(spec.binary_name, path_override, pathext_override)
+                    {
+                        results.push(AdapterInstallItemResult {
+                            preset_id: spec.preset_id.into(),
+                            action: "already_ready".into(),
+                            method: Some("path".into()),
+                            version: None,
+                            path: Some(found.display().to_string()),
+                            error: None,
+                        });
+                        continue;
+                    }
+                } else {
+                    if let Some(found) =
+                        resolve_non_shim_binary_in_path(spec.binary_name, path_override, pathext_override)
+                    {
+                        results.push(AdapterInstallItemResult {
+                            preset_id: spec.preset_id.into(),
+                            action: "already_ready".into(),
+                            method: Some("path".into()),
+                            version: None,
+                            path: Some(found.display().to_string()),
+                            error: None,
+                        });
+                        continue;
+                    }
+                    if let Some((found, meta)) = &existing_managed {
+                        results.push(AdapterInstallItemResult {
+                            preset_id: spec.preset_id.into(),
+                            action: "already_ready".into(),
+                            method: meta.as_ref().map(|m| m.method.clone()),
+                            version: meta.as_ref().and_then(|m| m.version.clone()),
+                            path: Some(found.display().to_string()),
+                            error: None,
+                        });
+                        continue;
+                    }
                 }
             }
 
-            let had_managed = resolve_managed_with_meta(&adapters_dir, spec, pathext_override).is_some();
-            match self.install_locked(spec, &adapters_dir, &registry_url, &env, refresh_registry).await {
+            let had_managed = existing_managed.is_some();
+            match self
+                .install_locked(
+                    spec,
+                    &adapters_dir,
+                    &registry_url,
+                    &env,
+                    refresh_registry && preloaded_registry.is_none(),
+                    preloaded_registry.clone(),
+                )
+                .await
+            {
                 Ok((bin_path, meta)) => {
                     any_changed = true;
                     core.drove.clear_probe_error_for_agent(spec.preset_id);
@@ -499,13 +632,14 @@ impl AdapterManager {
         registry_url: &str,
         env: &BTreeMap<String, String>,
         refresh_registry: bool,
+        preloaded_registry: Option<Arc<RegistryIndex>>,
     ) -> Result<(PathBuf, InstalledMeta), String> {
         self.set_installing(spec.preset_id, true, None);
         let dir = adapters_dir.to_path_buf();
         let url = registry_url.to_string();
         let env_cloned = env.clone();
         let res = tokio::task::spawn_blocking(move || {
-            install_adapter_sync(spec, &dir, &url, &env_cloned, refresh_registry)
+            install_adapter_sync_with_registry(spec, &dir, &url, &env_cloned, refresh_registry, preloaded_registry.as_deref())
         })
         .await
         .map_err(|e| format!("adapter installer task failed: {e}"))
@@ -576,7 +710,7 @@ pub fn start_background(core: &Arc<Core>) {
                 spec.binary_name,
                 adapters_dir.display()
             );
-            match core.adapters.install_locked(spec, &adapters_dir, &registry_url, &env, false).await {
+            match core.adapters.install_locked(spec, &adapters_dir, &registry_url, &env, false, None).await {
                 Ok((bin, meta)) => {
                     any_installed = true;
                     core.drove.clear_probe_error_for_agent(spec.preset_id);
@@ -796,12 +930,39 @@ fn select_binary_target<'a>(
     None
 }
 
-fn load_registry_index(
+fn normalize_version(v: &str) -> &str {
+    let t = v.trim();
+    t.strip_prefix('v').or_else(|| t.strip_prefix('V')).unwrap_or(t)
+}
+
+fn versions_match(installed: Option<&str>, latest: Option<&str>) -> bool {
+    match (
+        installed.map(normalize_version).filter(|s| !s.is_empty()),
+        latest.map(normalize_version).filter(|s| !s.is_empty()),
+    ) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    }
+}
+
+fn read_cached_registry(adapters_dir: &Path) -> Option<RegistryIndex> {
+    let cache_path = adapters_dir.join("registry-cache.json");
+    std::fs::read(&cache_path).ok().and_then(|bytes| serde_json::from_slice::<RegistryIndex>(&bytes).ok())
+}
+
+fn cached_registry_mtime_ms(adapters_dir: &Path) -> Option<u64> {
+    let cache_path = adapters_dir.join("registry-cache.json");
+    let modified = std::fs::metadata(&cache_path).ok()?.modified().ok()?;
+    let dur = modified.duration_since(UNIX_EPOCH).ok()?;
+    u64::try_from(dur.as_millis()).ok()
+}
+
+fn fetch_registry_index(
     adapters_dir: &Path,
     registry_url: &str,
     env: &BTreeMap<String, String>,
     force_refresh: bool,
-) -> Option<RegistryIndex> {
+) -> (Option<RegistryIndex>, bool, Option<String>) {
     let cache_path = adapters_dir.join("registry-cache.json");
     if !force_refresh
         && let Ok(meta) = std::fs::metadata(&cache_path)
@@ -810,34 +971,51 @@ fn load_registry_index(
         && let Ok(bytes) = std::fs::read(&cache_path)
         && let Ok(parsed) = serde_json::from_slice::<RegistryIndex>(&bytes)
     {
-        return Some(parsed);
+        return (Some(parsed), true, None);
     }
 
-    let fetched_bytes = if let Some(local_path) = registry_url.strip_prefix("file://") {
-        std::fs::read(local_path).ok()
+    let fetched: Result<Vec<u8>, String> = if let Some(local_path) = registry_url.strip_prefix("file://") {
+        std::fs::read(local_path).map_err(|e| format!("cannot read local registry {local_path}: {e}"))
     } else if Path::new(registry_url).is_file() {
-        std::fs::read(registry_url).ok()
+        std::fs::read(registry_url).map_err(|e| format!("cannot read local registry {registry_url}: {e}"))
     } else {
         let _ = std::fs::create_dir_all(adapters_dir);
         let tmp = adapters_dir.join(format!(".registry-{}.tmp", std::process::id()));
-        let ok = curl_download(registry_url, &tmp, env, REGISTRY_TIMEOUT_SECS, false).is_ok();
-        let bytes = if ok { std::fs::read(&tmp).ok() } else { None };
+        let res = curl_download(registry_url, &tmp, env, REGISTRY_TIMEOUT_SECS, false)
+            .and_then(|()| std::fs::read(&tmp).map_err(|e| format!("cannot read downloaded registry: {e}")));
         let _ = std::fs::remove_file(&tmp);
-        bytes
+        res
     };
 
-    if let Some(bytes) = fetched_bytes
-        && let Ok(parsed) = serde_json::from_slice::<RegistryIndex>(&bytes)
-    {
-        let _ = std::fs::create_dir_all(adapters_dir);
-        let _ = crate::paths::write_atomic(&cache_path, &bytes);
-        return Some(parsed);
+    match fetched {
+        Ok(bytes) => match serde_json::from_slice::<RegistryIndex>(&bytes) {
+            Ok(parsed) => {
+                let _ = std::fs::create_dir_all(adapters_dir);
+                let _ = crate::paths::write_atomic(&cache_path, &bytes);
+                return (Some(parsed), true, None);
+            }
+            Err(e) => {
+                let err = format!("invalid ACP registry JSON from {registry_url}: {e}");
+                return (read_cached_registry(adapters_dir), false, Some(err));
+            }
+        },
+        Err(err) => {
+            // Fallback to stale cache when offline.
+            (read_cached_registry(adapters_dir), false, Some(err))
+        }
     }
-
-    // Fallback to stale cache when offline.
-    std::fs::read(&cache_path).ok().and_then(|bytes| serde_json::from_slice::<RegistryIndex>(&bytes).ok())
 }
 
+fn load_registry_index(
+    adapters_dir: &Path,
+    registry_url: &str,
+    env: &BTreeMap<String, String>,
+    force_refresh: bool,
+) -> Option<RegistryIndex> {
+    fetch_registry_index(adapters_dir, registry_url, env, force_refresh).0
+}
+
+#[cfg(test)]
 fn install_adapter_sync(
     spec: &ManagedAdapterSpec,
     adapters_dir: &Path,
@@ -845,11 +1023,27 @@ fn install_adapter_sync(
     env: &BTreeMap<String, String>,
     refresh_registry: bool,
 ) -> Result<(PathBuf, InstalledMeta), String> {
+    install_adapter_sync_with_registry(spec, adapters_dir, registry_url, env, refresh_registry, None)
+}
+
+fn install_adapter_sync_with_registry(
+    spec: &ManagedAdapterSpec,
+    adapters_dir: &Path,
+    registry_url: &str,
+    env: &BTreeMap<String, String>,
+    refresh_registry: bool,
+    preloaded_registry: Option<&RegistryIndex>,
+) -> Result<(PathBuf, InstalledMeta), String> {
     std::fs::create_dir_all(adapters_dir)
         .map_err(|e| format!("cannot create adapters directory {}: {e}", adapters_dir.display()))?;
 
-    let registry = load_registry_index(adapters_dir, registry_url, env, refresh_registry);
-    let reg_agent = registry.as_ref().and_then(|idx| idx.agents.iter().find(|a| a.id == spec.registry_id));
+    let loaded_registry = if preloaded_registry.is_some() {
+        None
+    } else {
+        load_registry_index(adapters_dir, registry_url, env, refresh_registry)
+    };
+    let registry = preloaded_registry.or(loaded_registry.as_ref());
+    let reg_agent = registry.and_then(|idx| idx.agents.iter().find(|a| a.id == spec.registry_id));
 
     let platform_keys = current_registry_platform_keys();
     let mut binary_error: Option<String> = None;
@@ -1527,6 +1721,121 @@ printf '{"name":"@agentclientprotocol/codex-acp","version":"2.12.1"}' > "$prefix
 
         // Mismatched custom binary name must not resolve to the managed adapter.
         assert_eq!(resolve_managed_binary_in_env(Some("claude"), "my-custom-claude-acp", &env), None);
+
+        // Cached registry populates latest_version and update_available without network access.
+        let reg_same = serde_json::json!({
+            "version": "1.0.0",
+            "agents": [{ "id": "claude-acp", "version": "0.112.0" }]
+        });
+        std::fs::write(adapters_dir.join("registry-cache.json"), serde_json::to_vec(&reg_same).unwrap()).unwrap();
+        let st_same = mgr.status_in_env(&crate::config::Config::default(), &env);
+        let claude_same = st_same.adapters.iter().find(|a| a.preset_id == "claude").unwrap();
+        assert_eq!(claude_same.latest_version.as_deref(), Some("0.112.0"));
+        assert!(!claude_same.update_available);
+        assert!(st_same.registry_checked_at_ms.is_some());
+
+        let reg_newer = serde_json::json!({
+            "version": "1.0.0",
+            "agents": [{ "id": "claude-acp", "version": "0.113.0" }]
+        });
+        std::fs::write(adapters_dir.join("registry-cache.json"), serde_json::to_vec(&reg_newer).unwrap()).unwrap();
+        let st_newer = mgr.status_in_env(&crate::config::Config::default(), &env);
+        let claude_newer = st_newer.adapters.iter().find(|a| a.preset_id == "claude").unwrap();
+        assert_eq!(claude_newer.latest_version.as_deref(), Some("0.113.0"));
+        assert!(claude_newer.update_available);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn versions_match_normalizes_v_prefix_and_case() {
+        assert!(versions_match(Some("0.113.0"), Some("0.113.0")));
+        assert!(versions_match(Some("v0.113.0"), Some("0.113.0")));
+        assert!(versions_match(Some("0.113.0"), Some("V0.113.0")));
+        assert!(!versions_match(Some("0.112.0"), Some("0.113.0")));
+        assert!(!versions_match(None, Some("0.113.0")));
+        assert!(!versions_match(Some("0.113.0"), None));
+        assert!(!versions_match(Some("  "), Some("0.113.0")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn adapter_update_returns_up_to_date_when_version_matches_and_updates_when_bumped() {
+        let root = temp_dir("h2-managed-update-check");
+        let src_dir = root.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let fake_bin = src_dir.join("claude-agent-acp");
+        std::fs::write(&fake_bin, "#!/bin/sh\necho v1\n").unwrap();
+
+        let archive = root.join("claude-agent-acp.tar.gz");
+        let status = std::process::Command::new("tar")
+            .args(["-czf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&src_dir)
+            .arg("claude-agent-acp")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let sha = sha256_file(&archive).expect("sha256");
+
+        let keys = current_registry_platform_keys();
+        let reg_file = root.join("registry.json");
+        let write_reg = |ver: &str, bad_archive: bool| {
+            let arch_url = if bad_archive {
+                "file:///nonexistent/must-not-be-downloaded.tar.gz".to_string()
+            } else {
+                format!("file://{}", archive.display())
+            };
+            let reg_json = serde_json::json!({
+                "version": "1.0.0",
+                "agents": [{
+                    "id": "claude-acp",
+                    "version": ver,
+                    "distribution": {
+                        "binary": {
+                            keys[0]: {
+                                "archive": arch_url,
+                                "cmd": "./claude-agent-acp",
+                                "sha256": sha
+                            }
+                        }
+                    }
+                }]
+            });
+            std::fs::write(&reg_file, serde_json::to_vec(&reg_json).unwrap()).unwrap();
+        };
+
+        let adapters_dir = root.join("adapters");
+        let env = BTreeMap::from([("HERDR2_ADAPTERS_DIR".into(), adapters_dir.display().to_string())]);
+        let reg_url = format!("file://{}", reg_file.display());
+        write_reg("0.113.0", false);
+        let spec = lookup_spec("claude").unwrap();
+        let (_, meta) = install_adapter_sync(spec, &adapters_dir, &reg_url, &env, true).unwrap();
+        assert_eq!(meta.version.as_deref(), Some("0.113.0"));
+
+        // Point archive to nonexistent file while keeping the same version:
+        // fetch_registry_index + version match must short-circuit without touching the archive.
+        write_reg("0.113.0", true);
+        let (idx, fresh, err) = fetch_registry_index(&adapters_dir, &reg_url, &env, true);
+        assert!(fresh);
+        assert!(err.is_none());
+        let reg_ver = idx
+            .as_ref()
+            .and_then(|i| i.agents.iter().find(|a| a.id == spec.registry_id))
+            .and_then(|a| a.version.as_deref());
+        let (_, existing_meta) = resolve_managed_with_meta(&adapters_dir, spec, None).unwrap();
+        assert!(versions_match(existing_meta.as_ref().and_then(|m| m.version.as_deref()), reg_ver));
+
+        // Bumping the version in the registry marks update_available=true in status_in_env.
+        write_reg("0.114.0", false);
+        let (idx2, fresh2, _) = fetch_registry_index(&adapters_dir, &reg_url, &env, true);
+        assert!(fresh2);
+        let mgr = AdapterManager::new();
+        let st = mgr.status_in_env_with_registry(&crate::config::Config::default(), &env, idx2.as_ref(), None);
+        let claude = st.adapters.iter().find(|a| a.preset_id == "claude").unwrap();
+        assert!(claude.update_available);
+        assert_eq!(claude.latest_version.as_deref(), Some("0.114.0"));
 
         let _ = std::fs::remove_dir_all(&root);
     }

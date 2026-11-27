@@ -1242,6 +1242,10 @@ fn deadline_for(core: &Core, method: &str, params: &Value) -> Duration {
         // Standalone ACP adapter archives (e.g. claude-agent-acp ~235MB) and npm installs can take several minutes.
         return config.machine_timeout() + Duration::from_secs(900);
     }
+    if method == "adapter.status" && params["refresh"] == true {
+        // Refreshing the official ACP Registry index over curl allows up to 20s.
+        return config.machine_timeout() + Duration::from_secs(30);
+    }
     if matches!(method, "drove.probe" | "drove.roles.ai_configure") {
         // Probing installed ACP agents spawns multiple cold-start handshakes (up to 60s each),
         // and AI role configuration may probe + run a reasoning completion.

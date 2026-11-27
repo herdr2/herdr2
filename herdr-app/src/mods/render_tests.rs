@@ -2929,6 +2929,38 @@ fn split_pane_names_merged_tabs_and_windows_shells(cx: &mut TestAppContext) {
     assert!(probe_err_tree.contains("st-ag-row-cli-gemini"), "Uninstalled supported agent should expose one-click CLI install button: {probe_err_tree}");
     assert!(probe_err_tree.contains("st-ag-row-ai-cursor"), "Errored agent row should expose direct AI fix button: {probe_err_tree}");
     assert!(probe_err_tree.contains("st-ag-config-card"), "ACP configuration card should render: {probe_err_tree}");
+    assert!(probe_err_tree.contains("st-dr-adapter-check"), "Up-to-date managed adapters should render Check ACP Updates button instead of Update ACP: {probe_err_tree}");
+    assert!(!probe_err_tree.contains("st-dr-adapter-update"), "Top Update Available ACP button must stay hidden when no update is available: {probe_err_tree}");
+    assert!(!probe_err_tree.contains("st-ag-adapter-act-claude"), "Per-row Update ACP button must stay hidden when adapter is already up to date: {probe_err_tree}");
+    let adapter_update_avail_tree = describe(
+        cx,
+        &staged,
+        "frame/settings",
+        true,
+        json!({ "section": "agents" }),
+        updates("current", "current"),
+        Some("this.droveData = { config: { roles: {} }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'claude', installed: true, models: ['opus'] }, { id: 'codex', installed: true, models: ['gpt-5.4'] }] } }; this.adapterStatus = { adapters_dir: '/home/.local/share/herdr2/adapters', auto_install: true, default_permissions: 'approve-reads', inject_mcp: true, adapters: [{ preset_id: 'claude', binary_name: 'claude-agent-acp', companion_cli: 'claude', companion_installed: true, installed: true, source: 'managed', state: 'ready', version: '0.112.0', latest_version: '0.113.0', update_available: true }, { preset_id: 'codex', binary_name: 'codex-acp', companion_cli: 'codex', companion_installed: true, installed: true, source: 'managed', state: 'ready', version: '2.12.1', latest_version: '2.12.1', update_available: false }] };"),
+    )
+    .unwrap();
+    assert!(adapter_update_avail_tree.contains("st-dr-adapter-update"), "Top Update Available ACP button should render when an update is available: {adapter_update_avail_tree}");
+    assert!(!adapter_update_avail_tree.contains("st-dr-adapter-check"), "Check ACP Updates button should yield to Update Available ACP when updates exist: {adapter_update_avail_tree}");
+    assert!(adapter_update_avail_tree.contains("st-ag-adapter-act-claude"), "Outdated managed adapter row should render per-row Update button: {adapter_update_avail_tree}");
+    assert!(adapter_update_avail_tree.contains("Update v0.113.0"), "Outdated managed adapter row should display target version: {adapter_update_avail_tree}");
+    assert!(!adapter_update_avail_tree.contains("st-ag-adapter-act-codex"), "Up-to-date managed adapter row must not render Update button: {adapter_update_avail_tree}");
+    assert!(adapter_update_avail_tree.contains("Up to date v2.12.1"), "Up-to-date managed adapter row should render Up to date badge: {adapter_update_avail_tree}");
+    let adapter_update_fail_tree = describe(
+        cx,
+        &staged,
+        "frame/settings",
+        true,
+        json!({ "section": "agents" }),
+        updates("current", "current"),
+        Some("this.adapterActionFeedback = { claude: { action: 'failed', error: 'download timed out' } }; this.droveData = { config: { roles: {} }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'claude', installed: true, models: ['opus'] }] } }; this.adapterStatus = { adapters_dir: '/home/.local/share/herdr2/adapters', auto_install: true, default_permissions: 'approve-reads', inject_mcp: true, adapters: [{ preset_id: 'claude', binary_name: 'claude-agent-acp', companion_cli: 'claude', companion_installed: true, installed: true, source: 'managed', state: 'ready', version: '0.112.0', latest_version: '0.113.0', update_available: true }] };"),
+    )
+    .unwrap();
+    assert!(adapter_update_fail_tree.contains("Update Failed"), "Failed adapter update should surface Update Failed badge: {adapter_update_fail_tree}");
+    assert!(adapter_update_fail_tree.contains("Retry Update"), "Failed adapter update should surface Retry Update button: {adapter_update_fail_tree}");
+    assert!(adapter_update_fail_tree.contains("download timed out"), "Failed adapter update should surface inline failure detail: {adapter_update_fail_tree}");
     assert!(probe_err_tree.contains("st-dr-agent-errors"), "Probe error card should render in Agents & ACP: {probe_err_tree}");
     assert!(!probe_err_tree.contains("st-dr-probe-ai-btn"), "AI Diagnose button should be removed: {probe_err_tree}");
     assert!(probe_err_tree.contains("st-dr-probe-agent-fix-btn"), "Probe error card should render Fix with AI button: {probe_err_tree}");

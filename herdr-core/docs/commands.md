@@ -140,6 +140,7 @@ Usage: h2 adapter status [OPTIONS]
 
 Options:
       --json          JSON output even in a terminal
+      --refresh       Refresh the official ACP Registry index before reporting latest versions
       --on <MACHINE>  Target remote machine (`h2 machine ls`)
   -h, --help          Print help
 ```
@@ -2040,13 +2041,14 @@ Options:
 ## h2 skill
 
 ```text
-Detect coding agents and install/update bundled Herdr2 companion skills (`status`, `install`, `ai-install`)
+Detect coding agents and install/update bundled Herdr2 companion skills (`status`, `install`, `sync`, `ai-install`)
 
 Usage: h2 skill [OPTIONS] <COMMAND>
 
 Commands:
   status      Inspect detected coding agent skill directories and installed Herdr2 skill versions
   install     Install or update bundled Herdr2 companion skills (`herdr2`, `drove`, `drove-add`, `drove-setup`)
+  sync        Update all already-installed bundled Herdr2 skills to this h2 build's version
   ai-install  Use built-in Core AI to inspect local or remote coding agents and install Herdr2 skills automatically
   help        Print this message or the help of the given subcommand(s)
 
@@ -2095,6 +2097,19 @@ Options:
 Inspect detected coding agent skill directories and installed Herdr2 skill versions
 
 Usage: h2 skill status [OPTIONS]
+
+Options:
+      --json          JSON output even in a terminal
+      --on <MACHINE>  Target remote machine (`h2 machine ls`)
+  -h, --help          Print help
+```
+
+## h2 skill sync
+
+```text
+Update all already-installed bundled Herdr2 skills to this h2 build's version
+
+Usage: h2 skill sync [OPTIONS]
 
 Options:
       --json          JSON output even in a terminal

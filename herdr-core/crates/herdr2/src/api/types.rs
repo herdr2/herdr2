@@ -1538,6 +1538,9 @@ pub struct ReviewResult {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 pub struct AdapterStatusParams {
+    /// Refresh the official ACP Registry index before reporting latest versions.
+    #[serde(default)]
+    pub refresh: bool,
     /// Target remote machine (`h2 machine ls`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on: Option<String>,

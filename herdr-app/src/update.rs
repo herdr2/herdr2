@@ -129,11 +129,21 @@ struct AppAvailable {
 
 static READY: Mutex<Option<String>> = Mutex::new(None);
 static APP_AVAILABLE: Mutex<Option<AppAvailable>> = Mutex::new(None);
+static UPDATING: AtomicBool = AtomicBool::new(false);
 static APP_UPDATING: AtomicBool = AtomicBool::new(false);
 static ELEVATED_APPLIED: AtomicBool = AtomicBool::new(false);
 static APP_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static CHECK_SEQ: AtomicU64 = AtomicU64::new(0);
 static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+struct UpdatingGuard;
+
+impl Drop for UpdatingGuard {
+    fn drop(&mut self) {
+        UPDATING.store(false, Ordering::SeqCst);
+        crate::mods::request(crate::mods::Request::Refresh);
+    }
+}
 
 fn dir_writable(dir: &Path) -> bool {
     let probe = dir.join(format!(
@@ -188,7 +198,8 @@ pub fn ready() -> Option<String> {
 }
 
 pub fn is_updating() -> bool {
-    APP_UPDATING.load(Ordering::Relaxed)
+    UPDATING.load(Ordering::Relaxed)
+        || APP_UPDATING.load(Ordering::Relaxed)
         || crate::ui_update::is_applying()
         || CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).updating
         || MACHINES_UPDATING.load(Ordering::Relaxed)
@@ -429,7 +440,7 @@ pub fn status() -> serde_json::Value {
     let core_info = core();
     let machines_snapshot = machines();
     let machines_updating = MACHINES_UPDATING.load(Ordering::Relaxed) || machines_snapshot.iter().any(|m| m.updating);
-    let updating = app_updating || ui.applying || core_info.updating || machines_updating;
+    let updating = UPDATING.load(Ordering::Relaxed) || app_updating || ui.applying || core_info.updating || machines_updating;
     let core_updates_with_app = app_ready.is_some()
         && install_root.as_deref().is_some_and(has_bundled_core)
         && matches!(core_info.managed.as_deref(), None | Some("system package manager"));
@@ -642,7 +653,9 @@ fn run_one_check() -> bool {
     }
 
     // 2. UI bundle hot-update metadata check (skip if a full app binary update is available)
-    if !app_has_update && checks_ui() {
+    if app_has_update {
+        crate::ui_update::clear_available();
+    } else if checks_ui() {
         any_attempted = true;
         let app_dir = crate::mods::app_dir();
         match crate::ui_update::check_manifest_from(&app_dir, &base_url) {
@@ -901,6 +914,7 @@ fn emit_remote_sync_toast(summary: &RemoteSyncSummary, local: Option<(&str, &str
 }
 
 /// Syncs outdated / needs_update SSH remote machines in the background.
+#[allow(dead_code)]
 pub fn update_remotes() {
     if MACHINES_UPDATING.load(Ordering::Relaxed) {
         return;
@@ -911,8 +925,26 @@ pub fn update_remotes() {
     });
 }
 
-/// Upgrades local `h2` and all SSH remote machines' `herdr2-core` in the background (keeping running terminals alive).
-pub fn update_core() {
+fn sync_installed_skills_best_effort() -> Option<crate::core_bin::SkillSyncSummary> {
+    match crate::core_bin::sync_skills() {
+        Ok(summary) => {
+            if summary.updated_count > 0 {
+                tracing::info!(
+                    "update: synced {} installed skill file(s) ({})",
+                    summary.updated_count,
+                    summary.targets.join(", ")
+                );
+            }
+            Some(summary)
+        }
+        Err(e) => {
+            tracing::debug!("update: installed skill sync skipped/failed: {e}");
+            None
+        }
+    }
+}
+
+fn run_core_update_blocking() {
     let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if c.managed.is_some() || c.updating {
         return;
@@ -921,37 +953,75 @@ pub fn update_core() {
     c.error = None;
     drop(c);
     crate::mods::request(crate::mods::Request::Refresh);
-    let _ = std::thread::Builder::new().name("herdr2-core-update".into()).spawn(|| {
-        let res = crate::core_bin::update();
-        let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        c.updating = false;
-        match res {
-            Ok(now) => {
-                let ver = clean_core_version(&now).to_owned();
-                c.version = Some(ver.clone());
-                c.ready = None;
-                c.notes = None;
-                c.error = None;
-                drop(c);
-                reclassify_machines();
-                let remote_summary = sync_remote_machines_blocking(false);
-                emit_remote_sync_toast(
-                    &remote_summary,
-                    Some((&format!("herdr2-core updated to v{ver}"), "Running terminals stayed alive.")),
-                );
-            }
-            Err(e) => {
-                c.error = Some(e.clone());
-                drop(c);
-                crate::mods::request(crate::mods::Request::UpdateToast {
-                    title: "Core update failed".into(),
-                    body: e,
-                    level: "error".into(),
-                });
-            }
+
+    let res = crate::core_bin::update();
+    let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    c.updating = false;
+    match res {
+        Ok(now) => {
+            let ver = clean_core_version(&now).to_owned();
+            c.version = Some(ver.clone());
+            c.ready = None;
+            c.notes = None;
+            c.error = None;
+            drop(c);
+            let skill_summary = sync_installed_skills_best_effort();
+            reclassify_machines();
+            let remote_summary = sync_remote_machines_blocking(false);
+            let base_body = match skill_summary.as_ref().filter(|s| s.updated_count > 0) {
+                Some(s) => format!("Running terminals stayed alive. Synced {} installed skill(s).", s.updated_count),
+                None => "Running terminals stayed alive.".to_owned(),
+            };
+            emit_remote_sync_toast(
+                &remote_summary,
+                Some((&format!("herdr2-core updated to v{ver}"), &base_body)),
+            );
         }
-        crate::mods::request(crate::mods::Request::Refresh);
-    });
+        Err(e) => {
+            c.error = Some(e.clone());
+            drop(c);
+            crate::mods::request(crate::mods::Request::UpdateToast {
+                title: "Core update failed".into(),
+                body: e,
+                level: "error".into(),
+            });
+        }
+    }
+    crate::mods::request(crate::mods::Request::Refresh);
+}
+
+/// Upgrades local `h2` and all SSH remote machines' `herdr2-core` in the background (keeping running terminals alive).
+pub fn update_core() {
+    {
+        let c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if c.managed.is_some() || c.updating {
+            return;
+        }
+    }
+    let _ = std::thread::Builder::new().name("herdr2-core-update".into()).spawn(run_core_update_blocking);
+}
+
+fn run_ui_update_blocking(releases_base: Option<&str>, refresh_first: bool) -> bool {
+    let app_dir = crate::mods::app_dir();
+    match crate::ui_update::download_and_stage_from(&app_dir, releases_base, refresh_first) {
+        Ok(_) => {
+            if !core().updating {
+                let _ = sync_installed_skills_best_effort();
+            }
+            crate::mods::request(crate::mods::Request::ApplyUiBundle);
+            true
+        }
+        Err(e) => {
+            crate::ui_update::set_error(Some(e.clone()));
+            crate::mods::request(crate::mods::Request::UpdateToast {
+                title: "UI update failed".into(),
+                body: e,
+                level: "error".into(),
+            });
+            crate::mods::request(crate::mods::Request::Refresh);
+            false
+        }
+    }
 }
 
 /// Downloads and applies the available UI bundle in the background without restarting.
@@ -962,146 +1032,263 @@ pub fn start_ui_update() {
     crate::ui_update::set_applying(true);
     crate::mods::request(crate::mods::Request::Refresh);
     let _ = std::thread::Builder::new().name("herdr2-ui-update".into()).spawn(|| {
-        let app_dir = crate::mods::app_dir();
-        match crate::ui_update::download_and_stage_available(&app_dir) {
-            Ok(_) => {
-                crate::mods::request(crate::mods::Request::ApplyUiBundle);
-            }
-            Err(e) => {
-                crate::ui_update::set_error(Some(e.clone()));
-                crate::mods::request(crate::mods::Request::UpdateToast {
-                    title: "UI update failed".into(),
-                    body: e,
-                    level: "error".into(),
-                });
-                crate::mods::request(crate::mods::Request::Refresh);
-            }
-        }
+        let base = releases();
+        run_ui_update_blocking(base.as_deref(), base.is_some());
     });
 }
 
-/// Unified one-click background updater: downloads, verifies, and applies whichever
-/// update channel (App, UI bundle, local Core, and all SSH remote Cores) is available,
-/// keeping UI responsive with a spinner.
-pub fn start_update() {
-    if is_updating() {
-        return;
-    }
-    // 1. App update (staged or available)
-    if let Some(install_root) = checks_app() {
-        let already_staged = staged_version(&install_root).filter(|v| newer(v, env!("CARGO_PKG_VERSION")));
-        let avail = APP_AVAILABLE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
-        if already_staged.is_some() || avail.is_some() {
-            APP_UPDATING.store(true, Ordering::SeqCst);
-            *APP_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-            crate::mods::request(crate::mods::Request::Refresh);
-            let _ = std::thread::Builder::new().name("herdr2-app-update".into()).spawn(move || {
-                let elevated = needs_elevation_for(&install_root);
-                let stage_res: Result<(String, bool, Option<String>), String> = if elevated {
-                    match avail {
-                        Some(a) => download_and_apply_elevated_linux(&install_root, &a)
-                            .map(|core_ver| (a.version, true, core_ver)),
-                        None => Err("no app update available".into()),
-                    }
-                } else if let Some(ver) = already_staged {
-                    *READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ver.clone());
-                    Ok((ver, false, None))
-                } else if let Some(a) = avail {
-                    download_and_stage_app(&install_root, &a).map(|v| (v, false, None))
-                } else {
-                    Err("no app update available".into())
-                };
-                match stage_res {
-                    Ok((_, already_swapped, bundled_core_ver)) => {
-                        let active_in_root = crate::core_bin::path()
-                            .canonicalize()
-                            .ok()
-                            .is_some_and(|p| p.starts_with(&install_root));
-                        if let Some(new_core_ver) = bundled_core_ver {
-                            if active_in_root {
-                                match crate::core_bin::restart() {
-                                    Ok(()) => {
-                                        let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                        c.version = Some(new_core_ver);
-                                        c.ready = None;
-                                        c.notes = None;
-                                        c.error = None;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!("update: core restart after elevated swap failed: {e}");
-                                    }
-                                }
-                            }
+fn run_app_update_blocking(install_root: PathBuf, already_staged: Option<String>, avail: Option<AppAvailable>) {
+    APP_UPDATING.store(true, Ordering::SeqCst);
+    *APP_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    crate::mods::request(crate::mods::Request::Refresh);
+
+    let elevated = needs_elevation_for(&install_root);
+    let stage_res: Result<(String, bool, Option<String>), String> = if elevated {
+        match avail {
+            Some(a) => download_and_apply_elevated_linux(&install_root, &a)
+                .map(|(ver, core_ver)| (ver, true, core_ver)),
+            None => Err("no app update available".into()),
+        }
+    } else if let Some(ver) = already_staged {
+        *READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ver.clone());
+        Ok((ver, false, None))
+    } else if let Some(a) = avail {
+        download_and_stage_app(&install_root, &a).map(|v| (v, false, None))
+    } else {
+        Err("no app update available".into())
+    };
+    match stage_res {
+        Ok((_, already_swapped, bundled_core_ver)) => {
+            let active_in_root = crate::core_bin::path()
+                .canonicalize()
+                .ok()
+                .is_some_and(|p| p.starts_with(&install_root));
+            if let Some(new_core_ver) = bundled_core_ver {
+                if active_in_root {
+                    match crate::core_bin::restart() {
+                        Ok(()) => {
+                            let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                            c.version = Some(new_core_ver);
+                            c.ready = None;
+                            c.notes = None;
+                            c.error = None;
                         }
-                        // Also update external h2 core in lockstep if a non-managed core update is waiting.
-                        // Skip when the active core is bundled inside `install_root` and waiting for
-                        // post-restart swap (`after_update()` restarts the swapped bundled core on startup).
-                        let should_update_core = if active_in_root && !already_swapped {
-                            false
-                        } else {
-                            let c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                            c.managed.is_none() && c.ready.is_some() && !c.updating
-                        };
-                        if should_update_core {
-                            if let Ok(now) = crate::core_bin::update() {
-                                let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                                c.version = Some(clean_core_version(&now).to_owned());
-                                c.ready = None;
-                                c.notes = None;
-                                c.error = None;
-                            }
+                        Err(e) => {
+                            tracing::warn!("update: core restart after elevated swap failed: {e}");
                         }
-                        reclassify_machines();
-                        // Sync all SSH remote machines now when local core is already swapped on disk.
-                        // (If local core is bundled inside `install_root` and waiting for post-restart swap,
-                        // `after_update()` will restart the new bundled core and sync all remotes on startup.)
-                        if already_swapped || !active_in_root {
-                            let remote_summary = sync_remote_machines_blocking(false);
-                            if !remote_summary.failed.is_empty() {
-                                emit_remote_sync_toast(&remote_summary, None);
-                            }
-                        }
-                        if already_swapped {
-                            ELEVATED_APPLIED.store(true, Ordering::SeqCst);
-                        }
-                        crate::mods::request(crate::mods::Request::ApplyAppUpdate);
-                    }
-                    Err(e) => {
-                        APP_UPDATING.store(false, Ordering::SeqCst);
-                        *APP_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e.clone());
-                        crate::mods::request(crate::mods::Request::UpdateToast {
-                            title: "Update failed".into(),
-                            body: e,
-                            level: "error".into(),
-                        });
-                        crate::mods::request(crate::mods::Request::Refresh);
                     }
                 }
+            }
+            // Also update external h2 core in lockstep if a non-managed core update is waiting.
+            // Skip when the active core is bundled inside `install_root` and waiting for
+            // post-restart swap (`after_update()` restarts the swapped bundled core on startup).
+            let should_update_core = if active_in_root && !already_swapped {
+                false
+            } else {
+                let c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                c.managed.is_none() && c.ready.is_some() && !c.updating
+            };
+            if should_update_core {
+                if let Ok(now) = crate::core_bin::update() {
+                    let mut c = CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                    c.version = Some(clean_core_version(&now).to_owned());
+                    c.ready = None;
+                    c.notes = None;
+                    c.error = None;
+                }
+            }
+            reclassify_machines();
+            // Sync already-installed local skills and all SSH remote machines now when
+            // local core is already swapped on disk. (If local core is bundled inside
+            // `install_root` and waiting for post-restart swap, `after_update()` will
+            // restart the new bundled core, sync installed skills, and sync all remotes.)
+            if already_swapped || !active_in_root {
+                let _ = sync_installed_skills_best_effort();
+                let remote_summary = sync_remote_machines_blocking(false);
+                if !remote_summary.failed.is_empty() {
+                    emit_remote_sync_toast(&remote_summary, None);
+                }
+            }
+            if already_swapped {
+                ELEVATED_APPLIED.store(true, Ordering::SeqCst);
+            }
+            crate::mods::request(crate::mods::Request::ApplyAppUpdate);
+        }
+        Err(e) => {
+            APP_UPDATING.store(false, Ordering::SeqCst);
+            *APP_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(e.clone());
+            crate::mods::request(crate::mods::Request::UpdateToast {
+                title: "Update failed".into(),
+                body: e,
+                level: "error".into(),
+            });
+            crate::mods::request(crate::mods::Request::Refresh);
+        }
+    }
+}
+
+/// Refreshes App manifest right before applying an update so clicking the top-right
+/// Update button never uses a stale hourly SHA-256 against rolling `ota-latest` assets.
+fn refresh_app_manifest_for_root(install_root: &Path, base_url: &str) -> Result<Option<AppAvailable>, String> {
+    let avail = check_app_manifest_from(install_root, base_url)?;
+    if let Some(ref a) = avail
+        && staged_version(install_root).as_deref() == Some(a.version.as_str())
+    {
+        *READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(a.version.clone());
+    } else if avail.is_none() {
+        *READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+    *APP_AVAILABLE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = avail.clone();
+    *APP_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    Ok(avail)
+}
+
+fn run_start_update_blocking() {
+    let base_url = releases();
+    let install_root_opt = checks_app();
+    let had_app_ready = ready().is_some();
+    let had_ui_ready = crate::ui_update::ready().is_some();
+    let had_core_ready = {
+        let c = core();
+        c.managed.is_none() && c.ready.is_some()
+    };
+
+    let mut app_refresh_err: Option<String> = None;
+    let mut ui_refresh_err: Option<String> = None;
+    let mut core_refresh_err: Option<String> = None;
+
+    // Always re-fetch live manifests before downloading so rolling `ota-latest` tarballs
+    // (or newly published releases superseding an older UI/Core update) match the latest SHA-256.
+    if let (Some(install_root), Some(base)) = (install_root_opt.as_deref(), base_url.as_deref()) {
+        if let Err(e) = refresh_app_manifest_for_root(install_root, base)
+            && !is_missing_feed_err(&e)
+        {
+            tracing::warn!("update: pre-update app manifest refresh failed: {e}");
+            app_refresh_err = Some(e);
+        }
+    }
+
+    // 1. App update (staged or available)
+    if let Some(install_root) = install_root_opt {
+        let avail = if app_refresh_err.is_some() {
+            // Avoid downloading against a potentially stale cached SHA-256 when manifest refresh failed.
+            None
+        } else {
+            APP_AVAILABLE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+        };
+        let already_staged = staged_version(&install_root)
+            .filter(|v| newer(v, env!("CARGO_PKG_VERSION")))
+            .filter(|v| avail.as_ref().is_none_or(|a| !newer(&a.version, v)));
+
+        if already_staged.is_some() || avail.is_some() {
+            crate::ui_update::clear_available();
+            if checks_core()
+                && let Some(base) = base_url.as_deref()
+            {
+                let _ = check_core_from(base);
+            }
+            run_app_update_blocking(install_root, already_staged, avail);
+            return;
+        }
+        if let Some(err) = app_refresh_err.take()
+            && had_app_ready
+        {
+            *APP_ERROR.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(err.clone());
+            crate::mods::request(crate::mods::Request::UpdateToast {
+                title: "Update failed".into(),
+                body: err,
+                level: "error".into(),
             });
             return;
         }
     }
+
+    if checks_ui()
+        && let Some(base) = base_url.as_deref()
+    {
+        let app_dir = crate::mods::app_dir();
+        if let Err(e) = crate::ui_update::check_manifest_from(&app_dir, base)
+            && !is_missing_feed_err(&e)
+        {
+            tracing::warn!("update: pre-update ui manifest refresh failed: {e}");
+            ui_refresh_err = Some(e);
+        }
+    }
+
+    if checks_core()
+        && let Some(base) = base_url.as_deref()
+        && let Err(e) = check_core_from(base)
+        && !is_missing_feed_err(&e)
+    {
+        tracing::warn!("update: pre-update core manifest refresh failed: {e}");
+        core_refresh_err = Some(e);
+    }
+
     // 2. UI bundle hot-update (also sync local core / SSH remotes if waiting)
-    if crate::ui_update::ready().is_some() {
-        start_ui_update();
+    if crate::ui_update::ready().is_some() && ui_refresh_err.is_none() {
+        crate::ui_update::set_applying(true);
+        crate::mods::request(crate::mods::Request::Refresh);
+        let _ = run_ui_update_blocking(base_url.as_deref(), false);
         let c = core();
         if c.managed.is_none() && c.ready.is_some() {
-            update_core();
+            run_core_update_blocking();
         } else if has_pending_remote_updates() {
-            update_remotes();
+            let summary = sync_remote_machines_blocking(false);
+            emit_remote_sync_toast(&summary, None);
         }
         return;
     }
+
     // 3. Local Core update (automatically syncs all SSH remotes afterward)
     let c = core();
     if c.managed.is_none() && c.ready.is_some() {
-        update_core();
+        run_core_update_blocking();
         return;
     }
+
     // 4. Remote-only SSH core sync
     if has_pending_remote_updates() {
-        update_remotes();
+        let summary = sync_remote_machines_blocking(false);
+        emit_remote_sync_toast(&summary, None);
+        return;
     }
+
+    // Surface refresh failure if the user clicked Update on a previously advertised UI/Core update while offline.
+    if let Some(err) = ui_refresh_err.filter(|_| had_ui_ready) {
+        crate::ui_update::set_error(Some(err.clone()));
+        crate::mods::request(crate::mods::Request::UpdateToast {
+            title: "UI update failed".into(),
+            body: err,
+            level: "error".into(),
+        });
+    } else if let Some(err) = core_refresh_err.filter(|_| had_core_ready) {
+        CORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).error = Some(err.clone());
+        crate::mods::request(crate::mods::Request::UpdateToast {
+            title: "Core update failed".into(),
+            body: err,
+            level: "error".into(),
+        });
+    }
+}
+
+/// Unified one-click background updater: refreshes live manifests, downloads, verifies,
+/// and applies whichever update channel (App, UI bundle, local Core, and all SSH remote Cores)
+/// is available, keeping UI responsive with a spinner.
+pub fn start_update() {
+    if is_updating() {
+        return;
+    }
+    if UPDATING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    crate::mods::request(crate::mods::Request::Refresh);
+    let _ = std::thread::Builder::new().name("herdr2-start-update".into()).spawn(|| {
+        let _guard = UpdatingGuard;
+        run_start_update_blocking();
+    });
 }
 
 pub fn clear_app_updating() {
@@ -1148,9 +1335,7 @@ fn copy_executable(src: &Path, dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Downloads and verifies the latest same-generation `h2` core binary into `work/core-dl`
-/// when it is newer than `current_ver`. Returns `Ok(None)` if already current or absent.
-fn download_verified_core(
+fn download_verified_core_once(
     releases_base: &str,
     work: &Path,
     current_ver: Option<&str>,
@@ -1197,6 +1382,24 @@ fn download_verified_core(
         return Err(format!("downloaded core reported {reported}, expected {}", latest.version));
     }
     Ok(Some((bin, latest.version)))
+}
+
+/// Downloads and verifies the latest same-generation `h2` core binary into `work/core-dl`
+/// when it is newer than `current_ver`. Retries once if a rolling `ota-latest` upload causes
+/// a transient checksum mismatch.
+fn download_verified_core(
+    releases_base: &str,
+    work: &Path,
+    current_ver: Option<&str>,
+) -> Result<Option<(PathBuf, String)>, String> {
+    match download_verified_core_once(releases_base, work, current_ver) {
+        Err(e) if e.contains("checksum mismatch") => {
+            tracing::warn!("update: bundled core checksum mismatch; re-fetching core manifest and retrying once");
+            std::thread::sleep(Duration::from_secs(1));
+            download_verified_core_once(releases_base, work, current_ver)
+        }
+        other => other,
+    }
 }
 
 /// Preserves bundled files (`Contents/Helpers/h2` on macOS, `herdr2-core`/`h2` and extra PNG icons
@@ -1444,16 +1647,59 @@ fn run_elevated_swap_with(
     }
 }
 
-#[cfg(unix)]
-fn download_and_apply_elevated_linux(root: &Path, avail: &AppAvailable) -> Result<Option<String>, String> {
-    let version = avail.version.as_str();
-    tracing::info!("downloading Herdr {version} for elevated swap into {}", root.display());
-    let work = TempWorkDir::new("herdr2-app-update")?;
-    let unpacked = unpack(&avail.url, &avail.sha256, work.path())?;
-    if version_of(&unpacked).as_deref() != Some(version) {
-        return Err(format!("the download doesn't run as {version}"));
+/// Unpacks and verifies an app archive, retrying once with a freshly fetched `app-latest.json`
+/// if a rolling `ota-latest` release clobbered the archive mid-download (`checksum mismatch`).
+fn unpack_app_with_retry(
+    root: &Path,
+    avail: &AppAvailable,
+    work: &Path,
+    releases_base: Option<&str>,
+) -> Result<(PathBuf, String), String> {
+    let try_once = |cand: &AppAvailable, dir: &Path| -> Result<(PathBuf, String), String> {
+        let unpacked = unpack(&cand.url, &cand.sha256, dir)?;
+        if version_of(&unpacked).as_deref() != Some(cand.version.as_str()) {
+            return Err(format!("the download doesn't run as {}", cand.version));
+        }
+        Ok((unpacked, cand.version.clone()))
+    };
+
+    match try_once(avail, work) {
+        Ok(ok) => Ok(ok),
+        Err(err) if err.contains("checksum mismatch") => {
+            let Some(base) = releases_base else {
+                return Err(err);
+            };
+            tracing::warn!(
+                "update: checksum mismatch downloading Herdr {}; refreshing manifest from {} and retrying once",
+                avail.version,
+                base
+            );
+            std::thread::sleep(Duration::from_secs(1));
+            let Ok(Some(fresh)) = refresh_app_manifest_for_root(root, base) else {
+                return Err(err);
+            };
+            if fresh.url.is_empty() {
+                return Err(err);
+            }
+            let _ = std::fs::remove_dir_all(work);
+            std::fs::create_dir_all(work).map_err(|e| format!("{}: {e}", work.display()))?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(work, std::fs::Permissions::from_mode(0o700));
+            }
+            try_once(&fresh, work)
+        }
+        Err(err) => Err(err),
     }
+}
+
+#[cfg(unix)]
+fn download_and_apply_elevated_linux(root: &Path, avail: &AppAvailable) -> Result<(String, Option<String>), String> {
+    tracing::info!("downloading Herdr {} for elevated swap into {}", avail.version, root.display());
+    let work = TempWorkDir::new("herdr2-app-update")?;
     let releases_base = releases();
+    let (unpacked, version) = unpack_app_with_retry(root, avail, work.path(), releases_base.as_deref())?;
     let updated_core_ver = preserve_or_update_bundled_core(root, &unpacked, work.path(), releases_base.as_deref())?;
     run_elevated_swap_with(
         Path::new("pkexec"),
@@ -1461,46 +1707,54 @@ fn download_and_apply_elevated_linux(root: &Path, avail: &AppAvailable) -> Resul
         work.path(),
         &unpacked,
         root,
-        version,
+        &version,
     )?;
     *READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     *APP_AVAILABLE.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     let _ = std::fs::write(marker(), "");
-    Ok(updated_core_ver)
+    Ok((version, updated_core_ver))
 }
 
 #[cfg(not(unix))]
-fn download_and_apply_elevated_linux(_root: &Path, _avail: &AppAvailable) -> Result<Option<String>, String> {
+fn download_and_apply_elevated_linux(_root: &Path, _avail: &AppAvailable) -> Result<(String, Option<String>), String> {
     Err("elevated update is only supported on Linux".into())
 }
 
 fn download_and_stage_app(root: &Path, avail: &AppAvailable) -> Result<String, String> {
-    let version = avail.version.as_str();
+    download_and_stage_app_from(root, avail, releases().as_deref())
+}
+
+fn download_and_stage_app_from(
+    root: &Path,
+    avail: &AppAvailable,
+    releases_base: Option<&str>,
+) -> Result<String, String> {
     let staged = beside(root, ".new");
-    if staged_version(root).as_deref() == Some(version) {
-        *READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(version.to_owned());
-        return Ok(version.to_owned());
+    if staged_version(root).as_deref() == Some(avail.version.as_str()) {
+        *READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(avail.version.clone());
+        return Ok(avail.version.clone());
     }
-    tracing::info!("downloading Herdr {version}");
+    tracing::info!("downloading Herdr {}", avail.version);
     let work = beside(root, ".download");
     let _ = std::fs::remove_dir_all(&work);
     std::fs::create_dir_all(&work).map_err(|e| format!("{}: {e}", work.display()))?;
-    let releases_base = releases();
-    let result = unpack(&avail.url, &avail.sha256, &work).and_then(|unpacked| {
-        if version_of(&unpacked).as_deref() != Some(version) {
-            return Err(format!("the download doesn't run as {version}"));
-        }
-        let _ = preserve_or_update_bundled_core(root, &unpacked, &work, releases_base.as_deref())?;
+    let result = unpack_app_with_retry(root, avail, &work, releases_base).and_then(|(unpacked, final_version)| {
+        let _ = preserve_or_update_bundled_core(root, &unpacked, &work, releases_base)?;
         let _ = std::fs::remove_file(beside(root, ".new.json"));
         let _ = std::fs::remove_dir_all(&staged);
         std::fs::rename(&unpacked, &staged).map_err(|e| format!("{}: {e}", staged.display()))?;
         // Outside the bundle: writing a receipt must not change its signature.
-        std::fs::write(beside(root, ".new.json"), serde_json::json!({ "version": version }).to_string()).map_err(|e| e.to_string())
+        std::fs::write(
+            beside(root, ".new.json"),
+            serde_json::json!({ "version": final_version }).to_string(),
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(final_version)
     });
     let _ = std::fs::remove_dir_all(&work);
-    result.map(|()| {
-        *READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(version.to_owned());
-        version.to_owned()
+    result.map(|final_version| {
+        *READY.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(final_version.clone());
+        final_version
     })
 }
 
@@ -1525,7 +1779,10 @@ fn unpack(url: &str, sha: &str, work: &Path) -> Result<PathBuf, String> {
     let tarball = work.join(format!("app.{ext}"));
     download_file(url, &tarball)?;
     let bytes = std::fs::read(&tarball).map_err(|e| e.to_string())?;
-    if sha256(&bytes) != sha.to_ascii_lowercase() {
+    let got_sha = sha256(&bytes);
+    let want_sha = sha.to_ascii_lowercase();
+    if got_sha != want_sha {
+        tracing::warn!("update: checksum mismatch for {url}: expected {want_sha}, got {got_sha}");
         return Err("the download is damaged (checksum mismatch)".into());
     }
     unpack_archive(&tarball, work)?;
@@ -1539,7 +1796,10 @@ fn unpack(url: &str, sha: &str, work: &Path) -> Result<PathBuf, String> {
 }
 
 pub(crate) fn download_file(url: &str, dest: &Path) -> Result<(), String> {
-    run(curl_command().args(["-fsSL", "--max-time", "600", "-o"]).arg(dest).arg(url))
+    run(curl_command()
+        .args(["-fsSL", "-H", "Cache-Control: no-cache", "--max-time", "600", "-o"])
+        .arg(dest)
+        .arg(url))
 }
 
 pub(crate) fn unpack_archive(archive: &Path, dest: &Path) -> Result<(), String> {
@@ -1643,7 +1903,11 @@ fn decode_process_output(bytes: &[u8]) -> String {
 }
 
 pub(crate) fn curl_text(url: &str) -> Result<String, String> {
-    let out = curl_command().args(["-fsSL", "--max-time", "30", url]).stdin(Stdio::null()).output().map_err(|e| format!("curl: {e}"))?;
+    let out = curl_command()
+        .args(["-fsSL", "-H", "Cache-Control: no-cache", "--max-time", "30", url])
+        .stdin(Stdio::null())
+        .output()
+        .map_err(|e| format!("curl: {e}"))?;
     if !out.status.success() {
         return Err(format!("{url}: {}", decode_process_output(&out.stderr).trim()));
     }
@@ -2063,22 +2327,20 @@ fn marker() -> PathBuf {
     crate::mods::app_dir().join(".updated")
 }
 
-/// Runs once after an app binary swap: brings local `h2` core and all SSH remote machines up to date.
+/// Runs once after an app binary swap: brings local `h2` core, already-installed skills,
+/// and all SSH remote machines up to date.
 pub fn after_update(connected: std::sync::Arc<crate::hc::Core>) {
     let mark = marker();
     if !mark.is_file() {
         return;
     }
     let _ = std::fs::remove_file(&mark);
-    if !checks_core() {
-        return;
-    }
     let _ = std::thread::Builder::new().name("herdr2-after-update".into()).spawn(move || {
         let status = connected.call("server.status", serde_json::json!({})).map_err(|e| format!("{e:#}"));
         let managed = after_update_managed(status);
 
         // If a bundled `herdr2-core` inside the install folder was just swapped on disk,
-        // restart the local daemon so it runs the new version before syncing remotes.
+        // restart the local daemon so it runs the new version before syncing skills and remotes.
         let active_in_root = root().is_some_and(|r| {
             crate::core_bin::path()
                 .canonicalize()
@@ -2105,7 +2367,7 @@ pub fn after_update(connected: std::sync::Arc<crate::hc::Core>) {
             }
         }
 
-        if !managed {
+        if !managed && checks_core() {
             let have = core().version.unwrap_or_default();
             let latest = releases().and_then(|base| latest_core_from(&base).ok());
             if let Some(target) = after_update_target(&have, latest.as_ref(), crate::hc::GENERATION, crate::hc::core_min()) {
@@ -2131,9 +2393,25 @@ pub fn after_update(connected: std::sync::Arc<crate::hc::Core>) {
             }
         }
 
+        let skill_summary = sync_installed_skills_best_effort();
         reclassify_machines();
         let remote_summary = sync_remote_machines_blocking(false);
-        emit_remote_sync_toast(&remote_summary, None);
+        if remote_summary.updated.is_empty() && remote_summary.failed.is_empty() {
+            if let Some(s) = skill_summary.filter(|s| s.updated_count > 0) {
+                let suffix = if s.targets.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", s.targets.join(", "))
+                };
+                crate::mods::request(crate::mods::Request::UpdateToast {
+                    title: "Installed skills synced".into(),
+                    body: format!("Updated {} installed skill file(s){suffix}.", s.updated_count),
+                    level: "info".into(),
+                });
+            }
+        } else {
+            emit_remote_sync_toast(&remote_summary, None);
+        }
     });
 }
 
@@ -2841,5 +3119,86 @@ mod tests {
             std::fs::read_to_string(unpacked3.join("Contents/Helpers/h2")).unwrap(),
             packaged_body
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_app_manifest_sha256_refreshes_and_retries_on_rolling_ota_channel() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = TempWorkDir::new("herdr2-test-stale-app-sha").unwrap();
+        let root = work.path().join(PACKED);
+        std::fs::create_dir_all(exe_in(&root).parent().unwrap()).unwrap();
+        std::fs::write(exe_in(&root), format!("#!/bin/sh\necho herdr2 {}\n", env!("CARGO_PKG_VERSION"))).unwrap();
+        std::fs::set_permissions(exe_in(&root), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let ota_dir = work.path().join("releases/download/ota-latest");
+        std::fs::create_dir_all(&ota_dir).unwrap();
+        let archive = ota_dir.join(format!("herdr2-app-{}.tar.gz", target()));
+
+        let build_pkg = |ver: &str, marker_comment: &str| -> String {
+            let pkg_root = work.path().join("pkg-src").join(PACKED);
+            let _ = std::fs::remove_dir_all(work.path().join("pkg-src"));
+            let pkg_exe = exe_in(&pkg_root);
+            std::fs::create_dir_all(pkg_exe.parent().unwrap()).unwrap();
+            std::fs::write(&pkg_exe, format!("#!/bin/sh\n# {marker_comment}\necho herdr2 {ver}\n")).unwrap();
+            std::fs::set_permissions(&pkg_exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+            if cfg!(target_os = "macos") {
+                std::fs::create_dir_all(pkg_root.join("Contents")).unwrap();
+                std::fs::write(
+                    pkg_root.join("Contents/Info.plist"),
+                    "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict/></plist>",
+                )
+                .unwrap();
+            } else {
+                std::fs::write(pkg_root.join("herdr2.svg"), "<svg/>").unwrap();
+            }
+            assert!(
+                Command::new("tar")
+                    .args(["-czf"])
+                    .arg(&archive)
+                    .arg("-C")
+                    .arg(work.path().join("pkg-src"))
+                    .arg(PACKED)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            sha256(&std::fs::read(&archive).unwrap())
+        };
+
+        let base_url = format!("file://{}", ota_dir.display());
+        let write_app_manifest = |ver: &str, sha: &str| {
+            let doc = serde_json::json!({
+                "version": ver,
+                "notes": "Rolling OTA",
+                "targets": {
+                    target(): {
+                        "url": format!("file://{}", archive.display()),
+                        "sha256": sha,
+                    }
+                }
+            });
+            std::fs::write(ota_dir.join("app-latest.json"), doc.to_string()).unwrap();
+        };
+
+        // 1) Background hourly check sees Build A of 99.0.1 and caches sha_a.
+        let sha_a = build_pkg("99.0.1", "build-from-ota-update-yml");
+        write_app_manifest("99.0.1", &sha_a);
+        let stale_avail = refresh_app_manifest_for_root(&root, &base_url).unwrap().unwrap();
+        assert_eq!(stale_avail.sha256, sha_a);
+
+        // 2) `release.yml` finishes later and clobbers `ota-latest` with Build B (different SHA-256!).
+        let sha_b = build_pkg("99.0.1", "build-from-release-yml");
+        assert_ne!(sha_a, sha_b);
+        write_app_manifest("99.0.1", &sha_b);
+
+        // Even if download started with `stale_avail`, `unpack_app_with_retry` refreshes `app-latest.json`
+        // and stages Build B cleanly instead of failing with `checksum mismatch`.
+        let staged = download_and_stage_app_from(&root, &stale_avail, Some(&base_url)).unwrap();
+        assert_eq!(staged, "99.0.1");
+        assert_eq!(staged_version(&root).as_deref(), Some("99.0.1"));
+
+        *READY.lock().unwrap() = None;
+        *APP_AVAILABLE.lock().unwrap() = None;
     }
 }

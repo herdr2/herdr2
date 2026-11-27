@@ -141,6 +141,11 @@ fi
 if [ ! -e "$bin/h2" ] && ! command -v h2 >/dev/null 2>&1; then
   curl -fsSL "$core_installer" | H2_INSTALL_DIR="$bin" HERDR2_RELEASES_URL="$releases" sh || say "herdr2-core didn't install; Herdr2 will offer it when it opens."
 fi
+if [ -x "$bin/h2" ]; then
+  "$bin/h2" skill sync >/dev/null 2>&1 || true
+elif command -v h2 >/dev/null 2>&1; then
+  h2 skill sync >/dev/null 2>&1 || true
+fi
 
 say "Herdr2 is installed. Open it from your apps, or run: herdr2"
 case ":$PATH:" in

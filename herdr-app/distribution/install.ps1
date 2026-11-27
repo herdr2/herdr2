@@ -79,6 +79,10 @@ try {
             Write-Host "herdr2-core didn't install; Herdr2 will offer it when it opens."
         }
     }
+    try {
+        if (Test-Path $core) { & $core skill sync 2>$null | Out-Null }
+        elseif (Get-Command h2 -ErrorAction SilentlyContinue) { h2 skill sync 2>$null | Out-Null }
+    } catch {}
 
     Write-Host "Herdr2 is installed. Open it from the Start menu, or run: herdr2"
 } finally {

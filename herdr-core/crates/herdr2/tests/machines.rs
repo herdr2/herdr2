@@ -330,6 +330,7 @@ ERROR
   'cmd /d /c "echo herdr2-windows"') echo herdr2-windows; exit 0;;
   powershell\ *) [ -f '{root}/copied' ] || exit 1; touch '{root}/installed'; exit 0;;
   *'skill install --all --detected-only') touch '{root}/skills_synced'; exit 0;;
+  *'skill sync') touch '{root}/skills_synced_existing'; exit 0;;
   *--version) echo 'herdr2 test'; exit 0;;
 esac
 if [ ! -f '{root}/installed' ]; then

@@ -19,7 +19,7 @@ mod machine;
 mod output;
 mod run;
 mod server;
-mod skill;
+pub(crate) mod skill;
 mod update;
 use file::*;
 use machine::*;
@@ -249,7 +249,7 @@ enum Cmd {
     },
     /// Manage multi-agent Drove orchestration (`drove status`, `drove web`, `drove settings`, ...).
     Drove(crate::drove::cli::DroveCli),
-    /// Detect coding agents and install/update bundled Herdr2 companion skills (`status`, `install`, `ai-install`).
+    /// Detect coding agents and install/update bundled Herdr2 companion skills (`status`, `install`, `sync`, `ai-install`).
     Skill(skill::SkillCli),
     /// Inspect, install, or update managed ACP adapters (`status`, `install`, `update`).
     Adapter(adapter::AdapterCli),
@@ -1164,6 +1164,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
             {
                 let human = format!("{this} is already {v} or newer");
                 let mut out = up_to_date(&paths, v, human)?;
+                attach_skill_sync(&dest, &mut out);
                 attach_machine_sync(&paths, &dest, &mut out, force);
                 return Ok(Some(out));
             }
@@ -1192,16 +1193,26 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
                 let human = format!("{this} is up to date (latest release: {})", m.version);
                 up_to_date(&paths, &m.version, human)?
             } else {
-                let file = crate::releases::download(
-                    &m,
-                    &crate::releases::this_target(),
-                    &scratch.0,
-                    crate::platform::prefer_release_bundle(),
-                )?;
+                let target_triple = crate::releases::this_target();
+                let prefer_bundle = crate::platform::prefer_release_bundle();
+                let (file, release_ver) = match crate::releases::download(&m, &target_triple, &scratch.0, prefer_bundle) {
+                    Ok(f) => (f, m.version.clone()),
+                    Err(e) if crate::releases::is_checksum_mismatch(&e) => {
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                        let m2 = crate::releases::manifest(requested, &scratch.0)?;
+                        if m2.generation != crate::api::GENERATION && !force {
+                            return Err(e);
+                        }
+                        let f = crate::releases::download(&m2, &target_triple, &scratch.0, prefer_bundle)?;
+                        (f, m2.version)
+                    }
+                    Err(e) => return Err(e),
+                };
                 let mut out = update(&paths, &file, force)?;
-                out.json["release"] = m.version.into();
+                out.json["release"] = release_ver.into();
                 out
             };
+            attach_skill_sync(&dest, &mut out);
             attach_machine_sync(&paths, &dest, &mut out, force);
             out
         }
@@ -1210,6 +1221,7 @@ fn run(cmd: Option<Cmd>, json: bool, asked: bool) -> Result<Option<Out>, RpcErro
                 .and_then(|e| e.canonicalize())
                 .map_err(|e| RpcError::internal(e.to_string()))?;
             let mut out = update(&paths, &from, force)?;
+            attach_skill_sync(&dest, &mut out);
             attach_machine_sync(&paths, &dest, &mut out, force);
             out
         }

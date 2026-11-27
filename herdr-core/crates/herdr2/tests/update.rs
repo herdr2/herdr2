@@ -243,3 +243,55 @@ fn update_automatically_syncs_ssh_remotes_and_marks_unreachable_needs_update() {
     assert_eq!(f_bad["state"], "needs_update", "{forced}");
     assert!(remote.root.join(".local/bin/herdr2").is_file(), "remote binary was synced");
 }
+
+#[test]
+fn update_automatically_syncs_already_installed_local_and_remote_skills() {
+    let remote = Session::new();
+    let mut local = Session::new();
+    let dir = local.root.join("bin");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(BIN, dir.join("herdr2")).unwrap();
+    std::os::unix::fs::symlink("herdr2", dir.join("h2")).unwrap();
+    local.bin = dir.join("h2");
+
+    // Local: install subset into .claude and custom target, leave .cursor detected-but-uninstalled.
+    std::fs::create_dir_all(local.root.join(".claude")).unwrap();
+    std::fs::create_dir_all(local.root.join(".cursor")).unwrap();
+    local.json(&["skill", "install", "--agent", "claude", "--skills", "herdr2,drove"]);
+    let custom_dir = local.root.join("custom-skills");
+    local.json(&["skill", "install", "--target", custom_dir.to_str().unwrap(), "--skills", "drove-add"]);
+    std::fs::write(local.root.join(".claude/skills/herdr2/SKILL.md"), "old local herdr2").unwrap();
+    std::fs::write(custom_dir.join("drove-add/SKILL.md"), "old custom drove-add").unwrap();
+
+    // Remote: already has stale .codex skill and detected-but-uninstalled .cursor dir.
+    std::fs::create_dir_all(remote.root.join(".codex/skills/herdr2")).unwrap();
+    std::fs::write(remote.root.join(".codex/skills/herdr2/SKILL.md"), "old remote herdr2").unwrap();
+    std::fs::create_dir_all(remote.root.join(".cursor")).unwrap();
+
+    local.env.push(fake_ssh(&local, &[("linuxbox", &remote)]));
+    local.json(&["machine", "add", "dev@linuxbox"]);
+    wait_until("linuxbox connected", || {
+        local.json(&["machine", "ls"])["machines"]
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|m| m["name"] == "linuxbox" && m["state"] == "connected"))
+    });
+
+    // Running `h2 update --from ... --force` updates local binary, syncs already-installed local skills,
+    // and syncs remote binary + already-installed remote skills.
+    let out = local.cmd().args(["--json", "update", "--from", BIN, "--force"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let reply: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(reply["skills"]["ok"], true, "{reply}");
+    assert_eq!(reply["skills"]["updatedCount"], 2, "{reply}");
+
+    // Local installed skills were refreshed; uninstalled skills/agents stayed untouched.
+    assert!(std::fs::read_to_string(local.root.join(".claude/skills/herdr2/SKILL.md")).unwrap().contains("name: herdr2"));
+    assert!(std::fs::read_to_string(custom_dir.join("drove-add/SKILL.md")).unwrap().contains("name: drove-add"));
+    assert!(!local.root.join(".claude/skills/drove-setup/SKILL.md").exists());
+    assert!(!local.root.join(".cursor/skills").exists());
+
+    // Remote installed skill was refreshed; uninstalled remote skills/agents stayed untouched.
+    assert!(std::fs::read_to_string(remote.root.join(".codex/skills/herdr2/SKILL.md")).unwrap().contains("name: herdr2"));
+    assert!(!remote.root.join(".codex/skills/drove/SKILL.md").exists());
+    assert!(!remote.root.join(".cursor/skills").exists());
+}

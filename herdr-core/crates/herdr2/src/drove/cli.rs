@@ -1600,7 +1600,7 @@ pub fn execute(paths: &Paths, cli: DroveCli) -> Result<(Value, String), RpcError
             Ok((res, format!("resumed {run_id}")))
         }
         DroveAction::Worker { action } => execute_worker_action(action),
-        DroveAction::Install { target } => install_skills(target),
+        DroveAction::Install { target } => install_skills(paths, target),
     }
 }
 
@@ -2150,7 +2150,7 @@ const SKILL_DROVE: &str = include_str!("../../../../../skills/drove/SKILL.md");
 const SKILL_DROVE_ADD: &str = include_str!("../../../../../skills/drove-add/SKILL.md");
 const SKILL_DROVE_SETUP: &str = include_str!("../../../../../skills/drove-setup/SKILL.md");
 
-fn install_skills(target: Option<PathBuf>) -> Result<(Value, String), RpcError> {
+fn install_skills(paths: &Paths, target: Option<PathBuf>) -> Result<(Value, String), RpcError> {
     let base = match target {
         Some(dir) => dir,
         None => {
@@ -2170,6 +2170,7 @@ fn install_skills(target: Option<PathBuf>) -> Result<(Value, String), RpcError> 
         std::fs::write(&path, content).map_err(|e| RpcError::internal(format!("write {}: {e}", path.display())))?;
         written.push(path.display().to_string());
     }
+    crate::cli::skill::record_installed_target(paths, &base);
     let out = json!({ "ok": true, "target": base.display().to_string(), "files": written });
     Ok((out, format!("installed Drove skills into {}", base.display())))
 }

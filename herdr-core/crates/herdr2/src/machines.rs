@@ -469,11 +469,33 @@ fn run_raw(
     Ok(out)
 }
 
+#[derive(Clone, Copy)]
+enum RemoteSkillSync {
+    InstallDetectedAndSync,
+    SyncInstalledOnly,
+}
+
 /// Copies this very h2 to `target` (same OS and CPU only), swaps it in at
 /// ~/.local/bin/herdr2 (adding `h2` beside it only if there is none),
 /// and restarts h2 there in `session`, so kept agents there can resume.
+/// Also installs bundled skills for detected coding agents and syncs any already-installed skills.
 /// Returns what the installed one says it is.
 pub fn install(paths: &crate::paths::Paths, to: Reach, session: Option<&str>) -> Result<String, RpcError> {
+    install_with_skills(paths, to, session, RemoteSkillSync::InstallDetectedAndSync)
+}
+
+/// Updates an existing remote machine's h2 binary, restarts h2 there, and syncs
+/// all already-installed bundled skills (without installing into agents that never had them).
+pub fn update_remote(paths: &crate::paths::Paths, to: Reach, session: Option<&str>) -> Result<String, RpcError> {
+    install_with_skills(paths, to, session, RemoteSkillSync::SyncInstalledOnly)
+}
+
+fn install_with_skills(
+    paths: &crate::paths::Paths,
+    to: Reach,
+    session: Option<&str>,
+    skill_sync: RemoteSkillSync,
+) -> Result<String, RpcError> {
     check_target(to)?;
     let target = to.target;
     if let Some(s) = session {
@@ -493,7 +515,7 @@ pub fn install(paths: &crate::paths::Paths, to: Reach, session: Option<&str>) ->
             return Err(RpcError::new("install_failed", format!("{target} runs Windows"), "install h2 there yourself"));
         }
         WINDOWS.lock().unwrap_or_else(|p| p.into_inner()).push(target.to_string());
-        return install_windows(paths, target, session);
+        return install_windows(paths, target, session, skill_sync);
     }
     if !probe.status.success() {
         return Err(RpcError::new(
@@ -520,14 +542,40 @@ pub fn install(paths: &crate::paths::Paths, to: Reach, session: Option<&str>) ->
                 "install h2 there yourself",
             )
         };
-        let m = crate::releases::manifest(Some(version), &scratch.0)
-            .or_else(|_| crate::releases::manifest(None, &scratch.0))
+        let remote_target = there.replace(' ', "-");
+        let resolve_manifest = |exact: Option<&str>| {
+            crate::releases::manifest(exact, &scratch.0)
+                .and_then(|m| {
+                    if m.generation == crate::api::GENERATION {
+                        Ok(m)
+                    } else {
+                        Err(RpcError::new("unavailable", "protocol generation mismatch", ""))
+                    }
+                })
+        };
+        let m = resolve_manifest(Some(version))
+            .or_else(|_| resolve_manifest(None))
             .map_err(not_released)?;
-        crate::releases::download(&m, &there.replace(' ', "-"), &scratch.0, bundle)?
+        match crate::releases::download(&m, &remote_target, &scratch.0, bundle) {
+            Ok(bin) => bin,
+            Err(e) if crate::releases::is_checksum_mismatch(&e) => {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                let m2 = resolve_manifest(None).map_err(|_| e)?;
+                crate::releases::download(&m2, &remote_target, &scratch.0, bundle)?
+            }
+            Err(e) => return Err(e),
+        }
     };
     let (exe, bundled) = install_payload(&bin, &scratch.0)?;
     let n = exe.len();
     let session = session.map(|s| format!("H2_SESSION={s} ")).unwrap_or_default();
+    let bundled_skill_step = match skill_sync {
+        RemoteSkillSync::InstallDetectedAndSync => {
+            "\"$d/herdr2\" skill install --all --detected-only > /dev/null 2>&1 || true; \
+             \"$d/herdr2\" skill sync > /dev/null 2>&1 || true;"
+        }
+        RemoteSkillSync::SyncInstalledOnly => "\"$d/herdr2\" skill sync > /dev/null 2>&1 || true;",
+    };
     if bundled {
         let script = format!(
             "set -e; d=$HOME/.local/bin; mkdir -p \"$d\"; t=$(mktemp -d); trap \"rm -rf \\\"$t\\\"\" EXIT; \
@@ -535,7 +583,7 @@ pub fn install(paths: &crate::paths::Paths, to: Reach, session: Option<&str>) ->
              tar -xf \"$t/core.tar\" -C \"$t\"; b=\"$t/Herdr2.app/Contents/MacOS/herdr2\"; \
              \"$b\" --h2-install-bundle \"$b\" \"$d/herdr2\"; \
              {session}\"$d/herdr2\" server restart > /dev/null; \
-             \"$d/herdr2\" skill install --all --detected-only > /dev/null 2>&1 || true; \
+             {bundled_skill_step} \
              \"$d/herdr2\" --version"
         );
         return run_there(paths, to, &format!("sh -c '{script}'"), &exe);
@@ -546,15 +594,22 @@ pub fn install(paths: &crate::paths::Paths, to: Reach, session: Option<&str>) ->
     } else {
         ""
     };
+    let unix_skill_step = match skill_sync {
+        RemoteSkillSync::InstallDetectedAndSync => {
+            "$d/herdr2 skill install --all --detected-only > /dev/null 2>&1 || true; \
+             $d/herdr2 skill sync > /dev/null 2>&1 || true;"
+        }
+        RemoteSkillSync::SyncInstalledOnly => "$d/herdr2 skill sync > /dev/null 2>&1 || true;",
+    };
     // Into a temp file beside the target, checked whole and running, then swapped.
-    // Also best-effort install bundled skills into any detected coding agents on the remote host.
+    // Also best-effort install/sync bundled skills on the remote host.
     let script = format!(
         "set -e; d=$HOME/.local/bin; mkdir -p $d; {guard}rm -f $d/.herdr2.new.*; t=$d/.herdr2.new.$$; \
          head -c {n} > $t; [ $(($(wc -c < $t))) -eq {n} ] || {{ rm -f $t; echo \"the copy arrived incomplete\" >&2; exit 3; }}; \
          chmod 755 $t; $t --version > /dev/null || {{ rm -f $t; echo \"this h2 does not run there\" >&2; exit 4; }}; \
          mv -f $t $d/herdr2; command -v h2 > /dev/null 2>&1 || [ -e $d/h2 ] || ln -s herdr2 $d/h2; \
          {session}$d/herdr2 server restart > /dev/null; \
-         $d/herdr2 skill install --all --detected-only > /dev/null 2>&1 || true; \
+         {unix_skill_step} \
          $d/herdr2 --version"
     );
     run_there(paths, to, &format!("sh -c '{script}'"), &exe)
@@ -588,19 +643,41 @@ fn install_payload(bin: &Path, scratch: &Path) -> Result<(Vec<u8>, bool), RpcErr
 /// Windows there: this version's release zip and the installer go to its
 /// home folder, and the installer runs from them (no download there). It
 /// swaps an h2 already there the planned way.
-fn install_windows(paths: &crate::paths::Paths, target: &str, session: Option<&str>) -> Result<String, RpcError> {
+fn install_windows(
+    paths: &crate::paths::Paths,
+    target: &str,
+    session: Option<&str>,
+    skill_sync: RemoteSkillSync,
+) -> Result<String, RpcError> {
     let scratch = crate::releases::Scratch::new()?;
     let version = env!("CARGO_PKG_VERSION");
-    let m = crate::releases::manifest(Some(version), &scratch.0)
-        .or_else(|_| crate::releases::manifest(None, &scratch.0))
+    let resolve_manifest = |exact: Option<&str>| {
+        crate::releases::manifest(exact, &scratch.0).and_then(|m| {
+            if m.generation == crate::api::GENERATION {
+                Ok(m)
+            } else {
+                Err(RpcError::new("unavailable", "protocol generation mismatch", ""))
+            }
+        })
+    };
+    let m = resolve_manifest(Some(version))
+        .or_else(|_| resolve_manifest(None))
         .map_err(|_| {
-        RpcError::new(
-            "install_failed",
-            format!("{target} runs Windows, and h2 {version} has no release to download"),
-            "install h2 there yourself",
-        )
-    })?;
-    let zip = crate::releases::fetch(&m, "windows-x86_64", &scratch.0)?;
+            RpcError::new(
+                "install_failed",
+                format!("{target} runs Windows, and h2 {version} has no release to download"),
+                "install h2 there yourself",
+            )
+        })?;
+    let zip = match crate::releases::fetch(&m, "windows-x86_64", &scratch.0) {
+        Ok(z) => z,
+        Err(e) if crate::releases::is_checksum_mismatch(&e) => {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            let m2 = resolve_manifest(None).map_err(|_| e)?;
+            crate::releases::fetch(&m2, "windows-x86_64", &scratch.0)?
+        }
+        Err(e) => return Err(e),
+    };
     let script = scratch.0.join("h2-install.ps1");
     std::fs::write(&script, include_str!("../../../distribution/install.ps1"))
         .map_err(|e| RpcError::internal(e.to_string()))?;
@@ -630,7 +707,15 @@ fn install_windows(paths: &crate::paths::Paths, target: &str, session: Option<&s
         &format!("powershell -NoProfile -ExecutionPolicy Bypass -File h2-install.ps1 h2-install.zip{session}"),
         b"",
     )?;
-    let _ = run_there(paths, to, &format!("{WINDOWS_H2} skill install --all --detected-only"), b"");
+    match skill_sync {
+        RemoteSkillSync::InstallDetectedAndSync => {
+            let _ = run_there(paths, to, &format!("{WINDOWS_H2} skill install --all --detected-only"), b"");
+            let _ = run_there(paths, to, &format!("{WINDOWS_H2} skill sync"), b"");
+        }
+        RemoteSkillSync::SyncInstalledOnly => {
+            let _ = run_there(paths, to, &format!("{WINDOWS_H2} skill sync"), b"");
+        }
+    }
     run_there(paths, to, &format!("{WINDOWS_H2} --version"), b"")
 }
 

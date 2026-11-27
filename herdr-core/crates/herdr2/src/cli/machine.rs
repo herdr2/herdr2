@@ -134,7 +134,7 @@ pub(super) fn machine(
                     "see `h2 machine ls`",
                 ));
             };
-            let version = crate::machines::install(paths, reach_of(&m), m["session"].as_str())?;
+            let version = crate::machines::update_remote(paths, reach_of(&m), m["session"].as_str())?;
             let human = format!("{} now runs {version}", p.machine);
             Out { json: json!({"machine": p.machine, "version": version}), human }
         }

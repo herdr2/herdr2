@@ -74,6 +74,14 @@ jobs:
             echo "app=${{ inputs.build_app }}" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          APP_VER="${{ steps.ver.outputs.app_version }}"
+          if git ls-remote --tags origin "refs/tags/v${APP_VER}" "refs/tags/v${APP_VER}^{}" 2>/dev/null | awk '{print $1}' | grep -Fxq "$GITHUB_SHA"; then
+            echo "Commit $GITHUB_SHA is tagged as release v${APP_VER}; release.yml owns ota-latest for versioned releases."
+            echo "ui=false" >> "$GITHUB_OUTPUT"
+            echo "core=false" >> "$GITHUB_OUTPUT"
+            echo "app=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || git diff-tree --no-commit-id --name-only -r HEAD)
           UI=false; CORE=false; APP=false
           echo "$CHANGED" | grep -q '^herdr-app/defaults/' && UI=true || true
@@ -87,6 +95,9 @@ jobs:
     needs: detect
     if: needs.detect.outputs.ui == 'true'
     runs-on: ubuntu-latest
+    concurrency:
+      group: herdr2-ota-publish
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
 
@@ -106,13 +117,16 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          APP_VER="${{ needs.detect.outputs.app_version }}"
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && git ls-remote --tags origin "refs/tags/v${APP_VER}" "refs/tags/v${APP_VER}^{}" 2>/dev/null | awk '{print $1}' | grep -Fxq "$GITHUB_SHA"; then
+            echo "Skipping ota-latest UI upload because release tag v${APP_VER} points to $GITHUB_SHA (published by release.yml)."
+            exit 0
+          fi
           if ! gh release view "$OTA_TAG" >/dev/null 2>&1; then
             gh release create "$OTA_TAG" --title "Herdr2 OTA Channel (Rolling)" --notes "Rolling OTA hot-update channel for Herdr2 UI, Core, and App." --prerelease
           fi
-          gh release upload "$OTA_TAG" \
-            dist/ota-ui/herdr2-ui-bundle.tar.gz \
-            dist/ota-ui/ui-latest.json \
-            --clobber
+          gh release upload "$OTA_TAG" dist/ota-ui/herdr2-ui-bundle.tar.gz --clobber
+          gh release upload "$OTA_TAG" dist/ota-ui/ui-latest.json --clobber
 
   build-core-ota:
     needs: detect
@@ -194,6 +208,9 @@ jobs:
     needs: [detect, build-core-ota]
     if: needs.detect.outputs.core == 'true'
     runs-on: ubuntu-latest
+    concurrency:
+      group: herdr2-ota-publish
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -206,6 +223,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          APP_VER="${{ needs.detect.outputs.app_version }}"
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && git ls-remote --tags origin "refs/tags/v${APP_VER}" "refs/tags/v${APP_VER}^{}" 2>/dev/null | awk '{print $1}' | grep -Fxq "$GITHUB_SHA"; then
+            echo "Skipping ota-latest Core upload because release tag v${APP_VER} points to $GITHUB_SHA (published by release.yml)."
+            exit 0
+          fi
           BASE_URL="https://github.com/${{ github.repository }}/releases/download/${OTA_TAG}"
           python3 scripts/release.py manifest \
             --github-release \
@@ -215,7 +237,9 @@ jobs:
           if ! gh release view "$OTA_TAG" >/dev/null 2>&1; then
             gh release create "$OTA_TAG" --title "Herdr2 OTA Channel (Rolling)" --notes "Rolling OTA hot-update channel." --prerelease
           fi
-          gh release upload "$OTA_TAG" dist/ota-core/* --clobber
+          shopt -s nullglob
+          gh release upload "$OTA_TAG" dist/ota-core/herdr2-core-* dist/ota-core/core-install.* --clobber
+          gh release upload "$OTA_TAG" dist/ota-core/core-*-manifest.json dist/ota-core/core-latest.json --clobber
 
   build-app-ota:
     needs: detect
@@ -294,6 +318,9 @@ jobs:
     needs: [detect, build-app-ota]
     if: needs.detect.outputs.app == 'true'
     runs-on: ubuntu-latest
+    concurrency:
+      group: herdr2-ota-publish
+      cancel-in-progress: false
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -306,6 +333,11 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          APP_VER="${{ needs.detect.outputs.app_version }}"
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] && git ls-remote --tags origin "refs/tags/v${APP_VER}" "refs/tags/v${APP_VER}^{}" 2>/dev/null | awk '{print $1}' | grep -Fxq "$GITHUB_SHA"; then
+            echo "Skipping ota-latest App upload because release tag v${APP_VER} points to $GITHUB_SHA (published by release.yml)."
+            exit 0
+          fi
           BASE_URL="https://github.com/${{ github.repository }}/releases/download/${OTA_TAG}"
           python3 scripts/release.py manifest \
             --github-release \
@@ -315,4 +347,6 @@ jobs:
           if ! gh release view "$OTA_TAG" >/dev/null 2>&1; then
             gh release create "$OTA_TAG" --title "Herdr2 OTA Channel (Rolling)" --notes "Rolling OTA hot-update channel." --prerelease
           fi
-          gh release upload "$OTA_TAG" dist/ota-app/* --clobber
+          shopt -s nullglob
+          gh release upload "$OTA_TAG" dist/ota-app/herdr2-app-* dist/ota-app/app-install.* --clobber
+          gh release upload "$OTA_TAG" dist/ota-app/app-latest.json --clobber

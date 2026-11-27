@@ -124,7 +124,7 @@
       "AdapterInstallItemResult": {
         "properties": {
           "action": {
-            "description": "Outcome: `installed`, `updated`, `already_ready`, `skipped`, or `failed`.",
+            "description": "Outcome: `installed`, `updated`, `up_to_date`, `already_ready`, `skipped`, or `failed`.",
             "type": "string"
           },
           "error": {
@@ -202,6 +202,12 @@
           "installed": {
             "type": "boolean"
           },
+          "latest_version": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "method": {
             "type": [
               "string",
@@ -227,6 +233,10 @@
           "state": {
             "description": "Lifecycle state: `ready`, `installing`, `missing`, or `error`.",
             "type": "string"
+          },
+          "update_available": {
+            "default": false,
+            "type": "boolean"
           },
           "version": {
             "type": [
@@ -275,6 +285,20 @@
           "inject_mcp": {
             "default": true,
             "type": "boolean"
+          },
+          "registry_checked_at_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "registry_error": {
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "registry_url": {
             "type": "string"
@@ -6304,7 +6328,7 @@
       "name": "Apache-2.0"
     },
     "title": "herdr2",
-    "version": "2.0.19"
+    "version": "2.0.20"
   },
   "methods": [
     {
@@ -13426,6 +13450,16 @@
               "string",
               "null"
             ]
+          }
+        },
+        {
+          "description": "Refresh the official ACP Registry index before reporting latest versions.",
+          "name": "refresh",
+          "required": false,
+          "schema": {
+            "default": false,
+            "description": "Refresh the official ACP Registry index before reporting latest versions.",
+            "type": "boolean"
           }
         }
       ],

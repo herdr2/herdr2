@@ -164,6 +164,13 @@ pub fn set_error(err: Option<String>) {
     st.applying = false;
 }
 
+pub fn clear_available() {
+    let mut st = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    st.ready = None;
+    st.ready_notes = None;
+    st.available = None;
+}
+
 fn failed_versions(app_dir: &Path) -> BTreeSet<String> {
     std::fs::read(app_dir.join(FAILED_FILE))
         .ok()
@@ -308,7 +315,16 @@ pub fn stage_manifest(app_dir: &Path, manifest: &UiManifest) -> Result<String, S
         let archive = work.join("ui-bundle.tar.gz");
         crate::update::download_file(&manifest.url, &archive)?;
         let bytes = std::fs::read(&archive).map_err(|e| e.to_string())?;
-        if crate::update::sha256(&bytes) != manifest.sha256.to_ascii_lowercase() {
+        let got_sha = crate::update::sha256(&bytes);
+        let want_sha = manifest.sha256.to_ascii_lowercase();
+        if got_sha != want_sha {
+            tracing::warn!(
+                "ui_update: checksum mismatch for {} ({}): expected {}, got {}",
+                manifest.version,
+                manifest.url,
+                want_sha,
+                got_sha
+            );
             return Err("UI bundle checksum mismatch".into());
         }
         let unpacked = work.join("content");
@@ -335,7 +351,41 @@ pub fn stage_manifest(app_dir: &Path, manifest: &UiManifest) -> Result<String, S
 }
 
 /// Downloads and stages the currently available UI bundle (if not already staged).
-pub fn download_and_stage_available(app_dir: &Path) -> Result<String, String> {
+/// When `releases_base` is provided and `refresh_first` is true, re-fetches `ui-latest.json`
+/// before downloading so rolling `ota-latest` updates never fail against a stale in-memory SHA-256.
+/// Also retries once after re-fetching the manifest if a mid-rollout checksum mismatch occurs.
+pub fn download_and_stage_from(
+    app_dir: &Path,
+    releases_base: Option<&str>,
+    refresh_first: bool,
+) -> Result<String, String> {
+    if refresh_first && let Some(base) = releases_base {
+        match check_manifest_from(app_dir, base) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                if let Some(staged) = staged_receipt(app_dir)
+                    && is_newer_ui_version(&staged.version, &current_version(app_dir))
+                    && !failed_versions(app_dir).contains(&staged.version)
+                {
+                    return Ok(staged.version);
+                }
+                return Err("no compatible UI update available (check for a full Herdr2 update)".into());
+            }
+            Err(e) => {
+                if let Some(staged) = staged_receipt(app_dir) {
+                    let avail = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).available.clone();
+                    if avail
+                        .as_ref()
+                        .is_some_and(|m| m.version == staged.version && m.sha256.eq_ignore_ascii_case(&staged.sha256))
+                    {
+                        return Ok(staged.version);
+                    }
+                }
+                return Err(e);
+            }
+        }
+    }
+
     if let Some(staged) = staged_receipt(app_dir) {
         let avail = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner).available.clone();
         match avail {
@@ -346,13 +396,38 @@ pub fn download_and_stage_available(app_dir: &Path) -> Result<String, String> {
             _ => {}
         }
     }
-    let manifest = STATE
+    let manifest = match STATE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .available
         .clone()
-        .ok_or_else(|| "no UI update available".to_owned())?;
-    stage_manifest(app_dir, &manifest)
+    {
+        Some(m) => m,
+        None => match releases_base {
+            Some(base) => check_manifest_from(app_dir, base)?
+                .ok_or_else(|| "no UI update available".to_owned())?,
+            None => return Err("no UI update available".to_owned()),
+        },
+    };
+    match stage_manifest(app_dir, &manifest) {
+        Ok(ver) => Ok(ver),
+        Err(err) if err.contains("checksum mismatch") => {
+            let Some(base) = releases_base else {
+                return Err(err);
+            };
+            tracing::warn!(
+                "ui_update: retrying {} after checksum mismatch by refreshing manifest from {}",
+                manifest.version,
+                base
+            );
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            match check_manifest_from(app_dir, base) {
+                Ok(Some(fresh)) => stage_manifest(app_dir, &fresh),
+                _ => Err(err),
+            }
+        }
+        Err(err) => Err(err),
+    }
 }
 
 pub fn has_staged(app_dir: &Path) -> bool {
@@ -757,8 +832,12 @@ mod tests {
     }
 
     #[cfg(unix)]
+    static STATE_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(unix)]
     #[test]
     fn end_to_end_download_apply_preserves_user_edits_and_rolls_back() {
+        let _guard = STATE_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let work = temp_dir("e2e");
         let app_dir = work.join("app");
         let server_root = work.join("server");
@@ -820,6 +899,81 @@ mod tests {
         // Failed version is blacklisted so next check skips it.
         assert_eq!(check_from(&app_dir, &releases_url).unwrap(), None);
 
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_ui_manifest_sha256_refreshes_and_retries_on_rolling_ota_channel() {
+        let _guard = STATE_TEST_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let work = temp_dir("stale-sha");
+        let app_dir = work.join("app");
+        let ota_dir = work.join("releases/download/ota-latest");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        std::fs::create_dir_all(&ota_dir).unwrap();
+
+        let bundle_src = work.join("bundle-src");
+        std::fs::create_dir_all(bundle_src.join("mods/demo")).unwrap();
+        std::fs::write(bundle_src.join("mods/demo/main.js"), "// rolling v1\n").unwrap();
+
+        let archive = ota_dir.join("herdr2-ui-bundle.tar.gz");
+        let pack = |src: &Path, dst: &Path| {
+            let st = std::process::Command::new("tar")
+                .args(["-czf"])
+                .arg(dst)
+                .arg("-C")
+                .arg(src)
+                .arg("mods")
+                .status()
+                .unwrap();
+            assert!(st.success());
+            crate::update::sha256(&std::fs::read(dst).unwrap())
+        };
+
+        let sha1 = pack(&bundle_src, &archive);
+        let base_url = format!("file://{}", ota_dir.display());
+        let write_manifest = |ver: &str, sha: &str| {
+            let m = serde_json::json!({
+                "version": ver,
+                "app_version_min": env!("CARGO_PKG_VERSION"),
+                "host_api_generation": crate::mods::UI_HOST_API_GENERATION,
+                "url": format!("file://{}", archive.display()),
+                "sha256": sha,
+                "notes": "Rolling UI"
+            });
+            std::fs::write(ota_dir.join("ui-latest.json"), m.to_string()).unwrap();
+        };
+
+        // 1) Hourly background check caches v1's SHA-256 in memory.
+        write_manifest("99.0.0-ui.1", &sha1);
+        assert_eq!(
+            check_manifest_from(&app_dir, &base_url).unwrap().map(|m| m.version),
+            Some("99.0.0-ui.1".into())
+        );
+
+        // 2) Rolling `ota-latest` overwrites the archive + ui-latest.json with v2 before user clicks Update.
+        std::fs::write(bundle_src.join("mods/demo/main.js"), "// rolling v2\n").unwrap();
+        let sha2 = pack(&bundle_src, &archive);
+        assert_ne!(sha1, sha2);
+        write_manifest("99.0.0-ui.2", &sha2);
+
+        // Pre-download refresh picks up 99.0.0-ui.2 + sha2 without checksum mismatch.
+        let staged_ver = download_and_stage_from(&app_dir, Some(&base_url), true).unwrap();
+        assert_eq!(staged_ver, "99.0.0-ui.2");
+        let _ = std::fs::remove_dir_all(app_dir.join(STAGE_DIR));
+
+        // 3) Even if the archive is clobbered *after* pre-refresh (`refresh_first = false`),
+        //    thechecksum-mismatch retry re-fetches `ui-latest.json` and succeeds.
+        check_manifest_from(&app_dir, &base_url).unwrap();
+        std::fs::write(bundle_src.join("mods/demo/main.js"), "// rolling v3\n").unwrap();
+        let sha3 = pack(&bundle_src, &archive);
+        assert_ne!(sha2, sha3);
+        write_manifest("99.0.0-ui.3", &sha3);
+
+        let retried_ver = download_and_stage_from(&app_dir, Some(&base_url), false).unwrap();
+        assert_eq!(retried_ver, "99.0.0-ui.3");
+
+        clear_available();
         let _ = std::fs::remove_dir_all(&work);
     }
 }
