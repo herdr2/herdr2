@@ -1172,6 +1172,15 @@ describe("resolveAcpAuthErrorAction", () => {
     );
     expect(remote?.argv).toBeNull();
     expect(resolveAcpAuthErrorAction({ agent: "claude" }, "Network connection reset", false)).toBeNull();
+
+    const piAct = resolveAcpAuthErrorAction(
+      { agent: "pi", cwd: "D:\\Users\\zhihao.zou" },
+      "ACP session/new failed: Authentication required: Configure an API key or log in with an OAuth provider. (code -32000)",
+      false,
+    );
+    expect(piAct?.titleZh).toBe("Pi 需要先配置登录或 API Key");
+    expect(piAct?.argv).toEqual(["pi"]);
+    expect(piAct?.tabName).toBe("Pi CLI");
   });
 });
 

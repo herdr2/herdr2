@@ -1050,6 +1050,25 @@ mod tests {
         assert_eq!(folder_name(r"C:\Users\can\src\api", r"C:\Users\can"), "api");
         assert_eq!(folder_name(r"\\?\C:\Users\can\src\api\", r"C:\Users\can"), "api");
         assert_eq!(folder_name("C:/Users/can/src/web", r"C:\Users\can"), "web");
+
+        // Remote home folders display as `~` even when local home() is from another OS/host.
+        assert!(is_remote_home_folder(""));
+        assert!(is_remote_home_folder("~"));
+        assert!(is_remote_home_folder("/root"));
+        assert!(is_remote_home_folder("/home/zzh0838"));
+        assert!(is_remote_home_folder("/home/zzh0838/"));
+        assert!(is_remote_home_folder("/Users/alice"));
+        assert!(is_remote_home_folder(r"D:\Users\alice"));
+        assert!(!is_remote_home_folder("/home/zzh0838/Work/herdr2"));
+        assert!(!is_remote_home_folder("/Users/alice/Projects"));
+        assert!(!is_remote_home_folder(r"D:\Users\alice\repo"));
+
+        let mut m = Model::default();
+        m.add_space("wsl/sp1", "", "/home/zzh0838", Tab::new("wsl/tb1", "", "wsl/p1", "wsl/t1"));
+        m.space_mut("wsl/sp1").unwrap().machine = Some("ubuntu-wsl".into());
+        assert_eq!(m.space_name(m.space("wsl/sp1").unwrap(), r"D:\Users\winuser"), "~");
+        m.pane_folders.insert("wsl/p1".into(), "/home/zzh0838/Work/herdr2".into());
+        assert_eq!(m.space_name(m.space("wsl/sp1").unwrap(), r"D:\Users\winuser"), "herdr2");
     }
 
     #[test]

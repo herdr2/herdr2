@@ -59,7 +59,12 @@ pub(super) fn detail(a: &Value) -> String {
     if let Some(msg) = a["status"]["msg"].as_str().filter(|s| !s.is_empty()) {
         return msg.lines().next().unwrap_or_default().chars().take(60).collect();
     }
-    let base = a["template"].as_str().filter(|s| !s.is_empty()).map(String::from).unwrap_or_else(|| folder(a));
+    let base = a["labels"]["drove.display"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .or_else(|| a["template"].as_str().filter(|s| !s.is_empty()))
+        .map(String::from)
+        .unwrap_or_else(|| folder(a));
     match a["inbox_len"].as_u64() {
         Some(n) if n > 0 => format!("{base} (inbox: {n})"),
         _ => base,

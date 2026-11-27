@@ -1238,9 +1238,13 @@ fn deadline_for(core: &Core, method: &str, params: &Value) -> Duration {
         // Rollback may respawn a fresh ACP/PTY session and restore workspace git trees over SSH.
         return config.machine_timeout() + Duration::from_secs(60);
     }
-    if matches!(method, "drove.probe" | "drove.roles.ai_configure" | "adapter.install" | "adapter.update") {
+    if matches!(method, "adapter.install" | "adapter.update") {
+        // Standalone ACP adapter archives (e.g. claude-agent-acp ~235MB) and npm installs can take several minutes.
+        return config.machine_timeout() + Duration::from_secs(900);
+    }
+    if matches!(method, "drove.probe" | "drove.roles.ai_configure") {
         // Probing installed ACP agents spawns multiple cold-start handshakes (up to 60s each),
-        // AI role configuration may probe + run a reasoning completion, and adapter installs download packages.
+        // and AI role configuration may probe + run a reasoning completion.
         return config.machine_timeout() + Duration::from_secs(180);
     }
     if method == "drove.settings.get" {

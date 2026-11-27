@@ -805,10 +805,25 @@ pub(super) async fn run_adversarial_review_gate(
             let _ = tokio::time::timeout(Duration::from_millis(400), notified).await;
         }
 
-        // Guard against rogue file writes in unsandboxed environments (e.g. Windows job-object or container without bwrap).
-        let mut rogue_touched = diff_touched_paths(work_cwd, &rev_work_baseline);
+        // Guard against rogue file writes in unsandboxed environments (e.g. Windows job-object or container without bwrap),
+        // while filtering out concurrent legitimate writes/merges into `run.cwd` by sibling tasks.
+        let raw_work_diff = diff_touched_paths(work_cwd, &rev_work_baseline);
+        let mut rogue_touched = if work_cwd == run.cwd {
+            filter_concurrent_shared_cwd_changes(core, &run.id, &task.id, &run.cwd, spawn_agent_id, prev_entry_len, raw_work_diff)
+        } else {
+            raw_work_diff
+        };
         if let Some(ref main_base) = rev_main_baseline {
-            for rel in diff_touched_paths(&run.cwd, main_base) {
+            let filtered_base = filter_concurrent_shared_cwd_changes(
+                core,
+                &run.id,
+                &task.id,
+                &run.cwd,
+                spawn_agent_id,
+                prev_entry_len,
+                diff_touched_paths(&run.cwd, main_base),
+            );
+            for rel in filtered_base {
                 rogue_touched.push(format!("(base) {rel}"));
             }
         }
@@ -983,6 +998,12 @@ pub(super) async fn run_adversarial_review_gate(
 
     match circuit_outcome {
         ReviewCircuitOutcome::HandoffToCoordinator | ReviewCircuitOutcome::AwaitingUserDecision => {
+            let _ = super::integrate::sync_worktree_for_coordinator_handoff(
+                core,
+                run,
+                author_worker.worktree.as_deref(),
+            )
+            .await;
             let _ = core.drove.store.update_attempt(&attempt.id, |a| {
                 a.outcome = Some(Outcome::Failed);
                 a.ended_at = Some(now_iso());
@@ -1006,7 +1027,10 @@ pub(super) async fn run_adversarial_review_gate(
             } else {
                 "review_handoff_to_coordinator"
             };
-            return Err(ApiErr::new(422, err_code, reject_msg));
+            let worker_stop_msg = format!(
+                "{reject_msg}\n\n[DROVE CIRCUIT BREAKER TRIPPED — ATTEMPT CLOSED] Maximum review rounds reached; this task has been handed off to the Coordinator and candidate changes have been synced. STOP IMMEDIATELY: do NOT edit any more files, do NOT run further commands, and do NOT call `drove_finish` again. End your turn now."
+            );
+            return Err(ApiErr::new(422, err_code, worker_stop_msg));
         }
         ReviewCircuitOutcome::ContinueNormal => {
             Err(ApiErr::new(422, "review_changes_requested", reject_msg))
@@ -1174,10 +1198,24 @@ async fn run_adversarial_breaker_pass(
     let quotas = if cfg.magpie.enabled { core.drove.magpie.fetch_if_enabled(&cfg.magpie, false).await.0 } else { None };
     let run_workers = core.drove.store.list_workers(Some(&run.id));
     let run_attempts = core.drove.store.list_attempts(Some(&run.id), None, None);
-    let candidates =
+    let mut candidates =
         build_reviewer_candidates(&role_cfg, spec, &attempt.agent, quotas.as_deref(), &run_workers, &run_attempts);
     if candidates.is_empty() {
         return Ok(false);
+    }
+    if spec.agent.as_deref().map(str::trim).is_none_or(str::is_empty)
+        && candidates.len() >= 2
+        && cfg.ai.enabled
+        && super::router::has_routing_notes(&cfg, &candidates.iter().collect::<Vec<_>>())
+    {
+        let pool: Vec<(usize, RoleTarget)> = candidates.iter().cloned().enumerate().collect();
+        if let Some((pref_idx, _)) = super::ai::pick_role_candidate(core, &run.id, task, "reviewer", &pool).await
+            && pref_idx > 0
+            && pref_idx < candidates.len()
+        {
+            let preferred = candidates.remove(pref_idx);
+            candidates.insert(0, preferred);
+        }
     }
 
     const MAX_INLINE_BREAKER_PATCH_CHARS: usize = 36_000;
@@ -1207,6 +1245,7 @@ async fn run_adversarial_breaker_pass(
             super::integrate::reset_worktree_clean(&brk_cwd);
         }
         let brk_baseline = super::roles::capture_dirty_baseline(&brk_cwd);
+        let author_wt_baseline = (work_cwd != run.cwd).then(|| super::roles::capture_dirty_baseline(work_cwd));
         let main_baseline = super::roles::capture_dirty_baseline(&run.cwd);
 
         let port = core.drove.web_port.load(std::sync::atomic::Ordering::SeqCst);
@@ -1398,7 +1437,23 @@ async fn run_adversarial_breaker_pass(
             .filter(|p| !super::roles::is_ephemeral_cache_path(p))
             .collect();
         let mut violations = super::roles::find_scope_violations(&scope_cfg, &touched);
-        for rel in diff_touched_paths(&run.cwd, &main_baseline) {
+        if let Some(ref wt_base) = author_wt_baseline {
+            for rel in diff_touched_paths(work_cwd, wt_base) {
+                if !super::roles::is_ephemeral_cache_path(&rel) {
+                    violations.push(format!("(candidate) {rel}"));
+                }
+            }
+        }
+        let filtered_base = filter_concurrent_shared_cwd_changes(
+            core,
+            &run.id,
+            &task.id,
+            &run.cwd,
+            spawn.agent_id,
+            prev_entry_len,
+            diff_touched_paths(&run.cwd, &main_baseline),
+        );
+        for rel in filtered_base {
             violations.push(format!("(base) {rel}"));
         }
         if !violations.is_empty() {
@@ -1532,6 +1587,12 @@ async fn run_adversarial_breaker_pass(
 
             return match circuit_outcome {
                 ReviewCircuitOutcome::HandoffToCoordinator | ReviewCircuitOutcome::AwaitingUserDecision => {
+                    let _ = super::integrate::sync_worktree_for_coordinator_handoff(
+                        core,
+                        run,
+                        author_worker.worktree.as_deref(),
+                    )
+                    .await;
                     let _ = core.drove.store.update_attempt(&attempt.id, |a| {
                         a.outcome = Some(Outcome::Failed);
                         a.ended_at = Some(now_iso());
@@ -1555,7 +1616,10 @@ async fn run_adversarial_breaker_pass(
                     } else {
                         "review_handoff_to_coordinator"
                     };
-                    Err(ApiErr::new(422, err_code, reject_msg))
+                    let worker_stop_msg = format!(
+                        "{reject_msg}\n\n[DROVE CIRCUIT BREAKER TRIPPED — ATTEMPT CLOSED] Maximum review rounds reached; this task has been handed off to the Coordinator and candidate changes have been synced. STOP IMMEDIATELY: do NOT edit any more files, do NOT run further commands, and do NOT call `drove_finish` again. End your turn now."
+                    );
+                    Err(ApiErr::new(422, err_code, worker_stop_msg))
                 }
                 ReviewCircuitOutcome::ContinueNormal => {
                     Err(ApiErr::new(422, "review_changes_requested", reject_msg))
@@ -1736,6 +1800,93 @@ fn mark_reviewer_attempt_failed(
         tokens: None,
         cost: None,
     });
+}
+
+/// Filters `diff_touched_paths(&run.cwd, ...)` during concurrent runs so legitimate merges or
+/// writes into `run.cwd` by sibling tasks are never misattributed to a read-only Reviewer or Breaker.
+fn filter_concurrent_shared_cwd_changes(
+    core: &Core,
+    run_id: &str,
+    current_task_id: &str,
+    run_cwd: &str,
+    agent_id: u32,
+    start_idx: usize,
+    raw_diffs: Vec<String>,
+) -> Vec<String> {
+    if raw_diffs.is_empty() {
+        return raw_diffs;
+    }
+    let sibling_tasks = core.drove.store.list_tasks(run_id);
+    let mut sibling_owned: Vec<String> = Vec::new();
+    for t in &sibling_tasks {
+        if t.id == current_task_id || t.template == Some(true) {
+            continue;
+        }
+        if let Some(res) = &t.result
+            && let Some(modified) = &res.files_modified
+        {
+            for m in modified {
+                let norm = m.trim().replace('\\', "/").trim_start_matches("./").to_string();
+                if !norm.is_empty() {
+                    sibling_owned.push(norm);
+                }
+            }
+        }
+        if matches!(t.status, TaskStatus::Running | TaskStatus::Succeeded) {
+            for f in &t.files {
+                let norm = f.trim().replace('\\', "/").trim_start_matches("./").trim_end_matches('/').to_string();
+                if !norm.is_empty() {
+                    sibling_owned.push(norm);
+                }
+            }
+            let tgt = t.spec.target.trim().replace('\\', "/").trim_start_matches("./").trim_end_matches('/').to_string();
+            if !tgt.is_empty() && (tgt.contains('/') || tgt.contains('.')) && !tgt.contains(' ') {
+                sibling_owned.push(tgt);
+            }
+        }
+    }
+
+    let mutating_haystack: String = core
+        .read_transcript_entries(agent_id)
+        .unwrap_or_default()
+        .into_iter()
+        .skip(start_idx)
+        .filter_map(|e| match e {
+            Entry::ToolCall { title, tool_kind, detail, .. } => {
+                let kind = tool_kind.as_deref().unwrap_or("").to_ascii_lowercase();
+                if matches!(kind.as_str(), "read" | "search" | "think" | "fetch" | "list" | "glob" | "grep") {
+                    None
+                } else {
+                    Some(format!("{title}\n{}", detail.unwrap_or_default()))
+                }
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let norm_run_cwd = run_cwd.trim_end_matches('/').replace('\\', "/");
+    raw_diffs
+        .into_iter()
+        .filter(|p| !super::roles::is_ephemeral_cache_path(p))
+        .filter(|rel| {
+            let norm_rel = rel.replace('\\', "/");
+            let claimed_by_sibling = sibling_owned.iter().any(|own| {
+                own == &norm_rel
+                    || norm_rel.strip_prefix(own.as_str()).is_some_and(|r| r.starts_with('/'))
+            });
+            if claimed_by_sibling && !mutating_haystack.contains(&format!("{norm_run_cwd}/{norm_rel}")) {
+                return false;
+            }
+            if mutating_haystack.is_empty() {
+                return false;
+            }
+            let basename = norm_rel.rsplit('/').next().unwrap_or(&norm_rel);
+            mutating_haystack.contains(&norm_rel)
+                || mutating_haystack.contains(&norm_run_cwd)
+                || (!basename.is_empty() && mutating_haystack.contains(basename))
+        })
+        .collect()
 }
 
 fn collect_reviewer_turn_output(core: &Core, agent_id: u32, start_idx: usize) -> (String, Option<String>) {

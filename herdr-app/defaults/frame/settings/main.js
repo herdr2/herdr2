@@ -438,6 +438,10 @@ export default class Settings extends View {
     this.droveProbeFixAgent = null;
     this.droveProbeFixModel = null;
     this.droveProbeFixEffort = null;
+    this.agentAiInstallTargetId = null;
+    this.agentAiInstallAgent = null;
+    this.agentAiInstallModel = null;
+    this.agentAiInstallEffort = null;
     this.droveFixKnownAgents = {};
     this.droveFixKnownLoading = false;
     this.droveAiTesting = false;
@@ -2142,6 +2146,10 @@ export default class Settings extends View {
     this.droveProbeFixAgent = null;
     this.droveProbeFixModel = null;
     this.droveProbeFixEffort = null;
+    this.agentAiInstallTargetId = null;
+    this.agentAiInstallAgent = null;
+    this.agentAiInstallModel = null;
+    this.agentAiInstallEffort = null;
     this.syncAdapterInputs(null);
     cx.spawn(async (cx) => {
       await this.loadDrove();
@@ -2275,8 +2283,10 @@ export default class Settings extends View {
         ? "managed_acp_adapter_install"
         : a.issueKind === "env"
           ? "environment_detection"
-          : "acp_probe";
-      return `- agent: ${a.id}\n  kind: ${kind}\n  command: ${cmd}\n  path: ${a.path ?? "(unknown)"}\n  error: ${err}`;
+          : a.issueKind === "auth"
+            ? "acp_auth_required"
+            : "acp_probe";
+      return `- agent: ${a.id}\n  kind: ${kind}\n  command: ${cmd}\n  path: ${a.path ?? "(unknown)"}\n  error: ${this.stripAcpAuthRawNoise(err)}`;
     });
 
     if (this.lang() === "zh-CN") {
@@ -2289,7 +2299,7 @@ export default class Settings extends View {
         "",
         "请严格按以下阶段推进：",
         "1. **只读排查与解读错误原因**：",
-        "   - 对比守护进程 `herdr2 serve` 与当前交互式 Shell 的环境差异（尤其是 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY、PATH、Node/npm、认证凭据、以及 ACP 适配器是否已安装）。",
+        "   - 对比守护进程 `herdr2 serve` 与当前交互式 Shell 的环境差异（尤其是 HTTP_PROXY/HTTPS_PROXY/ALL_PROXY、PATH、Node/npm、认证凭据文件如 `~/.pi/agent/auth.json` / `models.json`、Windows 注册表用户环境变量 vs PowerShell `$PROFILE` / `~/.bashrc`、以及 ACP 适配器是否已安装）。",
         "   - 区分哪些是“工作区 CLI 正常但守护进程无头 ACP 探测环境缺失”导致的假阳性，哪些是需要登录、修配置、设代理镜像或安装适配器的真实问题。",
         "   - 逐项向我清楚解读每个异常 Agent 的报错含义与根本原因。",
         "2. **制定修复方案并等待确认**：",
@@ -2309,7 +2319,7 @@ export default class Settings extends View {
       "",
       "Please follow these phases strictly:",
       "1. **Read-only diagnosis & explain root causes**:",
-      "   - Compare the `herdr2 serve` daemon environment against the interactive shell (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY, PATH, Node/npm, auth state, and installed ACP adapters).",
+      "   - Compare the `herdr2 serve` daemon environment against the interactive shell (HTTP_PROXY/HTTPS_PROXY/ALL_PROXY, PATH, Node/npm, persistent auth files like `~/.pi/agent/auth.json` / `models.json`, Windows Registry user env vars vs PowerShell `$PROFILE` / `~/.bashrc`, and installed ACP adapters).",
       "   - Distinguish workspace-CLI vs headless-ACP false positives from genuine missing-adapter, network/mirror, config, or login issues.",
       "   - Clearly explain what each error means and its root cause.",
       "2. **Propose a fix plan & wait for confirmation**:",
@@ -2348,6 +2358,115 @@ export default class Settings extends View {
     ].join("\n");
   }
 
+  agentLoginSpec(agentId, row = null) {
+    const id = this.canonicalFixAgentId(agentId ?? row?.id);
+    switch (id) {
+      case "pi":
+        return {
+          argv: ["pi"],
+          display: "pi (/login)",
+          hintEn: "Run `pi` and execute `/login` (or configure `~/.pi/agent/models.json`; Windows env vars must be in User/System env, not only $PROFILE)",
+          hintZh: "运行 `pi` 并执行 `/login` 登录或配置 `~/.pi/agent/models.json`（Windows 环境变量需设在用户/系统变量，勿仅写在 $PROFILE）",
+        };
+      case "claude":
+        return {
+          argv: ["claude"],
+          display: "claude",
+          hintEn: "Run `claude` in a terminal to complete setup & sign in",
+          hintZh: "在终端运行 `claude` 选择主题并完成登录（或执行 `/login`）",
+        };
+      case "cursor":
+        return {
+          argv: ["cursor-agent", "login"],
+          display: "cursor-agent login",
+          hintEn: "Run `cursor-agent login` in a terminal to sign in",
+          hintZh: "在终端运行 `cursor-agent login` 完成登录",
+        };
+      case "codex":
+        return {
+          argv: ["codex", "login"],
+          display: "codex login",
+          hintEn: "Run `codex login` in a terminal to sign in",
+          hintZh: "在终端运行 `codex login` 完成登录",
+        };
+      case "copilot":
+        return {
+          argv: ["copilot", "login"],
+          display: "copilot login",
+          hintEn: "Run `copilot login` in a terminal to sign in",
+          hintZh: "在终端运行 `copilot login` 完成登录",
+        };
+      case "kimi":
+        return {
+          argv: ["kimi", "login"],
+          display: "kimi login",
+          hintEn: "Run `kimi login` in a terminal to sign in",
+          hintZh: "在终端运行 `kimi login` 完成登录",
+        };
+      case "gemini":
+        return {
+          argv: ["gemini"],
+          display: "gemini",
+          hintEn: "Run `gemini` in a terminal to sign in or configure API key",
+          hintZh: "在终端运行 `gemini` 完成登录或配置 API Key",
+        };
+      case "qwen":
+        return {
+          argv: ["qwen"],
+          display: "qwen",
+          hintEn: "Run `qwen` in a terminal to sign in or configure API key",
+          hintZh: "在终端运行 `qwen` 完成登录或配置 API Key",
+        };
+      case "opencode":
+        return {
+          argv: ["opencode", "auth", "login"],
+          display: "opencode auth login",
+          hintEn: "Run `opencode auth login` in a terminal to configure credentials",
+          hintZh: "在终端运行 `opencode auth login` 配置模型凭据",
+        };
+      default:
+        if (row?.cliInstalled && row?.cli) {
+          return {
+            argv: [row.cli],
+            display: row.cli,
+            hintEn: `Sign in via \`${row.cli}\` in a terminal`,
+            hintZh: `请在终端运行 \`${row.cli}\` 完成登录认证`,
+          };
+        }
+        return null;
+    }
+  }
+
+  launchAgentLoginCli(row, cx) {
+    if (!row || (typeof checking === "function" && checking())) return;
+    const spec = this.agentLoginSpec(row.id, row);
+    if (!spec?.argv?.length) return;
+    const targetMachine = this.droveMachine ?? null;
+    const tabName = this.tr(`${row.name} Sign In`, `${row.name} 登录`);
+    const targetSpace = this.targetHomeSpaceForMachine(targetMachine);
+    const baseLaunchArgs = {
+      folder: this.defaultHomeFolderForMachine(targetMachine),
+      argv: [...spec.argv],
+    };
+    if (targetSpace) {
+      run("tab.new", { space: targetSpace.id, name: tabName, ...baseLaunchArgs });
+    } else {
+      const args = { ...baseLaunchArgs, tab: tabName };
+      if (targetMachine) args.machine = targetMachine;
+      run("space.new", args);
+    }
+    this.close();
+    const machineText = targetMachine || this.tr("this computer", "本机");
+    notify({
+      title: this.tr(`Opened ${row.name} sign-in terminal`, `已打开 ${row.name} 终端登录`),
+      body: this.tr(
+        `Complete sign-in (${spec.display}) on ${machineText}, then return to Settings → Agents & ACP and click Detect Environment.`,
+        `请在「${machineText}」终端完成登录或配置 API Key（${spec.display}），完成后返回「设置 → 智能体与 ACP」点击「一键检测环境」。`,
+      ),
+    });
+    cx?.notify?.();
+  }
+
   installAgentCli(row, cx) {
     if (!row?.install || (typeof checking === "function" && checking())) return;
     const targetMachine = this.droveMachine ?? null;
@@ -2356,16 +2475,15 @@ export default class Settings extends View {
       ? [...row.install.winArgv]
       : [...row.install.argv];
     const tabName = this.tr(`Install ${row.name}`, `安装 ${row.name}`);
-    const targetSpace = this.targetSpaceForDroveMachine();
-    const launchArgs = {
-      name: tabName,
+    const targetSpace = this.targetHomeSpaceForMachine(targetMachine);
+    const baseLaunchArgs = {
       folder: this.defaultHomeFolderForMachine(targetMachine),
       argv,
     };
     if (targetSpace) {
-      run("tab.new", { space: targetSpace.id, ...launchArgs });
+      run("tab.new", { space: targetSpace.id, name: tabName, ...baseLaunchArgs });
     } else {
-      const args = { ...launchArgs, tab: tabName };
+      const args = { ...baseLaunchArgs, tab: tabName };
       if (targetMachine) args.machine = targetMachine;
       run("space.new", args);
     }
@@ -2381,15 +2499,125 @@ export default class Settings extends View {
     cx?.notify?.();
   }
 
-  launchAgentToInstall(row, cx) {
+  ensureAgentAiInstallSelection(targetRowId = null) {
+    const options = this.droveFixAgentOptions();
+    const excludeId = this.canonicalFixAgentId(targetRowId ?? this.agentAiInstallTargetId);
+    const curId = this.canonicalFixAgentId(this.agentAiInstallAgent);
+    let chosen = curId ? options.find((o) => o.id === curId) : null;
+    if (!chosen) {
+      chosen =
+        options.find((o) => o.ready) ??
+        options.find((o) => o.installed) ??
+        options.find((o) => !excludeId || o.id !== excludeId) ??
+        options[0] ??
+        null;
+      this.agentAiInstallAgent = chosen?.id ?? null;
+      this.agentAiInstallModel = null;
+    } else if (this.agentAiInstallAgent !== chosen.id) {
+      this.agentAiInstallAgent = chosen.id;
+    }
+    const agent = chosen?.id ?? null;
+    const model = String(this.agentAiInstallModel ?? "").trim() || null;
+    const disabledReason = agent ? this.droveFixEffortDisabledReason(agent, model) : null;
+    if (agent && this.agentAiInstallEffort && !disabledReason) {
+      this.agentAiInstallEffort = this.clampEffortFor(agent, model, this.agentAiInstallEffort);
+    }
+    return {
+      agent,
+      model,
+      effort: this.agentAiInstallEffort ?? null,
+      disabledReason,
+      option: chosen,
+      options,
+    };
+  }
+
+  setAgentAiInstallAgent(agentId, cx) {
+    const next = this.canonicalFixAgentId(agentId);
+    if (!next) return;
+    this.agentAiInstallAgent = next;
+    this.agentAiInstallModel = null;
+    if (this.agentAiInstallEffort && !this.droveFixEffortDisabledReason(next, null)) {
+      this.agentAiInstallEffort = this.clampEffortFor(next, null, this.agentAiInstallEffort);
+    }
+    cx?.notify?.();
+  }
+
+  setAgentAiInstallModel(modelId, cx) {
+    const next = String(modelId ?? "").trim() || null;
+    this.agentAiInstallModel = next;
+    const agent = this.canonicalFixAgentId(this.agentAiInstallAgent);
+    if (agent && this.agentAiInstallEffort && !this.droveFixEffortDisabledReason(agent, next)) {
+      this.agentAiInstallEffort = this.clampEffortFor(agent, next, this.agentAiInstallEffort);
+    }
+    cx?.notify?.();
+  }
+
+  setAgentAiInstallEffort(effort, cx) {
+    const raw = String(effort ?? "").trim().toLowerCase();
+    if (!raw || raw === "auto" || raw === "default") {
+      this.agentAiInstallEffort = null;
+    } else {
+      const agent = this.canonicalFixAgentId(this.agentAiInstallAgent);
+      this.agentAiInstallEffort = agent
+        ? this.clampEffortFor(agent, this.agentAiInstallModel, raw)
+        : raw;
+    }
+    cx?.notify?.();
+  }
+
+  openAgentAiInstall(rowOrId, cx) {
+    const targetId = typeof rowOrId === "string" ? rowOrId : rowOrId?.id;
+    if (!targetId) return;
+    if (
+      this.agentAiInstallTargetId !== targetId &&
+      typeof this.picking === "string" &&
+      this.picking.startsWith("drove:agent-install-")
+    ) {
+      this.picking = null;
+      this.droveModelSubmit = null;
+    }
+    this.agentAiInstallTargetId = targetId;
+    this.ensureAgentAiInstallSelection(targetId);
+    const machineKey = this.droveMachine ?? "__local__";
+    if (!Array.isArray(this.droveFixKnownAgents?.[machineKey])) {
+      this.loadDroveFixKnownAgents(cx);
+    }
+    cx?.notify?.();
+  }
+
+  closeAgentAiInstall(cx) {
+    this.agentAiInstallTargetId = null;
+    if (typeof this.picking === "string" && this.picking.startsWith("drove:agent-install-")) {
+      this.picking = null;
+      this.droveModelSubmit = null;
+    }
+    cx?.notify?.();
+  }
+
+  toggleAgentAiInstall(rowOrId, cx) {
+    const targetId = typeof rowOrId === "string" ? rowOrId : rowOrId?.id;
+    if (!targetId) return;
+    if (this.agentAiInstallTargetId === targetId) {
+      this.closeAgentAiInstall(cx);
+    } else {
+      this.openAgentAiInstall(targetId, cx);
+    }
+  }
+
+  launchAgentToInstall(row, cx, override = null) {
     if (!row || this.droveProbeAgentLaunching || (typeof checking === "function" && checking())) return;
     const targetMachine = this.droveMachine ?? null;
     const summary = this.droveProbeSummary();
+    const selectedAgent = override?.agent !== undefined ? override.agent : this.agentAiInstallAgent;
+    const selectedModel = override?.model !== undefined ? override.model : this.agentAiInstallModel;
+    const selectedEffort = override?.effort !== undefined ? override.effort : this.agentAiInstallEffort;
+    const needSeparateAcp = Boolean(row.cliInstalled && row.acpMode === "separate" && !row.acpInstalled);
     this.droveProbeAgentLaunching = true;
     cx?.notify?.();
     cx.spawn(async (cx) => {
       try {
-        const picked = await this.resolveFixAgentLaunch(targetMachine, summary.ready, null);
+        const picked = await this.resolveFixAgentLaunch(targetMachine, summary.ready, selectedAgent);
         if (!picked) {
           notify({
             title: this.tr("No installed AI agent available", "当前主机未检测到可用的 AI Agent"),
@@ -2401,25 +2629,51 @@ export default class Settings extends View {
           });
           return;
         }
+        const pickedId = this.canonicalFixAgentId(picked.id || selectedAgent || picked.name);
+        let cleanModel = pickedId === "zcode" ? null : (String(selectedModel ?? "").trim() || null);
+        const effortDisabled = Boolean(this.droveFixEffortDisabledReason(pickedId, cleanModel));
+        let cleanEffort = !effortDisabled && selectedEffort
+          ? this.clampEffortFor(pickedId, cleanModel, selectedEffort)
+          : null;
+        if (pickedId === "cursor") {
+          const resolvedCursor = this.resolveCursorCliModelForLaunch(cleanModel, cleanEffort, this.probedAgents());
+          cleanModel = resolvedCursor.model;
+          cleanEffort = resolvedCursor.effort;
+        }
         const prompt = this.buildAgentInstallPrompt(row);
-        const tabName = this.tr(`Install ${row.name}`, `AI 安装 ${row.name}`);
-        const targetSpace = this.targetSpaceForDroveMachine();
-        const launchArgs = {
-          name: tabName,
+        const tabName = needSeparateAcp
+          ? this.tr(`Install ${row.name} ACP`, `AI 安装 ${row.name} ACP`)
+          : this.tr(`Install ${row.name}`, `AI 安装 ${row.name}`);
+        const targetSpace = this.targetHomeSpaceForMachine(targetMachine);
+        const baseLaunchArgs = {
           folder: this.defaultHomeFolderForMachine(targetMachine),
           argv: picked.argv,
           task: prompt,
         };
+        if (cleanModel) baseLaunchArgs.model = cleanModel;
+        if (cleanEffort) baseLaunchArgs.effort = cleanEffort;
         if (targetSpace) {
-          run("tab.new", { space: targetSpace.id, ...launchArgs });
+          run("tab.new", { space: targetSpace.id, name: tabName, ...baseLaunchArgs });
         } else {
-          const args = { ...launchArgs, tab: tabName };
+          const args = { ...baseLaunchArgs, tab: tabName };
           if (targetMachine) args.machine = targetMachine;
           run("space.new", args);
         }
+        this.agentAiInstallTargetId = null;
+        if (typeof this.picking === "string" && this.picking.startsWith("drove:agent-install-")) {
+          this.picking = null;
+          this.droveModelSubmit = null;
+        }
         this.close();
+        const metaParts = [cleanModel, cleanEffort ? this.effortLabel(cleanEffort) : null].filter(Boolean);
+        const metaEn = metaParts.length > 0 ? ` (${metaParts.join(" · ")})` : "";
+        const metaZh = metaParts.length > 0 ? `（${metaParts.join(" · ")}）` : "";
+        const targetLabel = needSeparateAcp ? `${row.name} ACP` : row.name;
         notify({
-          title: this.tr(`Launched ${picked.name} to install ${row.name}`, `已启动 ${picked.name} 协助安装 ${row.name}`),
+          title: this.tr(
+            `Launched ${picked.name}${metaEn} to install ${targetLabel}`,
+            `已启动 ${picked.name}${metaZh} 协助安装 ${targetLabel}`,
+          ),
           body: this.tr(
             "After installation finishes, return to Settings → Agents & ACP and click Detect Environment.",
             "安装完成后，返回「设置 → 智能体与 ACP」点击「一键检测环境」即可更新状态。",
@@ -2438,18 +2692,112 @@ export default class Settings extends View {
     });
   }
 
-  targetSpaceForDroveMachine() {
-    const targetMachine = this.droveMachine ?? null;
+  isLikelyRemoteHomePath(rawPath) {
+    const p = String(rawPath ?? "").trim().replace(/[\\/]+$/, "");
+    if (!p || p === "~" || p === "/root") return true;
+    if (/^\/(?:home|Users)\/[^/\\]+$/.test(p)) return true;
+    if (/^[A-Za-z]:[\\/]Users[\\/][^/\\]+$/i.test(p)) return true;
+    return false;
+  }
+
+  isHomeSpace(space, targetMachine = null) {
+    if (!space || (space.machine ?? null) !== (targetMachine ?? null)) return false;
+    const spName = String(space.name ?? "").trim();
+    const spFolder = String(space.folder ?? "").trim();
+    if (spName === "~") return true;
+    if (spName && !spFolder) return false;
+    if (!spFolder || spFolder === "~") return true;
+    if (targetMachine) {
+      return this.isLikelyRemoteHomePath(spFolder);
+    }
+    const norm = (v) => String(v ?? "").trim().replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+    const localHome = typeof home === "function" ? norm(home()) : "";
+    return Boolean(localHome && norm(spFolder) === localHome);
+  }
+
+  targetHomeSpaceForMachine(targetMachine = null) {
+    const wantMachine = targetMachine ?? null;
     const all = typeof spaces === "function" ? (spaces() ?? []) : [];
-    const active = all.find((s) => s.active && (s.machine ?? null) === targetMachine);
-    if (active) return active;
-    return all.find((s) => (s.machine ?? null) === targetMachine) ?? null;
+    const activeHome = all.find((s) => s.active && this.isHomeSpace(s, wantMachine));
+    if (activeHome) return activeHome;
+    return all.find((s) => this.isHomeSpace(s, wantMachine)) ?? null;
+  }
+
+  targetSpaceForDroveMachine() {
+    return this.targetHomeSpaceForMachine(this.droveMachine ?? null);
   }
 
   defaultHomeFolderForMachine(targetMachine = null) {
-    if (targetMachine) return "";
+    if (targetMachine) return "~";
     const localHome = typeof home === "function" ? String(home() ?? "").trim() : "";
     return localHome || "~";
+  }
+
+  resolveCursorCliModelForLaunch(modelId, effort, probedList = null) {
+    const rawModel = String(modelId ?? "").trim();
+    if (!rawModel || /^auto$/i.test(rawModel) || /^default$/i.test(rawModel)) {
+      return { model: null, effort: null };
+    }
+    // Strip ACP-style bracket overrides (`grok-4.7[effort=high,fast=true]`) into CLI base + effort.
+    let base = rawModel;
+    let eff = String(effort ?? "").trim().toLowerCase() || null;
+    if (eff === "auto" || eff === "default") eff = null;
+    const bracketMatch = rawModel.match(/^([^\[]+)\[([^\]]*)\]$/);
+    if (bracketMatch) {
+      base = bracketMatch[1].trim();
+      for (const pair of bracketMatch[2].split(",")) {
+        const [kRaw, vRaw] = pair.split("=");
+        const k = String(kRaw ?? "").trim().toLowerCase();
+        const v = String(vRaw ?? "").trim().toLowerCase();
+        if (["effort", "reasoning_effort", "reasoning", "thought_level", "thinking"].includes(k) && v && v !== "auto" && v !== "default") {
+          eff = eff || v;
+        } else if (k === "fast" && ["true", "1", "yes"].includes(v) && !base.toLowerCase().endsWith("-fast")) {
+          base = `${base}-fast`;
+        }
+      }
+    }
+
+    const list = Array.isArray(probedList) ? probedList : this.probedAgents();
+    const probedIds = this.probedModelsFromList(list, "cursor").map((m) => m.id);
+    const findExact = (cand) => probedIds.find((x) => x.toLowerCase() === String(cand).toLowerCase()) ?? null;
+
+    const isFast = base.toLowerCase().endsWith("-fast");
+    const stem = isFast ? base.slice(0, -5) : base;
+    const fastSuf = isFast ? "-fast" : "";
+    const withTier = (tier) => `${stem}-${tier}${fastSuf}`;
+
+    // Already carries an embedded effort suffix (e.g. `grok-4.7-high`, `grok-4.7-high-fast`).
+    if (this.modelHasEmbeddedEffort(base)) {
+      return { model: findExact(base) ?? base, effort: null };
+    }
+
+    if (eff) {
+      const exactTier = findExact(withTier(eff));
+      if (exactTier) return { model: exactTier, effort: null };
+      // Some Cursor models (e.g. `gpt-5.3-codex`) use the bare slug for medium effort.
+      if (eff === "medium" && findExact(base) && !findExact(withTier("medium"))) {
+        return { model: findExact(base), effort: null };
+      }
+      if (probedIds.length > 0) {
+        const anyVariant = ["high", "medium", "low", "xhigh", "max"]
+          .map((t) => findExact(withTier(t)))
+          .find(Boolean);
+        if (anyVariant) return { model: anyVariant, effort: null };
+        const exactBase = findExact(base);
+        if (exactBase) return { model: exactBase, effort: null };
+      }
+      // Custom/unprobed Cursor model: let Rust format hyphenated CLI slug.
+      return { model: base, effort: eff };
+    }
+
+    // No explicit effort selected: if probed catalog exposes `-medium` as a distinct CLI slug
+    // (e.g. `grok-4.7-medium`, `claude-opus-5-5-medium`), the bare ACP slug (`grok-4.7`) is not
+    // accepted by `cursor-agent --model` directly — promote to its CLI high/medium slug.
+    if (probedIds.length > 0 && findExact(withTier("medium"))) {
+      const preferred = findExact(withTier("high")) ?? findExact(withTier("medium"));
+      if (preferred) return { model: preferred, effort: null };
+    }
+    return { model: findExact(base) ?? base, effort: null };
   }
 
   canonicalFixAgentId(raw) {
@@ -2699,6 +3047,9 @@ export default class Settings extends View {
           this.droveFixKnownAgents = { ...(this.droveFixKnownAgents ?? {}), [machineKey]: list };
           if ((this.droveMachine ?? null) === targetMachine) {
             this.ensureDroveFixSelection();
+            if (this.agentAiInstallTargetId) {
+              this.ensureAgentAiInstallSelection(this.agentAiInstallTargetId);
+            }
           }
         }
       } catch {}
@@ -2830,7 +3181,7 @@ export default class Settings extends View {
           command: Array.isArray(r.command) && r.command.length > 0 ? r.command : (r.acpCommand ? r.acpCommand.split(" ") : [r.id]),
           path: r.path ?? r.adapter?.path ?? null,
           error: combined,
-          issueKind: r.adapterError && !r.acpError ? "adapter" : "probe",
+          issueKind: r.adapterError && !r.acpError ? "adapter" : r.acpAuthRequired ? "auth" : "probe",
         });
         seen.add(r.id);
       }
@@ -2889,26 +3240,30 @@ export default class Settings extends View {
           return;
         }
         const pickedId = this.canonicalFixAgentId(picked.id || selectedAgent || picked.name);
-        const cleanModel = pickedId === "zcode" ? null : (String(selectedModel ?? "").trim() || null);
+        let cleanModel = pickedId === "zcode" ? null : (String(selectedModel ?? "").trim() || null);
         const effortDisabled = Boolean(this.droveFixEffortDisabledReason(pickedId, cleanModel));
-        const cleanEffort = !effortDisabled && selectedEffort
+        let cleanEffort = !effortDisabled && selectedEffort
           ? this.clampEffortFor(pickedId, cleanModel, selectedEffort)
           : null;
+        if (pickedId === "cursor") {
+          const resolvedCursor = this.resolveCursorCliModelForLaunch(cleanModel, cleanEffort, this.probedAgents());
+          cleanModel = resolvedCursor.model;
+          cleanEffort = resolvedCursor.effort;
+        }
         const prompt = this.buildDroveProbeFixPrompt(effectiveIssues);
         const tabName = this.tr("Fix Agent / ACP Issues", "AI 排查智能体异常");
-        const targetSpace = this.targetSpaceForDroveMachine();
-        const launchArgs = {
-          name: tabName,
+        const targetSpace = this.targetHomeSpaceForMachine(targetMachine);
+        const baseLaunchArgs = {
           folder: this.defaultHomeFolderForMachine(targetMachine),
           argv: picked.argv,
           task: prompt,
         };
-        if (cleanModel) launchArgs.model = cleanModel;
-        if (cleanEffort) launchArgs.effort = cleanEffort;
+        if (cleanModel) baseLaunchArgs.model = cleanModel;
+        if (cleanEffort) baseLaunchArgs.effort = cleanEffort;
         if (targetSpace) {
-          run("tab.new", { space: targetSpace.id, ...launchArgs });
+          run("tab.new", { space: targetSpace.id, name: tabName, ...baseLaunchArgs });
         } else {
-          const args = { ...launchArgs, tab: tabName };
+          const args = { ...baseLaunchArgs, tab: tabName };
           if (targetMachine) args.machine = targetMachine;
           run("space.new", args);
         }
@@ -3208,10 +3563,59 @@ export default class Settings extends View {
     return raw || null;
   }
 
-  formatAgentProbeError(raw) {
-    const text = String(raw ?? "").trim();
+  isAcpAuthError(raw) {
+    const lower = String(raw ?? "").trim().toLowerCase();
+    if (!lower) return false;
+    return (
+      lower.includes("authentication required") ||
+      lower.includes("auth_required") ||
+      lower.includes("configure an api key") ||
+      lower.includes("cursor_login") ||
+      lower.includes("agent login") ||
+      lower.includes("cursor-agent login") ||
+      lower.includes("onboarding is incomplete") ||
+      lower.includes("please run /login") ||
+      lower.includes("not logged in") ||
+      lower.includes("login required") ||
+      lower.includes("please log in") ||
+      lower.includes("please login") ||
+      lower.includes("sign in required") ||
+      lower.includes("session expired") ||
+      lower.includes("unauthenticated") ||
+      lower.includes("unauthorized") ||
+      (lower.includes("-32000") && (lower.includes("auth") || lower.includes("login") || lower.includes("api key")))
+    );
+  }
+
+  stripAcpAuthRawNoise(raw) {
+    let text = String(raw ?? "").trim();
     if (!text) return "";
-    const lines = text
+    if (!this.isAcpAuthError(text)) return text;
+    const stderrSplit = text.split(/\r?\nstderr:\r?\n/i);
+    if (stderrSplit.length > 1 && /^\s*Error handling request\b/i.test(stderrSplit[1])) {
+      text = stderrSplit[0].trim();
+    }
+    const authMethodsIdx = text.indexOf(': {"authMethods":');
+    if (authMethodsIdx >= 0) {
+      const prefix = text.slice(0, authMethodsIdx).trim();
+      const tail = text.slice(authMethodsIdx);
+      const codeMatch = tail.match(/\(code\s+-?\d+\)\s*$/);
+      text = codeMatch ? `${prefix} ${codeMatch[0]}` : prefix;
+    }
+    return text;
+  }
+
+  formatAgentProbeError(raw, agentId = null) {
+    const cleaned = this.stripAcpAuthRawNoise(raw);
+    if (!cleaned) return "";
+    if (this.isAcpAuthError(cleaned) && agentId) {
+      const spec = this.agentLoginSpec(agentId);
+      if (spec) {
+        const hint = this.tr(`Login / API key required · ${spec.hintEn}`, `需登录或配置 API Key · ${spec.hintZh}`);
+        return hint.length > 160 ? `${hint.slice(0, 159).trimEnd()}…` : hint;
+      }
+    }
+    const lines = cleaned
       .split(/\r?\n/)
       .map((l) => l.trim())
       .filter(Boolean);
@@ -5664,6 +6068,7 @@ export default class Settings extends View {
         const adapterNotInstalled = Boolean(
           r.acpMode === "managed" && !effectiveAcpInstalled && !adapterInstalling,
         );
+        const acpAuthRequired = Boolean(r.acpError && this.isAcpAuthError(r.acpError));
         const acpReady = Boolean(effectiveAcpInstalled && !r.acpError && !adapterError);
         const hasError = Boolean(r.acpError || adapterError);
         const needsAction = Boolean(hasError || adapterMissing);
@@ -5671,6 +6076,7 @@ export default class Settings extends View {
         return {
           ...r,
           acpInstalled: effectiveAcpInstalled,
+          acpAuthRequired,
           adapterInstalling,
           adapterError,
           adapterMissing,
@@ -5823,18 +6229,22 @@ export default class Settings extends View {
       .children(
         errorAgents.map((a) => {
           const rawErr = this.agentProbeError(a) ?? "";
-          const shortErr = this.formatAgentProbeError(rawErr);
+          const isAuth = a.issueKind === "auth" || this.isAcpAuthError(rawErr);
+          const shortErr = this.formatAgentProbeError(rawErr, a.id);
           const kindLabel = a.issueKind === "adapter"
             ? this.tr("Adapter", "适配器")
             : a.issueKind === "env"
               ? this.tr("Env", "环境")
-              : "ACP";
+              : isAuth
+                ? this.tr("Auth", "需登录")
+                : "ACP";
+          const badgeColor = isAuth ? t.working : t.blocked;
           return h_flex()
             .id(`st-dr-agent-err-${a.id}`)
             .w_full()
             .gap(8)
             .items_center()
-            .tooltip(rawErr)
+            .tooltip(this.stripAcpAuthRawNoise(rawErr))
             .child(
               h_flex()
                 .w(122)
@@ -5842,7 +6252,7 @@ export default class Settings extends View {
                 .gap(6)
                 .items_center()
                 .child(this.agentIconEl(t, a.id, 13))
-                .child(div().w(6).h(6).rounded(3).flex_none().bg(t.blocked))
+                .child(div().w(6).h(6).rounded(3).flex_none().bg(badgeColor))
                 .child(div().truncate().text_size(12).font_semibold().text_color(t.foreground).child(a.name || a.id)),
             )
             .child(
@@ -5853,9 +6263,9 @@ export default class Settings extends View {
                 .rounded(4)
                 .bg(t.background)
                 .border_1()
-                .border_color(alpha(t.blocked, "44") ?? t.border)
+                .border_color(alpha(badgeColor, "44") ?? t.border)
                 .text_size(10)
-                .text_color(t.blocked)
+                .text_color(badgeColor)
                 .child(kindLabel),
             )
             .child(div().flex_1().min_w(0).truncate().text_size(11.5).text_color(t.muted).child(shortErr));
@@ -6127,6 +6537,289 @@ export default class Settings extends View {
       });
   }
 
+  renderAgentAiInstallPanel(t, cx, row) {
+    const sel = this.ensureAgentAiInstallSelection(row.id);
+    const curAgent = sel.agent ?? "";
+    const curOpt = sel.option;
+    const curModel = sel.model;
+    const curEffort = sel.effort;
+    const effortDisabledReason = sel.disabledReason;
+    const disableEffort = Boolean(effortDisabledReason);
+    const isZcode = curAgent === "zcode";
+    const needSeparateAcp = Boolean(row.cliInstalled && row.acpMode === "separate" && !row.acpInstalled);
+    const targetName = needSeparateAcp ? `${row.name} ACP` : row.name;
+    const agentItems = sel.options.map((o) => ({
+      value: o.id,
+      label: o.name && o.name !== o.id ? `${o.name} (${o.id})` : o.id,
+      icon: o.id,
+      dot: Boolean(o.installed),
+      dotColor: !o.installed ? t.dim : o.probeError ? t.working : t.ansi2,
+      meta: !o.installed
+        ? this.tr("missing", "未安装")
+        : o.probeError
+          ? this.tr("ACP err · CLI", "ACP 异常 · CLI")
+          : o.models.length > 0
+            ? `${o.models.length} ${this.tr("models", "模型")}`
+            : "✓",
+      metaColor: o.probeError ? t.working : t.dim,
+      tooltip: o.probeError ? this.formatAgentProbeError(o.probeError) : undefined,
+      active: curAgent === o.id,
+    }));
+    const models = curOpt?.models?.length ? curOpt.models : (curAgent ? this.probedModelsFor(curAgent) : []);
+    const modelItems = [
+      { value: null, label: this.tr("Auto (agent default)", "自动（Agent 默认）"), active: !curModel },
+      ...models.map((m) => ({
+        value: m.id,
+        label: m.label,
+        active: curModel === m.id,
+      })),
+    ];
+    if (curModel && !models.some((m) => m.id === curModel)) {
+      modelItems.splice(1, 0, {
+        value: curModel,
+        label: curModel,
+        meta: this.tr("custom", "自定义"),
+        active: true,
+      });
+    }
+    const efforts = curAgent ? this.supportedEffortsFor(curAgent, curModel) : ["low", "medium", "high"];
+    const effortChoices = [null, ...efforts];
+    const canLaunch = Boolean(curOpt && !this.droveProbeAgentLaunching);
+    const footerHint = isZcode
+      ? this.tr(
+          "Note: ZCode ignores startup --model/--effort flags; select model inside its TUI.",
+          "提示：ZCode 不支持启动参数传入模型与思考强度，进入后需在 TUI 内切换。",
+        )
+      : curAgent === "cursor" && !curModel
+        ? this.tr(
+            "Tip: Select a specific Cursor model to apply custom reasoning effort.",
+            "提示：Cursor 需先指定具体模型才能生效自定义思考强度。",
+          )
+        : curOpt && !curOpt.installed
+          ? this.tr(
+              "This agent was not detected on the selected machine. Pick an installed agent above or install a CLI agent first.",
+              "目标主机未检测到该 Agent，请在上方选择已安装的 Agent，或先使用「一键安装」安装至少一个 CLI Agent。",
+            )
+          : curOpt?.probeError
+            ? this.tr(
+                "ACP probe errored for this agent, but its interactive CLI can still run in your terminal.",
+                "该 Agent 的 ACP 探测有异常，但在交互式终端中仍可直接启动协助安装。",
+              )
+            : needSeparateAcp
+              ? this.tr(
+                  `Will launch an interactive agent on the selected machine to install and configure ${row.acpCommand || `${row.name} ACP`} after your confirmation.`,
+                  `将在目标主机工作区标签页启动交互式 Agent，先检查环境并在你确认后安装配置 ${row.acpCommand || `${row.name} ACP`}。`,
+                )
+              : this.tr(
+                  `Will launch an interactive agent on the selected machine to inspect the environment and install ${row.name} after your confirmation.`,
+                  `将在目标主机工作区标签页启动交互式 Agent，先检查环境并给出安装方案，待你确认后安装 ${row.name}。`,
+                );
+
+    return v_flex()
+      .id("st-ag-ai-install-panel")
+      .w_full()
+      .px(10)
+      .py(9)
+      .gap(8)
+      .rounded(7)
+      .border_1()
+      .border_color(t.accent)
+      .bg(t.background)
+      .child(
+        h_flex()
+          .w_full()
+          .items_center()
+          .justify_between()
+          .gap(8)
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .child(svg(I("sparkles")).size(12.5).flex_none().text_color(t.accent))
+              .child(
+                div()
+                  .text_size(11.8)
+                  .font_semibold()
+                  .text_color(t.foreground)
+                  .child(
+                    this.tr(
+                      `AI Install ${targetName} · Choose Agent, Model & Reasoning Effort`,
+                      `AI 安装 ${targetName} · 选择 Agent 类型、模型与思考强度`,
+                    ),
+                  ),
+              ),
+          )
+          .child(
+            div()
+              .id("st-ag-ai-install-close")
+              .px(6)
+              .py(1)
+              .rounded(4)
+              .cursor_pointer()
+              .text_size(12)
+              .text_color(t.dim)
+              .hover((s) => s.bg(t.hover).text_color(t.foreground))
+              .on_click((_e, c) => this.closeAgentAiInstall(c))
+              .child("×"),
+          ),
+      )
+      .child(
+        h_flex()
+          .w_full()
+          .gap(6)
+          .items_center()
+          .flex_wrap()
+          .child(
+            this.drovePicker(
+              t,
+              "agent-install-agent",
+              curOpt ? (curOpt.name || curOpt.id) : this.tr("Select agent…", "选择 Agent…"),
+              agentItems,
+              (agent, c) => this.setAgentAiInstallAgent(agent, c),
+              {
+                width: 148,
+                popupWidth: 290,
+                icon: curAgent || undefined,
+                dot: curOpt ? Boolean(curOpt.installed) : undefined,
+                dotColor: !curOpt ? undefined : !curOpt.installed ? t.dim : curOpt.probeError ? t.working : t.ansi2,
+                tooltip: this.tr("Choose which CLI agent to launch for AI Install", "选择用于执行 AI 安装的 Agent 类型"),
+              },
+              cx,
+            ),
+          )
+          .child(
+            this.drovePicker(
+              t,
+              "agent-install-model",
+              curModel || this.tr("Auto (default)", "自动（默认）"),
+              modelItems,
+              (model, c) => this.setAgentAiInstallModel(model, c),
+              {
+                flex1: true,
+                width: 150,
+                popupWidth: 360,
+                allowCustom: true,
+                tooltip: isZcode
+                  ? effortDisabledReason
+                  : this.tr("Choose model or type a custom model ID", "选择模型或输入自定义模型 ID"),
+              },
+              cx,
+            ),
+          )
+          .child(
+            h_flex()
+              .id("st-ag-ai-install-eff-group")
+              .w(effortChoices.length >= 5 ? 196 : 164)
+              .min_w(effortChoices.length >= 5 ? 196 : 164)
+              .h(28)
+              .flex_none()
+              .p(2)
+              .gap(1)
+              .items_center()
+              .rounded(7)
+              .border_1()
+              .border_color(t.border)
+              .bg(t.surface)
+              .when(disableEffort, (el) => el.opacity(0.35).tooltip(effortDisabledReason))
+              .when(!disableEffort, (el) =>
+                el.tooltip(this.tr("Reasoning effort level", "选择模型思考强度")),
+              )
+              .children(
+                effortChoices.map((eff) => {
+                  const effKey = eff ?? "auto";
+                  const active = !disableEffort && (eff === null ? !curEffort : curEffort === eff);
+                  const label = eff === null ? this.tr("Auto", "默认") : this.effortLabel(eff);
+                  return div()
+                    .id(`st-ag-ai-install-eff-${effKey}`)
+                    .flex_1()
+                    .min_w(0)
+                    .h(22)
+                    .px(3)
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(5)
+                    .bg(active ? t.accent : "#00000000")
+                    .text_size(11)
+                    .when(active, (el) => el.font_semibold())
+                    .text_color(disableEffort ? t.dim : (active ? t.accent_foreground : t.muted))
+                    .when(!disableEffort, (el) =>
+                      el
+                        .cursor_pointer()
+                        .when(!active, (el2) => el2.hover((s) => s.bg(t.hover).text_color(t.foreground)))
+                        .on_click((_e, c) => this.setAgentAiInstallEffort(eff, c)),
+                    )
+                    .child(label);
+                }),
+              ),
+          ),
+      )
+      .child(
+        h_flex()
+          .w_full()
+          .items_center()
+          .justify_between()
+          .gap(8)
+          .flex_wrap()
+          .child(
+            div()
+              .flex_1()
+              .min_w(0)
+              .text_size(11)
+              .line_height("15px")
+              .text_color(t.dim)
+              .child(footerHint),
+          )
+          .child(
+            h_flex()
+              .gap(6)
+              .items_center()
+              .child(
+                this.button(t, "st-ag-ai-install-cancel", this.tr("Cancel", "取消"), (_e, c) =>
+                  this.closeAgentAiInstall(c),
+                ),
+              )
+              .child(
+                h_flex()
+                  .id("st-ag-ai-install-launch")
+                  .px(11)
+                  .py(4)
+                  .gap(5)
+                  .rounded(6)
+                  .border_1()
+                  .border_color(t.accent)
+                  .bg(t.accent)
+                  .items_center()
+                  .text_size(11.5)
+                  .font_semibold()
+                  .text_color(t.accent_foreground)
+                  .when(!canLaunch, (b) => b.opacity(0.55))
+                  .when(canLaunch, (b) =>
+                    b
+                      .cursor_pointer()
+                      .hover((s) => s.opacity(0.9))
+                      .on_click((_e, c) => this.launchAgentToInstall(row, c)),
+                  )
+                  .when(this.droveProbeAgentLaunching, (b) =>
+                    b.child(
+                      svg("mods/workspace-chrome/spinner.svg")
+                        .size(11)
+                        .text_color(t.accent_foreground)
+                        .spin(900),
+                    ),
+                  )
+                  .child(
+                    this.droveProbeAgentLaunching
+                      ? this.tr("Launching…", "启动中…")
+                      : needSeparateAcp
+                        ? this.tr("Start AI Install ACP", "启动 AI 安装 ACP")
+                        : this.tr("Start AI Install", "启动 AI 安装"),
+                  ),
+              ),
+          ),
+      );
+  }
+
   agents(t, cx) {
     const machines = (this.machineList ?? []).filter((m) => !m.temporary);
     const machineChip = (id, label, value) => {
@@ -6288,6 +6981,14 @@ export default class Settings extends View {
           alpha(t.blocked, "55") ?? t.border,
         ).tooltip(r.adapterError);
       }
+      if (r.acpAuthRequired) {
+        return pill(
+          this.tr("Login Required", "需登录"),
+          t.working,
+          alpha(t.working, "18") ?? t.background,
+          alpha(t.working, "55") ?? t.border,
+        ).tooltip(this.stripAcpAuthRawNoise(r.acpError));
+      }
       if (r.acpError) {
         return pill(
           this.tr("ACP Error", "探测异常"),
@@ -6370,8 +7071,19 @@ export default class Settings extends View {
     };
 
     const rowSubline = (r) => {
+      if (r.acpAuthRequired && !r.adapterError) {
+        return {
+          text: this.formatAgentProbeError(r.acpError, r.id),
+          color: t.working,
+          tooltip: this.stripAcpAuthRawNoise(r.acpError),
+        };
+      }
       if (r.acpError || r.adapterError) {
-        return { text: this.formatAgentProbeError(r.acpError || r.adapterError), color: t.blocked, tooltip: r.acpError || r.adapterError };
+        return {
+          text: this.formatAgentProbeError(r.acpError || r.adapterError, r.id),
+          color: t.blocked,
+          tooltip: this.stripAcpAuthRawNoise(r.acpError || r.adapterError),
+        };
       }
       const parts = [];
       if (r.models.length > 0) {
@@ -6409,8 +7121,39 @@ export default class Settings extends View {
       );
       const btns = [];
 
-      // 1. Always offer direct AI troubleshooting when this row has any error.
+      // 1. Surface direct sign-in terminal or AI troubleshooting when this row has any error.
       if (r.hasError) {
+        if (r.acpAuthRequired && !r.adapterError) {
+          const loginSpec = this.agentLoginSpec(r.id, r);
+          if (loginSpec?.argv?.length) {
+            btns.push(
+              actionBtn(
+                `st-ag-row-login-${r.id}`,
+                this.tr("Sign In", "终端登录"),
+                (_e, cx) => this.launchAgentLoginCli(r, cx),
+                {
+                  primary: true,
+                  tooltip: this.tr(
+                    `Open terminal to sign in (${loginSpec.display})`,
+                    `打开终端运行 ${loginSpec.display} 完成登录或配置 API Key`,
+                  ),
+                },
+              ),
+            );
+          }
+          btns.push(
+            actionBtn(
+              `st-ag-row-ai-${r.id}`,
+              this.tr("Fix with AI", "AI 处理"),
+              (_e, cx) => this.openAgentAiFix(cx, r.id),
+              {
+                icon: "sparkles",
+                tooltip: this.tr(`Use AI to diagnose and fix ${r.name}`, `启动 AI 排查并处理 ${r.name} 的认证/环境变量问题`),
+              },
+            ),
+          );
+          return btns;
+        }
         btns.push(
           actionBtn(
             `st-ag-row-ai-${r.id}`,
@@ -6510,15 +7253,20 @@ export default class Settings extends View {
             ),
           );
         } else {
+          const isOpen = this.agentAiInstallTargetId === r.id;
           btns.push(
             actionBtn(
               `st-ag-row-ai-inst-${r.id}`,
               this.tr("AI Install", "AI 安装"),
-              (_e, cx) => this.launchAgentToInstall(r, cx),
+              (_e, cx) => this.toggleAgentAiInstall(r, cx),
               {
+                primary: isOpen,
                 icon: "sparkles",
                 disabled: this.droveProbeAgentLaunching,
-                tooltip: this.tr(`Let AI help install ${r.name} on the selected machine`, `让 AI 根据本机环境协助安装 ${r.name}`),
+                tooltip: this.tr(
+                  `Choose an AI agent, model, and reasoning effort to help install ${r.name}`,
+                  `选择 AI Agent 类型、模型与思考强度，协助安装 ${r.name}`,
+                ),
               },
             ),
           );
@@ -6527,15 +7275,20 @@ export default class Settings extends View {
       }
 
       if (r.acpMode === "separate" && !r.acpInstalled) {
+        const isOpen = this.agentAiInstallTargetId === r.id;
         btns.push(
           actionBtn(
             `st-ag-row-ai-inst-${r.id}`,
             this.tr("AI Install ACP", "AI 装 ACP"),
-            (_e, cx) => this.launchAgentToInstall(r, cx),
+            (_e, cx) => this.toggleAgentAiInstall(r, cx),
             {
+              primary: isOpen,
               icon: "sparkles",
               disabled: this.droveProbeAgentLaunching,
-              tooltip: this.tr(`Let AI install ${r.acpCommand}`, `让 AI 协助安装 ${r.acpCommand}`),
+              tooltip: this.tr(
+                `Choose an AI agent, model, and reasoning effort to help install ${r.acpCommand}`,
+                `选择 AI Agent 类型、模型与思考强度，协助安装 ${r.acpCommand}`,
+              ),
             },
           ),
         );
@@ -6815,14 +7568,14 @@ export default class Settings extends View {
                 visibleRows.map((r, idx) => {
                   const sub = rowSubline(r);
                   const btns = rowActions(r);
-                  return h_flex()
+                  const aiInstallOpen = this.agentAiInstallTargetId === r.id;
+                  const rowEl = h_flex()
                     .id(`st-ag-row-${r.id}`)
                     .w_full()
                     .px(14)
                     .py(9)
                     .gap(10)
                     .items_center()
-                    .when(idx > 0, (el) => el.border_t(1).border_color(t.border))
                     // Col 1: Agent identity & details
                     .child(
                       h_flex()
@@ -6911,6 +7664,20 @@ export default class Settings extends View {
                               .child(r.anyInstalled ? this.tr("✓ Ready", "✓ 已就绪") : "—"),
                           ),
                         ),
+                    );
+                  if (!aiInstallOpen) {
+                    return rowEl.when(idx > 0, (el) => el.border_t(1).border_color(t.border));
+                  }
+                  return v_flex()
+                    .w_full()
+                    .when(idx > 0, (el) => el.border_t(1).border_color(t.border))
+                    .child(rowEl)
+                    .child(
+                      div()
+                        .w_full()
+                        .px(14)
+                        .pb(10)
+                        .child(this.renderAgentAiInstallPanel(t, cx, r)),
                     );
                 }),
               ),
@@ -8922,26 +9689,30 @@ export default class Settings extends View {
           return;
         }
         const pickedId = this.canonicalFixAgentId(picked.id || selectedAgent || picked.name);
-        const cleanModel = pickedId === "zcode" ? null : (String(selectedModel ?? "").trim() || null);
+        let cleanModel = pickedId === "zcode" ? null : (String(selectedModel ?? "").trim() || null);
         const effortDisabled = Boolean(this.droveFixEffortDisabledReason(pickedId, cleanModel));
-        const cleanEffort = !effortDisabled && selectedEffort
+        let cleanEffort = !effortDisabled && selectedEffort
           ? this.clampEffortFor(pickedId, cleanModel, selectedEffort, this.localProbedAgents())
           : null;
+        if (pickedId === "cursor") {
+          const resolvedCursor = this.resolveCursorCliModelForLaunch(cleanModel, cleanEffort, this.localProbedAgents());
+          cleanModel = resolvedCursor.model;
+          cleanEffort = resolvedCursor.effort;
+        }
         const prompt = this.buildAiUpdatePrompt(u, effectiveError);
         const tabName = this.tr("AI Update Herdr2", "AI 更新 Herdr2");
-        const localSpace = this.localWorkspaceSpace();
-        const launchArgs = {
-          name: tabName,
+        const localSpace = this.targetHomeSpaceForMachine(null);
+        const baseLaunchArgs = {
           folder: this.defaultHomeFolderForMachine(null),
           argv: picked.argv,
           task: prompt,
         };
-        if (cleanModel) launchArgs.model = cleanModel;
-        if (cleanEffort) launchArgs.effort = cleanEffort;
+        if (cleanModel) baseLaunchArgs.model = cleanModel;
+        if (cleanEffort) baseLaunchArgs.effort = cleanEffort;
         if (localSpace) {
-          run("tab.new", { space: localSpace.id, ...launchArgs });
+          run("tab.new", { space: localSpace.id, name: tabName, ...baseLaunchArgs });
         } else {
-          run("space.new", { ...launchArgs, tab: tabName });
+          run("space.new", { ...baseLaunchArgs, tab: tabName });
         }
         this.aiUpdateOpen = false;
         this.aiUpdateExtraError = null;

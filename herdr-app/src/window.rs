@@ -601,16 +601,20 @@ const WIN_GIT_BASH_PROFILE_LOAD: &str = concat!(
 const WIN_POSIX_RUN_STAY: &str = concat!(
     "__h2_p=$1; shift; ",
     "__h2_b=$(command -v -- \"$__h2_p\" 2>/dev/null); ",
-    "if [ -n \"${MSYS_NO_PATHCONV:-}\" ] && case \"$__h2_b\" in /*) true ;; *) false ;; esac && ! command -v -- \"$__h2_p.exe\" >/dev/null 2>&1 && command -v -- \"$__h2_p.cmd\" >/dev/null 2>&1; then ",
+    "if [ -n \"${MSYS_NO_PATHCONV:-}\" ] && case \"$__h2_b\" in /*) true ;; *) false ;; esac && ! command -v -- \"$__h2_p.exe\" >/dev/null 2>&1 && __h2_ps1=$(command -v -- \"$__h2_p.ps1\" 2>/dev/null); then ",
+    "__h2_ps=$(command -v pwsh.exe 2>/dev/null || printf powershell.exe); ",
+    "\"$__h2_ps\" -NoProfile -ExecutionPolicy Bypass -File \"$(cygpath -w \"$__h2_ps1\" 2>/dev/null || printf %s \"$__h2_ps1\")\" \"$@\"; ",
+    "elif [ -n \"${MSYS_NO_PATHCONV:-}\" ] && case \"$__h2_b\" in /*) true ;; *) false ;; esac && ! command -v -- \"$__h2_p.exe\" >/dev/null 2>&1 && command -v -- \"$__h2_p.cmd\" >/dev/null 2>&1; then ",
     "\"$__h2_p.cmd\" \"$@\"; ",
     "elif [ -n \"$__h2_b\" ]; then ",
     "\"$__h2_p\" \"$@\"; ",
+    "elif __h2_ps1=$(command -v -- \"$__h2_p.ps1\" 2>/dev/null); then ",
+    "__h2_ps=$(command -v pwsh.exe 2>/dev/null || printf powershell.exe); ",
+    "\"$__h2_ps\" -NoProfile -ExecutionPolicy Bypass -File \"$(cygpath -w \"$__h2_ps1\" 2>/dev/null || printf %s \"$__h2_ps1\")\" \"$@\"; ",
     "elif command -v -- \"$__h2_p.cmd\" >/dev/null 2>&1; then ",
     "\"$__h2_p.cmd\" \"$@\"; ",
     "elif command -v -- \"$__h2_p.bat\" >/dev/null 2>&1; then ",
     "\"$__h2_p.bat\" \"$@\"; ",
-    "elif __h2_ps1=$(command -v -- \"$__h2_p.ps1\" 2>/dev/null); then ",
-    "powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"$(cygpath -w \"$__h2_ps1\" 2>/dev/null || printf %s \"$__h2_ps1\")\" \"$@\"; ",
     "else ",
     "\"$__h2_p\" \"$@\"; ",
     "fi; ",
@@ -620,16 +624,20 @@ const WIN_POSIX_RUN_STAY: &str = concat!(
 const WIN_POSIX_RUN_EXEC: &str = concat!(
     "__h2_p=$1; shift; ",
     "__h2_b=$(command -v -- \"$__h2_p\" 2>/dev/null); ",
-    "if [ -n \"${MSYS_NO_PATHCONV:-}\" ] && case \"$__h2_b\" in /*) true ;; *) false ;; esac && ! command -v -- \"$__h2_p.exe\" >/dev/null 2>&1 && command -v -- \"$__h2_p.cmd\" >/dev/null 2>&1; then ",
+    "if [ -n \"${MSYS_NO_PATHCONV:-}\" ] && case \"$__h2_b\" in /*) true ;; *) false ;; esac && ! command -v -- \"$__h2_p.exe\" >/dev/null 2>&1 && __h2_ps1=$(command -v -- \"$__h2_p.ps1\" 2>/dev/null); then ",
+    "__h2_ps=$(command -v pwsh.exe 2>/dev/null || printf powershell.exe); ",
+    "unset HERDR_LAUNCH; exec \"$__h2_ps\" -NoProfile -ExecutionPolicy Bypass -File \"$(cygpath -w \"$__h2_ps1\" 2>/dev/null || printf %s \"$__h2_ps1\")\" \"$@\"; ",
+    "elif [ -n \"${MSYS_NO_PATHCONV:-}\" ] && case \"$__h2_b\" in /*) true ;; *) false ;; esac && ! command -v -- \"$__h2_p.exe\" >/dev/null 2>&1 && command -v -- \"$__h2_p.cmd\" >/dev/null 2>&1; then ",
     "unset HERDR_LAUNCH; exec \"$__h2_p.cmd\" \"$@\"; ",
     "elif [ -n \"$__h2_b\" ]; then ",
     "unset HERDR_LAUNCH; exec \"$__h2_p\" \"$@\"; ",
+    "elif __h2_ps1=$(command -v -- \"$__h2_p.ps1\" 2>/dev/null); then ",
+    "__h2_ps=$(command -v pwsh.exe 2>/dev/null || printf powershell.exe); ",
+    "unset HERDR_LAUNCH; exec \"$__h2_ps\" -NoProfile -ExecutionPolicy Bypass -File \"$(cygpath -w \"$__h2_ps1\" 2>/dev/null || printf %s \"$__h2_ps1\")\" \"$@\"; ",
     "elif command -v -- \"$__h2_p.cmd\" >/dev/null 2>&1; then ",
     "unset HERDR_LAUNCH; exec \"$__h2_p.cmd\" \"$@\"; ",
     "elif command -v -- \"$__h2_p.bat\" >/dev/null 2>&1; then ",
     "unset HERDR_LAUNCH; exec \"$__h2_p.bat\" \"$@\"; ",
-    "elif __h2_ps1=$(command -v -- \"$__h2_p.ps1\" 2>/dev/null); then ",
-    "unset HERDR_LAUNCH; exec powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"$(cygpath -w \"$__h2_ps1\" 2>/dev/null || printf %s \"$__h2_ps1\")\" \"$@\"; ",
     "else ",
     "printf '\\033]2;%s\\007cannot start \"%s\": No such file or directory\\n' \"$HERDR_LAUNCH\" \"$__h2_p\" >&2; exit 127; ",
     "fi",
@@ -678,6 +686,21 @@ pub(crate) fn wrap_windows_command_with(
             argv
         }
         WindowsShellKind::Cmd => {
+            // `cmd.exe /k` and `/c` cannot carry line breaks inside arguments (they truncate
+            // at the first `\n` and run subsequent lines as commands). Fall back to PowerShell
+            // so multiline CLI agent prompts arrive intact.
+            if cmd.iter().any(|arg| arg.contains(['\n', '\r'])) {
+                let ps_exe = find_pwsh_with(path_os, program_files, program_files_x86, local_app_data, None)
+                    .or_else(|| find_powershell_with(path_os, None))
+                    .unwrap_or_else(|| "powershell.exe".into());
+                let mut argv = vec![ps_exe, "-ExecutionPolicy".into(), "Bypass".into()];
+                if stay {
+                    argv.push("-NoExit".into());
+                }
+                argv.push("-Command".into());
+                argv.push(crate::programs::powershell_line(&cmd));
+                return argv;
+            }
             vec![
                 exe,
                 "/d".into(),
@@ -1006,6 +1029,7 @@ fn acp_login_command(agent_key: &str) -> Option<&'static [&'static str]> {
         "kimi" | "kimi-code" => Some(&["kimi", "login"]),
         "gemini" | "gemini-cli" => Some(&["gemini"]),
         "qwen" | "qwen-code" => Some(&["qwen"]),
+        "pi" | "pi-acp" => Some(&["pi"]),
         _ => None,
     }
 }
@@ -1037,6 +1061,7 @@ fn acp_agent_identity(record: &Value) -> (String, String) {
         "qwen" | "qwen-code" => "Qwen".to_string(),
         "opencode" => "OpenCode".to_string(),
         "agy" | "antigravity" => "Antigravity".to_string(),
+        "pi" | "pi-acp" => "Pi".to_string(),
         _ => {
             let mut chars = raw.chars();
             match chars.next() {
@@ -4647,7 +4672,7 @@ impl AppWindow {
         };
 
         let mut release = turn > entry_turn
-            || (reported && entry_rep.is_some() && rep_state.is_some() && rep_state != entry_rep);
+            || (reported && rep_state.is_some() && rep_state != entry_rep);
         if !release && !is_acp_addr(addr)
             && let Some(view) = self.best_terminal_view(addr, cx)
         {
@@ -4715,8 +4740,14 @@ impl AppWindow {
                 let base_state: &'static str = if core_state == Some("done") { "done" } else { "idle" };
                 let raw_title = rec.get("raw_title").and_then(Value::as_str).unwrap_or_default();
                 let view = self.best_terminal_view(addr, cx);
+                let recent_submit = view.as_ref().is_some_and(|v| v.read(cx).has_recent_submit(now));
                 let conf = view.as_ref().map_or(crate::terminal::QuietBlockConfidence::None, |v| v.read(cx).quiet_blocked_confidence(now));
-                let (want, want_summary, want_kind, cached_sem_title, cached_micro) = if conf == crate::terminal::QuietBlockConfidence::ExplicitPrompt {
+                let (want, want_summary, want_kind, cached_sem_title, cached_micro) = if recent_submit {
+                    if self.ai_terminal_states.contains_key(addr) {
+                        clear_verdicts.push(addr.clone());
+                    }
+                    (Value::String("working".into()), Value::Null, Value::Null, None, None)
+                } else if conf == crate::terminal::QuietBlockConfidence::ExplicitPrompt {
                     if self.ai_terminal_states.contains_key(addr) {
                         clear_verdicts.push(addr.clone());
                     }
@@ -14044,6 +14075,17 @@ mod tests {
         let claude_en = super::acp_launch_failure_toast_spec(&claude_rec, Some(claude_onboarding_err), false, false);
         assert_eq!(claude_en["notification"]["title"], "Claude CLI setup & login required");
         assert_eq!(claude_en["notification"]["actionLabel"], "Open Claude CLI");
+
+        let pi_rec = serde_json::json!({
+            "agent": "pi",
+            "reason": "spawn_failed",
+            "cwd": r"D:\Users\zhihao.zou",
+        });
+        let pi_err = "ACP session/new failed: Authentication required: Configure an API key or log in with an OAuth provider. (code -32000)";
+        let pi_zh = super::acp_launch_failure_toast_spec(&pi_rec, Some(pi_err), true, false);
+        assert_eq!(pi_zh["notification"]["title"], "Pi 需要先登录");
+        assert_eq!(pi_zh["notification"]["actionLabel"], "打开终端登录");
+        assert_eq!(pi_zh["notification"]["buttonAction"]["args"]["argv"], serde_json::json!(["pi"]));
     }
 
     /// The split wrapper's own "cannot start" comes after the person's shell config, so a
@@ -15839,6 +15881,34 @@ export default class SystemToast extends View {
         let cmd_split = super::wrap_windows_command_with("cmd", cli.clone(), false, None, None, None, None, Some("C:\\Windows\\System32\\cmd.exe"));
         assert_eq!(&cmd_split[..4], ["C:\\Windows\\System32\\cmd.exe", "/d", "/s", "/c"]);
         assert_eq!(super::AppWindow::unwrap_shell_agent_argv(cmd_split), cli);
+
+        // Multiline prompts must survive Windows wrappers without `.cmd` newline truncation:
+        // Git Bash wrapper prefers `.ps1` over `.cmd`/`.bat` (e.g. `cursor-agent.ps1` over
+        // `cursor-agent.cmd`), and `cmd.exe` falls back to PowerShell when args contain `\n`.
+        let stay_ps1_idx = super::WIN_POSIX_RUN_STAY.find("elif __h2_ps1=$(command -v -- \"$__h2_p.ps1\"").unwrap();
+        let stay_cmd_idx = super::WIN_POSIX_RUN_STAY.find("elif command -v -- \"$__h2_p.cmd\"").unwrap();
+        assert!(stay_ps1_idx < stay_cmd_idx);
+        let exec_ps1_idx = super::WIN_POSIX_RUN_EXEC.find("elif __h2_ps1=$(command -v -- \"$__h2_p.ps1\"").unwrap();
+        let exec_cmd_idx = super::WIN_POSIX_RUN_EXEC.find("elif command -v -- \"$__h2_p.cmd\"").unwrap();
+        assert!(exec_ps1_idx < exec_cmd_idx);
+
+        let multiline_cli = vec![
+            "cursor-agent".to_owned(),
+            "--yolo".to_owned(),
+            "--trust".to_owned(),
+            "请帮我排查 Herdr2 在目标主机「本机（local）」上检测到的智能体与 ACP 异常：\n\n- agent: cursor\n  error: timeout".to_owned(),
+        ];
+        let gb_multiline = super::wrap_windows_command_with("git-bash", multiline_cli.clone(), true, Some(&path_joined), Some(pf_str), None, None, None);
+        assert_eq!(&gb_multiline[4..], multiline_cli.as_slice());
+        assert_eq!(super::AppWindow::unwrap_shell_agent_argv(gb_multiline), multiline_cli);
+
+        let ps_multiline = super::wrap_windows_command_with("powershell", multiline_cli.clone(), true, Some(&path_joined), Some(pf_str), None, None, None);
+        assert_eq!(super::AppWindow::unwrap_shell_agent_argv(ps_multiline), multiline_cli);
+
+        let cmd_multiline = super::wrap_windows_command_with("cmd", multiline_cli.clone(), true, Some(&path_joined), Some(pf_str), None, None, Some("C:\\Windows\\System32\\cmd.exe"));
+        assert_eq!(cmd_multiline[0], pwsh_dir.join("pwsh.exe").to_string_lossy());
+        assert_eq!(&cmd_multiline[1..5], ["-ExecutionPolicy", "Bypass", "-NoExit", "-Command"]);
+        assert_eq!(super::AppWindow::unwrap_shell_agent_argv(cmd_multiline), multiline_cli);
 
         // Stale configured default Windows shell falls back to "auto" when not installed.
         assert_eq!(super::effective_windows_shell_with("pwsh", &["powershell", "cmd"]), "auto");

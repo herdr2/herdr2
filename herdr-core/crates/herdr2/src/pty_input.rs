@@ -428,13 +428,14 @@ impl Core {
         let (status, turn, reported) = self
             .type_in(id, quiet(), true, |st, t| {
                 let word = state_word(t);
-                if word.as_deref() == Some("blocked") && !force {
+                let blocked_kind = t.status.as_ref().and_then(|s| s.kind.as_deref());
+                if word.as_deref() == Some("blocked") && blocked_kind != Some("question") && !force {
                     return Err(RpcError::new(
                         "blocked",
                         format!(
                             "{} is blocked ({})",
                             crate::terminals::address(id),
-                            t.status.as_ref().and_then(|s| s.kind.as_deref()).unwrap_or("waiting")
+                            blocked_kind.unwrap_or("waiting")
                         ),
                         format!(
                             "typing would answer its dialog; read its screen first (h2 read {}), or --force",

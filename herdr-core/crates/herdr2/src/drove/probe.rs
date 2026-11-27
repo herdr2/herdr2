@@ -1,7 +1,7 @@
 //! ACP agent binary/model discovery and generic AI endpoint connection testing.
 
 use super::types::{ProbeSnapshot, ProbedAgent, now_iso};
-use crate::acp::presets::{BUILTIN_PRESETS, resolve_acp_command_in_env};
+use crate::acp::presets::{BUILTIN_PRESETS, resolve_acp_command_in_env, resolve_non_shim_binary_in_path};
 use crate::acp::{SpawnSpec, spawn_session};
 pub use crate::ai::client::{
     AiTestResult, all_model_ids, chat_endpoints, curl_json, curl_json_timeout, fetch_ai_models, first_model_id,
@@ -129,6 +129,27 @@ fn collect_probe_targets(core: &Core) -> Vec<(String, Vec<String>)> {
     targets
 }
 
+/// Resolves an ACP agent command for probing, skipping adapters whose required companion CLI
+/// is missing from `PATH` (for example `pi-acp` installed without the `pi` CLI binary).
+fn resolve_probe_command(
+    id: &str,
+    argv: &[String],
+    env: &BTreeMap<String, String>,
+) -> Option<(PathBuf, Vec<String>)> {
+    let first = argv.first()?;
+    if let Some(spec) = crate::acp::adapters::lookup_spec_for_preset_or_program(Some(id), first)
+        && spec.requires_companion_cli
+        && let Some(companion) = spec.companion_cli
+    {
+        let path_override = env_ignore_case(env, "PATH");
+        let pathext_override = env_ignore_case(env, "PATHEXT");
+        if resolve_non_shim_binary_in_path(companion, path_override, pathext_override).is_none() {
+            return None;
+        }
+    }
+    resolve_acp_command_in_env(Some(id), argv, env)
+}
+
 /// Fast (<2ms) stat-only refresh of `installed`/`path`/`command` flags against the current environment
 /// so newly installed agents never remain stuck as "missing" in a cached probe snapshot.
 /// Returns `true` if `snap` was modified.
@@ -138,7 +159,7 @@ pub async fn refresh_installed_status(core: &Core, snap: &mut ProbeSnapshot) -> 
     let mut changed = false;
 
     for (id, base_argv) in targets {
-        let resolved = resolve_acp_command_in_env(Some(&id), &base_argv, &base_env);
+        let resolved = resolve_probe_command(&id, &base_argv, &base_env);
         let now_installed = resolved.is_some();
         let (now_path, now_cmd) = match resolved {
             Some((p, cmd)) => (Some(p.display().to_string()), cmd),
@@ -209,7 +230,7 @@ pub async fn probe_agents(core: &Core, skip_acp_handshake: bool) -> ProbeSnapsho
     let mut quick_handles = Vec::new();
     let mut acp_targets = Vec::new();
     for (id, argv) in targets {
-        let resolved = resolve_acp_command_in_env(Some(&id), &argv, &base_env);
+        let resolved = resolve_probe_command(&id, &argv, &base_env);
         let mut env = base_env.clone();
         if resolved.is_none() || skip_acp_handshake {
             let installed = resolved.is_some();
@@ -597,7 +618,7 @@ async fn probe_one_acp_attempt(target: AcpProbeTarget, timeout: Duration) -> Pro
             // Always surface ACP spawn/handshake failures even when CLI or local model catalogs
             // are still available, so broken/unauthenticated agents are never misreported as healthy.
             let cli_probe = probe_cli_models(&id, &env, &cwd).await;
-            let err_msg = sanitize_probe_error(&err.message);
+            let err_msg = format_probe_acp_error(&id, &err.message);
             let err_opt = Some(if err_msg.is_empty() { "ACP probe failed".to_string() } else { err_msg });
             let models = merge_model_lists(&[cli_probe.models, local_models]);
             let model_efforts = infer_model_efforts_from_variants(&models);
@@ -655,6 +676,60 @@ fn infer_model_efforts_from_variants(models: &[String]) -> BTreeMap<String, Vec<
 struct CliModelsProbe {
     models: Vec<String>,
     error: Option<String>,
+}
+
+fn is_probe_auth_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    lower.contains("authentication required")
+        || lower.contains("auth_required")
+        || lower.contains("configure an api key")
+        || lower.contains("onboarding is incomplete")
+        || lower.contains("please run /login")
+        || lower.contains("not logged in")
+        || lower.contains("login required")
+        || lower.contains("please log in")
+        || lower.contains("please login")
+        || lower.contains("sign in required")
+        || lower.contains("session expired")
+        || lower.contains("unauthenticated")
+        || lower.contains("unauthorized")
+        || (lower.contains("-32000") && (lower.contains("auth") || lower.contains("login") || lower.contains("api key")))
+}
+
+fn strip_raw_auth_methods_noise(msg: &str) -> String {
+    let without_sdk_stderr = if let Some((head, tail)) = msg.split_once("\nstderr:\n")
+        && tail.trim_start().starts_with("Error handling request")
+    {
+        head.trim()
+    } else {
+        msg.trim()
+    };
+    if let Some((prefix, rest)) = without_sdk_stderr.split_once(": {\"authMethods\":") {
+        let code_suffix = rest.rfind("(code ").map(|idx| format!(" {}", &rest[idx..])).unwrap_or_default();
+        return format!("{}{code_suffix}", prefix.trim());
+    }
+    without_sdk_stderr.to_string()
+}
+
+fn format_probe_acp_error(agent_id: &str, raw: &str) -> String {
+    let pre_trimmed = raw.trim();
+    if pre_trimmed.is_empty() {
+        return String::new();
+    }
+    if !is_probe_auth_error(pre_trimmed) {
+        return sanitize_probe_error(pre_trimmed);
+    }
+    if agent_id.eq_ignore_ascii_case("pi") {
+        let env_note = if cfg!(windows) {
+            "; Windows API key env vars must be set in User/System environment, not only PowerShell $PROFILE"
+        } else {
+            ""
+        };
+        return format!(
+            "Authentication required: Pi has no configured API key or OAuth login. Run `pi` and execute `/login` (or configure ~/.pi/agent/models.json{env_note})."
+        );
+    }
+    sanitize_probe_error(&strip_raw_auth_methods_noise(pre_trimmed))
 }
 
 fn sanitize_probe_error(raw: &str) -> String {
@@ -870,19 +945,27 @@ pub(crate) fn parse_cli_models(agent_id: &str, text: &str) -> Vec<String> {
 
 fn user_home_dirs(env: &BTreeMap<String, String>) -> Vec<PathBuf> {
     let mut homes = Vec::new();
-    for val in [
-        env_ignore_case(env, "HOME").map(String::from),
-        env_ignore_case(env, "USERPROFILE").map(String::from),
-        std::env::var("HOME").ok(),
-        std::env::var("USERPROFILE").ok(),
-    ] {
-        if let Some(raw) = val {
-            let trimmed = raw.trim();
-            if !trimmed.is_empty() {
-                let pb = PathBuf::from(trimmed);
-                if !homes.contains(&pb) {
-                    homes.push(pb);
-                }
+    let candidates = if cfg!(windows) {
+        [
+            env_ignore_case(env, "USERPROFILE").map(String::from),
+            env_ignore_case(env, "HOME").map(String::from),
+            std::env::var("USERPROFILE").ok(),
+            std::env::var("HOME").ok(),
+        ]
+    } else {
+        [
+            env_ignore_case(env, "HOME").map(String::from),
+            env_ignore_case(env, "USERPROFILE").map(String::from),
+            std::env::var("HOME").ok(),
+            std::env::var("USERPROFILE").ok(),
+        ]
+    };
+    for val in candidates.into_iter().flatten() {
+        let trimmed = val.trim();
+        if !trimmed.is_empty() {
+            let pb = PathBuf::from(trimmed);
+            if !homes.contains(&pb) {
+                homes.push(pb);
             }
         }
     }
@@ -959,12 +1042,99 @@ fn push_semicolon_cap_models(raw: &str, dest: &mut Vec<String>) {
     }
 }
 
+fn expand_tilde_in_homes(raw: &str, homes: &[PathBuf]) -> PathBuf {
+    let trimmed = raw.trim();
+    if trimmed == "~"
+        && let Some(home) = homes.first()
+    {
+        return home.clone();
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/").or_else(|| trimmed.strip_prefix(r"~\"))
+        && let Some(home) = homes.first()
+    {
+        return home.join(rest);
+    }
+    PathBuf::from(trimmed)
+}
+
+fn collect_pi_agent_dir_models(agent_dir: &Path, models: &mut Vec<String>, default_model: &mut Option<String>) {
+    if let Ok(text) = std::fs::read_to_string(agent_dir.join("settings.json"))
+        && let Ok(val) = serde_json::from_str::<Value>(&text)
+    {
+        let prov = val["defaultProvider"].as_str().map(str::trim).filter(|s| !s.is_empty());
+        let dm = val["defaultModel"].as_str().map(str::trim).filter(|s| !s.is_empty());
+        if let Some(m) = dm {
+            let qualified = if m.contains('/') {
+                m.to_string()
+            } else if let Some(p) = prov {
+                format!("{p}/{m}")
+            } else {
+                m.to_string()
+            };
+            default_model.get_or_insert_with(|| qualified.clone());
+            push_unique(models, &qualified);
+        }
+        if let Some(arr) = val["enabledModels"].as_array() {
+            for item in arr {
+                if let Some(m) = item.as_str().map(str::trim).filter(|s| !s.is_empty())
+                    && !m.contains(['*', '?', '[', '{'])
+                {
+                    push_unique(models, m);
+                }
+            }
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string(agent_dir.join("models.json"))
+        && let Ok(val) = serde_json::from_str::<Value>(&text)
+        && let Some(providers) = val["providers"].as_object()
+    {
+        for (pname, pval) in providers {
+            let pname = pname.trim();
+            if pname.is_empty() {
+                continue;
+            }
+            if let Some(arr) = pval["models"].as_array() {
+                for entry in arr {
+                    if let Some(mid) =
+                        entry["id"].as_str().or_else(|| entry.as_str()).map(str::trim).filter(|s| !s.is_empty())
+                    {
+                        let qualified = if mid.contains('/') { mid.to_string() } else { format!("{pname}/{mid}") };
+                        push_unique(models, &qualified);
+                    }
+                }
+            } else if let Some(obj) = pval["models"].as_object() {
+                for mkey in obj.keys() {
+                    let mid = mkey.trim();
+                    if !mid.is_empty() {
+                        let qualified = if mid.contains('/') { mid.to_string() } else { format!("{pname}/{mid}") };
+                        push_unique(models, &qualified);
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn discover_local_models(
     agent_id: &str,
     installed: bool,
     env: &BTreeMap<String, String>,
 ) -> (Vec<String>, Option<String>) {
-    discover_local_models_in_homes(agent_id, installed, &user_home_dirs(env))
+    let homes = user_home_dirs(env);
+    if agent_id == "pi"
+        && let Some(custom_dir) = env_ignore_case(env, "PI_CODING_AGENT_DIR")
+            .map(String::from)
+            .or_else(|| std::env::var("PI_CODING_AGENT_DIR").ok().filter(|s| !s.trim().is_empty()))
+    {
+        let mut models = Vec::new();
+        let mut default_model = None;
+        collect_pi_agent_dir_models(&expand_tilde_in_homes(&custom_dir, &homes), &mut models, &mut default_model);
+        let (home_models, home_default) = discover_local_models_in_homes(agent_id, installed, &homes);
+        let merged = merge_model_lists(&[models, home_models]);
+        let dm = default_model.or(home_default).or_else(|| merged.first().cloned());
+        return (merged, dm);
+    }
+    discover_local_models_in_homes(agent_id, installed, &homes)
 }
 
 pub(crate) fn discover_local_models_in_homes(
@@ -1197,6 +1367,11 @@ pub(crate) fn discover_local_models_in_homes(
                         }
                     }
                 }
+            }
+        }
+        "pi" => {
+            for home in homes {
+                collect_pi_agent_dir_models(&home.join(".pi/agent"), &mut models, &mut default_model);
             }
         }
         "kimi" => {
@@ -1780,6 +1955,99 @@ done
         let picked = probe_working_dir(&unc_env);
         assert!(!is_unc_path(Path::new(&picked)), "must never return UNC path: {picked}");
         assert!(Path::new(&picked).is_dir(), "must return existing dir: {picked}");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn resolve_probe_command_skips_pi_acp_when_pi_cli_is_missing() {
+        let tmp = crate::test_tmp().join(format!("drove-probe-pi-companion-{}", crate::platform::random_hex()));
+        let bin_dir = tmp.join("bin");
+        let adapters_dir = tmp.join("adapters");
+        let pi_bin_dir = adapters_dir.join("pi/node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::create_dir_all(&pi_bin_dir).unwrap();
+
+        let pi_acp = pi_bin_dir.join(if cfg!(windows) { "pi-acp.cmd" } else { "pi-acp" });
+        std::fs::write(&pi_acp, "#!/bin/sh\n").unwrap();
+
+        let env = BTreeMap::from([
+            ("HOME".into(), tmp.display().to_string()),
+            ("PATH".into(), bin_dir.display().to_string()),
+            ("HERDR2_ADAPTERS_DIR".into(), adapters_dir.display().to_string()),
+        ]);
+
+        // Without `pi` CLI on PATH, `pi-acp` cannot run and must not be probed as installed.
+        assert!(resolve_probe_command("pi", &["pi-acp".into()], &env).is_none());
+
+        // Once `pi` CLI is installed on PATH, `resolve_probe_command` resolves the managed `pi-acp`.
+        let pi_cli = bin_dir.join(if cfg!(windows) { "pi.cmd" } else { "pi" });
+        std::fs::write(&pi_cli, "#!/bin/sh\n").unwrap();
+        let resolved = resolve_probe_command("pi", &["pi-acp".into()], &env).expect("pi-acp should resolve with pi CLI");
+        assert_eq!(resolved.0, pi_acp);
+
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[test]
+    fn format_probe_acp_error_normalizes_pi_auth_and_discovers_local_pi_models() {
+        let raw_win_err = r#"ACP session/new failed: Authentication required: Configure an API key or log in with an OAuth provider.: {"authMethods":[{"_meta":{"terminal-auth":{"args":["D:\\Users\\zhihao.zou\\AppData\\Local\\herdr2\\adapters\\pi\\node_modules\\pi-acp\\dist\\index.js","--terminal-login"],"command":"C:\\Program Files\\nodejs\\node.exe","label":"Launch pi"}},"args":["--terminal-login"],"description":"Start pi in an interactive terminal to configure API keys or login"}]} (code -32000)
+stderr:
+Error handling request {
+  id: 2,
+  jsonrpc: '2.0',
+  method: 'session/new',
+  params: { cwd: 'D:\\Users\\zhihao.zou', mcpServers: [] }
+} {
+  code: -32000
+}"#;
+        let pi_formatted = format_probe_acp_error("pi", raw_win_err);
+        assert!(pi_formatted.starts_with("Authentication required:"));
+        assert!(pi_formatted.contains("/login"));
+        assert!(pi_formatted.contains("models.json"));
+        assert!(!pi_formatted.contains("authMethods"));
+        assert!(!pi_formatted.contains("Error handling request"));
+
+        let other_formatted = format_probe_acp_error("custom-acp", raw_win_err);
+        assert!(!other_formatted.contains("authMethods"), "other agents must also strip authMethods JSON: {other_formatted}");
+        assert!(!other_formatted.contains("Error handling request"), "other agents must strip SDK echo: {other_formatted}");
+        assert!(other_formatted.contains("(code -32000)"));
+
+        let tmp = crate::test_tmp().join(format!("drove-probe-pi-models-{}", crate::platform::random_hex()));
+        let home_pi_dir = tmp.join("home/.pi/agent");
+        let custom_pi_dir = tmp.join("custom-pi-agent");
+        std::fs::create_dir_all(&home_pi_dir).unwrap();
+        std::fs::create_dir_all(&custom_pi_dir).unwrap();
+
+        std::fs::write(
+            home_pi_dir.join("settings.json"),
+            r#"{"defaultProvider":"anthropic","defaultModel":"claude-sonnet-4-5","enabledModels":["openai/gpt-5.4","anthropic/*"]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            home_pi_dir.join("models.json"),
+            r#"{"providers":{"ollama":{"models":[{"id":"qwen2.5-coder:7b"}]}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            custom_pi_dir.join("settings.json"),
+            r#"{"defaultModel":"deepseek/deepseek-chat"}"#,
+        )
+        .unwrap();
+
+        let home_env = BTreeMap::from([("HOME".into(), tmp.join("home").display().to_string())]);
+        let (models, dm) = discover_local_models("pi", true, &home_env);
+        assert_eq!(dm.as_deref(), Some("anthropic/claude-sonnet-4-5"));
+        assert_eq!(models, vec!["anthropic/claude-sonnet-4-5", "openai/gpt-5.4", "ollama/qwen2.5-coder:7b"]);
+
+        let override_env = BTreeMap::from([
+            ("HOME".into(), tmp.join("home").display().to_string()),
+            ("PI_CODING_AGENT_DIR".into(), custom_pi_dir.display().to_string()),
+        ]);
+        let (models2, dm2) = discover_local_models("pi", true, &override_env);
+        assert_eq!(dm2.as_deref(), Some("deepseek/deepseek-chat"));
+        assert_eq!(models2[0], "deepseek/deepseek-chat");
+        assert!(models2.contains(&"ollama/qwen2.5-coder:7b".to_string()));
+
         let _ = std::fs::remove_dir_all(tmp);
     }
 }

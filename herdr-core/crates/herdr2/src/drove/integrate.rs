@@ -393,6 +393,30 @@ pub(super) async fn merge_and_finalize_worktree(
     Ok(outcome)
 }
 
+/// Best-effort sync of candidate worktree changes into `run.cwd` when a review circuit trips into
+/// `HandoffToCoordinator` / `AwaitingUserDecision`, so the Coordinator immediately sees the author's
+/// candidate files in `run.cwd` and subsequent `retry` / worker reaping never wipes unmerged work.
+pub(super) async fn sync_worktree_for_coordinator_handoff(
+    core: &Arc<Core>,
+    run: &Run,
+    worktree_dir: Option<&str>,
+) -> Vec<String> {
+    let Some(wt) = worktree_dir.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Vec::new();
+    };
+    if wt == run.cwd || is_aosp_harness(&run.cwd) || !Path::new(wt).is_dir() {
+        return Vec::new();
+    }
+    let lock = core.drove.run_merge_lock(&run.id);
+    let _guard = lock.lock().await;
+    let run_cwd = run.cwd.clone();
+    let wt_str = wt.to_string();
+    match tokio::task::spawn_blocking(move || merge_worktree_stage_one(&run_cwd, &wt_str)).await {
+        Ok(Ok((outcome, _, _))) => outcome.changed_files,
+        _ => Vec::new(),
+    }
+}
+
 fn refresh_worktree_with_latest_main(run_cwd: &str, wt_dir: &str, changed_files: &[String], wt_patch: &[u8]) {
     let wt_parent = Path::new(wt_dir).parent().unwrap_or_else(|| Path::new(run_cwd));
     let Ok(new_base) = snapshot_working_tree_commit(run_cwd, wt_parent) else {

@@ -391,14 +391,35 @@ fn expand_foreach_from(core: &Arc<Core>, run: &Run, tasks: &[Task]) {
                 continue;
             }
             let title = format!("{} [{}]", tpl.title, idx + 1);
-            let mut spec = tpl.spec.clone();
             let item_str = match &item {
                 Value::String(s) => s.clone(),
                 other => other.to_string(),
             };
-            spec.target = spec.target.replace("{{item}}", &item_str);
-            spec.change = spec.change.replace("{{item}}", &item_str);
-            spec.acceptance = spec.acceptance.replace("{{item}}", &item_str);
+            let spec: Spec = serde_json::to_value(&tpl.spec)
+                .ok()
+                .map(|mut v| {
+                    super::routes::replace_item_in_value(&mut v, &item_str);
+                    v
+                })
+                .and_then(|v| serde_json::from_value(v).ok())
+                .unwrap_or_else(|| {
+                    let mut s = tpl.spec.clone();
+                    s.target = s.target.replace("{{item}}", &item_str);
+                    s.change = s.change.replace("{{item}}", &item_str);
+                    s.acceptance = s.acceptance.replace("{{item}}", &item_str);
+                    s
+                });
+            let exec: Option<ExecSpec> = tpl.exec.as_ref().and_then(|ex| {
+                let mut v = serde_json::to_value(ex).ok()?;
+                super::routes::replace_item_in_value(&mut v, &item_str);
+                serde_json::from_value(v).ok()
+            });
+            let cache = tpl.cache.as_ref().and_then(|ca| {
+                let mut v = serde_json::to_value(ca).ok()?;
+                super::routes::replace_item_in_value(&mut v, &item_str);
+                serde_json::from_value(v).ok()
+            });
+            let files: Vec<String> = tpl.files.iter().map(|f| f.replace("{{item}}", &item_str)).collect();
 
             core.drove.store.create_task(super::store::CreateTaskInput {
                 run_id: run.id.clone(),
@@ -407,7 +428,7 @@ fn expand_foreach_from(core: &Arc<Core>, run: &Run, tasks: &[Task]) {
                 phase: tpl.phase.clone(),
                 spec,
                 tags: tpl.tags.clone(),
-                files: tpl.files.clone(),
+                files,
                 deps: vec![tpl.id.clone()],
                 output_schema: tpl.output_schema.clone(),
                 isolation: tpl.isolation,
@@ -421,12 +442,12 @@ fn expand_foreach_from(core: &Arc<Core>, run: &Run, tasks: &[Task]) {
                 kind: tpl.kind.clone(),
                 trigger_rule: tpl.trigger_rule,
                 context: Some(item),
-                exec: tpl.exec.clone(),
+                exec,
                 foreach_from: None,
                 template: None,
                 expanded_from: Some(tpl.id.clone()),
                 review: tpl.review.clone(),
-                cache: tpl.cache.clone(),
+                cache,
                 cached_from: None,
                 retry_on_worker_reported: tpl.retry_on_worker_reported,
                 fork_from: tpl.fork_from.clone(),

@@ -34,7 +34,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
             let model = p.model.clone().or_else(|| t.model.clone());
             let mode = p.mode.clone().or_else(|| t.mode.clone());
             let explicit_permissions = p.permissions.or(t.permissions).or(settings.default_permissions);
-            let inject_mcp = if p.no_mcp { false } else { t.inject_mcp.or(settings.inject_mcp).unwrap_or(true) };
+            let inject_mcp = if p.no_mcp { false } else { t.inject_mcp.unwrap_or_else(|| settings.inject_mcp()) };
             let system_prompt = p.system_prompt.clone().or_else(|| t.system_prompt.clone());
             (resolved, prompt, model, mode, explicit_permissions, inject_mcp, system_prompt)
         }
@@ -42,7 +42,7 @@ pub(super) async fn agent_run(core: Ctx<'_>, mut p: RunParams) -> Result<RunResu
             let resolved = presets::resolve(p.agent.as_deref(), &p.argv, p.prompt.take(), &settings.agents)?;
             let prompt = resolved.prompt.clone().filter(|s| !s.trim().is_empty());
             let explicit_permissions = p.permissions.or(settings.default_permissions);
-            let inject_mcp = !p.no_mcp && settings.inject_mcp.unwrap_or(true);
+            let inject_mcp = !p.no_mcp && settings.inject_mcp();
             (
                 resolved,
                 prompt,

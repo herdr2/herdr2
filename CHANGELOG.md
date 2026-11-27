@@ -1,5 +1,51 @@
 # Changelog
 
+## v2.0.19
+
+#### 中文
+
+**新增功能**
+- **ACP 未登录状态统一识别与一键「终端登录」**：
+  - ACP 传输层自动解析 `-32000` 鉴权错误中的 `data.authMethods` 并过滤 `@agentclientprotocol/sdk` 冗余 `stderr` 回显；探测层新增 `pi` 本地模型解析（`~/.pi/agent/settings.json` 与 `models.json`）及 Windows `USERPROFILE` 目录优先级对齐。
+  - 设置页、欢迎页与 ACP 会话页统一区分「需登录」与真实适配器故障，为未登录智能体提供一键 **终端登录** 入口（支持 `pi`、`claude`、`cursor-agent`、`codex` 等），不再误导重装适配器。
+- **AI 异常排查体验增强**：按模型能力自动解析思考强度变体（不向无档位模型拼接非法后缀），AI 排查启动的 Agent 独立归属目标主机的 Home（`~`）工作区，跨平台远程主机亦正确显示为 `~`。
+
+**问题修复**
+- **修复 Windows 下 Cursor CLI 多行提示词截断**：Git Bash 包装脚本在无原生 `.exe` 时优先调用 `.ps1`（`pwsh`/`powershell`），`cmd.exe` 检测到换行符时自动改走 PowerShell 包装，避免批处理参数在首个换行处截断多行 UTF-8 提示词。
+- **Drove 编排引擎多项实测核心修复**：
+  - 静态 `foreach` 与动态 `foreachFrom` 现递归替换 `exec`（`cmd`/`program`/`args`/`env`）、`spec`（含 `verify`）、`files` 与 `cache` 全字段中的 `{{item}}`。
+  - 过滤并发 Worktree 合并导致的 Reviewer / Breaker 越权误判，并为 Breaker 补齐作者私有 Worktree 只读基线校验与时段/备注偏好筛选。
+  - `isolation: worktree` 触发 `handoff_to_coordinator` 或等待用户裁决时自动安全同步候选改动至 `run.cwd` 并止损收敛，防止代码丢失与无效重试 `drove_finish`。
+  - 修复 Linux `bwrap` 沙箱 NVM 多版本 `PATH` 注入（遵循 `~/.nvm/alias/default` 并补齐其余 Node 版本路径）。
+  - 完善 Run 自动收口守卫与 `retry` / `edit` 自动重激活；支持跨 `foreachFrom` 模板节点级联重开与 `h2 drove retry` 遵循上游依赖就绪度。
+  - 收紧 MCP `drove_ask` 单次轮询至 45s（兼容 `cursor-agent` 60s 硬超时）并按 `(attempt_id, question)` 幂等去重；`task_enrich` / `run_briefing` 切至 `Nano` 低思考档位并支持空正文截断自动扩容重试；修复 `h2 drove settings --compact` 列表展示与 `h2 ls` 的 `drove.display` 展示。
+- **修复托管 ACP 适配器优先级、远程安装超时与待确认对话状态**：
+  - 托管适配器目录现优先于 `PATH` 解析以确保 `h2 adapter update` 立即生效；远程 `adapter.install` / `adapter.update` RPC 超时延长至 `+900s` 以兼容大体积独立适配器包下载。
+  - 修复 PTY 提交非空提示词后从 `blocked` 立即切回 `working`、允许直接回复 `blocked (question)` 状态的 ACP/PTY 智能体而无需 `--force`/`--steer`，并跳过已有待处理队列消息的回合后提问仲裁。
+
+---
+
+#### English
+
+**New Features**
+- **Unified ACP Login-Required Detection & One-Click "Sign In"**:
+  - Parsed `data.authMethods` from ACP `-32000` authentication errors in the transport layer while suppressing noisy `@agentclientprotocol/sdk` stderr echoes; added `pi` local model discovery (`~/.pi/agent/settings.json` and `models.json`) and aligned Windows `USERPROFILE` home directory precedence.
+  - Settings, Welcome, and ACP session views now distinguish **Login Required** (amber) from true adapter failures and offer a one-click **Sign In** terminal action (`pi`, `claude`, `cursor-agent`, `codex`, etc.) instead of misleading adapter reinstall buttons.
+- **Improved AI Troubleshooting & Home (`~`) Workspace Isolation**: Automatically resolves supported reasoning-effort model variants without appending invalid suffixes, isolates AI troubleshooting sessions into the target host's dedicated Home (`~`) workspace, and displays remote Unix home paths consistently as `~`.
+
+**Bug Fixes**
+- **Fixed Multiline Prompt Truncation for Cursor CLI on Windows**: Updated Git Bash command wrappers to prefer `.ps1` (`pwsh`/`powershell`) over `.cmd`/`.bat` when no native `.exe` exists, and routed `cmd.exe` multiline arguments through PowerShell so multiline UTF-8 prompts are delivered intact.
+- **Drove Orchestration Reliability Fixes**:
+  - Recursively expanded `{{item}}` across `exec` (`cmd`/`program`/`args`/`env`), `spec` (including `verify`), `files`, and `cache` for both static `foreach` and dynamic `foreachFrom`.
+  - Filtered concurrent sibling worktree merges out of Reviewer/Breaker scope checks, added read-only baseline validation on author worktrees for Breakers, and aligned Breaker candidate routing preferences.
+  - Preserved worktree candidate edits into `run.cwd` when `handoff_to_coordinator` or user-decision gates fire, preventing lost work and redundant `drove_finish` retries.
+  - Fixed Linux `bwrap` sandbox `PATH` injection for multi-version NVM installs (respecting `~/.nvm/alias/default` plus installed Node version paths).
+  - Hardened Run auto-completion guards and automatic reactivation on `retry`/`edit`, supported cascading reopens across `foreachFrom` template barriers, and made `h2 drove retry` respect upstream dependency readiness.
+  - Tightened MCP `drove_ask` polling to 45s (avoiding `cursor-agent` 60s timeouts) with `(attempt_id, question)` deduplication, moved `task_enrich`/`run_briefing` to `AiTaskTier::Nano` with empty-body length-truncation retries, and fixed `h2 drove settings --compact` & `h2 ls` detail display.
+- **Fixed Managed ACP Adapter Precedence, Remote Install Timeout & Blocked-Question Replies**:
+  - Prioritized managed adapter binaries over `PATH` so `h2 adapter update` takes effect immediately, and extended remote `adapter.install`/`adapter.update` RPC deadlines to `+900s` for large standalone adapter archives.
+  - Transitioned PTY agents immediately from `blocked` to `working` upon non-empty prompt submission, allowed replying directly to `blocked (question)` ACP/PTY agents without `--force`/`--steer`, and skipped post-turn question arbitration when inbox messages are already queued.
+
 ## v2.0.18
 
 #### 中文

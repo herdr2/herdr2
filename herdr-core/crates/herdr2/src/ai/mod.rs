@@ -1749,9 +1749,7 @@ impl AiRuntime {
                         if proto == AiProtocol::Anthropic {
                             caps.anthropic_bearer_auth = winning_style == HttpAuthStyle::AnthropicBearer;
                         }
-                        let (in_tok, out_tok, cache_tok) = parse_usage_tokens(&parsed);
-                        let usage =
-                            AiUsage { input_tokens: in_tok, output_tokens: out_tok, cached_input_tokens: cache_tok };
+                        let (mut in_tok, mut out_tok, mut cache_tok) = parse_usage_tokens(&parsed);
                         if prompt_mode == "auto"
                             && used_canonical_prefix
                             && matches!(req.mode, AiConversationMode::StatelessSharedPrefix)
@@ -1769,7 +1767,43 @@ impl AiRuntime {
                             save_endpoint_caps(&self.paths, &map);
                         }
 
-                        let (raw_content, finish_reason) = extract_response_content(&parsed, proto);
+                        let (mut raw_content, mut finish_reason) = extract_response_content(&parsed, proto);
+                        // Always-thinking models (e.g. DeepSeek reasoning proxies ignoring `reasoning_effort`)
+                        // can exhaust tight `Nano`/`Fast` `max_tokens` inside `reasoning_content` before emitting
+                        // JSON `content`. Retry once with an expanded token ceiling when that happens.
+                        if raw_content.is_empty()
+                            && finish_reason == "length"
+                            && out_tok > 0
+                            && eff_max_tokens < 2048
+                            && let Some(win) = winning_variant
+                            && let Ok(mut retry_json) = serde_json::from_str::<Value>(&win.body)
+                        {
+                            let bumped = (eff_max_tokens.saturating_mul(3)).clamp(1024, 2560);
+                            retry_json["max_tokens"] = json!(bumped);
+                            if let Ok(retry_resp) = http_json_request_with_auth(
+                                "POST",
+                                &url,
+                                key.as_deref(),
+                                winning_style,
+                                Some(&retry_json.to_string()),
+                                req.timeout,
+                            )
+                            .await
+                                && (200..300).contains(&retry_resp.status)
+                                && let Ok(retry_parsed) = serde_json::from_str::<Value>(&retry_resp.body)
+                                && is_valid_protocol_response(&retry_parsed, proto)
+                            {
+                                let (r_in, r_out, r_cache) = parse_usage_tokens(&retry_parsed);
+                                in_tok = in_tok.saturating_add(r_in);
+                                out_tok = out_tok.saturating_add(r_out);
+                                cache_tok = cache_tok.saturating_add(r_cache);
+                                let (rc, rf) = extract_response_content(&retry_parsed, proto);
+                                raw_content = rc;
+                                finish_reason = rf;
+                            }
+                        }
+                        let usage =
+                            AiUsage { input_tokens: in_tok, output_tokens: out_tok, cached_input_tokens: cache_tok };
                         if raw_content.is_empty() || raw_content.contains("<tool_use") || raw_content.contains("DSML") {
                             let reason = if raw_content.is_empty() {
                                 if finish_reason == "length" {

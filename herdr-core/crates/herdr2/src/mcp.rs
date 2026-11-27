@@ -355,8 +355,11 @@ fn dispatch_drove_worker_tool(
             ("/api/worker/done", req)
         }
         "drove_ask" => {
+            let poll_sec = args.get("timeout").and_then(Value::as_u64).unwrap_or(45).clamp(1, 45);
             let mut req = json!({
                 "question": args.get("question").and_then(Value::as_str).unwrap_or_default(),
+                "timeoutSec": poll_sec,
+                "mcpPoll": true,
             });
             if let Some(opts) = args.get("options").and_then(Value::as_array) {
                 req["options"] = Value::Array(opts.clone());
@@ -366,9 +369,6 @@ fn dispatch_drove_worker_tool(
             }
             if let Some(why) = args.get("why").and_then(Value::as_str) {
                 req["why"] = Value::String(why.to_string());
-            }
-            if let Some(t) = args.get("timeout").and_then(Value::as_u64) {
-                req["timeoutSec"] = Value::Number(t.into());
             }
             ("/api/worker/ask", req)
         }

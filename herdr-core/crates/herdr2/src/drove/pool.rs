@@ -193,6 +193,20 @@ async fn handle_signal(core: &Arc<Core>, pending: &mut HashMap<String, PendingTe
                 return;
             }
             if attempt.outcome.is_some() || attempt.ended_at.is_some() {
+                // If an attempt ended mid-turn via `HandoffToCoordinator` and the worker touched its
+                // worktree before stopping, sync those files into `run.cwd` before returning.
+                if let Some(wt) = worker.worktree.as_deref()
+                    && let Some(t) = core.drove.store.get_task(&attempt.task_id)
+                    && t.review_circuit.as_ref().is_some_and(|rc| {
+                        matches!(
+                            rc.stage,
+                            ReviewCircuitStage::HandoffToCoordinator | ReviewCircuitStage::AwaitingUserDecision
+                        )
+                    })
+                    && let Some(run) = core.drove.store.get_run(&attempt.run_id)
+                {
+                    let _ = super::integrate::sync_worktree_for_coordinator_handoff(core, &run, Some(wt)).await;
+                }
                 return;
             }
             // Don't prematurely remind or fail if a blocking `drove worker ask` or synchronous
@@ -1239,13 +1253,15 @@ pub async fn close_run_for_coordinator(core: &Arc<Core>, run: &Run) {
         && cur.status == RunStatus::Active
     {
         let tasks = core.drove.store.list_tasks(&run.id);
-        let all_terminal = !tasks.is_empty()
-            && tasks
-                .iter()
-                .filter(|t| t.template != Some(true))
-                .all(|t| super::scheduler::is_terminal_status(t.status));
+        let has_unhandled = !core.drove.store.list_messages(&run.id, Some(true), true, None).is_empty();
+        let can_auto_done = !tasks.is_empty()
+            && cur.verify.is_none()
+            && !has_unhandled
+            && tasks.iter().filter(|t| t.template != Some(true)).all(|t| {
+                matches!(t.status, TaskStatus::Succeeded | TaskStatus::Skipped | TaskStatus::Cancelled)
+            });
         let _ = core.drove.store.update_run(&run.id, |r| {
-            if all_terminal {
+            if can_auto_done {
                 r.status = RunStatus::Done;
             } else {
                 r.status = RunStatus::Paused;
@@ -2285,31 +2301,60 @@ pub async fn handle_task_failure(
     }
 }
 
-/// Ensures Drove worker/reviewer child processes inherit a complete `PATH` (including `~/.nvm` Node
-/// shims, `~/.local/bin`, and `~/.cargo/bin`) even when `herdr2 hold` was spawned by a desktop GUI.
+/// Ensures Drove worker/reviewer child processes inherit a complete `PATH` (including `~/.nvm`
+/// default alias + all installed NVM Node bins, `~/.local/bin`, `~/.cargo/bin`, `~/.bun/bin`, etc.)
+/// even when `herdr2` was spawned by a desktop GUI or under a different NVM version.
 pub(super) fn inject_drove_path_env(env: &mut BTreeMap<String, String>) {
-    let mut dirs: Vec<std::path::PathBuf> =
-        std::env::var_os("PATH").map(|v| std::env::split_paths(&v).collect()).unwrap_or_default();
-    if let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) {
-        let mut extras = vec![home.join(".local/bin"), home.join(".cargo/bin")];
-        if let Ok(rd) = std::fs::read_dir(home.join(".nvm/versions/node")) {
-            let mut vers: Vec<std::path::PathBuf> = rd.filter_map(|e| e.ok().map(|e| e.path())).collect();
-            vers.sort();
-            if let Some(latest) = vers.pop() {
-                extras.insert(0, latest.join("bin"));
-            }
-        }
-        for ex in extras.into_iter().rev() {
-            if ex.is_dir() && !dirs.iter().any(|d| d == &ex) {
-                dirs.insert(0, ex);
-            }
-        }
-    }
-    if let Ok(joined) = std::env::join_paths(&dirs)
-        && let Some(s) = joined.to_str()
-        && !s.is_empty()
+    if !env.contains_key("PATH")
+        && let Some(p) = std::env::var_os("PATH").and_then(|v| v.into_string().ok())
     {
-        env.insert("PATH".into(), s.to_string());
+        env.insert("PATH".into(), p);
+    }
+    #[cfg(unix)]
+    {
+        let home_opt = env
+            .get("HOME")
+            .filter(|s| !s.is_empty())
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").filter(|s| !s.is_empty()).map(std::path::PathBuf::from));
+        if let Some(ref home) = home_opt
+            && !env.contains_key("HOME")
+            && let Some(hs) = home.to_str()
+        {
+            env.insert("HOME".into(), hs.to_string());
+        }
+        // 1. Apply canonical user PATH augmentation (honors `~/.nvm/alias/default`, `.local/bin`, `.bun/bin`, etc.).
+        crate::platform::augment_user_path_env(env);
+
+        // 2. Also append any other installed `~/.nvm/versions/node/*/bin` directories as fallback so
+        // global npm CLIs (`dsh`, `glm-acp-agent`, etc.) installed under a non-default Node version
+        // remain reachable inside `bwrap` sandboxes.
+        if let Some(home) = home_opt
+            && let Ok(rd) = std::fs::read_dir(home.join(".nvm/versions/node"))
+        {
+            let mut dirs: Vec<std::path::PathBuf> =
+                env.get("PATH").map(|v| std::env::split_paths(v).collect()).unwrap_or_default();
+            let mut nvm_bins: Vec<std::path::PathBuf> = rd
+                .filter_map(|e| e.ok().map(|e| e.path().join("bin")))
+                .filter(|b| b.is_dir())
+                .collect();
+            nvm_bins.sort();
+            nvm_bins.reverse();
+            let mut changed = false;
+            for bin in nvm_bins {
+                if !dirs.iter().any(|d| d == &bin) {
+                    dirs.push(bin);
+                    changed = true;
+                }
+            }
+            if changed
+                && let Ok(joined) = std::env::join_paths(&dirs)
+                && let Some(s) = joined.to_str()
+                && !s.is_empty()
+            {
+                env.insert("PATH".into(), s.to_string());
+            }
+        }
     }
 }
 

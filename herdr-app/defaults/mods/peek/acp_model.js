@@ -2354,6 +2354,7 @@ export function resolveAcpAuthErrorAction(record, message, isRemote = false) {
   const isAuth =
     lower.includes("authentication required") ||
     lower.includes("auth_required") ||
+    lower.includes("configure an api key") ||
     lower.includes("cursor_login") ||
     lower.includes("agent login") ||
     lower.includes("cursor-agent login") ||
@@ -2367,13 +2368,14 @@ export function resolveAcpAuthErrorAction(record, message, isRemote = false) {
     lower.includes("session expired") ||
     lower.includes("unauthenticated") ||
     lower.includes("unauthorized") ||
-    (lower.includes("-32000") && (lower.includes("auth") || lower.includes("login")));
+    (lower.includes("-32000") && (lower.includes("auth") || lower.includes("login") || lower.includes("api key")));
   if (!isAuth) return null;
 
   const key = String(record?.agent || record?.program?.key || "").trim().toLowerCase();
   const isClaude = key === "claude" || key === "claude-code" || lower.includes("claude");
   const isCursor = !isClaude && (key === "cursor" || key === "cursor-agent" || lower.includes("cursor"));
   const isCodex = !isClaude && !isCursor && (key === "codex" || lower.includes("codex"));
+  const isPi = !isClaude && !isCursor && !isCodex && (key === "pi" || key === "pi-acp" || lower.includes("pi-acp") || lower.includes("pi has no configured api key"));
 
   if (isClaude) {
     return {
@@ -2409,6 +2411,18 @@ export function resolveAcpAuthErrorAction(record, message, isRemote = false) {
       buttonZh: "打开终端登录",
       argv: isRemote ? null : ["codex", "login"],
       tabName: "Codex Login",
+    };
+  }
+  if (isPi) {
+    return {
+      titleEn: "Pi authentication required",
+      titleZh: "Pi 需要先配置登录或 API Key",
+      hintEn: "Run `pi` in a terminal and execute `/login` (or configure `~/.pi/agent/models.json`), then retry ACP.",
+      hintZh: "请先在终端运行 `pi` 并执行 `/login` 完成登录或配置 API Key（Windows 环境变量需设在用户/系统变量，勿仅写在 $PROFILE），完成后重试。",
+      buttonEn: "Open Pi CLI",
+      buttonZh: "打开 Pi 终端",
+      argv: isRemote ? null : ["pi"],
+      tabName: "Pi CLI",
     };
   }
   return {

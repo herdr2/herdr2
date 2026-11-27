@@ -31,10 +31,58 @@ pub enum CallError {
     Closed,
 }
 
+fn extract_auth_methods_hint(data: &Value) -> Option<String> {
+    let methods = data.get("authMethods")?.as_array()?;
+    for item in methods {
+        for key in ["description", "name", "label"] {
+            if let Some(s) = item.get(key).and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
+                return Some(s.to_string());
+            }
+        }
+        if let Some(label) = item
+            .pointer("/_meta/terminal-auth/label")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return Some(label.to_string());
+        }
+    }
+    Some(String::new())
+}
+
+fn is_rpc_auth_error(err: &JsonRpcError) -> bool {
+    if err.data.as_ref().and_then(|d| d.get("authMethods")).is_some() {
+        return true;
+    }
+    let lower = err.message.to_ascii_lowercase();
+    lower.contains("authentication required")
+        || lower.contains("auth_required")
+        || lower.contains("login required")
+        || lower.contains("not logged in")
+        || lower.contains("sign in required")
+        || lower.contains("configure an api key")
+        || (err.code == -32000 && (lower.contains("auth") || lower.contains("login") || lower.contains("api key")))
+}
+
+fn is_redundant_sdk_auth_stderr(stderr: &str) -> bool {
+    let trimmed = stderr.trim();
+    trimmed.starts_with("Error handling request") && trimmed.contains("-32000")
+}
+
 impl CallError {
     pub fn into_rpc_error(self, context: &str, stderr: &str) -> RpcError {
+        let mut is_auth = false;
+        let mut hint = String::new();
         let base = match self {
             Self::Rpc(e) => {
+                is_auth = is_rpc_auth_error(&e);
+                let auth_hint = e.data.as_ref().and_then(extract_auth_methods_hint);
+                if let Some(ref h) = auth_hint
+                    && !h.is_empty()
+                {
+                    hint = h.clone();
+                }
                 let detail = e
                     .data
                     .as_ref()
@@ -46,6 +94,9 @@ impl CallError {
                             .or_else(|| d.get("reason").and_then(Value::as_str))
                             .map(str::to_string)
                             .or_else(|| {
+                                if let Some(ref h) = auth_hint {
+                                    return (!h.is_empty()).then(|| h.clone());
+                                }
                                 let is_non_empty_obj = d.as_object().is_some_and(|m| !m.is_empty());
                                 if is_non_empty_obj {
                                     serde_json::to_string(d).ok().map(|s| {
@@ -73,8 +124,9 @@ impl CallError {
             Self::Closed => format!("{context}: agent closed stdio before replying"),
         };
         let tail = stderr.trim();
-        let message = if tail.is_empty() { base } else { format!("{base}\nstderr:\n{tail}") };
-        RpcError::new("spawn_failed", message, "")
+        let include_stderr = !tail.is_empty() && !(is_auth && is_redundant_sdk_auth_stderr(tail));
+        let message = if include_stderr { format!("{base}\nstderr:\n{tail}") } else { base };
+        RpcError::new("spawn_failed", message, hint)
     }
 
     pub fn is_invalid_params(&self) -> bool {
@@ -401,5 +453,34 @@ mod tests {
         })
         .into_rpc_error("ACP session/new failed", "");
         assert_eq!(err.message, "ACP session/new failed: Internal error: spawn ENOENT in UNC cwd (code -32603)");
+    }
+
+    #[test]
+    fn rpc_auth_error_extracts_auth_methods_description_and_suppresses_sdk_echo_stderr() {
+        let sdk_stderr = "Error handling request {\n  id: 2,\n  jsonrpc: '2.0',\n  method: 'session/new',\n  params: { cwd: 'D:\\\\Users\\\\zhihao.zou', mcpServers: [] }\n} {\n  code: -32000,\n  message: 'Authentication required'\n}";
+        let err = CallError::Rpc(JsonRpcError {
+            code: -32000,
+            message: "Authentication required: Configure an API key or log in with an OAuth provider.".into(),
+            data: Some(json!({
+                "authMethods": [{
+                    "id": "pi_terminal_login",
+                    "name": "Launch pi in the terminal",
+                    "description": "Start pi in an interactive terminal to configure API keys or login",
+                    "_meta": {
+                        "terminal-auth": {
+                            "command": r"C:\Program Files\nodejs\node.exe",
+                            "args": [r"D:\Users\zhihao.zou\AppData\Local\herdr2\adapters\pi\node_modules\pi-acp\dist\index.js", "--terminal-login"],
+                            "label": "Launch pi"
+                        }
+                    }
+                }]
+            })),
+        })
+        .into_rpc_error("ACP session/new failed", sdk_stderr);
+
+        assert!(!err.message.contains("terminal-auth"), "must not leak raw authMethods JSON: {}", err.message);
+        assert!(!err.message.contains("Error handling request"), "must strip redundant SDK stderr: {}", err.message);
+        assert!(err.message.contains("Start pi in an interactive terminal"), "missing human auth hint: {}", err.message);
+        assert_eq!(err.hint, "Start pi in an interactive terminal to configure API keys or login");
     }
 }

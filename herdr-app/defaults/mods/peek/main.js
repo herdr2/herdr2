@@ -887,10 +887,11 @@ export default class Peek extends View {
   }
 
   async runH2(args) {
-    if (checking() || this.busyAction) return;
+    if (checking() || this.busyAction) return false;
     this.busyAction = true;
     this.error = null;
     this.cx?.notify();
+    let ok = false;
     try {
       const res = await h2(args);
       if (res.code !== 0) {
@@ -900,6 +901,8 @@ export default class Peek extends View {
           if (parsed?.error?.message) msg = parsed.error.message;
         } catch {}
         this.error = msg;
+      } else {
+        ok = true;
       }
     } catch (e) {
       this.error = e?.message ?? String(e);
@@ -908,6 +911,7 @@ export default class Peek extends View {
       this.cx?.notify();
       this.scheduleReload(this.cx);
     }
+    return ok;
   }
 
   async interruptAgent(terminal = this.activeTerminal(), cx = this.cx) {
@@ -1104,7 +1108,17 @@ export default class Peek extends View {
     }
     args.push("--", terminal);
     if (text) args.push(text);
-    await this.runH2(args);
+    const ok = await this.runH2(args);
+    if (!ok && this.activeTerminal() === terminal) {
+      if (!(this.input?.value?.() ?? "").trim() && text) {
+        this.applyComposerText(text, text.length);
+        this.writeSavedDraft(terminal, text);
+      }
+      if (this.draftAttachments.length === 0 && attachments.length > 0) {
+        this.draftAttachments = attachments;
+      }
+      this.cx?.notify?.();
+    }
   }
 
   revertPolishedPrompt(cx) {

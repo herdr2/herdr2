@@ -1018,6 +1018,13 @@ pub(crate) fn resolve_acp_command_in_env(
     let path_override = env_ignore_case(env, "PATH");
     let pathext_override = env_ignore_case(env, "PATHEXT");
 
+    if let Some(managed) = crate::acp::adapters::resolve_managed_binary_in_env(preset_id, first, env) {
+        let mut effective = Vec::with_capacity(argv.len());
+        effective.push(managed.display().to_string());
+        effective.extend(argv[1..].iter().cloned());
+        return Some((managed, effective));
+    }
+
     if let Some(found) = resolve_non_shim_binary_in_path(first, path_override, pathext_override) {
         return Some((found, argv.to_vec()));
     }
@@ -1029,13 +1036,6 @@ pub(crate) fn resolve_acp_command_in_env(
             effective.extend(argv[1..].iter().cloned());
             return Some((found, effective));
         }
-    }
-
-    if let Some(managed) = crate::acp::adapters::resolve_managed_binary_in_env(preset_id, first, env) {
-        let mut effective = Vec::with_capacity(argv.len());
-        effective.push(managed.display().to_string());
-        effective.extend(argv[1..].iter().cloned());
-        return Some((managed, effective));
     }
 
     if let Some(cached) = resolve_in_npx_cache(first, env, pathext_override) {
@@ -1255,7 +1255,12 @@ mod tests {
         assert_eq!(resolved_argv, vec![claude_acp.display().to_string()]);
         assert!(is_claude_agent(None, &resolved_argv));
 
-        // Managed adapter directory beats _npx cache, while PATH binary beats managed adapter.
+        // Managed adapter directory beats both PATH binaries (so explicit `adapter update` takes effect)
+        // and `_npx` cache, while a custom executable name (e.g. config.toml `[agents]`) resolves via PATH.
+        let path_claude_acp = bin_dir.join("claude-agent-acp");
+        std::fs::write(&path_claude_acp, "#!/bin/sh\n").unwrap();
+        let custom_claude_acp = bin_dir.join("my-claude-acp");
+        std::fs::write(&custom_claude_acp, "#!/bin/sh\n").unwrap();
         let managed_dir = root.join("managed-adapters");
         let managed_claude_dir = managed_dir.join("claude/pkg");
         std::fs::create_dir_all(&managed_claude_dir).unwrap();
@@ -1281,6 +1286,9 @@ mod tests {
             resolve_acp_command_in_env(Some("claude"), &["claude-agent-acp".into()], &managed_env).unwrap();
         assert_eq!(managed_path, managed_claude_exe);
         assert_eq!(managed_argv, vec![managed_claude_exe.display().to_string()]);
+        let (custom_path, _) =
+            resolve_acp_command_in_env(Some("claude"), &["my-claude-acp".into()], &managed_env).unwrap();
+        assert_eq!(custom_path, custom_claude_acp);
 
         let (codex_path, codex_argv) = resolve_acp_command_in_env(Some("codex"), &["codex-acp".into()], &env).unwrap();
         assert_eq!(codex_path, npx_cli);

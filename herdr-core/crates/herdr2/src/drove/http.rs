@@ -720,8 +720,12 @@ async fn dispatch_http_inner(
             core.drove.message_reply_wake.notify_waiters();
             Ok(json!(reply))
         }
-        ("POST", ["api", "tasks", id, "retry"]) => retry_task_http(&core, id, &body).await,
-        ("PATCH", ["api", "tasks", id]) => edit_task_http(&core, id, &body).await,
+        ("POST", ["api", "tasks", id, "retry"]) => {
+            retry_task_http(&core, id, header(&req.headers, "x-drove-coordinator", "x-co-coordinator"), &body).await
+        }
+        ("PATCH", ["api", "tasks", id]) => {
+            edit_task_http(&core, id, header(&req.headers, "x-drove-coordinator", "x-co-coordinator"), &body).await
+        }
         ("POST", ["api", "tasks", id, "cancel"]) => cancel_task_http(&core, id, &body).await,
         ("POST", ["api", "tasks", id, "send"]) => send_task_http(&core, id, &body).await,
         ("GET", ["api", "tasks", id, "inspect"]) => {

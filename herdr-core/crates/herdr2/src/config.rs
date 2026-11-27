@@ -101,6 +101,10 @@ impl Config {
         self.auto_install_adapters.unwrap_or(true)
     }
 
+    pub fn inject_mcp(&self) -> bool {
+        self.inject_mcp.unwrap_or(true)
+    }
+
     pub fn validate(&self) -> Result<(), RpcError> {
         for (name, argv) in &self.agents {
             crate::acp::presets::check_preset_command(name, argv)?;
@@ -336,9 +340,11 @@ claude = ["my-claude-acp", "--flag"]
         cfg.validate().unwrap();
         assert_eq!(cfg.default_permissions, Some(PermissionMode::ApproveAll));
         assert_eq!(cfg.inject_mcp, Some(false));
+        assert!(!cfg.inject_mcp());
         assert!(!cfg.auto_install_adapters());
         assert_eq!(cfg.acp_registry_url.as_deref(), Some("https://mirror.example/registry.json"));
         assert!(Config::default().auto_install_adapters());
+        assert!(Config::default().inject_mcp());
         assert_eq!(cfg.agents["claude"], ["my-claude-acp", "--flag"]);
     }
 

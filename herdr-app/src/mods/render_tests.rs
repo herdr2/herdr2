@@ -2969,6 +2969,39 @@ fn split_pane_names_merged_tabs_and_windows_shells(cx: &mut TestAppContext) {
         .find(|l| l.contains("st-dr-probe-fix-eff-high"))
         .unwrap();
     assert!(!fix_eff_high.contains("on_click"), "Embedded-effort model should disable clicking effort pills: {fix_eff_high}");
+    let ai_install_tree = describe(
+        cx,
+        &staged,
+        "frame/settings",
+        true,
+        json!({ "section": "agents" }),
+        updates("current", "current"),
+        Some("this.agentAiInstallTargetId = 'agy'; this.agentAiInstallAgent = 'codex'; this.agentAiInstallModel = 'gpt-5.4'; this.agentAiInstallEffort = 'xhigh'; this.droveData = { config: { roles: {} }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'claude', installed: true, models: ['claude-opus-4-6'] }, { id: 'codex', installed: true, models: ['gpt-5.4'] }] } };"),
+    )
+    .unwrap();
+    assert!(ai_install_tree.contains("st-ag-ai-install-panel"), "AI Install selector panel should render when open: {ai_install_tree}");
+    assert!(ai_install_tree.contains("st-drp-agent-install-agent"), "AI Install panel should render agent type picker: {ai_install_tree}");
+    assert!(ai_install_tree.contains("st-drp-agent-install-model"), "AI Install panel should render model picker: {ai_install_tree}");
+    assert!(ai_install_tree.contains("st-ag-ai-install-eff-group"), "AI Install panel should render reasoning effort group: {ai_install_tree}");
+    assert!(ai_install_tree.contains("st-ag-ai-install-eff-xhigh"), "4-level model (gpt-5.4) should render xhigh effort pill in AI Install panel: {ai_install_tree}");
+    assert!(ai_install_tree.contains("st-ag-ai-install-launch"), "AI Install panel should render Start AI Install button: {ai_install_tree}");
+    let ai_install_acp_tree = describe(
+        cx,
+        &staged,
+        "frame/settings",
+        true,
+        json!({ "section": "agents" }),
+        updates("current", "current"),
+        Some("this.agentAiInstallTargetId = 'hermes'; this.agentAiInstallAgent = 'agy'; this.agentAiInstallModel = 'gemini-4-carbon-high'; this.agentAiInstallEffort = 'high'; this.droveFixKnownAgents = { __local__: [{ key: 'hermes', name: 'Hermes', installed: true, run: ['hermes'] }, { key: 'antigravity', name: 'Antigravity', installed: true, run: ['agy'] }] }; this.droveData = { config: { roles: {} }, aiStatus: { switches: {} }, agents: { fullProbe: true, agents: [{ id: 'agy', installed: true, models: ['gemini-4-carbon-high'] }] } };"),
+    )
+    .unwrap();
+    assert!(ai_install_acp_tree.contains("st-ag-ai-install-panel"), "ACP AI Install selector panel should render under separate-ACP row: {ai_install_acp_tree}");
+    assert!(ai_install_acp_tree.contains("Start AI Install ACP"), "Separate-ACP AI Install panel should show ACP launch button: {ai_install_acp_tree}");
+    let inst_eff_group = ai_install_acp_tree
+        .lines()
+        .find(|l| l.contains("st-ag-ai-install-eff-group"))
+        .unwrap();
+    assert!(inst_eff_group.contains("0.35"), "Embedded-effort model should dim AI Install panel effort group: {inst_eff_group}");
     assert!(aligned_tree.contains("st-dr-eff-reviewer-0-high"), "3-level model (claude-sonnet-4-5) should show High effort: {aligned_tree}");
     assert!(!aligned_tree.contains("st-dr-eff-reviewer-0-xhigh"), "3-level model (claude-sonnet-4-5) must NOT show xhigh effort: {aligned_tree}");
     assert!(aligned_tree.contains("st-dr-eff-reviewer-1-xhigh"), "4-level model (gpt-5.4) should show xhigh effort: {aligned_tree}");

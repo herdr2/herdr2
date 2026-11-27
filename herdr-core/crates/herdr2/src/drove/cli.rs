@@ -1616,6 +1616,7 @@ fn format_settings_output(val: Value, section: Option<&str>, compact: bool) -> R
             "effortCount": a["efforts"].as_array().map(|e| e.len()).unwrap_or(0),
         })
     };
+    let probed_root = if val["agents"].is_object() { &val["agents"] } else { &val["probed"] };
     let out = if let Some(sec) = section.map(str::trim).filter(|s| !s.is_empty()) {
         match sec.to_ascii_lowercase().as_str() {
             "roles" => json!({
@@ -1625,17 +1626,17 @@ fn format_settings_output(val: Value, section: Option<&str>, compact: bool) -> R
             "agents" => {
                 let agents = if compact {
                     Value::Array(
-                        val["probed"]["agents"]
+                        probed_root["agents"]
                             .as_array()
                             .map(|arr| arr.iter().map(summarize_agent).collect())
                             .unwrap_or_default(),
                     )
                 } else {
-                    val["probed"]["agents"].clone()
+                    probed_root["agents"].clone()
                 };
                 json!({
-                    "probedAt": val["probed"]["probedAt"],
-                    "fullProbe": val["probed"]["fullProbe"],
+                    "probedAt": probed_root["probedAt"],
+                    "fullProbe": probed_root["fullProbe"],
                     "agents": agents,
                 })
             }
@@ -1667,7 +1668,7 @@ fn format_settings_output(val: Value, section: Option<&str>, compact: bool) -> R
                 );
             }
         }
-        let installed_agents: Vec<Value> = val["probed"]["agents"]
+        let installed_agents: Vec<Value> = probed_root["agents"]
             .as_array()
             .map(|arr| arr.iter().filter(|a| a["installed"] == true).map(summarize_agent).collect())
             .unwrap_or_default();

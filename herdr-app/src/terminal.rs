@@ -194,6 +194,8 @@ pub struct TerminalView {
     draft: RefCell<CliDraftTracker>,
     /// When the person last pressed Enter/newline in this pane.
     last_enter_at: Cell<Option<Instant>>,
+    /// When the person last submitted a non-empty prompt via Enter in this pane.
+    last_submit_at: Cell<Option<Instant>>,
     /// When the current PTY stream attached (suppresses attach replay from counting as live output).
     attached_at: Instant,
     /// Last non-echo PTY output timestamp (fallback activity signal for CLI agents without OSC 7501).
@@ -301,24 +303,27 @@ impl CliDraftTracker {
         }
     }
 
-    fn submit_or_backslash_newline(&mut self) {
+    fn submit_or_backslash_newline(&mut self) -> (bool, bool) {
         if self.cursor > 0 && self.chars.get(self.cursor - 1) == Some(&'\\') {
             self.backspace();
             self.insert_char('\n');
+            (false, false)
         } else {
+            let non_empty = self.chars.iter().any(|c| !c.is_whitespace());
             self.clear();
+            (true, non_empty)
         }
     }
 
-    fn handle_escape(&mut self) {
+    fn handle_escape(&mut self) -> (bool, bool) {
         let seq = self.esc.clone();
         if seq == b"\x1b[200~" {
             self.pasting = true;
-            return;
+            return (false, false);
         }
         if seq == b"\x1b\r" || seq == b"\x1b\n" {
             self.insert_char('\n');
-            return;
+            return (false, false);
         }
         match seq.as_slice() {
             b"\x1b[D" | b"\x1bOD" => self.cursor = self.cursor.saturating_sub(1),
@@ -328,7 +333,7 @@ impl CliDraftTracker {
             b"\x1b[3~" => self.delete_forward(),
             // Win32 input mode: CSI Vk;Sc;Uc;Kd;Cs;Rc _
             _ if seq.starts_with(b"\x1b[") && seq.ends_with(b"_") => {
-                let Ok(body) = std::str::from_utf8(&seq[2..seq.len() - 1]) else { return };
+                let Ok(body) = std::str::from_utf8(&seq[2..seq.len() - 1]) else { return (false, false) };
                 let parts: Vec<u32> = body.split(';').filter_map(|p| p.parse::<u32>().ok()).collect();
                 if parts.len() >= 5 {
                     let (vk, kd, cs) = (parts[0], parts[3], parts[4]);
@@ -336,20 +341,20 @@ impl CliDraftTracker {
                         if cs != 0 {
                             self.insert_char('\n');
                         } else {
-                            self.submit_or_backslash_newline();
+                            return self.submit_or_backslash_newline();
                         }
                     }
                 }
             }
             // modifyOtherKeys: CSI 27;mod;code~
             _ if seq.starts_with(b"\x1b[27;") && seq.ends_with(b"~") => {
-                let Ok(body) = std::str::from_utf8(&seq[5..seq.len() - 1]) else { return };
+                let Ok(body) = std::str::from_utf8(&seq[5..seq.len() - 1]) else { return (false, false) };
                 let mut parts = body.split(';');
                 let modifiers = parts.next().and_then(|p| p.parse::<u32>().ok());
                 let code = parts.next().and_then(|p| p.parse::<u32>().ok());
-                let (Some(modifiers), Some(code)) = (modifiers, code) else { return };
+                let (Some(modifiers), Some(code)) = (modifiers, code) else { return (false, false) };
                 match (code, modifiers) {
-                    (13, 1) => self.submit_or_backslash_newline(),
+                    (13, 1) => return self.submit_or_backslash_newline(),
                     (13, 2..=16) => self.insert_char('\n'),
                     (99 | 117 | 100, 5) => self.clear(),
                     (97, 5) => self.cursor = 0,
@@ -360,19 +365,19 @@ impl CliDraftTracker {
                 }
             }
             _ if seq.starts_with(b"\x1b[") && seq.ends_with(b"u") => {
-                let Ok(body) = std::str::from_utf8(&seq[2..seq.len() - 1]) else { return };
+                let Ok(body) = std::str::from_utf8(&seq[2..seq.len() - 1]) else { return (false, false) };
                 let mut params = body.split(';');
                 let code = params.next().and_then(|p| p.split(':').next()?.parse::<u32>().ok());
                 let mut mods = params.next().unwrap_or("").split(':');
                 let modifiers = mods.next().filter(|s| !s.is_empty()).unwrap_or("1").parse::<u32>().ok();
                 let event = mods.next().unwrap_or("1");
                 if event == "3" {
-                    return;
+                    return (false, false);
                 }
-                let (Some(code), Some(modifiers)) = (code, modifiers) else { return };
+                let (Some(code), Some(modifiers)) = (code, modifiers) else { return (false, false) };
                 let m = modifiers.saturating_sub(1) & !0xc0;
                 match (code, m + 1) {
-                    (13, 1) => self.submit_or_backslash_newline(),
+                    (13, 1) => return self.submit_or_backslash_newline(),
                     (13, 2 | 3 | 4) => self.insert_char('\n'),
                     (8 | 127, 1) => self.backspace(),
                     (99 | 117 | 100, 5) => self.clear(),
@@ -393,9 +398,12 @@ impl CliDraftTracker {
             }
             _ => {}
         }
+        (false, false)
     }
 
-    fn feed(&mut self, bytes: &[u8]) {
+    fn feed(&mut self, bytes: &[u8]) -> (bool, bool) {
+        let mut any_submit = false;
+        let mut any_non_empty_submit = false;
         for &b in bytes {
             if self.pasting {
                 if b == 0x1b || !self.esc.is_empty() {
@@ -435,14 +443,20 @@ impl CliDraftTracker {
                     _ => true,
                 };
                 if complete || self.esc.len() >= 128 {
-                    self.handle_escape();
+                    let (sub, non_empty) = self.handle_escape();
+                    any_submit |= sub;
+                    any_non_empty_submit |= non_empty;
                     self.esc.clear();
                 }
                 continue;
             }
 
             match b {
-                b'\r' => self.submit_or_backslash_newline(),
+                b'\r' => {
+                    let (sub, non_empty) = self.submit_or_backslash_newline();
+                    any_submit |= sub;
+                    any_non_empty_submit |= non_empty;
+                }
                 // Ctrl+J / LF inserts a newline in CLI agents (Enter sends CR).
                 b'\n' => self.insert_char('\n'),
                 0x03 | 0x15 | 0x04 => self.clear(),
@@ -457,6 +471,7 @@ impl CliDraftTracker {
                 _ => {}
             }
         }
+        (any_submit, any_non_empty_submit)
     }
 }
 
@@ -991,6 +1006,7 @@ impl TerminalView {
             typed_at: Cell::new(None),
             draft: RefCell::new(CliDraftTracker::default()),
             last_enter_at: Cell::new(None),
+            last_submit_at: Cell::new(None),
             attached_at: Instant::now(),
             last_output_at: None,
             last_text_fingerprint: None,
@@ -1223,6 +1239,10 @@ impl TerminalView {
         self.last_output_at.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(2200))
     }
 
+    pub fn has_recent_submit(&self, now: Instant) -> bool {
+        self.last_submit_at.get().is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(3000))
+    }
+
     /// Best-effort execution state for an interactive CLI agent that did not emit OSC 7501.
     pub fn inferred_agent_state(&self, fallback_raw_title: &str, now: Instant) -> &'static str {
         self.inferred_agent_state_with_confidence(fallback_raw_title, now).0
@@ -1238,28 +1258,39 @@ impl TerminalView {
             fallback_raw_title
         };
         let active_output = self.has_active_output(now);
+        let recent_submit = self.has_recent_submit(now);
         let answered_since_output = matches!((self.last_output_at, self.last_typed_at()), (Some(out), Some(typed)) if typed > out);
         let quiet_ready = !active_output
+            && !recent_submit
             && !answered_since_output
             && self.last_output_at.is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(1000));
         let title_spinning = self.last_title_change_at.is_some_and(|t| now.saturating_duration_since(t) < Duration::from_millis(3000));
         // Claude Code parks its idle OSC title at `✳ <Session Name>`; strip the static glyph when quiet so it returns to idle.
-        let effective_title = if !active_output && !title_spinning && raw_title.trim_start().starts_with('\u{2733}') {
+        let effective_title = if !active_output && !recent_submit && !title_spinning && raw_title.trim_start().starts_with('\u{2733}') {
             shown_title(raw_title)
         } else {
             std::borrow::Cow::Borrowed(raw_title)
         };
         // Short-circuit before touching the grid when title alone already decides.
         let title_prelim = infer_pty_agent_state(effective_title.as_ref(), false, false, &[]);
-        if title_prelim != "idle" {
+        let stale_blocked_title = title_prelim == "blocked"
+            && (active_output || recent_submit)
+            && self
+                .last_enter_at()
+                .is_some_and(|enter| self.last_title_change_at.is_none_or(|tc| enter > tc));
+        if title_prelim != "idle" && !stale_blocked_title {
             return (title_prelim, false);
+        }
+        if recent_submit {
+            return ("working", false);
         }
         if !active_output && !quiet_ready {
             return ("idle", false);
         }
         let tail = self.grid.borrow().vt.tail_lines(if active_output { 8 } else { 20 });
         if active_output {
-            let st = infer_pty_agent_state(effective_title.as_ref(), true, false, &tail);
+            let title_for_active = if stale_blocked_title { "" } else { effective_title.as_ref() };
+            let st = infer_pty_agent_state(title_for_active, true, false, &tail);
             return (st, false);
         }
         match classify_quiet_tail_confirmation(&tail) {
@@ -1272,7 +1303,7 @@ impl TerminalView {
     /// Confidence tier of a quiet PTY screen showing a confirmation prompt, choice menu, or question
     /// (also used for OSC 7501 `idle`/`done` terminals to decide deterministic vs AI-assisted arbitration).
     pub(crate) fn quiet_blocked_confidence(&self, now: Instant) -> QuietBlockConfidence {
-        if self.has_active_output(now) {
+        if self.has_active_output(now) || self.has_recent_submit(now) {
             return QuietBlockConfidence::None;
         }
         if matches!((self.last_output_at, self.last_typed_at()), (Some(out), Some(typed)) if typed > out) {
@@ -1471,9 +1502,12 @@ impl TerminalView {
     fn send(&self, bytes: &[u8]) {
         let now = Instant::now();
         self.typed_at.set(Some(now));
-        self.draft.borrow_mut().feed(bytes);
-        if bytes.contains(&b'\r') || bytes.contains(&b'\n') {
+        let (submitted, submitted_non_empty) = self.draft.borrow_mut().feed(bytes);
+        if submitted || bytes.contains(&b'\r') || bytes.contains(&b'\n') {
             self.last_enter_at.set(Some(now));
+        }
+        if submitted_non_empty {
+            self.last_submit_at.set(Some(now));
         }
         let mut g = self.grid.borrow_mut();
         if let Some(ch) = g.channel
@@ -6439,6 +6473,50 @@ mod tests {
             assert!(t.ingest([crate::hc::Stream::Data(working.as_bytes().to_vec())], cx));
             assert_ne!(t.last_output_at(), Some(settled_past), "real working text change must refresh last_output_at");
             assert_eq!(t.inferred_agent_state("", Instant::now()), "working");
+        });
+    }
+
+    #[gpui::test]
+    fn submitting_prompt_from_blocked_pty_transitions_immediately_to_working(cx: &mut gpui::TestAppContext) {
+        use gpui::AppContext as _;
+        use std::time::{Duration, Instant};
+
+        let terminal = cx.new(|cx| super::TerminalView::attach(crate::hc::offline(), "t_blocked".into(), (80, 14), cx));
+        let settled_past = Instant::now() - Duration::from_secs(5);
+        terminal.update(cx, |t, cx| {
+            t.attached_at = settled_past;
+            let question = concat!(
+                "这里有两种实现方式，你更倾向哪种方案？\r\n",
+                "1. 方案 A：仅修改前端\r\n",
+                "2. 方案 B：前后端联动修改\r\n",
+                "❯ ",
+            );
+            assert!(t.ingest([crate::hc::Stream::Data(question.as_bytes().to_vec())], cx));
+            t.last_output_at = Some(settled_past);
+            t.raw_title = "Action Required - Claude Code".into();
+            t.last_title_change_at = Some(settled_past);
+            assert_eq!(t.inferred_agent_state("", Instant::now()), "blocked");
+
+            // Submitting a prompt via Kitty keyboard protocol Enter (`\x1b[13u`) immediately switches
+            // blocked -> working even before the CLI updates its title or streams new output.
+            t.send("选择方案 A".as_bytes());
+            t.send(b"\x1b[13u");
+            let now = Instant::now();
+            assert!(t.has_recent_submit(now));
+            assert_eq!(t.inferred_agent_state("", now), "working");
+            assert_eq!(t.quiet_blocked_confidence(now), super::QuietBlockConfidence::None);
+        });
+
+        // Empty Enter on an idle terminal must NOT falsely mark it as working.
+        let idle_term = cx.new(|cx| super::TerminalView::attach(crate::hc::offline(), "t_idle".into(), (80, 14), cx));
+        idle_term.update(cx, |t, cx| {
+            t.attached_at = settled_past;
+            assert!(t.ingest([crate::hc::Stream::Data(b"Done.\r\n> ".to_vec())], cx));
+            t.last_output_at = Some(settled_past);
+            t.send(b"\r");
+            let now = Instant::now();
+            assert!(!t.has_recent_submit(now));
+            assert_eq!(t.inferred_agent_state("", now), "idle");
         });
     }
 

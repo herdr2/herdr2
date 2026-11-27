@@ -101,8 +101,9 @@ impl Core {
                 ));
             }
             let word = state_word(a);
-            if word.as_deref() == Some("blocked") && !steer {
-                let kind = a.status.as_ref().and_then(|s| s.kind.as_deref()).unwrap_or("waiting");
+            let has_pending_perm = a.pending_permission.is_some() || st.pending_perms.contains_key(&id);
+            if has_pending_perm && !steer {
+                let kind = a.status.as_ref().and_then(|s| s.kind.as_deref()).unwrap_or("permission");
                 return Err(RpcError::new(
                     "blocked",
                     format!("{} is blocked ({kind})", a.address),

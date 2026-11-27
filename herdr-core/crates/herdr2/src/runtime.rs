@@ -597,6 +597,8 @@ impl Core {
             if a.labels.contains_key("drove.worker")
                 || a.pending_permission.is_some()
                 || a.turn != turn_num
+                || a.inbox_len > 0
+                || st.inboxes.get(&id).is_some_and(|q| !q.is_empty())
                 || a.status.as_ref().is_some_and(|s| matches!(s.state.as_str(), "working" | "error"))
             {
                 return;
@@ -634,6 +636,8 @@ impl Core {
             };
             if a.turn != turn_num
                 || a.pending_permission.is_some()
+                || a.inbox_len > 0
+                || st.inboxes.get(&id).is_some_and(|q| !q.is_empty())
                 || a.status.as_ref().is_some_and(|s| matches!(s.state.as_str(), "working" | "error"))
             {
                 return;

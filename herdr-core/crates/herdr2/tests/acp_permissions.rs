@@ -86,3 +86,30 @@ fn deny_rejects_pending_permission_and_permission_policies_behave_distinctly() {
     });
     assert!(text(&s, &ask).contains("read_tool=selected:allow-always"));
 }
+
+#[test]
+fn question_blocked_acp_session_accepts_reply_and_transitions_to_working() {
+    let s = Session::new();
+
+    // Turn 1 ends by asking the user a question -> blocked (kind=question, no pending_permission).
+    let a = run_fake(&s, &["--prompt", "请问应该修改全局配置还是仅修改当前项目？"]);
+    wait_until("question turn marked blocked", || {
+        let g = get(&s, &a);
+        g["turn"].as_u64().is_some_and(|t| t >= 1) && g["status"]["state"] == "blocked"
+    });
+    let info = get(&s, &a);
+    assert_eq!(info["status"]["kind"], "question", "{info}");
+    assert!(info["pending_permission"].is_null(), "{info}");
+
+    // Sending a normal follow-up prompt (without --steer) must succeed and immediately switch to working.
+    let sent = s.json(&["send", &a, "SLEEP:600\n仅修改当前项目"]);
+    assert_eq!(sent["started"], true, "{sent}");
+    assert_eq!(get(&s, &a)["status"]["state"], "working");
+
+    wait_until("follow-up turn completed", || {
+        let g = get(&s, &a);
+        g["turn"].as_u64().is_some_and(|t| t >= 2) && g["status"]["state"] == "idle"
+    });
+    let out = text(&s, &a);
+    assert!(out.contains("slept:600") && out.contains("仅修改当前项目"), "{out}");
+}

@@ -3631,3 +3631,175 @@ fn drove_worker_mcp_contracts_and_pre_tool_guard_end_to_end() {
         "task pointer json_path slice should return modules.0: {ro_hist}"
     );
 }
+
+#[test]
+fn drove_foreach_exec_retry_across_template_and_mcp_ask_dedup() {
+    let s = drove_session();
+    let _ = wait_web_port(&s);
+    configure_fake_roles(&s);
+
+    let work_dir = s.root.join("foreach_retry_ask_repo");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let gate_flag = work_dir.join("upstream_ok.txt");
+
+    // 1. Start a DAG where `emit_mods` fails on attempt 1 (until `gate_flag` exists),
+    //    cascading `skipped` through `dyn_check` (`foreachFrom`, `template: true`) -> `final_join`,
+    //    while static `foreach` (`static_touch`) tests `{{item}}` in `exec.cmd` and `files`.
+    let plan = json!({
+        "objective": "Verify foreach/foreachFrom exec {{item}}, template retry reopen, and MCP ask dedup",
+        "cwd": work_dir.display().to_string(),
+        "tasks": [
+            {
+                "key": "static_touch",
+                "title": "Static foreach exec placeholder",
+                "kind": "exec",
+                "foreach": ["alpha", "beta"],
+                "files": ["out-{{item}}.txt"],
+                "exec": {
+                    "cmd": "printf '%s' '{{item}}' > out-{{item}}.txt && cat out-{{item}}.txt"
+                },
+                "spec": {
+                    "target": "out-{{item}}.txt",
+                    "change": "Write {{item}}",
+                    "acceptance": "File created"
+                }
+            },
+            {
+                "key": "emit_mods",
+                "title": "Emit JSON array once gate_flag exists",
+                "kind": "exec",
+                "exec": {
+                    "cmd": format!("test -f {} && printf '{{\"items\":[\"m1\",\"m2\"]}}'", gate_flag.display()),
+                    "parseJson": true
+                },
+                "spec": {
+                    "target": "manifest",
+                    "change": "Emit items",
+                    "acceptance": "JSON emitted"
+                }
+            },
+            {
+                "key": "dyn_check",
+                "title": "Dynamic foreachFrom exec placeholder",
+                "kind": "exec",
+                "deps": ["emit_mods"],
+                "foreachFrom": {
+                    "task": "emit_mods",
+                    "path": "items"
+                },
+                "exec": {
+                    "cmd": "test -n \"$ITEM_TAG\" && printf '%s' \"dyn-{{item}}-$ITEM_TAG\" > dyn-{{item}}.txt",
+                    "env": {
+                        "ITEM_TAG": "ok_{{item}}"
+                    }
+                },
+                "spec": {
+                    "target": "dyn-{{item}}.txt",
+                    "change": "Check {{item}}",
+                    "acceptance": "Exits 0"
+                }
+            },
+            {
+                "key": "final_join",
+                "title": "Downstream dependent behind foreachFrom template",
+                "kind": "exec",
+                "deps": ["static_touch", "dyn_check"],
+                "exec": {
+                    "cmd": "test -f dyn-m1.txt && test -f dyn-m2.txt && echo all_joined"
+                },
+                "spec": {
+                    "target": "workspace",
+                    "change": "Join all",
+                    "acceptance": "Both dyn files exist"
+                }
+            }
+        ]
+    });
+    let plan_file = s.root.join("foreach-retry-plan.json");
+    std::fs::write(&plan_file, serde_json::to_vec(&plan).unwrap()).unwrap();
+    let started = s.json(&["drove", "plan", "--file", plan_file.to_str().unwrap(), "--cwd", work_dir.to_str().unwrap()]);
+    let run_id = started["run"]["id"].as_str().unwrap().to_string();
+
+    // Wait for `emit_mods` to fail, `static_touch#1/#2` to succeed, and `dyn_check`/`final_join` to cascade to `skipped`.
+    let w1 = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "15"]);
+    assert_eq!(w1["needsAttention"], true, "w1: {w1}");
+    let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let snap1 = s.json(&["drove", "show", &run_id]);
+        let tasks1 = snap1["tasks"].as_array().unwrap();
+        let st1 = tasks1.iter().find(|t| t["key"] == "static_touch#1").unwrap()["status"].as_str().unwrap_or("");
+        let st2 = tasks1.iter().find(|t| t["key"] == "static_touch#2").unwrap()["status"].as_str().unwrap_or("");
+        let dyn_st = tasks1.iter().find(|t| t["key"] == "dyn_check").unwrap()["status"].as_str().unwrap_or("");
+        if st1 == "succeeded" && st2 == "succeeded" && dyn_st == "skipped" {
+            break;
+        }
+        assert!(std::time::Instant::now() < settle_deadline, "wave 1 did not settle: {snap1}");
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    assert_eq!(std::fs::read_to_string(work_dir.join("out-alpha.txt")).unwrap(), "alpha");
+    assert_eq!(std::fs::read_to_string(work_dir.join("out-beta.txt")).unwrap(), "beta");
+
+    // Verify retrying `final_join` while upstream `emit_mods` is NOT succeeded keeps `final_join` Pending (not premature Ready).
+    let premature = s.json(&["drove", "retry", "final_join", "--run", &run_id]);
+    assert_eq!(premature["status"], "pending", "retry with unsatisfied deps must stay pending: {premature}");
+
+    // Unblock `emit_mods` and retry `emit_mods` -> must reopen `dyn_check` (`template: true`) AND `final_join`!
+    std::fs::write(&gate_flag, "ok").unwrap();
+    let retried = s.json(&["drove", "retry", "emit_mods", "--run", &run_id]);
+    assert_eq!(retried["status"], "ready");
+
+    let w2 = s.json(&["drove", "wait", "--run", &run_id, "--timeout", "15"]);
+    assert_eq!(w2["settled"], true, "w2 should settle all tasks to succeeded: {w2}");
+    let snap2 = s.json(&["drove", "show", &run_id]);
+    for key in ["static_touch#1", "static_touch#2", "emit_mods", "dyn_check", "dyn_check#1", "dyn_check#2", "final_join"]
+    {
+        let t = snap2["tasks"].as_array().unwrap().iter().find(|t| t["key"] == key).unwrap_or_else(|| {
+            panic!("missing task `{key}` in {snap2}");
+        });
+        assert_eq!(t["status"], "succeeded", "task `{key}` did not succeed: {t}");
+    }
+    assert_eq!(std::fs::read_to_string(work_dir.join("dyn-m1.txt")).unwrap(), "dyn-m1-ok_m1");
+    assert_eq!(std::fs::read_to_string(work_dir.join("dyn-m2.txt")).unwrap(), "dyn-m2-ok_m2");
+
+    // 2. Complete the run, then test MCP `drove_ask` short-poll (`status: "pending"`) + deduplication on an appended task!
+    let completed = s.json(&["drove", "complete", "--run", &run_id, "--summary", "wave 1 done"]);
+    assert_eq!(completed["run"]["status"], "done");
+
+    let add_plan = json!({
+        "tasks": [
+            {
+                "key": "mcp_ask_dedup",
+                "title": "MCP short-poll ask deduplication",
+                "role": "coder",
+                "deps": ["final_join"],
+                "spec": {
+                    "target": "ask.txt",
+                    "change": "MCP_CALL:drove_ask:{\"question\":\"Indent 2 or compact?\",\"timeout\":1}\nMCP_CALL:drove_ask:{\"question\":\"Indent 2 or compact?\",\"timeout\":1}\nMCP_CALL:drove_finish:{\"outcome\":\"done\",\"summary\":\"polled twice without duplicate\"}",
+                    "acceptance": "Single question posted"
+                }
+            }
+        ]
+    });
+    let add_file = s.root.join("add-ask-dedup.json");
+    std::fs::write(&add_file, serde_json::to_vec(&add_plan).unwrap()).unwrap();
+    let added = s.json(&["drove", "add", "--run", &run_id, "--file", add_file.to_str().unwrap()]);
+    // `add_tasks_http` now promotes tasks whose deps are already succeeded to `ready` immediately!
+    assert_eq!(added["tasks"][0]["status"], "ready", "added task with satisfied deps should be ready: {added}");
+
+    // First `drove wait` wakes immediately on the single Question message; wait until `mcp_ask_dedup` finishes both 1s polls.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let cur = s.json(&["drove", "show", &run_id]);
+        let ask_task = cur["tasks"].as_array().unwrap().iter().find(|t| t["key"] == "mcp_ask_dedup").unwrap();
+        if ask_task["status"] == "succeeded" {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "timed out waiting for mcp_ask_dedup: {cur}");
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    let inbox = s.json(&["drove", "inbox", "--run", &run_id]);
+    let questions: Vec<&Value> =
+        inbox["messages"].as_array().unwrap().iter().filter(|m| m["type"] == "question").collect();
+    assert_eq!(questions.len(), 1, "two identical MCP drove_ask polls must deduplicate to 1 question: {inbox}");
+}

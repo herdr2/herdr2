@@ -16,8 +16,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_ACP_REGISTRY_URL: &str = "https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json";
 const REGISTRY_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
-const INSTALL_TIMEOUT: Duration = Duration::from_secs(180);
-const DOWNLOAD_TIMEOUT_SECS: &str = "120";
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(600);
+const DOWNLOAD_TIMEOUT_SECS: &str = "900";
+const DOWNLOAD_SPEED_LIMIT_BYTES: &str = "10240";
+const DOWNLOAD_SPEED_TIME_SECS: &str = "45";
 const REGISTRY_TIMEOUT_SECS: &str = "20";
 
 /// Specification for one managed ACP adapter paired with a built-in Herdr2 preset.
@@ -31,6 +33,8 @@ pub struct ManagedAdapterSpec {
     pub binary_name: &'static str,
     /// Companion interactive CLI whose presence triggers background auto-install.
     pub companion_cli: Option<&'static str>,
+    /// True when the ACP adapter shells out to `companion_cli` at runtime and cannot run without it.
+    pub requires_companion_cli: bool,
     /// Fallback npm package when the ACP Registry is unreachable or omits the entry.
     pub fallback_npm_package: &'static str,
 }
@@ -41,6 +45,7 @@ pub const MANAGED_ADAPTERS: &[ManagedAdapterSpec] = &[
         registry_id: "claude-acp",
         binary_name: "claude-agent-acp",
         companion_cli: Some("claude"),
+        requires_companion_cli: false,
         fallback_npm_package: "@agentclientprotocol/claude-agent-acp",
     },
     ManagedAdapterSpec {
@@ -48,6 +53,7 @@ pub const MANAGED_ADAPTERS: &[ManagedAdapterSpec] = &[
         registry_id: "codex-acp",
         binary_name: "codex-acp",
         companion_cli: Some("codex"),
+        requires_companion_cli: false,
         fallback_npm_package: "@agentclientprotocol/codex-acp",
     },
     ManagedAdapterSpec {
@@ -55,6 +61,7 @@ pub const MANAGED_ADAPTERS: &[ManagedAdapterSpec] = &[
         registry_id: "pi-acp",
         binary_name: "pi-acp",
         companion_cli: Some("pi"),
+        requires_companion_cli: true,
         fallback_npm_package: "pi-acp",
     },
     ManagedAdapterSpec {
@@ -62,6 +69,7 @@ pub const MANAGED_ADAPTERS: &[ManagedAdapterSpec] = &[
         registry_id: "glm-acp-agent",
         binary_name: "glm-acp-agent",
         companion_cli: None,
+        requires_companion_cli: false,
         fallback_npm_package: "glm-acp-agent",
     },
 ];
@@ -124,7 +132,11 @@ pub struct AdapterStatusItem {
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
 pub struct AdapterStatusResult {
     pub adapters_dir: String,
     pub auto_install: bool,
@@ -133,11 +145,26 @@ pub struct AdapterStatusResult {
     pub custom_registry_url: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub default_permissions: String,
-    #[serde(default)]
+    #[serde(default = "default_true")]
     pub inject_mcp: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub config_path: String,
     pub adapters: Vec<AdapterStatusItem>,
+}
+
+impl Default for AdapterStatusResult {
+    fn default() -> Self {
+        Self {
+            adapters_dir: String::new(),
+            auto_install: true,
+            registry_url: String::new(),
+            custom_registry_url: None,
+            default_permissions: String::new(),
+            inject_mcp: true,
+            config_path: String::new(),
+            adapters: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, JsonSchema)]
@@ -278,10 +305,6 @@ impl AdapterManager {
                 && let Some(found) = resolve_non_shim_binary_in_path(exe, path_override, pathext_override)
             {
                 (true, "config".to_string(), Some(found.display().to_string()), None, Some("config".into()))
-            } else if let Some(found) =
-                resolve_non_shim_binary_in_path(spec.binary_name, path_override, pathext_override)
-            {
-                (true, "path".to_string(), Some(found.display().to_string()), None, Some("path".into()))
             } else if let Some((found, meta)) = resolve_managed_with_meta(&adapters_dir, spec, pathext_override) {
                 (
                     true,
@@ -290,6 +313,10 @@ impl AdapterManager {
                     meta.as_ref().and_then(|m| m.version.clone()),
                     meta.as_ref().map(|m| m.method.clone()),
                 )
+            } else if let Some(found) =
+                resolve_non_shim_binary_in_path(spec.binary_name, path_override, pathext_override)
+            {
+                (true, "path".to_string(), Some(found.display().to_string()), None, Some("path".into()))
             } else if let Some(cached) = resolve_in_npx_cache(spec.binary_name, env, pathext_override) {
                 (true, "npx_cache".to_string(), Some(cached.display().to_string()), None, Some("npx_cache".into()))
             } else if companion_installed && npx_available {
@@ -320,7 +347,9 @@ impl AdapterManager {
                 path,
                 version,
                 method,
-                error: live.last_error,
+                // Keep already-working adapters clean in status; failed manual updates still surface
+                // their detailed error in the `adapter.update` / `adapter.install` RPC response.
+                error: if installed { None } else { live.last_error },
             });
         }
 
@@ -335,7 +364,7 @@ impl AdapterManager {
                 .filter(|s| !s.is_empty())
                 .map(String::from),
             default_permissions: cfg.default_permissions.unwrap_or_default().as_str().into(),
-            inject_mcp: cfg.inject_mcp.unwrap_or(true),
+            inject_mcp: cfg.inject_mcp(),
             config_path: String::new(),
             adapters: items,
         }
@@ -493,6 +522,11 @@ impl AdapterManager {
 /// Starts the daemon background pre-installer: scans installed companion CLIs (`claude`, `codex`, `pi`)
 /// and silently installs missing managed ACP adapters when `auto_install_adapters` is enabled.
 pub fn start_background(core: &Arc<Core>) {
+    if std::env::var("HERDR2_AUTO_INSTALL_ADAPTERS")
+        .is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+    {
+        return;
+    }
     let core = core.clone();
     tokio::spawn(async move {
         // Brief startup yield so daemon socket serving and kept-session recovery take priority.
@@ -620,6 +654,15 @@ pub(crate) fn resolve_managed_binary_in_env(
         return None;
     }
     let spec = lookup_spec_for_preset_or_program(preset_id, program)?;
+    let lower_prog = program.trim().to_ascii_lowercase();
+    let stem = lower_prog
+        .strip_suffix(".exe")
+        .or_else(|| lower_prog.strip_suffix(".cmd"))
+        .or_else(|| lower_prog.strip_suffix(".bat"))
+        .unwrap_or(&lower_prog);
+    if stem != spec.binary_name {
+        return None;
+    }
     let root = adapters_root_in_env(env);
     let pathext_override = env_ignore_case(env, "PATHEXT");
     resolve_managed_with_meta(&root, spec, pathext_override).map(|(p, _)| p)
@@ -777,7 +820,7 @@ fn load_registry_index(
     } else {
         let _ = std::fs::create_dir_all(adapters_dir);
         let tmp = adapters_dir.join(format!(".registry-{}.tmp", std::process::id()));
-        let ok = curl_download(registry_url, &tmp, env, REGISTRY_TIMEOUT_SECS).is_ok();
+        let ok = curl_download(registry_url, &tmp, env, REGISTRY_TIMEOUT_SECS, false).is_ok();
         let bytes = if ok { std::fs::read(&tmp).ok() } else { None };
         let _ = std::fs::remove_file(&tmp);
         bytes
@@ -886,7 +929,7 @@ fn install_binary_archive(
             std::fs::copy(local_path, &archive_path)
                 .map_err(|e| format!("cannot copy local archive {local_path}: {e}"))?;
         } else {
-            curl_download(&target.archive, &archive_path, env, DOWNLOAD_TIMEOUT_SECS)?;
+            curl_download(&target.archive, &archive_path, env, DOWNLOAD_TIMEOUT_SECS, true)?;
         }
 
         if let Some(expected_sha) = target.sha256.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
@@ -1103,12 +1146,22 @@ fn curl_program() -> PathBuf {
     }
 }
 
-fn curl_download(url: &str, dest: &Path, env: &BTreeMap<String, String>, max_time_secs: &str) -> Result<(), String> {
+fn curl_download(
+    url: &str,
+    dest: &Path,
+    env: &BTreeMap<String, String>,
+    max_time_secs: &str,
+    stall_detect: bool,
+) -> Result<(), String> {
     let mut cmd = crate::platform::bg_command(curl_program());
     if cfg!(windows) {
         cmd.arg("--ssl-no-revoke");
     }
-    cmd.args(["-fsL", "--retry", "2", "--connect-timeout", "10", "--max-time", max_time_secs, "-o"])
+    cmd.args(["-fsSL", "--retry", "2", "--connect-timeout", "10", "--max-time", max_time_secs]);
+    if stall_detect {
+        cmd.args(["--speed-limit", DOWNLOAD_SPEED_LIMIT_BYTES, "--speed-time", DOWNLOAD_SPEED_TIME_SECS]);
+    }
+    cmd.arg("-o")
         .arg(dest)
         .arg(url)
         .stdin(std::process::Stdio::null())
@@ -1423,6 +1476,16 @@ printf '{"name":"@agentclientprotocol/codex-acp","version":"2.12.1"}' > "$prefix
         let mgr = AdapterManager::new();
         let st = mgr.status_in_env(&crate::config::Config::default(), &env);
         assert!(st.auto_install);
+        assert!(st.inject_mcp);
+        assert!(AdapterStatusResult::default().inject_mcp);
+        let parsed: AdapterStatusResult = serde_json::from_value(serde_json::json!({
+            "adapters_dir": "/tmp/adapters",
+            "auto_install": true,
+            "registry_url": "https://example.test/registry.json",
+            "adapters": []
+        }))
+        .unwrap();
+        assert!(parsed.inject_mcp);
 
         let claude = st.adapters.iter().find(|a| a.preset_id == "claude").unwrap();
         assert!(claude.installed);
@@ -1441,6 +1504,29 @@ printf '{"name":"@agentclientprotocol/codex-acp","version":"2.12.1"}' > "$prefix
         assert!(!pi.installed);
         assert!(!pi.companion_installed);
         assert_eq!(pi.source, "missing");
+
+        // Managed adapter beats PATH binary (e.g. after explicit `adapter update`), while config wins over both.
+        let path_claude = bin_dir.join(if cfg!(windows) { "claude-agent-acp.cmd" } else { "claude-agent-acp" });
+        std::fs::write(&path_claude, "#!/bin/sh\n").unwrap();
+        let st2 = mgr.status_in_env(&crate::config::Config::default(), &env);
+        let claude2 = st2.adapters.iter().find(|a| a.preset_id == "claude").unwrap();
+        assert_eq!(claude2.source, "managed");
+        assert_eq!(claude2.path.as_deref(), Some(claude_bin.to_string_lossy().as_ref()));
+
+        // A failed manual update on an already-ready adapter must not pollute status error,
+        // while a failed install on a missing adapter must surface state="error" and error message.
+        mgr.set_installing("claude", false, Some("download timed out".into()));
+        mgr.set_installing("codex", false, Some("npm timed out".into()));
+        let st3 = mgr.status_in_env(&crate::config::Config::default(), &env);
+        let claude3 = st3.adapters.iter().find(|a| a.preset_id == "claude").unwrap();
+        assert_eq!(claude3.state, "ready");
+        assert!(claude3.error.is_none());
+        let codex3 = st3.adapters.iter().find(|a| a.preset_id == "codex").unwrap();
+        assert_eq!(codex3.state, "error");
+        assert_eq!(codex3.error.as_deref(), Some("npm timed out"));
+
+        // Mismatched custom binary name must not resolve to the managed adapter.
+        assert_eq!(resolve_managed_binary_in_env(Some("claude"), "my-custom-claude-acp", &env), None);
 
         let _ = std::fs::remove_dir_all(&root);
     }

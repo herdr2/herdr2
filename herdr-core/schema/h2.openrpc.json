@@ -273,7 +273,7 @@
             "type": "string"
           },
           "inject_mcp": {
-            "default": false,
+            "default": true,
             "type": "boolean"
           },
           "registry_url": {
@@ -6304,7 +6304,7 @@
       "name": "Apache-2.0"
     },
     "title": "herdr2",
-    "version": "2.0.18"
+    "version": "2.0.19"
   },
   "methods": [
     {

@@ -818,13 +818,15 @@ test("ai protocol is auto-detected without manual selector and synced on connect
   expect(view.aiStatus?.availableModels).toEqual(["claude-sonnet-4-6"]);
 });
 
-test("launchAgentToFixDroveProbeErrors targets the selected machine space and creates one when missing", async () => {
+test("launchAgentToFixDroveProbeErrors targets the selected machine Home (~) space and creates one without polluting project spaces", async () => {
   const ran: Array<{ cmd: string; args: any }> = [];
   const toasts: any[] = [];
   let closed = 0;
   let currentSpaces: any[] = [
-    { id: "sp-local", machine: null, active: true },
-    { id: "sp-wsl", machine: "ubuntu-wsl", active: false },
+    { id: "sp-local-proj", name: "herdr2", folder: "/home/tester/work/herdr2", machine: null, active: true },
+    { id: "sp-local-home", name: "~", folder: "/home/tester", machine: null, active: false },
+    { id: "sp-wsl-proj", name: "herdr2", folder: "/home/dev/work/herdr2", machine: "ubuntu-wsl", active: true },
+    { id: "sp-wsl-home", name: "~", folder: "/home/dev", machine: "ubuntu-wsl", active: false },
   ];
   const customValues = {
     ...values,
@@ -862,30 +864,40 @@ test("launchAgentToFixDroveProbeErrors targets the selected machine space and cr
   view.launchAgentToFixDroveProbeErrors(cx);
   await task;
 
+  // Even when a project space is active on ubuntu-wsl, the fix agent launches in ubuntu-wsl's Home (~) space.
   expect(ran[0].cmd).toBe("tab.new");
-  expect(ran[0].args.space).toBe("sp-wsl");
-  expect(ran[0].args.folder).toBe("");
+  expect(ran[0].args.space).toBe("sp-wsl-home");
+  expect(ran[0].args.folder).toBe("~");
   expect(ran[0].args.argv).toEqual(["claude", "--dangerously-skip-permissions"]);
   expect(ran[0].args.task).toContain("cursor");
   expect(closed).toBe(1);
 
-  // When no space exists on the target machine, create a new space on that machine in its home directory.
-  currentSpaces = [{ id: "sp-local", machine: null, active: true }];
+  // When only a project space exists on the target machine (no Home space), create a dedicated unnamed Home (~) space.
+  currentSpaces = [
+    { id: "sp-local-proj", name: "herdr2", folder: "/home/tester/work/herdr2", machine: null, active: true },
+    { id: "sp-wsl-proj", name: "herdr2", folder: "/home/dev/work/herdr2", machine: "ubuntu-wsl", active: false },
+  ];
   view.launchAgentToFixDroveProbeErrors(cx);
   await task;
   expect(ran[1].cmd).toBe("space.new");
   expect(ran[1].args.machine).toBe("ubuntu-wsl");
-  expect(ran[1].args.folder).toBe("");
+  expect(ran[1].args.folder).toBe("~");
+  expect(ran[1].args.name).toBeUndefined();
+  expect(ran[1].args.tab).toBe("AI 排查智能体异常");
   expect(ran[1].args.argv).toEqual(["claude", "--dangerously-skip-permissions"]);
   expect(closed).toBe(2);
   expect(toasts.length).toBe(2);
 
-  // On local machine, fix agent defaults working directory to local home().
+  // On local machine with an existing Home (~) space, reuses that Home space with local home().
+  currentSpaces = [
+    { id: "sp-local-proj", name: "herdr2", folder: "/home/tester/work/herdr2", machine: null, active: true },
+    { id: "sp-local-home", name: "~", folder: "/home/tester", machine: null, active: false },
+  ];
   view.droveMachine = null;
   view.launchAgentToFixDroveProbeErrors(cx);
   await task;
   expect(ran[2].cmd).toBe("tab.new");
-  expect(ran[2].args.space).toBe("sp-local");
+  expect(ran[2].args.space).toBe("sp-local-home");
   expect(ran[2].args.folder).toBe("/home/tester");
 });
 
@@ -1114,17 +1126,36 @@ test("drove probe fix panel lets user select agent type, model, and effort and l
   expect(ran[1].args.model).toBe("gemini-4-carbon-high");
   expect(ran[1].args.effort).toBeUndefined();
 
-  // Cursor with base model passes normalized cursor-agent argv + model + effort; without model disables effort.
+  // Cursor resolves base model + effort to a valid CLI slug (never bracket `[effort=...]`).
+  view.droveData.agents.agents[3].models = [
+    "grok-4.7",
+    "grok-4.7-low",
+    "grok-4.7-medium",
+    "grok-4.7-high",
+    "grok-4.7-high-fast",
+    "grok-4.7-xhigh",
+    "grok-4.7-xhigh-fast",
+    "gpt-5.3-codex",
+    "gpt-5.3-codex-high",
+    "composer-2.5",
+  ];
   view.setDroveProbeFixAgent("cursor", cx);
   expect(view.droveFixEffortDisabledReason("cursor", null)).toBeTruthy();
-  view.setDroveProbeFixModel("gpt-5.4", cx);
-  expect(view.droveFixEffortDisabledReason("cursor", "gpt-5.4")).toBeNull();
-  view.setDroveProbeFixEffort("medium", cx);
+  view.setDroveProbeFixModel("grok-4.7", cx);
+  expect(view.droveFixEffortDisabledReason("cursor", "grok-4.7")).toBeNull();
+  view.setDroveProbeFixEffort("high", cx);
   view.launchAgentToFixDroveProbeErrors(cx);
   await task;
   expect(ran[2].args.argv).toEqual(["cursor-agent", "--yolo", "--trust"]);
-  expect(ran[2].args.model).toBe("gpt-5.4");
-  expect(ran[2].args.effort).toBe("medium");
+  expect(ran[2].args.model).toBe("grok-4.7-high");
+  expect(ran[2].args.effort).toBeUndefined();
+
+  // Cursor bare ACP slug (`grok-4.7`) with Auto effort promotes to CLI slug `grok-4.7-high`.
+  expect(view.resolveCursorCliModelForLaunch("grok-4.7", null)).toEqual({ model: "grok-4.7-high", effort: null });
+  expect(view.resolveCursorCliModelForLaunch("grok-4.7-fast", "xhigh")).toEqual({ model: "grok-4.7-xhigh-fast", effort: null });
+  expect(view.resolveCursorCliModelForLaunch("gpt-5.3-codex", "medium")).toEqual({ model: "gpt-5.3-codex", effort: null });
+  expect(view.resolveCursorCliModelForLaunch("composer-2.5", "high")).toEqual({ model: "composer-2.5", effort: null });
+  expect(view.resolveCursorCliModelForLaunch("grok-4.7[effort=high]", null)).toEqual({ model: "grok-4.7-high", effort: null });
 });
 
 test("buildDroveProbeFixPrompt instructs agent to explain causes, propose a fix plan, and wait for confirmation before fixing", () => {
@@ -1435,9 +1466,9 @@ test("Agents & ACP lists all supported agents, distinguishes npx fallback from i
   const knownCalls: any[] = [];
   const hcCalls: string[][] = [];
   let closed = 0;
-  const currentSpaces: any[] = [
-    { id: "sp-local", machine: null, active: true },
-    { id: "sp-remote", machine: "devbox", active: false },
+  let currentSpaces: any[] = [
+    { id: "sp-local", name: "~", folder: "/home/tester", machine: null, active: true },
+    { id: "sp-remote", name: "~", folder: "/home/dev", machine: "devbox", active: false },
   ];
   const customValues = {
     ...values,
@@ -1543,13 +1574,117 @@ test("Agents & ACP lists all supported agents, distinguishes npx fallback from i
   expect(ran[1].args.argv).toEqual(["npm", "install", "-g", "@google/gemini-cli"]);
   expect(closed).toBe(2);
 
-  // 5. AI-assisted install launches an installed agent when no static one-liner exists (e.g. agy).
+  // 5. AI-assisted install lets the user choose helper agent, model, and effort for both Agent CLI and separate ACP install.
   const agyRow = rows.find((r: any) => r.id === "agy");
+  view.toggleAgentAiInstall(agyRow, cx);
+  expect(view.agentAiInstallTargetId).toBe("agy");
+  expect(view.agentAiInstallAgent).toBe("claude");
+  view.setAgentAiInstallAgent("codex", cx);
+  view.setAgentAiInstallModel("gpt-5.4", cx);
+  view.setAgentAiInstallEffort("xhigh", cx);
   view.launchAgentToInstall(agyRow, cx);
   await Promise.all(pending.splice(0));
   expect(ran[2].cmd).toBe("tab.new");
   expect(ran[2].args.space).toBe("sp-remote");
+  expect(ran[2].args.argv).toEqual(["codex"]);
+  expect(ran[2].args.model).toBe("gpt-5.4");
+  expect(ran[2].args.effort).toBe("xhigh");
   expect(ran[2].args.task).toContain("Antigravity");
+  expect(view.agentAiInstallTargetId).toBeNull();
   expect(closed).toBe(3);
-  expect(toasts.length).toBeGreaterThanOrEqual(3);
+  expect(toasts[toasts.length - 1].title).toContain("Codex");
+  expect(toasts[toasts.length - 1].title).toContain("gpt-5.4");
+
+  // 6. Separate ACP AI install (CLI installed, ACP missing) supports switching agent/model and clamping effort.
+  const hermesRow = {
+    ...rows.find((r: any) => r.id === "hermes"),
+    cliInstalled: true,
+    acpMode: "separate",
+    acpInstalled: false,
+    acpCommand: "hermes-acp",
+  };
+  view.toggleAgentAiInstall(hermesRow, cx);
+  expect(view.agentAiInstallTargetId).toBe("hermes");
+  view.setAgentAiInstallAgent("claude", cx);
+  view.setAgentAiInstallEffort("xhigh", cx);
+  view.setAgentAiInstallModel("claude-sonnet-4-5", cx);
+  expect(view.agentAiInstallEffort).toBe("high");
+  view.launchAgentToInstall(hermesRow, cx);
+  await Promise.all(pending.splice(0));
+  expect(ran[3].cmd).toBe("tab.new");
+  expect(ran[3].args.name).toContain("ACP");
+  expect(ran[3].args.argv).toEqual(["claude", "--dangerously-skip-permissions"]);
+  expect(ran[3].args.model).toBe("claude-sonnet-4-5");
+  expect(ran[3].args.effort).toBe("high");
+  expect(ran[3].args.task).toContain("hermes-acp");
+  expect(view.agentAiInstallTargetId).toBeNull();
+  expect(closed).toBe(4);
+  expect(toasts[toasts.length - 1].title).toContain("Claude Code");
+  expect(toasts[toasts.length - 1].title).toContain("ACP");
+
+  // Toggling same row again closes panel cleanly.
+  view.toggleAgentAiInstall(agyRow, cx);
+  expect(view.agentAiInstallTargetId).toBe("agy");
+  view.toggleAgentAiInstall(agyRow, cx);
+  expect(view.agentAiInstallTargetId).toBeNull();
+
+  // 7. ACP auth-required probe error (e.g. Windows pi-acp -32000 with raw authMethods JSON) is classified as "auth",
+  //    stripped of raw JSON/SDK echo, and supports one-click sign-in terminal launch.
+  const rawWinPiAuthErr =
+    'ACP session/new failed: Authentication required: Configure an API key or log in with an OAuth provider.: {"authMethods":[{"_meta":{"terminal-auth":{"command":"C:\\\\Program Files\\\\nodejs\\\\node.exe","label":"Launch pi"}},"description":"Start pi in an interactive terminal"}]} (code -32000)\nstderr:\nError handling request {\n  id: 2,\n  method: \'session/new\'\n}';
+  view.droveMachine = null;
+  view.droveData = {
+    config: {},
+    agents: {
+      fullProbe: true,
+      agents: [
+        {
+          id: "pi",
+          installed: true,
+          command: ["D:\\Users\\zhihao.zou\\AppData\\Local\\herdr2\\adapters\\pi\\node_modules/.bin/pi-acp.CMD"],
+          path: "D:\\Users\\zhihao.zou\\AppData\\Local\\herdr2\\adapters\\pi\\node_modules/.bin/pi-acp.CMD",
+          models: [],
+          error: rawWinPiAuthErr,
+        },
+      ],
+    },
+  };
+  view.adapterStatus = {
+    adapters_dir: "D:\\Users\\zhihao.zou\\AppData\\Local\\herdr2\\adapters",
+    auto_install: true,
+    adapters: [
+      {
+        preset_id: "pi",
+        binary_name: "pi-acp",
+        companion_cli: "pi",
+        companion_installed: true,
+        installed: true,
+        source: "managed",
+        state: "ready",
+        path: "D:\\Users\\zhihao.zou\\AppData\\Local\\herdr2\\adapters\\pi\\node_modules/.bin/pi-acp.CMD",
+      },
+    ],
+  };
+  const authRows = view.detectedAgentRows();
+  const piAuthRow = authRows.find((r: any) => r.id === "pi");
+  expect(piAuthRow.acpAuthRequired).toBe(true);
+  expect(piAuthRow.acpReady).toBe(false);
+  const authIssues = view.agentIssues(authRows);
+  expect(authIssues.find((it: any) => it.id === "pi")?.issueKind).toBe("auth");
+
+  const shortPiErr = view.formatAgentProbeError(rawWinPiAuthErr, "pi");
+  expect(shortPiErr).toContain("/login");
+  expect(shortPiErr).not.toContain("authMethods");
+  expect(shortPiErr).not.toContain("Error handling request");
+
+  const fixPrompt = view.buildDroveProbeFixPrompt(authIssues);
+  expect(fixPrompt).toContain("kind: acp_auth_required");
+  expect(fixPrompt).not.toContain("authMethods");
+  expect(fixPrompt).not.toContain("Error handling request");
+
+  view.launchAgentLoginCli(piAuthRow, cx);
+  expect(ran[4].cmd).toBe("tab.new");
+  expect(ran[4].args.space).toBe("sp-local");
+  expect(ran[4].args.argv).toEqual(["pi"]);
+  expect(closed).toBe(5);
 });

@@ -72,6 +72,7 @@ impl Session {
             .env("PATH", std::env::var("PATH").unwrap_or_default())
             .env("HOME", &self.root)
             .env("H2_SESSION", "test")
+            .env("HERDR2_AUTO_INSTALL_ADAPTERS", "0")
             .env("XDG_RUNTIME_DIR", self.root.join("run"))
             .env("XDG_STATE_HOME", self.root.join("state"))
             .env("XDG_CONFIG_HOME", self.root.join("config"))

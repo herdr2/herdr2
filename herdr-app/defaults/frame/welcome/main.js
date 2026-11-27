@@ -1711,35 +1711,52 @@ export default class Welcome extends View {
               )
               .children(
                 shownRows.map((r, idx) => {
+                  const errLower = String(r.acpError ?? "").toLowerCase();
+                  const isAuthErr = Boolean(
+                    r.acpError &&
+                      (errLower.includes("authentication required") ||
+                        errLower.includes("auth_required") ||
+                        errLower.includes("configure an api key") ||
+                        errLower.includes("login required") ||
+                        errLower.includes("not logged in") ||
+                        errLower.includes("onboarding is incomplete") ||
+                        (errLower.includes("-32000") && (errLower.includes("auth") || errLower.includes("login")))),
+                  );
                   const dotColor = r.acpReady
                     ? t.ansi2
-                    : r.acpError
-                      ? t.blocked
-                      : r.adapterMissing || r.cliInstalled
-                        ? t.working
-                        : t.dim;
+                    : isAuthErr
+                      ? t.working
+                      : r.acpError
+                        ? t.blocked
+                        : r.adapterMissing || r.cliInstalled
+                          ? t.working
+                          : t.dim;
                   const statusText = r.adapterInstalling || this.adapterBusy === `detected:${r.id}`
                     ? this.tr("Installing adapter…", "正在安装适配器…")
                     : r.acpReady
                       ? (r.modelsCount > 0
                           ? this.tr(`ACP Ready · ${r.modelsCount} models`, `ACP 就绪 · ${r.modelsCount} 模型`)
                           : this.tr("ACP Ready", "ACP 就绪"))
-                      : r.acpError
-                        ? this.tr("ACP Error", "ACP 异常")
-                        : r.adapterMissing
-                          ? this.tr("Missing ACP Adapter", "缺少 ACP 适配器")
-                          : r.cliInstalled
-                            ? this.tr("CLI Ready", "CLI 可用")
-                            : this.tr("Not Installed", "未安装");
+                      : isAuthErr
+                        ? this.tr("Login Required", "需登录")
+                        : r.acpError
+                          ? this.tr("ACP Error", "ACP 异常")
+                          : r.adapterMissing
+                            ? this.tr("Missing ACP Adapter", "缺少 ACP 适配器")
+                            : r.cliInstalled
+                              ? this.tr("CLI Ready", "CLI 可用")
+                              : this.tr("Not Installed", "未安装");
                   const statusColor = r.acpReady
                     ? t.ansi2
-                    : r.acpError
-                      ? t.blocked
-                      : r.adapterMissing
-                        ? t.working
-                        : r.cliInstalled
-                          ? t.foreground
-                          : t.dim;
+                    : isAuthErr
+                      ? t.working
+                      : r.acpError
+                        ? t.blocked
+                        : r.adapterMissing
+                          ? t.working
+                          : r.cliInstalled
+                            ? t.foreground
+                            : t.dim;
                   const showInstallBtn = Boolean(
                     r.adapter && !r.adapter.installed && !r.adapterInstalling && (r.adapter.companion_installed || !r.adapter.companion_cli),
                   );

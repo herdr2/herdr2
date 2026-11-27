@@ -160,6 +160,7 @@ pub(super) async fn worker_ask_http(
 ) -> Result<Value, ApiErr> {
     let att = authenticate_worker(&core.drove, headers, body)?;
     let timeout_sec = body["timeoutSec"].as_u64().unwrap_or(300).clamp(1, 3600);
+    let mcp_poll = body["mcpPoll"].as_bool() == Some(true);
     let question = body["question"]
         .as_str()
         .map(str::trim)
@@ -173,49 +174,77 @@ pub(super) async fn worker_ask_http(
     let why = body["why"].as_str().map(String::from);
     let run = core.drove.store.get_run(&att.run_id).ok_or_else(|| ApiErr::new(404, "not_found", "Run not found"))?;
     let task = core.drove.store.get_task(&att.task_id);
-    let msg = core.drove.store.post_message(PostMessageInput {
-        run_id: att.run_id.clone(),
-        kind: MessageType::Question,
-        from: format!("worker:{}", att.worker_id),
-        to: "coordinator".into(),
-        thread_id: None,
-        task_id: Some(att.task_id.clone()),
-        attempt_id: Some(att.id.clone()),
-        subject: format!("Question from {}", task.as_ref().map(|t| t.key.as_str()).unwrap_or(&att.task_id)),
-        body: Some(question.clone()),
-        options,
-        recommend,
-        why,
-        raised_by: Some("worker".into()),
-        raised_by_worker: Some(att.worker_id.clone()),
-        tag: None,
-        ai_draft: None,
-        needs_action: true,
-    });
+
+    // Deduplicate identical questions within the same attempt (e.g. when an MCP client times out
+    // at 60s and re-calls `drove_ask` or falls back to `h2 drove worker ask`).
+    let existing_q = core
+        .drove
+        .store
+        .list_messages(&att.run_id, None, true, None)
+        .into_iter()
+        .rev()
+        .find(|m| {
+            m.kind == MessageType::Question
+                && m.attempt_id.as_deref() == Some(att.id.as_str())
+                && m.body.as_deref().map(str::trim) == Some(question.as_str())
+        });
+    if let Some(ref prev) = existing_q
+        && let Some(reply) = core.drove.store.latest_reply_for(&att.run_id, &prev.id)
+    {
+        return Ok(json!({ "questionId": prev.id, "reply": reply }));
+    }
+
+    let (msg, is_new_question) = match existing_q {
+        Some(prev) => (prev, false),
+        None => (
+            core.drove.store.post_message(PostMessageInput {
+                run_id: att.run_id.clone(),
+                kind: MessageType::Question,
+                from: format!("worker:{}", att.worker_id),
+                to: "coordinator".into(),
+                thread_id: None,
+                task_id: Some(att.task_id.clone()),
+                attempt_id: Some(att.id.clone()),
+                subject: format!("Question from {}", task.as_ref().map(|t| t.key.as_str()).unwrap_or(&att.task_id)),
+                body: Some(question.clone()),
+                options,
+                recommend,
+                why,
+                raised_by: Some("worker".into()),
+                raised_by_worker: Some(att.worker_id.clone()),
+                tag: None,
+                ai_draft: None,
+                needs_action: true,
+            }),
+            true,
+        ),
+    };
 
     core.drove.enter_ask(&att.id);
     let _guard = AskGuard { drove: core.drove.clone(), attempt_id: att.id.clone() };
-    super::ai::spawn_question_draft(
-        core.clone(),
-        att.run_id.clone(),
-        msg.id.clone(),
-        question.clone(),
-        msg.options.clone(),
-    );
-    super::ai::spawn_run_narrator(core.clone(), att.run_id.clone());
-    let tkey = task.as_ref().map(|t| t.key.as_str()).unwrap_or(&att.task_id);
-    notify_coordinator(
-        core,
-        &run,
-        "question",
-        &format!("Question on `{tkey}`"),
-        &format!("[drove] Question ({}) on `{tkey}`: {question}", msg.id),
-        Some(&att.task_id),
-        Some(&att.id),
-        Some(&att.worker_id),
-        Some(&msg.id),
-    )
-    .await;
+    if is_new_question {
+        super::ai::spawn_question_draft(
+            core.clone(),
+            att.run_id.clone(),
+            msg.id.clone(),
+            question.clone(),
+            msg.options.clone(),
+        );
+        super::ai::spawn_run_narrator(core.clone(), att.run_id.clone());
+        let tkey = task.as_ref().map(|t| t.key.as_str()).unwrap_or(&att.task_id);
+        notify_coordinator(
+            core,
+            &run,
+            "question",
+            &format!("Question on `{tkey}`"),
+            &format!("[drove] Question ({}) on `{tkey}`: {question}", msg.id),
+            Some(&att.task_id),
+            Some(&att.id),
+            Some(&att.worker_id),
+            Some(&msg.id),
+        )
+        .await;
+    }
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(timeout_sec);
     loop {
@@ -235,6 +264,13 @@ pub(super) async fn worker_ask_http(
             return Ok(json!({ "questionId": msg.id, "reply": reply }));
         }
         if tokio::time::timeout_at(deadline, woken).await.is_err() {
+            if mcp_poll {
+                return Ok(json!({
+                    "status": "pending",
+                    "questionId": msg.id,
+                    "message": "Coordinator has not replied yet. Call `drove_ask` again with the exact same `question` to continue waiting without creating a duplicate question."
+                }));
+            }
             return Err(ApiErr::new(408, "timeout", format!("timed out waiting for reply to {}", msg.id)));
         }
     }
@@ -849,7 +885,7 @@ pub(super) async fn add_tasks_http(
                     let t_base = obj.get("title").and_then(Value::as_str).unwrap_or(&base_key);
                     obj.insert("title".into(), Value::String(format!("{t_base} [{}]", idx + 1)));
                     obj.insert("context".into(), item.clone());
-                    replace_item_placeholder(obj.get_mut("spec"), &item_str);
+                    apply_foreach_item_placeholders(obj, &item_str);
                 }
                 created.push(create_one_task(core, &run.id, &mutated)?);
             }
@@ -863,39 +899,10 @@ pub(super) async fn add_tasks_http(
     }
 
     normalize_run_task_deps(core, &run.id);
+    let all_after_add = core.drove.store.list_tasks(&run.id);
+    super::scheduler::promote_pending_tasks(core, &all_after_add);
 
-    let rebind_sess = if super::pool::is_coordinator_closed(core, &run) {
-        body["hostSession"].as_str().or(coord_header).map(str::trim).filter(|s| !s.is_empty()).map(String::from)
-    } else {
-        None
-    };
-    let rebound_meta = if let Some(ref next_sess) = rebind_sess {
-        let (agent, model, pid, _, _) =
-            super::http::resolve_session_meta_and_entries(core, next_sess, true, false).await;
-        let bound = super::http::is_local_session_bound(core, next_sess);
-        Some((next_sess.clone(), agent, model, pid, bound))
-    } else {
-        None
-    };
-    let reactivate = run.status == RunStatus::Done
-        || (run.status == RunStatus::Paused
-            && matches!(run.pause_reason.as_deref(), Some("cancelled" | "coordinator_closed")));
-    if rebound_meta.is_some() || reactivate {
-        let _ = core.drove.store.update_run(&run.id, |r| {
-            if let Some((ref next_sess, ref agent, ref model, pid, bound)) = rebound_meta {
-                r.coordinator.generation += 1;
-                r.coordinator.host_session = next_sess.clone();
-                r.coordinator.agent = agent.clone();
-                r.coordinator.model = model.clone();
-                r.coordinator.host_pid = pid;
-                r.coordinator.session_bound = bound;
-            }
-            if reactivate {
-                r.status = RunStatus::Active;
-                r.pause_reason = None;
-            }
-        });
-    }
+    reactivate_run_if_needed(core, &run, coord_header, body["hostSession"].as_str()).await;
 
     let created: Vec<Task> = created.into_iter().filter_map(|t| core.drove.store.get_task(&t.id)).collect();
     for t in &created {
@@ -1026,12 +1033,84 @@ fn normalize_run_task_deps(core: &Arc<Core>, run_id: &str) {
     }
 }
 
-fn replace_item_placeholder(spec_opt: Option<&mut Value>, val: &str) {
-    let Some(Value::Object(spec)) = spec_opt else { return };
-    for k in ["target", "change", "acceptance", "constraints", "ownership"] {
-        if let Some(Value::String(s)) = spec.get_mut(k) {
-            *s = s.replace("{{item}}", val);
+pub(crate) fn replace_item_in_value(val: &mut Value, item_str: &str) {
+    match val {
+        Value::String(s) => {
+            if s.contains("{{item}}") {
+                *s = s.replace("{{item}}", item_str);
+            }
         }
+        Value::Array(arr) => {
+            for elem in arr {
+                replace_item_in_value(elem, item_str);
+            }
+        }
+        Value::Object(map) => {
+            for v in map.values_mut() {
+                replace_item_in_value(v, item_str);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn apply_foreach_item_placeholders(obj: &mut serde_json::Map<String, Value>, item_str: &str) {
+    for k in [
+        "spec",
+        "exec",
+        "files",
+        "cache",
+        "target",
+        "change",
+        "prompt",
+        "acceptance",
+        "constraints",
+        "ownership",
+        "verify",
+    ] {
+        if let Some(v) = obj.get_mut(k) {
+            replace_item_in_value(v, item_str);
+        }
+    }
+}
+
+async fn reactivate_run_if_needed(
+    core: &Arc<Core>,
+    run: &Run,
+    coord_header: Option<&str>,
+    host_session_override: Option<&str>,
+) {
+    let rebind_sess = if super::pool::is_coordinator_closed(core, run) {
+        host_session_override.or(coord_header).map(str::trim).filter(|s| !s.is_empty()).map(String::from)
+    } else {
+        None
+    };
+    let rebound_meta = if let Some(ref next_sess) = rebind_sess {
+        let (agent, model, pid, _, _) =
+            super::http::resolve_session_meta_and_entries(core, next_sess, true, false).await;
+        let bound = super::http::is_local_session_bound(core, next_sess);
+        Some((next_sess.clone(), agent, model, pid, bound))
+    } else {
+        None
+    };
+    let reactivate = run.status == RunStatus::Done
+        || (run.status == RunStatus::Paused
+            && matches!(run.pause_reason.as_deref(), Some("cancelled" | "coordinator_closed")));
+    if rebound_meta.is_some() || reactivate {
+        let _ = core.drove.store.update_run(&run.id, |r| {
+            if let Some((ref next_sess, ref agent, ref model, pid, bound)) = rebound_meta {
+                r.coordinator.generation += 1;
+                r.coordinator.host_session = next_sess.clone();
+                r.coordinator.agent = agent.clone();
+                r.coordinator.model = model.clone();
+                r.coordinator.host_pid = pid;
+                r.coordinator.session_bound = bound;
+            }
+            if reactivate {
+                r.status = RunStatus::Active;
+                r.pause_reason = None;
+            }
+        });
     }
 }
 
@@ -1431,6 +1510,7 @@ pub(super) async fn complete_run_http(core: &Arc<Core>, run_id: &str, body: &Val
         needs_action: false,
     });
     super::ai::spawn_run_narrator(core.clone(), run.id.clone());
+    core.drove.wake_scheduler();
     Ok(json!({ "ok": true, "run": updated }))
 }
 
@@ -1464,7 +1544,12 @@ fn has_live_running_attempt(core: &Core, task: &Task) -> bool {
     })
 }
 
-pub(super) async fn retry_task_http(core: &Arc<Core>, id: &str, body: &Value) -> Result<Value, ApiErr> {
+pub(super) async fn retry_task_http(
+    core: &Arc<Core>,
+    id: &str,
+    coord_header: Option<&str>,
+    body: &Value,
+) -> Result<Value, ApiErr> {
     let mut task = core.drove.store.get_task(id).ok_or_else(|| ApiErr::new(404, "not_found", "Task not found"))?;
     if task.status == TaskStatus::Running && has_live_running_attempt(core, &task) {
         return Err(ApiErr::new(409, "invalid_state", "cannot retry a running task"));
@@ -1621,8 +1706,13 @@ pub(super) async fn retry_task_http(core: &Arc<Core>, id: &str, body: &Value) ->
     if let Some(hint) = body["hint"].as_str().map(str::trim).filter(|s| !s.is_empty()) {
         core.drove.set_task_hint(&task.id, hint.to_string());
     }
+    let all_tasks_before = core.drove.store.list_tasks(&task.run_id);
+    let initial_status = initial_retried_task_status(&all_tasks_before, &task);
     let updated = core.drove.store.update_task(&task.id, |t| {
-        t.status = TaskStatus::Ready;
+        t.status = initial_status;
+        if t.template == Some(true) {
+            t.expansion_state = Some("pending".into());
+        }
         t.failures = 0;
         t.exec_phase = None;
         t.review_state = None;
@@ -1732,8 +1822,80 @@ pub(super) async fn retry_task_http(core: &Arc<Core>, id: &str, body: &Value) ->
             let _ = core.drove.store.mark_handled(&m.id);
         }
     }
+    if let Some(ref run) = run_opt {
+        reactivate_run_if_needed(core, run, coord_header, body["hostSession"].as_str()).await;
+    }
+    let refreshed = core.drove.store.get_task(&task.id).or(updated);
     core.drove.wake_scheduler();
-    Ok(json!(updated))
+    Ok(json!(refreshed))
+}
+
+fn initial_retried_task_status(tasks: &[Task], task: &Task) -> TaskStatus {
+    if task.template == Some(true) {
+        return TaskStatus::Pending;
+    }
+    if task.deps.is_empty() {
+        return TaskStatus::Ready;
+    }
+    let rule = task.trigger_rule.unwrap_or(TriggerRule::AllSuccess);
+    let mut dep_statuses = Vec::new();
+    let mut has_non_terminal = false;
+    for dep_ref in &task.deps {
+        if let Some(d) = tasks.iter().find(|t| &t.id == dep_ref || &t.key == dep_ref) {
+            if d.template == Some(true) && task.expanded_from.as_deref() != Some(d.id.as_str()) {
+                if d.expansion_state.as_deref() != Some("done") {
+                    has_non_terminal = true;
+                }
+                let mut child_count = 0usize;
+                for child in tasks.iter().filter(|c| c.expanded_from.as_deref() == Some(d.id.as_str())) {
+                    child_count += 1;
+                    if !super::scheduler::is_terminal_status(child.status) {
+                        has_non_terminal = true;
+                    }
+                    dep_statuses.push(child.status);
+                }
+                if child_count == 0 {
+                    if !super::scheduler::is_terminal_status(d.status) {
+                        has_non_terminal = true;
+                    }
+                    dep_statuses.push(d.status);
+                }
+            } else {
+                if !super::scheduler::is_terminal_status(d.status) {
+                    has_non_terminal = true;
+                }
+                dep_statuses.push(d.status);
+            }
+        } else {
+            for child in tasks.iter().filter(|c| c.key.strip_prefix(dep_ref.as_str()).is_some_and(|r| r.starts_with('#')))
+            {
+                if !super::scheduler::is_terminal_status(child.status) {
+                    has_non_terminal = true;
+                }
+                dep_statuses.push(child.status);
+            }
+        }
+    }
+    match rule {
+        TriggerRule::AllSuccess => {
+            if !has_non_terminal
+                && !dep_statuses
+                    .iter()
+                    .any(|s| matches!(s, TaskStatus::Failed | TaskStatus::Cancelled | TaskStatus::Skipped))
+            {
+                TaskStatus::Ready
+            } else {
+                TaskStatus::Pending
+            }
+        }
+        TriggerRule::AnySuccess => {
+            if dep_statuses.contains(&TaskStatus::Succeeded) {
+                TaskStatus::Ready
+            } else {
+                TaskStatus::Pending
+            }
+        }
+    }
 }
 
 fn reopen_skipped_dependents(core: &Arc<Core>, root: &Task) {
@@ -1748,16 +1910,20 @@ fn reopen_skipped_dependents(core: &Arc<Core>, root: &Task) {
     loop {
         let mut changed = false;
         for t in &tasks {
-            if t.template == Some(true) || t.status != TaskStatus::Skipped {
+            if t.status != TaskStatus::Skipped {
                 continue;
             }
             let depends_on_reopened = t.deps.iter().any(|d| reopened.contains(d))
-                || t.deps.iter().any(|d| root.key.strip_prefix(d.as_str()).is_some_and(|rest| rest.starts_with('#')));
+                || t.deps.iter().any(|d| root.key.strip_prefix(d.as_str()).is_some_and(|rest| rest.starts_with('#')))
+                || t.foreach_from.as_ref().is_some_and(|ff| reopened.contains(&ff.task));
             if depends_on_reopened && !reopened.contains(&t.id) {
                 let _ = core.drove.store.update_task(&t.id, |upd| {
                     if upd.status == TaskStatus::Skipped {
                         upd.status = TaskStatus::Pending;
                         upd.result = None;
+                        if upd.template == Some(true) {
+                            upd.expansion_state = Some("pending".into());
+                        }
                     }
                 });
                 reopened.insert(t.id.clone());
@@ -1777,7 +1943,12 @@ fn reopen_skipped_dependents(core: &Arc<Core>, root: &Task) {
     }
 }
 
-pub(super) async fn edit_task_http(core: &Arc<Core>, id: &str, body: &Value) -> Result<Value, ApiErr> {
+pub(super) async fn edit_task_http(
+    core: &Arc<Core>,
+    id: &str,
+    coord_header: Option<&str>,
+    body: &Value,
+) -> Result<Value, ApiErr> {
     let task = core.drove.store.get_task(id).ok_or_else(|| ApiErr::new(404, "not_found", "Task not found"))?;
     if task.status == TaskStatus::Running && has_live_running_attempt(core, &task) {
         return Err(ApiErr::new(409, "task_running", "cannot edit a task while an attempt is actively running"));
@@ -1963,6 +2134,11 @@ pub(super) async fn edit_task_http(core: &Arc<Core>, id: &str, body: &Value) -> 
         super::scheduler::promote_pending_tasks(core, &all);
     }
     let refreshed = core.drove.store.get_task(&updated.id).unwrap_or(updated);
+    if matches!(refreshed.status, TaskStatus::Pending | TaskStatus::Ready)
+        && let Some(run) = core.drove.store.get_run(&refreshed.run_id)
+    {
+        reactivate_run_if_needed(core, &run, coord_header, body["hostSession"].as_str()).await;
+    }
     core.drove.wake_scheduler();
     Ok(json!(refreshed))
 }
