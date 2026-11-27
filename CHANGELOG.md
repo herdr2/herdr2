@@ -1,5 +1,41 @@
 # Changelog
 
+## v2.0.22
+
+#### 中文
+
+**新增功能**
+- **AI 优先的「待确认 (`blocked`)」与「已完成 (`done`)」智能状态仲裁**：
+  - 升级 Core AI（`AiTaskTier::Nano` + 共享 KV-Cache 前缀 + 本地 0-token 缓存）状态判准并在送检前剥离代码块：仅当 Agent 真正向用户提出澄清问题、等待方案拍板或授权时才判定为 **待确认 (`blocked`)**；若任务已完成（即便末尾包含编号修改总结、自问自答或「如有问题请告诉我」「需要我顺便提交吗？」等礼貌性附带提议），统一判定为 **已完成 (`done`)**。
+  - ACP 回合结束先落 **已完成**，经 AI 确认存在真实提问后再升为 **待确认**（显式提问工具调用如 `AskUserQuestion` 除外），消除启发式误判导致的红标与提示音误闪；AI 不可用时自动平滑回退到收紧后的本地规则。
+  - 桌面端 PTY 静默 AI 仲裁提速（静默延迟由 2s 缩短至 1s，冷却由 5s 缩短至 1.5s），等待 AI 判定期间对模糊文本保持完成态不提前闪红。
+
+**问题修复**
+- **消除本地规则对「待确认」的误报（无 AI 配置时同样准确）**：
+  - 收紧 ACP 文本启发式规则，不再把「编号总结列表 + 确认/方案/选项」宽泛误判为待确认，仅匹配末尾连续候选项且紧邻明确提问/选择引导语，并补齐中英文礼貌结语及附带提议排除规则。
+  - 修复 PTY 屏幕底部已回到空闲输入提示符（如 `❯ ` / `› ` + `? for shortcuts`）时，历史滚动区里的编号输入（`❯ 1. ...`）、Codex 圆点（`● 1. ...`）或 Diff 代码中的 `(y/n)` 被误判为交互式确认弹窗的问题。
+- **修复「已完成」状态漏标与误清除**：
+  - 修复非 OSC 7501 终端（如 `h2 send` 触发或快速完成的回合）因 `allow_digest` 过滤条件偏差导致漏标 `mark_unseen`（「已完成」）的问题，新增 `acknowledged_output_at` 防止用户已读后被晚到的异步 AI 结果重复标回未读。
+  - 修复后台自动挂载非聚焦面板及单按修饰键误清除当前「已完成」状态的问题，以及 `ai.briefing` 对未读完成态的识别。
+
+---
+
+#### English
+
+**New Features**
+- **AI-First "Needs You (`blocked`)" vs "Done (`done`)" Status Arbitration**:
+  - Refined Core AI (`AiTaskTier::Nano` + shared KV-cache prefix + local 0-token cache) classification and stripped fenced code blocks before inspection: agents transition to **Needs you (`blocked`)** only when genuinely asking a clarifying question, awaiting a decision, or requesting authorization; completed tasks—even with numbered change summaries, rhetorical notes, or polite follow-up offers (e.g., "let me know if you want me to commit")—settle cleanly as **Done (`done`)**.
+  - Completed ACP turns now land in `done` first and promote to `blocked` only when AI confirms a real user question (while explicit question tools such as `AskUserQuestion` block immediately), eliminating heuristic false-alarm badges and sounds with automatic fallback to tightened local rules if AI is unavailable.
+  - Accelerated desktop PTY quiet-screen AI arbitration (1s quiet delay, 1.5s cooldown) without prematurely flashing `blocked` while awaiting AI confirmation.
+
+**Bug Fixes**
+- **Eliminated False-Positive `blocked` Detections in Local Rules (Even Without Core AI)**:
+  - Narrowed ACP text heuristics so numbered summary lists mentioning words like "confirm" or "options" no longer falsely trigger `blocked`, matching only trailing candidate lists directly paired with explicit question/choice prompts alongside expanded Chinese/English polite sign-off exclusions.
+  - Prevented PTY tail inference from misclassifying historical scrollback numbered lines (`❯ 1. ...`), Codex bullets (`● 1. ...`), or `(y/n)` inside code diffs as interactive confirmation dialogs when an idle prompt (`❯ ` / `› ` + `? for shortcuts`) is already active at the bottom of the screen.
+- **Fixed Missed & Prematurely Cleared `done` States**:
+  - Fixed `allow_digest` filtering out `raw_state == "done"` on non-OSC 7501 terminals (preventing missed `mark_unseen` badges) and tracked `acknowledged_output_at` so late async AI results never re-mark an already-read terminal as unread.
+  - Fixed background attachment of unfocused panes and modifier-only keypresses clearing `done`, and fixed `ai.briefing` recognition of unread `done` agents.
+
 ## v2.0.21
 
 #### 中文

@@ -1637,6 +1637,10 @@ pub struct AppWindow {
     pending_trash: HashMap<String, (String, Instant)>,
     /// Cached async semantic arbitration verdicts for non-OSC-7501 PTY CLI agents.
     ai_terminal_states: HashMap<String, AiTerminalVerdict>,
+    /// Last `output_at` timestamp already acknowledged as seen by the user per terminal, preventing late AI `"done"` verdicts from re-marking read turns.
+    acknowledged_output_at: HashMap<String, Instant>,
+    /// Deferred alerts queued from async AI status callbacks to be presented on the next window tick.
+    pending_ai_alerts: Vec<(String, model::Alert)>,
     /// PTY addresses currently awaiting an in-flight `ai.classify_terminal_state` RPC.
     ai_inflight: HashSet<String>,
     polish_inflight: HashSet<String>,
@@ -1795,6 +1799,8 @@ impl AppWindow {
             pending_names: HashMap::new(),
             pending_trash: HashMap::new(),
             ai_terminal_states: HashMap::new(),
+            acknowledged_output_at: HashMap::new(),
+            pending_ai_alerts: Vec::new(),
             ai_inflight: HashSet::new(),
             polish_inflight: HashSet::new(),
             polish_seq: 0,
@@ -3482,6 +3488,9 @@ impl AppWindow {
             if !uniq.insert(addr.as_str()) {
                 continue;
             }
+            if let Some(out_at) = self.best_terminal_view(addr, cx).and_then(|v| v.read(cx).last_output_at()) {
+                self.acknowledged_output_at.insert(addr.clone(), out_at);
+            }
             let Some(a) = self.model.agents.get(addr) else { continue };
             let turn = a.turn;
             if a.word.is_none() || !self.live.contains_key(addr) || turn == 0 {
@@ -4731,13 +4740,22 @@ impl AppWindow {
             let is_reported = rec.get("reported").and_then(Value::as_bool) == Some(true);
             if is_reported {
                 let core_state = rec.pointer("/report/state").and_then(Value::as_str);
-                if !is_agent || !matches!(core_state, Some("idle" | "done")) {
+                let core_kind = rec.pointer("/report/kind").and_then(Value::as_str);
+                let arbitrate_reported_blocked = core_state == Some("blocked")
+                    && !matches!(core_kind, Some("permission" | "auth"))
+                    && can_ai;
+                if !is_agent || (!matches!(core_state, Some("idle" | "done")) && !arbitrate_reported_blocked) {
                     if self.ai_terminal_states.contains_key(addr) {
                         clear_verdicts.push(addr.clone());
                     }
                     continue;
                 }
-                let base_state: &'static str = if core_state == Some("done") { "done" } else { "idle" };
+                let base_state: &'static str = match core_state {
+                    Some("done") => "done",
+                    Some("blocked") => "blocked",
+                    _ => "idle",
+                };
+                let non_blocked_base: &'static str = if core_state == Some("done") { "done" } else { "idle" };
                 let raw_title = rec.get("raw_title").and_then(Value::as_str).unwrap_or_default();
                 let view = self.best_terminal_view(addr, cx);
                 let recent_submit = view.as_ref().is_some_and(|v| v.read(cx).has_recent_submit(now));
@@ -4758,6 +4776,12 @@ impl AppWindow {
                     } else {
                         base_state
                     };
+                    // When AI is available, avoid prematurely flashing "blocked" on ambiguous text before AI confirms.
+                    let pending_state: &'static str = if can_ai && conf == crate::terminal::QuietBlockConfidence::AmbiguousText && base_state != "blocked" {
+                        non_blocked_base
+                    } else {
+                        det_default
+                    };
                     let v = view.read(cx);
                     let output_at = v.last_output_at();
                     let typed_at = v.last_typed_at();
@@ -4767,22 +4791,22 @@ impl AppWindow {
                     }
                     let (eff_state, eff_summary, eff_kind, eff_sem_title, eff_micro, need_ai) = match cached {
                         Some(c) => {
-                            let st = if c.state == "blocked" { "blocked" } else { base_state };
+                            let st = if c.state == "blocked" { "blocked" } else { non_blocked_base };
                             let sum = if c.summary.is_empty() { Value::Null } else { Value::String(c.summary.clone()) };
                             let kind = if c.kind.is_empty() { Value::Null } else { Value::String(c.kind.clone()) };
                             let sem = (!c.semantic_title.is_empty()).then(|| c.semantic_title.clone());
                             let ms = (!c.micro_summary.is_empty()).then(|| c.micro_summary.clone());
                             (st, sum, kind, sem, ms, false)
                         }
-                        None => (det_default, Value::Null, Value::Null, None, None, true),
+                        None => (pending_state, Value::Null, Value::Null, None, None, true),
                     };
                     if need_ai
                         && can_ai
                         && !self.ai_inflight.contains(addr)
-                        && self.ai_inflight.len() + jobs.len() < 2
-                        && self.ai_last_attempt.get(addr).is_none_or(|t| now.saturating_duration_since(*t) >= Duration::from_secs(5))
-                        && output_at.is_some_and(|t| now.saturating_duration_since(t) >= Duration::from_secs(2))
-                        && typed_at.is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(1500))
+                        && self.ai_inflight.len() + jobs.len() < 3
+                        && self.ai_last_attempt.get(addr).is_none_or(|t| now.saturating_duration_since(*t) >= Duration::from_millis(1500))
+                        && output_at.is_some_and(|t| now.saturating_duration_since(t) >= Duration::from_millis(1000))
+                        && typed_at.is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(1200))
                     {
                         let (screen_hash, tail_lines) = v.tail_snapshot_for_arbitration(20);
                         if !tail_lines.is_empty() {
@@ -4829,6 +4853,9 @@ impl AppWindow {
                     }
                     (Value::String(det.to_owned()), Value::Null, Value::Null, None, None)
                 } else if let Some(view) = view {
+                    // When AI is available, keep ambiguous conversational tails in finished ("idle" => "done" in UI)
+                    // until AI confirms the agent genuinely asked the user a blocking question.
+                    let pending_det: &'static str = if can_ai && det == "blocked" { "idle" } else { det };
                     let v = view.read(cx);
                     let output_at = v.last_output_at();
                     let typed_at = v.last_typed_at();
@@ -4847,15 +4874,15 @@ impl AppWindow {
                             let ms = (!c.micro_summary.is_empty()).then(|| c.micro_summary.clone());
                             (c.state, sum, kind, st, ms, recheck, c.working_rechecks.saturating_add(1))
                         }
-                        None => (det, Value::Null, Value::Null, None, None, true, 0),
+                        None => (pending_det, Value::Null, Value::Null, None, None, true, 0),
                     };
                     if need_recheck
                         && can_ai
                         && !self.ai_inflight.contains(addr)
-                        && self.ai_inflight.len() + jobs.len() < 2
-                        && self.ai_last_attempt.get(addr).is_none_or(|t| now.saturating_duration_since(*t) >= Duration::from_secs(5))
-                        && output_at.is_some_and(|t| now.saturating_duration_since(t) >= Duration::from_secs(2))
-                        && typed_at.is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(1500))
+                        && self.ai_inflight.len() + jobs.len() < 3
+                        && self.ai_last_attempt.get(addr).is_none_or(|t| now.saturating_duration_since(*t) >= Duration::from_millis(1500))
+                        && output_at.is_some_and(|t| now.saturating_duration_since(t) >= Duration::from_millis(1000))
+                        && typed_at.is_none_or(|t| now.saturating_duration_since(t) >= Duration::from_millis(1200))
                     {
                         let (screen_hash, tail_lines) = v.tail_snapshot_for_arbitration(20);
                         if !tail_lines.is_empty()
@@ -4955,16 +4982,20 @@ impl AppWindow {
                     };
                     let rec_reported = rec.get("reported").and_then(Value::as_bool) == Some(true);
                     let core_state = rec.pointer("/report/state").and_then(Value::as_str);
+                    let core_kind = rec.pointer("/report/kind").and_then(Value::as_str);
+                    let allowed_reported = matches!(core_state, Some("idle" | "done"))
+                        || (core_state == Some("blocked") && !matches!(core_kind, Some("permission" | "auth")));
                     if rec.get("acp").and_then(Value::as_bool) == Some(true)
                         || rec.get("manual_status").and_then(Value::as_str).is_some_and(|s| !s.is_empty())
                         || rec.pointer("/program/agent").and_then(Value::as_bool) != Some(true)
-                        || (rec_reported && !matches!(core_state, Some("idle" | "done")))
+                        || (rec_reported && !allowed_reported)
                     {
                         return;
                     }
                     let accepted = val.get("accepted").and_then(Value::as_bool) == Some(true);
                     let turn = rec.get("turn").and_then(Value::as_u64).unwrap_or(0);
                     let raw_state = val.get("state").and_then(Value::as_str).unwrap_or("idle");
+                    let _ = fallback_state;
                     let (mapped_state, kind, summary) = if accepted {
                         let mapped = if rec_reported || job_reported {
                             match raw_state {
@@ -4983,9 +5014,16 @@ impl AppWindow {
                         let s = val.get("summary").and_then(Value::as_str).unwrap_or("").trim().to_owned();
                         (mapped, k, s)
                     } else {
-                        (fallback_state, String::new(), String::new())
+                        // AI evaluated the screen (`usedAi == true`) and did NOT confirm a blocking question/error:
+                        // keep it in the completed/idle path rather than falling back to a false "blocked" state.
+                        let non_blocked = if (rec_reported || job_reported) && core_state == Some("done") {
+                            "done"
+                        } else {
+                            "idle"
+                        };
+                        (non_blocked, String::new(), String::new())
                     };
-                    let allow_digest = accepted && !(mapped_state == "idle" && turn == 0 && typed_at.is_none());
+                    let allow_digest = accepted && !(raw_state == "idle" && turn == 0 && typed_at.is_none());
                     let semantic_title = if allow_digest {
                         val.get("semanticTitle").and_then(Value::as_str).unwrap_or("").trim().to_owned()
                     } else {
@@ -5009,6 +5047,7 @@ impl AppWindow {
                         working_rechecks: next_rechecks,
                     };
                     this.ai_terminal_states.insert(addr.clone(), verdict);
+                    let child = rec.get("parent").and_then(Value::as_str).is_some_and(|p| !p.is_empty());
                     if let Some(obj) = this.live.get_mut(&addr).and_then(Value::as_object_mut) {
                         obj.insert("status".into(), Value::String(mapped_state.to_owned()));
                         obj.insert(
@@ -5031,9 +5070,28 @@ impl AppWindow {
                         .get(&addr)
                         .and_then(|r| r.pointer("/program/key").and_then(Value::as_str))
                         .map(str::to_owned);
+                    let looking = this.visible_addresses().iter().any(|x| x == &addr) && this.window_active;
+                    let prev_word = this.model.agents.get(&addr).and_then(|a| a.word.clone());
+                    let prev_status = this.model.status(&addr);
+                    let already_acknowledged =
+                        output_at.is_some_and(|out| this.acknowledged_output_at.get(&addr) == Some(&out));
+                    if let Some(alert) =
+                        this.model.alert_for(&addr, child, prev_word.as_deref(), Some(mapped_state), looking)
+                    {
+                        this.pending_ai_alerts.push((addr.clone(), alert));
+                    }
                     let word_changed = this.model.set_word(&addr, Some(mapped_state.to_owned()), app, false);
-                    if !word_changed && !rec_reported && accepted && raw_state == "done" && allow_digest {
-                        this.model.mark_unseen(&addr);
+                    if !word_changed
+                        && !rec_reported
+                        && accepted
+                        && raw_state == "done"
+                        && allow_digest
+                        && !already_acknowledged
+                        && this.model.mark_unseen(&addr)
+                        && prev_status != Some("done")
+                        && let Some(alert) = this.model.alert_for(&addr, child, Some("working"), Some("idle"), looking)
+                    {
+                        this.pending_ai_alerts.push((addr.clone(), alert));
                     }
                     mods::publish_terminals(this.ordered_live_values());
                     this.publish(cx);
@@ -5806,6 +5864,8 @@ impl AppWindow {
             }
         }
         self.ai_terminal_states.retain(|a, _| self.live.contains_key(a));
+        self.acknowledged_output_at.retain(|a, _| self.live.contains_key(a));
+        self.pending_ai_alerts.retain(|(a, _)| self.live.contains_key(a));
         self.ai_last_attempt.retain(|a, _| self.live.contains_key(a));
         self.ai_digest_attempted.retain(|a, _| self.live.contains_key(a));
         self.last_agent_titles.retain(|a, _| self.live.contains_key(a));
@@ -5837,6 +5897,7 @@ impl AppWindow {
                 }
             } else if is_shell_prog {
                 self.ai_terminal_states.remove(&addr);
+                self.acknowledged_output_at.remove(&addr);
                 self.ai_digest_attempted.remove(&addr);
                 let had_manual_label = self
                     .live
@@ -5900,7 +5961,14 @@ impl AppWindow {
         // listing is ours, and must ring.
         let mut changed = self.reconcile(window, cx);
         let visible: HashSet<String> = self.visible_addresses().into_iter().collect();
-        let mut alerts = Vec::new();
+        let mut alerts: Vec<(String, model::Alert, bool)> = std::mem::take(&mut self.pending_ai_alerts)
+            .into_iter()
+            .filter(|(addr, _)| self.live.contains_key(addr) && !self.closing_terminals.contains_key(addr))
+            .map(|(addr, alert)| {
+                let looking = visible.contains(&addr) && self.window_active;
+                (addr, alert, looking)
+            })
+            .collect();
         let addrs: Vec<String> = self.live.keys().cloned().collect();
         let mut republished = false;
         let mut manual_released = false;
@@ -7177,6 +7245,7 @@ impl AppWindow {
             return;
         }
         let is_acp = is_acp_addr(&address);
+        let should_mark_viewed = matches!(&change, TerminalChange::Keep { focus: true, .. });
         match change {
             TerminalChange::Keep { space, tab, pane, name, target, axis, create_space, focus } => {
                 if !self.live.contains_key(&address) { return; }
@@ -7223,7 +7292,11 @@ impl AppWindow {
             }
         }
         if !self.draining {
-            self.sync(window, cx);
+            if should_mark_viewed {
+                self.sync(window, cx);
+            } else {
+                self.sync_without_marking_seen(window, cx);
+            }
             self.flush_documents(false, window, cx);
         }
     }
@@ -13202,8 +13275,14 @@ impl Render for AppWindow {
                     }
                 }
             }))
-            .capture_key_down(cx.listener(|this, _ev: &KeyDownEvent, _, cx| {
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _, cx| {
                 if !this.window_active || this.overlays.iter().any(|o| o.kind.modal_keys() || o.kind == OverlayKind::Popup) {
+                    return;
+                }
+                if matches!(
+                    ev.keystroke.key.as_str(),
+                    "shift" | "control" | "alt" | "platform" | "super" | "capslock" | "fn"
+                ) {
                     return;
                 }
                 let viewed = this.viewed_addresses();

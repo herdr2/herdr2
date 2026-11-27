@@ -2409,8 +2409,27 @@ fn is_polite_pty_signoff(line: &str) -> bool {
         "还有什么问题吗",
         "有其他问题吗",
         "有其他需要吗",
+        "有什么其他需要",
         "随时告诉我",
         "随时联系我",
+        "欢迎随时",
+        "如有问题",
+        "如果有问题",
+        "如有任何问题",
+        "有问题请",
+        "如有需要",
+        "如果有需要",
+        "如有其他",
+        "需要调整请",
+        "请随时",
+        "请查看",
+        "请查收",
+        "请查阅",
+        "请确认效果",
+        "请确认是否正常",
+        "你可以运行",
+        "您可以运行",
+        "可以直接运行",
     ];
     if ZH_SIGNOFFS.iter().any(|p| line.contains(p)) {
         return true;
@@ -2421,10 +2440,82 @@ fn is_polite_pty_signoff(line: &str) -> bool {
         "how else can i help",
         "can i help you with anything",
         "let me know if you need anything",
+        "let me know if you'd like anything",
+        "let me know if you want any",
+        "let me know if you'd like any",
+        "let me know if there",
+        "please let me know if",
+        "if you have any questions",
+        "if you need any adjustments",
+        "if you'd like any adjustments",
         "feel free to ask",
+        "feel free to let me know",
         "happy to help",
     ];
     EN_SIGNOFFS.iter().any(|p| low.contains(p))
+}
+
+fn pty_tail_announces_completion(content: &[&str]) -> bool {
+    const ZH_DONE: &[&str] = &[
+        "已完成",
+        "已经完成",
+        "改完了",
+        "修改完毕",
+        "修复完成",
+        "已修复",
+        "已实现",
+        "已更新",
+        "全部通过",
+        "验证通过",
+        "测试通过",
+    ];
+    const EN_DONE: &[&str] = &[
+        "all tests pass",
+        "tests pass",
+        "changes are complete",
+        "implementation is complete",
+        "implemented and verified",
+        "successfully updated",
+        "successfully fixed",
+        "i've completed",
+        "i have completed",
+    ];
+    content.iter().any(|line| {
+        let low = line.to_ascii_lowercase();
+        ZH_DONE.iter().any(|p| line.contains(p)) || EN_DONE.iter().any(|p| low.contains(p))
+    })
+}
+
+fn pty_is_optional_followup_offer(content: &[&str], line: &str) -> bool {
+    if !pty_tail_announces_completion(content) {
+        return false;
+    }
+    let low = line.to_ascii_lowercase();
+    const ZH_OFFERS: &[&str] = &[
+        "需要我顺便",
+        "要不要顺便",
+        "需要顺便",
+        "是否需要顺便",
+        "需要帮你提交",
+        "需要我提交",
+        "要不要帮你提交",
+        "需要我帮你跑",
+        "要不要跑一下",
+    ];
+    if ZH_OFFERS.iter().any(|p| line.contains(p)) {
+        return true;
+    }
+    const EN_OFFERS: &[&str] = &[
+        "would you like me to commit",
+        "would you like me to push",
+        "would you like me to also",
+        "want me to commit",
+        "want me to push",
+        "want me to also",
+        "shall i commit",
+        "should i also commit",
+    ];
+    EN_OFFERS.iter().any(|p| low.contains(p))
 }
 
 fn pty_line_ends_with_question(line: &str) -> bool {
@@ -2446,17 +2537,18 @@ fn pty_has_decision_request(line: &str) -> bool {
     let low = line.to_ascii_lowercase();
     const ZH_CUES: &[&str] = &[
         "请选择",
-        "请确认",
         "请先确认",
         "请先选择",
         "请你选择",
         "请你确认",
-        "请告知",
-        "请告诉我",
-        "请回复",
+        "请确认是否",
+        "请确认要",
+        "请确认哪",
+        "请确认目",
         "请决定",
         "请指定",
         "请提供",
+        "请补充",
         "等你确认",
         "等你决定",
         "等你回复",
@@ -2468,8 +2560,6 @@ fn pty_has_decision_request(line: &str) -> bool {
         "告诉我你的选择",
         "你更倾向",
         "您更倾向",
-        "你希望",
-        "您希望",
         "回复数字",
         "回复编号",
         "输入编号",
@@ -2481,22 +2571,15 @@ fn pty_has_decision_request(line: &str) -> bool {
         "please choose",
         "please select",
         "please confirm",
-        "please let me know",
         "please specify",
         "please clarify",
         "please provide",
         "please decide",
-        "please reply",
         "choose an option",
         "select an option",
         "pick an option",
         "pick one",
-        "reply with",
         "let me know which",
-        "let me know how you'd like",
-        "let me know how you would like",
-        "let me know if you want me to",
-        "let me know if you'd like me to",
         "tell me which",
         "waiting for your confirmation",
         "waiting for your input",
@@ -2505,6 +2588,142 @@ fn pty_has_decision_request(line: &str) -> bool {
         "before proceeding",
     ];
     EN_CUES.iter().any(|p| low.contains(p))
+}
+
+fn pty_is_explicit_choice_header(line: &str) -> bool {
+    let t = line.trim();
+    if !(t.ends_with(':') || t.ends_with('：')) {
+        return false;
+    }
+    let low = t.to_ascii_lowercase();
+    const ZH_HEADERS: &[&str] = &[
+        "可选方案",
+        "候选方案",
+        "以下方案",
+        "两种方案",
+        "三种方案",
+        "几种方案",
+        "可选项",
+        "以下选项",
+    ];
+    if ZH_HEADERS.iter().any(|p| t.contains(p))
+        && !t.contains("已完成")
+        && !t.contains("已实现")
+        && !t.contains("已修改")
+        && !t.contains("已修复")
+    {
+        return true;
+    }
+    const EN_HEADERS: &[&str] = &[
+        "options:",
+        "available options:",
+        "possible approaches:",
+        "two options:",
+        "three options:",
+    ];
+    EN_HEADERS.iter().any(|p| low.ends_with(p))
+}
+
+fn pty_is_short_choice_hint(line: &str) -> bool {
+    let t = line.trim();
+    let low = t.to_ascii_lowercase();
+    t.chars().count() <= 48
+        && ((t.starts_with('(') && t.ends_with(')'))
+            || (t.starts_with('（') && t.ends_with('）'))
+            || t.contains("推荐")
+            || t.contains("默认")
+            || t.contains("回复")
+            || low.contains("recommended")
+            || low.contains("default")
+            || low.contains("reply"))
+}
+
+fn pty_line_has_direct_ui_prompt(line: &str) -> bool {
+    let t = line.trim();
+    // Ignore diff / markdown quote / code-fence lines so code snippets mentioning `(y/n)` do not trigger.
+    if t.starts_with("```")
+        || t.starts_with("~~~")
+        || t.starts_with("+ ")
+        || t.starts_with("- ")
+        || t.starts_with("@@ ")
+    {
+        return false;
+    }
+    let l = t.to_ascii_lowercase();
+    l.contains("(y/n)")
+        || l.contains("[y/n]")
+        || l.contains("(yes/no)")
+        || l.contains("do you want to proceed")
+        || l.contains("do you want to allow")
+        || l.contains("allow once")
+        || l.contains("allow always")
+        || l.contains("yes, allow")
+        || l.contains("needs your approval")
+        || l.contains("waiting for approval")
+        || l.contains("approve this")
+        || l.contains("enter to select")
+        || l.contains("↑/↓ to navigate")
+        || l.contains("use arrow keys")
+        || l.contains("space to select")
+        || l.contains("select an option")
+        || t.contains("是否允许")
+        || t.contains("允许本次")
+        || t.contains("总是允许")
+        || t.contains("等待批准")
+        || t.contains("需要你的批准")
+        || t.contains("按回车确认")
+        || t.contains("按回车选择")
+        || t.contains("上下键选择")
+        || t.contains("方向键选择")
+}
+
+/// Returns true when the bottom of `tail_lines` shows an idle CLI input prompt/footer (meaning
+/// any interactive permission or picker widget higher up in scrollback has already resolved).
+fn has_bottom_idle_cli_prompt(tail_lines: &[String]) -> bool {
+    let non_empty: Vec<&str> = tail_lines.iter().map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    if non_empty.is_empty() {
+        return false;
+    }
+    let bottom4 = &non_empty[non_empty.len().saturating_sub(4)..];
+    if bottom4.iter().any(|line| pty_line_has_direct_ui_prompt(line)) {
+        return false;
+    }
+    let bottom5 = &non_empty[non_empty.len().saturating_sub(5)..];
+    bottom5.iter().any(|&t| {
+        let low = t.to_ascii_lowercase();
+        let prompt_rest = t
+            .strip_prefix('❯')
+            .or_else(|| t.strip_prefix('›'))
+            .or_else(|| t.strip_prefix('>'))
+            .map(str::trim);
+        if let Some(rest) = prompt_rest {
+            let rlow = rest.to_ascii_lowercase();
+            if rest.is_empty()
+                || rlow.starts_with("try \"")
+                || rlow.starts_with("type a prompt")
+                || rlow.starts_with("ready for your next prompt")
+                || rlow.starts_with("ask anything")
+                || rest.starts_with("输入")
+            {
+                return true;
+            }
+        }
+        if t.starts_with('│') && t.ends_with('│') {
+            let inner = t.trim_matches('│').trim().to_ascii_lowercase();
+            if inner.is_empty()
+                || inner == ">"
+                || inner == "❯"
+                || inner.starts_with("type a prompt")
+                || inner.starts_with("ask anything")
+            {
+                return true;
+            }
+        }
+        low.contains("? for shortcuts")
+            || low.contains("shift+tab")
+            || low.contains("context left")
+            || low.contains("tokens left")
+    })
 }
 
 fn pty_is_option_line(line: &str) -> bool {
@@ -2536,56 +2755,36 @@ pub(crate) enum QuietBlockConfidence {
 
 /// Classifies whether a quiet PTY screen tail needs user confirmation/choice and at what confidence tier.
 pub(crate) fn classify_quiet_tail_confirmation(tail_lines: &[String]) -> QuietBlockConfidence {
-    // 1. Direct tool permission & interactive picker UI cues (checked on raw tail).
-    let has_direct_ui_prompt = tail_lines.iter().any(|line| {
-        let l = line.to_ascii_lowercase();
-        l.contains("(y/n)")
-            || l.contains("[y/n]")
-            || l.contains("(yes/no)")
-            || l.contains("do you want to proceed")
-            || l.contains("do you want to allow")
-            || l.contains("allow once")
-            || l.contains("allow always")
-            || l.contains("yes, allow")
-            || l.contains("needs your approval")
-            || l.contains("waiting for approval")
-            || l.contains("approve this")
-            || l.contains("enter to select")
-            || l.contains("↑/↓ to navigate")
-            || l.contains("use arrow keys")
-            || l.contains("space to select")
-            || l.contains("select an option")
-            || line.contains("是否允许")
-            || line.contains("允许本次")
-            || line.contains("总是允许")
-            || line.contains("等待批准")
-            || line.contains("需要你的批准")
-            || line.contains("按回车确认")
-            || line.contains("按回车选择")
-            || line.contains("上下键选择")
-            || line.contains("方向键选择")
-    });
-    if has_direct_ui_prompt {
-        return QuietBlockConfidence::ExplicitPrompt;
-    }
+    let idle_prompt_at_bottom = has_bottom_idle_cli_prompt(tail_lines);
+    if !idle_prompt_at_bottom {
+        let non_empty: Vec<&str> = tail_lines.iter().map(String::as_str).filter(|l| !l.trim().is_empty()).collect();
+        // 1. Direct tool permission & interactive picker UI cues in the active bottom region.
+        let bottom6 = &non_empty[non_empty.len().saturating_sub(6)..];
+        if bottom6.iter().any(|line| pty_line_has_direct_ui_prompt(line)) {
+            return QuietBlockConfidence::ExplicitPrompt;
+        }
 
-    // 2. Interactive numbered choice picker with cursor marker (e.g. `❯ 1. ...` + `2. ...`).
-    let has_cursor_numbered = tail_lines.iter().any(|line| {
-        let t = line.trim_start();
-        let after = t
-            .strip_prefix('❯')
-            .or_else(|| t.strip_prefix('›'))
-            .or_else(|| t.strip_prefix('●'))
-            .or_else(|| t.strip_prefix('◉'))
-            .map(str::trim_start);
-        after.is_some_and(|rest| {
-            let b = rest.as_bytes();
+        // 2. Interactive numbered choice picker with cursor marker (`❯ 1. ...` + unselected `2. ...`) at the bottom.
+        let bottom8 = &non_empty[non_empty.len().saturating_sub(8)..];
+        let is_cursor_numbered = |line: &str| -> bool {
+            let t = line.trim_start();
+            let after = t.strip_prefix('❯').or_else(|| t.strip_prefix('›')).map(str::trim_start);
+            after.is_some_and(|rest| {
+                let b = rest.as_bytes();
+                b.len() >= 2 && b[0].is_ascii_digit() && matches!(b[1], b'.' | b')')
+            })
+        };
+        let is_unselected_numbered = |line: &str| -> bool {
+            let t = line.trim_start();
+            if t.starts_with('❯') || t.starts_with('›') {
+                return false;
+            }
+            let b = t.as_bytes();
             b.len() >= 2 && b[0].is_ascii_digit() && matches!(b[1], b'.' | b')')
-        })
-    });
-    let numbered_count = tail_lines.iter().filter(|l| pty_is_option_line(l)).count();
-    if has_cursor_numbered && numbered_count >= 2 {
-        return QuietBlockConfidence::ExplicitPrompt;
+        };
+        if bottom8.iter().any(|l| is_cursor_numbered(l)) && bottom8.iter().any(|l| is_unselected_numbered(l)) {
+            return QuietBlockConfidence::ExplicitPrompt;
+        }
     }
 
     // 3. Conversational tail above TUI chrome/input box: question or choice request.
@@ -2598,23 +2797,54 @@ pub(crate) fn classify_quiet_tail_confirmation(tail_lines: &[String]) -> QuietBl
     let Some(&last) = content.last() else {
         return QuietBlockConfidence::None;
     };
-    if !is_polite_pty_signoff(last) && (pty_line_ends_with_question(last) || pty_has_decision_request(last)) {
+    let is_blocking_q = |line: &str| -> bool {
+        !is_polite_pty_signoff(line)
+            && !pty_is_optional_followup_offer(&content, line)
+            && (pty_line_ends_with_question(line) || pty_has_decision_request(line))
+    };
+    if is_blocking_q(last) {
         return QuietBlockConfidence::AmbiguousText;
     }
-    // Question or choice prompt paired with >= 2 option lines in the content tail.
-    let content_opts = content.iter().filter(|l| pty_is_option_line(l)).count();
-    if content_opts >= 2
-        && content.iter().rev().take(12).any(|&line| {
-            !pty_is_option_line(line)
-                && !is_polite_pty_signoff(line)
-                && (pty_line_ends_with_question(line)
-                    || pty_has_decision_request(line)
-                    || line.contains("方案")
-                    || line.contains("选项")
-                    || line.contains("选择"))
-        })
+
+    // Question within the last 3 content lines followed only by options or short hints.
+    let recent_start = content.len().saturating_sub(3);
+    for idx in (recent_start..content.len().saturating_sub(1)).rev() {
+        let line = content[idx];
+        if is_blocking_q(line)
+            && content[idx + 1..].iter().all(|after| pty_is_option_line(after) || pty_is_short_choice_hint(after))
+        {
+            return QuietBlockConfidence::AmbiguousText;
+        }
+    }
+
+    // Contiguous trailing option list (>= 2 choices at the bottom of content) immediately
+    // preceded by a question or explicit choice prompt (never matching completed numbered summaries).
+    let mut end_idx = content.len();
+    while end_idx > 0
+        && (pty_is_short_choice_hint(content[end_idx - 1]) || is_polite_pty_signoff(content[end_idx - 1]))
     {
-        return QuietBlockConfidence::AmbiguousText;
+        end_idx -= 1;
+    }
+    let mut opt_start = end_idx;
+    while opt_start > 0 && pty_is_option_line(content[opt_start - 1]) {
+        opt_start -= 1;
+    }
+    if end_idx.saturating_sub(opt_start) >= 2 && opt_start > 0 {
+        for idx in (opt_start.saturating_sub(2)..opt_start).rev() {
+            let intro = content[idx];
+            if pty_is_option_line(intro)
+                || is_polite_pty_signoff(intro)
+                || pty_is_optional_followup_offer(&content, intro)
+            {
+                continue;
+            }
+            if pty_line_ends_with_question(intro)
+                || pty_has_decision_request(intro)
+                || pty_is_explicit_choice_header(intro)
+            {
+                return QuietBlockConfidence::AmbiguousText;
+            }
+        }
     }
     QuietBlockConfidence::None
 }
@@ -6434,6 +6664,38 @@ mod tests {
             super::classify_quiet_tail_confirmation(&completed_with_footer),
             super::QuietBlockConfidence::None
         );
+
+        // 11. User's numbered prompt in scrollback + completed assistant reply + idle prompt -> NOT blocked!
+        let user_numbered_in_scrollback = vec![
+            "❯ 1. 修复状态判断误报".to_owned(),
+            "  2. 补充回归测试".to_owned(),
+            "⏺ 按照上述方案已完成修改：".to_owned(),
+            "  1. 仅在向用户提问时标为待确认".to_owned(),
+            "  2. 确认全部单元测试通过".to_owned(),
+            "────────────────────────────────────────".to_owned(),
+            "❯ ".to_owned(),
+            "  ? for shortcuts".to_owned(),
+        ];
+        assert_eq!(
+            super::classify_quiet_tail_confirmation(&user_numbered_in_scrollback),
+            super::QuietBlockConfidence::None
+        );
+        assert_eq!(super::infer_pty_agent_state("", false, true, &user_numbered_in_scrollback), "idle");
+
+        // 12. Codex bullet summary (`● 1. ...`) + diff line with `(y/n)` + optional commit offer -> NOT blocked!
+        let codex_done_with_diff_and_offer = vec![
+            "+ if prompt.contains(\"(y/n)\") { return true; }".to_owned(),
+            "● 1. 已完成终端状态判断优化".to_owned(),
+            "  2. 所有测试验证通过，需要我顺便提交 git commit 吗？".to_owned(),
+            "".to_owned(),
+            "› ".to_owned(),
+            "  94% context left · ? for shortcuts".to_owned(),
+        ];
+        assert_eq!(
+            super::classify_quiet_tail_confirmation(&codex_done_with_diff_and_offer),
+            super::QuietBlockConfidence::None
+        );
+        assert_eq!(super::infer_pty_agent_state("", false, true, &codex_done_with_diff_and_offer), "idle");
     }
 
     #[gpui::test]

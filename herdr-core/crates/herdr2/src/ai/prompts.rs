@@ -31,21 +31,22 @@ Purpose: Pin static background context (such as a Drove Run's objective, workspa
 Output JSON: {"ack":true}
 
 [OP: pty_status]
-Purpose: Arbitrate the true execution state of an interactive CLI coding agent running inside a pseudo-terminal when deterministic heuristics saw a quiet screen and could not be certain.
-Input fields: `program` (optional CLI name), `raw_title` (terminal title), `tail` (cleaned bottom lines of the terminal screen).
+Purpose: Arbitrate the true execution state of a coding agent (interactive PTY CLI screen or finished ACP assistant turn).
+Input fields: `program` (optional CLI/agent name), `raw_title` (terminal title or turn context), `tail` (cleaned trailing lines).
 State taxonomy:
 - "working": Agent is actively thinking, streaming, waiting on a long tool/build, or showing an active progress/thinking indicator (e.g., "Thinking...", "Running tests", "Searching", spinner/timer).
-- "blocked": Agent stopped and requires human input right now. Set `kind` to:
-  - "permission": Asking to approve/deny a tool call, shell command, or file edit (including numbered option menus or Chinese/English confirmation prompts).
-  - "question": Asking the user a clarifying question, choice between approaches, or interactive selection menu.
+- "blocked": Agent stopped and genuinely requires user input/decision right now BEFORE it can proceed. Set `kind` to:
+  - "permission": Asking to approve/deny a tool call, shell command, or file edit (live `[y/n]`, `Allow once`, or interactive cursor picker at the very bottom).
+  - "question": Agent paused to ask the user a clarifying question, ask the user to choose between approaches/options, or request missing required confirmation/parameters before acting.
   - "auth": Requesting login, OAuth, API key, or credential renewal.
 - "error": Agent halted due to an unrecovered error (API 429/rate limit, network timeout, quota exhausted, crash traceback, fatal CLI failure).
-- "done": Agent clearly completed its turn and returned to an idle input prompt after producing a final answer or summary.
-- "idle": Empty/fresh prompt with no active work, error, or question.
+- "done": Agent completed its task/answer without asking a blocking question (including numbered/bulleted change summaries, self-answered rhetorical questions, or completed replies ending with polite sign-offs/optional follow-up offers like "Anything else?", "如有问题请告诉我", "请查看/确认效果", "Would you like me to also commit/test?", "需要我顺便提交吗？").
+- "idle": Empty/fresh welcome prompt with no completed task output, active work, error, or question.
 Rules:
+- Set "blocked" ONLY when the agent genuinely asks the user a question or awaits approval to proceed; if the agent already finished the requested task, ALWAYS return "done" (never "blocked"), even if it ends with an optional courtesy offer or numbered summary, or if older resolved prompts appear higher in scrollback above an idle prompt.
 - Distinguish actual prompts at the bottom from code snippets or documentation quoted earlier in the screen.
-- Keep `summary` under 20 characters (Chinese) or 40 characters (English), describing specifically what is awaited or failed; set null when `idle`/`done`.
-- Optionally include `semantic_title` (<= 12 zh / <= 24 en chars) and `micro_summary` (<= 42 zh / <= 90 en chars) for an active task; null when `idle` on a welcome screen or "Recent activity" list.
+- Keep `summary` under 20 characters (Chinese) or 40 characters (English), describing specifically what question/approval is awaited or what failed; set null when `idle`/`done`.
+- Optionally include `semantic_title` (<= 12 zh / <= 24 en chars) and `micro_summary` (<= 42 zh / <= 90 en chars) for an active or completed task; null when `idle` on a welcome screen or "Recent activity" list.
 Output JSON: {"state":"working|blocked|done|error|idle","kind":"permission|question|auth|null","confidence":0.0,"summary":"...|null","semantic_title":"...|null","micro_summary":"...|null"}
 
 [OP: notes_digest]
@@ -208,7 +209,7 @@ pub fn op_expects_json(op: &str) -> bool {
 pub fn compact_system_for_op(op: &str) -> &'static str {
     match op {
         "pty_status" => {
-            "Pure text JSON classifier (no tools). Classify CLI terminal screen into {\"state\":\"working|blocked|done|error|idle\",\"kind\":\"permission|question|auth|null\",\"confidence\":0.0,\"summary\":\"<=20 chars|null\"}. Reply JSON only."
+            "Pure text JSON classifier (no tools). Classify coding agent state into {\"state\":\"working|blocked|done|error|idle\",\"kind\":\"permission|question|auth|null\",\"confidence\":0.0,\"summary\":\"<=20 chars|null\"}. Set \"blocked\" ONLY when agent genuinely asks user a blocking question/choice or tool approval; if task is completed (even with numbered summary or polite optional offer), return \"done\". Reply JSON only."
         }
         "notes_digest" => {
             "Pure text JSON summarizer (no tools). Summarize child agent error/exit output as {\"root_cause\":\"1 sentence\",\"files\":[\"...\"],\"next_step\":\"concise action\"}. Reply JSON only."

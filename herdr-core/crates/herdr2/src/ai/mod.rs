@@ -523,6 +523,11 @@ impl AiRuntime {
         key.is_some() || allows_keyless_url(&cfg.base_url)
     }
 
+    pub fn status_arbitration_enabled(&self) -> bool {
+        let cfg = self.config_snapshot();
+        cfg.enabled && cfg.pty_status_arbitration && self.is_configured() && !self.is_circuit_open()
+    }
+
     pub fn notes_digest_enabled(&self) -> bool {
         let cfg = self.config_snapshot();
         cfg.enabled && cfg.notes_digest && self.is_configured() && !self.is_circuit_open()

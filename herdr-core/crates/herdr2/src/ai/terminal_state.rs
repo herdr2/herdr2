@@ -93,8 +93,7 @@ pub async fn classify_terminal_state(
     ai: &AiRuntime,
     params: ClassifyTerminalStateParams,
 ) -> ClassifyTerminalStateResult {
-    let cfg = ai.config_snapshot();
-    if !cfg.enabled || !cfg.pty_status_arbitration || cfg.base_url.trim().is_empty() || ai.is_circuit_open() {
+    if !ai.status_arbitration_enabled() {
         return ClassifyTerminalStateResult::default();
     }
 
@@ -166,12 +165,13 @@ pub async fn classify_acp_turn_state(
     assistant_text: &str,
     language: Option<&str>,
 ) -> ClassifyTerminalStateResult {
-    let cfg = ai.config_snapshot();
-    if !cfg.enabled || !cfg.pty_status_arbitration || cfg.base_url.trim().is_empty() || ai.is_circuit_open() {
+    if !ai.status_arbitration_enabled() {
         return ClassifyTerminalStateResult::default();
     }
 
-    let compact_tail = strip_and_dedup_lines(assistant_text, 18, 220, 2000);
+    let stripped = crate::status::strip_fenced_code_blocks(assistant_text);
+    let prose_source = if stripped.trim().is_empty() { assistant_text } else { stripped.as_str() };
+    let compact_tail = strip_and_dedup_lines(prose_source, 24, 220, 2200);
     if compact_tail.trim().is_empty() {
         return ClassifyTerminalStateResult::default();
     }
@@ -183,7 +183,7 @@ pub async fn classify_acp_turn_state(
 
     let payload = json!({
         "program": prog,
-        "raw_title": "ACP turn finished: decide if final assistant reply completed the task (done) or stopped asking the user a question/choice/confirmation (blocked)",
+        "raw_title": "ACP turn finished: return blocked (kind=question) ONLY if the agent paused asking the user a question/choice to proceed; return done if the agent completed the task without asking a blocking question",
         "tail": compact_tail,
     });
     let user_prompt = format_op_user_message("pty_status", lang, &payload);

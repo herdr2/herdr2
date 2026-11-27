@@ -581,12 +581,11 @@ impl Core {
 
     /// Spawns a background Core AI arbitration pass after an ACP turn ends to verify or refine
     /// whether the assistant's final response is `done`/`idle` vs `blocked` (question/choice).
-    pub fn spawn_acp_status_ai(&self, id: u32, turn_num: u64) {
+    pub fn spawn_acp_status_ai(&self, id: u32, turn_num: u64, fallback_question: Option<String>) {
         let Some(core) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
             return;
         };
-        let cfg = self.ai.config_snapshot();
-        if !cfg.enabled || !cfg.pty_status_arbitration || cfg.base_url.trim().is_empty() || self.ai.is_circuit_open() {
+        if !self.ai.status_arbitration_enabled() {
             return;
         }
         let snapshot = {
@@ -624,12 +623,6 @@ impl Core {
                 Some(if is_zh { "zh" } else { "en" }),
             )
             .await;
-            if !verdict.used_ai || !verdict.accepted {
-                return;
-            }
-            let Some(ai_state) = verdict.state.as_deref() else {
-                return;
-            };
             let mut st = core.lock();
             let Some(a) = st.reg.agents.get(&id).filter(|a| a.is_live()) else {
                 return;
@@ -644,6 +637,32 @@ impl Core {
             }
             let cur_state = a.status.as_ref().map(|s| s.state.as_str()).unwrap_or("idle");
             let cur_msg = a.status.as_ref().map(|s| s.msg.as_str()).unwrap_or("");
+            if !verdict.used_ai {
+                if let Some(msg) = fallback_question
+                    && cur_state != "blocked"
+                {
+                    core.apply_status(
+                        &mut st,
+                        id,
+                        &crate::status::StatusReport {
+                            state: "blocked",
+                            kind: Some("question"),
+                            message: msg,
+                            ..crate::status::StatusReport::root("blocked")
+                        },
+                    );
+                }
+                return;
+            }
+            if !verdict.accepted {
+                if cur_state == "blocked" {
+                    core.apply_status(&mut st, id, &crate::status::StatusReport::root("idle"));
+                }
+                return;
+            }
+            let Some(ai_state) = verdict.state.as_deref() else {
+                return;
+            };
             match ai_state {
                 "blocked" => {
                     let kind = match verdict.kind.as_deref() {

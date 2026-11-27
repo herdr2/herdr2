@@ -1598,13 +1598,23 @@ async fn ai_briefing(core: Ctx<'_>, p: crate::ai::BriefingParams) -> Result<crat
             if !a.is_live() || a.labels.get("herdr.trashed").is_some_and(|s| !s.is_empty()) {
                 continue;
             }
-            let status = a
+            let manual_override = a
                 .labels
                 .get("herdr.status")
-                .filter(|s| !s.trim().is_empty())
-                .cloned()
-                .or_else(|| a.status.as_ref().map(|s| s.state.clone()))
-                .unwrap_or_else(|| "idle".into());
+                .and_then(|s| s.split('@').next())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            let status = manual_override.unwrap_or_else(|| {
+                let raw = a.status.as_ref().map(|s| s.state.as_str()).unwrap_or("idle");
+                let unseen_done = raw == "idle"
+                    && a.turn > 0
+                    && a.labels
+                        .get("herdr.seen")
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .is_some_and(|seen| a.turn > seen);
+                if unseen_done { "done".into() } else { raw.to_string() }
+            });
             let display_name = a
                 .labels
                 .get("herdr.name")
@@ -1689,8 +1699,10 @@ async fn ai_briefing(core: Ctx<'_>, p: crate::ai::BriefingParams) -> Result<crat
             let Some(status) = t
                 .labels
                 .get("herdr.status")
-                .filter(|s| !s.trim().is_empty())
-                .cloned()
+                .and_then(|s| s.split('@').next())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
                 .or_else(|| t.status.as_ref().map(|s| s.state.clone()))
             else {
                 continue;

@@ -113,3 +113,124 @@ fn question_blocked_acp_session_accepts_reply_and_transitions_to_working() {
     let out = text(&s, &a);
     assert!(out.contains("slept:600") && out.contains("仅修改当前项目"), "{out}");
 }
+
+#[test]
+fn completed_turn_without_question_is_done_not_blocked_and_ai_arbitrates_questions() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let s = Session::new();
+
+    // 1. Completed task with numbered summary + "确认" + optional courtesy offer -> NOT blocked;
+    //    when unread (`herdr.seen=0`), `ai.briefing` surfaces it as `done` (`readyToReview`).
+    let done_agent = run_fake(
+        &s,
+        &[
+            "--prompt",
+            "按照上述方案已完成重构：\n1. 优化了状态判断逻辑\n2. 补充单测并确认全部通过\n需要我顺便提交一下 git commit 吗？",
+        ],
+    );
+    wait_until("completed turn finishes in idle without false blocked", || {
+        let g = get(&s, &done_agent);
+        g["turn"].as_u64().is_some_and(|t| t >= 1) && g["status"]["state"] == "idle"
+    });
+    s.json(&["label", &done_agent, "herdr.seen=0"]);
+    let mut conn = s.connect();
+    let briefing = conn.call(1, "ai.briefing", serde_json::json!({ "language": "zh-CN" }));
+    assert!(
+        briefing["result"]["readyToReview"]
+            .as_array()
+            .is_some_and(|arr| arr.iter().any(|it| it["address"] == done_agent && it["status"] == "done")),
+        "expected unread completed agent in readyToReview as done: {briefing}"
+    );
+
+    // 2. Configure local mock AI server:
+    //    - Answers `GET /v1/models` during `ai.settings.set`
+    //    - Chat call 1 returns `done` (prevents false `blocked` on ambiguous "?" text)
+    //    - Chat call 2 returns `blocked` (`kind = question`) for a subtle non-"?" question
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = std::thread::spawn(move || {
+        let mut chat_replies = std::collections::VecDeque::from([
+            r#"{"choices":[{"message":{"content":"{\"state\":\"done\",\"kind\":null,\"confidence\":0.96,\"summary\":null}"}}]}"#,
+            r#"{"choices":[{"message":{"content":"{\"state\":\"blocked\",\"kind\":\"question\",\"confidence\":0.94,\"summary\":\"询问部署目标环境\"}"}}]}"#,
+        ]);
+        while !chat_replies.is_empty() {
+            let Ok((mut stream, _)) = listener.accept() else { break };
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let mut header_end = None;
+            let mut content_len = 0usize;
+            while let Ok(n) = stream.read(&mut tmp) {
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if header_end.is_none()
+                    && let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n")
+                {
+                    header_end = Some(pos + 4);
+                    let head = String::from_utf8_lossy(&buf[..pos]);
+                    for line in head.lines() {
+                        if let Some((k, v)) = line.split_once(':')
+                            && k.trim().eq_ignore_ascii_case("content-length")
+                        {
+                            content_len = v.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                if let Some(he) = header_end
+                    && buf.len() >= he + content_len
+                {
+                    break;
+                }
+            }
+            let req_line = String::from_utf8_lossy(&buf[..buf.iter().position(|b| *b == b'\r').unwrap_or(buf.len())]);
+            let body = if req_line.starts_with("GET ") && req_line.contains("/models") {
+                r#"{"data":[{"id":"mock-nano"}]}"#
+            } else {
+                chat_replies.pop_front().unwrap_or("{}")
+            };
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = stream.write_all(resp.as_bytes());
+        }
+    });
+
+    let set_ai = conn.call(
+        2,
+        "ai.settings.set",
+        serde_json::json!({
+            "enabled": true,
+            "baseUrl": format!("http://{addr}/v1"),
+            "model": "mock-nano",
+            "ptyStatusArbitration": true,
+            "semanticSummary": false,
+            "checkpointLabeling": false,
+            "notesDigest": false,
+        }),
+    );
+    assert!(set_ai.get("error").is_none(), "{set_ai}");
+
+    // Ambiguous trailing "?" that AI judges as completed (`done`) never lands in `blocked`.
+    let a_done = run_fake(&s, &["--prompt", "为什么之前报错？因为空指针，现已彻底修复！还需要看下别的吗？"]);
+    wait_until("AI-arbitrated completed turn settles in idle", || {
+        let g = get(&s, &a_done);
+        g["turn"].as_u64().is_some_and(|t| t >= 1) && g["status"]["state"] == "idle"
+    });
+
+    // Subtle non-"?" blocking question -> AI promotes turn to `blocked` (`kind = question`).
+    let a_ask = run_fake(&s, &["--prompt", "生产环境与预发环境配置不同，先等你拍板部署哪个环境我再继续执行。"]);
+    wait_until("AI-arbitrated question turn becomes blocked", || {
+        let g = get(&s, &a_ask);
+        g["turn"].as_u64().is_some_and(|t| t >= 1)
+            && g["status"]["state"] == "blocked"
+            && g["status"]["kind"] == "question"
+            && g["status"]["msg"] == "询问部署目标环境"
+    });
+
+    let _ = handle.join();
+}

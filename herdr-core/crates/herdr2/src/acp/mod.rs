@@ -1629,19 +1629,40 @@ fn finish_turn(core: &Core, id: u32, turn_num: u64, res: Result<Value, CallError
     }
     let mut turn_err = None;
     let mut turn_usage_detail = None;
+    let mut ai_fallback_question = None;
+    let mut arbitrate_with_ai = false;
     match res {
         Ok(val) => {
             turn_usage_detail = proto::extract_prompt_result_usage(&val);
             let _parsed: SessionPromptResult = serde_json::from_value(val).unwrap_or_default();
             let is_drove_worker = st.reg.agents.get(&id).is_some_and(|a| a.labels.contains_key("drove.worker"));
+            let entries = st.transcripts.get(&id).map(|t| t.entries()).unwrap_or(&[]);
+            let pending_q_tool = !is_drove_worker && crate::status::acp_turn_has_pending_question_tool(entries, turn_num);
             let question_summary = if is_drove_worker {
                 None
             } else {
-                st.transcripts
-                    .get(&id)
-                    .and_then(|t| crate::status::detect_acp_turn_needs_user_input(t.entries(), turn_num))
+                crate::status::detect_acp_turn_needs_user_input(entries, turn_num)
             };
-            if let Some(msg) = question_summary {
+            let has_assistant_text = !crate::status::acp_turn_assistant_text(entries, turn_num).trim().is_empty();
+            arbitrate_with_ai = !is_drove_worker
+                && !pending_q_tool
+                && has_assistant_text
+                && core.ai.status_arbitration_enabled();
+            if pending_q_tool {
+                core.apply_status(
+                    &mut st,
+                    id,
+                    &StatusReport {
+                        state: "blocked",
+                        kind: Some("question"),
+                        message: question_summary.unwrap_or_default(),
+                        ..StatusReport::root("blocked")
+                    },
+                );
+            } else if arbitrate_with_ai {
+                ai_fallback_question = question_summary;
+                core.apply_status(&mut st, id, &StatusReport::root("idle"));
+            } else if let Some(msg) = question_summary {
                 core.apply_status(
                     &mut st,
                     id,
@@ -1676,7 +1697,7 @@ fn finish_turn(core: &Core, id: u32, turn_num: u64, res: Result<Value, CallError
             );
         }
     }
-    let arbitrate_status = turn_err.is_none();
+    let arbitrate_status = turn_err.is_none() && arbitrate_with_ai;
     if let Some(a) = st.reg.agents.get(&id)
         && let Some(wid) = a.labels.get("drove.worker")
     {
@@ -1693,7 +1714,7 @@ fn finish_turn(core: &Core, id: u32, turn_num: u64, res: Result<Value, CallError
     drop(st);
     core.spawn_agent_digest_ai(id, Duration::from_secs(3));
     if arbitrate_status {
-        core.spawn_acp_status_ai(id, turn_num);
+        core.spawn_acp_status_ai(id, turn_num, ai_fallback_question);
     }
 }
 

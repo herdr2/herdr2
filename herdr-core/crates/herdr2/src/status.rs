@@ -402,8 +402,14 @@ pub fn detect_text_needs_user_input(text: &str) -> Option<String> {
     let tail = &lines[tail_start..];
     let last = *tail.last()?;
 
+    let is_blocking_question_line = |line: &str| -> bool {
+        !is_polite_signoff(line)
+            && !is_optional_followup_offer(tail, line)
+            && (line_ends_with_question(line) || has_explicit_decision_request(line))
+    };
+
     // 1. Last non-empty line is a direct question or explicit choice/confirmation request.
-    if !is_polite_signoff(last) && (line_ends_with_question(last) || has_explicit_decision_request(last)) {
+    if is_blocking_question_line(last) {
         return Some(compact_question_summary(last));
     }
 
@@ -411,23 +417,34 @@ pub fn detect_text_needs_user_input(text: &str) -> Option<String> {
     let recent_start = tail.len().saturating_sub(3);
     for idx in (recent_start..tail.len().saturating_sub(1)).rev() {
         let line = tail[idx];
-        if !is_polite_signoff(line)
-            && (line_ends_with_question(line) || has_explicit_decision_request(line))
+        if is_blocking_question_line(line)
             && tail[idx + 1..].iter().all(|after| is_option_list_line(after) || is_short_choice_hint(after))
         {
             return Some(compact_question_summary(line));
         }
     }
 
-    // 3. Trailing option list (>= 2 choices) preceded or followed by a question/choice prompt.
-    let opt_count = tail.iter().filter(|l| is_option_list_line(l)).count();
-    if opt_count >= 2 {
-        for &line in tail.iter().rev() {
-            if is_option_list_line(line) || is_polite_signoff(line) {
+    // 3. Contiguous trailing option list (>= 2 choices at the end of the reply) immediately
+    //    preceded by a question or explicit choice prompt (never matching completed numbered summaries).
+    let mut end_idx = tail.len();
+    while end_idx > 0 && (is_short_choice_hint(tail[end_idx - 1]) || is_polite_signoff(tail[end_idx - 1])) {
+        end_idx -= 1;
+    }
+    let mut opt_start = end_idx;
+    while opt_start > 0 && is_option_list_line(tail[opt_start - 1]) {
+        opt_start -= 1;
+    }
+    if end_idx.saturating_sub(opt_start) >= 2 && opt_start > 0 {
+        for idx in (opt_start.saturating_sub(2)..opt_start).rev() {
+            let intro = tail[idx];
+            if is_option_list_line(intro) || is_polite_signoff(intro) || is_optional_followup_offer(tail, intro) {
                 continue;
             }
-            if line_ends_with_question(line) || has_explicit_decision_request(line) || has_choice_intro_cue(line) {
-                return Some(compact_question_summary(line));
+            if line_ends_with_question(intro)
+                || has_explicit_decision_request(intro)
+                || is_explicit_choice_header(intro)
+            {
+                return Some(compact_question_summary(intro));
             }
         }
     }
@@ -435,7 +452,7 @@ pub fn detect_text_needs_user_input(text: &str) -> Option<String> {
     None
 }
 
-fn strip_fenced_code_blocks(text: &str) -> String {
+pub(crate) fn strip_fenced_code_blocks(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut in_fence = false;
     let mut fence_char = '`';
@@ -480,6 +497,23 @@ fn is_polite_signoff(line: &str) -> bool {
         "随时告诉我",
         "随时联系我",
         "欢迎随时",
+        "如有问题",
+        "如果有问题",
+        "如有任何问题",
+        "有问题请",
+        "如有需要",
+        "如果有需要",
+        "如有其他",
+        "需要调整请",
+        "请随时",
+        "请查看",
+        "请查收",
+        "请查阅",
+        "请确认效果",
+        "请确认是否正常",
+        "你可以运行",
+        "您可以运行",
+        "可以直接运行",
     ];
     if ZH_SIGNOFFS.iter().any(|p| line.contains(p)) {
         return true;
@@ -490,12 +524,82 @@ fn is_polite_signoff(line: &str) -> bool {
         "how else can i help",
         "can i help you with anything",
         "let me know if you need anything",
-        "let me know if you'd like anything else",
+        "let me know if you'd like anything",
+        "let me know if you want any",
+        "let me know if you'd like any",
+        "let me know if there",
+        "please let me know if",
+        "if you have any questions",
+        "if you need any adjustments",
+        "if you'd like any adjustments",
         "feel free to ask",
         "feel free to let me know",
         "happy to help",
     ];
     EN_SIGNOFFS.iter().any(|p| low.contains(p))
+}
+
+fn tail_announces_completion(tail: &[&str]) -> bool {
+    const ZH_DONE: &[&str] = &[
+        "已完成",
+        "已经完成",
+        "改完了",
+        "修改完毕",
+        "修复完成",
+        "已修复",
+        "已实现",
+        "已更新",
+        "全部通过",
+        "验证通过",
+        "测试通过",
+    ];
+    const EN_DONE: &[&str] = &[
+        "all tests pass",
+        "tests pass",
+        "changes are complete",
+        "implementation is complete",
+        "implemented and verified",
+        "successfully updated",
+        "successfully fixed",
+        "i've completed",
+        "i have completed",
+    ];
+    tail.iter().any(|line| {
+        let low = line.to_ascii_lowercase();
+        ZH_DONE.iter().any(|p| line.contains(p)) || EN_DONE.iter().any(|p| low.contains(p))
+    })
+}
+
+fn is_optional_followup_offer(tail: &[&str], line: &str) -> bool {
+    if !tail_announces_completion(tail) {
+        return false;
+    }
+    let low = line.to_ascii_lowercase();
+    const ZH_OFFERS: &[&str] = &[
+        "需要我顺便",
+        "要不要顺便",
+        "需要顺便",
+        "是否需要顺便",
+        "需要帮你提交",
+        "需要我提交",
+        "要不要帮你提交",
+        "需要我帮你跑",
+        "要不要跑一下",
+    ];
+    if ZH_OFFERS.iter().any(|p| line.contains(p)) {
+        return true;
+    }
+    const EN_OFFERS: &[&str] = &[
+        "would you like me to commit",
+        "would you like me to push",
+        "would you like me to also",
+        "want me to commit",
+        "want me to push",
+        "want me to also",
+        "shall i commit",
+        "should i also commit",
+    ];
+    EN_OFFERS.iter().any(|p| low.contains(p))
 }
 
 fn line_ends_with_question(line: &str) -> bool {
@@ -518,14 +622,14 @@ fn has_explicit_decision_request(line: &str) -> bool {
     let low = line.to_ascii_lowercase();
     const ZH_CUES: &[&str] = &[
         "请选择",
-        "请确认",
         "请先确认",
         "请先选择",
         "请你选择",
         "请你确认",
-        "请告知",
-        "请告诉我",
-        "请回复",
+        "请确认是否",
+        "请确认要",
+        "请确认哪",
+        "请确认目",
         "请决定",
         "请指定",
         "请提供",
@@ -541,8 +645,6 @@ fn has_explicit_decision_request(line: &str) -> bool {
         "告诉我你的选择",
         "你更倾向",
         "您更倾向",
-        "你希望",
-        "您希望",
         "回复数字",
         "回复编号",
         "输入编号",
@@ -554,22 +656,15 @@ fn has_explicit_decision_request(line: &str) -> bool {
         "please choose",
         "please select",
         "please confirm",
-        "please let me know",
         "please specify",
         "please clarify",
         "please provide",
         "please decide",
-        "please reply",
         "choose an option",
         "select an option",
         "pick an option",
         "pick one",
-        "reply with",
         "let me know which",
-        "let me know how you'd like",
-        "let me know how you would like",
-        "let me know if you want me to",
-        "let me know if you'd like me to",
         "tell me which",
         "waiting for your confirmation",
         "waiting for your input",
@@ -580,18 +675,38 @@ fn has_explicit_decision_request(line: &str) -> bool {
     EN_CUES.iter().any(|p| low.contains(p))
 }
 
-fn has_choice_intro_cue(line: &str) -> bool {
-    let low = line.to_ascii_lowercase();
-    line.contains("方案")
-        || line.contains("选项")
-        || line.contains("选择")
-        || line.contains("确认")
-        || line.contains("决定")
-        || low.contains("option")
-        || low.contains("approach")
-        || low.contains("choose")
-        || low.contains("prefer")
-        || low.contains("proceed")
+fn is_explicit_choice_header(line: &str) -> bool {
+    let t = line.trim();
+    if !(t.ends_with(':') || t.ends_with('：')) {
+        return false;
+    }
+    let low = t.to_ascii_lowercase();
+    const ZH_HEADERS: &[&str] = &[
+        "可选方案",
+        "候选方案",
+        "以下方案",
+        "两种方案",
+        "三种方案",
+        "几种方案",
+        "可选项",
+        "以下选项",
+    ];
+    if ZH_HEADERS.iter().any(|p| t.contains(p))
+        && !t.contains("已完成")
+        && !t.contains("已实现")
+        && !t.contains("已修改")
+        && !t.contains("已修复")
+    {
+        return true;
+    }
+    const EN_HEADERS: &[&str] = &[
+        "options:",
+        "available options:",
+        "possible approaches:",
+        "two options:",
+        "three options:",
+    ];
+    EN_HEADERS.iter().any(|p| low.ends_with(p))
 }
 
 fn is_option_list_line(line: &str) -> bool {
@@ -761,8 +876,21 @@ mod tests {
     fn detects_questions_and_choices_in_assistant_output() {
         assert!(detect_text_needs_user_input("我已经修好了这个 bug，并运行了全部单测，全部通过。").is_none());
         assert!(detect_text_needs_user_input("修改已完成！如果你还有其他问题，随时告诉我。").is_none());
+        assert!(detect_text_needs_user_input("已完成所有修改并通过测试！如有任何问题请告诉我。").is_none());
         assert!(detect_text_needs_user_input("All tests pass. Let me know if you need anything else!").is_none());
+        assert!(detect_text_needs_user_input("All changes are complete. Please let me know if you'd like any adjustments!").is_none());
         assert!(detect_text_needs_user_input("改完了，还有什么需要帮忙的吗？").is_none());
+        assert!(detect_text_needs_user_input("已按你希望的方式完成状态栏优化，请确认效果。").is_none());
+        assert!(detect_text_needs_user_input(
+            "按照上述方案已完成本次重构：\n1. 修复了多标签页模型选择逻辑\n2. 补充了单元测试并确认全部通过"
+        )
+        .is_none());
+        assert!(detect_text_needs_user_input(
+            "为什么之前会超时？原因如下：\n1. 锁未释放\n2. 重试间隔过长\n现已彻底修复并通过测试。"
+        )
+        .is_none());
+        assert!(detect_text_needs_user_input("所有改动已完成并验证通过。需要我顺便提交一下 git commit 吗？").is_none());
+        assert!(detect_text_needs_user_input("All tests pass. Would you like me to commit these changes as well?").is_none());
         assert!(detect_text_needs_user_input("修复了如下代码：\n```ts\nconst x = ok ? 1 : 2;\n```\n已验证通过。").is_none());
         assert!(detect_text_needs_user_input("检查了 https://example.com/api?v=1 并更新为 v2。").is_none());
 
@@ -771,6 +899,7 @@ mod tests {
             "这里有两种实现方式，你更倾向哪种方案？\n1. 方案 A：仅修改前端\n2. 方案 B：前后端联动修改"
         )
         .is_some());
+        assert!(detect_text_needs_user_input("可选方案：\n1. 方案 A：仅改前端\n2. 方案 B：全栈联动").is_some());
         assert!(detect_text_needs_user_input("请选择要部署的目标环境：\n- 方案 A：staging\n- 方案 B：production").is_some());
         assert!(detect_text_needs_user_input(
             "Before I proceed, should I migrate existing database rows or only apply this to new records?"
