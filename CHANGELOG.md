@@ -1,5 +1,23 @@
 # Changelog
 
+## v2.0.25
+
+#### 中文
+
+**行为优化**
+- **收紧「待确认（`blocked`）」状态解锁规则，仅在提交非空提示词或手动修改状态后变更**：
+  - 终端内仅在输入框存在非空提示词（含键盘键入、中文 IME、粘贴及历史回溯文本）并按回车提交时才推进提交水位并解除「待确认」锁定；仅打字未提交、`Shift+Enter` 换行、空回车、方向键/退格、点击聚焦或重绘均不再提前改写状态。
+  - Peek / 侧栏 / `h2` 交互侧仅响应提示词提交（`h2 send` / `h2 inbox send` / `agent.send` / `agent.send_review` / `handoff`）及用户手动修改状态（`agent.status`），不再因底层 `turn` 自增、中断或非提交类按键误解锁。
+
+---
+
+#### English
+
+**Improvements**
+- **Tightened "Needs You" (`blocked`) Release Rules to Require Prompt Submission or Manual Status Change**:
+  - Terminal `blocked` holds now unlock only when a non-empty prompt (typed, IME-committed, pasted, or history-recalled in the input box) is actually submitted, or when the user manually changes the agent status; typing without submitting, `Shift+Enter` newlines, bare Enter, navigation keys, focus/resize, and TUI redraws no longer clear `blocked`.
+  - Restricted JS mod interaction unlock signals to prompt submission commands (`h2 send` / `h2 inbox send`) alongside explicit `agent.send`, `agent.send_review`, `handoff`, and manual `agent.status` updates.
+
 ## v2.0.24
 
 #### 中文

@@ -1015,8 +1015,8 @@ fn exec_limit(options: Option<&HostValue>) -> Result<Duration, HostError> {
 
 static INTERACTED_AGENTS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
-/// Drains agent/terminal addresses that JS mods explicitly conversed with via `h2(...)`
-/// (e.g. `h2 send`, `h2 approve`, `h2 deny`, `h2 keys`, `h2 interrupt`, `h2 inbox send`).
+/// Drains agent/terminal addresses where JS mods submitted a prompt via `h2(...)`
+/// (e.g. `h2 send` or `h2 inbox send`).
 pub fn take_interacted_agents() -> Vec<String> {
     let mut guard = INTERACTED_AGENTS.lock().unwrap();
     if guard.is_empty() {
@@ -1028,7 +1028,7 @@ pub fn take_interacted_agents() -> Vec<String> {
 fn h2_interaction_target(args: &[String]) -> Option<String> {
     let first = args.first()?.as_str();
     let start_idx = match first {
-        "send" | "approve" | "deny" | "keys" | "interrupt" => 1,
+        "send" => 1,
         "inbox" if args.get(1).map(String::as_str) == Some("send") => 2,
         _ => return None,
     };
@@ -2514,14 +2514,15 @@ mod tests {
     }
 
     #[test]
-    fn h2_interaction_target_extracts_conversation_commands_and_ignores_reads() {
+    fn h2_interaction_target_extracts_prompt_submit_commands_only() {
         let v = |xs: &[&str]| xs.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
         assert_eq!(h2_interaction_target(&v(&["send", "--json", "t1", "hello"])), Some("t1".into()));
-        assert_eq!(h2_interaction_target(&v(&["approve", "--json", "--option", "allow", "a1"])), Some("a1".into()));
-        assert_eq!(h2_interaction_target(&v(&["deny", "--json", "a2"])), Some("a2".into()));
-        assert_eq!(h2_interaction_target(&v(&["interrupt", "--json", "box/t3"])), Some("box/t3".into()));
-        assert_eq!(h2_interaction_target(&v(&["keys", "--json", "t4", "enter"])), Some("t4".into()));
+        assert_eq!(h2_interaction_target(&v(&["send", "--json", "--on", "box", "t2", "hi"])), Some("t2".into()));
         assert_eq!(h2_interaction_target(&v(&["inbox", "send", "--json", "a5", "101"])), Some("a5".into()));
+        assert_eq!(h2_interaction_target(&v(&["approve", "--json", "--option", "allow", "a1"])), None);
+        assert_eq!(h2_interaction_target(&v(&["deny", "--json", "a2"])), None);
+        assert_eq!(h2_interaction_target(&v(&["interrupt", "--json", "box/t3"])), None);
+        assert_eq!(h2_interaction_target(&v(&["keys", "--json", "t4", "enter"])), None);
         assert_eq!(h2_interaction_target(&v(&["read", "--json", "t1"])), None);
         assert_eq!(h2_interaction_target(&v(&["get", "--json", "a1"])), None);
         assert_eq!(h2_interaction_target(&v(&["ls", "--json"])), None);

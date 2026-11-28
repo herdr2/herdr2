@@ -1209,6 +1209,10 @@ impl TerminalView {
         self.last_enter_at.get()
     }
 
+    pub fn last_submit_at(&self) -> Option<Instant> {
+        self.last_submit_at.get()
+    }
+
     pub fn last_output_at(&self) -> Option<Instant> {
         self.last_output_at
     }
@@ -1501,7 +1505,13 @@ impl TerminalView {
     fn send(&self, bytes: &[u8]) {
         let now = Instant::now();
         self.typed_at.set(Some(now));
-        let (submitted, submitted_non_empty) = self.draft.borrow_mut().feed(bytes);
+        let (submitted, mut submitted_non_empty) = self.draft.borrow_mut().feed(bytes);
+        if submitted && !submitted_non_empty {
+            let (rows, cursor_row) = self.grid.borrow().vt.active_prompt_rows(40);
+            if matches!(inspect_cli_input_box(&rows, cursor_row), CliScreenInput::Text(_)) {
+                submitted_non_empty = true;
+            }
+        }
         if submitted || bytes.contains(&b'\r') || bytes.contains(&b'\n') {
             self.last_enter_at.set(Some(now));
         }

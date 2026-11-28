@@ -1493,12 +1493,10 @@ struct BlockedHold {
     /// Preserved AI verdict metadata when `"blocked"` came from AI arbitration.
     ai_kind: Option<String>,
     ai_summary: Option<String>,
-    /// Terminal keyboard/paste watermark captured when entering `"blocked"`.
-    latched_typed_at: Option<Instant>,
-    /// Core turn watermark captured when entering `"blocked"`.
+    /// Terminal non-empty prompt-submission watermark captured when entering `"blocked"`.
+    latched_submit_at: Option<Instant>,
+    /// Core turn watermark captured when entering `"blocked"` (used for headless ACP prompt turns).
     latched_turn: u64,
-    /// Whether an ACP `pending_permission` was present when latched.
-    had_pending_permission: bool,
     /// Whether this address is a headless ACP agent.
     is_acp: bool,
 }
@@ -1506,27 +1504,17 @@ struct BlockedHold {
 fn should_release_blocked_hold(
     hold: &BlockedHold,
     has_manual_status: bool,
-    cur_typed_at: Option<Instant>,
+    cur_submit_at: Option<Instant>,
     cur_turn: u64,
-    has_pending_permission: bool,
-    raw_state: Option<&str>,
 ) -> bool {
     if has_manual_status {
         return true;
     }
-    if cur_typed_at > hold.latched_typed_at {
+    if cur_submit_at > hold.latched_submit_at {
         return true;
     }
-    if cur_turn > hold.latched_turn {
+    if hold.is_acp && cur_turn > hold.latched_turn {
         return true;
-    }
-    if hold.is_acp {
-        if hold.had_pending_permission && !has_pending_permission {
-            return true;
-        }
-        if raw_state == Some("working") {
-            return true;
-        }
     }
     false
 }
@@ -4710,11 +4698,11 @@ impl AppWindow {
         st_opt
     }
 
-    fn latest_typed_at(&self, addr: &str, cx: &App) -> Option<Instant> {
+    fn latest_submit_at(&self, addr: &str, cx: &App) -> Option<Instant> {
         self.terms
             .values()
             .filter(|t| t.address == addr)
-            .filter_map(|t| t.view.read(cx).last_typed_at())
+            .filter_map(|t| t.view.read(cx).last_submit_at())
             .max()
     }
 
@@ -4742,15 +4730,13 @@ impl AppWindow {
             }
             return;
         }
-        let latched_typed_at = self.latest_typed_at(addr, cx);
+        let latched_submit_at = self.latest_submit_at(addr, cx);
         let latched_turn = rec.get("turn").and_then(Value::as_u64).unwrap_or(0);
-        let had_pending_permission = rec.get("pending_permission").is_some_and(|v| !v.is_null());
         self.blocked_holds.insert(addr.to_owned(), BlockedHold {
             ai_kind,
             ai_summary,
-            latched_typed_at,
+            latched_submit_at,
             latched_turn,
-            had_pending_permission,
             is_acp,
         });
     }
@@ -4764,9 +4750,10 @@ impl AppWindow {
         }
     }
 
-    /// Reconciles active `"blocked"` holds against user conversation / explicit manual overrides,
-    /// and re-applies still-held `"blocked"` state onto `self.live` so focus/resize/redraw/list-refresh
-    /// events can never clear or flicker `"blocked"`.
+    /// Reconciles active `"blocked"` holds against explicit prompt submissions / manual status
+    /// changes, and re-applies still-held `"blocked"` state onto `self.live` so passive events
+    /// (focus, resize, redraw, typing without submitting, bare Enter, list refreshes) can never
+    /// clear or flicker `"blocked"`.
     /// Returns `(released_addrs, live_updated)`.
     fn reconcile_blocked_holds(&mut self, cx: &App) -> (HashSet<String>, bool) {
         let mut released: HashSet<String> = HashSet::new();
@@ -4786,11 +4773,9 @@ impl AppWindow {
             };
             let has_manual = self.manual_statuses.get(&addr).is_some_and(|e| e.status.is_some())
                 || rec.get("manual_status").and_then(Value::as_str).is_some_and(|s| !s.is_empty());
-            let cur_typed_at = self.latest_typed_at(&addr, cx);
+            let cur_submit_at = self.latest_submit_at(&addr, cx);
             let cur_turn = rec.get("turn").and_then(Value::as_u64).unwrap_or(0);
-            let has_pending_permission = rec.get("pending_permission").is_some_and(|v| !v.is_null());
-            let raw_state = rec.get("raw_state").and_then(Value::as_str);
-            if should_release_blocked_hold(hold, has_manual, cur_typed_at, cur_turn, has_pending_permission, raw_state) {
+            if should_release_blocked_hold(hold, has_manual, cur_submit_at, cur_turn) {
                 self.release_blocked_hold(&addr);
                 released.insert(addr);
             }
@@ -6198,12 +6183,12 @@ impl AppWindow {
                 && !self.blocked_holds.contains_key(&addr)
                 && !released_blocked.contains(&addr)
             {
-                let answered_since_output = !is_acp
+                let submitted_since_output = !is_acp
                     && self
                         .best_terminal_view(&addr, cx)
                         .map(|v| v.read(cx))
-                        .is_some_and(|v| matches!((v.last_output_at(), v.last_typed_at()), (Some(out), Some(typed)) if typed > out));
-                (!answered_since_output).then(|| {
+                        .is_some_and(|v| matches!((v.last_output_at(), v.last_submit_at()), (Some(out), Some(sub)) if sub > out));
+                (!submitted_since_output).then(|| {
                     let ai_kind = rec.get("ai_status_kind").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
                     let ai_summary = rec.get("ai_status_summary").and_then(Value::as_str).filter(|s| !s.is_empty()).map(str::to_owned);
                     (ai_kind, ai_summary)
@@ -13457,7 +13442,6 @@ impl Render for AppWindow {
                         && (is_acp_addr(&addr) || this.pane_is_structured(&pane))
                         && this.model.status(&addr) == Some("working")
                     {
-                        this.release_blocked_hold(&addr);
                         let core = this.core.clone();
                         cx.background_executor()
                             .spawn(async move {
@@ -16972,52 +16956,48 @@ export default class SystemToast extends View {
     }
 
     #[test]
-    fn blocked_hold_stays_locked_across_passive_events_and_releases_on_user_conversation() {
+    fn blocked_hold_stays_locked_until_prompt_submit_or_manual_status_change() {
         let t0 = std::time::Instant::now();
         let t1 = t0 + std::time::Duration::from_millis(50);
 
-        // 1. PTY agent latched as blocked: passive focus/resize/redraw (same typed_at & turn) MUST NOT release.
+        // 1. PTY agent latched as blocked: passive events, typing without submitting, bare Enter,
+        //    and automatic turn increments MUST NOT release.
         let pty_hold = super::BlockedHold {
             ai_kind: Some("question".into()),
             ai_summary: Some("Confirm deploy?".into()),
-            latched_typed_at: Some(t0),
+            latched_submit_at: Some(t0),
             latched_turn: 3,
-            had_pending_permission: false,
             is_acp: false,
         };
-        assert!(!super::should_release_blocked_hold(&pty_hold, false, Some(t0), 3, false, Some("idle")));
-        assert!(!super::should_release_blocked_hold(&pty_hold, false, None, 3, false, Some("working")));
-        // User types/responds in terminal -> releases hold.
-        assert!(super::should_release_blocked_hold(&pty_hold, false, Some(t1), 3, false, Some("idle")));
-        // User sends a new turn (e.g. via Peek / h2 send) -> releases hold.
-        assert!(super::should_release_blocked_hold(&pty_hold, false, Some(t0), 4, false, Some("idle")));
+        assert!(!super::should_release_blocked_hold(&pty_hold, false, Some(t0), 3));
+        assert!(!super::should_release_blocked_hold(&pty_hold, false, Some(t0), 4));
+        assert!(!super::should_release_blocked_hold(&pty_hold, false, None, 3));
+        // User types a prompt in the input box and submits it -> releases hold.
+        assert!(super::should_release_blocked_hold(&pty_hold, false, Some(t1), 3));
         // User manually changes status -> releases hold.
-        assert!(super::should_release_blocked_hold(&pty_hold, true, Some(t0), 3, false, Some("blocked")));
+        assert!(super::should_release_blocked_hold(&pty_hold, true, Some(t0), 3));
 
-        // 2. PTY agent latched before any keystroke (latched_typed_at == None): first keystroke releases.
+        // 2. PTY agent latched before any submission (latched_submit_at == None): first non-empty submit releases.
         let pty_fresh = super::BlockedHold {
             ai_kind: None,
             ai_summary: None,
-            latched_typed_at: None,
+            latched_submit_at: None,
             latched_turn: 0,
-            had_pending_permission: false,
             is_acp: false,
         };
-        assert!(!super::should_release_blocked_hold(&pty_fresh, false, None, 0, false, None));
-        assert!(super::should_release_blocked_hold(&pty_fresh, false, Some(t0), 0, false, None));
+        assert!(!super::should_release_blocked_hold(&pty_fresh, false, None, 0));
+        assert!(super::should_release_blocked_hold(&pty_fresh, false, Some(t0), 0));
 
-        // 3. ACP agent latched on pending permission: stays locked while pending, releases on approve/deny or working.
+        // 3. ACP agent latched as blocked: stays locked until a new prompt turn is submitted or status manually changed.
         let acp_hold = super::BlockedHold {
             ai_kind: None,
             ai_summary: None,
-            latched_typed_at: None,
+            latched_submit_at: None,
             latched_turn: 2,
-            had_pending_permission: true,
             is_acp: true,
         };
-        assert!(!super::should_release_blocked_hold(&acp_hold, false, None, 2, true, Some("blocked")));
-        assert!(super::should_release_blocked_hold(&acp_hold, false, None, 2, false, Some("working")));
-        assert!(super::should_release_blocked_hold(&acp_hold, false, None, 2, true, Some("working")));
-        assert!(super::should_release_blocked_hold(&acp_hold, false, None, 3, true, Some("blocked")));
+        assert!(!super::should_release_blocked_hold(&acp_hold, false, None, 2));
+        assert!(super::should_release_blocked_hold(&acp_hold, false, None, 3));
+        assert!(super::should_release_blocked_hold(&acp_hold, true, None, 2));
     }
 }
